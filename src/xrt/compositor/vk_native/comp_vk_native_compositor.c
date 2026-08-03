@@ -116,6 +116,13 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 // logs a one-line summary ~1/sec (WARN so it survives the hot-path filter).
 DEBUG_GET_ONCE_BOOL_OPTION(frame_stage_timing, "DXR_FRAME_STAGE_TIMING", false)
 
+// Deferred present (#837, default off): xrEndFrame submits this frame's GPU
+// work and returns without waiting; the frame is fence-waited and presented at
+// the START of the next commit. The app overlaps its next frame's work with
+// the weave; displayed content lags submission by one commit (+1 frame of
+// pose latency for the eye-tracked weave — HW-eyeball before relying on it).
+DEBUG_GET_ONCE_BOOL_OPTION(defer_present, "DXR_DEFER_PRESENT", false)
+
 enum vk_frame_stage
 {
 	VK_FSTAGE_PRE = 0,      // commit entry → pre-DP cmd recorded (renderer, accum, crops)
@@ -375,6 +382,19 @@ struct comp_vk_native_compositor
 	//! (identical on a single-queue iGPU, strictly narrower elsewhere) and
 	//! is the stepping stone for deferred present. Lazily created.
 	VkFence frame_fence;
+
+	//! #837 deferred present (DXR_DEFER_PRESENT): a submitted-but-not-yet
+	//! -presented frame is in flight; its cmd buffer and temporary target
+	//! framebuffer retire at the next commit's fence wait.
+	bool defer_pending;
+	VkCommandBuffer defer_cmd;
+	VkCommandPool defer_cmd_pool;
+	VkFramebuffer defer_target_fb;
+	//! Throttled retire-stage attribution (fence wait vs present), logged
+	//! as [DEFER_STAGES] once per 60 retired frames.
+	double defer_acc_wait_ms;
+	double defer_acc_present_ms;
+	uint32_t defer_acc_n;
 
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
@@ -3097,13 +3117,64 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		enum comp_vk_native_target_surface_state sstate =
 		    comp_vk_native_target_sync_surface(c->target);
 		if (sstate == COMP_VK_NATIVE_TARGET_SURFACE_LOST) {
+			// Any deferred frame targets a surface that no longer exists.
+			c->defer_pending = false;
 			return XRT_SUCCESS;
+		}
+
+		// #837 deferred present (DXR_DEFER_PRESENT=1, default off): retire the
+		// PREVIOUS frame here — wait its fence (≈signaled after a frame of app
+		// work) and present its image (still the target's current index) —
+		// then submit this frame below WITHOUT waiting. The app gets its
+		// thread back while the GPU weaves; displayed content lags submission
+		// by one commit. Draining the predecessor before recording keeps every
+		// scratch single-buffered (no per-frame-in-flight rings needed).
+		const bool defer = debug_get_bool_option_defer_present();
+		if (defer && c->defer_pending) {
+			c->defer_pending = false;
+			uint64_t dt0 = os_monotonic_get_ns();
+			if (c->frame_fence != VK_NULL_HANDLE) {
+				vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
+				vk->vkResetFences(vk->device, 1, &c->frame_fence);
+			}
+			uint64_t dt1 = os_monotonic_get_ns();
+			// The previous frame's GPU work is done — retire its resources.
+			if (c->defer_cmd != VK_NULL_HANDLE) {
+				vk->vkFreeCommandBuffers(vk->device, c->defer_cmd_pool, 1, &c->defer_cmd);
+				c->defer_cmd = VK_NULL_HANDLE;
+			}
+			if (c->defer_target_fb != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, c->defer_target_fb, NULL);
+				c->defer_target_fb = VK_NULL_HANDLE;
+			}
+			xret = comp_vk_native_target_present(c->target);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Deferred present failed");
+				return xret;
+			}
+			uint64_t dt2 = os_monotonic_get_ns();
+			c->defer_acc_wait_ms += (double)(dt1 - dt0) * 1e-6;
+			c->defer_acc_present_ms += (double)(dt2 - dt1) * 1e-6;
+			if (++c->defer_acc_n >= 60) {
+				U_LOG_W("[DEFER_STAGES] n=%u wait=%.2f present=%.2f (ms/frame)",
+				        c->defer_acc_n, c->defer_acc_wait_ms / c->defer_acc_n,
+				        c->defer_acc_present_ms / c->defer_acc_n);
+				c->defer_acc_wait_ms = 0.0;
+				c->defer_acc_present_ms = 0.0;
+				c->defer_acc_n = 0;
+			}
+#ifdef XRT_OS_WINDOWS
+			if (c->owns_window && c->own_window != NULL) {
+				comp_d3d11_window_signal_paint_done(c->own_window);
+			}
+#endif
 		}
 
 		uint32_t target_index;
 		xret = comp_vk_native_target_acquire(c->target, &target_index);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to acquire target");
+			c->defer_pending = false;
 			return xret;
 		}
 
@@ -3414,7 +3485,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
 			}
 			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, c->frame_fence);
-			if (res == VK_SUCCESS) {
+			if (res == VK_SUCCESS && defer && c->frame_fence != VK_NULL_HANDLE) {
+				// #837 deferred present: return with the frame in flight;
+				// the next commit fence-waits it, retires cmd + target_fb,
+				// and presents. The app overlaps its next frame with this
+				// frame's weave.
+				c->defer_pending = true;
+				c->defer_cmd = cmd;
+				c->defer_cmd_pool = cmd_pool;
+				c->defer_target_fb = target_fb;
+				target_fb = VK_NULL_HANDLE;
+				cmd = VK_NULL_HANDLE;
+			} else if (res == VK_SUCCESS) {
 				if (c->frame_fence != VK_NULL_HANDLE) {
 					vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, &c->frame_fence);
@@ -3423,7 +3505,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				}
 			}
 
-			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+			if (cmd != VK_NULL_HANDLE) {
+				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+			}
 		}
 
 		// Destroy temporary framebuffer after GPU is done
@@ -3435,8 +3519,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			fp[5] = os_monotonic_get_ns();
 		}
 
-		// Present
-		xret = comp_vk_native_target_present(c->target);
+		// Present — unless deferred, in which case the NEXT commit presents
+		// this frame after its fence signals.
+		if (!c->defer_pending) {
+			xret = comp_vk_native_target_present(c->target);
+		} else {
+			xret = XRT_SUCCESS;
+		}
 
 		if (ftime && fp[1] != 0) {
 			fp[6] = os_monotonic_get_ns();
@@ -3450,7 +3539,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 
 #ifdef XRT_OS_WINDOWS
-		if (c->owns_window && c->own_window != NULL) {
+		// Deferred frames signal paint-done at their actual present (in the
+		// next commit's retire step).
+		if (!c->defer_pending && c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
 		}
 #endif
@@ -3520,6 +3611,18 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
 	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)
+	// #837 deferred present: an in-flight frame's resources retire here — the
+	// device-wait above has already drained the GPU.
+	if (c->defer_cmd != VK_NULL_HANDLE) {
+		c->vk.vkFreeCommandBuffers(c->vk.device, c->defer_cmd_pool, 1, &c->defer_cmd);
+		c->defer_cmd = VK_NULL_HANDLE;
+	}
+	if (c->defer_target_fb != VK_NULL_HANDLE) {
+		c->vk.vkDestroyFramebuffer(c->vk.device, c->defer_target_fb, NULL);
+		c->defer_target_fb = VK_NULL_HANDLE;
+	}
+	c->defer_pending = false;
+
 	if (c->frame_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
 		c->frame_fence = VK_NULL_HANDLE;
