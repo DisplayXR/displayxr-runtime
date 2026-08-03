@@ -76,6 +76,8 @@
 #include <d3d11.h>
 #include <dxgi1_3.h>     // CreateDXGIFactory2, IDXGISwapChain1, CreateSwapChainForComposition
 #include <dcomp.h>       // DirectComposition (transparent GL present path)
+#include <dwmapi.h>      // DwmFlush (late-weave pacing — no DXGI stats on GL)
+#pragma comment(lib, "dwmapi.lib")
 #include <d3dcompiler.h> // D3DCompile (inline blit shader for the DComp present path)
 // GUID for ID3D11Texture2D (needed for OpenSharedResource in C)
 static const IID IID_ID3D11Texture2D_local = {
@@ -1800,6 +1802,26 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 
 		dp_tex = c->dp_input_texture;
 	}
+
+	// Late-weave (DXR_LATE_WEAVE=1): GL has no DXGI frame statistics or
+	// present_wait, so pace on DWM's composition pass instead — DwmFlush
+	// blocks until the next compose, putting the weave near the top of the
+	// refresh interval. Coarser than the D3D/VK scanout pacing but the same
+	// direction; GL is the least-used weave path (cube + legacy apps).
+#ifdef XRT_OS_WINDOWS
+	{
+		static int late_weave = -1;
+		if (late_weave < 0) {
+			// Default ON (opt-out DXR_LATE_WEAVE=0), matching the
+			// D3D11/D3D12/VK compositors.
+			const char *e = getenv("DXR_LATE_WEAVE");
+			late_weave = (e != NULL && e[0] == '0') ? 0 : 1;
+		}
+		if (late_weave == 1) {
+			DwmFlush();
+		}
+	}
+#endif
 
 	// Pass (possibly cropped) texture to DP. Canvas params are always 0 — the
 	// DP weaves the full client window (sub-rects are expressed as 3D zones now).

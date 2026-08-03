@@ -2285,6 +2285,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			scissor.bottom = static_cast<LONG>(tgt_height);
 			c->cmd_list->RSSetScissorRects(1, &scissor);
 
+			// Late-weave pacing + weave-latency harness mark (env-gated
+			// no-ops otherwise).
+			comp_d3d12_target_weave_mark(c->target);
+
 			// Pass actual backbuffer dimensions to the DP.
 			// Canvas offset and size are passed separately — the DP uses
 			// them to set a viewport sub-rect for correct interlacing phase.

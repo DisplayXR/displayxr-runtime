@@ -87,84 +87,10 @@ extern "C" bool g_bridge_relay_active;
  *
  */
 
-/*
- * Weave-latency measurement harness (env-gated; zero cost when off).
- *
- * DXR_WEAVE_LATENCY_CSV=<prefix> enables per-frame CSV logs correlating the
- * QPC timestamp taken immediately before process_atlas (T_weave — the moment
- * the weaver pulls its internal eye prediction) with the DXGI-reported scanout
- * time of the same frame. The residual R = SyncQPCTime(frame) − T_weave is the
- * latency the eye predictor has to cover; the late-weave work exists to shrink
- * it. Two row kinds, joined offline (dxr-perf-study/weave_latency.py):
- *   H,qpc_freq                                            (once per file)
- *   F,seq,qpc_weave,qpc_present_ret,present_count         (one per weave+present)
- *   S,present_count,present_refresh,sync_refresh,sync_qpc,qpc_now   (stats snapshot)
- * Each call site writes its own file (<prefix>.<site>.csv). Both sites run
- * under sys->render_mutex, so per-site state needs no extra locking.
- */
-struct weave_latency_log
-{
-	FILE *f = nullptr;
-	int enabled = -1; // -1 = unprobed
-	uint64_t seq = 0;
-	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
-
-	bool
-	on(const char *site)
-	{
-		if (enabled < 0) {
-			const char *prefix = getenv("DXR_WEAVE_LATENCY_CSV");
-			enabled = 0;
-			if (prefix != nullptr && prefix[0] != '\0') {
-				char path[MAX_PATH];
-				snprintf(path, sizeof(path), "%s.%s.csv", prefix, site);
-				f = fopen(path, "a");
-				if (f != nullptr) {
-					LARGE_INTEGER freq;
-					QueryPerformanceFrequency(&freq);
-					fprintf(f, "H,%lld\n", (long long)freq.QuadPart);
-					enabled = 1;
-				}
-			}
-		}
-		return enabled == 1;
-	}
-
-	void
-	mark_weave(const char *site)
-	{
-		if (!on(site)) {
-			return;
-		}
-		LARGE_INTEGER now;
-		QueryPerformanceCounter(&now);
-		qpc_weave = (uint64_t)now.QuadPart;
-	}
-
-	void
-	after_present(const char *site, IDXGISwapChain *sc)
-	{
-		if (!on(site) || sc == nullptr) {
-			return;
-		}
-		LARGE_INTEGER now;
-		QueryPerformanceCounter(&now);
-		if (qpc_weave != 0) {
-			UINT present_count = 0;
-			sc->GetLastPresentCount(&present_count);
-			fprintf(f, "F,%llu,%llu,%llu,%u\n", (unsigned long long)seq++,
-			        (unsigned long long)qpc_weave, (unsigned long long)now.QuadPart, present_count);
-			qpc_weave = 0;
-		}
-		DXGI_FRAME_STATISTICS stats = {};
-		if (SUCCEEDED(sc->GetFrameStatistics(&stats))) {
-			fprintf(f, "S,%u,%u,%u,%llu,%llu\n", stats.PresentCount, stats.PresentRefreshCount,
-			        stats.SyncRefreshCount, (unsigned long long)stats.SyncQPCTime.QuadPart,
-			        (unsigned long long)now.QuadPart);
-		}
-		fflush(f);
-	}
-};
+// Weave-latency measurement harness — shared header (also used by the
+// D3D11/D3D12 in-process targets). Site files: <prefix>.workspace.csv /
+// <prefix>.standalone.csv here.
+#include "util/comp_weave_latency_win.h"
 
 static weave_latency_log g_weave_latency_workspace;
 static weave_latency_log g_weave_latency_standalone;
@@ -182,8 +108,11 @@ dxr_late_weave_enabled()
 {
 	static int enabled = -1;
 	if (enabled < 0) {
+		// Default ON: late-weave is the product behavior on every path
+		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
 		const char *e = getenv("DXR_LATE_WEAVE");
-		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;
 }

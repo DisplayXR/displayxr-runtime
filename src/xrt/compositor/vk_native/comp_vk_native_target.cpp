@@ -121,8 +121,11 @@ dxr_late_weave_enabled()
 {
 	static int enabled = -1;
 	if (enabled < 0) {
+		// Default ON: late-weave is the product behavior on every path
+		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
 		const char *e = getenv("DXR_LATE_WEAVE");
-		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;
 }
