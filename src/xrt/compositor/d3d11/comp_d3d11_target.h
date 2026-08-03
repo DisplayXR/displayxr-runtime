@@ -82,6 +82,15 @@ xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval);
 
 /*!
+ * Late-weave pacing + weave-latency harness mark. Call immediately before the
+ * DP weave on the window path: paces on the previous present's actual scanout
+ * when DXR_LATE_WEAVE=1, and timestamps T_weave when DXR_WEAVE_LATENCY_CSV is
+ * set. No-op otherwise.
+ */
+void
+comp_d3d11_target_weave_mark(struct comp_d3d11_target *target);
+
+/*!
  * Get target dimensions.
  *
  * @ingroup comp_d3d11

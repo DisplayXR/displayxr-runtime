@@ -399,6 +399,19 @@ its own content by definition, so there is no full-window backer. Reference apps
   test apps stay on the legacy path deliberately** — it can never be deleted (third-party apps),
   so it keeps regression coverage. Ref: `displayxr-common#23`.
 
+- **INV-5.9 — VK apps enable `VK_KHR_present_id` + `VK_KHR_present_wait` at `vkCreateDevice` when
+  the device supports them.** The runtime's late-weave pacing (default-on) vsync-locks the weave by
+  waiting on the previous present hitting glass via `vkWaitForPresentKHR` — measured 95.8 → 16.6 ms
+  of weave→scanout eye staleness on this path. The features must be enabled by whoever creates the
+  `VkDevice`, which on the `XR_KHR_vulkan_enable` (v1) path is the app: query
+  `VkPhysicalDevicePresentIdFeaturesKHR` + `PresentWaitFeaturesKHR` via
+  `vkGetPhysicalDeviceFeatures2`, and when both report supported, chain them into
+  `VkDeviceCreateInfo` and append both extension names. Without them the runtime silently falls
+  back to stock pacing (no error — just ~6 refreshes of extra weave latency). Reference:
+  `cube_handle_vk_win/xr_session.cpp` (`CreateVulkanDevice`); a shared helper is planned in
+  `displayxr-common` (`EnablePresentWaitIfSupported`). Lint: WARN when a `vkCreateDevice` call is
+  present with no `PresentWaitFeatures` token anywhere in the app.
+
 ---
 
 ## 6. Kooima projection

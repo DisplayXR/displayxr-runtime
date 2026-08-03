@@ -1922,6 +1922,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_d3d11_target_bind(c->target);
 		}
 
+		// Late-weave pacing + weave-latency harness mark (env-gated no-ops).
+		comp_d3d11_target_weave_mark(c->target);
+
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,

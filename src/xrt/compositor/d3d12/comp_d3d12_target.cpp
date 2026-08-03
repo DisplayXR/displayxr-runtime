@@ -27,6 +27,29 @@
 // regardless of their alpha mode). See the use_transparent gate below.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+#include "util/comp_weave_latency_win.h"
+
+// One in-process D3D12 target per compositor per app process — file-scope
+// harness instance (the target struct is memset after construction, which
+// would clobber the logger's -1 sentinel).
+static weave_latency_log g_weave_latency_d3d12;
+
+// Late-weave (DXR_LATE_WEAVE=1): same gate as the D3D11 service / VK native
+// compositors — waitable swapchain, max frame latency 1, weave paced to the
+// waitable so the eye prediction is ~1 refresh old at scanout.
+static bool
+dxr_late_weave_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		// Default ON: late-weave is the product behavior on every path
+		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
+		const char *e = getenv("DXR_LATE_WEAVE");
+		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
 
 #define BACK_BUFFER_COUNT 3
 
@@ -52,6 +75,21 @@ struct comp_d3d12_target
 
 	//! Window handle.
 	HWND hwnd;
+
+	//! Late-weave (DXR_LATE_WEAVE=1): frame-latency waitable from the
+	//! swapchain (FRAME_LATENCY_WAITABLE_OBJECT + max latency 1). The
+	//! compositor waits on it right before the weave, vsync-locking
+	//! weave+present and capping the present queue at 1 (default here was
+	//! bc=3 with NO latency cap). NULL when late-weave is off or the
+	//! transparent DComp path is active.
+	HANDLE frame_latency_waitable;
+
+	//! Last Present()'s DXGI present count — the scanout pacer in
+	//! weave_mark waits until GetFrameStatistics reports it flipped to
+	//! glass. The waitable alone is NOT enough on composed (windowed)
+	//! presents: it releases on DWM *pickup*, 2-3 frames before scanout
+	//! (measured: waitable-only left R at ~62 ms on this path).
+	UINT last_present_count;
 
 	//! Child window context (non-NULL only when child window fallback is active).
 	struct child_window_context *child_ctx;
@@ -368,6 +406,9 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 		desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 	}
 	desc.Flags = 0;
+	if (dxr_late_weave_enabled() && !use_transparent) {
+		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	}
 
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
 	fs_desc.Windowed = TRUE;
@@ -448,6 +489,13 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
+	}
+
+	if ((desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
+		target->swapchain->SetMaximumFrameLatency(1);
+		target->frame_latency_waitable = target->swapchain->GetFrameLatencyWaitableObject();
+		U_LOG_W("Late-weave: D3D12 swapchain waitable, max latency 1 (waitable=%p)",
+		        target->frame_latency_waitable);
 	}
 
 	// Transparent path: bind the composition swapchain to the HWND through DComp.
@@ -554,6 +602,11 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 		target->dcomp_device->Release();
 	}
 
+	if (target->frame_latency_waitable != nullptr) {
+		CloseHandle(target->frame_latency_waitable);
+		target->frame_latency_waitable = nullptr;
+	}
+
 	if (target->swapchain != nullptr) {
 		target->swapchain->Release();
 	}
@@ -564,10 +617,41 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	*target_ptr = nullptr;
 }
 
+extern "C" void
+comp_d3d12_target_weave_mark(struct comp_d3d12_target *target)
+{
+	if (target->frame_latency_waitable != nullptr) {
+		// Queue cap: with max latency 1 this releases right after DWM picks
+		// up the previous present.
+		WaitForSingleObject(target->frame_latency_waitable, 100);
+
+		// Scanout pacing: DWM pickup is 2-3 frames before glass on composed
+		// presents, so additionally wait until DXGI frame statistics report
+		// the previous present actually flipped — the DXGI equivalent of
+		// the VK path's vkWaitForPresentKHR pacing. Bounded to ~3 refreshes
+		// so an occluded window (stats stop advancing) never wedges us.
+		if (target->last_present_count != 0) {
+			for (int i = 0; i < 50; i++) {
+				DXGI_FRAME_STATISTICS stats = {};
+				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
+				if (FAILED(shr) || stats.PresentCount >= target->last_present_count) {
+					break;
+				}
+				Sleep(1);
+			}
+		}
+	}
+	g_weave_latency_d3d12.mark_weave("d3d12");
+}
+
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	g_weave_latency_d3d12.after_present("d3d12", target->swapchain);
+	if (SUCCEEDED(hr) && target->frame_latency_waitable != nullptr) {
+		target->swapchain->GetLastPresentCount(&target->last_present_count);
+	}
 	if (FAILED(hr)) {
 		U_LOG_E("Present failed: 0x%08x", hr);
 		return XRT_ERROR_D3D;

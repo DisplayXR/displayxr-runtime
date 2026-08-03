@@ -27,6 +27,31 @@
 // regardless of their alpha mode). See the use_transparent gate below.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+#include "util/comp_weave_latency_win.h"
+
+// One in-process D3D11 target per compositor per app process — file-scope
+// harness + late-weave state (mirrors comp_d3d12_target.cpp; the target
+// struct is memset-adjacent zero-init so C++ members live at file scope).
+static weave_latency_log g_weave_latency_d3d11;
+
+static bool
+dxr_late_weave_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		// Default ON: late-weave is the product behavior on every path
+		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
+		const char *e = getenv("DXR_LATE_WEAVE");
+		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+// Late-weave pacing state (single target per process on this path).
+static HANDLE g_frame_latency_waitable = nullptr;
+static UINT g_last_present_count = 0;
+
 
 /*!
  * D3D11 target structure.
@@ -174,6 +199,9 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 	}
 	desc.Flags = 0;
+	if (dxr_late_weave_enabled() && !use_transparent) {
+		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	}
 
 	HRESULT hr;
 	if (use_transparent) {
@@ -191,6 +219,18 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
 		delete target;
 		return XRT_ERROR_D3D;
+	}
+
+	if ((desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
+		IDXGISwapChain2 *sc2 = nullptr;
+		if (SUCCEEDED(target->swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
+		                                                reinterpret_cast<void **>(&sc2)))) {
+			sc2->SetMaximumFrameLatency(1);
+			g_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+			sc2->Release();
+			U_LOG_W("Late-weave: D3D11 in-process swapchain waitable, max latency 1 (waitable=%p)",
+			        g_frame_latency_waitable);
+		}
 	}
 
 	// Disable Alt-Enter fullscreen toggle (HWND-bound only — composition swapchains
@@ -277,6 +317,12 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 
 	comp_d3d11_target *target = *target_ptr;
 
+	if (g_frame_latency_waitable != nullptr) {
+		CloseHandle(g_frame_latency_waitable);
+		g_frame_latency_waitable = nullptr;
+		g_last_present_count = 0;
+	}
+
 	if (target->rtv != nullptr) {
 		target->rtv->Release();
 	}
@@ -352,10 +398,37 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
 	internals->context->RSSetViewports(1, &viewport);
 }
 
+extern "C" void
+comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
+{
+	// Late-weave pacing: waitable caps the queue; the scanout-stats loop
+	// waits for the previous present to actually flip to glass (DWM pickup
+	// releases the waitable 2-3 frames early on composed presents — see
+	// comp_d3d12_target.cpp). Bounded so occluded windows never wedge.
+	if (g_frame_latency_waitable != nullptr) {
+		WaitForSingleObject(g_frame_latency_waitable, 100);
+		if (g_last_present_count != 0) {
+			for (int i = 0; i < 50; i++) {
+				DXGI_FRAME_STATISTICS stats = {};
+				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
+				if (FAILED(shr) || stats.PresentCount >= g_last_present_count) {
+					break;
+				}
+				Sleep(1);
+			}
+		}
+	}
+	g_weave_latency_d3d11.mark_weave("d3d11");
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval)
 {
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	g_weave_latency_d3d11.after_present("d3d11", target->swapchain);
+	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {
+		target->swapchain->GetLastPresentCount(&g_last_present_count);
+	}
 	if (FAILED(hr)) {
 		U_LOG_E("Present failed: 0x%08x", hr);
 
