@@ -370,6 +370,12 @@ struct comp_vk_native_compositor
 	uint32_t tap_target_w, tap_target_h;
 	uint32_t tap_region_w, tap_region_h;
 
+	//! #837 — fence for the windowed path's per-frame submit. Waiting this
+	//! instead of vkQueueWaitIdle scopes the CPU stall to OUR submission
+	//! (identical on a single-queue iGPU, strictly narrower elsewhere) and
+	//! is the stepping stone for deferred present. Lazily created.
+	VkFence frame_fence;
+
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
 	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
@@ -3396,9 +3402,22 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    .pCommandBuffers = &cmd,
 			};
 
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+			// #837: wait a fence scoped to THIS submit instead of draining
+			// the whole queue — same wall time on the single-queue iGPU,
+			// strictly narrower elsewhere, and the prerequisite for
+			// deferring the present off the frame's critical path.
+			if (c->frame_fence == VK_NULL_HANDLE) {
+				VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+				vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
+			}
+			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, c->frame_fence);
 			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
+				if (c->frame_fence != VK_NULL_HANDLE) {
+					vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, &c->frame_fence);
+				} else {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+				}
 			}
 
 			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -3498,6 +3517,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
 	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)
+	if (c->frame_fence != VK_NULL_HANDLE) {
+		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
+		c->frame_fence = VK_NULL_HANDLE;
+	}
+
 	vk_release_local2d_state(c);
 
 	// Destroy DP input crop image
