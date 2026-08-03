@@ -1404,17 +1404,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Get required device extensions
-    std::vector<const char*> deviceExtensions;
-    std::vector<std::string> extensionStorage;
-    if (!GetVulkanDeviceExtensions(xr, vkInstance, physDevice, deviceExtensions, extensionStorage)) {
-        LOG_ERROR("Failed to get Vulkan device extensions");
-        vkDestroyInstance(vkInstance, nullptr);
-        CleanupOpenXR(xr);
-        ShutdownLogging();
-        return 1;
-    }
-
     // Find graphics queue family
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
@@ -1428,7 +1417,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Create logical device
     VkDevice vkDevice = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
-    if (!CreateVulkanDevice(physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
+    if (!CreateVulkanDevice(xr, physDevice, queueFamilyIndex, vkDevice, graphicsQueue)) {
         LOG_ERROR("Vulkan device creation failed");
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);
