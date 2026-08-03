@@ -3218,6 +3218,9 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// to the window's panel position. Must precede process_atlas.
 				vk_update_present_origin(c);
 
+				// Weave-latency harness mark (env-gated no-op otherwise).
+				comp_vk_native_target_weave_mark(c->target);
+
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
 				    c->display_processor,

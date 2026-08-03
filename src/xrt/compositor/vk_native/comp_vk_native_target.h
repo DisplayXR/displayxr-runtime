@@ -106,6 +106,13 @@ xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target);
 
 /*!
+ * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the
+ * weave is recorded for the current frame. No-op when the harness is off.
+ */
+void
+comp_vk_native_target_weave_mark(struct comp_vk_native_target *target);
+
+/*!
  * Get target dimensions.
  *
  * @ingroup comp_vk_native
