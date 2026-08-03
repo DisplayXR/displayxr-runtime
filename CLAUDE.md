@@ -33,6 +33,7 @@ Each graphics API gets a native compositor — no interop, no Vulkan intermediar
 - Layer boundaries, the vendor-isolation rule, and "must NOT contain" constraints: `docs/architecture/separation-of-concerns.md`
 - Why per-API compositors: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`. Compositor never weaves (that's the DP's job): `docs/adr/ADR-007-compositor-never-weaves.md`
 - Compositor pipeline: `docs/architecture/compositor-pipeline.md`
+- Transparency modes (live/baked × shaped/unshaped vocabulary, per-app table): `docs/architecture/transparency-modes.md`
 - Display processor vtable design (all 5 API variants): `docs/archive/vendor-integration-historical.md`
 
 ### Source tree (`src/xrt/`)

@@ -49,6 +49,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — layer boundaries (authoritative)
 - **[Project Structure](architecture/project-structure.md)** — source tree organization
 - **[Compositor Pipeline](architecture/compositor-pipeline.md)** — end-to-end rendering pipeline (single-app)
+- **[Transparency Modes](architecture/transparency-modes.md)** — canonical vocabulary: live/baked composition × shaped/unshaped windows, costs, rules, per-app table
 - **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
