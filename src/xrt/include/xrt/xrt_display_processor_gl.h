@@ -326,6 +326,30 @@ struct xrt_display_processor_gl
 	 * full target presented. Appended per ADR-020 (append-only).
 	 */
 	void (*set_shared_texture_present)(struct xrt_display_processor_gl *xdp, bool enabled);
+	/*!
+	 * Per-frame presentation-timing feedback for the weave-latency control
+	 * loop. The runtime reports the MEASURED weave→scanout residual of the
+	 * most recently completed frame (DXGI frame statistics: SyncQPCTime of
+	 * the last flipped present minus that frame's weave-record time) plus
+	 * the display refresh period, so the DP can feed the vendor eye
+	 * predictor an exact motion-to-photon horizon (setLatency) instead of a
+	 * heuristic. Under late-weave pacing the residual sits at ~1 refresh;
+	 * unpaced paths report their true (larger) value — the point of
+	 * measuring rather than assuming. Called at most once per frame, before
+	 * process_atlas.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⇒ the DP
+	 * keeps its own horizon heuristic. Appended per ADR-020.
+	 *
+	 * @param xdp                  Pointer to self.
+	 * @param weave_to_scanout_ns  Measured residual of the last completed
+	 *                             frame; 0 = unknown / not yet measured.
+	 * @param frame_period_ns      Display refresh period; 0 = unknown.
+	 */
+	void (*set_frame_timing)(struct xrt_display_processor_gl *xdp,
+	                         uint64_t weave_to_scanout_ns,
+	                         uint64_t frame_period_ns);
+
 };
 
 /*
@@ -375,7 +399,16 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, publish_local_zone_m
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, clear_local_zone_mask)        == XRT_DP_GL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_transparent_background)   == XRT_DP_GL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_shared_texture_present)   == XRT_DP_GL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_frame_timing)            == XRT_DP_GL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the set_frame_timing slot, so a plug-in
+ * built against an older runtime can #ifdef-guard its implementation — the
+ * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
+ */
+#define XRT_DP_GL_HAS_FRAME_TIMING 1
+
 // clang-format on
 
 /*!
@@ -695,6 +728,24 @@ xrt_display_processor_gl_destroy(struct xrt_display_processor_gl **xdp_ptr)
 	*xdp_ptr = NULL;
 }
 
+
+
+/*!
+ * @copydoc xrt_display_processor_gl::set_frame_timing
+ * No-op if not supported (slot absent or NULL) — the DP then keeps its own
+ * horizon heuristic.
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline void
+xrt_display_processor_gl_set_frame_timing(struct xrt_display_processor_gl *xdp,
+                                           uint64_t weave_to_scanout_ns,
+                                           uint64_t frame_period_ns)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_frame_timing) || xdp->set_frame_timing == NULL) {
+		return;
+	}
+	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
 
 #ifdef __cplusplus
 }

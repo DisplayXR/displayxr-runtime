@@ -421,6 +421,13 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 	g_weave_latency_d3d11.mark_weave("d3d11");
 }
 
+extern "C" uint64_t
+comp_d3d11_target_get_measured_weave_ns(struct comp_d3d11_target *target)
+{
+	(void)target;
+	return g_weave_latency_d3d11.measured_r_ns;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval)
 {

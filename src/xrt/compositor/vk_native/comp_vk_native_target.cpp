@@ -205,6 +205,14 @@ struct comp_vk_native_target
 	bool present_wait_probed;
 	uint64_t present_id_counter;
 	uint64_t last_present_id;
+
+	//! Weave→scanout measurement for the DP timing feedback loop
+	//! (set_frame_timing): the acquire pacer waits for the previous
+	//! present to hit glass, so at wait-return "now − that frame's
+	//! weave-record QPC" IS the measured residual.
+	uint64_t weave_mark_qpc;
+	uint64_t last_present_weave_qpc;
+	uint64_t measured_r_ns;
 #endif
 
 	//! Window handle.
@@ -1592,15 +1600,26 @@ void
 comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 {
 #ifdef XRT_OS_WINDOWS
-	struct wl_harness *wl = wl_get(target);
-	if (wl == nullptr) {
-		return;
-	}
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
-	wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+	target->weave_mark_qpc = (uint64_t)now.QuadPart; // always: feeds set_frame_timing
+	struct wl_harness *wl = wl_get(target);
+	if (wl != nullptr) {
+		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+	}
 #else
 	(void)target;
+#endif
+}
+
+uint64_t
+comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	return target->measured_r_ns;
+#else
+	(void)target;
+	return 0;
 #endif
 }
 
@@ -1661,8 +1680,16 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	if (dxr_late_weave_enabled() && target->last_present_id != 0) {
 		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
 		if (wait_fn != nullptr) {
-			wait_fn(vk->device, target->swapchain, target->last_present_id,
-			        100ull * 1000 * 1000);
+			VkResult wres = wait_fn(vk->device, target->swapchain, target->last_present_id,
+			                        100ull * 1000 * 1000);
+			if (wres == VK_SUCCESS && target->last_present_weave_qpc != 0) {
+				LARGE_INTEGER now2, freq2;
+				QueryPerformanceCounter(&now2);
+				QueryPerformanceFrequency(&freq2);
+				target->measured_r_ns = (uint64_t)(
+				    (double)((uint64_t)now2.QuadPart - target->last_present_weave_qpc) *
+				    1000000000.0 / (double)freq2.QuadPart);
+			}
 		}
 	}
 #endif
@@ -1772,6 +1799,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
 		target->last_present_id = wl_id;
+		target->last_present_weave_qpc = target->weave_mark_qpc;
 		if (wl != nullptr) {
 			LARGE_INTEGER now;
 			QueryPerformanceCounter(&now);

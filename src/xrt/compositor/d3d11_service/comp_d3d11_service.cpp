@@ -8396,6 +8396,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		    mc->display_processor,
 		    compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED);
 		g_weave_latency_workspace.mark_weave("workspace");
+		// Timing feedback: measured weave→scanout of the last completed frame
+		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
+		// predictor's exact horizon.
+		xrt_display_processor_d3d11_set_frame_timing(
+		    mc->display_processor, g_weave_latency_workspace.measured_r_ns,
+		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(
 		    mc->display_processor, sys->context.get(), dp_input_srv,
 		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
@@ -11409,6 +11415,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			        (int)sys->hardware_display_3d, (int)use_zero_copy, (int)c->atlas_flip_y);
 		}
 		g_weave_latency_standalone.mark_weave("standalone");
+		// Timing feedback (see workspace path above).
+		xrt_display_processor_d3d11_set_frame_timing(
+		    c->render.display_processor, g_weave_latency_standalone.measured_r_ns,
+		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,
 		    input_view_w, input_view_h, eff_tile_columns, eff_tile_rows,

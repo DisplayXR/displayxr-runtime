@@ -3293,6 +3293,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// Weave-latency harness mark (env-gated no-op otherwise).
 				comp_vk_native_target_weave_mark(c->target);
 
+				// Timing feedback: hand the DP last frame's MEASURED
+				// weave→scanout residual so the vendor eye predictor
+				// runs with an exact horizon (0 = unknown ⟹ DP heuristic).
+				xrt_display_processor_vk_set_frame_timing(
+				    (struct xrt_display_processor_vk *)c->display_processor,
+				    comp_vk_native_target_get_measured_weave_ns(c->target),
+				    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
 				    c->display_processor,

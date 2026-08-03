@@ -172,6 +172,31 @@ struct xrt_display_processor_vk
 	 * @param panel_y  Window client-area top edge, panel-relative pixels.
 	 */
 	void (*set_present_origin)(struct xrt_display_processor_vk *xdp, int32_t panel_x, int32_t panel_y);
+
+	/*!
+	 * Per-frame presentation-timing feedback for the weave-latency control
+	 * loop. The runtime reports the MEASURED weave→scanout residual of the
+	 * most recently completed frame (VK_KHR_present_wait glass time minus
+	 * that frame's weave-record time) plus the display refresh period, so
+	 * the DP can feed the vendor eye predictor an exact motion-to-photon
+	 * horizon (setLatency) instead of a heuristic. Under late-weave pacing
+	 * the residual sits at ~1 refresh; unpaced paths report their true
+	 * (larger) value — the whole point of measuring rather than assuming.
+	 * Called at most once per frame, before @ref process_atlas.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP keeps its own horizon heuristic. Appended after
+	 * @ref set_present_origin per ADR-020 (append-only within a major; no
+	 * version bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp                  Pointer to self.
+	 * @param weave_to_scanout_ns  Measured residual of the last completed
+	 *                             frame; 0 = unknown / not yet measured.
+	 * @param frame_period_ns      Display refresh period; 0 = unknown.
+	 */
+	void (*set_frame_timing)(struct xrt_display_processor_vk *xdp,
+	                         uint64_t weave_to_scanout_ns,
+	                         uint64_t frame_period_ns);
 };
 
 /*!
@@ -182,6 +207,13 @@ struct xrt_display_processor_vk
  * (runtime#757 / LeiaSR#85).
  */
 #define XRT_DP_VK_HAS_PRESENT_ORIGIN 1
+
+/*!
+ * Defined when this header carries the @ref xrt_display_processor_vk::set_frame_timing
+ * slot — same coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_PRESENT_ORIGIN,
+ * for the weave-latency control loop landing across runtime + vendor plug-in.
+ */
+#define XRT_DP_VK_HAS_FRAME_TIMING 1
 
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
@@ -209,7 +241,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparent_back
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, notify_target_recreated)    == sizeof(struct xrt_display_processor) + 1 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_shared_texture_present) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_present_origin)          == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_frame_timing)            == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -311,6 +344,31 @@ xrt_display_processor_vk_set_present_origin(struct xrt_display_processor_vk *xdp
 	}
 	xdp->set_present_origin(xdp, panel_x, panel_y);
 	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_frame_timing
+ *
+ * No-op if not supported (the plug-in's `base.struct_size` doesn't cover the
+ * slot, or the pointer is NULL) — the DP then keeps its own horizon heuristic.
+ * Like the wrappers above, the presence check reads `xdp->base.struct_size`
+ * because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
+                                          uint64_t weave_to_scanout_ns,
+                                          uint64_t frame_period_ns)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end = (const char *)&xdp->set_frame_timing + sizeof(xdp->set_frame_timing);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_frame_timing == NULL) {
+		return;
+	}
+	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
 }
 
 #ifdef __cplusplus
