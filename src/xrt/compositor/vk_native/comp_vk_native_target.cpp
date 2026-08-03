@@ -110,11 +110,26 @@ dxr_present_alpha_mode(void)
  * apps do when the runtime advertises the extensions); when the proc is
  * missing the harness stays dormant.
  */
+/*
+ * Late-weave (DXR_LATE_WEAVE=1): pace the frame on the PREVIOUS present
+ * hitting glass (vkWaitForPresentKHR in acquire) — the VK equivalent of the
+ * D3D11 frame-latency waitable. The whole record+weave+submit+present then
+ * runs inside one refresh interval and the FIFO queue stays empty.
+ */
+static bool
+dxr_late_weave_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE");
+		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 struct wl_harness
 {
 	FILE *f = nullptr;
-	PFN_vkWaitForPresentKHR wait_fn = nullptr;
-	uint64_t next_present_id = 1;
 	uint64_t pending_weave_qpc = 0;
 	std::thread waiter;
 	std::mutex mtx;
@@ -179,6 +194,14 @@ struct comp_vk_native_target
 #ifdef XRT_OS_WINDOWS
 	//! Weave-latency harness state (nullptr unless DXR_WEAVE_LATENCY_CSV set).
 	struct wl_harness *wl;
+
+	//! Present-id state shared by the harness and late-weave pacing.
+	//! Ids are per-swapchain; reset on recreate. 0 = present_wait probed
+	//! and unavailable; resolved lazily.
+	PFN_vkWaitForPresentKHR present_wait_fn;
+	bool present_wait_probed;
+	uint64_t present_id_counter;
+	uint64_t last_present_id;
 #endif
 
 	//! Window handle.
@@ -298,6 +321,15 @@ create_swapchain(struct comp_vk_native_target *target)
 	target->height = extent.height;
 
 	uint32_t image_count = caps.minImageCount + 1;
+#ifdef XRT_OS_WINDOWS
+	// Late-weave: request the floor. The +1 exists for acquire throughput,
+	// but every extra image is another refresh of FIFO present-queue depth —
+	// measured 95.8 ms weave->scanout on this path with the default chain.
+	// With present_wait pacing (below) the queue never fills anyway.
+	if (dxr_late_weave_enabled()) {
+		image_count = caps.minImageCount;
+	}
+#endif
 	if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
 		image_count = caps.maxImageCount;
 	}
@@ -1436,6 +1468,26 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
  * when disabled or when vkWaitForPresentKHR is unavailable on this device
  * (extension/feature not enabled by the app).
  */
+/*
+ * Resolve vkWaitForPresentKHR once per target. Non-null only when the app
+ * enabled the present_id/present_wait features at device creation.
+ */
+static PFN_vkWaitForPresentKHR
+target_present_wait_fn(struct comp_vk_native_target *target)
+{
+	if (!target->present_wait_probed) {
+		struct vk_bundle *vk = target->vk;
+		target->present_wait_fn =
+		    (PFN_vkWaitForPresentKHR)vk->vkGetDeviceProcAddr(vk->device, "vkWaitForPresentKHR");
+		target->present_wait_probed = true;
+		if (target->present_wait_fn == nullptr && (dxr_late_weave_enabled() || getenv("DXR_WEAVE_LATENCY_CSV"))) {
+			U_LOG_W("vkWaitForPresentKHR unavailable (app did not enable "
+			        "VK_KHR_present_wait) — late-weave pacing/harness dormant");
+		}
+	}
+	return target->present_wait_fn;
+}
+
 static struct wl_harness *
 wl_get(struct comp_vk_native_target *target)
 {
@@ -1454,11 +1506,7 @@ wl_get(struct comp_vk_native_target *target)
 		}
 	}
 
-	struct vk_bundle *vk = target->vk;
-	auto wait_fn = (PFN_vkWaitForPresentKHR)vk->vkGetDeviceProcAddr(vk->device, "vkWaitForPresentKHR");
-	if (wait_fn == nullptr) {
-		U_LOG_W("Weave-latency harness: vkWaitForPresentKHR unavailable "
-		        "(app did not enable VK_KHR_present_wait) — harness dormant");
+	if (target_present_wait_fn(target) == nullptr) {
 		probed = 0;
 		return nullptr;
 	}
@@ -1473,14 +1521,14 @@ wl_get(struct comp_vk_native_target *target)
 
 	auto *wl = new wl_harness();
 	wl->f = f;
-	wl->wait_fn = wait_fn;
 	LARGE_INTEGER freq;
 	QueryPerformanceFrequency(&freq);
 	fprintf(f, "H,%lld\n", (long long)freq.QuadPart);
 
 	// Waiter: timestamps each present id hitting glass. 100 ms wait slices so
 	// teardown/recreate never blocks long on an in-flight wait.
-	wl->waiter = std::thread([target, wl]() {
+	PFN_vkWaitForPresentKHR wait_fn = target->present_wait_fn;
+	wl->waiter = std::thread([target, wl, wait_fn]() {
 		struct vk_bundle *vk = target->vk;
 		for (;;) {
 			uint64_t id = 0;
@@ -1494,7 +1542,7 @@ wl_get(struct comp_vk_native_target *target)
 				wl->ids.pop_front();
 			}
 			for (int i = 0; i < 20; i++) { // ≤2 s per id, sliced
-				VkResult r = wl->wait_fn(vk->device, target->swapchain, id, 100ull * 1000 * 1000);
+				VkResult r = wait_fn(vk->device, target->swapchain, id, 100ull * 1000 * 1000);
 				if (r == VK_TIMEOUT && !wl->stop) {
 					continue;
 				}
@@ -1600,6 +1648,22 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	}
 #endif
 
+#ifdef XRT_OS_WINDOWS
+	// Late-weave pacing: block until the PREVIOUS present hit glass before
+	// starting this frame. Everything downstream (record, weave with a fresh
+	// eye prediction, submit, present) then runs inside the current refresh
+	// interval and the FIFO present queue never accumulates depth — the VK
+	// twin of the D3D11 waitable-swapchain pacing. Timeout covers occluded
+	// windows where presents stop reaching glass.
+	if (dxr_late_weave_enabled() && target->last_present_id != 0) {
+		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
+		if (wait_fn != nullptr) {
+			wait_fn(vk->device, target->swapchain, target->last_present_id,
+			        100ull * 1000 * 1000);
+		}
+	}
+#endif
+
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
@@ -1611,8 +1675,10 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 #ifdef XRT_OS_WINDOWS
 		// Present ids are per-swapchain; drop the harness (it lazily
-		// re-arms on the new swapchain with a fresh id sequence).
+		// re-arms on the new swapchain) and reset the id sequence.
 		wl_teardown(target);
+		target->present_id_counter = 0;
+		target->last_present_id = 0;
 #endif
 
 		vk->vkDeviceWaitIdle(vk->device);
@@ -1683,13 +1749,14 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 	};
 
 #ifdef XRT_OS_WINDOWS
-	// Weave-latency harness: tag this present so the waiter thread can
-	// timestamp its scanout via vkWaitForPresentKHR.
+	// Tag this present with a VkPresentIdKHR when either consumer needs it:
+	// the weave-latency harness (waiter thread timestamps scanout) or the
+	// late-weave pacer (acquire waits on the previous id hitting glass).
 	struct wl_harness *wl = wl_get(target);
 	uint64_t wl_id = 0;
 	VkPresentIdKHR present_id = {};
-	if (wl != nullptr) {
-		wl_id = wl->next_present_id++;
+	if ((wl != nullptr || dxr_late_weave_enabled()) && target_present_wait_fn(target) != nullptr) {
+		wl_id = ++target->present_id_counter;
 		present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
 		present_id.swapchainCount = 1;
 		present_id.pPresentIds = &wl_id;
@@ -1700,20 +1767,23 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 	VkResult res = vk->vkQueuePresentKHR(vk->main_queue->queue, &present_info);
 
 #ifdef XRT_OS_WINDOWS
-	if (wl != nullptr && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
-		LARGE_INTEGER now;
-		QueryPerformanceCounter(&now);
-		{
-			std::lock_guard<std::mutex> lock(wl->mtx);
-			if (wl->pending_weave_qpc != 0) {
-				fprintf(wl->f, "F,%llu,%llu,%llu,%llu\n", (unsigned long long)wl_id,
-				        (unsigned long long)wl->pending_weave_qpc,
-				        (unsigned long long)now.QuadPart, (unsigned long long)wl_id);
-				wl->pending_weave_qpc = 0;
+	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+		target->last_present_id = wl_id;
+		if (wl != nullptr) {
+			LARGE_INTEGER now;
+			QueryPerformanceCounter(&now);
+			{
+				std::lock_guard<std::mutex> lock(wl->mtx);
+				if (wl->pending_weave_qpc != 0) {
+					fprintf(wl->f, "F,%llu,%llu,%llu,%llu\n", (unsigned long long)wl_id,
+					        (unsigned long long)wl->pending_weave_qpc,
+					        (unsigned long long)now.QuadPart, (unsigned long long)wl_id);
+					wl->pending_weave_qpc = 0;
+				}
+				wl->ids.push_back(wl_id);
 			}
-			wl->ids.push_back(wl_id);
+			wl->cv.notify_one();
 		}
-		wl->cv.notify_one();
 	}
 #endif
 
