@@ -77,7 +77,7 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
 | avatar (`displayxr-demo-avatar`) | baked + shaped (borderless) / baked + unshaped (framed `B` positioning mode) | Silhouette+bubble region; `B`-mode client bake is documented semantics. |
 | modelviewer (`displayxr-demo-modelviewer`) | opaque scene default; `Ctrl+T` = baked + shaped, chrome hidden, RMB-drag to move | Region from view-0 alpha via `dxr::ClickThroughRegion`; toast band kept in-region. |
 | gaussiansplat (`displayxr-demo-gaussiansplat`) | baked + unshaped *(shaping wiring pending)* | Kit-cached HUD landed; punch-through follows the modelviewer recipe. |
-| Unity provider overlay | shaped (region from rendered alpha); present path = whatever the runtime session uses | The origin of the shaping technique; gets baked composition with the same env, no plugin changes. |
+| Unity provider overlay | shaped (region from rendered alpha); present path = whatever the runtime session uses | The origin of the shaping technique; gets baked composition with the same env, no plugin changes. **Known gap:** on the D3D12 DP, baked mode currently shows a black silhouette halo + opaque/square Local2D bubbles (leia-plugin#126, alpha-sentinel gate; D3D11-DP sentinel-free design is the fix reference) — baked+shaped is not a recommended mode on the D3D12 DP until it lands. |
 
 Present-path env: `DXR_PRESENT_OPAQUE` (default off). App-side building
 blocks: displayxr-common ≥ v2.6.0 (`vk_overlay_kit.h`,
