@@ -14,6 +14,7 @@
 #include "vk/vk_helpers.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 
 #include <cstring>
@@ -27,6 +28,28 @@
 #include <d3d11_1.h>
 #include <dxgi1_3.h>
 #include <dcomp.h>
+
+// Decoupled presentation (#833): with DXR_PRESENT_OPAQUE=1 the bridge
+// presents through an HWND flip-model swapchain (ALPHA_MODE_IGNORE, no DComp
+// visual) - eligible for Hardware Independent Flip on the app's
+// WS_EX_NOREDIRECTIONBITMAP window - while the DP keeps compose-under-bg, so
+// the see-through look survives (the baked desktop makes the output opaque
+// by construction). A DComp visual costs full Composed: Flip regardless of
+// alpha mode, and the VK WSI opaque path needs a redirection surface NRB
+// windows lack - both measured dead ends on Intel UHD.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
+
+static inline DXGI_ALPHA_MODE
+dxr_present_alpha_mode(void)
+{
+	if (debug_get_bool_option_present_opaque()) {
+		U_LOG_W("DXR_PRESENT_OPAQUE: composition swapchain uses ALPHA_MODE_IGNORE "
+		        "(opaque present, DP compose-under-bg keeps the look, #833)");
+		return DXGI_ALPHA_MODE_IGNORE;
+	}
+	return DXGI_ALPHA_MODE_PREMULTIPLIED;
+}
+
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -53,6 +76,7 @@
 #include <vulkan/vulkan_xcb.h>
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
+
 #endif
 
 #define DCOMP_RING 2 // Number of shared back-buffers in the bridge ring
@@ -658,6 +682,15 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		return false;
 	}
 
+	// Decoupled presentation (#833): with DXR_PRESENT_OPAQUE=1, present the
+	// bridge through an HWND flip-model swapchain instead of DComp. The app's
+	// WS_EX_NOREDIRECTIONBITMAP window takes flip-model presents directly and
+	// is eligible for Hardware Independent Flip; a DComp visual stays at full
+	// Composed: Flip cost regardless of alpha mode (measured), and the VK WSI
+	// opaque path presents via a GDI/redirection mechanism NRB windows lack.
+	// The transparent look survives via the DP's compose-under-bg.
+	const bool present_opaque = debug_get_bool_option_present_opaque();
+
 	DXGI_SWAP_CHAIN_DESC1 desc = {};
 	desc.Width = w;
 	desc.Height = h;
@@ -666,38 +699,55 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	desc.BufferCount = DCOMP_RING;
 	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+	desc.AlphaMode = dxr_present_alpha_mode(); // #833: IGNORE when present_opaque
 
-	hr = dxgi_factory->CreateSwapChainForComposition(target->dcomp_dx_device, &desc, NULL,
-	                                                  &target->dcomp_swapchain);
+	if (present_opaque) {
+		DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
+		fs_desc.Windowed = TRUE;
+		hr = dxgi_factory->CreateSwapChainForHwnd(target->dcomp_dx_device, hwnd, &desc, &fs_desc,
+		                                           NULL, &target->dcomp_swapchain);
+		if (SUCCEEDED(hr)) {
+			dxgi_factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+			U_LOG_W("DXR_PRESENT_OPAQUE: bridge presents via HWND flip-model swapchain "
+			        "(no DComp visual, #833)");
+		}
+	} else {
+		hr = dxgi_factory->CreateSwapChainForComposition(target->dcomp_dx_device, &desc, NULL,
+		                                                  &target->dcomp_swapchain);
+	}
 	dxgi_factory->Release();
 	if (FAILED(hr) || target->dcomp_swapchain == NULL) {
-		U_LOG_W("DComp bridge: CreateSwapChainForComposition failed: 0x%08x", hr);
+		U_LOG_W("DComp bridge: swapchain create failed (present_opaque=%d): 0x%08x", (int)present_opaque,
+		        hr);
 		return false;
 	}
 
-	hr = DCompositionCreateDevice2(NULL, __uuidof(IDCompositionDevice),
-	                                (void **)&target->dcomp_dcomp_device);
-	if (FAILED(hr) || target->dcomp_dcomp_device == NULL) {
-		U_LOG_W("DComp bridge: DCompositionCreateDevice2 failed: 0x%08x", hr);
-		return false;
-	}
-	hr = target->dcomp_dcomp_device->CreateTargetForHwnd(hwnd, /*topmost*/ TRUE,
-	                                                      &target->dcomp_dcomp_target);
-	if (FAILED(hr) || target->dcomp_dcomp_target == NULL) {
-		U_LOG_W("DComp bridge: CreateTargetForHwnd failed: 0x%08x", hr);
-		return false;
-	}
-	hr = target->dcomp_dcomp_device->CreateVisual(&target->dcomp_dcomp_visual);
-	if (FAILED(hr) || target->dcomp_dcomp_visual == NULL) {
-		U_LOG_W("DComp bridge: CreateVisual failed: 0x%08x", hr);
-		return false;
-	}
-	if (FAILED(target->dcomp_dcomp_visual->SetContent(target->dcomp_swapchain)) ||
-	    FAILED(target->dcomp_dcomp_target->SetRoot(target->dcomp_dcomp_visual)) ||
-	    FAILED(target->dcomp_dcomp_device->Commit())) {
-		U_LOG_W("DComp bridge: visual setup failed");
-		return false;
+	// DComp binding only on the transparent-present path — the opaque path's
+	// swapchain is HWND-bound already (#833).
+	if (!present_opaque) {
+		hr = DCompositionCreateDevice2(NULL, __uuidof(IDCompositionDevice),
+		                                (void **)&target->dcomp_dcomp_device);
+		if (FAILED(hr) || target->dcomp_dcomp_device == NULL) {
+			U_LOG_W("DComp bridge: DCompositionCreateDevice2 failed: 0x%08x", hr);
+			return false;
+		}
+		hr = target->dcomp_dcomp_device->CreateTargetForHwnd(hwnd, /*topmost*/ TRUE,
+		                                                      &target->dcomp_dcomp_target);
+		if (FAILED(hr) || target->dcomp_dcomp_target == NULL) {
+			U_LOG_W("DComp bridge: CreateTargetForHwnd failed: 0x%08x", hr);
+			return false;
+		}
+		hr = target->dcomp_dcomp_device->CreateVisual(&target->dcomp_dcomp_visual);
+		if (FAILED(hr) || target->dcomp_dcomp_visual == NULL) {
+			U_LOG_W("DComp bridge: CreateVisual failed: 0x%08x", hr);
+			return false;
+		}
+		if (FAILED(target->dcomp_dcomp_visual->SetContent(target->dcomp_swapchain)) ||
+		    FAILED(target->dcomp_dcomp_target->SetRoot(target->dcomp_dcomp_visual)) ||
+		    FAILED(target->dcomp_dcomp_device->Commit())) {
+			U_LOG_W("DComp bridge: visual setup failed");
+			return false;
+		}
 	}
 
 	// Create the ring of KMT-shared D3D11 textures and import each as a VkImage.
@@ -810,7 +860,7 @@ dcomp_present(struct comp_vk_native_target *target)
 		U_LOG_E("DComp bridge: Present failed: 0x%08x", hr);
 		return XRT_ERROR_VULKAN;
 	}
-	target->dcomp_dcomp_device->Commit();
+	if (target->dcomp_dcomp_device != NULL) { target->dcomp_dcomp_device->Commit(); }
 	return XRT_SUCCESS;
 }
 
@@ -1605,7 +1655,7 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		target->dcomp_ring_idx = 0;
 		target->current_index = 0;
 		target->generation++; // #602: image set rebuilt — invalidate DP caches.
-		target->dcomp_dcomp_device->Commit();
+		if (target->dcomp_dcomp_device != NULL) { target->dcomp_dcomp_device->Commit(); }
 		return XRT_SUCCESS;
 	}
 #endif

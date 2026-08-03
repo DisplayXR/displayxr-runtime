@@ -22,6 +22,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
@@ -74,6 +75,12 @@ struct comp_settings
 /*!
  * The D3D12 native compositor structure.
  */
+// Decoupled presentation (#833): same env the target reads. On a transparent
+// session the DP's alpha-gate flattens against the captured desktop (plugin
+// #116), so the post-weave Local2D composite must flatten too instead of
+// emitting DWM-dependent alpha.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque_comp, "DXR_PRESENT_OPAQUE", false)
+
 struct comp_d3d12_compositor
 {
 	//! Base type - must be first!
@@ -137,6 +144,11 @@ struct comp_d3d12_compositor
 
 	//! True if shared texture mode is active (offscreen rendering).
 	bool has_shared_texture;
+
+	//! Transparent session (#573): the DP composes-under-bg. With
+	//! DXR_PRESENT_OPAQUE (#833) this also flips the Local2D composite into
+	//! its flatten mode (plugin #116 flattens the gate).
+	bool transparent_background;
 
 	//! #727 dual-tap diagnostics (DXR_WEAVE_TAP): a post-composite dump is
 	//! pending for this frame; index names the output file.
@@ -2614,6 +2626,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->owns_window = false;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
+	c->transparent_background = transparent_background;
 	c->hud = NULL;
 	c->hud_texture = nullptr;
 	c->hud_upload_buffer = nullptr;
@@ -4692,10 +4705,15 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		composite_logged = true;
 	}
 
+	// #833/#116 — opaque present on a transparent session: DWM completes no
+	// blends, so the composite flattens against the weave (which the DP's
+	// flattened gate already completed against the captured desktop) and
+	// emits α=1. Opaque sessions keep today's behavior even with the env set.
+	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
 	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), twod_res, mask_res,
 	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u,
-	    composite_mode);
+	    composite_mode, opaque_present);
 
 	// Restore steady states: dst → caller's post state, scratches → COMMON.
 	// twod_res is the local2d scratch that supplied the 2D pixels; it sits in

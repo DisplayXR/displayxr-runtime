@@ -225,6 +225,15 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
  *                           gates only the weave by zone geometry, the 2D
  *                           composites on top by its own alpha). Ignored on
  *                           the rect path.
+ * @param opaque_present     #833/#116 opaque present (DXR_PRESENT_OPAQUE on a
+ *                           transparent session): DWM completes no blends, so
+ *                           the composite flattens instead of emitting alpha —
+ *                           the DP's flattened gate baked the captured desktop
+ *                           into the weave wherever the atlas was transparent,
+ *                           so ZONES/ALPHA_OVER collapse to a premul-over of
+ *                           the 2D onto the weave and LERP completes its 2D
+ *                           side against the weave; α=1 everywhere. Ignored on
+ *                           the rect path (no weave bound there).
  * @ingroup aux_vk
  */
 #define VK_LOCAL2D_COMPOSITE_MODE_LERP 0u
@@ -246,7 +255,8 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           int32_t cy,
                           uint32_t cw,
                           uint32_t ch,
-                          uint32_t composite_mode);
+                          uint32_t composite_mode,
+                          bool opaque_present);
 
 /*!
  * Destroy composite resources.

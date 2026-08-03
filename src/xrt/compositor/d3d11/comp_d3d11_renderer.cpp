@@ -38,8 +38,10 @@ struct LayerConstants
 /*!
  * Masked 2D-over-3D composite constant buffer (unified-2d-3d-compositing #439,
  * Phase 0). Matches `cbuffer CompositeParams : register(b0)` in
- * shaders/masked_composite.hlsl. 32 bytes; HLSL packs as two float4 rows with
- * no straddle (dst_dims.xy | canvas_origin.xy , canvas_size.xy | mask | pad).
+ * shaders/masked_composite.hlsl. 48 bytes; HLSL packs as three float4 rows
+ * with no straddle (dst_dims.xy | canvas_origin.xy , canvas_size.xy | mask |
+ * mode , opaque_present | pad) — the trailing pad keeps sizeof a multiple of
+ * 16 for CreateBuffer.
  */
 struct CompositeParams
 {
@@ -48,6 +50,8 @@ struct CompositeParams
 	float canvas_size[2];   // 3D canvas sub-rect size (px)
 	uint32_t use_rect_mask;  // 1 = Phase 0 analytic rect mask
 	uint32_t composite_mode; // COMP_D3D11_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
+	uint32_t opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
+	uint32_t pad[3];
 };
 
 /*!
@@ -401,6 +405,7 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_size;
     uint   use_rect_mask;
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
+    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 };
 
 struct VS_OUTPUT
@@ -435,6 +440,26 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 
     float4 twod  = twod_tex.Sample(samp, input.uv);
     float4 weave = weave_tex.Sample(samp, input.uv);
+    if (opaque_present == 1)
+    {
+        // Opaque present (runtime #833 / plugin #116): DWM completes no
+        // blends, so never emit alpha < 1. The DP's flattened gate already
+        // baked the captured desktop into the weave wherever the atlas was
+        // transparent (2D bands, outside every zone), so the weave IS the
+        // background here: ZONES and ALPHA_OVER collapse to a premul-over
+        // of the 2D onto the flattened weave (the M weave-gate would
+        // discard that baked desktop); LERP keeps M but completes the 2D
+        // side the same way. Zone-edge feather becomes a no-op (both mix
+        // ends hold woven content inside the ramp) — a documented semantic
+        // of the mode.
+        float3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
+        if (composite_mode == 0)
+        {
+            float M = saturate(mask_tex.Sample(samp, input.uv).r);
+            return float4(M * weave.rgb + (1.0 - M) * over, 1.0);
+        }
+        return float4(over, 1.0);
+    }
     if (composite_mode == 1)
     {
         // #491: the 2D layer's own (premultiplied) alpha IS the blend —
@@ -1987,7 +2012,8 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
                                         int32_t cy,
                                         uint32_t cw,
                                         uint32_t ch,
-                                        uint32_t composite_mode)
+                                        uint32_t composite_mode,
+                                        bool opaque_present)
 {
 	if (renderer == nullptr || dst_texture == nullptr || twod_srv == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -2055,6 +2081,8 @@ comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
 	// authored mask and run the lerp.
 	params.use_rect_mask = (mask_srv == nullptr) ? 1 : 0;
 	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
+	// #833/#116 — the flatten needs the weave, so it stays off on the rect path.
+	params.opaque_present = (mask_srv != nullptr && opaque_present) ? 1 : 0;
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);

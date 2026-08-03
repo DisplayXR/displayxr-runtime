@@ -30,6 +30,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
@@ -103,6 +104,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+
+// Decoupled presentation (#833): same env the targets read. On a transparent
+// session the DP's alpha-gate flattens against the captured desktop (plugin
+// #116), so the post-weave Local2D composite must flatten too instead of
+// emitting DWM-dependent alpha.
+DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 /*!
  * Minimal settings struct for Vulkan compositor.
@@ -300,6 +307,17 @@ struct comp_vk_native_compositor
 	//! at the projection-done boundary (PROJECTION_ONLY) or end of
 	//! frame (POST_COMPOSE).
 	struct u_capture_intent capture_intent;
+
+	//! Composite-tap diagnostics (#833 debugging): the Local2D composite
+	//! stashes this frame's target + scratch state here so the
+	//! `displayxr_composite_tap_trigger` file (in %TEMP%) can dump the
+	//! final target, the weave snapshot (post-DP/gate) and the flattened
+	//! 2D scratch as PNGs at end of layer_commit. Zeroed at the top of
+	//! each commit; only valid on frames where the composite ran.
+	VkImage tap_target_image;
+	VkImageLayout tap_target_layout;
+	uint32_t tap_target_w, tap_target_h;
+	uint32_t tap_region_w, tap_region_h;
 
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
@@ -2243,6 +2261,189 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	return ok;
 }
 
+// Composite-tap diagnostics (#833 debugging): dump one BGRA8 image to PNG.
+// Same staging pattern as vk_native_capture_atlas_to_png but parameterized on
+// image/dims/layout, and optionally KEEPING alpha (the flattened 2D scratch's
+// alpha is the diagnostic signal). Restores the image to @p layout.
+static bool
+vk_native_dump_image_to_png(struct comp_vk_native_compositor *c,
+                            VkImage image,
+                            uint32_t w,
+                            uint32_t h,
+                            VkImageLayout layout,
+                            VkAccessFlags access,
+                            VkPipelineStageFlags stage,
+                            bool keep_alpha,
+                            const char *path)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (image == VK_NULL_HANDLE || w == 0 || h == 0) {
+		return false;
+	}
+	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	if (cmd_pool == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VkDeviceSize bytes = (VkDeviceSize)w * (VkDeviceSize)h * 4;
+	VkBuffer staging_buf = VK_NULL_HANDLE;
+	VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+	uint8_t *mapped = NULL;
+
+	VkBufferCreateInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = bytes,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bi, NULL, &staging_buf) != VK_SUCCESS) {
+		return false;
+	}
+	VkMemoryRequirements mreq;
+	vk->vkGetBufferMemoryRequirements(vk->device, staging_buf, &mreq);
+	uint32_t mem_type = 0;
+	if (!vk_native_find_host_visible_memory_type(vk, mreq.memoryTypeBits, &mem_type)) {
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mreq.size,
+	    .memoryTypeIndex = mem_type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, &staging_mem) != VK_SUCCESS ||
+	    vk->vkBindBufferMemory(vk->device, staging_buf, staging_mem, 0) != VK_SUCCESS) {
+		if (staging_mem != VK_NULL_HANDLE) vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo cbai = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &cbai, &cmd) != VK_SUCCESS) {
+		vk->vkFreeMemory(vk->device, staging_mem, NULL);
+		vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+		return false;
+	}
+	VkCommandBufferBeginInfo cbi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &cbi);
+
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .oldLayout = layout,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    .srcAccessMask = access,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	};
+	vk->vkCmdPipelineBarrier(cmd, stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+
+	VkBufferImageCopy region = {
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageExtent = {w, h, 1},
+	};
+	vk->vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 1, &region);
+
+	b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.newLayout = layout;
+	b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.dstAccessMask = access;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, stage, 0, 0, NULL, 0, NULL, 1, &b);
+
+	vk->vkEndCommandBuffer(cmd);
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+
+	bool ok = false;
+	if (vk->vkMapMemory(vk->device, staging_mem, 0, bytes, 0, (void **)&mapped) == VK_SUCCESS) {
+		// Composite target + scratches are B8G8R8A8_UNORM — swap to RGBA.
+		uint8_t *rgba = malloc((size_t)bytes);
+		if (rgba != NULL) {
+			for (VkDeviceSize i = 0; i < bytes; i += 4) {
+				rgba[i + 0] = mapped[i + 2];
+				rgba[i + 1] = mapped[i + 1];
+				rgba[i + 2] = mapped[i + 0];
+				rgba[i + 3] = mapped[i + 3];
+			}
+			if (!keep_alpha) {
+				u_image_force_opaque_rgba8(rgba, w, h, (size_t)w * 4);
+			}
+			ok = stbi_write_png(path, (int)w, (int)h, 4, rgba, (int)w * 4) != 0;
+			free(rgba);
+		}
+		vk->vkUnmapMemory(vk->device, staging_mem);
+	}
+	vk->vkFreeMemory(vk->device, staging_mem, NULL);
+	vk->vkDestroyBuffer(vk->device, staging_buf, NULL);
+	return ok;
+}
+
+// Composite-tap trigger (#833 debugging): when %TEMP%\displayxr_composite_tap_trigger
+// exists, dump this frame's final target / weave snapshot / flattened 2D
+// scratch next to it and delete the trigger. Windows-only diagnostic.
+static void
+vk_native_dispatch_composite_tap(struct comp_vk_native_compositor *c)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->tap_target_image == VK_NULL_HANDLE) {
+		return;
+	}
+	static char trigger[512] = {0};
+	static char out_dir[512] = {0};
+	if (trigger[0] == '\0') {
+		const char *tmp = getenv("TEMP");
+		if (tmp == NULL || tmp[0] == '\0') {
+			tmp = "C:\\Temp";
+		}
+		snprintf(trigger, sizeof(trigger), "%s\\displayxr_composite_tap_trigger", tmp);
+		snprintf(out_dir, sizeof(out_dir), "%s", tmp);
+	}
+	if (GetFileAttributesA(trigger) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trigger);
+
+	char path[600];
+	snprintf(path, sizeof(path), "%s\\displayxr_tap_target.png", out_dir);
+	bool ok_t = vk_native_dump_image_to_png(c, c->tap_target_image, c->tap_target_w, c->tap_target_h,
+	                                        c->tap_target_layout,
+	                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, false, path);
+	snprintf(path, sizeof(path), "%s\\displayxr_tap_weave.png", out_dir);
+	bool ok_w = vk_native_dump_image_to_png(c, c->weave_scratch, c->tap_region_w, c->tap_region_h,
+	                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                                        VK_ACCESS_SHADER_READ_BIT,
+	                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, false, path);
+	snprintf(path, sizeof(path), "%s\\displayxr_tap_twod.png", out_dir);
+	bool ok_2 = vk_native_dump_image_to_png(c, c->local2d_scratch, c->tap_region_w, c->tap_region_h,
+	                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                                        VK_ACCESS_SHADER_READ_BIT,
+	                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, true, path);
+	U_LOG_W("VK composite tap: target=%d weave=%d twod=%d (%ux%u region %ux%u) -> %s",
+	        ok_t, ok_w, ok_2, c->tap_target_w, c->tap_target_h, c->tap_region_w, c->tap_region_h,
+	        out_dir);
+#else
+	(void)c;
+#endif
+}
+
 // Run the capture readback if the per-frame intent matches @p mode_filter.
 // Caller polls intent at top of layer_commit; this fires at each boundary.
 static void
@@ -2358,6 +2559,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+
+	// Composite-tap state is per-frame: only valid when this frame's
+	// Local2D composite runs and re-stashes it.
+	c->tap_target_image = VK_NULL_HANDLE;
 
 	// #439 Phase 3 — per-frame Local2D accumulator flag (read by
 	// vk_effective_canvas + vk_composite_local_2d). Set once here so it reflects
@@ -3157,6 +3362,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// (projection + window-space + quads) the DP just received. Skipped
 	// when intent is for projection-only (consumed earlier) or empty.
 	vk_native_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+
+	// Composite-tap diagnostics (#833 debugging) — trigger-file dump of the
+	// final target / weave snapshot / flattened 2D scratch.
+	vk_native_dispatch_composite_tap(c);
 
 	return XRT_SUCCESS;
 }
@@ -5291,9 +5500,14 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_LERP;
 	}
 #endif
+	// #833/#116 — opaque present on a transparent session: DWM completes no
+	// blends, so the composite flattens against the weave (which the DP's
+	// flattened gate already completed against the captured desktop) and
+	// emits α=1. Opaque sessions keep today's behavior even with the env set.
+	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque();
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch, composite_mode);
+	                          region_h, cx, cy, cw, ch, composite_mode, opaque_present);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
@@ -5312,6 +5526,15 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, dst_outgoing,
 	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, k_color_sub);
+
+	// Composite-tap diagnostics (#833 debugging): stash this frame's images
+	// for the end-of-commit trigger dump.
+	c->tap_target_image = dst_image;
+	c->tap_target_layout = dst_outgoing;
+	c->tap_target_w = dst_w;
+	c->tap_target_h = dst_h;
+	c->tap_region_w = region_w;
+	c->tap_region_h = region_h;
 	return true;
 }
 
