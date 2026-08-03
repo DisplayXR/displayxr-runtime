@@ -51,6 +51,12 @@ using namespace xrt::auxiliary::d3d;
  * Accepted: "igpu"/"integrated", "dgpu"/"discrete", or an adapter index.
  * Returns an adapter or nullptr when unset/invalid (normal selection).
  * D3D sibling of the Vulkan-side DXR_VK_FORCE_GPU.
+ *
+ * SUPPORTED CONTRACT (#845): clients (e.g. the Unity plugin's Target GPU
+ * setting) build on this name and these semantics — do not rename, drop, or
+ * change classification without the deprecation path in
+ * docs/reference/adapter-selection.md. The getenv() read means in-process
+ * clients must set it via the CRT (_putenv_s), not SetEnvironmentVariableW.
  */
 static wil::com_ptr<IDXGIAdapter>
 env_forced_d3d_adapter()

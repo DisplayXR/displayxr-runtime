@@ -563,6 +563,9 @@ device_debug_print(struct vk_bundle *vk, const VkPhysicalDeviceProperties *pdp, 
  * ("igpu"/"integrated", "dgpu"/"discrete"). Returns -1 when unset/invalid
  * (normal selection applies); a keyword that matches no present device also
  * returns -1 so a copied-around env var cannot brick an app.
+ *
+ * SUPPORTED CONTRACT (#845): same stability promise and in-process getenv()
+ * caveat as DXR_D3D_FORCE_GPU — see docs/reference/adapter-selection.md.
  */
 static int
 env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count)
