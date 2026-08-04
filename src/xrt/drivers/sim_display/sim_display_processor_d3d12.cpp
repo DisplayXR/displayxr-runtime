@@ -250,6 +250,20 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		return;
 	}
 
+	// #854: this DP samples the atlas through root descriptor table 0. A zero
+	// GPU handle is not bindable — it is the descriptor corruption the debug
+	// layer flags and the retail-UMD AV of #854 (a pre-fix runtime passes 0).
+	// Skip the draw instead of recording an invalid bind.
+	if (atlas_srv_gpu_handle == 0) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("sim_display D3D12: atlas SRV GPU handle is 0 (runtime predates #854 fix?) — "
+			        "skipping DP draw");
+		}
+		return;
+	}
+
 	// Read the current mode (may change at runtime via 1/2/3 keys).
 	// Single-view input forces passthrough — 3D shaders need ≥2 views.
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
