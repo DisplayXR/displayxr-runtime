@@ -1580,6 +1580,43 @@ d3d12_compositor_dispatch_capture(struct comp_d3d12_compositor *c, uint32_t mode
 }
 
 
+// #854: write @p dp_resource's SRV into dp_srv_heap, bind the heap on the open
+// cmd_list, and return the GPU handle for process_atlas. The sim DP samples the
+// atlas through root descriptor table 0, and until now both call sites passed
+// literal 0 (the SR weaver takes its input via setInputViewTexture and ignores
+// the handle) — binding GPU VA 0 is what the debug layer reports as descriptor
+// corruption and what retail UMDs intermittently AV on (nvwgf2umx, #854).
+// Rewriting the single slot every frame is safe: layer_commit ends in an
+// unconditional Signal+Wait, so the GPU never reads last frame's descriptor
+// while this one is written. Returns 0 (DPs must then skip sampling) only when
+// the heap is missing.
+static uint64_t
+d3d12_bind_dp_atlas_srv(struct comp_d3d12_compositor *c, ID3D12Resource *dp_resource)
+{
+	if (c->dp_srv_heap == nullptr || dp_resource == nullptr) {
+		return 0;
+	}
+
+	D3D12_RESOURCE_DESC dp_desc = dp_resource->GetDesc();
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	// Typeless atlases (and anything unviewable) fall back to the path's
+	// R8G8B8A8_UNORM contract — the same format process_atlas advertises.
+	srv_desc.Format = (dp_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? DXGI_FORMAT_R8G8B8A8_UNORM
+	                                                                    : dp_desc.Format;
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Texture2D.MipLevels = 1;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	c->device->CreateShaderResourceView(dp_resource, &srv_desc,
+	                                    c->dp_srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+	// Every later pass in this cmd_list (renderer draw, zone composite,
+	// Local2D flatten) binds its own heap before use, so this bind is scoped
+	// to the DP call that follows.
+	ID3D12DescriptorHeap *heaps[] = {c->dp_srv_heap};
+	c->cmd_list->SetDescriptorHeaps(1, heaps);
+	return c->dp_srv_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+}
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2032,7 +2069,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->display_processor,
 			    c->cmd_list,
 			    dp_resource,
-			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
+			    d3d12_bind_dp_atlas_srv(c, dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
 			    st_rtv.ptr,
 			    c->shared_texture,
 			    view_width, view_height,
@@ -2303,7 +2340,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->display_processor,
 			    c->cmd_list,
 			    dp_resource,
-			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
+			    d3d12_bind_dp_atlas_srv(c, dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
 			    rtv_handle.ptr,
 			    back_buffer,
 			    view_width, view_height,
