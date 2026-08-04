@@ -183,6 +183,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 		RELATIVE_RUNTIME_DIR ${CMAKE_INSTALL_BINDIR}
 		OUT_FILENAME "DisplayXR_win64.json"
 		)
+	# #852 — also stage the manifest NEXT TO the DLL (_package/bin/). The
+	# top-level copy above is written for the installer's flat layout
+	# (library_path ".\DisplayXRClient.dll"), so inside the staging tree it
+	# points at a DLL that isn't there and the OpenXR loader silently falls
+	# back to the registry ActiveRuntime — apps run, look healthy, and
+	# measure the WRONG runtime. The bin/ copy is valid in-tree; point
+	# XR_RUNTIME_JSON at _package/bin/DisplayXR_win64.json for dev runs
+	# (and always verify the per-app log's "loaded from:" line).
+	generate_openxr_runtime_manifest_at_install(
+		RUNTIME_DIR_RELATIVE_TO_MANIFEST .
+		RUNTIME_TARGET ${RUNTIME_TARGET}
+		DESTINATION ${CMAKE_INSTALL_BINDIR}
+		RELATIVE_RUNTIME_DIR ${CMAKE_INSTALL_BINDIR}
+		OUT_FILENAME "DisplayXR_win64.json"
+		)
 	install(
 		TARGETS ${RUNTIME_TARGET}
 		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Runtime
