@@ -34,6 +34,10 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 // would clobber the logger's -1 sentinel).
 static weave_latency_log g_weave_latency_d3d12;
 
+// Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
+// auto-backoff. Lives at file scope for the same memset reason as the log.
+static late_weave_governor g_lw_gov_d3d12;
+
 // Late-weave (DXR_LATE_WEAVE=1): same gate as the D3D11 service / VK native
 // compositors — waitable swapchain, max frame latency 1, weave paced to the
 // waitable so the eye prediction is ~1 refresh old at scanout.
@@ -498,9 +502,11 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	}
 
 	if ((desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
-		target->swapchain->SetMaximumFrameLatency(1);
+		const int lat = g_lw_gov_d3d12.base_latency();
+		target->swapchain->SetMaximumFrameLatency(lat);
 		target->frame_latency_waitable = target->swapchain->GetFrameLatencyWaitableObject();
-		U_LOG_W("Late-weave: D3D12 swapchain waitable, max latency 1 (waitable=%p)",
+		U_LOG_W("Late-weave: D3D12 swapchain waitable, max latency %d%s (waitable=%p)", lat,
+		        (lat == 1 && g_lw_gov_d3d12.auto_backoff == 1) ? " + saturation auto-backoff" : "",
 		        target->frame_latency_waitable);
 	}
 
@@ -636,11 +642,15 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target)
 		// the previous present actually flipped — the DXGI equivalent of
 		// the VK path's vkWaitForPresentKHR pacing. Bounded to ~3 refreshes
 		// so an occluded window (stats stop advancing) never wedges us.
-		if (target->last_present_count != 0) {
+		// At effective depth L>1 (#850) the pacer targets the present L-1
+		// back instead, restoring L-1 frames of CPU/GPU overlap.
+		const UINT relax = (UINT)(g_lw_gov_d3d12.effective - 1);
+		if (target->last_present_count > relax) {
+			const UINT pace_target = target->last_present_count - relax;
 			for (int i = 0; i < 50; i++) {
 				DXGI_FRAME_STATISTICS stats = {};
 				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
-				if (FAILED(shr) || stats.PresentCount >= target->last_present_count) {
+				if (FAILED(shr) || stats.PresentCount >= pace_target) {
 					break;
 				}
 				Sleep(1);
@@ -648,6 +658,22 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target)
 		}
 	}
 	g_weave_latency_d3d12.mark_weave("d3d12");
+	if (target->frame_latency_waitable != nullptr) {
+		const int tr = g_lw_gov_d3d12.on_mark(g_weave_latency_d3d12.freq());
+		if (tr != 0) {
+			target->swapchain->SetMaximumFrameLatency((UINT)g_lw_gov_d3d12.effective);
+			static bool logged_backoff = false, logged_return = false;
+			bool &logged = (tr > 0) ? logged_backoff : logged_return;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("Late-weave: saturation %s -> max latency %d "
+				        "(frame interval %.1f ms vs display period %.1f ms)",
+				        tr > 0 ? "backoff engaged" : "cleared, probing return",
+				        g_lw_gov_d3d12.effective, g_lw_gov_d3d12.interval_ema_ns / 1e6,
+				        g_lw_gov_d3d12.period_ns / 1e6);
+			}
+		}
+	}
 }
 
 extern "C" uint64_t
@@ -661,7 +687,7 @@ extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
-	g_weave_latency_d3d12.after_present("d3d12", target->swapchain);
+	g_weave_latency_d3d12.after_present("d3d12", target->swapchain, &g_lw_gov_d3d12);
 	if (SUCCEEDED(hr) && target->frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&target->last_present_count);
 	}

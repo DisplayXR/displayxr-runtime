@@ -130,6 +130,23 @@ dxr_late_weave_enabled()
 	return enabled == 1;
 }
 
+// #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1). N>1 paces on the
+// present N-1 back, restoring N-1 frames of CPU/GPU overlap on a saturated
+// pipeline at the cost of that much extra weave-time prediction horizon.
+// (The DXGI paths additionally auto-back-off on measured saturation; the VK
+// pacer honors the explicit knob only for now.)
+static int
+vk_late_weave_max_latency()
+{
+	static int lat = -1;
+	if (lat < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_MAX_LATENCY");
+		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
+		lat = v < 1 ? 1 : (v > 3 ? 3 : v);
+	}
+	return lat;
+}
+
 struct wl_harness
 {
 	FILE *f = nullptr;
@@ -213,6 +230,12 @@ struct comp_vk_native_target
 	uint64_t weave_mark_qpc;
 	uint64_t last_present_weave_qpc;
 	uint64_t measured_r_ns;
+
+	//! #850: per-present weave-record QPC ring (indexed id % 4) so the pacer
+	//! can resolve the residual of the present it actually waited on when
+	//! DXR_LATE_WEAVE_MAX_LATENCY > 1 targets an older id.
+	uint64_t present_qpc_ring_id[4];
+	uint64_t present_qpc_ring[4];
 #endif
 
 	//! Window handle.
@@ -337,7 +360,10 @@ create_swapchain(struct comp_vk_native_target *target)
 	// but every extra image is another refresh of FIFO present-queue depth —
 	// measured 95.8 ms weave->scanout on this path with the default chain.
 	// With present_wait pacing (below) the queue never fills anyway.
-	if (dxr_late_weave_enabled()) {
+	// At DXR_LATE_WEAVE_MAX_LATENCY > 1 (#850) keep the +1: the relaxed
+	// pacer deliberately runs a frame of queue depth, and the floor count
+	// would make acquire the bottleneck instead of the pacer.
+	if (dxr_late_weave_enabled() && vk_late_weave_max_latency() == 1) {
 		image_count = caps.minImageCount;
 	}
 #endif
@@ -1680,15 +1706,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	if (dxr_late_weave_enabled() && target->last_present_id != 0) {
 		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
 		if (wait_fn != nullptr) {
-			VkResult wres = wait_fn(vk->device, target->swapchain, target->last_present_id,
-			                        100ull * 1000 * 1000);
-			if (wres == VK_SUCCESS && target->last_present_weave_qpc != 0) {
-				LARGE_INTEGER now2, freq2;
-				QueryPerformanceCounter(&now2);
-				QueryPerformanceFrequency(&freq2);
-				target->measured_r_ns = (uint64_t)(
-				    (double)((uint64_t)now2.QuadPart - target->last_present_weave_qpc) *
-				    1000000000.0 / (double)freq2.QuadPart);
+			// #850: at depth L>1 pace on the present L-1 back instead of
+			// the latest one, restoring L-1 frames of overlap.
+			const uint64_t relax = (uint64_t)(vk_late_weave_max_latency() - 1);
+			const uint64_t wait_id =
+			    target->last_present_id > relax ? target->last_present_id - relax : 0;
+			if (wait_id != 0) {
+				VkResult wres =
+				    wait_fn(vk->device, target->swapchain, wait_id, 100ull * 1000 * 1000);
+				const uint64_t weave_qpc =
+				    (target->present_qpc_ring_id[wait_id % 4] == wait_id)
+				        ? target->present_qpc_ring[wait_id % 4]
+				        : 0;
+				if (wres == VK_SUCCESS && weave_qpc != 0) {
+					LARGE_INTEGER now2, freq2;
+					QueryPerformanceCounter(&now2);
+					QueryPerformanceFrequency(&freq2);
+					target->measured_r_ns = (uint64_t)(
+					    (double)((uint64_t)now2.QuadPart - weave_qpc) *
+					    1000000000.0 / (double)freq2.QuadPart);
+				}
 			}
 		}
 	}
@@ -1800,6 +1837,8 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
 		target->last_present_id = wl_id;
 		target->last_present_weave_qpc = target->weave_mark_qpc;
+		target->present_qpc_ring_id[wl_id % 4] = wl_id;
+		target->present_qpc_ring[wl_id % 4] = target->weave_mark_qpc;
 		if (wl != nullptr) {
 			LARGE_INTEGER now;
 			QueryPerformanceCounter(&now);
