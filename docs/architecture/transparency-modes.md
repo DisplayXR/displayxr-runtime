@@ -57,17 +57,21 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
    are clean; animated content behind the blend band is the residual case.
    True dynamic live↔baked switching on drag brackets would need runtime
    swapchain recreation — not implemented, by choice.
-6. **Window-space-stamped chrome is additionally broken under baked
-   composition** (leia-plugin#121, open): present in the DP's input atlas,
-   missing from its gated output. Local2D chrome (post-weave composite) is
-   the proven path if chrome must show while transparent.
-7. **Late-weave latency-1 pacing halves a saturated pipeline** (#850, open):
-   the opaque flip chain enables the late-weave waitable (maxFrameLatency=1),
-   which removes all frame overlap — measured on a GPU-saturated Unity app:
-   ~4 ms better weave R p50 for **−63 % fps** (20 vs 54.5 fps), with the WGC
-   bake exonerated by decomposition. Until the latency knob/auto-backoff
-   lands, a saturated baked app should run `DXR_LATE_WEAVE=0`; the R metric
-   alone hides this trade — always record fps beside it.
+6. **Window-space-stamped chrome under baked composition needs plug-in
+   ≥ v2.1.1** (leia-plugin#121, fixed): older DPs dropped it from the gated
+   output (present in the input atlas, missing after the gate). Local2D
+   chrome (post-weave composite) remains the most portable path.
+7. **Late-weave latency-1 pacing halves a saturated pipeline** — governed
+   since runtime v2.4.1 (#850/#851): the opaque flip chain enables the
+   late-weave waitable (maxFrameLatency=1), which removes all frame
+   overlap — measured on a GPU-saturated Unity app: ~4 ms better weave
+   R p50 for **−63 % fps** (20 vs 54.5 fps), with the WGC bake exonerated
+   by decomposition. The saturation auto-backoff (default-ON) drops to
+   depth 2 when the pipeline can't make rate (one-shot WARN;
+   `DXR_LATE_WEAVE_MAX_LATENCY=N` pins, `DXR_LATE_WEAVE_AUTOBACKOFF=0`
+   opts out). The R metric alone hides this trade — always record fps
+   beside it, and prefer trimming the app under one refresh over relying
+   on the backoff (it is a safety net, not a target).
 
 ## What each app uses
 
@@ -77,7 +81,7 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
 | avatar (`displayxr-demo-avatar`) | baked + shaped (borderless) / baked + unshaped (framed `B` positioning mode) | Silhouette+bubble region; `B`-mode client bake is documented semantics. |
 | modelviewer (`displayxr-demo-modelviewer`) | opaque scene default; `Ctrl+T` = baked + shaped, chrome hidden, RMB-drag to move | Region from view-0 alpha via `dxr::ClickThroughRegion`; toast band kept in-region. |
 | gaussiansplat (`displayxr-demo-gaussiansplat`) | baked + unshaped *(shaping wiring pending)* | Kit-cached HUD landed; punch-through follows the modelviewer recipe. |
-| Unity provider overlay | shaped (region from rendered alpha); present path = whatever the runtime session uses | The origin of the shaping technique; gets baked composition with the same env, no plugin changes. **Known gap:** on the D3D12 DP, baked mode currently shows a black silhouette halo + opaque/square Local2D bubbles (leia-plugin#126, alpha-sentinel gate; D3D11-DP sentinel-free design is the fix reference) — baked+shaped is not a recommended mode on the D3D12 DP until it lands. |
+| Unity provider overlay | shaped (region from rendered alpha); present path = whatever the runtime session uses | The origin of the shaping technique; gets baked composition with the same env, no plugin changes. Baked+shaped on the D3D12 DP requires plug-in ≥ v2.1.1 (leia-plugin#126 replaced the alpha-sentinel gate with the D3D11-style sentinel-free compose-under; halo + opaque-bubble defects on older plug-ins). Works on the default D3D11 path too — no `-force-d3d12` needed. |
 
 Present-path env: `DXR_PRESENT_OPAQUE` (default off). App-side building
 blocks: displayxr-common ≥ v2.6.0 (`vk_overlay_kit.h`,
