@@ -234,6 +234,17 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
  *                           the 2D onto the weave and LERP completes its 2D
  *                           side against the weave; α=1 everywhere. Ignored on
  *                           the rect path (no weave bound there).
+ * @param scissors           #862 — optional cover of the pixels where the
+ *                           composite is NOT the identity, in REGION space.
+ *                           NULL means the whole region (previous behaviour);
+ *                           non-NULL with count 0 skips the pass entirely. One
+ *                           clipped draw is issued per rect. The render pass
+ *                           loads with LOAD_OP_LOAD, so pixels no rect covers
+ *                           keep the weave already in the target. Rects may
+ *                           overlap — the shader output is a pure function of
+ *                           its inputs and blending is off, so a redundant
+ *                           draw is idempotent. Must lie inside the region.
+ * @param scissor_count      Number of rects in @p scissors.
  * @ingroup aux_vk
  */
 #define VK_LOCAL2D_COMPOSITE_MODE_LERP 0u
@@ -256,7 +267,9 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           uint32_t cw,
                           uint32_t ch,
                           uint32_t composite_mode,
-                          bool opaque_present);
+                          bool opaque_present,
+                          const VkRect2D *scissors,
+                          uint32_t scissor_count);
 
 /*!
  * Destroy composite resources.
