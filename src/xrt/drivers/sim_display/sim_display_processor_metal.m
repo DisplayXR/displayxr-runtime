@@ -170,7 +170,7 @@ struct sim_display_processor_metal
 {
 	struct xrt_display_processor_metal base;
 	id<MTLDevice> device;
-	id<MTLRenderPipelineState> pipelines[6]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	id<MTLRenderPipelineState> pipelines[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 	id<MTLSamplerState> sampler;
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -250,6 +250,9 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
 	id<MTLRenderPipelineState> active_pipeline = sdp->pipelines[mode];
+	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "Metal")) {
+		active_pipeline = sdp->pipelines[SIM_DISPLAY_OUTPUT_ANAGLYPH];
+	}
 	if (active_pipeline == nil) {
 		return;
 	}
@@ -333,7 +336,7 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		sdp->pipelines[i] = nil;
 	}
 	sdp->sampler = nil;
@@ -369,10 +372,13 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		return false;
 	}
 
-	NSString *frag_names[6] = {@"sbs_fragment", @"anaglyph_fragment", @"blend_fragment", @"squeezed_sbs_fragment", @"quad_fragment", @"passthrough_fragment"};
-	const char *mode_names[6] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad", "Passthrough"};
+	NSString *frag_names[SIM_DP_PIPELINE_COUNT] = {@"sbs_fragment",  @"anaglyph_fragment",
+	                                               @"blend_fragment", @"squeezed_sbs_fragment",
+	                                               @"quad_fragment",  @"passthrough_fragment"};
+	const char *mode_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
+	                                                 "Quad", "Passthrough"};
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		id<MTLFunction> frag_fn = [library newFunctionWithName:frag_names[i]];
 		if (frag_fn == nil) {
 			U_LOG_E("sim_display Metal: %s fragment function not found", mode_names[i]);
@@ -586,7 +592,7 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display Metal processor (all 6 pipelines), initial mode: %s",
+	U_LOG_W("Created sim display Metal processor (all %d pipelines), initial mode: %s", SIM_DP_PIPELINE_COUNT,
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :

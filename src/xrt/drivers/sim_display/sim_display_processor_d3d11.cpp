@@ -202,7 +202,7 @@ struct sim_display_processor_d3d11_impl
 {
 	struct xrt_display_processor_d3d11 base;
 	ID3D11VertexShader *vs;
-	ID3D11PixelShader *ps_shaders[6]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	ID3D11PixelShader *ps_shaders[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 	ID3D11SamplerState *sampler;
 	ID3D11Buffer *tile_cb; //!< Constant buffer for tile parameters
 
@@ -320,6 +320,9 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
 	ID3D11PixelShader *active_ps = sdp->ps_shaders[mode];
+	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "D3D11")) {
+		active_ps = sdp->ps_shaders[SIM_DISPLAY_OUTPUT_ANAGLYPH];
+	}
 	if (active_ps == nullptr) {
 		return;
 	}
@@ -419,7 +422,7 @@ sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (sdp->vs != nullptr) {
 		sdp->vs->Release();
 	}
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		if (sdp->ps_shaders[i] != nullptr) {
 			sdp->ps_shaders[i]->Release();
 		}
@@ -784,11 +787,13 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Compile all 6 pixel shaders so runtime switching is instant
-	const char *ps_sources[6] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source, ps_squeezed_sbs_source, ps_quad_source, ps_passthrough_source};
-	const char *ps_names[6] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad", "Passthrough"};
+	// Compile all pixel shaders so runtime switching is instant
+	const char *ps_sources[SIM_DP_PIPELINE_COUNT] = {ps_sbs_source,  ps_anaglyph_source, ps_blend_source,
+	                                                 ps_squeezed_sbs_source, ps_quad_source, ps_passthrough_source};
+	const char *ps_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
+	                                               "Quad", "Passthrough"};
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		ID3DBlob *ps_blob = nullptr;
 		hr = compile_shader(ps_sources[i], "main", "ps_5_0", &ps_blob);
 		if (FAILED(hr)) {
@@ -838,7 +843,7 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display D3D11 processor (all 6 shaders), initial mode: %s",
+	U_LOG_W("Created sim display D3D11 processor (all %d shaders), initial mode: %s", SIM_DP_PIPELINE_COUNT,
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :

@@ -37,7 +37,7 @@
 #include "xrt/xrt_display_zones.h" // caps shape consumed by SIM_ZONE_FILL_CAPS
 #include "util/u_logging.h"
 
-#include "sim_display_interface.h" // sim_display_get_panel_metrics (#856)
+#include "sim_display_interface.h" // sim_display_get_panel_metrics (#856), enum sim_display_output_mode (#842)
 
 #ifdef __cplusplus
 extern "C" {
@@ -231,6 +231,41 @@ sim_zone_downsample_map(const uint8_t *pixels,
 		}                                                                                                      \
 		return (*out_pixel_width > 0 && *out_pixel_height > 0);                                                \
 	}
+//! #842: per-variant pipeline/shader table size — one entry per user-selectable
+//! output mode (enum sim_display_output_mode indexes the table directly).
+#define SIM_DP_PIPELINE_COUNT 6
+
+/*!
+ * #842 — position-preserving substitution rule, shared by all five variants.
+ *
+ * The compositor's zones composite gates the DP output by the zone raster
+ * (out = twod + (1−a)·(M·weave)), which assumes the DP output is
+ * POSITION-PRESERVING: pixel (x,y) shows the content that belongs at (x,y),
+ * as a real weave does. SBS / Squeezed SBS / Quad rearrange the whole canvas,
+ * so masking them to a zone rect shows displaced view fragments — with an
+ * active zone mask they must be replaced by a position-preserving one. We
+ * substitute ANAGLYPH: it already exists in every variant, is a per-pixel
+ * colour combine (so pixel (x,y) keeps showing the content that belongs at
+ * (x,y)), and reads as depth on a flat panel. Anaglyph, Blend and Passthrough
+ * are already position-preserving and stay as selected. One-shot WARN per
+ * variant (static is per-TU).
+ */
+static inline bool
+sim_zone_substitute_position_preserving(enum sim_display_output_mode mode, bool zone_active, const char *variant)
+{
+	if (!zone_active || (mode != SIM_DISPLAY_OUTPUT_SBS && mode != SIM_DISPLAY_OUTPUT_SQUEEZED_SBS &&
+	                     mode != SIM_DISPLAY_OUTPUT_QUAD)) {
+		return false;
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("sim_display %s: zone mask active — substituting position-preserving anaglyph "
+		        "for rearranging output mode %d (#842)",
+		        variant, (int)mode);
+	}
+	return true;
+}
 
 #ifdef __cplusplus
 }
