@@ -4303,7 +4303,13 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	if (xdev != NULL && xdev->rendering_mode_count > 0) {
 		for (uint32_t mi = 0; mi < xdev->rendering_mode_count; mi++) {
 			const struct xrt_rendering_mode *m = &xdev->rendering_modes[mi];
-			U_LOG_W("MODE[%u] '%s': tiles=%ux%u scale=%.2fx%.2f view=%ux%u atlas=%ux%u",
+			// Device-published DISPLAY-scoped table — the worst-case input to
+			// u_tiling_compute_system_atlas below. Per-frame view/atlas dims
+			// are CANVAS-scoped (the app's window when it owns one), so these
+			// legitimately differ from what layer_commit reports; the tag is
+			// here because that difference reads as a bug in a log otherwise.
+			U_LOG_W("MODE[%u] '%s' (display-scoped worst case): tiles=%ux%u scale=%.2fx%.2f "
+			        "view=%ux%u atlas=%ux%u",
 			        mi, m->mode_name, m->tile_columns, m->tile_rows,
 			        m->view_scale_x, m->view_scale_y,
 			        m->view_width_pixels, m->view_height_pixels,
