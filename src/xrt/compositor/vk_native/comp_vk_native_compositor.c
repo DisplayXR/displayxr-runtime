@@ -5272,6 +5272,31 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		return false; // only under-layers (or stale flag) — nothing to overlay
 	}
 
+	// A zones frame with no Local2D layers whose zones cover the WHOLE region has
+	// mask == 1 everywhere, so the composite reduces to `weave` — the identity.
+	// Running it anyway costs a full-region flatten + lerp per frame (measured
+	// ~1.45 ms on an 811x1421 region, Arc iGPU) to produce a bit-identical target.
+	if (rect_count == 0 && zones_frame) {
+		bool covers_region = false;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			const struct xrt_rect r = c->layer_accum.layers[i].data.zone_3d.rect;
+			if (c->layer_accum.layers[i].data.zone_3d.feather_px > 0.0f) {
+				covers_region = false; // a feathered edge is not the identity
+				break;
+			}
+			if (r.offset.w <= 0 && r.offset.h <= 0 && r.extent.w >= (int32_t)region_w &&
+			    r.extent.h >= (int32_t)region_h) {
+				covers_region = true;
+			}
+		}
+		if (covers_region) {
+			return false;
+		}
+	}
+
 	// XR_DXR_display_zones: the auto wish rasterizes from the ZONE rects.
 	struct xrt_rect zone_rects[XRT_MAX_LAYERS];
 	float zone_feathers[XRT_MAX_LAYERS]; // per-zone opt-in feather (runtime#800)
