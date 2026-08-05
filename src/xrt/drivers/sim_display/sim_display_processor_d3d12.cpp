@@ -182,7 +182,7 @@ struct sim_display_processor_d3d12_impl
 {
 	struct xrt_display_processor_d3d12 base;
 	ID3D12RootSignature *root_signature;
-	ID3D12PipelineState *psos[6]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	ID3D12PipelineState *psos[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
@@ -271,6 +271,9 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
 	ID3D12PipelineState *active_pso = sdp->psos[mode];
+	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "D3D12")) {
+		active_pso = sdp->psos[SIM_DISPLAY_OUTPUT_ANAGLYPH];
+	}
 	if (active_pso == nullptr) {
 		return;
 	}
@@ -365,7 +368,7 @@ sim_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 	if (sdp->root_signature != nullptr) {
 		sdp->root_signature->Release();
 	}
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		if (sdp->psos[i] != nullptr) {
 			sdp->psos[i]->Release();
 		}
@@ -657,11 +660,13 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_D3D;
 	}
 
-	// Compile all 6 pixel shaders and create PSOs
-	const char *ps_sources[6] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source, ps_squeezed_sbs_source, ps_quad_source, ps_passthrough_source};
-	const char *ps_names[6] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad", "Passthrough"};
+	// Compile all pixel shaders and create PSOs
+	const char *ps_sources[SIM_DP_PIPELINE_COUNT] = {ps_sbs_source,  ps_anaglyph_source, ps_blend_source,
+	                                                 ps_squeezed_sbs_source, ps_quad_source, ps_passthrough_source};
+	const char *ps_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
+	                                               "Quad", "Passthrough"};
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		ID3DBlob *ps_blob = nullptr;
 		hr = compile_shader(ps_sources[i], "main", "ps_5_0", &ps_blob);
 		if (FAILED(hr)) {
@@ -709,7 +714,7 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	// Set the initial output mode
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display D3D12 processor (all 6 PSOs), initial mode: %s",
+	U_LOG_W("Created sim display D3D12 processor (all %d PSOs), initial mode: %s", SIM_DP_PIPELINE_COUNT,
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :

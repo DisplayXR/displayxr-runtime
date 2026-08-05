@@ -48,7 +48,7 @@ struct sim_display_processor
 	struct xrt_display_processor base;
 	struct vk_bundle *vk;
 	VkRenderPass render_pass;
-	VkPipeline pipelines[6];        //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	VkPipeline pipelines[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 	VkPipelineLayout pipeline_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
@@ -149,6 +149,9 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
 	VkPipeline active_pipeline = sdp->pipelines[mode];
+	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "VK")) {
+		active_pipeline = sdp->pipelines[SIM_DISPLAY_OUTPUT_ANAGLYPH];
+	}
 
 	if (vk == NULL || active_pipeline == VK_NULL_HANDLE) {
 		return;
@@ -354,18 +357,18 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		const uint32_t *code;
 		size_t size;
 		const char *name;
-	} frag_shaders[6] = {
+	} frag_shaders[SIM_DP_PIPELINE_COUNT] = {
 	    {sim_display_shaders_sbs_frag, sizeof(sim_display_shaders_sbs_frag), "SBS"},
 	    {sim_display_shaders_anaglyph_frag, sizeof(sim_display_shaders_anaglyph_frag), "Anaglyph"},
 	    {sim_display_shaders_blend_frag, sizeof(sim_display_shaders_blend_frag), "Blend"},
 	    {sim_display_shaders_squeezed_sbs_frag, sizeof(sim_display_shaders_squeezed_sbs_frag), "Squeezed SBS"},
 	    {sim_display_shaders_quad_frag, sizeof(sim_display_shaders_quad_frag), "Quad"},
 	    {sim_display_shaders_passthrough_frag, sizeof(sim_display_shaders_passthrough_frag), "Passthrough"},
-	};
+		};
 
 	// Create all fragment shader modules upfront (keep alive until all pipelines are created)
-	VkShaderModule frag_modules[6] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-	for (int i = 0; i < 6; i++) {
+	VkShaderModule frag_modules[SIM_DP_PIPELINE_COUNT] = {VK_NULL_HANDLE};
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		ret = create_shader_module(vk, frag_shaders[i].code, frag_shaders[i].size, &frag_modules[i]);
 		if (ret != VK_SUCCESS) {
 			U_LOG_E("sim_display: Failed to create %s fragment shader: %d", frag_shaders[i].name, ret);
@@ -423,9 +426,9 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	};
 
 	// Build all pipeline create infos with their own stage arrays
-	VkPipelineShaderStageCreateInfo all_stages[6][2];
-	VkGraphicsPipelineCreateInfo pipeline_infos[6];
-	for (int i = 0; i < 6; i++) {
+	VkPipelineShaderStageCreateInfo all_stages[SIM_DP_PIPELINE_COUNT][2];
+	VkGraphicsPipelineCreateInfo pipeline_infos[SIM_DP_PIPELINE_COUNT];
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		all_stages[i][0] = (VkPipelineShaderStageCreateInfo){
 		    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		    .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -456,10 +459,11 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	}
 
 	// Create all pipelines in a single batch call
-	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 6, pipeline_infos, NULL, sdp->pipelines);
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, SIM_DP_PIPELINE_COUNT, pipeline_infos, NULL,
+	                                    sdp->pipelines);
 
 	// Destroy all shader modules now that pipelines are created
-	for (int i = 0; i < 6; i++)
+	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++)
 		vk->vkDestroyShaderModule(vk->device, frag_modules[i], NULL);
 	vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
 
@@ -575,7 +579,7 @@ sim_dp_destroy(struct xrt_display_processor *xdp)
 		if (sdp->sampler != VK_NULL_HANDLE) {
 			vk->vkDestroySampler(vk->device, sdp->sampler, NULL);
 		}
-		for (int i = 0; i < 6; i++) {
+		for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 			if (sdp->pipelines[i] != VK_NULL_HANDLE) {
 				vk->vkDestroyPipeline(vk->device, sdp->pipelines[i], NULL);
 			}
@@ -778,7 +782,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display processor (all 6 pipelines), initial mode: %s",
+	U_LOG_W("Created sim display processor (all %d pipelines), initial mode: %s", SIM_DP_PIPELINE_COUNT,
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
