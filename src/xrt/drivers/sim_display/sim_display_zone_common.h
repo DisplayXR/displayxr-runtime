@@ -37,6 +37,8 @@
 #include "xrt/xrt_display_zones.h" // caps shape consumed by SIM_ZONE_FILL_CAPS
 #include "util/u_logging.h"
 
+#include "sim_display_interface.h" // sim_display_get_panel_metrics (#856)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -190,6 +192,45 @@ sim_zone_downsample_map(const uint8_t *pixels,
 			memset((out_caps)->reserved, 0, sizeof((out_caps)->reserved));                                 \
 		}                                                                                                      \
 	} while (0)
+
+/*!
+ * #856 — panel geometry answers shared by all five DP variants.
+ *
+ * The compositor computes WINDOW-scoped Kooima itself, but only if the DP can
+ * answer BOTH of these; a false from either sends it down the display-scoped
+ * fallback, which stretches any viewport whose aspect differs from the panel's
+ * (a tall display-zone renders vertically elongated — the sim-vs-Leia
+ * difference David spotted). Returning 0 pixels before the HMD exists is
+ * treated as "unavailable", so callers must check.
+ */
+#define SIM_ZONE_DEFINE_PANEL_METRIC_FNS(PREFIX, XDP_TYPE)                                                             \
+	static bool PREFIX##_get_display_dimensions(struct XDP_TYPE *xdp, float *out_width_m, float *out_height_m)      \
+	{                                                                                                              \
+		(void)xdp;                                                                                             \
+		if (out_width_m == NULL || out_height_m == NULL) {                                                     \
+			return false;                                                                                  \
+		}                                                                                                      \
+		sim_display_get_panel_metrics(out_width_m, out_height_m, NULL, NULL);                                  \
+		return (*out_width_m > 0.0f && *out_height_m > 0.0f);                                                  \
+	}                                                                                                              \
+	static bool PREFIX##_get_display_pixel_info(struct XDP_TYPE *xdp, uint32_t *out_pixel_width,                   \
+	                                            uint32_t *out_pixel_height, int32_t *out_screen_left,              \
+	                                            int32_t *out_screen_top)                                           \
+	{                                                                                                              \
+		(void)xdp;                                                                                             \
+		if (out_pixel_width == NULL || out_pixel_height == NULL) {                                             \
+			return false;                                                                                  \
+		}                                                                                                      \
+		sim_display_get_panel_metrics(NULL, NULL, out_pixel_width, out_pixel_height);                          \
+		/* sim models a single panel at the desktop origin. */                                                 \
+		if (out_screen_left != NULL) {                                                                         \
+			*out_screen_left = 0;                                                                          \
+		}                                                                                                      \
+		if (out_screen_top != NULL) {                                                                          \
+			*out_screen_top = 0;                                                                            \
+		}                                                                                                      \
+		return (*out_pixel_width > 0 && *out_pixel_height > 0);                                                \
+	}
 
 #ifdef __cplusplus
 }
