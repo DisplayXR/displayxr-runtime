@@ -17,6 +17,9 @@
 #endif
 
 #include "util/comp_layer_accum.h"
+#ifdef XRT_OS_WINDOWS
+#include "util/comp_display_refresh_win.h"
+#endif
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_metrics.h"
@@ -1373,7 +1376,21 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 #endif
 
 	int64_t now_ns = (int64_t)os_monotonic_get_ns();
-	int64_t period_ns = (int64_t)(1000000000.0 / 60.0); // 60 Hz
+	// Panel period, not a 60 Hz constant (a 165 Hz display is 6.06 ms).
+	// Cached: EnumDisplaySettings is a syscall and this runs per frame.
+	int64_t period_ns = (int64_t)(1000000000.0 / 60.0);
+#ifdef XRT_OS_WINDOWS
+	{
+		static float cached_hz = 0.0f;
+		if (cached_hz == 0.0f) {
+			const float hz = comp_display_refresh_hz_win(gl_comp(xc)->hwnd);
+			cached_hz = (hz > 0.0f) ? hz : 60.0f;
+			U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", cached_hz,
+			        1000.0 / cached_hz);
+		}
+		period_ns = (int64_t)(1000000000.0 / cached_hz);
+	}
+#endif
 
 	static int64_t frame_id = 0;
 	*out_frame_id = ++frame_id;

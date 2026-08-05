@@ -10,6 +10,7 @@
 #include "comp_d3d11_compositor.h"
 #include "comp_d3d11_swapchain.h"
 #include "comp_d3d11_target.h"
+#include "util/comp_display_refresh_win.h"
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_window.h"
 
@@ -2306,49 +2307,24 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		U_LOG_I("No DXGI target — offscreen shared texture mode");
 	}
 
-	// Query display refresh rate from DXGI output
+	// Current mode of the monitor this session's window lives on. This used to
+	// walk the output's mode LIST and take the highest supported rate, which
+	// reports 165 Hz for a 165 Hz-capable panel running at 60 — the frame
+	// period handed to the display processor was then wrong by that ratio.
 	c->display_refresh_rate = 60.0f; // Default to 60Hz
-	IDXGIDevice *refresh_dxgi_device = nullptr;
-	hr = c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&refresh_dxgi_device));
-	if (SUCCEEDED(hr) && refresh_dxgi_device != nullptr) {
-		IDXGIAdapter *refresh_adapter = nullptr;
-		refresh_dxgi_device->GetAdapter(&refresh_adapter);
-		if (refresh_adapter != nullptr) {
-			IDXGIOutput *output = nullptr;
-			// Try to get the output containing the window
-			if (SUCCEEDED(refresh_adapter->EnumOutputs(0, &output)) && output != nullptr) {
-				DXGI_OUTPUT_DESC outputDesc;
-				if (SUCCEEDED(output->GetDesc(&outputDesc))) {
-					// Query the display mode list for the output
-					UINT numModes = 0;
-					output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &numModes, nullptr);
-					if (numModes > 0) {
-						DXGI_MODE_DESC *modes = new DXGI_MODE_DESC[numModes];
-						if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0,
-						                                          &numModes, modes))) {
-							// Find the highest refresh rate mode that matches our resolution
-							float best_rate = 0.0f;
-							for (UINT m = 0; m < numModes; m++) {
-								float rate = static_cast<float>(modes[m].RefreshRate.Numerator) /
-								             static_cast<float>(modes[m].RefreshRate.Denominator);
-								if (rate > best_rate) {
-									best_rate = rate;
-								}
-							}
-							if (best_rate > 0.0f) {
-								c->display_refresh_rate = best_rate;
-							}
-						}
-						delete[] modes;
-					}
-				}
-				output->Release();
-			}
-			refresh_adapter->Release();
+	{
+		HWND rate_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		const float hz = comp_display_refresh_hz_win(rate_hwnd);
+		if (hz > 0.0f) {
+			c->display_refresh_rate = hz;
 		}
-		refresh_dxgi_device->Release();
 	}
-	U_LOG_I("Display refresh rate: %.2f Hz", c->display_refresh_rate);
+	U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
+	        1000.0 / c->display_refresh_rate);
+	if (c->target != nullptr) {
+		comp_d3d11_target_set_display_period(
+		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
 
 	// Determine view dimensions for the atlas texture.
 	// Default: derive from window size (half width for 2-view atlas)
