@@ -735,10 +735,17 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
                           uint32_t cw,
                           uint32_t ch,
                           uint32_t composite_mode,
-                          bool opaque_present)
+                          bool opaque_present,
+                          const VkRect2D *scissors,
+                          uint32_t scissor_count)
 {
 	if (!lc->initialized || target_fb == VK_NULL_HANDLE || twod_view == VK_NULL_HANDLE || region_w == 0 ||
 	    region_h == 0) {
+		return;
+	}
+	// #862: no clip rects at all means every pixel would be the identity —
+	// skip the whole pass (checked before the render pass opens).
+	if (scissors != NULL && scissor_count == 0) {
 		return;
 	}
 	// The mask-lerp path samples mask + weave; both must be present together.
@@ -772,9 +779,10 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
 	// region; region-sized inputs sample 1:1.
 	VkViewport vp = {0.0f, 0.0f, (float)region_w, (float)region_h, 0.0f, 1.0f};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{0, 0}, {region_w, region_h}};
-	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
-
+	// #862: clip to the caller's non-identity sub-rect when given. The
+	// viewport still maps uv [0,1] across the whole region, so inputs keep
+	// sampling 1:1 — only the covered pixels change. LOAD_OP_LOAD preserves
+	// everything outside.
 	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->composite_pipe);
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->composite_layout, 0, 1, &set, 0,
 	                            NULL);
@@ -793,7 +801,23 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
 	};
 	vk->vkCmdPushConstants(cmd, lc->composite_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	// #862: one clipped draw per non-identity rect (the whole region when the
+	// caller passes none). The fragment shader's output is a pure function of
+	// its sampled inputs and blending is disabled, so overlapping rects are
+	// idempotent — callers may pass a conservative, overlapping cover.
+	if (scissors == NULL) {
+		VkRect2D full = {{0, 0}, {region_w, region_h}};
+		vk->vkCmdSetScissor(cmd, 0, 1, &full);
+		vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	} else {
+		for (uint32_t i = 0; i < scissor_count; i++) {
+			if (scissors[i].extent.width == 0 || scissors[i].extent.height == 0) {
+				continue;
+			}
+			vk->vkCmdSetScissor(cmd, 0, 1, &scissors[i]);
+			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+		}
+	}
 	vk->vkCmdEndRenderPass(cmd);
 }
 

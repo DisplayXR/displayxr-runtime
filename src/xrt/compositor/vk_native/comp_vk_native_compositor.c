@@ -113,6 +113,11 @@
 // #116), so the post-weave Local2D composite must flatten too instead of
 // emitting DWM-dependent alpha.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
+// #862 — clip the Local2D composite to the pixels where it is not the
+// identity. On by default; DXR_L2D_CLIP=0 restores the full-region pass for
+// A/B measurement (the win is GPU fill, so compare GPU busy time, not the
+// frame-stage timer — that stage also spans the submit + whole-frame wait).
+DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
 
 // Frame pipelining (#837): per-stage CPU timing of the windowed layer_commit
 // path — where does the non-GPU-busy frame time go? Accumulates per stage and
@@ -155,7 +160,11 @@ vk_frame_timing_flush(struct vk_frame_timing *t, uint64_t now)
 		return;
 	}
 	const double per = 1.0e-6 / (double)t->frames; // ns → ms per frame
-	U_LOG_W("[FRAME_STAGES] n=%u pre=%.2f preflush=%.2f weave=%.2f postwait=%.2f composite=%.2f "
+	// NB the label: this stage spans the composite + HUD RECORDING *and* the
+	// submit and whole-frame GPU drain, so at a paced frame rate it mostly
+	// measures the wait, not the composite. Reading it as "composite cost"
+	// invites optimising the wrong thing (#862) — name it for what it is.
+	U_LOG_W("[FRAME_STAGES] n=%u pre=%.2f preflush=%.2f weave=%.2f postwait=%.2f composite+wait=%.2f "
 	        "present=%.2f (ms/frame)",
 	        t->frames, t->stage_ns[VK_FSTAGE_PRE] * per, t->stage_ns[VK_FSTAGE_PREFLUSH] * per,
 	        t->stage_ns[VK_FSTAGE_WEAVE] * per, t->stage_ns[VK_FSTAGE_POSTWAIT] * per,
@@ -5561,6 +5570,183 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		mask_view = c->implicit_mask_view;
 	}
 
+	// #862 (generalises #858) — clip the snapshot + composite to the pixels
+	// where the pass is NOT the identity. The weave already lives in the
+	// target (weave_scratch is a copy OF it), so per mode, with an implicit
+	// mask, outside every Local2D rect:
+	//   ALPHA_OVER  out = twod + (1-twod.a)·weave        → weave (identity)
+	//   LERP        out = M·weave + (1-M)·twod, M==1     → weave (identity)
+	//   ZONES       out = twod + (1-twod.a)·(M·weave)    → weave only where
+	//               M==1, i.e. INSIDE a zone. Outside every zone M==0 and the
+	//               pass genuinely clears to 0, so this holds only when the
+	//               zones cover the whole region (and no feather ramp softens
+	//               an edge — a ramp is not the identity either).
+	// An explicitly authored mask may be anything anywhere, so it never clips.
+	// Under opaque present the same holds: the collapsed form is twod-over-
+	// weave with α forced to 1, and the swapchain is ALPHA_MODE_IGNORE.
+	// Cover of the non-identity pixels, in region space. Empty count => the
+	// whole pass is the identity (subsumes #858); NULL => no clipping.
+	VkRect2D clips[8];
+	uint32_t clip_count = 0;
+	bool clip_active = false;
+	{
+		const bool explicit_mask = (emask != NULL && emask->submitted &&
+		                            emask->staged_view != VK_NULL_HANDLE) ||
+		                           !debug_get_bool_option_local2d_clip();
+
+		// Bounding box of this frame's 2D rects — never the identity in any mode.
+		bool have_twod = false;
+		VkRect2D twod_box = {{0, 0}, {0, 0}};
+		if (rect_count > 0) {
+			int32_t x0 = rects[0].offset.w, y0 = rects[0].offset.h;
+			int32_t x1 = x0 + rects[0].extent.w, y1 = y0 + rects[0].extent.h;
+			for (uint32_t i = 1; i < rect_count; i++) {
+				const struct xrt_rect r = rects[i];
+				if (r.offset.w < x0) x0 = r.offset.w;
+				if (r.offset.h < y0) y0 = r.offset.h;
+				if (r.offset.w + r.extent.w > x1) x1 = r.offset.w + r.extent.w;
+				if (r.offset.h + r.extent.h > y1) y1 = r.offset.h + r.extent.h;
+			}
+			if (x0 < 0) x0 = 0;
+			if (y0 < 0) y0 = 0;
+			if (x1 > (int32_t)region_w) x1 = (int32_t)region_w;
+			if (y1 > (int32_t)region_h) y1 = (int32_t)region_h;
+			if (x1 > x0 && y1 > y0) {
+				twod_box.offset.x = x0;
+				twod_box.offset.y = y0;
+				twod_box.extent.width = (uint32_t)(x1 - x0);
+				twod_box.extent.height = (uint32_t)(y1 - y0);
+				have_twod = true;
+			}
+		}
+
+		if (!explicit_mask && zones_frame) {
+			// Largest zone INTERIOR (inset by its own feather, since the ramp is
+			// not the identity either) is the identity area. Its complement in
+			// the region is at most four bands — which is what makes a feathered
+			// zone clippable at all: the leftover is a ring, not a box.
+			VkRect2D best = {{0, 0}, {0, 0}};
+			uint64_t best_area = 0;
+			for (uint32_t i = 0; i < zone_rect_count; i++) {
+				const int32_t f = (int32_t)zone_feathers[i];
+				int32_t sx0 = zone_rects[i].offset.w + f;
+				int32_t sy0 = zone_rects[i].offset.h + f;
+				int32_t sx1 = zone_rects[i].offset.w + zone_rects[i].extent.w - f;
+				int32_t sy1 = zone_rects[i].offset.h + zone_rects[i].extent.h - f;
+				if (sx0 < 0) sx0 = 0;
+				if (sy0 < 0) sy0 = 0;
+				if (sx1 > (int32_t)region_w) sx1 = (int32_t)region_w;
+				if (sy1 > (int32_t)region_h) sy1 = (int32_t)region_h;
+				if (sx1 <= sx0 || sy1 <= sy0) {
+					continue;
+				}
+				const uint64_t area = (uint64_t)(sx1 - sx0) * (uint64_t)(sy1 - sy0);
+				if (area > best_area) {
+					best_area = area;
+					best.offset.x = sx0;
+					best.offset.y = sy0;
+					best.extent.width = (uint32_t)(sx1 - sx0);
+					best.extent.height = (uint32_t)(sy1 - sy0);
+				}
+			}
+			if (best_area > 0) {
+				const int32_t bx0 = best.offset.x, by0 = best.offset.y;
+				const int32_t bx1 = bx0 + (int32_t)best.extent.width;
+				const int32_t by1 = by0 + (int32_t)best.extent.height;
+				// Four bands around the identity interior (any may be empty).
+				const VkRect2D bands[4] = {
+				    {{0, 0}, {region_w, (uint32_t)by0}},                                 // top
+				    {{0, by1}, {region_w, (uint32_t)((int32_t)region_h - by1)}},          // bottom
+				    {{0, by0}, {(uint32_t)bx0, (uint32_t)(by1 - by0)}},                   // left
+				    {{bx1, by0}, {(uint32_t)((int32_t)region_w - bx1), (uint32_t)(by1 - by0)}}, // right
+				};
+				for (uint32_t i = 0; i < 4; i++) {
+					if (bands[i].extent.width > 0 && bands[i].extent.height > 0) {
+						clips[clip_count++] = bands[i];
+					}
+				}
+				// Only the part of the 2D box INSIDE the interior needs its own
+				// rect — the rest is already covered by the bands. Intersecting
+				// also keeps every rect disjoint, which vkCmdCopyImage requires
+				// of its regions.
+				if (have_twod) {
+					int32_t ix0 = (int32_t)twod_box.offset.x > bx0 ? twod_box.offset.x : bx0;
+					int32_t iy0 = (int32_t)twod_box.offset.y > by0 ? twod_box.offset.y : by0;
+					int32_t tx1 = twod_box.offset.x + (int32_t)twod_box.extent.width;
+					int32_t ty1 = twod_box.offset.y + (int32_t)twod_box.extent.height;
+					int32_t ix1 = tx1 < bx1 ? tx1 : bx1;
+					int32_t iy1 = ty1 < by1 ? ty1 : by1;
+					if (ix1 > ix0 && iy1 > iy0) {
+						clips[clip_count].offset.x = ix0;
+						clips[clip_count].offset.y = iy0;
+						clips[clip_count].extent.width = (uint32_t)(ix1 - ix0);
+						clips[clip_count].extent.height = (uint32_t)(iy1 - iy0);
+						clip_count++;
+					}
+				}
+				clip_active = true;
+			}
+		} else if (!explicit_mask && !zones_frame) {
+			// ALPHA_OVER / implicit LERP: identity everywhere outside the 2D rects.
+			if (have_twod) {
+				clips[clip_count++] = twod_box;
+			}
+			clip_active = true;
+		}
+
+		// Only clip when it actually saves fill — a tiny identity interior would
+		// cost four bands that redundantly cover the whole region.
+		if (clip_active) {
+			uint64_t covered = 0;
+			for (uint32_t i = 0; i < clip_count; i++) {
+				covered += (uint64_t)clips[i].extent.width * clips[i].extent.height;
+			}
+			const uint64_t full = (uint64_t)region_w * region_h;
+			if (covered * 10u > full * 8u) { // >80% of the region: not worth it
+				clip_active = false;
+				clip_count = 0;
+			}
+		}
+
+		// One-shot (NOT per-frame): what the cover resolved to and the geometry
+		// that produced it — the first thing to check when the composite stage
+		// costs more than the 2D content suggests it should.
+		static bool clip_logged = false;
+		if (!clip_logged) {
+			clip_logged = true;
+			if (clip_active) {
+				uint64_t covered = 0;
+				for (uint32_t i = 0; i < clip_count; i++) {
+					covered += (uint64_t)clips[i].extent.width * clips[i].extent.height;
+				}
+				U_LOG_W("VK Local2D clip (#862): %u rect(s), %u%% of the %ux%u region",
+				        clip_count,
+				        (unsigned)(covered * 100u / ((uint64_t)region_w * region_h)), region_w,
+				        region_h);
+				for (uint32_t i = 0; i < clip_count; i++) {
+					U_LOG_W("  clip[%u]: %d,%d %ux%u", i, clips[i].offset.x, clips[i].offset.y,
+					        clips[i].extent.width, clips[i].extent.height);
+				}
+			} else {
+				U_LOG_W("VK Local2D clip (#862): none, full %ux%u — reason: %s", region_w,
+				        region_h,
+				        explicit_mask ? "explicit authored mask" : "no worthwhile identity area");
+			}
+			for (uint32_t i = 0; i < rect_count; i++) {
+				U_LOG_W("  Local2D rect[%u]: %d,%d %dx%d", i, rects[i].offset.w,
+				        rects[i].offset.h, rects[i].extent.w, rects[i].extent.h);
+			}
+			for (uint32_t i = 0; i < zone_rect_count; i++) {
+				U_LOG_W("  zone rect[%u]: %d,%d %dx%d feather=%.1f", i, zone_rects[i].offset.w,
+				        zone_rects[i].offset.h, zone_rects[i].extent.w, zone_rects[i].extent.h,
+				        (double)zone_feathers[i]);
+			}
+		}
+		if (clip_active && clip_count == 0) {
+			return false; // every pixel is the identity — skip the pass (#858)
+		}
+	}
+
 	// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
 	// → COLOR_ATTACHMENT for the composite render pass.
 	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -5572,15 +5758,35 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                            k_color_sub);
-	VkImageCopy copy = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffset = {0, 0, 0},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffset = {0, 0, 0},
-	    .extent = {region_w, region_h, 1},
-	};
+	// #862: snapshot only the clipped sub-rect — the shader samples the scratch
+	// 1:1 in region space and only reads inside the scissor, so the rest of the
+	// scratch is never touched. Same offsets on both sides keeps that 1:1.
+	// #862: snapshot only the rects the composite will actually read. The
+	// shader samples the scratch 1:1 in region space and only inside its
+	// scissor, so untouched scratch is never read. The clip rects are disjoint
+	// by construction, which vkCmdCopyImage requires of its regions.
+	VkImageCopy copies[8];
+	uint32_t copy_count = 0;
+	if (clip_active) {
+		for (uint32_t i = 0; i < clip_count; i++) {
+			copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			copies[copy_count].srcOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+			copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+			copies[copy_count].dstOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+			copies[copy_count].extent =
+			    (VkExtent3D){clips[i].extent.width, clips[i].extent.height, 1};
+			copy_count++;
+		}
+	} else {
+		copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copies[copy_count].srcOffset = (VkOffset3D){0, 0, 0};
+		copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copies[copy_count].dstOffset = (VkOffset3D){0, 0, 0};
+		copies[copy_count].extent = (VkExtent3D){region_w, region_h, 1};
+		copy_count++;
+	}
 	vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy_count, copies);
 	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -5670,7 +5876,8 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque();
 	vk_local2d_composite_draw(&c->local2d, vk, cmd, c->composite_target_fb, dst_w, dst_h,
 	                          c->local2d_scratch_view, mask_view, c->weave_scratch_view, region_w,
-	                          region_h, cx, cy, cw, ch, composite_mode, opaque_present);
+	                          region_h, cx, cy, cw, ch, composite_mode, opaque_present,
+	                          clip_active ? clips : NULL, clip_count);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source resolved. WARN so it survives the hot-path INFO filter.
