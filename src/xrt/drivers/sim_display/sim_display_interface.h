@@ -159,6 +159,19 @@ bool
 sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *out_info);
 
 /*!
+ * Panel geometry published for the display-processor variants (#856).
+ *
+ * The DP variants have no @ref xrt_device pointer, but must answer
+ * get_display_dimensions / get_display_pixel_info — the compositor needs both
+ * to compute WINDOW-scoped Kooima. Valid after sim_display_hmd_create(); zeroed
+ * before (callers must treat 0 pixels as "not available" and return false).
+ *
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_get_panel_metrics(float *out_w_m, float *out_h_m, uint32_t *out_px_w, uint32_t *out_px_h);
+
+/*!
  * Create a simulated 3D display HMD device.
  *
  * Display properties are configurable via environment variables:

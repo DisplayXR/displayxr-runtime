@@ -326,6 +326,9 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 }
 
 
+// #856: panel geometry -> compositor computes window-scoped Kooima.
+SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp_d3d12, xrt_display_processor_d3d12)
+
 static bool
 sim_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xdp,
                                           struct xrt_eye_positions *out)
@@ -618,6 +621,8 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_d3d12_destroy;
 	sdp->base.process_atlas = sim_dp_d3d12_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d12_get_predicted_eye_positions;
+	sdp->base.get_display_dimensions = sim_dp_d3d12_get_display_dimensions;   // #856
+	sdp->base.get_display_pixel_info = sim_dp_d3d12_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_d3d12_is_alpha_native;
 	sdp->base.set_background_2d = sim_dp_d3d12_set_background_2d; // #491 part 3
 	sdp->base.get_local_zone_caps = sim_dp_d3d12_get_local_zone_caps;         // #224 / ADR-027

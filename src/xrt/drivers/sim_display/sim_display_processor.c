@@ -524,6 +524,9 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 }
 
 
+// #856: panel geometry -> compositor computes window-scoped Kooima.
+SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp, xrt_display_processor)
+
 static bool
 sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_positions *out)
 {
@@ -740,6 +743,8 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_destroy;
 	sdp->base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
+	sdp->base.get_display_dimensions = sim_dp_get_display_dimensions;   // #856
+	sdp->base.get_display_pixel_info = sim_dp_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_is_alpha_native;
 	sdp->base.set_background_2d = sim_dp_set_background_2d; // #491 part 3
 	sdp->base.get_local_zone_caps = sim_dp_get_local_zone_caps;          // #224 / ADR-027

@@ -49,8 +49,33 @@
  *
  */
 
-static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
+//! Default when SIM_DISPLAY_OUTPUT is unset: ANAGLYPH. It is the only 3D mode
+//! that is position-preserving (per-pixel colour combine, no canvas
+//! rearrangement), so it composites correctly with display-zones and reads as
+//! real depth on a flat panel. The rearranging modes (SBS / Squeezed / Quad)
+//! are deliberately opt-in — they are view-inspection tools, not a sane default.
+static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
 static xrt_atomic_s32_t g_sim_display_view_count = 1;
+
+//! Panel metrics published for the DP variants (#856). Written once in
+//! sim_display_hmd_create() before any display processor exists, then read-only
+//! — the DP needs these to answer get_display_dimensions/get_display_pixel_info,
+//! which is what lets the compositor build WINDOW-scoped (not display-scoped)
+//! Kooima. Without them the compositor's get_window_metrics bails and every
+//! non-display-aspect viewport (e.g. a tall display-zone) renders stretched.
+static float g_sim_panel_w_m = 0.0f;
+static float g_sim_panel_h_m = 0.0f;
+static uint32_t g_sim_panel_px_w = 0;
+static uint32_t g_sim_panel_px_h = 0;
+
+void
+sim_display_get_panel_metrics(float *out_w_m, float *out_h_m, uint32_t *out_px_w, uint32_t *out_px_h)
+{
+	if (out_w_m != NULL) *out_w_m = g_sim_panel_w_m;
+	if (out_h_m != NULL) *out_h_m = g_sim_panel_h_m;
+	if (out_px_w != NULL) *out_px_w = g_sim_panel_px_w;
+	if (out_px_h != NULL) *out_px_h = g_sim_panel_px_h;
+}
 
 /*!
  * Cross-platform atomic load for xrt_atomic_s32_t.
@@ -491,8 +516,14 @@ sim_display_hmd_create(void)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
 			else if (strcmp(mode_str, "quad") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_QUAD);
-			else
+			else if (strcmp(mode_str, "squeezed") == 0 || strcmp(mode_str, "squeezed_sbs") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SQUEEZED_SBS);
+			else if (strcmp(mode_str, "2d") == 0 || strcmp(mode_str, "passthrough") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_PASSTHROUGH);
+			else
+				U_LOG_W("sim_display: unknown SIM_DISPLAY_OUTPUT '%s' (want "
+				        "2d|anaglyph|sbs|squeezed|quad|blend) — keeping the anaglyph default",
+				        mode_str);
 		}
 	}
 
@@ -586,6 +617,12 @@ sim_display_hmd_create(void)
 	hmd->display_pixel_width = (uint32_t)pixel_w;
 	hmd->display_pixel_height = (uint32_t)pixel_h;
 #endif
+	// #856: publish the same geometry to the DP variants (see the globals).
+	g_sim_panel_w_m = hmd->display_width_m;
+	g_sim_panel_h_m = hmd->display_height_m;
+	g_sim_panel_px_w = hmd->display_pixel_width;
+	g_sim_panel_px_h = hmd->display_pixel_height;
+
 	hmd->ipd_m = ipd;
 	hmd->zoom_scale = 1.0f;
 	hmd->nominal_z_m = nominal_z;
