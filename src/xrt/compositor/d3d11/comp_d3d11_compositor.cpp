@@ -536,7 +536,17 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
+	// #867: measured wait_frame->scanout lookahead when available; the
+	// period*2 constant only holds for an app keeping up at queue depth 1.
+	int64_t lookahead_ns = period_ns * 2;
+	if (c->target != nullptr) {
+		const uint64_t measured = comp_d3d11_target_get_predicted_lookahead_ns(c->target);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_d3d11_target_mark_wait_frame(c->target);
+	}
+	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -588,7 +598,17 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
 
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
+	// #867: measured wait_frame->scanout lookahead when available; the
+	// period*2 constant only holds for an app keeping up at queue depth 1.
+	int64_t lookahead_ns = period_ns * 2;
+	if (c->target != nullptr) {
+		const uint64_t measured = comp_d3d11_target_get_predicted_lookahead_ns(c->target);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_d3d11_target_mark_wait_frame(c->target);
+	}
+	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	*out_predicted_display_period_ns = period_ns;
 
 	c->last_display_time_ns = static_cast<uint64_t>(*out_predicted_display_time_ns);
@@ -1924,7 +1944,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		// Late-weave pacing + weave-latency harness mark (env-gated no-ops).
-		comp_d3d11_target_weave_mark(c->target);
+		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns);
 
 		// Timing feedback: hand the DP last frame's MEASURED weave→scanout
 		// residual so the vendor eye predictor runs with an exact horizon

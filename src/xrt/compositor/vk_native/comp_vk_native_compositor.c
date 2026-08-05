@@ -1004,7 +1004,17 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 	int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
+	// #867: measured wait_frame->scanout lookahead when available; the
+	// period*2 constant only holds for an app keeping up at queue depth 1.
+	int64_t lookahead_ns = period_ns * 2;
+	if (c->target != NULL) {
+		uint64_t measured = comp_vk_native_target_get_predicted_lookahead_ns(c->target);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_vk_native_target_mark_wait_frame(c->target);
+	}
+	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -1052,7 +1062,17 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 	*out_frame_id = c->frame_id;
 
 	int64_t now_ns = (int64_t)os_monotonic_get_ns();
-	*out_predicted_display_time_ns = now_ns + period_ns * 2;
+	// #867: measured wait_frame->scanout lookahead when available; the
+	// period*2 constant only holds for an app keeping up at queue depth 1.
+	int64_t lookahead_ns = period_ns * 2;
+	if (c->target != NULL) {
+		uint64_t measured = comp_vk_native_target_get_predicted_lookahead_ns(c->target);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_vk_native_target_mark_wait_frame(c->target);
+	}
+	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	*out_predicted_display_period_ns = period_ns;
 
 	c->last_display_time_ns = (uint64_t)*out_predicted_display_time_ns;
@@ -4041,6 +4061,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 		U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
 		        1000.0 / c->display_refresh_rate);
+		if (c->target != NULL) {
+			comp_vk_native_target_set_display_period(
+			    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		}
 	}
 #endif
 

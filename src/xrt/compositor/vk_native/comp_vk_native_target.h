@@ -121,6 +121,26 @@ uint64_t
 comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target);
 
 /*!
+ * Note that xrWaitFrame just returned, so the span to this frame's weave can
+ * be measured (#867).
+ */
+void
+comp_vk_native_target_mark_wait_frame(struct comp_vk_native_target *target);
+
+/*!
+ * Seed the panel period used by the #867 lookahead estimate.
+ */
+void
+comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, uint64_t period_ns);
+
+/*!
+ * App-visible wait_frame->scanout lookahead in ns from measured frame cost +
+ * measured weave->scanout residual (#867). 0 when unmeasured.
+ */
+uint64_t
+comp_vk_native_target_get_predicted_lookahead_ns(struct comp_vk_native_target *target);
+
+/*!
  * Get target dimensions.
  *
  * @ingroup comp_vk_native
