@@ -833,8 +833,20 @@ sim_display_hmd_create(void)
 	u_var_add_f32(hmd, &hmd->nominal_z_m, "nominal_z_m");
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
-	U_LOG_W("Created sim 3D display: logical=%dx%d, physical=%ux%u, %.3fx%.3f m, eye=(0,%.2f,%.2f) IPD=%.0fmm",
-	        pixel_w, pixel_h, hmd->display_pixel_width, hmd->display_pixel_height,
+	// These two are NOT one rectangle in two units, and calling them
+	// logical/physical implied they were. On macOS `pixel_w/h` is the VISIBLE
+	// FRAME in logical points (menu bar and Dock excluded — it sizes the
+	// NSWindow and the advertised screen/view dims) while display_pixel_* is
+	// the FULL panel in physical pixels. Dividing one by the other to recover
+	// the backing scale yields 2.0 horizontally and ~2.39 vertically on a
+	// Retina display, i.e. a phantom. Label each by what it is.
+#ifdef XRT_OS_MACOS
+	const char *screen_units = "pt (visible frame)";
+#else
+	const char *screen_units = "px";
+#endif
+	U_LOG_W("Created sim 3D display: screen=%dx%d %s, panel=%ux%u px, %.3fx%.3f m, eye=(0,%.2f,%.2f) IPD=%.0fmm",
+	        pixel_w, pixel_h, screen_units, hmd->display_pixel_width, hmd->display_pixel_height,
 	        display_w_m, display_h_m, eye_y, eye_z, ipd * 1000.0f);
 
 	return &hmd->base;
