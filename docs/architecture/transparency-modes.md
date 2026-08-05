@@ -31,6 +31,36 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
 | **Live** | Classic transparency. Live punch-through everywhere. ~56 pts system GPU, dwm ~32 %, Composed: Flip. | Live everywhere (holes are real desktop; in-region blends DWM-live). dwm ∝ region area. Composed. |
 | **Baked** | Bake everywhere the window covers. **Cheapest**: 12–15 pts, dwm ≈ 0, **Hardware Composed: Independent Flip**. | **Live punch-through in the carved holes**; bake only in the in-region blend band (silhouette edges, de-occluded pixels, kept chrome). Cheap region compose. Composed. |
 
+### Product decision: shaped is the default; unshaped is not shipped
+
+Overlay-class apps ship **shaped**. Unshaped was evaluated (it is the only
+combination that reaches Independent Flip) and **rejected**, because dropping
+the region costs two things at once:
+
+1. **Background freshness.** Unshaped, the window covers its whole rectangle,
+   so *every* transparent pixel is served by the ~1-frame-old bake — not just
+   the silhouette fringe. For an avatar-class app that is most of the window.
+   (It is only *visibly* wrong when background pixels change — see rule 5 —
+   but that is a property of the content, not a guarantee.)
+2. **Click-through.** `SetWindowRgn` *is* the hit-testing mechanism on this
+   path. Per-pixel alpha gives see-through visually, but Windows does not
+   hit-test on alpha for a flip-model / `WS_EX_NOREDIRECTIONBITMAP` window
+   (alpha hit-testing exists only for `WS_EX_LAYERED` + `UpdateLayeredWindow`,
+   which is incompatible with our swapchain). Unshaped, the full rectangle
+   eats every click, scroll and hover.
+
+Both are recovered by the same mechanism, so the two costs arrive together.
+Schemes that enter unshaped conditionally (on cursor proximity, or on
+background motion) were considered and are **not** being pursued.
+
+**Consequence for the perf model:** Independent Flip is therefore unavailable
+to overlay-class apps, so `DXR_PRESENT_OPAQUE` buys them **no DWM saving**
+(measured: opaque gate on a shaped avatar 10.7 dwm vs 10.2 baseline). Its
+value on a shaped app is that the opaque flip chain is what carries the
+late-weave **waitable** — i.e. pacing and latency, not GPU. Quote it that way.
+Full-cover unshaped content (the cube apps) is unaffected and keeps the
+3.7–4.7× Independent Flip win.
+
 ## Rules (each learned the hard way)
 
 1. **Shaping only punches through what you carve.** Kept surface (OS frame,
