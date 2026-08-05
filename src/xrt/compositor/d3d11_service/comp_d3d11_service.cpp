@@ -91,6 +91,7 @@ extern "C" bool g_bridge_relay_active;
 // D3D11/D3D12 in-process targets). Site files: <prefix>.workspace.csv /
 // <prefix>.standalone.csv here.
 #include "util/comp_weave_latency_win.h"
+#include "util/comp_display_refresh_win.h"
 
 static weave_latency_log g_weave_latency_workspace;
 static weave_latency_log g_weave_latency_standalone;
@@ -13260,7 +13261,20 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->view_height = sys->output_height / sys->tile_rows;
 	sys->display_width = sys->tile_columns * sys->view_width;
 	sys->display_height = sys->tile_rows * sys->view_height;
+	// Current mode of the primary monitor — the service's display processor is
+	// created for COMP_DP_PRIMARY_MONITOR, and no window exists this early.
+	// A hardcoded 60 handed the DP a frame period 2.75× too long on a 165 Hz
+	// panel and made the late-weave governor judge saturation against the
+	// wrong budget.
 	sys->refresh_rate = 60.0f;
+	{
+		const float hz = comp_display_refresh_hz_win(NULL);
+		if (hz > 0.0f) {
+			sys->refresh_rate = hz;
+		}
+	}
+	U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", sys->refresh_rate,
+	        1000.0 / sys->refresh_rate);
 	// NOTE: Display processor queries happen after D3D11 device creation (below).
 
 	// Create D3D11 device (service owns this, independent of clients)

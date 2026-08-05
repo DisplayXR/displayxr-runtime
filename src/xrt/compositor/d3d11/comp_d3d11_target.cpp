@@ -422,18 +422,12 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 	if (g_frame_latency_waitable != nullptr) {
 		WaitForSingleObject(g_frame_latency_waitable, 100);
 		// At effective depth L>1 (#850) the pacer targets the present L-1
-		// back instead, restoring L-1 frames of CPU/GPU overlap.
+		// back instead, restoring L-1 frames of CPU/GPU overlap. The helper
+		// bounds itself to 3 panel periods and yields on fast panels.
 		const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
 		if (g_last_present_count > relax) {
-			const UINT pace_target = g_last_present_count - relax;
-			for (int i = 0; i < 50; i++) {
-				DXGI_FRAME_STATISTICS stats = {};
-				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
-				if (FAILED(shr) || stats.PresentCount >= pace_target) {
-					break;
-				}
-				Sleep(1);
-			}
+			late_weave_wait_scanout(target->swapchain, g_last_present_count - relax,
+			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
 		}
 	}
 	g_weave_latency_d3d11.mark_weave("d3d11");
@@ -457,6 +451,18 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 				        g_lw_gov_d3d11.period_ns / 1e6);
 			}
 		}
+	}
+}
+
+extern "C" void
+comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t period_ns)
+{
+	(void)target;
+	// Seed the governor from the compositor's queried refresh rate so the
+	// first frames judge saturation correctly; DXGI frame statistics refine
+	// it from there.
+	if (period_ns > 0 && g_lw_gov_d3d11.period_ns == 0.0) {
+		g_lw_gov_d3d11.period_ns = (double)period_ns;
 	}
 }
 

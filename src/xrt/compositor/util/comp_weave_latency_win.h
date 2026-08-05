@@ -103,23 +103,33 @@ struct weave_latency_log
  * cannot make rate it serializes the whole frame: measured −63% fps for ~4 ms
  * of R p50 on a saturated app, with no p95 win. Two escapes:
  *
- *  - DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1) forces a fixed queue
- *    depth. N>1 restores N−1 frames of overlap at the cost of (N−1) refresh
- *    intervals of extra weave-time eye-prediction horizon.
+ *  - DXR_LATE_WEAVE_MAX_LATENCY=N (1..LATE_WEAVE_MAX_DEPTH, default 1) forces
+ *    a fixed queue depth. N>1 restores N−1 frames of overlap at the cost of
+ *    (N−1) refresh intervals of extra weave-time eye-prediction horizon.
  *  - Saturation auto-backoff (default ON; DXR_LATE_WEAVE_AUTOBACKOFF=0
  *    disables; only active at the default depth 1): when the paced frame
- *    interval persistently exceeds the measured display period, effective
- *    depth goes to 2. Once the pipeline holds rate again the governor probes
- *    a return to 1 — with a dwell that doubles on every failed probe, so a
- *    persistently saturated app converges to depth 2 instead of oscillating.
+ *    interval persistently exceeds what the current depth can absorb, the
+ *    governor jumps straight to the depth the pipeline actually needs. Once
+ *    it holds rate again it steps back down one level at a time — with a
+ *    dwell that doubles on every failed probe, so a persistently saturated
+ *    app converges instead of oscillating.
+ *
+ * Refresh-rate scaling (the reason the depth is computed, not fixed): the
+ * frames of queue needed to keep a pipeline full is ceil(render_interval /
+ * display_period), which grows as the panel gets faster. A 16 ms app needs
+ * 1 frame at 60 Hz, ~3 at 165 Hz, ~4 at 240 Hz. A fixed 1→2 backoff is a
+ * 60 Hz-shaped rule and leaves a high-refresh panel starved.
  *
  * The caller owns applying transitions (SetMaximumFrameLatency + one-shot
  * WARN — silent backoff would make gate numbers non-reproducible) and relaxes
  * its scanout pacer by (effective−1) presents.
  */
+//! Queue-depth ceiling: covers a 16 ms frame on a 240 Hz panel (ceil(16/4.17)).
+#define LATE_WEAVE_MAX_DEPTH 4
+
 struct late_weave_governor
 {
-	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..3)
+	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..MAX)
 	int auto_backoff = -1; // DXR_LATE_WEAVE_AUTOBACKOFF, default 1
 	int effective = 1;
 
@@ -143,7 +153,7 @@ struct late_weave_governor
 		if (base < 0) {
 			const char *e = getenv("DXR_LATE_WEAVE_MAX_LATENCY");
 			int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
-			base = v < 1 ? 1 : (v > 3 ? 3 : v);
+			base = v < 1 ? 1 : (v > LATE_WEAVE_MAX_DEPTH ? LATE_WEAVE_MAX_DEPTH : v);
 			const char *a = getenv("DXR_LATE_WEAVE_AUTOBACKOFF");
 			auto_backoff = (a != nullptr && a[0] == '0') ? 0 : 1;
 			effective = base;
@@ -160,7 +170,11 @@ struct late_weave_governor
 			const double per = (double)(sync_qpc - last_sync_qpc) * 1000000000.0 /
 			                   (double)freq_hz /
 			                   (double)(stats.SyncRefreshCount - last_sync_refresh);
-			if (per > 4e6 && per < 5e7) { // 200 Hz .. 20 Hz sanity window
+			// 1000 Hz .. 10 Hz sanity window. The old 4 ms floor sat
+			// right on a 240 Hz panel's period (4.17 ms), so any jitter
+			// rejected every sample, left period_ns at 0 and silently
+			// disabled the governor on exactly the displays that need it.
+			if (per > 1e6 && per < 1e8) {
 				period_ns = (period_ns == 0.0) ? per : period_ns * 0.9 + per * 0.1;
 			}
 		}
@@ -168,9 +182,36 @@ struct late_weave_governor
 		last_sync_refresh = stats.SyncRefreshCount;
 	}
 
-	//! Call once per paced frame (end of the weave-mark pacer). Returns +1 on
-	//! a backoff engage (1→2), −1 on a return probe (2→1), 0 otherwise; the
-	//! caller applies SetMaximumFrameLatency and reads `effective`.
+	//! Headroom a level of queue is credited with. A depth of N absorbs N
+	//! periods of work, and we only add a level once the frame overruns that
+	//! by 30% — the same margin at every level, so deeper queues need
+	//! proportionally more overrun to justify the refresh of extra latency
+	//! they cost. Measured on a saturated Unity app at 60 Hz: forcing the
+	//! extra level a plain ceil() asked for bought +3 fps and cost +14 ms of
+	//! R p95, which is the wrong trade on a 3D display. The governor exists
+	//! to escape pathological serialization, not to chase peak fps.
+	static constexpr double kLevelHeadroom = 1.30;
+
+	//! Frames of queue this pipeline needs at the current panel period —
+	//! the smallest N whose absorbed budget (N × period × headroom) covers
+	//! the frame. Clamped; 0 when unknown.
+	int
+	needed_depth() const
+	{
+		if (period_ns <= 0.0 || interval_ema_ns <= 0.0) {
+			return 0;
+		}
+		const double budget = period_ns * kLevelHeadroom;
+		int n = (int)((interval_ema_ns + budget - 1.0) / budget);
+		if (n < 1) {
+			n = 1;
+		}
+		return n > LATE_WEAVE_MAX_DEPTH ? LATE_WEAVE_MAX_DEPTH : n;
+	}
+
+	//! Call once per paced frame (end of the weave-mark pacer). Returns +1 when
+	//! the depth rose, −1 when it fell, 0 otherwise; the caller applies
+	//! SetMaximumFrameLatency and reads `effective`.
 	int
 	on_mark(uint64_t freq_hz)
 	{
@@ -201,8 +242,18 @@ struct late_weave_governor
 			return 0;
 		}
 
-		if (effective == 1) {
-			over_frames = (interval_ema_ns > period_ns * 1.30) ? over_frames + 1 : 0;
+		// Starved once the frame overruns what the CURRENT depth absorbs.
+		// At depth 1 this is exactly the original >1.30×period rule.
+		const bool starved = interval_ema_ns > period_ns * (double)effective * kLevelHeadroom;
+		// Over-provisioned once the frame fits inside one fewer level, with a
+		// little extra margin so the two tests can't chatter against
+		// each other at the boundary.
+		const bool roomy = effective > 1 && interval_ema_ns <
+		                                        period_ns * (double)(effective - 1) * kLevelHeadroom * 0.95;
+
+		if (starved && effective < LATE_WEAVE_MAX_DEPTH) {
+			calm_frames = 0;
+			over_frames++;
 			if (over_frames >= 30) {
 				// Backoff shortly after a return probe = the probe
 				// failed → double the next dwell.
@@ -212,26 +263,84 @@ struct late_weave_governor
 					                     ? 300ull * 1000000000ull
 					                     : probe_dwell_ns * 2;
 				}
-				effective = 2;
+				// Jump straight to what the pipeline needs — on a fast
+				// panel a heavy frame can want 3-4 levels at once, and
+				// crawling up one per 30 frames would stall for seconds.
+				const int want = needed_depth();
+				effective = (want > effective) ? want : effective + 1;
 				over_frames = 0;
-				calm_frames = 0;
 				backoff_qpc = now;
 				return +1;
 			}
-		} else {
-			calm_frames = (interval_ema_ns < period_ns * 1.05) ? calm_frames + 1 : 0;
+		} else if (roomy) {
+			over_frames = 0;
+			calm_frames++;
 			const double since_backoff_ns =
 			    (double)(now - backoff_qpc) * 1e9 / (double)freq_hz;
 			if (calm_frames >= 300 && since_backoff_ns > (double)probe_dwell_ns) {
-				effective = 1;
+				// Step down one level at a time: the probe is what
+				// re-tests the pipeline, so it must be gentle.
+				effective--;
 				calm_frames = 0;
 				last_probe_qpc = now;
 				return -1;
 			}
+		} else {
+			over_frames = 0;
+			calm_frames = 0;
 		}
 		return 0;
 	}
 };
+
+/*!
+ * Wait until the swap chain reports @p target_present has reached glass, or a
+ * refresh-scaled deadline passes.
+ *
+ * The frame-latency waitable alone is not scanout: on composed presents it
+ * releases at DWM *pickup*, 2-3 frames early. This poll closes that gap.
+ *
+ * Two things here are refresh-rate-shaped. The bound is 3 panel periods (not
+ * a fixed iteration count), so an occluded window can never wedge us and a
+ * fast panel is not given a 60 Hz-sized budget. And the idle step yields
+ * rather than sleeps once the period is short: `Sleep(1)` can overshoot ~15 ms
+ * without a raised timer resolution, which is under one refresh at 60 Hz but
+ * 2.5 refreshes at 165 Hz — enough to miss the very frame we are pacing to.
+ */
+inline void
+late_weave_wait_scanout(IDXGISwapChain *sc, UINT target_present, double period_ns, uint64_t freq_hz)
+{
+	if (sc == nullptr || target_present == 0 || freq_hz == 0) {
+		return;
+	}
+	double bound_ns = (period_ns > 0.0) ? period_ns * 3.0 : 50e6;
+	if (bound_ns < 5e6) {
+		bound_ns = 5e6;
+	} else if (bound_ns > 100e6) {
+		bound_ns = 100e6;
+	}
+	LARGE_INTEGER start;
+	QueryPerformanceCounter(&start);
+	const uint64_t deadline =
+	    (uint64_t)start.QuadPart + (uint64_t)(bound_ns * (double)freq_hz / 1000000000.0);
+
+	for (;;) {
+		DXGI_FRAME_STATISTICS stats = {};
+		if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount >= target_present) {
+			return;
+		}
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		if ((uint64_t)now.QuadPart >= deadline) {
+			return;
+		}
+		if (period_ns > 0.0 && period_ns < 8e6) {
+			SwitchToThread();
+		} else {
+			Sleep(1);
+		}
+	}
+}
 
 inline void
 weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct late_weave_governor *gov)

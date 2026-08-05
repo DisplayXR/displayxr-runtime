@@ -640,21 +640,15 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target)
 		// Scanout pacing: DWM pickup is 2-3 frames before glass on composed
 		// presents, so additionally wait until DXGI frame statistics report
 		// the previous present actually flipped — the DXGI equivalent of
-		// the VK path's vkWaitForPresentKHR pacing. Bounded to ~3 refreshes
-		// so an occluded window (stats stop advancing) never wedges us.
+		// the VK path's vkWaitForPresentKHR pacing. The helper bounds itself
+		// to 3 panel periods so an occluded window never wedges us, and
+		// yields instead of sleeping on fast panels.
 		// At effective depth L>1 (#850) the pacer targets the present L-1
 		// back instead, restoring L-1 frames of CPU/GPU overlap.
 		const UINT relax = (UINT)(g_lw_gov_d3d12.effective - 1);
 		if (target->last_present_count > relax) {
-			const UINT pace_target = target->last_present_count - relax;
-			for (int i = 0; i < 50; i++) {
-				DXGI_FRAME_STATISTICS stats = {};
-				HRESULT shr = target->swapchain->GetFrameStatistics(&stats);
-				if (FAILED(shr) || stats.PresentCount >= pace_target) {
-					break;
-				}
-				Sleep(1);
-			}
+			late_weave_wait_scanout(target->swapchain, target->last_present_count - relax,
+			                        g_lw_gov_d3d12.period_ns, g_weave_latency_d3d12.freq());
 		}
 	}
 	g_weave_latency_d3d12.mark_weave("d3d12");
@@ -673,6 +667,18 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target)
 				        g_lw_gov_d3d12.period_ns / 1e6);
 			}
 		}
+	}
+}
+
+extern "C" void
+comp_d3d12_target_set_display_period(struct comp_d3d12_target *target, uint64_t period_ns)
+{
+	(void)target;
+	// Seed the governor from the compositor's queried refresh rate so the
+	// first frames judge saturation correctly; DXGI frame statistics refine
+	// it from there.
+	if (period_ns > 0 && g_lw_gov_d3d12.period_ns == 0.0) {
+		g_lw_gov_d3d12.period_ns = (double)period_ns;
 	}
 }
 

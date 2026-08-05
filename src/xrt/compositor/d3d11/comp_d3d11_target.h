@@ -91,6 +91,14 @@ void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target);
 
 /*!
+ * Seed the late-weave governor's panel period from the compositor's queried
+ * refresh rate, so saturation is judged correctly before DXGI frame
+ * statistics have produced their first period sample. No-op once measured.
+ */
+void
+comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t period_ns);
+
+/*!
  * Measured weave→scanout residual of the last completed frame in ns (0 =
  * unknown), from DXGI frame statistics. Feeds the DP's set_frame_timing
  * control loop.

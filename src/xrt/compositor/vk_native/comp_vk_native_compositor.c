@@ -17,6 +17,9 @@
 #include "comp_vk_native_renderer.h"
 
 #include "util/comp_layer_accum.h"
+#ifdef XRT_OS_WINDOWS
+#include "util/comp_display_refresh_win.h"
+#endif
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
@@ -4016,8 +4019,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-	// Default refresh rate
+	// Default refresh rate. On Windows, replace it with the monitor's CURRENT
+	// mode — a hardcoded 60 hands the display processor a frame period 2.75×
+	// too long on a 165 Hz panel. (Desktop Linux keeps the default until an
+	// XRandR equivalent lands.)
 	c->display_refresh_rate = 60.0f;
+#ifdef XRT_OS_WINDOWS
+	{
+		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		if (hz > 0.0f) {
+			c->display_refresh_rate = hz;
+		}
+		U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
+		        1000.0 / c->display_refresh_rate);
+	}
+#endif
 
 	// Create display processor via factory FIRST — the SR weaver creates
 	// its own VkSwapchain on the HWND, so we must not also create one.

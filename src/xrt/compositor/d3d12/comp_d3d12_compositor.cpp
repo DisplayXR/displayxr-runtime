@@ -10,6 +10,7 @@
 #include "comp_d3d12_compositor.h"
 #include "comp_d3d12_swapchain.h"
 #include "comp_d3d12_target.h"
+#include "util/comp_display_refresh_win.h"
 #include "comp_d3d12_renderer.h"
 
 #include "d3d11/comp_d3d11_window.h"
@@ -2874,8 +2875,23 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		U_LOG_I("No window — skipping DXGI swapchain");
 	}
 
-	// Query display refresh rate
+	// Current mode of the monitor this session's window lives on. Hardcoding
+	// 60 Hz here handed the display processor a frame period 2.75× too long
+	// on a 165 Hz panel — and this is the Unity/Unreal path.
 	c->display_refresh_rate = 60.0f;
+	{
+		HWND rate_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		const float hz = comp_display_refresh_hz_win(rate_hwnd);
+		if (hz > 0.0f) {
+			c->display_refresh_rate = hz;
+		}
+	}
+	U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
+	        1000.0 / c->display_refresh_rate);
+	if (c->target != nullptr) {
+		comp_d3d12_target_set_display_period(
+		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
 
 	// Determine view dimensions
 	uint32_t view_width = c->settings.preferred.width / 2;
