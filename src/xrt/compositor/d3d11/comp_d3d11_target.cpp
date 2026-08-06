@@ -413,7 +413,7 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
 }
 
 extern "C" void
-comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
+comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns)
 {
 	// Late-weave pacing: waitable caps the queue; the scanout-stats loop
 	// waits for the previous present to actually flip to glass (DWM pickup
@@ -430,7 +430,7 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
 		}
 	}
-	g_weave_latency_d3d11.mark_weave("d3d11");
+	g_weave_latency_d3d11.mark_weave("d3d11", predicted_display_time_ns);
 	if (g_frame_latency_waitable != nullptr) {
 		const int tr = g_lw_gov_d3d11.on_mark(g_weave_latency_d3d11.freq());
 		if (tr != 0) {
@@ -452,6 +452,20 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target)
 			}
 		}
 	}
+}
+
+extern "C" void
+comp_d3d11_target_mark_wait_frame(struct comp_d3d11_target *target)
+{
+	(void)target;
+	g_lw_gov_d3d11.on_wait_frame();
+}
+
+extern "C" uint64_t
+comp_d3d11_target_get_predicted_lookahead_ns(struct comp_d3d11_target *target)
+{
+	(void)target;
+	return g_lw_gov_d3d11.predicted_lookahead_ns(g_weave_latency_d3d11.measured_r_ns);
 }
 
 extern "C" void

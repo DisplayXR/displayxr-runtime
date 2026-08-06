@@ -16,6 +16,7 @@
 #include "util/u_logging.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
+#include "util/comp_late_weave_lookahead.h"
 
 #include <cstring>
 #include <cstdio>
@@ -240,6 +241,15 @@ struct comp_vk_native_target
 	//! before the pacer reads it.
 	uint64_t present_qpc_ring_id[8];
 	uint64_t present_qpc_ring[8];
+
+	//! #867: weave-mark to weave-mark EMA — the app's own frame cost, the
+	//! other half of the wait_frame->scanout lookahead alongside measured R.
+	uint64_t last_mark_qpc;
+	double interval_ema_ns;
+	double period_hint_ns;
+	//! #867: wait_frame-return → weave span (app render + pacer wait).
+	uint64_t wait_frame_qpc;
+	double wait_to_weave_ema_ns;
 #endif
 
 	//! Window handle.
@@ -1634,6 +1644,35 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 #ifdef XRT_OS_WINDOWS
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
+	// #867: frame-cost EMA. A pause (occlusion, drag loop, debugger) is not
+	// a frame cost — reset rather than poison the average.
+	if (target->last_mark_qpc != 0 && (uint64_t)now.QuadPart > target->last_mark_qpc) {
+		LARGE_INTEGER f;
+		QueryPerformanceFrequency(&f);
+		const double dt_ns = (double)((uint64_t)now.QuadPart - target->last_mark_qpc) *
+		                     1000000000.0 / (double)f.QuadPart;
+		if (dt_ns > 250e6) {
+			target->interval_ema_ns = 0.0;
+		} else {
+			target->interval_ema_ns = (target->interval_ema_ns == 0.0)
+			                              ? dt_ns
+			                              : target->interval_ema_ns * 0.9 + dt_ns * 0.1;
+		}
+	}
+	// #867: wait_frame → weave, the app-side half of the lookahead.
+	if (target->wait_frame_qpc != 0 && (uint64_t)now.QuadPart > target->wait_frame_qpc) {
+		LARGE_INTEGER wf;
+		QueryPerformanceFrequency(&wf);
+		const double phi_ns = (double)((uint64_t)now.QuadPart - target->wait_frame_qpc) *
+		                      1000000000.0 / (double)wf.QuadPart;
+		if (phi_ns < 250e6) {
+			target->wait_to_weave_ema_ns = (target->wait_to_weave_ema_ns == 0.0)
+			                                   ? phi_ns
+			                                   : target->wait_to_weave_ema_ns * 0.9 + phi_ns * 0.1;
+		}
+		target->wait_frame_qpc = 0;
+	}
+	target->last_mark_qpc = (uint64_t)now.QuadPart;
 	target->weave_mark_qpc = (uint64_t)now.QuadPart; // always: feeds set_frame_timing
 	struct wl_harness *wl = wl_get(target);
 	if (wl != nullptr) {
@@ -1641,6 +1680,41 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 	}
 #else
 	(void)target;
+#endif
+}
+
+void
+comp_vk_native_target_mark_wait_frame(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	target->wait_frame_qpc = (uint64_t)now.QuadPart;
+#else
+	(void)target;
+#endif
+}
+
+void
+comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, uint64_t period_ns)
+{
+#ifdef XRT_OS_WINDOWS
+	target->period_hint_ns = (double)period_ns;
+#else
+	(void)target;
+	(void)period_ns;
+#endif
+}
+
+uint64_t
+comp_vk_native_target_get_predicted_lookahead_ns(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	return late_weave_lookahead_ns(target->wait_to_weave_ema_ns, target->measured_r_ns,
+	                               target->period_hint_ns);
+#else
+	(void)target;
+	return 0;
 #endif
 }
 

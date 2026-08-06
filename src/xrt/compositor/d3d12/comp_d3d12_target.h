@@ -75,7 +75,22 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
  * DXR_WEAVE_LATENCY_CSV is set. No-op otherwise.
  */
 void
-comp_d3d12_target_weave_mark(struct comp_d3d12_target *target);
+comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns);
+
+/*!
+ * Note that xrWaitFrame just returned, so the span to this frame's weave can
+ * be measured (#867).
+ */
+void
+comp_d3d12_target_mark_wait_frame(struct comp_d3d12_target *target);
+
+/*!
+ * App-visible wait_frame->scanout lookahead in ns from measured frame cost +
+ * measured weave->scanout residual (#867). 0 when unmeasured, in which case
+ * the caller keeps its own estimate.
+ */
+uint64_t
+comp_d3d12_target_get_predicted_lookahead_ns(struct comp_d3d12_target *target);
 
 /*!
  * Seed the late-weave governor's panel period from the compositor's queried

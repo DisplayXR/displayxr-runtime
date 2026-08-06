@@ -30,6 +30,8 @@
 #include <windows.h>
 #include <dxgi.h>
 
+#include "comp_late_weave_lookahead.h"
+
 struct weave_latency_log
 {
 	FILE *f = nullptr;
@@ -46,7 +48,12 @@ struct weave_latency_log
 	{
 		UINT present_count;
 		uint64_t qpc;
+		//! #867: what xrWaitFrame promised this frame's photon time would
+		//! be (os_monotonic ns — QPC-derived, so directly comparable to
+		//! the scanout below). 0 = the caller did not supply one.
+		uint64_t predicted_ns;
 	};
+	uint64_t pending_predicted_ns = 0; // armed by mark_weave, consumed by after_present
 	pending ring[8] = {};
 	int ring_head = 0;
 	int ring_count = 0;
@@ -82,13 +89,17 @@ struct weave_latency_log
 		return enabled == 1;
 	}
 
+	//! @p predicted_display_time_ns is the value xrWaitFrame handed the app
+	//! for this frame (0 if unknown); it is differenced against the frame's
+	//! true scanout in after_present to expose prediction error (#867).
 	void
-	mark_weave(const char *site)
+	mark_weave(const char *site, uint64_t predicted_display_time_ns = 0)
 	{
 		(void)on(site);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		qpc_weave = (uint64_t)now.QuadPart;
+		pending_predicted_ns = predicted_display_time_ns;
 	}
 
 	void
@@ -137,6 +148,12 @@ struct late_weave_governor
 	// against the display period derived from DXGI frame statistics.
 	uint64_t last_mark_qpc = 0;
 	double interval_ema_ns = 0.0;
+	//! #867: wait_frame-return → weave span (app render + pacer wait). This
+	//! is the app-side half of the lookahead, measured rather than inferred
+	//! from the frame interval — the interval also contains post-weave work,
+	//! and using it whole over-predicted by ~9 ms on a saturated app.
+	uint64_t wait_frame_qpc = 0;
+	double wait_to_weave_ema_ns = 0.0;
 	double period_ns = 0.0;
 	uint64_t last_sync_qpc = 0;
 	UINT last_sync_refresh = 0;
@@ -192,6 +209,25 @@ struct late_weave_governor
 	//! to escape pathological serialization, not to chase peak fps.
 	static constexpr double kLevelHeadroom = 1.30;
 
+	//! #867: app-visible wait_frame→scanout lookahead from this governor's
+	//! measured frame interval plus the caller's measured weave→scanout
+	//! residual. 0 when unmeasured (caller keeps its fallback).
+	uint64_t
+	predicted_lookahead_ns(uint64_t measured_r_ns) const
+	{
+		return late_weave_lookahead_ns(wait_to_weave_ema_ns, measured_r_ns, period_ns);
+	}
+
+	//! Call when xrWaitFrame returns, so the span to this frame's weave can
+	//! be measured.
+	void
+	on_wait_frame()
+	{
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		wait_frame_qpc = (uint64_t)now.QuadPart;
+	}
+
 	//! Frames of queue this pipeline needs at the current panel period —
 	//! the smallest N whose absorbed budget (N × period × headroom) covers
 	//! the frame. Clamped; 0 when unknown.
@@ -231,6 +267,17 @@ struct late_weave_governor
 				calm_frames = 0;
 				dt_ns = 0.0;
 			}
+		}
+		// #867: wait_frame → weave, the app-side span of the lookahead.
+		if (wait_frame_qpc != 0 && now > wait_frame_qpc) {
+			const double phi_ns =
+			    (double)(now - wait_frame_qpc) * 1000000000.0 / (double)freq_hz;
+			if (phi_ns < 250e6) {
+				wait_to_weave_ema_ns = (wait_to_weave_ema_ns == 0.0)
+				                           ? phi_ns
+				                           : wait_to_weave_ema_ns * 0.9 + phi_ns * 0.1;
+			}
+			wait_frame_qpc = 0;
 		}
 		last_mark_qpc = now;
 		if (dt_ns > 0.0) {
@@ -357,7 +404,7 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 
 		if (qpc_weave != 0) {
 			// Track for the timing loop.
-			ring[ring_head] = {present_count, qpc_weave};
+			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns};
 			ring_head = (ring_head + 1) % 8;
 			if (ring_count < 8) {
 				ring_count++;
@@ -383,6 +430,21 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 					measured_r_ns = (uint64_t)(
 					    (double)((uint64_t)stats.SyncQPCTime.QuadPart - ring[idx].qpc) *
 					    1000000000.0 / (double)freq());
+					// #867: xrWaitFrame's promise vs this frame's real
+					// photon time. os_monotonic_get_ns() is QPC scaled
+					// to ns on Windows, so the two share an origin and
+					// the difference is the prediction error directly.
+					if (csv && ring[idx].predicted_ns != 0) {
+						const double scanout_ns =
+						    (double)(uint64_t)stats.SyncQPCTime.QuadPart *
+						    1000000000.0 / (double)freq();
+						fprintf(f, "D,%llu,%llu,%lld,%lld\n",
+						        (unsigned long long)seq,
+						        (unsigned long long)ring[idx].present_count,
+						        (long long)ring[idx].predicted_ns,
+						        (long long)((int64_t)scanout_ns -
+						                    (int64_t)ring[idx].predicted_ns));
+					}
 					break;
 				}
 			}
