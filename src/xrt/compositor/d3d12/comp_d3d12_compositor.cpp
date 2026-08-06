@@ -1852,32 +1852,6 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
 	xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
 
-	// #868 diag: does the 2D-under backdrop survive a repaint? A backdrop that
-	// is present on app frames but NULL on repaints is invisible in isolation
-	// and shows up only as the captured desktop flickering where the 2D should
-	// be. Split the counts by weave kind so the two populations can't hide each
-	// other in an average.
-	{
-		static uint64_t n_app = 0, n_rp = 0, null_app = 0, null_rp = 0;
-		if (is_repaint) {
-			n_rp++;
-			if (bd_res == nullptr) {
-				null_rp++;
-			}
-		} else {
-			n_app++;
-			if (bd_res == nullptr) {
-				null_app++;
-			}
-		}
-		if (((n_app + n_rp) % 300) == 0) {
-			U_LOG_W("#868 backdrop: app null %llu/%llu, repaint null %llu/%llu "
-			        "(local_2d_last_frame=%d, bd=%ux%u)",
-			        (unsigned long long)null_app, (unsigned long long)n_app,
-			        (unsigned long long)null_rp, (unsigned long long)n_rp,
-			        (int)c->local_2d_last_frame, bd_w, bd_h);
-		}
-	}
 
 	D3D12_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;
@@ -1929,33 +1903,10 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// from the DP; leave it in RENDER_TARGET so HUD's existing RT→COPY_DEST
 	// transition (below) proceeds unchanged. No-op when this frame carries no
 	// zones / Local2D / explicit mask.
-	const bool composited =
-	    d3d12_composite_zone_mask(c, is_repaint, back_buffer, rtv_handle.ptr,
-	                              D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
-	                              tgt_width, tgt_height, &eff_canvas);
+	d3d12_composite_zone_mask(c, is_repaint, back_buffer, rtv_handle.ptr,
+	                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+	                          tgt_width, tgt_height, &eff_canvas);
 
-	// #868 diag: the 2D actually lands here, not in the backdrop. If this runs
-	// on app frames but not on repaints, the 2D region alternates between
-	// composited and bare weave — which is the flicker.
-	{
-		static uint64_t n_app = 0, n_rp = 0, ok_app = 0, ok_rp = 0;
-		if (is_repaint) {
-			n_rp++;
-			if (composited) {
-				ok_rp++;
-			}
-		} else {
-			n_app++;
-			if (composited) {
-				ok_app++;
-			}
-		}
-		if (((n_app + n_rp) % 300) == 0) {
-			U_LOG_W("#868 composite: app %llu/%llu, repaint %llu/%llu",
-			        (unsigned long long)ok_app, (unsigned long long)n_app, (unsigned long long)ok_rp,
-			        (unsigned long long)n_rp);
-		}
-	}
 
 	// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
 	atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
