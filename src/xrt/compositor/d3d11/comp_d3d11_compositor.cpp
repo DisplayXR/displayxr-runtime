@@ -1577,6 +1577,45 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	    comp_d3d11_target_get_back_buffer(c->target));
 	d3d11_composite_zone_mask(c, is_repaint, back_buffer_2d, target_width, target_height, &eff_canvas);
 
+	/*
+	 * #868 diag: paired woven back-buffer capture. ONE trigger arms BOTH weave
+	 * kinds so the pair is adjacent in time — comparing an app weave against a
+	 * repaint captured seconds apart would drown the signal in scene motion.
+	 * This is the instrument that localised the equivalent D3D12 bug after
+	 * three wrong hypotheses.
+	 */
+	{
+		const char *tmp = getenv("TEMP");
+		static bool probe_logged = false;
+		if (!probe_logged) {
+			probe_logged = true;
+			U_LOG_W("#868 d3d11 capture probe: TEMP=%s back_buffer=%p", tmp ? tmp : "(null)",
+			        (void *)back_buffer_2d);
+		}
+		if (tmp != nullptr && back_buffer_2d != nullptr) {
+			static bool want_app = false, want_repaint = false;
+			char trig[512];
+			snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
+			FILE *tf = fopen(trig, "rb");
+			if (tf != nullptr) {
+				fclose(tf);
+				remove(trig);
+				want_app = true;
+				want_repaint = true;
+			}
+			bool *want = is_repaint ? &want_repaint : &want_app;
+			if (*want) {
+				*want = false;
+				char out[512];
+				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp,
+				         is_repaint ? "repaint" : "app");
+				bool wok = d3d11_capture_texture_to_png(c, back_buffer_2d, target_width,
+				                                        target_height, 0, 0, out);
+				U_LOG_W("#868 d3d11 woven capture %s -> %s", wok ? "OK" : "FAILED", out);
+			}
+		}
+	}
+
 	// Only a REAL frame resets the quiet-gate; a repaint must not, or repaints
 	// would pace off their own timestamps and drift below panel rate.
 	if (!is_repaint) {
