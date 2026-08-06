@@ -367,6 +367,11 @@ struct comp_d3d12_compositor
 		//! Kill switch: DXR_WEAVE_REPAINT=0. -1 = unprobed.
 		int enabled;
 
+		//! DXR_WEAVE_REPAINT_FORCE=1 — bypass the quiet-gate so the repaint
+		//! path runs on hardware where no app is slow enough to trip it.
+		//! A correctness probe; it costs frame rate by design.
+		int force;
+
 		//! Last frame was DP-woven and not zero-copy ⟹ safe to replay.
 		bool armed;
 
@@ -1903,6 +1908,28 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c,
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 	}
 
+	// #672 diag: file-triggered WOVEN back-buffer capture (post-DP). Shows the
+	// actual panel image, so a zone dropped by the weave is visible. Lives here
+	// rather than in layer_commit so it can capture a REPAINT too — the output
+	// name says which kind of weave produced it (#868).
+	if (back_buffer != nullptr) {
+		const char *tmp = getenv("TEMP");
+		if (tmp != nullptr) {
+			char trig[512];
+			snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
+			FILE *tf = fopen(trig, "rb");
+			if (tf != nullptr) {
+				fclose(tf);
+				remove(trig);
+				char out[512];
+				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp, is_repaint ? "repaint" : "app");
+				bool wok =
+				    d3d12_capture_backbuffer_to_png(c, back_buffer, D3D12_RESOURCE_STATE_PRESENT, out);
+				U_LOG_W("#672 woven back-buffer capture %s -> %s", wok ? "OK" : "FAILED", out);
+			}
+		}
+	}
+
 	return xret;
 }
 
@@ -1962,7 +1989,12 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// only exists when a refresh is genuinely unclaimed, which is what
 		// >= 2 periods means. That is also exactly the case #868 is FOR: a
 		// 60 fps app on a 240 Hz panel sits at 4 periods.
-		if (os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		//
+		// DXR_WEAVE_REPAINT_FORCE=1 bypasses the gate so the repaint path can be
+		// exercised on hardware where no app is slow enough to trip it. It makes
+		// the app SLOWER (it is meant to) — it is a correctness probe, never a
+		// perf setting.
+		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -1981,7 +2013,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			c->repaint.bail_armed++;
 			continue;
 		}
-		if (os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
 			c->repaint.bail_race++;
 			continue;
 		}
@@ -2692,27 +2724,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// capture surface works regardless of which weave path ran.
 		d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
 
-		// #672 diag: file-triggered WOVEN back-buffer capture (post-DP). Shows
-		// the actual panel image, so a zone dropped by the weave is visible.
-		{
-			const char *tmp = getenv("TEMP");
-			// back_buffer is NULL on the no-atlas path, which wove nothing.
-			if (tmp != nullptr && back_buffer != nullptr) {
-				char trig[512];
-				snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
-				FILE *tf = fopen(trig, "rb");
-				if (tf != nullptr) {
-					fclose(tf);
-					remove(trig);
-					char out[512];
-					snprintf(out, sizeof(out), "%s\\dxr_woven.png", tmp);
-					bool wok = d3d12_capture_backbuffer_to_png(c, back_buffer,
-				                                           D3D12_RESOURCE_STATE_PRESENT, out);
-					U_LOG_W("#672 woven back-buffer capture %s -> %s",
-					        wok ? "OK" : "FAILED", out);
-				}
-			}
-		}
+		// #672 woven back-buffer capture now lives in d3d12_dp_weave_and_present
+		// so it can capture repaints as well as app frames (#868).
 
 		return XRT_SUCCESS;
 	}
@@ -3184,6 +3197,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	{
 		const char *e = getenv("DXR_WEAVE_REPAINT");
 		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
+		if (c->repaint.force == 1) {
+			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
+			        "rate. This is a correctness probe and WILL cost frame rate.");
+		}
 		if (c->repaint.enabled == 1 && c->target != nullptr) {
 			c->repaint_quit.store(false);
 			c->repaint_thread = std::thread(d3d12_repaint_thread, c);
