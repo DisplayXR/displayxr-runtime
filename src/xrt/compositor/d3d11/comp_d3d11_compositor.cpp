@@ -362,6 +362,11 @@ struct comp_d3d11_compositor
 		uint64_t last_app_frame_ns;
 		uint64_t count, ticks;
 
+		//! DXR_WEAVE_REPAINT_HASH=1 adjacent-pair probe.
+		int hash_probe;
+		uint64_t app_hash, app_seq, hash_seq;
+		uint8_t *app_px; //!< retained pixels of the last app weave
+
 		//! Resolved by the last app frame; replayed as-is.
 		bool zero_copy;
 		void *zc_srv;
@@ -1470,6 +1475,86 @@ d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void
 }
 
 /*!
+ * #868 diag (DXR_WEAVE_REPAINT_HASH=1): cheap content hash of a rendered target.
+ *
+ * The PNG-pair instrument cannot settle whether a repaint reproduces the app
+ * frame, because encoding a PNG takes 70-150 ms and the scene moves in the gap —
+ * on D3D11 the residual difference is the same size as that animation artifact.
+ * This hashes on the frame path instead, so an app weave and the repaint that
+ * follows it can be compared with NOTHING in between.
+ *
+ * Subsamples every 4th row and every 4th pixel: enough to catch a structurally
+ * different frame, cheap enough to run every weave while probing. Still a
+ * staging copy + Map, so it is env-gated and never on by default.
+ */
+static uint64_t
+d3d11_hash_target(struct comp_d3d11_compositor *c,
+                  ID3D11Texture2D *tex,
+                  uint32_t w,
+                  uint32_t h,
+                  uint8_t **out_rgba)
+{
+	if (tex == nullptr || w == 0 || h == 0) {
+		return 0;
+	}
+	D3D11_TEXTURE2D_DESC td;
+	tex->GetDesc(&td);
+	if (w > td.Width)  w = td.Width;
+	if (h > td.Height) h = td.Height;
+
+	D3D11_TEXTURE2D_DESC sd = td;
+	sd.Width = w;
+	sd.Height = h;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	sd.SampleDesc.Count = 1;
+	sd.SampleDesc.Quality = 0;
+
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		return 0;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	c->context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		staging->Release();
+		return 0;
+	}
+	uint64_t hsh = 1469598103934665603ull; // FNV-1a offset basis
+	const uint8_t *base = (const uint8_t *)m.pData;
+	if (out_rgba != nullptr) {
+		// Keep the pixels so a mismatch can dump BOTH sides of the pair. The
+		// app frame is gone by the time the repaint discovers the mismatch, so
+		// it has to be retained up front.
+		free(*out_rgba);
+		*out_rgba = (uint8_t *)malloc((size_t)w * h * 4);
+		if (*out_rgba != nullptr) {
+			for (uint32_t y = 0; y < h; y++) {
+				memcpy(*out_rgba + (size_t)y * w * 4, base + (size_t)y * m.RowPitch,
+				       (size_t)w * 4);
+			}
+		}
+	}
+	for (uint32_t y = 0; y < h; y += 4) {
+		const uint8_t *row = base + (size_t)y * m.RowPitch;
+		for (uint32_t x = 0; x < w; x += 4) {
+			// RGB only — swapchain alpha is undefined for display output.
+			for (int k = 0; k < 3; k++) {
+				hsh ^= (uint64_t)row[(size_t)x * 4 + k];
+				hsh *= 1099511628211ull;
+			}
+		}
+	}
+	c->context->Unmap(staging, 0);
+	staging->Release();
+	return hsh;
+}
+
+/*!
  * #868: record the display-processor weave for the current frame state.
  * Shared by layer_commit and the repaint thread, so a repaint is constructed
  * exactly like the app frame it stands in for.
@@ -1576,6 +1661,54 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	ID3D11Texture2D *back_buffer_2d = static_cast<ID3D11Texture2D *>(
 	    comp_d3d11_target_get_back_buffer(c->target));
 	d3d11_composite_zone_mask(c, is_repaint, back_buffer_2d, target_width, target_height, &eff_canvas);
+
+	/*
+	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the
+	 * app frame it stands in for, pixel for pixel, whenever the viewer has not
+	 * moved. Comparing ONLY when no app weave has intervened (app_seq unchanged)
+	 * is what makes a mismatch meaningful — otherwise a newer atlas, which is
+	 * correct behaviour, reads as a defect.
+	 */
+	if (c->repaint.hash_probe == 1 && back_buffer_2d != nullptr) {
+		uint8_t *rp_px = nullptr;
+		const uint64_t hsh = d3d11_hash_target(c, back_buffer_2d, target_width, target_height,
+		                                       is_repaint ? &rp_px : &c->repaint.app_px);
+		if (!is_repaint) {
+			c->repaint.app_hash = hsh;
+			c->repaint.app_seq++;
+			c->repaint.hash_seq = c->repaint.app_seq;
+		} else if (c->repaint.app_hash != 0 && c->repaint.hash_seq == c->repaint.app_seq) {
+			static uint64_t same = 0, diff = 0;
+			if (hsh == c->repaint.app_hash) {
+				same++;
+			} else {
+				diff++;
+			}
+			if (((same + diff) % 120) == 0) {
+				U_LOG_W("#868 hash: adjacent repaint reproduced the app frame %llu/%llu "
+				        "(mismatches %llu)",
+				        (unsigned long long)same, (unsigned long long)(same + diff),
+				        (unsigned long long)diff);
+			}
+			// Dump the FIRST mismatching pair. Both sides are in hand and no
+			// app weave separates them, so the difference is the defect itself.
+			static bool dumped = false;
+			const char *tmp2 = getenv("TEMP");
+			if (!dumped && hsh != c->repaint.app_hash && tmp2 != nullptr && rp_px != nullptr &&
+			    c->repaint.app_px != nullptr) {
+				dumped = true;
+				char pa[512], pr[512];
+				snprintf(pa, sizeof(pa), "%s\\hash_app.png", tmp2);
+				snprintf(pr, sizeof(pr), "%s\\hash_repaint.png", tmp2);
+				stbi_write_png(pa, (int)target_width, (int)target_height, 4, c->repaint.app_px,
+				               (int)target_width * 4);
+				stbi_write_png(pr, (int)target_width, (int)target_height, 4, rp_px,
+				               (int)target_width * 4);
+				U_LOG_W("#868 hash: dumped first mismatching pair -> %s / %s", pa, pr);
+			}
+		}
+		free(rp_px);
+	}
 
 	/*
 	 * #868 diag: paired woven back-buffer capture. ONE trigger arms BOTH weave
@@ -2567,6 +2700,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
+		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");
+		c->repaint.hash_probe = (he != nullptr && he[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
 			        "rate. Correctness probe; it WILL cost frame rate.");
