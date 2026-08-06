@@ -54,6 +54,7 @@ struct weave_latency_log
 		uint64_t predicted_ns;
 	};
 	uint64_t pending_predicted_ns = 0; // armed by mark_weave, consumed by after_present
+	bool pending_repaint = false;      // #868: this weave re-wove an unchanged atlas
 	pending ring[8] = {};
 	int ring_head = 0;
 	int ring_count = 0;
@@ -93,13 +94,14 @@ struct weave_latency_log
 	//! for this frame (0 if unknown); it is differenced against the frame's
 	//! true scanout in after_present to expose prediction error (#867).
 	void
-	mark_weave(const char *site, uint64_t predicted_display_time_ns = 0)
+	mark_weave(const char *site, uint64_t predicted_display_time_ns = 0, bool repaint = false)
 	{
 		(void)on(site);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		qpc_weave = (uint64_t)now.QuadPart;
 		pending_predicted_ns = predicted_display_time_ns;
+		pending_repaint = repaint;
 	}
 
 	void
@@ -410,11 +412,15 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 				ring_count++;
 			}
 			if (csv) {
-				fprintf(f, "F,%llu,%llu,%llu,%u\n", (unsigned long long)seq++,
+				// #868: trailing field marks a repaint (re-weave of an
+				// unchanged atlas) so the two present populations can be
+				// counted apart. Older readers ignore the extra column.
+				fprintf(f, "F,%llu,%llu,%llu,%u,%d\n", (unsigned long long)seq++,
 				        (unsigned long long)qpc_weave, (unsigned long long)now.QuadPart,
-				        present_count);
+				        present_count, pending_repaint ? 1 : 0);
 			}
 			qpc_weave = 0;
+			pending_repaint = false;
 		}
 
 		DXGI_FRAME_STATISTICS stats = {};

@@ -57,6 +57,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <cmath>
 
 /*!
@@ -333,6 +335,69 @@ struct comp_d3d12_compositor
 
 	//! Thread safety.
 	std::mutex mutex;
+
+	/*!
+	 * #868 — weave-rate decoupling.
+	 *
+	 * Weave is f(atlas, eye_position) and the display processor re-pulls the
+	 * viewer's eyes at weave time, so re-weaving an UNCHANGED atlas against
+	 * fresh eyes is not a no-op: it re-derives the parallax for where the
+	 * viewer is now. An app rendering below the panel rate would otherwise
+	 * hold one interlace pattern across several refreshes, and head motion in
+	 * that window shows up as a stale view.
+	 *
+	 * The repaint thread replays the weave+present of the last frame at panel
+	 * rate whenever the app has gone quiet. Two invariants make it safe:
+	 *
+	 *  - It runs ONLY when the last frame was not zero-copy. On the zero-copy
+	 *    path the "atlas" is the app's own swapchain image, which the app
+	 *    reacquires and overwrites — re-weaving it would race the app and
+	 *    sample a half-drawn frame. Off zero-copy the DP reads
+	 *    @ref dp_input_resource, a compositor-owned crop that stays valid until
+	 *    the next layer_commit. This is a per-frame branch on the existing
+	 *    u_tiling_can_zero_copy() gate, not a policy flag.
+	 *  - It holds @ref mutex across the whole replay, so the display processor
+	 *    still only ever sees one caller. process_atlas has only ever been
+	 *    called from the app's thread; the plug-in contract does not promise
+	 *    thread-safety, and adding a loop on our side must not silently make
+	 *    thread-safety a vendor requirement.
+	 */
+	struct
+	{
+		//! Kill switch: DXR_WEAVE_REPAINT=0. -1 = unprobed.
+		int enabled;
+
+		//! Last frame was DP-woven and not zero-copy ⟹ safe to replay.
+		bool armed;
+
+		//! Everything process_atlas needs, captured at the last real weave.
+		//! Stable by construction: the resources are compositor-owned and the
+		//! geometry only changes when a new frame arrives (which re-arms).
+		uint32_t tgt_w, tgt_h;
+		uint32_t view_w, view_h;
+		uint32_t cols, rows;
+		struct u_canvas_rect canvas;
+		ID3D12Resource *dp_resource;
+		ID3D12Resource *backdrop;
+		uint32_t backdrop_w, backdrop_h;
+		struct xrt_eye_positions eye_pos;
+
+		//! os_monotonic_get_ns() of the last weave driven by a REAL app frame.
+		//! Gates the repaint so it only fires once the app has actually gone
+		//! quiet. Deliberately not touched by repaints — see the thread.
+		uint64_t last_app_frame_ns;
+
+		//! Diagnostics: where the loop goes, counted so a repaint that never
+		//! fires can be told apart from one that fires and does nothing.
+		uint64_t count;      // repaints actually issued
+		uint64_t ticks;      // loop wakeups
+		uint64_t bail_armed; // not armed (no non-zero-copy DP frame yet)
+		uint64_t bail_gate;  // app still making rate
+		uint64_t bail_race;  // app frame landed while we paced / took the lock
+	} repaint;
+
+	std::thread repaint_thread;
+	std::atomic<bool> repaint_quit;
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
@@ -1656,6 +1721,296 @@ d3d12_bind_dp_atlas_srv(struct comp_d3d12_compositor *c, ID3D12Resource *dp_reso
 	return c->dp_srv_heap->GetGPUDescriptorHandleForHeapStart().ptr;
 }
 
+/*!
+ * #868: record the display-processor weave into the open command list, then
+ * close, execute and present it.
+ *
+ * Everything this reads lives in `c->repaint`, which layer_commit fills in
+ * immediately before the call. That is the whole point: the weave is a pure
+ * function of (atlas, geometry, canvas, backdrop) plus a freshly acquired back
+ * buffer and whatever eye positions the display processor pulls for itself at
+ * weave time. Hold those fixed, re-run this, and you get the same content
+ * re-derived for where the viewer is NOW — which is exactly what the repaint
+ * thread wants.
+ *
+ * Entry contract: `c->cmd_list` is open and freshly reset, and the resource in
+ * `c->repaint.dp_resource` is readable by the DP.
+ *
+ * @param atlas_restore The renderer atlas layer_commit transitioned to COMMON on
+ *        the way in, to be put back to PIXEL_SHADER_RESOURCE before the list
+ *        closes. NULL from the repaint path, which never touches the renderer
+ *        atlas — it re-weaves the already-cropped `dp_input_resource`.
+ * @param is_repaint Selects the pacing mark that keeps repaints out of the
+ *        saturation governor and the #867 prediction ledger.
+ * @param[out] out_back_buffer The image this weave went into. Captured before
+ *        the present, which advances the swapchain's current index.
+ */
+static xrt_result_t
+d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c,
+                           ID3D12Resource *atlas_restore,
+                           bool is_repaint,
+                           ID3D12Resource **out_back_buffer)
+{
+	const uint32_t tgt_width = c->repaint.tgt_w;
+	const uint32_t tgt_height = c->repaint.tgt_h;
+	const struct u_canvas_rect eff_canvas = c->repaint.canvas;
+
+	uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
+	ID3D12Resource *back_buffer =
+	    static_cast<ID3D12Resource *>(comp_d3d12_target_get_back_buffer(c->target, bb_index));
+	uint64_t rtv_handle_raw = comp_d3d12_target_get_rtv_handle(c->target, bb_index);
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+	rtv_handle.ptr = static_cast<SIZE_T>(rtv_handle_raw);
+	if (out_back_buffer != nullptr) {
+		*out_back_buffer = back_buffer;
+	}
+
+	// One-time diagnostic: log back buffer vs viewport dimensions
+	static bool dp_dims_logged = false;
+	if (!dp_dims_logged && back_buffer != nullptr) {
+		dp_dims_logged = true;
+		D3D12_RESOURCE_DESC bb_desc = back_buffer->GetDesc();
+		U_LOG_W("D3D12 DP dims: back_buffer=%llux%u, viewport=%ux%u, "
+		        "view=%ux%u, atlas=%ux%u (tile %ux%u)",
+		        (unsigned long long)bb_desc.Width, (unsigned)bb_desc.Height, tgt_width, tgt_height,
+		        c->repaint.view_w, c->repaint.view_h, c->repaint.cols * c->repaint.view_w,
+		        c->repaint.rows * c->repaint.view_h, c->repaint.cols, c->repaint.rows);
+	}
+
+	// Transition back buffer: PRESENT → RENDER_TARGET
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = back_buffer;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &barrier);
+
+	// Bind back buffer as render target
+	c->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+
+	xrt_display_processor_d3d12_set_background_2d(c->display_processor, c->repaint.backdrop,
+	                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
+
+	D3D12_VIEWPORT viewport = {};
+	viewport.TopLeftX = 0.0f;
+	viewport.TopLeftY = 0.0f;
+	viewport.Width = static_cast<float>(tgt_width);
+	viewport.Height = static_cast<float>(tgt_height);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	c->cmd_list->RSSetViewports(1, &viewport);
+
+	D3D12_RECT scissor = {};
+	scissor.left = 0;
+	scissor.top = 0;
+	scissor.right = static_cast<LONG>(tgt_width);
+	scissor.bottom = static_cast<LONG>(tgt_height);
+	c->cmd_list->RSSetScissorRects(1, &scissor);
+
+	// Late-weave pacing + weave-latency harness mark (env-gated no-ops
+	// otherwise). A repaint already paced itself unlocked, and is deliberately
+	// kept out of the governor's frame-interval EMA and out of the #867
+	// prediction ledger — it has no app frame and no promised photon time
+	// behind it.
+	if (is_repaint) {
+		comp_d3d12_target_weave_mark_repaint(c->target);
+	} else {
+		comp_d3d12_target_weave_mark(c->target, c->last_display_time_ns);
+	}
+
+	// Timing feedback: hand the DP last frame's MEASURED weave→scanout residual
+	// so the vendor eye predictor runs with an exact horizon (0 = unknown ⟹ DP
+	// heuristic).
+	xrt_display_processor_d3d12_set_frame_timing(c->display_processor,
+	                                             comp_d3d12_target_get_measured_weave_ns(c->target),
+	                                             (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+
+	// Pass actual backbuffer dimensions to the DP. Canvas offset and size are
+	// passed separately — the DP uses them to set a viewport sub-rect for
+	// correct interlacing phase.
+	xrt_display_processor_d3d12_process_atlas(
+	    c->display_processor, c->cmd_list, c->repaint.dp_resource,
+	    d3d12_bind_dp_atlas_srv(c, c->repaint.dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
+	    rtv_handle.ptr, back_buffer, c->repaint.view_w, c->repaint.view_h, c->repaint.cols, c->repaint.rows,
+	    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM), tgt_width, tgt_height,
+	    eff_canvas.valid ? eff_canvas.x : 0, eff_canvas.valid ? eff_canvas.y : 0,
+	    eff_canvas.valid ? eff_canvas.w : 0, eff_canvas.valid ? eff_canvas.h : 0);
+
+	// #439 / ADR-027: an authored zone mask or Local2D layers composite the
+	// 2D/3D regions of the back buffer. Back buffer is still in RENDER_TARGET
+	// from the DP; leave it in RENDER_TARGET so HUD's existing RT→COPY_DEST
+	// transition (below) proceeds unchanged. No-op when this frame carries no
+	// zones / Local2D / explicit mask.
+	d3d12_composite_zone_mask(c, back_buffer, rtv_handle.ptr, D3D12_RESOURCE_STATE_RENDER_TARGET,
+	                          D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width, tgt_height, &eff_canvas);
+
+	// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
+	if (atlas_restore != nullptr) {
+		D3D12_RESOURCE_BARRIER atlas_barrier = {};
+		atlas_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		atlas_barrier.Transition.pResource = atlas_restore;
+		atlas_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		atlas_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		c->cmd_list->ResourceBarrier(1, &atlas_barrier);
+	}
+
+	// Transition back buffer for HUD overlay
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	c->cmd_list->ResourceBarrier(1, &barrier);
+
+	// HUD overlay
+	d3d12_render_hud_overlay(c, c->cmd_list, back_buffer, tgt_width, tgt_height, &c->repaint.eye_pos);
+
+	// Transition back buffer -> PRESENT, assuming the HUD overlay above
+	// left it in COPY_DEST.
+	//
+	// UNSOUND — tracked as #747. This StateBefore is an ASSUMPTION, not
+	// a tracked state: process_atlas hands the back buffer to the vendor
+	// display processor, which is a plug-in DLL (ADR-019) free to leave
+	// it in any state, and D3D12 offers no way to query it back. The
+	// assumption is unverifiable here and wrong states are undefined
+	// behaviour — a credible mechanism for the DEVICE_HUNG seen during
+	// interactive resize churn.
+	//
+	// The fix belongs in the plug-in contract (xrt_plugin_iface should
+	// SPECIFY the required entry state and the guaranteed exit state for
+	// the atlas and the target), not in more guessing here. Do not
+	// "improve" this by inferring what a particular vendor's DP does
+	// internally — that was the previous comment's mistake, and it
+	// justified this state by describing a chroma-key alpha pass that
+	// #573 deleted (set_chroma_key is gone from all five DP vtables;
+	// see xrt_plugin.h). The reasoning outlived the mechanism.
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+	c->cmd_list->ResourceBarrier(1, &barrier);
+
+	// Close and execute
+	c->cmd_list->Close();
+	ID3D12CommandList *weave_lists[] = {c->cmd_list};
+	c->command_queue->ExecuteCommandLists(1, weave_lists);
+
+	// Present with VSync
+	xrt_result_t xret = comp_d3d12_target_present(c->target, 1);
+
+	// Wait for frame completion (frame pacing)
+	gpu_wait_idle(c);
+
+	// Only a real frame resets the quiet-gate; see d3d12_repaint_thread.
+	if (!is_repaint) {
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+	}
+
+	return xret;
+}
+
+/*!
+ * #868 repaint loop: re-weave the last atlas at panel rate while the app is
+ * between frames.
+ *
+ * Ticks once per display period and replays the last weave only when the app
+ * has actually gone quiet (no real frame for ~1.5 periods). That gate is what
+ * keeps this from stealing time from an app that is already making rate: an app
+ * at or above the panel rate never trips it, and the thread costs one wakeup per
+ * refresh doing nothing.
+ *
+ * The lock is held across the whole replay. That serialises the repaint against
+ * layer_commit, so the display processor still only ever sees one caller — a
+ * loop we added must not become a thread-safety requirement on vendor plug-ins.
+ * The cost is that a real frame arriving mid-repaint waits for it; bounded by
+ * one weave+present, and only reachable when the app was idle enough to trip the
+ * gate in the first place.
+ */
+static void
+d3d12_repaint_thread(struct comp_d3d12_compositor *c)
+{
+	while (!c->repaint_quit.load(std::memory_order_relaxed)) {
+		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
+		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		// Tick well inside a period so "the app went quiet" is noticed near the
+		// refresh it matters for, rather than up to a full period late.
+		os_nanosleep((int64_t)(period_ns / 4));
+
+		if (c->repaint_quit.load(std::memory_order_relaxed)) {
+			break;
+		}
+
+		c->repaint.ticks++;
+
+		// Cheap unlocked pre-check, re-tested under the lock below. Avoids
+		// paying the pacing wait on every tick of an app that is making rate.
+		if (!c->repaint.armed) {
+			c->repaint.bail_armed++;
+			continue;
+		}
+		// Fire only once the app has ALREADY missed a full refresh — i.e. the
+		// panel has shown this atlas for a whole period and is about to show it
+		// again. Keyed on the last APP frame, never on the last repaint —
+		// otherwise repaints would pace off their own timestamps and drift below
+		// panel rate. Their cadence comes from the scanout wait instead.
+		//
+		// Two periods, not one-and-a-bit, and that margin is the whole design.
+		// An app whose interval merely straddles a period (measured: the Unity
+		// avatar at 46.7 fps on this 60 Hz panel, a 1.28-period interval) is
+		// about to submit anyway: by the time a repaint paces and takes the
+		// lock, the real frame has landed, so it bails having bought nothing —
+		// and on the ticks where it does not bail it is competing with the app
+		// for the same GPU to fill a gap that was closing on its own. The win
+		// only exists when a refresh is genuinely unclaimed, which is what
+		// >= 2 periods means. That is also exactly the case #868 is FOR: a
+		// 60 fps app on a 240 Hz panel sits at 4 periods.
+		if (os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+			c->repaint.bail_gate++;
+			continue;
+		}
+
+		// Pace to the panel BEFORE taking the lock — this blocks for up to a
+		// few periods, and holding the lock across it would stall an arriving
+		// app frame for exactly that long.
+		comp_d3d12_target_repaint_pace(c->target);
+
+		std::lock_guard<std::mutex> lock(c->mutex);
+
+		// Re-test everything: a real frame may have landed while we paced, in
+		// which case it just did this work and there is nothing stale to fix.
+		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
+		    c->display_processor == NULL || c->target == nullptr || c->repaint.dp_resource == nullptr) {
+			c->repaint.bail_armed++;
+			continue;
+		}
+		if (os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			c->repaint.bail_race++;
+			continue;
+		}
+
+		c->cmd_allocator->Reset();
+		c->cmd_list->Reset(c->cmd_allocator, nullptr);
+
+		d3d12_dp_weave_and_present(c, nullptr, true, nullptr);
+
+		c->repaint.count++;
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#868: repainting last atlas at %.1f Hz while the app is between frames "
+			        "(set DXR_WEAVE_REPAINT=0 to disable)",
+			        hz);
+		}
+		// Periodic counters: apps are usually killed rather than shut down
+		// cleanly, so the destroy-time dump alone is rarely seen.
+		if ((c->repaint.count % 240) == 0) {
+			U_LOG_W("#868: repaints=%llu ticks=%llu bail{armed=%llu gate=%llu race=%llu}",
+			        (unsigned long long)c->repaint.count, (unsigned long long)c->repaint.ticks,
+			        (unsigned long long)c->repaint.bail_armed,
+			        (unsigned long long)c->repaint.bail_gate,
+			        (unsigned long long)c->repaint.bail_race);
+		}
+	}
+}
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2258,65 +2613,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->cmd_allocator->Reset();
 		c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
-		// Get swapchain back buffer and bind as render target
-		uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
-		ID3D12Resource *back_buffer = static_cast<ID3D12Resource *>(
-		    comp_d3d12_target_get_back_buffer(c->target, bb_index));
-		uint64_t rtv_handle_raw = comp_d3d12_target_get_rtv_handle(c->target, bb_index);
-		D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
-		rtv_handle.ptr = static_cast<SIZE_T>(rtv_handle_raw);
-
-		// One-time diagnostic: log back buffer vs viewport dimensions
-		static bool dp_dims_logged = false;
-		if (!dp_dims_logged) {
-			dp_dims_logged = true;
-			D3D12_RESOURCE_DESC bb_desc = back_buffer->GetDesc();
-			uint32_t vw, vh;
-			comp_d3d12_renderer_get_view_dimensions(c->renderer, &vw, &vh);
-			uint32_t tc, tr;
-			comp_d3d12_renderer_get_tile_layout(c->renderer, &tc, &tr);
-			U_LOG_W("D3D12 DP dims: back_buffer=%llux%u, viewport=%ux%u, "
-			        "view=%ux%u, atlas=%ux%u (tile %ux%u), zero_copy=%d",
-			        (unsigned long long)bb_desc.Width, (unsigned)bb_desc.Height,
-			        tgt_width, tgt_height,
-			        vw, vh,
-			        tc * vw, tr * vh,
-			        tc, tr, (int)zero_copy);
-		}
-
-		// Transition back buffer: PRESENT → RENDER_TARGET
-		D3D12_RESOURCE_BARRIER barrier = {};
-		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barrier.Transition.pResource = back_buffer;
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		c->cmd_list->ResourceBarrier(1, &barrier);
-
-		// Bind back buffer as render target
-		c->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
-
 		// #542: the DP gets the frame's EFFECTIVE content layout (== the
 		// mode layout for matched submissions), not the mode layout.
 		uint32_t view_width = c->eff_layout.tile_w;
 		uint32_t view_height = c->eff_layout.tile_h;
+		// The back buffer this frame actually wove into. Captured by the
+		// helper BEFORE the present, because presenting advances the
+		// swapchain's current index — the post-present diagnostics below want
+		// the image that just went out, not the next one.
+		ID3D12Resource *back_buffer = nullptr;
 		ID3D12Resource *atlas_resource = zero_copy
 		    ? static_cast<ID3D12Resource *>(zc_resource)
 		    : static_cast<ID3D12Resource *>(comp_d3d12_renderer_get_atlas_resource(c->renderer));
-
-		if (diag_log) {
-			D3D12_RESOURCE_DESC atlas_desc = atlas_resource
-			    ? atlas_resource->GetDesc() : D3D12_RESOURCE_DESC{};
-			U_LOG_W("D3D12 dp path: atlas=%p (%llux%u), view=%ux%u, target=%ux%u, bb=%u, "
-			        "back_buffer=%p, rtv=0x%llx, zc=%d",
-			        (void *)atlas_resource,
-			        (unsigned long long)atlas_desc.Width, (unsigned)atlas_desc.Height,
-			        view_width, view_height,
-			        tgt_width, tgt_height, bb_index,
-			        (void *)back_buffer,
-			        (unsigned long long)rtv_handle.ptr,
-			        (int)zero_copy);
-		}
 
 		if (atlas_resource != nullptr) {
 			// Both 3D and 2D modes: DP handles weaving/blit
@@ -2339,121 +2647,45 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			// #491 part 3 — flatten the 2D-under layers PRE-weave and hand the
 			// resource to the DP. Done BEFORE the DP viewport/scissor setup
-			// below (the flatten sets its own viewport/scissor; the runtime
-			// re-sets the DP's afterward). NULL ⟹ no under-layers.
+			// (the flatten sets its own viewport/scissor; the runtime re-sets
+			// the DP's afterward). NULL ⟹ no under-layers.
 			uint32_t bd_w = 0, bd_h = 0;
 			ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
-			xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
 
-			D3D12_VIEWPORT viewport = {};
-			viewport.TopLeftX = 0.0f;
-			viewport.TopLeftY = 0.0f;
-			viewport.Width = static_cast<float>(tgt_width);
-			viewport.Height = static_cast<float>(tgt_height);
-			viewport.MinDepth = 0.0f;
-			viewport.MaxDepth = 1.0f;
-			c->cmd_list->RSSetViewports(1, &viewport);
+			// #868: publish everything the weave needs so the repaint thread
+			// can replay it against fresh eyes. Arm only off the zero-copy
+			// path — there dp_resource IS the app's swapchain image (the crop
+			// is skipped), which the app reacquires and overwrites, so a
+			// replay would race the app for a half-drawn frame.
+			c->repaint.tgt_w = tgt_width;
+			c->repaint.tgt_h = tgt_height;
+			c->repaint.view_w = view_width;
+			c->repaint.view_h = view_height;
+			c->repaint.cols = tile_columns;
+			c->repaint.rows = tile_rows;
+			c->repaint.canvas = eff_canvas;
+			c->repaint.dp_resource = dp_resource;
+			c->repaint.backdrop = bd_res;
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+			c->repaint.eye_pos = eye_pos;
+			c->repaint.armed = !zero_copy;
 
-			D3D12_RECT scissor = {};
-			scissor.left = 0;
-			scissor.top = 0;
-			scissor.right = static_cast<LONG>(tgt_width);
-			scissor.bottom = static_cast<LONG>(tgt_height);
-			c->cmd_list->RSSetScissorRects(1, &scissor);
-
-			// Late-weave pacing + weave-latency harness mark (env-gated
-			// no-ops otherwise).
-			comp_d3d12_target_weave_mark(c->target, c->last_display_time_ns);
-
-			// Timing feedback: hand the DP last frame's MEASURED
-			// weave→scanout residual so the vendor eye predictor runs
-			// with an exact horizon (0 = unknown ⟹ DP heuristic).
-			xrt_display_processor_d3d12_set_frame_timing(
-			    c->display_processor, comp_d3d12_target_get_measured_weave_ns(c->target),
-			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-
-			// Pass actual backbuffer dimensions to the DP.
-			// Canvas offset and size are passed separately — the DP uses
-			// them to set a viewport sub-rect for correct interlacing phase.
-			xrt_display_processor_d3d12_process_atlas(
-			    c->display_processor,
-			    c->cmd_list,
-			    dp_resource,
-			    d3d12_bind_dp_atlas_srv(c, dp_resource), // #854: real SRV — sim DP binds it; SR weaver ignores it
-			    rtv_handle.ptr,
-			    back_buffer,
-			    view_width, view_height,
-			    tile_columns, tile_rows,
-			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    tgt_width, tgt_height,
-			    eff_canvas.valid ? eff_canvas.x : 0,
-			    eff_canvas.valid ? eff_canvas.y : 0,
-			    eff_canvas.valid ? eff_canvas.w : 0,
-			    eff_canvas.valid ? eff_canvas.h : 0);
-
-			// #439 / ADR-027: an authored zone mask or Local2D layers
-			// composite the 2D/3D regions of the back buffer. Back buffer
-			// is still in RENDER_TARGET from the DP; leave it in
-			// RENDER_TARGET so HUD's existing RT→COPY_DEST transition
-			// (below) proceeds unchanged. No-op when this frame carries no
-			// zones / Local2D / explicit mask.
-			d3d12_composite_zone_mask(
-			    c, back_buffer, rtv_handle.ptr,
-			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
-			    tgt_width, tgt_height, &eff_canvas);
-
-			// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
-			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-			atlas_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
-
-			// Transition back buffer for HUD overlay
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-			c->cmd_list->ResourceBarrier(1, &barrier);
-
-			// HUD overlay
-			d3d12_render_hud_overlay(c, c->cmd_list, back_buffer, tgt_width, tgt_height, &eye_pos);
-
-			// Transition back buffer -> PRESENT, assuming the HUD overlay above
-			// left it in COPY_DEST.
-			//
-			// UNSOUND — tracked as #747. This StateBefore is an ASSUMPTION, not
-			// a tracked state: process_atlas hands the back buffer to the vendor
-			// display processor, which is a plug-in DLL (ADR-019) free to leave
-			// it in any state, and D3D12 offers no way to query it back. The
-			// assumption is unverifiable here and wrong states are undefined
-			// behaviour — a credible mechanism for the DEVICE_HUNG seen during
-			// interactive resize churn.
-			//
-			// The fix belongs in the plug-in contract (xrt_plugin_iface should
-			// SPECIFY the required entry state and the guaranteed exit state for
-			// the atlas and the target), not in more guessing here. Do not
-			// "improve" this by inferring what a particular vendor's DP does
-			// internally — that was the previous comment's mistake, and it
-			// justified this state by describing a chroma-key alpha pass that
-			// #573 deleted (set_chroma_key is gone from all five DP vtables;
-			// see xrt_plugin.h). The reasoning outlived the mechanism.
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-			c->cmd_list->ResourceBarrier(1, &barrier);
+			// Records the weave into the open command list, then closes,
+			// executes and presents it. Shared verbatim with the repaint
+			// thread — see d3d12_dp_weave_and_present.
+			d3d12_dp_weave_and_present(c, atlas_resource, false, &back_buffer);
 		} else {
-			// No atlas resource — just transition back buffer to PRESENT
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-			c->cmd_list->ResourceBarrier(1, &barrier);
+			c->repaint.armed = false;
+
+			// No atlas to weave — nothing was bound as a render target, so
+			// the back buffer is still in PRESENT. Just flush and present.
+			c->cmd_list->Close();
+			ID3D12CommandList *weave_lists[] = {c->cmd_list};
+			c->command_queue->ExecuteCommandLists(1, weave_lists);
+			comp_d3d12_target_present(c->target, 1);
+			gpu_wait_idle(c);
 		}
-
-		// Close and execute
-		c->cmd_list->Close();
-		ID3D12CommandList *weave_lists[] = {c->cmd_list};
-		c->command_queue->ExecuteCommandLists(1, weave_lists);
-
-		// Present with VSync
-		comp_d3d12_target_present(c->target, 1);
-
-		// Wait for frame completion (frame pacing)
-		gpu_wait_idle(c);
 
 		// Post-compose capture (#210) — fully composed atlas as DP saw it.
 		// DP path returns early; mirror the fallback path's call site so the
@@ -2464,7 +2696,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// the actual panel image, so a zone dropped by the weave is visible.
 		{
 			const char *tmp = getenv("TEMP");
-			if (tmp != nullptr) {
+			// back_buffer is NULL on the no-atlas path, which wove nothing.
+			if (tmp != nullptr && back_buffer != nullptr) {
 				char trig[512];
 				snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
 				FILE *tf = fopen(trig, "rb");
@@ -2584,6 +2817,20 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
 	U_LOG_I("Destroying D3D12 compositor");
+
+	// #868: stop the repaint loop FIRST. It touches the command list, the
+	// target and the display processor under c->mutex, so it has to be joined
+	// before any of that is torn down — not merely signalled.
+	c->repaint_quit.store(true);
+	if (c->repaint_thread.joinable()) {
+		c->repaint_thread.join();
+	}
+	if (c->repaint.ticks > 0) {
+		U_LOG_W("#868: repaints=%llu ticks=%llu bail{armed=%llu gate=%llu race=%llu}",
+		        (unsigned long long)c->repaint.count, (unsigned long long)c->repaint.ticks,
+		        (unsigned long long)c->repaint.bail_armed, (unsigned long long)c->repaint.bail_gate,
+		        (unsigned long long)c->repaint.bail_race);
+	}
 
 	// Uninstall MCP capture hook before the GPU resources go away.
 	u_capture_dims_set_provider(NULL, c);
@@ -2929,6 +3176,20 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	if (c->target != nullptr) {
 		comp_d3d12_target_set_display_period(
 		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
+
+	// #868: start the repaint loop. It arms itself off the first non-zero-copy
+	// DP frame and is inert until then, so starting it here (before the display
+	// processor exists) is safe.
+	{
+		const char *e = getenv("DXR_WEAVE_REPAINT");
+		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		if (c->repaint.enabled == 1 && c->target != nullptr) {
+			c->repaint_quit.store(false);
+			c->repaint_thread = std::thread(d3d12_repaint_thread, c);
+		} else if (c->repaint.enabled == 0) {
+			U_LOG_W("#868: weave repaint disabled (DXR_WEAVE_REPAINT=0)");
+		}
 	}
 
 	// Determine view dimensions
