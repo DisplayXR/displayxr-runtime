@@ -112,6 +112,29 @@ struct comp_d3d11_compositor
 	//! DXGI factory for swapchain creation.
 	IDXGIFactory4 *dxgi_factory;
 
+	/*!
+	 * #868: the device's multithread lock, held for the LIFETIME of the
+	 * compositor so a repaint can make its whole weave sequence atomic.
+	 *
+	 * `device`/`context` above belong to the APP — an immediate context is a
+	 * single shared object, and SetMultithreadProtected(TRUE) only makes
+	 * INDIVIDUAL calls thread-safe. A weave is a sequence (bind RTV, set
+	 * viewport, draw), so the app's own render thread could call
+	 * OMSetRenderTargets between our bind and the weaver's draw — the weave
+	 * then landed on the app's render target and the swapchain stayed black.
+	 * Enter()/Leave() takes that same internal lock across the whole
+	 * sequence, which is the only way to make it atomic.
+	 *
+	 * D3D12 needs no equivalent: it records into per-thread command lists and
+	 * allocators, so there is no shared immediate state to interleave with.
+	 *
+	 * MUST stay BELOW dxgi_factory: comp_d3d11_target.cpp mirrors the members
+	 * above as `comp_d3d11_compositor_internals` to reach them from C. A field
+	 * inserted into that prefix silently shifts the mirror and the target
+	 * reads the wrong pointer (crashes in comp_d3d11_target_create).
+	 */
+	ID3D10Multithread *mt_lock;
+
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
 
@@ -1680,11 +1703,44 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			c->repaint.app_seq++;
 			c->repaint.hash_seq = c->repaint.app_seq;
 		} else if (c->repaint.app_hash != 0 && c->repaint.hash_seq == c->repaint.app_seq) {
-			static uint64_t same = 0, diff = 0;
+			static uint64_t same = 0, diff = 0, black = 0;
 			if (hsh == c->repaint.app_hash) {
 				same++;
 			} else {
 				diff++;
+				/*
+				 * Classify the mismatch. The hash alone cannot separate the
+				 * two populations, and only one of them is a defect: a
+				 * repaint that wove with FRESHER EYES differs by design (that
+				 * is the whole feature), whereas a repaint that produced
+				 * NOTHING is the flicker. Subsampled mean luminance splits
+				 * them for free.
+				 */
+				if (rp_px != nullptr && c->repaint.app_px != nullptr) {
+					uint64_t sa = 0, sr = 0;
+					uint32_t n = 0;
+					const uint32_t stride = target_width * 4;
+					for (uint32_t y = 0; y < target_height; y += 8) {
+						for (uint32_t x = 0; x < target_width; x += 8) {
+							const uint32_t o = y * stride + x * 4;
+							sa += (uint64_t)c->repaint.app_px[o] +
+							      c->repaint.app_px[o + 1] + c->repaint.app_px[o + 2];
+							sr += (uint64_t)rp_px[o] + rp_px[o + 1] + rp_px[o + 2];
+							n++;
+						}
+					}
+					const double ma = n != 0 ? (double)sa / (n * 3.0) : 0.0;
+					const double mr = n != 0 ? (double)sr / (n * 3.0) : 0.0;
+					if (mr < 1.0) {
+						black++;
+					}
+					if ((diff % 10) == 0) {
+						U_LOG_W("#868 hash: mismatch #%llu app_lum=%.1f repaint_lum=%.1f "
+						        "(black repaints %llu)",
+						        (unsigned long long)diff, ma, mr,
+						        (unsigned long long)black);
+					}
+				}
 			}
 			if (((same + diff) % 120) == 0) {
 				U_LOG_W("#868 hash: adjacent repaint reproduced the app frame %llu/%llu "
@@ -1797,9 +1853,42 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			continue;
 		}
 
+		// Acquire exactly as the app frame does. This is NOT bookkeeping: the
+		// swapchain is FLIP_DISCARD, so the back buffer's contents are
+		// UNDEFINED after every Present, and acquire is what clears it to
+		// black. d3d11_dp_weave's comp_d3d11_target_bind() re-binds the RTV
+		// and viewport but does NOT clear — so a repaint that skipped acquire
+		// wove over discarded garbage wherever the weave and the zone
+		// composite do not write every pixel (outside the canvas sub-rect, and
+		// any 2D band). App frames started from black, repaints did not, so
+		// those regions alternated at the repaint rate — the D3D11 flicker.
+		//
+		// D3D12 has no equivalent exposure: its shared weave function
+		// re-queries the current back-buffer index and RTV on every weave, so
+		// both paths are constructed identically by design there. This is that
+		// same property, restored on D3D11.
+		uint32_t rp_index = 0;
+
+		/*
+		 * Make the whole replay atomic on the immediate context. c->mutex only
+		 * excludes the compositor's OWN callers; the app renders its scene on
+		 * its own thread through this same context and never takes it. Without
+		 * this, an app OMSetRenderTargets landing mid-sequence sent the weave
+		 * to the app's render target and left the swapchain black — measured
+		 * at ~19% of repaints, which is the flicker.
+		 */
+		if (c->mt_lock != nullptr) {
+			c->mt_lock->Enter();
+		}
+
+		comp_d3d11_target_acquire(c->target, &rp_index);
 		d3d11_dp_weave(c, true);
 		d3d11_render_hud_overlay(c, true, &c->repaint.eye_pos);
 		comp_d3d11_target_present(c->target, 1);
+
+		if (c->mt_lock != nullptr) {
+			c->mt_lock->Leave();
+		}
 
 		c->repaint.count++;
 		static bool logged = false;
@@ -2466,6 +2555,13 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->dxgi_factory->Release();
 	}
 
+	// #868: released after the repaint thread has been joined (above), so no
+	// replay can still be inside Enter()/Leave().
+	if (c->mt_lock != nullptr) {
+		c->mt_lock->Release();
+		c->mt_lock = nullptr;
+	}
+
 	if (c->context != nullptr) {
 		c->context->Release();
 	}
@@ -2570,12 +2666,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Enable D3D11 multithread protection for cross-thread window/compositor access.
 	// The HWND lives on a dedicated window thread while D3D11 rendering happens here.
 	HRESULT hr;
+	c->mt_lock = nullptr;
 	{
 		ID3D10Multithread *mt = nullptr;
 		hr = c->device->QueryInterface(__uuidof(ID3D10Multithread), (void **)&mt);
 		if (SUCCEEDED(hr) && mt != nullptr) {
 			mt->SetMultithreadProtected(TRUE);
-			mt->Release();
+			// #868: kept (not released) — the repaint thread needs
+			// Enter()/Leave() to make its weave sequence atomic against the
+			// app's own use of this same immediate context.
+			c->mt_lock = mt;
 			U_LOG_W("D3D11 multithread protection enabled");
 		}
 	}
@@ -2704,22 +2804,28 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	/*
-	 * #868: the repaint loop, OPT-IN on D3D11 (DXR_WEAVE_REPAINT=1).
+	 * #868: the repaint loop, ON by default (DXR_WEAVE_REPAINT=0 disables).
 	 *
-	 * D3D12 defaults this ON — it is hardware-verified there. D3D11 is NOT: the
-	 * frame-path hash probe (DXR_WEAVE_REPAINT_HASH=1) measures adjacent
-	 * repaints reproducing the app frame only 23 times in 1080, i.e. a 97.9%
-	 * divergence with an identical atlas, and the divergence is visible as
-	 * flicker. The cause is still unidentified, and #875 (single renderer on a
-	 * timer) is expected to remove the whole class rather than this path being
-	 * debugged further.
+	 * Hardware-verified on D3D11 as well as D3D12. Getting here took two fixes
+	 * that the frame-path hash probe (DXR_WEAVE_REPAINT_HASH=1) localised only
+	 * once a mean-luminance classifier split the mismatches into the two
+	 * populations they actually contained — a repaint weaving with FRESHER
+	 * EYES differs by design and is the feature, whereas ~19% of them were
+	 * coming out fully BLACK, which is the flicker:
 	 *
-	 * Default-off rather than compiled out so the probe stays usable on the
-	 * D3D11 path while #875 is built.
+	 *   1. The replay skipped comp_d3d11_target_acquire, which is what CLEARS
+	 *      the FLIP_DISCARD back buffer. App frames started from black,
+	 *      repaints started from discarded garbage.
+	 *   2. The replay ran unserialised against the APP's immediate context.
+	 *      See mt_lock — SetMultithreadProtected only protects individual
+	 *      calls, and a weave is a sequence.
+	 *
+	 * Measured after both: adjacent repaints reproduce the app frame 1320/1320
+	 * with zero black frames, against 500/1320 before.
 	 */
 	{
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
 		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");
