@@ -1719,12 +1719,6 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 */
 	{
 		const char *tmp = getenv("TEMP");
-		static bool probe_logged = false;
-		if (!probe_logged) {
-			probe_logged = true;
-			U_LOG_W("#868 d3d11 capture probe: TEMP=%s back_buffer=%p", tmp ? tmp : "(null)",
-			        (void *)back_buffer_2d);
-		}
 		if (tmp != nullptr && back_buffer_2d != nullptr) {
 			static bool want_app = false, want_repaint = false;
 			char trig[512];
@@ -2693,11 +2687,23 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 	}
 
-	// #868: start the repaint loop. It arms itself off the first non-zero-copy
-	// DP frame and is inert until then.
+	/*
+	 * #868: the repaint loop, OPT-IN on D3D11 (DXR_WEAVE_REPAINT=1).
+	 *
+	 * D3D12 defaults this ON — it is hardware-verified there. D3D11 is NOT: the
+	 * frame-path hash probe (DXR_WEAVE_REPAINT_HASH=1) measures adjacent
+	 * repaints reproducing the app frame only 23 times in 1080, i.e. a 97.9%
+	 * divergence with an identical atlas, and the divergence is visible as
+	 * flicker. The cause is still unidentified, and #875 (single renderer on a
+	 * timer) is expected to remove the whole class rather than this path being
+	 * debugged further.
+	 *
+	 * Default-off rather than compiled out so the probe stays usable on the
+	 * D3D11 path while #875 is built.
+	 */
 	{
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		c->repaint.enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
 		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");
