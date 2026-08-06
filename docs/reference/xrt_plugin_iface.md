@@ -204,6 +204,38 @@ The iface is designed to evolve without breaking older plug-ins:
 3. **Pure-additive struct changes do NOT bump the API version.** Only non-additive layout changes do.
 4. **Optional methods are NULL-safe.** Adding a new optional method is a pure-additive change; old plug-ins return NULL for the new slot, the runtime handles NULL.
 
+## Frame-timing inputs are an offer, never a requirement
+
+The runtime does a lot of work to make each frame reach the panel as late and
+as predictably as possible, and it hands the results to the display processor.
+**All of it is an offer.** A display processor that ignores every one of these
+inputs must still render correctly; it simply forgoes the accuracy they enable.
+Nothing in the runtime's frame path assumes a plug-in predicts anything.
+
+Concretely, and verified rather than assumed:
+
+| Input | How it reaches the plug-in | What happens if the plug-in ignores it |
+|---|---|---|
+| Measured weave→scanout residual and panel period | `set_frame_timing`, an **optional appended slot** on each per-API vtable | Guarded by both `XRT_DP_HAS_SLOT` (a `struct_size` read-clamp, so a plug-in compiled against older headers is safe) and a NULL check. The runtime skips the call. |
+| Presentation paced to the previous frame's real scanout | Nothing — the runtime simply presents later | The plug-in sees an ordinary `process_atlas` call. Pacing changes *when* it is called, never *what* it must do. |
+| Fresh viewer position at weave time | The plug-in's own `get_predicted_eye_positions`, if it chooses to re-predict | A plug-in that samples once, or not at all, produces a correct frame with a staler viewer position. No runtime path requires re-prediction. |
+
+The corollary matters for anyone writing a plug-in: **do not treat late
+presentation as a contract that you will be called at a particular time.** The
+runtime may present earlier or later as the pipeline changes, and on Vulkan the
+pacing depends on device features the *application* may not have enabled (see
+below), in which case it is dormant and every frame still arrives.
+
+The one place this asymmetry shows up in application code is Vulkan device
+creation. Pacing needs `VK_KHR_present_id` + `VK_KHR_present_wait`, which can
+only be enabled by whoever calls `vkCreateDevice`. Under
+`XR_KHR_vulkan_enable2` that is the runtime, which requests both when the
+driver reports support and proceeds without them when it does not. Under
+`XR_KHR_vulkan_enable` it is the application, and if it does not enable them
+the runtime logs one warning and runs unpaced. Either way nothing fails — the
+difference is accuracy, not correctness. Application-side guidance:
+[INV-5.9](../guides/displayxr-app-rules.md).
+
 ## Aux surface — separate from the iface
 
 Logging, debug-variable tracking, frame metrics, Perfetto tracing, and unique-ID generation are **not** plumbed through this iface. Plug-ins reach them by linking the runtime DLL's import library (`DisplayXRClient.lib`) and getting `__declspec(dllimport)`'d symbols. See [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) for the rationale.

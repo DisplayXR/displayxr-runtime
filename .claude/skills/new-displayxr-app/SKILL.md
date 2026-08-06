@@ -115,5 +115,14 @@ Pick the exact match; if none exists, pick the same **class+platform** (swap API
     exemplars. Pick per the reference-app map and say which path the new app is on.
 - **Color (INV-4.6):** the scaffold inherits the reference app's swapchain choice; if you change it,
   request an sRGB swapchain and store a correctly-encoded image — never double-encode.
+- **Vulkan session setup (INV-5.9):** `cube_handle_vk_win` uses `XR_KHR_vulkan_enable2`, so a
+  Windows VK app inherits it — the **runtime** creates the `VkDevice` and enables the
+  `present_id`/`present_wait` features that let it pace presentation, with zero app-side feature
+  code. Do not "simplify" the session back to `XR_KHR_vulkan_enable` and your own `vkCreateDevice`:
+  nothing will fail, the linter only WARNs, and you will silently lose the pacing because the
+  runtime is no longer the one creating the device. If you do keep enable1, chain
+  `VkPhysicalDevicePresentIdFeaturesKHR` + `PresentWaitFeaturesKHR` yourself. Watch the proc names
+  — the v1 spellings (`xrGetVulkanGraphicsRequirementsKHR`) are not dispatchable under
+  enable2-only, a trap that shipped twice in demo repos.
 - The linter is advisory on WARNs but **blocking on ERRORs**; treat a clean linter run as the
   definition of "scaffold complete."

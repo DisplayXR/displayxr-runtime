@@ -418,6 +418,14 @@ its own content by definition, so there is no full-window backer. Reference apps
   `PresentWaitFeatures` token anywhere in the app (enable2 apps have no `vkCreateDevice` call, so
   they pass by construction).
 
+  **This is an accuracy feature, not a dependency.** Enabling the features lets the runtime pace
+  presentation and hand the display processor a measured frame horizon; a display processor that
+  ignores that input renders exactly as before, and a driver that does not expose the extensions is
+  simply not asked for them. So there is no display that this rule is *required* for and none that
+  it can break — follow it because a display which does predict viewer position will track the
+  viewer better, not because anything fails otherwise. The plug-in side of that contract:
+  [`xrt_plugin_iface.md` § Frame-timing inputs are an offer](../reference/xrt_plugin_iface.md).
+
 ---
 
 ## 6. Kooima projection
