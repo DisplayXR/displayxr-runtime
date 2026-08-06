@@ -642,6 +642,15 @@ d3d12_compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
 
+	// The spec requires predictedDisplayTime to strictly increase across
+	// xrWaitFrame calls, and CTS enforces it. The old period*2 constant
+	// satisfied that for free — `now` only advances — but a MEASURED
+	// lookahead can shrink between calls (the EMA moves), and if it shrinks
+	// by more than `now` advanced the prediction would step backwards.
+	// Clamp forward; `now` overtakes the floor again within a frame or two.
+	if (*out_predicted_display_time_ns <= (int64_t)c->last_display_time_ns) {
+		*out_predicted_display_time_ns = (int64_t)c->last_display_time_ns + 1;
+	}
 	c->last_display_time_ns = static_cast<uint64_t>(*out_predicted_display_time_ns);
 
 	return XRT_SUCCESS;
@@ -683,6 +692,15 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	*out_predicted_display_period_ns = period_ns;
 
+	// The spec requires predictedDisplayTime to strictly increase across
+	// xrWaitFrame calls, and CTS enforces it. The old period*2 constant
+	// satisfied that for free — `now` only advances — but a MEASURED
+	// lookahead can shrink between calls (the EMA moves), and if it shrinks
+	// by more than `now` advanced the prediction would step backwards.
+	// Clamp forward; `now` overtakes the floor again within a frame or two.
+	if (*out_predicted_display_time_ns <= (int64_t)c->last_display_time_ns) {
+		*out_predicted_display_time_ns = (int64_t)c->last_display_time_ns + 1;
+	}
 	c->last_display_time_ns = static_cast<uint64_t>(*out_predicted_display_time_ns);
 
 	return XRT_SUCCESS;

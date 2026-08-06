@@ -14,6 +14,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdlib.h>
 
 /*!
  * The interval from an `xrWaitFrame` return to the moment the frame the app is
@@ -44,6 +45,21 @@
 static inline uint64_t
 late_weave_lookahead_ns(double interval_ema_ns, uint64_t measured_r_ns, double period_ns)
 {
+	// Diagnostic escape hatch: DXR_PREDICT_LEGACY=1 restores the pre-#867
+	// `period × 2` constant, so the two behaviours can be A/B'd from one
+	// binary in one session. Kept because the failure this fixes is only
+	// judgeable by eye (geometry lag under head motion), and a build-to-build
+	// comparison would confound it with every other difference between them.
+	{
+		static int legacy = -1;
+		if (legacy < 0) {
+			const char *e = getenv("DXR_PREDICT_LEGACY");
+			legacy = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (legacy == 1) {
+			return 0;
+		}
+	}
 	if (measured_r_ns == 0 || interval_ema_ns <= 0.0 || period_ns <= 0.0) {
 		return 0;
 	}
