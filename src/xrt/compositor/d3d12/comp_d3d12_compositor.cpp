@@ -468,6 +468,7 @@ d3d12_comp(struct xrt_compositor *xc)
 // points, called from the layer-commit paths + destroy above them.
 static bool d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                                       bool reuse_mask,
+                                      bool prepare_only,
                                        ID3D12Resource *dst,
                                        uint64_t dst_rtv,
                                        D3D12_RESOURCE_STATES dst_pre_state,
@@ -1922,7 +1923,7 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// from the DP; leave it in RENDER_TARGET so HUD's existing RT→COPY_DEST
 	// transition (below) proceeds unchanged. No-op when this frame carries no
 	// zones / Local2D / explicit mask.
-	d3d12_composite_zone_mask(c, is_repaint, back_buffer, rtv_handle.ptr,
+	d3d12_composite_zone_mask(c, /*reuse_mask=*/true, /*prepare_only=*/false, back_buffer, rtv_handle.ptr,
 	                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
 	                          tgt_width, tgt_height, &eff_canvas);
 
@@ -2647,7 +2648,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// No-op when this frame carries no zones / Local2D / explicit
 			// mask, leaving the woven texture as-is.
 			d3d12_composite_zone_mask(
-			    c, false, c->shared_texture, st_rtv.ptr,
+			    c, false, false, c->shared_texture, st_rtv.ptr,
 			    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
 			    dp_target_w, dp_target_h, &eff_canvas);
 
@@ -2727,6 +2728,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			U_LOG_W("D3D12 weaving via display processor (swapchain RT)");
 			dp_logged = true;
 		}
+
+		// #875 DEPOSIT half: mask resolve + Local2D flatten, recorded into the
+		// list that is closed/executed/synced immediately below.
+		d3d12_composite_zone_mask(c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0,
+		                          D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                          D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width, tgt_height,
+		                          &eff_canvas);
 
 		// Execute atlas copy so the texture is ready for the weaver
 		c->cmd_list->Close();
@@ -4934,9 +4942,20 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 // (d3d12_effective_canvas under c->mutex) — the window rect while the mask
 // is active, so the composite region and the weave region share one
 // authority.
+/*!
+ * #875 diag: name every exit path out of the zone/Local2D composite.
+ *
+ * Two structural attempts at the deposit/render split both lost the 2D, and both
+ * times I reasoned about the cause and was wrong. The symptom — 2D absent,
+ * everything else perfect — is what an early-out looks like, so make the function
+ * say which guard it left through instead of guessing.
+ */
+#define ZC_BAIL(reason)                                                                                                	do {                                                                                                           		static bool _zc_logged = false;                                                                        		if (!_zc_logged) {                                                                                     			_zc_logged = true;                                                                             			U_LOG_W("#875 composite bail[%s] reuse=%d prepare=%d", reason, (int)reuse_mask,                			        (int)prepare_only);                                                                    		}                                                                                                      		return false;                                                                                          	} while (0)
+
 static bool
 d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           bool reuse_mask,
+                          bool prepare_only,
                           ID3D12Resource *dst,
                           uint64_t dst_rtv,
                           D3D12_RESOURCE_STATES dst_pre_state,
@@ -4956,17 +4975,20 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if (dst == nullptr || dst_rtv == 0 || c->renderer == nullptr) {
-		return false;
+	if (!prepare_only && (dst == nullptr || dst_rtv == 0)) {
+		ZC_BAIL("dst");
+	}
+	if (c->renderer == nullptr) {
+		ZC_BAIL("renderer");
 	}
 	// #868: a repaint composites from the mask the last app frame resolved, so
 	// the per-frame predicates below do not apply to it — only the presence of
 	// that cached mask does.
 	if (!reuse_mask && !zones_frame && !have_explicit && !have_local_2d) {
-		return false;
+		ZC_BAIL("g1");
 	}
 	if (reuse_mask && c->repaint.mask_res == nullptr) {
-		return false;
+		ZC_BAIL("g2");
 	}
 
 	// The window region inside the worst-case surface (#464). No HWND →
@@ -4985,8 +5007,9 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// Validate the weave-target format up front (both paths): the composite
 	// has PSOs only for RGBA8/BGRA8 UNORM (the lerp is channel-agnostic —
 	// app shared textures are BGRA8 in the wild, DXGI targets RGBA8).
-	D3D12_RESOURCE_DESC dd = dst->GetDesc();
-	if (dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM && dd.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+	D3D12_RESOURCE_DESC dd = prepare_only ? D3D12_RESOURCE_DESC{} : dst->GetDesc();
+	if (!prepare_only && dd.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+	    dd.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
 		static bool dfmt_logged = false;
 		if (!dfmt_logged) {
 			U_LOG_W("D3D12 zone mask: target format %u unsupported "
@@ -4994,7 +5017,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			        (unsigned)dd.Format);
 			dfmt_logged = true;
 		}
-		return false;
+		ZC_BAIL("g3");
 	}
 
 	// Resolve the mask source: an explicit submitted mask wins; else
@@ -5076,7 +5099,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		mask_res = d3d12_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
 	if (mask_res == nullptr) {
-		return false;
+		ZC_BAIL("g4");
 	}
 	if (!reuse_mask) {
 		// Hand the repaint path a mask that is already resolved and published.
@@ -5091,16 +5114,13 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// over transparent, so pixels outside every zone present alpha 0.
 	ID3D12Resource *twod_res = nullptr;
 	if (!d3d12_ensure_local2d_scratch(c, region_w, region_h)) {
-		return false;
-	}
-	if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "local2d weave")) {
-		return false;
+		ZC_BAIL("g5");
 	}
 	// Zones frame: flatten ALL Local2D layers (no under/over split —
 	// 2D-under is reserved in v1).
 	if (!reuse_mask) {
 		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
-			return false;
+			ZC_BAIL("g7");
 		}
 	}
 	/*
@@ -5121,6 +5141,20 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	 * frame re-flattens it, which is exactly the content a repaint wants.
 	 */
 	twod_res = c->local2d_scratch;
+
+	// #875: the DEPOSIT half ends here — every read of an app-owned resource is
+	// done and its result lives in compositor-owned scratch.
+	if (prepare_only) {
+		return true;
+	}
+
+	// RENDER half only. This snapshot target is sized/typed from the render
+	// target's format, which the deposit half has no business knowing — asking
+	// for it during prepare requested DXGI_FORMAT_UNKNOWN and failed, which is
+	// what silently swallowed the 2D in the first two attempts at this split.
+	if (!d3d12_ensure_scratch(c, &c->weave_scratch, region_w, region_h, dd.Format, "local2d weave")) {
+		ZC_BAIL("g6");
+	}
 
 	// Snapshot the window region of the weave (the DP wrote dst; the weave
 	// target is RTV-only to the shader, so the lerp reads this copy).
