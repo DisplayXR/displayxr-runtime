@@ -46,6 +46,38 @@
 // windows lack - both measured dead ends on Intel UHD.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
+/*
+ * #870 — DXR_VK_BRIDGE_PACING=N: pace the VK live/DComp path on the bridge's
+ * DXGI frame-latency waitable, with queue depth N (1..3). 0/unset = off.
+ *
+ * Exists because Intel iGPUs expose NO Vulkan presentation-timing extension
+ * (no present_wait, present_id or GOOGLE_display_timing — verified per-device
+ * with vulkaninfo), so VK late-weave is permanently dormant on the very
+ * adapter that scans out the panel. The transparent path already presents
+ * through a DXGI object, which can carry the pacing Vulkan cannot.
+ *
+ * Off by default until a human confirms the benefit: the cost (throughput) is
+ * measurable and the benefit (crosstalk under head motion) is not, on this
+ * hardware, by any instrument we have.
+ */
+static int
+dxr_vk_bridge_pacing_depth(void)
+{
+	static int depth = -1;
+	if (depth < 0) {
+		const char *e = getenv("DXR_VK_BRIDGE_PACING");
+		int v = (e != NULL) ? atoi(e) : 0;
+		if (v < 0) {
+			v = 0;
+		}
+		if (v > 3) {
+			v = 3;
+		}
+		depth = v;
+	}
+	return depth;
+}
+
 static inline DXGI_ALPHA_MODE
 dxr_present_alpha_mode(void)
 {
@@ -294,6 +326,19 @@ struct comp_vk_native_target
 	ID3D11Device *dcomp_dx_device;
 	ID3D11DeviceContext *dcomp_dx_context;
 	IDXGISwapChain1 *dcomp_swapchain;
+	//! #870 — creation flags, so ResizeBuffers can pass them back (DXGI
+	//! E_INVALIDARGs a mismatch; this is the #848 trap, and adding the
+	//! waitable flag below is exactly what would have re-armed it).
+	UINT dcomp_swapchain_flags;
+	//! #870 — requested bridge queue depth (DXR_VK_BRIDGE_PACING), 0 = off.
+	int dcomp_pacing_depth;
+	//! #870 — frame-latency waitable on the BRIDGE swapchain. Intel iGPUs
+	//! expose no Vulkan presentation-timing extension at all, so VK
+	//! late-weave pacing (VK_KHR_present_wait) is permanently dormant there
+	//! — on the adapter that scans out our panels. The transparent path
+	//! already presents through this DXGI object, so it can carry the pacing
+	//! Vulkan cannot. NULL when late-weave is off or the QI failed.
+	HANDLE dcomp_frame_latency_waitable;
 	IDCompositionDevice *dcomp_dcomp_device;
 	IDCompositionTarget *dcomp_dcomp_target;
 	IDCompositionVisual *dcomp_dcomp_visual;
@@ -830,6 +875,23 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	desc.BufferCount = DCOMP_RING;
 	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 	desc.AlphaMode = dxr_present_alpha_mode(); // #833: IGNORE when present_opaque
+	// #870 — make the bridge swapchain waitable so the VK path can be paced on
+	// drivers with no VK_KHR_present_wait (every Intel iGPU).
+	//
+	// OFF BY DEFAULT, deliberately. The mechanism works, but on this hardware
+	// its benefit — lower weave→scanout latency, i.e. less crosstalk under
+	// head motion — is *unmeasurable*: there is no VK timing extension, and
+	// DXGI frame statistics come back DISJOINT on a composition swapchain (see
+	// the probe in dcomp_present). Meanwhile it demonstrably costs throughput,
+	// which is precisely the trade #850 caught with maxFrameLatency=1. Shipping
+	// an unprovable benefit at a measured cost is the wrong default, so this
+	// waits on a human eyeball: DXR_VK_BRIDGE_PACING=N (1..3) selects the
+	// queue depth, N=1 being the aggressive setting.
+	target->dcomp_pacing_depth = dxr_vk_bridge_pacing_depth();
+	if (target->dcomp_pacing_depth > 0) {
+		desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	}
+	target->dcomp_swapchain_flags = desc.Flags;
 
 	if (present_opaque) {
 		DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
@@ -850,6 +912,25 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		U_LOG_W("DComp bridge: swapchain create failed (present_opaque=%d): 0x%08x", (int)present_opaque,
 		        hr);
 		return false;
+	}
+
+	// #870 — pick up the frame-latency waitable. This is the pacing signal for
+	// drivers that expose no Vulkan presentation-timing extension (all Intel
+	// iGPUs), where VK late-weave would otherwise stay dormant on exactly the
+	// adapter that scans out the panel. Best-effort: a failure here just leaves
+	// the path unpaced, which is today's behaviour.
+	if ((target->dcomp_swapchain_flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
+		IDXGISwapChain2 *sc2 = NULL;
+		if (SUCCEEDED(target->dcomp_swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
+		                                                       (void **)&sc2)) &&
+		    sc2 != NULL) {
+			sc2->SetMaximumFrameLatency((UINT)target->dcomp_pacing_depth);
+			target->dcomp_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+			sc2->Release();
+		}
+		U_LOG_W("#870: bridge frame-latency waitable %s (waitable=%p)",
+		        target->dcomp_frame_latency_waitable != NULL ? "acquired" : "UNAVAILABLE",
+		        target->dcomp_frame_latency_waitable);
 	}
 
 	// DComp binding only on the transparent-present path — the opaque path's
@@ -986,6 +1067,33 @@ dcomp_present(struct comp_vk_native_target *target)
 	target->dcomp_shared_mutex[idx]->ReleaseSync(0);
 
 	hr = target->dcomp_swapchain->Present(/*SyncInterval*/ 1, /*Flags*/ 0);
+
+	// #870 — probe once whether this swapchain can report scanout truth. On
+	// Intel there is no VK presentation-timing extension, so the weave-latency
+	// harness has no R number on the very adapter that drives the panel: we
+	// cannot currently measure how bad the unpaced case is. DXGI frame
+	// statistics on a COMPOSITION swapchain are not guaranteed (DWM may report
+	// DXGI_ERROR_FRAME_STATISTICS_DISJOINT or nothing at all), so state
+	// plainly which it is rather than assuming — this decides whether #870's
+	// measurement half is possible here or has to fall back to estimation.
+	{
+		static bool stats_probed = false;
+		if (!stats_probed && SUCCEEDED(hr)) {
+			stats_probed = true;
+			DXGI_FRAME_STATISTICS fs = {};
+			HRESULT shr = target->dcomp_swapchain->GetFrameStatistics(&fs);
+			if (SUCCEEDED(shr)) {
+				U_LOG_W("#870: bridge frame statistics USABLE "
+				        "(PresentCount=%u SyncQPCTime=%lld) — scanout truth available "
+				        "without VK_KHR_present_wait",
+				        fs.PresentCount, (long long)fs.SyncQPCTime.QuadPart);
+			} else {
+				U_LOG_W("#870: bridge frame statistics unavailable (0x%08x) — measurement "
+				        "half needs estimation, pacing is unaffected",
+				        shr);
+			}
+		}
+	}
 	if (FAILED(hr)) {
 		U_LOG_E("DComp bridge: Present failed: 0x%08x", hr);
 		return XRT_ERROR_VULKAN;
@@ -1736,6 +1844,24 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
+		// #870 — late-weave pacing for the bridge. Block until DXGI says the
+		// previous present has been consumed, so the frame that follows
+		// (record → weave with a fresh eye prediction → present) starts on a
+		// known phase instead of free-running. This is the fallback for
+		// drivers with no VK_KHR_present_wait — i.e. every Intel iGPU, which
+		// is the adapter that scans out the panel — and it is deliberately
+		// skipped when Vulkan's own mechanism is available, so nothing
+		// double-paces on NVIDIA. Bounded wait: a lost/occluded present must
+		// not wedge the render thread.
+		if (target->dcomp_frame_latency_waitable != NULL && target_present_wait_fn(target) == NULL) {
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				U_LOG_W("#870: pacing the VK bridge on the DXGI waitable "
+				        "(no VK_KHR_present_wait on this device)");
+			}
+			WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 100, TRUE);
+		}
 		// Round-robin through the bridge ring. No WSI to acquire from.
 		// vkQueueWaitIdle in the compositor's render path covers the GPU
 		// fence; D3D11's IDXGIKeyedMutex::AcquireSync in dcomp_present
@@ -2028,8 +2154,10 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		// 2. Resize the composition swapchain in place. The swapchain object (and
 		// the visual->SetContent binding to it) survives ResizeBuffers; no back
 		// buffer is held (dcomp_present releases it each frame) so this succeeds.
+		// #870/#848 — ResizeBuffers must receive the creation flags or DXGI
+		// fails it with E_INVALIDARG (the waitable flag is now among them).
 		HRESULT hr = target->dcomp_swapchain->ResizeBuffers(
-		    DCOMP_RING, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, 0);
+		    DCOMP_RING, width, height, DXGI_FORMAT_B8G8R8A8_UNORM, target->dcomp_swapchain_flags);
 		if (FAILED(hr)) {
 			U_LOG_E("DComp bridge resize: ResizeBuffers(%ux%u) failed: 0x%08x", width, height, hr);
 			return XRT_ERROR_VULKAN;
