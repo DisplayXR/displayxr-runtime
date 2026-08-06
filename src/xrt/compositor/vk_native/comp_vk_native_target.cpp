@@ -1853,6 +1853,22 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		// skipped when Vulkan's own mechanism is available, so nothing
 		// double-paces on NVIDIA. Bounded wait: a lost/occluded present must
 		// not wedge the render thread.
+		//
+		// INVARIANT — ONLY THE PRESENTING THREAD MAY WAIT ON THIS HANDLE.
+		// The DXGI frame-latency waitable is a SEMAPHORE, not an event: every
+		// wait consumes a token that a present is supposed to replace. A
+		// second waiter (a repaint pacer, a stats thread, a "just check if
+		// we're behind" poll) steals tokens from the present loop and starves
+		// it — measured elsewhere in this runtime as 31.9 -> 16.9 fps while
+		// the offending thread issued essentially zero presents, with every
+		// counter reading zero because nothing looked wrong. This wait is
+		// safe only because acquire and present are both called from
+		// vk_compositor_layer_commit, i.e. the same thread, once per frame:
+		// one wait, one present. If you add a path that presents WITHOUT
+		// acquiring (e.g. re-presenting the last atlas), do not reuse this
+		// wait — either pair each extra present with its own wait on this
+		// same thread, or pace that path passively (frame statistics /
+		// present-wait polling) and never touch this handle.
 		if (target->dcomp_frame_latency_waitable != NULL && target_present_wait_fn(target) == NULL) {
 			static bool logged = false;
 			if (!logged) {
