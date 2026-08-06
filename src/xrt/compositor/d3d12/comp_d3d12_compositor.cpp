@@ -375,6 +375,28 @@ struct comp_d3d12_compositor
 		//! Last frame was DP-woven and not zero-copy ⟹ safe to replay.
 		bool armed;
 
+		/*!
+		 * True from layer_begin until the following layer_commit — i.e. while
+		 * the app is part-way through submitting a frame.
+		 *
+		 * Holding @ref mutex across the replay is NOT sufficient on its own.
+		 * layer_begin resets layer_accum and releases the lock; each
+		 * layer_projection / layer_local_2d call then takes and releases it
+		 * again before layer_commit. So a repaint can win the lock mid-
+		 * submission and see layer_accum empty or half-filled — and the replay
+		 * reads it live (d3d12_composite_zone_mask derives the zone/Local2D
+		 * mask from it). The observed failure was the 2D bubble dropping out
+		 * and the woven desktop compose-under showing through in its place,
+		 * flickering at the repaint rate.
+		 *
+		 * Outside this window layer_accum holds exactly the last COMPLETED
+		 * frame's layers, which is precisely what a repaint wants to replay.
+		 * The window is short in practice — an app renders between
+		 * xrWaitFrame and xrEndFrame, not between layer_begin and
+		 * layer_commit — so gating on it costs the repaint almost nothing.
+		 */
+		bool app_frame_in_progress;
+
 		//! Everything process_atlas needs, captured at the last real weave.
 		//! Stable by construction: the resources are compositor-owned and the
 		//! geometry only changes when a new frame arrives (which re-arms).
@@ -848,6 +870,9 @@ d3d12_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_f
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	std::lock_guard<std::mutex> lock(c->mutex);
+	// #868: layer_accum is now mid-rewrite and the lock is about to be
+	// released — keep the repaint thread out until layer_commit.
+	c->repaint.app_frame_in_progress = true;
 	comp_layer_accum_begin(&c->layer_accum, data);
 	return XRT_SUCCESS;
 }
@@ -1969,7 +1994,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		// Cheap unlocked pre-check, re-tested under the lock below. Avoids
 		// paying the pacing wait on every tick of an app that is making rate.
-		if (!c->repaint.armed) {
+		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
 			continue;
 		}
@@ -2008,8 +2033,13 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		// Re-test everything: a real frame may have landed while we paced, in
 		// which case it just did this work and there is nothing stale to fix.
+		// Re-test under the lock. app_frame_in_progress is the load-bearing one:
+		// the app can have opened a submission while we paced. It is NOT
+		// bypassed by the force probe — forcing a repaint into a half-written
+		// layer_accum does not exercise the feature, it just corrupts the frame.
 		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
-		    c->display_processor == NULL || c->target == nullptr || c->repaint.dp_resource == nullptr) {
+		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr ||
+		    c->repaint.dp_resource == nullptr) {
 			c->repaint.bail_armed++;
 			continue;
 		}
@@ -2049,6 +2079,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// #868: the submission window closes here. Cleared at the TOP rather than
+	// on the way out so it cannot be leaked by one of this function's several
+	// early returns — the lock is held throughout, so no repaint can interleave
+	// with layer_commit itself regardless.
+	c->repaint.app_frame_in_progress = false;
 
 	// Capture-intent poll — see u_capture_intent.h. Consumed at the
 	// projection-done boundary (PROJECTION_ONLY, once renderer split
