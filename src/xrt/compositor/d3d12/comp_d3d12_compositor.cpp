@@ -2016,12 +2016,23 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	if (back_buffer != nullptr) {
 		const char *tmp = getenv("TEMP");
 		if (tmp != nullptr) {
+			// One trigger arms BOTH kinds, so the pair captured is adjacent in
+			// time — that is what makes a pixel diff meaningful. Comparing an
+			// app weave against a repaint captured seconds apart would drown
+			// the signal in scene animation.
+			static bool want_app = false, want_repaint = false;
 			char trig[512];
 			snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
 			FILE *tf = fopen(trig, "rb");
 			if (tf != nullptr) {
 				fclose(tf);
 				remove(trig);
+				want_app = true;
+				want_repaint = true;
+			}
+			bool *want = is_repaint ? &want_repaint : &want_app;
+			if (*want) {
+				*want = false;
 				char out[512];
 				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp, is_repaint ? "repaint" : "app");
 				bool wok =
@@ -5117,9 +5128,28 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	}
 	// Zones frame: flatten ALL Local2D layers (no under/over split —
 	// 2D-under is reserved in v1).
-	if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
-		return false;
+	if (!reuse_mask) {
+		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
+			return false;
+		}
 	}
+	/*
+	 * #868: a repaint reuses the last app frame's flatten and must NOT re-run
+	 * it. d3d12_flatten_local_2d_layers samples the APP'S OWN Local2D swapchain
+	 * images; by the time a repaint runs, the app has reacquired those images
+	 * and may be part-way through drawing the next frame into them. This is the
+	 * same hazard that keeps repaints off the zero-copy atlas, and it applies to
+	 * every app-owned texture the composite touches -- not just the atlas.
+	 *
+	 * Symptom when this is wrong: the 2D region samples a half-written app
+	 * image, so the 2D content differs between an app weave and the repaint
+	 * standing in for it, and the two alternate on screen. Measured as a
+	 * whole-bubble difference in a pixel diff of an adjacent app/repaint pair,
+	 * while the opaque 3D content differed only at interlace edges.
+	 *
+	 * local2d_scratch is compositor-owned and survives until the next app
+	 * frame re-flattens it, which is exactly the content a repaint wants.
+	 */
 	twod_res = c->local2d_scratch;
 
 	// Snapshot the window region of the weave (the DP wrote dst; the weave
