@@ -415,6 +415,11 @@ struct comp_d3d12_compositor
 		ID3D12Resource *atlas;
 		uint32_t content_w, content_h;
 
+		//! The 2D-under backdrop the last app frame flattened. Reused for the
+		//! same reason as mask_res — the flatten reads app-owned textures.
+		ID3D12Resource *backdrop;
+		uint32_t backdrop_w, backdrop_h;
+
 		//! The zone / Local2D mask the last app frame RESOLVED. A repaint
 		//! composites from this instead of re-deriving it, because deriving it
 		//! ticks per-frame state machines (wish publish, implicit raster) that
@@ -1848,9 +1853,23 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	ID3D12Resource *dp_resource =
 	    d3d12_crop_atlas_for_dp(c, c->repaint.atlas, c->repaint.content_w, c->repaint.content_h);
 
-	uint32_t bd_w = 0, bd_h = 0;
-	ID3D12Resource *bd_res = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
-	xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd_res, bd_w, bd_h);
+	/*
+	 * The 2D-under backdrop flatten samples the APP'S OWN Local2D swapchain
+	 * images, exactly like the over-layer flatten in the composite — so a
+	 * repaint must not re-run it either, and reuses what the last app frame
+	 * produced. backdrop_scratch is compositor-owned and stable until the next
+	 * layer_commit. (Invisible in the avatar scene, where the backdrop is NULL
+	 * on every weave, but it is the same class of bug as the one that produced
+	 * the 2D flicker — see the composite.)
+	 */
+	if (!is_repaint) {
+		uint32_t bd_w = 0, bd_h = 0;
+		c->repaint.backdrop = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
+		c->repaint.backdrop_w = bd_w;
+		c->repaint.backdrop_h = bd_h;
+	}
+	xrt_display_processor_d3d12_set_background_2d(c->display_processor, c->repaint.backdrop,
+	                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
 
 
 	D3D12_VIEWPORT viewport = {};

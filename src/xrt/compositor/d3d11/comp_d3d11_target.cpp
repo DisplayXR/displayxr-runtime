@@ -412,6 +412,40 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
 	internals->context->RSSetViewports(1, &viewport);
 }
 
+/*!
+ * #868: pace a repaint to the panel — the wait half of weave_mark, split out so
+ * it can run WITHOUT the compositor lock held.
+ *
+ * Deliberately does NOT wait on the frame-latency waitable: that is a SEMAPHORE,
+ * and a non-presenting thread waiting on it consumes tokens the app's own frame
+ * loop needs (measured on the D3D12 leg: 31.9 -> 16.9 fps with essentially zero
+ * repaints issued). Scanout pacing alone is passive and costs nothing.
+ */
+extern "C" void
+comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
+{
+	if (g_frame_latency_waitable != nullptr) {
+		const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
+		if (g_last_present_count > relax) {
+			late_weave_wait_scanout(target->swapchain, g_last_present_count - relax,
+			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
+		}
+	}
+}
+
+/*!
+ * #868: stamp T_weave for a repaint and nothing else — no governor EMA (repaints
+ * land a panel period apart by construction and would collapse the saturation
+ * signal) and no predicted display time (xrWaitFrame promised no photon time for
+ * this present, so there is nothing to score it against).
+ */
+extern "C" void
+comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target)
+{
+	(void)target;
+	g_weave_latency_d3d11.mark_weave("d3d11", 0, true);
+}
+
 extern "C" void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns)
 {
