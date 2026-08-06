@@ -408,6 +408,7 @@ d3d11_comp(struct xrt_compositor *xc)
 static bool
 d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           bool is_repaint,
+                          bool prepare_only,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
@@ -1660,7 +1661,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// read-back. No-op when the frame carries neither.
 	ID3D11Texture2D *back_buffer_2d = static_cast<ID3D11Texture2D *>(
 	    comp_d3d11_target_get_back_buffer(c->target));
-	d3d11_composite_zone_mask(c, is_repaint, back_buffer_2d, target_width, target_height, &eff_canvas);
+	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d,
+	                          target_width, target_height, &eff_canvas);
 
 	/*
 	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the
@@ -2278,7 +2280,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or
 			// a Local2D layer composites the 2D/3D regions of the shared
 			// texture. No-op when the frame carries neither.
-			d3d11_composite_zone_mask(c, false, c->shared_texture, dp_target_w, dp_target_h, &eff_canvas);
+			d3d11_composite_zone_mask(c, false, false, c->shared_texture, dp_target_w, dp_target_h,
+			                          &eff_canvas);
 
 			weaving_done = true;
 		}
@@ -2312,6 +2315,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->repaint.armed = !zero_copy;
 		c->repaint.zero_copy = zero_copy;
 		c->repaint.zc_srv = zc_srv;
+
+		// #875 DEPOSIT: resolve the mask and flatten the Local2D layers while
+		// the app still owns the swapchain images they read. The weave below —
+		// and every repaint after it — then composite from compositor-owned
+		// state alone, so both produce the same pixels by construction.
+		{
+			uint32_t dep_w = 0, dep_h = 0;
+			comp_d3d11_target_get_dimensions(c->target, &dep_w, &dep_h);
+			ID3D11Texture2D *dep_bb =
+			    static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
+			d3d11_composite_zone_mask(c, /*is_repaint=*/false, /*prepare_only=*/true, dep_bb, dep_w,
+			                          dep_h, &eff_canvas);
+		}
 
 		weaving_done = d3d11_dp_weave(c, false);
 	}
@@ -3998,6 +4014,7 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 static bool
 d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           bool is_repaint,
+                          bool prepare_only,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
@@ -4157,6 +4174,19 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			}
 		}
 		twod_srv = c->local2d_scratch_srv;
+		/*
+		 * #875: DEPOSIT half ends here. Everything above reads app-owned
+		 * resources (the Local2D layer swapchain images) or ticks per-frame
+		 * state; everything below only touches compositor-owned scratch and the
+		 * render target. dst is still passed in during prepare because the
+		 * scratch formats derive from the target's format — prepare reads that
+		 * descriptor but never writes the target. (On the D3D12 leg, stubbing
+		 * the descriptor out instead requested DXGI_FORMAT_UNKNOWN and silently
+		 * swallowed the 2D.)
+		 */
+		if (prepare_only) {
+			return true;
+		}
 	} else {
 		// Unreachable: the early-out gate already returns false unless one of
 		// zones_frame / have_local_2d / have_explicit is set. Defensive only.
