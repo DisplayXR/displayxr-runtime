@@ -389,6 +389,22 @@ struct comp_d3d11_compositor
 		int hash_probe;
 		uint64_t app_hash, app_seq, hash_seq;
 		uint8_t *app_px; //!< retained pixels of the last app weave
+		/*!
+		 * #876 diag: why the last d3d11_composite_zone_mask call exited.
+		 * 0 = composited normally; 1..5 = the numbered early return that fired.
+		 * Sampled by the structural-mismatch detector so a black zone can be
+		 * attributed to a specific bail instead of guessed at — reading the
+		 * code already killed one plausible theory (repaint.mask_srv is only
+		 * ever assigned, never cleared, so its null-guard cannot fire after the
+		 * first frame).
+		 */
+		int composite_bail;
+
+		//! #876: per-cell luminance baseline for the absolute dropout detector.
+		double cell_ema[64];
+		uint64_t dropouts;
+		uint64_t detector_frames;
+
 		//! Set by the 8x8 grid scan when a cell lit in the app frame came out
 		//! black in the repaint — keys the PNG dump on the DEFECT rather than
 		//! on the first (usually benign) hash mismatch.
@@ -1702,6 +1718,78 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		uint8_t *rp_px = nullptr;
 		const uint64_t hsh = d3d11_hash_target(c, back_buffer_2d, target_width, target_height,
 		                                       is_repaint ? &rp_px : &c->repaint.app_px);
+
+		/*
+		 * #876 ABSOLUTE dropout detector — runs on EVERY weave, app or repaint.
+		 *
+		 * The adjacent-pair hash above can only see the app frame and its
+		 * repaint DISAGREEING. If a repaint faithfully replays a frame that is
+		 * already wrong, both are equally wrong and the pair reports
+		 * "reproduced" — measured at 2399/2400 agreement while the panel was
+		 * visibly flickering. So pair-comparison is blind to this class by
+		 * construction, and only an absolute measure can see it.
+		 *
+		 * Track a per-cell luminance EMA on an 8x8 grid and flag any cell that
+		 * was reliably lit and then collapses. That catches a zone dropping out
+		 * regardless of which path produced the frame.
+		 */
+		{
+			/*
+			 * Warm-up gate. The first couple of seconds are content fading in
+			 * while the EMA has no baseline yet — that produced 437 "dropouts"
+			 * in 2 s and then silence for the next 58, i.e. pure noise that
+			 * buried the once-per-10s event actually being hunted. Arm only
+			 * once the baseline means something.
+			 */
+			c->repaint.detector_frames++;
+			const uint8_t *px = is_repaint ? rp_px : c->repaint.app_px;
+			const bool armed = c->repaint.detector_frames > 300;
+			if (px != nullptr) {
+				const uint32_t GX = 8, GY = 8;
+				const uint32_t stride = target_width * 4;
+				for (uint32_t gj = 0; gj < GY; gj++) {
+					for (uint32_t gi = 0; gi < GX; gi++) {
+						const uint32_t y0 = gj * target_height / GY;
+						const uint32_t y1 = (gj + 1) * target_height / GY;
+						const uint32_t x0 = gi * target_width / GX;
+						const uint32_t x1 = (gi + 1) * target_width / GX;
+						uint64_t sum = 0;
+						uint32_t n = 0;
+						for (uint32_t y = y0; y < y1; y += 4) {
+							for (uint32_t x = x0; x < x1; x += 4) {
+								const uint32_t o = y * stride + x * 4;
+								sum += (uint64_t)px[o] + px[o + 1] + px[o + 2];
+								n++;
+							}
+						}
+						if (n == 0) {
+							continue;
+						}
+						const double mean = (double)sum / (n * 3.0);
+						const uint32_t ci = gj * GX + gi;
+						double *ema = &c->repaint.cell_ema[ci];
+						if (*ema <= 0.0) {
+							*ema = mean;
+							continue;
+						}
+						// Lit cell that collapsed: the dropout we are hunting.
+						if (armed && *ema > 8.0 && mean < *ema * 0.50) {
+							c->repaint.dropouts++;
+							U_LOG_W("#876 DROPOUT: cell(%u,%u) [%s] lum %.1f -> %.1f (%.0f%%) "
+							        "(%s weave, composite_bail=%d, total %llu)",
+							        gi, gj, gi < 4 ? "zoneA" : "zoneB", *ema, mean,
+							        100.0 * mean / *ema,
+							        is_repaint ? "REPAINT" : "APP",
+							        c->repaint.composite_bail,
+							        (unsigned long long)c->repaint.dropouts);
+						}
+						// Slow EMA so a one-frame dropout cannot drag the
+						// baseline down and mask the next one.
+						*ema = *ema * 0.95 + mean * 0.05;
+					}
+				}
+			}
+		}
 		if (!is_repaint) {
 			c->repaint.app_hash = hsh;
 			c->repaint.app_seq++;
@@ -4199,10 +4287,12 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
 	if (is_repaint && c->repaint.mask_srv == nullptr) {
+		c->repaint.composite_bail = 1;
 		return false;
 	}
 	if ((!is_repaint && !zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
 	    c->renderer == nullptr) {
+		c->repaint.composite_bail = 2;
 		return false;
 	}
 
@@ -4295,6 +4385,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		mask_srv = d3d11_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
 	if (mask_srv == nullptr) {
+		c->repaint.composite_bail = 3;
 		return false;
 	}
 	if (!is_repaint) {
@@ -4312,10 +4403,12 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		if (!d3d11_ensure_rt_srv_scratch(c, &c->local2d_scratch, &c->local2d_scratch_srv,
 		                                 &c->local2d_scratch_rtv, region_w, region_h, unorm_fmt,
 		                                 "local2d scratch")) {
+			c->repaint.composite_bail = 4;
 			return false;
 		}
 		if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h,
 		                              unorm_fmt, "local2d weave")) {
+			c->repaint.composite_bail = 5;
 			return false;
 		}
 		// Zones frame: flatten ALL Local2D layers (no under/over split —
@@ -4352,6 +4445,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		 * swallowed the 2D.)
 		 */
 		if (prepare_only) {
+			c->repaint.composite_bail = 0; // deposit half completed
 			return true;
 		}
 	} else {
@@ -4419,6 +4513,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			        zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"), composite_mode);
 		}
 	}
+	// #876 diag: 0 = composited, 6 = the draw itself failed.
+	c->repaint.composite_bail = (xret == XRT_SUCCESS) ? 0 : 6;
 	return xret == XRT_SUCCESS;
 }
 
