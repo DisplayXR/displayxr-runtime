@@ -3163,8 +3163,29 @@ gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float 
 		// bound FBO, which is why a non-zones transparent GL window animated.
 		GLint present_target_fbo = 0;
 		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &present_target_fbo);
-		if (!gl_composite_local_2d(c, atlas_for_present, (GLuint)present_target_fbo, present_w,
-		                           present_h, /*reuse_twod=*/is_repaint)) {
+		/*
+		 * #868 diag: when the composite declines, the caller falls back to the
+		 * PLAIN weave — which drops the 2D band entirely. That presents as a
+		 * black 2D zone with no error logged anywhere, and it is the one thing
+		 * never checked on GL. Count both outcomes per weave kind.
+		 */
+		const bool composited = gl_composite_local_2d(c, atlas_for_present,
+		                                              (GLuint)present_target_fbo, present_w,
+		                                              present_h, /*reuse_twod=*/is_repaint);
+		{
+			static uint64_t app_ok = 0, app_no = 0, rp_ok = 0, rp_no = 0;
+			if (is_repaint) {
+				composited ? rp_ok++ : rp_no++;
+			} else {
+				composited ? app_ok++ : app_no++;
+			}
+			if (((app_ok + app_no + rp_ok + rp_no) % 240) == 0) {
+				U_LOG_W("#868 gl composite: app ok=%llu declined=%llu | repaint ok=%llu declined=%llu",
+				        (unsigned long long)app_ok, (unsigned long long)app_no,
+				        (unsigned long long)rp_ok, (unsigned long long)rp_no);
+			}
+		}
+		if (!composited) {
 			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
 		}
 	} else {
@@ -3293,6 +3314,31 @@ gl_repaint_thread(void *ptr)
 		if (!wglMakeCurrent(c->hdc, c->hglrc)) {
 			os_mutex_unlock(&c->mutex);
 			continue;
+		}
+
+		/*
+		 * #868 diag: what GL state does the replay INHERIT?
+		 *
+		 * layer_commit saves and resets DEPTH_TEST / BLEND / CULL_FACE /
+		 * SCISSOR_TEST before rendering, because GL state is per-context and
+		 * sticky. The repaint path never did that — it was extracted from the
+		 * present half only. If any of these read as enabled here, the replay
+		 * is compositing under different state than the app frame, which would
+		 * explain a black 2D band that survives re-flattening (the flatten is
+		 * fine; the composite that consumes it is not).
+		 *
+		 * Measured before changing anything: the last GL "fix" applied without
+		 * this step made things worse and had to be reverted.
+		 */
+		{
+			static int logged = 0;
+			if (logged < 5) {
+				logged++;
+				U_LOG_W("#868 gl repaint inherits: depth=%d blend=%d cull=%d scissor=%d fbo=%d",
+				        (int)glIsEnabled(GL_DEPTH_TEST), (int)glIsEnabled(GL_BLEND),
+				        (int)glIsEnabled(GL_CULL_FACE), (int)glIsEnabled(GL_SCISSOR_TEST),
+				        [] { GLint fb = 0; glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fb); return (int)fb; }());
+			}
 		}
 
 		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
