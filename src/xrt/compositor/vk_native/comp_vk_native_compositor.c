@@ -2876,6 +2876,18 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		bool dp_self_submits = (c->display_processor != NULL) &&
 		    xrt_display_processor_is_self_submitting(c->display_processor);
 
+		{
+			// #879: which weave path is live decides what layout the target is
+			// actually in after process_atlas, and therefore what the composite
+			// and HUD must DECLARE. Never verified before.
+			static bool dp_path_logged = false;
+			if (!dp_path_logged) {
+				dp_path_logged = true;
+				U_LOG_W("#879: DP path — self_submits=%d render_pass=%s",
+				        (int)dp_self_submits,
+				        dp_render_pass != VK_NULL_HANDLE ? "present" : "NULL");
+			}
+		}
 		if (c->display_processor != NULL &&
 		    (dp_render_pass != VK_NULL_HANDLE || dp_self_submits)) {
 			static bool dp_logged = false;
