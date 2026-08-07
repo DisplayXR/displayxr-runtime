@@ -304,6 +304,13 @@ enum xrt_device_property_id
 	//! Enable/disable EXT app mode (value: 1=enable, 0=disable).
 	//! When enabled, device returns raw pose without qwerty composition.
 	XRT_DEVICE_PROPERTY_EXT_APP_MODE = 2,
+
+	//! Whether the device PINS its output mode and ignores OUTPUT_MODE
+	//! requests (value: 1=pinned, 0=not). Read-only. sim_display sets this
+	//! when SIM_DISPLAY_FORCE_MODE is active so the state tracker honors the
+	//! device's held mode instead of the app's request. Devices that don't
+	//! implement it return XRT_ERROR_NOT_IMPLEMENTED (treated as not-pinned).
+	XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED = 3,
 };
 
 /*!
