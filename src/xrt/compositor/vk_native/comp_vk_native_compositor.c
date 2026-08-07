@@ -4562,10 +4562,75 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
 		        (unsigned long)c->xcb_handle.window);
 #endif
+		/*
+		 * #868: resolve the runtime-owned queue BEFORE the display processor
+		 * is created — the DP captures whichever queue it is shown here, once,
+		 * and never re-reads it.
+		 */
+		/*
+		 * Belt and braces: refuse a "runtime-owned" queue that is actually the
+		 * APP's. Defaulting these to 0 instead of -1 once made them name
+		 * family 0 / queue 0 under vulkan_enable1 — the app's own queue — and
+		 * the repaint lost the device submitting to it. An identity check costs
+		 * nothing and makes that unrepeatable.
+		 */
+		if (c->repaint_queue_family == (int32_t)queue_family_index &&
+		    c->repaint_queue_index == (int32_t)queue_index) {
+			U_LOG_W("#868: refusing repaint queue (family %d index %d) — that is the APP's "
+			        "own queue, not a runtime-owned one",
+			        c->repaint_queue_family, c->repaint_queue_index);
+			c->repaint_queue_family = -1;
+			c->repaint_queue_index = -1;
+		}
+		if (c->repaint_queue_family >= 0 && c->repaint_queue_index >= 0) {
+			c->vk.vkGetDeviceQueue(c->vk.device, (uint32_t)c->repaint_queue_family,
+			                       (uint32_t)c->repaint_queue_index, &c->repaint_queue);
+		}
+
+		/*
+		 * #868: hand the display processor the RUNTIME-OWNED queue, not the
+		 * app's.
+		 *
+		 * The vendor DP reads vk->main_queue->queue ONCE, here at creation, and
+		 * the SR weaver captures it internally for its own submits — the
+		 * correction-texture upload, which vkQueueSubmit()s and waits from
+		 * inside weave(). weave() is called from the repaint thread too, so
+		 * with the app's queue captured, the SDK submits to the APP's queue off
+		 * the app's thread. A VkQueue is externally synchronised, so that is
+		 * undefined behaviour, and it is what validation reports as
+		 * "UNASSIGNED-Threading-MultipleThreads-Write". Confirmed by handle:
+		 * the queue named in the error is the app's, never the repaint one.
+		 *
+		 * The runtime's own submits already moved to the repaint queue, but
+		 * that never covered the SDK's internal ones. Since the capture happens
+		 * exactly once and reads this pointer, pointing it at the runtime queue
+		 * across the factory call moves every weaver-internal submit onto a
+		 * queue only the runtime touches, serialised by c->mutex.
+		 *
+		 * Safe: both queues live in the SAME family, so images need no
+		 * queue-family ownership transfer, and the weaver vkQueueWaitIdle()s
+		 * its own queue before returning, which CPU-orders those uploads ahead
+		 * of whichever queue we later submit the recorded weave on.
+		 *
+		 * The app frame keeps submitting on the APP's queue deliberately — that
+		 * is what orders the compositor's work after the app's own rendering
+		 * into the swapchain images it just released. Moving the app path to
+		 * the runtime queue would silently drop that ordering.
+		 *
+		 * Restored immediately; the repaint thread does not exist yet.
+		 */
+		VkQueue saved_main_queue = c->vk.main_queue->queue;
+		if (c->repaint_queue != VK_NULL_HANDLE) {
+			c->vk.main_queue->queue = c->repaint_queue;
+			U_LOG_W("#868: creating the display processor against the runtime-owned queue %p "
+			        "(app queue %p stays the app frame's)",
+			        (void *)c->repaint_queue, (void *)saved_main_queue);
+		}
 		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
 		                               dp_window_handle,
 		                               (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
 		                               &c->display_processor);
+		c->vk.main_queue->queue = saved_main_queue;
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("VK display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);
@@ -4692,25 +4757,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * VK_ERROR_DEVICE_LOST. So the loop is gated on actually having it, not
 		 * merely on the env var.
 		 */
-		/*
-		 * Belt and braces: refuse a "runtime-owned" queue that is actually the
-		 * APP's. Defaulting these to 0 instead of -1 once made them name
-		 * family 0 / queue 0 under vulkan_enable1 — the app's own queue — and
-		 * the repaint lost the device submitting to it. An identity check costs
-		 * nothing and makes that unrepeatable.
-		 */
-		if (c->repaint_queue_family == (int32_t)queue_family_index &&
-		    c->repaint_queue_index == (int32_t)queue_index) {
-			U_LOG_W("#868: refusing repaint queue (family %d index %d) — that is the APP's "
-			        "own queue, not a runtime-owned one",
-			        c->repaint_queue_family, c->repaint_queue_index);
-			c->repaint_queue_family = -1;
-			c->repaint_queue_index = -1;
-		}
-		if (c->repaint_queue_family >= 0 && c->repaint_queue_index >= 0) {
-			c->vk.vkGetDeviceQueue(c->vk.device, (uint32_t)c->repaint_queue_family,
-			                       (uint32_t)c->repaint_queue_index, &c->repaint_queue);
-		}
 		const char *e = getenv("DXR_WEAVE_REPAINT");
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 		if (c->repaint_queue == VK_NULL_HANDLE) {
@@ -4739,6 +4785,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 				U_LOG_W("#868: repaint will submit on the runtime-owned queue "
 				        "(family %d index %d) with its own fence and command pool",
 				        c->repaint_queue_family, c->repaint_queue_index);
+				// Log both handles so a validation "VkQueue is simultaneously
+				// used in thread A and thread B" can be attributed to a
+				// specific queue instead of guessed at.
+				U_LOG_W("#868: queue handles — app=%p repaint=%p",
+				        (void *)c->vk.main_queue->queue, (void *)c->repaint_queue);
 			}
 		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
