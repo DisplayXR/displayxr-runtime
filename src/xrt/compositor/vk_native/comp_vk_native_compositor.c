@@ -3123,7 +3123,24 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			if (!(is_repaint && no2d == 1))
 			vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
 			    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
-			    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			    /*
+			     * Declare the layout the target ACTUALLY has, not the one the
+			     * non-self-submitting path leaves behind.
+			     *
+			     * A self-submitting DP runs its own render pass whose
+			     * finalLayout leaves the target in COLOR_ATTACHMENT_OPTIMAL —
+			     * that is exactly why the explicit COLOR -> PRESENT_SRC barrier
+			     * further down exists. Passing PRESENT_SRC_KHR here therefore
+			     * declared a wrong oldLayout and tripped
+			     * VUID-VkImageMemoryBarrier-oldLayout-01197 (measured: 20
+			     * occurrences per run on cube_zones_vk_win). The composite must
+			     * also LEAVE it in COLOR_ATTACHMENT_OPTIMAL so that barrier
+			     * still has the layout it expects.
+			     */
+			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 			    /*reuse_twod=*/is_repaint);
 
 			// Diagnostic HUD overlay (TAB key toggle)
