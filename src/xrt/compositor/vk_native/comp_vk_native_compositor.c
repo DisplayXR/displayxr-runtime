@@ -480,6 +480,17 @@ struct comp_vk_native_compositor
 	//! DP gets the per-frame wish publish instead (vk_sync_zone_mask_to_dp).
 	bool zones_mode_requested;
 
+	//! Frame's effective atlas-capture source — the image the DP actually
+	//! received this frame: the renderer atlas for normal frames, or the app's
+	//! zero-copy swapchain when the submission exactly filled the worst-case
+	//! atlas (full-fill modes like Quad). Set each frame in layer_commit so the
+	//! atlas capture reflects what the DP got, independent of render mode —
+	//! otherwise a zero-copy frame captures the (unpainted) renderer atlas =
+	//! black. SHADER_READ_ONLY_OPTIMAL at the capture point (the DP sampled it).
+	uint64_t capture_src_image_u64;
+	int32_t capture_src_format;
+	uint32_t capture_src_atlas_w, capture_src_atlas_h;
+
 	//! #224 / ADR-027 hardware-DP zone leg (P4): cached get_local_zone_caps
 	//! result. 0 = not queried yet (calloc default), 1 = supported,
 	//! 2 = legacy DP (slot absent / caps unsupported — never publish).
@@ -2191,7 +2202,12 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 {
 	struct vk_bundle *vk = &c->vk;
 
-	uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+	// The DP's actual input this frame — the renderer atlas, or the zero-copy
+	// app swapchain — recorded in layer_commit. Fall back to the renderer atlas
+	// if a capture somehow fires before layer_commit set it.
+	uint64_t atlas_image_u64 = c->capture_src_image_u64 != 0
+	    ? c->capture_src_image_u64
+	    : comp_vk_native_renderer_get_atlas_image(c->renderer);
 	VkImage atlas_image = (VkImage)(uintptr_t)atlas_image_u64;
 	if (atlas_image == VK_NULL_HANDLE) {
 		return false;
@@ -2213,15 +2229,19 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
 		return false;
 	}
-	uint32_t atlas_w = 0, atlas_h = 0;
-	comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+	uint32_t atlas_w = c->capture_src_atlas_w, atlas_h = c->capture_src_atlas_h;
+	if (atlas_w == 0 || atlas_h == 0) {
+		comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+	}
 
 	uint32_t content_w = tile_columns * view_w;
 	uint32_t content_h = tile_rows * view_h;
 	if (atlas_w > 0 && content_w > atlas_w) content_w = atlas_w;
 	if (atlas_h > 0 && content_h > atlas_h) content_h = atlas_h;
 
-	VkFormat atlas_format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer);
+	VkFormat atlas_format = (VkFormat)(c->capture_src_format != 0
+	    ? c->capture_src_format
+	    : comp_vk_native_renderer_get_format(c->renderer));
 	bool swap_bgra =
 	    (atlas_format == VK_FORMAT_B8G8R8A8_UNORM || atlas_format == VK_FORMAT_B8G8R8A8_SRGB);
 
@@ -2914,6 +2934,22 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				}
 			}
 		}
+	}
+
+	// Record the frame's effective capture source = exactly what the DP will
+	// receive (renderer atlas, or the zero-copy app swapchain). The atlas
+	// capture reads this so it shows the DP's input regardless of render mode
+	// — a zero-copy frame otherwise captures the unpainted renderer atlas.
+	if (zero_copy) {
+		c->capture_src_image_u64 = zc_image_u64;
+		c->capture_src_format = zc_format;
+		c->capture_src_atlas_w = zc_width;
+		c->capture_src_atlas_h = zc_height;
+	} else {
+		c->capture_src_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+		c->capture_src_format = comp_vk_native_renderer_get_format(c->renderer);
+		comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &c->capture_src_atlas_w,
+		                                             &c->capture_src_atlas_h);
 	}
 
 	// Render projection layers to atlas texture (skip if zero-copy)
