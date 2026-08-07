@@ -1747,6 +1747,49 @@ wl_teardown(struct comp_vk_native_target *target)
 #endif // XRT_OS_WINDOWS
 
 void
+comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * Deliberately NOT the app-frame mark. A repaint updates only
+	 * weave_mark_qpc (so the harness can still timestamp this weave's own
+	 * scanout) and leaves last_mark_qpc, wait_frame_qpc, interval_ema_ns and
+	 * wait_to_weave_ema_ns alone — those describe the APP's cadence, and a
+	 * repaint is not an app frame.
+	 */
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	target->weave_mark_qpc = (uint64_t)now.QuadPart;
+	struct wl_harness *wl = wl_get(target);
+	if (wl != nullptr) {
+		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+	}
+#else
+	(void)target;
+#endif
+}
+
+void
+comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * Scanout-only pacing. See the header for why this must never wait on an
+	 * acquire/frame-latency token. When present_wait is unavailable (Intel
+	 * iGPUs expose no VK present-timing extensions) there is nothing to wait
+	 * on and the repaint thread's own sleep does the pacing.
+	 */
+	PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
+	if (wait_fn == nullptr || target->last_present_id == 0) {
+		return;
+	}
+	wait_fn(target->vk->device, target->swapchain, target->last_present_id, 100ull * 1000 * 1000);
+#else
+	(void)target;
+#endif
+}
+
+void
 comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 {
 #ifdef XRT_OS_WINDOWS

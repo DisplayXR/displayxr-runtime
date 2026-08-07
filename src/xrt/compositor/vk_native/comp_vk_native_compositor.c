@@ -38,6 +38,7 @@
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include "os/os_time.h"
+#include "os/os_threading.h"
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
@@ -320,6 +321,57 @@ struct comp_vk_native_compositor
 
 	//! Display refresh rate in Hz.
 	float display_refresh_rate;
+
+	/*!
+	 * #868: serialises the frame path against the repaint replay.
+	 *
+	 * VK had no compositor lock at all. It needs one for the same reason D3D11
+	 * did, plus a stronger one: `vk->main_queue->queue` is the APP's queue, and
+	 * a VkQueue requires EXTERNAL SYNCHRONISATION — two threads calling
+	 * vkQueueSubmit/vkQueuePresentKHR on it is undefined behaviour, not merely
+	 * a lost render target. The vendor weave records into our command buffer
+	 * (setCommandBuffer + weave()), but its texture-reload path submits and
+	 * waits on that same queue from inside weave(), and which weaver binary is
+	 * loaded varies by installed SR version. Holding this across the whole
+	 * replay means the queue and the display processor only ever see one
+	 * caller, whichever weaver is in play.
+	 */
+	struct os_mutex mutex;
+
+	//! #868: the repaint loop. See vk_repaint_thread.
+	struct os_thread_helper repaint_thread;
+
+	/*!
+	 * #868: everything the repaint thread needs to replay the last app frame's
+	 * weave WITHOUT touching app-owned state. Published by layer_commit.
+	 */
+	struct
+	{
+		int enabled;                    //!< DXR_WEAVE_REPAINT=0 disables.
+		int force;                      //!< DXR_WEAVE_REPAINT_FORCE=1 correctness probe.
+		bool armed;                     //!< False on zero-copy: the atlas IS the app's image.
+		bool app_frame_in_progress;     //!< Set by layer_begin, cleared by layer_commit.
+		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
+
+		//! Effective content layout the last app frame actually painted.
+		uint32_t view_w, view_h, cols, rows;
+
+		//! Compositor-owned atlas the last app frame wove from.
+		uint64_t atlas_image, atlas_view;
+		int32_t atlas_format;
+		uint32_t atlas_w, atlas_h;
+
+		/*!
+		 * The 2D-under backdrop the last app frame FLATTENED. Cached, never
+		 * re-flattened: the flatten samples the app's own Local2D swapchain
+		 * images, which it has since reacquired and overwritten. Re-reading
+		 * them is what made the D3D11/D3D12 bubble flicker.
+		 */
+		uint64_t backdrop_view;
+		uint32_t backdrop_w, backdrop_h;
+
+		uint64_t count, ticks;          //!< Diagnostics.
+	} repaint;
 
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
@@ -1280,6 +1332,13 @@ static xrt_result_t
 vk_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_frame_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+
+	// #868: the app's submission window opens here and closes in layer_commit.
+	// The compositor lock does NOT span it (layer_begin returns without
+	// holding anything), so a repaint could otherwise win the lock partway
+	// through the app filling layer_accum and replay a half-written frame.
+	c->repaint.app_frame_in_progress = true;
+
 	comp_layer_accum_begin(&c->layer_accum, data);
 	return XRT_SUCCESS;
 }
@@ -2656,8 +2715,561 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 	}
 }
 
+/*!
+ * #837 frame-stage accumulator. File-scope rather than a function-local
+ * static because both the app frame and the repaint replay record into it
+ * through the shared weave function below.
+ */
+static struct vk_frame_timing s_ftiming = {0};
+
+/*!
+ * #868: acquire -> weave -> submit -> present. Shared by the app frame and by
+ * the repaint replay, so a repaint is constructed exactly like the frame it
+ * stands in for rather than by a second code path that has to be kept in
+ * agreement with it (which is the bug class that cost D3D11 three fixes).
+ *
+ * Caller MUST hold c->mutex: this submits to the app's VkQueue and drives the
+ * vendor weaver, and neither tolerates two concurrent callers.
+ *
+ * On a repaint, three things are deliberately NOT re-done, because each reads
+ * state the app owns and has since overwritten:
+ *   - the window-space layer composite into the atlas,
+ *   - the 2D-under backdrop flatten (cached in c->repaint.backdrop_view),
+ *   - the app-frame timing marks (see comp_vk_native_target_weave_mark_repaint).
+ * The crop IS re-done: it reads the compositor-owned atlas and writes
+ * compositor-owned scratch, and skipping it hands the DP a stale image.
+ */
 static xrt_result_t
-vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
+                        bool is_repaint,
+                        bool zero_copy,
+                        uint64_t zc_image_u64,
+                        uint64_t zc_view_u64,
+                        int32_t zc_format,
+                        uint32_t zc_width,
+                        uint32_t zc_height,
+                        uint32_t tgt_width,
+                        uint32_t tgt_height,
+                        bool ftime,
+                        uint64_t *fp,
+                        bool *out_skip_frame)
+{
+	struct vk_bundle *vk = &c->vk;
+	xrt_result_t xret = XRT_SUCCESS;
+
+	// Re-sync the output surface against the live ANativeWindow (Android).
+	// On background→card the SurfaceView's surface is destroyed; presenting
+	// to that dead window wedges the render thread (Adreno never reports
+	// VK_ERROR_OUT_OF_DATE_KHR there) and the OS freezes the process. Skip
+	// acquire/present entirely while no surface exists, and pick up the new
+	// surface on resume. No-op on non-Android. #507
+	enum comp_vk_native_target_surface_state sstate =
+	    comp_vk_native_target_sync_surface(c->target);
+	if (sstate == COMP_VK_NATIVE_TARGET_SURFACE_LOST) {
+		*out_skip_frame = true;
+		return XRT_SUCCESS;
+	}
+
+	uint32_t target_index;
+	xret = comp_vk_native_target_acquire(c->target, &target_index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to acquire target");
+		return xret;
+	}
+
+	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
+	    comp_vk_native_renderer_get_cmd_pool(c->renderer);
+
+	VkCommandBufferAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+
+	VkCommandBuffer cmd;
+	VkFramebuffer target_fb = VK_NULL_HANDLE;
+	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	if (res == VK_SUCCESS) {
+		VkCommandBufferBeginInfo begin_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+		};
+		vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+		uint64_t target_image, target_view;
+		comp_vk_native_target_get_current_image(c->target, &target_image, &target_view);
+
+		// Display processor weaving path: record interlacing commands
+		// into our command buffer using a framebuffer from our target.
+		// This matches the multi-compositor approach where the weaver is
+		// a command recorder, not a standalone presenter.
+		VkRenderPass dp_render_pass = (c->display_processor != NULL)
+		    ? xrt_display_processor_get_render_pass(c->display_processor)
+		    : VK_NULL_HANDLE;
+
+		// A self-submitting DP (e.g. the Leia CNSDK weaver) runs its
+		// own render pass internally and exposes none to us, so
+		// get_render_pass() is NULL. Route it through the DP path
+		// anyway — gating solely on a non-NULL render pass would drop
+		// it into the blit_to_target fallback below, which on Android
+		// faults inside the Adreno driver (HW-3) and never weaves. Only
+		// the explicit-cmd-buffer DP path needs our render pass/FB.
+		bool dp_self_submits = (c->display_processor != NULL) &&
+		    xrt_display_processor_is_self_submitting(c->display_processor);
+
+		if (c->display_processor != NULL &&
+		    (dp_render_pass != VK_NULL_HANDLE || dp_self_submits)) {
+			static bool dp_logged = false;
+			if (!dp_logged) {
+				U_LOG_W("VK rendering via display processor (compositor-owned swapchain)");
+				dp_logged = true;
+			}
+
+			uint64_t src_image_u64, src_view_u64;
+			int32_t view_format;
+			uint32_t view_width, view_height, tc, tr;
+
+			if (zero_copy) {
+				src_image_u64 = zc_image_u64;
+				src_view_u64 = zc_view_u64;
+				view_format = zc_format;
+			} else {
+				src_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+				src_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+				view_format = comp_vk_native_renderer_get_format(c->renderer);
+			}
+
+			// #542: the DP and the window-space pass get the frame's
+			// EFFECTIVE content layout — the grid the renderer painted
+			// (== the mode layout for matched submissions).
+			view_width = c->eff_layout.tile_w;
+			view_height = c->eff_layout.tile_h;
+			tc = c->eff_layout.cols;
+			tr = c->eff_layout.rows;
+
+			// Pre-weave: composite window-space layers per-tile INTO the
+			// atlas. Skipped in zero-copy (no atlas) and when no
+			// window-space layers exist.
+			//
+			// #868: also skipped on a repaint — it samples the APP's own
+			// layer swapchain images, which the app has since reacquired
+			// and redrawn. The atlas already carries what the last app
+			// frame composited, so replaying the weave over it is both
+			// correct and what the repaint is for.
+			if (!zero_copy && !is_repaint) {
+				uint32_t atlas_w_pre, atlas_h_pre;
+				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
+				vk_compositor_render_window_space_into_atlas(c, cmd,
+				    (VkImage)(uintptr_t)src_image_u64,
+				    (VkImageView)(uintptr_t)src_view_u64,
+				    atlas_w_pre, atlas_h_pre,
+				    view_width, view_height, tc, tr);
+			}
+
+			// Crop atlas to content dimensions before passing to DP
+			{
+				uint32_t content_w = tc * view_width;
+				uint32_t content_h = tr * view_height;
+				uint32_t atlas_w, atlas_h;
+				if (zero_copy) {
+					atlas_w = zc_width;
+					atlas_h = zc_height;
+				} else {
+					comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+				}
+				vk_crop_atlas_for_dp(c, cmd, &src_image_u64, &src_view_u64,
+				                      content_w, content_h, atlas_w, atlas_h);
+			}
+
+			// Create temporary framebuffer from the target's swapchain image.
+			// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
+			// A self-submitting DP exposes no render pass, so leave target_fb
+			// NULL for it (it weaves internally and ignores the FB) — calling
+			// vkCreateFramebuffer with a NULL render pass would be invalid.
+			if (dp_render_pass != VK_NULL_HANDLE) {
+				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
+				VkFramebufferCreateInfo fb_ci = {
+				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+				    .renderPass = dp_render_pass,
+				    .attachmentCount = 1,
+				    .pAttachments = &fb_view,
+				    .width = tgt_width,
+				    .height = tgt_height,
+				    .layers = 1,
+				};
+				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
+			}
+
+			// #491 part 3 — flatten this frame's 2D-under layers PRE-weave
+			// (into backdrop_scratch) and hand them to the DP so it
+			// composites `backdrop over captured-desktop` under the 3D.
+			// Recorded into `cmd`; the dp_self_submits flush below makes the
+			// backdrop visible (SHADER_READ) before the DP's internal weave
+			// samples it. Independent of target_image, so its order vs the
+			// pre-weave target barrier is irrelevant. NULL ⟹ no under-layers.
+			//
+			// #868: the flatten samples the app's own Local2D swapchain
+			// images, so a repaint MUST NOT re-run it — it reuses what the
+			// last app frame produced. Re-reading them is exactly what made
+			// the 2D bubble flicker on D3D11 and D3D12; see
+			// [[repaint-never-touches-app-owned-state]].
+			uint32_t bd_w = 0, bd_h = 0;
+			VkImageView bd_view;
+			if (is_repaint) {
+				bd_view = (VkImageView)(uintptr_t)c->repaint.backdrop_view;
+				bd_w = c->repaint.backdrop_w;
+				bd_h = c->repaint.backdrop_h;
+			} else {
+				bd_view = vk_flatten_backdrop_2d(c, cmd, tgt_width, tgt_height, &bd_w, &bd_h);
+				c->repaint.backdrop_view = (uint64_t)(uintptr_t)bd_view;
+				c->repaint.backdrop_w = bd_w;
+				c->repaint.backdrop_h = bd_h;
+			}
+
+			// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
+			VkImageMemoryBarrier pre_weave = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = 0,
+			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .image = (VkImage)(uintptr_t)target_image,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			vk->vkCmdPipelineBarrier(cmd,
+			    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			    0, 0, NULL, 0, NULL, 1, &pre_weave);
+
+			if (ftime) {
+				fp[1] = os_monotonic_get_ns();
+			}
+			if (dp_self_submits) {
+				// Flush pre-DP work (WS-layer composite, atlas crop,
+				// target-image layout transition) so the DP's
+				// internal submit sees the right state on the GPU.
+				vk->vkEndCommandBuffer(cmd);
+				VkSubmitInfo pre_si = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				};
+				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
+				if (res == VK_SUCCESS) {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+				}
+			}
+
+			if (ftime) {
+				fp[2] = os_monotonic_get_ns();
+			}
+			// Hand the DP our lifecycle-managed view for this target
+			// image. A self-submitting DP with no render pass (Leia
+			// CNSDK) builds its own destination framebuffer and would
+			// otherwise have to create its own VkImageView on the
+			// swapchain image — which Adreno faults on. No-op for DPs
+			// that don't expose the slot.
+			xrt_display_processor_set_target_color_view(
+			    c->display_processor, (VkImageView)(uintptr_t)target_view);
+
+			// #491 part 3 — hand the DP this frame's backdrop (NULL ⟹ clears
+			// it → desktop-only background). Must precede process_atlas.
+			xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
+
+			// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase
+			// to the window's panel position. Must precede process_atlas.
+			vk_update_present_origin(c);
+
+			// Weave-latency harness mark (env-gated no-op otherwise). A
+			// repaint paced itself unlocked and stays out of the #867
+			// frame-cost ledger — it is not an app frame.
+			if (is_repaint) {
+				comp_vk_native_target_weave_mark_repaint(c->target);
+			} else {
+				comp_vk_native_target_weave_mark(c->target);
+			}
+
+			// Timing feedback: hand the DP last frame's MEASURED
+			// weave→scanout residual so the vendor eye predictor
+			// runs with an exact horizon (0 = unknown ⟹ DP heuristic).
+			xrt_display_processor_vk_set_frame_timing(
+			    (struct xrt_display_processor_vk *)c->display_processor,
+			    comp_vk_native_target_get_measured_weave_ns(c->target),
+			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+
+			// Call display processor with atlas (or zero-copy swapchain) texture
+			xrt_display_processor_process_atlas(
+			    c->display_processor,
+			    dp_self_submits ? VK_NULL_HANDLE : cmd,
+			    (VkImage_XDP)(uintptr_t)src_image_u64,
+			    (VkImageView)(uintptr_t)src_view_u64,
+			    view_width, view_height,
+			    tc, tr,
+			    (VkFormat_XDP)view_format,
+			    target_fb,
+			    (VkImage_XDP)(uintptr_t)target_image,
+			    tgt_width, tgt_height,
+			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target),
+			    0,
+			    0,
+			    0,
+			    0);
+
+			if (ftime) {
+				fp[3] = os_monotonic_get_ns();
+			}
+			if (dp_self_submits) {
+				// DP owned the post-weave submit. The vendor weave's
+				// queue submit may still be in flight writing to
+				// target_image; the HUD cmd buffer we're about to
+				// record writes to the same image, so drain the GPU
+				// before recording the HUD to avoid a target_image
+				// race (audit B7). On Android the HUD is c->hud==NULL
+				// and this overlay is a no-op, so the wait costs
+				// nothing in practice — but keep it for safety when
+				// HUD eventually wires up.
+				vk->vkDeviceWaitIdle(vk->device);
+
+				// Allocate a fresh cmd buffer for any post-DP
+				// overlays (HUD), then fall through to the shared
+				// end+submit below by re-using `cmd`.
+				VkCommandBufferAllocateInfo post_ai = {
+				    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+				    .commandPool = cmd_pool,
+				    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+				    .commandBufferCount = 1,
+				};
+				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+				vk->vkAllocateCommandBuffers(vk->device, &post_ai, &cmd);
+				VkCommandBufferBeginInfo post_bi = {
+				    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+				    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+				};
+				vk->vkBeginCommandBuffer(cmd, &post_bi);
+			}
+			if (ftime) {
+				fp[4] = os_monotonic_get_ns();
+			}
+
+			// Render pass finalLayout handles transition to PRESENT_SRC_KHR
+			// Window-space layers are composed pre-weave into the atlas
+			// (see vk_compositor_render_window_space_into_atlas), so we
+			// only need the diagnostic HUD on the target post-weave.
+
+			// #439 Phase 3 — overlay the frame's flattened 2D where the
+			// zone mask says "2D" (M*weave + (1-M)*twod). No-op unless the
+			// frame carries Local2D layers. Target stays PRESENT_SRC so the
+			// HUD's own PRESENT_SRC→COLOR→PRESENT transition still applies.
+			vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
+			    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
+			    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+			// Diagnostic HUD overlay (TAB key toggle)
+			vk_compositor_render_hud(c, cmd,
+			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+			// A self-submitting DP (Leia CNSDK) ran its own internal
+			// render pass, whose finalLayout leaves the target in
+			// COLOR_ATTACHMENT_OPTIMAL — not PRESENT_SRC_KHR. The
+			// non-self-submit path above relies on the compositor render
+			// pass's finalLayout for that transition, but here there's no
+			// such pass, so transition explicitly before present.
+			if (dp_self_submits) {
+				VkImageMemoryBarrier to_present = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    .dstAccessMask = 0,
+				    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+				    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .image = (VkImage)(uintptr_t)target_image,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd,
+				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+				    0, 0, NULL, 0, NULL, 1, &to_present);
+			}
+		} else {
+			// No display processor (or mono/2D mode): blit atlas texture to target
+			comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
+			                                        target_image, tgt_width, tgt_height);
+
+			// Diagnostic HUD overlay (TAB key toggle)
+			vk_compositor_render_hud(c, cmd,
+			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+		}
+
+		vk->vkEndCommandBuffer(cmd);
+
+		VkSubmitInfo submit_info = {
+		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		    .commandBufferCount = 1,
+		    .pCommandBuffers = &cmd,
+		};
+
+		// #837: wait a fence scoped to THIS submit instead of draining
+		// the whole queue — same wall time on the single-queue iGPU,
+		// strictly narrower elsewhere, and the prerequisite for
+		// deferring the present off the frame's critical path.
+		if (c->frame_fence == VK_NULL_HANDLE) {
+			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+			vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
+		}
+		res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, c->frame_fence);
+		if (res == VK_SUCCESS) {
+			if (c->frame_fence != VK_NULL_HANDLE) {
+				vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
+				vk->vkResetFences(vk->device, 1, &c->frame_fence);
+			} else {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			}
+		}
+
+		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+	}
+
+	// Destroy temporary framebuffer after GPU is done
+	if (target_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
+	}
+
+	if (ftime) {
+		fp[5] = os_monotonic_get_ns();
+	}
+
+	// Present
+	xret = comp_vk_native_target_present(c->target);
+
+	if (ftime && fp[1] != 0) {
+		fp[6] = os_monotonic_get_ns();
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRE, fp[0], fp[1]);
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PREFLUSH, fp[1], fp[2]);
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_WEAVE, fp[2], fp[3]);
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_POSTWAIT, fp[3], fp[4]);
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_COMPOSITE, fp[4], fp[5]);
+		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRESENT, fp[5], fp[6]);
+		vk_frame_timing_flush(&s_ftiming, fp[6]);
+	}
+
+#ifdef XRT_OS_WINDOWS
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_signal_paint_done(c->own_window);
+	}
+#endif
+
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to present");
+		return xret;
+	}
+
+	return xret;
+}
+
+/*!
+ * #868 repaint loop: re-weave the last atlas at panel rate while the app is
+ * between frames, so the viewer's eye position keeps driving the interlace even
+ * when the app cannot keep up. The weave is f(atlas, eye position), and the
+ * display processor re-samples the eyes at weave time — so replaying the same
+ * atlas is not a wasted frame, it is a fresher one.
+ *
+ * Fires only once the app has already MISSED a full refresh (>= 2 panel
+ * periods). A tighter gate loses the race against the app's next frame, and the
+ * repaint then just steals the lock from a submission that was about to happen
+ * anyway.
+ *
+ * Paces itself with the lock RELEASED, then takes it for the whole replay, so
+ * the queue and the vendor weaver only ever see one caller.
+ */
+static void *
+vk_repaint_thread(void *ptr)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)ptr;
+
+	while (os_thread_helper_is_running(&c->repaint_thread)) {
+		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
+		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		os_nanosleep((int64_t)(period_ns / 4));
+		if (!os_thread_helper_is_running(&c->repaint_thread)) {
+			break;
+		}
+		c->repaint.ticks++;
+
+		// #868 diag: where the loop actually goes. A repaint that never fires
+		// is indistinguishable from one that fires and produces nothing unless
+		// the gate state is sampled — this is what caught the loop never
+		// starting at all. Probe-only: at one line/second it is far too noisy
+		// for the default path.
+		if (c->repaint.force == 1 && (c->repaint.ticks % 240) == 0) {
+			U_LOG_W("#868 vk repaint: ticks=%llu count=%llu armed=%d in_frame=%d "
+			        "quiet_ns=%llu",
+			        (unsigned long long)c->repaint.ticks, (unsigned long long)c->repaint.count,
+			        (int)c->repaint.armed, (int)c->repaint.app_frame_in_progress,
+			        (unsigned long long)(os_monotonic_get_ns() - c->repaint.last_app_frame_ns));
+		}
+
+		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			continue;
+		}
+		// Keyed on the last APP frame, never on the last repaint — otherwise
+		// repaints pace off their own timestamps and free-run.
+		if (c->repaint.force != 1 &&
+		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+			continue;
+		}
+
+		comp_vk_native_target_repaint_pace(c->target);
+
+		os_mutex_lock(&c->mutex);
+
+		// Re-check under the lock. app_frame_in_progress is load-bearing and
+		// is NOT bypassed by the force probe: replaying into a half-written
+		// layer_accum does not exercise the feature, it corrupts the frame.
+		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
+		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == NULL) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		if (c->repaint.force != 1 &&
+		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+
+		uint32_t tgt_width = 0, tgt_height = 0;
+		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+
+		uint64_t fp[8] = {0};
+		bool skip_frame = false;
+		// zero_copy is hard false: c->repaint.armed is only set off that path.
+		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
+		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
+
+		c->repaint.count++;
+		os_mutex_unlock(&c->mutex);
+
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#868: repainting last atlas at %.1f Hz while the app is between frames "
+			        "(set DXR_WEAVE_REPAINT=0 to disable)",
+			        hz);
+		}
+	}
+
+	return NULL;
+}
+
+/*!
+ * The frame path proper. Runs with c->mutex HELD — see the locking wrapper
+ * vk_compositor_layer_commit below. Keeps its several early returns, which is
+ * exactly why the lock lives in the wrapper rather than being taken here.
+ */
+static xrt_result_t
+vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	struct vk_bundle *vk = &c->vk;
@@ -2665,7 +3277,6 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// #837 frame-stage timing (env-gated) — see vk_frame_timing above. fp[]
 	// marks are taken at the windowed-DP path's stage boundaries.
 	const bool ftime = debug_get_bool_option_frame_stage_timing();
-	static struct vk_frame_timing s_ftiming = {0};
 	uint64_t fp[7] = {0};
 	if (ftime) {
 		fp[0] = os_monotonic_get_ns();
@@ -3138,385 +3749,30 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// If we have a target (window), present to it
 	if (c->target != NULL) {
-		// Re-sync the output surface against the live ANativeWindow (Android).
-		// On background→card the SurfaceView's surface is destroyed; presenting
-		// to that dead window wedges the render thread (Adreno never reports
-		// VK_ERROR_OUT_OF_DATE_KHR there) and the OS freezes the process. Skip
-		// acquire/present entirely while no surface exists, and pick up the new
-		// surface on resume. No-op on non-Android. #507
-		enum comp_vk_native_target_surface_state sstate =
-		    comp_vk_native_target_sync_surface(c->target);
-		if (sstate == COMP_VK_NATIVE_TARGET_SURFACE_LOST) {
+		// #868: publish what the repaint thread needs to replay this weave.
+		// Armed only off the zero-copy path: there the atlas IS the app's own
+		// swapchain image, which it reacquires and overwrites, so replaying it
+		// would weave whatever the app has drawn since.
+		c->repaint.view_w = c->eff_layout.tile_w;
+		c->repaint.view_h = c->eff_layout.tile_h;
+		c->repaint.cols = c->eff_layout.cols;
+		c->repaint.rows = c->eff_layout.rows;
+		c->repaint.armed = !zero_copy;
+
+		bool skip_frame = false;
+		xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64,
+		                               zc_view_u64, zc_format, zc_width, zc_height, tgt_width,
+		                               tgt_height, ftime, fp, &skip_frame);
+		if (skip_frame) {
 			return XRT_SUCCESS;
 		}
-
-		uint32_t target_index;
-		xret = comp_vk_native_target_acquire(c->target, &target_index);
 		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to acquire target");
 			return xret;
 		}
 
-		VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
-		    comp_vk_native_renderer_get_cmd_pool(c->renderer);
-
-		VkCommandBufferAllocateInfo alloc_info = {
-		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		    .commandPool = cmd_pool,
-		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		    .commandBufferCount = 1,
-		};
-
-		VkCommandBuffer cmd;
-		VkFramebuffer target_fb = VK_NULL_HANDLE;
-		VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
-		if (res == VK_SUCCESS) {
-			VkCommandBufferBeginInfo begin_info = {
-			    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-			    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-			};
-			vk->vkBeginCommandBuffer(cmd, &begin_info);
-
-			uint64_t target_image, target_view;
-			comp_vk_native_target_get_current_image(c->target, &target_image, &target_view);
-
-			// Display processor weaving path: record interlacing commands
-			// into our command buffer using a framebuffer from our target.
-			// This matches the multi-compositor approach where the weaver is
-			// a command recorder, not a standalone presenter.
-			VkRenderPass dp_render_pass = (c->display_processor != NULL)
-			    ? xrt_display_processor_get_render_pass(c->display_processor)
-			    : VK_NULL_HANDLE;
-
-			// A self-submitting DP (e.g. the Leia CNSDK weaver) runs its
-			// own render pass internally and exposes none to us, so
-			// get_render_pass() is NULL. Route it through the DP path
-			// anyway — gating solely on a non-NULL render pass would drop
-			// it into the blit_to_target fallback below, which on Android
-			// faults inside the Adreno driver (HW-3) and never weaves. Only
-			// the explicit-cmd-buffer DP path needs our render pass/FB.
-			bool dp_self_submits = (c->display_processor != NULL) &&
-			    xrt_display_processor_is_self_submitting(c->display_processor);
-
-			if (c->display_processor != NULL &&
-			    (dp_render_pass != VK_NULL_HANDLE || dp_self_submits)) {
-				static bool dp_logged = false;
-				if (!dp_logged) {
-					U_LOG_W("VK rendering via display processor (compositor-owned swapchain)");
-					dp_logged = true;
-				}
-
-				uint64_t src_image_u64, src_view_u64;
-				int32_t view_format;
-				uint32_t view_width, view_height, tc, tr;
-
-				if (zero_copy) {
-					src_image_u64 = zc_image_u64;
-					src_view_u64 = zc_view_u64;
-					view_format = zc_format;
-				} else {
-					src_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
-					src_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
-					view_format = comp_vk_native_renderer_get_format(c->renderer);
-				}
-
-				// #542: the DP and the window-space pass get the frame's
-				// EFFECTIVE content layout — the grid the renderer painted
-				// (== the mode layout for matched submissions).
-				view_width = c->eff_layout.tile_w;
-				view_height = c->eff_layout.tile_h;
-				tc = c->eff_layout.cols;
-				tr = c->eff_layout.rows;
-
-				// Pre-weave: composite window-space layers per-tile INTO the
-				// atlas. Skipped in zero-copy (no atlas) and when no
-				// window-space layers exist.
-				if (!zero_copy) {
-					uint32_t atlas_w_pre, atlas_h_pre;
-					comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
-					vk_compositor_render_window_space_into_atlas(c, cmd,
-					    (VkImage)(uintptr_t)src_image_u64,
-					    (VkImageView)(uintptr_t)src_view_u64,
-					    atlas_w_pre, atlas_h_pre,
-					    view_width, view_height, tc, tr);
-				}
-
-				// Crop atlas to content dimensions before passing to DP
-				{
-					uint32_t content_w = tc * view_width;
-					uint32_t content_h = tr * view_height;
-					uint32_t atlas_w, atlas_h;
-					if (zero_copy) {
-						atlas_w = zc_width;
-						atlas_h = zc_height;
-					} else {
-						comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
-					}
-					vk_crop_atlas_for_dp(c, cmd, &src_image_u64, &src_view_u64,
-					                      content_w, content_h, atlas_w, atlas_h);
-				}
-
-				// Create temporary framebuffer from the target's swapchain image.
-				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
-				// A self-submitting DP exposes no render pass, so leave target_fb
-				// NULL for it (it weaves internally and ignores the FB) — calling
-				// vkCreateFramebuffer with a NULL render pass would be invalid.
-				if (dp_render_pass != VK_NULL_HANDLE) {
-					VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
-					VkFramebufferCreateInfo fb_ci = {
-					    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-					    .renderPass = dp_render_pass,
-					    .attachmentCount = 1,
-					    .pAttachments = &fb_view,
-					    .width = tgt_width,
-					    .height = tgt_height,
-					    .layers = 1,
-					};
-					vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
-				}
-
-				// #491 part 3 — flatten this frame's 2D-under layers PRE-weave
-				// (into backdrop_scratch) and hand them to the DP so it
-				// composites `backdrop over captured-desktop` under the 3D.
-				// Recorded into `cmd`; the dp_self_submits flush below makes the
-				// backdrop visible (SHADER_READ) before the DP's internal weave
-				// samples it. Independent of target_image, so its order vs the
-				// pre-weave target barrier is irrelevant. NULL ⟹ no under-layers.
-				uint32_t bd_w = 0, bd_h = 0;
-				VkImageView bd_view =
-				    vk_flatten_backdrop_2d(c, cmd, tgt_width, tgt_height, &bd_w, &bd_h);
-
-				// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
-				VkImageMemoryBarrier pre_weave = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = 0,
-				    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-				    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    .image = (VkImage)(uintptr_t)target_image,
-				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				};
-				vk->vkCmdPipelineBarrier(cmd,
-				    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				    0, 0, NULL, 0, NULL, 1, &pre_weave);
-
-				if (ftime) {
-					fp[1] = os_monotonic_get_ns();
-				}
-				if (dp_self_submits) {
-					// Flush pre-DP work (WS-layer composite, atlas crop,
-					// target-image layout transition) so the DP's
-					// internal submit sees the right state on the GPU.
-					vk->vkEndCommandBuffer(cmd);
-					VkSubmitInfo pre_si = {
-					    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-					    .commandBufferCount = 1,
-					    .pCommandBuffers = &cmd,
-					};
-					res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
-					if (res == VK_SUCCESS) {
-						vk->vkQueueWaitIdle(vk->main_queue->queue);
-					}
-				}
-
-				if (ftime) {
-					fp[2] = os_monotonic_get_ns();
-				}
-				// Hand the DP our lifecycle-managed view for this target
-				// image. A self-submitting DP with no render pass (Leia
-				// CNSDK) builds its own destination framebuffer and would
-				// otherwise have to create its own VkImageView on the
-				// swapchain image — which Adreno faults on. No-op for DPs
-				// that don't expose the slot.
-				xrt_display_processor_set_target_color_view(
-				    c->display_processor, (VkImageView)(uintptr_t)target_view);
-
-				// #491 part 3 — hand the DP this frame's backdrop (NULL ⟹ clears
-				// it → desktop-only background). Must precede process_atlas.
-				xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
-
-				// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase
-				// to the window's panel position. Must precede process_atlas.
-				vk_update_present_origin(c);
-
-				// Weave-latency harness mark (env-gated no-op otherwise).
-				comp_vk_native_target_weave_mark(c->target);
-
-				// Timing feedback: hand the DP last frame's MEASURED
-				// weave→scanout residual so the vendor eye predictor
-				// runs with an exact horizon (0 = unknown ⟹ DP heuristic).
-				xrt_display_processor_vk_set_frame_timing(
-				    (struct xrt_display_processor_vk *)c->display_processor,
-				    comp_vk_native_target_get_measured_weave_ns(c->target),
-				    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-
-				// Call display processor with atlas (or zero-copy swapchain) texture
-				xrt_display_processor_process_atlas(
-				    c->display_processor,
-				    dp_self_submits ? VK_NULL_HANDLE : cmd,
-				    (VkImage_XDP)(uintptr_t)src_image_u64,
-				    (VkImageView)(uintptr_t)src_view_u64,
-				    view_width, view_height,
-				    tc, tr,
-				    (VkFormat_XDP)view_format,
-				    target_fb,
-				    (VkImage_XDP)(uintptr_t)target_image,
-				    tgt_width, tgt_height,
-				    (VkFormat_XDP)comp_vk_native_target_get_format(c->target),
-				    0,
-				    0,
-				    0,
-				    0);
-
-				if (ftime) {
-					fp[3] = os_monotonic_get_ns();
-				}
-				if (dp_self_submits) {
-					// DP owned the post-weave submit. The vendor weave's
-					// queue submit may still be in flight writing to
-					// target_image; the HUD cmd buffer we're about to
-					// record writes to the same image, so drain the GPU
-					// before recording the HUD to avoid a target_image
-					// race (audit B7). On Android the HUD is c->hud==NULL
-					// and this overlay is a no-op, so the wait costs
-					// nothing in practice — but keep it for safety when
-					// HUD eventually wires up.
-					vk->vkDeviceWaitIdle(vk->device);
-
-					// Allocate a fresh cmd buffer for any post-DP
-					// overlays (HUD), then fall through to the shared
-					// end+submit below by re-using `cmd`.
-					VkCommandBufferAllocateInfo post_ai = {
-					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-					    .commandPool = cmd_pool,
-					    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-					    .commandBufferCount = 1,
-					};
-					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
-					vk->vkAllocateCommandBuffers(vk->device, &post_ai, &cmd);
-					VkCommandBufferBeginInfo post_bi = {
-					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-					    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-					};
-					vk->vkBeginCommandBuffer(cmd, &post_bi);
-				}
-				if (ftime) {
-					fp[4] = os_monotonic_get_ns();
-				}
-
-				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
-				// Window-space layers are composed pre-weave into the atlas
-				// (see vk_compositor_render_window_space_into_atlas), so we
-				// only need the diagnostic HUD on the target post-weave.
-
-				// #439 Phase 3 — overlay the frame's flattened 2D where the
-				// zone mask says "2D" (M*weave + (1-M)*twod). No-op unless the
-				// frame carries Local2D layers. Target stays PRESENT_SRC so the
-				// HUD's own PRESENT_SRC→COLOR→PRESENT transition still applies.
-				vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
-				    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
-				    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-				// Diagnostic HUD overlay (TAB key toggle)
-				vk_compositor_render_hud(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
-
-				// A self-submitting DP (Leia CNSDK) ran its own internal
-				// render pass, whose finalLayout leaves the target in
-				// COLOR_ATTACHMENT_OPTIMAL — not PRESENT_SRC_KHR. The
-				// non-self-submit path above relies on the compositor render
-				// pass's finalLayout for that transition, but here there's no
-				// such pass, so transition explicitly before present.
-				if (dp_self_submits) {
-					VkImageMemoryBarrier to_present = {
-					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-					    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-					    .dstAccessMask = 0,
-					    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-					    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-					    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-					    .image = (VkImage)(uintptr_t)target_image,
-					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-					};
-					vk->vkCmdPipelineBarrier(cmd,
-					    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-					    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-					    0, 0, NULL, 0, NULL, 1, &to_present);
-				}
-			} else {
-				// No display processor (or mono/2D mode): blit atlas texture to target
-				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
-				                                        target_image, tgt_width, tgt_height);
-
-				// Diagnostic HUD overlay (TAB key toggle)
-				vk_compositor_render_hud(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
-			}
-
-			vk->vkEndCommandBuffer(cmd);
-
-			VkSubmitInfo submit_info = {
-			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			    .commandBufferCount = 1,
-			    .pCommandBuffers = &cmd,
-			};
-
-			// #837: wait a fence scoped to THIS submit instead of draining
-			// the whole queue — same wall time on the single-queue iGPU,
-			// strictly narrower elsewhere, and the prerequisite for
-			// deferring the present off the frame's critical path.
-			if (c->frame_fence == VK_NULL_HANDLE) {
-				VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-				vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
-			}
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, c->frame_fence);
-			if (res == VK_SUCCESS) {
-				if (c->frame_fence != VK_NULL_HANDLE) {
-					vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
-					vk->vkResetFences(vk->device, 1, &c->frame_fence);
-				} else {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
-				}
-			}
-
-			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
-		}
-
-		// Destroy temporary framebuffer after GPU is done
-		if (target_fb != VK_NULL_HANDLE) {
-			vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
-		}
-
-		if (ftime) {
-			fp[5] = os_monotonic_get_ns();
-		}
-
-		// Present
-		xret = comp_vk_native_target_present(c->target);
-
-		if (ftime && fp[1] != 0) {
-			fp[6] = os_monotonic_get_ns();
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRE, fp[0], fp[1]);
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PREFLUSH, fp[1], fp[2]);
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_WEAVE, fp[2], fp[3]);
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_POSTWAIT, fp[3], fp[4]);
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_COMPOSITE, fp[4], fp[5]);
-			vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRESENT, fp[5], fp[6]);
-			vk_frame_timing_flush(&s_ftiming, fp[6]);
-		}
-
-#ifdef XRT_OS_WINDOWS
-		if (c->owns_window && c->own_window != NULL) {
-			comp_d3d11_window_signal_paint_done(c->own_window);
-		}
-#endif
-
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to present");
-			return xret;
-		}
+		// Only a REAL frame resets the quiet-gate. A repaint must not, or
+		// repaints would pace off their own timestamps and free-run.
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 	}
 
 	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
@@ -3537,6 +3793,29 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #868 locking wrapper. Serialises the whole frame path against the repaint
+ * replay, so the app's queue submits, the vendor weave and the present are
+ * never concurrent with a repaint's.
+ *
+ * Clearing app_frame_in_progress here — under the lock, after the frame path
+ * has returned — is what closes the submission window opened by layer_begin.
+ * It is cleared unconditionally so an early return inside the frame path
+ * cannot leak it and wedge the repaint loop off permanently.
+ */
+static xrt_result_t
+vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+
+	os_mutex_lock(&c->mutex);
+	xrt_result_t xret = vk_compositor_layer_commit_locked(xc, sync_handle);
+	c->repaint.app_frame_in_progress = false;
+	os_mutex_unlock(&c->mutex);
+
+	return xret;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
                                            struct xrt_compositor_semaphore *xcsem,
@@ -3552,6 +3831,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	struct vk_bundle *vk = &c->vk;
 
 	U_LOG_I("Destroying VK native compositor");
+
+	// #868: stop the repaint loop FIRST. It touches the queue, the target and
+	// the display processor, all of which are torn down below. Joining before
+	// anything is released is what makes the rest of this function safe.
+	os_thread_helper_destroy(&c->repaint_thread);
 
 	// Uninstall MCP capture hook before any GPU resources go away — the
 	// MCP thread can no longer post requests against us after this returns.
@@ -3661,6 +3945,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	// Note: we do NOT destroy the VkDevice — it belongs to the app.
 	// vk_bundle cleanup is minimal (just mutexes).
+
+	// #868: last, after the repaint thread has been joined above.
+	os_mutex_destroy(&c->mutex);
 
 	free(c);
 }
@@ -3778,6 +4065,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->shared_texture_handle = shared_texture_handle;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
+
+	// #868: before ANY path that can reach vk_compositor_destroy — it both
+	// joins the repaint thread and destroys this mutex, so they must be valid
+	// even on the earliest create failure. os_thread_helper_init only prepares
+	// the handle; the loop is started later, once the target exists.
+	os_mutex_init(&c->mutex);
+	os_thread_helper_init(&c->repaint_thread);
 
 	// Initialize vk_bundle from the app's existing VkDevice
 	VkResult vk_ret = vk_init_from_given(
@@ -4086,6 +4380,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+
 	// Create display processor via factory FIRST — the SR weaver creates
 	// its own VkSwapchain on the HWND, so we must not also create one.
 	if (dp_factory_vk != NULL) {
@@ -4212,6 +4507,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	} else {
 		c->target = NULL;
 		U_LOG_I("No VK target — offscreen shared texture mode");
+	}
+
+	/*
+	 * #868: the repaint loop, ON by default (DXR_WEAVE_REPAINT=0 disables),
+	 * matching D3D11 and D3D12. Only meaningful with a window target.
+ *
+ * MUST come after target creation: the display-processor factory runs
+ * before it, so at the refresh-rate probe further up c->target is still
+ * NULL and the guard below would silently skip the start.
+	 */
+	{
+		const char *e = getenv("DXR_WEAVE_REPAINT");
+		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
+		if (c->repaint.force == 1) {
+			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "
+			        "of app rate. Correctness probe; it WILL cost frame rate.");
+		}
+		if (c->repaint.enabled == 1 && c->target != NULL) {
+			os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
+		}
 	}
 
 	// Guard: target/swapchain creation above can trigger GPU-driver Vulkan
