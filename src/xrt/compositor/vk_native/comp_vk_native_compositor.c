@@ -357,6 +357,22 @@ struct comp_vk_native_compositor
 	int32_t repaint_queue_index;
 
 	/*!
+	 * #868: fence and command pool used ONLY by the repaint replay.
+	 *
+	 * frame_fence and the renderer's command pool cannot be shared once the
+	 * replay runs on its own queue. With a single queue the app frame's fence
+	 * wait drained everything before a repaint could start; with two queues
+	 * nothing does, and validation reports the whole "still in use" family:
+	 * vkQueueSubmit-fence-00064 (fence already in use),
+	 * vkResetFences-pFences-01123 (reset while in flight),
+	 * vkBeginCommandBuffer-commandBuffer-00049 and
+	 * vkQueueSubmit-pCommandBuffers-00071 (buffer re-recorded / resubmitted
+	 * while still pending). Separate objects remove the sharing entirely.
+	 */
+	VkFence repaint_fence;
+	VkCommandPool repaint_cmd_pool;
+
+	/*!
 	 * #868: everything the repaint thread needs to replay the last app frame's
 	 * weave WITHOUT touching app-owned state. Published by layer_commit.
 	 */
@@ -2803,8 +2819,10 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		return xret;
 	}
 
-	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
-	    comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	// #868: a repaint records from its OWN pool — see repaint_cmd_pool.
+	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
+	                             ? c->repaint_cmd_pool
+	                             : (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -3089,6 +3107,20 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// HUD's own PRESENT_SRC→COLOR→PRESENT transition still applies.
 			// #875: reuse the deposited 2D flatten on a repaint — see the
 			// reuse_twod half of vk_composite_local_2d.
+			/*
+			 * #868 bisect: DXR_WEAVE_REPAINT_NO2D=1 makes a repaint skip the
+			 * zones/Local2D composite entirely. Diagnostic only — it drops the 2D
+			 * bands from repainted frames. It answers whether the zones-only
+			 * VK_ERROR_DEVICE_LOST comes from this composite or from the weave
+			 * around it. cube_handle_vk_win never calls this and is clean over
+			 * 100 s, which is what makes it the prime suspect.
+			 */
+			static int no2d = -1;
+			if (no2d < 0) {
+				const char *ne = getenv("DXR_WEAVE_REPAINT_NO2D");
+				no2d = (ne != NULL && ne[0] == '1') ? 1 : 0;
+			}
+			if (!(is_repaint && no2d == 1))
 			vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
 			    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
 			    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -3143,15 +3175,17 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		// the whole queue — same wall time on the single-queue iGPU,
 		// strictly narrower elsewhere, and the prerequisite for
 		// deferring the present off the frame's critical path.
-		if (c->frame_fence == VK_NULL_HANDLE) {
+		// #868: a repaint signals its OWN fence — see repaint_fence.
+		VkFence *fence_p = is_repaint ? &c->repaint_fence : &c->frame_fence;
+		if (*fence_p == VK_NULL_HANDLE) {
 			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-			vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
+			vk->vkCreateFence(vk->device, &fci, NULL, fence_p);
 		}
-		res = vk->vkQueueSubmit(queue, 1, &submit_info, c->frame_fence);
+		res = vk->vkQueueSubmit(queue, 1, &submit_info, *fence_p);
 		if (res == VK_SUCCESS) {
-			if (c->frame_fence != VK_NULL_HANDLE) {
-				vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
-				vk->vkResetFences(vk->device, 1, &c->frame_fence);
+			if (*fence_p != VK_NULL_HANDLE) {
+				vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+				vk->vkResetFences(vk->device, 1, fence_p);
 			} else {
 				vk->vkQueueWaitIdle(queue);
 			}
@@ -3290,11 +3324,38 @@ vk_repaint_thread(void *ptr)
 		 */
 		c->local2d_pool_reset_this_frame = false;
 
+		/*
+		 * #868 probe: DXR_WEAVE_REPAINT_DRAIN=1 drains the WHOLE DEVICE before
+		 * and after the replay, which orders the app's queue against the
+		 * repaint queue.
+		 *
+		 * Diagnostic only — vkDeviceWaitIdle every repaint is far too heavy to
+		 * ship. It exists to answer one question: is the zones device-loss a
+		 * cross-queue race on the images the two queues now share
+		 * (local2d_scratch, weave_scratch, the mask rasters)? Those were
+		 * implicitly ordered while everything ran on one queue; with a
+		 * dedicated weaving queue nothing orders them, and vkQueueWaitIdle
+		 * drains only the queue it is handed. If draining makes the loss go
+		 * away, the fix is real cross-queue synchronisation on those images.
+		 */
+		static int drain = -1;
+		if (drain < 0) {
+			const char *de = getenv("DXR_WEAVE_REPAINT_DRAIN");
+			drain = (de != NULL && de[0] == '1') ? 1 : 0;
+		}
+		if (drain == 1) {
+			c->vk.vkDeviceWaitIdle(c->vk.device);
+		}
+
 		uint64_t fp[8] = {0};
 		bool skip_frame = false;
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
+
+		if (drain == 1) {
+			c->vk.vkDeviceWaitIdle(c->vk.device);
+		}
 
 		c->repaint.count++;
 		os_mutex_unlock(&c->mutex);
@@ -3910,6 +3971,17 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
 	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)
+	// #868: repaint-owned objects. The loop was joined at the top of destroy,
+	// so nothing can still be recording or waiting on these.
+	if (c->repaint_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->repaint_cmd_pool, NULL);
+		c->repaint_cmd_pool = VK_NULL_HANDLE;
+	}
+	if (c->repaint_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, c->repaint_fence, NULL);
+		c->repaint_fence = VK_NULL_HANDLE;
+	}
+
 	if (c->frame_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
 		c->frame_fence = VK_NULL_HANDLE;
@@ -4632,8 +4704,25 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			}
 			c->repaint.enabled = 0;
 		} else {
-			U_LOG_W("#868: repaint will submit on the runtime-owned queue (family %d index %d)",
-			        c->repaint_queue_family, c->repaint_queue_index);
+			/*
+			 * A command pool is externally synchronised too, so the replay
+			 * cannot record from the renderer's pool while the app frame
+			 * uses it on the other queue. Give the repaint its own.
+			 */
+			VkCommandPoolCreateInfo rp_ci = {
+			    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+			    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+			    .queueFamilyIndex = (uint32_t)c->repaint_queue_family,
+			};
+			if (c->vk.vkCreateCommandPool(c->vk.device, &rp_ci, NULL, &c->repaint_cmd_pool) !=
+			    VK_SUCCESS) {
+				U_LOG_W("#868: failed to create the repaint command pool — repaint disabled");
+				c->repaint_queue = VK_NULL_HANDLE;
+			} else {
+				U_LOG_W("#868: repaint will submit on the runtime-owned queue "
+				        "(family %d index %d) with its own fence and command pool",
+				        c->repaint_queue_family, c->repaint_queue_index);
+			}
 		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
