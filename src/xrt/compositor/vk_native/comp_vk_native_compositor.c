@@ -3246,6 +3246,25 @@ vk_repaint_thread(void *ptr)
 		uint32_t tgt_width = 0, tgt_height = 0;
 		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 
+		/*
+		 * A repaint is a FRAME as far as per-frame GPU resources are
+		 * concerned, so it must re-arm them exactly like the top of
+		 * layer_commit does.
+		 *
+		 * The Local2D descriptor pool is reset at most once per frame
+		 * (vk_local2d_begin_frame_once) and this guard is what makes that
+		 * "once" work. A repaint that leaves the guard set keeps ALLOCATING
+		 * sets from a pool nobody resets — it exhausts after a few dozen
+		 * replays and the allocation fails hard. That was the zones crash:
+		 * cube_handle_vk_win survived only because with no zones/Local2D the
+		 * composite early-returns and allocates nothing.
+		 *
+		 * Resetting here is safe: the frame path waits its fence before
+		 * presenting, so no app command buffer is still referencing these sets
+		 * by the time a repaint holds the lock.
+		 */
+		c->local2d_pool_reset_this_frame = false;
+
 		uint64_t fp[8] = {0};
 		bool skip_frame = false;
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
@@ -4522,8 +4541,33 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
  * NULL and the guard below would silently skip the start.
 	 */
 	{
+		/*
+		 * OPT-IN on VK (DXR_WEAVE_REPAINT=1), unlike D3D11/D3D12/GL where it
+		 * defaults on. This is a design blocker, not a tuning choice.
+		 *
+		 * vk->main_queue->queue is the APP's queue. A VkQueue is "externally
+		 * synchronised", which means the APPLICATION must serialise access —
+		 * and the app submits its own scene rendering on its own thread,
+		 * outside any OpenXR call and outside any lock the runtime controls.
+		 * c->mutex serialises the compositor's own two callers and cannot
+		 * cover the app's submits, so a repaint thread racing them is unsafe
+		 * by construction. Validation confirms it:
+		 *
+		 *   vkQueueSubmit(): THREADING ERROR : object of type VkQueue is
+		 *   simultaneously used in current thread A and thread B
+		 *
+		 * and the result is VK_ERROR_DEVICE_LOST (-4), after which the app
+		 * fails every frame. Measured on cube_zones_vk_win: zero validation
+		 * errors with the loop off, five distinct classes with it on.
+		 *
+		 * D3D11 had the same race on the app's immediate context and WAS
+		 * fixable, because ID3D10Multithread::Enter/Leave takes a lock the
+		 * DRIVER enforces for every caller including the app. Vulkan exposes
+		 * no such lock, so the fix has to come from somewhere else: a queue
+		 * the runtime owns exclusively, or the #875 single-renderer model.
+		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		c->repaint.enabled = (e != NULL && e[0] == '1') ? 1 : 0;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
@@ -4531,7 +4575,12 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			        "of app rate. Correctness probe; it WILL cost frame rate.");
 		}
 		if (c->repaint.enabled == 1 && c->target != NULL) {
-			os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
+			int sret = os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
+			U_LOG_W("#868: repaint loop start ret=%d (target=%p)", sret, (void *)c->target);
+		} else {
+			// Silence here is what hid the loop never starting once already.
+			U_LOG_W("#868: repaint loop NOT started (enabled=%d target=%p)", c->repaint.enabled,
+			        (void *)c->target);
 		}
 	}
 
