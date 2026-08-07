@@ -342,6 +342,21 @@ struct comp_vk_native_compositor
 	struct os_thread_helper repaint_thread;
 
 	/*!
+	 * #868: a VkQueue the RUNTIME owns exclusively, used ONLY by the repaint
+	 * replay. VK_NULL_HANDLE when none was obtainable, in which case the
+	 * repaint stays disabled.
+	 *
+	 * The app's queue cannot be used: a VkQueue is externally synchronised and
+	 * the APP submits to it on its own thread, outside any lock the runtime
+	 * controls. Sharing it produced VK_ERROR_DEVICE_LOST and validation's
+	 * "UNASSIGNED-Threading-MultipleThreads-Write". Requested at device
+	 * creation under vulkan_enable2 — see oxr_vk_create_vulkan_device.
+	 */
+	VkQueue repaint_queue;
+	int32_t repaint_queue_family;
+	int32_t repaint_queue_index;
+
+	/*!
 	 * #868: everything the repaint thread needs to replay the last app frame's
 	 * weave WITHOUT touching app-owned state. Published by layer_commit.
 	 */
@@ -2758,6 +2773,16 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	struct vk_bundle *vk = &c->vk;
 	xrt_result_t xret = XRT_SUCCESS;
 
+	/*
+	 * #868: every submit and the present below go to THIS queue. The app frame
+	 * uses the app's queue (the one it handed us); a repaint uses the
+	 * runtime-owned one. They must never be the same object: a VkQueue is
+	 * externally synchronised, and the runtime cannot serialise the app's own
+	 * submits, so sharing it is undefined behaviour — measured as
+	 * VK_ERROR_DEVICE_LOST. The repaint loop refuses to start without one.
+	 */
+	VkQueue queue = is_repaint ? c->repaint_queue : vk->main_queue->queue;
+
 	// Re-sync the output surface against the live ANativeWindow (Android).
 	// On background→card the SurfaceView's surface is destroyed; presenting
 	// to that dead window wedges the render thread (Adreno never reports
@@ -2772,7 +2797,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	}
 
 	uint32_t target_index;
-	xret = comp_vk_native_target_acquire(c->target, &target_index);
+	xret = comp_vk_native_target_acquire(c->target, &target_index, queue);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to acquire target");
 		return xret;
@@ -2956,9 +2981,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
-				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
+				res = vk->vkQueueSubmit(queue, 1, &pre_si, VK_NULL_HANDLE);
 				if (res == VK_SUCCESS) {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
+					vk->vkQueueWaitIdle(queue);
 				}
 			}
 
@@ -3122,13 +3147,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			vk->vkCreateFence(vk->device, &fci, NULL, &c->frame_fence);
 		}
-		res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, c->frame_fence);
+		res = vk->vkQueueSubmit(queue, 1, &submit_info, c->frame_fence);
 		if (res == VK_SUCCESS) {
 			if (c->frame_fence != VK_NULL_HANDLE) {
 				vk->vkWaitForFences(vk->device, 1, &c->frame_fence, VK_TRUE, UINT64_MAX);
 				vk->vkResetFences(vk->device, 1, &c->frame_fence);
 			} else {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
+				vk->vkQueueWaitIdle(queue);
 			}
 		}
 
@@ -3145,7 +3170,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	}
 
 	// Present
-	xret = comp_vk_native_target_present(c->target);
+	xret = comp_vk_native_target_present(c->target, queue);
 
 	if (ftime && fp[1] != 0) {
 		fp[6] = os_monotonic_get_ns();
@@ -4063,6 +4088,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  void *vk_device,
                                  uint32_t queue_family_index,
                                  uint32_t queue_index,
+                                 int32_t runtime_queue_family,
+                                 int32_t runtime_queue_index,
                                  void *dp_factory_vk,
                                  void *shared_texture_handle,
                                  bool transparent_background,
@@ -4085,6 +4112,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 	c->xdev = xdev;
 	c->queue_family_index = queue_family_index;
+	c->repaint_queue = VK_NULL_HANDLE;
+	c->repaint_queue_family = runtime_queue_family;
+	c->repaint_queue_index = runtime_queue_index;
 	c->shared_texture_handle = shared_texture_handle;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
@@ -4566,8 +4596,45 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * no such lock, so the fix has to come from somewhere else: a queue
 		 * the runtime owns exclusively, or the #875 single-renderer model.
 		 */
+		/*
+		 * #868: the repaint requires a queue the RUNTIME owns exclusively.
+		 * Without one, submitting from the repaint thread races the app's own
+		 * submits on the same VkQueue — undefined behaviour, measured as
+		 * VK_ERROR_DEVICE_LOST. So the loop is gated on actually having it, not
+		 * merely on the env var.
+		 */
+		/*
+		 * Belt and braces: refuse a "runtime-owned" queue that is actually the
+		 * APP's. Defaulting these to 0 instead of -1 once made them name
+		 * family 0 / queue 0 under vulkan_enable1 — the app's own queue — and
+		 * the repaint lost the device submitting to it. An identity check costs
+		 * nothing and makes that unrepeatable.
+		 */
+		if (c->repaint_queue_family == (int32_t)queue_family_index &&
+		    c->repaint_queue_index == (int32_t)queue_index) {
+			U_LOG_W("#868: refusing repaint queue (family %d index %d) — that is the APP's "
+			        "own queue, not a runtime-owned one",
+			        c->repaint_queue_family, c->repaint_queue_index);
+			c->repaint_queue_family = -1;
+			c->repaint_queue_index = -1;
+		}
+		if (c->repaint_queue_family >= 0 && c->repaint_queue_index >= 0) {
+			c->vk.vkGetDeviceQueue(c->vk.device, (uint32_t)c->repaint_queue_family,
+			                       (uint32_t)c->repaint_queue_index, &c->repaint_queue);
+		}
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != NULL && e[0] == '1') ? 1 : 0;
+		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		if (c->repaint_queue == VK_NULL_HANDLE) {
+			if (c->repaint.enabled == 1) {
+				U_LOG_W("#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
+				        "family was saturated) — repaint disabled. Sharing the app's queue "
+				        "is undefined behaviour and loses the device.");
+			}
+			c->repaint.enabled = 0;
+		} else {
+			U_LOG_W("#868: repaint will submit on the runtime-owned queue (family %d index %d)",
+			        c->repaint_queue_family, c->repaint_queue_index);
+		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {

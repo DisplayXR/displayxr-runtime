@@ -1926,6 +1926,25 @@ struct oxr_system
 	//! XR_NULL_HANDLE if neither has been called.
 	VkPhysicalDevice suggested_vulkan_physical_device;
 
+	/*!
+	 * #868: a queue the RUNTIME owns exclusively, for weaving off the app's
+	 * frame thread.
+	 *
+	 * A VkQueue is externally synchronised — the APPLICATION must serialise
+	 * access — so the runtime cannot submit from a repaint thread on the queue
+	 * the app also submits to. Doing so is undefined behaviour and was measured
+	 * as VK_ERROR_DEVICE_LOST plus
+	 * "UNASSIGNED-Threading-MultipleThreads-Write" from validation.
+	 *
+	 * Under vulkan_enable2 the runtime creates the device, so it can request
+	 * ONE extra queue on the app's graphics family and keep it for itself.
+	 * Set by oxr_vk_create_vulkan_device; -1 when unavailable (family already
+	 * saturated, or vulkan_enable1 where the APP created the device and no
+	 * spare queue can be conjured). -1 simply means no repaint on VK.
+	 */
+	int32_t vulkan_runtime_queue_family;
+	int32_t vulkan_runtime_queue_index;
+
 	struct
 	{
 		// No better place to keep this state.

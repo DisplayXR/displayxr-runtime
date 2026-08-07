@@ -389,6 +389,10 @@ struct comp_d3d11_compositor
 		int hash_probe;
 		uint64_t app_hash, app_seq, hash_seq;
 		uint8_t *app_px; //!< retained pixels of the last app weave
+		//! Set by the 8x8 grid scan when a cell lit in the app frame came out
+		//! black in the repaint — keys the PNG dump on the DEFECT rather than
+		//! on the first (usually benign) hash mismatch.
+		bool saw_black_region;
 
 		//! Resolved by the last app frame; replayed as-is.
 		bool zero_copy;
@@ -1717,27 +1721,79 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				 * them for free.
 				 */
 				if (rp_px != nullptr && c->repaint.app_px != nullptr) {
-					uint64_t sa = 0, sr = 0;
-					uint32_t n = 0;
+					/*
+					 * Trigger on STRUCTURAL difference, not on darkness.
+					 *
+					 * Two defects have shown up on the panel and neither is what
+					 * a naive detector finds. A whole-frame mean missed one zone
+					 * going black (frame mean stayed ~44). And the zones flicker
+					 * is often not dark at all — the cube appears "zoomed in,
+					 * double image", i.e. the weave ran with wrong tile geometry.
+					 * Both are large-area pixel differences, so count HOW MUCH of
+					 * the frame changed and localise it on an 8x8 grid.
+					 *
+					 * A repaint that merely wove with fresher eyes shifts the
+					 * interlace phase: many pixels change a little. A geometry or
+					 * dropout fault changes a lot of pixels a lot.
+					 */
+					const uint32_t GX = 8, GY = 8;
 					const uint32_t stride = target_width * 4;
-					for (uint32_t y = 0; y < target_height; y += 8) {
-						for (uint32_t x = 0; x < target_width; x += 8) {
+					uint64_t sa_all = 0, sr_all = 0;
+					uint32_t n_all = 0, big_all = 0;
+					uint32_t cell_big[64] = {0}, cell_n[64] = {0};
+					for (uint32_t y = 0; y < target_height; y += 4) {
+						const uint32_t gj = (y * GY) / target_height;
+						for (uint32_t x = 0; x < target_width; x += 4) {
+							const uint32_t gi = (x * GX) / target_width;
 							const uint32_t o = y * stride + x * 4;
-							sa += (uint64_t)c->repaint.app_px[o] +
-							      c->repaint.app_px[o + 1] + c->repaint.app_px[o + 2];
-							sr += (uint64_t)rp_px[o] + rp_px[o + 1] + rp_px[o + 2];
-							n++;
+							const int d0 = (int)c->repaint.app_px[o] - (int)rp_px[o];
+							const int d1 = (int)c->repaint.app_px[o + 1] - (int)rp_px[o + 1];
+							const int d2 = (int)c->repaint.app_px[o + 2] - (int)rp_px[o + 2];
+							const int ad = abs(d0) + abs(d1) + abs(d2);
+							sa_all += (uint64_t)c->repaint.app_px[o] + c->repaint.app_px[o + 1] +
+							          c->repaint.app_px[o + 2];
+							sr_all += (uint64_t)rp_px[o] + rp_px[o + 1] + rp_px[o + 2];
+							n_all++;
+							const uint32_t ci = gj * GX + gi;
+							if (ci < GX * GY) {
+								cell_n[ci]++;
+								if (ad > 48) {
+									big_all++;
+									cell_big[ci]++;
+								}
+							}
 						}
 					}
-					const double ma = n != 0 ? (double)sa / (n * 3.0) : 0.0;
-					const double mr = n != 0 ? (double)sr / (n * 3.0) : 0.0;
-					if (mr < 1.0) {
-						black++;
+					const double ma = n_all != 0 ? (double)sa_all / (n_all * 3.0) : 0.0;
+					const double mr = n_all != 0 ? (double)sr_all / (n_all * 3.0) : 0.0;
+					const double big_pct = n_all != 0 ? 100.0 * (double)big_all / (double)n_all : 0.0;
+					int worst_i = -1, worst_j = -1;
+					double worst_pct = 0.0;
+					for (uint32_t ci = 0; ci < GX * GY; ci++) {
+						if (cell_n[ci] == 0) {
+							continue;
+						}
+						const double cp = 100.0 * (double)cell_big[ci] / (double)cell_n[ci];
+						if (cp > worst_pct) {
+							worst_pct = cp;
+							worst_i = (int)(ci % GX);
+							worst_j = (int)(ci / GX);
+						}
 					}
-					if ((diff % 10) == 0) {
-						U_LOG_W("#868 hash: mismatch #%llu app_lum=%.1f repaint_lum=%.1f "
-						        "(black repaints %llu)",
-						        (unsigned long long)diff, ma, mr,
+					// >12% of the frame is far beyond an interlace-phase shift.
+					const bool structural = (big_pct > 12.0);
+					c->repaint.saw_black_region = structural;
+					if (structural) {
+						black++;
+						U_LOG_W("#868 hash: STRUCTURAL repaint mismatch — %.1f%% of frame differs "
+						        ">48; worst cell(%d,%d) %.0f%%; lum app=%.1f repaint=%.1f "
+						        "(structural %llu / %llu mismatches)",
+						        big_pct, worst_i, worst_j, worst_pct, ma, mr,
+						        (unsigned long long)black, (unsigned long long)diff);
+					} else if ((diff % 20) == 0) {
+						U_LOG_W("#868 hash: mismatch #%llu big=%.2f%% lum app=%.1f repaint=%.1f "
+						        "(structural %llu)",
+						        (unsigned long long)diff, big_pct, ma, mr,
 						        (unsigned long long)black);
 					}
 				}
@@ -1748,11 +1804,16 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				        (unsigned long long)same, (unsigned long long)(same + diff),
 				        (unsigned long long)diff);
 			}
-			// Dump the FIRST mismatching pair. Both sides are in hand and no
-			// app weave separates them, so the difference is the defect itself.
+			/*
+			 * Dump the first BLACK-REGION pair, not merely the first mismatch.
+			 * Most mismatches are the feature working (the repaint wove with
+			 * fresher eyes) and dumping one of those wastes the single shot —
+			 * it did exactly that on the zones app, capturing a pair whose
+			 * worst pixel differed by 21.
+			 */
 			static bool dumped = false;
 			const char *tmp2 = getenv("TEMP");
-			if (!dumped && hsh != c->repaint.app_hash && tmp2 != nullptr && rp_px != nullptr &&
+			if (!dumped && c->repaint.saw_black_region && tmp2 != nullptr && rp_px != nullptr &&
 			    c->repaint.app_px != nullptr) {
 				dumped = true;
 				char pa[512], pr[512];

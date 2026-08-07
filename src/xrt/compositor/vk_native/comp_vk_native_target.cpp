@@ -1881,7 +1881,7 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 }
 
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index)
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -2051,15 +2051,18 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	    .pWaitSemaphores = &target->image_available,
 	    .pWaitDstStageMask = &wait_stage,
 	};
-	vk->vkQueueSubmit(vk->main_queue->queue, 1, &wait_submit, VK_NULL_HANDLE);
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	// #868: whichever queue the CALLER owns — the app frame uses the app's,
+	// a repaint uses the runtime-owned one. Never mix: a VkQueue is externally
+	// synchronised and the runtime cannot serialise the app's own submits.
+	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(queue);
 
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
 }
 
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target)
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -2096,7 +2099,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 	}
 #endif
 
-	VkResult res = vk->vkQueuePresentKHR(vk->main_queue->queue, &present_info);
+	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {

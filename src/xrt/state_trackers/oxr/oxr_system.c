@@ -121,6 +121,16 @@ oxr_system_fill_in(
 #ifdef XR_USE_GRAPHICS_API_VULKAN
 	sys->vulkan_enable2_instance = VK_NULL_HANDLE;
 	sys->suggested_vulkan_physical_device = VK_NULL_HANDLE;
+	/*
+	 * #868: -1 = "no runtime-owned queue". MUST be set here and not only in
+	 * oxr_vk_create_vulkan_device, because that function never runs under
+	 * vulkan_enable1 (the app creates its own device). Left at the calloc
+	 * default of 0 these read as "family 0, queue 0" — which IS the app's own
+	 * queue, so the repaint would submit to exactly the queue it must avoid and
+	 * lose the device. That is not hypothetical; it is what happened.
+	 */
+	sys->vulkan_runtime_queue_family = -1;
+	sys->vulkan_runtime_queue_index = -1;
 #endif
 #if defined(XR_USE_GRAPHICS_API_D3D11) || defined(XR_USE_GRAPHICS_API_D3D12)
 	U_ZERO(&(sys->suggested_d3d_luid));

@@ -91,7 +91,7 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr);
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index);
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue);
 
 /*!
  * Present the rendered image.
@@ -103,7 +103,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target);
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue);
 
 /*!
  * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the

@@ -2739,6 +2739,25 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	 * deposited. Re-running them would sample textures the app has since
 	 * reacquired and redrawn — the 2D-bubble flicker found on D3D11 and D3D12.
 	 */
+	/*
+	 * #868 probe: DXR_WEAVE_REPAINT_REFLATTEN=1 makes a repaint re-run the
+	 * deposit half. That VIOLATES the app-owned-state rule and must never be a
+	 * default — it exists to answer one question in one run: is the black 2D
+	 * zone caused by reusing the deposited flatten, or by something else in the
+	 * replay? If the zone comes back with this set, the scratch is not
+	 * surviving between the app frame and the repaint.
+	 */
+	{
+		static int reflatten = -1;
+		if (reflatten < 0) {
+			const char *e = getenv("DXR_WEAVE_REPAINT_REFLATTEN");
+			reflatten = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (reflatten == 1) {
+			reuse_twod = false;
+		}
+	}
+
 	if (!reuse_twod) {
 		if (have_local_2d) {
 			gl_flatten_local_2d_layers(c, output_w, output_h, zones_frame ? -1 : proj_idx);
