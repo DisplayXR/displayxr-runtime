@@ -17,6 +17,7 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/comp_late_weave_lookahead.h"
+#include "os/os_time.h"
 
 #include <cstring>
 #include <cstdio>
@@ -1784,6 +1785,42 @@ comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
 		return;
 	}
 	wait_fn(target->vk->device, target->swapchain, target->last_present_id, 100ull * 1000 * 1000);
+
+	/*
+	 * LATE-weave, not early-weave.
+	 *
+	 * The wait above returns just after the PREVIOUS frame hit glass, which is
+	 * the START of a refresh period — weaving there would sample the eyes a
+	 * whole period before the pixels are actually scanned out, i.e. the
+	 * staleness this feature exists to remove.
+	 *
+	 * The next scanout is one period away, and `measured_r_ns` is how long a
+	 * weave takes to reach glass. So the last safe moment to begin is
+	 * period - R. Sleeping that much converts the repaint from "as early as
+	 * possible" to "as late as still lands", which is the whole point of
+	 * decoupling weave rate from render rate: the eye position used is the
+	 * freshest one that can still make the frame.
+	 *
+	 * Clamped hard. With no measurement yet (R = 0) we would sleep a full
+	 * period and miss the frame entirely, so a floor of a quarter period is
+	 * kept in hand, and anything that would not fit simply weaves immediately.
+	 * A repaint that arrives late is a dropped repaint; a repaint that arrives
+	 * early is merely stale. Never gamble the frame.
+	 */
+	const double period_ns = target->period_hint_ns;
+	const double residual_ns = (double)target->measured_r_ns;
+	if (period_ns <= 0.0 || residual_ns <= 0.0) {
+		return; // unmeasured — weave now rather than guess
+	}
+	double slack_ns = period_ns - residual_ns;
+	const double floor_ns = period_ns * 0.25; // never cut it finer than this
+	if (slack_ns > period_ns - floor_ns) {
+		slack_ns = period_ns - floor_ns;
+	}
+	if (slack_ns <= 0.0) {
+		return; // the weave already fills the period; go now
+	}
+	os_nanosleep((int64_t)slack_ns);
 #else
 	(void)target;
 #endif

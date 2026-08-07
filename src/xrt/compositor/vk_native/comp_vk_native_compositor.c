@@ -1747,7 +1747,8 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
                           VkCommandBuffer cmd,
                           VkImage target_image,
                           uint32_t target_width,
-                          uint32_t target_height)
+                          uint32_t target_height,
+                          VkImageLayout target_layout)
 {
 	if (c->hud == NULL || !u_hud_is_visible()) {
 		return;
@@ -1961,12 +1962,21 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
 		}
 	}
 
-	// Transition target from PRESENT_SRC_KHR to TRANSFER_DST
+	/*
+	 * The target is NOT always in PRESENT_SRC_KHR here. A self-submitting DP
+	 * runs its own render pass whose finalLayout leaves it in
+	 * COLOR_ATTACHMENT_OPTIMAL, so the caller passes the layout it actually
+	 * has. Hardcoding PRESENT_SRC_KHR declared a wrong oldLayout and tripped
+	 * VUID-VkImageMemoryBarrier-oldLayout-01197 (20x per run measured on
+	 * cube_zones_vk_win). Restored to the same layout on the way out so the
+	 * caller's own follow-up barrier still finds what it expects.
+	 */
+	// Transition target from its current layout to TRANSFER_DST
 	VkImageMemoryBarrier to_dst = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .oldLayout = target_layout,
 	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	    .image = target_image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
@@ -2022,13 +2032,13 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
 	    VK_PIPELINE_STAGE_HOST_BIT,
 	    0, 0, NULL, 0, NULL, 1, &hud_back);
 
-	// Transition target back to PRESENT_SRC_KHR
+	// Transition target back to whatever the caller handed us
 	VkImageMemoryBarrier to_present = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 	    .dstAccessMask = 0,
 	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .newLayout = target_layout,
 	    .image = target_image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
@@ -3145,7 +3155,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 			// Diagnostic HUD overlay (TAB key toggle)
 			vk_compositor_render_hud(c, cmd,
-			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
+			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
 			// A self-submitting DP (Leia CNSDK) ran its own internal
 			// render pass, whose finalLayout leaves the target in
@@ -3177,7 +3189,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 			// Diagnostic HUD overlay (TAB key toggle)
 			vk_compositor_render_hud(c, cmd,
-			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
+			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 		}
 
 		vk->vkEndCommandBuffer(cmd);
