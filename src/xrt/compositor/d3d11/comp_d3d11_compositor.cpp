@@ -3022,8 +3022,24 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	 * with zero black frames, against 500/1320 before.
 	 */
 	{
+		/*
+		 * OPT-IN on D3D11 (DXR_WEAVE_REPAINT=1) — see runtime#876.
+		 *
+		 * The repaint is correct on the handle cube but has an intermittent,
+		 * visible defect on zones apps: roughly once every 10 s a zone blinks,
+		 * sometimes as a black frame and sometimes as a doubled/zoomed cube.
+		 * It is repaint-caused (0 occurrences with the loop off, measured and
+		 * eyeballed both ways) and the cause is NOT yet found — three
+		 * detectors, each blind to the artefact in a different way, and four
+		 * hypotheses eliminated. Details and what has been ruled out are on
+		 * #876.
+		 *
+		 * A visible artefact is worse than a stale interlace, so this stays off
+		 * by default until the cause is understood. D3D12 and VK are verified
+		 * and remain default-ON.
+		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		c->repaint.enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
 		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");

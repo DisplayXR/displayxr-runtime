@@ -5274,8 +5274,22 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	 * thread, and a WGL context cannot be current on two threads at once.
 	 */
 	{
+		/*
+		 * OPT-IN on GL (DXR_WEAVE_REPAINT=1) — see runtime#868.
+		 *
+		 * With the repaint enabled the Local2D band composites black on zones
+		 * apps. It is repaint-caused (correct with the loop off, confirmed on
+		 * hardware) and unexplained: the deposit-half reuse, the mask
+		 * re-resolution, dirty inherited GL state and the composite silently
+		 * declining have all been measured and eliminated. Applying VK's
+		 * mask-reuse fix here by analogy made it WORSE (zone B went black too)
+		 * and was reverted.
+		 *
+		 * GL is the least-used backend and no shipping app depends on this, so
+		 * it stays off by default rather than shipping a known black region.
+		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		c->repaint.enabled = (e != NULL && e[0] == '1') ? 1 : 0;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
