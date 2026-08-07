@@ -405,6 +405,12 @@ struct comp_d3d11_compositor
 		uint64_t dropouts;
 		uint64_t detector_frames;
 
+		//! #876 geometry detector: hash of the layout the last APP frame wove
+		//! with, and how often a repaint disagreed with it.
+		uint64_t geom_app;
+		uint64_t geom_mismatches;
+		uint64_t geom_app_changes;
+
 		//! Set by the 8x8 grid scan when a cell lit in the app frame came out
 		//! black in the repaint — keys the PNG dump on the DEFECT rather than
 		//! on the first (usually benign) hash mismatch.
@@ -1628,6 +1634,49 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	uint32_t view_height = c->eff_layout.tile_h;
 	uint32_t tile_columns = c->eff_layout.cols;
 	uint32_t tile_rows = c->eff_layout.rows;
+
+	/*
+	 * #876 GEOMETRY detector.
+	 *
+	 * The reported artefact is a DOUBLE / zoomed cube, which is a weave
+	 * geometry or interlace-phase error — the weave ran with the wrong tile
+	 * stride, not with wrong pixels. Neither previous instrument could see it:
+	 * the adjacent-pair hash is blind when the app frame and its repaint AGREE
+	 * (measured 2399/2400), and a luminance detector is blind because a doubled
+	 * image has essentially unchanged brightness.
+	 *
+	 * So compare the geometry ITSELF. A repaint must weave with exactly the
+	 * layout of the app frame it stands in for; any difference is the defect,
+	 * and it shows up here whether or not the resulting pixels differ.
+	 */
+	{
+		const struct u_canvas_rect ec = c->repaint.canvas;
+		const uint64_t geom = ((uint64_t)view_width << 48) ^ ((uint64_t)view_height << 32) ^
+		                      ((uint64_t)tile_columns << 24) ^ ((uint64_t)tile_rows << 16) ^
+		                      ((uint64_t)(uint32_t)ec.w << 8) ^ (uint64_t)(uint32_t)ec.h ^
+		                      ((uint64_t)(uint32_t)ec.x << 40) ^ ((uint64_t)(uint32_t)ec.y << 20) ^
+		                      ((uint64_t)(ec.valid ? 1 : 0) << 60) ^ ((uint64_t)(zero_copy ? 1 : 0) << 61);
+		if (!is_repaint) {
+			// Baseline: what the app frame just wove with.
+			if (c->repaint.geom_app != 0 && geom != c->repaint.geom_app) {
+				c->repaint.geom_app_changes++;
+				U_LOG_W("#876 GEOM: APP layout changed -> %ux%u tiles %ux%u canvas %d,%d %ux%u "
+				        "valid=%d zc=%d (app-side changes %llu)",
+				        view_width, view_height, tile_columns, tile_rows, ec.x, ec.y, ec.w, ec.h,
+				        (int)ec.valid, (int)zero_copy,
+				        (unsigned long long)c->repaint.geom_app_changes);
+			}
+			c->repaint.geom_app = geom;
+		} else if (c->repaint.geom_app != 0 && geom != c->repaint.geom_app) {
+			c->repaint.geom_mismatches++;
+			U_LOG_W("#876 GEOM MISMATCH: repaint wove %ux%u tiles %ux%u canvas %d,%d %ux%u "
+			        "valid=%d zc=%d — differs from the app frame it replays (total %llu)",
+			        view_width, view_height, tile_columns, tile_rows, ec.x, ec.y, ec.w, ec.h,
+			        (int)ec.valid, (int)zero_copy,
+			        (unsigned long long)c->repaint.geom_mismatches);
+		}
+	}
+
 
 	// Crop the renderer's atlas to content dims before passing to the DP;
 	// never crop a zero-copy atlas — the app's swapchain is already a
