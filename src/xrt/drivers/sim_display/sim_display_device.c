@@ -514,6 +514,12 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 		*out_value = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS) ? 1 : 0;
 		return XRT_SUCCESS;
 	}
+	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED) {
+		// SIM_DISPLAY_FORCE_MODE pins the active mode; the state tracker reads
+		// this to honor the held mode over an app OUTPUT_MODE request.
+		*out_value = (debug_get_num_option_sim_display_force_mode() >= 0) ? 1 : 0;
+		return XRT_SUCCESS;
+	}
 	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 

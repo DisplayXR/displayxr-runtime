@@ -1474,26 +1474,38 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		                 modeIndex, head->rendering_mode_count);
 	}
 
-	struct xrt_rendering_mode *mode = &head->rendering_modes[modeIndex];
 	uint32_t previousModeIndex = head->hmd->active_rendering_mode_index;
-	bool hardware_state_changed = (mode->hardware_display_3d != sess->hardware_display_3d);
 
-	// 1. Set device output mode
+	// 1. Ask the device to change mode.
 	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, modeIndex);
 
-	// 2. Toggle hardware 3D mode if needed
+	// 2. Resolve the EFFECTIVE mode. The device owns the active mode: it may PIN
+	//    it and ignore the request (sim_display's SIM_DISPLAY_FORCE_MODE dev/test
+	//    override). When pinned, honor the mode the device actually holds instead
+	//    of the app's request; otherwise apply the requested index. That direct
+	//    write is also what updates the client-local OOP proxy, whose set_property
+	//    is a no-op across IPC (#553) — so it must still run on the non-pinned path.
+	int32_t pinned = 0;
+	if (xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &pinned) != XRT_SUCCESS) {
+		pinned = 0; // device doesn't implement the query ⟹ not pinned
+	}
+	uint32_t effectiveModeIndex = modeIndex;
+	if (pinned) {
+		effectiveModeIndex = head->hmd->active_rendering_mode_index;
+	} else {
+		head->hmd->active_rendering_mode_index = modeIndex;
+	}
+	struct xrt_rendering_mode *mode = &head->rendering_modes[effectiveModeIndex];
+	bool hardware_state_changed = (mode->hardware_display_3d != sess->hardware_display_3d);
+
+	// 3. Toggle hardware 3D mode if needed (to the EFFECTIVE mode's 3D state).
 	if (hardware_state_changed) {
 		oxr_session_request_display_mode(&log, sess, mode->hardware_display_3d);
 	}
 
-	// 3. Update active mode (view_count stays fixed at 2 for STEREO)
-	head->hmd->active_rendering_mode_index = modeIndex;
-
-	// 3b. Out-of-process the head update above is client-local (the proxy
-	// device doesn't cross IPC) — push the CONTENT mode to the server too
-	// (#553), so its multi_compositor can clamp the atlas to the mode grid.
-	// No-op in-process / bridge-relay.
-	oxr_session_push_rendering_mode_ipc(sess, modeIndex);
+	// 3b. Push the CONTENT mode to the server (#553) so its multi_compositor can
+	// clamp the atlas to the mode grid. No-op in-process / bridge-relay.
+	oxr_session_push_rendering_mode_ipc(sess, effectiveModeIndex);
 
 	// 4. Update recommended view scales
 	struct xrt_system_compositor *xsysc = sess->sys->xsysc;
@@ -1502,9 +1514,11 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		xsysc->info.recommended_view_scale_y = mode->view_scale_y;
 	}
 
-	// 5. Push rendering mode changed event (on every actual mode change)
-	if (modeIndex != previousModeIndex) {
-		oxr_event_push_XrEventDataRenderingModeChanged(&log, sess, previousModeIndex, modeIndex);
+	// 5. Push rendering mode changed event only on an ACTUAL change. A pinned
+	//    device that refused leaves effective == previous → no event, correctly
+	//    telling the app its request did not take.
+	if (effectiveModeIndex != previousModeIndex) {
+		oxr_event_push_XrEventDataRenderingModeChanged(&log, sess, previousModeIndex, effectiveModeIndex);
 	}
 
 	// 6. Push hardware display state changed event (only when hardware state flips)
