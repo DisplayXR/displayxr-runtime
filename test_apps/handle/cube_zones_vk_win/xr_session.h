@@ -80,9 +80,12 @@ bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPh
 // Find a graphics queue family
 bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queueFamilyIndex);
 
-// Create Vulkan logical device with required extensions
-bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
-    const std::vector<const char*>& deviceExtensions,
+// Create the Vulkan logical device via xrCreateVulkanDeviceKHR (vulkan_enable2).
+// The RUNTIME creates the device, so it can enable the extensions/features it
+// needs AND claim a queue of its own for weaving off the app's frame thread
+// (#868). Under vulkan_enable1 the app owns device creation and the runtime has
+// no way to obtain an exclusive queue, so the repaint stays disabled there.
+bool CreateVulkanDevice(XrSessionManager& xr, VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     VkDevice& device, VkQueue& graphicsQueue);
 
 // Create OpenXR session with Vulkan binding + win32_window_binding

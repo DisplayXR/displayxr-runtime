@@ -752,10 +752,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    std::vector<const char*> deviceExtensions;
-    std::vector<std::string> extensionStorage;
-    if (!GetVulkanDeviceExtensions(xr, vkInstance, physDevice, deviceExtensions, extensionStorage)) {
-        LOG_ERROR("Failed to get Vulkan device extensions");
+    // vulkan_enable2: the RUNTIME creates the device and appends whatever
+    // device extensions and features it needs — including present_id /
+    // present_wait for late-weave pacing, and its own weaving queue (#868).
+    // xrGetVulkanDeviceExtensionsKHR is a vulkan_enable1 entry point and is not
+    // dispatchable here; calling it aborted startup before session creation.
+    if (false) {
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);
         ShutdownLogging();
@@ -773,7 +775,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     VkDevice vkDevice = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
-    if (!CreateVulkanDevice(physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
+    if (!CreateVulkanDevice(xr, physDevice, queueFamilyIndex, vkDevice, graphicsQueue)) {
         LOG_ERROR("Vulkan device creation failed");
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);
