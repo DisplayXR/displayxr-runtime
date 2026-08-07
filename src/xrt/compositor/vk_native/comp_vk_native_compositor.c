@@ -401,6 +401,10 @@ struct comp_vk_native_compositor
 		uint64_t backdrop_view;
 		uint32_t backdrop_w, backdrop_h;
 
+		//! The zone/Local2D mask the last app frame RESOLVED. Replayed as-is —
+		//! a repaint neither re-rasterises it nor re-publishes the wish.
+		uint64_t mask_view;
+
 		uint64_t count, ticks;          //!< Diagnostics.
 	} repaint;
 
@@ -6071,69 +6075,95 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	VkImageView mask_view = VK_NULL_HANDLE;
 	struct comp_vk_native_zone_mask *emask = c->active_zone_mask;
 
-	// XR_DXR_display_zones: the COMPOSITE mask is always the BINARY zone
-	// raster — per ADR-027 the wish is HARDWARE-only and composition follows
-	// zone geometry + alpha, so an explicit frame wish never gates blending
-	// (it publishes below, verbatim). Binary, not ring-feathered: feathering
-	// is a cosmetic opt-in (runtime#800) and never belonged in either the
-	// composite default or the published wish. The zones composite draw runs
-	// MODE_ZONES (twod + (1-a)·(M·weave)), so M only gates the weave and
-	// Local2D overlays composite on top by their own alpha — a full-window
-	// zone no longer multiplies its toast away, and the window-edge feather
-	// ring artifact is gone.
-	if (zones_frame) {
-		if (zone_rect_count == 0) {
-			return false; // defensive — a zones frame always has zones
+	/*
+	 * #868: a repaint REUSES the mask the last app frame resolved; it must not
+	 * re-resolve it and must not touch the publish state.
+	 *
+	 * Two separate reasons, both learned on D3D12:
+	 *  - The block below does not only rasterise a mask, it PUBLISHES one
+	 *    (c->zone_wish_view / zone_wish_w/h / zone_publish_seq++). Those are
+	 *    once-per-app-frame values that layer_commit resets at the top and
+	 *    vk_sync_zone_mask_to_dp consumes at the bottom. Driving them at panel
+	 *    rate from the repaint thread desynchronises that sideband publish.
+	 *  - Re-resolving is also just wrong: the repaint replays RENDERING, not
+	 *    STATE TRANSITIONS. See [[repaint-never-touches-app-owned-state]].
+	 *
+	 * D3D11 does this with c->repaint.mask_srv and D3D12 with reuse_mask; VK
+	 * was the one backend still re-resolving on every replay, which is why its
+	 * 2D band flickered once it finally had content to show.
+	 */
+	if (reuse_twod) {
+		mask_view = (VkImageView)(uintptr_t)c->repaint.mask_view;
+		if (mask_view == VK_NULL_HANDLE) {
+			return false; // no app frame has resolved one yet — nothing to replay
 		}
-		if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
-		                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
-		                  region_h, mask_fmt,
-		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-		                  c->local2d.mask_rp, "zone mask")) {
-			return false;
-		}
-		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
-		                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
-		vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w, region_h,
-		                                 0.0f, zone_rects, zone_rect_count, 1.0f);
-		vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		                            VK_ACCESS_SHADER_READ_BIT,
-		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
-		mask_view = c->implicit_mask_view;
+	} else {
 
-		// Per-zone opt-in feather (XrDisplayZoneFeatherDXR, runtime#800):
-		// the COMPOSITE samples a separately-rastered mask with each zone's
-		// requested inward ramp; the binary raster above still publishes as
-		// the hardware wish (cosmetics never enter the wish).
-		if (any_feather) {
-			if (vk_ensure_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,
-			                 &c->feather_mask_fb, &c->feather_mask_w, &c->feather_mask_h, region_w,
-			                 region_h, mask_fmt,
-			                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-			                 c->local2d.mask_rp, "zone feather mask")) {
-				vk_cmd_image_barrier_locked(
-				    vk, cmd, c->feather_mask_tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				    k_color_sub);
-				vk_local2d_composite_raster_mask_zones(&c->local2d, vk, cmd, c->feather_mask_fb,
-				                                       region_w, region_h, zone_rects, zone_feathers,
-				                                       zone_rect_count);
-				vk_cmd_image_barrier_locked(
-				    vk, cmd, c->feather_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
-				mask_view = c->feather_mask_view;
-			} // ensure failure: fall back to the binary mask — hard edges, never a lost frame
+		// XR_DXR_display_zones: the COMPOSITE mask is always the BINARY zone
+		// raster — per ADR-027 the wish is HARDWARE-only and composition follows
+		// zone geometry + alpha, so an explicit frame wish never gates blending
+		// (it publishes below, verbatim). Binary, not ring-feathered: feathering
+		// is a cosmetic opt-in (runtime#800) and never belonged in either the
+		// composite default or the published wish. The zones composite draw runs
+		// MODE_ZONES (twod + (1-a)·(M·weave)), so M only gates the weave and
+		// Local2D overlays composite on top by their own alpha — a full-window
+		// zone no longer multiplies its toast away, and the window-edge feather
+		// ring artifact is gone.
+		if (zones_frame) {
+			if (zone_rect_count == 0) {
+				return false; // defensive — a zones frame always has zones
+			}
+			if (!vk_ensure_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
+			                  &c->implicit_mask_fb, &c->implicit_mask_w, &c->implicit_mask_h, region_w,
+			                  region_h, mask_fmt,
+			                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			                  c->local2d.mask_rp, "zone mask")) {
+				return false;
+			}
+			vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, 0,
+			                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+			                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+			vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, c->implicit_mask_fb, region_w, region_h,
+			                                 0.0f, zone_rects, zone_rect_count, 1.0f);
+			vk_cmd_image_barrier_locked(vk, cmd, c->implicit_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                            VK_ACCESS_SHADER_READ_BIT,
+			                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+			mask_view = c->implicit_mask_view;
+
+			// Per-zone opt-in feather (XrDisplayZoneFeatherDXR, runtime#800):
+			// the COMPOSITE samples a separately-rastered mask with each zone's
+			// requested inward ramp; the binary raster above still publishes as
+			// the hardware wish (cosmetics never enter the wish).
+			if (any_feather) {
+				if (vk_ensure_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,
+				                 &c->feather_mask_fb, &c->feather_mask_w, &c->feather_mask_h, region_w,
+				                 region_h, mask_fmt,
+				                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+				                 c->local2d.mask_rp, "zone feather mask")) {
+					vk_cmd_image_barrier_locked(
+					    vk, cmd, c->feather_mask_tex, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+					    k_color_sub);
+					vk_local2d_composite_raster_mask_zones(&c->local2d, vk, cmd, c->feather_mask_fb,
+					                                       region_w, region_h, zone_rects, zone_feathers,
+					                                       zone_rect_count);
+					vk_cmd_image_barrier_locked(
+					    vk, cmd, c->feather_mask_tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+					    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+					mask_view = c->feather_mask_view;
+				} // ensure failure: fall back to the binary mask — hard edges, never a lost frame
+			}
 		}
+		c->repaint.mask_view = (uint64_t)(uintptr_t)mask_view;
 	}
 
 	if (zones_frame && c->frame_wish != NULL && c->frame_wish->staged != VK_NULL_HANDLE &&
