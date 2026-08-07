@@ -2640,7 +2640,8 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
                       uint32_t dst_w,
                       uint32_t dst_h,
                       VkImageLayout dst_incoming,
-                      VkImageLayout dst_outgoing);
+                      VkImageLayout dst_outgoing,
+                      bool reuse_twod);
 // #491 part 3 — pre-weave 2D-under backdrop flatten (defined below near the
 // composite). Called before process_atlas; result handed to the DP.
 static VkImageView
@@ -3061,9 +3062,12 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// zone mask says "2D" (M*weave + (1-M)*twod). No-op unless the
 			// frame carries Local2D layers. Target stays PRESENT_SRC so the
 			// HUD's own PRESENT_SRC→COLOR→PRESENT transition still applies.
+			// #875: reuse the deposited 2D flatten on a repaint — see the
+			// reuse_twod half of vk_composite_local_2d.
 			vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
 			    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
-			    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+			    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			    /*reuse_twod=*/is_repaint);
 
 			// Diagnostic HUD overlay (TAB key toggle)
 			vk_compositor_render_hud(c, cmd,
@@ -5601,7 +5605,8 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
                       uint32_t dst_w,
                       uint32_t dst_h,
                       VkImageLayout dst_incoming,
-                      VkImageLayout dst_outgoing)
+                      VkImageLayout dst_outgoing,
+                      bool reuse_twod)
 {
 	struct vk_bundle *vk = &c->vk;
 
@@ -5718,38 +5723,57 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 
 	vk_local2d_begin_frame_once(c);
 
-	// --- twod: clear local2d_scratch transparent, flatten layers, → SHADER_READ.
-	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            k_color_sub);
-	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-	vk->vkCmdClearColorImage(cmd, c->local2d_scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1,
-	                         &k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	/*
+	 * --- twod: clear local2d_scratch transparent, flatten layers, → SHADER_READ.
+	 *
+	 * #875 DEPOSIT half. This is the ONLY part of the composite that reads
+	 * app-owned memory — vk_flatten_one_local2d_layer samples the app's Local2D
+	 * swapchain images. It therefore runs on the app frame ONLY. A repaint
+	 * (reuse_twod) skips it and lerps from whatever the last app frame left in
+	 * local2d_scratch, which is compositor-owned and still valid.
+	 *
+	 * Re-running it on a repaint would sample images the app has since
+	 * reacquired and redrawn — that is precisely the 2D-bubble flicker found on
+	 * D3D11 and D3D12. Skipping the barriers too is not an optimisation but a
+	 * correctness requirement: the scratch is already in SHADER_READ from the
+	 * app frame, so re-issuing a COLOR_ATTACHMENT→SHADER_READ transition would
+	 * declare a wrong oldLayout.
+	 */
+	if (!reuse_twod) {
+		vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            k_color_sub);
+		VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+		vk->vkCmdClearColorImage(cmd, c->local2d_scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                         &transparent, 1, &k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+		                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
-			continue;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
+			}
+			// #491 part 3 — under-layers are the DP backdrop (handled pre-weave);
+			// the overlay flattens only over-layers. Zones frames have no
+			// under/over split (2D-under reserved in v1).
+			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
+				continue;
+			}
+			vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
 		}
-		// #491 part 3 — under-layers are the DP backdrop (handled pre-weave);
-		// the overlay flattens only over-layers. Zones frames have no
-		// under/over split (2D-under reserved in v1).
-		if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
-			continue;
-		}
-		vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
+		vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 	}
-	vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 
 	// --- mask. Zones frame (XR_DXR_display_zones): the WISH — the explicit
 	// frame wish (staged in-cmd; referenced-at-frame-end = consume current

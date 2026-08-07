@@ -30,6 +30,8 @@
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_system.h"
 
+#include "os/os_threading.h"
+
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
@@ -312,6 +314,49 @@ struct comp_gl_compositor
 
 	// --- Layer accumulation ---
 	struct comp_layer_accum layer_accum;
+
+	/*!
+	 * #868 / #875: serialises the frame path against the repaint replay.
+	 *
+	 * GL needs this for a reason the other backends do not have: a WGL context
+	 * can be current on at most ONE thread at a time. The frame path makes
+	 * c->hglrc current and releases it before returning, so between app frames
+	 * the context is current nowhere — that gap is where a repaint claims it.
+	 * The lock is what guarantees the two never overlap.
+	 */
+	struct os_mutex mutex;
+
+	//! #868: the repaint loop. See gl_repaint_thread.
+	//! os_* primitives, not std::, because this struct is U_TYPED_CALLOC'd —
+	//! calloc runs no constructors, so a std::mutex/std::thread member here
+	//! would be undefined behaviour.
+	struct os_thread_helper repaint_thread;
+
+	/*!
+	 * #868: what the repaint thread needs to replay the last app frame's weave
+	 * WITHOUT re-reading app-owned state. Published by layer_commit; see the
+	 * #875 deposit half in gl_composite_local_2d.
+	 */
+	struct
+	{
+		int enabled;                 //!< DXR_WEAVE_REPAINT=0 disables.
+		int force;                   //!< DXR_WEAVE_REPAINT_FORCE=1 correctness probe.
+		bool armed;                  //!< False on zero-copy: the atlas IS the app's texture.
+		bool app_frame_in_progress;  //!< Set by layer_begin, cleared by layer_commit.
+		uint64_t last_app_frame_ns;  //!< Quiet-gate key. Never touched by a repaint.
+
+		//! The 2D-under backdrop the last app frame DEPOSITED. Reused, never
+		//! re-flattened — the flatten samples the app's Local2D textures.
+		GLuint backdrop_tex;
+		uint32_t backdrop_w, backdrop_h;
+
+		//! The atlas + geometry the last app frame wove from (compositor-owned).
+		GLuint atlas_tex;
+		uint32_t present_w, present_h;
+		float last_dt;
+
+		uint64_t count, ticks;       //!< Diagnostics.
+	} repaint;
 
 	// --- Platform context ---
 #ifdef XRT_OS_WINDOWS
@@ -1454,6 +1499,12 @@ static xrt_result_t
 gl_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_frame_data *data)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
+
+	// #868: the app's submission window opens here and closes in layer_commit.
+	// The lock does not span it, so without this a repaint could win the lock
+	// partway through the app filling layer_accum and replay a half-written frame.
+	c->repaint.app_frame_in_progress = true;
+
 	comp_layer_accum_begin(&c->layer_accum, data);
 	return XRT_SUCCESS;
 }
@@ -2533,7 +2584,7 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 // falls through to the plain present.
 static bool
 gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target_fbo, uint32_t output_w,
-                      uint32_t output_h)
+                      uint32_t output_h, bool reuse_twod)
 {
 	// XR_DXR_display_zones: a zones frame ALWAYS runs the composite (the
 	// MODE_ZONES pass gates the weave by the binary zone raster — pixels
@@ -2678,24 +2729,41 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 	// is reserved in v1); with zero Local2D layers the clear-only scratch
 	// means MODE_ZONES writes M·weave over transparent — pixels outside
 	// every zone present alpha 0.
-	if (have_local_2d) {
-		gl_flatten_local_2d_layers(c, output_w, output_h, zones_frame ? -1 : proj_idx);
-	} else {
-		glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
-		glViewport(0, 0, output_w, output_h);
-		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
-		glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	}
+	/*
+	 * #875 DEPOSIT half — the only part of this composite that reads app-owned
+	 * memory. Both flattens below sample the app's own Local2D swapchain
+	 * textures, so they run on the APP FRAME ONLY and land in
+	 * compositor-owned scratch (local2d_scratch_tex / the backdrop texture).
+	 *
+	 * A repaint (reuse_twod) skips them and lerps from what the last app frame
+	 * deposited. Re-running them would sample textures the app has since
+	 * reacquired and redrawn — the 2D-bubble flicker found on D3D11 and D3D12.
+	 */
+	if (!reuse_twod) {
+		if (have_local_2d) {
+			gl_flatten_local_2d_layers(c, output_w, output_h, zones_frame ? -1 : proj_idx);
+		} else {
+			glBindFramebuffer(GL_FRAMEBUFFER, c->local2d_scratch_fbo);
+			glViewport(0, 0, output_w, output_h);
+			glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		}
 
-	// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to the DP
-	// (it composites `backdrop over captured-desktop` under the 3D weave). 0 ⟹ no
-	// under-layers. Must precede the weave redirect below.
-	{
+		// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to the DP
+		// (it composites `backdrop over captured-desktop` under the 3D weave). 0 ⟹ no
+		// under-layers. Must precede the weave redirect below.
 		uint32_t bd_w = 0, bd_h = 0;
 		GLuint bd_tex = gl_flatten_backdrop_2d(c, output_w, output_h, &bd_w, &bd_h);
-		xrt_display_processor_gl_set_background_2d(c->display_processor, bd_tex, bd_w, bd_h);
+		c->repaint.backdrop_tex = bd_tex;
+		c->repaint.backdrop_w = bd_w;
+		c->repaint.backdrop_h = bd_h;
 	}
+
+	// The DP always needs the backdrop re-handed to it: it is per-frame state
+	// on the display processor, not a texture the DP retains across weaves.
+	xrt_display_processor_gl_set_background_2d(c->display_processor, c->repaint.backdrop_tex,
+	                                          c->repaint.backdrop_w, c->repaint.backdrop_h);
 
 	// Redirect the DP weave into weave_tex.
 	gl_dp_weave_to_fbo(c, atlas_tex, c->weave_fbo, output_w, output_h);
@@ -2986,8 +3054,258 @@ gl_compute_effective_layout(struct comp_gl_compositor *c)
 	}
 }
 
+/*!
+ * #868 / #875: bind the present target, run the masked composite (or the plain
+ * weave), and present. Shared by the app frame and the repaint replay.
+ *
+ * Caller MUST hold c->mutex AND have c->hglrc current on this thread. A WGL
+ * context lives on one thread at a time, so the repaint claims it in the gap
+ * the frame path leaves after releasing it.
+ *
+ * `atlas_for_present` is compositor-owned on every path a repaint can run
+ * (repaints are not armed for zero-copy, where the atlas IS the app's texture).
+ * The one app-owned read in the composite — the Local2D flatten — is the #875
+ * deposit half and is skipped here via reuse_twod; see gl_composite_local_2d.
+ */
+static void
+gl_window_present(struct comp_gl_compositor *c, GLuint atlas_for_present, float dt, bool is_repaint)
+{
+	// Normal window mode: present to screen
+	// Use actual window backing dimensions
+	uint32_t present_w = c->tile_columns * c->view_width;
+	uint32_t present_h = c->tile_rows * c->view_height;
+#ifdef XRT_OS_WINDOWS
+	if (c->hwnd != NULL) {
+		RECT rc;
+		if (GetClientRect(c->hwnd, &rc)) {
+			uint32_t ww = (uint32_t)(rc.right - rc.left);
+			uint32_t wh = (uint32_t)(rc.bottom - rc.top);
+			if (ww > 0 && wh > 0) {
+				present_w = ww;
+				present_h = wh;
+			}
+		}
+	}
+#elif defined(__APPLE__)
+	comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
+#endif
+
+	// Bind the present target. Default WGL path: FBO 0 (window default
+	// framebuffer). Transparent (DComp) path: lock the off-screen interop
+	// transit texture and bind its FBO — the DP weaves into it, then the
+	// D3D11 blit + Present below copies it to the DComp back buffer.
+#ifdef XRT_OS_WINDOWS
+	if (c->dcomp_active) {
+		// The transit texture is fixed-size; resize isn't supported yet
+		// (deferred follow-up). Clamp present dims to the setup dims.
+		if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
+			present_w = c->dcomp_present_w;
+			present_h = c->dcomp_present_h;
+		}
+		c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+		glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
+	} else
+#endif
+	{
+#ifdef XRT_OS_WINDOWS
+		if (c->dcomp_readback_active) {
+			// No-interop readback path: weave into a dedicated RGBA FBO (NOT
+			// FBO 0, whose default framebuffer drops alpha → opaque-black
+			// holes). Source texture is fixed-size, so clamp present dims.
+			if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
+				present_w = c->dcomp_present_w;
+				present_h = c->dcomp_present_h;
+			}
+			glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_readback_gl_fbo);
+		} else
+#endif
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		}
+	}
+
+	if (c->display_processor != NULL) {
+		// #439 Phase 3: when this frame carries Local2D layers or an
+		// active submitted mask, run the post-weave masked composite
+		// (DP weaves into weave_tex, then lerp M*weave+(1-M)*twod into the
+		// present target). Otherwise the DP weaves straight to it — the
+		// pre-Phase-3 path, byte-identical.
+		//
+		// The masked composite must lerp into the FBO bound just above —
+		// the off-screen DComp transit FBO on the transparent path, the
+		// readback FBO on the no-interop path, or FBO 0 (the window) on the
+		// opaque path. Passing a hardcoded 0 here was only accidentally
+		// correct for the opaque path: on the transparent DComp path it
+		// wrote the zones composite into the window default framebuffer
+		// (invisible on a WS_EX_NOREDIRECTIONBITMAP window) while the DComp
+		// present blitted the still-stale transit FBO — a static on-screen
+		// image even as the app submitted fresh frames (#613). The plain
+		// projection path (gl_crop_and_process_dp) already weaves into the
+		// bound FBO, which is why a non-zones transparent GL window animated.
+		GLint present_target_fbo = 0;
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &present_target_fbo);
+		if (!gl_composite_local_2d(c, atlas_for_present, (GLuint)present_target_fbo, present_w,
+		                           present_h, /*reuse_twod=*/is_repaint)) {
+			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
+		}
+	} else {
+		// No display processor: simple blit
+		glViewport(0, 0, present_w, present_h);
+		glUseProgram(c->program_blit);
+		GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+		float blit_w = (c->atlas_tex_width > 0)
+		    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
+		float blit_h = (c->atlas_tex_height > 0)
+		    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
+		glUniform4f(loc_rect, 0.0f, 0.0f, blit_w, blit_h);
+		GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+		glUniform1f(loc_flip, 0.0f);
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, atlas_for_present);
+		GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
+		glUniform1i(loc_out_tex, 0);
+
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+	}
+
+	// HUD overlay (post-weave, before swap)
+	if (c->owns_window) {
+		gl_compositor_render_hud(c, dt, present_w, present_h);
+	}
+
+	// Platform-specific swap
+#ifdef XRT_OS_WINDOWS
+	if (c->dcomp_active) {
+		// Transparent path: flush GL writes to the transit texture, release
+		// the interop lock, then blit + Present through DComp.
+		glFlush();
+		c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
+		gl_dcomp_present_frame(c);
+		// Restore default FBO so other paths see what they expect.
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	} else if (c->dcomp_readback_active) {
+		// No-interop transparent path: the weave is in FBO 0; glReadPixels it,
+		// upload to the DYNAMIC texture, then blit + Present through DComp. No
+		// SwapBuffers — DComp owns the (WS_EX_NOREDIRECTIONBITMAP) window.
+		glFlush();
+		gl_dcomp_readback_present_frame(c);
+	} else {
+		SwapBuffers(c->hdc);
+		if (c->owns_window && c->own_window != NULL) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
+		}
+	}
+#elif defined(XRT_OS_ANDROID)
+	// eglSwapBuffers(c->egl_display, c->egl_surface);
+#elif defined(__APPLE__)
+	comp_gl_window_macos_swap_buffers(c->macos_window);
+#endif
+}
+
+/*!
+ * #868 repaint loop for GL.
+ *
+ * Same contract as the other backends, plus one GL-specific rule: a WGL context
+ * can be current on at most ONE thread at a time. The frame path makes c->hglrc
+ * current and releases it before returning, so between app frames it is current
+ * nowhere — this thread claims it, replays, and MUST release it again before
+ * dropping the lock, or the app's next frame cannot make it current and the
+ * whole compositor wedges.
+ */
+static void *
+gl_repaint_thread(void *ptr)
+{
+	struct comp_gl_compositor *c = (struct comp_gl_compositor *)ptr;
+
+	while (os_thread_helper_is_running(&c->repaint_thread)) {
+		// GL keeps no cached refresh rate; query the window's (cheap, cached
+		// inside the helper) and fall back to 60 Hz off-Windows / on failure.
+		double hz = 60.0;
+#ifdef XRT_OS_WINDOWS
+		const float win_hz = comp_display_refresh_hz_win(c->hwnd);
+		if (win_hz > 1.0f) {
+			hz = (double)win_hz;
+		}
+#endif
+		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		os_nanosleep((int64_t)(period_ns / 4));
+		if (!os_thread_helper_is_running(&c->repaint_thread)) {
+			break;
+		}
+		c->repaint.ticks++;
+
+		if (c->repaint.force == 1 && (c->repaint.ticks % 240) == 0) {
+			U_LOG_W("#868 gl repaint: ticks=%llu count=%llu armed=%d in_frame=%d",
+			        (unsigned long long)c->repaint.ticks, (unsigned long long)c->repaint.count,
+			        (int)c->repaint.armed, (int)c->repaint.app_frame_in_progress);
+		}
+
+		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			continue;
+		}
+		if (c->repaint.force != 1 &&
+		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+			continue;
+		}
+
+		os_mutex_lock(&c->mutex);
+
+		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
+		    c->repaint.app_frame_in_progress || c->display_processor == NULL ||
+		    c->repaint.atlas_tex == 0) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		if (c->repaint.force != 1 &&
+		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+
+#ifdef XRT_OS_WINDOWS
+		if (c->hdc == NULL || c->hglrc == NULL) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		// Claim the context. Nothing else holds it: the frame path released it
+		// before returning, and the lock keeps it that way for this replay.
+		if (!wglMakeCurrent(c->hdc, c->hglrc)) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+
+		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
+
+		// Release unconditionally — see the note above about wedging the app.
+		wglMakeCurrent(NULL, NULL);
+#elif defined(__APPLE__)
+		comp_gl_window_macos_make_current(c->macos_window);
+		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
+#endif
+
+		c->repaint.count++;
+		os_mutex_unlock(&c->mutex);
+
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#868: repainting last atlas at %.1f Hz while the app is between frames "
+			        "(set DXR_WEAVE_REPAINT=0 to disable)",
+			        hz);
+		}
+	}
+
+	return NULL;
+}
+
+/*!
+ * The frame path proper. Runs with c->mutex HELD — see the locking wrapper
+ * below. Keeps its early returns, which is why the lock lives in the wrapper.
+ */
 static xrt_result_t
-gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 
@@ -3569,7 +3887,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// opaque. Falls back to the plain weave when no composite is
 			// needed (the helper returns false). Both land in
 			// shared_present_fbo (distinct from the c->fbo the crop reuses).
-			if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h)) {
+			if (!gl_composite_local_2d(c, atlas_for_present, c->shared_present_fbo, dp_w, dp_h, /*reuse_twod=*/false)) {
 				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
 			}
 
@@ -3649,7 +3967,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// no composite is needed (the helper returns false). The zone-wish
 			// publish to the DP happens once at end of layer_commit via
 			// gl_sync_zone_mask_to_dp, which consumes the resolved wish.
-			if (!gl_composite_local_2d(c, atlas_for_present, c->iosurface_present_fbo, dp_w, dp_h)) {
+			if (!gl_composite_local_2d(c, atlas_for_present, c->iosurface_present_fbo, dp_w, dp_h, /*reuse_twod=*/false)) {
 				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
 			}
 		} else {
@@ -3678,137 +3996,19 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	} else
 #endif
 	{
-		// Normal window mode: present to screen
-		// Use actual window backing dimensions
-		uint32_t present_w = c->tile_columns * c->view_width;
-		uint32_t present_h = c->tile_rows * c->view_height;
-#ifdef XRT_OS_WINDOWS
-		if (c->hwnd != NULL) {
-			RECT rc;
-			if (GetClientRect(c->hwnd, &rc)) {
-				uint32_t ww = (uint32_t)(rc.right - rc.left);
-				uint32_t wh = (uint32_t)(rc.bottom - rc.top);
-				if (ww > 0 && wh > 0) {
-					present_w = ww;
-					present_h = wh;
-				}
-			}
-		}
-#elif defined(__APPLE__)
-		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
-#endif
+		// #868: publish what the repaint thread replays. Armed only off the
+		// zero-copy path — there the atlas IS the app's own texture, which it
+		// redraws, so replaying it would weave whatever the app has since drawn.
+		c->repaint.atlas_tex = atlas_for_present;
+		c->repaint.armed = !zero_copy;
+		// The HUD's dt is the APP's frame delta; a repaint reports the last
+		// real frame's, not a repaint-to-repaint interval.
+		c->repaint.last_dt = dt;
 
-		// Bind the present target. Default WGL path: FBO 0 (window default
-		// framebuffer). Transparent (DComp) path: lock the off-screen interop
-		// transit texture and bind its FBO — the DP weaves into it, then the
-		// D3D11 blit + Present below copies it to the DComp back buffer.
-#ifdef XRT_OS_WINDOWS
-		if (c->dcomp_active) {
-			// The transit texture is fixed-size; resize isn't supported yet
-			// (deferred follow-up). Clamp present dims to the setup dims.
-			if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
-				present_w = c->dcomp_present_w;
-				present_h = c->dcomp_present_h;
-			}
-			c->pfn_wglDXLockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
-			glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_transit_fbo);
-		} else
-#endif
-		{
-#ifdef XRT_OS_WINDOWS
-			if (c->dcomp_readback_active) {
-				// No-interop readback path: weave into a dedicated RGBA FBO (NOT
-				// FBO 0, whose default framebuffer drops alpha → opaque-black
-				// holes). Source texture is fixed-size, so clamp present dims.
-				if (present_w != c->dcomp_present_w || present_h != c->dcomp_present_h) {
-					present_w = c->dcomp_present_w;
-					present_h = c->dcomp_present_h;
-				}
-				glBindFramebuffer(GL_FRAMEBUFFER, c->dcomp_readback_gl_fbo);
-			} else
-#endif
-			{
-				glBindFramebuffer(GL_FRAMEBUFFER, 0);
-			}
-		}
+		gl_window_present(c, atlas_for_present, dt, /*is_repaint=*/false);
 
-		if (c->display_processor != NULL) {
-			// #439 Phase 3: when this frame carries Local2D layers or an
-			// active submitted mask, run the post-weave masked composite
-			// (DP weaves into weave_tex, then lerp M*weave+(1-M)*twod into the
-			// present target). Otherwise the DP weaves straight to it — the
-			// pre-Phase-3 path, byte-identical.
-			//
-			// The masked composite must lerp into the FBO bound just above —
-			// the off-screen DComp transit FBO on the transparent path, the
-			// readback FBO on the no-interop path, or FBO 0 (the window) on the
-			// opaque path. Passing a hardcoded 0 here was only accidentally
-			// correct for the opaque path: on the transparent DComp path it
-			// wrote the zones composite into the window default framebuffer
-			// (invisible on a WS_EX_NOREDIRECTIONBITMAP window) while the DComp
-			// present blitted the still-stale transit FBO — a static on-screen
-			// image even as the app submitted fresh frames (#613). The plain
-			// projection path (gl_crop_and_process_dp) already weaves into the
-			// bound FBO, which is why a non-zones transparent GL window animated.
-			GLint present_target_fbo = 0;
-			glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &present_target_fbo);
-			if (!gl_composite_local_2d(c, atlas_for_present, (GLuint)present_target_fbo, present_w,
-			                           present_h)) {
-				gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
-			}
-		} else {
-			// No display processor: simple blit
-			glViewport(0, 0, present_w, present_h);
-			glUseProgram(c->program_blit);
-			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
-			float blit_w = (c->atlas_tex_width > 0)
-			    ? (float)(c->eff_cols * c->eff_tile_w) / (float)c->atlas_tex_width : 1.0f;
-			float blit_h = (c->atlas_tex_height > 0)
-			    ? (float)(c->eff_rows * c->eff_tile_h) / (float)c->atlas_tex_height : 1.0f;
-			glUniform4f(loc_rect, 0.0f, 0.0f, blit_w, blit_h);
-			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
-			glUniform1f(loc_flip, 0.0f);
-
-			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
-			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
-			glUniform1i(loc_out_tex, 0);
-
-			glDrawArrays(GL_TRIANGLES, 0, 3);
-		}
-
-		// HUD overlay (post-weave, before swap)
-		if (c->owns_window) {
-			gl_compositor_render_hud(c, dt, present_w, present_h);
-		}
-
-		// Platform-specific swap
-#ifdef XRT_OS_WINDOWS
-		if (c->dcomp_active) {
-			// Transparent path: flush GL writes to the transit texture, release
-			// the interop lock, then blit + Present through DComp.
-			glFlush();
-			c->pfn_wglDXUnlockObjectsNV(c->dcomp_dx_interop_device, 1, &c->dcomp_transit_iop);
-			gl_dcomp_present_frame(c);
-			// Restore default FBO so other paths see what they expect.
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
-		} else if (c->dcomp_readback_active) {
-			// No-interop transparent path: the weave is in FBO 0; glReadPixels it,
-			// upload to the DYNAMIC texture, then blit + Present through DComp. No
-			// SwapBuffers — DComp owns the (WS_EX_NOREDIRECTIONBITMAP) window.
-			glFlush();
-			gl_dcomp_readback_present_frame(c);
-		} else {
-			SwapBuffers(c->hdc);
-			if (c->owns_window && c->own_window != NULL) {
-				comp_d3d11_window_signal_paint_done(c->own_window);
-			}
-		}
-#elif defined(XRT_OS_ANDROID)
-		// eglSwapBuffers(c->egl_display, c->egl_surface);
-#elif defined(__APPLE__)
-		comp_gl_window_macos_swap_buffers(c->macos_window);
-#endif
+		// Only a REAL frame resets the quiet-gate.
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 	}
 
 	// Cache eye positions AFTER process_atlas (which updates the SR weaver's
@@ -3872,6 +4072,28 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #868 locking wrapper. Serialises the whole frame path against the repaint
+ * replay, so the GL context, the vendor weave and the present are never
+ * concurrent with a repaint's.
+ *
+ * app_frame_in_progress is cleared here — under the lock, after the frame path
+ * returns — and unconditionally, so an early return inside cannot leak it and
+ * wedge the repaint loop off permanently.
+ */
+static xrt_result_t
+gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
+{
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	os_mutex_lock(&c->mutex);
+	xrt_result_t xret = gl_compositor_layer_commit_locked(xc, sync_handle);
+	c->repaint.app_frame_in_progress = false;
+	os_mutex_unlock(&c->mutex);
+
+	return xret;
+}
+
 
 /*
  *
@@ -3883,6 +4105,11 @@ static void
 gl_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
+
+	// #868: stop the repaint loop FIRST — it holds the GL context and touches
+	// the display processor, both torn down below.
+	os_thread_helper_destroy(&c->repaint_thread);
+	os_mutex_destroy(&c->mutex);
 
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
@@ -4679,6 +4906,12 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	c->xdev = xdev;
 	c->transparent_background = transparent_background;
 
+	// #868: before ANY path that can reach gl_compositor_destroy — it joins the
+	// repaint thread and destroys this mutex, so both must be valid even on the
+	// earliest create failure.
+	os_mutex_init(&c->mutex);
+	os_thread_helper_init(&c->repaint_thread);
+
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
 
@@ -4966,6 +5199,28 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		CGLSetCurrentContext(caller_cgl_ctx);
 	}
 #endif
+
+	/*
+	 * #868: the repaint loop, ON by default (DXR_WEAVE_REPAINT=0 disables),
+	 * matching D3D11/D3D12/VK.
+	 *
+	 * Started HERE, after the compositor's context has been released back to
+	 * the caller just above — the loop makes c->hglrc current on its own
+	 * thread, and a WGL context cannot be current on two threads at once.
+	 */
+	{
+		const char *e = getenv("DXR_WEAVE_REPAINT");
+		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
+		if (c->repaint.force == 1) {
+			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "
+			        "of app rate. Correctness probe; it WILL cost frame rate.");
+		}
+		if (c->repaint.enabled == 1) {
+			os_thread_helper_start(&c->repaint_thread, gl_repaint_thread, c);
+		}
+	}
 
 	U_LOG_W("Native OpenGL compositor created: %ux%u", width, height);
 
