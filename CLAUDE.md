@@ -156,7 +156,8 @@ For tagged releases use `/release` — don't tag manually.
 ### Branch protection / merging PRs
 `main` is governed by a `main-protection` ruleset (same policy across all DisplayXR repos): required CI checks (`Runtime`, `Build`, `shell-path-guard`) **+ 1 required review**, with the **repo-admin role** and the **publish-bot** App as bypass actors. Implications when merging:
 - **Non-admin PRs need 1 approving review.** GitHub **auto-merge does not exercise the admin bypass** — enabling `--auto` on an admin PR just stalls on `REVIEW_REQUIRED` even with green CI (verified). So auto-merge only completes once a review lands.
-- **Admins merge review-free via the manual path only:** wait for green CI, then `gh pr merge <n> --squash --admin` (the bypass fires on explicit merge, not on `--auto`).
+- **Admins merge review-free via the manual path only:** wait for green CI, then `gh pr merge <n> --admin` (the bypass fires on explicit merge, not on `--auto`).
+- **Merge method — by what the commits ARE, not a blanket rule:** **rebase** (`--rebase --admin`) when the PR's commits are each a meaningful, self-contained step — a feature progression worth preserving in `main`'s history; **squash** (`--squash --admin`) when they're mostly a sequence of fixups/iterations on one change. A clean single-commit fix squashes to itself either way. (E.g. #878's two `feat` commits — add the force var, then make it authoritative — were rebased; #880's lone fix was squashed.)
 - The publish-bot bypasses everything, so `versions-bump` mirrors and `/release` marker-commit pushes to `main` keep working.
 
 ## Releasing
