@@ -192,6 +192,14 @@ DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_height_m, "SIM_DISPLAY_HEIGHT_M", 0.194f
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_w, "SIM_DISPLAY_PIXEL_W", 1920)
 DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_h, "SIM_DISPLAY_PIXEL_H", 1080)
+//! Dev/test knob: pin the active rendering mode to an explicit unified index —
+//! 0=2D, 1=Anaglyph, 2=Cropped SBS, 3=Squeezed SBS, 4=Quad — overriding the
+//! SIM_DISPLAY_OUTPUT-derived default AND every later mode request (see the
+//! guard in sim_display_hmd_set_property). -1 (unset) = normal behaviour. This
+//! is plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
+//! e.g. a zones app can be forced to 4-view Quad for atlas inspection despite
+//! the session-begin/zone reconciliation that would otherwise select 2 views.
+DEBUG_GET_ONCE_NUM_OPTION(sim_display_force_mode, "SIM_DISPLAY_FORCE_MODE", -1)
 
 
 /*
@@ -426,6 +434,22 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
                               int32_t value)
 {
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+		// SIM_DISPLAY_FORCE_MODE pins the active mode: swallow every later
+		// request so the forced view layout survives the session-begin default
+		// (oxr_session.c), the compositor, app xrRequestDisplayModeDXR calls,
+		// and zone reconciliation. Report success so callers don't treat it as
+		// an error; one-shot WARN so the override is visible in the log.
+		if (debug_get_num_option_sim_display_force_mode() >= 0) {
+			static bool warned_force = false;
+			if (!warned_force) {
+				warned_force = true;
+				U_LOG_W("sim_display: ignoring OUTPUT_MODE=%d request — "
+				        "SIM_DISPLAY_FORCE_MODE pins the active mode",
+				        value);
+			}
+			return XRT_SUCCESS;
+		}
+
 		if ((uint32_t)value >= xdev->rendering_mode_count) {
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
@@ -744,6 +768,29 @@ sim_display_hmd_create(void)
 		case SIM_DISPLAY_OUTPUT_QUAD:         default_mode = 4; break;
 		default:                              default_mode = 0; break;
 		}
+
+		// SIM_DISPLAY_FORCE_MODE overrides the SIM_DISPLAY_OUTPUT-derived
+		// default with an explicit unified index and keeps the DP present
+		// pipeline consistent with it. The set_property guard above then holds
+		// this mode against every later request (plug-in-wide, any app).
+		int32_t forced = (int32_t)debug_get_num_option_sim_display_force_mode();
+		if (forced >= 0 && (uint32_t)forced < hmd->base.rendering_mode_count) {
+			static const enum sim_display_output_mode idx_to_internal[5] = {
+			    SIM_DISPLAY_OUTPUT_PASSTHROUGH, SIM_DISPLAY_OUTPUT_ANAGLYPH,
+			    SIM_DISPLAY_OUTPUT_SBS, SIM_DISPLAY_OUTPUT_SQUEEZED_SBS,
+			    SIM_DISPLAY_OUTPUT_QUAD};
+			default_mode = (uint32_t)forced;
+			sim_display_set_output_mode(idx_to_internal[default_mode]);
+			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d — pinning active mode "
+			        "'%s' (view_count=%u); later mode requests are ignored",
+			        forced, hmd->base.rendering_modes[default_mode].mode_name,
+			        hmd->base.rendering_modes[default_mode].view_count);
+		} else if (forced != -1) {
+			U_LOG_W("sim_display: SIM_DISPLAY_FORCE_MODE=%d out of range [0,%u) — "
+			        "ignoring, using the SIM_DISPLAY_OUTPUT default",
+			        forced, hmd->base.rendering_mode_count);
+		}
+
 		hmd->base.hmd->active_rendering_mode_index = default_mode;
 		sim_display_set_view_count(hmd->base.rendering_modes[default_mode].view_count);
 	}
