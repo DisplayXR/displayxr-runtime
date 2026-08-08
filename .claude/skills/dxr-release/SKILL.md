@@ -533,6 +533,72 @@ Phase 1 is only used for the tag; signing happens entirely on the runner.
 
 ---
 
+## PHASE 3.6: WRITE THE RELEASE NOTES
+
+Sibling CI creates the GitHub Release but writes **no body** — `softprops/action-gh-release`
+is invoked without `body` / `body_path` / `generate_release_notes`, so every
+component released through this skill shipped a 1-byte release until this phase
+existed. (Unity is the exception: its workflow extracts the tagged section from
+`CHANGELOG.md` into `--notes-file`.)
+
+This matters beyond tidiness. The website's news pipeline
+(`/sync-website news`) parses release bodies for a **`## Highlights` / `## Features`**
+section to decide what reaches the homepage feed; an empty body is invisible to
+it and has to be triaged by reading commits by hand.
+
+### Step 3.6.1: Only fill genuine blanks
+```bash
+BODY_LEN=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | wc -c | tr -d ' ')
+if [ "$BODY_LEN" -gt 40 ]; then
+  echo "notes already present (${BODY_LEN}b) — leaving them alone"
+  SKIP_NOTES=1
+else
+  SKIP_NOTES=0
+  # PREV_TAG is empty on a repo's very first release — log the whole history then.
+  RANGE=${PREV_TAG:+$PREV_TAG..}$NEW_TAG
+  git -C "$WORK/repo" log --no-merges --format='%h %s' "$RANGE"
+fi
+```
+**Never clobber a body someone else authored.** The length guard is what makes
+this idempotent and what keeps unity (and any future CHANGELOG-driven repo)
+working unchanged — no per-component special-casing needed.
+
+### Step 3.6.2: Author the notes  (skip if `SKIP_NOTES=1`)
+
+Read the commit range and write it up. Mirror the runtime's `/release` format so
+one parser reads every repo in the org:
+
+```markdown
+## Highlights
+<Only when something user-visible landed. One short paragraph or 2–4 bullets,
+written as what a user can now do — not as commit subjects.>
+
+## Features
+- <feature, with (#NN)>
+
+## Fixes
+- <fix, with (#NN)>
+```
+
+**Omit `## Highlights` entirely when the range is only fixes, chores, CI, or
+dependency bumps.** This is the rule that matters most: the news detector treats
+Highlights bullets as *claims of new capability*, so a Highlights section
+containing "bumped deps" or "fixed a modal" actively poisons the feed — it turns
+a candidate that should be auto-skippable into one a human has to read and
+reject. A release with only `## Fixes` is a perfectly good release note, and the
+pipeline correctly ignores it. Do not manufacture a highlight to fill the
+heading.
+
+Write to a file and attach — never inline a heredoc into `--notes`, since bodies
+contain backticks and `$`:
+```bash
+# author "$WORK/notes.md" first, then:
+gh release edit "$NEW_TAG" -R "$REL_REPO" --notes-file "$WORK/notes.md"
+gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | head -20
+```
+
+---
+
 ## PHASE 4: WATCH THE DISPATCHED versions-bump RUN
 
 **Skip this phase entirely when `FIELD` is empty** (e.g. `unity`, which has no
@@ -611,6 +677,9 @@ Release $NEW_TAG published successfully!
 Component:   $COMPONENT  ($REPO)
 CI:          run $RUN_ID — $CI_CONC
 Release:     https://github.com/$REL_REPO/releases/tag/$NEW_TAG
+Notes:       [written → "curated notes written (Highlights + N features / M fixes)"]
+             [no-highlights → "notes written — Fixes only, no Highlights section (nothing user-visible shipped)"]
+             [kept → "left CI's own notes alone (${BODY_LEN}b already present)"]
 Signing:     [signed → "installer built + signed on the signing runner (full chain incl. uninstaller, run $SIGN_RUN), re-uploaded over the CI asset"]
              [none   → "⚠ UNSIGNED — signing runner unreachable / earthview macOS .pkg; ships the unsigned CI asset"]
              [unity  → "displayxr_unity.dll signed + re-injected into the .tgz + upm branch" | "⚠ unity ships unsigned"]
@@ -632,9 +701,7 @@ Commits since $PREV_TAG: N
   [first 5 commit oneliners]
 ```
 
-STOP. Sibling repos use GH's auto-generated release notes; if the user
-wants curated notes they run `gh release edit` themselves (different
-cadence from the runtime, where curated notes are the norm).
+STOP.
 
 ---
 
@@ -666,3 +733,13 @@ cadence from the runtime, where curated notes are the norm).
   `displayxr-website/scripts/sync-org.mjs` + `docs/org-sync.md`.)
 - Tags are sticky. Deleting a tag also deletes its GH Release. Prefer
   fixing forward with a patch release.
+- **Release notes feed the website's news feed — that's why PHASE 3.6 exists.**
+  `/sync-website news` parses release bodies for a `## Highlights` / `## Features`
+  section to decide what reaches the homepage "What's New" ticker. Before 3.6,
+  every component released through this skill shipped an empty body (verified
+  2026-08-08 across all 5 demos + mcp + leia-plugin), so the news pass had to
+  read raw commits to triage anything. Two consequences worth keeping in mind:
+  (1) the heading names are a **contract** with
+  `displayxr-website/scripts/sync-org.mjs` — don't invent new ones; (2) a
+  `## Highlights` section is read as a claim of new capability, so leaving it
+  out of a fixes-only release is the *correct* behavior, not laziness.
