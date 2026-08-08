@@ -3038,8 +3038,20 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		 * by default until the cause is understood. D3D12 and VK are verified
 		 * and remain default-ON.
 		 */
+		/*
+		 * Default ON again (DXR_WEAVE_REPAINT=0 disables), matching D3D12/VK.
+		 *
+		 * The opt-in was based on #876, which turned out NOT to be a repaint
+		 * bug at all: the zones test app's GetAsyncKeyState hotkeys are
+		 * GLOBAL, and another session typing 'o'/'m' anywhere on the box was
+		 * genuinely moving zone B onto zone A (the "double cube") and
+		 * republishing the wish mask (the black transients). Reproduced on
+		 * demand with injected keypresses; identical with the repaint
+		 * disabled (134 vs 141 dropouts). The app is now focus-gated and the
+		 * repaint exonerated.
+		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
-		c->repaint.enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
 		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");
@@ -3781,9 +3793,25 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 
 	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
 	             c->wish_mask_h != h || c->wish_rect_count != rect_count;
+	/*
+	 * #876 diag: NAME the condition that tripped. Mid-run re-rasters correlate
+	 * 1:1 with the dropout bursts, but every logged re-raster shows identical
+	 * inputs ("2 zone rect(s), 1280x720") — so WHICH term goes dirty is the
+	 * question, and guessing has been wrong five times on this bug.
+	 */
+	if (dirty && c->wish_mask_tex != nullptr) {
+		U_LOG_W("#876 wish dirty: srv_null=%d w %u!=%u h %u!=%u count %u!=%u",
+		        (int)(c->wish_mask_staged_srv == nullptr), c->wish_mask_w, w, c->wish_mask_h, h,
+		        c->wish_rect_count, rect_count);
+	}
 	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
 		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
 			dirty = true;
+			U_LOG_W("#876 wish dirty: rect[%u] %d,%d %ux%u -> %d,%d %ux%u", i,
+			        c->wish_rects[i].offset.w, c->wish_rects[i].offset.h,
+			        c->wish_rects[i].extent.w, c->wish_rects[i].extent.h,
+			        rects[i].offset.w, rects[i].offset.h,
+			        rects[i].extent.w, rects[i].extent.h);
 		}
 	}
 	if (!dirty) {
@@ -4111,6 +4139,10 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 			c->context->CopyResource(fw->staged, fw->tex);
 		}
 		if (c->frame_wish_last != fw || c->frame_wish_last_seq != fw->author_seq) {
+			U_LOG_W("#876 wish seq: EXPLICIT bump (fw %p->%p author_seq %llu->%llu)",
+			        (void *)c->frame_wish_last, (void *)fw,
+			        (unsigned long long)c->frame_wish_last_seq,
+			        (unsigned long long)fw->author_seq);
 			c->zone_publish_seq++;
 			c->frame_wish_last = fw;
 			c->frame_wish_last_seq = fw->author_seq;
@@ -4121,6 +4153,7 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 	// Source flip explicit -> auto: even an unchanged auto raster is new
 	// content at the DP.
 	if (c->frame_wish_last != nullptr) {
+		U_LOG_W("#876 wish seq: EXPLICIT->AUTO flip bump (fw_last %p)", (void *)c->frame_wish_last);
 		c->frame_wish_last = nullptr;
 		c->zone_publish_seq++;
 	}

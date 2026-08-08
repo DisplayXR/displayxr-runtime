@@ -764,6 +764,21 @@ static const char* WishModeName(int mode) {
 
 // Edge-triggered M (wish mode cycle) + O (zone B overlap toggle) polling.
 static void HandleZoneKeys(XrSessionManager& xr) {
+    /*
+     * #876: gate on FOCUS. GetAsyncKeyState reads GLOBAL keyboard state — these
+     * hotkeys fired whenever anyone typed 'o'/'m' anywhere on the machine (an
+     * editor, a terminal, another agent's session). On a shared dev box that
+     * manifested as "the zones app intermittently blinks black / shows a double
+     * cube": the 'O' handler below genuinely moved zone B onto zone A (the
+     * double cube is overlap mode rendering correctly) and each move republished
+     * the wish mask (the black transients). It was chased for a full day as a
+     * #868 repaint bug — reproduced on demand with injected keypresses, and
+     * identical with the repaint disabled (134 vs 141 dropouts).
+     */
+    if (GetForegroundWindow() != (HWND)xr.windowHandle) {
+        return;
+    }
+
     static bool mPrev = false, oPrev = false;
 
     const bool mNow = (GetAsyncKeyState('M') & 0x8000) != 0;
