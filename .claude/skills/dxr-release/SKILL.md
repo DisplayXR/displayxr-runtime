@@ -546,24 +546,46 @@ This matters beyond tidiness. The website's news pipeline
 section to decide what reaches the homepage feed; an empty body is invisible to
 it and has to be triaged by reading commits by hand.
 
-### Step 3.6.1: Only fill genuine blanks
+### Step 3.6.1: Classify the existing body
+
+There are three kinds of body, and only two of them are yours to touch:
+
 ```bash
-BODY_LEN=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | wc -c | tr -d ' ')
-if [ "$BODY_LEN" -gt 40 ]; then
-  echo "notes already present (${BODY_LEN}b) — leaving them alone"
-  SKIP_NOTES=1
+gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' > "$WORK/body.md"
+BODY_LEN=$(wc -c < "$WORK/body.md" | tr -d ' ')
+FIRST_HEADING=$(grep -m1 '^#\{1,4\} ' "$WORK/body.md" || true)
+
+if [ "$BODY_LEN" -le 40 ]; then
+  NOTES_MODE=fresh      # empty — author the whole body
+elif printf '%s' "$FIRST_HEADING" | grep -qi "what's changed"; then
+  NOTES_MODE=prepend    # GH auto-notes only — add curated sections ABOVE them
 else
-  SKIP_NOTES=0
+  NOTES_MODE=keep       # someone authored this (unity CHANGELOG, hand-written)
+fi
+echo "notes mode: $NOTES_MODE (${BODY_LEN}b, first heading: ${FIRST_HEADING:-none})"
+
+if [ "$NOTES_MODE" != keep ]; then
   # PREV_TAG is empty on a repo's very first release — log the whole history then.
   RANGE=${PREV_TAG:+$PREV_TAG..}$NEW_TAG
   git -C "$WORK/repo" log --no-merges --format='%h %s' "$RANGE"
 fi
 ```
-**Never clobber a body someone else authored.** The length guard is what makes
-this idempotent and what keeps unity (and any future CHANGELOG-driven repo)
-working unchanged — no per-component special-casing needed.
 
-### Step 3.6.2: Author the notes  (skip if `SKIP_NOTES=1`)
+Why classify rather than just check length: the demo/mcp/leia workflows now set
+`generate_release_notes: true`, so CI fills the body with GitHub's
+`## What's Changed` PR-title list *before* this phase runs. A plain length guard
+would read that as "notes already present" and this phase would never fire
+again. GitHub always leads auto-notes with that heading, and neither unity's
+CHANGELOG extract nor a hand-written body does — which is what makes the
+first-heading test a reliable three-way split.
+
+- `fresh`  → write the curated body.
+- `prepend` → write curated sections, then append the existing auto-notes
+  underneath. **Keep them**: the PR list is a genuinely useful "everything that
+  changed" appendix below a curated summary, and it costs nothing.
+- `keep`   → **never clobber a body someone else authored.** Skip the phase.
+
+### Step 3.6.2: Author the notes  (skip if `NOTES_MODE=keep`)
 
 Read the commit range and write it up. Mirror the runtime's `/release` format so
 one parser reads every repo in the org:
@@ -592,7 +614,11 @@ heading.
 Write to a file and attach — never inline a heredoc into `--notes`, since bodies
 contain backticks and `$`:
 ```bash
-# author "$WORK/notes.md" first, then:
+# author the curated sections into "$WORK/notes.md" first, then:
+if [ "$NOTES_MODE" = prepend ]; then
+  printf '\n---\n\n' >> "$WORK/notes.md"
+  cat "$WORK/body.md" >> "$WORK/notes.md"     # keep CI's ## What's Changed below
+fi
 gh release edit "$NEW_TAG" -R "$REL_REPO" --notes-file "$WORK/notes.md"
 gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | head -20
 ```
