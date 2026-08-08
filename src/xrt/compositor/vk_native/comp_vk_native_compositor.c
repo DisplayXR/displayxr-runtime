@@ -4141,12 +4141,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Forward transparent_background to the display processor (#573 —
-	// chroma-key-free). client_presents=false: the in-process present is
-	// opaque, so the DP owns see-through (alpha-gate / compose-under-bg). Safe
-	// no-op if the DP lacks the slot (sim_display) or display_processor is NULL.
+	// chroma-key-free). Safe no-op if the DP lacks the slot (sim_display) or
+	// display_processor is NULL.
+	//
+	// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE. On the
+	// default transparent path the VK→D3D11 bridge presents a DComp
+	// PREMULTIPLIED swapchain and DWM blends the live desktop into our alpha=0
+	// holes — precisely the client_presents=true contract in
+	// xrt_display_processor_vk.h. Passing false made the DP ALSO
+	// compose-under-bg: a WGC desktop capture, baked ~1 frame stale, that the
+	// post-weave alpha gate then discards. Wasted work, the documented frame of
+	// lag in the blend band, and WGC delivery is charged to dwm at the
+	// desktop's change rate — a moving cursor alone drives it. Mirrors the
+	// dcomp gate in comp_vk_native_target (transparent && hwnd) plus the
+	// alpha-mode choice. c->hwnd is Windows-only and NULL elsewhere, so
+	// macOS/Linux keep today's value — and compose-under-bg (WGC) is a
+	// Windows-only mechanism regardless.
 	if (c->display_processor != NULL) {
+		const bool runtime_transparent_present =
+		    transparent_background && c->hwnd != NULL && !debug_get_bool_option_present_opaque();
 		xrt_display_processor_vk_set_transparent_background(
-		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
+		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background,
+		    runtime_transparent_present);
 
 		// #613 / #68 — tell the DP whether the app self-presents only the canvas
 		// (shared-texture apps) vs the full target (handle apps). Gates the

@@ -2383,10 +2383,24 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		} else {
 			U_LOG_W("D3D11 display processor created via factory");
 			// Forward session-level transparency (#573 — chroma-key-free).
-			// client_presents=false: the in-process present is opaque, so the
-			// DP owns see-through (compose-under-bg from the atlas alpha).
+			// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE.
+			// On the default transparent path the target is a DComp
+			// PREMULTIPLIED swapchain and DWM blends the live desktop into our
+			// alpha=0 holes — which is precisely the client_presents=true
+			// contract in xrt_display_processor_d3d11.h. Passing false there
+			// made the DP ALSO compose-under-bg: it captures the desktop via
+			// WGC and bakes a ~1-frame-stale copy that the post-weave alpha
+			// gate then discards. Wasted work, the documented "frame of lag"
+			// in the blend band, and WGC delivery is charged to dwm at the
+			// desktop's change rate — a moving cursor alone is enough to make
+			// that expensive. Mirrors use_transparent in comp_d3d11_target.
+			// (Non-Windows keeps false naturally: c->hwnd is NULL there, and
+			// compose-under-bg is a Windows-only mechanism regardless.)
+			const bool runtime_transparent_present =
+			    transparent_background && c->hwnd != nullptr &&
+			    !debug_get_bool_option_present_opaque_comp();
 			xrt_display_processor_d3d11_set_transparent_background(
-			    c->display_processor, transparent_background, false);
+			    c->display_processor, transparent_background, runtime_transparent_present);
 			// #68: tell the DP whether the app self-presents only the canvas (a
 			// _texture app blits its shared texture's canvas to its own window)
 			// vs the runtime presenting the full target (handle apps). The DP
