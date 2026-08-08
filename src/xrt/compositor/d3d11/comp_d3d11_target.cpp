@@ -462,6 +462,13 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
 	if (slack_ns <= 0.0) {
 		return; // the weave already fills the period; go now
 	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("#884: repaint late-weave pacing engaged (period %.1f ms, weave residual %.1f ms, "
+		        "sleeping %.1f ms)",
+		        period_ns / 1e6, residual_ns / 1e6, slack_ns / 1e6);
+	}
 	os_nanosleep((int64_t)slack_ns);
 }
 
