@@ -2722,6 +2722,52 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 		return false;
 	}
 
+	/*
+	 * #885 diag (DXR_WEAVE_REPAINT_DIAG=1): name the composite's INPUTS on a
+	 * repaint vs an app frame. The composite reads layer_accum + per-frame
+	 * flags live, and a repaint replays between (or racing) app submissions —
+	 * if any input below differs from the adjacent app frame, that input is
+	 * the bug. Logs a few of each kind, then goes quiet.
+	 */
+	{
+		static int diag = -1;
+		if (diag < 0) {
+			const char *e = getenv("DXR_WEAVE_REPAINT_DIAG");
+			diag = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (diag == 1) {
+			static int logged_app = 0, logged_rp = 0;
+			int *counter = reuse_twod ? &logged_rp : &logged_app;
+			if (*counter < 6) {
+				(*counter)++;
+				char rects_str[256] = {0};
+				size_t off = 0;
+				uint32_t zc = 0;
+				for (uint32_t i = 0; i < c->layer_accum.layer_count && off < sizeof(rects_str) - 40;
+				     i++) {
+					const struct xrt_layer_data *ld = &c->layer_accum.layers[i].data;
+					if (ld->type == XRT_LAYER_ZONE_3D) {
+						zc++;
+						off += (size_t)snprintf(rects_str + off, sizeof(rects_str) - off,
+						                        " z[%d,%d %dx%d]", ld->zone_3d.rect.offset.w,
+						                        ld->zone_3d.rect.offset.h, ld->zone_3d.rect.extent.w,
+						                        ld->zone_3d.rect.extent.h);
+					} else if (ld->type == XRT_LAYER_LOCAL_2D) {
+						off += (size_t)snprintf(rects_str + off, sizeof(rects_str) - off,
+						                        " l[%d,%d %dx%d]", ld->local_2d.rect.offset.w,
+						                        ld->local_2d.rect.offset.h, ld->local_2d.rect.extent.w,
+						                        ld->local_2d.rect.extent.h);
+					}
+				}
+				U_LOG_W("#885 diag %s: layers=%u zone3d=%u zones_frame=%d explicit=%d local2d=%d "
+				        "mask_tex=%u in_frame=%d%s",
+				        reuse_twod ? "REPAINT" : "app", c->layer_accum.layer_count, zc,
+				        (int)zones_frame, (int)have_explicit, (int)have_local_2d, mask_tex,
+				        (int)c->repaint.app_frame_in_progress, rects_str);
+			}
+		}
+	}
+
 	// Flatten the Local2D layers (the twod source). With no Local2D layers (a
 	// pure explicit-mask frame) the scratch stays transparent → the masked
 	// region shows the desktop, matching the VK leg.
@@ -2786,6 +2832,72 @@ gl_composite_local_2d(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint tar
 
 	// Redirect the DP weave into weave_tex.
 	gl_dp_weave_to_fbo(c, atlas_tex, c->weave_fbo, output_w, output_h);
+
+	/*
+	 * #885 diag part 2 (same DXR_WEAVE_REPAINT_DIAG=1 gate): dump the three
+	 * composite inputs of the FIRST repaint — and the first app frame, for the
+	 * control pair — to %TEMP%\dxr_gl_diag_*.png. Mask is R8; the red channel
+	 * is M (red = keep weave, black = show 2D).
+	 */
+	{
+		static int diag2 = -1;
+		if (diag2 < 0) {
+			const char *e = getenv("DXR_WEAVE_REPAINT_DIAG");
+			diag2 = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		static bool dumped_rp = false, dumped_app = false;
+		bool *dumped = reuse_twod ? &dumped_rp : &dumped_app;
+		// Dump the app frame only AFTER the first repaint dump, so the pair is
+		// adjacent in time (a frame-0 app dump catches pre-content scratch).
+		if (diag2 == 1 && !*dumped && (reuse_twod || dumped_rp)) {
+			*dumped = true;
+			const char *tag = reuse_twod ? "repaint" : "app";
+			const char *tmp = getenv("TEMP");
+			GLuint dump_fbo = 0;
+			glGenFramebuffers(1, &dump_fbo);
+			GLuint texs[4] = {c->weave_tex, c->local2d_scratch_tex, mask_tex, atlas_tex};
+			const char *names[4] = {"weave", "twod", "mask", "atlas"};
+			for (int t = 0; tmp != NULL && t < 4; t++) {
+				const uint32_t tw = (t == 3) ? c->atlas_tex_width : output_w;
+				const uint32_t th = (t == 3) ? c->atlas_tex_height : output_h;
+				if (tw == 0 || th == 0) {
+					continue;
+				}
+				glBindFramebuffer(GL_FRAMEBUFFER, dump_fbo);
+				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+				                       texs[t], 0);
+				if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+					continue;
+				}
+				uint8_t *px = (uint8_t *)malloc((size_t)tw * th * 4);
+				if (px == NULL) {
+					continue;
+				}
+				glReadPixels(0, 0, (GLsizei)tw, (GLsizei)th, GL_RGBA, GL_UNSIGNED_BYTE, px);
+				// Force A=255 and flip to top-down for the PNG.
+				for (size_t i = 3; i < (size_t)tw * th * 4; i += 4) {
+					px[i] = 255;
+				}
+				char path[512];
+				snprintf(path, sizeof(path), "%s/dxr_gl_diag_%s_%s.png", tmp, tag, names[t]);
+				uint8_t *flipped = (uint8_t *)malloc((size_t)tw * th * 4);
+				if (flipped != NULL) {
+					for (uint32_t y = 0; y < th; y++) {
+						memcpy(flipped + (size_t)y * tw * 4,
+						       px + (size_t)(th - 1 - y) * tw * 4, (size_t)tw * 4);
+					}
+					stbi_write_png(path, (int)tw, (int)th, 4, flipped, (int)(tw * 4));
+					free(flipped);
+				}
+				free(px);
+			}
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			if (dump_fbo != 0) {
+				glDeleteFramebuffers(1, &dump_fbo);
+			}
+			U_LOG_W("#885 diag: dumped %s composite inputs to %%TEMP%%\\dxr_gl_diag_%s_*.png", tag, tag);
+		}
+	}
 
 	// Lerp M*weave + (1-M)*twod into the window framebuffer.
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
@@ -4071,6 +4183,26 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		c->repaint.last_dt = dt;
 
 		gl_window_present(c, atlas_for_present, dt, /*is_repaint=*/false);
+
+		/*
+		 * #885 diag probe (DXR_WEAVE_REPAINT_APPTHREAD=1): run the EXACT repaint
+		 * replay — same is_repaint=true path, same reuse_twod semantics — but on
+		 * the APP thread, immediately after the real present. Discriminates
+		 * "the replay path is broken" from "the DP is thread-affine": if this
+		 * replay weaves zone B + background correctly while the repaint-thread
+		 * one blacks them out, the difference is the THREAD, not the path.
+		 * Diagnostic only; never a default (double weave per frame).
+		 */
+		{
+			static int app_replay = -1;
+			if (app_replay < 0) {
+				const char *e = getenv("DXR_WEAVE_REPAINT_APPTHREAD");
+				app_replay = (e != NULL && e[0] == '1') ? 1 : 0;
+			}
+			if (app_replay == 1 && !zero_copy) {
+				gl_window_present(c, atlas_for_present, dt, /*is_repaint=*/true);
+			}
+		}
 
 		// Only a REAL frame resets the quiet-gate.
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
