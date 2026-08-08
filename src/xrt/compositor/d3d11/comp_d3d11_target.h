@@ -91,6 +91,20 @@ void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns);
 
 /*!
+ * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock, and never
+ * waits on the frame-latency waitable (a semaphore — see the implementation).
+ */
+void
+comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
+
+/*!
+ * #868: repaint counterpart of @ref comp_d3d11_target_weave_mark — stamps
+ * T_weave only, staying out of the saturation governor and the #867 ledger.
+ */
+void
+comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target);
+
+/*!
  * Note that xrWaitFrame just returned, so the span to this frame's weave can
  * be measured (#867).
  */

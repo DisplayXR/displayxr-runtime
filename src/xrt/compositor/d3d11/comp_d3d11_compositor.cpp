@@ -67,6 +67,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
+#include <thread>
+#include <atomic>
 #include <cmath>
 
 /*!
@@ -109,6 +111,29 @@ struct comp_d3d11_compositor
 
 	//! DXGI factory for swapchain creation.
 	IDXGIFactory4 *dxgi_factory;
+
+	/*!
+	 * #868: the device's multithread lock, held for the LIFETIME of the
+	 * compositor so a repaint can make its whole weave sequence atomic.
+	 *
+	 * `device`/`context` above belong to the APP — an immediate context is a
+	 * single shared object, and SetMultithreadProtected(TRUE) only makes
+	 * INDIVIDUAL calls thread-safe. A weave is a sequence (bind RTV, set
+	 * viewport, draw), so the app's own render thread could call
+	 * OMSetRenderTargets between our bind and the weaver's draw — the weave
+	 * then landed on the app's render target and the swapchain stayed black.
+	 * Enter()/Leave() takes that same internal lock across the whole
+	 * sequence, which is the only way to make it atomic.
+	 *
+	 * D3D12 needs no equivalent: it records into per-thread command lists and
+	 * allocators, so there is no shared immediate state to interleave with.
+	 *
+	 * MUST stay BELOW dxgi_factory: comp_d3d11_target.cpp mirrors the members
+	 * above as `comp_d3d11_compositor_internals` to reach them from C. A field
+	 * inserted into that prefix silently shifts the mirror and the target
+	 * reads the wrong pointer (crashes in comp_d3d11_target_create).
+	 */
+	ID3D10Multithread *mt_lock;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
@@ -344,6 +369,68 @@ struct comp_d3d11_compositor
 	//! Thread safety.
 	std::mutex mutex;
 
+	/*!
+	 * #868 — weave-rate decoupling. Mirrors the D3D12 leg; the invariants are
+	 * documented there and in [[repaint-never-touches-app-owned-state]]:
+	 * a repaint replays RENDERING only. It never reads an app-owned texture,
+	 * never ticks a per-frame state machine, and never runs while the app is
+	 * part-way through submitting a frame.
+	 */
+	struct
+	{
+		int enabled;  //!< DXR_WEAVE_REPAINT=0 kill switch. -1 = unprobed.
+		int force;    //!< DXR_WEAVE_REPAINT_FORCE=1 correctness probe.
+		bool armed;   //!< Last frame was DP-woven and not zero-copy.
+		bool app_frame_in_progress; //!< layer_begin .. layer_commit.
+		uint64_t last_app_frame_ns;
+		uint64_t count, ticks;
+
+		//! DXR_WEAVE_REPAINT_HASH=1 adjacent-pair probe.
+		int hash_probe;
+		uint64_t app_hash, app_seq, hash_seq;
+		uint8_t *app_px; //!< retained pixels of the last app weave
+		/*!
+		 * #876 diag: why the last d3d11_composite_zone_mask call exited.
+		 * 0 = composited normally; 1..5 = the numbered early return that fired.
+		 * Sampled by the structural-mismatch detector so a black zone can be
+		 * attributed to a specific bail instead of guessed at — reading the
+		 * code already killed one plausible theory (repaint.mask_srv is only
+		 * ever assigned, never cleared, so its null-guard cannot fire after the
+		 * first frame).
+		 */
+		int composite_bail;
+
+		//! #876: per-cell luminance baseline for the absolute dropout detector.
+		double cell_ema[64];
+		uint64_t dropouts;
+		uint64_t detector_frames;
+
+		//! #876 geometry detector: hash of the layout the last APP frame wove
+		//! with, and how often a repaint disagreed with it.
+		uint64_t geom_app;
+		uint64_t geom_mismatches;
+		uint64_t geom_app_changes;
+
+		//! Set by the 8x8 grid scan when a cell lit in the app frame came out
+		//! black in the repaint — keys the PNG dump on the DEFECT rather than
+		//! on the first (usually benign) hash mismatch.
+		bool saw_black_region;
+
+		//! Resolved by the last app frame; replayed as-is.
+		bool zero_copy;
+		void *zc_srv;
+		ID3D11ShaderResourceView *backdrop_srv;
+		uint32_t backdrop_w, backdrop_h;
+		ID3D11ShaderResourceView *atlas_srv;
+		ID3D11ShaderResourceView *mask_srv;
+		uint32_t view_w, view_h, cols, rows;
+		struct u_canvas_rect canvas;
+		struct xrt_eye_positions eye_pos;
+	} repaint;
+
+	std::thread repaint_thread;
+	std::atomic<bool> repaint_quit;
+
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	struct mcp_capture_request mcp_capture;
 
@@ -369,6 +456,8 @@ d3d11_comp(struct xrt_compositor *xc)
 // entry points, called from the layer-commit paths + destroy above them.
 static bool
 d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
+                          bool is_repaint,
+                          bool prepare_only,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
@@ -719,6 +808,9 @@ d3d11_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_f
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
+	// #868: layer_accum is about to be rewritten and the lock released — keep
+	// the repaint thread out until layer_commit closes the window.
+	c->repaint.app_frame_in_progress = true;
 	comp_layer_accum_begin(&c->layer_accum, data);
 
 	return XRT_SUCCESS;
@@ -1432,12 +1524,592 @@ d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
+/*!
+ * #868 diag (DXR_WEAVE_REPAINT_HASH=1): cheap content hash of a rendered target.
+ *
+ * The PNG-pair instrument cannot settle whether a repaint reproduces the app
+ * frame, because encoding a PNG takes 70-150 ms and the scene moves in the gap —
+ * on D3D11 the residual difference is the same size as that animation artifact.
+ * This hashes on the frame path instead, so an app weave and the repaint that
+ * follows it can be compared with NOTHING in between.
+ *
+ * Subsamples every 4th row and every 4th pixel: enough to catch a structurally
+ * different frame, cheap enough to run every weave while probing. Still a
+ * staging copy + Map, so it is env-gated and never on by default.
+ */
+static uint64_t
+d3d11_hash_target(struct comp_d3d11_compositor *c,
+                  ID3D11Texture2D *tex,
+                  uint32_t w,
+                  uint32_t h,
+                  uint8_t **out_rgba)
+{
+	if (tex == nullptr || w == 0 || h == 0) {
+		return 0;
+	}
+	D3D11_TEXTURE2D_DESC td;
+	tex->GetDesc(&td);
+	if (w > td.Width)  w = td.Width;
+	if (h > td.Height) h = td.Height;
+
+	D3D11_TEXTURE2D_DESC sd = td;
+	sd.Width = w;
+	sd.Height = h;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	sd.SampleDesc.Count = 1;
+	sd.SampleDesc.Quality = 0;
+
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		return 0;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	c->context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		staging->Release();
+		return 0;
+	}
+	uint64_t hsh = 1469598103934665603ull; // FNV-1a offset basis
+	const uint8_t *base = (const uint8_t *)m.pData;
+	if (out_rgba != nullptr) {
+		// Keep the pixels so a mismatch can dump BOTH sides of the pair. The
+		// app frame is gone by the time the repaint discovers the mismatch, so
+		// it has to be retained up front.
+		free(*out_rgba);
+		*out_rgba = (uint8_t *)malloc((size_t)w * h * 4);
+		if (*out_rgba != nullptr) {
+			for (uint32_t y = 0; y < h; y++) {
+				memcpy(*out_rgba + (size_t)y * w * 4, base + (size_t)y * m.RowPitch,
+				       (size_t)w * 4);
+			}
+		}
+	}
+	for (uint32_t y = 0; y < h; y += 4) {
+		const uint8_t *row = base + (size_t)y * m.RowPitch;
+		for (uint32_t x = 0; x < w; x += 4) {
+			// RGB only — swapchain alpha is undefined for display output.
+			for (int k = 0; k < 3; k++) {
+				hsh ^= (uint64_t)row[(size_t)x * 4 + k];
+				hsh *= 1099511628211ull;
+			}
+		}
+	}
+	c->context->Unmap(staging, 0);
+	staging->Release();
+	return hsh;
+}
+
+/*!
+ * #868: record the display-processor weave for the current frame state.
+ * Shared by layer_commit and the repaint thread, so a repaint is constructed
+ * exactly like the app frame it stands in for.
+ *
+ * The replay reads ONLY compositor-owned resources: the renderer atlas (or its
+ * crop), the cached 2D-under backdrop and the cached zone/Local2D mask. It never
+ * re-reads an app-owned texture and never ticks a per-frame state machine — see
+ * d3d11_composite_zone_mask, and the D3D12 leg for what happens when it does.
+ */
+static bool
+d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
+{
+	const bool zero_copy = c->repaint.zero_copy;
+	void *zc_srv = c->repaint.zc_srv;
+	const struct u_canvas_rect eff_canvas = c->repaint.canvas;
+
+	// Re-bind target RTV before DP — the renderer may have changed it to the atlas RTV.
+	// The DP writes to the currently bound render target (see xrt_display_processor_d3d11.h).
+	comp_d3d11_target_bind(c->target);
+
+	void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
+
+	// #542: the DP gets the frame's EFFECTIVE content layout — the grid
+	// the passes above actually painted (== the mode layout for matched
+	// submissions) — not the mode layout.
+	uint32_t view_width = c->eff_layout.tile_w;
+	uint32_t view_height = c->eff_layout.tile_h;
+	uint32_t tile_columns = c->eff_layout.cols;
+	uint32_t tile_rows = c->eff_layout.rows;
+
+	/*
+	 * #876 GEOMETRY detector.
+	 *
+	 * The reported artefact is a DOUBLE / zoomed cube, which is a weave
+	 * geometry or interlace-phase error — the weave ran with the wrong tile
+	 * stride, not with wrong pixels. Neither previous instrument could see it:
+	 * the adjacent-pair hash is blind when the app frame and its repaint AGREE
+	 * (measured 2399/2400), and a luminance detector is blind because a doubled
+	 * image has essentially unchanged brightness.
+	 *
+	 * So compare the geometry ITSELF. A repaint must weave with exactly the
+	 * layout of the app frame it stands in for; any difference is the defect,
+	 * and it shows up here whether or not the resulting pixels differ.
+	 */
+	{
+		const struct u_canvas_rect ec = c->repaint.canvas;
+		const uint64_t geom = ((uint64_t)view_width << 48) ^ ((uint64_t)view_height << 32) ^
+		                      ((uint64_t)tile_columns << 24) ^ ((uint64_t)tile_rows << 16) ^
+		                      ((uint64_t)(uint32_t)ec.w << 8) ^ (uint64_t)(uint32_t)ec.h ^
+		                      ((uint64_t)(uint32_t)ec.x << 40) ^ ((uint64_t)(uint32_t)ec.y << 20) ^
+		                      ((uint64_t)(ec.valid ? 1 : 0) << 60) ^ ((uint64_t)(zero_copy ? 1 : 0) << 61);
+		if (!is_repaint) {
+			// Baseline: what the app frame just wove with.
+			if (c->repaint.geom_app != 0 && geom != c->repaint.geom_app) {
+				c->repaint.geom_app_changes++;
+				U_LOG_W("#876 GEOM: APP layout changed -> %ux%u tiles %ux%u canvas %d,%d %ux%u "
+				        "valid=%d zc=%d (app-side changes %llu)",
+				        view_width, view_height, tile_columns, tile_rows, ec.x, ec.y, ec.w, ec.h,
+				        (int)ec.valid, (int)zero_copy,
+				        (unsigned long long)c->repaint.geom_app_changes);
+			}
+			c->repaint.geom_app = geom;
+		} else if (c->repaint.geom_app != 0 && geom != c->repaint.geom_app) {
+			c->repaint.geom_mismatches++;
+			U_LOG_W("#876 GEOM MISMATCH: repaint wove %ux%u tiles %ux%u canvas %d,%d %ux%u "
+			        "valid=%d zc=%d — differs from the app frame it replays (total %llu)",
+			        view_width, view_height, tile_columns, tile_rows, ec.x, ec.y, ec.w, ec.h,
+			        (int)ec.valid, (int)zero_copy,
+			        (unsigned long long)c->repaint.geom_mismatches);
+		}
+	}
+
+
+	// Crop the renderer's atlas to content dims before passing to the DP;
+	// never crop a zero-copy atlas — the app's swapchain is already a
+	// complete, correctly-strided multi-view atlas, and a top-left crop to
+	// the window-scaled width would slice the tiles and weave them
+	// misaligned (big disparity). See the offscreen path above (#431).
+	uint32_t content_w = tile_columns * view_width;
+	uint32_t content_h = tile_rows * view_height;
+	if (!zero_copy) {
+		atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+	}
+
+	uint32_t target_width, target_height;
+	comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
+
+	// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to
+	// the DP (it composites `backdrop over captured-desktop` under the 3D).
+	// The flatten binds/unbinds its own RTV, so re-bind the target RTV after
+	// (the DP writes to the currently bound target). NULL ⟹ no under-layers.
+	// The backdrop flatten samples the APP'S OWN Local2D under-layer swapchain
+	// images, so a repaint reuses what the last app frame produced rather than
+	// re-reading textures the app has since reacquired.
+	if (!is_repaint) {
+		uint32_t bd_w = 0, bd_h = 0;
+		c->repaint.backdrop_srv =
+		    d3d11_flatten_backdrop_2d(c, target_width, target_height, &bd_w, &bd_h);
+		c->repaint.backdrop_w = bd_w;
+		c->repaint.backdrop_h = bd_h;
+	}
+	xrt_display_processor_d3d11_set_background_2d(c->display_processor, c->repaint.backdrop_srv,
+	                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
+	if (c->repaint.backdrop_srv != nullptr) {
+		comp_d3d11_target_bind(c->target);
+	}
+
+	// Late-weave pacing + weave-latency harness mark (env-gated no-ops). A
+	// repaint paced itself unlocked and stays out of the governor EMA and the
+	// #867 prediction ledger.
+	if (is_repaint) {
+		comp_d3d11_target_weave_mark_repaint(c->target);
+	} else {
+		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns);
+	}
+
+	// Timing feedback: hand the DP last frame's MEASURED weave→scanout
+	// residual so the vendor eye predictor runs with an exact horizon
+	// (0 = unknown ⟹ DP falls back to its heuristic).
+	{
+		const uint64_t wl_measured = comp_d3d11_target_get_measured_weave_ns(c->target);
+		static bool wl_logged = false;
+		if (!wl_logged && wl_measured > 0) {
+			wl_logged = true;
+			U_LOG_W("Weave timing feedback engaged: measured=%llu us, period=%llu us",
+			        (unsigned long long)(wl_measured / 1000),
+			        (unsigned long long)((uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate) / 1000));
+		}
+		xrt_display_processor_d3d11_set_frame_timing(
+		    c->display_processor, wl_measured,
+		    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
+
+	xrt_display_processor_d3d11_process_atlas(
+	    c->display_processor, c->context, atlas_srv, view_width, view_height,
+	    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
+	    eff_canvas.valid ? eff_canvas.x : 0,
+	    eff_canvas.valid ? eff_canvas.y : 0,
+	    eff_canvas.valid ? eff_canvas.w : 0,
+	    eff_canvas.valid ? eff_canvas.h : 0);
+
+	// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or a
+	// Local2D layer composites the 2D/3D regions of the DXGI back buffer.
+	// The downstream CopyResource/CopySubresourceRegion (line ~1500)
+	// propagates the composite into c->shared_texture for _texture-mode
+	// read-back. No-op when the frame carries neither.
+	ID3D11Texture2D *back_buffer_2d = static_cast<ID3D11Texture2D *>(
+	    comp_d3d11_target_get_back_buffer(c->target));
+	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d,
+	                          target_width, target_height, &eff_canvas);
+
+	/*
+	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the
+	 * app frame it stands in for, pixel for pixel, whenever the viewer has not
+	 * moved. Comparing ONLY when no app weave has intervened (app_seq unchanged)
+	 * is what makes a mismatch meaningful — otherwise a newer atlas, which is
+	 * correct behaviour, reads as a defect.
+	 */
+	if (c->repaint.hash_probe == 1 && back_buffer_2d != nullptr) {
+		uint8_t *rp_px = nullptr;
+		const uint64_t hsh = d3d11_hash_target(c, back_buffer_2d, target_width, target_height,
+		                                       is_repaint ? &rp_px : &c->repaint.app_px);
+
+		/*
+		 * #876 ABSOLUTE dropout detector — runs on EVERY weave, app or repaint.
+		 *
+		 * The adjacent-pair hash above can only see the app frame and its
+		 * repaint DISAGREEING. If a repaint faithfully replays a frame that is
+		 * already wrong, both are equally wrong and the pair reports
+		 * "reproduced" — measured at 2399/2400 agreement while the panel was
+		 * visibly flickering. So pair-comparison is blind to this class by
+		 * construction, and only an absolute measure can see it.
+		 *
+		 * Track a per-cell luminance EMA on an 8x8 grid and flag any cell that
+		 * was reliably lit and then collapses. That catches a zone dropping out
+		 * regardless of which path produced the frame.
+		 */
+		{
+			/*
+			 * Warm-up gate. The first couple of seconds are content fading in
+			 * while the EMA has no baseline yet — that produced 437 "dropouts"
+			 * in 2 s and then silence for the next 58, i.e. pure noise that
+			 * buried the once-per-10s event actually being hunted. Arm only
+			 * once the baseline means something.
+			 */
+			c->repaint.detector_frames++;
+			const uint8_t *px = is_repaint ? rp_px : c->repaint.app_px;
+			const bool armed = c->repaint.detector_frames > 300;
+			if (px != nullptr) {
+				const uint32_t GX = 8, GY = 8;
+				const uint32_t stride = target_width * 4;
+				for (uint32_t gj = 0; gj < GY; gj++) {
+					for (uint32_t gi = 0; gi < GX; gi++) {
+						const uint32_t y0 = gj * target_height / GY;
+						const uint32_t y1 = (gj + 1) * target_height / GY;
+						const uint32_t x0 = gi * target_width / GX;
+						const uint32_t x1 = (gi + 1) * target_width / GX;
+						uint64_t sum = 0;
+						uint32_t n = 0;
+						for (uint32_t y = y0; y < y1; y += 4) {
+							for (uint32_t x = x0; x < x1; x += 4) {
+								const uint32_t o = y * stride + x * 4;
+								sum += (uint64_t)px[o] + px[o + 1] + px[o + 2];
+								n++;
+							}
+						}
+						if (n == 0) {
+							continue;
+						}
+						const double mean = (double)sum / (n * 3.0);
+						const uint32_t ci = gj * GX + gi;
+						double *ema = &c->repaint.cell_ema[ci];
+						if (*ema <= 0.0) {
+							*ema = mean;
+							continue;
+						}
+						// Lit cell that collapsed: the dropout we are hunting.
+						if (armed && *ema > 8.0 && mean < *ema * 0.50) {
+							c->repaint.dropouts++;
+							U_LOG_W("#876 DROPOUT: cell(%u,%u) [%s] lum %.1f -> %.1f (%.0f%%) "
+							        "(%s weave, composite_bail=%d, total %llu)",
+							        gi, gj, gi < 4 ? "zoneA" : "zoneB", *ema, mean,
+							        100.0 * mean / *ema,
+							        is_repaint ? "REPAINT" : "APP",
+							        c->repaint.composite_bail,
+							        (unsigned long long)c->repaint.dropouts);
+						}
+						// Slow EMA so a one-frame dropout cannot drag the
+						// baseline down and mask the next one.
+						*ema = *ema * 0.95 + mean * 0.05;
+					}
+				}
+			}
+		}
+		if (!is_repaint) {
+			c->repaint.app_hash = hsh;
+			c->repaint.app_seq++;
+			c->repaint.hash_seq = c->repaint.app_seq;
+		} else if (c->repaint.app_hash != 0 && c->repaint.hash_seq == c->repaint.app_seq) {
+			static uint64_t same = 0, diff = 0, black = 0;
+			if (hsh == c->repaint.app_hash) {
+				same++;
+			} else {
+				diff++;
+				/*
+				 * Classify the mismatch. The hash alone cannot separate the
+				 * two populations, and only one of them is a defect: a
+				 * repaint that wove with FRESHER EYES differs by design (that
+				 * is the whole feature), whereas a repaint that produced
+				 * NOTHING is the flicker. Subsampled mean luminance splits
+				 * them for free.
+				 */
+				if (rp_px != nullptr && c->repaint.app_px != nullptr) {
+					/*
+					 * Trigger on STRUCTURAL difference, not on darkness.
+					 *
+					 * Two defects have shown up on the panel and neither is what
+					 * a naive detector finds. A whole-frame mean missed one zone
+					 * going black (frame mean stayed ~44). And the zones flicker
+					 * is often not dark at all — the cube appears "zoomed in,
+					 * double image", i.e. the weave ran with wrong tile geometry.
+					 * Both are large-area pixel differences, so count HOW MUCH of
+					 * the frame changed and localise it on an 8x8 grid.
+					 *
+					 * A repaint that merely wove with fresher eyes shifts the
+					 * interlace phase: many pixels change a little. A geometry or
+					 * dropout fault changes a lot of pixels a lot.
+					 */
+					const uint32_t GX = 8, GY = 8;
+					const uint32_t stride = target_width * 4;
+					uint64_t sa_all = 0, sr_all = 0;
+					uint32_t n_all = 0, big_all = 0;
+					uint32_t cell_big[64] = {0}, cell_n[64] = {0};
+					for (uint32_t y = 0; y < target_height; y += 4) {
+						const uint32_t gj = (y * GY) / target_height;
+						for (uint32_t x = 0; x < target_width; x += 4) {
+							const uint32_t gi = (x * GX) / target_width;
+							const uint32_t o = y * stride + x * 4;
+							const int d0 = (int)c->repaint.app_px[o] - (int)rp_px[o];
+							const int d1 = (int)c->repaint.app_px[o + 1] - (int)rp_px[o + 1];
+							const int d2 = (int)c->repaint.app_px[o + 2] - (int)rp_px[o + 2];
+							const int ad = abs(d0) + abs(d1) + abs(d2);
+							sa_all += (uint64_t)c->repaint.app_px[o] + c->repaint.app_px[o + 1] +
+							          c->repaint.app_px[o + 2];
+							sr_all += (uint64_t)rp_px[o] + rp_px[o + 1] + rp_px[o + 2];
+							n_all++;
+							const uint32_t ci = gj * GX + gi;
+							if (ci < GX * GY) {
+								cell_n[ci]++;
+								if (ad > 48) {
+									big_all++;
+									cell_big[ci]++;
+								}
+							}
+						}
+					}
+					const double ma = n_all != 0 ? (double)sa_all / (n_all * 3.0) : 0.0;
+					const double mr = n_all != 0 ? (double)sr_all / (n_all * 3.0) : 0.0;
+					const double big_pct = n_all != 0 ? 100.0 * (double)big_all / (double)n_all : 0.0;
+					int worst_i = -1, worst_j = -1;
+					double worst_pct = 0.0;
+					for (uint32_t ci = 0; ci < GX * GY; ci++) {
+						if (cell_n[ci] == 0) {
+							continue;
+						}
+						const double cp = 100.0 * (double)cell_big[ci] / (double)cell_n[ci];
+						if (cp > worst_pct) {
+							worst_pct = cp;
+							worst_i = (int)(ci % GX);
+							worst_j = (int)(ci / GX);
+						}
+					}
+					// >12% of the frame is far beyond an interlace-phase shift.
+					const bool structural = (big_pct > 12.0);
+					c->repaint.saw_black_region = structural;
+					if (structural) {
+						black++;
+						U_LOG_W("#868 hash: STRUCTURAL repaint mismatch — %.1f%% of frame differs "
+						        ">48; worst cell(%d,%d) %.0f%%; lum app=%.1f repaint=%.1f "
+						        "(structural %llu / %llu mismatches)",
+						        big_pct, worst_i, worst_j, worst_pct, ma, mr,
+						        (unsigned long long)black, (unsigned long long)diff);
+					} else if ((diff % 20) == 0) {
+						U_LOG_W("#868 hash: mismatch #%llu big=%.2f%% lum app=%.1f repaint=%.1f "
+						        "(structural %llu)",
+						        (unsigned long long)diff, big_pct, ma, mr,
+						        (unsigned long long)black);
+					}
+				}
+			}
+			if (((same + diff) % 120) == 0) {
+				U_LOG_W("#868 hash: adjacent repaint reproduced the app frame %llu/%llu "
+				        "(mismatches %llu)",
+				        (unsigned long long)same, (unsigned long long)(same + diff),
+				        (unsigned long long)diff);
+			}
+			/*
+			 * Dump the first BLACK-REGION pair, not merely the first mismatch.
+			 * Most mismatches are the feature working (the repaint wove with
+			 * fresher eyes) and dumping one of those wastes the single shot —
+			 * it did exactly that on the zones app, capturing a pair whose
+			 * worst pixel differed by 21.
+			 */
+			static bool dumped = false;
+			const char *tmp2 = getenv("TEMP");
+			if (!dumped && c->repaint.saw_black_region && tmp2 != nullptr && rp_px != nullptr &&
+			    c->repaint.app_px != nullptr) {
+				dumped = true;
+				char pa[512], pr[512];
+				snprintf(pa, sizeof(pa), "%s\\hash_app.png", tmp2);
+				snprintf(pr, sizeof(pr), "%s\\hash_repaint.png", tmp2);
+				stbi_write_png(pa, (int)target_width, (int)target_height, 4, c->repaint.app_px,
+				               (int)target_width * 4);
+				stbi_write_png(pr, (int)target_width, (int)target_height, 4, rp_px,
+				               (int)target_width * 4);
+				U_LOG_W("#868 hash: dumped first mismatching pair -> %s / %s", pa, pr);
+			}
+		}
+		free(rp_px);
+	}
+
+	/*
+	 * #868 diag: paired woven back-buffer capture. ONE trigger arms BOTH weave
+	 * kinds so the pair is adjacent in time — comparing an app weave against a
+	 * repaint captured seconds apart would drown the signal in scene motion.
+	 * This is the instrument that localised the equivalent D3D12 bug after
+	 * three wrong hypotheses.
+	 */
+	{
+		const char *tmp = getenv("TEMP");
+		if (tmp != nullptr && back_buffer_2d != nullptr) {
+			static bool want_app = false, want_repaint = false;
+			char trig[512];
+			snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmp);
+			FILE *tf = fopen(trig, "rb");
+			if (tf != nullptr) {
+				fclose(tf);
+				remove(trig);
+				want_app = true;
+				want_repaint = true;
+			}
+			bool *want = is_repaint ? &want_repaint : &want_app;
+			if (*want) {
+				*want = false;
+				char out[512];
+				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp,
+				         is_repaint ? "repaint" : "app");
+				bool wok = d3d11_capture_texture_to_png(c, back_buffer_2d, target_width,
+				                                        target_height, 0, 0, out);
+				U_LOG_W("#868 d3d11 woven capture %s -> %s", wok ? "OK" : "FAILED", out);
+			}
+		}
+	}
+
+	// Only a REAL frame resets the quiet-gate; a repaint must not, or repaints
+	// would pace off their own timestamps and drift below panel rate.
+	if (!is_repaint) {
+		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+	}
+
+	return true;
+}
+
+/*!
+ * #868 repaint loop — see the D3D12 leg for the full rationale.
+ *
+ * Fires only once the app has already missed a full refresh (>= 2 panel
+ * periods), paces itself unlocked, then holds the compositor lock across the
+ * replay so the display processor still only ever sees one caller.
+ */
+static void
+d3d11_repaint_thread(struct comp_d3d11_compositor *c)
+{
+	while (!c->repaint_quit.load(std::memory_order_relaxed)) {
+		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
+		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		os_nanosleep((int64_t)(period_ns / 4));
+		if (c->repaint_quit.load(std::memory_order_relaxed)) {
+			break;
+		}
+		c->repaint.ticks++;
+
+		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			continue;
+		}
+		if (c->repaint.force != 1 &&
+		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+			continue;
+		}
+
+		comp_d3d11_target_repaint_pace(c->target);
+
+		std::lock_guard<std::mutex> lock(c->mutex);
+
+		// app_frame_in_progress is load-bearing and is NOT bypassed by the
+		// force probe: replaying into a half-written layer_accum does not
+		// exercise the feature, it corrupts the frame.
+		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
+		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr) {
+			continue;
+		}
+		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			continue;
+		}
+
+		// Acquire exactly as the app frame does. This is NOT bookkeeping: the
+		// swapchain is FLIP_DISCARD, so the back buffer's contents are
+		// UNDEFINED after every Present, and acquire is what clears it to
+		// black. d3d11_dp_weave's comp_d3d11_target_bind() re-binds the RTV
+		// and viewport but does NOT clear — so a repaint that skipped acquire
+		// wove over discarded garbage wherever the weave and the zone
+		// composite do not write every pixel (outside the canvas sub-rect, and
+		// any 2D band). App frames started from black, repaints did not, so
+		// those regions alternated at the repaint rate — the D3D11 flicker.
+		//
+		// D3D12 has no equivalent exposure: its shared weave function
+		// re-queries the current back-buffer index and RTV on every weave, so
+		// both paths are constructed identically by design there. This is that
+		// same property, restored on D3D11.
+		uint32_t rp_index = 0;
+
+		/*
+		 * Make the whole replay atomic on the immediate context. c->mutex only
+		 * excludes the compositor's OWN callers; the app renders its scene on
+		 * its own thread through this same context and never takes it. Without
+		 * this, an app OMSetRenderTargets landing mid-sequence sent the weave
+		 * to the app's render target and left the swapchain black — measured
+		 * at ~19% of repaints, which is the flicker.
+		 */
+		if (c->mt_lock != nullptr) {
+			c->mt_lock->Enter();
+		}
+
+		comp_d3d11_target_acquire(c->target, &rp_index);
+		d3d11_dp_weave(c, true);
+		d3d11_render_hud_overlay(c, true, &c->repaint.eye_pos);
+		comp_d3d11_target_present(c->target, 1);
+
+		if (c->mt_lock != nullptr) {
+			c->mt_lock->Leave();
+		}
+
+		c->repaint.count++;
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#868: repainting last atlas at %.1f Hz while the app is between frames "
+			        "(set DXR_WEAVE_REPAINT=0 to disable)",
+			        hz);
+		}
+	}
+}
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// #868: the app's submission window closes here. Cleared at the TOP so no
+	// early return can leak it; the lock is held throughout layer_commit, so no
+	// repaint can interleave with it regardless.
+	c->repaint.app_frame_in_progress = false;
 
 	// Capture-intent poll — see u_capture_intent.h. Consumed at the
 	// projection-done boundary (PROJECTION_ONLY, once renderer split
@@ -1895,7 +2567,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or
 			// a Local2D layer composites the 2D/3D regions of the shared
 			// texture. No-op when the frame carries neither.
-			d3d11_composite_zone_mask(c, c->shared_texture, dp_target_w, dp_target_h, &eff_canvas);
+			d3d11_composite_zone_mask(c, false, false, c->shared_texture, dp_target_w, dp_target_h,
+			                          &eff_canvas);
 
 			weaving_done = true;
 		}
@@ -1921,84 +2594,29 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_logged = true;
 		}
 
-		// Re-bind target RTV before DP — the renderer may have changed it to the atlas RTV.
-		// The DP writes to the currently bound render target (see xrt_display_processor_d3d11.h).
-		comp_d3d11_target_bind(c->target);
+		// #868: publish what the repaint thread needs to replay this weave.
+		// Armed only off the zero-copy path — there the atlas IS the app's own
+		// swapchain image, which it reacquires and overwrites.
+		c->repaint.canvas = eff_canvas;
+		c->repaint.eye_pos = eye_pos;
+		c->repaint.armed = !zero_copy;
+		c->repaint.zero_copy = zero_copy;
+		c->repaint.zc_srv = zc_srv;
 
-		void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
-
-		// #542: the DP gets the frame's EFFECTIVE content layout — the grid
-		// the passes above actually painted (== the mode layout for matched
-		// submissions) — not the mode layout.
-		uint32_t view_width = c->eff_layout.tile_w;
-		uint32_t view_height = c->eff_layout.tile_h;
-		uint32_t tile_columns = c->eff_layout.cols;
-		uint32_t tile_rows = c->eff_layout.rows;
-
-		// Crop the renderer's atlas to content dims before passing to the DP;
-		// never crop a zero-copy atlas — the app's swapchain is already a
-		// complete, correctly-strided multi-view atlas, and a top-left crop to
-		// the window-scaled width would slice the tiles and weave them
-		// misaligned (big disparity). See the offscreen path above (#431).
-		uint32_t content_w = tile_columns * view_width;
-		uint32_t content_h = tile_rows * view_height;
-		if (!zero_copy) {
-			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
-		}
-
-		uint32_t target_width, target_height;
-		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
-
-		// #491 part 3 — flatten the 2D-under layers PRE-weave and hand them to
-		// the DP (it composites `backdrop over captured-desktop` under the 3D).
-		// The flatten binds/unbinds its own RTV, so re-bind the target RTV after
-		// (the DP writes to the currently bound target). NULL ⟹ no under-layers.
-		uint32_t bd_w = 0, bd_h = 0;
-		ID3D11ShaderResourceView *bd_srv =
-		    d3d11_flatten_backdrop_2d(c, target_width, target_height, &bd_w, &bd_h);
-		xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv, bd_w, bd_h);
-		if (bd_srv != nullptr) {
-			comp_d3d11_target_bind(c->target);
-		}
-
-		// Late-weave pacing + weave-latency harness mark (env-gated no-ops).
-		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns);
-
-		// Timing feedback: hand the DP last frame's MEASURED weave→scanout
-		// residual so the vendor eye predictor runs with an exact horizon
-		// (0 = unknown ⟹ DP falls back to its heuristic).
+		// #875 DEPOSIT: resolve the mask and flatten the Local2D layers while
+		// the app still owns the swapchain images they read. The weave below —
+		// and every repaint after it — then composite from compositor-owned
+		// state alone, so both produce the same pixels by construction.
 		{
-			const uint64_t wl_measured = comp_d3d11_target_get_measured_weave_ns(c->target);
-			static bool wl_logged = false;
-			if (!wl_logged && wl_measured > 0) {
-				wl_logged = true;
-				U_LOG_W("Weave timing feedback engaged: measured=%llu us, period=%llu us",
-				        (unsigned long long)(wl_measured / 1000),
-				        (unsigned long long)((uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate) / 1000));
-			}
-			xrt_display_processor_d3d11_set_frame_timing(
-			    c->display_processor, wl_measured,
-			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+			uint32_t dep_w = 0, dep_h = 0;
+			comp_d3d11_target_get_dimensions(c->target, &dep_w, &dep_h);
+			ID3D11Texture2D *dep_bb =
+			    static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
+			d3d11_composite_zone_mask(c, /*is_repaint=*/false, /*prepare_only=*/true, dep_bb, dep_w,
+			                          dep_h, &eff_canvas);
 		}
 
-		xrt_display_processor_d3d11_process_atlas(
-		    c->display_processor, c->context, atlas_srv, view_width, view_height,
-		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
-		    eff_canvas.valid ? eff_canvas.x : 0,
-		    eff_canvas.valid ? eff_canvas.y : 0,
-		    eff_canvas.valid ? eff_canvas.w : 0,
-		    eff_canvas.valid ? eff_canvas.h : 0);
-
-		// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or a
-		// Local2D layer composites the 2D/3D regions of the DXGI back buffer.
-		// The downstream CopyResource/CopySubresourceRegion (line ~1500)
-		// propagates the composite into c->shared_texture for _texture-mode
-		// read-back. No-op when the frame carries neither.
-		ID3D11Texture2D *back_buffer_2d = static_cast<ID3D11Texture2D *>(
-		    comp_d3d11_target_get_back_buffer(c->target));
-		d3d11_composite_zone_mask(c, back_buffer_2d, target_width, target_height, &eff_canvas);
-
-		weaving_done = true;
+		weaving_done = d3d11_dp_weave(c, false);
 	}
 
 	// HUD overlay (post-processing, always readable)
@@ -2065,6 +2683,14 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
+	// #868: join the repaint loop FIRST — it touches the device context, the
+	// target and the display processor under c->mutex, so it must be stopped
+	// before any of that is torn down, not merely signalled.
+	c->repaint_quit.store(true);
+	if (c->repaint_thread.joinable()) {
+		c->repaint_thread.join();
+	}
+
 	U_LOG_I("Destroying D3D11 compositor");
 
 	u_capture_dims_set_provider(NULL, c);
@@ -2125,6 +2751,13 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	if (c->dxgi_factory != nullptr) {
 		c->dxgi_factory->Release();
+	}
+
+	// #868: released after the repaint thread has been joined (above), so no
+	// replay can still be inside Enter()/Leave().
+	if (c->mt_lock != nullptr) {
+		c->mt_lock->Release();
+		c->mt_lock = nullptr;
 	}
 
 	if (c->context != nullptr) {
@@ -2231,12 +2864,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Enable D3D11 multithread protection for cross-thread window/compositor access.
 	// The HWND lives on a dedicated window thread while D3D11 rendering happens here.
 	HRESULT hr;
+	c->mt_lock = nullptr;
 	{
 		ID3D10Multithread *mt = nullptr;
 		hr = c->device->QueryInterface(__uuidof(ID3D10Multithread), (void **)&mt);
 		if (SUCCEEDED(hr) && mt != nullptr) {
 			mt->SetMultithreadProtected(TRUE);
-			mt->Release();
+			// #868: kept (not released) — the repaint thread needs
+			// Enter()/Leave() to make its weave sequence atomic against the
+			// app's own use of this same immediate context.
+			c->mt_lock = mt;
 			U_LOG_W("D3D11 multithread protection enabled");
 		}
 	}
@@ -2362,6 +2999,71 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	if (c->target != nullptr) {
 		comp_d3d11_target_set_display_period(
 		    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+	}
+
+	/*
+	 * #868: the repaint loop, ON by default (DXR_WEAVE_REPAINT=0 disables).
+	 *
+	 * Hardware-verified on D3D11 as well as D3D12. Getting here took two fixes
+	 * that the frame-path hash probe (DXR_WEAVE_REPAINT_HASH=1) localised only
+	 * once a mean-luminance classifier split the mismatches into the two
+	 * populations they actually contained — a repaint weaving with FRESHER
+	 * EYES differs by design and is the feature, whereas ~19% of them were
+	 * coming out fully BLACK, which is the flicker:
+	 *
+	 *   1. The replay skipped comp_d3d11_target_acquire, which is what CLEARS
+	 *      the FLIP_DISCARD back buffer. App frames started from black,
+	 *      repaints started from discarded garbage.
+	 *   2. The replay ran unserialised against the APP's immediate context.
+	 *      See mt_lock — SetMultithreadProtected only protects individual
+	 *      calls, and a weave is a sequence.
+	 *
+	 * Measured after both: adjacent repaints reproduce the app frame 1320/1320
+	 * with zero black frames, against 500/1320 before.
+	 */
+	{
+		/*
+		 * OPT-IN on D3D11 (DXR_WEAVE_REPAINT=1) — see runtime#876.
+		 *
+		 * The repaint is correct on the handle cube but has an intermittent,
+		 * visible defect on zones apps: roughly once every 10 s a zone blinks,
+		 * sometimes as a black frame and sometimes as a doubled/zoomed cube.
+		 * It is repaint-caused (0 occurrences with the loop off, measured and
+		 * eyeballed both ways) and the cause is NOT yet found — three
+		 * detectors, each blind to the artefact in a different way, and four
+		 * hypotheses eliminated. Details and what has been ruled out are on
+		 * #876.
+		 *
+		 * A visible artefact is worse than a stale interlace, so this stays off
+		 * by default until the cause is understood. D3D12 and VK are verified
+		 * and remain default-ON.
+		 */
+		/*
+		 * Default ON again (DXR_WEAVE_REPAINT=0 disables), matching D3D12/VK.
+		 *
+		 * The opt-in was based on #876, which turned out NOT to be a repaint
+		 * bug at all: the zones test app's GetAsyncKeyState hotkeys are
+		 * GLOBAL, and another session typing 'o'/'m' anywhere on the box was
+		 * genuinely moving zone B onto zone A (the "double cube") and
+		 * republishing the wish mask (the black transients). Reproduced on
+		 * demand with injected keypresses; identical with the repaint
+		 * disabled (134 vs 141 dropouts). The app is now focus-gated and the
+		 * repaint exonerated.
+		 */
+		const char *e = getenv("DXR_WEAVE_REPAINT");
+		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
+		const char *he = getenv("DXR_WEAVE_REPAINT_HASH");
+		c->repaint.hash_probe = (he != nullptr && he[0] == '1') ? 1 : 0;
+		if (c->repaint.force == 1) {
+			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
+			        "rate. Correctness probe; it WILL cost frame rate.");
+		}
+		if (c->repaint.enabled == 1 && c->target != nullptr) {
+			c->repaint_quit.store(false);
+			c->repaint_thread = std::thread(d3d11_repaint_thread, c);
+		}
 	}
 
 	// Determine view dimensions for the atlas texture.
@@ -3091,9 +3793,25 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 
 	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
 	             c->wish_mask_h != h || c->wish_rect_count != rect_count;
+	/*
+	 * #876 diag: NAME the condition that tripped. Mid-run re-rasters correlate
+	 * 1:1 with the dropout bursts, but every logged re-raster shows identical
+	 * inputs ("2 zone rect(s), 1280x720") — so WHICH term goes dirty is the
+	 * question, and guessing has been wrong five times on this bug.
+	 */
+	if (dirty && c->wish_mask_tex != nullptr) {
+		U_LOG_W("#876 wish dirty: srv_null=%d w %u!=%u h %u!=%u count %u!=%u",
+		        (int)(c->wish_mask_staged_srv == nullptr), c->wish_mask_w, w, c->wish_mask_h, h,
+		        c->wish_rect_count, rect_count);
+	}
 	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
 		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
 			dirty = true;
+			U_LOG_W("#876 wish dirty: rect[%u] %d,%d %ux%u -> %d,%d %ux%u", i,
+			        c->wish_rects[i].offset.w, c->wish_rects[i].offset.h,
+			        c->wish_rects[i].extent.w, c->wish_rects[i].extent.h,
+			        rects[i].offset.w, rects[i].offset.h,
+			        rects[i].extent.w, rects[i].extent.h);
 		}
 	}
 	if (!dirty) {
@@ -3421,6 +4139,10 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 			c->context->CopyResource(fw->staged, fw->tex);
 		}
 		if (c->frame_wish_last != fw || c->frame_wish_last_seq != fw->author_seq) {
+			U_LOG_W("#876 wish seq: EXPLICIT bump (fw %p->%p author_seq %llu->%llu)",
+			        (void *)c->frame_wish_last, (void *)fw,
+			        (unsigned long long)c->frame_wish_last_seq,
+			        (unsigned long long)fw->author_seq);
 			c->zone_publish_seq++;
 			c->frame_wish_last = fw;
 			c->frame_wish_last_seq = fw->author_seq;
@@ -3431,6 +4153,7 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 	// Source flip explicit -> auto: even an unchanged auto raster is new
 	// content at the DP.
 	if (c->frame_wish_last != nullptr) {
+		U_LOG_W("#876 wish seq: EXPLICIT->AUTO flip bump (fw_last %p)", (void *)c->frame_wish_last);
 		c->frame_wish_last = nullptr;
 		c->zone_publish_seq++;
 	}
@@ -3643,6 +4366,8 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 // authority.
 static bool
 d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
+                          bool is_repaint,
+                          bool prepare_only,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
@@ -3659,8 +4384,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if ((!zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
+	if (is_repaint && c->repaint.mask_srv == nullptr) {
+		c->repaint.composite_bail = 1;
+		return false;
+	}
+	if ((!is_repaint && !zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
 	    c->renderer == nullptr) {
+		c->repaint.composite_bail = 2;
 		return false;
 	}
 
@@ -3704,7 +4434,15 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// mask from the OVER Local2D layer rects (Q3 — M=0 inside the rect
 	// union, M=1 elsewhere).
 	ID3D11ShaderResourceView *mask_srv = nullptr;
-	if (zones_frame) {
+	if (is_repaint) {
+		// #868: a repaint replays RENDERING, never STATE TRANSITIONS.
+		// d3d11_update_implicit_mask() rasters and republishes; the zones
+		// branch reads a wish staged once per app frame by
+		// d3d11_update_zone_wish_state(). Driving either at panel rate ticks a
+		// once-per-app-frame machine out of band with the post-present sideband
+		// publish that only layer_commit performs.
+		mask_srv = c->repaint.mask_srv;
+	} else if (zones_frame) {
 		mask_srv = c->wish_mask_staged_srv;
 
 		struct xrt_rect zrects[XRT_MAX_LAYERS];
@@ -3745,7 +4483,11 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		mask_srv = d3d11_update_implicit_mask(c, rects, rect_count, region_w, region_h);
 	}
 	if (mask_srv == nullptr) {
+		c->repaint.composite_bail = 3;
 		return false;
+	}
+	if (!is_repaint) {
+		c->repaint.mask_srv = mask_srv;
 	}
 
 	// Resolve the `twod` source + a window-sized weave snapshot scratch.
@@ -3759,20 +4501,51 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		if (!d3d11_ensure_rt_srv_scratch(c, &c->local2d_scratch, &c->local2d_scratch_srv,
 		                                 &c->local2d_scratch_rtv, region_w, region_h, unorm_fmt,
 		                                 "local2d scratch")) {
+			c->repaint.composite_bail = 4;
 			return false;
 		}
 		if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h,
 		                              unorm_fmt, "local2d weave")) {
+			c->repaint.composite_bail = 5;
 			return false;
 		}
 		// Zones frame: flatten ALL Local2D layers (no under/over split —
 		// 2D-under is reserved in v1); with zero Local2D layers this is a
 		// clear-only flatten and MODE_ZONES writes M·weave (zone interior)
 		// over transparent — pixels outside every zone present alpha 0.
-		if (!d3d11_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
-			return false;
+		/*
+		 * #868: a repaint must NOT re-run this. d3d11_flatten_local_2d_layers
+		 * samples the APP'S OWN Local2D swapchain images, and by the time a
+		 * repaint runs the app has reacquired them and may be drawing its next
+		 * frame into them — the same hazard that keeps repaints off the
+		 * zero-copy atlas. local2d_scratch is compositor-owned and still holds
+		 * the last app frame's flatten, which is what a repaint wants.
+		 *
+		 * Getting this wrong on the D3D12 leg produced a 2D region that
+		 * differed between an app weave and its repaint, alternating on screen
+		 * as a flicker confined to semi-transparent content.
+		 */
+		if (!is_repaint) {
+			if (!d3d11_flatten_local_2d_layers(c, region_w, region_h,
+			                                   zones_frame ? -1 : proj_idx)) {
+				return false;
+			}
 		}
 		twod_srv = c->local2d_scratch_srv;
+		/*
+		 * #875: DEPOSIT half ends here. Everything above reads app-owned
+		 * resources (the Local2D layer swapchain images) or ticks per-frame
+		 * state; everything below only touches compositor-owned scratch and the
+		 * render target. dst is still passed in during prepare because the
+		 * scratch formats derive from the target's format — prepare reads that
+		 * descriptor but never writes the target. (On the D3D12 leg, stubbing
+		 * the descriptor out instead requested DXGI_FORMAT_UNKNOWN and silently
+		 * swallowed the 2D.)
+		 */
+		if (prepare_only) {
+			c->repaint.composite_bail = 0; // deposit half completed
+			return true;
+		}
 	} else {
 		// Unreachable: the early-out gate already returns false unless one of
 		// zones_frame / have_local_2d / have_explicit is set. Defensive only.
@@ -3838,6 +4611,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			        zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"), composite_mode);
 		}
 	}
+	// #876 diag: 0 = composited, 6 = the draw itself failed.
+	c->repaint.composite_bail = (xret == XRT_SUCCESS) ? 0 : 6;
 	return xret == XRT_SUCCESS;
 }
 

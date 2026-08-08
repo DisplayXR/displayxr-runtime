@@ -319,6 +319,10 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    (void *)next->device,
 	    next->queueFamilyIndex,
 	    next->queueIndex,
+	    // #868: a queue the runtime owns exclusively, when vulkan_enable2 let us
+	    // ask for one. -1 = none, and the repaint stays off (see oxr_vulkan.c).
+	    sess->sys->vulkan_runtime_queue_family,
+	    sess->sys->vulkan_runtime_queue_index,
 	    dp_factory_vk, shared_texture_handle,
 	    transparent_background,
 	    display_screen_left, display_screen_top,

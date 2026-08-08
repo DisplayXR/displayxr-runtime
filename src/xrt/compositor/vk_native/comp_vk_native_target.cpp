@@ -17,6 +17,7 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/comp_late_weave_lookahead.h"
+#include "os/os_time.h"
 
 #include <cstring>
 #include <cstdio>
@@ -1747,6 +1748,85 @@ wl_teardown(struct comp_vk_native_target *target)
 #endif // XRT_OS_WINDOWS
 
 void
+comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * Deliberately NOT the app-frame mark. A repaint updates only
+	 * weave_mark_qpc (so the harness can still timestamp this weave's own
+	 * scanout) and leaves last_mark_qpc, wait_frame_qpc, interval_ema_ns and
+	 * wait_to_weave_ema_ns alone — those describe the APP's cadence, and a
+	 * repaint is not an app frame.
+	 */
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	target->weave_mark_qpc = (uint64_t)now.QuadPart;
+	struct wl_harness *wl = wl_get(target);
+	if (wl != nullptr) {
+		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+	}
+#else
+	(void)target;
+#endif
+}
+
+void
+comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * Scanout-only pacing. See the header for why this must never wait on an
+	 * acquire/frame-latency token. When present_wait is unavailable (Intel
+	 * iGPUs expose no VK present-timing extensions) there is nothing to wait
+	 * on and the repaint thread's own sleep does the pacing.
+	 */
+	PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
+	if (wait_fn == nullptr || target->last_present_id == 0) {
+		return;
+	}
+	wait_fn(target->vk->device, target->swapchain, target->last_present_id, 100ull * 1000 * 1000);
+
+	/*
+	 * LATE-weave, not early-weave.
+	 *
+	 * The wait above returns just after the PREVIOUS frame hit glass, which is
+	 * the START of a refresh period — weaving there would sample the eyes a
+	 * whole period before the pixels are actually scanned out, i.e. the
+	 * staleness this feature exists to remove.
+	 *
+	 * The next scanout is one period away, and `measured_r_ns` is how long a
+	 * weave takes to reach glass. So the last safe moment to begin is
+	 * period - R. Sleeping that much converts the repaint from "as early as
+	 * possible" to "as late as still lands", which is the whole point of
+	 * decoupling weave rate from render rate: the eye position used is the
+	 * freshest one that can still make the frame.
+	 *
+	 * Clamped hard. With no measurement yet (R = 0) we would sleep a full
+	 * period and miss the frame entirely, so a floor of a quarter period is
+	 * kept in hand, and anything that would not fit simply weaves immediately.
+	 * A repaint that arrives late is a dropped repaint; a repaint that arrives
+	 * early is merely stale. Never gamble the frame.
+	 */
+	const double period_ns = target->period_hint_ns;
+	const double residual_ns = (double)target->measured_r_ns;
+	if (period_ns <= 0.0 || residual_ns <= 0.0) {
+		return; // unmeasured — weave now rather than guess
+	}
+	double slack_ns = period_ns - residual_ns;
+	const double floor_ns = period_ns * 0.25; // never cut it finer than this
+	if (slack_ns > period_ns - floor_ns) {
+		slack_ns = period_ns - floor_ns;
+	}
+	if (slack_ns <= 0.0) {
+		return; // the weave already fills the period; go now
+	}
+	os_nanosleep((int64_t)slack_ns);
+#else
+	(void)target;
+#endif
+}
+
+void
 comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 {
 #ifdef XRT_OS_WINDOWS
@@ -1838,7 +1918,7 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 }
 
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index)
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -2008,15 +2088,18 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	    .pWaitSemaphores = &target->image_available,
 	    .pWaitDstStageMask = &wait_stage,
 	};
-	vk->vkQueueSubmit(vk->main_queue->queue, 1, &wait_submit, VK_NULL_HANDLE);
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	// #868: whichever queue the CALLER owns — the app frame uses the app's,
+	// a repaint uses the runtime-owned one. Never mix: a VkQueue is externally
+	// synchronised and the runtime cannot serialise the app's own submits.
+	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(queue);
 
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
 }
 
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target)
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -2053,7 +2136,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target)
 	}
 #endif
 
-	VkResult res = vk->vkQueuePresentKHR(vk->main_queue->queue, &present_info);
+	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {

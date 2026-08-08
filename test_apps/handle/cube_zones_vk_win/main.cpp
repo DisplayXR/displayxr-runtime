@@ -109,6 +109,19 @@ static DisplayZone g_zonesArr[kNumZones];
 // zone B right/shorter, with a gap between them.
 static const XrRect2Di kZoneARect = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect = {{700, 180}, {520, 360}};
+// Local2D strip along the top, mirroring cube_zones_d3d11_win / _gl_win. Without
+// a Local2D layer the composite runs with 0 layer(s) and MODE_ZONES writes
+// M*weave over a clear-only scratch, so the 2D band presents alpha 0 — it looked
+// like a runtime bug ("2D zone is transparent") when in fact this app simply
+// never submitted any 2D content.
+static const XrRect2Di kStripRect = {{0, 0}, {1280, 180}};
+
+// Always-on Local2D strip; filled once via a staging copy (static content).
+struct StripLayer {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+static StripLayer g_strip;
 
 // Zones activation: created a few frames in, once the session runs.
 static bool g_zonesActive = false;
@@ -399,6 +412,191 @@ static bool CreateZoneResources(XrSessionManager& xr, VkRenderer& renderer,
 
 // One-time zones activation: capabilities check + per-zone array swapchains.
 // On any failure the zones path is permanently disabled (empty-frame fallback).
+// One-shot host->device upload of the strip pixels. Vulkan has no
+// UpdateSubresource equivalent, so this is a host-visible staging buffer plus a
+// single-submit copy, with the layout transitions the copy requires.
+static bool UploadStripPixels(VkRenderer& renderer, VkImage image, uint32_t w, uint32_t h,
+                              const void* pixels, size_t size) {
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = (VkDeviceSize)size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(renderer.device, &bci, nullptr, &staging) != VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements req = {};
+    vkGetBufferMemoryRequirements(renderer.device, staging, &req);
+    VkPhysicalDeviceMemoryProperties mp = {};
+    vkGetPhysicalDeviceMemoryProperties(renderer.physicalDevice, &mp);
+    uint32_t typeIndex = UINT32_MAX;
+    const VkMemoryPropertyFlags want =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if ((req.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) {
+            typeIndex = i;
+            break;
+        }
+    }
+    if (typeIndex == UINT32_MAX) {
+        vkDestroyBuffer(renderer.device, staging, nullptr);
+        return false;
+    }
+
+    VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = typeIndex;
+    if (vkAllocateMemory(renderer.device, &mai, nullptr, &stagingMem) != VK_SUCCESS) {
+        vkDestroyBuffer(renderer.device, staging, nullptr);
+        return false;
+    }
+    vkBindBufferMemory(renderer.device, staging, stagingMem, 0);
+
+    void* mapped = nullptr;
+    if (vkMapMemory(renderer.device, stagingMem, 0, (VkDeviceSize)size, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(renderer.device, stagingMem, nullptr);
+        vkDestroyBuffer(renderer.device, staging, nullptr);
+        return false;
+    }
+    memcpy(mapped, pixels, size);
+    vkUnmapMemory(renderer.device, stagingMem);
+
+    VkCommandBufferAllocateInfo cai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = renderer.commandPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool ok = vkAllocateCommandBuffers(renderer.device, &cai, &cmd) == VK_SUCCESS;
+    if (ok) {
+        VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &cbi);
+
+        VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image = image;
+        toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // The runtime samples this as a normal layer image afterwards.
+        VkImageMemoryBarrier toRead = toDst;
+        toRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &toRead);
+
+        vkEndCommandBuffer(cmd);
+
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        ok = vkQueueSubmit(renderer.graphicsQueue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS;
+        if (ok) {
+            vkQueueWaitIdle(renderer.graphicsQueue);
+        }
+        vkFreeCommandBuffers(renderer.device, renderer.commandPool, 1, &cmd);
+    }
+
+    vkFreeMemory(renderer.device, stagingMem, nullptr);
+    vkDestroyBuffer(renderer.device, staging, nullptr);
+    return ok;
+}
+
+// Create the always-on Local2D strip swapchain and fill it once. Vulkan has no
+// UpdateSubresource, so the CPU pattern goes through a host-visible staging
+// buffer and a one-shot vkCmdCopyBufferToImage. Same visual as the D3D11/GL
+// zones apps: a grey checkerboard with an amber label band, so a capture reads
+// "this is the 2D strip" at a glance.
+static bool CreateStripLayer(XrSessionManager& xr, VkRenderer& renderer, VkFormat colorFormat) {
+    const uint32_t w = (uint32_t)kStripRect.extent.width;
+    const uint32_t h = (uint32_t)kStripRect.extent.height;
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = (int64_t)colorFormat;
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_strip.swapchain))) {
+        LOG_ERROR("[zones] strip: xrCreateSwapchain failed (%ux%u)", w, h);
+        return false;
+    }
+    g_strip.w = w;
+    g_strip.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_strip.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_strip.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("[zones] strip: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(g_strip.swapchain, &ai, &idx))) {
+        LOG_ERROR("[zones] strip: xrAcquireSwapchainImage failed");
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_strip.swapchain, &wi);
+
+    // BGRA8 bytes, matching the D3D11 app's pattern.
+    const size_t stride = (size_t)w * 4;
+    std::vector<uint8_t> buf(stride * h);
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* row = buf.data() + (size_t)y * stride;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t* px = row + (size_t)x * 4; // B,G,R,A
+            const bool label = (x >= 40 && x < 360 && y >= 70 && y < 110);
+            if (label) {
+                px[0] = 0; px[1] = 170; px[2] = 255; px[3] = 255;
+            } else {
+                const bool check = (((x / 24) + (y / 24)) & 1) != 0;
+                const uint8_t v = check ? 210 : 60;
+                px[0] = v; px[1] = v; px[2] = v; px[3] = 255;
+            }
+        }
+    }
+
+    bool ok = UploadStripPixels(renderer, imgs[idx].image, w, h, buf.data(), buf.size());
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_strip.swapchain, &ri);
+
+    if (!ok) {
+        LOG_ERROR("[zones] strip: pixel upload failed");
+        return false;
+    }
+    LOG_INFO("[zones] strip: Local2D %d,%d %dx%d filled",
+             kStripRect.offset.x, kStripRect.offset.y, kStripRect.extent.width,
+             kStripRect.extent.height);
+    return true;
+}
+
 static void TryActivateZones(XrSessionManager& xr, VkRenderer& renderer, VkFormat colorFormat) {
     g_zonesAttempted = true;
 
@@ -446,6 +644,13 @@ static void TryActivateZones(XrSessionManager& xr, VkRenderer& renderer, VkForma
             g_hasDisplayZonesExt = false;
             return;
         }
+    }
+
+    // Local2D strip. Non-fatal: zones still work without it, the 2D band just
+    // has nothing to show (which is precisely the bug this fixes).
+    if (!CreateStripLayer(xr, renderer, colorFormat)) {
+        LOG_WARN("[zones] strip creation failed — the 2D band will be empty");
+        g_strip.swapchain = XR_NULL_HANDLE;
     }
 
     g_zonesActive = true;
@@ -613,7 +818,9 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
 
     // Layer list: [projA (zone A chained), projB (zone B chained)].
     XrCompositionLayerProjection projLayers[kNumZones];
-    const XrCompositionLayerBaseHeader* layers[kNumZones] = {};
+    // +1 for the Local2D strip.
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+    const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
@@ -626,6 +833,18 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
         projLayers[zi].viewCount = submitViewCounts[zi];
         projLayers[zi].views = projViews[zi].data();
         layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&projLayers[zi];
+    }
+
+    // The Local2D band. Without this the composite runs with 0 layer(s) and the
+    // 2D region presents alpha 0 — the "2D zone is transparent" symptom.
+    if (g_strip.swapchain != XR_NULL_HANDLE) {
+        stripLayer.layerFlags = 0; // opaque content
+        stripLayer.subImage.swapchain = g_strip.swapchain;
+        stripLayer.subImage.imageRect.offset = {0, 0};
+        stripLayer.subImage.imageRect.extent = {(int32_t)g_strip.w, (int32_t)g_strip.h};
+        stripLayer.subImage.imageArrayIndex = 0;
+        stripLayer.rect = kStripRect;
+        layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&stripLayer;
     }
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -752,10 +971,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    std::vector<const char*> deviceExtensions;
-    std::vector<std::string> extensionStorage;
-    if (!GetVulkanDeviceExtensions(xr, vkInstance, physDevice, deviceExtensions, extensionStorage)) {
-        LOG_ERROR("Failed to get Vulkan device extensions");
+    // vulkan_enable2: the RUNTIME creates the device and appends whatever
+    // device extensions and features it needs — including present_id /
+    // present_wait for late-weave pacing, and its own weaving queue (#868).
+    // xrGetVulkanDeviceExtensionsKHR is a vulkan_enable1 entry point and is not
+    // dispatchable here; calling it aborted startup before session creation.
+    if (false) {
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);
         ShutdownLogging();
@@ -773,7 +994,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     VkDevice vkDevice = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
-    if (!CreateVulkanDevice(physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
+    if (!CreateVulkanDevice(xr, physDevice, queueFamilyIndex, vkDevice, graphicsQueue)) {
         LOG_ERROR("Vulkan device creation failed");
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);

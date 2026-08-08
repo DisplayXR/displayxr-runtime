@@ -572,6 +572,89 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	modified_info.ppEnabledExtensionNames = u_string_list_get_data(device_extension_list);
 	modified_info.enabledExtensionCount = u_string_list_get_size(device_extension_list);
 
+	/*
+	 * #868: ask for ONE extra queue on the app's graphics family, for the
+	 * runtime's own use.
+	 *
+	 * A VkQueue is externally synchronised — the APPLICATION must serialise
+	 * access to it — so the runtime must never submit from a repaint thread on
+	 * a queue the app also submits to. Measured consequence of doing so:
+	 * VK_ERROR_DEVICE_LOST, with validation reporting
+	 * "UNASSIGNED-Threading-MultipleThreads-Write ... VkQueue is simultaneously
+	 * used in current thread A and thread B".
+	 *
+	 * We only get this lever under vulkan_enable2, where the runtime creates
+	 * the device and therefore owns VkDeviceCreateInfo. It is already rewritten
+	 * above for extensions; one more queue is the same kind of edit. Under
+	 * vulkan_enable1 the app creates the device and there is nothing to do —
+	 * the repaint simply stays off there.
+	 *
+	 * Strictly best-effort: if the family has no spare queue we leave the
+	 * request untouched rather than fail device creation over a nicety.
+	 */
+	VkDeviceQueueCreateInfo *mod_queues = NULL;
+	float *mod_prios = NULL;
+	sys->vulkan_runtime_queue_family = -1;
+	sys->vulkan_runtime_queue_index = -1;
+	{
+		PFN_vkGetPhysicalDeviceQueueFamilyProperties GetQFP =
+		    (PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetInstanceProcAddr(
+		        sys->vulkan_enable2_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+		const uint32_t qci_count = createInfo->vulkanCreateInfo->queueCreateInfoCount;
+		if (GetQFP != NULL && qci_count > 0) {
+			uint32_t fam_count = 0;
+			GetQFP(physical_device, &fam_count, NULL);
+			VkQueueFamilyProperties *fams =
+			    fam_count > 0 ? U_TYPED_ARRAY_CALLOC(VkQueueFamilyProperties, fam_count) : NULL;
+			if (fams != NULL) {
+				GetQFP(physical_device, &fam_count, fams);
+
+				mod_queues = U_TYPED_ARRAY_CALLOC(VkDeviceQueueCreateInfo, qci_count);
+				for (uint32_t i = 0; i < qci_count; i++) {
+					mod_queues[i] = createInfo->vulkanCreateInfo->pQueueCreateInfos[i];
+				}
+
+				for (uint32_t i = 0; i < qci_count; i++) {
+					const uint32_t fam = mod_queues[i].queueFamilyIndex;
+					if (fam >= fam_count ||
+					    (fams[fam].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) {
+						continue;
+					}
+					const uint32_t want = mod_queues[i].queueCount + 1;
+					if (want > fams[fam].queueCount) {
+						oxr_log(log,
+						        "#868: graphics family %u is saturated (%u/%u) — no "
+						        "runtime-owned queue, VK repaint stays disabled",
+						        fam, mod_queues[i].queueCount, fams[fam].queueCount);
+						break;
+					}
+					mod_prios = U_TYPED_ARRAY_CALLOC(float, want);
+					for (uint32_t q = 0; q < mod_queues[i].queueCount; q++) {
+						mod_prios[q] = mod_queues[i].pQueuePriorities != NULL
+						                   ? mod_queues[i].pQueuePriorities[q]
+						                   : 1.0f;
+					}
+					// Lower priority than the app's: the repaint must never
+					// out-schedule the frame it stands in for.
+					mod_prios[want - 1] = 0.5f;
+
+					sys->vulkan_runtime_queue_family = (int32_t)fam;
+					sys->vulkan_runtime_queue_index = (int32_t)mod_queues[i].queueCount;
+					mod_queues[i].queueCount = want;
+					mod_queues[i].pQueuePriorities = mod_prios;
+
+					modified_info.pQueueCreateInfos = mod_queues;
+					oxr_log(log,
+					        "#868: requesting a runtime-owned queue (family %u index %u) so "
+					        "the weave can run off the app's frame thread",
+					        fam, (uint32_t)sys->vulkan_runtime_queue_index);
+					break;
+				}
+				free(fams);
+			}
+		}
+	}
+
 #ifdef VK_KHR_timeline_semaphore
 	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore = {
 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
@@ -633,6 +716,14 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 
 	*vulkanResult = CreateDevice(physical_device, &modified_info, createInfo->vulkanAllocator, vulkanDevice);
 
+	// #868: the rewritten queue arrays are only read by CreateDevice above.
+	// If creation failed there is no runtime-owned queue to speak of.
+	if (*vulkanResult != VK_SUCCESS) {
+		sys->vulkan_runtime_queue_family = -1;
+		sys->vulkan_runtime_queue_index = -1;
+	}
+	free(mod_queues);
+	free(mod_prios);
 
 	// Logging
 	{

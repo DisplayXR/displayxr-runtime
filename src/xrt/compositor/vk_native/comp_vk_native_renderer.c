@@ -373,7 +373,26 @@ cmd_image_barrier(struct vk_bundle *vk,
 	        .baseMipLevel = 0,
 	        .levelCount = 1,
 	        .baseArrayLayer = 0,
-	        .layerCount = 1,
+	        /*
+	         * ALL array layers, not just layer 0 (#879).
+	         *
+	         * A LAYERED zone/projection swapchain puts the eyes in array layers
+	         * of ONE VkImage (ADR-032). The zone transition loop dedupes its
+	         * barriers by VkImage — correctly, since re-transitioning the same
+	         * subresource would declare a wrong oldLayout — so with layerCount=1
+	         * only layer 0 ever moved to SHADER_READ_ONLY. Layer 1 stayed in
+	         * COLOR_ATTACHMENT_OPTIMAL and was then sampled, which validation
+	         * reports as exactly:
+	         *
+	         *   VUID-vkCmdDraw-None-09600 ... (arrayLayer = 1) to be in layout
+	         *   ... instead, current layout is VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+	         *
+	         * plus a matching VkImageMemoryBarrier-oldLayout-01197 on the way
+	         * back. Covering the whole image keeps the dedupe correct AND leaves
+	         * every layer in the layout the sampler was promised. Non-layered
+	         * images have exactly one layer, so this is a no-op for them.
+	         */
+	        .layerCount = VK_REMAINING_ARRAY_LAYERS,
 	    },
 	};
 

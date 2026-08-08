@@ -52,8 +52,10 @@ struct weave_latency_log
 		//! be (os_monotonic ns — QPC-derived, so directly comparable to
 		//! the scanout below). 0 = the caller did not supply one.
 		uint64_t predicted_ns;
+		bool repaint; //!< #868: this weave had no app frame behind it
 	};
 	uint64_t pending_predicted_ns = 0; // armed by mark_weave, consumed by after_present
+	bool pending_repaint = false;      // #868: this weave re-wove an unchanged atlas
 	pending ring[8] = {};
 	int ring_head = 0;
 	int ring_count = 0;
@@ -93,13 +95,14 @@ struct weave_latency_log
 	//! for this frame (0 if unknown); it is differenced against the frame's
 	//! true scanout in after_present to expose prediction error (#867).
 	void
-	mark_weave(const char *site, uint64_t predicted_display_time_ns = 0)
+	mark_weave(const char *site, uint64_t predicted_display_time_ns = 0, bool repaint = false)
 	{
 		(void)on(site);
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		qpc_weave = (uint64_t)now.QuadPart;
 		pending_predicted_ns = predicted_display_time_ns;
+		pending_repaint = repaint;
 	}
 
 	void
@@ -404,17 +407,21 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 
 		if (qpc_weave != 0) {
 			// Track for the timing loop.
-			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns};
+			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns, pending_repaint};
 			ring_head = (ring_head + 1) % 8;
 			if (ring_count < 8) {
 				ring_count++;
 			}
 			if (csv) {
-				fprintf(f, "F,%llu,%llu,%llu,%u\n", (unsigned long long)seq++,
+				// #868: trailing field marks a repaint (re-weave of an
+				// unchanged atlas) so the two present populations can be
+				// counted apart. Older readers ignore the extra column.
+				fprintf(f, "F,%llu,%llu,%llu,%u,%d\n", (unsigned long long)seq++,
 				        (unsigned long long)qpc_weave, (unsigned long long)now.QuadPart,
-				        present_count);
+				        present_count, pending_repaint ? 1 : 0);
 			}
 			qpc_weave = 0;
+			pending_repaint = false;
 		}
 
 		DXGI_FRAME_STATISTICS stats = {};
@@ -427,9 +434,34 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 				int idx = (ring_head - 1 - i + 16) % 8;
 				if (ring[idx].present_count != 0 && ring[idx].present_count <= stats.PresentCount &&
 				    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].qpc) {
-					measured_r_ns = (uint64_t)(
-					    (double)((uint64_t)stats.SyncQPCTime.QuadPart - ring[idx].qpc) *
-					    1000000000.0 / (double)freq());
+					/*
+					 * #868: only an APP weave updates the residual the
+					 * display processor is handed via set_frame_timing.
+					 *
+					 * A repaint's weave→scanout is a real measurement, but
+					 * it belongs to a different population — repaints pace
+					 * to one panel period while app frames sit at the
+					 * governor's depth. Letting both feed one value makes
+					 * it alternate; the vendor eye predictor then
+					 * extrapolates to a different horizon on alternate
+					 * frames, and an IDENTICAL atlas weaves to different
+					 * interlace. That is the flicker.
+					 *
+					 * Measured on cube_handle_d3d11_win with forced
+					 * repaints: adjacent repaints reproduced the app frame
+					 * 23/1080 with repaints feeding this, and 909/960 with
+					 * the residual held to app frames only.
+					 *
+					 * The same rule already governs the saturation EMA and
+					 * the #867 prediction ledger — this was the one ledger
+					 * repaints were still polluting.
+					 */
+					if (!ring[idx].repaint) {
+						measured_r_ns =
+						    (uint64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
+						                        ring[idx].qpc) *
+						               1000000000.0 / (double)freq());
+					}
 					// #867: xrWaitFrame's promise vs this frame's real
 					// photon time. os_monotonic_get_ns() is QPC scaled
 					// to ns on Windows, so the two share an origin and

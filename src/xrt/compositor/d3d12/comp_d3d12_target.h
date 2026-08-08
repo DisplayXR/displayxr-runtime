@@ -78,6 +78,31 @@ void
 comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns);
 
 /*!
+ * #868: pace a repaint to the panel — the wait half of
+ * @ref comp_d3d12_target_weave_mark, split out so it can run WITHOUT the
+ * compositor lock held.
+ *
+ * This blocks for up to ~3 panel periods. Doing it under the lock would let a
+ * repaint stall an arriving app frame for that long; doing it here means the
+ * lock only covers the record+submit+present, and it is also what limits the
+ * repaint loop to panel rate.
+ */
+void
+comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target);
+
+/*!
+ * #868: the repaint counterpart of @ref comp_d3d12_target_weave_mark — stamps
+ * T_weave and nothing else.
+ *
+ * A repaint carries no app frame, so it is kept out of the saturation
+ * governor's frame-interval EMA and out of the #867 prediction ledger. Call
+ * this (never the plain weave_mark) when re-weaving an unchanged atlas; pacing
+ * is @ref comp_d3d12_target_repaint_pace, called earlier and unlocked.
+ */
+void
+comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target);
+
+/*!
  * Note that xrWaitFrame just returned, so the span to this frame's weave can
  * be measured (#867).
  */

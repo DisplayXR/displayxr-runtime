@@ -91,7 +91,7 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr);
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index);
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue);
 
 /*!
  * Present the rendered image.
@@ -103,7 +103,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target);
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue);
 
 /*!
  * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the
@@ -111,6 +111,29 @@ comp_vk_native_target_present(struct comp_vk_native_target *target);
  */
 void
 comp_vk_native_target_weave_mark(struct comp_vk_native_target *target);
+
+/*!
+ * #868: repaint counterpart of @ref comp_vk_native_target_weave_mark.
+ *
+ * Stamps only what the weave→scanout harness needs, staying out of the #867
+ * frame-cost EMA, the wait_frame→weave lookahead and the residual handed to
+ * the display processor. A repaint is not an app frame, and letting one into
+ * those averages corrupts the eye-prediction horizon — measured on D3D11,
+ * where it dropped the residual's agreement with reality from 93% to 2%.
+ */
+void
+comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target);
+
+/*!
+ * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock.
+ *
+ * Waits on scanout only, never on a frame-latency/acquire token: those are
+ * semaphores, and a non-presenting thread consuming one starves the app's own
+ * frame loop (measured on D3D12: 31.9 -> 16.9 fps with essentially zero
+ * repaints issued).
+ */
+void
+comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target);
 
 /*!
  * Measured weave→scanout residual of the last completed frame in ns (0 =

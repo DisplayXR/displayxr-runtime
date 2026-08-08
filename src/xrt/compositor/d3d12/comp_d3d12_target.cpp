@@ -629,6 +629,50 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	*target_ptr = nullptr;
 }
 
+/*!
+ * #868 repaint mark: pace to the panel exactly like a real frame, but leave the
+ * governor and the #867 prediction ledger alone.
+ *
+ * A repaint re-weaves an unchanged atlas against fresh eye positions. It has no
+ * app frame behind it, so:
+ *  - it must NOT feed @ref late_weave_governor::on_mark — repaints land one
+ *    panel period apart by construction, so counting them would collapse the
+ *    saturation EMA and tell the governor a starved pipeline is keeping up.
+ *  - it must NOT carry a predicted display time — xrWaitFrame never promised a
+ *    photon time for this present, so there is no prediction to score against
+ *    it (0 suppresses the D row).
+ *
+ * The scanout pacing wait IS kept: a repaint that outran the panel would be
+ * wasted work, and the wait is what makes the repaint cadence self-limiting.
+ */
+extern "C" void
+comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target)
+{
+	if (target->frame_latency_waitable != nullptr) {
+		// Deliberately NOT WaitForSingleObject(frame_latency_waitable) — the
+		// waitable is a SEMAPHORE, and every wait consumes a token that the
+		// app's own layer_commit needs. A repaint thread waiting on it throttles
+		// the app to roughly half rate even on the ticks where the repaint then
+		// bails out and never presents (measured: 31.9 -> 16.9 fps on the Unity
+		// avatar with essentially zero repaints actually issued).
+		//
+		// Scanout pacing alone is enough here, and costs nothing: it only reads
+		// DXGI frame statistics until the previous present has flipped.
+		const UINT relax = (UINT)(g_lw_gov_d3d12.effective - 1);
+		if (target->last_present_count > relax) {
+			late_weave_wait_scanout(target->swapchain, target->last_present_count - relax,
+			                        g_lw_gov_d3d12.period_ns, g_weave_latency_d3d12.freq());
+		}
+	}
+}
+
+extern "C" void
+comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target)
+{
+	(void)target;
+	g_weave_latency_d3d12.mark_weave("d3d12", 0, true);
+}
+
 extern "C" void
 comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns)
 {
