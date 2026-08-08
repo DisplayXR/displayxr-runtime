@@ -351,6 +351,20 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	// we add is_vk_native_compositor for consistency
 	sess->is_vk_native_compositor = true;
 
+	/*
+	 * #886: the #868 repaint needs a queue the runtime owns, which only exists
+	 * when vulkan_enable2 let the runtime create the VkDevice. Under enable1
+	 * the app owns the device and the repaint silently stays off — name the
+	 * consequence once so this is discoverable rather than silent. (The
+	 * enable2-but-family-saturated case logs its own line in oxr_vulkan.c.)
+	 */
+	if (sess->sys->vulkan_runtime_queue_family < 0 && !sys->inst->extensions.KHR_vulkan_enable2) {
+		U_LOG_W("#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
+		        "the runtime has no queue of its own and weave rate cannot be decoupled from render "
+		        "rate (#868 repaint disabled). Port the app to XR_KHR_vulkan_enable2 "
+		        "(xrCreateVulkanDeviceKHR).");
+	}
+
 	// Native compositor is always visible and focused
 	sess->compositor_visible = true;
 	sess->compositor_focused = true;
