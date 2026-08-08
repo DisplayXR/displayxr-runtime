@@ -1800,6 +1800,60 @@ gl_flatten_backdrop_2d(struct comp_gl_compositor *c, uint32_t dst_w, uint32_t ds
                        uint32_t *out_h);
 
 /*!
+ * #894 — offer the DP this frame's timing horizon, immediately before every
+ * weave. GL was the only backend that never did this, so the vendor eye
+ * predictor ran on whatever it pinned at init while D3D11/D3D12/VK each fed it
+ * a measured horizon (see `xrt_plugin_iface.md` § "Frame-timing inputs are an
+ * offer"). That gap mattered once the #868 repaint went default-ON here: weave
+ * rate is now deliberately decoupled from render rate, which is exactly when a
+ * pinned horizon is wrong.
+ *
+ * `weave_to_scanout_ns = 0` is deliberate and means "unknown — keep your own
+ * heuristic". GL genuinely cannot measure weave→scanout on this path: there is
+ * no DXGI `GetFrameStatistics` and no `VK_KHR_present_wait`, only `DwmFlush()`
+ * pacing, and DWM *pickup* is several refreshes before glass — reporting it as
+ * scanout would hand the predictor a confidently wrong number, which is worse
+ * than none. `DwmGetCompositionTimingInfo()` (`cFrameDisplayed` /
+ * `qpcFrameDisplayed`) is the DWM analogue of DXGI frame statistics and is the
+ * named upgrade path in #894; it would also give GL real late-weave pacing.
+ *
+ * The panel period IS exact, and it is the half that corrects the DP's
+ * hardcoded 60 Hz display term — the constant part of the additive
+ * motion-to-photon model (`N_buffered × frame_interval + T_display`), wrong by
+ * construction on any non-60 Hz panel.
+ */
+static void
+gl_offer_frame_timing(struct comp_gl_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return;
+	}
+
+	uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / 60.0);
+#ifdef XRT_OS_WINDOWS
+	// EnumDisplaySettings is a syscall and this runs per weave — cache it,
+	// mirroring the wait_frame path's cache in this file.
+	static float cached_hz = 0.0f;
+	if (cached_hz == 0.0f) {
+		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		cached_hz = (hz > 1.0f) ? hz : 60.0f;
+	}
+	period_ns = (uint64_t)(U_TIME_1S_IN_NS / cached_hz);
+#endif
+
+	xrt_display_processor_gl_set_frame_timing(c->display_processor, /* weave_to_scanout_ns */ 0,
+	                                          period_ns);
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("#894: offering the DP a frame-timing horizon (panel period %.2f ms; "
+		        "weave→scanout unmeasured on GL — DP keeps its own residual heuristic)",
+		        (double)period_ns / 1e6);
+	}
+}
+
+/*!
  * Crop the valid content region from the (potentially oversized) atlas texture
  * and pass it to the display processor. If the atlas exactly matches the
  * content dimensions, the atlas is passed directly (no copy).
@@ -1912,6 +1966,9 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 		}
 	}
 #endif
+
+	// #894: hand the DP its horizon before the weave that consumes it.
+	gl_offer_frame_timing(c);
 
 	// Pass (possibly cropped) texture to DP. Canvas params are always 0 — the
 	// DP weaves the full client window (sub-rects are expressed as 3D zones now).
@@ -2640,6 +2697,10 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 		dp_tex = c->dp_input_texture;
 	}
+
+	// #894: hand the DP its horizon before the weave that consumes it — the
+	// masked-composite path weaves through here instead of gl_crop_and_process_dp.
+	gl_offer_frame_timing(c);
 
 	// Canvas params are always 0 — the DP weaves the full client window.
 	glBindFramebuffer(GL_FRAMEBUFFER, target_fbo);
