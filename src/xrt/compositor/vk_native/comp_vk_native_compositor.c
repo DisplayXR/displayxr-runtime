@@ -2857,6 +2857,22 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 		uint64_t target_image, target_view;
 		comp_vk_native_target_get_current_image(c->target, &target_image, &target_view);
+		{
+			// #879: name the images WE own, so the VkImage handle in a validation
+			// error can be ATTRIBUTED rather than assumed. The same correlation
+			// identified the queue in #868, and the assumption that
+			// oldLayout-01197 concerns the TARGET has never been checked — the
+			// render pass the DP actually exposes ends in PRESENT_SRC_KHR, so the
+			// runtime's assumption may well be right and the offending image
+			// something else entirely.
+			static int img_logged = 0;
+			if (img_logged < 3) {
+				img_logged++;
+				U_LOG_W("#879: target image=%p weave_scratch=%p local2d_scratch=%p",
+				        (void *)(uintptr_t)target_image, (void *)c->weave_scratch,
+				        (void *)c->local2d_scratch);
+			}
+		}
 
 		// Display processor weaving path: record interlacing commands
 		// into our command buffer using a framebuffer from our target.
