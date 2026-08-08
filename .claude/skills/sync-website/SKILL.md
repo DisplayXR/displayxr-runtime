@@ -1,6 +1,6 @@
 ---
 name: sync-website
-description: Editorial sync pass for the displayxr-website — driven from the displayxr-runtime hub. The mechanical facts (versions, demo cards, repo list, extension names) are auto-synced by the website's sync-org.yml; THIS skill handles the class-B narrative that needs judgment — surfacing new ADRs, new repos, new extensions, new demos, and closed milestones, then authoring the matching roadmap / architecture / ecosystem prose into the website's hand-written TSX and opening a PR. Use when a release or milestone has landed and the site's prose has fallen behind.
+description: Editorial sync pass for the displayxr-website — driven from the displayxr-runtime hub. The mechanical facts (versions, demo cards, repo list, extension names) are auto-synced by the website's sync-org.yml; THIS skill handles the class-B narrative that needs judgment — surfacing new ADRs, new repos, new extensions, new demos, and closed milestones, deciding which shipped releases are news-worthy and writing the homepage "What's New" feed, then authoring the matching roadmap / architecture / ecosystem prose into the website's hand-written TSX and opening a PR. Use when a release or milestone has landed and the site's prose has fallen behind.
 ---
 
 # sync-website — editorial drift pass for displayxr.org
@@ -15,21 +15,24 @@ The DisplayXR website is kept in sync with the org by a **two-layer** system
   icons) from `versions.json` and the GitHub API, and **direct-commit to the
   website's `main`** on a daily cron / on `org-changed` dispatch after any
   release. Versions, demo cards, the repo list, and extension *names* take care
-  of themselves. Do not duplicate that here.
+  of themselves. Do not duplicate that here. It also writes
+  `generated/news-candidates.json` — the raw "a release happened" list that
+  feeds §2.6 below — but it never decides what is news.
 
 - **Editorial layer (THIS skill).** The narrative that needs a human's judgment:
   roadmap phrasing, architecture prose, ecosystem blurbs, extension
-  titles/descriptions, device copy. The generator can *detect* that these inputs
-  changed (new ADR, new repo, new extension header, new demo, closed milestone)
-  but must never auto-write them. This skill reads the new sources and authors
-  tasteful prose into the **hand-written** TSX, then opens a **PR** — because
-  prose warrants a glance, unlike the mechanical facts.
+  titles/descriptions, device copy, **and the homepage "What's New" feed**. The
+  generator can *detect* that these inputs changed (new ADR, new repo, new
+  extension header, new demo, closed milestone, new release) but must never
+  auto-write them. This skill reads the new sources and authors tasteful prose
+  into the **hand-written** TSX, then opens a **PR** — because prose warrants a
+  glance, unlike the mechanical facts.
 
 **Mechanical commit = facts (direct to main). Skill PR = narrative.** They never
 touch the same fields: the skill edits authored TSX (`lib/data/roadmap.ts`,
-`lib/data/ecosystem.ts`, `lib/constants.ts`, `app/architecture/page.tsx`,
-`app/extensions/page.tsx`, `lib/data/devices.ts`, `app/contribute/page.tsx`) and
-**never** the `lib/data/generated/*.json` files.
+`lib/data/ecosystem.ts`, `lib/data/news.ts`, `lib/constants.ts`,
+`app/architecture/page.tsx`, `app/extensions/page.tsx`, `lib/data/devices.ts`,
+`app/contribute/page.tsx`) and **never** the `lib/data/generated/*.json` files.
 
 ### Site IA note (persona-led, since the 2026-06 overhaul)
 The site is organized around three audiences. Two facts matter for editorial
@@ -56,7 +59,7 @@ invocable from anywhere. It operates on a **fresh temp clone** of
 
   --dry-run   detect + report the editorial gaps, change nothing, open no PR.
   focus       optional: narrow to one surface — roadmap | architecture |
-              ecosystem | extensions | devices. Omit to scan all.
+              ecosystem | extensions | devices | news. Omit to scan all.
 ```
 
 Examples:
@@ -64,7 +67,11 @@ Examples:
 /sync-website                  # full scan → author prose → open PR
 /sync-website --dry-run        # just tell me what's drifted
 /sync-website architecture     # only reconcile new ADRs into /architecture
+/sync-website news             # only triage new releases into the What's New feed
 ```
+
+`news` is the highest-cadence focus — run it after any release batch, even when
+nothing else has drifted.
 
 This skill makes **outward-facing changes** (opens a PR, pushes a branch). The
 `--dry-run` form is safe and read-only — prefer it first if you're unsure what
@@ -116,14 +123,20 @@ on every run. To make ADR detection converge, this skill keeps a hand-owned
 
 ```bash
 BASE=lib/data/editorial-baseline.json   # NOT generator-owned; this skill owns it
-[ -f "$BASE" ] || echo '{"reviewedAdrs":[]}' > "$BASE"
-jq -r '.reviewedAdrs[]' "$BASE" 2>/dev/null | sort > /tmp/sw_adr_base.txt
+[ -f "$BASE" ] || echo '{"reviewedAdrs":[],"reviewedNewsCandidates":[]}' > "$BASE"
+jq -r '.reviewedAdrs[]'            "$BASE" 2>/dev/null | sort > /tmp/sw_adr_base.txt
+jq -r '.reviewedNewsCandidates[]?' "$BASE" 2>/dev/null | sort > /tmp/sw_news_base.txt
 ```
 
 First run: the baseline is empty, so the whole ADR backlog is "new" — that's the
 intended one-time reconciliation. After PHASE 3 you write every triaged ADR back
 into the baseline (whether you surfaced it or skipped it), so subsequent runs see
 only the delta.
+
+**Release candidates converge the same way** — for the same reason. Most releases
+are *not* news, so "is this release in `news.ts`" is false for the overwhelming
+majority and would re-flag the whole history every run. `reviewedNewsCandidates`
+records every `<repo>@<tag>` you triaged, surfaced or skipped.
 
 ---
 
@@ -192,7 +205,58 @@ gh api 'repos/DisplayXR/displayxr-runtime/milestones?state=closed&per_page=20' \
 A milestone closed since the last roadmap edit may mean a "Now"/"Next" item
 should move to "Done". Judgment call — surface the candidates.
 
-### 2.6 Build the gap report
+### 2.6 New releases → the "What's New" feed
+
+The homepage ticker and `/news` both render `lib/data/news.ts` (authored). The
+generator writes every recent release to `generated/news-candidates.json` with
+the bullet lines it found under a *Highlights / Features / What's New / Added*
+heading — so a candidate carrying `featureLines` is one that *claims* new
+capability. `looksMechanical: true` means the notes had no feature section at
+all, which is the common case.
+
+```bash
+CAND=lib/data/generated/news-candidates.json
+# Untriaged candidates, richest first. looksMechanical ones are listed after,
+# so you can skim them — occasionally a real feature ships with lazy notes.
+jq -r --slurpfile b <(jq '[.reviewedNewsCandidates[]?]' lib/data/editorial-baseline.json) '
+  [.[] | select(.id as $i | ($b[0] | index($i)) | not)]
+  | sort_by(.looksMechanical, (.date | explode | map(-.)))
+  | .[] | "\(if .looksMechanical then "·" else "★" end) \(.id)  \(.date)\n    \(.title)\n\(.featureLines | map("      - " + .) | join("\n"))"
+' "$CAND"
+
+# What the feed already says, so you never double-post a story.
+grep -nE '^\s+(id|date|headline|href):' lib/data/news.ts
+```
+
+**The news-worthiness rubric.** Apply it to every untriaged candidate. The test:
+*can you state it as a capability that did not exist last month, in ten words or
+fewer, without a version number?* If the sentence collapses to "we shipped a
+build", it is not news.
+
+| Verdict | What qualifies |
+|---|---|
+| `tier: "banner"` | **First-of-kind.** A new OS or platform · a new graphics API · a new engine · a new vendor (display *or* input) · a new product surface (browser, gallery, SDK) · a new input class · a standards/Khronos milestone · a headline capability users can name. |
+| `tier: "list"` | Real but incremental — a named feature inside an existing surface · a new demo or sample · a distribution milestone that reaches a new audience (a package manager, a new installer target) · a broad compatibility unlock. |
+| **skip** | Version bumps with no named feature · bundle/meta-installer releases · ABI bumps · patch releases · CI, refactors, docs, test infrastructure · bug fixes (unless the fix *is* the unlock, e.g. "every graphics API now works on iGPU laptops"). |
+
+Judgment notes that keep the feed credible:
+
+- **One story, one entry.** A release that lands three separate first-of-kind
+  things gets three entries (each with its own `id`, all pointing at that
+  release); a story that dribbles across four releases gets **one** entry, dated
+  when it became usable. Never post the same story twice under new versions.
+- **Vendor names are allowed when the vendor is the news** — a new display or
+  input vendor onboarding, a new tracking source. A vendor's own version bump is
+  not news. The homepage's *own prose* stays vendor-neutral (website CLAUDE.md);
+  a factual news item naming a vendor does not violate that.
+- **Prereleases and preview builds can be news** (the browser preview is), but
+  say so in the blurb — "preview", "ahead of GA" — rather than implying GA.
+- **Don't date it "today".** `date` is when it became true for a user: the
+  release's `date` field, or the upstream merge date for a standards item.
+- **When the pool is thin, resist promoting filler to `banner`.** The ticker
+  renders nothing when nothing qualifies, and that is the correct outcome.
+
+### 2.7 Build the gap report
 Collect all `MISSING*` lines + milestone/ADR candidates into a structured list.
 If `--dry-run`, print this report (PHASE 5 format) and **STOP** — clone can be
 deleted, no branch, no PR.
@@ -212,24 +276,50 @@ structure. Concrete mapping:
 | New extension | `app/extensions/page.tsx` | An `Extension` entry: `name`, human `title`, 1–2 sentence `description` derived from the header comment, `status`, `group`. |
 | New device | `lib/data/devices.ts` | A `Device` entry — only when the user supplies the hardware (not auto-discoverable). |
 | Closed milestone | `lib/data/roadmap.ts` | Move the matching item to the `done` phase, or add a `done` entry; trim the corresponding `now`/`next` item. |
+| News-worthy release (§2.6) | `lib/data/news.ts` | A `NewsItem` **prepended** to `NEWS` (the array is newest-first). See the writing rules below. |
+
+**Writing a `NewsItem`.** The file's header comment is the contract; the craft is
+in the two strings:
+
+- `headline` — **≤ 60 characters**, benefit-first, no version number, no repo
+  name, sentence case. It is read in a pill on the hero, so it must survive
+  being the only thing someone reads. Write the *outcome*, not the mechanism:
+  "Eye-position latency down to one display refresh", not "Late-weave
+  presentation pacing on every present path". "Motion controllers, from any
+  tracking source", not "Input-provider plug-in channel (ADR-034)".
+- `blurb` — one sentence, `/news` only. This is where the mechanism, the numbers,
+  and the caveat go. Concrete beats grand: cite the measured figure, name the
+  APIs, say "preview" if it is one.
+- `id` — a stable slug describing the *story*, not the release
+  (`input-provider-plugins`, not `runtime-v2-3-0`). Never recycle one; it is the
+  `/news` anchor.
+- `href` — the most durable destination: a spec or ADR for a capability, the
+  release for a feature set, the upstream PR for a standards item.
+- Do **not** set `pinnedUntil` unless the user asks — expiry is meant to be
+  automatic.
 
 Rules:
 - **Never** edit `lib/data/generated/*.json` or anything under `public/demos|engines/`.
 - If the generator wrote changes to `generated/*`/`public/` in PHASE 1, `git
   checkout -- lib/data/generated public` before committing so the PR is
   prose-only (the mechanical workflow owns those files).
-- **Update the baseline.** Append every ADR you triaged this run — both the ones
-  you surfaced AND the ones you deliberately skipped — to
-  `lib/data/editorial-baseline.json`'s `reviewedAdrs`, so they don't re-flag next
-  run. (Repos/extensions need no baseline — their grep checks self-correct.)
+- **Update the baseline.** Append every ADR *and* every release candidate you
+  triaged this run — both the ones you surfaced AND the ones you deliberately
+  skipped — to `lib/data/editorial-baseline.json`'s `reviewedAdrs` /
+  `reviewedNewsCandidates`, so they don't re-flag next run. (Repos/extensions
+  need no baseline — their grep checks self-correct.)
 - One coherent commit; conventional-commit message.
 
 ```bash
 # Write every ADR you triaged this run (surfaced + skipped), one path per line,
-# to /tmp/sw_triaged.txt — then fold into the reviewed baseline. (File-based, so
-# no bash-4 `mapfile` dependency.)
-jq --argjson new "$(jq -R . /tmp/sw_triaged.txt | jq -s .)" \
-   '.reviewedAdrs = (.reviewedAdrs + $new | unique)' \
+# to /tmp/sw_triaged.txt, and every release candidate id (<repo>@<tag>) to
+# /tmp/sw_news_triaged.txt — then fold both into the reviewed baseline.
+# (File-based, so no bash-4 `mapfile` dependency.)
+touch /tmp/sw_triaged.txt /tmp/sw_news_triaged.txt
+jq --argjson adrs "$(jq -R . /tmp/sw_triaged.txt      | jq -s 'map(select(. != ""))')" \
+   --argjson news "$(jq -R . /tmp/sw_news_triaged.txt | jq -s 'map(select(. != ""))')" \
+   '.reviewedAdrs            = ((.reviewedAdrs // [])            + $adrs | unique)
+  | .reviewedNewsCandidates  = ((.reviewedNewsCandidates // [])  + $news | unique)' \
    lib/data/editorial-baseline.json > /tmp/base.json && mv /tmp/base.json lib/data/editorial-baseline.json
 
 git checkout -- lib/data/generated public 2>/dev/null || true   # keep PR prose-only
@@ -281,14 +371,17 @@ The website auto-deploys on merge (Vercel). Editorial PRs are **not** auto-merge
 ```
 /sync-website  [DRY RUN | PR #NNN]
 
-Scanned: ADRs · repos · extensions · demos · milestones
+Scanned: ADRs · repos · extensions · demos · milestones · releases
 Gaps found:
   • architecture — ADR-021 (displayxr-runtime) → summarized in §Compositors
   • ecosystem    — displayxr-foo → added card (category: tools)
   • extensions   — XR_EXT_bar → added card (group: display)
+  • news         — runtime@v2.3.0 → 2 banner items (input providers, CTS in CI)
+                   browser@preview-0.1.7 → 1 banner item
 Skipped (judgment):
   • ADR-019 — internal vendor-isolation rule, not user-facing
   • displayxr-unity-test-2d-ui — test fork, not featured
+  • runtime@v2.4.1, installer@v2.0.14 (+9 more) — patch/bundle, no new capability
 Result: PR https://github.com/DisplayXR/displayxr-website/pull/NNN  (or "no gaps — site current")
 ```
 
@@ -300,12 +393,21 @@ Clean up the temp clone (`rm -rf "$WORK"`) when done.
 
 - **Cadence.** Run after a milestone closes or a batch of releases lands — not on
   every patch. The mechanical layer already keeps versions/demos live; prose
-  drifts on a slower clock.
-- **Detection source of truth.** `_meta.json.signals` is the generator's
-  deterministic snapshot (no timestamp). Repos/extensions/demos self-correct
-  against the authored TSX (grep), so they need no state; ADRs converge against
-  this skill's own `lib/data/editorial-baseline.json` reviewed-set. The skill
-  re-runs the generator first only as a safety net to freshen the snapshot.
+  drifts on a slower clock. **`/sync-website news` is the exception** — it is
+  cheap and worth running after every release batch, because the feed's value is
+  its freshness. Skipping everything is a valid outcome.
+- **Detection source of truth.** `_meta.json.signals` + `news-candidates.json`
+  are the generator's deterministic snapshots (no timestamps). Repos, extensions
+  and demos self-correct against the authored TSX (grep), so they need no state;
+  ADRs and release candidates converge against this skill's own
+  `lib/data/editorial-baseline.json` reviewed-sets. The skill re-runs the
+  generator first only as a safety net to freshen the snapshot.
+- **The feed ages itself out.** `getBannerNews()` drops banner items older than
+  `BANNER_MAX_AGE_DAYS` (90) and caps the ticker at `BANNER_MAX_ITEMS` (4), so
+  nothing has to be pruned by hand and an empty pool hides the ticker entirely.
+  The homepage is statically generated, so the *rendered* pool only refreshes on
+  a rebuild — which the mechanical sync's daily direct-commit to `main` already
+  triggers.
 - **Don't over-add.** Most internal ADRs and many repos should NOT appear on a
   marketing site. The skill's value is in the *judgment* of what to surface; when
   in doubt, list it under "Skipped" and let the user decide.
