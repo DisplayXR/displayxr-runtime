@@ -3319,10 +3319,21 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			        (unsigned)output_fmt, (void *)c->target);
 
 			// Forward session-level transparency (#573 — chroma-key-free).
-			// client_presents=false: the in-process present is opaque, so the
-			// DP owns see-through (compose-under-bg from the atlas alpha).
+			// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE.
+			// On the default transparent path the target is a DComp
+			// PREMULTIPLIED swapchain and DWM blends the live desktop into our
+			// alpha=0 holes — precisely the client_presents=true contract in
+			// xrt_display_processor_d3d12.h. Passing false made the DP ALSO
+			// compose-under-bg: a WGC desktop capture baked ~1 frame stale and
+			// then discarded by the post-weave alpha gate. Wasted work, the
+			// documented frame of lag in the blend band, and WGC delivery is
+			// charged to dwm at the desktop's change rate. Mirrors
+			// use_transparent in comp_d3d12_target.
+			const bool runtime_transparent_present =
+			    transparent_background && c->hwnd != nullptr &&
+			    !debug_get_bool_option_present_opaque_comp();
 			xrt_display_processor_d3d12_set_transparent_background(
-			    c->display_processor, transparent_background, false);
+			    c->display_processor, transparent_background, runtime_transparent_present);
 
 			// #68: tell the DP whether the app self-presents only the canvas
 			// (texture app) vs the runtime presenting the full target (handle).
