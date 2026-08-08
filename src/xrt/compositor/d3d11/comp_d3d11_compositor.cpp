@@ -385,6 +385,11 @@ struct comp_d3d11_compositor
 		uint64_t last_app_frame_ns;
 		uint64_t count, ticks;
 
+		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
+		//! repaint. armed = not armed / app mid-submission; gate = app still
+		//! making rate; race = an app frame landed while we paced.
+		uint64_t bail_armed, bail_gate, bail_race;
+
 		//! DXR_WEAVE_REPAINT_HASH=1 adjacent-pair probe.
 		int hash_probe;
 		uint64_t app_hash, app_seq, hash_seq;
@@ -2029,10 +2034,12 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		c->repaint.ticks++;
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			c->repaint.bail_armed++;
 			continue;
 		}
 		if (c->repaint.force != 1 &&
 		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+			c->repaint.bail_gate++;
 			continue;
 		}
 
@@ -2045,9 +2052,11 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// exercise the feature, it corrupts the frame.
 		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr) {
+			c->repaint.bail_armed++;
 			continue;
 		}
 		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			c->repaint.bail_race++;
 			continue;
 		}
 
@@ -2095,6 +2104,15 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			U_LOG_W("#868: repainting last atlas at %.1f Hz while the app is between frames "
 			        "(set DXR_WEAVE_REPAINT=0 to disable)",
 			        hz);
+		}
+		// #887 periodic counters: apps are usually killed rather than shut
+		// down cleanly, so a destroy-time dump alone is rarely seen.
+		if ((c->repaint.count % 240) == 0) {
+			U_LOG_W("#868: repaints=%llu ticks=%llu bail{armed=%llu gate=%llu race=%llu}",
+			        (unsigned long long)c->repaint.count, (unsigned long long)c->repaint.ticks,
+			        (unsigned long long)c->repaint.bail_armed,
+			        (unsigned long long)c->repaint.bail_gate,
+			        (unsigned long long)c->repaint.bail_race);
 		}
 	}
 }
@@ -2689,6 +2707,12 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	c->repaint_quit.store(true);
 	if (c->repaint_thread.joinable()) {
 		c->repaint_thread.join();
+	}
+	if (c->repaint.ticks > 0) {
+		U_LOG_W("#868: repaints=%llu ticks=%llu bail{armed=%llu gate=%llu race=%llu}",
+		        (unsigned long long)c->repaint.count, (unsigned long long)c->repaint.ticks,
+		        (unsigned long long)c->repaint.bail_armed, (unsigned long long)c->repaint.bail_gate,
+		        (unsigned long long)c->repaint.bail_race);
 	}
 
 	U_LOG_I("Destroying D3D11 compositor");
