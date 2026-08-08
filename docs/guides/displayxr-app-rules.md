@@ -399,10 +399,18 @@ its own content by definition, so there is no full-window backer. Reference apps
   test apps stay on the legacy path deliberately** — it can never be deleted (third-party apps),
   so it keeps regression coverage. Ref: `displayxr-common#23`.
 
-- **INV-5.9 — VK apps use `XR_KHR_vulkan_enable2` (preferred), or enable
-  `VK_KHR_present_id`/`present_wait` themselves under enable1.** The runtime's late-weave pacing
-  (default-on) vsync-locks the weave by waiting on the previous present hitting glass via
-  `vkWaitForPresentKHR` — measured 95.8 → 16.6 ms of weave→scanout eye staleness on this path.
+- **INV-5.9 — VK apps MUST use `XR_KHR_vulkan_enable2`.** Two runtime features hang off who
+  creates the `VkDevice`, and both are lost under enable1:
+  - **Weave-rate decoupling (#868) is enable2-only, full stop.** The repaint needs a `VkQueue`
+    the runtime owns exclusively, which it obtains by requesting one extra graphics-family
+    queue **at device creation** (`xrCreateVulkanDeviceKHR`). An enable1 app creates its own
+    device, no runtime queue can exist, and the repaint silently stays off — the app weaves at
+    its render rate no matter how far that falls below panel rate. The runtime logs a one-shot
+    `#886:` WARN at session create naming this.
+  - **Late-weave pacing** (default-on) vsync-locks the weave by waiting on the previous present
+    hitting glass via `vkWaitForPresentKHR` — measured 95.8 → 16.6 ms of weave→scanout eye
+    staleness. Under enable1 this survives only if the app enables
+    `VK_KHR_present_id`/`present_wait` itself.
   The features must be enabled by whoever creates the `VkDevice`:
   - **enable2 (preferred)**: the app calls `xrCreateVulkanInstanceKHR` /
     `xrGetVulkanGraphicsDevice2KHR` / `xrCreateVulkanDeviceKHR` and the **runtime** enables the
@@ -418,12 +426,12 @@ its own content by definition, so there is no full-window backer. Reference apps
   `PresentWaitFeatures` token anywhere in the app (enable2 apps have no `vkCreateDevice` call, so
   they pass by construction).
 
-  **This is an accuracy feature, not a dependency.** Enabling the features lets the runtime pace
-  presentation and hand the display processor a measured frame horizon; a display processor that
-  ignores that input renders exactly as before, and a driver that does not expose the extensions is
-  simply not asked for them. So there is no display that this rule is *required* for and none that
-  it can break — follow it because a display which does predict viewer position will track the
-  viewer better, not because anything fails otherwise. The plug-in side of that contract:
+  **Nothing errors under enable1 — that is the trap.** Both losses are silent degradations
+  (staler eyes, weave locked to render rate), not failures, which is exactly why enable1 keeps
+  looking acceptable until a heavy scene meets a fast panel. A display processor that ignores
+  the timing inputs renders exactly as before, and a driver that does not expose the extensions
+  is simply not asked for them — so enable2 costs nothing where it cannot help. The plug-in side
+  of that contract:
   [`xrt_plugin_iface.md` § Frame-timing inputs are an offer](../reference/xrt_plugin_iface.md).
 
 ---
