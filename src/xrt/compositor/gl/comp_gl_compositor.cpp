@@ -1285,11 +1285,31 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 
+	/*
+	 * #885 root cause: this claim of the compositor context was UNLOCKED and
+	 * UNCHECKED. A WGL context can be current on one thread at a time, and the
+	 * #868 repaint thread claims c->hglrc every tick — zones apps create their
+	 * zone/strip swapchains seconds into the session, so on a coin-flip of
+	 * launches a create landed while the repaint held the context, the
+	 * wglMakeCurrent below failed SILENTLY, and the swapchain textures were
+	 * created on whatever context was current on the app thread — invisible to
+	 * the compositor forever (that zone weaves black from the first frame).
+	 * Serialize with the repaint via c->mutex (the repaint holds it across its
+	 * claim..release) and check the claim.
+	 */
+	os_mutex_lock(&c->mutex);
+
 	// Ensure compositor's GL context is current for texture creation
 #ifdef XRT_OS_WINDOWS
 	HDC prev_hdc = wglGetCurrentDC();
 	HGLRC prev_hglrc = wglGetCurrentContext();
-	wglMakeCurrent(c->hdc, c->hglrc);
+	if (!wglMakeCurrent(c->hdc, c->hglrc)) {
+		os_mutex_unlock(&c->mutex);
+		U_LOG_W("create_swapchain: wglMakeCurrent(compositor ctx) FAILED (err=%lu) — "
+		        "refusing to create swapchain textures on the wrong context",
+		        (unsigned long)GetLastError());
+		return XRT_ERROR_ALLOCATION;
+	}
 #elif defined(__APPLE__)
 	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
 	comp_gl_window_macos_make_current(c->macos_window);
@@ -1381,6 +1401,8 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 		CGLSetCurrentContext(prev_cgl_ctx);
 	}
 #endif
+
+	os_mutex_unlock(&c->mutex);
 
 	return XRT_SUCCESS;
 }
@@ -2563,6 +2585,57 @@ gl_dp_weave_to_fbo(struct comp_gl_compositor *c, GLuint atlas_tex, GLuint target
 		                       0);
 		glBlitFramebuffer(0, 0, content_w, content_h, 0, 0, content_w, content_h, GL_COLOR_BUFFER_BIT,
 		                  GL_NEAREST);
+
+		/*
+		 * #885 diag (DXR_WEAVE_REPAINT_DIAG=1): the plug-in-side probes show
+		 * the DP receives an EMPTY dp_input on the repaint thread from its 3rd
+		 * call onward, while the app thread's stays correct. Probe THIS blit:
+		 * per-thread few-shot — READ-fbo status, blit GL error, a texel of the
+		 * SOURCE atlas and of the DEST dp_input at the same spot the plug-in
+		 * reads black. Names whether the source is already empty on this
+		 * thread or the blit drops the pixels.
+		 */
+		{
+			static int diag = -1;
+			if (diag < 0) {
+				const char *e = getenv("DXR_WEAVE_REPAINT_DIAG");
+				diag = (e != NULL && e[0] == '1') ? 1 : 0;
+			}
+			if (diag == 1) {
+#ifdef XRT_OS_WINDOWS
+				static DWORD s_tid[2] = {0, 0};
+				static ULONGLONG s_last_ms[2] = {0, 0};
+				DWORD tid = GetCurrentThreadId();
+				int slot = -1;
+				for (int i = 0; i < 2; i++) {
+					if (s_tid[i] == tid) { slot = i; break; }
+					if (s_tid[i] == 0) { s_tid[i] = tid; slot = i; break; }
+				}
+				ULONGLONG now_ms = GetTickCount64();
+				if (slot >= 0 && now_ms - s_last_ms[slot] >= 2000) {
+					s_last_ms[slot] = now_ms;
+					GLenum blit_err = glGetError();
+					// w/4 keeps the texel inside zone A content across modes — the
+				// tile CENTRE sits on zone A right edge in 4-view tiles.
+				GLint tx = (GLint)(eff_tile_w / 4), ty = (GLint)(eff_tile_h / 2);
+					uint8_t src_px[4] = {0}, dst_px[4] = {0};
+					// READ fbo still has the atlas attached.
+					GLenum rd_status = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+					glReadPixels(tx, ty, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, src_px);
+					glBindFramebuffer(GL_READ_FRAMEBUFFER, c->dp_crop_fbo);
+					glReadPixels(tx, ty, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, dst_px);
+					glBindFramebuffer(GL_READ_FRAMEBUFFER, c->fbo);
+					U_LOG_W("#885 crop diag tid=%lu atlas_tex=%u dp_input=%u rd_status=0x%x "
+					        "blit_err=0x%x src(%d,%d)=(%u,%u,%u,%u) dst=(%u,%u,%u,%u)",
+					        (unsigned long)tid, atlas_tex, c->dp_input_texture,
+					        (unsigned)rd_status, (unsigned)blit_err, tx, ty, src_px[0],
+					        src_px[1], src_px[2], src_px[3], dst_px[0], dst_px[1], dst_px[2],
+					        dst_px[3]);
+				}
+#endif
+			}
+		}
+
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 		dp_tex = c->dp_input_texture;
