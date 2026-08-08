@@ -13,6 +13,8 @@
 #include "util/u_logging.h"
 #include "util/u_debug.h"
 
+#include "os/os_time.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d11_4.h>
@@ -431,6 +433,36 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
 			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
 		}
 	}
+
+	/*
+	 * #884: LATE-weave, not early-weave (ported from comp_vk_native_target).
+	 *
+	 * The scanout wait above returns just after the PREVIOUS frame hit glass
+	 * — the START of a refresh period. Weaving there samples the eyes a whole
+	 * period before the pixels are scanned out, which is exactly the staleness
+	 * the repaint exists to remove. The next scanout is one period away and
+	 * measured_r_ns is how long a weave takes to reach glass, so the last safe
+	 * moment to begin is period - R.
+	 *
+	 * Clamped hard: a quarter-period floor is always kept in hand, and with no
+	 * measurement yet (R = 0) we weave immediately rather than guess. A repaint
+	 * that arrives late is a dropped repaint; an early one is merely stale —
+	 * never gamble the frame.
+	 */
+	const double period_ns = g_lw_gov_d3d11.period_ns;
+	const double residual_ns = (double)g_weave_latency_d3d11.measured_r_ns;
+	if (period_ns <= 0.0 || residual_ns <= 0.0) {
+		return; // unmeasured — weave now rather than guess
+	}
+	double slack_ns = period_ns - residual_ns;
+	const double floor_ns = period_ns * 0.25; // never cut it finer than this
+	if (slack_ns > period_ns - floor_ns) {
+		slack_ns = period_ns - floor_ns;
+	}
+	if (slack_ns <= 0.0) {
+		return; // the weave already fills the period; go now
+	}
+	os_nanosleep((int64_t)slack_ns);
 }
 
 /*!
