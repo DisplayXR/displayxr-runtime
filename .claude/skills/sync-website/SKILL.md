@@ -297,6 +297,16 @@ in the two strings:
   release for a feature set, the upstream PR for a standards item.
 - Do **not** set `pinnedUntil` unless the user asks — expiry is meant to be
   automatic.
+- **`priority` is for landmarks, and almost never yours to set.** The ticker
+  sorts by `priority` desc then date, so `priority: 1` lets an item outrank
+  fresher news. Reserve it for something whose importance outlives the week it
+  shipped in — a standards-body registration, a first vendor, a license change.
+  The bar: *would this still belong on the homepage a month from now, when four
+  newer things have shipped?* If the honest answer is "no", leave it unset.
+  Default to unset and say in the PR body that you considered it; a field every
+  item claims is a field that ranks nothing. It reorders the **ticker only** —
+  it does not extend the freshness window (`pinnedUntil` does that) and does not
+  touch `/news`, which stays strictly chronological.
 
 Rules:
 - **Never** edit `lib/data/generated/*.json` or anything under `public/demos|engines/`.
