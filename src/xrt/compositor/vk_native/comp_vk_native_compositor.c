@@ -912,9 +912,44 @@ import_shared_d3d11_texture(struct comp_vk_native_compositor *c, void *shared_ha
 	VkPhysicalDeviceMemoryProperties mem_props;
 	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
 
+	/*
+	 * #879: an IMPORT must pick its memoryTypeIndex from
+	 * VkMemoryWin32HandlePropertiesKHR::memoryTypeBits — the plain image
+	 * requirements alone chose index 0 where the handle's legal set differed
+	 * (VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645). Both constraints
+	 * apply, so intersect; fall back to the image bits if the proc is
+	 * unavailable.
+	 */
+	uint32_t import_legal_bits = requirements.memoryTypeBits;
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+	/*
+	 * Resolved LOCALLY, not via vk_bundle: the bundle struct crosses the
+	 * plug-in ABI boundary (the DP factory receives &c->vk), so adding a slot
+	 * mid-struct is an ADR-020 break — and vk_init_from_given loads the
+	 * external-memory procs conditionally anyway.
+	 */
+	PFN_vkGetMemoryWin32HandlePropertiesKHR get_handle_props =
+	    (PFN_vkGetMemoryWin32HandlePropertiesKHR)vk->vkGetDeviceProcAddr(
+	        vk->device, "vkGetMemoryWin32HandlePropertiesKHR");
+	if (get_handle_props != NULL) {
+		VkMemoryWin32HandlePropertiesKHR hp = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+		};
+		if (get_handle_props(vk->device,
+		                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+		                     (HANDLE)shared_handle, &hp) == VK_SUCCESS &&
+		    hp.memoryTypeBits != 0) {
+			import_legal_bits = hp.memoryTypeBits & requirements.memoryTypeBits;
+			if (import_legal_bits == 0) {
+				import_legal_bits = hp.memoryTypeBits;
+			}
+		}
+	}
+#endif
+
 	uint32_t memory_type_index = UINT32_MAX;
 	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
-		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
+		if ((import_legal_bits & (1u << i)) != 0) {
 			memory_type_index = i;
 			break;
 		}
