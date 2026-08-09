@@ -17,7 +17,8 @@
         },
         "eigen3",
         "glslang",
-        "vulkan"
+        "vulkan-headers",
+        "vulkan-loader"
     ],
     "default-features": [
         "usb"

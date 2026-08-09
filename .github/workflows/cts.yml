@@ -114,11 +114,9 @@ jobs:
           vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
           vcpkgJsonGlob: 'vcpkg.json'
 
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.3.296.0  # keep in sync with build-windows.yml (LunarG ages out old SDKs; 1.3.283.0 now 404s)
-          cache: true
+      # No Vulkan SDK download — loader/headers + glslangValidator come from vcpkg
+      # (vulkan-loader, vulkan-headers, glslang in vcpkg.json). Avoids the aging
+      # LunarG URL that 404s on a cold cache.
 
       - uses: ilammy/msvc-dev-cmd@v1
 

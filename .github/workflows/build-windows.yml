@@ -126,17 +126,12 @@ jobs:
           vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
           vcpkgJsonGlob: 'vcpkg.json'
 
-      - name: Install Vulkan SDK
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          # LunarG ages out old point-releases — 1.3.283.0's installer now 404s
-          # (curl error 22), which only bites on a COLD cache (this stayed green
-          # only while the Actions cache lasted). Bumped to a version LunarG still
-          # serves. Keep in sync with the other pin below, cts.yml, and
-          # displayxr-vendor-template (fixed in its #2).
-          version: 1.3.296.0
-          cache: true
+      # No Vulkan SDK download. The build only needs the loader + headers
+      # (find_package(Vulkan) -> Vulkan::Vulkan) and glslangValidator (SPIR-V.cmake),
+      # all supplied by vcpkg (vulkan-loader, vulkan-headers, glslang in vcpkg.json).
+      # The old humbletim/install-vulkan-sdk step pinned a LunarG version whose
+      # installer URL ages out (404 -> curl error 22 on a cold cache); dropping it
+      # removes that whole class of failure.
 
       - if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: ilammy/msvc-dev-cmd@v1
@@ -433,11 +428,8 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.3.296.0  # keep in sync with the Runtime-job pin above (LunarG ages out old SDKs)
-          cache: true
+      # No Vulkan SDK download — loader/headers + glslangValidator come from vcpkg
+      # (see the Runtime job above and vcpkg.json). Avoids the aging LunarG URL.
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
