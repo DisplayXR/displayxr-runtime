@@ -133,6 +133,24 @@ jobs:
       # installer URL ages out (404 -> curl error 22 on a cold cache); dropping it
       # removes that whole class of failure.
 
+      - name: Provision glslangValidator from vcpkg onto PATH
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          # SPIR-V.cmake calls find_program(glslangValidator), which the LunarG
+          # SDK used to satisfy via PATH. vcpkg's glslang ships the same tool
+          # (vcpkg_copy_tools -> <root>/x64-windows/tools/glslang/), but the
+          # toolchain only installs it *during* Generate, after which nothing
+          # has put its dir on PATH. Eagerly materialize the manifest deps here,
+          # locate the tool, and prepend its directory to PATH before Generate.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows --x-manifest-root="$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed ($LASTEXITCODE)" }
+          $tool = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Recurse -Include glslangValidator.exe,glslang.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '[\\/]tools[\\/]' } | Select-Object -First 1
+          if (-not $tool) { throw "glslang tool not found under the vcpkg install tree" }
+          Add-Content -Path $env:GITHUB_PATH -Value $tool.Directory.FullName
+          Write-Host "glslang tool on PATH: $($tool.FullName)"
+
       - if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -201,7 +219,6 @@ jobs:
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DCMAKE_PROGRAM_PATH="${{ github.workspace }}/build/vcpkg_installed/x64-windows/tools/glslang" `
             -DVCPKG_MANIFEST_FEATURES=gui `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `

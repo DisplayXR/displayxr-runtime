@@ -118,6 +118,22 @@ jobs:
       # (vulkan-loader, vulkan-headers, glslang in vcpkg.json). Avoids the aging
       # LunarG URL that 404s on a cold cache.
 
+      - name: Provision glslangValidator from vcpkg onto PATH
+        shell: pwsh
+        run: |
+          # SPIR-V.cmake's find_program(glslangValidator) was satisfied by the
+          # LunarG SDK on PATH. vcpkg's glslang ships the same tool under
+          # <root>/x64-windows/tools/glslang/, but only after the toolchain
+          # installs it during Generate. Eagerly materialize the deps, locate
+          # the tool, and prepend its dir to PATH before Generate.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows --x-manifest-root="$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed ($LASTEXITCODE)" }
+          $tool = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Recurse -Include glslangValidator.exe,glslang.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '[\\/]tools[\\/]' } | Select-Object -First 1
+          if (-not $tool) { throw "glslang tool not found under the vcpkg install tree" }
+          Add-Content -Path $env:GITHUB_PATH -Value $tool.Directory.FullName
+          Write-Host "glslang tool on PATH: $($tool.FullName)"
+
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install OpenXR loader
@@ -167,7 +183,6 @@ jobs:
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-            -DCMAKE_PROGRAM_PATH="${{ github.workspace }}/build/vcpkg_installed/x64-windows/tools/glslang" `
             -DVCPKG_MANIFEST_FEATURES=gui `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `
