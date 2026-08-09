@@ -120,6 +120,21 @@ comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_
                                                 int32_t *out_top_px);
 
 /*!
+ * Query the refresh rate (Hz) of the monitor the window sits on, via RandR
+ * (screen-resources + the CRTC under the window centre; falls back to the first
+ * active CRTC). Handle-based sibling of the Windows comp_display_refresh_hz_win():
+ * the display processor's frame period and the late-weave / #868 repaint pacing
+ * must track the panel's TRUE rate, not a hardcoded 60 — which is wrong by 2–4×
+ * on a high-refresh 3D panel (a 120/144/240 Hz Odyssey held each interlace
+ * pattern for several refreshes).
+ *
+ * @return true and writes *out_hz on success; false (leaving *out_hz untouched)
+ *         when RandR can't be read, so callers keep their existing default.
+ */
+bool
+comp_vk_native_window_xcb_query_refresh_hz(const struct comp_vk_native_xcb_handle *handle, float *out_hz);
+
+/*!
  * Create a self-owned X11 window (hosted class).
  *
  * @param width                  Requested window width in pixels.

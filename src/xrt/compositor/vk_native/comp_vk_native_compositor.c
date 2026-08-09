@@ -4619,10 +4619,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-	// Default refresh rate. On Windows, replace it with the monitor's CURRENT
-	// mode — a hardcoded 60 hands the display processor a frame period 2.75×
-	// too long on a 165 Hz panel. (Desktop Linux keeps the default until an
-	// XRandR equivalent lands.)
+	// Default refresh rate, replaced with the monitor's CURRENT mode where we
+	// can read it. A hardcoded 60 hands the display processor a frame period
+	// 2–4× too long on a high-refresh panel (2.75× on 165 Hz; a 120/144/240 Hz
+	// Odyssey held each #868 interlace pattern for several refreshes) — Windows
+	// via EnumDisplaySettings, desktop Linux via RandR.
 	c->display_refresh_rate = 60.0f;
 #ifdef XRT_OS_WINDOWS
 	{
@@ -4635,6 +4636,30 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		if (c->target != NULL) {
 			comp_vk_native_target_set_display_period(
 			    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		}
+	}
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	{
+		// Works for both the self-owned hosted window and an app-provided
+		// xlib/xcb window; either populates an xcb_handle. (Direct-scanout is
+		// its connector's fixed native mode — a follow-up, not this windowed
+		// path.)
+		struct comp_vk_native_xcb_handle refresh_handle = c->xcb_handle;
+		if (refresh_handle.connection == NULL && c->xcb_window != NULL) {
+			comp_vk_native_window_xcb_get_handle(c->xcb_window, &refresh_handle);
+		}
+		if (refresh_handle.connection != NULL) {
+			float hz = 0.0f;
+			if (comp_vk_native_window_xcb_query_refresh_hz(&refresh_handle, &hz) && hz > 0.0f) {
+				c->display_refresh_rate = hz;
+			}
+			U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
+			        1000.0 / c->display_refresh_rate);
+			if (c->target != NULL) {
+				comp_vk_native_target_set_display_period(
+				    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+			}
 		}
 	}
 #endif
