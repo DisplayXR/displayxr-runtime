@@ -2215,7 +2215,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
     for (const auto& ext : extensions) {
-        if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
+        if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) {
@@ -2235,9 +2235,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
     }
 
-    LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) {
-        LOG_ERROR("XR_KHR_vulkan_enable extension not available");
+        LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
         return false;
     }
 
@@ -2251,8 +2251,13 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         return false;
     }
 
+    // vulkan_enable2 (INV-5.9): the RUNTIME creates the VkInstance/VkDevice on
+    // our behalf (xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR), so it can
+    // append the device extensions AND enable the features late-weave needs —
+    // notably a runtime-owned VkQueue for the #868 repaint (re-weave the last
+    // atlas against fresh eyes at panel rate) + present_id/present_wait pacing.
     std::vector<const char*> enabledExtensions;
-    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
     enabledExtensions.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
     if (hasDisplayInfo) {
         // Enabled for the INV-1.3 panel desktop-position query below (#715).
@@ -2381,8 +2386,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 }
 
 static bool GetVulkanGraphicsRequirements(AppXrSession& xr) {
-    PFN_xrGetVulkanGraphicsRequirementsKHR pfn = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirementsKHR",
+    // vulkan_enable2: the v2 proc name — the v1 name is only dispatchable when
+    // XR_KHR_vulkan_enable (v1) is the enabled extension.
+    PFN_xrGetVulkanGraphicsRequirements2KHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsRequirements2KHR",
         (PFN_xrVoidFunction*)&pfn));
 
     XrGraphicsRequirementsVulkanKHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
@@ -2400,62 +2407,14 @@ static bool GetVulkanGraphicsRequirements(AppXrSession& xr) {
 }
 
 static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
-    LOG_INFO("Creating Vulkan instance...");
+    LOG_INFO("Creating Vulkan instance via xrCreateVulkanInstanceKHR (vulkan_enable2)...");
 
-    // Get required instance extensions from the runtime
-    PFN_xrGetVulkanInstanceExtensionsKHR pfn = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanInstanceExtensionsKHR",
+    // vulkan_enable2: the RUNTIME creates the VkInstance and appends whatever
+    // instance extensions it needs — no app-side xrGetVulkanInstanceExtensionsKHR
+    // parse + vkCreateInstance ceremony.
+    PFN_xrCreateVulkanInstanceKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrCreateVulkanInstanceKHR",
         (PFN_xrVoidFunction*)&pfn));
-
-    uint32_t bufferSize = 0;
-    pfn(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
-    std::string extensionsStr(bufferSize, '\0');
-    pfn(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
-
-    // Parse space-separated extension names
-    std::vector<std::string> extensionNames;
-    {
-        size_t start = 0;
-        while (start < extensionsStr.size()) {
-            size_t end = extensionsStr.find(' ', start);
-            if (end == std::string::npos) end = extensionsStr.size();
-            std::string name = extensionsStr.substr(start, end - start);
-            if (!name.empty() && name[0] != '\0') {
-                extensionNames.push_back(name);
-            }
-            start = end + 1;
-        }
-    }
-
-    // MoltenVK portability: enumerate available instance extensions and add
-    // VK_KHR_portability_enumeration if present
-    uint32_t availExtCount = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, nullptr);
-    std::vector<VkExtensionProperties> availExts(availExtCount);
-    vkEnumerateInstanceExtensionProperties(nullptr, &availExtCount, availExts.data());
-
-    bool hasPortabilityEnum = false;
-    // CANDIDATE PATCH (#706 Linux validation): MoltenVK-only portability
-    // enumeration; guard on the macro so it compiles out where Vulkan headers
-    // don't define it (e.g. Ubuntu Vulkan-Headers v204). Not needed on Linux.
-#ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
-    for (const auto& ext : availExts) {
-        if (strcmp(ext.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0) {
-            hasPortabilityEnum = true;
-            break;
-        }
-    }
-    if (hasPortabilityEnum) {
-        extensionNames.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-        LOG_INFO("  Adding VK_KHR_portability_enumeration for MoltenVK");
-    }
-#endif
-
-    std::vector<const char*> extensionPtrs;
-    for (auto& name : extensionNames) {
-        extensionPtrs.push_back(name.c_str());
-        LOG_INFO("  VkInstance extension: %s", name.c_str());
-    }
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -2468,25 +2427,32 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
     VkInstanceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
-    createInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
-    createInfo.ppEnabledExtensionNames = extensionPtrs.data();
-#ifdef VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
-    if (hasPortabilityEnum) {
-        createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-    }
-#endif
 
-    VK_CHECK(vkCreateInstance(&createInfo, nullptr, &vkInstance));
-    LOG_INFO("Vulkan instance created");
+    XrVulkanInstanceCreateInfoKHR xrCreateInfo = {XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
+    xrCreateInfo.systemId = xr.systemId;
+    xrCreateInfo.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xrCreateInfo.vulkanCreateInfo = &createInfo;
+
+    VkResult vkResult = VK_SUCCESS;
+    XR_CHECK(pfn(xr.instance, &xrCreateInfo, &vkInstance, &vkResult));
+    if (vkResult != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanInstanceKHR: vk result %d", vkResult);
+        return false;
+    }
+
+    LOG_INFO("Vulkan instance created (runtime-managed extensions)");
     return true;
 }
 
 static bool GetVulkanPhysicalDevice(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice& physDevice) {
-    PFN_xrGetVulkanGraphicsDeviceKHR pfn = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsDeviceKHR",
+    PFN_xrGetVulkanGraphicsDevice2KHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanGraphicsDevice2KHR",
         (PFN_xrVoidFunction*)&pfn));
 
-    XR_CHECK(pfn(xr.instance, xr.systemId, vkInstance, &physDevice));
+    XrVulkanGraphicsDeviceGetInfoKHR getInfo = {XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
+    getInfo.systemId = xr.systemId;
+    getInfo.vulkanInstance = vkInstance;
+    XR_CHECK(pfn(xr.instance, &getInfo, &physDevice));
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physDevice, &props);
@@ -2495,54 +2461,17 @@ static bool GetVulkanPhysicalDevice(AppXrSession& xr, VkInstance vkInstance, VkP
     return true;
 }
 
+// vulkan_enable2: the runtime appends the device extensions it needs at
+// xrCreateVulkanDeviceKHR — the app only lists what IT needs (maintenance1 for
+// the negative-viewport Y-flip). No xrGetVulkanDeviceExtensionsKHR query.
 static bool GetVulkanDeviceExtensions(AppXrSession& xr,
     std::vector<const char*>& deviceExtensions, std::vector<std::string>& extensionStorage,
     VkPhysicalDevice physDevice)
 {
-    PFN_xrGetVulkanDeviceExtensionsKHR pfn = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetVulkanDeviceExtensionsKHR",
-        (PFN_xrVoidFunction*)&pfn));
-
-    uint32_t bufferSize = 0;
-    pfn(xr.instance, xr.systemId, 0, &bufferSize, nullptr);
-
-    std::string extensionsStr(bufferSize, '\0');
-    pfn(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
-
+    (void)xr;
+    (void)physDevice;
     extensionStorage.clear();
     deviceExtensions.clear();
-    {
-        size_t start = 0;
-        while (start < extensionsStr.size()) {
-            size_t end = extensionsStr.find(' ', start);
-            if (end == std::string::npos) end = extensionsStr.size();
-            std::string name = extensionsStr.substr(start, end - start);
-            if (!name.empty() && name[0] != '\0') {
-                extensionStorage.push_back(name);
-            }
-            start = end + 1;
-        }
-    }
-
-    // MoltenVK portability: add VK_KHR_portability_subset if available on device
-    uint32_t devExtCount = 0;
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &devExtCount, nullptr);
-    std::vector<VkExtensionProperties> devExts(devExtCount);
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &devExtCount, devExts.data());
-
-    for (const auto& ext : devExts) {
-        if (strcmp(ext.extensionName, "VK_KHR_portability_subset") == 0) {
-            extensionStorage.push_back("VK_KHR_portability_subset");
-            LOG_INFO("  Adding VK_KHR_portability_subset for MoltenVK");
-            break;
-        }
-    }
-
-    for (auto& name : extensionStorage) {
-        deviceExtensions.push_back(name.c_str());
-        LOG_INFO("  VkDevice extension: %s", name.c_str());
-    }
-
     return true;
 }
 
@@ -2565,10 +2494,21 @@ static bool FindGraphicsQueueFamily(VkPhysicalDevice physDevice, uint32_t& queue
     return false;
 }
 
-static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
+static bool CreateVulkanDevice(AppXrSession& xr, VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     const std::vector<const char*>& deviceExtensions,
     VkDevice& device, VkQueue& graphicsQueue)
 {
+    LOG_INFO("Creating Vulkan device via xrCreateVulkanDeviceKHR (vulkan_enable2)...");
+
+    // vulkan_enable2: the RUNTIME creates the VkDevice — giving it ownership of a
+    // VkQueue that the #868 repaint uses to re-weave the last atlas against fresh
+    // eyes at panel rate, plus the present_id/present_wait features for late-weave
+    // pacing (INV-5.9). The app still lists its own device extensions
+    // (maintenance1); the runtime appends what it needs on top.
+    PFN_xrCreateVulkanDeviceKHR pfn = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrCreateVulkanDeviceKHR",
+        (PFN_xrVoidFunction*)&pfn));
+
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo = {};
     queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -2583,7 +2523,18 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
     createInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
     createInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
-    VK_CHECK(vkCreateDevice(physDevice, &createInfo, nullptr, &device));
+    XrVulkanDeviceCreateInfoKHR xrCreateInfo = {XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+    xrCreateInfo.systemId = xr.systemId;
+    xrCreateInfo.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xrCreateInfo.vulkanPhysicalDevice = physDevice;
+    xrCreateInfo.vulkanCreateInfo = &createInfo;
+
+    VkResult vkResult = VK_SUCCESS;
+    XR_CHECK(pfn(xr.instance, &xrCreateInfo, &device, &vkResult));
+    if (vkResult != VK_SUCCESS) {
+        LOG_ERROR("xrCreateVulkanDeviceKHR: vk result %d", vkResult);
+        return false;
+    }
 
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &graphicsQueue);
     LOG_INFO("Vulkan device and graphics queue created");
@@ -3412,7 +3363,7 @@ int main() {
     // Create logical device
     VkDevice vkDevice = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
-    if (!CreateVulkanDevice(physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
+    if (!CreateVulkanDevice(xr, physDevice, queueFamilyIndex, deviceExtensions, vkDevice, graphicsQueue)) {
         vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr);
         return 1;
