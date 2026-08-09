@@ -117,7 +117,7 @@ jobs:
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          version: 1.3.283.0
+          version: 1.3.296.0  # keep in sync with build-windows.yml (LunarG ages out old SDKs; 1.3.283.0 now 404s)
           cache: true
 
       - uses: ilammy/msvc-dev-cmd@v1
