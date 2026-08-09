@@ -16,8 +16,14 @@
             "platform": "windows"
         },
         "eigen3",
-        "glslang",
-        "vulkan"
+        {
+            "name": "glslang",
+            "features": [
+                "tools"
+            ]
+        },
+        "vulkan-headers",
+        "vulkan-loader"
     ],
     "default-features": [
         "usb"

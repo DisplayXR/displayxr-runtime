@@ -114,11 +114,25 @@ jobs:
           vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
           vcpkgJsonGlob: 'vcpkg.json'
 
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.3.296.0  # keep in sync with build-windows.yml (LunarG ages out old SDKs; 1.3.283.0 now 404s)
-          cache: true
+      # No Vulkan SDK download — loader/headers + glslangValidator come from vcpkg
+      # (vulkan-loader, vulkan-headers, glslang in vcpkg.json). Avoids the aging
+      # LunarG URL that 404s on a cold cache.
+
+      - name: Provision glslangValidator from vcpkg onto PATH
+        shell: pwsh
+        run: |
+          # SPIR-V.cmake's find_program(glslangValidator) was satisfied by the
+          # LunarG SDK on PATH. vcpkg's glslang ships the same tool under
+          # <root>/x64-windows/tools/glslang/, but only after the toolchain
+          # installs it during Generate. Eagerly materialize the deps, locate
+          # the tool, and prepend its dir to PATH before Generate.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows --x-manifest-root="$env:GITHUB_WORKSPACE"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed ($LASTEXITCODE)" }
+          $tool = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Recurse -Include glslangValidator.exe,glslang.exe -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '[\\/]tools[\\/]' } | Select-Object -First 1
+          if (-not $tool) { throw "glslang tool not found under the vcpkg install tree" }
+          Add-Content -Path $env:GITHUB_PATH -Value $tool.Directory.FullName
+          Write-Host "glslang tool on PATH: $($tool.FullName)"
 
       - uses: ilammy/msvc-dev-cmd@v1
 

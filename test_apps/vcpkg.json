@@ -1,0 +1,9 @@
+{
+    "name": "displayxr-test-apps",
+    "description": "Vulkan headers + loader for the Windows Vulkan test apps (cube_handle_vk_win / cube_zones_vk_win). Every other test app uses system SDKs (D3D11/D3D12/GL/Win32) and pulls nothing from vcpkg. The vk apps embed pre-built SPIR-V, so no glslang/glslangValidator is needed here.",
+    "dependencies": [
+        "vulkan-headers",
+        "vulkan-loader"
+    ],
+    "builtin-baseline": "c82f74667287d3dc386bce81e44964370c91a289"
+}
