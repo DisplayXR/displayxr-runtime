@@ -50,7 +50,7 @@ RULES = {
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
-    "INV-5.9": "VK apps enable VK_KHR_present_id/present_wait features at vkCreateDevice when supported — required for the runtime's late-weave (vsync-locked weave) pacing.",
+    "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
     "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
     "INV-7.2": "xrCaptureAtlasDXR pathPrefix takes NO extension; the runtime appends _atlas.png.",
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
@@ -118,12 +118,11 @@ SRC_PATTERNS = [
 ]
 
 # Tokens that indicate the app uses an sRGB swapchain somewhere (for INV-4.6).
-# Tokens for INV-5.9: VK apps must enable present_id/present_wait features at
-# vkCreateDevice (query-then-chain) so the runtime's late-weave pacing can
-# vsync-lock the weave (measured 95.8 -> 16.6 ms on the VK path). Without it
-# the runtime silently falls back to stock (deep-queue) pacing.
+# INV-5.9: a VK app that calls vkCreateDevice itself is using XR_KHR_vulkan_enable
+# (enable1) — the app owns the device. enable2 apps have the RUNTIME create the
+# device (xrCreateVulkanDeviceKHR) and therefore have no vkCreateDevice call, so
+# this token is the definitive enable1 tell.
 VK_CREATES_DEVICE = re.compile(r"\bvkCreateDevice\b")
-VK_PRESENT_WAIT_TOKENS = re.compile(r"PresentWaitFeatures|PRESENT_WAIT_EXTENSION|EnablePresentWaitIfSupported")
 
 SRGB_TOKENS = re.compile(
     r"_UNORM_SRGB|_SRGB\b|SRGB8_ALPHA8|MTLPixelFormat\w*sRGB|VK_FORMAT_\w*_SRGB",
@@ -210,25 +209,27 @@ def scan_sources(root: Path, findings: list):
             if m:
                 swapchain_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
 
-    # INV-5.9 advisory: VK app creates a VkDevice but never enables the
-    # present_id/present_wait features — runtime late-weave pacing stays dormant.
+    # INV-5.9 (enforced): a VK app that creates its own VkDevice is using
+    # XR_KHR_vulkan_enable (enable1). enable1 forfeits the runtime-owned VkQueue
+    # the #868 repaint needs (weave-rate decoupling) AND the late-weave pacing —
+    # both hang off who creates the device. VK apps MUST use enable2, where the
+    # runtime creates the device via xrCreateVulkanDeviceKHR (no vkCreateDevice).
     vk_device_loc = None
-    any_present_wait = any(VK_PRESENT_WAIT_TOKENS.search(t) for _, t in files)
     for path, text in files:
         m = VK_CREATES_DEVICE.search(text)
         if m:
             vk_device_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
             break
-    if vk_device_loc and not any_present_wait:
+    if vk_device_loc:
         p, ln = vk_device_loc
         findings.append(Finding(
-            WARN, "INV-5.9", p, ln,
-            "VkDevice created without VK_KHR_present_id/present_wait features — "
-            "the runtime's late-weave pacing (weave ~1 refresh before scanout) stays dormant.",
-            "Query VkPhysicalDevicePresentIdFeaturesKHR + PresentWaitFeaturesKHR via "
-            "vkGetPhysicalDeviceFeatures2, and when supported chain them into VkDeviceCreateInfo "
-            "and add both extension names (see cube_handle_vk_win/xr_session.cpp or "
-            "displayxr-common's EnablePresentWaitIfSupported).",
+            ERROR, "INV-5.9", p, ln,
+            "App calls vkCreateDevice -> XR_KHR_vulkan_enable (enable1). enable1 forfeits the "
+            "runtime-owned VkQueue the #868 weave-rate decoupling needs and the late-weave "
+            "pacing (both hang off who creates the VkDevice).",
+            "Migrate to XR_KHR_vulkan_enable2: request XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME and "
+            "create instance/device via xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR (no "
+            "app-side vkCreateInstance / vkCreateDevice). Reference: test_apps/handle/cube_handle_vk_win.",
         ))
 
     # INV-4.6 advisory: creates a swapchain but no sRGB format appears anywhere.
