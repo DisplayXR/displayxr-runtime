@@ -447,6 +447,110 @@ comp_vk_native_window_xcb_query_screen_position(const struct comp_vk_native_xcb_
 	return true;
 }
 
+bool
+comp_vk_native_window_xcb_query_refresh_hz(const struct comp_vk_native_xcb_handle *handle, float *out_hz)
+{
+	if (handle == NULL || handle->connection == NULL || handle->window == 0 || out_hz == NULL) {
+		return false;
+	}
+
+	xcb_connection_t *conn = (xcb_connection_t *)handle->connection;
+	const xcb_setup_t *setup = xcb_get_setup(conn);
+	if (setup == NULL) {
+		return false;
+	}
+	xcb_screen_t *screen = xcb_setup_roots_iterator(setup).data;
+	if (screen == NULL) {
+		return false;
+	}
+	xcb_window_t root = screen->root;
+
+	// Window centre in root (screen) pixels, so we pick the CRTC the window
+	// actually sits on rather than assuming the primary output (the Odyssey is
+	// not necessarily primary when a laptop panel is also connected).
+	int32_t cx = 0, cy = 0;
+	{
+		xcb_get_geometry_reply_t *geo =
+		    xcb_get_geometry_reply(conn, xcb_get_geometry(conn, (xcb_drawable_t)handle->window), NULL);
+		xcb_translate_coordinates_reply_t *pos = xcb_translate_coordinates_reply(
+		    conn, xcb_translate_coordinates(conn, (xcb_window_t)handle->window, root, 0, 0), NULL);
+		if (geo != NULL && pos != NULL) {
+			cx = pos->dst_x + (int32_t)geo->width / 2;
+			cy = pos->dst_y + (int32_t)geo->height / 2;
+		}
+		free(geo);
+		free(pos);
+	}
+
+	xcb_randr_get_screen_resources_current_reply_t *res = xcb_randr_get_screen_resources_current_reply(
+	    conn, xcb_randr_get_screen_resources_current(conn, root), NULL);
+	if (res == NULL) {
+		return false;
+	}
+
+	xcb_randr_mode_info_t *modes = xcb_randr_get_screen_resources_current_modes(res);
+	int modes_len = xcb_randr_get_screen_resources_current_modes_length(res);
+	xcb_randr_crtc_t *crtcs = xcb_randr_get_screen_resources_current_crtcs(res);
+	int crtcs_len = xcb_randr_get_screen_resources_current_crtcs_length(res);
+
+	xcb_randr_mode_t chosen_mode = 0;   // CRTC under the window centre
+	xcb_randr_mode_t fallback_mode = 0; // first active CRTC (if the centre misses)
+
+	for (int i = 0; i < crtcs_len; i++) {
+		xcb_randr_get_crtc_info_reply_t *ci = xcb_randr_get_crtc_info_reply(
+		    conn, xcb_randr_get_crtc_info(conn, crtcs[i], res->config_timestamp), NULL);
+		if (ci == NULL) {
+			continue;
+		}
+		if (ci->mode != 0 && ci->width > 0 && ci->height > 0) {
+			if (fallback_mode == 0) {
+				fallback_mode = ci->mode;
+			}
+			if (cx >= ci->x && cx < ci->x + (int32_t)ci->width && cy >= ci->y &&
+			    cy < ci->y + (int32_t)ci->height) {
+				chosen_mode = ci->mode;
+				free(ci);
+				break;
+			}
+		}
+		free(ci);
+	}
+	if (chosen_mode == 0) {
+		chosen_mode = fallback_mode;
+	}
+
+	float hz = 0.0f;
+	if (chosen_mode != 0) {
+		for (int i = 0; i < modes_len; i++) {
+			const xcb_randr_mode_info_t *m = &modes[i];
+			if (m->id != chosen_mode) {
+				continue;
+			}
+			// Standard RandR vrefresh: dot_clock / (htotal * vtotal), adjusted
+			// for interlace / double-scan flags.
+			double vtotal = (double)m->vtotal;
+			if (m->mode_flags & XCB_RANDR_MODE_FLAG_DOUBLE_SCAN) {
+				vtotal *= 2.0;
+			}
+			if (m->mode_flags & XCB_RANDR_MODE_FLAG_INTERLACE) {
+				vtotal /= 2.0;
+			}
+			if (m->htotal != 0 && vtotal != 0.0) {
+				hz = (float)((double)m->dot_clock / ((double)m->htotal * vtotal));
+			}
+			break;
+		}
+	}
+
+	free(res);
+
+	if (hz > 1.0f) {
+		*out_hz = hz;
+		return true;
+	}
+	return false;
+}
+
 void
 comp_vk_native_window_xcb_pump(struct comp_vk_native_window_xcb *win)
 {
