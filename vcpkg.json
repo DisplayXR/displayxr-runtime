@@ -16,7 +16,12 @@
             "platform": "windows"
         },
         "eigen3",
-        "glslang",
+        {
+            "name": "glslang",
+            "features": [
+                "tools"
+            ]
+        },
         "vulkan-headers",
         "vulkan-loader"
     ],
