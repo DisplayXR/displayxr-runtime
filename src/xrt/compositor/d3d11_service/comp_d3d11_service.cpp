@@ -12112,6 +12112,83 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 	return true;
 }
 
+//! DIAGNOSTIC ONLY (browser#73) — dump a D3D11 texture to %TEMP%\<name>.png.
+//!
+//! Answers "what did the present-owner actually hand us?" in pixels, which is
+//! the one thing the browser-side reasoning cannot settle: whether the SBS pair
+//! sitting at a clipped element's rect is correct, vertically offset, squished,
+//! or carries a duplicated band. Blocking Map on the immediate context — a
+//! one-shot debug path, never armed in a normal session.
+static void
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name)
+{
+	if (sys == nullptr || tex == nullptr) {
+		return;
+	}
+	D3D11_TEXTURE2D_DESC desc = {};
+	tex->GetDesc(&desc);
+	if (desc.Width == 0 || desc.Height == 0) {
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC sd = desc;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	wil::com_ptr<ID3D11Texture2D> staging;
+	HRESULT hr = sys->device->CreateTexture2D(&sd, nullptr, staging.put());
+	if (FAILED(hr)) {
+		U_LOG_W("#73 diag: CreateTexture2D(staging) failed for %s: 0x%08lx", name, hr);
+		return;
+	}
+	sys->context->CopyResource(staging.get(), tex);
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	hr = sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
+	if (FAILED(hr)) {
+		U_LOG_W("#73 diag: Map(staging) failed for %s: 0x%08lx", name, hr);
+		return;
+	}
+
+	const uint32_t w = desc.Width;
+	const uint32_t h = desc.Height;
+	std::vector<uint8_t> buf((size_t)w * h * 4u);
+	const uint8_t *src = static_cast<const uint8_t *>(m.pData);
+	for (uint32_t y = 0; y < h; y++) {
+		memcpy(buf.data() + (size_t)y * w * 4u, src + (size_t)y * m.RowPitch, (size_t)w * 4u);
+	}
+	sys->context->Unmap(staging.get(), 0);
+
+	// BGRA staging (the browser's shared input is B8G8R8A8) needs the channel
+	// swap stb does not do; alpha is kept AS SUBMITTED — the transparent gaps
+	// between tiles are exactly what we are here to inspect.
+	const bool bgra = (desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+	                   desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+	if (bgra) {
+		for (size_t i = 0; i < buf.size(); i += 4) {
+			const uint8_t b = buf[i];
+			buf[i] = buf[i + 2];
+			buf[i + 2] = b;
+		}
+	}
+
+	const char *tmp = getenv("TEMP");
+	if (tmp == nullptr) {
+		tmp = getenv("TMP");
+	}
+	if (tmp == nullptr) {
+		return;
+	}
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s\\%s.png", tmp, name);
+	if (stbi_write_png(path, (int)w, (int)h, 4, buf.data(), (int)(w * 4u)) != 0) {
+		U_LOG_W("#73 diag: wrote %s (%ux%u fmt=%d)", path, w, h, (int)desc.Format);
+	} else {
+		U_LOG_W("#73 diag: stbi_write_png failed for %s", path);
+	}
+}
+
 extern "C" bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
@@ -12312,6 +12389,26 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	D3D11_TEXTURE2D_DESC idesc = {};
 	in_tex->GetDesc(&idesc);
+
+	// DIAGNOSTIC ONLY (browser#73). Armed by creating
+	// %TEMP%\dxr_weave_dump_trigger; consumed (deleted) by the first submit that
+	// sees it, so one touch == one frame captured. Function-scope because the
+	// woven OUTPUT is dumped at the end, after the DP has written it.
+	bool dxr_diag_dump = false;
+	{
+		const char *tmp = getenv("TEMP");
+		if (tmp == nullptr) {
+			tmp = getenv("TMP");
+		}
+		if (tmp != nullptr) {
+			char trig[MAX_PATH];
+			snprintf(trig, sizeof(trig), "%s\\dxr_weave_dump_trigger", tmp);
+			if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES) {
+				DeleteFileA(trig);
+				dxr_diag_dump = true;
+			}
+		}
+	}
 
 	// Input sync: the caller signals key 0 ("done writing") via IDXGIKeyedMutex.
 	// The service does not import caller fences (compositor_import_fence is a
@@ -12540,6 +12637,16 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			sys->context->ClearRenderTargetView(c->render.weave_sbs_rtv.get(), sbs_transparent);
 		}
 
+		if (dxr_diag_dump) {
+			U_LOG_W("#73 diag: submit n=%u input=%ux%u win=%ux%u first=%d", rect_count, idesc.Width,
+			        idesc.Height, win_w, win_h, (int)weave_frame_first);
+			for (uint32_t i = 0; i < rect_count; i++) {
+				U_LOG_W("#73 diag:   rect[%u] = %d,%d %dx%d", i, rects[i].offset.w,
+				        rects[i].offset.h, rects[i].extent.w, rects[i].extent.h);
+			}
+			dxr_diag_dump_tex(sys, in_tex, "dxr73_weave_input");
+		}
+
 		const float src_tw = (float)idesc.Width;
 		const float src_th = (float)idesc.Height;
 		for (uint32_t i = 0; i < rect_count; i++) {
@@ -12564,6 +12671,9 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 		if (acquired && in_km) {
 			in_km->ReleaseSync(0);
+		}
+		if (dxr_diag_dump) {
+			dxr_diag_dump_tex(sys, c->render.weave_sbs_tex.get(), "dxr73_weave_sbs");
 		}
 		int64_t t_post_copies_ns = os_monotonic_get_ns();
 
@@ -12668,6 +12778,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 
 	int64_t t_post_weave_ns = os_monotonic_get_ns();
+
+	// DIAGNOSTIC ONLY (browser#73): the WOVEN OUTPUT — what the present-owner
+	// imports and draws back whole-window. The input and the assembled SBS atlas
+	// were both dumped above, so a fault visible only here is the DP's weave or
+	// its transparency reconstruction, not the geometry either side of it.
+	if (dxr_diag_dump) {
+		dxr_diag_dump_tex(sys, c->render.weave_output_texture.get(), "dxr73_weave_output");
+	}
 
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
 	// no Present to flush this standalone path), then the caller's Wait completes.
