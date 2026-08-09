@@ -446,8 +446,17 @@ jobs:
         with:
           submodules: recursive
 
-      # No Vulkan SDK download — loader/headers + glslangValidator come from vcpkg
-      # (see the Runtime job above and vcpkg.json). Avoids the aging LunarG URL.
+      # No Vulkan SDK download. The vk test apps (cube_handle_vk_win /
+      # cube_zones_vk_win) find_package(Vulkan) -> Vulkan::Vulkan from vcpkg's
+      # vulkan-loader + vulkan-headers (test_apps/vcpkg.json); they embed
+      # pre-built SPIR-V so no glslangValidator is needed. Every other app uses
+      # system SDKs. Avoids the aging LunarG URL that 404s on a cold cache.
+      - name: Restore from cache and setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: '${{ github.workspace }}/vcpkg'
+          vcpkgGitCommitId: '5d90b0d5d0317336e65662f2bf0d671b0902c632'
+          vcpkgJsonGlob: 'test_apps/vcpkg.json'
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -463,6 +472,7 @@ jobs:
       - name: Build all test apps (aggregate)
         run: |
           cmake -S test_apps -B test_apps/build -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build test_apps/build
