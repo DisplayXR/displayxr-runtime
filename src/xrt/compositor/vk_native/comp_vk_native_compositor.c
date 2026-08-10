@@ -4773,12 +4773,16 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// lag in the blend band, and WGC delivery is charged to dwm at the
 	// desktop's change rate — a moving cursor alone drives it. Mirrors the
 	// dcomp gate in comp_vk_native_target (transparent && hwnd) plus the
-	// alpha-mode choice. c->hwnd is Windows-only and NULL elsewhere, so
-	// macOS/Linux keep today's value — and compose-under-bg (WGC) is a
-	// Windows-only mechanism regardless.
+	// alpha-mode choice. The c->hwnd member itself is compiled only on
+	// Windows, so the predicate is #ifdef'd: macOS/Linux keep today's value
+	// (false) — compose-under-bg (WGC) is a Windows-only mechanism, and the
+	// macOS alpha-native path has its own contract (is_alpha_native).
 	if (c->display_processor != NULL) {
-		const bool runtime_transparent_present =
+		bool runtime_transparent_present = false;
+#ifdef XRT_OS_WINDOWS
+		runtime_transparent_present =
 		    transparent_background && c->hwnd != NULL && !debug_get_bool_option_present_opaque();
+#endif
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background,
 		    runtime_transparent_present);
