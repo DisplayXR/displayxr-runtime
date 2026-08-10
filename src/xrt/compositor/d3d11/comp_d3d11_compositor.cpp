@@ -3109,24 +3109,23 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		} else {
 			U_LOG_W("D3D11 display processor created via factory");
 			// Forward session-level transparency (#573 — chroma-key-free).
-			// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE.
-			// On the default transparent path the target is a DComp
-			// PREMULTIPLIED swapchain and DWM blends the live desktop into our
-			// alpha=0 holes — which is precisely the client_presents=true
-			// contract in xrt_display_processor_d3d11.h. Passing false there
-			// made the DP ALSO compose-under-bg: it captures the desktop via
-			// WGC and bakes a ~1-frame-stale copy that the post-weave alpha
-			// gate then discards. Wasted work, the documented "frame of lag"
-			// in the blend band, and WGC delivery is charged to dwm at the
-			// desktop's change rate — a moving cursor alone is enough to make
-			// that expensive. Mirrors use_transparent in comp_d3d11_target.
-			// (Non-Windows keeps false naturally: c->hwnd is NULL there, and
-			// compose-under-bg is a Windows-only mechanism regardless.)
-			const bool runtime_transparent_present =
-			    transparent_background && c->hwnd != nullptr &&
-			    !debug_get_bool_option_present_opaque_comp();
+			// client_presents=false — DELIBERATELY, and #904's true here was
+			// wrong for in-process (reverted after a hardware eyeball): the
+			// DE-OCCLUSION BAND (pixels where SOME but not all views are
+			// transparent — the parallax fringe around 3D content) cannot
+			// come from DWM live blending. The SR weaver destroys per-pixel
+			// alpha and the alpha-gate reconstructs only the binary
+			// all-views-transparent mask, so the band is either filled by
+			// the DP's compose-under-bg (~1-frame-stale bake, the product
+			// spec: live desktop in the holes, bake only in the band) or it
+			// is BLACK. #904 disabled the compose calling it wasted work —
+			// the dwm saving it measured partly bought black de-occlusions.
+			// The WGC cost is attacked by capture throttling instead, not by
+			// dropping the band. client_presents=true remains correct for
+			// true client-side presents (#551 IPC) and for content with no
+			// partial-alpha band.
 			xrt_display_processor_d3d11_set_transparent_background(
-			    c->display_processor, transparent_background, runtime_transparent_present);
+			    c->display_processor, transparent_background, false);
 			// #68: tell the DP whether the app self-presents only the canvas (a
 			// _texture app blits its shared texture's canvas to its own window)
 			// vs the runtime presenting the full target (handle apps). The DP
