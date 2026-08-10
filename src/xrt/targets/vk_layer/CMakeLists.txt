@@ -21,9 +21,18 @@ if(NOT WIN32)
 	target_link_libraries(VkLayer_DXR_queue_lock PRIVATE Threads::Threads)
 endif()
 
+# The per-config properties matter: multi-config generators (VS; Ninja
+# Multi-Config) append a $<CONFIG> subdir to the plain property, landing the
+# DLL in vk_layer/Release/ while the manifest below points at vk_layer/ — the
+# loader then SILENTLY skips the layer (found in the #902 Windows validation).
 set_target_properties(
-	VkLayer_DXR_queue_lock PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-					  C_VISIBILITY_PRESET hidden
+	VkLayer_DXR_queue_lock
+	PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+		   LIBRARY_OUTPUT_DIRECTORY_DEBUG ${CMAKE_CURRENT_BINARY_DIR}
+		   LIBRARY_OUTPUT_DIRECTORY_RELEASE ${CMAKE_CURRENT_BINARY_DIR}
+		   LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_CURRENT_BINARY_DIR}
+		   LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL ${CMAKE_CURRENT_BINARY_DIR}
+		   C_VISIBILITY_PRESET hidden
 	)
 
 # Belt and braces vs the ELF interposition trap (see the TRAP note in

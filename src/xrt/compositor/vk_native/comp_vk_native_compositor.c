@@ -5017,6 +5017,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			        "of app rate. Correctness probe; it WILL cost frame rate.");
 		}
 		if (c->repaint.enabled == 1 && c->target != NULL) {
+			// Seed the quiet-gate key so the first force-probe counter row
+			// doesn't log a garbage quiet_ns (now − 0) before the first app
+			// frame publishes (#902 Windows validation, cosmetic).
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
 			int sret = os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
 			U_LOG_W("#868: repaint loop start ret=%d (target=%p)", sret, (void *)c->target);
 		} else {
