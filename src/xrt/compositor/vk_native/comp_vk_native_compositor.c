@@ -2900,7 +2900,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	}
 
 	uint32_t target_index;
-	xret = comp_vk_native_target_acquire(c->target, &target_index, queue);
+	xret = comp_vk_native_target_acquire(c->target, &target_index, queue, is_repaint);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to acquire target");
 		return xret;

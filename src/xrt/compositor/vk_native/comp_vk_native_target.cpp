@@ -17,6 +17,26 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/comp_late_weave_lookahead.h"
+
+#ifdef XRT_OS_WINDOWS
+// #912 — the #850 saturation governor now also runs the VK bridge pacing
+// (present_wait-less drivers, i.e. every Intel iGPU). on_stats never fires
+// here (bridge frame statistics are DISJOINT); period_ns is seeded via
+// set_display_period and everything else (on_mark saturation EMA, depth
+// transitions, occlusion reset) is clock-source-agnostic. File scope for the
+// same memset reason as the weave-latency log.
+#include "util/comp_weave_latency_win.h"
+static late_weave_governor g_lw_gov_vk_bridge;
+// Defined later in this file; dcomp_setup consults it at creation so the
+// bridge waitable is never built on devices where VK's own present_wait
+// will pace (nothing should double-pace on NVIDIA).
+static PFN_vkWaitForPresentKHR
+target_present_wait_fn(struct comp_vk_native_target *target);
+#include <atomic>
+// #868 interplay: repaint presents release bridge-waitable tokens nobody
+// consumed; the app's next acquire drains the surplus (see the D3D targets).
+static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
+#endif
 #include "os/os_time.h"
 
 #include <cstring>
@@ -48,35 +68,42 @@
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 /*
- * #870 — DXR_VK_BRIDGE_PACING=N: pace the VK live/DComp path on the bridge's
- * DXGI frame-latency waitable, with queue depth N (1..3). 0/unset = off.
+ * #870/#912 — DXR_VK_BRIDGE_PACING: pace the VK live/DComp path on the
+ * bridge's DXGI frame-latency waitable. Intel iGPUs expose NO Vulkan
+ * presentation-timing extension (no present_wait / present_id /
+ * GOOGLE_display_timing — verified per-device with vulkaninfo), so VK
+ * late-weave is otherwise permanently dormant on the very adapter that scans
+ * out the panel. The transparent path already presents through a DXGI
+ * object, which can carry the pacing Vulkan cannot.
  *
- * Exists because Intel iGPUs expose NO Vulkan presentation-timing extension
- * (no present_wait, present_id or GOOGLE_display_timing — verified per-device
- * with vulkaninfo), so VK late-weave is permanently dormant on the very
- * adapter that scans out the panel. The transparent path already presents
- * through a DXGI object, which can carry the pacing Vulkan cannot.
- *
- * Off by default until a human confirms the benefit: the cost (throughput) is
- * measurable and the benefit (crosstalk under head motion) is not, on this
- * hardware, by any instrument we have.
+ * Semantics (getenv NULL is distinct from "0"):
+ *   unset -> GOVERNOR mode (default ON where present_wait is absent): depth
+ *            starts at the #850 governor's base and auto-backs-off on
+ *            saturation, exactly like the D3D paths.
+ *   "0"   -> off (kill switch).
+ *   N 1-3 -> pin the depth (governor transitions disabled).
  */
+#define DXR_VK_BRIDGE_PACING_GOVERNOR (-1)
 static int
-dxr_vk_bridge_pacing_depth(void)
+dxr_vk_bridge_pacing_mode(void)
 {
-	static int depth = -1;
-	if (depth < 0) {
+	static int mode = -2;
+	if (mode == -2) {
 		const char *e = getenv("DXR_VK_BRIDGE_PACING");
-		int v = (e != NULL) ? atoi(e) : 0;
-		if (v < 0) {
-			v = 0;
+		if (e == NULL || e[0] == '\0') {
+			mode = DXR_VK_BRIDGE_PACING_GOVERNOR;
+		} else {
+			int v = atoi(e);
+			if (v < 0) {
+				v = 0;
+			}
+			if (v > 3) {
+				v = 3;
+			}
+			mode = v;
 		}
-		if (v > 3) {
-			v = 3;
-		}
-		depth = v;
 	}
-	return depth;
+	return mode;
 }
 
 static inline DXGI_ALPHA_MODE
@@ -876,20 +903,19 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 	desc.BufferCount = DCOMP_RING;
 	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 	desc.AlphaMode = dxr_present_alpha_mode(); // #833: IGNORE when present_opaque
-	// #870 — make the bridge swapchain waitable so the VK path can be paced on
-	// drivers with no VK_KHR_present_wait (every Intel iGPU).
-	//
-	// OFF BY DEFAULT, deliberately. The mechanism works, but on this hardware
-	// its benefit — lower weave→scanout latency, i.e. less crosstalk under
-	// head motion — is *unmeasurable*: there is no VK timing extension, and
-	// DXGI frame statistics come back DISJOINT on a composition swapchain (see
-	// the probe in dcomp_present). Meanwhile it demonstrably costs throughput,
-	// which is precisely the trade #850 caught with maxFrameLatency=1. Shipping
-	// an unprovable benefit at a measured cost is the wrong default, so this
-	// waits on a human eyeball: DXR_VK_BRIDGE_PACING=N (1..3) selects the
-	// queue depth, N=1 being the aggressive setting.
-	target->dcomp_pacing_depth = dxr_vk_bridge_pacing_depth();
-	if (target->dcomp_pacing_depth > 0) {
+	// #870/#912 — make the bridge swapchain waitable so the VK path can be
+	// paced on drivers with no VK_KHR_present_wait (every Intel iGPU).
+	// Governor-managed default-ON there (the #850 saturation auto-backoff
+	// protects throughput — the reason the earlier opt-in shipped default-off
+	// no longer holds); never created when VK's own present_wait exists
+	// (nothing should double-pace on NVIDIA) and never when late-weave is
+	// globally off.
+	const int pacing_mode = dxr_vk_bridge_pacing_mode();
+	target->dcomp_pacing_depth = 0;
+	if (dxr_late_weave_enabled() && pacing_mode != 0 && target_present_wait_fn(target) == NULL) {
+		target->dcomp_pacing_depth =
+		    (pacing_mode == DXR_VK_BRIDGE_PACING_GOVERNOR) ? g_lw_gov_vk_bridge.base_latency()
+		                                                   : pacing_mode;
 		desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
 	target->dcomp_swapchain_flags = desc.Flags;
@@ -1765,6 +1791,9 @@ comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target)
 	if (wl != nullptr) {
 		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
 	}
+	// #912/#868 interplay: this repaint's present will release a bridge
+	// waitable token nobody waits for; the app's next acquire drains it.
+	g_vk_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);
 #else
 	(void)target;
 #endif
@@ -1832,35 +1861,38 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 #ifdef XRT_OS_WINDOWS
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
-	// #867: frame-cost EMA. A pause (occlusion, drag loop, debugger) is not
-	// a frame cost — reset rather than poison the average.
-	if (target->last_mark_qpc != 0 && (uint64_t)now.QuadPart > target->last_mark_qpc) {
-		LARGE_INTEGER f;
-		QueryPerformanceFrequency(&f);
-		const double dt_ns = (double)((uint64_t)now.QuadPart - target->last_mark_qpc) *
-		                     1000000000.0 / (double)f.QuadPart;
-		if (dt_ns > 250e6) {
-			target->interval_ema_ns = 0.0;
-		} else {
-			target->interval_ema_ns = (target->interval_ema_ns == 0.0)
-			                              ? dt_ns
-			                              : target->interval_ema_ns * 0.9 + dt_ns * 0.1;
+	// #867/#912: the #850 governor is now the single owner of the frame-cost
+	// and wait_frame→weave EMAs (its on_mark carries the identical constants,
+	// the 250 ms pause reset, and — new here — the saturation depth logic for
+	// the bridge pacing). The hand-rolled duplicates this replaced would have
+	// drifted from it. App frames only: weave_mark_repaint deliberately never
+	// calls on_mark (a repaint is not an app frame; its one-period cadence
+	// would collapse the saturation signal).
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	const int tr = g_lw_gov_vk_bridge.on_mark((uint64_t)f.QuadPart);
+	if (tr != 0 && target->dcomp_frame_latency_waitable != NULL &&
+	    dxr_vk_bridge_pacing_mode() == DXR_VK_BRIDGE_PACING_GOVERNOR) {
+		IDXGISwapChain2 *sc2 = NULL;
+		if (target->dcomp_swapchain != NULL &&
+		    SUCCEEDED(target->dcomp_swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
+		                                                       (void **)&sc2)) &&
+		    sc2 != NULL) {
+			sc2->SetMaximumFrameLatency((UINT)g_lw_gov_vk_bridge.effective);
+			sc2->Release();
+			target->dcomp_pacing_depth = g_lw_gov_vk_bridge.effective;
+		}
+		static bool logged_backoff = false, logged_return = false;
+		bool &logged = (tr > 0) ? logged_backoff : logged_return;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#912: bridge saturation %s -> max latency %d "
+			        "(frame interval %.1f ms vs display period %.1f ms)",
+			        tr > 0 ? "backoff engaged" : "cleared, probing return",
+			        g_lw_gov_vk_bridge.effective, g_lw_gov_vk_bridge.interval_ema_ns / 1e6,
+			        g_lw_gov_vk_bridge.period_ns / 1e6);
 		}
 	}
-	// #867: wait_frame → weave, the app-side half of the lookahead.
-	if (target->wait_frame_qpc != 0 && (uint64_t)now.QuadPart > target->wait_frame_qpc) {
-		LARGE_INTEGER wf;
-		QueryPerformanceFrequency(&wf);
-		const double phi_ns = (double)((uint64_t)now.QuadPart - target->wait_frame_qpc) *
-		                      1000000000.0 / (double)wf.QuadPart;
-		if (phi_ns < 250e6) {
-			target->wait_to_weave_ema_ns = (target->wait_to_weave_ema_ns == 0.0)
-			                                   ? phi_ns
-			                                   : target->wait_to_weave_ema_ns * 0.9 + phi_ns * 0.1;
-		}
-		target->wait_frame_qpc = 0;
-	}
-	target->last_mark_qpc = (uint64_t)now.QuadPart;
 	target->weave_mark_qpc = (uint64_t)now.QuadPart; // always: feeds set_frame_timing
 	struct wl_harness *wl = wl_get(target);
 	if (wl != nullptr) {
@@ -1875,9 +1907,8 @@ void
 comp_vk_native_target_mark_wait_frame(struct comp_vk_native_target *target)
 {
 #ifdef XRT_OS_WINDOWS
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	target->wait_frame_qpc = (uint64_t)now.QuadPart;
+	(void)target;
+	g_lw_gov_vk_bridge.on_wait_frame(); // #912: governor owns the EMAs now
 #else
 	(void)target;
 #endif
@@ -1888,6 +1919,14 @@ comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, u
 {
 #ifdef XRT_OS_WINDOWS
 	target->period_hint_ns = (double)period_ns;
+#ifdef XRT_OS_WINDOWS
+	// #912: seed the governor's saturation reference — on_stats never fires
+	// on the bridge (frame statistics are DISJOINT), so this is its only
+	// period source.
+	if (g_lw_gov_vk_bridge.period_ns <= 0.0 && period_ns > 0) {
+		g_lw_gov_vk_bridge.period_ns = (double)period_ns;
+	}
+#endif
 #else
 	(void)target;
 	(void)period_ns;
@@ -1898,7 +1937,7 @@ uint64_t
 comp_vk_native_target_get_predicted_lookahead_ns(struct comp_vk_native_target *target)
 {
 #ifdef XRT_OS_WINDOWS
-	return late_weave_lookahead_ns(target->wait_to_weave_ema_ns, target->measured_r_ns,
+	return late_weave_lookahead_ns(g_lw_gov_vk_bridge.wait_to_weave_ema_ns, target->measured_r_ns,
 	                               target->period_hint_ns);
 #else
 	(void)target;
@@ -1918,7 +1957,7 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 }
 
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue)
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -1949,14 +1988,56 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		// wait — either pair each extra present with its own wait on this
 		// same thread, or pace that path passively (frame statistics /
 		// present-wait polling) and never touch this handle.
-		if (target->dcomp_frame_latency_waitable != NULL && target_present_wait_fn(target) == NULL) {
+		// #912: repaints NEVER touch the waitable (the invariant above — and
+		// on tier-2 single-queue iGPUs the repaint shares the app's VkQueue,
+		// so the queue cannot discriminate; the caller passes is_repaint).
+		if (!is_repaint && target->dcomp_frame_latency_waitable != NULL &&
+		    target_present_wait_fn(target) == NULL) {
 			static bool logged = false;
 			if (!logged) {
 				logged = true;
-				U_LOG_W("#870: pacing the VK bridge on the DXGI waitable "
-				        "(no VK_KHR_present_wait on this device)");
+				U_LOG_W("#912: pacing the VK bridge on the DXGI waitable, depth %d%s "
+				        "(no VK_KHR_present_wait on this device)",
+				        target->dcomp_pacing_depth,
+				        (dxr_vk_bridge_pacing_mode() == DXR_VK_BRIDGE_PACING_GOVERNOR)
+				            ? " + saturation auto-backoff"
+				            : " (pinned)");
 			}
-			WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 100, TRUE);
+			// #868 interplay: repaint presents released tokens nobody
+			// consumed — drain the surplus or this wait returns instantly
+			// for that many frames after every idle stretch.
+			const uint32_t rp =
+			    g_vk_repaint_presents_since_app.exchange(0, std::memory_order_relaxed);
+			if (rp > 0) {
+				uint32_t drained = 0;
+				while (drained < rp + LATE_WEAVE_MAX_DEPTH &&
+				       WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 0, TRUE) ==
+				           WAIT_OBJECT_0) {
+					drained++;
+				}
+				static bool logged_drain = false;
+				if (!logged_drain && drained > 2) {
+					logged_drain = true;
+					U_LOG_W("#912: drained %u surplus bridge tokens after repaints "
+					        "(#868 interplay; logged once)",
+					        drained);
+				}
+			}
+			const uint64_t wait_t0 = os_monotonic_get_ns();
+			const DWORD wr =
+			    WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 100, TRUE);
+			const bool wait_blocked = (os_monotonic_get_ns() - wait_t0) > 2000000; // >2 ms
+			if (wr == WAIT_TIMEOUT) {
+				// Occlusion, not saturation (see on_wait_timeout).
+				g_lw_gov_vk_bridge.on_wait_timeout();
+			} else if (!wait_blocked) {
+				// Instant release (banked token, unknown phase): align to
+				// the DComp compositor tick so the weave gets a constant
+				// phase. A BLOCKING release is already tick-aligned — a
+				// clock wait on top adds a whole period (measured on the
+				// D3D legs: 2x-period intervals + spurious backoff).
+				late_weave_wait_compositor_clock(target->period_hint_ns);
+			}
 		}
 		// Round-robin through the bridge ring. No WSI to acquire from.
 		// vkQueueWaitIdle in the compositor's render path covers the GPU

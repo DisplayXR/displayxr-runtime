@@ -91,7 +91,7 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr);
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue);
+comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint);
 
 /*!
  * Present the rendered image.
