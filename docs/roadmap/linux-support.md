@@ -1,18 +1,27 @@
 # Linux Support
 
-Status: **Preview — code-complete + hardware-validated, not yet GA.** Phases 0/1a/2a/3a
-are code-complete on `main`; hosted + handle (`XR_DXR_xlib_window_binding`) sessions
-bring up the native Vulkan/XCB compositor and render the stereo cube on real Vulkan+X11
-hardware (Ubuntu 22.04, RTX 3080 + Acer SpatialLabs DS1; #708 / #706), and the **Track B
-real srSDK Vulkan weave is HW-validated on the DS1** (lens enables). Runtime **v1.28.0**
-is the first tag with complete Linux support. Distribution = user-level **tarball** via
-`scripts/package_linux.sh` (#705/#713) — no installer asset ships on releases. **CI:** a
-tri-LTS matrix (Ubuntu 22.04/24.04/26.04) is a required check on the runtime and all 5
-demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04 desktops.
-**Still open:** Phase 2b service-side render (**#710**), windowed-3D phase origin
-(**#729/#730**, twin of Windows #85), the deployment target (Ubuntu 26.04 + Intel Arc,
-blocked on hardware), and the Track B shippable re-pin onto a merged `sr-sdk-v*` tag.
-Windows, macOS, and Android ship today.
+Status: **Shipping — code-complete, hardware-validated, and published on every
+release.** Linux is a supported platform alongside Windows, macOS and Android.
+Phases 0/1a/2a/3a are complete on `main`; hosted + handle
+(`XR_DXR_xlib_window_binding`) sessions bring up the native Vulkan/XCB compositor
+and render the stereo cube on real Vulkan+X11 hardware (Ubuntu 22.04, RTX 3080 +
+Acer SpatialLabs DS1; #708 / #706), and the **Track B real srSDK Vulkan weave is
+HW-validated on the DS1** (lens enables). Runtime **v1.28.0** was the first tag
+with complete Linux support. **Distribution:** a `displayxr-runtime_<ver>_amd64.deb`
+is built on every PR and attached to every `v*` GitHub Release (#781), alongside
+the user-level tarball from `scripts/package_linux.sh` (#705/#713). **CI:** a
+tri-LTS matrix (Ubuntu 22.04/24.04/26.04) is a required check on the runtime and
+all 5 demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04
+desktops.
+
+**Still open** — none of these gate an in-process `_handle`/`_hosted` app, which
+is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
+only); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
+windowed weaving awaiting hardware validation (**#817** — X11 is unaffected); the
+deployment target (Ubuntu 26.04 + Intel Arc), blocked on hardware; and the Track B
+shippable re-pin onto a merged `sr-sdk-v*` tag. Note that vendor-side weave
+maturity is tracked separately from runtime readiness — the runtime hands the
+display processor a correct atlas on Linux exactly as it does elsewhere.
 
 ## TL;DR
 

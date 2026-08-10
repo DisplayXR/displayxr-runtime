@@ -8,7 +8,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, Linux, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
 
-**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) is **hardware-validated but pre-GA** — code-complete on `main` and rendering on real Vulkan+X11 hardware, distributed as a tarball via `scripts/package_linux.sh` (no installer asset ships yet). Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
+**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) **ships** — code-complete on `main`, hardware-validated on real Vulkan+X11 hardware, and published as a `.deb` attached to every `v*` release (#781) plus a tarball via `scripts/package_linux.sh`. Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
 
 ## Architecture
 
@@ -105,7 +105,7 @@ First run downloads deps (vcpkg, OpenXR loader). Requires VS 2022 (C++ workload)
 ```
 Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (`cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` failure was a MoltenVK-era issue since resolved. The one dev gotcha is the two-`libvulkan` loader-image conflict (dev build vs installed runtime) — see `docs/getting-started/building.md` and pin `XR_RUNTIME_JSON` / share one loader image.
 
-### Linux (Preview — HW-validated on NVIDIA/Ubuntu 22.04, pre-GA)
+### Linux (shipping — HW-validated on NVIDIA/Ubuntu 22.04; `.deb` on every release)
 ```bash
 # apt deps listed in the script header (Vulkan, XCB, glslang, …)
 ./scripts/build_linux.sh              # headless build + selftest
