@@ -15,6 +15,8 @@
 
 #include "os/os_time.h"
 
+#include <atomic>
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
@@ -39,6 +41,15 @@ static weave_latency_log g_weave_latency_d3d12;
 // Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
 // auto-backoff. Lives at file scope for the same memset reason as the log.
 static late_weave_governor g_lw_gov_d3d12;
+
+// Live-path pacing state (#833) — file scope for the same memset reason.
+// Mirrors comp_d3d11_target.cpp: composed chains pace with the DComp
+// compositor clock (their frame statistics are unreliable), flip chains with
+// GetFrameStatistics behind a behavioral trust gate; repaint presents release
+// waitable tokens the app's weave_mark must drain (#868 interplay).
+static bool g_d3d12_target_is_composed = false;
+static int g_d3d12_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disabled
+static std::atomic<uint32_t> g_d3d12_repaint_presents_since_app{0};
 
 // Late-weave (DXR_LATE_WEAVE=1): same gate as the D3D11 service / VK native
 // compositors — waitable swapchain, max frame latency 1, weave paced to the
@@ -377,6 +388,8 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	// Composed: Flip cost regardless of their alpha mode).
 	const bool present_opaque = debug_get_bool_option_present_opaque();
 	const bool use_transparent = transparent && hwnd != nullptr && !present_opaque;
+	g_d3d12_target_is_composed = use_transparent;
+	g_d3d12_scanout_stats_strikes = 0;
 	if (transparent && hwnd != nullptr && present_opaque) {
 		U_LOG_W("DXR_PRESENT_OPAQUE: HWND flip-model opaque present; DP compose-under-bg keeps "
 		        "the transparent look (#833)");
@@ -417,7 +430,12 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 		desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 	}
 	desc.Flags = 0;
-	if (dxr_late_weave_enabled() && !use_transparent) {
+	// Live-path late-weave: the waitable goes on the COMPOSITION swapchain
+	// too — live+shaped is the product default and must be paceable. Stage 2
+	// there is the DComp compositor clock (see weave_mark); frame statistics
+	// are unreliable on composition swapchains. bc is BACK_BUFFER_COUNT (3)
+	// on both paths already, so no buffer-count change is needed here.
+	if (dxr_late_weave_enabled()) {
 		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
 	target->swapchain_flags = desc.Flags;
@@ -650,7 +668,27 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 extern "C" void
 comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target)
 {
-	if (target->frame_latency_waitable != nullptr) {
+	// Composed chains: statistics are unusable and measured_r is 0, so both
+	// pacers below no-op — leaving Present(1) as the only throttle, blocking
+	// inside c->mutex. Stats-free QPC deadline instead (one repaint per
+	// period, paced out here, unlocked), then compositor-clock alignment so
+	// the repaint weave gets the same constant phase as app frames.
+	if (g_d3d12_target_is_composed) {
+		static uint64_t s_last_ns = 0;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const double period_ns = (g_lw_gov_d3d12.period_ns > 0.0) ? g_lw_gov_d3d12.period_ns : 16.7e6;
+		if (s_last_ns != 0 && now_ns > s_last_ns) {
+			const int64_t remain = (int64_t)(s_last_ns + (uint64_t)period_ns) - (int64_t)now_ns;
+			if (remain > 0 && remain < (int64_t)(period_ns * 2.0)) {
+				os_nanosleep(remain);
+			}
+		}
+		s_last_ns = os_monotonic_get_ns();
+		late_weave_wait_compositor_clock(period_ns);
+		return;
+	}
+
+	if (target->frame_latency_waitable != nullptr && g_d3d12_scanout_stats_strikes >= 0) {
 		// Deliberately NOT WaitForSingleObject(frame_latency_waitable) — the
 		// waitable is a SEMAPHORE, and every wait consumes a token that the
 		// app's own layer_commit needs. A repaint thread waiting on it throttles
@@ -710,31 +748,89 @@ comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target)
 {
 	(void)target;
 	g_weave_latency_d3d12.mark_weave("d3d12", 0, true);
+	// Each repaint's Present releases a waitable token nobody waits for; the
+	// app's weave_mark drains the excess on its next frame (#868 interplay).
+	g_d3d12_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);
 }
 
 extern "C" void
 comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns)
 {
+	bool wait_timed_out = false;
 	if (target->frame_latency_waitable != nullptr) {
+		// #868 interplay: repaint presents released tokens no one consumed —
+		// drain the surplus or the wait below returns instantly for that
+		// many frames after every idle stretch (mirrors comp_d3d11_target).
+		const uint32_t rp =
+		    g_d3d12_repaint_presents_since_app.exchange(0, std::memory_order_relaxed);
+		if (rp > 0) {
+			uint32_t drained = 0;
+			while (drained < rp + LATE_WEAVE_MAX_DEPTH &&
+			       WaitForSingleObjectEx(target->frame_latency_waitable, 0, FALSE) ==
+			           WAIT_OBJECT_0) {
+				drained++;
+			}
+			static bool logged_drain = false;
+			if (!logged_drain && drained > 2) {
+				logged_drain = true;
+				U_LOG_W("Late-weave: drained %u surplus waitable tokens after repaints "
+				        "(#868 interplay; logged once)",
+				        drained);
+			}
+		}
 		// Queue cap: with max latency 1 this releases right after DWM picks
 		// up the previous present.
-		WaitForSingleObject(target->frame_latency_waitable, 100);
+		const uint64_t wait_t0 = os_monotonic_get_ns();
+		wait_timed_out = WaitForSingleObject(target->frame_latency_waitable, 100) == WAIT_TIMEOUT;
+		const bool wait_blocked = (os_monotonic_get_ns() - wait_t0) > 2000000; // >2 ms
 
-		// Scanout pacing: DWM pickup is 2-3 frames before glass on composed
-		// presents, so additionally wait until DXGI frame statistics report
-		// the previous present actually flipped — the DXGI equivalent of
-		// the VK path's vkWaitForPresentKHR pacing. The helper bounds itself
-		// to 3 panel periods so an occluded window never wedges us, and
-		// yields instead of sleeping on fast panels.
-		// At effective depth L>1 (#850) the pacer targets the present L-1
-		// back instead, restoring L-1 frames of CPU/GPU overlap.
-		const UINT relax = (UINT)(g_lw_gov_d3d12.effective - 1);
-		if (target->last_present_count > relax) {
-			late_weave_wait_scanout(target->swapchain, target->last_present_count - relax,
-			                        g_lw_gov_d3d12.period_ns, g_weave_latency_d3d12.freq());
+		if (g_d3d12_target_is_composed) {
+			// Composed chain: a BLOCKING waitable release already lands at a
+			// compositor tick (DWM pickup is tick-aligned) — clock-waiting
+			// on top adds a whole period (measured 2x-period intervals and
+			// spurious backoff on D3D11). Clock alignment only when the
+			// wait returned instantly (banked token, unknown phase).
+			static bool logged_src = false;
+			bool clocked = false;
+			if (!wait_blocked && !wait_timed_out) {
+				clocked = late_weave_wait_compositor_clock(g_lw_gov_d3d12.period_ns);
+			}
+			if (!logged_src) {
+				logged_src = true;
+				U_LOG_W("Late-weave: live-path stage-2 source = %s",
+				        (clocked || wait_blocked) ? "DComp compositor clock / tick-aligned pickup"
+				                                  : "none (waitable only)");
+			}
+		} else if (g_d3d12_scanout_stats_strikes >= 0) {
+			// Scanout pacing: DWM pickup is 2-3 frames before glass, so
+			// additionally wait until DXGI frame statistics report the
+			// previous present actually flipped. At effective depth L>1
+			// (#850) the pacer targets the present L-1 back instead,
+			// restoring L-1 frames of CPU/GPU overlap. Behaviorally gated:
+			// stats that succeed but never advance burn the full 3-period
+			// bound every frame — declare them unusable after a few strikes.
+			const UINT relax = (UINT)(g_lw_gov_d3d12.effective - 1);
+			if (target->last_present_count > relax) {
+				const enum late_weave_scanout_result r = late_weave_wait_scanout(
+				    target->swapchain, target->last_present_count - relax,
+				    g_lw_gov_d3d12.period_ns, g_weave_latency_d3d12.freq());
+				if (r == LATE_WEAVE_SCANOUT_TIMED_OUT) {
+					if (++g_d3d12_scanout_stats_strikes >= 8) {
+						g_d3d12_scanout_stats_strikes = -1;
+						U_LOG_W("Late-weave: frame statistics stale on this "
+						        "chain — stage-2 scanout wait disabled");
+					}
+				} else if (r == LATE_WEAVE_SCANOUT_REACHED) {
+					g_d3d12_scanout_stats_strikes = 0;
+				}
+			}
 		}
 	}
 	g_weave_latency_d3d12.mark_weave("d3d12", predicted_display_time_ns);
+	if (wait_timed_out) {
+		// Occlusion, not saturation — see late_weave_governor::on_wait_timeout.
+		g_lw_gov_d3d12.on_wait_timeout();
+	}
 	if (target->frame_latency_waitable != nullptr) {
 		const int tr = g_lw_gov_d3d12.on_mark(g_weave_latency_d3d12.freq());
 		if (tr != 0) {
