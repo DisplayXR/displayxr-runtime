@@ -1,0 +1,9 @@
+; Copyright 2026, The DisplayXR Project
+; SPDX-License-Identifier: BSL-1.0
+; Exports for VK_LAYER_DXR_queue_lock (#902). The code deliberately carries no
+; __declspec(dllexport) — vk_layer.h/vulkan.h declare these names with plain /
+; dllimport linkage and MSVC rejects mismatched redefinitions (C2375).
+EXPORTS
+    vkGetInstanceProcAddr
+    vkGetDeviceProcAddr
+    vkNegotiateLoaderLayerInterfaceVersion

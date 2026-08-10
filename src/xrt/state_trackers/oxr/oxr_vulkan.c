@@ -339,7 +339,51 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 	modified_info.ppEnabledExtensionNames = u_string_list_get_data(instance_ext_list);
 	modified_info.enabledExtensionCount = u_string_list_get_size(instance_ext_list);
 
+	/*
+	 * #902: inject VK_LAYER_DXR_queue_lock — per-queue submit serialization so
+	 * the #868 repaint can share the app's VkQueue on GPUs whose graphics
+	 * family exposes a single queue (Intel iGPUs, AMD). enable2 puts the
+	 * runtime in-path here, so the app never knows. The compositor engages the
+	 * shared-queue tier only after resolving the layer's marker entry point on
+	 * the created device (handshake, not hope) — so a failed injection
+	 * degrades, never breaks. DXR_VK_QUEUE_MODE=off|queue skips injection.
+	 */
+	const char **merged_layers = NULL;
+	{
+		const char *mode = getenv("DXR_VK_QUEUE_MODE");
+		bool inject = !(mode != NULL && (strcmp(mode, "off") == 0 || strcmp(mode, "queue") == 0));
+		uint32_t app_layer_count = createInfo->vulkanCreateInfo->enabledLayerCount;
+		const char *const *app_layers = createInfo->vulkanCreateInfo->ppEnabledLayerNames;
+		for (uint32_t i = 0; inject && i < app_layer_count; i++) {
+			if (strcmp(app_layers[i], "VK_LAYER_DXR_queue_lock") == 0) {
+				inject = false; // already requested
+			}
+		}
+		if (inject) {
+			merged_layers = U_TYPED_ARRAY_CALLOC(const char *, app_layer_count + 1);
+			for (uint32_t i = 0; i < app_layer_count; i++) {
+				merged_layers[i] = app_layers[i];
+			}
+			merged_layers[app_layer_count] = "VK_LAYER_DXR_queue_lock";
+			modified_info.ppEnabledLayerNames = merged_layers;
+			modified_info.enabledLayerCount = app_layer_count + 1;
+		}
+	}
+
 	*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
+
+	// #902: the layer is an optimization, never a break — if the loader can't
+	// find it, retry with the app's own layer list and let the compositor
+	// fall back (no marker → repaint stays off on single-queue GPUs).
+	if (merged_layers != NULL && *vulkanResult == VK_ERROR_LAYER_NOT_PRESENT) {
+		oxr_warn(log,
+		         "#902: VK_LAYER_DXR_queue_lock not found by the Vulkan loader — retrying without it "
+		         "(shared-queue late-weave repaint unavailable; check the layer manifest / VK_LAYER_PATH)");
+		modified_info.ppEnabledLayerNames = createInfo->vulkanCreateInfo->ppEnabledLayerNames;
+		modified_info.enabledLayerCount = createInfo->vulkanCreateInfo->enabledLayerCount;
+		*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
+	}
+	free(merged_layers);
 
 
 	// Logging
