@@ -258,6 +258,10 @@ if [ "$BUILD_APPS" = "ON" ]; then
 export XR_RUNTIME_JSON="$BUILD_DIR/openxr_displayxr-dev.json"
 export LD_LIBRARY_PATH="$OPENXR_DIR/lib:\${LD_LIBRARY_PATH:-}"
 export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"
+# #902: dev-tree manifest for VK_LAYER_DXR_queue_lock, so the runtime-injected
+# queue-serialization layer is discoverable (shared-queue late-weave repaint on
+# single-graphics-queue GPUs). Installed builds use the system manifest path.
+export VK_LAYER_PATH="$BUILD_DIR/src/xrt/targets/vk_layer\${VK_LAYER_PATH:+:\$VK_LAYER_PATH}"
 export OXR_ENABLE_VK_NATIVE_COMPOSITOR="\${OXR_ENABLE_VK_NATIVE_COMPOSITOR:-1}"
 export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
 exec "$APP_DIR/build/$APP" "\$@"

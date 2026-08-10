@@ -380,6 +380,15 @@ struct comp_vk_native_compositor
 	{
 		int enabled;                    //!< DXR_WEAVE_REPAINT=0 disables.
 		int force;                      //!< DXR_WEAVE_REPAINT_FORCE=1 correctness probe.
+
+		/*!
+		 * #902: shared-queue tier — no runtime-owned queue exists (single
+		 * graphics-queue GPU), but VK_LAYER_DXR_queue_lock is live in the
+		 * device chain (marker resolved), so the repaint submits on the APP's
+		 * queue and the layer serializes every vkQueue* call per-queue. Set
+		 * only after the marker handshake; never assumed.
+		 */
+		int shared_queue;
 		bool armed;                     //!< False on zero-copy: the atlas IS the app's image.
 		bool app_frame_in_progress;     //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
@@ -2861,12 +2870,21 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	/*
 	 * #868: every submit and the present below go to THIS queue. The app frame
 	 * uses the app's queue (the one it handed us); a repaint uses the
-	 * runtime-owned one. They must never be the same object: a VkQueue is
-	 * externally synchronised, and the runtime cannot serialise the app's own
-	 * submits, so sharing it is undefined behaviour — measured as
-	 * VK_ERROR_DEVICE_LOST. The repaint loop refuses to start without one.
+	 * runtime-owned one where the driver gave us one. They must never be the
+	 * same object UNSERIALIZED: a VkQueue is externally synchronised, and the
+	 * runtime cannot serialise the app's own submits from outside the call —
+	 * sharing it bare is undefined behaviour, measured as
+	 * VK_ERROR_DEVICE_LOST.
+	 *
+	 * #902 shared-queue tier: on single-graphics-queue GPUs (Intel iGPUs,
+	 * AMD) there IS no runtime-owned queue — the repaint then submits on the
+	 * app's queue, made safe by VK_LAYER_DXR_queue_lock serializing every
+	 * vkQueue* call per-queue INSIDE the call, app's own submits included.
+	 * The repaint loop only starts in this mode after resolving the layer's
+	 * marker on the device (see repaint.shared_queue).
 	 */
-	VkQueue queue = is_repaint ? c->repaint_queue : vk->main_queue->queue;
+	VkQueue queue =
+	    (is_repaint && c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : vk->main_queue->queue;
 
 	// Re-sync the output surface against the live ANativeWindow (Android).
 	// On background→card the SurfaceView's surface is destroyed; presenting
@@ -4868,16 +4886,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	 */
 	{
 		/*
-		 * OPT-IN on VK (DXR_WEAVE_REPAINT=1), unlike D3D11/D3D12/GL where it
-		 * defaults on. This is a design blocker, not a tuning choice.
+		 * Why the repaint needs MORE than the env var on VK.
 		 *
 		 * vk->main_queue->queue is the APP's queue. A VkQueue is "externally
 		 * synchronised", which means the APPLICATION must serialise access —
 		 * and the app submits its own scene rendering on its own thread,
 		 * outside any OpenXR call and outside any lock the runtime controls.
 		 * c->mutex serialises the compositor's own two callers and cannot
-		 * cover the app's submits, so a repaint thread racing them is unsafe
-		 * by construction. Validation confirms it:
+		 * cover the app's submits, so a bare repaint thread racing them is
+		 * unsafe by construction. Validation confirms it:
 		 *
 		 *   vkQueueSubmit(): THREADING ERROR : object of type VkQueue is
 		 *   simultaneously used in current thread A and thread B
@@ -4889,41 +4906,95 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * D3D11 had the same race on the app's immediate context and WAS
 		 * fixable, because ID3D10Multithread::Enter/Leave takes a lock the
 		 * DRIVER enforces for every caller including the app. Vulkan exposes
-		 * no such lock, so the fix has to come from somewhere else: a queue
-		 * the runtime owns exclusively, or the #875 single-renderer model.
-		 */
-		/*
-		 * #868: the repaint requires a queue the RUNTIME owns exclusively.
-		 * Without one, submitting from the repaint thread races the app's own
-		 * submits on the same VkQueue — undefined behaviour, measured as
-		 * VK_ERROR_DEVICE_LOST. So the loop is gated on actually having it, not
-		 * merely on the env var.
+		 * no such lock — so the runtime supplies safety one of two ways
+		 * (#902, docs/roadmap/vk-late-weave-queue-serialization.md):
+		 *
+		 *   tier 1 — a queue the runtime owns exclusively (reserved at
+		 *            xrCreateVulkanDeviceKHR when the graphics family has a
+		 *            spare queue; NVIDIA);
+		 *   tier 2 — the SAME queue as the app, made safe by the injected
+		 *            VK_LAYER_DXR_queue_lock, which is the D3D11 driver lock
+		 *            recreated at the loader level: every vkQueue* call from
+		 *            every in-process caller (app engine, repaint thread,
+		 *            vendor DP internals) takes a per-queue mutex INSIDE the
+		 *            call (single-graphics-queue GPUs: Intel iGPUs, AMD).
+		 *
+		 * The loop is gated on actually having one of the two, not merely on
+		 * the env var.
 		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
-		if (c->repaint_queue == VK_NULL_HANDLE) {
+
+		/*
+		 * #902: tier selection. DXR_VK_QUEUE_MODE:
+		 *   auto (default) — dedicated runtime queue where the driver gave
+		 *                    one (tier 1); else shared-queue serialized by
+		 *                    VK_LAYER_DXR_queue_lock (tier 2); else repaint
+		 *                    off, pacing only (tier 3).
+		 *   queue — tier 1 only (no layer use).
+		 *   layer — force tier 2 even when a runtime queue exists, so the
+		 *           layer path is testable on multi-queue GPUs.
+		 *   off   — no layer injection (oxr_vulkan.c) and no repaint.
+		 */
+		const char *qm = getenv("DXR_VK_QUEUE_MODE");
+		bool mode_layer_ok = (qm == NULL) || (strcmp(qm, "auto") == 0) || (strcmp(qm, "layer") == 0);
+		if (qm != NULL && strcmp(qm, "off") == 0) {
+			c->repaint.enabled = 0;
+		}
+		if (qm != NULL && strcmp(qm, "layer") == 0 && c->repaint_queue != VK_NULL_HANDLE) {
+			U_LOG_W("#902: DXR_VK_QUEUE_MODE=layer — ignoring the runtime-owned queue (test "
+			        "override, forcing the shared-queue tier)");
+			c->repaint_queue = VK_NULL_HANDLE;
+		}
+
+		/*
+		 * #902 marker handshake: is the queue-lock layer live in THIS
+		 * device's chain? The repaint may only share the app's queue when
+		 * the layer actually serializes it — resolve the layer's marker
+		 * entry point rather than assume the injection worked.
+		 */
+		bool layer_live = c->vk.vkGetDeviceProcAddr != NULL &&
+		                  c->vk.vkGetDeviceProcAddr(c->vk.device, "vkGetQueueLockMarkerDXR") != NULL;
+		c->repaint.shared_queue = (c->repaint_queue == VK_NULL_HANDLE && layer_live && mode_layer_ok &&
+		                           c->repaint.enabled == 1)
+		                              ? 1
+		                              : 0;
+
+		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
 			if (c->repaint.enabled == 1) {
 				U_LOG_W("#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
-				        "family was saturated) — repaint disabled. Sharing the app's queue "
-				        "is undefined behaviour and loses the device.");
+				        "family was saturated) and no queue-lock layer (#902 marker %s) — "
+				        "repaint disabled. Sharing the app's queue bare is undefined "
+				        "behaviour and loses the device.",
+				        layer_live ? "resolved but mode excludes it" : "absent");
 			}
 			c->repaint.enabled = 0;
 		} else {
 			/*
 			 * A command pool is externally synchronised too, so the replay
 			 * cannot record from the renderer's pool while the app frame
-			 * uses it on the other queue. Give the repaint its own.
+			 * uses it concurrently. Give the repaint its own — on the
+			 * runtime queue's family (tier 1) or the app's family (tier 2;
+			 * same family by construction, it IS the graphics family).
 			 */
+			uint32_t rp_family = c->repaint_queue != VK_NULL_HANDLE
+			                         ? (uint32_t)c->repaint_queue_family
+			                         : c->queue_family_index;
 			VkCommandPoolCreateInfo rp_ci = {
 			    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 			    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-			    .queueFamilyIndex = (uint32_t)c->repaint_queue_family,
+			    .queueFamilyIndex = rp_family,
 			};
 			if (c->vk.vkCreateCommandPool(c->vk.device, &rp_ci, NULL, &c->repaint_cmd_pool) !=
 			    VK_SUCCESS) {
+				// Also drop enabled: the old code left it set here, and the
+				// start gate below would spin up a repaint thread with no
+				// queue to submit on.
 				U_LOG_W("#868: failed to create the repaint command pool — repaint disabled");
 				c->repaint_queue = VK_NULL_HANDLE;
-			} else {
+				c->repaint.shared_queue = 0;
+				c->repaint.enabled = 0;
+			} else if (c->repaint_queue != VK_NULL_HANDLE) {
 				U_LOG_W("#868: repaint will submit on the runtime-owned queue "
 				        "(family %d index %d) with its own fence and command pool",
 				        c->repaint_queue_family, c->repaint_queue_index);
@@ -4932,6 +5003,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 				// specific queue instead of guessed at.
 				U_LOG_W("#868: queue handles — app=%p repaint=%p",
 				        (void *)c->vk.main_queue->queue, (void *)c->repaint_queue);
+			} else {
+				U_LOG_W("#902: repaint will submit on the APP's queue %p, serialized "
+				        "per-call by VK_LAYER_DXR_queue_lock (shared-queue tier — single "
+				        "graphics-queue GPU)",
+				        (void *)c->vk.main_queue->queue);
 			}
 		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
