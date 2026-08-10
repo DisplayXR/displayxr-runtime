@@ -61,6 +61,15 @@ late-weave **waitable** — i.e. pacing and latency, not GPU. Quote it that way.
 Full-cover unshaped content (the cube apps) is unaffected and keeps the
 3.7–4.7× Independent Flip win.
 
+This also reconciles two measurements that look contradictory. On a **shaped**
+avatar, baked shows *no* dwm win (≈38 dwm, same as live) because the region
+denies the flip. On a config that is effectively **unshaped** — region-on-hover
+with the cursor parked — baked does win the flip (0.93 dwm vs live's 4.80). Same
+mechanism, opposite headline, decided entirely by whether a region is set. So a
+baked number quoted without stating the shaping state is unusable; always say
+which. And since shaped is the product default (above), the flip is off the
+table and the smear of rule 5 is the deciding factor.
+
 ## Rules (each learned the hard way)
 
 1. **Shaping only punches through what you carve.** Kept surface (OS frame,
@@ -81,12 +90,24 @@ Full-cover unshaped content (the cube apps) is unaffected and keeps the
    adapter** (`DXR_VK_FORCE_GPU=igpu` on Optimus boxes): cross-adapter WGC
    delivers black/no frames → holes flatten to black (the "opaque squared
    Local2D" failure; leia-plugin#119).
-5. **Bake lag is only perceptible under motion.** Over a static desktop the
-   ~1-frame-old full-monitor capture is pixel-identical at any window
-   position (given capture self-exclusion), so drags over static desktops
-   are clean; animated content behind the blend band is the residual case.
-   True dynamic live↔baked switching on drag brackets would need runtime
-   swapchain recreation — not implemented, by choice.
+5. **Bake lag breaks ordinary desktop interaction — it is not a narrow
+   residual.** *(Corrected 2026-08-10; the earlier wording claimed drags were
+   clean and animated content behind was an edge case. That was wrong and it
+   understated the failure.)* Moving **our own** window over a *static*
+   desktop is clean, because the ~1-frame-old full-monitor capture is
+   pixel-identical at any position given capture self-exclusion. But
+   **dragging any other window behind ours makes the background visibly
+   smear** — verified by hand on the panel — and that is ordinary desktop
+   use, not a corner case. It is **not tunable**: bisected one knob at a
+   time, a fresher capture (uncapped vs 66 ms) changes nothing and painting
+   more often (61 Hz vs 22 Hz) is *worse*. It is bake or don't. True dynamic
+   live↔baked switching on drag brackets would need runtime swapchain
+   recreation — not implemented, by choice.
+   **Consequence: live is the shippable composition mode for overlay apps**,
+   and baked is only defensible for content with no meaningful background
+   behind it. Measured cost of choosing live, cursor parked, six-lever
+   avatar config: **+4.90 system points, essentially all dwm** (10.36 baked
+   → 15.26 live) — the price of a correct background.
 6. **Window-space-stamped chrome under baked composition needs plug-in
    ≥ v2.1.1** (leia-plugin#121, fixed): older DPs dropped it from the gated
    output (present in the input atlas, missing after the gate). Local2D
