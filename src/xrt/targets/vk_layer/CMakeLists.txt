@@ -8,6 +8,12 @@
 
 add_library(VkLayer_DXR_queue_lock MODULE queue_lock_layer.c)
 
+# Windows exports come from the .def (no dllexport in code — vk_layer.h's plain
+# declarations clash with dllexport redefinitions, MSVC C2375).
+if(WIN32)
+	target_sources(VkLayer_DXR_queue_lock PRIVATE VkLayer_DXR_queue_lock.def)
+endif()
+
 target_include_directories(VkLayer_DXR_queue_lock PRIVATE ${Vulkan_INCLUDE_DIR})
 
 if(NOT WIN32)

@@ -31,6 +31,13 @@
  * OS mutex primitive.
  */
 
+/*
+ * VK_NO_PROTOTYPES: this layer calls NO Vulkan function directly (everything
+ * goes through chained pointers), and on Windows vulkan.h declares
+ * vkGetInstanceProcAddr/vkGetDeviceProcAddr as __declspec(dllimport) — which
+ * clashes (MSVC C2375) with this file DEFINING those very entry points.
+ */
+#define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
@@ -57,7 +64,14 @@ ql_mutex_init(ql_mutex_t *m)
 {
 	InitializeSRWLock(m);
 }
-#define QL_EXPORT __declspec(dllexport)
+/*
+ * No __declspec(dllexport): vk_layer.h declares
+ * vkNegotiateLoaderLayerInterfaceVersion with plain linkage, and MSVC rejects
+ * a dllexport redefinition (C2375). Exports come from the .def file instead
+ * (VkLayer_DXR_queue_lock.def) — PE has no ELF-style interposition, so plain
+ * exports are safe here.
+ */
+#define QL_EXPORT
 #else
 #include <pthread.h>
 typedef pthread_mutex_t ql_mutex_t;
