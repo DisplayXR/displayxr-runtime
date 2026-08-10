@@ -20,6 +20,13 @@ set_target_properties(
 					  C_VISIBILITY_PRESET hidden
 	)
 
+# Belt and braces vs the ELF interposition trap (see the TRAP note in
+# queue_lock_layer.c): libvulkan also exports vkGetInstanceProcAddr, and a
+# non-symbolic internal reference would bind to the loader's copy.
+if(NOT WIN32 AND NOT APPLE)
+	target_link_options(VkLayer_DXR_queue_lock PRIVATE "LINKER:-Bsymbolic")
+endif()
+
 # Dev-tree manifest with an absolute library_path — run scripts point
 # VK_LAYER_PATH here. (Installed builds get a relative-path manifest via the
 # packaging step instead; Windows additionally needs the ExplicitLayers

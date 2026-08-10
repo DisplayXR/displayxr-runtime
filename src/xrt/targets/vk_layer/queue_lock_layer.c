@@ -526,13 +526,24 @@ ql_QueueInsertDebugUtilsLabelEXT(VkQueue queue, const VkDebugUtilsLabelEXT *pLab
  *
  * Proc-addr dispatch.
  *
+ * TRAP (found the hard way, on-box deadlock): the implementations MUST be
+ * static, with the exported vkGetInstanceProcAddr/vkGetDeviceProcAddr as thin
+ * wrappers. `vkGetInstanceProcAddr` is a global default-visibility symbol that
+ * libvulkan.so.1 ALSO exports — and the app loads libvulkan first, so ELF
+ * interposition binds a non-static internal reference (including taking the
+ * function's address in the negotiate struct) to the LOADER's export, not
+ * ours. The loader then believes the layer's GIPA is its own public one,
+ * resolves the "first layer CreateInstance" to the public vkCreateInstance,
+ * and re-enters itself under its global lock — a self-deadlock inside
+ * vkCreateInstance. A static function's address is immune to interposition.
+ * (CMake adds -Bsymbolic as belt and braces on ELF.)
  */
 
-QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetDeviceProcAddr(VkDevice device, const char *pName);
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ql_GetDeviceProcAddr(VkDevice device, const char *pName);
 
-QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetInstanceProcAddr(VkInstance instance, const char *pName);
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ql_GetInstanceProcAddr(VkInstance instance, const char *pName);
 
 /*!
  * For an intercepted device entry point: return our wrapper only when the
@@ -543,7 +554,7 @@ static PFN_vkVoidFunction
 ql_device_intercept(struct ql_device *d, const char *pName)
 {
 	if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
-		return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+		return (PFN_vkVoidFunction)ql_GetDeviceProcAddr;
 	}
 	if (strcmp(pName, "vkDestroyDevice") == 0) {
 		return (PFN_vkVoidFunction)ql_DestroyDevice;
@@ -593,8 +604,8 @@ ql_device_intercept(struct ql_device *d, const char *pName)
 	return NULL;
 }
 
-QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetDeviceProcAddr(VkDevice device, const char *pName)
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ql_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
 	struct ql_device *d = NULL;
 	if (device != NULL) {
@@ -614,11 +625,11 @@ vkGetDeviceProcAddr(VkDevice device, const char *pName)
 	return d->gdpa(device, pName);
 }
 
-QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
-vkGetInstanceProcAddr(VkInstance instance, const char *pName)
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ql_GetInstanceProcAddr(VkInstance instance, const char *pName)
 {
 	if (strcmp(pName, "vkGetInstanceProcAddr") == 0) {
-		return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
+		return (PFN_vkVoidFunction)ql_GetInstanceProcAddr;
 	}
 	if (strcmp(pName, "vkCreateInstance") == 0) {
 		return (PFN_vkVoidFunction)ql_CreateInstance;
@@ -653,6 +664,26 @@ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
 
 /*
  *
+ * Exports. The manifest-declared entry points are thin wrappers over the
+ * static implementations — see the interposition TRAP note above; the
+ * loader must receive pointers that can only ever be OURS.
+ *
+ */
+
+QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetInstanceProcAddr(VkInstance instance, const char *pName)
+{
+	return ql_GetInstanceProcAddr(instance, pName);
+}
+
+QL_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetDeviceProcAddr(VkDevice device, const char *pName)
+{
+	return ql_GetDeviceProcAddr(device, pName);
+}
+
+/*
+ *
  * Loader negotiation (layer interface v2).
  *
  */
@@ -667,8 +698,8 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 	pVersionStruct->loaderLayerInterfaceVersion = 2;
-	pVersionStruct->pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
-	pVersionStruct->pfnGetDeviceProcAddr = vkGetDeviceProcAddr;
+	pVersionStruct->pfnGetInstanceProcAddr = ql_GetInstanceProcAddr;
+	pVersionStruct->pfnGetDeviceProcAddr = ql_GetDeviceProcAddr;
 	pVersionStruct->pfnGetPhysicalDeviceProcAddr = NULL;
 	return VK_SUCCESS;
 }
