@@ -4806,29 +4806,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// chroma-key-free). Safe no-op if the DP lacks the slot (sim_display) or
 	// display_processor is NULL.
 	//
-	// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE. On the
-	// default transparent path the VK→D3D11 bridge presents a DComp
-	// PREMULTIPLIED swapchain and DWM blends the live desktop into our alpha=0
-	// holes — precisely the client_presents=true contract in
-	// xrt_display_processor_vk.h. Passing false made the DP ALSO
-	// compose-under-bg: a WGC desktop capture, baked ~1 frame stale, that the
-	// post-weave alpha gate then discards. Wasted work, the documented frame of
-	// lag in the blend band, and WGC delivery is charged to dwm at the
-	// desktop's change rate — a moving cursor alone drives it. Mirrors the
-	// dcomp gate in comp_vk_native_target (transparent && hwnd) plus the
-	// alpha-mode choice. The c->hwnd member itself is compiled only on
-	// Windows, so the predicate is #ifdef'd: macOS/Linux keep today's value
-	// (false) — compose-under-bg (WGC) is a Windows-only mechanism, and the
-	// macOS alpha-native path has its own contract (is_alpha_native).
+	// client_presents=false — DELIBERATELY; #904's true was reverted after a
+	// hardware eyeball. The de-occlusion band (pixels where SOME but not all
+	// views are transparent — the parallax fringe around 3D content) cannot
+	// come from DWM live blending: the SR weaver destroys per-pixel alpha and
+	// the alpha-gate reconstructs only the binary all-views-transparent mask.
+	// The band is either the DP's compose-under-bg (~1-frame bake — the
+	// product spec: live desktop in the holes, bake only in the band) or it
+	// is BLACK. #904 disabled the compose calling it wasted work; the dwm
+	// saving partly bought black de-occlusions. WGC cost is attacked via
+	// capture throttling instead. client_presents=true remains correct for
+	// true client-side presents (#551 IPC) and bandless content.
 	if (c->display_processor != NULL) {
-		bool runtime_transparent_present = false;
-#ifdef XRT_OS_WINDOWS
-		runtime_transparent_present =
-		    transparent_background && c->hwnd != NULL && !debug_get_bool_option_present_opaque();
-#endif
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background,
-		    runtime_transparent_present);
+		    false);
 
 		// #613 / #68 — tell the DP whether the app self-presents only the canvas
 		// (shared-texture apps) vs the full target (handle apps). Gates the

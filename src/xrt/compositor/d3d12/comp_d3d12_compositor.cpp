@@ -3319,21 +3319,16 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			        (unsigned)output_fmt, (void *)c->target);
 
 			// Forward session-level transparency (#573 — chroma-key-free).
-			// The in-process present is opaque ONLY under DXR_PRESENT_OPAQUE.
-			// On the default transparent path the target is a DComp
-			// PREMULTIPLIED swapchain and DWM blends the live desktop into our
-			// alpha=0 holes — precisely the client_presents=true contract in
-			// xrt_display_processor_d3d12.h. Passing false made the DP ALSO
-			// compose-under-bg: a WGC desktop capture baked ~1 frame stale and
-			// then discarded by the post-weave alpha gate. Wasted work, the
-			// documented frame of lag in the blend band, and WGC delivery is
-			// charged to dwm at the desktop's change rate. Mirrors
-			// use_transparent in comp_d3d12_target.
-			const bool runtime_transparent_present =
-			    transparent_background && c->hwnd != nullptr &&
-			    !debug_get_bool_option_present_opaque_comp();
+			// client_presents=false — DELIBERATELY; #904's true was reverted
+			// after a hardware eyeball. The de-occlusion band (partial-alpha
+			// parallax fringe) cannot come from DWM blending: the weaver
+			// destroys per-pixel alpha and the gate reconstructs only the
+			// binary all-views-transparent mask, so the band is either the
+			// DP's ~1-frame bake (the product spec) or BLACK. WGC cost is
+			// attacked via capture throttling, not by dropping the band.
+			// See comp_d3d11_compositor.cpp for the full rationale.
 			xrt_display_processor_d3d12_set_transparent_background(
-			    c->display_processor, transparent_background, runtime_transparent_present);
+			    c->display_processor, transparent_background, false);
 
 			// #68: tell the DP whether the app self-presents only the canvas
 			// (texture app) vs the runtime presenting the full target (handle).
