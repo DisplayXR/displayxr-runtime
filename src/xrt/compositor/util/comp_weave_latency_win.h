@@ -251,6 +251,23 @@ struct late_weave_governor
 	//! Call once per paced frame (end of the weave-mark pacer). Returns +1 when
 	//! the depth rose, −1 when it fell, 0 otherwise; the caller applies
 	//! SetMaximumFrameLatency and reads `effective`.
+	/*!
+	 * The waitable wait TIMED OUT (DWM stopped picking up presents —
+	 * occluded/minimized window, not saturation). A ~100 ms timeout sits
+	 * BELOW the 250 ms pause threshold in on_mark, so without this the EMA
+	 * reads occlusion as a saturated pipeline, backs off to max depth, and
+	 * probe-dwell doubling pins it there for minutes after restore. Treat
+	 * it exactly like the pause: reset the signal, contribute nothing.
+	 */
+	void
+	on_wait_timeout()
+	{
+		last_mark_qpc = 0;
+		interval_ema_ns = 0.0;
+		over_frames = 0;
+		calm_frames = 0;
+	}
+
 	int
 	on_mark(uint64_t freq_hz)
 	{
@@ -357,11 +374,27 @@ struct late_weave_governor
  * without a raised timer resolution, which is under one refresh at 60 Hz but
  * 2.5 refreshes at 165 Hz — enough to miss the very frame we are pacing to.
  */
-inline void
+/*!
+ * Result of one scanout-wait attempt, for the behavioral trust gate: a chain
+ * whose GetFrameStatistics *fails* is cheap (we return immediately), but a
+ * chain whose stats SUCCEED yet never advance would burn the full bound every
+ * frame. Callers count consecutive TIMED_OUT results and stop calling after a
+ * few — the stats are then declared unusable for this chain (composition
+ * swapchains commonly behave this way; a one-shot probe cannot tell, since
+ * DXGI also returns DISJOINT transiently on the first call after presenting).
+ */
+enum late_weave_scanout_result
+{
+	LATE_WEAVE_SCANOUT_REACHED,   //!< stats advanced to the target present
+	LATE_WEAVE_SCANOUT_NO_STATS,  //!< GetFrameStatistics failed (free)
+	LATE_WEAVE_SCANOUT_TIMED_OUT, //!< stats succeed but never advanced (paid full bound)
+};
+
+inline enum late_weave_scanout_result
 late_weave_wait_scanout(IDXGISwapChain *sc, UINT target_present, double period_ns, uint64_t freq_hz)
 {
 	if (sc == nullptr || target_present == 0 || freq_hz == 0) {
-		return;
+		return LATE_WEAVE_SCANOUT_NO_STATS;
 	}
 	double bound_ns = (period_ns > 0.0) ? period_ns * 3.0 : 50e6;
 	if (bound_ns < 5e6) {
@@ -376,13 +409,16 @@ late_weave_wait_scanout(IDXGISwapChain *sc, UINT target_present, double period_n
 
 	for (;;) {
 		DXGI_FRAME_STATISTICS stats = {};
-		if (FAILED(sc->GetFrameStatistics(&stats)) || stats.PresentCount >= target_present) {
-			return;
+		if (FAILED(sc->GetFrameStatistics(&stats))) {
+			return LATE_WEAVE_SCANOUT_NO_STATS;
+		}
+		if (stats.PresentCount >= target_present) {
+			return LATE_WEAVE_SCANOUT_REACHED;
 		}
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		if ((uint64_t)now.QuadPart >= deadline) {
-			return;
+			return LATE_WEAVE_SCANOUT_TIMED_OUT;
 		}
 		if (period_ns > 0.0 && period_ns < 8e6) {
 			SwitchToThread();
@@ -390,6 +426,48 @@ late_weave_wait_scanout(IDXGISwapChain *sc, UINT target_present, double period_n
 			Sleep(1);
 		}
 	}
+}
+
+/*!
+ * Composed-chain freshness stage (#833/live-path late-weave): a composition
+ * swapchain's waitable releases at DWM *pickup* (~1 interval before scanout)
+ * and its frame statistics are unreliable, so the scanout-proximate signal
+ * there is DWM's own compositor clock. Waiting for the next tick right before
+ * the weave records aligns the weave (and its eye prediction) to a constant
+ * phase of the composition interval. Resolved dynamically — the export exists
+ * on Win10 1809+; absence just degrades to waitable-only pacing.
+ *
+ * Returns true when it waited on the clock, false when unavailable.
+ */
+inline bool
+late_weave_wait_compositor_clock(double period_ns)
+{
+	typedef HRESULT(WINAPI * pfn_wait_clock)(UINT, const HANDLE *, DWORD);
+	static pfn_wait_clock s_fn = nullptr;
+	static bool s_resolved = false;
+	if (!s_resolved) {
+		s_resolved = true;
+		HMODULE m = GetModuleHandleW(L"dcomp.dll");
+		if (m == nullptr) {
+			m = LoadLibraryW(L"dcomp.dll");
+		}
+		if (m != nullptr) {
+			s_fn = (pfn_wait_clock)GetProcAddress(m, "DCompositionWaitForCompositorClock");
+		}
+	}
+	if (s_fn == nullptr) {
+		return false;
+	}
+	// Bounded: a stopped compositor clock (occlusion) must not wedge the
+	// render thread. 2 periods covers a missed tick; occluded windows hit
+	// the timeout and the caller's occlusion guard handles the rest.
+	DWORD timeout_ms = 34;
+	if (period_ns > 0.0) {
+		const double t = period_ns * 2.0 / 1e6;
+		timeout_ms = (t < 4.0) ? 4 : (t > 100.0) ? 100 : (DWORD)t;
+	}
+	s_fn(0, nullptr, timeout_ms);
+	return true;
 }
 
 inline void
