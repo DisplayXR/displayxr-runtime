@@ -322,6 +322,13 @@ struct comp_vk_native_compositor
 	//! Display refresh rate in Hz.
 	float display_refresh_rate;
 
+	//! Last present origin handed to the DP (panel-relative px) — an origin
+	//! change means the window is being dragged; the target clamps its queue
+	//! shallow for the duration so the weave phase stays snapped (#912).
+	int last_present_origin_x;
+	int last_present_origin_y;
+	bool have_last_present_origin;
+
 	/*!
 	 * #868: serialises the frame path against the repaint replay.
 	 *
@@ -5591,9 +5598,21 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		// display-scoped (its present origin defaults to (0,0)).
 		return;
 	}
+	const int ox = m.window_screen_left - m.display_screen_left;
+	const int oy = m.window_screen_top - m.display_screen_top;
+	// Origin changed ⟹ the window is being dragged: have the target clamp
+	// its bridge queue shallow so the weave phase sampled here is still
+	// where the window IS when the frame reaches glass (#912 drag-shallow;
+	// repro was 3D stutter on avatar RMB-move at governor depth 2-3).
+	if (c->have_last_present_origin && c->target != NULL &&
+	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
+		comp_vk_native_target_note_origin_motion(c->target);
+	}
+	c->last_present_origin_x = ox;
+	c->last_present_origin_y = oy;
+	c->have_last_present_origin = true;
 	xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)c->display_processor,
-	                                            m.window_screen_left - m.display_screen_left,
-	                                            m.window_screen_top - m.display_screen_top);
+	                                            ox, oy);
 }
 
 bool

@@ -360,6 +360,16 @@ struct comp_vk_native_target
 	UINT dcomp_swapchain_flags;
 	//! #870 — requested bridge queue depth (DXR_VK_BRIDGE_PACING), 0 = off.
 	int dcomp_pacing_depth;
+	//! Drag-shallow (#912): while the present origin is moving (window drag)
+	//! the weave phase is anchored to the origin sampled at WEAVE time, but
+	//! the frame reaches glass queue-depth ticks later — at governor depth
+	//! 2-3 that is a 30-50 ms phase error, visible as 3D stutter during the
+	//! drag (repro: avatar RMB-move; the repaint path paces shallow and was
+	//! clean). While origin motion is recent, clamp the bridge queue to 1
+	//! (banked tokens drained) so phase error returns to ~1 tick; restore
+	//! the governor depth when the drag ends.
+	uint64_t origin_motion_until_ns;
+	bool drag_shallow;
 	//! #870 — frame-latency waitable on the BRIDGE swapchain. Intel iGPUs
 	//! expose no Vulkan presentation-timing extension at all, so VK
 	//! late-weave pacing (VK_KHR_present_wait) is permanently dormant there
@@ -1871,7 +1881,9 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 	LARGE_INTEGER f;
 	QueryPerformanceFrequency(&f);
 	const int tr = g_lw_gov_vk_bridge.on_mark((uint64_t)f.QuadPart);
-	if (tr != 0 && target->dcomp_frame_latency_waitable != NULL &&
+	// drag_shallow: while a drag clamps the queue to 1, do not let a governor
+	// transition re-deepen it mid-drag — the clamp owner restores depth.
+	if (tr != 0 && target->dcomp_frame_latency_waitable != NULL && !target->drag_shallow &&
 	    dxr_vk_bridge_pacing_mode() == DXR_VK_BRIDGE_PACING_GOVERNOR) {
 		IDXGISwapChain2 *sc2 = NULL;
 		if (target->dcomp_swapchain != NULL &&
@@ -1928,6 +1940,18 @@ comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, u
 #else
 	(void)target;
 	(void)period_ns;
+#endif
+}
+
+void
+comp_vk_native_target_note_origin_motion(struct comp_vk_native_target *target)
+{
+#ifdef XRT_OS_WINDOWS
+	// See drag_shallow in the target struct. 300 ms: a live drag refreshes
+	// this every frame; one dwell past the last movement restores depth.
+	target->origin_motion_until_ns = os_monotonic_get_ns() + 300ull * 1000000ull;
+#else
+	(void)target;
 #endif
 }
 
@@ -2021,6 +2045,54 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					        drained);
 				}
 			}
+			// Drag-shallow (see the struct field): clamp the queue to 1 while
+			// the present origin is moving, restore governor depth after.
+			const bool origin_moving =
+			    os_monotonic_get_ns() < target->origin_motion_until_ns;
+			if (origin_moving != target->drag_shallow) {
+				IDXGISwapChain2 *ds2 = NULL;
+				if (target->dcomp_swapchain != NULL &&
+				    SUCCEEDED(target->dcomp_swapchain->QueryInterface(
+				        __uuidof(IDXGISwapChain2), (void **)&ds2)) &&
+				    ds2 != NULL) {
+					// Governor mode: restore to the CURRENT effective —
+					// a transition that fired mid-drag was skipped and
+					// would otherwise be lost.
+					int restore = (dxr_vk_bridge_pacing_mode() ==
+					               DXR_VK_BRIDGE_PACING_GOVERNOR)
+					                  ? g_lw_gov_vk_bridge.effective
+					                  : target->dcomp_pacing_depth;
+					if (restore < 1) {
+						restore = 1;
+					}
+					if (!origin_moving) {
+						target->dcomp_pacing_depth = restore;
+					}
+					ds2->SetMaximumFrameLatency(origin_moving ? 1 : (UINT)restore);
+					ds2->Release();
+					if (origin_moving) {
+						// Reducing the cap does not revoke banked
+						// tokens — drain them, or the next waits
+						// return instantly and the queue stays deep.
+						int drained = 0;
+						while (drained < LATE_WEAVE_MAX_DEPTH &&
+						       WaitForSingleObjectEx(
+						           target->dcomp_frame_latency_waitable, 0,
+						           TRUE) == WAIT_OBJECT_0) {
+							drained++;
+						}
+					}
+					target->drag_shallow = origin_moving;
+					static bool logged_shallow = false;
+					if (origin_moving && !logged_shallow) {
+						logged_shallow = true;
+						U_LOG_W("#912: origin moving (window drag) — bridge "
+						        "queue clamped to 1 for phase snap; "
+						        "governor depth restored when the drag ends "
+						        "(logged once)");
+					}
+				}
+			}
 			const uint64_t wait_t0 = os_monotonic_get_ns();
 			const DWORD wr =
 			    WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 100, TRUE);
@@ -2043,7 +2115,8 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			if (wr == WAIT_TIMEOUT) {
 				// Occlusion, not saturation (see on_wait_timeout).
 				g_lw_gov_vk_bridge.on_wait_timeout();
-			} else if (!wait_blocked && !running_late && g_lw_gov_vk_bridge.align_ok()) {
+			} else if (!wait_blocked && !running_late && !origin_moving &&
+			           g_lw_gov_vk_bridge.align_ok()) {
 				// Instant release (banked token, unknown phase): align to
 				// the DComp compositor tick so the weave gets a constant
 				// phase. A BLOCKING release is already tick-aligned — a
