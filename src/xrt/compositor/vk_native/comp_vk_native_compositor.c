@@ -4651,10 +4651,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 		U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
 		        1000.0 / c->display_refresh_rate);
-		if (c->target != NULL) {
-			comp_vk_native_target_set_display_period(
-			    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-		}
+		// The target does not exist yet at this point in create — the period
+		// is seeded into it right after target creation below.
 	}
 #endif
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -4674,10 +4672,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			}
 			U_LOG_W("Display refresh rate: %.2f Hz (frame period %.2f ms)", c->display_refresh_rate,
 			        1000.0 / c->display_refresh_rate);
-			if (c->target != NULL) {
-				comp_vk_native_target_set_display_period(
-				    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-			}
+			// Seeded into the target right after target creation below.
 		}
 	}
 #endif
@@ -4882,6 +4877,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			U_LOG_E("Failed to create VK target");
 			vk_compositor_destroy(&c->base.base);
 			return xret;
+		}
+		// Seed the display period measured above — the two detection blocks
+		// run before the target exists, so seeding there was dead code and
+		// left period_hint_ns at 0 (no #867 lookahead, and the #912 pacing
+		// governor gated itself off entirely: period 0 reads as "unknown").
+		if (c->display_refresh_rate > 0.0f) {
+			comp_vk_native_target_set_display_period(
+			    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 		}
 	} else {
 		c->target = NULL;
