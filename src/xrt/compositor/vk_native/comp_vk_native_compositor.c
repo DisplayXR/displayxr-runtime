@@ -330,6 +330,19 @@ struct comp_vk_native_compositor
 	bool have_last_present_origin;
 
 	/*!
+	 * #908: when the origin last MOVED. A deposit is only replayable while
+	 * its geometry assumptions hold — the atlas bakes the window-relative
+	 * Kooima of the position it was rendered at, so a repaint during a drag
+	 * weaves old-position content with new-position phase. Interleaved with
+	 * fresh app frames that alternation IS the RMB-drag 3D stutter (the
+	 * B-mode control was clean because the app was parked and every weave
+	 * was a consistent replay). The repaint loop holds off while this is
+	 * recent; written by the frame path, read by the repaint thread — same
+	 * plain-field pattern as repaint.last_app_frame_ns.
+	 */
+	uint64_t last_origin_motion_ns;
+
+	/*!
 	 * #868: serialises the frame path against the repaint replay.
 	 *
 	 * VK had no compositor lock at all. It needs one for the same reason D3D11
@@ -387,6 +400,13 @@ struct comp_vk_native_compositor
 	{
 		int enabled;                    //!< DXR_WEAVE_REPAINT=0 disables.
 		int force;                      //!< DXR_WEAVE_REPAINT_FORCE=1 correctness probe.
+
+		/*!
+		 * #908: how long after an origin move replays stay held (see
+		 * last_origin_motion_ns). DXR_WEAVE_REPAINT_DRAG_HOLD_MS overrides;
+		 * 0 disables the hold (the A/B knob for the stutter bisect).
+		 */
+		uint64_t drag_hold_ns;
 
 		/*!
 		 * #902: shared-queue tier — no runtime-owned queue exists (single
@@ -3420,6 +3440,21 @@ vk_repaint_thread(void *ptr)
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			continue;
 		}
+		/*
+		 * #908 drag-hold: a deposit is only replayable while its geometry
+		 * assumptions hold. During a drag the atlas's baked window-relative
+		 * Kooima is for the OLD position; replaying it with fresh phase,
+		 * interleaved with fresh app frames, alternates consistent and
+		 * inconsistent phase/content pairs — eyeballed as RMB-drag 3D
+		 * stutter. Hold repaints while origin motion is recent; the next
+		 * app frame re-deposits at the new position and replays resume.
+		 * NOT bypassed by the force probe — like app_frame_in_progress,
+		 * this is content correctness, not pacing.
+		 */
+		if (c->repaint.drag_hold_ns > 0 && c->last_origin_motion_ns != 0 &&
+		    os_monotonic_get_ns() - c->last_origin_motion_ns < c->repaint.drag_hold_ns) {
+			continue;
+		}
 		// Keyed on the last APP frame, never on the last repaint — otherwise
 		// repaints pace off their own timestamps and free-run.
 		if (c->repaint.force != 1 &&
@@ -3436,6 +3471,13 @@ vk_repaint_thread(void *ptr)
 		// layer_accum does not exercise the feature, it corrupts the frame.
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == NULL) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		// #908: re-check the drag-hold under the lock too — an origin move
+		// noted between the unlocked check and here must still win.
+		if (c->repaint.drag_hold_ns > 0 && c->last_origin_motion_ns != 0 &&
+		    os_monotonic_get_ns() - c->last_origin_motion_ns < c->repaint.drag_hold_ns) {
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -5032,6 +5074,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 				        (void *)c->vk.main_queue->queue);
 			}
 		}
+		// #908: drag-hold window (default 150 ms — outlasts WM_MOUSEMOVE gaps
+		// during a drag; each origin move refreshes the stamp, so the hold
+		// ends ~150 ms after the LAST move). 0 disables (stutter-bisect A/B).
+		c->repaint.drag_hold_ns = 150u * 1000u * 1000u;
+		const char *dh = getenv("DXR_WEAVE_REPAINT_DRAG_HOLD_MS");
+		if (dh != NULL && dh[0] != '\0') {
+			c->repaint.drag_hold_ns = (uint64_t)strtoul(dh, NULL, 10) * 1000u * 1000u;
+		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
@@ -5604,9 +5654,14 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	// its bridge queue shallow so the weave phase sampled here is still
 	// where the window IS when the frame reaches glass (#912 drag-shallow;
 	// repro was 3D stutter on avatar RMB-move at governor depth 2-3).
-	if (c->have_last_present_origin && c->target != NULL &&
+	if (c->have_last_present_origin &&
 	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
-		comp_vk_native_target_note_origin_motion(c->target);
+		if (c->target != NULL) {
+			comp_vk_native_target_note_origin_motion(c->target);
+		}
+		// #908: geometry moved — deposited frames are no longer replayable
+		// (their baked Kooima is for the old position). Repaint holds off.
+		c->last_origin_motion_ns = os_monotonic_get_ns();
 	}
 	c->last_present_origin_x = ox;
 	c->last_present_origin_y = oy;
