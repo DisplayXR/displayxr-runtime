@@ -1919,14 +1919,12 @@ comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, u
 {
 #ifdef XRT_OS_WINDOWS
 	target->period_hint_ns = (double)period_ns;
-#ifdef XRT_OS_WINDOWS
 	// #912: seed the governor's saturation reference — on_stats never fires
 	// on the bridge (frame statistics are DISJOINT), so this is its only
 	// period source.
 	if (g_lw_gov_vk_bridge.period_ns <= 0.0 && period_ns > 0) {
 		g_lw_gov_vk_bridge.period_ns = (double)period_ns;
 	}
-#endif
 #else
 	(void)target;
 	(void)period_ns;
@@ -2026,11 +2024,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			const uint64_t wait_t0 = os_monotonic_get_ns();
 			const DWORD wr =
 			    WaitForSingleObjectEx(target->dcomp_frame_latency_waitable, 100, TRUE);
-			const bool wait_blocked = (os_monotonic_get_ns() - wait_t0) > 2000000; // >2 ms
+			const uint64_t wait_t1 = os_monotonic_get_ns();
+			const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
+			// Catch-up guard: if the LAST frame overran its period (GPU
+			// contention pushed the weave past a tick) the pipeline is
+			// already a vsync behind — tick-aligning now waits for yet
+			// another tick and turns one late pickup into a dropped frame.
+			// Measured on the iGPU: align-always put 20% of frames at
+			// 2 vsyncs (60 -> 51 fps) with identical per-frame GPU cost.
+			// Skip the align once; the queue slack absorbs the late frame
+			// and the next on-time frame re-aligns.
+			static uint64_t s_last_pace_done_ns;
+			const double cu_period_ns =
+			    (target->period_hint_ns > 0.0) ? target->period_hint_ns : 16.7e6;
+			const bool running_late =
+			    s_last_pace_done_ns != 0 &&
+			    (double)(wait_t1 - s_last_pace_done_ns) > cu_period_ns * 1.15;
 			if (wr == WAIT_TIMEOUT) {
 				// Occlusion, not saturation (see on_wait_timeout).
 				g_lw_gov_vk_bridge.on_wait_timeout();
-			} else if (!wait_blocked) {
+			} else if (!wait_blocked && !running_late && g_lw_gov_vk_bridge.align_ok()) {
 				// Instant release (banked token, unknown phase): align to
 				// the DComp compositor tick so the weave gets a constant
 				// phase. A BLOCKING release is already tick-aligned — a
@@ -2038,6 +2051,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 				// D3D legs: 2x-period intervals + spurious backoff).
 				late_weave_wait_compositor_clock(target->period_hint_ns);
 			}
+			s_last_pace_done_ns = os_monotonic_get_ns();
 		}
 		// Round-robin through the bridge ring. No WSI to acquire from.
 		// vkQueueWaitIdle in the compositor's render path covers the GPU
