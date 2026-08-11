@@ -782,7 +782,20 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 		// up the previous present.
 		const uint64_t wait_t0 = os_monotonic_get_ns();
 		wait_timed_out = WaitForSingleObject(target->frame_latency_waitable, 100) == WAIT_TIMEOUT;
-		const bool wait_blocked = (os_monotonic_get_ns() - wait_t0) > 2000000; // >2 ms
+		const uint64_t wait_t1 = os_monotonic_get_ns();
+		const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
+		// Catch-up guard: if the LAST frame overran its period the pipeline
+		// is already a vsync behind — tick-aligning now waits for yet
+		// another tick and turns one late pickup into a dropped frame
+		// (measured on the VK bridge: align-always put 20% of frames at
+		// 2 vsyncs, 60 -> 51 fps, identical per-frame GPU cost). Skip the
+		// align once; the queue slack absorbs the late frame and the next
+		// on-time frame re-aligns.
+		static uint64_t s_last_pace_done_ns;
+		const double cu_period_ns =
+		    (g_lw_gov_d3d12.period_ns > 0.0) ? g_lw_gov_d3d12.period_ns : 16.7e6;
+		const bool running_late = s_last_pace_done_ns != 0 &&
+		                          (double)(wait_t1 - s_last_pace_done_ns) > cu_period_ns * 1.15;
 
 		if (g_d3d12_target_is_composed) {
 			// Composed chain: a BLOCKING waitable release already lands at a
@@ -792,7 +805,7 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 			// wait returned instantly (banked token, unknown phase).
 			static bool logged_src = false;
 			bool clocked = false;
-			if (!wait_blocked && !wait_timed_out) {
+			if (!wait_blocked && !wait_timed_out && !running_late && g_lw_gov_d3d12.align_ok()) {
 				clocked = late_weave_wait_compositor_clock(g_lw_gov_d3d12.period_ns);
 			}
 			if (!logged_src) {
@@ -825,6 +838,7 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 				}
 			}
 		}
+		s_last_pace_done_ns = os_monotonic_get_ns();
 	}
 	g_weave_latency_d3d12.mark_weave("d3d12", predicted_display_time_ns);
 	if (wait_timed_out) {
