@@ -157,6 +157,14 @@ void
 comp_vk_native_target_set_display_period(struct comp_vk_native_target *target, uint64_t period_ns);
 
 /*!
+ * The present origin just changed (window drag) — clamp the paced bridge
+ * queue shallow while motion is recent so the weave phase stays snapped to
+ * the window position (#912 drag-shallow). No-op off Windows.
+ */
+void
+comp_vk_native_target_note_origin_motion(struct comp_vk_native_target *target);
+
+/*!
  * App-visible wait_frame->scanout lookahead in ns from measured frame cost +
  * measured weave->scanout residual (#867). 0 when unmeasured.
  */
