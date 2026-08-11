@@ -163,6 +163,32 @@ struct late_weave_governor
 
 	int over_frames = 0;
 	int calm_frames = 0;
+	// Slip-rate signal: the cost EMA only sees serialized frame cost, but a
+	// pipeline can drop frames purely from GPU-completion jitter (shared-queue
+	// iGPU: the weave lands behind the app's own render and misses DWM
+	// pickup) while the EMA sits far under the starvation threshold —
+	// measured: 11% of frames at 2 vsyncs with EMA 18.5 ms vs a 43 ms
+	// threshold. A vsync-doubled frame is dt > ~1.55x period; escalate when
+	// they exceed ~8% of a 120-mark window. An extra banked token is
+	// latency-free at a met frame rate (presents are still picked up at the
+	// next tick) — it only absorbs the jitter.
+	int slip_marks = 0;
+	int slip_count = 0;
+	// Adaptive tick-align (the composed-chain freshness stage): aligning the
+	// weave to the compositor tick buys a constant prediction phase, but it
+	// also serializes each frame's whole GPU chain into exactly one period —
+	// on a contended iGPU that alone dropped ~7-8% of frames at EVERY depth
+	// (depth absorbs cost jitter, not the align's hard deadline). A dropped
+	// frame holds a STALE weave on glass for a whole extra period — the
+	// exact artifact late-weave exists to prevent — so when escalation has
+	// run out (slip-heavy window at MAX depth) the align yields for a dwell
+	// instead. Healthy machines keep the constant phase permanently.
+	// Hold dwell doubles when a hold re-triggers shortly after expiring
+	// (chronic contention converges to align-off ≈ free-run throughput;
+	// transient contention recovers the constant phase after one dwell).
+	uint64_t align_hold_until_qpc = 0;
+	uint64_t align_hold_clear_qpc = 0;
+	uint64_t align_hold_ns = 10ull * 1000000000ull; // 10 s, x2 on re-trigger, cap 5 min
 	uint64_t backoff_qpc = 0;
 	uint64_t last_probe_qpc = 0;
 	uint64_t probe_dwell_ns = 30ull * 1000000000ull; // ×2 per failed probe, cap 5 min
@@ -266,6 +292,27 @@ struct late_weave_governor
 		interval_ema_ns = 0.0;
 		over_frames = 0;
 		calm_frames = 0;
+		slip_marks = 0;
+		slip_count = 0;
+	}
+
+	//! May the composed-chain tick-align run this frame? (See
+	//! align_hold_until_qpc — false while yielded after slip-heavy windows
+	//! at MAX depth.)
+	bool
+	align_ok()
+	{
+		if (align_hold_until_qpc == 0) {
+			return true;
+		}
+		LARGE_INTEGER now_li;
+		QueryPerformanceCounter(&now_li);
+		if ((uint64_t)now_li.QuadPart >= align_hold_until_qpc) {
+			align_hold_clear_qpc = align_hold_until_qpc;
+			align_hold_until_qpc = 0;
+			return true;
+		}
+		return false;
 	}
 
 	int
@@ -285,6 +332,8 @@ struct late_weave_governor
 				interval_ema_ns = 0.0;
 				over_frames = 0;
 				calm_frames = 0;
+				slip_marks = 0;
+				slip_count = 0;
 				dt_ns = 0.0;
 			}
 		}
@@ -307,6 +356,47 @@ struct late_weave_governor
 
 		if (base != 1 || auto_backoff != 1 || period_ns <= 0.0 || interval_ema_ns <= 0.0) {
 			return 0;
+		}
+
+		// Slip-rate escalation (see the field comment): jitter-dropped
+		// frames the cost EMA cannot see. Judged per 120-mark window so a
+		// single hiccup never escalates.
+		if (dt_ns > 0.0) {
+			slip_marks++;
+			if (dt_ns > period_ns * 1.55) {
+				slip_count++;
+			}
+			if (slip_marks >= 120) {
+				const bool slipping = slip_count >= 10; // ~8%
+				slip_marks = 0;
+				slip_count = 0;
+				if (slipping) {
+					if (effective < LATE_WEAVE_MAX_DEPTH) {
+						effective++;
+						over_frames = 0;
+						calm_frames = 0;
+						backoff_qpc = now;
+						return +1;
+					}
+					// Depth is exhausted — the align's hard deadline
+					// is the residual cost; yield it (see field
+					// comment). Re-trigger within 60 s of the last
+					// expiry = chronic — double the dwell.
+					if (align_hold_clear_qpc != 0 &&
+					    (double)(now - align_hold_clear_qpc) <
+					        60.0 * (double)freq_hz) {
+						align_hold_ns =
+						    align_hold_ns >= 150ull * 1000000000ull
+						        ? 300ull * 1000000000ull
+						        : align_hold_ns * 2;
+					} else {
+						align_hold_ns = 10ull * 1000000000ull;
+					}
+					align_hold_until_qpc =
+					    now + (uint64_t)((double)align_hold_ns / 1e9 *
+					                     (double)freq_hz);
+				}
+			}
 		}
 
 		// Starved once the frame overruns what the CURRENT depth absorbs.
