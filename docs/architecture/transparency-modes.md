@@ -31,6 +31,51 @@ gated iGPU A/B from that work (dxr-perf-study `BENCH-FINDINGS.md`,
 | **Live** | Classic transparency. Live punch-through everywhere. ~56 pts system GPU, dwm ~32 %, Composed: Flip. | Live everywhere (holes are real desktop; in-region blends DWM-live). dwm ∝ region area. Composed. |
 | **Baked** | Bake everywhere the window covers. **Cheapest**: 12–15 pts, dwm ≈ 0, **Hardware Composed: Independent Flip**. | **Live punch-through in the carved holes**; bake only in the in-region blend band (silhouette edges, de-occluded pixels, kept chrome). Cheap region compose. Composed. |
 
+## The default: live + shaped, hybrid composition, governor-paced late-weave
+
+Settled 2026-08-10 (#906 + leia-plugin#139 + #905/#907; each arm eyeballed on
+the panel). Transparent overlay apps ship:
+
+- **Live + shaped** — punch-through holes are real desktop (no drag-behind
+  smear, rule 5), `SetWindowRgn` carries click-through. **Hybrid** completes
+  it: the runtime owns the transparent present, and the DP still bakes the
+  **de-occlusion band** (silhouette fringe, partial-alpha pixels) from the
+  WGC capture — that band physically cannot be DWM-blended (the weaver
+  interlaces to opaque RGB; the post-weave alpha-gate reconstructs only the
+  binary all-views-transparent mask), so the band is a ~1-frame-old bake or
+  it is BLACK. In-process live passes `client_presents=false`;
+  `client_presents=true` (DP composes nothing, gate only) is reserved for
+  client-side presents / bandless content (#551). The WGC cost is contained
+  by the capture-delivery throttle (`LEIA_DP_CAPTURE_MIN_INTERVAL_MS`,
+  default 66 ms, `0` = uncapped) — free on a quiet desktop, ~9 pts saved
+  under motion.
+- **Late-weave pacing on the live path, all backends** (#905 D3D11/D3D12,
+  #907 VK): the composition swapchain carries the frame-latency waitable
+  (D3D chains get `bc=3`); on VK the DXGI **bridge** carries it, created
+  exactly where `VK_KHR_present_wait` is absent (every Intel iGPU) —
+  `DXR_VK_BRIDGE_PACING` unset = governor, `0` = off, N = pinned. The #850
+  governor is the single owner of pacing state, extended with: slip-rate
+  escalation (GPU-completion jitter the cost EMA can't see), a catch-up
+  guard (an overrun frame skips the next tick-align instead of dropping a
+  frame), an adaptive align-hold (chronic contention yields the constant
+  phase — a dropped frame holds a *stale weave on glass*, the exact
+  artifact late-weave prevents), drag-shallow (queue clamps to 1 while the
+  present origin moves), and an occlusion guard (waitable timeout ≠
+  saturation). Measured on the iGPU avatar: pacing on = 60.0 fps / 39.7 %
+  GPU busy vs off = 60.0 / 39.3 % — pacing is free, and it buys the bounded
+  weave→glass queue that late weave and app-rate throttling (#868 repaints
+  hold panel-rate weave cadence; measured 39.7 % → 17.7 % GPU busy with the
+  app idle-throttled) are built on.
+- **Baked (`DXR_PRESENT_OPAQUE=1`) is demoted to full-cover content** (the
+  cube-class apps, which keep the 3.7–4.7× Independent Flip win) and to
+  A/B instrumentation. Launcher recipes for overlay apps no longer set it.
+
+Live-path caveat: the weave→scanout residual is unmeasurable on composed
+chains (frame statistics DISJOINT; the compositor clock gives *alignment*,
+not a number), so `predictedDisplayTime` keeps the `period*2` fallback and
+the stage-2 source is logged one-shot (`Late-weave: live-path stage-2
+source = ...`).
+
 ### Product decision: shaped is the default; unshaped is not shipped
 
 Overlay-class apps ship **shaped**. Unshaped was evaluated (it is the only
@@ -129,7 +174,7 @@ table and the smear of rule 5 is the deciding factor.
 | App | Transparent-mode combo | Notes |
 |---|---|---|
 | cube test apps | baked + unshaped | Full-cover content ⇒ no holes to punch; gets Independent Flip. `DISPLAYXR_TRANSPARENT_BG=1` + env. |
-| avatar (`displayxr-demo-avatar`) | baked + shaped (borderless) / baked + unshaped (framed `B` positioning mode) | Silhouette+bubble region; `B`-mode client bake is documented semantics. |
+| avatar (`displayxr-demo-avatar`) | **live + shaped hybrid (the default above)**; framed `B` positioning mode is unshaped | Silhouette+bubble region; de-occlusion band baked by the DP. Known open: RMB-drag 3D stutter under live+shaped, bisected to NOT be the pacing (#908). |
 | modelviewer (`displayxr-demo-modelviewer`) | opaque scene default; `Ctrl+T` = baked + shaped, chrome hidden, RMB-drag to move | Region from view-0 alpha via `dxr::ClickThroughRegion`; toast band kept in-region. |
 | gaussiansplat (`displayxr-demo-gaussiansplat`) | baked + unshaped *(shaping wiring pending)* | Kit-cached HUD landed; punch-through follows the modelviewer recipe. |
 | Unity provider overlay | shaped (region from rendered alpha); present path = whatever the runtime session uses | The origin of the shaping technique; gets baked composition with the same env, no plugin changes. Baked+shaped on the D3D12 DP requires plug-in ≥ v2.1.1 (leia-plugin#126 replaced the alpha-sentinel gate with the D3D11-style sentinel-free compose-under; halo + opaque-bubble defects on older plug-ins). Works on the default D3D11 path too — no `-force-d3d12` needed. |
