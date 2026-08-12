@@ -3539,6 +3539,26 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		const bool defer_this = (defer_env == 1) && !is_repaint && res == VK_SUCCESS &&
 		                        *fence_p != VK_NULL_HANDLE && !c->deferred_pending;
 
+		/*
+		 * The line above reports the ENV, not that anything parked. Without
+		 * this, a run where defer_this never became true is indistinguishable
+		 * from one where every frame deferred — and a measurement against a
+		 * mechanism that never engaged is worse than no measurement. One-shot
+		 * each way, so the hot path stays clean.
+		 */
+		if (defer_env == 1) {
+			static bool parked_once = false, blocked_once = false;
+			if (defer_this && !parked_once) {
+				parked_once = true;
+				U_LOG_W("#837: first frame PARKED — deferral is live");
+			} else if (!defer_this && !parked_once && !blocked_once) {
+				blocked_once = true;
+				U_LOG_W("#837: deferral did NOT engage — repaint=%d res=%d fence=%d pending=%d",
+				        is_repaint ? 1 : 0, (int)res, *fence_p != VK_NULL_HANDLE ? 1 : 0,
+				        c->deferred_pending ? 1 : 0);
+			}
+		}
+
 		if (defer_this) {
 			c->deferred_cmd = cmd;
 			c->deferred_cmd_pool = cmd_pool;
