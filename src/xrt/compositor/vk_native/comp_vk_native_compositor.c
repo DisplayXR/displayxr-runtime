@@ -330,6 +330,21 @@ struct comp_vk_native_compositor
 	bool have_last_present_origin;
 
 	/*!
+	 * #602: the target image-set generation the display processor has already
+	 * been told about.
+	 *
+	 * begin_frame notifies when IT recreates the target, but that is not the
+	 * only recreate path: comp_vk_native_target_acquire rebuilds the swapchain
+	 * itself on VK_ERROR_OUT_OF_DATE_KHR, and nothing told the DP. It then
+	 * kept a strip-framebuffer cache keyed by VkImage handles that no longer
+	 * exist — Vulkan recycles freed handles, so the cache silently aliases
+	 * destroyed images and the next use faults the device
+	 * (VK_ERROR_DEVICE_LOST from vkQueueSubmit). Comparing against this makes
+	 * the notification happen for EVERY recreate, whoever caused it.
+	 */
+	uint32_t dp_notified_target_generation;
+
+	/*!
 	 * #868: serialises the frame path against the repaint replay.
 	 *
 	 * VK had no compositor lock at all. It needs one for the same reason D3D11
@@ -1256,6 +1271,30 @@ vk_compositor_mark_frame(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #868: a target or atlas recreate invalidates everything the repaint replay
+ * cached — the target images it would weave into, and the backdrop / mask /
+ * atlas views it deliberately reuses rather than re-deriving. Disarm it and
+ * drop the handles so no replay can resurrect them.
+ *
+ * Costs at most one frame of repaint: layer_commit re-arms unconditionally
+ * (`c->repaint.armed = !zero_copy`) on the next real app frame, so this
+ * self-heals without any re-arm bookkeeping here.
+ *
+ * Caller MUST hold c->mutex.
+ */
+static void
+vk_repaint_disarm_locked(struct comp_vk_native_compositor *c)
+{
+	c->repaint.armed = false;
+	c->repaint.backdrop_view = 0;
+	c->repaint.backdrop_w = 0;
+	c->repaint.backdrop_h = 0;
+	c->repaint.mask_view = 0;
+	c->repaint.atlas_image = 0;
+	c->repaint.atlas_view = 0;
+}
+
 static xrt_result_t
 vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
@@ -1272,6 +1311,28 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			    (new_width != c->settings.preferred.width ||
 			     new_height != c->settings.preferred.height)) {
 
+				/*
+				 * #868: the recreate below MUST hold the compositor lock.
+				 *
+				 * It destroys the target images, the swapchain and the DP's
+				 * target-keyed caches, and the #868 repaint thread uses all
+				 * three from its own thread under exactly this lock. Without
+				 * it, a fullscreen transition tore the target down underneath
+				 * a live repaint — the VK fullscreen crash. vkDeviceWaitIdle
+				 * below drains the GPU and does nothing for that: the race is
+				 * on the CPU, and a drain is not a mutex.
+				 *
+				 * d3d11_compositor_begin_frame and d3d12_compositor_begin_frame
+				 * have always taken theirs here; VK was the outlier. Taken only
+				 * on an actual size change, so the per-frame GetClientRect poll
+				 * stays lock-free.
+				 */
+				os_mutex_lock(&c->mutex);
+
+				// Before anything is torn down, so a repaint already queued
+				// on the lock finds nothing to replay.
+				vk_repaint_disarm_locked(c);
+
 				U_LOG_I("Window resized: %ux%u -> %ux%u",
 				        c->settings.preferred.width, c->settings.preferred.height,
 				        new_width, new_height);
@@ -1286,17 +1347,15 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					// VK_ERROR_DEVICE_LOST. Window resizes are rare, so the
 					// stall here is fine.
 					c->vk.vkDeviceWaitIdle(c->vk.device);
-					// #602: tell the DP its target-handle-keyed caches are
-					// stale — the resize recreated the target images and
-					// Vulkan can recycle the freed handles, so the DP's strip
-					// framebuffer cache could otherwise alias a destroyed
-					// image and fault the device. Safe to destroy DP objects
-					// here: the device was just drained above.
-					if (c->display_processor != NULL) {
-						xrt_display_processor_vk_notify_target_recreated(
-						    (struct xrt_display_processor_vk *)c->display_processor,
-						    comp_vk_native_target_get_generation(c->target));
-					}
+					// #602: the DP's target-handle-keyed caches are now
+					// stale. The notification is NOT issued here — it is
+					// issued once, for every recreate, at the acquire
+					// boundary in vk_dp_weave_and_present (see
+					// dp_notified_target_generation). Notifying only here
+					// missed the recreate that target_acquire performs on
+					// VK_ERROR_OUT_OF_DATE_KHR, which is how a stale cache
+					// reached the GPU and lost the device. Deferring to the
+					// acquire is safe: nothing uses the DP in between.
 				}
 				c->settings.preferred.width = new_width;
 				c->settings.preferred.height = new_height;
@@ -1315,6 +1374,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
 					                                tc * new_vw, tr * new_vh);
 				}
+
+				os_mutex_unlock(&c->mutex);
 			}
 		}
 	}
@@ -1329,6 +1390,10 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 		    (new_width != c->settings.preferred.width ||
 		     new_height != c->settings.preferred.height)) {
 
+			// #868: same lock as the Windows branch — see the rationale there.
+			os_mutex_lock(&c->mutex);
+			vk_repaint_disarm_locked(c);
+
 			U_LOG_I("Window resized: %ux%u -> %ux%u",
 			        c->settings.preferred.width, c->settings.preferred.height,
 			        new_width, new_height);
@@ -1342,12 +1407,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				comp_vk_native_target_resize(c->target, new_width, new_height);
 				// #602: drain after swapchain recreate (see Windows branch).
 				c->vk.vkDeviceWaitIdle(c->vk.device);
-				// #602: invalidate DP target-handle-keyed caches (see Windows branch).
-				if (c->display_processor != NULL) {
-					xrt_display_processor_vk_notify_target_recreated(
-					    (struct xrt_display_processor_vk *)c->display_processor,
-					    comp_vk_native_target_get_generation(c->target));
-				}
+				// #602: DP cache invalidation happens at the acquire boundary
+				// for every recreate path (see Windows branch).
 			}
 			c->settings.preferred.width = new_width;
 			c->settings.preferred.height = new_height;
@@ -1362,6 +1423,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
 				                                tc * new_vw, tr * new_vh);
 			}
+
+			os_mutex_unlock(&c->mutex);
 		}
 	}
 #endif
@@ -1381,6 +1444,10 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 		    (new_width != c->settings.preferred.width ||
 		     new_height != c->settings.preferred.height)) {
 
+			// #868: same lock as the Windows branch — see the rationale there.
+			os_mutex_lock(&c->mutex);
+			vk_repaint_disarm_locked(c);
+
 			U_LOG_I("Window resized: %ux%u -> %ux%u",
 			        c->settings.preferred.width, c->settings.preferred.height,
 			        new_width, new_height);
@@ -1389,12 +1456,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				comp_vk_native_target_resize(c->target, new_width, new_height);
 				// #602: drain after swapchain recreate (see Windows branch).
 				c->vk.vkDeviceWaitIdle(c->vk.device);
-				// #602: invalidate DP target-handle-keyed caches (see Windows branch).
-				if (c->display_processor != NULL) {
-					xrt_display_processor_vk_notify_target_recreated(
-					    (struct xrt_display_processor_vk *)c->display_processor,
-					    comp_vk_native_target_get_generation(c->target));
-				}
+				// #602: DP cache invalidation happens at the acquire boundary
+				// for every recreate path (see Windows branch).
 			}
 			c->settings.preferred.width = new_width;
 			c->settings.preferred.height = new_height;
@@ -1409,6 +1472,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
 				                                tc * new_vw, tr * new_vh);
 			}
+
+			os_mutex_unlock(&c->mutex);
 		}
 	}
 #endif
@@ -2913,6 +2978,27 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		return xret;
 	}
 
+	/*
+	 * #602: the acquire above may have rebuilt the swapchain itself
+	 * (VK_ERROR_OUT_OF_DATE_KHR) — a recreate begin_frame never sees, and so
+	 * never told the DP about. Catch every generation change here, whichever
+	 * path produced it, BEFORE anything is recorded against the new images.
+	 * See dp_notified_target_generation for what a missed notification costs.
+	 *
+	 * Safe to destroy DP objects at this point: both recreate paths drain the
+	 * device, and this runs under the compositor lock on both callers.
+	 */
+	{
+		uint32_t tgen = comp_vk_native_target_get_generation(c->target);
+		if (tgen != c->dp_notified_target_generation) {
+			c->dp_notified_target_generation = tgen;
+			if (c->display_processor != NULL) {
+				xrt_display_processor_vk_notify_target_recreated(
+				    (struct xrt_display_processor_vk *)c->display_processor, tgen);
+			}
+		}
+	}
+
 	// #868: a repaint records from its OWN pool — see repaint_cmd_pool.
 	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
 	                             ? c->repaint_cmd_pool
@@ -3427,7 +3513,19 @@ vk_repaint_thread(void *ptr)
 			continue;
 		}
 
-		comp_vk_native_target_repaint_pace(c->target);
+		struct comp_vk_native_target *tgt = c->target;
+		if (tgt == NULL) {
+			continue;
+		}
+
+		// #868: the pacing below runs UNLOCKED (it blocks for up to a
+		// panel period and must not stall the app's frame path), so a
+		// recreate can land across it. Sample the image-set generation on
+		// either side and drop the replay if it moved — every handle the
+		// replay would use belongs to the generation sampled here.
+		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
+
+		comp_vk_native_target_repaint_pace(tgt);
 
 		os_mutex_lock(&c->mutex);
 
@@ -3436,6 +3534,14 @@ vk_repaint_thread(void *ptr)
 		// layer_accum does not exercise the feature, it corrupts the frame.
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == NULL) {
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		if (comp_vk_native_target_get_generation(c->target) != gen_before) {
+			// Resized/recreated across the pace. begin_frame's disarm
+			// normally catches this first; the acquire-side out-of-date
+			// recreate does not go through begin_frame, so this is the
+			// path that catches that one.
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -5685,7 +5791,13 @@ comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
 				tr = c->xdev->rendering_modes[idx].tile_rows;
 			}
 		}
+		// #868: reallocates the atlas the repaint replay holds a view of.
+		// Same lock + disarm as begin_frame's resize path. Normally called
+		// once at session setup, but nothing guarantees that.
+		os_mutex_lock(&c->mutex);
+		vk_repaint_disarm_locked(c);
 		comp_vk_native_renderer_resize(c->renderer, vw, vh, tc * vw, tr * vh);
+		os_mutex_unlock(&c->mutex);
 	}
 }
 

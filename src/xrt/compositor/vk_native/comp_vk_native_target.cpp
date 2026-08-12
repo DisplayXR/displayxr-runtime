@@ -18,6 +18,8 @@
 #include "util/u_misc.h"
 #include "util/comp_late_weave_lookahead.h"
 
+#include "os/os_threading.h"
+
 #ifdef XRT_OS_WINDOWS
 // #912 — the #850 saturation governor now also runs the VK bridge pacing
 // (present_wait-less drivers, i.e. every Intel iGPU). on_stats never fires
@@ -241,6 +243,41 @@ struct comp_vk_native_target
 	//! Swapchain.
 	VkSwapchainKHR swapchain;
 
+	/*!
+	 * Guards the LIFETIME of @ref swapchain (and, in DComp-bridge mode, the
+	 * imported ring that stands in for it) against threads that touch it
+	 * WITHOUT the compositor lock.
+	 *
+	 * The compositor lock (`c->mutex`) serialises the frame path against the
+	 * #868 repaint replay, but the repaint's PACING deliberately runs
+	 * unlocked — @ref comp_vk_native_target_repaint_pace blocks for up to
+	 * 100 ms and holding `c->mutex` there would stall the app's frame path
+	 * for the same. That left it dereferencing @ref swapchain while the app
+	 * thread was in @ref comp_vk_native_target_resize, which nulls the handle
+	 * before recreating it: `vkWaitForPresentKHR(device, VK_NULL_HANDLE, …)`
+	 * → the ICD takes an SRW lock at `null+0x198` → hard process death. That
+	 * is the fullscreen crash; a window resize is the only moment the handle
+	 * is ever null.
+	 *
+	 * A `vkDeviceWaitIdle` does NOT substitute for this: it drains the GPU,
+	 * and the race is entirely on the CPU. Vulkan requires the swapchain to
+	 * be externally synchronised and this is that synchronisation.
+	 *
+	 * Held (briefly) by every unlocked swapchain user and (for the whole
+	 * destroy+create) by every recreate path.
+	 */
+	struct os_mutex swapchain_mutex;
+
+	/*!
+	 * A recreate wants @ref swapchain_mutex. A HINT ONLY — the mutex is the
+	 * correctness mechanism; this just lets a sliced wait bail at its next
+	 * slice boundary instead of making the recreate wait out the slice. A
+	 * stale read costs one extra slice and nothing else, so a plain bool is
+	 * deliberate (this struct is `U_TYPED_CALLOC`'d, so it cannot hold a
+	 * `std::atomic` — no constructor ever runs).
+	 */
+	bool recreate_pending;
+
 	//! Swapchain images.
 	VkImage images[MAX_TARGET_IMAGES];
 
@@ -388,6 +425,38 @@ struct comp_vk_native_target
 	uint32_t dcomp_ring_idx;
 #endif
 };
+
+namespace {
+/*!
+ * RAII holder for @ref comp_vk_native_target::swapchain_mutex, taken by the
+ * paths that DESTROY and rebuild the swapchain / imported ring.
+ *
+ * Sets `recreate_pending` before blocking on the lock so a sliced waiter
+ * (repaint pacing, harness) yields at its next slice instead of making us wait
+ * the slice out. RAII rather than bare lock/unlock because the recreate paths
+ * are studded with early returns.
+ *
+ * NOT recursive: never construct one while another is live on this thread.
+ * `wl_teardown` joins a thread that takes this mutex, so it must be called
+ * BEFORE the guard is constructed, never inside its scope.
+ */
+struct target_recreate_guard
+{
+	struct comp_vk_native_target *t;
+	explicit target_recreate_guard(struct comp_vk_native_target *t_) : t(t_)
+	{
+		t->recreate_pending = true;
+		os_mutex_lock(&t->swapchain_mutex);
+	}
+	~target_recreate_guard()
+	{
+		t->recreate_pending = false;
+		os_mutex_unlock(&t->swapchain_mutex);
+	}
+	target_recreate_guard(const target_recreate_guard &) = delete;
+	target_recreate_guard &operator=(const target_recreate_guard &) = delete;
+};
+} // namespace
 
 static void
 destroy_swapchain_views(struct comp_vk_native_target *target)
@@ -1166,6 +1235,7 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->height = height;
 	target->queue_family_index = queue_family_index;
 	target->transparent_background = transparent_background;
+	os_mutex_init(&target->swapchain_mutex);
 
 #ifdef XRT_OS_ANDROID
 	// Track the surface we build from + the generation it matches, so the
@@ -1468,6 +1538,7 @@ comp_vk_native_target_create_from_surface(struct comp_vk_native_compositor *c,
 	target->queue_family_index = queue_family_index;
 	target->surface = surface;
 	target->external_surface = true;
+	os_mutex_init(&target->swapchain_mutex);
 
 	VkBool32 present_support = VK_FALSE;
 	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface,
@@ -1531,6 +1602,10 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 	if (target->dcomp_active) {
 		dcomp_destroy(target);
 		// dcomp_active path doesn't allocate semaphores / surface / swapchain.
+		// The repaint thread was joined before we got here (see the destroy
+		// order in comp_vk_native_compositor.c), so nothing can be blocked on
+		// swapchain_mutex.
+		os_mutex_destroy(&target->swapchain_mutex);
 		free(target);
 		*target_ptr = NULL;
 		return;
@@ -1560,6 +1635,9 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 		target->android_window = NULL;
 	}
 #endif
+
+	// See the dcomp branch above: the repaint thread is already joined.
+	os_mutex_destroy(&target->swapchain_mutex);
 
 	free(target);
 	*target_ptr = NULL;
@@ -1740,7 +1818,18 @@ wl_get(struct comp_vk_native_target *target)
 				wl->ids.pop_front();
 			}
 			for (int i = 0; i < 20; i++) { // ≤2 s per id, sliced
+				// Same lifetime guard as comp_vk_native_target_repaint_pace:
+				// this thread has no compositor lock either, and a resize can
+				// null target->swapchain underneath it. Held per slice only —
+				// wl_teardown joins this thread and must never be called with
+				// swapchain_mutex held.
+				os_mutex_lock(&target->swapchain_mutex);
+				if (target->recreate_pending || target->swapchain == VK_NULL_HANDLE) {
+					os_mutex_unlock(&target->swapchain_mutex);
+					break;
+				}
 				VkResult r = wait_fn(vk->device, target->swapchain, id, 100ull * 1000 * 1000);
+				os_mutex_unlock(&target->swapchain_mutex);
 				if (r == VK_TIMEOUT && !wl->stop) {
 					continue;
 				}
@@ -1823,7 +1912,40 @@ comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
 	if (wait_fn == nullptr || target->last_present_id == 0) {
 		return;
 	}
-	wait_fn(target->vk->device, target->swapchain, target->last_present_id, 100ull * 1000 * 1000);
+
+	/*
+	 * SLICED, and under swapchain_mutex — this is the fullscreen-crash site.
+	 *
+	 * This runs on the repaint thread WITHOUT the compositor lock (by design:
+	 * see the header). A window resize on the app thread nulls
+	 * target->swapchain inside comp_vk_native_target_resize, and a single
+	 * 100 ms wait straddling that gave the ICD a VK_NULL_HANDLE swapchain →
+	 * SRW lock on null → hard process death. Fullscreen is simply the resize
+	 * that always lands mid-pace.
+	 *
+	 * The mutex alone would be correct but would make a recreate wait out the
+	 * whole 100 ms. Slicing keeps the total budget identical while bounding
+	 * how long a recreate can be held off to ONE slice — the same trade the
+	 * harness waiter already makes (see wl_setup).
+	 */
+	const uint64_t total_ns = 100ull * 1000 * 1000;
+	const uint64_t slice_ns = 12ull * 1000 * 1000;
+	for (uint64_t waited_ns = 0; waited_ns < total_ns; waited_ns += slice_ns) {
+		os_mutex_lock(&target->swapchain_mutex);
+		// Re-read under the lock every slice: a recreate between slices
+		// replaces the handle, and the id sequence restarts at 0 with it.
+		if (target->recreate_pending || target->swapchain == VK_NULL_HANDLE ||
+		    target->last_present_id == 0) {
+			os_mutex_unlock(&target->swapchain_mutex);
+			return;
+		}
+		VkResult wres =
+		    wait_fn(target->vk->device, target->swapchain, target->last_present_id, slice_ns);
+		os_mutex_unlock(&target->swapchain_mutex);
+		if (wres != VK_TIMEOUT) {
+			break; // presented (or the swapchain went out of date) — stop waiting
+		}
+	}
 
 	/*
 	 * LATE-weave, not early-weave.
@@ -2213,25 +2335,36 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 #ifdef XRT_OS_WINDOWS
 		// Present ids are per-swapchain; drop the harness (it lazily
 		// re-arms on the new swapchain) and reset the id sequence.
+		// MUST precede the guard: wl_teardown joins a thread that takes
+		// swapchain_mutex.
 		wl_teardown(target);
 		target->present_id_counter = 0;
 		target->last_present_id = 0;
 #endif
 
-		vk->vkDeviceWaitIdle(vk->device);
-		destroy_swapchain_views(target);
+		{
+			// Same lifetime guard as comp_vk_native_target_resize. This
+			// path runs under the compositor lock, but the compositor
+			// lock is exactly what the unlocked pacing does NOT hold —
+			// and either recreate path can be the one that nulls the
+			// handle under it.
+			target_recreate_guard guard(target);
 
-		// Destroy old swapchain BEFORE creating new one — MoltenVK requires
-		// the native window to be free (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR).
-		if (target->swapchain != VK_NULL_HANDLE) {
-			vk->vkDestroySwapchainKHR(vk->device, target->swapchain, NULL);
-			target->swapchain = VK_NULL_HANDLE;
-		}
+			vk->vkDeviceWaitIdle(vk->device);
+			destroy_swapchain_views(target);
 
-		xrt_result_t xret = create_swapchain(target);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to recreate swapchain");
-			return XRT_ERROR_VULKAN;
+			// Destroy old swapchain BEFORE creating new one — MoltenVK requires
+			// the native window to be free (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR).
+			if (target->swapchain != VK_NULL_HANDLE) {
+				vk->vkDestroySwapchainKHR(vk->device, target->swapchain, NULL);
+				target->swapchain = VK_NULL_HANDLE;
+			}
+
+			xrt_result_t xret = create_swapchain(target);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Failed to recreate swapchain");
+				return XRT_ERROR_VULKAN;
+			}
 		}
 
 		// Retry acquire with new swapchain
@@ -2391,6 +2524,10 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 			U_LOG_E("DComp bridge resize: target->hwnd is NULL");
 			return XRT_ERROR_VULKAN;
 		}
+		// Exclude the unlocked swapchain users for the whole rebuild: this
+		// branch nulls target->views/images below, and the repaint replay
+		// hands those straight to the vendor weaver.
+		target_recreate_guard guard(target);
 		vk->vkDeviceWaitIdle(vk->device);
 
 		// IN-PLACE resize. Keep the D3D11 device + DComp device/target/visual
@@ -2488,6 +2625,21 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 		return XRT_SUCCESS;
 	}
 #endif
+
+#ifdef XRT_OS_WINDOWS
+	// Present ids are per-swapchain: drop the harness (it lazily re-arms on
+	// the new swapchain) and reset the id sequence, exactly as the out-of-date
+	// recreate in target_acquire does. MUST precede the guard — wl_teardown
+	// joins a thread that takes swapchain_mutex.
+	wl_teardown(target);
+	target->present_id_counter = 0;
+	target->last_present_id = 0;
+#endif
+
+	// The crash this exists to stop: below, target->swapchain is set to
+	// VK_NULL_HANDLE before create_swapchain repopulates it, and the repaint
+	// thread reads it unlocked in comp_vk_native_target_repaint_pace.
+	target_recreate_guard guard(target);
 
 	vk->vkDeviceWaitIdle(vk->device);
 
