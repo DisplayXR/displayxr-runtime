@@ -3448,6 +3448,27 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			vk->vkCreateFence(vk->device, &fci, NULL, fence_p);
 		}
 		res = vk->vkQueueSubmit(queue, 1, &submit_info, *fence_p);
+
+		// Tell the DP the weave went to the GPU, and on which queue. The DP
+		// RECORDED this weave (into `cmd`) but the submit is ours, so without
+		// this it cannot know the frame is in flight — vendor late latching
+		// needs exactly that edge to patch the vertex buffer of a queued frame
+		// with a freshly predicted eye position. Must be the same queue we
+		// submitted to: the vendor counts frames in flight with its own
+		// fence-carrying submit on it.
+		//
+		// NOTE this is currently a no-op in effect, and deliberately still
+		// called. We wait on `*fence_p` immediately below, so at most ONE frame
+		// is ever in flight on this path and late latching has nothing queued
+		// to patch. The call is wired now so the plumbing is correct and
+		// testable the moment that synchronous wait is deferred (#837 calls
+		// that out as its own goal). Wiring it later would mean discovering
+		// this ordering constraint twice.
+		if (res == VK_SUCCESS && c->display_processor != NULL) {
+			xrt_display_processor_vk_weave_submitted(
+			    (struct xrt_display_processor_vk *)c->display_processor, queue);
+		}
+
 		if (res == VK_SUCCESS) {
 			if (*fence_p != VK_NULL_HANDLE) {
 				vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
