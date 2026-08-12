@@ -28,7 +28,14 @@ extern "C" {
 #endif
 
 // Forward declarations — avoid pulling in full Vulkan headers.
+//
+// These two are DISPATCHABLE handles, so they are `struct T *` in every build —
+// unlike the non-dispatchable set below, which is pointer-sized on 64-bit and
+// uint64_t on 32-bit. Declaring a dispatchable handle inside the XRT_64_BIT
+// branch would be wrong on 32-bit. Identical to vulkan.h's own definitions, so
+// a TU including both is fine.
 typedef struct VkCommandBuffer_T *VkCommandBuffer;
+typedef struct VkQueue_T *VkQueue;
 
 #ifdef XRT_64_BIT
 typedef struct VkImage_T *VkImage_XDP;

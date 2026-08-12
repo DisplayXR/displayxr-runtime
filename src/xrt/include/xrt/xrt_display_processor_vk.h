@@ -197,6 +197,40 @@ struct xrt_display_processor_vk
 	void (*set_frame_timing)(struct xrt_display_processor_vk *xdp,
 	                         uint64_t weave_to_scanout_ns,
 	                         uint64_t frame_period_ns);
+
+	/*!
+	 * Tell the DP that the command buffer carrying this frame's weave has
+	 * been SUBMITTED, and on which queue.
+	 *
+	 * This exists because the weave is recorded by the DP but submitted by
+	 * the compositor: the DP records into the `cmd` handed to
+	 * @ref xrt_display_processor::process_atlas and never sees the
+	 * `vkQueueSubmit`, so it cannot know when the frame went to the GPU.
+	 *
+	 * Vendor late latching needs exactly that moment. It re-runs the weave's
+	 * vertex attributes with the CURRENT predicted eye position and patches
+	 * the mapped vertex buffer of frames already queued but not yet executed
+	 * — so the pose is sampled at submit time rather than at record time.
+	 * Without this call the vendor weaver cannot distinguish a submitted
+	 * frame from an unsubmitted one, silently declines to latch, and still
+	 * reports success from its enable call. A latch that never runs is worse
+	 * than no latch, because a horizon predictor may stand down in its favour.
+	 *
+	 * MUST be called with the SAME queue the weave command buffer went to:
+	 * the vendor submits an empty fence-carrying submit on it to count frames
+	 * in flight, so a different queue tracks the wrong thing. Call once per
+	 * weave, immediately after the submit; two weaves without this call
+	 * between them degrade that frame to non-late-latched.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP has no late-latching support and the compositor simply does not call
+	 * it. Appended after @ref set_frame_timing per ADR-020 (append-only within
+	 * a major; no version bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp    Pointer to self.
+	 * @param queue  The `VkQueue` the weave command buffer was submitted to.
+	 */
+	void (*weave_submitted)(struct xrt_display_processor_vk *xdp, VkQueue queue);
 };
 
 /*!
@@ -214,6 +248,13 @@ struct xrt_display_processor_vk
  * for the weave-latency control loop landing across runtime + vendor plug-in.
  */
 #define XRT_DP_VK_HAS_FRAME_TIMING 1
+
+/*!
+ * Defined when this header carries the @ref xrt_display_processor_vk::weave_submitted
+ * slot — same coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_PRESENT_ORIGIN,
+ * for Vulkan late latching landing across runtime + vendor plug-in.
+ */
+#define XRT_DP_VK_HAS_WEAVE_SUBMITTED 1
 
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
@@ -242,7 +283,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, notify_target_recrea
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_shared_texture_present) == sizeof(struct xrt_display_processor) + 2 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_present_origin)          == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_frame_timing)            == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)             == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -369,6 +411,30 @@ xrt_display_processor_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
 		return;
 	}
 	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::weave_submitted
+ *
+ * Returns true if the DP was told, false if the slot is absent (older plug-in
+ * `struct_size`) or NULL — the caller can use that to decide whether late
+ * latching is drivable at all, since enabling it without this hook produces a
+ * latch that silently never runs.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_weave_submitted(struct xrt_display_processor_vk *xdp, VkQueue queue)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->weave_submitted + sizeof(xdp->weave_submitted);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->weave_submitted == NULL) {
+		return false;
+	}
+	xdp->weave_submitted(xdp, queue);
+	return true;
 }
 
 #ifdef __cplusplus
