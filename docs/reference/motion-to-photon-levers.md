@@ -102,9 +102,31 @@ Re-samples the eye position at submit for frames already queued but not yet exec
 | VK | Needs our submit hook → `srWeaverWeaveSubmittedVulkan` |
 | D3D12 | Upstream **stub**; deliberately not called |
 
-`srWeaverIsLateLatchingEnabled` reports the **effective** flag, not an echo, so it is worth
+`srWeaverIsLateLatchingEnabled` reports the **effective** flag rather than an echo, so it is worth
 asserting after enabling and again at the end of a run — the device-lost path hard-disables and
-never re-enables.
+never re-enables. **But it is not a complete check:** where the weaver declines for a documented
+reason (below) it declines *silently* and this still returns true. Treat it as "not obviously
+off", not as proof the latch runs.
+
+**Two contract constraints from the vendor's own shipped header** (`dx11weaver.h:118` in the SDK
+we already vendor):
+
+> "late latching requires applications to call `weave()` once per frame, and does not work with
+> deferred contexts."
+
+- **Deferred contexts** — not a concern for us: both the D3D11 service and the in-process path use
+  the **immediate** context.
+- **Once per frame** — worth understanding, because **repaint deliberately weaves outside the app
+  frame loop.** DX11 self-disables with *"Exceeded maximum frames in flight. Disabling late
+  latching."* when it thinks it is seeing multiple weaves per frame. **We have never tripped it:**
+  zero occurrences of that string (or `Invalid frame count`) across all 2,665 logs on this box, and
+  vendor lines are confirmed to reach our log stream, so that is a real negative rather than a
+  capture gap. Still, if you change repaint's cadence, grep for those strings — a silent
+  self-disable would look exactly like a working feature.
+
+**On Vulkan specifically:** the weaver's author stated in June 2026 that "late latching is just
+DX11 and OpenGL, no Vulkan" — before the submit-hook entry point existed. So the VK path is new
+and unproven upstream, which is the most economical explanation for our VK results to date.
 
 It only has anything to patch when frames are queued, which is to say only in combination with
 `DXR_DEFER_PRESENT`. Whether it produces a visible effect is **not established**; the 2026-08-12
@@ -163,6 +185,20 @@ Two traps that have each produced a wrong answer here, both worth more than any 
 For late-latching specifically, the dot test needs `pattern = 405` (not 450 — `dotRadius =
 pattern - 400 + 1`, so 450 gives 51-pixel discs), a viewer moving briskly and continuously, and a
 D3D11 bracket with a genuine off (`lateLatching=0` in `player.ini`) as the negative control.
+
+**Do not build a load rig for this — one already exists.** A purpose-built demo was written in
+2024 to prove late latching to customers: a modified `example_directx11_weaving.exe` rendering a
+torus knot whose polygon count *is* the GPU-load knob (`-STACKS`, default 10000), with the dots
+hacked into the weaver, and a later build adding an ImGui mesh-detail slider. It lives in
+`#sw-sdk-late-latching-demo` (Slack `C07QRRU2HKM`) and on SharePoint/OneDrive; ask the LeiaSR side
+for the current link, since the torus builds are on personal OneDrive and are **not** SharePoint-
+indexed. Known state: the 2024-10-29 build was reported broken in March 2025 and never integrated
+into SR, so a failure to launch is old news, not a new regression.
+
+The separation is exactly `P(t1) - P(t0)` — the *change* in predicted eye position between record
+and latch. **A stationary viewer cannot produce separation however well the latch works**, which
+is why the load knob and the movement are both load-bearing parts of the test rather than
+incidental advice.
 
 ## See also
 
