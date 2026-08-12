@@ -400,6 +400,7 @@ See `docs/README.md` for the full index. By task:
 | How Unity / engine D3D12 apps reach the runtime (hooked window-binding injection + overlay) | `docs/architecture/unity-d3d12-app-path.md` |
 | How Unreal D3D12 apps reach the runtime (first-class HMD plugin, direct runtime load + zero-copy atlas handoff, adaptive N-view) | `docs/architecture/unreal-d3d12-app-path.md` |
 | Eye-tracking MANAGED/MANUAL contract | `docs/specs/vendor/eye-tracking-modes.md` |
+| Tune or reason about motion-to-photon latency (late weave, repaint, VK queue tiers, deferred present, late latching) — and what the defaults are per GPU topology | `docs/reference/motion-to-photon-levers.md` |
 | GPU adapter selection on hybrid iGPU/dGPU machines (`DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU`, in-process `getenv` caveat) | `docs/reference/adapter-selection.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |

@@ -177,6 +177,7 @@ Cross-cutting references that don't belong to a single audience.
 - [Qwerty Device](reference/qwerty-device.md) — keyboard/mouse simulated controller
 - [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
 - [Debug Logging](reference/debug-logging.md) — log level conventions
+- [Motion-to-Photon Levers](reference/motion-to-photon-levers.md) — every latency knob (late weave, repaint, queue tiers, deferred present, late latching) with its default, and the defaults per GPU topology (dGPU / iGPU / hybrid)
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).
