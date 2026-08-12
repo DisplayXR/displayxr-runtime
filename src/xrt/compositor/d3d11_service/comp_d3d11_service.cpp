@@ -9477,6 +9477,20 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	if (c->render.hwnd != nullptr && c->render.swap_chain) {
+		/*
+		 * Everything below releases and rebuilds objects the RENDER thread
+		 * reads: this client's back_buffer_rtv / swap_chain (multi_compositor_render
+		 * pulls both off the slot) and, in the atlas branch, sys->view_* /
+		 * sys->display_*. The render thread touches them under
+		 * sys->render_mutex and never takes a per-client c->mutex, so c->mutex
+		 * alone did not exclude it. Take the same lock the render thread does.
+		 *
+		 * Order is c->mutex (held since the top of layer_commit) → render_mutex,
+		 * which is the order this function already uses for the zones composite,
+		 * so no new inversion. Recursive, so a nested take further down is fine.
+		 */
+		std::lock_guard<std::recursive_mutex> resize_render_lock(sys->render_mutex);
+
 		RECT client_rect;
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
 			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
