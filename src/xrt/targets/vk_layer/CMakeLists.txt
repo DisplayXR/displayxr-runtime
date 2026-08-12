@@ -54,3 +54,38 @@ endif()
 configure_file(
 	VkLayer_DXR_queue_lock.json.in ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_DXR_queue_lock.json @ONLY
 	)
+
+# --- Installed-tree manifest + install rules (#902 packaging) ----------------
+#
+# Without these the layer is BUILT but never SHIPPED, and the shared-queue
+# repaint tier is unreachable on every single-graphics-queue GPU (Intel iGPUs,
+# AMD) — the compositor logs "repaint disabled" and degrades silently, so
+# nothing announces the absence. Verified 2026-08-11: no install rule, no
+# installer entry, no ExplicitLayers key anywhere in the tree.
+#
+# The installed manifest uses a path RELATIVE to the manifest file (the Vulkan
+# loader resolves library_path that way), so the DLL and its .json ship side by
+# side in bin/ and the pair relocates with the install directory. The dev-tree
+# manifest above keeps its absolute path — run scripts point VK_LAYER_PATH at
+# the build dir and never move.
+# BARE FILENAME, no "./" prefix. The loader hands library_path straight to
+# LoadLibrary on Windows, which rejects "./name.dll" with error 87
+# (ERROR_INVALID_PARAMETER) — and the failure surfaces to the app as
+# VK_ERROR_OUT_OF_HOST_MEMORY at vkCreateInstance, which names neither the
+# layer nor the path. A bare filename is resolved relative to the manifest's
+# own directory, which is what we want and is portable. Found by installing it
+# and watching VK_LOADER_DEBUG=layer, not by reading the spec.
+if(WIN32)
+	set(DXR_QL_LIBRARY_PATH "VkLayer_DXR_queue_lock.dll")
+else()
+	set(DXR_QL_LIBRARY_PATH "libVkLayer_DXR_queue_lock.so")
+endif()
+configure_file(
+	VkLayer_DXR_queue_lock.json.in
+	${CMAKE_CURRENT_BINARY_DIR}/installed/VkLayer_DXR_queue_lock.json @ONLY
+	)
+
+install(TARGETS VkLayer_DXR_queue_lock LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}
+                                       RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/installed/VkLayer_DXR_queue_lock.json
+        DESTINATION ${CMAKE_INSTALL_BINDIR})
