@@ -2999,6 +2999,43 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		}
 	}
 
+	/*
+	 * #911: that same acquire-side recreate can come back at a DIFFERENT SIZE
+	 * — entering or leaving fullscreen is exactly that — and BOTH callers
+	 * sampled tgt_width/tgt_height before calling us. Everything below is
+	 * sized from that pair, including this frame's target framebuffer.
+	 *
+	 * Building a 3840x2160 framebuffer over a freshly created 1280x720
+	 * attachment is not a cosmetic mismatch, it is a hard GPU fault: the next
+	 * vkQueueSubmit returns VK_ERROR_DEVICE_LOST and the app spins in the
+	 * failure path forever with the last frame frozen on the panel. Validation
+	 * names it exactly — VUID-VkFramebufferCreateInfo-flags-04533/04534,
+	 * "attachment has width 1280 smaller than the corresponding framebuffer
+	 * width 3840" — immediately before the device dies.
+	 *
+	 * Once the acquire has returned, the target is the only authority on its
+	 * own size, so re-read it. The layout/atlas state derived from the old
+	 * size is stale for this one frame and the DP stretches over the
+	 * difference; the next frame recomputes it. One slightly-wrong frame beats
+	 * a lost device.
+	 */
+	if (c->target != NULL) {
+		uint32_t live_w = 0, live_h = 0;
+		comp_vk_native_target_get_dimensions(c->target, &live_w, &live_h);
+		if (live_w != 0 && live_h != 0 && (live_w != tgt_width || live_h != tgt_height)) {
+			static bool resize_logged = false;
+			if (!resize_logged) {
+				resize_logged = true;
+				U_LOG_W("#911: target resized under the weave (%ux%u -> %ux%u) — the "
+				        "acquire recreated the swapchain after this frame was sized; "
+				        "using the live dimensions",
+				        tgt_width, tgt_height, live_w, live_h);
+			}
+			tgt_width = live_w;
+			tgt_height = live_h;
+		}
+	}
+
 	// #868: a repaint records from its OWN pool — see repaint_cmd_pool.
 	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
 	                             ? c->repaint_cmd_pool
