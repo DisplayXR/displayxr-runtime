@@ -733,6 +733,49 @@ Section "DisplayXR Runtime" SecRuntime
 	; installer, so the cascade pass below skips it; the runtime
 	; uninstaller drops the subkey + plugins dir directly.
 
+	; -----------------------------------------------------------------
+	; #902: VK_LAYER_DXR_queue_lock — per-queue submit serialization so
+	; the #868 late-weave repaint can share the app's VkQueue on GPUs
+	; whose graphics family exposes a SINGLE queue (Intel iGPUs, AMD).
+	;
+	; Without this the compositor cannot get a runtime-owned queue, falls
+	; to tier 3 (pacing only), and logs "repaint disabled" — silently. So
+	; every single-graphics-queue GPU in the field simply never had the
+	; late-weave repaint. The layer was built but never packaged.
+	;
+	; The manifest ships beside the DLL and its library_path is RELATIVE,
+	; so the pair relocates with $INSTDIR. The ExplicitLayers key is
+	; required on Windows because VK_LAYER_PATH is ignored for elevated
+	; processes — an env var alone would work for some apps and not
+	; others, which is worse than not shipping it.
+	;
+	; The layer is an OPTIMIZATION, never a requirement: the runtime
+	; resolves it by a marker handshake (vkGetQueueLockMarkerDXR) and
+	; degrades to tier 3 if it is missing, so a failed registration
+	; costs pacing, never correctness.
+	; -----------------------------------------------------------------
+	; The manifest is GENERATED HERE, not shipped, because library_path must
+	; be ABSOLUTE. The Windows loader hands it to LoadLibrary: "./name.dll"
+	; and a bare "name.dll" both fail with error 87 (ERROR_INVALID_PARAMETER),
+	; and the failure reaches the app as VK_ERROR_OUT_OF_HOST_MEMORY at
+	; vkCreateInstance — naming neither the layer nor the path. Measured with
+	; VK_LOADER_DEBUG=layer against a real install; the relative form in the
+	; spec is not what this loader accepts from a registry-discovered manifest.
+	;
+	; Forward slashes: JSON would need every backslash doubled, and LoadLibrary
+	; accepts '/' on Windows, so converting sidesteps the escaping entirely.
+	File "${BIN_DIR}\VkLayer_DXR_queue_lock.dll"
+	${WordReplace} "$INSTDIR" "\" "/" "+" $R9
+	FileOpen $R8 "$INSTDIR\VkLayer_DXR_queue_lock.json" w
+	; One line on purpose: JSON ignores whitespace, and it keeps every
+	; quote/backslash out of NSIS escaping.
+	FileWrite $R8 '{"file_format_version":"1.2.0","layer":{"name":"VK_LAYER_DXR_queue_lock",'
+	FileWrite $R8 '"type":"GLOBAL","library_path":"$R9/VkLayer_DXR_queue_lock.dll",'
+	FileWrite $R8 '"api_version":"1.3.0","implementation_version":"1",'
+	FileWrite $R8 '"description":"DisplayXR per-queue submit serialization for the late-weave repaint (#902)"}}'
+	FileClose $R8
+	WriteRegDWORD HKLM "Software\Khronos\Vulkan\ExplicitLayers" "$INSTDIR\VkLayer_DXR_queue_lock.json" 0
+
 	; Create AppData directories
 	CreateDirectory "$APPDATA\DisplayXR"
 
@@ -1041,6 +1084,13 @@ Section "Uninstall"
 	${EndIf}
 
 	; Drop the parent key (cleans the sim-display subkey + any orphans).
+	; #902: drop the Vulkan layer registration before the files go.
+	; DeleteRegValue (not DeleteRegKey) — ExplicitLayers is a SHARED key
+	; owned by the Vulkan loader and holds other vendors' layers.
+	DeleteRegValue HKLM "Software\Khronos\Vulkan\ExplicitLayers" "$INSTDIR\VkLayer_DXR_queue_lock.json"
+	Delete "$INSTDIR\VkLayer_DXR_queue_lock.dll"
+	Delete "$INSTDIR\VkLayer_DXR_queue_lock.json"
+
 	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors"
 	; -----------------------------------------------------------------
 
