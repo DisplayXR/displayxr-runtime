@@ -1,12 +1,18 @@
 # Motion-to-photon levers and their defaults
 
-Every knob that changes how long it takes a head movement to reach the panel, what each one
-actually does, and what it is set to out of the box on each GPU topology.
+Every runtime knob that changes how long it takes a head movement to reach the panel, what each
+one actually does, and what it is set to out of the box on each GPU topology.
 
 **The short version:** late weave and repaint are the levers that carry the product. Everything
 else is either a fallback for hardware that cannot do those, a probe, or an experiment that has
 not paid off yet. If you are reading this to decide what to turn on: turn nothing on. The defaults
 are the tuned configuration.
+
+**Scope.** This covers the *runtime* side only. A display processor may also do pose re-sampling
+of its own inside the weave — that is DP-internal behaviour, it varies by vendor, and it is
+documented in the vendor's own plug-in repo (see [`docs/vendors/README.md`](../vendors/README.md)).
+The only thing the runtime guarantees a DP is a well-paced weave with a fresh pose; what the DP
+does with it is the DP's business.
 
 ## The central trade
 
@@ -15,12 +21,12 @@ a stack:
 
 | | Approach | What it costs |
 |---|---|---|
-| **A** | Let frames queue (`DXR_DEFER_PRESENT`), then re-sample the pose at submit time — SR **late latching** patches the already-queued frame | +1 frame of eye-pose staleness, which late latching is supposed to pay back. Measured null twice. |
+| **A** | Let frames queue (`DXR_DEFER_PRESENT`) so that a DP capable of re-sampling the pose at submit time has something to correct | +1 frame of eye-pose staleness, which the DP-side correction is supposed to pay back. Measured null twice. |
 | **B** | Never let the weave go stale in the first place — **repaint** re-weaves the last atlas at display rate with a **fresh** eye pose | A repaint costs GPU time even when the app has produced nothing new |
 
 **We ship B.** Repaint runs at the display rate, so the woven pose is at most one refresh old
-regardless of how slow the app is. That plausibly makes late latching redundant *by construction*:
-the staleness it exists to remove is already being removed every refresh.
+regardless of how slow the app is. That plausibly makes DP-side submit-time correction redundant
+*by construction*: the staleness it exists to remove is already being removed every refresh.
 
 That is the reasoning behind the defaults below — repaint and late weave on, deferred present off.
 
@@ -61,6 +67,11 @@ A repaint replays *rendering state only* — it never touches app-owned state.
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 
+**Repaint weaves outside the app's frame loop, and a DP may not expect that.** A display processor
+is entitled to assume a weave cadence tied to app frames, and one that does may degrade — possibly
+silently — when repaint drives extra weaves. That is a per-vendor contract question, not a runtime
+one; if you change repaint's cadence, re-check it against each vendor's documented constraints.
+
 ### `DXR_VK_QUEUE_MODE` — **default `auto`** (#902)
 
 Repaint needs somewhere to submit from. Three tiers, resolved automatically:
@@ -84,68 +95,22 @@ Return from the weave without waiting on the submit fence, parking the frame's c
 framebuffer and fence and retiring exactly that predecessor at the top of the next call. Net
 effect: one frame genuinely in flight instead of zero.
 
-It does **not** touch `setLatency`. It is a fence-discipline change, not a weaver call.
+It does **not** change the latency horizon handed to the DP. It is a fence-discipline change.
 
 **Measured as a null twice** — once unloaded (60→60 fps) and once under load with the mechanism
-proven live (`#837: first frame PARKED`), 15 fps and identical dot behaviour either way. It only
-touches app frames (`!is_repaint`), so with repaint on it affects roughly 15 of every 60 weaves.
-Keep it off.
+proven live (`#837: first frame PARKED`), 15 fps and identical results either way. It only touches
+app frames (`!is_repaint`), so with repaint on it affects roughly 15 of every 60 weaves. Keep it
+off.
 
-### SR late latching — enabled where wired, effect **unverified**
+### Prediction horizon — computed by the DP, no runtime env var
 
-Re-samples the eye position at submit for frames already queued but not yet executed. Per backend:
+The runtime feeds the DP a **measured weave→scanout residual** through its frame-timing loop. A DP
+that predicts eye position can use that instead of assuming a fixed pipeline depth, which means a
+change in real present latency is largely self-correcting without any runtime knob.
 
-| Backend | Mechanism |
-|---|---|
-| D3D11 | Automatic — implicit submission, the weaver places its own `D3D11_QUERY_EVENT` in `weave()` |
-| GL | Automatic, via `glFenceSync` |
-| VK | Needs our submit hook → `srWeaverWeaveSubmittedVulkan` |
-| D3D12 | Upstream **stub**; deliberately not called |
-
-`srWeaverIsLateLatchingEnabled` reports the **effective** flag rather than an echo, so it is worth
-asserting after enabling and again at the end of a run — the device-lost path hard-disables and
-never re-enables. **But it is not a complete check:** where the weaver declines for a documented
-reason (below) it declines *silently* and this still returns true. Treat it as "not obviously
-off", not as proof the latch runs.
-
-**Two contract constraints from the vendor's own shipped header** (`dx11weaver.h:118` in the SDK
-we already vendor):
-
-> "late latching requires applications to call `weave()` once per frame, and does not work with
-> deferred contexts."
-
-- **Deferred contexts** — not a concern for us: both the D3D11 service and the in-process path use
-  the **immediate** context.
-- **Once per frame** — worth understanding, because **repaint deliberately weaves outside the app
-  frame loop.** DX11 self-disables with *"Exceeded maximum frames in flight. Disabling late
-  latching."* when it thinks it is seeing multiple weaves per frame. **We have never tripped it:**
-  zero occurrences of that string (or `Invalid frame count`) across all 2,665 logs on this box, and
-  vendor lines are confirmed to reach our log stream, so that is a real negative rather than a
-  capture gap. Still, if you change repaint's cadence, grep for those strings — a silent
-  self-disable would look exactly like a working feature.
-
-**On Vulkan specifically:** the weaver's author stated in June 2026 that "late latching is just
-DX11 and OpenGL, no Vulkan" — before the submit-hook entry point existed. So the VK path is new
-and unproven upstream, which is the most economical explanation for our VK results to date.
-
-It only has anything to patch when frames are queued, which is to say only in combination with
-`DXR_DEFER_PRESENT`. Whether it produces a visible effect is **not established**; the 2026-08-12
-attempt to measure it was invalid (`pattern=450` draws 51-pixel dots that swallow the offset, and
-a stationary viewer cannot separate them at all). Standing decision: keep the wiring, it reports
-healthy and costs nothing, but do not spend hardware time proving it until there is a valid
-instrument.
-
-### Prediction horizon — plug-in side, no env var
-
-The plug-in feeds a latency horizon to the weaver via `srWeaverSetLatency` **before** `weave()`,
-so the frame's eye prediction uses it. It prefers the runtime's **measured** weave→scanout
-residual (fresh within 250 ms) over the additive heuristic
-`N_buffered * frame_interval + T_display`, smoothed with an EMA and ignoring hitches over 250 ms.
-
-Because the horizon is measured rather than assumed, a change in real present latency is largely
-self-correcting. **Unverified:** whether the timing loop still reports the residual meaningfully
-when `DXR_DEFER_PRESENT` moves the present into the following call. Check that before that flag is
-ever considered for default-on.
+**Unverified:** whether that residual still means what the DP thinks it means when
+`DXR_DEFER_PRESENT` moves the present into the following call. Check before that flag is ever
+considered for default-on.
 
 ### Adjacent levers that change the picture
 
@@ -158,20 +123,19 @@ ever considered for default-on.
 
 ## Defaults by GPU topology
 
-| | dGPU (discrete, multi-queue) | iGPU (Intel UHD) | Hybrid laptop |
+| | dGPU (discrete, multi-queue) | iGPU (integrated) | Hybrid laptop |
 |---|---|---|---|
-| Late weave | **on**, fully effective | **on**, but *dormant on VK* — Intel exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
+| Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
 | Repaint | **on**, tier 1 dedicated queue | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) | on; follows the adapter the session was created on |
 | `DXR_DEFER_PRESENT` | off | off | off |
-| Late latching | enabled where wired | enabled where wired | enabled where wired |
-| `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** here (no timing extensions to exploit); the opposite has been observed for Unity | off |
+| `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
-**Hybrid is the unresolved one.** On this class of laptop the panel is frequently **iGPU-scanned**
-— the Intel adapter holds the active mode — while the app renders on the dGPU. That makes the
-weave a cross-adapter operation, and cross-adapter sharing has its own traps (KMT handles share no
-pixels on Intel; use NT handles). Whether it is better to weave on the dGPU and copy, or run the
-weave/repaint on the iGPU next to the scanout, is **open — see #918**. There is no hybrid-specific
-default today; you get the dGPU column with a cross-adapter copy.
+**Hybrid is the unresolved one.** On this class of laptop the panel is frequently **scanned out by
+the integrated adapter** — it holds the active mode — while the app renders on the discrete one.
+That makes the weave a cross-adapter operation, and cross-adapter sharing has its own traps (KMT
+handles share no pixels on some integrated drivers; use NT handles). Whether it is better to weave
+on the dGPU and copy, or to run the weave and repaint next to the scanout, is **open — see #918**.
+There is no hybrid-specific default today; you get the dGPU column with a cross-adapter copy.
 
 ## Measuring any of this
 
@@ -182,27 +146,17 @@ Two traps that have each produced a wrong answer here, both worth more than any 
 2. **Counters are not pixels.** Present counts and frame rates prove nothing reached the panel.
    Confirm on the display.
 
-For late-latching specifically, the dot test needs `pattern = 405` (not 450 — `dotRadius =
-pattern - 400 + 1`, so 450 gives 51-pixel discs), a viewer moving briskly and continuously, and a
-D3D11 bracket with a genuine off (`lateLatching=0` in `player.ini`) as the negative control.
+Synthetic GPU contention is a poor lever for reaching a target frame rate: presents are
+vsync-quantised, so the rate steps 60/N rather than sliding, and enough contention to force a low
+step starts destabilising the app under test. Prefer an app that is genuinely heavy in its own
+render loop.
 
-**Do not build a load rig for this — one already exists.** A purpose-built demo was written in
-2024 to prove late latching to customers: a modified `example_directx11_weaving.exe` rendering a
-torus knot whose polygon count *is* the GPU-load knob (`-STACKS`, default 10000), with the dots
-hacked into the weaver, and a later build adding an ImGui mesh-detail slider. It lives in
-`#sw-sdk-late-latching-demo` (Slack `C07QRRU2HKM`) and on SharePoint/OneDrive; ask the LeiaSR side
-for the current link, since the torus builds are on personal OneDrive and are **not** SharePoint-
-indexed. Known state: the 2024-10-29 build was reported broken in March 2025 and never integrated
-into SR, so a failure to launch is old news, not a new regression.
-
-The separation is exactly `P(t1) - P(t0)` — the *change* in predicted eye position between record
-and latch. **A stationary viewer cannot produce separation however well the latch works**, which
-is why the load knob and the movement are both load-bearing parts of the test rather than
-incidental advice.
+Vendor-specific verification recipes — debug overlays, forced-off switches, purpose-built load
+demos — live in the vendor plug-in repos, not here.
 
 ## See also
 
 - [`docs/adr/ADR-007`](../adr/ADR-007-compositor-never-weaves.md) — the compositor never weaves; the DP does
 - [`docs/architecture/compositor-pipeline.md`](../architecture/compositor-pipeline.md)
 - [`docs/reference/adapter-selection.md`](adapter-selection.md) — GPU placement on hybrid machines
-- [`docs/reference/debug-logging.md`](debug-logging.md)
+- [`docs/vendors/README.md`](../vendors/README.md) — index; DP-internal behaviour lives in each vendor's repo
