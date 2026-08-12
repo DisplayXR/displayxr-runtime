@@ -131,6 +131,65 @@ reports `XRT_ERROR_DEVICE_CREATION_FAILED`.
 
 ---
 
+## 3D doesn't weave — the image is flat and the active plug-in is `sim-display`
+
+**Symptom.** Apps launch and `selftest` **passes**, but the picture is flat 2D with no
+weaving, and `displayxr-cli info` reports `active plug-in: id=sim-display` even though the
+vendor plug-in is installed and its key exists under
+`HKLM\Software\DisplayXR\DisplayProcessors`.
+
+**Cause — the vendor SDK isn't reachable on `PATH`, so the plug-in never loads.** The
+vendor plug-in DLL links its platform's DLLs, which live in the vendor platform's own
+install directory and resolve at load time through the `PATH` entry that the *vendor
+platform* installer adds. If they can't be found, `LoadLibrary` fails, the loader logs a
+**warning** and falls through to the next plug-in by probe order — the hardware-free
+`sim-display`. Nothing reports an error; you just silently get 2D.
+
+Two ways in:
+
+- **The vendor platform was never installed.**
+- **The vendor platform was installed *after* DisplayXR.** `PATH` is captured in a
+  process's environment block when that process starts. `displayxr-service.exe`
+  auto-starts at logon and is long-lived, so it keeps the *pre-install* `PATH` and keeps
+  failing the load — even though a freshly-started process would succeed.
+
+**Diagnose.** Open the newest log in `%LOCALAPPDATA%\DisplayXR\` and search for
+`plugin loader:`:
+
+```
+plugin loader:   <id>: LoadLibrary(...) failed (err=126).
+```
+
+`err=126` is `ERROR_MOD_NOT_FOUND` — a *dependency* DLL is missing, i.e. the vendor
+platform isn't on `PATH`. (A different error code points elsewhere; an ABI rejection logs
+a version mismatch instead, not a load failure.)
+
+**Fix.**
+
+1. Install the vendor platform runtime.
+2. Restart the service so it picks up the new `PATH` — or just reboot:
+
+```
+taskkill /IM displayxr-service.exe /F
+explorer.exe "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
+```
+
+(Relaunch via `explorer.exe` so the service runs **non-elevated**, matching how it starts
+at logon.)
+
+3. Re-run `displayxr-cli.exe selftest` and confirm the active plug-in is the vendor one.
+
+You do **not** need to reinstall DisplayXR — discovery is registry-driven at
+`xrCreateInstance`, so the plug-in is adopted as soon as its dependencies resolve.
+
+**If the `DisplayProcessors\<vendor>` key is missing entirely,** the plug-in was never
+installed: the end-user meta-installer auto-selects the vendor component only when it
+detects the vendor platform on disk at startup, and installing the platform later does not
+retroactively add it. Re-run `DisplayXRBundle-*.exe` (ARP → *Modify*) and tick the vendor
+component, or run its standalone installer — which requires only the DisplayXR runtime.
+
+---
+
 ## Vulkan app crashes immediately on launch
 
 **Symptom.** A Vulkan-backed app crashes at or just after startup (often a null-pointer

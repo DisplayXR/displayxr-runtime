@@ -66,6 +66,29 @@ both demo flags to install the released demos *and* clone their sources).
 - [GitHub CLI](https://cli.github.com/) (`winget install --id GitHub.cli`) authenticated via `gh auth login`. Same requirement as `scripts\build_windows.bat`.
 - **Elevated command prompt** — right-click cmd.exe and choose "Run as administrator". The NSIS installers all write to HKLM + Program Files; non-elevated runs fail with a clearer error than individual installers report.
 - PowerShell (preinstalled). The `.bat` shells out for JSON parsing and the publisher-scan uninstall path.
+- **Install the display vendor's platform runtime *first*** — on a Leia SR box, the SR Platform. `DisplayXR-LeiaSR.dll` links the `SimulatedReality*` DLLs, which resolve at load time through the `…\LeiaSR\Platform\bin` entry the SR installer adds to the machine `PATH`. See below for what happens if you go the other way round.
+
+### Ordering: vendor platform before DisplayXR
+
+Nothing is bound at install time — plug-in discovery is registry-driven at
+`xrCreateInstance` — so installing the vendor platform *afterwards* is
+recoverable, not fatal. But two things go quietly wrong if DisplayXR
+lands first:
+
+- **The end-user meta-bundle skips the vendor plug-in.** `DisplayXRBundle-*.exe`
+  probes for the SR Platform on disk at startup and only auto-selects the Leia SR
+  component when it finds it. Installing SR later does **not** retroactively add
+  the plug-in. Fix: re-run the bundle (ARP → *Modify*) and tick **Leia SR** by
+  hand, or run `DisplayXRLeiaSRSetup-*.exe` standalone — it requires only the
+  DisplayXR runtime, not the SR Platform. (`setup-displayxr.bat` is unaffected;
+  it installs the plug-in unconditionally.)
+- **An installed plug-in silently fails to load.** `PATH` is captured in a
+  process's environment block at start, and `displayxr-service.exe` auto-starts
+  at logon, so a long-running service keeps the pre-SR `PATH` and keeps failing
+  the `LoadLibrary` — the runtime falls back to `sim-display` and you get flat
+  2D with no error. Fix: **restart the service** (or reboot). Full symptom →
+  diagnosis → fix in
+  [Troubleshooting → *3D doesn't weave*](troubleshooting.md#3d-doesnt-weave--the-image-is-flat-and-the-active-plug-in-is-sim-display).
 
 ## Platform availability matrix
 
