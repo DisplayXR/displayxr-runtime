@@ -769,7 +769,26 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					U_LOG_I("Window resized: %ux%u -> %ux%u",
 					        current_width, current_height, new_width, new_height);
 
+					/*
+					 * Make the resize atomic on the immediate context, for the
+					 * same reason the #868 repaint replay is (see the
+					 * mt_lock rationale in d3d11_repaint_thread).
+					 * comp_d3d11_target_resize issues OMSetRenderTargets +
+					 * ResizeBuffers on the context the APP also renders its
+					 * scene on, from its own thread, without ever taking
+					 * c->mutex — so c->mutex keeps the repaint out but not the
+					 * app. D3D11 survives the interleave where VK does not, but
+					 * "survives" is not "correct": it is the same window that
+					 * sent the weave to the app's render target and left the
+					 * swapchain black.
+					 */
+					if (c->mt_lock != nullptr) {
+						c->mt_lock->Enter();
+					}
 					xrt_result_t xret = comp_d3d11_target_resize(c->target, new_width, new_height);
+					if (c->mt_lock != nullptr) {
+						c->mt_lock->Leave();
+					}
 					if (xret != XRT_SUCCESS) {
 						U_LOG_E("Failed to resize target");
 						// Continue anyway, rendering will just be wrong size
