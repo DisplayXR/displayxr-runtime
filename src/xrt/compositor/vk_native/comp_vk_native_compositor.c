@@ -506,6 +506,23 @@ struct comp_vk_native_compositor
 	//! is the stepping stone for deferred present. Lazily created.
 	VkFence frame_fence;
 
+	//! #837 revisit — DXR_DEFER_PRESENT=1 only. The previous frame's
+	//! submit-scoped resources, kept alive because we returned WITHOUT waiting
+	//! its fence. Retired at the top of the next vk_dp_weave_and_present.
+	//!
+	//! Deferring the wait is what puts a frame IN FLIGHT, which is the only
+	//! condition under which vendor late latching can do anything — it patches
+	//! the vertex buffer of frames queued but not yet executed. #837 measured
+	//! this as an fps null in Aug 2026 and closed; VK late latching did not
+	//! exist then, and the "+1 frame of eye-pose staleness" it was rejected for
+	//! is exactly what latching removes. Hence the env gate rather than a
+	//! revert: the pair is the experiment, not either half.
+	VkCommandBuffer deferred_cmd;
+	VkCommandPool deferred_cmd_pool;
+	VkFramebuffer deferred_fb;
+	VkFence deferred_fence;
+	bool deferred_pending;
+
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
 	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
@@ -2940,6 +2957,35 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	xrt_result_t xret = XRT_SUCCESS;
 
 	/*
+	 * #837 revisit: retire the PREVIOUS frame before touching anything. Its
+	 * submit was left un-waited so it could stay in flight; its command buffer
+	 * and framebuffer are still owned by the GPU until that fence signals.
+	 * Ring-free by construction — each call drains exactly its predecessor, so
+	 * at most one frame is ever outstanding and no resource is aliased.
+	 *
+	 * Doing it HERE rather than at the end of the previous call is the whole
+	 * point: the app's thread was released in between, so this wait usually
+	 * finds the fence already signalled.
+	 */
+	if (c->deferred_pending) {
+		if (c->deferred_fence != VK_NULL_HANDLE) {
+			vk->vkWaitForFences(vk->device, 1, &c->deferred_fence, VK_TRUE, UINT64_MAX);
+			vk->vkResetFences(vk->device, 1, &c->deferred_fence);
+		}
+		if (c->deferred_cmd != VK_NULL_HANDLE && c->deferred_cmd_pool != VK_NULL_HANDLE) {
+			vk->vkFreeCommandBuffers(vk->device, c->deferred_cmd_pool, 1, &c->deferred_cmd);
+		}
+		if (c->deferred_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->deferred_fb, NULL);
+		}
+		c->deferred_cmd = VK_NULL_HANDLE;
+		c->deferred_cmd_pool = VK_NULL_HANDLE;
+		c->deferred_fb = VK_NULL_HANDLE;
+		c->deferred_fence = VK_NULL_HANDLE;
+		c->deferred_pending = false;
+	}
+
+	/*
 	 * #868: every submit and the present below go to THIS queue. The app frame
 	 * uses the app's queue (the one it handed us); a repaint uses the
 	 * runtime-owned one where the driver gave us one. They must never be the
@@ -3469,19 +3515,55 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (struct xrt_display_processor_vk *)c->display_processor, queue);
 		}
 
-		if (res == VK_SUCCESS) {
-			if (*fence_p != VK_NULL_HANDLE) {
-				vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
-				vk->vkResetFences(vk->device, 1, fence_p);
-			} else {
-				vk->vkQueueWaitIdle(queue);
-			}
+		/*
+		 * #837 revisit — DXR_DEFER_PRESENT=1: return WITHOUT waiting, parking
+		 * this frame's resources for the next call to retire.
+		 *
+		 * Why it is gated and off by default: #837 measured deferral as an fps
+		 * null and closed. It is re-enabled here for a DIFFERENT question — a
+		 * frame in flight is the precondition for vendor late latching, which
+		 * did not exist for Vulkan when that null was measured. Whether the
+		 * pair is a win is the open experiment; whether either half alone is,
+		 * is already answered (no).
+		 *
+		 * Only the APP frame defers. A repaint shares c->repaint_fence and runs
+		 * off its own loop; letting it park too would let two paths own the
+		 * same parked slot, which is the aliasing this design avoids.
+		 */
+		static int defer_env = -1;
+		if (defer_env < 0) {
+			const char *e = getenv("DXR_DEFER_PRESENT");
+			defer_env = (e != NULL && e[0] == '1') ? 1 : 0;
+			U_LOG_W("#837: deferred present %s", defer_env ? "ENABLED (experiment)" : "off");
 		}
+		const bool defer_this = (defer_env == 1) && !is_repaint && res == VK_SUCCESS &&
+		                        *fence_p != VK_NULL_HANDLE && !c->deferred_pending;
 
-		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		if (defer_this) {
+			c->deferred_cmd = cmd;
+			c->deferred_cmd_pool = cmd_pool;
+			c->deferred_fb = target_fb;
+			c->deferred_fence = *fence_p;
+			c->deferred_pending = true;
+			// Ownership moved to the parked slot — do NOT free below, and do
+			// NOT let the framebuffer teardown after this block touch it.
+			target_fb = VK_NULL_HANDLE;
+		} else {
+			if (res == VK_SUCCESS) {
+				if (*fence_p != VK_NULL_HANDLE) {
+					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, fence_p);
+				} else {
+					vk->vkQueueWaitIdle(queue);
+				}
+			}
+
+			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		}
 	}
 
-	// Destroy temporary framebuffer after GPU is done
+	// Destroy temporary framebuffer after GPU is done. NULL when the frame was
+	// parked above — the retire step owns it then.
 	if (target_fb != VK_NULL_HANDLE) {
 		vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
 	}
