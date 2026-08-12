@@ -165,7 +165,7 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
 | `windowHandle` | App's window handle (`HWND`). **Required for all modes that need correct interlacing** — the display processor uses it to determine screen-space position (see [§2.4](#24-the-phase-alignment-problem)). Must remain valid for the session's lifetime. |
 | `readbackCallback` | If non-NULL, the runtime delivers composited RGBA pixels via this callback each frame (CPU offscreen mode). |
 | `readbackUserdata` | Opaque pointer passed to `readbackCallback`. |
-| `sharedTextureHandle` | Shared D3D11/D3D12 texture `HANDLE` for zero-copy GPU texture sharing. If non-NULL, the runtime composites into this shared texture instead of rendering to a window. |
+| `sharedTextureHandle` | Shared D3D11/D3D12 texture `HANDLE` for zero-copy GPU texture sharing. If non-NULL, the runtime composites into this shared texture instead of rendering to a window. Sizing, lifetime, format, and read-back are normative — see "Shared-texture contract" below. |
 | `transparentBackgroundEnabled` | (SPEC v4) When `XR_TRUE`, the runtime configures the bound HWND for per-pixel desktop transparency: app pixels written with `alpha = 1` appear opaque, `alpha = 0` regions composite through to the desktop. Per graphics API, the runtime picks the correct DXGI/DComp mechanism (apps shouldn't depend on which one). Only honored when `windowHandle` is non-NULL and the session is standalone (ignored in workspace/shell mode). **App-side HWND requirements** apply — see "Transparent-window contract" below. |
 
 **Three Modes:**
@@ -173,7 +173,7 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
 | Mode | `windowHandle` | `sharedTextureHandle` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | HWND | NULL | `_handle` | Runtime renders directly into the app's window |
-| **Texture** | HWND | HANDLE | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window. |
+| **Texture** | HWND | HANDLE | `_texture` | Runtime composites the multi-zone result (3D zones + Local2D zones, declared via [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window; size it worst-case and read back the canvas sub-rect 1:1 per "Shared-texture contract" below. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No window, no phase alignment. |
 
 > **Important for `_texture` apps:** You **must** provide a valid `windowHandle` even though the runtime renders into the shared texture, not the window. Without the HWND, the display processor cannot compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)).
@@ -183,6 +183,73 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
 **Fallback when absent:**
 
 When this structure is not in the `next` chain, the runtime falls back to its default behavior: creating its own window (`_hosted` mode). Existing OpenXR applications work without modification.
+
+#### Shared-texture contract (`_texture` mode)
+
+The dimensions, lifetime, and read-back rules for `sharedTextureHandle` are **normative** but were previously documented only in [`ADR-010`](../../adr/ADR-010-shared-app-iosurface-worst-case-sized.md) and [`displayxr-app-rules.md`](../../guides/displayxr-app-rules.md) (INV-4.2, INV-5.2). They are restated here because they are app-facing and not discoverable from the struct.
+
+**Size it worst-case, allocate it once, never resize it.** The shared texture is sized to the worst-case atlas across **all** rendering modes — not to the window, and not to the current mode:
+
+```c
+// INV-4.2. displayPixel* and the per-mode fields come from
+// xrEnumerateDisplayRenderingModesDXR (XR_DXR_display_info).
+for (uint32_t i = 0; i < renderingModeCount; i++) {
+    uint32_t w = (uint32_t)(tileColumns[i] * viewScaleX[i] * displayPixelWidth);
+    uint32_t h = (uint32_t)(tileRows[i]    * viewScaleY[i] * displayPixelHeight);
+    if (w > sharedWidth)  sharedWidth  = w;
+    if (h > sharedHeight) sharedHeight = h;
+}
+if (sharedWidth == 0 || sharedHeight == 0) {           // no mode table
+    sharedWidth  = displayPixelWidth  ? displayPixelWidth  : 1920;
+    sharedHeight = displayPixelHeight ? displayPixelHeight : 1080;
+}
+```
+
+Do **not** assume this equals the panel size. It does only when `tileColumns × viewScaleX == 1` per axis — true of the common SBS `2×1 @ 0.5` layout, which makes the two coincide on current hardware, but nothing in the runtime depends on it.
+
+The handle is captured at `xrCreateSession` and the surface is never reallocated. **A window resize does not require a new texture, and therefore never requires a new session** — the canvas derives from the window and the zone rects, so a resize changes what the runtime weaves *into* the surface, not the surface itself. There is deliberately no resize entry point (ADR-010 removed `xrUpdateSharedSurfaceEXT`).
+
+**Allocation.** Create it on the same graphics device the session uses, as a shared, render-targetable resource, and export an NT handle:
+
+```c
+D3D12_RESOURCE_DESC d = {};
+d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+d.Width            = sharedWidth;
+d.Height           = sharedHeight;
+d.DepthOrArraySize = 1;
+d.MipLevels        = 1;
+d.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;   // see "Format" below
+d.SampleDesc.Count = 1;
+d.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+d.Flags            = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;   // runtime creates an RTV on it
+
+device->CreateCommittedResource(&heapDefault, D3D12_HEAP_FLAG_SHARED, &d,
+                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex));
+device->CreateSharedHandle(tex.Get(), nullptr, GENERIC_ALL, nullptr, &sharedHandle);
+```
+
+**Format is app-chosen.** The runtime opens the handle and creates its render-target view using *your* format (`rtv_desc.Format = GetDesc().Format`), so BGRA8 and RGBA8 both work. The reference apps use `DXGI_FORMAT_B8G8R8A8_UNORM`. Whichever you pick, your presentation path must handle it — a `CopyResource` / `CopyTextureRegion` cannot cross the RGBA↔BGRA copy groups, so a format-converting shader blit is the portable choice.
+
+**Read-back: sample the canvas sub-rect, not the whole surface.** The runtime writes the composite at the canvas rect and leaves the remainder of the surface **undefined**. The general contract (ADR-010) is:
+
+```c
+uvOffset = (canvasX / (float)sharedWidth, canvasY / (float)sharedHeight);
+uvScale  = (canvasW / (float)sharedWidth, canvasH / (float)sharedHeight);
+```
+
+Under [`XR_DXR_display_zones`](XR_DXR_display_zones.md) — the sole region paradigm since [ADR-031](../../adr/ADR-031-remove-surround-output-rect-zones-sole-region-model.md) — the canvas is derived from the window and spans the full client area anchored at the origin, so on Windows this reduces to:
+
+```c
+uvOffset = (0, 0);
+uvScale  = (min(clientW, sharedWidth) / (float)sharedWidth,
+            min(clientH, sharedHeight) / (float)sharedHeight);
+```
+
+Present that sub-rect **1:1** — stretching it to fill a differently-sized window magnifies the interlace and destroys the 3D effect. Letterbox against the canvas aspect ratio, never the surface aspect ratio.
+
+**The runtime does not validate dimensions — clamp on your side.** Session creation fails only if the handle cannot be opened; the texture's size is queried for the display processor's target extent but is never compared against the window. A client area larger than the shared texture is silently truncated rather than reported, which is why the `min(...)` above belongs in app code.
+
+**Submit a zones frame every frame, even if it is one full-window zone.** The canvas is what the display processor weaves into, and it is derived from the submitted zones. A frame with no `XrDisplayZoneDXR` and no `XrCompositionLayerLocal2DDXR` yields no canvas, and a zero canvas means *"fill the entire target"* — i.e. the whole worst-case surface, not your window — which magnifies the weave. See INV-5.6.
 
 #### Transparent-window contract (`transparentBackgroundEnabled = XR_TRUE`)
 
@@ -923,4 +990,5 @@ These are guarantees current apps and vendors can rely on:
 
 - The window handle / view handle is the runtime's source of truth for screen-space position. Phase, DPI, and monitor routing flow from it.
 - Zone canvas coordinates (`XrDisplayZoneDXR` under [`XR_DXR_display_zones`](XR_DXR_display_zones.md)) are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
+- The app-provided shared texture is allocated once at the worst-case atlas size and is **never** resized or reallocated by the runtime (ADR-010). A window or canvas resize changes the zone rects the runtime weaves into it, never the surface — so no resize path requires recreating the texture or the session.
 - Vendor-specific weaving lives in the vendor's display processor (see [ADR-007](../../adr/ADR-007-compositor-never-weaves.md)). Apps and runtime compositors are vendor-blind.
