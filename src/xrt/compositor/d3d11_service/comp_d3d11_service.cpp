@@ -776,6 +776,17 @@ struct d3d11_service_system
 	//! Recursive because unregister_client calls render for final clear frame.
 	std::recursive_mutex render_mutex;
 
+	//! Count of threads currently blocked acquiring render_mutex through
+	//! render_mutex_fair_lock (every acquirer EXCEPT the capture render
+	//! thread). std::recursive_mutex has no waiter fairness, and with SR v2
+	//! late latching the capture render consumes ~the whole display period
+	//! inside the lock, re-acquiring ~instantly — so an IPC handler parked on
+	//! the mutex can starve for tens of seconds (observed: 25 s workspace
+	//! input-drain stalls; the shell launcher took 20+ s to open). The capture
+	//! thread checks this after unlocking and hands over the lock window when
+	//! anyone is waiting. Zero cost when uncontended.
+	std::atomic<int> render_mutex_waiters{0};
+
 	//! Timestamp of last workspace render (monotonic ns). Used to throttle renders
 	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
 	uint64_t last_workspace_render_ns;
@@ -851,6 +862,33 @@ struct d3d11_service_system
 	//! support Win32 events (currently macOS / Linux — wakeup event is a
 	//! Windows-only optimization).
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
+};
+
+/*!
+ * Fair acquire of sys->render_mutex for every contender EXCEPT the capture
+ * render thread: announces the wait in render_mutex_waiters so the capture
+ * loop (which otherwise holds the lock ~the whole display period under SR v2
+ * late latching and re-acquires instantly) yields its lock window. Without
+ * this, IPC handlers parked on the mutex starved for tens of seconds — the
+ * workspace input drain (and with it the shell's Ctrl+L) stalled 20-30 s.
+ * Drop-in replacement for std::lock_guard at those sites; recursion-safe
+ * (locks exactly once, like the lock_guard it replaces).
+ */
+struct render_mutex_fair_lock
+{
+	struct d3d11_service_system *sys;
+	explicit render_mutex_fair_lock(struct d3d11_service_system *s) : sys(s)
+	{
+		sys->render_mutex_waiters.fetch_add(1, std::memory_order_acq_rel);
+		sys->render_mutex.lock();
+		sys->render_mutex_waiters.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	~render_mutex_fair_lock()
+	{
+		sys->render_mutex.unlock();
+	}
+	render_mutex_fair_lock(const render_mutex_fair_lock &) = delete;
+	render_mutex_fair_lock &operator=(const render_mutex_fair_lock &) = delete;
 };
 
 
@@ -5396,6 +5434,20 @@ try {
 			}
 		}
 
+		// Fairness hand-off: with SR v2 late latching the render above holds
+		// render_mutex ~the whole display period (the present/latch wait sits
+		// inside), and this loop re-acquires ~instantly once the pacing
+		// deadline has passed. std::recursive_mutex wakes waiters but gives
+		// them no priority, so a parked IPC handler (workspace input drain,
+		// set_input_grab, layer_commit, ...) loses the re-acquire race every
+		// frame — observed 25 s input-drain stalls (shell Ctrl+L took 20-30 s).
+		// When someone is waiting, sleep a moment so they actually get the
+		// lock. Costs nothing when uncontended; ~2 ms of this frame's budget
+		// only on the (rare) contended frames.
+		if (sys->render_mutex_waiters.load(std::memory_order_acquire) > 0) {
+			Sleep(2);
+		}
+
 		emit_render_diag_if_window_elapsed(sys);
 	}
 } catch (std::exception const &e) {
@@ -5754,7 +5806,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	// concurrently when clients connect simultaneously (e.g., workspace launching
 	// D3D11 + VK apps). Without this lock, both threads create the display
 	// processor, causing SR SDK state corruption and crash.
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	if (sys->multi_comp == nullptr) {
 		sys->multi_comp = new d3d11_multi_compositor();
@@ -9195,7 +9247,7 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 
 	if (!zones_frame) {
 		if (c->zone_published && dp != nullptr) {
-			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			render_mutex_fair_lock lock(sys);
 			xrt_display_processor_d3d11_clear_local_zone_mask(dp);
 			c->zone_published = false;
 		}
@@ -9230,7 +9282,7 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 		return;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	ID3D11ShaderResourceView *srv = service_update_zone_wish_mask(sys, c, rects, rect_count, w, h);
 	if (srv == nullptr) {
 		return;
@@ -9489,7 +9541,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		 * which is the order this function already uses for the zones composite,
 		 * so no new inversion. Recursive, so a nested take further down is fine.
 		 */
-		std::lock_guard<std::recursive_mutex> resize_render_lock(sys->render_mutex);
+		render_mutex_fair_lock resize_render_lock(sys);
 
 		RECT client_rect;
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
@@ -10936,7 +10988,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// and can crash the service. recursive_mutex, so a caller already
 	// holding it is fine.
 	if (zones_frame || has_local_2d) {
-		std::lock_guard<std::recursive_mutex> zones_render_lock(sys->render_mutex);
+		render_mutex_fair_lock zones_render_lock(sys);
 		uint32_t zones_content_w = 0;
 		uint32_t zones_content_h = 0;
 		if (service_composite_zones_frame(sys, c, projection_rendered,
@@ -11642,7 +11694,7 @@ compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 	// an arbitrary IPC client may well be behind a live bridge.
 	struct d3d11_service_system *sys = c->sys;
 	if (sys != nullptr) {
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		render_mutex_fair_lock lock(sys);
 		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
 	}
 	return XRT_SUCCESS;
@@ -11795,7 +11847,7 @@ compositor_destroy(struct xrt_compositor *xc)
 	// (after hot-switch). Without this, the slot stays stale and shows a
 	// ghost remnant on workspace re-activate.
 	if (sys->multi_comp != nullptr) {
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		render_mutex_fair_lock lock(sys);
 		multi_compositor_unregister_client(sys, c);
 
 		// Clear active compositor if it's this one (still under render mutex
@@ -11847,7 +11899,7 @@ compositor_destroy(struct xrt_compositor *xc)
 		// #814: same fail-safe on the legacy single-client path — there are
 		// no other clients by construction, so this is the "last client" case.
 		{
-			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			render_mutex_fair_lock lock(sys);
 			service_failsafe_hardware_2d_on_teardown(sys, c);
 		}
 		fini_client_render_resources(&c->render);
@@ -12298,7 +12350,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	// Serialize with the render thread — sys->context is the (non-thread-safe)
 	// immediate context shared with multi_compositor_render.
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	// #776 blocker 1: apply any pending xrRequestDisplayRenderingModeDXR. A
 	// present-owner never runs the per-client commit, which used to be the only
@@ -12911,7 +12963,7 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	// The snap drives the vendor SR weaver's phase math, which reads the same
 	// (non-thread-safe) immediate context as the render thread — serialize with
 	// it just like weave_submit does.
-	std::lock_guard<std::recursive_mutex> lock(c->sys->render_mutex);
+	render_mutex_fair_lock lock(c->sys);
 
 	int32_t sx = target_x, sy = target_y;
 	if (!xrt_display_processor_d3d11_snap_window_rect(c->render.display_processor, origin_x, origin_y, target_x,
@@ -13125,7 +13177,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		}
 		int slot;
 		{
-			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			render_mutex_fair_lock lock(sys);
 			slot = multi_compositor_register_client(sys, c);
 		}
 		if (slot < 0) {
@@ -13742,7 +13794,7 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system
 	// below derefs freed memory — the use-after-free seen on last-client
 	// (total->0) churn. render_mutex is recursive, so callers that already
 	// hold it (multi_compositor_render, capture_frame) are unaffected.
-	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
+	render_mutex_fair_lock render_lock(sys);
 
 	// Caching now lives inside the DP itself (vendor-internal, populated
 	// by SR's EyePairStream listener). This is just a thin pass-through.
@@ -13838,7 +13890,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	}
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	// Select the source atlas by requested stage. We hold a com_ptr ref so the
 	// texture survives even if its owning compositor tears down (render_mutex
@@ -14010,7 +14062,7 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 	// DP, to serialize with compositor_destroy's full teardown (which frees
 	// render.display_processor). Same read-then-use-after-unlock UAF as
 	// get_predicted_eye_positions. render_mutex is recursive.
-	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
+	render_mutex_fair_lock render_lock(sys);
 
 	// Try to get display dimensions from display processor.
 	// In workspace mode, use multi-comp's DP; in normal mode, use active compositor's DP.
@@ -14059,7 +14111,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	// the DP below, to serialize with compositor_destroy's full teardown
 	// (which frees render.display_processor). Same read-then-use-after-unlock
 	// UAF as get_predicted_eye_positions. render_mutex is recursive.
-	std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
+	render_mutex_fair_lock render_lock(sys);
 
 	// In workspace mode, use multi-comp's window and DP.
 	// In normal mode, use the active compositor's.
@@ -14527,7 +14579,7 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	if (width_m < min_dim) width_m = min_dim;
 	if (height_m < min_dim) height_m = min_dim;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) {
@@ -14585,7 +14637,7 @@ comp_d3d11_service_set_client_frame_rate_cap(struct xrt_system_compositor *xsysc
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) return false;
@@ -14611,7 +14663,7 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) return false;
@@ -14647,7 +14699,7 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) return false;
@@ -14910,7 +14962,7 @@ comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
 		return -1;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	return multi_compositor_add_capture_client(sys, hwnd, name);
 }
 
@@ -14927,7 +14979,7 @@ comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	return multi_compositor_remove_capture_client(sys, slot_index);
 }
 
@@ -14965,7 +15017,7 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	// animation tick on FRAME_TICK alone when no user input is happening.
 	// The raw-event loop only runs when there is something to translate.
 	if (got > 0) {
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		render_mutex_fair_lock lock(sys);
 
 		for (uint32_t i = 0; i < got; i++) {
 		const struct workspace_public_event_raw *r = &raw[i];
@@ -15338,7 +15390,7 @@ comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc
 		return -1;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	return multi_comp_find_slot(mc, c);
 }
 
@@ -15357,7 +15409,7 @@ comp_d3d11_service_workspace_get_client_state(struct xrt_system_compositor *xsys
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) {
 		return false;
@@ -15420,7 +15472,7 @@ comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	struct d3d11_multi_client_slot *cs = &mc->clients[slot];
 	if (!cs->active) {
 		// Slot may bind a few ticks after the controller calls the create
@@ -15459,7 +15511,7 @@ comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compo
 		return XRT_SUCCESS; // workspace inactive — nothing to unregister
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 		struct d3d11_multi_client_slot *cs = &mc->clients[s];
 		// Match on chrome_xsc != null too — chrome_swapchain_id 0 is a
@@ -15492,7 +15544,7 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	struct d3d11_multi_client_slot *cs = &mc->clients[slot];
 	cs->chrome_pose_in_client = layout->pose_in_client;
 	cs->chrome_size_w_m = layout->size_w_m;
@@ -15525,7 +15577,7 @@ comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(struct xrt_system_
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	mc->clients[slot].chrome_pose_in_client = *pose_in_client;
 	// Note: chrome_layout_valid is NOT toggled here. A pose-only update on a
 	// slot whose layout hasn't been pushed yet just stages the pose for the
@@ -15550,7 +15602,7 @@ comp_d3d11_service_workspace_set_cursor(struct xrt_system_compositor *xsysc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	sys->cursor_xsc = xsc; // borrowed; controller owns lifetime
 	sys->cursor_hot_x = hot_x;
 	sys->cursor_hot_y = hot_y;
@@ -15607,7 +15659,7 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	// spec_version 21: !visible OR NULL swapchain = remove this id; other ids
 	// are untouched. Hides the overlay without tearing anything down.
@@ -15667,7 +15719,7 @@ comp_d3d11_service_set_client_style_by_slot(struct xrt_system_compositor *xsysc,
 	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
 		return false;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	apply_workspace_style_to_slot(&mc->clients[slot], style);
 	return true;
 }
@@ -15689,7 +15741,7 @@ comp_d3d11_service_set_capture_client_style(struct xrt_system_compositor *xsysc,
 	if (mc == nullptr || slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
 		return false;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	apply_workspace_style_to_slot(&mc->clients[slot_index], style);
 	return true;
 }
@@ -15794,7 +15846,7 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	if (mc == nullptr) {
 		return;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	int prev_focused = mc->focused_slot;
 	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
 		mc->focused_slot = -1;
@@ -15840,7 +15892,7 @@ comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
 	if (!sys->workspace_mode || mc == nullptr) {
 		return -1;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	return mc->focused_slot;
 }
 
@@ -15861,7 +15913,7 @@ comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, i
 	if (mc == nullptr) {
 		return;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
 		return;
 	}
@@ -15966,7 +16018,7 @@ comp_d3d11_service_workspace_post_file_picker_request(struct xrt_system_composit
 	if (mc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -16020,7 +16072,7 @@ comp_d3d11_service_workspace_get_file_picker_request(struct xrt_system_composito
 	if (mc == nullptr) {
 		return XRT_SUCCESS;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	size_t entry_count = sizeof(mc->file_picker) / sizeof(mc->file_picker[0]);
 	for (size_t i = 0; i < entry_count; i++) {
 		if (!mc->file_picker[i].in_use) continue;
@@ -16049,7 +16101,7 @@ comp_d3d11_service_workspace_file_picker_result(struct xrt_system_compositor *xs
 	if (mc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	size_t entry_count = sizeof(mc->file_picker) / sizeof(mc->file_picker[0]);
 	for (size_t i = 0; i < entry_count; i++) {
 		if (!mc->file_picker[i].in_use) continue;
@@ -16110,7 +16162,7 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
 	}
 	U_LOG_W("[mode_flip] hook: entering request_mode_flip(target=%u) from controller session",
 	        mode_index);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	// origin_slot = -1 (system origin) — the workspace controller is logically
 	// the system, not a renderable slot.
 	multi_compositor_request_mode_flip(sys, mode_index, /*origin=*/-1);
@@ -16164,7 +16216,7 @@ comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc)
 	if (sys == nullptr || sys->multi_comp == nullptr) {
 		return false;
 	}
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	struct xrt_device *head = (sys->xsysd != nullptr) ? sys->xsysd->static_roles.head : nullptr;
 	if (head == nullptr || head->hmd == NULL) {
@@ -16248,7 +16300,7 @@ comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsys
 	// has its own ref. Single Win32 event suffices for any number of
 	// controllers (only one workspace controller exists at a time per
 	// the activation auth handshake).
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	if (sys->workspace_wakeup_event == nullptr) {
 		HANDLE h = CreateEventA(NULL, FALSE /* auto-reset */, FALSE /* initial */, NULL);
 		if (h == NULL) {
@@ -16279,7 +16331,7 @@ comp_d3d11_service_workspace_set_cursor_depth(struct xrt_system_compositor *xsys
 		return;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (!sys->workspace_mode || mc == nullptr) {
 		return; // Workspace not active — drop.
@@ -16313,7 +16365,7 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	if (!mc->clients[slot_index].active) {
 		return false;
@@ -16377,7 +16429,7 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	if (!mc->clients[slot_index].active) {
 		return false;
@@ -16409,7 +16461,7 @@ comp_d3d11_service_set_capture_client_visibility(struct xrt_system_compositor *x
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	if (!mc->clients[slot_index].active) {
 		return false;
@@ -16454,7 +16506,7 @@ comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	struct d3d11_multi_client_slot *slot = &mc->clients[slot_index];
 	if (!slot->active || slot->client_type != CLIENT_TYPE_CAPTURE) {
@@ -16493,7 +16545,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		U_LOG_W("Workspace mode activated for D3D11 service system (via ensure_workspace_window)");
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	// If workspace was suspended (deactivated via Ctrl+Space), resume it:
 	// show window, recreate DP, restart render thread.
@@ -16610,7 +16662,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 	// the mutex during join, the render thread can deadlock waiting for
 	// the same mutex on its next iteration.
 	{
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		render_mutex_fair_lock lock(sys);
 
 		mc = sys->multi_comp;
 		if (mc == nullptr) {
@@ -16681,7 +16733,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 
 	// Re-acquire for final cleanup (DP destroy, hide window).
 	{
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		render_mutex_fair_lock lock(sys);
 
 		if (mc->display_processor != nullptr) {
 			DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
@@ -16713,7 +16765,7 @@ comp_d3d11_service_set_input_grab(struct xrt_system_compositor *xsysc, bool grab
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	render_mutex_fair_lock lock(sys);
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (mc == nullptr || mc->suspended) {
