@@ -27,6 +27,11 @@ extern int32_t g_displayScreenTop;
 // vehicle; promote to xr_session_common when more consumers adopt it.
 extern bool g_hasViewRigExt;
 
+// XR_EXT_hand_tracking available + enabled on the instance (#825 Tier 2).
+// App-local for the same reason as the view-rig flag — this app is the
+// hand-tracking verify vehicle (`--hands` joint markers).
+extern bool g_hasHandTrackingExt;
+
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (header v3 carries the Local2D
 // composition-layer + view-size-changed types). App-local for the same reason
 // as the view-rig flag: the shared XrSessionManager doesn't carry this

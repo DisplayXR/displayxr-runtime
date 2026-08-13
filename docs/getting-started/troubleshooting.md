@@ -247,6 +247,33 @@ app loads a different one anyway.
 
 ---
 
+## Hand tracking reports unsupported even though a provider claimed the roles
+
+**Symptom.** `displayxr-cli selftest` shows the provider claimed the hand-tracking
+roles, but in an app `XrSystemHandTrackingPropertiesEXT.supportsHandTracking` is 0
+and `xrCreateHandTrackerEXT` fails — and everything else (controllers, actions)
+works.
+
+**Cause.** An **implicit OpenXR API layer** is intercepting `XR_EXT_hand_tracking`
+before it reaches the runtime. The usual culprit is the Ultraleap Gemini / LeapSDK
+install, which registers `XR_APILAYER_ULTRALEAP_hand_tracking`
+(`HKLM\SOFTWARE\Khronos\OpenXR\1\ApiLayers\Implicit` →
+`C:\Program Files\Ultraleap\OpenXR\UltraleapHandTracking.json`). The layer
+advertises and claims the extension itself, answers the system-properties query
+from its *own* device detection (0 with no Leap camera), and never forwards any of
+it to DisplayXR — so the runtime's parse never even sees the extension. Note the
+selftest does NOT catch this: `displayxr-cli` talks to the runtime directly (no
+OpenXR loader, so no layers), which is exactly why the two disagree.
+
+**Fix.** Disable the layer for the process (each implicit layer JSON names its
+`disable_environment` variable — for Ultraleap:
+`set DISABLE_XR_APILAYER_ULTRALEAP_HAND_TRACKING_1=1`), or machine-wide by setting
+the layer's registry value to 1. Keep the layer enabled only if you *want* Leap
+hand tracking delivered by Ultraleap's layer instead of a DisplayXR input
+provider.
+
+---
+
 ## Still stuck?
 
 Grab a bug-report dump and open an issue on the

@@ -339,8 +339,9 @@ add_library(drv_sim_input_plugin SHARED
 if(XRT_HAVE_LINUX)
 	# ELF self-contained model: static aux, single-symbol version script —
 	# see the sim-display plug-in block for the full rationale (#496).
+	# aux_math: u_hand_simulation (#825 Tier 2) pulls the math helpers.
 	target_link_libraries(drv_sim_input_plugin PRIVATE
-		xrt-interfaces aux_util aux_os drv_includes)
+		xrt-interfaces aux_util aux_os aux_math drv_includes)
 else()
 	target_compile_definitions(drv_sim_input_plugin PRIVATE XRT_USING_RUNTIME_DLL)
 	target_link_libraries(
@@ -350,6 +351,7 @@ else()
 			xrt-interfaces
 			aux_util
 			aux_os
+			aux_math
 			drv_includes
 		)
 	add_dependencies(drv_sim_input_plugin ${RUNTIME_TARGET})
@@ -359,9 +361,12 @@ target_include_directories(drv_sim_input_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
 
+# LINKER_LANGUAGE CXX: the sources are C but aux_math (pulled by
+# u_hand_simulation, #825 Tier 2) is C++ — same rule as net_input below.
 set_target_properties(drv_sim_input_plugin PROPERTIES
 	OUTPUT_NAME "DisplayXR-SimInput"
 	PREFIX ""
+	LINKER_LANGUAGE CXX
 	C_VISIBILITY_PRESET hidden
 	CXX_VISIBILITY_PRESET hidden
 	VISIBILITY_INLINES_HIDDEN ON

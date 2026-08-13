@@ -11,6 +11,7 @@
 
 // XR_DXR_view_rig (#396 W7): app-local availability flag (see xr_session.h).
 bool g_hasViewRigExt = false;
+bool g_hasHandTrackingExt = false;
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
@@ -109,6 +110,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0) {
             g_zone.available = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
+            g_hasHandTrackingExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -119,6 +123,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_hand_tracking: %s", g_hasHandTrackingExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -153,6 +158,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_zone.available) {
         enabledExtensions.push_back(XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME);
+    }
+    if (g_hasHandTrackingExt) {
+        enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());

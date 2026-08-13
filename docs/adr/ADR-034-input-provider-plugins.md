@@ -65,6 +65,20 @@ env var, per project convention. v1 activates a **single provider**
 (first successful probe in ProbeOrder wins, exactly like the DP loader);
 multi-provider composition is deferred.
 
+**Hand-tracking role arbitration (#825 Tier 2):** the same pass also fills
+the static hand-tracking roles
+(`xrt_system_devices::static_roles.hand_tracking.{unobstructed,conforming}.{left,right}`),
+which gate `XR_EXT_hand_tracking` (system support, tracker creation, and
+joint locates all resolve through them). Devices self-describe here too:
+`supported.hand_tracking` gates, and the present `XRT_INPUT_HT_*` input
+names say which hand and which data source (unobstructed = optical,
+conforming = controller-derived) the device serves — one device may claim a
+controller role, hand-tracking roles, both (ultraleap, sim_input), or
+neither. First claimant wins per role, mirroring the controller rule.
+Absence is normal: a provider whose devices carry no hand-tracking inputs
+(net_input feeder) leaves the roles empty and `XR_EXT_hand_tracking`
+reports unsupported, exactly as before ADR-034.
+
 Option 3 is not rejected — it is demoted to *inside* a provider: the
 reference `net_input` provider wraps a documented loopback wire protocol
 (derived from Monado's removed `remote` driver), so processes that cannot
