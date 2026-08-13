@@ -10451,20 +10451,40 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// SHARED_KEYEDMUTEX contract; the
 						// real GPU sync still rides on the
 						// fence Wait below.
-						HRESULT hr_a =
-						    view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(
-						        0, 0);
-						if (SUCCEEDED(hr_a)) {
-							view_mutex_acquired[eye] = true;
-							sys->context->Wait(
-							    c->workspace_sync_fence.get(),
-							    signaled);
-							c->last_composed_fence_value[eye] = signaled;
-							c->fence_waits_queued_in_window++;
-						} else {
+						// #922: NEVER queue a context Wait for a fence value
+						// that has not completed yet. The client ships
+						// `signaled` at xrEndFrame BEFORE its GPU work
+						// finishes; if the client dies in that window (e.g.
+						// DELETE-key exit request mid-frame), the value never
+						// signals and the queued Wait JAMS the immediate
+						// context — weave, blits, and every other client's
+						// AcquireSync flush queue behind it until the dead
+						// client's fence is destroyed (observed: 9 s workspace
+						// freezes on app close). By compose time the client's
+						// GPU work has virtually always completed, so gating
+						// on GetCompletedValue() costs nothing in steady
+						// state; a not-yet-complete frame is treated exactly
+						// like the timeout path — reuse the previous atlas
+						// tile and retry next compose (last_composed is NOT
+						// updated, so the frame is picked up when it lands).
+						uint64_t completed = c->workspace_sync_fence->GetCompletedValue();
+						if (completed < signaled) {
 							view_skip_blit[eye] = true;
 							view_zc_eligible[eye] = false;
 							c->fence_stale_views_in_window++;
+						} else {
+							HRESULT hr_a =
+							    view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(
+							        0, 0);
+							if (SUCCEEDED(hr_a)) {
+								view_mutex_acquired[eye] = true;
+								c->last_composed_fence_value[eye] = signaled;
+								c->fence_waits_queued_in_window++;
+							} else {
+								view_skip_blit[eye] = true;
+								view_zc_eligible[eye] = false;
+								c->fence_stale_views_in_window++;
+							}
 						}
 						// Phase 2 leaves zero-copy semantics
 						// unchanged - `view_zc_eligible[eye]`
