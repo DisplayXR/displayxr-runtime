@@ -134,6 +134,17 @@ struct cli_query_result
 	char input_right_str[256];
 	char input_note[160];
 
+	/* Hand-tracking role checks (#825 Tier 2), same absence-never-fails
+	 * rule: `expected` = a provider role device advertises
+	 * `supported.hand_tracking`; only expected-but-unfilled static
+	 * hand-tracking roles flip the verdict to BAD_INPUT. A provider whose
+	 * devices carry no hand-tracking inputs (net_input feeder) leaves all
+	 * four fields false and passes. */
+	bool input_ht_expected_left;
+	bool input_ht_expected_right;
+	bool input_ht_left_ok;
+	bool input_ht_right_ok;
+
 	/* DP-factory selection divergence probe. Two render paths choose the
 	 * display processor differently: the in-process handle/texture path reads
 	 * the scalar dp_factory (== the active plug-in, `plugin_id` above), while
@@ -148,11 +159,11 @@ struct cli_query_result
 	 * mismatch — in-process plug-in id != service (registry primary) plug-in id. */
 	bool dp_sel_probed;
 	bool dp_sel_mismatch;
-	uint32_t dp_sel_monitor_count;  //!< EDID monitors enumerated.
-	uint32_t dp_sel_claim_count;    //!< registry entries (monitors a plug-in claimed).
-	char dp_sel_inproc_id[64];      //!< in-process path plug-in id (mirrors plugin_id).
-	char dp_sel_service_id[64];     //!< service path plug-in id (registry primary; == in-proc on empty registry).
-	char dp_sel_service_conf[24];   //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
+	uint32_t dp_sel_monitor_count; //!< EDID monitors enumerated.
+	uint32_t dp_sel_claim_count;   //!< registry entries (monitors a plug-in claimed).
+	char dp_sel_inproc_id[64];     //!< in-process path plug-in id (mirrors plugin_id).
+	char dp_sel_service_id[64];    //!< service path plug-in id (registry primary; == in-proc on empty registry).
+	char dp_sel_service_conf[24];  //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
 };
 
 /*!

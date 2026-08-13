@@ -128,12 +128,20 @@ In `target_builder_sim_display.c`:
 4. The head-pose path is untouched: the DP's `set_pose_source` hook keeps
    receiving the same pose source as today; input providers never supply
    the head.
+5. **Hand-tracking roles (#825 Tier 2):** the same pass fills
+   `static_roles.hand_tracking.{unobstructed,conforming}.{left,right}` from
+   provider devices that set `supported.hand_tracking` and carry the
+   matching `XRT_INPUT_HT_*` input (unobstructed = optical, conforming =
+   controller-derived; first claimant wins per role). These roles gate the
+   whole `XR_EXT_hand_tracking` path — system support, tracker creation,
+   joint locates. Providers without hand-tracking inputs leave them empty;
+   that is a valid configuration, never a failure.
 
 ## 5. In-tree reference providers (planned)
 
 | Provider | Status | Purpose |
 |---|---|---|
-| `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. ProbeOrder 200. Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input`. |
+| `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. Opt-in: never registered by default. |
 
@@ -174,8 +182,11 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
 - `displayxr-cli selftest` — when a provider is registered and not
   ForceQwerty-overridden, asserts provider-claimed left+right
   motion-controller role devices exist with a valid interaction profile
-  (`CLI_SELFTEST_BAD_INPUT` on failure). Provider *absence never fails* —
-  qwerty keeping the hand roles is the normal no-provider configuration.
+  (`CLI_SELFTEST_BAD_INPUT` on failure), and (#825 Tier 2) that any role
+  device advertising `supported.hand_tracking` actually claimed a static
+  hand-tracking role. Provider *absence never fails* — qwerty keeping the
+  hand roles is the normal no-provider configuration, and a provider
+  without hand-tracking inputs passes with the hand-track fields `n/a`.
   Wired into the hardware-free CI gate (`build-windows.yml` registers
   sim-input and additionally asserts the check *evaluated*).
 - Verification matrix: in-process AND `XRT_FORCE_MODE=ipc` (the IPC layer

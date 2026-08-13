@@ -228,6 +228,122 @@ static void UpdateActions(XrSession session, XrSpace baseSpace, XrTime displayTi
     }
 }
 
+// ============================================================================
+// Hands mode (#825 Tier 2) — optional, `--hands` / DXR_HANDS=1.
+//
+// First in-repo consumer of XR_EXT_hand_tracking: creates a hand tracker per
+// hand, locates all 26 joints at display time every frame, and renders each
+// tracked joint as a tiny marker cube. Drive it with any hand-tracking input
+// provider — sim_input (scripted curl wave, hardware-free) or ultraleap.
+// Composes with --actions (grip markers + joint markers together).
+// ============================================================================
+
+static bool g_handsMode = false;
+
+struct HandsState {
+    PFN_xrCreateHandTrackerEXT pfnCreate = nullptr;
+    PFN_xrDestroyHandTrackerEXT pfnDestroy = nullptr;
+    PFN_xrLocateHandJointsEXT pfnLocate = nullptr;
+    XrHandTrackerEXT tracker[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // 0 = left, 1 = right
+
+    // Per-frame results consumed by the renderer.
+    bool active[2] = {false, false};
+    XrHandJointLocationEXT joints[2][XR_HAND_JOINT_COUNT_EXT];
+    uint64_t locateCount = 0;
+};
+static HandsState g_hands;
+
+static bool SetupHands(XrInstance instance, XrSystemId systemId, XrSession session)
+{
+    if (!g_hasHandTrackingExt) {
+        LOG_ERROR("hands: XR_EXT_hand_tracking not available on this runtime");
+        return false;
+    }
+
+    // The runtime only supports hand tracking when a hand-tracking-capable
+    // input provider claimed the roles — surface that verdict up front.
+    XrSystemHandTrackingPropertiesEXT htProps = {XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES, &htProps};
+    if (XR_SUCCEEDED(xrGetSystemProperties(instance, systemId, &sysProps))) {
+        LOG_INFO("hands: XrSystemHandTrackingPropertiesEXT.supportsHandTracking = %d",
+                 htProps.supportsHandTracking);
+        if (!htProps.supportsHandTracking) {
+            LOG_ERROR("hands: system reports no hand tracking (no provider with hand-tracking "
+                      "devices registered?)");
+            return false;
+        }
+    }
+
+    if (XR_FAILED(xrGetInstanceProcAddr(instance, "xrCreateHandTrackerEXT",
+                                        (PFN_xrVoidFunction*)&g_hands.pfnCreate)) ||
+        XR_FAILED(xrGetInstanceProcAddr(instance, "xrDestroyHandTrackerEXT",
+                                        (PFN_xrVoidFunction*)&g_hands.pfnDestroy)) ||
+        XR_FAILED(xrGetInstanceProcAddr(instance, "xrLocateHandJointsEXT",
+                                        (PFN_xrVoidFunction*)&g_hands.pfnLocate))) {
+        LOG_ERROR("hands: xrGetInstanceProcAddr for XR_EXT_hand_tracking functions failed");
+        return false;
+    }
+
+    for (int hand = 0; hand < 2; hand++) {
+        XrHandTrackerCreateInfoEXT ci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+        ci.hand = hand == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+        ci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+        XrResult cr = g_hands.pfnCreate(session, &ci, &g_hands.tracker[hand]);
+        if (XR_FAILED(cr)) {
+            LOG_ERROR("hands: xrCreateHandTrackerEXT (hand %d) failed: %d", hand, cr);
+            return false;
+        }
+    }
+
+    LOG_INFO("hands: hand trackers created (default joint set, %d joints)", XR_HAND_JOINT_COUNT_EXT);
+    return true;
+}
+
+//! Per-frame: locate all joints of both hands at display time.
+static void UpdateHands(XrSpace baseSpace, XrTime displayTime)
+{
+    for (int hand = 0; hand < 2; hand++) {
+        g_hands.active[hand] = false;
+        if (g_hands.tracker[hand] == XR_NULL_HANDLE) {
+            continue;
+        }
+
+        XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+        li.baseSpace = baseSpace;
+        li.time = displayTime;
+
+        XrHandJointLocationsEXT locations = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+        locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+        locations.jointLocations = g_hands.joints[hand];
+
+        if (XR_FAILED(g_hands.pfnLocate(g_hands.tracker[hand], &li, &locations))) {
+            continue;
+        }
+        g_hands.active[hand] = locations.isActive == XR_TRUE;
+    }
+    g_hands.locateCount++;
+
+    // Throttled progress line (~every 2 s at 60 FPS) for headless-log runs.
+    if (g_hands.locateCount % 120 == 1) {
+        const XrHandJointLocationEXT &lw = g_hands.joints[0][XR_HAND_JOINT_WRIST_EXT];
+        const XrHandJointLocationEXT &rw = g_hands.joints[1][XR_HAND_JOINT_WRIST_EXT];
+        LOG_INFO("hands: locate #%llu L(active=%d wrist %.2f,%.2f,%.2f) R(active=%d wrist %.2f,%.2f,%.2f)",
+                 (unsigned long long)g_hands.locateCount,
+                 g_hands.active[0], lw.pose.position.x, lw.pose.position.y, lw.pose.position.z,
+                 g_hands.active[1], rw.pose.position.x, rw.pose.position.y, rw.pose.position.z);
+    }
+}
+
+static void CleanupHands()
+{
+    for (int hand = 0; hand < 2; hand++) {
+        if (g_hands.tracker[hand] != XR_NULL_HANDLE && g_hands.pfnDestroy != nullptr) {
+            g_hands.pfnDestroy(g_hands.tracker[hand]);
+            g_hands.tracker[hand] = XR_NULL_HANDLE;
+        }
+    }
+}
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
@@ -881,6 +997,9 @@ static void RenderOneFrame(RenderState& rs) {
         if (BeginFrame(xr, frameState)) {
                 // #823 actions mode: sync + locate the controllers for this
                 // frame's display time; the marker draws read g_actions.
+                if (g_handsMode) {
+                    UpdateHands(xr.localSpace, frameState.predictedDisplayTime);
+                }
                 if (g_actionsMode) {
                     UpdateActions(xr.session, xr.localSpace, frameState.predictedDisplayTime);
                 }
@@ -1326,6 +1445,40 @@ static void RenderOneFrame(RenderState& rs) {
                                 }
                             }
 
+                            // #825 hands mode: draw a tiny marker cube at each
+                            // tracked hand joint (26/hand), sized by the
+                            // runtime-reported joint radius. Same zoom
+                            // convention as the controller markers above.
+                            if (g_handsMode) {
+                                float zoomS = useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor;
+                                XMMATRIX zoomM = XMMatrixScaling(zoomS, zoomS, 1.0f);
+                                const XrSpaceLocationFlags needed =
+                                    XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                                for (int hnd = 0; hnd < 2; hnd++) {
+                                    if (!g_hands.active[hnd]) {
+                                        continue;
+                                    }
+                                    for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+                                        const XrHandJointLocationEXT &jl = g_hands.joints[hnd][j];
+                                        if ((jl.locationFlags & needed) != needed) {
+                                            continue;
+                                        }
+                                        float s = jl.radius > 0.001f ? jl.radius : 0.008f;
+                                        XMVECTOR q = XMVectorSet(jl.pose.orientation.x, jl.pose.orientation.y,
+                                                                 jl.pose.orientation.z, jl.pose.orientation.w);
+                                        XMMATRIX world = XMMatrixScaling(s, s, s) *
+                                                         XMMatrixRotationQuaternion(q) *
+                                                         XMMatrixTranslation(jl.pose.position.x, jl.pose.position.y,
+                                                                             jl.pose.position.z);
+                                        XMMATRIX wvp = world * viewMatrix * zoomM * projMatrix;
+                                        XMFLOAT4X4 wvpOut;
+                                        XMStoreFloat4x4(&wvpOut, wvp);
+                                        RenderCubeWithMVP(renderer, viewRtv, rs.depthDSV.Get(),
+                                                          &wvpOut.m[0][0]);
+                                    }
+                                }
+                            }
+
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                             projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
                             // ARRAY: full image at slice `eye`. TILED: this view's tile.
@@ -1540,6 +1693,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             g_actionsMode = true;
         }
     }
+    // #825 hands mode: `--hands` on the command line or DXR_HANDS=1.
+    if (lpCmdLine != nullptr && strstr(lpCmdLine, "--hands") != nullptr) {
+        g_handsMode = true;
+    }
+    {
+        char buf[8] = {0};
+        DWORD n = GetEnvironmentVariableA("DXR_HANDS", buf, sizeof(buf));
+        if (n > 0 && buf[0] != '0') {
+            g_handsMode = true;
+        }
+    }
 
     // Initialize logging
     if (!InitializeLogging(APP_NAME)) {
@@ -1657,6 +1821,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (!SetupActions(xr.instance, xr.session)) {
             LOG_ERROR("actions: setup failed — continuing without actions mode");
             g_actionsMode = false;
+        }
+    }
+
+    // #825 hands mode: create the hand trackers right after session
+    // creation. Failure downgrades to the plain cube.
+    if (g_handsMode) {
+        LOG_INFO("Hands mode ENABLED (--hands): XR_EXT_hand_tracking joint markers");
+        if (!SetupHands(xr.instance, xr.systemId, xr.session)) {
+            LOG_ERROR("hands: setup failed — continuing without hands mode");
+            g_handsMode = false;
         }
     }
 
@@ -1785,6 +1959,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     depthTexture.Reset();
 
     g_xr = nullptr;
+    CleanupHands();
     CleanupOpenXR(xr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupD3D11(renderer);

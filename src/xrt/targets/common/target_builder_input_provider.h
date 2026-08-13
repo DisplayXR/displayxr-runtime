@@ -51,6 +51,16 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 void
 t_builder_input_provider_get_claims(bool *out_left, bool *out_right);
 
+/*!
+ * Which hand-tracking roles did the (last) input-provider pass claim
+ * (#825 Tier 2)? A provider device claims one by advertising
+ * `supported.hand_tracking` plus the matching `XRT_INPUT_HT_*` input.
+ * False/false when no provider ran or its devices carry no hand-tracking
+ * inputs — which is a valid configuration, never a failure.
+ */
+void
+t_builder_input_provider_get_ht_claims(bool *out_left, bool *out_right);
+
 #ifdef __cplusplus
 }
 #endif

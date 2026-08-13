@@ -80,8 +80,8 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 	ID3D11Device *device = NULL;
 	ID3D11DeviceContext *context = NULL;
 	D3D_FEATURE_LEVEL fl;
-	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &fl,
-	                               &context);
+	HRESULT hr =
+	    D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0, D3D11_SDK_VERSION, &device, &fl, &context);
 	if (FAILED(hr) || device == NULL || context == NULL) {
 		snprintf(r->zone_probe_note, sizeof(r->zone_probe_note),
 		         "not probed: WARP D3D11 device creation failed (0x%08lx, OK)", (unsigned long)hr);
@@ -144,8 +144,8 @@ read_active_runtime(struct cli_query_result *r)
 	r->active_runtime_queried = true;
 	wchar_t wbuf[1024];
 	DWORD wbuf_bytes = sizeof(wbuf);
-	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Khronos\\OpenXR\\1", L"ActiveRuntime",
-	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Khronos\\OpenXR\\1", L"ActiveRuntime", RRF_RT_REG_SZ,
+	                          NULL, wbuf, &wbuf_bytes);
 	if (rc == ERROR_SUCCESS) {
 		WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, r->active_runtime, (int)sizeof(r->active_runtime), NULL,
 		                    NULL);
@@ -304,17 +304,50 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		snprintf(r->input_right_str, sizeof(r->input_right_str), "%s", xdev->str);
 	}
 
+	// #825 Tier 2 — hand-tracking role arbitration. Expected iff the
+	// provider's role device advertises supported.hand_tracking; ok iff
+	// the builder actually filled the matching static hand-tracking role
+	// (either data source). Providers without hand tracking expect
+	// nothing and pass.
+	if (roles.left >= 0 && (uint32_t)roles.left < h->xsysd->xdev_count) {
+		r->input_ht_expected_left = claimed_left && h->xsysd->xdevs[roles.left]->supported.hand_tracking;
+	}
+	if (roles.right >= 0 && (uint32_t)roles.right < h->xsysd->xdev_count) {
+		r->input_ht_expected_right = claimed_right && h->xsysd->xdevs[roles.right]->supported.hand_tracking;
+	}
+	bool ht_claimed_left = false;
+	bool ht_claimed_right = false;
+	t_builder_input_provider_get_ht_claims(&ht_claimed_left, &ht_claimed_right);
+	r->input_ht_left_ok = ht_claimed_left && (h->xsysd->static_roles.hand_tracking.unobstructed.left != NULL ||
+	                                          h->xsysd->static_roles.hand_tracking.conforming.left != NULL);
+	r->input_ht_right_ok = ht_claimed_right && (h->xsysd->static_roles.hand_tracking.unobstructed.right != NULL ||
+	                                            h->xsysd->static_roles.hand_tracking.conforming.right != NULL);
+
+	const bool ht_ok = (!r->input_ht_expected_left || r->input_ht_left_ok) &&
+	                   (!r->input_ht_expected_right || r->input_ht_right_ok);
+
 	if (!r->input_provider_active) {
 		snprintf(r->input_note, sizeof(r->input_note),
 		         "FAIL: %d provider(s) registered but none claimed the system", r->input_provider_count);
 	} else if (!r->input_left_ok || !r->input_right_ok) {
 		snprintf(r->input_note, sizeof(r->input_note),
-		         "FAIL: provider '%s' active but roles incomplete (left=%s right=%s)",
-		         r->input_provider_id, r->input_left_ok ? "ok" : "missing",
-		         r->input_right_ok ? "ok" : "missing");
+		         "FAIL: provider '%s' active but roles incomplete (left=%s right=%s)", r->input_provider_id,
+		         r->input_left_ok ? "ok" : "missing", r->input_right_ok ? "ok" : "missing");
+	} else if (!ht_ok) {
+		snprintf(
+		    r->input_note, sizeof(r->input_note),
+		    "FAIL: provider '%s' devices advertise hand tracking but roles unfilled (ht-left=%s ht-right=%s)",
+		    r->input_provider_id,
+		    !r->input_ht_expected_left ? "n/a"
+		    : r->input_ht_left_ok      ? "ok"
+		                               : "missing",
+		    !r->input_ht_expected_right ? "n/a"
+		    : r->input_ht_right_ok      ? "ok"
+		                                : "missing");
 	} else {
-		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'",
-		         r->input_provider_id, r->input_left_str, r->input_right_str);
+		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s",
+		         r->input_provider_id, r->input_left_str, r->input_right_str,
+		         (r->input_ht_left_ok || r->input_ht_right_ok) ? " (+hand-tracking roles)" : "");
 	}
 }
 
@@ -425,10 +458,14 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 #endif
 
 	// ADR-034 / #823 — a registered, non-overridden input provider must
-	// have produced left+right motion-controller role devices. Applied
-	// last so display failures keep their more fundamental codes.
+	// have produced left+right motion-controller role devices — and (#825
+	// Tier 2) hand-tracking roles for any role device that advertises
+	// hand tracking. Applied last so display failures keep their more
+	// fundamental codes.
 	if (r->result_code == CLI_SELFTEST_PASS && r->input_evaluated &&
-	    !(r->input_provider_active && r->input_left_ok && r->input_right_ok)) {
+	    !(r->input_provider_active && r->input_left_ok && r->input_right_ok &&
+	      (!r->input_ht_expected_left || r->input_ht_left_ok) &&
+	      (!r->input_ht_expected_right || r->input_ht_right_ok))) {
 		r->result_code = CLI_SELFTEST_BAD_INPUT;
 	}
 }
@@ -559,8 +596,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
 	char et_buf[64];
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
-	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)),
-	   i->supported_eye_tracking_modes, eye_default_label(i->default_eye_tracking_mode));
+	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)), i->supported_eye_tracking_modes,
+	   eye_default_label(i->default_eye_tracking_mode));
 	PT("modes:        %u\n", r->rendering_mode_count);
 	for (uint32_t m = 0; m < r->rendering_mode_count; m++) {
 		const struct xrt_rendering_mode *rm = &r->rendering_modes[m];
@@ -576,8 +613,7 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("not evaluated\n");
 	} else {
 		PT("in-process (handle/texture apps): '%s'\n", or_q(r->dp_sel_inproc_id));
-		PT("service / shell:                  '%s' (%s)\n", or_q(r->dp_sel_service_id),
-		   r->dp_sel_service_conf);
+		PT("service / shell:                  '%s' (%s)\n", or_q(r->dp_sel_service_id), r->dp_sel_service_conf);
 		PT("monitors=%u  claimed=%u\n", r->dp_sel_monitor_count, r->dp_sel_claim_count);
 		if (r->dp_sel_mismatch) {
 			PT("** MISMATCH: the shell will weave with '%s' while standalone apps use '%s'.\n",
@@ -592,11 +628,19 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	}
 
 	P(" :: Input providers (ADR-034)\n");
-	PT("registered:   %d%s\n", r->input_provider_count, r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
+	PT("registered:   %d%s\n", r->input_provider_count,
+	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
 		PT("left:         %s\n", r->input_left_ok ? r->input_left_str : "<missing>");
 		PT("right:        %s\n", r->input_right_ok ? r->input_right_str : "<missing>");
+		PT("hand-track:   left=%s right=%s\n",
+		   !r->input_ht_expected_left ? "n/a"
+		   : r->input_ht_left_ok      ? "ok"
+		                              : "MISSING",
+		   !r->input_ht_expected_right ? "n/a"
+		   : r->input_ht_right_ok      ? "ok"
+		                               : "MISSING");
 	} else {
 		PT("%s\n", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 	}
@@ -661,7 +705,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(o, "hardware_display_3d", rm->hardware_display_3d);
 			cJSON_AddBoolToObject(o, "has_tracking",
 			                      (rm->mode_flags & XRT_RENDERING_MODE_FLAG_HAS_TRACKING) != 0);
-			cJSON_AddBoolToObject(o, "can_rotate", (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) != 0);
+			cJSON_AddBoolToObject(o, "can_rotate",
+			                      (rm->mode_flags & XRT_RENDERING_MODE_FLAG_CAN_ROTATE) != 0);
 			cJSON *vs = cJSON_AddObjectToObject(o, "view_scale");
 			cJSON_AddNumberToObject(vs, "x", (double)rm->view_scale_x);
 			cJSON_AddNumberToObject(vs, "y", (double)rm->view_scale_y);
@@ -725,6 +770,11 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddStringToObject(ip, "left", r->input_left_str);
 			cJSON_AddBoolToObject(ip, "right_ok", r->input_right_ok);
 			cJSON_AddStringToObject(ip, "right", r->input_right_str);
+			// #825 Tier 2 hand-tracking roles.
+			cJSON_AddBoolToObject(ip, "ht_expected_left", r->input_ht_expected_left);
+			cJSON_AddBoolToObject(ip, "ht_left_ok", r->input_ht_left_ok);
+			cJSON_AddBoolToObject(ip, "ht_expected_right", r->input_ht_expected_right);
+			cJSON_AddBoolToObject(ip, "ht_right_ok", r->input_ht_right_ok);
 		}
 	}
 
@@ -732,7 +782,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 	{
 		cJSON *zc = cJSON_AddObjectToObject(root, "zone_caps");
 		cJSON_AddBoolToObject(zc, "probed", r->zone_caps_probed);
-		cJSON_AddStringToObject(zc, "note", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
+		cJSON_AddStringToObject(zc, "note",
+		                        r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 		if (r->zone_caps_probed) {
 			const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
 			cJSON_AddBoolToObject(zc, "malformed", r->zone_caps_malformed);
@@ -846,12 +897,15 @@ build_checks(const struct cli_query_result *r, struct check *out)
 
 	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
 	// stays true with no provider registered or ForceQwerty set; a
-	// registered provider must yield left+right role devices.
+	// registered provider must yield left+right role devices — and (#825
+	// Tier 2) hand-tracking roles wherever a role device advertises
+	// hand tracking.
 	c = &out[n++];
 	c->name = "input_providers";
-	c->ok = !r->input_evaluated || (r->input_provider_active && r->input_left_ok && r->input_right_ok);
-	snprintf(c->detail, sizeof(c->detail), "%s",
-	         r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+	c->ok = !r->input_evaluated || (r->input_provider_active && r->input_left_ok && r->input_right_ok &&
+	                                (!r->input_ht_expected_left || r->input_ht_left_ok) &&
+	                                (!r->input_ht_expected_right || r->input_ht_right_ok));
+	snprintf(c->detail, sizeof(c->detail), "%s", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 
 	return n;
 }
