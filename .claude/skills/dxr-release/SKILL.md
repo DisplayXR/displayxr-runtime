@@ -493,7 +493,12 @@ fi
 
 if [ "$SIGNED" = yes ]; then
   rm -rf _signed && gh run download "$SIGN_RUN" -R "$SIGN_REPO" -n signed-installer -D _signed
-  SIGNED_EXE=$(ls _signed/*Setup-*.exe 2>/dev/null | head -1)
+  # Glob-and-test, NEVER `ls`: an `ls -F` alias appends a `*` classifier to the
+  # filename, so `$(ls ...)` yields `...Setup-2.1.0.0.exe*` and every later use
+  # of the path silently fails. (Documented from bundle v2.0.15; hit AGAIN on
+  # shell v2.1.0 — this line was the last `ls` left in the skill.)
+  SIGNED_EXE=""
+  for f in _signed/*Setup-*.exe; do [ -f "$f" ] && { SIGNED_EXE="$f"; break; }; done
   [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
 fi
 
@@ -505,24 +510,31 @@ if [ "$SIGNED" = yes ]; then
   # (Setup-2.0.4.1883.exe) — the names never collide. Skip it and the release ships a signed
   # AND an unsigned installer side by side.
   #
+  # ASSET OPS TARGET $REL_REPO, NOT $REPO. For most components they are the
+  # same repo, which is why this block long read `$REPO` — but `shell` is the
+  # row where they differ: the release object lives on displayxr-shell-releases
+  # and `gh release view` against displayxr-shell-pvt fails with "release not
+  # found", so the delete + upload silently do nothing and the release keeps
+  # its UNSIGNED CI installer. (Hit for real on shell v2.1.0.)
+  #
   # startswith/endswith, NOT test("...\\.exe$"): that regex needs a \\ that survives only in
   # single quotes; one extra layer of double-quoting makes it \. , jq rejects it as an invalid
   # escape, $( ) yields empty, and the old `[ -n "$CI_EXE" ] &&` guard swallowed it silently.
   # (Hit for real on runtime v2.0.4.) Need a regex? Write [.] — no escaping required.
-  CI_EXE=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
+  CI_EXE=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
              --jq '.assets[].name | select(contains("Setup-") and endswith(".exe"))' \
            | grep -v -F "$(basename "$SIGNED_EXE")" || true)
   if [ -n "$CI_EXE" ]; then
     echo "$CI_EXE" | while read -r a; do
-      gh release delete-asset "$NEW_TAG" "$a" --yes -R "$REPO"
+      gh release delete-asset "$NEW_TAG" "$a" --yes -R "$REL_REPO"
     done
   else
     echo "NOTE: no CI installer asset found to delete — verify the release has exactly one .exe"
   fi
-  gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REPO"
+  gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REL_REPO"
 
   # Never ship signed + unsigned together.
-  N=$(gh release view "$NEW_TAG" -R "$REPO" --json assets \
+  N=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
         --jq '[.assets[].name | select(contains("Setup-") and endswith(".exe"))] | length')
   [ "$N" = 1 ] || echo "WARNING: $N installer .exe assets on $NEW_TAG — expected exactly 1 (signed)."
 fi
@@ -548,7 +560,7 @@ it and has to be triaged by reading commits by hand.
 
 ### Step 3.6.1: Classify the existing body
 
-There are three kinds of body, and only two of them are yours to touch:
+There are four kinds of body, and only one of them is off-limits:
 
 ```bash
 gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' > "$WORK/body.md"
@@ -559,6 +571,12 @@ if [ "$BODY_LEN" -le 40 ]; then
   NOTES_MODE=fresh      # empty — author the whole body
 elif printf '%s' "$FIRST_HEADING" | grep -qi "what's changed"; then
   NOTES_MODE=prepend    # GH auto-notes only — add curated sections ABOVE them
+elif [ -z "$FIRST_HEADING" ] && grep -qi 'auto-published from' "$WORK/body.md"; then
+  # CI provenance stub, NOT an authored body: shell's publish workflow writes
+  # "Auto-published from displayxr-shell-pvt @ <sha>" (~84b, no heading), which
+  # the length+heading test scores as `keep` — so this phase would never fire
+  # for shell and it shipped an uncurated release. (Hit for real on v2.1.0.)
+  NOTES_MODE=prepend    # curated sections above; keep the provenance line below
 else
   NOTES_MODE=keep       # someone authored this (unity CHANGELOG, hand-written)
 fi
@@ -577,7 +595,13 @@ Why classify rather than just check length: the demo/mcp/leia workflows now set
 would read that as "notes already present" and this phase would never fire
 again. GitHub always leads auto-notes with that heading, and neither unity's
 CHANGELOG extract nor a hand-written body does — which is what makes the
-first-heading test a reliable three-way split.
+first-heading test reliable.
+
+The general rule the four cases encode: **`keep` means a human (or a CHANGELOG)
+wrote prose here.** Machine-generated boilerplate — GitHub's PR list, a CI
+provenance line — is never `keep`; it is context to preserve *below* curated
+notes. When you meet a new CI stub that trips `keep`, add a case rather than
+skipping the phase.
 
 - `fresh`  → write the curated body.
 - `prepend` → write curated sections, then append the existing auto-notes
