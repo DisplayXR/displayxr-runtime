@@ -243,7 +243,7 @@ _package\run_cube_handle_d3d11_win.bat
 
 **Which DLL loaded?** Every `xrCreateInstance` logs a WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` — search `loaded from:` for the authoritative path. Full dev-iteration reference: `docs/getting-started/building.md`.
 
-After a rebuild, copy runtime binaries into `C:\Program Files\DisplayXR\Runtime` (registry discovery finds it); only run the installer when the installer itself changed.
+After a rebuild, push binaries to `C:\Program Files\DisplayXR\Runtime` with **`scripts/push-runtime-pf.sh`** — never hand-copy. A *partial* copy (e.g. service exe updated, client DLLs not) arms a time bomb: the client↔service git-tag gate rejects every `xrCreateInstance` from the moment the service next restarts, and every app goes black with no obvious cause. The script copies the full set (excluding the shell + preserving the installed MCP adapter), verifies both tags match, and restarts the service immediately so a mismatch can never lie dormant. Only run the installer when the installer itself changed.
 
 **From-source builds need a registered display processor (Windows).** Windows plug-in discovery is **registry-only** (`HKLM\Software\DisplayXR\DisplayProcessors`) — there's no adjacent-dir / `XRT_PLUGIN_SEARCH_PATH` fallback like POSIX has. `build_windows.bat` builds the sim-display plug-in DLL but does **not** register it, so a pure from-source runtime finds no DP and `xrt_instance_create_system` fails (`XRT_ERROR_DEVICE_CREATION_FAILED` / app "Failed to initialize OpenXR"). Register the freshly-built (ABI-matched) plug-in once, from an **elevated** prompt:
 ```bat
