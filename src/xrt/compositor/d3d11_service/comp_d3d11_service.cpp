@@ -8744,8 +8744,17 @@ zones_acquire_image(struct d3d11_service_system *sys,
 		return false;
 	}
 	if (use_fence_path && !*fence_wait_queued) {
-		sys->context->Wait(c->workspace_sync_fence.get(), fence_signaled);
-		*fence_wait_queued = true;
+		// #922 twin (zones/Local-2D path): NEVER queue a context Wait on a
+		// client-promised fence value that hasn't completed — a client dying
+		// between promising and signaling jams the shared immediate context
+		// (same bug fixed in the projection-view path). Not complete yet →
+		// release the acquire and treat the source as stale; the caller
+		// reuses the previous frame and retries next compose.
+		if (c->workspace_sync_fence->GetCompletedValue() < fence_signaled) {
+			sc->images[img].keyed_mutex->ReleaseSync(0);
+			return false;
+		}
+		*fence_wait_queued = true; // completed — the GPU work is done, no wait needed
 	}
 	acquired[*acquired_count].sc = sc;
 	acquired[*acquired_count].img = img;
@@ -11689,8 +11698,42 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Present to display
 	if (c->render.swap_chain) {
-		c->render.swap_chain->Present(1, 0);  // VSync
-		g_weave_latency_standalone.after_present("standalone", c->render.swap_chain.get());
+		// #924 S1b: this present runs on the CLIENT'S IPC thread and the
+		// design deliberately uses the block as self-pacing (device max
+		// latency 1 → Present(1) waits for the previous flip). That is fine
+		// while DWM consumes flips — but when the flip chain jams (observed:
+		// hybrid NV→Intel present path, frozen client's shared resource in
+		// the chain), a plain Present(1,0) blocks for MINUTES and this
+		// client's whole IPC stalls: its app freezes mid-startup or
+		// mid-frame with no way to even receive an exit request.
+		//
+		// Preserve the pacing, bound the wedge: retry a non-blocking present
+		// (~1 ms cadence ≈ the old block) up to a 50 ms deadline (~3 vsync).
+		// On deadline, drop the frame — a jammed client degrades to slow
+		// frames but keeps its IPC (and teardown) alive.
+		HRESULT phr = S_OK;
+		int64_t present_deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
+		for (;;) {
+			phr = c->render.swap_chain->Present(1, DXGI_PRESENT_DO_NOT_WAIT);
+			if (phr != DXGI_ERROR_WAS_STILL_DRAWING) {
+				break; // presented (or a real error — either way, done)
+			}
+			if ((int64_t)os_monotonic_get_ns() >= present_deadline_ns) {
+				static std::atomic<int64_t> s_last_drop_log_ns{0};
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
+				if (now_ns - prev_ns > 1000000000LL &&
+				    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+					U_LOG_W("standalone present: frame dropped after 50 ms — "
+					        "DWM not consuming flips (#924)");
+				}
+				break;
+			}
+			Sleep(1);
+		}
+		if (SUCCEEDED(phr)) {
+			g_weave_latency_standalone.after_present("standalone", c->render.swap_chain.get());
+		}
 		// DComp path: publish the new frame to dwm.exe. Cheap — IPC of delta state,
 		// no GPU work. Only present on the transparent opt-in path.
 		if (c->render.dcomp_device) {
@@ -11703,7 +11746,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// unblocks the app's modal drag loop while the frame is still
 		// queued for DWM composition, and by the time DWM presents, the
 		// window has moved further, causing visual stutter.
-		if (!c->render.owns_window && c->app_hwnd != nullptr) {
+		// #924 S1b: skip when the present just timed out — DwmFlush is
+		// another unbounded DWM wait and would re-wedge this thread.
+		if (SUCCEEDED(phr) && !c->render.owns_window && c->app_hwnd != nullptr) {
 			DwmFlush();
 		}
 	}
