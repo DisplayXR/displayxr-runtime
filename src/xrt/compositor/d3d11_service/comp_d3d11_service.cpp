@@ -1868,9 +1868,28 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		}
 		bool hw_settled = false;
 		bool current_is_3d = false;
-		if (xrt_display_processor_d3d11_get_hardware_3d_state(
-		        mc->display_processor, &current_is_3d)) {
-			hw_settled = (current_is_3d == mc->mode_flip.target_is_3d);
+		// #925 S1: the raw vendor call blocks ~10 ms and this runs on the
+		// RENDER thread under render_mutex, once per FLIPPING frame — rate-
+		// limit it to 10 Hz with the same CAS window the commit path uses
+		// (Phase 5b cache). Settle detection latency grows ≤100 ms, well
+		// inside the curtain window; the MFP ceiling still bounds the phase.
+		{
+			const int64_t kPollIntervalNs = 100LL * 1000000LL; // 100 ms
+			int64_t now_ns = os_monotonic_get_ns();
+			int64_t last_poll = sys->last_3d_state_poll_ns.load(std::memory_order_acquire);
+			if ((now_ns - last_poll) >= kPollIntervalNs &&
+			    sys->last_3d_state_poll_ns.compare_exchange_strong(
+			        last_poll, now_ns, std::memory_order_acq_rel, std::memory_order_acquire)) {
+				if (xrt_display_processor_d3d11_get_hardware_3d_state(
+				        mc->display_processor, &current_is_3d)) {
+					sys->cached_3d_state.store(current_is_3d, std::memory_order_relaxed);
+					sys->cached_3d_state_valid.store(true, std::memory_order_release);
+					hw_settled = (current_is_3d == mc->mode_flip.target_is_3d);
+				}
+			} else if (sys->cached_3d_state_valid.load(std::memory_order_acquire)) {
+				current_is_3d = sys->cached_3d_state.load(std::memory_order_relaxed);
+				hw_settled = (current_is_3d == mc->mode_flip.target_is_3d);
+			}
 		}
 		bool ceiling = mc->mode_flip.flip_frame_counter >= MFP_HW_CEILING_FRAMES;
 		if (hw_settled || ceiling) {
@@ -3577,8 +3596,20 @@ swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t ind
 
 	// For client-created swapchains (imported), server acquires mutex here
 	if (img->keyed_mutex && !img->mutex_acquired) {
-		// Convert timeout to milliseconds
-		DWORD timeout_ms = (timeout_ns < 0) ? INFINITE : static_cast<DWORD>(timeout_ns / 1000000);
+		// Convert timeout to milliseconds, CLAMPED (#925 S1). Two bugs in
+		// the old `(timeout_ns < 0) ? INFINITE : timeout_ns / 1e6`:
+		//  - XR_INFINITE_DURATION is INT64_MAX (POSITIVE) — /1e6 then cast
+		//    to 32-bit DWORD wrapped it to an arbitrary garbage timeout;
+		//  - a literal INFINITE on an IPC handler violates the no-unbounded-
+		//    waits rule: a dead producer wedged this client's IPC forever.
+		// 1000 ms is far beyond any healthy acquire (frame budget is 16 ms)
+		// and the timeout path already returns NO_IMAGE_AVAILABLE cleanly.
+		DWORD timeout_ms;
+		if (timeout_ns < 0 || timeout_ns / 1000000 >= 1000) {
+			timeout_ms = 1000;
+		} else {
+			timeout_ms = static_cast<DWORD>(timeout_ns / 1000000);
+		}
 
 		HRESULT hr = img->keyed_mutex->AcquireSync(0, timeout_ms);
 		if (hr == WAIT_TIMEOUT) {
@@ -3652,8 +3683,15 @@ semaphore_wait(struct xrt_compositor_semaphore *xcsem, uint64_t value, uint64_t 
 {
 	struct d3d11_service_semaphore *sem = d3d11_service_semaphore_from_xrt(xcsem);
 
-	// Convert nanoseconds to milliseconds
-	auto timeout_ms = std::chrono::milliseconds(timeout_ns / 1000000);
+	// Convert nanoseconds to milliseconds, CLAMPED (#925 S1): the app can
+	// pass XR_INFINITE_DURATION (INT64_MAX) and this runs on its IPC handler
+	// thread — an unbounded fence wait on a value a dying producer never
+	// signals wedges the client's whole IPC (same class as #922).
+	uint64_t ms = timeout_ns / 1000000;
+	if (ms > 1000) {
+		ms = 1000;
+	}
+	auto timeout_ms = std::chrono::milliseconds(ms);
 
 	return xrt::auxiliary::d3d::d3d11::waitOnFenceWithTimeout(
 	    sem->fence, sem->wait_event, value, timeout_ms);
@@ -11740,16 +11778,28 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			c->render.dcomp_device->Commit();
 		}
 		// For cross-process swap chains (post-hot-switch, external HWND),
-		// DwmFlush blocks until the next DWM composition pass — minimizes
-		// the latency between Present and the frame appearing on screen,
-		// which improves drag smoothness. Without it, the IPC response
-		// unblocks the app's modal drag loop while the frame is still
-		// queued for DWM composition, and by the time DWM presents, the
-		// window has moved further, causing visual stutter.
-		// #924 S1b: skip when the present just timed out — DwmFlush is
-		// another unbounded DWM wait and would re-wedge this thread.
+		// waiting for the next DWM composition pass minimizes the latency
+		// between Present and the frame appearing on screen, which improves
+		// drag smoothness. Without it, the IPC response unblocks the app's
+		// modal drag loop while the frame is still queued for DWM
+		// composition, and by the time DWM presents, the window has moved
+		// further, causing visual stutter.
+		// #925 S1: the wait must be BOUNDED. DwmFlush() blocks until DWM
+		// actually composes — a hung/stalled DWM (session lock, mode switch,
+		// TDR) wedged this thread even when the Present above SUCCEEDED
+		// (the old SUCCEEDED(phr) gate only covered "present timed out").
+		// DCompositionWaitForCompositorClock with the helper's 4-100 ms
+		// clamp gives the same pacing with a hard ceiling; if the API is
+		// unavailable (pre-20H1), skip — drag smoothness is not worth an
+		// unbounded DWM wait on the client's IPC thread.
 		if (SUCCEEDED(phr) && !c->render.owns_window && c->app_hwnd != nullptr) {
-			DwmFlush();
+			if (!late_weave_wait_compositor_clock(16.7e6)) {
+				static std::atomic<bool> s_warned{false};
+				if (!s_warned.exchange(true)) {
+					U_LOG_W("standalone present: compositor-clock wait unavailable — "
+					        "skipping DWM pacing (bounded-wait rule, #925)");
+				}
+			}
 		}
 	}
 
@@ -12592,7 +12642,13 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	int64_t t_pre_acquire_ns = os_monotonic_get_ns();
 	bool acquired = false;
 	if (in_km) {
-		hr = in_km->AcquireSync(0, 1000);
+		// #925 S1: weave_submit holds render_mutex end-to-end, so this
+		// acquire budget is a GLOBAL compositor stall ceiling — one
+		// misbehaving present-owner froze everything for the old 1000 ms.
+		// 4 ms (the budget every other compose-path acquire uses): the
+		// producer signals key 0 before submitting, so a healthy acquire is
+		// immediate; on timeout this weave is skipped and retried next frame.
+		hr = in_km->AcquireSync(0, 4);
 		if (FAILED(hr) || hr == static_cast<HRESULT>(WAIT_TIMEOUT)) {
 			U_LOG_W("#625 weave: input AcquireSync failed/timed out: 0x%08lx", hr);
 			return false;
@@ -12930,7 +12986,11 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
 			bool ov_acquired = false;
 			if (ov_km) {
-				HRESULT ah = ov_km->AcquireSync(0, 1000);
+				// #925 S1: 4 ms, same rationale as the input acquire above
+				// (held under render_mutex; skip-and-retry beats a 1 s
+				// global stall). Miss = this frame composes without the
+				// overlay, which the next frame corrects.
+				HRESULT ah = ov_km->AcquireSync(0, 4);
 				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
 					ov_acquired = true;
 				}
