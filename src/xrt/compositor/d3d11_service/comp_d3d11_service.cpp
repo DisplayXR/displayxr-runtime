@@ -1410,6 +1410,14 @@ struct d3d11_multi_compositor
 	//! weave+present runs vsync-locked right after the previous flip — the eye
 	//! prediction is pulled ~1 refresh before scanout instead of ~3.
 	HANDLE frame_latency_waitable{nullptr};
+	//! #924: one-present permission. Set when the pacing wait consumed a
+	//! frame-latency-waitable signal (a back buffer is free); consumed by the
+	//! present site. When absent, the present site tries a zero-timeout claim
+	//! and otherwise SKIPS the present — Present(1,0) with no free buffer
+	//! blocks for as long as DWM refuses the flip (observed: minutes, on the
+	//! hybrid NV→Intel present path with a frozen client's shared resource in
+	//! the chain), freezing the whole compositor.
+	std::atomic<bool> present_token{false};
 	//! @}
 
 	//! True when display is in 2D mode due to capture client focus.
@@ -5374,7 +5382,13 @@ try {
 		// stops signaling.
 		if (mc->frame_latency_waitable) {
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
-			WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, 100);
+			DWORD wr = WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, 100);
+			// #924: only a signaled waitable means a back buffer is free. On
+			// timeout (DWM throttled/occluded or the flip chain is wedged on a
+			// frozen client's resource) we still run the render pass — but the
+			// present site must NOT call a blocking Present. The token is the
+			// pacer's one-present grant.
+			mc->present_token.store(wr == WAIT_OBJECT_0, std::memory_order_release);
 
 			// Latency governor (#850): back the queue depth off to 2 when
 			// the workspace pipeline can't hold refresh rate at depth 1
@@ -8559,9 +8573,40 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Present
 	if (mc->swap_chain) {
-		mc->swap_chain->Present(1, 0);
-		g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
-		                                        &g_lw_gov_workspace);
+		// #924: NEVER call a blocking Present without a free back buffer.
+		// With the frame-latency waitable (late-weave), the pacer's wait
+		// consumed the buffer-free signal and granted a one-present token.
+		// Without a token (pacer timed out, or this render was driven by
+		// layer_commit which never goes through the pacer), try to claim a
+		// buffer with a zero-timeout wait. If none is free, SKIP: the
+		// composed atlas is retained and the next pass flips it once DWM
+		// resumes consuming. Skipping degrades to a visually-frozen workspace
+		// while the flip chain is jammed — but IPC, input, and teardown stay
+		// alive, and it recovers; the blocking Present froze the entire
+		// compositor for minutes.
+		bool may_present = true;
+		if (mc->frame_latency_waitable) {
+			may_present = mc->present_token.exchange(false, std::memory_order_acq_rel);
+			if (!may_present) {
+				may_present =
+				    WaitForSingleObject(mc->frame_latency_waitable, 0) == WAIT_OBJECT_0;
+			}
+			if (!may_present) {
+				static std::atomic<int64_t> s_last_skip_log_ns{0};
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				int64_t prev_ns = s_last_skip_log_ns.load(std::memory_order_relaxed);
+				if (now_ns - prev_ns > 1000000000LL &&
+				    s_last_skip_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+					U_LOG_W("Multi-comp: present skipped — no free back buffer "
+					        "(DWM not consuming flips; #924)");
+				}
+			}
+		}
+		if (may_present) {
+			mc->swap_chain->Present(1, 0);
+			g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
+			                                        &g_lw_gov_workspace);
+		}
 	}
 
 	// Signal WM_PAINT done
