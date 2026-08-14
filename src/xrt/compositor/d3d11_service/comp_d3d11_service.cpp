@@ -1154,6 +1154,15 @@ struct d3d11_multi_client_slot
 	//! worst applies last-frame's value for one call.
 	float frame_rate_cap_hz;
 
+	//! #929 / #925 S4: monotonic timestamp of this slot's xrEndSession, or 0
+	//! while the session is live. A session-ended client that never
+	//! disconnects (observed: an app wedged post-teardown kept its slot and
+	//! FOCUS indefinitely) is force-evicted by the render tick after a
+	//! bounded grace — the workspace must not depend on the client's
+	//! cooperation to reclaim the slot. Set/cleared under render_mutex by
+	//! compositor_end_session / compositor_begin_session.
+	int64_t session_ended_ns;
+
 	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
 	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
 	//! clears it; the controller responds with per-client setup (place via
@@ -4141,10 +4150,27 @@ compositor_create_semaphore(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+static void
+multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc); // forward decl (#929)
+
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
 	U_LOG_W("D3D11 service compositor: session begin");
+
+	// #929: a re-begun session revokes any pending eviction mark.
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+	if (sys != nullptr && sys->multi_comp != nullptr) {
+		render_mutex_fair_lock lock(sys);
+		struct d3d11_multi_compositor *mc = sys->multi_comp;
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			if (mc->clients[i].active && mc->clients[i].compositor == c) {
+				mc->clients[i].session_ended_ns = 0;
+				break;
+			}
+		}
+	}
 	return XRT_SUCCESS;
 }
 
@@ -4152,6 +4178,35 @@ static xrt_result_t
 compositor_end_session(struct xrt_compositor *xc)
 {
 	U_LOG_W("D3D11 service compositor: session end");
+
+	// #929 / #925 S4 tier 1: mark the slot so the render tick can evict it
+	// after a bounded grace if the client never disconnects, and surrender
+	// FOCUS immediately — whatever else happens, a session-ended client must
+	// stop being the keyboard/pointer target (the live wedge had input
+	// routed to a dead session). Per ADR-018, focus is cleared, not
+	// reassigned: the controller's client-list diff picks the successor.
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+	if (sys != nullptr && sys->multi_comp != nullptr) {
+		render_mutex_fair_lock lock(sys);
+		struct d3d11_multi_compositor *mc = sys->multi_comp;
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			if (!mc->clients[i].active || mc->clients[i].compositor != c) {
+				continue;
+			}
+			if (mc->clients[i].client_type == CLIENT_TYPE_IPC) {
+				mc->clients[i].session_ended_ns = (int64_t)os_monotonic_get_ns();
+				if (mc->focused_slot == i) {
+					mc->focused_slot = -1;
+					multi_compositor_update_input_forward(mc);
+					U_LOG_W("Multi-comp: slot %d ended its session while focused — "
+					        "focus surrendered (#929)",
+					        i);
+				}
+			}
+			break;
+		}
+	}
 	return XRT_SUCCESS;
 }
 
@@ -5223,6 +5278,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].has_first_frame_committed = false;
 			mc->clients[i].first_frame_ns = 0;
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
+			mc->clients[i].session_ended_ns = 0; // #929: no stale eviction mark on slot reuse
 			// Phase 2.C: drop any leftover chrome registration from a
 			// prior tenant so the new client starts with no chrome.
 			if (mc->clients[i].chrome_xsc != nullptr) {
@@ -5299,7 +5355,9 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 static void multi_compositor_render(struct d3d11_service_system *sys); // forward decl
 
 static void
-multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+multi_compositor_unregister_client(struct d3d11_service_system *sys,
+                                   struct d3d11_service_compositor *c,
+                                   bool render_final_frame)
 {
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (mc == nullptr) {
@@ -5346,7 +5404,12 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 			// Render one final frame to clear the stale content.
 			// Without this, the last app frame stays on screen because
 			// multi_compositor_render is only called from layer_commit.
-			multi_compositor_render(sys);
+			// (#929 eviction calls this FROM the render thread inside
+			// multi_compositor_render — it passes false to avoid
+			// recursing; the in-flight frame already redraws.)
+			if (render_final_frame) {
+				multi_compositor_render(sys);
+			}
 			break;
 		}
 	}
@@ -6729,6 +6792,45 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// sys->tile_columns so the read sees the just-landed (or still-pending)
 	// tile geometry consistently with the curtain state used by the blit.
 	multi_compositor_apply_pending_mode_flip(sys);
+
+	// #929 / #925 S4 tier 1: evict session-ended clients that never
+	// disconnect. compositor_end_session stamped session_ended_ns (and
+	// surrendered focus immediately); after the grace expires the slot is
+	// reclaimed via the same teardown the disconnect path uses — the
+	// workspace never depends on the client's cooperation (or death) to get
+	// its slot back. The client process is untouched: its compositor object
+	// survives (owned by the IPC layer) and its eventual real disconnect
+	// finds no active slot and no-ops. Grace via DXR_EVICT_ENDED_MS
+	// (default 2000; 0 disables eviction — focus surrender still applies).
+	{
+		static int64_t evict_grace_ns = -1;
+		if (evict_grace_ns < 0) {
+			const char *e = getenv("DXR_EVICT_ENDED_MS");
+			int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 2000;
+			evict_grace_ns = (ms < 0 ? 0 : ms) * 1000000LL;
+		}
+		if (evict_grace_ns > 0 && sys->multi_comp != nullptr) {
+			struct d3d11_multi_compositor *emc = sys->multi_comp;
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+				struct d3d11_multi_client_slot *slot = &emc->clients[s];
+				if (!slot->active || slot->client_type != CLIENT_TYPE_IPC ||
+				    slot->compositor == nullptr || slot->session_ended_ns == 0) {
+					continue;
+				}
+				if (now_ns - slot->session_ended_ns < evict_grace_ns) {
+					continue;
+				}
+				U_LOG_W("Multi-comp: evicting slot %d — session ended %lld ms ago "
+				        "without disconnect (#929)",
+				        s, (long long)((now_ns - slot->session_ended_ns) / 1000000));
+				multi_compositor_unregister_client(sys, slot->compositor,
+				                                   /*render_final_frame=*/false);
+				// unregister clears slot->active; loop continues to the
+				// next slot with fresh state.
+			}
+		}
+	}
 
 	// 2D/3D display mode auto-switch based on focused client type.
 	// When a capture (2D) window gets focus → switch to 2D mode.
@@ -12008,7 +12110,7 @@ compositor_destroy(struct xrt_compositor *xc)
 	// ghost remnant on workspace re-activate.
 	if (sys->multi_comp != nullptr) {
 		render_mutex_fair_lock lock(sys);
-		multi_compositor_unregister_client(sys, c);
+		multi_compositor_unregister_client(sys, c, true);
 
 		// Clear active compositor if it's this one (still under render mutex
 		// so the render thread can't snapshot a stale active_compositor).
