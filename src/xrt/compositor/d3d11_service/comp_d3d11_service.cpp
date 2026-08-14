@@ -5617,6 +5617,31 @@ capture_render_thread_start(struct d3d11_service_system *sys)
 }
 
 /*!
+ * Request the capture render thread to stop WITHOUT joining (#925 audit
+ * rank 6). The dismiss branch calls this from INSIDE multi_compositor_render
+ * — which runs either on the capture thread itself (a join there is a
+ * self-join, std::system_error) or on an IPC thread holding render_mutex
+ * (a join there deadlocks if the capture thread is already blocked in its
+ * own render_mutex acquire). The thread exits on its own after the current
+ * iteration; its handle is reaped by capture_render_thread_start's join
+ * (safe: by then the thread is past its loop) or by the full stop/destroy
+ * paths, which join outside the lock. Wakeup/waitable handles stay open for
+ * reuse — they are closed by the real stop or teardown.
+ */
+static void
+capture_render_thread_request_stop(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || !mc->capture_render_running.load()) {
+		return;
+	}
+	mc->capture_render_running.store(false);
+	if (mc->render_wakeup_event) {
+		SetEvent(mc->render_wakeup_event);
+	}
+}
+
+/*!
  * Stop the capture render timer thread (if running).
  */
 static void
@@ -6586,8 +6611,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 
-			// Stop render thread
-			capture_render_thread_stop(sys);
+			// Stop render thread — REQUEST only (#925 audit rank 6): this
+			// code runs inside multi_compositor_render, so the old
+			// stop-with-join was a self-join when the capture thread ran
+			// the dismiss, and a render_mutex deadlock candidate when an
+			// IPC-driven render did. The thread exits after this
+			// iteration; start()/teardown reap the handle safely.
+			capture_render_thread_request_stop(sys);
 
 			// Release shared DP (per-client DPs now handle display)
 			if (mc->display_processor != nullptr) {
@@ -8676,17 +8706,27 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			snprintf(ss_trigger, sizeof(ss_trigger), "%s\\workspace_screenshot_trigger", tmp);
 			snprintf(ss_prefix, sizeof(ss_prefix), "%s\\workspace_screenshot", tmp);
 		}
-		if (mc->combined_atlas &&
-		    GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
-			DeleteFileA(ss_trigger);
-			struct ipc_capture_result dummy = {};
-			comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
-			                                 IPC_CAPTURE_FLAG_ATLAS, &dummy);
+		// #925 audit rank 5: this stat runs on the RENDER thread under
+		// render_mutex — at ~60-70 Hz it was two %TEMP% filesystem touches
+		// per frame (with the MCP poll below), and a slow/AV-hooked TEMP
+		// stalls the whole compositor. 4 Hz is plenty for a human-driven
+		// debug trigger (the capture consumer sleeps seconds anyway).
+		static int64_t ss_last_poll_ns = 0;
+		int64_t ss_now_ns = (int64_t)os_monotonic_get_ns();
+		if (mc->combined_atlas && ss_now_ns - ss_last_poll_ns >= 250LL * 1000000LL) {
+			ss_last_poll_ns = ss_now_ns;
+			if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
+				DeleteFileA(ss_trigger);
+				struct ipc_capture_result dummy = {};
+				comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
+				                                 IPC_CAPTURE_FLAG_ATLAS, &dummy);
+			}
 		}
 	}
 
 	// MCP capture_frame: service a pending request before Present
-	// so the atlas is fully populated.
+	// so the atlas is fully populated. (In-memory flag check per frame is
+	// fine — the filesystem is only touched when a request is pending.)
 	comp_d3d11_service_poll_mcp_capture((struct xrt_system_compositor *)sys);
 
 	// Phase 1 Task 1.4 — env-gated Present-to-Present interval log for the
@@ -11793,11 +11833,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			snprintf(ss_trigger, sizeof(ss_trigger), "%s\\workspace_screenshot_trigger", tmp);
 			snprintf(ss_prefix, sizeof(ss_prefix), "%s\\workspace_screenshot", tmp);
 		}
-		if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
-			DeleteFileA(ss_trigger);
-			struct ipc_capture_result dummy = {};
-			comp_d3d11_service_capture_frame(&sys->base, ss_prefix, IPC_CAPTURE_FLAG_PROJECTION_ONLY,
-			                                 &dummy);
+		// #925 audit rank 5: per-commit stat → 4 Hz (see the workspace poll).
+		static int64_t ss_last_poll_ns = 0;
+		int64_t ss_now_ns = (int64_t)os_monotonic_get_ns();
+		if (ss_now_ns - ss_last_poll_ns >= 250LL * 1000000LL) {
+			ss_last_poll_ns = ss_now_ns;
+			if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
+				DeleteFileA(ss_trigger);
+				struct ipc_capture_result dummy = {};
+				comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
+				                                 IPC_CAPTURE_FLAG_PROJECTION_ONLY, &dummy);
+			}
 		}
 	}
 
@@ -12724,13 +12770,27 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// woven OUTPUT is dumped at the end, after the DP has written it.
 	bool dxr_diag_dump = false;
 	{
-		const char *tmp = getenv("TEMP");
-		if (tmp == nullptr) {
-			tmp = getenv("TMP");
+		// #925 audit rank 10: this ran per weave submit UNDER render_mutex
+		// with an uncached getenv + a %TEMP% stat. Path cached once, stat
+		// rate-limited to 4 Hz — plenty for a hand-armed one-shot trigger.
+		static char trig[MAX_PATH] = {};
+		static int trig_valid = -1;
+		if (trig_valid < 0) {
+			const char *tmp = getenv("TEMP");
+			if (tmp == nullptr) {
+				tmp = getenv("TMP");
+			}
+			if (tmp != nullptr) {
+				snprintf(trig, sizeof(trig), "%s\\dxr_weave_dump_trigger", tmp);
+				trig_valid = 1;
+			} else {
+				trig_valid = 0;
+			}
 		}
-		if (tmp != nullptr) {
-			char trig[MAX_PATH];
-			snprintf(trig, sizeof(trig), "%s\\dxr_weave_dump_trigger", tmp);
+		static int64_t trig_last_poll_ns = 0;
+		int64_t trig_now_ns = (int64_t)os_monotonic_get_ns();
+		if (trig_valid == 1 && trig_now_ns - trig_last_poll_ns >= 250LL * 1000000LL) {
+			trig_last_poll_ns = trig_now_ns;
 			if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES) {
 				DeleteFileA(trig);
 				dxr_diag_dump = true;
