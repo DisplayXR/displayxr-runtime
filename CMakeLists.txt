@@ -25,6 +25,19 @@ if(MSVC)
     SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO} CACHE STRING "compile flags" FORCE)
 
     set(CMAKE_VS_INCLUDE_INSTALL_TO_DEFAULT_BUILD 1)
+
+    # Real symbols in Release: /Z7 embeds debug info in the objects (no
+    # compiler-PDB write contention under Ninja parallelism); /DEBUG at link
+    # emits the .pdb. /OPT:REF /OPT:ICF restore the dead-code stripping and
+    # COMDAT folding that a bare /DEBUG would silently disable, so Release
+    # codegen is unchanged — the only new artifact is the .pdb next to the
+    # binary. PDBs are never packed by the installer (it Files *.dll and
+    # named .exes only); select targets install theirs to _package/bin for
+    # dev-deploy debugging.
+    string(APPEND CMAKE_C_FLAGS_RELEASE " /Z7")
+    string(APPEND CMAKE_CXX_FLAGS_RELEASE " /Z7")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS_RELEASE " /DEBUG /OPT:REF /OPT:ICF")
 endif()
 
 # CMake 3.11 introduced CMP0072 - Prefer GLVND

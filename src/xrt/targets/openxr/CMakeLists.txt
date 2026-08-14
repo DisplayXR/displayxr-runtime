@@ -209,6 +209,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 		# first-class CMake artifact promotable via the ARCHIVE slot.
 		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Development
 		)
+	if(MSVC)
+		# Stage DisplayXRClient.pdb next to the DLL in _package/bin so dev
+		# deploys carry real symbols. The NSIS installer never packs *.pdb.
+		install(
+			FILES $<TARGET_PDB_FILE:${RUNTIME_TARGET}>
+			DESTINATION ${CMAKE_INSTALL_BINDIR}
+			COMPONENT Runtime
+			OPTIONAL
+			)
+	endif()
 	if("${CMAKE_VERSION}" VERSION_GREATER_EQUAL 3.21)
 		# This generator expression is easier to control than install(RUNTIME_DEPENDENCY_SETS),
 		# which is prone to trying to distribute system DLLs.
