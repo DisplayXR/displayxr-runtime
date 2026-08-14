@@ -693,7 +693,39 @@ comp_d3d11_target_get_measured_weave_ns(struct comp_d3d11_target *target)
 extern "C" xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval)
 {
-	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	// #925 S1 (audit rank 1): a plain Present(1,0) into a jammed flip chain
+	// blocks for MINUTES with c->mutex held — the in-process twin of the
+	// #924 service wedge (hybrid NV→Intel present path observed live).
+	// This Present is deliberately the frame pacer (device max latency 1 →
+	// Present(1) waits ≤1 vsync when healthy), so preserve the pacing shape
+	// but bound the wedge: non-blocking present retried at ~1 ms cadence up
+	// to a 50 ms (~3 vsync) deadline, then drop the frame. A jammed chain
+	// degrades to slow frames; the app's render thread (and its IPC) stays
+	// alive. Mirrors the service's standalone commit path.
+	HRESULT hr;
+	if (sync_interval == 0) {
+		hr = target->swapchain->Present(0, 0); // immediate — never blocks on the chain
+	} else {
+		int64_t deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
+		for (;;) {
+			hr = target->swapchain->Present(sync_interval, DXGI_PRESENT_DO_NOT_WAIT);
+			if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+				break;
+			}
+			if ((int64_t)os_monotonic_get_ns() >= deadline_ns) {
+				static std::atomic<int64_t> s_last_drop_log_ns{0};
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				int64_t prev_ns = s_last_drop_log_ns.load(std::memory_order_relaxed);
+				if (now_ns - prev_ns > 1000000000LL &&
+				    s_last_drop_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+					U_LOG_W("d3d11 target present: frame dropped after 50 ms — "
+					        "DWM not consuming flips (#924/#925)");
+				}
+				break;
+			}
+			Sleep(1);
+		}
+	}
 	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);
 	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&g_last_present_count);
