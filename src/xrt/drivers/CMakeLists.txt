@@ -536,6 +536,37 @@ if(WIN32)
 		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
 		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
 		)
+	# #933: stage the SDK's LeapC.dll NEXT TO the plug-in. The LeiaSR
+	# Platform ships its own LeapC.dll in `LeiaSR\Platform\bin`, which is
+	# on the system PATH — without an app-local copy, a by-name LeapC
+	# import resolves to SR's DLL, and any SR-vs-Gemini version skew
+	# silently breaks the provider. The input-plugin loader uses
+	# LOAD_WITH_ALTERED_SEARCH_PATH with an absolute path, so the
+	# plug-in's own directory wins the dependency search when the DLL is
+	# staged there. (Installed LeiaViewer uses the same app-local pattern.)
+	get_filename_component(LEAPC_LIBRARY_DIR "${LEAPC_LIBRARY}" DIRECTORY)
+	find_file(LEAPC_RUNTIME_DLL LeapC.dll HINTS "${LEAPC_LIBRARY_DIR}" NO_DEFAULT_PATH)
+	if(LEAPC_RUNTIME_DLL)
+		add_custom_command(
+			TARGET drv_ultraleap_plugin
+			POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LEAPC_RUNTIME_DLL}"
+				"$<TARGET_FILE_DIR:drv_ultraleap_plugin>/LeapC.dll"
+			COMMENT "Staging LeapC.dll app-local next to DisplayXR-Ultraleap (#933)"
+			)
+		install(
+			FILES "${LEAPC_RUNTIME_DLL}"
+			DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins
+			COMPONENT Runtime
+			)
+	else()
+		message(
+			WARNING
+				"drv_ultraleap_plugin: LeapC.dll not found next to ${LEAPC_LIBRARY} — "
+				"the provider will resolve LeapC from the system PATH, where the LeiaSR "
+				"Platform's own copy shadows the SDK's (#933)."
+			)
+	endif()
 else()
 	install(
 		TARGETS drv_ultraleap_plugin
