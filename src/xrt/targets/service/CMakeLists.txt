@@ -65,6 +65,16 @@ if(APPLE)
 endif()
 
 install(TARGETS displayxr-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(MSVC)
+	# Stage the service PDB next to the exe in _package/bin so dev deploys
+	# (copy to Program Files) carry real symbols for stall/crash stack dumps.
+	# The NSIS installer never packs *.pdb.
+	install(
+		FILES $<TARGET_PDB_FILE:displayxr-service>
+		DESTINATION ${CMAKE_INSTALL_BINDIR}
+		OPTIONAL
+		)
+endif()
 
 if(XRT_HAVE_SYSTEMD)
 	set(SERVICE_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/displayxr.in.service")
