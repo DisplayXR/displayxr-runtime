@@ -68,11 +68,14 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <deque>
 #include <mutex>
 #include <map>
+#include <thread>
 #include <vector>
 #include <sddl.h>
 
@@ -890,6 +893,176 @@ struct render_mutex_fair_lock
 	render_mutex_fair_lock(const render_mutex_fair_lock &) = delete;
 	render_mutex_fair_lock &operator=(const render_mutex_fair_lock &) = delete;
 };
+
+
+/*
+ *
+ * Deferred cross-process window ops (#925 audit rank 7)
+ *
+ */
+
+/*!
+ * Pull the workspace window to the foreground *after* `render_mutex` is
+ * released (#925 audit rank 7). The target is our own HWND, but
+ * `SetForegroundWindow` still runs the win32k foreground-serialization path,
+ * which synchronizes with the *current* foreground window's input queue — a
+ * hung app owning the foreground blocks the call, and until now it did so
+ * with `render_mutex` held.
+ *
+ * Declare one of these immediately BEFORE the lock guard at the call site:
+ * locals destruct in reverse order, so the foreground switch runs once the
+ * mutex is gone, on every return path. Still synchronous from the caller's
+ * point of view, so the controller keeps its ordering guarantee (the launcher
+ * band needs foreground before it can receive wheel events).
+ */
+struct deferred_window_foreground
+{
+	HWND hwnd{nullptr};
+	bool want_focus{false};
+	~deferred_window_foreground()
+	{
+		if (hwnd == nullptr) {
+			return;
+		}
+		SetForegroundWindow(hwnd);
+		if (want_focus) {
+			// Only effective when our thread's input queue is attached
+			// to the window thread's; kept for parity with the previous
+			// inline call rather than for its (rare) effect.
+			SetFocus(hwnd);
+		}
+	}
+};
+
+/*!
+ * Restoring an adopted 2D window to the desktop takes three Win32 calls —
+ * `SetWindowPlacement`, `SetWindowLongPtr(GWL_EXSTYLE)`, `SetWindowPos`
+ * (FRAMECHANGED|SHOWWINDOW) — and every one of them dispatches messages
+ * (`WM_WINDOWPOSCHANGING`, `WM_NCCALCSIZE`, `WM_SHOWWINDOW`) *synchronously*
+ * into the owning app's UI thread. On a hung app that call never returns.
+ * Both restore sites used to run with `render_mutex` held — the dismiss branch
+ * on the render thread itself, `deactivate_workspace` on the controller RPC
+ * thread — so one wedged app froze the whole workspace. `SetWindowPlacement`
+ * has no `SWP_ASYNCWINDOWPOS`-style twin (the sibling resize sites at the
+ * bottom of `multi_compositor_render` do use it), so the ops move to a
+ * dedicated worker instead: the failure domain of a hung app becomes this one
+ * thread, exactly as the S2 principle requires.
+ *
+ * FIFO and single-threaded, so per-HWND ordering is preserved. The thread is
+ * created on first use and never joined — a join is the very unbounded wait
+ * being removed here — hence the deliberately leaked state below (a static
+ * object would be destroyed under a worker still using it during CRT
+ * teardown).
+ */
+struct window_op_restore
+{
+	HWND hwnd;
+	WINDOWPLACEMENT placement;
+	LONG_PTR exstyle;
+};
+
+struct window_op_worker
+{
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::deque<window_op_restore> queue;
+	bool started{false};
+};
+
+//! Intentionally leaked — see window_op_worker docs.
+static window_op_worker *g_window_ops = new window_op_worker();
+
+//! Bound on queued restores. One entry per adopted 2D window, so the cap is
+//! only reachable if the worker is stuck on a hung app; dropping the OLDEST
+//! keeps the newest intent for each window.
+#define WINDOW_OP_QUEUE_MAX 64
+
+static void
+window_op_worker_func()
+{
+	for (;;) {
+		struct window_op_restore op;
+		{
+			std::unique_lock<std::mutex> lk(g_window_ops->mutex);
+			g_window_ops->cv.wait(lk, [] { return !g_window_ops->queue.empty(); });
+			op = g_window_ops->queue.front();
+			g_window_ops->queue.pop_front();
+		}
+
+		if (op.hwnd == nullptr || !IsWindow(op.hwnd)) {
+			continue;
+		}
+
+		int64_t t0 = (int64_t)os_monotonic_get_ns();
+		SetWindowPlacement(op.hwnd, &op.placement);
+		SetWindowLongPtr(op.hwnd, GWL_EXSTYLE, op.exstyle);
+		SetWindowPos(op.hwnd, HWND_TOP, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+		int64_t dt_ms = ((int64_t)os_monotonic_get_ns() - t0) / 1000000;
+
+		// The whole point of this thread: a slow restore is now a logged
+		// oddity instead of a frozen workspace. Anything past a frame is
+		// the app's UI thread not pumping.
+		if (dt_ms > 100) {
+			U_LOG_W("Window ops: restore of HWND %p took %lld ms (app UI thread slow to pump)",
+			        (void *)op.hwnd, (long long)dt_ms);
+		} else {
+			U_LOG_I("Window ops: restored 2D window HWND %p (%lld ms)", (void *)op.hwnd,
+			        (long long)dt_ms);
+		}
+	}
+}
+
+/*!
+ * Queue "put this adopted 2D window back on the desktop". Safe to call with
+ * `render_mutex` held — it only touches the worker's own mutex for the few ns
+ * it takes to push.
+ */
+static void
+window_op_post_restore_2d(HWND hwnd, const WINDOWPLACEMENT *placement, LONG_PTR exstyle)
+{
+	if (hwnd == nullptr || placement == nullptr) {
+		return;
+	}
+
+	struct window_op_restore op = {};
+	op.hwnd = hwnd;
+	op.placement = *placement;
+	op.exstyle = exstyle;
+
+	{
+		std::lock_guard<std::mutex> lk(g_window_ops->mutex);
+		if (!g_window_ops->started) {
+			g_window_ops->started = true;
+			std::thread(window_op_worker_func).detach();
+		}
+		if (g_window_ops->queue.size() >= WINDOW_OP_QUEUE_MAX) {
+			U_LOG_W("Window ops: queue full (%d) — dropping oldest restore",
+			        WINDOW_OP_QUEUE_MAX);
+			g_window_ops->queue.pop_front();
+		}
+		g_window_ops->queue.push_back(op);
+	}
+	g_window_ops->cv.notify_one();
+}
+
+/*!
+ * Drop any queued restore for @p hwnd. Called when a window is (re-)adopted as
+ * a capture client: the adopt path saves a fresh placement, and a restore left
+ * over from a previous dismiss must not fire afterwards and yank the window
+ * back out of the workspace.
+ */
+static void
+window_op_cancel_restore(HWND hwnd)
+{
+	if (hwnd == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(g_window_ops->mutex);
+	for (auto it = g_window_ops->queue.begin(); it != g_window_ops->queue.end();) {
+		it = (it->hwnd == hwnd) ? g_window_ops->queue.erase(it) : it + 1;
+	}
+}
 
 
 /*
@@ -5728,6 +5901,12 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 				if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '-';
 			}
 
+			// Drop any restore still queued for this HWND from a previous
+			// adoption (#925 audit rank 7): the restore is deferred now, so
+			// a re-adopt that races a slow one would otherwise see the
+			// window yanked back to the desktop just after we take it.
+			window_op_cancel_restore(hwnd);
+
 			// Save original window placement and style (for restore on removal)
 			mc->clients[i].saved_placement.length = sizeof(WINDOWPLACEMENT);
 			GetWindowPlacement(hwnd, &mc->clients[i].saved_placement);
@@ -6547,12 +6726,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					slot->capture_ctx = nullptr;
 					slot->capture_srv = nullptr;
 					slot->capture_texture_last = nullptr;
-					// Restore 2D window to desktop
+					// Restore 2D window to desktop. Deferred (#925 audit
+					// rank 7): this runs on the render thread with
+					// render_mutex held, and the restore calls dispatch
+					// synchronously into the app's UI thread.
 					if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
-						SetWindowPlacement(slot->app_hwnd, &slot->saved_placement);
-						SetWindowLongPtr(slot->app_hwnd, GWL_EXSTYLE, slot->saved_exstyle);
-						SetWindowPos(slot->app_hwnd, HWND_TOP, 0, 0, 0, 0,
-						             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+						window_op_post_restore_2d(slot->app_hwnd, &slot->saved_placement,
+						                          slot->saved_exstyle);
 					}
 					slot->active = false;
 					slot->compositor = nullptr;
@@ -6564,7 +6744,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					struct d3d11_client_render_resources *res = &slot->compositor->render;
 					HWND app_hwnd = slot->app_hwnd;
 					if (app_hwnd != nullptr && IsWindow(app_hwnd)) {
-						ShowWindow(app_hwnd, SW_SHOW);
+						// Async (#925 audit rank 7): synchronous
+						// ShowWindow posts WM_SHOWWINDOW into the app's
+						// UI thread and waits, from the render thread
+						// under render_mutex. Same reason the lazy
+						// standalone path below uses ShowWindowAsync.
+						ShowWindowAsync(app_hwnd, SW_SHOW);
 						res->hwnd = app_hwnd;
 						res->owns_window = false;
 
@@ -16877,6 +17062,10 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		U_LOG_W("Workspace mode activated for D3D11 service system (via ensure_workspace_window)");
 	}
 
+	// Declared before the lock so it fires after render_mutex is released,
+	// on every return path below (#925 audit rank 7).
+	deferred_window_foreground foreground;
+
 	render_mutex_fair_lock lock(sys);
 
 	// If workspace was suspended (deactivated via Ctrl+Space), resume it:
@@ -16904,10 +17093,12 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			U_LOG_W("Workspace resume: flagged slot %d for lazy reverse hot-switch", i);
 		}
 
-		// Show the workspace window again
+		// Show the workspace window again. ShowWindow stays inline — the
+		// DP recreated just below binds this HWND and wants it visible —
+		// but the foreground switch is deferred past the lock.
 		if (mc->hwnd != nullptr) {
 			ShowWindow(mc->hwnd, SW_SHOW);
-			SetForegroundWindow(mc->hwnd);
+			foreground.hwnd = mc->hwnd;
 		}
 
 		// Recreate display processor via factory (window + swap chain still alive)
@@ -17028,11 +17219,12 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		slot->capture_height = 0;
 
 		if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
-			SetWindowPlacement(slot->app_hwnd, &slot->saved_placement);
-			SetWindowLongPtr(slot->app_hwnd, GWL_EXSTYLE, slot->saved_exstyle);
-			SetWindowPos(slot->app_hwnd, HWND_TOP, 0, 0, 0, 0,
-			             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-			U_LOG_W("Workspace deactivate: restored 2D window HWND=%p", (void *)slot->app_hwnd);
+			// Deferred (#925 audit rank 7) — see the dismiss-branch
+			// twin. render_mutex is held here too, on the controller
+			// RPC thread, so a hung app must not be able to stall it.
+			window_op_post_restore_2d(slot->app_hwnd, &slot->saved_placement,
+			                          slot->saved_exstyle);
+			U_LOG_W("Workspace deactivate: queued 2D window restore HWND=%p", (void *)slot->app_hwnd);
 		}
 
 		slot->active = false;
@@ -17063,7 +17255,8 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 	}
 	U_LOG_W("Workspace deactivate: render thread joined");
 
-	// Re-acquire for final cleanup (DP destroy, hide window).
+	// Re-acquire for final cleanup (DP destroy, mark suspended).
+	HWND hide_hwnd = nullptr;
 	{
 		render_mutex_fair_lock lock(sys);
 
@@ -17072,11 +17265,16 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 			xrt_display_processor_d3d11_destroy(&mc->display_processor);
 		}
 
-		if (mc->hwnd != nullptr) {
-			ShowWindow(mc->hwnd, SW_HIDE);
-		}
-
+		hide_hwnd = mc->hwnd;
 		mc->suspended = true;
+	}
+
+	// Hide outside the lock (#925 audit rank 7): ShowWindow dispatches
+	// WM_SHOWWINDOW synchronously into the window thread's message loop, and
+	// that loop's WndProc forwards input to app windows — so it is not a
+	// thread we want to wait on with render_mutex held.
+	if (hide_hwnd != nullptr) {
+		ShowWindow(hide_hwnd, SW_HIDE);
 	}
 
 	U_LOG_W("Workspace deactivate: complete — captures stopped, multi-comp suspended, "
@@ -17097,6 +17295,11 @@ comp_d3d11_service_set_input_grab(struct xrt_system_compositor *xsysc, bool grab
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// Declared before the lock: the foreground grab below runs after
+	// render_mutex is released (#925 audit rank 7).
+	deferred_window_foreground foreground;
+
 	render_mutex_fair_lock lock(sys);
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -17118,8 +17321,8 @@ comp_d3d11_service_set_input_grab(struct xrt_system_compositor *xsysc, bool grab
 	// foreground rights via AllowSetForegroundWindow before this IPC. (Mirrors
 	// the focus grab the old runtime launcher did on open.)
 	if (grab && mc->hwnd != nullptr) {
-		SetForegroundWindow(mc->hwnd);
-		SetFocus(mc->hwnd);
+		foreground.hwnd = mc->hwnd;
+		foreground.want_focus = true;
 	}
 	U_LOG_W("Workspace: input grab %s", grab ? "on" : "off");
 }
