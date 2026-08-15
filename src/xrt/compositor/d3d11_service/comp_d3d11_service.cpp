@@ -1320,7 +1320,7 @@ static window_op_worker *g_window_ops = new window_op_worker();
 
 static void
 window_op_worker_func()
-{
+try {
 	for (;;) {
 		struct window_op_restore op;
 		{
@@ -1352,6 +1352,16 @@ window_op_worker_func()
 			        (long long)dt_ms);
 		}
 	}
+} catch (std::exception const &e) {
+	// Detached std::thread: an escaping exception is std::terminate(), i.e. a
+	// silent kill of the whole service. Same defence as
+	// capture_render_thread_func(). `started` stays true — the worker is gone
+	// for this process lifetime, so queued restores stop firing, but every
+	// other client keeps its session. Restores are best-effort desktop
+	// hygiene; they are not worth the process.
+	U_LOG_E("window_op_worker_func: uncaught std::exception: %s — window-op worker stopped", e.what());
+} catch (...) {
+	U_LOG_E("window_op_worker_func: uncaught non-std exception — window-op worker stopped");
 }
 
 /*!
@@ -3795,16 +3805,28 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 	if (FAILED(hr)) {
 		if (!res->owns_window && hr == E_ACCESSDENIED) {
-			// res->hwnd is the app's OWN (cross-process) window. A process cannot
-			// create a DXGI swap chain on a window it does not own, so
-			// CreateSwapChainForHwnd returns E_ACCESSDENIED. This is only reached
-			// by a windowed _handle app forced into bare IPC (XRT_FORCE_MODE=ipc)
-			// outside workspace mode — not a valid configuration. Such an app must
-			// run in-process (native compositor) or under the workspace/shell,
-			// which uses the atlas-only path (no HWND swap chain).
+			// res->hwnd is the app's OWN (cross-process) window, and DXGI
+			// refused a swap chain on it. This is reached by a windowed
+			// _handle app forced into bare IPC (XRT_FORCE_MODE=ipc) outside
+			// workspace mode.
+			//
+			// NOTE (corrected): cross-process CreateSwapChainForHwnd is NOT
+			// categorically denied — whether it succeeds depends on the
+			// service's rights over the app's process/window (same session
+			// and integrity level being the common case). It is observed
+			// WORKING on dev boxes, so this configuration is not invalid per
+			// se; this branch is the graceful degradation for when Windows
+			// does say no. An earlier version of this comment claimed the
+			// call could never succeed and that the config was invalid —
+			// that was wrong, and it sent a strobe investigation down a
+			// false path. Treat E_ACCESSDENIED as "denied here", not as
+			// "impossible everywhere". The workspace/shell route (atlas-only,
+			// no HWND swap chain) and in-process remain the paths that never
+			// depend on those rights.
 			U_LOG_E("Failed to create swap chain on the app's cross-process HWND "
-			        "(0x%08lx E_ACCESSDENIED): a windowed _handle app cannot use "
-			        "non-workspace IPC. Run it in-process or under the workspace/shell.",
+			        "(0x%08lx E_ACCESSDENIED): this service cannot present into the "
+			        "app's window (rights/integrity mismatch). Run it in-process or "
+			        "under the workspace/shell.",
 			        hr);
 		} else {
 			U_LOG_E("Failed to create swap chain for client: 0x%08lx", hr);
