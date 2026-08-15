@@ -1336,6 +1336,15 @@ struct d3d11_multi_client_slot
 	//! compositor_end_session / compositor_begin_session.
 	int64_t session_ended_ns;
 
+	//! #925 S4 tier 2: monotonic timestamp of this slot's most recent layer
+	//! commit, stamped by service_update_slot_content_dims. Zero until the
+	//! first commit lands. A client that was rendering and then stopped —
+	//! frozen, deadlocked, or killed in a way that leaves the IPC connection
+	//! up — is evicted after a bounded idle grace, so the workspace reclaims
+	//! the slot without waiting on the client. Off by default; enabled with
+	//! DXR_EVICT_IDLE_MS (see the sweep in multi_compositor_render).
+	int64_t last_commit_ns;
+
 	//! spec_version 16 (#304): one-shot, set at register (slot-bind). The
 	//! drain emits one CLIENT_CONNECTED event per slot with this set, then
 	//! clears it; the controller responds with per-client setup (place via
@@ -5452,6 +5461,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].first_frame_ns = 0;
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
 			mc->clients[i].session_ended_ns = 0; // #929: no stale eviction mark on slot reuse
+			mc->clients[i].last_commit_ns = 0;   // #925 S4 tier 2: no stale heartbeat either
 			// Phase 2.C: drop any leftover chrome registration from a
 			// prior tenant so the new client starts with no chrome.
 			if (mc->clients[i].chrome_xsc != nullptr) {
@@ -7043,6 +7053,69 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				                                   /*render_final_frame=*/false);
 				// unregister clears slot->active; loop continues to the
 				// next slot with fresh state.
+			}
+		}
+	}
+
+	// #925 S4 tier 2: evict clients that were rendering and then stopped —
+	// frozen, deadlocked, or killed in a way that leaves the IPC connection
+	// up. Tier 1 above covers the client that says goodbye (xrEndSession) and
+	// then hangs; this covers the one that says nothing at all.
+	//
+	// OFF by default. A legitimately idle client is indistinguishable from a
+	// wedged one at this layer, and losing your window because your app paused
+	// rendering is a worse failure than a stale tile — so the grace is opt-in
+	// via DXR_EVICT_IDLE_MS and wants a soak before it can become a default.
+	//
+	// Guards that keep the false-positive rate down when it IS enabled:
+	//  - only clients that have committed a frame (a slow-starting Unity app
+	//    has no heartbeat yet and must never be evicted for it),
+	//  - never a minimized client — the controller hid it, so it is entitled
+	//    to stop rendering,
+	//  - never one that has already ended its session (tier 1 owns those),
+	//  - and the grace stretches to 4x the client's own frame-rate-cap period,
+	//    so a client the controller capped to 1 fps is judged on its own
+	//    cadence rather than the display's.
+	{
+		static int64_t idle_grace_ns = -1;
+		if (idle_grace_ns < 0) {
+			const char *e = getenv("DXR_EVICT_IDLE_MS");
+			int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 0;
+			idle_grace_ns = (ms < 0 ? 0 : ms) * 1000000LL;
+		}
+		if (idle_grace_ns > 0 && sys->multi_comp != nullptr) {
+			struct d3d11_multi_compositor *imc = sys->multi_comp;
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+				struct d3d11_multi_client_slot *slot = &imc->clients[s];
+				if (!slot->active || slot->client_type != CLIENT_TYPE_IPC ||
+				    slot->compositor == nullptr || slot->session_ended_ns != 0 ||
+				    slot->minimized || !slot->has_first_frame_committed ||
+				    slot->last_commit_ns == 0) {
+					continue;
+				}
+
+				int64_t grace_ns = idle_grace_ns;
+				if (slot->frame_rate_cap_hz > 0.0f) {
+					int64_t cap_period_ns =
+					    (int64_t)(1000000000.0 / (double)slot->frame_rate_cap_hz);
+					if (4 * cap_period_ns > grace_ns) {
+						grace_ns = 4 * cap_period_ns;
+					}
+				}
+
+				int64_t idle_ns = now_ns - slot->last_commit_ns;
+				if (idle_ns < grace_ns) {
+					continue;
+				}
+
+				U_LOG_W("Multi-comp: evicting slot %d — no frame for %lld ms "
+				        "(grace %lld ms, cap %.1f Hz) (#925 S4 tier 2)",
+				        s, (long long)(idle_ns / 1000000),
+				        (long long)(grace_ns / 1000000),
+				        (double)slot->frame_rate_cap_hz);
+				multi_compositor_unregister_client(sys, slot->compositor,
+				                                   /*render_final_frame=*/false);
 			}
 		}
 	}
@@ -9051,9 +9124,14 @@ service_update_slot_content_dims(struct d3d11_service_system *sys,
 			slot->blit_tile_rows = tr;
 		}
 
+		// #925 S4 tier 2 liveness heartbeat. Every commit path funnels
+		// through here, so this is the one stamp that says "this client
+		// was still producing frames at T".
+		slot->last_commit_ns = (int64_t)os_monotonic_get_ns();
+
 		if (!slot->has_first_frame_committed) {
 			slot->has_first_frame_committed = true;
-			slot->first_frame_ns = os_monotonic_get_ns();
+			slot->first_frame_ns = (uint64_t)slot->last_commit_ns;
 		}
 		break;
 	}
