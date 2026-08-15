@@ -921,7 +921,27 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_SESSION_NOT_STOPPING, "Session is not stopping");
 	}
 
-	// Auto-switch to 2D mode (mode 0) on session end
+	// Release the panel on session end: hardware 2D, and reset THIS session's
+	// content mode to 0.
+	//
+	// What must NOT happen here is pushing that reset to the server. The
+	// server's head device is shared by every client for the whole service
+	// lifetime, so `oxr_session_push_rendering_mode_ipc(sess, 0)` did not
+	// "reset on exit" — it installed 2D as the DEFAULT that the next client
+	// inherits. oxr_session_begin() reads `active_rendering_mode_index` and
+	// faithfully requests that mode's hardware_display_3d, so after the first
+	// app exited, EVERY later standalone client on that service came up flat:
+	// mono views, collapsed Kooima, and no way back except restarting the
+	// service. In-process never showed it because the reset dies with the
+	// process. (#762 family — mode state decoupled from the panel.)
+	//
+	// The service already had the right rule elsewhere: the #814 teardown
+	// failsafe drives hardware 2D but explicitly CLEARS pending_content_mode
+	// so "a half-applied mode switch from a dying client must not ride along".
+	// The push below was the one place that violated it, so it is gone. The
+	// local reset stays (it is this process's own state), and the hardware-2D
+	// request stays — releasing the lens on exit is correct and is what
+	// actually makes the panel go flat.
 #ifdef OXR_HAVE_DXR_display_info
 	{
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
@@ -929,9 +949,6 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		    !head->rendering_modes[0].hardware_display_3d) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;
-			// #553: mirror the reset on the server's CONTENT mode copy
-			// (out-of-process only; no-op in-process).
-			oxr_session_push_rendering_mode_ipc(sess, 0);
 		}
 		oxr_session_request_display_mode(log, sess, false);
 	}
