@@ -413,6 +413,18 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! #925 S4 tier 2: this client may hold a multi-comp slot (i.e. it is
+	//! neither a bridge relay nor a workspace controller). Gates the commit-
+	//! time slot re-register: an idle-evicted client that resumes committing
+	//! is re-registered as a fresh arrival, so the controller re-places it
+	//! instead of it rendering into the void forever.
+	bool workspace_slot_eligible;
+
+	//! #925 S4 tier 2: the slot app_name assigned at first registration,
+	//! restored on commit-time re-register (the naming logic with its
+	//! HWND-title fallbacks + dedup lives in the create path only).
+	char slot_app_name[128];
+
 	//! Set when workspace re-activates — next layer_commit tears down standalone resources
 	bool pending_workspace_reentry;
 
@@ -5536,6 +5548,9 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
  * Unregister a per-client compositor from the multi-compositor.
  */
 static void multi_compositor_render(struct d3d11_service_system *sys); // forward decl
+static int
+multi_comp_find_slot(const struct d3d11_multi_compositor *mc,
+                     const struct d3d11_service_compositor *c); // forward decl (#925 S4 tier 2)
 
 static void
 multi_compositor_unregister_client(struct d3d11_service_system *sys,
@@ -9976,6 +9991,41 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		sys->active_compositor = c;
 	}
 
+	// #925 S4 tier 2: an idle-evicted client that recovers commits again
+	// with no slot — without this it renders into the void forever while
+	// the workspace shows "No windows open". Re-register it as a fresh
+	// arrival (announce_connected fires, the controller re-places it).
+	// The lock-free pre-scan keeps the hot path free of a new render_mutex
+	// acquire: slot bindings only change under the lock, so a stale read
+	// here at worst defers the re-register by one commit.
+	if (sys->workspace_mode && sys->multi_comp != nullptr && c->workspace_slot_eligible) {
+		bool have_slot = false;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (sys->multi_comp->clients[s].active &&
+			    sys->multi_comp->clients[s].compositor == c) {
+				have_slot = true;
+				break;
+			}
+		}
+		if (!have_slot) {
+			render_mutex_fair_lock rereg_lock(sys);
+			if (multi_comp_find_slot(sys->multi_comp, c) < 0) {
+				int slot = multi_compositor_register_client(sys, c);
+				if (slot >= 0) {
+					sys->multi_comp->clients[slot].app_hwnd = c->app_hwnd;
+					if (c->slot_app_name[0] != '\0') {
+						snprintf(sys->multi_comp->clients[slot].app_name,
+						         sizeof(sys->multi_comp->clients[slot].app_name),
+						         "%s", c->slot_app_name);
+					}
+					U_LOG_W("Multi-comp: re-registered evicted client in slot %d "
+					        "(#925 S4 tier 2)",
+					        slot);
+				}
+			}
+		}
+	}
+
 	// Per-frame bridge-WS-client-live gate. Used below to enable/disable
 	// bridge-specific paths (crop override, atlas-resize skip, qwerty
 	// suppression, vendor hw-state forwarding). When the bridge process
@@ -13846,6 +13896,12 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 				         sizeof(sys->multi_comp->clients[slot].app_name),
 				         "%s", base_name);
 			}
+
+			// #925 S4 tier 2: keep the resolved name on the compositor so a
+			// commit-time re-register after idle eviction restores it.
+			snprintf(c->slot_app_name, sizeof(c->slot_app_name), "%s",
+			         sys->multi_comp->clients[slot].app_name);
+			c->workspace_slot_eligible = true;
 		}
 
 		// Update input forwarding now that app_hwnd is stored
