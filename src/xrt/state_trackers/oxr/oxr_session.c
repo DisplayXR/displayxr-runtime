@@ -2545,10 +2545,47 @@ oxr_session_locate_views(struct oxr_logger *log,
 		server_display_relative = server_display_relative ||
 		                          (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
 #endif
+		// A HOSTED app over IPC must see the same world-absolute view pose an
+		// in-process hosted app sees. In-process, the Kooima block above sets
+		// have_eye_override and writes world-space eyes straight into
+		// XrView.pose (camera at y≈1.7 for the 1.6 m rig + 0.1 nominal eye).
+		// Over IPC that override only engages for apps that chain
+		// XR_DXR_view_rig: the plain locate handler passes rig_reply == NULL,
+		// so rig_applied stays NONE and the server's HEAD-RELATIVE poses
+		// (y≈0.1) fall through to the chain below — where T_base_head is
+		// (0,0,0), because T_base_xdev is (0,-1.6,0): the LOCAL reference
+		// space origin is the initial head pose and cancels the standing
+		// height. Net effect measured on the dev box: the app got a camera at
+		// y=0.100 while drawing its cube at the world y=1.6 its hosted
+		// convention mandates, so the cube floated ~1.5 m overhead and you had
+		// to pitch up to find it. Same app, same scene, in-process: y=1.700.
+		//
+		// Compose against T_xdev_head instead — on Windows that IS the
+		// server's rig pose (see #739 below), so this re-adds the 1.6 m the
+		// LOCAL origin removed and lands on the in-process value exactly,
+		// while still carrying qwerty motion (the rig pose moves with WASD).
+		//
+		// Deliberately narrow: external-window and bridge-relay sessions are
+		// already handled by server_display_relative above; workspace sessions
+		// get an identity head relation (use_qwerty=0) and must not be
+		// touched; and apps that DO chain a rig take the override path and
+		// never reach here. That leaves exactly the broken class — a plain
+		// hosted app on the service.
+		const bool hosted_ipc_world_absolute =
+		    !server_display_relative && !have_eyes && !have_eye_override &&
+		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
+		    !sess->sys->xsysc->info.workspace_mode && !sess->has_external_window &&
+		    !sess->is_bridge_relay;
+
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-relative)
 			result.pose = view_pose;
 			result.relation_flags = T_base_head.relation_flags;
+		} else if (hosted_ipc_world_absolute) {
+			struct xrt_relation_chain xrc = {0};
+			m_relation_chain_push_pose_if_not_identity(&xrc, &view_pose);
+			m_relation_chain_push_relation(&xrc, &T_xdev_head);
+			m_relation_chain_resolve(&xrc, &result);
 		} else {
 			// Standard path: apply space relation chain
 			struct xrt_relation_chain xrc = {0};
