@@ -578,6 +578,30 @@ struct d3d11_service_semaphore
 };
 
 
+/*!
+ * #925 S5 (compose-from-copy): one service-owned copy of a cross-process
+ * producer's image, refreshed with a NON-BLOCKING keyed-mutex acquire +
+ * CopyResource and sampled by the compose pass in place of the live shared
+ * texture. A producer that is frozen mid-write (holding the keyed mutex)
+ * costs the compose pass nothing — the acquire misses instantly and last
+ * tick's copy composes instead. Same pattern the WS-layer HUD cache has
+ * used since Commit 8.D; S5 extends it to every controller-owned producer
+ * the render thread still blocked on (chrome, overlays, cursor — 4 ms
+ * blocking acquires per producer per frame under render_mutex).
+ * Gated by DXR_COMPOSE_FROM_COPY (default off until soaked).
+ */
+struct compose_copy_cache
+{
+	wil::com_ptr<ID3D11Texture2D> tex;
+	wil::com_ptr<ID3D11ShaderResourceView> srv;
+	uint32_t w{0};
+	uint32_t h{0};
+	//! True once at least one acquire+copy succeeded (until then there is
+	//! nothing valid to sample — the caller skips the draw, matching the
+	//! HUD cache's first-frame-before-acquire behavior).
+	bool valid{false};
+};
+
 //! spec_version 21: one entry in the keyed overlay map (see d3d11_service_system::overlays).
 //! Presence in the map == visible; the controller removes an overlay by pushing
 //! !visible / NULL swapchain for its id (erases the entry). z = 0, no disparity.
@@ -591,6 +615,7 @@ struct overlay_slot
 	float size_w_m;            //!< Physical overlay width in meters
 	float size_h_m;            //!< Physical overlay height in meters
 	bool  stereo_sbs;          //!< spec_version 19: image is side-by-side stereo
+	struct compose_copy_cache copy_cache; //!< #925 S5 service-owned copy
 };
 
 //! Cap on simultaneously-composited overlays — a buggy controller can't grow the
@@ -696,6 +721,10 @@ struct d3d11_service_system
 	//! composite draws low ids behind high ids (z-order). An entry's presence == it
 	//! is visible — !visible / NULL swapchain erases its id. Guarded by render_mutex.
 	std::map<uint32_t, overlay_slot> overlays;
+
+	//! #925 S5: service-owned copy of the controller's cursor swapchain
+	//! (DXR_COMPOSE_FROM_COPY).
+	struct compose_copy_cache cursor_copy_cache;
 
 	//! #308 (spec_version 18): controller input grab is active (modal UI like the
 	//! launcher band is up). While set, the cursor renders at z = 0 (zero
@@ -990,6 +1019,21 @@ struct render_mutex_fair_lock
  *
  */
 
+//! #925 S5: DXR_COMPOSE_FROM_COPY=1 switches the chrome/overlay/cursor
+//! compose reads from blocking 4 ms keyed-mutex acquires (sample the live
+//! shared texture) to the compose_copy_cache pattern (non-blocking acquire →
+//! CopyResource → sample the service-owned copy). Default OFF until soaked.
+static bool
+dxr_compose_from_copy_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_COMPOSE_FROM_COPY");
+		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
 //! DXR_CMD_QUEUE=0 reverts every enqueueing handler to the inline
 //! fair-lock path for A/B and triage. Default ON.
 static bool
@@ -1091,6 +1135,81 @@ service_ws_cmd_drain(struct d3d11_service_system *sys)
 	for (uint32_t i = 0; i < n; i++) {
 		service_ws_cmd_apply(sys, &local[i]);
 	}
+}
+
+
+/*
+ *
+ * #925 S5 — compose-from-copy refresh
+ *
+ */
+
+/*!
+ * Refresh @p cache from image @p img_idx of @p sc and return the SRV to
+ * sample, or NULL when nothing valid exists yet (caller skips the draw this
+ * tick). Never blocks: the keyed-mutex acquire is 0-timeout; a miss (the
+ * producer is mid-write — or frozen mid-write forever) just re-composes last
+ * tick's copy. The AcquireSync itself is the cross-process cache barrier
+ * (`feedback_acquiresync_load_bearing`) — without it the copy could read
+ * stale bytes even when the producer has fenced.
+ *
+ * Runs on the render thread under render_mutex; the copy is a GPU-async
+ * CopyResource on the immediate context, ~zero CPU cost.
+ */
+static ID3D11ShaderResourceView *
+compose_copy_cache_refresh(struct d3d11_service_system *sys,
+                           struct d3d11_service_swapchain *sc,
+                           uint32_t img_idx,
+                           struct compose_copy_cache *cache)
+{
+	if (sc == nullptr || img_idx >= sc->image_count || !sc->images[img_idx].texture) {
+		return cache->valid ? cache->srv.get() : nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC src_desc = {};
+	sc->images[img_idx].texture->GetDesc(&src_desc);
+
+	// Lazy (re)create on dim change — same shape as the HUD cache.
+	if (!cache->tex || cache->w != src_desc.Width || cache->h != src_desc.Height) {
+		cache->tex.reset();
+		cache->srv.reset();
+		cache->valid = false;
+		D3D11_TEXTURE2D_DESC cache_desc = {};
+		cache_desc.Width = src_desc.Width;
+		cache_desc.Height = src_desc.Height;
+		cache_desc.MipLevels = 1;
+		cache_desc.ArraySize = 1;
+		cache_desc.Format = (src_desc.Format == DXGI_FORMAT_UNKNOWN)
+		                        ? DXGI_FORMAT_R8G8B8A8_UNORM
+		                        : src_desc.Format;
+		cache_desc.SampleDesc.Count = 1;
+		cache_desc.Usage = D3D11_USAGE_DEFAULT;
+		cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = sys->device->CreateTexture2D(&cache_desc, nullptr, cache->tex.put());
+		if (FAILED(hr)) {
+			return nullptr;
+		}
+		sys->device->CreateShaderResourceView(cache->tex.get(), nullptr, cache->srv.put());
+		cache->w = src_desc.Width;
+		cache->h = src_desc.Height;
+	}
+
+	IDXGIKeyedMutex *km = sc->images[img_idx].keyed_mutex.get();
+	if (km != nullptr) {
+		HRESULT hr = km->AcquireSync(0, 0 /* non-blocking */);
+		if (SUCCEEDED(hr)) {
+			sys->context->CopyResource(cache->tex.get(), sc->images[img_idx].texture.get());
+			cache->valid = true;
+			km->ReleaseSync(0);
+		}
+	} else {
+		// Non-shared image (no keyed mutex) — same-device producer, plain
+		// copy is coherent on the immediate context.
+		sys->context->CopyResource(cache->tex.get(), sc->images[img_idx].texture.get());
+		cache->valid = true;
+	}
+
+	return cache->valid ? cache->srv.get() : nullptr;
 }
 
 
@@ -1495,6 +1614,11 @@ struct d3d11_multi_client_slot
 	uint32_t hud_cache_w[XRT_MAX_LAYERS];
 	uint32_t hud_cache_h[XRT_MAX_LAYERS];
 	bool hud_cache_valid[XRT_MAX_LAYERS]; // true once at least one acquire succeeded
+
+	//! #925 S5: service-owned copy of the controller's chrome swapchain for
+	//! this slot (DXR_COMPOSE_FROM_COPY) — compose samples this instead of
+	//! blocking 4 ms on the shell's keyed mutex every frame.
+	struct compose_copy_cache chrome_copy_cache;
 
 	//! Virtual window position in 3D space (identity = centered on display).
 	struct xrt_pose window_pose;
@@ -5669,6 +5793,8 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].chrome_swapchain_id = 0;
 			mc->clients[i].chrome_layout_valid = false;
 			mc->clients[i].chrome_region_count = 0;
+			// #925 S5: never compose a prior tenant's chrome pixels.
+			mc->clients[i].chrome_copy_cache.valid = false;
 
 			// ADR-018 (#304): the runtime no longer picks an initial window
 			// layout (compute_grid_layout is gone). Register at a sentinel
@@ -8502,9 +8628,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// runtime is expected to acquire when it actually reads. Hoisted
 				// above the per-view loop: one acquire/release per composite
 				// tick, not per view.
+				//
+				// #925 S5 (DXR_COMPOSE_FROM_COPY): instead of a 4 ms BLOCKING
+				// acquire + sampling the live shared texture, refresh the
+				// service-owned copy with a 0-timeout acquire and sample that.
+				// A frozen shell costs compose nothing; chrome goes stale
+				// instead of the workspace stuttering.
 				IDXGIKeyedMutex *chrome_mutex = csc->images[0].keyed_mutex.get();
 				bool chrome_mutex_held = false;
-				if (chrome_mutex != nullptr) {
+				if (dxr_compose_from_copy_enabled()) {
+					chrome_srv = compose_copy_cache_refresh(sys, csc, 0,
+					                                        &cs->chrome_copy_cache);
+					if (chrome_srv == nullptr) {
+						// First-frame-before-acquire — skip chrome this tick.
+						continue;
+					}
+				} else if (chrome_mutex != nullptr) {
 					HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
 					if (SUCCEEDED(hr)) {
 						chrome_mutex_held = true;
@@ -8677,8 +8816,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// xrCreateWorkspaceOverlaySwapchainDXR + xrSetWorkspaceOverlayDXR. The map is
 	// keyed by overlayId; std::map iterates ascending so lower ids composite
 	// behind higher ids (the shell picks ids to control z-order).
-	for (const auto &ov_kv : sys->overlays) {
-		const overlay_slot &ov = ov_kv.second;
+	for (auto &ov_kv : sys->overlays) {
+		overlay_slot &ov = ov_kv.second; // mutable: S5 copy_cache lives here
 		if (ov.xsc == nullptr) {
 			continue;
 		}
@@ -8689,21 +8828,29 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		// Resolve controller swapchain → SRV + texture dims. Acquire the keyed
 		// mutex once (KEYEDMUTEX flushes controller-side writes into our device).
+		// #925 S5 (DXR_COMPOSE_FROM_COPY): sample the service-owned copy via a
+		// 0-timeout refresh instead of blocking 4 ms on the shell's mutex.
 		struct d3d11_service_swapchain *ov_sc = d3d11_service_swapchain_from_xrt(ov.xsc);
 		ID3D11ShaderResourceView *overlay_srv = nullptr;
 		uint32_t sprite_w_px = 0, sprite_h_px = 0;
 		IDXGIKeyedMutex *overlay_mutex = nullptr;
 		bool overlay_mutex_held = false;
 		if (ov_sc != nullptr && ov_sc->image_count > 0 && ov_sc->images[0].srv) {
-			overlay_srv = ov_sc->images[0].srv.get();
 			D3D11_TEXTURE2D_DESC sdesc = {};
 			ov_sc->images[0].texture->GetDesc(&sdesc);
 			sprite_w_px = sdesc.Width;
 			sprite_h_px = sdesc.Height;
-			overlay_mutex = ov_sc->images[0].keyed_mutex.get();
-			if (overlay_mutex != nullptr) {
-				if (SUCCEEDED(overlay_mutex->AcquireSync(0, 4 /* ms */))) {
-					overlay_mutex_held = true;
+			if (dxr_compose_from_copy_enabled()) {
+				overlay_srv = compose_copy_cache_refresh(sys, ov_sc, 0, &ov.copy_cache);
+				// NULL = first-frame-before-acquire → the draw body below
+				// no-ops on overlay_srv == nullptr.
+			} else {
+				overlay_srv = ov_sc->images[0].srv.get();
+				overlay_mutex = ov_sc->images[0].keyed_mutex.get();
+				if (overlay_mutex != nullptr) {
+					if (SUCCEEDED(overlay_mutex->AcquireSync(0, 4 /* ms */))) {
+						overlay_mutex_held = true;
+					}
 				}
 			}
 		}
@@ -8845,15 +8992,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		IDXGIKeyedMutex *cursor_mutex = nullptr;
 		bool cursor_mutex_held = false;
 		if (cur_sc != nullptr && cur_sc->image_count > 0 && cur_sc->images[0].srv) {
-			cursor_srv = cur_sc->images[0].srv.get();
 			D3D11_TEXTURE2D_DESC sdesc = {};
 			cur_sc->images[0].texture->GetDesc(&sdesc);
 			sprite_w_px = sdesc.Width;
 			sprite_h_px = sdesc.Height;
-			cursor_mutex = cur_sc->images[0].keyed_mutex.get();
-			if (cursor_mutex != nullptr) {
-				if (SUCCEEDED(cursor_mutex->AcquireSync(0, 4 /* ms */))) {
-					cursor_mutex_held = true;
+			// #925 S5 (DXR_COMPOSE_FROM_COPY): service-owned copy, 0-timeout
+			// refresh — see the chrome/overlay passes.
+			if (dxr_compose_from_copy_enabled()) {
+				cursor_srv = compose_copy_cache_refresh(sys, cur_sc, 0,
+				                                        &sys->cursor_copy_cache);
+			} else {
+				cursor_srv = cur_sc->images[0].srv.get();
+				cursor_mutex = cur_sc->images[0].keyed_mutex.get();
+				if (cursor_mutex != nullptr) {
+					if (SUCCEEDED(cursor_mutex->AcquireSync(0, 4 /* ms */))) {
+						cursor_mutex_held = true;
+					}
 				}
 			}
 		}
@@ -16312,6 +16466,7 @@ comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compo
 			xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 			cs->chrome_swapchain_id = 0;
 			cs->chrome_layout_valid = false;
+			cs->chrome_copy_cache.valid = false; // #925 S5: drop stale copy
 			// #304: keep workspace_client_id (permanent slot id); only chrome
 			// state is torn down here.
 			U_LOG_W("workspace: chrome swapchain unregistered (slot=%d, id=%u)", s, swapchain_id);
