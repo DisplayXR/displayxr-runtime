@@ -50,6 +50,7 @@ typedef int net_input_socket_t;
 #endif
 
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_input_plugin.h"
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
@@ -333,6 +334,15 @@ handle_state_msg(struct net_input_hub *hub, const struct net_input_state_msg *ms
 	m_relation_history_push(dev->history, &rel, ts);
 }
 
+/*!
+ * Process-wide mirror of "is a feeder attached", read by
+ * @ref net_input_get_presence without a lock. For net_input the wire peer
+ * IS the hardware: with nobody feeding poses there is nothing to drive
+ * the hand roles with, so the runtime hands them back to qwerty. Single
+ * naturally-aligned word, same rationale as the ultraleap mirror.
+ */
+static int g_net_input_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
+
 //! One feeder session: handshake, then the state-message read loop.
 static void
 run_connection(struct net_input_hub *hub, net_input_socket_t client)
@@ -358,6 +368,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 	hub->connected = true;
 	hub->have_clock_offset = false;
 	os_mutex_unlock(&hub->mutex);
+	g_net_input_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_PRESENT;
 
 	U_LOG_W("net_input: feeder connected (proto v%u).", theirs.version);
 
@@ -384,6 +395,7 @@ run_connection(struct net_input_hub *hub, net_input_socket_t client)
 		}
 	}
 	os_mutex_unlock(&hub->mutex);
+	g_net_input_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
 
 	U_LOG_W("net_input: feeder disconnected.");
 }
@@ -685,4 +697,10 @@ net_input_create_devices(uint16_t port, struct xrt_device **out_left, struct xrt
 	*out_left = &left->base;
 	*out_right = &right->base;
 	return XRT_SUCCESS;
+}
+
+enum xrt_input_provider_presence
+net_input_get_presence(void)
+{
+	return (enum xrt_input_provider_presence)g_net_input_presence;
 }

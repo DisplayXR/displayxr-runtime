@@ -49,6 +49,7 @@
 #include "LeapC.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -79,6 +80,26 @@
  * concurrent Leap apps (e.g. LeiaViewer).
  */
 #define UL_IDLE_TIMEOUT_NS (5LL * 1000 * 1000 * 1000)
+
+/*!
+ * How long `ul_create_devices` waits for LeapC to say whether a device is
+ * attached before returning UNKNOWN and letting the answer arrive
+ * asynchronously. The runtime's role arbiter re-reads presence every
+ * ~250 ms either way, so this only buys a definitive verdict for the very
+ * first arbitration — worth it because that one decides whether the app's
+ * opening `xrSyncActions` binds Leap or qwerty, and a flip right after
+ * startup costs an `XrEventDataInteractionProfileChanged`.
+ * `DXR_ULTRALEAP_SETTLE_MS=0` disables the wait.
+ */
+#define UL_SETTLE_DEFAULT_MS 300
+
+/*!
+ * How long the poll thread waits after opening a connection before
+ * concluding "nothing answered — no hardware". Covers the case where the
+ * Ultraleap tracking service is not running at all: `LeapOpenConnection`
+ * is asynchronous and succeeds regardless, so silence is the only signal.
+ */
+#define UL_CONNECT_GRACE_NS (1500LL * 1000 * 1000)
 
 /*!
  * Mount offset: where the Leap device's origin sits in stage space.
@@ -140,11 +161,54 @@ struct ul_hub
 	bool leap_connected;
 	uint64_t idle_disconnects;
 
+	//! Is a Leap device attached? Guarded by mutex; written by the poll
+	//! thread from LeapC Device/DeviceLost/ConnectionLost events, read by
+	//! the runtime's role arbiter through ul_get_presence().
+	enum xrt_input_provider_presence presence;
+
+	//! Attached-device count behind `presence`. Guarded by mutex.
+	int32_t attached_devices;
+
+	//! When the current connection attempt started; poll-thread-owned.
+	//! After UL_CONNECT_GRACE_NS of silence an UNKNOWN presence becomes
+	//! ABSENT — a service that never answers means no hardware.
+	int64_t connect_started_ns;
+
 	struct ul_device *devices[2];
 
 	//! Live device count; the last xrt_device::destroy tears the hub down.
 	int device_refcount;
 };
+
+/*!
+ * Process-wide mirror of the live hub's `presence`, so `ul_get_presence()`
+ * needs neither the hub pointer nor a lock. A single naturally-aligned
+ * word written by the poll thread and read by the runtime's arbiter: a
+ * stale read costs at most one arbitration round (~250 ms), and there is
+ * no value it can tear into that is not one of the three valid states.
+ * (Deliberately not `<stdatomic.h>` — see the MinGW portability rules in
+ * CLAUDE.md.)
+ */
+static int g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
+
+//! Record a presence transition. Hub state under the lock, mirror outside.
+static void
+ul_set_presence(struct ul_hub *hub, enum xrt_input_provider_presence presence)
+{
+	os_mutex_lock(&hub->mutex);
+	bool changed = hub->presence != presence;
+	hub->presence = presence;
+	os_mutex_unlock(&hub->mutex);
+
+	g_ul_presence = (int)presence;
+
+	if (changed) {
+		U_LOG_W("ultraleap: device presence -> %s.", presence == XRT_INPUT_PROVIDER_PRESENCE_PRESENT ? "PRESENT"
+		                                             : presence == XRT_INPUT_PROVIDER_PRESENCE_ABSENT
+		                                                 ? "ABSENT"
+		                                                 : "UNKNOWN");
+	}
+}
 
 //! #941: an XR consumer touched this provider — keep (or revive) the
 //! LeapC connection. Called from update_inputs / get_tracked_pose /
@@ -396,10 +460,12 @@ ul_open_connection(struct ul_hub *hub)
 		return false;
 	}
 	LeapSetTrackingMode(hub->connection, eLeapTrackingMode_Desktop);
+	hub->connect_started_ns = (int64_t)os_monotonic_get_ns();
 	return true;
 }
 
-//! Deactivate both devices' inputs (used on idle disconnect, #941).
+//! Deactivate both devices' inputs (used on idle disconnect, #941, and
+//! whenever the hardware goes away).
 static void
 ul_set_all_untracked(struct ul_hub *hub)
 {
@@ -415,6 +481,49 @@ ul_set_all_untracked(struct ul_hub *hub)
 	os_mutex_unlock(&hub->mutex);
 }
 
+/*!
+ * Fold a LeapC connection/device event into the presence state. LeapC
+ * replays a `Device` event for every already-attached device when a
+ * connection opens, so this covers both "was plugged in before we
+ * started" and "plugged in while we were running".
+ */
+static void
+ul_handle_presence_event(struct ul_hub *hub, const LEAP_CONNECTION_MESSAGE *msg)
+{
+	switch (msg->type) {
+	case eLeapEventType_Device:
+		os_mutex_lock(&hub->mutex);
+		hub->attached_devices++;
+		os_mutex_unlock(&hub->mutex);
+		ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_PRESENT);
+		break;
+
+	case eLeapEventType_DeviceLost: {
+		os_mutex_lock(&hub->mutex);
+		if (hub->attached_devices > 0) {
+			hub->attached_devices--;
+		}
+		int32_t remaining = hub->attached_devices;
+		os_mutex_unlock(&hub->mutex);
+		if (remaining == 0) {
+			ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
+			ul_set_all_untracked(hub);
+		}
+		break;
+	}
+
+	case eLeapEventType_ConnectionLost:
+		os_mutex_lock(&hub->mutex);
+		hub->attached_devices = 0;
+		os_mutex_unlock(&hub->mutex);
+		ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
+		ul_set_all_untracked(hub);
+		break;
+
+	default: break;
+	}
+}
+
 static void *
 ul_poll_thread(void *ptr)
 {
@@ -422,6 +531,7 @@ ul_poll_thread(void *ptr)
 
 	if (!ul_open_connection(hub)) {
 		U_LOG_E("ultraleap: LeapOpenConnection failed — is the Ultraleap tracking service running?");
+		ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
 		return NULL;
 	}
 	hub->leap_connected = true;
@@ -430,6 +540,7 @@ ul_poll_thread(void *ptr)
 	while (os_thread_helper_is_running(&hub->oth)) {
 		os_mutex_lock(&hub->mutex);
 		int64_t last_activity = hub->last_activity_ns;
+		enum xrt_input_provider_presence presence = hub->presence;
 		os_mutex_unlock(&hub->mutex);
 		int64_t now = (int64_t)os_monotonic_get_ns();
 
@@ -449,14 +560,36 @@ ul_poll_thread(void *ptr)
 			U_LOG_W("ultraleap: input polled again — Leap connection reopened (#941).");
 		}
 
+		// Nothing has answered since we opened the connection: no
+		// tracking service, or a service with no device attached.
+		// Either way there is no hardware here, so say so and let the
+		// runtime hand the hand roles to qwerty.
+		if (presence == XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN &&
+		    now - hub->connect_started_ns > UL_CONNECT_GRACE_NS) {
+			ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
+			presence = XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
+		}
+
 		// #941 idle watchdog: no XR consumer for a while → stop being
 		// a tracking-service client until someone polls again.
-		if (now - last_activity > UL_IDLE_TIMEOUT_NS) {
+		//
+		// Only worth doing when a device is actually attached — that
+		// is the case where Hyperion burns a core running the tracking
+		// model for us. With no hardware there is nothing to save, and
+		// staying connected is what lets us SEE a Leap get plugged in
+		// (a closed connection can never report a Device event), so
+		// presence would otherwise be pinned at ABSENT forever.
+		if (presence == XRT_INPUT_PROVIDER_PRESENCE_PRESENT && now - last_activity > UL_IDLE_TIMEOUT_NS) {
 			LeapCloseConnection(hub->connection);
 			hub->leap_connected = false;
 			hub->idle_since_ns = now;
 			hub->idle_disconnects++;
 			ul_set_all_untracked(hub);
+			// Presence is deliberately FROZEN at PRESENT across an
+			// idle disconnect: we closed the connection, the user
+			// did not unplug the device. Anything that polls input
+			// revives the connection (ul_mark_activity) and the
+			// replayed Device events re-confirm it.
 			U_LOG_W(
 			    "ultraleap: no input consumer for %d s — Leap connection closed "
 			    "(#941; reopens on demand).",
@@ -478,6 +611,8 @@ ul_poll_thread(void *ptr)
 		}
 		if (msg.type == eLeapEventType_Tracking) {
 			ul_handle_tracking_event(hub, msg.tracking_event, (int64_t)os_monotonic_get_ns());
+		} else {
+			ul_handle_presence_event(hub, &msg);
 		}
 	}
 
@@ -495,6 +630,9 @@ static void
 ul_hub_destroy(struct ul_hub *hub)
 {
 	os_thread_helper_stop_and_wait(&hub->oth);
+
+	// The poll thread is gone, so nothing maintains presence any more.
+	g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
 
 	if (hub->leap_connected) {
 		LeapCloseConnection(hub->connection);
@@ -730,6 +868,8 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 		return XRT_ERROR_ALLOCATION;
 	}
 	hub->mount_offset = ul_mount_offset_default;
+	hub->presence = XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
+	g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
 	// #941: startup grace — the idle watchdog only fires once nothing has
 	// polled for the timeout, so probes/tests see frames immediately.
 	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
@@ -770,8 +910,41 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 	u_var_add_vec3_f32(hub, &hub->mount_offset, "mount_offset_m");
 	u_var_add_bool(hub, &hub->leap_connected, "leap_connected");
 	u_var_add_ro_u64(hub, &hub->idle_disconnects, "idle_disconnects");
+	u_var_add_ro_i32(hub, &hub->attached_devices, "attached_devices");
+
+	// Give the connection a bounded chance to say whether a device is
+	// attached, so the runtime's FIRST role arbitration (which happens
+	// immediately after this returns) usually gets a real answer instead
+	// of UNKNOWN. Not required for correctness — presence is re-read
+	// every ~250 ms — it just avoids a qwerty→Leap flip, and the
+	// XrEventDataInteractionProfileChanged it implies, moments into the
+	// first session.
+	int settle_ms = UL_SETTLE_DEFAULT_MS;
+	const char *settle_env = getenv("DXR_ULTRALEAP_SETTLE_MS");
+	if (settle_env != NULL) {
+		int v = atoi(settle_env);
+		if (v >= 0 && v <= 5000) {
+			settle_ms = v;
+		}
+	}
+	for (int waited = 0; waited < settle_ms; waited += 20) {
+		if (g_ul_presence != (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN) {
+			break;
+		}
+		os_nanosleep(20 * 1000 * 1000);
+	}
+	U_LOG_W("ultraleap: devices created; presence after settle = %s.",
+	        g_ul_presence == (int)XRT_INPUT_PROVIDER_PRESENCE_PRESENT  ? "PRESENT"
+	        : g_ul_presence == (int)XRT_INPUT_PROVIDER_PRESENCE_ABSENT ? "ABSENT"
+	                                                                   : "UNKNOWN (still settling)");
 
 	*out_left = &left->base;
 	*out_right = &right->base;
 	return XRT_SUCCESS;
+}
+
+extern "C" enum xrt_input_provider_presence
+ul_get_presence(void)
+{
+	return (enum xrt_input_provider_presence)g_ul_presence;
 }

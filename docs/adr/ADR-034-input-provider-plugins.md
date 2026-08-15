@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Accepted (Phase 1 implemented — #823)
+**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*)
 **Date:** 2026-08-02
 
 ## Context
@@ -57,13 +57,16 @@ without vtable changes). Devices are ordinary `xrt_device`s: pose via
 haptics via `set_output`. The provider owns its own threads and transport.
 
 **Role arbitration:** the system builder loads input providers before the
-qwerty fallback. If a provider supplies a left/right pair, it claims
-`xrt_system_roles`; qwerty still registers (debug value) but does not claim
-the hand roles. A registry override (`HKLM\Software\DisplayXR\Input\
-ForceQwerty`) forces the fallback for debugging — a registry gate, not an
-env var, per project convention. v1 activates a **single provider**
-(first successful probe in ProbeOrder wins, exactly like the DP loader);
-multi-provider composition is deferred.
+qwerty fallback. If a provider supplies a left/right pair *and its
+hardware is actually present*, it claims `xrt_system_roles`; qwerty still
+registers (debug value) and takes the hand roles whenever the provider
+does not — see *Amendment 1* for the presence gate, which replaced the
+original unconditional "provider wins" rule. A registry override
+(`HKLM\Software\DisplayXR\Input\ForceQwerty`) forces the fallback for
+debugging — a registry gate, not an env var, per project convention. v1
+activates a **single provider** (first successful probe in ProbeOrder
+wins, exactly like the DP loader); multi-provider composition is
+deferred.
 
 **Hand-tracking role arbitration (#825 Tier 2):** the same pass also fills
 the static hand-tracking roles
@@ -108,3 +111,106 @@ ABI, not the socket.
 - Costs: a second loader path to maintain (mitigated by sharing plumbing),
   a second ABI to police under ADR-020, and an arbitration policy in the
   builder that must stay predictable as providers multiply.
+
+## Amendment 1 — Role arbitration is presence-gated and dynamic (2026-08-15)
+
+**Status:** Accepted. Supersedes the "provider wins for the process
+lifetime" reading of *Role arbitration* above.
+
+### What was wrong
+
+Phase 1 arbitrated **once, at system build**, and asked only "did a
+provider create devices". Nothing anywhere asked whether the hardware
+behind those devices existed. The consequences were not hypothetical —
+both were observed on a dev box after #825 landed:
+
+- The Ultraleap provider creates its devices whether or not a Leap Motion
+  is plugged in (`LeapOpenConnection` is asynchronous and succeeds against
+  a service with no device). Registered-but-unplugged therefore displaced
+  qwerty permanently and the user had **no controllers at all** — the
+  regression was worst for hosted and legacy WebXR apps, which have no
+  window of their own and depend on the qwerty fallback.
+- With Ultraleap disabled, ProbeOrder fell through to `sim_input`, whose
+  synthetic motion pattern then drove the hand roles: **phantom
+  controllers** sweeping through the scene with nothing behind them.
+
+The deeper problem was that `xrt_input_plugin_iface` had no way to ask
+the question. `probe()` answers "should I be loaded", which is a
+registration decision made once; there was no liveness signal at all.
+
+### Decision
+
+1. **A liveness slot on the ABI.** `xrt_input_plugin_iface::get_presence`
+   returns `xrt_input_provider_presence`
+   (`UNKNOWN` / `ABSENT` / `PRESENT`) — a non-blocking read of state the
+   provider's own transport thread maintains. Appended at the end of the
+   vtable under `struct_size` cover, so this is **additive**: the API
+   major stays 1 and providers built before it keep loading. A NULL slot
+   (or a `struct_size` that predates it) means "assume present", which is
+   exactly the Phase-1 behaviour, so no provider is broken by the change.
+   `UNKNOWN` is read as *not yet present* — a provider that can never
+   tell should leave the slot NULL rather than return it.
+
+   Presence is deliberately NOT "is a hand currently visible". Hardware
+   that is attached but sees nothing reports `PRESENT` and simply
+   deactivates its inputs; making an empty tracking volume flip the roles
+   would bounce controllers back to qwerty every time the user's hands
+   left the frame.
+
+2. **Roles become dynamic; devices do not.** Both candidate pairs — the
+   provider's and qwerty's — are created once at system build and both
+   stay in `xrt_system_devices::xdevs`, exactly as before. Only the
+   *role assignment* moves. `target_input_arbiter.c` installs its own
+   `xrt_system_devices::get_roles`, which re-reads presence and points
+   `xrt_system_roles::left` / `::right` at whichever pair should own the
+   hands, bumping `generation_id` on each flip.
+
+   This answers "re-evaluate per app start" without inventing a
+   session-create hook: the OpenXR state tracker already re-reads roles in
+   `xrSyncActions`, rebinds actions and queues
+   `XrEventDataInteractionProfileChanged` when the generation moves, and
+   the IPC layer already forwards `get_roles` to the service. So
+   arbitration is re-run per app start **and** mid-session on plug/unplug,
+   over IPC too, with no new plumbing and nothing to poll.
+
+   The **static** hand-tracking roles are not arbitrated — they cannot be,
+   by the `xrt_system_devices` contract, and there is nothing to arbitrate
+   with: qwerty has no hand tracking. An absent optical tracker reports
+   inactive joints, which is what `XR_EXT_hand_tracking` expects.
+
+3. **`sim_input` leaves the product path.** It was a #825 debugging aid.
+   Its `probe()` now declines unless `DXR_SIM_INPUT` is set in the
+   environment, so registration alone can no longer put synthetic
+   controllers in front of a user, and `register_dev_plugin.bat input`
+   requires the literal `sim` argument instead of defaulting to it. An
+   env var rather than the usual registry gate on purpose: this is a
+   per-run developer switch, not machine configuration.
+
+4. **Absence is not a fault.** `displayxr-cli selftest` treats "provider
+   registered but its hardware is absent" and "every provider declined"
+   as passes — qwerty holding the roles is the correct outcome in both.
+   Only a provider that could not be *dispatched* (missing entry point,
+   ABI-major mismatch) still fails, which the loader now reports
+   separately from a clean decline.
+
+### Consequences
+
+- **The fallback is real again.** Alt/Ctrl + mouse controller actuation
+  (`qwerty_win32.c`) is restored for every app class that relies on it.
+- **Interaction profiles change at runtime.** qwerty is
+  `XRT_DEVICE_WMR_CONTROLLER`, most providers are
+  `XRT_DEVICE_SIMPLE_CONTROLLER`, so a flip is a genuine profile change.
+  That path already existed for dynamic roles; this is its first
+  in-tree producer, and apps that ignore
+  `XrEventDataInteractionProfileChanged` will notice.
+- **Providers own an honest presence answer.** A provider that reports
+  `PRESENT` unconditionally is back to the Phase-1 failure mode. This is
+  now the main thing to check when onboarding an input vendor.
+- Interaction with #941 (the Ultraleap idle-disconnect watchdog): the
+  watchdog now only fires while presence is `PRESENT`. With no hardware
+  there is no tracking model to stop paying for, and staying connected is
+  what lets the provider *see* a device get plugged in — a closed
+  connection can never report one, so presence would otherwise pin at
+  `ABSENT` forever. Across an idle disconnect presence is frozen, not
+  cleared: the runtime closed the connection, the user did not unplug the
+  device.

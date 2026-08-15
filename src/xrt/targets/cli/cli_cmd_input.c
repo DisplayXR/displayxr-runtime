@@ -138,23 +138,39 @@ cmd_haptic_test(int argc, const char **argv)
 		return 1;
 	}
 
+	// Roles are re-resolved every iteration, not captured once: they are
+	// arbitrated against provider presence (`target_input_arbiter.h`) and
+	// for net_input "present" means "a feeder is connected" — which
+	// normally happens AFTER the runtime is up, i.e. after this loop has
+	// already started. Re-reading is also what a real app does (every
+	// xrSyncActions), so this doubles as a live check of the flip.
 	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
-	xrt_system_devices_get_roles(h.xsysd, &roles);
-	struct xrt_device *left =
-	    (roles.left >= 0 && (uint32_t)roles.left < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.left] : NULL;
-	struct xrt_device *right =
-	    (roles.right >= 0 && (uint32_t)roles.right < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.right] : NULL;
-	if (left == NULL || right == NULL) {
-		P("FAIL: no left/right hand-role devices (left=%p right=%p).\n", (void *)left, (void *)right);
-		cli_query_teardown(&h);
-		return 1;
-	}
+	struct xrt_device *left = NULL;
+	struct xrt_device *right = NULL;
 
-	P("Firing haptics on '%s' + '%s' for %d s (2 Hz)...\n", left->str, right->str, seconds);
+	P("Firing haptics on the hand-role devices for %d s (2 Hz)...\n", seconds);
 
 	struct xrt_output_value value = {0};
 	uint32_t tracked_samples = 0;
+	uint32_t fired = 0;
+	uint64_t last_generation = 0;
 	for (int i = 0; i < seconds * 2; i++) {
+		xrt_system_devices_get_roles(h.xsysd, &roles);
+		left =
+		    (roles.left >= 0 && (uint32_t)roles.left < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.left] : NULL;
+		right = (roles.right >= 0 && (uint32_t)roles.right < h.xsysd->xdev_count) ? h.xsysd->xdevs[roles.right]
+		                                                                          : NULL;
+		if (roles.generation_id != last_generation) {
+			last_generation = roles.generation_id;
+			P("roles (generation %u): left='%s' right='%s'\n", (unsigned)roles.generation_id,
+			  left != NULL ? left->str : "<none>", right != NULL ? right->str : "<none>");
+		}
+		if (left == NULL || right == NULL) {
+			os_nanosleep(500 * 1000 * 1000);
+			continue;
+		}
+		fired++;
+
 		value.vibration.amplitude = 0.25f + 0.75f * (float)(i % 4) / 3.0f;
 		value.vibration.frequency = 160.0f;
 		value.vibration.duration_ns = 100 * 1000 * 1000;
@@ -176,8 +192,12 @@ cmd_haptic_test(int argc, const char **argv)
 		os_nanosleep(500 * 1000 * 1000);
 	}
 
-	P("Done — fired %d haptic event(s) per hand; %u tracked pose sample(s).\n", seconds * 2, tracked_samples);
+	P("Done — fired %u haptic event(s) per hand; %u tracked pose sample(s).\n", fired, tracked_samples);
 	cli_query_teardown(&h);
+	if (fired == 0) {
+		P("FAIL: the hand roles were never populated during the window.\n");
+		return 1;
+	}
 	return 0;
 }
 

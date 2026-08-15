@@ -20,10 +20,21 @@
  *      space-relative application).
  *
  * Injection overrides whatever device owns the hand roles (overrides are keyed
- * by source path at the oxr level), so the smoke is valid both with an input
- * provider registered (sim-input square-waving select underneath) and with
- * qwerty defaults. Prints CTS-SMOKE lines and exits: 0 = all pass,
+ * by source path at the oxr level), so the smoke does not care WHICH provider
+ * is underneath. Prints CTS-SMOKE lines and exits: 0 = all pass,
  * 1 = bool/actions failure, 2 = only the pose check failed.
+ *
+ * PRECONDITION — an input provider whose hardware is PRESENT must hold the
+ * hand roles. Overrides still need an action bound to a source path, and this
+ * is an external-window (_handle) session: those deliberately exclude the
+ * qwerty emulated controllers from profile binding (oxr_input.c
+ * `oxr_find_profiles_from_roles`, since 2026-03-10 / bbc115683). With no
+ * present provider there is no interaction profile at all, and every check
+ * below fails for that single reason. Since ADR-034 Amendment 1 the runtime
+ * hands the hand roles to qwerty whenever the provider's hardware is absent,
+ * so on a box with the tracker unplugged this probe needs either the hardware
+ * attached or `DXR_SIM_INPUT=1` with sim-input registered.
+ * `displayxr-cli selftest` reports which state the box is in.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -349,6 +360,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     xrPathToString(xr.instance, ips.interactionProfile, sizeof(buf), &len, buf);
                     Check(ips.interactionProfile == profilePath, "current interaction profile (left)", buf);
                 } else {
+                    // Almost always a MISSING PRECONDITION rather than a
+                    // runtime bug — see the file comment. No profile is bound,
+                    // so every check below fails for this one reason.
+                    LOG_ERROR(
+                        "smoke: PRECONDITION — no interaction profile is bound. This probe needs an input "
+                        "provider whose hardware is PRESENT to hold the hand roles (ADR-034 Amendment 1); "
+                        "qwerty cannot serve an external-window session. Attach the tracker, or register "
+                        "sim-input (scripts\\register_dev_plugin.bat input sim) and run with "
+                        "DXR_SIM_INPUT=1. `displayxr-cli selftest` reports the box's provider state.");
                     Check(false, "current interaction profile (left)", "xrGetCurrentInteractionProfile failed/NULL");
                 }
                 XrResult r1 = g_pfnSetActive(xr.session, profilePath, g_act.handPaths[0], XR_TRUE);

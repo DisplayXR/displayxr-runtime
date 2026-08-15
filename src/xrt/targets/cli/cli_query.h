@@ -117,16 +117,22 @@ struct cli_query_result
 	struct xrt_dp_local_zone_caps zone_caps;
 
 	/* Input-provider checks (ADR-034 / #823). Absence never fails: with
-	 * no provider registered — or the ForceQwerty override set — the
-	 * fields stay "not evaluated" and the verdict is untouched. Only a
-	 * registered, non-overridden provider that fails to produce
-	 * left+right motion-controller role devices (claimed by the
-	 * provider, valid `xrt_device_name` interaction profile) flips the
-	 * verdict to BAD_INPUT. */
-	int input_provider_count;   //!< registered providers (enumerated, unloaded)
-	bool input_force_qwerty;    //!< ForceQwerty override set
-	bool input_provider_active; //!< a provider claimed the system
-	bool input_evaluated;       //!< checks ran (provider registered, no override)
+	 * no provider registered — or the ForceQwerty override set, or the
+	 * provider's hardware simply not plugged in — the fields stay "not
+	 * evaluated" and the verdict is untouched. Only a registered,
+	 * non-overridden provider whose hardware IS present and which then
+	 * fails to produce left+right motion-controller role devices (valid
+	 * `xrt_device_name` interaction profile) flips the verdict to
+	 * BAD_INPUT.
+	 *
+	 * "Provider registered but its hardware is absent" is the normal
+	 * state of any box whose tracker is unplugged, and it is a PASS: the
+	 * arbiter hands the hand roles to qwerty, which is exactly right. */
+	int input_provider_count;    //!< registered providers (enumerated, unloaded)
+	bool input_force_qwerty;     //!< ForceQwerty override set
+	bool input_provider_active;  //!< a provider claimed the system
+	bool input_provider_present; //!< …and its hardware is there right now
+	bool input_evaluated;        //!< checks ran (provider present, no override)
 	bool input_left_ok;
 	bool input_right_ok;
 	char input_provider_id[64];

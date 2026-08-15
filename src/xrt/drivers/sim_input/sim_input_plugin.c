@@ -12,8 +12,18 @@
  *
  * sim_input has no hardware to probe — it is the vendor-neutral test
  * provider, registered at ProbeOrder 200 so any real tracking vendor
- * out-ranks it. Probe therefore always succeeds with a NULL instance
- * handle; the devices are self-contained (`sim_input_device.c`).
+ * out-ranks it. The devices are self-contained (`sim_input_device.c`).
+ *
+ * **NOT a product path.** This provider synthesises a fixed controller
+ * motion pattern; left registered and un-gated it silently displaces the
+ * qwerty fallback and the user sees phantom controllers sweeping through
+ * the scene with nothing driving them. It was a #825 debugging aid, so
+ * `probe()` now declines unless `DXR_SIM_INPUT=1` is set in the
+ * environment — being registered is no longer enough. (Env var rather
+ * than the usual registry gate on purpose: this is a developer switch
+ * flipped per-run, not machine configuration. Note the process-level
+ * caveat — the runtime DLL has its own static-CRT environment block, so
+ * set it before launching the host process, not from a run script.)
  *
  * @author David Fattal
  * @ingroup drv_sim_input
@@ -23,9 +33,14 @@
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 
+#include "util/u_logging.h"
+
 #include "sim_input_interface.h"
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 
 /*
@@ -34,13 +49,36 @@
  *
  */
 
+/*!
+ * Is the `DXR_SIM_INPUT` opt-in set? Anything but unset / empty / "0" /
+ * "false" / "no" / "off" counts as on.
+ */
+static bool
+sim_input_opted_in(void)
+{
+	const char *v = getenv("DXR_SIM_INPUT");
+	if (v == NULL || v[0] == '\0') {
+		return false;
+	}
+	return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0 && strcmp(v, "off") != 0;
+}
+
 static xrt_result_t
 sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 {
-	/* Always claims the system — the vendor-neutral test provider. No
-	 * per-instance state; ProbeOrder=200 (set at registration) ranks it
-	 * after every real-hardware provider. */
 	*out_inst = NULL;
+
+	/* Registration alone must NOT put synthetic controllers in front of
+	 * the user — see the file comment. Decline cleanly so the loader
+	 * moves on and, with no other provider, qwerty keeps the hand roles.
+	 * No per-instance state; ProbeOrder=200 (set at registration) still
+	 * ranks this after every real-hardware provider when it IS opted in. */
+	if (!sim_input_opted_in()) {
+		U_LOG_I("sim-input: declining — set DXR_SIM_INPUT=1 to enable the simulated input provider.");
+		return XRT_ERROR_PROBER_NOT_SUPPORTED;
+	}
+
+	U_LOG_W("sim-input: DXR_SIM_INPUT set — SIMULATED controllers will drive the hand roles.");
 	return XRT_SUCCESS;
 }
 
@@ -83,6 +121,17 @@ sim_input_plugin_destroy(struct xrt_input_plugin_instance *inst)
 	 * their own xrt_device::destroy. */
 }
 
+static enum xrt_input_provider_presence
+sim_input_plugin_get_presence(struct xrt_input_plugin_instance *inst)
+{
+	(void)inst;
+	/* Simulated hardware is present exactly when it was asked for, and
+	 * probe() already enforced the opt-in — so once we are loaded at all,
+	 * the answer is yes, and the roles stay with us rather than bouncing
+	 * to qwerty. */
+	return XRT_INPUT_PROVIDER_PRESENCE_PRESENT;
+}
+
 
 /*
  *
@@ -102,6 +151,8 @@ static struct xrt_input_plugin_iface g_sim_input_iface = {
     .probe = sim_input_plugin_probe,
     .create_devices = sim_input_plugin_create_devices,
     .destroy = sim_input_plugin_destroy,
+
+    .get_presence = sim_input_plugin_get_presence,
 };
 
 

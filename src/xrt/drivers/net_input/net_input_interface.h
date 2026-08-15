@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -46,6 +47,20 @@ struct xrt_device;
  */
 xrt_result_t
 net_input_create_devices(uint16_t port, struct xrt_device **out_left, struct xrt_device **out_right);
+
+/*!
+ * Is a feeder currently connected? For a wire-protocol provider the peer
+ * IS the hardware, so this backs
+ * @ref xrt_input_plugin_iface::get_presence: with nothing feeding poses
+ * the runtime gives the hand roles back to the qwerty fallback instead of
+ * leaving the user with two frozen controllers.
+ *
+ * Non-blocking single-word read of state the hub thread maintains.
+ *
+ * @ingroup drv_net_input
+ */
+enum xrt_input_provider_presence
+net_input_get_presence(void);
 
 #ifdef __cplusplus
 }

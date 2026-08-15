@@ -184,6 +184,11 @@ fi
 # Input-provider plug-in (ADR-034 / #823): the simulated motion
 # controllers. Same discovery dir; the `-input-provider.json` suffix
 # routes the manifest to the input loader instead of the DP loader.
+#
+# Staging the manifest is safe on its own: sim-input's probe() declines
+# unless DXR_SIM_INPUT is set in the environment (ADR-034 Amendment 1), so
+# a dev tree does NOT get synthetic controllers by default — qwerty keeps
+# the hand roles until you ask for the simulator.
 SIMINPUT_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.dylib" -type f | head -1)
 if [ -n "$SIMINPUT_PLUGIN" ] && [ -f "$SIMINPUT_PLUGIN" ]; then
   cp "$SIMINPUT_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"

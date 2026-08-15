@@ -19,6 +19,7 @@
 #include "target_builder_interface.h"
 #include "target_builder_input_provider.h"
 #include "target_builder_qwerty_input.h"
+#include "target_input_arbiter.h"
 #include "target_plugin_loader.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -89,7 +90,9 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		}
 	}
 	if (head == NULL) {
-		U_LOG_E("sim_display builder: no display-processor plug-in created a device. Verify a DisplayProcessor plug-in DLL is registered (HKLM\\Software\\DisplayXR\\DisplayProcessors\\* on Windows).");
+		U_LOG_E(
+		    "sim_display builder: no display-processor plug-in created a device. Verify a DisplayProcessor "
+		    "plug-in DLL is registered (HKLM\\Software\\DisplayXR\\DisplayProcessors\\* on Windows).");
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
@@ -100,14 +103,21 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	ubrh->head = head;
 
 	// Input-provider plug-ins run BEFORE qwerty (ADR-034 arbitration):
-	// a provider's left/right motion controllers claim the hand roles;
-	// qwerty below then only fills the roles left empty. The head-pose
-	// path (set_pose_source) is untouched — providers never supply a head.
+	// a provider's left/right motion controllers take the hand roles IF
+	// their hardware is actually present; qwerty below then fills the
+	// roles left empty. The head-pose path (set_pose_source) is
+	// untouched — providers never supply a head.
 	t_builder_add_input_provider_devices(xsysd, ubrh, U_LOGGING_INFO);
 
 	// Add qwerty keyboard/mouse input devices (controllers + HMD for pose).
 	struct xrt_device *qwerty_hmd = NULL;
 	t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, &qwerty_hmd);
+
+	// Both candidate pairs are now in the device list, so their indices
+	// are final: install the dynamic role arbitration. From here the
+	// left/right roles re-resolve against provider presence on every
+	// xrSyncActions — per app start, and mid-session on plug/unplug.
+	t_input_arbiter_install(xsysd);
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	// Configure qwerty HMD pose and delegate head's pose to qwerty for
@@ -128,8 +138,7 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		// drive the WASD camera scaling. Sourced from the plug-in iface.
 		float screen_height_m = 0.0f;
 		float nominal_z_m = 0.0f;
-		if (plugin != NULL &&
-		    plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
+		if (plugin != NULL && plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
 		    plugin->get_display_info != NULL) {
 			struct xrt_plugin_display_info pdi = {0};
 			pdi.struct_size = (uint32_t)sizeof(pdi);
@@ -147,8 +156,7 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 
 		// Bind the qwerty HMD as the head's external pose source.
 		// Iface-routed; the plug-in owns the vendor-private cast.
-		if (plugin != NULL &&
-		    plugin->struct_size > offsetof(struct xrt_plugin_iface, set_pose_source) &&
+		if (plugin != NULL && plugin->struct_size > offsetof(struct xrt_plugin_iface, set_pose_source) &&
 		    plugin->set_pose_source != NULL) {
 			plugin->set_pose_source(target_plugin_get_active_instance(), head, qwerty_hmd);
 		}

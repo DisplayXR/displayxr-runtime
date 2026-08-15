@@ -50,6 +50,27 @@ static const struct xrt_input_plugin_iface *g_input_active_iface = NULL;
 static struct xrt_input_plugin_instance *g_input_active_instance = NULL;
 
 /*!
+ * Outcome tally of the one discovery scan, for
+ * @ref target_input_plugin_get_scan_result. "Nobody claimed the system"
+ * is a normal state — every provider may legitimately decline (no
+ * hardware of its type, or an opt-in like sim-input's `DXR_SIM_INPUT`
+ * left unset) — so the self-test must not read it as a fault. What IS a
+ * fault is a provider that could not even be dispatched: a missing entry
+ * point, a failed load, or an ABI-major mismatch. Counting the two
+ * separately is what lets `displayxr-cli selftest` tell them apart.
+ */
+static int g_input_scan_declined = 0;
+static int g_input_scan_failed = 0;
+
+/*!
+ * Set by `input_try_load_one` when it returned NULL because the provider
+ * declined cleanly (`XRT_ERROR_PROBER_NOT_SUPPORTED` from `negotiate` or
+ * `probe`) rather than because it could not be dispatched. Read once per
+ * entry by `input_discover_active`; the loader scan is single-threaded.
+ */
+static bool g_input_last_declined = false;
+
+/*!
  * Maximum number of providers we enumerate. Matches the DP loader's
  * bound — a handful in practice.
  */
@@ -220,6 +241,7 @@ static const struct xrt_input_plugin_iface *
 input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+	g_input_last_declined = false;
 
 	// Same host-crash breadcrumb + #434 sanitizer as the DP loader —
 	// LoadLibrary of a provider runs host DLL-notification code too.
@@ -250,6 +272,7 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	uint32_t plugin_version = 0;
 	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
 	if (xret != XRT_SUCCESS || iface == NULL) {
+		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
 		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
 		        (void *)iface);
 		FreeLibrary(dll);
@@ -270,6 +293,7 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("input plugin loader:   %s: probe declined (no matching hardware).", e->id);
+			g_input_last_declined = true;
 			FreeLibrary(dll);
 			return NULL;
 		}
@@ -317,9 +341,17 @@ input_discover_active(struct xrt_input_plugin_instance **out_inst)
 		if (iface != NULL) {
 			return iface;
 		}
+		if (g_input_last_declined) {
+			g_input_scan_declined++;
+		} else {
+			g_input_scan_failed++;
+		}
 	}
 
-	U_LOG_I("input plugin loader: no registered provider claimed the system — qwerty keeps the hand roles.");
+	U_LOG_I(
+	    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) — "
+	    "qwerty keeps the hand roles.",
+	    g_input_scan_declined, g_input_scan_failed);
 	return NULL;
 }
 
@@ -602,6 +634,7 @@ static const struct xrt_input_plugin_iface *
 input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_instance **out_inst)
 {
 	*out_inst = NULL;
+	g_input_last_declined = false;
 
 	/* RTLD_LOCAL keeps the provider's symbols private; aux symbols
 	 * resolve via the runtime dylib/.so already in the process. */
@@ -630,6 +663,7 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	uint32_t plugin_version = 0;
 	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
 	if (xret != XRT_SUCCESS || iface == NULL) {
+		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
 		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
 		        (void *)iface);
 		dlclose(handle);
@@ -650,6 +684,7 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("input plugin loader:   %s: probe declined (no matching hardware).", e->id);
+			g_input_last_declined = true;
 			dlclose(handle);
 			return NULL;
 		}
@@ -691,9 +726,17 @@ input_discover_active(struct xrt_input_plugin_instance **out_inst)
 		if (iface != NULL) {
 			return iface;
 		}
+		if (g_input_last_declined) {
+			g_input_scan_declined++;
+		} else {
+			g_input_scan_failed++;
+		}
 	}
 
-	U_LOG_I("input plugin loader: no registered provider claimed the system — qwerty keeps the hand roles.");
+	U_LOG_I(
+	    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) — "
+	    "qwerty keeps the hand roles.",
+	    g_input_scan_declined, g_input_scan_failed);
 	return NULL;
 }
 
@@ -800,4 +843,16 @@ target_input_plugin_get_active_instance(void)
 {
 	(void)target_input_plugin_get_active();
 	return g_input_active_instance;
+}
+
+void
+target_input_plugin_get_scan_result(int *out_declined, int *out_failed)
+{
+	(void)target_input_plugin_get_active();
+	if (out_declined != NULL) {
+		*out_declined = g_input_scan_declined;
+	}
+	if (out_failed != NULL) {
+		*out_failed = g_input_scan_failed;
+	}
 }

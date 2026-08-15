@@ -37,6 +37,7 @@
 
 #include "xrt/xrt_results.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -104,6 +105,17 @@ struct xrt_device;
 #define XRT_INPUT_PLUGIN_EXPORT
 #endif
 
+/*!
+ * Guard for a vtable slot that was APPENDED after a provider may have
+ * been compiled (ADR-020): true only when the provider's reported
+ * `struct_size` actually covers @p FIELD *and* the provider filled it in.
+ * Every runtime-side dispatch through an appended slot must go through
+ * this — reading past `struct_size` is undefined by contract.
+ */
+#define XRT_INPUT_PLUGIN_IFACE_HAS(IFACE, FIELD)                                                                       \
+	((IFACE) != NULL && (IFACE)->struct_size > offsetof(struct xrt_input_plugin_iface, FIELD) &&                   \
+	 (IFACE)->FIELD != NULL)
+
 
 /*
  *
@@ -117,6 +129,51 @@ struct xrt_device;
  * out-param and passes it back to every subsequent vtable call.
  */
 struct xrt_input_plugin_instance;
+
+
+/*
+ *
+ * Liveness.
+ *
+ */
+
+/*!
+ * Is the provider's hardware/transport actually there RIGHT NOW?
+ *
+ * `probe()` answers "should I be loaded at all" once, at
+ * `xrCreateInstance`. This answers the different, *continuous* question
+ * the role arbiter asks every time it runs: is there real hardware
+ * behind these devices at this instant. A Leap Motion can be unplugged
+ * five minutes into a session and plugged back in later; the runtime
+ * re-reads this and moves the hand roles between the provider and the
+ * qwerty fallback accordingly (ADR-034 "Presence-gated role
+ * arbitration").
+ *
+ * Distinct from "is a hand currently visible": a device whose hardware
+ * is PRESENT but which sees nothing simply reports inactive inputs. Do
+ * NOT report ABSENT for an empty tracking volume — that would bounce the
+ * roles back to qwerty every time the user's hands leave the frame.
+ *
+ * @ingroup xrt_iface
+ */
+enum xrt_input_provider_presence
+{
+	/*!
+	 * The provider cannot determine presence right now — typically
+	 * still starting up. The arbiter treats this as NOT present, so a
+	 * provider that can never tell should leave
+	 * @ref xrt_input_plugin_iface::get_presence NULL instead of
+	 * returning this; that keeps the pre-presence behaviour (the
+	 * provider holds the roles unconditionally).
+	 */
+	XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN = 0,
+
+	//! Hardware/transport is not there — the runtime falls back to qwerty.
+	XRT_INPUT_PROVIDER_PRESENCE_ABSENT = 1,
+
+	//! Hardware/transport is there — the provider holds the hand roles.
+	XRT_INPUT_PROVIDER_PRESENCE_PRESENT = 2,
+};
 
 
 /*
@@ -273,6 +330,28 @@ struct xrt_input_plugin_iface
 	void (*destroy)(struct xrt_input_plugin_instance *inst);
 
 	/* Append-only below this line, forever (ADR-020). */
+
+	/*!
+	 * Snapshot of whether the provider's hardware is actually present —
+	 * see @ref xrt_input_provider_presence. Appended under `struct_size`
+	 * cover, so the API major stays 1 and providers built before it
+	 * still load; the runtime guards every call with
+	 * @ref XRT_INPUT_PLUGIN_IFACE_HAS.
+	 *
+	 * Called from the runtime's role arbiter, which runs on the
+	 * `xrSyncActions` path (and over IPC, per client, per frame). It
+	 * MUST therefore be non-blocking and allocation-free: return a
+	 * value your own transport thread maintains, never perform
+	 * discovery or I/O here.
+	 *
+	 * May be called before, after, and between `create_devices()`
+	 * calls, and with a NULL @p inst if that is what `probe()` produced.
+	 *
+	 * Leaving this NULL is legal and means "assume present" — the
+	 * pre-presence ADR-034 behaviour where the provider holds the hand
+	 * roles for as long as it is loaded.
+	 */
+	enum xrt_input_provider_presence (*get_presence)(struct xrt_input_plugin_instance *inst);
 };
 
 
