@@ -42,6 +42,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <exception> // std::exception — wnd_proc / window_thread_func catch-alls
+
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
 
@@ -581,8 +583,8 @@ static bool input_is_suppressed(struct comp_d3d11_window *w);
  * Uses InterlockedExchange to communicate state changes to the compositor
  * thread. No D3D11 operations happen here.
  */
-static LRESULT CALLBACK
-wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+static LRESULT
+wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	struct comp_d3d11_window *w = (struct comp_d3d11_window *)GetPropW(hWnd, szWindowData);
 
@@ -1349,6 +1351,46 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 }
 
 /*!
+ * Guarded window procedure — the real handler is wnd_proc_inner().
+ *
+ * A C++ exception must NEVER leave a window proc. On x64 Windows a window proc
+ * runs inside a kernel-mode callback, and an exception unwinding across that
+ * boundary does not reach a try/catch further up the thread — the process is
+ * terminated outright, silently: no WER report, no crash dump, and no log
+ * shutdown line. That is exactly the signature of the intermittent
+ * service death seen when a standalone HOSTED client tears down while the
+ * panel is in 3D: the last thing in the log is this thread's own
+ * "exiting" line, and the process is simply gone.
+ *
+ * This proc reaches vendor code on that path — WM_CLOSE calls
+ * xrt_display_processor_d3d11_request_display_mode() straight into the display
+ * processor, and the SR SDK is known to throw from its intrinsics. Any throw
+ * anywhere under here used to take the whole service with it, killing every
+ * OTHER client's session as collateral.
+ *
+ * Swallow it at the boundary instead: log once and fall back to
+ * DefWindowProcW. A dropped message is a cosmetic glitch; a dead service is
+ * not. Mirrors capture_render_thread_func()'s catch-all in
+ * comp_d3d11_service.cpp, which documents the same failure mode.
+ */
+static LRESULT CALLBACK
+wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	try {
+		return wnd_proc_inner(hWnd, message, wParam, lParam);
+	} catch (std::exception const &e) {
+		U_LOG_E("D3D11 window: uncaught std::exception in wnd_proc (msg=0x%04X): %s — "
+		        "message dropped, service kept alive",
+		        message, e.what());
+	} catch (...) {
+		U_LOG_E("D3D11 window: uncaught non-std exception in wnd_proc (msg=0x%04X) — "
+		        "message dropped, service kept alive",
+		        message);
+	}
+	return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+/*!
  * Two-party cleanup for @ref comp_d3d11_window. Both the window thread (when it
  * exits) and @ref comp_d3d11_window_destroy call this exactly once. The second
  * caller (vote reaches 2) frees the struct and closes its handles; the first
@@ -1388,11 +1430,9 @@ window_release(struct comp_d3d11_window *w)
  * WM_DXR_DESTROY_WINDOW (via comp_d3d11_window_destroy); a user WM_CLOSE only
  * sets should_exit and lets that orderly path run.
  */
-static DWORD WINAPI
-window_thread_func(LPVOID param)
+static DWORD
+window_thread_body(struct comp_d3d11_window *w)
 {
-	struct comp_d3d11_window *w = (struct comp_d3d11_window *)param;
-
 	U_LOG_W("D3D11 window thread: started (tid=%lu)", GetCurrentThreadId());
 
 	// Register window class on this thread
@@ -1517,6 +1557,37 @@ window_thread_func(LPVOID param)
 	U_LOG_W("D3D11 window thread: exiting");
 	window_release(w);
 	return 0;
+}
+
+/*!
+ * Thread entry — second line of defence behind wnd_proc()'s catch-all.
+ *
+ * A C++ exception escaping a thread entry point calls std::terminate(), which
+ * kills the whole service silently. wnd_proc() already contains the throws
+ * that actually cross the kernel callback boundary; this guard covers the rest
+ * of the body (window class registration, DestroyWindow, the cleanup tail).
+ *
+ * On the exception path we still vote via window_release(): every normal exit
+ * of window_thread_body() votes exactly once, and an exception means none of
+ * those votes ran, so voting here keeps the two-party cleanup balanced and
+ * stops comp_d3d11_window_destroy() from leaking @p w.
+ */
+static DWORD WINAPI
+window_thread_func(LPVOID param)
+{
+	struct comp_d3d11_window *w = (struct comp_d3d11_window *)param;
+	try {
+		return window_thread_body(w);
+	} catch (std::exception const &e) {
+		U_LOG_E("D3D11 window thread: uncaught std::exception: %s — thread stopped, "
+		        "service kept alive",
+		        e.what());
+	} catch (...) {
+		U_LOG_E("D3D11 window thread: uncaught non-std exception — thread stopped, "
+		        "service kept alive");
+	}
+	window_release(w);
+	return 1;
 }
 
 /*
