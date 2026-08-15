@@ -310,13 +310,20 @@ jobs:
           reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
           # ADR-034 / #823: also register the sim-input provider so the
           # self-test exercises the input-provider path — discovery, builder
-          # arbitration (provider claims left/right over qwerty), and the
-          # role/profile assertions all run hardware-free.
+          # arbitration (a PRESENT provider claims left/right over qwerty), and
+          # the role/profile assertions all run hardware-free.
           $inputPlugin = (Resolve-Path "_package/bin/plugins/DisplayXR-SimInput.dll").Path
           $inputKey = "HKLM\Software\DisplayXR\InputProviders\sim-input"
           reg add $inputKey /v Binary /t REG_SZ /d "$inputPlugin" /f | Out-Null
           reg add $inputKey /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
           reg add $inputKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Input" /f | Out-Null
+          # Registration is no longer enough: since ADR-034 Amendment 1
+          # sim-input's probe() declines unless DXR_SIM_INPUT is set, so that a
+          # stray registration on a dev box can't put synthetic controllers in
+          # front of a user. CI *wants* the simulated provider, so it opts in
+          # explicitly — and that keeps this gate meaningful, because the
+          # provider then reports PRESENT and must actually claim the roles.
+          $env:DXR_SIM_INPUT = "1"
           try {
             & $cli selftest
             $code = $LASTEXITCODE
@@ -377,6 +384,7 @@ jobs:
           } finally {
             reg delete $key /f | Out-Null
             reg delete $inputKey /f | Out-Null
+            Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
           }
           if ($code -ne 0) {
             Write-Host "::error::displayxr-cli headless gate failed (exit $code) — the runtime could not discover a display processor, reported invalid display info, or the per-display claim resolution was inconsistent. See the output above."
