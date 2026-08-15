@@ -115,10 +115,28 @@ No registered provider is not an error: the builder falls back to qwerty.
 
 In `target_builder_sim_display.c`:
 
+Arbitration is **presence-gated and dynamic** (ADR-034 *Amendment 1*). The
+devices are static — both candidate pairs are created once and both live
+in `xsysd->xdevs` — but which pair holds the hand roles is re-resolved for
+the life of the process.
+
 1. Input-provider loader runs **before** `t_builder_add_qwerty_input()`.
-2. If the active provider supplied a left/right pair, those devices claim
-   `xrt_system_roles.left/right` (and their `*_profile` fields). Qwerty
-   still registers as a device (debug value) but does not claim hand roles.
+2. If the active provider supplied a left/right pair **and reports
+   `XRT_INPUT_PROVIDER_PRESENCE_PRESENT`** (or predates the
+   `get_presence` slot, which means "assume present"), those devices hold
+   `xrt_system_roles.left/right` and their `*_profile` fields. Otherwise
+   qwerty holds them. Qwerty always registers as a device, so the roles
+   can come back to it.
+2a. `t_input_arbiter_install()` then replaces
+   `xrt_system_devices::get_roles` with the arbiter's, which re-reads
+   presence (rate-limited to ~250 ms) and bumps `generation_id` whenever
+   the assignment changes. The OpenXR state tracker picks that up in
+   `xrSyncActions` — rebinding actions and queueing
+   `XrEventDataInteractionProfileChanged` — and the IPC layer forwards
+   `get_roles` to the service, so this works for out-of-process clients
+   too. Net effect: arbitration is re-evaluated **per app start and
+   mid-session**, including a Leap unplugged (or plugged in) while apps
+   are running.
 3. Override: `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` (DWORD) on
    Windows; on POSIX a `force_qwerty` file in the per-user manifest dir
    (next to the DP loader's `preferred` file — first byte `'0'` = off,
@@ -135,13 +153,24 @@ In `target_builder_sim_display.c`:
    controller-derived; first claimant wins per role). These roles gate the
    whole `XR_EXT_hand_tracking` path — system support, tracker creation,
    joint locates. Providers without hand-tracking inputs leave them empty;
-   that is a valid configuration, never a failure.
+   that is a valid configuration, never a failure. These roles are
+   **static** by the `xrt_system_devices` contract and so are *not*
+   arbitrated: an absent optical tracker reports inactive joints, and
+   qwerty has no hand tracking to fall back to anyway.
+6. **`sim_input` is opt-in at run time.** Being registered is not enough
+   — its `probe()` declines unless `DXR_SIM_INPUT` is set in the
+   environment of the process loading the runtime. It synthesises a fixed
+   motion pattern, so an un-gated registration silently displaces the
+   qwerty fallback with phantom controllers. (Env var rather than the
+   usual registry gate on purpose: a per-run developer switch, not
+   machine configuration. Set it process-level — the runtime DLL has its
+   own static-CRT environment block.)
 
 ## 5. In-tree reference providers (planned)
 
 | Provider | Status | Purpose |
 |---|---|---|
-| `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input`. |
+| `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 

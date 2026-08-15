@@ -83,6 +83,24 @@ struct xrt_input_plugin_instance *
 target_input_plugin_get_active_instance(void);
 
 /*!
+ * Outcome of the (single, cached) discovery scan: how many registered
+ * providers DECLINED cleanly, and how many could not be dispatched at all.
+ *
+ * The distinction matters to diagnostics. "Nobody claimed the system" is
+ * a perfectly normal state — a provider declines when its hardware type
+ * isn't on the box, and sim-input declines unless `DXR_SIM_INPUT` is set
+ * — and then qwerty rightly keeps the hand roles. A provider that failed
+ * to LOAD (missing entry point, ABI-major mismatch) is a real fault worth
+ * failing a self-test over. Without this split the two are
+ * indistinguishable from outside the loader.
+ *
+ * Runs discovery on first call, like @ref target_input_plugin_get_active.
+ * Either out-param may be NULL.
+ */
+void
+target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
+
+/*!
  * Read the ForceQwerty debug override — `HKLM\Software\DisplayXR\Input\
  * ForceQwerty` (DWORD != 0) on Windows, a `force_qwerty` file in the
  * per-user manifest dir on POSIX (first byte '0' = off, anything else =

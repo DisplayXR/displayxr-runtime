@@ -75,14 +75,56 @@ for a device that binds multiple interaction profiles, and
 `sim_input_device.c` for the minimal single-profile
 (`khr/simple_controller`) case.
 
+## `get_presence` — the liveness slot (required in practice)
+
+```c
+enum xrt_input_provider_presence (*get_presence)(struct xrt_input_plugin_instance *inst);
+```
+
+Returns `XRT_INPUT_PROVIDER_PRESENCE_{UNKNOWN,ABSENT,PRESENT}`: is your
+hardware/transport there **right now**? `probe()` answers a different,
+one-shot question ("should I be loaded"); this one is re-asked for the
+life of the process and decides whether you or the qwerty fallback owns
+the hand roles (ADR-034 *Amendment 1*).
+
+Rules:
+
+- **Non-blocking and allocation-free.** It is called from the role
+  arbiter on the `xrSyncActions` path — per client, per frame, over IPC.
+  Return a value your own transport thread maintains; never do discovery
+  or I/O here. (The arbiter additionally rate-limits to ~250 ms, but do
+  not rely on that.)
+- **Presence is not visibility.** Hardware attached but seeing nothing is
+  `PRESENT` with inactive inputs. Reporting `ABSENT` because the user's
+  hands left the tracking volume makes the controllers flip to qwerty and
+  back continuously.
+- **`UNKNOWN` means "not yet"** — the arbiter treats it as not present.
+  If you can never determine presence, leave the slot NULL instead;
+  that means "assume present" and reproduces pre-amendment behaviour.
+- Appended under `struct_size` cover, so it is optional for ABI purposes
+  and the API major stays 1. The runtime guards every call with
+  `XRT_INPUT_PLUGIN_IFACE_HAS(iface, get_presence)`.
+- May be called before, after and between `create_devices()` calls, and
+  with a NULL `inst` if that is what `probe()` produced.
+
+In-tree examples: `ultraleap_provider.cpp` maintains it from LeapC
+`Device` / `DeviceLost` / `ConnectionLost` events; `net_input_hub.c` maps
+it to "a feeder is connected", since for a wire provider the peer *is*
+the hardware.
+
 ## Role arbitration (what the runtime does with the devices)
 
-`t_builder_add_input_provider_devices()` runs before the qwerty fallback:
-provider left/right devices claim `xrt_system_roles.left/right`; qwerty
-still registers its devices (debug value) but only claims a role the
-provider left empty. `HKLM\Software\DisplayXR\Input\ForceQwerty` (POSIX:
-a `force_qwerty` file next to the manifests) skips providers entirely.
-Details: discovery spec §4.
+`t_builder_add_input_provider_devices()` runs before the qwerty fallback,
+and **both** pairs end up in `xsysd->xdevs`. Which pair holds
+`xrt_system_roles.left/right` is then re-resolved continuously from
+`get_presence` by `target_input_arbiter.c`: the provider owns the hands
+while its hardware is present, qwerty owns them otherwise, and the roles
+move between them mid-session on plug/unplug (the `generation_id` bump
+makes the OpenXR state tracker rebind at the next `xrSyncActions`).
+
+`HKLM\Software\DisplayXR\Input\ForceQwerty` (POSIX: a `force_qwerty` file
+next to the manifests) skips providers entirely. Details: discovery spec
+§4.
 
 ## What providers must NOT do
 
@@ -98,8 +140,16 @@ Details: discovery spec §4.
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
   (no DLL load) + the predicted active one + the ForceQwerty state.
-- `displayxr-cli selftest` — with a provider registered (and no
-  override), asserts provider-claimed left+right role devices with a
-  valid interaction profile; provider absence never fails.
-- `scripts/register_dev_plugin.bat input [dll]` — register the dev
-  sim-input (or a vendor DLL) on Windows.
+- `displayxr-cli selftest` — with a provider registered, not overridden,
+  **and reporting `PRESENT`**, asserts left+right role devices with a
+  valid interaction profile. Provider absence never fails, and neither
+  does an unplugged provider or one that declined: qwerty holding the
+  roles is the correct outcome. Only a provider that failed to *load*
+  (missing entry point, ABI-major mismatch) fails the check.
+- `displayxr-cli input haptic-test [s]` — re-resolves the roles every
+  iteration and prints each `generation_id` change, so it doubles as a
+  live view of the arbitration flipping.
+- `scripts/register_dev_plugin.bat input <dll>` — register a vendor DLL
+  on Windows. `input sim` registers the dev sim-input, which additionally
+  needs `DXR_SIM_INPUT=1` in the loading process's environment before it
+  will probe.

@@ -31,6 +31,7 @@
 #include "target_plugin_loader.h"
 #include "target_input_plugin_loader.h"
 #include "target_builder_input_provider.h"
+#include "target_input_arbiter.h"
 
 #include <cjson/cJSON.h>
 
@@ -249,13 +250,14 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 
 /*!
  * ADR-034 / #823 — input-provider checks. ABSENCE NEVER FAILS: with no
- * provider registered, or the ForceQwerty override set, the checks are
- * skipped with an informational note (qwerty keeping the hand roles is
- * the normal configuration). Only a registered, non-overridden provider
- * that failed to produce provider-claimed left+right motion-controller
- * role devices with a valid interaction profile flips the verdict —
- * applied at the end of cli_query_fill so display failures keep their
- * more fundamental result codes.
+ * provider registered, the ForceQwerty override set, or the provider's
+ * hardware not actually plugged in, the checks are skipped with an
+ * informational note (qwerty keeping the hand roles is the normal
+ * configuration in all three cases). Only a registered, non-overridden
+ * provider whose hardware IS present and which then failed to produce
+ * left+right motion-controller role devices with a valid interaction
+ * profile flips the verdict — applied at the end of cli_query_fill so
+ * display failures keep their more fundamental result codes.
  */
 static void
 probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
@@ -274,13 +276,49 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		         "not evaluated: ForceQwerty override set (OK — qwerty keeps the hand roles)");
 		return;
 	}
-	r->input_evaluated = true;
 
 	const struct xrt_input_plugin_iface *iface = target_input_plugin_get_active();
 	r->input_provider_active = iface != NULL;
 	if (iface != NULL) {
 		snprintf(r->input_provider_id, sizeof(r->input_provider_id), "%s", iface->id ? iface->id : "");
 	}
+
+	// Nobody claimed the system. That is only a fault if a provider
+	// failed to LOAD (bad entry point, ABI-major mismatch); providers
+	// declining cleanly — no hardware of their type, or sim-input's
+	// DXR_SIM_INPUT opt-in left unset — is the ordinary state of most
+	// boxes and leaves qwerty correctly holding the hand roles.
+	if (!r->input_provider_active) {
+		int declined = 0;
+		int failed = 0;
+		target_input_plugin_get_scan_result(&declined, &failed);
+		if (failed > 0) {
+			r->input_evaluated = true;
+			snprintf(r->input_note, sizeof(r->input_note),
+			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)", failed,
+			         declined);
+		} else {
+			snprintf(r->input_note, sizeof(r->input_note),
+			         "not evaluated: all %d registered provider(s) declined "
+			         "(OK — qwerty keeps the hand roles)",
+			         declined);
+		}
+		return;
+	}
+
+	// Presence-gated arbitration: a loaded provider whose hardware is
+	// unplugged is SUPPOSED to leave the hand roles to qwerty, so there
+	// is nothing to assert about role devices in that state.
+	r->input_provider_present = t_input_arbiter_provider_holds_roles();
+	if (!r->input_provider_present) {
+		snprintf(r->input_note, sizeof(r->input_note),
+		         "not evaluated: provider '%s' loaded but its hardware is absent "
+		         "(OK — qwerty holds the hand roles)",
+		         r->input_provider_id);
+		return;
+	}
+
+	r->input_evaluated = true;
 
 	bool claimed_left = false;
 	bool claimed_right = false;
@@ -326,10 +364,7 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	const bool ht_ok = (!r->input_ht_expected_left || r->input_ht_left_ok) &&
 	                   (!r->input_ht_expected_right || r->input_ht_right_ok);
 
-	if (!r->input_provider_active) {
-		snprintf(r->input_note, sizeof(r->input_note),
-		         "FAIL: %d provider(s) registered but none claimed the system", r->input_provider_count);
-	} else if (!r->input_left_ok || !r->input_right_ok) {
+	if (!r->input_left_ok || !r->input_right_ok) {
 		snprintf(r->input_note, sizeof(r->input_note),
 		         "FAIL: provider '%s' active but roles incomplete (left=%s right=%s)", r->input_provider_id,
 		         r->input_left_ok ? "ok" : "missing", r->input_right_ok ? "ok" : "missing");
@@ -457,11 +492,14 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
 #endif
 
-	// ADR-034 / #823 — a registered, non-overridden input provider must
-	// have produced left+right motion-controller role devices — and (#825
-	// Tier 2) hand-tracking roles for any role device that advertises
-	// hand tracking. Applied last so display failures keep their more
-	// fundamental codes.
+	// ADR-034 / #823 — a registered, non-overridden input provider whose
+	// hardware is actually PRESENT must have produced left+right
+	// motion-controller role devices — and (#825 Tier 2) hand-tracking
+	// roles for any role device that advertises hand tracking. Providers
+	// that declined, or whose hardware is unplugged, leave input_evaluated
+	// false and pass: the arbiter giving the roles to qwerty is the
+	// correct outcome there, not a fault. Applied last so display
+	// failures keep their more fundamental codes.
 	if (r->result_code == CLI_SELFTEST_PASS && r->input_evaluated &&
 	    !(r->input_provider_active && r->input_left_ok && r->input_right_ok &&
 	      (!r->input_ht_expected_left || r->input_ht_left_ok) &&
@@ -632,6 +670,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
+		PT("hardware:     %s\n", r->input_provider_present ? "present (provider holds the hand roles)"
+		                                                   : "absent (qwerty holds the hand roles)");
 		PT("left:         %s\n", r->input_left_ok ? r->input_left_str : "<missing>");
 		PT("right:        %s\n", r->input_right_ok ? r->input_right_str : "<missing>");
 		PT("hand-track:   left=%s right=%s\n",
@@ -761,6 +801,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
 		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 		if (r->input_evaluated) {
@@ -896,10 +937,11 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	         r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 
 	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
-	// stays true with no provider registered or ForceQwerty set; a
-	// registered provider must yield left+right role devices — and (#825
-	// Tier 2) hand-tracking roles wherever a role device advertises
-	// hand tracking.
+	// stays true with no provider registered, ForceQwerty set, every
+	// provider declining, or the active provider's hardware unplugged.
+	// A provider that IS present must yield left+right role devices —
+	// and (#825 Tier 2) hand-tracking roles wherever a role device
+	// advertises hand tracking.
 	c = &out[n++];
 	c->name = "input_providers";
 	c->ok = !r->input_evaluated || (r->input_provider_active && r->input_left_ok && r->input_right_ok &&

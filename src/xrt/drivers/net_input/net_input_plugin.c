@@ -73,6 +73,13 @@ net_input_plugin_destroy(struct xrt_input_plugin_instance *inst)
 	/* Hub teardown rides the devices' refcounted destroy. */
 }
 
+static enum xrt_input_provider_presence
+net_input_plugin_get_presence(struct xrt_input_plugin_instance *inst)
+{
+	(void)inst;
+	return net_input_get_presence();
+}
+
 
 /*
  *
@@ -92,6 +99,8 @@ static struct xrt_input_plugin_iface g_net_input_iface = {
     .probe = net_input_plugin_probe,
     .create_devices = net_input_plugin_create_devices,
     .destroy = net_input_plugin_destroy,
+
+    .get_presence = net_input_plugin_get_presence,
 };
 
 

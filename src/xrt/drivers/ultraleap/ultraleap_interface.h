@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 
 #ifdef __cplusplus
@@ -38,10 +39,31 @@ struct xrt_device;
  * up but no device plugged in, the devices exist and report untracked
  * until hands appear, mirroring net_input's no-feeder semantics.
  *
+ * Before returning it waits a bounded settle window
+ * (`DXR_ULTRALEAP_SETTLE_MS`, default 300) for the LeapC connection to
+ * say whether a device is actually attached, so the runtime's very first
+ * role arbitration usually gets a definitive answer rather than
+ * @ref XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN.
+ *
  * @ingroup drv_ultraleap
  */
 xrt_result_t
 ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right);
+
+/*!
+ * Is a Leap Motion device actually attached right now? Non-blocking
+ * mutex read of state the poll thread maintains from LeapC's
+ * `Device` / `DeviceLost` / `ConnectionLost` events — this is what backs
+ * @ref xrt_input_plugin_iface::get_presence.
+ *
+ * Reports @ref XRT_INPUT_PROVIDER_PRESENCE_PRESENT while a device is
+ * attached even when no hand is in view: an empty tracking volume is
+ * inactive inputs, not absent hardware.
+ *
+ * @ingroup drv_ultraleap
+ */
+enum xrt_input_provider_presence
+ul_get_presence(void);
 
 #ifdef __cplusplus
 }

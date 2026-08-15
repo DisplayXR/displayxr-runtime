@@ -5,10 +5,17 @@
  * @brief  Plug-in entry point for the Ultraleap input provider.
  *
  * Implements @ref xrt_input_plugin_negotiate_fn_t (ADR-034 / #825) for
- * the Ultraleap hand-as-motion-controller provider. Probe always
- * succeeds (registration is the opt-in; the LeapC connection is claimed
- * at create time); if the Ultraleap tracking service is absent,
- * `create_devices` fails and the builder falls back to qwerty.
+ * the Ultraleap hand-as-motion-controller provider.
+ *
+ * `probe()` deliberately always succeeds: it answers "should this
+ * provider be loaded", which is a registration decision, not a hardware
+ * one. Whether a Leap Motion is actually plugged in is answered
+ * separately and continuously by `get_presence()`, because the loader is
+ * one-shot — a probe that declined on an unplugged device could never
+ * notice it being plugged in later, and the user would be stuck on the
+ * qwerty fallback for the rest of the process. With presence reported
+ * honestly, the runtime moves the hand roles between this provider and
+ * qwerty as the hardware comes and goes.
  *
  * Register with `register_dev_plugin.bat input <path>\DisplayXR-Ultraleap.dll`
  * (Windows) or an `NNN-ultraleap-input-provider.json` manifest (POSIX).
@@ -72,6 +79,13 @@ ul_plugin_destroy(struct xrt_input_plugin_instance *inst)
 	/* Hub teardown rides the devices' refcounted destroy. */
 }
 
+static enum xrt_input_provider_presence
+ul_plugin_get_presence(struct xrt_input_plugin_instance *inst)
+{
+	(void)inst;
+	return ul_get_presence();
+}
+
 
 /*
  *
@@ -91,6 +105,8 @@ static struct xrt_input_plugin_iface g_ul_iface = {
     .probe = ul_plugin_probe,
     .create_devices = ul_plugin_create_devices,
     .destroy = ul_plugin_destroy,
+
+    .get_presence = ul_plugin_get_presence,
 };
 
 

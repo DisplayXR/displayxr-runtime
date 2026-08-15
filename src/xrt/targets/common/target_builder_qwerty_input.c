@@ -10,6 +10,7 @@
 #include "xrt/xrt_config_drivers.h"
 
 #include "target_builder_qwerty_input.h"
+#include "target_input_arbiter.h"
 
 #include "util/u_system_helpers.h"
 #include "util/u_builders.h"
@@ -38,10 +39,13 @@ t_builder_add_qwerty_input(struct xrt_system_devices *xsysd,
 	if (qwerty_head != NULL) {
 		xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
 	}
-	// Hand-role arbitration (ADR-034): an input-provider plug-in loaded
-	// before this call may already have claimed left/right. Qwerty still
-	// registers its devices (debug value — visible in `test`, u_var, and
-	// as extra xdevs) but only claims a role the provider left empty.
+	// Hand-role arbitration (ADR-034, as amended): an input-provider
+	// plug-in loaded before this call may already have taken left/right —
+	// but only if its hardware was actually present. Qwerty always
+	// registers its devices and takes any role left empty, and it stays
+	// in the device list either way so the arbiter can hand the roles
+	// BACK to it if the provider's hardware goes away mid-session
+	// (`target_input_arbiter.h`).
 	if (left != NULL) {
 		xsysd->xdevs[xsysd->xdev_count++] = left;
 		if (ubrh->left == NULL) {
@@ -54,6 +58,7 @@ t_builder_add_qwerty_input(struct xrt_system_devices *xsysd,
 			ubrh->right = right;
 		}
 	}
+	t_input_arbiter_note_qwerty_pair(left, right);
 
 	if (out_qwerty_hmd != NULL) {
 		*out_qwerty_hmd = qwerty_head;
