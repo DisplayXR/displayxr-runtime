@@ -70,6 +70,17 @@
 #define UL_RELEASE_THRESHOLD 0.55f
 
 /*!
+ * #941 idle watchdog: close our LeapC connection when no XR consumer has
+ * polled poses/joints for this long. Hyperion runs the full tracking model
+ * (measured: one whole CPU core) for connected clients regardless of use,
+ * and upstream ships no auto-idle — so the provider stops being a client
+ * while nobody looks. Client-isolated by design: we close OUR connection
+ * rather than calling LeapSetPause, which is service-global and would stomp
+ * concurrent Leap apps (e.g. LeiaViewer).
+ */
+#define UL_IDLE_TIMEOUT_NS (5LL * 1000 * 1000 * 1000)
+
+/*!
  * Mount offset: where the Leap device's origin sits in stage space.
  * Hands hover 10–40 cm above the device, so an origin at stage height
  * minus ~15 cm puts the interaction volume around y ≈ 1.6 m — the
@@ -122,11 +133,32 @@ struct ul_hub
 	//! Diagnostics (u_var).
 	uint64_t frame_count;
 
+	//! #941 idle watchdog. last_activity_ns is guarded by mutex (marked
+	//! from app threads); the connection state is poll-thread-owned.
+	int64_t last_activity_ns;
+	int64_t idle_since_ns;
+	bool leap_connected;
+	uint64_t idle_disconnects;
+
 	struct ul_device *devices[2];
 
 	//! Live device count; the last xrt_device::destroy tears the hub down.
 	int device_refcount;
 };
+
+//! #941: an XR consumer touched this provider — keep (or revive) the
+//! LeapC connection. Called from update_inputs / get_tracked_pose /
+//! get_hand_tracking, i.e. both the controller-emulation and the
+//! hand-joint paths count as activity (begin/end_feature deliberately
+//! does NOT gate this — controllers never begin the hand-tracking
+//! feature and must keep tracking alive on their own).
+static inline void
+ul_mark_activity(struct ul_hub *hub)
+{
+	os_mutex_lock(&hub->mutex);
+	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
+	os_mutex_unlock(&hub->mutex);
+}
 
 static const char *
 leap_result_to_string(eLeapRS result)
@@ -357,19 +389,81 @@ ul_handle_tracking_event(struct ul_hub *hub, const LEAP_TRACKING_EVENT *ev, int6
 	}
 }
 
+static bool
+ul_open_connection(struct ul_hub *hub)
+{
+	if (LeapOpenConnection(hub->connection) != eLeapRS_Success) {
+		return false;
+	}
+	LeapSetTrackingMode(hub->connection, eLeapTrackingMode_Desktop);
+	return true;
+}
+
+//! Deactivate both devices' inputs (used on idle disconnect, #941).
+static void
+ul_set_all_untracked(struct ul_hub *hub)
+{
+	os_mutex_lock(&hub->mutex);
+	for (int idx = 0; idx < 2; idx++) {
+		struct ul_device *dev = hub->devices[idx];
+		if (dev != NULL) {
+			dev->tracked = false;
+			dev->btn_select = false;
+			dev->btn_menu = false;
+		}
+	}
+	os_mutex_unlock(&hub->mutex);
+}
+
 static void *
 ul_poll_thread(void *ptr)
 {
 	struct ul_hub *hub = (struct ul_hub *)ptr;
 
-	if (LeapOpenConnection(hub->connection) != eLeapRS_Success) {
+	if (!ul_open_connection(hub)) {
 		U_LOG_E("ultraleap: LeapOpenConnection failed — is the Ultraleap tracking service running?");
 		return NULL;
 	}
-	LeapSetTrackingMode(hub->connection, eLeapTrackingMode_Desktop);
+	hub->leap_connected = true;
 	U_LOG_W("ultraleap: connection open (desktop tracking mode); hands appear when the device sees them.");
 
 	while (os_thread_helper_is_running(&hub->oth)) {
+		os_mutex_lock(&hub->mutex);
+		int64_t last_activity = hub->last_activity_ns;
+		os_mutex_unlock(&hub->mutex);
+		int64_t now = (int64_t)os_monotonic_get_ns();
+
+		if (!hub->leap_connected) {
+			// Idle (#941): wait cheaply for an activity mark newer
+			// than the disconnect, then revive the connection.
+			if (last_activity <= hub->idle_since_ns) {
+				os_nanosleep(100 * 1000 * 1000); // 100 ms
+				continue;
+			}
+			if (!ul_open_connection(hub)) {
+				U_LOG_W("ultraleap: reconnect failed — retrying while input is being polled.");
+				os_nanosleep(500 * 1000 * 1000); // 500 ms
+				continue;
+			}
+			hub->leap_connected = true;
+			U_LOG_W("ultraleap: input polled again — Leap connection reopened (#941).");
+		}
+
+		// #941 idle watchdog: no XR consumer for a while → stop being
+		// a tracking-service client until someone polls again.
+		if (now - last_activity > UL_IDLE_TIMEOUT_NS) {
+			LeapCloseConnection(hub->connection);
+			hub->leap_connected = false;
+			hub->idle_since_ns = now;
+			hub->idle_disconnects++;
+			ul_set_all_untracked(hub);
+			U_LOG_W(
+			    "ultraleap: no input consumer for %d s — Leap connection closed "
+			    "(#941; reopens on demand).",
+			    (int)(UL_IDLE_TIMEOUT_NS / (1000 * 1000 * 1000)));
+			continue;
+		}
+
 		LEAP_CONNECTION_MESSAGE msg;
 		eLeapRS result = LeapPollConnection(hub->connection, 500 /* ms */, &msg);
 		if (result == eLeapRS_Timeout) {
@@ -402,7 +496,9 @@ ul_hub_destroy(struct ul_hub *hub)
 {
 	os_thread_helper_stop_and_wait(&hub->oth);
 
-	LeapCloseConnection(hub->connection);
+	if (hub->leap_connected) {
+		LeapCloseConnection(hub->connection);
+	}
 	LeapDestroyConnection(hub->connection);
 
 	u_var_remove_root(hub);
@@ -449,6 +545,8 @@ ul_device_update_inputs(struct xrt_device *xdev)
 	struct ul_device *dev = ul_device(xdev);
 	int64_t now = (int64_t)os_monotonic_get_ns();
 
+	ul_mark_activity(dev->hub); // #941
+
 	os_mutex_lock(&dev->hub->mutex);
 	bool tracked = dev->tracked;
 	bool select = dev->btn_select;
@@ -478,6 +576,8 @@ ul_device_get_tracked_pose(struct xrt_device *xdev,
                            struct xrt_space_relation *out_relation)
 {
 	struct ul_device *dev = ul_device(xdev);
+
+	ul_mark_activity(dev->hub); // #941
 
 	switch (name) {
 	case XRT_INPUT_SIMPLE_GRIP_POSE:
@@ -510,6 +610,8 @@ ul_device_get_hand_tracking(struct xrt_device *xdev,
                             int64_t *out_timestamp_ns)
 {
 	struct ul_device *dev = ul_device(xdev);
+
+	ul_mark_activity(dev->hub); // #941
 
 	enum xrt_input_name expected =
 	    dev->hand == 0 ? XRT_INPUT_HT_UNOBSTRUCTED_LEFT : XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
@@ -628,6 +730,9 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 		return XRT_ERROR_ALLOCATION;
 	}
 	hub->mount_offset = ul_mount_offset_default;
+	// #941: startup grace — the idle watchdog only fires once nothing has
+	// polled for the timeout, so probes/tests see frames immediately.
+	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
 
 	if (os_mutex_init(&hub->mutex) != 0) {
 		free(hub);
@@ -663,6 +768,8 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 	u_var_add_root(hub, "Ultraleap Input Hub", true);
 	u_var_add_ro_u64(hub, &hub->frame_count, "tracking_frame_count");
 	u_var_add_vec3_f32(hub, &hub->mount_offset, "mount_offset_m");
+	u_var_add_bool(hub, &hub->leap_connected, "leap_connected");
+	u_var_add_ro_u64(hub, &hub->idle_disconnects, "idle_disconnects");
 
 	*out_left = &left->base;
 	*out_right = &right->base;
