@@ -598,6 +598,68 @@ struct overlay_slot
 #define D3D11_SERVICE_MAX_OVERLAYS 16
 
 
+/*
+ *
+ * #925 S3 — workspace-control command queue
+ *
+ */
+
+//! Command types for the S3 queue. POSE commands are idempotent (drop-oldest
+//! on overflow keeps the newest intent); every other type is discrete and
+//! must not drop — on overflow a discrete command executes inline under the
+//! fair lock instead (the fallback layer).
+enum ws_cmd_type
+{
+	WS_CMD_SET_POSE_XC,    //!< set_client_window_pose (by compositor)
+	WS_CMD_SET_POSE_SLOT,  //!< set_capture_client_window_pose (by slot)
+	WS_CMD_SET_VIS_XC,     //!< set_client_visibility (by compositor)
+	WS_CMD_SET_VIS_SLOT,   //!< set_capture_client_visibility (by slot)
+	WS_CMD_SET_CAP_XC,     //!< set_client_frame_rate_cap (by compositor)
+	WS_CMD_SET_FOCUS,      //!< set_focused_slot
+	WS_CMD_EXIT_SLOT,      //!< workspace_request_exit_by_slot
+	WS_CMD_MODE_FLIP,      //!< workspace_request_mode_flip
+	WS_CMD_INPUT_GRAB,     //!< set_input_grab (suppress-flag half; the
+	                       //!< foreground grab stays on the caller thread)
+};
+
+/*!
+ * One queued workspace-control command (#925 S3). Plain POD — copied into a
+ * fixed ring under a mutex held for nanoseconds, applied on the render thread
+ * at the top of `multi_compositor_render` (which already holds
+ * `render_mutex`), so the IPC handlers that produce these never contend with
+ * a render pass that can hold the lock for a whole display period.
+ *
+ * `xc` is matched by POINTER IDENTITY against slot bindings at drain time
+ * (multi_comp_find_slot compares, never dereferences), so a client that
+ * disconnected between enqueue and drain is a benign no-op — validation
+ * moved to drain time by design (success-on-enqueue reply semantics).
+ */
+struct ws_command
+{
+	enum ws_cmd_type type;
+	//! Target for *_XC commands (pointer identity only at drain).
+	struct d3d11_service_compositor *xc;
+	//! Target for *_SLOT / SET_FOCUS / EXIT_SLOT commands.
+	int slot;
+	//! SET_POSE payload.
+	struct xrt_pose pose;
+	float width_m;
+	float height_m;
+	//! SET_VIS / INPUT_GRAB payload.
+	bool flag;
+	//! SET_CAP payload.
+	float cap_hz;
+	//! MODE_FLIP payload.
+	uint32_t mode_index;
+};
+
+//! Ring capacity. Drain runs at render cadence (~70 Hz) and the only
+//! high-rate producer is the 60 Hz drag pose, so depth stays ~1 in practice;
+//! 256 only fills if the render thread is wedged — the very failure S2's
+//! bounded-wait rules keep survivable — and then poses drop oldest-first
+//! while discrete commands fall back to inline execution.
+#define WS_CMD_QUEUE_CAP 256
+
 /*!
  * D3D11 service system compositor.
  *
@@ -802,6 +864,20 @@ struct d3d11_service_system
 	//! anyone is waiting. Zero cost when uncontended.
 	std::atomic<int> render_mutex_waiters{0};
 
+	/*!
+	 * @name #925 S3 — workspace-control command queue
+	 * Fixed ring of pending commands + its push mutex (held ~ns; never held
+	 * while `render_mutex` is held or wanted). Drained in one snapshot at
+	 * the top of `multi_compositor_render`, next to
+	 * `apply_pending_mode_flip` — see `service_ws_cmd_drain`.
+	 * @{
+	 */
+	std::mutex ws_cmd_mutex;
+	struct ws_command ws_cmd_ring[WS_CMD_QUEUE_CAP];
+	uint32_t ws_cmd_head{0};  //!< index of oldest queued command
+	uint32_t ws_cmd_count{0}; //!< number of queued commands
+	/*! @} */
+
 	//! Timestamp of last workspace render (monotonic ns). Used to throttle renders
 	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
 	uint64_t last_workspace_render_ns;
@@ -905,6 +981,117 @@ struct render_mutex_fair_lock
 	render_mutex_fair_lock(const render_mutex_fair_lock &) = delete;
 	render_mutex_fair_lock &operator=(const render_mutex_fair_lock &) = delete;
 };
+
+
+/*
+ *
+ * #925 S3 — command queue plumbing (definitions live with the handlers,
+ * after the multi-comp helpers they apply through)
+ *
+ */
+
+//! DXR_CMD_QUEUE=0 reverts every enqueueing handler to the inline
+//! fair-lock path for A/B and triage. Default ON.
+static bool
+dxr_cmd_queue_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_CMD_QUEUE");
+		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+//! Apply one command. Caller holds render_mutex — either the render thread
+//! inside the drain, or an IPC handler on the inline fallback path (queue
+//! off / ring full of undroppable commands). One code path either way.
+static void
+service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *cmd);
+
+//! Push onto the ring. Returns false when the command could not be queued
+//! (ring full of discrete commands) — the caller then applies inline under
+//! the fair lock. Never blocks beyond the ~ns push mutex.
+static bool
+service_ws_cmd_push(struct d3d11_service_system *sys, const struct ws_command *cmd);
+
+//! Snapshot-drain the ring and apply everything. Runs at the top of
+//! multi_compositor_render under render_mutex. Snapshot first so a nested
+//! render (remove_capture_client's final-frame render) sees an empty ring
+//! instead of re-entering the drain.
+static void
+service_ws_cmd_drain(struct d3d11_service_system *sys);
+
+//! Enqueue-or-inline helper shared by every converted handler: push, and on
+//! ring exhaustion take the fair lock and apply the same code inline.
+static void
+service_ws_cmd_submit(struct d3d11_service_system *sys, const struct ws_command *cmd)
+{
+	if (dxr_cmd_queue_enabled() && service_ws_cmd_push(sys, cmd)) {
+		return;
+	}
+	render_mutex_fair_lock lock(sys);
+	service_ws_cmd_apply(sys, cmd);
+}
+
+static bool
+service_ws_cmd_push(struct d3d11_service_system *sys, const struct ws_command *cmd)
+{
+	std::lock_guard<std::mutex> lk(sys->ws_cmd_mutex);
+
+	if (sys->ws_cmd_count >= WS_CMD_QUEUE_CAP) {
+		// Overflow: drop the oldest POSE command (idempotent — the newest
+		// intent for that window still lands). If the ring is somehow all
+		// discrete commands, refuse; the caller applies inline.
+		for (uint32_t i = 0; i < sys->ws_cmd_count; i++) {
+			uint32_t idx = (sys->ws_cmd_head + i) % WS_CMD_QUEUE_CAP;
+			enum ws_cmd_type t = sys->ws_cmd_ring[idx].type;
+			if (t != WS_CMD_SET_POSE_XC && t != WS_CMD_SET_POSE_SLOT) {
+				continue;
+			}
+			// Shift the gap toward the head, then advance the head over it.
+			for (uint32_t j = i; j > 0; j--) {
+				uint32_t dst = (sys->ws_cmd_head + j) % WS_CMD_QUEUE_CAP;
+				uint32_t src = (sys->ws_cmd_head + j - 1) % WS_CMD_QUEUE_CAP;
+				sys->ws_cmd_ring[dst] = sys->ws_cmd_ring[src];
+			}
+			sys->ws_cmd_head = (sys->ws_cmd_head + 1) % WS_CMD_QUEUE_CAP;
+			sys->ws_cmd_count--;
+			U_LOG_W("WS cmd queue: full — dropped oldest pose command");
+			break;
+		}
+		if (sys->ws_cmd_count >= WS_CMD_QUEUE_CAP) {
+			U_LOG_W("WS cmd queue: full of discrete commands — applying inline");
+			return false;
+		}
+	}
+
+	uint32_t tail = (sys->ws_cmd_head + sys->ws_cmd_count) % WS_CMD_QUEUE_CAP;
+	sys->ws_cmd_ring[tail] = *cmd;
+	sys->ws_cmd_count++;
+	return true;
+}
+
+static void
+service_ws_cmd_drain(struct d3d11_service_system *sys)
+{
+	// Snapshot under the push mutex, apply outside it — a producer never
+	// waits on an apply, and a nested render sees an empty ring.
+	struct ws_command local[WS_CMD_QUEUE_CAP];
+	uint32_t n = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_cmd_mutex);
+		n = sys->ws_cmd_count;
+		for (uint32_t i = 0; i < n; i++) {
+			local[i] = sys->ws_cmd_ring[(sys->ws_cmd_head + i) % WS_CMD_QUEUE_CAP];
+		}
+		sys->ws_cmd_head = 0;
+		sys->ws_cmd_count = 0;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		service_ws_cmd_apply(sys, &local[i]);
+	}
+}
 
 
 /*
@@ -7025,6 +7212,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// grow-in moved in #306, layout presets in Phase 2.G). The controller now
 	// drives all window motion via per-frame xrSetWorkspaceClientWindowPoseDXR,
 	// which already refreshes the input-forward rect (set_client_window_pose).
+
+	// #925 S3: drain queued workspace-control commands. Runs BEFORE
+	// apply_pending_mode_flip so a queued MODE_FLIP request enters the
+	// state machine in the same frame it drains.
+	service_ws_cmd_drain(sys);
 
 	// Per-frame tick for the workspace mode-flip state machine (#234). Owns
 	// the WAITING_ACK -> FLIPPING and FLIPPING -> IDLE transitions and the
@@ -15223,54 +15415,24 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	}
 
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
 	// Clamp dimensions to minimum 5% of display
 	float min_dim = 0.02f; // ~2cm minimum
 	if (width_m < min_dim) width_m = min_dim;
 	if (height_m < min_dim) height_m = min_dim;
 
-	render_mutex_fair_lock lock(sys);
-
-	int slot = multi_comp_find_slot(mc, c);
-	if (slot < 0) {
-		return false;
-	}
-
-	mc->clients[slot].window_pose = *pose;
-	mc->clients[slot].window_width_m = width_m;
-	mc->clients[slot].window_height_m = height_m;
-	// ADR-018 (#304): first set_pose marks the client placed; the runtime
-	// starts compositing it from here (gated with first-frame-committed).
-	mc->clients[slot].placed = true;
-
-	// Recompute pixel rect from pose
-	slot_pose_to_pixel_rect(sys, &mc->clients[slot],
-	                        &mc->clients[slot].window_rect_x,
-	                        &mc->clients[slot].window_rect_y,
-	                        &mc->clients[slot].window_rect_w,
-	                        &mc->clients[slot].window_rect_h);
-
-	mc->clients[slot].hwnd_resize_pending = true;
-
-	U_LOG_W("Workspace: set window pose slot %d pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f → rect=(%u,%u,%u,%u)",
-	        slot, pose->position.x, pose->position.y, pose->position.z,
-	        width_m, height_m,
-	        mc->clients[slot].window_rect_x, mc->clients[slot].window_rect_y,
-	        mc->clients[slot].window_rect_w, mc->clients[slot].window_rect_h);
-
-	// Refresh the WindowProc's forwarding rect so the new pose's pixel
-	// rect is used to decide which clicks reach the app. Without this
-	// the forwarding rect goes stale at whatever the rect was at first
-	// register_client (or last layout-preset animation tick) — clicks
-	// on the now-larger / moved tile fall outside the stale rect and
-	// are silently dropped. Only matters for the focused slot, but
-	// recompute always since the call is cheap and the result is
-	// idempotent for non-focused slots.
-	if (slot == mc->focused_slot) {
-		multi_compositor_update_input_forward(mc);
-	}
-
+	// #925 S3: enqueue — this is the hot workspace-control path (60 Hz
+	// during drags) and must never park on render_mutex behind a render
+	// pass. Slot resolution + the rect/forwarding updates happen at drain
+	// (service_ws_cmd_apply); success-on-enqueue, a vanished client is a
+	// benign no-op.
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_POSE_XC;
+	cmd.xc = c;
+	cmd.pose = *pose;
+	cmd.width_m = width_m;
+	cmd.height_m = height_m;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -15286,18 +15448,13 @@ comp_d3d11_service_set_client_frame_rate_cap(struct xrt_system_compositor *xsysc
 	if (!sys->workspace_mode || sys->multi_comp == nullptr) return false;
 
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	render_mutex_fair_lock lock(sys);
-
-	int slot = multi_comp_find_slot(mc, c);
-	if (slot < 0) return false;
-
-	float prev = mc->clients[slot].frame_rate_cap_hz;
-	mc->clients[slot].frame_rate_cap_hz = max_fps;
-	if (prev != max_fps) {
-		U_LOG_W("Workspace: set_frame_rate_cap slot %d %.1f → %.1f Hz", slot, prev, max_fps);
-	}
+	// #925 S3: enqueue (see set_client_window_pose).
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_CAP_XC;
+	cmd.xc = c;
+	cmd.cap_hz = max_fps;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -15312,26 +15469,13 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	if (!sys->workspace_mode || sys->multi_comp == nullptr) return false;
 
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
 
-	render_mutex_fair_lock lock(sys);
-
-	int slot = multi_comp_find_slot(mc, c);
-	if (slot < 0) return false;
-
-	// #307 slice B: `minimized` is now purely the composite gate. The controller
-	// owns the distinction between user-minimize and maximize-hide (it renders
-	// its own taskbar on the overlay swapchain and tracks which windows it hid),
-	// so the runtime no longer needs a separate controller_hidden flag.
-	mc->clients[slot].minimized = !visible;
-	U_LOG_W("Workspace: set_visibility slot %d visible=%d", slot, visible);
-
-	if (!visible && slot == mc->focused_slot) {
-		// ADR-018: hiding the focused client clears focus for forwarding
-		// safety; the controller picks the successor (shell auto-focus-next).
-		mc->focused_slot = -1;
-		multi_compositor_update_input_forward(mc);
-	}
+	// #925 S3: enqueue (see set_client_window_pose).
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_VIS_XC;
+	cmd.xc = c;
+	cmd.flag = visible;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -15980,23 +16124,19 @@ comp_d3d11_service_workspace_request_exit_by_slot(struct xrt_system_compositor *
 	if (!sys->workspace_mode || mc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	if (mc->clients[slot].client_type == CLIENT_TYPE_CAPTURE) {
-		multi_compositor_remove_capture_client(sys, slot);
-		U_LOG_W("Workspace: request_exit → removed capture slot %d", slot);
-	} else {
-		struct d3d11_service_compositor *fc = mc->clients[slot].compositor;
-		if (fc == nullptr || fc->xses == nullptr) {
-			return XRT_ERROR_IPC_FAILURE;
-		}
-		union xrt_session_event xse = XRT_STRUCT_INIT;
-		xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-		xrt_session_event_sink_push(fc->xses, &xse);
-		U_LOG_W("Workspace: request_exit → exit request for slot %d", slot);
-	}
+	// #925 S3: enqueue. The old inline body read mc->clients[slot] with NO
+	// lock at all (a race against unregister could deref a freed
+	// compositor); at drain the read is render_mutex-synchronized for free.
+	// The active check moves to drain — an exit request for a just-vanished
+	// slot succeeds as a no-op (success-on-enqueue semantics).
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_EXIT_SLOT;
+	cmd.slot = slot;
+	service_ws_cmd_submit(sys, &cmd);
 	return XRT_SUCCESS;
 }
 
@@ -16480,6 +16620,177 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 	PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
 }
 
+/*
+ *
+ * #925 S3 — command apply (the bodies the enqueueing handlers used to run
+ * inline under the fair lock; now run on the render thread at drain, or
+ * inline on the DXR_CMD_QUEUE=0 / ring-exhausted fallback — one code path).
+ *
+ */
+
+static void
+service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *cmd)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+
+	switch (cmd->type) {
+	case WS_CMD_SET_POSE_XC: {
+		int slot = multi_comp_find_slot(mc, cmd->xc);
+		if (slot < 0) {
+			return; // client vanished between enqueue and drain — benign
+		}
+		mc->clients[slot].window_pose = cmd->pose;
+		mc->clients[slot].window_width_m = cmd->width_m;
+		mc->clients[slot].window_height_m = cmd->height_m;
+		// ADR-018 (#304): first set_pose marks the client placed; the runtime
+		// starts compositing it from here (gated with first-frame-committed).
+		mc->clients[slot].placed = true;
+
+		slot_pose_to_pixel_rect(sys, &mc->clients[slot],
+		                        &mc->clients[slot].window_rect_x,
+		                        &mc->clients[slot].window_rect_y,
+		                        &mc->clients[slot].window_rect_w,
+		                        &mc->clients[slot].window_rect_h);
+		mc->clients[slot].hwnd_resize_pending = true;
+
+		U_LOG_W("Workspace: set window pose slot %d pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f → rect=(%u,%u,%u,%u)",
+		        slot, cmd->pose.position.x, cmd->pose.position.y, cmd->pose.position.z,
+		        cmd->width_m, cmd->height_m,
+		        mc->clients[slot].window_rect_x, mc->clients[slot].window_rect_y,
+		        mc->clients[slot].window_rect_w, mc->clients[slot].window_rect_h);
+
+		// Refresh the WindowProc's forwarding rect so the new pose's pixel
+		// rect decides which clicks reach the app (stale rects silently
+		// swallow clicks on a moved/resized tile).
+		if (slot == mc->focused_slot) {
+			multi_compositor_update_input_forward(mc);
+		}
+		return;
+	}
+	case WS_CMD_SET_POSE_SLOT: {
+		int slot = cmd->slot;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			return;
+		}
+		mc->clients[slot].window_pose = cmd->pose;
+		mc->clients[slot].window_width_m = cmd->width_m;
+		mc->clients[slot].window_height_m = cmd->height_m;
+		// ADR-018 (#304): slot-addressed path serves both capture clients
+		// and OpenXR clients posed by 1000+slot.
+		mc->clients[slot].placed = true;
+
+		slot_pose_to_pixel_rect(sys, &mc->clients[slot],
+		                        &mc->clients[slot].window_rect_x,
+		                        &mc->clients[slot].window_rect_y,
+		                        &mc->clients[slot].window_rect_w,
+		                        &mc->clients[slot].window_rect_h);
+
+		// #320: non-capture clients need the HWND resize (WM_SIZE drives the
+		// app's Kooima dims); capture clients resize their source HWND on
+		// their own edge-drag schedule.
+		if (mc->clients[slot].client_type != CLIENT_TYPE_CAPTURE) {
+			mc->clients[slot].hwnd_resize_pending = true;
+			if (slot == mc->focused_slot) {
+				multi_compositor_update_input_forward(mc);
+			}
+		}
+		return;
+	}
+	case WS_CMD_SET_VIS_XC:
+	case WS_CMD_SET_VIS_SLOT: {
+		int slot = (cmd->type == WS_CMD_SET_VIS_XC) ? multi_comp_find_slot(mc, cmd->xc)
+		                                            : cmd->slot;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			return;
+		}
+		// #307 slice B: `minimized` is purely the composite gate; the
+		// controller owns the user-minimize vs maximize-hide distinction.
+		mc->clients[slot].minimized = !cmd->flag;
+		U_LOG_W("Workspace: set_visibility slot %d visible=%d", slot, cmd->flag ? 1 : 0);
+
+		if (!cmd->flag && slot == mc->focused_slot) {
+			// ADR-018: hiding the focused client clears focus for forwarding
+			// safety; the controller picks the successor.
+			mc->focused_slot = -1;
+			multi_compositor_update_input_forward(mc);
+		}
+		return;
+	}
+	case WS_CMD_SET_CAP_XC: {
+		int slot = multi_comp_find_slot(mc, cmd->xc);
+		if (slot < 0) {
+			return;
+		}
+		float prev = mc->clients[slot].frame_rate_cap_hz;
+		mc->clients[slot].frame_rate_cap_hz = cmd->cap_hz;
+		if (prev != cmd->cap_hz) {
+			U_LOG_W("Workspace: set_frame_rate_cap slot %d %.1f → %.1f Hz", slot, prev, cmd->cap_hz);
+		}
+		return;
+	}
+	case WS_CMD_SET_FOCUS: {
+		int prev_focused = mc->focused_slot;
+		int slot = cmd->slot;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			mc->focused_slot = -1;
+		} else {
+			mc->focused_slot = slot;
+		}
+		// Re-evaluate the WindowProc forwarding target so the freshly-
+		// focused slot's HWND becomes the new fwd HWND (see #228 picker
+		// dismissal — stale fwd HWNDs silently swallow clicks).
+		multi_compositor_update_input_forward(mc);
+
+		// #370 Phase 2: if focus just moved while LMB is held, re-deliver
+		// the lost WM_LBUTTONDOWN so a click-to-focus drag starts in one
+		// motion.
+		if (mc->focused_slot >= 0 && mc->focused_slot != prev_focused) {
+			synthesize_focus_click_down(mc, mc->focused_slot);
+		}
+		return;
+	}
+	case WS_CMD_EXIT_SLOT: {
+		int slot = cmd->slot;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			return;
+		}
+		if (mc->clients[slot].client_type == CLIENT_TYPE_CAPTURE) {
+			// Ends with a final-frame render; the drain snapshots before
+			// applying, so the nested render sees an empty ring.
+			multi_compositor_remove_capture_client(sys, slot);
+			U_LOG_W("Workspace: request_exit → removed capture slot %d", slot);
+		} else {
+			struct d3d11_service_compositor *fc = mc->clients[slot].compositor;
+			if (fc == nullptr || fc->xses == nullptr) {
+				return;
+			}
+			union xrt_session_event xse = XRT_STRUCT_INIT;
+			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+			xrt_session_event_sink_push(fc->xses, &xse);
+			U_LOG_W("Workspace: request_exit → exit request for slot %d", slot);
+		}
+		return;
+	}
+	case WS_CMD_MODE_FLIP: {
+		// origin_slot = -1 (system origin) — the workspace controller is
+		// logically the system, not a renderable slot.
+		multi_compositor_request_mode_flip(sys, cmd->mode_index, /*origin=*/-1);
+		return;
+	}
+	case WS_CMD_INPUT_GRAB: {
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_input_suppress(mc->window, cmd->flag);
+		}
+		sys->input_grabbed = cmd->flag; // cursor render reads this to pin to z=0
+		U_LOG_W("Workspace: input grab %s", cmd->flag ? "on" : "off");
+		return;
+	}
+	}
+}
+
 extern "C" void
 comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot)
 {
@@ -16497,32 +16808,15 @@ comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slo
 	if (mc == nullptr) {
 		return;
 	}
-	render_mutex_fair_lock lock(sys);
-	int prev_focused = mc->focused_slot;
-	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
-		mc->focused_slot = -1;
-	} else {
-		mc->focused_slot = slot;
-	}
 
-	// Re-evaluate the WindowProc forwarding target so the freshly-
-	// focused slot's HWND becomes the new fwd HWND. Without this the
-	// fwd HWND stays at whatever the prior focused slot was (often a
-	// closed picker / dialog → a now-dead HWND that PostMessage
-	// silently swallows), so the user has to trigger another route
-	// (Ctrl+1 layout preset, mouse drag, etc.) before clicks reach
-	// the new focused app. Surfaced by #228 spatial picker dismissal
-	// returning focus to the requester (gauss demo) — without this
-	// refresh the gauss received no mouse input until a layout
-	// preset reset the fwd state.
-	multi_compositor_update_input_forward(mc);
-
-	// #370 Phase 2: if focus just moved to a new window while LMB is held,
-	// re-deliver the lost WM_LBUTTONDOWN so a click-to-focus drag starts in one
-	// motion (the WndProc forwarded the original DOWN to the prior focus).
-	if (mc->focused_slot >= 0 && mc->focused_slot != prev_focused) {
-		synthesize_focus_click_down(mc, mc->focused_slot);
-	}
+	// #925 S3: enqueue — focus mutation, forwarding-target refresh, and the
+	// #370 synthetic click all run at drain (service_ws_cmd_apply). The
+	// ≤1-frame added latency is invisible next to the click-to-focus round
+	// trip it belongs to.
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_FOCUS;
+	cmd.slot = slot;
+	service_ws_cmd_submit(sys, &cmd);
 }
 
 extern "C" int
@@ -16811,12 +17105,14 @@ comp_d3d11_service_workspace_request_mode_flip(struct xrt_system_compositor *xsy
 		        mode_index, (void *)sys, (void *)(sys ? sys->multi_comp : nullptr));
 		return false;
 	}
-	U_LOG_W("[mode_flip] hook: entering request_mode_flip(target=%u) from controller session",
+	U_LOG_W("[mode_flip] hook: queueing request_mode_flip(target=%u) from controller session",
 	        mode_index);
-	render_mutex_fair_lock lock(sys);
-	// origin_slot = -1 (system origin) — the workspace controller is logically
-	// the system, not a renderable slot.
-	multi_compositor_request_mode_flip(sys, mode_index, /*origin=*/-1);
+	// #925 S3: enqueue — drains right before apply_pending_mode_flip, so the
+	// request enters the state machine in the same render frame.
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_MODE_FLIP;
+	cmd.mode_index = mode_index;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -17011,14 +17307,7 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 		return false;
 	}
 
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
-		return false;
-	}
-
-	render_mutex_fair_lock lock(sys);
-
-	if (!mc->clients[slot_index].active) {
 		return false;
 	}
 
@@ -17026,36 +17315,17 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 	if (width_m < min_dim) width_m = min_dim;
 	if (height_m < min_dim) height_m = min_dim;
 
-	mc->clients[slot_index].window_pose = *pose;
-	mc->clients[slot_index].window_width_m = width_m;
-	mc->clients[slot_index].window_height_m = height_m;
-	// ADR-018 (#304): first set_pose marks the client placed (slot-addressed
-	// path — serves both capture clients and OpenXR clients posed by 1000+slot).
-	mc->clients[slot_index].placed = true;
-
-	slot_pose_to_pixel_rect(sys, &mc->clients[slot_index],
-	    &mc->clients[slot_index].window_rect_x,
-	    &mc->clients[slot_index].window_rect_y,
-	    &mc->clients[slot_index].window_rect_w,
-	    &mc->clients[slot_index].window_rect_h);
-
-	// #320 regression fix: OpenXR clients are posed through this slot-addressed
-	// (1000+slot) path too. The canonical-id setter resizes the app HWND on
-	// every pose change — and that resize is what delivers WM_SIZE to the app
-	// so it updates its window dims (Kooima physical screen size + render
-	// resolution). Without it the app keeps rendering at its launch size,
-	// scaled into a moved/resized tile, and its window-relative projection goes
-	// stale. Restore that for non-capture clients (and refresh the focused
-	// slot's input-forward rect so clicks track the moved/resized tile).
-	// Capture clients resize their source HWND on their own edge-drag schedule,
-	// so leave them untouched here.
-	if (mc->clients[slot_index].client_type != CLIENT_TYPE_CAPTURE) {
-		mc->clients[slot_index].hwnd_resize_pending = true;
-		if (slot_index == mc->focused_slot) {
-			multi_compositor_update_input_forward(mc);
-		}
-	}
-
+	// #925 S3: enqueue — this is the drag path for capture clients (and
+	// 1000+slot-addressed OpenXR clients), the same 60 Hz cadence as the
+	// by-xc pose setter. Full apply body incl. the #320 HWND-resize rule
+	// runs at drain.
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_POSE_SLOT;
+	cmd.slot = slot_index;
+	cmd.pose = *pose;
+	cmd.width_m = width_m;
+	cmd.height_m = height_m;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -17107,30 +17377,16 @@ comp_d3d11_service_set_capture_client_visibility(struct xrt_system_compositor *x
 		return false;
 	}
 
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
 		return false;
 	}
 
-	render_mutex_fair_lock lock(sys);
-
-	if (!mc->clients[slot_index].active) {
-		return false;
-	}
-
-	// Same semantics as the by-xc setter above (#307 slice B): `minimized`
-	// is purely the composite gate; the controller owns the user-minimize
-	// vs maximize-hide distinction. Slot-addressed and type-agnostic, like
-	// set_capture_client_window_pose.
-	mc->clients[slot_index].minimized = !visible;
-	U_LOG_W("Workspace: set_visibility slot %d visible=%d (slot-addressed)", slot_index, visible);
-
-	if (!visible && slot_index == mc->focused_slot) {
-		// ADR-018: hiding the focused client clears focus for forwarding
-		// safety; the controller picks the successor.
-		mc->focused_slot = -1;
-		multi_compositor_update_input_forward(mc);
-	}
+	// #925 S3: enqueue (see the by-xc setter).
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_SET_VIS_SLOT;
+	cmd.slot = slot_index;
+	cmd.flag = visible;
+	service_ws_cmd_submit(sys, &cmd);
 	return true;
 }
 
@@ -17430,35 +17686,37 @@ comp_d3d11_service_set_input_grab(struct xrt_system_compositor *xsysc, bool grab
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
-	// Declared before the lock: the foreground grab below runs after
-	// render_mutex is released (#925 audit rank 7).
-	deferred_window_foreground foreground;
-
-	render_mutex_fair_lock lock(sys);
-
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (mc == nullptr || mc->suspended) {
+		// Racy read, deliberately: while suspended the render thread is
+		// down and a queued grab would fire stale on resume, so ignore now
+		// exactly as the locked path did. A grab racing suspend is a
+		// controller-side ordering bug either way.
 		U_LOG_W("Workspace: set_input_grab %s ignored — multi-comp not active",
 		        grab ? "true" : "false");
 		return;
 	}
 
-	if (mc->window != nullptr) {
-		comp_d3d11_window_set_input_suppress(mc->window, grab);
-	}
-	sys->input_grabbed = grab; // cursor render reads this to pin to z=0
+	// #925 S3: the suppress-flag half enqueues; this handler touches
+	// render_mutex not at all anymore.
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_INPUT_GRAB;
+	cmd.flag = grab;
+	service_ws_cmd_submit(sys, &cmd);
 
 	// On grab, pull the compositor window to the foreground + give it keyboard
 	// focus. WM_MOUSEWHEEL (and WM_KEYDOWN) are delivered to the focus window —
 	// without this the controller's modal UI (launcher band) wouldn't receive
 	// wheel events to forward as SCROLL_EXT. The controller grants us
-	// foreground rights via AllowSetForegroundWindow before this IPC. (Mirrors
-	// the focus grab the old runtime launcher did on open.)
+	// foreground rights via AllowSetForegroundWindow before this IPC.
+	// Stays on the caller thread (#925 rank 7: never on the render thread,
+	// never under render_mutex — win32k foreground serialization can block
+	// on the current foreground window's input queue).
 	if (grab && mc->hwnd != nullptr) {
-		foreground.hwnd = mc->hwnd;
-		foreground.want_focus = true;
+		SetForegroundWindow(mc->hwnd);
+		SetFocus(mc->hwnd);
 	}
-	U_LOG_W("Workspace: input grab %s", grab ? "on" : "off");
+	U_LOG_W("Workspace: input grab %s (queued)", grab ? "on" : "off");
 }
 
 void
