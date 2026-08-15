@@ -242,6 +242,17 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv_srgb;
 	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
 
+	//! Standalone atlas-clear bookkeeping. The per-commit clear-to-black is
+	//! only safe when every slot is guaranteed to be re-blitted this frame —
+	//! and it is NOT: the fence / KeyedMutex paths deliberately skip a view's
+	//! blit and reuse the slot's previous content. Clearing first turns that
+	//! reuse into a BLACK tile, which the DP then weaves and presents (the
+	//! standalone strobe). So clear only when the previous content is no
+	//! longer a valid fallback — i.e. when the atlas geometry or tile layout
+	//! changed. Same reasoning workspace mode has always used (it never
+	//! clears here). 0 = never cleared, force a clear on the next commit.
+	uint64_t atlas_clear_signature;
+
 	//! Content-sized crop atlas for DP input (lazy-created when content < atlas)
 	wil::com_ptr<ID3D11Texture2D> crop_texture;
 	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
@@ -528,6 +539,10 @@ struct d3d11_service_compositor
 	//! `_ipc` apps without fence support).
 	wil::com_ptr<ID3D11Fence> workspace_sync_fence;
 	HANDLE workspace_sync_fence_handle;            // shared NT handle for IPC export; nullptr when disabled
+	//! Manual-reset event used by service_fence_reached() for the BOUNDED wait
+	//! on `workspace_sync_fence`. Per-client: a client's commits are serialised
+	//! on its own IPC thread, so one event per client is enough.
+	HANDLE fence_wait_event;
 	std::atomic<uint64_t> last_signaled_fence_value;
 	uint64_t last_composed_fence_value[XRT_MAX_VIEWS];
 
@@ -538,6 +553,14 @@ struct d3d11_service_compositor
 	int64_t fence_window_start_ns;
 	uint32_t fence_waits_queued_in_window;
 	uint32_t fence_stale_views_in_window;
+	//! Split of `fence_stale_views_in_window` by cause, so a stale burst can be
+	//! attributed without a rebuild: `nonew` = the client shipped no new fence
+	//! value since we last composed this view; `incomplete` = a new value was
+	//! shipped but the GPU has not reached it yet (#922 gate); `acqfail` = the
+	//! value completed but the 0-timeout AcquireSync lost the race.
+	uint32_t fence_stale_nonew_in_window;
+	uint32_t fence_stale_incomplete_in_window;
+	uint32_t fence_stale_acqfail_in_window;
 
 	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
@@ -3444,6 +3467,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->crop_texture.reset();
 	res->crop_width = 0;
 	res->crop_height = 0;
+	res->atlas_clear_signature = 0;
 	res->atlas_rtv.reset();
 	res->atlas_srv.reset();
 	res->atlas_srv_srgb.reset();
@@ -3889,6 +3913,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		fini_client_render_resources(res);
 		return XRT_ERROR_D3D11;
 	}
+	// Fresh atlas storage is undefined — force the layout-change clear to fire
+	// on the first commit (see atlas_clear_signature).
+	res->atlas_clear_signature = 0;
 
 	U_LOG_W("Created stereo render target for client (%ux%u)", sys->display_width, sys->display_height);
 
@@ -3958,6 +3985,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				sys->display_height = sys->tile_rows * sys->view_height;
 
 				// Recreate stereo texture at correct dimensions
+				res->atlas_clear_signature = 0;
 				res->atlas_rtv.reset();
 				res->atlas_srv.reset();
 				res->atlas_srv_srgb.reset();
@@ -9499,6 +9527,62 @@ service_update_slot_content_dims(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Has the client's GPU reached `signaled` on its workspace_sync_fence?
+ *
+ * #922 replaced the original "queue an `ID3D11DeviceContext4::Wait`" design
+ * with a bare `GetCompletedValue() < signaled` poll, because a client that
+ * dies between promising a value and signalling it would jam the shared
+ * immediate context. That fixed the jam but broke the common case: the poll
+ * runs MICROSECONDS after the client submitted the frame, so the GPU has
+ * essentially never reached the value yet. Measured on a 60 fps standalone
+ * client: ~75-80 % of commits polled "not complete" and skipped the view's
+ * blit — content advanced at ~12 fps under a 60 fps present.
+ *
+ * The fix is a wait that is bounded on the CPU instead of queued on the GPU:
+ * `SetEventOnCompletion` + `WaitForSingleObject(budget)`. It cannot jam
+ * anything — the only thing it can delay is THIS client's own IPC thread, by
+ * at most the budget (#925 bounded-wait rule) — and a dead client just burns
+ * its budget once per frame and falls back to the stale-reuse path.
+ *
+ * The verdict is always re-read from `GetCompletedValue()` after the wait, so
+ * a spurious wake (an older registration on the same event completing) can
+ * only cost an extra poll, never a false "fresh".
+ *
+ * `DXR_FENCE_WAIT_MS` tunes the budget; 0 restores the #922 poll-only
+ * behaviour.
+ */
+static bool
+service_fence_reached(struct d3d11_service_compositor *c, uint64_t signaled)
+{
+	if (c->workspace_sync_fence->GetCompletedValue() >= signaled) {
+		return true; // Fast path — already done, no event, no wait.
+	}
+
+	static int wait_ms = -1;
+	if (wait_ms < 0) {
+		const char *e = getenv("DXR_FENCE_WAIT_MS");
+		int v = (e != nullptr) ? atoi(e) : 4;
+		if (v < 0) {
+			v = 0;
+		}
+		if (v > 16) {
+			v = 16; // Never exceed one 60 Hz frame on the client's IPC thread.
+		}
+		wait_ms = v;
+	}
+	if (wait_ms == 0 || c->fence_wait_event == nullptr) {
+		return false;
+	}
+
+	ResetEvent(c->fence_wait_event);
+	if (FAILED(c->workspace_sync_fence->SetEventOnCompletion(signaled, c->fence_wait_event))) {
+		return false;
+	}
+	WaitForSingleObject(c->fence_wait_event, (DWORD)wait_ms);
+	return c->workspace_sync_fence->GetCompletedValue() >= signaled;
+}
+
+/*!
  * One acquired cross-process image during the zones composite. Acquires are
  * deduped per (swapchain, image) across the whole pass — a second
  * AcquireSync(0) on the same image from this thread would self-block.
@@ -9554,6 +9638,14 @@ zones_acquire_image(struct d3d11_service_system *sys,
 		// (same bug fixed in the projection-view path). Not complete yet →
 		// release the acquire and treat the source as stale; the caller
 		// reuses the previous frame and retries next compose.
+		// Deliberately a POLL here, not service_fence_reached()'s bounded
+		// wait: the zones composite runs under sys->render_mutex, so even a
+		// 4 ms wait would be 4 ms of render-mutex hold per source image
+		// (#925 starvation family). The projection path can afford the wait
+		// because it runs on the client's own IPC thread outside the mutex.
+		// A skipped zones placement is also cheap — the composite already
+		// clears the tile, so it costs one transparent frame, not a stale
+		// or black one.
 		if (c->workspace_sync_fence->GetCompletedValue() < fence_signaled) {
 			sc->images[img].keyed_mutex->ReleaseSync(0);
 			return false;
@@ -10520,6 +10612,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 								        new_atlas_w, new_atlas_h, ratio);
 
 								// Release old stereo texture resources
+								c->render.atlas_clear_signature = 0;
 								c->render.atlas_rtv.reset();
 								c->render.atlas_srv.reset();
 								c->render.atlas_srv_srgb.reset();
@@ -10565,22 +10658,48 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Clear stereo render target.
-	// In workspace mode, skip the clear — the blit overwrites the same tile positions
-	// each frame, so previous content is a safe fallback. Clearing to black here
-	// creates a race: if multi_compositor_render reads this atlas between the clear
-	// and the blit, the window flashes black.
-	if (c->render.atlas_rtv && !sys->workspace_mode) {
-		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
-	}
-
 	// Sync hardware_display_3d and tile layout from device's active rendering mode
 	sync_tile_layout(sys);
 	if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
 		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
 		if (idx < sys->xdev->rendering_mode_count) {
 			sys->hardware_display_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+		}
+	}
+
+	// Clear the per-client atlas — LAYOUT-CHANGE ONLY, never per-frame.
+	//
+	// Workspace mode has always skipped this clear: "the blit overwrites the
+	// same tile positions each frame, so previous content is a safe fallback".
+	// Standalone used to clear unconditionally, and that is what produced the
+	// standalone present strobe: the projection loop below deliberately sets
+	// `view_skip_blit[eye]` (fence value not new / not yet complete on the GPU,
+	// or a KeyedMutex timeout) and leaves the slot alone *on the documented
+	// assumption that the slot is persistent*. With a per-frame clear in front
+	// of it the slot is not persistent — it is black — so every skipped view
+	// weaved and presented a black tile. On this box ~70 % of commits go stale,
+	// giving the measured hard two-state black/content flip at frame rate.
+	//
+	// The clear's real job is to blank atlas regions no blit will cover, which
+	// only changes when the geometry does. So clear when the signature (atlas
+	// dims × tile grid) changes, and otherwise trust the previous content —
+	// exactly the workspace rationale, now applied to both paths.
+	if (c->render.atlas_rtv && !sys->workspace_mode) {
+		uint64_t sig = 0;
+		D3D11_TEXTURE2D_DESC ad = {};
+		if (c->render.atlas_texture) {
+			c->render.atlas_texture->GetDesc(&ad);
+		}
+		sig = ((uint64_t)ad.Width << 40) ^ ((uint64_t)ad.Height << 20) ^
+		      ((uint64_t)sys->tile_columns << 8) ^ (uint64_t)sys->tile_rows;
+		// Never let a valid signature collide with the "never cleared" sentinel.
+		if (sig == 0) {
+			sig = 1;
+		}
+		if (c->render.atlas_clear_signature != sig) {
+			float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+			sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
+			c->render.atlas_clear_signature = sig;
 		}
 	}
 
@@ -11312,6 +11431,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						view_skip_blit[eye] = true;
 						view_zc_eligible[eye] = false;
 						c->fence_stale_views_in_window++;
+						c->fence_stale_nonew_in_window++;
 					} else {
 						// Fresh frame. The shared swapchain
 						// texture still has
@@ -11360,11 +11480,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// like the timeout path — reuse the previous atlas
 						// tile and retry next compose (last_composed is NOT
 						// updated, so the frame is picked up when it lands).
-						uint64_t completed = c->workspace_sync_fence->GetCompletedValue();
-						if (completed < signaled) {
+						// #922 keeps its "never queue a GPU Wait" rule; the wait
+						// is now BOUNDED on the CPU instead of merely polled —
+						// see service_fence_reached().
+						if (!service_fence_reached(c, signaled)) {
 							view_skip_blit[eye] = true;
 							view_zc_eligible[eye] = false;
 							c->fence_stale_views_in_window++;
+							c->fence_stale_incomplete_in_window++;
 						} else {
 							HRESULT hr_a =
 							    view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(
@@ -11377,6 +11500,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 								view_skip_blit[eye] = true;
 								view_zc_eligible[eye] = false;
 								c->fence_stale_views_in_window++;
+								c->fence_stale_acqfail_in_window++;
 							}
 						}
 						// Phase 2 leaves zero-copy semantics
@@ -11466,15 +11590,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (window_ns >= 10LL * 1000LL * 1000LL * 1000LL) {
 				uint64_t last_value =
 				    c->last_signaled_fence_value.load(std::memory_order_relaxed);
-				U_LOG_W("[FENCE] client=%p waits_queued=%u stale_views=%u last_value=%llu window_s=%lld",
+				U_LOG_W("[FENCE] client=%p waits_queued=%u stale_views=%u "
+				        "(nonew=%u incomplete=%u acqfail=%u) last_value=%llu window_s=%lld",
 				        (void *)c,
 				        c->fence_waits_queued_in_window,
 				        c->fence_stale_views_in_window,
+				        c->fence_stale_nonew_in_window,
+				        c->fence_stale_incomplete_in_window,
+				        c->fence_stale_acqfail_in_window,
 				        (unsigned long long)last_value,
 				        (long long)(window_ns / 1000000000LL));
 				c->fence_window_start_ns = now_ns;
 				c->fence_waits_queued_in_window = 0;
 				c->fence_stale_views_in_window = 0;
+				c->fence_stale_nonew_in_window = 0;
+				c->fence_stale_incomplete_in_window = 0;
+				c->fence_stale_acqfail_in_window = 0;
 			}
 		}
 
@@ -12849,6 +12980,10 @@ compositor_destroy(struct xrt_compositor *xc)
 			CloseHandle(c->workspace_sync_fence_handle);
 			c->workspace_sync_fence_handle = nullptr;
 		}
+		if (c->fence_wait_event != nullptr) {
+			CloseHandle(c->fence_wait_event);
+			c->fence_wait_event = nullptr;
+		}
 		c->workspace_sync_fence.reset();
 	} else {
 		// No multi_comp: legacy single-client teardown, no render-thread
@@ -12873,6 +13008,10 @@ compositor_destroy(struct xrt_compositor *xc)
 		if (c->workspace_sync_fence_handle != nullptr) {
 			CloseHandle(c->workspace_sync_fence_handle);
 			c->workspace_sync_fence_handle = nullptr;
+		}
+		if (c->fence_wait_event != nullptr) {
+			CloseHandle(c->fence_wait_event);
+			c->fence_wait_event = nullptr;
 		}
 		c->workspace_sync_fence.reset();
 	}
@@ -14101,10 +14240,16 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		// and the legacy KeyedMutex path runs unchanged for this client
 		// (preserves WebXR bridge / older _ipc app compatibility).
 		c->workspace_sync_fence_handle = nullptr;
+		// Bounded-wait event for service_fence_reached(); manual-reset so the
+		// post-wait GetCompletedValue() re-check is the only verdict.
+		c->fence_wait_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 		c->last_signaled_fence_value.store(0, std::memory_order_relaxed);
 		c->fence_window_start_ns = 0;
 		c->fence_waits_queued_in_window = 0;
 		c->fence_stale_views_in_window = 0;
+		c->fence_stale_nonew_in_window = 0;
+		c->fence_stale_incomplete_in_window = 0;
+		c->fence_stale_acqfail_in_window = 0;
 		for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
 			c->last_composed_fence_value[v] = 0;
 		}

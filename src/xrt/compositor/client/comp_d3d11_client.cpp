@@ -1030,6 +1030,29 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			// (the IPC handler treats 0 as "no fence" sentinel).
 			c->workspace_sync_fence_value--;
 		} else {
+			// SUBMIT the signal before shipping the value. `Signal` only
+			// QUEUES into the immediate context's command buffer; D3D11
+			// batches until something forces submission. The frame's own
+			// render commands were already flushed by the swapchain image's
+			// `ReleaseSync` (keyed-mutex release implies a flush), but that
+			// happened in xrReleaseSwapchainImage — BEFORE this Signal. So
+			// without an explicit flush the signal can sit unsubmitted for
+			// frames, and the service's `GetCompletedValue() < signaled`
+			// gate (#922) then reads the value as "GPU hasn't got there
+			// yet" and skips the view's blit.
+			//
+			// Measured on this box before the flush: [FENCE] stale_views
+			// ~400 per 10 s window, 100 % of them `incomplete` — ~80 % of
+			// commits never reached the atlas, so content advanced at
+			// ~12 fps under a 60 fps present.
+			//
+			// The flush alone only moves that to ~70 % (the GPU still has
+			// not *finished* by the time the service polls, microseconds
+			// later); the service-side bounded wait is what closes it. But
+			// the flush is a PREREQUISITE for that wait — an unsubmitted
+			// signal can never complete, so the wait would just burn its
+			// budget every frame. Keep both.
+			c->fence_context->Flush();
 			comp_ipc_client_compositor_set_workspace_sync_fence_value(
 			    &c->xcn->base, c->workspace_sync_fence_value);
 		}
