@@ -306,3 +306,57 @@ uniformly to grip/aim action spaces, `xrLocateSpace`, and the hand-joint base
 - Covered by `tests/tests_space_overseer_rig.cpp`, which pins both halves of
   the rule — including that an *un*flagged device stays world-fixed, so the
   divergence from HMD semantics stays a deliberate opt-in.
+
+## Amendment 3 — Provider selection is a presence-ranked hierarchy (2026-08-15)
+
+**Status:** Accepted. Supersedes "v1 activates a single provider (first
+successful probe in ProbeOrder wins)" in *Role arbitration* above.
+
+### What was wrong
+
+Amendment 1 made the *roles* dynamic but left *provider selection* a
+one-shot: the loader stopped at the first successful probe, so exactly one
+provider DLL was ever resident. With two modalities registered (say Quest
+controllers at ProbeOrder 40 and an Ultraleap at 50), unplugging the Quest
+pair dropped the hands straight to qwerty — the Ultraleap was never even
+loaded. The DP loader never had this problem: it consults every registered
+plug-in and ranks them, which is exactly why "Leia wins if present, else
+sim" works for displays.
+
+### Decision
+
+1. **The loader keeps every claiming provider resident.**
+   `target_input_plugin_loader.c` collects all providers that load,
+   ABI-pass and probe (ProbeOrder ascending), instead of returning the
+   first. `target_input_plugin_get_count()/get_iface(i)/get_instance(i)/
+   get_priority(i)` expose the ranked list; `get_active()` survives as an
+   alias for index 0 (diagnostics).
+
+2. **The builder creates every provider's devices.** All candidate pairs
+   live in `xsysd->xdevs` for the process lifetime, exactly as Amendment 1
+   established for the single pair. Hand-tracking roles are claimed
+   first-claimant-wins across all providers, in priority order.
+
+3. **The arbiter walks a ranked candidate list.** Qwerty is a candidate
+   like any other — NULL iface (the keyboard is always present), priority
+   `UINT32_MAX` — so the rule collapses to one sentence: *each hand goes
+   to the highest-priority candidate that supplies that hand and reports
+   PRESENT.* The walk is per-hand, so a one-handed provider leaves the
+   other hand to the next rank rather than dragging it down. Presence
+   verdicts are cached per candidate (~250 ms), generations bump exactly
+   as before, and the IPC path is untouched.
+
+### Consequences
+
+- **Priority = ProbeOrder**, one convention across both plug-in types.
+  Vendors already understand it from the DP side.
+- **Roles can now move provider→provider**, not just provider↔qwerty. An
+  app sees the same `XrEventDataInteractionProfileChanged` machinery
+  either way.
+- Hardware-validated on the win box: `ultraleap(50) → sim-input(200) →
+  qwerty` fell through the ranks on a real USB unplug and climbed back on
+  replug, frames unbroken; the two-candidate config (no sim-input)
+  falls to qwerty as before.
+- Every resident provider's DLL stays loaded even while absent — the cost
+  of being able to see its hardware arrive. Providers that dislike this
+  should decline in `probe()` (registration is opt-in per box anyway).

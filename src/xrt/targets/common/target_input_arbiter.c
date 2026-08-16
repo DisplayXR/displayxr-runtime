@@ -31,6 +31,39 @@
  */
 #define ARBITER_PRESENCE_POLL_NS (250LL * 1000 * 1000)
 
+/*!
+ * Largest number of candidate pairs we arbitrate between: one per
+ * registered provider plus the qwerty floor.
+ */
+#define ARBITER_MAX_CANDIDATES 17
+
+/*!
+ * One competitor for the hand roles. Qwerty is a candidate like any
+ * other, distinguished only by a NULL @ref t_input_candidate::iface
+ * (nothing to ask — the keyboard is always there) and the lowest
+ * possible priority.
+ */
+struct t_input_candidate
+{
+	const struct xrt_input_plugin_iface *iface;
+	struct xrt_input_plugin_instance *inst;
+
+	//! Ascending = wins. Qwerty uses UINT32_MAX.
+	uint32_t priority;
+
+	struct xrt_device *left;
+	struct xrt_device *right;
+
+	//! Indices into xsysd->xdevs, resolved at install. -1 = absent.
+	int32_t left_index;
+	int32_t right_index;
+
+	//! Cached presence verdict for this candidate.
+	bool present;
+	bool have_verdict;
+	int64_t verdict_at_ns;
+};
+
 struct t_input_arbiter
 {
 	//! The system we arbitrate for; NULL until install.
@@ -39,24 +72,12 @@ struct t_input_arbiter
 	//! The get_roles we displaced, for any other xsysd.
 	xrt_result_t (*fallback_get_roles)(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles);
 
-	struct xrt_device *provider_left;
-	struct xrt_device *provider_right;
-	struct xrt_device *qwerty_left;
-	struct xrt_device *qwerty_right;
-
-	//! Indices into xsysd->xdevs, resolved at install. -1 = absent.
-	int32_t provider_left_index;
-	int32_t provider_right_index;
-	int32_t qwerty_left_index;
-	int32_t qwerty_right_index;
+	//! Candidates in priority order: providers first, qwerty last.
+	struct t_input_candidate candidates[ARBITER_MAX_CANDIDATES];
+	int candidate_count;
 
 	//! What get_roles hands out; generation_id bumps on every flip.
 	struct xrt_system_roles roles;
-
-	//! Cached provider verdict + when it was taken.
-	bool provider_holds;
-	bool have_verdict;
-	int64_t verdict_at_ns;
 };
 
 static struct t_input_arbiter g_arb = {0};
@@ -98,49 +119,97 @@ name_of(struct xrt_device *xdev)
 }
 
 /*!
- * Ask the active provider whether its hardware is there. Uncached — see
- * @ref t_input_arbiter_provider_holds_roles for the throttled entry point.
+ * Ask one candidate whether its hardware is there. Uncached — see
+ * @ref candidate_is_present_locked for the throttled entry point.
  */
 static bool
-query_provider_presence(void)
+query_candidate_presence(const struct t_input_candidate *cand)
 {
-	if (g_arb.provider_left == NULL && g_arb.provider_right == NULL) {
-		return false; // No provider devices at all.
+	if (cand->left == NULL && cand->right == NULL) {
+		return false; // Supplied no hand devices at all.
 	}
-
-	const struct xrt_input_plugin_iface *iface = target_input_plugin_get_active();
-	if (iface == NULL) {
-		return false;
+	if (cand->iface == NULL) {
+		return true; // Qwerty: the keyboard is always there.
 	}
-	if (!XRT_INPUT_PLUGIN_IFACE_HAS(iface, get_presence)) {
-		// Provider predates the presence slot: it holds the roles for
-		// as long as it is loaded, exactly as ADR-034 Phase 1 did.
+	if (!XRT_INPUT_PLUGIN_IFACE_HAS(cand->iface, get_presence)) {
+		// Provider predates the presence slot: assume present for as
+		// long as it is loaded, exactly as ADR-034 Phase 1 did.
 		return true;
 	}
 
-	enum xrt_input_provider_presence presence = iface->get_presence(target_input_plugin_get_active_instance());
-	return presence == XRT_INPUT_PROVIDER_PRESENCE_PRESENT;
+	return cand->iface->get_presence(cand->inst) == XRT_INPUT_PROVIDER_PRESENCE_PRESENT;
+}
+
+static const char *
+candidate_name(const struct t_input_candidate *cand)
+{
+	if (cand == NULL) {
+		return "none";
+	}
+	if (cand->iface == NULL) {
+		return "qwerty";
+	}
+	return cand->iface->id != NULL ? cand->iface->id : "provider";
+}
+
+//! Caller holds the mutex (or is the single-threaded builder path).
+static bool
+candidate_is_present_locked(struct t_input_candidate *cand)
+{
+	int64_t now = os_monotonic_get_ns();
+
+	if (cand->have_verdict && (now - cand->verdict_at_ns) < ARBITER_PRESENCE_POLL_NS) {
+		return cand->present;
+	}
+
+	bool present = query_candidate_presence(cand);
+	if (cand->have_verdict && present != cand->present) {
+		U_LOG_W("input arbiter: '%s' hardware %s.", candidate_name(cand), present ? "present again" : "gone");
+	}
+	cand->present = present;
+	cand->have_verdict = true;
+	cand->verdict_at_ns = now;
+	return present;
+}
+
+/*!
+ * First present candidate, in priority order, that supplies the hand
+ * selected by @p want_left. Returns NULL when nothing does.
+ *
+ * Resolved per hand on purpose: a provider that supplies only one
+ * controller should leave the other hand to the next-ranked candidate,
+ * not drag both down with it.
+ */
+static struct t_input_candidate *
+pick_for_hand_locked(bool want_left)
+{
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		int32_t index = want_left ? cand->left_index : cand->right_index;
+		if (index < 0) {
+			continue;
+		}
+		if (candidate_is_present_locked(cand)) {
+			return cand;
+		}
+	}
+	return NULL;
 }
 
 //! Caller holds the mutex (or is the single-threaded builder path).
 static bool
 provider_holds_roles_locked(void)
 {
-	int64_t now = os_monotonic_get_ns();
-
-	if (g_arb.have_verdict && (now - g_arb.verdict_at_ns) < ARBITER_PRESENCE_POLL_NS) {
-		return g_arb.provider_holds;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->iface == NULL) {
+			continue; // The qwerty floor is not a provider.
+		}
+		if (candidate_is_present_locked(cand)) {
+			return true;
+		}
 	}
-
-	bool holds = query_provider_presence();
-	if (g_arb.have_verdict && holds != g_arb.provider_holds) {
-		U_LOG_W("input arbiter: provider hardware %s — hand roles move to %s.",
-		        holds ? "present again" : "gone", holds ? "the provider" : "qwerty");
-	}
-	g_arb.provider_holds = holds;
-	g_arb.have_verdict = true;
-	g_arb.verdict_at_ns = now;
-	return holds;
+	return false;
 }
 
 /*!
@@ -151,20 +220,11 @@ provider_holds_roles_locked(void)
 static void
 refresh_roles_locked(void)
 {
-	bool provider = provider_holds_roles_locked();
+	struct t_input_candidate *left_cand = pick_for_hand_locked(true);
+	struct t_input_candidate *right_cand = pick_for_hand_locked(false);
 
-	int32_t left = provider ? g_arb.provider_left_index : g_arb.qwerty_left_index;
-	int32_t right = provider ? g_arb.provider_right_index : g_arb.qwerty_right_index;
-
-	// A pair that is only half-populated falls back per hand, so an
-	// exotic provider that supplies one controller still leaves the
-	// other hand usable from the keyboard.
-	if (left < 0) {
-		left = provider ? g_arb.qwerty_left_index : g_arb.provider_left_index;
-	}
-	if (right < 0) {
-		right = provider ? g_arb.qwerty_right_index : g_arb.provider_right_index;
-	}
+	int32_t left = left_cand != NULL ? left_cand->left_index : -1;
+	int32_t right = right_cand != NULL ? right_cand->right_index : -1;
 
 	if (g_arb.roles.generation_id != 0 && g_arb.roles.left == left && g_arb.roles.right == right) {
 		return; // Nothing moved.
@@ -183,9 +243,9 @@ refresh_roles_locked(void)
 	g_arb.roles.left_profile = name_of(left_xdev);
 	g_arb.roles.right_profile = name_of(right_xdev);
 
-	U_LOG_W("input arbiter: hand roles -> left='%s' right='%s' (%s, generation %u).",
-	        left_xdev != NULL ? left_xdev->str : "<none>", right_xdev != NULL ? right_xdev->str : "<none>",
-	        provider ? "input provider" : "qwerty fallback", (unsigned)generation);
+	U_LOG_W("input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), generation %u.",
+	        left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
+	        right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand), (unsigned)generation);
 }
 
 static xrt_result_t
@@ -229,33 +289,77 @@ t_input_arbiter_reset(void)
 
 	os_mutex_lock(&g_arb_mutex);
 	memset(&g_arb, 0, sizeof(g_arb));
-	g_arb.provider_left_index = -1;
-	g_arb.provider_right_index = -1;
-	g_arb.qwerty_left_index = -1;
-	g_arb.qwerty_right_index = -1;
 	g_arb.roles = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
 	os_mutex_unlock(&g_arb_mutex);
 }
 
-void
-t_input_arbiter_note_provider_pair(struct xrt_device *left, struct xrt_device *right)
+/*!
+ * Append a candidate keeping the array sorted by priority ascending.
+ * Builder-path only (single-threaded), like the note_* callers.
+ */
+static void
+note_candidate(const struct xrt_input_plugin_iface *iface,
+               struct xrt_input_plugin_instance *inst,
+               uint32_t priority,
+               struct xrt_device *left,
+               struct xrt_device *right)
 {
-	g_arb.provider_left = left;
-	g_arb.provider_right = right;
+	if (g_arb.candidate_count >= ARBITER_MAX_CANDIDATES) {
+		U_LOG_W("input arbiter: candidate table full — dropping '%s'.",
+		        iface != NULL && iface->id != NULL ? iface->id : "?");
+		return;
+	}
+
+	// Insertion sort: find the first slot with a strictly higher
+	// priority value, shift the tail up. Ties keep insertion order.
+	int pos = g_arb.candidate_count;
+	while (pos > 0 && g_arb.candidates[pos - 1].priority > priority) {
+		g_arb.candidates[pos] = g_arb.candidates[pos - 1];
+		pos--;
+	}
+
+	struct t_input_candidate *cand = &g_arb.candidates[pos];
+	memset(cand, 0, sizeof(*cand));
+	cand->iface = iface;
+	cand->inst = inst;
+	cand->priority = priority;
+	cand->left = left;
+	cand->right = right;
+	cand->left_index = -1;
+	cand->right_index = -1;
+	g_arb.candidate_count++;
+}
+
+void
+t_input_arbiter_note_provider_pair(const struct xrt_input_plugin_iface *iface,
+                                   struct xrt_input_plugin_instance *inst,
+                                   uint32_t probe_order,
+                                   struct xrt_device *left,
+                                   struct xrt_device *right)
+{
+	if (left == NULL && right == NULL) {
+		return; // Nothing to arbitrate with.
+	}
+	note_candidate(iface, inst, probe_order, left, right);
 }
 
 void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right)
 {
-	g_arb.qwerty_left = left;
-	g_arb.qwerty_right = right;
+	if (left == NULL && right == NULL) {
+		return;
+	}
+	// UINT32_MAX: the floor — every provider outranks the keyboard.
+	note_candidate(NULL, NULL, 0xFFFFFFFFu, left, right);
 }
 
 bool
 t_input_arbiter_provider_holds_roles(void)
 {
 	if (!g_arb_mutex_ready) {
-		return query_provider_presence();
+		// Mutex init failed (t_input_arbiter_reset warned): degrade to
+		// the mutex-free walk — the builder path is single-threaded.
+		return provider_holds_roles_locked();
 	}
 
 	os_mutex_lock(&g_arb_mutex);
@@ -271,15 +375,13 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		return;
 	}
 
-	bool have_provider = g_arb.provider_left != NULL || g_arb.provider_right != NULL;
-	bool have_qwerty = g_arb.qwerty_left != NULL || g_arb.qwerty_right != NULL;
-	if (!have_provider || !have_qwerty) {
-		// Only one candidate exists, so there is nothing to arbitrate
-		// between; the static roles the builder already assigned are
-		// the right (and only) answer.
-		U_LOG_I("input arbiter: not installed — %s.",
-		        !have_provider ? "no input-provider devices (qwerty owns the hand roles)"
-		                       : "no qwerty devices to fall back to");
+	if (g_arb.candidate_count < 2) {
+		// Zero or one candidate: nothing to arbitrate between; the
+		// static roles the builder already assigned are the right
+		// (and only) answer.
+		U_LOG_I("input arbiter: not installed — %s.", g_arb.candidate_count == 0
+		                                                  ? "no hand-role candidates at all"
+		                                                  : "single candidate owns the hand roles");
 		return;
 	}
 
@@ -287,24 +389,28 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 
 	g_arb.xsysd = xsysd;
 	g_arb.fallback_get_roles = xsysd->get_roles;
-	g_arb.provider_left_index = index_of(xsysd, g_arb.provider_left);
-	g_arb.provider_right_index = index_of(xsysd, g_arb.provider_right);
-	g_arb.qwerty_left_index = index_of(xsysd, g_arb.qwerty_left);
-	g_arb.qwerty_right_index = index_of(xsysd, g_arb.qwerty_right);
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		cand->left_index = index_of(xsysd, cand->left);
+		cand->right_index = index_of(xsysd, cand->right);
+		// Force a fresh verdict: the builder's own query may be older
+		// than the provider's startup grace.
+		cand->have_verdict = false;
+	}
 
-	// Force a fresh verdict: the builder's own query may be older than
-	// the provider's startup grace.
-	g_arb.have_verdict = false;
 	refresh_roles_locked();
 
 	xsysd->get_roles = arbiter_get_roles;
 
 	os_mutex_unlock(&g_arb_mutex);
 
-	U_LOG_W(
-	    "input arbiter: installed — provider pair (%d,%d), qwerty pair (%d,%d); "
-	    "roles re-resolve on every xrSyncActions.",
-	    g_arb.provider_left_index, g_arb.provider_right_index, g_arb.qwerty_left_index, g_arb.qwerty_right_index);
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		const struct t_input_candidate *cand = &g_arb.candidates[i];
+		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d).", i, candidate_name(cand),
+		        (unsigned)cand->priority, cand->left_index, cand->right_index);
+	}
+	U_LOG_W("input arbiter: installed — %d candidates; roles re-resolve on every xrSyncActions.",
+	        g_arb.candidate_count);
 }
 
 void

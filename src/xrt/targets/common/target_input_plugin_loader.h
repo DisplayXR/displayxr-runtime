@@ -65,12 +65,49 @@ int
 target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max);
 
 /*!
- * Returns the @ref xrt_input_plugin_iface for the active provider (first
- * successful probe in ProbeOrder), or NULL if none is registered /
- * claimed the system. NULL signals the builder to keep qwerty as the
- * hand-role source. One-shot per process; thread-safety mirrors
- * `target_plugin_get_active` (first call happens on the single-threaded
- * `xrCreateInstance` path).
+ * How many providers loaded, ABI-passed and probed successfully.
+ *
+ * ADR-034 Amendment 3: the scan keeps EVERY claiming provider resident,
+ * ordered by ProbeOrder ascending, rather than stopping at the first.
+ * Which one drives the hands is a presence question the arbiter answers
+ * continuously (`target_input_arbiter.h`) — a modality going away hands
+ * the roles to the next-ranked one that is present, and only falls to
+ * qwerty when none is. Runs discovery on first call.
+ */
+int
+target_input_plugin_get_count(void);
+
+/*!
+ * The @p index'th provider's iface in priority order (0 = highest
+ * priority), or NULL when @p index is out of range. Runs discovery on
+ * first call; thread-safety mirrors `target_plugin_get_active` (first
+ * call happens on the single-threaded `xrCreateInstance` path).
+ */
+const struct xrt_input_plugin_iface *
+target_input_plugin_get_iface(int index);
+
+/*!
+ * The instance handle produced by the @p index'th provider's `probe()`,
+ * or NULL. Pair with @ref target_input_plugin_get_iface.
+ */
+struct xrt_input_plugin_instance *
+target_input_plugin_get_instance(int index);
+
+/*!
+ * The @p index'th provider's ProbeOrder — its arbitration priority,
+ * ascending (lower wins), exactly the DP loader's convention. Returns
+ * `UINT32_MAX` when @p index is out of range.
+ */
+uint32_t
+target_input_plugin_get_priority(int index);
+
+/*!
+ * The highest-priority claiming provider, or NULL if none is registered
+ * / claimed the system. Convenience alias for
+ * `target_input_plugin_get_iface(0)`, kept for diagnostics
+ * (`displayxr-cli`) and single-provider call sites. NOTE: this is the
+ * highest-*ranked* provider, not necessarily the one currently holding
+ * the hand roles — ask the arbiter for that.
  */
 const struct xrt_input_plugin_iface *
 target_input_plugin_get_active(void);

@@ -46,8 +46,6 @@
  */
 
 static int g_input_load_attempted = 0;
-static const struct xrt_input_plugin_iface *g_input_active_iface = NULL;
-static struct xrt_input_plugin_instance *g_input_active_instance = NULL;
 
 /*!
  * Outcome tally of the one discovery scan, for
@@ -66,7 +64,7 @@ static int g_input_scan_failed = 0;
  * Set by `input_try_load_one` when it returned NULL because the provider
  * declined cleanly (`XRT_ERROR_PROBER_NOT_SUPPORTED` from `negotiate` or
  * `probe`) rather than because it could not be dispatched. Read once per
- * entry by `input_discover_active`; the loader scan is single-threaded.
+ * entry by `input_discover_all`; the loader scan is single-threaded.
  */
 static bool g_input_last_declined = false;
 
@@ -75,6 +73,48 @@ static bool g_input_last_declined = false;
  * bound — a handful in practice.
  */
 #define MAX_INPUT_PLUGIN_ENTRIES 16
+
+/*!
+ * Every provider that loaded, ABI-passed and probed successfully, in
+ * priority order (ProbeOrder ascending; ties keep discovery order).
+ *
+ * ADR-034 Amendment 3: the scan no longer stops at the first success. A
+ * box may have several modalities registered at once (a desk hand
+ * tracker AND a pair of 6DOF controllers), and which one should drive
+ * the hands is a *presence* question answered continuously by the
+ * arbiter — not a load-order question answered once. Keeping every
+ * candidate resident is what lets the roles fall from a higher-priority
+ * modality to a lower one instead of straight to qwerty.
+ *
+ * Mirrors the DP loader's display-claim source set
+ * (`target_plugin_loader.c`, `g_display_sources`), which likewise
+ * consults every registered plug-in rather than only the active one.
+ */
+static struct input_provider_slot
+{
+	const struct xrt_input_plugin_iface *iface;
+	struct xrt_input_plugin_instance *inst;
+	uint32_t probe_order;
+} g_input_providers[MAX_INPUT_PLUGIN_ENTRIES];
+
+static int g_input_provider_count = 0;
+
+/*!
+ * Record a provider that loaded, ABI-passed and probed. Called by each
+ * platform's discovery pass in ProbeOrder, so the array ends up sorted.
+ */
+static void
+input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst, uint32_t order)
+{
+	if (iface == NULL || g_input_provider_count >= MAX_INPUT_PLUGIN_ENTRIES) {
+		return;
+	}
+	struct input_provider_slot *slot = &g_input_providers[g_input_provider_count++];
+	slot->iface = iface;
+	slot->inst = inst;
+	slot->probe_order = order;
+}
+
 
 
 /*
@@ -312,18 +352,16 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	return iface;
 }
 
-static const struct xrt_input_plugin_iface *
-input_discover_active(struct xrt_input_plugin_instance **out_inst)
+static void
+input_discover_all(void)
 {
-	*out_inst = NULL;
-
 	// Providers import DisplayXRClient.dll like DP plug-ins do (#328).
 	target_plugin_preload_runtime_core_dll();
 
 	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
 	int n = input_enumerate_registry(entries, MAX_INPUT_PLUGIN_ENTRIES);
 	if (n == 0) {
-		return NULL;
+		return;
 	}
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), input_compare_by_probe_order);
@@ -337,9 +375,13 @@ input_discover_active(struct xrt_input_plugin_instance **out_inst)
 		}
 		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
 		        entries[i].probe_order, entries[i].binary_path);
-		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], out_inst);
+		struct xrt_input_plugin_instance *inst = NULL;
+		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], &inst);
 		if (iface != NULL) {
-			return iface;
+			// Keep going: every claiming provider is a live
+			// candidate the arbiter can fall back to.
+			input_note_provider(iface, inst, entries[i].probe_order);
+			continue;
 		}
 		if (g_input_last_declined) {
 			g_input_scan_declined++;
@@ -348,11 +390,12 @@ input_discover_active(struct xrt_input_plugin_instance **out_inst)
 		}
 	}
 
-	U_LOG_I(
-	    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) — "
-	    "qwerty keeps the hand roles.",
-	    g_input_scan_declined, g_input_scan_failed);
-	return NULL;
+	if (g_input_provider_count == 0) {
+		U_LOG_I(
+		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) "
+		    "— qwerty keeps the hand roles.",
+		    g_input_scan_declined, g_input_scan_failed);
+	}
 }
 
 int
@@ -402,11 +445,10 @@ target_input_plugin_get_force_qwerty(void)
  * shell-side input path is unaffected.
  */
 
-static const struct xrt_input_plugin_iface *
-input_discover_active(struct xrt_input_plugin_instance **out_inst)
+static void
+input_discover_all(void)
 {
-	*out_inst = NULL;
-	return NULL;
+	// No providers on Android in v1 — g_input_provider_count stays 0.
 }
 
 int
@@ -706,25 +748,27 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	return iface;
 }
 
-static const struct xrt_input_plugin_iface *
-input_discover_active(struct xrt_input_plugin_instance **out_inst)
+static void
+input_discover_all(void)
 {
-	*out_inst = NULL;
-
 	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
 	int n = input_enumerate_all(entries, MAX_INPUT_PLUGIN_ENTRIES);
 	if (n == 0) {
 		U_LOG_I("input plugin loader: no input-provider manifests found.");
-		return NULL;
+		return;
 	}
 
 	U_LOG_I("input plugin loader: %d registered provider(s); attempting in filename order.", n);
 	for (int i = 0; i < n; i++) {
 		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
 		        entries[i].probe_order, entries[i].binary_path);
-		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], out_inst);
+		struct xrt_input_plugin_instance *inst = NULL;
+		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], &inst);
 		if (iface != NULL) {
-			return iface;
+			// Keep going: every claiming provider is a live
+			// candidate the arbiter can fall back to.
+			input_note_provider(iface, inst, entries[i].probe_order);
+			continue;
 		}
 		if (g_input_last_declined) {
 			g_input_scan_declined++;
@@ -733,11 +777,12 @@ input_discover_active(struct xrt_input_plugin_instance **out_inst)
 		}
 	}
 
-	U_LOG_I(
-	    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) — "
-	    "qwerty keeps the hand roles.",
-	    g_input_scan_declined, g_input_scan_failed);
-	return NULL;
+	if (g_input_provider_count == 0) {
+		U_LOG_I(
+		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) "
+		    "— qwerty keeps the hand roles.",
+		    g_input_scan_declined, g_input_scan_failed);
+	}
 }
 
 int
@@ -829,20 +874,53 @@ target_input_plugin_get_force_qwerty(void)
 const struct xrt_input_plugin_iface *
 target_input_plugin_get_active(void)
 {
-	if (g_input_load_attempted) {
-		return g_input_active_iface;
-	}
-	g_input_load_attempted = 1;
+	return target_input_plugin_get_iface(0);
+}
 
-	g_input_active_iface = input_discover_active(&g_input_active_instance);
-	return g_input_active_iface;
+const struct xrt_input_plugin_iface *
+target_input_plugin_get_iface(int index)
+{
+	if (!g_input_load_attempted) {
+		g_input_load_attempted = 1;
+		input_discover_all();
+	}
+	if (index < 0 || index >= g_input_provider_count) {
+		return NULL;
+	}
+	return g_input_providers[index].iface;
+}
+
+struct xrt_input_plugin_instance *
+target_input_plugin_get_instance(int index)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	if (index < 0 || index >= g_input_provider_count) {
+		return NULL;
+	}
+	return g_input_providers[index].inst;
+}
+
+uint32_t
+target_input_plugin_get_priority(int index)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	if (index < 0 || index >= g_input_provider_count) {
+		return 0xFFFFFFFFu;
+	}
+	return g_input_providers[index].probe_order;
+}
+
+int
+target_input_plugin_get_count(void)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	return g_input_provider_count;
 }
 
 struct xrt_input_plugin_instance *
 target_input_plugin_get_active_instance(void)
 {
-	(void)target_input_plugin_get_active();
-	return g_input_active_instance;
+	return target_input_plugin_get_instance(0);
 }
 
 void
