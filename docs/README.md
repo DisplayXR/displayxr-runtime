@@ -52,6 +52,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Transparency Modes](architecture/transparency-modes.md)** — canonical vocabulary: live/baked composition × shaped/unshaped windows, costs, rules, per-app table
 - **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
+- **[Service Architecture](architecture/service-architecture.md)** — the service as built: processes, threads, locks, the two compositor modes, client classes, failure domains, limits
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
 - **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
 
@@ -132,6 +133,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-032](adr/ADR-032-array-layered-swapchains-first-class.md) — Array (Layered) Swapchains Are First-Class Alongside the Tiled Atlas
 - [ADR-033](adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md) — The Party That Owns Placement Reports Geometry; the Weaver Owns Everything Phase
 - [ADR-034](adr/ADR-034-input-provider-plugins.md) — Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
+- [ADR-035](adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) — The Service Owns Arbitration, Runs One Compositor Pipeline, and Isolates Its Satellites
 <!-- END ADR INDEX -->
 
 ---
