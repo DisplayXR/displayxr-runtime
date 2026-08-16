@@ -64,6 +64,13 @@
 DEBUG_GET_ONCE_BOOL_OPTION(exit_on_disconnect, "IPC_EXIT_ON_DISCONNECT", false)
 DEBUG_GET_ONCE_BOOL_OPTION(exit_when_idle, "IPC_EXIT_WHEN_IDLE", false)
 DEBUG_GET_ONCE_NUM_OPTION(exit_when_idle_delay_ms, "IPC_EXIT_WHEN_IDLE_DELAY_MS", 5000)
+
+// #951: per-client [HEALTH] telemetry cadence. 0 disables; default 10 s. This is
+// the IPC-layer health snapshot (class/session/resources) — it works in BOTH
+// compositor modes because it reads only ipc_server state, unlike [RENDER] which
+// exists solely on the workspace render thread. Enrichment with commit cadence /
+// fence timeouts and a `displayxr-cli clients` view are follow-ups (#951).
+DEBUG_GET_ONCE_NUM_OPTION(health_period_ms, "DXR_HEALTH_MS", 10000)
 DEBUG_GET_ONCE_LOG_OPTION(ipc_log, "IPC_LOG", U_LOGGING_INFO)
 
 
@@ -534,6 +541,54 @@ error:
 	return xret;
 }
 
+/*!
+ * #951: emit one `[HEALTH]` line per connected client, throttled to DXR_HEALTH_MS.
+ * Runs on the mainloop thread and takes global_state.lock briefly (the same lock
+ * connect/disconnect take), so the snapshot is consistent with the slot table.
+ * IPC-layer facts only — the next wedge is attributable per client from one log
+ * window without a debugger, in standalone AND workspace mode.
+ */
+static void
+emit_health_if_elapsed(struct ipc_server *s)
+{
+	long period_ms = debug_get_num_option_health_period_ms();
+	if (period_ms <= 0) {
+		return;
+	}
+	static uint64_t last_ns = 0;
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (last_ns != 0 && (now_ns - last_ns) < (uint64_t)period_ms * U_TIME_1MS_IN_NS) {
+		return;
+	}
+	last_ns = now_ns;
+
+	os_mutex_lock(&s->global_state.lock);
+	uint32_t active = 0;
+	int32_t active_idx = s->global_state.active_client_index;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		if (s->threads[i].state != IPC_THREAD_RUNNING && s->threads[i].state != IPC_THREAD_STARTING) {
+			continue;
+		}
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
+		const char *name = cs->info.application_name[0] ? cs->info.application_name : "?";
+		// Class is not a first-class field yet (#960); derive the coarse kind:
+		// a session with no compositor is a headless relay (the WebXR bridge).
+		const char *kind = (ics->xc == NULL) ? "relay" : (cs->session_overlay ? "overlay" : "app");
+		active++;
+		U_LOG_W(
+		    "[HEALTH] slot=%u id=%u pid=%d kind=%s name='%s' session=%c%c%c io=%c primary=%c%s "
+		    "swapchains=%u spaces=%u",
+		        i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
+		        cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
+		        cs->primary_application ? 'y' : 'n', ((int32_t)cs->id == active_idx) ? " ACTIVE" : "",
+		        ics->swapchain_count, ics->space_count);
+	}
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d window_s=%ld", active, (uint32_t)IPC_MAX_CLIENTS, active_idx,
+	        period_ms / 1000);
+	os_mutex_unlock(&s->global_state.lock);
+}
+
 static int
 main_loop(struct ipc_server *s)
 {
@@ -558,6 +613,9 @@ main_loop(struct ipc_server *s)
 				}
 			}
 		}
+
+		// #951: per-client health snapshot, throttled.
+		emit_health_if_elapsed(s);
 
 		// Check polling.
 		ipc_server_mainloop_poll(s, &s->ml);
