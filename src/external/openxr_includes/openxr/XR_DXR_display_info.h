@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 16
+#define XR_DXR_display_info_SPEC_VERSION 17
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -431,6 +431,56 @@ typedef struct XrEventDataEyeTrackingStateChangedDXR {
     XrBool32                    isTracking; //!< New state
     XrEyeTrackingModeDXR        activeMode; //!< Session's MANAGED/MANUAL preference at edge time
 } XrEventDataEyeTrackingStateChangedDXR;
+
+// ---- v17: Display-mode request denial (panel lease, ADR-035 D2 / #961) ----
+
+#define XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR ((XrStructureType)1004999014)
+
+//! Sentinel for XrEventDataDisplayModeRequestDeniedDXR::requestedModeIndex when
+//! the denied request carried no content mode (a pure xrRequestDisplayModeDXR).
+#define XR_DISPLAY_MODE_INDEX_NONE_DXR 0xFFFFFFFFu
+
+/*!
+ * @brief Why a display-mode request was denied.
+ *
+ * The runtime holds a single PANEL LEASE: while a workspace controller is
+ * active it owns the display mode; otherwise the built-in policy grants it to
+ * the focused session. A request from any other session is not applied and is
+ * NOT queued for later — this event is the only answer it gets. A request that
+ * the display hardware itself refuses (DISPLAY_PROCESSOR_REJECTED) leaves the
+ * runtime's reported mode unchanged.
+ */
+typedef enum XrDisplayModeDenialReasonDXR {
+    XR_DISPLAY_MODE_DENIAL_REASON_NONE_DXR = 0,
+    XR_DISPLAY_MODE_DENIAL_REASON_WORKSPACE_OWNS_MODE_DXR = 1,        //!< a workspace controller owns the panel
+    XR_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED_DXR = 2,                //!< no controller; only the focused session may request
+    XR_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR_DXR = 3,       //!< nothing to apply the request to
+    XR_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED_DXR = 4, //!< the display hardware refused the state
+    XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR = 5,            //!< a relay (WebXR bridge) owns this session's mode
+    XR_DISPLAY_MODE_DENIAL_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDisplayModeDenialReasonDXR;
+
+/*!
+ * @brief Event delivered to the requesting session when its
+ * xrRequestDisplayRenderingModeDXR / xrRequestDisplayModeDXR call was denied.
+ *
+ * Both entry points return XR_SUCCESS at call time (the request is forwarded
+ * to the runtime's mode owner); this event, or a
+ * XrEventDataRenderingModeChangedDXR / XrEventDataHardwareDisplayStateChangedDXR,
+ * is the outcome. requestedModeIndex is XR_DISPLAY_MODE_INDEX_NONE_DXR when the
+ * request carried no content mode; requestedHardware3D is -1 when it carried no
+ * hardware state, else 0 (2D) / 1 (3D).
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataDisplayModeRequestDeniedDXR {
+    XrStructureType               type;       //!< Must be XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR
+    const void* XR_MAY_ALIAS      next;
+    XrSession                     session;
+    uint32_t                      requestedModeIndex;
+    int32_t                       requestedHardware3D;
+    XrDisplayModeDenialReasonDXR  reason;
+} XrEventDataDisplayModeRequestDeniedDXR;
 
 #ifdef __cplusplus
 }

@@ -1482,12 +1482,15 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	// #518: only gate when a workspace controller is ACTUALLY active. In
 	// single-app out-of-process (no shell), no controller exists, so the lone app
 	// owns its display mode — otherwise nobody could ever switch 2D<->3D in OOP.
-	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
-	    sess->compositor != NULL &&
-	    oxr_workspace_owns_display_policy(sess) &&
-	    !sess->is_active_workspace_controller) {
-		return XR_SUCCESS;
-	}
+	//
+	// #961 UPDATE: a service-mode app no longer decides anything locally and is
+	// no longer silently dropped. Its request is FORWARDED to the service, which
+	// holds the panel lease (the controller while one is active, else the
+	// focused client) and answers by event: XrEventDataRenderingModeChangedDXR /
+	// XrEventDataHardwareDisplayStateChangedDXR when applied (the poll arm in
+	// oxr_session.c then updates the local device index / view scales), or
+	// XrEventDataDisplayModeRequestDeniedDXR with a reason. See below, after the
+	// controller path.
 
 	// Workspace controller path (#234): controllers legitimately own mode
 	// authority. Route through the compositor's acked-flip hook so the
@@ -1515,6 +1518,15 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "modeIndex %u >= rendering_mode_count %u",
 		                 modeIndex, head->rendering_mode_count);
+	}
+
+	// #961: service-mode APP path — forward to the panel-lease holder and let
+	// the service's events drive local state (no eager local writes, no local
+	// success events: the panel may not move at all).
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode && sess->compositor != NULL &&
+	    !sess->is_active_workspace_controller && !sess->is_bridge_relay) {
+		oxr_session_push_rendering_mode_ipc(sess, modeIndex);
+		return XR_SUCCESS;
 	}
 
 	uint32_t previousModeIndex = head->hmd->active_rendering_mode_index;
