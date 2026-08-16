@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*)
+**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*)
 **Date:** 2026-08-02
 
 ## Context
@@ -214,3 +214,95 @@ registration decision made once; there was no liveness signal at all.
   `ABSENT` forever. Across an idle disconnect presence is frozen, not
   cleared: the runtime closed the connection, the user did not unplug the
   device.
+
+## Amendment 2 — A provider's tracking volume is bolted to the rig, not to the world (2026-08-15)
+
+**Status:** Accepted. Adds a rule the original text left implicit, and one
+that **deliberately diverges from HMD VR semantics**.
+
+### The rule
+
+On a 3D display the viewer, the panel and the provider's sensor are **one
+physical assembly** — the *rig*. A Leap Motion sits on the same desk as the
+display. So:
+
+- **Voluntary rig motion — tracked input MUST follow, translation AND
+  rotation.** Mouse-look yaws the camera; if the hands keep pointing the old
+  way you cannot point at what you are looking at. WASD walks the camera; if
+  the hands stay behind they leave the screen entirely.
+- **Eye-tracked head parallax — tracked input MUST NOT follow, above all not
+  rotation.** The user's real hand is physically above the sensor on the desk.
+  If it swings when they lean or tilt, it destroys the one thing a 3D display
+  gets for free — that your hands are where your hands actually are — and it
+  fights the Kooima parallax that makes the display work.
+
+In HMD VR, world-fixed hands are the correct answer and this rule would be
+wrong. On a 3D display it is inverted, because the display does not travel
+with the head. Every provider author inherits this; it is not optional
+polish.
+
+### Why the provider does not implement it
+
+A provider's job stays exactly what Phase 1 said it was: report physically
+honest poses in **its own tracking volume**. How that volume is anchored to
+the world is a navigation question, and navigation is the runtime's business.
+Putting rig-awareness in the provider would leak navigation semantics across
+the vendor boundary (ADR-019) and make every future provider reimplement it —
+differently.
+
+### Decision
+
+Composition happens **once, in the runtime's space graph**, so it applies
+uniformly to grip/aim action spaces, `xrLocateSpace`, and the hand-joint base
+(`xrt_space_overseer::locate_device`) — in-process and over IPC alike.
+
+1. **The rig source is the head *device* pose**, not the view pose. Eye
+   tracking is applied later, at view-pose level, and never reaches the head
+   device pose (that is the fly camera qwerty drives). Composing against the
+   device pose therefore excludes parallax *for free* — there is no filter to
+   get wrong.
+
+2. **The composition is a travelled DELTA, not head-parenting:**
+
+   ```
+   world = (rig_now ∘ inverse(rig_initial)) ∘ device_volume
+   ```
+
+   Re-expressing the volume relative to the head would double-count the
+   standing height — the volume is anchored in stage space (an Ultraleap mount
+   offset is y≈1.45) while the head sits at y≈1.6 — and hang the hands off the
+   viewer's face. Moving by how far the rig has *travelled* is standard VR
+   locomotion semantics (move the player, not the hands) and yields the rule
+   exactly.
+
+3. **Mechanically:** `u_space_overseer` gains a `U_SPACE_TYPE_RIG` node
+   parented to the root, whose relation resolves to that delta, plus
+   `u_space_overseer_set_rig_source()` /
+   `u_space_overseer_set_device_rig_relative()`. The builder re-parents each
+   provider device's tracking-origin space onto that node
+   (`u_builder_roles_helper::rig_relative`, filled by
+   `t_builder_add_input_provider_devices`). `rig_initial` is captured once,
+   when composition is armed at build time.
+
+4. **Qwerty is deliberately excluded.** Its controllers already compose
+   against the qwerty HMD (`qwerty_device.c`, `follow_hmd`) — in the qwerty
+   model the "HMD" *is* the rig. Marking them too would move them twice. Only
+   a device whose space sits directly on the root may be marked; the setter
+   refuses anything else, and refuses the rig source itself.
+
+### Consequences
+
+- **Provider poses are no longer world-fixed.** A provider author reading only
+  Phase 1 would not expect this. It is the price of the volume being physically
+  attached to a display that moves.
+- **The delta is a pose, not a velocity.** Reported linear/angular velocities
+  do not include the rig's own motion. Nothing consumes them for hands today;
+  if something does, this is where to fix it.
+- **Inert until used.** With no provider device flagged, the rig node is never
+  created and the graph is byte-for-byte the old one — qwerty-only boxes and
+  every non-provider device are untouched.
+- **Recentering the rig carries the hands**, which is correct: a recenter is
+  voluntary.
+- Covered by `tests/tests_space_overseer_rig.cpp`, which pins both halves of
+  the rule — including that an *un*flagged device stays world-fixed, so the
+  divergence from HMD semantics stays a deliberate opt-in.

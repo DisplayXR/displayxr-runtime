@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_prober.h"
+#include "xrt/xrt_system.h"
 
 
 #ifdef __cplusplus
@@ -101,6 +102,20 @@ struct u_builder_roles_helper
 			struct xrt_device *right;
 		} conforming;
 	} hand_tracking;
+
+	/*!
+	 * Devices whose tracking volume is physically bolted to the rig (the
+	 * display + viewer + desk-mounted sensor assembly) rather than to the
+	 * world, so their poses must follow voluntary rig motion. See
+	 * @ref u_space_overseer_set_device_rig_relative for the full rule.
+	 *
+	 * Composed against @ref u_builder_roles_helper::head, which is the
+	 * voluntary fly camera. Leave empty for world-fixed behaviour.
+	 */
+	struct xrt_device *rig_relative[XRT_SYSTEM_MAX_DEVICES];
+
+	//! Number of valid entries in @ref u_builder_roles_helper::rig_relative.
+	uint32_t rig_relative_count;
 };
 
 /*!

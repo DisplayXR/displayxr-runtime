@@ -9,6 +9,7 @@
  */
 
 #include "xrt/xrt_space.h"
+#include "xrt/xrt_defines.h"
 
 
 #ifdef __cplusplus
@@ -18,6 +19,7 @@ extern "C" {
 
 struct u_space_overseer;
 struct xrt_session_event_sink;
+struct xrt_device;
 
 
 /*
@@ -73,6 +75,45 @@ u_space_overseer_create_null_space(struct u_space_overseer *uso,
  */
 void
 u_space_overseer_link_space_to_device(struct u_space_overseer *uso, struct xrt_space *xs, struct xrt_device *xdev);
+
+/*!
+ * Name the device whose pose is the **voluntary rig** — the fly camera / display
+ * rig that navigation (WASD, mouse-look) moves through the world. Arms the rig
+ * delta at the pose the device reports right now; that pose becomes "not
+ * travelled yet".
+ *
+ * Devices marked with @ref u_space_overseer_set_device_rig_relative then follow
+ * that delta. Nothing else changes: with no rig-relative device this is inert.
+ *
+ * Must be called after the device spaces exist (i.e. after
+ * @ref u_space_overseer_legacy_setup) and before any session locates a space.
+ * Must not be called twice.
+ *
+ * @ingroup aux_util
+ */
+void
+u_space_overseer_set_rig_source(struct u_space_overseer *uso, struct xrt_device *rig_xdev, enum xrt_input_name name);
+
+/*!
+ * Declare that @p xdev's tracking volume is physically bolted to the rig, so its
+ * poses must be composed with how far the rig has travelled.
+ *
+ * This is the 3D-display class rule and it deliberately diverges from HMD VR
+ * semantics: a desk-mounted hand tracker sits on the same table as the panel, so
+ * navigating carries it along, while the viewer's head moving *about* the panel
+ * (eye-tracked parallax) must NOT move it — the whole value of a 3D display is
+ * that your hands stay where your hands actually are. Composing against the head
+ * *device* pose gets that for free, because eye tracking is applied later, at
+ * view-pose level.
+ *
+ * Only devices whose space sits directly on the root can be marked; a device
+ * that already composes against the camera itself (qwerty's controllers follow
+ * the qwerty HMD) must NOT be marked or it moves twice.
+ *
+ * @ingroup aux_util
+ */
+void
+u_space_overseer_set_device_rig_relative(struct u_space_overseer *uso, struct xrt_device *xdev);
 
 
 /*

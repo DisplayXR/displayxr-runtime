@@ -274,6 +274,20 @@ u_builder_roles_helper_open_system(struct xrt_builder *xb,
 	    true,                               // per_app_local_spaces
 	    out_xso);                           // out_xso
 
+	/*
+	 * Rig composition. Devices the builder flagged as bolted to the rig
+	 * follow the head *device* pose — the voluntary fly camera — and not
+	 * eye-tracked parallax, which is applied later at view-pose level.
+	 */
+	if (ubrh.rig_relative_count > 0 && ubrh.head != NULL) {
+		struct u_space_overseer *uso = (struct u_space_overseer *)*out_xso;
+
+		u_space_overseer_set_rig_source(uso, ubrh.head, XRT_INPUT_GENERIC_HEAD_POSE);
+		for (uint32_t i = 0; i < ubrh.rig_relative_count; i++) {
+			u_space_overseer_set_device_rig_relative(uso, ubrh.rig_relative[i]);
+		}
+	}
+
 	return XRT_SUCCESS;
 }
 

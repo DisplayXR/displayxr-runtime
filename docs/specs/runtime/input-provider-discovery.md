@@ -166,6 +166,42 @@ the life of the process.
    machine configuration. Set it process-level — the runtime DLL has its
    own static-CRT environment block.)
 
+## 4a. Pose anchoring — provider volumes are rig-relative
+
+A provider reports poses **in its own tracking volume** and says nothing about
+where that volume sits in the world. On a 3D display the sensor is on the same
+desk as the panel, so the runtime anchors the volume to the **rig** — the
+viewer + display + sensor assembly — not to the world (ADR-034 *Amendment 2*).
+
+The resulting rule, which **diverges from HMD VR semantics and is not
+optional**:
+
+| Motion | Do provider poses follow? |
+|---|---|
+| Voluntary rig motion — WASD, mouse-look (translation **and** rotation) | **Yes** |
+| Eye-tracked head parallax — viewer leaning/tilting about the panel | **No** |
+
+Mechanically, `t_builder_add_input_provider_devices()` lists every device it
+adds in `u_builder_roles_helper::rig_relative`; the builder helper then calls
+`u_space_overseer_set_rig_source()` (the head *device* pose — the fly camera;
+eye tracking lands later at view-pose level and never reaches it) and
+`u_space_overseer_set_device_rig_relative()` per device. The space overseer
+re-parents each device's tracking-origin space onto a `U_SPACE_TYPE_RIG` node
+that resolves to `rig_now ∘ inverse(rig_initial)` — how far the rig has
+**travelled**, captured once at build time.
+
+Provider-facing consequences:
+
+- **Do not compose a camera or navigation transform in the provider.** It will
+  be applied twice. Report the sensor's honest reading plus your mount offset.
+- Your mount offset stays in **stage** space (e.g. a desk-mounted Leap at
+  y≈1.45). Do not express it relative to the head.
+- Devices that already follow the camera themselves are excluded — qwerty's
+  controllers parent to the qwerty HMD (`follow_hmd`) and are never marked.
+- Applies uniformly to grip/aim action spaces, `xrLocateSpace`, and the
+  hand-joint base (`xrt_space_overseer::locate_device`), in-process and over
+  IPC. Covered by `tests/tests_space_overseer_rig.cpp`.
+
 ## 5. In-tree reference providers (planned)
 
 | Provider | Status | Purpose |
