@@ -148,6 +148,10 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataEyeTrackingStateChangedDXR *changed = (XrEventDataEyeTrackingStateChangedDXR *)type;
 		return changed->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR: {
+		XrEventDataDisplayModeRequestDeniedDXR *denied = (XrEventDataDisplayModeRequestDeniedDXR *)type;
+		return denied->session == session;
+	}
 #ifdef OXR_HAVE_DXR_local_3d_zone
 	case XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR: {
 		XrEventDataLocal3DZoneViewSizeChangedDXR *changed = (XrEventDataLocal3DZoneViewSizeChangedDXR *)type;
@@ -519,6 +523,37 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
 	event->result = XR_SUCCESS;
 
 	U_LOG_I("OXR EVENT: Hardware display state changed to %s", hardwareDisplay3D ? "3D" : "2D");
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDisplayModeRequestDenied(struct oxr_logger *log,
+                                                   struct oxr_session *sess,
+                                                   uint32_t requestedModeIndex,
+                                                   int32_t requestedHardware3D,
+                                                   uint32_t reason)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDisplayModeRequestDeniedDXR *denied;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &denied);
+
+	denied->type = XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR;
+	denied->next = NULL;
+	denied->session = oxr_session_to_openxr(sess);
+	denied->requestedModeIndex = requestedModeIndex;
+	denied->requestedHardware3D = requestedHardware3D;
+	denied->reason = (XrDisplayModeDenialReasonDXR)reason;
+	event->result = XR_SUCCESS;
+
+	U_LOG_W("OXR EVENT: Display mode request DENIED (mode=%u hw=%d reason=%u) — panel lease held elsewhere (#961)",
+	        requestedModeIndex, requestedHardware3D, reason);
 
 	lock(inst);
 	push(inst, event);

@@ -494,7 +494,9 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	// forward to the browser and own no DP.
 	if (!sess->is_bridge_relay) {
 		comp_ipc_client_compositor_request_display_mode(&sess->xcn->base, enable_3d ? 1u : 0u);
-		sess->hardware_display_3d = enable_3d;
+		// #961: do NOT record the state locally — the service holds the panel
+		// lease and answers with XrEventDataHardwareDisplayStateChangedDXR once
+		// the panel really moved, or XrEventDataDisplayModeRequestDeniedDXR.
 	}
 
 	(void)success;
@@ -1268,9 +1270,20 @@ skip_macos_pump:
 			break;
 		case XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE:
 #ifdef OXR_HAVE_DXR_display_info
+			// #961: the service emits this only once the panel state is REAL,
+			// so it is the authoritative source for the session's view of it
+			// (a service-mode app no longer writes it locally at request time).
+			sess->hardware_display_3d = xse.hardware_display_state_change.hardware_display_3d;
 			oxr_event_push_XrEventDataHardwareDisplayStateChanged(
 			    log, sess,
 			    xse.hardware_display_state_change.hardware_display_3d ? XR_TRUE : XR_FALSE);
+#endif // OXR_HAVE_DXR_display_info
+			break;
+		case XRT_SESSION_EVENT_DISPLAY_MODE_REQUEST_DENIED:
+#ifdef OXR_HAVE_DXR_display_info
+			oxr_event_push_XrEventDataDisplayModeRequestDenied(
+			    log, sess, xse.display_mode_request_denied.requested_mode_index,
+			    xse.display_mode_request_denied.requested_hw_3d, xse.display_mode_request_denied.reason);
 #endif // OXR_HAVE_DXR_display_info
 			break;
 		case XRT_SESSION_EVENT_FILE_PICKER_COMPLETE:

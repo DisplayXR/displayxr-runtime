@@ -2191,22 +2191,48 @@ broadcast_rendering_mode_change(struct d3d11_service_system *sys,
 		return;
 	}
 
+	// #961: CONTENT mode only. The hardware event is emitted by
+	// broadcast_hardware_state() AFTER the DP confirmed the lens change (or when
+	// the vendor poll observed it) — never speculatively from a mode request.
 	union xrt_session_event xse = {};
 	xse.rendering_mode_change.type = XRT_SESSION_EVENT_RENDERING_MODE_CHANGE;
 	xse.rendering_mode_change.previous_mode_index = prev_idx;
 	xse.rendering_mode_change.current_mode_index = new_idx;
 	u_system_broadcast_event(sys->usys, &xse);
+}
 
-	if (prev_idx < head->rendering_mode_count && new_idx < head->rendering_mode_count) {
-		bool prev_3d = head->rendering_modes[prev_idx].hardware_display_3d;
-		bool new_3d = head->rendering_modes[new_idx].hardware_display_3d;
-		if (prev_3d != new_3d) {
-			union xrt_session_event xse2 = {};
-			xse2.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
-			xse2.hardware_display_state_change.hardware_display_3d = new_3d;
-			u_system_broadcast_event(sys->usys, &xse2);
-		}
+//! #961: tell every session the panel's hardware 2D/3D state — call only once
+//! the state is REAL (DP accepted the request, or the vendor poll read it).
+static void
+broadcast_hardware_state(struct d3d11_service_system *sys, bool hardware_3d)
+{
+	if (sys == nullptr || sys->usys == nullptr) {
+		return;
 	}
+	union xrt_session_event xse = {};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = hardware_3d;
+	u_system_broadcast_event(sys->usys, &xse);
+}
+
+//! #961: targeted "your mode request was denied" event to ONE client's session.
+static void
+push_mode_request_denied(struct d3d11_service_compositor *c,
+                         uint32_t requested_mode_index,
+                         int requested_hw_3d,
+                         enum xrt_display_mode_denial_reason reason)
+{
+	if (c == nullptr || c->xses == nullptr) {
+		return;
+	}
+	union xrt_session_event xse = {};
+	xse.display_mode_request_denied.type = XRT_SESSION_EVENT_DISPLAY_MODE_REQUEST_DENIED;
+	xse.display_mode_request_denied.requested_mode_index = requested_mode_index;
+	xse.display_mode_request_denied.requested_hw_3d = requested_hw_3d;
+	xse.display_mode_request_denied.reason = (uint32_t)reason;
+	xrt_session_event_sink_push(c->xses, &xse);
+	U_LOG_W("[lease] mode request DENIED for client '%s' (content=%u hw=%d): reason=%u", c->slot_app_name,
+	        requested_mode_index, requested_hw_3d, (uint32_t)reason);
 }
 
 /*!
@@ -2256,6 +2282,10 @@ multi_compositor_request_mode_flip(struct d3d11_service_system *sys,
 	    target_mode_idx == mc->mode_flip.source_mode_index) {
 		U_LOG_W("[mode_flip] toggle-back to source %u while pending — aborting",
 		        target_mode_idx);
+		// #761: the apps were told source->target at request time; tell them
+		// the transition did not land so they re-submit at the source layout.
+		broadcast_rendering_mode_change(sys, head, mc->mode_flip.target_mode_index,
+		                                mc->mode_flip.source_mode_index);
 		mc->mode_flip.phase = MFP_IDLE;
 		mc->mode_flip.curtain_active = false;
 		return;
@@ -2332,6 +2362,121 @@ dp_request_display_mode_checked(struct xrt_display_processor_d3d11 *xdp, bool en
 #define DP_REQUEST_DISPLAY_MODE(xdp, enable_3d) dp_request_display_mode_checked((xdp), (enable_3d), __func__, __LINE__)
 
 /*!
+ * #961: request the hardware state and report whether the runtime may now
+ * treat it as CONFIRMED. A DP that has no request_display_mode slot at all
+ * (sim_display — its mode switching rides XRT_DEVICE_PROPERTY_OUTPUT_MODE) has
+ * nothing to confirm, so the request counts as accepted; a DP that HAS the slot
+ * and returns false rejected it, and the caller must not record the new state.
+ */
+static bool
+dp_request_display_mode_confirmed(struct xrt_display_processor_d3d11 *xdp, bool enable_3d, const char *func, int line)
+{
+	if (xdp == nullptr) {
+		return false;
+	}
+	if (!XRT_DP_HAS_SLOT(xdp, request_display_mode) || xdp->request_display_mode == NULL) {
+		return true; // nothing to confirm (mode-neutral DP)
+	}
+	return dp_request_display_mode_checked(xdp, enable_3d, func, line);
+}
+#define DP_REQUEST_DISPLAY_MODE_CONFIRMED(xdp, enable_3d)                                                              \
+	dp_request_display_mode_confirmed((xdp), (enable_3d), __func__, __LINE__)
+
+//! #961: stamp the post-flip cooldown so the 100 ms vendor poll doesn't
+//! counter-correct a panel that is mid-transition (the same refresh every
+//! immediate-flip site used to do by hand).
+static void
+stamp_flip_cooldown(struct d3d11_service_system *sys, bool hardware_3d)
+{
+	int64_t now_ns = os_monotonic_get_ns();
+	sys->cached_3d_state.store(hardware_3d, std::memory_order_relaxed);
+	sys->cached_3d_state_valid.store(true, std::memory_order_release);
+	sys->last_3d_state_poll_ns.store(now_ns, std::memory_order_release);
+	sys->last_flip_landed_ns.store(now_ns, std::memory_order_release);
+}
+
+/*!
+ * #961: THE immediate-flip primitive. Every non-acked (standalone / weave /
+ * bridge-relay / runtime-initiated) mode writer goes through here instead of
+ * hand-rolling "write index, broadcast, call DP, sync tiles, set flag".
+ *
+ * Order (ADR-035 D2 / #761): the DP is asked FIRST; only when it confirms are the
+ * content index, OUTPUT_MODE property, tile layout and hardware flag written and
+ * the events broadcast — content change, then hardware change (only if the
+ * hardware state actually changed). On rejection nothing is written and nothing
+ * is broadcast, so apps never believe in a mode the panel did not reach.
+ *
+ * @param target_idx  content mode to land, or UINT32_MAX to keep the active one.
+ * @param want_3d     hardware state to request.
+ * @param xdp         DP to drive; nullptr = do not touch the DP (the caller knows
+ *                    the hardware is already at want_3d, e.g. the vendor poll,
+ *                    or a mask-capable DP is driven by the zone wish).
+ * @param tag         log tag.
+ * @return true if the transition landed (or nothing needed to change).
+ */
+static bool
+apply_mode_transition(struct d3d11_service_system *sys,
+                      struct xrt_device *head,
+                      struct xrt_display_processor_d3d11 *xdp,
+                      uint32_t target_idx,
+                      bool want_3d,
+                      const char *tag)
+{
+	if (sys == nullptr || head == nullptr || head->hmd == NULL) {
+		return false;
+	}
+	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+	bool prev_3d = sys->hardware_display_3d;
+	if (target_idx != UINT32_MAX && target_idx >= head->rendering_mode_count) {
+		return false;
+	}
+
+	if (xdp != nullptr && want_3d != prev_3d) {
+		if (!DP_REQUEST_DISPLAY_MODE_CONFIRMED(xdp, want_3d)) {
+			U_LOG_W("[%s] DP rejected hardware %s — mode %u -> %u NOT applied (#761)", tag,
+			        want_3d ? "3D" : "2D", prev_idx, target_idx == UINT32_MAX ? prev_idx : target_idx);
+			return false;
+		}
+	} else if (xdp != nullptr) {
+		// Same hardware state: re-assert is harmless and keeps a drifted vendor
+		// honest; its verdict does not gate the content change.
+		(void)DP_REQUEST_DISPLAY_MODE(xdp, want_3d);
+	}
+
+	if (target_idx != UINT32_MAX && target_idx != prev_idx) {
+		if (prev_idx < head->rendering_mode_count && head->rendering_modes[prev_idx].hardware_display_3d) {
+			sys->last_3d_mode_index = prev_idx;
+		}
+		head->hmd->active_rendering_mode_index = target_idx;
+		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target_idx);
+		broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
+	}
+	sync_tile_layout(sys);
+	sys->hardware_display_3d = want_3d;
+	if (want_3d != prev_3d) {
+		broadcast_hardware_state(sys, want_3d);
+	}
+	stamp_flip_cooldown(sys, want_3d);
+	return true;
+}
+
+/*!
+ * #961: does this client hold the PANEL LEASE right now? Under a workspace the
+ * lease is the controller's (its own commit path never gets here — mode goes
+ * through the acked flip); otherwise the built-in default policy grants it to
+ * the FOCUSED presenting client (c->state_focused mirrors the one focus
+ * authority, #962). Non-holders' requests are denied with a reason event.
+ */
+static inline bool
+client_holds_panel_lease(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (sys->workspace_mode) {
+		return false; // the controller holds it; it never asks per-client
+	}
+	return c->state_focused;
+}
+
+/*!
  * Per-frame tick for the workspace mode-flip state machine (#234).
  *
  * Called once near the top of multi_compositor_render, before the per-tile
@@ -2371,6 +2516,11 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		if (active_ipc_count == 0 || mc->display_processor == nullptr) {
 			U_LOG_W("[mode_flip] aborting pending flip — teardown (active_ipc=%d, dp=%p)",
 			        active_ipc_count, (void *)mc->display_processor);
+			// #761: the apps were told source->target at request time and the
+			// device index was (correctly) never written — tell them the flip
+			// did not land so nobody is stranded believing in the target.
+			broadcast_rendering_mode_change(sys, head, mc->mode_flip.target_mode_index,
+			                                mc->mode_flip.source_mode_index);
 			mc->mode_flip.phase = MFP_IDLE;
 			mc->mode_flip.curtain_active = false;
 			return;
@@ -2399,13 +2549,31 @@ multi_compositor_apply_pending_mode_flip(struct d3d11_service_system *sys)
 		// OUTPUT_MODE property (instead of consuming the event) also see
 		// the change. Apps that DO consume the event still get it via the
 		// broadcast in request_mode_flip.
+		// #961/#761: ask the DP FIRST; land the runtime state only when it
+		// confirms. On rejection revert the event (the apps have already been
+		// told source->target) and drop the flip — the panel did not move.
+		bool prev_hw_3d = sys->hardware_display_3d;
+		if (prev_hw_3d != mc->mode_flip.target_is_3d &&
+		    !DP_REQUEST_DISPLAY_MODE_CONFIRMED(mc->display_processor, mc->mode_flip.target_is_3d)) {
+			U_LOG_W("[mode_flip] DP rejected hardware %s — reverting %u -> %u (#761)",
+			        mc->mode_flip.target_is_3d ? "3D" : "2D", mc->mode_flip.target_mode_index,
+			        mc->mode_flip.source_mode_index);
+			broadcast_rendering_mode_change(sys, head, mc->mode_flip.target_mode_index,
+			                                mc->mode_flip.source_mode_index);
+			mc->mode_flip.phase = MFP_IDLE;
+			mc->mode_flip.curtain_active = false;
+			return;
+		} else if (prev_hw_3d == mc->mode_flip.target_is_3d) {
+			(void)DP_REQUEST_DISPLAY_MODE(mc->display_processor, mc->mode_flip.target_is_3d);
+		}
 		head->hmd->active_rendering_mode_index = mc->mode_flip.target_mode_index;
 		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
 		                        (int32_t)mc->mode_flip.target_mode_index);
-		DP_REQUEST_DISPLAY_MODE(
-		    mc->display_processor, mc->mode_flip.target_is_3d);
 		sync_tile_layout(sys);
 		sys->hardware_display_3d = mc->mode_flip.target_is_3d;
+		if (prev_hw_3d != mc->mode_flip.target_is_3d) {
+			broadcast_hardware_state(sys, mc->mode_flip.target_is_3d);
+		}
 
 		mc->mode_flip.phase = MFP_FLIPPING;
 		mc->mode_flip.flip_frame_counter = 0;
@@ -10305,21 +10473,46 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
  * which is what pinned every weave client to whatever mode
  * weave_force_3d_if_needed happened to pick (#776 blocker 1).
  *
- * Gated to standalone: workspace uses the controller's acked flip, the bridge
- * uses the HWND relay.
+ * #961 — the PANEL LEASE is enforced here. A request from a client that does
+ * not hold the lease (workspace mode: the controller holds it; standalone: only
+ * the focused client; a live bridge relay owns the mode of the client it
+ * relays) is CONSUMED and DENIED with a reason event — never latched for a later
+ * replay (the pre-#961 early return left pending_* set, so a request made under
+ * the shell fired the moment the workspace deactivated). @p as_service bypasses
+ * the lease for runtime-initiated transitions (the #814 teardown failsafe).
  *
  * @return true if a request was found and applied.
  */
 static bool
-service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool bridge_live)
+service_apply_pending_mode(struct d3d11_service_system *sys,
+                           struct d3d11_service_compositor *c,
+                           bool bridge_live,
+                           bool as_service = false)
 {
-	if (sys->workspace_mode || bridge_live || c->render.display_processor == nullptr || sys->xsysd == NULL) {
-		return false;
-	}
 	uint32_t req_mode = c->pending_content_mode.exchange(0xFFFFFFFFu, std::memory_order_acq_rel);
 	int req_hw = c->pending_hw_3d.exchange(-1, std::memory_order_acq_rel);
-	struct xrt_device *head = sys->xsysd->static_roles.head;
-	if ((req_mode == 0xFFFFFFFFu && req_hw < 0) || head == nullptr || head->hmd == NULL) {
+	if (req_mode == 0xFFFFFFFFu && req_hw < 0) {
+		return false;
+	}
+	struct xrt_device *head = sys->xsysd != NULL ? sys->xsysd->static_roles.head : nullptr;
+
+	// Lease / veto checks — DENY with a reason, drop the request.
+	enum xrt_display_mode_denial_reason deny = XRT_DISPLAY_MODE_DENIAL_REASON_NONE;
+	if (!as_service) {
+		if (sys->workspace_mode) {
+			deny = XRT_DISPLAY_MODE_DENIAL_REASON_WORKSPACE_OWNS_MODE;
+		} else if (bridge_live) {
+			deny = XRT_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE;
+		} else if (!client_holds_panel_lease(sys, c)) {
+			deny = XRT_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED;
+		}
+	}
+	if (deny == XRT_DISPLAY_MODE_DENIAL_REASON_NONE &&
+	    (c->render.display_processor == nullptr || head == nullptr || head->hmd == NULL)) {
+		deny = XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR;
+	}
+	if (deny != XRT_DISPLAY_MODE_DENIAL_REASON_NONE) {
+		push_mode_request_denied(c, req_mode, req_hw, deny);
 		return false;
 	}
 
@@ -10327,34 +10520,14 @@ service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_servic
 	// deferred-3D warmup kick so it can't fight the request.
 	c->render.deferred_3d_kicked = true;
 
-	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 	// Resolve the target hardware state: an explicit hardware request wins;
 	// otherwise follow the requested content mode's hardware_display_3d (the
 	// common no-divergence case).
 	bool want_3d = sys->hardware_display_3d;
+	uint32_t target_idx = UINT32_MAX;
 	if (req_mode != 0xFFFFFFFFu && req_mode < head->rendering_mode_count) {
 		want_3d = head->rendering_modes[req_mode].hardware_display_3d;
-		if (prev_idx != req_mode) {
-			// Remember the last 3D mode for later restores (vendor poll, etc.).
-			if (prev_idx < head->rendering_mode_count &&
-			    head->rendering_modes[prev_idx].hardware_display_3d) {
-				sys->last_3d_mode_index = prev_idx;
-			}
-			head->hmd->active_rendering_mode_index = req_mode;
-			broadcast_rendering_mode_change(sys, head, prev_idx, req_mode);
-		}
-		// #776 blocker 4: drive the head device's OUTPUT_MODE so the DP actually
-		// switches its per-view composition — the CONTENT-mode counterpart to the
-		// hardware 2D/3D DP_REQUEST_DISPLAY_MODE below. The Windows service is
-		// single-process, so this reaches the real head device (mirrors the macOS
-		// bridge in ipc_handle_compositor_request_rendering_mode). For sim_display
-		// this is the ONLY runtime lever that switches its weave view count
-		// (SBS/anaglyph/quad); without it a present-owner requesting mode 4 "Quad"
-		// held the index but the DP kept weaving 2 views unless SIM_DISPLAY_OUTPUT
-		// was set at service start. A real vendor DP that drives its own mode
-		// leaves set_property(OUTPUT_MODE) unimplemented — a harmless no-op, same
-		// as the macOS path assumes.
-		xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)req_mode);
+		target_idx = req_mode;
 	}
 	if (req_hw >= 0) {
 		want_3d = (req_hw != 0);
@@ -10371,18 +10544,18 @@ service_apply_pending_mode(struct d3d11_service_system *sys, struct d3d11_servic
 		c->hw_override.store(-1, std::memory_order_release);
 	}
 
-	DP_REQUEST_DISPLAY_MODE(c->render.display_processor, want_3d);
-	sync_tile_layout(sys);
-	sys->hardware_display_3d = want_3d;
-	// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll doesn't see
-	// the panel mid-transition and counter-correct (same refresh the deferred-3D
-	// kick / zones fallback do).
-	int64_t flip_ns = os_monotonic_get_ns();
-	sys->cached_3d_state.store(want_3d, std::memory_order_relaxed);
-	sys->last_3d_state_poll_ns.store(flip_ns, std::memory_order_release);
-	sys->last_flip_landed_ns.store(flip_ns, std::memory_order_release);
-	U_LOG_W("[app_mode] standalone IPC client requested mode (content=%u hw_req=%d) -> active=%u 3D=%d",
-	        req_mode, req_hw, head->hmd->active_rendering_mode_index, (int)want_3d);
+	// #776 blocker 4 lives inside apply_mode_transition: it drives the head
+	// device's OUTPUT_MODE (sim_display's only mode lever) alongside the DP's
+	// hardware request, DP first, events after confirmation (#761).
+	bool landed = apply_mode_transition(sys, head, c->render.display_processor, target_idx, want_3d, "app_mode");
+	if (!landed) {
+		push_mode_request_denied(c, req_mode, req_hw,
+		                         XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED);
+		return false;
+	}
+	U_LOG_W("[app_mode] %s IPC client '%s' requested mode (content=%u hw_req=%d) -> active=%u 3D=%d",
+	        as_service ? "service-driven" : "lease-holding", c->slot_app_name, req_mode, req_hw,
+	        head->hmd->active_rendering_mode_index, (int)want_3d);
 	return true;
 }
 
@@ -10750,24 +10923,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (head != nullptr && head->hmd != NULL &&
 			    modeIdx < head->rendering_mode_count &&
 			    modeIdx != head->hmd->active_rendering_mode_index) {
-				if (sys->multi_comp != nullptr) {
+				if (sys->workspace_mode &&
+				    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
 					multi_compositor_request_mode_flip(sys, modeIdx, /*origin=*/-1);
 					U_LOG_W("App-initiated mode change: request %u (via acked-flip)", modeIdx);
 				} else {
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-					head->hmd->active_rendering_mode_index = modeIdx;
-					broadcast_rendering_mode_change(sys, head, prev_idx, modeIdx);
-
 					bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
-					if (c->render.display_processor != nullptr) {
-						DP_REQUEST_DISPLAY_MODE(
-						    c->render.display_processor, want_3d);
-					}
-
-					sync_tile_layout(sys);
-					sys->hardware_display_3d = want_3d;
-					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)",
-					        prev_idx, modeIdx, (int)want_3d);
+					// #961: relay-owned request — DP first, events after confirmation.
+					bool landed = apply_mode_transition(sys, head, c->render.display_processor,
+					                                    modeIdx, want_3d, "bridge_relay");
+					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)%s", prev_idx,
+					        modeIdx, (int)want_3d, landed ? "" : " — DP REJECTED");
 				}
 			}
 		}
@@ -10817,18 +10984,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					target_idx = sys->last_3d_mode_index;
 				}
 
-				if (sys->multi_comp != nullptr) {
+				if (sys->workspace_mode &&
+				    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
 					multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
 				} else {
-					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-					head->hmd->active_rendering_mode_index = target_idx;
-					broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
-					if (c->render.display_processor != nullptr) {
-						DP_REQUEST_DISPLAY_MODE(
-						    c->render.display_processor, !force_2d);
-					}
-					sync_tile_layout(sys);
-					sys->hardware_display_3d = !force_2d;
+					// #961: runtime-initiated (V key) — DP first, events after.
+					(void)apply_mode_transition(sys, head, c->render.display_processor, target_idx,
+					                            !force_2d, "qwerty_v");
 				}
 			}
 		}
@@ -10971,29 +11133,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// so the intent is never corrupted; persisting the request across
 			// polls means the panel returns to 3D the instant the SR can weave
 			// again (tracking regained). Cooldown-refreshed so we don't hammer.
+			// #961: only the LEASE HOLDER's intent is re-asserted — an unfocused
+			// standalone client does not get to drive the panel back up.
 			if (!sys->workspace_mode && !bridge_live && got_state &&
-			    c->render.display_processor != nullptr && sys->hardware_display_3d &&
-			    !vendor_is_3d && !pending_flip && !in_cooldown) {
+			    c->render.display_processor != nullptr && sys->hardware_display_3d && !vendor_is_3d &&
+			    !pending_flip && !in_cooldown && client_holds_panel_lease(sys, c)) {
 				U_LOG_W("[force_3d] standalone vendor drifted to 2D (app wants 3D) — re-asserting 3D");
-				DP_REQUEST_DISPLAY_MODE(c->render.display_processor, true);
 				// If the content rendering mode also drifted to 2D (e.g. a prior
 				// demote before this re-assert was reached), restore the app's
-				// last 3D mode so it re-submits a 3D atlas.
+				// last 3D mode so it re-submits a 3D atlas. sys->hardware_display_3d
+				// is still true (the runtime's intent), so the helper re-asserts
+				// the DP without gating on its verdict and emits no hw event.
 				struct xrt_device *rhead = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
+				uint32_t restore_idx = UINT32_MAX;
 				if (rhead != nullptr && rhead->hmd != NULL) {
 					uint32_t cur = rhead->hmd->active_rendering_mode_index;
 					bool cur_is_3d = cur < rhead->rendering_mode_count &&
 					                 rhead->rendering_modes[cur].hardware_display_3d;
 					if (!cur_is_3d && sys->last_3d_mode_index < rhead->rendering_mode_count &&
 					    rhead->rendering_modes[sys->last_3d_mode_index].hardware_display_3d) {
-						rhead->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
-						broadcast_rendering_mode_change(sys, rhead, cur, sys->last_3d_mode_index);
+						restore_idx = sys->last_3d_mode_index;
 					}
 				}
-				sync_tile_layout(sys);
-				sys->cached_3d_state.store(true, std::memory_order_relaxed);
-				sys->last_3d_state_poll_ns.store(now_ns, std::memory_order_release);
-				sys->last_flip_landed_ns.store(now_ns, std::memory_order_release);
+				(void)apply_mode_transition(sys, rhead, c->render.display_processor, restore_idx, true,
+				                            "force_3d");
 				got_state = false; // skip the follow below
 			}
 			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip && !in_cooldown && got_state) {
@@ -11018,7 +11181,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					} else {
 						target_idx = sys->last_3d_mode_index;
 					}
-					if (sys->multi_comp != nullptr) {
+					if (sys->workspace_mode &&
+					    sys->multi_comp != nullptr) { // #961: acked flip needs the render thread
 						// Vendor-initiated: hardware is ALREADY at vendor_is_3d
 						// (the poll just discovered it). We still route through
 						// the acked-flip path so apps re-submit at the new
@@ -11026,17 +11190,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// hardware already settled and lift the curtain quickly.
 						multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
 					} else {
-						uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-						head->hmd->active_rendering_mode_index = target_idx;
-						broadcast_rendering_mode_change(sys, head, prev_idx, target_idx);
-						sync_tile_layout(sys);
-						sys->hardware_display_3d = vendor_is_3d;
+						// #961: the hardware is already there (vendor did it) — no
+						// DP call; record + broadcast content then the (real) hw state.
+						(void)apply_mode_transition(sys, head, nullptr, target_idx,
+							                    vendor_is_3d, "vendor_follow");
 					}
 				}
 				} else {
-					// Bridge path: just mirror sys->hardware_display_3d so the
-					// app's hardwarestatechange event fires; don't touch mode.
+					// Bridge path: mirror the vendor's (real) hardware state so
+					// the app's hardwarestatechange event fires; don't touch mode.
 					sys->hardware_display_3d = vendor_is_3d;
+					broadcast_hardware_state(sys, vendor_is_3d);
 				}
 			}
 		}
@@ -11106,7 +11270,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// semantics), using the same immediate-flip pattern as the app-initiated
 	// branch below. Workspace mode is untouched — the workspace owns the
 	// display mode and zones-client wishes stay inert (ADR-027 v1).
-	if (zones_frame && !sys->workspace_mode && !sys->hardware_display_3d && sys->xsysd != NULL) {
+	if (zones_frame && !sys->workspace_mode && !sys->hardware_display_3d && sys->xsysd != NULL &&
+	    client_holds_panel_lease(sys, c)) { // #961: only the lease holder drives the panel
 		struct xrt_device *zhead = sys->xsysd->static_roles.head;
 		if (zhead != nullptr && zhead->hmd != NULL) {
 			// Prefer the last 3D mode; fall back to the first 3D-capable
@@ -11125,31 +11290,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 			if (mode_idx < zhead->rendering_mode_count) {
 				uint32_t prev_idx = zhead->hmd->active_rendering_mode_index;
-				zhead->hmd->active_rendering_mode_index = mode_idx;
-				broadcast_rendering_mode_change(sys, zhead, prev_idx, mode_idx);
 				// Tier-1 demotion (#551): a mask-capable DP gets the
 				// published per-zone wish instead of the global hardware
 				// 3D request — the mask drives the panel, exactly like
-				// the in-process path. The MODE flip above stays either
-				// way (the multi-view atlas recipe is the mode's). If the
-				// DP later rejects the publish at runtime, the publish
-				// helper issues this request as the fallback.
+				// the in-process path. The MODE flip stays either way (the
+				// multi-view atlas recipe is the mode's). If the DP later
+				// rejects the publish at runtime, the publish helper issues
+				// this request as the fallback.
 				bool mask_capable = service_dp_accepts_zone_mask(c->render.display_processor) &&
 				                    !c->zone_mask_dp_rejected;
-				if (c->render.display_processor != nullptr && !mask_capable) {
-					DP_REQUEST_DISPLAY_MODE(
-					    c->render.display_processor, true);
-				}
-				sync_tile_layout(sys);
-				sys->hardware_display_3d = true;
-				// Stamp the post-flip cooldown (same refresh the [force_3d]
-				// re-assert does) — without it the 100 ms vendor 3D-state
-				// poll sees the panel still mid-transition and counter-
-				// corrects back to 2D, re-arming this fallback every frame.
-				int64_t flip_now_ns = os_monotonic_get_ns();
-				sys->cached_3d_state.store(true, std::memory_order_relaxed);
-				sys->last_3d_state_poll_ns.store(flip_now_ns, std::memory_order_release);
-				sys->last_flip_landed_ns.store(flip_now_ns, std::memory_order_release);
+				// #961: DP first (unless the wish drives it), events after.
+				(void)apply_mode_transition(sys, zhead,
+				                            mask_capable ? nullptr : c->render.display_processor,
+				                            mode_idx, true, "zones_tier1");
 				static bool zones_3d_logged = false;
 				if (!zones_3d_logged) {
 					zones_3d_logged = true;
@@ -11186,8 +11339,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// transitions belong to the vendor poll (genuine SR drift) and the
 	// app-initiated / V-key paths.
 	if (!sys->workspace_mode && !bridge_live && !zones_frame && !c->zone_published &&
-	    !c->render.deferred_3d_kicked && c->render.display_processor != nullptr &&
-	    sys->xsysd != NULL) {
+	    !c->render.deferred_3d_kicked && c->render.display_processor != nullptr && sys->xsysd != NULL &&
+	    client_holds_panel_lease(sys, c)) { // #961: holder only
 		if (++c->render.commit_frame_counter >= DEFERRED_3D_KICK_FRAMES) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
 			if (head != nullptr && head->hmd != NULL && !sys->hardware_display_3d) {
@@ -11208,22 +11361,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				}
 				if (mode_idx < head->rendering_mode_count) {
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-					head->hmd->active_rendering_mode_index = mode_idx;
-					broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
-					DP_REQUEST_DISPLAY_MODE(
-					    c->render.display_processor, true);
-					sync_tile_layout(sys);
-					sys->hardware_display_3d = true;
-					// Stamp the post-flip cooldown so the 100 ms vendor 3D-state
-					// poll doesn't see the panel mid-transition and counter-
-					// correct back to 2D (same refresh the zones fallback does).
-					int64_t kick_ns = os_monotonic_get_ns();
-					sys->cached_3d_state.store(true, std::memory_order_relaxed);
-					sys->last_3d_state_poll_ns.store(kick_ns, std::memory_order_release);
-					sys->last_flip_landed_ns.store(kick_ns, std::memory_order_release);
-					U_LOG_W("[deferred_3d] no-zones standalone client past warmup "
-					        "(%u commits), SR was 2D — forcing 3D (mode %u -> %u)",
-					        c->render.commit_frame_counter, prev_idx, mode_idx);
+					// #961: DP first, events after confirmation.
+					bool landed = apply_mode_transition(sys, head, c->render.display_processor,
+					                                    mode_idx, true, "deferred_3d");
+					U_LOG_W(
+					    "[deferred_3d] no-zones standalone client past warmup "
+					    "(%u commits), SR was 2D — forcing 3D (mode %u -> %u)%s",
+					    c->render.commit_frame_counter, prev_idx, mode_idx,
+					    landed ? "" : " — DP REJECTED, panel stays 2D");
 				}
 			}
 			// One-shot regardless: if the SR was already 3D (nothing to do) or
@@ -12850,6 +12995,16 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 	(void)tile_columns;
 	(void)tile_rows;
 	c->pending_content_mode.store(mode_index, std::memory_order_release);
+
+	// #961: drain inline like the hardware request above, so the lease verdict
+	// (applied / denied-with-reason) reaches the client immediately rather than
+	// on its next commit — a client that stopped rendering would otherwise never
+	// hear back. Same lock as the render thread; work is one DP hint + bookkeeping.
+	struct d3d11_service_system *sys = c->sys;
+	if (sys != nullptr) {
+		render_mutex_fair_lock lock(sys);
+		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
+	}
 	return XRT_SUCCESS;
 }
 
@@ -12937,7 +13092,7 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	c->pending_hw_3d.store(0, std::memory_order_release);
 	U_LOG_W("#814 failsafe: %s client leaving with the panel in 3D (%u survivor(s)) — requesting hardware 2D",
 	        this_client_is_weave_owner ? "weave present-owner" : "last", survivors);
-	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false);
+	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false, /* as_service */ true);
 }
 
 static void
@@ -13259,6 +13414,10 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	if (c->hw_override.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	// #961: only the lease holder may hold the panel in 3D by existing.
+	if (!client_holds_panel_lease(sys, c)) {
+		return;
+	}
 	struct xrt_device *head = sys->xsysd->static_roles.head;
 	if (head == nullptr || head->hmd == NULL) {
 		return;
@@ -13291,19 +13450,10 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 		return;
 	}
 	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
-	head->hmd->active_rendering_mode_index = mode_idx;
-	broadcast_rendering_mode_change(sys, head, prev_idx, mode_idx);
-	DP_REQUEST_DISPLAY_MODE(c->render.display_processor, true);
-	sync_tile_layout(sys);
-	sys->hardware_display_3d = true;
-	// Stamp the post-flip cooldown so the 100 ms vendor 3D-state poll doesn't see
-	// the panel mid-transition and counter-correct back to 2D.
-	int64_t kick_ns = os_monotonic_get_ns();
-	sys->cached_3d_state.store(true, std::memory_order_relaxed);
-	sys->last_3d_state_poll_ns.store(kick_ns, std::memory_order_release);
-	sys->last_flip_landed_ns.store(kick_ns, std::memory_order_release);
-	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks",
-	        prev_idx, mode_idx);
+	// #961: DP first, events after confirmation.
+	bool landed = apply_mode_transition(sys, head, c->render.display_processor, mode_idx, true, "weave_3d");
+	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks%s", prev_idx,
+	        mode_idx, landed ? "" : " — DP REJECTED");
 }
 
 extern "C" bool
@@ -17610,9 +17760,19 @@ comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc)
 	}
 
 	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, (int32_t)target_idx);
-	DP_REQUEST_DISPLAY_MODE(mc->display_processor, /*hardware_display_3d=*/true);
+	{
+		// #961: hardware event only once the DP took it (a mode-neutral DP
+		// counts as accepted); the controller asked, so a rejection is logged
+		// by the checked wrapper and the flag stays put.
+		bool prev_hw = sys->hardware_display_3d;
+		if (DP_REQUEST_DISPLAY_MODE_CONFIRMED(mc->display_processor, /*hardware_display_3d=*/true)) {
+			sys->hardware_display_3d = true;
+			if (!prev_hw) {
+				broadcast_hardware_state(sys, true);
+			}
+		}
+	}
 	sync_tile_layout(sys);
-	sys->hardware_display_3d = true;
 
 	U_LOG_W("[force_3d] same-target fast path (idx=%u, was 3d=%d) — FLIPPING engaged, curtain ON",
 	        target_idx, (int)was_3d);
@@ -18019,6 +18179,22 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 
 		// Reset focus state
 		mc->focused_slot = -1;
+
+		// #961/#761: a flip still pending in the acked machine can never land
+		// now (the render thread that drives it is going away) — tell the apps
+		// the transition did not happen and reset the machine, or every client
+		// is stranded believing in the target mode across the deactivate.
+		if (mc->mode_flip.phase != MFP_IDLE) {
+			struct xrt_device *fhead = (sys->xsysd != nullptr) ? sys->xsysd->static_roles.head : nullptr;
+			U_LOG_W("[mode_flip] workspace deactivate with a pending flip %u -> %u — reverting (#761)",
+			        mc->mode_flip.source_mode_index, mc->mode_flip.target_mode_index);
+			if (fhead != nullptr) {
+				broadcast_rendering_mode_change(sys, fhead, mc->mode_flip.target_mode_index,
+				                                mc->mode_flip.source_mode_index);
+			}
+			mc->mode_flip.phase = MFP_IDLE;
+			mc->mode_flip.curtain_active = false;
+		}
 
 		// Set request flag for render thread to exit. Don't join here —
 		// joining while holding the mutex deadlocks if the render thread

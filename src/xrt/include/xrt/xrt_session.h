@@ -82,6 +82,29 @@ enum xrt_session_event_type
 	//! XR_DXR_workspace_file_dialog: pending xrRequestFilePickerDXR
 	//! completed (success / cancel / picker-failed).
 	XRT_SESSION_EVENT_FILE_PICKER_COMPLETE = 14,
+
+	//! #961 (XR_DXR_display_info v17): this session's display-mode request was
+	//! denied by the panel-lease holder / policy; targeted, never broadcast.
+	XRT_SESSION_EVENT_DISPLAY_MODE_REQUEST_DENIED = 15,
+};
+
+/*!
+ * #961: why a display-mode request was denied. Mirrors
+ * XrDisplayModeDenialReasonDXR one-to-one.
+ */
+enum xrt_display_mode_denial_reason
+{
+	XRT_DISPLAY_MODE_DENIAL_REASON_NONE = 0,
+	//! A workspace controller is active and owns the panel lease.
+	XRT_DISPLAY_MODE_DENIAL_REASON_WORKSPACE_OWNS_MODE = 1,
+	//! No controller: the default policy grants the lease to the FOCUSED client, and this session is not it.
+	XRT_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED = 2,
+	//! No display processor to apply the request to.
+	XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR = 3,
+	//! The display processor (vendor) rejected the hardware state.
+	XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED = 4,
+	//! A relay (WebXR bridge) owns the mode of the session it relays.
+	XRT_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE = 5,
 };
 
 /*!
@@ -224,6 +247,19 @@ struct xrt_session_event_hardware_display_state_change
 };
 
 /*!
+ * #961: display-mode request denied, type @ref XRT_SESSION_EVENT_DISPLAY_MODE_REQUEST_DENIED.
+ * requested_mode_index is UINT32_MAX when no content mode was requested;
+ * requested_hw_3d is -1 when no hardware state was requested, else 0/1.
+ */
+struct xrt_session_event_display_mode_request_denied
+{
+	enum xrt_session_event_type type;
+	uint32_t requested_mode_index;
+	int32_t requested_hw_3d;
+	uint32_t reason; //!< enum xrt_display_mode_denial_reason
+};
+
+/*!
  * Spatial file-picker completion event, type @ref XRT_SESSION_EVENT_FILE_PICKER_COMPLETE.
  *
  * `path` is plain UTF-8, NUL-terminated within
@@ -262,6 +298,7 @@ union xrt_session_event {
 	struct xrt_session_event_rendering_mode_change rendering_mode_change;
 	struct xrt_session_event_hardware_display_state_change hardware_display_state_change;
 	struct xrt_session_event_file_picker_complete file_picker_complete;
+	struct xrt_session_event_display_mode_request_denied display_mode_request_denied;
 };
 
 /*!

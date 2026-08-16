@@ -1300,6 +1300,13 @@ oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,
                                                        XrBool32 hardwareDisplay3D);
 
 XrResult
+oxr_event_push_XrEventDataDisplayModeRequestDenied(struct oxr_logger *log,
+                                                   struct oxr_session *sess,
+                                                   uint32_t requestedModeIndex,
+                                                   int32_t requestedHardware3D,
+                                                   uint32_t reason);
+
+XrResult
 oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   struct oxr_session *sess,
                                                   XrBool32 isTracking,
