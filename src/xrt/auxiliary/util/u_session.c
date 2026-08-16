@@ -9,6 +9,7 @@
 
 #include "util/u_system.h"
 #include "util/u_session.h"
+#include "util/u_logging.h"
 #include "xrt/xrt_compositor.h"
 
 
@@ -64,6 +65,7 @@ destroy(struct xrt_session *xs)
 	}
 
 	us->events.ptr = NULL;
+	us->events.count = 0;
 
 	// Destroy headless compositor (created for event registration only).
 	if (us->headless_xcn != NULL) {
@@ -117,6 +119,21 @@ u_session_event_push(struct u_session *us, const union xrt_session_event *xse)
 
 	os_mutex_lock(&us->events.mutex);
 
+	// #956: at the depth cap, drop the OLDEST event so an unpolled queue
+	// (a stalled or headless client) cannot grow the service heap without
+	// bound. Warn once per session so it is visible but not spammy.
+	while (us->events.count >= U_SESSION_EVENT_QUEUE_MAX && us->events.ptr != NULL) {
+		struct u_session_event *oldest = us->events.ptr;
+		us->events.ptr = oldest->next;
+		free(oldest);
+		us->events.count--;
+		if (!us->events.overflow_warned) {
+			us->events.overflow_warned = true;
+			U_LOG_W("u_session: event queue hit %u — client is not polling; dropping oldest events (#956).",
+			        (unsigned)U_SESSION_EVENT_QUEUE_MAX);
+		}
+	}
+
 	// Find the last slot.
 	struct u_session_event **slot = &us->events.ptr;
 	while (*slot != NULL) {
@@ -124,6 +141,7 @@ u_session_event_push(struct u_session *us, const union xrt_session_event *xse)
 	}
 
 	*slot = use;
+	us->events.count++;
 
 	os_mutex_unlock(&us->events.mutex);
 }
@@ -142,6 +160,9 @@ u_session_event_pop(struct u_session *us, union xrt_session_event *out_xse)
 		*out_xse = use->xse;
 		us->events.ptr = use->next;
 		free(use);
+		if (us->events.count > 0) {
+			us->events.count--;
+		}
 	}
 
 	os_mutex_unlock(&us->events.mutex);

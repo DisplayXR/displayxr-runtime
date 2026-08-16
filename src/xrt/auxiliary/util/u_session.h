@@ -55,8 +55,16 @@ struct u_session
 	{
 		struct os_mutex mutex;
 		struct u_session_event *ptr;
+		//! #956: depth cap so a session that never polls (a stalled or
+		//! headless client) cannot grow this list — and the service heap —
+		//! without bound. At the cap the OLDEST event is dropped.
+		uint32_t count;
+		bool overflow_warned;
 	} events;
 };
+
+//! #956: max queued session events before drop-oldest kicks in.
+#define U_SESSION_EVENT_QUEUE_MAX 256
 
 /*!
  * Create a session, optionally pass in a @ref u_system. If @p usys is not NULL
