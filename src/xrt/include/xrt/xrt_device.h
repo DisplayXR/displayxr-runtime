@@ -1147,6 +1147,13 @@ xrt_device_set_brightness(struct xrt_device *xdev, float brightness, bool relati
 static inline xrt_result_t
 xrt_device_begin_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
 {
+	// #952: a device that supplies a feature (e.g. an input provider claiming
+	// a hand-tracking role) but leaves this slot NULL would be an access
+	// violation in whatever process hosts it — the service, for a shared
+	// provider. Treat "no implementation" as "not supported", not a crash.
+	if (xdev->begin_feature == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
 	return xdev->begin_feature(xdev, type);
 }
 
@@ -1160,6 +1167,10 @@ xrt_device_begin_feature(struct xrt_device *xdev, enum xrt_device_feature_type t
 static inline xrt_result_t
 xrt_device_end_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
 {
+	// #952: see xrt_device_begin_feature — never call through a NULL slot.
+	if (xdev->end_feature == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
 	return xdev->end_feature(xdev, type);
 }
 

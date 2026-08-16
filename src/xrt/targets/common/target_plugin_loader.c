@@ -22,6 +22,7 @@
 
 #include "target_plugin_loader.h"
 #include "target_plugin_preload_sanitize.h"
+#include "target_plugin_path_guard.h"
 
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_compositor.h"
@@ -368,6 +369,12 @@ load_and_probe_one(const struct plugin_entry *e,
 	*out_inst = NULL;
 	if (out_version != NULL) {
 		*out_version = 0;
+	}
+
+	// #952: refuse a build-tree/worktree DLL path (the #943 footgun) unless
+	// DXR_ALLOW_DEV_PLUGIN_PATHS is set; warn on other non-install paths.
+	if (target_plugin_path_check(e->binary_path, e->id, "plugin") == TARGET_PLUGIN_PATH_REFUSED) {
+		return NULL;
 	}
 
 	// Pre-load any dependency whose unwind data would crash host-engine

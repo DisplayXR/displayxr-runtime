@@ -25,6 +25,7 @@
 #include "target_input_plugin_loader.h"
 #include "target_plugin_loader.h"
 #include "target_plugin_preload_sanitize.h"
+#include "target_plugin_path_guard.h"
 
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
@@ -284,6 +285,11 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	g_input_last_declined = false;
 
 	// Same host-crash breadcrumb + #434 sanitizer as the DP loader —
+	// #952: same dev-path guard as the DP loader.
+	if (target_plugin_path_check(e->binary_path, e->id, "input plugin") == TARGET_PLUGIN_PATH_REFUSED) {
+		return NULL;
+	}
+
 	// LoadLibrary of a provider runs host DLL-notification code too.
 	target_plugin_sanitized_preload(e->binary_path);
 	U_LOG_W("input plugin loader:   %s: loading provider binary %ls", e->id, e->binary_path);
