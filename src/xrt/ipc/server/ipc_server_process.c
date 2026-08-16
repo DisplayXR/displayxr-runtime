@@ -612,19 +612,18 @@ emit_health_if_elapsed(struct ipc_server *s)
 		volatile struct ipc_client_state *ics = &s->threads[i].ics;
 		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
 		const char *name = cs->info.application_name[0] ? cs->info.application_name : "?";
-		// Class is not a first-class field yet (#960); derive the coarse kind:
-		// a session with no compositor is a headless relay (the WebXR bridge).
-		const char *kind = (ics->xc == NULL) ? "relay" : (cs->session_overlay ? "overlay" : "app");
+		// #960: the verified class ("APP" until describe_client has run).
+		const char *kind = ics->class_verified ? ipc_server_client_class_str(cs->client_class) : "unverified";
 		active++;
 		U_LOG_W(
-		    "[HEALTH] slot=%u id=%u pid=%d kind=%s name='%s' session=%c%c%c io=%c primary=%c%s "
+		    "[HEALTH] slot=%u id=%u pid=%d class=%s name='%s' session=%c%c%c io=%c primary=%c%s "
 		    "swapchains=%u spaces=%u",
-		        i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
-		        cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
-		        cs->primary_application ? 'y' : 'n', ((int32_t)cs->id == active_idx) ? " ACTIVE" : "",
-		        ics->swapchain_count, ics->space_count);
+		    i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
+		    cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
+		    cs->primary_application ? 'y' : 'n', ((int32_t)cs->id == active_idx) ? " ACTIVE" : "",
+		    ics->swapchain_count, ics->space_count);
 	}
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d window_s=%ld", active, (uint32_t)IPC_MAX_CLIENTS, active_idx,
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d window_s=%ld", active, s->max_clients, active_idx,
 	        period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
@@ -1066,7 +1065,9 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 			bool controller_in = false;
 			for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 				volatile struct ipc_client_state *_cs = &vs->threads[i].ics;
-				if (_cs->server_thread_index >= 0 && (unsigned long)_cs->client_state.pid == orch_pid) {
+				// #960: a VERIFIED CONTROLLER (of any provenance) releases the reservation.
+				if (_cs->server_thread_index >= 0 && _cs->class_verified &&
+				    _cs->client_state.client_class == XRT_CLIENT_CLASS_CONTROLLER) {
 					controller_in = true;
 					break;
 				}

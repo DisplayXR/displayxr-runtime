@@ -28,6 +28,7 @@
 
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server.h"
+#include "service_client_class.h" // #960
 
 #include "target_lists.h"
 
@@ -184,6 +185,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// controller's PID, so workspace_activate can authenticate that only the
 	// controller we spawned may transition the runtime into workspace mode.
 	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
+	// #960: verify CONTROLLER (registered controller binary) / DIAG (runtime dir)
+	// class claims — facts only the service target can check.
+	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
@@ -269,6 +273,10 @@ main(int argc, char *argv[])
 	// controller through the orchestrator's registry-discovery + respawn path.
 	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
 #endif
+
+	// #960: class verification (controller manifests are cross-platform; the
+	// orchestrator entry only exists on macOS).
+	ipc_server_set_client_class_verify_provider(service_client_class_verify);
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =

@@ -22,6 +22,8 @@ target_link_libraries(
 target_sources(displayxr-service PRIVATE
 	service_workspace_registry.c
 	service_workspace_registry.h
+	service_client_class.c
+	service_client_class.h
 )
 
 # Delay-load Vulkan so the service can start on systems where it is absent.

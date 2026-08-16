@@ -51,6 +51,7 @@ query_live_state(struct _JavaVM *vm, void *context)
 {
 	struct xrt_instance_info ii = {};
 	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-diag");
+	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG; // #960
 	ii.platform_info.vm = vm;
 	ii.platform_info.context = context;
 

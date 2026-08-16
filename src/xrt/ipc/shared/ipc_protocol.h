@@ -719,6 +719,8 @@ struct ipc_app_state
 	uint32_t z_order;
 	pid_t pid;
 	struct xrt_application_info info;
+	//! #960: the VERIFIED class (enum xrt_client_class); info.declared_client_class is the claim.
+	uint32_t client_class;
 };
 
 /*!

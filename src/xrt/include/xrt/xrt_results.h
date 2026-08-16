@@ -238,4 +238,11 @@ typedef enum xrt_result
 	 * orchestrator-spawned workspace controller.
 	 */
 	XRT_ERROR_NOT_AUTHORIZED = -39,
+
+	/*!
+	 * #960: the service refused the connection because the client's class
+	 * quota (or the runtime-admitted client cap) is exhausted. The state
+	 * tracker maps this to XR_ERROR_LIMIT_REACHED from xrCreateInstance.
+	 */
+	XRT_ERROR_CLIENT_LIMIT_REACHED = -40,
 } xrt_result_t;

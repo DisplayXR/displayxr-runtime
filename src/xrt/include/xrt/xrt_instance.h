@@ -62,6 +62,26 @@ struct xrt_platform_info
 #define XRT_MAX_APPLICATION_NAME_SIZE 128
 
 /*!
+ * IPC client class (#960, ADR-035 D1). The client DECLARES a class at connect
+ * (derived by the state tracker from the extensions it enabled, or set explicitly
+ * by runtime-internal tools); the service VERIFIES the claim against OS-derived
+ * facts and stores the verified class on the client. The verified class — never
+ * the declaration — drives per-class quotas, authorization and lease priority.
+ *
+ * Zero is APP so that a zeroed struct (legacy / raw connections) is an ordinary app.
+ */
+enum xrt_client_class
+{
+	XRT_CLIENT_CLASS_APP = 0,           //!< ordinary OpenXR app (default)
+	XRT_CLIENT_CLASS_CONTROLLER = 1,    //!< workspace controller (XR_DXR_spatial_workspace)
+	XRT_CLIENT_CLASS_PRESENT_OWNER = 2, //!< XR_DXR_weave present-owner (displayxr-browser)
+	XRT_CLIENT_CLASS_RELAY = 3,         //!< headless relay (XR_MND_headless + display_info; the WebXR bridge)
+	XRT_CLIENT_CLASS_PROVIDER_HOST = 4, //!< service-spawned input-provider host (Phase 4; reserved)
+	XRT_CLIENT_CLASS_DIAG = 5,          //!< read-only diagnostics (displayxr-cli clients, bridge introspection)
+	XRT_CLIENT_CLASS_COUNT = 6,
+};
+
+/*!
  * Non-process-specific information provided by the application at instance create time.
  *
  * This is transported between client and server over IPC.
@@ -82,6 +102,9 @@ struct xrt_application_info
 	bool meta_body_tracking_calibration_enabled;
 	bool ext_win32_appcontainer_compatible_enabled;  //!< Chrome WebXR uses this
 	bool ext_spatial_workspace_enabled;              //!< Workspace controller — forces IPC mode at xrt_instance_create
+	bool ext_weave_enabled;                          //!< XR_DXR_weave present-owner (#960)
+	//! #960: the client's DECLARED class (enum xrt_client_class); the service verifies it.
+	uint32_t declared_client_class;
 };
 
 /*!

@@ -38,6 +38,8 @@ cli_print_help(int argc, const char **argv)
 	P("                      'runtime status', 'runtime activate'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
+	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
+	P("                      (#960). Connects over IPC as a DIAG client; non-elevated on Windows.\n");
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -68,6 +70,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "displays") == 0) {
 		return cli_cmd_displays(argc, argv);
+	}
+	if (strcmp(argv[1], "clients") == 0) {
+		return cli_cmd_clients(argc, argv);
 	}
 	if (strcmp(argv[1], "test") == 0) {
 		return cli_cmd_test(argc, argv);

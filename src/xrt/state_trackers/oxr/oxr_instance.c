@@ -464,7 +464,25 @@ oxr_instance_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_DXR_spatial_workspace
 	    .ext_spatial_workspace_enabled = extensions->DXR_spatial_workspace,
 #endif
+#ifdef OXR_HAVE_DXR_weave
+	    .ext_weave_enabled = extensions->DXR_weave,
+#endif
 	};
+	// #960: declare the IPC client class from the enabled extension set. The
+	// service verifies the claim (ADR-035 D1); an unverifiable claim is demoted
+	// to APP server-side, never trusted.
+	i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_APP;
+	if (i_info.app_info.ext_spatial_workspace_enabled) {
+		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_CONTROLLER;
+	}
+#if defined(OXR_HAVE_MND_headless) && defined(OXR_HAVE_DXR_display_info)
+	else if (extensions->MND_headless && extensions->DXR_display_info) {
+		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_RELAY;
+	}
+#endif
+	else if (i_info.app_info.ext_weave_enabled) {
+		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_PRESENT_OWNER;
+	}
 	snprintf(i_info.app_info.application_name, sizeof(i_info.app_info.application_name), "%s",
 	         createInfo->applicationInfo.applicationName);
 
@@ -486,6 +504,14 @@ oxr_instance_create(struct oxr_logger *log,
 	 */
 
 	xret = xrt_instance_create(&i_info, &inst->xinst);
+	if (xret == XRT_ERROR_CLIENT_LIMIT_REACHED) {
+		// #960: the service refused us at the class quota / client cap.
+		ret = oxr_error(log, XR_ERROR_LIMIT_REACHED,
+		                "The DisplayXR service refused the connection: client quota reached (class %u)",
+		                i_info.app_info.declared_client_class);
+		oxr_instance_destroy(log, &inst->handle);
+		return ret;
+	}
 	if (xret != XRT_SUCCESS) {
 		ret = oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create instance '%i'", xret);
 		oxr_instance_destroy(log, &inst->handle);

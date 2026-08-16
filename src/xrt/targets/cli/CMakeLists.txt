@@ -32,6 +32,7 @@ add_executable(
 	cli_cmd_displays.c
 	cli_cmd_probe.c
 	cli_cmd_test.c
+	cli_cmd_clients.c
 	cli_common.h
 	cli_main.c
 	)
@@ -57,5 +58,12 @@ target_link_libraries(
 		target_lists
 		drv_includes
 	)
+
+# #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
+# Same gating as targets/diag-lib.
+if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
+	target_link_libraries(cli PRIVATE ipc_client)
+	target_compile_definitions(cli PRIVATE CLI_HAVE_IPC)
+endif()
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
