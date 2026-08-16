@@ -21,6 +21,20 @@
 #include <windows.h>
 #include <string.h>
 #include <stdio.h>
+
+#include "util/u_crash_guard.h"
+
+// #950: every orchestrator thread runs under the structured-exception guard
+// (records [TERMINATE] + stack, then propagates unchanged). The guarded
+// entry points wrap the *_body functions below; defined at the end of the
+// Windows section, forward-declared here because the workspace watchdog
+// respawns itself.
+static DWORD WINAPI
+workspace_watch_thread_func(LPVOID param);
+static DWORD WINAPI
+bridge_watch_thread_func(LPVOID param);
+static DWORD WINAPI
+trampoline_thread_func(LPVOID param);
 #endif
 
 DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGGING_WARN)
@@ -322,7 +336,7 @@ terminate_child(PROCESS_INFORMATION *pi, bool *running_flag)
  */
 
 static DWORD WINAPI
-workspace_watch_thread_func(LPVOID param)
+workspace_watch_thread_body(LPVOID param)
 {
 	(void)param;
 
@@ -430,7 +444,7 @@ spawn_workspace(void)
 static void start_bridge_trampoline(void);
 
 static DWORD WINAPI
-bridge_watch_thread_func(LPVOID param)
+bridge_watch_thread_body(LPVOID param)
 {
 	(void)param;
 
@@ -525,7 +539,7 @@ spawn_bridge(void)
 
 //! Worker thread — select() loop, spawns bridge on first connection.
 static DWORD WINAPI
-trampoline_thread_func(LPVOID param)
+trampoline_thread_body(LPVOID param)
 {
 	(void)param;
 
@@ -1131,6 +1145,48 @@ service_orchestrator_shutdown(void)
 		DeleteCriticalSection(&s_bridge_lock);
 		s_bridge_lock_inited = false;
 	}
+}
+
+/*
+ *
+ * #950 guarded thread entries (see the forward declarations at the top).
+ *
+ */
+
+static void *
+workspace_watch_thread_body_adapter(void *p)
+{
+	return (void *)(uintptr_t)workspace_watch_thread_body((LPVOID)p);
+}
+
+static DWORD WINAPI
+workspace_watch_thread_func(LPVOID param)
+{
+	return (DWORD)(uintptr_t)u_crash_guard_run("workspace_watch_thread_func", workspace_watch_thread_body_adapter, (void *)param);
+}
+
+static void *
+bridge_watch_thread_body_adapter(void *p)
+{
+	return (void *)(uintptr_t)bridge_watch_thread_body((LPVOID)p);
+}
+
+static DWORD WINAPI
+bridge_watch_thread_func(LPVOID param)
+{
+	return (DWORD)(uintptr_t)u_crash_guard_run("bridge_watch_thread_func", bridge_watch_thread_body_adapter, (void *)param);
+}
+
+static void *
+trampoline_thread_body_adapter(void *p)
+{
+	return (void *)(uintptr_t)trampoline_thread_body((LPVOID)p);
+}
+
+static DWORD WINAPI
+trampoline_thread_func(LPVOID param)
+{
+	return (DWORD)(uintptr_t)u_crash_guard_run("trampoline_thread_func", trampoline_thread_body_adapter, (void *)param);
 }
 
 #elif defined(XRT_OS_MACOS)

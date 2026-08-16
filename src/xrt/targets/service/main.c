@@ -14,6 +14,8 @@
 #include "util/u_metrics.h"
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
+#include "util/u_file_logging.h"
+#include "util/u_crash_guard.h"
 #include <displayxr_mcp/mcp_server.h>
 
 #ifdef XRT_OS_WINDOWS
@@ -28,6 +30,25 @@
 #include "server/ipc_server.h"
 
 #include "target_lists.h"
+
+// #950: run ipc_server_main under the structured-exception guard so an
+// exception escaping the main thread is recorded ([TERMINATE]) before it
+// propagates exactly as before.
+struct service_main_args
+{
+	int argc;
+	char **argv;
+	struct ipc_server_main_info *ismi;
+	int ret;
+};
+
+static void *
+service_main_body(void *p)
+{
+	struct service_main_args *a = (struct service_main_args *)p;
+	a->ret = ipc_server_main(a->argc, a->argv, a->ismi);
+	return NULL;
+}
 
 #include <string.h> // strcmp for --workspace flag
 
@@ -99,6 +120,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
 
+	// #950 exit/terminate tripwires. Bring the file logger up first so the
+	// [EXIT] record lands in the log: atexit handlers run LIFO, so the tripwire
+	// must register AFTER the logger's own shutdown handler.
+	u_file_logging_init();
+	u_crash_guard_install_exit_tripwire();
+
 	// Load orchestrator config (workspace/bridge modes, start-on-login)
 	struct service_config cfg;
 	service_config_load(&cfg);
@@ -124,6 +151,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// the toggle had ever been unchecked).
 	if (autostart && !cfg.start_on_login) {
 		U_LOG_W("Start-on-login is disabled in service.json; exiting (logon auto-start).");
+		u_crash_guard_mark_orderly_exit();
 		ExitProcess(0);
 	}
 
@@ -161,7 +189,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// workspace controller is registered). The service no longer hosts
 	// any MCP endpoint.
 
-	int ret = ipc_server_main(argc, argv, &ismi);
+	struct service_main_args sma = {argc, argv, &ismi, 0};
+	u_crash_guard_run("service-main", service_main_body, &sma);
+	int ret = sma.ret;
 
 	u_metrics_close();
 
@@ -171,6 +201,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// Clean up the tray icon
 	service_tray_cleanup();
 
+	u_crash_guard_mark_orderly_exit();
 	return ret;
 }
 
@@ -184,6 +215,10 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 int
 main(int argc, char *argv[])
 {
+	// #950 exit tripwire (see the Windows entry point for the ordering rule).
+	u_file_logging_init();
+	u_crash_guard_install_exit_tripwire();
+
 	u_trace_marker_init();
 	u_metrics_init();
 
@@ -230,7 +265,9 @@ main(int argc, char *argv[])
 	// workspace controller is registered). The service no longer hosts
 	// any MCP endpoint.
 
-	int ret = ipc_server_main(argc, argv, &ismi);
+	struct service_main_args sma = {argc, argv, &ismi, 0};
+	u_crash_guard_run("service-main", service_main_body, &sma);
+	int ret = sma.ret;
 
 	u_metrics_close();
 
@@ -239,6 +276,7 @@ main(int argc, char *argv[])
 	service_orchestrator_shutdown();
 #endif
 
+	u_crash_guard_mark_orderly_exit();
 	return ret;
 }
 

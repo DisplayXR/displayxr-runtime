@@ -73,6 +73,8 @@ add_library(
 	u_logging.h
 	u_file_logging.c
 	u_file_logging.h
+	u_crash_guard.c
+	u_crash_guard.h
 	u_metrics.c
 	u_metrics.h
 	u_misc.c
