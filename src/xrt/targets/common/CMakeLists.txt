@@ -14,6 +14,7 @@ add_library(
 			    target_input_plugin_loader.c target_input_plugin_loader.h
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_plugin_preload_sanitize.c target_plugin_preload_sanitize.h
+			    target_plugin_path_guard.c target_plugin_path_guard.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
 target_include_directories(target_lists PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
