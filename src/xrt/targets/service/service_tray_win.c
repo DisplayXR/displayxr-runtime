@@ -14,6 +14,8 @@
 #include <shellapi.h>
 #include <string.h>
 
+#include "util/u_crash_guard.h"
+
 #define IDI_DISPLAYXR_ICON_WHITE 101
 #define IDI_DISPLAYXR_ICON_BLACK 102
 #define WM_TRAYICON              (WM_APP + 1)
@@ -436,7 +438,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
  */
 
 static DWORD WINAPI
-tray_thread_func(LPVOID param)
+tray_thread_body(LPVOID param)
 {
 	(void)param;
 
@@ -484,6 +486,21 @@ tray_thread_func(LPVOID param)
 	return 0;
 }
 
+
+// #950: the tray thread hosts the message pump, the Ctrl+Space hook and the
+// orchestrator spawn path; an exception escaping it is recorded ([TERMINATE])
+// before it propagates exactly as before.
+static void *
+tray_thread_body_adapter(void *p)
+{
+	return (void *)(uintptr_t)tray_thread_body((LPVOID)p);
+}
+
+static DWORD WINAPI
+tray_thread_func(LPVOID param)
+{
+	return (DWORD)(uintptr_t)u_crash_guard_run("tray", tray_thread_body_adapter, (void *)param);
+}
 
 /*
  *

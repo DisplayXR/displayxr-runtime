@@ -10,6 +10,13 @@
 
 #include "util/u_misc.h"
 #include "util/u_trace_marker.h"
+#include "util/u_crash_guard.h"
+#include "util/u_debug.h"
+
+#include <stdlib.h>
+
+// #950 dev-only fault injection (see common_shutdown).
+DEBUG_GET_ONCE_NUM_OPTION(test_exit_on_disconnect, "DXR_TEST_EXIT_ON_DISCONNECT", 0)
 
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
@@ -204,6 +211,22 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// async removeView to a dying MainLooper, leaving a frozen frame. It's handled
 	// authoritatively from MonadoImpl.shutdown() (← MonadoService.onDestroy, on the
 	// main thread) via nativeDestroyServiceOverlay() instead.
+
+	// #950 dev-only fault injection for the exit/terminate tripwires, on the
+	// exact site #943 died on (client teardown, on the client's IPC thread):
+	//   DXR_TEST_EXIT_ON_DISCONNECT=1  -> exit(3)   (the #943 signature: banner, no cause)
+	//   DXR_TEST_EXIT_ON_DISCONNECT=2  -> write to NULL (an AV escaping an IPC thread)
+	// Never set on a production box.
+	{
+		long inject = debug_get_num_option_test_exit_on_disconnect();
+		if (inject == 1) {
+			U_LOG_W("DXR_TEST_EXIT_ON_DISCONNECT=1: calling exit(3) from the IPC thread (test)");
+			exit(3);
+		} else if (inject == 2) {
+			U_LOG_W("DXR_TEST_EXIT_ON_DISCONNECT=2: faulting on the IPC thread (test)");
+			*(volatile int *)0 = 0;
+		}
+	}
 }
 
 
@@ -605,12 +628,21 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	xrt_session_destroy((struct xrt_session **)&ics->xs);
 }
 
-void *
-ipc_server_client_thread(void *_ics)
+static void *
+client_thread_body(void *_ics)
 {
 	volatile struct ipc_client_state *ics = (volatile struct ipc_client_state *)_ics;
 
 	client_loop(ics);
 
 	return NULL;
+}
+
+void *
+ipc_server_client_thread(void *_ics)
+{
+	// #950: an exception escaping a per-client thread (vendor DP throw from a
+	// handler, provider fault crossing the C ABI) is recorded before it kills
+	// the process exactly as it did before.
+	return u_crash_guard_run("ipc-client", client_thread_body, _ics);
 }

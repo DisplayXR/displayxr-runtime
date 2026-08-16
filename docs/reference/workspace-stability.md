@@ -50,6 +50,17 @@ not mean compose never touches a client-owned resource.
 
 ## Diagnostics that earn their keep
 
+- **`[EXIT]` / `[TERMINATE]` tripwires (#950).** The service registers an
+  `atexit` hook that logs `[EXIT] unexpected process exit()` with the exiting
+  thread's stack whenever the process ends off its orderly shutdown path (an
+  in-process DLL calling `exit()` — the #943 signature: clean banner, no cause),
+  and every service thread entry runs under a structured-exception guard that
+  logs `[TERMINATE] thread '<name>' died: <kind> code=0x… at <module>+<offset>`
+  plus the faulting stack *before* the exception propagates unchanged (WER /
+  `std::terminate` happen exactly as before). Frames are `module+offset`; resolve
+  with `cdb -z <exe-or-dump> -y <pdb dir> -c "ln displayxr_service+0x<off>; q"`.
+  Dev-only fault injection on the client-teardown site: `DXR_TEST_EXIT_ON_DISCONNECT=1`
+  (`exit(3)`) / `=2` (write to NULL) — never on a production box.
 - **`[RENDER]` diag** (10 s window, service log): healthy ≈ 590/10 s.
   `capture_avg_us` is the per-iteration cost; `wait_avg_us` is `render_mutex`
   acquire latency — *that* climbing means lock trouble; low `wait_avg_us` with
