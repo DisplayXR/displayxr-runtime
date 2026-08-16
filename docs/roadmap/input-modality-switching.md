@@ -125,7 +125,18 @@ config (no sim-input) still lands on qwerty.
 - Everything downstream (generation bump, `XrEventDataInteractionProfileChanged`,
   IPC `get_roles` forwarding) already works and is untouched.
 
-### C. Arbitrate hand-tracking roles alongside controllers
+### C. Arbitrate hand-tracking roles alongside controllers — **SHIPPED 2026-08-16**
+
+Implemented as option (1) below: `xrt_system_roles` gained dynamic
+hand-tracking indices (same generation counter, rides the existing IPC
+`get_roles` forwarding for free), the arbiter walks the same presence-ranked
+candidates per HT slot, and the OpenXR hand tracker re-resolves its
+data-source devices from the session's cached roles whenever the generation
+moves. Static `static_roles.hand_tracking` remains the build-time seed and
+still gates extension support. Hardware-validated: with
+`ultraleap → sim-input → qwerty` registered, unplugging the Leap switched the
+live `XR_EXT_hand_tracking` joints to sim-input's synthetic hands mid-session
+(eyeballed on the win box) and back on replug.
 
 `static_roles.hand_tracking` is static by the current `xrt_system_devices`
 contract, which is why it cannot move today. Two options:

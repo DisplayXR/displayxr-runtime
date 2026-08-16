@@ -3371,9 +3371,25 @@ struct oxr_hand_tracker
 	const struct oxr_hand_tracking_data_source *requested_sources[2];
 	uint32_t requested_sources_count;
 
+	/*!
+	 * Roles generation the data sources were last resolved against.
+	 * The hand-tracking roles are dynamic (ADR-034 Amendment 3 — the
+	 * source follows input-provider presence); when the session's
+	 * cached roles outrun this, the joint-locate path re-resolves
+	 * @ref unobstructed / @ref conforming before use.
+	 */
+	uint64_t roles_generation;
+
 	XrHandEXT hand;
 	XrHandJointSetEXT hand_joint_set;
 };
+
+/*!
+ * (Re)bind @p hand_tracker's data-source devices from the dynamic
+ * hand-tracking roles, if the roles generation moved. In oxr_api_session.c.
+ */
+void
+oxr_hand_tracker_resolve_sources(struct oxr_logger *log, struct oxr_hand_tracker *hand_tracker);
 
 #ifdef OXR_HAVE_FB_passthrough
 

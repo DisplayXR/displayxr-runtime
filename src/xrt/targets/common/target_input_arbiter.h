@@ -86,6 +86,26 @@ t_input_arbiter_note_provider_pair(const struct xrt_input_plugin_iface *iface,
                                    struct xrt_device *right);
 
 /*!
+ * Record the hand-tracking devices the SAME provider supplied — must
+ * follow the matching @ref t_input_arbiter_note_provider_pair call
+ * (attaches to the most recently noted provider candidate). Any device
+ * may be NULL; one device commonly serves several slots (ultraleap's
+ * controllers are also its unobstructed trackers).
+ *
+ * The dynamic hand-tracking roles in @ref xrt_system_roles then follow
+ * the same presence walk as the controller roles: per source and hand,
+ * the highest-priority present provider carrying that input wins. There
+ * is no qwerty floor here — the keyboard has no joints — so with every
+ * carrier absent the role parks at -1 and consumers fall back to the
+ * static assignment's inactive joints.
+ */
+void
+t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left,
+                                            struct xrt_device *unobstructed_right,
+                                            struct xrt_device *conforming_left,
+                                            struct xrt_device *conforming_right);
+
+/*!
  * Record the qwerty fallback's left/right emulated controllers. Either
  * may be NULL. Called by @ref t_builder_add_qwerty_input.
  */
