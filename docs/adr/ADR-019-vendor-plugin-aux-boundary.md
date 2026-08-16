@@ -1,5 +1,5 @@
 ---
-status: Proposed
+status: Accepted (implemented; CI-enforced by build-windows.yml "zero vendor identifiers" assert)
 date: 2026-05-20
 ---
 # ADR-019: Aux Library Boundary for Vendor Plug-in DLLs
@@ -87,7 +87,7 @@ The audit conclusion is anchored by `dumpbin` output already quoted under "Why t
 
 ## Decision
 
-**Option C.** The runtime DLL (`DisplayXRClient.dll`) exports a single, deliberately small surface — the state-bearing TUs identified by the audit. Pure / instance-based TUs continue to static-link into each plug-in DLL. Plug-ins link an `aux_imp.lib` import library that resolves the exported surface to the runtime DLL.
+**Option C.** The runtime DLL (`DisplayXRClient.dll`) exports a single, deliberately small surface — the state-bearing TUs identified by the audit. Pure / instance-based TUs continue to static-link into each plug-in DLL. Plug-ins link a `DisplayXRClient.lib` import library that resolves the exported surface to the runtime DLL.
 
 Reasoning, in order of weight:
 
@@ -101,7 +101,7 @@ Reasoning, in order of weight:
 
 ## Exported surface (the v1 ABI commitment)
 
-`DisplayXRClient.dll` exports the symbols listed below. They form the contents of `aux_imp.lib` (Windows) / the published `.so` interface (Linux/macOS). **Adding to this list is non-breaking. Removing or changing the signature of anything on this list is an ABI break and requires the same discipline as a `xrt_dp_create_info`-style versioned struct bump.**
+`DisplayXRClient.dll` exports the symbols listed below. They form the contents of `DisplayXRClient.lib` (Windows) / the published `.so` interface (Linux/macOS). **Adding to this list is non-breaking. Removing or changing the signature of anything on this list is an ABI break and requires the same discipline as a `xrt_dp_create_info`-style versioned struct bump.**
 
 From `util/u_logging.h`:
 - `u_log`
@@ -168,7 +168,7 @@ The stress test, gated to land with Step 3 or Step 4 (whichever ships the first 
    - Calls `u_limited_unique_id_get()` and returns the value through an `out` pointer.
 2. Build that TU into two artifacts:
    - `aux_probe_inproc.lib` — static-linked into `displayxr-cli.exe` for a baseline.
-   - `aux_probe_plugin.dll` — separately-built DLL that links `aux_imp.lib`, exports the same function.
+   - `aux_probe_plugin.dll` — separately-built DLL that links `DisplayXRClient.lib`, exports the same function.
 3. Add a CLI subcommand `displayxr-cli aux-probe` that:
    - Calls the in-process `aux_probe_log_and_register("inproc")`.
    - `LoadLibraryExW("aux_probe_plugin.dll", ..., LOAD_WITH_ALTERED_SEARCH_PATH)`.
@@ -185,11 +185,14 @@ A failure on any of those four anchors is a regression in the boundary's impleme
 
 ## Consequences
 
+- **Status (2026-08-16).** The extraction shipped: vendor display processors are separately-built plug-in DLLs discovered at `xrCreateInstance`, and CI asserts the runtime DLL's link line carries **zero vendor identifiers** (`.github/workflows/build-windows.yml`). The "Verification plan" below was **never built** — there is no `tools/aux_boundary_check/`, no `aux_probe_plugin.dll`, and no `displayxr-cli aux-probe` subcommand. The CI assert took its place as the standing gate.
+- **Isolation is a separate decision.** This ADR keeps plug-ins in-process by construction. Moving satellites (input providers, MCP adapter) out of the service process is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
+
 - **The vendor driver and `drv_sim_display` migrate to plug-in DLLs without changing their U_LOG / u_var / u_metrics call sites.** Source compatibility for the existing 260 `U_LOG_*` call sites in the vendor driver is preserved; only the link line changes.
-- **`DisplayXRClient.dll`'s export count goes from 1 to roughly 50.** The Khronos loader interface (`xrNegotiateLoaderRuntimeInterface`) stays the one OpenXR-facing export; the new ~50 are explicitly for in-process plug-in consumption and live behind the `aux_imp.lib` import library. They're not part of any OpenXR-spec surface and do not need to satisfy any external contract.
+- **`DisplayXRClient.dll`'s export count goes from 1 to roughly 50.** The Khronos loader interface (`xrNegotiateLoaderRuntimeInterface`) stays the one OpenXR-facing export; the new ~50 are explicitly for in-process plug-in consumption and live behind the `DisplayXRClient.lib` import library. They're not part of any OpenXR-spec surface and do not need to satisfy any external contract.
 - **The CI vendor-identifier guard (a `findstr` on the vendor SDK identifier) from §4.8 of the plan continues to assert what it asserts.** Aux exports don't introduce vendor identifiers; the runtime's link line remains vendor-agnostic.
 - **One copy of log / var / metrics state per process.** The "one log per process" debug invariant becomes a structural property again, not a coincidence of in-tree static linking.
-- **`aux_util.lib` as built today doesn't disappear.** Internal consumers in the runtime DLL still static-link it the same way; the exports are layered on top via a small `__declspec(dllexport)` wrapper TU inside the runtime target. Plug-ins use `aux_imp.lib`. macOS uses the corresponding visibility annotations on the shared library. Linux uses `-fvisibility=hidden` + explicit `__attribute__((visibility("default")))`. Existing in-tree consumers (test apps that link aux_util directly) keep working unmodified; the boundary only matters for the new plug-in DLLs.
+- **`aux_util.lib` as built today doesn't disappear.** Internal consumers in the runtime DLL still static-link it the same way; the exports are layered on top via a small `__declspec(dllexport)` wrapper TU inside the runtime target. Plug-ins use `DisplayXRClient.lib`. macOS uses the corresponding visibility annotations on the shared library. Linux uses `-fvisibility=hidden` + explicit `__attribute__((visibility("default")))`. Existing in-tree consumers (test apps that link aux_util directly) keep working unmodified; the boundary only matters for the new plug-in DLLs.
 - **Headers in `src/xrt/include/xrt/util/` and `src/xrt/auxiliary/util/` describing the exported TUs gain `XRT_API_FUNC` / `XRT_API_VAR` macros** to tag the exported symbols. The macros expand to `__declspec(dllexport)` when building the runtime DLL, `__declspec(dllimport)` when building plug-ins, and nothing for internal consumers and test apps that static-link. The exact macro shape is a Step 2 deliverable (the `xrt_plugin.h` work) — this ADR commits to the **set** of symbols, not the spelling.
 - **Bumping the exported aux surface is treated as ABI work**, with the same discipline as extension struct bumps ([[feedback_extension_struct_abi.md]]): never reorder, additions go at the end, no signature changes on existing exports without a versioned wrapper.
 - **Vendor SDK upgrades become plug-in releases (plan goal #3) without requiring a runtime release**, because the plug-in's link to aux is via the runtime's stable import library, not the runtime's internal aux source.

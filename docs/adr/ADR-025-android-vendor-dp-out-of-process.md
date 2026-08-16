@@ -6,6 +6,17 @@ date: 2026-06-09
 
 ## Context
 
+> **Amendment / clarification (2026-08-16).** "Out-of-process" in this ADR means
+> the **app** is isolated from the vendor SDK by the app↔service split. It does
+> **not** mean the display processor runs in a process of its own: the DP is
+> `dlopen`ed into the service process, and no DP proxy or DP host exists on any
+> platform. #510 remains **open** with its acceptance criteria unchecked, and CI
+> builds only the `inProcess` flavor
+> (`.github/workflows/build-android.yml`). The service-side consequence this ADR
+> does not address — that an in-process DP shares the service's fate, and that
+> nothing arbitrates between concurrent client classes inside it — is
+> [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md).
+
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) establishes the vendor-isolation
 principle: vendor display processors ship as plug-ins behind a
 stable boundary, and an application talks only to DisplayXR (the OpenXR loader →

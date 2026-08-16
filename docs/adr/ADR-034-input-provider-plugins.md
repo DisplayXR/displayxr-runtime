@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*)
+**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*; presence-ranked hierarchy — all claiming providers stay resident, roles follow presence — amended 2026-08-16, see *Amendment 3*, whose addendum makes the hand-tracking source follow presence too). The process that **hosts** input providers is not decided here: today they load in-process, and moving them out is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
 **Date:** 2026-08-02
 
 ## Context

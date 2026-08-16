@@ -1,12 +1,12 @@
 ---
-status: Proposal
+status: Implemented (contract shipped; arbitration across concurrent client classes tracked in ADR-035 / #939)
 owner: David Fattal
-updated: 2026-03-21
+updated: 2026-08-16
 issues: [43, 44]
-code-paths: [src/xrt/compositor/multi/, src/xrt/ipc/]
+code-paths: [src/xrt/ipc/server/ipc_server_handler.c, src/xrt/compositor/d3d11_service/]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/DisplayXR/displayxr-runtime/issues/43), [#44](https://github.com/DisplayXR/displayxr-runtime/issues/44)
+> **Status: Implemented.** The contract ships — `workspace_activate` / `_deactivate`, pose, visibility, focus, client enumeration, and exit all land in `src/xrt/ipc/server/ipc_server_handler.c` against the D3D11 service compositor. What remains open is not the contract but **arbitration between concurrent client classes** (workspace controller vs standalone IPC client vs browser vs bridge): [#939](https://github.com/DisplayXR/displayxr-runtime/issues/939) and [ADR-035](../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md). Original tracking issues: [#43](https://github.com/DisplayXR/displayxr-runtime/issues/43), [#44](https://github.com/DisplayXR/displayxr-runtime/issues/44)
 
 # Workspace / Runtime Contract
 
@@ -44,12 +44,12 @@ The workspace controller must be able to send:
 | Message | Description | Status |
 |---------|-------------|--------|
 | **`workspace_activate`** | Enter workspace mode (multi-comp takes over DP + display) | Implemented |
-| **`workspace_deactivate`** | Exit workspace mode (per-client compositors resume direct rendering) | Phase 4D |
+| **`workspace_deactivate`** | Exit workspace mode (per-client compositors resume direct rendering) | Implemented |
 | **`workspace_set_window_pose`** | Position, orientation, size of a window quad in 3D space | Implemented |
 | **`workspace_get_window_pose`** | Query current window transform | Implemented |
 | **`workspace_set_window_visibility`** | Show/hide a window without destroying it (minimize) | Implemented |
-| **`workspace_add_capture_client`** | Adopt a 2D OS window: runtime starts `Windows.Graphics.Capture` for the given HWND, returns client_id | Phase 4A |
-| **`workspace_remove_capture_client`** | Stop capturing a 2D window, remove virtual client slot | Phase 4A |
+| **`workspace_add_capture_client`** | Adopt a 2D OS window: runtime starts `Windows.Graphics.Capture` for the given HWND, returns client_id | Implemented |
+| **`workspace_remove_capture_client`** | Stop capturing a 2D window, remove virtual client slot | Implemented |
 | **Capture commands** *(future)* | Start/stop frame capture, recording, session capture | Phase 5+ |
 | **Layout updates** | Batch update of multiple window transforms (layout preset apply) | Phase 2+ |
 
@@ -86,18 +86,12 @@ The shell and runtime live in separate repositories. The shell builds against a 
 | Repo | Visibility | Owns |
 |------|-----------|------|
 | `displayxr-runtime` | Public | Multi-compositor, capture mechanism, IPC protocol, SDK export |
-| `displayxr-shell` | Private | Window adoption, layout policy, launcher, persistence, spatial companion UX |
+| `displayxr-shell-pvt` | Private | Window adoption, layout policy, launcher, persistence, spatial companion UX |
 | `displayxr-shell-releases` | Public | Binary-only shell releases |
 
-**SDK surface (exported by runtime):**
+**SDK surface (as built).** There is no DisplayXR SDK package: the shell links only the Khronos OpenXR loader (`OpenXR::openxr_loader`), cJSON, and Win32, and reaches the runtime entirely through the `XR_DXR_spatial_workspace` extension — no `ipc_client.lib`, no `ipc_shared.lib`, no `DisplayXRSDKConfig.cmake`. The only import library the runtime exports is `DisplayXRClient.lib`, and that is for **vendor plug-in DLLs**, not for controllers.
 
-| Component | Contents |
-|-----------|----------|
-| Headers | `xrt/*.h` (core types), `ipc/client/*.h` (client API), `ipc/shared/*.h` (protocol), `util/u_logging.h` |
-| Libraries | `ipc_client.lib` (static), `ipc_shared.lib` (static), `aux_util.lib` (static) |
-| CMake | `DisplayXRSDKConfig.cmake` package config |
-
-The shell links statically — at runtime, the shell exe is fully standalone. It finds the service via named pipe (no library or path dependency on the runtime installation).
+The consequence is the intended one: the shell exe is standalone, has no build-time coupling to runtime source, and finds the service through the loader and the named pipe.
 
 **Capture code lives in the runtime** because `Windows.Graphics.Capture` must run on the same D3D11 device as the multi-compositor. The shell tells the runtime which HWNDs to capture; the runtime handles all GPU work. This preserves the mechanism/policy split.
 
@@ -105,7 +99,7 @@ The shell links statically — at runtime, the shell exe is fully standalone. It
 
 - Shell must not call into compositor internals directly — all communication goes through the contract
 - Runtime must not make UX decisions (e.g., where to place a new window) — it exposes primitives, shell decides policy
-- Contract must support multiple shells simultaneously in the future (e.g., spatial shell + accessibility overlay)
+- Contract must support multiple concurrent client classes (workspace controller + accessibility overlay + standalone IPC app + browser). This is the live design problem, not a future one: [#939](https://github.com/DisplayXR/displayxr-runtime/issues/939), decided in [ADR-035](../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
 - Latency-sensitive messages (window pose during drag) may need a fast path separate from general IPC
 - Runtime and shell are independently installable — runtime has standalone value without the shell
 - SDK is the only build-time coupling — shell never includes runtime source directly

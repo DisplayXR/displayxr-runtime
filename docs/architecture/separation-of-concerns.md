@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-05-31
+updated: 2026-08-16
 ---
 # Separation of Concerns: App → OXR → Compositor → Driver/DP
 
@@ -48,7 +48,7 @@ This document defines what each architectural layer owns and what must not cross
 
 ## Layer 5: Display Processors
 
-Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/compositor/` (generic).
+Vendor display processors ship as **plug-in DLLs from their own repos** ([ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md)), discovered at `xrCreateInstance`. In-tree there is only the vendor-neutral `src/xrt/drivers/sim_display/`; generic helpers live in `src/xrt/compositor/`.
 
 - `process_atlas()` — transform tiled atlas to display-specific output for all advertised modes (interlacing, SBS, anaglyph, and 2D passthrough). Receives atlas texture with dimensions exactly matching the mode's tile layout — no need to handle oversized or mismatched textures
 - `get_predicted_eye_positions()` — N-view eye positions from vendor SDK
@@ -58,6 +58,10 @@ Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/composi
 - `set_output_format()` — deferred format configuration (D3D12 DP only)
 - Pure vtable interface per API: `xrt_display_processor` (Vulkan), `xrt_display_processor_d3d11`, `xrt_display_processor_d3d12`, `xrt_display_processor_metal`, `xrt_display_processor_gl`
 - **Must NOT contain**: OXR types, session state, swapchain management
+
+## The service process as a layer
+
+The layers above describe one process. When the compositor runs out-of-process, the **service** is itself a layer: it owns the panel, the display processor, the display mode, and focus *across concurrent clients* of different classes. That layer — its threads, locks, two compositor modes, client classes, failure domains, and limits — is described in [service-architecture.md](service-architecture.md); its target contract (service-owned arbitration, one always-on pipeline, isolated satellites) is [ADR-035](../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md).
 
 ## Responsibility Matrix
 
@@ -76,22 +80,24 @@ Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/composi
 
 ## Vendor Isolation Rule
 
-> A new vendor integrates by adding files **only** under `src/xrt/drivers/<vendor>/` and `src/xrt/targets/common/`. Zero changes to compositor or state tracker code.
+> A new vendor adds **no files to this repo at all**. It ships its own DLL exporting `xrtPluginNegotiate`, discovered at `xrCreateInstance` via `HKLM\Software\DisplayXR\DisplayProcessors` on Windows and JSON manifests on POSIX ([ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md), [plugin-discovery.md](../specs/runtime/plugin-discovery.md)). Zero changes to compositor, driver, or state-tracker code.
+
+CI enforces this: `build-windows.yml` asserts the runtime DLL's link line carries **zero vendor identifiers**.
 
 ## Workspace Controller / Runtime Boundary
 
-The spatial-workspace surface (`XR_DXR_spatial_workspace`, spec_version 7) splits responsibility between the runtime and a separate **workspace controller** process (the DisplayXR Shell is the reference implementation):
+The spatial-workspace surface (`XR_DXR_spatial_workspace`, spec_version 24) splits responsibility between the runtime and a separate **workspace controller** process (the DisplayXR Shell is the reference implementation):
 
 - **Runtime owns mechanism**: cross-process texture sharing, atlas composition at controller-specified poses, depth pipeline, cursor-sprite compositing (at the per-eye depth — and over-window dim alpha — the controller pushes via `xrSetWorkspaceCursorDepthDXR`), input-event drain (POINTER / KEY / SCROLL / MOTION + FRAME_TICK carrying the OS cursor position), and lifecycle dispatch (close / fullscreen RPCs).
 - **Controller owns policy + appearance**: hit-testing (the eye→cursor raycast against window planes — which window / region / depth the cursor is over), every pixel of chrome (pill background, grip dots, buttons, icons, glyphs, focus glow), every region's hit-region geometry, every animation curve (hover-fade, slot-anim transitions, carousel rotation), every layout preset, the drag / resize / rotation state machines (driven via `xrSetWorkspaceClientWindowPoseDXR`), and every keyboard / window-behavior shortcut (close, launch, focus-cycle, maximize, depth-step) decided off the KEY event stream.
 
 After Phase 2.C the runtime ships with **zero default chrome**. Workspace clients render as bare content quads unless a controller submits a chrome swapchain via `xrCreateWorkspaceClientChromeSwapchainDXR`. This means controllers (third-party shells, accessibility overlays, OEM skins) can change chrome appearance, geometry, and behavior without forking the runtime.
 
-**Hit-test ownership (spec_version 22, issue #370):** the runtime no longer raycasts. `workspace_raycast_hit_test` and the public `xrWorkspaceHitTestDXR` were deleted; the runtime stopped enriching POINTER / POINTER_MOTION events and stopped emitting POINTER_HOVER. The controller runs the hit-test itself (it already owns the window poses it pushed, gets eye positions via its session, and receives the OS cursor position each frame on FRAME_TICK), generates its own hover transitions, and feeds the runtime only the resulting cursor **depth** so the sprite composites at the right per-eye disparity. The drag / resize / rotation state machines that ADR-018 flagged as the real layering violation have likewise moved to the controller. This reverses ADR-018's "hit-test stays in the runtime as plumbing" decision — see that ADR's superseded note.
+**Hit-test ownership (since spec_version 22, issue #370):** the runtime no longer raycasts. `workspace_raycast_hit_test` and the public `xrWorkspaceHitTestDXR` were deleted; the runtime stopped enriching POINTER / POINTER_MOTION events and stopped emitting POINTER_HOVER. The controller runs the hit-test itself (it already owns the window poses it pushed, gets eye positions via its session, and receives the OS cursor position each frame on FRAME_TICK), generates its own hover transitions, and feeds the runtime only the resulting cursor **depth** so the sprite composites at the right per-eye disparity. The drag / resize / rotation state machines that ADR-018 flagged as the real layering violation have likewise moved to the controller. This reverses ADR-018's "hit-test stays in the runtime as plumbing" decision — see that ADR's superseded note.
 
-**Residual input + look-and-feel policy retired (spec_version 23, issue #376):** the last runtime-side workspace policies moved to the controller. The runtime's `DELETE` (close-focused-client) and `Ctrl+O` (browse + launch an arbitrary exe) key intercepts were deleted — both are now controller policy driven off the drained KEY events (DELETE → `xrRequestWorkspaceClientExitDXR`; Ctrl+O → the controller's own file picker + launch path), joining the TAB / F11 / `[` / `]` shortcuts the controller already owned (#305–#307). The over-window cursor body alpha — previously a hardcoded `0.30` in the compositor — is now controller-pushed as `dimFactor` on `xrSetWorkspaceCursorDepthDXR`. (The dead `mc->drag` field, a vestige of the migrated drag state machine, was also removed.) The runtime retains the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
+**Residual input + look-and-feel policy retired (since spec_version 23, issue #376):** the last runtime-side workspace policies moved to the controller. The runtime's `DELETE` (close-focused-client) and `Ctrl+O` (browse + launch an arbitrary exe) key intercepts were deleted — both are now controller policy driven off the drained KEY events (DELETE → `xrRequestWorkspaceClientExitDXR`; Ctrl+O → the controller's own file picker + launch path), joining the TAB / F11 / `[` / `]` shortcuts the controller already owned (#305–#307). The over-window cursor body alpha — previously a hardcoded `0.30` in the compositor — is now controller-pushed as `dimFactor` on `xrSetWorkspaceCursorDepthDXR`. (The dead `mc->drag` field, a vestige of the migrated drag state machine, was also removed.) The runtime retains the close / launch / cursor *mechanisms*; the controller decides when and how they fire.
 
-**Reference**: `feedback_controllers_own_motion` for the architectural North Star; ADR-018 for the hit-test plumbing vs interactive policy split; `docs/specs/extensions/XR_DXR_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
+**Reference**: `feedback_controllers_own_motion` for the architectural North Star; ADR-018 for the hit-test plumbing vs interactive policy split; `docs/specs/extensions/XR_DXR_spatial_workspace.md` for the surface; `displayxr-shell-pvt/src/shell_chrome.cpp` (private repo) for the reference chrome implementation.
 
 ## Data Flow Examples
 

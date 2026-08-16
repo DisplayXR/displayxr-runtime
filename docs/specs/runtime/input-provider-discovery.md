@@ -6,13 +6,22 @@ runtime), and runtime engineers maintaining the discovery path.
 
 **Status:** v1 — §§2–4 and 6 are **implemented** (Phase 1, #823:
 `xrt/xrt_input_plugin.h`, `target_input_plugin_loader.c`, the builder
-arbitration, `sim_input`, and the CLI/self-test diagnostics). Still
-planned: the `net_input` provider + its wire protocol (§5, Phase 2) and
-the `PreferredPlugin` override (§3, noted inline). The authoritative
+arbitration, `sim_input`, and the CLI/self-test diagnostics). §5 —
+`net_input` and its wire protocol — has since **shipped**
+(`src/xrt/drivers/net_input/`, `DisplayXR-NetInput`). Still planned: the
+`PreferredPlugin` override (§3, noted inline). The authoritative
 rationale is `docs/adr/ADR-034-input-provider-plugins.md`. This spec
 intentionally mirrors the display-processor contract
 (`docs/specs/runtime/plugin-discovery.md`); where a rule is not restated
 here, the DP rule applies unchanged.
+
+**Host process.** Input providers are `dlopen`ed **in-process** — inside
+`displayxr-service.exe` in service mode, and inside the app in every
+in-process mode — so a provider shares the fate of whatever loaded it: a
+provider that hangs or calls `exit()` takes the service and every connected
+client down with it (#943). Which process *should* host them is
+[ADR-035](../../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
+decision D4.
 
 Terminology: "motion controller" = tracked hand-held input device. Not the
 workspace controller (shell) of ADR-014.
@@ -173,10 +182,17 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    controller-derived; first claimant wins per role). These roles gate the
    whole `XR_EXT_hand_tracking` path — system support, tracker creation,
    joint locates. Providers without hand-tracking inputs leave them empty;
-   that is a valid configuration, never a failure. These roles are
-   **static** by the `xrt_system_devices` contract and so are *not*
-   arbitrated: an absent optical tracker reports inactive joints, and
-   qwerty has no hand tracking to fall back to anyway.
+   that is a valid configuration, never a failure. These *static* roles
+   are build-time gating only — they decide whether `XR_EXT_hand_tracking`
+   is supported at all, and by the `xrt_system_devices` contract they never
+   change. The **source** a tracker actually reads from *is* arbitrated:
+   ADR-034 Amendment 3's addendum added dynamic
+   `hand_tracking.{unobstructed,conforming}.{left,right}` roles to
+   `xrt_system_roles`, filled by the arbiter's presence walk under the same
+   `generation_id` as the other roles (`target_input_arbiter.c`), so the
+   hand-tracking source follows provider presence like every other role. An
+   absent optical tracker reports inactive joints, and qwerty has no hand
+   tracking to fall back to anyway.
 6. **`sim_input` is opt-in at run time.** Being registered is not enough
    — its `probe()` declines unless `DXR_SIM_INPUT` is set in the
    environment of the process loading the runtime. It synthesises a fixed
@@ -222,7 +238,7 @@ Provider-facing consequences:
   hand-joint base (`xrt_space_overseer::locate_device`), in-process and over
   IPC. Covered by `tests/tests_space_overseer_rig.cpp`.
 
-## 5. In-tree reference providers (planned)
+## 5. In-tree reference providers
 
 | Provider | Status | Purpose |
 |---|---|---|

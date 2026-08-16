@@ -8,9 +8,18 @@ runtime dylib has zero `sim_display_*` symbols in its link line, the
 `DisplayXR-SimDisplay.dylib` plug-in is discovered via the JSON
 manifest path described in §3, and `scripts/build_macos.sh` packages
 + wires up the plug-in for dev runs via `XRT_PLUGIN_SEARCH_PATH`.
-Linux uses the same loader code (POSIX branch in
-`target_plugin_loader.c`), but is untested end-to-end because no
-graphics-stack-complete Linux build target ships today.
+Linux **ships** as well: the same loader code (POSIX branch in
+`target_plugin_loader.c`), hardware-validated on Vulkan + X11, with the
+plug-in installed from the `.deb` attached to every `v*` release (#781).
+
+The loader also runs inside `displayxr-service.exe`, not only inside apps:
+a display processor is an **in-process, shared-fate component of the
+service** (see `docs/architecture/service-architecture.md` §1.4 / §5) —
+if it hangs, calls `exit()`, or corrupts the heap, the service and every
+connected client go with it. For the same reason a development build must
+never register a plug-in DLL living in a worktree or build directory under
+a live service (#943): the service holds the DLL and its stale code for its
+whole lifetime.
 
 This document is the **runtime ↔ plug-in discovery contract**. The
 C-ABI side — the negotiation entry point, the `xrt_plugin_iface` vtable,
@@ -179,8 +188,9 @@ filesystem but use different shapes for the per-entry metadata.
 
 ### 3.1 POSIX: JSON-manifest discovery (macOS / Linux)
 
-> **Implementation status:** shipping on macOS (issue #267). Linux uses
-> the same code path but is untested end-to-end. The `XRT_PLUGIN_SEARCH_PATH`
+> **Implementation status:** shipping on macOS (issue #267) and on Linux
+> (same code path; hardware-validated, `.deb` on every release, #781).
+> The `XRT_PLUGIN_SEARCH_PATH`
 > env var (colon-separated directory list) overrides the default
 > search roots — used by `scripts/build_macos.sh`-generated
 > `run_*.sh` scripts to point at the dev tree's
@@ -415,9 +425,9 @@ manifest + binary, leaves the runtime alone.
 
 ## 6. Version negotiation
 
-`XRT_PLUGIN_API_VERSION_CURRENT` is defined in `xrt/xrt_plugin.h`. As of
-runtime v1.13.0 the current major is `XRT_PLUGIN_API_VERSION_3`
-(ADR-020, ADR-022). History:
+`XRT_PLUGIN_API_VERSION_CURRENT` is defined in `xrt/xrt_plugin.h`. The current major is
+`XRT_PLUGIN_API_VERSION_5` (`xrt_plugin.h:311`; ADR-020, ADR-022).
+History:
 
 - v1 → v2 (runtime v1.6.0): the one-time break that introduced the
   `struct_size` header on the display-processor vtables; ABI-v1
@@ -429,6 +439,21 @@ runtime v1.13.0 the current major is `XRT_PLUGIN_API_VERSION_3`
   array, so ABI-v2 plug-ins are rejected. The flags word + reserved
   padding make v3 the intended **last** rendering-mode layout break
   (ADR-022): future per-mode capabilities are new bits, not new fields.
+- v3 → v4 (transparency): `set_chroma_key` is removed from all five DP
+  vtables, shifting every slot after it — a layout break. The D3D12 and
+  GL DP vtables gain `set_transparent_background`, and the extension
+  struct drops `chromaKeyColor` (`XR_DXR_win32_window_binding`
+  SPEC_VERSION 7 → 8). True transparency (alpha-capable swapchain +
+  transparent present) becomes the sole path.
+- v4 → v5 (#757): `struct vk_bundle` — whose raw pointer crosses the
+  runtime → plug-in boundary via the VK DP factory — gained ABI-parity
+  `#else` placeholder members for every `VK_USE_PLATFORM_*`-conditional
+  PFN slot, so its layout no longer varies with configure-time feature
+  detection. That inserts members versus v4 binaries (a layout break),
+  but it is the **last** such break: the layout is now identical across
+  configs by construction. The Linux VK DP contract also newly
+  guarantees the dma-buf import extension set on the app device
+  (`VK_EXT_external_memory_dma_buf` + `VK_EXT_image_drm_format_modifier`).
 
 Both the runtime and the plug-in pass their own version through
 `xrtPluginNegotiate`. The runtime enforces a strict major match — a
@@ -449,10 +474,10 @@ their compile time; the runtime guards each new vtable call on
 `oxr_plugin_stub.c` for the structural asserts that enforce the
 append-only rule at compile time.
 
-Versioned struct bumps (the next would be `XRT_PLUGIN_API_VERSION_3`)
+Versioned struct bumps (the next would be `XRT_PLUGIN_API_VERSION_6`)
 are reserved for non-additive changes (reordering, renaming, signature
-changes on existing fields). v2 commits to the field order documented
-in the header.
+changes on existing fields). Each major commits to the field order documented in
+the header.
 
 ---
 
@@ -490,8 +515,8 @@ The runtime emits these one-shot lines at instance creation, all at
 | `plugin loader:   <id>: negotiate returned <code> (iface=<ptr>) — skipping.`                                         | WARN — negotiate failure. Usually version mismatch.                                                       |
 | `plugin loader:   <id>: probe returned <code> — skipping.`                                                            | WARN — probe failure other than the clean `XRT_ERROR_PROBER_NOT_SUPPORTED` decline.                       |
 | `plugin loader: active plug-in: id=<id> name='<name>' vendor='<vendor>' version='<version>' plugin_api=<v> probe_order=<n> path=<path>` | WARN — the winning plug-in. Authoritative line for "which DP shipped this session."                       |
-| `plugin loader: no registered plug-in claimed the system — falling back to static drivers.`                          | WARN — every entry failed / declined. Static fallback active.                                              |
-| `plugin loader: registry root HKLM\Software\DisplayXR\DisplayProcessors absent (rc=<n>) — no plug-ins to try.`       | INFO — no plug-ins registered. Static fallback active. Suppressed at default WARN.                        |
+| `plugin loader: no registered plug-in claimed the system — falling back to static drivers.`                          | WARN — every entry failed / declined. **The message is stale**: the static-link fallback was removed in #287 (see §7), so nothing loads and instance creation fails.  |
+| `plugin loader: registry root HKLM\Software\DisplayXR\DisplayProcessors absent (rc=<n>) — no plug-ins to try.`       | INFO — no plug-ins registered. Same stale "static" wording as above; there is no fallback. Suppressed at default WARN.  |
 
 Vendor support flows checking "is the plug-in actually loading"
 should look for the `active plug-in:` line in

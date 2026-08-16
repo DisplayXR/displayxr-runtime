@@ -1,5 +1,15 @@
 # In-Process vs Service Compositor Architecture
 
+> **Partially superseded (2026-08-16).** The service-side internals described
+> here predate the vendor plug-in extraction ([ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md))
+> and the #925 stabilisation. The authoritative map of the service — processes,
+> threads, locks, the two compositor modes, client classes, and failure domains
+> — is [service-architecture.md](service-architecture.md). Vendor symbols named
+> below (`leiasr_d3d11_*`, `XRT_HAVE_LEIA_SR_D3D11`, `struct leiasr_d3d11 *weaver`,
+> `ipc_compute_kooima_fov`) no longer exist: the display processor is reached
+> only through the vendor-neutral `xrt_display_processor_*` vtables, and the
+> Kooima math lives in `displayxr-common`.
+
 This document explains the architectural differences between the **in-process (native app)** and **service/IPC (WebXR/shell)** compositor pipelines in the DisplayXR runtime.
 
 > For the high-level view of what ships, what runs, and when each path activates, see [Production Components](production-components.md). This document covers the D3D11 implementation details.
@@ -11,7 +21,7 @@ This document explains the architectural differences between the **in-process (n
 | **Compositor** | `comp_d3d11_compositor` | `d3d11_service_compositor` |
 | **Process Model** | Single process | N+1 processes (one or more IPC clients — Chrome tab, shell-launched apps — plus `displayxr-service`) |
 | **D3D11 Device** | App's device (shared) | Service's own device |
-| **Swapchain Textures** | Local textures | Cross-process shared (NT handles + KeyedMutex) |
+| **Swapchain Textures** | Local textures | Cross-process shared (NT handles + KeyedMutex; the D3D11 workspace leg now also uses a shared fence, `workspace_sync_fence`) |
 | **View Poses** | Direct from compositor | Via IPC with tracking-aware poses from server |
 | **Eye Tracking** | Compositor queries vendor weaver | IPC server queries vendor weaver |
 | **Session Events** | Direct callbacks | IPC message queue |
@@ -99,7 +109,13 @@ The IPC plumbing is identical whether the client is a Chrome tab or an app launc
 - **N clients, not one.** The service runs in multi-compositor mode and composites every connected client (shell plus one or more 3D apps) into a single output.
 - **Not sandboxed.** Shell-launched apps run with the user's normal token — no AppContainer. `ipc_server_mainloop_windows.cpp` still sets a named-pipe DACL that grants access to both the normal user SID and AppContainer, so the same pipe works for both clients. The shared-handle `SECURITY_ATTRIBUTES` for Chrome adds a `ALL APPLICATION PACKAGES` ACE; shell-launched apps don't need that ACE but don't reject it either.
 - **Shell is a privileged IPC client.** Beyond the standard frame path, the shell sends window pose, focus, layout, and 2D-capture commands over the shell↔service control channel (see [workspace-runtime-contract.md](../roadmap/workspace-runtime-contract.md)).
-- **Mode gate.** `DISPLAYXR_SHELL_SESSION=1` is the flag the shell sets in the environment of every app it launches; the runtime DLL sees it in `u_sandbox_should_use_ipc()` and routes to IPC even though the process isn't sandboxed.
+- **Mode gate.** `DISPLAYXR_WORKSPACE_SESSION=1` is the flag the shell sets in the environment of every app it launches; the runtime DLL sees it in `u_sandbox_should_use_ipc()` and routes to IPC even though the process isn't sandboxed.
+- **Step 0 comes before that.** A session with `XR_DXR_spatial_workspace` enabled
+  (i.e. the workspace controller itself) is routed to IPC by
+  `ext_spatial_workspace_enabled` in `src/xrt/targets/openxr/target.c:49-52`,
+  *before* `u_sandbox_should_use_ipc()` is ever consulted. That auto-detection is
+  what lets a controller stay runtime-agnostic instead of setting
+  `XRT_FORCE_MODE=ipc` itself.
 
 ---
 
@@ -412,23 +428,23 @@ struct d3d11_service_system {
 | View poses source | vendor weaver via compositor | vendor weaver via IPC server |
 | Eye tracking | Direct compositor query | IPC server queries, sends to client |
 | FOV computation | `oxr_session_locate_views()` | `ipc_try_get_sr_view_poses()` |
-| Player transform | Qwerty device in-process | Qwerty device on server side (WebXR); shell-owned and forwarded to focused app (shell mode) |
+| Player transform / input roles | Presence-ranked **input-provider hierarchy** with the qwerty device as the floor, arbitrated by `target_input_arbiter.c` ([ADR-034](../adr/ADR-034-input-provider-plugins.md), Amendments 1–3) | Same hierarchy, resolved in the service and forwarded over IPC; under a workspace the controller still forwards window input to the focused app |
 | Session events | Direct callback | IPC message queue |
 | Window ownership | App or compositor | Service's window |
 | Process count | 1 | 2 (WebXR: Chrome + service) or N+1 (shell: shell + N apps + service) |
-| GPU sync | Local barriers | KeyedMutex (cross-process) |
+| GPU sync | Local barriers | KeyedMutex (cross-process); the D3D11 workspace leg now also uses a shared fence, `workspace_sync_fence` |
 
 ---
 
 ## Current Limitations (IPC Paths)
 
-1. **Double compositing:** The IPC client renders to shared textures, then the service compositor re-renders to output. This adds latency vs native in-process apps. Affects both WebXR and shell-launched apps.
+Each of these is expanded, with code anchors, in
+[service-architecture.md](service-architecture.md) §9.
 
-2. **Security constraints (WebXR only):** Chrome's AppContainer sandbox requires shared-handle `SECURITY_ATTRIBUTES` with a DACL that grants `ALL APPLICATION PACKAGES`. Shell-launched apps run under the normal user token and don't need this, but the service applies the same permissive DACL uniformly.
-
-3. **QWERTY keyboard control:**
-   - **WebXR path:** the qwerty device lives in the service and drives the player transform; it requires the service window to have focus.
-   - **Shell path:** the qwerty device is owned by the shell, not by individual apps. The shell forwards input to the focused app window; apps receive window-relative eye poses but no qwerty device of their own.
+1. **Connection cap:** `IPC_MAX_CLIENTS` is 8 (`src/xrt/ipc/shared/ipc_protocol.h`) — a hard array bound, and satellites consume slots too.
+2. **No arbitration between concurrent client classes** (#939): workspace, standalone IPC, browser, and bridge clients each assume they own the panel, the display mode, and focus.
+3. **In-process plug-ins share the service's fate** (#943): a display processor, input provider, or MCP adapter that calls `exit()`, hangs, or corrupts the heap takes the whole service and every client with it.
+4. **The standalone path is single-tenant in practice:** N standalone clients means N display processors, each presenting its own swap chain to the same panel.
 
 ---
 

@@ -1,8 +1,8 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-05-31
-code-paths: [src/xrt/compositor/multi/, src/xrt/compositor/d3d11_service/, src/xrt/ipc/]
+updated: 2026-08-16
+code-paths: [src/xrt/compositor/d3d11_service/, src/xrt/compositor/multi/, src/xrt/ipc/]
 ---
 # Service-Mode Multi-Compositor
 
@@ -16,6 +16,20 @@ It is a **mechanism**, independent of any window-placement policy. It backs ever
 policy — see [separation-of-concerns.md](separation-of-concerns.md) and the
 [`XR_DXR_spatial_workspace`](../specs/extensions/XR_DXR_spatial_workspace.md) surface. For the **single-app
 (in-process)** pipeline, see [compositor-pipeline.md](compositor-pipeline.md).
+
+## Which implementation
+
+"Multi-compositor" names a role, and two different implementations fill it. On
+Windows the service compositor is `comp_d3d11_service`
+(`src/xrt/targets/common/target_instance.c:245-260` calls
+`comp_d3d11_service_create_system()`). `compositor/multi/` (`comp_multi`) is the
+system compositor on macOS, Linux, and Android, reached through the null
+compositor (`null_compositor.c:1089`); on Windows it contributes only
+`comp_multi_workspace.c` — a chrome/window-pose state registry — and none of the
+compositing. `ipc_server_handler.c` states the split directly: "D3D11 service on
+Windows, null+comp_multi on Android/macOS". Both implementations, and the two
+modes of the Windows one, are described in
+[service-architecture.md](service-architecture.md).
 
 ## Topology
 
@@ -53,7 +67,8 @@ from compositing ([ADR-007](../adr/ADR-007-compositor-never-weaves.md)), so the 
 Cross-process texture sharing uses the platform-native primitive per API — DXGI shared handles
 (D3D11/D3D12), IOSurface (Metal), and the GL/VK shared-texture paths — never a Vulkan intermediary
 ([ADR-001](../adr/ADR-001-native-compositors-per-graphics-api.md)). The client→service handoff is
-synchronised with a keyed mutex (D3D11 source) or a shared fence (D3D12).
+synchronised with a keyed mutex (D3D11 source) or a shared fence (D3D12); the D3D11 leg also has a
+shared-fence model (`workspace_sync_fence`), not only KeyedMutex.
 
 ## Per-window parallax
 
@@ -94,9 +109,21 @@ workspace-specific composition (controller poses, chrome, per-tile alpha):
 
 - **Spatial workspace** (the DisplayXR Shell and other workspace controllers) — `workspace_mode = true`;
   windows placed via [`XR_DXR_spatial_workspace`](../specs/extensions/XR_DXR_spatial_workspace.md).
-- **Plain service-mode IPC apps** — the `_ipc` app class: one or more app processes connect to a single
-  runtime service and composite through the same path, with no workspace controller.
-- **WebXR bridge** — bridges browser WebXR sessions through the `d3d11_service` compositor.
+- **Plain service-mode IPC apps** — the `_ipc` app class. On Windows these do **not** go through the
+  multi-compositor: without an active workspace controller each IPC client takes the **standalone** path
+  and presents its **own** per-client swap chain through its own display processor
+  (`comp_d3d11_service.cpp`, `init_client_render_resources`, :3559-4086). The multi-compositor exists only
+  under workspace mode.
+- **Chrome / Edge WebXR** — frames come from Chrome's own OpenXR client (AppContainer → IPC), which is a
+  regular IPC client of the service.
+- **WebXR bridge** — **headless, metadata-only, submits no frames** (`webxr_bridge/main.cpp`, session
+  created with `XR_MND_headless`). It carries display info, modes, eye poses, and input; it is not a
+  compositing consumer.
+- **`displayxr-browser`** — a present-owner via `XR_DXR_weave`.
+
+Having two structurally different service compositor modes is the arbitration hole tracked as #939;
+[ADR-035](../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) targets a single
+always-on pipeline instead.
 
 ## Further reading
 

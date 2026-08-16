@@ -38,6 +38,8 @@ The service's responsibilities reduce to:
 
 The current `Enable / Auto / Disable` set, the `Ctrl+Space` keyboard-hook-based spawn, and the orchestrator's `TerminateProcess` path remain the **transitional implementation** until the controller-driven menu protocol lands. They are first-party-shell defaults that get stripped out the moment a third-party controller registers its own menu definitions.
 
+**Status note (2026-08-16) — the two halves diverged.** The **menu half landed**: controllers publish `Actions\<ordering>\{Label,Type}` and the service renders them (`service_tray_win.c:133 append_published_actions()`, called from the tray-menu build); the hardcoded `Enable / Auto / Disable` verbs are now only the *fallback* used when no controller publishes actions. The **lifecycle half did not**: `TerminateProcess` is still the only shutdown verb (`service_orchestrator.c:307`), and the "request orderly shutdown" IPC message this ADR predicts does not exist. That message is now a decision in [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) (D5), not an open item here.
+
 ## Consequences
 
 - The runtime stops being opinionated about workspace verbs. "Disable" is no longer a runtime concept — it is a controller-defined verb that some controllers may expose and others may not.

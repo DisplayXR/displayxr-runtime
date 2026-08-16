@@ -270,8 +270,9 @@ build-tree dir.
 
 ## Reference implementation
 
-See `installer/DisplayXRShellInstaller.nsi` for the canonical
-DisplayXR Shell registration. Third-party workspace apps should mirror
+See `displayxr-shell-pvt`'s installer for the canonical
+DisplayXR Shell registration (it does not live in this repo — CI's
+`shell-path-guard` fails any push reintroducing it). Third-party workspace apps should mirror
 its structure:
 
 - `.onInit` reads the runtime's `InstallPath`, aborts if missing,
@@ -299,7 +300,9 @@ a runtime-crash mystery.
 Beyond registration, controllers consume the existing
 `workspace_enumerate_input_events` poll for runtime → controller
 notifications (`POINTER`, `KEY`, `SCROLL`, `FRAME_TICK`,
-`FOCUS_CHANGED`, `POINTER_HOVER`, `WINDOW_POSE_CHANGED`). Two more
+`FOCUS_CHANGED`, `WINDOW_POSE_CHANGED`; `POINTER_HOVER` is **no longer
+emitted** — the runtime stopped raycasting in spec_version 22 (#370) and
+the enum value survives only for wire compatibility). Two more
 event types were added with the GH #227 modal-dialog work:
 
 - `IPC_WORKSPACE_INPUT_EVENT_MODAL_OPEN` — a client just spawned a
@@ -360,8 +363,17 @@ inside a workspace) without that risk.
 ## Display mode authority
 
 The workspace controller is the sole authority on display rendering mode
-(2D vs 3D, tile layout) for the clients it hosts. App-driven attempts
+(2D vs 3D, tile layout) **for the clients it hosts**. App-driven attempts
 to change mode from a workspace client are silently no-opped.
+
+That authority does **not** extend past its own clients. A *standalone*
+IPC client — one connected to the same service with no workspace active,
+or alongside one — re-asserts its own mode on every weave submit
+(`weave_force_3d_if_needed` in `comp_d3d11_service.cpp`), and nothing
+arbitrates between the two. That is the hole tracked as
+[#939](https://github.com/DisplayXR/displayxr-runtime/issues/939) and
+decided in
+[ADR-035](../../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md).
 
 **Enforcement (single point):** `oxr_api_session.c::oxr_xrRequestDisplayRenderingModeDXR`
 returns `XR_SUCCESS` without state change when the calling session is a
@@ -394,7 +406,16 @@ visible to users on every IPC-mode flip.
 
 ## Future evolution
 
-If multiple workspace apps need to coexist (one user has the
+The live problem is not two *workspace* apps — it is a workspace
+controller, a browser, a standalone IPC client, and the bridge all live
+against one service at once. That is
+[#939](https://github.com/DisplayXR/displayxr-runtime/issues/939), decided
+in
+[ADR-035](../../adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
+(service-owned arbitration, one always-on pipeline, isolated satellites);
+read that before designing against this section.
+
+For the narrower case of two workspace apps coexisting (one user has the
 DisplayXR Shell + a third-party cockpit installed simultaneously):
 
 - Tray submenu grows a controller chooser ("Switch workspace
