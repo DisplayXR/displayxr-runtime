@@ -197,6 +197,15 @@ struct ul_hub
 	 */
 	int64_t reconnect_started_ns;
 
+	/*!
+	 * The tracking service dropped the connection (ConnectionLost) —
+	 * reconnect eagerly, NOT gated on input activity. With the roles on
+	 * qwerty nothing polls this provider, so an activity-gated reconnect
+	 * would never fire and a dead connection can never see the hardware
+	 * come back. Poll-thread-owned.
+	 */
+	bool eager_reconnect;
+
 	struct ul_device *devices[2];
 
 	//! Live device count; the last xrt_device::destroy tears the hub down.
@@ -541,6 +550,14 @@ ul_handle_presence_event(struct ul_hub *hub, const LEAP_CONNECTION_MESSAGE *msg)
 		os_mutex_unlock(&hub->mutex);
 		ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
 		ul_set_all_untracked(hub);
+
+		// A lost connection never comes back by polling it —
+		// LeapPollConnection just returns Timeout forever, silently.
+		// Recycle it and reconnect eagerly (see eager_reconnect).
+		LeapCloseConnection(hub->connection);
+		hub->leap_connected = false;
+		hub->eager_reconnect = true;
+		U_LOG_W("ultraleap: tracking service dropped the connection — reconnecting eagerly.");
 		break;
 
 	default: break;
@@ -569,8 +586,12 @@ ul_poll_thread(void *ptr)
 
 		if (!hub->leap_connected) {
 			// Idle (#941): wait cheaply for an activity mark newer
-			// than the disconnect, then revive the connection.
-			if (last_activity <= hub->idle_since_ns) {
+			// than the disconnect, then revive the connection. A
+			// connection the SERVICE dropped skips the activity
+			// gate instead — nothing may be polling us while
+			// qwerty holds the roles, and only an open connection
+			// can ever see the hardware come back.
+			if (!hub->eager_reconnect && last_activity <= hub->idle_since_ns) {
 				os_nanosleep(100 * 1000 * 1000); // 100 ms
 				continue;
 			}
@@ -592,14 +613,18 @@ ul_poll_thread(void *ptr)
 					        (int)(UL_RECONNECT_GRACE_NS / (1000 * 1000 * 1000)));
 					ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
 					ul_set_all_untracked(hub);
-				} else {
+				} else if (!hub->eager_reconnect) {
 					U_LOG_W("ultraleap: reconnect failed — retrying while input is being polled.");
 				}
-				os_nanosleep(500 * 1000 * 1000); // 500 ms
+				// Eager retries are silent (already announced once)
+				// and slower — the service may be gone for good.
+				os_nanosleep(hub->eager_reconnect ? 1000LL * 1000 * 1000 : 500LL * 1000 * 1000);
 				continue;
 			}
 			hub->leap_connected = true;
 			hub->reconnect_started_ns = 0;
+			const bool was_eager = hub->eager_reconnect;
+			hub->eager_reconnect = false;
 
 			// The frozen PRESENT is now a CLAIM, not a fact: the
 			// device may have been unplugged while we were not
@@ -615,7 +640,8 @@ ul_poll_thread(void *ptr)
 			os_mutex_unlock(&hub->mutex);
 			hub->revalidate_deadline_ns = now + UL_CONNECT_GRACE_NS;
 
-			U_LOG_W("ultraleap: input polled again — Leap connection reopened (#941).");
+			U_LOG_W("ultraleap: %s — Leap connection reopened.",
+			        was_eager ? "tracking service back" : "input polled again (#941)");
 		}
 
 		// Revalidation verdict (see the reopen path above).

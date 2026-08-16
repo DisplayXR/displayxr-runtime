@@ -1832,14 +1832,21 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 		}
 	}
 
+	// One event for the whole attach, not one per subaction path — see the
+	// matching comment in oxr_session_update_action_bindings().
+	bool any_profile = false;
 #define POPULATE_PROFILE(X)                                                                                            \
 	sess->X = XR_NULL_PATH;                                                                                        \
 	if (profiles.X != NULL) {                                                                                      \
 		sess->X = profiles.X->path;                                                                            \
-		oxr_event_push_XrEventDataInteractionProfileChanged(log, sess);                                        \
+		any_profile = true;                                                                                    \
 	}
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(POPULATE_PROFILE)
 #undef POPULATE_PROFILE
+
+	if (any_profile) {
+		oxr_event_push_XrEventDataInteractionProfileChanged(log, sess);
+	}
 
 	{
 		const char *left_str = NULL;
@@ -1874,14 +1881,27 @@ oxr_session_update_action_bindings(struct oxr_logger *log, struct oxr_session *s
 		}
 	}
 
+	/*
+	 * One event per change-set, and only on an actual change. The event
+	 * carries no payload — the app re-queries every top-level path on
+	 * receipt — so a second identical event is pure duplication, and a
+	 * hand-role flip (input arbiter) used to emit a burst of them, one
+	 * per subaction path, driving one input re-enumeration each in
+	 * event-consuming apps.
+	 */
+	bool any_changed = false;
 #define POPULATE_PROFILE(X)                                                                                            \
-	sess->X = XR_NULL_PATH;                                                                                        \
-	if (profiles.X != NULL) {                                                                                      \
-		sess->X = profiles.X->path;                                                                            \
-		oxr_event_push_XrEventDataInteractionProfileChanged(log, sess);                                        \
+	{                                                                                                              \
+		XrPath new_path = profiles.X != NULL ? profiles.X->path : XR_NULL_PATH;                                \
+		any_changed |= sess->X != new_path;                                                                    \
+		sess->X = new_path;                                                                                    \
 	}
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(POPULATE_PROFILE)
 #undef POPULATE_PROFILE
+
+	if (any_changed) {
+		oxr_event_push_XrEventDataInteractionProfileChanged(log, sess);
+	}
 
 	return oxr_session_success_result(sess);
 }
