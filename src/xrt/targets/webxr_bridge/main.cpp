@@ -2035,12 +2035,15 @@ static void bridge_hud_destroy(Bridge &b) {
 static void run_event_loop(Bridge &b) {
 	LOG_I("Entering event loop. Ctrl+C to exit.");
 	int window_poll_counter = 0;
+	int poll_error_streak = 0;
 	while (g_running.load()) {
 		XrEventDataBuffer evt{XR_TYPE_EVENT_DATA_BUFFER};
 		XrResult r = xrPollEvent(b.instance, &evt);
 		if (r == XR_SUCCESS) {
+			poll_error_streak = 0;
 			handle_event(b, evt);
 		} else if (r == XR_EVENT_UNAVAILABLE) {
+			poll_error_streak = 0;
 			poll_eye_poses(b);
 
 			// Event-driven resize: the WinEvent hook flips this flag whenever
@@ -2082,6 +2085,29 @@ static void run_event_loop(Bridge &b) {
 			}
 			Sleep(10);
 		} else {
+			// #953: a dead service does NOT deliver an in-band
+			// INSTANCE_LOSS_PENDING event — xrPollEvent just starts
+			// returning INSTANCE_LOST/SESSION_LOST forever, and the old
+			// code spun on it with Sleep(100) indefinitely while still
+			// bound to :9014, so a restarted service could never re-arm
+			// its trampoline. Treat a lost instance/session (or a
+			// sustained error streak, as a backstop for other terminal
+			// codes) as terminal: exit so the orchestrator's supervisor
+			// restarts us fresh. Mirrors the shell's shell_openxr_poll_lost.
+			if (r == XR_ERROR_INSTANCE_LOST || r == XR_ERROR_SESSION_LOST) {
+				LOG_W(
+				    "xrPollEvent returned %s — service connection lost; exiting so the "
+				    "supervisor can restart the bridge and free :9014.",
+				    xr_result_str(b.instance, r));
+				g_running.store(false);
+				break;
+			}
+			if (++poll_error_streak >= 50) {
+				LOG_W("xrPollEvent error streak (%d) with %s — treating as a lost connection; exiting.",
+				      poll_error_streak, xr_result_str(b.instance, r));
+				g_running.store(false);
+				break;
+			}
 			LOG_W("xrPollEvent error: %s", xr_result_str(b.instance, r));
 			Sleep(100);
 		}
