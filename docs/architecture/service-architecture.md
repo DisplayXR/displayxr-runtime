@@ -43,9 +43,32 @@ Companion references: [workspace-stability.md](../reference/workspace-stability.
 >   the `[HEALTH]` per-client line (#951), the plugin dev-path guard (#952), the bridge
 >   exit-on-loss (#953), and the #975 trampoline crash fix.
 >
-> Still open / next: the arbitration contract (client classes #960, panel lease #961 — the
-> core of #939), the one-pipeline work (#964), and the noted per-slice follow-ups. The DP
-> stays in-process (fault-contained); #943's exit source waits for the armed tripwire.
+> **Phase-2 update (2026-08-16, later the same day).** The arbitration contract landed on
+> `main` — read the §2.2 / §4.2 rows for classes, focus and mode as "the problem that was fixed":
+> - **#960** explicit client classes (`enum xrt_client_class`: APP / CONTROLLER / PRESENT_OWNER /
+>   RELAY / PROVIDER_HOST / DIAG) declared at connect and **verified** at `describe_client`
+>   (orchestrator pid, registered controller `Binary`, runtime dir; `DXR_ALLOW_UNVERIFIED_CONTROLLER=1`
+>   dev override), per-class quotas → `XR_ERROR_LIMIT_REACHED`, class-driven auth (`workspace_activate`
+>   fails closed — the #955 first-claim hole is gone; `weave_*` PRESENT_OWNER-only; capture
+>   CONTROLLER/DIAG), `[HEALTH] class=`, `displayxr-cli clients`. Spec:
+>   [ipc-client-classes.md](../specs/runtime/ipc-client-classes.md). (§2.2, §4.1)
+> - **#962** ONE focus authority: the compositor's `focused_slot`, mirrored into `active_client_index`
+>   by the mainloop (`sync_focus_from_compositor`); default policy without a controller = newest
+>   presenting client; `predict_frame` promotes nobody under a controller; the workspace force-focus is
+>   gone (slots are VISIBLE, only the focused one FOCUSED); server-side input focus
+>   (`client_input_allowed` in the device handlers, hand tracking included); qwerty integrates by
+>   elapsed time. (§4.2 focus / input rows, §9-15)
+> - **#961** the PANEL LEASE: CONTROLLER while connected, else the focused client; non-holders'
+>   requests are consumed and DENIED with `XrEventDataDisplayModeRequestDeniedDXR` (display_info v17),
+>   never latched; every immediate-flip writer goes through `apply_mode_transition()` (DP first,
+>   content event, hardware event only after the DP confirmed); the acked flip reverts on
+>   rejection/abort/deactivate (**#761 closed**). `[HEALTH] lease=`. (§4.2 mode/DP rows, §9-3, §9-7 partly)
+>
+> Still open / next: **#963** (standalone↔workspace transition dead ends — one instance, the acked flip
+> selected after deactivate, was fixed under #961), the one-pipeline work (#964 — the "N standalone
+> clients ⇒ N DPs / lens hints" defect §9-11 is now the visible remainder of #939), and the noted
+> per-slice follow-ups. The DP stays in-process (fault-contained); #943's exit source waits for the
+> armed tripwire.
 
 **One-paragraph summary.** The service is a single-process, no-isolation host. `WinMain`
 starts a tray/message-pump thread, an orchestrator that spawns two children (workspace
