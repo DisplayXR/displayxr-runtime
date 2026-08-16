@@ -353,6 +353,16 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11ShaderResourceView> weave_crop_srv;
 	uint32_t                               weave_crop_w;
 	uint32_t                               weave_crop_h;
+
+	//! Per-view dims of the LAST DP handoff (0 until the first commit).
+	//! This is the authoritative "what is actually in the atlas" figure — it
+	//! is `input_view_w/h`, i.e. the same number passed to
+	//! `xrt_display_processor_d3d11_process_atlas`, for BOTH the zero-copy and
+	//! the cropped paths. The atlas capture crops to this rather than to the
+	//! active rendering mode's dims, which disagree for legacy sessions (see
+	//! comp_d3d11_service_capture_frame).
+	uint32_t                               last_dp_content_w;
+	uint32_t                               last_dp_content_h;
 	DXGI_FORMAT                            weave_crop_format;
 
 	//! Cached import of the caller's pre-weave input texture, keyed by the
@@ -12549,6 +12559,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		input_view_h = content_view_h;
 	}
 
+	// Remember what the DP is about to consume, so the atlas capture can crop
+	// to the same region instead of guessing from the active rendering mode.
+	c->render.last_dp_content_w = input_view_w;
+	c->render.last_dp_content_h = input_view_h;
+
 	// Always pass through the display processor — both 3D (weaving) and 2D
 	// (stretch-blit). This matches the in-process compositor path where
 	// process_atlas() handles all display modes. No separate mono blit needed.
@@ -15072,6 +15087,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	//     post-compose over IPC reports unsupported for those.
 	wil::com_ptr<ID3D11Texture2D> src_tex;
 	uint32_t want_flag = 0;
+	//! Per-view dims the DP actually consumed on the active client's last
+	//! commit (0 = unknown, e.g. post-compose capture or nothing rendered yet).
+	uint32_t dp_content_w = 0;
+	uint32_t dp_content_h = 0;
 	if (flags & IPC_CAPTURE_FLAG_PROJECTION_ONLY) {
 		std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
 		struct d3d11_service_compositor *ac = sys->active_compositor;
@@ -15086,6 +15105,8 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 			} else if (ac->render.atlas_texture) {
 				src_tex = ac->render.atlas_texture;
 			}
+			dp_content_w = ac->render.last_dp_content_w;
+			dp_content_h = ac->render.last_dp_content_h;
 			if (src_tex) {
 				want_flag = IPC_CAPTURE_FLAG_PROJECTION_ONLY;
 			}
@@ -15119,6 +15140,23 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	const uint32_t eye_h = eye_h_res;
 	uint32_t used_w = eye_w * tile_columns;
 	uint32_t used_h = eye_h * tile_rows;
+	// ...but prefer what the DP ACTUALLY consumed when we know it.
+	//
+	// resolve_active_view_dims() returns the ACTIVE RENDERING MODE's per-view
+	// dims — 1920x1080 in stereo SBS on a 4K panel. A LEGACY session does not
+	// render that: its compromise view scale is 0.50x1.00, i.e. the full tile
+	// at 1920x2160 per view (`oxr_system_fill_in`). The capture therefore cut
+	// 2160 -> 1080 and silently dropped the BOTTOM HALF of every legacy frame,
+	// while the display was perfectly correct (the DP weaves the full
+	// view=1920x2160). Measured with a ladder of markers at y = -0.6..+0.6 in
+	// a WebXR session: only y >= 0 reached the PNG, with y = 0 pinned to the
+	// bottom edge — so controller rays, floor and any lower UI were invisible
+	// in captures and looked exactly like a rendering bug. It cost a long
+	// debugging detour; hence trusting the handoff over the mode table.
+	if (dp_content_w > 0 && dp_content_h > 0) {
+		used_w = dp_content_w * tile_columns;
+		used_h = dp_content_h * tile_rows;
+	}
 	// Clamp to the source texture: the per-client projection atlas can be smaller
 	// than the display-derived view grid, and over-reading the staging copy would
 	// read past its rows.
