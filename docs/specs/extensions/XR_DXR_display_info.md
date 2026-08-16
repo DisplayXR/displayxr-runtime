@@ -637,7 +637,7 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_DXR_display_info`
-- Spec version: 14
+- Spec version: 17
 - Extension name define: `XR_DXR_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
@@ -824,7 +824,7 @@ XrResult xrRequestDisplayModeDXR(
 
 | Code | Meaning |
 |---|---|
-| `XR_SUCCESS` | The hardware-state request was accepted by the runtime. |
+| `XR_SUCCESS` | The request was **forwarded to the runtime's mode owner** (v17: this is not "applied" — see the panel lease below). |
 | `XR_ERROR_VALIDATION_FAILURE` | `mode` is not a valid `XrDisplayModeDXR` value. |
 | `XR_ERROR_HANDLE_INVALID` | The session handle is invalid. |
 
@@ -920,9 +920,32 @@ This abstraction also operates through:
 
 Two new event types are delivered via `xrPollEvent` to notify applications of asynchronous state changes:
 
-- **`XrEventDataRenderingModeChangedDXR`** — fired when the active display rendering mode changes (e.g., after a call to `xrRequestDisplayRenderingModeDXR` completes, or when the runtime changes modes autonomously). Applications that need to react to rendering mode transitions (e.g., reconfigure swapchains or shaders) should poll for this event.
+- **`XrEventDataRenderingModeChangedDXR`** — fired when the active display rendering mode changes (e.g., after a call to `xrRequestDisplayRenderingModeDXR` completes, or when the runtime changes modes autonomously). Applications that need to react to rendering mode transitions (e.g., reconfigure swapchains or shaders) should poll for this event. Under a workspace the runtime may fire it **before** the panel moves (the apps' re-submission at the new layout is what lets the transition land); if the transition then does not land — the display hardware refused it, or the workspace went away — a second event reverts to the previous mode (v17, #761). Applications must therefore treat the *latest* event as truth and never assume a requested mode is active until told.
 
-- **`XrEventDataHardwareDisplayStateChangedDXR`** — fired when the hardware 3D display state changes (e.g., the switchable lenses or backlight are enabled or disabled). Applications can use this event to update their UI or rendering pipeline in response to system-level display state changes.
+- **`XrEventDataHardwareDisplayStateChangedDXR`** — fired when the hardware 3D display state changes (e.g., the switchable lenses or backlight are enabled or disabled). Since v17 it is emitted only once the state is **real** — after the display processor accepted the request, or when the runtime observed the change — never speculatively from a request.
+
+### The Panel Lease and Request Denial (v17)
+
+The runtime holds a single **panel lease** over the display mode (the content rendering mode, the hardware 2D/3D state and the display processor's configuration):
+
+- While a **workspace controller** is active, the controller holds the lease. Any other session's `xrRequestDisplayRenderingModeDXR` / `xrRequestDisplayModeDXR` is **denied** — it is *not* queued for later (before v17 such a request could silently replay when the workspace ended).
+- Without a controller, the runtime's built-in policy grants the lease to the **focused** session (the one that would receive input). Requests from unfocused sessions are denied.
+
+Both entry points return `XR_SUCCESS` at call time (the request was forwarded); the outcome arrives as an event: `XrEventDataRenderingModeChangedDXR` / `XrEventDataHardwareDisplayStateChangedDXR` when applied, or the new
+
+- **`XrEventDataDisplayModeRequestDeniedDXR`** (`XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR`, `1004999014`) — delivered **only to the requesting session**, carrying `requestedModeIndex` (`XR_DISPLAY_MODE_INDEX_NONE_DXR` for a pure hardware request), `requestedHardware3D` (`-1` none, `0`/`1`) and a `reason`:
+
+| `XrDisplayModeDenialReasonDXR` | Meaning |
+|---|---|
+| `WORKSPACE_OWNS_MODE_DXR` | a workspace controller holds the lease |
+| `NOT_FOCUSED_DXR` | no controller; only the focused session may request |
+| `NO_DISPLAY_PROCESSOR_DXR` | nothing to apply the request to |
+| `DISPLAY_PROCESSOR_REJECTED_DXR` | the display hardware refused the state; the runtime's reported mode is unchanged |
+| `RELAY_OWNS_MODE_DXR` | a relay (WebXR bridge) owns this session's mode |
+
+`isRequestable` on `XrDisplayRenderingModeInfoDXR` remains the advisory hint ("will a request from this session be honoured right now?"); the event is the answer.
+
+Service-mode (out-of-process) sessions no longer apply a request locally: the local active mode index, view scales and hardware state follow the runtime's events. In-process sessions (which are their own mode owner) are unchanged.
 
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
@@ -2093,7 +2116,8 @@ the property) silently ignore the call — graceful degradation.
 | 12 | 2026-03-28 | David Fattal | Removed `hardwareDisplay3D` from `XrDisplayInfoDXR`. It remains available **per-mode** on `XrDisplayRenderingModeInfoDXR` (via `xrEnumerateDisplayRenderingModesDXR`) and is also reported by the `XrEventDataHardwareDisplayStateChangedDXR` event. Also moved `xrSetSharedTextureOutputRectDXR` to the window-binding extension headers. |
 | 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoDXR` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
 | 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeDXR`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedDXR`. No struct/ABI change. |
-| 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). **Current header version (`XR_DXR_display_info_SPEC_VERSION == 16`).** |
+| 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). |
+| 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 17`).** |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

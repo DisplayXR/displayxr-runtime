@@ -594,6 +594,9 @@ error:
  * IPC-layer facts only — the next wedge is attributable per client from one log
  * window without a debugger, in standalone AND workspace mode.
  */
+static bool
+controller_connected_locked(struct ipc_server *s); // #962, defined below
+
 static void
 emit_health_if_elapsed(struct ipc_server *s)
 {
@@ -629,7 +632,17 @@ emit_health_if_elapsed(struct ipc_server *s)
 		    cs->primary_application ? 'y' : 'n', ((int32_t)i == active_idx) ? " ACTIVE" : "",
 		    ics->swapchain_count, ics->space_count);
 	}
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d window_s=%ld", active, s->max_clients, active_idx,
+	// #961: who holds the PANEL LEASE — the controller while one is connected,
+	// else (default policy) the focused client, else nobody.
+	char lease[32];
+	if (controller_connected_locked(s)) {
+		snprintf(lease, sizeof(lease), "controller");
+	} else if (active_idx >= 0) {
+		snprintf(lease, sizeof(lease), "slot=%d", active_idx);
+	} else {
+		snprintf(lease, sizeof(lease), "none");
+	}
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s window_s=%ld", active, s->max_clients, active_idx, lease,
 	        period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
