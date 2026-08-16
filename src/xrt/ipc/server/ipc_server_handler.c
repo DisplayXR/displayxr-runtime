@@ -155,6 +155,31 @@ require_workspace_controller(volatile struct ipc_client_state *ics, const char *
 	return XRT_SUCCESS;
 }
 
+// #957: resolve a client id to its compositor pointer under global_state.lock,
+// then RELEASE the lock before the caller touches the compositor. The per-client
+// window/focus ops take render_mutex inside comp_d3d11_service_*; holding the
+// server's only mutex across those parked every other client's connect / disconnect
+// / session-activate behind the render thread (report C: global_state.lock ->
+// render_mutex nesting). Capturing the pointer here and calling out-of-lock removes
+// the nesting. find_slot_by_xc and the set/get_client_* calls match the compositor
+// by POINTER IDENTITY and never dereference it, so a client that tears its session
+// down in the gap is safe: its unregistered xc simply fails to match a slot.
+static struct xrt_compositor *
+find_client_xc_by_id(struct ipc_server *s, uint32_t client_id)
+{
+	struct xrt_compositor *xc = NULL;
+	os_mutex_lock(&s->global_state.lock);
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			xc = (struct xrt_compositor *)ics->xc;
+			break;
+		}
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	return xc;
+}
+
 static ipc_server_workspace_supports_file_dialog_fn s_workspace_file_dialog_provider = NULL;
 
 void
@@ -3863,28 +3888,14 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 		return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 	}
 
-	// Find target IPC client by ID
-	os_mutex_lock(&s->global_state.lock);
-
-	volatile struct ipc_client_state *target_ics = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target_ics = ics;
-			break;
-		}
-	}
-
-	if (target_ics == NULL || target_ics->xc == NULL) {
-		os_mutex_unlock(&s->global_state.lock);
+	// #957: resolve id -> xc under the lock, call the compositor out-of-lock.
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id);
+	if (target_xc == NULL) {
 		IPC_WARN(s, "Workspace: set_window_pose - client %u not found", client_id);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	bool ok = comp_d3d11_service_set_client_window_pose(
-	    s->xsysc, (struct xrt_compositor *)target_ics->xc, pose, width_m, height_m);
-
-	os_mutex_unlock(&s->global_state.lock);
+	bool ok = comp_d3d11_service_set_client_window_pose(s->xsysc, target_xc, pose, width_m, height_m);
 
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #elif defined(XRT_OS_MACOS)
@@ -3939,26 +3950,12 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 		return capture_ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 	}
 
-	os_mutex_lock(&s->global_state.lock);
-
-	volatile struct ipc_client_state *target_ics = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target_ics = ics;
-			break;
-		}
-	}
-
-	if (target_ics == NULL || target_ics->xc == NULL) {
-		os_mutex_unlock(&s->global_state.lock);
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	bool ok = comp_d3d11_service_set_client_visibility(
-	    s->xsysc, (struct xrt_compositor *)target_ics->xc, visible);
-
-	os_mutex_unlock(&s->global_state.lock);
+	bool ok = comp_d3d11_service_set_client_visibility(s->xsysc, target_xc, visible);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #elif defined(XRT_OS_MACOS)
 	// macOS OOP: record the minimized/hidden state in the workspace registry. The
@@ -4001,26 +3998,12 @@ ipc_handle_workspace_get_window_pose(volatile struct ipc_client_state *_ics,
 		return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 	}
 
-	os_mutex_lock(&s->global_state.lock);
-
-	volatile struct ipc_client_state *target_ics = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target_ics = ics;
-			break;
-		}
-	}
-
-	if (target_ics == NULL || target_ics->xc == NULL) {
-		os_mutex_unlock(&s->global_state.lock);
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	bool ok = comp_d3d11_service_get_client_window_pose(
-	    s->xsysc, (struct xrt_compositor *)target_ics->xc, out_pose, out_width_m, out_height_m);
-
-	os_mutex_unlock(&s->global_state.lock);
+	bool ok = comp_d3d11_service_get_client_window_pose(s->xsysc, target_xc, out_pose, out_width_m, out_height_m);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #elif defined(XRT_OS_MACOS)
 	// macOS OOP single-app model: the client fills the display, so its window
@@ -4457,21 +4440,12 @@ ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics,
 
 	// OpenXR client: find the IPC thread by client_id, take its xrt_compositor,
 	// and ask the multi-compositor for the matching slot.
-	os_mutex_lock(&s->global_state.lock);
-	volatile struct ipc_client_state *target = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target = ics;
-			break;
-		}
-	}
-	if (target == NULL || target->xc == NULL) {
-		os_mutex_unlock(&s->global_state.lock);
+	// #957: resolve id -> xc under the lock; find_slot_by_xc (render_mutex) runs out-of-lock.
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id);
+	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target->xc);
-	os_mutex_unlock(&s->global_state.lock);
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, target_xc);
 	if (slot < 0) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4516,21 +4490,12 @@ ipc_handle_workspace_request_client_fullscreen(volatile struct ipc_client_state 
 		    s->xsysc, (int)(client_id - 1000), fullscreen);
 	}
 
-	os_mutex_lock(&s->global_state.lock);
-	volatile struct ipc_client_state *target = NULL;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-			target = ics;
-			break;
-		}
-	}
-	if (target == NULL || target->xc == NULL) {
-		os_mutex_unlock(&s->global_state.lock);
+	// #957: resolve id -> xc under the lock; find_slot_by_xc (render_mutex) runs out-of-lock.
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id);
+	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target->xc);
-	os_mutex_unlock(&s->global_state.lock);
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, target_xc);
 	if (slot < 0) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
