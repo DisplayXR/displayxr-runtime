@@ -69,9 +69,9 @@ void
 u_crash_guard_log_stack(const char *tag, const char *reason)
 {
 	char buf[CRASH_GUARD_MSG_CAP];
-	size_t len = 0;
 
 #ifdef XRT_OS_WINDOWS
+	size_t len = 0;
 	void *frames[CRASH_GUARD_MAX_FRAMES];
 	USHORT n = CaptureStackBackTrace(1, CRASH_GUARD_MAX_FRAMES, frames, NULL);
 	int written = snprintf(buf, sizeof(buf),
