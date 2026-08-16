@@ -166,6 +166,10 @@ struct ipc_client_state
 	//! reuse (Windows; 0 elsewhere / low-integrity peer).
 	long peer_pid;
 	uint64_t peer_create_ns;
+
+	//! #960: set once describe_client has verified client_state.client_class.
+	//! Until then the client counts against no quota and holds no privilege.
+	bool class_verified;
 };
 
 enum ipc_thread_state
@@ -590,6 +594,46 @@ ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
  */
 unsigned long
 ipc_server_get_orchestrator_workspace_pid(void);
+
+/*!
+ * #960: class-verification provider. The IPC server verifies a client's declared
+ * class (enum xrt_client_class) at describe_client. Two claims need facts only
+ * the service target owns (registry / install dir), so they are delegated:
+ *   - CONTROLLER: is @p peer_exe_path a registered workspace-controller binary
+ *     (HKLM WorkspaceControllers\*\Binary, POSIX manifests, or the orchestrator's
+ *     dev-override entry)?
+ *   - DIAG: does @p peer_exe_path live in the runtime's own install directory
+ *     (displayxr-cli, the WebXR bridge's introspection connection)?
+ * @p peer_exe_path may be "" when the OS would not tell us (Low-IL peer). Return
+ * true to accept the claim, false to demote it to APP. Never called for classes
+ * the server can verify by itself (orchestrator-spawned pid) or by use
+ * (RELAY / PRESENT_OWNER).
+ */
+typedef bool (*ipc_server_client_class_verify_fn)(long peer_pid, const char *peer_exe_path, uint32_t declared_class);
+
+/*!
+ * Register the class-verification provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. With no provider registered, only the
+ * built-in checks (orchestrator pid, DXR_ALLOW_UNVERIFIED_CONTROLLER=1) can verify
+ * a CONTROLLER claim and no DIAG claim can be verified.
+ */
+void
+ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn);
+
+/*!
+ * #960: short upper-case name of an enum xrt_client_class value ("APP",
+ * "CONTROLLER", ...) for logs and telemetry.
+ */
+const char *
+ipc_server_client_class_str(uint32_t client_class);
+
+/*!
+ * #960: per-class admission quota (ADR-035 D6). CONTROLLER 1, RELAY 1,
+ * PRESENT_OWNER 2, DIAG 4, PROVIDER_HOST 2 (outside the app budget), APP =
+ * s->max_clients minus the reserved controller slot (0 = unlimited within the cap).
+ */
+uint32_t
+ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class);
 
 /*!
  * Function pointer the IPC server calls to learn whether the active

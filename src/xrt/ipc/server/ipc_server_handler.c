@@ -10,6 +10,7 @@
  */
 
 #include "util/u_misc.h"
+#include "util/u_debug.h"
 #include "util/u_handles.h"
 #include "util/u_pretty_print.h"
 #include "util/u_visibility_mask.h"
@@ -17,6 +18,7 @@
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 
 #include "server/ipc_server.h"
+#include "server/ipc_server_peer_creds.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
@@ -113,6 +115,130 @@ ipc_server_get_orchestrator_workspace_pid(void)
 	return get_orchestrator_workspace_pid();
 }
 
+/*
+ *
+ * #960: client classes — declared by the client, VERIFIED here, stored on
+ * ics->client_state.client_class. See enum xrt_client_class (xrt_instance.h) and
+ * ADR-035 D1/D6. Only the verified class ever drives auth, quotas or leases.
+ *
+ */
+
+static ipc_server_client_class_verify_fn s_class_verify_provider = NULL;
+
+void
+ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn)
+{
+	s_class_verify_provider = fn;
+}
+
+const char *
+ipc_server_client_class_str(uint32_t client_class)
+{
+	switch (client_class) {
+	case XRT_CLIENT_CLASS_APP: return "APP";
+	case XRT_CLIENT_CLASS_CONTROLLER: return "CONTROLLER";
+	case XRT_CLIENT_CLASS_PRESENT_OWNER: return "PRESENT_OWNER";
+	case XRT_CLIENT_CLASS_RELAY: return "RELAY";
+	case XRT_CLIENT_CLASS_PROVIDER_HOST: return "PROVIDER_HOST";
+	case XRT_CLIENT_CLASS_DIAG: return "DIAG";
+	default: return "?";
+	}
+}
+
+uint32_t
+ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class)
+{
+	switch (client_class) {
+	case XRT_CLIENT_CLASS_CONTROLLER: return 1;
+	case XRT_CLIENT_CLASS_RELAY: return 1;
+	case XRT_CLIENT_CLASS_PRESENT_OWNER: return 2;
+	case XRT_CLIENT_CLASS_DIAG: return 4;
+	case XRT_CLIENT_CLASS_PROVIDER_HOST: return 2;
+	case XRT_CLIENT_CLASS_APP:
+	default:
+		// APP gets the rest of the admitted cap minus the reserved controller slot.
+		return s->max_clients > 1 ? s->max_clients - 1 : 1;
+	}
+}
+
+// DXR_ALLOW_UNVERIFIED_CONTROLLER=1: dev override — accept a CONTROLLER claim from
+// a binary that is neither orchestrator-spawned nor registered (a worktree shell).
+// Loud by design; never set on a production box.
+DEBUG_GET_ONCE_BOOL_OPTION(allow_unverified_controller, "DXR_ALLOW_UNVERIFIED_CONTROLLER", false)
+
+// Verify a declared class against what the server knows. Returns the class to
+// store; a failed claim demotes to APP (never refuses — a demoted client is
+// simply powerless). peer_exe_path is best-effort (may be "").
+static uint32_t
+verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, const char *peer_exe_path)
+{
+	struct ipc_server *s = ics->server;
+	long pid = ics->peer_pid;
+	const char *why = NULL;
+
+	switch (declared) {
+	case XRT_CLIENT_CLASS_APP: return XRT_CLIENT_CLASS_APP;
+	case XRT_CLIENT_CLASS_RELAY:
+	case XRT_CLIENT_CLASS_PRESENT_OWNER:
+		// Verified by use: a RELAY may never create a compositor (session_create
+		// refuses), only a PRESENT_OWNER may call the weave_* handlers.
+		return declared;
+	case XRT_CLIENT_CLASS_CONTROLLER: {
+		unsigned long orch = get_orchestrator_workspace_pid();
+		if (orch != 0 && (unsigned long)pid == orch) {
+			return declared; // spawned by our orchestrator
+		}
+		if (s_class_verify_provider != NULL && s_class_verify_provider(pid, peer_exe_path, declared)) {
+			return declared; // a registered controller binary
+		}
+		if (debug_get_bool_option_allow_unverified_controller()) {
+			IPC_WARN(s,
+			         "[CLASS] pid %ld ('%s') claims CONTROLLER and is NOT a registered controller binary — "
+			         "ACCEPTED under DXR_ALLOW_UNVERIFIED_CONTROLLER=1 (dev override, #960).",
+			         pid, peer_exe_path);
+			return declared;
+		}
+		why = "not orchestrator-spawned and not a registered controller binary";
+		break;
+	}
+	case XRT_CLIENT_CLASS_DIAG:
+		if (s_class_verify_provider != NULL && s_class_verify_provider(pid, peer_exe_path, declared)) {
+			return declared;
+		}
+		why = "not a binary in the runtime install directory";
+		break;
+	case XRT_CLIENT_CLASS_PROVIDER_HOST:
+		// Phase 4 (#968): verified iff spawned by the service. No spawner yet.
+		if (s_class_verify_provider != NULL && s_class_verify_provider(pid, peer_exe_path, declared)) {
+			return declared;
+		}
+		why = "no service-spawned provider host exists";
+		break;
+	default: why = "unknown class value"; break;
+	}
+
+	IPC_WARN(s, "[CLASS] pid %ld exe='%s' declared %s but %s — demoted to APP (#960).", pid,
+	         peer_exe_path[0] ? peer_exe_path : "?", ipc_server_client_class_str(declared), why);
+	return XRT_CLIENT_CLASS_APP;
+}
+
+// Count connected clients of a class, EXCLUDING ics. Caller holds global_state.lock.
+static uint32_t
+count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, uint32_t client_class)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *o = &s->threads[i].ics;
+		if (o == ics || o->server_thread_index < 0 || !o->class_verified) {
+			continue;
+		}
+		if (o->client_state.client_class == client_class) {
+			n++;
+		}
+	}
+	return n;
+}
+
 // The effective workspace-controller pid for input/command authorization. The
 // orchestrator only knows a pid for a controller it SPAWNED (Windows Ctrl+Space
 // trampoline). A manually-launched controller — the macOS shell (#61), and any
@@ -145,6 +271,13 @@ effective_workspace_controller_pid(struct ipc_server *s)
 //     until workspace mode is active. Tightening the first-claim itself (so a
 //     griefer cannot BE the first controller on a shell-less box) is the
 //     verified-controller-binary follow-up on #955.
+//
+// #960 UPDATE: the gate now fails CLOSED on the verified client class. Only a
+// client admitted as CONTROLLER (orchestrator-spawned, a registered controller
+// binary, or DXR_ALLOW_UNVERIFIED_CONTROLLER=1) passes; the pid check below then
+// pins it to the controller that activated the workspace (CONTROLLER quota is 1,
+// so this is belt-and-braces). This closes the "no controller yet -> permit"
+// first-claim hole noted above.
 static xrt_result_t
 require_workspace_controller(volatile struct ipc_client_state *ics, const char *what)
 {
@@ -152,11 +285,32 @@ require_workspace_controller(volatile struct ipc_client_state *ics, const char *
 	unsigned long expected = effective_workspace_controller_pid(s);
 	unsigned long caller = (unsigned long)ics->client_state.pid;
 
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_CONTROLLER) {
+		IPC_WARN(s,
+		         "%s: denied — caller pid %lu is class %s, not a verified CONTROLLER; this is a "
+		         "controller-only operation (#960).",
+		         what, caller, ipc_server_client_class_str(ics->client_state.client_class));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
 	if (expected != 0 && caller != expected) {
 		IPC_WARN(s,
 		         "%s: denied — caller pid %lu is not the workspace controller (%lu); this is a "
 		         "controller-only operation (#955).",
 		         what, caller, expected);
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+// #960: the XR_DXR_weave handlers are PRESENT_OWNER-only. A client that did not
+// declare the class at connect (i.e. did not enable XR_DXR_weave) may not bind a
+// window to the weaver or submit through it.
+static xrt_result_t
+require_present_owner(volatile struct ipc_client_state *ics, const char *what)
+{
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_PRESENT_OWNER) {
+		IPC_WARN(ics->server, "%s: denied — caller pid %ld is class %s, not PRESENT_OWNER (#960).", what,
+		         ics->peer_pid, ipc_server_client_class_str(ics->client_state.client_class));
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
 	return XRT_SUCCESS;
@@ -1734,6 +1888,36 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	}
 	ics->client_state.info = client_desc->info;
 
+	// #960: verify the declared class and admit against the per-class quota.
+	// The class is settled ONCE per connection; a repeat describe_client keeps it.
+	if (!ics->class_verified) {
+		char exe[512];
+		ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+		uint32_t verified = verify_client_class(ics, client_desc->info.declared_client_class, exe);
+
+		struct ipc_server *s = ics->server;
+		os_mutex_lock(&s->global_state.lock);
+		uint32_t in_use = count_class_locked(s, ics, verified);
+		uint32_t quota = ipc_server_client_class_quota(s, verified);
+		bool refused = quota != 0 && in_use >= quota;
+		if (!refused) {
+			ics->client_state.client_class = verified;
+			ics->class_verified = true;
+		}
+		os_mutex_unlock(&s->global_state.lock);
+
+		if (refused) {
+			IPC_WARN(s, "[CAP] refusing client pid=%ld ('%s'): class %s quota %u/%u exhausted (#960).",
+			         ics->peer_pid, client_desc->info.application_name,
+			         ipc_server_client_class_str(verified), in_use, quota);
+			return XRT_ERROR_CLIENT_LIMIT_REACHED;
+		}
+		IPC_WARN(s, "[CLASS] client id=%u pid=%ld ('%s') admitted as %s (declared %s; %u/%u of class in use).",
+		         ics->client_state.id, ics->peer_pid, client_desc->info.application_name,
+		         ipc_server_client_class_str(verified),
+		         ipc_server_client_class_str(client_desc->info.declared_client_class), in_use + 1, quota);
+	}
+
 	struct u_pp_sink_stack_only sink;
 	u_pp_delegate_t dg = u_pp_sink_stack_only_init(&sink);
 
@@ -1746,6 +1930,8 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	PNT("id: %u", ics->client_state.id);
 	PNT("application_name: '%s'", client_desc->info.application_name);
 	PNT("pid: %ld (OS-derived; claimed %i)", ics->peer_pid, client_desc->pid);
+	PNT("class: %s (declared %s)", ipc_server_client_class_str(ics->client_state.client_class),
+	    ipc_server_client_class_str(client_desc->info.declared_client_class));
 	PNT("extensions:");
 
 	EXT(ext_hand_tracking_enabled);
@@ -1758,6 +1944,8 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	EXT(meta_body_tracking_calibration_enabled);
 	EXT(fb_face_tracking2_enabled);
 	EXT(ext_win32_appcontainer_compatible_enabled);
+	EXT(ext_spatial_workspace_enabled);
+	EXT(ext_weave_enabled);
 
 #undef EXT
 #undef PTT
@@ -1812,6 +2000,29 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	        (const char *)ics->client_state.info.application_name,
 	        sizeof(xsi_local.application_name) - 1);
 	xsi_local.application_name[sizeof(xsi_local.application_name) - 1] = '\0';
+
+	// #960: the compositor-facing role flags follow the VERIFIED class, not the
+	// client's session_info claim. A RELAY is headless by contract — it may not
+	// create a compositor (that is what would make it renderable / slot-eligible).
+	{
+		uint32_t cls = ics->client_state.client_class;
+		xsi_local.is_workspace_controller = (cls == XRT_CLIENT_CLASS_CONTROLLER);
+		xsi_local.is_bridge_relay = (cls == XRT_CLIENT_CLASS_RELAY);
+		if (cls == XRT_CLIENT_CLASS_RELAY && create_native_compositor) {
+			IPC_WARN(ics->server,
+			         "session_create: denied — RELAY client pid %ld asked for a native compositor (#960).",
+			         ics->peer_pid);
+			return XRT_ERROR_NOT_AUTHORIZED;
+		}
+		if ((xsi->is_workspace_controller && cls != XRT_CLIENT_CLASS_CONTROLLER) ||
+		    (xsi->is_bridge_relay && cls != XRT_CLIENT_CLASS_RELAY)) {
+			IPC_WARN(ics->server,
+			         "session_create: client pid %ld (class %s) claimed controller=%d relay=%d in session "
+			         "info — ignored, flags follow the verified class (#960).",
+			         ics->peer_pid, ipc_server_client_class_str(cls), xsi->is_workspace_controller,
+			         xsi->is_bridge_relay);
+		}
+	}
 
 	xrt_result_t xret = xrt_system_create_session(
 	    ics->server->xsys, &xsi_local, &xs,
@@ -3574,6 +3785,16 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 	unsigned long expected_pid = get_orchestrator_workspace_pid();
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
 
+	// #960: fail closed on the verified class — this replaces the old
+	// "no orchestrator -> first-claim wins" rule. A manually-launched shell is a
+	// registered controller binary and verifies at connect; a worktree shell
+	// needs DXR_ALLOW_UNVERIFIED_CONTROLLER=1 on the service.
+	if (_ics->client_state.client_class != XRT_CLIENT_CLASS_CONTROLLER) {
+		IPC_WARN(s,
+		         "workspace_activate: denied — caller pid %lu is class %s, not a verified CONTROLLER (#960).",
+		         caller_pid, ipc_server_client_class_str(_ics->client_state.client_class));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
 	if (expected_pid != 0 && caller_pid != expected_pid) {
 		IPC_WARN(s,
 		         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) — denied",
@@ -4520,10 +4741,9 @@ ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, s
 {
 	struct ipc_server *s = _ics->server;
 
-	unsigned long expected_pid = get_orchestrator_workspace_pid();
-	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
-	if (expected_pid != 0 && caller_pid != expected_pid) {
-		return XRT_ERROR_NOT_AUTHORIZED;
+	xrt_result_t auth = require_workspace_controller(_ics, "workspace_enumerate_clients");
+	if (auth != XRT_SUCCESS) {
+		return auth;
 	}
 
 	if (list == NULL) {
@@ -4572,10 +4792,9 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 {
 	struct ipc_server *s = _ics->server;
 
-	unsigned long expected_pid = get_orchestrator_workspace_pid();
-	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
-	if (expected_pid != 0 && caller_pid != expected_pid) {
-		return XRT_ERROR_NOT_AUTHORIZED;
+	xrt_result_t auth = require_workspace_controller(_ics, "workspace_get_client_info");
+	if (auth != XRT_SUCCESS) {
+		return auth;
 	}
 
 	if (out_state == NULL) {
@@ -4668,6 +4887,23 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	memset((void *)out_capture_result, 0, sizeof(*out_capture_result));
+
+	// #960 / ADR-035 D2: the atlas capture reads the WHOLE composited atlas under
+	// render_mutex. CONTROLLER and DIAG may always capture; an APP may capture only
+	// its own content — which, until per-slot capture exists, means only outside
+	// workspace mode (its standalone atlas IS its own content). Under a workspace
+	// an app capture would read every other client's pixels — denied.
+	{
+		uint32_t cls = _ics->client_state.client_class;
+		bool privileged = cls == XRT_CLIENT_CLASS_CONTROLLER || cls == XRT_CLIENT_CLASS_DIAG;
+		if (!privileged && s->workspace_mode) {
+			IPC_WARN(s,
+			         "workspace_capture_frame: denied — pid %ld (class %s) may not capture the workspace "
+			         "atlas; only CONTROLLER/DIAG may (#960).",
+			         _ics->peer_pid, ipc_server_client_class_str(cls));
+			return XRT_ERROR_NOT_AUTHORIZED;
+		}
+	}
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL || request == NULL) {
@@ -5667,6 +5903,11 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 {
 	IPC_TRACE_MARKER();
 
+	xrt_result_t auth = require_present_owner(ics, "weave_bind_window");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+
 	if (ics->xc == NULL) {
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
@@ -5701,6 +5942,10 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	xrt_result_t auth = require_present_owner(ics, "weave_submit");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 	*out_width = 0;
 	*out_height = 0;
 	*out_fence_value = 0;
@@ -5879,6 +6124,10 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	xrt_result_t auth = require_present_owner(ics, "weave_get_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 	*out_width = 0;
 	*out_height = 0;
 	*out_handle_count = 0;
@@ -5924,6 +6173,10 @@ ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
 	IPC_TRACE_MARKER();
 
 	*out_have_fence = false;
+	xrt_result_t auth = require_present_owner(ics, "weave_get_fence");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 	*out_handle_count = 0;
 
 	if (ics->xc == NULL || max_handle_count < 1) {
@@ -5956,6 +6209,10 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 {
 	IPC_TRACE_MARKER();
 
+	xrt_result_t auth = require_present_owner(ics, "weave_snap_window_rect");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 	// Default = no-op snap (the caller keeps its proposed target).
 	*out_snapped = false;
 	*out_snapped_x = target_x;

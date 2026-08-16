@@ -62,6 +62,36 @@ ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns)
 	return (long)pid;
 }
 
+bool
+ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
+{
+	if (out_path == NULL || out_len == 0) {
+		return false;
+	}
+	out_path[0] = 0;
+	if (pid <= 0) {
+		return false;
+	}
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (h == NULL) {
+		return false;
+	}
+	wchar_t wpath[MAX_PATH * 2];
+	DWORD wlen = (DWORD)(sizeof(wpath) / sizeof(wpath[0]));
+	BOOL ok = QueryFullProcessImageNameW(h, 0, wpath, &wlen);
+	CloseHandle(h);
+	if (!ok || wlen == 0) {
+		return false;
+	}
+	int n = WideCharToMultiByte(CP_UTF8, 0, wpath, (int)wlen, out_path, (int)out_len - 1, NULL, NULL);
+	if (n <= 0) {
+		out_path[0] = 0;
+		return false;
+	}
+	out_path[n] = 0;
+	return true;
+}
+
 #else /* POSIX */
 
 #include <sys/types.h>
@@ -97,6 +127,46 @@ ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns)
 #else
 	(void)handle;
 	return 0;
+#endif
+}
+
+
+#if defined(XRT_OS_MACOS)
+#include <libproc.h>
+#endif
+#include <unistd.h>
+#include <stdio.h>
+
+bool
+ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
+{
+	if (out_path == NULL || out_len == 0) {
+		return false;
+	}
+	out_path[0] = 0;
+	if (pid <= 0) {
+		return false;
+	}
+#if defined(XRT_OS_LINUX)
+	char link[64];
+	snprintf(link, sizeof(link), "/proc/%ld/exe", pid);
+	ssize_t n = readlink(link, out_path, out_len - 1);
+	if (n <= 0) {
+		out_path[0] = 0;
+		return false;
+	}
+	out_path[n] = 0;
+	return true;
+#elif defined(XRT_OS_MACOS)
+	char buf[PROC_PIDPATHINFO_MAXSIZE];
+	int n = proc_pidpath((int)pid, buf, sizeof(buf));
+	if (n <= 0) {
+		return false;
+	}
+	snprintf(out_path, out_len, "%s", buf);
+	return true;
+#else
+	return false;
 #endif
 }
 

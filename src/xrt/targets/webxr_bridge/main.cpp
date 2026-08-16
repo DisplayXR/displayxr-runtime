@@ -1087,6 +1087,11 @@ static bool init_ipc_connection(Bridge &b) {
 	snprintf(info.app_info.application_name,
 	         sizeof(info.app_info.application_name),
 	         "displayxr-webxr-bridge-ipc");
+	// #960: this connection only reads (client list / info / window metrics) —
+	// declare it DIAG so it does not count against the RELAY quota (the OpenXR
+	// session above is the one RELAY). The service verifies DIAG by exe path
+	// (must live in the runtime install dir, which the spawned bridge does).
+	info.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
 
 	// The service is already up (we just created an XrInstance against it),
 	// so one attempt is enough — no retry loop like the workspace controller uses for

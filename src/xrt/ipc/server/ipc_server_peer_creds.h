@@ -18,6 +18,8 @@
 #include "xrt/xrt_handles.h"
 
 #include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +42,22 @@ extern "C" {
  */
 long
 ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns);
+
+/*!
+ * #960: best-effort absolute executable path of a peer process, for class
+ * verification (CONTROLLER = a registered controller binary; DIAG = a binary in
+ * the runtime's own directory).
+ *
+ * Windows: `QueryFullProcessImageNameW` (needs PROCESS_QUERY_LIMITED_INFORMATION —
+ * fails against a Low-integrity/restricted-token peer such as the browser GPU
+ * process, which is fine: those never claim a path-verified class). Linux:
+ * `/proc/<pid>/exe`. macOS: `proc_pidpath`.
+ *
+ * @return true and a NUL-terminated UTF-8 path in @p out_path on success; false
+ *         (out_path[0] == 0) when it cannot be derived.
+ */
+bool
+ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len);
 
 #ifdef __cplusplus
 }
