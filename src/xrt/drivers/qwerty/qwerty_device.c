@@ -376,8 +376,28 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		return XRT_SUCCESS;
 	}
 
+	// #962 (#958 follow-up): integrate keyboard motion by ELAPSED TIME, not per
+	// call. Every IPC client polls this pose every frame (head pose is exempt
+	// from input-focus gating so view-locate keeps working), so a per-call step
+	// made N clients move the camera N times faster. Speeds stay tuned as
+	// "per 60 Hz frame"; dt is clamped so a stall does not teleport. Mouse
+	// deltas below are consume-once and need no scaling.
+	int64_t now_ns = os_monotonic_get_ns();
+	float dt_frames = 1.0f;
+	if (qd->last_integrate_ns != 0) {
+		int64_t dt_ns = now_ns - qd->last_integrate_ns;
+		if (dt_ns < 0) {
+			dt_ns = 0;
+		}
+		if (dt_ns > 100 * 1000 * 1000) { // 100 ms cap
+			dt_ns = 100 * 1000 * 1000;
+		}
+		dt_frames = (float)dt_ns / (1000000000.0f / 60.0f);
+	}
+	qd->last_integrate_ns = now_ns;
+
 	float sprint_boost = qd->sprint_pressed ? powf(MOVEMENT_SPEED_STEP, SPRINT_STEPS) : 1;
-	float mov_speed = qd->movement_speed * sprint_boost;
+	float mov_speed = qd->movement_speed * sprint_boost * dt_frames;
 	struct xrt_vec3 pos_delta = {
 	    mov_speed * (qd->right_pressed - qd->left_pressed),
 	    0, // Up/down movement will be relative to base space
@@ -396,9 +416,9 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 
 	// Orientation
 
-	// View rotation caused by keys
-	float y_look_speed = qd->look_speed * (qd->look_left_pressed - qd->look_right_pressed);
-	float x_look_speed = qd->look_speed * (qd->look_up_pressed - qd->look_down_pressed);
+	// View rotation caused by keys (time-based, see above)
+	float y_look_speed = qd->look_speed * dt_frames * (qd->look_left_pressed - qd->look_right_pressed);
+	float x_look_speed = qd->look_speed * dt_frames * (qd->look_up_pressed - qd->look_down_pressed);
 
 	// View rotation caused by mouse
 	y_look_speed += qd->yaw_delta;

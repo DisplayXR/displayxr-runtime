@@ -509,12 +509,14 @@ void
 ipc_server_deactivate_session(volatile struct ipc_client_state *ics);
 
 /*!
- * Called by client threads to recalculate active client.
+ * #962: compute a freshly-created session's initial visible/focused state from
+ * the focus authority (default policy or the controller's compositor focus) and
+ * push it to the compositor. Replaces the old unconditional visible+focused.
  *
  * @ingroup ipc_server
  */
 void
-ipc_server_update_state(struct ipc_server *s);
+ipc_server_client_initial_state(volatile struct ipc_client_state *ics, bool *out_visible, bool *out_focused);
 
 /*!
  * Thread function for the client side dispatching.

@@ -81,6 +81,9 @@ struct qwerty_device
 	//! #958: guards the pose/delta/speed integrator state below, which the
 	//! win32 input thread writes and N action-path consumers read+consume.
 	struct os_mutex lock;
+
+	//! #962: last keyboard-integration timestamp (os_monotonic_get_ns); 0 = never.
+	int64_t last_integrate_ns;
 	struct xrt_pose pose;      //!< Internal pose state
 	struct qwerty_system *sys; //!< Reference to the system this device is in.
 

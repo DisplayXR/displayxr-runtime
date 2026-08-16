@@ -2037,22 +2037,13 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	ics->xs = xs;
 	ics->xc = xcn != NULL ? &xcn->base : NULL;
 
-	// Set initial state to visible and focused (matching in-process behavior).
-	// This must be called so the client's OXR layer knows to transition the
-	// session state machine. The actual VISIBLE/FOCUSED state change events
-	// to the app are deferred for AppContainer apps in oxr_session_begin().
-	ics->client_state.session_visible = true;
-	ics->client_state.session_focused = true;
-	if (ics->xc != NULL) {
-		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, ics->client_state.session_visible,
-		                      ics->client_state.session_focused);
-		xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, ics->client_state.z_order);
-	}
-
-	// Return initial visibility/focus state to client (avoids race condition
-	// where client polls events after session_create but before begin_session)
-	*out_initial_visible = ics->client_state.session_visible;
-	*out_initial_focused = ics->client_state.session_focused;
+	// #962: the initial visible/focused state comes from the ONE focus
+	// authority (the controller's compositor focus, or the default policy) —
+	// not an unconditional visible+focused, which used to leave every new
+	// session FOCUSED (and its inputs live) regardless of who held focus. The
+	// actual VISIBLE/FOCUSED state change events to the app are deferred for
+	// AppContainer apps in oxr_session_begin().
+	ipc_server_client_initial_state(ics, out_initial_visible, out_initial_focused);
 
 	return XRT_SUCCESS;
 }
@@ -2781,8 +2772,10 @@ ipc_handle_compositor_predict_frame(volatile struct ipc_client_state *ics,
 	}
 
 	/*
-	 * We use this to signal that the session has started, this is needed
-	 * to make this client/session active/visible/focused.
+	 * We use this to signal that the session has started (session_active).
+	 * #962: this promotes the client to focus ONLY under the default policy
+	 * (no controller connected). With a controller, focus is the compositor's
+	 * focused slot and predict_frame promotes nobody.
 	 */
 	ipc_server_activate_session(ics);
 
@@ -3729,6 +3722,14 @@ ipc_handle_system_set_primary_client(volatile struct ipc_client_state *_ics, uin
 {
 	struct ipc_server *s = _ics->server;
 
+	// #962: focus is a controller policy; nobody else may move it. (No in-tree
+	// caller — inherited Monado debug-GUI surface. Under a controller the
+	// compositor mirror overrides this within one mainloop tick anyway.)
+	xrt_result_t auth = require_workspace_controller(_ics, "system_set_primary_client");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+
 	IPC_INFO(s, "System setting active client to %d.", client_id);
 
 	return ipc_server_set_active_client(s, client_id);
@@ -3739,11 +3740,11 @@ ipc_handle_system_set_focused_client(volatile struct ipc_client_state *ics, uint
 {
 	struct ipc_server *s = ics->server;
 
-	// Promote the requested client to the active slot. This is the closest
-	// IPC-layer concept to "focused" we have today — the per-client
-	// session_focused bit is then derived by update_server_state_locked()
-	// from the active_client_index, so we reuse that code path rather than
-	// writing the flag directly and going out of sync with the dispatcher.
+	// #962: controller-only (see system_set_primary_client).
+	xrt_result_t auth = require_workspace_controller(ics, "system_set_focused_client");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 	IPC_INFO(s, "System setting focused client to %u", client_id);
 	return ipc_server_set_active_client(s, client_id);
 }
@@ -3752,6 +3753,12 @@ xrt_result_t
 ipc_handle_system_toggle_io_client(volatile struct ipc_client_state *_ics, uint32_t client_id)
 {
 	struct ipc_server *s = _ics->server;
+
+	// #962: muting another client's inputs is a controller operation.
+	xrt_result_t auth = require_workspace_controller(_ics, "system_toggle_io_client");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
 
 	IPC_INFO(s, "System toggling io for client %u.", client_id);
 
@@ -3763,6 +3770,12 @@ ipc_handle_system_toggle_io_device(volatile struct ipc_client_state *ics, uint32
 {
 	if (device_id >= IPC_MAX_DEVICES) {
 		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// #962: this mutes a device for EVERY client — controller-only.
+	xrt_result_t auth = require_workspace_controller(ics, "system_toggle_io_device");
+	if (auth != XRT_SUCCESS) {
+		return auth;
 	}
 
 	struct ipc_device *idev = &ics->server->idevs[device_id];
@@ -4331,31 +4344,32 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 {
 	struct ipc_server *s = _ics->server;
 
-	// PID-auth gate matches workspace_activate. Focus is policy controlled by
-	// the workspace; only the registered controller may set it.
-	unsigned long expected_pid = get_orchestrator_workspace_pid();
-	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
-	if (expected_pid != 0 && caller_pid != expected_pid) {
-		return XRT_ERROR_NOT_AUTHORIZED;
+	// Focus is policy controlled by the workspace; only the controller may set it.
+	xrt_result_t auth = require_workspace_controller(_ics, "workspace_set_focused_client");
+	if (auth != XRT_SUCCESS) {
+		return auth;
 	}
 
-	// XR_NULL_WORKSPACE_CLIENT_ID (0) clears focus. The internal helper
-	// ipc_server_set_active_client looks up by id and would fail for 0;
-	// we directly reset the active-client indices instead.
+	// #962: the compositor's focused slot is the ONE focus authority. This
+	// handler writes ONLY the compositor; the IPC layer's active_client_index
+	// (session VISIBLE/FOCUSED events, input gating) is mirrored from it by the
+	// mainloop within one tick. Writing both here (the pre-#962 shape) raced
+	// the async WS_CMD_SET_FOCUS drain and could flap the session state.
+
+	// XR_NULL_WORKSPACE_CLIENT_ID (0) clears focus.
 	if (client_id == 0) {
-		os_mutex_lock(&s->global_state.lock);
-		s->global_state.active_client_index = -1;
-		s->global_state.last_active_client_index = -1;
-		os_mutex_unlock(&s->global_state.lock);
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-		// Phase 2.C spec_version 9: also clear the compositor's
-		// focused_slot view so the focus glow disappears.
 		if (s->xsysc != NULL) {
 			comp_d3d11_service_set_focused_slot(s->xsysc, -1);
 		}
 #elif defined(XRT_OS_MACOS)
 		// #59 Task 10: clear the focus tint (no client tinted).
 		comp_multi_workspace_set_focused_client(NULL);
+#else
+		os_mutex_lock(&s->global_state.lock);
+		s->global_state.active_client_index = -1;
+		s->global_state.last_active_client_index = -1;
+		os_mutex_unlock(&s->global_state.lock);
 #endif
 		return XRT_SUCCESS;
 	}
@@ -4374,67 +4388,36 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	// index — which drives session-focus events — in sync. Capture clients
 	// have no IPC session, so focused_slot alone is the whole story.
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (client_id >= 1000u && s->xsysc != NULL) {
-		int slot = (int)(client_id - 1000u);
-		uint32_t canonical_id = 0;
-		os_mutex_lock(&s->global_state.lock);
-		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-			volatile struct ipc_client_state *ics = &s->threads[i].ics;
-			if (ics->server_thread_index < 0 || ics->xc == NULL) {
-				continue;
-			}
-			if (comp_d3d11_service_workspace_find_slot_by_xc(
-			        s->xsysc, (struct xrt_compositor *)ics->xc) == slot) {
-				canonical_id = ics->client_state.id;
-				break;
-			}
-		}
-		os_mutex_unlock(&s->global_state.lock);
-		if (canonical_id != 0) {
-			(void)ipc_server_set_active_client(s, canonical_id);
-		}
-		comp_d3d11_service_set_focused_slot(s->xsysc, slot);
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (client_id >= 1000u) {
+		comp_d3d11_service_set_focused_slot(s->xsysc, (int)(client_id - 1000u));
 		return XRT_SUCCESS;
 	}
-#endif
-
-	// Canonical IPC client id path (xrEnumerateWorkspaceClientsDXR form).
-	xrt_result_t xret = ipc_server_set_active_client(s, client_id);
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	// Phase 2.C spec_version 9: mirror the focus change into the
-	// compositor's focused_slot. The IPC layer's active_client_index
-	// is keyed by ipc thread index; the compositor needs the slot
-	// index in mc->clients[]. Map via find_slot_by_xc — same lookup
-	// the chrome layout setter uses.
-	if (xret == XRT_SUCCESS && s->xsysc != NULL) {
-		os_mutex_lock(&s->global_state.lock);
-		volatile struct ipc_client_state *target_ics = NULL;
-		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-			volatile struct ipc_client_state *ics = &s->threads[i].ics;
-			if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
-				target_ics = ics;
-				break;
-			}
-		}
-		int mc_slot = -1;
-		if (target_ics != NULL && target_ics->xc != NULL) {
-			mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(
-			    s->xsysc, (struct xrt_compositor *)target_ics->xc);
-		}
-		os_mutex_unlock(&s->global_state.lock);
-		comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
+	// Canonical id: resolve the client's compositor pointer under the lock,
+	// then map it to a slot OUT of the lock (#957 shape — find_slot_by_xc takes
+	// render_mutex and matches by pointer identity, never dereferencing).
+	struct xrt_compositor *xc = find_client_xc_by_id(s, client_id);
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
 	}
+	int mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, xc);
+	comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
+	return XRT_SUCCESS;
 #elif defined(XRT_OS_MACOS)
-	// #59 Task 10: mirror the focus change into the compositor's focus-tint gate.
-	// The macOS shell passes canonical client ids (no 1000+slot form), so resolve
-	// the focused client's per-session compositor directly.
-	if (xret == XRT_SUCCESS) {
-		comp_multi_workspace_set_focused_client(macos_workspace_find_client_xc(s, client_id));
+	// #59 Task 10: the compositor's focus-tint gate is the authority on macOS.
+	// The macOS shell passes canonical client ids (no 1000+slot form).
+	struct xrt_compositor *xc = macos_workspace_find_client_xc(s, client_id);
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
 	}
+	comp_multi_workspace_set_focused_client(xc);
+	return XRT_SUCCESS;
+#else
+	// No compositor focus authority on this platform: the IPC layer is it.
+	return ipc_server_set_active_client(s, client_id);
 #endif
-
-	return xret;
 }
 
 xrt_result_t
@@ -6275,6 +6258,17 @@ ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, u
  *
  */
 
+// #962: server-side input focus. A client's device reads are live only while
+// it holds focus (session_focused — controller / relay / overlay sessions are
+// always focused, see handle_focused_client_events) and its io is not muted.
+// Reads session_focused racily on purpose: it is a bool written under
+// global_state.lock on flush; this is the per-frame hot path and must not lock.
+static inline bool
+client_input_allowed(volatile struct ipc_client_state *ics)
+{
+	return ics->io_active && ics->client_state.session_focused;
+}
+
 xrt_result_t
 ipc_handle_device_update_input(volatile struct ipc_client_state *ics, uint32_t id)
 {
@@ -6297,7 +6291,7 @@ ipc_handle_device_update_input(volatile struct ipc_client_state *ics, uint32_t i
 	struct xrt_input *dst = &ism->inputs[isdev->first_input_index];
 	size_t size = sizeof(struct xrt_input) * isdev->input_count;
 
-	bool io_active = ics->io_active && idev->io_active;
+	bool io_active = client_input_allowed(ics) && idev->io_active;
 	if (io_active) {
 		memcpy(dst, src, size);
 	} else {
@@ -6351,8 +6345,8 @@ ipc_handle_device_get_tracked_pose(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	// Special case the headpose.
-	bool disabled = (!isdev->io_active || !ics->io_active) && name != XRT_INPUT_GENERIC_HEAD_POSE;
+	// Special case the headpose (view-locate must keep working while unfocused).
+	bool disabled = (!isdev->io_active || !client_input_allowed(ics)) && name != XRT_INPUT_GENERIC_HEAD_POSE;
 	bool active_on_client = input->active;
 
 	// We have been disabled but the client hasn't called update.
@@ -6382,6 +6376,14 @@ ipc_handle_device_get_hand_tracking(volatile struct ipc_client_state *ics,
 	uint32_t device_id = id;
 	struct xrt_device *xdev = NULL;
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
+
+	// #962: hand tracking follows input focus like every other device read —
+	// an unfocused client gets an inactive joint set, not the tracked hands.
+	if (!client_input_allowed(ics)) {
+		U_ZERO(out_value);
+		*out_timestamp = at_timestamp;
+		return XRT_SUCCESS;
+	}
 
 	// Get the pose.
 	return xrt_device_get_hand_tracking(xdev, name, at_timestamp, out_value, out_timestamp);
