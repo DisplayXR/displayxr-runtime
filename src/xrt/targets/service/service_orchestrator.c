@@ -543,6 +543,20 @@ trampoline_thread_body(LPVOID param)
 {
 	(void)param;
 
+	// #975: this thread OWNS the listener. Nobody else may closesocket() it — a
+	// closesocket() from the stopper while this thread sat between select() and
+	// accept() raised STATUS_INVALID_HANDLE inside mswsock!SockImportHandle and
+	// killed the process (ten WER dumps in one day, every one a 2-10 s-old
+	// second instance shutting down). Stoppers only signal the quit event; we
+	// wake within one select() timeout, re-check it, and close the socket here.
+	EnterCriticalSection(&s_bridge_lock);
+	SOCKET sock = s_trampoline_sock;
+	LeaveCriticalSection(&s_bridge_lock);
+	if (sock == INVALID_SOCKET) {
+		return 0;
+	}
+
+	bool spawn = false;
 	for (;;) {
 		if (WaitForSingleObject(s_trampoline_quit_event, 0) == WAIT_OBJECT_0) {
 			break;
@@ -550,39 +564,49 @@ trampoline_thread_body(LPVOID param)
 
 		fd_set readfds;
 		FD_ZERO(&readfds);
-		FD_SET(s_trampoline_sock, &readfds);
+		FD_SET(sock, &readfds);
 		struct timeval tv = {0, 500000}; // 500 ms
 
 		int r = select(0, &readfds, NULL, NULL, &tv);
 		if (r == SOCKET_ERROR) {
-			// Listener was closed out from under us (stop path) — exit.
 			break;
 		}
 		if (r == 0) {
 			continue; // timeout, re-check quit event
 		}
 
-		SOCKET accepted = accept(s_trampoline_sock, NULL, NULL);
+		// A stop can race the readable wake-up: re-check before touching the
+		// socket again.
+		if (WaitForSingleObject(s_trampoline_quit_event, 0) == WAIT_OBJECT_0) {
+			break;
+		}
+
+		SOCKET accepted = accept(sock, NULL, NULL);
 		if (accepted == INVALID_SOCKET) {
 			break;
 		}
 
 		// Release the port immediately so the bridge can bind it.
 		closesocket(accepted);
-
-		EnterCriticalSection(&s_bridge_lock);
-		if (s_trampoline_sock != INVALID_SOCKET) {
-			closesocket(s_trampoline_sock);
-			s_trampoline_sock = INVALID_SOCKET;
-		}
-		s_trampoline_running = false;
-		LeaveCriticalSection(&s_bridge_lock);
-
-		OW("Bridge trampoline accepted — launching WebXR bridge");
-		spawn_bridge();
-		return 0;
+		spawn = true;
+		break;
 	}
 
+	// Retire the listener on the owning thread, then close it. Publishing
+	// INVALID_SOCKET first means a concurrent start_bridge_trampoline() sees a
+	// free slot only after the port is really about to be released.
+	EnterCriticalSection(&s_bridge_lock);
+	if (s_trampoline_sock == sock) {
+		s_trampoline_sock = INVALID_SOCKET;
+	}
+	s_trampoline_running = false;
+	LeaveCriticalSection(&s_bridge_lock);
+	closesocket(sock);
+
+	if (spawn) {
+		OW("Bridge trampoline accepted — launching WebXR bridge");
+		spawn_bridge();
+	}
 	return 0;
 }
 
@@ -661,22 +685,25 @@ stop_bridge_trampoline(void)
 		LeaveCriticalSection(&s_bridge_lock);
 		return;
 	}
+	// #975: never closesocket() the listener from here — the trampoline thread
+	// owns it and closes it on its way out. Signal and join (it wakes within
+	// one 500 ms select() timeout).
 	if (s_trampoline_quit_event) {
 		SetEvent(s_trampoline_quit_event);
 	}
-	if (s_trampoline_sock != INVALID_SOCKET) {
-		closesocket(s_trampoline_sock);
-		s_trampoline_sock = INVALID_SOCKET;
-	}
 	thread = s_trampoline_thread;
 	s_trampoline_thread = NULL;
-	s_trampoline_running = false;
 	LeaveCriticalSection(&s_bridge_lock);
 
 	if (thread) {
-		WaitForSingleObject(thread, 3000);
+		if (WaitForSingleObject(thread, 3000) != WAIT_OBJECT_0) {
+			OW("Bridge trampoline thread did not exit within 3 s; leaving its listener to it");
+		}
 		CloseHandle(thread);
 	}
+	EnterCriticalSection(&s_bridge_lock);
+	s_trampoline_running = false;
+	LeaveCriticalSection(&s_bridge_lock);
 }
 
 
