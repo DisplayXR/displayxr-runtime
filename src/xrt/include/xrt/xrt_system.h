@@ -196,6 +196,33 @@ struct xrt_system_roles
 	enum xrt_device_name right_profile;
 
 	enum xrt_device_name gamepad_profile;
+
+	/*!
+	 * Dynamic hand-tracking role indices into
+	 * @ref xrt_system_devices::xdevs, or negative when unassigned —
+	 * covered by the same @ref xrt_system_roles::generation_id as the
+	 * controller roles (ADR-034 Amendment 3: multiple input providers may
+	 * carry hand tracking, and the source follows provider presence).
+	 *
+	 * The static @ref xrt_system_devices::static_roles hand-tracking
+	 * fields remain the build-time seed and keep gating extension
+	 * support; consumers that can rebind (the OpenXR hand trackers)
+	 * should prefer these.
+	 */
+	struct
+	{
+		struct
+		{
+			int32_t left;
+			int32_t right;
+		} unobstructed;
+
+		struct
+		{
+			int32_t left;
+			int32_t right;
+		} conforming;
+	} hand_tracking;
 };
 
 /*!
@@ -208,6 +235,9 @@ struct xrt_system_roles
 #define XRT_SYSTEM_ROLES_INIT                                                                                          \
 	{                                                                                                              \
 		0, -1, -1, -1, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID,                             \
+		{                                                                                                      \
+			{-1, -1}, {-1, -1}                                                                             \
+		}                                                                                                      \
 	}
 
 

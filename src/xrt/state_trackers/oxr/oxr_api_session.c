@@ -480,6 +480,77 @@ oxr_hand_tracker_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 	return XR_SUCCESS;
 }
 
+/*!
+ * The hand-tracking roles are dynamic (ADR-034 Amendment 3): multiple input
+ * providers may carry hand tracking, and which one is the source follows
+ * provider presence, exactly like the controller roles. This resolves the
+ * tracker's data-source devices from the session's cached dynamic roles —
+ * once at create, and again from the joint-locate path whenever the
+ * generation moves (the cache itself is refreshed by `xrSyncActions`; a
+ * client that never syncs actions gets a direct `get_roles` on first use
+ * via the generation-0 cache state below).
+ */
+void
+oxr_hand_tracker_resolve_sources(struct oxr_logger *log, struct oxr_hand_tracker *hand_tracker)
+{
+	struct oxr_session *sess = hand_tracker->sess;
+	struct oxr_system *sys = sess->sys;
+
+	struct xrt_system_roles roles = XRT_STRUCT_INIT;
+	bool have_roles = false;
+
+	if (0 == os_mutex_trylock(&sys->sync_actions_mutex)) {
+		if (sys->dynamic_roles_cache.generation_id != 0) {
+			roles = sys->dynamic_roles_cache;
+			have_roles = true;
+		}
+		os_mutex_unlock(&sys->sync_actions_mutex);
+	}
+	if (!have_roles) {
+		// No sync has run yet (or the lock was contended) — ask the
+		// system directly; over IPC this is the same forwarded call
+		// xrSyncActions makes.
+		xrt_system_devices_get_roles(sys->xsysd, &roles);
+	}
+
+	if (hand_tracker->roles_generation == roles.generation_id) {
+		return; // Nothing moved.
+	}
+	hand_tracker->roles_generation = roles.generation_id;
+
+	const bool is_left = hand_tracker->hand == XR_HAND_LEFT_EXT;
+
+#define OXR_SET_HT_DATA_SOURCE(SRC, SRC_TYPE)                                                                          \
+	{                                                                                                              \
+		int32_t idx = is_left ? roles.hand_tracking.SRC.left : roles.hand_tracking.SRC.right;                 \
+		struct xrt_device *xdev = NULL;                                                                        \
+		if (idx >= 0 && (size_t)idx < sys->xsysd->xdev_count) {                                                \
+			xdev = sys->xsysd->xdevs[idx];                                                                 \
+		}                                                                                                      \
+                                                                                                                       \
+		hand_tracker->SRC.xdev = NULL;                                                                         \
+		if (xdev != NULL && xdev->supported.hand_tracking) {                                                   \
+			const enum xrt_input_name ht_input_name =                                                      \
+			    is_left ? XRT_INPUT_HT_##SRC_TYPE##_LEFT : XRT_INPUT_HT_##SRC_TYPE##_RIGHT;                \
+			struct xrt_input *input = NULL;                                                                \
+			if (oxr_xdev_find_input(xdev, ht_input_name, &input) && input != NULL) {                       \
+				hand_tracker->SRC = (struct oxr_hand_tracking_data_source){                            \
+				    .xdev = xdev,                                                                      \
+				    .input_name = ht_input_name,                                                       \
+				};                                                                                     \
+			}                                                                                              \
+		}                                                                                                      \
+                                                                                                                       \
+		if (xdev != NULL && hand_tracker->SRC.xdev == NULL)                                                    \
+			oxr_warn(log, "We got hand tracking xdev (%s) but it didn't have a hand tracking input.",      \
+			         #SRC);                                                                                \
+	}
+
+	OXR_SET_HT_DATA_SOURCE(unobstructed, UNOBSTRUCTED)
+	OXR_SET_HT_DATA_SOURCE(conforming, CONFORMING)
+#undef OXR_SET_HT_DATA_SOURCE
+}
+
 XrResult
 oxr_hand_tracker_create(struct oxr_logger *log,
                         struct oxr_session *sess,
@@ -498,37 +569,9 @@ oxr_hand_tracker_create(struct oxr_logger *log,
 	hand_tracker->hand = createInfo->hand;
 	hand_tracker->hand_joint_set = createInfo->handJointSet;
 
-#define OXR_SET_HT_DATA_SOURCE(SRC, SRC_TYPE)                                                                          \
-	{                                                                                                              \
-		struct xrt_device *xdev = NULL;                                                                        \
-		if (createInfo->hand == XR_HAND_LEFT_EXT) {                                                            \
-			xdev = GET_XDEV_BY_ROLE(sess->sys, hand_tracking_##SRC##_left);                                \
-		} else if (createInfo->hand == XR_HAND_RIGHT_EXT) {                                                    \
-			xdev = GET_XDEV_BY_ROLE(sess->sys, hand_tracking_##SRC##_right);                               \
-		}                                                                                                      \
-                                                                                                                       \
-		if (xdev != NULL && xdev->supported.hand_tracking) {                                                   \
-			const enum xrt_input_name ht_input_name = createInfo->hand == XR_HAND_LEFT_EXT                 \
-			                                              ? XRT_INPUT_HT_##SRC_TYPE##_LEFT                 \
-			                                              : XRT_INPUT_HT_##SRC_TYPE##_RIGHT;               \
-			struct xrt_input *input = NULL;                                                                \
-			if (oxr_xdev_find_input(xdev, ht_input_name, &input) && input != NULL) {                       \
-				hand_tracker->SRC = (struct oxr_hand_tracking_data_source){                            \
-				    .xdev = xdev,                                                                      \
-				    .input_name = ht_input_name,                                                       \
-				};                                                                                     \
-			}                                                                                              \
-		}                                                                                                      \
-                                                                                                                       \
-		if (xdev != NULL && hand_tracker->SRC.xdev == NULL)                                                    \
-			oxr_warn(log, "We got hand tracking xdev (%s) but it didn't have a hand tracking input.",      \
-			         #SRC);                                                                                \
-	}
-
-	// Find the assigned device.
-	OXR_SET_HT_DATA_SOURCE(unobstructed, UNOBSTRUCTED)
-	OXR_SET_HT_DATA_SOURCE(conforming, CONFORMING)
-#undef OXR_SET_HT_DATA_SOURCE
+	// Find the assigned devices (dynamic roles; re-resolved on
+	// generation moves from the joint-locate path).
+	oxr_hand_tracker_resolve_sources(log, hand_tracker);
 
 	hand_tracker->requested_sources_count = ARRAY_SIZE(hand_tracker->requested_sources);
 	hand_tracker->requested_sources[0] = &hand_tracker->unobstructed;

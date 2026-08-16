@@ -360,3 +360,20 @@ sim" works for displays.
 - Every resident provider's DLL stays loaded even while absent — the cost
   of being able to see its hardware arrive. Providers that dislike this
   should decline in `probe()` (registration is opt-in per box anyway).
+
+### Amendment 3 addendum — hand-tracking roles are dynamic too (2026-08-16)
+
+The static hand-tracking roles stay exactly as Amendment 1 described —
+build-time seed, first-claimant-wins across providers, gating
+`XR_EXT_hand_tracking` support. What changed: `xrt_system_roles` now also
+carries **dynamic** hand-tracking indices (`hand_tracking.{unobstructed,
+conforming}.{left,right}`), covered by the same `generation_id` and riding
+the existing IPC `get_roles` forwarding unchanged. The arbiter fills them
+with the same presence walk, per slot; there is no qwerty floor here (the
+keyboard has no joints), so with every carrier absent a slot parks at -1
+and the tracker reports inactive joints. The OpenXR hand tracker
+re-resolves its data-source devices from the session's cached roles
+whenever the generation moves (`oxr_hand_tracker_resolve_sources`), so the
+joint source hot-follows provider presence exactly like the controllers.
+Hardware-validated: Leap unplug switched live joints to sim-input's
+synthetic hands mid-session and back on replug.
