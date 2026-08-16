@@ -22,6 +22,31 @@ Companion references: [workspace-stability.md](../reference/workspace-stability.
 [#925 S2 site audit](https://github.com/DisplayXR/displayxr-runtime/issues/925),
 [production-components.md](production-components.md) (what ships).
 
+> **Phase-1 update (2026-08-16).** This map is a snapshot at `main @ c961d4d85`; the
+> `file:line` anchors are pinned to that commit. Since then, Phase 1 of the [ADR-035]
+> plan (epic #974) has **landed on `main`** and closed a number of the §9 defects — read
+> those §9 items as "the problem that was fixed":
+> - **#954** server-derived peer identity (`GetNamedPipeClientProcessId` / `SO_PEERCRED` /
+>   `LOCAL_PEERPID`) — the gates no longer trust the client-sent pid (§9-1).
+> - **#955** the 13 controller-only `workspace_*` mutators are now authorized (§9-2, part of §4.2).
+> - **#956** no blocking pipe I/O under `global_state.lock`; bounded client allocations;
+>   swapchain/semaphore id bounds; capped event queue (§9-4, §9-6).
+> - **#957** the window handlers resolve id→xc under the lock and call the compositor
+>   out-of-lock (part of §9-4; the nesting is latency, not deadlock — the compositor never
+>   takes `global_state.lock`; the `ics->xc` read is pointer-identity, currently safe).
+> - **#958** provider `get_presence` runs on a background poll thread, never a client
+>   thread; qwerty integrator is locked (§9-15).
+> - **#959** `IPC_MAX_CLIENTS` is now **32** (was 8), with a runtime-admitted cap read from
+>   box specs / `DXR_MAX_CLIENTS` and a reserved controller slot; refusal is a clean `[CAP]`
+>   log (§2.3, §9-17). The ~21 MB/client shm slim stays an Android follow-up.
+> - Phase-0 forensics/telemetry also landed: the `[EXIT]`/`[TERMINATE]` tripwires (#950),
+>   the `[HEALTH]` per-client line (#951), the plugin dev-path guard (#952), the bridge
+>   exit-on-loss (#953), and the #975 trampoline crash fix.
+>
+> Still open / next: the arbitration contract (client classes #960, panel lease #961 — the
+> core of #939), the one-pipeline work (#964), and the noted per-slice follow-ups. The DP
+> stays in-process (fault-contained); #943's exit source waits for the armed tripwire.
+
 **One-paragraph summary.** The service is a single-process, no-isolation host. `WinMain`
 starts a tray/message-pump thread, an orchestrator that spawns two children (workspace
 controller, WebXR bridge) with **no job object**, and then blocks forever in
