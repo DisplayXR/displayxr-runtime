@@ -124,6 +124,37 @@ effective_workspace_controller_pid(struct ipc_server *s)
 	return get_orchestrator_workspace_pid();
 }
 
+// #955: authorization for the controller-only workspace mutators (window
+// placement, capture clients, cursor/overlay/chrome, input grab). These are
+// XR_DXR_spatial_workspace operations — only the workspace controller may issue
+// them once one exists. Caller identity is the OS-derived peer pid (#954), so it
+// cannot be spoofed. Same shape as the existing workspace gates:
+//   - a controller IS established (orchestrator-spawned pid, or a pid that called
+//     workspace_activate) -> ONLY that pid passes; every other client is denied.
+//   - no controller yet (effective == 0, e.g. a manually-launched shell doing its
+//     pre-activate setup on a box with no orchestrator) -> permit, mirroring
+//     workspace_activate's own first-claim rule. There is nothing to protect
+//     before a controller exists: no client is captured into a workspace slot
+//     until workspace mode is active. Tightening the first-claim itself (so a
+//     griefer cannot BE the first controller on a shell-less box) is the
+//     verified-controller-binary follow-up on #955.
+static xrt_result_t
+require_workspace_controller(volatile struct ipc_client_state *ics, const char *what)
+{
+	struct ipc_server *s = ics->server;
+	unsigned long expected = effective_workspace_controller_pid(s);
+	unsigned long caller = (unsigned long)ics->client_state.pid;
+
+	if (expected != 0 && caller != expected) {
+		IPC_WARN(s,
+		         "%s: denied — caller pid %lu is not the workspace controller (%lu); this is a "
+		         "controller-only operation (#955).",
+		         what, caller, expected);
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
 static ipc_server_workspace_supports_file_dialog_fn s_workspace_file_dialog_provider = NULL;
 
 void
@@ -3561,6 +3592,10 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 xrt_result_t
 ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_deactivate");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 	if (!s->workspace_mode) {
@@ -3675,6 +3710,10 @@ ipc_handle_workspace_get_state(volatile struct ipc_client_state *_ics, bool *out
 xrt_result_t
 ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool grab)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_input_grab");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -3705,6 +3744,10 @@ ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics,
                                       uint32_t over_window,
                                       float dim_factor)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_cursor_depth");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -3771,6 +3814,10 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
                                   float width_m,
                                   float height_m)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_window_pose");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -3847,6 +3894,10 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
                                  uint32_t client_id,
                                  bool visible)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_window_visibility");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -3977,6 +4028,10 @@ ipc_handle_workspace_add_capture_client(volatile struct ipc_client_state *_ics,
                                      uint64_t hwnd,
                                      uint32_t *out_client_id)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_add_capture_client");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4010,6 +4065,10 @@ xrt_result_t
 ipc_handle_workspace_remove_capture_client(volatile struct ipc_client_state *_ics,
                                         uint32_t client_id)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_remove_capture_client");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4674,6 +4733,10 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
                                                uint32_t client_id,
                                                uint32_t swapchain_id)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_register_chrome_swapchain");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4763,6 +4826,10 @@ xrt_result_t
 ipc_handle_workspace_unregister_chrome_swapchain(volatile struct ipc_client_state *_ics,
                                                  uint32_t swapchain_id)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_unregister_chrome_swapchain");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL) {
@@ -4786,6 +4853,10 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
                                        uint32_t client_id,
                                        const struct ipc_workspace_chrome_layout *layout)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_chrome_layout");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL || layout == NULL) {
@@ -4880,6 +4951,10 @@ xrt_result_t
 ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
                                  const struct ipc_workspace_cursor_info *info)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_cursor");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL || info == NULL) {
@@ -4919,6 +4994,10 @@ xrt_result_t
 ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
                                   const struct ipc_workspace_overlay_info *info)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_overlay");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL || info == NULL) {
@@ -4963,6 +5042,10 @@ ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *
                                               uint32_t client_id,
                                               const struct xrt_pose *pose_in_client)
 {
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_update_chrome_layer_pose");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
 	struct ipc_server *s = _ics->server;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL || pose_in_client == NULL) {
