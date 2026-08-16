@@ -270,6 +270,18 @@ u_system_devices_static_finalize(struct u_system_devices_static *usysds,
 	usysds->cached.left = left_index;
 	usysds->cached.right = right_index;
 	usysds->cached.gamepad = gamepad_index;
+
+	// Seed the dynamic hand-tracking roles from the static assignment,
+	// so a system without the input arbiter reports the same sources
+	// dynamically as statically.
+	usysds->cached.hand_tracking.unobstructed.left =
+	    get_index_for_device(xsysd, xsysd->static_roles.hand_tracking.unobstructed.left);
+	usysds->cached.hand_tracking.unobstructed.right =
+	    get_index_for_device(xsysd, xsysd->static_roles.hand_tracking.unobstructed.right);
+	usysds->cached.hand_tracking.conforming.left =
+	    get_index_for_device(xsysd, xsysd->static_roles.hand_tracking.conforming.left);
+	usysds->cached.hand_tracking.conforming.right =
+	    get_index_for_device(xsysd, xsysd->static_roles.hand_tracking.conforming.right);
 }
 
 

@@ -58,10 +58,29 @@ struct t_input_candidate
 	int32_t left_index;
 	int32_t right_index;
 
+	/*!
+	 * Hand-tracking devices this candidate supplies, same slot layout
+	 * as `xrt_system_roles::hand_tracking`. Often the same devices as
+	 * @ref left / @ref right (ultraleap). All NULL for qwerty.
+	 */
+	struct xrt_device *ht_devices[4];
+
+	//! Indices for @ref ht_devices, resolved at install. -1 = absent.
+	int32_t ht_indices[4];
+
 	//! Cached presence verdict for this candidate.
 	bool present;
 	bool have_verdict;
 	int64_t verdict_at_ns;
+};
+
+//! Slot order for t_input_candidate::ht_devices / ::ht_indices.
+enum
+{
+	ARB_HT_UNOBSTRUCTED_LEFT = 0,
+	ARB_HT_UNOBSTRUCTED_RIGHT = 1,
+	ARB_HT_CONFORMING_LEFT = 2,
+	ARB_HT_CONFORMING_RIGHT = 3,
 };
 
 struct t_input_arbiter
@@ -75,6 +94,10 @@ struct t_input_arbiter
 	//! Candidates in priority order: providers first, qwerty last.
 	struct t_input_candidate candidates[ARBITER_MAX_CANDIDATES];
 	int candidate_count;
+
+	//! Index of the most recently noted candidate (insertion moves it),
+	//! for attaching hand-tracking devices. -1 = none.
+	int last_noted;
 
 	//! What get_roles hands out; generation_id bumps on every flip.
 	struct xrt_system_roles roles;
@@ -125,7 +148,11 @@ name_of(struct xrt_device *xdev)
 static bool
 query_candidate_presence(const struct t_input_candidate *cand)
 {
-	if (cand->left == NULL && cand->right == NULL) {
+	bool has_any = cand->left != NULL || cand->right != NULL;
+	for (int i = 0; !has_any && i < 4; i++) {
+		has_any = cand->ht_devices[i] != NULL;
+	}
+	if (!has_any) {
 		return false; // Supplied no hand devices at all.
 	}
 	if (cand->iface == NULL) {
@@ -196,6 +223,22 @@ pick_for_hand_locked(bool want_left)
 	return NULL;
 }
 
+//! Same walk for one hand-tracking slot; -1 when no present carrier.
+static int32_t
+pick_ht_slot_locked(int slot)
+{
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->ht_indices[slot] < 0) {
+			continue;
+		}
+		if (candidate_is_present_locked(cand)) {
+			return cand->ht_indices[slot];
+		}
+	}
+	return -1;
+}
+
 //! Caller holds the mutex (or is the single-threaded builder path).
 static bool
 provider_holds_roles_locked(void)
@@ -226,7 +269,15 @@ refresh_roles_locked(void)
 	int32_t left = left_cand != NULL ? left_cand->left_index : -1;
 	int32_t right = right_cand != NULL ? right_cand->right_index : -1;
 
-	if (g_arb.roles.generation_id != 0 && g_arb.roles.left == left && g_arb.roles.right == right) {
+	int32_t ht_ul = pick_ht_slot_locked(ARB_HT_UNOBSTRUCTED_LEFT);
+	int32_t ht_ur = pick_ht_slot_locked(ARB_HT_UNOBSTRUCTED_RIGHT);
+	int32_t ht_cl = pick_ht_slot_locked(ARB_HT_CONFORMING_LEFT);
+	int32_t ht_cr = pick_ht_slot_locked(ARB_HT_CONFORMING_RIGHT);
+
+	if (g_arb.roles.generation_id != 0 && g_arb.roles.left == left && g_arb.roles.right == right &&
+	    g_arb.roles.hand_tracking.unobstructed.left == ht_ul &&
+	    g_arb.roles.hand_tracking.unobstructed.right == ht_ur &&
+	    g_arb.roles.hand_tracking.conforming.left == ht_cl && g_arb.roles.hand_tracking.conforming.right == ht_cr) {
 		return; // Nothing moved.
 	}
 
@@ -242,6 +293,10 @@ refresh_roles_locked(void)
 	g_arb.roles.right = right;
 	g_arb.roles.left_profile = name_of(left_xdev);
 	g_arb.roles.right_profile = name_of(right_xdev);
+	g_arb.roles.hand_tracking.unobstructed.left = ht_ul;
+	g_arb.roles.hand_tracking.unobstructed.right = ht_ur;
+	g_arb.roles.hand_tracking.conforming.left = ht_cl;
+	g_arb.roles.hand_tracking.conforming.right = ht_cr;
 
 	U_LOG_W("input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), generation %u.",
 	        left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
@@ -289,6 +344,7 @@ t_input_arbiter_reset(void)
 
 	os_mutex_lock(&g_arb_mutex);
 	memset(&g_arb, 0, sizeof(g_arb));
+	g_arb.last_noted = -1;
 	g_arb.roles = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
 	os_mutex_unlock(&g_arb_mutex);
 }
@@ -327,7 +383,11 @@ note_candidate(const struct xrt_input_plugin_iface *iface,
 	cand->right = right;
 	cand->left_index = -1;
 	cand->right_index = -1;
+	for (int i = 0; i < 4; i++) {
+		cand->ht_indices[i] = -1;
+	}
 	g_arb.candidate_count++;
+	g_arb.last_noted = pos;
 }
 
 void
@@ -337,10 +397,34 @@ t_input_arbiter_note_provider_pair(const struct xrt_input_plugin_iface *iface,
                                    struct xrt_device *left,
                                    struct xrt_device *right)
 {
-	if (left == NULL && right == NULL) {
-		return; // Nothing to arbitrate with.
-	}
+	// A NULL/NULL pair is still noted: a provider may carry only
+	// hand-tracking devices (see note_provider_hand_tracking), and the
+	// candidate is the anchor those attach to.
 	note_candidate(iface, inst, probe_order, left, right);
+}
+
+void
+t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left,
+                                            struct xrt_device *unobstructed_right,
+                                            struct xrt_device *conforming_left,
+                                            struct xrt_device *conforming_right)
+{
+	// Attach to the most recently noted candidate — the builder calls
+	// this right after note_provider_pair for the same provider. The
+	// insertion sort keeps ties stable, but the newest candidate is not
+	// necessarily last, so find it by having empty HT slots AND being
+	// the highest insertion... simplest robust rule: the builder call
+	// order guarantees the newest candidate is the ONLY one whose HT
+	// slots are all still empty among this provider's — track it
+	// explicitly instead.
+	if (g_arb.last_noted < 0 || g_arb.last_noted >= g_arb.candidate_count) {
+		return;
+	}
+	struct t_input_candidate *cand = &g_arb.candidates[g_arb.last_noted];
+	cand->ht_devices[ARB_HT_UNOBSTRUCTED_LEFT] = unobstructed_left;
+	cand->ht_devices[ARB_HT_UNOBSTRUCTED_RIGHT] = unobstructed_right;
+	cand->ht_devices[ARB_HT_CONFORMING_LEFT] = conforming_left;
+	cand->ht_devices[ARB_HT_CONFORMING_RIGHT] = conforming_right;
 }
 
 void
@@ -393,6 +477,9 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		struct t_input_candidate *cand = &g_arb.candidates[i];
 		cand->left_index = index_of(xsysd, cand->left);
 		cand->right_index = index_of(xsysd, cand->right);
+		for (int k = 0; k < 4; k++) {
+			cand->ht_indices[k] = index_of(xsysd, cand->ht_devices[k]);
+		}
 		// Force a fresh verdict: the builder's own query may be older
 		// than the provider's startup grace.
 		cand->have_verdict = false;

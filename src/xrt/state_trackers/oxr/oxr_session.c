@@ -4048,6 +4048,12 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	//! Convert at_time to monotonic and give to device.
 	const int64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(inst->timekeeping, at_time);
 
+	// The hand-tracking source follows input-provider presence (ADR-034
+	// Amendment 3) — rebind the data-source devices if the roles moved.
+	// requested_sources[] holds pointers to the tracker's own source
+	// structs, so an in-place rebind propagates.
+	oxr_hand_tracker_resolve_sources(log, hand_tracker);
+
 	const struct oxr_hand_tracking_data_source *data_sources[ARRAY_SIZE(hand_tracker->requested_sources)] = {0};
 	memcpy(data_sources, hand_tracker->requested_sources, sizeof(data_sources));
 

@@ -172,6 +172,10 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 
 		struct xrt_device *prov_left = NULL;
 		struct xrt_device *prov_right = NULL;
+		struct xrt_device *ht_ul = NULL;
+		struct xrt_device *ht_ur = NULL;
+		struct xrt_device *ht_cl = NULL;
+		struct xrt_device *ht_cr = NULL;
 
 		for (uint32_t i = 0; i < count; i++) {
 			struct xrt_device *xdev = devs[i];
@@ -223,15 +227,41 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 				break;
 			}
 
-			// Hand-tracking roles are orthogonal to the controller
-			// roles: a device may claim either, both (ultraleap),
-			// or neither. These are STATIC roles by contract
-			// (`xrt_system_devices`), so unlike the controller
-			// roles they are not arbitrated — an absent optical
-			// tracker simply reports inactive joints, and qwerty
-			// has no hand tracking to fall back to anyway. First
-			// claimant across ALL providers wins.
+			// Hand-tracking roles: the STATIC roles
+			// (`xrt_system_devices` contract) seed extension
+			// support and are claimed first-claimant across ALL
+			// providers; the DYNAMIC copies in `xrt_system_roles`
+			// then follow provider presence via the arbiter, so
+			// the per-provider claimants are tracked too.
 			claim_hand_tracking_roles(ubrh, xdev);
+
+			if (xdev->supported.hand_tracking) {
+				for (uint32_t k = 0; k < xdev->input_count; k++) {
+					switch (xdev->inputs[k].name) {
+					case XRT_INPUT_HT_UNOBSTRUCTED_LEFT:
+						if (ht_ul == NULL) {
+							ht_ul = xdev;
+						}
+						break;
+					case XRT_INPUT_HT_UNOBSTRUCTED_RIGHT:
+						if (ht_ur == NULL) {
+							ht_ur = xdev;
+						}
+						break;
+					case XRT_INPUT_HT_CONFORMING_LEFT:
+						if (ht_cl == NULL) {
+							ht_cl = xdev;
+						}
+						break;
+					case XRT_INPUT_HT_CONFORMING_RIGHT:
+						if (ht_cr == NULL) {
+							ht_cr = xdev;
+						}
+						break;
+					default: break;
+					}
+				}
+			}
 
 			U_LOG_I("input provider builder: '%s' added device '%s' (type=%d)%s",
 			        iface->id != NULL ? iface->id : "?", xdev->str, (int)xdev->device_type,
@@ -245,6 +275,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		// once qwerty has been added too) makes the assignment
 		// re-resolve for the life of the process.
 		t_input_arbiter_note_provider_pair(iface, inst, priority, prov_left, prov_right);
+		t_input_arbiter_note_provider_hand_tracking(ht_ul, ht_ur, ht_cl, ht_cr);
 
 		if (first_left == NULL) {
 			first_left = prov_left;
