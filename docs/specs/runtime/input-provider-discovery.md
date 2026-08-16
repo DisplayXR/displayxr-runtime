@@ -127,6 +127,19 @@ and reports `PRESENT` wins; qwerty (always present, priority
 `UINT32_MAX`) is the floor. Roles therefore move provider→provider on
 plug/unplug, not just provider↔qwerty.
 
+**Profile stability (masquerade).** When the qwerty floor wins a hand on a
+box that HAS ranked providers, the arbiter reports the top provider's
+interaction profile instead of qwerty's own — qwerty carries
+binding-profile remaps for the common controller profiles
+(simple/touch/index/vive), so bindings still resolve. Combined with the
+change-only event rule in oxr, a provider↔qwerty hot-swap then emits **no
+`XrEventDataInteractionProfileChanged` at all**: apps see the pose source
+move and nothing else. This exists because real-world WebXR content
+(three.js `XRControllerModelFactory`) crashes its own render loop on
+repeated profile churn — see `docs/roadmap/input-modality-switching.md`
+§2. Provider-less boxes are bit-identical to before (full WMR qwerty);
+a provider whose profile qwerty cannot emulate is reported honestly.
+
 1. Input-provider loader runs **before** `t_builder_add_qwerty_input()`.
 2. If the active provider supplied a left/right pair **and reports
    `XRT_INPUT_PROVIDER_PRESENCE_PRESENT`** (or predates the
