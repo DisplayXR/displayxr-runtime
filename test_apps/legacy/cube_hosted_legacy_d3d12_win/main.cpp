@@ -141,13 +141,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Enumerated %u D3D12 swapchain images", count);
     }
 
-    // Determine swapchain format for RTV creation
-    DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    // Determine swapchain format for RTV creation.
+    //
+    // The runtime deliberately creates 8-bit colour swapchain resources as
+    // TYPELESS so it can pick the view interpretation itself
+    // (comp_d3d12_swapchain.cpp), and it then samples the atlas through an
+    // *_UNORM SRV -- no sRGB decode (comp_d3d12_compositor.cpp, "mirrors the
+    // GL skip-decode fix"). So the app must write raw UNORM to match.
+    //
+    // Resolving TYPELESS to *_UNORM_SRGB instead made the hardware sRGB-encode
+    // on write while the runtime still read the bytes as UNORM, double-encoding
+    // every colour: the 0.05/0.05/0.25 clear landed at #3F3F89 instead of
+    // #0D0D40, i.e. a washed-out purple rather than dark navy.
+    DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
     if (swapchainImages.size() > 0 && swapchainImages[0].texture != nullptr) {
         D3D12_RESOURCE_DESC desc = swapchainImages[0].texture->GetDesc();
         rtvFormat = desc.Format;
-        if (rtvFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS) rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        if (rtvFormat == DXGI_FORMAT_B8G8R8A8_TYPELESS) rtvFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if (rtvFormat == DXGI_FORMAT_R8G8B8A8_TYPELESS) rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (rtvFormat == DXGI_FORMAT_B8G8R8A8_TYPELESS) rtvFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
         LOG_INFO("Swapchain resource format: %u, RTV format: %u", (uint32_t)desc.Format, (uint32_t)rtvFormat);
     }
 
