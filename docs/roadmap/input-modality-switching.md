@@ -83,13 +83,24 @@ independent runs:
   own `WaitForSingleObjectEx`. Chrome simply stopped scheduling frames — it is
   not stuck in any `xr*` call.
 
-Leading theory for the Chrome side: the page's `inputsourceschange` handling —
-WebXR samples re-arm `requestAnimationFrame` inside the frame callback, and a
-controller-model/profile cache that goes stale on the second re-add of the same
-profile would throw and kill the loop. Cumulative state is definitely involved
-(first provider→qwerty flip always survives; the second never does). The
-prior teardown's `XR_ERROR_HANDLE_INVALID` double-destroys of input spaces
-point the same direction. Not yet confirmed from the page console.
+**Root cause CONFIRMED from the page console (2026-08-16):**
+
+```
+Uncaught TypeError: Cannot read properties of undefined (reading 'quaternion')
+    at XRControllerModelFactory.js:117
+    at XRControllerModel.updateMatrixWorld (XRControllerModelFactory.js:98)
+    at Scene.updateMatrixWorld (three.core.js:14388)
+```
+
+three.js's `XRControllerModelFactory` re-adds a **cached** motion-controller
+model whose visual-response scene nodes were disposed on the earlier removal;
+the throw inside `renderer.render()` kills the page's animation loop — hence
+zero further OpenXR calls and the black screen. That is why it is always the
+*third* flip: add(provider) → swap(qwerty, fresh model) → swap(provider,
+**stale cached model**) → throw. A three.js bug (worth filing upstream), not
+Chrome C++ and not the runtime; any page using `XRControllerModelFactory` —
+i.e. most three.js WebXR content — is exposed to it on ANY runtime that hot
+swaps interaction profiles.
 
 Interaction-profile transitions per `xrGetCurrentInteractionProfile` in that
 run: provider = `khr/simple_controller`, qwerty = `microsoft/motion_controller`.
