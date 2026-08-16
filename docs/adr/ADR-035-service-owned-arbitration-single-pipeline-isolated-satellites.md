@@ -202,6 +202,11 @@ macOS already has (one surface, one DP, N clients) plus the S1/S4-class bounded 
 D4's provider host is an AIDL-bound service; the `outOfProcess` flavor is built in CI and
 #510 folds into this plan.
 
+## Decisions confirmed (2026-08-16)
+
+- **Vendor DP stays in-process, fault-contained** (D4 option, not option 4). Confirmed by David: the DP is on the per-frame render hot path, needs the compositor's device+window, and every vendor SDK (SR, CNSDK) is built to link into the presenting process; guarded vtable calls + a duration watchdog + a DP-recreate path (#971) contain the fault class without a per-frame cross-process handoff.
+- **#943's `exit()` source is left to self-report** rather than hunted: the filed mechanism was dead code, and the #950 `[EXIT]` tripwire now names the calling thread+stack on recurrence while #952 refuses the worktree-DLL footgun that staged it.
+
 ## Consequences
 
 **Positive**
