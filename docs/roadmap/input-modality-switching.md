@@ -103,7 +103,12 @@ Keep the three layers, but make **A** presence-ranked like the DP loader and
 make **C** track **B**. One rule end to end: *the highest-priority modality
 whose hardware is present holds each role; qwerty is the floor.*
 
-### A. Multi-provider, presence-ranked activation (the "hierarchy")
+### A. Multi-provider, presence-ranked activation (the "hierarchy") — **SHIPPED 2026-08-15**
+
+Implemented as designed below (ADR-034 Amendment 3) and hardware-validated:
+`ultraleap(50) → sim-input(200) → qwerty` fell through the ranks on a real
+USB unplug and climbed back on replug, frames unbroken; the two-candidate
+config (no sim-input) still lands on qwerty.
 
 - Load **every** registered provider that ABI-passes, not just the first to
   probe. (Today the loader stops at the first success — change it to collect

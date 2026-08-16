@@ -121,142 +121,173 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		return XRT_SUCCESS;
 	}
 
-	const struct xrt_input_plugin_iface *iface = target_input_plugin_get_active();
-	if (iface == NULL) {
-		return XRT_SUCCESS; // No provider — qwerty claims the hand roles.
-	}
-	if (iface->create_devices == NULL) {
-		U_LOG_W("input provider builder: provider '%s' has no create_devices — ignoring.",
-		        iface->id != NULL ? iface->id : "?");
-		return XRT_SUCCESS;
-	}
+	// ADR-034 Amendment 3: every claiming provider's devices are created
+	// and stay resident; the arbiter ranks the pairs by ProbeOrder and
+	// the hand roles go to the highest-ranked candidate whose hardware
+	// is present, falling through the ranks before landing on qwerty.
+	int provider_count = target_input_plugin_get_count();
+	struct xrt_device *first_left = NULL;
+	struct xrt_device *first_right = NULL;
 
-	struct xrt_device *devs[XRT_INPUT_PLUGIN_MAX_DEVICES] = {0};
-	uint32_t max = XRT_INPUT_PLUGIN_MAX_DEVICES;
+	for (int p = 0; p < provider_count; p++) {
+		const struct xrt_input_plugin_iface *iface = target_input_plugin_get_iface(p);
+		struct xrt_input_plugin_instance *inst = target_input_plugin_get_instance(p);
+		uint32_t priority = target_input_plugin_get_priority(p);
 
-	// Never overflow the system device list — the head (and qwerty's
-	// three) still need slots after us.
-	uint32_t slots_free = 0;
-	if (xsysd->xdev_count < XRT_SYSTEM_MAX_DEVICES) {
-		slots_free = (uint32_t)(XRT_SYSTEM_MAX_DEVICES - xsysd->xdev_count);
-	}
-	if (slots_free < max) {
-		max = slots_free;
-	}
-	if (max == 0) {
-		U_LOG_W("input provider builder: no free device slots — skipping provider devices.");
-		return XRT_SUCCESS;
-	}
-
-	uint32_t count = 0;
-	xrt_result_t xret = iface->create_devices(target_input_plugin_get_active_instance(), devs, max, &count);
-	if (xret != XRT_SUCCESS || count == 0) {
-		U_LOG_W(
-		    "input provider builder: '%s' create_devices returned %d (count=%u) — "
-		    "qwerty keeps the hand roles.",
-		    iface->id != NULL ? iface->id : "?", (int)xret, count);
-		return XRT_SUCCESS; // Non-fatal by contract.
-	}
-	if (count > max) {
-		U_LOG_E("input provider builder: '%s' reported %u devices for a max of %u — clamping.",
-		        iface->id != NULL ? iface->id : "?", count, max);
-		count = max;
-	}
-
-	struct xrt_device *prov_left = NULL;
-	struct xrt_device *prov_right = NULL;
-
-	for (uint32_t i = 0; i < count; i++) {
-		struct xrt_device *xdev = devs[i];
-		if (xdev == NULL) {
+		if (iface == NULL || iface->create_devices == NULL) {
+			U_LOG_W("input provider builder: provider '%s' has no create_devices — ignoring.",
+			        iface != NULL && iface->id != NULL ? iface->id : "?");
 			continue;
 		}
 
-		xsysd->xdevs[xsysd->xdev_count++] = xdev;
+		struct xrt_device *devs[XRT_INPUT_PLUGIN_MAX_DEVICES] = {0};
+		uint32_t max = XRT_INPUT_PLUGIN_MAX_DEVICES;
 
-		// An input provider reports physically honest poses in its own
-		// tracking volume (ADR-034); anchoring that volume to the world
-		// is the runtime's job. On a 3D display the sensor sits on the
-		// same desk as the panel, so the volume is bolted to the rig:
-		// it follows voluntary navigation and ignores eye-tracked head
-		// parallax (ADR-034 Amendment 2). Qwerty is deliberately absent
-		// here — its controllers already follow the qwerty HMD.
-		if (ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
-			ubrh->rig_relative[ubrh->rig_relative_count++] = xdev;
+		// Never overflow the system device list — the head (and
+		// qwerty's three) still need slots after us.
+		uint32_t slots_free = 0;
+		if (xsysd->xdev_count < XRT_SYSTEM_MAX_DEVICES) {
+			slots_free = (uint32_t)(XRT_SYSTEM_MAX_DEVICES - xsysd->xdev_count);
 		}
-
-		// Devices self-describe via device_type (ADR-034). First
-		// claimant wins a role; ANY fills whichever hand is empty
-		// (left first, matching reader expectations elsewhere).
-		switch (xdev->device_type) {
-		case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
-			if (prov_left == NULL) {
-				prov_left = xdev;
-			}
-			break;
-		case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
-			if (prov_right == NULL) {
-				prov_right = xdev;
-			}
-			break;
-		case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
-			if (prov_left == NULL) {
-				prov_left = xdev;
-			} else if (prov_right == NULL) {
-				prov_right = xdev;
-			}
-			break;
-		default:
-			// Future device classes (generic trackers, …) ride
-			// along in the device list without claiming a role.
+		if (slots_free < max) {
+			max = slots_free;
+		}
+		if (max == 0) {
+			U_LOG_W("input provider builder: no free device slots — skipping remaining providers.");
 			break;
 		}
 
-		// Hand-tracking roles are orthogonal to the controller roles:
-		// a device may claim either, both (ultraleap), or neither.
-		// These are STATIC roles by contract (`xrt_system_devices`),
-		// so unlike the controller roles they are not arbitrated —
-		// an absent optical tracker simply reports inactive joints,
-		// and qwerty has no hand tracking to fall back to anyway.
-		claim_hand_tracking_roles(ubrh, xdev);
+		uint32_t count = 0;
+		xrt_result_t xret = iface->create_devices(inst, devs, max, &count);
+		if (xret != XRT_SUCCESS || count == 0) {
+			U_LOG_W("input provider builder: '%s' create_devices returned %d (count=%u) — skipping.",
+			        iface->id != NULL ? iface->id : "?", (int)xret, count);
+			continue; // Non-fatal by contract.
+		}
+		if (count > max) {
+			U_LOG_E("input provider builder: '%s' reported %u devices for a max of %u — clamping.",
+			        iface->id != NULL ? iface->id : "?", count, max);
+			count = max;
+		}
 
-		U_LOG_I("input provider builder: added device '%s' (type=%d)%s", xdev->str, (int)xdev->device_type,
-		        (prov_left == xdev)    ? " [left]"
-		        : (prov_right == xdev) ? " [right]"
-		                               : "");
+		struct xrt_device *prov_left = NULL;
+		struct xrt_device *prov_right = NULL;
+
+		for (uint32_t i = 0; i < count; i++) {
+			struct xrt_device *xdev = devs[i];
+			if (xdev == NULL) {
+				continue;
+			}
+
+			xsysd->xdevs[xsysd->xdev_count++] = xdev;
+
+			// An input provider reports physically honest poses in
+			// its own tracking volume (ADR-034); anchoring that
+			// volume to the world is the runtime's job. On a 3D
+			// display the sensor sits on the same desk as the
+			// panel, so the volume is bolted to the rig: it follows
+			// voluntary navigation and ignores eye-tracked head
+			// parallax (ADR-034 Amendment 2). Qwerty is
+			// deliberately absent here — its controllers already
+			// follow the qwerty HMD.
+			if (ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
+				ubrh->rig_relative[ubrh->rig_relative_count++] = xdev;
+			}
+
+			// Devices self-describe via device_type (ADR-034).
+			// First claimant wins a role; ANY fills whichever hand
+			// is empty (left first, matching reader expectations
+			// elsewhere).
+			switch (xdev->device_type) {
+			case XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER:
+				if (prov_left == NULL) {
+					prov_left = xdev;
+				}
+				break;
+			case XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER:
+				if (prov_right == NULL) {
+					prov_right = xdev;
+				}
+				break;
+			case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
+				if (prov_left == NULL) {
+					prov_left = xdev;
+				} else if (prov_right == NULL) {
+					prov_right = xdev;
+				}
+				break;
+			default:
+				// Future device classes (generic trackers, …)
+				// ride along in the device list without
+				// claiming a role.
+				break;
+			}
+
+			// Hand-tracking roles are orthogonal to the controller
+			// roles: a device may claim either, both (ultraleap),
+			// or neither. These are STATIC roles by contract
+			// (`xrt_system_devices`), so unlike the controller
+			// roles they are not arbitrated — an absent optical
+			// tracker simply reports inactive joints, and qwerty
+			// has no hand tracking to fall back to anyway. First
+			// claimant across ALL providers wins.
+			claim_hand_tracking_roles(ubrh, xdev);
+
+			U_LOG_I("input provider builder: '%s' added device '%s' (type=%d)%s",
+			        iface->id != NULL ? iface->id : "?", xdev->str, (int)xdev->device_type,
+			        (prov_left == xdev)    ? " [left]"
+			        : (prov_right == xdev) ? " [right]"
+			                               : "");
+		}
+
+		// Hand this provider's pair to the arbiter with its identity
+		// and rank; `t_input_arbiter_install()` (called by the builder
+		// once qwerty has been added too) makes the assignment
+		// re-resolve for the life of the process.
+		t_input_arbiter_note_provider_pair(iface, inst, priority, prov_left, prov_right);
+
+		if (first_left == NULL) {
+			first_left = prov_left;
+		}
+		if (first_right == NULL) {
+			first_right = prov_right;
+		}
+
+		g_provider_claimed_left |= prov_left != NULL;
+		g_provider_claimed_right |= prov_right != NULL;
+
+		U_LOG_W("input provider builder: provider '%s' (priority %u) supplied %u device(s)%s%s.",
+		        iface->id != NULL ? iface->id : "?", priority, count,
+		        prov_left != NULL ? " — left supplied" : "", prov_right != NULL ? ", right supplied" : "");
 	}
 
-	// Hand the pair to the arbiter and take the roles only if the
-	// hardware is actually there right now. Both pairs stay in the
-	// device list either way; `t_input_arbiter_install()` (called by the
-	// builder once qwerty has been added too) makes the assignment
-	// re-resolve for the life of the process.
-	t_input_arbiter_note_provider_pair(prov_left, prov_right);
-
+	// The static role seed: the highest-ranked pair, taken only if any
+	// provider hardware is actually there right now. The arbiter refines
+	// per-hand and re-resolves from the first xrSyncActions on.
 	const bool holds = t_input_arbiter_provider_holds_roles();
 	if (holds) {
 		if (ubrh->left == NULL) {
-			ubrh->left = prov_left;
+			ubrh->left = first_left;
 		}
 		if (ubrh->right == NULL) {
-			ubrh->right = prov_right;
+			ubrh->right = first_right;
 		}
 	}
 
-	g_provider_claimed_left = prov_left != NULL;
-	g_provider_claimed_right = prov_right != NULL;
 	g_provider_claimed_ht_left =
 	    ubrh->hand_tracking.unobstructed.left != NULL || ubrh->hand_tracking.conforming.left != NULL;
 	g_provider_claimed_ht_right =
 	    ubrh->hand_tracking.unobstructed.right != NULL || ubrh->hand_tracking.conforming.right != NULL;
 
-	U_LOG_W(
-	    "input provider builder: provider '%s' supplied %u device(s)%s%s%s%s; hardware %s — %s holds the hand "
-	    "roles.",
-	    iface->id != NULL ? iface->id : "?", count, g_provider_claimed_left ? " — left supplied" : "",
-	    g_provider_claimed_right ? ", right supplied" : "", g_provider_claimed_ht_left ? ", ht-left claimed" : "",
-	    g_provider_claimed_ht_right ? ", ht-right claimed" : "", holds ? "present" : "absent",
-	    holds ? "the provider" : "qwerty");
+	if (provider_count > 0) {
+		U_LOG_W(
+		    "input provider builder: %d provider(s) resident%s%s%s%s; hardware %s — %s holds the hand roles.",
+		    provider_count, g_provider_claimed_left ? " — left supplied" : "",
+		    g_provider_claimed_right ? ", right supplied" : "",
+		    g_provider_claimed_ht_left ? ", ht-left claimed" : "",
+		    g_provider_claimed_ht_right ? ", ht-right claimed" : "", holds ? "present" : "absent",
+		    holds ? "a provider" : "qwerty");
+	}
 
 	return XRT_SUCCESS;
 }

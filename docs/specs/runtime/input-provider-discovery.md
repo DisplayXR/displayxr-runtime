@@ -106,19 +106,26 @@ ones by `id`, as in the DP loader.
 
 ### Selection
 
-Entries sorted by ProbeOrder ascending; **first provider whose `probe()`
-succeeds wins** and is cached for the process lifetime (v1 = single active
-provider; multi-provider composition is explicitly deferred — see ADR-034).
-No registered provider is not an error: the builder falls back to qwerty.
+Entries sorted by ProbeOrder ascending; **every provider whose `probe()`
+succeeds stays resident** for the process lifetime (ADR-034 *Amendment 3* —
+this replaced the v1 first-wins rule). ProbeOrder is the provider's
+arbitration priority, exactly the DP loader's convention: lower wins. The
+ranked list is exposed via `target_input_plugin_get_count()/get_iface(i)`;
+`get_active()` aliases index 0. No registered provider is not an error: the
+builder falls back to qwerty.
 
 ## 4. Role arbitration (builder contract)
 
 In `target_builder_sim_display.c`:
 
-Arbitration is **presence-gated and dynamic** (ADR-034 *Amendment 1*). The
-devices are static — both candidate pairs are created once and both live
-in `xsysd->xdevs` — but which pair holds the hand roles is re-resolved for
-the life of the process.
+Arbitration is **presence-gated, dynamic and ranked** (ADR-034
+*Amendments 1 + 3*). The devices are static — every claiming provider's
+pair plus qwerty's is created once and all live in `xsysd->xdevs` — but
+which pair holds each hand role is re-resolved for the life of the
+process: per hand, the highest-priority candidate that supplies that hand
+and reports `PRESENT` wins; qwerty (always present, priority
+`UINT32_MAX`) is the floor. Roles therefore move provider→provider on
+plug/unplug, not just provider↔qwerty.
 
 1. Input-provider loader runs **before** `t_builder_add_qwerty_input()`.
 2. If the active provider supplied a left/right pair **and reports
