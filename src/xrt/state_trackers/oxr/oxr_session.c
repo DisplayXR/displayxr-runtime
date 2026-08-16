@@ -2571,8 +2571,33 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// touched; and apps that DO chain a rig take the override path and
 		// never reach here. That leaves exactly the broken class — a plain
 		// hosted app on the service.
+		//
+		// ...but NOT for Chrome WebXR. The world-absolute pose above is a
+		// concession to our in-tree hosted apps, which hardcode their content
+		// at the world standing height (the hosted cube is drawn at y=1.6) and
+		// so need a camera at y≈1.7 to see it. A standards-compliant app has
+		// no such convention: XrView.pose is specified relative to
+		// XrViewLocateInfo::space, and Chrome uses that space for EVERYTHING
+		// it owns — it renders with XRView.transform but positions its
+		// controllers, hit tests and content from base-space getPose()
+		// results. Re-adding the rig height there puts the camera 1.6 m above
+		// every pose Chrome has, so the qwerty controllers (base-space
+		// y = -0.30) sit ~2 m below the eye and their rays never enter the
+		// frustum — WebXR controllers simply vanish.
+		//
+		// Measured on the dev box before this exclusion: XrViewerPose
+		// head=(0,0,0) but XrView eye=(0,1.700,0) in the same LOCAL space, and
+		// a marker drawn dead ahead at eye level projected to NDC y=-2.46.
+		// After: eye=(0,0.100,0) — the 0.1 m nominal eye height above the
+		// head — and the controllers land just below centre where their rays
+		// cross the view.
+		//
+		// `is_appcontainer` (XR_EXT_win32_appcontainer_compatible, which
+		// Chrome enables because it is sandboxed and handle apps do not) is
+		// the same discriminator ipc_server_handler.c already uses to tell
+		// Chrome apart from a handle app for the qwerty head transform.
 		const bool hosted_ipc_world_absolute =
-		    !server_display_relative && !have_eyes && !have_eye_override &&
+		    !server_display_relative && !have_eyes && !have_eye_override && !sess->is_appcontainer &&
 		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
 		    !sess->sys->xsysc->info.workspace_mode && !sess->has_external_window &&
 		    !sess->is_bridge_relay;
