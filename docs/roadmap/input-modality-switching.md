@@ -165,7 +165,15 @@ Recommend (1) for the target design, (2) as the honest interim. ((2) was
 cleared as a freeze suspect — the native app validates flips with HT roles
 static.)
 
-### Mitigation candidate born from the §2 investigation — uniform profile
+### Mitigation candidate born from the §2 investigation — uniform profile — **SHIPPED 2026-08-16 (masquerade form)**
+
+Shipped as the arbiter-level masquerade: when the qwerty floor wins a hand on
+a provider-equipped box, it reports the top provider's profile (qwerty's
+binding-profile remaps serve the bindings). Hardware-validated against the
+previously-freezing Chrome page: six flips, zero events delivered, page
+survived. The *general* sticky-profile mechanism (rich-profile providers
+like Quest `oculus/touch` vs the floor) remains future work — tracked in a
+dedicated issue.
 
 Real-world WebXR content demonstrably breaks on repeated interaction-profile
 changes. The hierarchy design should weigh presenting a **uniform interaction

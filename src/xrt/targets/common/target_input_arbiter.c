@@ -256,6 +256,64 @@ provider_holds_roles_locked(void)
 }
 
 /*!
+ * The interaction profile to REPORT for @p winner's device on one hand.
+ *
+ * Profile stability: real-world WebXR content (three.js
+ * `XRControllerModelFactory`) breaks outright on interaction-profile
+ * churn — it re-adds a stale cached controller model on the second
+ * re-add of a profile and the throw kills the page's render loop. So
+ * when the qwerty floor wins a hand on a box that HAS ranked providers,
+ * report the top provider's profile instead of qwerty's own — qwerty
+ * carries binding-profile remaps for the common controller profiles
+ * (simple/touch/index/vive), so the bindings still resolve. Combined
+ * with the change-only event rule in oxr, a provider↔qwerty flip then
+ * emits no XrEventDataInteractionProfileChanged at all: apps see the
+ * pose source move, and nothing else.
+ *
+ * Falls back to the device's own name when there is no provider to
+ * mirror or qwerty cannot emulate its profile. Provider-less boxes are
+ * bit-identical to before. Caller holds the mutex.
+ */
+static enum xrt_device_name
+profile_to_report_locked(const struct t_input_candidate *winner, struct xrt_device *xdev, bool want_left)
+{
+	if (winner == NULL || xdev == NULL) {
+		return XRT_DEVICE_INVALID;
+	}
+	if (winner->iface != NULL) {
+		return xdev->name; // A real provider reports itself.
+	}
+
+	// The floor won: find the top-ranked provider candidate's device
+	// for this hand (either hand as a fallback — the profile is a
+	// device-class statement, not a handedness one).
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		const struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->iface == NULL) {
+			continue;
+		}
+		struct xrt_device *prov = want_left ? cand->left : cand->right;
+		if (prov == NULL) {
+			prov = want_left ? cand->right : cand->left;
+		}
+		if (prov == NULL) {
+			continue;
+		}
+
+		// Only masquerade if the floor device can actually serve the
+		// provider's profile through a binding-profile remap.
+		for (size_t k = 0; k < xdev->binding_profile_count; k++) {
+			if (xdev->binding_profiles[k].name == prov->name) {
+				return prov->name;
+			}
+		}
+		break; // Top provider found but not emulatable — be honest.
+	}
+
+	return xdev->name;
+}
+
+/*!
  * Recompute @ref t_input_arbiter::roles for the current verdict, bumping
  * `generation_id` only when the assignment actually changes. Caller holds
  * the mutex.
@@ -291,8 +349,8 @@ refresh_roles_locked(void)
 	g_arb.roles.generation_id = generation;
 	g_arb.roles.left = left;
 	g_arb.roles.right = right;
-	g_arb.roles.left_profile = name_of(left_xdev);
-	g_arb.roles.right_profile = name_of(right_xdev);
+	g_arb.roles.left_profile = profile_to_report_locked(left_cand, left_xdev, true);
+	g_arb.roles.right_profile = profile_to_report_locked(right_cand, right_xdev, false);
 	g_arb.roles.hand_tracking.unobstructed.left = ht_ul;
 	g_arb.roles.hand_tracking.unobstructed.right = ht_ur;
 	g_arb.roles.hand_tracking.conforming.left = ht_cl;
