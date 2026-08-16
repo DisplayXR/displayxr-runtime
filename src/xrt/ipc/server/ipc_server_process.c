@@ -36,6 +36,12 @@
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_peer_creds.h"
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#include "d3d11_service/comp_d3d11_service.h" // #962: focused-slot authority
+#elif defined(XRT_OS_MACOS)
+#include "multi/comp_multi_workspace.h" // #962: focused-client authority
+#endif
+
 #include <stdlib.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -620,13 +626,16 @@ emit_health_if_elapsed(struct ipc_server *s)
 		    "swapchains=%u spaces=%u",
 		    i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
 		    cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
-		    cs->primary_application ? 'y' : 'n', ((int32_t)cs->id == active_idx) ? " ACTIVE" : "",
+		    cs->primary_application ? 'y' : 'n', ((int32_t)i == active_idx) ? " ACTIVE" : "",
 		    ics->swapchain_count, ics->space_count);
 	}
 	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d window_s=%ld", active, s->max_clients, active_idx,
 	        period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
+
+static void
+sync_focus_from_compositor(struct ipc_server *s); // #962, defined below
 
 static int
 main_loop(struct ipc_server *s)
@@ -652,6 +661,9 @@ main_loop(struct ipc_server *s)
 				}
 			}
 		}
+
+		// #962: mirror the compositor's focus into the IPC layer (controller policy).
+		sync_focus_from_compositor(s);
 
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
@@ -700,6 +712,83 @@ handle_overlay_client_events(volatile struct ipc_client_state *ics, int active_i
 	}
 }
 
+/*
+ *
+ * #962: ONE focus authority.
+ *
+ * With a CONTROLLER connected, focus is the compositor's focused slot (the
+ * shell's xrSetWorkspaceFocusedClientDXR, click-to-focus, TAB, modal-close
+ * auto-refocus, hide/evict clearing) — the IPC layer's active_client_index is a
+ * DERIVED read, refreshed from the mainloop by sync_focus_from_compositor().
+ * Without a controller the built-in default policy applies: the newest
+ * presenting client (first predict_frame) holds focus. Nothing else promotes.
+ *
+ */
+
+// Caller holds global_state.lock.
+static bool
+controller_connected_locked(struct ipc_server *s)
+{
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->server_thread_index >= 0 && ics->class_verified &&
+		    ics->client_state.client_class == XRT_CLIENT_CLASS_CONTROLLER) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The compositor's focused client, as an xrt_compositor pointer for identity
+// matching against ics->xc (never dereferenced). NULL = none / no authority.
+// Takes the compositor's own lock — call OUTSIDE global_state.lock.
+static struct xrt_compositor *
+compositor_focused_xc(struct ipc_server *s)
+{
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	return s->xsysc != NULL ? comp_d3d11_service_get_focused_xc(s->xsysc) : NULL;
+#elif defined(XRT_OS_MACOS)
+	(void)s;
+	return comp_multi_workspace_get_focused_client();
+#else
+	(void)s;
+	return NULL;
+#endif
+}
+
+static void
+update_server_state_locked(struct ipc_server *s);
+
+// Mainloop tick (20 Hz): mirror the compositor's focus into active_client_index
+// and flush session-state events on change. Reads the compositor first (its
+// lock), then takes global_state.lock — no nesting.
+static void
+sync_focus_from_compositor(struct ipc_server *s)
+{
+	struct xrt_compositor *xc = compositor_focused_xc(s);
+
+	os_mutex_lock(&s->global_state.lock);
+	if (!controller_connected_locked(s)) {
+		os_mutex_unlock(&s->global_state.lock);
+		return; // default policy owns focus
+	}
+	int idx = -1;
+	if (xc != NULL) {
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->server_thread_index >= 0 && ics->xc == xc) {
+				idx = (int)i;
+				break;
+			}
+		}
+	}
+	if (idx != s->global_state.active_client_index) {
+		s->global_state.active_client_index = idx;
+		update_server_state_locked(s);
+	}
+	os_mutex_unlock(&s->global_state.lock);
+}
+
 static void
 handle_focused_client_events(volatile struct ipc_client_state *ics, int active_id, int prev_active_id)
 {
@@ -710,16 +799,28 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	bool focused = false;
 	bool visible = false;
 
-	// Set visible + focused if we are the primary application.
-	// In workspace mode, ALL clients are visible + focused (multi-app compositor).
+	// Set visible + focused if we are the active (focused) client.
 	if (ics->server_thread_index == active_id) {
 		visible = true;
 		focused = true;
 		z_order = INT64_MIN;
 	}
+	// #962: under a workspace every slot is composited (VISIBLE), but only the
+	// controller-focused one is FOCUSED. (Before #962 every client was forced
+	// FOCUSED here, so no client ever left FOCUSED and every client's actions /
+	// hand tracking stayed live — two focus authorities, none enforced.)
 	if (ics->server->xsysc != NULL && ics->server->xsysc->info.workspace_mode) {
 		visible = true;
-		focused = true;
+	}
+	// #962: the controller and relays are never gated by app focus — the
+	// controller drives its own actions while an app is focused; a relay is
+	// headless and forwards for a remote session.
+	{
+		uint32_t cls = ics->client_state.client_class;
+		if (cls == XRT_CLIENT_CLASS_CONTROLLER || cls == XRT_CLIENT_CLASS_RELAY) {
+			visible = true;
+			focused = true;
+		}
 	}
 
 	// Set all overlays to always active and focused.
@@ -783,34 +884,50 @@ update_server_state_locked(struct ipc_server *s)
 	//, or finally to the idle 'wallpaper' images.
 
 
-	bool set_idle = true;
-	int fallback_active_application = -1;
-
-	// do we have a fallback application?
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		if (ics->client_state.session_overlay == false && ics->server_thread_index >= 0 &&
-		    ics->client_state.session_active) {
-			fallback_active_application = i;
-			set_idle = false;
+	if (controller_connected_locked(s)) {
+		// #962 controller policy: focus is the compositor's focused slot, mirrored
+		// into active_client_index by sync_focus_from_compositor() on the
+		// mainloop. Never fall back to "some other session" here — the controller
+		// decides; an empty focus is a legitimate state (VISIBLE, not FOCUSED).
+		// Only drop an index whose client is gone.
+		if (s->global_state.active_client_index >= 0) {
+			volatile struct ipc_client_state *ics = &s->threads[s->global_state.active_client_index].ics;
+			if (ics->server_thread_index < 0 || ics->client_state.session_overlay) {
+				s->global_state.active_client_index = -1;
+			}
 		}
-	}
+	} else {
+		// #962 default policy (no controller): the newest presenting client holds
+		// focus; when it goes away fall back to the most recent session-active
+		// client, else idle. (This is the inherited Monado behaviour.)
+		bool set_idle = true;
+		int fallback_active_application = -1;
 
-	// if there is a currently-set active primary application and it is not
-	// actually active/displayable, use the fallback application
-	// instead.
-	if (s->global_state.active_client_index >= 0) {
-		volatile struct ipc_client_state *ics = &s->threads[s->global_state.active_client_index].ics;
-		if (!(ics->client_state.session_overlay == false && ics->client_state.session_active)) {
-			s->global_state.active_client_index = fallback_active_application;
+		// do we have a fallback application?
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			volatile struct ipc_client_state *ics = &s->threads[i].ics;
+			if (ics->client_state.session_overlay == false && ics->server_thread_index >= 0 &&
+			    ics->client_state.session_active) {
+				fallback_active_application = i;
+				set_idle = false;
+			}
 		}
-	}
 
+		// if there is a currently-set active primary application and it is not
+		// actually active/displayable, use the fallback application
+		// instead.
+		if (s->global_state.active_client_index >= 0) {
+			volatile struct ipc_client_state *ics = &s->threads[s->global_state.active_client_index].ics;
+			if (!(ics->client_state.session_overlay == false && ics->client_state.session_active)) {
+				s->global_state.active_client_index = fallback_active_application;
+			}
+		}
 
-	// if we have no applications to fallback to, enable the idle
-	// wallpaper.
-	if (set_idle) {
-		s->global_state.active_client_index = -1;
+		// if we have no applications to fallback to, enable the idle
+		// wallpaper.
+		if (set_idle) {
+			s->global_state.active_client_index = -1;
+		}
 	}
 
 	flush_state_to_all_clients_locked(s);
@@ -989,14 +1106,31 @@ ipc_server_activate_session(volatile struct ipc_client_state *ics)
 		                             s->global_state.last_active_client_index);
 		handle_overlay_client_events(ics, s->global_state.active_client_index,
 		                             s->global_state.last_active_client_index);
-	} else {
-		// Update active client
+	} else if (!controller_connected_locked(s)) {
+		// #962 default policy: the newest presenting client takes focus.
 		set_active_client_locked(s, ics->client_state.id);
 
 		// For new active regular sessions update all clients.
 		update_server_state_locked(s);
 	}
+	// #962: with a controller connected, predict_frame promotes nobody — focus
+	// is the compositor's and is mirrored by sync_focus_from_compositor().
 
+	os_mutex_unlock(&s->global_state.lock);
+}
+
+void
+ipc_server_client_initial_state(volatile struct ipc_client_state *ics, bool *out_visible, bool *out_focused)
+{
+	struct ipc_server *s = ics->server;
+
+	os_mutex_lock(&s->global_state.lock);
+	handle_focused_client_events(ics, s->global_state.active_client_index,
+	                             s->global_state.last_active_client_index);
+	handle_overlay_client_events(ics, s->global_state.active_client_index,
+	                             s->global_state.last_active_client_index);
+	*out_visible = ics->client_state.session_visible;
+	*out_focused = ics->client_state.session_focused;
 	os_mutex_unlock(&s->global_state.lock);
 }
 
@@ -1009,17 +1143,6 @@ ipc_server_deactivate_session(volatile struct ipc_client_state *ics)
 	os_mutex_lock(&s->global_state.lock);
 
 	ics->client_state.session_active = false;
-
-	update_server_state_locked(s);
-
-	os_mutex_unlock(&s->global_state.lock);
-}
-
-void
-ipc_server_update_state(struct ipc_server *s)
-{
-	// Multiple threads could call this at the same time.
-	os_mutex_lock(&s->global_state.lock);
 
 	update_server_state_locked(s);
 

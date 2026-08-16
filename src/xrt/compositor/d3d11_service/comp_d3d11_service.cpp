@@ -17201,6 +17201,33 @@ comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
 	return mc->focused_slot;
 }
 
+extern "C" struct xrt_compositor *
+comp_d3d11_service_get_focused_xc(struct xrt_system_compositor *xsysc)
+{
+	// #962: identity-only view of the focused slot for the IPC layer's focus
+	// mirror (see ipc_server_process.c sync_focus_from_compositor).
+	if (xsysc == nullptr) {
+		return nullptr;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return nullptr;
+	}
+	render_mutex_fair_lock lock(sys);
+	int32_t s = mc->focused_slot;
+	if (s < 0 || s >= D3D11_MULTI_MAX_CLIENTS) {
+		return nullptr;
+	}
+	const d3d11_multi_client_slot &slot = mc->clients[s];
+	if (!slot.active || slot.client_type != CLIENT_TYPE_IPC || slot.compositor == nullptr) {
+		return nullptr;
+	}
+	// ics->xc is &xcn->base (the xrt_compositor inside xrt_compositor_native,
+	// which is the first member of d3d11_service_compositor).
+	return &slot.compositor->base.base;
+}
+
 extern "C" void
 comp_d3d11_service_set_client_modal_state(struct xrt_system_compositor *xsysc, int slot, bool is_open)
 {

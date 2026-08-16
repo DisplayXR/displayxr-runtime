@@ -769,6 +769,17 @@ int
 comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #962: the focused slot's client compositor as an `xrt_compositor *` for
+ * POINTER-IDENTITY matching against `ipc_client_state.xc` — never dereference
+ * it. NULL when nothing is focused, the focused slot is a capture (non-IPC)
+ * client, or workspace mode is off. Takes render_mutex; call it OUTSIDE
+ * global_state.lock. This is how the IPC layer derives its active client from
+ * the one focus authority.
+ */
+struct xrt_compositor *
+comp_d3d11_service_get_focused_xc(struct xrt_system_compositor *xsysc);
+
+/*!
  * spec_version 10: mark slot @p slot as having a Win32 modal popup open
  * (@p is_open = true) or closed (false). Called from
  * ipc_handle_session_set_modal_state when an app-side CBT hook
