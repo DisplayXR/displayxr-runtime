@@ -34,6 +34,7 @@
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
 #include "server/ipc_server_interface.h"
+#include "server/ipc_server_peer_creds.h"
 
 #include <stdlib.h>
 #include <stdbool.h>
@@ -1062,8 +1063,17 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	// Reset everything.
 	U_ZERO((struct ipc_client_state *)ics);
 
+	// #954: derive the peer identity from the OS now, while the handle is
+	// freshly connected. This is what the authorization gates compare against
+	// (client_state.pid mirrors it); the client-sent pid becomes informational.
+	uint64_t peer_create_ns = 0;
+	long peer_pid = ipc_server_derive_peer_pid(ipc_handle, &peer_create_ns);
+
 	// Set state.
 	ics->client_state.id = id;
+	ics->peer_pid = peer_pid;
+	ics->peer_create_ns = peer_create_ns;
+	ics->client_state.pid = (int)peer_pid;
 	ics->imc.ipc_handle = ipc_handle;
 	ics->server = vs;
 	ics->server_thread_index = cs_index;

@@ -159,6 +159,13 @@ struct ipc_client_state
 	int server_thread_index;
 
 	xrt_shmem_handle_t ism_handle;
+
+	//! #954: OS-derived peer identity, set once at accept. peer_pid is the
+	//! authoritative PID (client_state.pid mirrors it); 0 = could not derive
+	//! (privileged gates must fail closed). peer_create_ns defends against PID
+	//! reuse (Windows; 0 elsewhere / low-integrity peer).
+	long peer_pid;
+	uint64_t peer_create_ns;
 };
 
 enum ipc_thread_state

@@ -116,6 +116,8 @@ add_library(
 	server/ipc_server.h
 	server/ipc_server_handler.c
 	server/ipc_server_per_client_thread.c
+	server/ipc_server_peer_creds.c
+	server/ipc_server_peer_creds.h
 	server/ipc_server_process.c
 	)
 target_include_directories(

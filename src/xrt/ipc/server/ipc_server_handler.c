@@ -1655,8 +1655,18 @@ xrt_result_t
 ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
                                     const struct ipc_client_description *client_desc)
 {
+	// #954: the client-sent pid is NO LONGER authoritative — client_state.pid is
+	// the OS-derived peer pid, set at accept. Keep the client's claim only as a
+	// diagnostic, and log loudly when it disagrees (a spoof attempt, or just an
+	// app that reported the wrong pid). The gates read client_state.pid, so this
+	// handler must not overwrite it.
+	if (ics->peer_pid != 0 && (long)client_desc->pid != ics->peer_pid) {
+		IPC_WARN(ics->server,
+		         "describe_client: client claims pid %i but the OS-derived peer pid is %ld — "
+		         "ignoring the claim (#954).",
+		         client_desc->pid, ics->peer_pid);
+	}
 	ics->client_state.info = client_desc->info;
-	ics->client_state.pid = client_desc->pid;
 
 	struct u_pp_sink_stack_only sink;
 	u_pp_delegate_t dg = u_pp_sink_stack_only_init(&sink);
@@ -1669,7 +1679,7 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	P("Client info:");
 	PNT("id: %u", ics->client_state.id);
 	PNT("application_name: '%s'", client_desc->info.application_name);
-	PNT("pid: %i", client_desc->pid);
+	PNT("pid: %ld (OS-derived; claimed %i)", ics->peer_pid, client_desc->pid);
 	PNT("extensions:");
 
 	EXT(ext_hand_tracking_enabled);
