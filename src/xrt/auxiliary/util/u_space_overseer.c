@@ -15,6 +15,7 @@
 
 #include "os/os_time.h"
 
+#include "math/m_api.h"
 #include "math/m_space.h"
 
 #include "util/u_misc.h"
@@ -42,6 +43,13 @@ enum u_space_type
 	U_SPACE_TYPE_POSE,
 	U_SPACE_TYPE_OFFSET,
 	U_SPACE_TYPE_ROOT,
+
+	/*!
+	 * The rig delta — how far the voluntary rig (fly camera / display
+	 * rig) has TRAVELLED since the session started. See the rig source
+	 * fields on @ref u_space_overseer for the why.
+	 */
+	U_SPACE_TYPE_RIG,
 };
 
 /*!
@@ -118,6 +126,40 @@ struct u_space_overseer
 	 * Create independent local and local_floor per application
 	 */
 	bool per_app_local_spaces;
+
+	/*!
+	 * @name Rig composition
+	 *
+	 * On a 3D display the viewer, the panel and any desk-mounted input
+	 * hardware are ONE physical assembly — the "rig". Navigating moves
+	 * the whole assembly through the world; the viewer's head moving
+	 * *about* the panel does not. So a device whose tracking volume is
+	 * bolted to the rig must follow **voluntary** rig motion (WASD,
+	 * mouse-look) and must NOT follow eye-tracked head parallax.
+	 *
+	 * The rig source is the head *device* pose, which is exactly the
+	 * voluntary fly camera — eye tracking is applied later, at view-pose
+	 * level, so parallax is excluded for free.
+	 *
+	 * The composition is a travelled DELTA, not head-parenting:
+	 *
+	 *     world = (rig_now * inverse(rig_initial)) * device_volume
+	 *
+	 * Parenting to the head instead would double-count the standing
+	 * height and hang the hands off the viewer's face.
+	 * @{
+	 */
+
+	//! Pose space of the rig source, or NULL for no rig composition.
+	struct u_space *rig_source;
+
+	//! Where the rig was when composition was armed; never changes.
+	struct xrt_pose rig_initial;
+
+	//! The single rig-delta space, parented to root. Owned reference.
+	struct u_space *rig_space;
+
+	/*! @} */
 };
 
 
@@ -310,6 +352,47 @@ notify_ref_space_usage_device(struct u_space_overseer *uso, enum xrt_reference_s
  *
  */
 
+static void
+push_then_traverse(struct u_space_overseer *uso,
+                   struct xrt_relation_chain *xrc,
+                   struct u_space *space,
+                   int64_t at_timestamp_ns);
+
+/*!
+ * How far the rig has TRAVELLED since composition was armed, in root space —
+ * `rig_now * inverse(rig_initial)`. Returns false when there is no rig source
+ * or it isn't reporting a pose, in which case nothing should be composed.
+ *
+ * Must be called with at least the read lock held.
+ */
+static bool
+get_rig_delta_read_locked(struct u_space_overseer *uso, int64_t at_timestamp_ns, struct xrt_pose *out_delta)
+{
+	if (uso->rig_source == NULL) {
+		return false;
+	}
+
+	// The rig source hangs off the root, never off the rig space, so
+	// this can't recurse back into us — asserted in the setter.
+	struct xrt_relation_chain xrc = {0};
+	push_then_traverse(uso, &xrc, uso->rig_source, at_timestamp_ns);
+
+	struct xrt_space_relation rig_now;
+	m_relation_chain_resolve(&xrc, &rig_now);
+
+	const enum xrt_space_relation_flags needed =
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+	if ((rig_now.relation_flags & needed) != needed) {
+		return false; // A rig with no pose hasn't travelled anywhere.
+	}
+
+	struct xrt_pose inv_initial;
+	math_pose_invert(&uso->rig_initial, &inv_initial);
+	math_pose_transform(&rig_now.pose, &inv_initial, out_delta);
+
+	return true;
+}
+
 /*!
  * For each space, push the relation of that space and then traverse by calling
  * @p push_then_traverse again with the parent space. That means traverse goes
@@ -317,7 +400,10 @@ notify_ref_space_usage_device(struct u_space_overseer *uso, enum xrt_reference_s
  * order.
  */
 static void
-push_then_traverse(struct xrt_relation_chain *xrc, struct u_space *space, int64_t at_timestamp_ns)
+push_then_traverse(struct u_space_overseer *uso,
+                   struct xrt_relation_chain *xrc,
+                   struct u_space *space,
+                   int64_t at_timestamp_ns)
 {
 	switch (space->type) {
 	case U_SPACE_TYPE_NULL: break; // No-op
@@ -330,12 +416,18 @@ push_then_traverse(struct xrt_relation_chain *xrc, struct u_space *space, int64_
 		m_relation_chain_push_relation(xrc, &xsr);
 	} break;
 	case U_SPACE_TYPE_OFFSET: m_relation_chain_push_pose_if_not_identity(xrc, &space->offset.pose); break;
+	case U_SPACE_TYPE_RIG: {
+		struct xrt_pose delta;
+		if (get_rig_delta_read_locked(uso, at_timestamp_ns, &delta)) {
+			m_relation_chain_push_pose_if_not_identity(xrc, &delta);
+		}
+	} break;
 	case U_SPACE_TYPE_ROOT: return; // Stops the traversing.
 	}
 
 	// Please tail-call optimise this miss compiler.
 	assert(space->next != NULL);
-	push_then_traverse(xrc, space->next, at_timestamp_ns);
+	push_then_traverse(uso, xrc, space->next, at_timestamp_ns);
 }
 
 /*!
@@ -345,19 +437,23 @@ push_then_traverse(struct xrt_relation_chain *xrc, struct u_space *space, int64_
  * the reversed order.
  */
 static void
-traverse_then_push_inverse(struct xrt_relation_chain *xrc, struct u_space *space, int64_t at_timestamp_ns)
+traverse_then_push_inverse(struct u_space_overseer *uso,
+                           struct xrt_relation_chain *xrc,
+                           struct u_space *space,
+                           int64_t at_timestamp_ns)
 {
 	// Done traversing.
 	switch (space->type) {
 	case U_SPACE_TYPE_NULL: break;
 	case U_SPACE_TYPE_POSE: break;
 	case U_SPACE_TYPE_OFFSET: break;
+	case U_SPACE_TYPE_RIG: break;
 	case U_SPACE_TYPE_ROOT: return; // Stops the traversing.
 	}
 
 	// Can't tail-call optimise this one :(
 	assert(space->next != NULL);
-	traverse_then_push_inverse(xrc, space->next, at_timestamp_ns);
+	traverse_then_push_inverse(uso, xrc, space->next, at_timestamp_ns);
 
 	switch (space->type) {
 	case U_SPACE_TYPE_NULL: break; // No-op
@@ -370,6 +466,12 @@ traverse_then_push_inverse(struct xrt_relation_chain *xrc, struct u_space *space
 		m_relation_chain_push_inverted_relation(xrc, &xsr);
 	} break;
 	case U_SPACE_TYPE_OFFSET: m_relation_chain_push_inverted_pose_if_not_identity(xrc, &space->offset.pose); break;
+	case U_SPACE_TYPE_RIG: {
+		struct xrt_pose delta;
+		if (get_rig_delta_read_locked(uso, at_timestamp_ns, &delta)) {
+			m_relation_chain_push_inverted_pose_if_not_identity(xrc, &delta);
+		}
+	} break;
 	case U_SPACE_TYPE_ROOT: assert(false); // Should not get here.
 	}
 }
@@ -385,8 +487,8 @@ build_relation_chain_read_locked(struct u_space_overseer *uso,
 	assert(base != NULL);
 	assert(target != NULL);
 
-	push_then_traverse(xrc, target, at_timestamp_ns);
-	traverse_then_push_inverse(xrc, base, at_timestamp_ns);
+	push_then_traverse(uso, xrc, target, at_timestamp_ns);
+	traverse_then_push_inverse(uso, xrc, base, at_timestamp_ns);
 }
 
 static void
@@ -1045,6 +1147,9 @@ destroy(struct xrt_space_overseer *xso)
 	xrt_space_reference(&uso->base.semantic.view, NULL);
 	xrt_space_reference(&uso->base.semantic.root, NULL);
 
+	u_space_reference(&uso->rig_source, NULL);
+	u_space_reference(&uso->rig_space, NULL);
+
 	// Each device has a reference to its space, make sure to unreference before creating.
 	u_hashmap_int_clear_and_call_for_each(uso->xdev_map, hashmap_unreference_space_items, uso);
 	u_hashmap_int_destroy(&uso->xdev_map);
@@ -1195,6 +1300,96 @@ u_space_overseer_create_null_space(struct u_space_overseer *uso, struct xrt_spac
 
 	// Created with one references.
 	*out_space = &us->base;
+}
+
+void
+u_space_overseer_set_rig_source(struct u_space_overseer *uso, struct xrt_device *rig_xdev, enum xrt_input_name name)
+{
+	assert(uso->rig_source == NULL); // Must not change during runtime.
+
+	if (rig_xdev == NULL) {
+		return;
+	}
+
+	pthread_rwlock_wrlock(&uso->lock);
+
+	struct u_space *rig_parent = find_xdev_space_read_locked(uso, rig_xdev);
+	if (rig_parent == NULL) {
+		pthread_rwlock_unlock(&uso->lock);
+		U_LOG_W("Rig source '%s' has no space — rig composition disabled.", rig_xdev->str);
+		return;
+	}
+
+	struct u_space *source = create_space(U_SPACE_TYPE_POSE, rig_parent);
+	source->pose.xdev = rig_xdev;
+	source->pose.xname = name;
+
+	// Arm the delta from wherever the rig is right now: whatever the
+	// builder left the fly camera at is "not travelled yet".
+	struct xrt_relation_chain xrc = {0};
+	push_then_traverse(uso, &xrc, source, os_monotonic_get_ns());
+
+	struct xrt_space_relation rig_now;
+	m_relation_chain_resolve(&xrc, &rig_now);
+
+	const enum xrt_space_relation_flags needed =
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+	if ((rig_now.relation_flags & needed) == needed) {
+		uso->rig_initial = rig_now.pose;
+	} else {
+		uso->rig_initial = (struct xrt_pose)XRT_POSE_IDENTITY;
+	}
+
+	// Take ownership of the one reference create_space() returned.
+	uso->rig_source = source;
+
+	// The delta node itself, which rig-relative devices hang off.
+	uso->rig_space = create_space(U_SPACE_TYPE_RIG, u_space(uso->base.semantic.root));
+
+	pthread_rwlock_unlock(&uso->lock);
+
+	U_LOG_W("Rig source '%s' armed at (%.3f, %.3f, %.3f).", rig_xdev->str, uso->rig_initial.position.x,
+	        uso->rig_initial.position.y, uso->rig_initial.position.z);
+}
+
+void
+u_space_overseer_set_device_rig_relative(struct u_space_overseer *uso, struct xrt_device *xdev)
+{
+	if (xdev == NULL) {
+		return;
+	}
+
+	if (uso->rig_space == NULL) {
+		U_LOG_W("No rig source set, '%s' stays world-fixed.", xdev->str);
+		return;
+	}
+
+	pthread_rwlock_wrlock(&uso->lock);
+
+	struct u_space *us = find_xdev_space_read_locked(uso, xdev);
+	struct u_space *root = u_space(uso->base.semantic.root);
+
+	// Re-parenting the rig source's own space would make the delta
+	// depend on itself — and only a space sitting directly on the root
+	// can be moved without disturbing an existing chain.
+	const bool is_rig_source = uso->rig_source != NULL && us == uso->rig_source->next;
+	const bool on_root = us != NULL && us->next == root;
+
+	if (us == NULL || is_rig_source || !on_root) {
+		pthread_rwlock_unlock(&uso->lock);
+		U_LOG_W("Device '%s' can't be made rig-relative (%s).", xdev->str,
+		        us == NULL      ? "no space"
+		        : is_rig_source ? "it is the rig source"
+		                        : "not parented to root");
+		return;
+	}
+
+	// Slide the rig delta in between the root and this device's volume.
+	u_space_reference(&us->next, uso->rig_space);
+
+	pthread_rwlock_unlock(&uso->lock);
+
+	U_LOG_W("Device '%s' is now rig-relative.", xdev->str);
 }
 
 void

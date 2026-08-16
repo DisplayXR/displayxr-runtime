@@ -23,6 +23,7 @@ set(tests
     tests_pose
     tests_vec3_angle
     tests_u_multi_display
+    tests_space_overseer_rig
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_comp_client_d3d11)
@@ -68,6 +69,7 @@ target_link_libraries(tests_pose PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

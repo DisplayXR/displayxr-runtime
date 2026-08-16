@@ -174,6 +174,17 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 
 		xsysd->xdevs[xsysd->xdev_count++] = xdev;
 
+		// An input provider reports physically honest poses in its own
+		// tracking volume (ADR-034); anchoring that volume to the world
+		// is the runtime's job. On a 3D display the sensor sits on the
+		// same desk as the panel, so the volume is bolted to the rig:
+		// it follows voluntary navigation and ignores eye-tracked head
+		// parallax (ADR-034 Amendment 2). Qwerty is deliberately absent
+		// here — its controllers already follow the qwerty HMD.
+		if (ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
+			ubrh->rig_relative[ubrh->rig_relative_count++] = xdev;
+		}
+
 		// Devices self-describe via device_type (ADR-034). First
 		// claimant wins a role; ANY fills whichever hand is empty
 		// (left first, matching reader expectations elsewhere).
