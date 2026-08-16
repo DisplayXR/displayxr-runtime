@@ -106,6 +106,13 @@ get_orchestrator_workspace_pid(void)
 	return s_workspace_pid_provider ? s_workspace_pid_provider() : 0;
 }
 
+// #959: public accessor for the accept path (ipc_server_process.c).
+unsigned long
+ipc_server_get_orchestrator_workspace_pid(void)
+{
+	return get_orchestrator_workspace_pid();
+}
+
 // The effective workspace-controller pid for input/command authorization. The
 // orchestrator only knows a pid for a controller it SPAWNED (Windows Ctrl+Space
 // trampoline). A manually-launched controller — the macOS shell (#61), and any

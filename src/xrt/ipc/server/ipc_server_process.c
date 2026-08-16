@@ -49,6 +49,7 @@
 
 #if defined(XRT_OS_WINDOWS)
 #include <timeapi.h>
+#include <windows.h>
 #endif
 
 #if defined(XRT_OS_MACOS)
@@ -72,6 +73,29 @@ DEBUG_GET_ONCE_NUM_OPTION(exit_when_idle_delay_ms, "IPC_EXIT_WHEN_IDLE_DELAY_MS"
 // exists solely on the workspace render thread. Enrichment with commit cadence /
 // fence timeouts and a `displayxr-cli clients` view are follow-ups (#951).
 DEBUG_GET_ONCE_NUM_OPTION(health_period_ms, "DXR_HEALTH_MS", 10000)
+
+// #959: runtime-admitted client cap. 0 = auto (from box specs); explicit values
+// clamp to [1, IPC_MAX_CLIENTS]. IPC_MAX_CLIENTS is the fixed ABI bound; this is
+// only how many we ACTUALLY admit.
+DEBUG_GET_ONCE_NUM_OPTION(max_clients, "DXR_MAX_CLIENTS", 0)
+
+static uint32_t
+compute_default_max_clients(void)
+{
+#if defined(XRT_OS_WINDOWS)
+	// ~1 client per GB of RAM, clamped to [8, IPC_MAX_CLIENTS]. Shm is pagefile-
+	// backed and per-connect, so headroom costs address space, not committed RAM.
+	MEMORYSTATUSEX ms = {0};
+	ms.dwLength = sizeof(ms);
+	if (GlobalMemoryStatusEx(&ms)) {
+		// Round to the nearest GB (a 32 GB box reports ~31.8 after firmware reserve).
+		uint64_t gb = (ms.ullTotalPhys + 512ull * 1024ull * 1024ull) / (1024ull * 1024ull * 1024ull);
+		uint32_t cap = (uint32_t)(gb < 8 ? 8 : gb);
+		return cap > IPC_MAX_CLIENTS ? (uint32_t)IPC_MAX_CLIENTS : cap;
+	}
+#endif
+	return IPC_MAX_CLIENTS;
+}
 DEBUG_GET_ONCE_LOG_OPTION(ipc_log, "IPC_LOG", U_LOGGING_INFO)
 
 
@@ -504,6 +528,21 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	s->running = true;
 	s->exit_on_disconnect = debug_get_bool_option_exit_on_disconnect();
 	s->exit_when_idle = debug_get_bool_option_exit_when_idle();
+
+	// #959: runtime-admitted client cap (<= IPC_MAX_CLIENTS ABI bound).
+	{
+		long cfg = debug_get_num_option_max_clients();
+		uint32_t cap = cfg > 0 ? (uint32_t)cfg : compute_default_max_clients();
+		if (cap < 1) {
+			cap = 1;
+		}
+		if (cap > IPC_MAX_CLIENTS) {
+			cap = IPC_MAX_CLIENTS;
+		}
+		s->max_clients = cap;
+		U_LOG_W("IPC: admitting up to %u concurrent clients (compile bound %u; %s).", s->max_clients,
+		        (unsigned)IPC_MAX_CLIENTS, cfg > 0 ? "DXR_MAX_CLIENTS override" : "auto from box specs");
+	}
 	s->last_client_disconnect_ns = 0;
 	uint64_t delay_ms = debug_get_num_option_exit_when_idle_delay_ms();
 	s->exit_when_idle_delay_ns = delay_ms * U_TIME_1MS_IN_NS;
@@ -1007,7 +1046,46 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	volatile struct ipc_client_state *ics = NULL;
 	int32_t cs_index = -1;
 
+	// #959: derive the peer identity now (OS-authoritative, #954) so the cap
+	// check can reserve the last slot for the workspace controller.
+	uint64_t peer_create_ns = 0;
+	long peer_pid = ipc_server_derive_peer_pid(ipc_handle, &peer_create_ns);
+	unsigned long orch_pid = ipc_server_get_orchestrator_workspace_pid();
+
 	os_mutex_lock(&vs->global_state.lock);
+
+	// #959: runtime-admitted cap with a reserved controller slot. A client whose
+	// OS pid is the orchestrator-spawned controller may use up to max_clients; any
+	// other client is refused once one slot short of the cap, UNLESS the controller
+	// is already connected (then the reservation is not needed). This keeps the
+	// workspace controller able to connect under load — predictable degradation.
+	{
+		bool is_controller = orch_pid != 0 && (unsigned long)peer_pid == orch_pid;
+		bool reserve = false;
+		if (!is_controller && orch_pid != 0) {
+			bool controller_in = false;
+			for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+				volatile struct ipc_client_state *_cs = &vs->threads[i].ics;
+				if (_cs->server_thread_index >= 0 && (unsigned long)_cs->client_state.pid == orch_pid) {
+					controller_in = true;
+					break;
+				}
+			}
+			reserve = !controller_in;
+		}
+		uint32_t admit_limit = vs->max_clients;
+		if (reserve && admit_limit > 1) {
+			admit_limit -= 1;
+		}
+		if (vs->global_state.connected_client_count >= admit_limit) {
+			xrt_ipc_handle_close(ipc_handle);
+			os_mutex_unlock(&vs->global_state.lock);
+			U_LOG_W("[CAP] refusing client pid=%ld: %u/%u slots in use%s (#959).", peer_pid,
+			        vs->global_state.connected_client_count, vs->max_clients,
+			        reserve ? " — last slot reserved for the workspace controller" : "");
+			return;
+		}
+	}
 
 	// Increment the connected client counter
 	vs->global_state.connected_client_count++;
@@ -1063,12 +1141,7 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	// Reset everything.
 	U_ZERO((struct ipc_client_state *)ics);
 
-	// #954: derive the peer identity from the OS now, while the handle is
-	// freshly connected. This is what the authorization gates compare against
-	// (client_state.pid mirrors it); the client-sent pid becomes informational.
-	uint64_t peer_create_ns = 0;
-	long peer_pid = ipc_server_derive_peer_pid(ipc_handle, &peer_create_ns);
-
+	// #954/#959: peer identity was derived at the top of this function; store it.
 	// Set state.
 	ics->client_state.id = id;
 	ics->peer_pid = peer_pid;

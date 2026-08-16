@@ -425,6 +425,11 @@ struct ipc_server
 
 	struct ipc_thread threads[IPC_MAX_CLIENTS];
 
+	//! #959: runtime-admitted client cap, <= IPC_MAX_CLIENTS. Set at start from
+	//! DXR_MAX_CLIENTS / a RAM heuristic. The last slot is reserved for the
+	//! workspace controller so it can always connect under load.
+	uint32_t max_clients;
+
 	volatile uint32_t current_slot_index;
 
 	//! Generator for IDs.
@@ -578,6 +583,13 @@ typedef unsigned long (*ipc_server_workspace_pid_provider_fn)(void);
  */
 void
 ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
+
+/*!
+ * #959: the orchestrator-spawned workspace controller pid (0 if none). Read by
+ * the accept path to reserve the last client slot for the controller.
+ */
+unsigned long
+ipc_server_get_orchestrator_workspace_pid(void);
 
 /*!
  * Function pointer the IPC server calls to learn whether the active
