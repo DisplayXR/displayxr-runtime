@@ -37,7 +37,14 @@
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem
 #define IPC_MAX_LAYERS XRT_MAX_LAYERS
 #define IPC_MAX_SLOTS 128
-#define IPC_MAX_CLIENTS 8
+//! #959: compile-time capacity — sizes the per-client thread/shm-pointer arrays
+//! and the on-wire ipc_client_list. It is a fixed ABI bound (client DLL + service
+//! map the same shared memory, gated by the git-tag handshake), so it CANNOT be
+//! runtime-variable. The number the service actually ADMITS is a separate runtime
+//! value (ipc_server::max_clients, read at start from box specs / env), always
+//! <= this. On Windows the isms[] entries are per-connect pagefile-backed maps, so
+//! a larger bound costs address space, not committed RAM, until clients connect.
+#define IPC_MAX_CLIENTS 32
 
 //! #956: hard ceiling on a client-supplied PCM haptic sample count, to bound
 //! the server-side alloc (1M samples = 4 MB, far beyond any real buffer).
