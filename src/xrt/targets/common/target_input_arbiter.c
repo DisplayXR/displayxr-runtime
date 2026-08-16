@@ -91,6 +91,10 @@ struct t_input_arbiter
 	//! The get_roles we displaced, for any other xsysd.
 	xrt_result_t (*fallback_get_roles)(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles);
 
+	//! #958: the destroy we displaced, so we can stop the presence poll thread
+	//! BEFORE the providers it dereferences are freed.
+	void (*fallback_destroy)(struct xrt_system_devices *xsysd);
+
 	//! Candidates in priority order: providers first, qwerty last.
 	struct t_input_candidate candidates[ARBITER_MAX_CANDIDATES];
 	int candidate_count;
@@ -113,6 +117,17 @@ static struct t_input_arbiter g_arb = {0};
  */
 static struct os_mutex g_arb_mutex;
 static bool g_arb_mutex_ready = false;
+
+/*!
+ * #958: background presence poll. get_presence() must never run on a client
+ * thread (it did, under g_arb_mutex on every xrSyncActions — a blocking provider
+ * would freeze every client). This thread polls all candidates off any client
+ * thread and caches the verdict; candidate_is_present_locked() is now a pure
+ * cache read. Kept OUT of g_arb (like g_arb_mutex) so t_input_arbiter_reset's
+ * memset never corrupts the helper's own mutex/cond.
+ */
+static struct os_thread_helper g_arb_poll;
+static bool g_arb_poll_ready = false;
 
 
 /*
@@ -179,24 +194,27 @@ candidate_name(const struct t_input_candidate *cand)
 	return cand->iface->id != NULL ? cand->iface->id : "provider";
 }
 
-//! Caller holds the mutex (or is the single-threaded builder path).
+//! Caller holds g_arb_mutex. #958: a PURE read of the cache the poll thread
+//! fills — no provider code runs here (and never on a client thread). Not-yet-
+//! verified reads as absent (matches PRESENCE_UNKNOWN).
 static bool
 candidate_is_present_locked(struct t_input_candidate *cand)
 {
-	int64_t now = os_monotonic_get_ns();
+	return cand->have_verdict ? cand->present : false;
+}
 
-	if (cand->have_verdict && (now - cand->verdict_at_ns) < ARBITER_PRESENCE_POLL_NS) {
-		return cand->present;
-	}
-
-	bool present = query_candidate_presence(cand);
+//! #958: write one candidate's fresh verdict into the cache under g_arb_mutex.
+//! Called from the poll thread (query done OFF-lock by the caller) and from the
+//! synchronous install seed. Logs the level-triggered edge (once per change).
+static void
+candidate_store_verdict_locked(struct t_input_candidate *cand, bool present)
+{
 	if (cand->have_verdict && present != cand->present) {
 		U_LOG_W("input arbiter: '%s' hardware %s.", candidate_name(cand), present ? "present again" : "gone");
 	}
 	cand->present = present;
 	cand->have_verdict = true;
-	cand->verdict_at_ns = now;
-	return present;
+	cand->verdict_at_ns = os_monotonic_get_ns();
 }
 
 /*!
@@ -382,6 +400,51 @@ arbiter_get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #958: presence poll thread. Queries every candidate off any client thread
+ * (get_presence is never held under g_arb_mutex — only the scalar cache write
+ * is), so a slow/blocking provider stalls this dedicated thread, not a client's
+ * xrSyncActions. Candidate array + iface/inst pointers are stable between
+ * install and the next reset (which stops this thread first), so reading them
+ * off-lock is safe.
+ */
+static void *
+arbiter_presence_poll_thread(void *ptr)
+{
+	(void)ptr;
+	while (os_thread_helper_is_running(&g_arb_poll)) {
+		int n = g_arb.candidate_count;
+		for (int i = 0; i < n; i++) {
+			struct t_input_candidate *cand = &g_arb.candidates[i];
+			bool present = query_candidate_presence(cand); // OFF-lock provider call
+			os_mutex_lock(&g_arb_mutex);
+			candidate_store_verdict_locked(cand, present);
+			os_mutex_unlock(&g_arb_mutex);
+		}
+		// Sleep the poll interval in small chunks so signal_stop is prompt.
+		for (int64_t slept = 0; slept < ARBITER_PRESENCE_POLL_NS && os_thread_helper_is_running(&g_arb_poll);
+		     slept += 50LL * 1000 * 1000) {
+			os_nanosleep(50LL * 1000 * 1000);
+		}
+	}
+	return NULL;
+}
+
+/*!
+ * #958: displaced xsysd->destroy. Stop the poll thread (which dereferences the
+ * candidates' iface/inst) BEFORE the providers are freed, then chain.
+ */
+static void
+arbiter_destroy(struct xrt_system_devices *xsysd)
+{
+	if (g_arb_poll_ready) {
+		os_thread_helper_stop_and_wait(&g_arb_poll);
+	}
+	if (g_arb.fallback_destroy != NULL) {
+		g_arb.fallback_destroy(xsysd);
+	}
+}
+
 
 /*
  *
@@ -398,6 +461,15 @@ t_input_arbiter_reset(void)
 			U_LOG_E("input arbiter: mutex init failed — hand roles stay static.");
 			return;
 		}
+	}
+	if (!g_arb_poll_ready) {
+		g_arb_poll_ready = os_thread_helper_init(&g_arb_poll) == 0;
+	}
+
+	// #958: stop any poll thread from a previous build BEFORE wiping g_arb — it
+	// reads g_arb.candidates. A fresh install restarts it.
+	if (g_arb_poll_ready) {
+		os_thread_helper_stop_and_wait(&g_arb_poll);
 	}
 
 	os_mutex_lock(&g_arb_mutex);
@@ -531,6 +603,7 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 
 	g_arb.xsysd = xsysd;
 	g_arb.fallback_get_roles = xsysd->get_roles;
+	g_arb.fallback_destroy = xsysd->destroy; // #958
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		struct t_input_candidate *cand = &g_arb.candidates[i];
 		cand->left_index = index_of(xsysd, cand->left);
@@ -538,16 +611,27 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		for (int k = 0; k < 4; k++) {
 			cand->ht_indices[k] = index_of(xsysd, cand->ht_devices[k]);
 		}
-		// Force a fresh verdict: the builder's own query may be older
-		// than the provider's startup grace.
+		// #958: seed the cache synchronously (single-threaded here) so the
+		// refresh below and the first client xrSyncActions / cli selftest get a
+		// valid verdict before the poll thread's first tick. The builder's own
+		// query may be older than the provider's startup grace, so re-query now.
 		cand->have_verdict = false;
+		candidate_store_verdict_locked(cand, query_candidate_presence(cand));
 	}
 
 	refresh_roles_locked();
 
 	xsysd->get_roles = arbiter_get_roles;
+	xsysd->destroy = arbiter_destroy; // #958: stop the poll thread before providers free
 
 	os_mutex_unlock(&g_arb_mutex);
+
+	// #958: start the presence poll now that the candidate array is resolved.
+	if (g_arb_poll_ready) {
+		if (os_thread_helper_start(&g_arb_poll, arbiter_presence_poll_thread, NULL) != 0) {
+			U_LOG_W("input arbiter: presence poll thread failed to start — presence will not refresh.");
+		}
+	}
 
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		const struct t_input_candidate *cand = &g_arb.candidates[i];

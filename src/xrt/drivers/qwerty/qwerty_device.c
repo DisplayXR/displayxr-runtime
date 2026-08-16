@@ -19,6 +19,8 @@
 #include "util/u_logging.h"
 #include "util/u_time.h"
 #include "util/u_misc.h"
+
+#include "os/os_threading.h"
 #include "os/os_time.h"
 
 #include "qwerty_device.h"
@@ -345,6 +347,8 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
+	os_mutex_lock(&qd->lock); // #958
+
 	// Position
 
 	// Skip pose integration when the bridge is driving — page owns input.
@@ -368,6 +372,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		out_relation->relation_flags =
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+		os_mutex_unlock(&qd->lock); // #958
 		return XRT_SUCCESS;
 	}
 
@@ -428,6 +433,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 
+	os_mutex_unlock(&qd->lock); // #958
 	return XRT_SUCCESS;
 }
 
@@ -438,6 +444,7 @@ qwerty_destroy(struct xrt_device *xd)
 	// ui will make a null reference
 	struct qwerty_device *qd = qwerty_device(xd);
 	qwerty_system_remove(qd->sys, qd);
+	os_mutex_destroy(&qd->lock); // #958
 	u_device_free(xd);
 }
 
@@ -455,6 +462,7 @@ qwerty_hmd_create(void)
 	qd->pose.position = QWERTY_HMD_CAMERA_POS; // Default is camera-centric mode
 	qd->movement_speed = QWERTY_HMD_INITIAL_MOVEMENT_SPEED;
 	qd->look_speed = QWERTY_HMD_INITIAL_LOOK_SPEED;
+	os_mutex_init(&qd->lock); // #958
 
 	struct xrt_device *xd = &qd->base;
 	xd->name = XRT_DEVICE_GENERIC_HMD;
@@ -514,6 +522,7 @@ qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 	qd->pose.position = QWERTY_CONTROLLER_INITIAL_POS(is_left);
 	qd->movement_speed = QWERTY_CONTROLLER_INITIAL_MOVEMENT_SPEED;
 	qd->look_speed = QWERTY_CONTROLLER_INITIAL_LOOK_SPEED;
+	os_mutex_init(&qd->lock); // #958
 
 	struct xrt_device *xd = &qd->base;
 
@@ -763,6 +772,7 @@ qwerty_release_sprint(struct qwerty_device *qd)
 void
 qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 {
+	os_mutex_lock(&qd->lock); // #958
 	qd->yaw_delta += yaw * qd->look_speed;
 	qd->pitch_delta += pitch * qd->look_speed;
 
@@ -773,24 +783,30 @@ qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 		U_LOG_I("qwerty_add_look_delta: qd=%p yaw_delta=%.4f pitch_delta=%.4f",
 		        (void *)qd, qd->yaw_delta, qd->pitch_delta);
 	}
+	os_mutex_unlock(&qd->lock); // #958
 }
 
 void
 qwerty_add_position_delta(struct qwerty_device *qd, float dx, float dy)
 {
+	os_mutex_lock(&qd->lock); // #958
 	qd->x_pos_delta += dx * qd->movement_speed;
 	qd->y_pos_delta += dy * qd->movement_speed;
+	os_mutex_unlock(&qd->lock); // #958
 }
 
 void
 qwerty_change_movement_speed(struct qwerty_device *qd, float steps)
 {
+	os_mutex_lock(&qd->lock); // #958
 	qd->movement_speed *= powf(MOVEMENT_SPEED_STEP, steps);
+	os_mutex_unlock(&qd->lock); // #958
 }
 
 void
 qwerty_release_all(struct qwerty_device *qd)
 {
+	os_mutex_lock(&qd->lock); // #958
 	qd->left_pressed = false;
 	qd->right_pressed = false;
 	qd->forward_pressed = false;
@@ -806,6 +822,7 @@ qwerty_release_all(struct qwerty_device *qd)
 	qd->pitch_delta = 0;
 	qd->x_pos_delta = 0;
 	qd->y_pos_delta = 0;
+	os_mutex_unlock(&qd->lock); // #958
 }
 
 // Controller methods

@@ -11,6 +11,8 @@
 #include "util/u_logging.h"
 #include "xrt/xrt_device.h"
 
+#include "os/os_threading.h"
+
 /*!
  * @addtogroup drv_qwerty
  * @{
@@ -76,6 +78,9 @@ struct qwerty_system
 struct qwerty_device
 {
 	struct xrt_device base;
+	//! #958: guards the pose/delta/speed integrator state below, which the
+	//! win32 input thread writes and N action-path consumers read+consume.
+	struct os_mutex lock;
 	struct xrt_pose pose;      //!< Internal pose state
 	struct qwerty_system *sys; //!< Reference to the system this device is in.
 
