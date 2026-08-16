@@ -102,6 +102,14 @@
 #define UL_CONNECT_GRACE_NS (1500LL * 1000 * 1000)
 
 /*!
+ * How long a reconnect after a #941 idle disconnect may keep failing before
+ * the frozen PRESENT is declared stale. Longer than @ref UL_CONNECT_GRACE_NS
+ * because a tracking service that is starting on demand legitimately refuses
+ * connections for a moment.
+ */
+#define UL_RECONNECT_GRACE_NS (3LL * 1000 * 1000 * 1000)
+
+/*!
  * Mount offset: where the Leap device's origin sits in stage space.
  * Hands hover 10–40 cm above the device, so an origin at stage height
  * minus ~15 cm puts the interaction volume around y ≈ 1.6 m — the
@@ -173,6 +181,21 @@ struct ul_hub
 	//! After UL_CONNECT_GRACE_NS of silence an UNKNOWN presence becomes
 	//! ABSENT — a service that never answers means no hardware.
 	int64_t connect_started_ns;
+
+	/*!
+	 * Deadline for re-confirming a PRESENT that survived a #941 idle
+	 * disconnect, or 0 when there is nothing to re-confirm.
+	 * Poll-thread-owned. See ul_poll_thread for why this exists.
+	 */
+	int64_t revalidate_deadline_ns;
+
+	/*!
+	 * When the current post-idle revival started trying to reconnect, or 0
+	 * when not reviving. Poll-thread-owned. A reconnect that keeps failing
+	 * past @ref UL_RECONNECT_GRACE_NS means the on-demand tracking service
+	 * went away with the hardware.
+	 */
+	int64_t reconnect_started_ns;
 
 	struct ul_device *devices[2];
 
@@ -551,13 +574,63 @@ ul_poll_thread(void *ptr)
 				os_nanosleep(100 * 1000 * 1000); // 100 ms
 				continue;
 			}
+			if (hub->reconnect_started_ns == 0) {
+				hub->reconnect_started_ns = now; // First try of this revival.
+			}
 			if (!ul_open_connection(hub)) {
-				U_LOG_W("ultraleap: reconnect failed — retrying while input is being polled.");
+				// Keep retrying — but a reconnect that keeps
+				// failing is itself evidence: the tracking
+				// service is on-demand, so it goes away with the
+				// hardware. Do not sit on a frozen PRESENT while
+				// that is true, or the hand roles never return
+				// to qwerty. Timed from the first attempt, not
+				// from the disconnect: a box that sat idle for
+				// an hour still gets a fair window.
+				if (presence == XRT_INPUT_PROVIDER_PRESENCE_PRESENT &&
+				    now - hub->reconnect_started_ns > UL_RECONNECT_GRACE_NS) {
+					U_LOG_W("ultraleap: reconnect failing for %d s — treating as unplugged.",
+					        (int)(UL_RECONNECT_GRACE_NS / (1000 * 1000 * 1000)));
+					ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
+					ul_set_all_untracked(hub);
+				} else {
+					U_LOG_W("ultraleap: reconnect failed — retrying while input is being polled.");
+				}
 				os_nanosleep(500 * 1000 * 1000); // 500 ms
 				continue;
 			}
 			hub->leap_connected = true;
+			hub->reconnect_started_ns = 0;
+
+			// The frozen PRESENT is now a CLAIM, not a fact: the
+			// device may have been unplugged while we were not
+			// listening, and a connection that was closed cannot
+			// have reported it. Drop the device count and give
+			// LeapC the grace window to replay its Device events;
+			// if none arrive the claim is stale and we say ABSENT
+			// below. Presence itself stays PRESENT meanwhile, so a
+			// device that IS still attached never flaps the hand
+			// roles over to qwerty and back.
+			os_mutex_lock(&hub->mutex);
+			hub->attached_devices = 0;
+			os_mutex_unlock(&hub->mutex);
+			hub->revalidate_deadline_ns = now + UL_CONNECT_GRACE_NS;
+
 			U_LOG_W("ultraleap: input polled again — Leap connection reopened (#941).");
+		}
+
+		// Revalidation verdict (see the reopen path above).
+		if (hub->revalidate_deadline_ns != 0 && now > hub->revalidate_deadline_ns) {
+			os_mutex_lock(&hub->mutex);
+			int32_t attached = hub->attached_devices;
+			os_mutex_unlock(&hub->mutex);
+
+			hub->revalidate_deadline_ns = 0;
+			if (attached == 0) {
+				U_LOG_W("ultraleap: no device replayed after reopen — unplugged while idle.");
+				ul_set_presence(hub, XRT_INPUT_PROVIDER_PRESENCE_ABSENT);
+				ul_set_all_untracked(hub);
+				presence = XRT_INPUT_PROVIDER_PRESENCE_ABSENT;
+			}
 		}
 
 		// Nothing has answered since we opened the connection: no
@@ -583,6 +656,7 @@ ul_poll_thread(void *ptr)
 			LeapCloseConnection(hub->connection);
 			hub->leap_connected = false;
 			hub->idle_since_ns = now;
+			hub->reconnect_started_ns = 0;
 			hub->idle_disconnects++;
 			ul_set_all_untracked(hub);
 			// Presence is deliberately FROZEN at PRESENT across an
