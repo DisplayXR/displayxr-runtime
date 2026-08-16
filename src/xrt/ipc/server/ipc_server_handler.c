@@ -221,7 +221,10 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 		}                                                                                                      \
 	} while (0)
 
-
+// #956: reject an out-of-range client swapchain/semaphore id before it indexes
+// ics->xscs[] / ics->xcsems[] (raw wire uint32s indexing fixed arrays = OOB read/write).
+#define IPC_CHECK_SWAPCHAIN_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SWAPCHAINS) { IPC_ERROR((ICS)->server, "swapchain id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
+#define IPC_CHECK_SEMAPHORE_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SEMAPHORES) { IPC_ERROR((ICS)->server, "semaphore id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
@@ -2132,33 +2135,48 @@ ipc_handle_space_locate_spaces(volatile struct ipc_client_state *ics,
 
 	struct xrt_space_overseer *xso = ics->server->xso;
 	struct xrt_space *base_space = NULL;
-
-	struct xrt_space **xspaces = U_TYPED_ARRAY_CALLOC(struct xrt_space *, space_count);
-	struct xrt_pose *offsets = U_TYPED_ARRAY_CALLOC(struct xrt_pose, space_count);
-	struct xrt_space_relation *out_relations = U_TYPED_ARRAY_CALLOC(struct xrt_space_relation, space_count);
-
+	struct xrt_space **xspaces = NULL;
+	struct xrt_pose *offsets = NULL;
+	struct xrt_space_relation *out_relations = NULL;
+	uint32_t *space_ids = NULL;
 	xrt_result_t xret;
 
-	os_mutex_lock(&ics->server->global_state.lock);
-
-	uint32_t *space_ids = U_TYPED_ARRAY_CALLOC(uint32_t, space_count);
-
-	// we need to send back whether allocation succeeded so the client knows whether to send more data
-	if (space_ids == NULL) {
+	// #956: bound the client-supplied count BEFORE allocating anything — it was
+	// four unchecked U_TYPED_ARRAY_CALLOCs scaled by a wire uint32, i.e. a
+	// ~64 GB-allocation + NULL-deref vector. A client cannot own more spaces
+	// than IPC_MAX_CLIENT_SPACES, so a larger count is invalid; report it as an
+	// allocation failure through the existing handshake so the client does not
+	// then stream ids/offsets and desync the pipe.
+	if (space_count > IPC_MAX_CLIENT_SPACES) {
+		IPC_ERROR(s, "locate_spaces: space_count %u exceeds max %u — rejecting", space_count,
+		          (uint32_t)IPC_MAX_CLIENT_SPACES);
 		xret = XRT_ERROR_ALLOCATION;
-	} else {
-		xret = XRT_SUCCESS;
+		(void)ipc_send(imc, &xret, sizeof(enum xrt_result));
+		return xret;
 	}
 
+	xspaces = U_TYPED_ARRAY_CALLOC(struct xrt_space *, space_count);
+	offsets = U_TYPED_ARRAY_CALLOC(struct xrt_pose, space_count);
+	out_relations = U_TYPED_ARRAY_CALLOC(struct xrt_space_relation, space_count);
+	space_ids = U_TYPED_ARRAY_CALLOC(uint32_t, space_count);
+	bool alloc_ok = xspaces != NULL && offsets != NULL && out_relations != NULL && space_ids != NULL;
+
+	// #956: no global_state.lock across the wire. The handshake (send alloc
+	// result, receive ids + offsets) and the final send run lock-free; the lock
+	// is taken only around the space validation + overseer locate, so a client
+	// that stalls mid-message can no longer freeze every other client behind
+	// the server's only mutex.
+
+	// we need to send back whether allocation succeeded so the client knows whether to send more data
+	xret = alloc_ok ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
 	xret = ipc_send(imc, &xret, sizeof(enum xrt_result));
 	if (xret != XRT_SUCCESS) {
 		IPC_ERROR(ics->server, "Failed to send spaces allocate result");
-		// Nothing else we can do
 		goto out_locate_spaces;
 	}
 
 	// only after sending the allocation result can we skip to the end in the allocation error case
-	if (space_ids == NULL) {
+	if (!alloc_ok) {
 		IPC_ERROR(s, "Failed to allocate space for receiving spaces ids");
 		xret = XRT_ERROR_ALLOCATION;
 		goto out_locate_spaces;
@@ -2167,20 +2185,21 @@ ipc_handle_space_locate_spaces(volatile struct ipc_client_state *ics,
 	xret = ipc_receive(imc, space_ids, space_count * sizeof(uint32_t));
 	if (xret != XRT_SUCCESS) {
 		IPC_ERROR(ics->server, "Failed to receive spaces ids");
-		// assume early abort is possible, i.e. client will not send more data for this request
 		goto out_locate_spaces;
 	}
 
 	xret = ipc_receive(imc, offsets, space_count * sizeof(struct xrt_pose));
 	if (xret != XRT_SUCCESS) {
 		IPC_ERROR(ics->server, "Failed to receive spaces offsets");
-		// assume early abort is possible, i.e. client will not send more data for this request
 		goto out_locate_spaces;
 	}
+
+	os_mutex_lock(&ics->server->global_state.lock);
 
 	xret = validate_space_id(ics, base_space_id, &base_space);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Invalid base_space_id %d!", base_space_id);
+		os_mutex_unlock(&ics->server->global_state.lock);
 		// Client is receiving out_relations now, it will get xret on this receive.
 		goto out_locate_spaces;
 	}
@@ -2192,6 +2211,7 @@ ipc_handle_space_locate_spaces(volatile struct ipc_client_state *ics,
 			xret = validate_space_id(ics, space_ids[i], &xspaces[i]);
 			if (xret != XRT_SUCCESS) {
 				U_LOG_E("Invalid space_id space_ids[%d] = %d!", i, space_ids[i]);
+				os_mutex_unlock(&ics->server->global_state.lock);
 				// Client is receiving out_relations now, it will get xret on this receive.
 				goto out_locate_spaces;
 			}
@@ -2207,10 +2227,11 @@ ipc_handle_space_locate_spaces(volatile struct ipc_client_state *ics,
 	    offsets,                             //
 	    out_relations);                      //
 
+	os_mutex_unlock(&ics->server->global_state.lock);
+
 	xret = ipc_send(imc, out_relations, sizeof(struct xrt_space_relation) * space_count);
 	if (xret != XRT_SUCCESS) {
 		IPC_ERROR(ics->server, "Failed to send spaces relations");
-		// Nothing else we can do
 		goto out_locate_spaces;
 	}
 
@@ -2218,7 +2239,7 @@ out_locate_spaces:
 	free(xspaces);
 	free(offsets);
 	free(out_relations);
-	os_mutex_unlock(&ics->server->global_state.lock);
+	free(space_ids);
 	return xret;
 }
 
@@ -5437,7 +5458,7 @@ ipc_handle_swapchain_wait_image(volatile struct ipc_client_state *ics, uint32_t 
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	//! @todo Look up the index.
+	IPC_CHECK_SWAPCHAIN_ID(ics, id);
 	uint32_t sc_index = id;
 	struct xrt_swapchain *xsc = ics->xscs[sc_index];
 
@@ -5452,7 +5473,7 @@ ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	//! @todo Look up the index.
+	IPC_CHECK_SWAPCHAIN_ID(ics, id);
 	uint32_t sc_index = id;
 	struct xrt_swapchain *xsc = ics->xscs[sc_index];
 
@@ -5475,7 +5496,7 @@ ipc_handle_swapchain_release_image(volatile struct ipc_client_state *ics, uint32
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	//! @todo Look up the index.
+	IPC_CHECK_SWAPCHAIN_ID(ics, id);
 	uint32_t sc_index = id;
 	struct xrt_swapchain *xsc = ics->xscs[sc_index];
 
@@ -5491,6 +5512,7 @@ ipc_handle_swapchain_destroy(volatile struct ipc_client_state *ics, uint32_t id)
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
+	IPC_CHECK_SWAPCHAIN_ID(ics, id);
 	ics->swapchain_count--;
 
 	// Drop our reference, does NULL checking. Cast away volatile.
@@ -6003,6 +6025,7 @@ ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, u
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
+	IPC_CHECK_SEMAPHORE_ID(ics, id);
 	if (ics->xcsems[id] == NULL) {
 		IPC_ERROR(ics->server, "Client tried to delete non-existent compositor semaphore!");
 		return XRT_ERROR_IPC_FAILURE;
@@ -6562,8 +6585,19 @@ ipc_handle_device_set_haptic_output(volatile struct ipc_client_state *ics,
 	struct xrt_device *xdev = NULL;
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
 
-	os_mutex_lock(&ics->server->global_state.lock);
+	// #956: bound the client-supplied sample count before allocating — it was an
+	// unchecked calloc scaled by a wire uint32. 1M samples (4 MB) is far beyond
+	// any real haptic buffer; a larger request is rejected through the handshake.
+	if (buffer->num_samples > IPC_MAX_HAPTIC_SAMPLES) {
+		IPC_ERROR(s, "set_haptic_output: num_samples %u exceeds max %u — rejecting", buffer->num_samples,
+		          (uint32_t)IPC_MAX_HAPTIC_SAMPLES);
+		xret = XRT_ERROR_ALLOCATION;
+		(void)ipc_send(imc, &xret, sizeof xret);
+		return xret;
+	}
 
+	// #956: no global_state.lock across the wire — alloc + handshake + receive
+	// run lock-free; the lock is taken only around the device output call.
 	float *samples = U_TYPED_ARRAY_CALLOC(float, buffer->num_samples);
 
 	// send the allocation result
@@ -6600,7 +6634,9 @@ ipc_handle_device_set_haptic_output(volatile struct ipc_client_state *ics,
 	};
 
 	// Set the output.
+	os_mutex_lock(&ics->server->global_state.lock);
 	xrt_device_set_output(xdev, name, &value);
+	os_mutex_unlock(&ics->server->global_state.lock);
 
 	xret = ipc_send(imc, &samples_consumed, sizeof samples_consumed);
 	if (xret != XRT_SUCCESS) {
@@ -6611,8 +6647,6 @@ ipc_handle_device_set_haptic_output(volatile struct ipc_client_state *ics,
 	xret = XRT_SUCCESS;
 
 set_haptic_output_end:
-	os_mutex_unlock(&ics->server->global_state.lock);
-
 	free(samples);
 
 	return xret;

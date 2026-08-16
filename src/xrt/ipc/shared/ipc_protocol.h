@@ -38,6 +38,10 @@
 #define IPC_MAX_LAYERS XRT_MAX_LAYERS
 #define IPC_MAX_SLOTS 128
 #define IPC_MAX_CLIENTS 8
+
+//! #956: hard ceiling on a client-supplied PCM haptic sample count, to bound
+//! the server-side alloc (1M samples = 4 MB, far beyond any real buffer).
+#define IPC_MAX_HAPTIC_SAMPLES (1u << 20)
 #define IPC_MAX_RAW_VIEWS 32 // Max views that we can get, artificial limit.
 #define IPC_EVENT_QUEUE_SIZE 32
 
