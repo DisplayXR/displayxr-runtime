@@ -2083,6 +2083,27 @@ struct d3d11_multi_compositor
 	//! when no DP exists. One DP per panel, always.
 	HWND panel_dp_hwnd;
 
+	//! #964: pacing hand-off for an APP_HWND active presenter.
+	//!
+	//! When the service window is hidden its swap chain stops signaling, so the
+	//! render loop fell back to the 20 ms tick and landed ~50 presents/s against
+	//! a 60+ Hz panel. Instead the loop paces on the ACTIVE presenter's own
+	//! frame-latency waitable. `pace_app_waitable` / `pace_app_sc` are published
+	//! by pipeline_default_policy_render at the end of each frame (under
+	//! render_mutex) and read by the render thread just before its wait; the
+	//! unregister path clears them while the lock is still held, so the handle
+	//! can never be closed underneath the wait.
+	//!
+	//! A satisfied wait CONSUMES the waitable's slot, so the render function
+	//! must not probe it again — `app_present_token` says "your buffer is
+	//! already claimed". It is keyed by `app_present_token_sc` because focus
+	//! (and therefore the presenter) can change between the wait and the render;
+	//! a token for a different swap chain is ignored, never blindly trusted.
+	HANDLE pace_app_waitable;
+	IDXGISwapChain1 *pace_app_sc;
+	std::atomic<bool> app_present_token{false};
+	IDXGISwapChain1 *app_present_token_sc;
+
 	//! #964 (D-3): last visibility we asked of the service window. Under the
 	//! default presenter policy the service window is shown only while it IS
 	//! the active presenter; under a controller it is always shown. Tracked so
@@ -6601,6 +6622,19 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys,
 				mc->clients[i].projection_flags_valid = false;
 			}
 
+			// #964: the render thread may be parked on THIS client's
+			// frame-latency waitable, and fini_client_render_resources is
+			// about to close that handle. Drop the pacing target while we
+			// still hold render_mutex — the thread re-reads it every wait,
+			// so it falls back to the tick on the next iteration.
+			if (mc->clients[i].compositor != nullptr &&
+			    mc->pace_app_sc == mc->clients[i].compositor->render.swap_chain.get()) {
+				mc->pace_app_waitable = nullptr;
+				mc->pace_app_sc = nullptr;
+				mc->app_present_token_sc = nullptr;
+				mc->app_present_token.store(false, std::memory_order_release);
+			}
+
 			mc->clients[i].active = false;
 			mc->clients[i].compositor = nullptr;
 			mc->client_count--;
@@ -6716,7 +6750,33 @@ try {
 		// in the wait set so shutdown still interrupts instantly; the
 		// timeout covers occluded/DWM-throttled windows where the waitable
 		// stops signaling.
-		if (mc->frame_latency_waitable) {
+		// #964: when an APP_HWND client is the ACTIVE presenter the service
+		// window is hidden, and a hidden swap chain's waitable stops signaling
+		// — pacing on it degrades to the fallback tick (~50 presents/s against
+		// a 60+ Hz panel). Pace on THAT PRESENTER'S OWN waitable instead: it
+		// signals right after its previous flip, exactly like the service
+		// window's does on the hosted path.
+		//
+		// A satisfied wait CONSUMES the waitable's slot, so we hand the render
+		// function a token instead of letting it probe again. The token is
+		// keyed by the swap chain it was won on — focus can move between the
+		// wait and the render, and a token must never be spent on a different
+		// presenter's back buffer.
+		HANDLE pace_app = mc->pace_app_waitable;
+		if (pace_app != nullptr && pipeline_always_on(sys) && !sys->workspace_mode &&
+		    !mc->service_window_shown) {
+			IDXGISwapChain1 *pace_sc = mc->pace_app_sc;
+			HANDLE waits[2] = {mc->render_wakeup_event, pace_app};
+			DWORD wr = (mc->render_wakeup_event != nullptr) ? WaitForMultipleObjects(2, waits, FALSE, 20)
+			                                                : WaitForSingleObject(pace_app, 20);
+			const bool app_signaled =
+			    (mc->render_wakeup_event != nullptr) ? (wr == WAIT_OBJECT_0 + 1) : (wr == WAIT_OBJECT_0);
+			mc->app_present_token_sc = app_signaled ? pace_sc : nullptr;
+			mc->app_present_token.store(app_signaled, std::memory_order_release);
+			// The service window is hidden; its own chain grants nothing.
+			mc->present_token.store(false, std::memory_order_release);
+		} else if (mc->frame_latency_waitable) {
+			mc->app_present_token.store(false, std::memory_order_release);
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			// #964: when the SERVICE WINDOW is not the active presenter it is
 			// hidden, and a hidden swap chain's waitable stops signaling — the
@@ -7997,6 +8057,16 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		return false;
 	}
 	if (c->render.frame_latency_waitable != nullptr) {
+		// #964: the render thread may already have paced on THIS chain's
+		// waitable, which consumed the slot — probing again would report "not
+		// ready" for a buffer we hold. The token says so; it is keyed by the
+		// swap chain so a focus change between the wait and here can never
+		// spend it on the wrong presenter.
+		struct d3d11_multi_compositor *tmc = c->sys != nullptr ? c->sys->multi_comp : nullptr;
+		if (is_active && tmc != nullptr && tmc->app_present_token_sc == c->render.swap_chain.get() &&
+		    tmc->app_present_token.exchange(false, std::memory_order_acq_rel)) {
+			return true;
+		}
 		return WaitForSingleObject(c->render.frame_latency_waitable, 0) == WAIT_OBJECT_0;
 	}
 	// Unpaced chain (the waitable flag was refused): the duration watchdog in
@@ -8265,6 +8335,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	if (kind == PRESENTER_NONE) {
 		// Nothing presenting yet (no client, or none past its first frame).
 		// The panel keeps whatever it last showed; nothing to weave.
+		mc->pace_app_waitable = nullptr; // #964: no app chain to pace on
+		mc->pace_app_sc = nullptr;
 		return;
 	}
 
@@ -8282,6 +8354,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	 * more here than anywhere else: a fullscreen service window would cover the
 	 * browser. Other app windows still get their courtesy repaint. */
 	if (kind == PRESENTER_SELF) {
+		// The present-owner drives its own frame loop; we neither present nor
+		// pace on it.
+		mc->pace_app_waitable = nullptr;
+		mc->pace_app_sc = nullptr;
 		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ false);
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -8481,6 +8557,19 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	}
 	t_present_ns = (int64_t)os_monotonic_get_ns();
 	sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+
+	/* #964: publish the pacing target for the render thread's next wait. Set
+	 * under render_mutex; the unregister path clears it under the same lock, so
+	 * the handle can never be closed while the thread is parked on it. Only an
+	 * APP_HWND presenter with a waitable qualifies — everything else keeps the
+	 * service window / tick pacing. */
+	if (kind == PRESENTER_APP_HWND && fc->render.frame_latency_waitable != nullptr) {
+		mc->pace_app_waitable = fc->render.frame_latency_waitable;
+		mc->pace_app_sc = fc->render.swap_chain.get();
+	} else {
+		mc->pace_app_waitable = nullptr;
+		mc->pace_app_sc = nullptr;
+	}
 	if (FAILED(phr)) {
 		static std::atomic<int64_t> s_last_log_ns{0};
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();

@@ -62,8 +62,19 @@ the mode writers correct as written.
 | `SERVICE_WINDOW` | hosted (NULL HWND), WebXR/Chrome, workspace | `mc->swap_chain` on `mc->hwnd` (fullscreen, native res) | pipeline start | render thread |
 | `APP_HWND` | `_handle` forced-IPC (real HWND) | per-client `CreateSwapChainForHwnd(app_hwnd)` sized to the client area | the client's IPC thread (DXGI/WM-deadlock rule) | render thread |
 | `CLIENT_TEXTURE` | ADR-029 client-presents (`transparent + HWND`) | the client's shared NT texture + fence, no swap chain | the client's IPC thread | render thread weaves + signals; app presents |
+| `SELF` | present-owner (`XR_DXR_weave`, displayxr-browser) | none — the client weaves synchronously through the panel DP and presents itself | `weave_bind_window` | nobody; counts as *presenting* from its first weave so it can hold focus/lease |
 
-`PRESENT_OWNER` (#625) keeps its own synchronous submit path — #965.
+`PRESENT_OWNER` (#625) keeps its own synchronous submit path (#965); the pipeline only binds the
+panel DP to its window while it is focused.
+
+**Never block the render thread on a foreign window.** `APP_HWND` swap chains are created with
+`FRAME_LATENCY_WAITABLE_OBJECT` + per-chain `SetMaximumFrameLatency(1)` (`DXR_APP_HWND_LATENCY`;
+never the device-wide call) and are presented only after a zero-timeout probe of the waitable (the
+#924 token model; the loop paces on the active presenter's waitable). Measured: `Present(1)` on an
+occluded cross-process flip chain throttles to DWM's drain rate for that window — 138–626 ms per
+call, growing — because DWM does not consume flips of an occluded foreign window; sync-interval-1
+`DO_NOT_WAIT` does not help (it only guards a full queue). Unfocused `APP_HWND` windows get a
+probe-gated flat 2D repaint with a 1 s backoff on occlusion/failure.
 
 **D-3 Default presenter policy (no controller).** The render thread runs a *direct path*
 each frame: focused presenting slot → its presenter; the panel DP is bound to that
@@ -77,20 +88,30 @@ The service window is visible only while it is the active presenter (or under a 
 Under a controller the existing compose path runs unchanged (service window presenter,
 DP bound to `mc->hwnd`).
 
-**D-4 One DP per panel, re-bound on presenter change.** `mc->display_processor` is bound to
+**D-4 One DP per panel, re-bound on presenter change — never freed synchronously.** `mc->display_processor` is bound to
 `mc->panel_dp_hwnd`. When the active presenter's HWND differs (focus moves between an
 `APP_HWND` client and a hosted one, or a controller attaches/detaches) the render thread
-destroys and recreates the DP bound to the new HWND (existing practice at the DP-dims
-mismatch site; async create flat-blits meanwhile). Follow-up: an append-only D3D11 vtable
+creates a new DP bound to the new HWND and retires the old one (async create flat-blits
+meanwhile). Follow-up: an append-only D3D11 vtable
 slot 20 `set_window(HWND)` → plug-in calls `setWindowHandle`, making the re-bind free
 (#964 follow-up issue; ABI append is legal, runtime degrades to recreate when absent).
+Re-bind is *create → configure → publish → retire*: the old DP is pushed to a small graveyard
+(its lens vote dropped first) and destroyed by the render thread after `DXR_DP_GRAVEYARD_MS`
+(2 s). Every DP call is bounded, so a stale pointer loaded once by an IPC thread stays a live object
+without taking `render_mutex` on the eye-pose hot path; the first live round crashed exactly here
+(`weave_submit` resolved the DP before the lock; the render thread had freed it — call through a
+freed vtable). Sites that hold `render_mutex` anyway resolve the DP inside it.
 
 **D-5 Focus authority is the compositor slot table always.** The "newest presenting client"
 default rule moves into the compositor (first committed frame under the default policy →
 `focused_slot`; on unregister → newest remaining presenting slot). The IPC mainloop mirror
 (`sync_focus_from_compositor`) runs whenever `multi_comp` exists, not only under
-`controller_policy_locked`; the IPC-side default rule stays as the fallback for platforms
-without this compositor.
+`controller_policy_locked`; the IPC-side default rule is disabled whenever the compositor is authoritative
+(`compositor_owns_focus_locked` = controller policy, or the D3D11 pipeline is on) — two writers
+made focus flap; it stays as the fallback for platforms without this compositor and under
+`DXR_LEGACY_STANDALONE`. A focus change re-arms the new holder's recorded mode wish
+(`wish_content_mode` / `wish_hw_3d`, recorded at request time even when denied) into its pending
+request, so the panel follows the focused client's mode as it did with per-client DP hints.
 
 **D-6 Mode writers keep their thread but target the panel DP under `render_mutex`.**
 `service_apply_pending_mode`, `[force_3d]`, deferred-3D, zones tier-1 and
@@ -140,7 +161,19 @@ stop driving the DP, orderly exit so the connect ladder relaunches).
 - `resolve_eye_display_processor`, vendor-poll cache, `[HEALTH]`: panel DP always.
 - `ipc_server_process.c` `sync_focus_from_compositor`: mirror whenever the compositor reports a slot table.
 
-## 4. Validation (done-when for the slice)
+## 4. Live rounds (2026-08-17, SR box, `main @ 32cd9612d` + this branch)
+
+Verified: hosted ×2 + forced-IPC `_handle` ×1 + shell attach/detach + displayxr-browser
+(present-owner) + ESC on the service window + legacy gate — one `Multi-comp: display processor
+created` per panel, focus follows the newest presenting slot, DP re-binds on presenter change
+(`[pipeline] panel DP re-bound to hwnd=…`, ~200 ms flat blit), activate/deactivate rebuild nothing,
+`[TERMINATE]`/`[EXIT]` silent, render thread ≈1 ms/frame. Not yet eyeballed with a person in front
+of the panel (the SR lens auto-drops to 2D on tracking loss, so the `[force_3d]` 2 s re-assert
+cadence in an empty room is expected). Known: the service window is destroyed+recreated (with the DP)
+after ESC — a hide would be cheaper; the workspace `Late-weave saturation backoff` governor misreads
+the hidden service window's waitable.
+
+## 5. Validation (done-when for the slice)
 
 - sim_display first, then SR: hosted cube ×2, forced-IPC handle cube ×2, hosted + handle,
   then shell attach/detach with all of them alive: exactly one `DP created` per panel in the
