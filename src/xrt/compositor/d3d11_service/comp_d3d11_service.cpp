@@ -2189,6 +2189,21 @@ struct d3d11_multi_compositor
 	//! every focused_slot write site individually.
 	int32_t focused_slot_signaled_value;
 
+	//! #964 Phase A: OS-foreground debounce state for pipeline_pick_focus.
+	//!
+	//! Under the default presenter policy the panel follows the OS foreground
+	//! window: Alt-Tab / click a client's window and that client takes the
+	//! panel. `focus_fg_last` is the last `GetForegroundWindow` sample
+	//! (normalised through GA_ROOT) and `focus_fg_stable` counts how many
+	//! consecutive frames it has held. A foreground CHANGE is only acted on
+	//! once it has been stable for PIPELINE_FOCUS_FG_STABLE_FRAMES samples —
+	//! Alt-Tab walks the z-order through intermediate windows and would
+	//! otherwise strobe the panel across every app it passes.
+	//!
+	//! Render-thread only, under render_mutex; no other reader.
+	HWND focus_fg_last;
+	int focus_fg_stable;
+
 	//! Phase 2.K: vsync-aligned frame counter. Incremented once per
 	//! `multi_compositor_render` and read by the public-API drain to emit
 	//! FRAME_TICK events (capped per-batch) so controllers can pace
@@ -8565,6 +8580,145 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	sys->render_diag_pipe_flat_present.fetch_add(1, std::memory_order_relaxed);
 }
 
+//! #964 Phase A: consecutive identical GetForegroundWindow samples (≈ frames)
+//! required before a foreground CHANGE is allowed to move the panel. Alt-Tab
+//! and click-to-activate both walk through transient activations; two samples
+//! is enough to let them settle without being perceptible.
+#define PIPELINE_FOCUS_FG_STABLE_FRAMES 2
+
+/*!
+ * #964 Phase A (D-3/D-5): pick the slot that owns the panel this frame.
+ *
+ * "Focus follows the OS foreground window": when the user Alt-Tabs to (or
+ * clicks) a client's window, that client takes the panel. No hotkeys — the
+ * runtime never *steals* activation, it only follows it.
+ *
+ * A slot matches the foreground window when the foreground HWND is the window
+ * that slot presents through:
+ *   - APP_HWND / CLIENT_TEXTURE : `c->render.hwnd` (both are the app's own
+ *     `external_window_handle`; CLIENT_TEXTURE just has no swap chain on it)
+ *   - SELF (present-owner)      : `c->render.weave_hwnd`
+ *   - SERVICE_WINDOW (hosted)   : `mc->hwnd` — the ONE service window, so it
+ *     cannot tell two hosted clients apart. Prefer the current holder if it is
+ *     hosted, else the newest hosted slot.
+ * A client's own `app_hwnd` also counts for any presenter kind, so a hosted
+ * client that still owns a real window is reachable by Alt-Tabbing to it.
+ *
+ * When the foreground window belongs to no client at all (an editor, a
+ * terminal, the desktop) the panel does NOT change hands: the current holder
+ * keeps it. Only when the holder stops presenting does the newest-presenting
+ * fallback (#962) pick its successor — which is also the rule at cold start,
+ * before anything has ever been focused.
+ *
+ * Render thread, under render_mutex. `GetForegroundWindow`/`GetAncestor` are
+ * cheap, non-blocking reads of the shell's global state (no cross-process SendMessage).
+ *
+ * Called only from pipeline_default_policy_render, i.e. only under
+ * `pipeline_always_on(sys) && !sys->workspace_mode`: with a controller
+ * attached the controller owns focus, and the legacy path never gets here.
+ *
+ * @param[out] out_reason "foreground" | "newest" | "fallback" — why the
+ *                        returned slot won. Only meaningful on a change.
+ */
+static int32_t
+pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, const char **out_reason)
+{
+	(void)sys;
+
+	const int32_t cur = mc->focused_slot;
+	const bool cur_live = cur >= 0 && cur < D3D11_MULTI_MAX_CLIENTS && pipeline_slot_presenting(&mc->clients[cur]);
+
+	/* (a) The standing fallback: the NEWEST presenting slot (#962). Also the
+	 * answer at cold start and whenever the previous holder stops presenting. */
+	int32_t newest = -1;
+	uint64_t newest_ns = 0;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (!pipeline_slot_presenting(&mc->clients[s])) {
+			continue;
+		}
+		if (newest < 0 || mc->clients[s].first_frame_ns >= newest_ns) {
+			newest = s;
+			newest_ns = mc->clients[s].first_frame_ns;
+		}
+	}
+
+	/* (b) Sample the OS foreground, normalised to its root window: a client
+	 * may activate a child/owned window (a dialog, a Chromium widget host) and
+	 * we still want the top-level identity we bound the presenter to. (The
+	 * GA_ROOT caveat elsewhere in the tree is about weave PHASE coordinates —
+	 * identity matching is exactly what GA_ROOT is for.) */
+	HWND fg = GetForegroundWindow();
+	if (fg != nullptr) {
+		HWND root = GetAncestor(fg, GA_ROOT);
+		if (root != nullptr) {
+			fg = root;
+		}
+	}
+	if (fg != mc->focus_fg_last) {
+		mc->focus_fg_last = fg;
+		mc->focus_fg_stable = 1;
+	} else if (mc->focus_fg_stable < PIPELINE_FOCUS_FG_STABLE_FRAMES) {
+		mc->focus_fg_stable++;
+	}
+	const bool fg_settled = fg != nullptr && mc->focus_fg_stable >= PIPELINE_FOCUS_FG_STABLE_FRAMES;
+
+	/* (c) Does the settled foreground window belong to a presenting client? */
+	if (fg_settled) {
+		int32_t match = -1;
+		int32_t hosted = -1; // best SERVICE_WINDOW candidate when fg == mc->hwnd
+		const bool fg_is_service_window = (mc->hwnd != nullptr && fg == mc->hwnd);
+
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS && match < 0; s++) {
+			struct d3d11_multi_client_slot *slot = &mc->clients[s];
+			if (!pipeline_slot_presenting(slot)) {
+				continue;
+			}
+			struct d3d11_service_compositor *c = slot->compositor;
+
+			HWND presented = nullptr;
+			switch (c->presenter) {
+			case PRESENTER_APP_HWND:
+			case PRESENTER_CLIENT_TEXTURE: presented = c->render.hwnd; break;
+			case PRESENTER_SELF: presented = c->render.weave_hwnd; break;
+			default: break;
+			}
+
+			// The app's own window counts for EVERY presenter kind: a hosted
+			// client can still own a real HWND the user Alt-Tabs to.
+			if ((presented != nullptr && presented == fg) ||
+			    (slot->app_hwnd != nullptr && slot->app_hwnd == fg) ||
+			    (c->app_hwnd != nullptr && c->app_hwnd == fg)) {
+				match = s;
+				break;
+			}
+
+			if (fg_is_service_window && c->presenter == PRESENTER_SERVICE_WINDOW) {
+				if (s == cur) {
+					hosted = s; // the current holder wins outright
+				} else if (hosted != cur &&
+				           (hosted < 0 || slot->first_frame_ns >= mc->clients[hosted].first_frame_ns)) {
+					hosted = s;
+				}
+			}
+		}
+		if (match < 0) {
+			match = hosted;
+		}
+		if (match >= 0) {
+			*out_reason = "foreground";
+			return match;
+		}
+	}
+
+	/* (d) Foreground is not a client (or has not settled): hold the panel. */
+	if (cur_live) {
+		*out_reason = "hold";
+		return cur;
+	}
+	*out_reason = cur < 0 ? "newest" : "fallback";
+	return newest;
+}
+
 /*!
  * #964 (D-3): THE default presenter policy. Runs on the render thread with
  * render_mutex held, in place of the compose path, whenever no workspace
@@ -8584,27 +8738,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	uint32_t flat_count = 0;
 
 	/* (a) Focus. The compositor slot table is the ONE focus authority (D-5):
-	 * the "newest presenting client wins" default rule lives here now, and the
-	 * IPC layer mirrors it (sync_focus_from_compositor). */
+	 * the default rule lives here now, and the IPC layer mirrors it
+	 * (sync_focus_from_compositor). Phase A: the panel follows the OS
+	 * FOREGROUND window (pipeline_pick_focus), with newest-presenting (#962)
+	 * as the cold-start / holder-departed fallback. */
 	int32_t focused = mc->focused_slot;
 	{
-		/* #962 rule, unconditional: the NEWEST presenting slot holds focus
-		 * (a new app coming up takes the panel, like a new window coming to
-		 * the front); when it leaves, the next-newest survivor takes over.
-		 * Nothing else writes focus under the default policy. */
-		int32_t best = -1;
-		uint64_t best_ns = 0;
-		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-			if (!pipeline_slot_presenting(&mc->clients[s])) {
-				continue;
-			}
-			if (best < 0 || mc->clients[s].first_frame_ns >= best_ns) {
-				best = s;
-				best_ns = mc->clients[s].first_frame_ns;
-			}
-		}
+		const char *reason = "newest";
+		int32_t best = pipeline_pick_focus(sys, mc, &reason);
 		if (best != mc->focused_slot) {
-			U_LOG_W("[pipeline] default focus: slot %d -> %d", mc->focused_slot, best);
+			U_LOG_W("[pipeline] default focus: slot %d -> %d (%s)", mc->focused_slot, best, reason);
 			mc->focused_slot = best;
 			multi_compositor_update_input_forward(mc);
 			service_signal_workspace_wakeup(sys);

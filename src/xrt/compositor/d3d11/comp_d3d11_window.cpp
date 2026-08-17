@@ -1550,12 +1550,24 @@ window_thread_body(struct comp_d3d11_window *w)
 	// Visible windows use WS_OVERLAPPEDWINDOW for normal window chrome.
 	DWORD style = w->hidden ? WS_POPUP : WS_OVERLAPPEDWINDOW;
 
+	// #964 Phase A: the service window is a first-class presenter that the
+	// user must be able to Alt-Tab BACK to. It is created, immediately
+	// fullscreened (which strips WS_OVERLAPPEDWINDOW, leaving a bare popup)
+	// and then hidden until it becomes the active presenter \u2014 so the shell
+	// never sees it during the show pass that normally enrols a window in the
+	// taskbar / Alt-Tab list. WS_EX_APPWINDOW forces that enrolment whenever
+	// the window is visible, independent of style bits and show ordering.
+	// Only on the start_hidden path: the legacy always-visible window and the
+	// SR-weaver `hidden` proxy window keep their historical ex-style of 0.
+	DWORD ex_style = w->start_hidden ? WS_EX_APPWINDOW : 0;
+
 	U_LOG_W("D3D11 window thread: Creating %s window at (%d, %d) size %ux%u",
 	        w->hidden ? "hidden" : "visible",
 	        (int)rc.left, (int)rc.top, w->requested_width, w->requested_height);
 
-	HWND hwnd = CreateWindowExW(0, szWindowClass, L"DisplayXR \u2014 D3D11 Native Compositor", style, rc.left, rc.top,
-	                            rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
+	HWND hwnd =
+	    CreateWindowExW(ex_style, szWindowClass, L"DisplayXR \u2014 D3D11 Native Compositor", style, rc.left,
+	                    rc.top, rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
 
 	if (hwnd == NULL) {
 		DWORD err = GetLastError();
