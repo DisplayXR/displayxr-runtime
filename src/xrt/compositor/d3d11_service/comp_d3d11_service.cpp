@@ -4387,11 +4387,69 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		res->owns_window = false;
 		res->window = nullptr;
 
+		/*
+		 * #1014 (Phase B): a HOSTED client — one with no window of its own —
+		 * gets its OWN runtime-created, taskbar-visible window instead of
+		 * sharing the single service window with every other hosted client.
+		 *
+		 * This is the legacy per-client hosted window resurrected as a
+		 * PRESENTER: from here on hosted is just an APP_HWND presenter whose
+		 * window happens to be runtime-owned, so it inherits the whole Phase A
+		 * machinery for free — its own taskbar / Alt-Tab entry, the foreground
+		 * and new-app focus rules, minimize-on-focus-loss, and per-window
+		 * ESC/close ending THAT client's session. Still one DP per panel: this
+		 * window never owns a display processor, the render thread binds the
+		 * panel DP to whichever presenter is focused.
+		 *
+		 * Created on the CLIENT'S IPC THREAD (the DXGI/WM rule), and the window
+		 * spawns its own message-pump thread. Minimized at birth when a
+		 * workspace controller is already driving — the workspace owns the
+		 * panel then, and a fresh fullscreen window would cover it; the user
+		 * restoring it from the taskbar is exactly the foreground override.
+		 */
+		if (external_hwnd == nullptr) {
+			xrt_result_t wret = comp_d3d11_window_create_ex(
+			    sys->output_width, sys->output_height, sys->base.info.display_screen_left,
+			    sys->base.info.display_screen_top, /*start_hidden*/ false, &res->window);
+			if (wret == XRT_SUCCESS && res->window != nullptr) {
+				res->hwnd = (HWND)comp_d3d11_window_get_hwnd(res->window);
+				res->owns_window = true;
+				if (c != nullptr) {
+					comp_d3d11_window_set_title(res->window, c->slot_app_name);
+				}
+				// Keyboard/mouse for a runtime-owned window, exactly as the
+				// legacy hosted path wired it.
+				if (xsysd != nullptr) {
+					comp_d3d11_window_set_system_devices(res->window, xsysd);
+				}
+				// TODO(#997/#1008): the drag phase-snap provider
+				// (comp_d3d11_window_set_snap_provider) is wired on the
+				// in-process path only; the service never has. These windows
+				// are fullscreen so there is nothing to snap yet — revisit
+				// with #1008's DP set_window re-bind.
+				if (sys->workspace_mode) {
+					comp_d3d11_window_minimize(res->window);
+				}
+				U_LOG_W("[pipeline] hosted client '%s' got its own window hwnd=%p (%s) (#1014)",
+				        c != nullptr ? c->slot_app_name : "?", (void *)res->hwnd,
+				        sys->workspace_mode ? "minimized — a controller is driving" : "visible");
+			} else {
+				// No window: fall through to the shared service window rather
+				// than failing the session.
+				U_LOG_E(
+				    "[pipeline] hosted client window create failed (%d) — falling back to the "
+				    "shared service-window presenter",
+				    (int)wret);
+				res->window = nullptr;
+				res->hwnd = nullptr;
+			}
+		}
+
 		uint32_t canvas_w = atlas_w;
 		uint32_t canvas_h = atlas_h;
-		if (external_hwnd != nullptr) {
+		if (res->hwnd != nullptr) {
 			RECT cr;
-			if (GetClientRect((HWND)external_hwnd, &cr)) {
+			if (GetClientRect(res->hwnd, &cr)) {
 				uint32_t cw = (uint32_t)(cr.right - cr.left);
 				uint32_t ch = (uint32_t)(cr.bottom - cr.top);
 				if (cw > 0 && ch > 0) {
@@ -4401,9 +4459,16 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			}
 		}
 
+		// SERVICE_WINDOW now means only "no window of our own to present into"
+		// — the shared window is the workspace compose target, plus the
+		// fallback when a per-client window or its swap chain could not be
+		// built. A runtime-owned window presents OPAQUE like any other
+		// APP_HWND: the DP owns see-through from the atlas alpha, so a hosted
+		// client asking for a transparent background needs no DComp route.
 		enum d3d11_presenter_kind kind = PRESENTER_SERVICE_WINDOW;
-		if (external_hwnd != nullptr) {
-			kind = transparent_hwnd ? PRESENTER_CLIENT_TEXTURE : PRESENTER_APP_HWND;
+		if (res->hwnd != nullptr) {
+			kind = (transparent_hwnd && external_hwnd != nullptr) ? PRESENTER_CLIENT_TEXTURE
+			                                                      : PRESENTER_APP_HWND;
 		}
 
 		if (kind == PRESENTER_CLIENT_TEXTURE) {
@@ -4516,6 +4581,15 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				                         "init_client_render_resources/app_hwnd_swapchain"); // #1002
 				res->swap_chain.reset();
 				kind = PRESENTER_SERVICE_WINDOW;
+				// #1014: if that was OUR window, it has no purpose now — the
+				// shared service window presents this client instead. Leaving
+				// it up would put a dead fullscreen window on the panel.
+				if (res->owns_window && res->window != nullptr) {
+					comp_d3d11_window_destroy(&res->window);
+				}
+				res->window = nullptr;
+				res->hwnd = nullptr;
+				res->owns_window = false;
 			} else {
 				if (sc_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
 					wil::com_ptr<IDXGISwapChain2> sc2;
@@ -8288,6 +8362,52 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
 			mc->dp_graveyard[i].retire_ns = 0;
 			mc->dp_graveyard[i].hwnd = nullptr;
 		}
+	}
+}
+
+/*!
+ * #1014: drop every panel DP bound to @p hwnd because that window is about to
+ * be DESTROYED.
+ *
+ * The one case where a DP must die synchronously. Everywhere else a rebind
+ * parks the old DP in the graveyard and lets it age out (a lock-free reader may
+ * still be inside a bounded call on it) — but the SR weaver subclasses the HWND
+ * it was created against, so destroying the window with a DP still attached
+ * re-enters the weaver's window procedure on a freed object. A destroyed window
+ * outranks the grace period.
+ *
+ * Only reachable when a client with a RUNTIME-OWNED window goes away, and the
+ * client that could have been driving that DP is gone by then. The render
+ * thread binds a fresh DP to whoever is focused on its next frame.
+ *
+ * Render thread or an IPC thread holding render_mutex.
+ */
+static void
+pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
+{
+	if (mc == nullptr || hwnd == nullptr) {
+		return;
+	}
+	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd) {
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *old = mc->display_processor;
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		(void)DP_REQUEST_DISPLAY_MODE(old, false);
+		xrt_display_processor_d3d11_destroy(&old);
+		U_LOG_W("[pipeline] panel DP released with its window hwnd=%p — rebinds on the next frame (#1014)",
+		        (void *)hwnd);
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(mc->dp_graveyard); i++) {
+		if (mc->dp_graveyard[i].dp == nullptr || mc->dp_graveyard[i].hwnd != hwnd) {
+			continue;
+		}
+		xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[i].dp);
+		mc->dp_graveyard[i].dp = nullptr;
+		mc->dp_graveyard[i].retire_ns = 0;
+		mc->dp_graveyard[i].hwnd = nullptr;
 	}
 }
 
@@ -15754,6 +15874,14 @@ compositor_destroy(struct xrt_compositor *xc)
 		// unregister above has made the survivor scan accurate.
 		service_failsafe_hardware_2d_on_teardown(sys, c);
 
+		// #1014: this client may own a runtime-created window that fini is
+		// about to destroy — and the panel DP subclasses the HWND it was
+		// created against. Detach it FIRST, still under render_mutex, or
+		// DestroyWindow re-enters the weaver on a live DP.
+		if (c->render.owns_window && c->render.hwnd != nullptr) {
+			pipeline_release_panel_dp_for_hwnd(sys->multi_comp, c->render.hwnd);
+		}
+
 		// Tear down per-client render resources (window, swap chain, DP,
 		// atlas textures / SRVs / RTVs) while still holding render_mutex.
 		fini_client_render_resources(&c->render);
@@ -18963,17 +19091,25 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_c
 	}
 
 	// #964 (#994): on the pipeline path "the runtime owns this client's window"
-	// is exactly "its presenter is the service window" — a hosted client with
-	// no HWND of its own, which is what the qwerty-head branch is for. Answered
-	// per client rather than from whoever committed last.
+	// means the client brought no HWND of its own — which is what the
+	// qwerty-head branch is for. Answered per client rather than from whoever
+	// committed last.
+	//
+	// #1014: that is no longer just "presenter is the service window". A
+	// hosted client now normally gets its OWN runtime-created window and
+	// presents as APP_HWND — still runtime-owned, still qwerty-headed, so
+	// `render.owns_window` is the real question. SERVICE_WINDOW stays in the
+	// answer for the fallback case (no per-client window could be built).
 	if (pipeline_always_on(sys)) {
+		auto owns = [](struct d3d11_service_compositor *pc) {
+			return pc != nullptr && (pc->presenter == PRESENTER_SERVICE_WINDOW ||
+			                         (pc->presenter == PRESENTER_APP_HWND && pc->render.owns_window));
+		};
 		if (xc != nullptr) {
-			struct d3d11_service_compositor *pc = d3d11_service_compositor_from_xrt(xc);
-			return pc != nullptr && pc->presenter == PRESENTER_SERVICE_WINDOW;
+			return owns(d3d11_service_compositor_from_xrt(xc));
 		}
 		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
-		return sys->active_compositor != nullptr &&
-		       sys->active_compositor->presenter == PRESENTER_SERVICE_WINDOW;
+		return owns(sys->active_compositor);
 	}
 
 	// Non-workspace mode: check the active compositor's actual ownership.
@@ -20955,8 +21091,15 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
 				continue;
 			}
-			if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
-				ShowWindowAsync(slot->app_hwnd, SW_MINIMIZE);
+			// #1014: a hosted client's window is runtime-owned, so it is on
+			// the presenter (`render.hwnd`), not on `slot->app_hwnd` — which
+			// only ever holds an app-PROVIDED HWND. Park whichever it has.
+			HWND park = slot->app_hwnd;
+			if (park == nullptr && slot->compositor != nullptr && slot->compositor->render.owns_window) {
+				park = slot->compositor->render.hwnd;
+			}
+			if (park != nullptr && IsWindow(park)) {
+				ShowWindowAsync(park, SW_MINIMIZE);
 			}
 		}
 
@@ -21141,11 +21284,19 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 				mc->capture_client_count--;
 				continue;
 			}
-			// An app that presents into its OWN window needs that window back.
-			if (slot->compositor != nullptr && slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd) &&
-			    (slot->compositor->presenter == PRESENTER_APP_HWND ||
-			     slot->compositor->presenter == PRESENTER_CLIENT_TEXTURE)) {
-				ShowWindowAsync(slot->app_hwnd, SW_SHOWNOACTIVATE);
+			// An app that presents into its OWN window needs that window back
+			// — including (#1014) a hosted client whose window WE created and
+			// parked at activate. Restoring them is what makes shell death or
+			// Ctrl+Space leave every client reachable instead of stranded.
+			if (slot->compositor != nullptr && (slot->compositor->presenter == PRESENTER_APP_HWND ||
+			                                    slot->compositor->presenter == PRESENTER_CLIENT_TEXTURE)) {
+				HWND show = slot->app_hwnd;
+				if (show == nullptr && slot->compositor->render.owns_window) {
+					show = slot->compositor->render.hwnd;
+				}
+				if (show != nullptr && IsWindow(show)) {
+					ShowWindowAsync(show, SW_SHOWNOACTIVATE);
+				}
 			}
 		}
 

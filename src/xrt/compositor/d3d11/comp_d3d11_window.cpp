@@ -1550,16 +1550,18 @@ window_thread_body(struct comp_d3d11_window *w)
 	// Visible windows use WS_OVERLAPPEDWINDOW for normal window chrome.
 	DWORD style = w->hidden ? WS_POPUP : WS_OVERLAPPEDWINDOW;
 
-	// #964 Phase A: the service window is a first-class presenter that the
-	// user must be able to Alt-Tab BACK to. It is created, immediately
+	// #964 Phase A / #1014: every window we create here is a first-class
+	// presenter the user must be able to Alt-Tab to \u2014 the service window, and
+	// (since #1014) one per hosted client. They are created, immediately
 	// fullscreened (which strips WS_OVERLAPPEDWINDOW, leaving a bare popup)
-	// and then hidden until it becomes the active presenter \u2014 so the shell
-	// never sees it during the show pass that normally enrols a window in the
-	// taskbar / Alt-Tab list. WS_EX_APPWINDOW forces that enrolment whenever
-	// the window is visible, independent of style bits and show ordering.
-	// Only on the start_hidden path: the legacy always-visible window and the
-	// SR-weaver `hidden` proxy window keep their historical ex-style of 0.
-	DWORD ex_style = w->start_hidden ? WS_EX_APPWINDOW : 0;
+	// and possibly hidden or minimized before the shell ever sees the show
+	// pass that normally enrols a window in the taskbar / Alt-Tab list.
+	// WS_EX_APPWINDOW forces that enrolment whenever the window is visible,
+	// independent of style bits and show ordering.
+	//
+	// The `hidden` window is the exception: it is the SR-weaver HWND proxy for
+	// shared-texture mode, never shown, and has no business in the taskbar.
+	DWORD ex_style = w->hidden ? 0 : WS_EX_APPWINDOW;
 
 	U_LOG_W("D3D11 window thread: Creating %s window at (%d, %d) size %ux%u",
 	        w->hidden ? "hidden" : "visible",
@@ -1834,6 +1836,21 @@ comp_d3d11_window_minimize(struct comp_d3d11_window *window)
 	if (!IsIconic(window->hwnd)) {
 		ShowWindowAsync(window->hwnd, SW_MINIMIZE);
 	}
+}
+
+extern "C" void
+comp_d3d11_window_set_title(struct comp_d3d11_window *window, const char *title)
+{
+	if (window == NULL || window->hwnd == NULL || title == NULL || title[0] == '\0') {
+		return;
+	}
+	// #1014: the taskbar / Alt-Tab entry has to say WHICH app it is, so a
+	// hosted client's runtime-owned window is titled with its application
+	// name. SetWindowText is a SendMessage to the window thread, and the
+	// caller is the client's IPC thread — bounded with a timeout rather than
+	// trusted, so a wedged window thread cannot stall session create.
+	(void)SendMessageTimeoutA(window->hwnd, WM_SETTEXT, 0, (LPARAM)title, SMTO_ABORTIFHUNG | SMTO_NORMAL, 1000,
+	                          NULL);
 }
 
 
