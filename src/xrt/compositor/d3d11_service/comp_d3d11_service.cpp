@@ -15561,6 +15561,31 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
 	}
 }
 
+/*!
+ * #965 — THE PRESENT-OWNER SUBMIT CONTRACT.
+ *
+ * This is the one path where a client's own thread drives the panel display
+ * processor. `displayxr-browser` weaves synchronously on Viz's present thread
+ * by design (zero-lag inline-3D), so it stays synchronous; what it may do is
+ * bounded:
+ *
+ *  - **Serialized by the panel owner.** Held under `sys->render_mutex` for the
+ *    weave itself, so it can never run concurrently with the render thread's
+ *    own `process_atlas` on the same DP or the same immediate context.
+ *  - **Bounded.** The only wait is the caller's keyed-mutex acquire (4 ms cap);
+ *    everything else is copy + `process_atlas` + fence signal. Nothing here may
+ *    block on DWM, on another client, or on an unbounded vendor call.
+ *  - **No mode or geometry mutation.** `sys->tile_columns/rows`, `view_*`,
+ *    `display_*` and `hardware_display_3d` are NOT written here. The two
+ *    writers this path used to have — `service_apply_pending_mode` and
+ *    `weave_force_3d_if_needed` — now enqueue a `WS_CMD_MODE_TRANSITION` and
+ *    the render thread applies it (#966).
+ *  - **DP only via `panel_dp()`**, resolved AFTER the lock is taken (a rebind
+ *    between the read and the call was the #1002-adjacent use-after-free), and
+ *    only on behalf of a client that holds the panel lease — an unfocused
+ *    present-owner weaves into its own handback texture but does not get to
+ *    move the panel.
+ */
 extern "C" bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,

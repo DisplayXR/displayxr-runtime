@@ -281,12 +281,40 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 | trampoline, watchdogs ×2 | `service_orchestrator.c:634, 418, 510` | §1 | none |
 | per-client IPC ×N | `ipc_server_process.c:1029` | blocking `ReadFile` → `ipc_dispatch` (bare `switch`, 131 handlers, no auth layer, `proto.py:266-330`) — **all handlers, including `compositor_layer_commit`, `weave_submit`, `request_display_mode`, session create/destroy, DP factory calls** | none |
 | capture/render | `comp_d3d11_service.cpp:6186` (workspace only) | pace on `frame_latency_waitable`/`render_wakeup_event` (100/14 ms) → `render_mutex` (plain `lock_guard`) → `multi_compositor_render` (the whole hold window) → `Sleep(2)` if waiters | try/catch |
-| D3D11 window | `comp_d3d11_window.cpp:1650` (one per service window **and one per hosted standalone client**) | WndProc, input ring; `WM_CLOSE` calls the vendor DP **with no lock** (`comp_d3d11_window.cpp:643-650`) | try/catch |
+| D3D11 window | `comp_d3d11_window.cpp:1650` (one per service window **and one per hosted standalone client**) | WndProc, input ring; `WM_CLOSE` leaves a flag the render thread consumes — it no longer touches the vendor DP (#966) | try/catch |
 | window-op worker | `comp_d3d11_service.cpp:1398` | `SetWindowPlacement`-family restores off the render path (#925 rank 7) | try/catch, no restart |
 | WinRT capture pool | `d3d11_capture.cpp:285-300` | `on_frame_arrived` → `CopyResource` on the **shared immediate context, outside `render_mutex`** (relies on `SetMultithreadProtected(TRUE)`, `comp_d3d11_service.cpp:14697-14705`) | partial |
 | provider threads | provider-owned (`ultraleap_provider.cpp:568` poll thread; net_input hub) | LeapC polling, #941 idle watchdog (a branch of the poll thread) | none |
 
-### 3.2 Locks
+### 3.2 Lock order (as of #964–#966)
+
+```
+c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
+                                capture ctx->mutex, clients_mutex, ws_cmd_mutex }
+```
+
+- **`render_mutex` is the panel lock.** Everything downstream of it is a leaf:
+  take them under it, never the reverse. It is recursive; every acquirer except
+  the render thread uses `render_mutex_fair_lock` (#925 starvation).
+- **`ws_cmd_mutex` is a leaf** held for nanoseconds. The drain takes it *under*
+  `render_mutex`; a producer takes it alone and must not then take
+  `render_mutex` while holding it.
+- **The display processor is touched on the render thread only** — the S3 drain,
+  the default-policy direct path, and the presenter re-bind — with two
+  exceptions that hold `render_mutex` end to end: `weave_submit` and
+  `weave_snap_window_rect` (#965). The window thread never touches it: `WM_CLOSE`
+  leaves a flag the render thread consumes (#966).
+- **Mode and geometry** (`sys->tile_columns/rows`, `view_*`, `display_*`,
+  `hardware_display_3d`) are written only by `apply_mode_transition`, which runs
+  on the render thread via `WS_CMD_MODE_TRANSITION` (#966). IPC threads enqueue;
+  they decide the lease/veto verdict themselves and report it synchronously.
+- **Retiring a panel DP never destroys it inline** — it goes to `mc->dp_graveyard`
+  and the render thread frees it after `DXR_DP_GRAVEYARD_MS` (#1002), so a
+  lock-free reader that latched the pointer cannot fault.
+- Never join the render thread under `render_mutex`; never hold
+  `global_state.lock` across a compositor call.
+
+### 3.3 Locks
 
 | Lock | Type / scope | Guards | Notable holders |
 |---|---|---|---|
