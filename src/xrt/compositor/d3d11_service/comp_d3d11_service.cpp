@@ -2130,6 +2130,10 @@ struct d3d11_multi_compositor
 	//! recreates the DP bound to the new one (pipeline_bind_panel_dp). NULL
 	//! when no DP exists. One DP per panel, always.
 	HWND panel_dp_hwnd;
+	//! #964: transparency mode the panel DP currently carries (true = alpha-gate only,
+	//! the presenter composes; false = opaque / DP owns see-through). Re-applied on a
+	//! same-window presenter-kind change (present-owner vs opaque app).
+	bool panel_dp_client_presents;
 
 	//! #964: pacing hand-off for an APP_HWND active presenter.
 	//!
@@ -8272,7 +8276,24 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		return; // #1002: never build a DP on a dead device
 	}
 	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd) {
-		return; // already bound where we want it
+		// Already bound where we want it -- but the presenter KIND may have
+		// changed on the same window (present-owner <-> opaque app): keep the
+		// DP's transparency mode in step with the presenter.
+		if (mc->panel_dp_client_presents != client_presents) {
+			(void)xrt_display_processor_d3d11_set_transparent_background(mc->display_processor,
+			                                                             client_presents, client_presents);
+			mc->panel_dp_client_presents = client_presents;
+			static int64_t s_last_tp_log_ns = 0;
+			const int64_t tp_now_ns = (int64_t)os_monotonic_get_ns();
+			if (tp_now_ns - s_last_tp_log_ns > 5LL * 1000000000LL) {
+				s_last_tp_log_ns = tp_now_ns;
+				U_LOG_W(
+				    "[pipeline] panel DP transparency -> client_presents=%d (same window; a background"
+				    " present-owner and an opaque presenter alternate; throttled)",
+				    (int)client_presents);
+			}
+		}
+		return;
 	}
 
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
@@ -8336,6 +8357,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// PUBLISH. Single pointer store; readers load it once into a local.
 	mc->display_processor = fresh;
 	mc->panel_dp_hwnd = hwnd;
+	mc->panel_dp_client_presents = client_presents;
 
 	if (mc->window != nullptr && hwnd == mc->hwnd) {
 		comp_d3d11_window_set_workspace_dp(mc->window, fresh);
@@ -8692,7 +8714,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		// pace on it.
 		mc->pace_app_waitable = nullptr;
 		mc->pace_app_sc = nullptr;
-		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ false);
+		// A present-owner composes the woven output over its OWN window content
+		// (displayxr-browser: page below, inline-3D tiles above, alpha outside
+		// the tiles). The DP must alpha-gate only -- never compose-under a
+		// captured background, never go opaque -- which is exactly the #551
+		// client_presents=true configuration legacy gave its per-client DP.
+		// Bound with false, the woven layer came out opaque and hid the page.
+		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true);
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
@@ -15755,6 +15783,21 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			        (int)sys->workspace_mode);
 		}
 		return false;
+	}
+	// #964: a present-owner composes the woven output over its OWN window, so
+	// the DP must alpha-gate only for THIS call even when the panel DP is
+	// currently configured for an opaque presenter (a hosted/handle app has
+	// focus and the browser weaves in the background). Legacy gave every
+	// present-owner its own transparent DP; with one DP per panel the mode is
+	// flipped around the weave and restored on every exit path (RAII, under
+	// render_mutex — nobody else touches the DP meanwhile). Toggle ON CHANGE
+	// only (the plug-in logs every switch): the mode is recorded on mc and the
+	// render thread's pipeline_bind_panel_dp() switches it back for its own
+	// opaque presenter on its next frame.
+	if (dp_is_shared && sys->multi_comp != nullptr && !sys->multi_comp->panel_dp_client_presents) {
+		if (xrt_display_processor_d3d11_set_transparent_background(dp, true, true)) {
+			sys->multi_comp->panel_dp_client_presents = true;
+		}
 	}
 	if (dp_is_shared) {
 		static std::atomic_flag s_logged = ATOMIC_FLAG_INIT;
