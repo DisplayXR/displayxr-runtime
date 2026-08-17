@@ -8948,8 +8948,30 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		bool want_shown = (kind == PRESENTER_SERVICE_WINDOW);
 		if (want_shown != mc->service_window_shown && mc->window != nullptr) {
 			mc->service_window_shown = want_shown;
-			comp_d3d11_window_set_visible(mc->window, want_shown);
-			U_LOG_W("[pipeline] service window %s", want_shown ? "shown" : "hidden");
+			if (want_shown) {
+				comp_d3d11_window_set_visible(mc->window, true);
+			} else {
+				/* Alt-Tab reachability (#964 Phase A): while any hosted client
+				 * still lives behind this window, PARK it (minimize) instead of
+				 * hiding — a hidden window has no Alt-Tab entry, so the hosted
+				 * app would be unreachable once another app takes the panel.
+				 * With no hosted clients at all, hide as before. */
+				bool hosted_alive = false;
+				for (int hs = 0; hs < D3D11_MULTI_MAX_CLIENTS; hs++) {
+					struct d3d11_service_compositor *hc = mc->clients[hs].compositor;
+					if (hc != nullptr && hc->presenter == PRESENTER_SERVICE_WINDOW &&
+					    pipeline_slot_presenting(&mc->clients[hs])) {
+						hosted_alive = true;
+						break;
+					}
+				}
+				if (hosted_alive) {
+					comp_d3d11_window_minimize(mc->window);
+				} else {
+					comp_d3d11_window_set_visible(mc->window, false);
+				}
+			}
+			U_LOG_W("[pipeline] service window %s", want_shown ? "shown" : "parked/hidden");
 		}
 	}
 
