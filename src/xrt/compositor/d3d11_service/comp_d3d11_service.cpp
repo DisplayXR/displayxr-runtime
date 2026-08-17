@@ -18889,13 +18889,34 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 	// #964 (#994): under the DEFAULT presenter policy there is no virtual
 	// window — the client's Kooima canvas is its PRESENTER's rect. An app
 	// presenting into its own HWND gets that window's rect; a hosted client
-	// presenting through the service window gets the whole display. Under a
-	// controller the slot rect below is still the answer.
-	if (pipeline_always_on(sys) && !sys->workspace_mode) {
-		if (c->presenter == PRESENTER_APP_HWND || c->presenter == PRESENTER_CLIENT_TEXTURE) {
-			return comp_d3d11_service_get_client_app_window_metrics(xsysc, xc, out_metrics);
+	// presenting through the service window gets the whole display.
+	//
+	// #1014 follow-up: the test is NOT "is a controller attached" — it is "is
+	// this client a PLACED workspace tile". Since workspace scoping, only
+	// shell-launched clients are ever placed, so with the shell up every other
+	// client (the browser, anything running under the foreground override)
+	// still had a slot and fell to the slot branch below — collecting the
+	// SENTINEL pose an unplaced slot carries (~30% size, centred). Observed:
+	// the browser's inline-3D rig computed against that phantom box while the
+	// shell composed a placed modelviewer. An unplaced slot has no virtual
+	// window, so it resolves exactly like the default policy.
+	bool placed_tile = false;
+	if (sys->workspace_mode && sys->multi_comp != nullptr) {
+		int placed_idx = multi_comp_find_slot(sys->multi_comp, c);
+		placed_tile = placed_idx >= 0 && sys->multi_comp->clients[placed_idx].placed;
+	}
+	if (pipeline_always_on(sys) && !placed_tile) {
+		// SELF (present-owner) resolves through the same call: its window is
+		// `render.weave_hwnd`, which the HWND resolution there now considers.
+		if (c->presenter == PRESENTER_APP_HWND || c->presenter == PRESENTER_CLIENT_TEXTURE ||
+		    c->presenter == PRESENTER_SELF) {
+			if (comp_d3d11_service_get_client_app_window_metrics(xsysc, xc, out_metrics)) {
+				return true;
+			}
+			// No usable window (not yet bound, already gone): fall through to
+			// the display rect rather than handing back an invalid canvas.
 		}
-		if (c->presenter == PRESENTER_SERVICE_WINDOW) {
+		{
 			float dw_m = sys->base.info.display_width_m;
 			float dh_m = sys->base.info.display_height_m;
 			uint32_t dpw = sys->base.info.display_pixel_width;
@@ -18921,8 +18942,6 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 			out_metrics->valid = true;
 			return true;
 		}
-		out_metrics->valid = false;
-		return false;
 	}
 
 	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
@@ -19011,10 +19030,20 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
-	// app_hwnd is only populated in workspace mode; outside it the client's
-	// external HWND lives on the per-client render resources (set by
-	// init_client_render_resources from xsi->external_window_handle).
-	HWND hwnd = c->app_hwnd;
+	// Which window IS this client's canvas?
+	//
+	// - A present-owner (#625 XR_DXR_weave, e.g. displayxr-browser) presents
+	//   the woven output into `weave_hwnd`; that is its canvas, and it wins —
+	//   the same precedence the weave paths use. Null for everyone else, so
+	//   this reorders nothing for other clients (#1014 follow-up).
+	// - `app_hwnd` is only populated in workspace mode.
+	// - Otherwise the client's HWND lives on the per-client render resources:
+	//   its external binding, or (since #1014) the runtime-created window a
+	//   hosted client presents into — either way the right rect.
+	HWND hwnd = c->render.weave_hwnd;
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = c->app_hwnd;
+	}
 	if (hwnd == nullptr || !IsWindow(hwnd)) {
 		hwnd = c->render.hwnd;
 	}
@@ -19087,7 +19116,24 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_c
 	// Kooima with real DP eye tracking, not the camera-centric qwerty path.
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	if (sys->workspace_mode) {
-		return false;
+		// ...but only for the clients the controller actually COMPOSES.
+		// #1014 follow-up: since workspace scoping only shell-launched clients
+		// are ever placed, so with the shell up an outside app (the browser,
+		// anything on the foreground override) landed here and was told the
+		// runtime does not own its window — flipping use_qwerty_head and the
+		// view-rig branch under it. An UNPLACED slot is not a workspace tile:
+		// it answers like the default policy below.
+		bool placed_tile = false;
+		if (sys->multi_comp != nullptr && xc != nullptr) {
+			struct d3d11_service_compositor *wc = d3d11_service_compositor_from_xrt(xc);
+			int placed_idx = multi_comp_find_slot(sys->multi_comp, wc);
+			placed_tile = placed_idx >= 0 && sys->multi_comp->clients[placed_idx].placed;
+		} else {
+			placed_tile = true; // no per-client question asked — keep today's answer
+		}
+		if (placed_tile) {
+			return false;
+		}
 	}
 
 	// #964 (#994): on the pipeline path "the runtime owns this client's window"
