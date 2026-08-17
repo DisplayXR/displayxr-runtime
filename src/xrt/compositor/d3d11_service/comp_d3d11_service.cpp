@@ -9998,7 +9998,9 @@ service_update_slot_content_dims(struct d3d11_service_system *sys,
                                  uint32_t content_view_w,
                                  uint32_t content_view_h)
 {
-	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+	// #964 (D-1/D-5): the slot table exists whenever the pipeline does, not
+	// only under a controller — it is the readiness + focus authority now.
+	if ((!sys->workspace_mode && !pipeline_always_on(sys)) || sys->multi_comp == nullptr) {
 		return;
 	}
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -10701,7 +10703,9 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 static void
 service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_service_compositor *c, bool zones_frame)
 {
-	struct xrt_display_processor_d3d11 *dp = c->render.display_processor;
+	// #964 D-4: one DP per panel — the wish goes to the panel DP on the
+	// pipeline path, to the client's own DP on the legacy one.
+	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
 
 	if (!zones_frame) {
 		if (c->zone_published && dp != nullptr) {
@@ -10815,8 +10819,12 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 			deny = XRT_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED;
 		}
 	}
+	// #964 (D-6): the panel DP — the multi-comp's shared one on the pipeline
+	// path, the client's own on the legacy one. Callers on an IPC thread hold
+	// render_mutex around this whole call (the render thread drives the same DP).
+	struct xrt_display_processor_d3d11 *xdp = panel_dp(sys, c);
 	if (deny == XRT_DISPLAY_MODE_DENIAL_REASON_NONE &&
-	    (c->render.display_processor == nullptr || head == nullptr || head->hmd == NULL)) {
+	    (xdp == nullptr || head == nullptr || head->hmd == NULL)) {
 		deny = XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR;
 	}
 	if (deny != XRT_DISPLAY_MODE_DENIAL_REASON_NONE) {
@@ -10855,7 +10863,7 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	// #776 blocker 4 lives inside apply_mode_transition: it drives the head
 	// device's OUTPUT_MODE (sim_display's only mode lever) alongside the DP's
 	// hardware request, DP first, events after confirmation (#761).
-	bool landed = apply_mode_transition(sys, head, c->render.display_processor, target_idx, want_3d, "app_mode");
+	bool landed = apply_mode_transition(sys, head, xdp, target_idx, want_3d, "app_mode");
 	if (!landed) {
 		push_mode_request_denied(c, req_mode, req_hw,
 		                         XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED);
@@ -10949,7 +10957,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// The lock-free pre-scan keeps the hot path free of a new render_mutex
 	// acquire: slot bindings only change under the lock, so a stale read
 	// here at worst defers the re-register by one commit.
-	if (sys->workspace_mode && sys->multi_comp != nullptr && c->workspace_slot_eligible) {
+	// #964: also on the pipeline path without a controller — a slot is how a
+	// client reaches the panel at all now, so losing one must self-heal.
+	if ((sys->workspace_mode || pipeline_always_on(sys)) && sys->multi_comp != nullptr &&
+	    c->workspace_slot_eligible) {
 		bool have_slot = false;
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			if (sys->multi_comp->clients[s].active &&
@@ -11026,7 +11037,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		in_size_move = comp_d3d11_window_is_in_size_move(c->render.window);
 	}
 
-	if (c->render.hwnd != nullptr && c->render.swap_chain) {
+	bool want_resize_pass = c->render.hwnd != nullptr && c->render.swap_chain;
+	if (want_resize_pass && pipeline_always_on(sys)) {
+		// #964: the APP_HWND presenter's swap chain lives here (this is the
+		// client's own IPC thread — the only thread allowed to touch DXGI for
+		// the app's window). Probe LOCK-FREE first: taking render_mutex on
+		// every commit of every client is the #925 starvation pattern, and a
+		// resize is a rare, user-driven event. The probe also refreshes the
+		// client's canvas, which the render thread's direct path weaves against.
+		RECT probe = {};
+		DXGI_SWAP_CHAIN_DESC1 probe_desc = {};
+		c->render.swap_chain->GetDesc1(&probe_desc);
+		want_resize_pass = false;
+		if (GetClientRect(c->render.hwnd, &probe)) {
+			uint32_t pw = static_cast<uint32_t>(probe.right - probe.left);
+			uint32_t ph = static_cast<uint32_t>(probe.bottom - probe.top);
+			if (pw > 0 && ph > 0) {
+				if (c->presenter == PRESENTER_APP_HWND) {
+					c->canvas_w = pw;
+					c->canvas_h = ph;
+				}
+				want_resize_pass = (probe_desc.Width != pw || probe_desc.Height != ph);
+			}
+		}
+	}
+
+	if (want_resize_pass) {
 		/*
 		 * Everything below releases and rebuilds objects the RENDER thread
 		 * reads: this client's back_buffer_rtv / swap_chain (multi_compositor_render
@@ -11045,6 +11081,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
 			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
 			uint32_t client_height = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+
+			// #964: the APP_HWND presenter's canvas IS its window client rect.
+			// Recorded every commit (cheap) so the render thread's direct path
+			// always weaves against the size the app is actually rendering for.
+			if (pipeline_always_on(sys) && c->presenter == PRESENTER_APP_HWND && client_width > 0 &&
+			    client_height > 0) {
+				c->canvas_w = client_width;
+				c->canvas_h = client_height;
+			}
 
 			// Check if swap chain size matches window client area
 			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
@@ -11085,6 +11130,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// The conservative min-ratio shrink here can make the atlas
 					// narrower than the bridge-computed content, clipping it.
 					// The display processor handles mismatched stereo/target sizes via stretching.
+					//
+					// #964: LEGACY-ONLY by construction — the pipeline path has
+					// no per-client DP, so this whole block (and its writes to
+					// the GLOBAL sys->view_*/display_*, which cannot describe N
+					// clients) is skipped. The pipeline's atlas is display-native
+					// and the client's canvas is tracked in c->canvas_w/h above.
 					if (c->render.display_processor != nullptr && !in_size_move &&
 					    !bridge_live) {
 						uint32_t disp_px_w = 0, disp_px_h = 0;
@@ -11197,7 +11248,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// only changes when the geometry does. So clear when the signature (atlas
 	// dims × tile grid) changes, and otherwise trust the previous content —
 	// exactly the workspace rationale, now applied to both paths.
-	if (c->render.atlas_rtv && !sys->workspace_mode) {
+	//
+	// #964: legacy-only. On the pipeline path the render thread samples this
+	// atlas exactly the way the compose path always has, so it inherits the
+	// workspace rationale (never clear here) unchanged.
+	if (c->render.atlas_rtv && !sys->workspace_mode && !pipeline_always_on(sys)) {
 		uint64_t sig = 0;
 		D3D11_TEXTURE2D_DESC ad = {};
 		if (c->render.atlas_texture) {
@@ -11239,7 +11294,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
 					// #961: relay-owned request — DP first, events after confirmation.
-					bool landed = apply_mode_transition(sys, head, c->render.display_processor,
+					// #964 D-6: drives the PANEL DP under render_mutex.
+					render_mutex_fair_lock mode_lock(sys);
+					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c),
 					                                    modeIdx, want_3d, "bridge_relay");
 					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)%s", prev_idx,
 					        modeIdx, (int)want_3d, landed ? "" : " — DP REJECTED");
@@ -11259,7 +11316,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// relay above does, and what the Android multi_compositor path does via its own
 	// request_display_mode. Gated to standalone: workspace uses the controller's
 	// acked-flip; bridge uses the HWND relay above.
-	(void)service_apply_pending_mode(sys, c, bridge_live);
+	// #964 D-6: on the pipeline path this drives the SHARED panel DP, so it
+	// runs under render_mutex (legal nesting: c->mutex -> render_mutex).
+	{
+		// Cheap pre-check so the hot path never takes render_mutex just to
+		// discover there is nothing pending (#925 starvation rule).
+		if (c->pending_content_mode.load(std::memory_order_acquire) != 0xFFFFFFFFu ||
+		    c->pending_hw_3d.load(std::memory_order_acquire) >= 0) {
+			render_mutex_fair_lock mode_lock(sys);
+			(void)service_apply_pending_mode(sys, c, bridge_live);
+		}
+	}
 
 	// Runtime-side 2D/3D toggle (V key) + 1/2/3 mode-select — polls qwerty
 	// driver each frame.
@@ -11297,7 +11364,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
 				} else {
 					// #961: runtime-initiated (V key) — DP first, events after.
-					(void)apply_mode_transition(sys, head, c->render.display_processor, target_idx,
+					// #964 D-6: panel DP, under render_mutex.
+					render_mutex_fair_lock v_lock(sys);
+					(void)apply_mode_transition(sys, head, panel_dp(sys, c), target_idx,
 					                            !force_2d, "qwerty_v");
 				}
 			}
@@ -11351,11 +11420,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		if (won_poll_race) {
+			// #964 D-6: one DP per panel — the vendor poll asks the PANEL DP,
+			// whichever client happened to win the race. Under render_mutex:
+			// the render thread drives the same object every frame. Rate-limited
+			// to ~10 Hz process-wide by the CAS above, so the lock is cheap.
+			render_mutex_fair_lock poll_lock(sys);
 			struct xrt_display_processor_d3d11 *dp = nullptr;
 			if (sys->workspace_mode && sys->multi_comp != nullptr) {
 				dp = sys->multi_comp->display_processor;
-			} else if (c->render.display_processor != nullptr) {
-				dp = c->render.display_processor;
+			} else {
+				dp = panel_dp(sys, c);
 			}
 			if (xrt_display_processor_d3d11_get_hardware_3d_state(dp, &vendor_is_3d)) {
 				sys->cached_3d_state.store(vendor_is_3d, std::memory_order_relaxed);
@@ -11444,7 +11518,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// #961: only the LEASE HOLDER's intent is re-asserted — an unfocused
 			// standalone client does not get to drive the panel back up.
 			if (!sys->workspace_mode && !bridge_live && got_state &&
-			    c->render.display_processor != nullptr && sys->hardware_display_3d && !vendor_is_3d &&
+			    panel_dp(sys, c) != nullptr && sys->hardware_display_3d && !vendor_is_3d &&
 			    !pending_flip && !in_cooldown && client_holds_panel_lease(sys, c)) {
 				U_LOG_W("[force_3d] standalone vendor drifted to 2D (app wants 3D) — re-asserting 3D");
 				// If the content rendering mode also drifted to 2D (e.g. a prior
@@ -11463,7 +11537,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						restore_idx = sys->last_3d_mode_index;
 					}
 				}
-				(void)apply_mode_transition(sys, rhead, c->render.display_processor, restore_idx, true,
+				render_mutex_fair_lock f3d_lock(sys); // #964 D-6: shared panel DP
+				(void)apply_mode_transition(sys, rhead, panel_dp(sys, c), restore_idx, true,
 				                            "force_3d");
 				got_state = false; // skip the follow below
 			}
@@ -11520,9 +11595,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// This is a cheap snapshot read — the Leia DP subscribes to SR's
 	// EyePairStream listener and maintains the cache internally (#248
 	// Tier 2). No SDK polling on the per-client commit path.
+	//
+	// #964: the pipeline path deliberately does NOT read the panel DP here.
+	// The only consumers below are the UI-layer pass and the HUD, both of
+	// which are legacy-only on this path (the render thread owns the weave),
+	// and a per-commit-per-client DP read would have to take render_mutex
+	// every frame — the #925 starvation pattern. Same as workspace mode,
+	// which has always fallen through to the default eye pair here.
 	struct xrt_eye_positions eye_pos = {};
 	bool weaving_done = false;
-	if (c->render.display_processor != nullptr) {
+	if (!pipeline_always_on(sys) && c->render.display_processor != nullptr) {
 		xrt_display_processor_d3d11_get_predicted_eye_positions(
 		    c->render.display_processor, &eye_pos);
 	}
@@ -11605,11 +11687,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// multi-view atlas recipe is the mode's). If the DP later
 				// rejects the publish at runtime, the publish helper issues
 				// this request as the fallback.
-				bool mask_capable = service_dp_accepts_zone_mask(c->render.display_processor) &&
-				                    !c->zone_mask_dp_rejected;
+				// #964 D-6: the panel DP, under render_mutex.
+				render_mutex_fair_lock z_lock(sys);
+				struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
+				bool mask_capable =
+				    service_dp_accepts_zone_mask(zdp) && !c->zone_mask_dp_rejected;
 				// #961: DP first (unless the wish drives it), events after.
-				(void)apply_mode_transition(sys, zhead,
-				                            mask_capable ? nullptr : c->render.display_processor,
+				(void)apply_mode_transition(sys, zhead, mask_capable ? nullptr : zdp,
 				                            mode_idx, true, "zones_tier1");
 				static bool zones_3d_logged = false;
 				if (!zones_3d_logged) {
@@ -11647,7 +11731,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// transitions belong to the vendor poll (genuine SR drift) and the
 	// app-initiated / V-key paths.
 	if (!sys->workspace_mode && !bridge_live && !zones_frame && !c->zone_published &&
-	    !c->render.deferred_3d_kicked && c->render.display_processor != nullptr && sys->xsysd != NULL &&
+	    !c->render.deferred_3d_kicked && panel_dp(sys, c) != nullptr && sys->xsysd != NULL &&
 	    client_holds_panel_lease(sys, c)) { // #961: holder only
 		if (++c->render.commit_frame_counter >= DEFERRED_3D_KICK_FRAMES) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
@@ -11670,7 +11754,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				if (mode_idx < head->rendering_mode_count) {
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					// #961: DP first, events after confirmation.
-					bool landed = apply_mode_transition(sys, head, c->render.display_processor,
+					// #964 D-6: the panel DP, under render_mutex.
+					render_mutex_fair_lock d3d_lock(sys);
+					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c),
 					                                    mode_idx, true, "deferred_3d");
 					U_LOG_W(
 					    "[deferred_3d] no-zones standalone client past warmup "
@@ -12533,7 +12619,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// per-zone Tier-2 leg the tier-1 block above is the fallback for. Runs
 	// on EVERY standalone commit (a non-zones frame withdraws a previously
 	// published mask). Workspace clients stay inert per ADR-027 v1.
-	if (!sys->workspace_mode) {
+	//
+	// #964: with ONE DP per panel the mask is a panel-wide resource, so only
+	// the lease holder may publish or withdraw it — otherwise a non-zones
+	// sibling's per-frame withdraw would wipe the zones client's mask. On the
+	// legacy path each client owns its own DP, so the lease is irrelevant there.
+	if (!sys->workspace_mode && (!pipeline_always_on(sys) || client_holds_panel_lease(sys, c))) {
 		service_update_zone_wish_publish(sys, c, zones_frame);
 	}
 
@@ -12803,7 +12894,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Tear down per-client standalone resources on the app's own thread.
 	// Hide the HWND last (sends WM but app's main thread isn't blocked here
 	// since we're about to return from this layer_commit).
-	if (c->pending_workspace_reentry) {
+	//
+	// #964: LEGACY-ONLY. On the pipeline path nothing is ever built per client
+	// on activate/deactivate, so there is nothing to tear down (D-1) — the
+	// whole #963 hot-switch seam goes away with DXR_LEGACY_STANDALONE.
+	if (c->pending_workspace_reentry && !pipeline_always_on(sys)) {
 		U_LOG_W("Reverse hot-switch: tearing down standalone resources");
 		c->pending_workspace_reentry = false;
 
@@ -12843,7 +12938,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		U_LOG_W("Reverse hot-switch: done — back to export mode");
 	}
 
-	if (sys->workspace_mode) {
+	// #964 (D-3): on the pipeline path the commit ENDS here for every client,
+	// controller or not. The per-client atlas is written; the render thread
+	// crops it, hands it to the panel DP and presents into whichever surface
+	// this client's presenter names. No IPC-thread DP call, no IPC-thread
+	// Present — that is the whole point of the single pipeline (ADR-035 D3).
+	//
+	// Publish what this commit packed so the render thread's direct path can
+	// crop it correctly (ADR-030 / #575: the grid follows what was PACKED, not
+	// the possibly-lagging global sys->tile_columns).
+	if (pipeline_always_on(sys)) {
+		uint32_t pipe_cols = sys->tile_columns;
+		uint32_t pipe_rows = sys->tile_rows;
+		if (eff_view_count == 1) {
+			pipe_cols = 1;
+			pipe_rows = 1;
+		}
+		c->pipe_content_w = content_view_w;
+		c->pipe_content_h = content_view_h;
+		c->pipe_tile_columns = pipe_cols > 0 ? pipe_cols : 1;
+		c->pipe_tile_rows = pipe_rows > 0 ? pipe_rows : 1;
+		if (content_view_w > 0 && content_view_h > 0) {
+			c->pipe_frame_ready = true;
+		}
+	}
+
+	if (sys->workspace_mode || pipeline_always_on(sys)) {
 		// Phase 3 — per-client commits no longer drive multi_compositor_render.
 		// `capture_render_thread_func` is the sole driver of the workspace
 		// atlas render at ~70 Hz. Per-client tile-blit work above (lines
