@@ -2753,6 +2753,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
 
+		if (oxr_qtrace_enabled()) {
+			U_LOG_W("[QTRACE] LV[%u/%u] sess=%p base=%s(%p) t=%lld head=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) "
+			        "view=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) fov=(%.3f,%.3f,%.3f,%.3f) eyeovr=%d eyes=%d "
+			        "qcam=%d qdisp=%d extwin=%d",
+			        i, view_count, (void *)sess, oxr_qtrace_space_str(baseSpc), (void *)baseSpc,
+			        (long long)viewLocateInfo->displayTime, world_head_pos.x, world_head_pos.y, world_head_pos.z,
+			        world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w,
+			        views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z,
+			        views[i].pose.orientation.x, views[i].pose.orientation.y, views[i].pose.orientation.z,
+			        views[i].pose.orientation.w, views[i].fov.angleLeft, views[i].fov.angleRight,
+			        views[i].fov.angleUp, views[i].fov.angleDown, have_eye_override, have_eyes,
+			        qwerty_camera, qwerty_display, sess->has_external_window);
+		}
+
 		if (should_log && i == 0) {
 			U_LOG_I("VIEW[0] FINAL: pos=(%.3f,%.3f,%.3f) fov_L=%.4f fov_R=%.4f fov_U=%.4f fov_D=%.4f",
 			        views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,

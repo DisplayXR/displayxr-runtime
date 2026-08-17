@@ -2989,6 +2989,13 @@ struct oxr_action_attachment
  */
 
 
+// [QTRACE] pose-path tracer helpers (oxr_space.c), off unless DXR_QTRACE=1.
+// See docs/reference/debug-logging.md § Opt-in tracers.
+const char *
+oxr_qtrace_space_str(const struct oxr_space *spc);
+bool
+oxr_qtrace_enabled(void);
+
 static inline bool
 oxr_space_type_is_reference(enum oxr_space_type space_type)
 {

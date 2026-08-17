@@ -31,6 +31,10 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include "util/u_debug.h"
+// [QTRACE] pose-path tracer, off unless DXR_QTRACE=1 (docs/reference/debug-logging.md)
+DEBUG_GET_ONCE_BOOL_OPTION(qwerty_qtrace, "DXR_QTRACE", false)
+
 // Suppress qwerty pose integration while the WebXR bridge is driving the
 // session. multi_compositor flips this via qwerty_set_bridge_relay_active().
 // Self-contained in the qwerty driver so tools that link qwerty without the
@@ -423,6 +427,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	// View rotation caused by mouse
 	y_look_speed += qd->yaw_delta;
 	x_look_speed += qd->pitch_delta;
+	const float qt_yaw = qd->yaw_delta, qt_pitch = qd->pitch_delta;
 	qd->yaw_delta = 0;
 	qd->pitch_delta = 0;
 
@@ -435,6 +440,22 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	math_quat_rotate(&qd->pose.orientation, &x_rotation, &qd->pose.orientation); // local-space pitch
 	math_quat_rotate(&y_rotation, &qd->pose.orientation, &qd->pose.orientation); // base-space yaw
 	math_quat_normalize(&qd->pose.orientation);
+
+	if (debug_get_bool_option_qwerty_qtrace()) {
+		bool moving = qd->forward_pressed || qd->backward_pressed || qd->left_pressed || qd->right_pressed ||
+		              qd->up_pressed || qd->down_pressed || qd->look_left_pressed || qd->look_right_pressed ||
+		              qd->look_up_pressed || qd->look_down_pressed;
+		if (moving || qt_yaw != 0.f || qt_pitch != 0.f || pos_delta.x != 0.f || pos_delta.y != 0.f ||
+		    pos_delta.z != 0.f) {
+			U_LOG_W("[QTRACE] QD qd=%p name=%d dtf=%.3f yaw=%.4f pitch=%.4f keys=%d%d%d%d -> pos=(%.4f,%.4f,%.4f) "
+			        "ori=(%.4f,%.4f,%.4f,%.4f)",
+			        (void *)qd, (int)name, (double)dt_frames, (double)qt_yaw, (double)qt_pitch,
+			        qd->forward_pressed, qd->backward_pressed, qd->left_pressed, qd->right_pressed,
+			        (double)qd->pose.position.x, (double)qd->pose.position.y, (double)qd->pose.position.z,
+			        (double)qd->pose.orientation.x, (double)qd->pose.orientation.y,
+			        (double)qd->pose.orientation.z, (double)qd->pose.orientation.w);
+		}
+	}
 
 	// HMD Parenting
 

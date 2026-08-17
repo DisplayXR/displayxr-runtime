@@ -29,6 +29,36 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/u_logging.h"
+
+// [QTRACE] pose-path tracer, off unless DXR_QTRACE=1 is set.
+// Contract + tag reference: docs/reference/debug-logging.md § Opt-in tracers.
+DEBUG_GET_ONCE_BOOL_OPTION(qtrace, "DXR_QTRACE", false)
+
+const char *
+oxr_qtrace_space_str(const struct oxr_space *spc)
+{
+	if (spc == NULL) {
+		return "null";
+	}
+	switch (spc->space_type) {
+	case OXR_SPACE_TYPE_REFERENCE_VIEW: return "VIEW";
+	case OXR_SPACE_TYPE_REFERENCE_LOCAL: return "LOCAL";
+	case OXR_SPACE_TYPE_REFERENCE_LOCAL_FLOOR: return "LOCAL_FLOOR";
+	case OXR_SPACE_TYPE_REFERENCE_STAGE: return "STAGE";
+	case OXR_SPACE_TYPE_REFERENCE_UNBOUNDED_MSFT: return "UNBOUNDED";
+	case OXR_SPACE_TYPE_ACTION: return "ACTION";
+	case OXR_SPACE_TYPE_XDEV_POSE: return "XDEV";
+	default: return "?";
+	}
+}
+
+bool
+oxr_qtrace_enabled(void)
+{
+	return debug_get_bool_option_qtrace();
+}
+
 
 /*
  *
@@ -232,6 +262,12 @@ oxr_space_reference_create(struct oxr_logger *log,
 	if (xtype != XRT_SPACE_REFERENCE_TYPE_INVALID) {
 		xrt_space_overseer_ref_space_inc(sess->sys->xso, xtype);
 	}
+	if (oxr_qtrace_enabled()) {
+		U_LOG_W("[QTRACE] CREATE-REF sess=%p spc=%p type=%s pose=(%.3f,%.3f,%.3f|%.3f,%.3f,%.3f,%.3f)",
+		        (void *)sess, (void *)spc, oxr_qtrace_space_str(spc), spc->pose.position.x,
+		        spc->pose.position.y, spc->pose.position.z, spc->pose.orientation.x, spc->pose.orientation.y,
+		        spc->pose.orientation.z, spc->pose.orientation.w);
+	}
 
 	*out_space = spc;
 
@@ -424,6 +460,16 @@ oxr_spaces_locate(struct oxr_logger *log,
 			}
 
 			oxr_pp_relation_indented(&slog, &results[i], "relation");
+			if (oxr_qtrace_enabled()) {
+				U_LOG_W("[QTRACE] LSS[%u/%u] spc=%s(%p) base=%s(%p) t=%lld flags=0x%llx pose=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f)",
+				        i, spc_count, oxr_qtrace_space_str(spcs[i]), (void *)spcs[i],
+				        oxr_qtrace_space_str(baseSpc), (void *)baseSpc, (long long)time,
+				        (unsigned long long)locations->locations[i].locationFlags,
+				        locations->locations[i].pose.position.x, locations->locations[i].pose.position.y,
+				        locations->locations[i].pose.position.z, locations->locations[i].pose.orientation.x,
+				        locations->locations[i].pose.orientation.y, locations->locations[i].pose.orientation.z,
+				        locations->locations[i].pose.orientation.w);
+			}
 		}
 	}
 
@@ -552,6 +598,13 @@ oxr_space_locate(
 
 	OXR_XRT_POSE_TO_XRPOSEF(result.pose, location->pose);
 	location->locationFlags = xrt_to_xr_space_location_flags(result.relation_flags);
+	if (oxr_qtrace_enabled()) {
+		U_LOG_W("[QTRACE] LS spc=%s(%p) base=%s(%p) t=%lld flags=0x%x pose=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f)",
+		        oxr_qtrace_space_str(spc), (void *)spc, oxr_qtrace_space_str(baseSpc), (void *)baseSpc,
+		        (long long)time, (unsigned)location->locationFlags, location->pose.position.x,
+		        location->pose.position.y, location->pose.position.z, location->pose.orientation.x,
+		        location->pose.orientation.y, location->pose.orientation.z, location->pose.orientation.w);
+	}
 
 	if (gaze_sample_time) {
 		(void)gaze_sample_time; //! @todo Implement.
