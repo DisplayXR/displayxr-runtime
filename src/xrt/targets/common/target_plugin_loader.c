@@ -641,7 +641,12 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		}
 	}
 
-	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	// A refresh (max_probe_order bounded by the current winner) legitimately
+	// attempts nothing when nothing better is registered — that is not a
+	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
+	if (max_probe_order == 0xFFFFFFFFu) {
+		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	}
 	return NULL;
 }
 
@@ -1262,7 +1267,12 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		}
 	}
 
-	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	// A refresh (max_probe_order bounded by the current winner) legitimately
+	// attempts nothing when nothing better is registered — that is not a
+	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
+	if (max_probe_order == 0xFFFFFFFFu) {
+		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	}
 	return NULL;
 }
 
@@ -1795,7 +1805,12 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		}
 	}
 
-	U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	// A refresh (max_probe_order bounded by the current winner) legitimately
+	// attempts nothing when nothing better is registered — that is not a
+	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
+	if (max_probe_order == 0xFFFFFFFFu) {
+		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
+	}
 	return NULL;
 }
 

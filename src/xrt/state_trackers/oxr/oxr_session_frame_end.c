@@ -36,6 +36,53 @@
 
 #include <openxr/XR_DXR_win32_window_binding.h>
 
+#include <stdarg.h>
+#include <stdio.h>
+
+/*
+ * Monkey-test F1: layer-verification failures are APP input errors on the
+ * per-frame hot path. A non-conformant app (both cube test apps submitted
+ * zeroed projection views while shouldRender was false) that is no longer
+ * paced by xrWaitFrame spins at 5-9 kfps and, unthrottled, wrote ~1 MB/s of
+ * XR_ERROR_POSE_INVALID lines. The RESULT is still returned on every call —
+ * only the logging is rate-limited: the first 20 verbatim, then one line per
+ * second carrying the suppressed count.
+ */
+static XrResult
+layer_error_throttled(struct oxr_logger *log, XrResult res, const char *fmt, ...)
+{
+	static uint32_t burst = 0;
+	static uint32_t suppressed = 0;
+	static int64_t last_ns = 0;
+
+	int64_t now_ns = os_monotonic_get_ns();
+	bool emit = false;
+	if (burst < 20) {
+		burst++;
+		emit = true;
+	} else if (now_ns - last_ns >= (int64_t)1000000000) {
+		emit = true;
+	}
+	if (!emit) {
+		suppressed++;
+		return res;
+	}
+	last_ns = now_ns;
+
+	char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	if (suppressed > 0) {
+		oxr_error(log, res, "%s (+%u identical layer-verification errors suppressed)", buf, suppressed);
+		suppressed = 0;
+	} else {
+		oxr_error(log, res, "%s", buf);
+	}
+	return res;
+}
+
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
 #endif
@@ -447,16 +494,17 @@ verify_quad_layer(struct oxr_session *sess,
 
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&quad->pose.orientation)) {
 		XrQuaternionf *q = &quad->pose.orientation;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat",
-		                 layer_index, q->x, q->y, q->z, q->w);
+		return layer_error_throttled(
+		    log, XR_ERROR_POSE_INVALID,
+		    "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat", layer_index,
+		    q->x, q->y, q->z, q->w);
 	}
 
 	if (!math_vec3_validate((struct xrt_vec3 *)&quad->pose.position)) {
 		XrVector3f *p = &quad->pose.position;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid", layer_index,
-		                 p->x, p->y, p->z);
+		return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+		                             "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid",
+		                             layer_index, p->x, p->y, p->z);
 	}
 
 	if (sc->array_layer_count <= quad->subImage.imageArrayIndex) {
@@ -688,18 +736,18 @@ verify_projection_layer(struct oxr_session *sess,
 		//! @todo More validation?
 		if (!math_quat_validate_within_1_percent((struct xrt_quat *)&view->pose.orientation)) {
 			const XrQuaternionf *q = &view->pose.orientation;
-			return oxr_error(log, XR_ERROR_POSE_INVALID,
-			                 "(frameEndInfo->layers[%u]->views[%i]->pose."
-			                 "orientation == {%f %f %f %f}) is not a valid quat",
-			                 layer_index, i, q->x, q->y, q->z, q->w);
+			return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+			                             "(frameEndInfo->layers[%u]->views[%i]->pose."
+			                             "orientation == {%f %f %f %f}) is not a valid quat",
+			                             layer_index, i, q->x, q->y, q->z, q->w);
 		}
 
 		if (!math_vec3_validate((struct xrt_vec3 *)&view->pose.position)) {
 			const XrVector3f *p = &view->pose.position;
-			return oxr_error(log, XR_ERROR_POSE_INVALID,
-			                 "(frameEndInfo->layers[%u]->views[%i]->pose."
-			                 "position == {%f %f %f}) is not valid",
-			                 layer_index, i, p->x, p->y, p->z);
+			return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+			                             "(frameEndInfo->layers[%u]->views[%i]->pose."
+			                             "position == {%f %f %f}) is not valid",
+			                             layer_index, i, p->x, p->y, p->z);
 		}
 
 		if (view->subImage.swapchain == XR_NULL_HANDLE) {
@@ -819,9 +867,10 @@ verify_cube_layer(struct oxr_session *sess,
 
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&cube->orientation)) {
 		const XrQuaternionf *q = &cube->orientation;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat",
-		                 layer_index, q->x, q->y, q->z, q->w);
+		return layer_error_throttled(
+		    log, XR_ERROR_POSE_INVALID,
+		    "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat", layer_index,
+		    q->x, q->y, q->z, q->w);
 	}
 
 	if (sc->array_layer_count <= cube->imageArrayIndex) {
@@ -887,16 +936,17 @@ verify_cylinder_layer(struct oxr_session *sess,
 
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&cylinder->pose.orientation)) {
 		const XrQuaternionf *q = &cylinder->pose.orientation;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat",
-		                 layer_index, q->x, q->y, q->z, q->w);
+		return layer_error_throttled(
+		    log, XR_ERROR_POSE_INVALID,
+		    "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat", layer_index,
+		    q->x, q->y, q->z, q->w);
 	}
 
 	if (!math_vec3_validate((struct xrt_vec3 *)&cylinder->pose.position)) {
 		const XrVector3f *p = &cylinder->pose.position;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid", layer_index,
-		                 p->x, p->y, p->z);
+		return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+		                             "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid",
+		                             layer_index, p->x, p->y, p->z);
 	}
 
 	if (sc->array_layer_count <= cylinder->subImage.imageArrayIndex) {
@@ -997,16 +1047,17 @@ verify_equirect1_layer(struct oxr_session *sess,
 
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&equirect->pose.orientation)) {
 		const XrQuaternionf *q = &equirect->pose.orientation;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat",
-		                 layer_index, q->x, q->y, q->z, q->w);
+		return layer_error_throttled(
+		    log, XR_ERROR_POSE_INVALID,
+		    "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat", layer_index,
+		    q->x, q->y, q->z, q->w);
 	}
 
 	if (!math_vec3_validate((struct xrt_vec3 *)&equirect->pose.position)) {
 		const XrVector3f *p = &equirect->pose.position;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid", layer_index,
-		                 p->x, p->y, p->z);
+		return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+		                             "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid",
+		                             layer_index, p->x, p->y, p->z);
 	}
 
 	if (sc->array_layer_count <= equirect->subImage.imageArrayIndex) {
@@ -1094,16 +1145,17 @@ verify_equirect2_layer(struct oxr_session *sess,
 
 	if (!math_quat_validate_within_1_percent((struct xrt_quat *)&equirect->pose.orientation)) {
 		const XrQuaternionf *q = &equirect->pose.orientation;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat",
-		                 layer_index, q->x, q->y, q->z, q->w);
+		return layer_error_throttled(
+		    log, XR_ERROR_POSE_INVALID,
+		    "(frameEndInfo->layers[%u]->pose.orientation == {%f %f %f %f}) is not a valid quat", layer_index,
+		    q->x, q->y, q->z, q->w);
 	}
 
 	if (!math_vec3_validate((struct xrt_vec3 *)&equirect->pose.position)) {
 		const XrVector3f *p = &equirect->pose.position;
-		return oxr_error(log, XR_ERROR_POSE_INVALID,
-		                 "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid", layer_index,
-		                 p->x, p->y, p->z);
+		return layer_error_throttled(log, XR_ERROR_POSE_INVALID,
+		                             "(frameEndInfo->layers[%u]->pose.position == {%f %f %f}) is not valid",
+		                             layer_index, p->x, p->y, p->z);
 	}
 
 	if (sc->array_layer_count <= equirect->subImage.imageArrayIndex) {

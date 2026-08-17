@@ -1601,7 +1601,19 @@ static void RenderOneFrame(RenderState& rs) {
             // build the layer list manually (projection + panels in list order)
             // and submit raw — the shared EndFrame helpers don't carry the
             // Local2D layer type. Otherwise use the normal helper paths.
-            if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
+            if (!frameState.shouldRender) {
+                // Not visible: xrEndFrame is still required (keeps the frame loop
+                // paced) but with NO layers — the projection views were never
+                // located this frame and would be rejected (POSE_INVALID).
+                XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                endInfo.displayTime = frameState.predictedDisplayTime;
+                endInfo.environmentBlendMode = xr.runtimeSupportsAlphaBlend
+                    ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+                    : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                endInfo.layerCount = 0;
+                endInfo.layers = nullptr;
+                xrEndFrame(xr.session, &endInfo);
+            } else if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                 XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
                 projLayer.space = xr.localSpace;
                 projLayer.viewCount = (uint32_t)eyeCount;
