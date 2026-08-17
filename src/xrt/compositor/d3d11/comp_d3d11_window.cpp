@@ -1809,10 +1809,30 @@ comp_d3d11_window_set_visible(struct comp_d3d11_window *window, bool visible)
 	// weaver's window is not visible on the panel) -- the panel never goes 3D.
 	// The hosted app also needs the window active for keyboard input (qwerty).
 	if (visible) {
+		// SetWindowPos(SHOWWINDOW) does not un-minimize; restore first so an
+		// Alt-Tab-parked (minimized) window actually comes back.
+		if (IsIconic(window->hwnd)) {
+			ShowWindowAsync(window->hwnd, SW_RESTORE);
+		}
 		SetWindowPos(window->hwnd, HWND_TOP, 0, 0, 0, 0,
 		             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
 	} else {
 		ShowWindowAsync(window->hwnd, SW_HIDE);
+	}
+}
+
+
+extern "C" void
+comp_d3d11_window_minimize(struct comp_d3d11_window *window)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+	// Park in the taskbar / Alt-Tab list instead of vanishing: a HIDDEN
+	// window has no Alt-Tab entry, so a hosted client whose surface this is
+	// would be unreachable once another app takes the panel (#964 Phase A).
+	if (!IsIconic(window->hwnd)) {
+		ShowWindowAsync(window->hwnd, SW_MINIMIZE);
 	}
 }
 

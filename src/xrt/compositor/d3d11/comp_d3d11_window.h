@@ -145,6 +145,13 @@ void
 comp_d3d11_window_set_visible(struct comp_d3d11_window *window, bool visible);
 
 /*!
+ * Minimize the window (async) so it stays in the taskbar / Alt-Tab list.
+ * Used instead of hiding while a hosted client still lives behind it.
+ */
+void
+comp_d3d11_window_minimize(struct comp_d3d11_window *window);
+
+/*!
  * Destroy the self-owned window.
  *
  * Posts the private WM_DXR_DESTROY_WINDOW message to the window thread and waits
