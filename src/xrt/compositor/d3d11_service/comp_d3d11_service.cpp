@@ -127,6 +127,29 @@ dxr_late_weave_enabled()
 	return enabled == 1;
 }
 
+/*
+ * #964 D-7: DXR_LEGACY_STANDALONE=1 keeps the pre-#964 per-client
+ * window / swap-chain / display-processor path byte-for-byte. Default off =
+ * the always-on multi-compositor pipeline (ADR-035 D3). Read once; the value
+ * is latched onto `sys->legacy_standalone` at system create so every gate is
+ * a plain field read. Ships for one release for the motion-to-photon A/B, then
+ * goes away together with #963's hot-switch seam.
+ * See docs/architecture/service-one-pipeline.md §2 D-7.
+ */
+static bool
+dxr_legacy_standalone_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_LEGACY_STANDALONE");
+		enabled = (e != nullptr &&
+		           (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y'))
+		              ? 1
+		              : 0;
+	}
+	return enabled == 1;
+}
+
 // Helper to create security attributes for AppContainer sharing
 static bool
 create_appcontainer_sa(SECURITY_ATTRIBUTES &sa, PSECURITY_DESCRIPTOR &sd)
@@ -433,6 +456,30 @@ struct d3d11_service_compositor
 
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
+
+	//! #964 (D-2): which surface the render thread presents this client into.
+	//! PRESENTER_NONE on the legacy path (DXR_LEGACY_STANDALONE=1) and for
+	//! sessions with no render resources (bridge relay, workspace controller).
+	enum d3d11_presenter_kind presenter;
+
+	//! #964: this client's CANVAS in pixels — the surface its views are sized
+	//! against. APP_HWND: the app window's client rect (tracked by the resize
+	//! block in compositor_layer_commit). SERVICE_WINDOW / CLIENT_TEXTURE:
+	//! the display. Replaces the global `sys->view_*`/`sys->output_*` reads on
+	//! the pipeline path, which cannot describe N clients at once.
+	uint32_t canvas_w;
+	uint32_t canvas_h;
+
+	//! #964: what the LAST commit actually packed into this client's atlas —
+	//! per-view content dims plus the effective tile grid (ADR-030 / #575).
+	//! Written at the end of the pipeline commit (under c->mutex), read by the
+	//! render thread's direct present path to crop the atlas for the panel DP.
+	//! `pipe_frame_ready` is false until the first projection/zones commit.
+	uint32_t pipe_content_w;
+	uint32_t pipe_content_h;
+	uint32_t pipe_tile_columns;
+	uint32_t pipe_tile_rows;
+	bool pipe_frame_ready;
 
 	//! #925 S4 tier 2: this client may hold a multi-comp slot (i.e. it is
 	//! neither a bridge relay nor a workspace controller). Gates the commit-
@@ -911,7 +958,17 @@ struct d3d11_service_system
 
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	//! Read from base.info.workspace_mode on first client connect.
+	//!
+	//! #964 (D-1): this now means ONLY "a workspace controller drives policy".
+	//! The pipeline's EXISTENCE (multi_comp, service window, panel DP, render
+	//! thread) is independent of it — see `legacy_standalone` below.
 	bool workspace_mode;
+
+	//! #964 (D-7): DXR_LEGACY_STANDALONE=1 — keep the pre-#964 per-client
+	//! window / swap-chain / DP path. Latched once at system create. Every new
+	//! pipeline branch is gated on `!legacy_standalone` (via pipeline_always_on)
+	//! so the legacy path stays byte-for-byte what it was.
+	bool legacy_standalone;
 
 	//! XR_DXR_view_rig (#396 W7): the workspace controller's imposed view rig,
 	//! applied to app-client locates server-side (ipc_try_get_sr_view_poses).
@@ -1532,6 +1589,28 @@ enum d3d11_client_type
 };
 
 /*!
+ * #964 (ADR-035 D3 / D-2): how a client's composed frame reaches the panel.
+ *
+ * On the always-on pipeline the render thread is the ONLY presenter; this
+ * enum says WHICH surface it presents into for a given client. Decided once
+ * at session create from `external_window_handle` × `transparent_background_enabled`
+ * (see `init_client_render_resources`), never afterwards.
+ *
+ * Design note: docs/architecture/service-one-pipeline.md §2 D-2.
+ */
+enum d3d11_presenter_kind
+{
+	//! No presentable surface (bridge relay / workspace controller / legacy path).
+	PRESENTER_NONE = 0,
+	//! Hosted (NULL HWND) / WebXR: the service-owned window + its swap chain.
+	PRESENTER_SERVICE_WINDOW = 1,
+	//! `_handle` forced-IPC: a per-client swap chain on the app's real HWND.
+	PRESENTER_APP_HWND = 2,
+	//! ADR-029 client-presents: a shared NT texture + fence; the app presents.
+	PRESENTER_CLIENT_TEXTURE = 3,
+};
+
+/*!
  * Acked-flip + curtain state machine for workspace display-mode transitions
  * (issue #234). Replaces the historical "flip DP + sync_tile_layout
  * immediately, hope apps catch up" pattern that exposed a raw-atlas glitch
@@ -1872,6 +1951,19 @@ struct d3d11_multi_compositor
 	//! Display processor (single, shared).
 	struct xrt_display_processor_d3d11 *display_processor;
 
+	//! #964 (D-4): the HWND `display_processor` was CREATED against. The D3D11
+	//! DP takes its interlace phase and target size from that window, so when
+	//! the active presenter's HWND changes the render thread destroys and
+	//! recreates the DP bound to the new one (pipeline_bind_panel_dp). NULL
+	//! when no DP exists. One DP per panel, always.
+	HWND panel_dp_hwnd;
+
+	//! #964 (D-3): last visibility we asked of the service window. Under the
+	//! default presenter policy the service window is shown only while it IS
+	//! the active presenter; under a controller it is always shown. Tracked so
+	//! the render thread issues ShowWindowAsync only on a transition.
+	bool service_window_shown;
+
 	//! Crop texture for DP input (content-sized, lazily created).
 	wil::com_ptr<ID3D11Texture2D> crop_texture;
 	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
@@ -2061,6 +2153,21 @@ static inline struct d3d11_service_semaphore *
 d3d11_service_semaphore_from_xrt(struct xrt_compositor_semaphore *xcsem)
 {
 	return reinterpret_cast<struct d3d11_service_semaphore *>(xcsem);
+}
+
+/*!
+ * #964 (ADR-035 D3): is the always-on multi-compositor pipeline in force?
+ *
+ * True unless DXR_LEGACY_STANDALONE=1. When true the multi-compositor, the
+ * service window, the panel DP and the render thread exist from the first
+ * non-relay client regardless of `sys->workspace_mode`, and NO client ever
+ * gets its own window / swap chain on the service window / display processor.
+ * `workspace_mode` then means only "a controller drives policy" (D-1).
+ */
+static inline bool
+pipeline_always_on(const struct d3d11_service_system *sys)
+{
+	return sys != nullptr && !sys->legacy_standalone;
 }
 
 // Write sys->workspace_mode and mirror the flag onto the multi-comp window so
@@ -2487,6 +2594,28 @@ client_holds_panel_lease(struct d3d11_service_system *sys, struct d3d11_service_
 		return false; // the controller holds it; it never asks per-client
 	}
 	return c->state_focused;
+}
+
+/*!
+ * #964 (D-4/D-6): THE display processor that drives the panel for @p c.
+ *
+ * One DP per panel on the pipeline path — every mode writer, the vendor poll,
+ * the eye-position resolve and the weave path go through the multi-comp's
+ * shared DP, whoever asked. On the legacy path this is the client's own DP,
+ * exactly as before. May be nullptr (no vendor plug-in, or the DP is being
+ * re-bound); every caller already handles that.
+ *
+ * Callers that touch the returned DP from an IPC thread MUST hold
+ * `sys->render_mutex` (render_mutex_fair_lock) — the render thread drives the
+ * same object every frame. Legal nesting: `c->mutex` -> `render_mutex`.
+ */
+static inline struct xrt_display_processor_d3d11 *
+panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (pipeline_always_on(sys)) {
+		return sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
+	}
+	return c != nullptr ? c->render.display_processor : nullptr;
 }
 
 /*!
@@ -3734,6 +3863,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
  * @param external_hwnd External window handle from XR_DXR_win32_window_binding, or NULL
  * @param xsysd System devices for qwerty input (may be NULL)
  * @param res Output render resources struct
+ * @param c   Owning compositor — receives the presenter kind + canvas dims
+ *            (#964). May be NULL only on paths that do not present.
  * @return XRT_SUCCESS on success
  */
 static xrt_result_t
@@ -3741,16 +3872,18 @@ init_client_render_resources(struct d3d11_service_system *sys,
                               void *external_hwnd,
                               bool transparent_hwnd,
                               struct xrt_system_devices *xsysd,
-                              struct d3d11_client_render_resources *res)
+                              struct d3d11_client_render_resources *res,
+                              struct d3d11_service_compositor *c)
 {
 	std::memset(res, 0, sizeof(*res));
 
 	HRESULT hr;
 
-	// Workspace mode: only create atlas texture. No window, swap chain, or DP.
-	// The multi-compositor owns those shared resources.
+	// Workspace mode / #964 pipeline: only create the atlas texture. No window,
+	// no display processor — the multi-compositor owns those shared resources
+	// and its render thread is the only presenter (ADR-035 D3).
 	// Atlas sized to native display (app HWND is fullscreen, renders at native * scale).
-	if (sys->workspace_mode) {
+	if (sys->workspace_mode || pipeline_always_on(sys)) {
 		uint32_t atlas_w = sys->base.info.display_pixel_width;
 		uint32_t atlas_h = sys->base.info.display_pixel_height;
 		if (atlas_w == 0 || atlas_h == 0) {
@@ -3813,8 +3946,152 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		sys->device->CreateRenderTargetView(
 		    res->atlas_texture.get(), &unorm_rtv_desc, res->atlas_rtv.put());
 
-		U_LOG_W("Workspace mode: created atlas-only resources for client (%ux%u)",
-		        atlas_w, atlas_h);
+		U_LOG_W("Pipeline: created atlas-only resources for client (%ux%u)", atlas_w, atlas_h);
+
+		if (!pipeline_always_on(sys)) {
+			// Legacy workspace: the multi-comp presents everything and the
+			// client hot-switches back to its own window on deactivate.
+			if (c != nullptr) {
+				c->presenter = PRESENTER_SERVICE_WINDOW;
+				c->canvas_w = atlas_w;
+				c->canvas_h = atlas_h;
+			}
+			return XRT_SUCCESS;
+		}
+
+		/*
+		 * #964 (D-2): decide the presenter kind and build ONLY its surface.
+		 * The choice is `external_window_handle` × `transparent_background_enabled`
+		 * and is final for the session — nothing here depends on
+		 * `sys->workspace_mode`, so a controller attaching or detaching never
+		 * rebuilds a client (D-1). Created on the CLIENT'S IPC THREAD, which
+		 * is the only thread allowed to touch DXGI for the app's own HWND.
+		 */
+		res->hwnd = (HWND)external_hwnd;
+		res->owns_window = false;
+		res->window = nullptr;
+
+		uint32_t canvas_w = atlas_w;
+		uint32_t canvas_h = atlas_h;
+		if (external_hwnd != nullptr) {
+			RECT cr;
+			if (GetClientRect((HWND)external_hwnd, &cr)) {
+				uint32_t cw = (uint32_t)(cr.right - cr.left);
+				uint32_t ch = (uint32_t)(cr.bottom - cr.top);
+				if (cw > 0 && ch > 0) {
+					canvas_w = cw;
+					canvas_h = ch;
+				}
+			}
+		}
+
+		enum d3d11_presenter_kind kind = PRESENTER_SERVICE_WINDOW;
+		if (external_hwnd != nullptr) {
+			kind = transparent_hwnd ? PRESENTER_CLIENT_TEXTURE : PRESENTER_APP_HWND;
+		}
+
+		if (kind == PRESENTER_CLIENT_TEXTURE) {
+			// ADR-029 client-presents (#551): no swap chain. The render
+			// thread weaves into this SHARED NT texture and signals the
+			// fence; the app presents it through its own transparent DComp
+			// swap chain so DWM blends the LIVE desktop into the alpha holes.
+			D3D11_TEXTURE2D_DESC od = {};
+			od.Width = canvas_w;
+			od.Height = canvas_h;
+			od.MipLevels = 1;
+			od.ArraySize = 1;
+			od.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			od.SampleDesc.Count = 1;
+			od.Usage = D3D11_USAGE_DEFAULT;
+			od.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+			od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+			hr = sys->device->CreateTexture2D(&od, nullptr, res->transparent_output_texture.put());
+			if (SUCCEEDED(hr)) {
+				hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(),
+				                                         nullptr, res->back_buffer_rtv.put());
+			}
+			wil::com_ptr<IDXGIResource1> dxgi_res1;
+			if (SUCCEEDED(hr)) {
+				hr = res->transparent_output_texture->QueryInterface(IID_PPV_ARGS(dxgi_res1.put()));
+			}
+			if (SUCCEEDED(hr)) {
+				hr = dxgi_res1->CreateSharedHandle(
+				    nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+				    &res->transparent_output_texture_handle);
+			}
+			if (SUCCEEDED(hr)) {
+				hr = sys->device->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+				                              IID_PPV_ARGS(res->transparent_output_fence.put()));
+			}
+			if (SUCCEEDED(hr)) {
+				hr = res->transparent_output_fence->CreateSharedHandle(
+				    nullptr, GENERIC_ALL, nullptr, &res->transparent_output_fence_handle);
+			}
+			if (FAILED(hr)) {
+				U_LOG_E("[pipeline] client-presents output create failed (0x%08lx) — "
+				        "falling back to the service-window presenter",
+				        hr);
+				res->transparent_output_fence.reset();
+				res->transparent_output_texture.reset();
+				res->back_buffer_rtv.reset();
+				kind = PRESENTER_SERVICE_WINDOW;
+			} else {
+				res->transparent_output_w = canvas_w;
+				res->transparent_output_h = canvas_h;
+				res->transparent_output_value = 0;
+				U_LOG_W("[pipeline] presenter=CLIENT_TEXTURE hwnd=%p %ux%u "
+				        "(shared texture + service->client fence)",
+				        external_hwnd, canvas_w, canvas_h);
+			}
+		} else if (kind == PRESENTER_APP_HWND) {
+			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+			sc_desc.Width = canvas_w;
+			sc_desc.Height = canvas_h;
+			sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sc_desc.SampleDesc.Count = 1;
+			sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			sc_desc.BufferCount = 2;
+			sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+			// IGNORE so DWM doesn't composite the desktop through the HWND (#163).
+			sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+
+			hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc,
+			                                               nullptr, nullptr, res->swap_chain.put());
+			if (FAILED(hr)) {
+				// Cross-process CreateSwapChainForHwnd is not categorically
+				// denied — it depends on this service's rights over the app's
+				// window (same session + integrity level is the common case,
+				// and it is observed working). When Windows does say no, fall
+				// back to the service window rather than failing the session.
+				U_LOG_W("[pipeline] swap chain on the app's HWND %p failed (0x%08lx%s) — "
+				        "falling back to the service-window presenter",
+				        res->hwnd, hr, hr == E_ACCESSDENIED ? " E_ACCESSDENIED" : "");
+				res->swap_chain.reset();
+				kind = PRESENTER_SERVICE_WINDOW;
+			} else {
+				wil::com_ptr<ID3D11Texture2D> bb;
+				res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+				sys->device->CreateRenderTargetView(bb.get(), nullptr, res->back_buffer_rtv.put());
+				U_LOG_W("[pipeline] presenter=APP_HWND hwnd=%p %ux%u", res->hwnd, canvas_w,
+				        canvas_h);
+			}
+		}
+
+		if (kind == PRESENTER_SERVICE_WINDOW) {
+			// Hosted / WebXR / fallback: the service window + its swap chain
+			// (created once by multi_compositor_ensure_output). Nothing to
+			// build per client; the canvas is the whole display.
+			canvas_w = atlas_w;
+			canvas_h = atlas_h;
+			U_LOG_W("[pipeline] presenter=SERVICE_WINDOW (canvas %ux%u)", canvas_w, canvas_h);
+		}
+
+		if (c != nullptr) {
+			c->presenter = kind;
+			c->canvas_w = canvas_w;
+			c->canvas_h = canvas_h;
+		}
+		(void)xsysd; // the service window owns qwerty on this path
 		return XRT_SUCCESS;
 	}
 
@@ -6739,6 +7016,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
 				if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 					U_LOG_W("Multi-comp: display processor recreated on live window");
+					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
 					if (mc->window != nullptr) {
 						comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 					}
@@ -6761,16 +7039,23 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		win_w = sys->output_width;
 		win_h = sys->output_height;
 	}
-	xrt_result_t wret = comp_d3d11_window_create(
+	// #964 (D-3): under the default presenter policy the service window is only
+	// SHOWN while it is the active presenter, so create it hidden and let
+	// pipeline_default_policy_render decide per frame. Under a controller (or
+	// on the legacy path) it comes up visible exactly as before.
+	const bool start_hidden = pipeline_always_on(sys) && !sys->workspace_mode;
+	xrt_result_t wret = comp_d3d11_window_create_ex(
 	    win_w, win_h,
 	    sys->base.info.display_screen_left,
 	    sys->base.info.display_screen_top,
+	    start_hidden,
 	    &mc->window);
 	if (wret != XRT_SUCCESS || mc->window == nullptr) {
 		U_LOG_E("Multi-comp: failed to create window");
 		return XRT_ERROR_D3D11;
 	}
 	mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
+	mc->service_window_shown = !start_hidden;
 	sys->compositor_hwnd = mc->hwnd;
 	// Seed the window's workspace-mode flag from current sys state (service_set_workspace_mode
 	// no-ops while multi_comp is null, so earlier activation hasn't reached the window).
@@ -7059,6 +7344,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 		if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 			U_LOG_W("Multi-comp: display processor created");
+			mc->panel_dp_hwnd = mc->hwnd; // #964 D-4: the panel DP's bound window
 
 			// Store DP on window for ESC/close 2D mode switch
 			if (mc->window != nullptr) {
@@ -7078,21 +7364,24 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 				// Teardown and recreate at correct size
 				xrt_display_processor_d3d11_destroy(&mc->display_processor);
+				mc->panel_dp_hwnd = nullptr;
 				mc->back_buffer_rtv.reset();
 				mc->swap_chain.reset();
 				comp_d3d11_window_destroy(&mc->window);
 
 				// Recreate window at DP-reported size
-				wret = comp_d3d11_window_create(
+				wret = comp_d3d11_window_create_ex(
 				    dp_px_w, dp_px_h,
 				    sys->base.info.display_screen_left,
 				    sys->base.info.display_screen_top,
+				    start_hidden,
 				    &mc->window);
 				if (wret != XRT_SUCCESS || mc->window == nullptr) {
 					U_LOG_E("Multi-comp: failed to recreate window at %ux%u", dp_px_w, dp_px_h);
 					return XRT_ERROR_D3D11;
 				}
 				mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
+				mc->service_window_shown = !start_hidden;
 				sys->compositor_hwnd = mc->hwnd;
 				comp_d3d11_window_set_workspace_mode_active(mc->window, sys->workspace_mode);
 
@@ -7135,6 +7424,12 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				dp_ret = factory(sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
 				if (dp_ret != XRT_SUCCESS) {
 					U_LOG_E("Multi-comp: failed to recreate DP");
+				} else {
+					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
+					if (mc->window != nullptr) {
+						comp_d3d11_window_set_workspace_dp(mc->window,
+						                                   mc->display_processor);
+					}
 				}
 
 				U_LOG_W("Multi-comp: recreated at %ux%u", actual_w, actual_h);
@@ -14508,7 +14803,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		}
 
 		xrt_result_t res_ret = init_client_render_resources(
-		    sys, external_hwnd, transparent_hwnd, sys->xsysd, &c->render);
+		    sys, external_hwnd, transparent_hwnd, sys->xsysd, &c->render, c);
 		if (res_ret != XRT_SUCCESS) {
 			U_LOG_E("Failed to initialize client render resources");
 			delete c;
@@ -14582,7 +14877,12 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// title inside the workspace it is supposed to be controlling.
 	// compositor_destroy's unregister call is already a no-op on a
 	// never-registered compositor (its loop won't find a matching slot).
-	if (sys->workspace_mode && !is_headless_relay && !is_workspace_controller) {
+	//
+	// #964 (D-1): the pipeline is ALWAYS on — every renderable client takes a
+	// multi-comp slot from its first frame, controller or not. The slot table
+	// is the focus authority (D-5), the render thread is the only presenter
+	// (D-3), and activate/deactivate become pure policy switches.
+	if ((sys->workspace_mode || pipeline_always_on(sys)) && !is_headless_relay && !is_workspace_controller) {
 		// Ensure multi_comp struct exists for registration
 		// Eagerly create multi-comp output (window + DP) on first client connect.
 		// This ensures the DP is available for ipc_try_get_sr_view_poses
@@ -14859,6 +15159,15 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->log_level = U_LOGGING_INFO;
 	sys->hardware_display_3d = true;
 	sys->last_3d_mode_index = 1;
+
+	// #964 (D-7): latch the pipeline-vs-legacy choice once, up front, and say
+	// which one is running — every downstream gate is a field read from here.
+	sys->legacy_standalone = dxr_legacy_standalone_enabled();
+	U_LOG_W("[pipeline] %s (DXR_LEGACY_STANDALONE=%s)",
+	        sys->legacy_standalone ? "LEGACY standalone path — per-client window/swap chain/DP"
+	                               : "always-on multi-compositor — one DP per panel, "
+	                                 "render thread presents",
+	        sys->legacy_standalone ? "1" : "0");
 
 	// Default tile layout (stereo side-by-side) and display dimensions
 	sys->tile_columns = 2;

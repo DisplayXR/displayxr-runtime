@@ -145,6 +145,12 @@ struct comp_d3d11_window
 	//! True if window should stay hidden (for SR weaver HWND in shared-texture mode)
 	bool hidden;
 
+	//! #964: create the window fully (fullscreen geometry, native-res client
+	//! rect) but do not SHOW it. Unlike `hidden` above this keeps the normal
+	//! style/geometry path — the window is a real, showable presenter surface
+	//! that simply starts out invisible. See comp_d3d11_window_set_visible.
+	bool start_hidden;
+
 	//! Window thread handle
 	HANDLE thread_handle;
 
@@ -1585,8 +1591,18 @@ window_thread_body(struct comp_d3d11_window *w)
 			set_fullscreen(hwnd, true);
 		}
 
-		ShowWindow(hwnd, SW_SHOW);
-		UpdateWindow(hwnd);
+		if (w->start_hidden) {
+			// #964: geometry is set (client rect is native-res, which is
+			// what the DP and the swap chain are sized against), but the
+			// window stays off-screen until it becomes the active
+			// presenter. set_fullscreen's SWP_SHOWWINDOW ran above; this
+			// undoes it before the message loop starts pumping, so the
+			// window is never composited.
+			ShowWindow(hwnd, SW_HIDE);
+		} else {
+			ShowWindow(hwnd, SW_SHOW);
+			UpdateWindow(hwnd);
+		}
 	}
 
 	// Store initial client dimensions
@@ -1668,11 +1684,23 @@ comp_d3d11_window_create(uint32_t width,
                          int32_t screen_top,
                          struct comp_d3d11_window **out)
 {
+	return comp_d3d11_window_create_ex(width, height, screen_left, screen_top, /*start_hidden*/ false, out);
+}
+
+extern "C" xrt_result_t
+comp_d3d11_window_create_ex(uint32_t width,
+                            uint32_t height,
+                            int32_t screen_left,
+                            int32_t screen_top,
+                            bool start_hidden,
+                            struct comp_d3d11_window **out)
+{
 	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
 	if (w == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	w->start_hidden = start_hidden;
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
@@ -1741,9 +1769,22 @@ comp_d3d11_window_create(uint32_t width,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	U_LOG_W("D3D11 window: Window created on thread %lu, HWND=%p", w->thread_id, (void *)w->hwnd);
+	U_LOG_W("D3D11 window: Window created on thread %lu, HWND=%p%s", w->thread_id, (void *)w->hwnd,
+	        w->start_hidden ? " (hidden)" : "");
 	*out = w;
 	return XRT_SUCCESS;
+}
+
+extern "C" void
+comp_d3d11_window_set_visible(struct comp_d3d11_window *window, bool visible)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+	// Async: callers are the compositor render thread (holding render_mutex)
+	// and the workspace policy switches. A synchronous ShowWindow dispatches
+	// WM_SHOWWINDOW into the window thread's loop and waits for it.
+	ShowWindowAsync(window->hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
 }
 
 
