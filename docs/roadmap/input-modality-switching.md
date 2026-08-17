@@ -97,10 +97,23 @@ model whose visual-response scene nodes were disposed on the earlier removal;
 the throw inside `renderer.render()` kills the page's animation loop — hence
 zero further OpenXR calls and the black screen. That is why it is always the
 *third* flip: add(provider) → swap(qwerty, fresh model) → swap(provider,
-**stale cached model**) → throw. A three.js bug (worth filing upstream), not
-Chrome C++ and not the runtime; any page using `XRControllerModelFactory` —
-i.e. most three.js WebXR content — is exposed to it on ANY runtime that hot
-swaps interaction profiles.
+**stale cached model**) → throw. A three.js bug (filed upstream as
+[mrdoob/three.js#34264]), not Chrome C++ and not the runtime; any page using
+`XRControllerModelFactory` — i.e. most three.js WebXR content — is exposed to
+it on ANY runtime that hot swaps interaction profiles.
+
+**Fixed upstream 2026-08-16 — but this does not retire our masquerade.**
+Mugen87 closed #34264 same-day via [mrdoob/three.js#34266] ("outdated async
+load callbacks no longer corrupt the motion controller's cached scene
+references"), milestone **r186**. That only helps content shipping r186+;
+every page pinned to an older three.js stays fragile, and no other engine's
+controller-model plumbing has been tested against profile churn. Treat the
+upstream fix as one exposed engine hardened, not as the class of bug going
+away — the runtime-side profile-stability rule (§3, and #948) remains the
+durable answer.
+
+[mrdoob/three.js#34264]: https://github.com/mrdoob/three.js/issues/34264
+[mrdoob/three.js#34266]: https://github.com/mrdoob/three.js/pull/34266
 
 Interaction-profile transitions per `xrGetCurrentInteractionProfile` in that
 run: provider = `khr/simple_controller`, qwerty = `microsoft/motion_controller`.
