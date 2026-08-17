@@ -198,3 +198,21 @@ workspace `Late-weave saturation backoff` governor misreads the hidden service w
 - `DXR_LEGACY_STANDALONE=1` reproduces today's behaviour exactly (N DPs, per-client windows).
 - Motion-to-photon A/B (LL probes) hosted cube legacy vs pipeline, on the NV and the Intel
   present path, before the legacy path is deleted.
+
+**A/B, first pass (2026-08-17, SR box, NV renders / panel on the Intel iGPU, `DXR_WEAVE_LATENCY_CSV`,
+R = weave→scanout, 50–70 s per arm, no face):**
+
+| shape | pipeline p50 / p95 | legacy (`DXR_LEGACY_STANDALONE=1`) p50 / p95 |
+|---|---|---|
+| forced-IPC `_handle` cube (APP_HWND) | **16.6 / 16.6 ms** @ 60 Hz | 30.3 / 31.6 ms |
+| hosted cube (SERVICE_WINDOW), run 1 | 33.2 / 33.3 ms | 30.7 / 63.4 ms |
+| hosted, alternating repeats ×3 | 33.3, 39.4, 39.2 ms p50 @ ~57 Hz | 62.4, 62.5, 53.4 ms p50 @ ~33 Hz |
+
+The `_handle` shape gains a full refresh (the render thread paces on the app chain's waitable);
+the hosted shape is parity-or-better with a much tighter tail (legacy p95 = 2× p50). Caveats:
+the box is not a clean lab — an elevated IDE window over the panel throttles whichever window
+DWM considers occluded and moved the legacy hosted arm from 31 to 62 ms between sessions; both
+hosted arms sit at ≈2 refresh periods where the handle window sits at 1 (fullscreen borderless →
+independent-flip on the cross-adapter iGPU path is the suspect, not the compositor: legacy shows
+it too); no `D` (prediction-error) rows exist on the service paths. Repeat on a clean desktop and
+on an Intel-only present path before deleting the legacy code (#964 follow-up).
