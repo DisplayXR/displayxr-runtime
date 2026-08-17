@@ -6884,12 +6884,23 @@ try {
 			                                                : WaitForSingleObject(pace_app, 20);
 			const bool app_signaled =
 			    (mc->render_wakeup_event != nullptr) ? (wr == WAIT_OBJECT_0 + 1) : (wr == WAIT_OBJECT_0);
-			mc->app_present_token_sc = app_signaled ? pace_sc : nullptr;
-			mc->app_present_token.store(app_signaled, std::memory_order_release);
-			// The service window is hidden; its own chain grants nothing.
-			mc->present_token.store(false, std::memory_order_release);
+			// Tokens are STICKY: a satisfied wait consumed the chain's slot, and
+			// that slot stays ours until a Present spends it. Overwriting the
+			// token on a timeout (the old per-loop store) dropped the grant
+			// whenever a frame presented nothing (no client yet, focused client
+			// without a new frame) — the waitable then never re-signals and the
+			// presenter is dead for good (measured: pipe_active_present=0,
+			// skip=97/10 s). Only a Present clears a token; a chain change
+			// (unregister / re-key) drops it explicitly.
+			if (app_signaled) {
+				if (mc->app_present_token_sc != pace_sc) {
+					mc->app_present_token_sc = pace_sc;
+				}
+				mc->app_present_token.store(true, std::memory_order_release);
+			}
+			// The service window's own token (if any) stays until spent.
 		} else if (mc->frame_latency_waitable) {
-			mc->app_present_token.store(false, std::memory_order_release);
+			// (app token, if any, stays until spent or re-keyed — see above)
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			// #964: when the SERVICE WINDOW is not the active presenter it is
 			// hidden, and a hidden swap chain's waitable stops signaling — the
@@ -6905,7 +6916,10 @@ try {
 			// frozen client's resource) we still run the render pass — but the
 			// present site must NOT call a blocking Present. The token is the
 			// pacer's one-present grant.
-			mc->present_token.store(wr == WAIT_OBJECT_0, std::memory_order_release);
+			if (wr == WAIT_OBJECT_0) {
+				mc->present_token.store(true,
+				                        std::memory_order_release); // sticky until a Present spends it
+			}
 
 			// Latency governor (#850): back the queue depth off to 2 when
 			// the workspace pipeline can't hold refresh rate at depth 1
@@ -8230,7 +8244,7 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		// swap chain so a focus change between the wait and here can never
 		// spend it on the wrong presenter.
 		struct d3d11_multi_compositor *tmc = c->sys != nullptr ? c->sys->multi_comp : nullptr;
-		if (is_active && tmc != nullptr && tmc->app_present_token_sc == c->render.swap_chain.get() &&
+		if (tmc != nullptr && tmc->app_present_token_sc == c->render.swap_chain.get() &&
 		    tmc->app_present_token.exchange(false, std::memory_order_acq_rel)) {
 			return true;
 		}
