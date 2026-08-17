@@ -113,6 +113,38 @@ comp_d3d11_window_create(uint32_t width,
                          struct comp_d3d11_window **out);
 
 /*!
+ * As @ref comp_d3d11_window_create, but with control over the window's initial
+ * visibility.
+ *
+ * @p start_hidden = true creates the window fully (thread, class, HWND,
+ * fullscreen geometry, so the client rect is already native-res) but leaves it
+ * HIDDEN. Used by the always-on service pipeline (#964): the service window
+ * exists from the first client so the panel display processor and the render
+ * thread have a home, but it is only SHOWN while it is the active presenter —
+ * an app presenting into its own HWND must not have the service window on top
+ * of it. Show/hide it later with @ref comp_d3d11_window_set_visible.
+ *
+ * @p start_hidden = false is identical to @ref comp_d3d11_window_create.
+ */
+xrt_result_t
+comp_d3d11_window_create_ex(uint32_t width,
+                            uint32_t height,
+                            int32_t screen_left,
+                            int32_t screen_top,
+                            bool start_hidden,
+                            struct comp_d3d11_window **out);
+
+/*!
+ * Show or hide the window asynchronously (#964).
+ *
+ * Uses ShowWindowAsync so the caller — typically the compositor render thread
+ * holding render_mutex — never blocks on the window thread's message loop.
+ * Idempotent from the OS's point of view; the caller tracks transitions.
+ */
+void
+comp_d3d11_window_set_visible(struct comp_d3d11_window *window, bool visible);
+
+/*!
  * Destroy the self-owned window.
  *
  * Posts the private WM_DXR_DESTROY_WINDOW message to the window thread and waits
