@@ -53,6 +53,8 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
 - **[Service Architecture](architecture/service-architecture.md)** — the service as built: processes, threads, locks, the two compositor modes, client classes, failure domains, limits
+- **[One Compositor Pipeline (D3D11 service)](architecture/service-one-pipeline.md)** — #964 design note: always-on multi-comp, presenter kinds, default presenter policy, one DP per panel, legacy gate
+- **[comp_multi One Pipeline (macOS/Linux/Android)](architecture/comp-multi-one-pipeline.md)** — #967 design note: bounded waits, shared-surface port to Android, issue split
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
 - **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
 
