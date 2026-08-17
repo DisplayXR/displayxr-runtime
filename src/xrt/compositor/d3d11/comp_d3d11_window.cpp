@@ -1782,9 +1782,22 @@ comp_d3d11_window_set_visible(struct comp_d3d11_window *window, bool visible)
 		return;
 	}
 	// Async: callers are the compositor render thread (holding render_mutex)
-	// and the workspace policy switches. A synchronous ShowWindow dispatches
-	// WM_SHOWWINDOW into the window thread's loop and waits for it.
-	ShowWindowAsync(window->hwnd, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+	// and the workspace policy switches. A synchronous ShowWindow/SetWindowPos
+	// dispatches into the window thread's loop and waits for it.
+	//
+	// Show = raise to the top of the z-order AND activate, exactly what the
+	// legacy hosted window got from set_fullscreen()'s SetWindowPos(HWND_TOP,
+	// SWP_SHOWWINDOW) at creation. SW_SHOWNOACTIVATE alone leaves a window
+	// that was created hidden at the BOTTOM of the z-order: occluded by any
+	// editor/terminal, and the SR service then refuses the lens hint (the
+	// weaver's window is not visible on the panel) -- the panel never goes 3D.
+	// The hosted app also needs the window active for keyboard input (qwerty).
+	if (visible) {
+		SetWindowPos(window->hwnd, HWND_TOP, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+	} else {
+		ShowWindowAsync(window->hwnd, SW_HIDE);
+	}
 }
 
 

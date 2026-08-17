@@ -773,6 +773,30 @@ controller_policy_locked(struct ipc_server *s)
 	return s->workspace_mode && controller_connected_locked(s);
 }
 
+// #964 (D-5): does the COMPOSITOR own focus? Then this layer only mirrors it
+// (sync_focus_from_compositor) and must never write active_client_index from
+// its own rule — the predict_frame promotion and the session-active fallback
+// below would otherwise fight the compositor's slot table and flap every
+// client's focused state on each new connection.
+//
+// True whenever a controller drives policy (as before), AND — new — whenever
+// the D3D11 service compositor reports that its slot table is authoritative,
+// which is the always-on pipeline case (everything except
+// DXR_LEGACY_STANDALONE=1). Platforms without that compositor, and the legacy
+// path, keep the inherited IPC rule untouched. Caller holds global_state.lock.
+static bool
+compositor_owns_focus_locked(struct ipc_server *s)
+{
+	if (controller_policy_locked(s)) {
+		return true;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	return s->xsysc != NULL && comp_d3d11_service_focus_is_authoritative(s->xsysc);
+#else
+	return false;
+#endif
+}
+
 // The compositor's focused client, as an xrt_compositor pointer for identity
 // matching against ics->xc (never dereferenced). NULL = none / no authority.
 // Takes the compositor's own lock — call OUTSIDE global_state.lock.
@@ -802,15 +826,15 @@ sync_focus_from_compositor(struct ipc_server *s)
 	struct xrt_compositor *xc = compositor_focused_xc(s);
 
 	os_mutex_lock(&s->global_state.lock);
-	// #964 (D-5): the compositor's slot table is the focus authority whenever
-	// it HAS one — the "newest presenting client" default rule now lives there
-	// (comp_d3d11_service's pipeline_default_policy_render), so mirror it even
-	// without a controller. A NULL answer without a controller means "no
-	// verdict" (no slot table, or nothing presenting yet), and the IPC-side
-	// default rule below stays in force as the fallback — including on
-	// platforms whose compositor has no slot table at all. With a controller
-	// attached, NULL is a real verdict ("focus is nobody") and is mirrored.
-	if (!controller_policy_locked(s) && xc == NULL) {
+	// #964 (D-5): when the compositor owns focus we mirror it VERBATIM —
+	// including a NULL verdict, which means "nobody is presenting" and must
+	// land as active_client_index = -1. Anything softer leaves this layer's own
+	// rule as a second writer, and the two authorities flap every client's
+	// focused state each time a client joins or leaves.
+	//
+	// When it does NOT own focus (legacy path, or a platform without the
+	// slot-table compositor) the inherited IPC rule stays in force untouched.
+	if (!compositor_owns_focus_locked(s)) {
 		os_mutex_unlock(&s->global_state.lock);
 		return;
 	}
@@ -933,11 +957,12 @@ update_server_state_locked(struct ipc_server *s)
 	//, or finally to the idle 'wallpaper' images.
 
 
-	if (controller_policy_locked(s)) {
-		// #962 controller policy: focus is the compositor's focused slot, mirrored
-		// into active_client_index by sync_focus_from_compositor() on the
-		// mainloop. Never fall back to "some other session" here — the controller
-		// decides; an empty focus is a legitimate state (VISIBLE, not FOCUSED).
+	if (compositor_owns_focus_locked(s)) {
+		// #962 / #964 D-5: focus is the compositor's focused slot, mirrored into
+		// active_client_index by sync_focus_from_compositor() on the mainloop.
+		// Never fall back to "some other session" here — the compositor decides
+		// (controller policy, or the pipeline's newest-presenting-client rule);
+		// an empty focus is a legitimate state (VISIBLE, not FOCUSED).
 		// Only drop an index whose client is gone.
 		if (s->global_state.active_client_index >= 0) {
 			volatile struct ipc_client_state *ics = &s->threads[s->global_state.active_client_index].ics;
@@ -1155,15 +1180,18 @@ ipc_server_activate_session(volatile struct ipc_client_state *ics)
 		                             s->global_state.last_active_client_index);
 		handle_overlay_client_events(ics, s->global_state.active_client_index,
 		                             s->global_state.last_active_client_index);
-	} else if (!controller_policy_locked(s)) {
+	} else if (!compositor_owns_focus_locked(s)) {
 		// #962 default policy: the newest presenting client takes focus.
 		set_active_client_locked(s, ics->client_state.id);
 
 		// For new active regular sessions update all clients.
 		update_server_state_locked(s);
 	}
-	// #962: with a controller connected, predict_frame promotes nobody — focus
-	// is the compositor's and is mirrored by sync_focus_from_compositor().
+	// #962 / #964 D-5: when the compositor owns focus, predict_frame promotes
+	// nobody — focus is the slot table's and reaches us only through
+	// sync_focus_from_compositor(). The compositor applies the SAME
+	// newest-presenting-client rule, one frame later and with the presenting
+	// state it alone can see.
 
 	os_mutex_unlock(&s->global_state.lock);
 }

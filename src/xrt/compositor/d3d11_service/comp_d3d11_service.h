@@ -775,6 +775,25 @@ int
 comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #964 (D-5): is the COMPOSITOR the one focus authority right now?
+ *
+ * True on the always-on pipeline (i.e. always, unless DXR_LEGACY_STANDALONE=1):
+ * the slot table owns focus whether or not a workspace controller is attached,
+ * because the "newest presenting client wins" default rule moved into
+ * `pipeline_default_policy_render`. The IPC layer must then STOP writing
+ * `active_client_index` from its own rule (predict_frame promotion, the
+ * session-active fallback) and only mirror — two writers produce the observed
+ * focused=1/focused=0 event flap when a second client joins.
+ *
+ * False under `DXR_LEGACY_STANDALONE=1`, where each client owns its own
+ * presenter and the inherited IPC-side rule is still correct.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_focus_is_authoritative(struct xrt_system_compositor *xsysc);
+
+/*!
  * #962: the focused slot's client compositor as an `xrt_compositor *` for
  * POINTER-IDENTITY matching against `ipc_client_state.xc` — never dereference
  * it. NULL when nothing is focused, the focused slot is a capture (non-IPC)

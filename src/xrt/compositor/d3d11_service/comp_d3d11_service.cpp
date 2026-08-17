@@ -136,16 +136,44 @@ dxr_late_weave_enabled()
  * goes away together with #963's hot-switch seam.
  * See docs/architecture/service-one-pipeline.md §2 D-7.
  */
+/*
+ * #964: per-CHAIN max frame latency for an APP_HWND presenter's swap chain
+ * (DXR_APP_HWND_LATENCY, default 1, clamped 1..3).
+ *
+ * 1 gives the tightest motion-to-photon but leaves zero slack: the render
+ * thread's zero-timeout probe fires on a fixed cadence and DWM releases the
+ * buffer on the vblank, so a probe landing a hair early is a whole skipped
+ * frame for that window. 2 buys one buffer of slack — the wait still bounds
+ * us, so the render thread can never block — at the cost of ~one refresh of
+ * latency. Env-gated so the skip ratio in `[RENDER]` can be A/B'd against it
+ * without a rebuild.
+ */
+static UINT
+dxr_app_hwnd_latency()
+{
+	static int latency = -1;
+	if (latency < 0) {
+		const char *e = getenv("DXR_APP_HWND_LATENCY");
+		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
+		if (v < 1) {
+			v = 1;
+		}
+		if (v > 3) {
+			v = 3;
+		}
+		latency = v;
+	}
+	return (UINT)latency;
+}
+
 static bool
 dxr_legacy_standalone_enabled()
 {
 	static int enabled = -1;
 	if (enabled < 0) {
 		const char *e = getenv("DXR_LEGACY_STANDALONE");
-		enabled = (e != nullptr &&
-		           (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y'))
-		              ? 1
-		              : 0;
+		enabled =
+		    (e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
 	}
 	return enabled == 1;
 }
@@ -249,6 +277,19 @@ struct d3d11_client_render_resources
 
 	//! DXGI swap chain for display output
 	wil::com_ptr<IDXGISwapChain1> swap_chain;
+
+	//! #964: frame-latency waitable of an APP_HWND presenter's swap chain
+	//! (created with FRAME_LATENCY_WAITABLE_OBJECT + per-CHAIN max latency 1).
+	//! The render thread probes it with a ZERO timeout before touching that
+	//! back buffer and skips the presenter entirely when it is not signaled —
+	//! the #924 model, applied to a cross-process window. Without it,
+	//! `Present(1, …)` on an occluded foreign HWND throttles the render thread
+	//! to DWM's (non-)drain rate for that window: measured 138-626 ms per
+	//! frame, growing. NULL when the chain could not be created waitable
+	//! ("unpaced" — then the duration watchdog below owns the protection).
+	//! Owned here; closed in fini_client_render_resources. Survives
+	//! ResizeBuffers as long as the creation flag is preserved.
+	HANDLE frame_latency_waitable;
 
 	//! Back buffer render target view
 	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
@@ -481,6 +522,15 @@ struct d3d11_service_compositor
 	uint32_t pipe_tile_rows;
 	bool pipe_frame_ready;
 
+	//! #964: pacing state for this client's presenter when it is an APP_HWND —
+	//! a foreign, frequently occluded window the render thread must never
+	//! block on. `last_flat_present_ns` rate-limits the unfocused flat-2D
+	//! present when no waitable is available; `present_backoff_until_ns` parks
+	//! the presenter for a second after DXGI reports occlusion, an error, or
+	//! the duration watchdog trips (a Present that took > 20 ms).
+	int64_t last_flat_present_ns;
+	int64_t present_backoff_until_ns;
+
 	//! #925 S4 tier 2: this client may hold a multi-comp slot (i.e. it is
 	//! neither a bridge relay nor a workspace controller). Gates the commit-
 	//! time slot re-register: an idle-evicted client that resumes committing
@@ -572,6 +622,25 @@ struct d3d11_service_compositor
 	//! -1 none / 0 = 2D / 1 = 3D.
 	std::atomic<uint32_t> pending_content_mode{0xFFFFFFFFu};
 	std::atomic<int>      pending_hw_3d{-1};
+
+	//! #964 (D-4): this client's STANDING WISH for the panel — the last mode it
+	//! asked for, recorded at REQUEST time whether or not the request was
+	//! granted (a denied request is still what the client wants). Unlike
+	//! `pending_*` above it is never consumed.
+	//!
+	//! With ONE display processor per panel the runtime has to re-apply it
+	//! itself on every focus change: on the legacy path each client held its
+	//! own DP and the vendor SDK OR'd the live hints, so an unfocused client's
+	//! 2D hint simply went away with its DP. Here the panel keeps whatever the
+	//! last lease holder asked for — observed: a handle app wanting 2D exits,
+	//! the hosted app wanting 3D takes focus, and the panel stays flat.
+	//! `pipeline_default_policy_render` re-arms `pending_*` from these on the
+	//! focus transition; the new holder's next commit applies them through the
+	//! normal lease + apply_mode_transition path.
+	//!
+	//! -1 = no wish (never asked) — the panel is then left exactly as it is.
+	std::atomic<int32_t> wish_content_mode{-1};
+	std::atomic<int> wish_hw_3d{-1};
 
 	//! #815: the app's standing HARDWARE override, latched from the last
 	//! xrRequestDisplayModeDXR this client made. -1 = none / 0 = 2D / 1 = 3D.
@@ -1042,6 +1111,28 @@ struct d3d11_service_system
 	std::atomic<int64_t> render_diag_client_render_total_ns{0};
 	std::atomic<int64_t> render_diag_mutex_wait_total_ns{0};
 	std::atomic<uint32_t> render_diag_mutex_wait_count{0};
+	/*! @} */
+
+	/*!
+	 * @name #964 — pipeline counters on the same `[RENDER]` 10 s window.
+	 *
+	 * The app-HWND presenter is probe-then-skip (a zero-timeout wait on its
+	 * frame-latency waitable), so the SKIP RATIO is the diagnostic that
+	 * separates "we probed a hair before the vblank release" (jitter — high
+	 * present count, low skip count) from "DWM is not consuming this window's
+	 * flips at all" (skips dominate). `backoff` counts only the skips caused by
+	 * the duration watchdog / occlusion parking, which is the pathological case.
+	 * `presenter` is the active presenter kind at emit time (enum
+	 * d3d11_presenter_kind). Reset per window like everything above.
+	 * @{
+	 */
+	std::atomic<uint32_t> render_diag_pipe_active_present{0};
+	std::atomic<uint32_t> render_diag_pipe_active_skip{0};
+	std::atomic<uint32_t> render_diag_pipe_active_backoff{0};
+	std::atomic<uint32_t> render_diag_pipe_flat_present{0};
+	std::atomic<uint32_t> render_diag_pipe_flat_skip{0};
+	std::atomic<uint32_t> render_diag_pipe_rebind{0};
+	std::atomic<int> render_diag_pipe_presenter{0};
 	/*! @} */
 
 	//! Phase 5b — rate-limited cache of `xrt_display_processor_d3d11_get_hardware_3d_state`.
@@ -1608,6 +1699,13 @@ enum d3d11_presenter_kind
 	PRESENTER_APP_HWND = 2,
 	//! ADR-029 client-presents: a shared NT texture + fence; the app presents.
 	PRESENTER_CLIENT_TEXTURE = 3,
+	//! XR_DXR_weave present-owner (#625/#965, e.g. displayxr-browser): it never
+	//! commits projection layers — it calls `weave_submit` synchronously and
+	//! presents the handback itself, into its OWN window. The pipeline never
+	//! draws its slot and never presents for it; it only owns the PANEL, so
+	//! the panel DP is bound to its `weave_hwnd` while it is focused and the
+	//! service window stays hidden (covering the browser would be a disaster).
+	PRESENTER_SELF = 4,
 };
 
 /*!
@@ -1950,6 +2048,33 @@ struct d3d11_multi_compositor
 
 	//! Display processor (single, shared).
 	struct xrt_display_processor_d3d11 *display_processor;
+
+	//! #964: DEFERRED-DESTROY GRAVEYARD for retired panel display processors.
+	//!
+	//! `display_processor` is read LOCK-FREE on several IPC-thread paths (the
+	//! eye-position hot path, mode-writer gates, the weave service). On the
+	//! legacy path that was safe by construction — a per-client DP could only
+	//! die on its owner's own thread. With ONE DP per panel that the render
+	//! thread re-binds on every presenter change, a reader could latch the
+	//! pointer, the render thread could free it, and the reader would then call
+	//! through a freed vtable. Observed: `weave_submit -> process_atlas -> 0x0`
+	//! one millisecond after a `panel DP re-bound` line.
+	//!
+	//! So a rebind NEVER destroys synchronously. It creates the new DP, PUBLISHES
+	//! it into `display_processor` (a single pointer store; every reader loads it
+	//! ONCE into a local and uses that local for one bounded call sequence), and
+	//! parks the old one here. The render thread destroys entries older than
+	//! DXR_DP_GRAVEYARD_MS (default 2000) at the top of its frame under
+	//! render_mutex; `multi_compositor_destroy` drains whatever is left.
+	//!
+	//! Why a time bound is enough: every DP call is bounded (µs–ms), so a reader
+	//! that latched the pointer just before the swap is long done 2 s later.
+	//! Entries are pushed/popped under render_mutex only.
+	struct
+	{
+		struct xrt_display_processor_d3d11 *dp;
+		int64_t retire_ns;
+	} dp_graveyard[4];
 
 	//! #964 (D-4): the HWND `display_processor` was CREATED against. The D3D11
 	//! DP takes its interlace phase and target size from that window, so when
@@ -2609,6 +2734,11 @@ client_holds_panel_lease(struct d3d11_service_system *sys, struct d3d11_service_
  * `sys->render_mutex` (render_mutex_fair_lock) — the render thread drives the
  * same object every frame. Legal nesting: `c->mutex` -> `render_mutex`.
  */
+//! #964: deferred-destroy graveyard for retired panel DPs — see the
+//! `dp_graveyard` field comment. Defined next to pipeline_bind_panel_dp.
+static void
+pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force);
+
 static inline struct xrt_display_processor_d3d11 *
 panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
@@ -3846,6 +3976,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_overlay_srv.reset();
 	res->weave_overlay_tex.reset();
 
+	// #964: the APP_HWND presenter's frame-latency waitable (owned handle).
+	if (res->frame_latency_waitable != nullptr) {
+		CloseHandle(res->frame_latency_waitable);
+		res->frame_latency_waitable = nullptr;
+	}
 	res->swap_chain.reset();
 
 	if (res->owns_window && res->window != nullptr) {
@@ -3869,11 +4004,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
  */
 static xrt_result_t
 init_client_render_resources(struct d3d11_service_system *sys,
-                              void *external_hwnd,
-                              bool transparent_hwnd,
-                              struct xrt_system_devices *xsysd,
-                              struct d3d11_client_render_resources *res,
-                              struct d3d11_service_compositor *c)
+                             void *external_hwnd,
+                             bool transparent_hwnd,
+                             struct xrt_system_devices *xsysd,
+                             struct d3d11_client_render_resources *res,
+                             struct d3d11_service_compositor *c)
 {
 	std::memset(res, 0, sizeof(*res));
 
@@ -4007,8 +4142,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 			hr = sys->device->CreateTexture2D(&od, nullptr, res->transparent_output_texture.put());
 			if (SUCCEEDED(hr)) {
-				hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(),
-				                                         nullptr, res->back_buffer_rtv.put());
+				hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(), nullptr,
+				                                         res->back_buffer_rtv.put());
 			}
 			wil::com_ptr<IDXGIResource1> dxgi_res1;
 			if (SUCCEEDED(hr)) {
@@ -4028,9 +4163,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				    nullptr, GENERIC_ALL, nullptr, &res->transparent_output_fence_handle);
 			}
 			if (FAILED(hr)) {
-				U_LOG_E("[pipeline] client-presents output create failed (0x%08lx) — "
-				        "falling back to the service-window presenter",
-				        hr);
+				U_LOG_E(
+				    "[pipeline] client-presents output create failed (0x%08lx) — "
+				    "falling back to the service-window presenter",
+				    hr);
 				res->transparent_output_fence.reset();
 				res->transparent_output_texture.reset();
 				res->back_buffer_rtv.reset();
@@ -4039,9 +4175,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				res->transparent_output_w = canvas_w;
 				res->transparent_output_h = canvas_h;
 				res->transparent_output_value = 0;
-				U_LOG_W("[pipeline] presenter=CLIENT_TEXTURE hwnd=%p %ux%u "
-				        "(shared texture + service->client fence)",
-				        external_hwnd, canvas_w, canvas_h);
+				U_LOG_W(
+				    "[pipeline] presenter=CLIENT_TEXTURE hwnd=%p %ux%u "
+				    "(shared texture + service->client fence)",
+				    external_hwnd, canvas_w, canvas_h);
 			}
 		} else if (kind == PRESENTER_APP_HWND) {
 			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
@@ -4054,26 +4191,69 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 			// IGNORE so DWM doesn't composite the desktop through the HWND (#163).
 			sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+			// FRAME_LATENCY_WAITABLE so the render thread can ask "is a back
+			// buffer free?" with a ZERO-timeout wait and SKIP this presenter
+			// when it is not — the #924 model. Mandatory here: this is a
+			// cross-process, frequently occluded window, and a plain
+			// Present(1, …) on it throttles the render thread to DWM's drain
+			// rate for that window (measured 138-626 ms/frame, growing).
+			//
+			// The latency cap is applied PER CHAIN via IDXGISwapChain2, never
+			// via IDXGIDevice1::SetMaximumFrameLatency — that one is
+			// DEVICE-WIDE and this device also owns the service window's
+			// waitable chain, which is what actually paces the render thread.
+			sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
-			hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc,
-			                                               nullptr, nullptr, res->swap_chain.put());
+			hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc, nullptr,
+			                                               nullptr, res->swap_chain.put());
+			if (FAILED(hr)) {
+				// Some cross-process / legacy HWNDs refuse the waitable flag.
+				// Retry unpaced; the render thread then falls back to
+				// Present(0, DO_NOT_WAIT) + a duration watchdog.
+				U_LOG_W(
+				    "[pipeline] waitable swap chain on app HWND %p refused "
+				    "(0x%08lx) — retrying unpaced",
+				    res->hwnd, hr);
+				res->swap_chain.reset();
+				sc_desc.Flags = 0;
+				hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc,
+				                                               nullptr, nullptr, res->swap_chain.put());
+			}
 			if (FAILED(hr)) {
 				// Cross-process CreateSwapChainForHwnd is not categorically
 				// denied — it depends on this service's rights over the app's
 				// window (same session + integrity level is the common case,
 				// and it is observed working). When Windows does say no, fall
 				// back to the service window rather than failing the session.
-				U_LOG_W("[pipeline] swap chain on the app's HWND %p failed (0x%08lx%s) — "
-				        "falling back to the service-window presenter",
-				        res->hwnd, hr, hr == E_ACCESSDENIED ? " E_ACCESSDENIED" : "");
+				U_LOG_W(
+				    "[pipeline] swap chain on the app's HWND %p failed (0x%08lx%s) — "
+				    "falling back to the service-window presenter",
+				    res->hwnd, hr, hr == E_ACCESSDENIED ? " E_ACCESSDENIED" : "");
 				res->swap_chain.reset();
 				kind = PRESENTER_SERVICE_WINDOW;
 			} else {
+				if (sc_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+					wil::com_ptr<IDXGISwapChain2> sc2;
+					if (SUCCEEDED(res->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+						// Per CHAIN, never the device (DXR_APP_HWND_LATENCY).
+						sc2->SetMaximumFrameLatency(dxr_app_hwnd_latency());
+						res->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+					}
+				}
 				wil::com_ptr<ID3D11Texture2D> bb;
 				res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
 				sys->device->CreateRenderTargetView(bb.get(), nullptr, res->back_buffer_rtv.put());
-				U_LOG_W("[pipeline] presenter=APP_HWND hwnd=%p %ux%u", res->hwnd, canvas_w,
-				        canvas_h);
+				if (res->frame_latency_waitable != nullptr) {
+					U_LOG_W(
+					    "[pipeline] presenter=APP_HWND hwnd=%p %ux%u (waitable, max "
+					    "latency %u)",
+					    res->hwnd, canvas_w, canvas_h, dxr_app_hwnd_latency());
+				} else {
+					U_LOG_W(
+					    "[pipeline] presenter=APP_HWND hwnd=%p %ux%u (UNPACED — "
+					    "watchdog only)",
+					    res->hwnd, canvas_w, canvas_h);
+				}
 			}
 		}
 
@@ -4309,6 +4489,11 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	// 1, which makes Present(1) block until the previous frame flips. The
 	// weave then runs ~1-2 refreshes before scanout instead of ~3 (baseline R
 	// mean 46.4 ms), and the blocked RPC self-paces the client to vsync.
+	//
+	// #964: LEGACY-ONLY — the pipeline path returned above. The cap is
+	// DEVICE-WIDE, and on the pipeline that device also owns the service
+	// window's waitable chain (the render thread's pacer), so it must never be
+	// set from a per-client path there.
 	if (dxr_late_weave_enabled()) {
 		static bool device_latency_set = false;
 		if (!device_latency_set) {
@@ -6485,6 +6670,27 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u wait_avg_us=%u window_s=10",
 	    cap_r, cap_avg_us, cli_r, cli_s, cli_avg_us, wait_avg_us);
 
+	// #964: pipeline presenter counters on the same window. The ratio
+	// pipe_active_present : pipe_active_skip is the diagnostic for the
+	// probe-then-skip app-HWND path — a few percent of skips is probe/vblank
+	// jitter (try DXR_APP_HWND_LATENCY=2 for a buffer of slack), skips
+	// dominating means DWM is not consuming that window's flips at all.
+	// pipe_active_backoff counts only the watchdog/occlusion parking.
+	// presenter = enum d3d11_presenter_kind of the active presenter at emit.
+	if (pipeline_always_on(sys)) {
+		uint32_t ap = sys->render_diag_pipe_active_present.exchange(0, std::memory_order_relaxed);
+		uint32_t as = sys->render_diag_pipe_active_skip.exchange(0, std::memory_order_relaxed);
+		uint32_t ab = sys->render_diag_pipe_active_backoff.exchange(0, std::memory_order_relaxed);
+		uint32_t fp = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
+		uint32_t fs = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
+		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
+		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
+		U_LOG_W(
+		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
+		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u presenter=%d window_s=10",
+		    ap, as, ab, fp, fs, rb, pk);
+	}
+
 	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
 }
 
@@ -6512,7 +6718,15 @@ try {
 		// stops signaling.
 		if (mc->frame_latency_waitable) {
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
-			DWORD wr = WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, 100);
+			// #964: when the SERVICE WINDOW is not the active presenter it is
+			// hidden, and a hidden swap chain's waitable stops signaling — the
+			// loop would then fall back to the 100 ms timeout and drive an
+			// app-HWND presenter at 10 Hz. Use the pre-late-weave 14 ms tick in
+			// that state so the pipeline still runs at ~display rate; the app
+			// chain's own waitable does the per-window pacing.
+			const DWORD wait_ms =
+			    (pipeline_always_on(sys) && !sys->workspace_mode && !mc->service_window_shown) ? 14u : 100u;
+			DWORD wr = WaitForMultipleObjects(mc->render_wakeup_event ? 2 : 1, waits, FALSE, wait_ms);
 			// #924: only a signaled waitable means a back buffer is free. On
 			// timeout (DWM throttled/occluded or the flip chain is wedged on a
 			// frozen client's resource) we still run the render pass — but the
@@ -6948,6 +7162,10 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 		DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 	}
+	mc->panel_dp_hwnd = nullptr;
+	// #964: the render thread is joined above, so nothing can still be reading
+	// a retired DP — drain the graveyard unconditionally.
+	pipeline_dp_graveyard_sweep(mc, /*force*/ true);
 
 	mc->back_buffer_rtv.reset();
 	mc->combined_atlas_rtv.reset();
@@ -7044,12 +7262,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	// pipeline_default_policy_render decide per frame. Under a controller (or
 	// on the legacy path) it comes up visible exactly as before.
 	const bool start_hidden = pipeline_always_on(sys) && !sys->workspace_mode;
-	xrt_result_t wret = comp_d3d11_window_create_ex(
-	    win_w, win_h,
-	    sys->base.info.display_screen_left,
-	    sys->base.info.display_screen_top,
-	    start_hidden,
-	    &mc->window);
+	xrt_result_t wret = comp_d3d11_window_create_ex(win_w, win_h, sys->base.info.display_screen_left,
+	                                                sys->base.info.display_screen_top, start_hidden, &mc->window);
 	if (wret != XRT_SUCCESS || mc->window == nullptr) {
 		U_LOG_E("Multi-comp: failed to create window");
 		return XRT_ERROR_D3D11;
@@ -7370,12 +7584,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				comp_d3d11_window_destroy(&mc->window);
 
 				// Recreate window at DP-reported size
-				wret = comp_d3d11_window_create_ex(
-				    dp_px_w, dp_px_h,
-				    sys->base.info.display_screen_left,
-				    sys->base.info.display_screen_top,
-				    start_hidden,
-				    &mc->window);
+				wret = comp_d3d11_window_create_ex(dp_px_w, dp_px_h, sys->base.info.display_screen_left,
+				                                   sys->base.info.display_screen_top, start_hidden,
+				                                   &mc->window);
 				if (wret != XRT_SUCCESS || mc->window == nullptr) {
 					U_LOG_E("Multi-comp: failed to recreate window at %ux%u", dp_px_w, dp_px_h);
 					return XRT_ERROR_D3D11;
@@ -7427,8 +7638,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				} else {
 					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
 					if (mc->window != nullptr) {
-						comp_d3d11_window_set_workspace_dp(mc->window,
-						                                   mc->display_processor);
+						comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 					}
 				}
 
@@ -7488,8 +7698,7 @@ quat_from_yaw_pitch(float yaw_rad, float pitch_rad)
 static inline bool
 quat_is_identity(const struct xrt_quat *q)
 {
-	return fabsf(q->x) < 0.0001f && fabsf(q->y) < 0.0001f &&
-	       fabsf(q->z) < 0.0001f && fabsf(q->w - 1.0f) < 0.0001f;
+	return fabsf(q->x) < 0.0001f && fabsf(q->y) < 0.0001f && fabsf(q->z) < 0.0001f && fabsf(q->w - 1.0f) < 0.0001f;
 }
 
 // C5: WORKSPACE_CHROME_FADE_{IN,OUT}_NS, slot_chrome_fade_to, and
@@ -7516,14 +7725,15 @@ quat_is_identity(const struct xrt_quat *q)
  * and window aspect ratio on size change.
  */
 static void
-capture_slot_update_srv(struct d3d11_service_system *sys,
-                        struct d3d11_multi_client_slot *slot)
+capture_slot_update_srv(struct d3d11_service_system *sys, struct d3d11_multi_client_slot *slot)
 {
-	if (slot->capture_ctx == nullptr) return;
+	if (slot->capture_ctx == nullptr)
+		return;
 
 	uint32_t w = 0, h = 0;
 	ID3D11Texture2D *tex = d3d11_capture_get_texture(slot->capture_ctx, &w, &h);
-	if (tex == nullptr || w == 0 || h == 0) return;
+	if (tex == nullptr || w == 0 || h == 0)
+		return;
 
 	// Recreate SRV if texture pointer or dimensions changed
 	if (tex != slot->capture_texture_last || w != slot->capture_width || h != slot->capture_height) {
@@ -7552,9 +7762,8 @@ capture_slot_update_srv(struct d3d11_service_system *sys,
 		if (size_changed && slot->capture_width > 0 && slot->capture_height > 0) {
 			float aspect = (float)w / (float)h;
 			slot->window_height_m = slot->window_width_m / aspect;
-			slot_pose_to_pixel_rect(sys, slot,
-			    &slot->window_rect_x, &slot->window_rect_y,
-			    &slot->window_rect_w, &slot->window_rect_h);
+			slot_pose_to_pixel_rect(sys, slot, &slot->window_rect_x, &slot->window_rect_y,
+			                        &slot->window_rect_w, &slot->window_rect_h);
 		}
 	}
 }
@@ -7588,6 +7797,86 @@ capture_slot_update_srv(struct d3d11_service_system *sys,
  * @param client_presents ADR-029: the presenter is the client's shared texture,
  *        so the DP alpha-gates only and must NOT compose the captured desktop.
  */
+//! #964: how long a retired panel DP stays alive after being unpublished.
+//! Every DP call is bounded (µs–ms), so a reader that latched the old pointer
+//! just before the swap is long finished by then. DXR_DP_GRAVEYARD_MS.
+static int64_t
+dxr_dp_graveyard_ns()
+{
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *e = getenv("DXR_DP_GRAVEYARD_MS");
+		int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 2000;
+		if (ms < 0) {
+			ms = 0;
+		}
+		ns = ms * 1000000LL;
+	}
+	return ns;
+}
+
+/*!
+ * #964: park a retired panel DP instead of destroying it. Caller holds
+ * render_mutex and has ALREADY published its replacement (or nullptr).
+ *
+ * The lens vote is dropped immediately (`request_display_mode(false)`) — the
+ * vendor SDK ORs the hints of every live context, so a graveyard DP still
+ * asking for 3D would fight the new one for its whole retirement.
+ */
+static void
+pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_processor_d3d11 *old)
+{
+	if (old == nullptr) {
+		return;
+	}
+	(void)DP_REQUEST_DISPLAY_MODE(old, false);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	for (size_t i = 0; i < ARRAY_SIZE(mc->dp_graveyard); i++) {
+		if (mc->dp_graveyard[i].dp == nullptr) {
+			mc->dp_graveyard[i].dp = old;
+			mc->dp_graveyard[i].retire_ns = now_ns;
+			return;
+		}
+	}
+	// Full: destroy the OLDEST now. Last resort — it means rebinds are
+	// arriving faster than the grace period, which is itself a bug worth
+	// seeing in the log.
+	size_t oldest = 0;
+	for (size_t i = 1; i < ARRAY_SIZE(mc->dp_graveyard); i++) {
+		if (mc->dp_graveyard[i].retire_ns < mc->dp_graveyard[oldest].retire_ns) {
+			oldest = i;
+		}
+	}
+	U_LOG_W("[pipeline] DP graveyard full — destroying the oldest entry synchronously");
+	xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[oldest].dp);
+	mc->dp_graveyard[oldest].dp = old;
+	mc->dp_graveyard[oldest].retire_ns = now_ns;
+}
+
+/*!
+ * #964: destroy graveyard entries past their grace period. Render thread, top
+ * of the frame, under render_mutex. @p force drains everything (teardown).
+ */
+static void
+pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	const int64_t grace_ns = dxr_dp_graveyard_ns();
+	for (size_t i = 0; i < ARRAY_SIZE(mc->dp_graveyard); i++) {
+		if (mc->dp_graveyard[i].dp == nullptr) {
+			continue;
+		}
+		if (force || now_ns - mc->dp_graveyard[i].retire_ns >= grace_ns) {
+			xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[i].dp);
+			mc->dp_graveyard[i].dp = nullptr;
+			mc->dp_graveyard[i].retire_ns = 0;
+		}
+	}
+}
+
 static void
 pipeline_bind_panel_dp(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
@@ -7620,36 +7909,143 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// silently drop the panel out of 3D.
 	const bool want_3d = sys->hardware_display_3d;
 
-	if (mc->display_processor != nullptr) {
-		// Detach from the window's ESC/close hook before the object dies.
-		if (mc->window != nullptr) {
-			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
-		}
-		xrt_display_processor_d3d11_destroy(&mc->display_processor);
-		mc->panel_dp_hwnd = nullptr;
+	/*
+	 * CREATE FIRST, PUBLISH, THEN RETIRE. The old DP is never destroyed
+	 * synchronously: lock-free readers on IPC threads (weave_submit, the
+	 * eye-position path, the mode-writer gates) may be holding the pointer in
+	 * a local right now, and freeing it under them is a call through a dead
+	 * vtable — the observed `weave_submit -> process_atlas -> 0x0` crash.
+	 * See the dp_graveyard field comment.
+	 */
+	struct xrt_display_processor_d3d11 *fresh = nullptr;
+	auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
+	xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), hwnd, &fresh);
+	if (dp_ret != XRT_SUCCESS || fresh == nullptr) {
+		U_LOG_E("[pipeline] panel DP create on hwnd=%p failed (%d) — keeping the current one", (void *)hwnd,
+		        (int)dp_ret);
+		return; // the OLD DP stays published and usable; try again later
 	}
 
-	auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
-	xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), hwnd, &mc->display_processor);
-	if (dp_ret != XRT_SUCCESS || mc->display_processor == nullptr) {
-		mc->display_processor = nullptr;
-		U_LOG_E("[pipeline] panel DP create on hwnd=%p failed (%d) — flat blit until it returns",
-		        (void *)hwnd, (int)dp_ret);
-		return;
-	}
-	mc->panel_dp_hwnd = hwnd;
-	if (mc->window != nullptr && hwnd == mc->hwnd) {
-		comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
-	}
+	// Configure the new one BEFORE it becomes the panel's, so no reader ever
+	// sees a half-set-up DP.
 	if (client_presents) {
 		// #551 / ADR-029: the app presents through a transparent DComp swap
 		// chain, so DWM blends the LIVE desktop into the alpha holes — the DP
 		// must alpha-gate only, never bake a captured (stale) background.
-		(void)xrt_display_processor_d3d11_set_transparent_background(mc->display_processor, true, true);
+		(void)xrt_display_processor_d3d11_set_transparent_background(fresh, true, true);
 	}
-	(void)DP_REQUEST_DISPLAY_MODE(mc->display_processor, want_3d);
-	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p (client_presents=%d, hw3d=%d)", (void *)hwnd,
-	        (int)client_presents, (int)want_3d);
+	(void)DP_REQUEST_DISPLAY_MODE(fresh, want_3d);
+
+	// Detach the window's ESC/close hook from the outgoing DP first: that hook
+	// runs on the WINDOW thread, which takes no lock of ours.
+	struct xrt_display_processor_d3d11 *old = mc->display_processor;
+	if (mc->window != nullptr) {
+		comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+	}
+
+	// PUBLISH. Single pointer store; readers load it once into a local.
+	mc->display_processor = fresh;
+	mc->panel_dp_hwnd = hwnd;
+
+	if (mc->window != nullptr && hwnd == mc->hwnd) {
+		comp_d3d11_window_set_workspace_dp(mc->window, fresh);
+	}
+
+	// RETIRE. Destroyed by the render thread's sweep once the grace expires.
+	pipeline_dp_retire(mc, old);
+
+	sys->render_diag_pipe_rebind.fetch_add(1, std::memory_order_relaxed);
+	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p (client_presents=%d, hw3d=%d, old=%p retired)", (void *)hwnd,
+	        (int)client_presents, (int)want_3d, (void *)old);
+}
+
+//! Defined further down (browser#73 diagnostic); used by the pipeline's
+//! screenshot file-trigger to dump the ACTIVE presenter's back buffer.
+static void
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name);
+
+/*!
+ * #964: may the render thread touch this APP_HWND presenter's back buffer this
+ * frame?
+ *
+ * The render thread must NEVER block in Present. For a cross-process app window
+ * that means asking DXGI up front — a ZERO-timeout wait on the chain's
+ * frame-latency waitable, exactly what the service window does (#924). Not
+ * signaled ⇒ the presenter is skipped whole for this frame (no crop, no weave,
+ * no present); the next tick retries. A window that is hidden, minimized or
+ * parked in backoff is skipped the same way.
+ *
+ * @param is_active the FOCUSED presenter (runs at display rate) vs an unfocused
+ *        flat-2D one (a courtesy repaint, capped at ~30 Hz when unpaced).
+ */
+static bool
+pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool is_active, bool *out_backoff)
+{
+	if (out_backoff != nullptr) {
+		*out_backoff = false;
+	}
+	if (now_ns < c->present_backoff_until_ns) {
+		// Parked by the duration watchdog / occlusion — the pathological case,
+		// counted apart from an ordinary "no free buffer yet" probe miss.
+		if (out_backoff != nullptr) {
+			*out_backoff = true;
+		}
+		return false;
+	}
+	HWND h = c->render.hwnd;
+	if (h == nullptr || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) {
+		return false;
+	}
+	if (c->render.frame_latency_waitable != nullptr) {
+		return WaitForSingleObject(c->render.frame_latency_waitable, 0) == WAIT_OBJECT_0;
+	}
+	// Unpaced chain (the waitable flag was refused): the duration watchdog in
+	// pipeline_present_app_hwnd is the only guard, so don't hammer an
+	// unfocused window with it.
+	if (!is_active && c->last_flat_present_ns != 0 && now_ns - c->last_flat_present_ns < 33LL * 1000000LL) {
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * #964: present an APP_HWND presenter with a duration watchdog.
+ *
+ * A paced chain (waitable) already had its free-buffer guarantee, so a plain
+ * `Present(1, 0)` is correct and vsync-paces the active presenter. An unpaced
+ * one gets `Present(0, DO_NOT_WAIT)` — hand over and return. Either way, if the
+ * call actually took more than ~20 ms the window is pathological (occluded
+ * cross-process chain that DWM is not draining, or an app UI thread parked
+ * inside an IPC call to this very service): park that presenter for a second so
+ * one sick window cannot own the render thread.
+ */
+static HRESULT
+pipeline_present_app_hwnd(struct d3d11_service_compositor *c, bool paced)
+{
+	const int64_t t0_ns = (int64_t)os_monotonic_get_ns();
+	HRESULT phr =
+	    paced ? c->render.swap_chain->Present(1, 0) : c->render.swap_chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	c->last_flat_present_ns = now_ns;
+
+	bool park = (now_ns - t0_ns) > 20LL * 1000000LL;
+	if (phr == DXGI_STATUS_OCCLUDED) {
+		park = true;
+	} else if (FAILED(phr) && phr != DXGI_ERROR_WAS_STILL_DRAWING) {
+		park = true;
+	}
+	if (park) {
+		c->present_backoff_until_ns = now_ns + 1000LL * 1000000LL;
+		static std::atomic<int64_t> s_last_log_ns{0};
+		int64_t prev_ns = s_last_log_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "[pipeline] app-HWND present took %lld us (hr=0x%08lx, paced=%d) — "
+			    "parking that presenter for 1 s",
+			    (long long)((now_ns - t0_ns) / 1000), phr, (int)paced);
+		}
+	}
+	return phr;
 }
 
 /*!
@@ -7700,6 +8096,22 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	    c->render.atlas_texture == nullptr || !c->pipe_frame_ready) {
 		return;
 	}
+
+	/*
+	 * This present runs on the RENDER THREAD, under render_mutex, against a
+	 * CROSS-PROCESS window that is normally fully occluded by whatever the
+	 * active presenter is — so it goes through the same free-buffer probe the
+	 * active path uses. A stall here stalls the whole pipeline (measured:
+	 * capture_avg_us went 84 -> 191171 with one unfocused handle client, and
+	 * kept growing, because Present(1) throttles to DWM's drain rate for a
+	 * window DWM is not draining at all).
+	 */
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (!pipeline_app_hwnd_ready(c, now_ns, /*is_active*/ false, nullptr)) {
+		sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	uint32_t bb_w = 0, bb_h = 0;
 	pipeline_rtv_dims(c->render.back_buffer_rtv.get(), &bb_w, &bb_h);
 	if (bb_w == 0 || bb_h == 0) {
@@ -7722,16 +8134,9 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	// same format family, so a box copy is legal and needs no shader pass.
 	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
 	sys->context->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
-	// DO_NOT_WAIT: an unfocused window must never stall the render thread.
-	HRESULT phr = c->render.swap_chain->Present(1, DXGI_PRESENT_DO_NOT_WAIT);
-	if (FAILED(phr) && phr != DXGI_ERROR_WAS_STILL_DRAWING) {
-		static std::atomic<int64_t> s_last_log_ns{0};
-		int64_t now_ns = (int64_t)os_monotonic_get_ns();
-		int64_t prev_ns = s_last_log_ns.load(std::memory_order_relaxed);
-		if (now_ns - prev_ns > 1000000000LL && s_last_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
-			U_LOG_W("[pipeline] flat present failed: 0x%08lx", phr);
-		}
-	}
+	// Never vsync-pace an unfocused window: sync interval 0 either way.
+	(void)pipeline_present_app_hwnd(c, /*paced*/ false);
+	sys->render_diag_pipe_flat_present.fetch_add(1, std::memory_order_relaxed);
 }
 
 /*!
@@ -7742,11 +8147,25 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
 {
+	/* Stage timing. The whole pass runs on the render thread holding
+	 * render_mutex, so any stall here shows up as [RENDER] capture_avg_us AND
+	 * as IPC-handler starvation (wait_avg_us). Five cheap os_monotonic reads
+	 * per frame buy per-stage attribution when that happens; one throttled
+	 * WARN fires only on a frame over budget. */
+	const int64_t t_start_ns = (int64_t)os_monotonic_get_ns();
+	int64_t t_bind_ns = t_start_ns, t_crop_ns = t_start_ns, t_weave_ns = t_start_ns, t_present_ns = t_start_ns,
+	        t_flat_ns = t_start_ns;
+	uint32_t flat_count = 0;
+
 	/* (a) Focus. The compositor slot table is the ONE focus authority (D-5):
 	 * the "newest presenting client wins" default rule lives here now, and the
 	 * IPC layer mirrors it (sync_focus_from_compositor). */
 	int32_t focused = mc->focused_slot;
-	if (focused < 0 || focused >= D3D11_MULTI_MAX_CLIENTS || !pipeline_slot_presenting(&mc->clients[focused])) {
+	{
+		/* #962 rule, unconditional: the NEWEST presenting slot holds focus
+		 * (a new app coming up takes the panel, like a new window coming to
+		 * the front); when it leaves, the next-newest survivor takes over.
+		 * Nothing else writes focus under the default policy. */
 		int32_t best = -1;
 		uint64_t best_ns = 0;
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -7763,13 +8182,44 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 			mc->focused_slot = best;
 			multi_compositor_update_input_forward(mc);
 			service_signal_workspace_wakeup(sys);
+
+			/* #964 (D-4): re-arm the NEW holder's standing wish. With one DP
+			 * per panel nothing else does: the legacy path gave every client
+			 * its own DP and the vendor SDK OR'd the live hints, so a departing
+			 * client's 2D hint vanished with its DP. Here the panel keeps the
+			 * last holder's mode — observed as a handle app wanting 2D exiting
+			 * and the hosted app wanting 3D inheriting a flat panel.
+			 *
+			 * We re-arm `pending_*` rather than driving the DP here: the new
+			 * holder's next commit runs them through the ordinary
+			 * service_apply_pending_mode path, so the lease check (which it now
+			 * passes), the DP-first ordering of apply_mode_transition and the
+			 * denial events all stay in exactly one place. Also covers the
+			 * workspace deactivate -> default policy resume, which clears
+			 * focused_slot and therefore lands in this branch on the next tick.
+			 * A client with no wish leaves the panel untouched. */
+			if (best >= 0 && mc->clients[best].compositor != nullptr) {
+				struct d3d11_service_compositor *nc = mc->clients[best].compositor;
+				int32_t wish_mode = nc->wish_content_mode.load(std::memory_order_acquire);
+				int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
+				if (wish_mode >= 0 || wish_hw >= 0) {
+					if (wish_mode >= 0) {
+						nc->pending_content_mode.store((uint32_t)wish_mode,
+						                               std::memory_order_release);
+					}
+					if (wish_hw >= 0) {
+						nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
+					}
+					U_LOG_W("[pipeline] focus -> slot %d: re-arming wish content=%d hw=%d", best,
+					        (int)wish_mode, wish_hw);
+				}
+			}
 		}
 		focused = best;
 	}
 
 	/* (b) The active presenter. */
-	struct d3d11_service_compositor *fc =
-	    focused >= 0 ? mc->clients[focused].compositor : nullptr;
+	struct d3d11_service_compositor *fc = focused >= 0 ? mc->clients[focused].compositor : nullptr;
 	enum d3d11_presenter_kind kind = fc != nullptr ? fc->presenter : PRESENTER_NONE;
 	HWND present_hwnd = nullptr;
 	IDXGISwapChain1 *present_sc = nullptr;
@@ -7790,9 +8240,15 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		present_sc = mc->swap_chain.get();
 		present_rtv = mc->back_buffer_rtv.get();
 		break;
+	case PRESENTER_SELF:
+		// #625/#965 present-owner: it weaves synchronously on its own thread
+		// (weave_submit) and presents into its own window. The pipeline draws
+		// nothing for it — no RTV, no swap chain — it only owns the PANEL.
+		present_hwnd = fc->render.weave_hwnd;
+		break;
 	default: break;
 	}
-	if (present_rtv == nullptr || present_hwnd == nullptr) {
+	if (present_hwnd == nullptr || (kind != PRESENTER_SELF && present_rtv == nullptr)) {
 		kind = PRESENTER_NONE;
 	}
 
@@ -7812,6 +8268,67 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		return;
 	}
 
+	/* #964: free-buffer probe for an APP_HWND active presenter. Not signaled ⇒
+	 * skip it WHOLE this frame — no crop, no weave, no present into a back
+	 * buffer DXGI still owns. The render thread's own pacing is the service
+	 * window's waitable / the 14 ms tick, so skipping costs nothing but this
+	 * one window's frame; the next tick retries. Unfocused windows are handled
+	 * by the same probe inside pipeline_flat_present. */
+	/* #964: a focused PRESENT-OWNER owns the panel but not the frame. Bind the
+	 * panel DP to ITS window (D-4: interlace phase follows the presenter's
+	 * window, which is what xrWeaveSnapWindowRectDXR then snaps against) and
+	 * stop — its own weave_submit already wove and it presents itself. The
+	 * service window is already hidden (it is not the presenter), which matters
+	 * more here than anywhere else: a fullscreen service window would cover the
+	 * browser. Other app windows still get their courtesy repaint. */
+	if (kind == PRESENTER_SELF) {
+		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ false);
+		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
+				continue;
+			}
+			struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+			if (oc->presenter == PRESENTER_APP_HWND) {
+				pipeline_flat_present(sys, oc);
+			}
+		}
+		return;
+	}
+
+	bool active_backoff = false;
+	if (kind == PRESENTER_APP_HWND &&
+	    !pipeline_app_hwnd_ready(fc, (int64_t)os_monotonic_get_ns(), /*is_active*/ true, &active_backoff)) {
+		sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
+		if (active_backoff) {
+			sys->render_diag_pipe_active_backoff.fetch_add(1, std::memory_order_relaxed);
+		}
+		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+		static std::atomic<int64_t> s_last_skip_log_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = s_last_skip_log_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_skip_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			// Rate: see [RENDER] pipe_active_present vs pipe_active_skip — a
+			// low skip ratio is probe/vblank jitter, a dominant one is DWM
+			// genuinely not consuming this window's flips.
+			U_LOG_W(
+			    "[pipeline] active app-HWND presenter skipped — no free back buffer "
+			    "(backoff=%d; #924 model)",
+			    (int)active_backoff);
+		}
+		// Other app windows still get their courtesy repaint.
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
+				continue;
+			}
+			struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+			if (oc->presenter == PRESENTER_APP_HWND) {
+				pipeline_flat_present(sys, oc);
+			}
+		}
+		return;
+	}
+
 	/* (c) One DP per panel, bound to the active presenter's window. */
 	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE);
 	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
@@ -7824,11 +8341,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		return;
 	}
 
+	t_bind_ns = (int64_t)os_monotonic_get_ns();
+
 	uint32_t cols = fc->pipe_tile_columns > 0 ? fc->pipe_tile_columns : 1;
 	uint32_t rows = fc->pipe_tile_rows > 0 ? fc->pipe_tile_rows : 1;
-	ID3D11ShaderResourceView *dp_input_srv =
-	    service_crop_atlas_for_dp(sys, &fc->render, fc->pipe_content_w, fc->pipe_content_h, cols, rows,
-	                              fc->atlas_flip_y);
+	ID3D11ShaderResourceView *dp_input_srv = service_crop_atlas_for_dp(
+	    sys, &fc->render, fc->pipe_content_w, fc->pipe_content_h, cols, rows, fc->atlas_flip_y);
+	t_crop_ns = (int64_t)os_monotonic_get_ns();
 	// What the DP is about to consume — the atlas capture crops to this rather
 	// than guessing from the active rendering mode.
 	fc->render.last_dp_content_w = fc->pipe_content_w;
@@ -7842,13 +8361,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		// because the compose path may have left the shared DP on LINEAR.
 		xrt_display_processor_d3d11_set_atlas_encoding(dp, XRT_ATLAS_ENCODING_ENCODED);
 		g_weave_latency_workspace.mark_weave("pipeline");
-		xrt_display_processor_d3d11_set_frame_timing(
-		    dp, g_weave_latency_workspace.measured_r_ns,
-		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_input_srv,
-		                                          fc->pipe_content_w, fc->pipe_content_h, cols, rows,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0,
-		                                          0);
+		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
+		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_input_srv, fc->pipe_content_w,
+		                                          fc->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
+		                                          target_w, target_h, 0, 0, 0, 0);
 	} else if (fc->render.atlas_texture) {
 		// No DP (no vendor plug-in, or mid-rebind): raw copy so the presenter
 		// shows content rather than freezing.
@@ -7864,6 +8381,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 			}
 		}
 	}
+
+	t_weave_ns = (int64_t)os_monotonic_get_ns();
 
 	/* Atlas capture. The standalone poll lives past the commit's early return
 	 * and the compose poll past this branch, so the debug trigger would
@@ -7887,6 +8406,23 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 			ss_last_poll_ns = ss_now_ns;
 			if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
 				DeleteFileA(ss_trigger);
+				// (1) %TEMP%\workspace_screenshot.png — the ACTIVE PRESENTER'S
+				// BACK BUFFER, post-weave and pre-Present. This is the direct
+				// path's actual output (interlaced when the panel is 3D), which
+				// is the thing to eyeball; it is the same pixels the panel is
+				// about to scan out, for whichever surface won the presenter
+				// election. Blocking Map on the immediate context — debug only,
+				// and only on an explicit file trigger.
+				{
+					wil::com_ptr<ID3D11Resource> pres;
+					present_rtv->GetResource(pres.put());
+					wil::com_ptr<ID3D11Texture2D> ptex;
+					if (pres && SUCCEEDED(pres->QueryInterface(IID_PPV_ARGS(ptex.put())))) {
+						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot");
+					}
+				}
+				// (2) %TEMP%\workspace_screenshot_atlas*.png — the pre-weave
+				// atlas the DP consumed, for comparison.
 				{
 					std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
 					sys->active_compositor = fc; // capture the PRESENTED client
@@ -7923,20 +8459,28 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		}
 		if (may_present) {
 			phr = present_sc->Present(1, 0);
+			sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 			if (SUCCEEDED(phr)) {
-				g_weave_latency_workspace.after_present("pipeline", present_sc,
-				                                        &g_lw_gov_workspace);
+				g_weave_latency_workspace.after_present("pipeline", present_sc, &g_lw_gov_workspace);
 			}
+		} else {
+			sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
 		}
-	} else if (present_sc != nullptr) {
-		// APP_HWND: not a waitable chain, so bound the wait explicitly.
-		phr = present_sc->Present(1, DXGI_PRESENT_DO_NOT_WAIT);
-		if (phr == DXGI_ERROR_WAS_STILL_DRAWING) {
-			phr = S_OK; // frame skipped; the next tick flips it
+	} else if (kind == PRESENTER_APP_HWND && present_sc != nullptr) {
+		// The probe above guaranteed a free back buffer on a paced chain, so a
+		// plain Present(1, 0) is safe and vsync-paces the active window. An
+		// unpaced chain gets Present(0, DO_NOT_WAIT); both are watchdogged.
+		const bool paced = fc->render.frame_latency_waitable != nullptr;
+		phr = pipeline_present_app_hwnd(fc, paced);
+		sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
+		if (phr == DXGI_ERROR_WAS_STILL_DRAWING || phr == DXGI_STATUS_OCCLUDED) {
+			phr = S_OK; // frame skipped / window not on screen — not an error
 		} else if (SUCCEEDED(phr)) {
 			g_weave_latency_workspace.after_present("pipeline", present_sc, &g_lw_gov_workspace);
 		}
 	}
+	t_present_ns = (int64_t)os_monotonic_get_ns();
+	sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 	if (FAILED(phr)) {
 		static std::atomic<int64_t> s_last_log_ns{0};
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
@@ -7954,12 +8498,36 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		struct d3d11_service_compositor *oc = mc->clients[s].compositor;
 		if (oc->presenter == PRESENTER_APP_HWND) {
 			pipeline_flat_present(sys, oc);
+			flat_count++;
 		}
 	}
+	t_flat_ns = (int64_t)os_monotonic_get_ns();
 
 	// The runtime-owned window's modal drag loop waits on this.
 	if (mc->window != nullptr) {
 		comp_d3d11_window_signal_paint_done(mc->window);
+	}
+
+	/* Over-budget attribution. 25 ms is ~1.5 refreshes at 60 Hz — a frame past
+	 * that is a stall, not jitter, and it starves every IPC handler parked on
+	 * render_mutex. Throttled to 1 Hz so a sustained stall costs one line/s. */
+	{
+		const int64_t total_ns = t_flat_ns - t_start_ns;
+		if (total_ns > 25LL * 1000000LL) {
+			static std::atomic<int64_t> s_last_slow_log_ns{0};
+			int64_t prev_ns = s_last_slow_log_ns.load(std::memory_order_relaxed);
+			if (t_flat_ns - prev_ns > 1000000000LL &&
+			    s_last_slow_log_ns.compare_exchange_strong(prev_ns, t_flat_ns)) {
+				U_LOG_W(
+				    "[pipeline] slow frame: total=%lldus focus_bind=%lldus crop=%lldus "
+				    "weave=%lldus present=%lldus flat[%u]=%lldus presenter=%d",
+				    (long long)(total_ns / 1000), (long long)((t_bind_ns - t_start_ns) / 1000),
+				    (long long)((t_crop_ns - t_bind_ns) / 1000),
+				    (long long)((t_weave_ns - t_crop_ns) / 1000),
+				    (long long)((t_present_ns - t_weave_ns) / 1000), flat_count,
+				    (long long)((t_flat_ns - t_present_ns) / 1000), (int)kind);
+			}
+		}
 	}
 }
 
@@ -8033,6 +8601,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 		mc = sys->multi_comp;
 	}
+
+	// #964: reap panel DPs retired by a presenter rebind, once their grace
+	// period has expired. Render thread, under render_mutex — the only place
+	// a panel DP is ever actually destroyed outside teardown.
+	pipeline_dp_graveyard_sweep(mc, /*force*/ false);
 
 	if (mc->suspended) {
 		// Workspace deactivated — don't render, wait for re-activation.
@@ -11297,8 +11870,7 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	// path, the client's own on the legacy one. Callers on an IPC thread hold
 	// render_mutex around this whole call (the render thread drives the same DP).
 	struct xrt_display_processor_d3d11 *xdp = panel_dp(sys, c);
-	if (deny == XRT_DISPLAY_MODE_DENIAL_REASON_NONE &&
-	    (xdp == nullptr || head == nullptr || head->hmd == NULL)) {
+	if (deny == XRT_DISPLAY_MODE_DENIAL_REASON_NONE && (xdp == nullptr || head == nullptr || head->hmd == NULL)) {
 		deny = XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR;
 	}
 	if (deny != XRT_DISPLAY_MODE_DENIAL_REASON_NONE) {
@@ -11770,8 +12342,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// #961: relay-owned request — DP first, events after confirmation.
 					// #964 D-6: drives the PANEL DP under render_mutex.
 					render_mutex_fair_lock mode_lock(sys);
-					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c),
-					                                    modeIdx, want_3d, "bridge_relay");
+					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c), modeIdx,
+					                                    want_3d, "bridge_relay");
 					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)%s", prev_idx,
 					        modeIdx, (int)want_3d, landed ? "" : " — DP REJECTED");
 				}
@@ -11840,8 +12412,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// #961: runtime-initiated (V key) — DP first, events after.
 					// #964 D-6: panel DP, under render_mutex.
 					render_mutex_fair_lock v_lock(sys);
-					(void)apply_mode_transition(sys, head, panel_dp(sys, c), target_idx,
-					                            !force_2d, "qwerty_v");
+					(void)apply_mode_transition(sys, head, panel_dp(sys, c), target_idx, !force_2d,
+					                            "qwerty_v");
 				}
 			}
 		}
@@ -11961,13 +12533,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// the workspace controller asked for. #234.
 			if (sys->workspace_mode && vendor_is_3d != sys->hardware_display_3d &&
 			    !pending_flip && !in_cooldown) {
-				if (sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr) {
+				// #964: resolve the panel DP UNDER render_mutex and use that
+				// one local — the render thread can re-bind it at any moment.
+				render_mutex_fair_lock wf3d_lock(sys);
+				struct xrt_display_processor_d3d11 *wdp =
+				    sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
+				if (wdp != nullptr) {
 					U_LOG_W("[force_3d] vendor drifted (vendor=%s runtime=%s) — re-asserting DP to runtime state",
 					        vendor_is_3d ? "3D" : "2D",
 					        sys->hardware_display_3d ? "3D" : "2D");
-					DP_REQUEST_DISPLAY_MODE(
-					    sys->multi_comp->display_processor,
-					    sys->hardware_display_3d);
+					DP_REQUEST_DISPLAY_MODE(wdp, sys->hardware_display_3d);
 					// Refresh cooldown so we don't hammer the DP on every poll
 					// while the vendor settles back.
 					sys->cached_3d_state.store(sys->hardware_display_3d, std::memory_order_relaxed);
@@ -11991,9 +12566,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// again (tracking regained). Cooldown-refreshed so we don't hammer.
 			// #961: only the LEASE HOLDER's intent is re-asserted — an unfocused
 			// standalone client does not get to drive the panel back up.
-			if (!sys->workspace_mode && !bridge_live && got_state &&
-			    panel_dp(sys, c) != nullptr && sys->hardware_display_3d && !vendor_is_3d &&
-			    !pending_flip && !in_cooldown && client_holds_panel_lease(sys, c)) {
+			if (!sys->workspace_mode && !bridge_live && got_state && panel_dp(sys, c) != nullptr &&
+			    sys->hardware_display_3d && !vendor_is_3d && !pending_flip && !in_cooldown &&
+			    client_holds_panel_lease(sys, c)) {
 				U_LOG_W("[force_3d] standalone vendor drifted to 2D (app wants 3D) — re-asserting 3D");
 				// If the content rendering mode also drifted to 2D (e.g. a prior
 				// demote before this re-assert was reached), restore the app's
@@ -12161,14 +12736,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// multi-view atlas recipe is the mode's). If the DP later
 				// rejects the publish at runtime, the publish helper issues
 				// this request as the fallback.
+				// #964: a zones client's tier-1 request is its standing wish.
+				c->wish_hw_3d.store(1, std::memory_order_release);
+				c->wish_content_mode.store((int32_t)mode_idx, std::memory_order_release);
 				// #964 D-6: the panel DP, under render_mutex.
 				render_mutex_fair_lock z_lock(sys);
 				struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
-				bool mask_capable =
-				    service_dp_accepts_zone_mask(zdp) && !c->zone_mask_dp_rejected;
+				bool mask_capable = service_dp_accepts_zone_mask(zdp) && !c->zone_mask_dp_rejected;
 				// #961: DP first (unless the wish drives it), events after.
-				(void)apply_mode_transition(sys, zhead, mask_capable ? nullptr : zdp,
-				                            mode_idx, true, "zones_tier1");
+				(void)apply_mode_transition(sys, zhead, mask_capable ? nullptr : zdp, mode_idx, true,
+				                            "zones_tier1");
 				static bool zones_3d_logged = false;
 				if (!zones_3d_logged) {
 					zones_3d_logged = true;
@@ -12229,9 +12806,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					// #961: DP first, events after confirmation.
 					// #964 D-6: the panel DP, under render_mutex.
+					// #964: the kick is this client's wish too — re-applied
+					// whenever it takes focus back.
+					c->wish_hw_3d.store(1, std::memory_order_release);
+					c->wish_content_mode.store((int32_t)mode_idx, std::memory_order_release);
 					render_mutex_fair_lock d3d_lock(sys);
-					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c),
-					                                    mode_idx, true, "deferred_3d");
+					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c), mode_idx, true,
+					                                    "deferred_3d");
 					U_LOG_W(
 					    "[deferred_3d] no-zones standalone client past warmup "
 					    "(%u commits), SR was 2D — forcing 3D (mode %u -> %u)%s",
@@ -13891,6 +14472,10 @@ compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 {
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->pending_hw_3d.store(enable_3d ? 1 : 0, std::memory_order_release);
+	// #964: latch the STANDING WISH here, before any lease check — a request
+	// this client is not currently allowed to apply is still what it wants, and
+	// the panel must adopt it the moment this client takes focus.
+	c->wish_hw_3d.store(enable_3d ? 1 : 0, std::memory_order_release);
 
 	// #815: also drain it here, not only on the client's next frame.
 	//
@@ -13936,6 +14521,13 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 	(void)tile_columns;
 	(void)tile_rows;
 	c->pending_content_mode.store(mode_index, std::memory_order_release);
+	// #964: standing wish, recorded before the lease check (see the hardware
+	// twin above). A rendering-mode request also ENDS any standing hardware
+	// override — that mode's own default hardware state applies from here —
+	// so the hardware wish is cleared, exactly as service_apply_pending_mode
+	// clears hw_override.
+	c->wish_content_mode.store((int32_t)mode_index, std::memory_order_release);
+	c->wish_hw_3d.store(-1, std::memory_order_release);
 
 	// #961: drain inline like the hardware request above, so the lease verdict
 	// (applied / denied-with-reason) reaches the client immediately rather than
@@ -14451,6 +15043,14 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	c->render.weave_hwnd = (HWND)(uintptr_t)hwnd;
+	// #964: binding a window IS the declaration "I am a present-owner". There
+	// is no earlier signal the compositor can see (the session info carries no
+	// present-owner bit), so this is the switch. From here the pipeline never
+	// draws or presents for this client — it only hands it the panel.
+	if (pipeline_always_on(c->sys) && c->render.weave_hwnd != nullptr) {
+		c->presenter = PRESENTER_SELF;
+		U_LOG_W("[pipeline] presenter=SELF (present-owner) hwnd=%p", (void *)c->render.weave_hwnd);
+	}
 	// NB: do NOT force 3D here — that would fire before the SR init settle window
 	// (#140 premature-flip → vendor poll demotes it). weave_force_3d_if_needed()
 	// in weave_submit does it deferred + self-healing once frames are flowing.
@@ -14601,8 +15201,29 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// snaps real content via xrWeaveSnapWindowRectDXR.) The render thread and this
 	// path both run process_atlas under sys->render_mutex, so sharing the DP is
 	// serialized — no concurrent immediate-context / DP use.
-	struct xrt_display_processor_d3d11 *dp = c->render.display_processor;
-	bool dp_is_shared = false;
+	HANDLE in = (HANDLE)in_handle;
+	if (in == nullptr || in == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+
+	// Serialize with the render thread — sys->context is the (non-thread-safe)
+	// immediate context shared with multi_compositor_render.
+	//
+	// #964: the lock is taken BEFORE the DP is resolved, and the resolved
+	// pointer is used only inside it. Resolving first (as this did) raced the
+	// render thread's presenter rebind: it destroyed the DP in the window
+	// between the read and the lock, and the weave then called through a freed
+	// vtable — the `weave_submit -> process_atlas -> 0x0` crash. The graveyard
+	// makes that survivable; resolving under the lock makes it impossible.
+	render_mutex_fair_lock lock(sys);
+
+	// #964 (D-4): on the pipeline path there is exactly ONE display processor
+	// per panel and the present-owner drives it like everyone else — never a
+	// per-client DP (it has none). `panel_dp()` returns it; the fallback below
+	// stays for the legacy path, where a per-client DP may or may not exist.
+	// ONE load into a local, used for this whole bounded call sequence.
+	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
+	bool dp_is_shared = pipeline_always_on(sys) && dp != nullptr;
 	if (dp == nullptr && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 		dp_is_shared = (dp != nullptr);
@@ -14623,14 +15244,6 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			        "present-owner weave through the shared multi-compositor DP");
 		}
 	}
-	HANDLE in = (HANDLE)in_handle;
-	if (in == nullptr || in == INVALID_HANDLE_VALUE) {
-		return false;
-	}
-
-	// Serialize with the render thread — sys->context is the (non-thread-safe)
-	// immediate context shared with multi_compositor_render.
-	render_mutex_fair_lock lock(sys);
 
 	// #776 blocker 1: apply any pending xrRequestDisplayRenderingModeDXR. A
 	// present-owner never runs the per-client commit, which used to be the only
@@ -15179,6 +15792,26 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
 	}
 
+	/* #964: a present-owner never commits a projection layer, so nothing else
+	 * would ever mark its slot as PRESENTING — it would sit outside the default
+	 * focus rule forever, never hold the lease, and weave_force_3d_if_needed
+	 * (lease-gated) would never fire: inline-3D stuck flat, a regression against
+	 * the legacy path where the browser WAS the newest presenting IPC client and
+	 * drove its own DP. A landed weave is this client's "first frame". Caller
+	 * holds render_mutex, which is what guards the slot table. */
+	if (pipeline_always_on(sys) && sys->multi_comp != nullptr) {
+		c->pipe_frame_ready = true;
+		int wslot = multi_comp_find_slot(sys->multi_comp, c);
+		if (wslot >= 0 && !sys->multi_comp->clients[wslot].has_first_frame_committed) {
+			sys->multi_comp->clients[wslot].has_first_frame_committed = true;
+			sys->multi_comp->clients[wslot].first_frame_ns = (uint64_t)os_monotonic_get_ns();
+			U_LOG_W("[pipeline] present-owner slot %d is presenting (first weave landed)", wslot);
+		}
+		if (wslot >= 0) {
+			sys->multi_comp->clients[wslot].last_commit_ns = (int64_t)os_monotonic_get_ns();
+		}
+	}
+
 	// Throttled phase timing (#625 batch-degradation diagnosis): where a slow
 	// submit spends its time — the keyed-mutex acquire (waiting on the caller's
 	// GPU queue) vs the copy+weave loop vs the fence/flush/eye epilogue.
@@ -15260,18 +15893,25 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	if (c->render.display_processor == nullptr) {
-		return false;
-	}
 
 	// The snap drives the vendor SR weaver's phase math, which reads the same
 	// (non-thread-safe) immediate context as the render thread — serialize with
-	// it just like weave_submit does.
+	// it just like weave_submit does. #964: take the lock BEFORE resolving the
+	// DP, since on the pipeline path that is the shared panel DP the render
+	// thread can re-bind.
 	render_mutex_fair_lock lock(c->sys);
 
+	// #964 (D-4): the panel DP — the present-owner has none of its own on the
+	// pipeline path, and the phase it snaps to is the panel's, not a per-client
+	// weaver's. While this client is focused the panel DP is bound to its own
+	// weave_hwnd, so the snap is against the right window.
+	struct xrt_display_processor_d3d11 *sdp = panel_dp(c->sys, c);
+	if (sdp == nullptr) {
+		return false;
+	}
+
 	int32_t sx = target_x, sy = target_y;
-	if (!xrt_display_processor_d3d11_snap_window_rect(c->render.display_processor, origin_x, origin_y, target_x,
-	                                                  target_y, &sx, &sy)) {
+	if (!xrt_display_processor_d3d11_snap_window_rect(sdp, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		return false; // DP has no snap support — caller uses the target unchanged
 	}
 	*out_x = sx;
@@ -15409,8 +16049,8 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 			U_LOG_W("Workspace mode activated for D3D11 service system");
 		}
 
-		xrt_result_t res_ret = init_client_render_resources(
-		    sys, external_hwnd, transparent_hwnd, sys->xsysd, &c->render, c);
+		xrt_result_t res_ret =
+		    init_client_render_resources(sys, external_hwnd, transparent_hwnd, sys->xsysd, &c->render, c);
 		if (res_ret != XRT_SUCCESS) {
 			U_LOG_E("Failed to initialize client render resources");
 			delete c;
@@ -18419,6 +19059,19 @@ comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
 	return mc->focused_slot;
 }
 
+extern "C" bool
+comp_d3d11_service_focus_is_authoritative(struct xrt_system_compositor *xsysc)
+{
+	// #964 (D-5): on the pipeline the compositor slot table is the SOLE focus
+	// authority — the default "newest presenting client" rule lives in
+	// pipeline_default_policy_render, so the IPC layer must mirror and never
+	// write. Under DXR_LEGACY_STANDALONE the inherited IPC rule still owns it.
+	if (xsysc == nullptr) {
+		return false;
+	}
+	return pipeline_always_on(d3d11_service_system_from_xrt(xsysc));
+}
+
 extern "C" struct xrt_compositor *
 comp_d3d11_service_get_focused_xc(struct xrt_system_compositor *xsysc)
 {
@@ -19374,8 +20027,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 				continue;
 			}
 			// An app that presents into its OWN window needs that window back.
-			if (slot->compositor != nullptr && slot->app_hwnd != nullptr &&
-			    IsWindow(slot->app_hwnd) &&
+			if (slot->compositor != nullptr && slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd) &&
 			    (slot->compositor->presenter == PRESENTER_APP_HWND ||
 			     slot->compositor->presenter == PRESENTER_CLIENT_TEXTURE)) {
 				ShowWindowAsync(slot->app_hwnd, SW_SHOWNOACTIVATE);
@@ -19399,8 +20051,9 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 			mc->mode_flip.curtain_active = false;
 		}
 
-		U_LOG_W("[pipeline] workspace deactivated — default presenter policy resumes; "
-		        "render thread, panel DP and every client untouched");
+		U_LOG_W(
+		    "[pipeline] workspace deactivated — default presenter policy resumes; "
+		    "render thread, panel DP and every client untouched");
 		return;
 	}
 
