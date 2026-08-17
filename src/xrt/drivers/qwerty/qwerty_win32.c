@@ -28,6 +28,10 @@
 #include <string.h>
 #include <stdbool.h>
 
+#include "util/u_debug.h"
+// [QTRACE] pose-path tracer, off unless DXR_QTRACE=1 (docs/reference/debug-logging.md)
+DEBUG_GET_ONCE_BOOL_OPTION(qw32_qtrace, "DXR_QTRACE", false)
+
 // Amount of look_speed units a mouse delta of 1px in screen space will rotate the device.
 // This value is multiplied by look_speed (0.02 for HMD) in qwerty_add_look_delta().
 #define SENSITIVITY 0.1f
@@ -195,6 +199,9 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	    (message == WM_KILLFOCUS) ||
 	    (message == WM_ACTIVATE && LOWORD((unsigned long)wParam) == WA_INACTIVE);
 	if (lose_focus) {
+		if (debug_get_bool_option_qw32_qtrace()) {
+			U_LOG_W("[QTRACE] W32 LOSE_FOCUS msg=0x%x wParam=0x%llx", message, wParam);
+		}
 		if (lmb_was_down) {
 			for (int i = 0; i < 2; i++) {
 				qwerty_release_trigger(i == 0 ? qleft : qright);
@@ -317,6 +324,10 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					qwerty_press_forward(targets[i]);
 				else
 					qwerty_release_forward(targets[i]);
+			}
+			if (debug_get_bool_option_qw32_qtrace()) {
+				U_LOG_W("[QTRACE] W32 KEY W %s target0=%p ntargets=%d hmd=%p", is_keydown ? "DOWN" : "UP",
+				        (void *)targets[0], target_count, (void *)qd_hmd);
 			}
 			break;
 		case 'A':
@@ -580,6 +591,11 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		mouse_look_active = true;
 		GetCursorPos(&last_mouse_pos);
 		SetCapture(GetActiveWindow()); // Capture mouse to receive events outside window
+		if (debug_get_bool_option_qw32_qtrace()) {
+			U_LOG_W("[QTRACE] W32 RBUTTONDOWN active=%p fg=%p focus=%p capture=%p target0=%p ntargets=%d hmd=%p",
+			        (void *)GetActiveWindow(), (void *)GetForegroundWindow(), (void *)GetFocus(),
+			        (void *)GetCapture(), (void *)targets[0], target_count, (void *)qd_hmd);
+		}
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -589,6 +605,9 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		// End mouse look mode
 		mouse_look_active = false;
 		ReleaseCapture();
+		if (debug_get_bool_option_qw32_qtrace()) {
+			U_LOG_W("[QTRACE] W32 RBUTTONUP");
+		}
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -670,6 +689,10 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				float pitch = (float)(-dy) * SENSITIVITY;
 				for (int i = 0; i < target_count; i++)
 					qwerty_add_look_delta(targets[i], yaw, pitch);
+				if (debug_get_bool_option_qw32_qtrace()) {
+					U_LOG_W("[QTRACE] W32 LOOK dx=%d dy=%d yaw=%.3f pitch=%.3f target0=%p", dx, dy,
+					        (double)yaw, (double)pitch, (void *)targets[0]);
+				}
 			} else if (ctrl_pressed || alt_pressed) {
 				// Controller focused (no RMB): XY translation
 				float pos_dx = (float)(dx) * POSITION_SENSITIVITY;
