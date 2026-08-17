@@ -8966,6 +8966,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		mc = sys->multi_comp;
 	}
 
+	// #966: the window thread asked for a flat panel on WM_CLOSE (it may not
+	// touch the DP itself). Apply it here, on the panel owner, through the
+	// same queued transition every other writer uses. UINT32_MAX keeps the
+	// content mode — only the lens is being turned off.
+	if (mc->window != nullptr && comp_d3d11_window_take_close_request(mc->window)) {
+		U_LOG_W("[TRANSITION] window close requested a flat panel — queueing hardware 2D (#966)");
+		(void)service_request_mode_transition(sys, nullptr, UINT32_MAX, /*want_3d*/ false,
+		                                      /*skip_dp*/ false, "window_close");
+	}
+
 	// #964: reap panel DPs retired by a presenter rebind, once their grace
 	// period has expired. Render thread, under render_mutex — the only place
 	// a panel DP is ever actually destroyed outside teardown.
