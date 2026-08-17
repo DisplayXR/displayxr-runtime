@@ -62,16 +62,6 @@ struct comp_d3d11_swapchain
 
 	//! Next ring index that acquire() will hand out.
 	uint32_t next_acquire;
-
-	//! D3D11.4 fence for efficient GPU→CPU release notification.
-	//! Signaled at xrReleaseSwapchainImage; waited in layer_commit.
-	ID3D11Fence *release_fence;
-
-	//! Auto-reset Win32 event; fired when GPU reaches release_fence.
-	HANDLE release_event;
-
-	//! Monotonic counter; incremented on each release.
-	uint64_t release_fence_value;
 };
 
 // Access compositor internals
@@ -201,31 +191,14 @@ d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direct
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 
-	// When transitioning from app to compositor, flush pending GPU commands then
-	// signal a fence so layer_commit can wait efficiently via WaitForSingleObject.
+	// App -> compositor handoff. The compositor renders on this same immediate
+	// context, and D3D11 executes one immediate context strictly in submission
+	// order, so every compositor read of this image is already ordered after the
+	// app's writes to it - no CPU-side fence wait is needed (or wanted: it would
+	// only stall the app's render thread and destroy CPU/GPU overlap). Flush so
+	// the app's work reaches the GPU now rather than at our Present.
 	if (direction == XRT_BARRIER_TO_COMP && sc->c != nullptr) {
-		auto internals = get_internals(sc->c);
-
-		// Flush all pending immediate-context commands to the GPU.
-		internals->context->Flush();
-
-		// Signal fence after the flush.  When the GPU reaches this signal,
-		// release_event fires and layer_commit's WaitForSingleObject returns,
-		// guaranteeing all commands submitted up to this release are complete.
-		if (sc->release_fence != nullptr && sc->release_event != nullptr) {
-			ID3D11DeviceContext4 *ctx4 = nullptr;
-			if (SUCCEEDED(internals->context->QueryInterface(
-			        __uuidof(ID3D11DeviceContext4), (void **)&ctx4))) {
-				uint64_t val = ++sc->release_fence_value;
-				ctx4->Signal(sc->release_fence, val);
-				sc->release_fence->SetEventOnCompletion(val, sc->release_event);
-				ctx4->Release();
-				// Signal() queues a GPU command; flush it so the GPU actually executes it
-				// and fires the event. Without this second Flush the event never fires
-				// and WaitForSingleObject always times out (100 ms penalty per frame).
-				internals->context->Flush();
-			}
-		}
+		get_internals(sc->c)->context->Flush();
 	}
 
 	return XRT_SUCCESS;
@@ -267,13 +240,6 @@ d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		}
 	}
 
-	if (sc->release_event != nullptr) {
-		CloseHandle(sc->release_event);
-	}
-	if (sc->release_fence != nullptr) {
-		sc->release_fence->Release();
-	}
-
 	delete sc;
 }
 
@@ -307,30 +273,6 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	sc->image_count = image_count;
 	sc->num_acquired = 0;
 	sc->next_acquire = 0; // First acquire returns index 0
-	sc->release_fence = nullptr;
-	sc->release_event = nullptr;
-	sc->release_fence_value = 0;
-
-	// Create ID3D11Fence for efficient GPU→CPU sync (D3D11.4 / Windows 10+).
-	// Falls back to D3D11_QUERY_EVENT spin-wait on older hardware.
-	{
-		ID3D11Device5 *dev5 = nullptr;
-		if (SUCCEEDED(internals->device->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5))) {
-			HRESULT fence_hr = dev5->CreateFence(
-			    0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), (void **)&sc->release_fence);
-			if (SUCCEEDED(fence_hr)) {
-				sc->release_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-				if (sc->release_event == nullptr) {
-					sc->release_fence->Release();
-					sc->release_fence = nullptr;
-				}
-			}
-			dev5->Release();
-		}
-		if (sc->release_fence == nullptr) {
-			U_LOG_I("D3D11: ID3D11Fence unavailable — will use D3D11_QUERY_EVENT fallback");
-		}
-	}
 
 	// Convert format
 	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
@@ -579,59 +521,4 @@ comp_d3d11_swapchain_get_array_size(struct xrt_swapchain *xsc)
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 	return sc->info.array_size > 0 ? sc->info.array_size : 1;
-}
-
-/*!
- * Wait for GPU completion of all commands submitted up to the most recent
- * xrReleaseSwapchainImage for this swapchain.
- *
- * Fast path (D3D11.4): OS-level WaitForSingleObject on an ID3D11Fence event —
- * zero CPU spin, no per-frame allocations.
- *
- * Fallback (pre-D3D11.4): Flush + spin-wait on D3D11_QUERY_EVENT.
- *
- * @param xsc       The swapchain.
- * @param timeout_ms Timeout in milliseconds (100 ms is recommended).
- */
-extern "C" void
-comp_d3d11_swapchain_wait_gpu_complete(struct xrt_swapchain *xsc, uint32_t timeout_ms)
-{
-	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
-
-	// Fast path: ID3D11Fence (D3D11.4 / Windows 10+).
-	// The fence was signaled in barrier_image(TO_COMP) after Flush(), so waiting
-	// here guarantees all GPU commands up to xrReleaseSwapchainImage are done.
-	//
-	// We check GetCompletedValue() first because the auto-reset event can fire
-	// and reset between barrier_image and here (GPU is fast, ~1ms; CPU overhead
-	// to reach layer_commit may be <1ms). If the event already auto-reset,
-	// WaitForSingleObject would block for the full timeout_ms (100ms → ~10fps).
-	// GetCompletedValue() avoids that race for the common case where the GPU
-	// has already finished by the time layer_commit runs.
-	if (sc->release_fence != nullptr && sc->release_event != nullptr &&
-	    sc->release_fence_value > 0) {
-		if (sc->release_fence->GetCompletedValue() < sc->release_fence_value) {
-			// GPU hasn't finished yet — event is still pending, safe to wait.
-			WaitForSingleObject(sc->release_event, timeout_ms);
-		}
-		// Either GetCompletedValue confirmed done, or WaitForSingleObject returned.
-		return;
-	}
-
-	// Fallback: Flush + spin-wait on D3D11_QUERY_EVENT.
-	if (sc->c != nullptr) {
-		auto internals = get_internals(sc->c);
-		internals->context->Flush();
-		ID3D11Query *eq = nullptr;
-		D3D11_QUERY_DESC qd = {};
-		qd.Query = D3D11_QUERY_EVENT;
-		if (SUCCEEDED(internals->device->CreateQuery(&qd, &eq))) {
-			internals->context->End(eq);
-			BOOL done = FALSE;
-			while (internals->context->GetData(eq, &done, sizeof(done), 0) == S_FALSE) {
-				// Spin-wait for GPU to drain
-			}
-			eq->Release();
-		}
-	}
 }

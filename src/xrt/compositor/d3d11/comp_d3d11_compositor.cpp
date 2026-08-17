@@ -13,6 +13,7 @@
 #include "util/comp_display_refresh_win.h"
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_window.h"
+#include "comp_d3d11_state_guard.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -785,6 +786,9 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					if (c->mt_lock != nullptr) {
 						c->mt_lock->Enter();
 					}
+					// Deliberately NOT wrapped in app_state_guard: the guard would
+					// AddRef whatever RTV is bound, and if that is our own back
+					// buffer, ResizeBuffers fails (it needs zero outstanding refs).
 					xrt_result_t xret = comp_d3d11_target_resize(c->target, new_width, new_height);
 					if (c->mt_lock != nullptr) {
 						c->mt_lock->Leave();
@@ -2107,10 +2111,18 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			c->mt_lock->Enter();
 		}
 
-		comp_d3d11_target_acquire(c->target, &rp_index);
-		d3d11_dp_weave(c, true);
-		d3d11_render_hud_overlay(c, true, &c->repaint.eye_pos);
-		comp_d3d11_target_present(c->target, 1);
+		{
+			// The replay lands BETWEEN the app's own draw calls on this context.
+			// Enter()/Leave() keeps our sequence atomic against the app; this
+			// guard keeps the app's cached state truthful once we Leave().
+			// Scoped so the restore runs before Leave().
+			xrt::compositor::d3d11::app_state_guard app_state(c->context);
+
+			comp_d3d11_target_acquire(c->target, &rp_index);
+			d3d11_dp_weave(c, true);
+			d3d11_render_hud_overlay(c, true, &c->repaint.eye_pos);
+			comp_d3d11_target_present(c->target, 1);
+		}
 
 		if (c->mt_lock != nullptr) {
 			c->mt_lock->Leave();
@@ -2142,6 +2154,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Everything below renders on the APP's immediate context. Hand its pipeline
+	// state back on every exit path, or a state-caching engine (Unity's D3D11
+	// backend) draws its next frame against what WE left bound: see-through
+	// geometry, degenerate triangles, shredded text. See comp_d3d11_state_guard.h.
+	xrt::compositor::d3d11::app_state_guard app_state(c->context);
 
 	// #868: the app's submission window closes here. Cleared at the TOP so no
 	// early return can leak it; the lock is held throughout layer_commit, so no
@@ -2420,55 +2438,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 
-	// Wait for GPU completion of all projection swapchain textures before reading.
-	//
-	// barrier_image(TO_COMP) at xrReleaseSwapchainImage inserts a Flush() then
-	// signals an ID3D11Fence.  Waiting here blocks until the GPU has processed
-	// all commands up to that release point — no spinning, no per-frame allocs.
-	// Falls back to Flush+D3D11_QUERY_EVENT spin-wait on pre-D3D11.4 hardware.
-	//
-	// Deduplicates swapchains so two eyes on one swapchain only wait once.
-	{
-		struct xrt_swapchain *waited[XRT_MAX_LAYERS * XRT_MAX_VIEWS] = {};
-		uint32_t wait_count = 0;
-
-		for (uint32_t li = 0; li < c->layer_accum.layer_count; li++) {
-			struct comp_layer *layer = &c->layer_accum.layers[li];
-
-			// Determine which swapchains to wait on based on layer type
-			uint32_t sc_count = 0;
-			if (layer->data.type == XRT_LAYER_PROJECTION ||
-			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH ||
-			    layer->data.type == XRT_LAYER_ZONE_3D) {
-				sc_count = layer->data.view_count < XRT_MAX_VIEWS
-				               ? layer->data.view_count
-				               : XRT_MAX_VIEWS;
-			} else if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
-				sc_count = 1; // Window-space layers have one swapchain in sc_array[0]
-			} else {
-				continue;
-			}
-
-			for (uint32_t v = 0; v < sc_count; v++) {
-				struct xrt_swapchain *xsc = layer->sc_array[v];
-				if (xsc == nullptr) {
-					continue;
-				}
-				// Skip if already waited on this swapchain this frame.
-				bool seen = false;
-				for (uint32_t w = 0; w < wait_count; w++) {
-					if (waited[w] == xsc) {
-						seen = true;
-						break;
-					}
-				}
-				if (!seen && wait_count < ARRAY_SIZE(waited)) {
-					waited[wait_count++] = xsc;
-					comp_d3d11_swapchain_wait_gpu_complete(xsc, 100);
-				}
-			}
-		}
-	}
+	// No CPU-side wait for the app's GPU work here, by design: the app renders
+	// on this same immediate context, and D3D11 executes it in submission order,
+	// so every read of an app swapchain image below is already ordered after
+	// the app's writes. A wait would only stall the app's render thread and
+	// serialise CPU against GPU. (A previous fence+event wait here was, in
+	// practice, a no-op that consumed a stale auto-reset signal; making it
+	// "work" cost ~1 ms/frame on the app thread and fixed nothing.)
 
 	// Verify app renders at the expected resolution (not stretched)
 	{

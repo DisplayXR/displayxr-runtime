@@ -12,6 +12,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		comp_d3d11_compositor.h
 		comp_d3d11_renderer.cpp
 		comp_d3d11_renderer.h
+		comp_d3d11_state_guard.h
 		comp_d3d11_swapchain.cpp
 		comp_d3d11_swapchain.h
 		comp_d3d11_target.cpp
