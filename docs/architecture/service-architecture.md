@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-08-16
+updated: 2026-08-17
 anchors: main @ c961d4d85 (comp_d3d11_service.cpp = 18,145 L; ipc_server_handler.c = 6,755 L)
 code-paths: [src/xrt/targets/service/, src/xrt/ipc/, src/xrt/compositor/d3d11_service/, src/xrt/compositor/multi/, src/xrt/targets/common/]
 ---
@@ -72,9 +72,29 @@ Companion references: [workspace-stability.md](../reference/workspace-stability.
 >   disconnect (§4.2 "50 ms unlocked shm push" — now locked). New follow-up **#994**: a hosted client in
 >   a slot / any non-slot client under a workspace gets no valid view poses (`POSE_INVALID` per frame).
 >
-> Still open / next: the one-pipeline work (#964 — the "N standalone clients ⇒ N DPs / lens hints"
-> defect §9-11 is now the visible remainder of #939), #994, and the noted per-slice follow-ups. The DP stays in-process (fault-contained); #943's exit source waits for the
-> armed tripwire.
+> **Phase-3 update (2026-08-17).** The one-pipeline work landed on `main` — read §4.3 ("the two
+> compositor modes") as history; the current model is [service-one-pipeline.md](service-one-pipeline.md):
+> - **#964** (PR #1003) the D3D11 multi-compositor is **always on** — one panel DP, render-thread
+>   presents for every client, presenter kinds `SERVICE_WINDOW` / `APP_HWND` / `CLIENT_TEXTURE` / `SELF`,
+>   a **default presenter policy** without a controller (focused = newest presenting slot, full-screen),
+>   activate/deactivate are policy switches (nothing rebuilt; #963's seam machinery is legacy-only),
+>   focus authority = the compositor slot table always, panel-DP re-bind = create → publish → retire
+>   (graveyard). §9-11 (N DPs / N lens hints) is closed by construction. Legacy per-client path:
+>   `DXR_LEGACY_STANDALONE=1` for one release (m2p A/B before deletion; DP re-bind slot = #1008).
+> - **#1002** (PR #1009) `DXGI_ERROR_DEVICE_REMOVED` is detected at every create/present site, the DP is
+>   no longer driven, `[HEALTH] device=REMOVED`, orderly exit for relaunch after
+>   `DXR_DEVICE_REMOVED_EXIT_MS` (§4.4 "not handled anywhere" is history; DP-recreate-in-place stays #971).
+> - **#966 + #965** (PR #1010) every mode/geometry transition is applied on the render thread through the
+>   S3 ring (`WS_CMD_MODE_TRANSITION`, `apply_mode_transition` has two callers: the drain and the
+>   legacy/teardown inline fallback); `WM_CLOSE` posts a request instead of calling the DP; the
+>   present-owner (`XR_DXR_weave`) submit contract is stated at `weave_submit` (serialized, bounded, no
+>   mode/geometry mutation, panel DP only) — §9-7 / §9-9 closed. Lock order as of #964–#966 is in §3.2.
+> - **#967** is scoped (design note [comp-multi-one-pipeline.md](comp-multi-one-pipeline.md); sub-issues
+>   #1004 (merged, PR #1011) → #1007 → #1005 → #1006).
+>
+> Still open / next: #994's remaining half (non-slot clients under a controller), the m2p A/B and
+> legacy-path deletion, #1008, #1007/#1005/#1006, Phase 4 (#968–#971) and Phase 5. The DP stays
+> in-process (fault-contained); #943's exit source waits for the armed tripwire.
 
 **One-paragraph summary.** The service is a single-process, no-isolation host. `WinMain`
 starts a tray/message-pump thread, an orchestrator that spawns two children (workspace
