@@ -10142,11 +10142,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Empty state: DisplayXR logo + a neutral hint when no clients are visible.
-	// The runtime no longer owns the launcher (migrated to the workspace
-	// controller in #308), so the hint doesn't reference any controller-specific
-	// hotkey.
-	if (mc->client_count == 0 && mc->font_atlas_srv) {
+	// Empty state: DisplayXR logo + a neutral hint when the WORKSPACE shows
+	// nothing. Since the always-on pipeline (#964) every IPC client occupies a
+	// slot, and since workspace scoping only shell-launched clients are ever
+	// PLACED - so the empty test is "no placed slot", not "no slot": outside
+	// apps parked in the taskbar must not suppress the logo (David: grey
+	// screen, no logo, 2026-08-17). The runtime no longer owns the launcher
+	// (#308), so the hint doesn't reference any controller-specific hotkey.
+	bool any_placed = false;
+	for (int es = 0; es < D3D11_MULTI_MAX_CLIENTS; es++) {
+		if (mc->clients[es].active && mc->clients[es].placed) {
+			any_placed = true;
+			break;
+		}
+	}
+	if (!any_placed && mc->font_atlas_srv) {
 		// Lazy-load the embedded logo PNG on first entry.
 		if (!mc->logo_load_tried) {
 			mc->logo_load_tried = true;
