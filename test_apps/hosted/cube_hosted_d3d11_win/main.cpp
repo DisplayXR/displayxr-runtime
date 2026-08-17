@@ -288,8 +288,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                 }
 
-                // Submit frame (projection layer only)
-                EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
+                if (frameState.shouldRender) {
+                    // Submit frame (projection layer only)
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
+                } else {
+                    // Not visible: xrEndFrame is still required to keep the frame
+                    // loop paced, but with NO layers — the projection views above
+                    // were never located and would be rejected (POSE_INVALID).
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = 0;
+                    endInfo.layers = nullptr;
+                    xrEndFrame(xr.session, &endInfo);
+                }
             }
         } else {
             Sleep(100);

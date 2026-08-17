@@ -2495,6 +2495,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 			} else {
 				oxr_slog_cancel(&slog);
 			}
+			// Never hand back XR_SUCCESS with views[] unwritten (a latent
+			// route to app-side zero quats). Report "no valid pose" per the
+			// spec: identity poses, viewStateFlags = 0.
+			if (ret == XR_SUCCESS) {
+				viewState->viewStateFlags = 0;
+				for (uint32_t i = 0; i < viewCapacityInput && i < view_count; i++) {
+					views[i].pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+				}
+			}
 			return ret;
 		}
 	}

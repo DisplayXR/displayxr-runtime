@@ -760,6 +760,19 @@ controller_connected_locked(struct ipc_server *s)
 	return false;
 }
 
+// Monkey-test F1 (case B): the CONTROLLER POLICY — "focus is the compositor's
+// focused slot" — applies only once the workspace is ACTIVE. Between the
+// controller's connect and its workspace_activate (~1 s) the compositor has no
+// slot table to consult (comp_d3d11_service_get_focused_xc returns NULL while
+// !workspace_mode), and mirroring that NULL as "focus = nobody" flushed EVERY
+// app to visible=0 for that window. Until activation the default policy stays
+// in force. Caller holds global_state.lock.
+static bool
+controller_policy_locked(struct ipc_server *s)
+{
+	return s->workspace_mode && controller_connected_locked(s);
+}
+
 // The compositor's focused client, as an xrt_compositor pointer for identity
 // matching against ics->xc (never dereferenced). NULL = none / no authority.
 // Takes the compositor's own lock — call OUTSIDE global_state.lock.
@@ -789,9 +802,9 @@ sync_focus_from_compositor(struct ipc_server *s)
 	struct xrt_compositor *xc = compositor_focused_xc(s);
 
 	os_mutex_lock(&s->global_state.lock);
-	if (!controller_connected_locked(s)) {
+	if (!controller_policy_locked(s)) {
 		os_mutex_unlock(&s->global_state.lock);
-		return; // default policy owns focus
+		return; // default policy owns focus (no controller, or workspace not active yet)
 	}
 	int idx = -1;
 	if (xc != NULL) {
@@ -830,7 +843,14 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	// controller-focused one is FOCUSED. (Before #962 every client was forced
 	// FOCUSED here, so no client ever left FOCUSED and every client's actions /
 	// hand tracking stayed live — two focus authorities, none enforced.)
-	if (ics->server->xsysc != NULL && ics->server->xsysc->info.workspace_mode) {
+	//
+	// Monkey-test F1 (case A): VISIBLE is NOT exclusive outside a workspace
+	// either. DisplayXR's standalone path is multi-client by design (each app
+	// owns its own window and per-client DP), so a second app connecting must
+	// not drop the first below VISIBLE — Monado's inherited "only the active
+	// client is visible" left the older app at SYNCHRONIZED with
+	// shouldRender=false, unpaced. Only FOCUS is exclusive.
+	if (ics->xc != NULL) {
 		visible = true;
 	}
 	// #962: the controller and relays are never gated by app focus — the
@@ -905,7 +925,7 @@ update_server_state_locked(struct ipc_server *s)
 	//, or finally to the idle 'wallpaper' images.
 
 
-	if (controller_connected_locked(s)) {
+	if (controller_policy_locked(s)) {
 		// #962 controller policy: focus is the compositor's focused slot, mirrored
 		// into active_client_index by sync_focus_from_compositor() on the
 		// mainloop. Never fall back to "some other session" here — the controller
@@ -1127,7 +1147,7 @@ ipc_server_activate_session(volatile struct ipc_client_state *ics)
 		                             s->global_state.last_active_client_index);
 		handle_overlay_client_events(ics, s->global_state.active_client_index,
 		                             s->global_state.last_active_client_index);
-	} else if (!controller_connected_locked(s)) {
+	} else if (!controller_policy_locked(s)) {
 		// #962 default policy: the newest presenting client takes focus.
 		set_active_client_locked(s, ics->client_state.id);
 
