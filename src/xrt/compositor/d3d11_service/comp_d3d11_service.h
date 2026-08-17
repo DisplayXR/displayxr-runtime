@@ -165,13 +165,19 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
  * - Session target (app window): App controls head position, no offset applied
  * - Own window (Monado window): Apply standing height offset for VR apps
  *
+ * #964: answered PER CLIENT on the always-on pipeline — "the runtime owns this
+ * client's window" is "its presenter is the service window". Pass the calling
+ * client's compositor; NULL falls back to the most recently active one (the
+ * pre-#964 behaviour).
+ *
  * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param xc    The calling client's compositor, or NULL.
  * @return true if compositor owns the window, false if using app's window.
  *
  * @ingroup comp_d3d11_service
  */
 bool
-comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc);
+comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc);
 
 /*!
  * Get window metrics from the active D3D11 service compositor.

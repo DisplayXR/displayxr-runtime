@@ -802,9 +802,17 @@ sync_focus_from_compositor(struct ipc_server *s)
 	struct xrt_compositor *xc = compositor_focused_xc(s);
 
 	os_mutex_lock(&s->global_state.lock);
-	if (!controller_policy_locked(s)) {
+	// #964 (D-5): the compositor's slot table is the focus authority whenever
+	// it HAS one — the "newest presenting client" default rule now lives there
+	// (comp_d3d11_service's pipeline_default_policy_render), so mirror it even
+	// without a controller. A NULL answer without a controller means "no
+	// verdict" (no slot table, or nothing presenting yet), and the IPC-side
+	// default rule below stays in force as the fallback — including on
+	// platforms whose compositor has no slot table at all. With a controller
+	// attached, NULL is a real verdict ("focus is nobody") and is mirrored.
+	if (!controller_policy_locked(s) && xc == NULL) {
 		os_mutex_unlock(&s->global_state.lock);
-		return; // default policy owns focus (no controller, or workspace not active yet)
+		return;
 	}
 	int idx = -1;
 	if (xc != NULL) {

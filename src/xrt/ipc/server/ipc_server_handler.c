@@ -779,7 +779,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
-	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
+	// #964: per-client — "does the RUNTIME own this client's window", i.e. is
+	// its presenter the service window (hosted). Was previously answered from
+	// whichever client committed last.
+	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc, xc);
 
 	// Workspace-mode distinction: the workspace compositor renders the workspace UI
 	// via DP eye tracker (Kooima) with no qwerty offset — otherwise WASD
