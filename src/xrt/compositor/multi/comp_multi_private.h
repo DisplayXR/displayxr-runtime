@@ -6,15 +6,12 @@
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup comp_multi
  *
- * @note DisplayXR-specific: this is the Monado-legacy multi-client orchestrator.
- * DisplayXR's workspace mode uses a separate per-client compositor
- * (`d3d11_service_compositor`) and its own multi-client orchestration
- * (`d3d11_multi_compositor`) inside `compositor/d3d11_service/comp_d3d11_service.cpp`.
- * Structs in this header are instantiated only via
- * `compositor/null/null_compositor.c` (headless testing). The OpenXR state tracker
- * (`oxr_session.c`) includes this header for type knowledge but does not
- * exercise these code paths in workspace mode. Modifying these structs does
- * NOT affect workspace-mode performance or behavior.
+ * @note These structs back the PRODUCTION system compositor on macOS, Linux and
+ * Android: `compositor/null/null_compositor.c` is its sole entry point, and
+ * `targets/common/target_instance.c` selects it whenever `XRT_D3D11_SERVICE_ONLY`
+ * is unset. Windows ships `compositor/d3d11_service/` instead, so comp_multi is
+ * a non-shipping fallback there. Design: `docs/architecture/comp-multi-one-pipeline.md`
+ * (#967); platform shape: `docs/architecture/service-architecture.md` §7.
  */
 
 #pragma once
@@ -61,7 +58,11 @@ extern "C" {
 /*!
  * Number of max active clients.
  *
- * @todo Move to `xrt_limits.h`, or make dynamic to remove limit.
+ * Hard cap on @ref multi_system_compositor::clients. Exhaustion is NOT silent:
+ * @ref multi_compositor_create fails with `XRT_ERROR_CLIENT_LIMIT_REACHED`
+ * rather than handing back a compositor that never renders (#1004).
+ *
+ * @todo Move to `xrt_limits.h`, or make dynamic to remove the limit.
  * @ingroup comp_multi
  */
 #define MULTI_MAX_CLIENTS 64
