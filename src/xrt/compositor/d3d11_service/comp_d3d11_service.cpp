@@ -8794,6 +8794,21 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	if (dp != nullptr && dp_input_srv != nullptr) {
 		ID3D11RenderTargetView *rtvs[] = {present_rtv};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		// Reset viewport AND scissor to the full target. The compose path does
+		// this every frame in its blit helpers; the direct path skipped it, so
+		// a canvas-sub-rect scissor latched on the shared immediate context by
+		// a present-owner's alpha-gate pass (the browser: its window rect)
+		// survived and CLIPPED the fullscreen weave to the browser's old
+		// window — content cropped to a top-left sub-rect, black elsewhere
+		// (eyeball regression, 2026-08-17). The DP sets its own viewport but
+		// never the scissor.
+		D3D11_VIEWPORT full_vp = {};
+		full_vp.Width = (float)target_w;
+		full_vp.Height = (float)target_h;
+		full_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &full_vp);
+		D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
+		sys->context->RSSetScissorRects(1, &full_scissor);
 		// ADR-021 Model A: one client, nothing to blend — the atlas carries
 		// the app's own ENCODED bytes straight through. Stated explicitly
 		// because the compose path may have left the shared DP on LINEAR.
