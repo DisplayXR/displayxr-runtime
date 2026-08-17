@@ -4737,22 +4737,50 @@ ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, s
 	// system enumerate — both walk the IPC thread table — but the auth
 	// model differs: only the registered workspace controller may see
 	// the full client list.
+	// #960/#963 follow-up (monkey-test F3): only WINDOW-BEARING classes are
+	// workspace clients — APP and PRESENT_OWNER. CONTROLLER (the caller's own
+	// session), RELAY (the WebXR bridge's headless session) and DIAG (the
+	// bridge's introspection connection, displayxr-cli) have no window; the old
+	// code skipped only slot-less *compositor* clients and let the xc==NULL
+	// ones fall through as canonical ids, so the shell listed — and could
+	// focus — the bridge as two windows.
+	//
+	// #957 shape: snapshot (id, xc) under global_state.lock, resolve slots
+	// OUT of it (find_slot_by_xc takes render_mutex; pointer identity only).
+	struct
+	{
+		uint32_t id;
+		struct xrt_compositor *xc;
+	} cand[IPC_MAX_CLIENTS];
+	uint32_t n_cand = 0;
 	os_mutex_lock(&s->global_state.lock);
-	uint32_t count = 0;
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 		volatile struct ipc_client_state *ics = &s->threads[i].ics;
 		if (ics->server_thread_index < 0) {
 			continue;
 		}
+		uint32_t cls = ics->client_state.client_class;
+		if (cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_PRESENT_OWNER) {
+			continue;
+		}
+		cand[n_cand].id = ics->client_state.id;
+		cand[n_cand].xc = (struct xrt_compositor *)ics->xc;
+		n_cand++;
+	}
+	os_mutex_unlock(&s->global_state.lock);
+
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < n_cand; i++) {
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		// #304 id-unification: return the unified 1000+slot workspace id so
 		// it matches what the events report and what set_*/chrome accept.
-		// Clients not yet bound to a compositor slot (and the controller's
-		// own session, which has no slot) are skipped — they reappear once
-		// slotted, and they can't be posed/chromed/focused before that.
-		if (s->xsysc != NULL && ics->xc != NULL) {
-			int slot = comp_d3d11_service_workspace_find_slot_by_xc(
-			    s->xsysc, (struct xrt_compositor *)ics->xc);
+		// Clients not yet bound to a compositor slot are skipped — they
+		// reappear once slotted; they can't be posed/chromed/focused before.
+		if (s->xsysc != NULL) {
+			if (cand[i].xc == NULL) {
+				continue;
+			}
+			int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, cand[i].xc);
 			if (slot < 0) {
 				continue;
 			}
@@ -4760,10 +4788,9 @@ ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, s
 			continue;
 		}
 #endif
-		list->ids[count++] = ics->client_state.id;
+		list->ids[count++] = cand[i].id;
 	}
 	list->id_count = count;
-	os_mutex_unlock(&s->global_state.lock);
 
 	return XRT_SUCCESS;
 }

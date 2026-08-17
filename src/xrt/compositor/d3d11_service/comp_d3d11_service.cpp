@@ -14439,6 +14439,13 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 
 	c->sys = sys;
 	c->log_level = sys->log_level;
+	// Monkey-test F5: seed the per-client name from the session's application
+	// name so a STANDALONE client (never slotted, so never given a slot title)
+	// still identifies itself in [lease]/[app_mode]/[TRANSITION] lines. The
+	// slot-registration path overwrites it with the window title as before.
+	if (xsi != nullptr && xsi->application_name[0] != '\0') {
+		snprintf(c->slot_app_name, sizeof(c->slot_app_name), "%s", xsi->application_name);
+	}
 	{
 		std::lock_guard<std::mutex> reg(sys->clients_mutex); // #963
 		sys->all_clients.push_back(c);
@@ -18122,15 +18129,16 @@ enrol_standalone_clients_locked(struct d3d11_service_system *sys)
 		// fresh runtime window on the way back (#963 case B).
 		HWND app_hwnd = (!c->render.owns_window && c->render.hwnd != nullptr) ? c->render.hwnd : nullptr;
 		c->app_hwnd = app_hwnd;
-		if (c->slot_app_name[0] == '\0') {
-			// Same title rules as session-create: window title, else "App";
-			// bitmap font is ASCII-only; strip a " - " subtitle.
+		{
+			// Same title rules as session-create: window title, else the
+			// application name seeded at create, else "App"; bitmap font is
+			// ASCII-only; strip a " - " subtitle.
 			char title[128] = {0};
 			if (app_hwnd != nullptr) {
 				GetWindowTextA(app_hwnd, title, sizeof(title));
 			}
 			if (title[0] == '\0') {
-				snprintf(title, sizeof(title), "App");
+				snprintf(title, sizeof(title), "%s", c->slot_app_name[0] ? c->slot_app_name : "App");
 			}
 			for (char *p = title; *p; p++) {
 				if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
