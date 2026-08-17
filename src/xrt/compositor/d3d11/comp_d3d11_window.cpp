@@ -129,6 +129,19 @@ struct comp_d3d11_window
 	//! True while inside a modal move/size loop (window thread writes, compositor reads)
 	volatile LONG in_size_move;
 
+	//! Drag phase-snap provider (#625): installed by the compositor once a
+	//! display processor exists; called from WM_WINDOWPOSCHANGING on the
+	//! window thread. Guarded by snap_lock — wnd_proc reads under shared,
+	//! the setter writes under exclusive, so detaching waits out any call
+	//! in flight. SRWLOCK zero-init (U_TYPED_CALLOC) == SRWLOCK_INIT.
+	SRWLOCK snap_lock;
+	comp_d3d11_window_snap_fn snap_fn;
+	void *snap_userdata;
+
+	//! Window outer rect captured at WM_ENTERSIZEMOVE — the drag origin the
+	//! phase snap is computed relative to (window thread only).
+	RECT drag_origin_rect;
+
 	//! True if window should stay hidden (for SR weaver HWND in shared-texture mode)
 	bool hidden;
 
@@ -610,11 +623,63 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_ENTERSIZEMOVE:
 		InterlockedExchange(&w->in_size_move, TRUE);
+		// Drag origin for the phase snap: where the window was when the user
+		// grabbed it. The snap keeps the interlace phase of THIS position.
+		GetWindowRect(hWnd, &w->drag_origin_rect);
 		// Publish to HWND so cross-process consumers (WebXR bridge mouse
 		// hook) can suppress mouse forwarding during the modal drag loop.
 		SetPropW(hWnd, L"DXR_InSizeMove", (HANDLE)(uintptr_t)1);
 		InvalidateRect(hWnd, NULL, FALSE); // Kick off first WM_PAINT
 		return 0;
+
+	case WM_WINDOWPOSCHANGING:
+		// #625 (v2): phase-snap the runtime-owned window while the USER drags
+		// it, so the interlace pattern does not walk across the lens. This is
+		// the vendor-neutral replacement for the SR SDK's own WndProc subclass
+		// (which the v2 API deliberately does not install): the window owner —
+		// us — asks the display processor where the window may land, via
+		// snap_window_rect. A DP with no interlace lattice never snaps and the
+		// window moves freely; same when no provider is installed at all.
+		if (InterlockedCompareExchange(&w->in_size_move, 0, 0)) {
+			WINDOWPOS *pos = reinterpret_cast<WINDOWPOS *>(lParam);
+			if ((pos->flags & SWP_NOMOVE) == 0) {
+				// Prevent content copy/scale artifacts while moving
+				// (mirrors the vendor SDK's own drag handling).
+				pos->flags |= SWP_NOCOPYBITS;
+
+				AcquireSRWLockShared(&w->snap_lock);
+				comp_d3d11_window_snap_fn snap = w->snap_fn;
+				void *snap_ud = w->snap_userdata;
+				if (snap != NULL) {
+					int32_t sx = pos->x;
+					int32_t sy = pos->y;
+					if (snap(snap_ud, w->drag_origin_rect.left, w->drag_origin_rect.top,
+					         pos->x, pos->y, &sx, &sy) &&
+					    (sx != pos->x || sy != pos->y)) {
+						const int32_t dx = sx - pos->x;
+						const int32_t dy = sy - pos->y;
+						// Resize (top/left edge drags move x/y too): keep the
+						// bottom-right edge anchored by compensating the size
+						// for the snap delta.
+						if ((pos->flags & SWP_NOSIZE) == 0) {
+							pos->cx -= dx;
+							pos->cy -= dy;
+						}
+						pos->x = sx;
+						pos->y = sy;
+						static bool snap_logged = false;
+						if (!snap_logged) {
+							snap_logged = true;
+							U_LOG_W("D3D11 window: drag phase-snap LIVE "
+							        "(first correction (%d,%d))",
+							        (int)dx, (int)dy);
+						}
+					}
+				}
+				ReleaseSRWLockShared(&w->snap_lock);
+			}
+		}
+		break;
 
 	case WM_EXITSIZEMOVE:
 		InterlockedExchange(&w->in_size_move, FALSE);
@@ -1807,6 +1872,22 @@ comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window)
 		return;
 	}
 	SetEvent(window->paint_done_event);
+}
+
+extern "C" void
+comp_d3d11_window_set_snap_provider(struct comp_d3d11_window *window,
+                                    comp_d3d11_window_snap_fn fn,
+                                    void *userdata)
+{
+	if (window == NULL) {
+		return;
+	}
+	// Exclusive vs the wnd_proc's shared hold: returning from this with
+	// fn == NULL guarantees no snap call is in flight and none will start.
+	AcquireSRWLockExclusive(&window->snap_lock);
+	window->snap_fn = fn;
+	window->snap_userdata = userdata;
+	ReleaseSRWLockExclusive(&window->snap_lock);
 }
 
 extern "C" void

@@ -457,6 +457,32 @@ d3d11_comp(struct xrt_compositor *xc)
 	return reinterpret_cast<struct comp_d3d11_compositor *>(xc);
 }
 
+/*!
+ * #625: drag phase-snap provider for the self-owned window, routed through the
+ * DP vtable (snap_window_rect, slot 18). Runs on the WINDOW thread inside
+ * WM_WINDOWPOSCHANGING; safe because the v2 snap is a pure coordinate function
+ * with no thread affinity, and the v1 fallback's own thread guard makes it
+ * return false here (see the prewarm at DP creation). c->display_processor is
+ * stable for the compositor's lifetime and the provider is detached (with the
+ * setter's exclusive lock) before the DP is destroyed.
+ */
+static bool
+d3d11_compositor_snap_window_rect_cb(void *userdata,
+                                     int32_t origin_x,
+                                     int32_t origin_y,
+                                     int32_t target_x,
+                                     int32_t target_y,
+                                     int32_t *out_x,
+                                     int32_t *out_y)
+{
+	auto *c = static_cast<struct comp_d3d11_compositor *>(userdata);
+	if (c == nullptr || c->display_processor == nullptr) {
+		return false;
+	}
+	return xrt_display_processor_d3d11_snap_window_rect(c->display_processor, origin_x, origin_y,
+	                                                    target_x, target_y, out_x, out_y);
+}
+
 // #439 Phase 1 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined
 // near the bottom of the file alongside the comp_d3d11_compositor_zone_mask_*
 // entry points, called from the layer-commit paths + destroy above them.
@@ -2757,6 +2783,13 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->dp_input_texture = nullptr;
 	}
 
+	// Detach the window's phase-snap provider BEFORE the DP dies: the
+	// setter's exclusive lock waits out any snap call in flight on the
+	// window thread, so the callback can never race the destroy below.
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
+	}
+
 	// Destroy display processor (handles all vendor cleanup internally)
 	xrt_display_processor_d3d11_destroy(&c->display_processor);
 
@@ -3132,6 +3165,34 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");
+	}
+
+	// #625 (v2): let the runtime-owned window phase-snap its own drags via
+	// the DP's snap_window_rect (vtable slot 18). Handle apps don't need
+	// this — the app owns the window and the vendor SDK handles its drags.
+	// A DP that leaves the slot NULL (no interlace lattice, FPGA weave,
+	// older plug-in) simply never snaps: the wrapper returns false and the
+	// window moves freely, exactly as before.
+	if (c->display_processor != nullptr && c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_snap_provider(c->own_window, d3d11_compositor_snap_window_rect_cb, c);
+
+		// Prewarm one snap from THIS thread, before any rendering runs.
+		// Load-bearing for the Leia v1 (pre-1.37) fallback: its snap drives
+		// a probe window that is thread-affine and shares our immediate
+		// context, so it must be created here — after this, window-thread
+		// snap calls hit the plugin's own thread guard and return false
+		// (v1 keeps the SDK's in-window subclass behaviour, no double
+		// snap). On v2 the snap is a pure function and this is just a
+		// probe of availability.
+		RECT wr = {};
+		if (c->hwnd != nullptr && GetWindowRect(c->hwnd, &wr)) {
+			int32_t sx = wr.left;
+			int32_t sy = wr.top;
+			bool ok = xrt_display_processor_d3d11_snap_window_rect(
+			    c->display_processor, wr.left, wr.top, wr.left, wr.top, &sx, &sy);
+			U_LOG_W("D3D11: window drag phase-snap provider armed (prewarm: %s)",
+			        ok ? "snap available" : "declined — window will move unsnapped");
+		}
 	}
 
 	// If display processor is available, query display pixel info to compute

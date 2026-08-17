@@ -235,6 +235,40 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
                                       struct xrt_system_devices *xsysd);
 
 /*!
+ * Phase-snap provider for user drags of the runtime-owned window (#625).
+ *
+ * All coordinates are absolute screen pixels (window outer rect top-left).
+ * Returns true when a snapped position was produced in out_x/out_y; false
+ * means "no snap available" and the caller keeps the proposed position
+ * unchanged. A display processor with no interlace lattice (or none at all)
+ * simply never produces a snap.
+ */
+typedef bool (*comp_d3d11_window_snap_fn)(void *userdata,
+                                          int32_t origin_x,
+                                          int32_t origin_y,
+                                          int32_t target_x,
+                                          int32_t target_y,
+                                          int32_t *out_x,
+                                          int32_t *out_y);
+
+/*!
+ * Install (or remove, fn == NULL) the drag phase-snap provider.
+ *
+ * The provider is called from the WINDOW THREAD inside WM_WINDOWPOSCHANGING
+ * during a modal move/size loop, so it must be quick and must not block on the
+ * compositor. The setter takes an exclusive lock that waits out any call in
+ * flight — detach the provider BEFORE destroying whatever it calls into.
+ *
+ * @param window   The window object
+ * @param fn       Snap callback, or NULL to detach
+ * @param userdata Opaque pointer handed back to fn
+ */
+void
+comp_d3d11_window_set_snap_provider(struct comp_d3d11_window *window,
+                                    comp_d3d11_window_snap_fn fn,
+                                    void *userdata);
+
+/*!
  * Set the target HWND and window rect for input forwarding (workspace mode).
  *
  * When hwnd is non-NULL, the window enters workspace input-forwarding mode:
