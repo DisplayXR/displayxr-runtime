@@ -2121,6 +2121,7 @@ struct d3d11_multi_compositor
 	{
 		struct xrt_display_processor_d3d11 *dp;
 		int64_t retire_ns;
+		HWND hwnd; //!< the window it was CREATED against (see pipeline_dp_graveyard_flush_hwnd)
 	} dp_graveyard[4];
 
 	//! #964 (D-4): the HWND `display_processor` was CREATED against. The D3D11
@@ -2882,6 +2883,8 @@ client_holds_panel_lease(struct d3d11_service_system *sys, struct d3d11_service_
 //! `dp_graveyard` field comment. Defined next to pipeline_bind_panel_dp.
 static void
 pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force);
+static bool
+pipeline_dp_graveyard_flush_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd);
 
 static inline struct xrt_display_processor_d3d11 *
 panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
@@ -7013,7 +7016,14 @@ try {
 			// the workspace pipeline can't hold refresh rate at depth 1
 			// (depth 1 removes all frame overlap — measured −63% fps on a
 			// saturated pipeline for ~4 ms of R), probe a return later.
-			const int tr = g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq());
+			// #964: only sample the governor while the SERVICE WINDOW is actually
+			// presenting. On the pipeline an idle loop (no client yet) or a hidden
+			// window paces on the 14/100 ms fallback, which the governor read as
+			// saturation and backed the depth off to 2 for the next 30 s -- the
+			// hosted m2p A/B measured R = 33 ms (2 periods) because of it.
+			const bool gov_sample =
+			    !pipeline_always_on(sys) || sys->workspace_mode || mc->service_window_shown;
+			const int tr = gov_sample ? g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq()) : 0;
 			if (tr != 0) {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
@@ -7500,7 +7510,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		// self-heals instead of flipping mode bookkeeping against a dead
 		// panel. Gated so a deliberate deactivate (suspended) or a
 		// dismissed window stays torn down.
-		if (mc->display_processor == nullptr && !mc->suspended && !mc->window_dismissed) {
+		if (mc->display_processor == nullptr && !mc->suspended && !mc->window_dismissed &&
+		    pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) { // one DP per HWND, ever
 			void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR,
 			                                          COMP_DP_API_D3D11);
 			if (dp_fac != NULL) {
@@ -7827,9 +7838,10 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Create display processor via factory
+	// Create display processor via factory (one DP per HWND, ever — a retired DP
+	// still bound to this window is destroyed first, or the create waits a frame)
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
-	if (dp_fac != NULL) {
+	if (dp_fac != NULL && pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
 		xrt_result_t dp_ret = factory(
 		    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
@@ -8102,7 +8114,7 @@ dxr_dp_graveyard_ns()
  * asking for 3D would fight the new one for its whole retirement.
  */
 static void
-pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_processor_d3d11 *old)
+pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_processor_d3d11 *old, HWND old_hwnd)
 {
 	if (old == nullptr) {
 		return;
@@ -8113,6 +8125,7 @@ pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_process
 		if (mc->dp_graveyard[i].dp == nullptr) {
 			mc->dp_graveyard[i].dp = old;
 			mc->dp_graveyard[i].retire_ns = now_ns;
+			mc->dp_graveyard[i].hwnd = old_hwnd;
 			return;
 		}
 	}
@@ -8129,6 +8142,48 @@ pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_process
 	xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[oldest].dp);
 	mc->dp_graveyard[oldest].dp = old;
 	mc->dp_graveyard[oldest].retire_ns = now_ns;
+	mc->dp_graveyard[oldest].hwnd = old_hwnd;
+}
+
+/*!
+ * ONE DP PER HWND, EVER. The SR SDK subclasses the weaver's window
+ * (SetWindowLongPtr GWLP_WNDPROC) and looks its context up by HWND; two live
+ * weavers on one window make the subclass chain self-referencing and the
+ * window thread recurses until the stack is gone (monkey round 3:
+ * FATAL_USER_CALLBACK_EXCEPTION, 2474 SimulatedRealityDirectX frames — a DP
+ * bound to the service window was still in the graveyard when a rebind
+ * created the next one on the same window 1.9 s later). So before a DP is
+ * created on @p hwnd every graveyard entry bound to that window is destroyed
+ * NOW — unless it was retired less than ~250 ms ago (a stale lock-free reader
+ * could still be inside a bounded call on it), in which case the caller
+ * defers the bind to a later frame. Returns true when the window is clear.
+ * Render thread, under render_mutex.
+ */
+static bool
+pipeline_dp_graveyard_flush_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
+{
+	if (mc == nullptr || hwnd == nullptr) {
+		return true;
+	}
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	const int64_t min_age_ns = 250LL * 1000000LL;
+	bool clear = true;
+	for (size_t i = 0; i < ARRAY_SIZE(mc->dp_graveyard); i++) {
+		if (mc->dp_graveyard[i].dp == nullptr || mc->dp_graveyard[i].hwnd != hwnd) {
+			continue;
+		}
+		if (now_ns - mc->dp_graveyard[i].retire_ns < min_age_ns) {
+			clear = false; // too fresh — the caller retries next frame
+			continue;
+		}
+		U_LOG_W("[pipeline] DP graveyard: destroying the retired DP bound to hwnd=%p before rebinding to it",
+		        (void *)hwnd);
+		xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[i].dp);
+		mc->dp_graveyard[i].dp = nullptr;
+		mc->dp_graveyard[i].retire_ns = 0;
+		mc->dp_graveyard[i].hwnd = nullptr;
+	}
+	return clear;
 }
 
 /*!
@@ -8151,6 +8206,7 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
 			xrt_display_processor_d3d11_destroy(&mc->dp_graveyard[i].dp);
 			mc->dp_graveyard[i].dp = nullptr;
 			mc->dp_graveyard[i].retire_ns = 0;
+			mc->dp_graveyard[i].hwnd = nullptr;
 		}
 	}
 }
@@ -8223,6 +8279,10 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	if (dp_fac == NULL) {
 		return; // no vendor plug-in — the flat-blit fallback owns the frame
 	}
+	// One DP per HWND, ever (SR subclass chain) — see pipeline_dp_graveyard_flush_hwnd.
+	if (!pipeline_dp_graveyard_flush_hwnd(mc, hwnd)) {
+		return; // a just-retired DP still owns that window; rebind next frame
+	}
 
 	// A failing factory must not be retried every frame (the vendor SDK can
 	// hold the panel for a moment across a rebind); back off to ~2 Hz.
@@ -8268,6 +8328,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// Detach the window's ESC/close hook from the outgoing DP first: that hook
 	// runs on the WINDOW thread, which takes no lock of ours.
 	struct xrt_display_processor_d3d11 *old = mc->display_processor;
+	HWND old_hwnd = mc->panel_dp_hwnd;
 	if (mc->window != nullptr) {
 		comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
 	}
@@ -8281,7 +8342,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	}
 
 	// RETIRE. Destroyed by the render thread's sweep once the grace expires.
-	pipeline_dp_retire(mc, old);
+	pipeline_dp_retire(mc, old, old_hwnd);
 
 	sys->render_diag_pipe_rebind.fetch_add(1, std::memory_order_relaxed);
 	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p (client_presents=%d, hw3d=%d, old=%p retired)", (void *)hwnd,
@@ -20407,7 +20468,8 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 
 		// Recreate display processor via factory (window + swap chain still alive)
 		void *dp_fac_resume = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
-		if (mc->display_processor == nullptr && dp_fac_resume != NULL && !service_device_removed(sys)) {
+		if (mc->display_processor == nullptr && dp_fac_resume != NULL && !service_device_removed(sys) &&
+		    pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) {
 			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_resume;
 			xrt_result_t dp_ret = factory(
 			    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
