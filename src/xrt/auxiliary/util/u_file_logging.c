@@ -72,16 +72,33 @@ file_logging_sink(const char *file,
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 
-	// Write timestamp, level, and function
-	fprintf(g_log_file, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] [%s] ",
-	        st.wYear, st.wMonth, st.wDay,
-	        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-	        level_to_string(level),
-	        func ? func : "?");
-
-	// Write the message
-	vfprintf(g_log_file, format, args);
-	fprintf(g_log_file, "\n");
+	// Format the WHOLE line into one buffer and emit it with ONE stdio call.
+	// The CRT locks the FILE per call, so the old prefix / body / newline
+	// triple interleaved across the service's threads under load (monkey-test
+	// F4: "[ts] [WARN] [fn] [ts] [WARN] [fn] msg", spliced bodies) — exactly
+	// the lines you need intact when debugging a multi-client wedge.
+	char buf[4096];
+	int n =
+	    snprintf(buf, sizeof(buf), "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] [%s] ", st.wYear, st.wMonth, st.wDay,
+	             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, level_to_string(level), func ? func : "?");
+	if (n < 0) {
+		return;
+	}
+	if ((size_t)n < sizeof(buf) - 2) {
+		int m = vsnprintf(buf + n, sizeof(buf) - 2 - (size_t)n, format, args);
+		if (m < 0) {
+			m = 0;
+		}
+		n += m;
+		if ((size_t)n > sizeof(buf) - 2) {
+			n = (int)sizeof(buf) - 2; // truncated (vsnprintf reports the would-be length)
+		}
+	} else {
+		n = (int)sizeof(buf) - 2;
+	}
+	buf[n++] = '\n';
+	buf[n] = '\0';
+	fwrite(buf, 1, (size_t)n, g_log_file);
 
 	// Flush to ensure logs are written immediately (important for crash debugging)
 	fflush(g_log_file);
@@ -251,10 +268,17 @@ u_file_logging_write_raw(const char *msg)
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 
-	fprintf(g_log_file, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [OXR  ] %s",
-	        st.wYear, st.wMonth, st.wDay,
-	        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-	        msg);
+	// One stdio call per line (see file_logging_sink).
+	char line[4096];
+	int n = snprintf(line, sizeof(line), "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [OXR  ] %s", st.wYear, st.wMonth,
+	                 st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
+	if (n < 0) {
+		return;
+	}
+	if ((size_t)n >= sizeof(line)) {
+		n = (int)sizeof(line) - 1;
+	}
+	fwrite(line, 1, (size_t)n, g_log_file);
 	fflush(g_log_file);
 }
 
