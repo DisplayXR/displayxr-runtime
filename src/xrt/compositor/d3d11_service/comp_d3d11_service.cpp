@@ -8855,6 +8855,50 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 }
 
 /*!
+ * #964 Phase A: PARK the window of a slot that just lost the panel.
+ *
+ * An APP_HWND client that is no longer the presenter kept its window on screen
+ * showing the flat 2D courtesy repaint — a half-lit, un-woven copy of its
+ * content sitting next to whatever now owns the panel. Minimizing it instead is
+ * both cleaner and reversible in the one gesture that already means "give this
+ * app the panel back": restoring it from the taskbar / Alt-Tab foregrounds it,
+ * and the foreground rule hands it the panel on the next tick.
+ *
+ * Only APP_HWND. NOT `SELF` — a present-owner (displayxr-browser) is a normal
+ * desktop app the user may well want to keep reading in 2D — and NOT
+ * `CLIENT_TEXTURE`, whose window the app presents itself.
+ *
+ * NOT when the client is on its way out (exited, ended its session, closed its
+ * window): `pipeline_slot_presenting` is already false for all three, and
+ * minimizing a window that is being destroyed is pointless noise.
+ *
+ * The flat repaint path stays as it is — it self-gates on `IsIconic`, so it
+ * simply becomes rare: a restored-but-not-yet-focused window still gets its
+ * courtesy repaint, which is correct.
+ *
+ * Render thread, under render_mutex. ShowWindowAsync, never ShowWindow: this is
+ * a cross-process window and a synchronous show dispatches into the app's UI
+ * thread, which may be blocked in an IPC call on us.
+ */
+static void
+pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !pipeline_slot_presenting(&mc->clients[slot])) {
+		return;
+	}
+	struct d3d11_service_compositor *c = mc->clients[slot].compositor;
+	if (c->presenter != PRESENTER_APP_HWND) {
+		return;
+	}
+	HWND h = c->render.hwnd;
+	if (h == nullptr || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) {
+		return;
+	}
+	ShowWindowAsync(h, SW_MINIMIZE);
+	U_LOG_W("[pipeline] parked slot %d's window %p (lost the panel; restore it to take it back)", slot, (void *)h);
+}
+
+/*!
  * #964 (D-3): THE default presenter policy. Runs on the render thread with
  * render_mutex held, in place of the compose path, whenever no workspace
  * controller is driving.
@@ -8892,12 +8936,17 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		focused = forced_focus;
 	} else {
 		const char *reason = "newest";
+		const int32_t was_focused = mc->focused_slot;
 		int32_t best = pipeline_pick_focus(sys, mc, &reason);
 		if (best != mc->focused_slot) {
 			U_LOG_W("[pipeline] default focus: slot %d -> %d (%s)", mc->focused_slot, best, reason);
 			mc->focused_slot = best;
 			multi_compositor_update_input_forward(mc);
 			service_signal_workspace_wakeup(sys);
+
+			// The outgoing APP_HWND presenter's window gets out of the way
+			// rather than sitting there showing the flat 2D repaint.
+			pipeline_park_app_hwnd(mc, was_focused);
 
 			/* Covers the workspace deactivate -> default policy resume too,
 			 * which clears focused_slot and so lands in this branch next tick. */
@@ -9573,9 +9622,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// wish is the one that should be on the panel.
 				mc->foreground_override_slot.store(override_slot, std::memory_order_release);
 				pipeline_rearm_focus_wish(mc, override_slot, "foreground override");
+				// Override moved straight from one client to another: the
+				// outgoing one lost the panel just the same, so park it.
+				pipeline_park_app_hwnd(mc, prev_override);
 			} else {
 				U_LOG_W("[pipeline] foreground override ended — workspace compose resumes");
 				mc->foreground_override_slot.store(-1, std::memory_order_release);
+				// Park the outgoing app's window: the workspace is about to
+				// own the panel again and that window would otherwise sit on
+				// top of it showing a stale frame.
+				pipeline_park_app_hwnd(mc, prev_override);
 				// The panel DP is still bound to the client's window; put it
 				// back on the service window and re-assert the controller's
 				// own mode before the compose path weaves again.
