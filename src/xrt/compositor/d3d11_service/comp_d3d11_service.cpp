@@ -799,6 +799,7 @@ enum ws_cmd_type
 	WS_CMD_MODE_FLIP,      //!< workspace_request_mode_flip
 	WS_CMD_INPUT_GRAB,     //!< set_input_grab (suppress-flag half; the
 	                       //!< foreground grab stays on the caller thread)
+	WS_CMD_MODE_TRANSITION, //!< #966: apply_mode_transition on the render thread
 };
 
 /*!
@@ -830,6 +831,22 @@ struct ws_command
 	float cap_hz;
 	//! MODE_FLIP payload.
 	uint32_t mode_index;
+
+	/*!
+	 * @name MODE_TRANSITION payload (#966)
+	 * Every mode/geometry transition is APPLIED by the render thread now.
+	 * `apply_mode_transition` writes `sys->tile_columns/rows`, `view_*`,
+	 * `display_*` and `hardware_display_3d` — all of which the render thread
+	 * reads under `render_mutex` every frame — and drives the panel DP. Doing
+	 * that from an IPC thread was a genuine data race (#966) and the leading
+	 * mechanical explanation for the #761 family.
+	 * @{
+	 */
+	uint32_t mode_target_idx; //!< content mode, or UINT32_MAX to keep the active one
+	bool mode_want_3d;        //!< hardware state to request
+	bool mode_skip_dp;        //!< don't touch the DP (vendor already moved / a zone wish drives it)
+	const char *mode_tag;     //!< string literal only — the log tag
+	                          /*! @} */
 };
 
 //! Ring capacity. Drain runs at render cadence (~70 Hz) and the only
@@ -1317,6 +1334,20 @@ service_ws_cmd_push(struct d3d11_service_system *sys, const struct ws_command *c
 		if (sys->ws_cmd_count >= WS_CMD_QUEUE_CAP) {
 			U_LOG_W("WS cmd queue: full of discrete commands — applying inline");
 			return false;
+		}
+	}
+
+	// #966: coalesce identical mode transitions. The self-healing writers
+	// (force-3D, deferred-3D, the vendor follow) can fire several times before
+	// the render thread drains, and re-asserting the same target is pure
+	// vendor-SDK churn — each one is a synchronous lens hint.
+	if (cmd->type == WS_CMD_MODE_TRANSITION) {
+		for (uint32_t i = 0; i < sys->ws_cmd_count; i++) {
+			const struct ws_command *q = &sys->ws_cmd_ring[(sys->ws_cmd_head + i) % WS_CMD_QUEUE_CAP];
+			if (q->type == WS_CMD_MODE_TRANSITION && q->mode_target_idx == cmd->mode_target_idx &&
+			    q->mode_want_3d == cmd->mode_want_3d && q->mode_skip_dp == cmd->mode_skip_dp) {
+				return true; // already queued — nothing to add
+			}
 		}
 	}
 
@@ -2866,6 +2897,63 @@ panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 		return sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
 	}
 	return c != nullptr ? c->render.display_processor : nullptr;
+}
+
+/*!
+ * #966: ask for a mode/geometry transition. THE entry point for every writer
+ * that is not already the render thread.
+ *
+ * `apply_mode_transition` writes `sys->tile_columns/rows`, `sys->view_*`,
+ * `sys->display_*` and `sys->hardware_display_3d`, and drives the panel DP.
+ * The render thread reads all of those under `render_mutex` on every frame, so
+ * applying them from an IPC thread was a real data race — and, with one DP per
+ * panel (#964), a second thread driving the vendor weaver. So IPC-thread
+ * callers now ENQUEUE on the S3 ring and the drain at the top of
+ * `multi_compositor_render` applies it, on the render thread, under the lock.
+ *
+ * Returns true when the transition was applied OR accepted for application.
+ * Callers that latch a one-shot on the result (deferred-3D, zones tier-1) want
+ * exactly that: the request is theirs, made once, whatever the DP later says.
+ * The DP's verdict is no longer available synchronously — the lease and veto
+ * denials that clients actually act on are decided before this call, on the
+ * caller's own thread, and still reported there.
+ *
+ * Applies INLINE (exactly as before) on the legacy standalone path and whenever
+ * no render thread is running — during teardown the drain would never come.
+ *
+ * @param skip_dp pass no DP: the hardware is already where we want it (vendor
+ *        follow) or a published zone wish owns the panel instead.
+ */
+static bool
+service_request_mode_transition(struct d3d11_service_system *sys,
+                                struct d3d11_service_compositor *c,
+                                uint32_t target_idx,
+                                bool want_3d,
+                                bool skip_dp,
+                                const char *tag)
+{
+	if (sys == nullptr) {
+		return false;
+	}
+	struct xrt_device *head = sys->xsysd != NULL ? sys->xsysd->static_roles.head : nullptr;
+
+	const bool render_thread_live =
+	    sys->multi_comp != nullptr && sys->multi_comp->capture_render_running.load(std::memory_order_acquire);
+	if (!pipeline_always_on(sys) || !render_thread_live) {
+		// Legacy path, or teardown with no drain to come: unchanged behaviour.
+		return apply_mode_transition(sys, head, skip_dp ? nullptr : panel_dp(sys, c), target_idx, want_3d,
+		                             tag);
+	}
+
+	struct ws_command cmd = {};
+	cmd.type = WS_CMD_MODE_TRANSITION;
+	cmd.xc = c; // pointer identity only; never dereferenced at drain
+	cmd.mode_target_idx = target_idx;
+	cmd.mode_want_3d = want_3d;
+	cmd.mode_skip_dp = skip_dp;
+	cmd.mode_tag = tag; // string literal — outlives the ring
+	service_ws_cmd_submit(sys, &cmd);
+	return true;
 }
 
 /*!
@@ -12206,15 +12294,20 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	// #776 blocker 4 lives inside apply_mode_transition: it drives the head
 	// device's OUTPUT_MODE (sim_display's only mode lever) alongside the DP's
 	// hardware request, DP first, events after confirmation (#761).
-	bool landed = apply_mode_transition(sys, head, xdp, target_idx, want_3d, "app_mode");
+	// #776 blocker 4 lives inside apply_mode_transition. #966: the APPLY runs
+	// on the render thread now (service_request_mode_transition) — the lease /
+	// veto verdict above is what the client acts on, and it was already decided
+	// here, synchronously, on the client's own thread.
+	(void)xdp;
+	bool landed = service_request_mode_transition(sys, c, target_idx, want_3d, /*skip_dp*/ false, "app_mode");
 	if (!landed) {
 		push_mode_request_denied(c, req_mode, req_hw,
 		                         XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED);
 		return false;
 	}
-	U_LOG_W("[app_mode] %s IPC client '%s' requested mode (content=%u hw_req=%d) -> active=%u 3D=%d",
+	U_LOG_W("[app_mode] %s IPC client '%s' requested mode (content=%u hw_req=%d) -> target=%d 3D=%d via=queue",
 	        as_service ? "service-driven" : "lease-holding", c->slot_app_name, req_mode, req_hw,
-	        head->hmd->active_rendering_mode_index, (int)want_3d);
+	        target_idx == UINT32_MAX ? -1 : (int)target_idx, (int)want_3d);
 	return true;
 }
 
@@ -12565,12 +12658,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Sync hardware_display_3d and tile layout from device's active rendering mode
-	sync_tile_layout(sys);
-	if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
-		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
-		if (idx < sys->xdev->rendering_mode_count) {
-			sys->hardware_display_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+	// Sync hardware_display_3d and tile layout from the device's active mode.
+	//
+	// #966: THE race this issue names. These are GLOBAL geometry/mode writes
+	// (`sys->tile_columns/rows`, `view_*`, `display_*`, `hardware_display_3d`)
+	// and they ran here on the client's IPC thread with no lock, while the
+	// render thread read all of them under render_mutex on every frame. On the
+	// pipeline path they are also redundant: `multi_compositor_render` runs the
+	// same `sync_tile_layout` at the top of its own frame, and every mode
+	// transition now lands through `apply_mode_transition` on that same thread.
+	// So: legacy only. (The reads below are unchanged; a stale read costs at
+	// most one frame of old geometry, which is exactly what the per-slot stride
+	// snapshot already bounds.)
+	if (!pipeline_always_on(sys)) {
+		sync_tile_layout(sys);
+		if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
+			uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+			if (idx < sys->xdev->rendering_mode_count) {
+				sys->hardware_display_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+			}
 		}
 	}
 
@@ -12636,11 +12742,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				} else {
 					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
-					// #961: relay-owned request — DP first, events after confirmation.
-					// #964 D-6: drives the PANEL DP under render_mutex.
-					render_mutex_fair_lock mode_lock(sys);
-					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c), modeIdx,
-					                                    want_3d, "bridge_relay");
+					// #961: relay-owned request — DP first, events after
+					// confirmation. #966: applied by the render thread.
+					bool landed = service_request_mode_transition(
+					    sys, c, modeIdx, want_3d, /*skip_dp*/ false, "bridge_relay");
 					U_LOG_W("App-initiated mode change: %u -> %u (3D=%d, immediate)%s", prev_idx,
 					        modeIdx, (int)want_3d, landed ? "" : " — DP REJECTED");
 				}
@@ -12659,17 +12764,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// relay above does, and what the Android multi_compositor path does via its own
 	// request_display_mode. Gated to standalone: workspace uses the controller's
 	// acked-flip; bridge uses the HWND relay above.
-	// #964 D-6: on the pipeline path this drives the SHARED panel DP, so it
-	// runs under render_mutex (legal nesting: c->mutex -> render_mutex).
-	{
-		// Cheap pre-check so the hot path never takes render_mutex just to
-		// discover there is nothing pending (#925 starvation rule).
-		if (c->pending_content_mode.load(std::memory_order_acquire) != 0xFFFFFFFFu ||
-		    c->pending_hw_3d.load(std::memory_order_acquire) >= 0) {
-			render_mutex_fair_lock mode_lock(sys);
-			(void)service_apply_pending_mode(sys, c, bridge_live);
-		}
-	}
+	// #966: no render_mutex here any more. The lease/veto decision is a cheap
+	// local check and the APPLY is queued for the render thread, so this hot
+	// path never contends with a render pass that can hold the lock for a whole
+	// display period (#925 starvation rule).
+	(void)service_apply_pending_mode(sys, c, bridge_live);
 
 	// Runtime-side 2D/3D toggle (V key) + 1/2/3 mode-select — polls qwerty
 	// driver each frame.
@@ -12692,8 +12791,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (head != nullptr && head->hmd != NULL) {
 				uint32_t target_idx;
 				if (force_2d) {
+					// #966: apply_mode_transition saves the outgoing 3D mode
+					// itself, on the render thread. Keep the legacy write for
+					// the direct-apply path only.
 					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
+					if (!pipeline_always_on(sys) && cur < head->rendering_mode_count &&
 					    head->rendering_modes[cur].hardware_display_3d) {
 						sys->last_3d_mode_index = cur;
 					}
@@ -12707,10 +12809,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
 				} else {
 					// #961: runtime-initiated (V key) — DP first, events after.
-					// #964 D-6: panel DP, under render_mutex.
-					render_mutex_fair_lock v_lock(sys);
-					(void)apply_mode_transition(sys, head, panel_dp(sys, c), target_idx, !force_2d,
-					                            "qwerty_v");
+					// #966: applied by the render thread.
+					(void)service_request_mode_transition(sys, c, target_idx, !force_2d,
+					                                      /*skip_dp*/ false, "qwerty_v");
 				}
 			}
 		}
@@ -12830,16 +12931,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// the workspace controller asked for. #234.
 			if (sys->workspace_mode && vendor_is_3d != sys->hardware_display_3d &&
 			    !pending_flip && !in_cooldown) {
-				// #964: resolve the panel DP UNDER render_mutex and use that
-				// one local — the render thread can re-bind it at any moment.
-				render_mutex_fair_lock wf3d_lock(sys);
-				struct xrt_display_processor_d3d11 *wdp =
-				    sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
-				if (wdp != nullptr) {
+				// #966: this used to be a bare DP call from an IPC thread.
+				// Queue the re-assert instead — same intent, applied by the
+				// panel owner. UINT32_MAX keeps the content mode; only the
+				// hardware state is being corrected.
+				if (sys->multi_comp != nullptr) {
 					U_LOG_W("[force_3d] vendor drifted (vendor=%s runtime=%s) — re-asserting DP to runtime state",
 					        vendor_is_3d ? "3D" : "2D",
 					        sys->hardware_display_3d ? "3D" : "2D");
-					DP_REQUEST_DISPLAY_MODE(wdp, sys->hardware_display_3d);
+					(void)service_request_mode_transition(sys, c, UINT32_MAX,
+					                                      sys->hardware_display_3d,
+					                                      /*skip_dp*/ false, "force_3d");
 					// Refresh cooldown so we don't hammer the DP on every poll
 					// while the vendor settles back.
 					sys->cached_3d_state.store(sys->hardware_display_3d, std::memory_order_relaxed);
@@ -12883,9 +12985,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						restore_idx = sys->last_3d_mode_index;
 					}
 				}
-				render_mutex_fair_lock f3d_lock(sys); // #964 D-6: shared panel DP
-				(void)apply_mode_transition(sys, rhead, panel_dp(sys, c), restore_idx, true,
-				                            "force_3d");
+				// #966: applied by the render thread.
+				(void)rhead;
+				(void)service_request_mode_transition(sys, c, restore_idx, true, /*skip_dp*/ false,
+				                                      "force_3d");
 				got_state = false; // skip the follow below
 			}
 			if (vendor_is_3d != sys->hardware_display_3d && !pending_flip && !in_cooldown && got_state) {
@@ -12901,8 +13004,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				if (head != nullptr && head->hmd != NULL) {
 					uint32_t target_idx;
 					if (!vendor_is_3d) {
+						// #966: as above — the render thread saves it.
 						uint32_t cur = head->hmd->active_rendering_mode_index;
-						if (cur < head->rendering_mode_count &&
+						if (!pipeline_always_on(sys) &&
+						    cur < head->rendering_mode_count &&
 						    head->rendering_modes[cur].hardware_display_3d) {
 							sys->last_3d_mode_index = cur;
 						}
@@ -12919,17 +13024,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						// hardware already settled and lift the curtain quickly.
 						multi_compositor_request_mode_flip(sys, target_idx, /*origin=*/-1);
 					} else {
-						// #961: the hardware is already there (vendor did it) — no
-						// DP call; record + broadcast content then the (real) hw state.
-						(void)apply_mode_transition(sys, head, nullptr, target_idx,
-							                    vendor_is_3d, "vendor_follow");
+						// #961: the hardware is already there (vendor did
+						// it) — no DP call; record + broadcast content then
+						// the (real) hw state. #966: applied by the render
+						// thread.
+						(void)service_request_mode_transition(
+						    sys, c, target_idx, vendor_is_3d, /*skip_dp*/ true,
+						    "vendor_follow");
 					}
 				}
 				} else {
 					// Bridge path: mirror the vendor's (real) hardware state so
-					// the app's hardwarestatechange event fires; don't touch mode.
-					sys->hardware_display_3d = vendor_is_3d;
-					broadcast_hardware_state(sys, vendor_is_3d);
+					// the app's hardwarestatechange event fires; don't touch
+					// mode. #966: queued — the write and its broadcast belong
+					// to the render thread. UINT32_MAX keeps the content mode
+					// and skip_dp says the hardware is already there.
+					(void)service_request_mode_transition(sys, c, UINT32_MAX, vendor_is_3d,
+					                                      /*skip_dp*/ true, "bridge_hw_follow");
 				}
 			}
 		}
@@ -13036,13 +13147,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// #964: a zones client's tier-1 request is its standing wish.
 				c->wish_hw_3d.store(1, std::memory_order_release);
 				c->wish_content_mode.store((int32_t)mode_idx, std::memory_order_release);
-				// #964 D-6: the panel DP, under render_mutex.
-				render_mutex_fair_lock z_lock(sys);
-				struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
-				bool mask_capable = service_dp_accepts_zone_mask(zdp) && !c->zone_mask_dp_rejected;
+				// #964 D-6: the panel DP. The capability query is a bounded
+				// read taken under the lock; the APPLY is queued (#966).
+				bool mask_capable;
+				{
+					render_mutex_fair_lock z_lock(sys);
+					mask_capable = service_dp_accepts_zone_mask(panel_dp(sys, c)) &&
+					               !c->zone_mask_dp_rejected;
+				}
 				// #961: DP first (unless the wish drives it), events after.
-				(void)apply_mode_transition(sys, zhead, mask_capable ? nullptr : zdp, mode_idx, true,
-				                            "zones_tier1");
+				(void)service_request_mode_transition(sys, c, mode_idx, true,
+				                                      /*skip_dp*/ mask_capable, "zones_tier1");
 				static bool zones_3d_logged = false;
 				if (!zones_3d_logged) {
 					zones_3d_logged = true;
@@ -13107,9 +13222,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// whenever it takes focus back.
 					c->wish_hw_3d.store(1, std::memory_order_release);
 					c->wish_content_mode.store((int32_t)mode_idx, std::memory_order_release);
-					render_mutex_fair_lock d3d_lock(sys);
-					bool landed = apply_mode_transition(sys, head, panel_dp(sys, c), mode_idx, true,
-					                                    "deferred_3d");
+					// #961: DP first, events after confirmation.
+					// #966: applied by the render thread.
+					bool landed = service_request_mode_transition(
+					    sys, c, mode_idx, true, /*skip_dp*/ false, "deferred_3d");
 					U_LOG_W(
 					    "[deferred_3d] no-zones standalone client past warmup "
 					    "(%u commits), SR was 2D — forcing 3D (mode %u -> %u)%s",
@@ -14797,9 +14913,9 @@ compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 	// whichever runs first consumes it and the other sees "nothing pending".
 	// bridge_live is re-evaluated rather than assumed — unlike the weave path,
 	// an arbitrary IPC client may well be behind a live bridge.
+	// #966: the apply is queued for the render thread, so no lock is needed.
 	struct d3d11_service_system *sys = c->sys;
 	if (sys != nullptr) {
-		render_mutex_fair_lock lock(sys);
 		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
 	}
 	return XRT_SUCCESS;
@@ -14831,10 +14947,9 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 	// #961: drain inline like the hardware request above, so the lease verdict
 	// (applied / denied-with-reason) reaches the client immediately rather than
 	// on its next commit — a client that stopped rendering would otherwise never
-	// hear back. Same lock as the render thread; work is one DP hint + bookkeeping.
+	// hear back. #966: the apply is queued for the render thread — no lock.
 	struct d3d11_service_system *sys = c->sys;
 	if (sys != nullptr) {
-		render_mutex_fair_lock lock(sys);
 		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
 	}
 	return XRT_SUCCESS;
@@ -15329,7 +15444,9 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	}
 	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 	// #961: DP first, events after confirmation.
-	bool landed = apply_mode_transition(sys, head, panel_dp(sys, c), mode_idx, true, "weave_3d");
+	// #965/#966: the present-owner submit path must not mutate mode/geometry
+	// inline — it queues the request and returns; the panel owner applies it.
+	bool landed = service_request_mode_transition(sys, c, mode_idx, true, /*skip_dp*/ false, "weave_3d");
 	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks%s", prev_idx,
 	        mode_idx, landed ? "" : " — DP REJECTED");
 }
@@ -19166,6 +19283,21 @@ static void
 service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *cmd)
 {
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	// #966: the mode transition is the one command that is not about a slot —
+	// handle it before the multi-comp null gate below.
+	if (cmd->type == WS_CMD_MODE_TRANSITION) {
+		struct xrt_device *head = sys->xsysd != NULL ? sys->xsysd->static_roles.head : nullptr;
+		struct xrt_display_processor_d3d11 *xdp = cmd->mode_skip_dp ? nullptr : panel_dp(sys, nullptr);
+		const char *tag = cmd->mode_tag != nullptr ? cmd->mode_tag : "queued";
+		bool landed = apply_mode_transition(sys, head, xdp, cmd->mode_target_idx, cmd->mode_want_3d, tag);
+		U_LOG_W("[%s] via=queue applied on the render thread: content=%d hw3d=%d dp=%s landed=%d", tag,
+		        cmd->mode_target_idx == UINT32_MAX ? -1 : (int)cmd->mode_target_idx,
+		        (int)cmd->mode_want_3d, cmd->mode_skip_dp ? "skipped" : (xdp != nullptr ? "panel" : "none"),
+		        (int)landed);
+		return;
+	}
+
 	if (mc == nullptr) {
 		return;
 	}
