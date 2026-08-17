@@ -1982,6 +1982,12 @@ struct d3d11_multi_client_slot
 	//! window with a black interior for those seconds.
 	uint64_t first_frame_ns;
 
+	//! #964 Phase A: has this slot EVER held the panel? Drives the "new app"
+	//! focus rule — a client that has come up and never once been focused is
+	//! still waiting for its first frame on the panel, so it gets it. Set the
+	//! moment the slot becomes `focused_slot`; cleared on slot (re)use.
+	bool ever_focused;
+
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
 
@@ -2203,6 +2209,13 @@ struct d3d11_multi_compositor
 	//! Render-thread only, under render_mutex; no other reader.
 	HWND focus_fg_last;
 	int focus_fg_stable;
+
+	//! #964 Phase A: when the current holder ACQUIRED the panel (monotonic ns,
+	//! 0 = never). The "new app" rule compares a candidate's `first_frame_ns`
+	//! against this: a client that started rendering AFTER the incumbent took
+	//! the panel, and has never held it itself, is a freshly launched app and
+	//! gets one turn. Stamped on every focus change under the default policy.
+	int64_t focus_acquired_ns;
 
 	//! #964 Phase A (workspace scope): the slot whose OWN window is the
 	//! debounced OS foreground WHILE A CONTROLLER IS ATTACHED — the
@@ -6766,6 +6779,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].active = true;
 			mc->clients[i].has_first_frame_committed = false;
 			mc->clients[i].first_frame_ns = 0;
+			mc->clients[i].ever_focused = false; // #964 Phase A: a new tenant gets its new-app turn
 			mc->clients[i].frame_rate_cap_hz = 0.0f;
 			mc->clients[i].session_ended_ns = 0; // #929: no stale eviction mark on slot reuse
 			mc->clients[i].last_commit_ns = 0;   // #925 S4 tier 2: no stale heartbeat either
@@ -8807,7 +8821,45 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 		}
 	}
 
-	/* (d) Foreground is not a client (or has not settled): hold the panel. */
+	/* (d) NEW APP. Launching an app must show it — deterministically, without
+	 * reintroducing newest-wins churn.
+	 *
+	 * Foreground alone cannot carry this: Windows foreground-lock refuses
+	 * activation to a process launched from the background, so a freshly
+	 * started app's window often never becomes foreground at all. Observed:
+	 * the handle cube came up with a visible window that never took the panel
+	 * and sat on the unpaced 20 ms flat path until the watchdog parked it.
+	 *
+	 * So: a presenting slot that has NEVER held the panel and started
+	 * rendering AFTER the incumbent acquired it is a new app, and gets exactly
+	 * one turn. `ever_focused` makes it once-only — an app that has had the
+	 * panel and lost it never re-takes it this way, so two live clients cannot
+	 * ping-pong. Foreground is checked FIRST above, so an explicit Alt-Tab
+	 * always beats a launch.
+	 */
+	{
+		int32_t fresh = -1;
+		uint64_t fresh_ns = 0;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			struct d3d11_multi_client_slot *slot = &mc->clients[s];
+			if (s == cur || slot->ever_focused || !pipeline_slot_presenting(slot)) {
+				continue;
+			}
+			if (slot->first_frame_ns <= (uint64_t)mc->focus_acquired_ns) {
+				continue; // already rendering before the incumbent took over
+			}
+			if (fresh < 0 || slot->first_frame_ns >= fresh_ns) {
+				fresh = s;
+				fresh_ns = slot->first_frame_ns;
+			}
+		}
+		if (fresh >= 0) {
+			*out_reason = "new-app";
+			return fresh;
+		}
+	}
+
+	/* (e) Foreground is not a client (or has not settled): hold the panel. */
 	if (cur_live) {
 		*out_reason = "hold";
 		return cur;
@@ -8941,6 +8993,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		if (best != mc->focused_slot) {
 			U_LOG_W("[pipeline] default focus: slot %d -> %d (%s)", mc->focused_slot, best, reason);
 			mc->focused_slot = best;
+			// #964 Phase A: stamp the acquisition so the new-app rule can tell
+			// "started after the incumbent took the panel" from "was already
+			// there", and mark the slot so it only ever gets that one turn.
+			mc->focus_acquired_ns = (int64_t)os_monotonic_get_ns();
+			if (best >= 0) {
+				mc->clients[best].ever_focused = true;
+			}
 			multi_compositor_update_input_forward(mc);
 			service_signal_workspace_wakeup(sys);
 
