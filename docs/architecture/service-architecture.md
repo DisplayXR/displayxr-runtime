@@ -64,10 +64,16 @@ Companion references: [workspace-stability.md](../reference/workspace-stability.
 >   content event, hardware event only after the DP confirmed); the acked flip reverts on
 >   rejection/abort/deactivate (**#761 closed**). `[HEALTH] lease=`. (§4.2 mode/DP rows, §9-3, §9-7 partly)
 >
-> Still open / next: **#963** (standalone↔workspace transition dead ends — one instance, the acked flip
-> selected after deactivate, was fixed under #961), the one-pipeline work (#964 — the "N standalone
-> clients ⇒ N DPs / lens hints" defect §9-11 is now the visible remainder of #939), and the noted
-> per-slice follow-ups. The DP stays in-process (fault-contained); #943's exit source waits for the
+> - **#963** the transition dead ends (§4.3, §9-8, §9-10): activate now **enrols live standalone
+>   clients into slots synchronously** (a `sys->all_clients` registry replaces "slot table only");
+>   deactivate creates a **runtime-owned window** for no-HWND clients instead of logging forever; the
+>   #814 failsafe counts **standalone survivors**. Also closed a real crash: the mainloop's per-tick shm
+>   mode-index push ran without `global_state.lock` and wrote into a just-unmapped section on client
+>   disconnect (§4.2 "50 ms unlocked shm push" — now locked). New follow-up **#994**: a hosted client in
+>   a slot / any non-slot client under a workspace gets no valid view poses (`POSE_INVALID` per frame).
+>
+> Still open / next: the one-pipeline work (#964 — the "N standalone clients ⇒ N DPs / lens hints"
+> defect §9-11 is now the visible remainder of #939), #994, and the noted per-slice follow-ups. The DP stays in-process (fault-contained); #943's exit source waits for the
 > armed tripwire.
 
 **One-paragraph summary.** The service is a single-process, no-isolation host. `WinMain`
