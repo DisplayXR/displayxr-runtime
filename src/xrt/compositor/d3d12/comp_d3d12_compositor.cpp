@@ -778,8 +778,9 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 	// Check if window was closed
 	if (c->owns_window && c->own_window != nullptr &&
 	    !comp_d3d11_window_is_valid(c->own_window)) {
-		U_LOG_I("Window closed - signaling session exit");
-		return XRT_ERROR_IPC_FAILURE;
+		// #999: graceful exit request, not a lost session (see the d3d11 note).
+		U_LOG_I("Window closed - requesting session exit");
+		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);

@@ -1019,6 +1019,41 @@ oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess)
 	return oxr_session_success_result(sess);
 }
 
+/*!
+ * Runtime-INITIATED session exit: the user closed the window the runtime owns.
+ *
+ * Drives the app to STOPPING so it calls xrEndSession, with `exiting` set first
+ * so xrEndSession then goes IDLE → EXITING rather than IDLE → READY. Without
+ * that, an app that restarts VR whenever it sees READY (Blender) immediately
+ * opens a new window, in a loop. Idempotent: repeat calls are no-ops once
+ * `exiting` is set.
+ *
+ * Shared by the out-of-process route (@ref XRT_SESSION_EVENT_EXIT_REQUEST,
+ * pushed by the multi/service compositor) and the in-process one (#999:
+ * @ref XRT_ERROR_COMPOSITOR_WINDOW_CLOSED from wait_frame — the native
+ * compositors have no session event sink to push an event through).
+ */
+static void
+session_begin_runtime_exit(struct oxr_logger *log, struct oxr_session *sess)
+{
+	if (sess->exiting) {
+		return;
+	}
+	sess->exiting = true;
+
+	if (sess->state == XR_SESSION_STATE_FOCUSED) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+	}
+	if (sess->state == XR_SESSION_STATE_VISIBLE) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+	}
+	if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+		sess->has_ended_once = true;
+	}
+	oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
+}
+
 #ifdef OXR_HAVE_FB_passthrough
 static inline XrPassthroughStateChangedFlagsFB
 xrt_to_passthrough_state_flags(enum xrt_passthrough_state state)
@@ -1048,6 +1083,17 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 
 	if (xs == NULL) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "xrt_session is null");
+	}
+
+	// #999: in-process native-compositor sessions get "the user closed my
+	// window" as XRT_ERROR_COMPOSITOR_WINDOW_CLOSED out of wait_frame (they
+	// own no session event sink), which arms runtime_exit_pending. Run the
+	// same exit the event route runs, so ESC / X / Alt+F4 ends the session
+	// the OpenXR way — STOPPING here, then the app's xrEndSession →
+	// EXITING → xrDestroySession — instead of leaving the app spinning on a
+	// dead session.
+	if (sess->runtime_exit_pending) {
+		session_begin_runtime_exit(log, sess);
 	}
 
 #ifdef XRT_OS_MACOS
@@ -1089,18 +1135,7 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		extern bool oxr_macos_window_closed(void);
 		if (oxr_macos_window_closed() && !sess->exiting && !sess->has_external_window) {
 			U_LOG_W("macOS window closed — requesting session exit");
-			sess->exiting = true;
-			if (sess->state == XR_SESSION_STATE_FOCUSED) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-			}
-			if (sess->state == XR_SESSION_STATE_VISIBLE) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-			}
-			if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-				sess->has_ended_once = true;
-			}
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
+			session_begin_runtime_exit(log, sess);
 		}
 	}
 #endif
@@ -1297,24 +1332,9 @@ skip_macos_pump:
 			break;
 		case XRT_SESSION_EVENT_EXIT_REQUEST:
 			// Runtime-initiated session exit (e.g. own window was closed).
-			// Drive the state machine to STOPPING so the app calls xrEndSession.
-			// Set sess->exiting so xrEndSession transitions IDLE → EXITING
-			// (not IDLE → READY). Without this, apps like Blender see READY
-			// and immediately restart VR, creating a new window in a loop.
 			// With EXITING, apps destroy the session and stay alive — the user
 			// can start a new VR session manually.
-			sess->exiting = true;
-			if (sess->state == XR_SESSION_STATE_FOCUSED) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-			}
-			if (sess->state == XR_SESSION_STATE_VISIBLE) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-			}
-			if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
-				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-				sess->has_ended_once = true;
-			}
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
+			session_begin_runtime_exit(log, sess);
 			break;
 		default: U_LOG_W("unhandled event type! %d", xse.type); break;
 		}
@@ -2899,6 +2919,23 @@ do_wait_frame_and_checks(struct oxr_logger *log,
 	    &frame_id,                           // out_frame_id
 	    &predicted_display_time,             // out_predicted_display_time
 	    &predicted_display_period);          // out_predicted_display_period
+
+	// #999: the runtime's own window was closed (ESC / X / Alt+F4) on an
+	// in-process native-compositor session. Not a failure of the session —
+	// arm the graceful exit for the next xrPollEvent (which takes the app to
+	// STOPPING → xrEndSession → EXITING) and fail only THIS frame, exactly
+	// like the out-of-process path does via frame_id = -1. Must not fall into
+	// OXR_CHECK_XRET: it would flag the session lost, and then the app could
+	// no longer poll the event, end the session, or exit on its own terms.
+	if (xret == XRT_ERROR_COMPOSITOR_WINDOW_CLOSED) {
+		if (!sess->runtime_exit_pending) {
+			sess->runtime_exit_pending = true;
+			oxr_warn(log, "Runtime window closed — exiting the session");
+		}
+		// Quiet after the first frame: the app keeps calling xrWaitFrame
+		// until it has drained the event and ended the session.
+		return XR_ERROR_RUNTIME_FAILURE;
+	}
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_wait_frame);
 
 	if (frame_id < 0) {
