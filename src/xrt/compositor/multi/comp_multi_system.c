@@ -8,13 +8,12 @@
  * @author Korcan Hussein <korcan.hussein@collabora.com>
  * @ingroup comp_multi
  *
- * @note DisplayXR-specific: this is the Monado-legacy multi-client orchestrator.
- * DisplayXR's workspace mode uses a separate per-client compositor
- * (`d3d11_service_compositor`) and its own multi-client orchestration
- * (`d3d11_multi_compositor`) inside `compositor/d3d11_service/comp_d3d11_service.cpp`.
- * The code in this file is reachable only via `compositor/null/null_compositor.c`
- * (headless testing). Modifying it does NOT affect workspace-mode performance
- * or behavior.
+ * @note This file is the PRODUCTION system compositor on macOS, Linux and
+ * Android: `compositor/null/null_compositor.c` is its sole entry point, and
+ * `targets/common/target_instance.c` selects it whenever `XRT_D3D11_SERVICE_ONLY`
+ * is unset. Windows ships `compositor/d3d11_service/` instead, so comp_multi is
+ * a non-shipping fallback there. Design: `docs/architecture/comp-multi-one-pipeline.md`
+ * (#967); platform shape: `docs/architecture/service-architecture.md` §7.
  */
 
 #include "xrt/xrt_config_os.h"

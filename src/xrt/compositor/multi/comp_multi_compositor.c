@@ -8,13 +8,12 @@
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup comp_multi
  *
- * @note DisplayXR-specific: this is the Monado-legacy multi-client orchestrator.
- * DisplayXR's workspace mode uses a separate per-client compositor
- * (`d3d11_service_compositor`) and its own multi-client orchestration
- * (`d3d11_multi_compositor`) inside `compositor/d3d11_service/comp_d3d11_service.cpp`.
- * The code in this file is reachable only via `compositor/null/null_compositor.c`
- * (headless testing). Modifying it does NOT affect workspace-mode performance
- * or behavior.
+ * @note This file is the PRODUCTION per-client compositor on macOS, Linux and
+ * Android: `compositor/null/null_compositor.c` is comp_multi's sole entry point,
+ * and `targets/common/target_instance.c` selects it whenever `XRT_D3D11_SERVICE_ONLY`
+ * is unset. Windows ships `compositor/d3d11_service/` instead, so comp_multi is
+ * a non-shipping fallback there. Design: `docs/architecture/comp-multi-one-pipeline.md`
+ * (#967); platform shape: `docs/architecture/service-architecture.md` §7.
  */
 
 #include "util/u_logging.h"
@@ -2307,13 +2306,46 @@ multi_compositor_create(struct multi_system_compositor *msc,
 
 	os_mutex_lock(&msc->list_and_timing_lock);
 
-	// If we have too many clients, just ignore it.
+	// Take a client slot. Exhaustion used to be silent ("just ignore it"):
+	// the compositor was still built and returned, but never entered
+	// clients[], so the session rendered nothing, forever, with no log.
+	// Fail the create instead (#1004) so the app sees an error.
+	bool registered = false;
 	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
 		if (mc->msc->clients[i] != NULL) {
 			continue;
 		}
 		mc->msc->clients[i] = mc;
+		registered = true;
 		break;
+	}
+
+	if (!registered) {
+		os_mutex_unlock(&msc->list_and_timing_lock);
+
+		const char *name = mc->xsi.application_name[0] != '\0' ? mc->xsi.application_name : "(unnamed)";
+		U_LOG_E("comp_multi: all %d client slots (MULTI_MAX_CLIENTS) in use, refusing session for '%s'",
+		        MULTI_MAX_CLIENTS, name);
+
+		// Release what this function allocated, in reverse order — the
+		// destroy tail only: the wait thread has not been started, no
+		// swapchain slots were ever filled, and we never made it onto
+		// msc->clients[], so none of the list/session teardown in
+		// multi_compositor_destroy() applies.
+		os_thread_helper_destroy(&mc->wait_thread.oth);
+		u_pa_destroy(&mc->upa); // Does null checking.
+		os_precise_sleeper_deinit(&mc->frame_sleeper);
+		os_precise_sleeper_deinit(&mc->scheduled_sleeper);
+		os_mutex_destroy(&mc->slot_lock);
+		free(mc);
+
+		// This is a capacity limit, not an out-of-memory condition, and
+		// not XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED (that means "more
+		// than one session is unsupported here"). XRT_ERROR_CLIENT_LIMIT_REACHED
+		// is the runtime's existing "client cap exhausted" result (#960,
+		// also used by the IPC server's per-class quota) and the state
+		// tracker already maps it to XR_ERROR_LIMIT_REACHED.
+		return XRT_ERROR_CLIENT_LIMIT_REACHED;
 	}
 
 	if (mc->xsi.is_bridge_relay) {
