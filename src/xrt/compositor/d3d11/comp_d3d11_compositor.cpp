@@ -699,8 +699,11 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// controlled by the app, not our hidden weaver window.
 	if (c->owns_window && c->own_window != nullptr && c->hwnd != nullptr &&
 	    !comp_d3d11_window_is_valid(c->own_window)) {
-		U_LOG_I("Window closed - signaling session exit");
-		return XRT_ERROR_IPC_FAILURE;
+		// #999: NOT XRT_ERROR_IPC_FAILURE — that flags the session lost and
+		// makes xrPollEvent / xrEndSession / xrRequestExitSession fail, so the
+		// app can never be told to leave. This code arms the graceful exit.
+		U_LOG_I("Window closed - requesting session exit");
+		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 
 	// During drag, synchronize with the window thread's WM_PAINT cycle.

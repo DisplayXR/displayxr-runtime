@@ -1208,24 +1208,27 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 #ifdef XRT_OS_WINDOWS
 	if (c->owns_window && c->own_window != NULL &&
 	    !comp_d3d11_window_is_valid(c->own_window)) {
-		U_LOG_I("Window closed - signaling session exit");
-		return XRT_ERROR_IPC_FAILURE;
+		// #999: graceful exit request, not a lost session.
+		U_LOG_I("Window closed - requesting session exit");
+		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 #endif
 
 #ifdef XRT_OS_MACOS
 	if (c->owns_window && c->macos_window != NULL &&
 	    !comp_vk_native_window_macos_is_valid(c->macos_window)) {
-		U_LOG_I("Window closed - signaling session exit");
-		return XRT_ERROR_IPC_FAILURE;
+		// #999: graceful exit request, not a lost session.
+		U_LOG_I("Window closed - requesting session exit");
+		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	if (c->owns_window && c->xcb_window != NULL &&
 	    !comp_vk_native_window_xcb_is_valid(c->xcb_window)) {
-		U_LOG_I("Window closed - signaling session exit");
-		return XRT_ERROR_IPC_FAILURE;
+		// #999: graceful exit request, not a lost session.
+		U_LOG_I("Window closed - requesting session exit");
+		return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 	}
 #endif
 

@@ -245,4 +245,24 @@ typedef enum xrt_result
 	 * tracker maps this to XR_ERROR_LIMIT_REACHED from xrCreateInstance.
 	 */
 	XRT_ERROR_CLIENT_LIMIT_REACHED = -40,
+
+	/*!
+	 * #999: the user closed the RUNTIME-OWNED window (ESC / the X button /
+	 * Alt+F4) of an in-process native-compositor session. This is a request
+	 * to exit, NOT a failure: the session, instance and compositor are all
+	 * still alive and every other entry point must keep working, because the
+	 * app still has to be told to leave (xrPollEvent → STOPPING) and still
+	 * has to run xrEndSession + xrDestroySession for the compositor to tear
+	 * the display processor down before the HWND dies.
+	 *
+	 * Only @ref xrt_compositor::wait_frame returns it, and only the state
+	 * tracker consumes it: it arms the same graceful exit the out-of-process
+	 * path gets from @ref XRT_SESSION_EVENT_EXIT_REQUEST (the in-process
+	 * native compositors have no session event sink to push that through) and
+	 * reports XR_ERROR_RUNTIME_FAILURE from xrWaitFrame so the app drops out
+	 * of its frame loop. Do NOT use @ref XRT_ERROR_IPC_FAILURE for this —
+	 * that one means "the session is gone", sets `has_lost` and turns every
+	 * later call, xrRequestExitSession included, into XR_ERROR_SESSION_LOST.
+	 */
+	XRT_ERROR_COMPOSITOR_WINDOW_CLOSED = -41,
 } xrt_result_t;

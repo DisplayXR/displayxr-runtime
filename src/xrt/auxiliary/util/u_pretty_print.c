@@ -191,6 +191,7 @@ u_pp_xrt_result(struct u_pp_delegate dg, xrt_result_t xret)
 	case XRT_TIMEOUT:                                    DG("XRT_TIMEOUT"); return;
 	case XRT_SPACE_BOUNDS_UNAVAILABLE:                   DG("XRT_SPACE_BOUNDS_UNAVAILABLE"); return;
 	case XRT_ERROR_IPC_FAILURE:                          DG("XRT_ERROR_IPC_FAILURE"); return;
+	case XRT_ERROR_COMPOSITOR_WINDOW_CLOSED:             DG("XRT_ERROR_COMPOSITOR_WINDOW_CLOSED"); return;
 	case XRT_ERROR_NO_IMAGE_AVAILABLE:                   DG("XRT_ERROR_NO_IMAGE_AVAILABLE"); return;
 	case XRT_ERROR_VULKAN:                               DG("XRT_ERROR_VULKAN"); return;
 	case XRT_ERROR_OPENGL:                               DG("XRT_ERROR_OPENGL"); return;

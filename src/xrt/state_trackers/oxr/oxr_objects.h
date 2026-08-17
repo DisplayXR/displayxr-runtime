@@ -2473,6 +2473,17 @@ struct oxr_session
 	bool frame_started;
 	bool exiting;
 
+	/*!
+	 * #999: the runtime-owned window was closed by the user (ESC / X / Alt+F4)
+	 * on an in-process native-compositor session, so the runtime owes the app
+	 * a graceful exit. Armed from xrWaitFrame (the only entry point the
+	 * compositor can report it through — @ref XRT_ERROR_COMPOSITOR_WINDOW_CLOSED)
+	 * and consumed once by the next @ref oxr_session_poll, which then runs the
+	 * same state machine the out-of-process path gets from
+	 * @ref XRT_SESSION_EVENT_EXIT_REQUEST. Out-of-process sessions never set it.
+	 */
+	bool runtime_exit_pending;
+
 	struct
 	{
 		int64_t waited;

@@ -1436,8 +1436,9 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 		struct comp_gl_compositor *c = gl_comp(xc);
 		if (c->owns_window && c->own_window != NULL &&
 		    !comp_d3d11_window_is_valid(c->own_window)) {
-			U_LOG_I("Window closed - signaling session exit");
-			return XRT_ERROR_IPC_FAILURE;
+			// #999: graceful exit request, not a lost session.
+			U_LOG_I("Window closed - requesting session exit");
+			return XRT_ERROR_COMPOSITOR_WINDOW_CLOSED;
 		}
 	}
 #endif
