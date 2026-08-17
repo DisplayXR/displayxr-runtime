@@ -105,6 +105,15 @@ struct xrt_application_info
 	bool ext_weave_enabled;                          //!< XR_DXR_weave present-owner (#960)
 	//! #960: the client's DECLARED class (enum xrt_client_class); the service verifies it.
 	uint32_t declared_client_class;
+	//! #964 Phase A: this process was launched INSIDE a workspace session
+	//! (`DISPLAYXR_WORKSPACE_SESSION=1`, set by the workspace controller for
+	//! its children and by the service orchestrator's spawn). Only such
+	//! clients are workspace clients: the controller enumerates, places and
+	//! composes them. Everything else keeps its own window and reaches the
+	//! panel through the foreground override. Read client-side from the env
+	//! (u_sandbox_is_workspace_session); the server just records the claim —
+	//! it is a scoping hint, not a privilege, so there is nothing to verify.
+	bool workspace_session;
 };
 
 /*!

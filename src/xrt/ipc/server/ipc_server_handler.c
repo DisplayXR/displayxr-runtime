@@ -4766,6 +4766,15 @@ ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, s
 		if (cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_PRESENT_OWNER) {
 			continue;
 		}
+		// #964 Phase A: the shell composes ONLY what was launched under it.
+		// A client that did not come up inside a workspace session (no
+		// DISPLAYXR_WORKSPACE_SESSION=1) is somebody else's app: it keeps its
+		// own window and reaches the panel through the foreground override,
+		// so the controller must never see it, place it or compose it.
+		// Invisible to enumerate == never `placed` == never composed.
+		if (!ics->client_state.info.workspace_session) {
+			continue;
+		}
 		cand[n_cand].id = ics->client_state.id;
 		cand[n_cand].xc = (struct xrt_compositor *)ics->xc;
 		n_cand++;
@@ -4846,6 +4855,16 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 	xrt_result_t xret = ipc_server_get_client_app_state(s, client_id, out_state);
 	if (xret != XRT_SUCCESS) {
 		return xret;
+	}
+
+	// #964 Phase A: same scope as enumerate — a client that did not come up
+	// inside a workspace session is not a workspace client, so it must not be
+	// introspectable either (the controller could otherwise still address one
+	// by a guessed / stale id). Same error as "no such client": to the
+	// controller it simply is not there.
+	if (!out_state->info.workspace_session) {
+		memset(out_state, 0, sizeof(*out_state));
+		return XRT_ERROR_IPC_FAILURE;
 	}
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)

@@ -22,6 +22,7 @@
 #include "util/u_git_tag.h"
 #include "util/u_logging.h"
 #include "util/u_builders.h"
+#include "util/u_sandbox.h"
 #include <displayxr_mcp/mcp_server.h>
 #include "oxr_mcp_tools.h"
 
@@ -483,6 +484,15 @@ oxr_instance_create(struct oxr_logger *log,
 	else if (i_info.app_info.ext_weave_enabled) {
 		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_PRESENT_OWNER;
 	}
+	// #964 Phase A: is this process part of a workspace session? The workspace
+	// controller sets DISPLAYXR_WORKSPACE_SESSION=1 for the apps it launches
+	// (so does the service orchestrator's spawn), and ONLY those clients are
+	// workspace clients — the controller enumerates, places and composes them.
+	// An app the user started themselves keeps its own window and reaches the
+	// panel through the foreground override instead of becoming a tile.
+	// Unlike the class this is a scoping hint, not a privilege: the server
+	// records the claim, there is nothing to verify.
+	i_info.app_info.workspace_session = u_sandbox_is_workspace_session();
 	snprintf(i_info.app_info.application_name, sizeof(i_info.app_info.application_name), "%s",
 	         createInfo->applicationInfo.applicationName);
 

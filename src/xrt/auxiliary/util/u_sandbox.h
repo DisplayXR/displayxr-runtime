@@ -66,6 +66,26 @@ u_sandbox_is_app_container(void);
 bool
 u_sandbox_should_use_ipc(void);
 
+/*!
+ * Was this process launched inside a workspace session?
+ *
+ * True when `DISPLAYXR_WORKSPACE_SESSION=1` is in the environment — set by the
+ * workspace controller for the apps it launches, and by the service
+ * orchestrator's spawn path. Two consumers:
+ * - u_sandbox_should_use_ipc(): a workspace session always runs over IPC.
+ * - #964 Phase A: only workspace-session clients are WORKSPACE clients (the
+ *   controller enumerates, places and composes them). Everything else keeps
+ *   its own window and reaches the panel through the foreground override.
+ *
+ * On Windows the process env block is consulted as well as the CRT's
+ * environment: the host EXE may set the var with SetEnvironmentVariableA after
+ * CRT init, which a separately-linked static CRT in this DLL would miss.
+ *
+ * @ingroup aux_sandbox
+ */
+bool
+u_sandbox_is_workspace_session(void);
+
 
 #ifdef __cplusplus
 }
