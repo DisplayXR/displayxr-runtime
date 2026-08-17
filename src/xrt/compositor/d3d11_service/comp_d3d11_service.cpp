@@ -449,6 +449,10 @@ struct d3d11_service_compositor
 	//! Set when workspace re-activates — next layer_commit tears down standalone resources
 	bool pending_workspace_reentry;
 
+	//! #963: one-shot guards for the deactivate hot-switch path.
+	bool hot_switch_check_logged;
+	bool hot_switch_window_failed;
+
 	//! Whether the window has been closed (triggers session exit)
 	bool window_closed;
 
@@ -889,6 +893,15 @@ struct d3d11_service_system
 
 	//! Mutex for active_compositor access
 	std::mutex active_compositor_mutex;
+
+	//! #963: EVERY live per-client compositor (created in
+	//! system_create_native_compositor, removed in compositor_destroy). The
+	//! multi-comp slot table only knows workspace members; standalone clients
+	//! were invisible to activate (never enrolled) and to the #814 failsafe
+	//! (never counted). Guarded by clients_mutex; never take render_mutex while
+	//! holding it (render_mutex -> clients_mutex is the only order).
+	std::vector<struct d3d11_service_compositor *> all_clients;
+	std::mutex clients_mutex;
 
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
@@ -12514,7 +12527,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (c->render.hud != nullptr) {
 			u_hud_destroy(&c->render.hud);
 		}
+		// #963: a hosted client (NULL binding) owns a runtime window with its
+		// own thread — destroy it too (DP already destroyed above, as the
+		// window header requires), else it stays alive and visible under the
+		// workspace window for the rest of the session.
+		if (c->render.owns_window && c->render.window != nullptr) {
+			comp_d3d11_window_destroy(&c->render.window);
+			U_LOG_W("[TRANSITION] reverse hot-switch: destroyed the client's runtime-owned window");
+		}
+		c->render.window = nullptr;
+		c->render.owns_window = false;
 		c->render.hwnd = nullptr;
+		c->hot_switch_check_logged = false; // #963: log once per transition cycle
+		c->hot_switch_window_failed = false;
 
 		// Hide the app's HWND (workspace composites the content).
 		if (c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
@@ -12579,21 +12604,50 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Workspace was deactivated: workspace_mode is false but this client was created
 	// in workspace mode (no swap chain, no DP). Create standalone resources now,
 	// on the app's own IPC thread — safe from WM deadlocks.
-	if (!c->render.swap_chain) {
-		U_LOG_W("Hot-switch check: swap_chain=NULL, app_hwnd=%p, workspace_mode=%d",
+	if (!c->render.swap_chain && !c->hot_switch_check_logged) {
+		// #963: one-shot (was per frame — 1.4k lines/s for a stranded client).
+		c->hot_switch_check_logged = true;
+		U_LOG_W("[TRANSITION] Hot-switch check: swap_chain=NULL, app_hwnd=%p, workspace_mode=%d",
 		        (void *)c->app_hwnd, sys->workspace_mode);
 	}
-	if (!c->render.swap_chain && c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
-		U_LOG_W("Hot-switch: lazy standalone init for HWND=%p", (void *)c->app_hwnd);
+	// #963: a client with NO app HWND (hosted / Chrome AppContainer that joined
+	// under the shell, or a hosted client enrolled at activate) used to fail the
+	// IsWindow test below and stay dark forever. Give it what session-create
+	// gives a NULL binding: a runtime-owned window on its own thread. Created
+	// here on the client's IPC thread — the window is ours, no cross-process WM.
+	bool hs_have_app_hwnd = c->app_hwnd != nullptr && IsWindow(c->app_hwnd);
+	if (!c->render.swap_chain && !hs_have_app_hwnd && !c->is_bridge_relay && c->render.weave_hwnd == nullptr &&
+	    c->render.window == nullptr && !c->hot_switch_window_failed) {
+		xrt_result_t wret =
+		    comp_d3d11_window_create(sys->output_width, sys->output_height, sys->base.info.display_screen_left,
+		                             sys->base.info.display_screen_top, &c->render.window);
+		if (wret == XRT_SUCCESS && c->render.window != nullptr) {
+			c->render.hwnd = (HWND)comp_d3d11_window_get_hwnd(c->render.window);
+			c->render.owns_window = true;
+			comp_d3d11_window_set_system_devices(c->render.window, sys->xsysd);
+			U_LOG_W("[TRANSITION] Hot-switch: no app HWND — created a runtime-owned window hwnd=%p (%ux%u)",
+			        (void *)c->render.hwnd, sys->output_width, sys->output_height);
+		} else {
+			c->hot_switch_window_failed = true; // don't retry every frame
+			U_LOG_E(
+			    "[TRANSITION] Hot-switch: failed to create a runtime window (ret=%d) — client stays dark",
+			    (int)wret);
+		}
+	}
+	HWND hs_target_hwnd = hs_have_app_hwnd ? c->app_hwnd : (c->render.owns_window ? c->render.hwnd : nullptr);
+	if (!c->render.swap_chain && hs_target_hwnd != nullptr) {
+		U_LOG_W("[TRANSITION] Hot-switch: lazy standalone init for HWND=%p (%s)", (void *)hs_target_hwnd,
+		        hs_have_app_hwnd ? "app window" : "runtime window");
 
-		// Show the HWND with ShowWindowAsync to avoid deadlock with the
-		// app's main thread (blocked on this IPC layer_commit). Keep
-		// decorations intact — user wants the standalone window to look
-		// like a normal app window.
-		ShowWindowAsync(c->app_hwnd, SW_SHOWNOACTIVATE);
-
-		c->render.hwnd = c->app_hwnd;
-		c->render.owns_window = false;
+		if (hs_have_app_hwnd) {
+			// Show the HWND with ShowWindowAsync to avoid deadlock with the
+			// app's main thread (blocked on this IPC layer_commit). Keep
+			// decorations intact — user wants the standalone window to look
+			// like a normal app window.
+			ShowWindowAsync(c->app_hwnd, SW_SHOWNOACTIVATE);
+			c->render.hwnd = c->app_hwnd;
+			c->render.owns_window = false;
+		}
 
 		// Swap chain at display-native size (matches DP expectation).
 		// The compositor's auto-resize handler will adapt it to the
@@ -12614,9 +12668,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		sc_desc.BufferCount = 2;
 		sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
-		HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-		    sys->device.get(), c->app_hwnd, &sc_desc,
-		    nullptr, nullptr, c->render.swap_chain.put());
+		HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), hs_target_hwnd, &sc_desc,
+		                                                       nullptr, nullptr, c->render.swap_chain.put());
 		if (SUCCEEDED(hr)) {
 			// Reduce DXGI frame latency to 1 — minimizes the queue depth
 			// between Present and DWM cross-process composition. Critical
@@ -12638,8 +12691,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		void *dp_fac_hs = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 		if (dp_fac_hs != NULL) {
 			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_hs;
-			factory(sys->device.get(), sys->context.get(),
-			        c->app_hwnd, &c->render.display_processor);
+			factory(sys->device.get(), sys->context.get(), hs_target_hwnd, &c->render.display_processor);
 			if (c->render.display_processor != nullptr) {
 				// Phase 6.1 (#140): don't call request_display_mode(true)
 				// — same SR SDK recalibration issue. DP comes up in the
@@ -13072,6 +13124,27 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 			}
 		}
 	}
+	// #963: STANDALONE survivors — clients that never held a slot (pure
+	// standalone service, or two hosted clients side by side). A standalone
+	// client that is presenting owns its own DP; it must not lose the panel
+	// because a sibling left. Caller holds render_mutex; clients_mutex nests
+	// inside it.
+	{
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		for (struct d3d11_service_compositor *other : sys->all_clients) {
+			if (other == c || other->is_bridge_relay || other->render.display_processor == nullptr) {
+				continue;
+			}
+			bool in_slot = mc != nullptr && multi_comp_find_slot(mc, other) >= 0;
+			if (in_slot) {
+				continue; // already counted above
+			}
+			survivors++;
+			if (other->render.weave_hwnd != nullptr) {
+				survivor_wants_3d = true;
+			}
+		}
+	}
 	if (survivor_wants_3d) {
 		return;
 	}
@@ -13136,6 +13209,18 @@ compositor_destroy(struct xrt_compositor *xc)
 	// registered in workspace mode but is now closing in standalone mode
 	// (after hot-switch). Without this, the slot stays stale and shows a
 	// ghost remnant on workspace re-activate.
+	// #963: leave the live-client registry FIRST so a concurrent activate /
+	// failsafe scan cannot pick us up mid-teardown.
+	{
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		for (size_t i = 0; i < sys->all_clients.size(); i++) {
+			if (sys->all_clients[i] == c) {
+				sys->all_clients.erase(sys->all_clients.begin() + (ptrdiff_t)i);
+				break;
+			}
+		}
+	}
+
 	if (sys->multi_comp != nullptr) {
 		render_mutex_fair_lock lock(sys);
 		multi_compositor_unregister_client(sys, c, true);
@@ -14354,6 +14439,10 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 
 	c->sys = sys;
 	c->log_level = sys->log_level;
+	{
+		std::lock_guard<std::mutex> reg(sys->clients_mutex); // #963
+		sys->all_clients.push_back(c);
+	}
 	c->frame_id = 0;
 
 	// Store session event sink for pushing state change events
@@ -17986,6 +18075,97 @@ comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
 	return true;
 }
 
+/*!
+ * #963: flag every live STANDALONE client for enrolment into the workspace.
+ *
+ * Activate used to flag only slot members (`pending_workspace_reentry` on
+ * `mc->clients[]`), so a client that was standalone at that moment — a forced-
+ * IPC app started before Ctrl+Space — was never told: its commits took the
+ * workspace early-return before process_atlas/Present (dark) while its per-
+ * client DP stayed alive on the panel (a second weaver).
+ *
+ * The SLOT is registered right here, synchronously (render_mutex is held by the
+ * caller, exactly like session-create's registration) — registration touches
+ * no window / swap chain / DP, and it has to happen before the client's next
+ * commit because a non-slot client under a workspace gets no valid view poses,
+ * so its xrEndFrame fails client-side and it never commits (chicken-and-egg for
+ * a commit-time enrolment). Only the teardown of the client's standalone
+ * resources stays lazy (`pending_workspace_reentry`, its own thread — the DXGI /
+ * WM deadlock rule).
+ *
+ * Skipped: relays (no render), controllers (no render), weave present-owners
+ * (they present themselves; #965 owns that path), clients with nothing standalone
+ * to tear down, and clients already in a slot.
+ */
+static void
+enrol_standalone_clients_locked(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+	std::lock_guard<std::mutex> reg(sys->clients_mutex);
+	for (struct d3d11_service_compositor *c : sys->all_clients) {
+		if (c->is_bridge_relay || c->render.weave_hwnd != nullptr) {
+			continue;
+		}
+		bool standalone_live = c->render.display_processor != nullptr || c->render.swap_chain != nullptr;
+		if (!standalone_live) {
+			continue; // controller session, or a workspace-created (atlas-only) client
+		}
+		if (multi_comp_find_slot(mc, c) >= 0) {
+			continue; // already a member; the resume loop flagged it
+		}
+		// External-window client: the slot needs its HWND for capture/forward and
+		// for the deactivate hot-switch back to its own window. A hosted client
+		// (runtime-owned window) gets its window destroyed on re-entry and a
+		// fresh runtime window on the way back (#963 case B).
+		HWND app_hwnd = (!c->render.owns_window && c->render.hwnd != nullptr) ? c->render.hwnd : nullptr;
+		c->app_hwnd = app_hwnd;
+		if (c->slot_app_name[0] == '\0') {
+			// Same title rules as session-create: window title, else "App";
+			// bitmap font is ASCII-only; strip a " - " subtitle.
+			char title[128] = {0};
+			if (app_hwnd != nullptr) {
+				GetWindowTextA(app_hwnd, title, sizeof(title));
+			}
+			if (title[0] == '\0') {
+				snprintf(title, sizeof(title), "App");
+			}
+			for (char *p = title; *p; p++) {
+				if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) {
+					*p = '-';
+				}
+			}
+			char *sep = strstr(title, " - ");
+			if (sep != nullptr) {
+				*sep = '\0';
+			}
+			snprintf(c->slot_app_name, sizeof(c->slot_app_name), "%s", title);
+		}
+		int slot = multi_compositor_register_client(sys, c);
+		if (slot < 0) {
+			U_LOG_W(
+			    "[TRANSITION] activate: no free slot for standalone client '%s' — it stays standalone "
+			    "(dark)",
+			    c->slot_app_name);
+			continue;
+		}
+		mc->clients[slot].app_hwnd = app_hwnd;
+		snprintf(mc->clients[slot].app_name, sizeof(mc->clients[slot].app_name), "%s", c->slot_app_name);
+		c->workspace_slot_eligible = true;
+		c->pending_workspace_reentry = true;
+		U_LOG_W(
+		    "[TRANSITION] activate: enrolled live standalone client '%s' into slot %d (app_hwnd=%p, "
+		    "owns_window=%d) — its DP/swap chain%s are torn down on its next commit",
+		    c->slot_app_name, slot, (void *)app_hwnd, (int)c->render.owns_window,
+		    c->render.owns_window ? "/runtime window" : "");
+	}
+	if (mc->client_count > 0) {
+		multi_compositor_update_input_forward(mc);
+	}
+}
+
 bool
 comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 {
@@ -18060,6 +18240,10 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			capture_render_thread_start(sys);
 		}
 
+		// #963: clients that were STANDALONE while the workspace was down were
+		// never flagged above (they hold no slot) — enrol them now.
+		enrol_standalone_clients_locked(sys);
+
 		U_LOG_W("Workspace: resumed — window shown, DP recreated, render running");
 		return true;
 	}
@@ -18102,6 +18286,11 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 	if (!sys->multi_comp->capture_render_running.load()) {
 		capture_render_thread_start(sys);
 	}
+
+	// #963: clients that connected BEFORE the first activation are standalone
+	// (own window/swapchain/DP, never in a slot) — enrol them so they show up as
+	// tiles instead of going dark with an orphan DP.
+	enrol_standalone_clients_locked(sys);
 
 	U_LOG_W("Workspace: window created for empty workspace (ready for Ctrl+O)");
 	return true;

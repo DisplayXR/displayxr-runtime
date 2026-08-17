@@ -664,15 +664,23 @@ main_loop(struct ipc_server *s)
 		os_nanosleep(U_TIME_1S_IN_NS / 20);
 #endif
 
-		// Sync active rendering mode index to all clients' shared memory
+		// Sync active rendering mode index to all clients' shared memory.
+		//
+		// #963: under global_state.lock. common_shutdown() unmaps a client's shm
+		// and NULLs s->isms[i] under that lock; reading the pointer here without
+		// it was a TOCTOU that wrote into a just-unmapped section — an access
+		// violation on the mainloop (caught by the #950 [TERMINATE] tripwire at
+		// main_loop+0x9e when two clients tore down in one tick, 2026-08-16).
 		if (s->xsysd != NULL && s->xsysd->static_roles.head != NULL &&
 		    s->xsysd->static_roles.head->hmd != NULL) {
 			uint32_t mode_idx = s->xsysd->static_roles.head->hmd->active_rendering_mode_index;
+			os_mutex_lock(&s->global_state.lock);
 			for (uint32_t ci = 0; ci < IPC_MAX_CLIENTS; ci++) {
 				if (s->isms[ci] != NULL) {
 					s->isms[ci]->hmd.active_rendering_mode_index = mode_idx;
 				}
 			}
+			os_mutex_unlock(&s->global_state.lock);
 		}
 
 		// #962: mirror the compositor's focus into the IPC layer (controller policy).
