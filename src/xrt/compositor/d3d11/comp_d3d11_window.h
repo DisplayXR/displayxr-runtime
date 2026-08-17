@@ -398,6 +398,20 @@ void
 comp_d3d11_window_set_workspace_dp(struct comp_d3d11_window *window, void *dp);
 
 /*!
+ * #966: take the pending "panel should go flat" request left by WM_CLOSE.
+ *
+ * The window thread must never call the vendor display processor — with one DP
+ * per panel (#964) the compositor's render thread is driving that same object
+ * every frame, and the WndProc took no lock. So WM_CLOSE only sets a flag and
+ * the render thread consumes it here, then applies the 2D transition through
+ * its own queue.
+ *
+ * One-shot: returns true at most once per request.
+ */
+bool
+comp_d3d11_window_take_close_request(struct comp_d3d11_window *window);
+
+/*!
  * Consume pending input events from the WndProc ring buffer.
  *
  * Called from the compositor/render thread to drain buffered input events

@@ -230,6 +230,12 @@ struct comp_d3d11_window
 	//! Workspace display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *workspace_dp;
 
+	//! #966: WM_CLOSE asks for the panel to go flat; it does NOT call the
+	//! vendor display processor itself. Set on the window thread, consumed
+	//! (and cleared) by the compositor's render thread, which is the only
+	//! thread allowed to touch the DP. See comp_d3d11_window_take_close_request.
+	volatile LONG close_request_2d;
+
 	//! Ring buffer for capture client input events (WndProc writes, render thread reads).
 	//! Lock-free SPSC: WndProc is the single producer, render loop is the single consumer.
 	struct workspace_input_event input_ring[WORKSPACE_INPUT_RING_SIZE];
@@ -708,17 +714,15 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_CLOSE:
 		U_LOG_W("D3D11 window: WM_CLOSE received (signalling exit; not destroying inline)");
-		// Switch workspace DP to 2D mode (lens off) before closing.
-		// This runs on the window thread and works even with no active clients.
-		{
-			void *dp = (void *)InterlockedCompareExchangePointer(
-			    (volatile PVOID *)&w->workspace_dp, NULL, NULL);
-			if (dp != NULL) {
-				struct xrt_display_processor_d3d11 *xdp =
-				    (struct xrt_display_processor_d3d11 *)dp;
-				xrt_display_processor_d3d11_request_display_mode(xdp, false);
-				U_LOG_W("D3D11 window: switched workspace DP to 2D on close");
-			}
+		// #966: REQUEST the panel go flat; do not drive the display processor
+		// from this thread. This used to call the vendor DP directly, with no
+		// lock, while the compositor's render thread was driving the same
+		// object every frame — and after #964 there is exactly ONE DP per
+		// panel, so the window thread was a second, unsynchronized writer into
+		// the vendor weaver. The render thread picks the flag up on its next
+		// pass and applies it through the normal queued transition.
+		if (InterlockedCompareExchangePointer((volatile PVOID *)&w->workspace_dp, NULL, NULL) != NULL) {
+			InterlockedExchange(&w->close_request_2d, TRUE);
 		}
 		// Request shutdown only. should_exit makes comp_d3d11_window_is_valid()
 		// return false, which the compositor surfaces to the app's frame loop as
@@ -2109,6 +2113,17 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 			PostMessage(fwd, WM_LBUTTONUP, 0, 0);
 		}
 	}
+}
+
+extern "C" bool
+comp_d3d11_window_take_close_request(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return false;
+	}
+	// One-shot: the taker owns the request, so a second poller (or a second
+	// pass before the transition lands) does not re-fire it.
+	return InterlockedExchange(&window->close_request_2d, FALSE) != FALSE;
 }
 
 extern "C" void

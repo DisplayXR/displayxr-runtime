@@ -129,6 +129,20 @@ every new branch is gated on `!legacy`. It ships for one release for the motion-
 A/B (`docs/reference/motion-to-photon-levers.md`; the Intel-iGPU present path has no
 `present_wait`) and is then deleted together with #963's seam machinery.
 
+**D-6 amendment (#966) and the present-owner contract (#965).** All mode
+transitions are now *applied* on the render thread: IPC-thread writers enqueue a
+`WS_CMD_MODE_TRANSITION` on the S3 ring and the drain at the top of
+`multi_compositor_render` calls `apply_mode_transition` under `render_mutex`.
+The lease/veto decision and its denial event stay on the caller's thread, so a
+client still learns synchronously whether it was allowed to ask; only the write
+to `sys->` mode/geometry and the DP hint move. Identical queued transitions
+coalesce. Under `DXR_LEGACY_STANDALONE`, and during teardown when no render
+thread is running, the apply stays inline. `WM_CLOSE` no longer calls the vendor
+DP from the window thread — it leaves a flag the render thread consumes (#966).
+`weave_submit` keeps its synchronous path (zero-lag inline-3D) but is now
+contract-bound: serialized by the panel owner, bounded, no mode/geometry
+mutation, DP resolved through `panel_dp()` *after* the lock (#965).
+
 **D-8 Not in this slice.** #965 (present-owner through the panel owner), #966 (queue), #967
 (comp_multi), the DP re-bind slot, #1002 detection (separate small PR on the same present
 site: check `Present`/create HRESULTs for `0x887A0005/6`, log `[DEVICE_REMOVED] reason=`,
@@ -168,10 +182,11 @@ Verified: hosted ×2 + forced-IPC `_handle` ×1 + shell attach/detach + displayx
 created` per panel, focus follows the newest presenting slot, DP re-binds on presenter change
 (`[pipeline] panel DP re-bound to hwnd=…`, ~200 ms flat blit), activate/deactivate rebuild nothing,
 `[TERMINATE]`/`[EXIT]` silent, render thread ≈1 ms/frame. Not yet eyeballed with a person in front
-of the panel (the SR lens auto-drops to 2D on tracking loss, so the `[force_3d]` 2 s re-assert
-cadence in an empty room is expected). Known: the service window is destroyed+recreated (with the DP)
-after ESC — a hide would be cheaper; the workspace `Late-weave saturation backoff` governor misreads
-the hidden service window's waitable.
+of the panel. Lesson: a `[force_3d]` re-assert every 2 s meant the **presenter was starved** (the
+render loop ran at 10 Hz on the 100 ms fallback and the SR service saw no weaving, so it dropped
+the lens) — not tracking loss; once the loop presents at display rate the lens holds. Known: the
+service window is destroyed+recreated (with the DP) after ESC — a hide would be cheaper; the
+workspace `Late-weave saturation backoff` governor misreads the hidden service window's waitable.
 
 ## 5. Validation (done-when for the slice)
 
