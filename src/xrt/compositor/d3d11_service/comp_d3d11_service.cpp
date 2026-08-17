@@ -7658,8 +7658,11 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 static inline bool
 pipeline_slot_presenting(const struct d3d11_multi_client_slot *slot)
 {
+	// #929: a session-ended client that never disconnects must not keep the
+	// panel — it stops being a presenter the moment it calls xrEndSession.
 	return slot->active && slot->client_type == CLIENT_TYPE_IPC && slot->compositor != nullptr &&
-	       !slot->minimized && slot->has_first_frame_committed && slot->compositor->pipe_frame_ready;
+	       !slot->minimized && slot->session_ended_ns == 0 && slot->has_first_frame_committed &&
+	       slot->compositor->pipe_frame_ready && !slot->compositor->window_closed;
 }
 
 /*!
