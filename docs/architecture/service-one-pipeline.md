@@ -182,10 +182,11 @@ Verified: hosted ×2 + forced-IPC `_handle` ×1 + shell attach/detach + displayx
 created` per panel, focus follows the newest presenting slot, DP re-binds on presenter change
 (`[pipeline] panel DP re-bound to hwnd=…`, ~200 ms flat blit), activate/deactivate rebuild nothing,
 `[TERMINATE]`/`[EXIT]` silent, render thread ≈1 ms/frame. Not yet eyeballed with a person in front
-of the panel (the SR lens auto-drops to 2D on tracking loss, so the `[force_3d]` 2 s re-assert
-cadence in an empty room is expected). Known: the service window is destroyed+recreated (with the DP)
-after ESC — a hide would be cheaper; the workspace `Late-weave saturation backoff` governor misreads
-the hidden service window's waitable.
+of the panel. Lesson: a `[force_3d]` re-assert every 2 s meant the **presenter was starved** (the
+render loop ran at 10 Hz on the 100 ms fallback and the SR service saw no weaving, so it dropped
+the lens) — not tracking loss; once the loop presents at display rate the lens holds. Known: the
+service window is destroyed+recreated (with the DP) after ESC — a hide would be cheaper; the
+workspace `Late-weave saturation backoff` governor misreads the hidden service window's waitable.
 
 ## 5. Validation (done-when for the slice)
 

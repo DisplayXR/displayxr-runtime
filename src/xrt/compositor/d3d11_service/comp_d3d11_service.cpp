@@ -9139,6 +9139,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// cursor, overlays, the acked mode flip, the per-slot compose — is
 	// controller policy and stays exactly as it was.
 	if (pipeline_always_on(sys) && !sys->workspace_mode) {
+		// #966: the S3 ring is drained by the render thread on BOTH policies.
+		// Without this the queued WS_CMD_MODE_TRANSITIONs (every mode writer
+		// enqueues now) would sit unapplied until a controller attached, and
+		// the [force_3d]/deferred-3D gates on the IPC threads would re-fire
+		// every frame (measured: 218 lines in 225 ms) with the panel never
+		// changing. Same order as the compose path: drain first.
+		service_ws_cmd_drain(sys);
 		pipeline_default_policy_render(sys, mc);
 		return;
 	}
