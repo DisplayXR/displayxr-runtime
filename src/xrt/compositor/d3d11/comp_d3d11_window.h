@@ -152,6 +152,17 @@ void
 comp_d3d11_window_minimize(struct comp_d3d11_window *window);
 
 /*!
+ * Set the window's title bar / taskbar text (#1014).
+ *
+ * Used to name a hosted client's runtime-owned window after its application,
+ * so its taskbar and Alt-Tab entry identify it. Safe to call from any thread:
+ * the WM_SETTEXT is sent with a timeout, so a wedged window thread cannot
+ * stall the caller.
+ */
+void
+comp_d3d11_window_set_title(struct comp_d3d11_window *window, const char *title);
+
+/*!
  * Destroy the self-owned window.
  *
  * Posts the private WM_DXR_DESTROY_WINDOW message to the window thread and waits
