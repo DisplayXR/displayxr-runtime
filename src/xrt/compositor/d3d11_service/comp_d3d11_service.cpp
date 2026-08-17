@@ -7016,7 +7016,14 @@ try {
 			// the workspace pipeline can't hold refresh rate at depth 1
 			// (depth 1 removes all frame overlap — measured −63% fps on a
 			// saturated pipeline for ~4 ms of R), probe a return later.
-			const int tr = g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq());
+			// #964: only sample the governor while the SERVICE WINDOW is actually
+			// presenting. On the pipeline an idle loop (no client yet) or a hidden
+			// window paces on the 14/100 ms fallback, which the governor read as
+			// saturation and backed the depth off to 2 for the next 30 s -- the
+			// hosted m2p A/B measured R = 33 ms (2 periods) because of it.
+			const bool gov_sample =
+			    !pipeline_always_on(sys) || sys->workspace_mode || mc->service_window_shown;
+			const int tr = gov_sample ? g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq()) : 0;
 			if (tr != 0) {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
