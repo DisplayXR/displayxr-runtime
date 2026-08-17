@@ -26,6 +26,7 @@
 #include "util/u_misc.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
+#include "util/u_crash_guard.h"
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
@@ -1032,6 +1033,21 @@ struct d3d11_service_system
 	//! The pipeline's EXISTENCE (multi_comp, service window, panel DP, render
 	//! thread) is independent of it — see `legacy_standalone` below.
 	bool workspace_mode;
+
+	//! #1002: the D3D11 device is GONE (TDR / GPU reset / driver update).
+	//!
+	//! Latched once, from whichever site first sees a device-lost HRESULT.
+	//! Every D3D11 object created on this device is dead: textures, swap
+	//! chains, and — the reason this matters — the vendor display processor,
+	//! whose weaver dereferences the device from inside its own SDK. Left
+	//! undetected, the service ran 162 s of failing creates and then took an
+	//! access violation inside the SR weaver on an IPC thread (#1002).
+	//!
+	//! Once set, NOTHING touches the display processor again and the service
+	//! exits for relaunch after DXR_DEVICE_REMOVED_EXIT_MS.
+	std::atomic<bool> device_removed{false};
+	std::atomic<int32_t> device_removed_reason{0}; //!< GetDeviceRemovedReason()
+	std::atomic<int64_t> device_removed_ns{0};     //!< when it was latched
 
 	//! #964 (D-7): DXR_LEGACY_STANDALONE=1 — keep the pre-#964 per-client
 	//! window / swap-chain / DP path. Latched once at system create. Every new
@@ -2316,6 +2332,82 @@ pipeline_always_on(const struct d3d11_service_system *sys)
 	return sys != nullptr && !sys->legacy_standalone;
 }
 
+/*!
+ * #1002: is @p hr the device telling us it is gone?
+ *
+ * All three mean "every object on this device is dead": REMOVED (TDR, GPU
+ * reset, driver update, adapter unplug), RESET (this process caused the
+ * reset), HUNG (the GPU stopped responding to us).
+ */
+static inline bool
+d3d11_hr_is_device_lost(HRESULT hr)
+{
+	return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG;
+}
+
+/*!
+ * #1002: DEV-ONLY injection — make the first present report the device gone.
+ *
+ * A real TDR is not reproducible on demand, and the fault chain it opens
+ * (162 s of failing creates, then an access violation inside the vendor
+ * weaver) is deterministic once it starts. DXR_TEST_FAKE_DEVICE_REMOVED=1
+ * turns the first successful present into DXGI_ERROR_DEVICE_REMOVED so the
+ * whole detect -> stop-driving-the-DP -> exit-for-relaunch path can be walked.
+ * Guarded exactly like DXR_TEST_EXIT_ON_DISCONNECT: opt-in env, one shot.
+ */
+static HRESULT
+dxr_test_fake_device_removed(HRESULT hr)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_TEST_FAKE_DEVICE_REMOVED");
+		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	if (enabled != 1 || FAILED(hr)) {
+		return hr;
+	}
+	static std::atomic_flag fired = ATOMIC_FLAG_INIT;
+	if (fired.test_and_set()) {
+		return hr;
+	}
+	U_LOG_W("DXR_TEST_FAKE_DEVICE_REMOVED=1: injecting DXGI_ERROR_DEVICE_REMOVED on this present (test)");
+	return DXGI_ERROR_DEVICE_REMOVED;
+}
+
+/*!
+ * #1002: latch device-lost if @p hr says so. Returns true when it did (or when
+ * the flag was already set by an earlier site), so callers can bail.
+ *
+ * Logs exactly ONCE — the failure that follows a real removal is a flood (178
+ * failed creates in the observed incident), and one line naming the first site
+ * plus GetDeviceRemovedReason is the whole diagnostic. Safe from any thread.
+ */
+static bool
+service_note_device_lost(struct d3d11_service_system *sys, HRESULT hr, const char *site)
+{
+	if (sys == nullptr || !d3d11_hr_is_device_lost(hr)) {
+		return false;
+	}
+	bool expected = false;
+	if (sys->device_removed.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+	                                                std::memory_order_acquire)) {
+		HRESULT reason = sys->device ? sys->device->GetDeviceRemovedReason() : hr;
+		sys->device_removed_reason.store((int32_t)reason, std::memory_order_release);
+		sys->device_removed_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
+		U_LOG_E("[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX site=%s — the display processor will not be "
+		        "touched again; the service will exit for relaunch",
+		        (unsigned long)hr, (unsigned long)reason, site != nullptr ? site : "?");
+	}
+	return true;
+}
+
+//! #1002: has the device gone? Cheap relaxed read for the many gate sites.
+static inline bool
+service_device_removed(const struct d3d11_service_system *sys)
+{
+	return sys != nullptr && sys->device_removed.load(std::memory_order_acquire);
+}
+
 // Write sys->workspace_mode and mirror the flag onto the multi-comp window so
 // its WndProc's ESC-close path can distinguish empty-workspace (no focused app)
 // from true non-workspace mode — see comp_d3d11_window.cpp ESC handling.
@@ -2763,6 +2855,13 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force);
 static inline struct xrt_display_processor_d3d11 *
 panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
+	// #1002: the device is gone — the DP's weaver would dereference it from
+	// inside the vendor SDK and take the process down (the observed AV). This
+	// single gate covers every mode writer, the vendor poll, the weave service
+	// and the zone-mask publish, because they all resolve the DP through here.
+	if (service_device_removed(sys)) {
+		return nullptr;
+	}
 	if (pipeline_always_on(sys)) {
 		return sys->multi_comp != nullptr ? sys->multi_comp->display_processor : nullptr;
 	}
@@ -4068,7 +4167,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 		hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, res->atlas_texture.put());
 		if (FAILED(hr)) {
-			U_LOG_E("Workspace mode: failed to create atlas texture (hr=0x%08X)", hr);
+			service_note_device_lost(sys, hr, "init_client_render_resources/atlas"); // #1002
+			U_LOG_E("Pipeline: failed to create atlas texture (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
 
@@ -4188,6 +4288,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				    "[pipeline] client-presents output create failed (0x%08lx) — "
 				    "falling back to the service-window presenter",
 				    hr);
+				service_note_device_lost(sys, hr,
+				                         "init_client_render_resources/client_texture"); // #1002
 				res->transparent_output_fence.reset();
 				res->transparent_output_texture.reset();
 				res->back_buffer_rtv.reset();
@@ -4250,6 +4352,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				    "[pipeline] swap chain on the app's HWND %p failed (0x%08lx%s) — "
 				    "falling back to the service-window presenter",
 				    res->hwnd, hr, hr == E_ACCESSDENIED ? " E_ACCESSDENIED" : "");
+				service_note_device_lost(sys, hr,
+				                         "init_client_render_resources/app_hwnd_swapchain"); // #1002
 				res->swap_chain.reset();
 				kind = PRESENTER_SERVICE_WINDOW;
 			} else {
@@ -4500,6 +4604,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		} else {
 			U_LOG_E("Failed to create swap chain for client: 0x%08lx", hr);
 		}
+		service_note_device_lost(sys, hr, "init_client_render_resources/swapchain"); // #1002
 		fini_client_render_resources(res);
 		return XRT_ERROR_D3D11;
 	}
@@ -4589,6 +4694,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 	hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, res->atlas_texture.put());
 	if (FAILED(hr)) {
+		service_note_device_lost(sys, hr, "init_client_render_resources/atlas_legacy"); // #1002
 		U_LOG_E("Failed to create atlas texture for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
 		return XRT_ERROR_D3D11;
@@ -5094,6 +5200,13 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create shared texture [%u]: 0x%08lx", i, hr);
 			swapchain_destroy(&sc->base.base);
+			// #1002: a dead device is NOT "this creation flag is unsupported".
+			// The old blanket mapping surfaced 178 device-lost failures to apps
+			// as XR_ERROR_FEATURE_UNSUPPORTED, sending every reader down the
+			// wrong path. XRT_ERROR_D3D11 lands on XR_ERROR_RUNTIME_FAILURE.
+			if (service_note_device_lost(sys, hr, "compositor_create_swapchain/texture")) {
+				return XRT_ERROR_D3D11;
+			}
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
@@ -7378,6 +7491,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
 	    mc->swap_chain.put());
 	if (FAILED(hr)) {
+		service_note_device_lost(sys, hr, "multi_compositor_ensure_output/swapchain"); // #1002
 		U_LOG_E("Multi-comp: failed to create swap chain (hr=0x%08X)", hr);
 		return XRT_ERROR_D3D11;
 	}
@@ -7426,6 +7540,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 		hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, mc->combined_atlas.put());
 		if (FAILED(hr)) {
+			service_note_device_lost(sys, hr, "multi_compositor_ensure_output/combined_atlas"); // #1002
 			U_LOG_E("Multi-comp: failed to create combined atlas (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
@@ -7446,6 +7561,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		depth_desc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 		hr = sys->device->CreateTexture2D(&depth_desc, nullptr, mc->combined_atlas_depth.put());
 		if (FAILED(hr)) {
+			service_note_device_lost(sys, hr, "multi_compositor_ensure_output/atlas_depth"); // #1002
 			U_LOG_E("Multi-comp: failed to create combined atlas depth (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
@@ -7937,6 +8053,54 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
 	}
 }
 
+/*!
+ * #1002: THE defined action for a lost device — exit so the connect ladder
+ * brings the service back on a fresh one.
+ *
+ * There is no in-place recovery worth the risk: every texture, swap chain and
+ * (critically) the vendor display processor were built on the dead device, and
+ * the DP's internals are not ours to rebuild safely. Staying up means what was
+ * observed in #1002 — 162 s of failing creates, every new client black, then an
+ * access violation inside the SR weaver. Exiting hands clients a clean pipe
+ * break (INSTANCE_LOST) and the next connect relaunches us.
+ *
+ * The delay lets the one-shot log line flush and lets in-flight IPC calls
+ * unwind rather than dying mid-RPC. DXR_DEVICE_REMOVED_EXIT_MS=0 disables the
+ * exit entirely (the service then just runs inert, for debugging).
+ *
+ * Called from the RENDER THREAD only — never an IPC handler.
+ */
+static void
+service_device_removed_exit_if_due(struct d3d11_service_system *sys)
+{
+	static int64_t exit_ms = -1;
+	if (exit_ms < 0) {
+		const char *e = getenv("DXR_DEVICE_REMOVED_EXIT_MS");
+		exit_ms = (e != nullptr && e[0] != 0) ? atoll(e) : 2000;
+		if (exit_ms < 0) {
+			exit_ms = 0;
+		}
+	}
+	if (exit_ms == 0) {
+		return;
+	}
+	const int64_t marked_ns = sys->device_removed_ns.load(std::memory_order_acquire);
+	if (marked_ns == 0 || (int64_t)os_monotonic_get_ns() - marked_ns < exit_ms * 1000000LL) {
+		return;
+	}
+	static std::atomic_flag exiting = ATOMIC_FLAG_INIT;
+	if (exiting.test_and_set()) {
+		return;
+	}
+	U_LOG_E("[DEVICE_REMOVED] exiting for relaunch (DXR_DEVICE_REMOVED_EXIT_MS=%lld, reason=0x%08lX)",
+	        (long long)exit_ms,
+	        (unsigned long)(uint32_t)sys->device_removed_reason.load(std::memory_order_acquire));
+	// Mark orderly so the atexit tripwire does not report this as an
+	// unexplained [EXIT] — this exit is the fix, not the fault.
+	u_crash_guard_mark_orderly_exit();
+	ExitProcess(3);
+}
+
 static void
 pipeline_bind_panel_dp(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
@@ -7945,6 +8109,9 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 {
 	if (sys == nullptr || mc == nullptr || hwnd == nullptr) {
 		return;
+	}
+	if (service_device_removed(sys)) {
+		return; // #1002: never build a DP on a dead device
 	}
 	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd) {
 		return; // already bound where we want it
@@ -8095,6 +8262,10 @@ pipeline_present_app_hwnd(struct d3d11_service_compositor *c, bool paced)
 	const int64_t t0_ns = (int64_t)os_monotonic_get_ns();
 	HRESULT phr =
 	    paced ? c->render.swap_chain->Present(1, 0) : c->render.swap_chain->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+	phr = dxr_test_fake_device_removed(phr);
+	if (service_note_device_lost(c->sys, phr, "pipeline_present_app_hwnd")) { // #1002
+		return phr;
+	}
 	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	c->last_flat_present_ns = now_ns;
 
@@ -8535,6 +8706,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		}
 		if (may_present) {
 			phr = present_sc->Present(1, 0);
+			phr = dxr_test_fake_device_removed(phr);
+			(void)service_note_device_lost(sys, phr, "pipeline/service_window_present"); // #1002
 			sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 			if (SUCCEEDED(phr)) {
 				g_weave_latency_workspace.after_present("pipeline", present_sc, &g_lw_gov_workspace);
@@ -8695,6 +8868,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// period has expired. Render thread, under render_mutex — the only place
 	// a panel DP is ever actually destroyed outside teardown.
 	pipeline_dp_graveyard_sweep(mc, /*force*/ false);
+
+	// #1002: the device is gone. Do NOT crop, weave, present or re-bind the
+	// display processor — every one of those reaches into the dead device, and
+	// the DP path does it from inside the vendor SDK, where a fault is an
+	// access violation rather than an error code. Just count down to the
+	// relaunch; the render thread is where that exit belongs.
+	if (service_device_removed(sys)) {
+		static std::atomic<int64_t> s_last_log_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = s_last_log_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_E("[DEVICE_REMOVED] render thread idle — not driving the display processor");
+		}
+		service_device_removed_exit_if_due(sys);
+		return;
+	}
 
 	if (mc->suspended) {
 		// Workspace deactivated — don't render, wait for re-activation.
@@ -11074,9 +11263,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 		if (may_present) {
-			mc->swap_chain->Present(1, 0);
-			g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
-			                                        &g_lw_gov_workspace);
+			// #1002: this HRESULT used to be discarded, so a removed device was
+			// invisible to the compose path forever.
+			HRESULT phr = mc->swap_chain->Present(1, 0);
+			phr = dxr_test_fake_device_removed(phr);
+			if (!service_note_device_lost(sys, phr, "compose/service_window_present")) {
+				g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
+				                                        &g_lw_gov_workspace);
+			}
 		}
 	}
 
@@ -14484,6 +14678,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		int64_t present_deadline_ns = (int64_t)os_monotonic_get_ns() + 50LL * 1000000LL;
 		for (;;) {
 			phr = c->render.swap_chain->Present(1, DXGI_PRESENT_DO_NOT_WAIT);
+			phr = dxr_test_fake_device_removed(phr);
+			(void)service_note_device_lost(sys, phr, "standalone_present"); // #1002
 			if (phr != DXGI_ERROR_WAS_STILL_DRAWING) {
 				break; // presented (or a real error — either way, done)
 			}
@@ -16055,6 +16251,17 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 {
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
+	// #1002: the device is gone; every resource this session needs would fail
+	// to create. Refuse honestly (-> XR_ERROR_RUNTIME_FAILURE) instead of
+	// handing back a session whose every frame is black — the observed incident
+	// had 178 such creations fail over 162 s. The service is already counting
+	// down to its relaunch.
+	if (service_device_removed(sys)) {
+		U_LOG_E("[DEVICE_REMOVED] refusing a new session — the D3D11 device is gone (reason=0x%08lX)",
+		        (unsigned long)(uint32_t)sys->device_removed_reason.load(std::memory_order_acquire));
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
 	// #342 / ADR-020: re-derive dp_factory_* from the plug-in loader before
 	// any per-client DP-factory read in this function (and downstream
 	// `multi_compositor_ensure_output` calls). Picks up a vendor plug-in
@@ -16814,6 +17021,12 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
 static struct xrt_display_processor_d3d11 *
 resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compositor *xc)
 {
+	// #1002: dead device — hand out no DP at all; callers then fall back to
+	// their default eye pair instead of faulting inside the vendor weaver.
+	if (service_device_removed(sys)) {
+		return nullptr;
+	}
+
 	// Workspace mode / #964 pipeline: per-client compositors have no DP of
 	// their own — the multi-compositor owns the one panel DP (D-4).
 	if ((sys->workspace_mode || pipeline_always_on(sys)) && sys->multi_comp != nullptr) {
@@ -17159,8 +17372,10 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 
 	// Try to get display dimensions from display processor.
 	// In workspace mode, use multi-comp's DP; in normal mode, use active compositor's DP.
+	// #1002: a lost device means no DP call at all -- fall through to the
+	// cached xrt_system_compositor_info values below, which are still true.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	if (sys->workspace_mode && sys->multi_comp != nullptr) {
+	if (!service_device_removed(sys) && sys->workspace_mode && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 	}
 	if (dp == nullptr) {
@@ -17211,7 +17426,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	struct xrt_display_processor_d3d11 *dp = nullptr;
 	HWND metrics_hwnd = nullptr;
 
-	if (sys->workspace_mode && sys->multi_comp != nullptr &&
+	if (!service_device_removed(sys) && sys->workspace_mode && sys->multi_comp != nullptr && // #1002
 	    sys->multi_comp->display_processor != nullptr && sys->multi_comp->hwnd != nullptr) {
 		dp = sys->multi_comp->display_processor;
 		metrics_hwnd = sys->multi_comp->hwnd;
@@ -17837,7 +18052,7 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 
 	// Get display screen position from DP (needed for display_screen_left/top)
 	int32_t disp_left = 0, disp_top = 0;
-	if (mc->display_processor != nullptr) {
+	if (mc->display_processor != nullptr && !service_device_removed(sys)) { // #1002
 		xrt_display_processor_d3d11_get_display_pixel_info(
 		    mc->display_processor, NULL, NULL, &disp_left, &disp_top);
 	}
@@ -19149,6 +19364,15 @@ comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc)
 }
 
 extern "C" bool
+comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+	return service_device_removed(d3d11_service_system_from_xrt(xsysc));
+}
+
+extern "C" bool
 comp_d3d11_service_focus_is_authoritative(struct xrt_system_compositor *xsysc)
 {
 	// #964 (D-5): on the pipeline the compositor slot table is the SOLE focus
@@ -19553,6 +19777,9 @@ comp_d3d11_service_force_display_3d(struct xrt_system_compositor *xsysc)
 	// (DP request, sync_tile_layout, hardware_display_3d update); the
 	// apply_pending FLIPPING handler then waits for the hardware to
 	// actually settle before dropping the curtain.
+	if (service_device_removed(sys)) {
+		return false; // #1002: dead device -- no lens hint to give
+	}
 	if (mc->display_processor == nullptr) {
 		U_LOG_W("[force_3d] no DP yet — caller should retry after DP attach");
 		return false;
@@ -19992,7 +20219,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 
 		// Recreate display processor via factory (window + swap chain still alive)
 		void *dp_fac_resume = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
-		if (mc->display_processor == nullptr && dp_fac_resume != NULL) {
+		if (mc->display_processor == nullptr && dp_fac_resume != NULL && !service_device_removed(sys)) {
 			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_resume;
 			xrt_result_t dp_ret = factory(
 			    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);

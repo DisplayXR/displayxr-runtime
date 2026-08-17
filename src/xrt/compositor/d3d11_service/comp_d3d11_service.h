@@ -775,6 +775,20 @@ int
 comp_d3d11_service_get_focused_slot(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #1002: has the D3D11 device been lost (TDR / GPU reset / driver update)?
+ *
+ * Once true the service drives no display processor, refuses new sessions and
+ * is counting down to an orderly exit so the connect ladder relaunches it on a
+ * fresh device. Exposed so the IPC layer's `[HEALTH]` summary can say so —
+ * the observed incident was 162 s of silent failure with nothing in the log
+ * naming the cause.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc);
+
+/*!
  * #964 (D-5): is the COMPOSITOR the one focus authority right now?
  *
  * True on the always-on pipeline (i.e. always, unless DXR_LEGACY_STANDALONE=1):
