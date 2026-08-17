@@ -2204,6 +2204,29 @@ struct d3d11_multi_compositor
 	HWND focus_fg_last;
 	int focus_fg_stable;
 
+	//! #964 Phase A (workspace scope): the slot whose OWN window is the
+	//! debounced OS foreground WHILE A CONTROLLER IS ATTACHED — the
+	//! "foreground override". -1 = none, i.e. the workspace compose path runs
+	//! as it always did.
+	//!
+	//! The user must never have to kill the shell to use another IPC app:
+	//! Alt-Tab to a client's window and that client goes live on the panel for
+	//! as long as it holds the foreground. This is a per-FRAME render decision
+	//! only — the controller session, its slots, chrome, poses and mode-flip
+	//! state are all untouched, and `mc->suspended` never moves.
+	//!
+	//! Written by the render thread under render_mutex; read by
+	//! `client_holds_panel_lease` on IPC threads, hence atomic.
+	std::atomic<int32_t> foreground_override_slot{-1};
+
+	//! #964 Phase A: an override just ended and the panel DP is still bound to
+	//! the client's window. The render thread re-binds it to `mc->hwnd` and
+	//! re-asserts the controller's mode before letting the compose path weave.
+	//! Deadline-bounded: with no vendor plug-in the DP never binds, and this
+	//! must not latch forever. Render thread only.
+	bool foreground_override_restore;
+	int64_t foreground_override_restore_deadline_ns;
+
 	//! Phase 2.K: vsync-aligned frame counter. Incremented once per
 	//! `multi_compositor_render` and read by the public-API drain to emit
 	//! FRAME_TICK events (capped per-batch) so controllers can pace
@@ -2880,6 +2903,20 @@ static inline bool
 client_holds_panel_lease(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
 	if (sys->workspace_mode) {
+		/* #964 Phase A: ...UNLESS the user Alt-Tabbed to this client's own
+		 * window. The render thread is then presenting THIS client to the
+		 * panel instead of the workspace compose (the foreground override),
+		 * so its mode requests are the ones that must land — otherwise the
+		 * app is live on the panel but cannot get it out of 2D. Written by
+		 * the render thread under render_mutex; the callers here hold the
+		 * fair lock, and the atomic makes the read correct regardless. */
+		struct d3d11_multi_compositor *mc = sys->multi_comp;
+		if (mc != nullptr && pipeline_always_on(sys)) {
+			int32_t ov = mc->foreground_override_slot.load(std::memory_order_acquire);
+			if (ov >= 0 && ov < D3D11_MULTI_MAX_CLIENTS && mc->clients[ov].compositor == c) {
+				return true;
+			}
+		}
 		return false; // the controller holds it; it never asks per-client
 	}
 	return c->state_focused;
@@ -6861,6 +6898,16 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys,
 			mc->clients[i].active = false;
 			mc->clients[i].compositor = nullptr;
 			mc->client_count--;
+			// #964 Phase A: the client holding the foreground override just
+			// left. The render thread would notice next frame anyway (a dead
+			// slot never matches), but drop it here so no lease read can see
+			// a stale index in between.
+			if (mc->foreground_override_slot.load(std::memory_order_relaxed) == i) {
+				mc->foreground_override_slot.store(-1, std::memory_order_release);
+				mc->foreground_override_restore = true;
+				mc->foreground_override_restore_deadline_ns =
+				    (int64_t)os_monotonic_get_ns() + 2000LL * 1000000LL;
+			}
 			if (mc->focused_slot == i) {
 				// ADR-018: the disconnecting client held focus. Clear it so
 				// keyboard forwarding never targets a freed slot, but DON'T
@@ -8587,22 +8634,109 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 #define PIPELINE_FOCUS_FG_STABLE_FRAMES 2
 
 /*!
+ * #964 Phase A: sample the OS foreground window, debounced.
+ *
+ * Normalised to its root window: a client may activate a child/owned window (a
+ * dialog, a Chromium widget host) and we still want the top-level identity the
+ * presenter was bound to. (The GA_ROOT caveat elsewhere in the tree is about
+ * weave PHASE coordinates — identity matching is exactly what GA_ROOT is for.)
+ *
+ * Returns the foreground root once it has held for
+ * PIPELINE_FOCUS_FG_STABLE_FRAMES consecutive samples, else nullptr. Call
+ * EXACTLY ONCE per frame — it advances the debounce counter. Render thread,
+ * under render_mutex; `GetForegroundWindow`/`GetAncestor` are cheap,
+ * non-blocking reads of the shell's global state (no cross-process
+ * SendMessage).
+ */
+static HWND
+pipeline_sample_foreground(struct d3d11_multi_compositor *mc)
+{
+	HWND fg = GetForegroundWindow();
+	if (fg != nullptr) {
+		HWND root = GetAncestor(fg, GA_ROOT);
+		if (root != nullptr) {
+			fg = root;
+		}
+	}
+	if (fg != mc->focus_fg_last) {
+		mc->focus_fg_last = fg;
+		mc->focus_fg_stable = 1;
+	} else if (mc->focus_fg_stable < PIPELINE_FOCUS_FG_STABLE_FRAMES) {
+		mc->focus_fg_stable++;
+	}
+	if (fg == nullptr || mc->focus_fg_stable < PIPELINE_FOCUS_FG_STABLE_FRAMES) {
+		return nullptr;
+	}
+	return fg;
+}
+
+/*!
+ * #964 Phase A: the window @p slot presents THROUGH, or NULL when that is the
+ * shared service window (which names no single client).
+ */
+static HWND
+pipeline_slot_own_window(const struct d3d11_multi_client_slot *slot)
+{
+	const struct d3d11_service_compositor *c = slot->compositor;
+	if (c == nullptr) {
+		return nullptr;
+	}
+	HWND presented = nullptr;
+	switch (c->presenter) {
+	// Both hold the app's own `external_window_handle`; CLIENT_TEXTURE just
+	// has no swap chain on it (the app presents the shared texture itself).
+	case PRESENTER_APP_HWND:
+	case PRESENTER_CLIENT_TEXTURE: presented = c->render.hwnd; break;
+	case PRESENTER_SELF: presented = c->render.weave_hwnd; break;
+	default: break;
+	}
+	if (presented != nullptr) {
+		return presented;
+	}
+	// The app's own window counts for EVERY presenter kind: a hosted client
+	// can still own a real HWND the user Alt-Tabs to.
+	if (slot->app_hwnd != nullptr) {
+		return slot->app_hwnd;
+	}
+	return c->app_hwnd;
+}
+
+/*!
+ * #964 Phase A: which PRESENTING slot owns @p fg as its own window? -1 = none.
+ *
+ * "Own" excludes the shared service window on purpose — see pipeline_pick_focus
+ * for how a foreground match on `mc->hwnd` is resolved among hosted clients.
+ */
+static int32_t
+pipeline_slot_for_foreground(struct d3d11_multi_compositor *mc, HWND fg)
+{
+	if (fg == nullptr || (mc->hwnd != nullptr && fg == mc->hwnd)) {
+		return -1;
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[s];
+		if (!pipeline_slot_presenting(slot)) {
+			continue;
+		}
+		HWND own = pipeline_slot_own_window(slot);
+		if (own != nullptr && own == fg) {
+			return s;
+		}
+	}
+	return -1;
+}
+
+/*!
  * #964 Phase A (D-3/D-5): pick the slot that owns the panel this frame.
  *
  * "Focus follows the OS foreground window": when the user Alt-Tabs to (or
  * clicks) a client's window, that client takes the panel. No hotkeys — the
  * runtime never *steals* activation, it only follows it.
  *
- * A slot matches the foreground window when the foreground HWND is the window
- * that slot presents through:
- *   - APP_HWND / CLIENT_TEXTURE : `c->render.hwnd` (both are the app's own
- *     `external_window_handle`; CLIENT_TEXTURE just has no swap chain on it)
- *   - SELF (present-owner)      : `c->render.weave_hwnd`
- *   - SERVICE_WINDOW (hosted)   : `mc->hwnd` — the ONE service window, so it
- *     cannot tell two hosted clients apart. Prefer the current holder if it is
- *     hosted, else the newest hosted slot.
- * A client's own `app_hwnd` also counts for any presenter kind, so a hosted
- * client that still owns a real window is reachable by Alt-Tabbing to it.
+ * Match rules are pipeline_slot_own_window's, plus the shared service window:
+ * `mc->hwnd` is the ONE window every hosted (SERVICE_WINDOW) client presents
+ * through, so it cannot tell two of them apart. A match on it keeps the current
+ * holder if that holder is hosted, else takes the newest hosted slot.
  *
  * When the foreground window belongs to no client at all (an editor, a
  * terminal, the desktop) the panel does NOT change hands: the current holder
@@ -8610,12 +8744,9 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
  * fallback (#962) pick its successor — which is also the rule at cold start,
  * before anything has ever been focused.
  *
- * Render thread, under render_mutex. `GetForegroundWindow`/`GetAncestor` are
- * cheap, non-blocking reads of the shell's global state (no cross-process SendMessage).
- *
- * Called only from pipeline_default_policy_render, i.e. only under
- * `pipeline_always_on(sys) && !sys->workspace_mode`: with a controller
- * attached the controller owns focus, and the legacy path never gets here.
+ * Called only from pipeline_default_policy_render. Under a controller the
+ * controller owns `focused_slot`; the foreground override there is a per-frame
+ * presenter decision that never touches it (see multi_compositor_render).
  *
  * @param[out] out_reason "foreground" | "newest" | "fallback" — why the
  *                        returned slot won. Only meaningful on a change.
@@ -8642,71 +8773,37 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 		}
 	}
 
-	/* (b) Sample the OS foreground, normalised to its root window: a client
-	 * may activate a child/owned window (a dialog, a Chromium widget host) and
-	 * we still want the top-level identity we bound the presenter to. (The
-	 * GA_ROOT caveat elsewhere in the tree is about weave PHASE coordinates —
-	 * identity matching is exactly what GA_ROOT is for.) */
-	HWND fg = GetForegroundWindow();
-	if (fg != nullptr) {
-		HWND root = GetAncestor(fg, GA_ROOT);
-		if (root != nullptr) {
-			fg = root;
-		}
-	}
-	if (fg != mc->focus_fg_last) {
-		mc->focus_fg_last = fg;
-		mc->focus_fg_stable = 1;
-	} else if (mc->focus_fg_stable < PIPELINE_FOCUS_FG_STABLE_FRAMES) {
-		mc->focus_fg_stable++;
-	}
-	const bool fg_settled = fg != nullptr && mc->focus_fg_stable >= PIPELINE_FOCUS_FG_STABLE_FRAMES;
+	/* (b) Debounced foreground sample — once per frame, here. */
+	HWND fg = pipeline_sample_foreground(mc);
 
-	/* (c) Does the settled foreground window belong to a presenting client? */
-	if (fg_settled) {
-		int32_t match = -1;
-		int32_t hosted = -1; // best SERVICE_WINDOW candidate when fg == mc->hwnd
-		const bool fg_is_service_window = (mc->hwnd != nullptr && fg == mc->hwnd);
+	/* (c) A client's own window in the foreground wins outright. */
+	int32_t match = pipeline_slot_for_foreground(mc, fg);
+	if (match >= 0) {
+		*out_reason = "foreground";
+		return match;
+	}
 
-		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS && match < 0; s++) {
+	/* (c') The shared service window in the foreground: the focused HOSTED
+	 * client keeps it, else the newest hosted client takes it. */
+	if (fg != nullptr && mc->hwnd != nullptr && fg == mc->hwnd) {
+		int32_t hosted = -1;
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			struct d3d11_multi_client_slot *slot = &mc->clients[s];
-			if (!pipeline_slot_presenting(slot)) {
+			if (!pipeline_slot_presenting(slot) ||
+			    slot->compositor->presenter != PRESENTER_SERVICE_WINDOW) {
 				continue;
 			}
-			struct d3d11_service_compositor *c = slot->compositor;
-
-			HWND presented = nullptr;
-			switch (c->presenter) {
-			case PRESENTER_APP_HWND:
-			case PRESENTER_CLIENT_TEXTURE: presented = c->render.hwnd; break;
-			case PRESENTER_SELF: presented = c->render.weave_hwnd; break;
-			default: break;
-			}
-
-			// The app's own window counts for EVERY presenter kind: a hosted
-			// client can still own a real HWND the user Alt-Tabs to.
-			if ((presented != nullptr && presented == fg) ||
-			    (slot->app_hwnd != nullptr && slot->app_hwnd == fg) ||
-			    (c->app_hwnd != nullptr && c->app_hwnd == fg)) {
-				match = s;
+			if (s == cur) {
+				hosted = s; // the current holder wins outright
 				break;
 			}
-
-			if (fg_is_service_window && c->presenter == PRESENTER_SERVICE_WINDOW) {
-				if (s == cur) {
-					hosted = s; // the current holder wins outright
-				} else if (hosted != cur &&
-				           (hosted < 0 || slot->first_frame_ns >= mc->clients[hosted].first_frame_ns)) {
-					hosted = s;
-				}
+			if (hosted < 0 || slot->first_frame_ns >= mc->clients[hosted].first_frame_ns) {
+				hosted = s;
 			}
 		}
-		if (match < 0) {
-			match = hosted;
-		}
-		if (match >= 0) {
+		if (hosted >= 0) {
 			*out_reason = "foreground";
-			return match;
+			return hosted;
 		}
 	}
 
@@ -8720,12 +8817,57 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 }
 
 /*!
+ * #964 (D-4): re-arm @p slot's standing mode wish into its pending request.
+ *
+ * With one DP per panel nothing else does: the legacy path gave every client
+ * its own DP and the vendor SDK OR'd the live hints, so a departing client's 2D
+ * hint vanished with its DP. Here the panel keeps the last holder's mode —
+ * observed as a handle app wanting 2D exiting and the hosted app wanting 3D
+ * inheriting a flat panel.
+ *
+ * We re-arm `pending_*` rather than driving the DP here: the new holder's next
+ * commit runs them through the ordinary service_apply_pending_mode path, so the
+ * lease check (which it now passes), the DP-first ordering of
+ * apply_mode_transition and the denial events all stay in exactly one place. A
+ * client with no wish leaves the panel untouched.
+ *
+ * Render thread, under render_mutex.
+ */
+static void
+pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const char *tag)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *nc = mc->clients[slot].compositor;
+	int32_t wish_mode = nc->wish_content_mode.load(std::memory_order_acquire);
+	int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
+	if (wish_mode < 0 && wish_hw < 0) {
+		return;
+	}
+	if (wish_mode >= 0) {
+		nc->pending_content_mode.store((uint32_t)wish_mode, std::memory_order_release);
+	}
+	if (wish_hw >= 0) {
+		nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
+	}
+	U_LOG_W("[pipeline] %s -> slot %d: re-arming wish content=%d hw=%d", tag, slot, (int)wish_mode, wish_hw);
+}
+
+/*!
  * #964 (D-3): THE default presenter policy. Runs on the render thread with
  * render_mutex held, in place of the compose path, whenever no workspace
  * controller is driving.
+ *
+ * @param forced_focus -1 = pick focus normally (the default policy owns
+ *        `mc->focused_slot`). >= 0 = the FOREGROUND OVERRIDE under a controller
+ *        (#964 Phase A workspace scope): present exactly that slot this frame
+ *        and do not touch `mc->focused_slot` — that is the controller's.
  */
 static void
-pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+pipeline_default_policy_render(struct d3d11_service_system *sys,
+                               struct d3d11_multi_compositor *mc,
+                               int32_t forced_focus)
 {
 	/* Stage timing. The whole pass runs on the render thread holding
 	 * render_mutex, so any stall here shows up as [RENDER] capture_avg_us AND
@@ -8743,7 +8885,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 	 * FOREGROUND window (pipeline_pick_focus), with newest-presenting (#962)
 	 * as the cold-start / holder-departed fallback. */
 	int32_t focused = mc->focused_slot;
-	{
+	if (forced_focus >= 0) {
+		/* Foreground override: the CONTROLLER still owns `mc->focused_slot`
+		 * (and everything hanging off it — chrome, input forwarding, the
+		 * FOCUS_CHANGED event stream). We only borrow the presenter. */
+		focused = forced_focus;
+	} else {
 		const char *reason = "newest";
 		int32_t best = pipeline_pick_focus(sys, mc, &reason);
 		if (best != mc->focused_slot) {
@@ -8752,37 +8899,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 			multi_compositor_update_input_forward(mc);
 			service_signal_workspace_wakeup(sys);
 
-			/* #964 (D-4): re-arm the NEW holder's standing wish. With one DP
-			 * per panel nothing else does: the legacy path gave every client
-			 * its own DP and the vendor SDK OR'd the live hints, so a departing
-			 * client's 2D hint vanished with its DP. Here the panel keeps the
-			 * last holder's mode — observed as a handle app wanting 2D exiting
-			 * and the hosted app wanting 3D inheriting a flat panel.
-			 *
-			 * We re-arm `pending_*` rather than driving the DP here: the new
-			 * holder's next commit runs them through the ordinary
-			 * service_apply_pending_mode path, so the lease check (which it now
-			 * passes), the DP-first ordering of apply_mode_transition and the
-			 * denial events all stay in exactly one place. Also covers the
-			 * workspace deactivate -> default policy resume, which clears
-			 * focused_slot and therefore lands in this branch on the next tick.
-			 * A client with no wish leaves the panel untouched. */
-			if (best >= 0 && mc->clients[best].compositor != nullptr) {
-				struct d3d11_service_compositor *nc = mc->clients[best].compositor;
-				int32_t wish_mode = nc->wish_content_mode.load(std::memory_order_acquire);
-				int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
-				if (wish_mode >= 0 || wish_hw >= 0) {
-					if (wish_mode >= 0) {
-						nc->pending_content_mode.store((uint32_t)wish_mode,
-						                               std::memory_order_release);
-					}
-					if (wish_hw >= 0) {
-						nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
-					}
-					U_LOG_W("[pipeline] focus -> slot %d: re-arming wish content=%d hw=%d", best,
-					        (int)wish_mode, wish_hw);
-				}
-			}
+			/* Covers the workspace deactivate -> default policy resume too,
+			 * which clears focused_slot and so lands in this branch next tick. */
+			pipeline_rearm_focus_wish(mc, best, "focus");
 		}
 		focused = best;
 	}
@@ -8821,8 +8940,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys, struct d3d11_mu
 		kind = PRESENTER_NONE;
 	}
 
-	/* (d) The service window is visible only while it IS the presenter. */
-	{
+	/* (d) The service window is visible only while it IS the presenter — under
+	 * the DEFAULT policy. Under a controller (foreground override) it stays
+	 * shown: hiding it would take the workspace out of the Alt-Tab list, and
+	 * Alt-Tabbing back to the workspace is exactly how the override ends. */
+	if (forced_focus < 0) {
 		bool want_shown = (kind == PRESENTER_SERVICE_WINDOW);
 		if (want_shown != mc->service_window_shown && mc->window != nullptr) {
 			mc->service_window_shown = want_shown;
@@ -9393,8 +9515,77 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// every frame (measured: 218 lines in 225 ms) with the panel never
 		// changing. Same order as the compose path: drain first.
 		service_ws_cmd_drain(sys);
-		pipeline_default_policy_render(sys, mc);
+		pipeline_default_policy_render(sys, mc, /*forced_focus*/ -1);
 		return;
+	}
+
+	/* #964 Phase A (workspace scope): FOREGROUND OVERRIDE.
+	 *
+	 * A controller IS attached, but the user Alt-Tabbed to some other IPC
+	 * app's own window. Killing the shell to use that app is not acceptable,
+	 * so for as long as that window holds the OS foreground the render thread
+	 * runs the DIRECT path for its client instead of the workspace compose:
+	 * the panel DP re-binds to that presenter's window and the app is live on
+	 * the panel. Nothing else moves — no deactivate, no policy switch,
+	 * `mc->suspended`, the slot table, chrome, poses and the acked-flip state
+	 * are all exactly as the controller left them, and `mc->focused_slot`
+	 * stays the controller's (pipeline_default_policy_render takes the slot as
+	 * a parameter rather than picking one).
+	 *
+	 * Only a client's OWN window overrides: the workspace/service window and
+	 * any non-client window (editor, terminal, desktop) mean "compose as
+	 * today", so Alt-Tabbing back to the workspace ends the override.
+	 */
+	if (pipeline_always_on(sys)) {
+		const int32_t prev_override = mc->foreground_override_slot.load(std::memory_order_relaxed);
+		const int32_t override_slot = pipeline_slot_for_foreground(mc, pipeline_sample_foreground(mc));
+
+		if (override_slot != prev_override) {
+			if (override_slot >= 0) {
+				U_LOG_W("[pipeline] foreground override -> slot %d ('%s')", override_slot,
+				        mc->clients[override_slot].app_name[0] != '\0'
+				            ? mc->clients[override_slot].app_name
+				            : "?");
+				// The overridden client holds the panel lease while it is up
+				// (client_holds_panel_lease reads this), so its standing mode
+				// wish is the one that should be on the panel.
+				mc->foreground_override_slot.store(override_slot, std::memory_order_release);
+				pipeline_rearm_focus_wish(mc, override_slot, "foreground override");
+			} else {
+				U_LOG_W("[pipeline] foreground override ended — workspace compose resumes");
+				mc->foreground_override_slot.store(-1, std::memory_order_release);
+				// The panel DP is still bound to the client's window; put it
+				// back on the service window and re-assert the controller's
+				// own mode before the compose path weaves again.
+				mc->foreground_override_restore = true;
+				mc->foreground_override_restore_deadline_ns =
+				    (int64_t)os_monotonic_get_ns() + 2000LL * 1000000LL;
+			}
+		}
+
+		if (override_slot >= 0) {
+			// Same order as the default path: drain the S3 ring first.
+			service_ws_cmd_drain(sys);
+			pipeline_default_policy_render(sys, mc, override_slot);
+			return;
+		}
+
+		if (mc->foreground_override_restore) {
+			// One DP per panel, back on the service window (D-4). The rebind
+			// can defer a frame or two (a just-retired DP still owns the
+			// window) and does nothing at all with no vendor plug-in, so the
+			// latch is deadline-bounded rather than "until it binds".
+			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false);
+			const bool bound = mc->display_processor != nullptr && mc->panel_dp_hwnd == mc->hwnd;
+			if (bound || (int64_t)os_monotonic_get_ns() >= mc->foreground_override_restore_deadline_ns) {
+				mc->foreground_override_restore = false;
+				// Re-assert the controller's settled state on the panel: the
+				// override client may have driven the lens somewhere else.
+				(void)service_request_mode_transition(sys, nullptr, UINT32_MAX,
+				                                      sys->hardware_display_3d,
+				                                      /*skip_dp*/ false, "override_end");
+			}
+		}
 	}
 
 	// ADR-018: the runtime no longer consumes TAB to cycle focus. TAB is
@@ -20605,8 +20796,12 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			capture_render_thread_start(sys);
 		}
 
-		// Hide every app-owned window — under a controller the app's pixels
-		// reach the panel through the composed atlas, not its own HWND.
+		// Get every app-owned window out of the way — under a controller the
+		// app's pixels reach the panel through the composed atlas, not its own
+		// HWND. MINIMIZE, not hide (#964 Phase A): a hidden window is gone from
+		// the taskbar and Alt-Tab, so the user could not get back to an app
+		// without killing the shell. Minimized it stays reachable, and
+		// Alt-Tabbing to it restores it -> foreground -> foreground override.
 		// Async: the app's UI thread may be blocked in an IPC call.
 		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 			struct d3d11_multi_client_slot *slot = &pmc->clients[i];
@@ -20614,7 +20809,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 				continue;
 			}
 			if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
-				ShowWindowAsync(slot->app_hwnd, SW_HIDE);
+				ShowWindowAsync(slot->app_hwnd, SW_MINIMIZE);
 			}
 		}
 
@@ -20630,6 +20825,12 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		}
 		// The controller owns focus from here; it places + focuses each client.
 		pmc->focused_slot = -1;
+		// #964 Phase A: the workspace window is about to take the foreground,
+		// so no override is live; start the debounce from a clean slate.
+		pmc->foreground_override_slot.store(-1, std::memory_order_release);
+		pmc->foreground_override_restore = false;
+		pmc->focus_fg_last = nullptr;
+		pmc->focus_fg_stable = 0;
 		U_LOG_W("[pipeline] workspace activated — policy switch only, nothing rebuilt");
 		return true;
 	}
@@ -20803,6 +21004,13 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 
 		// The default rule re-picks on the next render tick.
 		mc->focused_slot = -1;
+		// #964 Phase A: the controller is gone (Ctrl+Space, or it disconnected
+		// mid-override) — the default policy owns the panel again, so drop the
+		// override and let pipeline_pick_focus start from a clean debounce.
+		mc->foreground_override_slot.store(-1, std::memory_order_release);
+		mc->foreground_override_restore = false;
+		mc->focus_fg_last = nullptr;
+		mc->focus_fg_stable = 0;
 
 		// #961/#761: a flip still waiting on app acks can never land now — tell
 		// the apps it did not happen rather than stranding them in the target.
