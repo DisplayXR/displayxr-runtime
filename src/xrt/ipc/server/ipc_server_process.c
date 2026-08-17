@@ -642,8 +642,17 @@ emit_health_if_elapsed(struct ipc_server *s)
 	} else {
 		snprintf(lease, sizeof(lease), "none");
 	}
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s window_s=%ld", active, s->max_clients, active_idx, lease,
-	        period_ms / 1000);
+	// #1002: name the device state here too. A lost device makes every client
+	// fail identically and silently; one word in the summary line is the
+	// difference between "why is everything black" and a known cause.
+	const char *device_state = "ok";
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc != NULL && comp_d3d11_service_device_is_removed(s->xsysc)) {
+		device_state = "REMOVED";
+	}
+#endif
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s window_s=%ld", active, s->max_clients,
+	        active_idx, lease, device_state, period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
 
