@@ -506,10 +506,12 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
-	//! #1019: when this client last passed the commit-pacing gate (monotonic
-	//! ns). Only a client arriving EARLY — faster than the display can show it
-	//! — is made to wait; an app already paced by xrWaitFrame never is.
-	int64_t last_commit_pace_ns;
+	//! #1019: this client's next commit-pacing deadline (monotonic ns, 0 =
+	//! unsynced). ABSOLUTE and advanced by exactly one display period per
+	//! commit, so render/commit time is absorbed inside the interval rather
+	//! than added to it — a "sleep the remainder" schedule drifts past one
+	//! period and lands the presenter at half rate.
+	int64_t pace_deadline_ns;
 
 	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
 	//! client's own claim). Set by the IPC server right after session create.
@@ -15745,36 +15747,52 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		 * rather than any client swap chain: a pipeline client may have no
 		 * chain of its own at all.
 		 */
-		const double pace_period_ns = 1e9 / (sys->refresh_rate > 0.0f ? sys->refresh_rate : 60.0f);
-		const int64_t pace_now_ns = (int64_t)os_monotonic_get_ns();
-		const int64_t since_ns = c->last_commit_pace_ns != 0 ? pace_now_ns - c->last_commit_pace_ns : INT64_MAX;
+		/*
+		 * ABSOLUTE schedule, not "sleep the remainder".
+		 *
+		 * Sleeping period-minus-elapsed measured from the END of the previous
+		 * commit makes the loop period `period + render/commit time`, which is
+		 * strictly longer than one display period — so the presenter misses
+		 * every other vblank and settles at half rate. Measured exactly that:
+		 * cadence a perfect 16.8 ms but present ~350/10 s with ~250 skips (the
+		 * ~600 attempts are all there; half of them just land too late).
+		 *
+		 * Advancing an absolute deadline by exactly one period each commit
+		 * removes the drift: the work time is absorbed INSIDE the interval
+		 * instead of being added to it. Same property that made legacy's
+		 * tick-aligned compositor-clock wait hold full rate for years.
+		 *
+		 * Resync when more than a period late (a stalled or newly-started
+		 * client) so we never try to "catch up" by not sleeping at all for a
+		 * burst of frames.
+		 */
+		const int64_t pace_period_ns = (int64_t)(1e9 / (sys->refresh_rate > 0.0f ? sys->refresh_rate : 60.0f));
 		// DXR_COMMIT_PACE=0 turns the backpressure off (A/B lever, and the
 		// escape hatch if a client turns out to need to run free).
 		static int pace_on = -1;
 		if (pace_on < 0) {
 			const char *e = getenv("DXR_COMMIT_PACE");
-			pace_on = (e != nullptr && e[0] == '0') ? 0 : 1;
+			pace_on = (e == nullptr || e[0] == 0) ? 1 : (e[0] - '0');
+			if (pace_on < 0 || pace_on > 2) {
+				pace_on = 1;
+			}
 		}
-		// Sleep out the REMAINDER of this client's display period — a plain
-		// duration, deliberately NOT the compositor clock.
-		//
-		// Phase-aligning here was measurably worse. Waiting on
-		// DCompositionWaitForCompositorClock parks the client's IPC thread on
-		// the SAME tick the render thread paces to, so both wake together and
-		// the client's atlas blit lands on the shared immediate context right
-		// as the render thread wants it — a convoy. Measured with the hosted
-		// cube: commit cadence went to a perfect 16.6 ms either way, but
-		// pipe_active_present fell 580 -> ~350 per 10 s (skip 12 -> ~250) with
-		// the clock wait, and stayed at ~580 with this sleep. Sleeping a
-		// duration leaves each client at whatever phase it already had, so
-		// they spread across the interval instead of stacking on one edge.
-		//
-		// Bounded by construction: at most one display period, and only for a
-		// client that has ALREADY committed more recently than that.
-		if (pace_on && since_ns < (int64_t)pace_period_ns) {
-			os_nanosleep((int64_t)pace_period_ns - since_ns);
+		if (pace_on == 2) {
+			// Legacy shape: tick-align on DWM's compositor clock, every
+			// commit, unconditionally — what the per-client Present path did
+			// for years. Bounded by the helper's 4-100 ms clamp (#925).
+			(void)late_weave_wait_compositor_clock((double)pace_period_ns);
+		} else if (pace_on) {
+			const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			if (c->pace_deadline_ns == 0 || now_ns > c->pace_deadline_ns + pace_period_ns) {
+				c->pace_deadline_ns = now_ns + pace_period_ns; // (re)sync
+			} else {
+				if (now_ns < c->pace_deadline_ns) {
+					os_nanosleep(c->pace_deadline_ns - now_ns);
+				}
+				c->pace_deadline_ns += pace_period_ns;
+			}
 		}
-		c->last_commit_pace_ns = (int64_t)os_monotonic_get_ns();
 	}
 
 	if (sys->workspace_mode || pipeline_always_on(sys)) {
