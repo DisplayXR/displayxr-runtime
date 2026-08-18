@@ -408,6 +408,31 @@ struct xrt_display_processor_d3d11
 	                         uint64_t weave_to_scanout_ns,
 	                         uint64_t frame_period_ns);
 
+	/*!
+	 * Re-bind the display processor to a different window WITHOUT
+	 * recreating the weaver (#1008).
+	 *
+	 * The D3D11 weaver takes its interlace phase and target size from the
+	 * window it was created against, so the runtime's only way to follow a
+	 * presenter change was destroy + async recreate — ~200 ms of flat blit
+	 * on every focus change, plus a graveyard entry per rebind (one DP per
+	 * HWND at a time). This makes the common case free.
+	 *
+	 * @return true when the re-bind was performed; false when unsupported,
+	 *         in which case the runtime falls back to destroy + recreate.
+	 *
+	 * The new HWND must be on the same display. May be called from the
+	 * runtime's RENDER THREAD, so it must be bounded (no blocking waits),
+	 * and it must NOT flip the hardware lens state — a re-bind is a
+	 * presenter change, not a mode change.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL means the
+	 * runtime recreates as before. Appended per ADR-020.
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param window_handle  The new HWND to bind to.
+	 */
+	bool (*set_window)(struct xrt_display_processor_d3d11 *xdp, void *window_handle /* HWND */);
 };
 
 /*
@@ -461,7 +486,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_transparent_b
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_shared_texture_present)    == XRT_DP_D3D11_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, snap_window_rect)              == XRT_DP_D3D11_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_frame_timing)            == XRT_DP_D3D11_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_window)                  == XRT_DP_D3D11_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_frame_timing slot, so a plug-in
@@ -469,6 +495,12 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
  */
 #define XRT_DP_D3D11_HAS_FRAME_TIMING 1
+
+/*!
+ * Defined when this header carries the set_window slot (#1008), so a plug-in
+ * built against an older runtime can #ifdef-guard its implementation.
+ */
+#define XRT_DP_D3D11_HAS_SET_WINDOW 1
 
 // clang-format on
 
@@ -838,6 +870,21 @@ xrt_display_processor_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 
 		return;
 	}
 	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_window
+ * Returns false if not supported (slot absent or NULL) — the caller then
+ * falls back to destroying and recreating the DP against the new window.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_handle)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_window) || xdp->set_window == NULL) {
+		return false;
+	}
+	return xdp->set_window(xdp, window_handle);
 }
 
 #ifdef __cplusplus

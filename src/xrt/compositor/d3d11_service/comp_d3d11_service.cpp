@@ -8692,6 +8692,42 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		return;
 	}
 
+	/*
+	 * #1008 FAST PATH: ask the live DP to follow the new window instead of
+	 * destroying it.
+	 *
+	 * The D3D11 weaver takes its interlace phase and target size from the
+	 * window it was CREATED against, so until now a presenter change meant
+	 * destroy + async recreate: ~200 ms of flat blit on every focus change,
+	 * and a graveyard entry each time because only one DP may exist per HWND
+	 * (the SR subclass chain). Across an Alt-Tab ping-pong that churn is
+	 * continuous. A plug-in implementing slot 20 re-points its weaver in
+	 * place and we keep the same instance.
+	 *
+	 * Deliberately BEFORE the factory lookup and the graveyard flush: nothing
+	 * is retired on this path, so neither applies. The transparency mode IS
+	 * re-applied, because it belongs to the incoming PRESENTER rather than to
+	 * the window. Encoding is left alone: same DP instance, so the #1016
+	 * tracker's belief is still true, and every process_atlas site asserts
+	 * its own regardless.
+	 *
+	 * False (older plug-in, or a re-bind it cannot honour) falls through to
+	 * the recreate path below, unchanged.
+	 */
+	if (mc->display_processor != nullptr &&
+	    xrt_display_processor_d3d11_set_window(mc->display_processor, (void *)hwnd)) {
+		mc->panel_dp_hwnd = hwnd;
+		pipeline_dp_set_transparency(mc, mc->display_processor, client_presents, "set_window");
+		// The window's ESC/close hook follows the binding, as on the recreate path.
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window,
+			                                   hwnd == mc->hwnd ? mc->display_processor : nullptr);
+		}
+		sys->render_diag_pipe_rebind.fetch_add(1, std::memory_order_relaxed);
+		U_LOG_W("[pipeline] panel DP re-bound in place to hwnd=%p (set_window)", (void *)hwnd);
+		return;
+	}
+
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 	if (dp_fac == NULL) {
 		return; // no vendor plug-in — the flat-blit fallback owns the frame

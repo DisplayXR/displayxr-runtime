@@ -722,6 +722,28 @@ sim_dp_d3d11_clear_local_zone_mask(struct xrt_display_processor_d3d11 *xdp)
  *
  */
 
+/*!
+ * #1008: re-bind to a different window.
+ *
+ * sim_display never weaves against a real window — it has no interlace phase
+ * to re-derive — so honouring this is free, and returning true is honest:
+ * after the call the DP is bound wherever the runtime says it is. Implemented
+ * so the runtime's in-place rebind path is exercised on hardware-free CI and
+ * dev boxes rather than only against a vendor plug-in.
+ */
+static bool
+sim_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_handle)
+{
+	(void)xdp;
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("sim_display D3D11 #1008: set_window(%p) accepted (no window binding to update)",
+		        window_handle);
+	}
+	return true;
+}
+
 extern "C" xrt_result_t
 sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
                                    void *d3d11_device,
@@ -756,6 +778,7 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.publish_local_zone_mask = sim_dp_d3d11_publish_local_zone_mask;
 	sdp->base.clear_local_zone_mask = sim_dp_d3d11_clear_local_zone_mask;
 	sdp->base.set_background_2d = sim_dp_d3d11_set_background_2d; // #491 part 3
+	sdp->base.set_window = sim_dp_d3d11_set_window;               // #1008
 
 	// #224 / ADR-027 local-zone test double config (shared parser — see
 	// sim_display_zone_common.h for the SIM_DISPLAY_ZONE_GRID /
