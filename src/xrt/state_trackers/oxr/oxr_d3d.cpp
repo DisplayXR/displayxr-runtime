@@ -133,27 +133,48 @@ oxr_d3d_get_requirements(struct oxr_logger *log,
 
 	try {
 
+		// #1000: track WHICH adapter we suggest and WHY. A hung run on a hybrid
+		// iGPU/dGPU box used to produce a log byte-identical to a healthy one
+		// because placement was never recorded — it took a process dump to learn
+		// it. This fires once per app (xrGetD3D11/12GraphicsRequirementsKHR).
+		const char *provenance = "unknown";
+		DXGI_ADAPTER_DESC desc{};
+		bool have_desc = false;
+
 		wil::com_ptr<IDXGIAdapter> forced = env_forced_d3d_adapter();
 		if (forced != nullptr) {
-			DXGI_ADAPTER_DESC desc{};
 			THROW_IF_FAILED(forced->GetDesc(&desc));
+			have_desc = true;
 			sys->suggested_d3d_luid = desc.AdapterLuid;
+			provenance = "env-forced";
 		} else if (sys->xsysc->info.client_d3d_deviceLUID_valid) {
 			sys->suggested_d3d_luid =
 			    reinterpret_cast<const LUID &>(sys->xsysc->info.client_d3d_deviceLUID);
-			if (nullptr == getAdapterByLUID(sys->xsysc->info.client_d3d_deviceLUID, U_LOGGING_INFO)) {
+			// Keep the enumerated adapter (rather than just null-checking it) so
+			// the log below can name it.
+			wil::com_ptr<IDXGIAdapter> adapter =
+			    getAdapterByLUID(sys->xsysc->info.client_d3d_deviceLUID, U_LOGGING_INFO);
+			if (adapter == nullptr) {
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 				                 " failure enumerating adapter for LUID specified for use.");
 			}
+			have_desc = SUCCEEDED(adapter->GetDesc(&desc));
+			provenance = "compositor-device";
 		} else {
 			auto adapter = getAdapterByIndex(0, U_LOGGING_INFO);
 			if (adapter == nullptr) {
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, " failure enumerating adapter LUIDs.");
 			}
-			DXGI_ADAPTER_DESC desc{};
 			THROW_IF_FAILED(adapter->GetDesc(&desc));
+			have_desc = true;
 			sys->suggested_d3d_luid = desc.AdapterLuid;
+			provenance = "adapter[0] fallback";
 		}
+		const WCHAR *desc_name = have_desc ? desc.Description : L"<unknown>";
+		U_LOG_W("D3D graphics requirements: adapter '%ls' LUID=%08lx:%08lx (%s) (#1000)", desc_name,
+		        (unsigned long)sys->suggested_d3d_luid.HighPart,
+		        (unsigned long)sys->suggested_d3d_luid.LowPart, provenance);
+
 		sys->suggested_d3d_luid_valid = true;
 		*adapter_luid = sys->suggested_d3d_luid;
 		//! @todo implement better?
