@@ -3108,6 +3108,18 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->command_queue = static_cast<ID3D12CommandQueue *>(d3d12_command_queue);
 	c->command_queue->AddRef();
 
+	// #1000: record which adapter the app's device actually lives on. On a
+	// hybrid iGPU/dGPU box a hung run's log was byte-identical to a healthy
+	// one because placement was never written down. One-time, init-only —
+	// never per frame. D3D12 has no IDXGIDevice, and there is no DXGI factory
+	// in scope here, so log the LUID alone rather than spinning one up just
+	// for a description string — the LUID is what identifies the adapter.
+	{
+		LUID log_luid = c->device->GetAdapterLuid();
+		U_LOG_W("D3D12 compositor: app device on adapter LUID=%08lx:%08lx (#1000)",
+		        (unsigned long)log_luid.HighPart, (unsigned long)log_luid.LowPart);
+	}
+
 	// Create command allocator and command list
 	HRESULT hr = c->device->CreateCommandAllocator(
 	    D3D12_COMMAND_LIST_TYPE_DIRECT,

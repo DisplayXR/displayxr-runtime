@@ -2916,6 +2916,32 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Get immediate context
 	c->device->GetImmediateContext(&c->context);
 
+	// #1000: record which adapter the app's device actually lives on. On a
+	// hybrid iGPU/dGPU box a hung run's log was byte-identical to a healthy
+	// one because placement was never written down. One-time, init-only —
+	// never per frame. Purely diagnostic: every failure path skips the log
+	// and continues, logging must never fail the create.
+	{
+		IDXGIDevice *log_dxgi_dev = nullptr;
+		if (SUCCEEDED(c->device->QueryInterface(__uuidof(IDXGIDevice),
+		                                        reinterpret_cast<void **>(&log_dxgi_dev))) &&
+		    log_dxgi_dev != nullptr) {
+			IDXGIAdapter *log_adapter = nullptr;
+			if (SUCCEEDED(log_dxgi_dev->GetAdapter(&log_adapter)) && log_adapter != nullptr) {
+				DXGI_ADAPTER_DESC log_desc{};
+				if (SUCCEEDED(log_adapter->GetDesc(&log_desc))) {
+					U_LOG_W("D3D11 compositor: app device on adapter '%ls' "
+					        "LUID=%08lx:%08lx (#1000)",
+					        log_desc.Description,
+					        (unsigned long)log_desc.AdapterLuid.HighPart,
+					        (unsigned long)log_desc.AdapterLuid.LowPart);
+				}
+				log_adapter->Release();
+			}
+			log_dxgi_dev->Release();
+		}
+	}
+
 	// Enable D3D11 multithread protection for cross-thread window/compositor access.
 	// The HWND lives on a dedicated window thread while D3D11 rendering happens here.
 	HRESULT hr;
