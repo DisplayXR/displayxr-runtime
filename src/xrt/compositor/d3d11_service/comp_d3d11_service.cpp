@@ -506,6 +506,14 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
+	//! client's own claim). Set by the IPC server right after session create.
+	//! Used to match the OS foreground window to a client by PROCESS when no
+	//! HWND matches exactly: an engine app (Unity) presents through a
+	//! provider-created overlay, but the user Alt-Tabs to the ENGINE'S MAIN
+	//! WINDOW, which the runtime has never been told about. 0 = unknown.
+	long client_pid;
+
 	//! #964 (D-2): which surface the render thread presents this client into.
 	//! PRESENTER_NONE on the legacy path (DXR_LEGACY_STANDALONE=1) and for
 	//! sessions with no render resources (bridge relay, workspace controller).
@@ -9112,7 +9120,72 @@ pipeline_slot_for_foreground(struct d3d11_multi_compositor *mc, HWND fg)
 			return s;
 		}
 	}
-	return -1;
+
+	/* #1018: no exact HWND match — fall back to the PROCESS.
+	 *
+	 * An engine app does not present through the window the user thinks of as
+	 * "the app". The Unity provider creates a WS_POPUP + NOREDIRECTIONBITMAP
+	 * OVERLAY and binds THAT; Unity's main game window is a different HWND the
+	 * runtime is never told about. Alt-Tab goes to the main window, matched
+	 * nothing, and focus never came back — while the parked overlay was not
+	 * Alt-Tab reachable either, so the app was simply stuck (David, live).
+	 *
+	 * Any window of the client's process means "the user is looking at this
+	 * client". Exact-HWND keeps priority above; this runs only when that found
+	 * nothing. The pid is the OS-derived one (#954), never the client's claim.
+	 * An ambiguous tie (two presenting slots in ONE process — impossible for
+	 * engine apps, which are one client per process) keeps the current holder
+	 * rather than guessing.
+	 */
+	DWORD fg_pid = 0;
+	if (GetWindowThreadProcessId(fg, &fg_pid) == 0 || fg_pid == 0) {
+		return -1;
+	}
+	int32_t pid_match = -1;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[s];
+		if (!pipeline_slot_presenting(slot) || slot->compositor->client_pid == 0) {
+			continue;
+		}
+		if ((DWORD)slot->compositor->client_pid != fg_pid) {
+			continue;
+		}
+		if (pid_match >= 0) {
+			return -1; // ambiguous — keep the current holder
+		}
+		pid_match = s;
+	}
+	return pid_match;
+}
+
+/*!
+ * #1018: UN-park the window a slot presents through, because that slot has just
+ * taken the panel.
+ *
+ * The counterpart to pipeline_park_app_hwnd. Focus can land on a slot whose
+ * presenter window we minimized earlier — via the process-level foreground
+ * match above (the user Alt-Tabbed to the engine's MAIN window while the bound
+ * OVERLAY stayed iconic), or via survivor-fallback when the previous holder
+ * exits. `pipeline_app_hwnd_ready` skips an iconic window every frame, so the
+ * new holder would own the panel and render nothing but black.
+ *
+ * Restoring OUR OWN window is always allowed — SW_RESTORE from the runtime is
+ * not subject to Windows' foreground lock (proven live in #1014). Async, never
+ * synchronous: the window's thread may be the app's.
+ */
+static void
+pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
+		return;
+	}
+	HWND h = mc->clients[slot].compositor->render.hwnd;
+	if (h == nullptr || !IsWindow(h) || !IsIconic(h)) {
+		return;
+	}
+	ShowWindowAsync(h, SW_RESTORE);
+	U_LOG_W("[pipeline] restored slot %d's parked presenter window %p — it now holds the panel (#1018)", slot,
+	        (void *)h);
 }
 
 /*!
@@ -9435,6 +9508,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// The outgoing APP_HWND presenter's window gets out of the way
 			// rather than sitting there showing the flat 2D repaint.
 			pipeline_park_app_hwnd(mc, was_focused);
+			// #1018: the INCOMING one may itself be parked — restore it, or
+			// the ready-probe skips it every frame and the panel goes black.
+			// Covers the survivor-fallback path too (holder exits -> next).
+			pipeline_unpark_app_hwnd(mc, best);
 			// #1016: and the incoming one takes the qwerty ticker with it.
 			pipeline_set_qwerty_owner(mc, pipeline_slot_runtime_window(mc, best));
 
@@ -10159,6 +10236,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// wish is the one that should be on the panel.
 				mc->foreground_override_slot.store(override_slot, std::memory_order_release);
 				pipeline_rearm_focus_wish(mc, override_slot, "foreground override");
+				pipeline_unpark_app_hwnd(mc, override_slot); // #1018
 				// #1016: the override window ticks qwerty, not the workspace.
 				pipeline_set_qwerty_owner(mc, pipeline_slot_runtime_window(mc, override_slot));
 				// Override moved straight from one client to another: the
@@ -19611,6 +19689,18 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 	out_metrics->valid = true;
 
 	return true;
+}
+
+void
+comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c != nullptr) {
+		c->client_pid = pid;
+	}
 }
 
 bool

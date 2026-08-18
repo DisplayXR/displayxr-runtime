@@ -180,6 +180,21 @@ bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc);
 
 /*!
+ * #1018: record the client process's OS-DERIVED pid on its compositor.
+ *
+ * The foreground-follows focus rule matches the OS foreground window against
+ * the window each client PRESENTS through. An engine app breaks that: the Unity
+ * provider binds a WS_POPUP overlay, while the user Alt-Tabs to Unity's main
+ * game window — a HWND the runtime never sees. The pid lets the matcher fall
+ * back to "any window of this client's process", so focus comes back.
+ *
+ * MUST be the server-derived peer pid (#954), never the client's own claim.
+ * No-op unless @p xc is a D3D11 service compositor.
+ */
+void
+comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid);
+
+/*!
  * Get window metrics from the active D3D11 service compositor.
  *
  * Returns window physical dimensions and center offset from display center,

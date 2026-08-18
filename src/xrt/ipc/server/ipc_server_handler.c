@@ -2040,6 +2040,17 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	ics->xs = xs;
 	ics->xc = xcn != NULL ? &xcn->base : NULL;
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #1018: hand the compositor this client's OS-derived pid so the
+	// foreground focus rule can match a client by PROCESS when no HWND matches
+	// — an engine app presents through a provider overlay while the user
+	// Alt-Tabs to the engine's main window. peer_pid is the #954
+	// server-derived identity; the client's own claim is never trusted.
+	if (ics->xc != NULL) {
+		comp_d3d11_service_compositor_set_client_pid((struct xrt_compositor *)ics->xc, ics->peer_pid);
+	}
+#endif
+
 	// #962: the initial visible/focused state comes from the ONE focus
 	// authority (the controller's compositor focus, or the default policy) —
 	// not an unconditional visible+focused, which used to leave every new
