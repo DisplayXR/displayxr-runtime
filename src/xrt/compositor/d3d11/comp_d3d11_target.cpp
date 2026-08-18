@@ -71,6 +71,90 @@ static std::atomic<uint32_t> g_repaint_presents_since_app{0};
 // auto-backoff (mirrors comp_d3d12_target.cpp).
 static late_weave_governor g_lw_gov_d3d11;
 
+/*
+ * Present watchdog (#1000).
+ *
+ * The #925 S1 bound above (DXGI_PRESENT_DO_NOT_WAIT retried <=50 ms) handles a
+ * FULL flip queue — DXGI returns WAS_STILL_DRAWING and we drop the frame. It
+ * cannot handle the mode captured in #1000's dump: ONE Present call that never
+ * returns, blocked inside the display adapter's user-mode driver on a
+ * cross-adapter sync object (dGPU renders, iGPU scans out — every present on
+ * this topology crosses adapters):
+ *
+ *   dxgi!CFlipPresentToDWM -> igd10iumd64!... ->
+ *   d3d11!NDXGI::CDevice::WaitForSynchronizationObjectFromCpuCB   (minutes)
+ *
+ * DO_NOT_WAIT never fires there — the wait is below DXGI's queue check, during
+ * submission itself. No code on the calling thread can bound it, and because
+ * layer_commit holds c->mutex across the present, the repaint thread wedges
+ * behind it and the process goes silent while still reporting Responding=TRUE
+ * (the window thread keeps pumping). The result reads as a crash with an empty
+ * log.
+ *
+ * So: a tiny sampling thread. The present path stamps g_present_wd_enter_ns
+ * around the Present call; this thread wakes 4x/s and escalates a WARN at
+ * 500 ms / 5 s / 30 s, then every 60 s, and logs recovery if the call ever
+ * completes. Diagnosis only — it must never touch the swapchain.
+ */
+static std::atomic<int64_t> g_present_wd_enter_ns{0};
+static std::atomic<uint64_t> g_present_wd_seq{0};
+static HANDLE g_present_wd_thread = nullptr;
+static HANDLE g_present_wd_exit = nullptr;
+
+static DWORD WINAPI
+present_watchdog_thread_proc(LPVOID param)
+{
+	(void)param;
+	uint64_t warned_seq = 0;
+	int warned_stage = 0; // 0 none, 1 @500ms, 2 @5s, 3 @30s, 4+ repeats
+	int64_t warned_enter_ns = 0;
+
+	for (;;) {
+		if (WaitForSingleObject(g_present_wd_exit, 250) == WAIT_OBJECT_0) {
+			return 0;
+		}
+
+		int64_t enter_ns = g_present_wd_enter_ns.load(std::memory_order_acquire);
+		uint64_t seq = g_present_wd_seq.load(std::memory_order_acquire);
+
+		// The stuck call completed (or a new one started): report recovery once.
+		if (warned_stage > 0 && (enter_ns == 0 || seq != warned_seq)) {
+			int64_t stuck_ms = ((int64_t)os_monotonic_get_ns() - warned_enter_ns) / 1000000;
+			U_LOG_W("d3d11 present watchdog: Present recovered after ~%lld ms (#1000)",
+			        (long long)stuck_ms);
+			warned_stage = 0;
+		}
+		if (enter_ns == 0) {
+			continue;
+		}
+
+		int64_t elapsed_ms = ((int64_t)os_monotonic_get_ns() - enter_ns) / 1000000;
+		if (seq != warned_seq) {
+			warned_seq = seq;
+			warned_stage = 0;
+		}
+
+		int stage = 0;
+		if (elapsed_ms >= 30000) {
+			// Stage 3 first, then one repeat WARN per further 60 s.
+			stage = 3 + (int)((elapsed_ms - 30000) / 60000);
+		} else if (elapsed_ms >= 5000) {
+			stage = 2;
+		} else if (elapsed_ms >= 500) {
+			stage = 1;
+		}
+		if (stage > warned_stage) {
+			warned_stage = stage;
+			warned_enter_ns = enter_ns;
+			U_LOG_W("d3d11 present watchdog: Present has not returned for %lld ms — "
+			        "blocked inside the driver's cross-adapter present submission; "
+			        "DO_NOT_WAIT cannot bound this mode. c->mutex is held, so the "
+			        "repaint thread is stalled behind it. (#1000)",
+			        (long long)elapsed_ms);
+		}
+	}
+}
+
 
 /*!
  * D3D11 target structure.
@@ -345,6 +429,22 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		return xret;
 	}
 
+	// Present watchdog (#1000) — see the file-scope block above. Optional:
+	// failure to start it must not fail target creation.
+	if (g_present_wd_thread == nullptr) {
+		g_present_wd_enter_ns.store(0, std::memory_order_relaxed);
+		g_present_wd_exit = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+		if (g_present_wd_exit != nullptr) {
+			g_present_wd_thread =
+			    CreateThread(nullptr, 0, present_watchdog_thread_proc, nullptr, 0, nullptr);
+			if (g_present_wd_thread == nullptr) {
+				CloseHandle(g_present_wd_exit);
+				g_present_wd_exit = nullptr;
+				U_LOG_W("d3d11 target: present watchdog thread failed to start (#1000)");
+			}
+		}
+	}
+
 	*out_target = target;
 
 	U_LOG_I("Created D3D11 target: %ux%u", width, height);
@@ -360,6 +460,18 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	}
 
 	comp_d3d11_target *target = *target_ptr;
+
+	// Stop the present watchdog (#1000). Join with a bound: if the watchdog is
+	// somehow wedged we must not hang teardown for it.
+	if (g_present_wd_thread != nullptr) {
+		SetEvent(g_present_wd_exit);
+		WaitForSingleObject(g_present_wd_thread, 2000);
+		CloseHandle(g_present_wd_thread);
+		CloseHandle(g_present_wd_exit);
+		g_present_wd_thread = nullptr;
+		g_present_wd_exit = nullptr;
+		g_present_wd_enter_ns.store(0, std::memory_order_relaxed);
+	}
 
 	if (g_frame_latency_waitable != nullptr) {
 		CloseHandle(g_frame_latency_waitable);
@@ -703,6 +815,13 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 	// degrades to slow frames; the app's render thread (and its IPC) stays
 	// alive. Mirrors the service's standalone commit path.
 	HRESULT hr;
+	// Present watchdog (#1000): stamp entry so the sampling thread can name a
+	// Present call that never returns (in-driver cross-adapter wait — the
+	// DO_NOT_WAIT bound below never sees it). seq before enter: the watchdog
+	// keys re-warn state on seq, and a stale seq with a fresh enter would
+	// suppress the first warning of a new incident.
+	g_present_wd_seq.fetch_add(1, std::memory_order_relaxed);
+	g_present_wd_enter_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
 	if (sync_interval == 0) {
 		hr = target->swapchain->Present(0, 0); // immediate — never blocks on the chain
 	} else {
@@ -726,6 +845,7 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 			Sleep(1);
 		}
 	}
+	g_present_wd_enter_ns.store(0, std::memory_order_release);
 	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);
 	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&g_last_present_count);
