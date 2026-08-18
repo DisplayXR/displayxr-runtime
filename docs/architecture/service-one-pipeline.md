@@ -148,6 +148,31 @@ mutation, DP resolved through `panel_dp()` *after* the lock (#965).
 site: check `Present`/create HRESULTs for `0x887A0005/6`, log `[DEVICE_REMOVED] reason=`,
 stop driving the DP, orderly exit so the connect ladder relaunches).
 
+**D-9 Focus follows the OS foreground window (2026-08-17, David).** No focus hotkeys. Every
+client is a first-class window citizen: `_handle` apps their own HWND, hosted clients a
+runtime-created taskbar window each (title = app name; minimized when not the presenter;
+`WS_SYSMENU|WS_MINIMIZEBOX` survive the borderless-fullscreen style strip or the shell refuses
+to Alt-Tab-restore them), present-owners their own window. The render thread samples the
+debounced foreground root each frame: a client window in the foreground takes the panel
+(`(foreground)`); a freshly launched app that never got OS activation (foreground-lock) takes
+it once (`(new-app)`, per-slot `ever_focused`); an unrelated foreground window changes nothing;
+the newest presenting slot is the fallback. Losing the panel parks (minimizes) an APP_HWND
+window; restoring it takes the panel back. On a chain handover the incoming swap chain is
+re-primed (`SetMaximumFrameLatency`) and the pacer token dropped — the frame-latency waitable
+is a semaphore and a slot consumed for a chain that then never presents is lost forever
+(observed: 14 presents then a dead presenter); a desync watchdog (500 ms probe-miss ⇒ re-prime
++ one unpaced recovery present) self-heals the rest.
+
+**D-10 The workspace is scoped and never exclusive (2026-08-17, David).** The shell composes
+ONLY clients launched under it (`DISPLAYXR_WORKSPACE_SESSION=1`, reported by the client in
+`xrt_application_info.workspace_session`; `workspace_enumerate/get_client_info` filter).
+While the shell runs, foregrounding an outside client's window runs the direct path for that
+client (foreground override: panel + lease follow it; workspace state untouched, no
+deactivate); foregrounding the workspace window resumes the compose. The workspace empty
+state keys on *placed* slots. Window metrics/Kooima: a PLACED slot uses its slot rect; every
+unplaced client uses its presenter's rect (the browser under a shell previously got a phantom
+centered sentinel box — wrong point of view).
+
 ## 3. What changes, by site (grep by name — lines drift)
 
 - `system_create_native_compositor` / `init_client_render_resources`: always TYPELESS atlas +
