@@ -139,14 +139,31 @@ dxr_late_weave_enabled()
  */
 /*
  * #964: per-CHAIN max frame latency for an APP_HWND presenter's swap chain
- * (DXR_APP_HWND_LATENCY, default 1, clamped 1..3).
+ * (DXR_APP_HWND_LATENCY, default 2, clamped 1..3).
  *
  * 1 gives the tightest motion-to-photon but leaves zero slack: the render
  * thread's zero-timeout probe fires on a fixed cadence and DWM releases the
  * buffer on the vblank, so a probe landing a hair early is a whole skipped
  * frame for that window. 2 buys one buffer of slack — the wait still bounds
  * us, so the render thread can never block — at the cost of ~one refresh of
- * latency. Env-gated so the skip ratio in `[RENDER]` can be A/B'd against it
+ * latency.
+ *
+ * #1019: 2 is now the DEFAULT, because on this class of machine 1 does not
+ * hold 60 fps at all. The panel hangs off the iGPU, so every present on an
+ * app-HWND chain crosses adapters, and at depth 1 the flip slot does not come
+ * back within a display period — the probe misses, the frame is skipped, and
+ * the presenter settles near 40 fps (measured 378-449 presents/10 s with
+ * ~150-250 skips). That stayed invisible until #1019 added commit
+ * backpressure: an unthrottled client committing at ~1400 Hz kept the pacer's
+ * 20 ms wait saturated and masked the slot-return latency entirely. Legacy
+ * reached 60 fps at depth 1 only by BLOCKING the client's own thread inside
+ * Present, which is exactly what the render thread may never do (#924).
+ *
+ * Measured with the change: 599-601 presents/10 s at 0-1 skips — 40 -> 60 fps
+ * for one extra frame of queued latency. Buy that frame back later via #1008's
+ * DP set_window re-bind and late-latching, not by shrinking the queue again.
+ *
+ * Env still overrides, so the skip ratio in `[RENDER]` can be A/B'd against it
  * without a rebuild.
  */
 static UINT
@@ -155,7 +172,7 @@ dxr_app_hwnd_latency()
 	static int latency = -1;
 	if (latency < 0) {
 		const char *e = getenv("DXR_APP_HWND_LATENCY");
-		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
+		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 2;
 		if (v < 1) {
 			v = 1;
 		}
