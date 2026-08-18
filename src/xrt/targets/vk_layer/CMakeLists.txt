@@ -68,17 +68,26 @@ configure_file(
 # side in bin/ and the pair relocates with the install directory. The dev-tree
 # manifest above keeps its absolute path — run scripts point VK_LAYER_PATH at
 # the build dir and never move.
-# BARE FILENAME, no "./" prefix. The loader hands library_path straight to
-# LoadLibrary on Windows, which rejects "./name.dll" with error 87
-# (ERROR_INVALID_PARAMETER) — and the failure surfaces to the app as
-# VK_ERROR_OUT_OF_HOST_MEMORY at vkCreateInstance, which names neither the
-# layer nor the path. A bare filename is resolved relative to the manifest's
-# own directory, which is what we want and is portable. Found by installing it
-# and watching VK_LOADER_DEBUG=layer, not by reading the spec.
+# The prefix is load-bearing, and on Windows it must be a BACKSLASH.
+# The loader only treats library_path as a path — and only then joins it to the
+# manifest's own directory — when it contains the platform DIRECTORY_SYMBOL
+# ('\' on Windows, '/' on POSIX). Anything else (a bare filename, or "./name"
+# on Windows) is handed to LoadLibraryEx verbatim, and LoadLibraryEx rejects
+# every non-absolute path when called with LOAD_LIBRARY_SEARCH_* flags:
+# error 87, ERROR_INVALID_PARAMETER. The loader then reports that layer-library
+# open failure to the app as VK_ERROR_OUT_OF_HOST_MEMORY out of
+# vkCreateInstance — naming neither the layer nor the path. That is what broke
+# the Vulkan media-player demo. Measured with VK_LOADER_DEBUG=all against a
+# real install: ".\name.dll" logs `Insert instance layer ... (C:\Program
+# Files\DisplayXR\Runtime\VkLayer_DXR_queue_lock.dll)`; the bare name logs
+# `Failed to open dynamic library "VkLayer_DXR_queue_lock.dll" with error 87`.
+# (The NSIS installer sidesteps all of this by writing an absolute $INSTDIR
+# path, which LoadLibraryEx accepts regardless of separator style.)
 if(WIN32)
-	set(DXR_QL_LIBRARY_PATH "VkLayer_DXR_queue_lock.dll")
+	# Two backslashes in the generated JSON = one after JSON unescaping.
+	set(DXR_QL_LIBRARY_PATH ".\\\\VkLayer_DXR_queue_lock.dll")
 else()
-	set(DXR_QL_LIBRARY_PATH "libVkLayer_DXR_queue_lock.so")
+	set(DXR_QL_LIBRARY_PATH "./libVkLayer_DXR_queue_lock.so")
 endif()
 configure_file(
 	VkLayer_DXR_queue_lock.json.in
