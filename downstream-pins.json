@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Manifest of pins that live DOWNSTREAM of this repo. Companion to versions.json:",
+    "versions.json records what each component last released; this file records where",
+    "each downstream repo pins the runtime (and third-party SDKs) in its own sources.",
+    "",
+    "Consumed by .github/workflows/runtime-pin-bump.yml (opens repin PRs on a runtime",
+    "release, ABI-gated) and .github/workflows/pin-rot-canary.yml (checks SDK pins",
+    "still resolve AND still unpack a usable SDK). Spec + rationale:",
+    "docs/specs/runtime/downstream-pin-bump.md",
+    "",
+    "To onboard a new vendor plug-in repo: add an entry under runtime_tag_pins with",
+    "every location its pin appears in, grouped by track. Nothing else to write --",
+    "the bump job is centralized here, not copied into each repo."
+  ],
+
+  "_schema": {
+    "runtime_tag_pins.<repo>.tracks.<track>": {
+      "auto_bump": "true = repin automatically on a qualifying runtime release; false = human-owned, never touched",
+      "locations": "EVERY file the track's tag appears in. Written in ONE commit -- see atomicity note below.",
+      "locations[].kind": "cmake_set  -> matches set(<key> \"<tag>\"   |  yaml_env -> matches <key>: <tag>"
+    },
+    "_atomicity": [
+      "A track is an ATOMIC GROUP. Each downstream repo runs a 'Rule-5' CI step that",
+      "hard-fails when its two pin locations disagree, so a bump MUST write every",
+      "location of the track in one commit. Updating one alone breaks that repo's CI."
+    ],
+    "_derived_values_are_not_pins": [
+      "displayxr-leia-plugin/installer/CMakeLists.txt regex-derives MIN_RUNTIME_VERSION",
+      "from DXR_RUNTIME_GIT_TAG. It is a CONSUMER of the pin, not a pin: CMake recomputes",
+      "it. Never list or edit derived values -- and note this derivation is exactly why",
+      "the bump is ABI-gated, since raising the pin raises that installer's minimum",
+      "runtime floor."
+    ],
+    "_shape_constraint": [
+      "The downstream Rule-5 checks regex the literal set(DXR_RUNTIME_GIT_TAG \"vX.Y.Z\"",
+      "shape. Rewrites must preserve it exactly -- no computed values, no indirection."
+    ]
+  },
+
+  "runtime_tag_pins": {
+    "displayxr-leia-plugin": {
+      "role": "Leia SR display-processor plug-in (first vendor integration)",
+      "tracks": {
+        "windows": {
+          "auto_bump": true,
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
+            { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
+          ]
+        },
+        "linux": {
+          "auto_bump": false,
+          "reason": "Deliberately held behind the Windows pin -- the Linux plug-in build tracks an older runtime on purpose. Human-owned; the bump job must never touch it.",
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG_LINUX" },
+            { "file": ".github/workflows/build-linux.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
+          ]
+        }
+      }
+    },
+    "displayxr-vendor-template": {
+      "role": "Scaffold every new vendor plug-in repo is generated from -- stale pins here seed into all future vendor repos, so it matters more than its commit count suggests",
+      "tracks": {
+        "windows": {
+          "auto_bump": true,
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
+            { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
+          ]
+        }
+      }
+    }
+  },
+
+  "sdk_pins": [
+    { "repo": "displayxr-demo-avatar",        "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-demo-earthview",     "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-demo-gaussiansplat", "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-demo-mediaplayer",   "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-demo-modelviewer",   "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-leia-plugin",        "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+    { "repo": "displayxr-vendor-template",    "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" }
+  ],
+
+  "excluded": {
+    "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029).",
+    "displayxr-runtime/.gitlab-ci/windows/monado_deps_build.ps1": "Inert Monado-era leftover carrying a stale LunarG URL. Not on any active CI path -- excluded so the canary does not report a failure nothing can act on."
+  }
+}
