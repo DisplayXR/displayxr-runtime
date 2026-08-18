@@ -136,6 +136,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-033](adr/ADR-033-placement-reports-geometry-weaver-owns-phase.md) — The Party That Owns Placement Reports Geometry; the Weaver Owns Everything Phase
 - [ADR-034](adr/ADR-034-input-provider-plugins.md) — Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 - [ADR-035](adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) — The Service Owns Arbitration, Runs One Compositor Pipeline, and Isolates Its Satellites
+- [ADR-036](adr/ADR-036-android-per-window-compositor-instances.md) — Android: per-window compositor instances; the workspace overlay is an optional mode
 <!-- END ADR INDEX -->
 
 ---

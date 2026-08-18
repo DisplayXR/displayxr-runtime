@@ -17,6 +17,23 @@ date: 2026-06-09
 > nothing arbitrates between concurrent client classes inside it — is
 > [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md).
 
+> **Amendment (2026-08-18) — the deployment choice below is superseded for Android by
+> [ADR-036](ADR-036-android-per-window-compositor-instances.md).** This ADR's
+> *requirement* stands unchanged: an app must carry no vendor SDK, no vendor `.so`, and
+> no vendor `<queries>` naming a vendor package. What ADR-036 changes is how that
+> requirement is met. It shows the coupling this ADR objected to is satisfiable without
+> moving the compositor out of the app — vendor services advertise a vendor-neutral
+> `org.displayxr.action.VENDOR_DISPLAY_SERVICE` intent action, and the app carries one
+> `<queries><intent>` for it (supplied by the `displayxr` AAR), so neither the temporal
+> nor the combinatorial coupling remains. Consequently **"in-process is a
+> development/bring-up flavor only, not a shippable application model" no longer
+> holds**: the Android target is a compositor instance per window, in the app's process
+> (ADR-036 D2), with the per-app satellite process as the sanctioned out-of-process
+> deployment of the same abstraction (ADR-036 D3) and the fallback if the vendor
+> manifest convention stalls. Nothing below is rewritten — it is the record of why the
+> service split was chosen in 2026-06 and why it remains correct wherever D5's
+> convention is unavailable.
+
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) establishes the vendor-isolation
 principle: vendor display processors ship as plug-ins behind a
 stable boundary, and an application talks only to DisplayXR (the OpenXR loader →
