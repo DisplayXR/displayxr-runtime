@@ -163,6 +163,19 @@ void
 comp_d3d11_window_set_title(struct comp_d3d11_window *window, const char *title);
 
 /*!
+ * #1016: may this window feed the process-global qwerty state?
+ *
+ * `qwerty_process_win32` keeps ONE file-static state machine, so with a runtime
+ * window per hosted client (#1014) every window's key and activation messages
+ * landed in the same integrator — an unfocused window's WM_KILLFOCUS ran the
+ * focus-loss reset while the user held W in the focused one. The service grants
+ * this to exactly one window, the ACTIVE PRESENTER's, so input follows the
+ * panel. Defaults to true; the legacy in-process paths never call it.
+ */
+void
+comp_d3d11_window_set_qwerty_active(struct comp_d3d11_window *window, bool active);
+
+/*!
  * Destroy the self-owned window.
  *
  * Posts the private WM_DXR_DESTROY_WINDOW message to the window thread and waits

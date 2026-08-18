@@ -200,6 +200,18 @@ struct comp_d3d11_window
 	//! thread.
 	volatile LONG input_suppress;
 
+	//! #1016: may THIS window feed the global qwerty state? Since #1014 the
+	//! service owns one runtime window per hosted client, and every one of them
+	//! was pumping WM_KEY*/WM_ACTIVATE into `qwerty_process_win32` — which
+	//! keeps ONE file-static state machine for the whole process. An unfocused
+	//! window's WM_KILLFOCUS then ran qwerty's focus-loss handler (clear all
+	//! keys, release held buttons) while the user was holding W in the focused
+	//! one: WASD stuttered "as if fighting something". Exactly one window holds
+	//! this at a time — the ACTIVE PRESENTER's, so input follows the panel.
+	//! Defaults to 1 so the legacy/in-process paths, which never call the
+	//! setter, behave exactly as before.
+	volatile LONG qwerty_active;
+
 	//! True when a mouse button press originated inside the app content rect.
 	//! Used to prevent title bar clicks from being forwarded as app drags.
 	//! Set on button-down inside rect, cleared on button-up.
@@ -828,7 +840,8 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// fall through to the focused app's WindowProc / qwerty stays
 			// active only in non-workspace paths.
 			if (w->qwerty_enabled && w->xsysd != NULL && !bridge_page_attached(hWnd) &&
-			    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
+			    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0) &&
+			    InterlockedCompareExchange(&w->qwerty_active, 0, 0)) {
 				bool handled = false;
 				qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 				                     message, wParam, lParam, &handled);
@@ -972,7 +985,8 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		// Suppress qwerty under workspace mode — see L596 comment.
 		if (w->qwerty_enabled && w->xsysd != NULL &&
-		    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
+		    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0) &&
+		    InterlockedCompareExchange(&w->qwerty_active, 0, 0)) {
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
@@ -1019,7 +1033,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			kb_reset(w);
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		if (w->qwerty_enabled && w->xsysd != NULL) {
+		// #1016: THE site that caused the stutter — ungated, so every runtime
+		// window's activation churn (park, restore, Alt-Tab) reached the one
+		// global qwerty state and ran its focus-loss reset under the window
+		// that actually had the keys held.
+		if (w->qwerty_enabled && w->xsysd != NULL && InterlockedCompareExchange(&w->qwerty_active, 0, 0)) {
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, NULL);
 		}
@@ -1370,7 +1388,8 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// (workspace apps own input; qwerty intercepting here is a regression).
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		if (w->qwerty_enabled && w->xsysd != NULL && !bridge_page_attached(hWnd) &&
-		    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
+		    !InterlockedCompareExchange(&w->workspace_mode_active, 0, 0) &&
+		    InterlockedCompareExchange(&w->qwerty_active, 0, 0)) {
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
@@ -1733,6 +1752,7 @@ comp_d3d11_window_create_ex(uint32_t width,
 	w->display_screen_top = screen_top;
 	w->xsysd = NULL;
 	w->qwerty_enabled = true;  // Always enabled for DisplayXR-owned windows
+	w->qwerty_active = 1;      // #1016: until the service says otherwise
 	// -1 = controller has not registered a reserved-key set yet; the WndProc
 	// gate falls back to the built-in default until xrSetWorkspaceReservedKeysDXR
 	// arrives (U_TYPED_CALLOC would otherwise leave this 0 = "empty set").
@@ -2131,7 +2151,16 @@ input_is_suppressed(struct comp_d3d11_window *w)
 	return InterlockedCompareExchange(&w->input_suppress, 0, 0) != 0;
 }
 
-extern "C" void
+extern "C" extern "C" void
+comp_d3d11_window_set_qwerty_active(struct comp_d3d11_window *window, bool active)
+{
+	if (window == NULL) {
+		return;
+	}
+	InterlockedExchange(&window->qwerty_active, active ? 1 : 0);
+}
+
+void
 comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool suppress)
 {
 	if (window == NULL) return;

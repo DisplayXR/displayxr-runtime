@@ -9275,6 +9275,60 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 }
 
 /*!
+ * #1016: grant the qwerty ticker to exactly ONE window — @p owner.
+ *
+ * `qwerty_process_win32` is one file-static state machine for the whole
+ * process. Before #1014 that was fine: the service had a single window. Now it
+ * owns one per hosted client, and every one of them was pumping key and
+ * ACTIVATION messages into that shared state — so parking, restoring or
+ * Alt-Tabbing any OTHER window ran qwerty's focus-loss reset (clear keys,
+ * release held buttons) underneath whichever window the user was actually
+ * holding W in. Symptom: WASD/mouse-look stutter, "as if fighting something".
+ *
+ * Input follows the panel (D-9): the ACTIVE PRESENTER's window ticks and every
+ * other runtime window is silenced. @p owner NULL silences all of them, which
+ * is right when the presenter is an app-provided HWND — that is the app's own
+ * window and the runtime has no ticker there anyway.
+ *
+ * Render thread, on presenter changes only (never per frame). The setter is a
+ * single Interlocked store, so it never reaches into a window thread.
+ */
+static void
+pipeline_set_qwerty_owner(struct d3d11_multi_compositor *mc, struct comp_d3d11_window *owner)
+{
+	if (mc->window != nullptr) {
+		comp_d3d11_window_set_qwerty_active(mc->window, mc->window == owner);
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_service_compositor *cc = mc->clients[s].compositor;
+		if (cc == nullptr || !cc->render.owns_window || cc->render.window == nullptr) {
+			continue;
+		}
+		comp_d3d11_window_set_qwerty_active(cc->render.window, cc->render.window == owner);
+	}
+}
+
+/*!
+ * #1016: the runtime window a slot presents through, or NULL when it presents
+ * into an app-provided HWND (nothing of ours ticks there).
+ */
+static struct comp_d3d11_window *
+pipeline_slot_runtime_window(struct d3d11_multi_compositor *mc, int32_t slot)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return nullptr;
+	}
+	struct d3d11_service_compositor *cc = mc->clients[slot].compositor;
+	if (cc == nullptr) {
+		return nullptr;
+	}
+	if (cc->presenter == PRESENTER_SERVICE_WINDOW) {
+		return mc->window;
+	}
+	return cc->render.owns_window ? cc->render.window : nullptr;
+}
+
+/*!
  * #964 Phase A: PARK the window of a slot that just lost the panel.
  *
  * An APP_HWND client that is no longer the presenter kept its window on screen
@@ -9374,6 +9428,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// The outgoing APP_HWND presenter's window gets out of the way
 			// rather than sitting there showing the flat 2D repaint.
 			pipeline_park_app_hwnd(mc, was_focused);
+			// #1016: and the incoming one takes the qwerty ticker with it.
+			pipeline_set_qwerty_owner(mc, pipeline_slot_runtime_window(mc, best));
 
 			/* Covers the workspace deactivate -> default policy resume too,
 			 * which clears focused_slot and so lands in this branch next tick. */
@@ -10069,6 +10125,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// wish is the one that should be on the panel.
 				mc->foreground_override_slot.store(override_slot, std::memory_order_release);
 				pipeline_rearm_focus_wish(mc, override_slot, "foreground override");
+				// #1016: the override window ticks qwerty, not the workspace.
+				pipeline_set_qwerty_owner(mc, pipeline_slot_runtime_window(mc, override_slot));
 				// Override moved straight from one client to another: the
 				// outgoing one lost the panel just the same, so park it.
 				pipeline_park_app_hwnd(mc, prev_override);
@@ -10079,6 +10137,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// own the panel again and that window would otherwise sit on
 				// top of it showing a stale frame.
 				pipeline_park_app_hwnd(mc, prev_override);
+				// #1016: the workspace window is the ticker again (today's
+				// behaviour under a controller).
+				pipeline_set_qwerty_owner(mc, mc->window);
 				// The panel DP is still bound to the client's window; put it
 				// back on the service window and re-assert the controller's
 				// own mode before the compose path weaves again.
@@ -21449,6 +21510,8 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		pmc->foreground_override_restore = false;
 		pmc->focus_fg_last = nullptr;
 		pmc->focus_fg_stable = 0;
+		// #1016: under a controller the service window is the qwerty ticker.
+		pipeline_set_qwerty_owner(pmc, pmc->window);
 		U_LOG_W("[pipeline] workspace activated — policy switch only, nothing rebuilt");
 		return true;
 	}
