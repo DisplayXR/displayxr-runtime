@@ -372,6 +372,17 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 			        (double)qd->pose.position.y,
 			        (double)qd->pose.position.z);
 		}
+		// #1016: KEEP THE INTEGRATOR'S CLOCK MOVING while frozen. This path
+		// returns before the `last_integrate_ns = now` store below, so the
+		// stamp went stale for the whole frozen span — and the first poll
+		// after the gate released integrated that entire span in ONE tick,
+		// clamped to 100 ms = SIX frames of movement at once. The gate flips
+		// per WS client connect/disconnect (qwerty_set_bridge_relay_active
+		// from the bridge-live check), so a WebXR session that reconnects
+		// lurches on every transition — the stutter David saw, and invisible
+		// to any single-consumer test because nothing else sets this flag.
+		// Freezing motion must not BANK time.
+		qd->last_integrate_ns = os_monotonic_get_ns();
 		out_relation->pose = qd->pose;
 		out_relation->relation_flags =
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
