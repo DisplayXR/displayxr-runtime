@@ -2638,11 +2638,27 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// Chrome enables because it is sandboxed and handle apps do not) is
 		// the same discriminator ipc_server_handler.c already uses to tell
 		// Chrome apart from a handle app for the qwerty head transform.
+		//
+		// #1014 amendment: the exclusion is NOT `workspace_mode`. It used to
+		// be, because "workspace session" implied "server returned an identity
+		// head relation" (use_qwerty_head was false for every client whenever a
+		// controller was up). Per-client window ownership (59d701ed4) ended
+		// that: an UNPLACED slot — a hosted app reached through the foreground
+		// override rather than launched by the controller — is not a workspace
+		// tile, so the server hands it the qwerty rig head exactly as it does
+		// with no controller running. Keying on `workspace_mode` then cancelled
+		// the 1.6 m back out and dropped the camera to the floor with the cube
+		// overhead, purely because a shell happened to be running. Key on the
+		// thing the flag was standing in for: did the server send a real head
+		// pose? An identity T_xdev_head means it did not (workspace tiles,
+		// controller chrome) and the standard chain still owns those.
+		const bool server_sent_head_pose =
+		    (T_xdev_head.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0 &&
+		    !m_pose_is_identity(&T_xdev_head.pose);
 		const bool hosted_ipc_world_absolute =
 		    !server_display_relative && !have_eyes && !have_eye_override && !sess->is_appcontainer &&
-		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
-		    !sess->sys->xsysc->info.workspace_mode && !sess->has_external_window &&
-		    !sess->is_bridge_relay;
+		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode && server_sent_head_pose &&
+		    !sess->has_external_window && !sess->is_bridge_relay;
 
 		if (server_display_relative && !have_eyes && !have_eye_override) {
 			// Use server poses directly (display-relative)
