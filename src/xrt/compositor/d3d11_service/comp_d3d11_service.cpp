@@ -523,6 +523,28 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! #1018: serialises this client's ATLAS WRITE SET against readers.
+	//!
+	//! All GPU work goes through the one shared immediate context, so GPU
+	//! EXECUTION is already in submission order (#996). The tear is purely
+	//! CPU-side: the render thread can submit its crop BETWEEN this client's
+	//! per-view tile submissions, handing the DP an atlas that is half this
+	//! frame and half the last one.
+	//!
+	//! LOCK RULES — read before using:
+	//!  - The WRITER (this client's IPC thread) blocks on it, but only across
+	//!    the tile-blit submissions, which take microseconds.
+	//!  - READERS MUST `try_lock` AND NEVER BLOCK. This is not a style
+	//!    preference: the client's commit takes `render_mutex` at several
+	//!    points inside the surrounding region, and the render thread already
+	//!    holds `render_mutex` when it reads an atlas — a blocking reader is
+	//!    a textbook ABBA deadlock. A reader that cannot get the lock skips
+	//!    its crop and re-shows the previous frame, which is exactly the
+	//!    seqlock behaviour we want and strictly better than a tear.
+	//!  - Consequently it is a LEAF only for readers. Never wait on anything
+	//!    else while holding it as a writer either.
+	std::mutex atlas_submit_mutex;
+
 	//! #1019: this client's next commit-pacing deadline (monotonic ns, 0 =
 	//! unsynced). ABSOLUTE and advanced by exactly one display period per
 	//! commit, so render/commit time is absorbed inside the interval rather
@@ -1239,6 +1261,9 @@ struct d3d11_service_system
 	std::atomic<uint32_t> render_diag_pipe_flat_present{0};
 	std::atomic<uint32_t> render_diag_pipe_flat_skip{0};
 	std::atomic<uint32_t> render_diag_pipe_rebind{0};
+	//! #1018: times a reader had to skip an atlas because the owning client
+	//! was mid-write. Non-zero proves the tear window is real AND closed.
+	std::atomic<uint32_t> render_diag_atlas_contention{0};
 	std::atomic<int> render_diag_pipe_presenter{0};
 	/*! @} */
 
@@ -6439,6 +6464,33 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
  *        this frame), NOT sys->tile_columns — see #575 / ADR-030. For a mono
  *        frame this is 1×1 even when the content rendering mode is still 3D.
  */
+/*!
+ * #1018: take a client's atlas for READING, without ever blocking.
+ *
+ * Readers run on the render thread holding `render_mutex`; the writing
+ * client takes `render_mutex` at points inside its commit. Blocking here
+ * would deadlock (see the atlas_submit_mutex field comment), so a reader
+ * that loses the race simply does not read this frame: the caller re-shows
+ * whatever it cropped last, which is a whole frame old rather than half of
+ * two frames stitched together.
+ *
+ * Contention is counted, not logged — it surfaces as `[RENDER]
+ * atlas_contention=N`, which is how we know the window is real and shut.
+ */
+struct atlas_read_guard
+{
+	std::unique_lock<std::mutex> lock;
+	bool held;
+
+	atlas_read_guard(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+	    : lock(c->atlas_submit_mutex, std::try_to_lock), held(lock.owns_lock())
+	{
+		if (!held && sys != nullptr) {
+			sys->render_diag_atlas_contention.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+};
+
 static ID3D11ShaderResourceView *
 service_crop_atlas_for_dp(struct d3d11_service_system *sys,
                           struct d3d11_client_render_resources *res,
@@ -7168,11 +7220,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		uint32_t fp = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
 		uint32_t fs = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
 		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
+		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
 		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
 		U_LOG_W(
 		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
-		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u presenter=%d window_s=10",
-		    ap, as, ab, fp, fs, rb, pk);
+		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u atlas_contention=%u "
+		    "presenter=%d window_s=10",
+		    ap, as, ab, fp, fs, rb, ac, pk);
 	}
 
 	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
@@ -9042,7 +9096,15 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	// Atlas storage is R8G8B8A8_TYPELESS and the back buffer R8G8B8A8_UNORM —
 	// same format family, so a box copy is legal and needs no shader pass.
 	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
-	sys->context->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
+	{
+		// #1018: same rule for the courtesy repaint — skip rather than tear.
+		atlas_read_guard flat_guard(sys, c);
+		if (!flat_guard.held) {
+			sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		sys->context->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
+	}
 	// Never vsync-pace an unfocused window: sync interval 0 either way.
 	(void)pipeline_present_app_hwnd(c, /*paced*/ false);
 	sys->render_diag_pipe_flat_present.fetch_add(1, std::memory_order_relaxed);
@@ -9737,6 +9799,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 
 	uint32_t cols = fc->pipe_tile_columns > 0 ? fc->pipe_tile_columns : 1;
 	uint32_t rows = fc->pipe_tile_rows > 0 ? fc->pipe_tile_rows : 1;
+	// #1018: never crop an atlas its owner is mid-write into. A miss re-shows
+	// the previous crop (one frame stale) instead of tearing.
+	atlas_read_guard fc_atlas_guard(sys, fc);
+	if (!fc_atlas_guard.held) {
+		sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	ID3D11ShaderResourceView *dp_input_srv = service_crop_atlas_for_dp(
 	    sys, &fc->render, fc->pipe_content_w, fc->pipe_content_h, cols, rows, fc->atlas_flip_y);
 	t_crop_ns = (int64_t)os_monotonic_get_ns();
@@ -11695,6 +11764,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// HUD layer, t1 is bound to NULL — D3D11 returns float4(0)
 				// on sample, which makes the shader's compose collapse to a
 				// passthrough no-op (matches `cb->hud_present = 0`).
+				// #1018: the compose read of a client's atlas gets the same
+				// non-blocking guard as the direct path. Scope is deliberately
+				// just the bind+draw: the surrounding loop takes
+				// ws_snapshot_mutex, and holding a leaf across another lock is
+				// what the field comment forbids. On a miss this slot keeps last
+				// frame's pixels in the combined atlas.
+				struct d3d11_service_compositor *slot_cc = mc->clients[s].compositor;
+				std::unique_lock<std::mutex> slot_atlas_lock;
+				if (slot_cc != nullptr) {
+					slot_atlas_lock =
+					    std::unique_lock<std::mutex>(slot_cc->atlas_submit_mutex, std::try_to_lock);
+					if (!slot_atlas_lock.owns_lock()) {
+						sys->render_diag_atlas_contention.fetch_add(1,
+						                                            std::memory_order_relaxed);
+						continue;
+					}
+				}
 				ID3D11ShaderResourceView *content_srvs[2] = {slot_srv, hud_srv_to_bind};
 				sys->context->PSSetShaderResources(0, 2, content_srvs);
 				sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
@@ -15082,13 +15168,20 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		if (!zero_copy) {
-		// Blit each view into its atlas tile position
-		static bool logged_blit_path = false;
-		if (!logged_blit_path) {
-			U_LOG_W("Blit path: srgb=%d, blit_vs=%p -> %s",
-			        view_is_srgb[0], (void*)sys->blit_vs.get(),
-			        (view_is_srgb[0] && sys->blit_vs) ? "SHADER BLIT (linear output)" : "COPY (no conversion)");
-			logged_blit_path = true;
+			// #1018: the per-view tile submissions are the tear window — the
+			// render thread could submit its crop between two of them. Hold the
+			// client's atlas mutex across the whole set so a reader sees either
+			// all of this frame's tiles or none of them. Microseconds: these are
+			// submissions, not execution, and nothing inside waits on a lock.
+			std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
+			// Blit each view into its atlas tile position
+			static bool logged_blit_path = false;
+			if (!logged_blit_path) {
+				U_LOG_W("Blit path: srgb=%d, blit_vs=%p -> %s", view_is_srgb[0],
+				        (void *)sys->blit_vs.get(),
+				        (view_is_srgb[0] && sys->blit_vs) ? "SHADER BLIT (linear output)"
+				                                          : "COPY (no conversion)");
+				logged_blit_path = true;
 		}
 
 		// Record flip_y for multi-compositor render (GL clients need Y-flip)
