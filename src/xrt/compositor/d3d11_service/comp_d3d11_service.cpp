@@ -2176,6 +2176,24 @@ struct d3d11_multi_compositor
 	//! same-window presenter-kind change (present-owner vs opaque app).
 	bool panel_dp_client_presents;
 
+	//! #1016: the atlas ENCODING the panel DP currently carries (an
+	//! xrt_atlas_encoding, -1 = never set). The DP latches encoding per
+	//! instance, and with one DP per panel there are THREE writers into it —
+	//! the workspace compose, the direct/override path, and a present-owner's
+	//! weave_submit — so "what the last writer left" is not a safe default for
+	//! the next one. Tracked so every process_atlas site can assert what IT
+	//! needs while still only calling the vendor on a real change.
+	int panel_dp_encoding;
+
+	//! #1016: DP-state thrash detector. Counts encoding/transparency FLIPS in
+	//! a rolling one-second window; more than a couple per second means two
+	//! writers are fighting over the shared DP every frame, which is the
+	//! signature of the washed-out 3-way mix. Throttled log, render/IPC
+	//! threads under render_mutex.
+	int64_t dp_state_flip_window_ns;
+	uint32_t dp_state_flips;
+	int64_t dp_state_thrash_logged_ns;
+
 	//! #964: pacing hand-off for an APP_HWND active presenter.
 	//!
 	//! When the service window is hidden its swap chain stops signaling, so the
@@ -8494,6 +8512,116 @@ service_device_removed_exit_if_due(struct d3d11_service_system *sys)
 	ExitProcess(3);
 }
 
+/*!
+ * #1016: note that a shared-DP state bit actually FLIPPED, and complain when
+ * two writers are fighting over it every frame.
+ *
+ * One DP per panel means the workspace compose, the direct/override path and a
+ * present-owner's weave_submit all drive the same instance. Each of them now
+ * asserts what it needs before its own process_atlas, so a steady-state mix
+ * flips a bit at most once per handover. A sustained flip rate means the mix
+ * is interleaving per frame — exactly the state that produced washed-out
+ * WebXR under shell + browser (#1016) — and that should be visible in a log
+ * rather than only in the pixels.
+ */
+static void
+pipeline_dp_note_state_flip(struct d3d11_multi_compositor *mc, const char *what, const char *who)
+{
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (now_ns - mc->dp_state_flip_window_ns > 1000000000LL) {
+		mc->dp_state_flip_window_ns = now_ns;
+		mc->dp_state_flips = 0;
+	}
+	mc->dp_state_flips++;
+	if (mc->dp_state_flips > 2 && now_ns - mc->dp_state_thrash_logged_ns > 5000000000LL) {
+		mc->dp_state_thrash_logged_ns = now_ns;
+		U_LOG_W(
+		    "[pipeline] DP state thrash: encoding/transparency flipping between writers (%u flips/s, "
+		    "last %s by %s) — the shared panel DP is being contested every frame (#1016)",
+		    mc->dp_state_flips, what, who);
+	}
+}
+
+/*!
+ * #1016: THE way to set the panel DP's transparency mode.
+ *
+ * `client_presents` = the presenter composes the woven output itself, so the DP
+ * must alpha-gate only and never bake a captured background. Both the bind and
+ * every process_atlas call site go through here, so the state is asserted by
+ * whoever is about to weave rather than inherited from whoever wove last — a
+ * bind that DEFERS (a just-retired DP still owns the target window) or fails
+ * used to leave a present-owner's alpha-gate mode latched on the DP that the
+ * direct path then wove an opaque client through.
+ *
+ * No-ops on no change: the vendor plug-in logs every switch and this is a
+ * per-frame path. Render thread or an IPC thread, under render_mutex.
+ */
+static void
+pipeline_dp_set_transparency(struct d3d11_multi_compositor *mc,
+                             struct xrt_display_processor_d3d11 *dp,
+                             bool client_presents,
+                             const char *who)
+{
+	if (mc == nullptr || dp == nullptr || mc->panel_dp_client_presents == client_presents) {
+		return;
+	}
+	if (!xrt_display_processor_d3d11_set_transparent_background(dp, client_presents, client_presents)) {
+		return; // plug-in refused — leave the tracked state alone so we retry
+	}
+	mc->panel_dp_client_presents = client_presents;
+	pipeline_dp_note_state_flip(mc, "transparency", who);
+}
+
+/*!
+ * #1016: THE way to set the panel DP's atlas encoding. Same contract as
+ * pipeline_dp_set_transparency — asserted per call site, no-op on no change.
+ */
+static void
+pipeline_dp_set_encoding(struct d3d11_multi_compositor *mc,
+                         struct xrt_display_processor_d3d11 *dp,
+                         enum xrt_atlas_encoding encoding,
+                         const char *who)
+{
+	if (mc == nullptr || dp == nullptr) {
+		return;
+	}
+	if (mc->panel_dp_encoding == (int)encoding) {
+		return;
+	}
+	xrt_display_processor_d3d11_set_atlas_encoding(dp, encoding);
+	const bool was_known = mc->panel_dp_encoding >= 0;
+	mc->panel_dp_encoding = (int)encoding;
+	if (was_known) {
+		pipeline_dp_note_state_flip(mc, "encoding", who);
+	}
+}
+
+/*!
+ * #1016: the atlas encoding a SINGLE-CLIENT handoff must declare.
+ *
+ * Always ENCODED, and deliberately not derived from `atlas_holds_srgb_bytes`.
+ * That flag records the swapchain FORMAT, not the colour space of the bytes:
+ * true means an honest sRGB swapchain (bytes are gamma-encoded), but false —
+ * UNORM — is AMBIGUOUS, holding encoded bytes for most apps (every cube test
+ * app) and genuinely linear bytes for a few (the VK demos). ADR-021 resolves
+ * that ambiguity the same way in both places: UNORM stays on Model A.
+ *
+ * And a single-layer handoff is Model A by construction — one client, nothing
+ * to blend, pure passthrough — so LINEAR (Model B) cannot apply here at all;
+ * the compose path is the only Model B site, and only when EVERY contributing
+ * layer is honest sRGB. Declaring LINEAR off a UNORM client would tell the DP
+ * to encode already-encoded bytes: the washed-out, milky result.
+ *
+ * The client is taken so the reasoning has a home if per-client handoff
+ * negotiation ever arrives; today the answer is the same for every client.
+ */
+static inline enum xrt_atlas_encoding
+service_single_client_atlas_encoding(const struct d3d11_service_compositor *c)
+{
+	(void)c;
+	return XRT_ATLAS_ENCODING_ENCODED;
+}
+
 static void
 pipeline_bind_panel_dp(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
@@ -8511,9 +8639,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		// changed on the same window (present-owner <-> opaque app): keep the
 		// DP's transparency mode in step with the presenter.
 		if (mc->panel_dp_client_presents != client_presents) {
-			(void)xrt_display_processor_d3d11_set_transparent_background(mc->display_processor,
-			                                                             client_presents, client_presents);
-			mc->panel_dp_client_presents = client_presents;
+			pipeline_dp_set_transparency(mc, mc->display_processor, client_presents, "bind");
 			static int64_t s_last_tp_log_ns = 0;
 			const int64_t tp_now_ns = (int64_t)os_monotonic_get_ns();
 			if (tp_now_ns - s_last_tp_log_ns > 5LL * 1000000000LL) {
@@ -8589,6 +8715,10 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	mc->display_processor = fresh;
 	mc->panel_dp_hwnd = hwnd;
 	mc->panel_dp_client_presents = client_presents;
+	// #1016: a fresh DP starts on the plug-in's ENCODED default and no writer
+	// has touched it yet — record "unknown" so the first process_atlas site
+	// asserts its own encoding rather than trusting that default.
+	mc->panel_dp_encoding = -1;
 
 	if (mc->window != nullptr && hwnd == mc->hwnd) {
 		comp_d3d11_window_set_workspace_dp(mc->window, fresh);
@@ -9442,10 +9572,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		sys->context->RSSetViewports(1, &full_vp);
 		D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
 		sys->context->RSSetScissorRects(1, &full_scissor);
-		// ADR-021 Model A: one client, nothing to blend — the atlas carries
-		// the app's own ENCODED bytes straight through. Stated explicitly
-		// because the compose path may have left the shared DP on LINEAR.
-		xrt_display_processor_d3d11_set_atlas_encoding(dp, XRT_ATLAS_ENCODING_ENCODED);
+		// #1016: this call site owns the DP's state. Three writers share one
+		// panel DP — the workspace compose, this path, and a present-owner's
+		// weave_submit — so neither the encoding nor the transparency mode may
+		// be inherited from whoever wove last. The bind above normally sets
+		// transparency, but it DEFERS when a just-retired DP still owns the
+		// target window (250 ms) and returns early when the factory is absent
+		// or fails; in the 3-way mix those frames wove an opaque client through
+		// a DP the browser had left in alpha-gate mode — washed-out WebXR.
+		pipeline_dp_set_transparency(mc, dp, kind == PRESENTER_CLIENT_TEXTURE, "direct");
+		pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(fc), "direct");
 		g_weave_latency_workspace.mark_weave("pipeline");
 		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
@@ -12107,9 +12243,18 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// (append-only setter; the format arg stays the real DXGI format so
 		// older plug-ins are unaffected). LINEAR under Model B (the DP performs
 		// the matched output encode), ENCODED under Model A (passthrough).
-		xrt_display_processor_d3d11_set_atlas_encoding(
-		    mc->display_processor,
-		    compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED);
+		// #1016: same per-call ownership as the other two writers. The model
+		// decision itself is unchanged; what is new is that it is asserted
+		// through the shared tracker, and that the compose path also states
+		// its TRANSPARENCY need. It presents opaquely into the service window
+		// (the DP owns see-through), which is what activate binds it with —
+		// but a background present-owner's weave_submit flips the shared DP to
+		// alpha-gate between compose ticks, and nothing flipped it back for
+		// the compose itself.
+		pipeline_dp_set_transparency(mc, mc->display_processor, /*client_presents*/ false, "compose");
+		pipeline_dp_set_encoding(mc, mc->display_processor,
+		                         compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED,
+		                         "compose");
 		g_weave_latency_workspace.mark_weave("workspace");
 		// Timing feedback: measured weave→scanout of the last completed frame
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
@@ -16550,10 +16695,15 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// only (the plug-in logs every switch): the mode is recorded on mc and the
 	// render thread's pipeline_bind_panel_dp() switches it back for its own
 	// opaque presenter on its next frame.
-	if (dp_is_shared && sys->multi_comp != nullptr && !sys->multi_comp->panel_dp_client_presents) {
-		if (xrt_display_processor_d3d11_set_transparent_background(dp, true, true)) {
-			sys->multi_comp->panel_dp_client_presents = true;
-		}
+	if (dp_is_shared && sys->multi_comp != nullptr) {
+		pipeline_dp_set_transparency(sys->multi_comp, dp, /*client_presents*/ true, "weave");
+		// #1016: and STATE THE ENCODING. This site set none at all, relying on
+		// the plug-in's ENCODED default — which holds only for a per-client DP.
+		// On the shared panel DP a workspace compose tick can have left LINEAR
+		// behind, and the present-owner's next weave then handed encoded bytes
+		// to a DP that had been told they were linear. A present-owner weave is
+		// single-layer Model A passthrough, exactly like the direct path.
+		pipeline_dp_set_encoding(sys->multi_comp, dp, service_single_client_atlas_encoding(c), "weave");
 	}
 	if (dp_is_shared) {
 		static std::atomic_flag s_logged = ATOMIC_FLAG_INIT;
