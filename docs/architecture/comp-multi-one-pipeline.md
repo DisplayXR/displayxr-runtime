@@ -1,7 +1,7 @@
 ---
-status: Active (design note for #967; Phase 3/5 of ADR-035, epic #974)
+status: Active (design note for #967; Phase 3/5 of ADR-035, epic #974). D-4/D-5 re-scoped 2026-08-18 as an opt-in Android **workspace overlay mode** by ADR-036 / epic #1031 — the Android default is the per-window path.
 owner: David Fattal
-updated: 2026-08-17
+updated: 2026-08-18
 anchors: main @ 32cd9612d
 code-paths: [src/xrt/compositor/multi/, src/xrt/compositor/null/null_compositor.c, src/xrt/targets/common/target_instance.c]
 ---
@@ -81,19 +81,34 @@ spec for that work.
   lock, drop it, then record/submit/DP/present. macOS first (one submit+present per frame,
   local change); Android after D-4. A per-client render lock, if needed, sits *below*
   `list_and_timing_lock → slot_lock`.
-- **D-4 Android shared-surface port** = the D3D11 "one pipeline" shape: de-`#ifdef` the
-  macOS shared block in `comp_multi_private.h`, generalise target acquisition (NSWindow ←
+- **D-4 Android WORKSPACE OVERLAY MODE** (opt-in via a workspace controller; shared surface
+  + one DP + mode channel). **Re-scoped 2026-08-18 by [ADR-036](../adr/ADR-036-android-per-window-compositor-instances.md)
+  / #1031: this is no longer the Android default.** The Android **default is the per-window
+  path** — every app keeps its own Surface, its own compositor instance and its own DP, and
+  SurfaceFlinger composites them (ADR-036 D1/D2/D3). The shared-surface shape is entered
+  **only when a registered workspace controller activates it**
+  ([workspace-controller-registration.md](../specs/runtime/workspace-controller-registration.md)),
+  exactly as on Windows — a spatial-desktop overlay, not a replacement for the platform's
+  window manager.
+
+  Mechanically unchanged when that mode *is* active: de-`#ifdef` the macOS shared block in
+  `comp_multi_private.h`, generalise target acquisition (NSWindow ←
   `comp_target_service_create(…, NULL, …)` vs `ANativeWindow` ← `android_globals`), one atlas,
-  **one DP**, N clients composited; delete the per-client target/DP path on Android (keeping
-  the pause-not-destroy rule). It needs the same **default presenter policy + focus rule**
-  as `service-one-pipeline.md` D-3/D-5 (focused = newest committed client, shown
-  full-screen at native res in its requested mode; compositor slot table is the focus
-  authority; IPC mirrors) — without it a correct atlas has nothing deciding what fills it.
+  **one DP**, N clients composited at controller-supplied poses. What changes vs the original
+  plan: the per-client target/DP path on Android is **kept**, not deleted — it is the default
+  — so the shared path is added *alongside* it and the two are selected by controller
+  presence (keeping the Android pause-not-destroy rule in both). The **default presenter
+  policy + focus rule** of `service-one-pipeline.md` D-3/D-5 (focused = newest committed
+  client, shown full-screen at native res in its requested mode; compositor slot table is the
+  focus authority; IPC mirrors) applies **within** the overlay mode, deciding what fills the
+  shared atlas; with no controller there is no shared atlas to fill.
 - **D-5 Shared-DP mode channel** (2D/3D + tile grid on `shared_dp`, currently absent on
-  macOS and inherited by the Android port) is a distinct gap: route
+  macOS and inherited by the Android overlay mode) is a distinct gap: route
   `multi_compositor_request_display_mode` to `shared_dp` under the panel-lease rule when
-  the shared surface is active. Ships with D-4 (Android needs it for hardware 3D); macOS
-  benefits for free.
+  the shared surface is active. Ships with D-4 (the overlay mode needs it for hardware 3D on
+  Android); macOS benefits for free. In the per-window default the mode channel stays where
+  it is today — per-client DP — with the display-global lens state refcounted across
+  instances (ADR-036 D1).
 
 ## 3. Issue split
 
@@ -102,12 +117,21 @@ spec for that work.
 | #967a | D-1: header truth + loud `MULTI_MAX_CLIENTS` overflow | all | low |
 | #967b | D-2: bounded waits + per-client stall deadline | all | medium |
 | #967c | D-3: GPU work out of `list_and_timing_lock` | macOS, then Android | medium |
-| #967d | D-4 + D-5: Android shared-surface port with default policy + shared-DP mode channel | Android (macOS gains the mode channel) | high; needs device validation |
+| #967d (#1006) | D-4 + D-5: Android **workspace overlay mode** (opt-in via a registered workspace controller) — shared surface + one DP + presenter policy + shared-DP mode channel. **Not the Android default**; the per-window path (ADR-036, epic #1031) is | Android (macOS gains the mode channel) | high; needs device validation |
 
 Order: a → b → c(macOS) → d → c(Android). #967a/b can ship before #964 settles; c/d take
 the presenter-policy shape from `service-one-pipeline.md` once it is live-validated on Windows.
+D-1/D-2/D-3 are unaffected by the ADR-036 re-scope — they help every path, per-window and
+overlay alike — and are no longer blocked on deciding the Android shape.
 
-## 4. Done-when (unchanged from #967)
+## 4. Done-when
 
-Two IPC clients on an Android device both visible (composited) with one DP; killing one does
-not stall the other's frames; macOS unchanged; Linux unaffected beyond bounded waits.
+- **D-1/D-2/D-3 (all platforms):** banners tell the truth and slot exhaustion fails the create
+  loudly; no unbounded wait remains on the main loop, and a stalled client is skipped rather
+  than blocking the loop; GPU work and present run outside `list_and_timing_lock`. macOS
+  unchanged behaviourally; Linux unaffected beyond bounded waits.
+- **D-4/D-5 (Android overlay mode, #1006):** with a registered workspace controller active,
+  two IPC clients are both visible (composited into one atlas through one DP) and killing one
+  does not stall the other's frames; the shared DP accepts mode requests under the panel
+  lease. **The per-window default is unaffected** — with no controller active, each client
+  still renders to its own target with its own DP, and that path must show no regression.
