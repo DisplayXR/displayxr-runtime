@@ -372,18 +372,44 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 
 	*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
 
-	// #902: the layer is an optimization, never a break — if the loader can't
-	// find it, retry with the app's own layer list and let the compositor
-	// fall back (no marker → repaint stays off on single-queue GPUs).
-	if (merged_layers != NULL && *vulkanResult == VK_ERROR_LAYER_NOT_PRESENT) {
-		oxr_warn(log,
-		         "#902: VK_LAYER_DXR_queue_lock not found by the Vulkan loader — retrying without it "
-		         "(shared-queue late-weave repaint unavailable; check the layer manifest / VK_LAYER_PATH)");
+	/*
+	 * #902: the layer is an optimization, never a break. If the FIRST attempt
+	 * failed for ANY reason while our layer was injected — the loader could not
+	 * find it, or it was found and loaded but its presence broke creation for
+	 * this app (the Vulkan media-player demo got VK_ERROR_OUT_OF_HOST_MEMORY)
+	 * — strip our layer and retry exactly once with the app's own layer list,
+	 * letting the compositor fall back (no marker → repaint stays off on
+	 * single-queue GPUs). The retry cannot double-inject: merged_layers is only
+	 * non-NULL when the app did NOT request the layer itself, and the retry
+	 * restores the app's own array verbatim.
+	 */
+	if (merged_layers != NULL && *vulkanResult != VK_SUCCESS) {
+		VkResult first_result = *vulkanResult;
+		if (first_result == VK_ERROR_LAYER_NOT_PRESENT) {
+			oxr_warn(log,
+			         "#902: VK_LAYER_DXR_queue_lock not found by the Vulkan loader — retrying without "
+			         "it (shared-queue late-weave repaint unavailable; check the layer manifest / "
+			         "VK_LAYER_PATH)");
+		} else {
+			oxr_warn(log,
+			         "#902: vkCreateInstance failed with %s while VK_LAYER_DXR_queue_lock was injected "
+			         "— retrying without it (the layer is an optimization, never a break; shared-queue "
+			         "late-weave repaint unavailable)",
+			         vk_result_string(first_result));
+		}
 		modified_info.ppEnabledLayerNames = createInfo->vulkanCreateInfo->ppEnabledLayerNames;
 		modified_info.enabledLayerCount = createInfo->vulkanCreateInfo->enabledLayerCount;
+		*vulkanInstance = VK_NULL_HANDLE;
 		*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
+		if (*vulkanResult != VK_SUCCESS) {
+			oxr_warn(log,
+			         "#902: the retry without VK_LAYER_DXR_queue_lock also failed (%s; the first, "
+			         "injected attempt returned %s) — reporting the retry's result to the app",
+			         vk_result_string(*vulkanResult), vk_result_string(first_result));
+		}
 	}
 	free(merged_layers);
+	merged_layers = NULL;
 
 
 	// Logging
