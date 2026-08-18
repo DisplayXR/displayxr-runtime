@@ -10,6 +10,7 @@
 
 #include "d3d/d3d_d3d11_helpers.hpp"
 
+#include "os/os_time.h" // os_monotonic_get_ns
 #include "util/u_logging.h"
 
 #include <d3d11_4.h> // ID3D11Fence / ID3D11DeviceContext4
@@ -35,7 +36,13 @@ struct comp_d3d_transparent_presenter
 
 	com_ptr<ID3D11Texture2D> output_texture; //!< imported shared service output
 	com_ptr<ID3D11Fence> output_fence;       //!< imported service→client fence
-	uint64_t present_value = 0;              //!< client wait counter (lockstep with the service)
+	//! Highest fence value we have already put on screen. We follow the fence's OWN
+	//! completed value rather than counting our commits — see the present function.
+	uint64_t presented_value = 0;
+	//! For the "no new weave landed" diagnostic. Armed at create so the very first
+	//! second of silence is reported too — the case where the client never presents at
+	//! ALL is exactly the one worth naming.
+	int64_t last_present_ns = 0;
 
 	com_ptr<IDXGISwapChain1> swapchain; //!< DComp composition swap chain
 	com_ptr<IDCompositionDevice> dcomp_device;
@@ -43,6 +50,7 @@ struct comp_d3d_transparent_presenter
 	com_ptr<IDCompositionVisual> dcomp_visual;
 
 	uint32_t width = 0, height = 0;
+	bool first_present_logged = false;
 };
 
 extern "C" struct comp_d3d_transparent_presenter *
@@ -125,6 +133,25 @@ comp_d3d_transparent_presenter_create(void *existing_d3d11_device,
 		THROW_IF_FAILED(dxgi_dev->GetAdapter(adapter.put()));
 		THROW_IF_FAILED(adapter->GetParent(IID_PPV_ARGS(factory.put())));
 
+		/*
+		 * Name the adapter this composition swap chain lives on. DirectComposition
+		 * hands the swap chain straight to dwm.exe, so if we are not on the adapter
+		 * DWM composites this window's monitor with, the visual can go unseen with
+		 * every call still returning S_OK — see the notes on the present function.
+		 * One line, once per presenter: this is the first thing to check when a
+		 * transparent client presents happily and shows nothing.
+		 */
+		{
+			DXGI_ADAPTER_DESC ad = {};
+			if (SUCCEEDED(adapter->GetDesc(&ad))) {
+				U_LOG_W(
+				    "[ADR-029] transparent present swap chain on adapter '%ls' "
+				    "(LUID %08lx-%08lx)",
+				    ad.Description, (unsigned long)ad.AdapterLuid.HighPart,
+				    (unsigned long)ad.AdapterLuid.LowPart);
+			}
+		}
+
 		DXGI_SWAP_CHAIN_DESC1 sd = {};
 		sd.Width = width;
 		sd.Height = height;
@@ -156,6 +183,7 @@ comp_d3d_transparent_presenter_create(void *existing_d3d11_device,
 		return fail();
 	}
 
+	p->last_present_ns = (int64_t)os_monotonic_get_ns();
 	U_LOG_W("transparent presenter ready (hwnd=0x%llx %ux%u) — DWM blends live desktop into the "
 	        "DP alpha-gate holes",
 	        (unsigned long long)hwnd_val, width, height);
@@ -168,16 +196,54 @@ comp_d3d_transparent_presenter_present(struct comp_d3d_transparent_presenter *p)
 	if (p == nullptr || !p->swapchain || !p->output_fence || !p->context) {
 		return;
 	}
-	// Lockstep with the service: it bumps + signals once per commit, we bump + wait once per
-	// commit, so this value always matches the frame just weaved.
-	p->present_value++;
-	p->context->Wait(p->output_fence.get(), p->present_value);
+
+	/*
+	 * Follow the fence, do not COUNT.
+	 *
+	 * This used to assume strict lockstep — "the service signals once per commit, so
+	 * bump a local counter and GPU-wait it". The service does NOT signal once per
+	 * commit: `pipeline_client_texture_weave` legitimately skips (this client is not
+	 * the panel owner, the device was removed, the RTV/atlas is not up yet), and each
+	 * skip left the local counter permanently AHEAD of the fence. The GPU then sat on
+	 * a `Wait` for a value that would never be signalled, `Present` blocked behind it,
+	 * and the app's frame thread wedged — with a window that had never been presented,
+	 * i.e. fully transparent, forever. One skipped commit at startup was enough; every
+	 * forced-IPC transparent client froze on its first frame.
+	 *
+	 * `GetCompletedValue()` is the fence's own truth and it is monotonic, so:
+	 *   - a value <= completed is GPU-complete ⇒ the weave for it has finished and the
+	 *     shared texture can be copied with NO wait at all (strictly safer than before);
+	 *   - a value > completed may never arrive ⇒ never wait for one.
+	 * If nothing new landed we simply keep the frame DComp is already showing. So a
+	 * client that loses the panel freezes its picture instead of freezing its thread.
+	 */
+	const uint64_t completed = p->output_fence->GetCompletedValue();
+	if (completed <= p->presented_value) {
+		// Nothing new weaved for us. Say so, at most once a second, because the visible
+		// symptom (a window that stops updating) is otherwise unattributable.
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		if (now_ns - p->last_present_ns > 1000000000LL) {
+			p->last_present_ns = now_ns;
+			U_LOG_W(
+			    "[ADR-029] no new weave landed (fence completed=%llu, already shown=%llu) — the "
+			    "window keeps whatever it last presented",
+			    (unsigned long long)completed, (unsigned long long)p->presented_value);
+		}
+		return;
+	}
+	p->presented_value = completed;
+	p->last_present_ns = (int64_t)os_monotonic_get_ns();
 
 	com_ptr<ID3D11Texture2D> back;
 	if (SUCCEEDED(p->swapchain->GetBuffer(0, IID_PPV_ARGS(back.put()))) && back) {
 		p->context->CopyResource(back.get(), p->output_texture.get());
 	}
-	p->swapchain->Present(1, 0);
+	HRESULT phr = p->swapchain->Present(1, 0);
+	if (!p->first_present_logged) {
+		p->first_present_logged = true;
+		U_LOG_W("[ADR-029] first transparent present landed (fence=%llu hr=0x%08lx)",
+		        (unsigned long long)completed, phr);
+	}
 	// Publish the new frame to dwm.exe (cheap delta-state IPC, no GPU work).
 	if (p->dcomp_device) {
 		p->dcomp_device->Commit();

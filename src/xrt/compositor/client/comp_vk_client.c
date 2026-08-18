@@ -16,6 +16,27 @@
 
 #include "comp_vk_client.h"
 
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+#include <windows.h> // CloseHandle
+
+#include "client/comp_d3d_transparent_present.h"
+
+// ADR-029 (#573) — transparent compositing output bridges, defined in
+// src/xrt/ipc/client/ipc_client_compositor.c (resolved at link time). Shared
+// with the D3D11/D3D12/GL clients.
+extern xrt_result_t
+comp_ipc_client_compositor_get_transparent_output(struct xrt_compositor *xc,
+                                                  bool *out_have_output,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height,
+                                                  uint64_t *out_hwnd,
+                                                  xrt_graphics_buffer_handle_t *out_handle);
+extern xrt_result_t
+comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *xc,
+                                                        bool *out_have_fence,
+                                                        xrt_graphics_sync_handle_t *out_handle);
+#endif
+
 #include "util/u_logging.h"
 #include "os/os_time.h" // os_monotonic_get_ns — VK [COMMIT_PROFILE_CLIENT]
 
@@ -528,6 +549,10 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
 		c->workspace_sync_semaphore = VK_NULL_HANDLE;
 	}
 
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+	comp_d3d_transparent_presenter_destroy(&c->transparent); // ADR-029 (#573)
+#endif
+
 	// Now safe to free the pool.
 	vk_cmd_pool_destroy(vk, &c->pool);
 
@@ -813,21 +838,37 @@ client_vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	xrt_result_t xret = XRT_SUCCESS;
 	if (submit_handle(c, sync_handle, &xret)) {
-		return xret;
+		// Landed. Fall through to the transparent present below.
 	} else if (submit_fallback(c, &xret)) {
 		// In IPC/workspace mode, skip semaphore and fence paths — the app's VK
 		// device dispatch table may have null entries for extension functions
 		// that the IPC compositor's VK bundle expects. The fallback path uses
 		// only core VK functions (vkQueueWaitIdle) and is safe.
-		return xret;
 	} else if (submit_semaphore(c, &xret)) {
-		return xret;
+		// Landed.
 	} else if (submit_fence(c, &xret)) {
-		return xret;
+		// Landed.
 	} else {
 		// Really bad state.
 		return XRT_ERROR_VULKAN;
 	}
+
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+	/*
+	 * ADR-029 (#573): a transparent forced-IPC client owns its own present. The
+	 * submit above is the layer-commit RPC, so by here the service has weaved
+	 * this client's atlas into the shared output texture and signaled the
+	 * service->client fence (#1017 moved that work onto the service's IPC thread
+	 * for this client, but it still completes inside the commit call). Now put
+	 * those pixels on the app's window.
+	 *
+	 * No-op — a single NULL check — for every client that is not transparent,
+	 * which is all of them off the forced-IPC path.
+	 */
+	comp_d3d_transparent_presenter_present(c->transparent);
+#endif
+
+	return xret;
 }
 
 static xrt_result_t
@@ -1171,6 +1212,50 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		vk->vkGetPhysicalDeviceProperties(vk->physical_device, &pdp);
 		c->base.base.info.max_texture_size = pdp.limits.maxImageDimension2D;
 	}
+
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+	/*
+	 * ADR-029 (#573) — transparent compositing output. If the service made a
+	 * shared output texture for this (transparent) client, hand the texture +
+	 * service->client fence to the render-API-agnostic presenter, which stands up
+	 * a transparent DirectComposition swap chain on the app's own window.
+	 *
+	 * Vulkan passes NULL for the device: the present is pure D3D11 + DComp on
+	 * handles any D3D11 device can open, so the helper makes its own small device
+	 * rather than dragging the app's VkDevice into it. Same call the D3D12 and GL
+	 * (win32) clients make.
+	 *
+	 * Without this a forced-IPC transparent Vulkan client showed an ENTIRELY
+	 * TRANSPARENT window: service-side it is a `PRESENTER_CLIENT_TEXTURE` client,
+	 * so the service deliberately does not present it — it weaves into the shared
+	 * texture and waits for the client to put it on screen. Nobody did. The
+	 * D3D11/D3D12/GL clients had this wiring from #573; Vulkan was simply missed,
+	 * and the app's own window stayed as empty as the day it was created.
+	 *
+	 * Non-fatal: any failure leaves `transparent` NULL and this client behaves
+	 * exactly as it did before.
+	 */
+	{
+		bool have_out = false, have_fence = false;
+		uint32_t tw = 0, th = 0;
+		uint64_t hwnd_val = 0;
+		xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		xrt_graphics_sync_handle_t fence_h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t oret = comp_ipc_client_compositor_get_transparent_output(&xcn->base, &have_out, &tw, &th,
+		                                                                      &hwnd_val, &tex_h);
+		if (oret == XRT_SUCCESS && have_out && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID && hwnd_val != 0) {
+			(void)comp_ipc_client_compositor_get_transparent_output_fence(&xcn->base, &have_fence,
+			                                                              &fence_h);
+			// The presenter consumes (closes) both handles regardless of outcome.
+			c->transparent = comp_d3d_transparent_presenter_create(NULL, hwnd_val, tw, th, tex_h, fence_h);
+			U_LOG_W("[ADR-029] VK client transparent present %s (%ux%u hwnd=0x%llx fence=%d)",
+			        c->transparent != NULL ? "ACTIVE" : "setup FAILED — window stays as the app left it",
+			        tw, th, (unsigned long long)hwnd_val, (int)have_fence);
+		} else if (tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+			CloseHandle((HANDLE)tex_h);
+		}
+	}
+#endif
 
 	if (!c->renderdoc_enabled) {
 		return c;
