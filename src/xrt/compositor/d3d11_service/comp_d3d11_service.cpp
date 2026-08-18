@@ -167,6 +167,13 @@ dxr_app_hwnd_latency()
 	return (UINT)latency;
 }
 
+//! #1014 Bug B: how long the ACTIVE presenter's frame-latency waitable may stay
+//! unsignaled on a genuinely presentable window before we call it a drained
+//! semaphore and re-prime the chain. Comfortably longer than any vblank jitter
+//! or DWM hiccup (~500 ms = 30 missed frames at 60 Hz), short enough that a
+//! user Alt-Tabbing back never sees a frozen window for long.
+#define DXR_WAITABLE_DESYNC_MS 500
+
 static bool
 dxr_legacy_standalone_enabled()
 {
@@ -531,6 +538,34 @@ struct d3d11_service_compositor
 	//! the duration watchdog trips (a Present that took > 20 ms).
 	int64_t last_flat_present_ns;
 	int64_t present_backoff_until_ns;
+
+	//! #1014 Bug B: waitable-desync recovery for an APP_HWND presenter.
+	//!
+	//! The frame-latency waitable is a SEMAPHORE, and its count can be lost:
+	//! the pacer waits on the chain published LAST frame, so a focus change in
+	//! between consumes a slot the frame then never presents, and a Present
+	//! that comes back DXGI_STATUS_OCCLUDED (a parked/covered window) may not
+	//! return one either. Lose enough and the count sits at 0 forever — the
+	//! zero-timeout probe misses every frame and the presenter is dead with a
+	//! stale frame on screen (measured: pipe_active_present 14 then 0, skip
+	//! ~465/10 s, for as long as the client lived).
+	//!
+	//! Rather than try to make the accounting exact across every park/restore
+	//! path, we detect the stuck state and re-prime: `probe_miss_since_ns` is
+	//! when this presenter's probe last started missing while its window was
+	//! genuinely presentable, and `force_unpaced_present` tells the present
+	//! site to hand over with Present(0, DO_NOT_WAIT) for that one recovery
+	//! frame — we have no grant, so it must not be allowed to block.
+	//! `was_iconic` catches the restore edge so a stale backoff cannot outlive
+	//! the park that caused it.
+	int64_t probe_miss_since_ns;
+	bool force_unpaced_present;
+	bool was_iconic;
+	//! Was this client the ACTIVE presenter last time we asked? A chain that
+	//! has just taken over is the one whose latency budget the previous focus
+	//! holder's pacing wait most likely spent, so it is re-primed up front
+	//! rather than after the desync watchdog has let a stale frame sit.
+	bool was_active_presenter;
 
 	//! #925 S4 tier 2: this client may hold a multi-comp slot (i.e. it is
 	//! neither a bridge relay nor a workspace controller). Gates the commit-
@@ -8592,6 +8627,28 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 	if (out_backoff != nullptr) {
 		*out_backoff = false;
 	}
+	c->force_unpaced_present = false;
+
+	HWND h = c->render.hwnd;
+	const bool have_window = h != nullptr && IsWindow(h);
+	const bool iconic = have_window && IsIconic(h) != FALSE;
+
+	// #1014 Bug B: the park -> restore edge. A parked window's presents come
+	// back DXGI_STATUS_OCCLUDED, which arms the 1 s backoff; without this the
+	// backoff outlives the park and the first second after a restore is spent
+	// refusing to draw. Restoring also invalidates everything we believed
+	// about the chain's latency semaphore, so the desync clock restarts here.
+	if (have_window && c->was_iconic && !iconic) {
+		c->was_iconic = false;
+		c->present_backoff_until_ns = 0;
+		c->probe_miss_since_ns = 0;
+		if (out_backoff != nullptr) {
+			*out_backoff = false;
+		}
+	} else if (iconic) {
+		c->was_iconic = true;
+	}
+
 	if (now_ns < c->present_backoff_until_ns) {
 		// Parked by the duration watchdog / occlusion — the pathological case,
 		// counted apart from an ordinary "no free buffer yet" probe miss.
@@ -8600,11 +8657,30 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		}
 		return false;
 	}
-	HWND h = c->render.hwnd;
-	if (h == nullptr || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) {
+	if (!have_window || !IsWindowVisible(h) || iconic) {
+		// Not presentable at all — that is not a desync, so don't let the
+		// stuck-probe clock run while the window is parked.
+		c->probe_miss_since_ns = 0;
 		return false;
 	}
 	if (c->render.frame_latency_waitable != nullptr) {
+		// #1014: this presenter has JUST taken over. The pacer waits on the
+		// chain published by the PREVIOUS frame, so the handover reliably
+		// spends a slot on the outgoing chain and leaves the incoming one a
+		// budget short — the desync watchdog below would recover it, but only
+		// after DXR_WAITABLE_DESYNC_MS of stale frame on a window the user is
+		// looking at. Re-prime the budget on the switch instead, so the very
+		// first frame after an Alt-Tab has a grant.
+		if (is_active && !c->was_active_presenter) {
+			wil::com_ptr<IDXGISwapChain2> sc2;
+			if (c->render.swap_chain &&
+			    SUCCEEDED(c->render.swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+				sc2->SetMaximumFrameLatency(dxr_app_hwnd_latency());
+			}
+			c->probe_miss_since_ns = 0;
+		}
+		c->was_active_presenter = is_active;
+
 		// #964: the render thread may already have paced on THIS chain's
 		// waitable, which consumed the slot — probing again would report "not
 		// ready" for a buffer we hold. The token says so; it is keyed by the
@@ -8613,9 +8689,51 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		struct d3d11_multi_compositor *tmc = c->sys != nullptr ? c->sys->multi_comp : nullptr;
 		if (tmc != nullptr && tmc->app_present_token_sc == c->render.swap_chain.get() &&
 		    tmc->app_present_token.exchange(false, std::memory_order_acq_rel)) {
+			c->probe_miss_since_ns = 0;
 			return true;
 		}
-		return WaitForSingleObject(c->render.frame_latency_waitable, 0) == WAIT_OBJECT_0;
+		if (WaitForSingleObject(c->render.frame_latency_waitable, 0) == WAIT_OBJECT_0) {
+			c->probe_miss_since_ns = 0;
+			return true;
+		}
+
+		// Probe missed on a window that IS presentable. Ordinarily that is
+		// vblank jitter and the next tick gets it — but if it never comes back
+		// the chain's semaphore has been drained (see the field comment) and
+		// this presenter is dead forever. Only the ACTIVE presenter is worth
+		// recovering: an unfocused one is skipped by design.
+		if (!is_active) {
+			return false;
+		}
+		if (c->probe_miss_since_ns == 0) {
+			c->probe_miss_since_ns = now_ns;
+			return false;
+		}
+		if (now_ns - c->probe_miss_since_ns < DXR_WAITABLE_DESYNC_MS * 1000000LL) {
+			return false;
+		}
+
+		// Stuck. Re-prime the chain's latency budget, then force ONE present
+		// through unpaced so a completed flip re-signals the waitable and
+		// normal pacing resumes. Re-setting the maximum frame latency is the
+		// documented way to re-establish that budget; the unpaced present is
+		// the belt to its braces, because we are presenting without a grant
+		// and must not be allowed to block on a full queue.
+		wil::com_ptr<IDXGISwapChain2> sc2;
+		if (c->render.swap_chain && SUCCEEDED(c->render.swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+			sc2->SetMaximumFrameLatency(dxr_app_hwnd_latency());
+		}
+		c->force_unpaced_present = true;
+		c->probe_miss_since_ns = now_ns; // re-arm; recovery is rate-limited
+		static std::atomic<int64_t> s_last_desync_log_ns{0};
+		int64_t prev_ns = s_last_desync_log_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_desync_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "[pipeline] active presenter's frame-latency waitable stopped signaling for %d ms on a "
+			    "presentable window — re-priming the chain and forcing an unpaced present (#1014)",
+			    (int)DXR_WAITABLE_DESYNC_MS);
+		}
+		return true;
 	}
 	// Unpaced chain (the waitable flag was refused): the duration watchdog in
 	// pipeline_present_app_hwnd is the only guard, so don't hammer an
@@ -9440,8 +9558,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// The probe above guaranteed a free back buffer on a paced chain, so a
 		// plain Present(1, 0) is safe and vsync-paces the active window. An
 		// unpaced chain gets Present(0, DO_NOT_WAIT); both are watchdogged.
-		const bool paced = fc->render.frame_latency_waitable != nullptr;
+		// #1014: a recovery frame has NO grant (the probe never signaled), so
+		// it must hand over without waiting even though the chain is paced.
+		const bool paced = fc->render.frame_latency_waitable != nullptr && !fc->force_unpaced_present;
 		phr = pipeline_present_app_hwnd(fc, paced);
+		fc->force_unpaced_present = false;
 		sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 		if (phr == DXGI_ERROR_WAS_STILL_DRAWING || phr == DXGI_STATUS_OCCLUDED) {
 			phr = S_OK; // frame skipped / window not on screen — not an error
@@ -9457,13 +9578,24 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	 * the handle can never be closed while the thread is parked on it. Only an
 	 * APP_HWND presenter with a waitable qualifies — everything else keeps the
 	 * service window / tick pacing. */
+	IDXGISwapChain1 *next_pace_sc = nullptr;
 	if (kind == PRESENTER_APP_HWND && fc->render.frame_latency_waitable != nullptr) {
 		mc->pace_app_waitable = fc->render.frame_latency_waitable;
-		mc->pace_app_sc = fc->render.swap_chain.get();
+		next_pace_sc = fc->render.swap_chain.get();
 	} else {
 		mc->pace_app_waitable = nullptr;
-		mc->pace_app_sc = nullptr;
 	}
+	// #1014 Bug B: when the chain we pace on CHANGES, any outstanding token is
+	// dead weight — it was won on the old chain, whose slot is already spent,
+	// and holding it lets a much later frame present that chain on a grant that
+	// no longer corresponds to a free buffer. Drop it; the desync watchdog in
+	// pipeline_app_hwnd_ready is what recovers the lost slot. (Within ONE chain
+	// the token stays sticky — that fix is still load-bearing.)
+	if (next_pace_sc != mc->pace_app_sc) {
+		mc->app_present_token.store(false, std::memory_order_release);
+		mc->app_present_token_sc = nullptr;
+	}
+	mc->pace_app_sc = next_pace_sc;
 	if (FAILED(phr)) {
 		static std::atomic<int64_t> s_last_log_ns{0};
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
