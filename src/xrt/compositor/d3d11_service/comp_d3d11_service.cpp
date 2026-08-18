@@ -506,6 +506,11 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! #1019: when this client last passed the commit-pacing gate (monotonic
+	//! ns). Only a client arriving EARLY — faster than the display can show it
+	//! — is made to wait; an app already paced by xrWaitFrame never is.
+	int64_t last_commit_pace_ns;
+
 	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
 	//! client's own claim). Set by the IPC server right after session create.
 	//! Used to match the OS foreground window to a client by PROCESS when no
@@ -15713,6 +15718,63 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (c->presenter == PRESENTER_CLIENT_TEXTURE) {
 			pipeline_client_texture_weave(sys, c);
 		}
+
+		/*
+		 * #1019: COMMIT BACKPRESSURE. The pipeline commit ends at the atlas —
+		 * no Present, no wait — so nothing throttles a client that does not
+		 * pace itself. Legacy got that for free from its per-client
+		 * `Present(1, DO_NOT_WAIT)` + compositor-clock wait; the pipeline
+		 * dropped both.
+		 *
+		 * Measured on the legacy-WebXR bridge client: [CLIENT_FRAME_NS] p50
+		 * 3.4 ms, p90 4.3 ms — ~300 Hz, only 76/2000 commits near 17 ms.
+		 * Chrome free-ran and rewrote this client's atlas ~5x per displayed
+		 * frame, so the render thread cropped a half-overwritten atlas
+		 * (visible TEARING) and consecutive displayed frames came from
+		 * unrelated points in the app's timeline (the "fighting" stutter).
+		 * Apps that pace on xrWaitFrame — the cubes, Unity — were never
+		 * affected, which is why this only ever showed up in WebXR.
+		 *
+		 * One bounded wait for the next compositor tick restores the missing
+		 * backpressure. It is <= one display period by construction and the
+		 * helper hard-clamps its timeout to 4-100 ms (#925's bounded-wait
+		 * rule), so a stalled DWM cannot wedge an IPC thread. A client that is
+		 * ALREADY paced arrives near the tick edge and waits ~0 — this costs
+		 * well-behaved apps nothing. We deliberately pace on the PANEL's clock
+		 * (DWM's composition clock, which the render thread also follows)
+		 * rather than any client swap chain: a pipeline client may have no
+		 * chain of its own at all.
+		 */
+		const double pace_period_ns = 1e9 / (sys->refresh_rate > 0.0f ? sys->refresh_rate : 60.0f);
+		const int64_t pace_now_ns = (int64_t)os_monotonic_get_ns();
+		const int64_t since_ns = c->last_commit_pace_ns != 0 ? pace_now_ns - c->last_commit_pace_ns : INT64_MAX;
+		// DXR_COMMIT_PACE=0 turns the backpressure off (A/B lever, and the
+		// escape hatch if a client turns out to need to run free).
+		static int pace_on = -1;
+		if (pace_on < 0) {
+			const char *e = getenv("DXR_COMMIT_PACE");
+			pace_on = (e != nullptr && e[0] == '0') ? 0 : 1;
+		}
+		// Sleep out the REMAINDER of this client's display period — a plain
+		// duration, deliberately NOT the compositor clock.
+		//
+		// Phase-aligning here was measurably worse. Waiting on
+		// DCompositionWaitForCompositorClock parks the client's IPC thread on
+		// the SAME tick the render thread paces to, so both wake together and
+		// the client's atlas blit lands on the shared immediate context right
+		// as the render thread wants it — a convoy. Measured with the hosted
+		// cube: commit cadence went to a perfect 16.6 ms either way, but
+		// pipe_active_present fell 580 -> ~350 per 10 s (skip 12 -> ~250) with
+		// the clock wait, and stayed at ~580 with this sleep. Sleeping a
+		// duration leaves each client at whatever phase it already had, so
+		// they spread across the interval instead of stacking on one edge.
+		//
+		// Bounded by construction: at most one display period, and only for a
+		// client that has ALREADY committed more recently than that.
+		if (pace_on && since_ns < (int64_t)pace_period_ns) {
+			os_nanosleep((int64_t)pace_period_ns - since_ns);
+		}
+		c->last_commit_pace_ns = (int64_t)os_monotonic_get_ns();
 	}
 
 	if (sys->workspace_mode || pipeline_always_on(sys)) {
