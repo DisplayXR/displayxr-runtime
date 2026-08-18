@@ -584,7 +584,14 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 		windowPrevHeight = rect.bottom - rect.top;
 
 		GetMonitorInfo(MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY), &mi);
-		SetWindowLong(hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+		// #1014: keep WS_SYSMENU | WS_MINIMIZEBOX. Stripping WS_OVERLAPPEDWINDOW
+		// wholesale takes those two with it, and the SHELL REFUSES TO RESTORE a
+		// minimized window that has no minimize box — Alt-Tab / clicking the
+		// taskbar entry of a parked hosted window did nothing at all, so the
+		// user could never get back to it (SW_RESTORE from our own code still
+		// worked, which is what made this look like a wndproc problem). Neither
+		// bit draws anything without WS_CAPTION, so the window stays borderless.
+		SetWindowLong(hWnd, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_SYSMENU | WS_MINIMIZEBOX);
 		SetWindowPos(hWnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
 		             mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
 		             SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
