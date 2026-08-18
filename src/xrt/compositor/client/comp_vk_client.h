@@ -13,10 +13,17 @@
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_cmd_pool.h"
+#include "xrt/xrt_config_have.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_gfx_vk.h"
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+//! ADR-029 — render-API-agnostic transparent DComp presenter (client/comp_d3d_transparent_present.h).
+struct comp_d3d_transparent_presenter;
 #endif
 
 
@@ -100,6 +107,26 @@ struct client_vk_compositor
 
 	bool renderdoc_enabled;
 	VkCommandBuffer dcb;
+
+#if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
+	/*!
+	 * ADR-029 (#573) — render-API-agnostic transparent DComp presenter. A
+	 * forced-IPC client that asked for a transparent background on its own
+	 * window is a `PRESENTER_CLIENT_TEXTURE` client service-side: the service
+	 * weaves (with alpha-gate holes) into a shared output texture and signals a
+	 * service->client fence, but it CANNOT present — a process may not create a
+	 * DirectComposition target on another process's HWND. So the client owns the
+	 * present, through this helper, on its own window.
+	 *
+	 * The present is pure D3D11 + DComp and independent of the app's render API
+	 * (we pass NULL and the helper spins up its own small D3D11 device), which is
+	 * why the same helper serves the D3D11, D3D12, GL and Vulkan clients.
+	 *
+	 * NULL ⇒ this client is not a transparent one (or the setup failed): the
+	 * service's own presenter stays in effect and nothing here runs.
+	 */
+	struct comp_d3d_transparent_presenter *transparent;
+#endif
 };
 
 

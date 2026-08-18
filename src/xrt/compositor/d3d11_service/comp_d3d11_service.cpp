@@ -13668,11 +13668,39 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 	if (!pipeline_always_on(sys) || c->presenter != PRESENTER_CLIENT_TEXTURE || !c->pipe_frame_ready) {
 		return;
 	}
+
+	/*
+	 * Every `return` below leaves this client's shared texture UNTOUCHED, and a
+	 * CLIENT_TEXTURE client presents that texture itself — so a silent skip here
+	 * reads to the user as an all-transparent window with no other symptom. Name
+	 * the reason, once a second, so it can never be silent again. (The blank
+	 * window that motivated this was actually a missing client-side present, and
+	 * hunting it would have been minutes rather than hours with this line.)
+	 */
+	const char *skip = nullptr;
 	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
-		return; // a background transparent client must not drive the panel
+		// A background transparent client must not drive the shared panel DP: the
+		// interlace phase follows the OWNER's window, so weaving here would put
+		// the wrong phase on this client's pixels. Known gap — a non-owning
+		// CLIENT_TEXTURE client's own window goes stale.
+		skip = "not the panel owner";
+	} else if (c->render.transparent_output_fence == nullptr) {
+		skip = "no service->client fence";
+	} else if (c->render.back_buffer_rtv == nullptr) {
+		skip = "no shared-texture RTV";
+	} else if (c->render.atlas_texture == nullptr) {
+		skip = "no atlas texture";
 	}
-	if (c->render.transparent_output_fence == nullptr || c->render.back_buffer_rtv == nullptr ||
-	    c->render.atlas_texture == nullptr) {
+	if (skip != nullptr) {
+		static std::atomic<int64_t> s_last_skip_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = s_last_skip_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_skip_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "[client_texture] '%s' NOT weaved — %s; its window shows whatever it last "
+			    "presented (transparent, if it never got a frame)",
+			    c->slot_app_name, skip);
+		}
 		return;
 	}
 	if (service_device_removed(sys)) {
@@ -13724,6 +13752,18 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv, c->pipe_content_w,
 		                                          c->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
 		                                          target_w, target_h, 0, 0, 0, 0);
+	}
+
+	{
+		static std::atomic<int64_t> s_last_ok_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = s_last_ok_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_ok_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "[client_texture] '%s' weaved: content=%ux%u grid=%ux%u -> target=%ux%u dp=%p fence_v=%llu",
+			    c->slot_app_name, c->pipe_content_w, c->pipe_content_h, cols, rows, target_w, target_h,
+			    (void *)dp, (unsigned long long)(c->render.transparent_output_value + 1));
+		}
 	}
 
 	// ADR-029: signal the service->client fence; the app GPU-waits on it and

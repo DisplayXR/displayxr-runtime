@@ -79,8 +79,9 @@ if(XRT_HAVE_D3D11 OR XRT_HAVE_D3D12)
 	# transparent clients (ADR-029). The client must own the present because a
 	# process cannot create a DComp target on another process's HWND; this helper
 	# imports the service's shared output texture + fence and presents on the app's
-	# window. Shared by the D3D11, D3D12 and GL (win32) client compositors, so it
-	# (and the d3d11/dxgi/dcomp libs it needs) lives in the shared D3D block.
+	# window. Shared by the D3D11, D3D12, GL (win32) and Vulkan client compositors
+	# (the present is pure D3D11 + DComp, so it is render-API-agnostic), which is
+	# why it (and the d3d11/dxgi/dcomp libs it needs) lives in the shared D3D block.
 	target_sources(
 		comp_client PRIVATE client/comp_d3d_transparent_present.cpp
 				    client/comp_d3d_transparent_present.h
