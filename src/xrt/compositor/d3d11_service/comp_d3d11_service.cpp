@@ -530,6 +530,13 @@ struct d3d11_service_compositor
 	uint32_t pipe_tile_rows;
 	bool pipe_frame_ready;
 
+	//! #1017: does this client currently OWN the panel, as decided by the
+	//! render thread's focus pick? Read by the CLIENT_TEXTURE weave on the
+	//! client's own IPC thread, which is why it is atomic. Only the owner
+	//! weaves — a background transparent client must not drive the shared
+	//! panel DP out from under whoever holds it.
+	std::atomic<bool> pipe_owns_panel{false};
+
 	//! #964: pacing state for this client's presenter when it is an APP_HWND —
 	//! a foreign, frequently occluded window the render thread must never
 	//! block on. `last_flat_present_ns` rate-limits the unfocused flat-2D
@@ -9438,6 +9445,15 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		focused = best;
 	}
 
+	/* #1017: publish panel ownership for the commit-side weave. Only the
+	 * focused slot owns it; everyone else must not touch the shared DP. */
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+		if (oc != nullptr && s != focused) {
+			oc->pipe_owns_panel.store(false, std::memory_order_release);
+		}
+	}
+
 	/* (b) The active presenter. */
 	struct d3d11_service_compositor *fc = focused >= 0 ? mc->clients[focused].compositor : nullptr;
 	enum d3d11_presenter_kind kind = fc != nullptr ? fc->presenter : PRESENTER_NONE;
@@ -9528,9 +9544,25 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	 * service window is already hidden (it is not the presenter), which matters
 	 * more here than anywhere else: a fullscreen service window would cover the
 	 * browser. Other app windows still get their courtesy repaint. */
-	if (kind == PRESENTER_SELF) {
-		// The present-owner drives its own frame loop; we neither present nor
-		// pace on it.
+	if (kind == PRESENTER_SELF || kind == PRESENTER_CLIENT_TEXTURE) {
+		// #1017: CLIENT_TEXTURE joins the present-owner here. Its weave used to
+		// run on THIS thread and end with
+		// `sys->context->Signal(transparent_output_fence)` — a SHARED,
+		// cross-adapter fence (the panel is on the iGPU, so every present
+		// crosses adapters). On NVIDIA that Signal does not return: the render
+		// thread parked inside
+		// d3d11!CContext::TID3D11DeviceContext_Signal_ -> CDevice::SignalFence
+		// -> Flush -> nvwgf2umx while HOLDING render_mutex, and the whole
+		// service wedged behind it (the main loop blocked in
+		// sync_focus_from_compositor, [HEALTH] silent, every later client a
+		// zombie). One zones cube did that to everything.
+		//
+		// The render thread may never make an unbounded driver call on behalf
+		// of ONE client. So the weave+Signal moved back to that client's own
+		// commit (pipeline_client_texture_weave), which is where legacy did it
+		// and where a stall costs only the client that caused it. This is also
+		// what ADR-029 says the split is: the service weaves and signals, the
+		// CLIENT presents. Here we only bind the panel to its window.
 		mc->pace_app_waitable = nullptr;
 		mc->pace_app_sc = nullptr;
 		// A present-owner composes the woven output over its OWN window content
@@ -9541,6 +9573,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// Bound with false, the woven layer came out opaque and hid the page.
 		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true);
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+		// Tell the owner it holds the panel, so its next commit weaves.
+		fc->pipe_owns_panel.store(true, std::memory_order_release);
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
 				continue;
@@ -13204,6 +13238,10 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 			render_mutex_fair_lock lock(sys);
 			xrt_display_processor_d3d11_clear_local_zone_mask(dp);
 			c->zone_published = false;
+			// #1017: never withdraw a panel-wide resource silently — a stale
+			// mask left on the shared DP is invisible otherwise.
+			U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (non-zones frame)",
+			        pipeline_always_on(sys) ? "panel" : "per-client");
 		}
 		return;
 	}
@@ -13249,10 +13287,14 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	    dp, sys->context.get(), srv, w, h, (int32_t)origin.x, (int32_t)origin.y, w, h, c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
+			// #1017: this said "per-client DP", which does not exist on the
+			// pipeline path and sent the zones wedge hunt looking for a limbo
+			// DP. The target is whatever panel_dp() resolved: the shared panel
+			// DP under the pipeline, the client's own only on the legacy path.
 			U_LOG_W(
-			    "ZONES SVC: wish mask published to the per-client DP "
+			    "ZONES SVC: wish mask published to the %s DP "
 			    "(%ux%u @ screen %ld,%ld, %u zone rect(s))",
-			    w, h, origin.x, origin.y, rect_count);
+			    pipeline_always_on(sys) ? "panel" : "per-client", w, h, origin.x, origin.y, rect_count);
 		}
 		c->zone_published = true;
 	} else if (!c->zone_mask_dp_rejected) {
@@ -13371,6 +13413,101 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 	return true;
 }
 
+
+/*!
+ * #1017 (ADR-029): weave a CLIENT_TEXTURE client's atlas into its shared output
+ * texture and signal the service->client fence — on the CLIENT'S OWN IPC
+ * THREAD, at commit.
+ *
+ * This used to run on the render thread as part of the direct path. It ended in
+ * `sys->context->Signal(transparent_output_fence)`, and that fence is SHARED and
+ * crosses adapters (the panel is on the iGPU). On NVIDIA the Signal does not
+ * return: the render thread parked inside
+ * `d3d11!CContext::TID3D11DeviceContext_Signal_ -> CDevice::SignalFence ->
+ * Flush -> nvwgf2umx` while HOLDING render_mutex, and the whole service wedged
+ * behind it — [HEALTH] silent, the main loop stuck in
+ * sync_focus_from_compositor, every later client a zombie. A single zones cube
+ * took the service down within a second of its first frame.
+ *
+ * The rule this restores: the render thread never makes an unbounded driver
+ * call on behalf of ONE client. Here the same call blocks only the client that
+ * caused it — legacy's blast radius, and the split ADR-029 actually describes
+ * (the service weaves and signals; the CLIENT presents).
+ *
+ * Runs under `render_mutex_fair_lock` (legal: `c->mutex` -> `render_mutex`), so
+ * it is serialized against the render thread exactly like weave_submit, and it
+ * asserts its own DP state per #1016 rather than inheriting it.
+ */
+static void
+pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!pipeline_always_on(sys) || c->presenter != PRESENTER_CLIENT_TEXTURE || !c->pipe_frame_ready) {
+		return;
+	}
+	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
+		return; // a background transparent client must not drive the panel
+	}
+	if (c->render.transparent_output_fence == nullptr || c->render.back_buffer_rtv == nullptr ||
+	    c->render.atlas_texture == nullptr) {
+		return;
+	}
+	if (service_device_removed(sys)) {
+		return; // #1002
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+
+	render_mutex_fair_lock lock(sys);
+
+	// Re-check under the lock: focus can move between the load and here.
+	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
+		return;
+	}
+
+	const uint32_t cols = c->pipe_tile_columns > 0 ? c->pipe_tile_columns : 1;
+	const uint32_t rows = c->pipe_tile_rows > 0 ? c->pipe_tile_rows : 1;
+	ID3D11ShaderResourceView *in_srv = service_crop_atlas_for_dp(sys, &c->render, c->pipe_content_w,
+	                                                             c->pipe_content_h, cols, rows, c->atlas_flip_y);
+	c->render.last_dp_content_w = c->pipe_content_w;
+	c->render.last_dp_content_h = c->pipe_content_h;
+
+	uint32_t target_w = 0, target_h = 0;
+	pipeline_rtv_dims(c->render.back_buffer_rtv.get(), &target_w, &target_h);
+
+	// The panel DP is bound to this client's window by the render thread's
+	// SELF/CLIENT_TEXTURE branch; resolve it INSIDE the lock (#964 D-4).
+	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
+	if (dp != nullptr && in_srv != nullptr && target_w > 0 && target_h > 0) {
+		ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		// #1013: own viewport AND scissor — a present-owner's alpha-gate pass
+		// leaves a window-sized scissor latched on this shared context.
+		D3D11_VIEWPORT vp = {};
+		vp.Width = (float)target_w;
+		vp.Height = (float)target_h;
+		vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &vp);
+		D3D11_RECT sc_rect = {0, 0, (LONG)target_w, (LONG)target_h};
+		sys->context->RSSetScissorRects(1, &sc_rect);
+		// #1016: this call site owns the DP's state.
+		pipeline_dp_set_transparency(mc, dp, /*client_presents*/ true, "client_texture");
+		pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(c), "client_texture");
+		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
+		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv, c->pipe_content_w,
+		                                          c->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
+		                                          target_w, target_h, 0, 0, 0, 0);
+	}
+
+	// ADR-029: signal the service->client fence; the app GPU-waits on it and
+	// presents the shared texture itself. THE call that wedged the render
+	// thread — bounded here to this client's own thread.
+	c->render.transparent_output_value++;
+	sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
+}
 
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
@@ -15489,6 +15626,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (content_view_w > 0 && content_view_h > 0) {
 			c->pipe_frame_ready = true;
 		}
+
+		// #1017: a CLIENT_TEXTURE client weaves HERE, on its own IPC thread —
+		// the one presenter kind the render thread must not finish, because
+		// its fence Signal is a cross-adapter shared-fence call that can block
+		// forever on NVIDIA. Everything above has published what this commit
+		// packed, which is exactly what the weave needs.
+		if (c->presenter == PRESENTER_CLIENT_TEXTURE) {
+			pipeline_client_texture_weave(sys, c);
+		}
 	}
 
 	if (sys->workspace_mode || pipeline_always_on(sys)) {
@@ -16203,8 +16349,19 @@ compositor_destroy(struct xrt_compositor *xc)
 
 		// Withdraw this client's zone-mask contribution while the DP is
 		// still alive (#551) — equivalent to publishing an all-zero mask.
-		if (c->zone_published && c->render.display_processor != nullptr) {
-			xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
+		//
+		// #1017: this read `c->render.display_processor`, which is ALWAYS NULL
+		// on the pipeline path (one DP per panel, owned by the multi-comp). So
+		// a zones client dying left its mask live on the SHARED panel DP for
+		// every client after it — the exact silent-stale-mask case. panel_dp()
+		// resolves the right one on both paths. Already under render_mutex here.
+		if (c->zone_published) {
+			struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
+			if (zdp != nullptr) {
+				xrt_display_processor_d3d11_clear_local_zone_mask(zdp);
+				U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (client teardown)",
+				        pipeline_always_on(sys) ? "panel" : "per-client");
+			}
 			c->zone_published = false;
 		}
 
@@ -16246,8 +16403,14 @@ compositor_destroy(struct xrt_compositor *xc)
 				sys->active_compositor = nullptr;
 			}
 		}
-		if (c->zone_published && c->render.display_processor != nullptr) {
-			xrt_display_processor_d3d11_clear_local_zone_mask(c->render.display_processor);
+		if (c->zone_published) {
+			// #1017: same as above — panel_dp() on both paths (legacy has no
+			// multi_comp, so this resolves to the client's own DP).
+			struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
+			if (zdp != nullptr) {
+				xrt_display_processor_d3d11_clear_local_zone_mask(zdp);
+				U_LOG_W("ZONES SVC: wish mask withdrawn (single-client teardown)");
+			}
 			c->zone_published = false;
 		}
 		// #814: same fail-safe on the legacy single-client path — there are
