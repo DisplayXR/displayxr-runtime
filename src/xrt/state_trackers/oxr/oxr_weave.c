@@ -75,11 +75,18 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_rect *overlay_rects,
                                         bool weave_frame_first,
                                         const struct xrt_weave_atlas_layout *layout,
+                                        uint32_t flat_rect_count,
+                                        const struct xrt_rect *flat_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                                         uint32_t rect_count,
+                                                         const struct xrt_rect *screen_rects);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
@@ -313,6 +320,34 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
+	// Spec v8 (browser#88): a chained XrWeaveSubmitFlatRegionsDXR names the
+	// regions of this submit that must be PHYSICALLY FLAT. The service subtracts
+	// them from the weave rects to derive the per-region hardware wish it
+	// publishes to the DP. Purely advisory and hardware-only (ADR-027 D6 /
+	// ADR-030) — it gates no content, so validation here is bounds only and an
+	// absent chain is byte-for-byte pre-v8.
+	uint32_t flat_rect_count = 0;
+	struct xrt_rect flat_rects[XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR];
+	const XrWeaveSubmitFlatRegionsDXR *flat = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR, XrWeaveSubmitFlatRegionsDXR);
+	if (flat != NULL && flat->rectCount > 0) {
+		if (flat->rectCount > XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitFlatRegionsDXR::rectCount (%u) must be "
+			                 "0..XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR (%u)",
+			                 flat->rectCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR);
+		}
+		OXR_VERIFY_ARG_NOT_NULL(&log, flat->rects);
+		flat_rect_count = flat->rectCount;
+		for (uint32_t i = 0; i < flat_rect_count; i++) {
+			// xrt_offset names its fields w/h; they are x/y here.
+			flat_rects[i].offset.w = flat->rects[i].offset.x;
+			flat_rects[i].offset.h = flat->rects[i].offset.y;
+			flat_rects[i].extent.w = (int)flat->rects[i].extent.width;
+			flat_rects[i].extent.h = (int)flat->rects[i].extent.height;
+		}
+	}
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -362,7 +397,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    (uint32_t)submitInfo->rect.extent.width, (uint32_t)submitInfo->rect.extent.height, rect_count,
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
-	    layout.view_count > 0 ? &layout : NULL, &have_out, &w, &h, &fence_value, &eyes);
+	    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
+	    &have_out, &w, &h, &fence_value, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
@@ -461,6 +497,55 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 	snappedRect->offset.x = sx;
 	snappedRect->offset.y = sy;
 	snappedRect->extent = targetRect->extent;
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const XrRect2Di *screenRects)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveSetScreenFlatRegionsDXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
+
+	if (rectCount > XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrWeaveSetScreenFlatRegionsDXR: rectCount (%u) must be "
+		                 "0..XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR (%u)",
+		                 rectCount, (uint32_t)XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR);
+	}
+	// rectCount 0 CLEARS the latch, so screenRects is only required when there is
+	// something to read.
+	if (rectCount > 0) {
+		OXR_VERIFY_ARG_NOT_NULL(&log, screenRects);
+	}
+
+	if (!session_is_ipc(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveSetScreenFlatRegionsDXR: the weave service is only available on the "
+		                 "out-of-process (service) path");
+	}
+
+	struct xrt_rect rects[XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR];
+	for (uint32_t i = 0; i < rectCount; i++) {
+		// xrt_offset names its fields w/h; they are x/y here. Absolute PHYSICAL
+		// screen pixels — unlike the per-submit list these are not
+		// window-relative, so no origin is applied on this side.
+		rects[i].offset.w = screenRects[i].offset.x;
+		rects[i].offset.h = screenRects[i].offset.y;
+		rects[i].extent.w = (int)screenRects[i].extent.width;
+		rects[i].extent.h = (int)screenRects[i].extent.height;
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_weave_set_screen_flat_regions(&sess->xcn->base, rectCount,
+	                                                                            rectCount > 0 ? rects : NULL);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrWeaveSetScreenFlatRegionsDXR: latch failed (xrt_result=%d)", (int)xret);
+	}
 	return XR_SUCCESS;
 }
 

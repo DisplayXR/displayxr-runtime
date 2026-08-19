@@ -139,13 +139,46 @@
  * GPU-complete (no fence handle, fenceValue is a monotonic counter). An
  * fd-based (`sync_file`) acquire/release variant is a documented follow-up.
  *
+ * Per-region hardware wish (SPEC_VERSION 8, browser#88 Phase 3 item A). Until v8
+ * the weave path drove the panel's physical 3D element ALL-OR-NOTHING: a present-
+ * owner with a single woven element held the whole panel behind the lens, so the
+ * flat 2D around it was viewed through a lenticular it did not want (the shipped
+ * ghosting). v8 lets the caller name the regions that are FLAT, and the runtime
+ * publishes a per-region hardware WISH derived from them — the same mechanism the
+ * XR_DXR_display_zones path already publishes (ADR-027 Decision 5), now reached
+ * from the weave path too:
+ *
+ *   wish = union(submitted weave rects) − union(flat rects)
+ *
+ * Two ways to say "flat", differing only in lifetime and coordinate space:
+ *
+ *  - PER-SUBMIT. Chain an XrWeaveSubmitFlatRegionsDXR onto
+ *    XrWeaveSubmitInfoDXR::next carrying window-relative rects. Scoped to that
+ *    one submit — the natural fit for content that moves every frame (a scrolled
+ *    page's flat bands).
+ *  - STICKY. Call xrWeaveSetScreenFlatRegionsDXR with ABSOLUTE PHYSICAL SCREEN
+ *    rects. Latched until the next call, applied immediately — the fit for
+ *    screen-anchored furniture (a browser's toolbar / tab strip) that must stay
+ *    flat regardless of what any given frame submits.
+ *
+ * Both are ADVISORY, and in exactly the sense ADR-027 Decision 6 / ADR-030 mean:
+ * they move the physical 3D element only. They never gate, mask, crop or reorder
+ * CONTENT — the woven pixels are identical with and without them, and a runtime or
+ * vendor that ignores the wish entirely is still conformant (its panel is simply
+ * 3D where the caller asked for flat, i.e. the pre-v8 behaviour). Rounding, where
+ * a rect edge lands between hardware switch cells, always errs toward 3D:
+ * marking a working 3D region flat is a mono regression, marking a flat region 3D
+ * is only the pre-v8 ghosting. Omitting both = byte-for-byte pre-v8.
+ *
  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
  * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas; 5 =
  * XrWeaveSubmitInfoDXR::firstChunk (coherent whole-window output, browser#22);
  * 6 = XrWeaveSubmitLayoutDXR N-view worst-case atlas (#774); 7 =
  * XrWeaveSubmitHandlesDXR handle kinds + xrWeaveBindWindow2DXR /
- * XrWeaveWindowGeometryDXR explicit window geometry, Android support (#1036).
+ * XrWeaveWindowGeometryDXR explicit window geometry, Android support (#1036);
+ * 8 = XrWeaveSubmitFlatRegionsDXR + xrWeaveSetScreenFlatRegionsDXR per-region
+ * hardware wish on the weave path (browser#88).
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -158,10 +191,10 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 7
+#define XR_DXR_weave_SPEC_VERSION 8
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
-// Reserved 1004999190..197. Final values reconcile with the Khronos registry
+// Reserved 1004999190..199. Final values reconcile with the Khronos registry
 // before spec freeze. Allocation registry: README.md in this directory.
 #define XR_TYPE_WEAVE_SUBMIT_INFO_DXR     ((XrStructureType)1004999190)
 #define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
@@ -171,6 +204,10 @@ extern "C" {
 #define XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR ((XrStructureType)1004999195)
 #define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
 #define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
+#define XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR ((XrStructureType)1004999198)
+// 1004999199 is RESERVED for a spec v9 per-submit wish MASK (an R8 texture handle
+// instead of a rect list, for callers whose flat geometry is not rectangular —
+// rounded corners, arbitrary CSS clip paths). Do not assign it to anything else.
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -180,6 +217,17 @@ extern "C" {
 //! runtime's IPC message stays within its fixed buffer). Callers with more
 //! visible elements split into multiple batched submits.
 #define XR_WEAVE_SUBMIT_MAX_RECTS_DXR 32
+
+//! Upper bound on flat rects carried by one XrWeaveSubmitFlatRegionsDXR (spec
+//! v8). Smaller than XR_WEAVE_SUBMIT_MAX_RECTS_DXR on purpose: the flat list
+//! describes PANEL FURNITURE (bands, gutters, chrome), not per-element geometry,
+//! and it has to fit in the same fixed IPC message as the weave rects. A caller
+//! with more flat regions than this merges them into their bounding boxes —
+//! which errs toward flat, so it must merge only regions that are ALL flat.
+#define XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR 16
+
+//! Upper bound on rects passed to xrWeaveSetScreenFlatRegionsDXR (spec v8).
+#define XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR 8
 
 /*!
  * @brief Per-frame weave submission for one window sub-rect.
@@ -365,6 +413,47 @@ typedef struct XrWeaveSubmitOverlaysDXR {
 } XrWeaveSubmitOverlaysDXR;
 
 /*!
+ * @brief Regions of this submit that must be PHYSICALLY FLAT (spec v8, browser#88).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. The runtime derives this frame's
+ * per-region hardware wish as
+ *
+ *   wish = union(XrWeaveSubmitRectsDXR::rects) − union(@c rects)
+ *
+ * and publishes it to the display processor, which switches its physical 3D
+ * element per region where the hardware can (ADR-027 Decision 5). The classic
+ * case is a page with one inline-3D element inside otherwise flat 2D: without
+ * this the whole panel sits behind the lens and the flat content ghosts.
+ *
+ * ADVISORY — it moves the HARDWARE element only, never CONTENT (ADR-027
+ * Decision 6 / ADR-030). The woven pixels this call produces are bit-identical
+ * whether or not this struct is chained; nothing here crops, masks or reorders
+ * anything the caller submitted, and a DP with no per-region capability simply
+ * quantizes the wish to its whole-panel any-nonzero default (= pre-v8 behaviour).
+ * So a caller may always chain it, and never has to ask whether the panel can
+ * honour it.
+ *
+ * Where a flat rect's edge falls between the hardware's switch cells the runtime
+ * rounds TOWARD 3D (the flat rect shrinks to cell boundaries). Marking a working
+ * 3D region flat would be a mono regression; leaving a flat region 3D is only the
+ * pre-v8 ghosting, so the asymmetry is deliberate.
+ *
+ * @c rects are window-relative device pixels (y-down), the same space as
+ * XrWeaveSubmitRectsDXR::rects. They may overlap each other and may overlap the
+ * weave rects — subtraction is by area, not by list position. Scoped to THIS
+ * submit; for regions that persist across frames in screen space use
+ * xrWeaveSetScreenFlatRegionsDXR instead (the two compose: both are subtracted).
+ *
+ * @c rectCount 0 (or omitting the struct) = no flat regions, byte-for-byte pre-v8.
+ */
+typedef struct XrWeaveSubmitFlatRegionsDXR {
+    XrStructureType          type;      //!< XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 rectCount; //!< 0..XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR
+    const XrRect2Di*         rects;     //!< window-relative flat regions, device px (y-down)
+} XrWeaveSubmitFlatRegionsDXR;
+
+/*!
  * @brief Weaved output handed back to the present-owner.
  *
  * @c weavedTexture is a runtime-allocated shared GPU texture HANDLE sized to
@@ -468,6 +557,9 @@ typedef XrResult (XRAPI_PTR *PFN_xrWeaveSubmitDXR)(
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowRectDXR)(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
 
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveSetScreenFlatRegionsDXR)(
+    XrSession session, uint32_t rectCount, const XrRect2Di* screenRects);
+
 #ifndef XR_NO_PROTOTYPES
 
 //! Bind the present-owner's window (HWND on Windows) so the DP phase-snaps the
@@ -506,6 +598,28 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSubmitDXR(
 //! in-process session.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowRectDXR(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
+//! Latch the regions of the PANEL that must stay physically flat (spec v8,
+//! browser#88). Sticky companion to XrWeaveSubmitFlatRegionsDXR: same advisory
+//! hardware-only semantics (see that struct — it moves the 3D element, never
+//! content), but expressed in ABSOLUTE PHYSICAL SCREEN pixels and held until the
+//! next call rather than scoped to one submit. For screen-anchored furniture — a
+//! browser's toolbar and tab strip — that must be flat no matter what any
+//! individual frame submits, and that the caller would otherwise have to re-send
+//! on every submit forever.
+//!
+//! Applied IMMEDIATELY: if a wish is currently published the runtime re-rasters
+//! and republishes it before returning, so the panel does not wait for the next
+//! submit. Screen rects are intersected with the bound window's client area (the
+//! wish is published window-anchored), so a rect naming panel area outside the
+//! window is simply clipped away, not an error.
+//!
+//! @c rectCount 0 clears the latch (with @c screenRects NULL or ignored);
+//! 1..XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR replaces it wholesale — this is a
+//! SET, not an add. Reports XR_ERROR_FEATURE_UNSUPPORTED on an in-process
+//! session.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSetScreenFlatRegionsDXR(
+    XrSession session, uint32_t rectCount, const XrRect2Di* screenRects);
 
 #endif /* !XR_NO_PROTOTYPES */
 

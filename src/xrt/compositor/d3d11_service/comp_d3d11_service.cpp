@@ -288,6 +288,14 @@ struct d3d11_service_swapchain
 #define WEAVE_OUTPUT_GEN_MAX_INPUTS 32
 
 /*!
+ * XR_DXR_weave v8 (browser#88): capacity of the merged FLAT rect list — the
+ * per-submit list (XrWeaveSubmitFlatRegionsDXR) plus the sticky screen-space
+ * latch (xrWeaveSetScreenFlatRegionsDXR), which COMPOSE. Sized for both budgets
+ * used to the full at once so nothing is ever silently dropped.
+ */
+#define WEAVE_WISH_MAX_FLAT_RECTS (IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX + IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX)
+
+/*!
  * Per-client render resources.
  *
  * These resources are created when a client connects and destroyed when the
@@ -822,11 +830,52 @@ struct d3d11_service_compositor
 	wil::com_ptr<ID3D11ShaderResourceView> wish_mask_staged_srv;
 	uint32_t wish_mask_w;
 	uint32_t wish_mask_h;
-	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< last rasterized rects (dirty check)
+	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< last rasterized ON (3D) rects (dirty check)
 	uint32_t wish_rect_count;
 	uint64_t zone_publish_seq;  //!< mask content generation (bumped per re-raster)
 	bool zone_published;        //!< a mask is live at the DP (clear on non-zones frames / teardown)
 	bool zone_mask_dp_rejected; //!< DP rejected the publish — tier-1 hardware request owns the panel
+
+	/*
+	 * ── XR_DXR_weave v8 (browser#88): per-region hardware wish on the weave
+	 *    path. Reuses everything above — the raster, the staged SRV, the publish
+	 *    channel — and only adds the SUBTRACTIVE (flat) half plus the mask-
+	 *    resolution bookkeeping the per-scroll-frame re-raster needs. ──
+	 */
+
+	//! Last rasterized FLAT (physically-2D) rects: wish = union(ON) - union(flat).
+	//! Dirty-tracked alongside wish_rects — a scroll changes only this list.
+	//! Sized for BOTH sources at once (@ref WEAVE_WISH_MAX_FLAT_RECTS) so a client
+	//! using its full per-submit and sticky budgets never has flat rects silently
+	//! dropped — dropping one leaves that region 3D, which is the safe direction
+	//! but still not what the caller asked for.
+	struct xrt_rect wish_flat_rects[WEAVE_WISH_MAX_FLAT_RECTS];
+	uint32_t wish_flat_rect_count;
+
+	//! STICKY screen-space flat regions (xrWeaveSetScreenFlatRegionsDXR).
+	//! ABSOLUTE PHYSICAL SCREEN px, latched until the next call — converted to
+	//! window-relative and merged into the flat list at raster time.
+	struct xrt_rect weave_screen_flat_rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX];
+	uint32_t weave_screen_flat_rect_count;
+
+	//! Window dims the cached raster was SCALED FROM. The mask is published at
+	//! the DP's preferred resolution, not the window's, so a resize changes the
+	//! scale factors while leaving the raw rects identical — without this the
+	//! dirty check would miss it.
+	uint32_t wish_win_w;
+	uint32_t wish_win_h;
+
+	//! Cached @ref xrt_dp_local_zone_caps. get_local_zone_caps is a vtable call
+	//! into the vendor, so it is taken ONCE per client (first publish) and never
+	//! per submit.
+	struct xrt_dp_local_zone_caps wish_caps;
+	bool wish_caps_valid;
+
+	//! R6 watchdog (browser#88): submits since a non-empty wish was accepted, used
+	//! once to verify the panel actually reacted. See service_wish_watchdog_tick.
+	uint32_t wish_watchdog_submits;
+	bool wish_watchdog_armed;
+	bool wish_watchdog_done;
 };
 
 /*!
@@ -13468,33 +13517,156 @@ service_dp_accepts_zone_mask(struct xrt_display_processor_d3d11 *xdp)
 }
 
 /*!
- * (Re)rasterize the union of @p rects into the per-client R8_UNORM wish mask
- * (BINARY: M=1 inside every zone rect, 0 outside — #800/#801), then copy
- * to the SRV-only staged texture the DP samples. Dirty-tracked: an unchanged
- * rect set returns the existing staged SRV without GPU work. Port of the
- * in-process d3d11_update_zone_wish_mask.
+ * Default cap on the published wish-mask resolution when the DP states no
+ * preference (@ref xrt_dp_local_zone_caps::max_mask_width / max_mask_height
+ * report 0).
+ *
+ * The wish is a HARDWARE control signal, not content: the DP downsamples it to
+ * its own switch-cell grid (1x1 on today's panels — the any-nonzero rule of
+ * ADR-027 Decision 5), so 256 is already far finer than any consumer of it. What
+ * it buys is the cost: the re-raster + CopyResource move ~64 KB instead of the
+ * window's several megabytes, which is what makes republishing on a SCROLL frame
+ * affordable (browser#88). The zones path re-rasters rarely and never cared; the
+ * weave path re-rasters whenever the page moves.
+ */
+#define ZONE_WISH_MASK_DEFAULT_MAX 256u
+
+//! Clamp a window/mask-space coordinate into [lo, hi].
+static inline int32_t
+wish_clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/*!
+ * Cached @ref xrt_dp_local_zone_caps for @p c.
+ *
+ * `get_local_zone_caps` is a vtable call into the vendor plug-in, so it is taken
+ * ONCE per client and reused by every later raster — never per submit
+ * (browser#88). Caller MUST hold sys->render_mutex.
+ *
+ * @return the cached caps, or nullptr when the DP cannot report them (absent
+ *         slot / older plug-in) — callers then fall back to their own defaults.
+ */
+static const struct xrt_dp_local_zone_caps *
+service_zone_caps(struct d3d11_service_compositor *c, struct xrt_display_processor_d3d11 *dp)
+{
+	if (c->wish_caps_valid) {
+		return &c->wish_caps;
+	}
+	if (dp == nullptr) {
+		return nullptr;
+	}
+	struct xrt_dp_local_zone_caps caps = {};
+	// Append contract (ADR-020 / ADR-027): the CALLER zeroes the struct and
+	// states its own compile-time sizeof; the plug-in writes only fields within
+	// it, so any field an older plug-in never wrote reads 0 — absence is always
+	// the conservative default.
+	caps.struct_size = (uint32_t)sizeof(caps);
+	if (!xrt_display_processor_d3d11_get_local_zone_caps(dp, &caps)) {
+		return nullptr;
+	}
+	c->wish_caps = caps;
+	c->wish_caps_valid = true;
+	return &c->wish_caps;
+}
+
+/*!
+ * (Re)rasterize the per-client R8_UNORM wish mask, then copy to the SRV-only
+ * staged texture the DP samples. Dirty-tracked: an unchanged input returns the
+ * existing staged SRV without GPU work. Port of the in-process
+ * d3d11_update_zone_wish_mask, extended for the weave path (browser#88).
+ *
+ * The mask is
+ *
+ *     wish = union(@p rects) - union(@p flat_rects)
+ *
+ * still BINARY (M=1 where 3D, 0 where flat — #800/#801: the wish is hardware-only
+ * and hard-edged; cosmetic feather is a composite concern and never enters it).
+ * @p flat_rects is empty on the zones path, which reduces this to exactly the
+ * pre-existing union-of-zone-rects raster.
+ *
+ * RESOLUTION. The mask is rastered at the DP's preferred resolution (caps
+ * max_mask_width/height, else @ref ZONE_WISH_MASK_DEFAULT_MAX), NOT at the
+ * window's — @p win_w / @p win_h are the coordinate space the rects are
+ * expressed in, and the DP anchors the mask onto the client rect itself, so
+ * downscaling costs nothing but bandwidth. Scaling is independent per axis.
+ *
+ * ROUNDING IS LOAD-BEARING. Where a rect edge falls between mask pixels the ON
+ * rects EXPAND outward and the flat rects SHRINK inward — i.e. both err toward
+ * 3D. Marking a working 3D region flat is a mono regression (visible, wrong);
+ * leaving a flat region 3D is only the pre-v8 ghosting (visible, no worse than
+ * shipped). The asymmetry is deliberate, not a rounding accident.
  *
  * Caller MUST hold sys->render_mutex — ClearView/CopyResource run on the
  * shared immediate context from the commit thread.
  *
- * Returns the staged SRV, or nullptr on failure / empty input.
+ * @param[out] out_mask_w Mask width actually rastered (the publish needs it).
+ * @param[out] out_mask_h Mask height actually rastered.
+ * @return the staged SRV, or nullptr on failure / empty input.
  */
 static ID3D11ShaderResourceView *
 service_update_zone_wish_mask(struct d3d11_service_system *sys,
                               struct d3d11_service_compositor *c,
+                              struct xrt_display_processor_d3d11 *dp,
                               const struct xrt_rect *rects,
                               uint32_t rect_count,
-                              uint32_t w,
-                              uint32_t h)
+                              const struct xrt_rect *flat_rects,
+                              uint32_t flat_rect_count,
+                              uint32_t win_w,
+                              uint32_t win_h,
+                              uint32_t *out_mask_w,
+                              uint32_t *out_mask_h)
 {
-	if (w == 0 || h == 0 || rect_count == 0) {
+	if (win_w == 0 || win_h == 0 || rect_count == 0) {
 		return nullptr;
 	}
+	if (flat_rects == nullptr) {
+		flat_rect_count = 0;
+	}
+	if (flat_rect_count > WEAVE_WISH_MAX_FLAT_RECTS) {
+		flat_rect_count = WEAVE_WISH_MAX_FLAT_RECTS;
+	}
 
+	// Mask resolution: the DP's stated preference, else the default cap, and
+	// never larger than the window (upscaling a window-space rect list gains no
+	// information).
+	uint32_t cap_w = ZONE_WISH_MASK_DEFAULT_MAX;
+	uint32_t cap_h = ZONE_WISH_MASK_DEFAULT_MAX;
+	const struct xrt_dp_local_zone_caps *caps = service_zone_caps(c, dp);
+	if (caps != nullptr) {
+		if (caps->max_mask_width != 0) {
+			cap_w = caps->max_mask_width;
+		}
+		if (caps->max_mask_height != 0) {
+			cap_h = caps->max_mask_height;
+		}
+	}
+	uint32_t w = win_w < cap_w ? win_w : cap_w;
+	uint32_t h = win_h < cap_h ? win_h : cap_h;
+	if (w == 0 || h == 0) {
+		return nullptr;
+	}
+	if (out_mask_w != nullptr) {
+		*out_mask_w = w;
+	}
+	if (out_mask_h != nullptr) {
+		*out_mask_h = h;
+	}
+
+	// Dirty check covers BOTH rect lists AND the window dims: the mask is scaled
+	// from window space, so a resize changes the raster even when every raw rect
+	// is byte-identical.
 	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
-	             c->wish_mask_h != h || c->wish_rect_count != rect_count;
+	             c->wish_mask_h != h || c->wish_win_w != win_w || c->wish_win_h != win_h ||
+	             c->wish_rect_count != rect_count || c->wish_flat_rect_count != flat_rect_count;
 	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
 		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+	}
+	for (uint32_t i = 0; !dirty && i < flat_rect_count; i++) {
+		if (memcmp(&c->wish_flat_rects[i], &flat_rects[i], sizeof(flat_rects[i])) != 0) {
 			dirty = true;
 		}
 	}
@@ -13557,39 +13729,101 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 	// published wish is hardware-only and defaults hard-edged. Cosmetic
 	// feather (XrDisplayZoneFeatherDXR) is a compositor-composite concern
 	// and never enters the wish.
+	//
+	// Two passes. ON (3D) rects first, then FLAT rects subtract back to 0 over
+	// them, so the flat list wins on overlap and the result is a true set
+	// difference regardless of list order. Coordinates are clamped to the window
+	// BEFORE scaling, which both drops off-window geometry and keeps every value
+	// non-negative — so the integer division below is unambiguously floor.
 	const float all_on[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 	for (uint32_t i = 0; i < rect_count; i++) {
 		int32_t left = rects[i].offset.w;
 		int32_t top = rects[i].offset.h;
 		int32_t right = rects[i].offset.w + rects[i].extent.w;
 		int32_t bottom = rects[i].offset.h + rects[i].extent.h;
-		if (left < 0) {
-			left = 0;
-		}
-		if (top < 0) {
-			top = 0;
-		}
-		if (right > (int32_t)w) {
-			right = (int32_t)w;
-		}
-		if (bottom > (int32_t)h) {
-			bottom = (int32_t)h;
-		}
+		left = wish_clamp_i32(left, 0, (int32_t)win_w);
+		top = wish_clamp_i32(top, 0, (int32_t)win_h);
+		right = wish_clamp_i32(right, 0, (int32_t)win_w);
+		bottom = wish_clamp_i32(bottom, 0, (int32_t)win_h);
 		if (right <= left || bottom <= top) {
 			continue;
 		}
-		D3D11_RECT dr = {left, top, right, bottom};
+		// EXPAND to mask space: floor the near edges, ceil the far ones. Err
+		// toward 3D — never shrink a region the caller said is 3D.
+		int32_t ml = (int32_t)(((uint32_t)left * w) / win_w);
+		int32_t mt = (int32_t)(((uint32_t)top * h) / win_h);
+		int32_t mr = (int32_t)(((uint32_t)right * w + win_w - 1) / win_w);
+		int32_t mb = (int32_t)(((uint32_t)bottom * h + win_h - 1) / win_h);
+		mr = wish_clamp_i32(mr, 0, (int32_t)w);
+		mb = wish_clamp_i32(mb, 0, (int32_t)h);
+		if (mr <= ml || mb <= mt) {
+			continue;
+		}
+		D3D11_RECT dr = {ml, mt, mr, mb};
 		ctx1->ClearView(c->wish_mask_rtv.get(), all_on, &dr, 1);
+	}
+
+	// SUBTRACTIVE pass (browser#88): the regions the caller declared physically
+	// flat are cleared back to 0. Advisory and hardware-only — this mask never
+	// touches a woven pixel (ADR-027 D6 / ADR-030).
+	for (uint32_t i = 0; i < flat_rect_count; i++) {
+		int32_t left = flat_rects[i].offset.w;
+		int32_t top = flat_rects[i].offset.h;
+		int32_t right = flat_rects[i].offset.w + flat_rects[i].extent.w;
+		int32_t bottom = flat_rects[i].offset.h + flat_rects[i].extent.h;
+		left = wish_clamp_i32(left, 0, (int32_t)win_w);
+		top = wish_clamp_i32(top, 0, (int32_t)win_h);
+		right = wish_clamp_i32(right, 0, (int32_t)win_w);
+		bottom = wish_clamp_i32(bottom, 0, (int32_t)win_h);
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		// SHRINK to mask space: ceil the near edges, floor the far ones — the
+		// mirror image of the ON pass, and the same bias. A flat rect that does
+		// not fully cover a mask pixel leaves it 3D.
+		int32_t ml = (int32_t)(((uint32_t)left * w + win_w - 1) / win_w);
+		int32_t mt = (int32_t)(((uint32_t)top * h + win_h - 1) / win_h);
+		int32_t mr = (int32_t)(((uint32_t)right * w) / win_w);
+		int32_t mb = (int32_t)(((uint32_t)bottom * h) / win_h);
+		ml = wish_clamp_i32(ml, 0, (int32_t)w);
+		mt = wish_clamp_i32(mt, 0, (int32_t)h);
+		if (mr <= ml || mb <= mt) {
+			continue; // sub-pixel flat region — stays 3D, by design
+		}
+		D3D11_RECT dr = {ml, mt, mr, mb};
+		ctx1->ClearView(c->wish_mask_rtv.get(), all_off, &dr, 1);
 	}
 
 	sys->context->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
+	if (flat_rect_count > 0) {
+		memcpy(c->wish_flat_rects, flat_rects, sizeof(flat_rects[0]) * flat_rect_count);
+	}
+	c->wish_flat_rect_count = flat_rect_count;
+	c->wish_win_w = win_w;
+	c->wish_win_h = win_h;
 	c->zone_publish_seq++; // new wish content generation
 
-	U_LOG_W("ZONES SVC: wish mask (auto): %ux%u, %u zone rect(s), binary (mode=zones-binary-wish)", w, h,
-	        rect_count);
+	// SHAPE-CHANGE ONLY, plus a 5 s floor. The zones path re-rasters rarely, but
+	// the weave path re-rasters whenever the page scrolls — a plain per-re-raster
+	// U_LOG_W there is a per-frame log, which is forbidden. The counts and dims
+	// are what a bug report needs; the rect VALUES churn every frame and are the
+	// one thing not worth logging.
+	{
+		static uint32_t s_logged_shape = UINT32_MAX;
+		static int64_t s_last_log_ns = 0;
+		uint32_t shape = (w << 20) ^ (h << 8) ^ (rect_count << 4) ^ flat_rect_count;
+		int64_t now_ns = os_monotonic_get_ns();
+		if (s_logged_shape != shape || now_ns - s_last_log_ns > 5LL * 1000 * 1000 * 1000) {
+			s_logged_shape = shape;
+			s_last_log_ns = now_ns;
+			U_LOG_W("ZONES SVC: wish mask (auto): %ux%u mask for a %ux%u window, %u 3D rect(s) - %u "
+			        "flat rect(s), binary (mode=zones-binary-wish)",
+			        w, h, win_w, win_h, rect_count, flat_rect_count);
+		}
+	}
 	return c->wish_mask_staged_srv.get();
 }
 
@@ -13653,7 +13887,14 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	}
 
 	render_mutex_fair_lock lock(sys);
-	ID3D11ShaderResourceView *srv = service_update_zone_wish_mask(sys, c, rects, rect_count, w, h);
+	// No flat rects on the zones path: a zones frame's 3D rects ARE the wish, so
+	// this reduces to the pre-v8 union-of-zone-rects raster (browser#88). The
+	// mask may now be rastered smaller than the window — the DP anchors mask space
+	// onto the screen rect below, so the two dimensions are independent.
+	uint32_t mask_w = w, mask_h = h;
+	ID3D11ShaderResourceView *srv = service_update_zone_wish_mask(sys, c, dp, rects, rect_count,
+	                                                              /*flat_rects*/ nullptr, /*flat_rect_count*/ 0, w,
+	                                                              h, &mask_w, &mask_h);
 	if (srv == nullptr) {
 		return;
 	}
@@ -13662,7 +13903,8 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	// seq is the content generation, so a vendor's content evaluation runs
 	// once per re-raster, not once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    dp, sys->context.get(), srv, w, h, (int32_t)origin.x, (int32_t)origin.y, w, h, c->zone_publish_seq);
+	    dp, sys->context.get(), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
+	    c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
 			// #1017: this said "per-client DP", which does not exist on the
@@ -17184,12 +17426,362 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 		return;
 	}
 	uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+	// TIER-1 DEMOTION (browser#88), the same pattern the zones path uses: when the
+	// DP consumes a published per-region wish, the MODE transition still fires —
+	// the multi-view atlas recipe is the mode's (ADR-028) and the caller must
+	// re-submit at the right layout — but the PHYSICAL element is left to the wish
+	// this submit is about to publish. Without this the whole-panel request races
+	// the wish and wins, which is exactly the all-or-nothing behaviour v8 exists
+	// to remove. If the DP later rejects the publish, the publish helper (or the
+	// watchdog) latches zone_mask_dp_rejected and this reverts to whole-panel
+	// force-3D on the next submit.
+	//
+	// This helper is deliberately kept GEOMETRY-FREE: it decides only "who drives
+	// the panel", never which regions — that is the wish's job alone.
+	bool mask_capable = service_dp_accepts_zone_mask(panel_dp(sys, c)) && !c->zone_mask_dp_rejected;
 	// #961: DP first, events after confirmation.
 	// #965/#966: the present-owner submit path must not mutate mode/geometry
 	// inline — it queues the request and returns; the panel owner applies it.
-	bool landed = service_request_mode_transition(sys, c, mode_idx, true, /*skip_dp*/ false, "weave_3d");
-	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks%s", prev_idx,
-	        mode_idx, landed ? "" : " — DP REJECTED");
+	bool landed = service_request_mode_transition(sys, c, mode_idx, true, /*skip_dp*/ mask_capable, "weave_3d");
+	U_LOG_W("[weave_3d] present-owner: SR was 2D — forcing 3D (mode %u -> %u) so the eye tracker locks%s%s",
+	        prev_idx, mode_idx, mask_capable ? " (panel driven by the published wish)" : "",
+	        landed ? "" : " — DP REJECTED");
+}
+
+/*!
+ * Submits a non-empty wish must survive before the R6 watchdog checks whether the
+ * panel actually reacted. ~2 s at 60 Hz — long enough to clear the vendor's own
+ * warmup/settle window, short enough that a silently-ignored wish self-heals
+ * within a couple of seconds rather than looking like a permanent mono bug.
+ */
+#define WEAVE_WISH_WATCHDOG_SUBMITS 120
+
+/*!
+ * Withdraw this client's published wish, if any (browser#88).
+ *
+ * Caller MUST hold sys->render_mutex. Mirrors the zones path's non-zones-frame
+ * branch — including the #1017 rule that a panel-wide resource is never
+ * withdrawn silently, since a stale mask left on a shared DP is invisible
+ * otherwise.
+ */
+static void
+service_weave_wish_withdraw(struct d3d11_service_system *sys,
+                            struct d3d11_service_compositor *c,
+                            struct xrt_display_processor_d3d11 *dp,
+                            const char *reason)
+{
+	if (!c->zone_published) {
+		return;
+	}
+	if (dp != nullptr) {
+		xrt_display_processor_d3d11_clear_local_zone_mask(dp);
+	}
+	c->zone_published = false;
+	c->wish_watchdog_submits = 0;
+	c->wish_watchdog_armed = false;
+	U_LOG_W("[weave_wish] withdrawn from the %s DP (%s)", pipeline_always_on(sys) ? "panel" : "per-client", reason);
+}
+
+/*!
+ * Is the wish PROVABLY non-empty — i.e. does some region certainly ask for 3D
+ * after the flat rects are subtracted? (browser#88)
+ *
+ * Only used to decide whether the R6 watchdog may run, so it must err on the side
+ * of "don't know". Getting this wrong in the optimistic direction is the one way
+ * the watchdog could do harm: an all-flat wish CORRECTLY leaves the panel 2D, and
+ * mistaking that for a broken DP would force the whole panel 3D — precisely the
+ * ghosting v8 exists to remove, now applied against the caller's explicit wish.
+ *
+ * So the test is deliberately sufficient-but-not-necessary: an ON rect that
+ * intersects NO flat rect survives subtraction whole, which proves the mask has
+ * set pixels. Anything subtler (an ON rect partially covered, or covered only by
+ * the union of several flat rects) returns false and simply leaves the watchdog
+ * disarmed — no false positives, at the price of not catching every case.
+ */
+static bool
+wish_definitely_nonempty(const struct xrt_rect *rects,
+                         uint32_t rect_count,
+                         const struct xrt_rect *flat_rects,
+                         uint32_t flat_rect_count)
+{
+	for (uint32_t i = 0; i < rect_count; i++) {
+		if (rects[i].extent.w <= 0 || rects[i].extent.h <= 0) {
+			continue;
+		}
+		const int32_t l = rects[i].offset.w;
+		const int32_t t = rects[i].offset.h;
+		const int32_t r = l + rects[i].extent.w;
+		const int32_t b = t + rects[i].extent.h;
+		bool touched = false;
+		for (uint32_t j = 0; j < flat_rect_count && !touched; j++) {
+			if (flat_rects[j].extent.w <= 0 || flat_rects[j].extent.h <= 0) {
+				continue;
+			}
+			const int32_t fl = flat_rects[j].offset.w;
+			const int32_t ft = flat_rects[j].offset.h;
+			const int32_t fr = fl + flat_rects[j].extent.w;
+			const int32_t fb = ft + flat_rects[j].extent.h;
+			if (fl < r && fr > l && ft < b && fb > t) {
+				touched = true;
+			}
+		}
+		if (!touched) {
+			return true; // this ON rect survives untouched
+		}
+	}
+	return false;
+}
+
+/*!
+ * R6 watchdog (browser#88): confirm ONCE that an accepted wish actually moved the
+ * panel, and fall back to the whole-panel hardware request if it did not.
+ *
+ * `zone_mask_dp_rejected` only catches an explicit false from the publish call. A
+ * DP that returns true and then does nothing with the mask would leave the panel
+ * flat forever — and because tier-1 was demoted on the strength of that true, the
+ * whole-panel request that used to hold the lens is no longer being made. That is
+ * a mono regression with no error anywhere, so it needs a positive check.
+ *
+ * The observation has to be a real one. Neither `sys->hardware_display_3d` nor
+ * `sys->cached_3d_state` can serve: `apply_mode_transition` writes BOTH to the
+ * requested state even when it skipped the DP (stamp_flip_cooldown), so after a
+ * demoted transition they say "3D" by construction. So this asks the DP directly,
+ * exactly once, and only where the answer is meaningful:
+ *
+ *  - `supported == 0`, or no caps at all ⟹ nothing to verify (the DP never
+ *    claimed to consume the wish); disarm.
+ *  - `zone_grid > 1x1` ⟹ real per-zone hardware, where a GLOBAL 3D state of
+ *    false is the CORRECT reading while individual cells are lensed (the same
+ *    reason the vendor poll is suppressed under a mask). Unobservable by
+ *    construction, so trust the DP; disarm.
+ *  - `zone_grid == 1x1` ⟹ the DP told us its switch is global, so the panel's
+ *    global 3D state IS the answer. A false there means the wish did nothing.
+ *
+ * Caller MUST hold sys->render_mutex.
+ */
+static void
+service_weave_wish_watchdog(struct d3d11_service_system *sys,
+                            struct d3d11_service_compositor *c,
+                            struct xrt_display_processor_d3d11 *dp,
+                            bool wish_nonempty)
+{
+	if (c->wish_watchdog_done || dp == nullptr) {
+		return;
+	}
+	if (!wish_nonempty) {
+		// An all-flat wish SHOULD leave the panel 2D — nothing to catch.
+		c->wish_watchdog_submits = 0;
+		c->wish_watchdog_armed = false;
+		return;
+	}
+
+	const struct xrt_dp_local_zone_caps *caps = service_zone_caps(c, dp);
+	if (caps == nullptr || caps->supported == 0 || caps->zone_grid_width != 1 || caps->zone_grid_height != 1) {
+		c->wish_watchdog_done = true; // unobservable — see above
+		return;
+	}
+
+	c->wish_watchdog_armed = true;
+	if (++c->wish_watchdog_submits < WEAVE_WISH_WATCHDOG_SUBMITS) {
+		return;
+	}
+	c->wish_watchdog_done = true; // one shot, whatever the verdict
+
+	bool is_3d = false;
+	if (!xrt_display_processor_d3d11_get_hardware_3d_state(dp, &is_3d)) {
+		return; // DP can't report it — no verdict, no action
+	}
+	if (is_3d) {
+		return; // the wish took effect
+	}
+
+	// The DP accepted a non-empty wish, says its switch is global, and the panel
+	// is still flat. Stop trusting the wish for this client: withdraw it, latch
+	// the rejection so weave_force_3d_if_needed resumes driving the panel whole,
+	// and ask for 3D now rather than waiting a frame.
+	c->zone_mask_dp_rejected = true;
+	service_weave_wish_withdraw(sys, c, dp, "watchdog: accepted but panel stayed 2D");
+	U_LOG_W("[weave_wish] DP accepted the wish but the panel stayed 2D after %u submits (grid 1x1) — "
+	        "falling back to the whole-panel 3D request (browser#88 R6)",
+	        (uint32_t)WEAVE_WISH_WATCHDOG_SUBMITS);
+	DP_REQUEST_DISPLAY_MODE(dp, true);
+}
+
+/*!
+ * XR_DXR_weave v8 (browser#88): publish this submit's per-region hardware wish.
+ *
+ *     wish = union(weave rects) - union(per-submit flat rects + sticky screen flat rects)
+ *
+ * This is the weave path's half of ADR-027 Decision 5 — the same
+ * `publish_local_zone_mask` channel the display-zones path already drove, reached
+ * from a present-owner submit, which is why v8 needed no DP vtable surface at all.
+ * The panel's physical 3D element now follows the content instead of being held
+ * whole behind the lens (the shipped ghosting).
+ *
+ * Called from weave_submit AFTER process_atlas + the overlay composite and BEFORE
+ * the fence signal, so the wish and the frame it describes land together — the
+ * same atomicity the zones path gets by publishing at commit.
+ *
+ * Caller MUST hold sys->render_mutex (unlike the zones helper, which takes it
+ * itself — a weave submit is already inside it).
+ *
+ * @param wnd        the bound present-owner window (screen anchor).
+ * @param rects      the submitted weave rects (ON / 3D).
+ * @param flat_rects this submit's flat rects; the sticky latch is merged in here.
+ */
+static void
+service_weave_publish_wish(struct d3d11_service_system *sys,
+                           struct d3d11_service_compositor *c,
+                           struct xrt_display_processor_d3d11 *dp,
+                           HWND wnd,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           const struct xrt_rect *flat_rects,
+                           uint32_t flat_rect_count,
+                           uint32_t win_w,
+                           uint32_t win_h)
+{
+	// ADR-027 v1: the wish is inert under a spatial workspace (the controller owns
+	// the panel). #961: and only the lease holder may move it.
+	if (sys->workspace_mode || dp == nullptr || !client_holds_panel_lease(sys, c)) {
+		return;
+	}
+	// A zero-rect submit is a withdrawal: nothing is woven, so nothing wants the
+	// lens. One of the three teardown edges (the others are the last submit going
+	// away and session destroy, both already handled by the zones clear sites).
+	if (rect_count == 0) {
+		service_weave_wish_withdraw(sys, c, dp, "zero-rect submit");
+		return;
+	}
+	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
+		return; // whole-panel force-3D owns the panel
+	}
+
+	// Screen anchor: the client area's origin in physical screen pixels. The DP
+	// maps mask space onto this rect, which is also what makes the STICKY
+	// screen-space rects convertible to window space.
+	RECT cr;
+	POINT origin = {0, 0};
+	if (wnd == nullptr || !IsWindow(wnd) || !GetClientRect(wnd, &cr) || cr.right <= 0 || cr.bottom <= 0 ||
+	    !ClientToScreen(wnd, &origin)) {
+		return;
+	}
+
+	// Merge the two flat sources into one window-space list. Per-submit rects are
+	// already window-relative; the sticky ones are absolute screen px, so they
+	// shift by the client origin (and are clipped to the window by the raster).
+	struct xrt_rect merged[WEAVE_WISH_MAX_FLAT_RECTS];
+	uint32_t merged_count = 0;
+	for (uint32_t i = 0; i < flat_rect_count && merged_count < WEAVE_WISH_MAX_FLAT_RECTS; i++) {
+		merged[merged_count++] = flat_rects[i];
+	}
+	for (uint32_t i = 0; i < c->weave_screen_flat_rect_count && merged_count < WEAVE_WISH_MAX_FLAT_RECTS; i++) {
+		struct xrt_rect r = c->weave_screen_flat_rects[i];
+		r.offset.w -= (int32_t)origin.x;
+		r.offset.h -= (int32_t)origin.y;
+		merged[merged_count++] = r;
+	}
+
+	uint32_t mask_w = win_w, mask_h = win_h;
+	ID3D11ShaderResourceView *srv =
+	    service_update_zone_wish_mask(sys, c, dp, rects, rect_count, merged_count > 0 ? merged : nullptr,
+	                                  merged_count, win_w, win_h, &mask_w, &mask_h);
+	if (srv == nullptr) {
+		return;
+	}
+
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, sys->context.get(), srv, mask_w, mask_h,
+	                                                              (int32_t)origin.x, (int32_t)origin.y,
+	                                                              (uint32_t)cr.right, (uint32_t)cr.bottom,
+	                                                              c->zone_publish_seq);
+	if (ok) {
+		if (!c->zone_published) {
+			U_LOG_W("[weave_wish] published to the %s DP (%ux%u mask @ screen %ld,%ld %ldx%ld, "
+			        "%u 3D rect(s) - %u flat rect(s))",
+			        pipeline_always_on(sys) ? "panel" : "per-client", mask_w, mask_h, origin.x, origin.y,
+			        cr.right, cr.bottom, rect_count, merged_count);
+		}
+		c->zone_published = true;
+		service_weave_wish_watchdog(sys, c, dp,
+		                            wish_definitely_nonempty(rects, rect_count, merged, merged_count));
+	} else if (!c->zone_mask_dp_rejected) {
+		c->zone_mask_dp_rejected = true;
+		// Withdraw any mask an EARLIER submit published successfully. Leaving one
+		// live would strand a stale panel-wide wish (#1017) and keep the vendor
+		// poll suppressed (`zone_published` gates it), while tier-1 has already
+		// reverted to driving the panel whole — the two would fight.
+		service_weave_wish_withdraw(sys, c, dp, "publish rejected");
+		U_LOG_W("[weave_wish] DP rejected the wish publish — falling back to the whole-panel 3D request");
+		DP_REQUEST_DISPLAY_MODE(dp, true);
+	}
+}
+
+/*!
+ * @copydoc comp_d3d11_service_weave_set_screen_flat_regions
+ *
+ * Sticky screen-space flat regions (browser#88). Runs on the IPC thread, so it
+ * takes render_mutex for the republish — the same bounded pattern the #815
+ * rendering-mode request drain uses (store the state, then apply it under the
+ * lock; nothing here waits on the vendor beyond one publish).
+ */
+extern "C" bool
+comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                                 uint32_t rect_count,
+                                                 const struct xrt_rect *screen_rects)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	if (rect_count > IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX || (rect_count > 0 && screen_rects == nullptr)) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+	if (sys == nullptr) {
+		return false;
+	}
+
+	render_mutex_fair_lock lock(sys);
+
+	// SET, not add: the latch is replaced wholesale, and count 0 clears it.
+	for (uint32_t i = 0; i < rect_count; i++) {
+		c->weave_screen_flat_rects[i] = screen_rects[i];
+	}
+	c->weave_screen_flat_rect_count = rect_count;
+	U_LOG_W("[weave_wish] sticky screen flat regions latched: %u rect(s)", rect_count);
+
+	// Apply immediately when a wish is already live, so screen furniture goes flat
+	// without waiting for the next submit; otherwise there is nothing to
+	// republish and the next submit picks the latch up on its own.
+	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
+	HWND wnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
+	RECT cr = {};
+	if (c->zone_published && dp != nullptr && wnd != nullptr && c->wish_rect_count > 0 &&
+	    GetClientRect(wnd, &cr) && cr.right > 0 && cr.bottom > 0) {
+		// Republish from the LAST submitted 3D rects — they are still the active
+		// geometry; only the flat set moved. Force the re-raster: the sticky list
+		// is merged in from a source the dirty check cannot see, so without this
+		// an unchanged rect set would short-circuit to the stale mask.
+		c->wish_win_w = 0;
+		c->wish_win_h = 0;
+
+		struct xrt_rect last_rects[XRT_MAX_LAYERS];
+		uint32_t last_count = c->wish_rect_count;
+		if (last_count > XRT_MAX_LAYERS) {
+			last_count = XRT_MAX_LAYERS;
+		}
+		for (uint32_t i = 0; i < last_count; i++) {
+			last_rects[i] = c->wish_rects[i];
+		}
+		// Per-submit flat rects are deliberately NOT reconstructed here: the
+		// cached list is already the MERGED one, so re-merging would double-count
+		// the previous latch. This republish therefore carries the new latch
+		// alone; the next submit (≤ one frame away) restores the full composition.
+		service_weave_publish_wish(sys, c, dp, wnd, last_rects, last_count,
+		                           /*flat_rects*/ nullptr, /*flat_rect_count*/ 0, (uint32_t)cr.right,
+		                           (uint32_t)cr.bottom);
+	}
+	return true;
 }
 
 extern "C" bool
@@ -17333,6 +17925,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                const struct xrt_rect *overlay_rects,
                                bool weave_frame_first,
                                const struct xrt_weave_atlas_layout *layout,
+                               uint32_t flat_rect_count,
+                               const struct xrt_rect *flat_rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
@@ -17341,6 +17935,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
 	(void)overlay_rect_count;
 	(void)overlay_rects;
+	// v8 (browser#88): bound the untrusted count once, here, so every later use is
+	// safe without re-checking.
+	if (flat_rects == nullptr) {
+		flat_rect_count = 0;
+	}
+	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX) {
+		flat_rect_count = IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX;
+	}
 	if (out_width != nullptr) {
 		*out_width = 0;
 	}
@@ -17459,10 +18061,6 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// which now prefers the active mode over its first-3D fallback).
 	(void)service_apply_pending_mode(sys, c, /*bridge_live*/ false);
 
-	// Keep the panel in 3D so the vendor eye tracker locks (look-around). A
-	// present-owner never runs the per-client commit that normally does this.
-	weave_force_3d_if_needed(sys, c);
-
 	// Output is sized to the bound window's client area so the weave phase is
 	// correct at the window's absolute screen position; the sub-rect is confined
 	// via canvas_offset/size. Fall back to the per-client window, then the rect.
@@ -17494,6 +18092,15 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	if (win_w == 0 || win_h == 0) {
 		return false;
 	}
+
+	// Keep the panel in 3D so the vendor eye tracker locks (look-around). A
+	// present-owner never runs the per-client commit that normally does this.
+	//
+	// AFTER the window resolve (browser#88): this call demotes the whole-panel
+	// hardware request when the DP consumes a published wish, so it must not run
+	// on a frame that then bails out before publishing one — the geometry above is
+	// exactly what decides that. (It still takes no geometry itself.)
+	weave_force_3d_if_needed(sys, c);
 
 	if (!weave_ensure_output(c, win_w, win_h)) {
 		return false;
@@ -18083,6 +18690,35 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 
 	int64_t t_post_weave_ns = os_monotonic_get_ns();
+
+	// XR_DXR_weave v8 (browser#88): publish this frame's per-region hardware wish
+	// — union(weave rects) minus the flat rects — so the panel's physical 3D
+	// element follows the content instead of being held whole behind the lens.
+	//
+	// HERE, and not earlier: after process_atlas and the overlay composite, before
+	// the fence signal. The wish then lands atomically with the frame it describes,
+	// mirroring the zones path's publish-at-commit ordering — a wish published
+	// before the pixels it belongs to would switch the element a frame early.
+	// Already under render_mutex, and the DP was resolved under it.
+	//
+	// The legacy single-rect path (rect_count == 0, spec v2 layout) carries its one
+	// rect in rect_x/y/w/h, so synthesize the list — otherwise a v2-shaped caller
+	// would read as a zero-rect withdrawal and never get a wish at all.
+	{
+		struct xrt_rect legacy_rect = {};
+		const struct xrt_rect *wish_rects = rects;
+		uint32_t wish_rect_count = rect_count;
+		if (wish_rect_count == 0 && rect_w > 0 && rect_h > 0) {
+			legacy_rect.offset.w = rect_x;
+			legacy_rect.offset.h = rect_y;
+			legacy_rect.extent.w = (int)rect_w;
+			legacy_rect.extent.h = (int)rect_h;
+			wish_rects = &legacy_rect;
+			wish_rect_count = 1;
+		}
+		service_weave_publish_wish(sys, c, dp, wnd, wish_rects, wish_rect_count, flat_rects, flat_rect_count,
+		                           win_w, win_h);
+	}
 
 	// DIAGNOSTIC ONLY (browser#73): the WOVEN OUTPUT — what the present-owner
 	// imports and draws back whole-window. The input and the assembled SBS atlas

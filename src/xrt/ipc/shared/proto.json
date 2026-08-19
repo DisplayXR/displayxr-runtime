@@ -752,6 +752,12 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"weave_set_screen_flat_regions": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_weave_screen_flat_regions"}
+		]
+	},
+
 	"weave_snap_window_rect": {
 		"in": [
 			{"name": "origin_x", "type": "int32_t"},
