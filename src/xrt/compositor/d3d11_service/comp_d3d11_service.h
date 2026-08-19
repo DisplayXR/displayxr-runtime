@@ -1053,13 +1053,23 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * Pass XRT_GRAPHICS_BUFFER_HANDLE_INVALID for no overlay.
  *
  * v5 firstChunk (browser#22): when @p weave_frame_first is true the woven
- * output is cleared to premultiplied transparent (0,0,0,0) BEFORE process_atlas,
- * so regions between the woven tiles are transparent (not stale from a prior
- * frame). A present-owner sets it on the first submit of a frame so it can draw
- * the woven output back WHOLE-WINDOW (opaque tiles replace the page, transparent
- * gaps show it). false (the legacy default) keeps the accumulate-and-draw-back-
- * only-your-own-tiles behavior; a frame split across multiple submits sets it on
- * the first submit alone.
+ * output AND the batch path's SBS scratch are cleared to premultiplied
+ * transparent (0,0,0,0) BEFORE process_atlas, so regions between the woven tiles
+ * are transparent (not stale from a prior frame). A present-owner sets it on the
+ * first submit of a frame so it can draw the woven output back WHOLE-WINDOW
+ * (opaque tiles replace the page, transparent gaps show it); a frame split
+ * across multiple submits sets it on the first submit alone.
+ *
+ * #1058: false no longer means "never clear the output". The output is a
+ * persistent texture every path only ever writes into, and the legacy
+ * @p rect_count == 0 path weaves with canvas = the element rect, so anything
+ * outside it stays as some earlier frame left it — trails that survive
+ * navigation. When a caller never sets @p weave_frame_first, the implementation
+ * infers the frame boundary on that path from the set of input handles seen
+ * since the last clear (one input texture per element, an element submits once
+ * per frame, so the first repeat starts a new frame) and clears the output
+ * there. What false still preserves is the SBS SCRATCH accumulation across
+ * submits of one frame.
  *
  * v6 N-view atlas (#774): a non-NULL @p layout with view_count > 0 REPLACES the
  * batch path's per-rect squeezed-SBS contract with the layout every other

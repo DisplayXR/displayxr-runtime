@@ -281,6 +281,12 @@ struct d3d11_service_swapchain
 	bool service_created;
 };
 
+//! #1058: bound on the per-frame input-handle set used to infer the frame
+//! boundary on the legacy weave path. Sized like XR_WEAVE_SUBMIT_MAX_RECTS_DXR
+//! — a page with more woven elements than this per frame simply gets an extra
+//! (harmless) output clear mid-frame instead of an unbounded trail.
+#define WEAVE_OUTPUT_GEN_MAX_INPUTS 32
+
 /*!
  * Per-client render resources.
  *
@@ -466,6 +472,20 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11Texture2D>          weave_input_tex;
 	wil::com_ptr<ID3D11ShaderResourceView> weave_input_srv;
 	wil::com_ptr<IDXGIKeyedMutex>          weave_input_km;
+
+	//! #1058 frame-boundary tracking for the woven-OUTPUT clear. The output is
+	//! cleared once per frame, on the frame's FIRST submit; spec-v5
+	//! `firstChunk` says so authoritatively when the caller sets it, and
+	//! `weave_saw_frame_first` records that it ever has. A caller that never
+	//! sets it drives the legacy one-submit-per-element path, where the frame
+	//! boundary is inferred from the set of INPUT HANDLES woven since the last
+	//! clear (an element submits at most once per frame, so the first repeat
+	//! starts the next frame). See the decision block in weave_submit.
+	bool                                   weave_saw_frame_first;
+	uint32_t                               weave_gen_count;
+	HANDLE                                 weave_gen_inputs[WEAVE_OUTPUT_GEN_MAX_INPUTS];
+	//! One-shot: this client has been reported as using the legacy path (#1058).
+	bool                                   weave_legacy_warned;
 
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
 	//! shared-handle value exactly like weave_input_* above. A window-sized
@@ -4368,6 +4388,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_input_km.reset();
 	res->weave_input_srv.reset();
 	res->weave_input_tex.reset();
+	// #1058: the frame-boundary state keys off handle VALUES, which the OS
+	// recycles — never let a reconnecting client inherit a dead client's set.
+	res->weave_saw_frame_first = false;
+	res->weave_gen_count = 0;
+	res->weave_legacy_warned = false;
 	res->weave_overlay_handle_cached = nullptr;
 	res->weave_overlay_km.reset();
 	res->weave_overlay_srv.reset();
@@ -16947,6 +16972,18 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h)
 		c->render.weave_output_texture.reset();
 		return false;
 	}
+	// #1058: a freshly created texture's contents are undefined, and the weave
+	// paths only ever composite INTO this texture (the legacy branch rewrites
+	// nothing but its own rect). The caller blits the whole thing back over its
+	// window, so hand it out premultiplied-transparent rather than letting the
+	// first frames show driver garbage outside the woven rects. Also resets the
+	// frame-boundary state: the previous generation's handles described a
+	// texture that no longer exists.
+	{
+		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
+		c->render.weave_gen_count = 0;
+	}
 	c->render.weave_output_w = w;
 	c->render.weave_output_h = h;
 	U_LOG_W("#625 weave: server output %ux%u shared texture + service→caller fence ready", w, h);
@@ -17442,6 +17479,75 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
 	const bool nview = (layout != nullptr && layout->view_count > 0);
+
+	/*
+	 * #1058: clear the woven OUTPUT on the frame's FIRST submit.
+	 *
+	 * All three branches below composite INTO this persistent window-sized
+	 * texture and only ever WRITE it — nothing has ever cleared it. That is
+	 * invisible on the batch branch (canvas = the whole window, so every pixel
+	 * is rewritten every submit) and on v6 (same), but the LEGACY single-rect
+	 * branch passes canvas = the element's own rect, so everything outside that
+	 * rect keeps whatever some earlier frame wove there. The caller blits the
+	 * whole output back "over" its window each frame, so stale tiles march
+	 * across the page as it scrolls and survive navigation (the texture only
+	 * dies on window resize — the reported "resizing clears it" discriminator).
+	 * The header has documented this clear since spec v5; the implementation
+	 * cleared the SBS SCRATCH instead.
+	 *
+	 * Placement: AFTER the input AcquireSync succeeded. Clearing before it
+	 * would blank the whole window for a frame whose input never became
+	 * readable (that path returns early), i.e. trade a trail for a flash.
+	 *
+	 * Frame boundary — two rules, in order:
+	 *
+	 *  1. `weave_frame_first` (spec-v5 firstChunk) is authoritative. It lives
+	 *     on the BASE submit struct, so a legacy single-rect caller can set it
+	 *     too; once a client has ever sent it, it owns the boundary and rule 2
+	 *     stays out of the way (it must, or a >MAX-rect frame's later chunks
+	 *     would wipe the earlier ones).
+	 *
+	 *  2. Callers that never set it still need a boundary, and "clear on every
+	 *     legacy submit" is WRONG: the extension contract is "the caller calls
+	 *     weave once per element per frame" (XR_DXR_weave.h), so a page with N
+	 *     woven elements issues N single-rect submits per frame and clearing on
+	 *     each would leave only the last element alive. Infer the boundary from
+	 *     the set of INPUT HANDLES woven since the last clear instead: on this
+	 *     branch the input is an ELEMENT-sized 2x1 SBS atlas — one texture per
+	 *     element, reused across frames (that is what the import cache above
+	 *     exists for) — and an element is submitted at most once per frame, so
+	 *     the first REPEAT of a handle is the start of the next frame. Handles
+	 *     are the right key precisely because the rects are not: scrolling
+	 *     moves every rect every frame, so any rect-equality rule would never
+	 *     fire, which is the bug. The set is bounded (see
+	 *     WEAVE_OUTPUT_GEN_MAX_INPUTS): overflowing it forces a clear, so even
+	 *     a caller that cycles its input textures can only ever accumulate a
+	 *     bounded trail instead of an unbounded one.
+	 */
+	const bool legacy_single_rect = (!nview && rect_count == 0);
+	bool clear_output = weave_frame_first;
+	if (weave_frame_first) {
+		c->render.weave_saw_frame_first = true;
+		c->render.weave_gen_count = 0;
+	} else if (legacy_single_rect && !c->render.weave_saw_frame_first) {
+		bool repeat = false;
+		for (uint32_t i = 0; i < c->render.weave_gen_count; i++) {
+			if (c->render.weave_gen_inputs[i] == in) {
+				repeat = true;
+				break;
+			}
+		}
+		if (repeat || c->render.weave_gen_count >= WEAVE_OUTPUT_GEN_MAX_INPUTS) {
+			clear_output = true;
+			c->render.weave_gen_count = 0;
+		}
+		c->render.weave_gen_inputs[c->render.weave_gen_count++] = in;
+	}
+	if (clear_output && c->render.weave_output_rtv) {
+		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
+	}
+
 	if (nview) {
 		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
 		// way every other DisplayXR app does — tiles contiguous from the
@@ -17540,6 +17646,18 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		// #1013/#1016 (#1058): own viewport AND scissor. weave_submit was the
+		// only process_atlas site that asserted neither — it inherited whatever
+		// the last writer left on this shared immediate context (a compose
+		// blit, an alpha-gate pass), and the DP sets its own viewport but never
+		// the scissor. Full target; the canvas args below do the confining.
+		D3D11_VIEWPORT weave_vp = {};
+		weave_vp.Width = (float)win_w;
+		weave_vp.Height = (float)win_h;
+		weave_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &weave_vp);
+		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
+		sys->context->RSSetScissorRects(1, &weave_scissor);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
 		                                          /*view_w*/ cvw, /*view_h*/ cvh,
 		                                          layout->tile_columns, layout->tile_rows,
@@ -17571,10 +17689,36 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// SBS atlas — per-view dims = half width × full height. The DP weaves
 		// into the bound RTV, confined to the sub-rect via canvas_offset/size
 		// at the correct absolute phase.
+		//
+		// #1058: canvas = THE ELEMENT RECT here (every other path passes the
+		// full window), so this branch writes only that rect of the output and
+		// leaves the rest untouched. That is only safe because the output is
+		// now cleared once per frame above — without the clear, the untouched
+		// remainder is a previous frame's weave and the element trails as the
+		// page scrolls. Do not "optimise" that clear away for this branch.
 		uint32_t view_w = idesc.Width / 2;
 		uint32_t view_h = idesc.Height;
 
+		// #1058 one-shot per client: this is the DEGRADED path — one weave()
+		// per element per frame (the SR predictor wants one per frame) and a
+		// rect-scoped canvas. A client landing here has fallen out of the
+		// batch/v6 path; the line marks the session in the service log.
+		if (!c->render.weave_legacy_warned) {
+			c->render.weave_legacy_warned = true;
+			U_LOG_W("#1058 weave: client is on the LEGACY single-rect path (canvas = the element "
+			        "rect, one weave per element per frame) — degraded; the woven output is now "
+			        "cleared per frame so it cannot trail");
+		}
+
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		// #1013/#1016 (#1058): own viewport AND scissor — see the v6 branch.
+		D3D11_VIEWPORT weave_vp = {};
+		weave_vp.Width = (float)win_w;
+		weave_vp.Height = (float)win_h;
+		weave_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &weave_vp);
+		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
+		sys->context->RSSetScissorRects(1, &weave_scissor);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv,
 		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y,
@@ -17636,11 +17780,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 		// v5 firstChunk (browser#22): clear the SBS atlas to premultiplied
 		// transparent on the first submit of a frame so regions BETWEEN the
-		// tiles are alpha 0. process_atlas draws a fullscreen quad from this
-		// atlas (canvas_offset is a no-op today, #85), and the display processor
-		// is alpha-native (passes the atlas alpha through the weave), so cleared
-		// gaps come out transparent while the blitted tile regions keep the
-		// page's opaque alpha. That lets the present-owner draw the woven output
+		// tiles are alpha 0. This branch weaves with canvas = the WHOLE window
+		// (#1058: the DP honours canvas_offset/size — it scopes its viewport to
+		// exactly that rect; the old "canvas_offset is a no-op today, #85" note
+		// here was stale and is why the never-cleared output went unnoticed on
+		// the legacy branch), and the display processor is alpha-native (passes
+		// the atlas alpha through the weave), so cleared gaps come out
+		// transparent while the blitted tile regions keep the page's opaque
+		// alpha. That lets the present-owner draw the woven output
 		// back WHOLE-WINDOW (opaque tiles replace the page, transparent gaps show
 		// it through), single-sourcing 2D chrome that spans tile gaps. The clear
 		// is opt-in (weave_frame_first): legacy present-owners draw back only
@@ -17695,6 +17842,16 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// ONE weave for the whole window: constant geometry (full-window
 		// canvas), one predictor update, one fence signal (below).
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		// #1013/#1016 (#1058): own viewport AND scissor — see the v6 branch.
+		// This branch was only ACCIDENTALLY safe: the blit helper above happens
+		// to leave a full-scratch scissor latched. State it.
+		D3D11_VIEWPORT weave_vp = {};
+		weave_vp.Width = (float)win_w;
+		weave_vp.Height = (float)win_h;
+		weave_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &weave_vp);
+		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
+		sys->context->RSSetScissorRects(1, &weave_scissor);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
 		                                          /*view_w*/ win_w, /*view_h*/ win_h,
 		                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
