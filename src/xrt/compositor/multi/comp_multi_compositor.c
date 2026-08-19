@@ -1859,6 +1859,20 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		// pool was cached alongside it.
 		U_LOG_W("Reusing cached display processor for HWND %p (#528)",
 		        mc->session_render.external_window_handle);
+#ifdef XRT_OS_ANDROID
+		// #1032: resume the cached DP HERE, not in begin_session.
+		// multi_compositor_end_session pauses it (backlight forced to flat
+		// 2D so the home screen behind us isn't shown through a 3D lens),
+		// and begin_session is supposed to undo that — but begin_session
+		// runs BEFORE this lazy init, so at that point
+		// session_render.display_processor is still NULL and its
+		// on_resume is a no-op. The vendor DP then stayed paused forever:
+		// frames kept presenting but nothing weaved and the panel stayed
+		// 2D after the first background/foreground cycle. Observed on the
+		// NP02J with two satellite compositors, but it is not
+		// satellite-specific — one app backgrounding once is enough.
+		xrt_display_processor_on_resume(mc->session_render.display_processor);
+#endif
 	} else {
 		xrt_dp_factory_vk_fn_t factory =
 		    (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
