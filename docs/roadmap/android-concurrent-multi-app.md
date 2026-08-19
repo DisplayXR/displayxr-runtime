@@ -238,7 +238,7 @@ The abstraction is shared, so ~80% of the runtime work (window-origin feed + DP 
 | # | Limitation | Where | Needed for | Fix |
 |---|---|---|---|---|
 | L1 | Head-tracking config (orientation, tracked eyes, IPD, face count, fps, log level) is service-global last-writer-wins | CNSDK `server.cpp:126-267`, `common.hpp:50-66` | A, C (N cores) | per-client scoping or aggregation like start/fps; runtime never writes config |
-| L2 | Backlight multi-client service is a binary bind-refcount; no "bound but 2D" | `BacklightMultiClientControlService.kt:48-103`, empty AIDL | mixed 2D/3D windows | per-client preference + OR-refcount + admin force-2D — LeiaSR's `switchablehintserver.cpp:63-102` protocol ports directly |
+| L2 | Backlight multi-client service is a binary bind-refcount; no "bound but 2D" | `BacklightMultiClientControlService.kt:48-103`, empty AIDL | mixed 2D/3D windows | per-client preference + OR-refcount + admin force-2D — LeiaSR's `switchablehintserver.cpp:63-102` protocol ports directly. **Not a blocker for hidden-window handling** — see the note below (#1039). |
 | L3 | Legacy `BacklightControlService` forces 2D + `stopSelf` on unbind | `.kt:40-45` | all | never use; deprecate |
 | L4 | One CNSDK core per process (singleton + globals) | `core.h:39,84`; `LeiaSDK.java:388`; `androidDevice.cpp:83-95` | B only | make `device::` state per-core |
 | L5 | Core release joins a thread that never exits (leia-plugin#39) | `leia_cnsdk.cpp:732-746` | all | fix in core; C contains it by process death; A needs `_exit` |
@@ -246,6 +246,21 @@ The abstraction is shared, so ~80% of the runtime work (window-origin feed + DP 
 | L7 | Vendor services discoverable only by package name | CNSDK service manifests | **A** | add `org.displayxr.action.*` intent filters to head-tracking + display-config services |
 | L8 | (LeiaSR, if ported) phase origin only from HWND; `weave(w,h,x,y)` ignores its args | `dx11weaver.cpp:965-973,1092`; `vkweaver.cpp:1293` | LeiaSR-on-Android / browser weave | add `setWeavingScreenOrigin(x,y,screenW,screenH)` — one funnel line per backend |
 | L9 | (LeiaSR) `Dimenco::Weaver` statics = one calibration per process | `Weaver.h:39-170` | multi-display | per-display instances (`DrawRegion::serialNumber` is the hook) |
+
+**L2 update (#1039, device-verified).** The bind-refcount is *sufficient* for the
+multi-window pause case, because it already is an OR-of-votes arbiter: `onBind`/`onRebind`
+request `MODE_3D` and `onUnbind` — delivered only when the last client disconnects —
+requests `MODE_2D`. And `leia_core_enable_3d(false)` on that tier is a pure **unbind**:
+CNSDK `device::SetBacklightMode` (`androidDevice.cpp`) takes the multi-client branch and
+returns from it, never reaching `BacklightControlService::requestBacklightMode("MODE_2D")`
+or `LeiaManagerUtility::SetBacklightMode`. So a hidden window releasing its preference
+drops the refcount to N−1 and the panel stays 3D for its siblings, while the last release
+takes it to 0 and the service flattens the panel itself (#563). Verified on an NP02J with
+two satellites: refcount 2 → 1 → 2 with `setBacklightMode:false` never firing, and 2 → 0
+with it firing exactly once. The `debug.dxr.multiapp` hold (leia-plugin#151) is therefore
+deprecated. What L2 is still needed for is **mixed 2D/3D** windows (a bound client that
+wants 2D right now) and the **legacy tiers**, where the same call does command the panel
+globally (L3).
 
 **CNSDK vs LeiaSR-port.** CNSDK already has the property LeiaSR lacks (per-interlacer screen origin); LeiaSR already has the arbitration CNSDK lacks (per-client lens preference + OR-refcount, occlusion gating, admin force-2D). The cheapest coherent vendor stack for Android is **CNSDK + L1/L2/L7**, not a LeiaSR port. If a LeiaSR port is wanted anyway: reuse `srCore`/`srConfig`/`srFacetrackers`/`libfilter`/`DimencoWeaving`, new Android service host + lens actuator (`IBacklightControlInterface`) + tracker shim over CNSDK's head-tracking service + L8 setter; drop `Window2`/FPC/DeviceManager/shm/session/modeswitcher.
 

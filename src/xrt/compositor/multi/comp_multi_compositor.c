@@ -540,6 +540,59 @@ multi_compositor_create_semaphore(struct xrt_compositor *xc,
 	return xrt_comp_create_semaphore(&mc->msc->xcn->base, out_handle, out_xcsem);
 }
 
+#ifdef XRT_OS_ANDROID
+/*
+ * #1039. SINGLE WRITER: this is called from exactly one place — the multi main
+ * loop's per-frame convergence pass (`android_window_transition_locked`), with
+ * `list_and_timing_lock` held. It deliberately is NOT called from
+ * begin_session / end_session / init_session_render: those run on IPC handler
+ * threads that drop the lock around the expensive parts, and a second writer
+ * races the vendor call (a binder round-trip of tens of ms) against this
+ * function's state update — observed on an NP02J as a session-end pause landing
+ * AFTER a surface-state resume had already recorded VISIBLE, leaving the DP
+ * released while the runtime believed it was asserted, with no further edge to
+ * correct it. Those sites now only move the inputs (`state.session_active`),
+ * and the next pass converges within a frame.
+ */
+void
+multi_compositor_set_window_visible_locked(struct multi_compositor *mc, bool visible, const char *reason)
+{
+	if (mc == NULL) {
+		return;
+	}
+
+	const int want = visible ? MULTI_DP_VIS_VISIBLE : MULTI_DP_VIS_HIDDEN;
+	if (mc->session_render.dp_visibility == want) {
+		return;
+	}
+
+	// No DP yet: leave the state UNKNOWN so the next pass pushes as soon as
+	// one exists. Recording it here would silently swallow the first
+	// transition for a session whose DP is still being created.
+	if (mc->session_render.display_processor == NULL) {
+		return;
+	}
+
+	mc->session_render.dp_visibility = want;
+
+	// Edge-triggered, so this WARN is one line per transition, not per frame.
+	// The wording IS the contract (#1039): a window that is not visible
+	// RELEASES its lens preference; it never commands the panel to 2D. With N
+	// windows on one panel the vendor arbiter ORs the votes, so the lens only
+	// goes out when the last vote is released (which is #563).
+	if (visible) {
+		U_LOG_W("multi[#1039]: window visible (%s) - resuming DP, re-asserting its lens preference",
+		        reason);
+		xrt_display_processor_on_resume(mc->session_render.display_processor);
+	} else {
+		U_LOG_W("multi[#1039]: window not visible (%s) - pausing DP, releasing its lens preference",
+		        reason);
+		xrt_display_processor_on_pause(mc->session_render.display_processor);
+	}
+}
+
+#endif // XRT_OS_ANDROID
+
 static xrt_result_t
 multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
@@ -644,10 +697,14 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 		mc->session_render.use_android_surface = true;
 		U_LOG_I("Android: enabling per-session rendering (surface via android_globals)");
 
-		// Counterpart of end_session's on_pause (#563): the DP is cached
-		// across end→begin (#39), so wake the vendor SDK back up. The
-		// weave loop re-enables the 3D backlight on the first frame.
-		xrt_display_processor_on_resume(mc->session_render.display_processor);
+		// Counterpart of end_session's release (#563/#1039): the DP is cached
+		// across end→begin (#39), so it has to re-assert its lens preference.
+		// Nothing to call here — `state.session_active` below is the input,
+		// and the main loop's convergence pass re-asserts on the next frame
+		// IF the output surface is also live. That subsumes #1046's fix (a
+		// resume issued here was a no-op because session_render.display_processor
+		// is still NULL until the lazy init_session_render) and refuses to take
+		// a lens vote for a session begun while its window is still gone.
 #endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
@@ -720,12 +777,19 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// reuses the cached pair; the real destroy happens at client
 			// teardown.
 			//
-			// But DO pause it: the panel's switchable backlight is
-			// system-global and whatever is behind us (home screen,
-			// picker) is 2D content — without this the screen stays in
-			// physical 3D after the session ends (#563). begin_session
-			// resumes the cached DP and the weave re-enables 3D.
-			xrt_display_processor_on_pause(mc->session_render.display_processor);
+			// But it MUST release its lens preference: this session no
+			// longer has a window, so it must stop weaving and give its
+			// vote back (#1039). Not by forcing the panel to 2D — with a
+			// sibling window still weaving that would flatten the panel
+			// underneath it; when this was the LAST vote the vendor
+			// arbiter drops the lens itself, which is what keeps the home
+			// screen / picker out of a 3D lens (#563).
+			//
+			// The release is driven by `state.session_active`, cleared at
+			// the top of this function, plus the main loop's convergence
+			// pass. Calling the DP from here instead would race that pass
+			// (this runs on an IPC handler thread with the lock dropped)
+			// — see the note on multi_compositor_set_window_visible_locked.
 #else
 			// Destroy display processor (owns any vendor SDK handles)
 			xrt_display_processor_destroy(&mc->session_render.display_processor);
@@ -1318,8 +1382,10 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// Android end_session path deliberately caches it across end->begin
 	// (leia-plugin#39), so a client that ended its session before
 	// disconnecting reaches this destroy with initialized == false and the
-	// DP still alive. Destroy it unconditionally — the vendor destroy also
-	// drops the panel's system-global 3D backlight back to 2D (#563); the
+	// DP still alive. Destroy it unconditionally — DP destroy implies
+	// on_pause, i.e. it releases whatever lens preference the DP still held
+	// (#1039), which is what turns the lens off once the LAST window on the
+	// panel is gone (#563); the
 	// initialized-gated block below destroys it for the still-initialized
 	// case (xrt_display_processor_destroy NULLs the pointer, so at most one
 	// of the two calls acts).
@@ -1871,7 +1937,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		// 2D after the first background/foreground cycle. Observed on the
 		// NP02J with two satellite compositors, but it is not
 		// satellite-specific — one app backgrounding once is enough.
-		xrt_display_processor_on_resume(mc->session_render.display_processor);
+		//
+		// #1039 moved the actual push to the main loop's convergence pass,
+		// which keys on (live output surface AND session active) and runs on
+		// the same thread as this lazy init — so the cached DP is re-asserted
+		// on the next frame, and only if its window really is back.
 #endif
 	} else {
 		xrt_dp_factory_vk_fn_t factory =

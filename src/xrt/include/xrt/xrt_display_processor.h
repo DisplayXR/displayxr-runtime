@@ -270,9 +270,49 @@ struct xrt_display_processor
 	bool (*is_self_submitting)(struct xrt_display_processor *xdp);
 
 	/*!
-	 * Notify the display processor that the host activity has paused
-	 * (backgrounded). Vendor SDKs use this to drop face-tracking
-	 * cameras, dim backlights, and otherwise save power.
+	 * Notify the display processor that **this session's output window is
+	 * not visible** — its surface was destroyed, or the session ended.
+	 *
+	 * ## The contract (#1039, ADR-036)
+	 *
+	 * `on_pause` means *"stop weaving and **release your lens
+	 * preference**"*. It does **NOT** mean *"force the panel to 2D"*.
+	 *
+	 * The switchable-3D lens is **display-global** but the runtime drives
+	 * it **per window**: with N concurrently woven windows on one panel,
+	 * the lens must stay on while *any* of them is visible and wants 3D.
+	 * A display processor therefore never commands the panel — it only
+	 * casts a vote, and the vendor's arbiter (on Android, a binder
+	 * bind-refcount over a multi-client backlight service; on LeiaSR, the
+	 * per-client hint protocol) ORs the votes together. "Last one out
+	 * turns the light off" then falls out for free, which is exactly the
+	 * stuck-3D-after-close case (#563) — the last vote released drops the
+	 * refcount to zero and the arbiter flattens the panel itself.
+	 *
+	 * Concretely, a DP that owns a vendor lens vote MUST, on `on_pause`:
+	 *   - stop weaving / stop touching the output surface, and
+	 *   - **release** its vote (unbind / refcount--), NOT write a global
+	 *     "2D" mode through a legacy single-client path. If the vendor
+	 *     stack only offers a global force-2D, say so in the plug-in's
+	 *     docs and treat it as a vendor gap, not as the contract.
+	 * Everything else is free-form power saving: drop face-tracking
+	 * cameras, release GPU scratch, etc.
+	 *
+	 * The runtime guarantees this call is **edge-triggered and paired**:
+	 * it fires once per visible→hidden transition of *this* session's
+	 * window (Android: `MonadoView.surfaceDestroyed` →
+	 * `Client.clearAppSurface` → `android_globals_clear_window` →
+	 * `comp_multi_system::android_window_transition_locked`; plus
+	 * `multi_compositor_end_session`), and is always followed by exactly
+	 * one @ref on_resume or by @ref destroy. It is keyed on **surface
+	 * visibility**, never on Activity `onPause` — in multi-window only
+	 * one Activity is top-resumed while both windows are on screen and
+	 * weaving.
+	 *
+	 * Known gap: a window that is fully *occluded* but whose surface still
+	 * exists does not produce an `on_pause` — SurfaceFlinger does not
+	 * throttle occluded layers, so the runtime has no signal. Such a
+	 * window keeps weaving (and keeps its vote).
 	 *
 	 * Idempotent. Safe to call before the vendor SDK is fully
 	 * initialized — the vendor wrapper should no-op in that case.
@@ -284,10 +324,15 @@ struct xrt_display_processor
 	void (*on_pause)(struct xrt_display_processor *xdp);
 
 	/*!
-	 * Notify the display processor that the host activity has resumed
-	 * (foregrounded). Counterpart of @ref on_pause.
+	 * Notify the display processor that this session's output window is
+	 * visible again. Counterpart of @ref on_pause: **re-assert** the lens
+	 * preference (re-bind / refcount++) and resume weaving.
 	 *
-	 * Optional — NULL means no-op.
+	 * Fires once per hidden→visible transition of this session's window
+	 * (surface re-published, or the session begun / the cached DP
+	 * re-adopted, see #1046).
+	 *
+	 * Idempotent. Optional — NULL means no-op.
 	 *
 	 * @param xdp Pointer to self.
 	 */
@@ -295,6 +340,10 @@ struct xrt_display_processor
 
 	/*!
 	 * Destroy this display processor and free all resources.
+	 *
+	 * Implies @ref on_pause: any lens preference still held MUST be
+	 * released here (#1039), whether or not `on_pause` ran first. This is
+	 * the last chance — the process may exit immediately afterwards.
 	 *
 	 * @param xdp Pointer to self.
 	 */

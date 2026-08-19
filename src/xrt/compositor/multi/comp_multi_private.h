@@ -134,6 +134,24 @@ struct multi_layer_slot
  * @ingroup comp_multi
  * @implements xrt_compositor_native
  */
+/*!
+ * #1039: per-session window-visibility state, as pushed to that session's
+ * display processor via @ref xrt_display_processor_on_pause / _on_resume.
+ *
+ * The DP contract (see `xrt_display_processor.h`) is a per-window *preference*,
+ * not a display command: HIDDEN releases this session's lens vote, VISIBLE
+ * re-asserts it, and the vendor arbiter ORs the votes across every window on
+ * the panel. Tracking it per session (rather than reacting to a single
+ * system-wide surface edge) makes the transitions idempotent and lets a DP that
+ * came up *after* the surface was already lost converge to the right state.
+ */
+enum multi_dp_visibility
+{
+	MULTI_DP_VIS_UNKNOWN = 0, //!< Nothing pushed yet (zero-init).
+	MULTI_DP_VIS_VISIBLE,     //!< on_resume pushed; lens preference asserted.
+	MULTI_DP_VIS_HIDDEN,      //!< on_pause pushed; lens preference released.
+};
+
 struct multi_compositor
 {
 	struct xrt_compositor_native base;
@@ -280,6 +298,14 @@ struct multi_compositor
 		//! Generic display output processor for this session.
 		//! Wraps vendor-specific display processing (created via factory).
 		struct xrt_display_processor *display_processor;
+
+		//! #1039: the window-visibility state last pushed to
+		//! @ref display_processor, as a @ref multi_dp_visibility. Zero
+		//! (UNKNOWN) until the first push, so a DP created while the
+		//! window is already hidden still gets its on_pause. Makes the
+		//! on_pause/on_resume pair edge-triggered and idempotent per
+		//! SESSION rather than per system-wide surface edge.
+		int dp_visibility;
 
 		//! @name Generic per-session Vulkan rendering resources
 		//! Used by any display processor path.
@@ -746,11 +772,12 @@ struct multi_system_compositor
 
 #ifdef XRT_OS_ANDROID
 	/*!
-	 * #563: last observed android_globals output-surface validity
-	 * (-1 = unknown). The main loop pauses/resumes the clients' display
-	 * processors on transitions so the panel's system-global 3D backlight
-	 * drops to 2D when the app backgrounds WITHOUT ending its session
-	 * (the #528 surface-lost case) and comes back on resume.
+	 * #563/#1039: last observed android_globals output-surface validity
+	 * (-1 = unknown). Used ONLY to log the transition once; the actual
+	 * pause/resume decision is per client and lives in
+	 * `session_render.dp_visibility` (see @ref multi_dp_visibility), so a
+	 * client whose per-session render came up after the edge still
+	 * converges.
 	 */
 	int android_window_valid_state;
 #endif
@@ -917,6 +944,33 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
 	       mc->session_render.shared_texture_handle != NULL || mc->session_render.use_android_surface ||
 	       mc->session_render.use_macos_surface;
 }
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * #1039: converge this session's display processor onto @p visible, pushing
+ * at most one on_pause / on_resume per transition.
+ *
+ * `visible` is "this session's output window is on screen", i.e. the service has
+ * a live Android output surface AND this session is running. HIDDEN releases the
+ * DP's lens preference (it must NOT force the panel to 2D — the vendor arbiter
+ * does that when the LAST vote drops, which is the #563 case); VISIBLE
+ * re-asserts it.
+ *
+ * SINGLE WRITER: call ONLY from the multi main loop's convergence pass
+ * (`android_window_transition_locked`), with `list_and_timing_lock` held. The
+ * vendor call is a binder round-trip; a second writer on an IPC handler thread
+ * races the state update against it.
+ *
+ * @param mc      The client.
+ * @param visible Whether this session's window is on screen.
+ * @param reason  Short tag for the transition log line.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+void
+multi_compositor_set_window_visible_locked(struct multi_compositor *mc, bool visible, const char *reason);
+#endif // XRT_OS_ANDROID
 
 /*!
  * Get predicted eye positions from the session's display processor.
