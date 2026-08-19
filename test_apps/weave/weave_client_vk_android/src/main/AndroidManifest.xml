@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, The DisplayXR Project
+    SPDX-License-Identifier: BSL-1.0
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Android 12+ package visibility: without these the Khronos loader's scan
+         for the runtime returns nothing and xrCreateInstance fails with
+         XR_ERROR_RUNTIME_UNAVAILABLE even with DisplayXR installed. Same set as
+         cube_handle_vk_android. -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker"
+            tools:replace="android:authorities" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
+    </queries>
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:label="DisplayXR Weave Client">
+
+        <!--
+            ADR-036 D6 / #1033 / XR_DXR_weave spec v7: this app's whole reason to
+            exist is publishing View.getLocationOnScreen to the runtime so the
+            weave phase is anchored where the window sits. An OEM applying the
+            OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS compat change makes that call return
+            WINDOW-relative coordinates — every window would report (0,0) and weave
+            at the same wrong phase, with no error anywhere. The opt-out is
+            per-APP, so it must live here.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+            android:resizeableActivity="true"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
