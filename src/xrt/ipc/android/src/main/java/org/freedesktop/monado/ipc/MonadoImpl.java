@@ -94,6 +94,22 @@ public class MonadoImpl extends IMonado.Stub {
         }
     }
 
+    /**
+     * Strong reference to the Surface most recently published to the native side (#1040).
+     *
+     * <p>Without this the binder-received Surface is unreachable the instant {@link
+     * #passAppSurface} returns, so the ART finalizer can run {@code Surface.release()} at an
+     * arbitrary later point — concurrently with the compositor building/tearing down a
+     * VkSurfaceKHR from the matching ANativeWindow. Holding it makes the Java object's lifetime
+     * bracket the native one deterministically: it is dropped only when a replacement arrives or
+     * the client clears the surface, i.e. after the native side has been told to stop using it.
+     *
+     * <p>We never call {@code release()} ourselves — the native ANativeWindow reference counting
+     * (android_globals + the compositor targets) owns that side, and an explicit release here
+     * would be exactly the double-free this issue is about.
+     */
+    private Surface currentSurface = null;
+
     @Override
     public void passAppSurface(Surface surface) {
         Log.i(TAG, "passAppSurface");
@@ -101,7 +117,12 @@ public class MonadoImpl extends IMonado.Stub {
             Log.e(TAG, "Received a null Surface from the client!");
             return;
         }
+        // Publish first, THEN swap our strong reference: the previous Surface must stay
+        // reachable until android_globals has adopted the replacement (#1040).
         nativeAppSurface(surface);
+        synchronized (this) {
+            currentSurface = surface;
+        }
     }
 
     // Cached overlay decision from the last resolved client connect, returned for
@@ -164,7 +185,12 @@ public class MonadoImpl extends IMonado.Stub {
     @Override
     public void clearAppSurface() {
         Log.i(TAG, "clearAppSurface");
+        // Mark the published window invalid first; only once the compositor has been told to
+        // stop presenting into it do we let the Java Surface become collectable (#1040).
         nativeClearAppSurface();
+        synchronized (this) {
+            currentSurface = null;
+        }
     }
 
     public void shutdown() {

@@ -134,15 +134,23 @@ comp_window_android_init_swapchain(struct comp_target *ct, uint32_t width, uint3
 	// normally already present by the time the session reaches this point.
 	// Use the versioned window state so the per-acquire surface sync (#528)
 	// and this init agree on the generation the surface was built from.
+	// #1040: take our OWN reference on the published window rather than
+	// "adopting" the publisher's — an xrEndSession→xrBeginSession cycle builds
+	// a second target from the same publication, and adopting made the second
+	// teardown release a reference nobody had taken (native Surface destroyed
+	// under the live Java Surface → SIGSEGV in Surface.finalize).
 	struct ANativeWindow *window = NULL;
 	uint64_t generation = 0;
 	bool valid = false;
 	for (int i = 0; i < 100; i++) {
-		android_globals_get_window_state((struct _ANativeWindow **)&window, &generation, &valid);
+		window = (struct ANativeWindow *)android_globals_acquire_window(&generation, &valid);
 		if (valid && window != NULL) {
 			break;
 		}
-		window = NULL;
+		if (window != NULL) {
+			ANativeWindow_release(window);
+			window = NULL;
+		}
 		os_nanosleep(20 * U_TIME_1MS_IN_NS);
 	}
 
@@ -154,11 +162,12 @@ comp_window_android_init_swapchain(struct comp_target *ct, uint32_t width, uint3
 	VkResult ret = comp_window_android_create_surface(cwa, window, &cwa->base.surface.handle);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("comp_window_android: failed to create surface: %s", vk_result_string(ret));
+		ANativeWindow_release(window);
 		return false;
 	}
 
-	// Seed the surface-lifecycle tracking (#528): take ownership of the
-	// published window ref, released when the sync tears the target down.
+	// Seed the surface-lifecycle tracking (#528). The reference acquired above
+	// is released when the sync (or cleanup) tears the target down.
 	cwa->base.android_surface.window = (struct _ANativeWindow *)window;
 	cwa->base.android_surface.generation = generation;
 	cwa->base.android_surface.lost = false;

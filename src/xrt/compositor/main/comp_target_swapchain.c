@@ -1145,31 +1145,45 @@ android_surface_sync(struct comp_target_swapchain *cts)
 	// OUT_OF_DATE handling rebuilds the swapchain images at the new extent.
 	struct vk_bundle *vk = get_vk(cts);
 
+	// #1040: take our OWN reference, atomically with the read, instead of
+	// adopting the publisher's. `cur_window` above is only safe to compare —
+	// a concurrent passAppSurface could replace (and free) it at any moment.
+	uint64_t acq_gen = 0;
+	bool acq_valid = false;
+	struct _ANativeWindow *win = android_globals_acquire_window(&acq_gen, &acq_valid);
+	if (win == NULL || !acq_valid) {
+		if (win != NULL) {
+			ANativeWindow_release((ANativeWindow *)win);
+		}
+		cts->android_surface.lost = true;
+		cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
+		return VK_ERROR_SURFACE_LOST_KHR;
+	}
+	cts->android_surface.generation = acq_gen;
+
 	VkAndroidSurfaceCreateInfoKHR surface_info = {
 	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
 	    .flags = 0,
-	    .window = (struct ANativeWindow *)cur_window,
+	    .window = (struct ANativeWindow *)win,
 	};
 
 	VkSurfaceKHR surface = VK_NULL_HANDLE;
 	VkResult ret = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_info, NULL, &surface);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("comp_window_android: vkCreateAndroidSurfaceKHR on resume failed: %s", vk_result_string(ret));
+		ANativeWindow_release((ANativeWindow *)win);
 		cts->android_surface.lost = true;
 		cts->android_surface.last_skip_log_ns = os_monotonic_get_ns();
 		return VK_ERROR_SURFACE_LOST_KHR;
 	}
 
 	cts->surface.handle = surface;
-	// Take ownership of the published ref (released at the next teardown). A
-	// window published and replaced between two syncs leaks one ref — bounded
-	// and rare, same accepted behavior as the in-process path (#507).
-	cts->android_surface.window = cur_window;
+	cts->android_surface.window = win;
 	cts->android_surface.lost = false;
 
 	U_LOG_W("comp_window_android: surface recreated from new ANativeWindow %p, requesting swapchain "
 	        "rebuild (#528)",
-	        (void *)cur_window);
+	        (void *)win);
 
 	return VK_ERROR_OUT_OF_DATE_KHR;
 }
