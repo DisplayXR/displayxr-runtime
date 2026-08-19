@@ -585,6 +585,23 @@
 
 
 /*
+ * XR_DXR_android_surface_binding
+ *
+ * Android only. The app hands the runtime its OWN Surface/ANativeWindow; the
+ * runtime-spawned SurfaceView survives only as the `_hosted` fullscreen
+ * fallback (it has no ViewParent, so it crashes in any multi-window
+ * container). ADR-036 D2/D6, #1037.
+ */
+#if defined(XR_DXR_android_surface_binding) && defined(XRT_OS_ANDROID)
+#define OXR_HAVE_DXR_android_surface_binding
+#define OXR_EXTENSION_SUPPORT_DXR_android_surface_binding(_) \
+    _(DXR_android_surface_binding, DXR_ANDROID_SURFACE_BINDING)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_android_surface_binding(_)
+#endif
+
+
+/*
  * XR_DXR_macos_gl_binding
  */
 #if defined(XR_DXR_macos_gl_binding) && defined(XR_USE_PLATFORM_MACOS)
@@ -1195,6 +1212,7 @@
     OXR_EXTENSION_SUPPORT_DXR_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_info(_) \
     OXR_EXTENSION_SUPPORT_DXR_spatial_workspace(_) \
+    OXR_EXTENSION_SUPPORT_DXR_android_surface_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_) \
     OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \

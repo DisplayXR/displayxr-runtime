@@ -931,6 +931,16 @@ oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
                                  const XrWorkspaceClientStyleDXR *style);
 #endif
 
+#ifdef OXR_HAVE_DXR_android_surface_binding
+//! OpenXR API function @ep{xrSetAndroidSurfaceDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetAndroidSurfaceDXR(XrSession session, const XrAndroidSurfaceBindingCreateInfoDXR *binding);
+
+//! OpenXR API function @ep{xrSetAndroidWindowGeometryDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeometryDXR *geometry);
+#endif
+
 #ifdef OXR_HAVE_DXR_atlas_capture
 //! OpenXR API function @ep{xrCaptureAtlasDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
