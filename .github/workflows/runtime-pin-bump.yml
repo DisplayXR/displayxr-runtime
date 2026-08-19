@@ -1,0 +1,178 @@
+# Repin downstream repos onto a new runtime release -- ABI-gated.
+#
+# The mirror image of versions-bump.yml. That one runs when a SIBLING releases
+# and records the new version here; this one runs when THIS repo releases and
+# pushes the new tag out to every repo that pins the runtime in its sources.
+# Before this existed, build-windows.yml's ABI-gate failure message simply told
+# a human to go bump DXR_RUNTIME_GIT_TAG by hand.
+#
+# It opens PRs -- never direct commits. versions.json may be direct-committed
+# because it RECORDS a pin; a source pin change alters what compiles, so the
+# downstream repo's own CI has to gate it and a human merges. A bump that breaks
+# a plug-in therefore sits as a red PR and harms nothing.
+#
+# Manifest: downstream-pins.json      Spec: docs/specs/runtime/downstream-pin-bump.md
+name: runtime-pin-bump
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Runtime tag to pin downstream (vX.Y.Z)'
+        required: true
+      repo:
+        description: 'Limit to one repo (optional, e.g. displayxr-leia-plugin)'
+        required: false
+      dry_run:
+        description: 'Decide and log only -- open no PRs'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize so two tags in quick succession cannot race the same downstream branch.
+  group: runtime-pin-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: github.repository == 'DisplayXR/displayxr-runtime'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: t
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            DRY="${{ inputs.dry_run }}"
+            ONLY="${{ inputs.repo }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            DRY=false
+            ONLY=""
+          fi
+          # Strict, matching the auto-bump convention elsewhere: only canonical
+          # release tags propagate. Anything else (rc, nightly, retag) is skipped
+          # deliberately rather than pinned downstream.
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::notice::'$TAG' is not a canonical vX.Y.Z tag -- nothing to propagate."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "dry=$DRY"   >> "$GITHUB_OUTPUT"
+          echo "only=$ONLY" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        if: steps.t.outputs.skip != 'true'
+
+      # The ABI gate. Skips are the common, correct outcome: a patch release
+      # changes no ABI, and repinning would only raise each plug-in installer's
+      # MIN_RUNTIME_VERSION floor. See the spec's "Bump policy" section.
+      - name: Decide which repos need a repin
+        if: steps.t.outputs.skip != 'true'
+        id: decide
+        run: |
+          ARGS="--new-tag ${{ steps.t.outputs.tag }} --json decisions.json"
+          if [ -n "${{ steps.t.outputs.only }}" ]; then
+            ARGS="$ARGS --repo ${{ steps.t.outputs.only }}"
+          fi
+          python3 scripts/downstream_pin_bump.py decide $ARGS
+          {
+            echo "### Downstream pin decisions for ${{ steps.t.outputs.tag }}"
+            jq -r '.[] | "- **\(.action)** \(.repo)/\(.track) - \(.reason)"' decisions.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "n=$(jq '[.[] | select(.action=="bump")] | length' decisions.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Mint app token
+        if: steps.t.outputs.skip != 'true' && steps.decide.outputs.n != '0' && steps.t.outputs.dry != 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+
+      - name: Open repin PRs
+        if: steps.t.outputs.skip != 'true' && steps.decide.outputs.n != '0' && steps.t.outputs.dry != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.t.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config --global user.name  'displayxr-publish-bot[bot]'
+          git config --global user.email 'displayxr-publish-bot[bot]@users.noreply.github.com'
+
+          jq -c '.[] | select(.action=="bump")' decisions.json > bumps.jsonl
+          while read -r d; do
+            REPO=$(echo "$d"  | jq -r .repo)
+            TRACK=$(echo "$d" | jq -r .track)
+            CUR=$(echo "$d"   | jq -r .current_tag)
+            WHY=$(echo "$d"   | jq -r .reason)
+            # Tag in the branch name: a fixed name strands a stale PR and then
+            # silently attaches the next run to it.
+            BRANCH="chore/runtime-pin-${TAG}"
+            WORK="$RUNNER_TEMP/$REPO"
+            MSG="$RUNNER_TEMP/msg-${REPO}.txt"
+            BODY="$RUNNER_TEMP/body-${REPO}.md"
+
+            echo "::group::$REPO/$TRACK  $CUR -> $TAG"
+            rm -rf "$WORK"
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/${REPO}.git" "$WORK"
+            git -C "$WORK" checkout -b "$BRANCH"
+
+            # Writes every location of the track, or fails without touching any:
+            # a half-bumped repo trips its own Rule-5 drift check.
+            python3 scripts/downstream_pin_bump.py rewrite --new-tag "$TAG" --repo "$REPO" --track "$TRACK" --dir "$WORK"
+
+            if git -C "$WORK" diff --quiet; then
+              echo "no textual change -- skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Plain echo lines: a heredoc delimiter would have to sit at column 0,
+            # which a YAML block scalar cannot contain.
+            {
+              echo "chore(ci): repin runtime ${CUR} -> ${TAG} (${TRACK})"
+              echo ""
+              echo "${WHY}"
+              echo ""
+              echo "Auto-opened by displayxr-runtime's runtime-pin-bump.yml."
+            } > "$MSG"
+            git -C "$WORK" commit -aF "$MSG"
+            git -C "$WORK" push -u origin "$BRANCH" --force-with-lease
+
+            {
+              echo "Automated repin: this repo's ${TRACK} runtime pin moves **${CUR} -> ${TAG}**."
+              echo ""
+              echo "**Why this release and not the others:** ${WHY}"
+              echo ""
+              echo "Bumps are ABI-gated, not tag-chasing -- a release that changes no plug-in"
+              echo "ABI is skipped deliberately, because raising the pin also raises this"
+              echo "repo's installer MIN_RUNTIME_VERSION floor and would make it refuse a"
+              echo "runtime it works fine against. See docs/specs/runtime/downstream-pin-bump.md"
+              echo "in displayxr-runtime."
+              echo ""
+              echo "Every location of the ${TRACK} track was written in one commit, so this"
+              echo "repo's Rule-5 drift check should pass. **Merge only once CI is green** --"
+              echo "if the new runtime genuinely breaks the build, that is the signal this PR"
+              echo "exists to surface."
+              echo ""
+              echo "Opened by runtime-pin-bump.yml from displayxr-runtime@${TAG}"
+            } > "$BODY"
+
+            # --body-file, not --body: gh mangles backticks in an inline body.
+            gh pr create --repo "DisplayXR/${REPO}" --base main --head "$BRANCH" --title "chore(ci): repin runtime ${CUR} -> ${TAG} (${TRACK})" --body-file "$BODY" || echo "::warning::PR creation failed for $REPO (may already exist)"
+            echo "::endgroup::"
+          done < bumps.jsonl
+
+      - name: Note dry run
+        if: steps.t.outputs.dry == 'true'
+        run: echo "::notice::dry_run -- decisions logged above, no PRs opened."

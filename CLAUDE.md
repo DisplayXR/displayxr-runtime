@@ -198,6 +198,18 @@ To make them invocable from *any* directory (not just a runtime checkout), `scri
 
 Full spec: `docs/specs/runtime/versions-json-autobump.md`.
 
+### Downstream pins — the other direction
+`versions.json` records what siblings released; **`downstream-pins.json`** records where
+they pin *the runtime* in their own sources (`DXR_RUNTIME_GIT_TAG` / `RUNTIME_REF`).
+On a `v*` tag, `runtime-pin-bump.yml` opens repin **PRs** (never direct commits — a source
+pin changes what compiles, so downstream CI must gate it). Bumps are **ABI-gated, not
+tag-chasing**: a release that changes no plug-in ABI is skipped, because a vendor's
+`installer/CMakeLists.txt` derives `MIN_RUNTIME_VERSION` from the pin, so chasing patches
+would make its installer reject a runtime it works fine against. A track (e.g. leia's
+Linux pin) can be marked manual and is then never touched. `pin-rot-canary.yml` weekly-checks
+each pinned third-party SDK still resolves **and still unpacks `Include/`+`Lib/`** — a URL
+check alone passes a pin that cannot build. Spec: `docs/specs/runtime/downstream-pin-bump.md`.
+
 ### Release code-signing
 CI builds are **unsigned** (contributors need no signing access). Signed
 releases are produced by a **signing provider** — a repo named by the
