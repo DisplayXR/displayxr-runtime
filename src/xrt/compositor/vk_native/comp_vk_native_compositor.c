@@ -80,6 +80,13 @@
 #include "vk_native/comp_vk_native_window_xcb.h"
 #endif
 
+#ifdef XRT_OS_ANDROID
+// #1037/#1033: the app publishes its window's on-screen rect through
+// android_globals (XR_DXR_android_surface_binding); we consume it for both the
+// DP weave phase and the per-window Kooima canvas.
+#include "android/android_globals.h"
+#endif
+
 // Direct-scanout present path (ST-5539). Only compiled when the bundle carries
 // the display + acquire-xlib platform (CMake: XRT_HAVE_XLIB_XRANDR); the whole
 // direct branch below is gated on the same macro so its symbols exist.
@@ -328,6 +335,14 @@ struct comp_vk_native_compositor
 	int last_present_origin_x;
 	int last_present_origin_y;
 	bool have_last_present_origin;
+
+#ifdef XRT_OS_ANDROID
+	//! Last window-rect generation (android_globals) already handed to the DP
+	//! / already logged, so the per-window rect feed and its Kooima line stay
+	//! lifecycle events rather than per-frame noise (#1037).
+	uint64_t android_rect_generation_fed;
+	uint64_t android_rect_generation_logged;
+#endif
 
 	/*!
 	 * #602: the target image-set generation the display processor has already
@@ -5736,6 +5751,77 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_orientation = (struct xrt_quat){0, 0, 0, 1};
 	// Meters left 0 (see above) — the caller derives them from xsysc->info.
 	out_metrics->valid = true;
+
+	/*
+	 * PER-WINDOW Kooima, in-process (ADR-036 D6, epic #1031, #1034 in-process
+	 * twin). With N windows on one panel every session composites into ITS OWN
+	 * window, so the Kooima canvas is that window's physical rectangle — not
+	 * the panel. Left display-scoped, a half-width window renders a frustum
+	 * ~2x too wide whose off-axis skew is referenced to the panel centre, so
+	 * two side-by-side cubes read as two independent centred views instead of
+	 * one shared space seen through two apertures.
+	 *
+	 * Filling window_*_m + window_center_offset_* here is all it takes: the
+	 * Kooima block in oxr_session.c already prefers those over the display
+	 * dims, and rebases the render eyes to the window centre. Exactly the
+	 * shape ipc_try_get_oop_view_poses uses out-of-process.
+	 *
+	 * Source is the rect the app publishes each frame via
+	 * xrSetAndroidWindowGeometryDXR: physical screen pixels in the CURRENT
+	 * rotation, y down, together with the panel extent in that same rotation.
+	 * Both are needed — the runtime's own display info is the NATURAL-
+	 * orientation panel (this device class is natively portrait and runs
+	 * landscape) and a sub-panel window fits inside both orderings, so the
+	 * held orientation is not recoverable from the rect alone. No rect (or a
+	 * pre-#1037 app) → everything above stands unchanged.
+	 */
+	{
+		int32_t win_x = 0, win_y = 0;
+		uint32_t rect_w = 0, rect_h = 0, panel_w = 0, panel_h = 0;
+		int32_t display_id = -1;
+		uint64_t generation = 0;
+		float pitch = 0.0f;
+		if (c->sys_info_set && c->sys_info.display_pixel_width > 0 && c->sys_info.display_width_m > 0.0f) {
+			// Square-pixel pitch from the NATIVE panel dims — orientation-
+			// invariant, so it is valid against the current-rotation pixels.
+			pitch = c->sys_info.display_width_m / (float)c->sys_info.display_pixel_width;
+		}
+		if (pitch > 0.0f && android_globals_get_window_screen_rect(&win_x, &win_y, &rect_w, &rect_h,
+		                                                          &display_id, &panel_w, &panel_h,
+		                                                          &generation) &&
+		    rect_w > 0 && rect_h > 0 && panel_w > 0 && panel_h > 0) {
+			out_metrics->window_pixel_width = rect_w;
+			out_metrics->window_pixel_height = rect_h;
+			out_metrics->display_pixel_width = panel_w;
+			out_metrics->display_pixel_height = panel_h;
+			out_metrics->window_screen_left = win_x;
+			out_metrics->window_screen_top = win_y;
+			out_metrics->display_width_m = (float)panel_w * pitch;
+			out_metrics->display_height_m = (float)panel_h * pitch;
+			out_metrics->window_width_m = (float)rect_w * pitch;
+			out_metrics->window_height_m = (float)rect_h * pitch;
+
+			const float win_center_x = (float)win_x + (float)rect_w * 0.5f;
+			const float win_center_y = (float)win_y + (float)rect_h * 0.5f;
+			// +x right in both frames; y is negated because screen pixels
+			// are y-down and eye coordinates are y-up.
+			out_metrics->window_center_offset_x_m = (win_center_x - (float)panel_w * 0.5f) * pitch;
+			out_metrics->window_center_offset_y_m = -((win_center_y - (float)panel_h * 0.5f) * pitch);
+			out_metrics->window_center_offset_z_m = 0.0f;
+
+			// Lifecycle only (a window moved or resized), never per frame.
+			if (generation != c->android_rect_generation_logged) {
+				c->android_rect_generation_logged = generation;
+				U_LOG_W("in-process Kooima: per-window rect=(%d,%d %ux%u)px panel=%ux%u "
+				        "canvas=%.4fx%.4fm offset=(%.4f,%.4f)m (#1037/#1034)",
+				        win_x, win_y, rect_w, rect_h, panel_w, panel_h,
+				        (double)out_metrics->window_width_m,
+				        (double)out_metrics->window_height_m,
+				        (double)out_metrics->window_center_offset_x_m,
+				        (double)out_metrics->window_center_offset_y_m);
+			}
+		}
+	}
 	return true;
 #endif
 }
@@ -5759,6 +5845,42 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	if (c->display_processor == NULL) {
 		return;
 	}
+
+#ifdef XRT_OS_ANDROID
+	/*
+	 * Android takes the D6 route instead of set_present_origin: the DP needs
+	 * the window's full on-panel RECT (x, y, w, h, display_id), because a pure
+	 * window MOVE raises no resize and SurfaceFlinger repositions the layer
+	 * with the old buffer — nothing else in the pipeline can see it. Same feed
+	 * the out-of-process path makes in comp_multi_system.c's
+	 * update_window_screen_rect (#1033), from the same android_globals sink;
+	 * in-process the publisher is the app's own
+	 * xrSetAndroidWindowGeometryDXR (#1037).
+	 *
+	 * Sticky on the DP side, but re-asserted whenever the rect changes: a DP
+	 * recreated mid-session then never misses the origin. No rect published →
+	 * the DP stays display-scoped, exactly the behaviour that shipped before.
+	 */
+	{
+		int32_t x = 0, y = 0, display_id = -1;
+		uint32_t w = 0, h = 0, disp_w = 0, disp_h = 0;
+		uint64_t generation = 0;
+		if (android_globals_get_window_screen_rect(&x, &y, &w, &h, &display_id, &disp_w, &disp_h,
+		                                           &generation)) {
+			if (generation != c->android_rect_generation_fed) {
+				c->android_rect_generation_fed = generation;
+				// Lifecycle event (a window moved/resized), never per frame.
+				U_LOG_W("WINDOW_RECT: in-process window %d,%d %ux%u display %d panel %ux%u "
+				        "(#1037/#1033)",
+				        x, y, w, h, display_id, disp_w, disp_h);
+			}
+			xrt_display_processor_vk_set_window_screen_rect(
+			    (struct xrt_display_processor_vk *)c->display_processor, x, y, w, h, display_id);
+		}
+	}
+	return;
+#endif
+
 	struct xrt_window_metrics m;
 	if (!comp_vk_native_compositor_get_window_metrics(&c->base.base, &m) || !m.valid) {
 		// No live window metrics (headless / no window) — leave the DP
