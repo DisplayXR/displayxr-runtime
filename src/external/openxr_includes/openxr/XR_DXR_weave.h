@@ -222,8 +222,12 @@ extern "C" {
 //! v8). Smaller than XR_WEAVE_SUBMIT_MAX_RECTS_DXR on purpose: the flat list
 //! describes PANEL FURNITURE (bands, gutters, chrome), not per-element geometry,
 //! and it has to fit in the same fixed IPC message as the weave rects. A caller
-//! with more flat regions than this merges them into their bounding boxes —
-//! which errs toward flat, so it must merge only regions that are ALL flat.
+//! with more flat regions than this DROPS the smallest ones. Do NOT merge into
+//! bounding boxes: a merged box that swallows woven geometry marks working 3D as
+//! flat, and the two error directions are not symmetric — flat-marked-3D is the
+//! pre-v8 behaviour (a ghost the caller's own 2D composite already hides), while
+//! 3D-marked-flat displays a live woven tile through a flat lens, which is a
+//! regression. Dropping a flat rect degrades to the ghost; growing one breaks 3D.
 #define XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR 16
 
 //! Upper bound on rects passed to xrWeaveSetScreenFlatRegionsDXR (spec v8).
