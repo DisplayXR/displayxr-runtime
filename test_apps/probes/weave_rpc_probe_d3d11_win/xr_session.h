@@ -23,8 +23,16 @@
 
 // XR_DXR_weave available + enabled on the instance, and the resolved entry points.
 extern bool g_hasWeaveExt;
+//! The spec version the RUNTIME advertises for XR_DXR_weave (extensionVersion), not
+//! the version this probe's headers declare. The two can differ — an installed
+//! runtime older than these headers still advertises its own number — and every v8
+//! feature below is gated on the runtime's, so a stale runtime degrades to a clear
+//! log line instead of a silently-ignored chain.
+extern uint32_t g_weaveSpecVersion;
 extern PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow;
 extern PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit;
+//! Spec v8 (browser#88). NULL on a pre-v8 runtime — the sticky-latch tests skip.
+extern PFN_xrWeaveSetScreenFlatRegionsDXR g_pfnWeaveSetScreenFlat;
 
 // Initialize OpenXR instance + system; detect/enable D3D11 + win32_window_binding
 // + display_info + weave.

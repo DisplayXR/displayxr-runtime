@@ -11,8 +11,10 @@
 #include <vector>
 
 bool g_hasWeaveExt = false;
+uint32_t g_weaveSpecVersion = 0;
 PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow = nullptr;
 PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit = nullptr;
+PFN_xrWeaveSetScreenFlatRegionsDXR g_pfnWeaveSetScreenFlat = nullptr;
 
 #define XR_CHECK(call)                                                                                                  \
 	do {                                                                                                               \
@@ -77,13 +79,19 @@ InitializeOpenXR(XrSessionManager &xr)
 		}
 		if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
 			g_hasWeaveExt = true;
+			g_weaveSpecVersion = ext.extensionVersion;
 		}
 	}
 
 	LOG_INFO("XR_KHR_D3D11_enable:         %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
 	LOG_INFO("XR_DXR_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
 	LOG_INFO("XR_DXR_display_info:         %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
-	LOG_INFO("XR_DXR_weave:                %s", g_hasWeaveExt ? "AVAILABLE" : "NOT FOUND");
+	// Report BOTH the runtime's advertised spec version and the one these headers
+	// were built against — the per-region hardware wish (v8) is silently absent on
+	// an older runtime, and "chain sent" would otherwise look like "chain honoured".
+	LOG_INFO("XR_DXR_weave:                %s (runtime spec v%u, probe headers v%u)",
+	         g_hasWeaveExt ? "AVAILABLE" : "NOT FOUND", g_weaveSpecVersion,
+	         (uint32_t)XR_DXR_weave_SPEC_VERSION);
 
 	if (!hasD3D11) {
 		LOG_ERROR("XR_KHR_D3D11_enable not available - cannot continue");
@@ -177,8 +185,13 @@ CreateSession(XrSessionManager &xr, ID3D11Device *d3d11Device, HWND appHwnd)
 	// Resolve the weave entry points.
 	xrGetInstanceProcAddr(xr.instance, "xrWeaveBindWindowDXR", (PFN_xrVoidFunction *)&g_pfnWeaveBindWindow);
 	xrGetInstanceProcAddr(xr.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g_pfnWeaveSubmit);
-	LOG_INFO("xrWeaveBindWindowDXR: %s, xrWeaveSubmitDXR: %s", g_pfnWeaveBindWindow ? "resolved" : "NULL",
-	         g_pfnWeaveSubmit ? "resolved" : "NULL");
+	// v8 (browser#88): OPTIONAL — a pre-v8 runtime resolves this to NULL and the
+	// sticky-latch leg self-skips. Not folded into the hard check below.
+	xrGetInstanceProcAddr(xr.instance, "xrWeaveSetScreenFlatRegionsDXR",
+	                      (PFN_xrVoidFunction *)&g_pfnWeaveSetScreenFlat);
+	LOG_INFO("xrWeaveBindWindowDXR: %s, xrWeaveSubmitDXR: %s, xrWeaveSetScreenFlatRegionsDXR: %s",
+	         g_pfnWeaveBindWindow ? "resolved" : "NULL", g_pfnWeaveSubmit ? "resolved" : "NULL",
+	         g_pfnWeaveSetScreenFlat ? "resolved" : "NULL (pre-v8 runtime)");
 	if (!g_pfnWeaveBindWindow || !g_pfnWeaveSubmit) {
 		LOG_ERROR("Failed to resolve weave entry points");
 		return false;

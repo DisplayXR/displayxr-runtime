@@ -27,6 +27,30 @@
  *
  * Run forced-IPC: set XRT_FORCE_MODE=ipc process-level, start displayxr-service,
  * then launch this exe.
+ *
+ * ── Spec v8 per-region hardware wish (browser#88) ────────────────────────────
+ *
+ * Two flags drive the two ways to declare a region PHYSICALLY FLAT, so the wish
+ * (`union(weave rects) - union(flat rects)`) can be exercised on real hardware:
+ *
+ *   --flat-band=top20   chain XrWeaveSubmitFlatRegionsDXR, one window-relative
+ *                       rect = the TOP 20% of the client area (any topN, or
+ *                       `all` = the whole window, which drives the wish EMPTY).
+ *   --screen-flat=X,Y,WxH   call xrWeaveSetScreenFlatRegionsDXR once after bind
+ *                       with one ABSOLUTE SCREEN rect (`clear` clears the latch).
+ *
+ * --flat-band also widens the weave rect to the FULL client area, because the
+ * wish is a subtraction: with the default centred 640x360 element a top band
+ * would not intersect the weave rect at all and the wish would be unchanged.
+ * `--rect=centred` keeps the centred element if that is what you want to see.
+ *
+ * WHAT IS OBSERVABLE WHERE. The wish is ADVISORY and HARDWARE-ONLY (ADR-027 D6 /
+ * ADR-030): woven pixels are bit-identical with and without it. A DP whose panel
+ * has ONE zone quantizes the wish to any-nonzero, so on such hardware a partial
+ * band cannot go flat on its own — only an EMPTY wish (`--flat-band=all`) moves
+ * the panel, to 2D. The per-REGION half is observable on a DP reporting a real
+ * cell grid; sim_display simulates one via SIM_DISPLAY_ZONE_GRID +
+ * SIM_DISPLAY_ZONE_DUMP, which logs the resolved cell map.
  */
 
 #include "xr_session.h"
@@ -39,6 +63,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // atoi — --flat-band / --screen-flat parsing
+#include <cstring> // strtok_s / _stricmp — ditto
 #include <string>
 #include <vector>
 
@@ -93,6 +119,23 @@ static bool g_v6Exact = false; //!< DXR_WEAVE_V6_EXACT=1 -> atlas == packed regi
 // before — the request was stored and never applied. -1 = don't request.
 static int g_requestMode = -1;
 static float g_v6ScaleX = 0.5f, g_v6ScaleY = 1.0f;
+
+// ---- v8 per-region hardware wish (browser#88) --------------------------------
+// --flat-band=topN / =all: percentage of the client area's HEIGHT, measured from
+// the top, that this submit declares physically FLAT via a chained
+// XrWeaveSubmitFlatRegionsDXR. 0 = flag absent (byte-for-byte pre-v8: no chain).
+// 100 (`all`) makes the wish EMPTY, which is the one case a single-zone panel can
+// act on (it goes 2D) — see the file header.
+static uint32_t g_flatBandPct = 0;
+// --flat-band widens the weave rect to the whole client area so the band actually
+// intersects it; --rect=centred overrides back to the default 640x360 element.
+static bool g_fullRect = false;
+static bool g_rectOverride = false;
+// --screen-flat=X,Y,WxH: one ABSOLUTE SCREEN rect latched once via
+// xrWeaveSetScreenFlatRegionsDXR after bind. --screen-flat=clear latches zero
+// rects (exercises the clear path). g_screenFlatMode: 0 = absent, 1 = set, 2 = clear.
+static int g_screenFlatMode = 0;
+static int32_t g_screenFlatRect[4] = {0, 0, 0, 0}; // x, y, w, h
 
 // v4 overlay atlas (browser#18): a window-sized premultiplied-alpha 2D layer the
 // DP composites OVER the woven output. Painted ONCE (a static crisp 2D badge that
@@ -627,12 +670,139 @@ MaybeDumpWeaved()
 	g_context->Unmap(staging.Get(), 0);
 }
 
+// ---- v8 option parsing (browser#88) ------------------------------------------
+// Flags, unlike the older DXR_WEAVE_* env knobs, because the run script forwards
+// %* — so the hardware validation is one command, not a `set` + a launch. Each
+// flag still has an env twin for harnesses that can only set the environment;
+// the flag wins when both are present.
+
+//! `topN` / `N` / `all` -> percent of client height declared flat from the top.
+static void
+ApplyFlatBand(const char *v)
+{
+	if (v == nullptr || v[0] == '\0') {
+		return;
+	}
+	unsigned pct = 0;
+	if (_stricmp(v, "all") == 0) {
+		pct = 100; // whole window flat => EMPTY wish
+	} else if (_strnicmp(v, "top", 3) == 0) {
+		pct = (unsigned)atoi(v + 3);
+	} else {
+		pct = (unsigned)atoi(v);
+	}
+	if (pct < 1 || pct > 100) {
+		LOG_ERROR("--flat-band: bad value '%s' (want topN / N / all, N in 1..100) — ignored", v);
+		return;
+	}
+	g_flatBandPct = pct;
+	// The wish is a SUBTRACTION from the weave rects: a top band that misses the
+	// default centred element would change nothing, so widen the rect unless the
+	// operator explicitly asked otherwise.
+	if (!g_rectOverride) {
+		g_fullRect = true;
+	}
+}
+
+//! `X,Y,WxH` -> one absolute-screen sticky flat rect; `clear` -> clear the latch.
+static void
+ApplyScreenFlat(const char *v)
+{
+	if (v == nullptr || v[0] == '\0') {
+		return;
+	}
+	if (_stricmp(v, "clear") == 0) {
+		g_screenFlatMode = 2;
+		return;
+	}
+	int x = 0, y = 0, w = 0, h = 0;
+	if (sscanf_s(v, "%d,%d,%dx%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+		LOG_ERROR("--screen-flat: bad value '%s' (want X,Y,WxH or clear) — ignored", v);
+		return;
+	}
+	g_screenFlatRect[0] = x;
+	g_screenFlatRect[1] = y;
+	g_screenFlatRect[2] = w;
+	g_screenFlatRect[3] = h;
+	g_screenFlatMode = 1;
+}
+
+//! `full` / `centred` -> weave-rect shape, pinned against --flat-band's default.
+static void
+ApplyRect(const char *v)
+{
+	if (v == nullptr || v[0] == '\0') {
+		return;
+	}
+	if (_stricmp(v, "full") == 0) {
+		g_fullRect = true;
+	} else if (_stricmp(v, "centred") == 0 || _stricmp(v, "centered") == 0 || _stricmp(v, "centre") == 0 ||
+	           _stricmp(v, "center") == 0) {
+		g_fullRect = false;
+	} else {
+		LOG_ERROR("--rect: bad value '%s' (want full or centred) — ignored", v);
+		return;
+	}
+	g_rectOverride = true; // pin it: a later --flat-band must not undo this
+}
+
+//! Env fallback for a flag, applied only when the flag itself was absent.
+static void
+ApplyFromEnv(const char *name, void (*apply)(const char *), bool already_set)
+{
+	if (already_set) {
+		return;
+	}
+	char buf[64] = {0};
+	DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
+	if (n > 0 && n < sizeof(buf)) {
+		apply(buf);
+	}
+}
+
+static void
+ParseOptions(PWSTR cmdLineW)
+{
+	// --rect is applied FIRST so its pin survives whatever order the operator
+	// typed the flags in (--flat-band defaults the rect only when unpinned).
+	char narrow[1024] = {0};
+	if (cmdLineW != nullptr) {
+		WideCharToMultiByte(CP_UTF8, 0, cmdLineW, -1, narrow, (int)sizeof(narrow) - 1, nullptr, nullptr);
+	}
+	for (int pass = 0; pass < 2; pass++) {
+		char work[1024];
+		memcpy(work, narrow, sizeof(work));
+		char *ctx = nullptr;
+		for (char *tok = strtok_s(work, " \t", &ctx); tok != nullptr; tok = strtok_s(nullptr, " \t", &ctx)) {
+			if (pass == 0) {
+				if (_strnicmp(tok, "--rect=", 7) == 0) {
+					ApplyRect(tok + 7);
+				}
+				continue;
+			}
+			if (_strnicmp(tok, "--flat-band=", 12) == 0) {
+				ApplyFlatBand(tok + 12);
+			} else if (_strnicmp(tok, "--screen-flat=", 14) == 0) {
+				ApplyScreenFlat(tok + 14);
+			} else if (_strnicmp(tok, "--rect=", 7) != 0) {
+				LOG_INFO("unrecognized argument '%s' — ignored", tok);
+			}
+		}
+	}
+
+	ApplyFromEnv("DXR_WEAVE_RECT", ApplyRect, g_rectOverride);
+	ApplyFromEnv("DXR_WEAVE_FLAT_BAND", ApplyFlatBand, g_flatBandPct != 0);
+	ApplyFromEnv("DXR_WEAVE_SCREEN_FLAT", ApplyScreenFlat, g_screenFlatMode != 0);
+}
+
 // -----------------------------------------------------------------------------
 int WINAPI
-wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
+wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 {
 	InitializeLogging("weave_rpc_probe_d3d11_win");
 	LOG_INFO("=== XR_DXR_weave probe (#625) starting ===");
+
+	ParseOptions(pCmdLine);
 
 	{
 		char buf[8] = {0};
@@ -670,6 +840,21 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 	if (g_useV6) {
 		LOG_INFO("  v6 grid=%ux%u views=%u scale=%.3fx%.3f atlas=%s", g_v6Cols, g_v6Rows,
 		         g_v6Cols * g_v6Rows, g_v6ScaleX, g_v6ScaleY, g_v6Exact ? "exact (zero-copy)" : "oversized (crop)");
+	}
+	LOG_INFO("Weave rect: %s", g_fullRect ? "FULL client area" : "centred 640x360 element");
+	if (g_flatBandPct == 0) {
+		LOG_INFO("v8 per-submit flat regions: OFF (no chain — byte-for-byte pre-v8)");
+	} else if (g_flatBandPct >= 100) {
+		LOG_INFO("v8 per-submit flat regions: ALL (whole window flat => wish EMPTY => panel should go 2D)");
+	} else {
+		LOG_INFO("v8 per-submit flat regions: top %u%% of the client area flat => wish = rect - band",
+		         g_flatBandPct);
+	}
+	if (g_screenFlatMode == 1) {
+		LOG_INFO("v8 sticky screen flat regions: SET 1 rect @ screen %d,%d %dx%d", g_screenFlatRect[0],
+		         g_screenFlatRect[1], g_screenFlatRect[2], g_screenFlatRect[3]);
+	} else if (g_screenFlatMode == 2) {
+		LOG_INFO("v8 sticky screen flat regions: CLEAR (rectCount 0)");
 	}
 
 	XrSessionManager xr;
@@ -718,6 +903,27 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		return 1;
 	}
 
+	// v8 (browser#88): latch the STICKY screen-space flat regions. Once, AFTER the
+	// bind — the runtime intersects screen rects with the bound window's client
+	// area, so latching before there is a window to clip against would drop them.
+	// Applied immediately: the runtime re-rasters and republishes any live wish
+	// before returning, so this does not wait for the next submit.
+	if (g_screenFlatMode != 0) {
+		if (g_pfnWeaveSetScreenFlat == nullptr) {
+			LOG_ERROR("--screen-flat requested but xrWeaveSetScreenFlatRegionsDXR is NOT RESOLVED "
+			          "(runtime spec v%u < 8) — skipping the sticky leg",
+			          g_weaveSpecVersion);
+		} else {
+			XrRect2Di sr = {{g_screenFlatRect[0], g_screenFlatRect[1]},
+			                {g_screenFlatRect[2], g_screenFlatRect[3]}};
+			const uint32_t n = (g_screenFlatMode == 2) ? 0u : 1u;
+			XrResult fr = g_pfnWeaveSetScreenFlat(xr.session, n, n > 0 ? &sr : nullptr);
+			LogXrResult("xrWeaveSetScreenFlatRegionsDXR", fr);
+			LOG_INFO("v8 sticky latch %s: %u rect(s)%s", XR_SUCCEEDED(fr) ? "SENT" : "FAILED", n,
+			         n > 0 ? " (absolute screen px)" : " (latch cleared)");
+		}
+	}
+
 	// #776: ask for a specific rendering mode. Before the #776 fix a
 	// present-owner's request was stored and never applied (the only consumer
 	// was the per-client commit, which a weave caller never runs), and the
@@ -762,12 +968,14 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			}
 		}
 
-		// Centre the weaved sub-rect in the current client area.
+		// Centre the weaved sub-rect in the current client area — or take the whole
+		// client area when --flat-band widened it, so a flat band actually falls
+		// INSIDE the weave rects it is subtracted from (v8).
 		RECT rc = {};
 		GetClientRect(g_hwnd, &rc);
 		int32_t cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-		uint32_t rw = (uint32_t)min((int32_t)kRectW, cw);
-		uint32_t rh = (uint32_t)min((int32_t)kRectH, ch);
+		uint32_t rw = g_fullRect ? (uint32_t)cw : (uint32_t)min((int32_t)kRectW, cw);
+		uint32_t rh = g_fullRect ? (uint32_t)ch : (uint32_t)min((int32_t)kRectH, ch);
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
@@ -820,13 +1028,21 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		in.rect.extent.height = (int32_t)rh;
 		in.firstChunk = XR_TRUE; // single submit per frame → also the first: clears the woven output
 
+		// Chain assembly. Appended through a MOVING TAIL rather than each link
+		// hand-picking its predecessor: with four optional links (rects, layout,
+		// overlays, flat regions) that pairwise bookkeeping is where a silently
+		// dropped struct comes from — an unchained struct is not an error, it just
+		// never reaches the runtime.
+		const void **tail = &in.next;
+
 		// v3 batch: one window-relative rect (element position). Switches the
 		// runtime to the window-sized-input batch layout + the firstChunk clear.
 		XrRect2Di batchRect = {{rx, ry}, {(int32_t)rw, (int32_t)rh}};
 		XrWeaveSubmitRectsDXR rects = {XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
 		rects.rectCount = 1;
 		rects.rects = &batchRect;
-		in.next = &rects;
+		*tail = &rects;
+		tail = &rects.next;
 
 		// v6 (#774): declare the N-view atlas layout. With this chained the rect
 		// above degrades to a scope hint and the runtime skips the per-rect
@@ -838,7 +1054,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			lay.tileRows = g_v6Rows;
 			lay.contentViewWidth = v6ContentW;
 			lay.contentViewHeight = v6ContentH;
-			rects.next = &lay;
+			*tail = &lay;
+			tail = &lay.next;
 		}
 
 		// Chain the 2D overlay atlas (browser#18 v4) so the DP composites it over
@@ -849,13 +1066,29 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			ov.overlayIsDxgi = XR_FALSE;
 			ov.rectCount = 0;
 			ov.rects = nullptr;
-			// Append, don't overwrite — the v6 layout may already sit at
-			// rects.next (chain is rects -> layout -> overlays).
-			if (g_useV6) {
-				lay.next = &ov;
-			} else {
-				rects.next = &ov;
-			}
+			*tail = &ov;
+			tail = &ov.next;
+		}
+
+		// v8 (browser#88): declare the FLAT band. wish = union(rects) - union(flat),
+		// published to the DP's zone-wish channel. ADVISORY and HARDWARE-ONLY — the
+		// woven pixels below are bit-identical whether or not this is chained, which
+		// is exactly what makes an A/B of the two runs a valid test: the ONLY thing
+		// that may differ is the panel's physical 3D element.
+		XrRect2Di flatRect = {};
+		XrWeaveSubmitFlatRegionsDXR flat = {XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR};
+		if (g_flatBandPct > 0) {
+			// Band measured off the WEAVE RECT, not the window, so --rect=centred
+			// still produces a band that intersects something.
+			const int32_t bandH = (int32_t)(((uint32_t)rh * g_flatBandPct) / 100u);
+			flatRect.offset.x = rx;
+			flatRect.offset.y = ry;
+			flatRect.extent.width = (int32_t)rw;
+			flatRect.extent.height = bandH;
+			flat.rectCount = 1;
+			flat.rects = &flatRect;
+			*tail = &flat;
+			tail = &flat.next;
 		}
 
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
@@ -874,6 +1107,24 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
 		latSum += ms;
 		latCount++;
+
+		// One-shot on the first ACCEPTED submit: state what actually went over the
+		// wire. "Sent" is the honest claim this probe can make — whether the panel
+		// obeyed is the DP's business and shows up in the service log's
+		// [weave_wish] lines, so the two are deliberately reported separately.
+		if (latCount == 1) {
+			if (g_flatBandPct > 0) {
+				LOG_INFO("v8 XrWeaveSubmitFlatRegionsDXR CHAIN SENT: 1 flat rect %d,%d %dx%d "
+				         "(weave rect %d,%d %ux%u) => wish %s",
+				         flatRect.offset.x, flatRect.offset.y, flatRect.extent.width,
+				         flatRect.extent.height, rx, ry, rw, rh,
+				         g_flatBandPct >= 100 ? "EMPTY (panel should go 2D)"
+				                              : "= weave rect minus the band");
+			} else {
+				LOG_INFO("v8 XrWeaveSubmitFlatRegionsDXR CHAIN NOT SENT (--flat-band absent) — "
+				         "wish = the whole weave rect, i.e. pre-v8 behaviour");
+			}
+		}
 
 		// Feed the returned tracked eyes into next frame's off-axis render.
 		if (out.eyesValid == XR_TRUE && out.eyeCount >= 2) {
@@ -908,9 +1159,10 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 
 		if ((frame % 120) == 0 && latCount > 0) {
 			LOG_INFO("weave round-trip: last=%.3f ms, avg=%.3f ms (%u frames), out=%ux%u rect=%d,%d %ux%u "
-			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f)",
+			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) flat=%u band=%dx%d",
 			         ms, latSum / latCount, latCount, out.width, out.height, rx, ry, rw, rh,
-			         out.eyesValid, out.eyesTracking, out.eyeCount, g_lastEyeX[0], g_lastEyeX[1]);
+			         out.eyesValid, out.eyesTracking, out.eyeCount, g_lastEyeX[0], g_lastEyeX[1],
+			         flat.rectCount, flatRect.extent.width, flatRect.extent.height);
 		}
 
 		// #776 blocker 3: once the requested-mode change event has had time to
