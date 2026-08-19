@@ -130,9 +130,37 @@ history is not rewritten.
 >   `XR_DXR_android_surface_binding` (app-provided `ANativeWindow`) has to land and the
 >   runtime-spawned SurfaceView demoted to the `_hosted` fallback. Tracked in #1037.
 >
-> Still open in-process, unchanged by this amendment: the window-rect feed for
+> Still open in-process after this amendment: the window-rect feed for
 > `comp_vk_native` (the D6 contract in-process), and a `comp_vk_native` audit for
 > per-process statics.
+
+### D2, Amendment 2 — the surface binding ships; multi-window A is unblocked (2026-08-18, #1037)
+
+`XR_DXR_android_surface_binding` is
+[implemented and specified](../specs/extensions/XR_DXR_android_surface_binding.md).
+The app owns and passes its `ANativeWindow`; the runtime-spawned SurfaceView survives
+only as the `_hosted` fullscreen fallback, with the `ViewParent` NPE named at the site.
+Two runtime functions carry what changes during a session and Android reports to nobody
+but the app: `xrSetAndroidSurfaceDXR` (the Surface dies and is reborn on every
+background/resume) and `xrSetAndroidWindowGeometryDXR` (**the in-process half of D6** —
+window rect + panel extent, once per frame from a `Choreographer` callback).
+
+The in-process compositor consumes that rect twice, exactly mirroring what the
+out-of-process path already did: `set_window_screen_rect` before `process_atlas` for
+the weave phase (#1033), and `get_window_metrics` for the per-window Kooima canvas +
+eye rebase (#1034). Both degrade to the display-scoped behaviour that shipped before
+when no rect is published.
+
+Two in-process cubes now weave side by side on the NP02J at their own origins — the
+first time Architecture A has run multi-window on hardware. The D6 contract is
+therefore satisfied on both deployments.
+
+One consequence worth recording, because it is the inverse of what Amendment 1 removed:
+a client APK now carries **zero vendor classes and zero vendor `.so`**, but still needs
+two vendor `<queries><package>` lines, because package visibility is enforced per
+calling UID and the runtime declaring them does not help. They were previously
+invisible — injected by the vendor AAR's own manifest — so removing the AAR is what
+exposed them. D5 / L7's neutral intent action removes them for good.
 
 ### D3 — Satellite-per-app (Architecture C) is the sanctioned out-of-process deployment
 

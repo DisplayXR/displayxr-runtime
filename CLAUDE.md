@@ -76,7 +76,7 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 - `XR_DXR_cocoa_window_binding` — app passes NSWindow to runtime
 - `XR_DXR_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
 - `XR_DXR_display_info` — display dimensions, eye-tracking modes
-- `XR_DXR_android_surface_binding` — Android surface binding
+- `XR_DXR_android_surface_binding` — app passes its own Android Surface/`ANativeWindow`; `xrSetAndroidSurfaceDXR` republishes it across background/resume and `xrSetAndroidWindowGeometryDXR` feeds the per-frame window rect (ADR-036 D6). **Required for multi-window on Android** — the runtime-spawned SurfaceView is `_hosted`-fullscreen-only
 - `XR_DXR_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallDXR`
 
 Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.

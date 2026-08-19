@@ -24,9 +24,9 @@ side-channel removed ([ADR-031](../adr/ADR-031-remove-surround-output-rect-zones
 
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
-| **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
+| **Handle** | `_handle` | App provides its own window handle via `XR_DXR_*_window_binding` (Android: its own Surface, via [`XR_DXR_android_surface_binding`](../specs/extensions/XR_DXR_android_surface_binding.md)) | Native compositor directly in-process |
 | **Texture** | `_texture` | **Present-ownership handoff** for a producer that has no window the runtime can weave into — an offscreen browser composite (CEF), a WebXR bridge surface, a decode/capture target. App provides a shared texture; the runtime's display processor weaves **into that texture** and the app presents it. Regions (if the app mixes 2D/3D) are declared with [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md) exactly as any other class — texture is **not** itself a region mechanism | Native compositor directly in-process |
-| **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
+| **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR). **On Android this is fullscreen-only**: the runtime's self-spawned `SurfaceView` is added straight to the `WindowManager`, so it has no `ViewParent` and `SurfaceView.onAttachedToWindow` crashes in any multi-window (freeform / split-screen) container. An Android app that wants multi-window must be `_handle` — own the Surface and chain the binding (ADR-036 D2, #1037) | Native compositor directly in-process |
 | **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
 
 > **Class is about *who presents the surface*, not about mixing 2D and 3D.**

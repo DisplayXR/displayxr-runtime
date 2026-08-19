@@ -144,6 +144,31 @@ Android-OOP is a **vendor-isolation policy derived from a real 🟦 manifest rul
 > [ADR-036](../adr/ADR-036-android-per-window-compositor-instances.md) D2/D5
 > Amendment 1.
 
+> **Both remaining blockers CLEARED (2026-08-18, #1037 part 2).**
+> [`XR_DXR_android_surface_binding`](../specs/extensions/XR_DXR_android_surface_binding.md)
+> is implemented: the app hands the runtime its own `ANativeWindow`, republishes it
+> across background/resume with `xrSetAndroidSurfaceDXR`, and publishes its on-screen
+> rect each frame with `xrSetAndroidWindowGeometryDXR`. The runtime-spawned SurfaceView
+> is demoted to the `_hosted` fullscreen fallback, so the `ViewParent` NPE is
+> structurally unreachable for a binding app. The in-process compositor consumes the
+> rect twice — `set_window_screen_rect` before `process_atlas` (weave phase) and
+> `get_window_metrics` (per-window Kooima canvas + eye rebase).
+>
+> Measured on the NP02J, two in-process cubes staged side by side in freeform
+> (1600x2560 portrait, 800-wide columns), each with runtime + `comp_vk_native` + vendor
+> DP + one vendor core in its own process:
+>
+> ```
+> A  window screen rect 0,60 800x2500     canvas=0.0734x0.2295m offset=(-0.0367,-0.0028)m
+> B  window screen rect 800,60 800x2500   canvas=0.0734x0.2295m offset=( 0.0367,-0.0028)m
+> HW_DBG_CNSDK: weave full-target screen-pos 0,60 / 800,60   target 800x2500
+> ```
+>
+> Moving a window post-session updates all three (rect, canvas, weave origin) with no
+> session churn; home/resume drops and republishes the surface and the lens-preference
+> refcount walks 2 → 1 → 0 and back. A backgrounded app is still frozen by the platform
+> (`do_freezer_trap`) — the §6b freezer question is unchanged by any of this.
+
 ## 6b. Android platform constraints that shape every option 🟦
 
 Cited from AOSP/dev-docs by the platform survey; **[A]** marks inference.
@@ -246,10 +271,12 @@ The abstraction is shared, so ~80% of the runtime work (window-origin feed + DP 
 6. Docs: reconcile `android-build-guide.md`/`android-bringup-checklist.md` with ADR-025; new ADR "per-window compositor instances on Android"; amend ADR-025 with the visibility convention.
 
 **A-specific:**
-7. Implement `XR_DXR_android_surface_binding` (app passes its Surface/`ANativeWindow`; retire the runtime-spawned SurfaceView, `oxr_session_gfx_vk_native.c:274-300`; keep it as the `_hosted` fallback).
-8. Async main-thread marshalling for DP creation inside the app (`aux_android/android_main_thread`, non-blocking when `xrCreateSession` is on the main thread; DP becomes ready asynchronously, session reports `XR_SESSION_STATE_READY` after).
+7. ~~Implement `XR_DXR_android_surface_binding` (app passes its Surface/`ANativeWindow`; retire the runtime-spawned SurfaceView, `oxr_session_gfx_vk_native.c:274-300`; keep it as the `_hosted` fallback).~~ **Done (#1037):** [spec](../specs/extensions/XR_DXR_android_surface_binding.md) + `oxr_android_surface.c`; plus `xrSetAndroidSurfaceDXR` for surface loss/regain and `xrSetAndroidWindowGeometryDXR` for the in-process D6 rect feed (consumed by both `set_window_screen_rect` and `get_window_metrics`). The self-spawned SurfaceView is the documented `_hosted` fullscreen fallback.
+8. Async main-thread marshalling for DP creation inside the app (`aux_android/android_main_thread`, non-blocking when `xrCreateSession` is on the main thread; DP becomes ready asynchronously, session reports `XR_SESSION_STATE_READY` after). **Partially addressed (#1037):** `oxr_session_populate_vk_native` now WARNs when the calling thread has no `ALooper`, which is the actual failure condition (see the D2 amendment). Marshalling itself still needs a hook on the app's main thread — `android_main_thread_dispatch_init()` is installed by the SERVICE's JNI entry point and has no in-process equivalent. Remaining work: the engine shape (`xrCreateSession` on a bare pthread).
+
+8b. **Audit `comp_vk_native` for per-process statics** of the `comp_d3d11_target.cpp` kind. Untouched by #1037; benign today because Architecture A gives every window its own process, but it is the thing that would bite if two sessions ever shared one.
 9. ~~Plug-in-loader host classloader: `target_plugin_loader.c` Android branch exposes a runtime-APK `Context`/classloader to plug-ins (mirrors `loadClassFromRuntimeApk`) so CNSDK's Java glue resolves without the app bundling it.~~ **Done (#1037):** `xrt_plugin_host_iface::get_android_class_host_context` + `createPackageContext` in `target_plugin_loader.c`; the `inProcess` flavor carries the glue AAR.
-10. `displayxr` AAR manifest: `<queries><intent><action android:name="org.displayxr.action.VENDOR_DISPLAY_SERVICE"/></intent></queries>` (+ the OpenXR broker provider); audit `comp_vk_native` for per-process statics of the `comp_d3d11_target.cpp` kind.
+10. `displayxr` AAR manifest: `<queries><intent><action android:name="org.displayxr.action.VENDOR_DISPLAY_SERVICE"/></intent></queries>` (+ the OpenXR broker provider). **Now the LAST vendor-specific thing in a client APK.** #1037 removed the vendor Java glue from clients (the runtime hosts it, item 9) but package visibility is enforced per calling UID, so the two vendor `<package>` lines had to be written by hand in `cube_handle_vk_android`'s manifest — they used to arrive transitively from the vendor AAR, and dropping the AAR exposed them. Blocked on the vendor advertising the neutral action (D5 / L7).
 
 **C-specific:**
 11. `MonadoServiceSlot{0..K-1}` (`android:process=":dxrN"`, non-isolated) + broker (`IMonado.acquireSlot() → ComponentName`) or slot hash in `Client.java` (call sites `:337,363`); satellite `onUnbind → stopSelf/exit` (contains leia-plugin#39); Watchdog per satellite trivially correct.
@@ -352,7 +379,7 @@ Validation of the brief's ownership model: **confirmed**, with three corrections
 1. **PoC-0 (1–2 days, no vendor change) — two satellites, two cubes (Arch C mechanics).** Add `MonadoServiceSlot1` (`android:process=":dxr1"`) to the OOP flavor; hack `Client.java` to pick the slot by package hash; run `cube_handle_vk_android` twice (two package ids) in split-screen on NP02J with the Leia plug-in. Success = both woven and tracked, killing one leaves the other at full rate; log head-tracking client count and backlight refcount. This decides the vendor question for A **and** C in one shot (N cores in N processes; L1 config-stomp for real).
 2. **PoC-1 — window origin.** `getLocationOnScreen` (Choreographer poll) → `set_window_screen_rect` → `set_viewport_screen_position`; drag a freeform window; quantify crosstalk during/after drag; decide whether per-frame updates suffice or a "weave flat while moving" heuristic is needed.
 3. **PoC-2 — Kooima rebase + mixed 2D/3D.** Enable the window-local view rebase; run one 3D app + one 2D app; confirm L2 behaviour and take the per-client-preference change to Leia.
-4. **PoC-3 — Arch A spike.** ✅ **Ran 2026-08-18 (#1037).** Intent-only package visibility proven on a retail device (no vendor package names); runtime classloader hosting for the vendor Java glue **shipped** (`get_android_class_host_context`); async main-thread DP creation found **not to be a blocker**; **one cube fully in-process** with the vendor DP and a vendor-free APK. **Two apps side by side crashed** in the runtime-spawned SurfaceView (no `ViewParent`), which pins the next step: a real `XR_DXR_android_surface_binding`. Hop measurement vs PoC-0 not taken.
+4. **PoC-3 — Arch A spike.** ✅ **Ran 2026-08-18 (#1037).** Intent-only package visibility proven on a retail device (no vendor package names); runtime classloader hosting for the vendor Java glue **shipped** (`get_android_class_host_context`); async main-thread DP creation found **not to be a blocker**; **one cube fully in-process** with the vendor DP and a vendor-free APK. **Two apps side by side crashed** in the runtime-spawned SurfaceView (no `ViewParent`), which pins the next step: a real `XR_DXR_android_surface_binding`. Hop measurement vs PoC-0 not taken. **Follow-up landed the same day (#1037 part 2):** the surface binding + the in-process rect feed + per-window Kooima ship, and two in-process cubes now weave side by side at their own origins on the NP02J (evidence in §6).
 5. **PoC-4 — browser weave. RUNTIME HALF DONE (#1036).** `comp_multi_weave_android.c` + the un-gated extension + `test_apps/weave/weave_client_vk_android`, a native present-owner submitting an AHardwareBuffer with rects, are on hardware: PRESENT_OWNER admission, weave engine bring-up, woven AHardwareBuffer handed back, window geometry reaching `leia_interlacer_set_viewport_screen_position`, and re-allocation across a rotation. Remaining: the Chromium spike (`Client.blockingConnect` from `:privileged_process0`, or browser-process connect + fd handoff over Mojo with an "adopt fd" entry in `ipc_client_connection.c`), and running the weave client next to another app, which needs the satellite slots of #1053.
 6. Productise: ADR, `#967` re-scope, slot broker (C) / AAR + surface-binding extension (A).
 
