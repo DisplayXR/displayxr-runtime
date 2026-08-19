@@ -442,6 +442,13 @@ struct multi_compositor
 		int32_t window_screen_x, window_screen_y;
 		uint32_t window_screen_w, window_screen_h;
 		int32_t window_screen_display_id;
+		//! Panel extent in the SAME (current) rotation the rect is expressed in,
+		//! as the client sampled it from `Display.getRealSize` (#1034). Needed by
+		//! the per-window Kooima rebase to place the window centre against the
+		//! panel centre; the runtime's own display info is the NATURAL-orientation
+		//! panel and a sub-panel window fits inside both orderings, so the held
+		//! orientation cannot be inferred from the rect alone. 0 = not reported.
+		uint32_t window_screen_disp_w, window_screen_disp_h;
 		uint64_t window_rect_generation;
 		//! @}
 
@@ -941,6 +948,30 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
  */
 bool
 multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics);
+
+/*!
+ * Read this session's cached window rect on the panel (ADR-036 D6, #1033/#1034).
+ *
+ * Android only: the rect the client last published over `IMonado.updateWindowRect`,
+ * in physical screen pixels of the CURRENT rotation (y down, window origin
+ * inclusive of any caption), plus the panel extent in that same rotation. This is
+ * the geometry channel the per-window Kooima rebase consumes
+ * (`ipc_try_get_oop_view_poses`), the same value the DP gets via
+ * `set_window_screen_rect`.
+ *
+ * @return false until the first rect arrives, or when the panel extent is unknown
+ *         — the caller then keeps today's display-scoped behaviour.
+ *
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_get_window_screen_rect(struct multi_compositor *mc,
+                                        int32_t *out_x,
+                                        int32_t *out_y,
+                                        uint32_t *out_w,
+                                        uint32_t *out_h,
+                                        uint32_t *out_disp_w,
+                                        uint32_t *out_disp_h);
 
 /*!
  * Request display mode switch (2D/3D).

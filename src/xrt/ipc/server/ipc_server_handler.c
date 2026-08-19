@@ -1191,9 +1191,11 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// unknown — the Kooima needs a real physical size.
 	float screen_width_m = s->xsysc->info.display_width_m;
 	float screen_height_m = s->xsysc->info.display_height_m;
-	// #59 per-window Kooima: when a workspace window pose is applied (macOS shared
-	// surface), the render eyes are rebased to the window centre so the off-axis
-	// frustum looks THROUGH the tiled window (set below). 0 = display-centric.
+	// Per-window Kooima: when this session owns a WINDOW rather than the panel —
+	// a placed workspace window on macOS (#59), a freeform window on Android
+	// (ADR-036 D6, #1034) — screen_*_m becomes the window's metres and the render
+	// eyes are rebased to the window centre so the off-axis frustum looks THROUGH
+	// the window (both set below). 0 = display-centric.
 	float win_eye_offset_x = 0.0f, win_eye_offset_y = 0.0f, win_eye_offset_z = 0.0f;
 	if (screen_width_m <= 0.0f || screen_height_m <= 0.0f) {
 		static bool logged_no_dims = false;
@@ -1206,8 +1208,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 
 	// Live window px + #499 orientation swap: if the held orientation disagrees
 	// with the physical-dims orientation, swap the meters so the FOV aspect
-	// follows the panel. Android metrics carry identity orientation + zero
-	// center offset (display-centric), so no window-local eye rebase is needed.
+	// follows the panel. This is the DISPLAY-scoped baseline; on Android the
+	// #1034 block below replaces it outright once the client has published a
+	// window rect (the swap then only matters as the pre-rect fallback), and on
+	// macOS the #59 block does the same from the controller-placed window pose.
 	struct xrt_window_metrics wm = {0};
 	bool have_wm = multi_compositor_get_window_metrics(mc, &wm);
 	if (have_wm && wm.window_pixel_width > 0 && wm.window_pixel_height > 0) {
@@ -1219,6 +1223,76 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
+
+#ifdef XRT_OS_ANDROID
+	// PER-WINDOW Kooima (ADR-036 D6, epic #1031, #1034).
+	//
+	// With N windows on one panel every session composites into ITS OWN window, so
+	// the Kooima canvas is that window's physical rectangle — not the panel. Left
+	// display-scoped, every app renders as if it owned the whole panel: the frustum
+	// is ~2x too wide for a half-width window and its off-axis skew is referenced to
+	// the panel centre, so only a window that happens to be centred looks right and
+	// two side-by-side cubes read as two independent centred views instead of one
+	// shared space seen through two apertures.
+	//
+	// Same shape as the macOS #59 block below and the Windows per-client
+	// window-metrics path (ipc_try_get_sr_view_poses): screen = the window's metres,
+	// and the render eyes are rebased to the WINDOW centre (subtracted further down,
+	// alongside the zone offset) so the off-axis frustum looks THROUGH the window.
+	// Geometry only — ADR-033 is unchanged, the weaver still owns all phase (that is
+	// the sibling #1033 feed of the same rect).
+	//
+	// Source is the #1033 window rect the client publishes each frame: physical
+	// screen pixels in the CURRENT rotation, y down, window origin inclusive of any
+	// caption, together with the panel extent in that same rotation. Both are needed
+	// — the runtime's own display info is the NATURAL-orientation panel (this class
+	// of device is natively portrait and runs landscape), and a sub-panel window fits
+	// inside both orderings, so the held orientation cannot be recovered from the
+	// rect alone. No rect yet (or a client that predates the panel-extent field) →
+	// fall through to the display-scoped behaviour above, exactly as today.
+	{
+		int32_t win_x = 0, win_y = 0;
+		uint32_t win_w = 0, win_h = 0, panel_w = 0, panel_h = 0;
+		if (multi_compositor_get_window_screen_rect(mc, &win_x, &win_y, &win_w, &win_h, &panel_w,
+		                                            &panel_h)) {
+			// Square-pixel pitch from the NATIVE panel dims — orientation-
+			// invariant, so it is valid against the current-rotation pixels above
+			// (same derivation the display-zones rebase below uses).
+			float pitch = 0.0f;
+			if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
+				pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
+			}
+			if (pitch > 0.0f) {
+				screen_width_m = (float)win_w * pitch;
+				screen_height_m = (float)win_h * pitch;
+				const float win_center_x = (float)win_x + (float)win_w * 0.5f;
+				const float win_center_y = (float)win_y + (float)win_h * 0.5f;
+				// +x right in both frames; y is negated because screen pixels are
+				// y-down and eye coordinates are y-up.
+				win_eye_offset_x = (win_center_x - (float)panel_w * 0.5f) * pitch;
+				win_eye_offset_y = -((win_center_y - (float)panel_h * 0.5f) * pitch);
+				win_eye_offset_z = 0.0f;
+
+				// Lifecycle only (a window moved or resized), never per frame.
+				static int32_t logged_x = INT32_MIN, logged_y = INT32_MIN;
+				static uint32_t logged_w = 0, logged_h = 0;
+				if (win_x != logged_x || win_y != logged_y || win_w != logged_w ||
+				    win_h != logged_h) {
+					logged_x = win_x;
+					logged_y = win_y;
+					logged_w = win_w;
+					logged_h = win_h;
+					IPC_WARN(s,
+					         "oop Kooima: per-window rect=(%d,%d %ux%u)px panel=%ux%u "
+					         "canvas=%.4fx%.4fm offset=(%.4f,%.4f)m (#1034)",
+					         win_x, win_y, win_w, win_h, panel_w, panel_h,
+					         (double)screen_width_m, (double)screen_height_m,
+					         (double)win_eye_offset_x, (double)win_eye_offset_y);
+				}
+			}
+		}
+	}
+#endif
 
 #ifdef XRT_OS_MACOS
 	// Shared spatial surface (#59) PER-WINDOW Kooima. Each client composites into a
@@ -1604,9 +1678,12 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	static bool first_call = true;
 	if (first_call) {
 		first_call = false;
-		IPC_WARN(s, "oop Kooima: FIRST CALL view_count=%u dp_eyes=%d screen=%.3fx%.3fm win_px=%ux%u",
+		IPC_WARN(s,
+		         "oop Kooima: FIRST CALL view_count=%u dp_eyes=%d screen=%.3fx%.3fm win_px=%ux%u "
+		         "winOffset=(%.4f,%.4f)m",
 		         view_count, (int)have_dp_eyes, (double)screen_width_m, (double)screen_height_m,
-		         (unsigned)wm.window_pixel_width, (unsigned)wm.window_pixel_height);
+		         (unsigned)wm.window_pixel_width, (unsigned)wm.window_pixel_height,
+		         (double)win_eye_offset_x, (double)win_eye_offset_y);
 	}
 	static int log_counter = 0;
 	if (++log_counter >= 300) {
@@ -1615,9 +1692,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		float v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
 		float fov_aspect = (v != 0.0f) ? (h / v) : 0.0f;
 		IPC_WARN(s,
-		         "oop Kooima: views=%u screen=%.3fx%.3fm FOV H=%.1f° V=%.1f° "
+		         "oop Kooima: views=%u screen=%.3fx%.3fm winOffset=(%.4f,%.4f)m FOV H=%.1f° V=%.1f° "
 		         "fovAspect=%.3f tracking=%d rig=%d zone=%d",
-		         view_count, (double)screen_width_m, (double)screen_height_m, (double)h, (double)v,
+		         view_count, (double)screen_width_m, (double)screen_height_m, (double)win_eye_offset_x,
+		         (double)win_eye_offset_y, (double)h, (double)v,
 		         (double)fov_aspect, (int)is_tracking, (int)rig_display, (int)zone_applied);
 	}
 
