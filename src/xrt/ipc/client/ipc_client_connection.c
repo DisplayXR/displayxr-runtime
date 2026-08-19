@@ -96,8 +96,40 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void
 #define IPC_CONNECT_BUSY_TOTAL_MS 5000
 #define IPC_CONNECT_BUSY_WAIT_MS 500
 
+// #1058 / browser#92: how long we keep retrying ERROR_FILE_NOT_FOUND while a
+// live service instance is detectable (i.e. the pipe is missing only because
+// that instance has not posted it yet), and the poll step in between.
+#define IPC_CONNECT_STARTING_TOTAL_MS 5000
+#define IPC_CONNECT_STARTING_STEP_MS 250
+
+//! The service's single-instance mutex (see targets/service/main.c, #975). Held
+//! for the process lifetime, so "can be opened" == "a service process is alive
+//! in this session". Local\ namespace: same-session only, which is exactly the
+//! scope of the pipe.
+#define IPC_SERVICE_SINGLETON_NAME L"Local\\DisplayXR.Service.Singleton"
+
 /*!
- * Open the service comm pipe, retrying on ERROR_PIPE_BUSY.
+ * Is a displayxr-service process alive right now?
+ *
+ * Best-effort and deliberately conservative: a sandboxed client (AppContainer
+ * Chrome) may be denied the open even when the service IS up, in which case we
+ * report false and the caller keeps its pre-#1058 behavior. False negatives
+ * only cost us the retry window; there are no false positives that matter.
+ */
+static bool
+ipc_service_instance_alive(void)
+{
+	HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, IPC_SERVICE_SINGLETON_NAME);
+	if (m == NULL) {
+		return false;
+	}
+	CloseHandle(m);
+	return true;
+}
+
+/*!
+ * Open the service comm pipe, retrying on ERROR_PIPE_BUSY — and, while a
+ * service instance is alive, on ERROR_FILE_NOT_FOUND.
  *
  * The server mainloop only posts the next listening pipe instance *after* it
  * finishes handling the previous connection, so when several clients connect at
@@ -105,6 +137,17 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void
  * get ERROR_PIPE_BUSY (231). The canonical Win32 client dance for that is to
  * WaitNamedPipe() for an instance to free up and retry, bounded by a deadline,
  * instead of failing xrCreateInstance outright. See issue #603.
+ *
+ * #1058 / browser#92: ERROR_FILE_NOT_FOUND (2) is no longer only "server not
+ * running". Since #1002 the service RELAUNCHES ITSELF on device-lost, so a
+ * client connecting during those couple of seconds finds no pipe even though a
+ * service is coming up. That fell through to the auto-launch fallback, whose
+ * spawned instance immediately exits on the #975 singleton guard — and the wait
+ * loop there only waits on the process IT spawned, so xrCreateInstance failed
+ * (-2) while a perfectly good service arrived a second later. Retry instead,
+ * but ONLY while the singleton mutex says an instance is actually alive: with no
+ * service running at all this returns on the first attempt exactly as before, so
+ * the cold-start auto-launch path pays nothing.
  *
  * On failure the original GetLastError() is preserved so callers can still tell
  * "server not running" (ERROR_FILE_NOT_FOUND, drives the auto-launch fallback)
@@ -114,20 +157,37 @@ static HANDLE
 ipc_open_pipe_busy_retry(struct ipc_connection *ipc_c, const char *pipe_name)
 {
 	DWORD waited_ms = 0;
+	DWORD starting_waited_ms = 0;
 	for (int attempt = 1;; attempt++) {
 		HANDLE pipe_inst =
 		    CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 		if (pipe_inst != INVALID_HANDLE_VALUE) {
-			if (waited_ms > 0) {
-				// Leave a breadcrumb that the busy-retry path recovered a
-				// concurrent connect that would previously have failed (#603).
-				IPC_INFO(ipc_c, "Pipe %s was busy, connected after ~%u ms (attempt %d)",
-				         pipe_name, waited_ms, attempt);
+			if (waited_ms > 0 || starting_waited_ms > 0) {
+				// Leave a breadcrumb that the retry path recovered a connect
+				// that would previously have failed (#603 busy, #1058 starting).
+				IPC_INFO(ipc_c, "Pipe %s was unavailable, connected after ~%u ms (attempt %d)",
+				         pipe_name, waited_ms + starting_waited_ms, attempt);
 			}
 			return pipe_inst;
 		}
 
 		DWORD err = GetLastError();
+
+		// #1058: the pipe is missing but a service instance is alive — it is
+		// mid-start (or mid-restart) and has not posted the pipe yet. Poll.
+		if (err == ERROR_FILE_NOT_FOUND && starting_waited_ms < IPC_CONNECT_STARTING_TOTAL_MS &&
+		    ipc_service_instance_alive()) {
+			if (starting_waited_ms == 0) {
+				IPC_INFO(ipc_c,
+				         "Pipe %s not posted yet but a service instance is alive (starting or "
+				         "relaunching) — waiting up to %u ms",
+				         pipe_name, (unsigned)IPC_CONNECT_STARTING_TOTAL_MS);
+			}
+			Sleep(IPC_CONNECT_STARTING_STEP_MS);
+			starting_waited_ms += IPC_CONNECT_STARTING_STEP_MS;
+			continue;
+		}
+
 		if (err != ERROR_PIPE_BUSY) {
 			// Server-down or a genuine error: hand back with the error intact.
 			SetLastError(err);
@@ -249,12 +309,26 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		}
 		err = GetLastError();
 		// Keep waiting while the freshly-launched service is still spinning up
-		// its pipe (FILE_NOT_FOUND) or is momentarily saturated (PIPE_BUSY), as
-		// long as the service process is still alive.
-		if ((err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY) ||
-		    WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT) {
+		// its pipe (FILE_NOT_FOUND) or is momentarily saturated (PIPE_BUSY).
+		if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PIPE_BUSY) {
 			IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 			break;
+		}
+		// #1058 / browser#92: our child exiting is NOT proof that no service is
+		// coming. It exits immediately on the #975 singleton guard whenever
+		// another instance owns it — which is precisely the case we land in when
+		// the service is mid-relaunch (#1002 device-lost). Give the pipe a
+		// bounded grace window after the child dies instead of failing
+		// xrCreateInstance the instant it does.
+		if (WaitForSingleObject(pi.hProcess, 100) != WAIT_TIMEOUT) {
+			if (i * 100 >= IPC_CONNECT_STARTING_TOTAL_MS) {
+				IPC_ERROR(ipc_c, "Connect to %s failed: %d %s (launched service exited)", pipe_name,
+				          err, ipc_winerror(err));
+				break;
+			}
+			// The wait above returned immediately (process gone), so pace the
+			// poll ourselves rather than spinning.
+			Sleep(100);
 		}
 	}
 	CloseHandle(pi.hProcess);
