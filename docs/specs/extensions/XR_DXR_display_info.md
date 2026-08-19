@@ -436,197 +436,28 @@ xrEndFrame(session, &endInfo);
 
 ## 4. Extension 2: XR_DXR_android_surface_binding
 
-> **Status: Planned — not yet implemented.** The extension header exists but no
-> compositor or platform code implements Android surface binding yet.
+> **Status: IMPLEMENTED (#1037) — this section is superseded.** The normative
+> spec now lives in its own file, alongside the other window-binding siblings:
+> **[`XR_DXR_android_surface_binding.md`](XR_DXR_android_surface_binding.md)**.
+>
+> What changed versus the sketch this section used to carry:
+>
+> - `XrAndroidSurfaceBindingCreateInfoDXR` gained
+>   `transparentBackgroundEnabled` (append-only), and its `surface` field is
+>   typed `void*` rather than `jobject` so the header stays JNI-free. The type
+>   value `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR = 1004999005` is
+>   unchanged.
+> - The sketch's "the application **should** destroy and recreate the session
+>   with updated offsets" is **replaced**. Neither a surface loss nor a window
+>   move may cost a session on Android — both are ordinary lifecycle events.
+>   Two functions handle them live: `xrSetAndroidSurfaceDXR` (surface
+>   lost/regained) and `xrSetAndroidWindowGeometryDXR` (the per-frame window
+>   rect + panel extent, ADR-036 D6). `screenOffsetX/Y` survive only as the
+>   initial seed.
+> - The runtime-spawned `SurfaceView` it implicitly assumed away is demoted to
+>   the `_hosted` fullscreen fallback: it has no `ViewParent`, so it crashes in
+>   any multi-window container. See the new spec's §1.
 
-### IP Status
-
-No known IP claims.
-
-### Name Strings
-
-- Extension name: `XR_DXR_android_surface_binding`
-- Spec version: 1
-- Extension name define: `XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME`
-
-### Overview
-
-This extension is the Android counterpart to `XR_DXR_win32_window_binding`. It allows an
-OpenXR application to provide its own Android rendering surface to the runtime via the
-session creation chain. When provided, the runtime renders into the application's surface
-instead of managing its own display output.
-
-On Android, applications inherently own their Activity and rendering surface. This
-extension formalizes the handoff: the application passes an `ANativeWindow*` (obtained
-from a `SurfaceView` or `SurfaceHolder` via the NDK) to the runtime, which uses it as the
-compositing and interlacing target. The application also provides the Java `Surface`
-`jobject`, which the runtime may need for platform SDK integration (some vendor Android
-SDKs require the Java Surface for interlacer initialization). Additionally, the application must provide
-the surface's screen-space position, since neither `ANativeWindow` nor `Surface` exposes
-where the surface is located on the physical display — information the runtime needs for
-correct light field interlacing.
-
-**Use cases:**
-- **Application-owned rendering surface**: the application controls the `SurfaceView`
-  lifecycle, visibility, and z-order within the Android view hierarchy.
-- **Hybrid 2D/3D UI**: 3D content composited alongside Android UI elements (toolbars,
-  overlays, system UI).
-- **Multi-surface scenarios**: the application may have multiple surfaces and dedicate one
-  to OpenXR stereo content.
-- **Window-space overlays**: HUD and status overlays positioned in fractional surface
-  coordinates, automatically adapting to surface resize (using
-  `XrCompositionLayerWindowSpaceDXR`).
-
-### New Enum Constants
-
-```c
-#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR  ((XrStructureType)1004999005)
-```
-
-> **Note**: This value uses the vendor extension range. It would be replaced with an
-> officially assigned value upon standardization.
-
-### New Structures
-
-#### XrAndroidSurfaceBindingCreateInfoDXR
-
-Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to provide
-an external native window for session rendering.
-
-| Member | Type | Description |
-|---|---|---|
-| `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR`. |
-| `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
-| `nativeWindow` | `ANativeWindow*` | The Android native window to render into. Must be a valid, active native window. |
-| `surface` | `jobject` | The Java `android.view.Surface` associated with the native window. The runtime may need this for platform SDK initialization (e.g., a vendor's interlacer). May be `NULL` if the runtime does not require it. |
-| `screenOffsetX` | `int32_t` | Horizontal offset of the surface's left edge on the physical display, in display pixels. |
-| `screenOffsetY` | `int32_t` | Vertical offset of the surface's top edge on the physical display, in display pixels. |
-
-```c
-typedef struct XrAndroidSurfaceBindingCreateInfoDXR {
-    XrStructureType             type;
-    const void* XR_MAY_ALIAS    next;
-    ANativeWindow*              nativeWindow;
-    jobject                     surface;
-    int32_t                     screenOffsetX;
-    int32_t                     screenOffsetY;
-} XrAndroidSurfaceBindingCreateInfoDXR;
-```
-
-**Valid Usage:**
-- `type` **must** be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR`.
-- `nativeWindow` **must** be a valid `ANativeWindow*` obtained via
-  `ANativeWindow_fromSurface()` or `ASurfaceHolder_getNativeWindow()`.
-- `surface` **should** be a valid global reference to the Java `android.view.Surface`
-  associated with `nativeWindow`. It **may** be `NULL` if the runtime does not require it
-  for platform SDK integration, but runtimes **should** document whether they need it.
-- `screenOffsetX` and `screenOffsetY` **must** be the surface's top-left corner position
-  in physical display pixel coordinates. The application obtains these by calling
-  `View.getLocationOnScreen()` on the `SurfaceView`. For a fullscreen surface on the
-  primary display, both values are typically `0`.
-- The native window **must** remain valid for the lifetime of the `XrSession`.
-- The application **must not** release the native window (via `ANativeWindow_release()`)
-  before calling `xrDestroySession`.
-- The application **should** acquire a reference (via `ANativeWindow_acquire()`) to ensure
-  the window outlives the session.
-- If the surface moves or is resized (e.g., multi-window mode, orientation change), the
-  application **should** destroy and recreate the session with updated offsets, or the
-  runtime **may** provide a mechanism to update offsets dynamically in a future revision.
-
-### New Functions
-
-None. This extension operates entirely through structure chaining:
-- `XrAndroidSurfaceBindingCreateInfoDXR` chains to `XrSessionCreateInfo`.
-- `XrCompositionLayerWindowSpaceDXR` (defined in `XR_DXR_win32_window_binding`) is
-  platform-independent and works with Android surface bindings as well.
-
-### Interactions
-
-- **Requires** an Android-compatible graphics binding extension (`XR_KHR_vulkan_enable` or
-  `XR_KHR_opengl_es_enable`) for the graphics binding in the session creation chain.
-- **Does not require** `XR_DXR_display_info`, but they are complementary.
-- **Mutually exclusive** with `XR_DXR_win32_window_binding` — an application uses one or
-  the other based on platform.
-- When the surface is resized (e.g., orientation change), the runtime **must** adjust its
-  rendering surface accordingly.
-
-### Example Code: Session Creation with Vulkan on Android
-
-```cpp
-// 1. Enable the extension at instance creation
-std::vector<const char*> extensions = {
-    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-    XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME,
-};
-
-XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-createInfo.enabledExtensionCount = (uint32_t)extensions.size();
-createInfo.enabledExtensionNames = extensions.data();
-// ... fill in applicationInfo ...
-xrCreateInstance(&createInfo, &instance);
-
-// 2. Obtain ANativeWindow and screen position from a SurfaceView
-ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, javaSurface);
-ANativeWindow_acquire(nativeWindow);  // ensure lifetime
-
-// Get screen position: call SurfaceView.getLocationOnScreen() from Java
-jint location[2];
-// ... JNI call to getLocationOnScreen(location) ...
-int32_t screenX = location[0];
-int32_t screenY = location[1];
-
-// 3. Create session with surface binding chained to graphics binding
-XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
-vkBinding.instance = vkInstance;
-vkBinding.physicalDevice = vkPhysicalDevice;
-vkBinding.device = vkDevice;
-vkBinding.queueFamilyIndex = graphicsQueueFamily;
-vkBinding.queueIndex = 0;
-
-XrAndroidSurfaceBindingCreateInfoDXR surfaceBinding = {
-    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR};
-surfaceBinding.nativeWindow = nativeWindow;
-surfaceBinding.surface = javaSurface;       // Java Surface jobject
-surfaceBinding.screenOffsetX = screenX;     // position on physical display
-surfaceBinding.screenOffsetY = screenY;
-
-// Chain: sessionInfo -> vkBinding -> surfaceBinding
-vkBinding.next = &surfaceBinding;
-
-XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-sessionInfo.next = &vkBinding;
-sessionInfo.systemId = systemId;
-
-xrCreateSession(instance, &sessionInfo, &session);
-```
-
-### Example Code: Session Creation with OpenGL ES on Android
-
-```cpp
-XrGraphicsBindingOpenGLESAndroidKHR glesBinding = {
-    XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
-glesBinding.display = eglDisplay;
-glesBinding.config = eglConfig;
-glesBinding.context = eglContext;
-
-XrAndroidSurfaceBindingCreateInfoDXR surfaceBinding = {
-    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR};
-surfaceBinding.nativeWindow = nativeWindow;
-surfaceBinding.surface = javaSurface;
-surfaceBinding.screenOffsetX = screenX;
-surfaceBinding.screenOffsetY = screenY;
-
-// Chain: sessionInfo -> glesBinding -> surfaceBinding
-glesBinding.next = &surfaceBinding;
-
-XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-sessionInfo.next = &glesBinding;
-sessionInfo.systemId = systemId;
-
-xrCreateSession(instance, &sessionInfo, &session);
-```
-
----
 
 ## 5. Extension 3: XR_DXR_display_info
 

@@ -40,7 +40,9 @@ Rules:
 | 1004999190–197 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625), 192 = `XR_TYPE_WEAVE_SUBMIT_RECTS_DXR` (batch, spec v3), 193 = `XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR` (2D overlay atlas, spec v4, browser#18), 194 = `XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR` (N-view worst-case atlas, spec v6, #774), 195 = `XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR`, 196 = `XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR`, 197 = `XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR` (Android / platform-neutral handles + geometry, spec v7, #1036) |
 | 1004999200–209 | `XR_DXR_xlib_window_binding` | 200 = `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (#660 Phase 3) |
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
-| 1004999220+ | **next free** | |
+| 1004999220–229 | `XR_DXR_android_surface_binding` | 220 = `XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR` (#1037). The extension's `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR` keeps **1004999005** — one of the two unused gaps in the `XR_DXR_display_info` decade — because that value was already published in the (then unimplemented) sketch in `docs/specs/extensions/XR_DXR_display_info.md` §4 |
+| 1004999230+ | **next free** | |
 
-`XR_DXR_android_surface_binding` defines no `1004999xxx` values in this
-directory as of this writing; if it gains any, claim a decade here first.
+`XR_DXR_android_surface_binding` was implemented in #1037 and now has its own
+header and decade — see the row above for why its create-info type value sits
+outside that decade.
