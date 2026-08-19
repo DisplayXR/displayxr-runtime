@@ -510,12 +510,12 @@ the #930 signature (no banner) rather than #943's (banner present). See the #943
 
 | | Windows | macOS | Linux desktop | Android |
 |---|---|---|---|---|
-| service | `displayxr-service.exe` | `displayxr-service` + orchestrator (posix_spawn, respawn) | `displayxr-service`, **no orchestrator**; systemd socket activation optional | `libservice_target.so` in a bound **foreground** `Service` (`START_STICKY`), `ipc_server_main_android` on a `std::thread` |
+| service | `displayxr-service.exe` | `displayxr-service` + orchestrator (posix_spawn, respawn) | `displayxr-service`, **no orchestrator**; systemd socket activation optional | `libservice_target.so` in a bound **foreground** `Service` (`START_STICKY`), `ipc_server_main_android` on a `std::thread`; **one satellite process per client** (`MonadoServiceSlot0..3`, `android:process=":dxrN"`) brokered by the main process — see §7a |
 | transport | named pipe | AF_UNIX | AF_UNIX | binder for bootstrap only (`IMonado.aidl` 4 methods); per-frame traffic on a socketpair; **connect blocks a binder thread on a condvar until the 50 ms mainloop accepts** (`ipc_server_mainloop_android.c:170-222`) |
 | system compositor | `comp_d3d11_service` | **null + `comp_multi`** (shared-surface workspace path exists) | null + `comp_multi`, **headless only** (no present arm) | null + `comp_multi`, per-session `comp_window_android` |
 | DP | in-process; 1 or N | in-process; **one shared** | in-process | in-process (`dlopen`); **one per client**, `process_atlas` per client per frame |
-| clients on screen | N | N | 0 | **1** — the app surface is a process-global singleton (`android_globals.cpp:21-44`); two clients ⇒ two `vkCreateAndroidSurfaceKHR` on one window |
-| arbitration | inside `comp_d3d11_service.cpp` | Monado active-client fallthrough only | — | Monado active-client fallthrough only; mode = per-client DP, last writer wins |
+| clients on screen | N | N | 0 | **N, one per satellite process** (4 slots by default; §7a). Within *one* process it is still 1 — the app surface is a process-global singleton (`android_globals.cpp:21-44`) — which is exactly why each client gets its own process |
+| arbitration | inside `comp_d3d11_service.cpp` | Monado active-client fallthrough only | — | none needed for the on-screen part: the OS is the window manager and each client owns a process. What *is* shared — the panel's 3D lens — is a per-window preference resolved by refcount in the vendor services (#1039), not a display command |
 | #925 S1–S5 | ✔ | ✘ (`list_and_timing_lock` holds the whole per-client render + present; `vkWaitForFences(UINT64_MAX)`; unbounded `process_atlas`) | ✘ | ✘ |
 | supervision | orchestrator for children; nothing for the service | orchestrator | none | the OS (`START_STICKY`, but restart arrives with a null Intent → not re-foregrounded, `MonadoService.kt:63-71`); no client reconnect |
 
@@ -524,6 +524,56 @@ SDK by the app↔service split; the DP still lives in the service. There is no D
 the tree, #510 is open with every box unchecked, and CI builds only the `inProcess` Android
 flavor (`build-android.yml:137`). Android is not a precedent for process-isolating the DP; it
 *is* the platform where every app is IPC, so every gap in §4 applies with no shell to hide it.
+
+---
+
+### 7a. Android satellites (ADR-036 D3, #1031)
+
+Android is the only platform where the runtime deliberately runs **more than one service
+process**. The reason is the row above: the pieces that decide what reaches the panel — the app
+`Surface` in `android_globals`, the display processor, the vendor core — are process-global in
+the runtime, and no keying scheme was going to be cheaper or safer than giving each client its
+own process. So the `outOfProcess` flavor declares N *satellite* components:
+
+| Piece | Where | What it is |
+|---|---|---|
+| `SlotBrokerService` / `SlotBroker` | **main** process | Assigns slots. Its own `ISlotBroker` binder, deliberately not `IMonado` — `MonadoImpl`'s constructor calls `nativeStartServer`, so brokering over `IMonado` would start a compositor in a process that owns no window. Loads no native code. |
+| `MonadoServiceSlot0..N-1` | `:dxr0` … `:dxrN-1` | `MonadoService` subclasses, one per pre-declared `android:process`. Each runs the ordinary out-of-process service for **exactly one** client. Non-isolated on purpose: an `isolatedProcess` cannot reach SurfaceFlinger or gralloc. |
+| `MonadoService` | main process | Unchanged single-service path. Still used by the runtime's own in-APK clients, and by any client the broker could not place. |
+
+**N is 4** by default: one Gradle constant (`dxrSatelliteSlots`) generates the Kotlin subclasses,
+feeds `BuildConfig.SATELLITE_SLOT_COUNT`, and is checked against the hand-written manifest by
+`:src:xrt:ipc:checkSatelliteSlotManifest`, which fails the build when the two disagree. Raising
+it costs one Gradle property plus the matching `<service>` entries — and ~30–60 MB and one GPU
+context per additional live satellite.
+
+**Assignment.** `Client.bind()` binds the broker, calls `acquireSlot(pkg, pid, preferredSlot,
+token)`, then binds the named `MonadoServiceSlotN` by **explicit ComponentName**. Policy, in
+order: the package's existing slot (a relaunch rebinds to its own satellite), a free pin
+(`debug.dxr.slot` sysprop for dev, the client's `com.displayxr.satellite_slot` meta-data for an
+app), the lowest free slot, or **-1** — on which the client logs why and falls back to the
+main-process service, i.e. exactly the single-window behaviour that shipped before slots existed.
+Identity comes from `Binder.getCallingUid()`, not from the caller's claim, so an app cannot ask
+for another package's satellite.
+
+**Lifecycle.** The client keeps its broker binding for as long as it holds the slot: that is what
+pins the assignment (the broker holds a death link on the client's token, so a crash frees the
+slot) and what keeps the broker process at the client's importance. All binds use
+`BIND_AUTO_CREATE|BIND_IMPORTANT|BIND_ABOVE_CLIENT|BIND_INCLUDE_CAPABILITIES`, so a satellite
+inherits its app's importance and freezes *with* it when the app is cached — the desired
+behaviour for a compositor that exists to serve one window. On `onUnbind` a satellite
+`stopSelf()`s, returns `false` (no rebind — a relaunching client goes back to the broker and gets
+a fresh process), and hard-exits: `onDestroy` kills the process, with an off-thread 3 s backstop
+because the vendor core-release path can hang (displayxr-leia-plugin#39). Each slot offsets its
+foreground-notification id and uses an explicit-component shutdown `PendingIntent`, so N
+notifications do not collide and each one shuts down its own process.
+
+Gaps this does **not** close: the satellites carry over every §4 hazard of the service they are
+copies of; `START_STICKY` restart still arrives with a null Intent and is not re-foregrounded;
+CI still builds only the `inProcess` flavor (#972), so this whole path is device-validated, not
+CI-validated; there is no eviction policy beyond "first come, and the fifth app degrades to the
+legacy single-window path"; and nothing yet reports slot occupancy through `displayxr-cli` or the
+diag dashboard.
 
 ---
 
@@ -567,7 +617,7 @@ Numbered for reference from the ADR and the issue plan.
 17. `IPC_MAX_CLIENTS 8` on the wire; ~21 MB shm per client; 24 compositor slots unreachable.
 18. #943's filed mechanism is dead code (§5); the true exit source is unidentified.
 19. `[RENDER] wait_avg` cannot see handler starvation; nothing per-client; `sys->mcp_capture` polled per frame with (INFERRED) no producer.
-20. Android: single global surface, per-client DPs, no arbitration, `Watchdog` client counting likely wrong for N>1 (INFERRED), `START_STICKY` restart not re-foregrounded, `outOfProcess` flavor unbuilt in CI, `MULTI_MAX_CLIENTS 64` silent truncation.
+20. Android: single global surface **per process** — addressed by the satellites of §7a, which also make the `Watchdog`'s client counting trivially correct (0 or 1 per satellite); still open: `START_STICKY` restart not re-foregrounded, `outOfProcess` flavor unbuilt in CI (#972), `MULTI_MAX_CLIENTS 64` silent truncation, no slot-occupancy observability.
 
 Doc corrections applied alongside this map: `workspace-stability.md` (S3/S4/S5 shipped, #929
 tier-1 fixed, missing rows), `production-components.md` (auto-start, names, paths),
