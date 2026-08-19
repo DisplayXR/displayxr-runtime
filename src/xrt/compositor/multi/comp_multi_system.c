@@ -2715,14 +2715,11 @@ session_render_workspace_cursor(struct multi_compositor *mc,
 static void
 update_window_screen_rect(struct multi_compositor *mc)
 {
-	if (mc->session_render.display_processor == NULL) {
-		return;
-	}
 #ifdef XRT_OS_ANDROID
 	int32_t x = 0, y = 0, display_id = -1;
-	uint32_t w = 0, h = 0;
+	uint32_t w = 0, h = 0, disp_w = 0, disp_h = 0;
 	uint64_t generation = 0;
-	if (!android_globals_get_window_screen_rect(&x, &y, &w, &h, &display_id, &generation)) {
+	if (!android_globals_get_window_screen_rect(&x, &y, &w, &h, &display_id, &disp_w, &disp_h, &generation)) {
 		return; // client hasn't reported yet — stay display-scoped
 	}
 	const bool changed = generation != mc->session_render.window_rect_generation;
@@ -2731,14 +2728,21 @@ update_window_screen_rect(struct multi_compositor *mc)
 	mc->session_render.window_screen_w = w;
 	mc->session_render.window_screen_h = h;
 	mc->session_render.window_screen_display_id = display_id;
+	mc->session_render.window_screen_disp_w = disp_w;
+	mc->session_render.window_screen_disp_h = disp_h;
 	mc->session_render.window_rect_generation = generation;
 	if (changed) {
 		// Lifecycle event (a window moved/resized), never per frame.
-		U_LOG_W("WINDOW_RECT: session window %d,%d %ux%u display %d (#1033)", x, y, w, h, display_id);
+		U_LOG_W("WINDOW_RECT: session window %d,%d %ux%u display %d panel %ux%u (#1033/#1034)", x, y, w, h,
+		        display_id, disp_w, disp_h);
 	}
 	// Sticky on the DP side, but re-assert every frame: it is a handful of
 	// integers, the DP dedupes, and a DP recreated mid-session then never
-	// misses the origin.
+	// misses the origin. (The cache above is filled even with no DP — the
+	// per-window Kooima rebase of #1034 reads it independently.)
+	if (mc->session_render.display_processor == NULL) {
+		return;
+	}
 	xrt_display_processor_vk_set_window_screen_rect(
 	    (struct xrt_display_processor_vk *)mc->session_render.display_processor, x, y, w, h, display_id);
 #else

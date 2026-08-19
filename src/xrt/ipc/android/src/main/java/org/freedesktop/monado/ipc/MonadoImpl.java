@@ -201,13 +201,21 @@ public class MonadoImpl extends IMonado.Stub {
     private int lastRectH = -1;
     private int lastRectDisplayId = -1;
 
+    /** Panel extent in the CURRENT rotation the rect is expressed in (#1034). */
+    private int lastRectDispW = -1;
+
+    private int lastRectDispH = -1;
+
     @Override
-    public synchronized void updateWindowRect(int x, int y, int w, int h, int displayId) {
+    public synchronized void updateWindowRect(
+            int x, int y, int w, int h, int displayId, int dispW, int dispH) {
         if (x == lastRectX
                 && y == lastRectY
                 && w == lastRectW
                 && h == lastRectH
-                && displayId == lastRectDisplayId) {
+                && displayId == lastRectDisplayId
+                && dispW == lastRectDispW
+                && dispH == lastRectDispH) {
             return;
         }
         lastRectX = x;
@@ -215,10 +223,27 @@ public class MonadoImpl extends IMonado.Stub {
         lastRectW = w;
         lastRectH = h;
         lastRectDisplayId = displayId;
+        lastRectDispW = dispW;
+        lastRectDispH = dispH;
         // WARN-level once per distinct rect (never per frame) — this is the log line
         // the side-by-side PoC greps to prove each satellite got its own origin.
-        Log.i(TAG, "updateWindowRect: " + x + "," + y + " " + w + "x" + h + " display " + displayId);
-        nativeWindowScreenRect(x, y, w, h, displayId);
+        Log.i(
+                TAG,
+                "updateWindowRect: "
+                        + x
+                        + ","
+                        + y
+                        + " "
+                        + w
+                        + "x"
+                        + h
+                        + " display "
+                        + displayId
+                        + " panel "
+                        + dispW
+                        + "x"
+                        + dispH);
+        nativeWindowScreenRect(x, y, w, h, displayId, dispW, dispH);
     }
 
     public void shutdown() {
@@ -301,7 +326,8 @@ public class MonadoImpl extends IMonado.Stub {
      * <p>Implementation in `src/xrt/targets/service-lib/service_target.cpp`.
      */
     @SuppressWarnings("JavaJniMissingFunction")
-    private native void nativeWindowScreenRect(int x, int y, int w, int h, int displayId);
+    private native void nativeWindowScreenRect(
+            int x, int y, int w, int h, int displayId, int dispW, int dispH);
 
     /**
      * Native handling of receiving an FD for a new client: the FD should be used to start up the

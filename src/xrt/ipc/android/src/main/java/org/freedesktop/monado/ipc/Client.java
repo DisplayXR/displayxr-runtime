@@ -310,8 +310,9 @@ public class Client implements ServiceConnection {
 
                             @Override
                             public void onWindowRectChanged(
-                                    int x, int y, int w, int h, int displayId) {
-                                sendWindowRect(x, y, w, h, displayId);
+                                    int x, int y, int w, int h, int displayId, int dispW,
+                                    int dispH) {
+                                sendWindowRect(x, y, w, h, displayId, dispW, dispH);
                             }
                         });
         SurfaceHolder holder = monadoView.waitGetSurfaceHolder(2000);
@@ -363,13 +364,13 @@ public class Client implements ServiceConnection {
      * view re-reports on its next real change; the compositor also falls back to display-scoped
      * weaving until a rect arrives.
      */
-    private void sendWindowRect(int x, int y, int w, int h, int displayId) {
+    private void sendWindowRect(int x, int y, int w, int h, int displayId, int dispW, int dispH) {
         IMonado service = monado;
         if (service == null) {
             return;
         }
         try {
-            service.updateWindowRect(x, y, w, h, displayId);
+            service.updateWindowRect(x, y, w, h, displayId, dispW, dispH);
         } catch (RemoteException e) {
             Log.e(TAG, "updateWindowRect failed: " + e);
         }
