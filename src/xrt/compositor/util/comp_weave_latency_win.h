@@ -56,6 +56,9 @@ struct weave_latency_log
 	};
 	uint64_t pending_predicted_ns = 0; // armed by mark_weave, consumed by after_present
 	bool pending_repaint = false;      // #868: this weave re-wove an unchanged atlas
+	//! #1051: last SyncQPCTime emitted as an S row, so stale-mixed stats can
+	//! be suppressed from the CSV (see the S-row write in after_present).
+	uint64_t last_s_sync_qpc = 0;
 	pending ring[8] = {};
 	int ring_head = 0;
 	int ring_count = 0;
@@ -648,7 +651,16 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 					break;
 				}
 			}
-			if (csv) {
+			// #1051: on slow-app configs GetFrameStatistics can report an
+			// ADVANCED PresentCount paired with a STALE SyncQPCTime (an
+			// older flip's) — writing that raw joins offline as scanout
+			// BEFORE weave, a physical impossibility (up to 97.8% of rows).
+			// The internal consumer above is already guarded (sync_qpc >
+			// ring[idx].qpc); gate only the CSV row the same way: a
+			// strictly-increasing sync suppresses the repeated/stale
+			// samples while every genuinely-resolved flip still emits once.
+			if (csv && (uint64_t)stats.SyncQPCTime.QuadPart > last_s_sync_qpc) {
+				last_s_sync_qpc = (uint64_t)stats.SyncQPCTime.QuadPart;
 				fprintf(f, "S,%u,%u,%u,%llu,%llu\n", stats.PresentCount,
 				        stats.PresentRefreshCount, stats.SyncRefreshCount,
 				        (unsigned long long)stats.SyncQPCTime.QuadPart,
