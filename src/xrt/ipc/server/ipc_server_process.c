@@ -38,6 +38,7 @@
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h" // #962: focused-slot authority
+#include "xrt/xrt_display_processor_d3d11.h"  // XRT_DP_BACKEND_STATE_* for the [HEALTH] dp= word
 #elif defined(XRT_OS_MACOS)
 #include "multi/comp_multi_workspace.h" // #962: focused-client authority
 #endif
@@ -646,13 +647,26 @@ emit_health_if_elapsed(struct ipc_server *s)
 	// fail identically and silently; one word in the summary line is the
 	// difference between "why is everything black" and a known cause.
 	const char *device_state = "ok";
+	// Same idea for the vendor display processor's BACKEND: the vendor platform
+	// service can restart underneath us, after which a DP that cannot reconnect
+	// keeps returning successful-but-stale eye positions and every app weaves
+	// untracked. "degraded" = the DP is reconnecting, "stale" = it cannot and
+	// the compositor is recreating it.
+	const char *dp_state = "n/a";
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc != NULL && comp_d3d11_service_device_is_removed(s->xsysc)) {
 		device_state = "REMOVED";
 	}
+	if (s->xsysc != NULL) {
+		switch (comp_d3d11_service_dp_backend_state(s->xsysc)) {
+		case XRT_DP_BACKEND_STATE_DEGRADED: dp_state = "degraded"; break;
+		case XRT_DP_BACKEND_STATE_STALE: dp_state = "stale"; break;
+		default: dp_state = "ok"; break;
+		}
+	}
 #endif
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s window_s=%ld", active, s->max_clients,
-	        active_idx, lease, device_state, period_ms / 1000);
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s dp=%s window_s=%ld", active, s->max_clients,
+	        active_idx, lease, device_state, dp_state, period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
 
