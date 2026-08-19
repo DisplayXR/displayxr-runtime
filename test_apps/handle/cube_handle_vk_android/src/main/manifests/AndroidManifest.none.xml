@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, Leia Inc.
+    SPDX-License-Identifier: BSL-1.0
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Android 12+ package-visibility restriction: cross-package
+        intent queries return empty unless the caller declares what
+        it wants to see in <queries>. Without this, the Khronos
+        OpenXR loader's PackageManager scan for
+        org.khronos.openxr.OpenXRRuntimeService returns zero matches
+        and xrCreateInstance fails with XR_ERROR_RUNTIME_UNAVAILABLE
+        — even on a device that has the DisplayXR runtime installed.
+        See https://developer.android.com/training/package-visibility
+    -->
+    <queries>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <!-- The Khronos loader resolves the active runtime through this broker
+             ContentProvider. Under Android 11+ package visibility the provider
+             is invisible unless we declare its authority here; without it the
+             loader gets "Failed to find provider info … runtime_broker" → a
+             null cursor → xrCreateInstance fails with RUNTIME_UNAVAILABLE
+             (the app shows a black screen). The authority is shared by both
+             runtime flavors. (#510) -->
+        <!-- tools:replace resolves the merge conflict with the openxr_loader AAR
+             (1.1.41+), which declares the same broker provider authority. The cube
+             only needs visibility of the user-installed runtime's runtime_broker;
+             the loader AAR's system_runtime_broker (for system runtimes) is N/A here. -->
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker"
+            tools:replace="android:authorities" />
+        <!-- Explicit package visibility so we can wake the DisplayXR runtime
+             out of Android's "stopped" state and bind its IPC service before
+             xrCreateInstance. Both flavors are listed so the same cube APK runs
+             against either: in_process (dev) or out_of_process (#510, vendor
+             DPs run in the runtime service). -->
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <!-- IPC bind to the out-of-process runtime service. -->
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
+
+        <!--
+            ARCHITECTURE A (in-process, ADR-036 D2) residue: the vendor display
+            processor now runs in THIS process, and its core loader calls
+            PackageManager.getPackageInfo() on the on-device vendor services to
+            bind them for display config + face tracking. Package visibility is
+            enforced per CALLING UID, so declaring them in the runtime APK is not
+            enough — without these two lines the loader gets a
+            NameNotFoundException it never clears and the next JNI call trips
+            CheckJNI, aborting the app inside xrCreateSession (ADR-025).
+
+            This is the LAST vendor-specific thing in a DisplayXR client APK:
+            #1037 removed the vendor Java glue (the runtime hosts it via the
+            plug-in loader's class-host Context, #1061) and this APK carries zero
+            com.leia.* classes and zero vendor .so. These lines were never
+            hand-written before either — they came from the vendor AAR's own
+            manifest via the merger, so dropping the AAR is what exposed them.
+
+            They go away entirely once the vendor services advertise a neutral
+            intent action (ADR-036 D5 / vendor ask L7,
+            org.displayxr.action.VENDOR_DISPLAY_SERVICE): an <intent> query on
+            that action grants the same visibility with no vendor package name in
+            any client manifest. Verified on retail hardware in the #1037 spike
+            using the vendor's existing action; only the neutral name is pending.
+        -->
+        <!--
+            NEGATIVE CONTROL (-PdxrVendorQueries=none). No vendor visibility of
+            any form. The vendor core loader's getPackageInfo() must throw
+            NameNotFoundException and the app must abort — which is what proves
+            package visibility is really enforced on this device, i.e. that the
+            intent variant's success is not an artefact of a permissive build.
+        -->
+    </queries>
+
+    <uses-feature
+        android:glEsVersion="0x00030002"
+        android:required="false" />
+
+    <!--
+        CNSDK's face tracker uses the front-facing camera at runtime
+        (via libleiaSDK-faceTrackingInApp.so, loaded by the runtime
+        broker into this app's process). Without these declarations:
+          - CAMERA permission missing → camera open silently fails →
+            CNSDK never reports a face → all xrLocateViews calls use
+            the default centered eye position (no head tracking on
+            Lume Pad).
+          - uses-feature camera.front missing → Play Store filters
+            this app off devices that lack a front camera, AND
+            Android may not surface camera in the runtime permission
+            dialog.
+        Both required="false" so the same APK still installs on the
+        emulator (no camera hardware) — CNSDK is fine with no face.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.front" android:required="false" />
+
+    <!--
+        Long XR sessions don't generate user-input events; without
+        WAKE_LOCK the screen dims/sleeps and the session pauses.
+        FLAG_KEEP_SCREEN_ON would also work but requires the Activity
+        to set it programmatically — for a NativeActivity, easier to
+        request the permission and let the runtime keep the wake
+        lock for its session duration.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:label="${dxrAppLabel}">
+
+        <!--
+            Optional pin for the satellite compositor process (":dxrN" in the
+            out-of-process runtime), injected from build.gradle. -1 (the default)
+            means "no preference" — the runtime's slot broker decides, which is the
+            path that ships. `-PdxrSatelliteSlot=N` pins one for a test that needs a
+            fixed app-to-process pairing.
+        -->
+        <meta-data
+            android:name="com.displayxr.satellite_slot"
+            android:value="${dxrSatelliteSlot}" />
+
+        <!--
+            ADR-036 D6 / runtime#1033: the runtime samples this window's
+            on-screen origin (View.getLocationOnScreen) every frame and feeds it
+            to the display processor so the weave's interlace phase is anchored
+            where the window physically sits on the panel. An OEM that applies
+            the OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS compat change makes that call
+            return WINDOW-relative coordinates — every window would report (0,0)
+            and a side-by-side pair would weave at the same (wrong) phase, with
+            no error anywhere. Opting out is per-APP, so it has to live in the
+            client's manifest, not the runtime's.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
+
+        <!--
+            MainActivity is a thin Kotlin wrapper around NativeActivity
+            that requests CAMERA at onCreate so CNSDK's face tracker
+            can open the front camera at xrCreateSession. The
+            android.app.lib_name meta-data is still required so the
+            wrapper inherits the native lib load path from
+            NativeActivity.
+        -->
+        <!--
+            Orientation is NOT locked. The runtime + CNSDK detect the current
+            orientation and adapt the weave + face-detector axes, and re-adapt
+            on physical rotation — matching Leia-viewer behavior (confirmed:
+            the Leia viewer head-tracks correctly in landscape on this unit, so
+            the head-tracking service handles all orientations; forcing portrait
+            was our bug). configChanges keeps the NativeActivity alive across
+            rotations (the surface resizes instead of the activity recreating).
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+            android:resizeableActivity="true"
+            android:launchMode="singleTask">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="cube_handle_vk_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

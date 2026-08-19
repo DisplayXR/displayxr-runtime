@@ -137,9 +137,30 @@ android {
     // Ship the shared Wood_Crate textures (basecolor / normal / AO) in the APK
     // assets so the native crate_scene loads them via AAssetManager (#499). The
     // same JPEGs the Windows / macOS cubes use, in test_apps/common/textures.
+    // Vendor package-visibility form for THIS client APK (#1038 L7 / CNSDK#699):
+    //   package (default) — the two vendor <package> lines, i.e. main's manifest
+    //                       unchanged; what ships today.
+    //   intent            — ONE <intent> query on
+    //                       org.displayxr.action.VENDOR_DISPLAY_SERVICE, zero
+    //                       vendor names in the APK. Needs services that
+    //                       advertise the action (CNSDK#699).
+    //   none              — no vendor visibility at all; the negative control
+    //                       that proves visibility is enforced (expect
+    //                       NameNotFoundException -> abort).
+    // `-PdxrVendorNeutralQueries=true` is an alias for `intent`.
+    def vendorQueries = (project.findProperty('dxrVendorQueries')
+        ?: ((project.findProperty('dxrVendorNeutralQueries') ?: 'false').toString().toBoolean()
+            ? 'intent' : 'package')).toString()
+    assert vendorQueries in ['package', 'intent', 'none'] :
+        "dxrVendorQueries must be one of package|intent|none, got '${vendorQueries}'"
+    println "cube_handle_vk_android: vendor <queries> form = ${vendorQueries}"
+
     sourceSets {
         main {
             assets.srcDirs += ['../common/textures']
+            if (vendorQueries != 'package') {
+                manifest.srcFile "src/main/manifests/AndroidManifest.${vendorQueries}.xml"
+            }
         }
     }
 
