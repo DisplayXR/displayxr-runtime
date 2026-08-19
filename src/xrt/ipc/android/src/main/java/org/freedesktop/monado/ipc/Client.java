@@ -307,6 +307,12 @@ public class Client implements ServiceConnection {
                             public void onSurfaceDestroyed() {
                                 notifySurfaceLost();
                             }
+
+                            @Override
+                            public void onWindowRectChanged(
+                                    int x, int y, int w, int h, int displayId) {
+                                sendWindowRect(x, y, w, h, displayId);
+                            }
                         });
         SurfaceHolder holder = monadoView.waitGetSurfaceHolder(2000);
         Surface surface = null;
@@ -340,6 +346,32 @@ public class Client implements ServiceConnection {
             } catch (RemoteException e) {
                 Log.e(TAG, "passAppSurface failed: " + e);
             }
+        }
+    }
+
+    /**
+     * Forward this window's on-screen rect to the service so the per-session compositor can anchor
+     * the weave phase where the window physically sits on the panel (ADR-036 D6, #1033).
+     *
+     * <p>{@code oneway} on the AIDL side: never blocks the UI thread, and a dropped update
+     * self-heals on the next change. Fired only on an actual change (MonadoView dedupes), so a
+     * static window costs zero binder traffic.
+     *
+     * <p>Best-effort before the binder is up — MonadoView starts polling at
+     * {@code onAttachedToWindow}, which can precede {@code onServiceConnected}. The first rect
+     * after connect is re-sent because the last-sent cache lives in the service, not here, and the
+     * view re-reports on its next real change; the compositor also falls back to display-scoped
+     * weaving until a rect arrives.
+     */
+    private void sendWindowRect(int x, int y, int w, int h, int displayId) {
+        IMonado service = monado;
+        if (service == null) {
+            return;
+        }
+        try {
+            service.updateWindowRect(x, y, w, h, displayId);
+        } catch (RemoteException e) {
+            Log.e(TAG, "updateWindowRect failed: " + e);
         }
     }
 

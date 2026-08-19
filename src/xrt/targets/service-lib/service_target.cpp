@@ -309,6 +309,35 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeClearAppSurface(JNIEnv *env, jo
 	U_LOG_I("service: app surface cleared (#528)");
 }
 
+/*!
+ * Publish the client window's on-screen rect (ADR-036 D6, #1033).
+ *
+ * The app process samples `View.getLocationOnScreen()` + the SurfaceView extent
+ * from a Choreographer callback and pushes changes over the oneway
+ * `IMonado.updateWindowRect`; this lands them in the service-process globals,
+ * where the per-session compositor picks them up and forwards them to the
+ * display processor (`set_window_screen_rect`) before each weave. Without it a
+ * window that is not at the panel's top-left weaves at the wrong interlace
+ * phase — and a pure MOVE never even raises a resize on Android.
+ *
+ * Deduped Java-side; the globals dedupe again, so this is cheap.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_MonadoImpl_nativeWindowScreenRect(
+    JNIEnv *env, jobject thiz, jint x, jint y, jint w, jint h, jint display_id)
+{
+	jni::init(env);
+	jni::Object monadoImpl(thiz);
+
+	if (w <= 0 || h <= 0) {
+		return;
+	}
+	android_globals_set_window_screen_rect((int32_t)x, (int32_t)y, (uint32_t)w, (uint32_t)h,
+	                                       (int32_t)display_id);
+	U_LOG_I("service: window screen rect %d,%d %dx%d display %d (#1033)", (int)x, (int)y, (int)w, (int)h,
+	        (int)display_id);
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_org_freedesktop_monado_ipc_MonadoImpl_nativeShutdownServer(JNIEnv *env, jobject thiz)
 {

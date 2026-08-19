@@ -428,6 +428,23 @@ struct multi_compositor
 		int32_t resize_x, resize_y, resize_w, resize_h;
 		//! @}
 
+		//! @name Window screen rect (ADR-036 D6, #1033)
+		//! This session's window on the panel, in physical screen pixels, as the
+		//! client reported it (Android: a per-frame `getLocationOnScreen` sample
+		//! forwarded over `IMonado.updateWindowRect`). Fed to the DP via
+		//! `set_window_screen_rect` before every weave so the interlace phase is
+		//! referenced to where the window actually is — a pure Android window MOVE
+		//! raises no resize, so nothing else in the pipeline sees it. Also the
+		//! input the per-window Kooima rebase will consume (#1034).
+		//! `window_rect_generation` is 0 until the first rect arrives; the DP is
+		//! left display-scoped (today's behaviour) until then.
+		//! @{
+		int32_t window_screen_x, window_screen_y;
+		uint32_t window_screen_w, window_screen_h;
+		int32_t window_screen_display_id;
+		uint64_t window_rect_generation;
+		//! @}
+
 		//! True if per-session resources are initialized
 		bool initialized;
 	} session_render;

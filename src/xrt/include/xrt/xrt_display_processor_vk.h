@@ -231,6 +231,76 @@ struct xrt_display_processor_vk
 	 * @param queue  The `VkQueue` the weave command buffer was submitted to.
 	 */
 	void (*weave_submitted)(struct xrt_display_processor_vk *xdp, VkQueue queue);
+
+	/*!
+	 * Report **this window's on-panel rectangle** — the origin AND size of the
+	 * surface this DP weaves into, in the platform's screen pixels for the
+	 * display named by @p display_id (ADR-036 D6, runtime#1033, LeiaSR#150).
+	 *
+	 * One compositor instance weaves into one window, so the interlacing phase
+	 * must be referenced to where that window physically sits on the panel. The
+	 * compositor — the party that knows the placement — reports geometry; the
+	 * weaver still owns everything phase, including snapping. ADR-033 is
+	 * unchanged by this slot.
+	 *
+	 * Android is what forces it. A pure window **move** raises no resize
+	 * (`WindowFrames.didFrameSizeChange` compares w/h only): it goes out as a
+	 * `oneway IWindow.moved` that surfaces no public callback, and
+	 * SurfaceFlinger repositions the layer with the *old* buffer — so a
+	 * window-relative weave keeps a stale phase for the whole drag. The client
+	 * therefore samples `View.getLocationOnScreen()` from a `Choreographer`
+	 * callback (opting out of OEM view-bounds sandboxing) and the value reaches
+	 * the compositor, which forwards it here. Windows solves the same problem
+	 * inside the vendor weaver (it subclasses the HWND and polls the screen
+	 * rect); Android exposes no such hook, which is why the runtime reports.
+	 *
+	 * Coordinates are the platform's own screen coordinates for that display —
+	 * on Android, *current*-orientation screen space exactly as
+	 * `getLocationOnScreen` returns it. A vendor SDK that rotates into the
+	 * panel's natural orientation internally (CNSDK does) takes them unchanged.
+	 * @p x / @p y may be negative for a partially off-panel window. Any
+	 * per-atlas canvas (zone) offset is *added to* this origin by the DP:
+	 * phase = window origin + canvas offset.
+	 *
+	 * Sticky: applies to every subsequent @ref xrt_display_processor::process_atlas
+	 * until changed. The compositor calls it once per frame immediately before
+	 * process_atlas whenever it knows the rect; never calling it ⟹ display-scoped
+	 * weaving (window anchored at the panel top-left) — exactly today's
+	 * behaviour. DPs should cache the last rect and skip the vendor call when
+	 * unchanged.
+	 *
+	 * Relationship to @ref set_present_origin (Linux windowed weaving,
+	 * runtime#757): this is its platform-neutral successor — same meaning for
+	 * the origin, plus the size and the display id. A DP implementing both takes
+	 * whichever it was called with most recently as authoritative.
+	 *
+	 * Why the *variant* and not the base vtable: the base cannot grow without
+	 * moving every slot of this variant (which embeds the base by value), which
+	 * would misdispatch calls into any already-built VK-variant plug-in — a
+	 * silent break of exactly the kind ADR-020 exists to prevent. The base *is*
+	 * the Vulkan interface, so appending here costs no reach; D3D11 carries its
+	 * own placement slot (`xrt_display_processor_d3d11::set_window`, #1008).
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ no
+	 * per-window phase support; the DP weaves display-scoped. Appended after
+	 * @ref weave_submitted per ADR-020 (append-only within a major; no version
+	 * bump — gated by the variant's `base.struct_size`).
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param x           Window left edge in physical screen pixels.
+	 * @param y           Window top edge in physical screen pixels.
+	 * @param w           Window width in physical screen pixels.
+	 * @param h           Window height in physical screen pixels.
+	 * @param display_id  Platform display id the rect is expressed in (Android
+	 *                    `Display.getDisplayId()`, 0 = default panel); -1 =
+	 *                    unknown / single-display.
+	 */
+	void (*set_window_screen_rect)(struct xrt_display_processor_vk *xdp,
+	                               int32_t x,
+	                               int32_t y,
+	                               uint32_t w,
+	                               uint32_t h,
+	                               int32_t display_id);
 };
 
 /*!
@@ -255,6 +325,15 @@ struct xrt_display_processor_vk
  * for Vulkan late latching landing across runtime + vendor plug-in.
  */
 #define XRT_DP_VK_HAS_WEAVE_SUBMITTED 1
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::set_window_screen_rect slot — same coupled-ABI-
+ * addition pattern as @ref XRT_DP_VK_HAS_PRESENT_ORIGIN, for the per-window
+ * weave-phase contract landing across runtime + vendor plug-in (ADR-036 D6,
+ * runtime#1033 / LeiaSR#150).
+ */
+#define XRT_DP_VK_HAS_WINDOW_SCREEN_RECT 1
 
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
@@ -284,7 +363,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_shared_texture_p
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_present_origin)          == sizeof(struct xrt_display_processor) + 3 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_frame_timing)            == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)             == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_window_screen_rect)      == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -434,6 +514,36 @@ xrt_display_processor_vk_weave_submitted(struct xrt_display_processor_vk *xdp, V
 		return false;
 	}
 	xdp->weave_submitted(xdp, queue);
+	return true;
+}
+
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_window_screen_rect
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the caller then leaves the DP weaving
+ * display-scoped. Like the wrappers above, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_window_screen_rect(struct xrt_display_processor_vk *xdp,
+                                                int32_t x,
+                                                int32_t y,
+                                                uint32_t w,
+                                                uint32_t h,
+                                                int32_t display_id)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_window_screen_rect + sizeof(xdp->set_window_screen_rect);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_window_screen_rect == NULL) {
+		return false;
+	}
+	xdp->set_window_screen_rect(xdp, x, y, w, h, display_id);
 	return true;
 }
 

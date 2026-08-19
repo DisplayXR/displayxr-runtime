@@ -128,6 +128,24 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   position** → create session with the binding. Hosted apps need none of this — the runtime
   places its own window (#715).
 
+- **INV-1.4 (Android) — Opt out of view-bounds sandboxing in YOUR manifest.** The runtime
+  anchors the weave's interlace phase to your window's on-screen origin, which it learns by
+  sampling `View.getLocationOnScreen()` once per frame (ADR-036 D6, #1033 — a pure window
+  *move* on Android raises no resize and SurfaceFlinger repositions the layer with the old
+  buffer, so there is no other signal). An OEM that applies the
+  `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` compat change makes that call return **window-relative**
+  coordinates: every window then reports `(0,0)`, two side-by-side windows weave at the same
+  wrong phase, and nothing anywhere errors. The opt-out is per-app, so it must be in the app's
+  own `<application>` block:
+
+  ```xml
+  <property
+      android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+      android:value="false" />
+  ```
+
+  Ref: `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`.
+
 ---
 
 ## 2. Display info & rendering modes (`XR_DXR_display_info`)

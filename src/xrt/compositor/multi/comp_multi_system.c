@@ -41,6 +41,7 @@
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_workspace.h"
 #include "main/comp_target.h"
+#include "xrt/xrt_display_processor_vk.h" // #1033: per-window weave phase (set_window_screen_rect)
 
 // Per-session rendering support (Phase 4)
 #include "util/comp_swapchain.h"
@@ -2697,6 +2698,55 @@ session_render_workspace_cursor(struct multi_compositor *mc,
 }
 
 /*!
+ * Feed the DP this session's window rect on the panel (ADR-036 D6, #1033).
+ *
+ * A compositor instance weaves into ONE window, so the interlacing phase has to
+ * be referenced to that window's on-panel origin. On Android the client samples
+ * `View.getLocationOnScreen()` from a Choreographer callback and pushes it over
+ * `IMonado.updateWindowRect` (a pure window MOVE raises no resize and
+ * SurfaceFlinger repositions the layer with the OLD buffer, so nothing else in
+ * the pipeline can see it). We cache it on `session_render` — the per-window
+ * Kooima rebase (#1034) consumes the same value — and forward it to the DP.
+ *
+ * No-op until the first rect arrives, and on any DP without the (ADR-020)
+ * `set_window_screen_rect` slot: the DP then weaves display-scoped, exactly
+ * today's behaviour.
+ */
+static void
+update_window_screen_rect(struct multi_compositor *mc)
+{
+	if (mc->session_render.display_processor == NULL) {
+		return;
+	}
+#ifdef XRT_OS_ANDROID
+	int32_t x = 0, y = 0, display_id = -1;
+	uint32_t w = 0, h = 0;
+	uint64_t generation = 0;
+	if (!android_globals_get_window_screen_rect(&x, &y, &w, &h, &display_id, &generation)) {
+		return; // client hasn't reported yet — stay display-scoped
+	}
+	const bool changed = generation != mc->session_render.window_rect_generation;
+	mc->session_render.window_screen_x = x;
+	mc->session_render.window_screen_y = y;
+	mc->session_render.window_screen_w = w;
+	mc->session_render.window_screen_h = h;
+	mc->session_render.window_screen_display_id = display_id;
+	mc->session_render.window_rect_generation = generation;
+	if (changed) {
+		// Lifecycle event (a window moved/resized), never per frame.
+		U_LOG_W("WINDOW_RECT: session window %d,%d %ux%u display %d (#1033)", x, y, w, h, display_id);
+	}
+	// Sticky on the DP side, but re-assert every frame: it is a handful of
+	// integers, the DP dedupes, and a DP recreated mid-session then never
+	// misses the origin.
+	xrt_display_processor_vk_set_window_screen_rect(
+	    (struct xrt_display_processor_vk *)mc->session_render.display_processor, x, y, w, h, display_id);
+#else
+	(void)mc;
+#endif
+}
+
+/*!
  * Render a single per-session client to its own comp_target using display processing.
  *
  * @param mc The multi_compositor with per-session rendering
@@ -3308,6 +3358,15 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                         0, 0, NULL, 0, NULL, 1, &pre_weave);
+
+			// Per-window weave phase (ADR-036 D6, #1033): tell the DP where
+			// this session's window physically sits on the panel, so the
+			// vendor weaver references the interlace phase to the window's
+			// origin instead of assuming the panel's top-left. Without it a
+			// side-by-side satellite pair weaves the right-hand window at the
+			// left-hand phase and its 3D collapses. ADR-033 is unchanged —
+			// this reports geometry; the weaver still owns all phase.
+			update_window_screen_rect(mc);
 
 			// Hand the DP the target swapchain image view BEFORE process_atlas.
 			// A self-submitting DP (Leia CNSDK) builds its own destination

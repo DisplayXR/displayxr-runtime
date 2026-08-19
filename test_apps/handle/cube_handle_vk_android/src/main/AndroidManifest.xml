@@ -87,6 +87,21 @@
         android:label="DisplayXR Cube VK">
 
         <!--
+            ADR-036 D6 / runtime#1033: the runtime samples this window's
+            on-screen origin (View.getLocationOnScreen) every frame and feeds it
+            to the display processor so the weave's interlace phase is anchored
+            where the window physically sits on the panel. An OEM that applies
+            the OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS compat change makes that call
+            return WINDOW-relative coordinates — every window would report (0,0)
+            and a side-by-side pair would weave at the same (wrong) phase, with
+            no error anywhere. Opting out is per-APP, so it has to live in the
+            client's manifest, not the runtime's.
+        -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
+
+        <!--
             MainActivity is a thin Kotlin wrapper around NativeActivity
             that requests CAMERA at onCreate so CNSDK's face tracker
             can open the front camera at xrCreateSession. The

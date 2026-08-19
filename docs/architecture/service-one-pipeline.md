@@ -29,6 +29,12 @@ records the spike that decided the shape, against the code as mapped in
   `mc->suspended`) and every client lazily rebuilds a per-client window/swap-chain/DP on its
   own IPC thread; #963's `enrol_standalone_clients_locked` / `pending_workspace_reentry` /
   runtime-window-on-deactivate exist only to bridge that seam.
+- **`set_window_screen_rect` is the platform-neutral placement channel** (ADR-036 D6,
+  #1033): the VK DP variant's successor to `set_present_origin`, carrying origin **+ size +
+  display id**. It is how a per-window compositor instance tells the weaver where its window
+  sits when there is no HWND to subclass — Android's case, where a pure window *move* raises
+  no resize at all. ADR-033 is unchanged: the runtime reports geometry, the weaver owns phase
+  (including snapping), so this is the successor to *HWND-derived phase*, not to phase policy.
 - **The D3D11 DP has no placement channel.** `set_present_origin` exists only on the VK
   vtable; on D3D11 the SR weaver takes its interlace phase from the HWND it was *created*
   with (SDK polls `Window2::getScreenRect()` per frame) and the target size must equal that

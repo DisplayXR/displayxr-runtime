@@ -20,6 +20,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Choreographer;
 import android.view.Display;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -50,6 +51,23 @@ public class MonadoView extends SurfaceView
 
         /** The current surface was destroyed. UI thread. */
         void onSurfaceDestroyed();
+
+        /**
+         * The view's on-screen rectangle changed (ADR-036 D6, #1033). UI thread, fired from a
+         * Choreographer callback, only when the value actually changed.
+         *
+         * <p>A pure window MOVE on Android raises no resize and no public callback — SurfaceFlinger
+         * just repositions the layer with the old buffer — so the compositor cannot learn where the
+         * window went from the surface. Polling {@link android.view.View#getLocationOnScreen} once
+         * per frame is the only signal there is.
+         *
+         * @param x window left edge in physical screen pixels (may be negative)
+         * @param y window top edge in physical screen pixels
+         * @param w view width in physical screen pixels
+         * @param h view height in physical screen pixels
+         * @param displayId {@code Display.getDisplayId()} the rect is expressed in
+         */
+        void onWindowRectChanged(int x, int y, int w, int h, int displayId);
     }
 
     @Nullable private SurfaceStateListener surfaceStateListener = null;
@@ -142,6 +160,112 @@ public class MonadoView extends SurfaceView
         // behavior (#499) untouched.
         if (hostActivity == null) {
             installPassthroughTouchRegion();
+        }
+        startWindowRectPoll();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        stopWindowRectPoll();
+        super.onDetachedFromWindow();
+    }
+
+    // ---------------------------------------------------------------- window rect (#1033)
+
+    private final int[] locationOnScreen = new int[2];
+    private int lastRectX = Integer.MIN_VALUE;
+    private int lastRectY = Integer.MIN_VALUE;
+    private int lastRectW = -1;
+    private int lastRectH = -1;
+    private int lastRectDisplayId = -1;
+    private boolean windowRectPollRunning = false;
+    @Nullable private Choreographer.FrameCallback windowRectCallback = null;
+
+    /**
+     * Sample this view's on-screen rect once per frame and report changes (ADR-036 D6, #1033).
+     *
+     * <p>Choreographer rather than a layout/position listener because a pure window MOVE produces
+     * neither: {@code WindowFrames.didFrameSizeChange} compares w/h only, so the move goes out as a
+     * {@code oneway IWindow.moved} that updates {@code mAttachInfo.mWindowLeft/Top} and nothing
+     * else — no layout, no invalidate, no callback. SurfaceView derives {@code positionChanged}
+     * from {@code getLocationInWindow()}, which is unchanged by a move. Meanwhile SurfaceFlinger
+     * has already repositioned the layer with the OLD buffer, so an un-updated weave keeps a stale
+     * interlace phase for the whole drag.
+     *
+     * <p>Cost is one {@code getLocationOnScreen} per frame plus five int compares; the listener
+     * (and therefore the binder hop) only fires on an actual change.
+     *
+     * <p>TRAP: an OEM that applies {@code OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS} makes
+     * {@code getLocationOnScreen} return WINDOW-relative coordinates, which would silently report
+     * (0,0) for every window. Clients opt out with
+     * {@code <property android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+     * android:value="false"/>} in their own manifest — see docs/guides/displayxr-app-rules.md.
+     */
+    private void startWindowRectPoll() {
+        if (windowRectPollRunning) {
+            return;
+        }
+        if (surfaceStateListener == null) {
+            // Nobody to report to — e.g. the SERVICE-owned overlay (#558), which has no
+            // host Activity and no IPC client to forward to. Don't burn a Choreographer
+            // callback per frame for nothing. The listener is assigned in
+            // attachToActivity() before the view reaches the window manager, so a real
+            // client is always registered by the time onAttachedToWindow fires.
+            return;
+        }
+        windowRectPollRunning = true;
+        windowRectCallback =
+                new Choreographer.FrameCallback() {
+                    @Override
+                    public void doFrame(long frameTimeNanos) {
+                        if (!windowRectPollRunning) {
+                            return;
+                        }
+                        sampleWindowRect();
+                        Choreographer.getInstance().postFrameCallback(this);
+                    }
+                };
+        Choreographer.getInstance().postFrameCallback(windowRectCallback);
+    }
+
+    private void stopWindowRectPoll() {
+        windowRectPollRunning = false;
+        if (windowRectCallback != null) {
+            Choreographer.getInstance().removeFrameCallback(windowRectCallback);
+            windowRectCallback = null;
+        }
+    }
+
+    private void sampleWindowRect() {
+        int w = getWidth();
+        int h = getHeight();
+        if (w <= 0 || h <= 0) {
+            return; // not laid out yet
+        }
+        getLocationOnScreen(locationOnScreen);
+        int x = locationOnScreen[0];
+        int y = locationOnScreen[1];
+        int displayId = 0;
+        Display display = getDisplay();
+        if (display != null) {
+            displayId = display.getDisplayId();
+        }
+        if (x == lastRectX
+                && y == lastRectY
+                && w == lastRectW
+                && h == lastRectH
+                && displayId == lastRectDisplayId) {
+            return;
+        }
+        lastRectX = x;
+        lastRectY = y;
+        lastRectW = w;
+        lastRectH = h;
+        lastRectDisplayId = displayId;
+        Log.i(TAG, "windowRect: " + x + "," + y + " " + w + "x" + h + " display " + displayId);
+        SurfaceStateListener listener = surfaceStateListener;
+        if (listener != null) {
+            listener.onWindowRectChanged(x, y, w, h, displayId);
         }
     }
 
