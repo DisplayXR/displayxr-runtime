@@ -500,6 +500,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 
 #ifdef OXR_HAVE_DXR_weave
 	ENTRY_IF_EXT(xrWeaveBindWindowDXR, DXR_weave);
+	ENTRY_IF_EXT(xrWeaveBindWindow2DXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveSubmitDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveSnapWindowRectDXR, DXR_weave);
 #endif

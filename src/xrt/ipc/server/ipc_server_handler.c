@@ -6038,7 +6038,7 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -6046,6 +6046,50 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 #else
 	(void)hwnd;
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+/*!
+ * XR_DXR_weave spec v7 (#1036): the present-owner's client-area rect on the
+ * panel. The weave phase is absolute-screen, so a window that is not at the
+ * panel origin needs its origin fed to the DP (`set_window_screen_rect`, ADR-036
+ * D6 / #1033). Windows derives the same numbers from the bound HWND and ignores
+ * this call; Android has no handle to derive them from, so this IS the channel.
+ */
+xrt_result_t
+ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
+                                     int32_t origin_x,
+                                     int32_t origin_y,
+                                     uint32_t client_w,
+                                     uint32_t client_h,
+                                     int32_t display_id)
+{
+	IPC_TRACE_MARKER();
+
+	xrt_result_t auth = require_present_owner(ics, "weave_set_window_geometry");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+	if (!comp_multi_weave_set_window_geometry(ics->xc, origin_x, origin_y, client_w, client_h, display_id)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#else
+	// Windows: the D3D11 service reads the client rect off the bound HWND, so an
+	// explicit publication is redundant rather than unsupported — accept and drop
+	// it, keeping the call portable for a caller that always sends it.
+	(void)origin_x;
+	(void)origin_y;
+	(void)client_w;
+	(void)client_h;
+	(void)display_id;
+	return XRT_SUCCESS;
 #endif
 }
 
@@ -6156,8 +6200,9 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_fence_value = fv;
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
-	// handles[0] is the retained IOSurfaceRef the IPC receive looked up; the
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer
+	// (Android) the IPC receive looked up; the
 	// weave engine takes ownership (adopts it into its import cache or
 	// releases it). No DXGI low-bit tag exists on POSIX handles.
 	// v4 overlay atlas (browser#18): handles[1] is a second retained IOSurfaceRef
@@ -6267,7 +6312,7 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 		*out_width = w;
 		*out_height = ht;
 	}
-#elif defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	uint32_t w = 0, ht = 0;
 	if (comp_multi_weave_export_output(ics->xc, &h, &w, &ht)) {
@@ -6351,7 +6396,7 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 		*out_snapped_y = sy;
 	}
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 	// Identity today (sim_display has no interlace lattice); routes to a
 	// future VK DP snap slot in one place (#759).
 	int32_t sx = target_x, sy = target_y;

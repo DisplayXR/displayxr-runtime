@@ -570,6 +570,97 @@ struct multi_compositor
 		//! @}
 	} weave;
 #endif
+
+#ifdef XRT_OS_ANDROID
+	/*!
+	 * XR_DXR_weave present-owner state (#1036) — the Android sibling of the
+	 * macOS block above, same engine shape with AHardwareBuffer in place of
+	 * IOSurface. The caller owns its SurfaceView and presents itself; we
+	 * import its AHB, blit every submitted rect into a window-sized 2x1 SBS
+	 * scratch atlas (or sample its v6 N-view atlas directly), run ONE DP
+	 * process_atlas into an AHB-backed output, and wait completion before the
+	 * IPC reply (synchronous contract — no cross-process fence).
+	 * Implemented in comp_multi_weave_android.c.
+	 */
+	struct
+	{
+		bool mutex_initialized;
+		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
+
+		bool engine_initialized;
+		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
+		VkCommandPool cmd_pool;
+		VkCommandBuffer cmd;
+		VkFence fence;
+		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, RGBA8).
+		struct xrt_display_processor *dp;
+
+		uint64_t window_id;   //!< Present-owner window id from bind (opaque on Android).
+		uint64_t fence_value; //!< Monotonic; completion is synchronous.
+
+		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
+		//! Android has no HWND to read a client rect off, so the caller
+		//! publishes it. Forwarded to the DP's per-window phase slot
+		//! (`set_window_screen_rect`, #1033) before every weave.
+		//! @{
+		bool have_geometry;
+		int32_t win_x, win_y;
+		uint32_t win_w, win_h;
+		int32_t win_display_id;
+		bool geometry_dirty; //!< Log the change once, not per frame.
+		//! @}
+
+		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)
+		//! @{
+		void *in_ahb; //!< Acquired AHardwareBuffer * (adopted from the IPC receive).
+		VkImage in_image;
+		VkDeviceMemory in_memory;
+		VkImageView in_view; //!< Full-image view (v6 zero-copy DP sample source).
+		uint32_t in_w, in_h;
+		bool in_first_use; //!< First barrier transitions from UNDEFINED.
+		//! @}
+
+		//! @name v6 N-view crop staging (#774) — see the macOS block.
+		//! @{
+		VkImage crop_image;
+		VkDeviceMemory crop_memory;
+		VkImageView crop_view;
+		uint32_t crop_w, crop_h;
+		bool crop_first_use;
+		//! @}
+
+		//! @name Window-sized 2x1 SBS scratch atlas (2*out_w x out_h)
+		//! @{
+		VkImage sbs_image;
+		VkDeviceMemory sbs_memory;
+		VkImageView sbs_view;
+		uint32_t sbs_w, sbs_h;
+		bool sbs_first_use;
+		//! @}
+
+		//! @name AHardwareBuffer-backed weaved output (exported to the caller)
+		//! @{
+		VkImage out_image;
+		VkDeviceMemory out_memory;
+		VkImageView out_view;
+		VkFramebuffer out_fb;
+		void *out_ahb; //!< AHardwareBuffer * the runtime allocated + bound.
+		uint32_t out_w, out_h;
+		//! @}
+
+		//! @name v4 DP-composited 2D overlay atlas (browser#18)
+		//! @{
+		void *overlay_ahb;
+		VkImage overlay_image;
+		VkDeviceMemory overlay_memory;
+		VkImageView overlay_view;
+		uint32_t overlay_w, overlay_h;
+		bool overlay_first_use;
+		struct vk_local2d_composite overlay_blend;
+		bool overlay_blend_initialized;
+		//! @}
+	} weave;
+#endif
 };
 
 /*!
@@ -875,17 +966,32 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 bool
 multi_compositor_init_session_render(struct multi_compositor *mc);
 
-#ifdef XRT_OS_MACOS
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 /*!
- * @name XR_DXR_weave on the macOS service path (#759)
+ * @name XR_DXR_weave on the comp_multi service path (macOS #759, Android #1036)
  * Present-owner weave entry points, called from ipc_server_handler.c exactly
- * where the Windows build calls comp_d3d11_service_weave_* (#625). All are
- * implemented in comp_multi_weave_macos.c; see that file for the platform
- * contract (IOSurface transport, synchronous completion, no fence).
+ * where the Windows build calls comp_d3d11_service_weave_* (#625). One engine
+ * shape, two backends: comp_multi_weave_macos.c (IOSurface) and
+ * comp_multi_weave_android.c (AHardwareBuffer). Both are synchronous — the
+ * submit returns after the weave completed on the GPU, so there is no fence.
  * @{
  */
 bool
 comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id);
+
+/*!
+ * Publish the present-owner's client-area rect on the panel (spec v7, #1036).
+ * The weave phase is absolute-screen, so the DP needs the window's origin
+ * (`set_window_screen_rect`, ADR-036 D6 / #1033). Cheap and idempotent — the
+ * caller re-publishes on every move.
+ */
+bool
+comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
+                                     int32_t origin_x,
+                                     int32_t origin_y,
+                                     uint32_t client_w,
+                                     uint32_t client_h,
+                                     int32_t display_id);
 
 bool
 comp_multi_weave_submit(struct xrt_compositor *xc,
@@ -926,7 +1032,7 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 void
 comp_multi_weave_fini(struct multi_compositor *mc);
 /*! @} */
-#endif // XRT_OS_MACOS
+#endif // XRT_OS_MACOS || XRT_OS_ANDROID
 
 /*!
  * Check if a multi_compositor has per-session rendering enabled.

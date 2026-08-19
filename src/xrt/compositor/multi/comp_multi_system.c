@@ -3493,7 +3493,13 @@ submit_and_present:
 #ifdef XRT_OS_ANDROID
 	ts_submit0 = os_monotonic_get_ns(); // record (per-tile blit + weave + overlays) done
 #endif
+	// VkQueue is externally synchronized, and it is no longer this thread's alone:
+	// an XR_DXR_weave present-owner submits its synchronous weave on the same queue
+	// from its IPC handler thread (#1036). comp_target_present already takes this
+	// lock internally (comp_target_swapchain.c); the submit had been missing it.
+	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
+	vk_queue_unlock(vk->main_queue);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
@@ -5210,7 +5216,10 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	    .signalSemaphoreCount = (signal_sem != VK_NULL_HANDLE) ? 1 : 0,
 	    .pSignalSemaphores = (signal_sem != VK_NULL_HANDLE) ? &signal_sem : NULL,
 	};
+	// Same external-synchronization rule as the per-session path above (#1036).
+	vk_queue_lock(vk->main_queue);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, msc->shared_fences[buffer_index]);
+	vk_queue_unlock(vk->main_queue);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[#59] shared submit failed: %s", vk_result_string(ret));
 		return;

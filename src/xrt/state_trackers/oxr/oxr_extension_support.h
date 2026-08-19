@@ -678,9 +678,11 @@
  * the DisplayXR blocks — keep them when regenerating). Windows: the weave
  * service is implemented on the D3D11 service compositor (#625). macOS: on the
  * comp_multi Vulkan weave engine, IOSurface transport, synchronous completion
- * (#759).
+ * (#759). Android: the same comp_multi Vulkan weave engine with AHardwareBuffer
+ * transport and explicit window geometry (spec v7, #1036).
  */
-#if defined(XR_DXR_weave) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS))
+#if defined(XR_DXR_weave) &&                                                                                           \
+    (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) || defined(XR_USE_PLATFORM_ANDROID))
 #define OXR_HAVE_DXR_weave
 #define OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     _(DXR_weave, DXR_WEAVE)

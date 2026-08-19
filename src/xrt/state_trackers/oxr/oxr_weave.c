@@ -52,6 +52,14 @@ xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
 
 xrt_result_t
+comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
+                                                     int32_t origin_x,
+                                                     int32_t origin_y,
+                                                     uint32_t client_w,
+                                                     uint32_t client_h,
+                                                     int32_t display_id);
+
+xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,
                                         bool in_is_dxgi,
@@ -95,6 +103,28 @@ comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
                                                   int32_t *out_snapped_x,
                                                   int32_t *out_snapped_y);
 
+/*!
+ * Is @p kind a handle kind THIS platform can accept (spec v7, #1036)?
+ * PLATFORM_DEFAULT always is — it means "resolve from the platform", which is
+ * what every pre-v7 caller does implicitly.
+ */
+static bool
+weave_handle_kind_ok(XrWeaveHandleKindDXR kind)
+{
+	switch (kind) {
+	case XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR: return true;
+#if defined(XR_USE_PLATFORM_WIN32)
+	case XR_WEAVE_HANDLE_KIND_D3D11_NT_DXR:
+	case XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR: return true;
+#elif defined(XR_USE_PLATFORM_ANDROID)
+	case XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR: return true;
+#elif defined(XR_USE_PLATFORM_MACOS)
+	case XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR: return true;
+#endif
+	default: return false;
+	}
+}
+
 //! IPC sessions hold a native-compositor handle (the IPC client compositor) but
 //! none of the in-process native-compositor flags are set. Mirrors oxr_capture.c.
 static bool
@@ -131,6 +161,57 @@ oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle)
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
 		                 "xrWeaveBindWindowDXR: bind failed (xrt_result=%d)", (int)xret);
+	}
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bindInfo)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWeaveBindWindow2DXR");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_weave);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, bindInfo, XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR);
+
+	if (!session_is_ipc(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveBindWindow2DXR: the weave service is only available on the "
+		                 "out-of-process (service) path");
+	}
+
+	// The handle half is exactly xrWeaveBindWindowDXR (NULL is legal — Android
+	// has no window handle at all and binds by geometry alone).
+	xrt_result_t xret = comp_ipc_client_compositor_weave_bind_window(
+	    &sess->xcn->base, (uint64_t)(uintptr_t)bindInfo->windowHandle);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrWeaveBindWindow2DXR: bind failed (xrt_result=%d)", (int)xret);
+	}
+
+	// Spec v7 (#1036): explicit client-area geometry on the panel. Optional on
+	// Windows / macOS (the runtime can read it off the window handle there),
+	// required on Android. Forwarded to the DP's per-window phase slot.
+	const XrWeaveWindowGeometryDXR *geom =
+	    OXR_GET_INPUT_FROM_CHAIN(bindInfo, XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR, XrWeaveWindowGeometryDXR);
+	if (geom != NULL) {
+		if (geom->clientSize.width <= 0 || geom->clientSize.height <= 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveBindWindow2DXR: XrWeaveWindowGeometryDXR::clientSize "
+			                 "(%dx%d) must be positive",
+			                 geom->clientSize.width, geom->clientSize.height);
+		}
+		xret = comp_ipc_client_compositor_weave_set_window_geometry(
+		    &sess->xcn->base, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
+		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId);
+		if (xret != XRT_SUCCESS) {
+			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+			                 "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
+			                 (int)xret);
+		}
 	}
 	return XR_SUCCESS;
 }
@@ -208,6 +289,27 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			overlay_rects[i].offset.h = ov->rects[i].offset.y;
 			overlay_rects[i].extent.w = (int)ov->rects[i].extent.width;
 			overlay_rects[i].extent.h = (int)ov->rects[i].extent.height;
+		}
+	}
+
+	// Spec v7 (#1036): a chained XrWeaveSubmitHandlesDXR declares what the
+	// handles ARE. It changes no layout contract — it only lets us reject a
+	// cross-platform mistake here instead of dereferencing an alien pointer in
+	// the service. PLATFORM_DEFAULT (and an absent chain) = pre-v7 behaviour.
+	const XrWeaveSubmitHandlesDXR *kinds =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR, XrWeaveSubmitHandlesDXR);
+	if (kinds != NULL) {
+		if (!weave_handle_kind_ok(kinds->inputKind)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitHandlesDXR::inputKind (%d) is not a "
+			                 "handle kind this platform accepts",
+			                 (int)kinds->inputKind);
+		}
+		if (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID && !weave_handle_kind_ok(kinds->overlayKind)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitHandlesDXR::overlayKind (%d) is not a "
+			                 "handle kind this platform accepts",
+			                 (int)kinds->overlayKind);
 		}
 	}
 
