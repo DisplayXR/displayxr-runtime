@@ -16,5 +16,65 @@
                 <action android:name="${shutdownActionName}" />
             </intent-filter>
         </service>
+
+        <!--
+            The satellite compositor-slot broker (ADR-036 D3, #1031). Lives in
+            the APK's MAIN process, loads no native code and starts no runtime
+            server; it only decides which satellite a client gets. Bound by
+            explicit ComponentName from Client.java, so no intent-filter.
+        -->
+        <service
+            android:name="org.freedesktop.monado.ipc.SlotBrokerService"
+            android:enabled="true"
+            android:exported="true" />
+
+        <!--
+            Satellite compositor slots (ADR-036 D3, #1031). One android:process
+            each, so every bound client gets its own runtime process running the
+            ordinary out-of-process compositor for exactly one client (own
+            comp_multi, own android_globals surface, own display processor, own
+            vendor core).
+
+            NOT android:isolatedProcess — an isolated process cannot reach
+            SurfaceFlinger or gralloc and therefore could never present.
+
+            No intent-filter: clients bind by explicit ComponentName after the
+            broker names the slot, which is also what keeps the runtime broker /
+            RuntimeService / MonadoService in the main process untouched.
+
+            Same foregroundServiceType as MonadoService above: each satellite
+            calls startForeground() for its own client. specialUse would be the
+            honest type for an always-on compositor, but it requires a
+            PROPERTY_SPECIAL_USE_FGS_SUBTYPE declaration and Play review, so the
+            slots stay consistent with the service they subclass.
+
+            THE COUNT IS CHECKED: :src:xrt:ipc:checkSatelliteSlotManifest fails
+            the build if these entries disagree with dxrSatelliteSlots in
+            build.gradle.
+        -->
+        <service
+            android:name="org.freedesktop.monado.ipc.MonadoServiceSlot0"
+            android:enabled="true"
+            android:exported="true"
+            android:process=":dxr0"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
+        <service
+            android:name="org.freedesktop.monado.ipc.MonadoServiceSlot1"
+            android:enabled="true"
+            android:exported="true"
+            android:process=":dxr1"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
+        <service
+            android:name="org.freedesktop.monado.ipc.MonadoServiceSlot2"
+            android:enabled="true"
+            android:exported="true"
+            android:process=":dxr2"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
+        <service
+            android:name="org.freedesktop.monado.ipc.MonadoServiceSlot3"
+            android:enabled="true"
+            android:exported="true"
+            android:process=":dxr3"
+            android:foregroundServiceType="connectedDevice|mediaPlayback" />
     </application>
 </manifest>
