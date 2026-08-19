@@ -14,7 +14,9 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
+import android.os.Binder;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
@@ -38,6 +40,19 @@ import org.freedesktop.monado.auxiliary.SystemUiController;
 @Keep
 public class Client implements ServiceConnection {
     private static final String TAG = "monado-ipc-client";
+
+    /** Optional client-manifest pin for the satellite compositor slot (#1031). */
+    private static final String SLOT_META_DATA = "com.displayxr.satellite_slot";
+
+    /** Dev override for the satellite slot, read before the manifest pin. */
+    private static final String SLOT_SYSPROP = "debug.dxr.slot";
+
+    /** How long to wait for the slot broker before falling back to the main-process service. */
+    private static final long BROKER_TIMEOUT_MS = 3000;
+
+    /** Explicit component of the main-process broker (see SlotBrokerService). */
+    private static final String SLOT_BROKER_CLASS_NAME =
+            "org.freedesktop.monado.ipc.SlotBrokerService";
 
     /** Used to block until binder is ready. */
     private final Object binderSync = new Object();
@@ -89,6 +104,18 @@ public class Client implements ServiceConnection {
      */
     private Surface lastSurfaceSent = null;
 
+    /** Connection to the main-process slot broker; held for as long as we hold a slot (#1031). */
+    private final BrokerConnection brokerConnection = new BrokerConnection();
+
+    /**
+     * The token the broker links to death on. Its lifetime IS our claim on the slot: if this
+     * process dies without releasing, the broker frees the slot when this binder dies with it.
+     */
+    private final IBinder slotToken = new Binder();
+
+    /** Satellite slot we hold, or -1 when we are on the classic main-process service. */
+    private int satelliteSlot = -1;
+
     /**
      * Constructor
      *
@@ -105,6 +132,9 @@ public class Client implements ServiceConnection {
         if (context != null) {
             context.unbindService(this);
         }
+        // Give the satellite back before we stop existing, so the next app can have it
+        // without waiting for our binder death to be noticed.
+        releaseSatelliteSlot();
 
         if (fd != null) {
             try {
@@ -255,10 +285,47 @@ public class Client implements ServiceConnection {
             return false;
         }
 
-        Intent intent = new Intent(BuildConfig.SERVICE_ACTION).setPackage(packageName);
+        // ADR-036 D3 / #1031: an OpenXR client gets its own SATELLITE compositor process
+        // (:dxrN) rather than sharing the single main-process service, because the pieces
+        // that decide what ends up on the panel — the app surface, the display processor,
+        // the vendor core — are process-global in the runtime. One client per process is
+        // what makes N apps weave at once.
+        //
+        // The runtime's OWN in-APK clients (the dashboard's headless diag query) stay on the
+        // main-process service: they are short-lived, never present, and would otherwise
+        // occupy a satellite that a real app needs.
+        Intent intent;
+        if (packageName.equals(context.getPackageName())) {
+            intent = new Intent(BuildConfig.SERVICE_ACTION).setPackage(packageName);
+            Log.i(TAG, "bind: in-APK client — using the main-process MonadoService");
+        } else {
+            satelliteSlot = acquireSatelliteSlot(context_, packageName);
+            if (satelliteSlot < 0) {
+                // Not fatal: without a satellite the runtime behaves exactly as it did
+                // before slots existed — one client on screen, on the main-process service.
+                intent = new Intent(BuildConfig.SERVICE_ACTION).setPackage(packageName);
+                Log.w(TAG, "bind: no satellite slot — falling back to the main-process service");
+            } else {
+                intent =
+                        new Intent(BuildConfig.SERVICE_ACTION)
+                                .setComponent(
+                                        new ComponentName(
+                                                packageName,
+                                                MonadoServiceSlots.classNameFor(satelliteSlot)));
+                Log.i(
+                        TAG,
+                        "bind: satellite slot "
+                                + satelliteSlot
+                                + " ("
+                                + intent.getComponent().getClassName()
+                                + ") for "
+                                + context.getPackageName());
+            }
+        }
 
         if (!bindService(context, intent)) {
             Log.e(TAG, "bindService: Service " + intent + " could not be found to bind!");
+            releaseSatelliteSlot();
             return false;
         }
 
@@ -266,7 +333,211 @@ public class Client implements ServiceConnection {
         return true;
     }
 
+    /**
+     * Ask the runtime's main-process broker for a satellite compositor slot (#1031).
+     *
+     * <p>Blocking, and deliberately so: {@link #blockingConnect} is already documented as
+     * off-the-UI-thread, and the slot has to be known before we can name the component to bind. A
+     * broker that does not answer within {@link #BROKER_TIMEOUT_MS} is treated as "no slot", which
+     * costs concurrency and nothing else.
+     *
+     * <p>The broker binding is kept afterwards, not dropped: it is what pins the assignment (the
+     * broker holds a death link on {@link #slotToken}) and what keeps the broker process at this
+     * app's importance.
+     *
+     * @return the slot index, or -1 to use the main-process service.
+     */
+    private int acquireSatelliteSlot(Context context_, String packageName) {
+        Intent intent =
+                new Intent().setComponent(new ComponentName(packageName, SLOT_BROKER_CLASS_NAME));
+        ISlotBroker broker = brokerConnection.connect(context, intent);
+        if (broker == null) {
+            Log.w(TAG, "acquireSatelliteSlot: slot broker unavailable");
+            return -1;
+        }
+        try {
+            int slot =
+                    broker.acquireSlot(
+                            context_.getPackageName(),
+                            android.os.Process.myPid(),
+                            preferredSlot(context_),
+                            slotToken);
+            if (slot < 0) {
+                Log.w(TAG, "acquireSatelliteSlot: broker has no free slot");
+            }
+            return slot;
+        } catch (RemoteException e) {
+            Log.e(TAG, "acquireSatelliteSlot: " + e);
+            return -1;
+        }
+    }
+
+    /** Hand the slot back so the next app can have it. Safe to call when we never had one. */
+    private void releaseSatelliteSlot() {
+        ISlotBroker broker = brokerConnection.get();
+        if (broker != null && satelliteSlot >= 0) {
+            try {
+                broker.releaseSlot(satelliteSlot, slotToken);
+            } catch (RemoteException e) {
+                // The broker died; it frees the slot on our token's death anyway.
+            }
+        }
+        satelliteSlot = -1;
+        brokerConnection.disconnect(context);
+    }
+
+    /**
+     * A slot the client would like, or -1. {@code setprop debug.dxr.slot N} is the dev override
+     * (test harnesses pin a known slot); the {@code com.displayxr.satellite_slot} manifest
+     * meta-data is an app pin. Both are only a *preference* — the broker still owns the decision,
+     * so two apps pinning the same slot cannot collide.
+     */
+    private static int preferredSlot(Context context_) {
+        int override = getIntSystemProperty(SLOT_SYSPROP, -1);
+        if (override >= 0) {
+            Log.i(TAG, "preferredSlot: " + SLOT_SYSPROP + " -> " + override);
+            return override;
+        }
+        int declared = getAppMetaDataInt(context_, SLOT_META_DATA, -1);
+        if (declared >= 0) {
+            Log.i(TAG, "preferredSlot: " + SLOT_META_DATA + " -> " + declared);
+        }
+        return declared;
+    }
+
+    /** Manifest {@code <meta-data>} on the client app. */
+    private static int getAppMetaDataInt(Context context_, String key, int defaultValue) {
+        try {
+            ApplicationInfo ai =
+                    context_.getPackageManager()
+                            .getApplicationInfo(
+                                    context_.getPackageName(), PackageManager.GET_META_DATA);
+            if (ai.metaData == null) {
+                return defaultValue;
+            }
+            Object raw = ai.metaData.get(key);
+            if (raw instanceof Integer) {
+                return (Integer) raw;
+            }
+            if (raw instanceof String) {
+                return Integer.parseInt(((String) raw).trim());
+            }
+            return defaultValue;
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
+    /** Read an {@code android.os.SystemProperties} int by reflection (it is a hidden API). */
+    private static int getIntSystemProperty(String key, int defaultValue) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String raw = (String) sp.getMethod("get", String.class).invoke(null, key);
+            if (raw == null || raw.isEmpty()) {
+                return defaultValue;
+            }
+            return Integer.parseInt(raw.trim());
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
+    /** Bind/unbind helper for the slot broker, with a bounded wait for onServiceConnected. */
+    private class BrokerConnection implements ServiceConnection {
+        private final Object sync = new Object();
+        private ISlotBroker broker = null;
+        private boolean bound = false;
+        private boolean settled = false;
+
+        @Nullable
+        ISlotBroker connect(Context ctx, Intent intent) {
+            synchronized (sync) {
+                if (broker != null) {
+                    return broker;
+                }
+                if (!bound) {
+                    settled = false;
+                    // Same flags as the compositor bind: the broker must inherit our
+                    // importance, or the freezer can take it out from under us.
+                    bound = bindService(ctx, intent, this);
+                    if (!bound) {
+                        return null;
+                    }
+                }
+                long deadline = android.os.SystemClock.uptimeMillis() + BROKER_TIMEOUT_MS;
+                while (!settled) {
+                    long remaining = deadline - android.os.SystemClock.uptimeMillis();
+                    if (remaining <= 0) {
+                        Log.w(TAG, "slot broker did not connect within " + BROKER_TIMEOUT_MS + "ms");
+                        break;
+                    }
+                    try {
+                        sync.wait(remaining);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                return broker;
+            }
+        }
+
+        @Nullable
+        ISlotBroker get() {
+            synchronized (sync) {
+                return broker;
+            }
+        }
+
+        void disconnect(Context ctx) {
+            synchronized (sync) {
+                // Drop the IBinder as well as the binding: a sync binder call into a frozen
+                // process kills it, so nothing may keep a reference to a service it no
+                // longer holds a binding to.
+                broker = null;
+                if (bound && ctx != null) {
+                    try {
+                        ctx.unbindService(this);
+                    } catch (IllegalArgumentException e) {
+                        // Never bound / already unbound.
+                    }
+                    bound = false;
+                }
+            }
+        }
+
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder service) {
+            synchronized (sync) {
+                broker = ISlotBroker.Stub.asInterface(service);
+                settled = true;
+                sync.notifyAll();
+            }
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            synchronized (sync) {
+                broker = null;
+                settled = true;
+                sync.notifyAll();
+            }
+        }
+    }
+
     private boolean bindService(Context context, Intent intent) {
+        return bindService(context, intent, this);
+    }
+
+    /**
+     * Bind with the flags that make the target inherit OUR importance.
+     *
+     * <p>{@code BIND_IMPORTANT | BIND_ABOVE_CLIENT | BIND_INCLUDE_CAPABILITIES} is what keeps a
+     * satellite (and the broker) out of the freezer for as long as this app is foreground, and
+     * makes them freeze WITH the app when it is cached — which is exactly the desired behaviour
+     * for a compositor that exists to serve one window.
+     */
+    private boolean bindService(Context context, Intent intent, ServiceConnection connection) {
         boolean result;
         int flags = Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT | Context.BIND_ABOVE_CLIENT;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -275,9 +546,9 @@ public class Client implements ServiceConnection {
                             intent,
                             flags | Context.BIND_INCLUDE_CAPABILITIES,
                             Executors.newSingleThreadExecutor(),
-                            this);
+                            connection);
         } else {
-            result = context.bindService(intent, this, flags);
+            result = context.bindService(intent, connection, flags);
         }
 
         return result;

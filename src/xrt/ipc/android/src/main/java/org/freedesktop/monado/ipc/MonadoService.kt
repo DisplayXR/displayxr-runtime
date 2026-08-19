@@ -14,6 +14,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
@@ -25,15 +26,35 @@ import org.freedesktop.monado.auxiliary.IServiceNotification
  * This is needed so that the APK can expose the binder service implemented in MonadoImpl.
  */
 @AndroidEntryPoint
-class MonadoService : Service(), Watchdog.ShutdownListener {
+open class MonadoService : Service(), Watchdog.ShutdownListener {
     private lateinit var binder: MonadoImpl
 
     private lateinit var watchdog: Watchdog
 
     @Inject lateinit var serviceNotification: IServiceNotification
 
+    /**
+     * Which satellite compositor slot this service instance is, or `-1` for the classic single
+     * main-process service (ADR-036 D3, #1031).
+     *
+     * The generated `MonadoServiceSlotN` subclasses, each declared with its own
+     * `android:process=":dxrN"`, override this. Everything below that branches on it is about one
+     * fact: a satellite hosts **exactly one** client, and must die with it.
+     */
+    protected open val slotIndex: Int
+        get() = -1
+
+    /**
+     * Foreground-notification id, offset per slot: two `startForeground()` calls with the same id
+     * would have the second process silently replace the first process's notification, and the
+     * user would lose the shutdown affordance for one of the satellites.
+     */
+    private val notificationId: Int
+        get() = serviceNotification.getNotificationId() + (if (slotIndex < 0) 0 else slotIndex + 1)
+
     override fun onCreate() {
         super.onCreate()
+        Log.i(TAG, "onCreate: slot=$slotIndex pid=${Process.myPid()}")
 
         binder = MonadoImpl(this)
         watchdog =
@@ -83,11 +104,16 @@ class MonadoService : Service(), Watchdog.ShutdownListener {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             flags = PendingIntent.FLAG_IMMUTABLE
         }
+        // Explicit component and a per-slot request code: several services in this package
+        // answer the shutdown action once the satellite slots exist, and an implicit
+        // PendingIntent would always resolve to the main-process MonadoService — so the
+        // notification for :dxr2 would shut down the wrong process. Distinct request codes
+        // additionally keep the PendingIntents from aliasing onto one another.
         val pendingShutdownIntent =
             PendingIntent.getForegroundService(
                 this,
-                0,
-                Intent(BuildConfig.SHUTDOWN_ACTION).setPackage(packageName),
+                slotIndex + 1,
+                Intent(this, javaClass).setAction(BuildConfig.SHUTDOWN_ACTION),
                 flags,
             )
 
@@ -95,12 +121,12 @@ class MonadoService : Service(), Watchdog.ShutdownListener {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
-                serviceNotification.getNotificationId(),
+                notificationId,
                 notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST,
             )
         } else {
-            startForeground(serviceNotification.getNotificationId(), notification)
+            startForeground(notificationId, notification)
         }
     }
 
