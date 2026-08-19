@@ -878,6 +878,27 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 	{
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
+			// #1041: undo oxr_session_end()'s local drop-to-2D when this is
+			// an end→begin cycle on the same session (Android resizes/pauses
+			// an app into one; the app is emphatically NOT gone). Guarded on
+			// the index still being the 0 we ourselves wrote, so a mode set
+			// by anyone else in between — the workspace/panel lease, another
+			// client's request re-synced onto the IPC proxy — wins and is
+			// never stomped by a stale restore.
+			if (sess->has_ended_rendering_mode) {
+				uint32_t restore = sess->ended_rendering_mode_index;
+				sess->has_ended_rendering_mode = false;
+				if (head->hmd->active_rendering_mode_index == 0 &&
+				    restore < head->rendering_mode_count) {
+					head->hmd->active_rendering_mode_index = restore;
+					// One-off lifecycle event (WARN so it survives the
+					// default log level — this is the evidence that the
+					// end->begin bounce did not downgrade the app).
+					U_LOG_W("oxr: xrBeginSession restoring content mode %u after an "
+					        "end->begin cycle (#1041)",
+					        restore);
+				}
+			}
 			uint32_t default_mode = head->hmd->active_rendering_mode_index;
 			sess->last_rendering_mode_index = default_mode;
 			if (default_mode < head->rendering_mode_count) {
@@ -949,6 +970,18 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->rendering_mode_count > 0 &&
 		    !head->rendering_modes[0].hardware_display_3d) {
+			// #1041: xrEndSession is NOT always "the app is going away" —
+			// Android bounces an app through end→begin on a window
+			// resize/pause. Remember what we are dropping so
+			// oxr_session_begin() can restore it; without this the begin
+			// faithfully republishes mode 0 and the app is stuck in flat
+			// 2D content next to a 3D lens. Nothing is pushed to the
+			// server here (see above), so this is purely this session's
+			// own state — the single mode field stays the only authority.
+			if (head->hmd != NULL && head->hmd->active_rendering_mode_index != 0) {
+				sess->ended_rendering_mode_index = head->hmd->active_rendering_mode_index;
+				sess->has_ended_rendering_mode = true;
+			}
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;
 		}
