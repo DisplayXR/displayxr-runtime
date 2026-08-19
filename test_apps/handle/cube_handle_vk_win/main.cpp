@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -562,7 +563,43 @@ static void RenderThreadFunc(
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
+    // DXR_TESTAPP_MAX_HZ — unconditional app-side frame cap, default off.
+    // Lets a run drive the app below the panel refresh so the runtime's repaint
+    // path can be measured against a slow producer. Deliberately unconditional:
+    // it never ramps back up, unlike an idle throttle.
+    int capHz = 0;
+    if (const char *capEnv = getenv("DXR_TESTAPP_MAX_HZ")) {
+        capHz = atoi(capEnv);
+        if (capHz < 0) capHz = 0;
+        if (capHz > 240) capHz = 240;
+    }
+    const std::chrono::nanoseconds capInterval(capHz > 0 ? 1000000000LL / capHz : 0);
+    std::chrono::steady_clock::time_point capNext = std::chrono::steady_clock::now();
+    if (capHz > 0) {
+        LOG_WARN("[RenderThread] DXR_TESTAPP_MAX_HZ=%d — app frame cap active (min interval %.2f ms)",
+                 capHz, capInterval.count() / 1e6);
+    } else {
+        LOG_INFO("[RenderThread] DXR_TESTAPP_MAX_HZ unset — no app frame cap");
+    }
+
     while (g_running.load() && !xr->exitRequested) {
+        // Frame cap: hold the top of the loop until the minimum interval has
+        // elapsed. Coarse sleep for the bulk, then yield-spin for the tail so
+        // the cadence does not inherit the ~15 ms scheduler granularity. If we
+        // fell behind, resync to now rather than bursting to catch up.
+        if (capHz > 0) {
+            auto now = std::chrono::steady_clock::now();
+            if (capNext > now) {
+                // Sleep only — NO yield-spin. Kept identical to the d3d11 app so
+                // the capped-VK vs capped-D3D11 comparison isolates the API, not
+                // the pacing code. (A spin was measured to steal from the
+                // runtime's repaint thread and was removed from both.)
+                std::this_thread::sleep_for(capNext - now);
+                now = std::chrono::steady_clock::now();
+            }
+            capNext = (capNext + capInterval > now) ? capNext + capInterval : now + capInterval;
+        }
+
         InputState inputSnapshot;
         bool resetRequested = false;
         uint32_t windowW, windowH;

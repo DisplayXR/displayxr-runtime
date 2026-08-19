@@ -25,6 +25,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <thread>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -1924,6 +1926,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
+    // DXR_TESTAPP_MAX_HZ — unconditional app-side frame cap, default off.
+    // Same env name, semantics and pacing maths as cube_handle_vk_win: the
+    // capped-D3D11 vs capped-VK comparison is only meaningful if both apps are
+    // rate-limited by identical code, so keep these two in lockstep.
+    int capHz = 0;
+    if (const char *capEnv = getenv("DXR_TESTAPP_MAX_HZ")) {
+        capHz = atoi(capEnv);
+        if (capHz < 0) capHz = 0;
+        if (capHz > 240) capHz = 240;
+    }
+    const std::chrono::nanoseconds capInterval(capHz > 0 ? 1000000000LL / capHz : 0);
+    std::chrono::steady_clock::time_point capNext = std::chrono::steady_clock::now();
+    if (capHz > 0) {
+        LOG_WARN("[RenderLoop] DXR_TESTAPP_MAX_HZ=%d — app frame cap active (min interval %.2f ms)",
+                 capHz, capInterval.count() / 1e6);
+    } else {
+        LOG_INFO("[RenderLoop] DXR_TESTAPP_MAX_HZ unset — no app frame cap");
+    }
+
     // Set virtual display height (app units). 0.24 = 4x the 0.06m cube height.
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
     g_inputState.initialVirtualDisplayHeight = g_inputState.viewParams.virtualDisplayHeight; // SPACE-reset target
@@ -1957,6 +1978,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             DispatchMessage(&msg);
         }
         if (!g_running) break;
+
+        // Frame cap. NOTE: unlike the VK app, this loop also pumps messages, so
+        // the wait below stalls the pump for up to one capped interval (~33 ms
+        // at cap 30). That is accepted deliberately — identical pacing to the VK
+        // app is worth more here than input latency in an unattended cell — but
+        // it does make the window feel sluggish to drag while a cap is active.
+        if (capHz > 0) {
+            auto now = std::chrono::steady_clock::now();
+            if (capNext > now) {
+                // Sleep only — NO yield-spin. A spin here burns a core for most
+                // of the capped interval and starves the runtime's repaint
+                // thread, which collapses total panel cadence (measured: repaint
+                // fell to 44 Hz and the app to 19 Hz against a 30 Hz cap).
+                // Sleep jitter is the cheaper error: it perturbs the app's own
+                // cadence slightly, it does not steal from the thing under test.
+                std::this_thread::sleep_for(capNext - now);
+                now = std::chrono::steady_clock::now();
+            }
+            capNext = (capNext + capInterval > now) ? capNext + capInterval : now + capInterval;
+        }
 
         RenderOneFrame(rs);
     }
