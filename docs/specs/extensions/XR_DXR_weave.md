@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 6 |
-| **Extension Type** | Instance extension (service path only — Windows/D3D11 + macOS/comp_multi-Vulkan, #759) |
+| **Spec Version** | 7 |
+| **Extension Type** | Instance extension (service path only — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–194` type block, pending Khronos registry) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, issues #625, #774 |
+| **Status** | Provisional (`1004999190–197` type block, pending Khronos registry) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036 |
 
 ## 1. What it is
 
@@ -19,9 +19,12 @@ rect(s) and composites back a weaved shared texture, gated on a fence. Eyes flow
 (runtime → caller) so the caller can render its next frame's off-axis (Kooima) projections;
 the interlace itself reads the vendor's tracker DP-internally.
 
-Three entry points:
+Four entry points:
 
 - `xrWeaveBindWindowDXR(session, hwnd)` — bind the present-owner's window (phase reference).
+- `xrWeaveBindWindow2DXR(session, bindInfo)` — (v7) the chainable form of the same bind, so
+  the caller can attach an `XrWeaveWindowGeometryDXR` giving the client area's absolute
+  on-screen origin + size + display id. Required on Android; optional elsewhere.
 - `xrWeaveSubmitDXR(session, submitInfo, output)` — synchronous weave; returns dims, fence
   value, tracked eyes; hands back the shared woven-texture/fence HANDLEs on the first call and
   on re-allocation (resize).
@@ -163,6 +166,39 @@ The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 S
 `process_atlas` per submit). Verification harness: `test_apps/probes/weave_probe_vk_macos`
 (headless; CPU-checks the sim anaglyph weave — left-eye-white → red, right-eye-white → cyan).
 
+## 5b. Android platform mapping (#1036)
+
+Android runs the **same** comp_multi Vulkan weave engine as macOS
+(`comp_multi_weave_android.c`), with AHardwareBuffer in place of IOSurface. The batch and
+N-view algorithms are byte-identical; only the transport, the sync contract's plumbing and
+the geometry source differ.
+
+| Contract point | Windows (D3D11 service) | macOS (comp_multi Vulkan) | Android (comp_multi Vulkan) |
+|---|---|---|---|
+| Window binding | HWND (`GetClientRect` + DP phase snap) | opaque id, stored only | **no handle** — `xrWeaveBindWindow2DXR` + chained `XrWeaveWindowGeometryDXR` |
+| Window geometry | derived from the HWND | derived from the input surface dims | **explicit, caller-published**; forwarded to the DP's `set_window_screen_rect` slot (ADR-036 D6 / #1033) |
+| `inputTexture` | D3D11 NT / legacy-DXGI shared HANDLE | IOSurfaceRef (global IOSurfaceID on the wire) | **`AHardwareBuffer *`** (the buffer itself crosses the socket) |
+| Handle kind | implied + `inputIsDxgi` | implied | declarable via `XrWeaveSubmitHandlesDXR` (v7) on all three |
+| Input-ready sync | keyed mutex `AcquireSync(0)` | caller finishes writes before submit | caller finishes writes before submit |
+| `weavedTexture` | shared NT HANDLE (caller `CloseHandle`s) | retained IOSurfaceRef (caller `CFRelease`s) | **`AHardwareBuffer *`** the runtime allocated (caller `AHardwareBuffer_release`s) |
+| `fence` / `fenceValue` | shared D3D fence, GPU-wait | no fence — completion is SYNCHRONOUS | no fence — completion is SYNCHRONOUS (bounded 1 s wait server-side) |
+| `xrWeaveSnapWindowRectDXR` | vendor DP lattice snap | identity | identity (the app does not drag its own window; phase comes from the geometry slot) |
+
+Notes that only bite on Android:
+
+- The vendor DP is a **pure offscreen weaver** — it takes no `ANativeWindow` and renders into
+  the VkImage the runtime hands it, so a weave client never competes for the app's Surface.
+  Its async init must still be kicked off from a Looper-bearing thread, so DP creation hops to
+  the service main thread (#510 M2).
+- Client class is `PRESENT_OWNER` (quota 2), declared from the enabled extension set and
+  verified service-side (#960 / ADR-035 D1).
+- The AHardwareBuffer IPC transport now frames an explicit handle count, because
+  `AHardwareBuffer_recvHandleFromUnixSocket` blocks: a receiver expecting one buffer that the
+  sender did not send would hang rather than fail.
+- **Follow-up, not a correctness gap:** an fd-based (`sync_file`) acquire/release pair would let
+  the submit return before the GPU finishes. Today's synchronous contract is the simplest one
+  that is correct, and it is what macOS already ships.
+
 ## 6. Version history
 
 | Version | Change |
@@ -170,6 +206,10 @@ The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 S
 | 1 | Initial: bindWindow + per-element submit + snap (pre-rename numbering carried over). |
 | 2 | `inputIsDxgi` legacy-DXGI handle tagging (Low-integrity GPU-process callers, #743). |
 | 3 | `XrWeaveSubmitRectsDXR` batched submit — N rects, one call, one fence (#744). |
+| 4 | `XrWeaveSubmitOverlaysDXR` DP-composited premul-RGBA 2D overlay atlas (browser#18). |
+| 5 | `XrWeaveSubmitInfoDXR::firstChunk` — coherent whole-window output (browser#22). |
+| 6 | `XrWeaveSubmitLayoutDXR` N-view worst-case atlas layout (#774). |
+| 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
 
 ## 7. Consumers
 
@@ -178,6 +218,7 @@ The batch algorithm is identical (all rects blitted into ONE window-sized 2×1 S
 | DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
 | `displayxr-webxr-bridge` | Service client | Legacy |
+| DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it
 (`third_party/displayxr` in the fork) — coupled-PR order: runtime → extensions auto-sync →
