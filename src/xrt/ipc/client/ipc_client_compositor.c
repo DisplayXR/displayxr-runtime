@@ -486,6 +486,30 @@ comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t
 	return ipc_call_weave_bind_window(icc->ipc_c, hwnd);
 }
 
+/*!
+ * Spec v7 (#1036): push the present-owner's explicit client-area geometry on the
+ * panel. Separate from bind so the caller can re-publish it every time the
+ * window moves without re-binding the handle, and so Windows (which derives the
+ * same numbers from the HWND) keeps its existing bind path byte-for-byte.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
+                                                     int32_t origin_x,
+                                                     int32_t origin_y,
+                                                     uint32_t client_w,
+                                                     uint32_t client_h,
+                                                     int32_t display_id)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id);
+}
+
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         xrt_graphics_buffer_handle_t in_handle,

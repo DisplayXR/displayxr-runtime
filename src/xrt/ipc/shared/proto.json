@@ -712,6 +712,16 @@
 		]
 	},
 
+	"weave_set_window_geometry": {
+		"in": [
+			{"name": "origin_x", "type": "int32_t"},
+			{"name": "origin_y", "type": "int32_t"},
+			{"name": "client_w", "type": "uint32_t"},
+			{"name": "client_h", "type": "uint32_t"},
+			{"name": "display_id", "type": "int32_t"}
+		]
+	},
+
 	"weave_submit": {
 		"in": [
 			{"name": "args", "type": "struct ipc_arg_weave_submit"}

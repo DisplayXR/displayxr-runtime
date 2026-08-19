@@ -1029,6 +1029,10 @@ oxr_xrGetWorkspaceTileSizeDXR(XrSession session, XrExtent2Di *tileSize);
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle);
 
+//! OpenXR API function @ep{xrWeaveBindWindow2DXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bindInfo);
+
 //! OpenXR API function @ep{xrWeaveSubmitDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, XrWeaveOutputDXR *output);

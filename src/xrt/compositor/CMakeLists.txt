@@ -307,6 +307,15 @@ if(APPLE)
 	target_link_libraries(comp_multi PRIVATE "-framework IOSurface" "-framework CoreFoundation")
 endif()
 
+if(ANDROID)
+	# XR_DXR_weave present-owner service (#1036): AHardwareBuffer in/out + the
+	# same Vulkan weave engine as macOS. aux_vk already brings aux_android
+	# (ahardwarebuffer_image_allocate, android_run_on_main_thread_blocking), so
+	# no extra link is needed beyond the NDK's libandroid, which aux_android
+	# already carries.
+	target_sources(comp_multi PRIVATE multi/comp_multi_weave_android.c)
+endif()
+
 ###
 # Mock native compositor
 add_library(comp_mock STATIC mock/mock_compositor.cpp mock/mock_compositor.h)

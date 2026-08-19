@@ -319,8 +319,29 @@ ipc_receive_handles_graphics_buffer(struct ipc_message_channel *imc,
 	if (result != XRT_SUCCESS) {
 		return result;
 	}
+
+	/*
+	 * Receive how many buffers actually follow (#1036). AHardwareBuffer_recv…
+	 * is a BLOCKING socket read with no in-band framing, so a receiver that
+	 * loops its own capacity while the sender had fewer to give does not fail —
+	 * it hangs forever. That is not hypothetical: the XR_DXR_weave
+	 * weave_get_output call always asks for one buffer but legitimately gets
+	 * none (no output allocated yet, or a denied caller). The FD path is
+	 * naturally tolerant and the Metal path already sends a count; this makes
+	 * the AHardwareBuffer path agree with both.
+	 */
+	uint32_t actual_count = 0;
+	result = ipc_receive(imc, &actual_count, sizeof(actual_count));
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+	if (actual_count > handle_count) {
+		IPC_ERROR(imc, "Received %u AHardwareBuffer handles but only %u fit", actual_count, handle_count);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	bool failed = false;
-	for (uint32_t i = 0; i < handle_count; ++i) {
+	for (uint32_t i = 0; i < actual_count; ++i) {
 		int err = AHardwareBuffer_recvHandleFromUnixSocket(imc->ipc_handle, &(out_handles[i]));
 		if (err != 0) {
 			failed = true;
@@ -341,6 +362,14 @@ ipc_send_handles_graphics_buffer(struct ipc_message_channel *imc,
 	if (result != XRT_SUCCESS) {
 		return result;
 	}
+
+	// Tell the receiver how many buffers follow, so it never blocks on one we
+	// did not send (#1036) — see the receive side for why.
+	result = ipc_send(imc, &handle_count, sizeof(handle_count));
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
 	bool failed = false;
 	for (uint32_t i = 0; i < handle_count; ++i) {
 		int err = AHardwareBuffer_sendHandleToUnixSocket(handles[i], imc->ipc_handle);

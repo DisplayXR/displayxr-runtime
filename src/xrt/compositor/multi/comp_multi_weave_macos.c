@@ -908,6 +908,30 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 }
 
 bool
+comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
+                                     int32_t origin_x,
+                                     int32_t origin_y,
+                                     uint32_t client_w,
+                                     uint32_t client_h,
+                                     int32_t display_id)
+{
+	// Spec v7 (#1036): accepted and recorded, but macOS derives its geometry
+	// from the input IOSurface dims and sim_display's anaglyph has no interlace
+	// lattice to phase-align — so there is nothing to feed a DP slot with yet.
+	// Kept so a portable present-owner can publish unconditionally.
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	(void)origin_x;
+	(void)origin_y;
+	(void)client_w;
+	(void)client_h;
+	(void)display_id;
+	return true;
+}
+
+bool
 comp_multi_weave_submit(struct xrt_compositor *xc,
                         xrt_graphics_buffer_handle_t in_handle,
                         int32_t rect_x,
