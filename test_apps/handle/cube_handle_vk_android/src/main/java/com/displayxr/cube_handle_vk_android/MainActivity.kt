@@ -22,10 +22,12 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Point
 import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Choreographer
 import android.view.MotionEvent
 
 class MainActivity : NativeActivity() {
@@ -49,6 +51,14 @@ class MainActivity : NativeActivity() {
     // native input queue never gets a touchable frame — dispatchTouchEvent on
     // this (focused) activity window is the path that actually delivers touch.
     private external fun nativeOnTouch(action: Int, x: Float, y: Float, eventTimeMs: Long)
+
+    // Implemented in main.cpp. This window's on-screen rect + the panel extent in
+    // the SAME rotation, pushed once per frame (XR_DXR_android_surface_binding /
+    // runtime#1037). The native side forwards changes to the runtime with
+    // xrSetAndroidWindowGeometryDXR.
+    private external fun nativeSetWindowRect(
+        x: Int, y: Int, w: Int, h: Int, panelW: Int, panelH: Int, displayId: Int,
+    )
 
     // True once xrCreateInstance failed with RUNTIME_UNAVAILABLE.
     private external fun nativeRuntimeUnavailable(): Boolean
@@ -100,6 +110,56 @@ class MainActivity : NativeActivity() {
                 .setNegativeButton("Close") { _, _ -> finish() }
                 .show()
         } catch (_: Throwable) {
+        }
+    }
+
+    // ---------------------------------------------------------------- window rect
+    //
+    // Choreographer rather than a layout / position listener, because a pure
+    // window MOVE produces neither: WindowFrames.didFrameSizeChange compares w/h
+    // only, so the move goes out as a `oneway IWindow.moved` that updates
+    // mAttachInfo.mWindowLeft/Top and nothing else — no layout, no invalidate, no
+    // callback. Meanwhile SurfaceFlinger has already repositioned the layer with
+    // the OLD buffer, so an un-updated weave keeps a stale interlace phase for the
+    // whole drag and the per-window Kooima frustum stays anchored to the old
+    // position. Cost is one getLocationOnScreen per frame plus seven int compares;
+    // the native push only happens on an actual change.
+    //
+    // TRAP: an OEM applying OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS makes
+    // getLocationOnScreen return WINDOW-relative coords — every window would report
+    // (0,0), silently. The opt-out is the
+    // PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS property in our manifest.
+    private val locationOnScreen = IntArray(2)
+    private var lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+    private var rectPollRunning = false
+
+    private val rectCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!rectPollRunning) return
+            sampleWindowRect()
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun sampleWindowRect() {
+        val view = window?.decorView ?: return
+        val w = view.width
+        val h = view.height
+        if (w <= 0 || h <= 0) return // not laid out yet
+        view.getLocationOnScreen(locationOnScreen)
+        val display = view.display ?: return
+        val real = Point()
+        @Suppress("DEPRECATION")
+        display.getRealSize(real) // the raw panel extent, not the app bounds
+        val next = intArrayOf(
+            locationOnScreen[0], locationOnScreen[1], w, h, real.x, real.y, display.displayId,
+        )
+        if (next.contentEquals(lastRect)) return
+        lastRect = next
+        try {
+            nativeSetWindowRect(next[0], next[1], next[2], next[3], next[4], next[5], next[6])
+        } catch (_: Throwable) {
+            // Native lib not bound yet — the next frame retries.
         }
     }
 
@@ -173,6 +233,21 @@ class MainActivity : NativeActivity() {
     override fun onResume() {
         super.onResume()
         pushRotation()
+        if (!rectPollRunning) {
+            // Forget the last sample so the first frame after a resume always
+            // re-pushes: the surface was destroyed and rebuilt underneath us and
+            // the runtime has to be told the rect again, even when it is
+            // byte-identical to the one before we went away.
+            lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
+            rectPollRunning = true
+            Choreographer.getInstance().postFrameCallback(rectCallback)
+        }
+    }
+
+    override fun onPause() {
+        rectPollRunning = false
+        Choreographer.getInstance().removeFrameCallback(rectCallback)
+        super.onPause()
     }
 
     override fun onDestroy() {

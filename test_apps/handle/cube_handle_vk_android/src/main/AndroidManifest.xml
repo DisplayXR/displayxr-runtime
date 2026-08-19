@@ -45,6 +45,33 @@
         <intent>
             <action android:name="org.freedesktop.monado.ipc.CONNECT" />
         </intent>
+
+        <!--
+            ARCHITECTURE A (in-process, ADR-036 D2) residue: the vendor display
+            processor now runs in THIS process, and its core loader calls
+            PackageManager.getPackageInfo() on the on-device vendor services to
+            bind them for display config + face tracking. Package visibility is
+            enforced per CALLING UID, so declaring them in the runtime APK is not
+            enough — without these two lines the loader gets a
+            NameNotFoundException it never clears and the next JNI call trips
+            CheckJNI, aborting the app inside xrCreateSession (ADR-025).
+
+            This is the LAST vendor-specific thing in a DisplayXR client APK:
+            #1037 removed the vendor Java glue (the runtime hosts it via the
+            plug-in loader's class-host Context, #1061) and this APK carries zero
+            com.leia.* classes and zero vendor .so. These lines were never
+            hand-written before either — they came from the vendor AAR's own
+            manifest via the merger, so dropping the AAR is what exposed them.
+
+            They go away entirely once the vendor services advertise a neutral
+            intent action (ADR-036 D5 / vendor ask L7,
+            org.displayxr.action.VENDOR_DISPLAY_SERVICE): an <intent> query on
+            that action grants the same visibility with no vendor package name in
+            any client manifest. Verified on retail hardware in the #1037 spike
+            using the vendor's existing action; only the neutral name is pending.
+        -->
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
     </queries>
 
     <uses-feature
