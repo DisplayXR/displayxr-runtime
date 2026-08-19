@@ -35,6 +35,22 @@ extern "C" {
 struct xrt_eye_positions;
 struct xrt_window_metrics;
 
+/*
+ * ── DP vendor-backend health states ────────────────────────────────────────
+ *
+ * Values reported through the per-API `get_backend_state` slot. Guarded so
+ * every DP header can define them independently of include order (no MSVC
+ * C4005 redefinition).
+ */
+#ifndef XRT_DP_BACKEND_STATE_OK
+//! Backend connected and healthy.
+#define XRT_DP_BACKEND_STATE_OK 0u
+//! Backend down or reconnecting — the DP is handling it; surface only.
+#define XRT_DP_BACKEND_STATE_DEGRADED 1u
+//! Backend connection dead and unrecoverable in place — recreate the DP.
+#define XRT_DP_BACKEND_STATE_STALE 2u
+#endif
+
 /*!
  * @interface xrt_display_processor_d3d11
  *
@@ -433,6 +449,34 @@ struct xrt_display_processor_d3d11
 	 * @param window_handle  The new HWND to bind to.
 	 */
 	bool (*set_window)(struct xrt_display_processor_d3d11 *xdp, void *window_handle /* HWND */);
+
+	/*!
+	 * Report the health of the DP's vendor backend — the vendor platform
+	 * service/session this DP is connected to — so the runtime can react
+	 * when that backend restarts or degrades underneath a long-lived
+	 * process (a service upgrade, a driver reset, a session teardown).
+	 *
+	 * States written to @p out_state:
+	 * - @ref XRT_DP_BACKEND_STATE_OK — connected and healthy.
+	 * - @ref XRT_DP_BACKEND_STATE_DEGRADED — backend down or reconnecting;
+	 *   the DP is handling it and output may be temporarily untracked / 2D.
+	 *   No action is needed beyond surfacing it.
+	 * - @ref XRT_DP_BACKEND_STATE_STALE — the DP's backend connection is
+	 *   dead and the DP cannot recover in place; destroying and recreating
+	 *   the DP is the remedy.
+	 *
+	 * Must be cheap and non-blocking — the runtime polls it at ~1 Hz from
+	 * the RENDER THREAD.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL, or a
+	 * false return, means "unknown": the runtime treats that as OK.
+	 * Appended per ADR-020.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param[out] out_state  One of the XRT_DP_BACKEND_STATE_* values.
+	 * @return true when @p out_state was written.
+	 */
+	bool (*get_backend_state)(struct xrt_display_processor_d3d11 *xdp, uint32_t *out_state);
 };
 
 /*
@@ -487,7 +531,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_shared_textur
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, snap_window_rect)              == XRT_DP_D3D11_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_frame_timing)            == XRT_DP_D3D11_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_window)                  == XRT_DP_D3D11_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_backend_state)           == XRT_DP_D3D11_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_frame_timing slot, so a plug-in
@@ -501,6 +546,13 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * built against an older runtime can #ifdef-guard its implementation.
  */
 #define XRT_DP_D3D11_HAS_SET_WINDOW 1
+
+/*!
+ * Defined when this header carries the get_backend_state slot, so a plug-in
+ * built against an older runtime can #ifdef-guard its implementation — the
+ * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
+ */
+#define XRT_DP_D3D11_HAS_BACKEND_STATE 1
 
 // clang-format on
 
@@ -885,6 +937,21 @@ xrt_display_processor_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, 
 		return false;
 	}
 	return xdp->set_window(xdp, window_handle);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_backend_state
+ * Returns false if not supported (slot absent or NULL) — the caller then
+ * treats the backend state as unknown, i.e. @ref XRT_DP_BACKEND_STATE_OK.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_backend_state(struct xrt_display_processor_d3d11 *xdp, uint32_t *out_state)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_backend_state) || xdp->get_backend_state == NULL) {
+		return false;
+	}
+	return xdp->get_backend_state(xdp, out_state);
 }
 
 #ifdef __cplusplus
