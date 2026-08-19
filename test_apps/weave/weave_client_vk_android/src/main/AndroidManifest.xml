@@ -57,5 +57,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            #1056: the simulated Chromium GPU process. Non-isolated and
+            pre-declared, exactly like Chromium's :privileged_process0 (an
+            isolatedProcess cannot reach SurfaceFlinger or gralloc — report
+            §6b). Not exported: only our own Activity binds it.
+
+            It owns the whole OpenXR/Vulkan/weave session while never calling
+            bindService and never loading org.freedesktop.monado.ipc.*; the
+            runtime socket and the Surface both arrive over binder from the
+            Activity's process. Only active under debug.dxr.fdhandoff=1.
+        -->
+        <service
+            android:name=".WeaveGpuService"
+            android:process=":gpu"
+            android:exported="false" />
     </application>
 </manifest>

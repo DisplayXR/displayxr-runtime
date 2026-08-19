@@ -36,10 +36,13 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 
+#include <dlfcn.h>
 #include <jni.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/system_properties.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -71,8 +74,18 @@
 	} while (0)
 
 //! Set by JNI_OnLoad / nativeOnCreate; the loader + instance creation need both.
+//! In the #1056 fd-handoff shape g_activity is the SERVICE object, not an
+//! Activity — android_instance_base_init only NewGlobalRef's it, and the
+//! Khronos loader only needs a Context for the runtime broker query.
 JavaVM *g_jvm = nullptr;
 jobject g_activity = nullptr;
+
+//! #1056: an already-connected runtime socket handed to us by another process,
+//! or -1 for the ordinary Java connect. Read once, in xr_create_instance().
+int g_adopt_fd = -1;
+//! When the fd arrived, so we can report connect-to-first-weave. Reported once.
+uint64_t g_adopt_ns = 0;
+bool g_adopt_reported = false;
 
 namespace {
 
@@ -183,6 +196,70 @@ now_ns()
  *
  */
 
+/*!
+ * #1056: publish an adopted runtime socket to the runtime's IPC client, so the
+ * next xrCreateInstance skips the Java connect entirely.
+ *
+ * Two routes, in preference order, because an embedder may only have one:
+ *
+ *  1. `ipc_client_connection_adopt_fd()` — exported from the runtime library
+ *     (libopenxr.version). It is only resolvable once the loader has actually
+ *     loaded the runtime .so into this process, which a cheap
+ *     xrEnumerateInstanceExtensionProperties() forces; before that
+ *     dlsym(RTLD_DEFAULT) sees nothing.
+ *  2. `DXR_IPC_FD=<n>` in the environment. No symbol resolution at all, which
+ *     is what a process handed the fd in its descriptor table at launch wants
+ *     (Chromium's FileDescriptorInfo / base::GlobalDescriptors shape). setenv()
+ *     is visible to the runtime because Android has ONE bionic libc per process
+ *     — the Windows static-CRT-environment caveat does not apply here.
+ *
+ * Both are tried so the spike proves both work.
+ */
+void
+publish_adopted_fd()
+{
+	if (g_adopt_fd < 0) {
+		return;
+	}
+
+	// Force the loader to load the runtime .so so its exports are visible.
+	uint32_t count = 0;
+	xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
+
+	// `setprop debug.dxr.fdhandoff.env 1` forces the environment route, so both
+	// mechanisms can be exercised on the same build.
+	char force_env[PROP_VALUE_MAX] = {};
+	const bool env_only = __system_property_get("debug.dxr.fdhandoff.env", force_env) > 0 && force_env[0] == '1';
+
+	using adopt_fn = void (*)(int);
+	adopt_fn adopt = env_only ? nullptr
+	                          : reinterpret_cast<adopt_fn>(dlsym(RTLD_DEFAULT, "ipc_client_connection_adopt_fd"));
+	if (adopt == nullptr && !env_only) {
+		// The Khronos loader dlopen()s the runtime .so RTLD_LOCAL, so its
+		// exports are NOT in the global scope. RTLD_NOLOAD gives a handle to
+		// the already-loaded copy without loading it twice — an embedder that
+		// wants the explicit entry has to name the .so this way.
+		void *h = dlopen("openxr_displayxr.so", RTLD_NOLOAD | RTLD_NOW);
+		if (h != nullptr) {
+			adopt = reinterpret_cast<adopt_fn>(dlsym(h, "ipc_client_connection_adopt_fd"));
+			LOGI("HANDOFF: dlopen(RTLD_NOLOAD) got the runtime handle, adopt symbol %s",
+			     adopt != nullptr ? "FOUND" : "missing");
+		} else {
+			LOGI("HANDOFF: dlopen(openxr_displayxr.so, RTLD_NOLOAD) failed: %s", dlerror());
+		}
+	}
+	if (adopt != nullptr) {
+		adopt(g_adopt_fd);
+		LOGW("HANDOFF: published fd %d via ipc_client_connection_adopt_fd() (dlsym route)", g_adopt_fd);
+		return;
+	}
+
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%d", g_adopt_fd);
+	setenv("DXR_IPC_FD", buf, 1);
+	LOGW("HANDOFF: adopt symbol not reachable (loader dlopens the runtime RTLD_LOCAL) — using DXR_IPC_FD=%s", buf);
+}
+
 bool
 xr_create_instance()
 {
@@ -196,6 +273,8 @@ xr_create_instance()
 		init.applicationContext = g_activity;
 		initialize_loader(reinterpret_cast<const XrLoaderInitInfoBaseHeaderKHR *>(&init));
 	}
+
+	publish_adopted_fd();
 
 	const char *extensions[] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
@@ -1151,6 +1230,15 @@ render_frame()
 		g_app.submit_ns_max = dt;
 	}
 
+	// #1056: the headline number for the fd-handoff spike — how long from "this
+	// process was handed a connected socket" to "this process got woven pixels
+	// back", with no Java connect of its own anywhere in between.
+	if (!g_adopt_reported && g_adopt_ns != 0) {
+		g_adopt_reported = true;
+		LOGW("HANDOFF: adopt -> first woven frame = %.1f ms (first submit %.2f ms)",
+		     (double)(now_ns() - g_adopt_ns) / 1e6, (double)dt / 1e6);
+	}
+
 	// The woven buffer arrives on the first submit and again on every
 	// re-allocation (resize). On steady-state frames it is NULL and we reuse it.
 	if (out.weavedTexture != nullptr) {
@@ -1408,6 +1496,58 @@ JNIEXPORT jboolean JNICALL
 Java_com_displayxr_weave_1client_1vk_1android_MainActivity_nativeXrReady(JNIEnv *, jobject)
 {
 	return g_xr_ready ? JNI_TRUE : JNI_FALSE;
+}
+
+/*
+ *
+ * #1056 — the :gpu process's entry points.
+ *
+ * Same native code, same render thread; the ONLY differences are that the
+ * Surface and the runtime socket both arrive from another process and that the
+ * Context we hand the loader is a Service, not an Activity.
+ *
+ */
+
+JNIEXPORT void JNICALL
+Java_com_displayxr_weave_1client_1vk_1android_WeaveGpuService_nativeAdoptAndStart(JNIEnv *env,
+                                                                                 jobject thiz,
+                                                                                 jint fd,
+                                                                                 jobject surface)
+{
+	g_activity = env->NewGlobalRef(thiz);
+
+	// Dup: the Java ParcelFileDescriptor keeps owning what it gave us.
+	g_adopt_fd = fd >= 0 ? dup(fd) : -1;
+	g_adopt_ns = now_ns();
+	LOGW("HANDOFF: :gpu pid %d adopting runtime socket fd %d (dup %d) — no bindService, no "
+	     "org.freedesktop.monado.ipc.* in this process (#1056)",
+	     (int)getpid(), (int)fd, g_adopt_fd);
+
+	pthread_mutex_lock(&g_app.lock);
+	if (g_app.window != nullptr) {
+		ANativeWindow_release(g_app.window);
+	}
+	g_app.window = surface != nullptr ? ANativeWindow_fromSurface(env, surface) : nullptr;
+	g_app.window_changed = true;
+	pthread_mutex_unlock(&g_app.lock);
+
+	pthread_t tid;
+	pthread_create(&tid, nullptr, render_thread, nullptr);
+	pthread_detach(tid);
+}
+
+JNIEXPORT void JNICALL
+Java_com_displayxr_weave_1client_1vk_1android_WeaveGpuService_nativeSetWindowGeometry(
+    JNIEnv *env, jobject thiz, jint x, jint y, jint w, jint h, jint display_id)
+{
+	Java_com_displayxr_weave_1client_1vk_1android_MainActivity_nativeSetWindowGeometry(env, thiz, x, y, w, h,
+	                                                                                  display_id);
+}
+
+JNIEXPORT void JNICALL
+Java_com_displayxr_weave_1client_1vk_1android_WeaveGpuService_nativeOnDestroy(JNIEnv *env, jobject thiz)
+{
+	Java_com_displayxr_weave_1client_1vk_1android_MainActivity_nativeOnDestroy(env, thiz);
 }
 
 } // extern "C"

@@ -34,6 +34,7 @@
 
 
 #include <stdio.h>
+#include <stdlib.h>
 #if !defined(XRT_OS_WINDOWS)
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -60,9 +61,197 @@ DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
 #ifdef XRT_OS_ANDROID
 
+#include <pthread.h>
+
+/*
+ *
+ * #1056: adopting an already-connected socket instead of dialling.
+ *
+ * The normal Android connect is Java: `org.freedesktop.monado.ipc.Client`
+ * (loaded out of the RUNTIME apk with `loadClassFromRuntimeApk`) binds
+ * `MonadoService` over AIDL, makes a socketpair and hands one end to the
+ * service. That needs a `Context`, cross-apk class loading and package
+ * visibility, which is a poor fit for an embedder whose renderer/GPU process is
+ * not the process that owns the app's Java world — Chromium being the motivating
+ * case (`displayxr-browser` on Android, epic #1031).
+ *
+ * So: let a process that ALREADY holds a connected socket end skip the Java path
+ * entirely. The privileged/browser-side process does the Java connect once and
+ * ships the fd down (Mojo `PlatformHandle`, a `ParcelFileDescriptor` over its own
+ * binder, `SCM_RIGHTS`, or the child-launch descriptor table); the adopting
+ * process publishes it with one of:
+ *
+ *   - `ipc_client_connection_adopt_fd(fd)` before `xrCreateInstance` — for an
+ *     embedder that receives the fd at runtime, and
+ *   - `DXR_IPC_FD=<n>` in the environment — for a process that is handed the fd
+ *     in its descriptor table at launch (Chromium's `FileDescriptorInfo` /
+ *     `base::GlobalDescriptors` shape), and for test harnesses.
+ *
+ * The adopted fd is consumed ONCE, by the next connection setup; the caller keeps
+ * ownership of what it passed (we dup, exactly like the Java path does).
+ *
+ * NOT a security boundary: an fd is a capability, and whoever can call this is
+ * already inside the process. Server-side identity is unchanged (see
+ * `ipc_server_peer_creds.c`) — and note SO_PEERCRED on a socketpair reports the
+ * process that CREATED the pair, so an adopted connection is attributed to the
+ * creator, not the adopter (#1056; documented in the extension spec).
+ */
+
+static pthread_mutex_t s_adopt_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int s_adopted_fd = -1;
+
+/*!
+ * Is @p fd something we are willing to talk the IPC protocol over?
+ *
+ * Cheap, local, and deliberately strict: a wrong fd here would otherwise fail
+ * much later as a corrupt protocol stream. We require an open, connected,
+ * AF_UNIX, SOCK_STREAM/SOCK_SEQPACKET socket.
+ */
+static bool
+ipc_client_fd_is_plausible(int fd, const char **out_why)
+{
+	const char *why = NULL;
+	int type = 0;
+	int domain = 0;
+	socklen_t len = 0;
+	struct sockaddr_storage peer;
+	socklen_t peer_len = sizeof(peer);
+
+	if (fd < 0) {
+		why = "negative fd";
+		goto bad;
+	}
+	if (fcntl(fd, F_GETFD) < 0) {
+		why = "not an open descriptor";
+		goto bad;
+	}
+
+	len = sizeof(type);
+	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) {
+		why = "not a socket";
+		goto bad;
+	}
+	if (type != SOCK_STREAM && type != SOCK_SEQPACKET) {
+		why = "socket is not stream/seqpacket";
+		goto bad;
+	}
+
+	len = sizeof(domain);
+	if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &len) == 0 && domain != AF_UNIX) {
+		why = "socket is not AF_UNIX";
+		goto bad;
+	}
+
+	// A socketpair end is "connected" even though it was never bound, so
+	// getpeername() succeeding (with an empty sun_path) is the check that the
+	// peer has not already gone away.
+	if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0) {
+		why = "socket is not connected";
+		goto bad;
+	}
+
+	return true;
+
+bad:
+	if (out_why != NULL) {
+		*out_why = why;
+	}
+	return false;
+}
+
+void
+ipc_client_connection_adopt_fd(int fd)
+{
+	const char *why = NULL;
+
+	if (!ipc_client_fd_is_plausible(fd, &why)) {
+		U_LOG_E("ipc_client_connection_adopt_fd(%d): rejected — %s (#1056).", fd, why);
+		return;
+	}
+
+	// Dup now: the caller owns what it passed, and the value must stay valid
+	// even if the caller closes its copy before xrCreateInstance.
+	int dup_fd = dup(fd);
+	if (dup_fd < 0) {
+		U_LOG_E("ipc_client_connection_adopt_fd(%d): dup failed, errno %d (#1056).", fd, errno);
+		return;
+	}
+	// Never leak the connection into a child of the adopting process.
+	(void)fcntl(dup_fd, F_SETFD, FD_CLOEXEC);
+
+	pthread_mutex_lock(&s_adopt_mutex);
+	int previous = s_adopted_fd;
+	s_adopted_fd = dup_fd;
+	pthread_mutex_unlock(&s_adopt_mutex);
+
+	if (previous >= 0) {
+		U_LOG_W("ipc_client_connection_adopt_fd: replacing a previously adopted fd %d (#1056).", previous);
+		close(previous);
+	}
+	U_LOG_W("ipc_client_connection_adopt_fd: adopted fd %d (dup of %d) — the Java connect will be skipped (#1056).",
+	        dup_fd, fd);
+}
+
+/*!
+ * Take the adopted fd, if there is one, else -1. Consumes it.
+ *
+ * The `DXR_IPC_FD` environment fallback is resolved here rather than at adopt
+ * time so that a process launched with the fd in its descriptor table needs no
+ * code at all before `xrCreateInstance`.
+ */
+static int
+ipc_client_take_adopted_fd(void)
+{
+	pthread_mutex_lock(&s_adopt_mutex);
+	int fd = s_adopted_fd;
+	s_adopted_fd = -1;
+	pthread_mutex_unlock(&s_adopt_mutex);
+
+	if (fd >= 0) {
+		return fd;
+	}
+
+	const char *env = getenv("DXR_IPC_FD");
+	if (env == NULL || env[0] == '\0') {
+		return -1;
+	}
+
+	char *end = NULL;
+	long parsed = strtol(env, &end, 10);
+	if (end == env || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
+		U_LOG_E("DXR_IPC_FD='%s' is not a descriptor number — ignoring (#1056).", env);
+		return -1;
+	}
+
+	const char *why = NULL;
+	if (!ipc_client_fd_is_plausible((int)parsed, &why)) {
+		U_LOG_E("DXR_IPC_FD=%ld: rejected — %s (#1056).", parsed, why);
+		return -1;
+	}
+
+	int dup_fd = dup((int)parsed);
+	if (dup_fd < 0) {
+		U_LOG_E("DXR_IPC_FD=%ld: dup failed, errno %d (#1056).", parsed, errno);
+		return -1;
+	}
+	(void)fcntl(dup_fd, F_SETFD, FD_CLOEXEC);
+	U_LOG_W("DXR_IPC_FD=%ld adopted as fd %d — the Java connect will be skipped (#1056).", parsed, dup_fd);
+	return dup_fd;
+}
+
 static bool
 ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void *context)
 {
+	// #1056: an already-connected socket short-circuits the whole Java path —
+	// no Context, no cross-apk class load, no bindService, no package
+	// visibility. ipc_c->ica stays NULL, which fini already tolerates.
+	int adopted = ipc_client_take_adopted_fd();
+	if (adopted >= 0) {
+		IPC_INFO(ipc_c, "Adopted an already-connected service socket (fd %d) (#1056).", adopted);
+		ipc_c->imc.ipc_handle = adopted;
+		return true;
+	}
+
 	ipc_c->ica = ipc_client_android_create(vm, context);
 
 	if (ipc_c->ica == NULL) {

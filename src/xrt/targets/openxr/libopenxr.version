@@ -98,6 +98,13 @@ OPENXR {
         /* --- u_pacing.h --- */
         u_pa_factory_create;
 
+        /* --- ipc_client_connection.h (Android only; absent elsewhere, which a
+         *     version script tolerates). #1056: lets an embedder whose render
+         *     process has no usable Java world (Chromium's GPU process) adopt a
+         *     service socket connected by another process instead of dialling
+         *     one itself. --- */
+        ipc_client_connection_adopt_fd;
+
     local:
         *;
 };
