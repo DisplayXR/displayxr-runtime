@@ -418,6 +418,10 @@ load_and_probe_one(const struct plugin_entry *e,
 	// Activity when in-process; Service Context when out-of-process (CNSDK only
 	// needs an android.content.Context to bind the on-device tracking service).
 	host.get_android_activity = plugin_host_get_android_activity;
+	// #1037: a Context whose classloader is the runtime APK's, so an
+	// in-process vendor plug-in can resolve vendor Java glue the app does
+	// not ship. Class loading only — see xrt_plugin.h.
+	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -812,6 +816,8 @@ target_plugin_clear_preferred(void)
 
 #include "android/android_globals.h"
 
+#include <jni.h>
+
 #include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>
@@ -860,6 +866,186 @@ plugin_host_get_android_activity(void)
 {
 	void *activity = android_globals_get_activity();
 	return activity != NULL ? activity : android_globals_get_context();
+}
+
+/*
+ * ADR-036 D2 / #1037 — the runtime APK's package name, derived from the
+ * directory the runtime `.so` was loaded from
+ * (`/data/app/~~<h>==/<pkg>-<h>==/lib/<abi>`). Android package names cannot
+ * contain '-', so the path segment up to the first '-' is the package.
+ * Remembered once from discover_active_plugin()'s search root.
+ */
+static char g_runtime_pkg[256] = {0};
+static void *g_class_host_ctx = NULL;
+static bool g_class_host_ctx_tried = false;
+
+static void
+remember_runtime_package_from_lib_dir(const char *lib_dir)
+{
+	if (lib_dir == NULL || g_runtime_pkg[0] != '\0') {
+		return;
+	}
+	/* .../<pkg>-<hash>==/lib/<abi> — the segment just before "/lib/". */
+	const char *lib = strstr(lib_dir, "/lib/");
+	if (lib == NULL) {
+		return;
+	}
+	const char *seg_end = lib;
+	const char *seg_start = seg_end;
+	while (seg_start > lib_dir && seg_start[-1] != '/') {
+		seg_start--;
+	}
+	size_t n = 0;
+	while (seg_start + n < seg_end && seg_start[n] != '-' && n + 1 < sizeof(g_runtime_pkg)) {
+		g_runtime_pkg[n] = seg_start[n];
+		n++;
+	}
+	g_runtime_pkg[n] = '\0';
+	/* Sanity: a package name always has at least one dot. An
+	 * XRT_PLUGIN_SEARCH_PATH override or an unexpected layout lands here
+	 * and simply leaves the slot unavailable. */
+	if (strchr(g_runtime_pkg, '.') == NULL) {
+		g_runtime_pkg[0] = '\0';
+		return;
+	}
+	U_LOG_I("plugin loader: runtime package '%s' (class-host Context source)", g_runtime_pkg);
+}
+
+/*
+ * Read `Context.getPackageName()` off `ctx`. Returns false on any JNI
+ * trouble, leaving `out` untouched.
+ */
+static bool
+context_package_name(JNIEnv *env, jobject ctx, char *out, size_t out_size)
+{
+	jclass cls = (*env)->GetObjectClass(env, ctx);
+	if (cls == NULL) {
+		(*env)->ExceptionClear(env);
+		return false;
+	}
+	jmethodID mid = (*env)->GetMethodID(env, cls, "getPackageName", "()Ljava/lang/String;");
+	if (mid == NULL) {
+		(*env)->ExceptionClear(env);
+		(*env)->DeleteLocalRef(env, cls);
+		return false;
+	}
+	jstring name = (jstring)(*env)->CallObjectMethod(env, ctx, mid);
+	if ((*env)->ExceptionCheck(env)) {
+		(*env)->ExceptionClear(env);
+		name = NULL;
+	}
+	(*env)->DeleteLocalRef(env, cls);
+	if (name == NULL) {
+		return false;
+	}
+	const char *utf = (*env)->GetStringUTFChars(env, name, NULL);
+	bool ok = false;
+	if (utf != NULL) {
+		snprintf(out, out_size, "%s", utf);
+		(*env)->ReleaseStringUTFChars(env, name, utf);
+		ok = true;
+	}
+	(*env)->DeleteLocalRef(env, name);
+	return ok;
+}
+
+/*
+ * Host-iface callback: an Android `Context` whose `getClassLoader()` resolves
+ * classes shipped in the RUNTIME's APK, so a vendor plug-in running in the
+ * APP's process can load vendor Java glue the app does not ship (ADR-025's
+ * requirement, met the ADR-036 D2/D5 way). See the `xrt_plugin.h` docstring
+ * for the full contract — in particular that this is for CLASS LOADING ONLY;
+ * Activity-typed vendor calls keep using @ref plugin_host_get_android_activity.
+ *
+ * Implemented with plain framework JNI —
+ * `Context.createPackageContext(pkg, CONTEXT_INCLUDE_CODE|CONTEXT_IGNORE_SECURITY)`,
+ * the same mechanism `loadClassFromRuntimeApk` (ipc/android/ipc_client_android.cpp)
+ * uses to host `org.freedesktop.monado.ipc.Client`. No runtime Java class is
+ * involved, which matters because in-process there is no runtime Java at all:
+ * only the dlopen'd `.so`.
+ *
+ * Out-of-process (the service) the runtime package IS this process, so the
+ * host Context is returned as-is and no cross-package Context is created.
+ *
+ * The result is a JNI global ref cached for the process lifetime and owned
+ * here; plug-ins must not delete it.
+ */
+static void *
+plugin_host_get_android_class_host_context(void)
+{
+	if (g_class_host_ctx_tried) {
+		return g_class_host_ctx;
+	}
+
+	JavaVM *vm = (JavaVM *)android_globals_get_vm();
+	jobject host = (jobject)plugin_host_get_android_activity();
+	if (vm == NULL || host == NULL || g_runtime_pkg[0] == '\0') {
+		g_class_host_ctx_tried = true;
+		return NULL;
+	}
+
+	JNIEnv *env = NULL;
+	bool attached = false;
+	if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+		if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) {
+			g_class_host_ctx_tried = true;
+			return NULL;
+		}
+		attached = true;
+	}
+
+	jobject out = NULL;
+	char host_pkg[256] = {0};
+	if (context_package_name(env, host, host_pkg, sizeof(host_pkg)) && strcmp(host_pkg, g_runtime_pkg) == 0) {
+		/* Out-of-process: the runtime package is this very process. */
+		out = (*env)->NewGlobalRef(env, host);
+		if (out != NULL) {
+			U_LOG_I("plugin loader: class-host Context is this process ('%s').", g_runtime_pkg);
+		}
+	} else {
+		jclass ctx_cls = (*env)->FindClass(env, "android/content/Context");
+		if (ctx_cls != NULL) {
+			jmethodID mid = (*env)->GetMethodID(env, ctx_cls, "createPackageContext",
+			                                    "(Ljava/lang/String;I)Landroid/content/Context;");
+			if (mid != NULL) {
+				jstring pkg = (*env)->NewStringUTF(env, g_runtime_pkg);
+				/* CONTEXT_INCLUDE_CODE (1) | CONTEXT_IGNORE_SECURITY (2) */
+				jobject local = (*env)->CallObjectMethod(env, host, mid, pkg, 3);
+				if ((*env)->ExceptionCheck(env)) {
+					(*env)->ExceptionDescribe(env);
+					(*env)->ExceptionClear(env);
+					local = NULL;
+				}
+				if (local != NULL) {
+					out = (*env)->NewGlobalRef(env, local);
+					(*env)->DeleteLocalRef(env, local);
+				}
+				if (pkg != NULL) {
+					(*env)->DeleteLocalRef(env, pkg);
+				}
+			} else {
+				(*env)->ExceptionClear(env);
+			}
+			(*env)->DeleteLocalRef(env, ctx_cls);
+		} else {
+			(*env)->ExceptionClear(env);
+		}
+
+		if (out != NULL) {
+			U_LOG_W("plugin loader: class-host Context for '%s' created (ADR-036 D2).", g_runtime_pkg);
+		} else {
+			U_LOG_W("plugin loader: createPackageContext('%s') failed; using app classloader.",
+			        g_runtime_pkg);
+		}
+	}
+
+	if (attached) {
+		(*vm)->DetachCurrentThread(vm);
+	}
+
+	g_class_host_ctx = (void *)out;
+	g_class_host_ctx_tried = true;
+	return g_class_host_ctx;
 }
 
 /*
@@ -1166,6 +1352,10 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// Activity when in-process; Service Context when out-of-process (CNSDK only
 	// needs an android.content.Context to bind the on-device tracking service).
 	host.get_android_activity = plugin_host_get_android_activity;
+	// #1037: a Context whose classloader is the runtime APK's, so an
+	// in-process vendor plug-in can resolve vendor Java glue the app does
+	// not ship. Class loading only — see xrt_plugin.h.
+	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -1250,6 +1440,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	 * loaded-soinfo table before any plug-in dlopen so DT_NEEDED can
 	 * resolve them. See preload_runtime_lib_dir's docstring. */
 	preload_runtime_lib_dir(root);
+
+	/* #1037: the class-host Context handed to plug-ins is created for this
+	 * package — see plugin_host_get_android_class_host_context(). */
+	remember_runtime_package_from_lib_dir(root);
 
 	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
 	for (int i = 0; i < n; i++) {
@@ -1690,6 +1884,10 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// Activity when in-process; Service Context when out-of-process (CNSDK only
 	// needs an android.content.Context to bind the on-device tracking service).
 	host.get_android_activity = plugin_host_get_android_activity;
+	// #1037: a Context whose classloader is the runtime APK's, so an
+	// in-process vendor plug-in can resolve vendor Java glue the app does
+	// not ship. Class loading only — see xrt_plugin.h.
+	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;

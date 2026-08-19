@@ -429,11 +429,58 @@ struct xrt_plugin_host_iface
 	void *(*get_android_activity)(void);
 
 	/*!
+	 * Return an Android `Context` (as a jobject `void *`) whose
+	 * `getClassLoader()` can resolve classes shipped in the **runtime's**
+	 * APK, or NULL when the host cannot provide one.
+	 *
+	 * ADR-036 D2/D5, #1037: with the compositor and the vendor plug-in
+	 * running IN THE APP's process, the vendor SDK's Java glue must still
+	 * come from the runtime — an app must never bundle a vendor AAR
+	 * (ADR-025). A vendor SDK that builds its own `DexClassLoader` takes
+	 * the parent loader from the `Context` it is handed, so a Context made
+	 * with `createPackageContext(<runtime pkg>,
+	 * CONTEXT_INCLUDE_CODE | CONTEXT_IGNORE_SECURITY)` is all it takes for
+	 * the vendor's classes to resolve out of the runtime APK. This mirrors
+	 * how the runtime already hosts `org.freedesktop.monado.ipc.Client`
+	 * (`loadClassFromRuntimeApk`, `ipc/android/ipc_client_android.cpp`).
+	 *
+	 * **Use it ONLY for class loading.** It is a class-hosting Context: it
+	 * still runs under the app's uid, so `getPackageManager()` visibility
+	 * and `bindService()` identity remain the app's, and it is not an
+	 * Activity. Activity-typed vendor calls (orientation limiting,
+	 * permission dialogs) MUST keep using @ref get_android_activity.
+	 *
+	 * Out-of-process (the runtime service) the "runtime package" is the
+	 * calling process itself, so the host returns its own Context and the
+	 * slot is a no-op that costs the plug-in nothing.
+	 *
+	 * The returned reference is a JNI global ref owned by the host and
+	 * cached for the process lifetime; the plug-in MUST NOT delete it.
+	 *
+	 * Carved out of the former `reserved[]` block, exactly as
+	 * @ref get_android_vm was: `struct_size` is unchanged and the slot was
+	 * previously zero-initialized, so older plug-ins are unaffected and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Plug-ins MUST
+	 * NULL-check before calling.
+	 */
+	void *(*get_android_class_host_context)(void);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[12];
+	void *reserved[11];
 };
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::get_android_class_host_context slot, so a plug-in
+ * that must also compile against an older runtime header (which lacks the
+ * field) can `#ifdef`-guard its use — the same coupled-ABI-addition pattern the
+ * display-processor slots use (see `XRT_DP_VK_HAS_WINDOW_SCREEN_RECT`).
+ * #1037 / ADR-036 D2.
+ */
+#define XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT 1
 
 /*!
  * The plug-in's vtable. Filled in by the plug-in inside its
