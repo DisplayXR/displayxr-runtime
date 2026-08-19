@@ -164,6 +164,54 @@ frame 120
 ...
 ```
 
+## Multi-app testing (satellite compositor processes)
+
+Two or more DisplayXR apps weave at the same time on Android because the `outOfProcess`
+runtime hands each client its own **satellite compositor process** — `MonadoServiceSlot0..3`,
+declared with `android:process=":dxr0"` … `":dxr3"`, assigned by a broker in the runtime's main
+process (ADR-036 D3, #1031; mechanism in
+[`service-architecture.md` §7a](../architecture/service-architecture.md)). Nothing needs
+enabling: any out-of-process client gets a satellite, and the fifth concurrent app falls back to
+the single main-process service.
+
+**Build a second copy of the cube** (same source, different `applicationId`, so two clients can
+be installed at once):
+```bash
+./gradlew :src:xrt:targets:openxr_android:assembleOutOfProcessDebug
+./gradlew :test_apps:cube_handle_vk_android:assembleDebug                      # A
+./gradlew :test_apps:cube_handle_vk_android:assembleDebug -PdxrAppIdSuffix=b   # B → ....b
+```
+(The two builds write the same APK path, so copy A aside before building B. On a host with a
+system cJSON — `brew install cjson` — add `-PdxrForceVendoredCjson`; see #496.)
+
+**Run them side by side:**
+```bash
+scripts/android-sidebyside.sh                 # freeform, left = A, right = B
+scripts/android-sidebyside.sh --kill          # tear down apps + satellites first
+scripts/android-sidebyside.sh --no-stage      # let the first app take the relayout bounce
+```
+The script SIGSTOPs each app until its task bounds are final, so no window is resized after its
+OpenXR session is live, and prints one status line per app: task, window frame, satellite pid and
+`:dxrN`, the broker's decision verbatim, whether that satellite is presenting, its content mode,
+and its swapchain surface format.
+
+**Checking slot assignment by hand:**
+```bash
+adb logcat -s dxr-slot-broker            # acquire/release decisions + occupancy
+adb shell ps -A -o PID,NAME | grep :dxr  # one process per live client
+adb shell setprop debug.dxr.slot 2       # dev pin: every client asks for slot 2
+adb shell setprop debug.dxr.slot -1      # back to broker-assigned
+```
+An app can also pin itself with `<meta-data android:name="com.displayxr.satellite_slot"
+android:value="N"/>`. Both are only *preferences* — the broker still decides, so two apps
+pinning the same slot cannot collide.
+
+**Raising the slot count.** `dxrSatelliteSlots` in `src/xrt/ipc/android/build.gradle` (default 4)
+is the single source of truth: it generates the `MonadoServiceSlotN` classes. Add the matching
+`<service android:name=".MonadoServiceSlotN" android:process=":dxrN"/>` entries to that module's
+`AndroidManifest.xml` — `:src:xrt:ipc:checkSatelliteSlotManifest` fails the build if you forget.
+Each extra live satellite costs ~30–60 MB and one GPU context.
+
 ## Troubleshooting
 
 ### Build fails: "No CNSDK AAR found"

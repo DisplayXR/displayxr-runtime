@@ -111,6 +111,24 @@ Roughly 80% of the work — the window-origin feed and DP slot, per-window Kooim
 backlight hygiene, `XR_DXR_weave` on Android, the pixel-exactness rules — is common to
 A and C, which is what makes keeping both cheap.
 
+> **Amendment 1 (2026-08-18) — D3 is realised: N slots + a broker.** The PoC-0 gate
+> (#1032) passed on an NP02J, and the mechanism it proved has been productised
+> (#1031 sub-issue, "satellite compositor process per app"). As built:
+> **`MonadoServiceSlot0..N-1`** (`android:process=":dxrN"`, non-isolated, exported,
+> same FGS type as `MonadoService`), `N = 4` by default and generated from one Gradle
+> constant with a manifest consistency check; assignment is decided by a
+> **`SlotBroker` in the runtime's main process**, reached over a dedicated
+> `ISlotBroker` binder — *not* `IMonado`, whose stub starts a full runtime server in
+> its constructor and would therefore spin up a compositor in a process that owns no
+> window. Policy: a package that already owns a slot keeps it, then a pin
+> (`debug.dxr.slot` / the client's `com.displayxr.satellite_slot` meta-data) if free,
+> then the lowest free slot, then **-1 → the client falls back to the single
+> main-process service**, i.e. the pre-slot single-window behaviour. Ownership is
+> tracked by `linkToDeath` on a client-supplied token, so a crashed app frees its slot;
+> a satellite `stopSelf()`s on `onUnbind` (one client per satellite by construction)
+> and hard-exits after a bounded grace period, because the vendor core-release path can
+> hang (displayxr-leia-plugin#39). The PoC's package-name hash is gone.
+
 ### D4 — The shared-surface path (#967d) is a workspace MODE, never the Android default
 
 The one-surface/one-DP shape is entered **only when a registered workspace controller

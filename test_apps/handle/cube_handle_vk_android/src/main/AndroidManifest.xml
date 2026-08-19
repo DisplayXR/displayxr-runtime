@@ -84,7 +84,18 @@
 
     <application
         android:allowBackup="false"
-        android:label="DisplayXR Cube VK">
+        android:label="${dxrAppLabel}">
+
+        <!--
+            Optional pin for the satellite compositor process (":dxrN" in the
+            out-of-process runtime), injected from build.gradle. -1 (the default)
+            means "no preference" — the runtime's slot broker decides, which is the
+            path that ships. `-PdxrSatelliteSlot=N` pins one for a test that needs a
+            fixed app-to-process pairing.
+        -->
+        <meta-data
+            android:name="com.displayxr.satellite_slot"
+            android:value="${dxrSatelliteSlot}" />
 
         <!--
             ADR-036 D6 / runtime#1033: the runtime samples this window's

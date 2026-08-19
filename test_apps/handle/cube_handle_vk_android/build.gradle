@@ -59,8 +59,29 @@ android {
         prefab true
     }
 
+    // A second, independently-installable copy of this cube, so two DisplayXR clients
+    // can be run side by side — each on its own satellite compositor process (#1031).
+    // `-PdxrAppIdSuffix=b` gives applicationId `...cube_handle_vk_android.b`.
+    //
+    // No slot is pinned by default: the broker assigns them, and testing the default
+    // path is the point. `-PdxrSatelliteSlot=N` pins one when a test needs a fixed
+    // pairing (the runtime treats it as a preference, not a claim).
+    def appIdSuffix = project.findProperty('dxrAppIdSuffix')
+    def satelliteSlot = (project.findProperty('dxrSatelliteSlot') ?: -1) as int
+    println "cube_handle_vk_android: applicationIdSuffix=${appIdSuffix ?: '(none)'} " +
+        "satellite slot=${satelliteSlot < 0 ? 'broker-assigned' : satelliteSlot}"
+
     defaultConfig {
         applicationId 'com.displayxr.cube_handle_vk_android'
+        if (appIdSuffix) {
+            applicationIdSuffix ".${appIdSuffix}"
+        }
+        manifestPlaceholders = [
+            dxrSatelliteSlot: satelliteSlot,
+            dxrAppLabel     : appIdSuffix
+                ? "DisplayXR Cube VK ${appIdSuffix.toString().toUpperCase()}"
+                : 'DisplayXR Cube VK',
+        ]
         minSdkVersion project.sharedMinSdk
         targetSdkVersion project.sharedTargetSdk
         versionCode 1

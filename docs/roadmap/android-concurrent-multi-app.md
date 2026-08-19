@@ -181,6 +181,16 @@ flowchart LR
 
 **C — one compositor process per app (satellite).** K pre-declared `MonadoServiceSlot0..K-1` with `android:process=":dxrN"`; the main runtime service (broker) hands a free slot to each client; each satellite runs **today's OOP code unchanged** for one client (comp_multi + null + one `android_globals` window + one DP + one core). Isolation by process; backlight refcount and multi-client tracking come from the vendor services. Needs the same per-window origin feed as A/B, plus slot brokerage and lifecycle (bound `BIND_IMPORTANT|BIND_ABOVE_CLIENT` → inherits its app's importance; exits on unbind). Cost: ~30–60 MB + one GPU context per app, static slot count.
 
+> **AS BUILT (2026-08-18, #1031).** N = 4 pre-declared slots generated from one Gradle
+> constant (`dxrSatelliteSlots`) with a manifest consistency check; a `SlotBroker` in the
+> runtime's **main** process, on its own `ISlotBroker` binder (binding `IMonado` would start
+> a runtime server in a windowless process), assigns them — same-package reuse, then a pin
+> (`debug.dxr.slot` / `com.displayxr.satellite_slot`), then lowest-free, then -1 and the
+> client falls back to the single main-process service. Slots are freed by `linkToDeath` on
+> a client token; a satellite `stopSelf()`s on `onUnbind` and hard-exits after a 3 s grace
+> period. Device-validated on an NP02J: 4 satellites weaving concurrently, the 5th app
+> falling back. Test vehicle: `scripts/android-sidebyside.sh`.
+
 **(B′) shared-surface workspace overlay (#967d D-4).** Service-owned fullscreen surface, one DP, N clients composited at workspace poses (macOS `render_shared_surface_locked` shape). One runtime-owned window per display — a spatial-desktop overlay, wrong as the default when the OS is the window manager, legitimate as a shell/kiosk *mode*.
 
 ## 8. Pros / cons / risks
