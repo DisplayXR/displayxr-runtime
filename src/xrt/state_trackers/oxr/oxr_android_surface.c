@@ -127,11 +127,29 @@ oxr_android_surface_publish(struct oxr_logger *log,
 		// down instead of presenting into a dead window.
 		android_globals_clear_window();
 	} else {
+		/*
+		 * android_globals_set_window ADOPTS the reference resolve_window
+		 * just took, and drops the one the globals held on whatever it
+		 * replaces (#1040). So exactly one acquire per publish, and the
+		 * globals are the single owner — a second owner here would double-
+		 * release: after a surface-lost the globals still point at the old
+		 * window, and the next publish's internal drop would run on memory
+		 * this file had already freed (SIGSEGV in RefBase::decStrong,
+		 * caught on the NP02J background→resume cycle).
+		 */
 		android_globals_set_window((struct _ANativeWindow *)win);
-		if (binding != NULL && (binding->screenOffsetX != 0 || binding->screenOffsetY != 0)) {
-			// Seed the rect so the very first weave is phase-correct even
-			// before the app's first geometry call. Extent unknown here —
-			// use the window's own buffer size, which is the surface size.
+		/*
+		 * Seed the rect so the very first weave is phase-correct before the
+		 * app's first xrSetAndroidWindowGeometryDXR. ONLY when nothing has
+		 * been published yet: the seed carries no panel extent (the create-
+		 * info has no field for it), and overwriting a good rect with a
+		 * partial one on every republish would silently drop the per-window
+		 * Kooima back to display-scoped for the rest of the session — the
+		 * app de-duplicates its own samples, so it would not re-push an
+		 * unchanged rect to repair it.
+		 */
+		if (binding != NULL && !android_globals_get_window_screen_rect(NULL, NULL, NULL, NULL, NULL,
+		                                                               NULL, NULL, NULL)) {
 			int32_t w = ANativeWindow_getWidth(win);
 			int32_t h = ANativeWindow_getHeight(win);
 			if (w > 0 && h > 0) {
@@ -144,13 +162,13 @@ oxr_android_surface_publish(struct oxr_logger *log,
 	}
 
 	if (sess != NULL) {
-		// Drop the reference the previous publish left us holding. Done
-		// AFTER the new publish so the window can never be freed while the
-		// globals still point at it.
-		if (sess->android_bound_window != NULL && sess->android_bound_window != (void *)win) {
-			ANativeWindow_release((ANativeWindow *)sess->android_bound_window);
+		// Marker, NOT an owned reference (see above) — it records that this
+		// session put a window into the globals, so fini knows to take it
+		// back out. A surface-lost publish leaves it non-NULL on purpose:
+		// the globals still hold a reference on the last real window.
+		if (win != NULL) {
+			sess->android_bound_window = (void *)win;
 		}
-		sess->android_bound_window = (void *)win;
 	}
 
 	return XR_SUCCESS;
@@ -162,7 +180,13 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	if (sess == NULL || sess->android_bound_window == NULL) {
 		return;
 	}
-	ANativeWindow_release((ANativeWindow *)sess->android_bound_window);
+	/*
+	 * Release the globals' reference on our window. Publishing NULL is the
+	 * only way to do it: android_globals_clear_window deliberately KEEPS the
+	 * reference so the stale pointer stays safe to compare against (#1040),
+	 * and set_window(NULL) is what finally drops it.
+	 */
+	android_globals_set_window(NULL);
 	sess->android_bound_window = NULL;
 }
 
