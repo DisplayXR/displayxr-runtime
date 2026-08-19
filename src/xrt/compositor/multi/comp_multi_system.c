@@ -5705,13 +5705,62 @@ update_session_state_locked(struct multi_system_compositor *msc)
 
 #ifdef XRT_OS_ANDROID
 /*!
- * #563: pause/resume the clients' display processors when the published
- * output surface goes away / comes back (Client.java clearAppSurface /
- * passAppSurface, the #528 backgrounding case that does NOT end the
- * session). The panel's switchable 3D backlight is system-global — if the
- * weave just stops, the screen stays in physical 3D over the 2D home
- * screen. Session end/begin and client destroy have their own hooks; this
- * covers the surface-only transition.
+ * #563/#1039: converge every client's display processor onto the visibility of
+ * its output window, once per frame.
+ *
+ * ## The call chain that produces the hidden edge
+ *
+ * ```
+ * MonadoView.surfaceDestroyed              (app process, UI thread)
+ *   -> Client.clearAppSurface              (synchronous binder, by design)
+ *   -> MonadoImpl.clearAppSurface
+ *   -> nativeClearAppSurface -> android_globals_clear_window   (generation++, valid=false)
+ *   -> HERE
+ * ```
+ *
+ * The counterpart edge is `Client.passAppSurface` -> `android_globals_store_window`.
+ * `multi_compositor_{begin,end}_session` drive the same per-client state from the
+ * session side, and the cached-DP re-adopt in `init_session_render` re-pushes it
+ * (#1046).
+ *
+ * ## Why surface validity and NOT Activity onPause
+ *
+ * In multi-window only ONE Activity is top-resumed while BOTH windows are on
+ * screen and weaving, so Activity lifecycle is the wrong signal — and the
+ * runtime deliberately forwards none of it. Surface validity is the right one:
+ * a visible-but-unfocused window keeps its surface (and keeps weaving), and a
+ * multi-window relayout genuinely destroys and recreates the SurfaceView
+ * surface, so the pause it produces is legitimate.
+ *
+ * ## What the DP is being told
+ *
+ * `on_pause` = "this session's window is not visible: stop weaving and RELEASE
+ * your lens preference". It is NOT "force the panel to 2D" — the switchable
+ * lens is display-global, so a window that flattened it on its own way out
+ * would flatten it under a sibling that is still weaving. The vendor arbiter
+ * ORs the per-window votes (on Android, the binder bind-refcount over the
+ * multi-client backlight service), so "last one out turns the light off" —
+ * i.e. #563 — falls out for free. Full contract in `xrt_display_processor.h`.
+ *
+ * ## Convergent, not edge-latched
+ *
+ * The decision is per client and lives in `session_render.dp_visibility`, so a
+ * client whose per-session render came up AFTER the surface was lost still gets
+ * its pause instead of silently holding a lens vote forever. The global
+ * `android_window_valid_state` now only throttles the system-level log line.
+ *
+ * This pass is also the SINGLE WRITER of that state — begin_session /
+ * end_session / init_session_render only move its inputs. They run on IPC
+ * handler threads with `list_and_timing_lock` dropped, and a vendor on_pause is
+ * a binder round-trip of tens of milliseconds, so letting them push directly
+ * raced this pass: a session-end pause landed AFTER a surface-state resume had
+ * recorded VISIBLE, leaving the DP released while the runtime believed it was
+ * asserted — and with no edge left, nothing corrected it (seen on an NP02J).
+ *
+ * Known gap: a window that is fully OCCLUDED but whose surface still exists
+ * produces no edge at all — SurfaceFlinger does not throttle occluded layers
+ * (roadmap §6b), so there is no signal to key on. Such a window keeps weaving
+ * and keeps its vote. Acceptable while N is small; revisit with #1038.
  */
 static void
 android_window_transition_locked(struct multi_system_compositor *msc)
@@ -5721,29 +5770,33 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 	bool valid = false;
 	android_globals_get_window_state(&window, &generation, &valid);
 
-	int state = (valid && window != NULL) ? 1 : 0;
-	if (state == msc->android_window_valid_state) {
-		return;
-	}
-	bool first = msc->android_window_valid_state < 0;
-	msc->android_window_valid_state = state;
-	if (first && state == 1) {
-		return; // startup with a live surface — nothing to resume
+	const bool visible = valid && window != NULL;
+	const int state = visible ? 1 : 0;
+
+	if (state != msc->android_window_valid_state) {
+		msc->android_window_valid_state = state;
+		U_LOG_W("multi[#1039]: output surface %s (generation %llu)", visible ? "published" : "lost",
+		        (unsigned long long)generation);
 	}
 
+	// Push to every client every frame; the per-client helper is a compare
+	// and returns immediately unless THIS client's state actually changed,
+	// so there is no per-frame logging and no repeated vtable call.
+	//
+	// A session's window is visible when the service has a live output
+	// surface AND that session is running: end_session takes the window
+	// away just as surely as surfaceDestroyed does, and folding both into
+	// one convergent decision here is what keeps this the SINGLE writer.
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
-		if (mc == NULL || !mc->session_render.initialized ||
-		    mc->session_render.display_processor == NULL) {
+		if (mc == NULL) {
 			continue;
 		}
-		if (state == 0) {
-			U_LOG_W("multi: output surface lost — pausing DP (backlight to 2D, #563)");
-			xrt_display_processor_on_pause(mc->session_render.display_processor);
-		} else {
-			U_LOG_W("multi: output surface back — resuming DP (#563)");
-			xrt_display_processor_on_resume(mc->session_render.display_processor);
-		}
+		const bool active = mc->state.session_active;
+		multi_compositor_set_window_visible_locked(mc, visible && active,
+		                                           !visible ? "surface lost"
+		                                                    : (active ? "surface live, session active"
+		                                                              : "session not active"));
 	}
 }
 #endif // XRT_OS_ANDROID

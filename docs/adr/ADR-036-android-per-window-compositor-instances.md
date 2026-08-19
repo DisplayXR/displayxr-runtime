@@ -173,6 +173,32 @@ instead.
 the reason this is shaped as a report: the party that owns placement reports geometry;
 the weaver still owns everything phase, including snapping.
 
+### D7 — The panel's 3D lens is a per-window *preference*, aggregated by the vendor
+
+The switchable 3D lens is display-global, but with N windows on one panel no single
+compositor instance may command it. `xrt_display_processor::on_pause` therefore means
+**"this session's window is not visible: stop weaving and RELEASE your lens
+preference"** — never "force the panel to 2D"; `on_resume` re-asserts; `destroy`
+implies `on_pause`. The vendor arbiter ORs the votes, so "last one out turns the light
+off" — [#563](https://github.com/DisplayXR/displayxr-runtime/issues/563) — falls out
+for free. The contract is written into `xrt_display_processor.h` (#1039).
+
+The runtime owns the *when*: visibility is `live output surface AND session active`,
+keyed on surface validity (`MonadoView.surfaceDestroyed` → `Client.clearAppSurface` →
+`android_globals_clear_window`) and NEVER on Activity `onPause` — in multi-window only
+one Activity is top-resumed while both windows weave. It is evaluated per client, once
+per frame, from a single writer in `comp_multi_system::android_window_transition_locked`.
+
+On the Leia/CNSDK stack that vote is literally the binder bind-refcount of
+`BacklightMultiClientControlService`, and `leia_core_enable_3d(false)` on that tier is a
+pure unbind — so no new vendor API is needed there and `debug.dxr.multiapp` (the #151
+interim hold) is deprecated. It IS needed on the legacy single-client tiers, where the
+same call forces a global `MODE_2D`: limitation **L2/L3**, tracked in #1038.
+
+Known gap: a window that is fully *occluded* but whose surface still exists produces no
+signal — SurfaceFlinger does not throttle occluded layers — so it keeps weaving and
+keeps its vote.
+
 ## Alternatives considered
 
 **B — one multi-session service — rejected as the primary.** It is *more* runtime work
