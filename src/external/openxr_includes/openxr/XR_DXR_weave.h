@@ -118,10 +118,34 @@
  * overlay count. Per-overlay depth (2D-under, mid-depth layers) is reserved for
  * a later version; v4 overlays are all at screen depth, "over" the weave.
  *
+ * Platform-neutral handles + explicit window geometry (SPEC_VERSION 7, #1036).
+ * Android has neither an HWND nor an IOSurface, so v7 makes the two things that
+ * were previously platform-implied explicit and portable:
+ *
+ *  - HANDLE KIND. Chain an XrWeaveSubmitHandlesDXR to declare what
+ *    inputTexture / overlayTexture actually are (D3D11 NT, legacy DXGI,
+ *    IOSurface, AHardwareBuffer). PLATFORM_DEFAULT — and omitting the chain
+ *    entirely — keeps every pre-v7 caller byte-for-byte correct.
+ *  - WINDOW GEOMETRY. xrWeaveBindWindow2DXR takes an XrWeaveBindWindowInfoDXR
+ *    with an optional chained XrWeaveWindowGeometryDXR carrying the client
+ *    area's absolute on-screen origin + size + display id. Windows/macOS may
+ *    still bind by handle and let the runtime derive it; Android MUST supply it
+ *    (a SurfaceView's on-screen position is known only to the app, and a pure
+ *    move raises no resize). The runtime forwards it to the DP's per-window
+ *    phase slot (set_window_screen_rect, ADR-036 D6 / #1033).
+ *
+ * Sync on Android is the macOS contract: the caller finishes its GPU writes
+ * before submitting and the submit returns only once the woven output is
+ * GPU-complete (no fence handle, fenceValue is a monotonic counter). An
+ * fd-based (`sync_file`) acquire/release variant is a documented follow-up.
+ *
  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
  * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas; 5 =
- * XrWeaveSubmitInfoDXR::firstChunk (coherent whole-window output, browser#22).
+ * XrWeaveSubmitInfoDXR::firstChunk (coherent whole-window output, browser#22);
+ * 6 = XrWeaveSubmitLayoutDXR N-view worst-case atlas (#774); 7 =
+ * XrWeaveSubmitHandlesDXR handle kinds + xrWeaveBindWindow2DXR /
+ * XrWeaveWindowGeometryDXR explicit window geometry, Android support (#1036).
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -134,16 +158,19 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 6
+#define XR_DXR_weave_SPEC_VERSION 7
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
-// Reserved 1004999190..193. Final values reconcile with the Khronos registry
+// Reserved 1004999190..197. Final values reconcile with the Khronos registry
 // before spec freeze. Allocation registry: README.md in this directory.
 #define XR_TYPE_WEAVE_SUBMIT_INFO_DXR     ((XrStructureType)1004999190)
 #define XR_TYPE_WEAVE_OUTPUT_DXR          ((XrStructureType)1004999191)
 #define XR_TYPE_WEAVE_SUBMIT_RECTS_DXR    ((XrStructureType)1004999192)
 #define XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR ((XrStructureType)1004999193)
 #define XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR   ((XrStructureType)1004999194)
+#define XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR ((XrStructureType)1004999195)
+#define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
+#define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -188,6 +215,59 @@ typedef struct XrWeaveSubmitInfoDXR {
     XrRect2Di                rect;         //!< window-relative sub-rect, device px (y-down)
     XrBool32                 firstChunk;   //!< XR_TRUE = first submit of the frame; clears the woven output to transparent (v5)
 } XrWeaveSubmitInfoDXR;
+
+/*!
+ * @brief Platform kind of the GPU handles carried by a submit (spec v7, #1036).
+ *
+ * The weave service is platform-neutral, but @c inputTexture / @c overlayTexture
+ * are opaque platform handles whose meaning is fixed by the OS. Until spec v7
+ * the kind was implied by the platform (plus the @c inputIsDxgi bit on Windows),
+ * which stopped working once Android joined: an AHardwareBuffer is neither an NT
+ * handle nor an IOSurface, and a caller that is wrong about the kind hands the
+ * runtime a pointer it will dereference. v7 lets the caller SAY what it is
+ * passing so a mismatch is a clean XR_ERROR_VALIDATION_FAILURE, not a crash.
+ *
+ * @c XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR keeps every pre-v7 caller correct
+ * byte-for-byte: the runtime resolves it to the platform's native kind (Windows:
+ * NT handle, or legacy DXGI when @c inputIsDxgi / @c overlayIsDxgi is XR_TRUE;
+ * macOS: IOSurface; Android: AHardwareBuffer).
+ */
+typedef enum XrWeaveHandleKindDXR {
+    //! Resolve from the platform (+ the inputIsDxgi / overlayIsDxgi bit on Windows).
+    XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR = 0,
+    //! Windows: D3D11 NT shared handle (IDXGIKeyedMutex, key 0).
+    XR_WEAVE_HANDLE_KIND_D3D11_NT_DXR = 1,
+    //! Windows: legacy global DXGI shared handle (Low-integrity callers, #743).
+    XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR = 2,
+    //! macOS: IOSurfaceRef (crosses the runtime IPC as a global IOSurfaceID).
+    XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR = 3,
+    //! Android: AHardwareBuffer* (the buffer itself travels over the IPC socket).
+    XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR = 4,
+    XR_WEAVE_HANDLE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrWeaveHandleKindDXR;
+
+/*!
+ * @brief Explicit handle kinds for a submit (spec v7, #1036).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. Purely declarative — it changes no
+ * layout contract, it only names what @c inputTexture and
+ * XrWeaveSubmitOverlaysDXR::overlayTexture ARE, so the runtime can reject a
+ * cross-platform mistake instead of dereferencing it. Omit it (or leave both
+ * fields PLATFORM_DEFAULT) for the pre-v7 behaviour.
+ *
+ * Sync note (v7): Android adopts the macOS contract — the caller completes its
+ * GPU writes into @c inputTexture BEFORE calling xrWeaveSubmitDXR, and the call
+ * RETURNS only once the woven output is GPU-complete (XrWeaveOutputDXR::fence
+ * stays NULL, @c fenceValue is a plain monotonic counter). An fd-based
+ * (`sync_file`) acquire/release variant is a documented follow-up; it is a
+ * latency optimisation, never a correctness requirement.
+ */
+typedef struct XrWeaveSubmitHandlesDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR
+    const void* XR_MAY_ALIAS next;
+    XrWeaveHandleKindDXR     inputKind;   //!< kind of XrWeaveSubmitInfoDXR::inputTexture
+    XrWeaveHandleKindDXR     overlayKind; //!< kind of XrWeaveSubmitOverlaysDXR::overlayTexture
+} XrWeaveSubmitHandlesDXR;
 
 /*!
  * @brief Batched weave submission — N window sub-rects in ONE call (spec v3).
@@ -320,8 +400,67 @@ typedef struct XrWeaveOutputDXR {
     XrBool32           eyesTracking;
 } XrWeaveOutputDXR;
 
+/*!
+ * @brief Explicit on-screen window geometry (spec v7, #1036).
+ *
+ * Chain onto XrWeaveBindWindowInfoDXR::next. The weave phase is locked to
+ * ABSOLUTE SCREEN position, so the runtime has to know where the present-owner's
+ * client area sits on the panel. On Windows it can read that off the HWND
+ * (`GetClientRect` + `ClientToScreen`); on Android there is no such handle — a
+ * SurfaceView's position is known only to the app (`View.getLocationOnScreen()`),
+ * and a pure window MOVE raises no resize, so nothing else in the pipeline can
+ * observe it. v7 therefore lets the caller state the geometry itself.
+ *
+ * The runtime forwards it to the display processor's per-window phase slot
+ * (`set_window_screen_rect`, ADR-036 D6 / runtime#1033), which is what makes the
+ * interlace phase-correct for a window that is not at the panel origin.
+ *
+ *  - @c windowOriginOnScreen is the CLIENT AREA's top-left in absolute physical
+ *    screen pixels of @c displayId (y-down), NOT the window frame's.
+ *  - @c clientSize is the client area in device pixels.
+ *  - @c displayId is the platform display the rect is expressed in (Android
+ *    `Display.getDisplayId()`, 0 = default panel); -1 = unknown / single display.
+ *
+ * Usable on every platform. On Windows and macOS it is OPTIONAL — when absent
+ * the runtime derives the geometry from @c windowHandle exactly as before. On
+ * Android it is REQUIRED (there is nothing to derive it from); a bind with no
+ * geometry chain leaves the DP weaving display-scoped, i.e. phase-correct only
+ * for a full-screen window at the panel origin.
+ *
+ * The caller RE-BINDS (calls xrWeaveBindWindow2DXR again) whenever the window
+ * moves or resizes. It is a handful of integers and the runtime dedupes, so
+ * re-binding every frame from a Choreographer / WM_WINDOWPOSCHANGED callback is
+ * a supported (and on Android the expected) usage.
+ */
+typedef struct XrWeaveWindowGeometryDXR {
+    XrStructureType          type;                //!< XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR
+    const void* XR_MAY_ALIAS next;
+    XrOffset2Di              windowOriginOnScreen; //!< client-area top-left, absolute screen px (y-down)
+    XrExtent2Di              clientSize;           //!< client-area size, device px
+    int32_t                  displayId;            //!< platform display id; -1 = unknown / single display
+} XrWeaveWindowGeometryDXR;
+
+/*!
+ * @brief Window-bind parameters (spec v7, #1036).
+ *
+ * The chainable form of xrWeaveBindWindowDXR, so geometry (and future per-window
+ * state) can be attached without another entry point. @c windowHandle carries the
+ * platform window handle where one exists (HWND on Windows, an opaque id on
+ * macOS) and is NULL on Android, where the app's Surface is its own and the
+ * runtime never touches it — there the chained XrWeaveWindowGeometryDXR carries
+ * everything the runtime needs.
+ */
+typedef struct XrWeaveBindWindowInfoDXR {
+    XrStructureType          type;         //!< XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR
+    const void* XR_MAY_ALIAS next;         //!< chain XrWeaveWindowGeometryDXR here
+    void*                    windowHandle; //!< HWND / platform window id; NULL on Android
+} XrWeaveBindWindowInfoDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
+
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindow2DXR)(
+    XrSession session, const XrWeaveBindWindowInfoDXR* bindInfo);
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSubmitDXR)(
     XrSession session, const XrWeaveSubmitInfoDXR* submitInfo, XrWeaveOutputDXR* output);
@@ -336,6 +475,17 @@ typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowRectDXR)(
 //! the first xrWeaveSubmitDXR; call again if the window handle changes.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveBindWindowDXR(
     XrSession session, void* windowHandle);
+
+//! Bind the present-owner's window with explicit, chainable parameters (spec
+//! v7). Equivalent to xrWeaveBindWindowDXR(session, bindInfo->windowHandle) plus
+//! whatever is chained on @c next — today an XrWeaveWindowGeometryDXR giving the
+//! client area's absolute on-screen origin + size, which the runtime forwards to
+//! the display processor's per-window phase slot. Call again on every window
+//! move / resize. On Android this is the ONLY way to bind (there is no window
+//! handle to derive geometry from). Reports XR_ERROR_FEATURE_UNSUPPORTED on an
+//! in-process session.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveBindWindow2DXR(
+    XrSession session, const XrWeaveBindWindowInfoDXR* bindInfo);
 
 //! Weave one window sub-rect from a pre-weave SBS texture. Synchronous: returns
 //! once the runtime has issued the DP weave into the output texture and signaled
