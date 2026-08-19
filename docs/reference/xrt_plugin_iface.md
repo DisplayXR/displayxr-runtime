@@ -52,7 +52,7 @@ The single C-ABI symbol your plug-in DLL must export. Called once per process at
 | Param | Contract |
 |---|---|
 | `runtime_api_version` | The `XRT_PLUGIN_API_VERSION_*` the runtime speaks. Compare against `XRT_PLUGIN_API_VERSION_CURRENT` from your headers; return `XRT_ERROR_PROBER_NOT_SUPPORTED` if you can't handle the runtime's version. |
-| `host` | Read-only callback table from the runtime. v1 has only the struct-size header + reserved slots; future host-supplied callbacks land in the reserved space. Lifetime: valid for the duration of this call AND for the plug-in's lifetime. **Don't dereference past `host->struct_size`.** |
+| `host` | Read-only callback table from the runtime — struct-size header, then host-supplied callbacks carved out of the reserved space (see [The host iface](#the-host-iface) below). Lifetime: valid for the duration of this call AND for the plug-in's lifetime. **Don't dereference past `host->struct_size`,** and NULL-check every callback. |
 | `out_iface` | You return your vtable here. Storage is plug-in-owned; the runtime treats it as a read-only borrow until `destroy()`. Must remain valid until `destroy()` returns. Set `(*out_iface)->struct_size = sizeof(struct xrt_plugin_iface)` at YOUR compile time so the runtime can forward-version-detect. |
 | `out_plugin_api_version` | The `XRT_PLUGIN_API_VERSION_*` you implement. Runtime compares; mismatch → plug-in skipped with a logged warning. |
 
@@ -60,6 +60,74 @@ The single C-ABI symbol your plug-in DLL must export. Called once per process at
 - `XRT_SUCCESS` → runtime proceeds to call `(*out_iface)->probe()`
 - `XRT_ERROR_PROBER_NOT_SUPPORTED` → clean decline (e.g. version mismatch), runtime logs an info line and skips
 - Other `XRT_ERROR_*` → hard failure, runtime logs a warning and skips
+
+## The host iface
+
+`struct xrt_plugin_host_iface` is the runtime→plug-in direction: things only
+the host can supply. Every slot after the header was **carved out of the
+original `reserved[]` block**, so `struct_size` never grew and no
+`XRT_PLUGIN_API_VERSION_CURRENT` bump was needed — which is exactly why
+**every callback must be NULL-checked** before use. A plug-in loaded by an
+older runtime sees a zeroed slot.
+
+| Slot | Platform | What it is |
+|---|---|---|
+| `struct_size`, `host_api_version` | all | Header. Read-clamp + a structural cross-check of the `runtime_api_version` argument. |
+| `get_android_vm` | Android | The host's `JavaVM *`. A plug-in that statically links `aux_android` gets its own private, never-populated copy of the VM globals, so it MUST come through here rather than calling `android_globals_get_vm()`. |
+| `get_android_activity` | Android | The host's Activity `jobject` when there is one, else the Service `Context` (the out-of-process runtime service has no Activity). Use for anything Activity-typed — orientation limiting, permission dialogs — and as the generic `android.content.Context` for `bindService`. |
+| `get_android_class_host_context` | Android | A `Context` whose `getClassLoader()` can resolve classes shipped in the **runtime's** APK. **Class loading only.** See below. |
+
+### `get_android_class_host_context` (ADR-036 D2, #1037)
+
+```c
+void *(*get_android_class_host_context)(void);   /* jobject, or NULL */
+```
+
+Under [ADR-036 D2](../adr/ADR-036-android-per-window-compositor-instances.md)
+the compositor and the vendor plug-in run **in the app's own process**, and
+[ADR-025](../adr/ADR-025-android-vendor-dp-out-of-process.md)'s requirement still
+stands: the app carries no vendor `.so`, no vendor `<queries>` and **no vendor
+Java glue**. So the glue ships in the runtime APK, and a vendor SDK that builds
+its own `DexClassLoader` has to be pointed at the runtime's classloader —
+which it takes from the `Context` it is handed.
+
+The runtime therefore returns a Context created with
+
+```java
+context.createPackageContext(<runtime pkg>, CONTEXT_INCLUDE_CODE | CONTEXT_IGNORE_SECURITY)
+```
+
+the same mechanism the runtime already uses to host
+`org.freedesktop.monado.ipc.Client` (`loadClassFromRuntimeApk`,
+`src/xrt/ipc/android/ipc_client_android.cpp`). The runtime package is derived
+from the directory the runtime `.so` was loaded from — no runtime Java class is
+involved, which matters because in-process there is no runtime Java at all,
+only the `dlopen`'d `.so`.
+
+**Contract:**
+
+- **Use it ONLY for class loading.** It is a class-*hosting* Context: it still
+  runs under the app's uid, so `getPackageManager()` visibility and
+  `bindService()` identity remain the app's. It is not an Activity.
+- **Activity-typed calls keep using `get_android_activity`.** Orientation
+  limiting, permission dialogs and anything else needing a real Activity must
+  not be routed here.
+- **Out-of-process** (the runtime service) the runtime package *is* the calling
+  process, so the host returns its own Context — the slot costs the plug-in
+  nothing and needs no special-casing on the plug-in side.
+- **NULL is normal** and means "older runtime, or the host could not make one".
+  Fall back to `get_android_activity` (today's behaviour) rather than failing.
+- The returned reference is a **host-owned JNI global ref**, cached for the
+  process lifetime. Don't delete it.
+
+Plug-ins that must also compile against an older runtime header can guard on
+the feature macro, the same coupled-ABI-addition pattern the DP slots use:
+
+```c
+#ifdef XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT
+	vendor_set_class_context_accessor(host->get_android_class_host_context);
+#endif
+```
 
 ## Required vtable methods
 

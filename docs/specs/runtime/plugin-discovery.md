@@ -316,6 +316,15 @@ name.
 | `display_name`, `vendor` | `iface->display_name`, `iface->vendor` (post-negotiate).    |
 | `version`     | Not surfaced in v1 (no install record to compare against).             |
 
+**Host iface on Android.** Beyond discovery, the loader hands each plug-in a
+`struct xrt_plugin_host_iface` carrying the host's `JavaVM`, its
+Activity/Service `Context`, and — since #1037 / ADR-036 D2 — a **class-host
+`Context`** whose `getClassLoader()` resolves classes shipped in the *runtime's*
+APK, so a plug-in running in the **app's** process can load vendor Java glue the
+app does not bundle. The runtime package is derived from the same
+`dladdr`-recovered lib dir used as the discovery root above. Contract:
+[`docs/reference/xrt_plugin_iface.md` § The host iface](../../reference/xrt_plugin_iface.md#the-host-iface).
+
 **Non-goals (v1):**
 
 - Multi-APK discovery: scanning `PackageManager` for separate vendor
