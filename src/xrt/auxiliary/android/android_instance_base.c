@@ -138,10 +138,17 @@ android_instance_base_init(struct android_instance_base *aib,
 	// aib->base.register_surface_callback = base_register_surface_callback;
 	// aib->base.remove_surface_callback = base_remove_surface_callback;
 
+	// A NULL container is NOT an error: android_lifecycle_callbacks_create()
+	// returns NULL when the Context is not an Activity, which is the normal
+	// case for a client hosted in a Service — the runtime's own service, and
+	// (#1056) an embedder whose rendering process is a bound Service rather
+	// than an Activity, such as Chromium's GPU process. Everything downstream
+	// already handles it: base_register_activity_lifecycle_callback() logs
+	// "instance is likely Service" and succeeds. Failing here instead made
+	// xrCreateInstance return XR_ERROR_RUNTIME_FAILURE for every such client.
 	aib->lifecycle_callbacks = android_lifecycle_callbacks_create(&aib->base);
-
 	if (aib->lifecycle_callbacks == NULL) {
-		return XRT_ERROR_ALLOCATION;
+		U_LOG_I("No Activity lifecycle callbacks (Context is not an Activity) — continuing without them.");
 	}
 	return XRT_SUCCESS;
 }
