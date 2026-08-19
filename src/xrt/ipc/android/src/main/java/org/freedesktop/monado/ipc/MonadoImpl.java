@@ -167,6 +167,34 @@ public class MonadoImpl extends IMonado.Stub {
         nativeClearAppSurface();
     }
 
+    /** Last rect forwarded to native, so a repeated Choreographer sample costs nothing. */
+    private int lastRectX = Integer.MIN_VALUE;
+
+    private int lastRectY = Integer.MIN_VALUE;
+    private int lastRectW = -1;
+    private int lastRectH = -1;
+    private int lastRectDisplayId = -1;
+
+    @Override
+    public synchronized void updateWindowRect(int x, int y, int w, int h, int displayId) {
+        if (x == lastRectX
+                && y == lastRectY
+                && w == lastRectW
+                && h == lastRectH
+                && displayId == lastRectDisplayId) {
+            return;
+        }
+        lastRectX = x;
+        lastRectY = y;
+        lastRectW = w;
+        lastRectH = h;
+        lastRectDisplayId = displayId;
+        // WARN-level once per distinct rect (never per frame) — this is the log line
+        // the side-by-side PoC greps to prove each satellite got its own origin.
+        Log.i(TAG, "updateWindowRect: " + x + "," + y + " " + w + "x" + h + " display " + displayId);
+        nativeWindowScreenRect(x, y, w, h, displayId);
+    }
+
     public void shutdown() {
         Log.i(TAG, "shutdown");
         // #558: authoritatively tear down the service-owned overlay before the
@@ -238,6 +266,16 @@ public class MonadoImpl extends IMonado.Stub {
      */
     @SuppressWarnings("JavaJniMissingFunction")
     private native void nativeClearAppSurface();
+
+    /**
+     * Publish the client window's on-screen rect to the service-process globals, where the
+     * per-session compositor picks it up and forwards it to the display processor
+     * (set_window_screen_rect) before each weave. ADR-036 D6 / #1033.
+     *
+     * <p>Implementation in `src/xrt/targets/service-lib/service_target.cpp`.
+     */
+    @SuppressWarnings("JavaJniMissingFunction")
+    private native void nativeWindowScreenRect(int x, int y, int w, int h, int displayId);
 
     /**
      * Native handling of receiving an FD for a new client: the FD should be used to start up the

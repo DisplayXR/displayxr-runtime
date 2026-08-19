@@ -10,6 +10,7 @@
 #include "android_globals.h"
 
 #include <stddef.h>
+#include <stdint.h>
 #include <atomic>
 #include <mutex>
 #include <jni.h>
@@ -156,6 +157,76 @@ android_globals_get_context()
 
 // #558 per-app overlay mode: service-process flag set by MonadoImpl from the
 // connecting client's manifest, read by the vendor DP plug-in.
+/*!
+ * Client window on-screen rect (ADR-036 D6, #1033) — published from the Java
+ * `IMonado.updateWindowRect` binder call (UI-thread Choreographer sample in the
+ * app process) and read from the compositor render thread, hence its own lock.
+ * @ref generation is bumped on every publish so the consumer can skip the
+ * vendor call when nothing moved.
+ */
+static struct
+{
+	std::mutex mutex;
+	int32_t x = 0;
+	int32_t y = 0;
+	uint32_t w = 0;
+	uint32_t h = 0;
+	int32_t display_id = -1;
+	uint64_t generation = 0;
+	bool have = false;
+} android_window_rect;
+
+void
+android_globals_set_window_screen_rect(int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id)
+{
+	std::lock_guard<std::mutex> lock(android_window_rect.mutex);
+	if (android_window_rect.have && android_window_rect.x == x && android_window_rect.y == y &&
+	    android_window_rect.w == w && android_window_rect.h == h &&
+	    android_window_rect.display_id == display_id) {
+		return; // unchanged — don't churn the generation
+	}
+	android_window_rect.x = x;
+	android_window_rect.y = y;
+	android_window_rect.w = w;
+	android_window_rect.h = h;
+	android_window_rect.display_id = display_id;
+	android_window_rect.generation++;
+	android_window_rect.have = true;
+}
+
+bool
+android_globals_get_window_screen_rect(int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h,
+                                       int32_t *out_display_id,
+                                       uint64_t *out_generation)
+{
+	std::lock_guard<std::mutex> lock(android_window_rect.mutex);
+	if (!android_window_rect.have) {
+		return false;
+	}
+	if (out_x != nullptr) {
+		*out_x = android_window_rect.x;
+	}
+	if (out_y != nullptr) {
+		*out_y = android_window_rect.y;
+	}
+	if (out_w != nullptr) {
+		*out_w = android_window_rect.w;
+	}
+	if (out_h != nullptr) {
+		*out_h = android_window_rect.h;
+	}
+	if (out_display_id != nullptr) {
+		*out_display_id = android_window_rect.display_id;
+	}
+	if (out_generation != nullptr) {
+		*out_generation = android_window_rect.generation;
+	}
+	return true;
+}
+
 static std::atomic<bool> android_overlay_mode{false};
 
 void

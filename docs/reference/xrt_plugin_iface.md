@@ -204,6 +204,45 @@ The iface is designed to evolve without breaking older plug-ins:
 3. **Pure-additive struct changes do NOT bump the API version.** Only non-additive layout changes do.
 4. **Optional methods are NULL-safe.** Adding a new optional method is a pure-additive change; old plug-ins return NULL for the new slot, the runtime handles NULL.
 
+## Where the window is: `set_window_screen_rect` (ADR-036 D6)
+
+A compositor instance weaves into **one window**, so the interlacing phase has
+to be referenced to that window's origin on the panel. The Vulkan DP variant
+therefore carries an optional appended slot:
+
+```c
+void (*set_window_screen_rect)(struct xrt_display_processor_vk *xdp,
+                               int32_t x, int32_t y,
+                               uint32_t w, uint32_t h,
+                               int32_t display_id);
+```
+
+- **Units.** The platform's own screen pixels for `display_id` — on Android the
+  *current*-orientation coordinates `View.getLocationOnScreen()` returns. A
+  vendor SDK that rotates into the panel's natural orientation internally (CNSDK
+  does) takes them unchanged. `x`/`y` may be negative.
+- **Composition.** Any per-atlas canvas (zone) offset is *added to* this origin
+  by the DP: `phase = window origin + canvas offset`. It is therefore the base
+  the `set_viewport` / zone rect stacks onto, not a replacement for it.
+- **Cadence.** Sticky; the compositor re-asserts it every frame before
+  `process_atlas`. Cache the last rect and skip the vendor call when unchanged.
+- **Absent slot** (older plug-in `struct_size`) or NULL ⟹ display-scoped weaving,
+  exactly today's behaviour. Never calling it is also legal.
+- **ADR-033 is unchanged.** This *reports geometry*; the weaver still owns all
+  phase, including snapping.
+- Relationship to `set_present_origin` (Linux windowed weaving, #757): this is
+  its platform-neutral successor — the same origin, plus size and display id. A
+  DP implementing both takes whichever arrived most recently as authoritative.
+
+Why it lives on `xrt_display_processor_vk` and not on the base
+`xrt_display_processor`: the variant embeds the base **by value**, so growing the
+base moves every variant slot and would misdispatch calls into an already-built
+VK-variant plug-in — the exact silent break ADR-020 exists to prevent. The base
+*is* the Vulkan interface, so appending to the variant costs no reach, and D3D11
+carries its own placement slot (`xrt_display_processor_d3d11::set_window`,
+#1008). **Appending to the base vtable is no longer ABI-neutral now that a
+variant embeds it.**
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and
