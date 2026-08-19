@@ -1142,15 +1142,18 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 	os_mutex_lock(&mc->weave.mutex);
 	bool ok = false;
 	if (mc->weave.out_ahb != NULL && mc->weave.out_w != 0) {
-		// The send path consumes the reference it is given; the cache keeps its
-		// own (released on resize / teardown).
-		xrt_graphics_buffer_handle_t h = u_graphics_buffer_ref((xrt_graphics_buffer_handle_t)mc->weave.out_ahb);
-		if (xrt_graphics_buffer_is_valid(h)) {
-			*out_handle = h;
-			*out_width = mc->weave.out_w;
-			*out_height = mc->weave.out_h;
-			ok = true;
-		}
+		// Hand out the CACHED handle without taking a reference. The generated
+		// out_handles send path only READS the handle — it never releases it
+		// (proto.py) — and AHardwareBuffer_sendHandleToUnixSocket does not
+		// consume one either; the receiving process gets its own reference from
+		// AHardwareBuffer_recvHandleFromUnixSocket. Adding a reference here
+		// would therefore strand the whole buffer (~15 MB at panel size) on
+		// every re-allocation, since nothing on this side would ever drop it.
+		// Ownership stays with the cache, which releases on resize / teardown.
+		*out_handle = (xrt_graphics_buffer_handle_t)mc->weave.out_ahb;
+		*out_width = mc->weave.out_w;
+		*out_height = mc->weave.out_h;
+		ok = true;
 	}
 	os_mutex_unlock(&mc->weave.mutex);
 	return ok;
