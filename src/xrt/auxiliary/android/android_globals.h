@@ -201,12 +201,16 @@ android_globals_self_declares_overlay(void);
 
 /*!
  * Publish the client window's on-screen rect (physical screen pixels, current
- * orientation, as Android reports it). Bumps a generation so the consumer can
- * cheaply detect a change.
+ * orientation, as Android reports it), together with the PANEL extent in that
+ * same current rotation (@p disp_w x @p disp_h, #1034 — the per-window Kooima
+ * needs the panel frame the rect lives in, and it is NOT derivable from the
+ * runtime's natural-orientation display info). Bumps a generation so the
+ * consumer can cheaply detect a change.
  * @ingroup aux_android
  */
 void
-android_globals_set_window_screen_rect(int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id);
+android_globals_set_window_screen_rect(
+    int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id, uint32_t disp_w, uint32_t disp_h);
 
 /*!
  * Read the last published window rect.
@@ -216,8 +220,14 @@ android_globals_set_window_screen_rect(int32_t x, int32_t y, uint32_t w, uint32_
  * @ingroup aux_android
  */
 bool
-android_globals_get_window_screen_rect(
-    int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h, int32_t *out_display_id, uint64_t *out_generation);
+android_globals_get_window_screen_rect(int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h,
+                                       int32_t *out_display_id,
+                                       uint32_t *out_disp_w,
+                                       uint32_t *out_disp_h,
+                                       uint64_t *out_generation);
 
 /*! @} */
 

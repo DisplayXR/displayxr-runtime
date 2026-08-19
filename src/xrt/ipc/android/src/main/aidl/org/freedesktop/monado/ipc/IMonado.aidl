@@ -57,5 +57,5 @@ interface IMonado {
      * @param h         window height in physical screen pixels
      * @param displayId Display.getDisplayId() the rect is expressed in
      */
-    oneway void updateWindowRect(int x, int y, int w, int h, int displayId);
+    oneway void updateWindowRect(int x, int y, int w, int h, int displayId, int dispW, int dispH);
 }

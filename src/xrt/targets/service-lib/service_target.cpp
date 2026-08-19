@@ -324,7 +324,7 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeClearAppSurface(JNIEnv *env, jo
  */
 extern "C" JNIEXPORT void JNICALL
 Java_org_freedesktop_monado_ipc_MonadoImpl_nativeWindowScreenRect(
-    JNIEnv *env, jobject thiz, jint x, jint y, jint w, jint h, jint display_id)
+    JNIEnv *env, jobject thiz, jint x, jint y, jint w, jint h, jint display_id, jint disp_w, jint disp_h)
 {
 	jni::init(env);
 	jni::Object monadoImpl(thiz);
@@ -333,9 +333,10 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeWindowScreenRect(
 		return;
 	}
 	android_globals_set_window_screen_rect((int32_t)x, (int32_t)y, (uint32_t)w, (uint32_t)h,
-	                                       (int32_t)display_id);
-	U_LOG_I("service: window screen rect %d,%d %dx%d display %d (#1033)", (int)x, (int)y, (int)w, (int)h,
-	        (int)display_id);
+	                                       (int32_t)display_id, (uint32_t)(disp_w > 0 ? disp_w : 0),
+	                                       (uint32_t)(disp_h > 0 ? disp_h : 0));
+	U_LOG_I("service: window screen rect %d,%d %dx%d display %d panel %dx%d (#1033/#1034)", (int)x, (int)y,
+	        (int)w, (int)h, (int)display_id, (int)disp_w, (int)disp_h);
 }
 
 extern "C" JNIEXPORT jint JNICALL

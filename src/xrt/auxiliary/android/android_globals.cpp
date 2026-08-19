@@ -223,17 +223,21 @@ static struct
 	uint32_t w = 0;
 	uint32_t h = 0;
 	int32_t display_id = -1;
+	uint32_t disp_w = 0; //!< panel extent in the CURRENT rotation (#1034)
+	uint32_t disp_h = 0;
 	uint64_t generation = 0;
 	bool have = false;
 } android_window_rect;
 
 void
-android_globals_set_window_screen_rect(int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id)
+android_globals_set_window_screen_rect(
+    int32_t x, int32_t y, uint32_t w, uint32_t h, int32_t display_id, uint32_t disp_w, uint32_t disp_h)
 {
 	std::lock_guard<std::mutex> lock(android_window_rect.mutex);
 	if (android_window_rect.have && android_window_rect.x == x && android_window_rect.y == y &&
 	    android_window_rect.w == w && android_window_rect.h == h &&
-	    android_window_rect.display_id == display_id) {
+	    android_window_rect.display_id == display_id && android_window_rect.disp_w == disp_w &&
+	    android_window_rect.disp_h == disp_h) {
 		return; // unchanged — don't churn the generation
 	}
 	android_window_rect.x = x;
@@ -241,6 +245,8 @@ android_globals_set_window_screen_rect(int32_t x, int32_t y, uint32_t w, uint32_
 	android_window_rect.w = w;
 	android_window_rect.h = h;
 	android_window_rect.display_id = display_id;
+	android_window_rect.disp_w = disp_w;
+	android_window_rect.disp_h = disp_h;
 	android_window_rect.generation++;
 	android_window_rect.have = true;
 }
@@ -251,6 +257,8 @@ android_globals_get_window_screen_rect(int32_t *out_x,
                                        uint32_t *out_w,
                                        uint32_t *out_h,
                                        int32_t *out_display_id,
+                                       uint32_t *out_disp_w,
+                                       uint32_t *out_disp_h,
                                        uint64_t *out_generation)
 {
 	std::lock_guard<std::mutex> lock(android_window_rect.mutex);
@@ -271,6 +279,12 @@ android_globals_get_window_screen_rect(int32_t *out_x,
 	}
 	if (out_display_id != nullptr) {
 		*out_display_id = android_window_rect.display_id;
+	}
+	if (out_disp_w != nullptr) {
+		*out_disp_w = android_window_rect.disp_w;
+	}
+	if (out_disp_h != nullptr) {
+		*out_disp_h = android_window_rect.disp_h;
 	}
 	if (out_generation != nullptr) {
 		*out_generation = android_window_rect.generation;

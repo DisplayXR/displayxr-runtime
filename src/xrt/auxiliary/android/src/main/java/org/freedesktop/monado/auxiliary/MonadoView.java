@@ -12,6 +12,7 @@ package org.freedesktop.monado.auxiliary;
 import android.app.Activity;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.graphics.Point;
 import android.graphics.Region;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
@@ -66,8 +67,10 @@ public class MonadoView extends SurfaceView
          * @param w view width in physical screen pixels
          * @param h view height in physical screen pixels
          * @param displayId {@code Display.getDisplayId()} the rect is expressed in
+         * @param dispW display width in physical screen pixels, CURRENT rotation (#1034)
+         * @param dispH display height in physical screen pixels, CURRENT rotation (#1034)
          */
-        void onWindowRectChanged(int x, int y, int w, int h, int displayId);
+        void onWindowRectChanged(int x, int y, int w, int h, int displayId, int dispW, int dispH);
     }
 
     @Nullable private SurfaceStateListener surfaceStateListener = null;
@@ -178,6 +181,8 @@ public class MonadoView extends SurfaceView
     private int lastRectW = -1;
     private int lastRectH = -1;
     private int lastRectDisplayId = -1;
+    private int lastRectDispW = -1;
+    private int lastRectDispH = -1;
     private boolean windowRectPollRunning = false;
     @Nullable private Choreographer.FrameCallback windowRectCallback = null;
 
@@ -246,15 +251,32 @@ public class MonadoView extends SurfaceView
         int x = locationOnScreen[0];
         int y = locationOnScreen[1];
         int displayId = 0;
+        int dispW = 0;
+        int dispH = 0;
         Display display = getDisplay();
         if (display != null) {
             displayId = display.getDisplayId();
+            // #1034: the panel extent in the CURRENT rotation, which is the frame the
+            // rect above is expressed in. The per-window Kooima needs it to place the
+            // window centre relative to the panel centre, and it cannot be derived from
+            // the runtime's display info: that is the NATURAL-orientation panel (this
+            // device is natively portrait 1600x2560 and runs landscape 2560x1600), and a
+            // sub-panel window fits inside BOTH orderings, so "which way is the panel
+            // held" is genuinely ambiguous without asking Android. getRealSize is
+            // deprecated but is the only call that gives the raw panel extent (not the
+            // app bounds) on every API level we ship to.
+            Point real = new Point();
+            display.getRealSize(real);
+            dispW = real.x;
+            dispH = real.y;
         }
         if (x == lastRectX
                 && y == lastRectY
                 && w == lastRectW
                 && h == lastRectH
-                && displayId == lastRectDisplayId) {
+                && displayId == lastRectDisplayId
+                && dispW == lastRectDispW
+                && dispH == lastRectDispH) {
             return;
         }
         lastRectX = x;
@@ -262,10 +284,27 @@ public class MonadoView extends SurfaceView
         lastRectW = w;
         lastRectH = h;
         lastRectDisplayId = displayId;
-        Log.i(TAG, "windowRect: " + x + "," + y + " " + w + "x" + h + " display " + displayId);
+        lastRectDispW = dispW;
+        lastRectDispH = dispH;
+        Log.i(
+                TAG,
+                "windowRect: "
+                        + x
+                        + ","
+                        + y
+                        + " "
+                        + w
+                        + "x"
+                        + h
+                        + " display "
+                        + displayId
+                        + " panel "
+                        + dispW
+                        + "x"
+                        + dispH);
         SurfaceStateListener listener = surfaceStateListener;
         if (listener != null) {
-            listener.onWindowRectChanged(x, y, w, h, displayId);
+            listener.onWindowRectChanged(x, y, w, h, displayId, dispW, dispH);
         }
     }
 

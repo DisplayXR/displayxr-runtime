@@ -2143,6 +2143,63 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 }
 
 bool
+multi_compositor_get_window_screen_rect(struct multi_compositor *mc,
+                                        int32_t *out_x,
+                                        int32_t *out_y,
+                                        uint32_t *out_w,
+                                        uint32_t *out_h,
+                                        uint32_t *out_disp_w,
+                                        uint32_t *out_disp_h)
+{
+#ifdef XRT_OS_ANDROID
+	if (mc == NULL || !mc->session_render.initialized) {
+		return false;
+	}
+	// Filled by update_window_screen_rect() on the per-session render thread from
+	// the client's Choreographer samples (#1033). Generation 0 = the client has
+	// never reported, and a zero panel extent means an older client that predates
+	// the #1034 field — both keep the caller display-scoped.
+	if (mc->session_render.window_rect_generation == 0 || mc->session_render.window_screen_w == 0 ||
+	    mc->session_render.window_screen_h == 0 || mc->session_render.window_screen_disp_w == 0 ||
+	    mc->session_render.window_screen_disp_h == 0) {
+		return false;
+	}
+	// Plain int reads against the render thread's plain int writes: a torn read
+	// costs at most one frame of a stale/mixed rect during a drag, which the next
+	// locate corrects. Deliberately no lock on the per-frame locate path — the
+	// same trade the DP feed already makes.
+	if (out_x != NULL) {
+		*out_x = mc->session_render.window_screen_x;
+	}
+	if (out_y != NULL) {
+		*out_y = mc->session_render.window_screen_y;
+	}
+	if (out_w != NULL) {
+		*out_w = mc->session_render.window_screen_w;
+	}
+	if (out_h != NULL) {
+		*out_h = mc->session_render.window_screen_h;
+	}
+	if (out_disp_w != NULL) {
+		*out_disp_w = mc->session_render.window_screen_disp_w;
+	}
+	if (out_disp_h != NULL) {
+		*out_disp_h = mc->session_render.window_screen_disp_h;
+	}
+	return true;
+#else
+	(void)mc;
+	(void)out_x;
+	(void)out_y;
+	(void)out_w;
+	(void)out_h;
+	(void)out_disp_w;
+	(void)out_disp_h;
+	return false;
+#endif
+}
+
+bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d)
 {
 	if (mc == NULL || !mc->session_render.initialized) {
