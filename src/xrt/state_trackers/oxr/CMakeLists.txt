@@ -21,6 +21,7 @@ add_library(
 	oxr_api_verify.h
 	oxr_api_xdev.c
 	oxr_binding.c
+	oxr_android_surface.c
 	oxr_capture.c
 	oxr_conformance.c
 	oxr_chain.h

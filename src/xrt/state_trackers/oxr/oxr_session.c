@@ -3248,6 +3248,13 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
 
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	// Drop the reference XR_DXR_android_surface_binding took on the app's
+	// window. AFTER the compositor teardown above, which is what still had a
+	// VkSurfaceKHR built from it. The app keeps owning the Surface itself.
+	oxr_android_surface_session_fini(sess);
+#endif
+
 	free(sess);
 
 	return ret;
@@ -3993,6 +4000,33 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#if defined(OXR_HAVE_DXR_android_surface_binding)
+	// XR_DXR_android_surface_binding (#1037, ADR-036 D2): the app hands us its
+	// OWN Surface. Resolve it here (upstream, where xsi is still mutable) and
+	// publish it through android_globals, which is the same channel the
+	// vk_native target polls per frame to (re)build its VkSurfaceKHR. The
+	// window then flows to the compositor as xsi.external_window_handle, so
+	// oxr_session_gfx_vk_native's runtime-spawned-SurfaceView branch is skipped
+	// and stays what it now is: the `_hosted` fullscreen fallback.
+	//
+	// The reference taken here is adopted by the session below
+	// (sess->android_bound_window) — assigned after oxr_session_create_impl so
+	// the create path can't leak it on an early error, because the release is
+	// keyed on the session existing.
+	void *android_bound_window = NULL;
+	const XrAndroidSurfaceBindingCreateInfoDXR *android_binding = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR, XrAndroidSurfaceBindingCreateInfoDXR);
+	if (android_binding != NULL) {
+		oxr_android_surface_publish(log, NULL, android_binding, &android_bound_window);
+		if (android_bound_window != NULL) {
+			xsi.external_window_handle = android_bound_window;
+		}
+		if (android_binding->transparentBackgroundEnabled) {
+			xsi.transparent_background_enabled = true;
+		}
+	}
+#endif
+
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
@@ -4053,6 +4087,12 @@ oxr_session_create(struct oxr_logger *log,
 	// Track whether this session has an external window handle, offscreen readback, or shared texture
 	sess->has_external_window =
 	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
+
+#if defined(OXR_HAVE_DXR_android_surface_binding)
+	// Adopt the ANativeWindow reference the binding parse took, so session
+	// destroy (and every later xrSetAndroidSurfaceDXR) releases exactly one.
+	sess->android_bound_window = android_bound_window;
+#endif
 	sess->is_bridge_relay = xsi.is_bridge_relay;
 
 #ifdef OXR_HAVE_DXR_display_info

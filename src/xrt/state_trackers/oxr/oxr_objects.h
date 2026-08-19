@@ -1373,6 +1373,38 @@ void
 oxr_mcp_app_tools_session_destroy(struct oxr_session *sess);
 #endif // OXR_HAVE_DXR_mcp_tools
 
+#ifdef OXR_HAVE_DXR_android_surface_binding
+/*!
+ * @name XR_DXR_android_surface_binding internals (oxr_android_surface.c)
+ * @{
+ */
+
+/*!
+ * Publish (or, with a NULL/empty binding, drop) the app-provided Android
+ * Surface. Takes the runtime's OWN `ANativeWindow_acquire()` reference,
+ * releases the one the previous publish left on @p sess, and pushes the window
+ * into `android_globals` — the channel the vk_native compositor target already
+ * polls per frame to (re)build its VkSurfaceKHR (#507/#528).
+ *
+ * @p sess may be NULL during xrCreateSession, before the session object owns
+ * anything; @p out_window then receives the referenced window so the caller can
+ * hand it to the compositor and adopt the reference itself.
+ */
+XrResult
+oxr_android_surface_publish(struct oxr_logger *log,
+                            struct oxr_session *sess,
+                            const XrAndroidSurfaceBindingCreateInfoDXR *binding,
+                            void **out_window);
+
+/*!
+ * Release the session's outstanding ANativeWindow reference. Session destroy.
+ */
+void
+oxr_android_surface_session_fini(struct oxr_session *sess);
+
+/*! @} */
+#endif // OXR_HAVE_DXR_android_surface_binding
+
 #ifdef OXR_HAVE_FB_display_refresh_rate
 XrResult
 oxr_event_push_XrEventDataDisplayRefreshRateChangedFB(struct oxr_logger *log,
@@ -2361,6 +2393,16 @@ struct oxr_session
 
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
+
+#ifdef XRT_OS_ANDROID
+	//! The ANativeWindow this session currently holds a reference on, from
+	//! XR_DXR_android_surface_binding (#1037). Exactly one
+	//! `ANativeWindow_release()` is owed on it; replaced on every
+	//! xrSetAndroidSurfaceDXR and dropped at session destroy. NULL when the
+	//! app chained no binding (the runtime-spawned `_hosted` SurfaceView owns
+	//! its own window instead).
+	void *android_bound_window;
+#endif
 
 	//! True if this is a headless bridge-relay session (XR_DXR_display_info +
 	//! XR_MND_headless). The bridge forwards raw DP-tracked eye positions to

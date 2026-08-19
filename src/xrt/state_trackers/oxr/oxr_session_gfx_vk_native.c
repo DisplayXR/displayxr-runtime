@@ -189,6 +189,7 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 #endif
 
 #ifdef XRT_OS_ANDROID
+#include <android/looper.h>
 #include "android/android_custom_surface.h"
 #include "android/android_globals.h"
 #endif
@@ -271,11 +272,35 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	}
 
 #ifdef XRT_OS_ANDROID
-	// POC plumbing for XR_DXR_android_surface_binding. Apps don't pass an
-	// ANativeWindow* yet, so spawn a SurfaceView on the activity via
-	// android_custom_surface (existing Monado machinery) and block briefly
-	// for its ANativeWindow. Leaks the handle for now — process scope,
-	// single-app POC.
+	/*
+	 * Vendor display processors are created below, on THIS thread, and some
+	 * vendor SDKs post their async init to the calling thread's Looper — with
+	 * no Looper the init tears down immediately and the DP never comes up
+	 * (#510 M2). `native_app_glue`'s android_main thread and a Java UI thread
+	 * both have one; a bare pthread render thread (the engine shape) does not.
+	 * In-process the runtime has no hook on the app's main thread to marshal
+	 * onto (that hook, android_main_thread_dispatch_init(), is installed by the
+	 * SERVICE's own JNI entry point), so name the condition instead of hanging.
+	 */
+	if (ALooper_forThread() == NULL) {
+		U_LOG_W("Android: xrCreateSession is running on a thread with NO ALooper. A vendor display "
+		        "processor whose init posts to the calling thread's Looper will not come up. Call "
+		        "xrCreateSession from your Activity's main thread or from native_app_glue's "
+		        "android_main thread.");
+	}
+
+	/*
+	 * No XR_DXR_android_surface_binding chained ⟹ the `_hosted` fallback:
+	 * spawn a SurfaceView on the activity via android_custom_surface and block
+	 * briefly for its ANativeWindow.
+	 *
+	 * FULLSCREEN ONLY. This view is added straight to the WindowManager, so it
+	 * has no ViewParent — and SurfaceView.onAttachedToWindow dereferences one on
+	 * the freeform/translucent path, so the app dies with
+	 * `NullPointerException … ViewParent.requestTransparentRegion` the moment
+	 * the task lands in a multi-window container. An app that wants multi-window
+	 * owns its own SurfaceView and chains the binding (#1037, ADR-036 D2).
+	 */
 	if (window_handle == NULL) {
 		struct _JavaVM *vm = (struct _JavaVM *)android_globals_get_vm();
 		void *activity = android_globals_get_activity();
@@ -308,6 +333,16 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 		window_handle = (void *)win;
 		U_LOG_IFL_I(U_LOGGING_INFO,
 		            "Android: ANativeWindow %p obtained via android_custom_surface", (void *)win);
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	else {
+		// App-provided Surface (XR_DXR_android_surface_binding). The window is
+		// already published in android_globals by the session-create parse, and
+		// the session owns the reference — nothing to acquire or leak here.
+		U_LOG_IFL_I(U_LOGGING_INFO, "Android: using the APP-provided ANativeWindow %p (#1037)",
+		            window_handle);
 	}
 #endif
 
