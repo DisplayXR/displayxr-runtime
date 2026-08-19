@@ -164,8 +164,12 @@ dxr_present_alpha_mode(void)
  * harness). DXR_WEAVE_LATENCY_CSV=<prefix> writes <prefix>.vknative.csv with
  * the same row shapes the shared parser understands:
  *   H,qpc_freq
- *   F,seq,qpc_weave,qpc_present_ret,present_id
+ *   F,seq,qpc_weave,qpc_present_ret,present_id,repaint
  *   S,present_id,0,0,scanout_qpc,qpc_now
+ * The trailing F field marks a repaint (re-weave of an unchanged atlas, #868)
+ * so the two present populations can be counted apart — same shape as the
+ * D3D11/D3D12 sites; dropping it here made every capped-app VK run read as
+ * one mixed population (#1048). Older readers ignore the extra column.
  * Scanout truth comes from VK_KHR_present_wait: each present is tagged with a
  * VkPresentIdKHR and a waiter thread timestamps vkWaitForPresentKHR(id)
  * returning — the moment the frame is on glass. Requires the app to have
@@ -216,6 +220,11 @@ struct wl_harness
 {
 	FILE *f = nullptr;
 	uint64_t pending_weave_qpc = 0;
+	//! #1048: whether the pending weave is a repaint (re-weave of an unchanged
+	//! atlas, #868). Set at the mark alongside pending_weave_qpc, consumed by
+	//! the F-row write — the D3D11/D3D12 sites already tag this; dropping it
+	//! here made every capped-app VK run read as one mixed population.
+	bool pending_repaint = false;
 	std::thread waiter;
 	std::mutex mtx;
 	std::condition_variable cv;
@@ -1912,6 +1921,7 @@ comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target)
 	struct wl_harness *wl = wl_get(target);
 	if (wl != nullptr) {
 		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+		wl->pending_repaint = true; // #1048: this weave is a repaint — tag its F row
 	}
 	// #912/#868 interplay: this repaint's present will release a bridge
 	// waitable token nobody waits for; the app's next acquire drains it.
@@ -2054,6 +2064,7 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
 	struct wl_harness *wl = wl_get(target);
 	if (wl != nullptr) {
 		wl->pending_weave_qpc = (uint64_t)now.QuadPart;
+		wl->pending_repaint = false; // #1048: an app frame, not a repaint
 	}
 #else
 	(void)target;
@@ -2474,10 +2485,16 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 			{
 				std::lock_guard<std::mutex> lock(wl->mtx);
 				if (wl->pending_weave_qpc != 0) {
-					fprintf(wl->f, "F,%llu,%llu,%llu,%llu\n", (unsigned long long)wl_id,
+					// #1048: trailing repaint field, same F-row shape as the
+					// D3D11/D3D12 sites (F,seq,qpc_weave,qpc_present_ret,
+					// present_count,repaint) so the offline parser can count
+					// the two present populations apart.
+					fprintf(wl->f, "F,%llu,%llu,%llu,%llu,%d\n", (unsigned long long)wl_id,
 					        (unsigned long long)wl->pending_weave_qpc,
-					        (unsigned long long)now.QuadPart, (unsigned long long)wl_id);
+					        (unsigned long long)now.QuadPart, (unsigned long long)wl_id,
+					        wl->pending_repaint ? 1 : 0);
 					wl->pending_weave_qpc = 0;
+					wl->pending_repaint = false;
 				}
 				wl->ids.push_back(wl_id);
 			}
