@@ -93,6 +93,47 @@ vendor `.so`s or vendor glue — but D5 below satisfies that requirement without
 the compositor out of the app. ADR-025 carries an amendment note pointing here; its
 history is not rewritten.
 
+> **Amendment 1 (2026-08-18) — the spike ran; the Java-glue half is real (#1037).**
+> Architecture A was exercised end-to-end on an NP02J: a cube with **zero `com.leia.*`
+> classes, zero vendor `.so` and zero vendor package names in its APK** weaved through
+> the Leia DP **in its own process**. The mechanism that made it possible is now on
+> `main`:
+>
+> - **`xrt_plugin_host_iface::get_android_class_host_context`** — an Android `Context`
+>   whose `getClassLoader()` resolves classes shipped in the *runtime's* APK, carved
+>   out of `reserved[]` (no ABI bump, ADR-020) and implemented in
+>   `target_plugin_loader.c` with `createPackageContext(<runtime pkg>,
+>   CONTEXT_INCLUDE_CODE|CONTEXT_IGNORE_SECURITY)`, mirroring how the runtime already
+>   hosts `org.freedesktop.monado.ipc.Client`. Class loading only: Activity-typed
+>   vendor calls keep using `get_android_activity`. Contract:
+>   [`docs/reference/xrt_plugin_iface.md`](../reference/xrt_plugin_iface.md#the-host-iface).
+> - **The `inProcess` runtime flavor now carries the vendor Java-glue AAR** the way
+>   `outOfProcess` already did — still gated on `cnsdk.dir`, so default/CI builds stay
+>   vendor-free per ADR-019.
+>
+> Root cause confirmed in vendor source: the core loader builds its `DexClassLoader`
+> with `context.getClassLoader()` as the parent, so **the Context is the sole injection
+> point** — nothing else had to move.
+>
+> Two spike findings that change the plan rather than the decision:
+>
+> - **Main-thread DP creation is not a blocker.** Measured in-process, DP creation ran
+>   on the `native_app_glue` `android_main` thread (≠ the process main thread) and the
+>   vendor core initialised fine. The real requirement is "the calling thread has a
+>   prepared `ALooper` that is pumped afterwards". The genuine gap is an app that calls
+>   `xrCreateSession` on a bare pthread render thread (the engine shape).
+> - **Multi-window A is blocked on the runtime-spawned SurfaceView.** Staging two apps
+>   side by side crashed with `NullPointerException` in
+>   `SurfaceView.onAttachedToWindow` → `MonadoView.onAttachedToWindow`: the view is
+>   added straight to the `WindowManager`, so it has no `ViewParent` to
+>   `requestTransparentRegion` on. This is exactly why a real
+>   `XR_DXR_android_surface_binding` (app-provided `ANativeWindow`) has to land and the
+>   runtime-spawned SurfaceView demoted to the `_hosted` fallback. Tracked in #1037.
+>
+> Still open in-process, unchanged by this amendment: the window-rect feed for
+> `comp_vk_native` (the D6 contract in-process), and a `comp_vk_native` audit for
+> per-process statics.
+
 ### D3 — Satellite-per-app (Architecture C) is the sanctioned out-of-process deployment
 
 Architecture C is *the same abstraction*, with the process boundary one step out: K
@@ -170,6 +211,30 @@ classloader, the way the runtime already hosts `org.freedesktop.monado.ipc.Clien
 This requires a vendor manifest change (external dependency L7 below) and one on-device
 verification: that an explicit-component `bindService` still succeeds after
 intent-query visibility.
+
+> **Amendment 1 (2026-08-18) — verified on a retail device (#1037).** The
+> intent-action form works, and the verification D5 asked for passed.
+>
+> - **Correction to the premise:** an app was never expected to hand-write the vendor
+>   `<queries>` in the first place — the *vendor AAR's own manifest* declares
+>   `<queries><package …/></queries>` and the manifest merger injects them into every
+>   app that links it. ADR-025's coupling is **transitive from the vendor AAR**, which
+>   is why hosting the glue in the runtime APK (D2 Amendment 1) removes it at the root.
+> - Stripping the vendor `<package>` entries while keeping the AAR classes reproduced
+>   ADR-025's abort exactly: `PackageManager$NameNotFoundException` inside
+>   `GetPackageInfo` → `Runtime aborting`.
+> - With **zero vendor package names** in the shipped binary manifest (confirmed with
+>   `aapt2 dump xmltree`) and only a `<queries><intent><action …/></queries>`,
+>   everything worked: `getPackageInfo` succeeded, the core initialised, head tracking
+>   connected, and — the verification this decision called for — **an
+>   explicit-component `bindService` to the backlight service still succeeded after
+>   intent-query visibility**. The vendor services are `SYSTEM` but
+>   `forceQueryable=false` and the app was `targetSdk=31`, so visibility genuinely
+>   applied; the result is not an artefact.
+>
+> What remains is only the **action string**: today's filters are vendor-named, so L7
+> (the `org.displayxr.action.VENDOR_DISPLAY_SERVICE` filter) is still the ask, and the
+> `displayxr` AAR that carries the single `<queries><intent>` ships once L7 lands.
 
 ### D6 — Window origin is a contract; phase stays the weaver's
 
@@ -288,7 +353,7 @@ Tracked runtime-side in **#1038**; anchors in report §11.
 |---|---|---|
 | **L1** | Head-tracking **config** (orientation, tracked eyes, IPD, face count, fps, log level) is service-global, last-writer-wins — per-client scoping or aggregation, the way start/fps already aggregate. Runtime-side mitigation: never write config. | A and C (N cores) |
 | **L2** | The backlight multi-client service is a **binary bind-refcount** — a bound client cannot express "I am 2D right now". Add a per-client preference + OR-refcount + admin force-2D; the Windows SDK's switchable-hint protocol ports directly. | mixed 2D/3D windows |
-| **L7** | Vendor services are discoverable **only by package name** — add the `org.displayxr.action.VENDOR_DISPLAY_SERVICE` intent filter to the head-tracking and display-config service manifests. | **D5 / Architecture A** |
+| **L7** | Vendor services are discoverable **only by package name** — add the `org.displayxr.action.VENDOR_DISPLAY_SERVICE` intent filter to the head-tracking and display-config service manifests. **Mechanism proven on device (D5 Amendment 1, #1037); only the action string waits on the vendor.** | **D5 / Architecture A** |
 
 ## References
 

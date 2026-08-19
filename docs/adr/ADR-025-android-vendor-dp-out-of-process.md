@@ -33,6 +33,21 @@ date: 2026-06-09
 > manifest convention stalls. Nothing below is rewritten — it is the record of why the
 > service split was chosen in 2026-06 and why it remains correct wherever D5's
 > convention is unavailable.
+>
+> **Amendment (2026-08-18) — the vendor `<queries>` were never the app author's, and
+> the Java glue is now the runtime's (#1037).** Two spike results sharpen the above.
+> First, an app does not hand-write vendor `<queries>`: the **vendor AAR's own
+> manifest** declares them and the manifest merger injects them, so this ADR's coupling
+> is *transitive from the AAR* — remove the AAR from the app and the coupling goes with
+> it. Second, that removal is now implemented: the plug-in loader hands a vendor plug-in
+> an Android `Context` whose `getClassLoader()` is the **runtime APK's**
+> (`xrt_plugin_host_iface::get_android_class_host_context`, ADR-036 D2), so vendor Java
+> glue resolves out of the runtime even when the plug-in runs in the app's process —
+> the way the runtime already hosts `org.freedesktop.monado.ipc.Client`. Demonstrated
+> on hardware with an app APK carrying **no vendor classes, no vendor `.so` and no
+> vendor package names**. In other words: **in-process no longer requires vendor
+> classes in the app**, and this ADR's isolation requirement is met without the service
+> split.
 
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) establishes the vendor-isolation
 principle: vendor display processors ship as plug-ins behind a
