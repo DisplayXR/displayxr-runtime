@@ -2438,6 +2438,13 @@ struct oxr_session
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
 
+	//! #1041: the content mode this session was in when xrEndSession dropped
+	//! the panel to 2D, so a later xrBeginSession on the SAME session can put
+	//! it back instead of silently coming up flat. Only meaningful while
+	//! @ref has_ended_rendering_mode is true; cleared once consumed.
+	uint32_t ended_rendering_mode_index;
+	bool has_ended_rendering_mode;
+
 	//! Last recommended per-view render size polled at frame end (#439
 	//! Phase 3 Q4): 0 = no sample yet (baseline set without firing), else
 	//! edge detection pushes XrEventDataLocal3DZoneViewSizeChangedDXR.
