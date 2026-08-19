@@ -7,7 +7,7 @@
 >
 > **Authoritative source = shipped code, not prose.** Where this doc and an inline spec
 > example disagree, the test apps under `test_apps/` win (several spec examples predate the
-> multiview model — see [§12 Known discrepancies](#12-known-discrepancies)).
+> multiview model — see [§13 Discrepancy resolutions](#13-discrepancy-resolutions-history)).
 >
 > **Tooling that consumes this doc:**
 > - **Scaffold** a new app correct-by-construction: the `/new-displayxr-app` skill clones the
@@ -144,7 +144,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
       android:value="false" />
   ```
 
-  Ref: `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`.
+  Ref: `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`. This is one of
+  the Android pixel-exactness rules — the rest live in
+  [§11 Android — pixel-exactness rules](#11-android--pixel-exactness-rules).
 
 ---
 
@@ -654,7 +656,131 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 
 ---
 
-## 11. Quick checklist (paste into a PR description)
+## 11. Android — pixel-exactness rules
+
+Weaving is **pixel-exact**: the display processor interlaces on the assumption that the pixel it
+wrote at surface coordinate `(x, y)` lands on panel pixel `(origin_x + x, origin_y + y)`. Any
+scale, crop, or rotate applied *after* the app between the buffer and the panel destroys the
+interlace — the image does not "look slightly soft", it loses 3D and ghosts.
+
+Android is the one platform that can insert such a transform **invisibly to the client**:
+`WindowState.mGlobalScale = mCompatScale * mOverrideScale` (size-compat scaling for
+non-resizable / fixed-aspect activities, letterboxing, and `DOWNSCALED` compat overrides) is
+applied server-side, and the app's `Surface` reports the pre-scale size with no callback and no
+error. Desktop windowing went GA in Android 16 QPR3 **with** "compatibility treatments to scale
+windows", so this is a shipping code path, not a theoretical one. Sources and the full platform
+survey: [`docs/roadmap/android-concurrent-multi-app.md` §6b](../roadmap/android-concurrent-multi-app.md)
+(finding **F9**: every rule here is architecture-neutral — it holds for ADR-036 Architecture A,
+Architecture C, and the workspace overlay mode alike).
+
+**Who enforces what.** For a `_handle` app the **runtime** owns the `VkSurfaceKHR`, the swapchain,
+and the present — INV-11.3 and INV-11.5 are runtime invariants you inherit for free. They become
+**app** rules only if your app owns the presentation itself: an `XR_DXR_weave` client
+(`test_apps/weave/weave_client_vk_android`) creates its own `VkSwapchainKHR` on its own
+SurfaceView and presents the woven frame, so it must satisfy them itself. Each rule below is
+tagged **[app]**, **[runtime]**, or **[app if present-owner]**.
+
+Lint an Android app dir with `python3 scripts/check_displayxr_app.py <app-dir>` — the Android
+checks parse `AndroidManifest.xml` and grep Java/Kotlin/native sources; they no-op on a Windows or
+macOS app (no manifest → no Android findings).
+
+- **INV-11.1 [app] — Declare the activity resizable, with no fixed orientation and no fixed aspect
+  ratio.** A non-resizable, fixed-orientation, or fixed-aspect activity is exactly what makes the
+  window manager reach for size-compat / letterbox scaling (`mCompatScale`), and the scaling is
+  invisible on the client side. Also keep `targetSdkVersion` current — old target SDKs opt an app
+  into legacy compat treatments by default.
+
+  ```xml
+  <activity android:name=".MainActivity"
+            android:resizeableActivity="true"
+            ...>   <!-- and NO android:screenOrientation, NO android:maxAspectRatio/minAspectRatio -->
+  ```
+
+  Programmatic locking counts too: `requestedOrientation = SCREEN_ORIENTATION_PORTRAIT` is the same
+  mistake in Kotlin. `SCREEN_ORIENTATION_FULL_SENSOR` / `UNSPECIFIED` / `USER` are fine — they don't
+  fix an orientation. Ref: `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`,
+  `.../MainActivity.kt` (`SCREEN_ORIENTATION_FULL_SENSOR`, with the "do NOT lock orientation"
+  comment). **Error** in the linter.
+
+- **INV-11.2 [app] — Never call `SurfaceHolder.setFixedSize()`, and never rely on
+  `setSizeFromLayout()` to mean "native resolution".** `setFixedSize(w, h)` decouples
+  `SurfaceView.mSurfaceWidth/mSurfaceHeight` from `mScreenRect`; SurfaceFlinger then **scales** the
+  buffer onto the view rect. A weave produced at the fixed size is resampled onto the panel and the
+  interlace is gone. Let the surface be whatever size the layout gives it and render at exactly
+  that size. **Error** in the linter.
+
+- **INV-11.3 [runtime; app if present-owner] — Recreate the swapchain with
+  `imageExtent == surfaceCapabilities.currentExtent`, every time.** Vulkan will happily create a
+  swapchain whose `imageExtent` differs from `currentExtent` — presentation then scales. The
+  runtime does this for you: `select_extent()` returns `caps.currentExtent` verbatim
+  (`src/xrt/compositor/main/comp_target_swapchain.c:215-241`) and the target re-queries live and
+  rebuilds when the surface extent moves (`:1251-1300`). A weave client that owns its own
+  swapchain must do the same — re-query `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` on every
+  `OUT_OF_DATE`/`SUBOPTIMAL` and on every configuration change, and never cache a "designed"
+  resolution.
+
+- **INV-11.4 [app] — SurfaceView only, never TextureView; and never `lockCanvas()` on your own
+  SurfaceView.** A `TextureView` is composited through the view hierarchy as a GL texture (it is
+  not a SurfaceFlinger layer), so it is transformable, filterable, and a frame behind — all three
+  are fatal to a weave. Worse, a single `SurfaceHolder.lockCanvas()` connects the CPU producer to
+  the BufferQueue (`BufferQueueProducer::connect`) and **permanently poisons it for GL/Vulkan**
+  (every later GL/VK connect returns `BAD_VALUE "already connected"`) — the app must never draw on
+  its own SurfaceView. AOSP: `source.android.com/docs/core/graphics/arch-tv` and `.../arch-sh`.
+  **Error** in the linter.
+
+- **INV-11.5 [runtime; app if present-owner] — Honour the buffer transform hint, or the composer
+  rotates the buffer under you.** `AttachedSurfaceControl.getBufferTransformHint()` (API 31+) —
+  and its Vulkan equivalent `VkSurfaceCapabilitiesKHR::currentTransform` — tell you the transform
+  the composer will otherwise apply. Ignore it and you pay a rotate + resample, which is a weave
+  killer, plus a latency spike. The runtime pins `preTransform` on Android to
+  `VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR` so the buffer scans out 1:1 and handles orientation
+  upstream in the Kooima aspect + the DP weave (`comp_target_swapchain.c:860-880`, LOXR-730/733).
+  Present-owners: do the same — pin IDENTITY (or apply the hint yourself into your own render
+  transform), never leave `currentTransform` to be applied by the composer.
+
+- **INV-11.6 [app] — Opaque, sRGB, non-HDR buffers.** Ask for a plain 8-bit sRGB surface and leave
+  the dataspace alone. A wide-gamut or HDR dataspace (`setBuffersDataSpace`,
+  `DATASPACE_BT2020_*`/`SCRGB`/`DISPLAY_P3`, `Window.setColorMode(COLOR_MODE_HDR)`,
+  `isWideColorGamut`) puts a **colour-management pass** between your buffer and the panel; the
+  per-subpixel values the interlace depends on are then remapped, and on some devices the whole
+  layer takes a GPU composition detour. This is the Android statement of the same rule as INV-4.6.
+  **Warning** in the linter.
+
+- **INV-11.7 [app] — Don't float translucent app UI over the SurfaceView region.** A SurfaceView is
+  a separate SurfaceFlinger layer punched through the view hierarchy; by default it sits **below**
+  the window (Z-order "media"), and any semi-transparent view drawn over the hole is alpha-blended
+  onto the *woven* pixels, which are per-subpixel interlaced — the blend smears neighbouring views
+  into each other. Keep app chrome outside the weave rect. If you genuinely need UI on top,
+  `setZOrderOnTop(true)` puts the surface above the window instead (an opaque overlay on top of a
+  weave is fine; a translucent one over it is not) — a deliberate choice you should comment.
+  **Warning** in the linter (translucent theme detected / `setZOrderOnTop` flagged as INFO to be
+  confirmed).
+
+- **INV-1.4 (recap) [app] — Opt out of view-bounds sandboxing.** The interlace phase is anchored to
+  the window's on-screen origin, sampled from `View.getLocationOnScreen()`; the
+  `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` compat change silently makes that window-relative, so every
+  window reports `(0, 0)` and side-by-side windows weave at the same wrong phase. The opt-out is
+  per-app, so it must be in *your* `<application>` block — see
+  [INV-1.4](#1-window-binding--app-class) for the property snippet (ADR-036 D6, #1033).
+
+- **INV-11.8 [app] — Declare a full `configChanges` set so relayout doesn't recreate the activity
+  mid-session.** Every default-handled configuration change tears the Activity (and its
+  `NativeActivity` native thread, and therefore the OpenXR session and the vendor display
+  processor) down and builds it back up. On a 3D panel that is a visible mode reset and a
+  tracking/backlight re-acquisition; in a multi-window/desktop-windowing session, where relayouts
+  are frequent, it is a session churn loop. Declare at least:
+
+  ```xml
+  android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize|density|uiMode|navigation|keyboard|layoutDirection"
+  ```
+
+  and handle `onConfigurationChanged` instead (the surface resizes; the session survives). This is
+  what the PoC-0 side-by-side runs needed (#1032/#1053). Ref:
+  `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`. **Warning** in the linter.
+
+---
+
+## 12. Quick checklist (paste into a PR description)
 
 - [ ] Window passed for handle/texture, NULL for hosted (INV-1.1); HWND kept even in texture mode (INV-1.2)
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
@@ -671,10 +797,15 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
 - [ ] Full mip chain + trilinear on every backend (INV-7.5)
 - [ ] Loader DLL shipped next to exe; no compiled-in runtime path (INV-8.2)
 - [ ] `.displayxr.json` (schema 1) + `icon.png` (512×512) + `icon_sbs.png` (1024×512, sbs-lr) shipped (INV-9.1/9.2)
+- [ ] (Android) activity `resizeableActivity="true"`, no `screenOrientation`, no min/maxAspectRatio, current targetSdk (INV-11.1)
+- [ ] (Android) no `SurfaceHolder.setFixedSize()`; SurfaceView only, never TextureView; no `lockCanvas()` on it (INV-11.2/11.4)
+- [ ] (Android, present-owner) swapchain `imageExtent == currentExtent` on every recreate; buffer transform hint honoured / preTransform pinned IDENTITY (INV-11.3/11.5)
+- [ ] (Android) plain sRGB non-HDR surface — no wide-gamut dataspace / `setBuffersDataSpace` (INV-11.6); no translucent UI over the SurfaceView (INV-11.7)
+- [ ] (Android) `PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS=false` (INV-1.4) + full `configChanges` (INV-11.8)
 
 ---
 
-## 12. Discrepancy resolutions (history)
+## 13. Discrepancy resolutions (history)
 
 The spec-vs-code discrepancies found during research have been resolved (or made moot by the
 surround→display-zones removal):
