@@ -57,6 +57,31 @@ struct xrt_eye_positions;
 struct xrt_window_metrics;
 
 
+/*
+ * ── DP vendor-backend health states ────────────────────────────────────────
+ *
+ * Values reported through the per-API `get_backend_state` slot: the vendor
+ * platform service/session a DP is connected to can restart or degrade
+ * underneath a long-lived runtime process, and the runtime needs to hear about
+ * it. Guarded so every DP header can define them independently of include order
+ * (no MSVC C4005 redefinition).
+ *
+ * The slot itself lives on the per-API variants (d3d11 / d3d12 / gl / vk), NOT
+ * on this base vtable: @ref xrt_display_processor_vk embeds this struct by
+ * value, so growing it here would move every appended slot of that variant and
+ * misdispatch calls into any already-built VK-variant plug-in — the silent
+ * break ADR-020 exists to prevent. Vulkan callers use
+ * @ref xrt_display_processor_vk_get_backend_state.
+ */
+#ifndef XRT_DP_BACKEND_STATE_OK
+//! Backend connected and healthy.
+#define XRT_DP_BACKEND_STATE_OK 0u
+//! Backend down or reconnecting — the DP is handling it; surface only.
+#define XRT_DP_BACKEND_STATE_DEGRADED 1u
+//! Backend connection dead and unrecoverable in place — recreate the DP.
+#define XRT_DP_BACKEND_STATE_STALE 2u
+#endif
+
 /*!
  * @interface xrt_display_processor
  *

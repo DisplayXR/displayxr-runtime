@@ -301,6 +301,40 @@ struct xrt_display_processor_vk
 	                               uint32_t w,
 	                               uint32_t h,
 	                               int32_t display_id);
+
+	/*!
+	 * Report the health of the DP's vendor backend — the vendor platform
+	 * service/session this DP is connected to — so the runtime can react
+	 * when that backend restarts or degrades underneath a long-lived
+	 * process (a service upgrade, a driver reset, a session teardown).
+	 *
+	 * States written to @p out_state:
+	 * - @ref XRT_DP_BACKEND_STATE_OK — connected and healthy.
+	 * - @ref XRT_DP_BACKEND_STATE_DEGRADED — backend down or reconnecting;
+	 *   the DP is handling it and output may be temporarily untracked / 2D.
+	 *   No action is needed beyond surfacing it.
+	 * - @ref XRT_DP_BACKEND_STATE_STALE — the DP's backend connection is
+	 *   dead and the DP cannot recover in place; destroying and recreating
+	 *   the DP is the remedy.
+	 *
+	 * Must be cheap and non-blocking — the runtime polls it at ~1 Hz from
+	 * the RENDER THREAD.
+	 *
+	 * Why the *variant* and not the base vtable: the base cannot grow
+	 * without moving every slot of this variant (which embeds the base by
+	 * value), which would misdispatch calls into any already-built
+	 * VK-variant plug-in — see @ref set_window_screen_rect. The base *is*
+	 * the Vulkan interface, so appending here costs no reach.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL,
+	 * or a false return, means "unknown": the runtime treats that as OK.
+	 * Appended after @ref set_window_screen_rect per ADR-020.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param[out] out_state  One of the XRT_DP_BACKEND_STATE_* values.
+	 * @return true when @p out_state was written.
+	 */
+	bool (*get_backend_state)(struct xrt_display_processor_vk *xdp, uint32_t *out_state);
 };
 
 /*!
@@ -335,6 +369,14 @@ struct xrt_display_processor_vk
  */
 #define XRT_DP_VK_HAS_WINDOW_SCREEN_RECT 1
 
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::get_backend_state slot — same coupled-ABI-
+ * addition pattern as @ref XRT_DP_VK_HAS_PRESENT_ORIGIN, for the vendor-backend
+ * health report landing across runtime + vendor plug-in.
+ */
+#define XRT_DP_VK_HAS_BACKEND_STATE 1
+
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
  *
@@ -364,7 +406,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_present_origin) 
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_frame_timing)            == sizeof(struct xrt_display_processor) + 4 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)             == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_window_screen_rect)      == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_backend_state)          == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 8 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -545,6 +588,30 @@ xrt_display_processor_vk_set_window_screen_rect(struct xrt_display_processor_vk 
 	}
 	xdp->set_window_screen_rect(xdp, x, y, w, h, display_id);
 	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_backend_state
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL, or the DP declined) — the caller then treats
+ * the backend state as unknown, i.e. @ref XRT_DP_BACKEND_STATE_OK. Like the
+ * wrappers above, the presence check reads `xdp->base.struct_size` because the
+ * variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_backend_state(struct xrt_display_processor_vk *xdp, uint32_t *out_state)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_backend_state + sizeof(xdp->get_backend_state);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->get_backend_state == NULL) {
+		return false;
+	}
+	return xdp->get_backend_state(xdp, out_state);
 }
 
 #ifdef __cplusplus
