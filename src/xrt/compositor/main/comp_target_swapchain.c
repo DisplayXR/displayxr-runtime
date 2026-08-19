@@ -988,6 +988,21 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	cts->base.final_layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 	cts->base.surface_transform = pre_transform;
 
+#ifdef XRT_OS_ANDROID
+	// One line per swapchain (re)build naming everything that can make one
+	// satellite's output differ visually from another's — the #1032 PoC has two
+	// satellite processes side by side, and "the left window is darker" needs a
+	// format/colorspace/alpha comparison to answer. Not per-frame.
+	// U_LOG_W, not COMP_WARN: the service compositor's per-instance log level
+	// filters COMP_* out, and this must survive in a stock service log.
+	U_LOG_W("SURFACE_FMT: format=%s(%d) colorspace=%s(%d) compositeAlpha=0x%x transparent=%d overlay=%d "
+	        "extent=%ux%u images=%u",
+	        vk_format_string(cts->surface.format.format), (int)cts->surface.format.format,
+	        vk_color_space_string(cts->surface.format.colorSpace), (int)cts->surface.format.colorSpace,
+	        composite_alpha, want_transparent ? 1 : 0, android_globals_get_overlay_mode() ? 1 : 0, extent.width,
+	        extent.height, image_count);
+#endif
+
 	create_image_views(cts);
 
 #ifdef VK_EXT_display_control
