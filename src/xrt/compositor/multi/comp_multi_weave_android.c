@@ -575,11 +575,21 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         xrt_graphics_buffer_handle_t overlay_handle,
                         bool weave_frame_first,
                         const struct xrt_weave_atlas_layout *layout,
+                        uint32_t flat_rect_count,
+                        const struct xrt_rect *flat_rects,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes)
 {
+	// v8 (browser#88): accepted and ignored — the per-region hardware wish is
+	// published through the D3D11 service's zone-wish channel and has no Android
+	// counterpart yet. Ignoring it is CONFORMANT, not a stub: the wish is advisory
+	// and hardware-only (ADR-027 D6), so the woven pixels are unaffected and the
+	// panel simply stays as 3D as it was pre-v8.
+	(void)flat_rect_count;
+	(void)flat_rects;
+
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || mc->msc == NULL || in_handle == XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
 		return false;

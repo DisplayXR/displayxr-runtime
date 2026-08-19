@@ -28,6 +28,17 @@ issues: [439, 396]
 > for genuinely windowless producers) is designed separately in **#697**. See
 > `docs/getting-started/app-classes.md` for the app-facing framing.
 
+> **Second wish producer (2026-08, browser#88):** the per-region hardware wish decided here is
+> no longer published only by the display-zones path. `XR_DXR_weave` spec v8 lets a
+> present-owner name the regions of its window that must be physically flat, from which the
+> runtime derives `wish = union(submitted weave rects) − union(flat rects)` and publishes it —
+> making the weave path a second producer of the same wish. It required **no new DP vtable
+> surface**: publication reuses the `publish_local_zone_mask` slot from Decision 5, and the
+> weave-path wish inherits that decision's default any-nonzero quantization plus Decision 6's
+> advisory, hardware-only contract unchanged (a DP with no per-region capability behaves
+> exactly as it did before). Contract: `docs/specs/extensions/XR_DXR_weave.md` §2c; runtime PR
+> for browser#88 Phase 3 item A.
+
 ## Context
 
 The current composition model couples three concerns into one object chain:

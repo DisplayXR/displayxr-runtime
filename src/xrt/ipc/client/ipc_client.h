@@ -212,6 +212,12 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  *   @p rect_count 1..IPC_WEAVE_SUBMIT_RECTS_MAX selects the spec-v3 batch
  *   layout (window-sized input, each rect's content at its own window
  *   position, @p rects used, @p rect_x/y/w/h ignored).
+ *   @p flat_rect_count / @p flat_rects (spec v8) name regions of the submit that
+ *   must be physically FLAT; the service publishes union(rects) minus
+ *   union(flat_rects) as the per-region hardware wish. Advisory and hardware-only
+ *   — 0 is byte-for-byte pre-v8.
+ * @c weave_set_screen_flat_regions latches the STICKY screen-space flat regions
+ *   (spec v8, absolute physical screen px, held until the next call).
  * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated
  *   weaved-texture handle + fence handle ONCE (the caller caches them).
  */
@@ -234,11 +240,18 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_rect *overlay_rects,
                                         bool weave_frame_first,
                                         const struct xrt_weave_atlas_layout *layout,
+                                        uint32_t flat_rect_count,
+                                        const struct xrt_rect *flat_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
                                         struct xrt_eye_positions *out_eyes);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                                         uint32_t rect_count,
+                                                         const struct xrt_rect *screen_rects);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,

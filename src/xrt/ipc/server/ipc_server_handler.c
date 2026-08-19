@@ -6093,6 +6093,57 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 #endif
 }
 
+/*!
+ * XR_DXR_weave spec v8 (browser#88): latch the present-owner's STICKY
+ * screen-space flat regions (xrWeaveSetScreenFlatRegionsDXR). Absolute physical
+ * screen pixels, held until the next call; the service intersects them with the
+ * bound window and subtracts them from every subsequent submit's hardware wish.
+ * Applied immediately — if a wish is already published the service re-rasters and
+ * republishes before returning, so screen furniture goes flat without waiting for
+ * the next frame.
+ */
+xrt_result_t
+ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
+                                         const struct ipc_arg_weave_screen_flat_regions *args)
+{
+	IPC_TRACE_MARKER();
+
+	xrt_result_t auth = require_present_owner(ics, "weave_set_screen_flat_regions");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	// The wire is not trusted.
+	if (args->rect_count > IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_rect rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+	if (!comp_d3d11_service_weave_set_screen_flat_regions(ics->xc, args->rect_count,
+	                                                      args->rect_count > 0 ? rects : NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#else
+	// No per-region hardware wish channel on this platform yet (macOS / Android /
+	// Linux). Accept and drop rather than fail, so a portable caller can always
+	// publish its flat furniture — the same accept-and-ignore contract v7's
+	// window geometry has on Windows.
+	(void)args;
+	return XRT_SUCCESS;
+#endif
+}
+
 xrt_result_t
 ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         const struct ipc_arg_weave_submit *args,
@@ -6145,6 +6196,19 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
 
+	// v8 (browser#88): the flat (physically-2D) regions of this submit. Bounds
+	// re-checked here because the wire is not trusted, same as rect_count.
+	if (args->flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->flat_rect_count; i++) {
+		flat_rects[i].offset.w = args->flat_rects[i].x; // xrt_offset fields are named w/h
+		flat_rects[i].offset.h = args->flat_rects[i].y;
+		flat_rects[i].extent.w = (int)args->flat_rects[i].w;
+		flat_rects[i].extent.h = (int)args->flat_rects[i].h;
+	}
+
 	// v4 overlay atlas (browser#18): when have_overlay is set the second
 	// in_handle is a window-sized premul-RGBA atlas the runtime composites over
 	// the weave. Decode its DXGI-vs-NT tag like the input handle. Per-overlay
@@ -6190,6 +6254,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    args->overlay_rect_count, NULL,                         //
 	    args->weave_frame_first != 0,                           //
 	    layout.view_count > 0 ? &layout : NULL,                 //
+	    args->flat_rect_count,                                  //
+	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -6229,6 +6295,26 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
 
+	// v8 (browser#88): the flat (physically-2D) regions of this submit. The
+	// macOS / Android weave engines accept and ignore them for now — there is no
+	// per-region hardware wish channel on those platforms yet, exactly as v7's
+	// Windows-only handle kinds are accepted and ignored here.
+	if (args->flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX) {
+		xrt_graphics_buffer_handle_t reject = handles[0];
+		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
+		if (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+			u_graphics_buffer_unref(&overlay_handle); // nor the overlay ref
+		}
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->flat_rect_count; i++) {
+		flat_rects[i].offset.w = args->flat_rects[i].x; // xrt_offset fields are named w/h
+		flat_rects[i].offset.h = args->flat_rects[i].y;
+		flat_rects[i].extent.w = (int)args->flat_rects[i].w;
+		flat_rects[i].extent.h = (int)args->flat_rects[i].h;
+	}
+
 	// v6 (#774): a non-zero view_count means the input is a worst-case-sized
 	// N-view atlas (tiles packed contiguously top-left at content_view_w/h)
 	// rather than per-rect squeezed SBS. Validated client-side in oxr_weave.c;
@@ -6261,6 +6347,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
 	    overlay_handle, args->weave_frame_first != 0,           //
 	    layout.view_count > 0 ? &layout : NULL,                 //
+	    args->flat_rect_count,                                  //
+	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		return XRT_ERROR_IPC_FAILURE;

@@ -526,6 +526,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_rect *overlay_rects,
                                         bool weave_frame_first,
                                         const struct xrt_weave_atlas_layout *layout,
+                                        uint32_t flat_rect_count,
+                                        const struct xrt_rect *flat_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -540,6 +542,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	if (overlay_rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (overlay_rect_count > 0 && overlay_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX || (flat_rect_count > 0 && flat_rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_have_output = false;
@@ -595,6 +600,18 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		args.content_view_h = layout->content_view_h;
 	}
 
+	// v8 (browser#88): regions of this submit that must be physically flat. The
+	// service subtracts them from the weave rects to derive the published
+	// per-region hardware wish. Advisory and hardware-only — count 0 (a pre-v8
+	// caller) leaves the wire bytes and the behaviour unchanged.
+	args.flat_rect_count = flat_rect_count;
+	for (uint32_t i = 0; i < flat_rect_count; i++) {
+		args.flat_rects[i].x = flat_rects[i].offset.w; // xrt_offset fields are named w/h
+		args.flat_rects[i].y = flat_rects[i].offset.h;
+		args.flat_rects[i].w = (uint32_t)flat_rects[i].extent.w;
+		args.flat_rects[i].h = (uint32_t)flat_rects[i].extent.h;
+	}
+
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
@@ -628,6 +645,39 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_fence_value = fv;
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
+}
+
+/*!
+ * Spec v8 (browser#88): latch the STICKY screen-space flat regions. Separate
+ * entry point rather than a submit field because the lifetime is different — the
+ * latch outlives any one frame and is expressed in absolute screen pixels, so a
+ * caller sets it when its chrome layout changes, not every submit.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                                         uint32_t rect_count,
+                                                         const struct xrt_rect *screen_rects)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (rect_count > IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX || (rect_count > 0 && screen_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_arg_weave_screen_flat_regions args = {0};
+	args.rect_count = rect_count;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		args.rects[i].x = screen_rects[i].offset.w; // xrt_offset fields are named w/h
+		args.rects[i].y = screen_rects[i].offset.h;
+		args.rects[i].w = (uint32_t)screen_rects[i].extent.w;
+		args.rects[i].h = (uint32_t)screen_rects[i].extent.h;
+	}
+	return ipc_call_weave_set_screen_flat_regions(icc->ipc_c, &args);
 }
 
 xrt_result_t

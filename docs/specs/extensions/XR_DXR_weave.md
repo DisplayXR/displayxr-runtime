@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 7 |
+| **Spec Version** | 8 |
 | **Extension Type** | Instance extension (service path only — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–197` type block, pending Khronos registry) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036 |
+| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88 |
 
 ## 1. What it is
 
@@ -19,7 +19,7 @@ rect(s) and composites back a weaved shared texture, gated on a fence. Eyes flow
 (runtime → caller) so the caller can render its next frame's off-axis (Kooima) projections;
 the interlace itself reads the vendor's tracker DP-internally.
 
-Four entry points:
+Five entry points:
 
 - `xrWeaveBindWindowDXR(session, hwnd)` — bind the present-owner's window (phase reference).
 - `xrWeaveBindWindow2DXR(session, bindInfo)` — (v7) the chainable form of the same bind, so
@@ -30,6 +30,8 @@ Four entry points:
   on re-allocation (resize).
 - `xrWeaveSnapWindowRectDXR(session, origin, target, snapped)` — drag-time phase snap
   (window-position constraint against the DP's interlace lattice).
+- `xrWeaveSetScreenFlatRegionsDXR(session, rectCount, screenRects)` — (v8) latch the screen
+  regions that must stay physically flat, so the per-region hardware wish excludes them (§2c).
 
 Only the out-of-process (service/IPC) path implements it; in-process sessions report
 `XR_ERROR_FEATURE_UNSUPPORTED`.
@@ -104,7 +106,7 @@ handed to the display processor directly when it exactly fills the active mode's
 (zero-copy per ADR-030 — rare: only the worst-case-achieving mode, at fullscreen),
 otherwise **one** box copy crops it first (contiguous packing means a single rectangle, not
 the per-tile gather the `xrEndFrame` path needs). `rects` degrade to a scope hint (zone /
-wish-mask publication, caller draw-back), so `XR_WEAVE_SUBMIT_MAX_RECTS_DXR` no longer
+wish-mask publication — §2c, caller draw-back), so `XR_WEAVE_SUBMIT_MAX_RECTS_DXR` no longer
 bounds elements per frame, and `firstChunk` has nothing to clear on this path —
 transparency between elements is carried by the caller's own atlas alpha.
 
@@ -121,6 +123,81 @@ is the only signal that the runtime will honour the layout. A caller supporting 
 assemble the **v3/v4/v5 per-rect SBS input** when the runtime reports `< 6`, and the N-view
 atlas only when it reports `>= 6`.
 
+## 2c. Per-region hardware wish (v8, browser#88)
+
+Until v8 the weave path drove the panel's physical 3D element **all-or-nothing**: a
+present-owner with one woven element held the *whole* panel behind the lens, so the flat 2D
+around it was viewed through a lenticular it did not want (the shipped ghosting). v8 lets the
+caller name the regions that are **flat**, from which the runtime derives a per-region
+hardware **wish**:
+
+```
+wish = union(submitted weave rects) − union(flat rects)
+```
+
+That is the same wish the `XR_DXR_display_zones` path already publishes (ADR-027 Decision 5),
+now reachable from the weave path. Two ways to declare flat, differing only in lifetime and
+coordinate space:
+
+| | Per-submit — `XrWeaveSubmitFlatRegionsDXR` | Sticky — `xrWeaveSetScreenFlatRegionsDXR` |
+|---|---|---|
+| Delivery | chained on `XrWeaveSubmitInfoDXR::next` | its own entry point |
+| Coordinates | window-relative device px, y-down (the space of `XrWeaveSubmitRectsDXR::rects`) | absolute **physical screen** px, clipped to the bound window's client area |
+| Lifetime | that one submit | latched until the next call — a **SET**, not an add; `rectCount 0` clears |
+| Max rects | `XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR` = 16 | `XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR` = 8 |
+| Applied | with the submit it rides on | **immediately** — a live wish is re-rastered and republished before the call returns |
+| Fits | content that moves every frame (a scrolled page's flat bands) | screen-anchored furniture (a toolbar / tab strip) that must stay flat whatever a frame submits |
+
+The two lists **compose** — both are subtracted. Rects may overlap each other and the weave
+rects; subtraction is by area, not by list position. A sticky rect naming panel area outside
+the window is clipped away (the wish is published window-anchored), not an error.
+
+```c
+#define XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR     16
+#define XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR 8
+
+typedef struct XrWeaveSubmitFlatRegionsDXR {
+    XrStructureType    type;      // XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR (1004999198)
+    const void*        next;
+    uint32_t           rectCount; // 0..XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR (0 = no flat regions)
+    const XrRect2Di*   rects;     // window-relative flat regions, device px, y-down
+} XrWeaveSubmitFlatRegionsDXR;
+
+XrResult xrWeaveSetScreenFlatRegionsDXR(XrSession session,
+                                        uint32_t rectCount, const XrRect2Di* screenRects);
+```
+
+**Advisory and hardware-only**, in exactly the sense of ADR-027 Decision 6 / ADR-030: it
+moves the physical 3D element and nothing else. The woven pixels are bit-identical with and
+without it — nothing here gates, masks, crops or reorders content — and a runtime or vendor
+that ignores the wish is still conformant (its panel is simply 3D where the caller asked for
+flat, i.e. the pre-v8 behaviour). A DP with no per-region capability quantizes the wish to
+its whole-panel any-nonzero default, which *is* pre-v8. So a caller may always send the flat
+lists and never has to ask whether the panel can honour them.
+
+**Rounding always errs toward 3D.** Where a rect edge falls between the hardware's switch
+cells, ON (weave) rects are ceiled outward to the cell boundary and flat rects floored
+inward. The asymmetry is deliberate: marking a working 3D region flat is a mono regression,
+whereas leaving a flat region 3D is only the pre-v8 ghosting. A caller with more flat regions
+than the cap merges them into bounding boxes — which errs toward *flat*, so it must merge
+only regions that are all flat.
+
+**Compatibility — no version gate needed** (unlike v6). Omitting both is byte-for-byte
+pre-v8, and a pre-v8 runtime skips the unknown chained struct and behaves exactly as it does
+today, so the chain degrades gracefully rather than being misread. Only the sticky entry point
+needs a check: it does not resolve through `xrGetInstanceProcAddr` on a pre-v8 runtime.
+
+`1004999199` is **reserved** for a possible v9 per-submit wish **mask** — an R8 texture handle
+in place of a rect list, for callers whose flat geometry is not rectangular (rounded corners,
+arbitrary CSS clip paths). Do not assign it to anything else.
+
+**Runtime side.** The weave path publishes the wish through the **same**
+`publish_local_zone_mask` channel the display-zones path already used, so no DP/plug-in ABI
+change was needed. It is published atomically with the frame (after the atlas + overlay
+composite, before the fence signal) and withdrawn on teardown. On a path whose weave engine
+publishes no wish, or against a DP without the slot, the flat lists are simply inert — which
+the advisory contract makes conformant.
+
 ## 3. Why batch (the scaling wall)
 
 Each submit carries a fixed cost independent of the rect area: the runtime IPC round-trip,
@@ -132,10 +209,10 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
 
 ## 4. Service semantics (implementation notes)
 
-- The output texture is sized to the bound window's client area and **never cleared**:
-  each weave writes only its sub-rect(s), so all elements accumulate at their window
-  positions. Stale regions from closed elements are harmless — the caller's draw-back
-  composites only current rects.
+- The output texture is sized to the bound window's client area and is **cleared only when a
+  submit sets `firstChunk`** (v5): otherwise each weave writes only its sub-rect(s), so all
+  elements accumulate at their window positions. Stale regions from closed elements are then
+  harmless — the caller's draw-back composites only current rects.
 - The DP's `process_atlas` samples its whole SRV as the atlas (no input-offset parameter),
   so the batch path copies each rect out of the window-sized input into an exact-size
   scratch tile before the per-rect weave. The input's keyed mutex is released right after
@@ -148,8 +225,8 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
 
 ## 5. macOS platform mapping (#759)
 
-The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same three entry
-points with these platform substitutions (`comp_multi_weave_macos.c`):
+The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same bind /
+submit / snap contract with these platform substitutions (`comp_multi_weave_macos.c`):
 
 | Contract point | Windows (D3D11 service) | macOS (comp_multi Vulkan) |
 |---|---|---|
@@ -210,6 +287,7 @@ Notes that only bite on Android:
 | 5 | `XrWeaveSubmitInfoDXR::firstChunk` — coherent whole-window output (browser#22). |
 | 6 | `XrWeaveSubmitLayoutDXR` N-view worst-case atlas layout (#774). |
 | 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
+| 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
 
 ## 7. Consumers
 

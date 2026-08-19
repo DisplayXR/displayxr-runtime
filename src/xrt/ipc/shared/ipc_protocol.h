@@ -755,6 +755,21 @@ struct ipc_arg_swapchain_from_native
 #define IPC_WEAVE_SUBMIT_RECTS_MAX 32
 
 /*!
+ * Max FLAT rects one weave_submit carries (spec v8, browser#88). Mirrors
+ * XR_WEAVE_SUBMIT_MAX_FLAT_RECTS_DXR. Deliberately half the weave-rect bound:
+ * this list describes panel furniture (bands, gutters, chrome), not per-element
+ * geometry, and it has to share the same fixed IPC message — see the size
+ * accounting on @ref ipc_arg_weave_submit.
+ */
+#define IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX 16
+
+/*!
+ * Max rects one weave_set_screen_flat_regions call latches (spec v8). Mirrors
+ * XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR.
+ */
+#define IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX 8
+
+/*!
  * One window-relative weave sub-rect on the wire (bound-window client pixels,
  * y-down).
  *
@@ -826,6 +841,37 @@ struct ipc_arg_weave_submit
 	uint32_t tile_rows;       //!< Active mode atlas grid rows
 	uint32_t content_view_w;  //!< Per-tile content width  = window width  * mode view_scale_x
 	uint32_t content_view_h;  //!< Per-tile content height = window height * mode view_scale_y
+
+	//! XR_DXR_weave v8 (browser#88): regions of THIS submit that must be
+	//! physically FLAT. The runtime publishes the per-region hardware wish as
+	//! union(@c rects) minus union(@c flat_rects) — see XrWeaveSubmitFlatRegionsDXR.
+	//! ADVISORY and hardware-only: it moves the panel's 3D element, never content,
+	//! so flat_rect_count 0 is byte-for-byte the pre-v8 behaviour.
+	//!
+	//! APPENDED AT THE END on purpose. This struct is a fixed-size POD in a fixed
+	//! IPC_BUF_SIZE (1024 B) message, so growth is size-accounted: 564 B before v8
+	//! + 4 (flat_rect_count) + 256 (16 * 16 B) = 824 B, plus the 4 B command word
+	//! = 828 of 1024. There is no version negotiation on this wire and none is
+	//! needed — the client DLL and the service are gated to the same u_git_tag at
+	//! xrCreateInstance, so a mismatched pair never connects in the first place.
+	uint32_t flat_rect_count; //!< 0..IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX (0 = no flat regions)
+	struct ipc_weave_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX]; //!< first flat_rect_count valid
+};
+
+/*!
+ * XR_DXR_weave v8 (browser#88): STICKY screen-space flat regions
+ * (xrWeaveSetScreenFlatRegionsDXR). Unlike @ref ipc_arg_weave_submit's per-submit
+ * list these are ABSOLUTE PHYSICAL SCREEN pixels and are LATCHED at the service
+ * until the next call — screen-anchored furniture (a browser's toolbar / tab
+ * strip) that must stay flat regardless of what any individual frame submits.
+ * A call REPLACES the latch wholesale; @c rect_count 0 clears it.
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_weave_screen_flat_regions
+{
+	uint32_t rect_count; //!< 0..IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX (0 = clear the latch)
+	struct ipc_weave_rect rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX]; //!< absolute screen px (y-down)
 };
 
 /*!

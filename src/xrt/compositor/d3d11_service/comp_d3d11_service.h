@@ -1097,6 +1097,15 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * first. @p rects then carry only a scope hint (zone mask / caller draw-back),
  * so XR_WEAVE_SUBMIT_MAX_RECTS_DXR stops bounding elements per frame. NULL (or
  * view_count 0) keeps the v3/v4/v5 behavior byte-for-byte.
+ *
+ * v8 per-region hardware wish (browser#88): @p flat_rects name the regions of
+ * this submit that must be PHYSICALLY FLAT. The weave path publishes
+ * union(@p rects) minus union(@p flat_rects) — plus whatever
+ * @ref comp_d3d11_service_weave_set_screen_flat_regions has latched — to the
+ * panel DP's zone-wish channel, so the physical 3D element follows the content
+ * instead of holding the whole panel behind the lens. ADVISORY and HARDWARE-ONLY:
+ * nothing here changes a woven pixel (ADR-027 D6 / ADR-030), and
+ * @p flat_rect_count 0 with no latch is byte-for-byte the pre-v8 behaviour.
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -1114,10 +1123,35 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                const struct xrt_rect *overlay_rects,
                                bool weave_frame_first,
                                const struct xrt_weave_atlas_layout *layout,
+                               uint32_t flat_rect_count,
+                               const struct xrt_rect *flat_rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes);
+
+/*!
+ * XR_DXR_weave v8 (browser#88): latch this present-owner's STICKY screen-space
+ * flat regions (xrWeaveSetScreenFlatRegionsDXR).
+ *
+ * @p screen_rects are ABSOLUTE PHYSICAL SCREEN pixels (y-down), unlike the
+ * window-relative per-submit list — screen-anchored furniture (a browser's
+ * toolbar / tab strip) stays flat wherever the window moves under it. The latch
+ * REPLACES any previous one; @p rect_count 0 clears it. Both lists compose: every
+ * submit subtracts the latch AND its own flat rects from the published wish.
+ *
+ * Applied IMMEDIATELY — when a wish is currently published this re-rasters and
+ * republishes it before returning (taken under render_mutex from the IPC thread,
+ * the same bounded pattern the #815 mode-request drain uses), so the panel does
+ * not wait for the next submit. Advisory and hardware-only, exactly as the
+ * per-submit list.
+ *
+ * @return true when the latch was stored (whether or not a republish was needed).
+ */
+bool
+comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                                 uint32_t rect_count,
+                                                 const struct xrt_rect *screen_rects);
 
 /*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)

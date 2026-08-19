@@ -993,6 +993,14 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
                                      uint32_t client_h,
                                      int32_t display_id);
 
+/*!
+ * @p flat_rect_count / @p flat_rects (spec v8, browser#88) name the regions of
+ * this submit that must be physically FLAT. ACCEPTED AND IGNORED here: the
+ * per-region hardware wish is published through the D3D11 service's zone-wish
+ * channel, which has no macOS / Android counterpart yet. Same shape as v7's
+ * Windows-only handle kinds — the parameter exists so the wire and the call
+ * signature stay one thing across platforms.
+ */
 bool
 comp_multi_weave_submit(struct xrt_compositor *xc,
                         xrt_graphics_buffer_handle_t in_handle,
@@ -1005,6 +1013,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         xrt_graphics_buffer_handle_t overlay_handle,
                         bool weave_frame_first,
                         const struct xrt_weave_atlas_layout *layout,
+                        uint32_t flat_rect_count,
+                        const struct xrt_rect *flat_rects,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
