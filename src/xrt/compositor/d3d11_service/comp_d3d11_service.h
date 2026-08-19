@@ -804,6 +804,22 @@ bool
 comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc);
 
 /*!
+ * Latest vendor-backend health the panel display processor reported: an
+ * XRT_DP_BACKEND_STATE_* value (0 = ok, 1 = degraded, 2 = stale), polled at
+ * ~1 Hz by the render thread.
+ *
+ * A vendor platform service can restart underneath this long-lived process,
+ * after which a DP that cannot reconnect keeps returning successful but STALE
+ * eye positions — apps weave untracked and the log says nothing. Exposed so
+ * the IPC layer's `[HEALTH]` summary can name it. Returns
+ * XRT_DP_BACKEND_STATE_OK when unknown (no DP, or a plug-in without the slot).
+ *
+ * @ingroup comp_d3d11_service
+ */
+uint32_t
+comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc);
+
+/*!
  * #964 (D-5): is the COMPOSITOR the one focus authority right now?
  *
  * True on the always-on pipeline (i.e. always, unless DXR_LEGACY_STANDALONE=1):

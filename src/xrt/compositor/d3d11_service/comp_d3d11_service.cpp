@@ -1281,11 +1281,27 @@ struct d3d11_service_system
 	std::atomic<uint32_t> render_diag_pipe_flat_present{0};
 	std::atomic<uint32_t> render_diag_pipe_flat_skip{0};
 	std::atomic<uint32_t> render_diag_pipe_rebind{0};
+	//! Times the panel DP was destroyed and recreated because it reported its
+	//! vendor backend STALE (pipeline_dp_health_poll). Should be 0; a steady
+	//! trickle means the DP keeps losing a backend it cannot hold.
+	std::atomic<uint32_t> render_diag_dp_stale_recreate{0};
 	//! #1018: times a reader had to skip an atlas because the owning client
 	//! was mid-write. Non-zero proves the tear window is real AND closed.
 	std::atomic<uint32_t> render_diag_atlas_contention{0};
 	std::atomic<int> render_diag_pipe_presenter{0};
 	/*! @} */
+
+	//! Latest vendor-backend health the panel DP reported (an
+	//! XRT_DP_BACKEND_STATE_* value) and the monotonic timestamp of the last
+	//! poll. A vendor platform service can restart underneath this long-lived
+	//! process; a DP that cannot reconnect keeps answering eye-position queries
+	//! SUCCESSFULLY with stale data, so every app weaves untracked and nothing
+	//! in the log says why. The render thread polls at ~1 Hz
+	//! (pipeline_dp_health_poll) and the IPC `[HEALTH]` line reports it.
+	//! @{
+	std::atomic<uint32_t> dp_backend_state{XRT_DP_BACKEND_STATE_OK};
+	std::atomic<int64_t> dp_backend_poll_ns{0};
+	//! @}
 
 	//! Phase 5b — rate-limited cache of `xrt_display_processor_d3d11_get_hardware_3d_state`.
 	//! The vendor SDK call is synchronous and blocks ~10 ms per invocation
@@ -7245,13 +7261,14 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		uint32_t fp = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
 		uint32_t fs = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
 		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
+		uint32_t sr = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
 		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
 		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
 		U_LOG_W(
 		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
-		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u atlas_contention=%u "
-		    "presenter=%d window_s=10",
-		    ap, as, ab, fp, fs, rb, ac, pk);
+		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
+		    "atlas_contention=%u presenter=%d window_s=10",
+		    ap, as, ab, fp, fs, rb, sr, ac, pk);
 	}
 
 	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
@@ -8744,7 +8761,8 @@ static void
 pipeline_bind_panel_dp(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
                        HWND hwnd,
-                       bool client_presents)
+                       bool client_presents,
+                       bool force_recreate)
 {
 	if (sys == nullptr || mc == nullptr || hwnd == nullptr) {
 		return;
@@ -8752,6 +8770,39 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	if (service_device_removed(sys)) {
 		return; // #1002: never build a DP on a dead device
 	}
+
+	/*
+	 * FORCED re-bind: the panel DP reported its vendor backend STALE, so the
+	 * DP INSTANCE is what has to go — an in-place re-bind cannot revive a
+	 * dead backend connection. Retiring it here disarms both shortcuts below
+	 * (they need a live `display_processor`) and hands the rest to the
+	 * ordinary create-first / publish / retire machinery.
+	 *
+	 * Retire FIRST is not optional on this path. Every other rebind targets a
+	 * DIFFERENT window than the live DP's, so creating before retiring is
+	 * safe; a forced recreate targets the SAME one, and two live weavers on
+	 * one HWND make the vendor's window-subclass chain self-referencing (see
+	 * pipeline_dp_graveyard_flush_hwnd). Parking it in the graveyard also arms
+	 * that function's ~250 ms grace, so the fall-through below returns without
+	 * creating and a later frame's ordinary bind brings the fresh DP up; the
+	 * panel flat-blits in between.
+	 */
+	if (force_recreate && mc->display_processor != nullptr) {
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *dead = mc->display_processor;
+		HWND dead_hwnd = mc->panel_dp_hwnd;
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_encoding = -1; // #1016: a fresh DP starts unknown
+		pipeline_dp_retire(mc, dead, dead_hwnd);
+		U_LOG_W(
+		    "[pipeline] panel DP retired on a STALE vendor backend (hwnd=%p) — rebinding on a"
+		    " later frame",
+		    (void *)dead_hwnd);
+	}
+
 	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd) {
 		// Already bound where we want it -- but the presenter KIND may have
 		// changed on the same window (present-owner <-> opaque app): keep the
@@ -8884,6 +8935,78 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	sys->render_diag_pipe_rebind.fetch_add(1, std::memory_order_relaxed);
 	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p (client_presents=%d, hw3d=%d, old=%p retired)", (void *)hwnd,
 	        (int)client_presents, (int)want_3d, (void *)old);
+}
+
+/*!
+ * Poll the panel DP's vendor-backend health at ~1 Hz and force a recreate when
+ * it reports STALE.
+ *
+ * A vendor platform service can restart underneath this long-lived process — a
+ * vendor runtime installer upgrading it, a driver reset, a session teardown. A
+ * DP whose backend connection died then keeps answering eye-position queries
+ * SUCCESSFULLY with stale data, so every app weaves untracked until somebody
+ * restarts the service, with nothing in the log naming the cause. Plug-ins that
+ * can reconnect in place report DEGRADED while they do it and need no help;
+ * those that cannot report STALE, and for those the only remedy is destroying
+ * and recreating the DP.
+ *
+ * Vendor-neutral by construction: the runtime knows only the three states from
+ * the DP vtable slot, never what the backend is.
+ *
+ * Render thread, under render_mutex. Cheap — the slot is contractually
+ * non-blocking and this runs once a second.
+ */
+static void
+pipeline_dp_health_poll(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	if (sys == nullptr || mc == nullptr) {
+		return;
+	}
+	if (service_device_removed(sys)) {
+		return; // #1002: never reach into a DP built on a dead device
+	}
+
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	const int64_t last_ns = sys->dp_backend_poll_ns.load(std::memory_order_relaxed);
+	if (last_ns != 0 && now_ns - last_ns < U_TIME_1S_IN_NS) {
+		return;
+	}
+	sys->dp_backend_poll_ns.store(now_ns, std::memory_order_relaxed);
+
+	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
+	uint32_t state = XRT_DP_BACKEND_STATE_OK;
+	if (dp != nullptr && !xrt_display_processor_d3d11_get_backend_state(dp, &state)) {
+		// Absent slot (older plug-in) or the DP declined — unknown reads as OK.
+		state = XRT_DP_BACKEND_STATE_OK;
+	}
+
+	const uint32_t prev = sys->dp_backend_state.exchange(state, std::memory_order_relaxed);
+	if (state != prev) {
+		// State EDGE only — this runs on the render thread, never per frame.
+		switch (state) {
+		case XRT_DP_BACKEND_STATE_DEGRADED:
+			U_LOG_W(
+			    "[pipeline] panel DP reports backend DEGRADED — vendor backend down or"
+			    " reconnecting; output may be untracked");
+			break;
+		case XRT_DP_BACKEND_STATE_STALE:
+			U_LOG_W(
+			    "[pipeline] panel DP reports backend STALE — the DP cannot recover in place;"
+			    " forcing a recreate");
+			break;
+		default: U_LOG_W("[pipeline] panel DP backend recovered — state OK"); break;
+		}
+	}
+
+	if (state != XRT_DP_BACKEND_STATE_STALE || dp == nullptr) {
+		return;
+	}
+
+	sys->render_diag_dp_stale_recreate.fetch_add(1, std::memory_order_relaxed);
+	// The 1 Hz cadence rate-limits the retries; the graveyard grace and the
+	// factory backoff protect the rebind path itself.
+	pipeline_bind_panel_dp(sys, mc, mc->panel_dp_hwnd, mc->panel_dp_client_presents,
+	                       /*force_recreate*/ true);
 }
 
 //! Defined further down (browser#73 diagnostic); used by the pipeline's
@@ -9795,7 +9918,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// captured background, never go opaque -- which is exactly the #551
 		// client_presents=true configuration legacy gave its per-client DP.
 		// Bound with false, the woven layer came out opaque and hid the page.
-		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true);
+		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true, /*force_recreate*/ false);
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		// Tell the owner it holds the panel, so its next commit weaves.
 		fc->pipe_owns_panel.store(true, std::memory_order_release);
@@ -9845,7 +9968,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 
 	/* (c) One DP per panel, bound to the active presenter's window. */
-	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE);
+	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE, /*force_recreate*/ false);
 	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
 
 	/* (e) Direct path: crop the focused client's atlas (ADR-030) and weave it
@@ -10189,6 +10312,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// a panel DP is ever actually destroyed outside teardown.
 	pipeline_dp_graveyard_sweep(mc, /*force*/ false);
 
+	// Ask the panel DP once a second whether its vendor backend is still
+	// alive, and recreate it if it says it cannot recover. Same locked
+	// region as the sweep — the render thread is the only writer of
+	// `display_processor`.
+	pipeline_dp_health_poll(sys, mc);
+
 	// #1002: the device is gone. Do NOT crop, weave, present or re-bind the
 	// display processor — every one of those reaches into the dead device, and
 	// the DP path does it from inside the vendor SDK, where a fault is an
@@ -10427,7 +10556,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// can defer a frame or two (a just-retired DP still owns the
 			// window) and does nothing at all with no vendor plug-in, so the
 			// latch is deadline-bounded rather than "until it binds".
-			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false);
+			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false, /*force_recreate*/ false);
 			const bool bound = mc->display_processor != nullptr && mc->panel_dp_hwnd == mc->hwnd;
 			if (bound || (int64_t)os_monotonic_get_ns() >= mc->foreground_override_restore_deadline_ns) {
 				mc->foreground_override_restore = false;
@@ -21361,6 +21490,15 @@ comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc)
 	return service_device_removed(d3d11_service_system_from_xrt(xsysc));
 }
 
+extern "C" uint32_t
+comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return XRT_DP_BACKEND_STATE_OK;
+	}
+	return d3d11_service_system_from_xrt(xsysc)->dp_backend_state.load(std::memory_order_relaxed);
+}
+
 extern "C" bool
 comp_d3d11_service_focus_is_authoritative(struct xrt_system_compositor *xsysc)
 {
@@ -22169,7 +22307,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		}
 
 		// One DP per panel, back on the service window (D-4).
-		pipeline_bind_panel_dp(sys, pmc, pmc->hwnd, /*client_presents*/ false);
+		pipeline_bind_panel_dp(sys, pmc, pmc->hwnd, /*client_presents*/ false, /*force_recreate*/ false);
 
 		if (pmc->hwnd != nullptr) {
 			if (!pmc->service_window_shown) {
