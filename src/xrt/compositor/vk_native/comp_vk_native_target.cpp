@@ -225,6 +225,10 @@ struct wl_harness
 	//! the F-row write — the D3D11/D3D12 sites already tag this; dropping it
 	//! here made every capped-app VK run read as one mixed population.
 	bool pending_repaint = false;
+	//! #1044: F rows actually written; teardown WARNs when the harness armed
+	//! but produced nothing (e.g. the DComp bridge path, which never presents
+	//! through the VK swapchain the waiter watches).
+	uint64_t rows_written = 0;
 	std::thread waiter;
 	std::mutex mtx;
 	std::condition_variable cv;
@@ -1880,6 +1884,19 @@ wl_get(struct comp_vk_native_target *target)
 
 	target->wl = wl;
 	U_LOG_W("Weave-latency harness: VK present_wait scanout timing active (%s)", path);
+	// #1044: the DComp bridge never presents through the VK swapchain the
+	// waiter watches (present dispatches to dcomp_present before the F-row
+	// writer), so on that path this CSV gets a header and nothing else. The
+	// bridge is set up in target_create, before any mark/present can reach
+	// this first wl_get, so dcomp_active is already settled here — one-shot
+	// by construction (wl_get creates the harness once per target).
+	if (target->dcomp_active) {
+		U_LOG_W(
+		    "Weave-latency harness: DComp-bridge mode — %s will contain a "
+		    "header and NO rows; this path never presents through the VK "
+		    "swapchain the waiter watches (#1044)",
+		    path);
+	}
 	return wl;
 }
 
@@ -1897,6 +1914,14 @@ wl_teardown(struct comp_vk_native_target *target)
 	wl->cv.notify_all();
 	if (wl->waiter.joinable()) {
 		wl->waiter.join();
+	}
+	// #1044: an armed harness that measured nothing must say so — a silent
+	// header-only CSV reads as "no latency problem" instead of "cannot
+	// measure on this presentation path".
+	if (wl->rows_written == 0) {
+		U_LOG_W(
+		    "Weave-latency harness: armed but wrote zero F rows — this "
+		    "presentation path cannot measure scanout (#1044)");
 	}
 	fclose(wl->f);
 	delete wl;
@@ -2495,6 +2520,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 					        wl->pending_repaint ? 1 : 0);
 					wl->pending_weave_qpc = 0;
 					wl->pending_repaint = false;
+					wl->rows_written++;
 				}
 				wl->ids.push_back(wl_id);
 			}

@@ -154,6 +154,9 @@ render loop.
 Vendor-specific verification recipes — debug overlays, forced-off switches, purpose-built load
 demos — live in the vendor plug-in repos, not here.
 
+R is unobtainable on the DComp-bridge (transparent VK) presentation path — DXGI frame statistics
+are unavailable there (#1044); the plain-swapchain paths are the instrumented ones.
+
 ## See also
 
 - [`docs/adr/ADR-007`](../adr/ADR-007-compositor-never-weaves.md) — the compositor never weaves; the DP does
