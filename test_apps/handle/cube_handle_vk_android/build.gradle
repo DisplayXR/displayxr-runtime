@@ -12,14 +12,22 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// CNSDK is OPTIONAL (#499). The app is CNSDK-free by default — the vendor-
-// neutral sim_display fallback needs none of it. But the in-process Leia CNSDK
-// display-processor resolves its com.leia.* classes via FindClass against THIS
-// app's classloader, so when testing against the Leia plug-in the CNSDK Java
-// glue (sdk-<ver>.aar) must be dexed here. Resolve it from `cnsdk.dir` in
-// local.properties (or -PcnsdkDir); if unset / the AAR isn't found, the app
-// builds CNSDK-free. So: no cnsdk.dir → sim_display path; cnsdk.dir set →
-// Leia path.
+// CNSDK glue is OFF by default (#1037 / ADR-036 D2 Amendment 1).
+//
+// It used to be on whenever `cnsdk.dir` was set, because the in-process vendor
+// display processor resolved its com.leia.* classes via FindClass against THIS
+// app's classloader, so the vendor AAR had to be dexed into every client. That
+// coupling is gone: the runtime's plug-in loader now hands the plug-in a
+// class-host Context for the RUNTIME package
+// (`xrt_plugin_host_iface::get_android_class_host_context`, #1061), and the
+// inProcess runtime flavor carries the vendor AAR — so a client APK ships ZERO
+// vendor classes and ZERO vendor .so and still weaves through the vendor DP in
+// its own process. Which is the whole point of ADR-019 on Android.
+//
+// `-PcubeCnsdkGlue=1` re-enables the old in-APK glue, for bisecting against a
+// runtime that predates the class-host Context. It still needs `cnsdk.dir` in
+// local.properties (or -PcnsdkDir).
+def cnsdkGlueRequested = (project.findProperty('cubeCnsdkGlue') ?: '0').toString() != '0'
 def resolveCnsdkDir = {
     def fromProp = project.findProperty('cnsdkDir') ?: project.findProperty('cnsdk.dir')
     if (fromProp) {
@@ -42,8 +50,8 @@ def cnsdkDir = resolveCnsdkDir()
 def cnsdkVersionFile = cnsdkDir ? new File("${cnsdkDir}/VERSION.txt") : null
 def cnsdkVersion = (cnsdkVersionFile?.exists()) ? cnsdkVersionFile.text.trim() : null
 def cnsdkAar = (cnsdkDir && cnsdkVersion) ? new File("${cnsdkDir}/android/sdk-${cnsdkVersion}.aar") : null
-def hasCnsdk = cnsdkAar?.exists()
-println "cube_handle_vk_android: CNSDK glue ${hasCnsdk ? "ENABLED (${cnsdkAar})" : 'disabled (sim_display path)'}"
+def hasCnsdk = cnsdkGlueRequested && (cnsdkAar?.exists())
+println "cube_handle_vk_android: in-APK CNSDK glue ${hasCnsdk ? "ENABLED (${cnsdkAar})" : 'DISABLED (runtime hosts it, #1061)'}"
 
 android {
     namespace 'com.displayxr.cube_handle_vk_android'
