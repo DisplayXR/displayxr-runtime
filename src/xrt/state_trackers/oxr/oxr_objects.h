@@ -2395,12 +2395,13 @@ struct oxr_session
 	bool has_external_window;
 
 #ifdef XRT_OS_ANDROID
-	//! The ANativeWindow this session currently holds a reference on, from
-	//! XR_DXR_android_surface_binding (#1037). Exactly one
-	//! `ANativeWindow_release()` is owed on it; replaced on every
-	//! xrSetAndroidSurfaceDXR and dropped at session destroy. NULL when the
-	//! app chained no binding (the runtime-spawned `_hosted` SurfaceView owns
-	//! its own window instead).
+	//! The last ANativeWindow this session published into `android_globals`
+	//! from XR_DXR_android_surface_binding (#1037). A MARKER, not an owned
+	//! reference: `android_globals_set_window` adopts the publisher's
+	//! reference and is the single owner (#1040). It tells session destroy to
+	//! take the window back out of the globals. NULL when the app chained no
+	//! binding (the runtime-spawned `_hosted` SurfaceView owns its own
+	//! window instead).
 	void *android_bound_window;
 #endif
 
