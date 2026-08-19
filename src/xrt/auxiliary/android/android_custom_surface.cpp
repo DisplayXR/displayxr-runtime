@@ -232,14 +232,22 @@ android_custom_surface_wait_get_surface(struct android_custom_surface *custom_su
 	}
 
 	// If the periodic pull (android_custom_surface_refresh_window) already
-	// published this surface's ANativeWindow, reuse it so we keep a single owning
-	// reference (the compositor releases exactly one ref on teardown). Only if
-	// nothing has been published yet do we acquire + publish here. #507
-	struct _ANativeWindow *published = nullptr;
-	bool valid = false;
-	android_globals_get_window_state(&published, nullptr, &valid);
-	if (valid && published != nullptr) {
-		return (ANativeWindow *)published;
+	// published this surface's ANativeWindow, reuse it. #507
+	//
+	// #1040: return an OWNED reference either way — every caller of this
+	// function hands the result straight to android_globals_store_window(),
+	// which now consumes one reference. Handing back the published pointer
+	// unreferenced made that store release a reference nobody had taken.
+	{
+		uint64_t gen = 0;
+		bool valid = false;
+		struct _ANativeWindow *published = android_globals_acquire_window(&gen, &valid);
+		if (published != nullptr) {
+			if (valid) {
+				return (ANativeWindow *)published;
+			}
+			ANativeWindow_release((ANativeWindow *)published);
+		}
 	}
 
 	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf.object().makeLocalReference());

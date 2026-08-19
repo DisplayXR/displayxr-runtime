@@ -14,6 +14,7 @@
 #include <mutex>
 #include <jni.h>
 #include <wrap/android.app.h>
+#include <android/native_window.h>
 
 /*!
  * @todo Do we need locking here?
@@ -87,23 +88,73 @@ android_globals_get_window()
 	return android_globals.window;
 }
 
+/*
+ * Reference-counting contract (#1040)
+ * ------------------------------------
+ * `android_globals` OWNS exactly one reference on the window it publishes:
+ * every caller of set/store_window TRANSFERS one reference in (the one
+ * `ANativeWindow_fromSurface` just acquired), and the globals release the
+ * previous one. Consumers that want to keep the window take their OWN
+ * reference via android_globals_acquire_window().
+ *
+ * The old model ("the consumer adopts the single published reference") made
+ * the count depend on how many consumers happened to see one publish: an
+ * xrEndSession→xrBeginSession cycle builds a second compositor target from the
+ * same still-valid publication, so the second teardown released a reference
+ * nobody had taken. That dropped the native Surface's strong count to zero
+ * while the Java Surface still held its own, and the eventual
+ * Surface.finalize() → nativeRelease() ran RefBase::incStrong() on freed
+ * memory → SIGSEGV in FinalizerDaemon.
+ */
 void
 android_globals_set_window(struct _ANativeWindow *window)
 {
-	std::lock_guard<std::mutex> lock(android_surface.mutex);
-	android_surface.window = window;
-	android_surface.valid = (window != nullptr);
-	android_surface.generation++;
+	struct _ANativeWindow *drop = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(android_surface.mutex);
+		// Either the window we are replacing, or — when the same window is
+		// re-published (ANativeWindow_fromSurface returns the same pointer for
+		// an unchanged Surface, referencing it again) — the caller's duplicate.
+		// Both cases drop exactly one reference and leave the globals owning one.
+		drop = android_surface.window;
+		android_surface.window = window;
+		android_surface.valid = (window != nullptr);
+		android_surface.generation++;
+	}
+	if (drop != nullptr) {
+		ANativeWindow_release((ANativeWindow *)drop);
+	}
 }
 
 void
 android_globals_clear_window(void)
 {
 	std::lock_guard<std::mutex> lock(android_surface.mutex);
-	// Keep the pointer (consumer releases it after idling the GPU) but mark it
-	// invalid + bump the generation so the next re-sync tears the surface down.
+	// Keep the pointer AND the globals' reference on it — that is what makes
+	// the stale pointer safe to compare against until the next publish (#1040).
+	// Mark it invalid + bump the generation so the next re-sync tears the
+	// surface down.
 	android_surface.valid = false;
 	android_surface.generation++;
+}
+
+struct _ANativeWindow *
+android_globals_acquire_window(uint64_t *out_generation, bool *out_valid)
+{
+	std::lock_guard<std::mutex> lock(android_surface.mutex);
+	if (out_generation != nullptr) {
+		*out_generation = android_surface.generation;
+	}
+	if (out_valid != nullptr) {
+		*out_valid = android_surface.valid;
+	}
+	if (android_surface.window == nullptr) {
+		return nullptr;
+	}
+	// Acquired under the same lock that replaces/frees it, so this can never
+	// race a concurrent set_window into a use-after-free.
+	ANativeWindow_acquire((ANativeWindow *)android_surface.window);
+	return android_surface.window;
 }
 
 void

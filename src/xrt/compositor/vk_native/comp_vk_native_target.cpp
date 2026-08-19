@@ -1240,7 +1240,16 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 #ifdef XRT_OS_ANDROID
 	// Track the surface we build from + the generation it matches, so the
 	// per-frame re-sync can detect surface loss / replacement on resume. #507
+	//
+	// #1040: hold our OWN reference on it. `hwnd` is the window android_globals
+	// published (and still owns); adopting that single reference made a second
+	// target in the same process — an xrEndSession→xrBeginSession cycle —
+	// release a reference nobody had taken, destroying the native Surface under
+	// the live Java Surface (SIGSEGV in Surface.finalize).
 	target->android_window = hwnd;
+	if (target->android_window != NULL) {
+		ANativeWindow_acquire((ANativeWindow *)target->android_window);
+	}
 	target->surface_lost = false;
 	android_globals_get_window_state(NULL, &target->surface_generation, NULL);
 #endif
@@ -1694,22 +1703,36 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
 	}
 
-	// Resume: rebuild VkSurfaceKHR + swapchain from the new ANativeWindow,
-	// taking ownership of the reference aux_android published.
+	// Resume: rebuild VkSurfaceKHR + swapchain from the new ANativeWindow.
+	// #1040: take our own reference, atomically with the read — `cur_window`
+	// above is only safe to compare, a concurrent publish can free it.
+	uint64_t acq_gen = 0;
+	bool acq_valid = false;
+	struct _ANativeWindow *win = android_globals_acquire_window(&acq_gen, &acq_valid);
+	if (win == NULL || !acq_valid) {
+		if (win != NULL) {
+			ANativeWindow_release((ANativeWindow *)win);
+		}
+		target->surface_lost = true;
+		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
+	}
+	target->surface_generation = acq_gen;
+
 	VkAndroidSurfaceCreateInfoKHR surface_ci = {
 	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
 	    .pNext = NULL,
 	    .flags = 0,
-	    .window = (ANativeWindow *)cur_window,
+	    .window = (ANativeWindow *)win,
 	};
 	VkResult res = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_ci, NULL, &target->surface);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("sync_surface: vkCreateAndroidSurfaceKHR failed: %d", res);
+		ANativeWindow_release((ANativeWindow *)win);
 		target->surface = VK_NULL_HANDLE;
 		target->surface_lost = true;
 		return COMP_VK_NATIVE_TARGET_SURFACE_LOST;
 	}
-	target->android_window = cur_window;
+	target->android_window = (void *)win;
 
 	// Adopt the new surface's current extent (covers a portrait<->landscape flip
 	// that happened while backgrounded).

@@ -95,9 +95,8 @@ android_globals_set_window(struct _ANativeWindow *window);
  * counter and clears the valid flag so the compositor tears its surface down
  * instead of presenting to a dead window. Thread-safe.
  *
- * Keeps the ANativeWindow pointer around (still the "current" window) so a
- * consumer mid-frame can finish/idle before it next re-syncs; the consumer
- * releases the old reference itself once it has idled the GPU.
+ * Keeps the ANativeWindow pointer AND the globals' own reference on it, so the
+ * pointer can never dangle between the clear and the next publish (#1040).
  * @ingroup aux_android
  */
 void
@@ -106,6 +105,11 @@ android_globals_clear_window(void);
 /*!
  * Atomically read the current window + generation + validity.
  *
+ * The returned pointer is NOT referenced for the caller — it is only safe to
+ * compare/inspect. A caller that intends to KEEP the window (build a
+ * VkSurfaceKHR from it, stash it in a target struct) must use
+ * @ref android_globals_acquire_window instead (#1040).
+ *
  * @param[out] out_window     the current ANativeWindow (may be NULL).
  * @param[out] out_generation monotonic counter, bumped on every set/clear.
  * @param[out] out_valid      true if a live surface is currently published.
@@ -113,6 +117,30 @@ android_globals_clear_window(void);
  */
 void
 android_globals_get_window_state(struct _ANativeWindow **out_window, uint64_t *out_generation, bool *out_valid);
+
+/*!
+ * Atomically take an OWNED reference on the currently published window (#1040).
+ *
+ * This is the only safe way for a consumer to keep the window: it acquires
+ * under the same lock that publishes/replaces it, so a concurrent
+ * @ref android_globals_set_window can never free the window between the read
+ * and the acquire. The caller must pair the returned pointer with exactly one
+ * `ANativeWindow_release()`.
+ *
+ * Before #1040 every consumer "adopted the published reference" instead, which
+ * made the reference count depend on how many compositor instances happened to
+ * consume one publish — a second consumer (an xrEndSession→xrBeginSession
+ * cycle, or a second satellite session) released a reference nobody had taken,
+ * destroying the native Surface under the still-live Java `Surface` and
+ * SIGSEGVing the finalizer.
+ *
+ * @param[out] out_generation monotonic counter matching the returned window.
+ * @param[out] out_valid      true if a live surface is currently published.
+ * @return the referenced ANativeWindow, or NULL if none is published.
+ * @ingroup aux_android
+ */
+struct _ANativeWindow *
+android_globals_acquire_window(uint64_t *out_generation, bool *out_valid);
 
 /*!
  * Store/retrieve the active android_custom_surface (opaque) so a periodic tick
