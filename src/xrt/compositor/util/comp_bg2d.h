@@ -96,6 +96,39 @@ struct comp_bg2d_state
 
 
 /*!
+ * Where a whole-panel capture must be cut for a session's compose-under
+ * backdrop, in panel pixels — the single authority both compositor paths use.
+ *
+ * The DP maps the backdrop with `bg_uv` (0,0)-(1,1) across **whatever region
+ * `process_atlas` writes**, so the crop is a function of that region and
+ * nothing else. That region is @p dp_canvas when the caller hands
+ * `process_atlas` a non-degenerate canvas sub-rect (the out-of-process
+ * `comp_multi` path passes the frame's zone-3D rect), and the **whole client
+ * window** when it hands it the degenerate rect (the in-process
+ * `comp_vk_native` path always does: a zones frame's rects drive the lens mask,
+ * not the weave output rect, so the DP fills the target).
+ *
+ * Deriving the crop from anything else — the zone rect on a path that does not
+ * pass it down — squeezes the whole panel into a band: the backdrop then reads
+ * as a `panel_h / canvas_h` vertical stretch, exact at the canvas' far edge and
+ * drifting linearly toward its near one (#1101; measured 1.333x on a 1600x2560
+ * panel under a bottom-75% zone).
+ *
+ * @param      window_on_panel Client window rect in panel pixels.
+ * @param      dp_canvas       Canvas sub-rect handed to `process_atlas`,
+ *                             window-relative. A degenerate (zero-extent) rect
+ *                             means "the DP fills the whole target".
+ * @param[out] out_rect        Crop rect in panel pixels.
+ * @return false when @p window_on_panel is degenerate and no crop can be
+ *         derived; the caller then supplies no backdrop rather than a
+ *         mis-registered one.
+ */
+bool
+comp_bg2d_backdrop_source_rect(const struct xrt_rect *window_on_panel,
+                               const struct xrt_rect *dp_canvas,
+                               struct xrt_rect *out_rect);
+
+/*!
  * Is a runtime-supplied backdrop configured at all?
  *
  * Parsed once per process from `debug.dxr.bg2d` / `DXR_BG2D`. Cheap enough to

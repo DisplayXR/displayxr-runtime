@@ -2931,6 +2931,30 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
  */
 static struct vk_frame_timing s_ftiming = {0};
 
+/*!
+ * The canvas sub-rect this compositor hands `xrt_display_processor_process_atlas`,
+ * window-relative — the ONE place that answers "what region will the DP write".
+ *
+ * In-process the answer is always the degenerate rect, i.e. "fill the whole
+ * target". A zones frame is not an exception: each zone rect is its own canvas
+ * and drives the lens mask, while the weave output rect stays the full client
+ * window (same rule `vk_effective_canvas` encodes for the view dims). The
+ * out-of-process `comp_multi` path differs — it passes the frame's zone-3D rect
+ * down and the DP confines the weave to it.
+ *
+ * It exists as a function, and is read by the `process_atlas` call sites rather
+ * than open-coded there, because the compose-under backdrop must be cut to
+ * exactly this region: when the two disagree the backdrop is stretched by
+ * `target_h / canvas_h` (#1101). One authority, no per-call-site math.
+ */
+static struct xrt_rect
+vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
+{
+	(void)c;
+	return (struct xrt_rect){0};
+}
+
+
 /*
  * Compose-under backdrop for the base-DP slot-16 seam (#1073), in-process leg.
  *
@@ -2978,15 +3002,19 @@ vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
 		return VK_NULL_HANDLE;
 	}
 
-	// Where this session's canvas sits on the panel, in panel pixels. A T2
-	// producer sends whole-PANEL pixels while slot 16 promises the CANVAS, so
-	// comp_bg2d crops to this rect (#174) — and re-crops whenever it moves,
-	// which is what makes a device rotation self-correcting.
+	// Where the backdrop must be cut from, in panel pixels. A T2 producer sends
+	// whole-PANEL pixels while slot 16 promises the DP a backdrop already in the
+	// region it will map onto, so comp_bg2d crops to this rect (#174) — and
+	// re-crops whenever it moves, which is what makes a device rotation
+	// self-correcting.
 	//
 	// In-process the window rect comes from the app's own
 	// xrSetAndroidWindowGeometryDXR publish (#1037) through the same
-	// android_globals sink the OOP path reads (#1033); the canvas inside it is
-	// the frame's zone-3D rect, or the whole window when the frame has none.
+	// android_globals sink the OOP path reads (#1033). The region *inside* it is
+	// whatever `process_atlas` is handed as its canvas sub-rect — read from the
+	// one authority below, never re-derived here, because deriving it from the
+	// frame's zone-3D rect while the DP is told to fill the whole target is
+	// exactly the #1101 vertical stretch.
 	int32_t win_x = 0, win_y = 0, display_id = -1;
 	uint32_t win_w = 0, win_h = 0, panel_w = 0, panel_h = 0;
 	uint64_t generation = 0;
@@ -3001,24 +3029,16 @@ vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
 		return VK_NULL_HANDLE;
 	}
 
-	int32_t canvas_x = 0, canvas_y = 0;
-	uint32_t canvas_w = 0, canvas_h = 0;
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
-			continue;
-		}
-		const struct xrt_rect *zr = &c->layer_accum.layers[i].data.zone_3d.rect;
-		canvas_x = zr->offset.w;
-		canvas_y = zr->offset.h;
-		canvas_w = (uint32_t)zr->extent.w;
-		canvas_h = (uint32_t)zr->extent.h;
-		break;
-	}
-
-	struct xrt_rect canvas_on_panel = {
-	    .offset = {.w = win_x + canvas_x, .h = win_y + canvas_y},
-	    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : win_w), .h = (int)(canvas_h != 0 ? canvas_h : win_h)},
+	const struct xrt_rect window_on_panel = {
+	    .offset = {.w = win_x, .h = win_y},
+	    .extent = {.w = (int)win_w, .h = (int)win_h},
 	};
+	const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
+
+	struct xrt_rect canvas_on_panel = {0};
+	if (!comp_bg2d_backdrop_source_rect(&window_on_panel, &dp_canvas, &canvas_on_panel)) {
+		return VK_NULL_HANDLE;
+	}
 
 	struct vk_bundle *vk = &c->vk;
 	VkCommandPool pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
@@ -3422,23 +3442,18 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    comp_vk_native_target_get_measured_weave_ns(c->target),
 			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 
-			// Call display processor with atlas (or zero-copy swapchain) texture
+			// Call display processor with atlas (or zero-copy swapchain) texture.
+			// The canvas sub-rect comes from vk_dp_canvas_rect() — the same
+			// authority vk_bg2d_backdrop() cuts the compose-under backdrop to,
+			// so the two can never disagree (#1101).
+			const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
 			xrt_display_processor_process_atlas(
-			    c->display_processor,
-			    dp_self_submits ? VK_NULL_HANDLE : cmd,
-			    (VkImage_XDP)(uintptr_t)src_image_u64,
-			    (VkImageView)(uintptr_t)src_view_u64,
-			    view_width, view_height,
-			    tc, tr,
-			    (VkFormat_XDP)view_format,
-			    target_fb,
-			    (VkImage_XDP)(uintptr_t)target_image,
-			    tgt_width, tgt_height,
-			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target),
-			    0,
-			    0,
-			    0,
-			    0);
+			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
+			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
+			    view_height, tc, tr, (VkFormat_XDP)view_format, target_fb,
+			    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
+			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
+			    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
 
 			if (ftime) {
 				fp[3] = os_monotonic_get_ns();
@@ -4254,22 +4269,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// the window's panel position. Must precede process_atlas.
 			vk_update_present_origin(c);
 
+			// Same single canvas authority as the window path (#1101).
+			const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
 			xrt_display_processor_process_atlas(
-			    c->display_processor,
-			    dp_self_submits ? VK_NULL_HANDLE : cmd,
-			    (VkImage_XDP)(uintptr_t)src_image_u64,
-			    (VkImageView)(uintptr_t)src_view_u64,
-			    view_width, view_height,
-			    tc, tr,
-			    (VkFormat_XDP)view_format,
-			    shared_fb,
-			    (VkImage_XDP)c->shared_image,
-			    dp_target_w, dp_target_h,
-			    (VkFormat_XDP)view_format,
-			    0,
-			    0,
-			    0,
-			    0);
+			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
+			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
+			    view_height, tc, tr, (VkFormat_XDP)view_format, shared_fb, (VkImage_XDP)c->shared_image,
+			    dp_target_w, dp_target_h, (VkFormat_XDP)view_format, dp_canvas.offset.w, dp_canvas.offset.h,
+			    (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
 
 			if (dp_self_submits) {
 				// DP owns its own submit — nothing left for us to do this
