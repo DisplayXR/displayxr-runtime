@@ -168,6 +168,10 @@ if(XRT_HAVE_VULKAN)
 		comp_util STATIC
 		util/comp_base.h
 		util/comp_base.c
+		util/comp_bg2d.c
+		util/comp_bg2d.h
+		util/comp_bg2d_capture.c
+		util/comp_bg2d_capture.h
 		util/comp_high_level_render.c
 		util/comp_high_level_render.h
 		util/comp_high_level_scratch.c
@@ -273,8 +277,6 @@ add_library(
 			  multi/comp_multi_private.h multi/comp_multi_system.c
 			  multi/comp_multi_workspace.c multi/comp_multi_workspace.h
 			  multi/comp_multi_content_blend.c multi/comp_multi_content_blend.h
-			  multi/comp_multi_bg2d.c multi/comp_multi_bg2d.h
-			  multi/comp_multi_bg2d_capture.c multi/comp_multi_bg2d_capture.h
 	)
 target_link_libraries(
 	comp_multi
@@ -285,6 +287,14 @@ target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # comp_render provides render_shaders_load/fini used by window-space layer compositing
 target_link_libraries(comp_multi PRIVATE comp_render)
+
+# The compose-under backdrop producer (base-DP slot 16, #1073) lives in
+# comp_util rather than here, because the IN-PROCESS vk_native compositor needs
+# the identical producer and neither library links the other. comp_util is
+# Vulkan-gated; so is the backdrop, which is a VkImageView.
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(comp_multi PRIVATE comp_util)
+endif()
 
 # Qwerty include path for runtime-side 2D/3D toggle polling
 if(XRT_BUILD_DRIVER_QWERTY)

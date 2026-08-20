@@ -17,6 +17,7 @@
 #include "comp_vk_native_renderer.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/comp_bg2d.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -304,6 +305,14 @@ struct comp_vk_native_compositor
 	//! present uses a transparent compositeAlpha. Cached for the macOS Local2D
 	//! flat-2D-over-desktop rule (#568) in vk_composite_local_2d.
 	bool transparent_background;
+
+	//! Compose-under backdrop for the base-DP slot-16 seam (#1073). The
+	//! out-of-process path produces this in comp_multi_system.c; in-process
+	//! this is the same producer, so an Arch-A app (its own translucent
+	//! window, no service overlay, no anti-tapjacking alpha clamp) gets the
+	//! same opaque-band weave. Only ever populated when nothing else already
+	//! claimed the slot — see vk_bg2d_backdrop.
+	struct comp_bg2d_state bg2d;
 
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
@@ -2922,6 +2931,104 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
  */
 static struct vk_frame_timing s_ftiming = {0};
 
+/*
+ * Compose-under backdrop for the base-DP slot-16 seam (#1073), in-process leg.
+ *
+ * ## Why this exists twice
+ *
+ * The weave assigns views per *subpixel* while RGBA carries one alpha per
+ * *pixel*, so a mixed-alpha pixel — the silhouette, the parallax de-occlusion
+ * band — has no correct alpha at all. The fix is to composite an opaque
+ * background under every view BEFORE the per-subpixel collapse, which is what
+ * slot 16 delivers. `comp_multi_system.c` does this for the out-of-process
+ * session path; this is the same producer for the in-process one, and it is
+ * not a duplicate — `comp_bg2d` is shared verbatim, only the geometry the
+ * compositor happens to know differs.
+ *
+ * It matters because the two paths differ in exactly the way that decides
+ * whether the result is shippable. Out of process the weave lands on the
+ * service's `TYPE_APPLICATION_OVERLAY`, which carries the ≤ 0.80
+ * anti-tapjacking alpha clamp — a 20 % launcher ghost over every pixel that no
+ * backdrop can remove. In process (ADR-036 Architecture A) the app owns a plain
+ * translucent `TYPE_APPLICATION` window: no clamp, no overlay at all, so an
+ * opaque-band weave over real captured pixels is the end state rather than a
+ * demonstration of one.
+ *
+ * ## Precedence: an app-supplied Local2D backdrop wins
+ *
+ * `vk_flatten_backdrop_2d` (#491) already owns this slot when the frame has
+ * 2D-UNDER Local2D layers: the app explicitly said "this is what is behind my
+ * 3D content", and a captured screenshot is a *guess* at the same question. An
+ * explicit answer beats a guess, so the capture only fills the slot on frames
+ * where the flatten declined it. The two are never blended — one background,
+ * one authority.
+ *
+ * Returns VK_NULL_HANDLE (leaving @p w / @p h at 0) whenever there is nothing
+ * to supply, which is byte-for-byte the pre-#1073 path.
+ */
+static VkImageView
+vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
+{
+	*w = 0;
+	*h = 0;
+#ifdef XRT_OS_ANDROID
+	// Same two gates as the OOP path: a backdrop is meaningless under an
+	// opaque present, and the whole producer is off unless asked for.
+	if (!c->transparent_background || !comp_bg2d_enabled() || c->display_processor == NULL) {
+		return VK_NULL_HANDLE;
+	}
+
+	// Where this session's canvas sits on the panel, in panel pixels. A T2
+	// producer sends whole-PANEL pixels while slot 16 promises the CANVAS, so
+	// comp_bg2d crops to this rect (#174) — and re-crops whenever it moves,
+	// which is what makes a device rotation self-correcting.
+	//
+	// In-process the window rect comes from the app's own
+	// xrSetAndroidWindowGeometryDXR publish (#1037) through the same
+	// android_globals sink the OOP path reads (#1033); the canvas inside it is
+	// the frame's zone-3D rect, or the whole window when the frame has none.
+	int32_t win_x = 0, win_y = 0, display_id = -1;
+	uint32_t win_w = 0, win_h = 0, panel_w = 0, panel_h = 0;
+	uint64_t generation = 0;
+	if (!android_globals_get_window_screen_rect(&win_x, &win_y, &win_w, &win_h, &display_id, &panel_w, &panel_h,
+	                                            &generation)) {
+		// No geometry published: cropping would be a guess, and a whole-panel
+		// backdrop stretched across the canvas is exactly the mis-registration
+		// #174 was about. Sit it out.
+		return VK_NULL_HANDLE;
+	}
+	if (panel_w == 0 || panel_h == 0 || win_w == 0 || win_h == 0) {
+		return VK_NULL_HANDLE;
+	}
+
+	int32_t canvas_x = 0, canvas_y = 0;
+	uint32_t canvas_w = 0, canvas_h = 0;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+			continue;
+		}
+		const struct xrt_rect *zr = &c->layer_accum.layers[i].data.zone_3d.rect;
+		canvas_x = zr->offset.w;
+		canvas_y = zr->offset.h;
+		canvas_w = (uint32_t)zr->extent.w;
+		canvas_h = (uint32_t)zr->extent.h;
+		break;
+	}
+
+	struct xrt_rect canvas_on_panel = {
+	    .offset = {.w = win_x + canvas_x, .h = win_y + canvas_y},
+	    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : win_w), .h = (int)(canvas_h != 0 ? canvas_h : win_h)},
+	};
+
+	struct vk_bundle *vk = &c->vk;
+	VkCommandPool pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+	return comp_bg2d_ensure(&c->bg2d, vk, pool, &canvas_on_panel, panel_w, panel_h, w, h);
+#else
+	(void)c;
+	return VK_NULL_HANDLE;
+#endif
+}
+
 /*!
  * #868: acquire -> weave -> submit -> present. Shared by the app frame and by
  * the repaint replay, so a repaint is constructed exactly like the frame it
@@ -3232,6 +3339,16 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				c->repaint.backdrop_view = (uint64_t)(uintptr_t)bd_view;
 				c->repaint.backdrop_w = bd_w;
 				c->repaint.backdrop_h = bd_h;
+			}
+
+			// #1073 — nothing app-supplied claimed the slot, so offer the
+			// captured desktop instead. Deliberately also on a repaint: the
+			// capture is compositor-owned state read off a socket, not the
+			// app's Local2D swapchains, so re-running it breaks no #868 rule
+			// and lets a repaint after a device rotation pick up the newly
+			// re-cropped backdrop instead of re-presenting the stale one.
+			if (bd_view == VK_NULL_HANDLE) {
+				bd_view = vk_bg2d_backdrop(c, &bd_w, &bd_h);
 			}
 
 			// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
@@ -4102,6 +4219,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			uint32_t bd_w = 0, bd_h = 0;
 			VkImageView bd_view = vk_flatten_backdrop_2d(c, cmd, dp_target_w, dp_target_h, &bd_w, &bd_h);
 
+			// #1073 — same precedence as the window path: the captured desktop
+			// only fills the slot the app's own Local2D backdrop declined. The
+			// upload is self-contained (its own one-shot command buffer, waited
+			// on), so it is complete before the flush below either way.
+			if (bd_view == VK_NULL_HANDLE) {
+				bd_view = vk_bg2d_backdrop(c, &bd_w, &bd_h);
+			}
+
 			bool dp_self_submits =
 			    xrt_display_processor_is_self_submitting(c->display_processor);
 
@@ -4293,6 +4418,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_fini(&c->mcp_capture);
 
 	vk->vkDeviceWaitIdle(vk->device);
+
+	// Compose-under backdrop (#1073). The socket receiver behind it is
+	// process-global and deliberately left running: one screen has one
+	// background, and a producer is allowed to outlive any single session.
+	comp_bg2d_teardown(&c->bg2d, vk);
 
 	// Destroy HUD resources
 	if (c->hud_image != VK_NULL_HANDLE) {

@@ -40,7 +40,7 @@
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_workspace.h"
-#include "multi/comp_multi_bg2d.h"
+#include "util/comp_bg2d.h"
 #include "main/comp_target.h"
 #include "xrt/xrt_display_processor_vk.h" // #1033: per-window weave phase (set_window_screen_rect)
 
@@ -3411,7 +3411,7 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			//
 			// Cleared explicitly when off, so a session that stops being
 			// transparent can never leave a stale view bound in the DP.
-			if (mc->session_render.dp_transparent && comp_multi_bg2d_enabled()) {
+			if (mc->session_render.dp_transparent && comp_bg2d_enabled()) {
 				// Where this session's canvas sits on the panel. T2 sends a
 				// whole-panel capture while slot 16 promises the canvas, so
 				// the receiver crops to this rect (#174); T0 draws its own
@@ -3445,7 +3445,8 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 				};
 				uint32_t bg_w = 0, bg_h = 0;
 				VkImageView bg_view =
-				    comp_multi_bg2d_ensure(mc, vk, &canvas_on_panel, panel_w, panel_h, &bg_w, &bg_h);
+				    comp_bg2d_ensure(&mc->session_render.bg2d, vk, mc->session_render.cmd_pool,
+				                     &canvas_on_panel, panel_w, panel_h, &bg_w, &bg_h);
 				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
 				                                        bg_view, bg_w, bg_h);
 			} else {
