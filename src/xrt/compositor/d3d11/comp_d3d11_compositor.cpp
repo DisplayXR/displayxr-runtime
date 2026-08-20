@@ -129,10 +129,11 @@ struct comp_d3d11_compositor
 	 * D3D12 needs no equivalent: it records into per-thread command lists and
 	 * allocators, so there is no shared immediate state to interleave with.
 	 *
-	 * MUST stay BELOW dxgi_factory: comp_d3d11_target.cpp mirrors the members
+	 * MUST stay BELOW dxgi_factory: comp_d3d11_renderer.cpp mirrors the members
 	 * above as `comp_d3d11_compositor_internals` to reach them from C. A field
-	 * inserted into that prefix silently shifts the mirror and the target
-	 * reads the wrong pointer (crashes in comp_d3d11_target_create).
+	 * inserted into that prefix silently shifts the mirror and the renderer
+	 * reads the wrong pointer. (comp_d3d11_target.cpp no longer mirrors it —
+	 * the target is handed its device/context/factory explicitly, #918.)
 	 */
 	ID3D10Multithread *mt_lock;
 
@@ -1048,9 +1049,16 @@ d3d11_compositor_layer_zone_3d(struct xrt_compositor *xc,
 /*!
  * Render the HUD overlay onto the back buffer (post-weave).
  * Uses CopySubresourceRegion for zero-shader simplicity.
+ *
+ * @p device / @p context are the device the staging texture is created on and
+ * the context the upload + back-buffer blit run on — explicit (#918) so the HUD
+ * follows the output target rather than the compositor's own device.
  */
 static void
-d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
+d3d11_render_hud_overlay(struct comp_d3d11_compositor *c,
+                         ID3D11Device *device,
+                         ID3D11DeviceContext *context,
+                         bool weaving_done,
                          const struct xrt_eye_positions *eye_pos)
 {
 	if (!c->owns_window || c->hud == NULL || !u_hud_is_visible()) {
@@ -1180,7 +1188,7 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = 0; // No shader binding needed, just copy source
 
-		HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->hud_texture);
+		HRESULT hr = device->CreateTexture2D(&desc, nullptr, &c->hud_texture);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create HUD texture: 0x%08x", hr);
 			return;
@@ -1192,9 +1200,7 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
 	// Upload pixels to staging texture if changed
 	if (dirty && c->hud_texture != nullptr) {
 		uint32_t hud_w = u_hud_get_width(c->hud);
-		c->context->UpdateSubresource(c->hud_texture, 0, nullptr,
-		                               u_hud_get_pixels(c->hud),
-		                               hud_w * 4, 0);
+		context->UpdateSubresource(c->hud_texture, 0, nullptr, u_hud_get_pixels(c->hud), hud_w * 4, 0);
 	}
 
 	// Blit HUD texture to bottom-left of back buffer
@@ -1210,8 +1216,7 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
 			uint32_t dst_y = (win_h > hud_h + 10) ? (win_h - hud_h - 10) : 0;
 
 			D3D11_BOX src_box = {0, 0, 0, hud_w, hud_h, 1};
-			c->context->CopySubresourceRegion(back_buffer, 0, dst_x, dst_y, 0,
-			                                   c->hud_texture, 0, &src_box);
+			context->CopySubresourceRegion(back_buffer, 0, dst_x, dst_y, 0, c->hud_texture, 0, &src_box);
 		}
 	}
 }
@@ -1323,8 +1328,12 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 // (#431). A uniform resample is correct for an equal-sized tile grid — the tile
 // boundary at source view_w maps exactly to the target view_w. Pass 0 to write
 // the read-back region verbatim (no resample).
+//
+// The device/context the readback runs on are explicit parameters (#918) — the
+// capture is not tied to the compositor's own device.
 static bool
-d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
+d3d11_capture_texture_to_png(ID3D11Device *device,
+                             ID3D11DeviceContext *context,
                              ID3D11Texture2D *atlas_tex,
                              uint32_t content_w,
                              uint32_t content_h,
@@ -1350,15 +1359,15 @@ d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
 	sd.MiscFlags = 0;
 
 	ID3D11Texture2D *staging = nullptr;
-	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+	if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
 		return false;
 	}
 
 	D3D11_BOX src_box = {0, 0, 0, content_w, content_h, 1};
-	c->context->CopySubresourceRegion(staging, 0, 0, 0, 0, atlas_tex, 0, &src_box);
+	context->CopySubresourceRegion(staging, 0, 0, 0, 0, atlas_tex, 0, &src_box);
 
 	D3D11_MAPPED_SUBRESOURCE m = {};
-	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+	if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
 		staging->Release();
 		return false;
 	}
@@ -1417,7 +1426,7 @@ d3d11_capture_texture_to_png(struct comp_d3d11_compositor *c,
 		free(tight);
 	}
 
-	c->context->Unmap(staging, 0);
+	context->Unmap(staging, 0);
 	staging->Release();
 	return ok;
 }
@@ -1495,7 +1504,7 @@ d3d11_compositor_capture_atlas_to_png(struct comp_d3d11_compositor *c, const cha
 	if (atlas_tex == nullptr || !d3d11_compositor_content_dims(c, &content_w, &content_h)) {
 		return false;
 	}
-	return d3d11_capture_texture_to_png(c, atlas_tex, content_w, content_h, 0, 0, path);
+	return d3d11_capture_texture_to_png(c->device, c->context, atlas_tex, content_w, content_h, 0, 0, path);
 }
 
 // Service a pending MCP capture_frame request — thin wrapper around
@@ -1565,8 +1574,8 @@ d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void
 				dst_h = content_h;
 			}
 		}
-		ok = d3d11_capture_texture_to_png(c, zc_tex, zdesc.Width, zdesc.Height,
-		                                  dst_w, dst_h, c->capture_intent.path);
+		ok = d3d11_capture_texture_to_png(c->device, c->context, zc_tex, zdesc.Width, zdesc.Height, dst_w,
+		                                  dst_h, c->capture_intent.path);
 	}
 	if (resource != nullptr) {
 		resource->Release();
@@ -1595,7 +1604,8 @@ d3d11_compositor_dispatch_capture_zerocopy(struct comp_d3d11_compositor *c, void
  * staging copy + Map, so it is env-gated and never on by default.
  */
 static uint64_t
-d3d11_hash_target(struct comp_d3d11_compositor *c,
+d3d11_hash_target(ID3D11Device *device,
+                  ID3D11DeviceContext *context,
                   ID3D11Texture2D *tex,
                   uint32_t w,
                   uint32_t h,
@@ -1620,14 +1630,14 @@ d3d11_hash_target(struct comp_d3d11_compositor *c,
 	sd.SampleDesc.Quality = 0;
 
 	ID3D11Texture2D *staging = nullptr;
-	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+	if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
 		return 0;
 	}
 	D3D11_BOX box = {0, 0, 0, w, h, 1};
-	c->context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
+	context->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
 
 	D3D11_MAPPED_SUBRESOURCE m = {};
-	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+	if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
 		staging->Release();
 		return 0;
 	}
@@ -1656,7 +1666,7 @@ d3d11_hash_target(struct comp_d3d11_compositor *c,
 			}
 		}
 	}
-	c->context->Unmap(staging, 0);
+	context->Unmap(staging, 0);
 	staging->Release();
 	return hsh;
 }
@@ -1822,8 +1832,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 */
 	if (c->repaint.hash_probe == 1 && back_buffer_2d != nullptr) {
 		uint8_t *rp_px = nullptr;
-		const uint64_t hsh = d3d11_hash_target(c, back_buffer_2d, target_width, target_height,
-		                                       is_repaint ? &rp_px : &c->repaint.app_px);
+		const uint64_t hsh = d3d11_hash_target(c->device, c->context, back_buffer_2d, target_width,
+		                                       target_height, is_repaint ? &rp_px : &c->repaint.app_px);
 
 		/*
 		 * #876 ABSOLUTE dropout detector — runs on EVERY weave, app or repaint.
@@ -2049,8 +2059,8 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				char out[512];
 				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp,
 				         is_repaint ? "repaint" : "app");
-				bool wok = d3d11_capture_texture_to_png(c, back_buffer_2d, target_width,
-				                                        target_height, 0, 0, out);
+				bool wok = d3d11_capture_texture_to_png(c->device, c->context, back_buffer_2d,
+				                                        target_width, target_height, 0, 0, out);
 				U_LOG_W("#868 d3d11 woven capture %s -> %s", wok ? "OK" : "FAILED", out);
 			}
 		}
@@ -2149,7 +2159,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 
 			comp_d3d11_target_acquire(c->target, &rp_index);
 			d3d11_dp_weave(c, true);
-			d3d11_render_hud_overlay(c, true, &c->repaint.eye_pos);
+			d3d11_render_hud_overlay(c, c->device, c->context, true, &c->repaint.eye_pos);
 			comp_d3d11_target_present(c->target, 1);
 		}
 
@@ -2662,7 +2672,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// HUD overlay (post-processing, always readable)
-	d3d11_render_hud_overlay(c, weaving_done, &eye_pos);
+	d3d11_render_hud_overlay(c, c->device, c->context, weaving_done, &eye_pos);
 
 	// Note: transparency (compose-under-bg / alpha-gate) lives inside the
 	// vendor display processor, enabled via set_transparent_background. The
@@ -3048,11 +3058,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// Create output target (DXGI swapchain) — skip if offscreen (no HWND)
 	if (c->hwnd != nullptr) {
-		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd,
-		                                              c->settings.preferred.width,
-		                                              c->settings.preferred.height,
-		                                              transparent_background,
-		                                              &c->target);
+		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, c->device, c->context, c->dxgi_factory,
+		                                             c->settings.preferred.width, c->settings.preferred.height,
+		                                             transparent_background, &c->target);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create D3D11 target");
 			d3d11_compositor_destroy(&c->base.base);
