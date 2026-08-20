@@ -37,25 +37,6 @@ struct LayerConstants
 };
 
 /*!
- * Masked 2D-over-3D composite constant buffer (unified-2d-3d-compositing #439,
- * Phase 0). Matches `cbuffer CompositeParams : register(b0)` in
- * shaders/masked_composite.hlsl. 48 bytes; HLSL packs as three float4 rows
- * with no straddle (dst_dims.xy | canvas_origin.xy , canvas_size.xy | mask |
- * mode , opaque_present | pad) — the trailing pad keeps sizeof a multiple of
- * 16 for CreateBuffer.
- */
-struct CompositeParams
-{
-	float dst_dims[2];      // destination width,height in px
-	float canvas_origin[2]; // 3D canvas sub-rect top-left (px)
-	float canvas_size[2];   // 3D canvas sub-rect size (px)
-	uint32_t use_rect_mask;  // 1 = Phase 0 analytic rect mask
-	uint32_t composite_mode; // COMP_D3D11_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
-	uint32_t opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
-	uint32_t pad[3];
-};
-
-/*!
  * Local2D flatten constant buffer (#439 Phase 3). One float4: the source
  * sub-rect in normalized [0,1] swapchain-image coords. The viewport's uv [0,1]
  * maps through it as `src_uv = xy + uv*zw`. The caller bakes the dest-clip
@@ -105,12 +86,6 @@ struct comp_d3d11_renderer
 	//! Pixel shader for quad layers.
 	ID3D11PixelShader *quad_ps;
 
-	//! Masked 2D-over-3D composite shaders (#439 Phase 0).
-	ID3D11VertexShader *composite_vs;
-	ID3D11PixelShader *composite_ps;
-	//! Constant buffer for the composite pass (CompositeParams).
-	ID3D11Buffer *composite_cb;
-
 	//! Local2D flatten shaders (#439 Phase 3): draw one app Local2D layer
 	//! image into the runtime 2D scratch at a per-draw viewport.
 	ID3D11VertexShader *local2d_flatten_vs;
@@ -123,9 +98,6 @@ struct comp_d3d11_renderer
 
 	//! Linear sampler.
 	ID3D11SamplerState *sampler_linear;
-
-	//! Point sampler.
-	ID3D11SamplerState *sampler_point;
 
 	//! Blend state for alpha blending.
 	ID3D11BlendState *blend_alpha;
@@ -371,128 +343,6 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 }
 )";
 
-// Masked 2D-over-3D composite (#439 Phase 0). Keep byte-aligned with
-// shaders/masked_composite.hlsl. Phase 0 derives a hard mask from the canvas
-// rect (discard inside → weave kept; sample 2D outside at 1:1). The Phase 1+
-// lerp path (sample mask_tex t1, lerp against weave_tex t2) is present but
-// gated by use_rect_mask.
-static const char *masked_composite_vs_source = R"(
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-static const float2 positions[3] = {
-    float2(-1.0, -1.0),
-    float2(-1.0,  3.0),
-    float2( 3.0, -1.0),
-};
-static const float2 uvs[3] = {
-    float2(0.0, 1.0),
-    float2(0.0, -1.0),
-    float2(2.0, 1.0),
-};
-
-VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
-{
-    VS_OUTPUT o;
-    o.position = float4(positions[vertex_id], 0.0, 1.0);
-    o.uv = uvs[vertex_id];
-    return o;
-}
-)";
-
-static const char *masked_composite_ps_source = R"(
-Texture2D twod_tex   : register(t0);
-Texture2D mask_tex   : register(t1);
-Texture2D weave_tex  : register(t2);
-SamplerState samp    : register(s0);
-
-cbuffer CompositeParams : register(b0)
-{
-    float2 dst_dims;
-    float2 canvas_origin;
-    float2 canvas_size;
-    uint   use_rect_mask;
-    uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
-    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
-};
-
-struct VS_OUTPUT
-{
-    float4 position : SV_Position;
-    float2 uv : TEXCOORD0;
-};
-
-float region_mask(float2 px, float2 uv)
-{
-    if (use_rect_mask)
-    {
-        bool inside =
-            px.x >= canvas_origin.x && px.x < canvas_origin.x + canvas_size.x &&
-            px.y >= canvas_origin.y && px.y < canvas_origin.y + canvas_size.y;
-        return inside ? 1.0 : 0.0;
-    }
-    return saturate(mask_tex.Sample(samp, uv).r);
-}
-
-float4 PSMain(VS_OUTPUT input) : SV_Target
-{
-    float2 px = input.uv * dst_dims;
-
-    if (use_rect_mask)
-    {
-        float M = region_mask(px, input.uv);
-        if (M >= 0.5)
-            discard;
-        return twod_tex.Sample(samp, input.uv);
-    }
-
-    float4 twod  = twod_tex.Sample(samp, input.uv);
-    float4 weave = weave_tex.Sample(samp, input.uv);
-    if (opaque_present == 1)
-    {
-        // Opaque present (runtime #833 / plugin #116): DWM completes no
-        // blends, so never emit alpha < 1. The DP's flattened gate already
-        // baked the captured desktop into the weave wherever the atlas was
-        // transparent (2D bands, outside every zone), so the weave IS the
-        // background here: ZONES and ALPHA_OVER collapse to a premul-over
-        // of the 2D onto the flattened weave (the M weave-gate would
-        // discard that baked desktop); LERP keeps M but completes the 2D
-        // side the same way. Zone-edge feather becomes a no-op (both mix
-        // ends hold woven content inside the ramp) — a documented semantic
-        // of the mode.
-        float3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
-        if (composite_mode == 0)
-        {
-            float M = saturate(mask_tex.Sample(samp, input.uv).r);
-            return float4(M * weave.rgb + (1.0 - M) * over, 1.0);
-        }
-        return float4(over, 1.0);
-    }
-    if (composite_mode == 1)
-    {
-        // #491: the 2D layer's own (premultiplied) alpha IS the blend —
-        // translucent 2D reveals the 3D scene, not the desktop.
-        return twod + (1.0 - twod.a) * weave;
-    }
-    float M = saturate(mask_tex.Sample(samp, input.uv).r);
-    if (composite_mode == 2)
-    {
-        // XR_DXR_display_zones (ADR-027, #801): M gates only the WEAVE by
-        // zone geometry (binary zone raster, or the #803 opt-in feather
-        // ramp); the 2D composites on top by its own premultiplied alpha.
-        // Zone interior with no 2D -> weave; a Local2D overlay inside a
-        // zone -> glass over the weave; a 2D band outside every zone ->
-        // the 2D with its own alpha (alpha 0 where uncovered, so a
-        // transparent present still reaches the desktop).
-        return twod + (1.0 - twod.a) * (M * weave);
-    }
-    return M * weave + (1.0 - M) * twod;
-}
-)";
-
 // #439 Phase 3 — Local2D flatten. Draws one app Local2D layer image into the
 // runtime 2D scratch. The per-draw viewport (RSSetViewports, set by the caller)
 // restricts output to the clipped dest sub-rect; uv [0,1] over that viewport
@@ -656,34 +506,6 @@ create_shaders(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	// Masked 2D-over-3D composite vertex shader (#439 Phase 0).
-	xret = compile_shader(internals->device, masked_composite_vs_source, "VSMain", "vs_5_0", &blob);
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to compile composite vertex shader");
-		return xret;
-	}
-	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->composite_vs);
-	blob->Release();
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create composite vertex shader: 0x%08x", hr);
-		return XRT_ERROR_D3D;
-	}
-
-	// Masked 2D-over-3D composite pixel shader (#439 Phase 0).
-	xret = compile_shader(internals->device, masked_composite_ps_source, "PSMain", "ps_5_0", &blob);
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to compile composite pixel shader");
-		return xret;
-	}
-	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                          &r->composite_ps);
-	blob->Release();
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create composite pixel shader: 0x%08x", hr);
-		return XRT_ERROR_D3D;
-	}
-
 	// Local2D flatten vertex shader (#439 Phase 3).
 	xret = compile_shader(internals->device, local2d_flatten_vs_source, "VSMain", "vs_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
@@ -835,18 +657,6 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	// Composite constant buffer (#439 Phase 0).
-	D3D11_BUFFER_DESC compCbDesc = {};
-	compCbDesc.ByteWidth = sizeof(CompositeParams);
-	compCbDesc.Usage = D3D11_USAGE_DYNAMIC;
-	compCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	compCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	hr = internals->device->CreateBuffer(&compCbDesc, nullptr, &r->composite_cb);
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create composite constant buffer: 0x%08x", hr);
-		return XRT_ERROR_D3D;
-	}
-
 	// Local2D flatten constant buffer (#439 Phase 3).
 	D3D11_BUFFER_DESC flattenCbDesc = {};
 	flattenCbDesc.ByteWidth = sizeof(FlattenParams);
@@ -869,15 +679,6 @@ create_resources(struct comp_d3d11_renderer *r)
 	hr = internals->device->CreateSamplerState(&sampDesc, &r->sampler_linear);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create linear sampler: 0x%08x", hr);
-		return XRT_ERROR_D3D;
-	}
-
-	// Create point sampler
-	sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-
-	hr = internals->device->CreateSamplerState(&sampDesc, &r->sampler_point);
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create point sampler: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -1417,15 +1218,11 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->blend_opaque);
 	SAFE_RELEASE(r->blend_premul);
 	SAFE_RELEASE(r->blend_alpha);
-	SAFE_RELEASE(r->sampler_point);
 	SAFE_RELEASE(r->sampler_linear);
 	SAFE_RELEASE(r->constant_buffer);
 	SAFE_RELEASE(r->flatten_cb);
 	SAFE_RELEASE(r->local2d_flatten_ps);
 	SAFE_RELEASE(r->local2d_flatten_vs);
-	SAFE_RELEASE(r->composite_cb);
-	SAFE_RELEASE(r->composite_ps);
-	SAFE_RELEASE(r->composite_vs);
 	SAFE_RELEASE(r->quad_ps);
 	SAFE_RELEASE(r->quad_vs);
 	SAFE_RELEASE(r->projection_ps_array);
@@ -2076,117 +1873,6 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
 	// drops this binding anyway — no scratch read/write overlap).
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	internals->context->PSSetShaderResources(0, 1, &null_srv);
-	return XRT_SUCCESS;
-}
-
-extern "C" xrt_result_t
-comp_d3d11_renderer_composite_2d_masked(struct comp_d3d11_renderer *renderer,
-                                        void *dst_texture,
-                                        void *twod_srv,
-                                        void *mask_srv,
-                                        void *weave_srv,
-                                        uint32_t region_w,
-                                        uint32_t region_h,
-                                        int32_t cx,
-                                        int32_t cy,
-                                        uint32_t cw,
-                                        uint32_t ch,
-                                        uint32_t composite_mode,
-                                        bool opaque_present)
-{
-	if (renderer == nullptr || dst_texture == nullptr || twod_srv == nullptr) {
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-	// The authored-mask path lerps against the weave, so it must be readable.
-	if (mask_srv != nullptr && weave_srv == nullptr) {
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	auto internals = get_internals(renderer->c);
-	ID3D11Texture2D *dst = static_cast<ID3D11Texture2D *>(dst_texture);
-
-	// Temporary RTV on the weave target (which already holds the weave).
-	ID3D11RenderTargetView *rtv = nullptr;
-	HRESULT hr = internals->device->CreateRenderTargetView(dst, nullptr, &rtv);
-	if (FAILED(hr)) {
-		U_LOG_E("composite_2d_masked: failed to create RTV: 0x%08x", hr);
-		return XRT_ERROR_D3D;
-	}
-
-	// Bind weave target as RTV (no depth — the rect path discards inside the
-	// canvas so those weaved pixels stay untouched; the mask path lerps
-	// against the weave snapshot in t2).
-	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
-
-	// #464: the composite region is window-sized at the top-left anchor of
-	// the (worst-case-allocated) surface; pixels beyond it are never written.
-	// The full-screen triangle's uv [0,1] spans the viewport, so region-sized
-	// SRVs sample 1:1. Phase 0 passes region == dst dims (full surface).
-	D3D11_VIEWPORT vp = {};
-	vp.Width = static_cast<float>(region_w);
-	vp.Height = static_cast<float>(region_h);
-	vp.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &vp);
-
-	// Full-screen triangle (3 verts pulled from SV_VertexID), opaque output
-	// + point sampling → byte-identical to the strip CopySubresourceRegion.
-	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	internals->context->IASetInputLayout(nullptr);
-	internals->context->VSSetShader(renderer->composite_vs, nullptr, 0);
-	internals->context->PSSetShader(renderer->composite_ps, nullptr, 0);
-	internals->context->RSSetState(renderer->rasterizer_state);
-	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
-	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
-	internals->context->PSSetSamplers(0, 1, &renderer->sampler_point);
-
-	// t0 = 2D layer, t1 = authored mask (Phase 1), t2 = weave snapshot
-	// (Phase 1). t1/t2 stay NULL on the Phase 0 rect path — the shader never
-	// samples them when use_rect_mask is set.
-	ID3D11ShaderResourceView *srvs[3] = {
-	    static_cast<ID3D11ShaderResourceView *>(twod_srv),
-	    static_cast<ID3D11ShaderResourceView *>(mask_srv),
-	    static_cast<ID3D11ShaderResourceView *>(weave_srv),
-	};
-	internals->context->PSSetShaderResources(0, 3, srvs);
-
-	CompositeParams params = {};
-	params.dst_dims[0] = static_cast<float>(region_w);
-	params.dst_dims[1] = static_cast<float>(region_h);
-	params.canvas_origin[0] = static_cast<float>(cx);
-	params.canvas_origin[1] = static_cast<float>(cy);
-	params.canvas_size[0] = static_cast<float>(cw);
-	params.canvas_size[1] = static_cast<float>(ch);
-	// Phase 0: hard rect mask derived from the canvas. Phase 1: sample the
-	// authored mask and run the lerp.
-	params.use_rect_mask = (mask_srv == nullptr) ? 1 : 0;
-	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
-	// #833/#116 — the flatten needs the weave, so it stays off on the rect path.
-	params.opaque_present = (mask_srv != nullptr && opaque_present) ? 1 : 0;
-
-	D3D11_MAPPED_SUBRESOURCE mapped;
-	hr = internals->context->Map(renderer->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-	if (FAILED(hr)) {
-		// A stale CB could write the 2D layer over the canvas — bail and let
-		// the caller fall back to the strip copy.
-		U_LOG_E("composite_2d_masked: failed to map constant buffer: 0x%08x", hr);
-		rtv->Release();
-		return XRT_ERROR_D3D;
-	}
-	memcpy(mapped.pData, &params, sizeof(params));
-	internals->context->Unmap(renderer->composite_cb, 0);
-	internals->context->PSSetConstantBuffers(0, 1, &renderer->composite_cb);
-
-	internals->context->Draw(3, 0);
-
-	// Unbind SRVs + RTV to avoid read/write hazard warnings — the dst is the
-	// DP's weave target and gets copied/sampled downstream (shared-texture
-	// readback, capture) while still in flight.
-	ID3D11ShaderResourceView *null_srvs[3] = {nullptr, nullptr, nullptr};
-	internals->context->PSSetShaderResources(0, 3, null_srvs);
-	ID3D11RenderTargetView *null_rtv = nullptr;
-	internals->context->OMSetRenderTargets(1, &null_rtv, nullptr);
-
-	rtv->Release();
 	return XRT_SUCCESS;
 }
 

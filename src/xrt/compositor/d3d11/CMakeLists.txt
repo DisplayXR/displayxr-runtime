@@ -8,8 +8,11 @@
 if(WIN32 AND XRT_HAVE_D3D11)
 	add_library(
 		comp_d3d11 STATIC
+		comp_d3d11_composite_shaders.h
 		comp_d3d11_compositor.cpp
 		comp_d3d11_compositor.h
+		comp_d3d11_outcomp.cpp
+		comp_d3d11_outcomp.h
 		comp_d3d11_renderer.cpp
 		comp_d3d11_renderer.h
 		comp_d3d11_state_guard.h
