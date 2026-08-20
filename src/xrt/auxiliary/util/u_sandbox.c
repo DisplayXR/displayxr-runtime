@@ -75,14 +75,22 @@ u_sandbox_is_app_container(void)
  *
  */
 
-#include <sandbox.h>
-#include <unistd.h>
-
 bool
 u_sandbox_is_app_container(void)
 {
-	int result = sandbox_check(getpid(), NULL, SANDBOX_FILTER_NONE);
-	return result != 0;
+	// App Sandbox exports this into the process environment for, and only for,
+	// a sandboxed app; it is the public, documented signal.
+	//
+	// This branch had never actually been compiled (see the xrt_config_os.h
+	// note at the top), and what it contained —
+	// `sandbox_check(getpid(), NULL, SANDBOX_FILTER_NONE)` — could not have
+	// worked as written: `sandbox_check` is an undeclared SPI, absent from the
+	// public <sandbox.h>, so enabling the branch is what surfaced it. It is
+	// also the wrong test for us even if declared: it reports *any* sandbox
+	// policy, which on a modern macOS is far broader than "this app is
+	// containerised", and a false positive here silently pushes an ordinary
+	// in-process macOS app onto the IPC path.
+	return getenv("APP_SANDBOX_CONTAINER_ID") != NULL;
 }
 
 #else /* stub for other platforms */
