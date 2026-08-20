@@ -26,8 +26,15 @@ extern "C" {
 /*!
  * Create a D3D11 output target (DXGI swapchain).
  *
+ * The device/context/factory the target presents on are passed explicitly — the
+ * target does NOT own them (no AddRef/Release), it only borrows them for the
+ * lifetime of the caller-owned swapchain.
+ *
  * @param c The D3D11 compositor.
  * @param hwnd The window handle to present to.
+ * @param device The ID3D11Device* the swapchain and its RTV are created on.
+ * @param context The ID3D11DeviceContext* used to bind/clear the back buffer.
+ * @param dxgi_factory The IDXGIFactory4* the swapchain is created from.
  * @param width Preferred width.
  * @param height Preferred height.
  * @param transparent When true (and hwnd != NULL), use BitBlt swap effect so DWM
@@ -42,6 +49,9 @@ extern "C" {
 xrt_result_t
 comp_d3d11_target_create(struct comp_d3d11_compositor *c,
                          void *hwnd,
+                         void *device,
+                         void *context,
+                         void *dxgi_factory,
                          uint32_t width,
                          uint32_t height,
                          bool transparent,

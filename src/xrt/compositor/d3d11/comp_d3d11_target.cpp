@@ -164,6 +164,12 @@ struct comp_d3d11_target
 	//! Parent compositor.
 	struct comp_d3d11_compositor *c;
 
+	//! Device/context/factory this target presents on, handed in at create.
+	//! NOT owned — no AddRef/Release; the caller outlives the target.
+	ID3D11Device *dev;
+	ID3D11DeviceContext *ctx;
+	IDXGIFactory4 *factory;
+
 	//! DXGI swapchain.
 	IDXGISwapChain1 *swapchain;
 
@@ -197,29 +203,9 @@ struct comp_d3d11_target
 	IDCompositionVisual *dcomp_visual;
 };
 
-// Access compositor internals
-extern "C" {
-struct comp_d3d11_compositor_internals
-{
-	struct xrt_compositor_native base;
-	struct xrt_device *xdev;
-	ID3D11Device *device;
-	ID3D11DeviceContext *context;
-	IDXGIFactory4 *dxgi_factory;
-};
-}
-
-static inline struct comp_d3d11_compositor_internals *
-get_internals(struct comp_d3d11_compositor *c)
-{
-	return reinterpret_cast<struct comp_d3d11_compositor_internals *>(c);
-}
-
 static xrt_result_t
 create_rtv(struct comp_d3d11_target *target)
 {
-	auto internals = get_internals(target->c);
-
 	// Release existing RTV and back buffer
 	if (target->rtv != nullptr) {
 		target->rtv->Release();
@@ -239,7 +225,7 @@ create_rtv(struct comp_d3d11_target *target)
 	}
 
 	// Create RTV
-	hr = internals->device->CreateRenderTargetView(target->back_buffer, nullptr, &target->rtv);
+	hr = target->dev->CreateRenderTargetView(target->back_buffer, nullptr, &target->rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -251,15 +237,20 @@ create_rtv(struct comp_d3d11_target *target)
 extern "C" xrt_result_t
 comp_d3d11_target_create(struct comp_d3d11_compositor *c,
                          void *hwnd,
+                         void *device,
+                         void *context,
+                         void *dxgi_factory,
                          uint32_t width,
                          uint32_t height,
                          bool transparent,
                          struct comp_d3d11_target **out_target)
 {
-	auto internals = get_internals(c);
-
 	comp_d3d11_target *target = new comp_d3d11_target();
 	target->c = c;
+	// Borrowed, not owned — the caller keeps the references.
+	target->dev = static_cast<ID3D11Device *>(device);
+	target->ctx = static_cast<ID3D11DeviceContext *>(context);
+	target->factory = static_cast<IDXGIFactory4 *>(dxgi_factory);
 	target->hwnd = static_cast<HWND>(hwnd);
 	target->width = width;
 	target->height = height;
@@ -328,16 +319,15 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 
 	HRESULT hr;
 	if (use_transparent) {
-		hr = internals->dxgi_factory->CreateSwapChainForComposition(
-		    internals->device, &desc, nullptr, &target->swapchain);
+		hr = target->factory->CreateSwapChainForComposition(target->dev, &desc, nullptr, &target->swapchain);
 		U_LOG_W("Transparent HWND opt-in: DComp + flip-model swapchain "
 		        "(FLIP_DISCARD + PREMULTIPLIED, bc=%u)",
 		        desc.BufferCount);
 	} else {
 		DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc = {};
 		fsDesc.Windowed = TRUE;
-		hr = internals->dxgi_factory->CreateSwapChainForHwnd(
-		    internals->device, target->hwnd, &desc, &fsDesc, nullptr, &target->swapchain);
+		hr = target->factory->CreateSwapChainForHwnd(target->dev, target->hwnd, &desc, &fsDesc, nullptr,
+		                                             &target->swapchain);
 	}
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
@@ -364,7 +354,7 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// Disable Alt-Enter fullscreen toggle (HWND-bound only — composition swapchains
 	// have no HWND association).
 	if (!use_transparent) {
-		internals->dxgi_factory->MakeWindowAssociation(target->hwnd, DXGI_MWA_NO_ALT_ENTER);
+		target->factory->MakeWindowAssociation(target->hwnd, DXGI_MWA_NO_ALT_ENTER);
 	}
 
 	// Transparent path: bind the composition swapchain to the HWND through DComp.
@@ -509,15 +499,13 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 extern "C" xrt_result_t
 comp_d3d11_target_acquire(struct comp_d3d11_target *target, uint32_t *out_index)
 {
-	auto internals = get_internals(target->c);
-
 	// For FLIP_DISCARD swapchain, we always render to buffer 0
 	// The swapchain handles double-buffering internally
 	*out_index = 0;
 	target->current_index = 0;
 
 	// Bind the render target
-	internals->context->OMSetRenderTargets(1, &target->rtv, nullptr);
+	target->ctx->OMSetRenderTargets(1, &target->rtv, nullptr);
 
 	// Set viewport
 	D3D11_VIEWPORT viewport = {};
@@ -527,11 +515,11 @@ comp_d3d11_target_acquire(struct comp_d3d11_target *target, uint32_t *out_index)
 	viewport.Height = static_cast<float>(target->height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &viewport);
+	target->ctx->RSSetViewports(1, &viewport);
 
 	// Clear to black
 	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-	internals->context->ClearRenderTargetView(target->rtv, clear_color);
+	target->ctx->ClearRenderTargetView(target->rtv, clear_color);
 
 	return XRT_SUCCESS;
 }
@@ -539,10 +527,8 @@ comp_d3d11_target_acquire(struct comp_d3d11_target *target, uint32_t *out_index)
 extern "C" void
 comp_d3d11_target_bind(struct comp_d3d11_target *target)
 {
-	auto internals = get_internals(target->c);
-
 	// Re-bind the render target and viewport (no clear)
-	internals->context->OMSetRenderTargets(1, &target->rtv, nullptr);
+	target->ctx->OMSetRenderTargets(1, &target->rtv, nullptr);
 
 	D3D11_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;
@@ -551,7 +537,7 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
 	viewport.Height = static_cast<float>(target->height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &viewport);
+	target->ctx->RSSetViewports(1, &viewport);
 }
 
 /*!
@@ -895,10 +881,8 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 		return XRT_SUCCESS;
 	}
 
-	auto internals = get_internals(target->c);
-
 	// Release current back buffer and RTV
-	internals->context->OMSetRenderTargets(0, nullptr, nullptr);
+	target->ctx->OMSetRenderTargets(0, nullptr, nullptr);
 	if (target->rtv != nullptr) {
 		target->rtv->Release();
 		target->rtv = nullptr;
