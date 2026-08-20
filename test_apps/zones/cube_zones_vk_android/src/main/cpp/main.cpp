@@ -2457,6 +2457,8 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
              uint32_t render_h, uint32_t cols, uint32_t rows, bool swap_lr, const XrPosef &rig_pose)
 {
 	(void)rows;
+	// DIAG (#1074): live-tunable flat per-view tint (see the clear below).
+	const bool tint_views = get_prop_float("debug.dxr.tintviews", 0.0f) != 0.0f;
 	VkCommandBufferAllocateInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	ai.commandPool = g_app_cmd_pool;
@@ -2630,6 +2632,32 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 			                    hud_bbox[2] + padx, hud_bbox[3] + pady, 0.022f, 0.0045f, pcol);
 			const float text_col[4] = {0.92f, 0.96f, 1.0f, 1.0f};
 			hud_font_draw(g_hud_font, cmd, hud_mvp.m, text_col, hud_text_n);
+		}
+
+		// DIAG (#1074) — eye-order discriminator. `debug.dxr.tintviews 1`
+		// overwrites each tile with a flat colour keyed to the SOURCE VIEW
+		// (0 = red, 1 = blue, 2+ = green), so a screencap of the WOVEN output
+		// tells you which view feeds which subpixel phase. Off by default and
+		// scoped to this test app; costs one vkCmdClearAttachments per tile.
+		if (tint_views) {
+			static const float kTint[3][4] = {
+			    {1.0f, 0.0f, 0.0f, 1.0f},
+			    {0.0f, 0.0f, 1.0f, 1.0f},
+			    {0.0f, 1.0f, 0.0f, 1.0f},
+			};
+			const float *tc = kTint[src < 2 ? src : 2];
+			VkClearAttachment ca = {};
+			ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			ca.colorAttachment = 0;
+			ca.clearValue.color.float32[0] = tc[0];
+			ca.clearValue.color.float32[1] = tc[1];
+			ca.clearValue.color.float32[2] = tc[2];
+			ca.clearValue.color.float32[3] = tc[3];
+			VkClearRect cr = {};
+			cr.rect = scissor;
+			cr.baseArrayLayer = 0;
+			cr.layerCount = 1;
+			vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
 		}
 	}
 
@@ -2912,6 +2940,26 @@ render_frame()
 		res = xrLocateViews(g_session, &locate_info, &view_state, g_max_view_count,
 		                    &located_view_count, views);
 		if (res == XR_SUCCESS && located_view_count >= submit_views) {
+			// DIAG (#1074) — eye-ORDER evidence that is independent of the
+			// weave AND of where the face happens to be: the SIGN of
+			// (v1.x - v0.x) in the runtime's render-ready rig must be POSITIVE
+			// (view 0 = left eye). Compare it across routes to tell a genuine
+			// eye swap apart from an interlace-PHASE error, which looks
+			// identical on the panel. Logged once, then only when the sign
+			// flips — never per frame.
+			if (located_view_count >= 2) {
+				const float dx = views[1].pose.position.x - views[0].pose.position.x;
+				static int last_sign = 0;
+				const int sign = (dx > 0.0f) ? 1 : -1;
+				if (sign != last_sign) {
+					last_sign = sign;
+					LOGI("EYEORDER: v0.x=%+.4f v1.x=%+.4f dx=%+.4f (must be > 0) "
+					     "fov0=[%+.3f,%+.3f] fov1=[%+.3f,%+.3f]",
+					     views[0].pose.position.x, views[1].pose.position.x, dx,
+					     views[0].fov.angleLeft, views[0].fov.angleRight,
+					     views[1].fov.angleLeft, views[1].fov.angleRight);
+				}
+			}
 #ifdef XRT_DEBUG_ANDROID_VERBOSE
 			// Throttle ~1Hz: dump per-view pose + FOV for calibration checks.
 			if ((g_frame_count % 60) == 0) {
