@@ -97,3 +97,13 @@ EXPORTS
 
     ; --- u_pacing.h ---
     u_pa_factory_create
+
+    ; --- ipc_client_connection.h ---
+    ; browser#103 RC-4: the Windows twin of the Android adopt_fd export. Lets an
+    ; embedder whose rendering process cannot open the service pipe (Chromium's
+    ; GPU process — a USER_LIMITED restricted token the pipe SD does not admit)
+    ; adopt an endpoint brokered by a sibling process instead of dialling one.
+    ; The broker half is the OpenXR entry point xrWeaveExportIpcConnectionDXR,
+    ; reached through xrGetInstanceProcAddr, so it needs no export here.
+    ipc_client_connection_adopt_handle
+    ipc_client_connection_has_adopted_handle

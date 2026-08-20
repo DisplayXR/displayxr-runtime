@@ -64,6 +64,14 @@ struct ipc_connection
 
 	struct os_mutex mutex;
 
+	/*!
+	 * browser#103 / #1056: this connection was ADOPTED (handed to us
+	 * already-connected) rather than dialled by us. The transport end was
+	 * therefore created by some other process, which is what the OS reports as
+	 * the peer — see ipc_client_connection_adopt_fd / _adopt_handle.
+	 */
+	bool adopted;
+
 #ifdef XRT_OS_ANDROID
 	struct ipc_client_android *ica;
 #endif // XRT_OS_ANDROID

@@ -3,11 +3,11 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_DXR_weave` |
-| **Spec Version** | 8 |
+| **Spec Version** | 9 |
 | **Extension Type** | Instance extension (service path only — Windows/D3D11, macOS/comp_multi-Vulkan #759, Android/comp_multi-Vulkan #1036) |
 | **Header** | `src/external/openxr_includes/openxr/XR_DXR_weave.h` (canonical; auto-syncs to `displayxr-extensions`) |
-| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c) |
-| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88 |
+| **Status** | Provisional (`1004999190–198` type block, pending Khronos registry; `199` reserved, see §2c; v9 additions in a fresh `1004999240–249` decade) |
+| **Design history** | `docs/roadmap/webxr-step-b-design.md` §13.6–13.9, `docs/roadmap/android-concurrent-multi-app.md` F11/§10.4, issues #625, #774, #1031/#1036, browser#88, browser#103 |
 
 ## 1. What it is
 
@@ -225,7 +225,9 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
 
 ## 4b. Error codes and connection loss
 
-All five entry points share one error contract.
+All five *session*-level entry points share one error contract. (The v9
+instance-level `xrWeaveExportIpcConnectionDXR` has no session to lose; its errors are in
+§4c.)
 
 | Result | When | Is the session still usable? |
 |---|---|---|
@@ -259,6 +261,70 @@ application* — instead of retrying blind. It is still not permanent: drop to a
 rather than switching off, because a rollback (or an installer that has finished writing)
 recovers without a relaunch. A runtime that predates the code reports
 `XR_ERROR_RUNTIME_FAILURE` here, indistinguishable from any other create failure.
+
+## 4c. Brokering a connection to a sandboxed sibling (v9, browser#103)
+
+`xrWeaveExportIpcConnectionDXR` exists for one shape of embedder: **the process that
+renders is not the process that can reach the runtime's IPC transport.**
+
+```c
+XrWeaveIpcConnectionDXR conn = { XR_TYPE_WEAVE_IPC_CONNECTION_DXR };
+xrWeaveExportIpcConnectionDXR(instance, &conn);   // browser process
+// ship conn.handle (Windows) / conn.fd (POSIX) to the sandboxed process
+```
+
+and, in the receiving process, before its own `xrCreateInstance`:
+
+```c
+ipc_client_connection_adopt_handle(h);   // Windows; exported from the runtime DLL
+ipc_client_connection_adopt_fd(fd);      // POSIX / Android (#1056)
+// or: DXR_IPC_HANDLE=<decimal> / DXR_IPC_FD=<n> in the environment
+```
+
+Chromium is the motivating case on both platforms. On Android the renderer/GPU process
+has no usable Java world, so it cannot run the AIDL connect (#1056). On Windows the GPU
+process runs a `USER_LIMITED` restricted token whose restricted-SID list matches neither
+ACE on the service pipe's security descriptor, so `CreateFileA` on the pipe returns
+`ACCESS_DENIED` — measured, not assumed (browser#103 experiment E0) — while the
+unsandboxed browser process opens it routinely.
+
+Three rules make this correct rather than merely convenient:
+
+1. **The export does not handshake.** Connection setup is *connect → shared-memory
+   transfer → git-tag check → client description*. Only the connect happens in the
+   exporter. The other three MUST run in the adopting process: the shared memory has to
+   be mapped in the adopter's address space, and the identity the service settles has to
+   be the adopter's. An exporter that handshakes hands over a connection belonging to
+   itself.
+2. **The adopter declares itself.** On Windows the service derives both the
+   handle-duplication target and the peer's integrity level from
+   `GetNamedPipeClientProcessId`, i.e. from whoever *opened* the pipe. Under a brokered
+   handle that is the exporter, so shared memory, the woven texture and the fence would
+   all be duplicated into the wrong process and the weave would report success while the
+   caller imported nothing. So an adopted connection sends a **peer declaration** naming
+   its own pid as the very first message, before any handle crosses; the service accepts
+   it only when the opener's integrity level is **at least** the declared target's — a
+   Medium browser may delegate down to its own Low sandboxed child, a Low process may
+   never escalate. A refused declaration is not fatal: the connection continues with
+   opener attribution, exactly as if nothing had been declared. Details in
+   `docs/architecture/service-architecture.md`.
+3. **The exporter's own connection is untouched.** Each export opens a new endpoint.
+
+The endpoint is consumed **once**, by the next connection setup in the adopting process,
+and the adopter duplicates it — the transferring code keeps ownership of what it passed.
+This is not a security boundary: a handle or fd is a capability, and whoever can call
+these functions is already inside the process. The receiving process already held this
+exact capability in Chromium's case (it is handed the connection before its sandbox is
+lowered and keeps it for the browser's lifetime); the broker refreshes an existing
+capability rather than granting a new one.
+
+`xrWeaveExportIpcConnectionDXR` is **instance-level**, not session-level: a broker is not
+required to be a present-owner, and may export before it ever creates a session. It
+reports `XR_ERROR_FEATURE_UNSUPPORTED` on an instance that is provably in-process, and
+`XR_ERROR_RUNTIME_FAILURE` when no endpoint could be opened. It is not implemented on
+Android, where the connect is Java-side and needs a `Context` the runtime only sees at
+`xrCreateInstance`; an Android embedder brokers with the shipped Java connect + `DXR_IPC_FD`
+instead.
 
 ## 5. macOS platform mapping (#759)
 
@@ -325,12 +391,12 @@ Notes that only bite on Android:
 | 6 | `XrWeaveSubmitLayoutDXR` N-view worst-case atlas layout (#774). |
 | 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
 | 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
+| 9 | `xrWeaveExportIpcConnectionDXR` + `XrWeaveIpcConnectionDXR` — brokering a runtime IPC endpoint to a sandboxed sibling process (§4c); plus §4b, the error table making a dead connection report `XR_ERROR_INSTANCE_LOST` / `XR_ERROR_SESSION_LOST` (browser#103). |
 
-browser#103 added §4b. It introduces **no** new entry point, struct or provisional type
-value — the entry points now report a dead connection with the same
-`XR_ERROR_INSTANCE_LOST` every other IPC-backed OpenXR call already used, and §4b writes
-down the contract that was previously only implicit. Whether a behavioural change of that
-kind warrants a **v9** bump is left to review; the table above is unbumped on purpose.
+§4b arrived first, and on its own would not have earned a bump — the entry points simply
+started reporting a dead connection with the same `XR_ERROR_INSTANCE_LOST` every other
+IPC-backed OpenXR call already used, and §4b wrote down a contract that was previously
+implicit. §4c's entry point + struct settle it: **v9**.
 
 ## 7. Consumers
 

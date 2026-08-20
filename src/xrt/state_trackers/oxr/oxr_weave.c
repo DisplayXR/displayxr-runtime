@@ -41,6 +41,7 @@
 #include "oxr_xret.h"
 
 #include "util/u_trace_marker.h"
+#include "util/u_logging.h"
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
@@ -61,6 +62,12 @@
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
 struct xrt_compositor;
+
+//! browser#103 RC-4: the broker half of the adopt mechanism, defined in
+//! ipc_client_connection.c. Same link-time-resolution pattern as the bridges
+//! below — st_oxr does not pull the ipc_client include path.
+xrt_result_t
+ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *out_handle);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
@@ -544,6 +551,49 @@ oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_set_screen_flat_regions(&sess->xcn->base, rectCount,
 	                                                                            rectCount > 0 ? rects : NULL);
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSetScreenFlatRegionsDXR: latch failed (xrt_result=%d)", (int)xret);
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_instance *inst = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrWeaveExportIpcConnectionDXR");
+	OXR_VERIFY_EXTENSION(&log, inst, DXR_weave);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, connection, XR_TYPE_WEAVE_IPC_CONNECTION_DXR);
+
+	connection->handle = NULL;
+	connection->fd = -1;
+
+	// Instance-level, so there is no session to read session_is_ipc() off — and
+	// deliberately so: a broker is not required to be a present-owner, and may
+	// well export before it ever creates a session. Reject only when we can
+	// POSITIVELY prove this instance is in-process (a system compositor exists
+	// and says so); otherwise let the connect itself be the test.
+	struct xrt_system_compositor *xsysc = inst->system.xsysc;
+	if (xsysc != NULL && !xsysc->info.is_service_mode) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWeaveExportIpcConnectionDXR: there is no IPC connection to export on an "
+		                 "in-process session");
+	}
+
+	xrt_ipc_handle_t exported = XRT_IPC_HANDLE_INVALID;
+	xrt_result_t xret = ipc_client_connection_export(u_log_get_global_level(), &exported);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrWeaveExportIpcConnectionDXR: could not open a service endpoint "
+		                 "(xrt_result=%d)",
+		                 (int)xret);
+	}
+
+#ifdef XRT_OS_WINDOWS
+	connection->handle = (void *)exported;
+#else
+	connection->fd = (int32_t)exported;
+#endif
 	return XR_SUCCESS;
 }
 
