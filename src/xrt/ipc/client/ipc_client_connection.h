@@ -52,6 +52,20 @@ extern "C" {
  */
 void
 ipc_client_connection_adopt_fd(int fd);
+
+/*!
+ * Has this process been handed a service socket — either through
+ * @ref ipc_client_connection_adopt_fd or `DXR_IPC_FD`?
+ *
+ * A peek, not a take: the fd stays available for the connection that follows.
+ * #1031 hybrid mode uses it at `xrt_instance_create` to route an fd-adopting
+ * client onto the IPC path, since adopting a connected service socket only
+ * means anything there. Safe to call before any connection exists.
+ *
+ * @ingroup ipc_client
+ */
+bool
+ipc_client_connection_has_adopted_fd(void);
 #endif // XRT_OS_ANDROID
 
 /*!

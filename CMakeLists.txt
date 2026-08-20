@@ -309,7 +309,14 @@ option(XRT_FEATURE_SSE2 "Build using SSE2 instructions, if building for 32-bit x
 option_with_deps(XRT_FEATURE_TRACING "Enable debug tracing on supported platforms" DEFAULT OFF DEPENDS "XRT_HAVE_PERCETTO OR XRT_HAVE_TRACY")
 option_with_deps(XRT_FEATURE_WINDOW_PEEK "Enable a window that displays the content of the HMD on screen" DEPENDS XRT_HAVE_SDL2)
 option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS XRT_HAVE_SDL2)
-option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE")
+# Hybrid mode: ONE runtime binary that carries both the in-process native
+# compositor and the IPC client, and picks between them per process at
+# xrt_instance_create (XRT_FORCE_MODE, workspace/present-owner capability,
+# sandbox detection). Windows has shipped this since day one; ANDROID joins it
+# in the flavor merge (#1031) so a single runtime APK serves in-process apps
+# (Arch A) and IPC clients (Arch C satellites, weave present-owners, the
+# browser) without two mutually-exclusive installs.
+option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID")
 
 if (XRT_FEATURE_SERVICE)
 	# Disable the client debug gui by default for out-of-proc -
@@ -434,12 +441,16 @@ list(
 
 # Package name needs to be known by the native code itself.
 # Can be overridden from outside/command line
+# Flavor merge (#1031): ONE runtime APK, one applicationId. The historical
+# `.in_process` / `.out_of_process` suffixes existed only because the two
+# Gradle flavors could not be installed side by side (both claim the Khronos
+# `org.khronos.openxr.runtime_broker` authority); with hybrid mode there is a
+# single artifact and the suffix is meaningless. The `.out_of_process` id is
+# retained as the merged id: it is what every installed demo, the slot broker
+# and the satellite `:dxrN` process names already resolve, so keeping it means
+# zero reinstall churn on device.
 if(ANDROID AND NOT XRT_ANDROID_PACKAGE)
-	if(XRT_FEATURE_SERVICE)
-		set(XRT_ANDROID_PACKAGE "org.freedesktop.monado.openxr_runtime.out_of_process")
-	else()
-		set(XRT_ANDROID_PACKAGE "org.freedesktop.monado.openxr_runtime.in_process")
-	endif()
+	set(XRT_ANDROID_PACKAGE "org.freedesktop.monado.openxr_runtime.out_of_process")
 endif()
 
 ###

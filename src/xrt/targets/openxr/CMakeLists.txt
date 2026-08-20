@@ -66,6 +66,16 @@ if(XRT_FEATURE_HYBRID_MODE)
 			comp_client
 		)
 	target_compile_definitions(${RUNTIME_TARGET} PRIVATE XRT_FEATURE_HYBRID_MODE)
+	if(ANDROID)
+		# #1031: the Android arm of the hybrid decision reads the app's own
+		# manifest meta-data (com.displayxr.force_ipc) through aux_android,
+		# and peeks at the adopted-fd state in ipc_client. comp_multi comes
+		# along because st_oxr's Android in-process path uses it, exactly as
+		# the XRT_FEATURE_IPC_CLIENT branch below already links it.
+		target_link_libraries(${RUNTIME_TARGET} PUBLIC aux_android comp_multi)
+		target_include_directories(${RUNTIME_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+			${CMAKE_CURRENT_SOURCE_DIR}/../../ipc)
+	endif()
 elseif(XRT_FEATURE_IPC_CLIENT)
 	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client comp_multi)
 else()

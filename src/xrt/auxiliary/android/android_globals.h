@@ -180,6 +180,25 @@ bool
 android_globals_self_declares_overlay(void);
 
 /*!
+ * True if THIS process's own package declares
+ * `<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>`.
+ *
+ * #1031 hybrid mode: the per-app, no-shell-access way for an Android client to
+ * opt out of the default in-process compositor and onto the IPC/satellite path
+ * — the Android analogue of Windows' `XRT_FORCE_MODE=ipc`, which needs a parent
+ * process to set an env var that Android app launches do not have.
+ *
+ * Called from xrt_instance_create, so the VM/Context are passed in from
+ * @ref xrt_instance_info::platform_info rather than read from the globals
+ * (which are used as a fallback). NOT cached — it is read exactly once per
+ * process, at instance create.
+ *
+ * @ingroup aux_android
+ */
+bool
+android_globals_self_declares_force_ipc(struct _JavaVM *vm, void *context);
+
+/*!
  * @name Window screen rect (ADR-036 D6, #1033)
  *
  * The client's SurfaceView on-screen rectangle, sampled by the app process from

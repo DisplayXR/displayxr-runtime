@@ -306,20 +306,21 @@ android_globals_get_overlay_mode(void)
 	return android_overlay_mode.load(std::memory_order_acquire);
 }
 
-bool
-android_globals_self_declares_overlay(void)
+/*!
+ * Read one boolean `<meta-data>` entry off THIS process's own ApplicationInfo.
+ * Returns @p def on any JNI failure, a missing key, or a missing Context — the
+ * callers are all "opt-in flag" shaped, so a failure must read as "not set".
+ *
+ * Factored out of android_globals_self_declares_overlay() for the #1031
+ * hybrid-mode `com.displayxr.force_ipc` read; the JNI shape is unchanged.
+ * Not cached here — each caller caches its own key.
+ */
+static bool
+read_self_bool_meta_data(const char *name, bool def, void *context)
 {
-	// Query this process's own package manifest metadata once; cache the result
-	// (-1 uncomputed, 0 no, 1 yes). Used in the APP process where the connecting
-	// app is this process (e.g. oxr_session keep-alive).
-	static std::atomic<int> cached{-1};
-	int c = cached.load(std::memory_order_acquire);
-	if (c >= 0) {
-		return c != 0;
-	}
-	int result = 0; // default false, also on any JNI failure
-	jobject ctx = (jobject)android_globals_get_context();
-	if (android_globals.vm != nullptr && ctx != nullptr) {
+	int result = def ? 1 : 0;
+	jobject ctx = (jobject)context;
+	if (ctx != nullptr) {
 		JNIEnv *env = jni::env();
 		if (env != nullptr) {
 			jclass ctxCls = env->GetObjectClass(ctx);
@@ -345,8 +346,11 @@ android_globals_self_declares_overlay(void)
 						jclass bCls = env->GetObjectClass(bundle);
 						jmethodID mGetBool =
 						    env->GetMethodID(bCls, "getBoolean", "(Ljava/lang/String;Z)Z");
-						jstring key = env->NewStringUTF("com.displayxr.overlay_mode");
-						result = env->CallBooleanMethod(bundle, mGetBool, key, JNI_FALSE) ? 1 : 0;
+						jstring key = env->NewStringUTF(name);
+						result = env->CallBooleanMethod(bundle, mGetBool, key,
+						                                def ? JNI_TRUE : JNI_FALSE)
+						             ? 1
+						             : 0;
 					}
 				}
 			}
@@ -355,6 +359,41 @@ android_globals_self_declares_overlay(void)
 			}
 		}
 	}
+	return result != 0;
+}
+
+bool
+android_globals_self_declares_overlay(void)
+{
+	// Query this process's own package manifest metadata once; cache the result
+	// (-1 uncomputed, 0 no, 1 yes). Used in the APP process where the connecting
+	// app is this process (e.g. oxr_session keep-alive).
+	static std::atomic<int> cached{-1};
+	int c = cached.load(std::memory_order_acquire);
+	if (c >= 0) {
+		return c != 0;
+	}
+	int result = read_self_bool_meta_data("com.displayxr.overlay_mode", false, android_globals_get_context()) ? 1 : 0;
 	cached.store(result, std::memory_order_release);
 	return result != 0;
+}
+
+bool
+android_globals_self_declares_force_ipc(struct _JavaVM *vm, void *context)
+{
+	// #1031 hybrid mode. Called once, from xrt_instance_create — before any of
+	// the usual per-session setup — so the VM and Context come in from
+	// xrt_instance_info.platform_info, with the globals as a fallback for
+	// clients that stored them some other way (a JNI_OnLoad host, the CLI).
+	if (vm == nullptr) {
+		vm = android_globals_get_vm();
+	}
+	if (context == nullptr) {
+		context = android_globals_get_context();
+	}
+	if (vm == nullptr || context == nullptr) {
+		return false;
+	}
+	jni::init(vm);
+	return read_self_bool_meta_data("com.displayxr.force_ipc", false, context);
 }
