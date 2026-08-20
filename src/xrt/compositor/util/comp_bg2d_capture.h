@@ -30,24 +30,48 @@
  * pre-#1073 path. That is the whole probe/fallback story — there is no
  * handshake to fail and nothing to time out.
  *
- * ## Wire protocol (v1)
+ * ## Wire protocol (v1, v2)
  *
  * `AF_UNIX`/`SOCK_STREAM` on the **abstract** namespace (Linux + Android), so
  * there is no filesystem path to chown and nothing to clean up. Default name
  * `@displayxr.bg2d`.
  *
  * ```text
- *   producer → runtime, once:      { u32 magic = 'DXRB', u32 version = 1 }
+ *   producer → runtime, once:      { u32 magic = 'DXRB', u32 version }
  *   producer → runtime, per frame: { u32 magic = 'DXRF', u32 seq,
  *                                    u32 width, u32 height,
  *                                    u32 stride_bytes, u32 format,
- *                                    u32 payload_bytes }  followed by
- *                                  payload_bytes of pixels
+ *                                    u32 payload_bytes,
+ *                                    u32 panel_w, u32 panel_h }  // v2 only
+ *                                  followed by payload_bytes of pixels
  * ```
+ *
+ * The version is negotiated once, in the hello, and fixes the frame-header
+ * length for the connection: 28 bytes at v1, 36 at v2. The receiver accepts
+ * both, so a v1 producer keeps working unchanged.
  *
  * `format` is 0 = `R8G8B8A8_UNORM`, opaque (so premultiplied and straight
  * agree, satisfying slot 16's premultiplied contract by construction).
  * `stride_bytes` may exceed `width * 4`; the receiver repacks.
+ *
+ * ## Why v2 carries the panel extent (#1073 rotation)
+ *
+ * A frame is a uniformly downscaled copy of **the whole panel**, and the
+ * consumer's only job is to cut its own canvas out of it. That cut maps
+ * canvas→frame through the panel extent — so it is only correct against the
+ * extent the panel *had when the shot was taken*, not the one it has now.
+ *
+ * Those two agree right up until the device **rotates** under a live session,
+ * and then they are transposed. A held portrait frame mapped across a landscape
+ * window is the whole panel squeezed into the wrong aspect: measured on a
+ * 1600x2560 NP02J, the backdrop came out 1.6x wide and 0.625x tall, which is
+ * the exact inverse of the #1101 stretch and just as wrong.
+ *
+ * v1 gave the receiver no way to know: it could only compare the *frame's*
+ * aspect to the panel's and guess, which a square-ish panel or a cropped
+ * capture defeats. v2 states the capture-time extent outright, so "this frame
+ * belongs to the other orientation" becomes a fact rather than a heuristic —
+ * and the receiver drops the frame rather than rendering it mis-registered.
  *
  * **Bytes, not `AHardwareBuffer`, and deliberately so.** The background exists
  * to fill the *de-occlusion band*, which is thin — T0 shipped a 4x256 gradient
@@ -75,7 +99,12 @@ extern "C" {
 //! Wire magics, little-endian u32 as written by the producer.
 #define COMP_BG2D_CAPTURE_MAGIC_HELLO 0x42525844u // 'DXRB'
 #define COMP_BG2D_CAPTURE_MAGIC_FRAME 0x46525844u // 'DXRF'
-#define COMP_BG2D_CAPTURE_VERSION 1u
+
+//! Oldest protocol the receiver still speaks (no panel extent on the wire).
+#define COMP_BG2D_CAPTURE_VERSION_MIN 1u
+//! Newest protocol the receiver speaks; a producer may announce anything in
+//! [MIN, CURRENT] and the frame-header length follows from what it announced.
+#define COMP_BG2D_CAPTURE_VERSION_CURRENT 2u
 
 /*!
  * One received frame, borrowed from the receiver.
@@ -93,6 +122,13 @@ struct comp_bg2d_capture_frame
 	//! starts at 1 and never resets, so "nothing uploaded yet" is 0 and a
 	//! producer restart cannot alias onto a frame the consumer already has.
 	uint32_t seq;
+
+	//! Panel extent this frame was captured against, in panel pixels, or 0/0
+	//! from a v1 producer that does not state it. It is the coordinate space
+	//! `width`x`height` is a downscale OF, and therefore the only extent a
+	//! canvas→frame mapping may legitimately go through — see the rotation
+	//! discussion at the top of this file.
+	uint32_t panel_w, panel_h;
 };
 
 /*!
