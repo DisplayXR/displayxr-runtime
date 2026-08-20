@@ -250,6 +250,16 @@ re-exports the woven texture/fence HANDLEs on the first submit of the new sessio
 off between attempts — a service that is crash-looping must not be met with a reconnect
 storm — and never mark the failure permanent: a service restart self-heals.
 
+**Version skew is a distinct outcome.** If the installed runtime was upgraded under a
+running caller, the re-`xrCreateInstance` fails the client-library ↔ service git-tag gate
+and returns `XR_ERROR_RUNTIME_VERSION_SKEW_DXR`
+(`src/external/openxr_includes/openxr/XR_DXR_result_codes.h`, browser#103) rather than a
+generic `XR_ERROR_RUNTIME_FAILURE`, so a caller can log the real remedy — *relaunch the
+application* — instead of retrying blind. It is still not permanent: drop to a long tail
+rather than switching off, because a rollback (or an installer that has finished writing)
+recovers without a relaunch. A runtime that predates the code reports
+`XR_ERROR_RUNTIME_FAILURE` here, indistinguishable from any other create failure.
+
 ## 5. macOS platform mapping (#759)
 
 The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same bind /

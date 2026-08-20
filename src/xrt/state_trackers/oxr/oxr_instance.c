@@ -41,6 +41,8 @@
 #include "oxr_subaction.h"
 #include "oxr_chain.h"
 
+#include <openxr/XR_DXR_result_codes.h>
+
 #include <sys/types.h>
 #ifdef XRT_OS_UNIX
 #include <unistd.h>
@@ -519,6 +521,19 @@ oxr_instance_create(struct oxr_logger *log,
 		ret = oxr_error(log, XR_ERROR_LIMIT_REACHED,
 		                "The DisplayXR service refused the connection: client quota reached (class %u)",
 		                i_info.app_info.declared_client_class);
+		oxr_instance_destroy(log, &inst->handle);
+		return ret;
+	}
+	if (xret == XRT_ERROR_IPC_VERSION_SKEW) {
+		// browser#103: the client library and the running service are from
+		// different builds (an in-place upgrade under a live client is the
+		// usual cause). Distinct from the generic failure below so a caller
+		// that reconnects mid-session can report "relaunch" instead of
+		// retrying blind — but still recoverable, so not a permanent state.
+		// The client library already logged both git tags.
+		ret = oxr_error(log, XR_ERROR_RUNTIME_VERSION_SKEW_DXR,
+		                "The DisplayXR client library and the running service are different builds "
+		                "(version skew) - relaunch the application");
 		oxr_instance_destroy(log, &inst->handle);
 		return ret;
 	}
