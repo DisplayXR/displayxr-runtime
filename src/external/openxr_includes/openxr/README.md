@@ -41,7 +41,8 @@ Rules:
 | 1004999200–209 | `XR_DXR_xlib_window_binding` | 200 = `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (#660 Phase 3) |
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
 | 1004999220–229 | `XR_DXR_android_surface_binding` | 220 = `XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR` (#1037). The extension's `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR` keeps **1004999005** — one of the two unused gaps in the `XR_DXR_display_info` decade — because that value was already published in the (then unimplemented) sketch in `docs/specs/extensions/XR_DXR_display_info.md` §4 |
-| 1004999230+ | **next free** | |
+| 1004999230–239 | `XR_DXR_result_codes` | Not an extension — runtime-wide `XrResult` values returned from core entry points, where no extension can have been enabled. 230 = `XR_ERROR_RUNTIME_VERSION_SKEW_DXR` (browser#103), an **error**-class result, so it appears in the header negated as `-1004999230` |
+| 1004999240+ | **next free** | |
 
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own
 header and decade — see the row above for why its create-info type value sits

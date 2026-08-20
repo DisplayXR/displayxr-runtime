@@ -193,6 +193,7 @@ u_pp_xrt_result(struct u_pp_delegate dg, xrt_result_t xret)
 	case XRT_ERROR_IPC_FAILURE:                          DG("XRT_ERROR_IPC_FAILURE"); return;
 	case XRT_ERROR_COMPOSITOR_WINDOW_CLOSED:             DG("XRT_ERROR_COMPOSITOR_WINDOW_CLOSED"); return;
 	case XRT_ERROR_WEAVE_REFUSED:                        DG("XRT_ERROR_WEAVE_REFUSED"); return;
+	case XRT_ERROR_IPC_VERSION_SKEW:                     DG("XRT_ERROR_IPC_VERSION_SKEW"); return;
 	case XRT_ERROR_NO_IMAGE_AVAILABLE:                   DG("XRT_ERROR_NO_IMAGE_AVAILABLE"); return;
 	case XRT_ERROR_VULKAN:                               DG("XRT_ERROR_VULKAN"); return;
 	case XRT_ERROR_OPENGL:                               DG("XRT_ERROR_OPENGL"); return;

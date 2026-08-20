@@ -677,7 +677,12 @@ ipc_client_check_git_tag(struct ipc_connection *ipc_c)
 
 	if (!debug_get_bool_option_ipc_ignore_version()) {
 		IPC_ERROR(ipc_c, "Set IPC_IGNORE_VERSION=1 to ignore this version conflict");
-		return XRT_ERROR_IPC_FAILURE;
+		// browser#103: NOT XRT_ERROR_IPC_FAILURE. A client that reconnects
+		// mid-session (a service restart, an in-place upgrade) has to tell
+		// "retry in a moment" apart from "these two binaries will never agree";
+		// the generic code made skew indistinguishable from a dozen transient
+		// failures at xrCreateInstance. The log line above still names both tags.
+		return XRT_ERROR_IPC_VERSION_SKEW;
 	}
 
 	// Error is ignored.

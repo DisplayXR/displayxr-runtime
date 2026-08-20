@@ -286,4 +286,24 @@ typedef enum xrt_result
 	 * XR_ERROR_RUNTIME_FAILURE, leaving the session usable.
 	 */
 	XRT_ERROR_WEAVE_REFUSED = -42,
+
+	/*!
+	 * browser#103: the IPC client library's build-time git tag does not match
+	 * the running service's. The connection was made, the shared memory was
+	 * mapped, and the handshake was then refused because the two halves of
+	 * the runtime are from different builds — the usual cause being an
+	 * installer that upgraded the runtime under a live client.
+	 *
+	 * Split out of @ref XRT_ERROR_IPC_FAILURE so a caller that reconnects
+	 * mid-session can *classify* this: retrying at the same cadence will
+	 * never succeed, and the real remedy is "relaunch the application". It is
+	 * still not permanent — a rollback, or an installer that has finished
+	 * writing, recovers without a relaunch — so a caller should back off to a
+	 * long tail rather than switching off.
+	 *
+	 * The state tracker maps this to XR_ERROR_RUNTIME_VERSION_SKEW_DXR from
+	 * xrCreateInstance. Only the tag check produces it; `IPC_IGNORE_VERSION=1`
+	 * suppresses the check entirely and is unaffected.
+	 */
+	XRT_ERROR_IPC_VERSION_SKEW = -43,
 } xrt_result_t;
