@@ -6247,7 +6247,16 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				return false;
 			}
 		}
-		if (!comp_d3d11_outcomp_ensure_weave_scratch(c->outcomp, region_w, region_h, (uint32_t)unorm_fmt)) {
+		/*
+		 * #918 F10: ONE size authority per frame. The weave snapshot belongs to
+		 * the CONSUME half alone — the deposit half never reads it — and under
+		 * the split the two halves legitimately run at two different regions
+		 * during a resize (live window vs the slot's stamped region). Sizing it
+		 * from both is what made the two halves ping-pong the allocation; the
+		 * consume half's region is the one that matters, so only it asks.
+		 */
+		if (!prepare_only &&
+		    !comp_d3d11_outcomp_ensure_weave_scratch(c->outcomp, region_w, region_h, (uint32_t)unorm_fmt)) {
 			c->repaint.composite_bail = 5;
 			return false;
 		}

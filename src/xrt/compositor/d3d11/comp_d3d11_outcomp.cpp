@@ -49,21 +49,37 @@ struct CompositeParams
 	uint32_t composite_mode; // COMP_D3D11_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
 	uint32_t opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
 	uint32_t pad0;
-	//! #918 Phase 2a: region / source extent, per input. 1.0 whenever the input
-	//! is exactly region-sized, which is every input on the non-split path; the
-	//! bridge planes are panel-sized and need the sub-rect scale.
+	/*!
+	 * #918 Phase 2a: region / source extent, for the two inputs addressed BY
+	 * PIXEL. 1.0 whenever the input is exactly region-sized, which is every
+	 * input on the non-split path; the Local2D bridge plane is panel-sized and
+	 * the weave scratch is grow-only, so both need the sub-rect scale.
+	 *
+	 * There is deliberately no MASK scale. An authored mask maps
+	 * STRETCH-TO-REGION — the whole mask texture over the whole region — in the
+	 * composite and in the DP publish alike, split and non-split alike. That is
+	 * the pre-#918 behavior and the mapping the vendor DP applies, so the mask
+	 * is sampled at plain uv and a mask whose dims differ from the region is
+	 * never cropped.
+	 */
 	float twod_uv_scale[2];
-	float mask_uv_scale[2];
+	float weave_uv_scale[2];
 	uint32_t pad1[2];
 };
 static_assert(sizeof(CompositeParams) == 64, "CompositeParams must match the HLSL cbuffer packing");
 
 /*!
- * #918 Phase 2a — the uv scale for one input SRV: how much of it the composite
- * region occupies. Reading the extent off the resource rather than taking it as
- * another parameter is deliberate — a caller that hands in a bigger texture gets
- * the right sub-rect automatically, instead of silently stretching it across the
- * pass. Once per composite call, so the QI cost is per frame, not per pixel.
+ * #918 Phase 2a — the uv scale for one PIXEL-ADDRESSED input SRV: how much of it
+ * the composite region occupies. Reading the extent off the resource rather than
+ * taking it as another parameter is deliberate — a caller that hands in a bigger
+ * texture gets the right sub-rect automatically, instead of silently stretching
+ * it across the pass. Once per composite call, so the QI cost is per frame, not
+ * per pixel.
+ *
+ * ONLY for inputs whose content is a top-left sub-rect of an over-allocated
+ * texture: the panel-sized Local2D bridge plane and the grow-only weave scratch.
+ * The MASK is NOT such an input — it maps stretch-to-region and must never be
+ * run through this.
  */
 static void
 outcomp_uv_scale(void *srv_ptr, uint32_t region_w, uint32_t region_h, float out_scale[2])
@@ -84,10 +100,21 @@ outcomp_uv_scale(void *srv_ptr, uint32_t region_w, uint32_t region_h, float out_
 	    tex != nullptr) {
 		D3D11_TEXTURE2D_DESC td = {};
 		tex->GetDesc(&td);
-		if (td.Width > region_w) {
+		/*
+		 * #918 F2/D3: BIDIRECTIONAL. The earlier one-sided `if (Width >
+		 * region_w)` silently stretched an input that was SMALLER than the
+		 * region across the whole pass instead of addressing it by pixel —
+		 * the exact failure the scale exists to prevent, just in the other
+		 * direction. Both remaining callers are ≥ the region by construction
+		 * (the Local2D plane is panel-sized and the region is clamped to the
+		 * panel; the weave scratch is grow-only), so a scale > 1 should be
+		 * unreachable — and if it ever happens the CLAMP sampler edge-repeats
+		 * rather than sampling garbage.
+		 */
+		if (td.Width != 0) {
 			out_scale[0] = (float)region_w / (float)td.Width;
 		}
-		if (td.Height > region_h) {
+		if (td.Height != 0) {
 			out_scale[1] = (float)region_h / (float)td.Height;
 		}
 		tex->Release();
@@ -121,11 +148,27 @@ struct comp_d3d11_outcomp
 	ID3D11RasterizerState *rasterizer_state;
 	ID3D11DepthStencilState *depth_stencil_state;
 
-	//! SRV-capable scratch snapshot of the weave target's window region, for
-	//! the authored-mask lerp (the mask path reads the weave; the target is
-	//! RTV-only). Lazily (re)allocated window-sized (#464).
+	/*!
+	 * SRV-capable scratch snapshot of the weave target's window region, for the
+	 * authored-mask lerp (the mask path reads the weave; the target is
+	 * RTV-only). Lazily allocated window-sized (#464) and then GROW-ONLY
+	 * (#918 F10).
+	 *
+	 * Grow-only, because two callers ask for two sizes in the same frame under
+	 * the output-device split: the deposit half runs at the LIVE window region
+	 * and the consume half at the region stamped on the egress slot, which
+	 * during a resize drag differ by a frame. Reallocating on every mismatch
+	 * made them ping-pong — two full texture rebuilds per frame for the whole
+	 * drag. An oversized scratch costs nothing instead: the composite takes the
+	 * region explicitly and `weave_uv_scale` addresses the sub-rect, so the
+	 * pixels are identical either way.
+	 */
 	ID3D11Texture2D *weave_scratch;
 	ID3D11ShaderResourceView *weave_scratch_srv;
+	//! Allocated extent of @ref weave_scratch (0 when unallocated).
+	uint32_t weave_scratch_w, weave_scratch_h;
+	//! Grow events, reported once at destroy — the number #918 F10 is about.
+	uint64_t weave_scratch_reallocs;
 };
 
 #define SAFE_RELEASE(p)                                                                                                \
@@ -339,6 +382,13 @@ comp_d3d11_outcomp_destroy(struct comp_d3d11_outcomp **outcomp_ptr)
 	}
 	struct comp_d3d11_outcomp *oc = *outcomp_ptr;
 
+	if (oc->weave_scratch_reallocs > 0) {
+		// #918 F10: grow events for the whole session. A resize drag should
+		// cost a handful (one per new high-water mark), never two a frame.
+		U_LOG_W("D3D11 outcomp: weave scratch grew %llu time(s), final %ux%u (#918 F10)",
+		        (unsigned long long)oc->weave_scratch_reallocs, oc->weave_scratch_w, oc->weave_scratch_h);
+	}
+
 	SAFE_RELEASE(oc->weave_scratch_srv);
 	SAFE_RELEASE(oc->weave_scratch);
 	SAFE_RELEASE(oc->depth_stencil_state);
@@ -360,11 +410,43 @@ comp_d3d11_outcomp_ensure_weave_scratch(struct comp_d3d11_outcomp *outcomp,
                                         uint32_t h,
                                         uint32_t dxgi_format)
 {
-	if (outcomp == nullptr) {
+	if (outcomp == nullptr || w == 0 || h == 0) {
 		return false;
 	}
-	return d3d11_ensure_srv_scratch(outcomp->dev, &outcomp->weave_scratch, &outcomp->weave_scratch_srv, w, h,
-	                                static_cast<DXGI_FORMAT>(dxgi_format), "local2d weave");
+	/*
+	 * #918 F10 — GROW-ONLY within a session. A scratch that already covers the
+	 * request is kept: the composite takes the region explicitly and scales the
+	 * weave uv into the sub-rect, so an oversized scratch produces identical
+	 * pixels. What it buys is that the deposit and consume halves — which under
+	 * the split legitimately ask for two different regions in one frame during a
+	 * resize — can no longer ping-pong the allocation.
+	 *
+	 * A FORMAT change is not a grow: the snapshot has to match the target, so
+	 * that one still reallocates (it happens on a target rebuild, not per frame).
+	 */
+	if (outcomp->weave_scratch != nullptr) {
+		D3D11_TEXTURE2D_DESC cur;
+		outcomp->weave_scratch->GetDesc(&cur);
+		if (cur.Format == static_cast<DXGI_FORMAT>(dxgi_format) && cur.Width >= w && cur.Height >= h) {
+			return true;
+		}
+		// Grow to the high-water mark in BOTH axes so a taller-then-wider
+		// sequence costs two allocations, not an alternating series.
+		if (cur.Format == static_cast<DXGI_FORMAT>(dxgi_format)) {
+			w = (cur.Width > w) ? cur.Width : w;
+			h = (cur.Height > h) ? cur.Height : h;
+		}
+	}
+	if (!d3d11_ensure_srv_scratch(outcomp->dev, &outcomp->weave_scratch, &outcomp->weave_scratch_srv, w, h,
+	                              static_cast<DXGI_FORMAT>(dxgi_format), "local2d weave")) {
+		outcomp->weave_scratch_w = 0;
+		outcomp->weave_scratch_h = 0;
+		return false;
+	}
+	outcomp->weave_scratch_w = w;
+	outcomp->weave_scratch_h = h;
+	outcomp->weave_scratch_reallocs++;
+	return true;
 }
 
 extern "C" void *
@@ -377,9 +459,33 @@ comp_d3d11_outcomp_snapshot_weave(struct comp_d3d11_outcomp *outcomp,
 		return nullptr;
 	}
 
-	// Snapshot the window region of the weave (the DP wrote dst; RT≠SRV, so
-	// the lerp reads this copy — impl doc §3 step 2).
-	D3D11_BOX sbox = {0, 0, 0, region_w, region_h, 1};
+	/*
+	 * Snapshot the window region of the weave (the DP wrote dst; RT≠SRV, so the
+	 * lerp reads this copy — impl doc §3 step 2).
+	 *
+	 * #918 F6: clamp the box to min(src, dst). An oversized `CopySubresourceRegion`
+	 * box is not an error the runtime sees — D3D11 DROPS the call silently — so an
+	 * unclamped box hands the composite whatever the scratch happened to hold.
+	 */
+	D3D11_TEXTURE2D_DESC sd;
+	static_cast<ID3D11Texture2D *>(dst_texture)->GetDesc(&sd);
+	uint32_t w = region_w, h = region_h;
+	if (w > sd.Width) {
+		w = sd.Width;
+	}
+	if (h > sd.Height) {
+		h = sd.Height;
+	}
+	if (w > outcomp->weave_scratch_w) {
+		w = outcomp->weave_scratch_w;
+	}
+	if (h > outcomp->weave_scratch_h) {
+		h = outcomp->weave_scratch_h;
+	}
+	if (w == 0 || h == 0) {
+		return nullptr;
+	}
+	D3D11_BOX sbox = {0, 0, 0, w, h, 1};
 	outcomp->ctx->CopySubresourceRegion(outcomp->weave_scratch, 0, 0, 0, 0,
 	                                    static_cast<ID3D11Texture2D *>(dst_texture), 0, &sbox);
 	return outcomp->weave_scratch_srv;
@@ -467,11 +573,15 @@ comp_d3d11_outcomp_composite_2d_masked(struct comp_d3d11_outcomp *outcomp,
 	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
 	// #833/#116 — the flatten needs the weave, so it stays off on the rect path.
 	params.opaque_present = (mask_srv != nullptr && opaque_present) ? 1 : 0;
-	// #918 Phase 2a: the bridge planes are panel-sized, so scale their uv into
-	// the region's sub-rect. The weave scratch is allocated at exactly the region
-	// (comp_d3d11_outcomp_ensure_weave_scratch), so it needs none.
+	/*
+	 * #918 Phase 2a: the Local2D bridge plane is panel-sized and the weave
+	 * scratch is grow-only (#918 F10), so both carry the region in a top-left
+	 * sub-rect and their uv scales into it. The MASK deliberately gets no
+	 * scale — it maps stretch-to-region, so it is sampled at plain uv whatever
+	 * its dims are.
+	 */
 	outcomp_uv_scale(twod_srv, region_w, region_h, params.twod_uv_scale);
-	outcomp_uv_scale(mask_srv, region_w, region_h, params.mask_uv_scale);
+	outcomp_uv_scale(weave_srv, region_w, region_h, params.weave_uv_scale);
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = outcomp->ctx->Map(outcomp->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
