@@ -382,11 +382,22 @@ comp_d3d11_outcomp_destroy(struct comp_d3d11_outcomp **outcomp_ptr)
 	}
 	struct comp_d3d11_outcomp *oc = *outcomp_ptr;
 
+	/*
+	 * #918 F10: grow events for the whole session. A resize drag should cost a
+	 * handful (one per new high-water mark), never two a frame.
+	 *
+	 * Behind DXR_XBRIDGE_DIAG with the rest of the #918 evidence, deliberately:
+	 * this unit is on the NON-split path too, and the split-off WARN class set is
+	 * diffed against the merge base as an acceptance check. A diagnostic for a
+	 * split concern must not add a class to a session that has no split.
+	 */
 	if (oc->weave_scratch_reallocs > 0) {
-		// #918 F10: grow events for the whole session. A resize drag should
-		// cost a handful (one per new high-water mark), never two a frame.
-		U_LOG_W("D3D11 outcomp: weave scratch grew %llu time(s), final %ux%u (#918 F10)",
-		        (unsigned long long)oc->weave_scratch_reallocs, oc->weave_scratch_w, oc->weave_scratch_h);
+		const char *diag = getenv("DXR_XBRIDGE_DIAG");
+		if (diag != nullptr && *diag == '1') {
+			U_LOG_W("D3D11 outcomp: weave scratch grew %llu time(s), final %ux%u (#918 F10)",
+			        (unsigned long long)oc->weave_scratch_reallocs, oc->weave_scratch_w,
+			        oc->weave_scratch_h);
+		}
 	}
 
 	SAFE_RELEASE(oc->weave_scratch_srv);
