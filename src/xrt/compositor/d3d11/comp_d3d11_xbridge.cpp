@@ -41,13 +41,24 @@
 #define XB_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 
 /*!
- * #918 Phase 2a bandwidth gate. The supervisor's acceptance number for the whole
- * transport, atlas + planes, measured over the DIAG second. A session that
- * exceeds it latches its LARGEST plane to half rate (one WARN, once) rather than
- * disabling the split — the split's win is the repaint arm and the local present,
- * neither of which a plane's rate affects.
+ * #918 Phase 2a bandwidth gate. The acceptance number for the whole transport,
+ * atlas + planes, measured over a rolling second. A session that exceeds it
+ * latches its largest PLANE to half rate (one WARN) rather than disabling the
+ * split — the split's win is the repaint arm and the local present, neither of
+ * which a plane's rate affects.
  */
 #define XB_BANDWIDTH_GATE_BYTES_PER_S (2000ull * 1000ull * 1000ull)
+/*!
+ * #918 review F7 — the gate's only lever is a plane's rate, so it must not fire
+ * on a total the planes barely contribute to. Below this plane rate the atlas IS
+ * the cost (a 4-view 4K atlas is ~4 GB/s at 120 Hz by itself) and halving a plane
+ * would spend 2D update rate to change nothing measurable.
+ */
+#define XB_GATE_PLANE_FLOOR_BYTES_PER_S (250ull * 1000ull * 1000ull)
+//! #918 review F7 — how long the transport must stay inside the gate before a
+//! half-rate latch is released. The latch is pressure relief, not a session-long
+//! sentence for one busy second.
+#define XB_GATE_UNLATCH_NS (5ull * 1000ull * 1000ull * 1000ull)
 
 //! #918 R2: two content-box changes closer together than this are a drag, not a
 //! mode switch — stop reallocating the egress ring per size.
@@ -281,10 +292,20 @@ struct comp_d3d11_xbridge
 		uint64_t half_rate_parity;
 	} plane[COMP_D3D11_XBRIDGE_PLANE_COUNT];
 	uint64_t atlas_bytes;
-	//! Rolling one-second window for the bandwidth gate (independent of the
-	//! compositor's DIAG cadence, which may be off).
+	/*!
+	 * Rolling one-second window for the bandwidth gate (independent of the
+	 * compositor's DIAG cadence, which may be off). #918 review F7: atlas and
+	 * plane bytes are accumulated SEPARATELY — the over-budget test is on the
+	 * total, but the decision to throttle is on the planes, because a plane's
+	 * rate is the only thing the gate can change.
+	 */
 	uint64_t gate_window_ns;
-	uint64_t gate_bytes;
+	uint64_t gate_atlas_bytes;
+	uint64_t gate_plane_bytes;
+	//! When the transport last came back inside the gate — the un-latch clock.
+	uint64_t gate_under_since_ns;
+	//! One WARN for the over-budget-but-not-the-planes case, ever.
+	bool gate_atlas_only_warned;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -906,10 +927,23 @@ comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
 	}
 	pl.src_gen = generation;
 	pl.src_bound = true;
+	// #918 review F7: a re-bind is a new source, so whatever rate history earned
+	// the half-rate latch no longer describes this plane. Release it here as well
+	// as on the gate's own un-latch clock.
+	pl.half_rate = false;
 	// A new source texture invalidates every slot's pixels, and each slot now
 	// owes a FULL refresh rather than just the next frame's dirty box.
 	xb_plane_invalidate_slots(xb, pl);
 	return true;
+}
+
+extern "C" void
+comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plane)
+{
+	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
+		return;
+	}
+	xb_plane_invalidate_slots(xb, xb->plane[plane]);
 }
 
 //! Fold @p (x,y,w,h) into slot @p i's pending dirty box.
@@ -1225,16 +1259,31 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
 }
 
 /*!
- * #918 Phase 2a bandwidth gate. Sum every leg over a rolling second; if the
- * transport exceeds the acceptance number, latch the LARGEST plane to half rate
- * with ONE WARN. Never the split — the split's win is the repaint arm and the
- * iGPU-local present, neither of which a plane's rate touches.
+ * #918 Phase 2a bandwidth gate, rewritten for #918 review F7.
+ *
+ * The gate's only lever is a PLANE's rate, so it must aim at plane-attributable
+ * bytes. It used to meter the whole transport — atlas included — and then
+ * throttle the largest plane, which meant a 4-view 4K atlas (3.98 GB/s at 120 Hz
+ * on its own, before any 2D content exists) latched every plane in turn, one a
+ * second, for a total the planes did not cause and halving them cannot fix. The
+ * standing comment "the atlas alone is over, which it never is" was the
+ * assumption that made that look safe.
+ *
+ * Three rules now:
+ *  - the OVER-BUDGET test is on the transport TOTAL, which is what the
+ *    acceptance number is about;
+ *  - throttling only happens when the PLANES contribute meaningfully to it
+ *    (@ref XB_GATE_PLANE_FLOOR_BYTES_PER_S), so an over-budget atlas alone never
+ *    throttles a plane;
+ *  - the latch is NOT permanent — it clears when the transport has stayed inside
+ *    budget for @ref XB_GATE_UNLATCH_NS, and a plane re-bind clears its own.
  */
 static void
-xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t frame_bytes, uint64_t seq)
+xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
 {
 	const uint64_t now = os_monotonic_get_ns();
-	xb->gate_bytes += frame_bytes;
+	xb->gate_atlas_bytes += atlas_bytes;
+	xb->gate_plane_bytes += plane_bytes;
 	if (xb->gate_window_ns == 0) {
 		xb->gate_window_ns = now;
 		return;
@@ -1243,32 +1292,73 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t frame_bytes, uint64_t 
 	if (elapsed < 1000ull * 1000ull * 1000ull) {
 		return;
 	}
-	const uint64_t rate = (uint64_t)((double)xb->gate_bytes * 1.0e9 / (double)elapsed);
-	xb->gate_bytes = 0;
+	const double inv = 1.0e9 / (double)elapsed;
+	const uint64_t plane_rate = (uint64_t)((double)xb->gate_plane_bytes * inv);
+	const uint64_t total_rate = (uint64_t)((double)(xb->gate_atlas_bytes + xb->gate_plane_bytes) * inv);
+	xb->gate_atlas_bytes = 0;
+	xb->gate_plane_bytes = 0;
 	xb->gate_window_ns = now;
 
 	uint32_t worst = COMP_D3D11_XBRIDGE_PLANE_COUNT;
 	uint64_t worst_bytes = 0;
+	bool any_latched = false;
 	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
-		if (xb->plane[p].live && !xb->plane[p].half_rate && xb->plane[p].gate_bytes > worst_bytes) {
+		if (xb->plane[p].half_rate) {
+			any_latched = true;
+		} else if (xb->plane[p].live && xb->plane[p].gate_bytes > worst_bytes) {
 			worst_bytes = xb->plane[p].gate_bytes;
 			worst = p;
 		}
 		xb->plane[p].gate_bytes = 0;
 	}
-	if (rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
+
+	if (total_rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
+		// UN-LATCH. A latched plane runs at half rate for as long as the
+		// pressure lasts, not for the rest of the session — a resize or a
+		// fullscreen burst must not permanently halve the 2D update rate of a
+		// session that spends the next hour idle.
+		if (xb->gate_under_since_ns == 0) {
+			xb->gate_under_since_ns = now;
+		} else if (any_latched && now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
+			for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+				xb->plane[p].half_rate = false;
+			}
+			xb->gate_under_since_ns = 0;
+			U_LOG_W(
+			    "d3d11 xbridge: transport has been inside the %.1f GB/s gate for %llu s — "
+			    "releasing the half-rate latch on every plane (#918 Phase 2a)",
+			    (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
+			    (unsigned long long)(XB_GATE_UNLATCH_NS / 1000000000ull));
+		}
+		return;
+	}
+	xb->gate_under_since_ns = 0;
+
+	if (plane_rate < XB_GATE_PLANE_FLOOR_BYTES_PER_S) {
+		// Over budget, but not because of the planes. Halving one would cost
+		// the 2D update rate and buy nothing measurable.
+		if (!xb->gate_atlas_only_warned) {
+			xb->gate_atlas_only_warned = true;
+			U_LOG_W(
+			    "d3d11 xbridge: transport measured %.2f GB/s, above the %.1f GB/s acceptance gate, "
+			    "but the planes account for only %.2f GB/s of it — the atlas is the cost and the "
+			    "gate has no lever on it, so nothing is throttled (#918 Phase 2a)",
+			    (double)total_rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
+			    (double)plane_rate / 1.0e9);
+		}
 		return;
 	}
 	if (worst >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
-		return; // nothing left to throttle — the atlas alone is over, which it never is
+		return; // every live plane is already latched
 	}
 	xb->plane[worst].half_rate = true;
 	xb->plane[worst].half_rate_parity = seq & 1ull;
 	U_LOG_W(
-	    "d3d11 xbridge: transport measured %.2f GB/s over the last second, above the %.1f GB/s "
-	    "acceptance gate — latching the %s plane to HALF RATE for this session. The split stays on "
-	    "(#918 Phase 2a)",
-	    (double)rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9, xb_plane_name(worst));
+	    "d3d11 xbridge: transport measured %.2f GB/s over the last second (planes %.2f GB/s), above "
+	    "the %.1f GB/s acceptance gate — latching the %s plane to HALF RATE until the transport "
+	    "settles. The split stays on (#918 Phase 2a)",
+	    (double)total_rate / 1.0e9, (double)plane_rate / 1.0e9,
+	    (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9, xb_plane_name(worst));
 }
 
 
@@ -1970,26 +2060,68 @@ xb_egress_write_slot(struct comp_d3d11_xbridge *xb)
 	return best;
 }
 
-extern "C" void
-comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
+/*!
+ * The #918 F6 back-fence: queue a GPU-side wait on the app's immediate context
+ * for the last seq the producer queue was told to signal, so nothing the app
+ * submits AFTER this point can overwrite a resource the producer's copy of an
+ * earlier seq is still reading.
+ *
+ * Wait for the LAST SEQ THE PRODUCER QUEUE WAS ACTUALLY TOLD TO SIGNAL, not for
+ * seq-1: a frame whose allocator was busy (or that arrived while the bridge was
+ * degraded) never reaches leg 1, so its fence value is never signalled — and a
+ * GPU wait on a value nothing will ever signal wedges the app's queue
+ * permanently. This value is always backed by work already submitted, so the
+ * wait is guaranteed to resolve.
+ *
+ * The immediate context is one ordered stream, so ONE wait per producer seq
+ * covers every app-device write that follows it — hence the `app_waited_seq`
+ * guard, which makes repeat calls within a frame free.
+ */
+static void
+xb_app_back_wait(struct comp_d3d11_xbridge *xb)
 {
-	if (xb == nullptr || !xb->app_back_wait_ok || xb->ingress_mode != XB_INGRESS_DIRECT) {
+	if (!xb->app_back_wait_ok) {
 		return;
 	}
-	/*
-	 * Wait for the LAST SEQ THE PRODUCER QUEUE WAS ACTUALLY TOLD TO SIGNAL, not
-	 * for seq-1: a frame whose allocator was busy (or that arrived while the
-	 * bridge was degraded) never reaches leg 1, so its fence value is never
-	 * signalled — and a GPU wait on a value nothing will ever signal wedges the
-	 * app's queue permanently. This value is always backed by work already
-	 * submitted, so the wait is guaranteed to resolve.
-	 */
 	const uint64_t want = xb->prod_submit_seq.load(std::memory_order_acquire);
 	if (want == 0 || want == xb->app_waited_seq) {
 		return;
 	}
 	xb->app_ctx4->Wait(xb->f_xa_app, want);
 	xb->app_waited_seq = want;
+}
+
+extern "C" void
+comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
+{
+	if (xb == nullptr || xb->ingress_mode != XB_INGRESS_DIRECT) {
+		return;
+	}
+	xb_app_back_wait(xb);
+}
+
+extern "C" void
+comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane)
+{
+	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		return;
+	}
+	/*
+	 * #918 review, R1-adjacent. A plane source is opened by the producer
+	 * directly (the Option-I shape), so the producer's copy of seq N-1 reads the
+	 * app's texture — and the authored mask's staging copy runs on an OpenXR call
+	 * of the app's, BEFORE layer_commit and therefore before the frame's
+	 * pre_render wait. Nothing ordered that write against the in-flight read.
+	 * Same mechanism, same fence, applied at the write instead.
+	 *
+	 * Unconditional on ingress mode, unlike pre_render: Option II gives the ATLAS
+	 * a private staging slot, but the planes are direct either way.
+	 */
+	auto &pl = xb->plane[plane];
+	if (!pl.live || !pl.src_bound) {
+		return;
+	}
+	xb_app_back_wait(xb);
 }
 
 extern "C" void
@@ -2096,11 +2228,14 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(xb->xa_cons[xa]);
 		xb->cons_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 	}
-	uint64_t frame_bytes = (uint64_t)content_w * content_h * 4ull;
-	xb->atlas_bytes += frame_bytes;
+	// #918 review F7: atlas and plane bytes stay separate all the way into the
+	// gate — the gate can only throttle planes, so it must know which is which.
+	const uint64_t atlas_frame_bytes = (uint64_t)content_w * content_h * 4ull;
+	xb->atlas_bytes += atlas_frame_bytes;
 
+	uint64_t plane_frame_bytes = 0;
 	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
-		frame_bytes += xb_record_plane(xb, p, seq, xa, eg);
+		plane_frame_bytes += xb_record_plane(xb, p, seq, xa, eg);
 	}
 
 	xb->prod_list->Close();
@@ -2164,7 +2299,7 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 		}
 	}
 
-	xb_bandwidth_gate(xb, frame_bytes, seq);
+	xb_bandwidth_gate(xb, atlas_frame_bytes, plane_frame_bytes, seq);
 
 	xb->last_submit_seq.store(seq, std::memory_order_release);
 	xb->frames++;

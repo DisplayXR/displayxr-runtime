@@ -317,6 +317,35 @@ void
 comp_d3d11_xbridge_stage_plane(
     struct comp_d3d11_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h);
 
+/*!
+ * #918 review F4 — drop every slot's pixels for @p plane and make each owe a
+ * FULL refresh of the plane extent.
+ *
+ * For the caller whose SOURCE content moved without the source texture being
+ * reallocated: a composite region change leaves stale pixels outside the new
+ * region in a panel-sized scratch, and the dirty-box union that follows would
+ * carry them across as if they were content. The caller clears its whole scratch
+ * and calls this, so the next copy is a full refresh of known-good pixels.
+ */
+void
+comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plane);
+
+/*!
+ * #918 review, R1-adjacent — order an app-device write to @p plane's SOURCE
+ * behind the producer's in-flight read of it.
+ *
+ * @ref comp_d3d11_xbridge_pre_render covers everything layer_commit writes, but
+ * the authored mask is staged from an OpenXR entry point of the app's, before
+ * layer_commit runs — so that write preceded the frame's back-fence in the
+ * command stream and raced the producer's copy of the previous seq. Call
+ * immediately before any such out-of-band write.
+ *
+ * GPU-side wait on the app's immediate context only; this thread never waits,
+ * and the wait is free after the first call for a given producer seq.
+ */
+void
+comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane);
+
 //! Stage the composite recipe the next submit stamps on its slot.
 void
 comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp_d3d11_xbridge_recipe *recipe);

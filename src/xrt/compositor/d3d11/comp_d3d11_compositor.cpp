@@ -362,6 +362,10 @@ struct comp_d3d11_compositor
 	//! extra app-device copy per frame). NULL/0 when the split is off.
 	HANDLE local2d_scratch_share;
 	uint64_t local2d_scratch_gen;
+	//! #918 review F4 — the region this scratch was last cleared at. A CHANGE
+	//! clears the whole (panel-sized) surface and invalidates the plane's slots,
+	//! so pixels the content vacated cannot ride a later dirty-box union across.
+	uint32_t local2d_scratch_region_w, local2d_scratch_region_h;
 
 	//! #491 part 3 — 2D-under backdrop flatten target (RT+SRV), same trio as
 	//! local2d_scratch. The frame's UNDER Local2D layers (before the projection
@@ -374,6 +378,8 @@ struct comp_d3d11_compositor
 	//! #918 Phase 2a — same plane-source shape as local2d_scratch above.
 	HANDLE backdrop_scratch_share;
 	uint64_t backdrop_scratch_gen;
+	//! #918 review F4 — same region-change bookkeeping as local2d_scratch above.
+	uint32_t backdrop_scratch_region_w, backdrop_scratch_region_h;
 
 	//! #439 Phase 3 — runtime-owned IMPLICIT zone mask, rasterized from the
 	//! frame's Local2D layer rects (Q3): M=1 (keep the weave) everywhere,
@@ -4955,9 +4961,19 @@ d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_m
 		return;
 	}
 
-	// Tier 1/2 need no transport at all — their rasters are pure CPU rects and
-	// were simply run again on the output-device shadow.
-	if (mask == nullptr || !mask->app_authored || mask->staged_share == nullptr) {
+	/*
+	 * Tier 1/2 need no transport at all — their rasters are pure CPU rects and
+	 * were simply run again on the output-device shadow.
+	 *
+	 * #918 review D5: unless that shadow could not be allocated. The WARN at
+	 * create said "Tier-1/2 masks degrade under the split" and nothing degraded —
+	 * the composite simply had no mask on the output device, bailed for ever, and
+	 * the DP's mask was cleared. A mask with no shadow rides the plane instead,
+	 * whatever tier authored it: the transport already exists, the pixels are the
+	 * same, and it costs one R8 copy per authoring call.
+	 */
+	const bool needs_plane = mask != nullptr && (mask->app_authored || mask->out_staged_srv == nullptr);
+	if (mask == nullptr || !needs_plane || mask->staged_share == nullptr) {
 		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
@@ -5040,11 +5056,11 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
 	 * #918 review D6: the KIND follows this frame's single publisher, not a
 	 * per-site guess. `mask_plane_live` is false whenever the plane could not be
 	 * bound (no share handle, a stack that refuses R8 cross-adapter) or the mask
-	 * has never been app-authored — and then the output-device shadow is both the
-	 * right answer and the honest one to stamp on the recipe.
+	 * does not need it — and then the output-device shadow is both the right
+	 * answer and the honest one to stamp on the recipe.
 	 */
-	if (!mask->app_authored || !c->mask_plane_live || c->mask_plane_gen != mask->staged_gen) {
-		return mask->out_staged_srv;
+	if (!c->mask_plane_live || c->mask_plane_gen != mask->staged_gen) {
+		return mask->out_staged_srv; // NULL when the shadow itself failed (#918 review D5)
 	}
 	if (out_kind != nullptr) {
 		*out_kind = COMP_D3D11_XBRIDGE_MASK_PLANE;
@@ -5078,6 +5094,16 @@ d3d11_zone_mask_stage(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_ma
 {
 	if (mask == nullptr || mask->staged == nullptr || mask->tex == nullptr) {
 		return;
+	}
+	/*
+	 * #918 review, R1-adjacent: `mask->staged` is a bridge PLANE SOURCE the
+	 * producer opened directly, so this write has to be ordered behind the
+	 * producer's in-flight read of the previous seq — the same back-fence
+	 * layer_commit takes for the atlas, applied here because this copy can run
+	 * from an OpenXR entry point BEFORE layer_commit does. GPU-side only.
+	 */
+	if (c->split_active && c->xbridge != nullptr) {
+		comp_d3d11_xbridge_pre_plane_write(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK);
 	}
 	c->context->CopyResource(mask->staged, mask->tex);
 	if (c->split_active && mask->out_staged != nullptr && mask->out_tex != nullptr) {
@@ -5992,16 +6018,46 @@ d3d11_clamp_region_to_panel(struct comp_d3d11_compositor *c, uint32_t *w, uint32
  * the region nothing is ever sampled, so clearing the region is not an
  * approximation: it is the same set of authoritative pixels the region-sized
  * scratch used to hold.
+ *
+ * **#918 review F4 — except on the frame the region CHANGES.** "Outside the
+ * region nothing is sampled" is true of the scratch and false of its egress
+ * plane. Shrink the window and the pixels the content vacated are still in the
+ * scratch, un-cleared, and the dirty-box union that follows copies them across;
+ * grow it back and the plane keeps them for ever, because the union only ever
+ * covers where content IS, never where it WAS. That is a ghost overlay at its
+ * old position, flickering with the ring rotation. So a region change clears the
+ * WHOLE scratch and makes every egress slot owe a full refresh. It is a
+ * per-change cost, not a per-frame one, and it is the only thing that makes the
+ * plane's pixels a function of the scratch's.
+ *
+ * @param last_w,last_h The region this scratch was last cleared at, owned by the
+ *        caller (one pair per scratch).
+ * @param plane The bridge plane this scratch feeds.
  */
 static void
 d3d11_clear_scratch_region(struct comp_d3d11_compositor *c,
                            ID3D11RenderTargetView *rtv,
                            uint32_t region_w,
-                           uint32_t region_h)
+                           uint32_t region_h,
+                           uint32_t *last_w,
+                           uint32_t *last_h,
+                           uint32_t plane)
 {
 	// Where a pixel is M=0 (2D) but no layer covers it, twod stays (0,0,0,0) →
 	// final.a → 0 → the desktop shows through (Q2, §4.2 output-alpha rule).
 	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+	const bool region_changed = (*last_w != region_w) || (*last_h != region_h);
+	*last_w = region_w;
+	*last_h = region_h;
+	if (region_changed) {
+		c->context->ClearRenderTargetView(rtv, transparent);
+		if (c->split_active && c->xbridge != nullptr) {
+			comp_d3d11_xbridge_invalidate_plane(c->xbridge, plane);
+		}
+		return;
+	}
+
 	ID3D11DeviceContext1 *ctx1 = nullptr;
 	if (SUCCEEDED(c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1))) &&
 	    ctx1 != nullptr) {
@@ -6121,7 +6177,8 @@ d3d11_local2d_digest(struct comp_d3d11_compositor *c,
 static bool
 d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
-	d3d11_clear_scratch_region(c, c->local2d_scratch_rtv, region_w, region_h);
+	d3d11_clear_scratch_region(c, c->local2d_scratch_rtv, region_w, region_h, &c->local2d_scratch_region_w,
+	                           &c->local2d_scratch_region_h, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D);
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -6214,7 +6271,8 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 		return nullptr;
 	}
 
-	d3d11_clear_scratch_region(c, c->backdrop_scratch_rtv, region_w, region_h);
+	d3d11_clear_scratch_region(c, c->backdrop_scratch_rtv, region_w, region_h, &c->backdrop_scratch_region_w,
+	                           &c->backdrop_scratch_region_h, COMP_D3D11_XBRIDGE_PLANE_BACKDROP);
 
 	for (int32_t i = 0; i < proj_idx; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -6900,10 +6958,21 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 			hr = out_device->CreateShaderResourceView(mask->out_staged, nullptr, &mask->out_staged_srv);
 		}
 		if (FAILED(hr) || mask->out_staged_srv == nullptr) {
+			/*
+			 * #918 review D5: name the actual consequence. With no shadow this
+			 * mask rides the bridge plane at every tier (d3d11_stage_mask_plane),
+			 * which costs one R8 transport per authoring call instead of zero —
+			 * a real degradation with a real fallback behind it. Without a share
+			 * handle either, there is nothing left and the mask is inert under
+			 * the split.
+			 */
 			U_LOG_W(
-			    "zone_mask_create: output-device shadow failed 0x%08x — Tier-1/2 masks degrade "
-			    "under the split (#918 Phase 2a)",
-			    hr);
+			    "zone_mask_create: output-device shadow failed 0x%08x — %s (#918 Phase 2a)", hr,
+			    mask->staged_share != nullptr
+			        ? "every tier of this mask rides the bridge plane instead, at one R8 transport "
+			          "per authoring call"
+			        : "and there is no share handle either, so this mask cannot composite under the "
+			          "output-device split at all");
 		} else {
 			out_context->ClearRenderTargetView(mask->out_rtv, all_3d);
 			out_context->CopyResource(mask->out_staged, mask->out_tex);
@@ -7129,6 +7198,12 @@ comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	// tear into a frame, and make this the active mask. Sticky
 	// last-submit-wins: it stays active across frames until re-submit or
 	// destroy.
+	//
+	// #918 review, R1-adjacent: order the write behind the producer's read of
+	// the previous seq — see d3d11_zone_mask_stage.
+	if (c->split_active && c->xbridge != nullptr) {
+		comp_d3d11_xbridge_pre_plane_write(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK);
+	}
 	c->context->CopyResource(mask->staged, mask->tex);
 	// #918 Phase 2a: stage the shadow too, so a Tier-1/2 mask is consumable on
 	// the output device without any transport at all.
