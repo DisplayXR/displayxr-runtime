@@ -119,6 +119,7 @@ considered for default-on.
 | `DXR_VK_BRIDGE_PACING` | governor | `0..3` pins the queue depth and disables governor transitions (#912) |
 | `DXR_PRESENT_OPAQUE` | `false` | Opaque flip chain instead of the composed chain. Different pacing source: `GetFrameStatistics` vs the DComp compositor clock |
 | `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` | unset | Which adapter renders and weaves (#821). See [adapter-selection.md](adapter-selection.md) |
+| `DXR_WEAVE_ON_SCANOUT` | off | **Prototype (#918 Phase 1), D3D11 windowed path only.** Splits the output device off the app device on a hybrid: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. **Projection-only:** zones, Local2D, authored masks and the 2D-under backdrop are device-crossing and are hard-gated off with one WARN (Phase 2). No-op (one WARN) when the scanout adapter already is the app's. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick |
 | `DXR_FRAME_STAGE_TIMING` | off | Per-stage CPU timing of the windowed commit. `composite=` is the GPU wait |
 
 ## Defaults by GPU topology
@@ -130,12 +131,24 @@ considered for default-on.
 | `DXR_DEFER_PRESENT` | off | off | off |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
-**Hybrid is the unresolved one.** On this class of laptop the panel is frequently **scanned out by
-the integrated adapter** — it holds the active mode — while the app renders on the discrete one.
-That makes the weave a cross-adapter operation, and cross-adapter sharing has its own traps (KMT
-handles share no pixels on some integrated drivers; use NT handles). Whether it is better to weave
-on the dGPU and copy, or to run the weave and repaint next to the scanout, is **open — see #918**.
-There is no hybrid-specific default today; you get the dGPU column with a cross-adapter copy.
+**Hybrid is the one still being settled — but the answer is now measured.** On this class of laptop
+the panel is frequently **scanned out by the integrated adapter** — it holds the active mode — while
+the app renders on the discrete one, which makes today's weave a cross-adapter operation: every
+woven frame, and every repaint tick, crosses inside `Present`. Measured on the reference box
+([hybrid-igpu-weave.md](../investigations/hybrid-igpu-weave.md)): 42 ms present-to-display against
+16 ms for a scanout-local pipeline, and a forced repaint burning 327 ms/s of dGPU copy engine
+purely on re-transfer.
+
+The **output-device split** (`DXR_WEAVE_ON_SCANOUT=1`, above) is that scanout-local pipeline, and
+it exists today behind the flag on the D3D11 windowed path — #918 stays **open** because it is
+projection-only and unverified beyond D3D11. Cross-adapter sharing has its own traps: D3D11 has no
+cross-adapter texture path at all on this stack (all six share flavours fail at the open call, both
+directions), so the transport is a D3D12 `SHARED | SHARED_CROSS_ADAPTER` heap with D3D11 on both
+ends; KMT handles share no pixels on some integrated drivers, so use NT handles.
+
+There is still **no hybrid-specific default** — unflagged, you get the dGPU column with a
+cross-adapter copy. Do not read the split as tuning advice yet; read it as the lever to try first
+when a hybrid box shows a ~2.5-frame residual.
 
 ## Measuring any of this
 
