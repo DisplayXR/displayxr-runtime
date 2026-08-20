@@ -477,9 +477,86 @@ Modes, and what each is honestly correct for:
 
 | `--mode` | filter | correct when |
 |---|---|---|
-| `once` | none, captured **before** the overlay exists | the background is static — the launcher. Complete (wallpaper included) and feedback-free. **The default.** |
-| `uid` | `CaptureArgs.setUid` inclusion | the background is one app's window. Drops anything another uid drew, wallpaper included |
+| `uids` | N × `CaptureArgs.setUid`, composited bottom-up | the background is the home screen. Feedback-free *and* continuous, so it survives a device rotation. **The default.** |
+| `once` | none, captured **before** the overlay exists | the background is static *and* the device never rotates. Complete and feedback-free |
+| `uid` | one `CaptureArgs.setUid` inclusion | the background is one app's window. Drops anything another uid drew, wallpaper included. Superseded by `uids` |
 | `all` | none, continuous | diagnostic only — includes our own layer, so it feeds back |
+
+### Device rotation, and why `once` cannot survive one
+
+A rotation invalidates a held capture **twice over**: the frame's aspect no
+longer matches the panel, and the launcher behind it has *re-laid out*, so even
+a correctly rotated copy of the old pixels would be wrong. Only a genuinely new
+capture in the new orientation fixes it — which raises the question of when a
+new capture could possibly be clean.
+
+The answer, measured on an NP02J, is *never*, for a whole-display capture:
+
+- **There is no gap.** Looping `screencap` across a `user_rotation` flip, the
+  **first** landscape frame already contains the consumer's woven content.
+  SurfaceFlinger keeps the layer's last buffer latched straight through the
+  rotation; the swapchain going `OUT_OF_DATE` and being recreated (≈ 4 ms here)
+  never blanks the layer. So "re-capture in the window where our surface is
+  destroyed" — the obvious plan — has no window to aim at.
+- **`all` demonstrably feeds back.** With the backdrop-debug view on
+  (`debug.dxr.leia.bgdebug=1`, leia-plugin#175), `--mode=all` shows the band
+  visibly recursing.
+- **Hiding our own layer for a frame** would work, and a rotation is the one
+  moment where the flicker would be masked by the system's own animation — but
+  it buys a handshake, a present stall and a timing race to solve a problem a
+  filter solves outright.
+
+`uids` solves it outright. A uid-filtered `captureDisplay` leaves every layer it
+skipped **transparent**, which is what makes a union of several well defined:
+`SRC_OVER` of capture[i+1] over capture[i] reproduces SurfaceFlinger's own
+stacking for the listed uids. The wallpaper host and the home launcher are
+different uids (`com.android.systemui` and the launcher package on this device)
+— which is precisely why a single `--uid` drops the wallpaper and why the plural
+exists. Their union is the whole home screen, and the consumer's uid is absent
+by construction.
+
+Because it is feedback-free it can run **continuously**, and that is the whole
+rotation fix: the next tick is already captured in the new orientation with the
+launcher re-laid out, and the consumer's existing "re-crop when the geometry
+moves" path (below) picks it up. **No trigger, no handshake, no timing race.**
+
+The consumer's half is one line of correctness: the re-crop key is the canvas
+rect **and the panel extent**, because `bg2d_canvas_crop_rect` maps canvas→frame
+*through* the panel dims, so the same canvas rect on a rotated panel is a
+different crop. A capture whose aspect disagrees with the panel's now also logs
+one line naming the cause, so "PASS at launch, FAIL after rotating" reads out of
+a bug report instead of needing to be reproduced.
+
+The honest cost of `uids`: content drawn by a uid that is not on the list is
+missing (transparent, forced to black). That is correct for the home-screen case
+the capability ships against and not for an arbitrary app stack — which is the
+same boundary the *product* tier crosses, with
+`captureLayers(excludeLayers=[our layer])` in a platform-signed helper.
+
+### Both compositors, one producer
+
+The backdrop producer is `src/xrt/compositor/util/comp_bg2d.{c,h}` (plus the
+socket receiver `comp_bg2d_capture.{c,h}`), consumed by **both** compositor
+paths through a caller-owned `struct comp_bg2d_state`:
+
+- **out of process** — `comp_multi_system.c`, per session, canvas rect from the
+  frame's zone-3D layer plus the `android_globals` window rect (#1033);
+- **in process** — `comp_vk_native_compositor.c`, same geometry from the app's
+  own `xrSetAndroidWindowGeometryDXR` publish (#1037).
+
+In-process is the one that matters for the end state. Out of process the weave
+lands on the service's `TYPE_APPLICATION_OVERLAY` and therefore carries the
+≤ 0.80 anti-tapjacking alpha clamp — a 20 % launcher ghost over *every* pixel
+that no backdrop can remove (§2). In process (ADR-036 Architecture A) the app
+owns a plain translucent `TYPE_APPLICATION` window: no clamp, no overlay at all.
+Compose-under there is the shipping combination rather than a demonstration of
+one.
+
+Precedence where both could supply the slot: an **app-supplied Local2D backdrop
+wins**. `vk_flatten_backdrop_2d` (#491) claims slot 16 when the frame has
+2D-under Local2D layers — the app explicitly said what is behind its 3D content,
+and a screen capture is a *guess* at the same question. The capture only fills
+the slot on frames where the flatten declined it; the two are never blended.
 
 ### Sequencing
 

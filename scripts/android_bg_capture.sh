@@ -15,23 +15,37 @@
 # signs the service, a permitted uid is the only way to exercise the path.
 #
 # Usage:
-#   scripts/android_bg_capture.sh [--mode once|all|uid] [--uid N] [--width N]
-#                                 [--rate HZ] [--delay-ms N] [--serial S]
+#   scripts/android_bg_capture.sh [--mode uids|once|all|uid] [--uid N[,N...]]
+#                                 [--width N] [--rate HZ] [--delay-ms N]
+#                                 [--serial S]
 #
 # Typical validation run (avatar over the launcher):
 #   adb shell setprop debug.dxr.bg2d capture     # arm the runtime consumer
-#   scripts/android_bg_capture.sh --mode once    # capture the launcher, hold it
+#   scripts/android_bg_capture.sh                # start the producer
 #   ...then launch the transparent app.
 #
-# `once` is the default because it is the only mode that is both complete
-# (wallpaper included) and feedback-free: it captures before the overlay exists.
+# `uids` is the default because it is the only mode that survives a DEVICE
+# ROTATION. A rotation invalidates a held capture twice over -- the frame's
+# aspect no longer matches the panel, and the launcher behind it has re-laid
+# out -- and `once` cannot re-take the shot, because by then the consumer's
+# layer is on screen and SurfaceFlinger keeps its last buffer latched straight
+# through the rotation (measured: the first post-rotation frame already
+# contains the weave). `uids` captures each listed uid separately and
+# composites them bottom-up; a uid-filtered captureDisplay leaves skipped
+# layers transparent, so the union is well defined and the consumer's own uid
+# is absent by construction. That makes it feedback-free, so it can run
+# continuously -- and a rotation then needs no trigger at all.
+#
+# With no --uid this resolves the wallpaper host and the current home launcher
+# itself. Pass --uid to override (bottom layer first). `once` remains available
+# and remains correct for a session that never rotates.
 
 set -euo pipefail
 
-MODE=once
+MODE=uids
 UID_ARG=""
 WIDTH=512
-RATE=5
+RATE=2
 DELAY=0
 SERIAL=""
 SOCKET=displayxr.bg2d
@@ -46,7 +60,7 @@ while [ $# -gt 0 ]; do
 	--delay-ms) DELAY="$2"; shift 2 ;;
 	--socket) SOCKET="$2"; shift 2 ;;
 	--serial) SERIAL="-s $2"; shift 2 ;;
-	-h | --help) sed -n '2,32p' "$0"; exit 0 ;;
+	-h | --help) sed -n '2,45p' "$0"; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -61,8 +75,41 @@ if [ -z "$APK" ]; then
 	exit 1
 fi
 
+# Resolve the default uid list. The wallpaper belongs to the wallpaper host
+# (SystemUI here) and the icons to the home launcher, and they are DIFFERENT
+# uids -- which is exactly why a single --uid drops the wallpaper and why this
+# mode exists. Bottom layer first.
+if [ "$MODE" = "uids" ] && [ -z "$UID_ARG" ]; then
+	uid_of() {
+		# shellcheck disable=SC2086
+		$ADB shell dumpsys package "$1" 2>/dev/null | sed -n 's/.*userId=\([0-9]*\).*/\1/p' | head -1 | tr -d '\r'
+	}
+	# shellcheck disable=SC2086
+	WALLPAPER_PKG=$($ADB shell dumpsys wallpaper 2>/dev/null |
+		sed -n 's/.*mWallpaperComponent=ComponentInfo{\([^\/]*\)\/.*/\1/p' | head -1 | tr -d '\r')
+	# shellcheck disable=SC2086
+	LAUNCHER_PKG=$($ADB shell cmd package resolve-activity -a android.intent.action.MAIN \
+		-c android.intent.category.HOME 2>/dev/null |
+		sed -n 's/^ *packageName=\(.*\)/\1/p' | head -1 | tr -d '\r')
+	UIDS=""
+	for pkg in "$WALLPAPER_PKG" "$LAUNCHER_PKG"; do
+		[ -n "$pkg" ] || continue
+		u=$(uid_of "$pkg")
+		[ -n "$u" ] || continue
+		case ",$UIDS," in *",$u,"*) continue ;; esac
+		UIDS="${UIDS:+$UIDS,}$u"
+		echo "  contributor: $pkg -> uid $u"
+	done
+	if [ -z "$UIDS" ]; then
+		echo "error: could not resolve the wallpaper host / home launcher uids." >&2
+		echo "       Pass them explicitly: --uid <wallpaper_uid>,<launcher_uid>" >&2
+		exit 1
+	fi
+	UID_ARG="--uid=$UIDS"
+fi
+
 echo "producer APK: $APK"
-echo "mode=$MODE width=$WIDTH rate=${RATE}Hz socket=@$SOCKET"
+echo "mode=$MODE width=$WIDTH rate=${RATE}Hz socket=@$SOCKET ${UID_ARG}"
 echo
 echo "The runtime must already be listening: adb shell setprop debug.dxr.bg2d capture"
 echo "Ctrl-C releases the background (the runtime keeps the last frame)."
