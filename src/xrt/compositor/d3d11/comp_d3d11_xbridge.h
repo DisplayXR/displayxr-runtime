@@ -109,16 +109,25 @@ comp_d3d11_xbridge_alloc_worstcase_egress(struct comp_d3d11_xbridge *xb);
  * skipped entirely. Cheap to call every frame — no-op when the size is
  * unchanged. Returns false if the allocation failed, in which case the previous
  * (worst-case) ring is restored and the caller crops on the output device.
- */
+  */
 bool
 comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h);
 
 /*!
- * True when the egress ring is content-sized (Stage B succeeded), i.e. the
- * caller may skip its own crop-before-DP pass.
+ * The layout that produced @p slot's pixels: the generation passed to
+ * @ref comp_d3d11_xbridge_submit and the content box that frame painted.
+ *
+ * Both matter to the weave. The generation is a REFUSAL test — a slot composited
+ * under a layout the DP has since switched away from must never be woven (#918
+ * R1). The content box is the geometry to weave a surviving slot WITH: during a
+ * resize it is a frame behind the window, and cropping it to the current frame's
+ * box would slice the tiles at the wrong stride.
+ *
+ * @return false when the slot holds nothing (empty ring, or out of range).
  */
 bool
-comp_d3d11_xbridge_egress_is_content_sized(struct comp_d3d11_xbridge *xb);
+comp_d3d11_xbridge_slot_layout(
+    struct comp_d3d11_xbridge *xb, int32_t slot, uint64_t *out_gen, uint32_t *out_w, uint32_t *out_h);
 
 /*!
  * Ingress Option I: bind the renderer's NT-shared atlas directly, so the
@@ -153,21 +162,48 @@ comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb);
  * nothing on this thread ever waits.
  *
  * @param seq Monotonic app frame counter; the one sequence every fence uses.
+ * @param layout_gen The caller's layout generation — bumped whenever the
+ *        effective layout (the DP's recipe) changes. Stamped on the egress slot
+ *        so a later weave can tell whether the slot's pixels still belong to the
+ *        recipe the DP is running (#918 R1).
  * @param atlas_texture `ID3D11Texture2D *` of the renderer atlas. Only read in
  *        Option II (the ingress staging copy); ignored in Option I.
  * @param content_w/content_h The content box actually painted this frame.
  */
 void
-comp_d3d11_xbridge_submit(
-    struct comp_d3d11_xbridge *xb, uint64_t seq, void *atlas_texture, uint32_t content_w, uint32_t content_h);
+comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
+                          uint64_t seq,
+                          uint64_t layout_gen,
+                          void *atlas_texture,
+                          uint32_t content_w,
+                          uint32_t content_h);
 
 /*!
- * Newest egress slot whose consumer copy has already completed, or -1 when
- * nothing has landed yet (warmup). Opportunistic by default;
- * `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the seq-1 slot deterministically.
+ * Newest egress slot whose consumer copy has already completed AND whose stamped
+ * layout generation is still @p want_gen, or -1 when there is none (warmup, or
+ * every landed slot predates a mode switch). Opportunistic by default;
+ * `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the seq-1 slot deterministically —
+ * subject to the same generation test, which is never relaxed.
  */
 int32_t
-comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb);
+comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen);
+
+/*!
+ * #918 R1 — the TRANSITION pick. The newest slot carrying @p want_gen content
+ * whether or not its consumer copy has landed yet; -1 when there is none, or
+ * when the output device could not open the consumer fence.
+ *
+ * Only for the frame where @ref comp_d3d11_xbridge_pick_slot came back empty
+ * because a layout change just rebuilt the ring. Presenting nothing there is not
+ * neutral: with FLIP_DISCARD the panel keeps showing the last frame it WAS
+ * given, which was woven for the mode the display has just left — an interlaced
+ * frame under a disabled lens is the offset cube the maintainer sees on 3D->2D.
+ * Weaving the in-flight slot instead costs a GPU-side wait on the output queue
+ * (never a CPU one: the caller must follow with
+ * @ref comp_d3d11_xbridge_gpu_wait_slot) and the frame goes out correct.
+ */
+int32_t
+comp_d3d11_xbridge_pick_inflight_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen);
 
 /*!
  * Queue a GPU-side wait for @p slot's completion on the output context (cached

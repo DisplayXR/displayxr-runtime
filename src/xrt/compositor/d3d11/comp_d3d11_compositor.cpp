@@ -182,6 +182,34 @@ struct comp_d3d11_compositor
 	//! once a second — a skip is a per-frame event and must never WARN per frame.
 	uint64_t split_skip_present;
 	uint64_t split_skip_logged_ns;
+	/*!
+	 * #918 R1: the layout generation, bumped whenever the effective layout the
+	 * DP is handed changes (a mode switch, a submission whose view count
+	 * changed). Every bridged frame is stamped with it and every weave demands
+	 * it, so the split can never do what the non-split path cannot — weave one
+	 * frame's pixels under the next frame's recipe.
+	 */
+	uint64_t split_layout_gen;
+	//! Signature of the layout `split_layout_gen` currently stands for.
+	uint64_t split_layout_sig;
+	//! Weaves refused because the only landed content predates the current
+	//! generation. One per mode switch is expected and correct.
+	uint64_t split_stale_refusals;
+	//! Generation whose first refusal has already been logged — the refusal WARN
+	//! is per TRANSITION (a handful per session), never per frame.
+	uint64_t split_stale_logged_gen;
+	//! #918 R1: transition frames woven from a still-in-flight slot instead of
+	//! being skipped. Each one is a mode switch that did NOT leave the panel
+	//! holding a frame woven for the mode it just left.
+	uint64_t split_inflight_weaves;
+	//! Weave cadence, for the #918 R1/R2 evidence: the last weave that reached
+	//! the DP and the longest gap between two of them.
+	uint64_t split_weave_last_ns;
+	uint64_t split_weave_gap_max_ns;
+	//! DXR_XBRIDGE_DIAG=1 — a once-a-second cadence line while testing the
+	//! split. Off by default; never per frame either way.
+	bool split_diag;
+	uint64_t split_diag_logged_ns;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
@@ -574,8 +602,8 @@ d3d11_split_note_skipped_present(struct comp_d3d11_compositor *c, const char *wh
 	c->split_skip_logged_ns = now;
 	U_LOG_W(
 	    "D3D11 output-device split: %s had nothing woven — present SKIPPED, the panel holds the "
-	    "last woven frame (%llu skips so far) (#918)",
-	    where, (unsigned long long)c->split_skip_present);
+	    "last woven frame (%llu skips so far, %llu of them refusing a superseded layout) (#918)",
+	    where, (unsigned long long)c->split_skip_present, (unsigned long long)c->split_stale_refusals);
 }
 
 /*!
@@ -1936,17 +1964,98 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 * the entire woven frame on every repaint).
 	 */
 	if (c->split_active) {
+		const uint64_t want_gen = c->split_layout_gen;
 		int32_t slot;
 		if (is_repaint) {
 			slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
 		} else {
-			slot = comp_d3d11_xbridge_pick_slot(c->xbridge);
+			slot = comp_d3d11_xbridge_pick_slot(c->xbridge, want_gen);
+			if (slot < 0) {
+				/*
+				 * #918 R1 — the transition frame. A layout change rebuilt
+				 * the ring, so nothing of the CURRENT generation has landed
+				 * yet, and holding is not the neutral choice it looks like:
+				 * FLIP_DISCARD leaves the panel showing the frame woven for
+				 * the mode the display has just left. Take the slot whose
+				 * copy is still in flight and let the GPU-side wait below
+				 * order the weave behind it — the frame goes out one
+				 * transition-only wait late instead of one mode wrong.
+				 */
+				slot = comp_d3d11_xbridge_pick_inflight_slot(c->xbridge, want_gen);
+				if (slot >= 0) {
+					c->split_inflight_weaves++;
+				}
+			}
 			if (slot >= 0) {
 				comp_d3d11_xbridge_set_weave_slot(c->xbridge, slot);
 			} else {
 				// Warmup: nothing has crossed yet. Keep weaving whatever the
 				// last good slot was rather than handing the DP a null atlas.
+				// (The generation test below vets it just the same.)
 				slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+			}
+		}
+		/*
+		 * #918 R1 — a slot may only be woven under the generation that produced
+		 * it. "The atlas recipe IS the mode": non-split the weave consumes the
+		 * atlas its own frame composited, so layout and recipe change together
+		 * by construction; under the split the weave consumes a slot some frame
+		 * filled, and the two can differ across a mode switch.
+		 *
+		 * Today the ring happens to be rebuilt at every switch (the content box
+		 * really does change — 2 x 640x360 in 3D against 1 x 1280x720 in 2D on
+		 * the reference panel) which empties it and hides the exposure. The R2
+		 * hysteresis below deliberately STOPS rebuilding per size, so surviving
+		 * slots become reachable across a layout change and this test is what
+		 * keeps a superseded recipe from ever reaching the DP.
+		 *
+		 * The degrade of last resort is the F4 one — weave nothing, skip the
+		 * present. But note what that costs, because it is the actual R1 defect:
+		 * a skipped present leaves FLIP_DISCARD showing the frame woven for the
+		 * mode the display has just LEFT. On 3D->2D that is an interlaced frame
+		 * under a disabled lens, whose two eye-column sets become visible side by
+		 * side — the offset cube. (2D->3D holds a flat frame under an enabled
+		 * lens, which is why only one direction was ever reported.) So the pick
+		 * above prefers the in-flight slot of the CURRENT generation and skips
+		 * only when there is genuinely nothing of this recipe anywhere.
+		 */
+		if (slot >= 0) {
+			uint64_t slot_gen = 0;
+			uint32_t slot_cw = 0, slot_ch = 0;
+			if (!comp_d3d11_xbridge_slot_layout(c->xbridge, slot, &slot_gen, &slot_cw, &slot_ch) ||
+			    slot_gen != want_gen) {
+				c->split_stale_refusals++;
+				// Once per TRANSITION — this names the exact frame that used
+				// to go out with the wrong geometry.
+				if (c->split_stale_logged_gen != want_gen) {
+					c->split_stale_logged_gen = want_gen;
+					U_LOG_W(
+					    "#918 R1: %s refused egress slot %d — its %ux%u content was "
+					    "composited under layout generation %llu, the DP is now on "
+					    "generation %llu (%ux%u tiles of %ux%u). Weaving it is the "
+					    "one-frame offset; presenting nothing holds the last good frame.",
+					    is_repaint ? "the repaint tick" : "the app frame", (int)slot, slot_cw,
+					    slot_ch, (unsigned long long)slot_gen, (unsigned long long)want_gen,
+					    tile_columns, tile_rows, view_width, view_height);
+				}
+				slot = -1;
+			} else if (slot_cw > 0 && slot_ch > 0 && tile_columns > 0 && tile_rows > 0 &&
+			           (slot_cw != content_w || slot_ch != content_h)) {
+				/*
+				 * #918 R2: same recipe, but the slot was painted at a
+				 * different SCALE — the resize hysteresis keeps a
+				 * worst-case ring through a drag, so what landed is a
+				 * frame behind the window. Weave it with ITS OWN content
+				 * box: the DP derives its tile stride from the atlas
+				 * width, so cropping to the CURRENT box would slice every
+				 * tile at the wrong offset. The canvas stays the live one,
+				 * so the weave phase tracks the window; only the content
+				 * scale lags, by the one frame the bridge always costs.
+				 */
+				view_width = slot_cw / tile_columns;
+				view_height = slot_ch / tile_rows;
+				content_w = view_width * tile_columns;
+				content_h = view_height * tile_rows;
 			}
 		}
 		if (slot < 0) {
@@ -1972,12 +2081,42 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		if (atlas_srv == nullptr) {
 			return false;
 		}
-		// The consumer copy already landed content-sized (stage B), so the
-		// compositor's own crop-before-DP pass is not just skippable, it would
-		// be a second crop of an already-cropped image. When stage B fell back
-		// to a worst-case ring, crop here instead — on the OUTPUT device.
-		if (!comp_d3d11_xbridge_egress_is_content_sized(c->xbridge)) {
+		/*
+		 * Crop only when the slot's content does not already fill it. A
+		 * content-sized ring (the steady state) needs none — cropping an
+		 * already-cropped image would be a second crop. A worst-case ring — the
+		 * Stage-B fallback, and every frame of a resize drag under the R2
+		 * hysteresis — needs one, on the OUTPUT device, to the box that slot was
+		 * painted at, which the block above already resolved.
+		 */
+		uint32_t eg_w = 0, eg_h = 0;
+		comp_d3d11_xbridge_get_egress_dims(c->xbridge, &eg_w, &eg_h);
+		if (content_w != eg_w || content_h != eg_h) {
 			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+		}
+
+		// Weave cadence — the #918 R2 evidence. A gap far past a frame period
+		// means weaves are STARVING (the panel is holding), which is what a
+		// per-size egress realloc used to do to every frame of a resize.
+		{
+			const uint64_t now = os_monotonic_get_ns();
+			if (c->split_weave_last_ns != 0) {
+				const uint64_t gap = now - c->split_weave_last_ns;
+				if (gap > c->split_weave_gap_max_ns) {
+					c->split_weave_gap_max_ns = gap;
+				}
+			}
+			c->split_weave_last_ns = now;
+			if (c->split_diag && now - c->split_diag_logged_ns >= U_TIME_1S_IN_NS) {
+				c->split_diag_logged_ns = now;
+				U_LOG_W(
+				    "#918 DIAG: weave %ux%u tiles %ux%u (ring %ux%u) gap_max=%.1f ms "
+				    "stale-refusals=%llu skipped-presents=%llu",
+				    view_width, view_height, tile_columns, tile_rows, eg_w, eg_h,
+				    (double)c->split_weave_gap_max_ns / 1.0e6,
+				    (unsigned long long)c->split_stale_refusals,
+				    (unsigned long long)c->split_skip_present);
+			}
 		}
 	}
 
@@ -2800,6 +2939,29 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		const uint32_t bridge_w = c->eff_layout.cols * c->eff_layout.tile_w;
 		const uint32_t bridge_h = c->eff_layout.rows * c->eff_layout.tile_h;
 		if (bridge_w > 0 && bridge_h > 0) {
+			/*
+			 * #918 R1: the layout GENERATION. It counts changes to the DP's
+			 * recipe — the tile grid and the submitted view count — and NOT
+			 * the tile dimensions, which move continuously through a resize
+			 * while the recipe stays put (those are handled per slot, by
+			 * weaving each slot at the box it was painted with).
+			 *
+			 * A 3D<->2D switch is precisely a grid change that leaves the
+			 * content box identical, so nothing else in the pipeline marks
+			 * it; this is the only signal the weave gets.
+			 */
+			const uint64_t sig = ((uint64_t)c->eff_layout.cols << 40) |
+			                     ((uint64_t)c->eff_layout.rows << 20) | (uint64_t)c->eff_layout.views;
+			if (sig != c->split_layout_sig) {
+				c->split_layout_sig = sig;
+				c->split_layout_gen++;
+				U_LOG_W(
+				    "#918: layout generation %llu — %ux%u tiles of %ux%u, %u view(s) "
+				    "submitted; slots from generation %llu are no longer weavable",
+				    (unsigned long long)c->split_layout_gen, c->eff_layout.cols, c->eff_layout.rows,
+				    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.views,
+				    (unsigned long long)(c->split_layout_gen - 1));
+			}
 			// The atlas is only reallocated on a genuine grow (mode switch,
 			// window resize); the generation is what tells the producer to
 			// re-open, and it never moves on the #602 fits-early-out.
@@ -2810,7 +2972,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// active mode, so a V-key mode switch or a resize lands here.
 			comp_d3d11_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h);
 			c->split_seq++;
-			comp_d3d11_xbridge_submit(c->xbridge, c->split_seq,
+			comp_d3d11_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
 			                          comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w,
 			                          bridge_h);
 		}
@@ -3045,8 +3207,12 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	 * reading the renderer's atlas or writing an egress slot.
 	 */
 	if (c->xbridge != nullptr) {
-		U_LOG_W("D3D11 output-device split: %llu presents skipped for want of a woven frame (#918 F4)",
-		        (unsigned long long)c->split_skip_present);
+		U_LOG_W(
+		    "D3D11 output-device split: %llu presents skipped for want of a woven frame "
+		    "(%llu refusing a superseded layout, #918 R1); %llu transition frames woven from an "
+		    "in-flight slot rather than held; longest gap between weaves %.1f ms (#918 F4/R1/R2)",
+		    (unsigned long long)c->split_skip_present, (unsigned long long)c->split_stale_refusals,
+		    (unsigned long long)c->split_inflight_weaves, (double)c->split_weave_gap_max_ns / 1.0e6);
 		comp_d3d11_xbridge_quiesce(c->xbridge);
 	}
 
@@ -3558,6 +3724,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		if (reason == nullptr) {
 			c->split_active = true;
 			c->out_luid = sdesc.AdapterLuid;
+			{
+				const char *d = getenv("DXR_XBRIDGE_DIAG");
+				c->split_diag = (d != nullptr && d[0] == '1');
+			}
 			U_LOG_W("D3D11 output-device split ACTIVE: weave/repaint/present move to '%ls' "
 			        "LUID=%08lx:%08lx (app device on LUID=%08lx:%08lx); atlas crosses via a D3D12 "
 			        "cross-adapter heap once per frame (#918)",

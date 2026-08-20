@@ -146,12 +146,29 @@ struct comp_d3d11_xbridge
 	HANDLE eg_share[XB_EGRESS_RING]; //!< NT share handles of eg_tex
 	ID3D12Resource *eg_12[XB_EGRESS_RING];
 	uint64_t eg_seq[XB_EGRESS_RING];
+	/*!
+	 * #918 R1: the LAYOUT that produced each slot's content.
+	 *
+	 * "The atlas recipe IS the mode" — the atlas layout and the DP recipe must
+	 * switch atomically. Non-split they do: the weave consumes the atlas
+	 * composited by the same frame. Under the split the weave consumes whichever
+	 * slot has landed, which across a mode switch can belong to the previous
+	 * recipe. Stamping the producing layout on the slot is what lets the weave
+	 * tell the difference — refuse a superseded one, and recognise the fresh one
+	 * it should wait for instead.
+	 */
+	uint64_t eg_gen[XB_EGRESS_RING];
+	//! Content box that produced the slot — the crop/tile stride to weave it
+	//! with, which during a resize is NOT the frame's current content box.
+	uint32_t eg_cw[XB_EGRESS_RING], eg_ch[XB_EGRESS_RING];
 	uint32_t eg_w, eg_h;
 	bool eg_content_sized;
 	//! #918 F5: the content dims whose allocation last failed. Retried only when
 	//! the request changes, so a persistently-failing size costs one WARN and one
 	//! attempt, not a realloc + a WARN every frame.
 	uint32_t eg_fail_w, eg_fail_h;
+	//! #918: egress ring rebuilds.
+	uint64_t eg_reallocs;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -188,6 +205,13 @@ struct comp_d3d11_xbridge
 
 	int force_depth; //!< DXR_WEAVE_ON_SCANOUT_DEPTH=1 -> deterministic seq-1.
 	uint64_t pick_now, pick_prev, pick_older, pick_none;
+	//! #918 R1: picks that found landed content but ONLY under a superseded
+	//! layout generation, and refused it. One held frame per mode switch.
+	uint64_t pick_stale_gen;
+	//! #918 R1: transition frames woven from a slot whose consumer copy was still
+	//! in flight, ordered by the GPU-side wait. One per mode switch — the
+	//! alternative is a presented frame woven for the PREVIOUS optical mode.
+	uint64_t pick_inflight;
 	uint64_t skip_alloc_busy;
 	uint64_t frames;
 };
@@ -302,6 +326,9 @@ xb_release_egress(struct comp_d3d11_xbridge *xb)
 			xb->eg_tex[i] = nullptr;
 		}
 		xb->eg_seq[i] = 0;
+		xb->eg_gen[i] = 0;
+		xb->eg_cw[i] = 0;
+		xb->eg_ch[i] = 0;
 	}
 	xb->eg_w = 0;
 	xb->eg_h = 0;
@@ -780,8 +807,10 @@ xb_alloc_egress(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, bool cont
 	xb->eg_h = h;
 	xb->eg_content_sized = content_sized;
 	xb->weave_slot = -1;
-	U_LOG_W("d3d11 xbridge: egress ring x%d at %ux%u on the scanout adapter (%s) (#918)", XB_EGRESS_RING, w, h,
-	        content_sized ? "content-sized" : "worst-case");
+	xb->eg_reallocs++;
+	U_LOG_W("d3d11 xbridge: egress ring x%d at %ux%u on the scanout adapter (%s), rebuild #%llu (#918)",
+	        XB_EGRESS_RING, w, h, content_sized ? "content-sized" : "worst-case",
+	        (unsigned long long)xb->eg_reallocs);
 	return true;
 }
 
@@ -851,9 +880,16 @@ comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, u
 }
 
 extern "C" bool
-comp_d3d11_xbridge_egress_is_content_sized(struct comp_d3d11_xbridge *xb)
+comp_d3d11_xbridge_slot_layout(
+    struct comp_d3d11_xbridge *xb, int32_t slot, uint64_t *out_gen, uint32_t *out_w, uint32_t *out_h)
 {
-	return xb != nullptr && xb->eg_content_sized;
+	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
+		return false;
+	}
+	*out_gen = xb->eg_gen[slot];
+	*out_w = xb->eg_cw[slot];
+	*out_h = xb->eg_ch[slot];
+	return true;
 }
 
 /*!
@@ -1008,8 +1044,12 @@ comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" void
-comp_d3d11_xbridge_submit(
-    struct comp_d3d11_xbridge *xb, uint64_t seq, void *atlas_texture, uint32_t content_w, uint32_t content_h)
+comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
+                          uint64_t seq,
+                          uint64_t layout_gen,
+                          void *atlas_texture,
+                          uint32_t content_w,
+                          uint32_t content_h)
 {
 	if (xb == nullptr || seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
 		return;
@@ -1126,6 +1166,12 @@ comp_d3d11_xbridge_submit(
 		xb->cons_q->Signal(xb->f_out_cons, seq);
 		xb->cons_alloc_seq[ca] = seq;
 		xb->eg_seq[eg] = seq;
+		// #918 R1/R2: stamp the slot with the layout that produced its pixels.
+		// The weave refuses a superseded generation outright, and weaves a
+		// surviving one with ITS OWN content box rather than the frame's.
+		xb->eg_gen[eg] = layout_gen;
+		xb->eg_cw[eg] = content_w;
+		xb->eg_ch[eg] = content_h;
 	}
 
 	xb->last_submit_seq.store(seq, std::memory_order_release);
@@ -1140,7 +1186,7 @@ comp_d3d11_xbridge_submit(
  */
 
 extern "C" int32_t
-comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
+comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen)
 {
 	if (xb == nullptr || xb->eg_w == 0) {
 		return -1;
@@ -1150,6 +1196,10 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 
 	int32_t pick = -1;
 	uint64_t best = 0;
+	//! #918 R1: content HAS landed, but every landed slot predates the current
+	//! layout generation. Weaving one is the offset-cube frame; refusing it and
+	//! holding the last presented frame is the whole point of the stamp.
+	bool saw_stale = false;
 
 	if (xb->force_depth == 1) {
 		// Deterministic one-frame pipeline: always the previous frame's slot,
@@ -1162,6 +1212,10 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 			const uint64_t want = submitted - 1;
 			for (int32_t i = 0; i < XB_EGRESS_RING; i++) {
 				if (xb->eg_seq[i] == want) {
+					if (xb->eg_gen[i] != want_gen) {
+						saw_stale = true;
+						break;
+					}
 					pick = i;
 					best = want;
 					break;
@@ -1172,13 +1226,22 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 	if (pick < 0) {
 		for (int32_t i = 0; i < XB_EGRESS_RING; i++) {
 			if (xb->eg_seq[i] != 0 && xb->eg_seq[i] <= done && xb->eg_seq[i] > best) {
+				// #918 R1: never hand back a slot whose pixels were composited
+				// under a layout the DP has since switched away from.
+				if (xb->eg_gen[i] != want_gen) {
+					saw_stale = true;
+					continue;
+				}
 				best = xb->eg_seq[i];
 				pick = i;
 			}
 		}
 	}
 
-	if (pick < 0) {
+	if (pick < 0 && saw_stale) {
+		xb->pick_stale_gen++;
+		xb->pick_none++;
+	} else if (pick < 0) {
 		xb->pick_none++;
 	} else if (best == submitted) {
 		xb->pick_now++;
@@ -1192,10 +1255,36 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 	if (total > 0 && (total % 1000) == 0) {
 		U_LOG_I(
 		    "d3d11 xbridge: pick distribution over %llu weaves — seq=%llu seq-1=%llu older=%llu "
-		    "none=%llu (alloc-busy skips %llu)",
+		    "none=%llu (of which stale-layout refusals %llu; alloc-busy skips %llu)",
 		    (unsigned long long)total, (unsigned long long)xb->pick_now, (unsigned long long)xb->pick_prev,
 		    (unsigned long long)xb->pick_older, (unsigned long long)xb->pick_none,
-		    (unsigned long long)xb->skip_alloc_busy);
+		    (unsigned long long)xb->pick_stale_gen, (unsigned long long)xb->skip_alloc_busy);
+	}
+	return pick;
+}
+
+extern "C" int32_t
+comp_d3d11_xbridge_pick_inflight_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen)
+{
+	/*
+	 * #918 R1. Requires the GPU-side ordering: without the consumer fence open
+	 * on the output device there is nothing to sequence the DP's sampling behind
+	 * the copy that is still filling this slot, and the only honest answer is to
+	 * present nothing.
+	 */
+	if (xb == nullptr || !xb->out_gpu_wait_ok || xb->eg_w == 0) {
+		return -1;
+	}
+	int32_t pick = -1;
+	uint64_t best = 0;
+	for (int32_t i = 0; i < XB_EGRESS_RING; i++) {
+		if (xb->eg_seq[i] != 0 && xb->eg_gen[i] == want_gen && xb->eg_seq[i] > best) {
+			best = xb->eg_seq[i];
+			pick = i;
+		}
+	}
+	if (pick >= 0) {
+		xb->pick_inflight++;
 	}
 	return pick;
 }
@@ -1301,10 +1390,11 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 	if (total > 0) {
 		U_LOG_W(
 		    "d3d11 xbridge: %llu frames bridged; picks seq=%llu seq-1=%llu older=%llu none=%llu "
-		    "(alloc-busy skips %llu)",
+		    "in-flight=%llu (stale-layout refusals %llu; alloc-busy skips %llu); egress rebuilds %llu",
 		    (unsigned long long)xb->frames, (unsigned long long)xb->pick_now, (unsigned long long)xb->pick_prev,
 		    (unsigned long long)xb->pick_older, (unsigned long long)xb->pick_none,
-		    (unsigned long long)xb->skip_alloc_busy);
+		    (unsigned long long)xb->pick_inflight, (unsigned long long)xb->pick_stale_gen,
+		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs);
 	}
 }
 
