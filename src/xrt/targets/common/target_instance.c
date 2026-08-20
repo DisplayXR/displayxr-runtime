@@ -41,7 +41,13 @@
 
 #include "target_instance_parts.h"
 
+#ifdef XRT_OS_WINDOWS
+// The one place that answers "which adapter scans out the 3D panel?" (#918).
+#include "d3d/d3d_scanout_helpers.h"
+#endif
+
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef XRT_OS_ANDROID
@@ -69,10 +75,11 @@ null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_composi
 
 xrt_result_t
 null_compositor_create_system_with_dims(struct xrt_device *xdev,
-                                         uint32_t recommended_width,
-                                         uint32_t recommended_height,
-                                         float refresh_rate_hz,
-                                         struct xrt_system_compositor **out_xsysc);
+                                        uint32_t recommended_width,
+                                        uint32_t recommended_height,
+                                        float refresh_rate_hz,
+                                        uint64_t scanout_adapter_luid,
+                                        struct xrt_system_compositor **out_xsysc);
 
 
 
@@ -158,6 +165,59 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	build_dp_registry(info);
 }
 
+/*!
+ * `DXR_VK_FORCE_GPU=scanout` (#918 Phase 0, closes the #846 gap): resolve the
+ * LUID of the adapter that owns the output the 3D panel is scanned out on, so
+ * the Vulkan device selection down in aux_vk — which can see neither the
+ * display-processor plug-in nor DXGI — has something to match against.
+ *
+ * This is the only layer that holds both halves: the plug-in's panel rect and
+ * (on Windows) DXGI. The D3D side does the same resolution against the same
+ * helper from `oxr_d3d.cpp`, where the rect is already on `xsysc->info`.
+ *
+ * Costs nothing unless the keyword is actually requested. Any failure to
+ * resolve is exactly one WARN and a 0 return — the caller then leaves normal
+ * selection in place, so a copied-around env var can never brick an app.
+ *
+ * @param pdi The plug-in's display info, or NULL if it could not be obtained.
+ * @return the packed LUID, or 0 when not requested / not resolvable.
+ */
+static uint64_t
+resolve_scanout_adapter_luid(const struct xrt_plugin_display_info *pdi)
+{
+	const char *val = getenv("DXR_VK_FORCE_GPU");
+	if (val == NULL || strcmp(val, "scanout") != 0) {
+		return 0;
+	}
+
+#ifdef XRT_OS_WINDOWS
+	if (pdi == NULL || pdi->display_pixel_width == 0 || pdi->display_pixel_height == 0) {
+		U_LOG_W("DXR_VK_FORCE_GPU=scanout: no panel dimensions from the display processor — ignoring");
+		return 0;
+	}
+
+	uint64_t luid = 0;
+	if (!d3d_scanout_adapter_luid(pdi->display_screen_left, pdi->display_screen_top, pdi->display_pixel_width,
+	                              pdi->display_pixel_height, &luid) ||
+	    luid == 0) {
+		U_LOG_W(
+		    "DXR_VK_FORCE_GPU=scanout: could not resolve the panel's scanout adapter "
+		    "(panel %ux%u at %d,%d) — ignoring",
+		    pdi->display_pixel_width, pdi->display_pixel_height, (int)pdi->display_screen_left,
+		    (int)pdi->display_screen_top);
+		return 0;
+	}
+
+	U_LOG_W("DXR_VK_FORCE_GPU=scanout: panel scans out on adapter LUID=%08lx:%08lx", (unsigned long)(luid >> 32),
+	        (unsigned long)(luid & 0xffffffffu));
+	return luid;
+#else
+	// Windows-only semantics; env_forced_gpu_index() emits the one WARN.
+	(void)pdi;
+	return 0;
+#endif
+}
+
 static xrt_result_t
 t_instance_create_system(struct xrt_instance *xinst,
                          struct xrt_system **out_xsys,
@@ -213,6 +273,12 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// dropped the old in-proc leia_edid refresh query). get_display_info is
 	// idempotent + cheap; it's called again below to populate the full info.
 	float sr_refresh_rate_hz = 60.0f;
+	// DXR_VK_FORCE_GPU=scanout (#918 Phase 0): the panel rect is only knowable
+	// here — aux_vk sees neither the plug-in nor DXGI — so resolve the scanout
+	// adapter's LUID now and hand it to the compositor's Vulkan bundle. Zero
+	// unless the keyword is actually asked for, so the DXGI walk costs nothing
+	// in the normal case.
+	uint64_t scanout_adapter_luid = 0;
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
 		if (rr_plugin != NULL &&
@@ -220,18 +286,24 @@ t_instance_create_system(struct xrt_instance *xinst,
 		    rr_plugin->get_display_info != NULL) {
 			struct xrt_plugin_display_info rr_pdi = {0};
 			rr_pdi.struct_size = (uint32_t)sizeof(rr_pdi);
-			if (rr_plugin->get_display_info(target_plugin_get_active_instance(), head, &rr_pdi) &&
-			    rr_pdi.refresh_mhz > 0) {
-				sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
+			if (rr_plugin->get_display_info(target_plugin_get_active_instance(), head, &rr_pdi)) {
+				if (rr_pdi.refresh_mhz > 0) {
+					sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
+				}
+				scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
+			} else {
+				resolve_scanout_adapter_luid(NULL);
 			}
+		} else {
+			resolve_scanout_adapter_luid(NULL);
 		}
 	}
 	U_LOG_W("Null-compositor frame pacing: %.2f Hz", (double)sr_refresh_rate_hz);
 
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
-		xret = null_compositor_create_system_with_dims(head, 0, 0,
-		                                               sr_refresh_rate_hz, &xsysc);
+		xret = null_compositor_create_system_with_dims(head, 0, 0, sr_refresh_rate_hz, scanout_adapter_luid,
+		                                               &xsysc);
 	}
 #else
 	if (use_null) {
