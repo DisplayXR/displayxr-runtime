@@ -142,6 +142,32 @@ adb shell dumpsys package org.freedesktop.monado.openxr_runtime.in_process | gre
 # and SoFilename=libopenxr_displayxr.so
 ```
 
+### Re-grant the overlay permission after EVERY reinstall
+
+`SYSTEM_ALERT_WINDOW` ("display over other apps") is a **special app-op
+permission**: it is never granted at install time, and an `adb uninstall` +
+`adb install` **drops** any previous grant. The runtime needs it for **overlay
+mode** (#558) — the service-owned `TYPE_APPLICATION_OVERLAY` that see-through
+apps (`displayxr-demo-avatar`) weave into.
+
+```bash
+adb shell appops set org.freedesktop.monado.openxr_runtime.out_of_process SYSTEM_ALERT_WINDOW allow
+# verify: should print "SYSTEM_ALERT_WINDOW: allow"
+adb shell appops get org.freedesktop.monado.openxr_runtime.out_of_process SYSTEM_ALERT_WINDOW
+```
+
+`scripts/build-android.sh install` now does this for you; the manual command is
+for the hand-installed / released-APK case. **Symptom when it's missing:** a
+see-through app renders on a **BLACK** background and nothing else looks wrong —
+the 3D weave keeps working, so it is easily mistaken for a transparency
+regression in the runtime or the demo. Confirm with:
+
+```bash
+adb logcat | grep SURFACE_FMT
+# lost grant : ... compositeAlpha=0x8 transparent=0 overlay=0
+# granted    : ... compositeAlpha=0x8 transparent=1 overlay=1
+```
+
 ## Step 6: Smoke test
 
 See `android-bringup-checklist.md` for the full A→B→C→D procedure. Quick check:
@@ -261,6 +287,26 @@ If `SoFilename` shows `libopenxr_monado.so` instead, your branch predates day-3 
    adb logcat | grep "Leia CNSDK DP created"
    # Should log: "Leia CNSDK DP created (atlas mode)"  (or "(self-submitting, per-tile blit + CNSDK weave)" on per-tile-blit branches)
    ```
+
+### See-through app (demo-avatar) renders on a BLACK background
+
+The weave is fine; overlay mode is off. Almost always the runtime package lost
+`SYSTEM_ALERT_WINDOW` on a reinstall — see *Re-grant the overlay permission*
+under Step 5. Check the gate in order:
+
+```bash
+# 1. the permission (the usual culprit)
+adb shell appops get org.freedesktop.monado.openxr_runtime.out_of_process SYSTEM_ALERT_WINDOW
+# 2. the app's opt-in: its manifest must carry
+#    <meta-data android:name="com.displayxr.overlay_mode" android:value="true"/>
+adb logcat | grep -E "canDrawOverOtherApps|creating service overlay"
+# 3. what the compositor actually built
+adb logcat | grep -E "SURFACE_FMT|set_transparent_background|alpha-gate"
+```
+
+A healthy overlay session logs `canDrawOverOtherApps (overlay mode) = true`,
+`connect: overlay mode — creating service overlay`, `transparent=1 overlay=1`,
+and `Leia CNSDK DP: alpha-gate pipeline ready`.
 
 ### Device not found by ADB
 
