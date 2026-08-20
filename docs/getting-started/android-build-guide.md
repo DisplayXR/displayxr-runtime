@@ -124,6 +124,37 @@ D3, Architecture C), by any one of:
 | Capability | enable `XR_DXR_weave` | Present-owners (the browser, `weave_client_vk_android`). Weave lives only in the service compositor, so this is automatic — no configuration. |
 | Adopted socket | `ipc_client_connection_adopt_fd()` or `DXR_IPC_FD=<n>` | Embedders with no `Context` (Chromium's GPU process, #1056). |
 
+### Migrating an existing app to the merged runtime
+
+Before #1031 every app on the device was pushed out of process, because the
+installed `outOfProcess` flavor left it no choice. In-process is now the
+default, so an app that was never ported to Architecture A gets the in-process
+path for the first time — and if it is not ready for it, that shows up as a
+`xrCreateSession` failure rather than a graceful fallback.
+
+The known failure shape, seen with the `native_app_glue` demos (`android_main`
+render thread, no first-class Activity/surface binding): the vendor core loader
+aborts under CheckJNI with a **null jobject in `GetObjectClass`**, inside
+`libleiaCore-loader.so` reached from `leia_cnsdk_create` →
+`leia_dp_factory_cnsdk` → `comp_vk_native_compositor_create` →
+`oxr_session_populate_vk_native`. The app has no Activity-typed Context to hand
+the vendor Java glue in its own process. This is the Architecture-A gap noted
+in ADR-036 D2 Amendment 1, not a regression — those apps simply never ran
+in-process before.
+
+Until such an app is ported (real `XR_DXR_android_surface_binding`, an Activity
+the runtime can reach — the `cube_handle_vk_android` shape), keep it on the IPC
+path with one line in its own manifest:
+
+```xml
+<application>
+    <meta-data android:name="com.displayxr.force_ipc" android:value="true" />
+</application>
+```
+
+That is a per-app change in the app's repo; it needs nothing from the runtime
+and does not affect any other app on the device.
+
 Check which one an app got:
 
 ```bash
