@@ -92,21 +92,46 @@ sdk.dir=C:/Users/<you>/AppData/Local/Android/Sdk          # Windows
 ## Step 3: Build the runtime APK
 
 ```bash
-# In-process debug variant (no IPC, simplest)
-./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
+./gradlew :src:xrt:targets:openxr_android:assembleDebug
 
 # APK output:
-# src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+# src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 ```
 
 ### Build variants
 
+There is **one** runtime APK (#1031). The `inProcess` / `outOfProcess` product
+flavors are gone: the merged build carries both the in-process native compositor
+and the service + satellite slots, and each app lands on one or the other at
+`xrCreateInstance`. So the only axis left is debug vs release.
+
 | Variant | Use case |
 |---------|---------|
-| `inProcessDebug` | First-time hardware testing, single app. **Use this.** |
-| `inProcessRelease` | Performance testing |
-| `outOfProcessDebug` | Multi-app / shell testing (not POC-supported) |
-| `outOfProcessRelease` | Production multi-app |
+| `debug` | Everything — first-time bring-up, single app, multi-app, weave. **Use this.** |
+| `release` | Performance testing / production |
+
+### Which deployment does my app get?
+
+**In-process by default** — the app's own process hosts the compositor and the
+vendor display processor (ADR-036 D2, Architecture A). An app opts into the IPC
+path, where the runtime service hands it a satellite compositor process (ADR-036
+D3, Architecture C), by any one of:
+
+| Opt-in | How | Notes |
+|---|---|---|
+| Env / sysprop | `XRT_FORCE_MODE=ipc`, or `adb shell setprop debug.dxr.force_ipc 1` | Overrides everything, both directions — `XRT_FORCE_MODE=native` forces back in-process. The sysprop is device-wide, so unset it when you are done. |
+| Manifest | `<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>` | The per-app switch. Pair with `com.displayxr.satellite_slot` to pin a slot. |
+| Capability | enable `XR_DXR_weave` | Present-owners (the browser, `weave_client_vk_android`). Weave lives only in the service compositor, so this is automatic — no configuration. |
+| Adopted socket | `ipc_client_connection_adopt_fd()` or `DXR_IPC_FD=<n>` | Embedders with no `Context` (Chromium's GPU process, #1056). |
+
+Check which one an app got:
+
+```bash
+adb logcat -d | grep "Hybrid mode:"
+# "using in-process native compositor"  -> Architecture A
+# "... forcing IPC ..." / "using IPC/service compositor" -> Architecture C
+adb shell ps -A -o PID,NAME | grep :dxr   # satellites, one per IPC client
+```
 
 ## Step 4: Build the test app APK
 
@@ -125,19 +150,19 @@ The test app does loader init → `xrCreateInstance` → `xrGetSystem` → `xrCr
 ## Step 5: Install on device
 
 ```bash
-adb uninstall org.freedesktop.monado.openxr_runtime.in_process 2>/dev/null
+adb uninstall org.freedesktop.monado.openxr_runtime.out_of_process 2>/dev/null
 adb uninstall com.displayxr.cube_handle_vk_android 2>/dev/null
 
-adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+adb install -r src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 adb install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
 Verify the runtime is registered:
 ```bash
 adb shell pm list packages | grep monado
-# package:org.freedesktop.monado.openxr_runtime.in_process
+# package:org.freedesktop.monado.openxr_runtime.out_of_process
 
-adb shell dumpsys package org.freedesktop.monado.openxr_runtime.in_process | grep -A3 OpenXR
+adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process | grep -A3 OpenXR
 # Should show org.khronos.openxr.OpenXRRuntimeService
 # and SoFilename=libopenxr_displayxr.so
 ```
@@ -192,20 +217,29 @@ frame 120
 
 ## Multi-app testing (satellite compositor processes)
 
-Two or more DisplayXR apps weave at the same time on Android because the `outOfProcess`
-runtime hands each client its own **satellite compositor process** — `MonadoServiceSlot0..3`,
+Two or more DisplayXR apps weave at the same time on Android either **in-process**
+(each app hosts its own compositor and vendor core — the default since #1031) or
+**out-of-process**, where the runtime hands an IPC client its own **satellite
+compositor process** — `MonadoServiceSlot0..3`,
 declared with `android:process=":dxr0"` … `":dxr3"`, assigned by a broker in the runtime's main
 process (ADR-036 D3, #1031; mechanism in
 [`service-architecture.md` §7a](../architecture/service-architecture.md)). Nothing needs
 enabling: any out-of-process client gets a satellite, and the fifth concurrent app falls back to
-the single main-process service.
+the single main-process service. Since #1031 the two deployments coexist on one device — see
+"Which deployment does my app get?" above for how an app lands on each.
 
 **Build a second copy of the cube** (same source, different `applicationId`, so two clients can
 be installed at once):
 ```bash
-./gradlew :src:xrt:targets:openxr_android:assembleOutOfProcessDebug
+./gradlew :src:xrt:targets:openxr_android:assembleDebug
 ./gradlew :test_apps:cube_handle_vk_android:assembleDebug                      # A
 ./gradlew :test_apps:cube_handle_vk_android:assembleDebug -PdxrAppIdSuffix=b   # B → ....b
+```
+Both cubes run **in-process** by default. To put one of them on a satellite instead
+(the mixed case), force just that package:
+```bash
+adb shell am start -n com.displayxr.cube_handle_vk_android.b/....MainActivity  # in-process
+adb shell setprop debug.dxr.force_ipc 1   # next launch goes IPC; unset when done
 ```
 (The two builds write the same APK path, so copy A aside before building B. On a host with a
 system cJSON — `brew install cjson` — add `-PdxrForceVendoredCjson`; see #496.)
@@ -257,7 +291,7 @@ Should be fixed by `fix/cmake-android-target-guards`. If you see this on an old 
 ### APK installs but runtime not discovered
 
 ```bash
-adb shell dumpsys package org.freedesktop.monado.openxr_runtime.in_process \
+adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process \
     | grep -A10 OpenXRRuntimeService
 ```
 

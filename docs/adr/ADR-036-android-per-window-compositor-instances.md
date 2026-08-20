@@ -63,7 +63,7 @@ whose OS is already the window manager.
 
 ## Decision
 
-Adopt **one runtime abstraction** and pick its Android deployment. Six decisions:
+Adopt **one runtime abstraction** and pick its Android deployment. Seven decisions:
 
 ### D1 — The abstraction is one compositor instance per window
 
@@ -372,6 +372,51 @@ global, and it also blocks the browser port.
 (`XR_DXR_android_surface_binding` spec follows), the satellite slot-broker protocol,
 the Chromium GPU-process ↔ satellite connection, or whether `compositor/multi/` is
 ported or replaced under Architecture A.
+
+## Amendment (2026-08-19) — the flavor merge: D2 and D3 coexist in one APK (#1031)
+
+D2 (Architecture A, in-app) and D3 (Architecture C, satellite) were both realised
+and both device-proven — but never **at the same time on one device**, because the
+two Gradle product flavors were mutually exclusive. `inProcess`
+(`XRT_FEATURE_SERVICE=OFF`) and `outOfProcess` (`ON`) shipped different
+`applicationId`s and both declared the Khronos `org.khronos.openxr.runtime_broker`
+ContentProvider authority, so only one could be installed. Whichever was installed
+decided the deployment for **every** app on the device: with `inProcess` there were
+no satellites, no slot broker and no `XR_DXR_weave`; with `outOfProcess` every
+single app was pushed out of process, including ones that wanted A. That is the
+"blocker" noted in D2 Amendment 1 ("only one runtime flavor installable at a time"),
+and it made "A is the target, C is the sanctioned out-of-process deployment" an
+either/or in practice rather than the two-deployments-of-one-abstraction this ADR
+describes.
+
+**The flavor dimension is deleted. There is one hybrid runtime APK.** It builds
+with `XRT_FEATURE_SERVICE=ON` *and* `XRT_FEATURE_HYBRID_MODE=ON`, so
+`openxr_displayxr.so` carries the in-process native compositor and the IPC client
+together, and `xrt_instance_create` chooses **per process** — exactly the model
+Windows' `DisplayXRClient.dll` has always used. Service, slot broker, satellite
+`:dxrN` slots and the watchdog are unchanged and still there; an in-process app
+simply never binds them.
+
+**In-process (A) is now the default**, which is what D2 says the Android target
+deployment is. A client opts into IPC (C) by one of four signals, in this order:
+
+| Signal | Shape | For |
+|---|---|---|
+| `XRT_FORCE_MODE=ipc` / `=native` | env, or the `debug.xrt.XRT_FORCE_MODE` / `debug.dxr.force_ipc` system properties | dev + test; wins over everything, both directions |
+| `<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>` | the app's own manifest | the per-app, build-time switch — pairs with `com.displayxr.satellite_slot` |
+| `XR_DXR_weave` enabled | capability | present-owners (#1036); weave on Android exists only in the service compositor, so this needs no configuration at all |
+| an adopted service socket | `ipc_client_connection_adopt_fd` / `DXR_IPC_FD` | the browser's GPU process (#1056) |
+
+`applicationId` stays `org.freedesktop.monado.openxr_runtime.out_of_process` —
+the name is now historical, but it is what every shipped demo declares in
+`<queries>` and hands to `createPackageContext`, so the merged runtime upgrades
+in place.
+
+Nothing in D1–D7 changes. What changes is that the choice between D2 and D3 stops
+being a **device-wide install-time** decision and becomes a **per-application**
+one, so an Arch-A app, a second Arch-A app and an Arch-C present-owner can weave
+concurrently on one panel. D5's vendor-neutral visibility (L7) is still the
+outstanding item for A; it is unaffected by the merge.
 
 ## External dependencies (vendor asks)
 

@@ -199,7 +199,7 @@ Same shape, same code: D1/D2/D6/D7 live in `ipc_server` and apply unchanged (ide
 binder credentials, quotas returned to `MonadoImpl.connect`, telemetry via
 sysprops/logcat). D3 requires `comp_multi` to gain the shared-surface compositing that
 macOS already has (one surface, one DP, N clients) plus the S1/S4-class bounded waits;
-D4's provider host is an AIDL-bound service; the `outOfProcess` flavor is built in CI and
+D4's provider host is an AIDL-bound service; the single merged runtime APK (#1031) is built in CI and
 #510 folds into this plan.
 
 ## Decisions confirmed (2026-08-16)
