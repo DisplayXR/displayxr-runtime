@@ -12,6 +12,7 @@
  */
 
 #include "comp_d3d11_xbridge.h"
+#include "comp_d3d11_plane_policy.h"
 
 #include "util/u_logging.h"
 #include "os/os_time.h"
@@ -946,32 +947,25 @@ comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plan
 	xb_plane_invalidate_slots(xb, xb->plane[plane]);
 }
 
+//! Slot @p i's pending dirty box, as the policy's box type.
+static inline struct xb_plane_box
+xb_plane_pend_box(const struct comp_d3d11_xbridge::xb_plane &pl, int i)
+{
+	struct xb_plane_box b = {pl.pend_x[i], pl.pend_y[i], pl.pend_w[i], pl.pend_h[i]};
+	return b;
+}
+
 //! Fold @p (x,y,w,h) into slot @p i's pending dirty box.
 static void
 xb_plane_pend(struct comp_d3d11_xbridge::xb_plane &pl, int i, int32_t x, int32_t y, uint32_t w, uint32_t h)
 {
-	if (w == 0 || h == 0) {
-		return;
-	}
-	if (pl.pend_w[i] == 0 || pl.pend_h[i] == 0) {
-		pl.pend_x[i] = x;
-		pl.pend_y[i] = y;
-		pl.pend_w[i] = w;
-		pl.pend_h[i] = h;
-		return;
-	}
-	const int32_t x0 = pl.pend_x[i] < x ? pl.pend_x[i] : x;
-	const int32_t y0 = pl.pend_y[i] < y ? pl.pend_y[i] : y;
-	const int32_t x1a = pl.pend_x[i] + (int32_t)pl.pend_w[i];
-	const int32_t y1a = pl.pend_y[i] + (int32_t)pl.pend_h[i];
-	const int32_t x1b = x + (int32_t)w;
-	const int32_t y1b = y + (int32_t)h;
-	const int32_t x1 = x1a > x1b ? x1a : x1b;
-	const int32_t y1 = y1a > y1b ? y1a : y1b;
-	pl.pend_x[i] = x0;
-	pl.pend_y[i] = y0;
-	pl.pend_w[i] = (uint32_t)(x1 - x0);
-	pl.pend_h[i] = (uint32_t)(y1 - y0);
+	struct xb_plane_box acc = xb_plane_pend_box(pl, i);
+	const struct xb_plane_box add = {x, y, w, h};
+	xb_plane_box_union(&acc, &add);
+	pl.pend_x[i] = acc.x;
+	pl.pend_y[i] = acc.y;
+	pl.pend_w[i] = acc.w;
+	pl.pend_h[i] = acc.h;
 }
 
 extern "C" void
@@ -995,32 +989,14 @@ comp_d3d11_xbridge_stage_plane(
 	// Clamp into the PLANE's own extent (not the panel's — an authored mask
 	// plane is mask-sized, #918 review F5). Nothing beyond it can be sampled.
 	{
-		const int32_t lim_x = (int32_t)((pl.src_w != 0 && pl.src_w < pl.alloc_w) ? pl.src_w : pl.alloc_w);
-		const int32_t lim_y = (int32_t)((pl.src_h != 0 && pl.src_h < pl.alloc_h) ? pl.src_h : pl.alloc_h);
-		int32_t x0 = x, y0 = y;
-		int32_t x1 = x + (int32_t)w, y1 = y + (int32_t)h;
-		if (x0 < 0) {
-			x0 = 0;
-		}
-		if (y0 < 0) {
-			y0 = 0;
-		}
-		if (x1 > lim_x) {
-			x1 = lim_x;
-		}
-		if (y1 > lim_y) {
-			y1 = lim_y;
-		}
-		if (x1 <= x0 || y1 <= y0) {
-			x0 = 0;
-			y0 = 0;
-			x1 = 0;
-			y1 = 0;
-		}
-		x = x0;
-		y = y0;
-		w = (uint32_t)(x1 - x0);
-		h = (uint32_t)(y1 - y0);
+		uint32_t lim_w = 0, lim_h = 0;
+		xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
+		const struct xb_plane_box in = {x, y, w, h};
+		const struct xb_plane_box clipped = xb_plane_box_clamp(&in, lim_w, lim_h);
+		x = clipped.x;
+		y = clipped.y;
+		w = clipped.w;
+		h = clipped.h;
 	}
 
 	/*
@@ -1164,95 +1140,55 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
 	if (!pl.live || !pl.src_bound || !pl.staged || pl.src12 == nullptr) {
 		return 0;
 	}
-	/*
-	 * CHANGE-SKIP. The slot already holds exactly this content generation and
-	 * owes no accumulated box, so there is nothing to transport — the consume
-	 * half keeps sampling the pixels already there, which is why the recipe
-	 * carries plane_seq: a change-skipped plane is provably the SAME content,
-	 * never merely an old one.
-	 */
-	if (pl.slot_seq[eg] == pl.stage_seq && pl.pend_w[eg] == 0) {
-		pl.skips++;
-		return 0;
-	}
-	// Bandwidth gate: latched planes transport on every other seq. Never
-	// disabled — a half-rate plane still tracks, it just tracks at 30 Hz.
-	if (pl.half_rate && (seq & 1ull) != pl.half_rate_parity) {
-		pl.skips++;
-		return 0;
-	}
-
-	// The union of what this slot owes and what the frame staged.
+	// The union of what this slot owes and what the frame staged, decided by the
+	// policy in comp_d3d11_plane_policy.h rather than restated here.
 	xb_plane_pend(pl, eg, pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h);
-	/*
-	 * Snap the box out to a 4-pixel grid. Copy-queue `CopyTextureRegion` is only
-	 * documented as offset-free for uncompressed formats, and a mis-copied plane
-	 * would show up as a subtly torn 2D band rather than a hard failure — the
-	 * kind of defect that costs a day. Four pixels is free (the box is already
-	 * hundreds wide) and covers every block-size a copy queue could impose.
-	 */
-	int32_t bx = pl.pend_x[eg] & ~3;
-	int32_t by = pl.pend_y[eg] & ~3;
-	uint32_t bw = (uint32_t)((pl.pend_x[eg] + (int32_t)pl.pend_w[eg] - bx + 3) & ~3);
-	uint32_t bh = (uint32_t)((pl.pend_y[eg] + (int32_t)pl.pend_h[eg] - by + 3) & ~3);
-	/*
-	 * Clamp to min(SOURCE, this plane's allocated extent). The 4-pixel snap
-	 * above can push the box past a source that is not a multiple of 4 — an
-	 * authored mask is created at the app's own zone dims — and an out-of-range
-	 * box on either side is an invalid `CopyTextureRegion` on a copy queue.
-	 */
-	uint32_t lim_w = (pl.src_w != 0 && pl.src_w < pl.alloc_w) ? pl.src_w : pl.alloc_w;
-	uint32_t lim_h = (pl.src_h != 0 && pl.src_h < pl.alloc_h) ? pl.src_h : pl.alloc_h;
-	if ((uint32_t)bx >= lim_w || (uint32_t)by >= lim_h) {
-		bw = 0;
-		bh = 0;
-	} else {
-		if (bx + (int32_t)bw > (int32_t)lim_w) {
-			bw = lim_w - (uint32_t)bx;
-		}
-		if (by + (int32_t)bh > (int32_t)lim_h) {
-			bh = lim_h - (uint32_t)by;
-		}
-	}
-	if (pl.pend_w[eg] == 0 || pl.pend_h[eg] == 0) {
-		bw = 0;
-		bh = 0;
-	}
-	if (bw == 0 || bh == 0) {
+	const struct xb_plane_box pend = xb_plane_pend_box(pl, eg);
+	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &pend, pl.half_rate, seq, pl.half_rate_parity) !=
+	    XB_PLANE_COPY) {
 		/*
-		 * Nothing transportable. Leave `slot_seq` ALONE: advancing it here would
+		 * Skipped. Leave `slot_seq` ALONE in every skip case: advancing it would
 		 * mark the slot as carrying this generation's pixels when no copy ever
 		 * landed, which is exactly the "old pixels, silently" failure the
-		 * change-skip design exists to make impossible.
+		 * change-skip design exists to make impossible — and the recipe stamp
+		 * reads slot_seq to decide validity (#918 review F3).
 		 */
 		pl.skips++;
 		return 0;
 	}
 
+	uint32_t lim_w = 0, lim_h = 0;
+	xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
+	const struct xb_plane_box b = xb_plane_box_snap_clamp(&pend, lim_w, lim_h);
+	if (xb_plane_box_empty(&b)) {
+		pl.skips++;
+		return 0;
+	}
+
 	D3D12_BOX box{};
-	box.left = (UINT)bx;
-	box.top = (UINT)by;
+	box.left = (UINT)b.x;
+	box.top = (UINT)b.y;
 	box.front = 0;
-	box.right = (UINT)bx + bw;
-	box.bottom = (UINT)by + bh;
+	box.right = (UINT)b.x + b.w;
+	box.bottom = (UINT)b.y + b.h;
 	box.back = 1;
 
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.xa_prod[xa]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(pl.src12);
-		xb->prod_list->CopyTextureRegion(&dst, (UINT)bx, (UINT)by, 0, &src, &box);
+		xb->prod_list->CopyTextureRegion(&dst, (UINT)b.x, (UINT)b.y, 0, &src, &box);
 	}
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.eg_12[eg]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(pl.xa_cons[xa]);
-		xb->cons_list->CopyTextureRegion(&dst, (UINT)bx, (UINT)by, 0, &src, &box);
+		xb->cons_list->CopyTextureRegion(&dst, (UINT)b.x, (UINT)b.y, 0, &src, &box);
 	}
 
 	pl.slot_seq[eg] = pl.stage_seq;
 	pl.pend_w[eg] = 0;
 	pl.pend_h[eg] = 0;
 	pl.copies++;
-	const uint64_t bytes = (uint64_t)bw * bh * pl.bpp;
+	const uint64_t bytes = (uint64_t)b.w * b.h * pl.bpp;
 	pl.bytes += bytes;
 	pl.gate_bytes += bytes;
 	return bytes;
@@ -1357,8 +1293,8 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t 
 	    "d3d11 xbridge: transport measured %.2f GB/s over the last second (planes %.2f GB/s), above "
 	    "the %.1f GB/s acceptance gate — latching the %s plane to HALF RATE until the transport "
 	    "settles. The split stays on (#918 Phase 2a)",
-	    (double)total_rate / 1.0e9, (double)plane_rate / 1.0e9,
-	    (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9, xb_plane_name(worst));
+	    (double)total_rate / 1.0e9, (double)plane_rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
+	    xb_plane_name(worst));
 }
 
 
@@ -2294,7 +2230,7 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 		 * is what let a stale 2D band composite under a current frame with
 		 * nothing anywhere able to tell.
 		 */
-		if (pl.live && pl.staged && pl.slot_seq[eg] != 0 && pl.slot_seq[eg] == pl.stage_seq) {
+		if (xb_plane_slot_is_valid(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq)) {
 			xb->eg_recipe[eg].plane_valid |= (1u << p);
 		}
 	}

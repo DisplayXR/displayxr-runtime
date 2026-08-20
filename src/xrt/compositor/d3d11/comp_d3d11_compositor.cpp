@@ -2295,11 +2295,12 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 					comp_d3d11_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps, &half);
 					const double gbs = (double)pb / secs / 1.0e9;
 					total_gbs += gbs;
-					const int n = snprintf(
-					    planes + off, sizeof(planes) - off, "%s %.3f GB/s (%llu copies, %llu skips%s) |",
-					    comp_d3d11_xbridge_plane_label(p), gbs,
-					    (unsigned long long)(pc - c->split_plane_copies_prev[p]),
-					    (unsigned long long)(ps - c->split_plane_skips_prev[p]), half ? " HALF-RATE" : "");
+					const int n = snprintf(planes + off, sizeof(planes) - off,
+					                       "%s %.3f GB/s (%llu copies, %llu skips%s) |",
+					                       comp_d3d11_xbridge_plane_label(p), gbs,
+					                       (unsigned long long)(pc - c->split_plane_copies_prev[p]),
+					                       (unsigned long long)(ps - c->split_plane_skips_prev[p]),
+					                       half ? " HALF-RATE" : "");
 					if (n > 0 && (size_t)n < sizeof(planes) - off) {
 						off += (size_t)n;
 					}
@@ -4880,9 +4881,10 @@ d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
 			// every repaint tick), and the repo forbids a per-frame WARN.
 			if (!v->warned) {
 				v->warned = true;
-				U_LOG_W("%s: DP-view alloc (%ux%u) failed 0x%08x — that sideband degrades for this "
-				        "session (#918)",
-				        what, w, h, hr);
+				U_LOG_W(
+				    "%s: DP-view alloc (%ux%u) failed 0x%08x — that sideband degrades for this "
+				    "session (#918)",
+				    what, w, h, hr);
 			}
 			if (v->tex != nullptr) {
 				v->tex->Release();
@@ -6545,8 +6547,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	 * ever. The first authoring frame now transports, and consumption starts
 	 * whenever the slot lands.
 	 */
-	const bool deposit_bridged_mask =
-	    prepare_only && c->split_active && mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE;
+	const bool deposit_bridged_mask = prepare_only && c->split_active && mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE;
 	if (mask_srv == nullptr && !deposit_bridged_mask) {
 		c->repaint.composite_bail = 3;
 		return false;
@@ -6966,13 +6967,12 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 			 * handle either, there is nothing left and the mask is inert under
 			 * the split.
 			 */
-			U_LOG_W(
-			    "zone_mask_create: output-device shadow failed 0x%08x — %s (#918 Phase 2a)", hr,
-			    mask->staged_share != nullptr
-			        ? "every tier of this mask rides the bridge plane instead, at one R8 transport "
-			          "per authoring call"
-			        : "and there is no share handle either, so this mask cannot composite under the "
-			          "output-device split at all");
+			U_LOG_W("zone_mask_create: output-device shadow failed 0x%08x — %s (#918 Phase 2a)", hr,
+			        mask->staged_share != nullptr
+			            ? "every tier of this mask rides the bridge plane instead, at one R8 transport "
+			              "per authoring call"
+			            : "and there is no share handle either, so this mask cannot composite under the "
+			              "output-device split at all");
 		} else {
 			out_context->ClearRenderTargetView(mask->out_rtv, all_3d);
 			out_context->CopyResource(mask->out_staged, mask->out_tex);

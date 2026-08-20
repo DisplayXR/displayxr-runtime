@@ -163,7 +163,7 @@ transported — and for three of the four mask sources the answer is **none**.
 | auto wish mask / implicit mask / feather mask / Tier-1-2 authored mask | **none** — every rasterizer takes pure CPU rects, so it is simply run again on the output device | 0 B/s |
 | Local2D OVER flatten (`local2d_scratch`) | bridge plane, RGBA8, panel-sized, per frame with dirty box + change-skip | **3 copies per session** at rest (see below) |
 | 2D-under backdrop (`backdrop_scratch`) | bridge plane, RGBA8, panel-sized, dirty box | **3 copies per session** at rest |
-| Tier-3 authored mask (app-drawn RT) | bridge plane, **R8**, on `author_seq` change only | one copy per re-authoring; R8 ROW_MAJOR cross-adapter **works** on this stack — no RGBA carrier needed |
+| Tier-3 authored mask (app-drawn RT) | bridge plane, **R8**, **sized at the mask** (not the panel), on `author_seq` change only | one copy per re-authoring; R8 ROW_MAJOR cross-adapter **works** on this stack — no RGBA carrier needed |
 | weave snapshot (`weave_scratch`) | **none** — its source is the output-side back buffer, so it is output-local | 0 B/s |
 
 The planes ride the **same egress slot as the atlas**: parallel per-slot arrays, copies
@@ -196,14 +196,37 @@ largest plane to half rate with one WARN — never the split, whose win is the r
 the iGPU-local present, neither of which a plane's rate affects. It did not fire in any
 session measured here.
 
+The gate aims at **plane-attributable** bytes: the over-budget test is on the transport total,
+but a plane is only throttled when the planes contribute at least 0.25 GB/s of it. Otherwise
+the atlas is the cost — a 4-view 4K atlas is ~4 GB/s at 120 Hz before any 2D content exists —
+and the gate has no lever on it, so it says so once and throttles nothing. The half-rate latch
+is pressure relief, not a session-long sentence: it clears once the transport has stayed inside
+budget for 5 s, and a plane re-bind clears its own.
+
 Under a forced repaint (`DXR_WEAVE_REPAINT_FORCE=1`, 960 repaints, backdrop active) the
 transport stayed at the app's frame rate — 0.055 GB/s against 30 app frames/s — so **repaint
 ticks add zero bridge traffic with the planes live**, exactly as they did projection-only.
 
-Plane textures are **panel-sized once and never resized**, which puts them structurally
-outside the R2 churn hysteresis. A 3 s continuous resize with the Local2D plane active
-produced 6 egress rebuilds / 1 churn entry / 1 settle / 77.1 ms longest weave gap, against
-6 / 1 / 1 / 76.8 ms for the same resize with no planes at all.
+The two **2D** plane textures are **panel-sized once and never resized**, which puts them
+structurally outside the R2 churn hysteresis. A 3 s continuous resize with the Local2D plane
+active produced 6 egress rebuilds / 1 churn entry / 1 settle / 77.1 ms longest weave gap,
+against 6 / 1 / 1 / 76.8 ms for the same resize with no planes at all.
+
+The **mask** plane is the deliberate exception. An authored mask maps *stretch-to-region* —
+the whole mask texture over the whole composite region, whatever its own dimensions, which is
+also what the display processor does with the published mask — and an app picks those
+dimensions itself (the zones docs recommend a downsampled one). A panel-sized mask plane would
+therefore transport the mask into a corner of a texture the composite then stretches whole,
+sampling a band no copy ever wrote; for R8 that band reads as "2D everywhere", the exact
+inverse of an unauthored mask's all-3D default. So the mask plane is allocated **at the mask**,
+and it rebuilds only when the app creates a differently-sized one — an on-change event, like
+its transport, and so never the per-frame churn the 2D planes are protected from.
+
+The DP **sideband** views (`set_background_2d`, `publish_local_zone_mask`) are seq-gated on the
+slot's plane generation and metered in the DIAG line. They run on the output device rather than
+the bridge, so they are not bridge traffic — but they are real per-tick bandwidth, and an
+unchanged backdrop under a forced repaint must copy nothing. With the mask plane now
+mask-sized, the mask sideband is a passthrough and copies nothing at all.
 
 ## Not measured, and why
 
