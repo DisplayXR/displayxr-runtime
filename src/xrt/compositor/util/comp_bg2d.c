@@ -605,13 +605,42 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 		// keying the upload on the frame sequence alone would freeze that first
 		// canvas-less mapping for the life of the session. Asking for seq 0
 		// re-acquires whatever the receiver still holds.
-		const bool canvas_moved =
+		//
+		// The PANEL extent is part of the key for the same reason the canvas
+		// rect is: bg2d_canvas_crop_rect maps canvas→frame through it, so the
+		// identical canvas rect on a rotated panel is a different crop. A
+		// rotation normally moves the canvas too and would be caught either
+		// way, but a full-panel canvas on a square-ish crop need not, and a
+		// silently-unrecropped backdrop is exactly the failure this follow-up
+		// exists to close.
+		const bool geometry_moved =
 		    canvas_on_panel != NULL &&
-		    (!st->have_canvas_used ||
+		    (!st->have_canvas_used || st->panel_used_w != panel_w || st->panel_used_h != panel_h ||
 		     memcmp(&st->canvas_used, canvas_on_panel, sizeof(*canvas_on_panel)) != 0);
 
 		struct comp_bg2d_capture_frame f = {0};
-		if (comp_bg2d_capture_acquire(&f, canvas_moved ? 0 : st->seq)) {
+		if (comp_bg2d_capture_acquire(&f, geometry_moved ? 0 : st->seq)) {
+			// A capture whose aspect disagrees with the panel's is a frame
+			// taken in the OTHER orientation — i.e. a producer that did not
+			// re-capture across a device rotation. The crop below will still
+			// run and will still be wrong, so say so once: this is the whole
+			// #1073 "PASS at launch, FAIL on rotation" symptom, and naming it
+			// in the log turns a visual bug report into a one-line answer.
+			// `once` mode cannot fix it (by then the consumer's overlay is on
+			// screen and SurfaceFlinger keeps it latched through the rotation,
+			// so there is no clean frame to re-take) — a continuous,
+			// feedback-free producer must.
+			if (panel_w != 0 && panel_h != 0 && f.width != 0 && f.height != 0 &&
+			    ((panel_w > panel_h) != (f.width > f.height)) && !st->logged_orientation) {
+				st->logged_orientation = true;
+				U_LOG_W(
+				    "bg2d(#1073 T2): the %ux%u capture is the wrong way round for a "
+				    "%ux%u panel — the producer has not re-captured since the device "
+				    "rotated, so the backdrop will be mis-registered. Use a "
+				    "continuous, feedback-free capture mode.",
+				    f.width, f.height, panel_w, panel_h);
+			}
+
 			// #174 — the producer sent PANEL pixels; slot 16 promises the
 			// CANVAS. Crop before the upload so the DP's (0,0)-(1,1) tile
 			// mapping lands the backdrop exactly where the atlas depicts.
@@ -657,6 +686,8 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 				st->seq = seq;
 				if (canvas_on_panel != NULL) {
 					st->canvas_used = *canvas_on_panel;
+					st->panel_used_w = panel_w;
+					st->panel_used_h = panel_h;
 					st->have_canvas_used = true;
 				}
 			}

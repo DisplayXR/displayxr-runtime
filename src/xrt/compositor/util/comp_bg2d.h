@@ -76,15 +76,20 @@ struct comp_bg2d_state
 	//! canvas-space).
 	uint8_t *crop_scratch;
 	size_t crop_capacity;
-	bool logged_crop; //!< One "cropped to the canvas" line per consumer.
+	bool logged_crop;        //!< One "cropped to the canvas" line per consumer.
+	bool logged_orientation; //!< One "capture is the wrong way round" line per consumer.
 
-	//! Canvas rect the currently-uploaded backdrop was cropped for. A T2
-	//! producer in `once`
+	//! Canvas rect the currently-uploaded backdrop was cropped for, and the
+	//! panel extent that rect was expressed against. A T2 producer in `once`
 	//! mode sends exactly ONE frame, and it usually lands before the app has
 	//! submitted the zone layer that establishes the canvas — so "re-upload
 	//! when a newer frame arrives" alone would freeze the very first,
-	//! canvas-less mapping in place forever.
+	//! canvas-less mapping in place forever. The panel extent is part of the
+	//! key because it is what a **device rotation** changes: the crop maps
+	//! canvas→frame through it, so the same canvas rect on a rotated panel is
+	//! a different crop (#1073 rotation follow-up).
 	struct xrt_rect canvas_used;
+	uint32_t panel_used_w, panel_used_h;
 	bool have_canvas_used;
 	bool failed; //!< Latched after a failed build, so we try once.
 };
