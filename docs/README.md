@@ -165,6 +165,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Per-App MCP Tools & Workspace Aggregator](roadmap/per-app-mcp-tools.md) — apps register their own MCP tools via `XR_DXR_mcp_tools`; one-connection `--target workspace` aggregator with `<app-id>__<tool>` namespacing
 - [WebXR Support — Status & Roadmap](roadmap/webxr-support.md) — shipped Bridge v2 metadata sideband + the inline-3D (`session.displayXR.weave()`) roadmap via Chromium patches
 - [Display Zones](roadmap/display-zones.md) — N 3D zones + 2D zones + wish mask: avatar migration + phased plan (ADR-027)
+- [Android Transparency — Compose-Under-Background](roadmap/android-transparency-compose-under.md) — why Android weaves-then-gates instead of compositing a captured background under the views, the Android capture landscape, and the T0/T1/T2 plan (#1031)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
