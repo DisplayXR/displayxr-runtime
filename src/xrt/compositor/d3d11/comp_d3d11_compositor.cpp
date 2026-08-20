@@ -247,6 +247,34 @@ struct comp_d3d11_compositor
 	bool split_diag;
 	uint64_t split_diag_logged_ns;
 
+	/*!
+	 * #918 review D6/F1 — the authored-mask PLANE's per-frame publication,
+	 * resolved once by @ref d3d11_stage_mask_plane and read everywhere else.
+	 *
+	 * There is exactly ONE authored-mask plane and two candidate producers (a
+	 * zones frame's explicit wish, a legacy frame's sticky submitted mask). They
+	 * used to bind it from their own code paths with globally-unique
+	 * generations, so alternating frames re-bound it every frame — a blocking
+	 * producer drain and a full re-transport each time — and the sticky path's
+	 * bind sat inside a branch that returned before the recipe was ever stamped,
+	 * which is why a sticky Tier-3 mask could never bootstrap at all. One
+	 * publisher per frame, called from layer_commit before the deposit, replaces
+	 * both.
+	 * @{
+	 */
+	//! True when this frame's authored mask is genuinely riding the plane. When
+	//! false the composite and the DP publish fall back to the output-device
+	//! shadow, so a bind failure degrades Tier 3 and nothing else.
+	bool mask_plane_live;
+	//! `staged_gen` of the mask the plane currently carries (0 = none). The
+	//! destroy hook drops the binding only for THIS mask (#918 review D2).
+	uint64_t mask_plane_gen;
+	/*! @} */
+
+	//! #918 review D4 — one WARN per session when the Local2D plane cannot be
+	//! bound, never one per frame.
+	bool local2d_plane_warned;
+
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
 
@@ -628,6 +656,14 @@ d3d11_out_context(struct comp_d3d11_compositor *c)
  * the masks by being rasterized on the output device in the first place — so
  * ZERO gates remain and the helper is gone rather than left as a dead branch.
  */
+
+// #918 review D6/F1 — defined with the rest of the zone-mask code; layer_commit
+// (far above it) is where the authored-mask plane's one publisher is called.
+struct comp_d3d11_zone_mask;
+static struct comp_d3d11_zone_mask *
+d3d11_frame_authored_mask(struct comp_d3d11_compositor *c);
+static void
+d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_mask *mask);
 
 /*!
  * #918 F4: count a frame whose weave produced nothing and whose Present was
@@ -3112,6 +3148,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		comp_d3d11_target_get_dimensions(c->target, &dep_w, &dep_h);
 		ID3D11Texture2D *dep_bb = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
 
+		/*
+		 * #918 review D6/F1 — publish the authored-mask plane ONCE per frame,
+		 * BEFORE anything asks whether its pixels have landed. This is the only
+		 * site that binds or stages PLANE_MASK.
+		 */
+		d3d11_stage_mask_plane(c, d3d11_frame_authored_mask(c));
+
 		// #918 Phase 2a: the 2D-under backdrop flatten is app-device work reading
 		// app-owned swapchain images, so it belongs in the deposit half beside the
 		// overlay flatten — and under the split that is also what stages it as a
@@ -3134,8 +3177,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->split_active && !deposited && c->xbridge != nullptr) {
 			/*
 			 * A projection-only frame. Stamp a recipe that says so and un-stage
-			 * the 2D planes, so a slot from a Local2D frame that is still in the
-			 * ring cannot lend its pixels to this one.
+			 * the LOCAL2D plane, so a slot from a Local2D frame that is still in
+			 * the ring cannot lend its pixels to this one.
+			 *
+			 * #918 review F1: the MASK plane is deliberately NOT un-staged here.
+			 * It is published above, before the deposit runs, and this branch
+			 * fires on exactly the frame whose transport the NEXT frame needs —
+			 * reverting it here is half of what made a Tier-3 mask unable to
+			 * bootstrap. The mask plane's own publisher already un-stages it when
+			 * the frame genuinely has no authored mask.
 			 */
 			struct comp_d3d11_xbridge_recipe r = {};
 			r.composite = false;
@@ -3145,7 +3195,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			r.bd_h = c->repaint.backdrop_h;
 			comp_d3d11_xbridge_stage_recipe(c->xbridge, &r);
 			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
-			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 		}
 	}
 
@@ -4769,6 +4818,93 @@ d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
 }
 
 /*!
+ * The frame's AUTHORITATIVE authored mask, or NULL when it has none.
+ *
+ * A zones frame's is its explicit frame wish; a legacy frame's is the sticky
+ * submitted mask. They are mutually exclusive by construction — which is exactly
+ * why the single authored-mask plane needs one arbiter rather than two
+ * independent binders (#918 review D6).
+ */
+static struct comp_d3d11_zone_mask *
+d3d11_frame_authored_mask(struct comp_d3d11_compositor *c)
+{
+	if (c->zones_frame) {
+		return c->frame_wish;
+	}
+	struct comp_d3d11_zone_mask *m = c->active_zone_mask;
+	return (m != nullptr && m->submitted) ? m : nullptr;
+}
+
+/*!
+ * #918 review D6/F1 — the ONE per-frame publisher of the authored-mask bridge
+ * plane. Called from layer_commit before the deposit half, with the frame's
+ * authoritative mask (which may be NULL).
+ *
+ * Two properties matter and neither survived the scattered binds:
+ *
+ * 1. **One producer.** Binding the same plane from two call sites with two
+ *    globally-unique generations made alternating frames re-open it every frame,
+ *    each re-open a blocking producer drain plus a full re-transport.
+ *
+ * 2. **Staging does not depend on consumption.** The transport is set up here,
+ *    before anything asks whether the plane's pixels have landed. That breaks
+ *    the F1 cycle: the frame that authors a mask transports it, and consumption
+ *    starts on whichever later frame the slot lands — instead of the composite
+ *    refusing to deposit because the plane it was about to fill was still empty.
+ */
+static void
+d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_mask *mask)
+{
+	if (!c->split_active || c->xbridge == nullptr) {
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return;
+	}
+
+	// Tier 1/2 need no transport at all — their rasters are pure CPU rects and
+	// were simply run again on the output-device shadow.
+	if (mask == nullptr || !mask->app_authored || mask->staged_share == nullptr) {
+		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return;
+	}
+
+	/*
+	 * Sized at the MASK, not the panel (#918 review F5) — the composite and the
+	 * DP both stretch the whole mask over the region, so the whole mask is what
+	 * has to cross.
+	 */
+	if (!comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, mask->staged_share,
+	                                   mask->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM, mask->w, mask->h)) {
+		// Transport unavailable (no share handle, or the stack refused an R8
+		// cross-adapter heap). Tier-1/2 content still composites through the
+		// shadow; the Tier-3 strokes do not.
+		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return;
+	}
+
+	/*
+	 * Content generation: unique across mask OBJECTS as well as across authoring
+	 * calls on one, since a session can hand this single plane two different
+	 * masks and two masks both at author_seq 1 must not look like the same
+	 * pixels. Mixed rather than bit-tagged, so no bit budget is spent on which
+	 * call site produced it — there is only one now.
+	 */
+	uint64_t seq = 1469598103934665603ull;
+	seq = (seq ^ mask->staged_gen) * 1099511628211ull;
+	seq = (seq ^ mask->author_seq) * 1099511628211ull;
+	if (seq == 0) {
+		seq = 1; // 0 is reserved for "this frame does not use the plane"
+	}
+	comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, seq, 0, 0, mask->w, mask->h);
+	c->mask_plane_live = true;
+	c->mask_plane_gen = mask->staged_gen;
+}
+
+/*!
  * #918 Phase 2a — the SRV of @p mask ON THE COMPOSITE DEVICE, plus how it got
  * there (a COMP_D3D11_XBRIDGE_MASK_* kind for the recipe stamp).
  *
@@ -4800,7 +4936,14 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
 	if (!c->split_active) {
 		return mask->staged_srv;
 	}
-	if (!mask->app_authored) {
+	/*
+	 * #918 review D6: the KIND follows this frame's single publisher, not a
+	 * per-site guess. `mask_plane_live` is false whenever the plane could not be
+	 * bound (no share handle, a stack that refuses R8 cross-adapter) or the mask
+	 * has never been app-authored — and then the output-device shadow is both the
+	 * right answer and the honest one to stamp on the recipe.
+	 */
+	if (!mask->app_authored || !c->mask_plane_live || c->mask_plane_gen != mask->staged_gen) {
 		return mask->out_staged_srv;
 	}
 	if (out_kind != nullptr) {
@@ -5551,20 +5694,13 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 		/*
 		 * #918 Phase 2a: an EXPLICIT frame wish the app drew itself (Tier 3) is
 		 * the one wish that cannot be reproduced on the output device, so it
-		 * rides the authored-mask plane. On-change only — `author_seq` moves
-		 * exactly when the app re-authors. The publish below reads the plane from
-		 * the LAST published weave slot, so a freshly-authored wish reaches the DP
-		 * one frame later; the publish is a per-frame sideband that republishes
-		 * every frame, so that lag is invisible (and the vendor dedups on
-		 * zone_publish_seq anyway).
+		 * rides the authored-mask plane — staged by d3d11_stage_mask_plane, the
+		 * single per-frame publisher (#918 review D6), not from here. The publish
+		 * below reads the plane from the LAST published weave slot, so a freshly
+		 * authored wish reaches the DP one frame later; the publish is a
+		 * per-frame sideband that republishes every frame, so that lag is
+		 * invisible (and the vendor dedups on zone_publish_seq anyway).
 		 */
-		if (c->split_active && fw->app_authored && c->xbridge != nullptr) {
-			if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, fw->staged_share,
-			                                  fw->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM)) {
-				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK,
-				                               fw->author_seq | (1ull << 62), 0, 0, fw->w, fw->h);
-			}
-		}
 		if (c->frame_wish_last != fw || c->frame_wish_last_seq != fw->author_seq) {
 			U_LOG_W("#876 wish seq: EXPLICIT bump (fw %p->%p author_seq %llu->%llu)",
 			        (void *)c->frame_wish_last, (void *)fw,
@@ -5577,14 +5713,10 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 		return;
 	}
 
-	// #918 Phase 2a: no explicit wish this frame, so the authored-mask plane
-	// carries nothing — un-stage it rather than let an earlier explicit wish's
-	// pixels keep riding along and stamping themselves valid in the recipe.
-	// (Only reachable on a zones frame; the sticky legacy mask's use of the same
-	// plane happens on frames this function is not called for.)
-	if (c->split_active && c->xbridge != nullptr) {
-		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
-	}
+	// No explicit wish this frame; d3d11_stage_mask_plane un-stages the plane
+	// for exactly that case, so there is nothing to do here (#918 review D6 —
+	// this used to un-stage from here, which is a second producer of the same
+	// plane guarded only by prose about which frames reach this function).
 
 	// Source flip explicit -> auto: even an unchanged auto raster is new
 	// content at the DP.
@@ -5968,9 +6100,12 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 		struct xrt_rect box = {};
 		uint64_t hash = 0;
 		d3d11_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
+		// Panel-sized, always: never resized, so structurally outside the R2
+		// churn path (#918 Phase 2a).
 		if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP,
 		                                  c->backdrop_scratch_share, c->backdrop_scratch_gen,
-		                                  (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM)) {
+		                                  (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, c->split_panel_w,
+		                                  c->split_panel_h)) {
 			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP, hash,
 			                               box.offset.w, box.offset.h, (uint32_t)box.extent.w,
 			                               (uint32_t)box.extent.h);
@@ -6176,26 +6311,10 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		}
 	} else if (have_explicit) {
 		// #918 Phase 2a: the shadow (Tier 1/2) or the bridge plane (Tier 3).
+		// The plane was BOUND AND STAGED before this function ran, by
+		// d3d11_stage_mask_plane — the transport does not depend on whether the
+		// pixels have landed yet (#918 review F1/D6).
 		mask_srv = d3d11_zone_mask_consume_srv(c, mask, slot, &mask_kind);
-		if (mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE && c->split_active) {
-			/*
-			 * The app drew these pixels on the app device, so they have to
-			 * cross. On-change only: `author_seq` moves on every authoring call
-			 * and on submit, so a mask that is drawn once and reused costs one
-			 * R8 transport for the whole session.
-			 */
-			if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, mask->staged_share,
-			                                  mask->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM)) {
-				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK,
-				                               mask->author_seq | (1ull << 63), 0, 0, mask->w, mask->h);
-			} else {
-				// Transport unavailable (no share handle, or the stack refused
-				// an R8 cross-adapter heap). Fall back to the shadow: Tier-1/2
-				// content still composites, the Tier-3 strokes do not.
-				mask_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
-				mask_srv = mask->out_staged_srv;
-			}
-		}
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
@@ -6213,11 +6332,22 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		mask_srv = d3d11_update_implicit_mask(c, d3d11_out_device(c), d3d11_out_context(c), rects, rect_count,
 		                                      region_w, region_h);
 	}
-	if (mask_srv == nullptr) {
+	/*
+	 * #918 review F1 — the DEPOSIT half under the split does not need the mask
+	 * resolved. The consume half reads its kind and its pixels FROM THE SLOT, and
+	 * a Tier-3 mask's plane has legitimately not landed on the frame that authors
+	 * it. Bailing here is what made a sticky Tier-3 mask permanently dead: no
+	 * deposit → no recipe stamp → no transport → still no SRV next frame, for
+	 * ever. The first authoring frame now transports, and consumption starts
+	 * whenever the slot lands.
+	 */
+	const bool deposit_bridged_mask =
+	    prepare_only && c->split_active && mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE;
+	if (mask_srv == nullptr && !deposit_bridged_mask) {
 		c->repaint.composite_bail = 3;
 		return false;
 	}
-	if (!is_repaint && !split_consume) {
+	if (!is_repaint && !split_consume && mask_srv != nullptr) {
 		c->repaint.mask_srv = mask_srv;
 	}
 
@@ -6303,12 +6433,34 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				uint64_t hash = 0;
 				d3d11_local2d_digest(c, zones_frame ? -1 : proj_idx, /*over=*/true, region_w, region_h,
 				                     &box, &hash);
-				if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
-				                                  c->local2d_scratch_share, c->local2d_scratch_gen,
-				                                  (uint32_t)unorm_fmt)) {
+				const bool twod_bound = comp_d3d11_xbridge_bind_plane(
+				    c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D, c->local2d_scratch_share,
+				    c->local2d_scratch_gen, (uint32_t)unorm_fmt, c->split_panel_w, c->split_panel_h);
+				if (twod_bound) {
 					comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
 					                               hash, box.offset.w, box.offset.h,
 					                               (uint32_t)box.extent.w, (uint32_t)box.extent.h);
+				} else {
+					/*
+					 * #918 review D4: the Local2D plane IS the composite's
+					 * `twod` under the split, so a frame that could not bind it
+					 * has no composite to stamp. Claiming otherwise stamped
+					 * `composite=true` on a slot whose plane the submit would
+					 * then mark invalid, and the consume half bailed on every
+					 * frame afterwards with no log outside the #876 diag.
+					 */
+					if (!c->local2d_plane_warned) {
+						c->local2d_plane_warned = true;
+						U_LOG_W(
+						    "D3D11 output-device split: the Local2D plane could not be bound "
+						    "— 2D content does not composite under the split for this "
+						    "session; the 3D weave is unaffected (#918 Phase 2a)");
+					}
+					// Returning false routes through layer_commit's
+					// `!deposited` branch, which stamps composite=false and
+					// un-stages the plane — the one place that decision lives.
+					c->repaint.composite_bail = 4;
+					return false;
 				}
 
 				// Stamp the recipe this frame's slot will carry.
@@ -6502,12 +6654,34 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 	if (SUCCEEDED(hr) && mask->tex != nullptr) {
 		hr = device->CreateRenderTargetView(mask->tex, nullptr, &mask->rtv);
 	}
+	bool staged_shared = false;
 	if (SUCCEEDED(hr) && mask->rtv != nullptr) {
 		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 		if (split) {
+			/*
+			 * #918 review D1: the share flags are an OPTIMISATION (they let the
+			 * Tier-3 mask ride the bridge as a plane), never a requirement. A
+			 * stack that refuses a shared R8 texture must not take
+			 * xrCreateLocal3DZoneMaskDXR down with it — every other Phase-2a
+			 * failure on this path degrades, and so does this one: retry
+			 * unshared, and Tier 1/2 keep working through the output-device
+			 * shadow.
+			 */
 			td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+			hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
+			staged_shared = SUCCEEDED(hr);
+			if (!staged_shared) {
+				U_LOG_W(
+				    "zone_mask_create: this stack refuses a shared R8 staging texture 0x%08x — "
+				    "Tier-3 (app-drawn) masks will not cross the output-device split this "
+				    "session; the mask itself is created normally (#918 Phase 2a)",
+				    hr);
+				td.MiscFlags = 0;
+				hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
+			}
+		} else {
+			hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
 		}
-		hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
 		td.MiscFlags = 0;
 	}
 	if (SUCCEEDED(hr) && mask->staged != nullptr) {
@@ -6538,7 +6712,8 @@ d3d11_zone_mask_alloc(ID3D11Device *device,
 		// Plane source handle. A failure here only costs the TIER-3 path (the
 		// shadow below still serves Tier 1/2), so it is a WARN, not an error.
 		IDXGIResource1 *dr = nullptr;
-		if (SUCCEEDED(mask->staged->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr))) &&
+		if (staged_shared &&
+		    SUCCEEDED(mask->staged->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr))) &&
 		    dr != nullptr) {
 			if (FAILED(dr->CreateSharedHandle(nullptr,
 			                                  DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
@@ -6844,12 +7019,22 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		// sync would otherwise leave the panel pinned by a dead client.
 		d3d11_sync_zone_mask_to_dp(c);
 	}
-	// #918 Phase 2a: the bridge's producer may hold an open of mask->staged as
-	// the authored-mask plane source. Drop the binding (which drains the producer
-	// link, or leaks on timeout) BEFORE releasing the texture underneath it.
-	if (c->split_active && c->xbridge != nullptr && mask->staged_share != nullptr) {
+	/*
+	 * #918 Phase 2a: the bridge's producer may hold an open of mask->staged as
+	 * the authored-mask plane source. Drop the binding (which drains the producer
+	 * link, or leaks on timeout) BEFORE releasing the texture underneath it.
+	 *
+	 * #918 review D2: only when the plane is actually bound to THIS mask.
+	 * `staged_gen` is unique per mask object, so the test is exact — and without
+	 * it, destroying any other mask that merely HAS a share handle unbound the
+	 * live one, costing a blocking drain plus a full re-transport for nothing.
+	 */
+	if (c->split_active && c->xbridge != nullptr && mask->staged_share != nullptr &&
+	    c->mask_plane_gen == mask->staged_gen) {
 		comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, nullptr, 0,
-		                              (uint32_t)DXGI_FORMAT_R8_UNORM);
+		                              (uint32_t)DXGI_FORMAT_R8_UNORM, 0, 0);
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
 	}
 	if (mask->out_staged_srv != nullptr) {
 		mask->out_staged_srv->Release();

@@ -219,6 +219,17 @@ struct comp_d3d11_xbridge
 		bool failed;  //!< allocation refused once — never retried, never re-WARNed
 		uint32_t fmt; //!< DXGI_FORMAT of the whole chain
 		uint32_t bpp;
+		/*!
+		 * Allocated extent of the whole chain (XA ring + egress). NOT always the
+		 * panel (#918 review F5): the 2D planes are panel-sized once, on purpose,
+		 * so they never enter the R2 churn path — but an authored MASK is created
+		 * at the app's own dims and maps stretch-to-region, so a panel-sized mask
+		 * plane would transport the mask into a corner of a texture the composite
+		 * then stretches whole, sampling a never-written band. Sizing the mask
+		 * plane at the MASK makes the full mask the thing that crosses, and makes
+		 * an uninitialised band structurally impossible.
+		 */
+		uint32_t alloc_w, alloc_h;
 
 		//! Producer's open of the app-device source (Option-I shape).
 		ID3D12Resource *src12;
@@ -442,60 +453,149 @@ xb_release_egress(struct comp_d3d11_xbridge *xb)
 }
 
 /*!
- * One egress slot: an output-device D3D11 texture (SRV for the DP) shared by NT
- * handle and opened on the consumer D3D12 device as a copy destination.
+ * ONE egress texture: an output-device D3D11 texture (SRV for whoever samples
+ * it) shared by NT handle and opened on the consumer D3D12 device as a copy
+ * destination.
+ *
+ * The single recipe for BOTH rings — the atlas egress and every plane's (#918
+ * review D9). They differed only in dims, format and whether the texture also
+ * needs an RTV; two copies of a five-call sequence with a share handle in the
+ * middle is exactly where the two rings would drift apart.
+ *
+ * @return the HRESULT of the first failing step (S_OK on success). The caller
+ *         owns whatever was written, including on failure — release through its
+ *         normal teardown so a partial chain is not leaked.
  */
-static bool
-xb_make_egress_slot(struct comp_d3d11_xbridge *xb, int i, uint32_t w, uint32_t h, const char **out_reason)
+static HRESULT
+xb_make_egress_texture(struct comp_d3d11_xbridge *xb,
+                       uint32_t w,
+                       uint32_t h,
+                       DXGI_FORMAT fmt,
+                       bool want_rtv,
+                       ID3D11Texture2D **out_tex,
+                       ID3D11ShaderResourceView **out_srv,
+                       HANDLE *out_share,
+                       ID3D12Resource **out_12)
 {
-	char b[32];
-
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = XB_FORMAT;
+	td.Format = fmt;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (want_rtv ? D3D11_BIND_RENDER_TARGET : 0);
 	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 
-	HRESULT hr = xb->out_dev->CreateTexture2D(&td, nullptr, &xb->eg_tex[i]);
-	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: egress texture %ux%u failed %s", w, h, xb_hr(hr, b, sizeof(b)));
-		*out_reason = "egress share failed";
-		return false;
+	HRESULT hr = xb->out_dev->CreateTexture2D(&td, nullptr, out_tex);
+	if (SUCCEEDED(hr)) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+		sv.Format = fmt;
+		sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sv.Texture2D.MipLevels = 1;
+		hr = xb->out_dev->CreateShaderResourceView(*out_tex, &sv, out_srv);
 	}
-
-	D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
-	sv.Format = XB_FORMAT;
-	sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	sv.Texture2D.MipLevels = 1;
-	hr = xb->out_dev->CreateShaderResourceView(xb->eg_tex[i], &sv, &xb->eg_srv[i]);
-	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: egress SRV failed %s", xb_hr(hr, b, sizeof(b)));
-		*out_reason = "egress share failed";
-		return false;
-	}
-
 	IDXGIResource1 *dr = nullptr;
-	hr = xb->eg_tex[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr));
+	if (SUCCEEDED(hr)) {
+		hr = (*out_tex)->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr));
+	}
 	if (SUCCEEDED(hr) && dr != nullptr) {
 		hr = dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
-		                            &xb->eg_share[i]);
+		                            out_share);
 		dr->Release();
 	}
-	if (FAILED(hr) || xb->eg_share[i] == nullptr) {
-		U_LOG_W("d3d11 xbridge: egress CreateSharedHandle failed %s", xb_hr(hr, b, sizeof(b)));
-		*out_reason = "egress share failed";
-		return false;
+	if (SUCCEEDED(hr) && *out_share == nullptr) {
+		hr = E_FAIL;
+	}
+	if (SUCCEEDED(hr)) {
+		hr = xb->cons_dev->OpenSharedHandle(*out_share, __uuidof(ID3D12Resource),
+		                                    reinterpret_cast<void **>(out_12));
+	}
+	if (SUCCEEDED(hr) && *out_12 == nullptr) {
+		hr = E_FAIL;
+	}
+	return hr;
+}
+
+/*!
+ * ONE cross-adapter placed ring slot: a SHARED|SHARED_CROSS_ADAPTER heap created
+ * on the producer, opened on the consumer, with a ROW_MAJOR ALLOW_CROSS_ADAPTER
+ * placed resource at offset 0 on each side. The second half of #918 review D9's
+ * duplication — the atlas ring and every plane ring build the identical chain.
+ *
+ * @param out_heap_bytes Receives the heap size, for the one-shot log line.
+ */
+static HRESULT
+xb_make_xa_slot(struct comp_d3d11_xbridge *xb,
+                uint32_t w,
+                uint32_t h,
+                DXGI_FORMAT fmt,
+                ID3D12Heap **out_heap_prod,
+                ID3D12Heap **out_heap_cons,
+                HANDLE *out_heap_h,
+                ID3D12Resource **out_prod,
+                ID3D12Resource **out_cons,
+                uint64_t *out_heap_bytes)
+{
+	D3D12_RESOURCE_DESC td{};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = w;
+	td.Height = h;
+	td.DepthOrArraySize = 1;
+	td.MipLevels = 1;
+	td.Format = fmt;
+	td.SampleDesc.Count = 1;
+	td.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	td.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+	UINT rows = 0;
+	UINT64 row_bytes = 0, total = 0;
+	xb->prod_dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+
+	const UINT64 align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+	D3D12_HEAP_DESC hd{};
+	hd.SizeInBytes = (total + align - 1) & ~(align - 1);
+	hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+	hd.Alignment = align;
+	hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
+	                              D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
+	if (out_heap_bytes != nullptr) {
+		*out_heap_bytes = hd.SizeInBytes;
 	}
 
-	hr = xb->cons_dev->OpenSharedHandle(xb->eg_share[i], __uuidof(ID3D12Resource),
-	                                    reinterpret_cast<void **>(&xb->eg_12[i]));
-	if (FAILED(hr) || xb->eg_12[i] == nullptr) {
-		U_LOG_W("d3d11 xbridge: consumer OpenSharedHandle(egress) failed %s", xb_hr(hr, b, sizeof(b)));
+	HRESULT hr = xb->prod_dev->CreateHeap(&hd, __uuidof(ID3D12Heap), reinterpret_cast<void **>(out_heap_prod));
+	if (SUCCEEDED(hr)) {
+		hr = xb->prod_dev->CreateSharedHandle(*out_heap_prod, nullptr, GENERIC_ALL, nullptr, out_heap_h);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = xb->cons_dev->OpenSharedHandle(*out_heap_h, __uuidof(ID3D12Heap),
+		                                    reinterpret_cast<void **>(out_heap_cons));
+	}
+	if (SUCCEEDED(hr)) {
+		hr = xb->prod_dev->CreatePlacedResource(*out_heap_prod, 0, &td, D3D12_RESOURCE_STATE_COMMON, nullptr,
+		                                        __uuidof(ID3D12Resource), reinterpret_cast<void **>(out_prod));
+	}
+	if (SUCCEEDED(hr)) {
+		hr = xb->cons_dev->CreatePlacedResource(*out_heap_cons, 0, &td, D3D12_RESOURCE_STATE_COMMON, nullptr,
+		                                        __uuidof(ID3D12Resource), reinterpret_cast<void **>(out_cons));
+	}
+	return hr;
+}
+
+/*!
+ * One egress slot of the ATLAS ring. Same texture recipe as a plane's, plus the
+ * RTV bind the atlas egress has always carried.
+ */
+static bool
+xb_make_egress_slot(struct comp_d3d11_xbridge *xb, int i, uint32_t w, uint32_t h, const char **out_reason)
+{
+	char b[32];
+	HRESULT hr = xb_make_egress_texture(xb, w, h, XB_FORMAT, /*want_rtv=*/true, &xb->eg_tex[i], &xb->eg_srv[i],
+	                                    &xb->eg_share[i], &xb->eg_12[i]);
+	if (FAILED(hr)) {
+		U_LOG_W("d3d11 xbridge: egress slot %d (%ux%u) failed %s", i, w, h, xb_hr(hr, b, sizeof(b)));
 		*out_reason = "egress share failed";
 		return false;
 	}
@@ -546,8 +646,9 @@ xb_format_bpp(uint32_t fmt)
 static void
 xb_plane_invalidate_slots(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge::xb_plane &pl)
 {
-	uint32_t w = xb->panel_w;
-	uint32_t h = xb->panel_h;
+	(void)xb;
+	uint32_t w = pl.alloc_w;
+	uint32_t h = pl.alloc_h;
 	if (pl.src_w != 0 && pl.src_w < w) {
 		w = pl.src_w;
 	}
@@ -615,12 +716,26 @@ xb_release_plane(struct comp_d3d11_xbridge *xb, uint32_t p, bool drained)
 	pl.src_bound = false;
 	pl.src_w = 0;
 	pl.src_h = 0;
+	pl.alloc_w = 0;
+	pl.alloc_h = 0;
 }
 
 /*!
- * Allocate one plane's whole chain at the PANEL extent: its own cross-adapter
- * heap + placed ring and its own egress textures (D3D11 on the output device,
- * NT-shared and opened by the consumer).
+ * Allocate one plane's whole chain at @p w x @p h: its own cross-adapter heap +
+ * placed ring and its own egress textures (D3D11 on the output device, NT-shared
+ * and opened by the consumer).
+ *
+ * **The extent is the CALLER's, not the panel's (#918 review F5).** The two 2D
+ * planes ask for the panel deliberately — allocated once, never resized,
+ * structurally outside the R2 churn path. The authored MASK does not: an app
+ * creates a mask at dims of its own choosing (the docs even recommend a
+ * downsampled one) and the mask maps stretch-to-region, so a panel-sized mask
+ * plane would transport the mask into a corner of a texture the composite then
+ * stretches whole — sampling a band no copy ever wrote, which for R8 reads as
+ * "2D everywhere", the exact inverse of an unauthored mask's all-3D default.
+ * Sizing the plane at the mask makes the whole mask the thing that crosses. It
+ * costs nothing on the churn argument either: the mask plane transports on
+ * `author_seq` change only, so its allocation is on-change too.
  *
  * This is also where the R8 cross-adapter question is ANSWERED rather than
  * predicted. `CrossAdapterRowMajorTextureSupported` was measured NOT to predict
@@ -630,108 +745,57 @@ xb_release_plane(struct comp_d3d11_xbridge *xb, uint32_t p, bool drained)
  * and the feature that needs it degrades. The split is never affected.
  */
 static bool
-xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt)
+xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, uint32_t h)
 {
 	char b[32];
 	auto &pl = xb->plane[p];
-	if (pl.live) {
-		// The format is a property of the plane, fixed for the session — never
-		// reallocate over a live chain.
-		return pl.fmt == fmt;
-	}
 	if (pl.failed) {
 		return false;
 	}
-	if (xb->panel_w == 0 || xb->panel_h == 0) {
-		pl.failed = true;
+	if (pl.live) {
+		// The format is a property of the plane, fixed for the session.
+		if (pl.fmt != fmt) {
+			return false;
+		}
+		if (pl.alloc_w == w && pl.alloc_h == h) {
+			return true;
+		}
+		/*
+		 * A dims change means the app created a differently-sized mask — an
+		 * on-change event, never a per-frame one, so a rebuild here cannot
+		 * become the R2 churn the 2D planes are protected from (they always
+		 * ask for the panel and so never reach this). The consumer may still
+		 * be copying into the old egress; drain before releasing, and leak on
+		 * timeout exactly as every other structural transition does.
+		 */
+		const bool drained = xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire),
+		                                    "plane re-size");
+		xb_release_plane(xb, p, drained);
+	}
+	if (w == 0 || h == 0) {
+		// No usable extent yet — NOT a permanent failure (a mask can be bound
+		// before its dims are known), so do not latch `failed`.
 		return false;
 	}
 	pl.fmt = fmt;
 	pl.bpp = xb_format_bpp(fmt);
+	pl.alloc_w = w;
+	pl.alloc_h = h;
 
 	HRESULT hr = S_OK;
 	const char *what = "cross-adapter heap";
-
-	D3D12_RESOURCE_DESC td{};
-	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-	td.Width = xb->panel_w;
-	td.Height = xb->panel_h;
-	td.DepthOrArraySize = 1;
-	td.MipLevels = 1;
-	td.Format = (DXGI_FORMAT)fmt;
-	td.SampleDesc.Count = 1;
-	td.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-	td.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
-
-	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-	UINT rows = 0;
-	UINT64 row_bytes = 0, total = 0;
-	xb->prod_dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
-
-	const UINT64 align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-	D3D12_HEAP_DESC hd{};
-	hd.SizeInBytes = (total + align - 1) & ~(align - 1);
-	hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-	hd.Alignment = align;
-	hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
-	                              D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
+	uint64_t heap_bytes = 0;
 
 	for (int i = 0; i < XB_XA_RING && SUCCEEDED(hr); i++) {
-		hr = xb->prod_dev->CreateHeap(&hd, __uuidof(ID3D12Heap), reinterpret_cast<void **>(&pl.heap_prod[i]));
-		if (SUCCEEDED(hr)) {
-			hr = xb->prod_dev->CreateSharedHandle(pl.heap_prod[i], nullptr, GENERIC_ALL, nullptr,
-			                                      &pl.heap_h[i]);
-		}
-		if (SUCCEEDED(hr)) {
-			hr = xb->cons_dev->OpenSharedHandle(pl.heap_h[i], __uuidof(ID3D12Heap),
-			                                    reinterpret_cast<void **>(&pl.heap_cons[i]));
-		}
-		if (SUCCEEDED(hr)) {
-			hr = xb->prod_dev->CreatePlacedResource(pl.heap_prod[i], 0, &td, D3D12_RESOURCE_STATE_COMMON,
-			                                        nullptr, __uuidof(ID3D12Resource),
-			                                        reinterpret_cast<void **>(&pl.xa_prod[i]));
-		}
-		if (SUCCEEDED(hr)) {
-			hr = xb->cons_dev->CreatePlacedResource(pl.heap_cons[i], 0, &td, D3D12_RESOURCE_STATE_COMMON,
-			                                        nullptr, __uuidof(ID3D12Resource),
-			                                        reinterpret_cast<void **>(&pl.xa_cons[i]));
-		}
+		hr = xb_make_xa_slot(xb, w, h, (DXGI_FORMAT)fmt, &pl.heap_prod[i], &pl.heap_cons[i], &pl.heap_h[i],
+		                     &pl.xa_prod[i], &pl.xa_cons[i], &heap_bytes);
 	}
 
 	// Egress: an output-device D3D11 texture per slot, NT-shared to the consumer.
 	for (int i = 0; i < XB_EGRESS_RING && SUCCEEDED(hr); i++) {
 		what = "egress";
-		D3D11_TEXTURE2D_DESC ed = {};
-		ed.Width = xb->panel_w;
-		ed.Height = xb->panel_h;
-		ed.MipLevels = 1;
-		ed.ArraySize = 1;
-		ed.Format = (DXGI_FORMAT)fmt;
-		ed.SampleDesc.Count = 1;
-		ed.Usage = D3D11_USAGE_DEFAULT;
-		ed.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		ed.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-		hr = xb->out_dev->CreateTexture2D(&ed, nullptr, &pl.eg_tex[i]);
-		if (SUCCEEDED(hr)) {
-			D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
-			sv.Format = (DXGI_FORMAT)fmt;
-			sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-			sv.Texture2D.MipLevels = 1;
-			hr = xb->out_dev->CreateShaderResourceView(pl.eg_tex[i], &sv, &pl.eg_srv[i]);
-		}
-		IDXGIResource1 *dr = nullptr;
-		if (SUCCEEDED(hr)) {
-			hr = pl.eg_tex[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr));
-		}
-		if (SUCCEEDED(hr)) {
-			hr = dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-			                            nullptr, &pl.eg_share[i]);
-			dr->Release();
-		}
-		if (SUCCEEDED(hr)) {
-			hr = xb->cons_dev->OpenSharedHandle(pl.eg_share[i], __uuidof(ID3D12Resource),
-			                                    reinterpret_cast<void **>(&pl.eg_12[i]));
-		}
+		hr = xb_make_egress_texture(xb, w, h, (DXGI_FORMAT)fmt, /*want_rtv=*/false, &pl.eg_tex[i],
+		                            &pl.eg_srv[i], &pl.eg_share[i], &pl.eg_12[i]);
 	}
 
 	if (FAILED(hr)) {
@@ -739,7 +803,7 @@ xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt)
 		    "d3d11 xbridge: the %s plane could not allocate its %s at %ux%u fmt=%u %s — THAT FEATURE "
 		    "is unavailable under the output-device split for this session; the split itself is "
 		    "unaffected (#918 Phase 2a)",
-		    xb_plane_name(p), what, xb->panel_w, xb->panel_h, fmt, xb_hr(hr, b, sizeof(b)));
+		    xb_plane_name(p), what, w, h, fmt, xb_hr(hr, b, sizeof(b)));
 		xb_release_plane(xb, p, /*drained=*/true);
 		pl.failed = true;
 		return false;
@@ -749,14 +813,18 @@ xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt)
 	// Fresh egress textures hold nothing: every slot owes a full refresh.
 	xb_plane_invalidate_slots(xb, pl);
 	U_LOG_W("d3d11 xbridge: %s plane up — %ux%u fmt=%u, heap %llu bytes x%d + egress x%d (#918 Phase 2a)",
-	        xb_plane_name(p), xb->panel_w, xb->panel_h, fmt, (unsigned long long)hd.SizeInBytes, XB_XA_RING,
-	        XB_EGRESS_RING);
+	        xb_plane_name(p), w, h, fmt, (unsigned long long)heap_bytes, XB_XA_RING, XB_EGRESS_RING);
 	return true;
 }
 
 extern "C" bool
-comp_d3d11_xbridge_bind_plane(
-    struct comp_d3d11_xbridge *xb, uint32_t plane, void *nt_handle, uint64_t generation, uint32_t dxgi_format)
+comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
+                              uint32_t plane,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t dxgi_format,
+                              uint32_t w,
+                              uint32_t h)
 {
 	char b[32];
 	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
@@ -798,7 +866,7 @@ comp_d3d11_xbridge_bind_plane(
 		drop_source();
 		return false;
 	}
-	if (!xb_plane_alloc(xb, plane, dxgi_format)) {
+	if (!xb_plane_alloc(xb, plane, dxgi_format, w, h)) {
 		return false;
 	}
 	if (pl.src_bound && pl.src_gen == generation) {
@@ -877,9 +945,11 @@ comp_d3d11_xbridge_stage_plane(
 		pl.staged = false;
 		return;
 	}
-	// Clamp into the panel — the source is panel-sized and nothing beyond it
-	// can be sampled.
+	// Clamp into the PLANE's own extent (not the panel's — an authored mask
+	// plane is mask-sized, #918 review F5). Nothing beyond it can be sampled.
 	{
+		const int32_t lim_x = (int32_t)((pl.src_w != 0 && pl.src_w < pl.alloc_w) ? pl.src_w : pl.alloc_w);
+		const int32_t lim_y = (int32_t)((pl.src_h != 0 && pl.src_h < pl.alloc_h) ? pl.src_h : pl.alloc_h);
 		int32_t x0 = x, y0 = y;
 		int32_t x1 = x + (int32_t)w, y1 = y + (int32_t)h;
 		if (x0 < 0) {
@@ -888,11 +958,11 @@ comp_d3d11_xbridge_stage_plane(
 		if (y0 < 0) {
 			y0 = 0;
 		}
-		if (x1 > (int32_t)xb->panel_w) {
-			x1 = (int32_t)xb->panel_w;
+		if (x1 > lim_x) {
+			x1 = lim_x;
 		}
-		if (y1 > (int32_t)xb->panel_h) {
-			y1 = (int32_t)xb->panel_h;
+		if (y1 > lim_y) {
+			y1 = lim_y;
 		}
 		if (x1 <= x0 || y1 <= y0) {
 			x0 = 0;
@@ -1052,13 +1122,13 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
 	uint32_t bw = (uint32_t)((pl.pend_x[eg] + (int32_t)pl.pend_w[eg] - bx + 3) & ~3);
 	uint32_t bh = (uint32_t)((pl.pend_y[eg] + (int32_t)pl.pend_h[eg] - by + 3) & ~3);
 	/*
-	 * Clamp to the SOURCE, not just the panel. The 4-pixel snap above can push
-	 * the box past a source that is not a multiple of 4 — an authored mask is
-	 * created at the app's own zone dims — and an out-of-range source box is an
-	 * invalid `CopyTextureRegion` on a copy queue.
+	 * Clamp to min(SOURCE, this plane's allocated extent). The 4-pixel snap
+	 * above can push the box past a source that is not a multiple of 4 — an
+	 * authored mask is created at the app's own zone dims — and an out-of-range
+	 * box on either side is an invalid `CopyTextureRegion` on a copy queue.
 	 */
-	uint32_t lim_w = (pl.src_w != 0 && pl.src_w < xb->panel_w) ? pl.src_w : xb->panel_w;
-	uint32_t lim_h = (pl.src_h != 0 && pl.src_h < xb->panel_h) ? pl.src_h : xb->panel_h;
+	uint32_t lim_w = (pl.src_w != 0 && pl.src_w < pl.alloc_w) ? pl.src_w : pl.alloc_w;
+	uint32_t lim_h = (pl.src_h != 0 && pl.src_h < pl.alloc_h) ? pl.src_h : pl.alloc_h;
 	if ((uint32_t)bx >= lim_w || (uint32_t)by >= lim_h) {
 		bw = 0;
 		bh = 0;

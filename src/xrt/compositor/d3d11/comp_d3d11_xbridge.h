@@ -77,12 +77,15 @@ struct comp_d3d11_xbridge_info
 	uint32_t max_height;
 
 	/*!
-	 * Panel extent (`xdev->hmd->screens[0]`). The #918 Phase 2a PLANES are sized
-	 * from this ONCE and never resized — a window can never exceed the panel, so
-	 * a plane allocated here fits every region the session will ever composite.
-	 * That is deliberate: it puts the planes structurally outside the R2 churn
+	 * Panel extent (`xdev->hmd->screens[0]`). The two 2D PLANES are sized from
+	 * this ONCE and never resized — a window can never exceed the panel, so a
+	 * plane allocated here fits every region the session will ever composite.
+	 * That is deliberate: it puts them structurally outside the R2 churn
 	 * hysteresis and the #1091 resize path, where a per-size realloc of three
 	 * NT-shared textures on the frame path is exactly what cost 21 of 50 frames.
+	 *
+	 * The authored-MASK plane is the exception and is sized at the MASK — see
+	 * @ref comp_d3d11_xbridge_bind_plane.
 	 */
 	uint32_t panel_width;
 	uint32_t panel_height;
@@ -272,12 +275,24 @@ comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb);
  * @param dxgi_format The plane's DXGI format — RGBA8 for the 2D planes, R8 for
  *        the authored mask. Probed against the cross-adapter heap at first use;
  *        a format the stack refuses disables that plane alone.
+ * @param w,h Extent to allocate the plane's chain at. The 2D planes pass the
+ *        PANEL and so never resize — that is what keeps them outside the R2
+ *        churn path. The authored MASK passes the MASK's own dims: it maps
+ *        stretch-to-region, so a panel-sized mask plane would leave the
+ *        composite stretching a never-written band over the region (#918 review
+ *        F5). A dims change rebuilds the chain, drained; for the mask that is an
+ *        on-change event, never a per-frame one.
  *
  * @return true when the plane is live.
  */
 bool
-comp_d3d11_xbridge_bind_plane(
-    struct comp_d3d11_xbridge *xb, uint32_t plane, void *nt_handle, uint64_t generation, uint32_t dxgi_format);
+comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
+                              uint32_t plane,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t dxgi_format,
+                              uint32_t w,
+                              uint32_t h);
 
 /*!
  * Stage @p plane for the NEXT @ref comp_d3d11_xbridge_submit.
