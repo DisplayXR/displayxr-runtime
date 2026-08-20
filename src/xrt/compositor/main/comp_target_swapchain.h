@@ -82,6 +82,14 @@ struct comp_target_swapchain
 	} pending_extent;
 
 	/*!
+	 * #1074: last DISPLAY orientation seen (1 landscape / 0 portrait / -1
+	 * unknown), taken from the panel extent that rides along with the window
+	 * rect (#1034). A device rotation swaps it; a window resize never does,
+	 * which is exactly the distinction the extent alone cannot make.
+	 */
+	int last_display_landscape;
+
+	/*!
 	 * Surface lifecycle tracking for the out-of-process present target
 	 * (#528, mirrors the in-process comp_vk_native_target sync #507). The
 	 * client forwards surfaceDestroyed/new-surface events over binder into

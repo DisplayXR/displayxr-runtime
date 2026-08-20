@@ -28,6 +28,13 @@
 #include <android/choreographer.h>
 #include <android/looper.h>
 #include <sys/system_properties.h>
+
+//! Absolute difference, unsigned-safe (#1074 resize-vs-flap size test).
+static inline uint32_t
+absdiff_u32(uint32_t a, uint32_t b)
+{
+	return a > b ? a - b : b - a;
+}
 #endif
 
 #include <assert.h>
@@ -1270,22 +1277,54 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 			// Settled (or no caps) — drop any pending debounce.
 			cts->pending_extent.since_ns = 0;
 		} else {
-			// A real orientation change flips which dimension is larger; honor it
-			// immediately. A same-orientation resize (transient startup inset flap,
-			// e.g. 1600<->1540) must persist before we churn the swapchain, which
-			// otherwise stalls the Android BufferQueue / pacing (#510).
-			bool cur_landscape = cts->base.width >= cts->base.height;
-			bool new_landscape = caps.currentExtent.width >= caps.currentExtent.height;
-			bool orientation_flip = cur_landscape != new_landscape;
+			// What must be debounced is the TRANSIENT startup inset flap
+			// (1600<->1540, tens of pixels), because churning the swapchain
+			// stalls the Android BufferQueue / pacing (#510). Everything else
+			// is a real geometry change and must be honoured at once.
+			//
+			// #1074: this used to classify "real" as *the extent aspect
+			// crossed over*, on the assumption that only a device rotation
+			// swaps width and height. In a freeform / split-screen window the
+			// surface follows the WINDOW, so an aspect-crossing resize
+			// (1000x1500 -> 1500x1000) swaps the extent on a display that
+			// never rotated — and, worse, a same-aspect freeform resize was
+			// then held at a stale extent for 2.5 s, weaving a scaled image
+			// the whole time. Two independent questions were being answered
+			// with one test:
+			//   * did the DEVICE rotate?  -> the panel extent in the current
+			//     rotation, published with the window rect (#1034). This is
+			//     the only true rotation signal the compositor has.
+			//   * is this a settled change or the startup flap? -> its SIZE.
+			bool disp_landscape = false;
+			bool rotated = false;
+			if (android_globals_get_display_landscape(&disp_landscape)) {
+				const int now_landscape = disp_landscape ? 1 : 0;
+				rotated = cts->last_display_landscape >= 0 &&
+				          cts->last_display_landscape != now_landscape;
+				cts->last_display_landscape = now_landscape;
+			} else {
+				// No window-geometry publisher (older client): no rotation
+				// signal exists, so keep the pre-#1074 aspect heuristic rather
+				// than silently debouncing a rotation for 2.5 s.
+				rotated = (cts->base.width >= cts->base.height) !=
+				          (caps.currentExtent.width >= caps.currentExtent.height);
+			}
 
-			const int64_t same_orient_debounce_ns = 2500 * 1000 * 1000LL; // 2.5 s
+			// The flap this debounce exists for is small; a deliberate resize
+			// is not. Anything bigger goes straight through, so a freeform
+			// resize is never served at a stale extent.
+			const uint32_t settle_px = 128;
+			bool big_change = absdiff_u32(caps.currentExtent.width, cts->base.width) > settle_px ||
+			                  absdiff_u32(caps.currentExtent.height, cts->base.height) > settle_px;
+
+			const int64_t settle_debounce_ns = 2500 * 1000 * 1000LL; // 2.5 s
 			int64_t now_ns = os_monotonic_get_ns();
 			bool persisted = false;
-			if (!orientation_flip) {
+			if (!rotated && !big_change) {
 				if (caps.currentExtent.width == cts->pending_extent.width &&
 				    caps.currentExtent.height == cts->pending_extent.height &&
 				    cts->pending_extent.since_ns != 0) {
-					persisted = (now_ns - cts->pending_extent.since_ns) >= same_orient_debounce_ns;
+					persisted = (now_ns - cts->pending_extent.since_ns) >= settle_debounce_ns;
 				} else {
 					// New pending value — start its timer.
 					cts->pending_extent.width = caps.currentExtent.width;
@@ -1294,16 +1333,17 @@ comp_target_swapchain_acquire_next_image(struct comp_target *ct, uint32_t *out_i
 				}
 			}
 
-			if (orientation_flip || persisted) {
+			if (rotated || big_change || persisted) {
 				U_LOG_W("comp_window_android: surface extent %ux%u -> %ux%u (%s), recreating",
 				        cts->base.width, cts->base.height, caps.currentExtent.width,
 				        caps.currentExtent.height,
-				        orientation_flip ? "rotation" : "resize-debounced");
+				        rotated ? "device rotation"
+				                : (big_change ? "window resize" : "settled-flap"));
 				cts->pending_extent.since_ns = 0;
 				return VK_ERROR_OUT_OF_DATE_KHR;
 			}
-			// Same-orientation flap, not yet persistent: keep the current swapchain
-			// (present is at worst slightly scaled) and acquire normally.
+			// Small, not-yet-settled flap: keep the current swapchain (present is
+			// at worst slightly scaled) and acquire normally.
 		}
 	}
 #endif
@@ -1599,6 +1639,9 @@ comp_target_swapchain_init_and_set_fnptrs(struct comp_target_swapchain *cts,
                                           enum comp_target_display_timing_usage timing_usage)
 {
 	cts->timing_usage = timing_usage;
+#ifdef XRT_OS_ANDROID
+	cts->last_display_landscape = -1; // unknown until a rect is published (#1074)
+#endif
 	cts->base.check_ready = comp_target_swapchain_check_ready;
 	cts->base.create_images = comp_target_swapchain_create_images;
 	cts->base.has_images = comp_target_swapchain_has_images;

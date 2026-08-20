@@ -324,6 +324,14 @@ struct comp_vk_native_target
 	//! Surface format.
 	VkFormat format;
 
+#ifdef XRT_OS_ANDROID
+	//! #1074: last DISPLAY orientation seen (1 landscape / 0 portrait / -1
+	//! unknown), from the panel extent published with the window rect. Used
+	//! ONLY to tell a device rotation apart from a window resize — never to
+	//! decide whether to recreate, which every extent change requires.
+	int last_display_landscape;
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	//! Weave-latency harness state (nullptr unless DXR_WEAVE_LATENCY_CSV set).
 	struct wl_harness *wl;
@@ -1246,6 +1254,9 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	target->hwnd = hwnd;
 	target->width = width;
 	target->height = height;
+#ifdef XRT_OS_ANDROID
+	target->last_display_landscape = -1; // unknown until a rect is published (#1074)
+#endif
 	target->queue_family_index = queue_family_index;
 	target->transparent_background = transparent_background;
 	os_mutex_init(&target->swapchain_mutex);
@@ -1557,6 +1568,9 @@ comp_vk_native_target_create_from_surface(struct comp_vk_native_compositor *c,
 	target->hwnd = NULL;
 	target->width = width;
 	target->height = height;
+#ifdef XRT_OS_ANDROID
+	target->last_display_landscape = -1; // unknown until a rect is published (#1074)
+#endif
 	target->queue_family_index = queue_family_index;
 	target->surface = surface;
 	target->external_surface = true;
@@ -2334,9 +2348,31 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		    caps.currentExtent.width != 0 && caps.currentExtent.height != 0 &&
 		    (caps.currentExtent.width != target->width ||
 		     caps.currentExtent.height != target->height)) {
-			U_LOG_W("HW_XFORM: surface extent %ux%u -> %ux%u (rotation), recreating target",
+			// #1074: the extent changing is NOT proof the DEVICE rotated.
+			// In a freeform / split-screen window the surface follows the
+			// WINDOW, so an aspect-crossing resize (1000x1500 -> 1500x1000)
+			// swaps the extent on a display that never moved. Ask the
+			// display, whose extent in the current rotation rides along
+			// with the window rect (#1034). Diagnostic only here — this leg
+			// recreates on ANY extent change, which is what a resize needs;
+			// what was wrong was calling every one of them a rotation.
+			bool disp_landscape = false;
+			const char *why = "window resize";
+			if (android_globals_get_display_landscape(&disp_landscape)) {
+				const int now_landscape = disp_landscape ? 1 : 0;
+				if (target->last_display_landscape >= 0 &&
+				    target->last_display_landscape != now_landscape) {
+					why = "device rotation";
+				}
+				target->last_display_landscape = now_landscape;
+			} else {
+				// Nothing published a rect (no window-geometry extension):
+				// no rotation signal exists, so say so rather than guess.
+				why = "extent change";
+			}
+			U_LOG_W("HW_XFORM: surface extent %ux%u -> %ux%u (%s), recreating target",
 			        target->width, target->height, caps.currentExtent.width,
-			        caps.currentExtent.height);
+			        caps.currentExtent.height, why);
 			xrt_result_t rret = comp_vk_native_target_resize(
 			    target, caps.currentExtent.width, caps.currentExtent.height);
 			if (rret != XRT_SUCCESS) {

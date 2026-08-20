@@ -292,6 +292,19 @@ android_globals_get_window_screen_rect(int32_t *out_x,
 	return true;
 }
 
+bool
+android_globals_get_display_landscape(bool *out_landscape)
+{
+	std::lock_guard<std::mutex> lock(android_window_rect.mutex);
+	if (!android_window_rect.have || android_window_rect.disp_w == 0 || android_window_rect.disp_h == 0) {
+		return false;
+	}
+	if (out_landscape != nullptr) {
+		*out_landscape = android_window_rect.disp_w >= android_window_rect.disp_h;
+	}
+	return true;
+}
+
 static std::atomic<bool> android_overlay_mode{false};
 
 void

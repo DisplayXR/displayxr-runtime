@@ -248,6 +248,23 @@ android_globals_get_window_screen_rect(int32_t *out_x,
                                        uint32_t *out_disp_h,
                                        uint64_t *out_generation);
 
+/*!
+ * Coarse DISPLAY orientation: true when the panel extent **in the current
+ * rotation** (the @p disp_w x @p disp_h published above) is landscape.
+ *
+ * This is the only rotation signal the compositor has, and it is the one it
+ * must use (#1074). A surface's extent is NOT a rotation signal: in a freeform
+ * / split-screen window the surface tracks the WINDOW, so an aspect-crossing
+ * resize (e.g. 1000x1500 -> 1500x1000) swaps the extent on a display that never
+ * rotated. The panel extent only swaps when the device really rotates.
+ *
+ * @return false when nothing has published a rect yet, in which case the caller
+ *         must keep whatever behaviour it had before this signal existed.
+ * @ingroup aux_android
+ */
+bool
+android_globals_get_display_landscape(bool *out_landscape);
+
 /*! @} */
 
 #ifdef __cplusplus
