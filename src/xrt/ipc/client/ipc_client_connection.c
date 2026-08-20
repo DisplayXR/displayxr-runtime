@@ -269,6 +269,7 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void
 	if (adopted >= 0) {
 		IPC_INFO(ipc_c, "Adopted an already-connected service socket (fd %d) (#1056).", adopted);
 		ipc_c->imc.ipc_handle = adopted;
+		ipc_c->adopted = true;
 		return true;
 	}
 
@@ -299,6 +300,187 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c, struct _JavaVM *vm, void
 }
 
 #elif defined(XRT_OS_WINDOWS)
+
+/*
+ *
+ * browser#103: adopting an already-connected pipe HANDLE instead of dialling.
+ *
+ * The Windows twin of the Android `DXR_IPC_FD` / `ipc_client_connection_adopt_fd`
+ * mechanism above (#1056), and deliberately the SAME contract rather than a
+ * second one: same one-shot consumption, same "we duplicate, the caller keeps
+ * ownership of what it passed", same precedence (an adopted endpoint wins over a
+ * normal connect), same "not a security boundary" framing.
+ *
+ * The motivating case is identical too. Chromium's GPU process runs a
+ * `USER_LIMITED` restricted token whose restricted-SID list matches neither ACE
+ * on the service pipe's SD, so `CreateFileA` on the pipe returns ACCESS_DENIED
+ * (browser#103 experiment E0). The browser process — which is NOT sandboxed and
+ * opens that pipe today — brokers a fresh endpoint with
+ * @ref ipc_client_connection_export and ships the raw HANDLE to the GPU over its
+ * own mojo transport (mojo duplicates it into the target itself; no hand-rolled
+ * OpenProcess/DuplicateHandle). The GPU publishes it with one of:
+ *
+ *   - `ipc_client_connection_adopt_handle(h)` before `xrCreateInstance` — for an
+ *     embedder that receives the HANDLE at runtime, and
+ *   - `DXR_IPC_HANDLE=<decimal>` in the environment — for a process handed the
+ *     HANDLE at launch (inherited or `UpdateProcThreadAttribute`-injected), and
+ *     for test harnesses.
+ *
+ * The BROKER MUST NOT HANDSHAKE. `ipc_client_connection_init` is
+ * connect -> setup_shm -> check_git_tag -> describe_client, and all three of
+ * those have to run in the ADOPTING process so it gets its own shmem handle and
+ * is peer-identified as itself. @ref ipc_client_connection_export therefore only
+ * connects.
+ *
+ * Unlike the POSIX socketpair case, mis-attribution here is FATAL, not cosmetic:
+ * `GetNamedPipeClientProcessId` reports the OPENER, and the server duplicates
+ * shmem / woven-texture / fence handles into that process. Hence RC-1 — the
+ * adopting client declares its own pid as the duplication target and peer
+ * identity in the first exchange, before any handle crosses. See
+ * `ipc_server_peer_creds.c`.
+ */
+
+//! Adopted-but-not-yet-consumed pipe endpoint. NULL = none. Published and taken
+//! with Interlocked*, so no static initializer / lock is needed (and MSVC C11
+//! <stdatomic.h> is off the table per the portability rules in CLAUDE.md).
+static HANDLE volatile s_adopted_handle = NULL;
+
+/*!
+ * Is @p h something we are willing to talk the IPC protocol over?
+ *
+ * Cheap, local, and deliberately strict — the twin of
+ * ipc_client_fd_is_plausible(). A wrong HANDLE here would otherwise fail much
+ * later as a corrupt protocol stream. GetNamedPipeInfo() succeeding proves it is
+ * a pipe handle at all; the PIPE_SERVER_END bit being CLEAR proves it is the
+ * client end (adopting a listening server end would deadlock the service).
+ */
+static bool
+ipc_client_handle_is_plausible(HANDLE h, const char **out_why)
+{
+	const char *why = NULL;
+	DWORD flags = 0;
+
+	if (h == NULL || h == INVALID_HANDLE_VALUE) {
+		why = "null handle";
+		goto bad;
+	}
+	if (!GetNamedPipeInfo(h, &flags, NULL, NULL, NULL)) {
+		why = "not a named-pipe handle";
+		goto bad;
+	}
+	if ((flags & PIPE_SERVER_END) != 0) {
+		why = "handle is the SERVER end of the pipe";
+		goto bad;
+	}
+
+	return true;
+
+bad:
+	if (out_why != NULL) {
+		*out_why = why;
+	}
+	return false;
+}
+
+//! Duplicate into this process so the value stays valid even if the caller
+//! closes its copy before xrCreateInstance. Mirrors the dup() in the fd path.
+static HANDLE
+ipc_client_dup_own_handle(HANDLE h)
+{
+	HANDLE dup = NULL;
+	HANDLE self = GetCurrentProcess();
+	if (!DuplicateHandle(self, h, self, &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+		return NULL;
+	}
+	return dup;
+}
+
+void
+ipc_client_connection_adopt_handle(void *pipe_handle)
+{
+	HANDLE h = (HANDLE)pipe_handle;
+	const char *why = NULL;
+
+	if (!ipc_client_handle_is_plausible(h, &why)) {
+		U_LOG_E("ipc_client_connection_adopt_handle(%p): rejected — %s (browser#103).", h, why);
+		return;
+	}
+
+	HANDLE dup = ipc_client_dup_own_handle(h);
+	if (dup == NULL) {
+		DWORD err = GetLastError();
+		U_LOG_E("ipc_client_connection_adopt_handle(%p): DuplicateHandle failed: %lu (browser#103).", h, err);
+		return;
+	}
+
+	HANDLE previous = InterlockedExchangePointer((PVOID volatile *)&s_adopted_handle, dup);
+	if (previous != NULL) {
+		U_LOG_W("ipc_client_connection_adopt_handle: replacing a previously adopted handle %p (browser#103).",
+		        previous);
+		CloseHandle(previous);
+	}
+	U_LOG_W(
+	    "ipc_client_connection_adopt_handle: adopted handle %p (duplicate of %p) — the pipe connect will be "
+	    "skipped (browser#103).",
+	    dup, h);
+}
+
+bool
+ipc_client_connection_has_adopted_handle(void)
+{
+	// A peek, not a take — deliberately does NOT validate or duplicate. Twin of
+	// ipc_client_connection_has_adopted_fd().
+	if (InterlockedCompareExchangePointer((PVOID volatile *)&s_adopted_handle, NULL, NULL) != NULL) {
+		return true;
+	}
+
+	const char *env = getenv("DXR_IPC_HANDLE");
+	return env != NULL && env[0] != '\0';
+}
+
+/*!
+ * Take the adopted pipe endpoint, if there is one, else NULL. Consumes it.
+ *
+ * The `DXR_IPC_HANDLE` environment fallback is resolved here rather than at
+ * adopt time so that a process handed the HANDLE at launch needs no code at all
+ * before `xrCreateInstance` — same reasoning as `DXR_IPC_FD`.
+ */
+static HANDLE
+ipc_client_take_adopted_handle(void)
+{
+	HANDLE h = InterlockedExchangePointer((PVOID volatile *)&s_adopted_handle, NULL);
+	if (h != NULL) {
+		return h;
+	}
+
+	const char *env = getenv("DXR_IPC_HANDLE");
+	if (env == NULL || env[0] == '\0') {
+		return NULL;
+	}
+
+	char *end = NULL;
+	unsigned long long parsed = strtoull(env, &end, 10);
+	if (end == env || *end != '\0' || parsed == 0) {
+		U_LOG_E("DXR_IPC_HANDLE='%s' is not a handle value — ignoring (browser#103).", env);
+		return NULL;
+	}
+
+	HANDLE raw = (HANDLE)(uintptr_t)parsed;
+	const char *why = NULL;
+	if (!ipc_client_handle_is_plausible(raw, &why)) {
+		U_LOG_E("DXR_IPC_HANDLE=%llu: rejected — %s (browser#103).", parsed, why);
+		return NULL;
+	}
+
+	HANDLE dup = ipc_client_dup_own_handle(raw);
+	if (dup == NULL) {
+		U_LOG_E("DXR_IPC_HANDLE=%llu: DuplicateHandle failed: %lu (browser#103).", parsed, GetLastError());
+		return NULL;
+	}
+	U_LOG_W("DXR_IPC_HANDLE=%llu adopted as handle %p — the pipe connect will be skipped (browser#103).", parsed,
+	        dup);
+	return dup;
+}
 
 // Total time we are willing to keep retrying a busy pipe before giving up, and
 // the per-attempt WaitNamedPipe timeout used between retries.
@@ -545,23 +727,49 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 }
 #endif
 
-static bool
-ipc_client_socket_connect(struct ipc_connection *ipc_c)
-{
-	// Use a fixed global pipe name for Windows.
-	// This is required for AppContainer apps (like Chrome WebXR) which have virtualized
-	// temp directories - using temp path would cause client and server to use different pipe names.
-	const char *pipe_name = "\\\\.\\pipe\\displayxr\\displayxr_comp_ipc";
+// Use a fixed global pipe name for Windows.
+// This is required for AppContainer apps (like Chrome WebXR) which have virtualized
+// temp directories - using temp path would cause client and server to use different pipe names.
+#define IPC_WINDOWS_PIPE_NAME "\\\\.\\pipe\\displayxr\\displayxr_comp_ipc"
 
-	HANDLE pipe_inst = ipc_connect_pipe(ipc_c, pipe_name);
-	if (pipe_inst == INVALID_HANDLE_VALUE) {
-		return false;
-	}
+//! Message mode is a property of the handle, and a duplicate shares the file
+//! object, so this is idempotent — both the broker and the adopter set it.
+static bool
+ipc_client_set_pipe_message_mode(struct ipc_connection *ipc_c, HANDLE pipe_inst)
+{
 	DWORD mode = PIPE_READMODE_MESSAGE | PIPE_WAIT;
 	if (!SetNamedPipeHandleState(pipe_inst, &mode, NULL, NULL)) {
 		DWORD err = GetLastError();
 		IPC_ERROR(ipc_c, "SetNamedPipeHandleState(PIPE_READMODE_MESSAGE | PIPE_WAIT) failed: %d %s", err,
 		          ipc_winerror(err));
+		return false;
+	}
+	return true;
+}
+
+static bool
+ipc_client_socket_connect(struct ipc_connection *ipc_c)
+{
+	// browser#103: an already-connected endpoint short-circuits the whole
+	// CreateFileA path — which is the point, since the sandboxed peer that needs
+	// this cannot open the pipe at all. Exact analogue of the Android arm above.
+	HANDLE adopted = ipc_client_take_adopted_handle();
+	if (adopted != NULL) {
+		IPC_INFO(ipc_c, "Adopted an already-connected service pipe (handle %p) (browser#103).", adopted);
+		if (!ipc_client_set_pipe_message_mode(ipc_c, adopted)) {
+			CloseHandle(adopted);
+			return false;
+		}
+		ipc_c->imc.ipc_handle = adopted;
+		ipc_c->adopted = true;
+		return true;
+	}
+
+	HANDLE pipe_inst = ipc_connect_pipe(ipc_c, IPC_WINDOWS_PIPE_NAME);
+	if (pipe_inst == INVALID_HANDLE_VALUE) {
+		return false;
+	}
+	if (!ipc_client_set_pipe_message_mode(ipc_c, pipe_inst)) {
 		return false;
 	}
 
@@ -573,8 +781,12 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 
 #else
 
-static bool
-ipc_client_socket_connect(struct ipc_connection *ipc_c)
+/*!
+ * Dial the service socket and hand back the connected fd. No handshake — that
+ * is the caller's job, and browser#103's broker deliberately never does it.
+ */
+static int
+ipc_client_posix_dial(struct ipc_connection *ipc_c)
 {
 #ifdef SOCK_CLOEXEC
 	// Make sure the socket is not inherited by child processes. For one, when there is an fd to the socket
@@ -593,7 +805,7 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 	ret = socket(PF_UNIX, SOCK_STREAM | flags, 0);
 	if (ret < 0) {
 		IPC_ERROR(ipc_c, "Socket Create Error!");
-		return false;
+		return -1;
 	}
 
 	int socket = ret;
@@ -603,7 +815,8 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 	ssize_t size = u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, sock_file, PATH_MAX);
 	if (size == -1) {
 		IPC_ERROR(ipc_c, "Could not get socket file name");
-		return false;
+		close(socket);
+		return -1;
 	}
 
 	memset(&addr, 0, sizeof(addr));
@@ -614,6 +827,17 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 	if (ret < 0) {
 		IPC_ERROR(ipc_c, "Failed to connect to socket %s: %s!", sock_file, strerror(errno));
 		close(socket);
+		return -1;
+	}
+
+	return socket;
+}
+
+static bool
+ipc_client_socket_connect(struct ipc_connection *ipc_c)
+{
+	int socket = ipc_client_posix_dial(ipc_c);
+	if (socket < 0) {
 		return false;
 	}
 
@@ -717,6 +941,69 @@ ipc_client_describe_client(struct ipc_connection *ipc_c, const struct xrt_applic
  * 'Exported' functions.
  *
  */
+
+xrt_result_t
+ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *out_handle)
+{
+	if (out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_handle = XRT_IPC_HANDLE_INVALID;
+
+	// Only the message channel's log_level is read by the connect helpers; no
+	// part of the connection struct outlives this call.
+	struct ipc_connection scratch = {0};
+	scratch.imc.ipc_handle = XRT_IPC_HANDLE_INVALID;
+	scratch.imc.log_level = log_level;
+
+#if defined(XRT_OS_WINDOWS)
+	// A fresh pipe INSTANCE — the caller's own connection is untouched. No
+	// auto-launch fallback on purpose: an export only makes sense while a
+	// service is already up (the exporter is holding a live connection to it),
+	// and a broker must never spawn.
+	HANDLE pipe_inst = ipc_open_pipe_busy_retry(&scratch, IPC_WINDOWS_PIPE_NAME);
+	if (pipe_inst == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		U_LOG_E("ipc_client_connection_export: CreateFileA(%s) failed: %lu %s (browser#103).",
+		        IPC_WINDOWS_PIPE_NAME, err, ipc_winerror(err));
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (!ipc_client_set_pipe_message_mode(&scratch, pipe_inst)) {
+		CloseHandle(pipe_inst);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_handle = pipe_inst;
+	U_LOG_W(
+	    "ipc_client_connection_export: exported an un-handshaken service pipe endpoint %p — the ADOPTING "
+	    "process must run setup_shm / git-tag / describe_client (browser#103).",
+	    pipe_inst);
+	return XRT_SUCCESS;
+
+#elif defined(XRT_OS_ANDROID)
+	// The Android connect is Java and needs the JavaVM + Context that only
+	// xrCreateInstance was given (#1056). An Android embedder brokers by doing
+	// that Java connect in the process that owns the Java world and shipping the
+	// fd — which is the mechanism DXR_IPC_FD / adopt_fd already ships, so there
+	// is nothing here to wrap. Left unimplemented rather than faked.
+	(void)log_level;
+	U_LOG_E(
+	    "ipc_client_connection_export: not implemented on Android — broker with the Java connect + "
+	    "DXR_IPC_FD instead (#1056).");
+	return XRT_ERROR_NOT_IMPLEMENTED;
+
+#else
+	int fd = ipc_client_posix_dial(&scratch);
+	if (fd < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_handle = fd;
+	U_LOG_W(
+	    "ipc_client_connection_export: exported an un-handshaken service socket fd %d — the ADOPTING "
+	    "process must run setup_shm / git-tag / describe_client (browser#103).",
+	    fd);
+	return XRT_SUCCESS;
+#endif
+}
 
 xrt_result_t
 ipc_client_connection_init(struct ipc_connection *ipc_c,

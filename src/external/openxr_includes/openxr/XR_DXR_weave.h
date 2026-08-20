@@ -178,7 +178,11 @@
  * XrWeaveSubmitHandlesDXR handle kinds + xrWeaveBindWindow2DXR /
  * XrWeaveWindowGeometryDXR explicit window geometry, Android support (#1036);
  * 8 = XrWeaveSubmitFlatRegionsDXR + xrWeaveSetScreenFlatRegionsDXR per-region
- * hardware wish on the weave path (browser#88).
+ * hardware wish on the weave path (browser#88); 9 =
+ * xrWeaveExportIpcConnectionDXR + XrWeaveIpcConnectionDXR, brokering a runtime
+ * IPC endpoint to a sandboxed sibling process (browser#103), plus the §4b error
+ * table (a dead connection now reports XR_ERROR_INSTANCE_LOST /
+ * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE).
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -191,7 +195,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 8
+#define XR_DXR_weave_SPEC_VERSION 9
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -205,9 +209,13 @@ extern "C" {
 #define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
 #define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
 #define XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR ((XrStructureType)1004999198)
-// 1004999199 is RESERVED for a spec v9 per-submit wish MASK (an R8 texture handle
+// 1004999199 is RESERVED for a per-submit wish MASK (an R8 texture handle
 // instead of a rect list, for callers whose flat geometry is not rectangular —
 // rounded corners, arbitrary CSS clip paths). Do not assign it to anything else.
+
+// Reserved 1004999240..249 — a fresh decade for spec v9+ additions, because the
+// 190..199 block above is exhausted (199 is spoken for). Same registry.
+#define XR_TYPE_WEAVE_IPC_CONNECTION_DXR ((XrStructureType)1004999240)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -549,8 +557,34 @@ typedef struct XrWeaveBindWindowInfoDXR {
     void*                    windowHandle; //!< HWND / platform window id; NULL on Android
 } XrWeaveBindWindowInfoDXR;
 
+/*!
+ * @brief A fresh, connected, UN-HANDSHAKEN runtime IPC endpoint (spec v9, browser#103).
+ *
+ * Output of xrWeaveExportIpcConnectionDXR. Exactly one of the two value fields
+ * is meaningful per platform; both are always present so the struct's layout
+ * does not change between platforms.
+ *
+ *  - @c handle — Windows: the connected named-pipe HANDLE. NULL elsewhere.
+ *  - @c fd — POSIX: the connected socket descriptor. -1 on Windows.
+ *
+ * The caller OWNS what it receives and must `CloseHandle()` / `close()` it once
+ * it has been transferred (or if the transfer fails). Transferring it into
+ * another process is the caller's business — on Windows, mojo's
+ * `PlatformHandle` / `DuplicateHandle` into the target; on POSIX, `SCM_RIGHTS`
+ * or the child-launch descriptor table.
+ */
+typedef struct XrWeaveIpcConnectionDXR {
+    XrStructureType    type;   //!< XR_TYPE_WEAVE_IPC_CONNECTION_DXR
+    void* XR_MAY_ALIAS next;
+    void*              handle; //!< Windows: connected pipe HANDLE; NULL elsewhere
+    int32_t            fd;     //!< POSIX: connected socket fd; -1 on Windows
+} XrWeaveIpcConnectionDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
+
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveExportIpcConnectionDXR)(
+    XrInstance instance, XrWeaveIpcConnectionDXR* connection);
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindow2DXR)(
     XrSession session, const XrWeaveBindWindowInfoDXR* bindInfo);
@@ -624,6 +658,41 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowRectDXR(
 //! session.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSetScreenFlatRegionsDXR(
     XrSession session, uint32_t rectCount, const XrRect2Di* screenRects);
+
+//! Export a FRESH, CONNECTED, UN-HANDSHAKEN runtime IPC endpoint so another
+//! process can adopt it (spec v9, browser#103).
+//!
+//! For an embedder whose rendering process cannot reach the runtime's IPC
+//! transport itself. Chromium's GPU process is the motivating case: it runs a
+//! `USER_LIMITED` restricted token that matches neither ACE on the service
+//! pipe's security descriptor, so opening the pipe returns ACCESS_DENIED, while
+//! its unsandboxed browser process opens it routinely. The browser process
+//! calls this, ships the endpoint to the GPU process over its own transport,
+//! and the GPU process adopts it (`ipc_client_connection_adopt_handle`, or
+//! `DXR_IPC_HANDLE=<decimal>` / `DXR_IPC_FD=<n>` in the environment) before its
+//! own `xrCreateInstance`.
+//!
+//! INSTANCE-level, not session-level: the endpoint this hands back has no
+//! session on it, and the exporting instance may well have no weave session
+//! either — a broker is not required to be a present-owner. The extension must
+//! be enabled on @c instance.
+//!
+//! THE EXPORT DOES NOT HANDSHAKE. Connection setup is
+//! connect -> shared-memory transfer -> version check -> client description, and
+//! only the connect happens here; the other three MUST run in the ADOPTING
+//! process, so that process gets its own mapping of the shared memory and is the
+//! one identified to the service. An exporter that handshakes hands over a
+//! connection attributed to itself, and the service duplicates shared handles
+//! into the wrong address space.
+//!
+//! The caller's own connection is untouched — this opens a new endpoint. The
+//! returned handle/fd is owned by the caller.
+//!
+//! Reports XR_ERROR_FEATURE_UNSUPPORTED when the calling instance is not on the
+//! out-of-process (service) path, and XR_ERROR_RUNTIME_FAILURE if no endpoint
+//! could be opened.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveExportIpcConnectionDXR(
+    XrInstance instance, XrWeaveIpcConnectionDXR* connection);
 
 #endif /* !XR_NO_PROTOTYPES */
 

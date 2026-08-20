@@ -1057,6 +1057,10 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 //! OpenXR API function @ep{xrWeaveSetScreenFlatRegionsDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const XrRect2Di *screenRects);
+
+//! OpenXR API function @ep{xrWeaveExportIpcConnectionDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection);
 #endif
 
 #ifdef OXR_HAVE_EXT_conformance_automation
