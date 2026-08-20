@@ -76,8 +76,11 @@ struct comp_bg2d_state
 	//! canvas-space).
 	uint8_t *crop_scratch;
 	size_t crop_capacity;
-	bool logged_crop;        //!< One "cropped to the canvas" line per consumer.
-	bool logged_orientation; //!< One "capture is the wrong way round" line per consumer.
+	bool logged_crop; //!< One "cropped to the canvas" line per consumer.
+	//! One "dropped a capture from the other orientation" line per stale
+	//! episode — cleared again when a usable frame is accepted, so each
+	//! rotation that outruns the producer is reported exactly once.
+	bool logged_stale;
 
 	//! Canvas rect the currently-uploaded backdrop was cropped for, and the
 	//! panel extent that rect was expressed against. A T2 producer in `once`
@@ -178,7 +181,12 @@ comp_bg2d_enabled(void);
  * @param      canvas_on_panel Canvas rect in panel pixels, or NULL / a
  *                    degenerate rect to use the frame whole (T0 always passes
  *                    NULL — a runtime-drawn backdrop is already canvas-space).
- * @param      panel_w, panel_h Panel extent the rect is expressed against.
+ * @param      panel_w, panel_h Panel extent @p canvas_on_panel is expressed
+ *                    against, i.e. the panel as it is NOW. The frame's own
+ *                    space is the panel as it was when the shot was taken,
+ *                    which the producer states from protocol v2 on; the two
+ *                    part company across a device rotation and a frame from the
+ *                    other orientation is dropped rather than mapped (#1073).
  * @param[out] out_w  Backdrop width in pixels (may be NULL).
  * @param[out] out_h  Backdrop height in pixels (may be NULL).
  */

@@ -648,33 +648,68 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 
 		struct comp_bg2d_capture_frame f = {0};
 		if (comp_bg2d_capture_acquire(&f, geometry_moved ? 0 : st->seq)) {
-			// A capture whose aspect disagrees with the panel's is a frame
-			// taken in the OTHER orientation — i.e. a producer that did not
-			// re-capture across a device rotation. The crop below will still
-			// run and will still be wrong, so say so once: this is the whole
-			// #1073 "PASS at launch, FAIL on rotation" symptom, and naming it
-			// in the log turns a visual bug report into a one-line answer.
-			// `once` mode cannot fix it (by then the consumer's overlay is on
-			// screen and SurfaceFlinger keeps it latched through the rotation,
-			// so there is no clean frame to re-take) — a continuous,
-			// feedback-free producer must.
+			// Which panel-coordinate space are these pixels a downscale OF?
+			// A v2 producer states it; a v1 one does not, and the frame's own
+			// aspect is the only proxy available (exact whenever the capture
+			// is the whole panel uniformly scaled, which is what every
+			// producer does today, but defeated by a square-ish panel or a
+			// cropped capture — which is precisely why v2 exists).
+			const bool have_cap_panel = f.panel_w != 0 && f.panel_h != 0;
+			const uint32_t cap_panel_w = have_cap_panel ? f.panel_w : panel_w;
+			const uint32_t cap_panel_h = have_cap_panel ? f.panel_h : panel_h;
+			const bool cap_landscape = have_cap_panel ? (f.panel_w > f.panel_h) : (f.width > f.height);
+
+			// A frame from the OTHER orientation cannot be cropped into this
+			// one at all: the canvas rect is expressed in today's panel
+			// coordinates and the rotation transposed them, so there is no
+			// sub-rect of this frame that depicts the canvas. Mapping it
+			// anyway is the #1073 rotation symptom — the whole panel squeezed
+			// into the wrong aspect (measured 1.6x wide / 0.625x tall on a
+			// 1600x2560 NP02J, the exact inverse of the #1101 stretch).
+			//
+			// So DROP it. No background is the byte-for-byte pre-#1073 path
+			// (the post-weave alpha gate), which is a known-good, if less
+			// pretty, picture; a mis-registered background is a wrong one.
+			// The producer's job is to re-capture — until it does, this stays
+			// in the "no background" state and re-checks every frame, so the
+			// moment a correctly-oriented frame lands it is picked up.
 			if (panel_w != 0 && panel_h != 0 && f.width != 0 && f.height != 0 &&
-			    ((panel_w > panel_h) != (f.width > f.height)) && !st->logged_orientation) {
-				st->logged_orientation = true;
-				U_LOG_W(
-				    "bg2d(#1073 T2): the %ux%u capture is the wrong way round for a "
-				    "%ux%u panel — the producer has not re-captured since the device "
-				    "rotated, so the backdrop will be mis-registered. Use a "
-				    "continuous, feedback-free capture mode.",
-				    f.width, f.height, panel_w, panel_h);
+			    (panel_w > panel_h) != cap_landscape) {
+				if (!st->logged_stale) {
+					st->logged_stale = true;
+					U_LOG_W(
+					    "bg2d(#1073 T2): dropping the %ux%u capture — it was taken "
+					    "against a %ux%u panel%s and the panel is now %ux%u, so it "
+					    "belongs to the other orientation and no crop of it depicts "
+					    "this canvas. Falling back to no background until the producer "
+					    "re-captures.",
+					    f.width, f.height, cap_panel_w, cap_panel_h,
+					    have_cap_panel ? ""
+					                   : " (inferred from its aspect; a v2 producer "
+					                     "would state it)",
+					    panel_w, panel_h);
+				}
+				comp_bg2d_capture_release();
+				// Drop what is already bound too: it is the same stale frame,
+				// and leaving it up would keep showing the squeeze.
+				if (st->initialized) {
+					comp_bg2d_teardown(st, vk);
+				}
+				return VK_NULL_HANDLE;
 			}
 
 			// #174 — the producer sent PANEL pixels; slot 16 promises the
 			// CANVAS. Crop before the upload so the DP's (0,0)-(1,1) tile
 			// mapping lands the backdrop exactly where the atlas depicts.
+			//
+			// Through the CAPTURE-time extent, not the current one: the frame
+			// is a downscale of the panel as it was, so that is the only ratio
+			// that maps panel pixels onto frame pixels. They agree except
+			// across a display-geometry change, and the one change that
+			// transposes them was refused just above.
 			uint32_t cx = 0, cy = 0, up_w = f.width, up_h = f.height;
-			const bool crop = bg2d_canvas_crop_rect(canvas_on_panel, panel_w, panel_h, f.width, f.height,
-			                                        &cx, &cy, &up_w, &up_h);
+			const bool crop = bg2d_canvas_crop_rect(canvas_on_panel, cap_panel_w, cap_panel_h, f.width,
+			                                        f.height, &cx, &cy, &up_w, &up_h);
 
 			// Settle the upload dims BEFORE any teardown: the producer may
 			// re-negotiate its output size (a rotation, a different capture
@@ -702,8 +737,8 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 					    "bg2d(#1073 T2): cropped the %ux%u panel capture to the canvas"
 					    " %d,%d %dx%d on a %ux%u panel -> %ux%u at (%u,%u) (#174)",
 					    f.width, f.height, canvas_on_panel->offset.w, canvas_on_panel->offset.h,
-					    canvas_on_panel->extent.w, canvas_on_panel->extent.h, panel_w, panel_h,
-					    up_w, up_h, cx, cy);
+					    canvas_on_panel->extent.w, canvas_on_panel->extent.h, cap_panel_w,
+					    cap_panel_h, up_w, up_h, cx, cy);
 				}
 			}
 
@@ -712,6 +747,10 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 			comp_bg2d_capture_release();
 			if (ok) {
 				st->seq = seq;
+				// Re-arm the drop notice: a portrait→landscape→portrait
+				// round trip is two separate stale episodes and each is
+				// worth exactly one line.
+				st->logged_stale = false;
 				if (canvas_on_panel != NULL) {
 					st->canvas_used = *canvas_on_panel;
 					st->panel_used_w = panel_w;
