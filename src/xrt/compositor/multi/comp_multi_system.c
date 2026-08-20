@@ -3412,10 +3412,17 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			// Cleared explicitly when off, so a session that stops being
 			// transparent can never leave a stale view bound in the DP.
 			if (mc->session_render.dp_transparent && comp_bg2d_enabled()) {
-				// Where this session's canvas sits on the panel. T2 sends a
-				// whole-panel capture while slot 16 promises the canvas, so
-				// the receiver crops to this rect (#174); T0 draws its own
+				// Where the backdrop must be cut from, in panel pixels. T2
+				// sends a whole-panel capture while slot 16 promises the DP a
+				// backdrop already in the region it will map onto, so the
+				// receiver crops to this rect (#174); T0 draws its own
 				// canvas-space backdrop and is unaffected.
+				//
+				// Derived by comp_bg2d_backdrop_source_rect() from the SAME
+				// canvas rect handed to process_atlas below — one shared
+				// mapping for both compositor paths, because deriving it
+				// separately is how the in-process path came to stretch the
+				// backdrop by target_h/canvas_h (#1101).
 				//
 				// The canvas rect is in TARGET pixels, and on Android OOP the
 				// target IS the panel — which is also the fallback when no
@@ -3437,16 +3444,23 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 				const uint32_t win_h = mc->session_render.window_screen_h != 0
 				                           ? mc->session_render.window_screen_h
 				                           : framebufferHeight;
-				struct xrt_rect canvas_on_panel = {
-				    .offset = {.w = mc->session_render.window_screen_x + canvas_x,
-				               .h = mc->session_render.window_screen_y + canvas_y},
-				    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : win_w),
-				               .h = (int)(canvas_h != 0 ? canvas_h : win_h)},
+				const struct xrt_rect window_on_panel = {
+				    .offset = {.w = mc->session_render.window_screen_x,
+				               .h = mc->session_render.window_screen_y},
+				    .extent = {.w = (int)win_w, .h = (int)win_h},
 				};
+				const struct xrt_rect dp_canvas = {
+				    .offset = {.w = canvas_x, .h = canvas_y},
+				    .extent = {.w = (int)canvas_w, .h = (int)canvas_h},
+				};
+				struct xrt_rect canvas_on_panel = {0};
+				VkImageView bg_view = VK_NULL_HANDLE;
 				uint32_t bg_w = 0, bg_h = 0;
-				VkImageView bg_view =
-				    comp_bg2d_ensure(&mc->session_render.bg2d, vk, mc->session_render.cmd_pool,
-				                     &canvas_on_panel, panel_w, panel_h, &bg_w, &bg_h);
+				if (comp_bg2d_backdrop_source_rect(&window_on_panel, &dp_canvas, &canvas_on_panel)) {
+					bg_view =
+					    comp_bg2d_ensure(&mc->session_render.bg2d, vk, mc->session_render.cmd_pool,
+					                     &canvas_on_panel, panel_w, panel_h, &bg_w, &bg_h);
+				}
 				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
 				                                        bg_view, bg_w, bg_h);
 			} else {

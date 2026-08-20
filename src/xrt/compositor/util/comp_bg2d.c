@@ -482,6 +482,34 @@ fail:
 }
 
 
+bool
+comp_bg2d_backdrop_source_rect(const struct xrt_rect *window_on_panel,
+                               const struct xrt_rect *dp_canvas,
+                               struct xrt_rect *out_rect)
+{
+	if (window_on_panel == NULL || out_rect == NULL) {
+		return false;
+	}
+	if (window_on_panel->extent.w <= 0 || window_on_panel->extent.h <= 0) {
+		return false;
+	}
+
+	// A degenerate canvas is the DP's "fill the whole target" — so the region
+	// the backdrop gets mapped onto is the client window, and the crop is the
+	// window. Anything else here is the #1101 stretch.
+	if (dp_canvas == NULL || dp_canvas->extent.w <= 0 || dp_canvas->extent.h <= 0) {
+		*out_rect = *window_on_panel;
+		return true;
+	}
+
+	out_rect->offset.w = window_on_panel->offset.w + dp_canvas->offset.w;
+	out_rect->offset.h = window_on_panel->offset.h + dp_canvas->offset.h;
+	out_rect->extent.w = dp_canvas->extent.w;
+	out_rect->extent.h = dp_canvas->extent.h;
+	return true;
+}
+
+
 /*!
  * Where the canvas lands inside a T2 capture frame (#174).
  *
