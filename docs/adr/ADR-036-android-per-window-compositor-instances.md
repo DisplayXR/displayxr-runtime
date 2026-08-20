@@ -412,6 +412,19 @@ the name is now historical, but it is what every shipped demo declares in
 `<queries>` and hands to `createPackageContext`, so the merged runtime upgrades
 in place.
 
+**Migration consequence.** Because every app was previously forced out of
+process by the installed flavor, in-process becomes a *new* path for apps that
+were never ported to A. Confirmed on device with the `native_app_glue` demos
+(`android_main` render thread, no first-class surface binding): the vendor core
+loader aborts under CheckJNI on a null jobject in `GetObjectClass`
+(`leia_cnsdk_create` → `leia_dp_factory_cnsdk` →
+`comp_vk_native_compositor_create` → `oxr_session_populate_vk_native`) — the app
+has no Activity-typed Context to hand the vendor Java glue in its own process.
+That is the A-readiness gap D2 Amendment 1 already names, surfaced rather than
+introduced. The per-app `com.displayxr.force_ipc` meta-data exists precisely so
+such an app pins itself to C with a one-line change in its own repo until it is
+ported.
+
 Nothing in D1–D7 changes. What changes is that the choice between D2 and D3 stops
 being a **device-wide install-time** decision and becomes a **per-application**
 one, so an Arch-A app, a second Arch-A app and an Arch-C present-owner can weave

@@ -7,6 +7,17 @@
  * @ingroup aux_util
  */
 
+// Every platform branch below keys off XRT_OS_*, and NOTHING else this file
+// includes pulls in the generated config header — not u_sandbox.h (stdbool
+// only), not u_logging.h → xrt_api/xrt_compiler/xrt_results → xrt_defines.
+// Without this include all three branches compiled out and the file silently
+// reduced to the "other platforms" stub: u_sandbox_is_app_container() always
+// returned false (so Windows AppContainer auto-detection never fired) and the
+// Windows GetEnvironmentVariableA fallback for XRT_FORCE_MODE /
+// DISPLAYXR_WORKSPACE_SESSION never ran. Found while wiring the Android
+// hybrid-mode sysprop override (#1031), which was dead for the same reason.
+#include "xrt/xrt_config_os.h"
+
 #include "u_sandbox.h"
 #include "u_logging.h"
 
