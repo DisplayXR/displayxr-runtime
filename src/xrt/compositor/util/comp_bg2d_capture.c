@@ -80,6 +80,10 @@ struct bg2d_capture
 	size_t pixels_capacity;
 	uint32_t width;
 	uint32_t height;
+	//! Panel extent the live frame was captured against (v2 producers only; 0
+	//! when the producer speaks v1 and does not say).
+	uint32_t panel_w;
+	uint32_t panel_h;
 	//! Our own delivery counter, NOT the producer's `seq`. It starts at 1 (so
 	//! "0" can mean "nothing uploaded yet") and never resets, which makes the
 	//! consumer immune both to a producer whose first frame is seq 0 and to a
@@ -154,10 +158,15 @@ read_full(struct bg2d_capture *c, int fd, void *dst, size_t len)
  * this thread instead is time it does not spend blocked.
  */
 static bool
-read_one_frame(struct bg2d_capture *c, int fd)
+read_one_frame(struct bg2d_capture *c, int fd, uint32_t version)
 {
-	uint32_t hdr[7];
-	if (!read_full(c, fd, hdr, sizeof(hdr))) {
+	uint32_t hdr[9];
+	// The negotiated version fixes the header length for the whole connection
+	// (v1 = 7 words, v2 = 9), so this is a length lookup and never a guess — a
+	// header we sized from the frame's own contents could not be re-synced if
+	// it were ever wrong.
+	const size_t words = (version >= 2u) ? 9u : 7u;
+	if (!read_full(c, fd, hdr, words * sizeof(hdr[0]))) {
 		return false;
 	}
 	if (hdr[0] != COMP_BG2D_CAPTURE_MAGIC_FRAME) {
@@ -170,6 +179,18 @@ read_one_frame(struct bg2d_capture *c, int fd)
 	uint32_t stride = hdr[4];
 	uint32_t format = hdr[5];
 	uint32_t payload = hdr[6];
+	uint32_t panel_w = (words >= 9u) ? hdr[7] : 0u;
+	uint32_t panel_h = (words >= 9u) ? hdr[8] : 0u;
+
+	// A panel extent is advisory metadata, not a length: a nonsensical one must
+	// not cost us the frame, so drop the claim and keep the pixels. The consumer
+	// treats 0/0 as "the producer did not say" and falls back to the v1 aspect
+	// heuristic, which is exactly the right behaviour for a producer that said
+	// something impossible.
+	if (panel_w == 0 || panel_h == 0) {
+		panel_w = 0;
+		panel_h = 0;
+	}
 
 	if (w == 0 || h == 0 || w > BG2D_CAPTURE_MAX_DIM || h > BG2D_CAPTURE_MAX_DIM || format != 0 ||
 	    stride < w * 4u || payload != stride * h || payload > BG2D_CAPTURE_MAX_BYTES) {
@@ -218,6 +239,8 @@ read_one_frame(struct bg2d_capture *c, int fd)
 	c->pixels_capacity = c->scratch_capacity;
 	c->width = w;
 	c->height = h;
+	c->panel_w = panel_w;
+	c->panel_h = panel_h;
 	c->delivered++;
 	c->have_frame = true;
 	os_thread_helper_unlock(&c->oth);
@@ -226,7 +249,16 @@ read_one_frame(struct bg2d_capture *c, int fd)
 
 	if (!c->logged_first_frame) {
 		c->logged_first_frame = true;
-		U_LOG_W("bg2d capture(#1073 T2): FIRST frame from the producer — %ux%u, seq %u", w, h, seq);
+		if (panel_w != 0) {
+			U_LOG_W(
+			    "bg2d capture(#1073 T2): FIRST frame from the producer — %ux%u of a %ux%u panel, seq %u", w,
+			    h, panel_w, panel_h, seq);
+		} else {
+			U_LOG_W(
+			    "bg2d capture(#1073 T2): FIRST frame from the producer — %ux%u, seq %u (v1 producer: no "
+			    "capture-time panel extent, so a rotation can only be detected by aspect)",
+			    w, h, seq);
+		}
 	}
 	return true;
 }
@@ -238,15 +270,25 @@ serve_producer(struct bg2d_capture *c, int fd)
 	if (!read_full(c, fd, hello, sizeof(hello))) {
 		return;
 	}
-	if (hello[0] != COMP_BG2D_CAPTURE_MAGIC_HELLO || hello[1] != COMP_BG2D_CAPTURE_VERSION) {
-		U_LOG_E("bg2d capture: bad hello (magic 0x%08x version %u) — expected 'DXRB' v%u", hello[0], hello[1],
-		        COMP_BG2D_CAPTURE_VERSION);
+	if (hello[0] != COMP_BG2D_CAPTURE_MAGIC_HELLO || hello[1] < COMP_BG2D_CAPTURE_VERSION_MIN ||
+	    hello[1] > COMP_BG2D_CAPTURE_VERSION_CURRENT) {
+		U_LOG_E("bg2d capture: bad hello (magic 0x%08x version %u) — expected 'DXRB' v%u..v%u", hello[0],
+		        hello[1], COMP_BG2D_CAPTURE_VERSION_MIN, COMP_BG2D_CAPTURE_VERSION_CURRENT);
 		return;
 	}
-	U_LOG_W("bg2d capture(#1073 T2): producer connected (protocol v%u)", hello[1]);
+	const uint32_t version = hello[1];
+	U_LOG_W("bg2d capture(#1073 T2): producer connected (protocol v%u)", version);
+
+	// A reconnecting producer may speak a different version, and its first
+	// frame has not landed yet — so clear the panel extent the PREVIOUS
+	// producer stated rather than let it describe someone else's pixels.
+	os_thread_helper_lock(&c->oth);
+	c->panel_w = 0;
+	c->panel_h = 0;
+	os_thread_helper_unlock(&c->oth);
 
 	while (os_thread_helper_is_running(&c->oth)) {
-		if (!read_one_frame(c, fd)) {
+		if (!read_one_frame(c, fd, version)) {
 			break;
 		}
 	}
@@ -358,6 +400,8 @@ comp_bg2d_capture_acquire(struct comp_bg2d_capture_frame *out, uint32_t last_seq
 	out->pixels = c->pixels;
 	out->width = c->width;
 	out->height = c->height;
+	out->panel_w = c->panel_w;
+	out->panel_h = c->panel_h;
 	out->seq = c->delivered;
 	return true; // lock intentionally held until _release
 }
@@ -391,6 +435,8 @@ comp_bg2d_capture_stop(void)
 	c->scratch = NULL;
 	c->scratch_capacity = 0;
 	c->have_frame = false;
+	c->panel_w = 0;
+	c->panel_h = 0;
 	os_thread_helper_destroy(&c->oth);
 }
 
