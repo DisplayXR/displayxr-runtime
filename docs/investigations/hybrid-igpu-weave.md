@@ -109,6 +109,13 @@ the iGPU while sessions ran:
   present.
 - Tracking state changes in later unattended runs correlate with the viewer leaving the
   desk (A/B/A discriminator all-zero unattended), not with config.
+- **Attended confirmation (closed):** viewer watched a fullscreen B session with the 25 %
+  load active throughout — **iGPU at 78 % total** (session 449 + loadgen 256 ms/s), R
+  16.66 mean / 16.61 p95, 60 fps, tracking clean, and head-lock judged good by eye.
+- Observation from the attended runs: brief **black frames during session warmup**
+  (weaver async-create flat-blit window + the fullscreen swapchain resize, before
+  tracking engages, ~5 s). Warmup behaviour, not load- or config-correlated — but an
+  output-device split must not lengthen that window.
 
 ## Cross-adapter transport (the bridge B needs)
 
@@ -144,10 +151,10 @@ Capability-probed and benchmarked with purpose-built tools
 
 ## Not measured, and why
 
-- **Attended eye-pose latency under B** — the SR camera→pose path has no runtime-side
-  instrument and the box was unattended for the B ladder; needs one eyeball session
-  (viewer watches 3D lock under `DXR_D3D_FORCE_GPU=igpu` + `gpu_loadgen --duty=25`).
-  This is the remaining falsifier.
+- ~~Attended eye-pose latency under B~~ — **closed**: attended run with load active
+  throughout (see ladder above); tracking and head-lock held at 78 % iGPU. No
+  quantitative camera→pose latency instrument exists runtime-side; the check is
+  observational.
 - **True option-B (split pipeline)** — doesn't exist yet; B was proxied by an all-iGPU
   session. The proxy's biases run *against* B (extra render load) and the bridge was
   measured separately.
@@ -160,8 +167,9 @@ Capability-probed and benchmarked with purpose-built tools
 Would have reversed the recommendation, none occurred: B's iGPU busy exceeding A's
 receive-cost by more than the freed dGPU time (measured: +74 ms/s vs −210 ms/s);
 R or frame rate degrading in B or under load (stable to 79 % iGPU); no workable
-cross-adapter transport (D3D12 heaps work at 3× required bandwidth). Still open:
-attended tracking degradation under B would reopen the decision.
+cross-adapter transport (D3D12 heaps work at 3× required bandwidth); attended tracking
+degradation under B (checked at 78 % iGPU with a viewer present — held). No falsifier
+remains open on this topology.
 
 ## Reproduction
 
