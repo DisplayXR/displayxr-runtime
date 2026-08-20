@@ -40,6 +40,13 @@
 
 #define XB_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 
+//! #918 R2: two content-box changes closer together than this are a drag, not a
+//! mode switch — stop reallocating the egress ring per size.
+#define XB_CHURN_WINDOW_NS (500ull * 1000ull * 1000ull)
+//! …and this long without a change is the drag ending: one realloc back to a
+//! content-sized ring.
+#define XB_SETTLE_NS (500ull * 1000ull * 1000ull)
+
 namespace {
 
 template <class T>
@@ -167,8 +174,26 @@ struct comp_d3d11_xbridge
 	//! the request changes, so a persistently-failing size costs one WARN and one
 	//! attempt, not a realloc + a WARN every frame.
 	uint32_t eg_fail_w, eg_fail_h;
-	//! #918: egress ring rebuilds.
-	uint64_t eg_reallocs;
+	/*!
+	 * #918 R2 resize hysteresis. The content box follows the window, so an
+	 * interactive resize asks for a NEW size on every mouse event — and a
+	 * per-size rebuild is expensive where it stands: a drain of the consumer
+	 * fence, then three NT-shared textures, three SRVs and three D3D12 opens
+	 * released and recreated, on the frame path. Measured over a 1.2 s edge
+	 * drag: 12 rebuilds, 29 frames delivered against the non-split path's 50.
+	 * While the dims are churning the ring therefore stays WORST-CASE sized and
+	 * the caller crops on the output device instead; one realloc settles it back.
+	 */
+	uint32_t req_w, req_h;   //!< last size the caller asked for
+	uint64_t dims_change_ns; //!< when that request last CHANGED
+	//! Layout generation the last request carried. A size change that comes WITH
+	//! a new generation is a mode switch (one step, then still) and must not be
+	//! mistaken for the continuous size motion of a drag.
+	uint64_t size_gen;
+	bool churn;             //!< worst-case ring engaged for a churning size
+	uint64_t churn_entries; //!< times churn mode engaged
+	uint64_t churn_settles; //!< times it settled back to a content-sized ring
+	uint64_t eg_reallocs;   //!< egress ring rebuilds (the thing R2 minimises)
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -824,7 +849,7 @@ comp_d3d11_xbridge_alloc_worstcase_egress(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" bool
-comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h)
+comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, uint64_t layout_gen)
 {
 	if (xb == nullptr || w == 0 || h == 0) {
 		return false;
@@ -834,6 +859,75 @@ comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, u
 	}
 	if (h > xb->max_h) {
 		h = xb->max_h;
+	}
+	/*
+	 * #918 R2 — resize hysteresis, BEFORE any of the equality shortcuts below.
+	 *
+	 * A mode switch changes the content box once; an interactive resize changes
+	 * it on every mouse event of the drag. The per-size realloc that is right for
+	 * the first is expensive for the second, and the cost is TIME on the frame
+	 * path — measured, not theorised: a 1.2 s edge drag rebuilt the ring 12 times
+	 * and the split delivered 29 frames where the non-split path delivered 50,
+	 * with a 161 ms worst gap against its 77. Each rebuild drains the consumer
+	 * fence and then releases and recreates three NT-shared textures, their SRVs
+	 * and their D3D12 opens on the scanout adapter.
+	 *
+	 * So the SECOND same-generation change inside the window switches the ring to
+	 * worst-case ONCE and leaves it there: the content still lands (top-left, at
+	 * its own stride) and the caller crops it on the output device, so a
+	 * correctly-sized weave lands every frame of the drag with no rebuild at all.
+	 * One realloc settles back to a content-sized ring when the size holds still.
+	 */
+	{
+		const uint64_t now = os_monotonic_get_ns();
+		// A change that arrives WITH a new layout generation is a mode switch:
+		// one step, then the size holds still. Only same-generation motion — a
+		// resize drag — is churn. Generation 0 means "no frame has been composited
+		// yet", i.e. the two setup calls that size the ring before the session
+		// runs; those are never churn either. Without both clauses the warmup —
+		// which steps through the mode's nominal box and then the first frame's
+		// real one inside ~70 ms — would engage churn and commit the worst-case
+		// ring during exactly the window Stage A exists to keep cheap.
+		const bool gen_changed = (layout_gen == 0 || layout_gen != xb->size_gen);
+		xb->size_gen = layout_gen;
+
+		if (w != xb->req_w || h != xb->req_h) {
+			const uint64_t prev_change_ns = xb->dims_change_ns;
+			xb->req_w = w;
+			xb->req_h = h;
+			xb->dims_change_ns = now;
+
+			if (xb->churn) {
+				return true; // the worst-case ring absorbs it; no realloc
+			}
+			if (!gen_changed && prev_change_ns != 0 && (now - prev_change_ns) < XB_CHURN_WINDOW_NS) {
+				xb->churn = true;
+				xb->churn_entries++;
+				U_LOG_W(
+				    "d3d11 xbridge: content box is churning (%ux%u after %llu ms) — holding a "
+				    "WORST-CASE egress ring and cropping on the output device so weaves keep "
+				    "landing through the resize (#918)",
+				    w, h, (unsigned long long)((now - prev_change_ns) / (1000 * 1000)));
+				if (xb->eg_w != xb->max_w || xb->eg_h != xb->max_h) {
+					comp_d3d11_xbridge_alloc_worstcase_egress(xb);
+				}
+				return true;
+			}
+			// First change in a while — a mode switch, not a drag. Fall through
+			// to the ordinary content-sized realloc.
+		} else if (xb->churn) {
+			if ((now - xb->dims_change_ns) < XB_SETTLE_NS) {
+				return true; // still inside the settle window
+			}
+			xb->churn = false;
+			xb->churn_settles++;
+			U_LOG_W(
+			    "d3d11 xbridge: content box settled at %ux%u — one realloc back to a "
+			    "content-sized egress ring (#918)",
+			    w, h);
+			// Fall through: eg_* still holds the worst-case ring, so the
+			// equality shortcut below cannot swallow this.
+		}
 	}
 	/*
 	 * #918 F5 (a): the ring already has EXACTLY these dims. That includes the
@@ -1390,11 +1484,13 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 	if (total > 0) {
 		U_LOG_W(
 		    "d3d11 xbridge: %llu frames bridged; picks seq=%llu seq-1=%llu older=%llu none=%llu "
-		    "in-flight=%llu (stale-layout refusals %llu; alloc-busy skips %llu); egress rebuilds %llu",
+		    "in-flight=%llu (stale-layout refusals %llu; alloc-busy skips %llu); egress rebuilds %llu "
+		    "(resize-churn entries %llu, settles %llu)",
 		    (unsigned long long)xb->frames, (unsigned long long)xb->pick_now, (unsigned long long)xb->pick_prev,
 		    (unsigned long long)xb->pick_older, (unsigned long long)xb->pick_none,
 		    (unsigned long long)xb->pick_inflight, (unsigned long long)xb->pick_stale_gen,
-		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs);
+		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs,
+		    (unsigned long long)xb->churn_entries, (unsigned long long)xb->churn_settles);
 	}
 }
 

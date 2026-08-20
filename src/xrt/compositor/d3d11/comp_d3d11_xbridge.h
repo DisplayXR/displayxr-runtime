@@ -109,9 +109,25 @@ comp_d3d11_xbridge_alloc_worstcase_egress(struct comp_d3d11_xbridge *xb);
  * skipped entirely. Cheap to call every frame — no-op when the size is
  * unchanged. Returns false if the allocation failed, in which case the previous
  * (worst-case) ring is restored and the caller crops on the output device.
-  */
+ *
+ * **#918 R2 hysteresis.** A size that keeps CHANGING — an interactive resize
+ * drag moves the content box on every mouse event — does not realloc per size:
+ * the ring switches to worst-case once and stays there until the size has held
+ * still for half a second, and the caller crops instead (as it already does for
+ * any worst-case ring). Measured on the reference panel: a 1.2 s edge drag cost
+ * 12 ring rebuilds, and the split delivered 29 frames against the non-split
+ * path's 50 with a 161 ms worst gap. A rebuild is not free — it drains the
+ * consumer fence, then releases and recreates three NT-shared textures, their
+ * SRVs and their D3D12 opens, on the frame path. A window MOVE changes no size,
+ * rebuilds nothing, and already matched the non-split path; this makes a resize
+ * behave the same way.
+ *
+ * @param layout_gen The caller's layout generation. A size change carrying a NEW
+ *        generation is a mode switch — one step, then still — and is deliberately
+ *        NOT treated as churn.
+ */
 bool
-comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h);
+comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, uint64_t layout_gen);
 
 /*!
  * The layout that produced @p slot's pixels: the generation passed to

@@ -2970,7 +2970,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			                              comp_d3d11_renderer_get_atlas_generation(c->renderer));
 			// Live egress re-size: the content box follows the window and the
 			// active mode, so a V-key mode switch or a resize lands here.
-			comp_d3d11_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h);
+			comp_d3d11_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h, c->split_layout_gen);
 			c->split_seq++;
 			comp_d3d11_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
 			                          comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w,
@@ -3707,7 +3707,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 				if (eg_w > 0 && eg_h > 0) {
 					// Falls back to a worst-case ring internally if the
 					// content-sized allocation fails.
-					comp_d3d11_xbridge_set_content_size(c->xbridge, eg_w, eg_h);
+					comp_d3d11_xbridge_set_content_size(c->xbridge, eg_w, eg_h, 0);
 					uint32_t gw = 0, gh = 0;
 					comp_d3d11_xbridge_get_egress_dims(c->xbridge, &gw, &gh);
 					eg_ok = (gw > 0 && gh > 0);
@@ -4019,7 +4019,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			cw = c->settings.preferred.width;
 			ch = c->settings.preferred.height;
 		}
-		if (!comp_d3d11_xbridge_set_content_size(c->xbridge, cw, ch)) {
+		if (!comp_d3d11_xbridge_set_content_size(c->xbridge, cw, ch, c->split_layout_gen)) {
 			U_LOG_W("D3D11 output-device split: stage B could not size the egress ring to %ux%u — "
 			        "keeping the worst-case ring and cropping on the output device (#918)",
 			        cw, ch);
