@@ -87,6 +87,28 @@ cube_{class}_{api}_{platform}
 | `cube_hosted_legacy_vk_macos` | Vulkan | Legacy hosted, Vulkan via MoltenVK. |
 | `cube_hosted_legacy_gl_macos` | OpenGL | Legacy hosted, OpenGL. |
 
+### Android — Handle + Zones Apps
+
+| App | API | Description |
+|-----|-----|-------------|
+| `cube_handle_vk_android` | Vulkan | NativeActivity cube; owns its Surface via `XR_DXR_android_surface_binding`. |
+| `cube_zones_vk_android` | Vulkan | The same cube in a **zones frame** (`XR_DXR_display_zones`): one 3D zone offset from the window origin plus a Local2D band, for checking per-zone weave **phase** on hardware. |
+
+Both live under `test_apps/{handle,zones}/` and build with Gradle:
+
+```bash
+./gradlew :test_apps:cube_zones_vk_android:installDebug -PdxrForceVendoredCjson
+```
+
+Zone-phase check (the invariant is `screen-pos == window-origin + zone-offset`) —
+the full recipe, including the freeform-at-an-offset case, is in the header
+comment of `test_apps/zones/cube_zones_vk_android/src/main/cpp/main.cpp`.
+
+**Runtime limit worth knowing:** the Android out-of-process per-session render
+path composites the **first** projection / `ZONE_3D` layer of a frame and ignores
+the rest, so exactly one 3D zone is woven on Android regardless of the
+`maxZones3D` the runtime advertises.
+
 ## Building
 
 ### Windows
