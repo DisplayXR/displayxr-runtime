@@ -17,6 +17,8 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		comp_d3d11_swapchain.h
 		comp_d3d11_target.cpp
 		comp_d3d11_target.h
+		comp_d3d11_xbridge.cpp
+		comp_d3d11_xbridge.h
 		)
 
 	target_link_libraries(
@@ -28,8 +30,13 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			aux_util
 			aux_os
 			aux_math
+			# #918: aux_d3d supplies the scanout-adapter resolver; d3d12 is the
+			# cross-adapter atlas bridge (D3D11 has no cross-adapter texture
+			# path at all — see docs/investigations/hybrid-igpu-weave.md).
+			aux_d3d
 			xrt-external-stb
 			d3d11
+			d3d12
 			dxgi
 			d3dcompiler
 			dcomp

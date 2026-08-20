@@ -149,6 +149,25 @@ the DXGI walk costs nothing otherwise.
 adapter to resolve; `DXR_VK_FORCE_GPU=scanout` WARNs once and is ignored.
 (`DXR_D3D_FORCE_GPU` is Windows-only to begin with.)
 
+## Interaction with the output-device split (`DXR_WEAVE_ON_SCANOUT`)
+
+These two variables answer *different* questions and can cancel each other out.
+`DXR_D3D_FORCE_GPU` decides which adapter the **whole session** — app render,
+weave and present — lives on. `DXR_WEAVE_ON_SCANOUT=1` (#918 Phase 1, D3D11)
+instead **splits** them: the app keeps rendering wherever its device already is,
+while the swapchain, the display processor, the HUD and the repaint loop move to
+the scanout adapter, with the composited atlas crossing once per app frame.
+
+The split's activation gate is a LUID comparison, so **forcing the app onto the
+scanout adapter makes the split a no-op**: `DXR_WEAVE_ON_SCANOUT=1` together with
+`DXR_D3D_FORCE_GPU=scanout` (or `=igpu` where those are the same adapter) logs
+`scanout adapter ... IS the app's adapter — split is a no-op` and takes the stock
+single-device path. That is correct, not a failure — everything is already local
+to the panel, which is exactly what the split was going to arrange. Use one or
+the other: `DXR_D3D_FORCE_GPU=scanout` when the app can afford to render on the
+iGPU, `DXR_WEAVE_ON_SCANOUT=1` when it cannot and the dGPU has to keep the
+rendering.
+
 ## Choosing a value
 
 - **Overlay-class / weaving apps on hybrid machines**: use `scanout`. It is the

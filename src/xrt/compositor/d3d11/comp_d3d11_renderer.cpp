@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
+#include <dxgi1_2.h> // IDXGIResource1 — #918 atlas NT share handle
 
 #include <algorithm>
 #include <cstring>
@@ -163,6 +164,16 @@ struct comp_d3d11_renderer
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
 	bool legacy_app_tile_scaling;
+
+	//! #918 output-device split: allocate the atlas NT-shareable so the
+	//! cross-adapter bridge's producer D3D12 device can open it directly.
+	//! Opt-in — false leaves the allocation shape exactly as it was.
+	bool shared_nt;
+	//! NT share handle of @ref atlas_texture (owned; NULL when !shared_nt).
+	HANDLE atlas_shared_handle;
+	//! Bumped on every GENUINE atlas (re)allocation, never on the #602
+	//! fits-early-out. Tells the bridge when to re-open the handle.
+	uint64_t atlas_generation;
 };
 
 // Access compositor internals
@@ -704,6 +715,38 @@ create_shaders(struct comp_d3d11_renderer *r)
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #918: (re)publish the atlas's NT share handle and bump the generation. No-op
+ * unless the renderer was created with @p shared_nt. Never fatal — a failure
+ * just leaves the handle NULL and the bridge falls back to its staged ingress.
+ */
+static void
+renderer_refresh_atlas_share(struct comp_d3d11_renderer *r)
+{
+	if (r->atlas_shared_handle != nullptr) {
+		CloseHandle(r->atlas_shared_handle);
+		r->atlas_shared_handle = nullptr;
+	}
+	r->atlas_generation++;
+	if (!r->shared_nt || r->atlas_texture == nullptr) {
+		return;
+	}
+
+	IDXGIResource1 *dxgi_res = nullptr;
+	HRESULT hr = r->atlas_texture->QueryInterface(__uuidof(IDXGIResource1),
+	                                              reinterpret_cast<void **>(&dxgi_res));
+	if (SUCCEEDED(hr) && dxgi_res != nullptr) {
+		hr = dxgi_res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+		                                  nullptr, &r->atlas_shared_handle);
+		dxgi_res->Release();
+	}
+	if (FAILED(hr) || r->atlas_shared_handle == nullptr) {
+		r->atlas_shared_handle = nullptr;
+		U_LOG_W("#918: atlas NT share handle failed: 0x%08x — the bridge will stage instead",
+		        (unsigned int)hr);
+	}
+}
+
 static xrt_result_t
 create_resources(struct comp_d3d11_renderer *r)
 {
@@ -721,6 +764,12 @@ create_resources(struct comp_d3d11_renderer *r)
 	texDesc.SampleDesc.Count = 1;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	// #918: NT share (no keyed mutex — a keyed-mutex resource cannot be opened
+	// by a D3D12 device). Strictly opt-in; ordering is carried by the bridge's
+	// own fences, not by the resource.
+	texDesc.MiscFlags = r->shared_nt
+	                        ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED)
+	                        : 0;
 
 	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->atlas_texture);
 	if (FAILED(hr)) {
@@ -729,6 +778,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	}
 	r->atlas_alloc_width = texDesc.Width;
 	r->atlas_alloc_height = texDesc.Height;
+	renderer_refresh_atlas_share(r);
 
 	U_LOG_W("Created atlas texture: %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
 	        texDesc.Width, texDesc.Height, r->view_width, r->view_height,
@@ -753,9 +803,11 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	// Create depth texture
+	// Create depth texture. MiscFlags must be cleared — a depth format is not
+	// shareable, and the atlas desc above may carry the #918 NT-share bits.
 	texDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+	texDesc.MiscFlags = 0;
 
 	hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->depth_texture);
 	if (FAILED(hr)) {
@@ -1290,6 +1342,7 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
                            uint32_t view_width,
                            uint32_t view_height,
                            uint32_t target_height,
+                           bool shared_nt,
                            struct comp_d3d11_renderer **out_renderer)
 {
 	comp_d3d11_renderer *r = new comp_d3d11_renderer();
@@ -1298,6 +1351,7 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 	r->c = c;
 	r->view_width = view_width;
 	r->view_height = view_height;
+	r->shared_nt = shared_nt;
 
 	// Initialize tile layout from the active rendering mode
 	auto ci = get_internals(c);
@@ -1385,8 +1439,26 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 
 #undef SAFE_RELEASE
 
+	// #918: the renderer owns the atlas share handle.
+	if (r->atlas_shared_handle != nullptr) {
+		CloseHandle(r->atlas_shared_handle);
+		r->atlas_shared_handle = nullptr;
+	}
+
 	delete r;
 	*renderer_ptr = nullptr;
+}
+
+extern "C" void *
+comp_d3d11_renderer_get_atlas_shared_handle(struct comp_d3d11_renderer *renderer)
+{
+	return (renderer != nullptr) ? renderer->atlas_shared_handle : nullptr;
+}
+
+extern "C" uint64_t
+comp_d3d11_renderer_get_atlas_generation(struct comp_d3d11_renderer *renderer)
+{
+	return (renderer != nullptr) ? renderer->atlas_generation : 0;
 }
 
 // Per-frame effective CONTENT layout (#542): the content recipe is the
@@ -1864,6 +1936,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	texDesc.SampleDesc.Count = 1;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	texDesc.MiscFlags = renderer->shared_nt
+	                        ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED)
+	                        : 0;
 
 	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->atlas_texture);
 	if (FAILED(hr)) {
@@ -1872,6 +1947,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	}
 	renderer->atlas_alloc_width = texDesc.Width;
 	renderer->atlas_alloc_height = texDesc.Height;
+	// #918: this IS a genuine realloc (the fits path returned above), so the
+	// share handle is republished and the generation bumped exactly here.
+	renderer_refresh_atlas_share(renderer);
 
 	// Recreate SRV
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -1892,9 +1970,10 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	// Recreate depth texture
+	// Recreate depth texture (MiscFlags cleared — depth is not shareable).
 	texDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
 	texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+	texDesc.MiscFlags = 0;
 
 	hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->depth_texture);
 	if (FAILED(hr)) {
