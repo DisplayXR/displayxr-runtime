@@ -175,10 +175,44 @@ struct comp_d3d11_compositor
 	bool split_active;
 	//! Monotonic app frame counter — the single seq every bridge fence uses.
 	uint64_t split_seq;
-	//! Per-SITE one-shot latches for the projection-only scope WARNs (#918
-	//! Phase 1). One shared latch would name whichever feature happened to be
-	//! gated first and silence the other two — see d3d11_split_gate_site.
-	bool split_gated_warned[3];
+	/*!
+	 * #918 Phase 2a — the panel extent the bridge PLANES are sized from, and the
+	 * dims the Local2D / backdrop scratches take under the split. Panel-sized
+	 * once, never resized: a window can never exceed the panel, so this keeps the
+	 * plane transport structurally out of the R2 churn hysteresis and the #1091
+	 * resize path. 0 when the split is off (the scratches stay region-sized, byte
+	 * for byte as before).
+	 */
+	uint32_t split_panel_w, split_panel_h;
+	/*!
+	 * #918 Phase 2a — composite recipes REFUSED because the slot's stamp
+	 * disagreed with the frame the DP is now running. Same class as
+	 * split_stale_refusals, one level down: the atlas generation guards the
+	 * weave, this guards the composite on top of it. Expected to read ZERO —
+	 * a mode change bumps the layout generation, so the slot is normally refused
+	 * upstream before this can fire. It is the instrument that PROVES that.
+	 */
+	uint64_t split_recipe_refusals;
+	uint64_t split_recipe_logged_gen;
+	//! Per-plane DIAG deltas: the lifetime copy/skip totals as of the last line.
+	uint64_t split_plane_copies_prev[3];
+	uint64_t split_plane_skips_prev[3];
+	/*!
+	 * #918 Phase 2a — REGION-SIZED views of the two planes the DISPLAY PROCESSOR
+	 * consumes through its sideband entry points.
+	 *
+	 * The masked composite can sample a panel-sized plane over a sub-rect because
+	 * its shader takes a uv scale. The DP's `set_background_2d` and
+	 * `publish_local_zone_mask` take an SRV plus a width/height and no scale, so
+	 * handing them the panel-sized plane would tell a vendor the backdrop is
+	 * 1280x720 while giving it a 3840x2160 texture — it would minify the whole
+	 * panel into the region. One output-device copy of the region per frame is the
+	 * price of not changing a plug-in ABI for this.
+	 */
+	ID3D11Texture2D *dp_bd_view;
+	ID3D11ShaderResourceView *dp_bd_view_srv;
+	ID3D11Texture2D *dp_mask_view;
+	ID3D11ShaderResourceView *dp_mask_view_srv;
 	//! Frames where the split had nothing woven to show, so the Present was
 	//! skipped and the panel kept the previous frame (#918 F4). Reported at most
 	//! once a second — a skip is a per-frame event and must never WARN per frame.
@@ -273,6 +307,11 @@ struct comp_d3d11_compositor
 	ID3D11Texture2D *local2d_scratch;
 	ID3D11ShaderResourceView *local2d_scratch_srv;
 	ID3D11RenderTargetView *local2d_scratch_rtv;
+	//! #918 Phase 2a: NT share handle + realloc generation, so the bridge's
+	//! producer can open this app-device texture directly (Option-I shape — no
+	//! extra app-device copy per frame). NULL/0 when the split is off.
+	HANDLE local2d_scratch_share;
+	uint64_t local2d_scratch_gen;
 
 	//! #491 part 3 — 2D-under backdrop flatten target (RT+SRV), same trio as
 	//! local2d_scratch. The frame's UNDER Local2D layers (before the projection
@@ -282,6 +321,9 @@ struct comp_d3d11_compositor
 	ID3D11Texture2D *backdrop_scratch;
 	ID3D11ShaderResourceView *backdrop_scratch_srv;
 	ID3D11RenderTargetView *backdrop_scratch_rtv;
+	//! #918 Phase 2a — same plane-source shape as local2d_scratch above.
+	HANDLE backdrop_scratch_share;
+	uint64_t backdrop_scratch_gen;
 
 	//! #439 Phase 3 — runtime-owned IMPLICIT zone mask, rasterized from the
 	//! frame's Local2D layer rects (Q3): M=1 (keep the weave) everywhere,
@@ -576,41 +618,16 @@ d3d11_out_context(struct comp_d3d11_compositor *c)
 	return c->split_active ? c->out_ctx : c->context;
 }
 
-/*!
- * The three Phase-1-gated features. Each gets its own latch: a single shared one
- * would report only whichever fired first, so a session that gates the backdrop
- * would silently gate zones too and the log would name the wrong feature.
- */
-enum d3d11_split_gate_site
-{
-	D3D11_SPLIT_GATE_BACKDROP = 0,   //!< the 2D-under backdrop handoff
-	D3D11_SPLIT_GATE_ZONE_MASK_SYNC, //!< the hardware zone-mask sideband publish
-	D3D11_SPLIT_GATE_ZONE_COMPOSITE, //!< the zones / Local2D / authored-mask composite
-};
-
-/*!
- * #918 Phase 1 scope gate. Zones, Local2D, authored masks and the 2D backdrop
- * all read app-device textures and write the output-device back buffer, so they
- * are device-crossing by construction and are deferred to Phase 2. Under the
- * split they are hard-gated with ONE WARN PER FEATURE; a plain projection weave
- * continues unaffected, and nothing crashes.
+/*
+ * #918 Phase 2a: `d3d11_split_gate` and its per-site enum lived here.
  *
- * @return true when the caller must skip the device-crossing work.
+ * Phase 1 shipped the split projection-only, hard-gating the three
+ * device-crossing features (the 2D-under backdrop, the zone-mask sideband
+ * publish, the zones / Local2D / authored-mask composite) with one WARN each.
+ * All three now cross for real — two as bridge planes riding the egress slot,
+ * the masks by being rasterized on the output device in the first place — so
+ * ZERO gates remain and the helper is gone rather than left as a dead branch.
  */
-static bool
-d3d11_split_gate(struct comp_d3d11_compositor *c, enum d3d11_split_gate_site site, const char *what)
-{
-	if (!c->split_active) {
-		return false;
-	}
-	if (!c->split_gated_warned[site]) {
-		c->split_gated_warned[site] = true;
-		U_LOG_W("D3D11 output-device split: %s is device-crossing and is NOT implemented in "
-		        "Phase 1 — skipped for this session; plain projection weave continues (#918)",
-		        what);
-	}
-	return true;
-}
 
 /*!
  * #918 F4: count a frame whose weave produced nothing and whose Present was
@@ -669,7 +686,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
-                          const struct u_canvas_rect *eff_canvas);
+                          const struct u_canvas_rect *eff_canvas,
+                          int32_t slot);
 // #491 part 3 — pre-weave 2D-under backdrop flatten (defined with the other
 // Local2D helpers near the bottom; called from the process_atlas sites above).
 static ID3D11ShaderResourceView *
@@ -677,6 +695,18 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
                           uint32_t *out_h);
 static void
 d3d11_release_zone_state(struct comp_d3d11_compositor *c);
+// #918 Phase 2a — region-sized output-device view of a panel-sized bridge plane,
+// for the DP sidebands that take dims but no uv scale. Defined with the other
+// zone helpers near the bottom; called from d3d11_dp_weave above them.
+static ID3D11ShaderResourceView *
+d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
+                    ID3D11Texture2D **tex,
+                    ID3D11ShaderResourceView **srv,
+                    void *plane_srv,
+                    uint32_t w,
+                    uint32_t h,
+                    DXGI_FORMAT fmt,
+                    const char *what);
 // #224 hardware-DP zone leg: per-frame sideband publish of the active mask to
 // the display processor (and the clear-on-deactivate edge). Defined with the
 // other zone helpers near the bottom.
@@ -1952,10 +1982,14 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// images, so a repaint reuses what the last app frame produced rather than
 	// re-reading textures the app has since reacquired.
 	//
-	// #918 Phase 1: the backdrop flatten reads APP-device Local2D swapchain
-	// images and hands the resulting SRV to a DP that now lives on the OUTPUT
-	// device — device-crossing, so it is gated off under the split (Phase 2).
-	if (!d3d11_split_gate(c, D3D11_SPLIT_GATE_BACKDROP, "the 2D-under backdrop handoff")) {
+	//
+	// #918 Phase 2a: under the split the flatten happens in the DEPOSIT half
+	// (before the bridge submit, so the plane rides this frame's slot) and the
+	// SRV handed to the DP is the BACKDROP PLANE that landed with the slot being
+	// woven — resolved below, once the slot is known. The app-device SRV cached
+	// in c->repaint.backdrop_srv lives on the wrong adapter and is never used
+	// there; it stays exactly as-is on the non-split path.
+	if (!c->split_active) {
 		if (!is_repaint) {
 			uint32_t bd_w = 0, bd_h = 0;
 			c->repaint.backdrop_srv =
@@ -1990,6 +2024,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 * tick, which is the whole point of the split (today's placement re-crosses
 	 * the entire woven frame on every repaint).
 	 */
+	int32_t weave_slot = -1;
 	if (c->split_active) {
 		const uint64_t want_gen = c->split_layout_gen;
 		int32_t slot;
@@ -2108,6 +2143,35 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		if (atlas_srv == nullptr) {
 			return false;
 		}
+		weave_slot = slot;
+
+		/*
+		 * #918 Phase 2a — the 2D-under backdrop, from the slot. Same GPU wait,
+		 * same fence, same seq as the atlas above, so the DP composites this
+		 * frame's backdrop under this frame's 3D and never last frame's. A
+		 * repaint tick reads it out of the published slot with ZERO bridge
+		 * traffic, which is the whole point of the split.
+		 */
+		{
+			struct comp_d3d11_xbridge_recipe brec = {};
+			ID3D11ShaderResourceView *bd_srv = nullptr;
+			if (comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &brec) && brec.bd_w > 0 && brec.bd_h > 0 &&
+			    (brec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_BACKDROP)) != 0) {
+				// Region-sized view: the DP's contract is an SRV plus the
+				// backdrop's real dims, and the plane is panel-sized.
+				bd_srv = d3d11_plane_dp_view(c, &c->dp_bd_view, &c->dp_bd_view_srv,
+				                             comp_d3d11_xbridge_get_plane_srv(
+				                                 c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_BACKDROP),
+				                             brec.bd_w, brec.bd_h, DXGI_FORMAT_R8G8B8A8_UNORM,
+				                             "2D-under backdrop");
+			}
+			xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv,
+			                                              bd_srv != nullptr ? brec.bd_w : 0,
+			                                              bd_srv != nullptr ? brec.bd_h : 0);
+			if (bd_srv != nullptr) {
+				comp_d3d11_target_bind(c->target);
+			}
+		}
 		/*
 		 * Crop only when the slot's content does not already fill it. A
 		 * content-sized ring (the steady state) needs none — cropping an
@@ -2135,14 +2199,52 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			}
 			c->split_weave_last_ns = now;
 			if (c->split_diag && now - c->split_diag_logged_ns >= U_TIME_1S_IN_NS) {
+				const double secs = (c->split_diag_logged_ns != 0)
+				                        ? (double)(now - c->split_diag_logged_ns) / 1.0e9
+				                        : 1.0;
 				c->split_diag_logged_ns = now;
+				/*
+				 * #918 Phase 2a — the BANDWIDTH evidence. Per-plane bytes/s and
+				 * change-skips beside the atlas, because the acceptance number
+				 * ("< 2.0 GB/s sustained on the 4K full-screen backdrop case") is
+				 * a per-plane question and a whole-transport total answers it
+				 * without saying which plane to fix.
+				 */
+				const double atlas_gbs =
+				    (double)comp_d3d11_xbridge_take_atlas_bytes(c->xbridge) / secs / 1.0e9;
+				double plane_gbs[3] = {0.0, 0.0, 0.0};
+				uint64_t plane_copies[3] = {0, 0, 0};
+				uint64_t plane_skips[3] = {0, 0, 0};
+				bool plane_half[3] = {false, false, false};
+				double total_gbs = atlas_gbs;
+				for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT && p < 3; p++) {
+					uint64_t pb = 0, pc = 0, ps = 0;
+					comp_d3d11_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps,
+					                                    &plane_half[p]);
+					plane_gbs[p] = (double)pb / secs / 1.0e9;
+					total_gbs += plane_gbs[p];
+					plane_copies[p] = pc - c->split_plane_copies_prev[p];
+					plane_skips[p] = ps - c->split_plane_skips_prev[p];
+					c->split_plane_copies_prev[p] = pc;
+					c->split_plane_skips_prev[p] = ps;
+				}
 				U_LOG_W(
 				    "#918 DIAG: weave %ux%u tiles %ux%u (ring %ux%u) gap_max=%.1f ms "
-				    "stale-refusals=%llu skipped-presents=%llu",
+				    "stale-refusals=%llu recipe-refusals=%llu skipped-presents=%llu | "
+				    "atlas %.3f GB/s | local2d %.3f GB/s (%llu copies, %llu skips%s) | "
+				    "backdrop %.3f GB/s (%llu copies, %llu skips%s) | mask %.3f GB/s "
+				    "(%llu copies, %llu skips%s) | TOTAL %.3f GB/s",
 				    view_width, view_height, tile_columns, tile_rows, eg_w, eg_h,
 				    (double)c->split_weave_gap_max_ns / 1.0e6,
 				    (unsigned long long)c->split_stale_refusals,
-				    (unsigned long long)c->split_skip_present);
+				    (unsigned long long)c->split_recipe_refusals,
+				    (unsigned long long)c->split_skip_present, atlas_gbs, plane_gbs[0],
+				    (unsigned long long)plane_copies[0], (unsigned long long)plane_skips[0],
+				    plane_half[0] ? " HALF-RATE" : "", plane_gbs[1],
+				    (unsigned long long)plane_copies[1], (unsigned long long)plane_skips[1],
+				    plane_half[1] ? " HALF-RATE" : "", plane_gbs[2],
+				    (unsigned long long)plane_copies[2], (unsigned long long)plane_skips[2],
+				    plane_half[2] ? " HALF-RATE" : "", total_gbs);
 			}
 		}
 	}
@@ -2179,8 +2281,46 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// read-back. No-op when the frame carries neither.
 	ID3D11Texture2D *back_buffer_2d = static_cast<ID3D11Texture2D *>(
 	    comp_d3d11_target_get_back_buffer(c->target));
-	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d,
-	                          target_width, target_height, &eff_canvas);
+	/*
+	 * DXR_WEAVE_PROBE=1 — one-shot dump of the back buffer as the DP left it,
+	 * BEFORE the masked composite. The composite writes every pixel of the
+	 * region, so a wrong final frame is ambiguous between "the weave produced
+	 * nothing" and "the composite blended it away"; this separates the two in one
+	 * run. Env-gated and one-shot — nothing on the frame path when unset.
+	 */
+	{
+		static int weave_probe = -1;
+		if (weave_probe < 0) {
+			const char *e = getenv("DXR_WEAVE_PROBE");
+			weave_probe = (e != nullptr && e[0] == '1') ? 1 : 0;
+		}
+		const char *tmpp = getenv("TEMP");
+		if (weave_probe == 1 && back_buffer_2d != nullptr && tmpp != nullptr) {
+			/*
+			 * Armed by the SAME `dxr_woven_trigger` file as the post-composite
+			 * capture below, and deliberately does not consume it — the post
+			 * block does that. The pair is then the same frame either side of the
+			 * composite, which is the only way to read it: two dumps seconds
+			 * apart would differ by scene motion and prove nothing.
+			 */
+			char trig[512];
+			snprintf(trig, sizeof(trig), "%s\\dxr_woven_trigger", tmpp);
+			FILE *tf = fopen(trig, "rb");
+			if (tf != nullptr) {
+				fclose(tf);
+				char out[512];
+				snprintf(out, sizeof(out), "%s\\dxr_weave_precomposite_%s.png", tmpp,
+				         is_repaint ? "repaint" : "app");
+				bool ok = d3d11_capture_texture_to_png(d3d11_out_device(c), d3d11_out_context(c),
+				                                       back_buffer_2d, target_width, target_height, 0,
+				                                       0, out);
+				U_LOG_W("#918 WEAVE PROBE: pre-composite back buffer %s -> %s", ok ? "OK" : "FAILED",
+				        out);
+			}
+		}
+	}
+	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d, target_width,
+	                          target_height, &eff_canvas, weave_slot);
 
 	/*
 	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the
@@ -2955,7 +3095,63 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	/*
-	 * #918: ship this frame's atlas across the adapter boundary.
+	 * #875 DEPOSIT: resolve the mask and flatten the Local2D layers while the app
+	 * still owns the swapchain images they read. The weave below — and every
+	 * repaint after it — then composite from compositor-owned state alone, so both
+	 * produce the same pixels by construction.
+	 *
+	 * #918 Phase 2a moved this ABOVE the bridge submit (it used to sit after the
+	 * target acquire). The plane copies have to be recorded into the same command
+	 * lists as the atlas copy, so the pixels they transport must already exist
+	 * when submit runs. Nothing here writes the target — the deposit only reads
+	 * its descriptor for the scratch format — and `comp_d3d11_target_acquire` does
+	 * not block, so this reorder costs the copy legs no window at all.
+	 */
+	if (c->target != nullptr && c->display_processor != NULL) {
+		uint32_t dep_w = 0, dep_h = 0;
+		comp_d3d11_target_get_dimensions(c->target, &dep_w, &dep_h);
+		ID3D11Texture2D *dep_bb = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
+
+		// #918 Phase 2a: the 2D-under backdrop flatten is app-device work reading
+		// app-owned swapchain images, so it belongs in the deposit half beside the
+		// overlay flatten — and under the split that is also what stages it as a
+		// bridge plane in time for the submit below.
+		if (c->split_active) {
+			uint32_t bd_w = 0, bd_h = 0;
+			c->repaint.backdrop_srv = d3d11_flatten_backdrop_2d(c, dep_w, dep_h, &bd_w, &bd_h);
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+			if (c->repaint.backdrop_srv == nullptr && c->xbridge != nullptr) {
+				// No under-layers this frame — un-stage, so the recipe stamps
+				// the plane invalid instead of carrying stale pixels forward.
+				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP, 0, 0, 0,
+				                               0, 0);
+			}
+		}
+
+		const bool deposited = d3d11_composite_zone_mask(c, /*is_repaint=*/false, /*prepare_only=*/true, dep_bb,
+		                                                 dep_w, dep_h, &eff_canvas, -1);
+		if (c->split_active && !deposited && c->xbridge != nullptr) {
+			/*
+			 * A projection-only frame. Stamp a recipe that says so and un-stage
+			 * the 2D planes, so a slot from a Local2D frame that is still in the
+			 * ring cannot lend its pixels to this one.
+			 */
+			struct comp_d3d11_xbridge_recipe r = {};
+			r.composite = false;
+			// The backdrop is independent of the composite: a frame can have
+			// 2D-under layers and still not run the masked pass.
+			r.bd_w = c->repaint.backdrop_w;
+			r.bd_h = c->repaint.backdrop_h;
+			comp_d3d11_xbridge_stage_recipe(c->xbridge, &r);
+			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
+			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		}
+	}
+
+	/*
+	 * #918: ship this frame's atlas — and, since Phase 2a, its planes — across the
+	 * adapter boundary.
 	 *
 	 * Placed here deliberately — after both renderer passes (so the copy sources
 	 * a COMPLETE atlas) and before the target acquire + late-weave sleep below,
@@ -3077,7 +3273,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// a Local2D layer composites the 2D/3D regions of the shared
 			// texture. No-op when the frame carries neither.
 			d3d11_composite_zone_mask(c, false, false, c->shared_texture, dp_target_w, dp_target_h,
-			                          &eff_canvas);
+			                          &eff_canvas, -1);
 
 			weaving_done = true;
 		}
@@ -3103,27 +3299,23 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_logged = true;
 		}
 
-		// #868: publish what the repaint thread needs to replay this weave.
-		// Armed only off the zero-copy path — there the atlas IS the app's own
-		// swapchain image, which it reacquires and overwrites.
+		/*
+		 * #868: publish what the repaint thread needs to replay this weave.
+		 * Armed only off the zero-copy path — there the atlas IS the app's own
+		 * swapchain image, which it reacquires and overwrites.
+		 *
+		 * #918 Phase 2a moved the #875 DEPOSIT above the bridge submit (the plane
+		 * copies ride the same command lists as the atlas, so their pixels must
+		 * exist before submit records them) but deliberately left THIS here, after
+		 * a successful acquire: arming the repaint thread for a frame the acquire
+		 * then failed to produce is a behaviour change the split has no business
+		 * making, and the deposit reads none of these fields.
+		 */
 		c->repaint.canvas = eff_canvas;
 		c->repaint.eye_pos = eye_pos;
 		c->repaint.armed = !zero_copy;
 		c->repaint.zero_copy = zero_copy;
 		c->repaint.zc_srv = zc_srv;
-
-		// #875 DEPOSIT: resolve the mask and flatten the Local2D layers while
-		// the app still owns the swapchain images they read. The weave below —
-		// and every repaint after it — then composite from compositor-owned
-		// state alone, so both produce the same pixels by construction.
-		{
-			uint32_t dep_w = 0, dep_h = 0;
-			comp_d3d11_target_get_dimensions(c->target, &dep_w, &dep_h);
-			ID3D11Texture2D *dep_bb =
-			    static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
-			d3d11_composite_zone_mask(c, /*is_repaint=*/false, /*prepare_only=*/true, dep_bb, dep_w,
-			                          dep_h, &eff_canvas);
-		}
 
 		weaving_done = d3d11_dp_weave(c, false);
 	}
@@ -3237,9 +3429,11 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		U_LOG_W(
 		    "D3D11 output-device split: %llu presents skipped for want of a woven frame "
 		    "(%llu refusing a superseded layout, #918 R1); %llu transition frames woven from an "
-		    "in-flight slot rather than held; longest gap between weaves %.1f ms (#918 F4/R1/R2)",
+		    "in-flight slot rather than held; %llu composites refused for a stale recipe stamp "
+		    "(#918 Phase 2a — expected 0); longest gap between weaves %.1f ms (#918 F4/R1/R2)",
 		    (unsigned long long)c->split_skip_present, (unsigned long long)c->split_stale_refusals,
-		    (unsigned long long)c->split_inflight_weaves, (double)c->split_weave_gap_max_ns / 1.0e6);
+		    (unsigned long long)c->split_inflight_weaves, (unsigned long long)c->split_recipe_refusals,
+		    (double)c->split_weave_gap_max_ns / 1.0e6);
 		comp_d3d11_xbridge_quiesce(c->xbridge);
 	}
 
@@ -3709,6 +3903,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			xbi.out_adapter = scanout.get();
 			xbi.max_width = sys_w;
 			xbi.max_height = sys_h;
+			/*
+			 * #918 Phase 2a: the PANEL extent sizes the bridge planes (and the
+			 * Local2D / backdrop scratches that feed them) once, for good. A
+			 * window can never exceed the panel, so nothing here ever has to
+			 * resize — which is exactly what keeps the planes out of the R2 churn
+			 * hysteresis and the #1091 resize path.
+			 */
+			xbi.panel_width = xdev->hmd->screens[0].w_pixels;
+			xbi.panel_height = xdev->hmd->screens[0].h_pixels;
 
 			const char *xb_reason = nullptr;
 			const uint64_t xb_t0 = os_monotonic_get_ns();
@@ -3755,6 +3958,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		if (reason == nullptr) {
 			c->split_active = true;
 			c->out_luid = sdesc.AdapterLuid;
+			c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+			c->split_panel_h = xdev->hmd->screens[0].h_pixels;
 			{
 				const char *d = getenv("DXR_XBRIDGE_DIAG");
 				c->split_diag = (d != nullptr && d[0] == '1');
@@ -4107,15 +4312,19 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	/*
-	 * #918 Phase 2a — the masked 2D-over-3D composite unit. Created on the APP
-	 * device whether or not the split is active, which is exactly what the
-	 * renderer used to do with these same shaders and states: this PR only
-	 * makes the device a parameter. Phase 2a-2 flips it to the output device
-	 * once the composite's inputs cross the bridge.
+	 * #918 Phase 2a — the masked 2D-over-3D composite unit, on the OUTPUT device.
+	 *
+	 * The composite's destination is the weave target, which Phase 1 moved to the
+	 * scanout adapter, so the pass has to run there no matter what — that is the
+	 * reframe the whole phase turns on. Every input now arrives on that device:
+	 * the mask rasterizers are constructed there, the Local2D flatten and the
+	 * authored Tier-3 mask cross as bridge planes, and the weave scratch is unit-
+	 * owned. `d3d11_out_device` collapses to the app device when the split is off,
+	 * so the non-split path is byte-identical to PR 2a-1.
 	 *
 	 * Fatal on failure, like the renderer's shader compile it replaces.
 	 */
-	xret = comp_d3d11_outcomp_create(c->device, c->context, &c->outcomp);
+	xret = comp_d3d11_outcomp_create(d3d11_out_device(c), d3d11_out_context(c), &c->outcomp);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create the D3D11 output composite unit");
 		d3d11_compositor_destroy(&c->base.base);
@@ -4284,6 +4493,31 @@ struct comp_d3d11_zone_mask
 	//! authoring from the frame; refreshed by zone_mask_submit).
 	ID3D11Texture2D *staged;
 	ID3D11ShaderResourceView *staged_srv;
+	/*!
+	 * #918 Phase 2a — OUTPUT-DEVICE SHADOW.
+	 *
+	 * Tier-1 (whole) and Tier-2 (rects) authoring are pure CPU-rect ClearView
+	 * rasters — they sample nothing — so under the split they are simply RUN
+	 * AGAIN on the output device and the composite reads the shadow. Nothing
+	 * crosses the bridge for them, which is the single largest simplification in
+	 * this phase. NULL when the split is off.
+	 */
+	ID3D11Texture2D *out_tex;
+	ID3D11RenderTargetView *out_rtv;
+	ID3D11Texture2D *out_staged;
+	ID3D11ShaderResourceView *out_staged_srv;
+	/*!
+	 * Tier 3 is the exception: the APP draws into @ref rtv on the APP device, so
+	 * those pixels genuinely have to cross. Set the first time
+	 * xrAcquireLocal3DZoneMaskRenderTargetDXR hands the RTV out, and never
+	 * cleared — a mask that has ever been app-authored keeps crossing, because a
+	 * later Tier-1/2 fill on the shadow could not reproduce what the app drew.
+	 */
+	bool app_authored;
+	//! #918 Phase 2a: NT share handle of @ref staged + its realloc generation,
+	//! so the bridge's producer can open it as the authored-mask plane source.
+	HANDLE staged_share;
+	uint64_t staged_gen;
 	//! Mask dimensions in client-window pixels.
 	uint32_t w, h;
 	//! True once submitted at least once (an unsubmitted mask is invisible).
@@ -4362,6 +4596,11 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 		c->local2d_scratch->Release();
 		c->local2d_scratch = nullptr;
 	}
+	// #918 Phase 2a — the plane-source share handles.
+	if (c->local2d_scratch_share != nullptr) {
+		CloseHandle(c->local2d_scratch_share);
+		c->local2d_scratch_share = nullptr;
+	}
 	// #491 part 3 — 2D-under backdrop flatten scratch.
 	if (c->backdrop_scratch_rtv != nullptr) {
 		c->backdrop_scratch_rtv->Release();
@@ -4374,6 +4613,27 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 	if (c->backdrop_scratch != nullptr) {
 		c->backdrop_scratch->Release();
 		c->backdrop_scratch = nullptr;
+	}
+	if (c->backdrop_scratch_share != nullptr) {
+		CloseHandle(c->backdrop_scratch_share);
+		c->backdrop_scratch_share = nullptr;
+	}
+	// #918 Phase 2a — the region-sized DP views of the bridge planes.
+	if (c->dp_bd_view_srv != nullptr) {
+		c->dp_bd_view_srv->Release();
+		c->dp_bd_view_srv = nullptr;
+	}
+	if (c->dp_bd_view != nullptr) {
+		c->dp_bd_view->Release();
+		c->dp_bd_view = nullptr;
+	}
+	if (c->dp_mask_view_srv != nullptr) {
+		c->dp_mask_view_srv->Release();
+		c->dp_mask_view_srv = nullptr;
+	}
+	if (c->dp_mask_view != nullptr) {
+		c->dp_mask_view->Release();
+		c->dp_mask_view = nullptr;
 	}
 	if (c->implicit_mask_staged_srv != nullptr) {
 		c->implicit_mask_staged_srv->Release();
@@ -4434,14 +4694,141 @@ d3d11_zone_dp_supported(struct comp_d3d11_compositor *c)
 	return c->zone_dp_state == 1;
 }
 
+/*!
+ * #918 Phase 2a — a REGION-SIZED output-device view of a panel-sized bridge
+ * plane, for the two DP sideband entry points that take dims but no uv scale.
+ *
+ * Reuses one texture per site (the region only changes on a resize). Returns
+ * NULL on any failure, which the callers already treat as "no backdrop" / "skip
+ * the publish" — a degraded feature, never a broken frame.
+ */
+static ID3D11ShaderResourceView *
+d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
+                    ID3D11Texture2D **tex,
+                    ID3D11ShaderResourceView **srv,
+                    void *plane_srv,
+                    uint32_t w,
+                    uint32_t h,
+                    DXGI_FORMAT fmt,
+                    const char *what)
+{
+	auto *psrv = static_cast<ID3D11ShaderResourceView *>(plane_srv);
+	if (psrv == nullptr || w == 0 || h == 0) {
+		return nullptr;
+	}
+	ID3D11Resource *pres = nullptr;
+	psrv->GetResource(&pres);
+	if (pres == nullptr) {
+		return nullptr;
+	}
+
+	bool need_alloc = (*tex == nullptr) || (*srv == nullptr);
+	if (!need_alloc) {
+		D3D11_TEXTURE2D_DESC cur;
+		(*tex)->GetDesc(&cur);
+		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != fmt);
+	}
+	if (need_alloc) {
+		if (*srv != nullptr) {
+			(*srv)->Release();
+			*srv = nullptr;
+		}
+		if (*tex != nullptr) {
+			(*tex)->Release();
+			*tex = nullptr;
+		}
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = fmt;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = d3d11_out_device(c)->CreateTexture2D(&td, nullptr, tex);
+		if (SUCCEEDED(hr) && *tex != nullptr) {
+			hr = d3d11_out_device(c)->CreateShaderResourceView(*tex, nullptr, srv);
+		}
+		if (FAILED(hr) || *srv == nullptr) {
+			U_LOG_W("%s: DP-view alloc (%ux%u) failed 0x%08x — that sideband degrades (#918)", what, w, h,
+			        hr);
+			if (*tex != nullptr) {
+				(*tex)->Release();
+				*tex = nullptr;
+			}
+			pres->Release();
+			return nullptr;
+		}
+	}
+
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	d3d11_out_context(c)->CopySubresourceRegion(*tex, 0, 0, 0, 0, pres, 0, &box);
+	pres->Release();
+	return *srv;
+}
+
+/*!
+ * #918 Phase 2a — the SRV of @p mask ON THE COMPOSITE DEVICE, plus how it got
+ * there (a COMP_D3D11_XBRIDGE_MASK_* kind for the recipe stamp).
+ *
+ * Three cases, and only one of them costs bandwidth:
+ *   - split off → the app-device staged snapshot, verbatim.
+ *   - split on, Tier-1/2 only → the OUTPUT-DEVICE SHADOW. The rasters are pure
+ *     CPU rects, so they were simply run again over there; nothing crossed.
+ *   - split on, ever Tier-3 → the bridge plane for @p slot. The app drew those
+ *     pixels, so they genuinely have to be transported.
+ *
+ * @param slot Egress slot to read a bridged mask from; -1 asks for the published
+ *        weave slot (what the DP sideband publish and a repaint want).
+ */
+static ID3D11ShaderResourceView *
+d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
+                            struct comp_d3d11_zone_mask *mask,
+                            int32_t slot,
+                            uint32_t *out_kind)
+{
+	if (out_kind != nullptr) {
+		*out_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+	}
+	if (mask == nullptr) {
+		if (out_kind != nullptr) {
+			*out_kind = COMP_D3D11_XBRIDGE_MASK_NONE;
+		}
+		return nullptr;
+	}
+	if (!c->split_active) {
+		return mask->staged_srv;
+	}
+	if (!mask->app_authored) {
+		return mask->out_staged_srv;
+	}
+	if (out_kind != nullptr) {
+		*out_kind = COMP_D3D11_XBRIDGE_MASK_PLANE;
+	}
+	if (slot < 0) {
+		slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+	}
+	return static_cast<ID3D11ShaderResourceView *>(
+	    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK));
+}
+
+//! Refresh @p mask's staged snapshot on every device that consumes it.
+static void
+d3d11_zone_mask_stage(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_mask *mask)
+{
+	if (mask == nullptr || mask->staged == nullptr || mask->tex == nullptr) {
+		return;
+	}
+	c->context->CopyResource(mask->staged, mask->tex);
+	if (c->split_active && mask->out_staged != nullptr && mask->out_tex != nullptr) {
+		c->out_ctx->CopyResource(mask->out_staged, mask->out_tex);
+	}
+}
+
 static void
 d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 {
-	// #918 Phase 1: the publish stages an APP-device mask SRV through the
-	// OUTPUT-device DP context — device-crossing, deferred to Phase 2.
-	if (d3d11_split_gate(c, D3D11_SPLIT_GATE_ZONE_MASK_SYNC, "the hardware zone-mask sideband publish")) {
-		return;
-	}
 	if (!d3d11_zone_dp_supported(c)) {
 		return; // legacy DP — global request_display_mode path unchanged.
 	}
@@ -4453,23 +4840,41 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	ID3D11ShaderResourceView *srv = nullptr;
 	uint32_t mask_w = 0;
 	uint32_t mask_h = 0;
+	// #918 Phase 2a: every SRV below is resolved ON THE DP'S DEVICE — the auto
+	// wish / feather rasters are built there in the first place, and an authored
+	// mask resolves to its output-device shadow (Tier 1/2) or its bridge plane
+	// (Tier 3). The publish's contract already took the context and the SRV as
+	// parameters, so there is no vtable change here at all.
+	uint32_t pub_kind = COMP_D3D11_XBRIDGE_MASK_NONE;
 	if (c->zones_frame) {
-		if (c->frame_wish != nullptr && c->frame_wish->staged_srv != nullptr) {
-			srv = c->frame_wish->staged_srv;
+		ID3D11ShaderResourceView *fw_srv =
+		    (c->frame_wish != nullptr) ? d3d11_zone_mask_consume_srv(c, c->frame_wish, -1, &pub_kind) : nullptr;
+		if (fw_srv != nullptr) {
+			srv = fw_srv;
 			mask_w = c->frame_wish->w;
 			mask_h = c->frame_wish->h;
 		} else if (c->wish_mask_staged_srv != nullptr) {
+			pub_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
 			srv = c->wish_mask_staged_srv;
 			mask_w = c->wish_mask_w;
 			mask_h = c->wish_mask_h;
 		}
 	} else {
 		struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
-		if (mask != nullptr && mask->submitted && mask->staged_srv != nullptr) {
-			srv = mask->staged_srv;
+		if (mask != nullptr && mask->submitted) {
+			srv = d3d11_zone_mask_consume_srv(c, mask, -1, &pub_kind);
 			mask_w = mask->w;
 			mask_h = mask->h;
 		}
+	}
+	/*
+	 * #918 Phase 2a: a BRIDGED (Tier-3) mask arrives as a panel-sized plane while
+	 * the publish declares the mask's own dims — and the vtable has no scale. Give
+	 * the DP a region-sized view instead of changing a plug-in ABI for it.
+	 */
+	if (srv != nullptr && pub_kind == COMP_D3D11_XBRIDGE_MASK_PLANE) {
+		srv = d3d11_plane_dp_view(c, &c->dp_mask_view, &c->dp_mask_view_srv, srv, mask_w, mask_h,
+		                          DXGI_FORMAT_R8_UNORM, "zone-mask publish");
 	}
 
 	if (srv == nullptr) {
@@ -4496,8 +4901,8 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	// content evaluation (e.g. the 1×1 any-nonzero check) runs once per
 	// generation instead of once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    c->display_processor, c->context, srv, mask_w, mask_h, (int32_t)origin.x,
-	    (int32_t)origin.y, (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
+	    c->display_processor, d3d11_out_context(c), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y,
+	    (uint32_t)r.right, (uint32_t)r.bottom, c->zone_publish_seq);
 	if (ok) {
 		c->zone_published = true;
 	}
@@ -4512,6 +4917,13 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 // #918: the device is explicit — this scratch is written by the Local2D
 // flatten (app device today) and read by the composite, so which device owns
 // it is a decision, not a detail. Callers pass c->device.
+// #918 Phase 2a: @p share/@p gen are non-NULL when this scratch is a BRIDGE
+// PLANE SOURCE. The texture is then created NT-shareable so the bridge's
+// producer D3D12 device can open it directly (no extra app-device copy per
+// frame), the handle is handed back for that open, and the generation is bumped
+// on every REALLOCATION so the bridge knows to re-open. Under the split these
+// are allocated at the PANEL extent exactly once, so the generation moves during
+// warmup and never again.
 static bool
 d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
                             ID3D11Texture2D **tex,
@@ -4520,7 +4932,9 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
                             uint32_t w,
                             uint32_t h,
                             DXGI_FORMAT fmt,
-                            const char *what)
+                            const char *what,
+                            HANDLE *share = nullptr,
+                            uint64_t *gen = nullptr)
 {
 	bool need_alloc = *tex == nullptr || *rtv == nullptr;
 	if (!need_alloc) {
@@ -4543,6 +4957,10 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
 		(*tex)->Release();
 		*tex = nullptr;
 	}
+	if (share != nullptr && *share != nullptr) {
+		CloseHandle(*share);
+		*share = nullptr;
+	}
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
 	td.Height = h;
@@ -4552,10 +4970,32 @@ d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	if (share != nullptr) {
+		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+	}
 	HRESULT hr = device->CreateTexture2D(&td, nullptr, tex);
 	if (FAILED(hr) || *tex == nullptr) {
 		U_LOG_W("%s: RT scratch alloc (%ux%u fmt=%u) failed: 0x%08x", what, w, h, fmt, hr);
 		return false;
+	}
+	if (share != nullptr) {
+		IDXGIResource1 *dr = nullptr;
+		if (SUCCEEDED((*tex)->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr))) &&
+		    dr != nullptr) {
+			if (FAILED(dr->CreateSharedHandle(
+			        nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, share))) {
+				*share = nullptr;
+			}
+			dr->Release();
+		}
+		if (*share == nullptr) {
+			// Not fatal here: the caller's bind_plane sees a NULL handle and
+			// degrades that ONE plane with its own WARN.
+			U_LOG_W("%s: NT share handle unavailable — this bridge plane will not transport (#918)", what);
+		}
+		if (gen != nullptr) {
+			(*gen)++;
+		}
 	}
 	hr = device->CreateShaderResourceView(*tex, nullptr, srv);
 	if (FAILED(hr) || *srv == nullptr) {
@@ -5099,12 +5539,31 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 		}
 		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 	}
-	d3d11_update_zone_wish_mask(c, c->device, c->context, rects, rect_count, w, h);
+	// #918 Phase 2a: on the OUTPUT device. Every input of this raster is CPU-side
+	// (zone rects, window dims), so it is built where it is consumed — the DP
+	// publish and the MODE_ZONES composite both live on the scanout adapter now —
+	// and the wish never touches the bridge.
+	d3d11_update_zone_wish_mask(c, d3d11_out_device(c), d3d11_out_context(c), rects, rect_count, w, h);
 
 	if (c->frame_wish != nullptr) {
 		struct comp_d3d11_zone_mask *fw = c->frame_wish;
-		if (fw->staged != nullptr && fw->tex != nullptr) {
-			c->context->CopyResource(fw->staged, fw->tex);
+		d3d11_zone_mask_stage(c, fw);
+		/*
+		 * #918 Phase 2a: an EXPLICIT frame wish the app drew itself (Tier 3) is
+		 * the one wish that cannot be reproduced on the output device, so it
+		 * rides the authored-mask plane. On-change only — `author_seq` moves
+		 * exactly when the app re-authors. The publish below reads the plane from
+		 * the LAST published weave slot, so a freshly-authored wish reaches the DP
+		 * one frame later; the publish is a per-frame sideband that republishes
+		 * every frame, so that lag is invisible (and the vendor dedups on
+		 * zone_publish_seq anyway).
+		 */
+		if (c->split_active && fw->app_authored && c->xbridge != nullptr) {
+			if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, fw->staged_share,
+			                                  fw->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM)) {
+				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK,
+				                               fw->author_seq | (1ull << 62), 0, 0, fw->w, fw->h);
+			}
 		}
 		if (c->frame_wish_last != fw || c->frame_wish_last_seq != fw->author_seq) {
 			U_LOG_W("#876 wish seq: EXPLICIT bump (fw %p->%p author_seq %llu->%llu)",
@@ -5116,6 +5575,15 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 			c->frame_wish_last_seq = fw->author_seq;
 		}
 		return;
+	}
+
+	// #918 Phase 2a: no explicit wish this frame, so the authored-mask plane
+	// carries nothing — un-stage it rather than let an earlier explicit wish's
+	// pixels keep riding along and stamping themselves valid in the recipe.
+	// (Only reachable on a zones frame; the sticky legacy mask's use of the same
+	// plane happens on frames this function is not called for.)
+	if (c->split_active && c->xbridge != nullptr) {
+		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 	}
 
 	// Source flip explicit -> auto: even an unchanged auto raster is new
@@ -5203,6 +5671,172 @@ d3d11_flatten_one_local2d_layer(struct comp_d3d11_compositor *c,
 	                                     (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h, unpremult);
 }
 
+/*!
+ * #918 Phase 2a — clamp a composite region to the PANEL under the split.
+ *
+ * The plane scratches and their egress textures are panel-sized once, and the
+ * header's claim that "a window can never exceed the panel" is an assumption
+ * about the window manager, not something the code enforces. If it were ever
+ * false the flatten would be clipped while the uv scale stayed 1.0 and the
+ * clipped content would be stretched across the region — silently. Clamp, and
+ * say so once.
+ */
+static void
+d3d11_clamp_region_to_panel(struct comp_d3d11_compositor *c, uint32_t *w, uint32_t *h)
+{
+	if (!c->split_active || c->split_panel_w == 0 || c->split_panel_h == 0) {
+		return;
+	}
+	if (*w <= c->split_panel_w && *h <= c->split_panel_h) {
+		return;
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W(
+		    "D3D11 output-device split: composite region %ux%u exceeds the panel %ux%u — clamping; "
+		    "the bridge planes are panel-sized by construction (#918 Phase 2a)",
+		    *w, *h, c->split_panel_w, c->split_panel_h);
+	}
+	if (*w > c->split_panel_w) {
+		*w = c->split_panel_w;
+	}
+	if (*h > c->split_panel_h) {
+		*h = c->split_panel_h;
+	}
+}
+
+/*!
+ * #918 Phase 2a — clear the flatten scratch's REGION, not the whole texture.
+ *
+ * Under the split the scratch is panel-sized (so the bridge plane never resizes)
+ * while the content is window-sized, and a full-surface clear would write the
+ * whole panel every frame — 33 MB at 4K, on the app device, for nothing. Outside
+ * the region nothing is ever sampled, so clearing the region is not an
+ * approximation: it is the same set of authoritative pixels the region-sized
+ * scratch used to hold.
+ */
+static void
+d3d11_clear_scratch_region(struct comp_d3d11_compositor *c,
+                           ID3D11RenderTargetView *rtv,
+                           uint32_t region_w,
+                           uint32_t region_h)
+{
+	// Where a pixel is M=0 (2D) but no layer covers it, twod stays (0,0,0,0) →
+	// final.a → 0 → the desktop shows through (Q2, §4.2 output-alpha rule).
+	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	ID3D11DeviceContext1 *ctx1 = nullptr;
+	if (SUCCEEDED(c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1))) &&
+	    ctx1 != nullptr) {
+		D3D11_RECT dr = {0, 0, (LONG)region_w, (LONG)region_h};
+		ctx1->ClearView(rtv, transparent, &dr, 1);
+		ctx1->Release();
+		return;
+	}
+	c->context->ClearRenderTargetView(rtv, transparent);
+}
+
+/*!
+ * #918 Phase 2a — CHANGE-SKIP key and DIRTY BOX for a Local2D flatten.
+ *
+ * The hash covers everything that can change the flattened pixels without
+ * changing the rect: the swapchain a layer draws from, the image index inside
+ * it, the source sub-rect, the flip and the blend flags. The image index is what
+ * makes this safe rather than optimistic — `d3d11_swapchain_acquire_image` hands
+ * out indices round-robin, so an app that redraws hashes differently every frame
+ * and an app that stops acquiring keeps the index (and genuinely has not
+ * changed). An app that redraws into ONE image without re-acquiring would defeat
+ * it, which OpenXR's acquire/wait/release cycle does not permit.
+ *
+ * @param over true for the OVER layers (the composite's `twod`), false for the
+ *        2D-under backdrop.
+ */
+static void
+d3d11_local2d_digest(struct comp_d3d11_compositor *c,
+                     int32_t proj_idx,
+                     bool over,
+                     uint32_t region_w,
+                     uint32_t region_h,
+                     struct xrt_rect *out_box,
+                     uint64_t *out_hash)
+{
+	uint64_t h = 1469598103934665603ull; // FNV-1a offset basis
+	auto mix = [&h](const void *p, size_t n) {
+		const uint8_t *b = static_cast<const uint8_t *>(p);
+		for (size_t i = 0; i < n; i++) {
+			h ^= b[i];
+			h *= 1099511628211ull;
+		}
+	};
+	mix(&region_w, sizeof(region_w));
+	mix(&region_h, sizeof(region_h));
+
+	int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		const bool is_under = (proj_idx >= 0 && (int32_t)i < proj_idx);
+		if (is_under == over) {
+			continue;
+		}
+		mix(&i, sizeof(i));
+		void *sc = layer->sc_array[0];
+		mix(&sc, sizeof(sc));
+		mix(&layer->data.local_2d.sub.image_index, sizeof(layer->data.local_2d.sub.image_index));
+		mix(&layer->data.local_2d.sub.rect, sizeof(layer->data.local_2d.sub.rect));
+		mix(&layer->data.local_2d.sub.norm_rect, sizeof(layer->data.local_2d.sub.norm_rect));
+		mix(&layer->data.local_2d.rect, sizeof(layer->data.local_2d.rect));
+		mix(&layer->data.flip_y, sizeof(layer->data.flip_y));
+		mix(&layer->data.flags, sizeof(layer->data.flags));
+
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		if (dr->extent.w <= 0 || dr->extent.h <= 0) {
+			continue;
+		}
+		if (dr->offset.w < x0) {
+			x0 = dr->offset.w;
+		}
+		if (dr->offset.h < y0) {
+			y0 = dr->offset.h;
+		}
+		if (dr->offset.w + dr->extent.w > x1) {
+			x1 = dr->offset.w + dr->extent.w;
+		}
+		if (dr->offset.h + dr->extent.h > y1) {
+			y1 = dr->offset.h + dr->extent.h;
+		}
+	}
+
+	if (x1 <= x0 || y1 <= y0) {
+		// No layers on this side: the plane is a cleared region, and the clear
+		// itself is what has to reach the other adapter.
+		x0 = 0;
+		y0 = 0;
+		x1 = (int32_t)region_w;
+		y1 = (int32_t)region_h;
+	}
+	if (x0 < 0) {
+		x0 = 0;
+	}
+	if (y0 < 0) {
+		y0 = 0;
+	}
+	if (x1 > (int32_t)region_w) {
+		x1 = (int32_t)region_w;
+	}
+	if (y1 > (int32_t)region_h) {
+		y1 = (int32_t)region_h;
+	}
+	out_box->offset.w = x0;
+	out_box->offset.h = y0;
+	out_box->extent.w = (x1 > x0) ? (x1 - x0) : 0;
+	out_box->extent.h = (y1 > y0) ? (y1 - y0) : 0;
+	// 0 is reserved for "the frame does not use this plane".
+	*out_hash = (h != 0) ? h : 1ull;
+}
+
 // #439 Phase 3 — flatten this frame's OVER Local2D layers into local2d_scratch
 // (the `twod` source the masked composite reads). Under-layers (#491 part 3,
 // before the projection in list order) are the DP backdrop and are skipped here.
@@ -5210,11 +5844,7 @@ d3d11_flatten_one_local2d_layer(struct comp_d3d11_compositor *c,
 static bool
 d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
-	// Clear transparent once. Where a pixel is M=0 (2D) but no layer covers
-	// it, twod stays (0,0,0,0) → final.a → 0 → the desktop shows through (Q2,
-	// §4.2 output-alpha rule).
-	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(c->local2d_scratch_rtv, transparent);
+	d3d11_clear_scratch_region(c, c->local2d_scratch_rtv, region_w, region_h);
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -5288,16 +5918,26 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	if (region_w == 0 || region_h == 0) {
 		return nullptr;
 	}
+	d3d11_clamp_region_to_panel(c, &region_w, &region_h);
 
-	// Premultiplied RGBA, UNORM (sRGB-passthrough) like local2d_scratch.
+	/*
+	 * Premultiplied RGBA, UNORM (sRGB-passthrough) like local2d_scratch.
+	 *
+	 * #918 Phase 2a: under the split this is a BRIDGE PLANE SOURCE — panel-sized
+	 * once (so it never enters the R2 churn path) and NT-shareable (so the
+	 * producer opens it directly, with no extra app-device copy per frame).
+	 */
+	const bool split = c->split_active;
+	const uint32_t alloc_w = split ? c->split_panel_w : region_w;
+	const uint32_t alloc_h = split ? c->split_panel_h : region_h;
 	if (!d3d11_ensure_rt_srv_scratch(c->device, &c->backdrop_scratch, &c->backdrop_scratch_srv,
-	                                 &c->backdrop_scratch_rtv, region_w, region_h, DXGI_FORMAT_R8G8B8A8_UNORM,
-	                                 "backdrop scratch")) {
+	                                 &c->backdrop_scratch_rtv, alloc_w, alloc_h, DXGI_FORMAT_R8G8B8A8_UNORM,
+	                                 "backdrop scratch", split ? &c->backdrop_scratch_share : nullptr,
+	                                 split ? &c->backdrop_scratch_gen : nullptr)) {
 		return nullptr;
 	}
 
-	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(c->backdrop_scratch_rtv, transparent);
+	d3d11_clear_scratch_region(c, c->backdrop_scratch_rtv, region_w, region_h);
 
 	for (int32_t i = 0; i < proj_idx; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -5315,6 +5955,26 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 		logged = true;
 		U_LOG_W("D3D11 #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)",
 		        region_w, region_h);
+	}
+
+	/*
+	 * #918 Phase 2a — stage the backdrop as a bridge plane. The SRV returned here
+	 * is the APP-device one; under the split the caller never hands THAT to the
+	 * DP (it lives on the wrong adapter) — it hands the egress plane SRV of the
+	 * slot it wove. Returning it anyway keeps the non-split path byte-identical
+	 * and gives the caller its dims.
+	 */
+	if (split && c->xbridge != nullptr) {
+		struct xrt_rect box = {};
+		uint64_t hash = 0;
+		d3d11_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
+		if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP,
+		                                  c->backdrop_scratch_share, c->backdrop_scratch_gen,
+		                                  (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM)) {
+			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP, hash,
+			                               box.offset.w, box.offset.h, (uint32_t)box.extent.w,
+			                               (uint32_t)box.extent.h);
+		}
 	}
 
 	*out_w = region_w;
@@ -5340,7 +6000,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
                           ID3D11Texture2D *dst,
                           uint32_t dst_w,
                           uint32_t dst_h,
-                          const struct u_canvas_rect *eff_canvas)
+                          const struct u_canvas_rect *eff_canvas,
+                          int32_t slot)
 {
 	// #439 Phase 3: run when EITHER an explicit submitted mask exists OR this
 	// frame carries Local2D layers (the layers supply the 2D pixels + an
@@ -5349,22 +6010,42 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// MODE_ZONES pass gates the weave by the binary zone raster — pixels
 	// outside every zone go to the 2D flatten / transparent even with zero
 	// Local2D layers); the sticky mask + implicit-mask rules are inert.
-	// #918 Phase 1: every input of this pass (the mask raster, the Local2D
-	// flatten, the weave scratch) is allocated on the APP device while `dst` is
-	// now the OUTPUT device's back buffer. Device-crossing by construction —
-	// gated off under the split, so a plain projection weave still runs.
-	if (d3d11_split_gate(c, D3D11_SPLIT_GATE_ZONE_COMPOSITE, "the zones / Local2D / authored-mask composite")) {
-		return false;
-	}
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
-	if (is_repaint && c->repaint.mask_srv == nullptr) {
+
+	/*
+	 * #918 Phase 2a — the DEPOSIT / CONSUME seam is also the DEVICE seam.
+	 *
+	 * The deposit half (prepare_only) reads app-owned resources — the Local2D
+	 * swapchain images — and stays on the app device, unchanged. The consume half
+	 * writes `dst`, which the split moved to the scanout adapter, so it runs on
+	 * the OUTPUT device against the plane pixels that crossed with this slot's
+	 * atlas, and it reads its PARAMETERS from the slot's recipe stamp rather than
+	 * from live CPU state. That is the Phase-1 offset-cube defect class closed one
+	 * level down: the atlas generation stops a slot being woven under the wrong
+	 * mode, this stops its pixels being composited under the wrong recipe.
+	 */
+	const bool split_consume = c->split_active && !prepare_only;
+	struct comp_d3d11_xbridge_recipe rec = {};
+	if (split_consume) {
+		if (slot < 0 || !comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &rec)) {
+			c->repaint.composite_bail = 2;
+			return false;
+		}
+		if (!rec.composite) {
+			// A projection-only frame filled this slot — nothing to composite,
+			// and that is the correct answer, not a bail.
+			c->repaint.composite_bail = 0;
+			return false;
+		}
+	}
+	if (is_repaint && !split_consume && c->repaint.mask_srv == nullptr) {
 		c->repaint.composite_bail = 1;
 		return false;
 	}
-	if ((!is_repaint && !zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
+	if ((!is_repaint && !split_consume && !zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
 	    c->renderer == nullptr || c->outcomp == nullptr) {
 		c->repaint.composite_bail = 2;
 		return false;
@@ -5380,6 +6061,35 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
 			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
 			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+		}
+	}
+	d3d11_clamp_region_to_panel(c, &region_w, &region_h);
+	if (split_consume) {
+		/*
+		 * The recipe's region is the one the plane pixels were flattened at. It
+		 * lags the window by at most the one frame the bridge always costs — the
+		 * same lag the R2 hysteresis already accepts for the atlas — and using it
+		 * is what keeps every input sampled at the scale it was drawn at.
+		 *
+		 * A region LAG is deliberately not a refusal. The uv scales are derived
+		 * per input from that input's own extent, so an out-device mask rasterized
+		 * at the live region and a plane flattened at the slot's region are BOTH
+		 * addressed by window pixel and both come out geometrically right; only
+		 * the 2D content's scale trails by a frame, exactly as the 3D content's
+		 * does. Refusing here instead would drop the 2D band on every frame of a
+		 * resize drag, which is strictly worse and buys no correctness.
+		 */
+		region_w = rec.region_w;
+		region_h = rec.region_h;
+		if (region_w > dst_w) {
+			region_w = dst_w;
+		}
+		if (region_h > dst_h) {
+			region_h = dst_h;
+		}
+		if (region_w == 0 || region_h == 0) {
+			c->repaint.composite_bail = 2;
+			return false;
 		}
 	}
 
@@ -5410,7 +6120,29 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// mask from the OVER Local2D layer rects (Q3 — M=0 inside the rect
 	// union, M=1 elsewhere).
 	ID3D11ShaderResourceView *mask_srv = nullptr;
-	if (is_repaint) {
+	uint32_t mask_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+	if (split_consume) {
+		/*
+		 * #918 Phase 2a — the consume half never re-derives the mask; it takes
+		 * the KIND from the slot. A bridged (Tier-3, app-drawn) mask reads the
+		 * plane that landed with this slot's atlas; every other kind is an
+		 * output-device raster the compositor owns. That raster is region-sized
+		 * and may have been re-rastered at a NEWER region than this slot's, which
+		 * is harmless: the composite addresses every input by window pixel through
+		 * a uv scale derived from that input's own extent, so the sub-rect sampled
+		 * is the right one either way.
+		 */
+		if (rec.mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE) {
+			if ((rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_MASK)) == 0) {
+				c->repaint.composite_bail = 3;
+				return false;
+			}
+			mask_srv = static_cast<ID3D11ShaderResourceView *>(
+			    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK));
+		} else {
+			mask_srv = c->repaint.mask_srv;
+		}
+	} else if (is_repaint) {
 		// #868: a repaint replays RENDERING, never STATE TRANSITIONS.
 		// d3d11_update_implicit_mask() rasters and republishes; the zones
 		// branch reads a wish staged once per app frame by
@@ -5437,13 +6169,33 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		}
 		if (any_feather) {
 			ID3D11ShaderResourceView *fsrv = d3d11_update_zone_feather_mask(
-			    c, c->device, c->context, zrects, zfeather, zcount, region_w, region_h);
+			    c, d3d11_out_device(c), d3d11_out_context(c), zrects, zfeather, zcount, region_w, region_h);
 			if (fsrv != nullptr) {
 				mask_srv = fsrv;
 			} // raster failure: binary fallback — hard edges, never a lost frame
 		}
 	} else if (have_explicit) {
-		mask_srv = mask->staged_srv;
+		// #918 Phase 2a: the shadow (Tier 1/2) or the bridge plane (Tier 3).
+		mask_srv = d3d11_zone_mask_consume_srv(c, mask, slot, &mask_kind);
+		if (mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE && c->split_active) {
+			/*
+			 * The app drew these pixels on the app device, so they have to
+			 * cross. On-change only: `author_seq` moves on every authoring call
+			 * and on submit, so a mask that is drawn once and reused costs one
+			 * R8 transport for the whole session.
+			 */
+			if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, mask->staged_share,
+			                                  mask->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM)) {
+				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK,
+				                               mask->author_seq | (1ull << 63), 0, 0, mask->w, mask->h);
+			} else {
+				// Transport unavailable (no share handle, or the stack refused
+				// an R8 cross-adapter heap). Fall back to the shadow: Tier-1/2
+				// content still composites, the Tier-3 strokes do not.
+				mask_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+				mask_srv = mask->out_staged_srv;
+			}
+		}
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
@@ -5456,29 +6208,44 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			}
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
-		mask_srv = d3d11_update_implicit_mask(c, c->device, c->context, rects, rect_count, region_w, region_h);
+		// #918 Phase 2a: rasterized on the OUTPUT device — pure CPU rects in,
+		// so it is built where the composite consumes it and never transported.
+		mask_srv = d3d11_update_implicit_mask(c, d3d11_out_device(c), d3d11_out_context(c), rects, rect_count,
+		                                      region_w, region_h);
 	}
 	if (mask_srv == nullptr) {
 		c->repaint.composite_bail = 3;
 		return false;
 	}
-	if (!is_repaint) {
+	if (!is_repaint && !split_consume) {
 		c->repaint.mask_srv = mask_srv;
 	}
 
+
 	// Resolve the `twod` source + a window-sized weave snapshot scratch.
 	ID3D11ShaderResourceView *twod_srv = nullptr;
-	if (zones_frame || have_local_2d || have_explicit) {
+	if (zones_frame || have_local_2d || have_explicit || split_consume) {
 		// #439 Phase 3: flatten the Local2D layers into a runtime-owned RT
 		// scratch. The flatten write, the weave snapshot, and the lerp all
 		// operate on plain UNORM bytes (sRGB-passthrough), so both scratches
 		// use the UNORM sibling of the dst format — no implicit gamma.
 		DXGI_FORMAT unorm_fmt = d3d_dxgi_format_srgb_to_unorm(dd.Format);
-		if (!d3d11_ensure_rt_srv_scratch(c->device, &c->local2d_scratch, &c->local2d_scratch_srv,
-		                                 &c->local2d_scratch_rtv, region_w, region_h, unorm_fmt,
-		                                 "local2d scratch")) {
-			c->repaint.composite_bail = 4;
-			return false;
+		if (!split_consume) {
+			/*
+			 * #918 Phase 2a: under the split this scratch is a BRIDGE PLANE
+			 * SOURCE — panel-sized once (outside the R2 churn path and #1091)
+			 * and NT-shareable so the producer opens it directly.
+			 */
+			const uint32_t alloc_w = c->split_active ? c->split_panel_w : region_w;
+			const uint32_t alloc_h = c->split_active ? c->split_panel_h : region_h;
+			if (!d3d11_ensure_rt_srv_scratch(c->device, &c->local2d_scratch, &c->local2d_scratch_srv,
+			                                 &c->local2d_scratch_rtv, alloc_w, alloc_h, unorm_fmt,
+			                                 "local2d scratch",
+			                                 c->split_active ? &c->local2d_scratch_share : nullptr,
+			                                 c->split_active ? &c->local2d_scratch_gen : nullptr)) {
+				c->repaint.composite_bail = 4;
+				return false;
+			}
 		}
 		if (!comp_d3d11_outcomp_ensure_weave_scratch(c->outcomp, region_w, region_h, (uint32_t)unorm_fmt)) {
 			c->repaint.composite_bail = 5;
@@ -5500,7 +6267,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		 * differed between an app weave and its repaint, alternating on screen
 		 * as a flicker confined to semi-transparent content.
 		 */
-		if (!is_repaint) {
+		if (!is_repaint && !split_consume) {
 			if (!d3d11_flatten_local_2d_layers(c, region_w, region_h,
 			                                   zones_frame ? -1 : proj_idx)) {
 				return false;
@@ -5516,8 +6283,50 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		 * descriptor but never writes the target. (On the D3D12 leg, stubbing
 		 * the descriptor out instead requested DXGI_FORMAT_UNKNOWN and silently
 		 * swallowed the 2D.)
+		 *
+		 * #918 Phase 2a: this is ALSO the device seam. Everything above ran on
+		 * the app device; everything below runs on the output device, reading the
+		 * plane pixels the bridge landed beside this slot's atlas.
 		 */
 		if (prepare_only) {
+			if (c->split_active && c->xbridge != nullptr) {
+				struct xrt_rect box = {};
+				uint64_t hash = 0;
+				d3d11_local2d_digest(c, zones_frame ? -1 : proj_idx, /*over=*/true, region_w, region_h,
+				                     &box, &hash);
+				if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
+				                                  c->local2d_scratch_share, c->local2d_scratch_gen,
+				                                  (uint32_t)unorm_fmt)) {
+					comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
+					                               hash, box.offset.w, box.offset.h,
+					                               (uint32_t)box.extent.w, (uint32_t)box.extent.h);
+				}
+
+				// Stamp the recipe this frame's slot will carry.
+				struct comp_d3d11_xbridge_recipe r = {};
+				r.composite = true;
+				r.mask_kind = mask_kind;
+				r.region_w = region_w;
+				r.region_h = region_h;
+				if (zones_frame) {
+					r.composite_mode = COMP_D3D11_COMPOSITE_MODE_ZONES;
+				} else if (have_explicit) {
+					r.composite_mode = COMP_D3D11_COMPOSITE_MODE_LERP;
+				} else {
+					r.composite_mode = COMP_D3D11_COMPOSITE_MODE_ALPHA_OVER;
+				}
+				r.opaque_present =
+				    c->transparent_background && debug_get_bool_option_present_opaque_comp();
+				r.cx = eff_canvas->valid ? eff_canvas->x : 0;
+				r.cy = eff_canvas->valid ? eff_canvas->y : 0;
+				r.cw = eff_canvas->valid ? eff_canvas->w : region_w;
+				r.ch = eff_canvas->valid ? eff_canvas->h : region_h;
+				// The backdrop's OWN extent — the DP declares it separately from
+				// the composite region, and the two can legitimately differ.
+				r.bd_w = c->repaint.backdrop_w;
+				r.bd_h = c->repaint.backdrop_h;
+				comp_d3d11_xbridge_stage_recipe(c->xbridge, &r);
+			}
 			c->repaint.composite_bail = 0; // deposit half completed
 			return true;
 		}
@@ -5525,6 +6334,24 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		// Unreachable: the early-out gate already returns false unless one of
 		// zones_frame / have_local_2d / have_explicit is set. Defensive only.
 		return false;
+	}
+
+	/*
+	 * #918 Phase 2a: under the split `twod` is the LOCAL2D PLANE that landed with
+	 * this slot — the app-device scratch above lives on the wrong adapter and is
+	 * never what the composite samples here.
+	 */
+	if (split_consume) {
+		if ((rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_LOCAL2D)) == 0) {
+			c->repaint.composite_bail = 4;
+			return false;
+		}
+		twod_srv = static_cast<ID3D11ShaderResourceView *>(
+		    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D));
+		if (twod_srv == nullptr) {
+			c->repaint.composite_bail = 4;
+			return false;
+		}
 	}
 
 	// Snapshot the window region of the weave (the DP wrote dst; RT≠SRV, so
@@ -5536,10 +6363,12 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// Effective canvas rect clamped to the window region (the shader ignores
 	// it on the mask path; kept coherent for the CB anyway). #439 Phase 2:
 	// this is the window rect while the mask is active.
-	int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
-	int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
-	uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
-	uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
+	// #918 Phase 2a: under the split these come FROM THE SLOT, not from live CPU
+	// state — see split_consume above.
+	int32_t cx = split_consume ? rec.cx : (eff_canvas->valid ? eff_canvas->x : 0);
+	int32_t cy = split_consume ? rec.cy : (eff_canvas->valid ? eff_canvas->y : 0);
+	uint32_t cw = split_consume ? rec.cw : (eff_canvas->valid ? eff_canvas->w : region_w);
+	uint32_t ch = split_consume ? rec.ch : (eff_canvas->valid ? eff_canvas->h : region_h);
 	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
 	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
 	if (cx_u > region_w)
@@ -5571,7 +6400,39 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// blends, so the composite flattens against the weave (which the DP's
 	// flattened gate already completed against the captured desktop) and
 	// emits α=1. Opaque sessions keep today's behavior even with the env set.
-	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+	bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+
+	if (split_consume) {
+		/*
+		 * #918 Phase 2a — the RECIPE REFUSAL, and the counter that proves it
+		 * never has to fire.
+		 *
+		 * A slot composited under one blend recipe must never be finished under
+		 * another. In practice a recipe change (zones on/off, 2D<->3D, a mask
+		 * appearing) also changes the tile grid, so `eg_gen` refuses the slot one
+		 * level up and this is unreachable — that is the DESIGN, and this test is
+		 * what turns "should be unreachable" into a number in the log. Refusing
+		 * costs the 2D band for one frame; compositing under the wrong recipe
+		 * would put visibly wrong pixels on the panel.
+		 */
+		if (rec.composite_mode != composite_mode || rec.opaque_present != opaque_present) {
+			c->split_recipe_refusals++;
+			if (c->split_recipe_logged_gen != c->split_layout_gen) {
+				c->split_recipe_logged_gen = c->split_layout_gen;
+				U_LOG_W(
+				    "#918 Phase 2a: refused the composite on egress slot %d — its recipe "
+				    "(mode=%u opaque=%d) is not the one this frame runs (mode=%u opaque=%d). "
+				    "The weave still went out; only the 2D band is held for this frame. "
+				    "(total %llu)",
+				    (int)slot, rec.composite_mode, (int)rec.opaque_present, composite_mode,
+				    (int)opaque_present, (unsigned long long)c->split_recipe_refusals);
+			}
+			c->repaint.composite_bail = 7;
+			return false;
+		}
+		composite_mode = rec.composite_mode;
+		opaque_present = rec.opaque_present;
+	}
 	xrt_result_t xret = comp_d3d11_outcomp_composite_2d_masked(
 	    c->outcomp, dst, twod_srv, mask_srv, weave_srv, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u,
 	    cright - cx_u, cbottom - cy_u, composite_mode, opaque_present);
@@ -5593,13 +6454,23 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 }
 
 // #918: the authored-mask resource set, allocated on an EXPLICIT device.
-// A Tier-3 mask is drawn by the APP through the returned RTV, so this one is
+// A Tier-3 mask is drawn by the APP through the returned RTV, so that one is
 // pinned to the app device — but naming the device at the call site is what
 // makes that a stated rule instead of an accident of which struct member was
 // in scope. Callers pass c->device / c->context.
+//
+// #918 Phase 2a: @p out_device/@p out_context non-NULL (i.e. the split is on)
+// additionally allocate the OUTPUT-DEVICE SHADOW that Tier-1/2 authoring
+// mirrors onto, and make the app-side staged texture NT-shareable so a Tier-3
+// mask can ride the bridge as a plane.
 static xrt_result_t
-d3d11_zone_mask_alloc(
-    ID3D11Device *device, ID3D11DeviceContext *context, uint32_t w, uint32_t h, struct comp_d3d11_zone_mask **out_mask)
+d3d11_zone_mask_alloc(ID3D11Device *device,
+                      ID3D11DeviceContext *context,
+                      ID3D11Device *out_device,
+                      ID3D11DeviceContext *out_context,
+                      uint32_t w,
+                      uint32_t h,
+                      struct comp_d3d11_zone_mask **out_mask)
 {
 	struct comp_d3d11_zone_mask *mask = U_TYPED_CALLOC(struct comp_d3d11_zone_mask);
 	if (mask == nullptr) {
@@ -5607,6 +6478,7 @@ d3d11_zone_mask_alloc(
 	}
 	mask->w = w;
 	mask->h = h;
+	const bool split = out_device != nullptr && out_device != device;
 
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
@@ -5623,7 +6495,11 @@ d3d11_zone_mask_alloc(
 	}
 	if (SUCCEEDED(hr) && mask->rtv != nullptr) {
 		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		if (split) {
+			td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+		}
 		hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
+		td.MiscFlags = 0;
 	}
 	if (SUCCEEDED(hr) && mask->staged != nullptr) {
 		hr = device->CreateShaderResourceView(mask->staged, nullptr, &mask->staged_srv);
@@ -5649,30 +6525,96 @@ d3d11_zone_mask_alloc(
 	context->ClearRenderTargetView(mask->rtv, all_3d);
 	context->CopyResource(mask->staged, mask->tex);
 
+	if (split) {
+		// Plane source handle. A failure here only costs the TIER-3 path (the
+		// shadow below still serves Tier 1/2), so it is a WARN, not an error.
+		IDXGIResource1 *dr = nullptr;
+		if (SUCCEEDED(mask->staged->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr))) &&
+		    dr != nullptr) {
+			if (FAILED(dr->CreateSharedHandle(nullptr,
+			                                  DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                                  nullptr, &mask->staged_share))) {
+				mask->staged_share = nullptr;
+			}
+			dr->Release();
+		}
+		/*
+		 * #918 Phase 2a: the generation must be unique ACROSS mask objects, not
+		 * just across reallocations of one. The bridge re-opens a plane's source
+		 * only when the generation changes, and a session can hand the single
+		 * authored-mask plane two different mask objects (the sticky composite
+		 * mask on a legacy frame, the explicit frame wish on a zones frame) — two
+		 * masks both numbered 1 would leave the producer reading the first one's
+		 * texture for the second one's pixels.
+		 */
+		static uint64_t s_zone_mask_gen = 0;
+		mask->staged_gen = ++s_zone_mask_gen;
+		if (mask->staged_share == nullptr) {
+			U_LOG_W(
+			    "zone_mask_create: no NT share handle for the authored mask — Tier-3 (app-drawn) "
+			    "masks will not cross the output-device split this session (#918 Phase 2a)");
+		}
+
+		// The output-device shadow Tier-1/2 authoring mirrors onto.
+		td.BindFlags = D3D11_BIND_RENDER_TARGET;
+		hr = out_device->CreateTexture2D(&td, nullptr, &mask->out_tex);
+		if (SUCCEEDED(hr) && mask->out_tex != nullptr) {
+			hr = out_device->CreateRenderTargetView(mask->out_tex, nullptr, &mask->out_rtv);
+		}
+		if (SUCCEEDED(hr) && mask->out_rtv != nullptr) {
+			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			hr = out_device->CreateTexture2D(&td, nullptr, &mask->out_staged);
+		}
+		if (SUCCEEDED(hr) && mask->out_staged != nullptr) {
+			hr = out_device->CreateShaderResourceView(mask->out_staged, nullptr, &mask->out_staged_srv);
+		}
+		if (FAILED(hr) || mask->out_staged_srv == nullptr) {
+			U_LOG_W(
+			    "zone_mask_create: output-device shadow failed 0x%08x — Tier-1/2 masks degrade "
+			    "under the split (#918 Phase 2a)",
+			    hr);
+		} else {
+			out_context->ClearRenderTargetView(mask->out_rtv, all_3d);
+			out_context->CopyResource(mask->out_staged, mask->out_tex);
+		}
+	}
+
 	*out_mask = mask;
 	return XRT_SUCCESS;
 }
 
 // #918 — Tier-1 authoring (whole mask 3D or 2D) on an EXPLICIT context.
+// Phase 2a: mirrored onto the output-device shadow when one exists. The raster
+// samples nothing, so running it twice is exact — not an approximation of a
+// transport.
 static void
-d3d11_zone_mask_fill_whole(ID3D11DeviceContext *context, struct comp_d3d11_zone_mask *mask, bool enable_3d)
+d3d11_zone_mask_fill_whole(ID3D11DeviceContext *context,
+                           ID3D11DeviceContext *out_context,
+                           struct comp_d3d11_zone_mask *mask,
+                           bool enable_3d)
 {
 	const float m[4] = {enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
 	context->ClearRenderTargetView(mask->rtv, m);
+	if (out_context != nullptr && mask->out_rtv != nullptr) {
+		out_context->ClearRenderTargetView(mask->out_rtv, m);
+	}
 	mask->author_seq++;
 }
 
 // #918 — Tier-2 authoring (M=1 inside each rect) on an EXPLICIT context. The
-// fourth mask rasterizer; like the other three its inputs are pure CPU rects.
+// fourth mask rasterizer; like the other three its inputs are pure CPU rects,
+// which is exactly why Phase 2a can mirror it onto the output device instead of
+// transporting its result.
 static xrt_result_t
-d3d11_zone_mask_fill_rects(ID3D11DeviceContext *context,
-                           struct comp_d3d11_zone_mask *mask,
-                           uint32_t count,
-                           const struct xrt_rect *rects)
+d3d11_zone_mask_fill_rects_one(ID3D11DeviceContext *context,
+                               ID3D11RenderTargetView *rtv,
+                               struct comp_d3d11_zone_mask *mask,
+                               uint32_t count,
+                               const struct xrt_rect *rects)
 {
 	// M=0 everywhere, then M=1 inside each rect (client-window px, clamped).
 	const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	context->ClearRenderTargetView(mask->rtv, all_2d);
+	context->ClearRenderTargetView(rtv, all_2d);
 
 	// ID3D11DeviceContext1::ClearView with rects — D3D11.1, present on every
 	// Win10/11 driver this runtime targets.
@@ -5706,11 +6648,27 @@ d3d11_zone_mask_fill_rects(ID3D11DeviceContext *context,
 			continue;
 		}
 		D3D11_RECT dr = {left, top, right, bottom};
-		ctx1->ClearView(mask->rtv, all_3d, &dr, 1);
+		ctx1->ClearView(rtv, all_3d, &dr, 1);
 	}
 	ctx1->Release();
-	mask->author_seq++;
 	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+d3d11_zone_mask_fill_rects(ID3D11DeviceContext *context,
+                           ID3D11DeviceContext *out_context,
+                           struct comp_d3d11_zone_mask *mask,
+                           uint32_t count,
+                           const struct xrt_rect *rects)
+{
+	xrt_result_t xret = d3d11_zone_mask_fill_rects_one(context, mask->rtv, mask, count, rects);
+	if (xret == XRT_SUCCESS && out_context != nullptr && mask->out_rtv != nullptr) {
+		xret = d3d11_zone_mask_fill_rects_one(out_context, mask->out_rtv, mask, count, rects);
+	}
+	if (xret == XRT_SUCCESS) {
+		mask->author_seq++;
+	}
+	return xret;
 }
 
 extern "C" xrt_result_t
@@ -5746,7 +6704,8 @@ comp_d3d11_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 	}
 
 	struct comp_d3d11_zone_mask *mask = nullptr;
-	xrt_result_t xret = d3d11_zone_mask_alloc(c->device, c->context, w, h, &mask);
+	xrt_result_t xret = d3d11_zone_mask_alloc(c->device, c->context, c->split_active ? c->out_dev : nullptr,
+	                                          c->split_active ? c->out_ctx : nullptr, w, h, &mask);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -5769,7 +6728,7 @@ comp_d3d11_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	d3d11_zone_mask_fill_whole(c->context, mask, enable_3d);
+	d3d11_zone_mask_fill_whole(c->context, c->split_active ? c->out_ctx : nullptr, mask, enable_3d);
 	return XRT_SUCCESS;
 }
 
@@ -5787,7 +6746,7 @@ comp_d3d11_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	return d3d11_zone_mask_fill_rects(c->context, mask, count, rects);
+	return d3d11_zone_mask_fill_rects(c->context, c->split_active ? c->out_ctx : nullptr, mask, count, rects);
 }
 
 extern "C" xrt_result_t
@@ -5812,6 +6771,15 @@ comp_d3d11_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
 	*out_w = mask->w;
 	*out_h = mask->h;
 	mask->author_seq++;
+	/*
+	 * #918 Phase 2a: from here on this mask's authoritative pixels live on the
+	 * APP device — the app is about to draw into them and no CPU-rect replay on
+	 * the output-device shadow can reproduce that. Latch it so the submit path
+	 * routes this mask through the bridge plane instead of the shadow, for the
+	 * rest of its life (a later Tier-1/2 fill does not un-author it: the shadow
+	 * would then be missing whatever the app had already drawn).
+	 */
+	mask->app_authored = true;
 	return XRT_SUCCESS;
 }
 
@@ -5831,6 +6799,11 @@ comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	// last-submit-wins: it stays active across frames until re-submit or
 	// destroy.
 	c->context->CopyResource(mask->staged, mask->tex);
+	// #918 Phase 2a: stage the shadow too, so a Tier-1/2 mask is consumable on
+	// the output device without any transport at all.
+	if (c->split_active && mask->out_staged != nullptr && mask->out_tex != nullptr) {
+		c->out_ctx->CopyResource(mask->out_staged, mask->out_tex);
+	}
 	mask->submitted = true;
 	mask->author_seq++;
 	c->active_zone_mask = mask;
@@ -5861,6 +6834,28 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 		// commit another frame (teardown-path destroy), and the per-frame
 		// sync would otherwise leave the panel pinned by a dead client.
 		d3d11_sync_zone_mask_to_dp(c);
+	}
+	// #918 Phase 2a: the bridge's producer may hold an open of mask->staged as
+	// the authored-mask plane source. Drop the binding (which drains the producer
+	// link, or leaks on timeout) BEFORE releasing the texture underneath it.
+	if (c->split_active && c->xbridge != nullptr && mask->staged_share != nullptr) {
+		comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, nullptr, 0,
+		                              (uint32_t)DXGI_FORMAT_R8_UNORM);
+	}
+	if (mask->out_staged_srv != nullptr) {
+		mask->out_staged_srv->Release();
+	}
+	if (mask->out_staged != nullptr) {
+		mask->out_staged->Release();
+	}
+	if (mask->out_rtv != nullptr) {
+		mask->out_rtv->Release();
+	}
+	if (mask->out_tex != nullptr) {
+		mask->out_tex->Release();
+	}
+	if (mask->staged_share != nullptr) {
+		CloseHandle(mask->staged_share);
 	}
 	if (mask->staged_srv != nullptr) {
 		mask->staged_srv->Release();

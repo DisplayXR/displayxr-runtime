@@ -67,6 +67,15 @@ cbuffer CompositeParams : register(b0)
     uint   use_rect_mask;
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
     uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
+    uint   _pad0;
+    // #918 Phase 2a: region / texture extent, per input. Every SRV used to be
+    // exactly region-sized, so uv in [0,1] addressed it 1:1. The bridge planes
+    // are PANEL-sized (allocated once so they never enter the resize churn
+    // path), so their uv has to be scaled down to the region's sub-rect or the
+    // 2D band is stretched across the whole panel. 1.0 for a region-sized
+    // input, which is every input on the non-split path.
+    float2 twod_uv_scale;
+    float2 mask_uv_scale;
 };
 
 struct VS_OUTPUT
@@ -84,7 +93,7 @@ float region_mask(float2 px, float2 uv)
             px.y >= canvas_origin.y && px.y < canvas_origin.y + canvas_size.y;
         return inside ? 1.0 : 0.0;
     }
-    return saturate(mask_tex.Sample(samp, uv).r);
+    return saturate(mask_tex.Sample(samp, uv * mask_uv_scale).r);
 }
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
@@ -96,10 +105,10 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         float M = region_mask(px, input.uv);
         if (M >= 0.5)
             discard;
-        return twod_tex.Sample(samp, input.uv);
+        return twod_tex.Sample(samp, input.uv * twod_uv_scale);
     }
 
-    float4 twod  = twod_tex.Sample(samp, input.uv);
+    float4 twod  = twod_tex.Sample(samp, input.uv * twod_uv_scale);
     float4 weave = weave_tex.Sample(samp, input.uv);
     if (opaque_present == 1)
     {
@@ -116,7 +125,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         float3 over = twod.rgb + (1.0 - twod.a) * weave.rgb;
         if (composite_mode == 0)
         {
-            float M = saturate(mask_tex.Sample(samp, input.uv).r);
+            float M = saturate(mask_tex.Sample(samp, input.uv * mask_uv_scale).r);
             return float4(M * weave.rgb + (1.0 - M) * over, 1.0);
         }
         return float4(over, 1.0);
@@ -127,7 +136,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         // translucent 2D reveals the 3D scene, not the desktop.
         return twod + (1.0 - twod.a) * weave;
     }
-    float M = saturate(mask_tex.Sample(samp, input.uv).r);
+    float M = saturate(mask_tex.Sample(samp, input.uv * mask_uv_scale).r);
     if (composite_mode == 2)
     {
         // XR_DXR_display_zones (ADR-027, #801): M gates only the WEAVE by

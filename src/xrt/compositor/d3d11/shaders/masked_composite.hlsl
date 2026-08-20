@@ -50,7 +50,12 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_size;    // canvas sub-rect size (px)
     uint   use_rect_mask;  // 1 = Phase 0 analytic rect mask; 0 = sample mask_tex
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
-    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
+    uint   opaque_present;
+    uint   _pad0;
+    // #918 Phase 2a: region / texture extent per input — the bridge planes are
+    // panel-sized, every other input is region-sized (scale 1.0).
+    float2 twod_uv_scale;
+    float2 mask_uv_scale; // #833/#116: 1 = flatten (DWM completes no blends)
 };
 
 struct VS_OUTPUT
@@ -91,7 +96,7 @@ float region_mask(float2 px, float2 uv)
         return inside ? 1.0 : 0.0;
     }
     // Phase 1+: separate scalar mask, sampled 1:1.
-    return saturate(mask_tex.Sample(samp, uv).r);
+    return saturate(mask_tex.Sample(samp, uv * mask_uv_scale).r);
 }
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
@@ -107,11 +112,11 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     {
         if (M >= 0.5)
             discard;                       // inside canvas: weave stays
-        return twod_tex.Sample(samp, input.uv);
+        return twod_tex.Sample(samp, input.uv * twod_uv_scale);
     }
 
     // Phase 1+ general path, by composite_mode (see the header comment).
-    float4 twod  = twod_tex.Sample(samp, input.uv);
+    float4 twod  = twod_tex.Sample(samp, input.uv * twod_uv_scale);
     float4 weave = weave_tex.Sample(samp, input.uv);
     if (opaque_present == 1)
     {

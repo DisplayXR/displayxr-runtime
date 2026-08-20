@@ -40,6 +40,15 @@
 
 #define XB_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 
+/*!
+ * #918 Phase 2a bandwidth gate. The supervisor's acceptance number for the whole
+ * transport, atlas + planes, measured over the DIAG second. A session that
+ * exceeds it latches its LARGEST plane to half rate (one WARN, once) rather than
+ * disabling the split — the split's win is the repaint arm and the local present,
+ * neither of which a plane's rate affects.
+ */
+#define XB_BANDWIDTH_GATE_BYTES_PER_S (2000ull * 1000ull * 1000ull)
+
 //! #918 R2: two content-box changes closer together than this are a drag, not a
 //! mode switch — stop reallocating the egress ring per size.
 #define XB_CHURN_WINDOW_NS (500ull * 1000ull * 1000ull)
@@ -194,6 +203,77 @@ struct comp_d3d11_xbridge
 	uint64_t churn_entries; //!< times churn mode engaged
 	uint64_t churn_settles; //!< times it settled back to a content-sized ring
 	uint64_t eg_reallocs;   //!< egress ring rebuilds (the thing R2 minimises)
+
+	//! #918 Phase 2a — the composite recipe stamped on each slot, and the one
+	//! the next submit will stamp. Read back by the consume half so it never
+	//! composites a slot's pixels under a later frame's recipe.
+	struct comp_d3d11_xbridge_recipe eg_recipe[XB_EGRESS_RING];
+	struct comp_d3d11_xbridge_recipe staged_recipe;
+
+	// --- planes (#918 Phase 2a) -------------------------------------------
+	//! Panel extent — every plane is allocated here ONCE and never resized.
+	uint32_t panel_w, panel_h;
+	struct xb_plane
+	{
+		bool live;    //!< allocated and bound; false ⟹ the feature degrades
+		bool failed;  //!< allocation refused once — never retried, never re-WARNed
+		uint32_t fmt; //!< DXGI_FORMAT of the whole chain
+		uint32_t bpp;
+
+		//! Producer's open of the app-device source (Option-I shape).
+		ID3D12Resource *src12;
+		uint64_t src_gen;
+		bool src_bound;
+		//! The source's own extent. NOT always the panel: an authored mask is
+		//! created at the app's chosen zone dims, and a copy box snapped out past
+		//! them is an out-of-bounds source region on the copy queue.
+		uint32_t src_w, src_h;
+
+		//! Own cross-adapter heap + placed ring — per plane, so one plane's
+		//! allocation failure cannot take the others (or the atlas) with it.
+		ID3D12Heap *heap_prod[XB_XA_RING];
+		ID3D12Heap *heap_cons[XB_XA_RING];
+		HANDLE heap_h[XB_XA_RING];
+		ID3D12Resource *xa_prod[XB_XA_RING];
+		ID3D12Resource *xa_cons[XB_XA_RING];
+
+		//! Egress, parallel to the atlas ring: same slot index, same seq.
+		ID3D11Texture2D *eg_tex[XB_EGRESS_RING];
+		ID3D11ShaderResourceView *eg_srv[XB_EGRESS_RING];
+		HANDLE eg_share[XB_EGRESS_RING];
+		ID3D12Resource *eg_12[XB_EGRESS_RING];
+		//! Content generation each slot's pixels carry (0 = never written).
+		uint64_t slot_seq[XB_EGRESS_RING];
+		//! Dirty box each slot still owes, accumulated across the frames it was
+		//! not the write slot. Empty (w==0) means "already current".
+		int32_t pend_x[XB_EGRESS_RING], pend_y[XB_EGRESS_RING];
+		uint32_t pend_w[XB_EGRESS_RING], pend_h[XB_EGRESS_RING];
+
+		//! Staged for the next submit.
+		uint64_t stage_seq;
+		int32_t stage_x, stage_y;
+		uint32_t stage_w, stage_h;
+		bool staged;
+		//! The box the last staged content occupied, folded into every slot's
+		//! pending box on a change so vacated pixels are refreshed too.
+		int32_t last_x, last_y;
+		uint32_t last_w, last_h;
+
+		//! `bytes` is the DIAG window (drained by take_plane_stats); copies and
+		//! skips are LIFETIME totals (the compositor diffs them, and quiesce
+		//! reports them whole). `gate_bytes` is the bandwidth gate's own window,
+		//! deliberately independent of the DIAG cadence — DXR_XBRIDGE_DIAG is off
+		//! by default and the gate must still fire.
+		uint64_t bytes, copies, skips, gate_bytes;
+		//! Bandwidth gate: latched to submit every other frame.
+		bool half_rate;
+		uint64_t half_rate_parity;
+	} plane[COMP_D3D11_XBRIDGE_PLANE_COUNT];
+	uint64_t atlas_bytes;
+	//! Rolling one-second window for the bandwidth gate (independent of the
+	//! compositor's DIAG cadence, which may be off).
+	uint64_t gate_window_ns;
+	uint64_t gate_bytes;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -422,6 +502,666 @@ xb_make_egress_slot(struct comp_d3d11_xbridge *xb, int i, uint32_t w, uint32_t h
 	return true;
 }
 
+/*
+ *
+ * Planes (#918 Phase 2a).
+ *
+ */
+
+static const char *
+xb_plane_name(uint32_t p)
+{
+	switch (p) {
+	case COMP_D3D11_XBRIDGE_PLANE_LOCAL2D: return "Local2D";
+	case COMP_D3D11_XBRIDGE_PLANE_BACKDROP: return "backdrop";
+	case COMP_D3D11_XBRIDGE_PLANE_MASK: return "authored mask";
+	default: return "?";
+	}
+}
+
+static uint32_t
+xb_format_bpp(uint32_t fmt)
+{
+	switch ((DXGI_FORMAT)fmt) {
+	case DXGI_FORMAT_R8_UNORM: return 1;
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return 4;
+	default: return 4;
+	}
+}
+
+/*!
+ * Invalidate every slot's pixels for @p pl, and make each slot OWE A FULL
+ * REFRESH.
+ *
+ * Seeding the pending box to the whole plane rather than clearing it is the
+ * point: a slot marked "no pixels, owes nothing" would take the next frame's
+ * DIRTY BOX as its first and only copy — a small sub-rect — and then be stamped
+ * valid, leaving everything outside that box at whatever the texture held
+ * before. For the RGBA planes that reads as transparent by luck (fresh
+ * allocations are zero-filled); for the R8 mask, zero means "2D everywhere",
+ * which is the opposite of the all-3D default an unauthored mask is supposed to
+ * have.
+ */
+static void
+xb_plane_invalidate_slots(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge::xb_plane &pl)
+{
+	uint32_t w = xb->panel_w;
+	uint32_t h = xb->panel_h;
+	if (pl.src_w != 0 && pl.src_w < w) {
+		w = pl.src_w;
+	}
+	if (pl.src_h != 0 && pl.src_h < h) {
+		h = pl.src_h;
+	}
+	for (int i = 0; i < XB_EGRESS_RING; i++) {
+		pl.slot_seq[i] = 0;
+		pl.pend_x[i] = 0;
+		pl.pend_y[i] = 0;
+		pl.pend_w[i] = w;
+		pl.pend_h[i] = h;
+	}
+	pl.last_w = 0;
+	pl.last_h = 0;
+}
+
+/*!
+ * Release one plane's GPU side. @p drained says whether the consumer fence has
+ * reached the last submitted seq; when it has NOT, the D3D12 objects are dropped
+ * WITHOUT releasing, exactly as @ref xb_release_egress does — a leak is
+ * recoverable, a use-after-free on a copy queue is not (#918 F1).
+ */
+static void
+xb_release_plane(struct comp_d3d11_xbridge *xb, uint32_t p, bool drained)
+{
+	auto &pl = xb->plane[p];
+	for (int i = 0; i < XB_EGRESS_RING; i++) {
+		if (drained) {
+			safe_release(pl.eg_12[i]);
+			safe_close(pl.eg_share[i]);
+			safe_release(pl.eg_srv[i]);
+			safe_release(pl.eg_tex[i]);
+		} else {
+			pl.eg_12[i] = nullptr;
+			pl.eg_share[i] = nullptr;
+			pl.eg_srv[i] = nullptr;
+			pl.eg_tex[i] = nullptr;
+		}
+		pl.slot_seq[i] = 0;
+		pl.pend_w[i] = 0;
+		pl.pend_h[i] = 0;
+	}
+	for (int i = 0; i < XB_XA_RING; i++) {
+		if (drained) {
+			safe_release(pl.xa_cons[i]);
+			safe_release(pl.xa_prod[i]);
+			safe_release(pl.heap_cons[i]);
+			safe_release(pl.heap_prod[i]);
+			safe_close(pl.heap_h[i]);
+		} else {
+			pl.xa_cons[i] = nullptr;
+			pl.xa_prod[i] = nullptr;
+			pl.heap_cons[i] = nullptr;
+			pl.heap_prod[i] = nullptr;
+			pl.heap_h[i] = nullptr;
+		}
+	}
+	if (drained) {
+		safe_release(pl.src12);
+	} else {
+		pl.src12 = nullptr;
+	}
+	pl.live = false;
+	pl.src_bound = false;
+	pl.src_w = 0;
+	pl.src_h = 0;
+}
+
+/*!
+ * Allocate one plane's whole chain at the PANEL extent: its own cross-adapter
+ * heap + placed ring and its own egress textures (D3D11 on the output device,
+ * NT-shared and opened by the consumer).
+ *
+ * This is also where the R8 cross-adapter question is ANSWERED rather than
+ * predicted. `CrossAdapterRowMajorTextureSupported` was measured NOT to predict
+ * behaviour on this stack (NVIDIA reports FALSE and samples cleanly), so the
+ * only honest probe is the allocation itself — if the driver refuses an R8
+ * ROW_MAJOR cross-adapter placed resource, the plane is disabled with one WARN
+ * and the feature that needs it degrades. The split is never affected.
+ */
+static bool
+xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt)
+{
+	char b[32];
+	auto &pl = xb->plane[p];
+	if (pl.live) {
+		// The format is a property of the plane, fixed for the session — never
+		// reallocate over a live chain.
+		return pl.fmt == fmt;
+	}
+	if (pl.failed) {
+		return false;
+	}
+	if (xb->panel_w == 0 || xb->panel_h == 0) {
+		pl.failed = true;
+		return false;
+	}
+	pl.fmt = fmt;
+	pl.bpp = xb_format_bpp(fmt);
+
+	HRESULT hr = S_OK;
+	const char *what = "cross-adapter heap";
+
+	D3D12_RESOURCE_DESC td{};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = xb->panel_w;
+	td.Height = xb->panel_h;
+	td.DepthOrArraySize = 1;
+	td.MipLevels = 1;
+	td.Format = (DXGI_FORMAT)fmt;
+	td.SampleDesc.Count = 1;
+	td.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	td.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+	UINT rows = 0;
+	UINT64 row_bytes = 0, total = 0;
+	xb->prod_dev->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+
+	const UINT64 align = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+	D3D12_HEAP_DESC hd{};
+	hd.SizeInBytes = (total + align - 1) & ~(align - 1);
+	hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+	hd.Alignment = align;
+	hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
+	                              D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
+
+	for (int i = 0; i < XB_XA_RING && SUCCEEDED(hr); i++) {
+		hr = xb->prod_dev->CreateHeap(&hd, __uuidof(ID3D12Heap), reinterpret_cast<void **>(&pl.heap_prod[i]));
+		if (SUCCEEDED(hr)) {
+			hr = xb->prod_dev->CreateSharedHandle(pl.heap_prod[i], nullptr, GENERIC_ALL, nullptr,
+			                                      &pl.heap_h[i]);
+		}
+		if (SUCCEEDED(hr)) {
+			hr = xb->cons_dev->OpenSharedHandle(pl.heap_h[i], __uuidof(ID3D12Heap),
+			                                    reinterpret_cast<void **>(&pl.heap_cons[i]));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = xb->prod_dev->CreatePlacedResource(pl.heap_prod[i], 0, &td, D3D12_RESOURCE_STATE_COMMON,
+			                                        nullptr, __uuidof(ID3D12Resource),
+			                                        reinterpret_cast<void **>(&pl.xa_prod[i]));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = xb->cons_dev->CreatePlacedResource(pl.heap_cons[i], 0, &td, D3D12_RESOURCE_STATE_COMMON,
+			                                        nullptr, __uuidof(ID3D12Resource),
+			                                        reinterpret_cast<void **>(&pl.xa_cons[i]));
+		}
+	}
+
+	// Egress: an output-device D3D11 texture per slot, NT-shared to the consumer.
+	for (int i = 0; i < XB_EGRESS_RING && SUCCEEDED(hr); i++) {
+		what = "egress";
+		D3D11_TEXTURE2D_DESC ed = {};
+		ed.Width = xb->panel_w;
+		ed.Height = xb->panel_h;
+		ed.MipLevels = 1;
+		ed.ArraySize = 1;
+		ed.Format = (DXGI_FORMAT)fmt;
+		ed.SampleDesc.Count = 1;
+		ed.Usage = D3D11_USAGE_DEFAULT;
+		ed.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		ed.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+		hr = xb->out_dev->CreateTexture2D(&ed, nullptr, &pl.eg_tex[i]);
+		if (SUCCEEDED(hr)) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+			sv.Format = (DXGI_FORMAT)fmt;
+			sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sv.Texture2D.MipLevels = 1;
+			hr = xb->out_dev->CreateShaderResourceView(pl.eg_tex[i], &sv, &pl.eg_srv[i]);
+		}
+		IDXGIResource1 *dr = nullptr;
+		if (SUCCEEDED(hr)) {
+			hr = pl.eg_tex[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dr));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                            nullptr, &pl.eg_share[i]);
+			dr->Release();
+		}
+		if (SUCCEEDED(hr)) {
+			hr = xb->cons_dev->OpenSharedHandle(pl.eg_share[i], __uuidof(ID3D12Resource),
+			                                    reinterpret_cast<void **>(&pl.eg_12[i]));
+		}
+	}
+
+	if (FAILED(hr)) {
+		U_LOG_W(
+		    "d3d11 xbridge: the %s plane could not allocate its %s at %ux%u fmt=%u %s — THAT FEATURE "
+		    "is unavailable under the output-device split for this session; the split itself is "
+		    "unaffected (#918 Phase 2a)",
+		    xb_plane_name(p), what, xb->panel_w, xb->panel_h, fmt, xb_hr(hr, b, sizeof(b)));
+		xb_release_plane(xb, p, /*drained=*/true);
+		pl.failed = true;
+		return false;
+	}
+
+	pl.live = true;
+	// Fresh egress textures hold nothing: every slot owes a full refresh.
+	xb_plane_invalidate_slots(xb, pl);
+	U_LOG_W("d3d11 xbridge: %s plane up — %ux%u fmt=%u, heap %llu bytes x%d + egress x%d (#918 Phase 2a)",
+	        xb_plane_name(p), xb->panel_w, xb->panel_h, fmt, (unsigned long long)hd.SizeInBytes, XB_XA_RING,
+	        XB_EGRESS_RING);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_xbridge_bind_plane(
+    struct comp_d3d11_xbridge *xb, uint32_t plane, void *nt_handle, uint64_t generation, uint32_t dxgi_format)
+{
+	char b[32];
+	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		return false;
+	}
+	auto &pl = xb->plane[plane];
+	/*
+	 * A plane that has failed once is never retried. Without this the callers —
+	 * which bind unconditionally EVERY FRAME — would re-attempt a failed open and
+	 * re-emit its WARN per frame, which the repo's logging law forbids outright.
+	 */
+	if (pl.failed) {
+		return false;
+	}
+
+	/*
+	 * Same #918 F2 hazard as the atlas re-bind, and it applies to DROPPING the
+	 * binding as much as to replacing it: the producer's copy of the last
+	 * submitted seq reads exactly this resource, and the caller is about to
+	 * release the texture underneath it. Drain the producer link first; on
+	 * timeout LEAK rather than hand the copy queue a freed resource.
+	 */
+	auto drop_source = [&]() {
+		if (pl.src12 == nullptr) {
+			return;
+		}
+		if (!xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire),
+		                    "plane re-bind")) {
+			pl.src12 = nullptr; // deliberate leak — a UAF is not recoverable
+		}
+		safe_release(pl.src12);
+		pl.src_w = 0;
+		pl.src_h = 0;
+		pl.src_bound = false;
+		xb_plane_invalidate_slots(xb, pl);
+	};
+
+	if (nt_handle == nullptr) {
+		drop_source();
+		return false;
+	}
+	if (!xb_plane_alloc(xb, plane, dxgi_format)) {
+		return false;
+	}
+	if (pl.src_bound && pl.src_gen == generation) {
+		return true;
+	}
+	drop_source();
+	HRESULT hr = xb->prod_dev->OpenSharedHandle(static_cast<HANDLE>(nt_handle), __uuidof(ID3D12Resource),
+	                                            reinterpret_cast<void **>(&pl.src12));
+	if (FAILED(hr) || pl.src12 == nullptr) {
+		U_LOG_W(
+		    "d3d11 xbridge: the producer could not open the %s plane's source %s — that feature "
+		    "degrades for this session (#918 Phase 2a)",
+		    xb_plane_name(plane), xb_hr(hr, b, sizeof(b)));
+		pl.failed = true;
+		pl.src_bound = false;
+		return false;
+	}
+	{
+		// The source's real extent — the copy box is clamped to it, not just to
+		// the panel, because an authored mask is created at the app's zone dims.
+		D3D12_RESOURCE_DESC sd = pl.src12->GetDesc();
+		pl.src_w = (uint32_t)sd.Width;
+		pl.src_h = sd.Height;
+	}
+	pl.src_gen = generation;
+	pl.src_bound = true;
+	// A new source texture invalidates every slot's pixels, and each slot now
+	// owes a FULL refresh rather than just the next frame's dirty box.
+	xb_plane_invalidate_slots(xb, pl);
+	return true;
+}
+
+//! Fold @p (x,y,w,h) into slot @p i's pending dirty box.
+static void
+xb_plane_pend(struct comp_d3d11_xbridge::xb_plane &pl, int i, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0) {
+		return;
+	}
+	if (pl.pend_w[i] == 0 || pl.pend_h[i] == 0) {
+		pl.pend_x[i] = x;
+		pl.pend_y[i] = y;
+		pl.pend_w[i] = w;
+		pl.pend_h[i] = h;
+		return;
+	}
+	const int32_t x0 = pl.pend_x[i] < x ? pl.pend_x[i] : x;
+	const int32_t y0 = pl.pend_y[i] < y ? pl.pend_y[i] : y;
+	const int32_t x1a = pl.pend_x[i] + (int32_t)pl.pend_w[i];
+	const int32_t y1a = pl.pend_y[i] + (int32_t)pl.pend_h[i];
+	const int32_t x1b = x + (int32_t)w;
+	const int32_t y1b = y + (int32_t)h;
+	const int32_t x1 = x1a > x1b ? x1a : x1b;
+	const int32_t y1 = y1a > y1b ? y1a : y1b;
+	pl.pend_x[i] = x0;
+	pl.pend_y[i] = y0;
+	pl.pend_w[i] = (uint32_t)(x1 - x0);
+	pl.pend_h[i] = (uint32_t)(y1 - y0);
+}
+
+extern "C" void
+comp_d3d11_xbridge_stage_plane(
+    struct comp_d3d11_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		return;
+	}
+	auto &pl = xb->plane[plane];
+	if (!pl.live || !pl.src_bound) {
+		return;
+	}
+	// seq 0 = "this frame does not use the plane". Un-stage rather than carry
+	// the previous frame's box forward, so the recipe stamps it invalid and the
+	// consume half cannot sample content the frame did not produce.
+	if (content_seq == 0) {
+		pl.staged = false;
+		return;
+	}
+	// Clamp into the panel — the source is panel-sized and nothing beyond it
+	// can be sampled.
+	{
+		int32_t x0 = x, y0 = y;
+		int32_t x1 = x + (int32_t)w, y1 = y + (int32_t)h;
+		if (x0 < 0) {
+			x0 = 0;
+		}
+		if (y0 < 0) {
+			y0 = 0;
+		}
+		if (x1 > (int32_t)xb->panel_w) {
+			x1 = (int32_t)xb->panel_w;
+		}
+		if (y1 > (int32_t)xb->panel_h) {
+			y1 = (int32_t)xb->panel_h;
+		}
+		if (x1 <= x0 || y1 <= y0) {
+			x0 = 0;
+			y0 = 0;
+			x1 = 0;
+			y1 = 0;
+		}
+		x = x0;
+		y = y0;
+		w = (uint32_t)(x1 - x0);
+		h = (uint32_t)(y1 - y0);
+	}
+
+	/*
+	 * Content changed: every slot now owes the union of what the plane used to
+	 * cover and what it covers now — the first refreshes pixels the content has
+	 * VACATED, the second the pixels it moved onto. Accumulating per slot is what
+	 * lets a slot that sat out several changes catch up in one copy instead of
+	 * being left partially updated.
+	 */
+	if (content_seq != pl.stage_seq || !pl.staged) {
+		for (int i = 0; i < XB_EGRESS_RING; i++) {
+			xb_plane_pend(pl, i, pl.last_x, pl.last_y, pl.last_w, pl.last_h);
+			xb_plane_pend(pl, i, x, y, w, h);
+		}
+		pl.last_x = x;
+		pl.last_y = y;
+		pl.last_w = w;
+		pl.last_h = h;
+	}
+	pl.stage_seq = content_seq;
+	pl.stage_x = x;
+	pl.stage_y = y;
+	pl.stage_w = w;
+	pl.stage_h = h;
+	pl.staged = true;
+}
+
+extern "C" void
+comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp_d3d11_xbridge_recipe *recipe)
+{
+	if (xb == nullptr || recipe == nullptr) {
+		return;
+	}
+	xb->staged_recipe = *recipe;
+}
+
+extern "C" bool
+comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, struct comp_d3d11_xbridge_recipe *out)
+{
+	if (xb == nullptr || out == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
+		return false;
+	}
+	*out = xb->eg_recipe[slot];
+	return true;
+}
+
+extern "C" void *
+comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane)
+{
+	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		return nullptr;
+	}
+	auto &pl = xb->plane[plane];
+	if (!pl.live || pl.slot_seq[slot] == 0) {
+		return nullptr;
+	}
+	return pl.eg_srv[slot];
+}
+
+extern "C" void
+comp_d3d11_xbridge_take_plane_stats(struct comp_d3d11_xbridge *xb,
+                                    uint32_t plane,
+                                    uint64_t *out_bytes,
+                                    uint64_t *out_copies,
+                                    uint64_t *out_skips,
+                                    bool *out_half_rate)
+{
+	uint64_t bytes = 0, copies = 0, skips = 0;
+	bool half = false;
+	if (xb != nullptr && plane < COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		auto &pl = xb->plane[plane];
+		bytes = pl.bytes;
+		copies = pl.copies;
+		skips = pl.skips;
+		half = pl.half_rate;
+		pl.bytes = 0; // window; copies/skips stay lifetime totals
+	}
+	if (out_bytes != nullptr) {
+		*out_bytes = bytes;
+	}
+	if (out_copies != nullptr) {
+		*out_copies = copies;
+	}
+	if (out_skips != nullptr) {
+		*out_skips = skips;
+	}
+	if (out_half_rate != nullptr) {
+		*out_half_rate = half;
+	}
+}
+
+extern "C" uint64_t
+comp_d3d11_xbridge_take_atlas_bytes(struct comp_d3d11_xbridge *xb)
+{
+	if (xb == nullptr) {
+		return 0;
+	}
+	const uint64_t v = xb->atlas_bytes;
+	xb->atlas_bytes = 0;
+	return v;
+}
+
+/*!
+ * Record both legs of one plane into the command lists the atlas is already
+ * using, so the plane lands on the SAME seq and the SAME fence pair — the
+ * atomicity the whole per-slot design rests on.
+ *
+ * @return the bytes copied (0 when skipped).
+ */
+static uint64_t
+xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa, int eg)
+{
+	auto &pl = xb->plane[p];
+	if (!pl.live || !pl.src_bound || !pl.staged || pl.src12 == nullptr) {
+		return 0;
+	}
+	/*
+	 * CHANGE-SKIP. The slot already holds exactly this content generation and
+	 * owes no accumulated box, so there is nothing to transport — the consume
+	 * half keeps sampling the pixels already there, which is why the recipe
+	 * carries plane_seq: a change-skipped plane is provably the SAME content,
+	 * never merely an old one.
+	 */
+	if (pl.slot_seq[eg] == pl.stage_seq && pl.pend_w[eg] == 0) {
+		pl.skips++;
+		return 0;
+	}
+	// Bandwidth gate: latched planes transport on every other seq. Never
+	// disabled — a half-rate plane still tracks, it just tracks at 30 Hz.
+	if (pl.half_rate && (seq & 1ull) != pl.half_rate_parity) {
+		pl.skips++;
+		return 0;
+	}
+
+	// The union of what this slot owes and what the frame staged.
+	xb_plane_pend(pl, eg, pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h);
+	/*
+	 * Snap the box out to a 4-pixel grid. Copy-queue `CopyTextureRegion` is only
+	 * documented as offset-free for uncompressed formats, and a mis-copied plane
+	 * would show up as a subtly torn 2D band rather than a hard failure — the
+	 * kind of defect that costs a day. Four pixels is free (the box is already
+	 * hundreds wide) and covers every block-size a copy queue could impose.
+	 */
+	int32_t bx = pl.pend_x[eg] & ~3;
+	int32_t by = pl.pend_y[eg] & ~3;
+	uint32_t bw = (uint32_t)((pl.pend_x[eg] + (int32_t)pl.pend_w[eg] - bx + 3) & ~3);
+	uint32_t bh = (uint32_t)((pl.pend_y[eg] + (int32_t)pl.pend_h[eg] - by + 3) & ~3);
+	/*
+	 * Clamp to the SOURCE, not just the panel. The 4-pixel snap above can push
+	 * the box past a source that is not a multiple of 4 — an authored mask is
+	 * created at the app's own zone dims — and an out-of-range source box is an
+	 * invalid `CopyTextureRegion` on a copy queue.
+	 */
+	uint32_t lim_w = (pl.src_w != 0 && pl.src_w < xb->panel_w) ? pl.src_w : xb->panel_w;
+	uint32_t lim_h = (pl.src_h != 0 && pl.src_h < xb->panel_h) ? pl.src_h : xb->panel_h;
+	if ((uint32_t)bx >= lim_w || (uint32_t)by >= lim_h) {
+		bw = 0;
+		bh = 0;
+	} else {
+		if (bx + (int32_t)bw > (int32_t)lim_w) {
+			bw = lim_w - (uint32_t)bx;
+		}
+		if (by + (int32_t)bh > (int32_t)lim_h) {
+			bh = lim_h - (uint32_t)by;
+		}
+	}
+	if (pl.pend_w[eg] == 0 || pl.pend_h[eg] == 0) {
+		bw = 0;
+		bh = 0;
+	}
+	if (bw == 0 || bh == 0) {
+		/*
+		 * Nothing transportable. Leave `slot_seq` ALONE: advancing it here would
+		 * mark the slot as carrying this generation's pixels when no copy ever
+		 * landed, which is exactly the "old pixels, silently" failure the
+		 * change-skip design exists to make impossible.
+		 */
+		pl.skips++;
+		return 0;
+	}
+
+	D3D12_BOX box{};
+	box.left = (UINT)bx;
+	box.top = (UINT)by;
+	box.front = 0;
+	box.right = (UINT)bx + bw;
+	box.bottom = (UINT)by + bh;
+	box.back = 1;
+
+	{
+		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.xa_prod[xa]);
+		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(pl.src12);
+		xb->prod_list->CopyTextureRegion(&dst, (UINT)bx, (UINT)by, 0, &src, &box);
+	}
+	{
+		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.eg_12[eg]);
+		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(pl.xa_cons[xa]);
+		xb->cons_list->CopyTextureRegion(&dst, (UINT)bx, (UINT)by, 0, &src, &box);
+	}
+
+	pl.slot_seq[eg] = pl.stage_seq;
+	pl.pend_w[eg] = 0;
+	pl.pend_h[eg] = 0;
+	pl.copies++;
+	const uint64_t bytes = (uint64_t)bw * bh * pl.bpp;
+	pl.bytes += bytes;
+	pl.gate_bytes += bytes;
+	return bytes;
+}
+
+/*!
+ * #918 Phase 2a bandwidth gate. Sum every leg over a rolling second; if the
+ * transport exceeds the acceptance number, latch the LARGEST plane to half rate
+ * with ONE WARN. Never the split — the split's win is the repaint arm and the
+ * iGPU-local present, neither of which a plane's rate touches.
+ */
+static void
+xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t frame_bytes, uint64_t seq)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	xb->gate_bytes += frame_bytes;
+	if (xb->gate_window_ns == 0) {
+		xb->gate_window_ns = now;
+		return;
+	}
+	const uint64_t elapsed = now - xb->gate_window_ns;
+	if (elapsed < 1000ull * 1000ull * 1000ull) {
+		return;
+	}
+	const uint64_t rate = (uint64_t)((double)xb->gate_bytes * 1.0e9 / (double)elapsed);
+	xb->gate_bytes = 0;
+	xb->gate_window_ns = now;
+
+	uint32_t worst = COMP_D3D11_XBRIDGE_PLANE_COUNT;
+	uint64_t worst_bytes = 0;
+	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+		if (xb->plane[p].live && !xb->plane[p].half_rate && xb->plane[p].gate_bytes > worst_bytes) {
+			worst_bytes = xb->plane[p].gate_bytes;
+			worst = p;
+		}
+		xb->plane[p].gate_bytes = 0;
+	}
+	if (rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
+		return;
+	}
+	if (worst >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+		return; // nothing left to throttle — the atlas alone is over, which it never is
+	}
+	xb->plane[worst].half_rate = true;
+	xb->plane[worst].half_rate_parity = seq & 1ull;
+	U_LOG_W(
+	    "d3d11 xbridge: transport measured %.2f GB/s over the last second, above the %.1f GB/s "
+	    "acceptance gate — latching the %s plane to HALF RATE for this session. The split stays on "
+	    "(#918 Phase 2a)",
+	    (double)rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9, xb_plane_name(worst));
+}
+
+
 /*!
  * #1017 posture: the cross-adapter fence is the one place a hybrid stack has
  * historically wedged with no diagnostic. Model taken from the present watchdog
@@ -535,6 +1275,11 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	xb->quit.store(false);
 	xb->max_w = info->max_width;
 	xb->max_h = info->max_height;
+	// #918 Phase 2a: the planes are panel-sized once. Nothing here allocates —
+	// each plane's heap is created lazily on its first bind, so a session that
+	// never uses Local2D or zones pays nothing.
+	xb->panel_w = info->panel_width;
+	xb->panel_h = info->panel_height;
 	xb->ingress_mode = XB_INGRESS_DIRECT;
 	xb->force_depth = 0;
 	{
@@ -1212,61 +1957,94 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 	box.bottom = content_h;
 	box.back = 1;
 
-	// --- leg 1: app adapter -> cross-adapter ring -------------------------
+	/*
+	 * #918 Phase 2a: BOTH command lists are opened first and closed last, with
+	 * the atlas copy and every plane copy recorded between. That is the whole
+	 * atomicity argument — one seq, one fence pair, so the DP can never sample an
+	 * atlas from frame N beside a Local2D plane from frame N-1, and the layout
+	 * refusal / slot-readiness / repaint republish that already guard the atlas
+	 * guard the planes for free.
+	 */
+	if (FAILED(xb->prod_alloc[pa]->Reset()) || FAILED(xb->prod_list->Reset(xb->prod_alloc[pa], nullptr))) {
+		return;
+	}
+	if (FAILED(xb->cons_alloc[ca]->Reset()) || FAILED(xb->cons_list->Reset(xb->cons_alloc[ca], nullptr))) {
+		xb->prod_list->Close();
+		return;
+	}
+
+	// Every resource here is COMMON and implicitly promotes to
+	// COPY_SOURCE/COPY_DEST on a copy queue — no barriers, and D3D11-shared
+	// resources must stay in COMMON anyway.
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(xb->xa_prod[xa]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(src12);
-		if (FAILED(xb->prod_alloc[pa]->Reset())) {
-			return;
-		}
-		if (FAILED(xb->prod_list->Reset(xb->prod_alloc[pa], nullptr))) {
-			return;
-		}
-		// Every resource here is COMMON and implicitly promotes to
-		// COPY_SOURCE/COPY_DEST on a copy queue — no barriers, and D3D11-shared
-		// resources must stay in COMMON anyway.
 		xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-		xb->prod_list->Close();
-
-		xb->prod_q->Wait(xb->f_app_prod, seq);
-		ID3D12CommandList *l[] = {xb->prod_list};
-		xb->prod_q->ExecuteCommandLists(1, l);
-		xb->prod_q->Signal(xb->f_xa_prod, seq);
-		xb->prod_alloc_seq[pa] = seq;
-		// Published for the watchdog's producer link, the F1/F2 drains and the
-		// F6 back-fence — all of which need the last seq the producer queue was
-		// told to signal, never a seq that was skipped.
-		xb->prod_submit_seq.store(seq, std::memory_order_release);
 	}
-
-	// --- leg 2: cross-adapter ring -> egress (scanout adapter) ------------
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(xb->eg_12[eg]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(xb->xa_cons[xa]);
-		if (FAILED(xb->cons_alloc[ca]->Reset())) {
-			return;
-		}
-		if (FAILED(xb->cons_list->Reset(xb->cons_alloc[ca], nullptr))) {
-			return;
-		}
 		xb->cons_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-		xb->cons_list->Close();
+	}
+	uint64_t frame_bytes = (uint64_t)content_w * content_h * 4ull;
+	xb->atlas_bytes += frame_bytes;
 
-		// The ONE cross-adapter wait in the whole design, and it belongs to the
-		// consumer's own copy queue.
-		xb->cons_q->Wait(xb->f_xa_cons, seq);
+	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+		frame_bytes += xb_record_plane(xb, p, seq, xa, eg);
+	}
+
+	xb->prod_list->Close();
+	xb->cons_list->Close();
+
+	// --- leg 1: app adapter -> cross-adapter ring -------------------------
+	xb->prod_q->Wait(xb->f_app_prod, seq);
+	{
+		ID3D12CommandList *l[] = {xb->prod_list};
+		xb->prod_q->ExecuteCommandLists(1, l);
+	}
+	xb->prod_q->Signal(xb->f_xa_prod, seq);
+	xb->prod_alloc_seq[pa] = seq;
+	// Published for the watchdog's producer link, the F1/F2 drains and the
+	// F6 back-fence — all of which need the last seq the producer queue was
+	// told to signal, never a seq that was skipped.
+	xb->prod_submit_seq.store(seq, std::memory_order_release);
+
+	// --- leg 2: cross-adapter ring -> egress (scanout adapter) ------------
+	// The ONE cross-adapter wait in the whole design, and it belongs to the
+	// consumer's own copy queue.
+	xb->cons_q->Wait(xb->f_xa_cons, seq);
+	{
 		ID3D12CommandList *l[] = {xb->cons_list};
 		xb->cons_q->ExecuteCommandLists(1, l);
-		xb->cons_q->Signal(xb->f_out_cons, seq);
-		xb->cons_alloc_seq[ca] = seq;
-		xb->eg_seq[eg] = seq;
-		// #918 R1/R2: stamp the slot with the layout that produced its pixels.
-		// The weave refuses a superseded generation outright, and weaves a
-		// surviving one with ITS OWN content box rather than the frame's.
-		xb->eg_gen[eg] = layout_gen;
-		xb->eg_cw[eg] = content_w;
-		xb->eg_ch[eg] = content_h;
 	}
+	xb->cons_q->Signal(xb->f_out_cons, seq);
+	xb->cons_alloc_seq[ca] = seq;
+	xb->eg_seq[eg] = seq;
+	// #918 R1/R2: stamp the slot with the layout that produced its pixels.
+	// The weave refuses a superseded generation outright, and weaves a
+	// surviving one with ITS OWN content box rather than the frame's.
+	xb->eg_gen[eg] = layout_gen;
+	xb->eg_cw[eg] = content_w;
+	xb->eg_ch[eg] = content_h;
+
+	/*
+	 * #918 Phase 2a — stamp the COMPOSITE RECIPE. plane_valid/plane_seq are
+	 * resolved from what the slot ACTUALLY holds after the recording above, not
+	 * from what the frame wished for: a change-skipped plane keeps the seq it
+	 * already carried, so the consume half can tell "same pixels, provably" from
+	 * "older pixels" without a second channel.
+	 */
+	xb->eg_recipe[eg] = xb->staged_recipe;
+	xb->eg_recipe[eg].plane_valid = 0;
+	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+		auto &pl = xb->plane[p];
+		xb->eg_recipe[eg].plane_seq[p] = pl.slot_seq[eg];
+		if (pl.live && pl.staged && pl.slot_seq[eg] != 0) {
+			xb->eg_recipe[eg].plane_valid |= (1u << p);
+		}
+	}
+
+	xb_bandwidth_gate(xb, frame_bytes, seq);
 
 	xb->last_submit_seq.store(seq, std::memory_order_release);
 	xb->frames++;
@@ -1492,6 +2270,15 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs,
 		    (unsigned long long)xb->churn_entries, (unsigned long long)xb->churn_settles);
 	}
+	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+		const auto &pl = xb->plane[p];
+		if (!pl.live && pl.copies == 0) {
+			continue;
+		}
+		U_LOG_W("d3d11 xbridge: %s plane — %llu copies, %llu change-skips%s (#918 Phase 2a)", xb_plane_name(p),
+		        (unsigned long long)pl.copies, (unsigned long long)pl.skips,
+		        pl.half_rate ? ", LATCHED to half rate by the bandwidth gate" : "");
+	}
 }
 
 extern "C" void
@@ -1536,6 +2323,22 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 	// Reverse of create: egress -> consumer -> cross-adapter heap -> producer
 	// -> fences -> the D3D11 ends.
 	xb_release_egress(xb);
+
+	/*
+	 * #918 Phase 2a: the planes go through the SAME drain-or-leak gate as the
+	 * egress ring, and in the same drained window. Their egress textures are
+	 * written by `cons_list` copies exactly like the atlas slots, so freeing one
+	 * under an in-flight copy is the same use-after-free (#918 F1). xb_drain_fence
+	 * returns immediately when the fence has already reached the target, so this
+	 * costs nothing on the normal path.
+	 */
+	{
+		const bool pl_drained = xb_drain_fence(
+		    xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "plane release");
+		for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+			xb_release_plane(xb, p, pl_drained);
+		}
+	}
 
 	for (int i = 0; i < XB_INGRESS_RING; i++) {
 		safe_release(xb->in_12[i]);

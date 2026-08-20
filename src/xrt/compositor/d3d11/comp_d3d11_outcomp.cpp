@@ -34,10 +34,11 @@
 /*!
  * Masked 2D-over-3D composite constant buffer (unified-2d-3d-compositing #439,
  * Phase 0). Matches `cbuffer CompositeParams : register(b0)` in
- * shaders/masked_composite.hlsl. 48 bytes; HLSL packs as three float4 rows
- * with no straddle (dst_dims.xy | canvas_origin.xy , canvas_size.xy | mask |
- * mode , opaque_present | pad) — the trailing pad keeps sizeof a multiple of
- * 16 for CreateBuffer.
+ * comp_d3d11_composite_shaders.h / shaders/masked_composite.hlsl. 64 bytes;
+ * HLSL packs as four float4 rows with no straddle (dst_dims.xy |
+ * canvas_origin.xy , canvas_size.xy | mask | mode , opaque_present | pad0 |
+ * twod_uv_scale.xy , mask_uv_scale.xy | pad) — note the deliberate `pad0`,
+ * which is what keeps `twod_uv_scale` from straddling a 16-byte boundary.
  */
 struct CompositeParams
 {
@@ -47,8 +48,52 @@ struct CompositeParams
 	uint32_t use_rect_mask;  // 1 = Phase 0 analytic rect mask
 	uint32_t composite_mode; // COMP_D3D11_COMPOSITE_MODE_*: 0 hard M-lerp, 1 #491 over, 2 zones
 	uint32_t opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
-	uint32_t pad[3];
+	uint32_t pad0;
+	//! #918 Phase 2a: region / source extent, per input. 1.0 whenever the input
+	//! is exactly region-sized, which is every input on the non-split path; the
+	//! bridge planes are panel-sized and need the sub-rect scale.
+	float twod_uv_scale[2];
+	float mask_uv_scale[2];
+	uint32_t pad1[2];
 };
+static_assert(sizeof(CompositeParams) == 64, "CompositeParams must match the HLSL cbuffer packing");
+
+/*!
+ * #918 Phase 2a — the uv scale for one input SRV: how much of it the composite
+ * region occupies. Reading the extent off the resource rather than taking it as
+ * another parameter is deliberate — a caller that hands in a bigger texture gets
+ * the right sub-rect automatically, instead of silently stretching it across the
+ * pass. Once per composite call, so the QI cost is per frame, not per pixel.
+ */
+static void
+outcomp_uv_scale(void *srv_ptr, uint32_t region_w, uint32_t region_h, float out_scale[2])
+{
+	out_scale[0] = 1.0f;
+	out_scale[1] = 1.0f;
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(srv_ptr);
+	if (srv == nullptr || region_w == 0 || region_h == 0) {
+		return;
+	}
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return;
+	}
+	ID3D11Texture2D *tex = nullptr;
+	if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) &&
+	    tex != nullptr) {
+		D3D11_TEXTURE2D_DESC td = {};
+		tex->GetDesc(&td);
+		if (td.Width > region_w) {
+			out_scale[0] = (float)region_w / (float)td.Width;
+		}
+		if (td.Height > region_h) {
+			out_scale[1] = (float)region_h / (float)td.Height;
+		}
+		tex->Release();
+	}
+	res->Release();
+}
 
 /*!
  * The output composite unit.
@@ -422,6 +467,11 @@ comp_d3d11_outcomp_composite_2d_masked(struct comp_d3d11_outcomp *outcomp,
 	params.composite_mode = composite_mode; // LERP / ALPHA_OVER (#491) / ZONES (ADR-027)
 	// #833/#116 — the flatten needs the weave, so it stays off on the rect path.
 	params.opaque_present = (mask_srv != nullptr && opaque_present) ? 1 : 0;
+	// #918 Phase 2a: the bridge planes are panel-sized, so scale their uv into
+	// the region's sub-rect. The weave scratch is allocated at exactly the region
+	// (comp_d3d11_outcomp_ensure_weave_scratch), so it needs none.
+	outcomp_uv_scale(twod_srv, region_w, region_h, params.twod_uv_scale);
+	outcomp_uv_scale(mask_srv, region_w, region_h, params.mask_uv_scale);
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
 	hr = outcomp->ctx->Map(outcomp->composite_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
