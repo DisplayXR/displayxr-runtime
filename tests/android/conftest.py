@@ -51,7 +51,7 @@ class AdbTesting:
 
         # TODO allow most of the following to be configured
         self._ndk_ver = "26.3.11579264"
-        self._build_variant = "outOfProcessDebug"
+        self._build_variant = "debug"
         self._sdk_root = Path.home() / "Android" / "Sdk"
         self._arch = "arm64-v8a"
         self._ndk_stack = self._sdk_root / "ndk" / self._ndk_ver / "ndk-stack"

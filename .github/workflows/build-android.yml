@@ -134,12 +134,12 @@ jobs:
           # externalNativeBuild block uses ANDROID_NDK_HOME to resolve
           # the toolchain.
           chmod +x ./gradlew
-          ./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug --no-daemon --stacktrace
+          ./gradlew :src:xrt:targets:openxr_android:assembleDebug --no-daemon --stacktrace
 
       - name: Inspect APK contents
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          APK=src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+          APK=src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
           echo "APK size: $(du -h "$APK" | cut -f1)"
           echo "Native libs:"
           unzip -l "$APK" | grep '\.so$' || echo "(none)"
@@ -163,7 +163,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: DisplayXR-Android-inProcess-debug
-          path: src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+          name: DisplayXR-Android-debug
+          path: src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
           if-no-files-found: error
           retention-days: 14
