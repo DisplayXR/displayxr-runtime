@@ -67,6 +67,9 @@ echo
 echo "The runtime must already be listening: adb shell setprop debug.dxr.bg2d capture"
 echo "Ctrl-C releases the background (the runtime keeps the last frame)."
 echo
+echo "If the connect fails with EACCES, SELinux is refusing the cross-domain"
+echo "abstract-socket connect: 'adb shell setenforce 0' on an engineering unit."
+echo
 
 # app_process needs the dex on its classpath; /system/bin is the nominal cwd
 # argument the runtime expects, not a path we use.

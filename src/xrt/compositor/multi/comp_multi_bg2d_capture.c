@@ -289,6 +289,7 @@ comp_multi_bg2d_capture_start(const char *socket_name)
 	if (g_started) {
 		return true;
 	}
+	c->listen_fd = -1;
 
 	const char *name =
 	    (socket_name != NULL && socket_name[0] != '\0') ? socket_name : COMP_MULTI_BG2D_CAPTURE_SOCKET;
