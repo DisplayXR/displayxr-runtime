@@ -66,7 +66,7 @@ class MainActivity : NativeActivity() {
     // True once the OpenXR instance is up (runtime reached).
     private external fun nativeXrReady(): Boolean
 
-    private val runtimePackage = "org.freedesktop.monado.openxr_runtime.in_process"
+    private val runtimePackage = "org.freedesktop.monado.openxr_runtime.out_of_process"
 
     // Watch the native bring-up just until it resolves: if the runtime can't be
     // reached, prompt the user to launch DisplayXR first; if it comes up, stop
@@ -189,7 +189,7 @@ class MainActivity : NativeActivity() {
     private fun wakeRuntime() {
         try {
             val intent = Intent("org.khronos.openxr.OpenXRRuntimeService").apply {
-                `package` = "org.freedesktop.monado.openxr_runtime.in_process"
+                `package` = "org.freedesktop.monado.openxr_runtime.out_of_process"
                 addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
             }
             startService(intent)

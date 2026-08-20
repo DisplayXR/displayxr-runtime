@@ -177,22 +177,15 @@ distributions:
           - name: android:spotlessCheck
             target: spotlessCheck
 
-          - name: android:outOfProcessDebug
-            target: assembleOutOfProcessDebug
-            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/outOfProcess
+          # #1031: one hybrid variant — the inProcess/outOfProcess flavor
+          # dimension is gone.
+          - name: android:debug
+            target: assembleDebug
+            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/debug
 
-          - name: android:inProcessDebug
-            target: assembleInProcessDebug
-            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/inProcess
-
-          - name: android:outOfProcessRelease
-            target: assembleOutOfProcessRelease
-            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/outOfProcess
-            extra_extends: .monado.packaging.conditions
-
-          - name: android:inProcessRelease
-            target: assembleInProcessRelease
-            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/inProcess
+          - name: android:release
+            target: assembleRelease
+            artifact_path: src/xrt/targets/openxr_android/build/outputs/apk/release
             extra_extends: .monado.packaging.conditions
 
   - name: ubuntu

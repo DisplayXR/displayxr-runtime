@@ -7,16 +7,17 @@
 # dylib/.so leaks into the aarch64 link and ld.lld dies with "unknown file type".
 #
 # Usage:
-#   ./scripts/build-android.sh                      # build outOfProcess debug
-#   ./scripts/build-android.sh build inprocess      # build inProcess debug
-#   ./scripts/build-android.sh install              # build + adb install outOfProcess
-#   ./scripts/build-android.sh install inprocess    # build + adb install inProcess
-#   ./scripts/build-android.sh build outofprocess release
+#   ./scripts/build-android.sh                      # build debug
+#   ./scripts/build-android.sh install              # build + adb install debug
+#   ./scripts/build-android.sh build release
 #
 # Args (any order after the verb):
 #   verb     : build (default) | install | clean
-#   flavor   : outofprocess (default) | inprocess
 #   variant  : debug (default) | release
+#
+# #1031: there is ONE hybrid runtime APK — in-process by default, IPC per app.
+# The old inprocess/outofprocess flavor words are accepted and ignored so old
+# muscle memory and scripts don't break.
 #
 # Env overrides:
 #   ANDROID_HOME   — Android SDK (else read from local.properties sdk.dir)
@@ -37,22 +38,21 @@ ANDROID_DIR="$REPO_ROOT/src/xrt/targets/openxr_android"
 
 # ---- parse args (positional, order-insensitive after the verb) --------------
 VERB="build"
-FLAVOR="outofprocess"
 VARIANT="debug"
 for arg in "$@"; do
     case "$arg" in
         build|install|clean)        VERB="$arg" ;;
-        inprocess|inProcess|in)     FLAVOR="inprocess" ;;
-        outofprocess|outOfProcess|out|oop) FLAVOR="outofprocess" ;;
+        # Accepted-and-ignored: the flavors were merged in #1031.
+        inprocess|inProcess|in|outofprocess|outOfProcess|out|oop)
+            echo "NOTE: '$arg' ignored — there is one hybrid runtime APK since #1031." >&2 ;;
         debug|release)              VARIANT="$arg" ;;
         *) echo "ERROR: unknown arg '$arg'" >&2; exit 2 ;;
     esac
 done
 
-# Gradle camelCase flavor + capitalized variant for task names / output paths.
-if [ "$FLAVOR" = "inprocess" ]; then GRADLE_FLAVOR="inProcess"; else GRADLE_FLAVOR="outOfProcess"; fi
 VARIANT_CAP="$(tr '[:lower:]' '[:upper:]' <<< "${VARIANT:0:1}")${VARIANT:1}"
-APK="$ANDROID_DIR/build/outputs/apk/$GRADLE_FLAVOR/$VARIANT/openxr_android-$GRADLE_FLAVOR-$VARIANT.apk"
+APK="$ANDROID_DIR/build/outputs/apk/$VARIANT/openxr_android-$VARIANT.apk"
+PKG="org.freedesktop.monado.openxr_runtime.out_of_process"
 
 # ---- locate the SDK ---------------------------------------------------------
 if [ -z "${ANDROID_HOME:-}" ]; then
@@ -90,7 +90,7 @@ fi
 # ---- build ------------------------------------------------------------------
 # -PdxrForceVendoredCjson is the #496 fix; CI hosts have no system cJSON so it's
 # a no-op there, but every local macOS/Linux dev box needs it.
-TASK="$ANDROID_MODULE:assemble${GRADLE_FLAVOR}${VARIANT_CAP}"
+TASK="$ANDROID_MODULE:assemble${VARIANT_CAP}"
 echo ">> ./gradlew $TASK -PdxrForceVendoredCjson  (ANDROID_HOME=$ANDROID_HOME)"
 ./gradlew "$TASK" -PdxrForceVendoredCjson
 
@@ -121,7 +121,7 @@ fi
 # fails on a version downgrade (prints only "Performing Streamed Install").
 echo ">> adb ${DEVICE_ARGS[*]} install -r -d <apk>"
 "$ADB" "${DEVICE_ARGS[@]}" install -r -d "$APK"
-echo "Installed $GRADLE_FLAVOR/$VARIANT on device."
+echo "Installed $VARIANT on device."
 
 # ---- re-grant the overlay permission ----------------------------------------
 # SYSTEM_ALERT_WINDOW ("display over other apps") is a special app-op permission:
@@ -132,8 +132,6 @@ echo "Installed $GRADLE_FLAVOR/$VARIANT on device."
 # back to publishing its own opaque surface, and the app renders on a BLACK
 # background with no other symptom (3D/weave keeps working). Re-grant on every
 # install so a reinstall can't silently regress transparency.
-if [ "$FLAVOR" = "outofprocess" ]; then PKG="org.freedesktop.monado.openxr_runtime.out_of_process"
-else PKG="org.freedesktop.monado.openxr_runtime.in_process"; fi
 echo ">> adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow"
 if "$ADB" "${DEVICE_ARGS[@]}" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow; then
     echo "Overlay permission (SYSTEM_ALERT_WINDOW) granted to $PKG."

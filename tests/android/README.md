@@ -26,7 +26,7 @@ tests themselves.
   `adb shell getprop ro.product.vendor.device` shows you the expected device.)
 - Have Python and pytest installed, either system-wide or in a `venv`. The
   version of pytest in Debian Bookworm is suitable.
-- Have built and installed the "outOfProcessDebug" build of Monado.
+- Have built and installed the "debug" build of the runtime.
   (`./gradlew installOOPD` in root dir)
 - Have set the out-of-process runtime as active in the OpenXR Runtime Broker (if
   applicable).

@@ -24,12 +24,6 @@ Files: src/xrt/targets/openxr_android/src/main/res/mipmap-mdpi/*.webp
   src/xrt/targets/openxr_android/src/main/res/mipmap-xxhdpi/*.webp
   src/xrt/targets/openxr_android/src/main/res/mipmap-xxxhdpi/*.webp
   src/xrt/targets/openxr_android/src/main/ic_launcher-playstore.png
-  src/xrt/targets/openxr_android/src/inProcess/res/mipmap-mdpi/*.webp
-  src/xrt/targets/openxr_android/src/inProcess/res/mipmap-hdpi/*.webp
-  src/xrt/targets/openxr_android/src/inProcess/res/mipmap-xhdpi/*.webp
-  src/xrt/targets/openxr_android/src/inProcess/res/mipmap-xxhdpi/*.webp
-  src/xrt/targets/openxr_android/src/inProcess/res/mipmap-xxxhdpi/*.webp
-  src/xrt/targets/openxr_android/src/inProcess/ic_launcher_inproc-playstore.png
   src/xrt/targets/openxr_android/src/main/res/drawable-mdpi/*.png
   src/xrt/targets/openxr_android/src/main/res/drawable-hdpi/*.png
   src/xrt/targets/openxr_android/src/main/res/drawable-xhdpi/*.png
