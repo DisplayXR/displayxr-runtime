@@ -422,6 +422,7 @@ load_and_probe_one(const struct plugin_entry *e,
 	// in-process vendor plug-in can resolve vendor Java glue the app does
 	// not ship. Class loading only — see xrt_plugin.h.
 	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
+	host.android_package_is_visible = plugin_host_android_package_is_visible;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -869,6 +870,100 @@ plugin_host_get_android_activity(void)
 }
 
 /*
+ * runtime#1079 — is `package_name` visible to THIS process?
+ *
+ * Android resolves `<queries>` per calling uid. In-process (ADR-036 D2) the
+ * vendor DP runs in the app's uid, so a vendor service package the runtime APK
+ * declares is still invisible unless the APP declares it too. A vendor core
+ * loader that queries it, swallows the NameNotFoundException and then makes one
+ * more JNI call takes the whole app down via CheckJNI, from inside closed code.
+ *
+ * This lets a plug-in ask BEFORE it hands control to that loader. Every JNI step
+ * is exception-checked, and the probe reports "not visible" for any failure —
+ * the caller's contract is a clean bool, never a pending exception.
+ */
+static bool
+plugin_host_android_package_is_visible(const char *package_name)
+{
+	if (package_name == NULL) {
+		return false;
+	}
+	JavaVM *vm = (JavaVM *)android_globals_get_vm();
+	// The APP's Context is the one whose visibility decides this; the
+	// class-host Context is deliberately NOT used (it runs under the same uid
+	// but exists only for class loading, and using it here would suggest
+	// otherwise).
+	jobject ctx = (jobject)plugin_host_get_android_activity();
+	if (vm == NULL || ctx == NULL) {
+		return false;
+	}
+
+	JNIEnv *env = NULL;
+	bool attached = false;
+	if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+		if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK) {
+			return false;
+		}
+		attached = true;
+	}
+	if (env == NULL) {
+		return false;
+	}
+	if ((*env)->ExceptionCheck(env)) {
+		(*env)->ExceptionClear(env);
+	}
+
+	bool visible = false;
+	jclass ctx_cls = (*env)->GetObjectClass(env, ctx);
+	if (ctx_cls != NULL) {
+		jmethodID get_pm = (*env)->GetMethodID(env, ctx_cls, "getPackageManager",
+		                                       "()Landroid/content/pm/PackageManager;");
+		jobject pm = (get_pm != NULL) ? (*env)->CallObjectMethod(env, ctx, get_pm) : NULL;
+		if ((*env)->ExceptionCheck(env)) {
+			(*env)->ExceptionClear(env);
+			pm = NULL;
+		}
+		if (pm != NULL) {
+			jclass pm_cls = (*env)->GetObjectClass(env, pm);
+			jmethodID get_info =
+			    (pm_cls != NULL)
+			        ? (*env)->GetMethodID(env, pm_cls, "getPackageInfo",
+			                              "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;")
+			        : NULL;
+			if (get_info != NULL) {
+				jstring jpkg = (*env)->NewStringUTF(env, package_name);
+				if (jpkg != NULL) {
+					jobject info = (*env)->CallObjectMethod(env, pm, get_info, jpkg, 0);
+					// NameNotFoundException is the EXPECTED negative answer, not
+					// an error: clear it and report false.
+					if ((*env)->ExceptionCheck(env)) {
+						(*env)->ExceptionClear(env);
+						info = NULL;
+					}
+					visible = (info != NULL);
+					if (info != NULL) {
+						(*env)->DeleteLocalRef(env, info);
+					}
+					(*env)->DeleteLocalRef(env, jpkg);
+				}
+			}
+			if (pm_cls != NULL) {
+				(*env)->DeleteLocalRef(env, pm_cls);
+			}
+			(*env)->DeleteLocalRef(env, pm);
+		}
+		(*env)->DeleteLocalRef(env, ctx_cls);
+	}
+	if ((*env)->ExceptionCheck(env)) {
+		(*env)->ExceptionClear(env);
+	}
+	if (attached) {
+		(*vm)->DetachCurrentThread(vm);
+	}
+	return visible;
+}
+
+/*
  * ADR-036 D2 / #1037 — the runtime APK's package name, derived from the
  * directory the runtime `.so` was loaded from
  * (`/data/app/~~<h>==/<pkg>-<h>==/lib/<abi>`). Android package names cannot
@@ -918,6 +1013,18 @@ remember_runtime_package_from_lib_dir(const char *lib_dir)
 static bool
 context_package_name(JNIEnv *env, jobject ctx, char *out, size_t out_size)
 {
+	// Under CheckJNI both a NULL object and an already-pending exception turn
+	// the GetObjectClass below into a process ABORT rather than an error
+	// return, so neither may reach it. Clearing an inherited exception here is
+	// deliberate: we did not raise it, we cannot handle it, and carrying it
+	// into the next JNI call is what makes an unrelated component the one that
+	// dies. (runtime#1079.)
+	if (ctx == NULL) {
+		return false;
+	}
+	if ((*env)->ExceptionCheck(env)) {
+		(*env)->ExceptionClear(env);
+	}
 	jclass cls = (*env)->GetObjectClass(env, ctx);
 	if (cls == NULL) {
 		(*env)->ExceptionClear(env);
@@ -1356,6 +1463,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// in-process vendor plug-in can resolve vendor Java glue the app does
 	// not ship. Class loading only — see xrt_plugin.h.
 	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
+	host.android_package_is_visible = plugin_host_android_package_is_visible;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
@@ -1888,6 +1996,7 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 	// in-process vendor plug-in can resolve vendor Java glue the app does
 	// not ship. Class loading only — see xrt_plugin.h.
 	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
+	host.android_package_is_visible = plugin_host_android_package_is_visible;
 #endif
 
 	struct xrt_plugin_iface *iface = NULL;
