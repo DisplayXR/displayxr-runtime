@@ -326,6 +326,42 @@ That reframing is what makes tier 0 worth shipping.
 | **T1** | MediaProjection producer behind the same seam, dev-gated | `MediaProjection` + `VirtualDisplay` (+ hidden-API layer exclusion where the ROM allows) | lab validation, A/B of the compose pass against a real background | ~1 wk, **not shippable** |
 | **T2** | Out-of-process capture producer feeding the same seam. Consumer shipped (`comp_multi_bg2d_capture.c`, `debug.dxr.bg2d=capture`); producer shipped in the vendor display-config APK with two entry points — a bound service for the day the platform permits it, and an `app_process` daemon at shell/root uid for now | vendor service (product) / permitted-uid daemon (dev) | `once`: complete and feedback-free, correct for a static background — the avatar-over-launcher case. `uid`: single-app backgrounds. Everything else needs the OEM | our side done; vendor side is the schedule |
 
+### T2 and the canvas rect (leia-plugin#174)
+
+Slot 16's contract is that the backdrop arrives **in the canvas rect** — the
+same client-window pixel space `process_atlas` works in — which is why the DP
+maps the whole image onto each atlas tile with `bg_uv = (0,0)-(1,1)` and needs
+no notion of producer tier. T0 satisfies that by construction: the runtime draws
+the backdrop, so it *is* canvas-space.
+
+**A T2 producer does not.** A screen capture is the whole screen, so the frame
+is whole-**panel** pixels. Passing it straight through put the entire launcher
+inside the avatar's zone-3D canvas — the bottom 75 % of the panel — shifted down
+25 % and scaled to 0.75. On a full-width window the horizontal half of that
+error is the identity, so what remained visible was a pure vertical
+displacement; against T0's x-constant gradient it was invisible entirely, which
+is why it surfaced only once a real background arrived.
+
+`comp_multi_bg2d_ensure` therefore **crops the captured frame to the canvas rect
+before upload**. The rect is `window_screen_{x,y}` + the zone-3D placement rect,
+in panel pixels; the frame is a uniform downscale of the panel
+(`DisplayCaptureArgs.setSize`), so the mapping is one ratio per axis. Cropping
+in the receiver rather than in the DP keeps one coordinate space on the seam,
+puts no producer-tier flag on the wire, and matches Windows/Linux, where the
+capture module hands the DP a window sub-rect instead of the DP
+reverse-engineering one.
+
+Verified on an NP02J by pushing a deterministic asymmetric pattern through
+`@displayxr.bg2d` with the plug-in's `debug.dxr.leia.bgdebug=1` (compose the
+backdrop only, skip the alpha gate — both tiles then carry identical
+zero-disparity content, so a panel `screencap` reads back as the backdrop
+itself): the quadrant boundary moved from panel y 0.625 to 0.500, and a real
+launcher capture composes 1:1 with the live screen behind it.
+
+*(#174 reported this as the background being sampled mirrored in X. It is not —
+the same pattern test shows every corner and edge marker landing where it was
+sent. The defect was only ever vertical.)*
+
 ### T0 as built (#1073)
 
 - **Producer** — `src/xrt/compositor/multi/comp_multi_bg2d.c`: a 4x256 RGBA8

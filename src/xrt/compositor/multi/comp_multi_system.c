@@ -3373,6 +3373,24 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			// this reports geometry; the weaver still owns all phase.
 			update_window_screen_rect(mc);
 
+			// Canvas sub-rect: a zone-3D layer (XR_DXR_display_zones, #568)
+			// confines its woven output to a placement rect (e.g. the avatar's
+			// bottom-75% tiger zone); the DP weaves into that band and clears
+			// outside it transparent. A plain projection layer passes 0,0,0,0
+			// → the DP fills the full target (unchanged for every other app).
+			//
+			// Computed here rather than at the process_atlas call below because
+			// the compose-under backdrop has to be cut to the SAME rect (#174).
+			int32_t canvas_x = 0, canvas_y = 0;
+			uint32_t canvas_w = 0, canvas_h = 0;
+			if (layer->data.type == XRT_LAYER_ZONE_3D) {
+				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
+				canvas_x = zr->offset.w;
+				canvas_y = zr->offset.h;
+				canvas_w = (uint32_t)zr->extent.w;
+				canvas_h = (uint32_t)zr->extent.h;
+			}
+
 #ifdef XRT_OS_ANDROID
 			// #1073 T0 — compose-under background (base DP vtable slot 16).
 			//
@@ -3394,8 +3412,24 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			// Cleared explicitly when off, so a session that stops being
 			// transparent can never leave a stale view bound in the DP.
 			if (mc->session_render.dp_transparent && comp_multi_bg2d_enabled()) {
+				// Where this session's canvas sits on the panel. T2 sends a
+				// whole-panel capture while slot 16 promises the canvas, so
+				// the receiver crops to this rect (#174); T0 draws its own
+				// canvas-space backdrop and ignores it. The canvas rect is in
+				// target pixels, which on Android OOP are panel pixels, so the
+				// window origin is the only offset needed. A zero rect (plain
+				// projection layer, or no window rect reported yet) means "the
+				// whole window", which is the pre-#174 behaviour.
+				const bool have_win = mc->session_render.window_rect_generation != 0;
+				struct xrt_rect canvas_on_panel = {
+				    .offset = {.w = mc->session_render.window_screen_x + canvas_x,
+				               .h = mc->session_render.window_screen_y + canvas_y},
+				    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : mc->session_render.window_screen_w),
+				               .h = (int)(canvas_h != 0 ? canvas_h : mc->session_render.window_screen_h)},
+				};
 				uint32_t bg_w = 0, bg_h = 0;
-				VkImageView bg_view = comp_multi_bg2d_ensure(mc, vk, &bg_w, &bg_h);
+				VkImageView bg_view =
+				    comp_multi_bg2d_ensure(mc, vk, have_win ? &canvas_on_panel : NULL, &bg_w, &bg_h);
 				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
 				                                        bg_view, bg_w, bg_h);
 			} else {
@@ -3413,21 +3447,6 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			// it — which is why in-process Leia 3D works but OOP was black. (#510 M2)
 			xrt_display_processor_set_target_color_view(mc->session_render.display_processor,
 			                                            ct->images[buffer_index].view);
-
-			// Canvas sub-rect: a zone-3D layer (XR_DXR_display_zones, #568)
-			// confines its woven output to a placement rect (e.g. the avatar's
-			// bottom-75% tiger zone); the DP weaves into that band and clears
-			// outside it transparent. A plain projection layer passes 0,0,0,0
-			// → the DP fills the full target (unchanged for every other app).
-			int32_t canvas_x = 0, canvas_y = 0;
-			uint32_t canvas_w = 0, canvas_h = 0;
-			if (layer->data.type == XRT_LAYER_ZONE_3D) {
-				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
-				canvas_x = zr->offset.w;
-				canvas_y = zr->offset.h;
-				canvas_w = (uint32_t)zr->extent.w;
-				canvas_h = (uint32_t)zr->extent.h;
-			}
 
 			// Call display processor with atlas input
 			xrt_display_processor_process_atlas(

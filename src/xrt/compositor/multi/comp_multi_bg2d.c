@@ -192,6 +192,10 @@ comp_multi_bg2d_teardown(struct multi_compositor *mc, struct vk_bundle *vk)
 	if (mc == NULL) {
 		return;
 	}
+	// #174 crop scratch — plain host memory, so it goes regardless of `vk`.
+	free(mc->session_render.bg2d_crop_scratch);
+	mc->session_render.bg2d_crop_scratch = NULL;
+	mc->session_render.bg2d_crop_capacity = 0;
 	if (vk != NULL) {
 		if (mc->session_render.bg2d_view != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, mc->session_render.bg2d_view, NULL);
@@ -474,8 +478,103 @@ fail:
 }
 
 
+/*!
+ * Where the canvas lands inside a T2 capture frame (#174).
+ *
+ * A capture producer sends the whole **panel**; slot 16 promises the DP the
+ * **canvas** (see comp_multi_bg2d.h). Both are expressed here in panel pixels
+ * and the frame is a uniformly downscaled copy of the panel — SurfaceFlinger
+ * does the scaling via `DisplayCaptureArgs.setSize` — so the mapping is one
+ * ratio per axis, taken from the frame's own dims against the panel's.
+ *
+ * Only computes the rect; the repack is separate so the caller can settle the
+ * upload dimensions (and therefore whether the image must be rebuilt) *before*
+ * touching the scratch buffer that teardown owns.
+ *
+ * @return false for any reason not to crop — no panel dims yet, a degenerate or
+ *         fully off-panel canvas, or a canvas that already is the whole frame.
+ *         An uncropped backdrop is merely mis-scaled; a wrongly cropped one can
+ *         be empty, so "don't crop" is always the safe answer.
+ */
+static bool
+bg2d_canvas_crop_rect(const struct xrt_rect *canvas_on_panel,
+                      uint32_t panel_w,
+                      uint32_t panel_h,
+                      uint32_t frame_w,
+                      uint32_t frame_h,
+                      uint32_t *out_x,
+                      uint32_t *out_y,
+                      uint32_t *out_w,
+                      uint32_t *out_h)
+{
+	if (canvas_on_panel == NULL || panel_w == 0 || panel_h == 0 || frame_w == 0 || frame_h == 0) {
+		return false;
+	}
+	if (canvas_on_panel->extent.w <= 0 || canvas_on_panel->extent.h <= 0) {
+		return false;
+	}
+
+	// Round each EDGE from its panel coordinate rather than adding a rounded
+	// extent to a rounded origin, so abutting canvases stay abutting.
+	const double sx = (double)frame_w / (double)panel_w;
+	const double sy = (double)frame_h / (double)panel_h;
+	int64_t x0 = (int64_t)((double)canvas_on_panel->offset.w * sx + 0.5);
+	int64_t y0 = (int64_t)((double)canvas_on_panel->offset.h * sy + 0.5);
+	int64_t x1 = (int64_t)(((double)canvas_on_panel->offset.w + canvas_on_panel->extent.w) * sx + 0.5);
+	int64_t y1 = (int64_t)(((double)canvas_on_panel->offset.h + canvas_on_panel->extent.h) * sy + 0.5);
+
+	// Clamp to the frame; a canvas partly off-panel crops to what exists.
+	x0 = x0 < 0 ? 0 : (x0 > (int64_t)frame_w ? (int64_t)frame_w : x0);
+	y0 = y0 < 0 ? 0 : (y0 > (int64_t)frame_h ? (int64_t)frame_h : y0);
+	x1 = x1 < 0 ? 0 : (x1 > (int64_t)frame_w ? (int64_t)frame_w : x1);
+	y1 = y1 < 0 ? 0 : (y1 > (int64_t)frame_h ? (int64_t)frame_h : y1);
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	if ((uint32_t)(x1 - x0) == frame_w && (uint32_t)(y1 - y0) == frame_h) {
+		return false; // already exactly the canvas — nothing to do
+	}
+
+	*out_x = (uint32_t)x0;
+	*out_y = (uint32_t)y0;
+	*out_w = (uint32_t)(x1 - x0);
+	*out_h = (uint32_t)(y1 - y0);
+	return true;
+}
+
+//! Repack a sub-rect of @p src into @p scratch (grown as needed). NULL on OOM.
+static const uint8_t *
+bg2d_repack_crop(const uint8_t *src,
+                 uint32_t frame_w,
+                 uint32_t x,
+                 uint32_t y,
+                 uint32_t w,
+                 uint32_t h,
+                 uint8_t **scratch,
+                 size_t *scratch_capacity)
+{
+	const size_t need = (size_t)w * h * 4;
+	if (*scratch_capacity < need) {
+		uint8_t *grown = realloc(*scratch, need);
+		if (grown == NULL) {
+			return NULL;
+		}
+		*scratch = grown;
+		*scratch_capacity = need;
+	}
+	for (uint32_t row = 0; row < h; row++) {
+		memcpy(*scratch + (size_t)row * w * 4, src + ((size_t)(y + row) * frame_w + x) * 4, (size_t)w * 4);
+	}
+	return *scratch;
+}
+
+
 VkImageView
-comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t *out_w, uint32_t *out_h)
+comp_multi_bg2d_ensure(struct multi_compositor *mc,
+                       struct vk_bundle *vk,
+                       const struct xrt_rect *canvas_on_panel,
+                       uint32_t *out_w,
+                       uint32_t *out_h)
 {
 	if (mc == NULL || vk == NULL) {
 		return VK_NULL_HANDLE;
@@ -495,17 +594,49 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 
 		struct comp_multi_bg2d_capture_frame f = {0};
 		if (comp_multi_bg2d_capture_acquire(&f, mc->session_render.bg2d_seq)) {
-			const bool resized =
-			    mc->session_render.bg2d_initialized &&
-			    (mc->session_render.bg2d_w != f.width || mc->session_render.bg2d_h != f.height);
-			if (resized) {
-				// The producer may re-negotiate its output size (a
-				// rotation, a different crop). Rebuild rather than
-				// scale — it happens ~never and correctness is free.
+			// #174 — the producer sent PANEL pixels; slot 16 promises the
+			// CANVAS. Crop before the upload so the DP's (0,0)-(1,1) tile
+			// mapping lands the backdrop exactly where the atlas depicts.
+			uint32_t cx = 0, cy = 0, up_w = f.width, up_h = f.height;
+			const bool crop = bg2d_canvas_crop_rect(
+			    canvas_on_panel, mc->session_render.window_screen_disp_w,
+			    mc->session_render.window_screen_disp_h, f.width, f.height, &cx, &cy, &up_w, &up_h);
+
+			// Settle the upload dims BEFORE any teardown: the producer may
+			// re-negotiate its output size (a rotation, a different capture
+			// crop) and the canvas rect itself can move. Rebuild rather than
+			// scale — it happens ~never and correctness is free. Teardown also
+			// frees the crop scratch, so it must run before the repack writes
+			// into it.
+			if (mc->session_render.bg2d_initialized &&
+			    (mc->session_render.bg2d_w != up_w || mc->session_render.bg2d_h != up_h)) {
 				comp_multi_bg2d_teardown(mc, vk);
 			}
+
+			const uint8_t *px = f.pixels;
+			if (crop) {
+				// Session-owned scratch, not a per-frame malloc: a producer
+				// at 10 Hz repacks once per delivery, not once per frame.
+				px = bg2d_repack_crop(f.pixels, f.width, cx, cy, up_w, up_h,
+				                      &mc->session_render.bg2d_crop_scratch,
+				                      &mc->session_render.bg2d_crop_capacity);
+				if (px == NULL) { // OOM — a mis-scaled backdrop beats none
+					px = f.pixels;
+					up_w = f.width;
+					up_h = f.height;
+				} else if (!mc->session_render.bg2d_logged_crop) {
+					mc->session_render.bg2d_logged_crop = true;
+					U_LOG_W("bg2d(#1073 T2): cropped the %ux%u panel capture to the canvas"
+					        " %d,%d %dx%d on a %ux%u panel -> %ux%u at (%u,%u) (#174)",
+					        f.width, f.height, canvas_on_panel->offset.w,
+					        canvas_on_panel->offset.h, canvas_on_panel->extent.w,
+					        canvas_on_panel->extent.h, mc->session_render.window_screen_disp_w,
+					        mc->session_render.window_screen_disp_h, up_w, up_h, cx, cy);
+				}
+			}
+
 			uint32_t seq = f.seq;
-			bool ok = bg2d_build(mc, vk, f.width, f.height, f.pixels);
+			bool ok = bg2d_build(mc, vk, up_w, up_h, px);
 			comp_multi_bg2d_capture_release();
 			if (ok) {
 				mc->session_render.bg2d_seq = seq;
@@ -519,6 +650,8 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 			return VK_NULL_HANDLE;
 		}
 	} else if (!mc->session_render.bg2d_initialized) {
+		// T0's backdrop is runtime-drawn, so it is canvas-space by
+		// construction and never cropped — canvas_on_panel is unused here.
 		if (!bg2d_build(mc, vk, BG2D_W, BG2D_H, NULL)) {
 			return VK_NULL_HANDLE;
 		}

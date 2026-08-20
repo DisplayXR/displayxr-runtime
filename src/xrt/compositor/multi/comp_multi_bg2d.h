@@ -41,6 +41,7 @@
 #pragma once
 
 #include "vk/vk_helpers.h"
+#include "xrt/xrt_defines.h" // struct xrt_rect (the T2 canvas crop, #174)
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,13 +69,44 @@ comp_multi_bg2d_enabled(void);
  * copy recorded into the compositor's frame command buffer would still be
  * unsubmitted when the DP's compose pass samples the image.
  *
+ * ## T2 and the canvas rect (#174)
+ *
+ * Slot 16's contract is that the backdrop arrives *"in the same client-window
+ * pixel space / canvas rect as `process_atlas`"* — the DP therefore maps the
+ * whole image onto each atlas tile (`bg_uv` = (0,0)-(1,1)) and must not be
+ * asked to guess a sub-rect. T0 satisfies that by construction: the runtime
+ * draws the backdrop, so it *is* canvas-space. A **T2 producer does not** — it
+ * sends whole-**panel** pixels, because a screen capture is the whole screen.
+ *
+ * Handing those straight through is what made the compose-under band show
+ * launcher content at the wrong place and scale (#174: an avatar whose zone-3D
+ * canvas is the bottom ~75 % of the panel got the entire launcher squeezed into
+ * that band, shifted down 25 % and scaled to 0.75). The full-width case hides
+ * the horizontal half of the error, which is why it read as a pure vertical
+ * offset on the avatar and as "nothing obviously wrong" against T0's
+ * x-constant gradient.
+ *
+ * So the **receiver crops**: @p canvas_on_panel is where this session's canvas
+ * actually sits on the panel, in panel pixels, and the captured frame is cut
+ * down to it before upload. Cropping here rather than in the DP keeps the slot
+ * contract intact (one coordinate space, no producer-tier flag on the wire) and
+ * matches Windows/Linux, where the capture module hands the DP a window sub-rect
+ * rather than the DP reverse-engineering one.
+ *
  * @param      mc     Session whose `session_render` owns the resources.
  * @param      vk     The compositor's Vulkan bundle.
+ * @param      canvas_on_panel Canvas rect in panel pixels, or NULL / a
+ *                    degenerate rect to use the frame whole (T0 always passes
+ *                    NULL — a runtime-drawn backdrop is already canvas-space).
  * @param[out] out_w  Backdrop width in pixels (may be NULL).
  * @param[out] out_h  Backdrop height in pixels (may be NULL).
  */
 VkImageView
-comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t *out_w, uint32_t *out_h);
+comp_multi_bg2d_ensure(struct multi_compositor *mc,
+                       struct vk_bundle *vk,
+                       const struct xrt_rect *canvas_on_panel,
+                       uint32_t *out_w,
+                       uint32_t *out_h);
 
 /*!
  * Release the backdrop image/memory/staging buffer. Idempotent; safe with a
