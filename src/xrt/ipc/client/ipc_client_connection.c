@@ -850,6 +850,62 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 #endif
 
 
+/*!
+ * browser#103 RC-1: tell the service which process this connection really
+ * belongs to, before any handle crosses.
+ *
+ * Sent ONLY on an adopted connection — a normally-dialled client's wire traffic
+ * is byte-for-byte what it was, and the service's behaviour for it is unchanged.
+ *
+ * WHAT WE DECLARE IS ALWAYS OURSELVES, and that is the whole trick. An adopting
+ * process cannot know whether it also happens to be the process that opened the
+ * transport: it was handed a connected endpoint, not a provenance. But it does
+ * not need to. Its own pid is unconditionally the correct answer to both
+ * questions the server is asking — which process must the shared memory, woven
+ * texture and fence be duplicated into (this one: it is the process running the
+ * client library and importing them), and whose identity should gates run
+ * against (this one: it is the process making the calls). If the adopter turns
+ * out to be the opener too, the declaration is a no-op that names the value the
+ * server already had. So "adopt-time init always declares self" is correct
+ * regardless of who opened the pipe, and needs no extra channel to tell the two
+ * cases apart.
+ *
+ * A refusal is not fatal (the server answers accepted=0 rather than an error):
+ * the connection continues with opener attribution, i.e. exactly today's
+ * behaviour. On Windows that means the sandboxed peer will fail to import
+ * handles, which is a loud, well-logged failure — much better than a connection
+ * that dies at xrCreateInstance for a reason the caller cannot classify.
+ */
+static void
+ipc_client_declare_peer(struct ipc_connection *ipc_c)
+{
+	struct ipc_peer_declaration decl = {0};
+#ifdef XRT_OS_WINDOWS
+	decl.target_pid = (int64_t)GetCurrentProcessId();
+#else
+	decl.target_pid = (int64_t)getpid();
+#endif
+
+	uint32_t accepted = 0;
+	xrt_result_t xret = ipc_call_instance_declare_peer(ipc_c, &decl, &accepted);
+	if (xret != XRT_SUCCESS) {
+		IPC_WARN(ipc_c,
+		         "Peer declaration call failed (xret %d) — continuing with the service's own view of "
+		         "this connection (browser#103).",
+		         xret);
+		return;
+	}
+	if (accepted == 0) {
+		IPC_WARN(ipc_c,
+		         "The service REFUSED our peer declaration (pid %lld); handles will be duplicated to whoever "
+		         "opened this connection. See the service log for the reason (browser#103).",
+		         (long long)decl.target_pid);
+		return;
+	}
+	IPC_INFO(ipc_c, "Adopted connection declared to the service as pid %lld (browser#103).",
+	         (long long)decl.target_pid);
+}
+
 static xrt_result_t
 ipc_client_setup_shm(struct ipc_connection *ipc_c)
 {
@@ -1046,6 +1102,14 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		          "###");
 		os_mutex_destroy(&ipc_c->mutex);
 		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// browser#103 RC-1: MUST precede ipc_client_setup_shm — that is the call
+	// that transfers the first handle, and a declaration afterwards is too late
+	// (the server refuses it). Only an adopted connection sends anything here,
+	// so the wire for every other client is unchanged.
+	if (ipc_c->adopted) {
+		ipc_client_declare_peer(ipc_c);
 	}
 
 	// Do this first so we can use it to check git tags.

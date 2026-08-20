@@ -1027,5 +1027,14 @@
 			{"name": "brightness", "type": "float"},
 			{"name": "relative", "type": "bool"}
 		]
+	},
+
+	"instance_declare_peer": {
+		"in": [
+			{"name": "decl", "type": "struct ipc_peer_declaration"}
+		],
+		"out": [
+			{"name": "accepted", "type": "uint32_t"}
+		]
 	}
 }

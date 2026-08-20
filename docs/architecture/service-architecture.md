@@ -388,6 +388,39 @@ dev-launched service, `:95-107`); 3 check `s->workspace_controller_pid` (fail cl
 1 uses the "effective" fallback. `session_set_modal_state`/`session_request_file_picker`
 document their no-auth choice; the 14 ungated `workspace_*` handlers do not.
 
+#### 4.1a Declared peer identity, for a brokered connection (browser#103 RC-1)
+
+Since #954 the peer is OS-derived, from `GetNamedPipeClientProcessId` (Windows) /
+`SO_PEERCRED` / `LOCAL_PEERPID`. On Windows that call names **whoever opened the pipe**, and
+the same value is what `open_target_process_dup_handle` (`ipc_message_channel_windows.cpp`)
+duplicates shared memory, the woven texture and the fence into.
+
+That is right for every client that dials its own connection, and wrong for a **brokered**
+one — an endpoint opened by a process on behalf of a sandboxed sibling that cannot reach the
+pipe (`XR_DXR_weave` §4c; Chromium's GPU process). There the handles would land in the broker
+and the sibling would import nothing, while its integrity level was misread as the broker's.
+
+So a connection may **declare** the process it really belongs to:
+
+| | |
+|---|---|
+| Wire | `instance_declare_peer` — `struct ipc_peer_declaration { int64_t target_pid; uint32_t flags; }` → `uint32_t accepted` |
+| When | The client's FIRST call, before `instance_get_shm_fd` transfers any handle. The server refuses one that arrives after (`ics->handles_sent`) or a second one (`ics->peer_declared`) — identity settles once, so no gate can be re-run against a changed peer |
+| Who sends it | Only an **adopted** connection (`ipc_connection::adopted`), and it always declares **itself**. The adopter cannot know whether it is also the opener, and does not need to: its own pid is unconditionally both the right duplication target and the right identity, so if it *is* the opener the declaration merely restates what the server had |
+| **The rule** | The opener is the AUTHORISER, the declared target is the PEER. Accepted only when **opener IL ≥ target IL** — a Medium browser may delegate to its own Low child, a Low process may never escalate |
+| Enforcement point | `ipc_server_peer_declaration_allowed()` in `ipc_server_peer_creds.c` — reads both processes' `TokenIntegrityLevel` RIDs and **fails closed** on anything unreadable. POSIX has no handle duplication and no IL, so only self-declaration is honoured there |
+| On acceptance | `ics->peer_pid` / `client_state.pid` become the declared target (`ics->opener_pid` keeps the authoriser) and `imc.dup_target_pid` redirects the duplication. That last field is the ONLY behavioural change; 0 = ask the OS = every pre-existing client |
+| On refusal | Not fatal. `accepted = 0`, both sides log why, and the connection continues with opener attribution — byte-identical to a client that declared nothing |
+
+Net effect on the trust model: attribution gets **more** accurate, not less. Before, a brokered
+connection was silently credited to the broker's pid and integrity level; now it is credited to
+the process actually making the calls, and only when the broker was entitled to hand it over.
+
+The wire addition is free on compatibility grounds — `ipc_client_check_git_tag`
+(`ipc_client_connection.c`) already forces client library and service into exact
+`u_git_tag` lockstep, and the call is appended to `proto.json` so no existing command's
+numeric id moves.
+
 ### 4.2 Shared display state — who writes it
 
 | State | Writers (class → anchor) | Rule today |
