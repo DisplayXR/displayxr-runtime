@@ -14,6 +14,7 @@
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
+#include "comp_d3d11_xbridge.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -49,6 +50,7 @@
 
 #include "math/m_api.h"
 #include "d3d/d3d_dxgi_formats.h"
+#include "d3d/d3d_scanout_helpers.hpp"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
@@ -96,6 +98,20 @@ struct comp_settings
 // emitting DWM-dependent alpha.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque_comp, "DXR_PRESENT_OPAQUE", false)
 
+/*!
+ * #918 output-device split. On a non-MUX hybrid the panel is scanned out by the
+ * iGPU while the app renders on the dGPU, so today's placement pays ~42 ms of
+ * present-to-display and re-crosses the whole woven frame on every repaint tick
+ * (docs/investigations/hybrid-igpu-weave.md). Opting in moves the target, the
+ * display processor, the HUD and the repaint loop onto the SCANOUT adapter and
+ * ships only the atlas across, once per app frame.
+ *
+ * Prototype, off by default. Silent no-op when the scanout adapter IS the app's
+ * adapter; any setup failure falls back to the stock single-device path with one
+ * WARN naming the reason — it must never brick a session.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(weave_on_scanout, "DXR_WEAVE_ON_SCANOUT", false)
+
 struct comp_d3d11_compositor
 {
 	//! Base type - must be first!
@@ -136,6 +152,29 @@ struct comp_d3d11_compositor
 	 * the target is handed its device/context/factory explicitly, #918.)
 	 */
 	ID3D10Multithread *mt_lock;
+
+	/*!
+	 * #918 OUTPUT-DEVICE SPLIT. Everything below is NULL/false unless
+	 * DXR_WEAVE_ON_SCANOUT=1 resolved a scanout adapter that differs from the
+	 * app device's. When the split is active these — not `device`/`context`/
+	 * `dxgi_factory` above — own the swapchain, the display processor, the HUD
+	 * and the repaint loop; the renderer and the atlas stay on the app device
+	 * and the composited atlas crosses once per frame through `xbridge`.
+	 *
+	 * Appended AFTER mt_lock deliberately: comp_d3d11_renderer.cpp still
+	 * mirrors the prefix up to dxgi_factory as
+	 * `comp_d3d11_compositor_internals`, so nothing may be inserted into it.
+	 */
+	ID3D11Device *out_dev;
+	ID3D11DeviceContext *out_ctx;
+	IDXGIFactory4 *out_factory;
+	LUID out_luid;
+	struct comp_d3d11_xbridge *xbridge;
+	bool split_active;
+	//! Monotonic app frame counter — the single seq every bridge fence uses.
+	uint64_t split_seq;
+	//! One-shot latch for the projection-only scope WARN (#918 Phase 1).
+	bool split_gated_warned;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
@@ -456,6 +495,47 @@ static inline struct comp_d3d11_compositor *
 d3d11_comp(struct xrt_compositor *xc)
 {
 	return reinterpret_cast<struct comp_d3d11_compositor *>(xc);
+}
+
+/*!
+ * #918: the device the OUTPUT side lives on — the swapchain, the display
+ * processor, the HUD and every read-back of the woven back buffer. The app
+ * device when the split is off, so every call site is written once.
+ */
+static inline ID3D11Device *
+d3d11_out_device(struct comp_d3d11_compositor *c)
+{
+	return c->split_active ? c->out_dev : c->device;
+}
+
+static inline ID3D11DeviceContext *
+d3d11_out_context(struct comp_d3d11_compositor *c)
+{
+	return c->split_active ? c->out_ctx : c->context;
+}
+
+/*!
+ * #918 Phase 1 scope gate. Zones, Local2D, authored masks and the 2D backdrop
+ * all read app-device textures and write the output-device back buffer, so they
+ * are device-crossing by construction and are deferred to Phase 2. Under the
+ * split they are hard-gated with ONE WARN; a plain projection weave continues
+ * unaffected, and nothing crashes.
+ *
+ * @return true when the caller must skip the device-crossing work.
+ */
+static bool
+d3d11_split_gate(struct comp_d3d11_compositor *c, const char *what)
+{
+	if (!c->split_active) {
+		return false;
+	}
+	if (!c->split_gated_warned) {
+		c->split_gated_warned = true;
+		U_LOG_W("D3D11 output-device split: %s is device-crossing and is NOT implemented in "
+		        "Phase 1 — skipped for this session; plain projection weave continues (#918)",
+		        what);
+	}
+	return true;
 }
 
 /*!
@@ -813,14 +893,19 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					 * sent the weave to the app's render target and left the
 					 * swapchain black.
 					 */
-					if (c->mt_lock != nullptr) {
+					// #918: under the split the swapchain lives on the runtime's own
+					// output device, which the app never touches — so this bracket
+					// (whose sole purpose is excluding the app's render thread from
+					// the APP's immediate context) is unnecessary and wrong to take.
+					const bool resize_needs_lock = !c->split_active && c->mt_lock != nullptr;
+					if (resize_needs_lock) {
 						c->mt_lock->Enter();
 					}
 					// Deliberately NOT wrapped in app_state_guard: the guard would
 					// AddRef whatever RTV is bound, and if that is our own back
 					// buffer, ResizeBuffers fails (it needs zero outstanding refs).
 					xrt_result_t xret = comp_d3d11_target_resize(c->target, new_width, new_height);
-					if (c->mt_lock != nullptr) {
+					if (resize_needs_lock) {
 						c->mt_lock->Leave();
 					}
 					if (xret != XRT_SUCCESS) {
@@ -1267,7 +1352,7 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-		HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->dp_input_texture);
+		HRESULT hr = d3d11_out_device(c)->CreateTexture2D(&desc, nullptr, &c->dp_input_texture);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create DP input texture %ux%u: 0x%lx", content_w, content_h, hr);
 			atlas_tex->Release();
@@ -1286,7 +1371,8 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 		srv_desc.Texture2D.MostDetailedMip = 0;
 		srv_desc.Texture2D.MipLevels = 1;
-		hr = c->device->CreateShaderResourceView(c->dp_input_texture, &srv_desc, &c->dp_input_srv);
+		hr = d3d11_out_device(c)->CreateShaderResourceView(c->dp_input_texture, &srv_desc,
+		                                                   &c->dp_input_srv);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create DP input SRV: 0x%lx", hr);
 			c->dp_input_texture->Release();
@@ -1303,8 +1389,8 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 
 	// Copy content region from atlas to intermediate
 	D3D11_BOX src_box = {0, 0, 0, content_w, content_h, 1};
-	c->context->CopySubresourceRegion(c->dp_input_texture, 0, 0, 0, 0,
-	                                   atlas_tex, 0, &src_box);
+	d3d11_out_context(c)->CopySubresourceRegion(c->dp_input_texture, 0, 0, 0, 0,
+	                                            atlas_tex, 0, &src_box);
 	atlas_tex->Release();
 
 	return c->dp_input_srv;
@@ -1692,7 +1778,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// The DP writes to the currently bound render target (see xrt_display_processor_d3d11.h).
 	comp_d3d11_target_bind(c->target);
 
-	void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
+	// #918: under the split the atlas the DP samples is an OUTPUT-device egress
+	// texture, and which slot it is can only be decided after the late-weave
+	// pace below — so it is resolved further down rather than here.
+	void *atlas_srv = c->split_active ? nullptr
+	                                  : (zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer));
 
 	// #542: the DP gets the frame's EFFECTIVE content layout — the grid
 	// the passes above actually painted (== the mode layout for matched
@@ -1752,7 +1842,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// misaligned (big disparity). See the offscreen path above (#431).
 	uint32_t content_w = tile_columns * view_width;
 	uint32_t content_h = tile_rows * view_height;
-	if (!zero_copy) {
+	if (!zero_copy && !c->split_active) {
 		atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
 	}
 
@@ -1766,17 +1856,23 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// The backdrop flatten samples the APP'S OWN Local2D under-layer swapchain
 	// images, so a repaint reuses what the last app frame produced rather than
 	// re-reading textures the app has since reacquired.
-	if (!is_repaint) {
-		uint32_t bd_w = 0, bd_h = 0;
-		c->repaint.backdrop_srv =
-		    d3d11_flatten_backdrop_2d(c, target_width, target_height, &bd_w, &bd_h);
-		c->repaint.backdrop_w = bd_w;
-		c->repaint.backdrop_h = bd_h;
-	}
-	xrt_display_processor_d3d11_set_background_2d(c->display_processor, c->repaint.backdrop_srv,
-	                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
-	if (c->repaint.backdrop_srv != nullptr) {
-		comp_d3d11_target_bind(c->target);
+	//
+	// #918 Phase 1: the backdrop flatten reads APP-device Local2D swapchain
+	// images and hands the resulting SRV to a DP that now lives on the OUTPUT
+	// device — device-crossing, so it is gated off under the split (Phase 2).
+	if (!d3d11_split_gate(c, "the 2D-under backdrop handoff")) {
+		if (!is_repaint) {
+			uint32_t bd_w = 0, bd_h = 0;
+			c->repaint.backdrop_srv =
+			    d3d11_flatten_backdrop_2d(c, target_width, target_height, &bd_w, &bd_h);
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+		}
+		xrt_display_processor_d3d11_set_background_2d(c->display_processor, c->repaint.backdrop_srv,
+		                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
+		if (c->repaint.backdrop_srv != nullptr) {
+			comp_d3d11_target_bind(c->target);
+		}
 	}
 
 	// Late-weave pacing + weave-latency harness mark (env-gated no-ops). A
@@ -1786,6 +1882,48 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		comp_d3d11_target_weave_mark_repaint(c->target);
 	} else {
 		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns);
+	}
+
+	/*
+	 * #918: pick the egress slot the DP will sample, AFTER the late-weave pace
+	 * above — a slot that landed during the sleep is the freshest one available
+	 * and picking before the sleep would throw it away.
+	 *
+	 * An app frame picks OPPORTUNISTICALLY: the newest slot whose consumer copy
+	 * has already completed, CPU-verified, so this thread never waits. A repaint
+	 * re-weaves the slot the last app frame published — zero bridge traffic per
+	 * tick, which is the whole point of the split (today's placement re-crosses
+	 * the entire woven frame on every repaint).
+	 */
+	if (c->split_active) {
+		int32_t slot;
+		if (is_repaint) {
+			slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+		} else {
+			slot = comp_d3d11_xbridge_pick_slot(c->xbridge);
+			if (slot >= 0) {
+				comp_d3d11_xbridge_set_weave_slot(c->xbridge, slot);
+			} else {
+				// Warmup: nothing has crossed yet. Keep weaving whatever the
+				// last good slot was rather than handing the DP a null atlas.
+				slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+			}
+		}
+		if (slot < 0) {
+			return false; // pre-first-crossing; the acquired target stays black
+		}
+		comp_d3d11_xbridge_gpu_wait_slot(c->xbridge, c->out_ctx, slot);
+		atlas_srv = comp_d3d11_xbridge_get_srv(c->xbridge, slot);
+		if (atlas_srv == nullptr) {
+			return false;
+		}
+		// The consumer copy already landed content-sized (stage B), so the
+		// compositor's own crop-before-DP pass is not just skippable, it would
+		// be a second crop of an already-cropped image. When stage B fell back
+		// to a worst-case ring, crop here instead — on the OUTPUT device.
+		if (!comp_d3d11_xbridge_egress_is_content_sized(c->xbridge)) {
+			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+		}
 	}
 
 	// Timing feedback: hand the DP last frame's MEASURED weave→scanout
@@ -1806,7 +1944,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	}
 
 	xrt_display_processor_d3d11_process_atlas(
-	    c->display_processor, c->context, atlas_srv, view_width, view_height,
+	    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
 	    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
 	    eff_canvas.valid ? eff_canvas.x : 0,
 	    eff_canvas.valid ? eff_canvas.y : 0,
@@ -1832,8 +1970,9 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	 */
 	if (c->repaint.hash_probe == 1 && back_buffer_2d != nullptr) {
 		uint8_t *rp_px = nullptr;
-		const uint64_t hsh = d3d11_hash_target(c->device, c->context, back_buffer_2d, target_width,
-		                                       target_height, is_repaint ? &rp_px : &c->repaint.app_px);
+		const uint64_t hsh =
+		    d3d11_hash_target(d3d11_out_device(c), d3d11_out_context(c), back_buffer_2d, target_width,
+		                      target_height, is_repaint ? &rp_px : &c->repaint.app_px);
 
 		/*
 		 * #876 ABSOLUTE dropout detector — runs on EVERY weave, app or repaint.
@@ -2059,8 +2198,9 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				char out[512];
 				snprintf(out, sizeof(out), "%s\\dxr_woven_%s.png", tmp,
 				         is_repaint ? "repaint" : "app");
-				bool wok = d3d11_capture_texture_to_png(c->device, c->context, back_buffer_2d,
-				                                        target_width, target_height, 0, 0, out);
+				bool wok = d3d11_capture_texture_to_png(d3d11_out_device(c), d3d11_out_context(c),
+				                                        back_buffer_2d, target_width,
+				                                        target_height, 0, 0, out);
 				U_LOG_W("#868 d3d11 woven capture %s -> %s", wok ? "OK" : "FAILED", out);
 			}
 		}
@@ -2146,25 +2286,43 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		 * to the app's render target and left the swapchain black — measured
 		 * at ~19% of repaints, which is the flicker.
 		 */
-		if (c->mt_lock != nullptr) {
-			c->mt_lock->Enter();
-		}
-
-		{
-			// The replay lands BETWEEN the app's own draw calls on this context.
-			// Enter()/Leave() keeps our sequence atomic against the app; this
-			// guard keeps the app's cached state truthful once we Leave().
-			// Scoped so the restore runs before Leave().
-			xrt::compositor::d3d11::app_state_guard app_state(c->context);
-
+		/*
+		 * #918: under the output-device split the replay runs entirely on the
+		 * RUNTIME-OWNED output context, whose only two callers are layer_commit
+		 * and this loop — and both already hold c->mutex. The mt_lock bracket
+		 * and the app_state_guard exist solely to defend against the APP's
+		 * render thread interleaving on the APP's immediate context, which this
+		 * replay no longer touches; taking them here would add contention on a
+		 * device the app is still rendering with, for nothing. Note also that
+		 * the replay costs ZERO bridge traffic: it re-weaves the egress slot the
+		 * last app frame published, already resident on this adapter.
+		 */
+		if (c->split_active) {
 			comp_d3d11_target_acquire(c->target, &rp_index);
 			d3d11_dp_weave(c, true);
-			d3d11_render_hud_overlay(c, c->device, c->context, true, &c->repaint.eye_pos);
+			d3d11_render_hud_overlay(c, c->out_dev, c->out_ctx, true, &c->repaint.eye_pos);
 			comp_d3d11_target_present(c->target, 1);
-		}
+		} else {
+			if (c->mt_lock != nullptr) {
+				c->mt_lock->Enter();
+			}
 
-		if (c->mt_lock != nullptr) {
-			c->mt_lock->Leave();
+			{
+				// The replay lands BETWEEN the app's own draw calls on this
+				// context. Enter()/Leave() keeps our sequence atomic against the
+				// app; this guard keeps the app's cached state truthful once we
+				// Leave(). Scoped so the restore runs before Leave().
+				xrt::compositor::d3d11::app_state_guard app_state(c->context);
+
+				comp_d3d11_target_acquire(c->target, &rp_index);
+				d3d11_dp_weave(c, true);
+				d3d11_render_hud_overlay(c, c->device, c->context, true, &c->repaint.eye_pos);
+				comp_d3d11_target_present(c->target, 1);
+			}
+
+			if (c->mt_lock != nullptr) {
+				c->mt_lock->Leave();
+			}
 		}
 
 		c->repaint.count++;
@@ -2416,9 +2574,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	comp_d3d11_renderer_compute_effective_layout(c->renderer, &c->layer_accum, &c->eff_layout);
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
+	//
+	// #918: never under the output-device split. The app's swapchain image lives
+	// on the app's adapter and the DP is on the scanout adapter, so there is
+	// nothing to hand over zero-copy — the atlas has to cross regardless. The
+	// probe is skipped entirely rather than computed and discarded.
 	bool zero_copy = false;
 	void *zc_srv = nullptr;
-	{
+	if (!c->split_active) {
 		const struct xrt_rendering_mode *mode = NULL;
 		if (c->xdev != NULL && c->xdev->hmd != NULL) {
 			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
@@ -2548,6 +2711,34 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	/*
+	 * #918: ship this frame's atlas across the adapter boundary.
+	 *
+	 * Placed here deliberately — after both renderer passes (so the copy sources
+	 * a COMPLETE atlas) and before the target acquire + late-weave sleep below,
+	 * which is the window the copy legs get to run in. Nothing on this thread
+	 * waits: the app-side cost is one fence signal plus a flush.
+	 */
+	if (c->split_active) {
+		const uint32_t bridge_w = c->eff_layout.cols * c->eff_layout.tile_w;
+		const uint32_t bridge_h = c->eff_layout.rows * c->eff_layout.tile_h;
+		if (bridge_w > 0 && bridge_h > 0) {
+			// The atlas is only reallocated on a genuine grow (mode switch,
+			// window resize); the generation is what tells the producer to
+			// re-open, and it never moves on the #602 fits-early-out.
+			comp_d3d11_xbridge_bind_atlas(c->xbridge,
+			                              comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
+			                              comp_d3d11_renderer_get_atlas_generation(c->renderer));
+			// Live egress re-size: the content box follows the window and the
+			// active mode, so a V-key mode switch or a resize lands here.
+			comp_d3d11_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h);
+			c->split_seq++;
+			comp_d3d11_xbridge_submit(c->xbridge, c->split_seq,
+			                          comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w,
+			                          bridge_h);
+		}
+	}
+
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Update debug GUI preview with the rendered atlas texture
 	if (comp_d3d11_debug_is_active(c->debug)) {
@@ -2671,8 +2862,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		weaving_done = d3d11_dp_weave(c, false);
 	}
 
-	// HUD overlay (post-processing, always readable)
-	d3d11_render_hud_overlay(c, c->device, c->context, weaving_done, &eye_pos);
+	// HUD overlay (post-processing, always readable). #918: the staging texture
+	// and the back-buffer blit follow the target onto the output device.
+	d3d11_render_hud_overlay(c, d3d11_out_device(c), d3d11_out_context(c), weaving_done, &eye_pos);
 
 	// Note: transparency (compose-under-bg / alpha-gate) lives inside the
 	// vendor display processor, enabled via set_transparent_background. The
@@ -2749,6 +2941,16 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		        (unsigned long long)c->repaint.bail_race);
 	}
 
+	/*
+	 * #918: with the repaint loop joined, quiesce the bridge NEXT — stop
+	 * submitting, join its watchdog, and drain the copy queues under a bounded
+	 * (2 s) CPU wait. Nothing below may run while a cross-adapter copy is still
+	 * reading the renderer's atlas or writing an egress slot.
+	 */
+	if (c->xbridge != nullptr) {
+		comp_d3d11_xbridge_quiesce(c->xbridge);
+	}
+
 	U_LOG_I("Destroying D3D11 compositor");
 
 	u_capture_dims_set_provider(NULL, c);
@@ -2813,6 +3015,30 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	if (c->target != nullptr) {
 		comp_d3d11_target_destroy(&c->target);
 	}
+
+	/*
+	 * #918: the bridge dies AFTER the target — its egress textures are the
+	 * atlas the DP was sampling and the target's back buffer is the thing the DP
+	 * wrote, so both consumers must be gone first. Inside, the release order is
+	 * egress -> consumer -> cross-adapter heap -> producer -> fences.
+	 */
+	if (c->xbridge != nullptr) {
+		comp_d3d11_xbridge_destroy(&c->xbridge);
+	}
+
+	if (c->out_factory != nullptr) {
+		c->out_factory->Release();
+		c->out_factory = nullptr;
+	}
+	if (c->out_ctx != nullptr) {
+		c->out_ctx->Release();
+		c->out_ctx = nullptr;
+	}
+	if (c->out_dev != nullptr) {
+		c->out_dev->Release();
+		c->out_dev = nullptr;
+	}
+	c->split_active = false;
 
 	if (c->dxgi_factory != nullptr) {
 		c->dxgi_factory->Release();
@@ -3056,9 +3282,227 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		c->has_shared_texture = true;
 	}
 
-	// Create output target (DXGI swapchain) — skip if offscreen (no HWND)
+	/*
+	 * #918 STAGE A — resolve the scanout adapter and, if it differs from the
+	 * app's, stand up the runtime-owned output device plus the cross-adapter
+	 * atlas bridge. Everything here is best-effort: on ANY failure we log the
+	 * exact reason once and fall through to the stock single-device path.
+	 *
+	 * Stage A must stay cheap — the session warmup already shows a brief black
+	 * window (weaver async-create + the fullscreen swapchain resize) and the
+	 * investigation's explicit constraint is that the split must not lengthen
+	 * it. Duration is logged so a regression is visible, not inferred.
+	 */
+	if (debug_get_bool_option_weave_on_scanout()) {
+		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
+		double stage_a_bridge_ms = 0.0;
+		const char *reason = nullptr;
+
+		if (c->hwnd == nullptr) {
+			reason = "no HWND";
+		} else if (c->has_shared_texture) {
+			reason = "shared-texture session";
+		}
+
+		// The app device's adapter — the LUID the scanout adapter is compared
+		// against, and the producer side of the bridge.
+		IDXGIAdapter *app_adapter = nullptr;
+		LUID app_luid = {};
+		if (reason == nullptr) {
+			IDXGIDevice *dd = nullptr;
+			if (SUCCEEDED(c->device->QueryInterface(__uuidof(IDXGIDevice),
+			                                        reinterpret_cast<void **>(&dd))) &&
+			    dd != nullptr) {
+				dd->GetAdapter(&app_adapter);
+				dd->Release();
+			}
+			DXGI_ADAPTER_DESC ad{};
+			if (app_adapter == nullptr || FAILED(app_adapter->GetDesc(&ad))) {
+				reason = "scanout unresolvable";
+			} else {
+				app_luid = ad.AdapterLuid;
+			}
+		}
+
+		wil::com_ptr<IDXGIAdapter> scanout;
+		DXGI_ADAPTER_DESC sdesc{};
+		if (reason == nullptr) {
+			scanout = xrt::auxiliary::d3d::getScanoutAdapter(
+			    display_screen_left, display_screen_top, xdev->hmd->screens[0].w_pixels,
+			    xdev->hmd->screens[0].h_pixels, U_LOGGING_INFO);
+			if (!scanout || FAILED(scanout->GetDesc(&sdesc))) {
+				reason = "scanout unresolvable";
+			} else if (sdesc.AdapterLuid.LowPart == app_luid.LowPart &&
+			           sdesc.AdapterLuid.HighPart == app_luid.HighPart) {
+				// Not a failure: on a MUX'd / single-GPU box the weave is
+				// already local, so the split has nothing to do. One INFO,
+				// no WARN.
+				U_LOG_W("D3D11 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
+				        "app's adapter — split is a no-op (#918)",
+				        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+				        (unsigned long)sdesc.AdapterLuid.LowPart);
+				reason = ""; // handled; suppress the fallback WARN
+			}
+		}
+
+		// Runtime-owned D3D11 device on the scanout adapter.
+		if (reason == nullptr) {
+			UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+			D3D_FEATURE_LEVEL got = {};
+			static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+			hr = D3D11CreateDevice(scanout.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
+			                       ARRAYSIZE(levels), D3D11_SDK_VERSION, &c->out_dev, &got,
+			                       &c->out_ctx);
+			if (FAILED(hr) || c->out_dev == nullptr || c->out_ctx == nullptr) {
+				U_LOG_W("D3D11 output-device split: D3D11CreateDevice failed 0x%08lx",
+				        (unsigned long)hr);
+				reason = "D3D11CreateDevice failed";
+			}
+		}
+		if (reason == nullptr) {
+			// The output context has exactly two callers (layer_commit and the
+			// repaint loop, both under c->mutex), but the vendor DP may touch it
+			// from its own threads — keep the same protection the app device has.
+			ID3D10Multithread *omt = nullptr;
+			if (SUCCEEDED(c->out_dev->QueryInterface(__uuidof(ID3D10Multithread),
+			                                         reinterpret_cast<void **>(&omt))) &&
+			    omt != nullptr) {
+				omt->SetMultithreadProtected(TRUE);
+				omt->Release();
+			}
+			// Same one-deep DXGI queue the app device gets: the present now
+			// happens HERE, so this is where the pacing lever lives.
+			IDXGIDevice1 *od1 = nullptr;
+			if (SUCCEEDED(c->out_dev->QueryInterface(__uuidof(IDXGIDevice1),
+			                                         reinterpret_cast<void **>(&od1))) &&
+			    od1 != nullptr) {
+				od1->SetMaximumFrameLatency(1);
+				od1->Release();
+			}
+			hr = scanout->GetParent(__uuidof(IDXGIFactory4),
+			                        reinterpret_cast<void **>(&c->out_factory));
+			if (FAILED(hr) || c->out_factory == nullptr) {
+				U_LOG_W("D3D11 output-device split: scanout DXGI factory failed 0x%08lx",
+				        (unsigned long)hr);
+				reason = "D3D11CreateDevice failed";
+			}
+		}
+
+		// The bridge: both D3D12 devices, both COPY queues, the cross-adapter
+		// heap + placed ring, every fence, and one probe egress round-trip.
+		if (reason == nullptr) {
+			uint32_t sys_w = 0, sys_h = 0;
+			if (xdev->rendering_mode_count > 0) {
+				u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count,
+				                              &sys_w, &sys_h);
+			}
+			if (sys_w == 0 || sys_h == 0) {
+				sys_w = c->settings.preferred.width;
+				sys_h = c->settings.preferred.height;
+			}
+
+			struct comp_d3d11_xbridge_info xbi = {};
+			xbi.app_device = c->device;
+			xbi.app_context = c->context;
+			xbi.app_adapter = app_adapter;
+			xbi.out_device = c->out_dev;
+			xbi.out_adapter = scanout.get();
+			xbi.max_width = sys_w;
+			xbi.max_height = sys_h;
+
+			const char *xb_reason = nullptr;
+			const uint64_t xb_t0 = os_monotonic_get_ns();
+			if (comp_d3d11_xbridge_create(&xbi, &c->xbridge, &xb_reason) != XRT_SUCCESS) {
+				c->xbridge = nullptr;
+				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
+			} else {
+				/*
+				 * The egress ring is allocated HERE, not in stage B: the split
+				 * must not be able to activate and THEN discover it has nothing
+				 * to weave into. Size it at the ACTIVE MODE's nominal content
+				 * box rather than the worst-case atlas — same fail-safe, but it
+				 * avoids committing (and immediately freeing) ~100 MB of iGPU
+				 * memory during the session warmup the investigation asked us
+				 * not to lengthen. Stage B refines it to the real content dims.
+				 */
+				uint32_t eg_w = 0, eg_h = 0;
+				if (xdev->hmd != NULL) {
+					uint32_t mi = xdev->hmd->active_rendering_mode_index;
+					if (mi < xdev->rendering_mode_count) {
+						const struct xrt_rendering_mode *m = &xdev->rendering_modes[mi];
+						eg_w = m->tile_columns * m->view_width_pixels;
+						eg_h = m->tile_rows * m->view_height_pixels;
+					}
+				}
+				bool eg_ok;
+				if (eg_w > 0 && eg_h > 0) {
+					// Falls back to a worst-case ring internally if the
+					// content-sized allocation fails.
+					comp_d3d11_xbridge_set_content_size(c->xbridge, eg_w, eg_h);
+					uint32_t gw = 0, gh = 0;
+					comp_d3d11_xbridge_get_egress_dims(c->xbridge, &gw, &gh);
+					eg_ok = (gw > 0 && gh > 0);
+				} else {
+					eg_ok = comp_d3d11_xbridge_alloc_worstcase_egress(c->xbridge);
+				}
+				if (!eg_ok) {
+					reason = "egress share failed";
+				}
+			}
+			stage_a_bridge_ms = (double)(os_monotonic_get_ns() - xb_t0) / 1.0e6;
+		}
+
+		if (reason == nullptr) {
+			c->split_active = true;
+			c->out_luid = sdesc.AdapterLuid;
+			U_LOG_W("D3D11 output-device split ACTIVE: weave/repaint/present move to '%ls' "
+			        "LUID=%08lx:%08lx (app device on LUID=%08lx:%08lx); atlas crosses via a D3D12 "
+			        "cross-adapter heap once per frame (#918)",
+			        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			        (unsigned long)sdesc.AdapterLuid.LowPart, (unsigned long)app_luid.HighPart,
+			        (unsigned long)app_luid.LowPart);
+		} else {
+			if (c->xbridge != nullptr) {
+				comp_d3d11_xbridge_destroy(&c->xbridge);
+			}
+			if (c->out_factory != nullptr) {
+				c->out_factory->Release();
+				c->out_factory = nullptr;
+			}
+			if (c->out_ctx != nullptr) {
+				c->out_ctx->Release();
+				c->out_ctx = nullptr;
+			}
+			if (c->out_dev != nullptr) {
+				c->out_dev->Release();
+				c->out_dev = nullptr;
+			}
+			if (reason[0] != '\0') {
+				U_LOG_W("D3D11 output-device split DISABLED (%s) — falling back to the stock "
+				        "single-device path (#918)",
+				        reason);
+			}
+		}
+		if (app_adapter != nullptr) {
+			app_adapter->Release();
+		}
+		// Warmup budget: the session already shows a brief black window while the
+		// vendor weaver async-creates, and the investigation's constraint is that
+		// the split must not lengthen it. Both numbers are logged so a regression
+		// is visible rather than inferred — the bridge (two D3D12 devices, the
+		// cross-adapter heap, the fences, the egress ring) dominates.
+		U_LOG_W("D3D11 output-device split: stage A took %.1f ms (bridge %.1f ms, active=%d)",
+		        (double)(os_monotonic_get_ns() - stage_a_start_ns) / 1.0e6, stage_a_bridge_ms,
+		        (int)c->split_active);
+	}
+
+	// Create output target (DXGI swapchain) — skip if offscreen (no HWND).
+	// #918: under the split the swapchain, its waitable and its frame statistics
+	// all live on the SCANOUT adapter, which is what removes the cross-adapter
+	// present (~26 ms of the measured 42 ms present-to-display).
 	if (c->hwnd != nullptr) {
-		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, c->device, c->context, c->dxgi_factory,
+		xrt_result_t xret = comp_d3d11_target_create(c, c->hwnd, d3d11_out_device(c), d3d11_out_context(c),
+		                                             c->split_active ? c->out_factory : c->dxgi_factory,
 		                                             c->settings.preferred.width, c->settings.preferred.height,
 		                                             transparent_background, &c->target);
 		if (xret != XRT_SUCCESS) {
@@ -3166,7 +3610,12 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		// Use app HWND for position tracking in shared texture mode,
 		// otherwise use the compositor's own HWND
 		HWND dp_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-		xrt_result_t dp_ret = factory(c->device, c->context, dp_hwnd, &c->display_processor);
+		// #918: under the split the weaver is created on the OUTPUT device, so
+		// it weaves and presents local to the panel. One weaver per HWND — this
+		// factory call is the single creation point and it runs exactly once,
+		// after out_dev exists.
+		xrt_result_t dp_ret =
+		    factory(d3d11_out_device(c), d3d11_out_context(c), dp_hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);
@@ -3270,11 +3719,43 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// NOTE: the per-frame resize path (renderer_resize) must apply the same guard —
 	// see resize_target_h in the mode-switch handler above.
 	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
-	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
+	// #918: only the split asks for an NT-shareable atlas. The non-split
+	// allocation shape is unchanged, byte for byte.
+	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, c->split_active,
+	                                               &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
 		d3d11_compositor_destroy(&c->base.base);
 		return xret;
+	}
+
+	/*
+	 * #918 STAGE B — right-size the egress ring and bind the ingress, now that
+	 * the DP factory has returned and the vendor's ~200 ms async weaver create
+	 * is running in the background. A failure here is NOT fatal: Stage A already
+	 * allocated a worst-case ring, so the fallback is simply that the consumer
+	 * copy lands worst-case-sized and d3d11_crop_atlas_for_dp runs on the OUTPUT
+	 * device, exactly as the non-split path crops on the app device.
+	 */
+	if (c->split_active) {
+		uint32_t cols = 2, rows = 1;
+		comp_d3d11_renderer_get_tile_layout(c->renderer, &cols, &rows);
+		uint32_t cw = cols * view_width;
+		uint32_t ch = rows * view_height;
+		if (cw == 0 || ch == 0) {
+			cw = c->settings.preferred.width;
+			ch = c->settings.preferred.height;
+		}
+		if (!comp_d3d11_xbridge_set_content_size(c->xbridge, cw, ch)) {
+			U_LOG_W("D3D11 output-device split: stage B could not size the egress ring to %ux%u — "
+			        "keeping the worst-case ring and cropping on the output device (#918)",
+			        cw, ch);
+		}
+		// Ingress Option I: the producer reads the renderer's atlas directly.
+		// A NULL handle (or a failed D3D12 open) latches Option II inside the
+		// bridge, with its own one-off WARN.
+		comp_d3d11_xbridge_bind_atlas(c->xbridge, comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
+		                              comp_d3d11_renderer_get_atlas_generation(c->renderer));
 	}
 
 	// Expose current window-scaled capture dims to xrCaptureAtlasDXR (#431).
@@ -3569,6 +4050,11 @@ d3d11_zone_dp_supported(struct comp_d3d11_compositor *c)
 static void
 d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 {
+	// #918 Phase 1: the publish stages an APP-device mask SRV through the
+	// OUTPUT-device DP context — device-crossing, deferred to Phase 2.
+	if (d3d11_split_gate(c, "the hardware zone-mask sideband publish")) {
+		return;
+	}
 	if (!d3d11_zone_dp_supported(c)) {
 		return; // legacy DP — global request_display_mode path unchanged.
 	}
@@ -4510,6 +4996,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// MODE_ZONES pass gates the weave by the binary zone raster — pixels
 	// outside every zone go to the 2D flatten / transparent even with zero
 	// Local2D layers); the sticky mask + implicit-mask rules are inert.
+	// #918 Phase 1: every input of this pass (the mask raster, the Local2D
+	// flatten, the weave scratch) is allocated on the APP device while `dst` is
+	// now the OUTPUT device's back buffer. Device-crossing by construction —
+	// gated off under the split, so a plain projection weave still runs.
+	if (d3d11_split_gate(c, "the zones / Local2D / authored-mask composite")) {
+		return false;
+	}
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);

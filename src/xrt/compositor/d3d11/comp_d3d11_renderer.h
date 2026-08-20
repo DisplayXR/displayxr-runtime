@@ -66,6 +66,10 @@ comp_d3d11_renderer_compute_effective_layout(struct comp_d3d11_renderer *rendere
  * @param target_height Height of the render target (window). The internal
  *        atlas texture height is max(view_height, target_height) so that
  *        mono (2D) rendering can fill the full window without cropping.
+ * @param shared_nt Allocate the atlas NT-shareable (#918 output-device split):
+ *        the cross-adapter bridge's producer D3D12 device opens it directly, so
+ *        no extra app-device copy is needed. STRICTLY opt-in — when false the
+ *        allocation shape is byte-for-byte what it always was.
  * @param out_renderer Pointer to receive the created renderer.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -77,7 +81,29 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
                            uint32_t view_width,
                            uint32_t view_height,
                            uint32_t target_height,
+                           bool shared_nt,
                            struct comp_d3d11_renderer **out_renderer);
+
+/*!
+ * #918: the atlas's NT share handle, or NULL when the renderer was not created
+ * with @p shared_nt. Owned by the renderer — do NOT CloseHandle it; it is
+ * recreated (and @ref comp_d3d11_renderer_get_atlas_generation bumped) whenever
+ * the atlas is genuinely reallocated.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_renderer_get_atlas_shared_handle(struct comp_d3d11_renderer *renderer);
+
+/*!
+ * #918: monotonic atlas generation. Bumped ONLY on a genuine (re)allocation —
+ * never on the #602 fits-early-out, which keeps the same texture. A consumer
+ * holding an open of the shared handle re-opens when this changes.
+ *
+ * @ingroup comp_d3d11
+ */
+uint64_t
+comp_d3d11_renderer_get_atlas_generation(struct comp_d3d11_renderer *renderer);
 
 /*!
  * Destroy a D3D11 renderer.
