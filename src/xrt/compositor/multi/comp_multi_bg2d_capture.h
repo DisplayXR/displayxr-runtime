@@ -89,6 +89,9 @@ struct comp_multi_bg2d_capture_frame
 	const uint8_t *pixels; //!< Tightly packed RGBA8, `width * height * 4` bytes.
 	uint32_t width;
 	uint32_t height;
+	//! Receiver-side delivery counter, not the producer's wire sequence: it
+	//! starts at 1 and never resets, so "nothing uploaded yet" is 0 and a
+	//! producer restart cannot alias onto a frame the consumer already has.
 	uint32_t seq;
 };
 
@@ -108,7 +111,8 @@ comp_multi_bg2d_capture_start(const char *socket_name);
  * Borrow the most recent frame.
  *
  * @param[out] out         Filled on success.
- * @param      last_seq    Sequence number the caller has already uploaded.
+ * @param      last_seq    Delivery counter the caller has already uploaded, 0
+ *                         if none.
  * @return true when a frame newer than @p last_seq is available — and *only*
  *         then, so a steady producer at 10 Hz costs one upload per delivery,
  *         not one per compositor frame. The receiver lock is held on true and
