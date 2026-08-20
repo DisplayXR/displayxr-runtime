@@ -18,6 +18,10 @@
 #include <windows.h>
 #endif
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
+
 /*
  *
  * Windows implementation
@@ -127,6 +131,40 @@ u_sandbox_should_use_ipc(void)
 		if (n > 0) force_mode = force_mode_buf;
 	}
 #endif
+#ifdef XRT_OS_ANDROID
+	// An Android app is launched by the system, not by a parent process that
+	// could export an env var, so `XRT_FORCE_MODE` alone is unusable there for
+	// anything but a self-setenv() before xrCreateInstance. Accept the same
+	// override as a system property as well, in both the u_debug spelling
+	// (debug.xrt.<NAME>, what DEBUG_GET_ONCE_* reads) and a short convenience
+	// form, so `adb shell setprop` can flip a single app onto the IPC path
+	// with no rebuild. Env still wins — it is the more specific signal.
+	// Per-app targeting is the manifest meta-data instead (#1031); see
+	// android_globals_self_declares_force_ipc().
+	char sysprop_buf[PROP_VALUE_MAX] = {0};
+	if (force_mode == NULL && __system_property_get("debug.xrt.XRT_FORCE_MODE", sysprop_buf) > 0 &&
+	    sysprop_buf[0] != '\0') {
+		force_mode = sysprop_buf;
+	}
+	if (force_mode == NULL && __system_property_get("debug.dxr.force_ipc", sysprop_buf) > 0 &&
+	    (sysprop_buf[0] == '1' || sysprop_buf[0] == 't')) {
+		U_LOG_I("debug.dxr.force_ipc=%s: forcing IPC/service mode", sysprop_buf);
+		return true;
+	}
+#endif
+
+	// An already-connected service socket handed in by an embedder (#1056:
+	// Chromium's GPU process, which has no Context and cannot bindService)
+	// only makes sense on the IPC path — adopting it is the connection. The
+	// process-global variant set through ipc_client_connection_adopt_fd() is
+	// checked by the caller, which can see the IPC layer; this is the env
+	// half, which aux_util can read without a layering violation.
+	const char *ipc_fd = getenv("DXR_IPC_FD");
+	if (ipc_fd != NULL && ipc_fd[0] != '\0') {
+		U_LOG_I("DXR_IPC_FD=%s: adopting a connected service socket, forcing IPC mode", ipc_fd);
+		return true;
+	}
+
 	if (force_mode != NULL) {
 		if (strcmp(force_mode, "native") == 0) {
 			U_LOG_I("XRT_FORCE_MODE=native: forcing in-process native compositor");

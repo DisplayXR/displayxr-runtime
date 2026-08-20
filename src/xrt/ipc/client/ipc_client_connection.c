@@ -192,6 +192,26 @@ ipc_client_connection_adopt_fd(int fd)
 	        dup_fd, fd);
 }
 
+bool
+ipc_client_connection_has_adopted_fd(void)
+{
+	// Deliberately does NOT validate or dup: this runs on the hybrid-mode
+	// decision path (#1031), before any connection exists, and its only job is
+	// to answer "did somebody hand this process a socket?". A bogus fd is
+	// rejected later, by ipc_client_take_adopted_fd(), where the failure has a
+	// connection to fail. Cheap enough to call unconditionally.
+	pthread_mutex_lock(&s_adopt_mutex);
+	bool have = s_adopted_fd >= 0;
+	pthread_mutex_unlock(&s_adopt_mutex);
+
+	if (have) {
+		return true;
+	}
+
+	const char *env = getenv("DXR_IPC_FD");
+	return env != NULL && env[0] != '\0';
+}
+
 /*!
  * Take the adopted fd, if there is one, else -1. Consumes it.
  *
