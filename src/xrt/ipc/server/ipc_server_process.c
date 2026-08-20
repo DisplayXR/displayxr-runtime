@@ -1371,7 +1371,11 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	ics->peer_pid = peer_pid;
 	ics->peer_create_ns = peer_create_ns;
 	ics->client_state.pid = (int)peer_pid;
+	// browser#103 RC-1: the opener IS the peer until (and unless) a declaration
+	// says otherwise; it stays the authoriser after one is accepted.
+	ics->opener_pid = peer_pid;
 	ics->imc.ipc_handle = ipc_handle;
+	ics->imc.dup_target_pid = 0;
 	ics->server = vs;
 	ics->server_thread_index = cs_index;
 	ics->io_active = true;

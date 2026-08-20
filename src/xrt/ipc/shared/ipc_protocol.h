@@ -309,6 +309,42 @@ struct ipc_client_description
 	struct xrt_application_info info;
 };
 
+/*!
+ * browser#103 RC-1: a client's declaration of WHICH PROCESS this connection
+ * really belongs to.
+ *
+ * Sent as the FIRST message of an adopted connection, before
+ * `ipc_client_setup_shm` transfers any handle. It exists because on Windows the
+ * server derives both the handle-duplication target and the peer's integrity
+ * level from `GetNamedPipeClientProcessId`, i.e. from whoever OPENED the pipe —
+ * which under a brokered handle (see `ipc_client_connection_adopt_handle`) is
+ * NOT the process running the client library. Left uncorrected, shared memory,
+ * the woven texture and the fence would all be duplicated into the broker.
+ *
+ * The pipe opener is the AUTHORISER; @p target_pid is the PEER. The server
+ * accepts only when the opener's integrity level is at least the declared
+ * target's — delegation downward (a Medium browser to its own Low sandboxed
+ * child) is allowed, escalation upward never is.
+ *
+ * A client that does not send this is treated exactly as before. A declaration
+ * the server refuses is likewise not fatal: the connection continues with
+ * opener attribution.
+ *
+ * `int64_t` rather than `pid_t`/`DWORD` so the wire width is fixed and the
+ * struct needs no platform typedefs (see the MinGW portability rules).
+ */
+struct ipc_peer_declaration
+{
+	//! The process the server should duplicate handles into and attribute this
+	//! connection to. Must be > 0.
+	int64_t target_pid;
+
+	//! Reserved for future use, must be 0.
+	uint32_t flags;
+
+	uint32_t _pad;
+};
+
 struct ipc_client_list
 {
 	uint32_t ids[IPC_MAX_CLIENTS];

@@ -170,6 +170,21 @@ struct ipc_client_state
 	//! #960: set once describe_client has verified client_state.client_class.
 	//! Until then the client counts against no quota and holds no privilege.
 	bool class_verified;
+
+	//! browser#103 RC-1: the OS-derived pid of the process that OPENED this
+	//! connection. Equal to peer_pid until a peer declaration is accepted, after
+	//! which peer_pid becomes the DECLARED target and this stays the authoriser.
+	long opener_pid;
+
+	//! browser#103 RC-1: a peer declaration has been settled on this connection.
+	//! Settled ONCE — a second declaration is refused, so no client can move its
+	//! identity after gates have run against it.
+	bool peer_declared;
+
+	//! browser#103 RC-1: a handle has already been duplicated to this client
+	//! (instance_get_shm_fd ran). A declaration arriving after this point is too
+	//! late to be honoured and is refused.
+	bool handles_sent;
 };
 
 enum ipc_thread_state

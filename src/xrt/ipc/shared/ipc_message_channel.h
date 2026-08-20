@@ -30,6 +30,19 @@ struct ipc_message_channel
 {
 	xrt_ipc_handle_t ipc_handle;
 	enum u_logging_level log_level;
+
+	/*!
+	 * browser#103 RC-1, Windows only: the process handles should be duplicated
+	 * INTO, when that is not the process the OS names as the other end of this
+	 * channel.
+	 *
+	 * 0 (the default, and the value for every channel that has not accepted a
+	 * peer declaration) means "ask the OS", i.e. `GetNamedPipeClientProcessId` /
+	 * `GetNamedPipeServerProcessId` exactly as before. Set only by
+	 * `ipc_handle_instance_declare_peer`, and only after the declaration passed
+	 * the integrity-level check — see `ipc_server_peer_declaration_allowed`.
+	 */
+	long dup_target_pid;
 };
 
 /*!

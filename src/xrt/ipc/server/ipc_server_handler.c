@@ -1949,6 +1949,68 @@ ipc_handle_instance_get_shm_fd(volatile struct ipc_client_state *ics,
 	out_handles[0] = get_ism_handle(ics);
 	*out_handle_count = 1;
 
+	// browser#103 RC-1: the first handle to cross. Any peer declaration after
+	// this point is too late — this one already went to whoever the connection
+	// was attributed to when it was sent.
+	ics->handles_sent = true;
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_instance_declare_peer(volatile struct ipc_client_state *ics,
+                                 const struct ipc_peer_declaration *decl,
+                                 uint32_t *out_accepted)
+{
+	IPC_TRACE_MARKER();
+
+	*out_accepted = 0;
+
+	// A refused declaration is NOT a connection failure — the caller carries on
+	// with opener attribution, which is exactly what every client that never
+	// declares anything gets. So every path below returns XRT_SUCCESS with
+	// out_accepted 0, and the connection stays usable.
+	const char *why = NULL;
+
+	if (decl->flags != 0) {
+		why = "reserved flags are not zero";
+	} else if (ics->peer_declared) {
+		// Settle ONCE. Otherwise a client could move its identity after a gate
+		// has already run against the old one.
+		why = "this connection has already settled its peer declaration";
+	} else if (ics->handles_sent) {
+		why = "a handle has already been duplicated to this client";
+	} else if (!ipc_server_peer_declaration_allowed(ics->opener_pid, (long)decl->target_pid, &why)) {
+		// why is filled in by the callee.
+	} else {
+		long declared = (long)decl->target_pid;
+		bool delegated = declared != ics->opener_pid;
+
+		ics->peer_declared = true;
+		ics->peer_pid = declared;
+		ics->client_state.pid = (int)declared;
+		// The only site that actually changes behaviour: ipc_send_handles's
+		// open_target_process_dup_handle now duplicates into the declared peer
+		// instead of the pipe opener.
+		ics->imc.dup_target_pid = declared;
+
+		// Re-derive the PID-reuse guard for the new identity; unreadable (a
+		// restricted-token peer) is fine and matches accept-time behaviour.
+		ics->peer_create_ns = 0;
+		if (delegated) {
+			IPC_WARN(ics->server,
+			         "[PEER] client id=%u: pid %ld delegated this connection to pid %ld — handles "
+			         "duplicate there and it is the peer identity (browser#103).",
+			         ics->client_state.id, ics->opener_pid, declared);
+		}
+		*out_accepted = 1;
+		return XRT_SUCCESS;
+	}
+
+	IPC_WARN(ics->server,
+	         "[PEER] client id=%u: REFUSING a peer declaration of pid %lld from opener pid %ld — %s. The "
+	         "connection stays attributed to the opener (browser#103).",
+	         ics->client_state.id, (long long)decl->target_pid, ics->opener_pid, why != NULL ? why : "refused");
 	return XRT_SUCCESS;
 }
 

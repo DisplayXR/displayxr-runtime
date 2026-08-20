@@ -63,7 +63,16 @@ open_target_process_dup_handle(struct ipc_message_channel *imc)
 
 	ULONG pid;
 	if (flags & PIPE_SERVER_END) {
-		if (!GetNamedPipeClientProcessId(imc->ipc_handle, &pid)) {
+		// browser#103 RC-1: GetNamedPipeClientProcessId names whoever OPENED the
+		// pipe. When a broker opened it on a sandboxed peer's behalf that is the
+		// wrong process to duplicate into, and the peer receives values
+		// meaningless in its address space. A connection may therefore DECLARE
+		// its real process, which the server accepts only after checking the
+		// opener may delegate to it (ipc_server_peer_declaration_allowed).
+		// Unset (0) is every pre-existing client, and behaves exactly as before.
+		if (imc->dup_target_pid > 0) {
+			pid = (ULONG)imc->dup_target_pid;
+		} else if (!GetNamedPipeClientProcessId(imc->ipc_handle, &pid)) {
 			DWORD err = GetLastError();
 			IPC_ERROR(imc, "GetNamedPipeClientProcessId(%p) failed: %d %s", imc->ipc_handle, err,
 			          ipc_winerror(err));

@@ -17,6 +17,7 @@
 #include "util/u_logging.h"
 
 #include <stddef.h>
+#include <stdlib.h>
 
 #ifdef XRT_OS_WINDOWS
 
@@ -90,6 +91,112 @@ ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
 	}
 	out_path[n] = 0;
 	return true;
+}
+
+/*!
+ * Read a process's integrity-level RID (SECURITY_MANDATORY_*_RID).
+ *
+ * Only PROCESS_QUERY_LIMITED_INFORMATION is needed, which a Medium-integrity
+ * service holds against both a Medium sibling and a Low child.
+ */
+static bool
+ipc_server_process_integrity_rid(long pid, DWORD *out_rid)
+{
+	bool ok = false;
+	HANDLE proc = NULL;
+	HANDLE token = NULL;
+	TOKEN_MANDATORY_LABEL *label = NULL;
+	DWORD size = 0;
+
+	if (pid <= 0) {
+		return false;
+	}
+
+	proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (proc == NULL) {
+		goto out;
+	}
+	if (!OpenProcessToken(proc, TOKEN_QUERY, &token)) {
+		goto out;
+	}
+
+	// First call reports the size; ERROR_INSUFFICIENT_BUFFER is the success path.
+	if (GetTokenInformation(token, TokenIntegrityLevel, NULL, 0, &size) || size == 0) {
+		goto out;
+	}
+	label = (TOKEN_MANDATORY_LABEL *)malloc(size);
+	if (label == NULL) {
+		goto out;
+	}
+	if (!GetTokenInformation(token, TokenIntegrityLevel, label, size, &size)) {
+		goto out;
+	}
+
+	{
+		UCHAR *count = GetSidSubAuthorityCount(label->Label.Sid);
+		if (count == NULL || *count == 0) {
+			goto out;
+		}
+		*out_rid = *GetSidSubAuthority(label->Label.Sid, (DWORD)(*count - 1));
+		ok = true;
+	}
+
+out:
+	free(label);
+	if (token != NULL) {
+		CloseHandle(token);
+	}
+	if (proc != NULL) {
+		CloseHandle(proc);
+	}
+	return ok;
+}
+
+bool
+ipc_server_peer_declaration_allowed(long opener_pid, long declared_pid, const char **out_why)
+{
+	const char *why = NULL;
+
+	if (declared_pid <= 0) {
+		why = "declared pid is not a process id";
+		goto refuse;
+	}
+	if (opener_pid <= 0) {
+		// Fail closed: with no authoriser there is nobody to authorise.
+		why = "the opener's identity could not be derived";
+		goto refuse;
+	}
+	if (declared_pid == opener_pid) {
+		// The adopter turned out to BE the opener. Nothing is delegated, so
+		// there is nothing to authorise; accepting keeps the client's "always
+		// declare self" rule uniform.
+		return true;
+	}
+
+	DWORD opener_rid = 0;
+	DWORD declared_rid = 0;
+	if (!ipc_server_process_integrity_rid(opener_pid, &opener_rid)) {
+		why = "the opener's integrity level could not be read";
+		goto refuse;
+	}
+	if (!ipc_server_process_integrity_rid(declared_pid, &declared_rid)) {
+		why = "the declared target's integrity level could not be read";
+		goto refuse;
+	}
+
+	// THE RULE. Delegation may only ever go downward.
+	if (opener_rid < declared_rid) {
+		why = "the opener may not delegate UPWARD (integrity escalation)";
+		goto refuse;
+	}
+
+	return true;
+
+refuse:
+	if (out_why != NULL) {
+		*out_why = why;
+	}
+	return false;
 }
 
 #else /* POSIX */
@@ -168,6 +275,24 @@ ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len)
 #else
 	return false;
 #endif
+}
+
+bool
+ipc_server_peer_declaration_allowed(long opener_pid, long declared_pid, const char **out_why)
+{
+	// POSIX has no handle duplication into a target process and no integrity
+	// level, so a declaration naming anyone but the opener buys nothing and is
+	// refused: the OS-derived creds (SO_PEERCRED / LOCAL_PEERPID) stay
+	// authoritative. Self-declaration is a no-op and is accepted so the client
+	// side needs no platform branch.
+	if (declared_pid > 0 && declared_pid == opener_pid) {
+		return true;
+	}
+	if (out_why != NULL) {
+		*out_why =
+		    "POSIX attributes a connection to the transport's creator; only self-declaration is honoured";
+	}
+	return false;
 }
 
 #endif
