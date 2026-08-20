@@ -223,6 +223,33 @@ window-sized output), so ONE submit carrying N rects makes 50 visible tiles cost
   low-bit-tagged with no `OpenProcess` — required for Low-integrity sandboxed callers
   (Chromium's GPU process; see #743). NT handles remain supported for Medium callers.
 
+## 4b. Error codes and connection loss
+
+All five entry points share one error contract.
+
+| Result | When | Is the session still usable? |
+|---|---|---|
+| `XR_ERROR_VALIDATION_FAILURE` | A chained struct is out of contract (`rectCount` out of range, a NULL `rects`, a zero-sized `clientSize`, an inconsistent `XrWeaveSubmitLayoutDXR`, a handle kind this platform cannot accept). | Yes — caller bug, nothing was submitted. |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | The session is in-process. The weave service exists only on the out-of-process (service/IPC) path. | Yes — and it will never succeed on this session. |
+| `XR_ERROR_RUNTIME_FAILURE` | The service was reached over a healthy connection and **refused this call** — most commonly `xrWeaveSubmitDXR` losing the input keyed-mutex race (the service gives the input `AcquireSync` 4 ms, §4) while the caller is still writing. | **Yes — retry on the next frame.** This is the expected steady-state miss and must not be treated as fatal. |
+| `XR_ERROR_INSTANCE_LOST` | The IPC connection to the service is **gone** (the service exited, crashed, or was restarted under a live client). | **No.** The session is marked lost. |
+| `XR_ERROR_SESSION_LOST` | Any call *after* an `XR_ERROR_INSTANCE_LOST`. | No. |
+
+The `INSTANCE_LOST` / `SESSION_LOST` behaviour is what every other IPC-backed OpenXR
+call in the runtime (`xrEndFrame`, `xrLocateViews`, `xrSyncActions`, `xrPollEvent`) has
+always done; the weave entry points joined it in browser#103, having previously reported
+a broken pipe as an ordinary `XR_ERROR_RUNTIME_FAILURE` — indistinguishable from the
+transient refusal above, so a weave-only present-owner could not tell "retry next frame"
+from "your connection is dead".
+
+**Recovery is a new instance, not a rebind.** There is no partial re-attach: a caller that
+sees `XR_ERROR_INSTANCE_LOST` destroys its session + instance and runs the whole
+`xrCreateInstance` → `xrCreateSession` → `xrWeaveBindWindow2DXR` sequence again, then
+re-asserts its sticky state (`xrWeaveSetScreenFlatRegionsDXR`, window geometry) and
+re-exports the woven texture/fence HANDLEs on the first submit of the new session. Back
+off between attempts — a service that is crash-looping must not be met with a reconnect
+storm — and never mark the failure permanent: a service restart self-heals.
+
 ## 5. macOS platform mapping (#759)
 
 The macOS service (comp_multi + null compositor, Vulkan/MoltenVK) implements the same bind /
@@ -288,6 +315,12 @@ Notes that only bite on Android:
 | 6 | `XrWeaveSubmitLayoutDXR` N-view worst-case atlas layout (#774). |
 | 7 | `XrWeaveSubmitHandlesDXR` handle kinds + `xrWeaveBindWindow2DXR` / `XrWeaveWindowGeometryDXR` explicit window geometry; **Android** support (#1036). |
 | 8 | `XrWeaveSubmitFlatRegionsDXR` + `xrWeaveSetScreenFlatRegionsDXR` — per-region hardware wish on the weave path (browser#88). |
+
+browser#103 added §4b. It introduces **no** new entry point, struct or provisional type
+value — the entry points now report a dead connection with the same
+`XR_ERROR_INSTANCE_LOST` every other IPC-backed OpenXR call already used, and §4b writes
+down the contract that was previously only implicit. Whether a behavioural change of that
+kind warrants a **v9** bump is left to review; the table above is unbumped on purpose.
 
 ## 7. Consumers
 

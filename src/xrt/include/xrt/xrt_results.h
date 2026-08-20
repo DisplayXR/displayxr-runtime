@@ -265,4 +265,25 @@ typedef enum xrt_result
 	 * later call, xrRequestExitSession included, into XR_ERROR_SESSION_LOST.
 	 */
 	XRT_ERROR_COMPOSITOR_WINDOW_CLOSED = -41,
+
+	/*!
+	 * browser#103: the service-side weave engine REFUSED this XR_DXR_weave
+	 * call. The connection is healthy — the request crossed the wire, the
+	 * service answered, and the answer was "not this frame".
+	 *
+	 * This exists purely to keep a transient refusal distinguishable from a
+	 * dead pipe. The canonical producer is the 4 ms input `AcquireSync`
+	 * timeout in `comp_d3d11_service_weave_submit` (the caller is still
+	 * writing the shared input): the submit is simply retried on the next
+	 * frame, and a present-owner that treated it as fatal would tear down a
+	 * perfectly good session. Bind / geometry / flat-region refusals ride the
+	 * same code for the same reason.
+	 *
+	 * Do NOT use @ref XRT_ERROR_IPC_FAILURE for this — that one means "the
+	 * transport is gone", and @ref OXR_CHECK_XRET maps it to `has_lost` +
+	 * XR_ERROR_INSTANCE_LOST, after which every later call is
+	 * XR_ERROR_SESSION_LOST. The state tracker maps THIS code to a plain
+	 * XR_ERROR_RUNTIME_FAILURE, leaving the session usable.
+	 */
+	XRT_ERROR_WEAVE_REFUSED = -42,
 } xrt_result_t;
