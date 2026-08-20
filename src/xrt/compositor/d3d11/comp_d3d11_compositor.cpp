@@ -173,8 +173,15 @@ struct comp_d3d11_compositor
 	bool split_active;
 	//! Monotonic app frame counter — the single seq every bridge fence uses.
 	uint64_t split_seq;
-	//! One-shot latch for the projection-only scope WARN (#918 Phase 1).
-	bool split_gated_warned;
+	//! Per-SITE one-shot latches for the projection-only scope WARNs (#918
+	//! Phase 1). One shared latch would name whichever feature happened to be
+	//! gated first and silence the other two — see d3d11_split_gate_site.
+	bool split_gated_warned[3];
+	//! Frames where the split had nothing woven to show, so the Present was
+	//! skipped and the panel kept the previous frame (#918 F4). Reported at most
+	//! once a second — a skip is a per-frame event and must never WARN per frame.
+	uint64_t split_skip_present;
+	uint64_t split_skip_logged_ns;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d11_target *target;
@@ -515,27 +522,60 @@ d3d11_out_context(struct comp_d3d11_compositor *c)
 }
 
 /*!
+ * The three Phase-1-gated features. Each gets its own latch: a single shared one
+ * would report only whichever fired first, so a session that gates the backdrop
+ * would silently gate zones too and the log would name the wrong feature.
+ */
+enum d3d11_split_gate_site
+{
+	D3D11_SPLIT_GATE_BACKDROP = 0,   //!< the 2D-under backdrop handoff
+	D3D11_SPLIT_GATE_ZONE_MASK_SYNC, //!< the hardware zone-mask sideband publish
+	D3D11_SPLIT_GATE_ZONE_COMPOSITE, //!< the zones / Local2D / authored-mask composite
+};
+
+/*!
  * #918 Phase 1 scope gate. Zones, Local2D, authored masks and the 2D backdrop
  * all read app-device textures and write the output-device back buffer, so they
  * are device-crossing by construction and are deferred to Phase 2. Under the
- * split they are hard-gated with ONE WARN; a plain projection weave continues
- * unaffected, and nothing crashes.
+ * split they are hard-gated with ONE WARN PER FEATURE; a plain projection weave
+ * continues unaffected, and nothing crashes.
  *
  * @return true when the caller must skip the device-crossing work.
  */
 static bool
-d3d11_split_gate(struct comp_d3d11_compositor *c, const char *what)
+d3d11_split_gate(struct comp_d3d11_compositor *c, enum d3d11_split_gate_site site, const char *what)
 {
 	if (!c->split_active) {
 		return false;
 	}
-	if (!c->split_gated_warned) {
-		c->split_gated_warned = true;
+	if (!c->split_gated_warned[site]) {
+		c->split_gated_warned[site] = true;
 		U_LOG_W("D3D11 output-device split: %s is device-crossing and is NOT implemented in "
 		        "Phase 1 — skipped for this session; plain projection weave continues (#918)",
 		        what);
 	}
 	return true;
+}
+
+/*!
+ * #918 F4: count a frame whose weave produced nothing and whose Present was
+ * therefore skipped, and report the running total at most once a second. Never
+ * per frame — a black-flash transition is a burst of skips, and the repo law is
+ * that nothing on the frame path may WARN per frame.
+ */
+static void
+d3d11_split_note_skipped_present(struct comp_d3d11_compositor *c, const char *where)
+{
+	c->split_skip_present++;
+	const uint64_t now = os_monotonic_get_ns();
+	if (now - c->split_skip_logged_ns < U_TIME_1S_IN_NS) {
+		return;
+	}
+	c->split_skip_logged_ns = now;
+	U_LOG_W(
+	    "D3D11 output-device split: %s had nothing woven — present SKIPPED, the panel holds the "
+	    "last woven frame (%llu skips so far) (#918)",
+	    where, (unsigned long long)c->split_skip_present);
 }
 
 /*!
@@ -1860,7 +1900,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// #918 Phase 1: the backdrop flatten reads APP-device Local2D swapchain
 	// images and hands the resulting SRV to a DP that now lives on the OUTPUT
 	// device — device-crossing, so it is gated off under the split (Phase 2).
-	if (!d3d11_split_gate(c, "the 2D-under backdrop handoff")) {
+	if (!d3d11_split_gate(c, D3D11_SPLIT_GATE_BACKDROP, "the 2D-under backdrop handoff")) {
 		if (!is_repaint) {
 			uint32_t bd_w = 0, bd_h = 0;
 			c->repaint.backdrop_srv =
@@ -1910,9 +1950,24 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			}
 		}
 		if (slot < 0) {
-			return false; // pre-first-crossing; the acquired target stays black
+			// Pre-first-crossing, or the ring was just reallocated. The target
+			// was acquired (== cleared to black); returning false is what tells
+			// layer_commit / the repaint tick to SKIP the present, so the panel
+			// holds the last shown frame instead of flashing black (#918 F4).
+			return false;
 		}
-		comp_d3d11_xbridge_gpu_wait_slot(c->xbridge, c->out_ctx, slot);
+		/*
+		 * #918 F7 (b): a repaint re-weaves a slot it did not pick, so nothing
+		 * has verified that slot's consumer copy landed. The GPU-side wait does
+		 * it when the output device could open the consumer fence; when it could
+		 * not, check CPU-side and bail rather than weave a slot the consumer is
+		 * mid-way through rewriting. (This runs on the repaint thread, never on
+		 * the app's render thread, and it is a single poll — not a wait.)
+		 */
+		if (is_repaint && !comp_d3d11_xbridge_slot_ready(c->xbridge, slot)) {
+			return false;
+		}
+		comp_d3d11_xbridge_gpu_wait_slot(c->xbridge, slot);
 		atlas_srv = comp_d3d11_xbridge_get_srv(c->xbridge, slot);
 		if (atlas_srv == nullptr) {
 			return false;
@@ -2298,10 +2353,23 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		 * last app frame published, already resident on this adapter.
 		 */
 		if (c->split_active) {
+			// #918 F4: nothing published to re-weave (warmup, or the egress ring
+			// was just reallocated by a mode switch / resize). Bail BEFORE the
+			// acquire — acquire clears the back buffer, and a present of that
+			// clear is exactly the black flash this guard exists to remove.
+			if (comp_d3d11_xbridge_get_weave_slot(c->xbridge) < 0) {
+				c->repaint.bail_armed++;
+				continue;
+			}
 			comp_d3d11_target_acquire(c->target, &rp_index);
-			d3d11_dp_weave(c, true);
-			d3d11_render_hud_overlay(c, c->out_dev, c->out_ctx, true, &c->repaint.eye_pos);
-			comp_d3d11_target_present(c->target, 1);
+			if (d3d11_dp_weave(c, true)) {
+				d3d11_render_hud_overlay(c, c->out_dev, c->out_ctx, true, &c->repaint.eye_pos);
+				comp_d3d11_target_present(c->target, 1);
+			} else {
+				// Cleared but unwoven — hold the last shown frame (FLIP_DISCARD
+				// keeps it on screen precisely because we do not present).
+				d3d11_split_note_skipped_present(c, "the repaint tick");
+			}
 		} else {
 			if (c->mt_lock != nullptr) {
 				c->mt_lock->Enter();
@@ -2691,6 +2759,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// can read the atlas in between.
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
+		/*
+		 * #918 F6: the passes below overwrite the atlas the producer copies OUT
+		 * of. Take the GPU-queue back-fence first, so the app's adapter cannot
+		 * start frame N's writes until the producer's copy of the last bridged
+		 * frame retired. GPU-side only — this thread does not wait.
+		 */
+		if (c->split_active) {
+			comp_d3d11_xbridge_pre_render(c->xbridge);
+		}
 		xret = comp_d3d11_renderer_draw_projection_pass(
 		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
@@ -2862,6 +2939,26 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		weaving_done = d3d11_dp_weave(c, false);
 	}
 
+	/*
+	 * #918 F4: under the split the weave can legitimately produce NOTHING — the
+	 * first frames before anything has crossed, and the frame after an egress
+	 * realloc (a mode switch or a resize) that reset the ring. The back buffer
+	 * was already acquired, and acquire CLEARS it, so presenting here would put
+	 * a black frame on the panel; the repaint tick would then do it again, which
+	 * is the mode-switch black flash.
+	 *
+	 * With FLIP_DISCARD the correct degrade is simply not to present: the panel
+	 * keeps showing the last frame that WAS woven, for the one or two frames the
+	 * transition takes. The skip is counted, never logged per frame.
+	 */
+	if (c->split_active && !weaving_done) {
+		d3d11_split_note_skipped_present(c, "the app frame");
+		if (c->owns_window && c->own_window != nullptr) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
+		}
+		return XRT_SUCCESS;
+	}
+
 	// HUD overlay (post-processing, always readable). #918: the staging texture
 	// and the back-buffer blit follow the target onto the output device.
 	d3d11_render_hud_overlay(c, d3d11_out_device(c), d3d11_out_context(c), weaving_done, &eye_pos);
@@ -2948,6 +3045,8 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	 * reading the renderer's atlas or writing an egress slot.
 	 */
 	if (c->xbridge != nullptr) {
+		U_LOG_W("D3D11 output-device split: %llu presents skipped for want of a woven frame (#918 F4)",
+		        (unsigned long long)c->split_skip_present);
 		comp_d3d11_xbridge_quiesce(c->xbridge);
 	}
 
@@ -3384,7 +3483,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			if (FAILED(hr) || c->out_factory == nullptr) {
 				U_LOG_W("D3D11 output-device split: scanout DXGI factory failed 0x%08lx",
 				        (unsigned long)hr);
-				reason = "D3D11CreateDevice failed";
+				// Its own reason: the device was created fine, it is the
+				// adapter's IDXGIFactory4 parent that could not be reached,
+				// and the fallback WARN must not misname that.
+				reason = "scanout DXGI factory unavailable";
 			}
 		}
 
@@ -3406,6 +3508,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			xbi.app_context = c->context;
 			xbi.app_adapter = app_adapter;
 			xbi.out_device = c->out_dev;
+			xbi.out_context = c->out_ctx;
 			xbi.out_adapter = scanout.get();
 			xbi.max_width = sys_w;
 			xbi.max_height = sys_h;
@@ -4052,7 +4155,7 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 {
 	// #918 Phase 1: the publish stages an APP-device mask SRV through the
 	// OUTPUT-device DP context — device-crossing, deferred to Phase 2.
-	if (d3d11_split_gate(c, "the hardware zone-mask sideband publish")) {
+	if (d3d11_split_gate(c, D3D11_SPLIT_GATE_ZONE_MASK_SYNC, "the hardware zone-mask sideband publish")) {
 		return;
 	}
 	if (!d3d11_zone_dp_supported(c)) {
@@ -5000,7 +5103,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// flatten, the weave scratch) is allocated on the APP device while `dst` is
 	// now the OUTPUT device's back buffer. Device-crossing by construction —
 	// gated off under the split, so a plain projection weave still runs.
-	if (d3d11_split_gate(c, "the zones / Local2D / authored-mask composite")) {
+	if (d3d11_split_gate(c, D3D11_SPLIT_GATE_ZONE_COMPOSITE, "the zones / Local2D / authored-mask composite")) {
 		return false;
 	}
 	struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
