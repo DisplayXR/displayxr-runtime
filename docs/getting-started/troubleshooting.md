@@ -41,6 +41,11 @@ displayxr-cli.exe dp reset             &&  displayxr-cli.exe selftest   :: real 
 plug-in ABI, the active plug-in's identity and display info, and the Windows
 `ActiveRuntime` value.
 
+On a hybrid iGPU/dGPU machine, `info`'s **`GPU topology`** section (and the matching
+one-line `weave placement:` WARN every D3D11 session logs) tells you whether the weave
+runs on the adapter that scans out the panel or has to cross adapters to reach it — see
+[Adapter selection](../reference/adapter-selection.md#checking-where-the-weave-actually-runs).
+
 **Which runtime DLL actually loaded?** Every `xrCreateInstance` logs it. Open the newest
 log in `%LOCALAPPDATA%\DisplayXR\` (named `DisplayXR_<exe>.<pid>_<timestamp>.log`) and
 search for `loaded from:` — that's the authoritative path.

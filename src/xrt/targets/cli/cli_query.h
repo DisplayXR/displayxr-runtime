@@ -58,6 +58,23 @@ enum cli_selftest_result
 	CLI_SELFTEST_BAD_INPUT = 5,
 };
 
+//! Hardware adapters reported by the GPU-topology probe (#918).
+#define CLI_MAX_GPU_ADAPTERS 8
+
+/*!
+ * One hardware DXGI adapter, as reported by the #918 GPU-topology probe.
+ * Software adapters (WARP / Basic Render Driver) are skipped.
+ */
+struct cli_gpu_adapter
+{
+	char name[128];
+	//! Packed exactly as Vulkan reports `VkPhysicalDeviceIDProperties::deviceLUID`
+	//! (raw LUID bytes, LowPart first) — the same packing
+	//! @ref d3d_scanout_adapter_luid returns.
+	uint64_t luid;
+	uint64_t dedicated_vram_bytes;
+};
+
 /*!
  * A fully self-contained snapshot of runtime / plug-in / display state.
  * All pointers from the runtime are copied into fixed buffers and the
@@ -170,6 +187,35 @@ struct cli_query_result
 	char dp_sel_inproc_id[64];     //!< in-process path plug-in id (mirrors plugin_id).
 	char dp_sel_service_id[64];    //!< service path plug-in id (registry primary; == in-proc on empty registry).
 	char dp_sel_service_conf[24];  //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
+
+	/* #918 GPU topology — does this box pay a cross-adapter present to get
+	 * the woven frame onto the panel? Windows-only: `gpu_probed` stays false
+	 * everywhere else and the serializers print nothing but an "n/a" line.
+	 *
+	 * scanout — the adapter that owns the output the panel is scanned out
+	 *           on (`d3d_scanout_adapter_luid` over the plug-in's panel
+	 *           rect). Unresolvable is reported as such, never guessed.
+	 * render  — the adapter the runtime would suggest by default, i.e. the
+	 *           hardware adapter with the MOST dedicated VRAM (mirrors the
+	 *           dGPU classification in oxr_d3d.cpp; deliberately not
+	 *           EnumAdapterByGpuPreference, which a per-app
+	 *           UserGpuPreferences entry can reorder).
+	 * applies — render != scanout, i.e. the session pays the cross-adapter
+	 *           present and DXR_WEAVE_ON_SCANOUT has something to move. */
+	bool gpu_probed;
+	uint32_t gpu_adapter_count;
+	struct cli_gpu_adapter gpu_adapters[CLI_MAX_GPU_ADAPTERS];
+	bool gpu_scanout_resolved;
+	uint64_t gpu_scanout_luid;
+	char gpu_scanout_name[128];
+	bool gpu_render_resolved;
+	uint64_t gpu_render_luid;
+	char gpu_render_name[128];
+	bool gpu_split_applies;
+	char gpu_verdict[192]; //!< the one-line verdict, reused verbatim by selftest.
+	bool gpu_weave_env_set;
+	char gpu_weave_env[64]; //!< DXR_WEAVE_ON_SCANOUT value when set.
+	char gpu_note[128];     //!< why the probe could not answer, when it could not.
 };
 
 /*!
