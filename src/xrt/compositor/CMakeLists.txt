@@ -274,6 +274,7 @@ add_library(
 			  multi/comp_multi_workspace.c multi/comp_multi_workspace.h
 			  multi/comp_multi_content_blend.c multi/comp_multi_content_blend.h
 			  multi/comp_multi_bg2d.c multi/comp_multi_bg2d.h
+			  multi/comp_multi_bg2d_capture.c multi/comp_multi_bg2d_capture.h
 	)
 target_link_libraries(
 	comp_multi

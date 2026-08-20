@@ -11,6 +11,7 @@
  */
 
 #include "comp_multi_bg2d.h"
+#include "comp_multi_bg2d_capture.h"
 #include "comp_multi_private.h"
 
 #include "util/u_logging.h"
@@ -43,6 +44,12 @@ struct bg2d_config
 	bool enabled;
 	uint8_t top[3];    //!< RGB at v = 0.
 	uint8_t bottom[3]; //!< RGB at v = 1 (== top for a solid fill).
+
+	//! T2: take the backdrop from an external capture producer instead of
+	//! drawing it. When set, `top`/`bottom` are unused and the image is
+	//! rebuilt whenever a new frame lands. See comp_multi_bg2d_capture.h.
+	bool capture;
+	char capture_sock[64];
 };
 
 //! Parse "RRGGBB" (with or without a leading '#') into @p out. Returns false on
@@ -127,7 +134,17 @@ bg2d_config_get(void)
 	memcpy(cfg.top, kDefTop, 3);
 	memcpy(cfg.bottom, kDefBottom, 3);
 
-	if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 || strcmp(s, "grad") == 0) {
+	if (strcmp(s, "capture") == 0 || strncmp(s, "capture:", 8) == 0) {
+		// T2 — real screen-behind-the-window pixels from a privileged
+		// producer. The gradient stays parsed as the fallback the DP gets
+		// while no producer is connected: nothing, i.e. today's path.
+		cfg.capture = true;
+		const char *sock = (s[7] == ':') ? s + 8 : "";
+		snprintf(cfg.capture_sock, sizeof(cfg.capture_sock), "%s", sock);
+		U_LOG_W("bg2d(#1073 T2): external capture producer selected (socket @%s)",
+		        cfg.capture_sock[0] != '\0' ? cfg.capture_sock : COMP_MULTI_BG2D_CAPTURE_SOCKET);
+		return &cfg;
+	} else if (strcmp(s, "1") == 0 || strcmp(s, "on") == 0 || strcmp(s, "grad") == 0) {
 		// keep the default gradient
 	} else if (strncmp(s, "grad:", 5) == 0) {
 		const char *rest = s + 5;
@@ -200,6 +217,8 @@ comp_multi_bg2d_teardown(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.bg2d_w = 0;
 	mc->session_render.bg2d_h = 0;
 	mc->session_render.bg2d_initialized = false;
+	mc->session_render.bg2d_uploaded_once = false;
+	mc->session_render.bg2d_seq = 0;
 	mc->session_render.bg2d_failed = false;
 }
 
@@ -224,27 +243,13 @@ bg2d_rasterize(const struct bg2d_config *cfg, uint8_t *pixels)
 	}
 }
 
-VkImageView
-comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t *out_w, uint32_t *out_h)
+//! Allocate the backdrop image, its view and a host-visible staging buffer at
+//! @p w x @p h. Only ever called when nothing is allocated yet, or after a
+//! teardown forced by a size change.
+static bool
+bg2d_create(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t w, uint32_t h)
 {
-	if (mc == NULL || vk == NULL) {
-		return VK_NULL_HANDLE;
-	}
-	const struct bg2d_config *cfg = bg2d_config_get();
-	if (!cfg->enabled || mc->session_render.bg2d_failed) {
-		return VK_NULL_HANDLE;
-	}
-	if (mc->session_render.bg2d_initialized) {
-		if (out_w != NULL) {
-			*out_w = mc->session_render.bg2d_w;
-		}
-		if (out_h != NULL) {
-			*out_h = mc->session_render.bg2d_h;
-		}
-		return mc->session_render.bg2d_view;
-	}
-
-	const VkDeviceSize pixel_size = (VkDeviceSize)BG2D_W * BG2D_H * 4;
+	const VkDeviceSize pixel_size = (VkDeviceSize)w * h * 4;
 	VkResult ret;
 
 	// --- image (device-local, TRANSFER_DST | SAMPLED) ---
@@ -252,7 +257,7 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 	    .imageType = VK_IMAGE_TYPE_2D,
 	    .format = VK_FORMAT_R8G8B8A8_UNORM,
-	    .extent = {BG2D_W, BG2D_H, 1},
+	    .extent = {w, h, 1},
 	    .mipLevels = 1,
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -263,7 +268,7 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	ret = vk->vkCreateImage(vk->device, &image_info, NULL, &mc->session_render.bg2d_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: image create failed: %s", vk_result_string(ret));
-		goto fail;
+		goto fail_create;
 	}
 
 	VkMemoryRequirements img_reqs;
@@ -275,12 +280,12 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	if (!vk_get_memory_type(vk, img_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 	                        &img_alloc.memoryTypeIndex)) {
 		U_LOG_E("bg2d: no device-local memory type");
-		goto fail;
+		goto fail_create;
 	}
 	ret = vk->vkAllocateMemory(vk->device, &img_alloc, NULL, &mc->session_render.bg2d_memory);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: image memory alloc failed: %s", vk_result_string(ret));
-		goto fail;
+		goto fail_create;
 	}
 	vk->vkBindImageMemory(vk->device, mc->session_render.bg2d_image, mc->session_render.bg2d_memory, 0);
 
@@ -289,7 +294,7 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	                     &mc->session_render.bg2d_view);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: view create failed: %s", vk_result_string(ret));
-		goto fail;
+		goto fail_create;
 	}
 
 	// --- staging buffer, filled with the rasterised gradient ---
@@ -301,7 +306,7 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	ret = vk->vkCreateBuffer(vk->device, &buf_info, NULL, &mc->session_render.bg2d_staging_buffer);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: staging buffer create failed: %s", vk_result_string(ret));
-		goto fail;
+		goto fail_create;
 	}
 	VkMemoryRequirements buf_reqs;
 	vk->vkGetBufferMemoryRequirements(vk->device, mc->session_render.bg2d_staging_buffer, &buf_reqs);
@@ -313,15 +318,45 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 	                        &buf_alloc.memoryTypeIndex)) {
 		U_LOG_E("bg2d: no host-visible memory type");
-		goto fail;
+		goto fail_create;
 	}
 	ret = vk->vkAllocateMemory(vk->device, &buf_alloc, NULL, &mc->session_render.bg2d_staging_memory);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("bg2d: staging memory alloc failed: %s", vk_result_string(ret));
-		goto fail;
+		goto fail_create;
 	}
 	vk->vkBindBufferMemory(vk->device, mc->session_render.bg2d_staging_buffer,
 	                       mc->session_render.bg2d_staging_memory, 0);
+
+	mc->session_render.bg2d_w = w;
+	mc->session_render.bg2d_h = h;
+	return true;
+
+fail_create:
+	comp_multi_bg2d_teardown(mc, vk);
+	mc->session_render.bg2d_failed = true;
+	return false;
+}
+
+
+/*!
+ * Fill the backdrop image, creating it first if needed.
+ *
+ * @param src Tightly packed RGBA8 `w * h * 4`, or NULL to rasterise the
+ *            configured gradient (T0). The upload path is identical either
+ *            way — that is the point of the seam: T0 and T2 differ only in
+ *            where the bytes came from.
+ */
+static bool
+bg2d_build(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t w, uint32_t h, const uint8_t *src)
+{
+	if (!mc->session_render.bg2d_initialized && !bg2d_create(mc, vk, w, h)) {
+		return false;
+	}
+
+	const VkDeviceSize pixel_size = (VkDeviceSize)w * h * 4;
+	VkResult ret;
+	VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
 	void *mapped = NULL;
 	ret = vk->vkMapMemory(vk->device, mc->session_render.bg2d_staging_memory, 0, pixel_size, 0, &mapped);
@@ -329,7 +364,11 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 		U_LOG_E("bg2d: staging map failed: %s", vk_result_string(ret));
 		goto fail;
 	}
-	bg2d_rasterize(cfg, (uint8_t *)mapped);
+	if (src != NULL) {
+		memcpy(mapped, src, (size_t)pixel_size);
+	} else {
+		bg2d_rasterize(bg2d_config_get(), (uint8_t *)mapped);
+	}
 	vk->vkUnmapMemory(vk->device, mc->session_render.bg2d_staging_memory);
 
 	// --- one-shot upload ---
@@ -356,11 +395,16 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 	};
 	vk->vkBeginCommandBuffer(cmd, &bi);
 
+	// A refresh (T2 delivers a new frame) finds the image in
+	// SHADER_READ_ONLY_OPTIMAL from the previous upload; the very first one
+	// finds it UNDEFINED. Getting this wrong is a validation error and, on a
+	// tiler, a real corruption.
 	VkImageMemoryBarrier to_dst = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = 0,
 	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .oldLayout = mc->session_render.bg2d_uploaded_once ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+	                                                       : VK_IMAGE_LAYOUT_UNDEFINED,
 	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -372,14 +416,14 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 
 	VkBufferImageCopy region = {
 	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .imageExtent = {BG2D_W, BG2D_H, 1},
+	    .imageExtent = {w, h, 1},
 	};
 	vk->vkCmdCopyBufferToImage(cmd, mc->session_render.bg2d_staging_buffer, mc->session_render.bg2d_image,
 	                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
 	// The slot's contract: the view is left in SHADER_READ_ONLY_OPTIMAL and
-	// outlives the process_atlas call. Nothing ever writes it again, so this is
-	// the image's final layout for the session.
+	// outlives the process_atlas call. That is also the layout the next T2
+	// refresh transitions *from*, which is why bg2d_uploaded_once exists.
 	VkImageMemoryBarrier to_read = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -412,24 +456,79 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32
 		goto fail;
 	}
 
-	mc->session_render.bg2d_w = BG2D_W;
-	mc->session_render.bg2d_h = BG2D_H;
 	mc->session_render.bg2d_initialized = true;
-	U_LOG_W("bg2d(#1073 T0): backdrop %ux%u uploaded — handing it to the DP via set_background_2d", BG2D_W,
-	        BG2D_H);
-
-	if (out_w != NULL) {
-		*out_w = BG2D_W;
+	mc->session_render.bg2d_uploaded_once = true;
+	if (!mc->session_render.bg2d_logged) {
+		mc->session_render.bg2d_logged = true;
+		U_LOG_W("bg2d(#1073): backdrop %ux%u uploaded (%s) — handing it to the DP via set_background_2d", w, h,
+		        src != NULL ? "captured" : "runtime-drawn");
 	}
-	if (out_h != NULL) {
-		*out_h = BG2D_H;
-	}
-	return mc->session_render.bg2d_view;
+	return true;
 
 fail:
 	comp_multi_bg2d_teardown(mc, vk);
 	// Latch the failure so a broken environment costs one attempt, not one per
 	// frame. Teardown clears the flag, so set it after.
 	mc->session_render.bg2d_failed = true;
-	return VK_NULL_HANDLE;
+	return false;
+}
+
+
+VkImageView
+comp_multi_bg2d_ensure(struct multi_compositor *mc, struct vk_bundle *vk, uint32_t *out_w, uint32_t *out_h)
+{
+	if (mc == NULL || vk == NULL) {
+		return VK_NULL_HANDLE;
+	}
+	const struct bg2d_config *cfg = bg2d_config_get();
+	if (!cfg->enabled || mc->session_render.bg2d_failed) {
+		return VK_NULL_HANDLE;
+	}
+
+	if (cfg->capture) {
+		// T2 — the producer is out of process (it must be: no Android
+		// permission tier lets an app capture the screen behind its own
+		// layer, see comp_multi_bg2d_capture.h). Start the listener once,
+		// then re-upload only when a genuinely new frame has landed; a
+		// static screen therefore costs one upload, not one per frame.
+		comp_multi_bg2d_capture_start(cfg->capture_sock);
+
+		struct comp_multi_bg2d_capture_frame f = {0};
+		if (comp_multi_bg2d_capture_acquire(&f, mc->session_render.bg2d_seq)) {
+			const bool resized =
+			    mc->session_render.bg2d_initialized &&
+			    (mc->session_render.bg2d_w != f.width || mc->session_render.bg2d_h != f.height);
+			if (resized) {
+				// The producer may re-negotiate its output size (a
+				// rotation, a different crop). Rebuild rather than
+				// scale — it happens ~never and correctness is free.
+				comp_multi_bg2d_teardown(mc, vk);
+			}
+			uint32_t seq = f.seq;
+			bool ok = bg2d_build(mc, vk, f.width, f.height, f.pixels);
+			comp_multi_bg2d_capture_release();
+			if (ok) {
+				mc->session_render.bg2d_seq = seq;
+			}
+		}
+
+		// No producer yet (or ever): no background, which is exactly the
+		// pre-#1073 path. Never latch bg2d_failed for this — the producer
+		// is allowed to show up an hour into the session.
+		if (!mc->session_render.bg2d_initialized) {
+			return VK_NULL_HANDLE;
+		}
+	} else if (!mc->session_render.bg2d_initialized) {
+		if (!bg2d_build(mc, vk, BG2D_W, BG2D_H, NULL)) {
+			return VK_NULL_HANDLE;
+		}
+	}
+
+	if (out_w != NULL) {
+		*out_w = mc->session_render.bg2d_w;
+	}
+	if (out_h != NULL) {
+		*out_h = mc->session_render.bg2d_h;
+	}
+	return mc->session_render.bg2d_view;
 }
