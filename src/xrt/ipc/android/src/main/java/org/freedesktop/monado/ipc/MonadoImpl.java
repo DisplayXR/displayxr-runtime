@@ -142,6 +142,22 @@ public class MonadoImpl extends IMonado.Stub {
         // (avatar) gets the service overlay — without a global toggle. debug.dxr.overlay
         // stays as a dev FORCE-ALL override.
         if (!Settings.canDrawOverlays(context)) {
+            // Say so LOUDLY and only when it actually matters. SYSTEM_ALERT_WINDOW is a
+            // special app-op permission: never granted at install time, and DROPPED by an
+            // uninstall+install. Silently returning false here makes a see-through app
+            // (demo-avatar) render on a BLACK background with every other symptom absent —
+            // the weave still runs — which is indistinguishable from a transparency
+            // regression. Only warn for an app that asked for overlay mode, so a normal
+            // opaque client (cube) stays quiet.
+            if (callerDeclaresOverlay() || nativeOverlayModeEnabled()) {
+                Log.w(
+                        TAG,
+                        "canDrawOverOtherApps = false: the client asked for overlay mode but"
+                            + " this runtime package lacks SYSTEM_ALERT_WINDOW ('display over"
+                            + " other apps'), so there is no service overlay and the app will"
+                            + " render on an OPAQUE surface. Grant it: adb shell appops set "
+                                + context.getPackageName() + " SYSTEM_ALERT_WINDOW allow");
+            }
             return false;
         }
         boolean overlay = callerDeclaresOverlay() || nativeOverlayModeEnabled();

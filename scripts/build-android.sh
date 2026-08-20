@@ -122,3 +122,23 @@ fi
 echo ">> adb ${DEVICE_ARGS[*]} install -r -d <apk>"
 "$ADB" "${DEVICE_ARGS[@]}" install -r -d "$APK"
 echo "Installed $GRADLE_FLAVOR/$VARIANT on device."
+
+# ---- re-grant the overlay permission ----------------------------------------
+# SYSTEM_ALERT_WINDOW ("display over other apps") is a special app-op permission:
+# it is NEVER granted at install time, and an uninstall+install DROPS a previous
+# grant. The runtime needs it for overlay mode (#558) — the service-owned
+# TYPE_APPLICATION_OVERLAY that see-through apps (demo-avatar) weave into.
+# Without it MonadoImpl.canDrawOverOtherApps() returns false, the client falls
+# back to publishing its own opaque surface, and the app renders on a BLACK
+# background with no other symptom (3D/weave keeps working). Re-grant on every
+# install so a reinstall can't silently regress transparency.
+if [ "$FLAVOR" = "outofprocess" ]; then PKG="org.freedesktop.monado.openxr_runtime.out_of_process"
+else PKG="org.freedesktop.monado.openxr_runtime.in_process"; fi
+echo ">> adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow"
+if "$ADB" "${DEVICE_ARGS[@]}" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow; then
+    echo "Overlay permission (SYSTEM_ALERT_WINDOW) granted to $PKG."
+else
+    echo "WARN: could not grant SYSTEM_ALERT_WINDOW to $PKG — overlay mode (#558)" >&2
+    echo "      will be OFF, so see-through apps (demo-avatar) render on black." >&2
+    echo "      Grant it by hand: adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow" >&2
+fi
