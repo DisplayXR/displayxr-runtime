@@ -98,6 +98,7 @@ comp_multi_bg2d_enabled(void);
  * @param      canvas_on_panel Canvas rect in panel pixels, or NULL / a
  *                    degenerate rect to use the frame whole (T0 always passes
  *                    NULL — a runtime-drawn backdrop is already canvas-space).
+ * @param      panel_w, panel_h Panel extent the rect is expressed against.
  * @param[out] out_w  Backdrop width in pixels (may be NULL).
  * @param[out] out_h  Backdrop height in pixels (may be NULL).
  */
@@ -105,6 +106,8 @@ VkImageView
 comp_multi_bg2d_ensure(struct multi_compositor *mc,
                        struct vk_bundle *vk,
                        const struct xrt_rect *canvas_on_panel,
+                       uint32_t panel_w,
+                       uint32_t panel_h,
                        uint32_t *out_w,
                        uint32_t *out_h);
 

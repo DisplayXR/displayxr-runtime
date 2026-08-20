@@ -196,6 +196,9 @@ comp_multi_bg2d_teardown(struct multi_compositor *mc, struct vk_bundle *vk)
 	free(mc->session_render.bg2d_crop_scratch);
 	mc->session_render.bg2d_crop_scratch = NULL;
 	mc->session_render.bg2d_crop_capacity = 0;
+	// The image is gone, so the next ensure() must re-acquire and re-crop even
+	// if the canvas has not moved.
+	mc->session_render.bg2d_have_canvas_used = false;
 	if (vk != NULL) {
 		if (mc->session_render.bg2d_view != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, mc->session_render.bg2d_view, NULL);
@@ -573,6 +576,8 @@ VkImageView
 comp_multi_bg2d_ensure(struct multi_compositor *mc,
                        struct vk_bundle *vk,
                        const struct xrt_rect *canvas_on_panel,
+                       uint32_t panel_w,
+                       uint32_t panel_h,
                        uint32_t *out_w,
                        uint32_t *out_h)
 {
@@ -592,15 +597,25 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc,
 		// static screen therefore costs one upload, not one per frame.
 		comp_multi_bg2d_capture_start(cfg->capture_sock);
 
+		// Re-crop when the canvas MOVES, not only when a newer frame lands.
+		// `once` mode sends exactly one frame and it typically arrives before
+		// the app has submitted the zone layer that establishes the canvas, so
+		// keying the upload on the frame sequence alone would freeze that first
+		// canvas-less mapping for the life of the session. Asking for seq 0
+		// re-acquires whatever the receiver still holds.
+		const bool canvas_moved =
+		    canvas_on_panel != NULL && (!mc->session_render.bg2d_have_canvas_used ||
+		                                memcmp(&mc->session_render.bg2d_canvas_used, canvas_on_panel,
+		                                       sizeof(*canvas_on_panel)) != 0);
+
 		struct comp_multi_bg2d_capture_frame f = {0};
-		if (comp_multi_bg2d_capture_acquire(&f, mc->session_render.bg2d_seq)) {
+		if (comp_multi_bg2d_capture_acquire(&f, canvas_moved ? 0 : mc->session_render.bg2d_seq)) {
 			// #174 — the producer sent PANEL pixels; slot 16 promises the
 			// CANVAS. Crop before the upload so the DP's (0,0)-(1,1) tile
 			// mapping lands the backdrop exactly where the atlas depicts.
 			uint32_t cx = 0, cy = 0, up_w = f.width, up_h = f.height;
 			const bool crop = bg2d_canvas_crop_rect(
-			    canvas_on_panel, mc->session_render.window_screen_disp_w,
-			    mc->session_render.window_screen_disp_h, f.width, f.height, &cx, &cy, &up_w, &up_h);
+			    canvas_on_panel, panel_w, panel_h, f.width, f.height, &cx, &cy, &up_w, &up_h);
 
 			// Settle the upload dims BEFORE any teardown: the producer may
 			// re-negotiate its output size (a rotation, a different capture
@@ -630,8 +645,7 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc,
 					        " %d,%d %dx%d on a %ux%u panel -> %ux%u at (%u,%u) (#174)",
 					        f.width, f.height, canvas_on_panel->offset.w,
 					        canvas_on_panel->offset.h, canvas_on_panel->extent.w,
-					        canvas_on_panel->extent.h, mc->session_render.window_screen_disp_w,
-					        mc->session_render.window_screen_disp_h, up_w, up_h, cx, cy);
+					        canvas_on_panel->extent.h, panel_w, panel_h, up_w, up_h, cx, cy);
 				}
 			}
 
@@ -640,6 +654,10 @@ comp_multi_bg2d_ensure(struct multi_compositor *mc,
 			comp_multi_bg2d_capture_release();
 			if (ok) {
 				mc->session_render.bg2d_seq = seq;
+				if (canvas_on_panel != NULL) {
+					mc->session_render.bg2d_canvas_used = *canvas_on_panel;
+					mc->session_render.bg2d_have_canvas_used = true;
+				}
 			}
 		}
 
