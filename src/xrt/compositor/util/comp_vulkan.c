@@ -396,6 +396,10 @@ comp_vulkan_init_bundle(struct vk_bundle *vk,
 		return false;
 	}
 
+	// Must be in place before device selection: env_forced_gpu_index() reads it
+	// when DXR_VK_FORCE_GPU=scanout (#918).
+	vk->scanout_adapter_luid = vk_args->scanout_adapter_luid;
+
 	ret = create_device(vk, vk_args);
 	if (ret != VK_SUCCESS) {
 		// Error already reported.

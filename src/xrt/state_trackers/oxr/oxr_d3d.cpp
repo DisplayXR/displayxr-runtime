@@ -11,6 +11,7 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "d3d/d3d_dxgi_helpers.hpp"
+#include "d3d/d3d_scanout_helpers.hpp"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -48,9 +49,17 @@ using namespace xrt::auxiliary::d3d;
  * redirect it; a client rendering on the iGPU then diverges from the
  * session device and the cross-adapter eye bridge presents black (#240).
  *
- * Accepted: "igpu"/"integrated", "dgpu"/"discrete", or an adapter index.
- * Returns an adapter or nullptr when unset/invalid (normal selection).
+ * Accepted: "scanout", "igpu"/"integrated", "dgpu"/"discrete", or an adapter
+ * index. Returns an adapter or nullptr when unset/invalid (normal selection).
  * D3D sibling of the Vulkan-side DXR_VK_FORCE_GPU.
+ *
+ * "scanout" (#918 Phase 0, closes the #846 gap) resolves dynamically to the
+ * adapter that owns the output the 3D panel is scanned out on — the iGPU on a
+ * box whose panel hangs off the integrated display controller, the dGPU on a
+ * MUX'd laptop or a panel wired to the discrete card. It is NOT an alias for
+ * "igpu": the rule is "weave next to scanout", and which silicon that is is a
+ * property of the machine, not of the keyword. @p info supplies the panel rect
+ * and may be NULL (then it is unresolvable → WARN + normal selection).
  *
  * SUPPORTED CONTRACT (#845): clients (e.g. the Unity plugin's Target GPU
  * setting) build on this name and these semantics — do not rename, drop, or
@@ -59,11 +68,37 @@ using namespace xrt::auxiliary::d3d;
  * clients must set it via the CRT (_putenv_s), not SetEnvironmentVariableW.
  */
 static wil::com_ptr<IDXGIAdapter>
-env_forced_d3d_adapter()
+env_forced_d3d_adapter(const struct xrt_system_compositor_info *info)
 {
 	const char *val = getenv("DXR_D3D_FORCE_GPU");
 	if (val == NULL || val[0] == '\0') {
 		return nullptr;
+	}
+
+	if (strcmp(val, "scanout") == 0) {
+		if (info == NULL) {
+			U_LOG_W("DXR_D3D_FORCE_GPU=scanout: no display info available — ignoring");
+			return nullptr;
+		}
+		auto adapter = getScanoutAdapter(info->display_screen_left, info->display_screen_top,
+		                                 info->display_pixel_width, info->display_pixel_height, U_LOGGING_INFO);
+		if (adapter == nullptr) {
+			U_LOG_W(
+			    "DXR_D3D_FORCE_GPU=scanout: could not resolve the panel's scanout adapter "
+			    "(panel %ux%u at %d,%d) — ignoring",
+			    info->display_pixel_width, info->display_pixel_height, (int)info->display_screen_left,
+			    (int)info->display_screen_top);
+			return nullptr;
+		}
+		DXGI_ADAPTER_DESC sdesc{};
+		if (SUCCEEDED(adapter->GetDesc(&sdesc))) {
+			U_LOG_W(
+			    "DXR_D3D_FORCE_GPU=scanout: suggesting adapter %ls (scans out the panel %ux%u at "
+			    "%d,%d)",
+			    sdesc.Description, info->display_pixel_width, info->display_pixel_height,
+			    (int)info->display_screen_left, (int)info->display_screen_top);
+		}
+		return adapter;
 	}
 
 	bool want_igpu;
@@ -141,7 +176,7 @@ oxr_d3d_get_requirements(struct oxr_logger *log,
 		DXGI_ADAPTER_DESC desc{};
 		bool have_desc = false;
 
-		wil::com_ptr<IDXGIAdapter> forced = env_forced_d3d_adapter();
+		wil::com_ptr<IDXGIAdapter> forced = env_forced_d3d_adapter(&sys->xsysc->info);
 		if (forced != nullptr) {
 			THROW_IF_FAILED(forced->GetDesc(&desc));
 			have_desc = true;

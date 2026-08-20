@@ -559,10 +559,20 @@ device_debug_print(struct vk_bundle *vk, const VkPhysicalDeviceProperties *pdp, 
  * without this there is no way to put the runtime (and thus the app, via
  * xrGetVulkanGraphicsDevice) on an iGPU on an Optimus machine.
  *
- * Accepted values: a device index ("0", "1", …) or a device-type keyword
- * ("igpu"/"integrated", "dgpu"/"discrete"). Returns -1 when unset/invalid
- * (normal selection applies); a keyword that matches no present device also
- * returns -1 so a copied-around env var cannot brick an app.
+ * Accepted values: a device index ("0", "1", …), a device-type keyword
+ * ("igpu"/"integrated", "dgpu"/"discrete"), or "scanout". Returns -1 when
+ * unset/invalid (normal selection applies); a keyword that matches no present
+ * device also returns -1 so a copied-around env var cannot brick an app.
+ *
+ * "scanout" (#918 Phase 0, closes the #846 gap) means "the adapter that owns
+ * the output scanning out the 3D panel" — the iGPU on a box whose panel hangs
+ * off the integrated display controller, the dGPU on a MUX'd laptop or a panel
+ * wired to the discrete card. It is NOT an alias for "igpu". Resolving it needs
+ * the panel rect + DXGI, neither of which belongs in aux_vk, so the layer that
+ * owns the rect resolves the LUID and writes vk->scanout_adapter_luid before
+ * selection; here we only match it against the devices' reported LUIDs.
+ * Windows-only: elsewhere there is no scanout LUID to match, so it WARNs once
+ * and falls through to normal selection.
  *
  * SUPPORTED CONTRACT (#845): same stability promise and in-process getenv()
  * caveat as DXR_D3D_FORCE_GPU — see docs/reference/adapter-selection.md.
@@ -572,6 +582,48 @@ env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t d
 {
 	const char *val = getenv("DXR_VK_FORCE_GPU");
 	if (val == NULL || val[0] == '\0') {
+		return -1;
+	}
+
+	if (strcmp(val, "scanout") == 0) {
+#ifdef XRT_OS_WINDOWS
+		if (vk->scanout_adapter_luid == 0) {
+			// The resolver already WARNed once at the site that owns
+			// the panel rect — don't double-log the same failure.
+			return -1;
+		}
+		if (vk->vkGetPhysicalDeviceProperties2 == NULL) {
+			VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: no vkGetPhysicalDeviceProperties2 — ignoring");
+			return -1;
+		}
+		for (uint32_t i = 0; i < device_count; i++) {
+			VkPhysicalDeviceIDProperties pdidp = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+			};
+			VkPhysicalDeviceProperties2 pdp2 = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			    .pNext = &pdidp,
+			};
+			vk->vkGetPhysicalDeviceProperties2(devices[i], &pdp2);
+			if (pdidp.deviceLUIDValid != VK_TRUE) {
+				continue;
+			}
+			uint64_t packed = 0;
+			memcpy(&packed, pdidp.deviceLUID, sizeof(packed));
+			if (packed == vk->scanout_adapter_luid) {
+				VK_WARN(vk,
+				        "DXR_VK_FORCE_GPU=scanout: selecting device %u (%s), the panel's "
+				        "scanout adapter",
+				        i, pdp2.properties.deviceName);
+				return (int)i;
+			}
+		}
+		VK_WARN(vk,
+		        "DXR_VK_FORCE_GPU=scanout: no Vulkan device on the panel's scanout adapter — using "
+		        "normal selection");
+#else
+		VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: Windows-only — ignoring");
+#endif
 		return -1;
 	}
 

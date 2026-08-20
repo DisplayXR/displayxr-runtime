@@ -1,7 +1,8 @@
 # GPU adapter selection (`DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU`)
 
 **Status: SUPPORTED client-facing contract** (not a debug knob). Both variables
-shipped in **v2.2.4** (#821) and follow the same compatibility promise as the
+shipped in **v2.2.4** (#821); the shared `scanout` keyword landed with #918
+Phase 0 (closing #846). They follow the same compatibility promise as the
 `XR_DXR_*` extensions: names, accepted values, and selection semantics below
 will not be renamed, dropped, or changed in meaning without a major-version
 bump and a deprecation note here. Client software (e.g. the Unity plugin's
@@ -24,6 +25,7 @@ Read in `env_forced_d3d_adapter()` (`src/xrt/state_trackers/oxr/oxr_d3d.cpp`).
 
 | Value | Meaning |
 |---|---|
+| `scanout` | The adapter that owns the output the 3D panel is scanned out on — resolved per machine, see below |
 | `igpu` / `integrated` | Hardware adapter with the **least** dedicated VRAM |
 | `dgpu` / `discrete` | Hardware adapter with the **most** dedicated VRAM |
 | `0`, `1`, … | DXGI adapter by enumeration index |
@@ -66,6 +68,7 @@ Overrides the physical device the runtime selects (and thus what
 
 | Value | Meaning |
 |---|---|
+| `scanout` | The device whose `VkPhysicalDeviceIDProperties::deviceLUID` is the panel's scanout adapter (**Windows only**) — see below |
 | `igpu` / `integrated` | First device with `VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` |
 | `dgpu` / `discrete` | First device with `VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU` |
 | `0`, `1`, … | `vkEnumeratePhysicalDevices` index |
@@ -75,13 +78,84 @@ Vulkan classifies by driver-reported device type (reliable in VK, unlike
 DXGI preference ordering). The same `getenv()` caveat applies to in-process
 clients on Windows.
 
+## The `scanout` keyword
+
+Shipped in **#918 Phase 0**, closing the gap tracked as #846. Accepted by
+**both** variables, with identical meaning: *the adapter that owns the output
+the 3D panel is scanned out on*.
+
+**It is not an alias for `igpu`.** The rule is **weave next to scanout**, and
+which silicon that is is a property of the machine, not of the keyword:
+
+| Machine | `scanout` resolves to |
+|---|---|
+| Panel wired to the integrated display controller (typical SR desktop/laptop) | the **iGPU** |
+| MUX'd laptop in discrete mode, or a panel wired to the discrete card | the **dGPU** |
+| Single-GPU box | that GPU (a no-op) |
+
+That is the whole point of having a keyword rather than telling users to type
+`igpu`: the same launcher script, the same Unity *Target GPU* setting, and the
+same `.bat` file do the right thing on every machine.
+
+### How it resolves
+
+One resolver, shared by both variables
+(`src/xrt/auxiliary/d3d/d3d_scanout_helpers.{h,hpp,cpp}`):
+
+1. Take the panel rect the display-processor plug-in reports
+   (`display_screen_left/top` + `display_pixel_width/height`).
+2. Compute its **centre point** and call
+   `MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST)`.
+3. Walk the DXGI hardware adapters (WARP/software skipped) and their outputs;
+   the adapter whose `DXGI_OUTPUT_DESC::Monitor` equals that `HMONITOR` is the
+   scanout adapter. HMONITOR equality keeps the whole comparison inside one
+   process's GDI coordinate space.
+
+**The centre point is deliberate, and edge-exact rect matching is deliberately
+avoided.** `display_pixel_width/height` are *physical panel pixels*, while
+`display_screen_left/top` are virtual-screen coordinates that Windows
+DPI-virtualizes for a non-DPI-aware process. The two are therefore not
+guaranteed to be in the same units, and an edge comparison would miss on a
+scaled display. A centre point plus `DEFAULTTONEAREST` tolerates that error.
+
+### Where each variable consumes it
+
+- **D3D** — `env_forced_d3d_adapter()` in
+  `src/xrt/state_trackers/oxr/oxr_d3d.cpp` calls the resolver directly: by
+  `xrGetD3D11/12GraphicsRequirementsKHR` time the panel rect is already on
+  `xsysc->info`.
+- **Vulkan** — `env_forced_gpu_index()` lives in `aux_vk`
+  (`src/xrt/auxiliary/vk/vk_bundle_init.c`), which can see neither the plug-in
+  nor DXGI. So the layer that owns both — `target_instance.c`, which already
+  queries the plug-in for the panel refresh rate before creating the
+  compositor — resolves the LUID and passes it down the existing creation path
+  (`null_compositor_create_system_with_dims` → `comp_vulkan_arguments` →
+  `vk_bundle::scanout_adapter_luid`). `env_forced_gpu_index()` then only
+  compares LUIDs, staying free of any Win32 dependency. That single hook
+  covers both the app suggestion (`xrGetVulkanGraphicsDeviceKHR`, which reports
+  the runtime's `client_vk_deviceUUID`) and the compositor's own `vk_bundle`,
+  so client and session land on the same silicon.
+
+### Failure semantics
+
+Same contract as every other value (#845): **any** resolution failure — no
+plug-in display info, a zero-sized panel, DXGI unavailable, no adapter claiming
+the panel's monitor, no Vulkan device reporting that LUID — is **one WARN and
+a fall back to normal selection**. A copied-around env var can never brick an
+app. The resolution happens only when the keyword is actually requested, so
+the DXGI walk costs nothing otherwise.
+
+**Windows-only semantics.** On macOS / Linux / Android there is no scanout
+adapter to resolve; `DXR_VK_FORCE_GPU=scanout` WARNs once and is ignored.
+(`DXR_D3D_FORCE_GPU` is Windows-only to begin with.)
+
 ## Choosing a value
 
-- **Overlay-class / weaving apps on hybrid machines**: prefer the adapter that
-  scans out the 3D panel (usually the iGPU). Baked composition
-  (`DXR_PRESENT_OPAQUE=1`) *requires* it — cross-adapter Windows Graphics
-  Capture delivers black frames (see `docs/architecture/transparency-modes.md`).
+- **Overlay-class / weaving apps on hybrid machines**: use `scanout`. It is the
+  portable spelling of "the adapter that scans out the 3D panel", which on most
+  SR boxes is the iGPU but is the dGPU on a MUX'd laptop — prefer it over
+  hardcoding `igpu`. Baked composition (`DXR_PRESENT_OPAQUE=1`) *requires* the
+  scanout adapter — cross-adapter Windows Graphics Capture delivers black
+  frames (see `docs/architecture/transparency-modes.md`).
 - **Render-heavy apps**: the default (discrete) is usually right; the present
   bridge handles cross-adapter scanout on the live-composition path.
-- A future `scanout` keyword resolving "the adapter that owns the 3D panel's
-  output" portably is tracked in #846.

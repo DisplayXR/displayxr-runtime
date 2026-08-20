@@ -576,6 +576,14 @@ struct vk_bundle
 	// offset), so a new field must be append-only to preserve every prior field's
 	// offset. Loaded in vk_function_loaders.c alongside vkCmdClearColorImage.
 	PFN_vkCmdClearAttachments vkCmdClearAttachments;
+
+	// #918 Phase 0 — appended for the same append-only reason as the field
+	// above. Packed LUID (the raw 8 bytes of the Windows LUID, which is exactly
+	// what VkPhysicalDeviceIDProperties::deviceLUID carries) of the adapter that
+	// scans out the 3D panel. Written by the layer that owns the panel rect,
+	// before device selection; 0 = unknown / not resolved. Read only by
+	// DXR_VK_FORCE_GPU=scanout — every other selection path ignores it.
+	uint64_t scanout_adapter_luid;
 };
 
 struct vk_buffer

@@ -74,6 +74,12 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		)
 	target_include_directories(target_instance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+	# DXR_VK_FORCE_GPU=scanout (#918): the panel rect -> scanout adapter LUID
+	# resolver lives in aux_d3d (DXGI). Windows-only.
+	if(WIN32 AND TARGET aux_d3d)
+		target_link_libraries(target_instance PRIVATE aux_d3d)
+	endif()
+
 	# comp_main (Vulkan server compositor) removed — lightweight runtime uses
 	# null compositor + native compositors (D3D11/Metal) only.
 	if(XRT_FEATURE_HYBRID_MODE AND WIN32)
@@ -103,6 +109,11 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 			)
 		target_include_directories(target_instance_hybrid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 		target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../compositor)
+
+		# Same scanout resolver as target_instance above (#918).
+		if(WIN32 AND TARGET aux_d3d)
+			target_link_libraries(target_instance_hybrid PRIVATE aux_d3d)
+		endif()
 
 		# Hybrid mode always uses null compositor during instance creation.
 		# Native compositors (D3D11/Metal) are created during session creation.

@@ -95,6 +95,14 @@ struct null_compositor
 
 		//! Frame interval that we are using.
 		uint64_t frame_interval_ns;
+
+		/*!
+		 * Packed LUID of the adapter that scans out the 3D panel, 0 if
+		 * unknown. Supplied by the caller (only the instance layer sees
+		 * the panel rect) and forwarded to the Vulkan bundle, where
+		 * `DXR_VK_FORCE_GPU=scanout` consumes it. @see #918
+		 */
+		uint64_t scanout_adapter_luid;
 	} settings;
 
 	// Kept here for convenience.

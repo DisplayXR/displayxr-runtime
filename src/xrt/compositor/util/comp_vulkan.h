@@ -57,6 +57,14 @@ struct comp_vulkan_arguments
 
 	//! Vulkan physical device index for clients to use, -1 for auto.
 	int client_gpu_index;
+
+	/*!
+	 * Packed LUID of the adapter that scans out the 3D panel, 0 if unknown.
+	 * Resolved by the layer that owns the panel rect (aux_vk can see neither
+	 * the rect nor DXGI) and consulted only by `DXR_VK_FORCE_GPU=scanout`.
+	 * Windows-only in practice. @see #918
+	 */
+	uint64_t scanout_adapter_luid;
 };
 
 /*!

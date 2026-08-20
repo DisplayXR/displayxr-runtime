@@ -280,10 +280,11 @@ compositor_init_vulkan(struct null_compositor *c)
 	    .required_device_extensions = required_device_extension_list,
 	    .optional_device_extensions = optional_device_extension_list,
 	    .log_level = c->settings.log_level,
-	    .only_compute_queue = false, // Regular GFX
-	    .selected_gpu_index = -1,    // Auto
-	    .client_gpu_index = -1,      // Auto
-	    .timeline_semaphore = true,  // Flag is optional, not a hard requirement.
+	    .only_compute_queue = false,                              // Regular GFX
+	    .selected_gpu_index = -1,                                 // Auto
+	    .client_gpu_index = -1,                                   // Auto
+	    .timeline_semaphore = true,                               // Flag is optional, not a hard requirement.
+	    .scanout_adapter_luid = c->settings.scanout_adapter_luid, // 0 unless resolved, #918
 	};
 
 	struct comp_vulkan_results vk_res = {0};
@@ -991,15 +992,16 @@ xrt_result_t
 null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_compositor **out_xsysc)
 {
 	// Use default dimensions (0, 0) and default refresh rate (0 = 20 FPS)
-	return null_compositor_create_system_with_dims(xdev, 0, 0, 0.0f, out_xsysc);
+	return null_compositor_create_system_with_dims(xdev, 0, 0, 0.0f, 0, out_xsysc);
 }
 
 xrt_result_t
 null_compositor_create_system_with_dims(struct xrt_device *xdev,
-                                         uint32_t recommended_width,
-                                         uint32_t recommended_height,
-                                         float refresh_rate_hz,
-                                         struct xrt_system_compositor **out_xsysc)
+                                        uint32_t recommended_width,
+                                        uint32_t recommended_height,
+                                        float refresh_rate_hz,
+                                        uint64_t scanout_adapter_luid,
+                                        struct xrt_system_compositor **out_xsysc)
 {
 	struct null_compositor *c = U_TYPED_CALLOC(struct null_compositor);
 
@@ -1015,6 +1017,7 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	c->base.base.base.get_display_refresh_rate = null_compositor_get_display_refresh_rate;
 	c->base.base.base.request_display_refresh_rate = null_compositor_request_display_refresh_rate;
 	c->settings.log_level = debug_get_log_option_log();
+	c->settings.scanout_adapter_luid = scanout_adapter_luid;
 	c->frame.waited.id = -1;
 	c->frame.rendering.id = -1;
 
