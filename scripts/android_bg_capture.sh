@@ -24,21 +24,34 @@
 #   scripts/android_bg_capture.sh                # start the producer
 #   ...then launch the transparent app.
 #
-# `uids` is the default because it is the only mode that survives a DEVICE
-# ROTATION. A rotation invalidates a held capture twice over -- the frame's
-# aspect no longer matches the panel, and the launcher behind it has re-laid
-# out -- and `once` cannot re-take the shot, because by then the consumer's
-# layer is on screen and SurfaceFlinger keeps its last buffer latched straight
-# through the rotation (measured: the first post-rotation frame already
-# contains the weave). `uids` captures each listed uid separately and
-# composites them bottom-up; a uid-filtered captureDisplay leaves skipped
-# layers transparent, so the union is well defined and the consumer's own uid
-# is absent by construction. That makes it feedback-free, so it can run
-# continuously -- and a rotation then needs no trigger at all.
+# `uids` is requested by default because where it works it is the only mode
+# that survives a DEVICE ROTATION. A rotation invalidates a held capture twice
+# over -- the frame's aspect no longer matches the panel, and the launcher
+# behind it has re-laid out. `uids` captures each listed uid separately and
+# composites them bottom-up, so the consumer's own uid is absent by
+# construction; being feedback-free it can run continuously, and a rotation
+# then needs no trigger at all.
+#
+# WHETHER IT WORKS IS A PER-BUILD PROPERTY, and the daemon decides, not this
+# script. The union is well defined only if a uid-filtered captureDisplay
+# leaves the layers it skipped TRANSPARENT. SurfaceFlinger composites a display
+# screenshot over a fill layer whose alpha is RenderArea::CaptureFill, and
+# DisplayRenderArea uses OPAQUE -- on such a build every per-uid capture is
+# opaque black outside that uid's layers and the union collapses to the LAST
+# uid. Measured on the NP02J: the launcher's black fill erased the wallpaper
+# captured under it, leaving icons and the dock floating on black, which reads
+# as a working background until you notice the wallpaper is gone. CNSDK#718
+# probes for this at startup and falls back to `once`, printing
+#
+#   uid-filtered captureDisplay fills OPAQUE on this build, ... falling back to --mode=once
+#
+# so `--mode uids` on such a device is a REQUEST, not a guarantee. The fallback
+# is not a downgrade in content -- `once` is complete by construction -- and it
+# keeps most of the rotation-follow by re-capturing in the gap between consumer
+# sessions, which is where a rotation lands for an orientation-locked app.
 #
 # With no --uid this resolves the wallpaper host and the current home launcher
-# itself. Pass --uid to override (bottom layer first). `once` remains available
-# and remains correct for a session that never rotates.
+# itself. Pass --uid to override (bottom layer first).
 
 set -euo pipefail
 

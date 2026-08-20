@@ -477,8 +477,8 @@ Modes, and what each is honestly correct for:
 
 | `--mode` | filter | correct when |
 |---|---|---|
-| `uids` | N × `CaptureArgs.setUid`, composited bottom-up | the background is the home screen. Feedback-free *and* continuous, so it survives a device rotation. **The default.** |
-| `once` | none, captured **before** the overlay exists | the background is static *and* the device never rotates. Complete and feedback-free |
+| `uids` | N × `CaptureArgs.setUid`, composited bottom-up | the background is the home screen **and** this build's uid filter leaves skipped layers transparent (see below — the NP02J's does not). Feedback-free *and* continuous, so where it works it survives a rotation. **Requested by default**; the daemon probes and degrades |
+| `once` | none, captured **before** the overlay exists | the background is static. Complete and feedback-free at every privilege tier, and re-captured between consumer sessions, so it follows a rotation that goes through an app restart. **The working default on the NP02J** |
 | `uid` | one `CaptureArgs.setUid` inclusion | the background is one app's window. Drops anything another uid drew, wallpaper included. Superseded by `uids` |
 | `all` | none, continuous | diagnostic only — includes our own layer, so it feeds back |
 
@@ -506,19 +506,53 @@ The answer, measured on an NP02J, is *never*, for a whole-display capture:
   it buys a handshake, a present stall and a timing race to solve a problem a
   filter solves outright.
 
-`uids` solves it outright. A uid-filtered `captureDisplay` leaves every layer it
-skipped **transparent**, which is what makes a union of several well defined:
-`SRC_OVER` of capture[i+1] over capture[i] reproduces SurfaceFlinger's own
-stacking for the listed uids. The wallpaper host and the home launcher are
-different uids (`com.android.systemui` and the launcher package on this device)
-— which is precisely why a single `--uid` drops the wallpaper and why the plural
-exists. Their union is the whole home screen, and the consumer's uid is absent
-by construction.
+`uids` was meant to solve it outright, and does — *on a platform that allows
+it*. The idea: a uid-filtered `captureDisplay` leaves every layer it skipped
+**transparent**, which makes a union of several well defined (`SRC_OVER` of
+capture[i+1] over capture[i] reproduces SurfaceFlinger's own stacking for the
+listed uids). The wallpaper host and the home launcher are different uids
+(`com.android.systemui` and the launcher package on this device) — which is
+precisely why a single `--uid` drops the wallpaper and why the plural exists.
+Their union is the whole home screen, and the consumer's uid is absent by
+construction. Being feedback-free it can run **continuously**, so the next tick
+is already in the new orientation with the launcher re-laid out.
 
-Because it is feedback-free it can run **continuously**, and that is the whole
-rotation fix: the next tick is already captured in the new orientation with the
-launcher re-laid out, and the consumer's existing "re-crop when the geometry
-moves" path (below) picks it up. **No trigger, no handshake, no timing race.**
+#### The premise is false on the NP02J (runtime#1101 follow-up, CNSDK#718)
+
+SurfaceFlinger composites a display screenshot over a **fill layer** whose alpha
+comes from `RenderArea::CaptureFill`, and `DisplayRenderArea` uses **`OPAQUE`**.
+Every per-uid capture therefore comes back fully opaque — *black* wherever that
+uid drew nothing — and the union collapses to the **last** uid.
+
+Measured: with `--uid=<systemui>,<launcher>` the composed backdrop carried the
+launcher's icons and dock **in exactly the right place** over pure black, the
+wallpaper gone. The systemui uid captured *alone* returns the wallpaper
+complete and correctly registered, so neither uid resolution nor ordering was at
+fault. The decisive isolation was `--uid=<systemui>,19998` — a uid that owns no
+layer at all — which wiped the wallpaper to pure black. **An empty capture
+cannot erase anything unless the fill is opaque.** (RGB alone could never have
+settled this: "nothing drawn" and "drew black" are the same colour. Only alpha
+answers it, which is what the probe reads.)
+
+Note the failure mode — it *looks* correct. Right icons, right positions, right
+registration; only the missing wallpaper gives it away. That is why the daemon
+now **probes rather than assumes** (`ScreenCapture.uidFilterLeavesRestTransparent`),
+and falls back to `once` with a line on stdout naming the cause. `uids` is kept,
+not deleted: it is right on a build whose fill is `CLEAR`, and the probe decides
+per device. **Run it on every new panel.**
+
+The fallback would have cost the rotation-follow `uids` exists for, so `once`
+was narrowed at the same time: it **re-captures in the window between one
+consumer session ending and the next beginning**. That window is exactly the
+feedback-free moment `once` needs — the overlay is off screen — and an
+orientation-locked overlay app must be relaunched to change orientation anyway,
+so it is where a rotation lands in practice. Verified by the held frame's clock
+advancing across an app restart (12:05 → 12:13).
+
+What survives unchanged from the original argument: there is **no gap** during a
+rotation for a *whole-display* capture of a *running* consumer, so the
+"re-capture mid-rotation" plan still has no window to aim at. The session
+boundary is a different window, and it is the one that exists.
 
 The consumer's half is one line of correctness: the re-crop key is the canvas
 rect **and the panel extent**, because `bg2d_canvas_crop_rect` maps canvas→frame
