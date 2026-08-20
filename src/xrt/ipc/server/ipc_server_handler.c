@@ -6033,14 +6033,16 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
+	// A refusal from the weave engine is NOT a transport failure — see
+	// XRT_ERROR_WEAVE_REFUSED (browser#103). The client's session must survive it.
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #else
@@ -6076,8 +6078,9 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 	}
 
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+	// Engine refusal, not a dead pipe (browser#103).
 	if (!comp_multi_weave_set_window_geometry(ics->xc, origin_x, origin_y, client_w, client_h, display_id)) {
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #else
@@ -6129,9 +6132,10 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 		rects[i].extent.w = (int)args->rects[i].w;
 		rects[i].extent.h = (int)args->rects[i].h;
 	}
+	// Engine refusal, not a dead pipe (browser#103).
 	if (!comp_d3d11_service_weave_set_screen_flat_regions(ics->xc, args->rect_count,
 	                                                      args->rect_count > 0 ? rects : NULL)) {
-		return XRT_ERROR_IPC_FAILURE;
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #else
@@ -6167,7 +6171,14 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_fence_value = 0;
 	U_ZERO(out_eyes);
 
-	if (ics->xc == NULL || handle_count < 1) {
+	if (ics->xc == NULL) {
+		// Client state, not transport — same code the bind/geometry/flat
+		// siblings already return for this (browser#103).
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (handle_count < 1) {
+		// Malformed request: the wire is not trusted, so this one IS a
+		// transport-class failure.
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
@@ -6258,7 +6269,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
-		return XRT_ERROR_IPC_FAILURE;
+		// TRANSIENT, and the distinction is load-bearing (browser#103): the
+		// commonest `false` here is the 4 ms input AcquireSync timeout — the
+		// caller is still writing the shared input and the submit is retried
+		// next frame. Reporting XRT_ERROR_IPC_FAILURE would make the state
+		// tracker declare the session lost over a perfectly healthy pipe.
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	*out_have_output = true;
 	*out_width = w;
@@ -6351,7 +6367,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
-		return XRT_ERROR_IPC_FAILURE;
+		// Transient engine refusal, not a dead pipe (browser#103).
+		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	*out_have_output = true;
 	*out_width = w;

@@ -21,10 +21,24 @@
  * bridges (defined in ipc_client_compositor.c); st_oxr does not pull the
  * ipc_client include path, so the symbols resolve at link time — same pattern
  * as oxr_capture.c / oxr_workspace.c.
+ *
+ * Connection loss (browser#103): every bridge result goes through
+ * OXR_CHECK_XRET_MSG, so a dead pipe (XRT_ERROR_IPC_FAILURE) marks the session
+ * lost and reports XR_ERROR_INSTANCE_LOST — after which
+ * OXR_VERIFY_SESSION_NOT_LOST short-circuits every later call to
+ * XR_ERROR_SESSION_LOST, exactly like xrEndFrame / xrLocateViews. A weave-only
+ * present-owner is otherwise the one client in the runtime that never learns its
+ * connection died.
+ *
+ * A service-side weave REFUSAL is deliberately NOT that: the service answers
+ * XRT_ERROR_WEAVE_REFUSED over a healthy pipe (canonically the 4 ms input
+ * AcquireSync timeout in comp_d3d11_service_weave_submit, retried next frame),
+ * which stays a non-fatal XR_ERROR_RUNTIME_FAILURE and leaves the session usable.
  */
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
+#include "oxr_xret.h"
 
 #include "util/u_trace_marker.h"
 
@@ -165,10 +179,7 @@ oxr_xrWeaveBindWindowDXR(XrSession session, void *windowHandle)
 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_bind_window(
 	    &sess->xcn->base, (uint64_t)(uintptr_t)windowHandle);
-	if (xret != XRT_SUCCESS) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveBindWindowDXR: bind failed (xrt_result=%d)", (int)xret);
-	}
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindowDXR: bind failed (xrt_result=%d)", (int)xret);
 	return XR_SUCCESS;
 }
 
@@ -194,10 +205,7 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 	// has no window handle at all and binds by geometry alone).
 	xrt_result_t xret = comp_ipc_client_compositor_weave_bind_window(
 	    &sess->xcn->base, (uint64_t)(uintptr_t)bindInfo->windowHandle);
-	if (xret != XRT_SUCCESS) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveBindWindow2DXR: bind failed (xrt_result=%d)", (int)xret);
-	}
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: bind failed (xrt_result=%d)", (int)xret);
 
 	// Spec v7 (#1036): explicit client-area geometry on the panel. Optional on
 	// Windows / macOS (the runtime can read it off the window handle there),
@@ -214,11 +222,8 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 		xret = comp_ipc_client_compositor_weave_set_window_geometry(
 		    &sess->xcn->base, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
 		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId);
-		if (xret != XRT_SUCCESS) {
-			return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-			                 "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
-			                 (int)xret);
-		}
+		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
+		                   (int)xret);
 	}
 	return XR_SUCCESS;
 }
@@ -399,10 +404,9 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 	    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
 	    &have_out, &w, &h, &fence_value, &eyes);
-	if (xret != XRT_SUCCESS) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
-	}
+	// XRT_ERROR_WEAVE_REFUSED (the service said "not this frame") lands on the
+	// non-fatal branch; only a dead pipe loses the session. See the file header.
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
 
 	// Per-frame scalars are always valid; the shared HANDLEs are handed back
 	// only on the first submit and on re-allocation (resize → dims change).
@@ -489,10 +493,7 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 	xrt_result_t xret = comp_ipc_client_compositor_weave_snap_window_rect(
 	    &sess->xcn->base, originRect->offset.x, originRect->offset.y, targetRect->offset.x, targetRect->offset.y,
 	    &snapped, &sx, &sy);
-	if (xret != XRT_SUCCESS) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveSnapWindowRectDXR: snap failed (xrt_result=%d)", (int)xret);
-	}
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSnapWindowRectDXR: snap failed (xrt_result=%d)", (int)xret);
 
 	snappedRect->offset.x = sx;
 	snappedRect->offset.y = sy;
@@ -542,10 +543,7 @@ oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const 
 
 	xrt_result_t xret = comp_ipc_client_compositor_weave_set_screen_flat_regions(&sess->xcn->base, rectCount,
 	                                                                            rectCount > 0 ? rects : NULL);
-	if (xret != XRT_SUCCESS) {
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrWeaveSetScreenFlatRegionsDXR: latch failed (xrt_result=%d)", (int)xret);
-	}
+	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSetScreenFlatRegionsDXR: latch failed (xrt_result=%d)", (int)xret);
 	return XR_SUCCESS;
 }
 
