@@ -42,6 +42,10 @@ struct ZoneMaskHarness {
     PFN_xrCreateLocal3DZoneMaskDXR pfnCreate = nullptr;
     PFN_xrSetLocal3DZoneFromRectsDXR pfnSetRects = nullptr;
     PFN_xrSubmitLocal3DZoneDXR pfnSubmit = nullptr;
+    // #918 review F1 — Tier-3 (app-drawn) authoring. The sticky (non-zones)
+    // Tier-3 mask is the one path the output-device split could not bootstrap,
+    // and no handle-class app exercised it; DXR_LOCAL2D_MASK=3 does now.
+    PFN_xrAcquireLocal3DZoneRenderTargetDXR pfnAcquire = nullptr;
     PFN_xrDestroyLocal3DZoneMaskDXR pfnDestroy = nullptr;
     XrLocal3DZoneMaskDXR mask = XR_NULL_HANDLE;
 };

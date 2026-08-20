@@ -167,8 +167,15 @@ xb_plane_limits(uint32_t src_w, uint32_t src_h, uint32_t alloc_w, uint32_t alloc
 
 /*!
  * What this frame's submit should do with a plane whose write slot holds
- * generation @p slot_seq and owes @p pend, given that the frame staged
- * generation @p stage_seq.
+ * generation @p slot_seq and still OWES @p owed, given that the frame staged
+ * generation @p stage_seq over @p staged.
+ *
+ * @p owed is what the slot accumulated across the frames it was not the write
+ * slot; @p staged is this frame's own dirty box. They are separate parameters
+ * because the ORDER is load-bearing — the change-skip asks whether the slot owes
+ * anything BEFORE this frame's box is folded in. Fold first and every slot that
+ * already holds the current generation looks dirty, which turns the skip into a
+ * copy on every frame and inverts the entire bandwidth argument.
  *
  * @param half_rate,parity The bandwidth gate's latch: a latched plane transports
  *        on every other seq.
@@ -176,7 +183,8 @@ xb_plane_limits(uint32_t src_w, uint32_t src_h, uint32_t alloc_w, uint32_t alloc
 static inline enum xb_plane_action
 xb_plane_decide(uint64_t slot_seq,
                 uint64_t stage_seq,
-                const struct xb_plane_box *pend,
+                const struct xb_plane_box *owed,
+                const struct xb_plane_box *staged,
                 bool half_rate,
                 uint64_t seq,
                 uint64_t parity)
@@ -187,13 +195,13 @@ xb_plane_decide(uint64_t slot_seq,
 	 * pixels already there — which is why the recipe carries plane_seq: a
 	 * change-skipped plane is provably the SAME content, never merely an old one.
 	 */
-	if (slot_seq == stage_seq && xb_plane_box_empty(pend)) {
+	if (slot_seq == stage_seq && xb_plane_box_empty(owed)) {
 		return XB_PLANE_SKIP_UNCHANGED;
 	}
 	if (half_rate && (seq & 1ull) != parity) {
 		return XB_PLANE_SKIP_HALF_RATE;
 	}
-	if (xb_plane_box_empty(pend)) {
+	if (xb_plane_box_empty(owed) && xb_plane_box_empty(staged)) {
 		return XB_PLANE_SKIP_EMPTY;
 	}
 	return XB_PLANE_COPY;

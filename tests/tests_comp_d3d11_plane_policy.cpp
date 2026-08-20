@@ -182,32 +182,50 @@ TEST_CASE("xb_plane_limits is min(source, allocation), with 0 meaning unknown")
 TEST_CASE("xb_plane_decide")
 {
 	const struct xb_plane_box owes = box(0, 0, 64, 64);
+	const struct xb_plane_box dirty = box(0, 0, 128, 128);
 	const struct xb_plane_box nothing = box(0, 0, 0, 0);
 
 	SECTION("a slot on this generation owing nothing is a change-skip")
 	{
-		CHECK(xb_plane_decide(7, 7, &nothing, false, 100, 0) == XB_PLANE_SKIP_UNCHANGED);
+		CHECK(xb_plane_decide(7, 7, &nothing, &dirty, false, 100, 0) == XB_PLANE_SKIP_UNCHANGED);
+	}
+
+	/*
+	 * THE ORDER IS THE POINT. The change-skip asks what the slot OWES, before
+	 * this frame's staged box is folded in. Deciding on the union instead makes
+	 * every slot that already holds the current generation look dirty — a copy
+	 * on every frame, for content that has not changed, which is the entire
+	 * bandwidth argument inverted. (Caught in a live run: 61 copies/s and zero
+	 * skips where the design says three copies then skips for ever.)
+	 */
+	SECTION("this frame's staged box does NOT defeat the change-skip")
+	{
+		CHECK(xb_plane_decide(7, 7, &nothing, &dirty, false, 100, 0) == XB_PLANE_SKIP_UNCHANGED);
+		CHECK(xb_plane_decide(7, 7, &nothing, &owes, false, 101, 0) == XB_PLANE_SKIP_UNCHANGED);
 	}
 
 	SECTION("a slot on this generation that still owes a box copies")
 	{
-		CHECK(xb_plane_decide(7, 7, &owes, false, 100, 0) == XB_PLANE_COPY);
+		CHECK(xb_plane_decide(7, 7, &owes, &nothing, false, 100, 0) == XB_PLANE_COPY);
 	}
 
-	SECTION("a slot on an older generation copies")
+	SECTION("a slot on an older generation copies, even owing nothing")
 	{
-		CHECK(xb_plane_decide(6, 7, &owes, false, 100, 0) == XB_PLANE_COPY);
+		// New content this frame, a slot that has not seen it: the staged box
+		// is what gets transported.
+		CHECK(xb_plane_decide(6, 7, &nothing, &dirty, false, 100, 0) == XB_PLANE_COPY);
+		CHECK(xb_plane_decide(6, 7, &owes, &dirty, false, 100, 0) == XB_PLANE_COPY);
 	}
 
 	SECTION("the half-rate latch drops the off seq and keeps the on seq")
 	{
-		CHECK(xb_plane_decide(6, 7, &owes, true, 100, 1) == XB_PLANE_SKIP_HALF_RATE);
-		CHECK(xb_plane_decide(6, 7, &owes, true, 101, 1) == XB_PLANE_COPY);
+		CHECK(xb_plane_decide(6, 7, &owes, &dirty, true, 100, 1) == XB_PLANE_SKIP_HALF_RATE);
+		CHECK(xb_plane_decide(6, 7, &owes, &dirty, true, 101, 1) == XB_PLANE_COPY);
 	}
 
-	SECTION("an empty box with nothing to say is not a copy")
+	SECTION("nothing owed and nothing staged is not a copy")
 	{
-		CHECK(xb_plane_decide(6, 7, &nothing, false, 100, 0) == XB_PLANE_SKIP_EMPTY);
+		CHECK(xb_plane_decide(6, 7, &nothing, &nothing, false, 100, 0) == XB_PLANE_SKIP_EMPTY);
 	}
 }
 
@@ -289,8 +307,10 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
 			}
 		}
 
-		// Submit.
-		if (xb_plane_decide(slot_seq[eg], stage_seq, &pend[eg], false, seq, 0) == XB_PLANE_COPY) {
+		// Submit. The staged box is this frame's own; `pend[eg]` is what the
+		// slot owed before it — decided in that order, then folded.
+		const struct xb_plane_box frame_box = box(0, 0, 256, 256);
+		if (xb_plane_decide(slot_seq[eg], stage_seq, &pend[eg], &frame_box, false, seq, 0) == XB_PLANE_COPY) {
 			slot_seq[eg] = stage_seq;
 			pend[eg] = box(0, 0, 0, 0);
 			copies++;

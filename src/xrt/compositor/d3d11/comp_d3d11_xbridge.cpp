@@ -1140,11 +1140,16 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
 	if (!pl.live || !pl.src_bound || !pl.staged || pl.src12 == nullptr) {
 		return 0;
 	}
-	// The union of what this slot owes and what the frame staged, decided by the
-	// policy in comp_d3d11_plane_policy.h rather than restated here.
-	xb_plane_pend(pl, eg, pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h);
-	const struct xb_plane_box pend = xb_plane_pend_box(pl, eg);
-	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &pend, pl.half_rate, seq, pl.half_rate_parity) !=
+	/*
+	 * Decide on what the slot OWES, before folding this frame's staged box in.
+	 * The order is load-bearing: a slot that already holds this generation and
+	 * owes nothing is a change-skip, and folding the staged box first would make
+	 * every such slot look dirty — turning the skip into a copy on every single
+	 * frame, which is the entire bandwidth argument inverted.
+	 */
+	const struct xb_plane_box owed = xb_plane_pend_box(pl, eg);
+	const struct xb_plane_box staged = {pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h};
+	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity) !=
 	    XB_PLANE_COPY) {
 		/*
 		 * Skipped. Leave `slot_seq` ALONE in every skip case: advancing it would
@@ -1157,6 +1162,9 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
 		return 0;
 	}
 
+	// Now fold this frame's box in, and transport the union.
+	xb_plane_pend(pl, eg, pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h);
+	const struct xb_plane_box pend = xb_plane_pend_box(pl, eg);
 	uint32_t lim_w = 0, lim_h = 0;
 	xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
 	const struct xb_plane_box b = xb_plane_box_snap_clamp(&pend, lim_w, lim_h);

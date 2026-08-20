@@ -17,11 +17,14 @@
 #include "logging.h"
 #include "input_handler.h"
 #include "d3d11_renderer.h"
-#include "text_overlay.h"
-#include "hud_renderer.h"
-#include "xr_session.h"
-#include "projection_depth.h"
+
+// #918 review F1 — ID3D11DeviceContext1::ClearView, for the Tier-3 mask stroke.
 #include "atlas_capture.h"
+#include "hud_renderer.h"
+#include "projection_depth.h"
+#include "text_overlay.h"
+#include "xr_session.h"
+#include <d3d11_1.h>
 
 #include <chrono>
 #include <cmath>
@@ -403,6 +406,18 @@ static DWORD g_savedWindowStyle = 0;
 //                        list-order stacking + alpha fringing).
 static bool g_l2dPanel = false;
 static bool g_l2dMask = false;
+// #918 review F1 — DXR_LOCAL2D_MASK=3 additionally acquires the Tier-3
+// (app-drawn) render target and strokes it, which is what latches
+// `app_authored` in the runtime and puts the STICKY mask on the bridge plane
+// under the output-device split. Nothing in the handle-class apps exercised
+// that path before.
+static bool g_l2dMaskTier3 = false;
+// #918 review F2 — DXR_LOCAL2D_MASK_DIM=WxH creates the mask at explicit dims
+// instead of letting the runtime pick the window backing size. An authored mask
+// maps STRETCH-TO-REGION, so a mask whose dims differ from the window is the
+// case that distinguishes stretching from cropping.
+static uint32_t g_l2dMaskW = 0;
+static uint32_t g_l2dMaskH = 0;
 static bool g_l2dPanel2 = false;
 // #491 part 3 — 2D-under backdrop (0=off, 2=opaque, 3=semi-transparent).
 static int g_l2dBackdropVariant = 0;
@@ -1571,6 +1586,8 @@ static void RenderOneFrame(RenderState& rs) {
                             (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
                         mci.maskWidth = 0; // runtime picks the window backing size
                         mci.maskHeight = 0;
+                        mci.maskWidth = g_l2dMaskW;
+                        mci.maskHeight = g_l2dMaskH;
                         ok = XR_SUCCEEDED(g_zone.pfnCreate(xr.session, &mci, &g_zone.mask));
                         if (ok) {
                             // Two 3D islands: a large center-right one and a
@@ -1582,7 +1599,56 @@ static void RenderOneFrame(RenderState& rs) {
                             islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
                             islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
                             islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
-                            ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
+                            ok = XR_SUCCEEDED(
+                                g_zone.pfnSetRects(g_zone.mask, 2, islands));
+                            /*
+                             * #918 review F1 — Tier 3. Acquiring the render
+                             * target is what latches `app_authored` in the
+                             * runtime, and a stroke drawn here cannot be
+                             * reproduced by re-running the rect raster on
+                             * another device, so this is the mask that
+                             * genuinely has to cross the adapter boundary. One
+                             * stroke: a 3D bar down the left edge, outside both
+                             * rect islands, so a capture can tell the app's
+                             * pixels from the rects'.
+                             */
+                            if (ok && g_l2dMaskTier3 && g_zone.pfnAcquire) {
+                              XrLocal3DZoneRenderTargetD3D11DXR rtb = {
+                                  (XrStructureType)
+                                      XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D11_DXR};
+                              XrResult ar =
+                                  g_zone.pfnAcquire(g_zone.mask, &rtb);
+                              if (XR_SUCCEEDED(ar) &&
+                                  rtb.renderTargetView != nullptr) {
+                                ID3D11DeviceContext1 *ctx1 = nullptr;
+                                if (SUCCEEDED(renderer.context->QueryInterface(
+                                        __uuidof(ID3D11DeviceContext1),
+                                        (void **)&ctx1)) &&
+                                    ctx1 != nullptr) {
+                                  const float m3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                                  D3D11_RECT bar = {(LONG)(rtb.width / 16),
+                                                    (LONG)(rtb.height / 3),
+                                                    (LONG)(rtb.width / 8),
+                                                    (LONG)(rtb.height * 2 / 3)};
+                                  ctx1->ClearView((ID3D11RenderTargetView *)
+                                                      rtb.renderTargetView,
+                                                  m3d, &bar, 1);
+                                  ctx1->Release();
+                                  LOG_INFO("[mask] Tier-3 stroke drawn into "
+                                           "the %ux%u authored "
+                                           "mask (bar %ld,%ld %ldx%ld)",
+                                           rtb.width, rtb.height, bar.left,
+                                           bar.top, bar.right - bar.left,
+                                           bar.bottom - bar.top);
+                                }
+                              } else {
+                                LOG_ERROR("[mask] "
+                                          "xrAcquireLocal3DZoneRenderTargetDXR "
+                                          "failed (0x%x)",
+                                          (unsigned)ar);
+                              }
+                            }
+                            ok = ok &&
                                  XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
                         }
                     }
@@ -1733,7 +1799,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* e = getenv("DXR_LOCAL2D_PANEL");
         if (e && *e == '1') g_l2dPanel = true;
         e = getenv("DXR_LOCAL2D_MASK");
-        if (e && *e == '1') g_l2dMask = true;
+        if (e && (*e == '1' || *e == '3')) {
+          g_l2dMask = true;
+          g_l2dMaskTier3 = (*e == '3'); // #918 review F1
+        }
+        // #918 review F2 — DXR_LOCAL2D_MASK_DIM=WxH (0x0 / unset = window
+        // size).
+        e = getenv("DXR_LOCAL2D_MASK_DIM");
+        if (e != nullptr && *e != 0) {
+          unsigned mw = 0, mh = 0;
+          if (sscanf(e, "%ux%u", &mw, &mh) == 2) {
+            g_l2dMaskW = mw;
+            g_l2dMaskH = mh;
+          }
+        }
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
         // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (variant 2); =2 ⟹
