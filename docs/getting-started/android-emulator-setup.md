@@ -120,7 +120,7 @@ cp build-android/src/drv_leia_android/libdxrp050_leia_cnsdk.so \
 
 # Runtime + test app
 cd /c/displayxr-runtime
-./gradlew.bat :src:xrt:targets:openxr_android:assembleInProcessDebug --rerun-tasks
+./gradlew.bat :src:xrt:targets:openxr_android:assembleDebug --rerun-tasks
 ./gradlew.bat :test_apps:cube_handle_vk_android:assembleDebug
 ```
 
@@ -134,7 +134,7 @@ shows both `openxr_displayxr.so` and `libdxrp050_leia_cnsdk.so`.
 
 ```bash
 ADB="$LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe"
-"$ADB" install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+"$ADB" install -r src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 "$ADB" install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
@@ -189,7 +189,7 @@ Half-dozen bug classes you can hit and fix without leaving the host:
 ```bash
 "$ADB" shell am force-stop com.displayxr.cube_handle_vk_android
 "$ADB" uninstall com.displayxr.cube_handle_vk_android
-"$ADB" uninstall org.freedesktop.monado.openxr_runtime.in_process
+"$ADB" uninstall org.freedesktop.monado.openxr_runtime.out_of_process
 "$ADB" emu kill
 ```
 

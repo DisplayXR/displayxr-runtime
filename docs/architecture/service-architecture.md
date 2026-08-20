@@ -521,7 +521,7 @@ the #930 signature (no banner) rather than #943's (banner present). See the #943
 
 **ADR-025 clarification.** "Out-of-process" there means the *app* is isolated from the vendor
 SDK by the app↔service split; the DP still lives in the service. There is no DP proxy/host in
-the tree, #510 is open with every box unchecked, and CI builds only the `inProcess` Android
+the tree, #510 is open with every box unchecked, and CI does not exercise the Android service
 flavor (`build-android.yml:137`). Android is not a precedent for process-isolating the DP; it
 *is* the platform where every app is IPC, so every gap in §4 applies with no shell to hide it.
 
@@ -533,7 +533,7 @@ Android is the only platform where the runtime deliberately runs **more than one
 process**. The reason is the row above: the pieces that decide what reaches the panel — the app
 `Surface` in `android_globals`, the display processor, the vendor core — are process-global in
 the runtime, and no keying scheme was going to be cheaper or safer than giving each client its
-own process. So the `outOfProcess` flavor declares N *satellite* components:
+own process. So the runtime APK declares N *satellite* components:
 
 | Piece | Where | What it is |
 |---|---|---|
@@ -570,7 +570,7 @@ notifications do not collide and each one shuts down its own process.
 
 Gaps this does **not** close: the satellites carry over every §4 hazard of the service they are
 copies of; `START_STICKY` restart still arrives with a null Intent and is not re-foregrounded;
-CI still builds only the `inProcess` flavor (#972), so this whole path is device-validated, not
+CI builds the one merged runtime APK (#1031), which carries this path — but does not exercise it, so it stays device-validated, not
 CI-validated; there is no eviction policy beyond "first come, and the fifth app degrades to the
 legacy single-window path"; and nothing yet reports slot occupancy through `displayxr-cli` or the
 diag dashboard.
@@ -617,7 +617,7 @@ Numbered for reference from the ADR and the issue plan.
 17. `IPC_MAX_CLIENTS 8` on the wire; ~21 MB shm per client; 24 compositor slots unreachable.
 18. #943's filed mechanism is dead code (§5); the true exit source is unidentified.
 19. `[RENDER] wait_avg` cannot see handler starvation; nothing per-client; `sys->mcp_capture` polled per frame with (INFERRED) no producer.
-20. Android: single global surface **per process** — addressed by the satellites of §7a, which also make the `Watchdog`'s client counting trivially correct (0 or 1 per satellite); still open: `START_STICKY` restart not re-foregrounded, `outOfProcess` flavor unbuilt in CI (#972), `MULTI_MAX_CLIENTS 64` silent truncation, no slot-occupancy observability.
+20. Android: single global surface **per process** — addressed by the satellites of §7a, which also make the `Watchdog`'s client counting trivially correct (0 or 1 per satellite); still open: `START_STICKY` restart not re-foregrounded, the service path built but not exercised in CI (#972), `MULTI_MAX_CLIENTS 64` silent truncation, no slot-occupancy observability.
 
 Doc corrections applied alongside this map: `workspace-stability.md` (S3/S4/S5 shipped, #929
 tier-1 fixed, missing rows), `production-components.md` (auto-start, names, paths),

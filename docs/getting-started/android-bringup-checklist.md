@@ -64,7 +64,7 @@ adb shell pm grant com.displayxr.cube_handle_vk_android android.permission.CAMER
 # stack: atlas mode + all audit fixes + CMake TARGET guards + AAR
 # fallback + build guide + this checklist + verbose HW debug logging.
 git checkout feat/android-hw-debug-logs
-./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
+./gradlew :src:xrt:targets:openxr_android:assembleDebug
 
 # Test app APK
 git checkout feat/cube-test-app-hw-debug-logs
@@ -75,11 +75,11 @@ git checkout feat/cube-test-app-hw-debug-logs
 
 ```bash
 # Clean slate
-adb uninstall org.freedesktop.monado.openxr_runtime.in_process 2>/dev/null
+adb uninstall org.freedesktop.monado.openxr_runtime.out_of_process 2>/dev/null
 adb uninstall com.displayxr.cube_handle_vk_android 2>/dev/null
 
 # Install both
-adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+adb install -r src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 adb install -r test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/cube_handle_vk_android-debug.apk
 ```
 
@@ -128,7 +128,7 @@ frame 120
 | Symptom | Likely cause | Diagnostic / fix |
 |---|---|---|
 | `xrInitializeLoaderKHR` fails | Loader missing / wrong .aar | Check `lib/arm64-v8a/libopenxr_loader.so` exists in the test APK: `unzip -l <apk> \| grep loader` |
-| `xrCreateInstance` fails (RUNTIME_UNAVAILABLE) | Loader can't find runtime APK | `adb shell dumpsys package org.freedesktop.monado.openxr_runtime.in_process \| grep OpenXR` should show `OpenXRRuntimeService` |
+| `xrCreateInstance` fails (RUNTIME_UNAVAILABLE) | Loader can't find runtime APK | `adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process \| grep OpenXR` should show `OpenXRRuntimeService` |
 | `xrCreateInstance` fails (INSTANCE_LOST) | Runtime native lib crashed on init | Look for native crash signature: `adb logcat \| grep -i "tombstone\|fatal\|abort"` |
 | `xrGetSystem(HMD) -> FORM_FACTOR_UNSUPPORTED`, `HANDHELD` also fails | Runtime advertises no system | `adb logcat \| grep -i "leia\|cnsdk\|sim_display\|drv_leia"` — check DP factory ran |
 | `xrCreateSession` fails | Vulkan device/queue mismatch | Confirm `xrGetVulkanGraphicsDevice2KHR` chose a real device; check the value isn't `VK_NULL_HANDLE` |
@@ -163,10 +163,10 @@ Each fix is a 1-line change in `leia_cnsdk.cpp`. Land as `fix/cnsdk-cal-<axis|vi
 
 ```bash
 git checkout fix/compositor-b7-hw-debug-logs
-./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
+./gradlew :src:xrt:targets:openxr_android:assembleDebug
 
-adb uninstall org.freedesktop.monado.openxr_runtime.in_process
-adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+adb uninstall org.freedesktop.monado.openxr_runtime.out_of_process
+adb install -r src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 # Test app unchanged — no reinstall
 adb shell am start -n com.displayxr.cube_handle_vk_android/android.app.NativeActivity
 ```
@@ -188,7 +188,7 @@ Install the third-party APK alongside the runtime APK (keep the runtime, replace
 ## What we deliberately skip
 
 - **Day-1 through day-8b historical branches.** Pre-audit; known frame-1 failure modes (atlas layout, semaphore double-signal, face position mm-vs-m, destroy UAF). Useful only for `git bisect` if a regression appears in the fix stack. Don't install on hardware.
-- **`outOfProcess*` build variants.** POC is in-process only. Multi-app shell + IPC is a separate milestone.
+- **Separate `inProcess`/`outOfProcess` build variants.** Merged into one hybrid APK in #1031; deployment is chosen per app at `xrCreateInstance`.
 - **Mono (2D) mode.** Compositor passes `tile_columns==1` in 2D mode; the DP currently skips it silently (audit B8). Not POC scope.
 
 ## Bottom line

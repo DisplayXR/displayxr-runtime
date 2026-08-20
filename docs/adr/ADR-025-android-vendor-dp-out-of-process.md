@@ -49,6 +49,27 @@ date: 2026-06-09
 > classes in the app**, and this ADR's isolation requirement is met without the service
 > split.
 
+> **Amendment (2026-08-19) — there are no flavors any more (#1031).** The
+> `inProcess` / `outOfProcess` product flavors this ADR describes below have been
+> **merged into one hybrid runtime APK**, and with them goes the framing of
+> in-process vs out-of-process as a *build* choice. `XRT_FEATURE_SERVICE=ON` and
+> `XRT_FEATURE_HYBRID_MODE=ON` are both on; `openxr_displayxr.so` carries the
+> in-process native compositor and the IPC client together and picks **per
+> process** at `xrt_instance_create`, as Windows' `DisplayXRClient.dll` always
+> has. The service, the slot broker and the `:dxrN` satellites are all still
+> there — an in-process app just never binds them.
+>
+> So read every "`inProcess` flavor" / "`outOfProcess` flavor" below as a
+> *deployment an individual app ends up in*, not an APK. **In-process is the
+> default**; an app opts into IPC via `XRT_FORCE_MODE=ipc` (or the
+> `debug.dxr.force_ipc` sysprop), a `com.displayxr.force_ipc` manifest
+> `<meta-data>`, enabling `XR_DXR_weave`, or an adopted service socket. This
+> ADR's isolation requirement is unaffected: it was already satisfied
+> in-process by the previous amendment. Details: ADR-036's flavor-merge
+> amendment. The one installed package is
+> `org.freedesktop.monado.openxr_runtime.out_of_process` — a historical name now,
+> kept because every shipped demo resolves it.
+
 [ADR-019](ADR-019-vendor-plugin-aux-boundary.md) establishes the vendor-isolation
 principle: vendor display processors ship as plug-ins behind a
 stable boundary, and an application talks only to DisplayXR (the OpenXR loader →
