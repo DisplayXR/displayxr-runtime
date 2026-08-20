@@ -297,9 +297,40 @@ That reframing is what makes tier 0 worth shipping.
 
 | Tier | What | Producer | Correct for | Effort |
 |---|---|---|---|---|
-| **T0** | Runtime-supplied backdrop through the existing `set_background_2d` slot; DP composes under, gate flattens to opaque in the band | runtime (colour / still / under-Local2D stack) | static or near-static backgrounds; **the whole workspace-overlay case** | runtime ~2 d, plug-in ~2 d |
+| **T0** | Runtime-supplied backdrop through the existing `set_background_2d` slot; DP composes under, gate flattens to opaque in the band | runtime (colour / still / under-Local2D stack) | static or near-static backgrounds; **the whole workspace-overlay case** | **SHIPPED** — runtime #1073, plug-in `feat/t0-android-compose-under` |
 | **T1** | MediaProjection producer behind the same seam, dev-gated | `MediaProjection` + `VirtualDisplay` (+ hidden-API layer exclusion where the ROM allows) | lab validation, A/B of the compose pass against a real background | ~1 wk, **not shippable** |
 | **T2** | Vendor-privileged `captureDisplay(excludeLayers=…)` helper, frames over `AHardwareBuffer`, into the same seam | OEM/vendor system service | everything, incl. avatar over an arbitrary app | our side ~1 wk; vendor side is the schedule |
+
+### T0 as built (#1073)
+
+- **Producer** — `src/xrt/compositor/multi/comp_multi_bg2d.c`: a 4x256 RGBA8
+  solid/gradient the runtime rasterises and uploads once per session, selected
+  by `debug.dxr.bg2d` (`1` | `solid:RRGGBB` | `grad:RRGGBB,RRGGBB`; unset =
+  off, which is the shipping default). Uploaded on its OWN one-shot command
+  buffer, not the frame one — the Android vendor DP is self-submitting, so
+  anything recorded into `cmd` is still unsubmitted when the DP samples it.
+- **Transport** — `comp_multi_system.c` calls
+  `xrt_display_processor_set_background_2d` before every `process_atlas` on
+  transparent Android sessions, and clears it explicitly otherwise. This is
+  the first `comp_multi_*` call site for slot 16 anywhere.
+- **Consumer** — `drv_leia_android`'s `compose_pre_weave`, the Linux DP's
+  `compose_*` pipeline over a byte-identical copy of
+  `drv_leia/shaders/compose_under_bg.frag`, plus alpha-gate **mode 2
+  (flattened)**, selected automatically whenever the compose pass actually ran
+  and never by `debug.dxr.alphagate`.
+- **Formal flag** — `android_transparent_requested()` now reads
+  `xsi.transparent_background_enabled` first, so
+  `XrAndroidSurfaceBindingCreateInfoDXR::transparentBackgroundEnabled` stops
+  being parsed and dropped on Android.
+- **Measured on the NP02J** (avatar, 3840x866 atlas): the compose pass costs
+  **~2.6-2.8 ms/frame**, dominated by the fence wait, because CNSDK exposes no
+  wait-semaphore hook — the pass must be *finished*, not merely queued, before
+  the weave is submitted. That is the single number to beat before T0 could
+  ever default on; a semaphore handshake with the vendor weave is the fix, and
+  it is a #1038-class ask, not something the runtime can do alone.
+- **Known T0 limitation, by construction:** the band stops being *chromatic*
+  and becomes *the wrong colour* wherever the static backdrop disagrees with
+  the real screen behind it. That is the whole of what T1/T2 buy.
 
 ### Split of work
 

@@ -40,6 +40,7 @@
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_interface.h"
 #include "multi/comp_multi_workspace.h"
+#include "multi/comp_multi_bg2d.h"
 #include "main/comp_target.h"
 #include "xrt/xrt_display_processor_vk.h" // #1033: per-window weave phase (set_window_screen_rect)
 
@@ -3371,6 +3372,37 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 			// left-hand phase and its 3D collapses. ADR-033 is unchanged —
 			// this reports geometry; the weaver still owns all phase.
 			update_window_screen_rect(mc);
+
+#ifdef XRT_OS_ANDROID
+			// #1073 T0 — compose-under background (base DP vtable slot 16).
+			//
+			// The weave picks a view per SUBPIXEL; RGBA carries one alpha per
+			// PIXEL. On the avatar's silhouette and in the parallax
+			// de-occlusion band no single alpha is correct, which is why the
+			// post-weave gate leaves a chromatic fringe there no matter how it
+			// is tuned. Windows and Linux resolve it before that collapse, by
+			// compositing a background under each view and weaving an opaque
+			// result. `set_background_2d` is the transport for exactly that —
+			// implemented on D3D11/D3D12/GL/Metal/Linux-VK and, until now,
+			// never called from comp_multi_* at all, i.e. never on Android.
+			//
+			// T0's producer is the runtime itself (a static colour/gradient):
+			// no capture, no permissions, and enough for the band, which is
+			// thin. T1 (MediaProjection) and T2 (vendor-privileged
+			// captureDisplay) fill this same seam later.
+			//
+			// Cleared explicitly when off, so a session that stops being
+			// transparent can never leave a stale view bound in the DP.
+			if (mc->session_render.dp_transparent && comp_multi_bg2d_enabled()) {
+				uint32_t bg_w = 0, bg_h = 0;
+				VkImageView bg_view = comp_multi_bg2d_ensure(mc, vk, &bg_w, &bg_h);
+				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
+				                                        bg_view, bg_w, bg_h);
+			} else {
+				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
+				                                        VK_NULL_HANDLE, 0, 0);
+			}
+#endif
 
 			// Hand the DP the target swapchain image view BEFORE process_atlas.
 			// A self-submitting DP (Leia CNSDK) builds its own destination
