@@ -231,9 +231,18 @@ android {
     ndkVersion "${ndk_version}"
 
     defaultConfig {
-        applicationId 'org.freedesktop.monado.openxr_runtime'
+        // #1031 flavor merge: ONE applicationId. `.out_of_process` is kept as
+        // the merged id deliberately — it is what every installed demo already
+        // declares first in its `<queries>` and hands to createPackageContext
+        // (displayxr-demo-*/android/.../MainActivity.kt), what the Khronos
+        // broker rows resolve to, and what is installed on every dev pad — so
+        // the merged APK upgrades in place with zero client churn. The
+        // suffix is now a historical name, not a deployment mode.
+        applicationId 'org.freedesktop.monado.openxr_runtime.out_of_process'
         minSdkVersion project.sharedMinSdk
         targetSdkVersion project.sharedTargetSdk
+
+        resValue "string", "app_name", "DisplayXR"
 
         versionCode = getVersionCode()
         versionName = getVersionString()
@@ -259,6 +268,26 @@ android {
             }
 
             cmake.arguments "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH"
+
+            // #1031 flavor merge — the two switches that make ONE APK serve
+            // both deployments. SERVICE=ON builds libdisplayxr-service.so and
+            // turns on the IPC client; HYBRID_MODE=ON makes the runtime .so
+            // carry the in-process native compositor *as well* and choose per
+            // process at xrt_instance_create (in-process is the default).
+            cmake.arguments "-DXRT_FEATURE_SERVICE=ON",
+                "-DXRT_FEATURE_HYBRID_MODE=ON"
+
+            // drv_sim_display_plugin: the vendor-neutral fallback DP. CMake
+            // emits libdxrp200_sim_display.so; gradle packages it into
+            // jniLibs/<abi>/ where convention-driven discovery finds it at
+            // probe order 200 (#496).
+            // displayxr-diag: the dashboard's JNI query bridge (#558). Its
+            // name doesn't match the libdxrp<NNN>_ plug-in convention, so
+            // discovery never mistakes it for a DP.
+            // displayxr-service: the service .so hosted by MonadoService and
+            // the MonadoServiceSlotN satellites.
+            cmake.targets "openxr_displayxr", "displayxr-service",
+                "drv_sim_display_plugin", "displayxr-diag"
 
             // Cross-building Android on a host that has a system cJSON
             // (e.g. macOS `brew install cjson`, Linux `libcjson-dev`) leaks the
@@ -328,34 +357,27 @@ android {
         }
     }
 
-    flavorDimensions = ['deployment']
-    productFlavors {
-        inProcess {
-            dimension 'deployment'
-            applicationIdSuffix '.in_process'
-            externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=OFF"
-            // Build the vendor-neutral fallback DP plug-in too. CMake emits it
-            // as libdxrp200_sim_display.so; gradle packages it into the APK's
-            // jniLibs/<abi>/, where the runtime's convention-driven discovery
-            // finds it (probe order 200). Issue #496.
-            // displayxr-diag = the dashboard's JNI query bridge (#558); its
-            // name doesn't match the libdxrp<NNN>_ plug-in convention, so
-            // discovery never mistakes it for a DP.
-            externalNativeBuild.cmake.targets "openxr_displayxr", "drv_sim_display_plugin", "displayxr-diag"
-
-            buildConfigField "boolean", "inProcess", "true"
-            resValue "string", "app_name", "DisplayXR"
-        }
-        outOfProcess {
-            dimension 'deployment'
-            applicationIdSuffix '.out_of_process'
-            externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
-            externalNativeBuild.cmake.targets "openxr_displayxr", "displayxr-service", "drv_sim_display_plugin", "displayxr-diag"
-
-            buildConfigField "boolean", "inProcess", "false"
-            resValue "string", "app_name", "DisplayXR"
-        }
-    }
+    // FLAVOR MERGE (#1031). There is no `deployment` flavor dimension any
+    // more: the two mutually-exclusive `inProcess` / `outOfProcess` APKs are
+    // now ONE hybrid runtime APK, mirroring Windows (one DisplayXRClient.dll
+    // that hosts both the in-process native compositor and the IPC client and
+    // picks per process at xrCreateInstance).
+    //
+    // Why the flavors had to die rather than coexist: both declared the same
+    // `org.khronos.openxr.runtime_broker` ContentProvider authority, so only
+    // one could ever be installed — which meant an Arch-A in-process app and
+    // an Arch-C satellite / weave present-owner could never run on the same
+    // device at the same time (ADR-036's D2+D3 coexistence blocker).
+    //
+    // The merged build turns BOTH switches on:
+    //   XRT_FEATURE_SERVICE=ON     -> libdisplayxr-service.so (satellite slots,
+    //                                 SlotBroker, MonadoService) + IPC client
+    //   XRT_FEATURE_HYBRID_MODE=ON -> openxr_displayxr.so links the in-process
+    //                                 native compositor AND the IPC client, and
+    //                                 target.c selects between them at
+    //                                 xrt_instance_create (see u_sandbox.c /
+    //                                 android_app_mode.cpp for the rules).
+    // In-process is the DEFAULT; an app opts into IPC per process.
     hilt {
         enableAggregatingTask = true
     }
@@ -400,7 +422,9 @@ aboutLibraries {
 }
 
 dependencies {
-    outOfProcessImplementation project(':src:xrt:ipc')
+    // #1031: unconditional now. The merged APK always carries the service +
+    // slot broker Java side; an in-process app simply never binds it.
+    implementation project(':src:xrt:ipc')
     implementation project(':src:xrt:auxiliary')
     implementation project(':src:xrt:targets:android_common')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
@@ -425,13 +449,14 @@ dependencies {
     // above (#510 M2), which applies to both flavors, so the ADR-019 CI guard
     // ("no libleiaSDK*.so in the runtime APK") holds either way.
     if (hasCnsdk) {
-        outOfProcessImplementation files(cnsdkAar)
-        outOfProcessImplementation "androidx.annotation:annotation:$androidxAnnotationVersion"
-        // #1037 / ADR-036 D2: the in-process flavor hosts the same glue for
-        // vendor plug-ins running in the APP's process, exactly as it already
-        // hosts org.freedesktop.monado.ipc.Client for the IPC client.
-        inProcessImplementation files(cnsdkAar)
-        inProcessImplementation "androidx.annotation:annotation:$androidxAnnotationVersion"
+        // #1031: one variant, so one dependency. It serves BOTH consumers —
+        // the plug-in running in the runtime service process (#510 M2) and
+        // the plug-in running in the APP's process, which reaches these
+        // classes through createPackageContext(<runtime pkg>) (#1037 /
+        // ADR-036 D2) — exactly as this APK already hosts
+        // org.freedesktop.monado.ipc.Client for the IPC client.
+        implementation files(cnsdkAar)
+        implementation "androidx.annotation:annotation:$androidxAnnotationVersion"
     }
 }
 
