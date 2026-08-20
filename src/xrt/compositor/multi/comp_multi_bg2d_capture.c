@@ -80,7 +80,11 @@ struct bg2d_capture
 	size_t pixels_capacity;
 	uint32_t width;
 	uint32_t height;
-	uint32_t seq;
+	//! Our own delivery counter, NOT the producer's `seq`. It starts at 1 (so
+	//! "0" can mean "nothing uploaded yet") and never resets, which makes the
+	//! consumer immune both to a producer whose first frame is seq 0 and to a
+	//! producer restart that begins renumbering from the start.
+	uint32_t delivered;
 	bool have_frame;
 
 	//! Thread-owned scratch the producer streams into. Frames are published by
@@ -214,7 +218,7 @@ read_one_frame(struct bg2d_capture *c, int fd)
 	c->pixels_capacity = c->scratch_capacity;
 	c->width = w;
 	c->height = h;
-	c->seq = seq;
+	c->delivered++;
 	c->have_frame = true;
 	os_thread_helper_unlock(&c->oth);
 	c->scratch = old;
@@ -348,14 +352,14 @@ comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint3
 		return false;
 	}
 	os_thread_helper_lock(&c->oth);
-	if (!c->have_frame || c->seq == last_seq) {
+	if (!c->have_frame || c->delivered == last_seq) {
 		os_thread_helper_unlock(&c->oth);
 		return false;
 	}
 	out->pixels = c->pixels;
 	out->width = c->width;
 	out->height = c->height;
-	out->seq = c->seq;
+	out->seq = c->delivered;
 	return true; // lock intentionally held until _release
 }
 
