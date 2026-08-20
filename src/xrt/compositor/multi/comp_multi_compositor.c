@@ -34,6 +34,7 @@
 
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_workspace.h"
+#include "multi/comp_multi_bg2d.h"
 #include "main/comp_target.h"
 
 // Vulkan helpers needed for Y-flip SBS cleanup (not Leia-specific)
@@ -71,8 +72,19 @@
 //! deprecated): the compositor tells the vendor DP to reconstruct alpha post-weave,
 //! exactly as the Windows transparent-present path does.
 static bool
-android_transparent_requested(void)
+android_transparent_requested(struct multi_compositor *mc)
 {
+	// #1073 (formal-flag cleanup): the app's own declaration comes first.
+	// XR_DXR_android_surface_binding already carries
+	// XrAndroidSurfaceBindingCreateInfoDXR::transparentBackgroundEnabled; it
+	// reaches xrt_session_info in oxr_session.c and crosses IPC inside the
+	// struct, but until now the ONLY compositor that read the field was
+	// comp_d3d11_service — so on Android a correctly-written app's request was
+	// parsed and dropped, and transparency depended entirely on overlay mode or
+	// a sysprop. Read it here and that dangling seam is closed.
+	if (mc != NULL && mc->xsi.transparent_background_enabled) {
+		return true;
+	}
 	// #558 per-app: transparency follows overlay mode (see-through overlay app vs
 	// opaque normal app), set per-session in android_globals; sysprop is a dev override.
 	if (android_globals_get_overlay_mode()) {
@@ -1483,6 +1495,9 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		}
 		u_hud_destroy(&mc->session_render.hud);
 
+		// #1073 T0: release the runtime-supplied compose-under backdrop.
+		comp_multi_bg2d_teardown(mc, vk);
+
 		// Destroy workspace chrome blend (#48) — its own flag, independent of
 		// the HUD (chrome can be present without the FPS HUD being enabled).
 		if (vk != NULL && mc->session_render.chrome_blend_initialized) {
@@ -1992,12 +2007,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	// the plug-in didn't advertise the xrt_display_processor_vk variant. Covers
 	// both the freshly-created and the cached (#528) DP. On Android the platform
 	// (SurfaceFlinger) always presents, so client_presents = true.
-	if (mc->session_render.display_processor != NULL && android_transparent_requested()) {
+	mc->session_render.dp_transparent = android_transparent_requested(mc);
+	if (mc->session_render.display_processor != NULL && mc->session_render.dp_transparent) {
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)mc->session_render.display_processor,
 		    true,  // enabled
 		    true); // client_presents
-		U_LOG_W("#568: requested transparent-background alpha-gate on the Android DP");
+		U_LOG_W("#568: requested transparent-background alpha-gate on the Android DP"
+		        " (xsi flag=%d, overlay/sysprop otherwise)",
+		        mc->xsi.transparent_background_enabled ? 1 : 0);
 	}
 #endif
 

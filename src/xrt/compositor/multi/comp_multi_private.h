@@ -307,6 +307,13 @@ struct multi_compositor
 		//! SESSION rather than per system-wide surface edge.
 		int dp_visibility;
 
+		//! #568 / #1073 — does this session want a see-through (transparent)
+		//! background? Latched at DP creation from the formal
+		//! XR_DXR_android_surface_binding flag (xsi), overlay mode, or the
+		//! `debug.dxr.transparent` dev override; read per frame by the
+		//! compose-under backdrop producer.
+		bool dp_transparent;
+
 		//! @name Generic per-session Vulkan rendering resources
 		//! Used by any display processor path.
 		//! @{
@@ -400,6 +407,25 @@ struct multi_compositor
 		int flip_height;
 		VkFormat flip_format;
 		bool flip_initialized;
+		//! @}
+
+		//! @name Runtime-supplied 2D backdrop (#1073 T0, compose-under)
+		//! The *producer* for base-DP slot 16 `set_background_2d`. A tiny
+		//! static solid/gradient image the runtime rasterises itself, handed
+		//! to the vendor DP before every process_atlas so it can composite the
+		//! app's mixed-alpha band over an opaque backdrop BEFORE the weave —
+		//! which is the only place a per-subpixel weave and a one-alpha-per-
+		//! pixel buffer can be reconciled. Off unless `debug.dxr.bg2d` /
+		//! `DXR_BG2D` selects a colour. See comp_multi_bg2d.h.
+		//! @{
+		VkImage bg2d_image;
+		VkDeviceMemory bg2d_memory;
+		VkImageView bg2d_view;
+		VkBuffer bg2d_staging_buffer;
+		VkDeviceMemory bg2d_staging_memory;
+		uint32_t bg2d_w, bg2d_h;
+		bool bg2d_initialized;
+		bool bg2d_failed;   //!< Latched after a failed build, so we try once.
 		//! @}
 
 #ifdef XRT_OS_WINDOWS
