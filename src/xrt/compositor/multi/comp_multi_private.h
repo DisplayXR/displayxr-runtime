@@ -428,6 +428,13 @@ struct multi_compositor
 		bool bg2d_uploaded_once; //!< Has content, so a refresh transitions from SHADER_READ_ONLY.
 		bool bg2d_logged;        //!< One "backdrop uploaded" line per session, not one per frame.
 		uint32_t bg2d_seq;       //!< #1073 T2: sequence of the captured frame currently uploaded.
+		//! #174 — a T2 producer sends whole-PANEL pixels but slot 16 promises the
+		//! canvas, so the receiver crops. Scratch for the repack, owned here and
+		//! freed by comp_multi_bg2d_teardown; unused by T0 (runtime-drawn, already
+		//! canvas-space).
+		uint8_t *bg2d_crop_scratch;
+		size_t bg2d_crop_capacity;
+		bool bg2d_logged_crop; //!< One "cropped to the canvas" line per session.
 		bool bg2d_failed;   //!< Latched after a failed build, so we try once.
 		//! @}
 
