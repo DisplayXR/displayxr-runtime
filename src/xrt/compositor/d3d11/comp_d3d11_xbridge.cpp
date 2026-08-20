@@ -93,6 +93,9 @@ struct comp_d3d11_xbridge
 	ID3D11DeviceContext4 *app_ctx4;
 	ID3D11Device *out_dev;
 	ID3D11Device5 *out_dev5;
+	ID3D11DeviceContext *out_ctx;
+	//! Cached at create — the weave path must not QI per call (#918 F9).
+	ID3D11DeviceContext4 *out_ctx4;
 
 	// --- D3D12 middle ---------------------------------------------------
 	ID3D12Device *prod_dev;
@@ -115,6 +118,13 @@ struct comp_d3d11_xbridge
 	ID3D12Fence *f_xa_prod;
 	ID3D12Fence *f_xa_cons;
 	HANDLE f_xa_h;
+	//! Same fence re-opened on the APP D3D11 device (same adapter as the
+	//! producer). The back-fence of ingress Option I: the app's renderer passes
+	//! GPU-wait on it so frame N cannot overwrite an atlas the producer's copy
+	//! of N-1 may still be reading (#918 F6).
+	ID3D11Fence *f_xa_app;
+	bool app_back_wait_ok;
+	uint64_t app_waited_seq;
 	//! Consumer completion. Polled CPU-side to pick a slot; ALSO opened on the
 	//! output D3D11 device so the weave can take a GPU-side wait (never a CPU
 	//! one) on the slot it picked.
@@ -138,6 +148,10 @@ struct comp_d3d11_xbridge
 	uint64_t eg_seq[XB_EGRESS_RING];
 	uint32_t eg_w, eg_h;
 	bool eg_content_sized;
+	//! #918 F5: the content dims whose allocation last failed. Retried only when
+	//! the request changes, so a persistently-failing size costs one WARN and one
+	//! attempt, not a realloc + a WARN every frame.
+	uint32_t eg_fail_w, eg_fail_h;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -154,10 +168,23 @@ struct comp_d3d11_xbridge
 	int32_t weave_slot;
 
 	// --- watchdog + stats -------------------------------------------------
+	//! Last seq for which BOTH legs were submitted (the consumer link's target).
 	std::atomic<uint64_t> last_submit_seq;
+	//! Last seq the PRODUCER queue was told to signal — the drain target for any
+	//! release of a producer-side resource, and the producer link's watchdog
+	//! target. Diverges from last_submit_seq only on a leg-2 record failure.
+	std::atomic<uint64_t> prod_submit_seq;
+	//! Every frame the compositor ASKED to bridge, including the ones skipped
+	//! because an allocator was still busy. A rising attempt count with a
+	//! standing consumer fence is a stall even though nothing was submitted
+	//! (#918 F3).
+	std::atomic<uint64_t> attempted;
 	std::atomic<bool> degraded;
 	std::atomic<bool> quit;
 	std::thread watchdog;
+	//! Set when a teardown drain timed out: the D3D12 side is then LEAKED rather
+	//! than released under work that may still be running (#918 F1/F2).
+	bool drain_failed;
 
 	int force_depth; //!< DXR_WEAVE_ON_SCANOUT_DEPTH=1 -> deterministic seq-1.
 	uint64_t pick_now, pick_prev, pick_older, pick_none;
@@ -179,19 +206,107 @@ xb_hr(HRESULT hr, char *buf, size_t n)
 	return buf;
 }
 
-//! Release the egress ring (both the D3D11 side and the consumer's opens).
+//! Defined with the rest of the ingress code; create() needs it for the #918 F6
+//! fallback (no back-fence on the app device ⟹ Option I is unsafe).
+static bool
+xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb);
+
+//! Bounded CPU wait cap for the structural-transition drains below.
+#define XB_DRAIN_TIMEOUT_MS 2000
+
+/*!
+ * Wait for @p fence to reach @p target, bounded at #XB_DRAIN_TIMEOUT_MS.
+ *
+ * **This is NOT the per-frame path.** Every caller is a structural transition —
+ * an egress realloc on a mode switch or resize, an atlas re-bind on a generation
+ * change, or teardown — where the alternative to a bounded CPU wait is releasing
+ * a D3D12 resource an in-flight `CopyTextureRegion` is still reading or writing.
+ * D3D12 has no deferred destruction: that is a use-after-free, and it surfaces
+ * as `DXGI_ERROR_DEVICE_REMOVED` on whichever adapter lost the race (#918 F1/F2).
+ *
+ * @return true when the fence reached @p target; false on timeout, in which case
+ *         the caller must LEAK the resources rather than free them.
+ */
+static bool
+xb_drain_fence(ID3D12Fence *fence, uint64_t target, const char *what)
+{
+	if (fence == nullptr || target == 0 || fence->GetCompletedValue() >= target) {
+		return true;
+	}
+
+	HANDLE ev = CreateEventEx(nullptr, nullptr, 0, EVENT_MODIFY_STATE | SYNCHRONIZE);
+	if (ev != nullptr) {
+		if (SUCCEEDED(fence->SetEventOnCompletion(target, ev))) {
+			WaitForSingleObject(ev, XB_DRAIN_TIMEOUT_MS);
+		}
+		CloseHandle(ev);
+	} else {
+		// No event to wait on — poll to the same bound rather than skip the
+		// drain entirely.
+		const uint64_t deadline_ns = os_monotonic_get_ns() + (uint64_t)XB_DRAIN_TIMEOUT_MS * 1000ull * 1000ull;
+		while (fence->GetCompletedValue() < target && os_monotonic_get_ns() < deadline_ns) {
+			os_nanosleep(1000 * 1000);
+		}
+	}
+
+	if (fence->GetCompletedValue() >= target) {
+		return true;
+	}
+	U_LOG_W(
+	    "d3d11 xbridge: %s drain timed out at %llu/%llu after %d ms — LEAKING the resources "
+	    "rather than freeing them under an in-flight copy (#918)",
+	    what, (unsigned long long)fence->GetCompletedValue(), (unsigned long long)target, XB_DRAIN_TIMEOUT_MS);
+	return false;
+}
+
+/*!
+ * Release the egress ring (both the D3D11 side and the consumer's opens).
+ *
+ * The consumer's `CopyTextureRegion` writes `eg_12[]` directly, so nothing here
+ * may be freed while a consumer copy is still in flight — drain first. On a
+ * drain timeout the pointers are dropped WITHOUT releasing: a leak is
+ * recoverable (the session ends and the process reclaims it), a use-after-free
+ * on a D3D12 copy queue is not (#918 F1).
+ */
 static void
 xb_release_egress(struct comp_d3d11_xbridge *xb)
 {
+	bool in_flight_reachable = false;
 	for (int i = 0; i < XB_EGRESS_RING; i++) {
-		safe_release(xb->eg_12[i]);
-		safe_close(xb->eg_share[i]);
-		safe_release(xb->eg_srv[i]);
-		safe_release(xb->eg_tex[i]);
+		if (xb->eg_12[i] != nullptr) {
+			in_flight_reachable = true;
+			break;
+		}
+	}
+	const bool drained =
+	    !in_flight_reachable ||
+	    xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "egress release");
+	if (!drained && !xb->degraded.load(std::memory_order_relaxed)) {
+		xb->degraded.store(true, std::memory_order_release);
+		U_LOG_W(
+		    "d3d11 xbridge: DEGRADED — the consumer queue would not drain for an egress "
+		    "realloc; no further submissions (#918)");
+	}
+
+	for (int i = 0; i < XB_EGRESS_RING; i++) {
+		if (drained) {
+			safe_release(xb->eg_12[i]);
+			safe_close(xb->eg_share[i]);
+			safe_release(xb->eg_srv[i]);
+			safe_release(xb->eg_tex[i]);
+		} else {
+			// Deliberate leak — see the comment above.
+			xb->eg_12[i] = nullptr;
+			xb->eg_share[i] = nullptr;
+			xb->eg_srv[i] = nullptr;
+			xb->eg_tex[i] = nullptr;
+		}
 		xb->eg_seq[i] = 0;
 	}
 	xb->eg_w = 0;
 	xb->eg_h = 0;
+	xb->eg_content_sized = false;
+	xb->weave_slot = -1;
 }
 
 /*!
@@ -261,11 +376,20 @@ xb_make_egress_slot(struct comp_d3d11_xbridge *xb, int i, uint32_t w, uint32_t h
  * in comp_d3d11_target.cpp — 4 Hz, escalating WARNs, and diagnosis only, except
  * that at 5 s this one also latches `degraded` so the panel keeps showing the
  * last good frame instead of hanging on a bridge that is never coming back.
+ *
+ * #918 F3: BOTH links are monitored, not just the producer's. Watching
+ * `f_xa_prod` alone misses a wedged CONSUMER queue entirely — a submit whose
+ * allocator is still busy returns BEFORE leg 1, so `last_submit_seq` stops
+ * advancing, `submitted <= prod_done` holds forever, and the panel freezes with
+ * a permanently "healthy" watchdog. Hence the third clause: frames are still
+ * being ATTEMPTED and the consumer fence is not moving.
  */
 static void
 xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
 {
-	uint64_t last_done = 0;
+	uint64_t last_prod_done = 0;
+	uint64_t last_cons_done = 0;
+	uint64_t last_attempted = 0;
 	uint64_t stall_since_ns = os_monotonic_get_ns();
 	int stage = 0;
 
@@ -275,15 +399,27 @@ xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
 			break;
 		}
 
-		const uint64_t submitted = xb->last_submit_seq.load(std::memory_order_acquire);
-		const uint64_t done = (xb->f_xa_prod != nullptr) ? xb->f_xa_prod->GetCompletedValue() : 0;
+		const uint64_t prod_target = xb->prod_submit_seq.load(std::memory_order_acquire);
+		const uint64_t attempted = xb->attempted.load(std::memory_order_acquire);
+		const uint64_t prod_done = (xb->f_xa_prod != nullptr) ? xb->f_xa_prod->GetCompletedValue() : 0;
+		const uint64_t cons_done = (xb->f_out_cons != nullptr) ? xb->f_out_cons->GetCompletedValue() : 0;
 
-		if (done != last_done || submitted <= done) {
+		const bool prod_stall = prod_target > prod_done;
+		const bool cons_stall = prod_done > cons_done;
+		// Nothing new submitted, but the compositor keeps asking — the
+		// allocator-busy skip loop, which no fence comparison above can see.
+		const bool attempt_stall = (attempted > last_attempted) && (cons_done == last_cons_done);
+		const bool advanced = (prod_done != last_prod_done) || (cons_done != last_cons_done);
+
+		last_attempted = attempted;
+
+		if (advanced || !(prod_stall || cons_stall || attempt_stall)) {
 			if (stage > 0) {
-				U_LOG_W("d3d11 xbridge: cross-adapter fence recovered at seq=%llu (#1017)",
-				        (unsigned long long)done);
+				U_LOG_W("d3d11 xbridge: bridge recovered at prod=%llu cons=%llu (#1017)",
+				        (unsigned long long)prod_done, (unsigned long long)cons_done);
 			}
-			last_done = done;
+			last_prod_done = prod_done;
+			last_cons_done = cons_done;
 			stall_since_ns = os_monotonic_get_ns();
 			stage = 0;
 			continue;
@@ -300,8 +436,15 @@ xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
 		}
 		if (want > stage) {
 			stage = want;
-			U_LOG_W("d3d11 xbridge: cross-adapter fence stalled at seq=%llu for %lld ms (#1017)",
-			        (unsigned long long)done, (long long)ms);
+			const char *link = prod_stall ? "PRODUCER link (app adapter -> cross-adapter ring)"
+			                              : (cons_stall ? "CONSUMER link (cross-adapter ring -> egress)"
+			                                            : "CONSUMER link (frames attempted, no egress "
+			                                              "progress — allocators never free)");
+			U_LOG_W(
+			    "d3d11 xbridge: %s stalled for %lld ms — submitted=%llu prod=%llu cons=%llu "
+			    "attempts=%llu (#1017)",
+			    link, (long long)ms, (unsigned long long)prod_target, (unsigned long long)prod_done,
+			    (unsigned long long)cons_done, (unsigned long long)attempted);
 			if (want >= 2 && !xb->degraded.load(std::memory_order_relaxed)) {
 				xb->degraded.store(true, std::memory_order_release);
 				U_LOG_W(
@@ -334,6 +477,8 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	auto *xb = new comp_d3d11_xbridge();
 	xb->weave_slot = -1;
 	xb->last_submit_seq.store(0);
+	xb->prod_submit_seq.store(0);
+	xb->attempted.store(0);
 	xb->degraded.store(false);
 	xb->quit.store(false);
 	xb->max_w = info->max_width;
@@ -350,9 +495,19 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	xb->app_dev = static_cast<ID3D11Device *>(info->app_device);
 	xb->app_ctx = static_cast<ID3D11DeviceContext *>(info->app_context);
 	xb->out_dev = static_cast<ID3D11Device *>(info->out_device);
+	xb->out_ctx = static_cast<ID3D11DeviceContext *>(info->out_context);
 	xb->app_dev->AddRef();
 	xb->app_ctx->AddRef();
 	xb->out_dev->AddRef();
+	if (xb->out_ctx != nullptr) {
+		xb->out_ctx->AddRef();
+		// Cached once: gpu_wait_slot runs on the weave path, which must not QI
+		// per frame (#918 F9). A failure here only costs the GPU-side wait.
+		if (FAILED(xb->out_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
+		                                       reinterpret_cast<void **>(&xb->out_ctx4)))) {
+			xb->out_ctx4 = nullptr;
+		}
+	}
 
 	hr = xb->app_dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&xb->app_dev5));
 	if (SUCCEEDED(hr)) {
@@ -516,6 +671,32 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 		*out_reason = "cross-adapter heap unsupported";
 		goto fail;
 	}
+	/*
+	 * #918 F6 — the ingress BACK-fence. In Option I the producer copies straight
+	 * out of the renderer's atlas, so without this the app's next frame overwrites
+	 * the atlas while that copy is still reading it: torn frames, and the tear
+	 * lands in whatever the panel is showing. Re-opening the producer fence on the
+	 * APP D3D11 device (same adapter, so a plain shared-fence open) lets the app's
+	 * renderer passes take a GPU-QUEUE wait on it — never a CPU one.
+	 *
+	 * If the open fails, Option I is simply unsafe and is NOT kept: the staged
+	 * ingress ring is latched instead, whose per-seq slot gives the copy a full
+	 * ring of margin.
+	 */
+	hr = xb->app_dev5->OpenSharedFence(xb->f_xa_h, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&xb->f_xa_app));
+	if (SUCCEEDED(hr) && xb->f_xa_app != nullptr) {
+		xb->app_back_wait_ok = true;
+	} else {
+		xb->app_back_wait_ok = false;
+		U_LOG_W(
+		    "d3d11 xbridge: the app device could not open the producer fence %s — ingress Option I "
+		    "has no back-pressure and is unsafe; latching the staged ingress ring (#918)",
+		    xb_hr(hr, b, sizeof(b)));
+		if (!xb_latch_staged_ingress(xb)) {
+			*out_reason = "ingress back-fence unavailable";
+			goto fail;
+		}
+	}
 
 	hr = xb->cons_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence),
 	                               reinterpret_cast<void **>(&xb->f_out_cons));
@@ -531,7 +712,7 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	// slot pick is still CPU-verified complete before the weave, we simply lose
 	// the belt-and-braces GPU ordering (and the forced-depth mode's guarantee).
 	xb->out_gpu_wait_ok = false;
-	if (xb->out_dev5 != nullptr) {
+	if (xb->out_dev5 != nullptr && xb->out_ctx4 != nullptr) {
 		hr = xb->out_dev5->OpenSharedFence(xb->f_out_h, __uuidof(ID3D11Fence),
 		                                   reinterpret_cast<void **>(&xb->f_out_out11));
 		if (SUCCEEDED(hr) && xb->f_out_out11 != nullptr) {
@@ -625,14 +806,46 @@ comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, u
 	if (h > xb->max_h) {
 		h = xb->max_h;
 	}
-	if (xb->eg_w == w && xb->eg_h == h && xb->eg_content_sized) {
+	/*
+	 * #918 F5 (a): the ring already has EXACTLY these dims. That includes the
+	 * case where the content box IS the worst-case atlas — a worst-case ring is
+	 * then content-sized by definition, and reallocating it (every frame, since
+	 * the flag would never stick) would tear the ring down and back up on the
+	 * hot path for nothing.
+	 */
+	if (xb->eg_w == w && xb->eg_h == h) {
+		if (!xb->eg_content_sized) {
+			xb->eg_content_sized = true;
+			U_LOG_W(
+			    "d3d11 xbridge: egress ring %ux%u already matches the content box — "
+			    "no crop needed (#918)",
+			    w, h);
+		}
 		return true;
 	}
+	/*
+	 * (b) A size whose allocation already failed is not retried until the
+	 * REQUEST changes. Without this a persistently-failing content size (out of
+	 * iGPU memory, say) re-attempts the whole ring — and re-logs — every single
+	 * frame, while the worst-case ring it falls back to works fine.
+	 */
+	if (xb->eg_fail_w == w && xb->eg_fail_h == h) {
+		return false;
+	}
 	if (xb_alloc_egress(xb, w, h, true)) {
+		xb->eg_fail_w = 0;
+		xb->eg_fail_h = 0;
 		return true;
 	}
 	// Never leave the session without an egress ring: restore the worst-case
-	// one and let the caller crop on the output device instead.
+	// one and let the caller crop on the output device instead. (c) One WARN per
+	// transition — never per frame.
+	xb->eg_fail_w = w;
+	xb->eg_fail_h = h;
+	U_LOG_W(
+	    "d3d11 xbridge: egress ring could not be sized to %ux%u — keeping the worst-case ring and "
+	    "cropping on the output device; this size will not be retried (#918)",
+	    w, h);
 	comp_d3d11_xbridge_alloc_worstcase_egress(xb);
 	return false;
 }
@@ -708,6 +921,23 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 		return true;
 	}
 
+	/*
+	 * #918 F2: the generation changed (mode switch / resize grew the atlas), so
+	 * the old `atlas_12` is about to be released — but the producer's copy of the
+	 * last submitted seq reads exactly that resource, and D3D12 will not keep it
+	 * alive for us. Drain the producer link first; on timeout, LEAK it rather
+	 * than hand the copy queue a freed resource (same rationale as F1).
+	 */
+	if (xb->atlas_12 != nullptr &&
+	    !xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire), "atlas re-bind")) {
+		xb->atlas_12 = nullptr; // deliberate leak — a UAF is not recoverable
+		if (!xb->degraded.load(std::memory_order_relaxed)) {
+			xb->degraded.store(true, std::memory_order_release);
+			U_LOG_W(
+			    "d3d11 xbridge: DEGRADED — the producer queue would not drain for an atlas "
+			    "re-bind; no further submissions (#918)");
+		}
+	}
 	safe_release(xb->atlas_12);
 	HRESULT hr = xb->prod_dev->OpenSharedHandle(static_cast<HANDLE>(nt_handle), __uuidof(ID3D12Resource),
 	                                            reinterpret_cast<void **>(&xb->atlas_12));
@@ -728,6 +958,55 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
  *
  */
 
+/*!
+ * #918 F7 (a): the egress slot this frame's consumer copy writes into.
+ *
+ * A plain `seq % XB_EGRESS_RING` will, every ring period, land on the very slot
+ * the compositor published as `weave_slot` — the one a repaint tick is re-weaving
+ * right now, and the one an app frame's DP is sampling. Choose instead the
+ * oldest slot that is NOT the published one; with a depth of 3 there is always
+ * one free.
+ */
+static int
+xb_egress_write_slot(struct comp_d3d11_xbridge *xb)
+{
+	const int32_t avoid = xb->weave_slot;
+	int best = -1;
+	uint64_t best_seq = UINT64_MAX;
+	for (int i = 0; i < XB_EGRESS_RING; i++) {
+		if ((int32_t)i == avoid) {
+			continue;
+		}
+		if (xb->eg_seq[i] <= best_seq) {
+			best_seq = xb->eg_seq[i];
+			best = i;
+		}
+	}
+	return best;
+}
+
+extern "C" void
+comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
+{
+	if (xb == nullptr || !xb->app_back_wait_ok || xb->ingress_mode != XB_INGRESS_DIRECT) {
+		return;
+	}
+	/*
+	 * Wait for the LAST SEQ THE PRODUCER QUEUE WAS ACTUALLY TOLD TO SIGNAL, not
+	 * for seq-1: a frame whose allocator was busy (or that arrived while the
+	 * bridge was degraded) never reaches leg 1, so its fence value is never
+	 * signalled — and a GPU wait on a value nothing will ever signal wedges the
+	 * app's queue permanently. This value is always backed by work already
+	 * submitted, so the wait is guaranteed to resolve.
+	 */
+	const uint64_t want = xb->prod_submit_seq.load(std::memory_order_acquire);
+	if (want == 0 || want == xb->app_waited_seq) {
+		return;
+	}
+	xb->app_ctx4->Wait(xb->f_xa_app, want);
+	xb->app_waited_seq = want;
+}
+
 extern "C" void
 comp_d3d11_xbridge_submit(
     struct comp_d3d11_xbridge *xb, uint64_t seq, void *atlas_texture, uint32_t content_w, uint32_t content_h)
@@ -738,6 +1017,9 @@ comp_d3d11_xbridge_submit(
 	if (content_w == 0 || content_h == 0 || xb->eg_w == 0) {
 		return;
 	}
+	// Counted BEFORE the allocator-busy early-outs below: the watchdog's whole
+	// point is that a skipped frame is still an attempted frame (#918 F3).
+	xb->attempted.fetch_add(1, std::memory_order_release);
 	if (content_w > xb->eg_w) {
 		content_w = xb->eg_w;
 	}
@@ -772,7 +1054,10 @@ comp_d3d11_xbridge_submit(
 	const int pa = (int)(seq % XB_ALLOC_RING);
 	const int ca = pa;
 	const int xa = (int)(seq % XB_XA_RING);
-	const int eg = (int)(seq % XB_EGRESS_RING);
+	const int eg = xb_egress_write_slot(xb);
+	if (eg < 0) {
+		return;
+	}
 
 	// Never CPU-wait for an allocator: if the seq that last used it is still in
 	// flight the frame is simply not bridged, and the weave picks an older slot.
@@ -814,6 +1099,10 @@ comp_d3d11_xbridge_submit(
 		xb->prod_q->ExecuteCommandLists(1, l);
 		xb->prod_q->Signal(xb->f_xa_prod, seq);
 		xb->prod_alloc_seq[pa] = seq;
+		// Published for the watchdog's producer link, the F1/F2 drains and the
+		// F6 back-fence — all of which need the last seq the producer queue was
+		// told to signal, never a seq that was skipped.
+		xb->prod_submit_seq.store(seq, std::memory_order_release);
 	}
 
 	// --- leg 2: cross-adapter ring -> egress (scanout adapter) ------------
@@ -867,11 +1156,16 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 		// GPU-waited rather than CPU-verified. Removes the pick jitter when the
 		// question under measurement is latency, not throughput.
 		if (submitted >= 2) {
+			// Searched, not computed: the write slot is chosen to dodge the
+			// published weave slot (#918 F7), so seq no longer maps to a slot
+			// by modulo.
 			const uint64_t want = submitted - 1;
-			const int32_t s = (int32_t)(want % XB_EGRESS_RING);
-			if (xb->eg_seq[s] == want) {
-				pick = s;
-				best = want;
+			for (int32_t i = 0; i < XB_EGRESS_RING; i++) {
+				if (xb->eg_seq[i] == want) {
+					pick = i;
+					best = want;
+					break;
+				}
 			}
 		}
 	}
@@ -907,7 +1201,7 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" void
-comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, void *out_context, int32_t slot)
+comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, int32_t slot)
 {
 	if (xb == nullptr || !xb->out_gpu_wait_ok || slot < 0 || slot >= XB_EGRESS_RING) {
 		return;
@@ -916,13 +1210,24 @@ comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, void *out_contex
 	if (want == 0) {
 		return;
 	}
-	auto *ctx = static_cast<ID3D11DeviceContext *>(out_context);
-	ID3D11DeviceContext4 *ctx4 = nullptr;
-	if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&ctx4))) &&
-	    ctx4 != nullptr) {
-		ctx4->Wait(xb->f_out_out11, want);
-		ctx4->Release();
+	// out_ctx4 is cached at create — out_gpu_wait_ok implies it is non-NULL.
+	xb->out_ctx4->Wait(xb->f_out_out11, want);
+}
+
+extern "C" bool
+comp_d3d11_xbridge_slot_ready(struct comp_d3d11_xbridge *xb, int32_t slot)
+{
+	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING) {
+		return false;
 	}
+	if (xb->out_gpu_wait_ok) {
+		return true; // the queue-side wait orders the weave behind the copy
+	}
+	const uint64_t want = xb->eg_seq[slot];
+	if (want == 0 || xb->f_out_cons == nullptr) {
+		return false;
+	}
+	return xb->f_out_cons->GetCompletedValue() >= want;
 }
 
 extern "C" void *
@@ -983,23 +1288,13 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 		xb->watchdog.join();
 	}
 
-	const uint64_t target = xb->last_submit_seq.load(std::memory_order_acquire);
-	if (target == 0 || xb->f_out_cons == nullptr) {
-		return;
-	}
-
-	// The ONLY CPU wait in this unit, and it is bounded. #1017: a hybrid stack
-	// that has wedged must not turn a session teardown into a hang.
-	const uint64_t deadline_ns = os_monotonic_get_ns() + 2ull * 1000 * 1000 * 1000;
-	while (xb->f_out_cons->GetCompletedValue() < target) {
-		if (os_monotonic_get_ns() > deadline_ns) {
-			U_LOG_W(
-			    "d3d11 xbridge: teardown drain timed out at seq=%llu/%llu after 2000 ms — "
-			    "releasing anyway (#1017)",
-			    (unsigned long long)xb->f_out_cons->GetCompletedValue(), (unsigned long long)target);
-			break;
-		}
-		os_nanosleep(1000 * 1000);
+	// Both links, bounded, producer first (it is the upstream one). #1017: a
+	// hybrid stack that has wedged must not turn a session teardown into a hang —
+	// but a timeout here means the releases below are unsafe, so it also latches
+	// `drain_failed` and the destroy leaks instead of freeing (#918 F1/F2).
+	if (!xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire), "teardown producer") ||
+	    !xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "teardown consumer")) {
+		xb->drain_failed = true;
 	}
 
 	const uint64_t total = xb->pick_now + xb->pick_prev + xb->pick_older + xb->pick_none;
@@ -1024,6 +1319,34 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 
 	comp_d3d11_xbridge_quiesce(xb);
 
+	/*
+	 * #918 F1/F2: if the bounded drain in quiesce timed out, copies may STILL be
+	 * running against the D3D12 resources below. D3D12 has no deferred
+	 * destruction, so releasing them here is a use-after-free on the copy queues
+	 * — the thing that shows up as DEVICE_REMOVED. Leak the whole D3D12 side
+	 * instead: holding the devices alive keeps every child alive with them, the
+	 * memory is reclaimed when the process exits, and a leak is recoverable in a
+	 * way a use-after-free is not.
+	 */
+	if (xb->drain_failed) {
+		U_LOG_W(
+		    "d3d11 xbridge: teardown drain never completed — LEAKING the D3D12 side "
+		    "(both devices, queues, the cross-adapter ring and the egress opens) rather than "
+		    "freeing resources under in-flight copies (#918)");
+		safe_release(xb->f_out_out11);
+		safe_release(xb->f_xa_app);
+		safe_release(xb->out_ctx4);
+		safe_release(xb->out_ctx);
+		safe_release(xb->out_dev5);
+		safe_release(xb->out_dev);
+		safe_release(xb->app_ctx4);
+		safe_release(xb->app_ctx);
+		safe_release(xb->app_dev5);
+		safe_release(xb->app_dev);
+		delete xb;
+		return;
+	}
+
 	// Reverse of create: egress -> consumer -> cross-adapter heap -> producer
 	// -> fences -> the D3D11 ends.
 	xb_release_egress(xb);
@@ -1046,6 +1369,7 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 	safe_release(xb->f_out_out11);
 	safe_release(xb->f_out_cons);
 	safe_close(xb->f_out_h);
+	safe_release(xb->f_xa_app);
 	safe_release(xb->f_xa_cons);
 	safe_release(xb->f_xa_prod);
 	safe_close(xb->f_xa_h);
@@ -1064,6 +1388,8 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 	safe_release(xb->cons_dev);
 	safe_release(xb->prod_dev);
 
+	safe_release(xb->out_ctx4);
+	safe_release(xb->out_ctx);
 	safe_release(xb->out_dev5);
 	safe_release(xb->out_dev);
 	safe_release(xb->app_ctx4);

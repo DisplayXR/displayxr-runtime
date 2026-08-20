@@ -67,6 +67,7 @@ struct comp_d3d11_xbridge_info
 	void *app_context; //!< `ID3D11DeviceContext *`, the app's immediate context.
 	void *app_adapter; //!< `IDXGIAdapter *` the app device lives on.
 	void *out_device;  //!< `ID3D11Device *` on the scanout adapter.
+	void *out_context; //!< `ID3D11DeviceContext *` of @ref out_device.
 	void *out_adapter; //!< `IDXGIAdapter *` that scans out the panel.
 
 	//! Worst-case system atlas (u_tiling_compute_system_atlas) — the
@@ -134,6 +135,20 @@ bool
 comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t generation);
 
 /*!
+ * Back-pressure for ingress Option I (#918 review F6). The producer's copy of
+ * frame N-1 reads the app's atlas directly, so the renderer passes of frame N
+ * must not start overwriting it until that copy has retired. Call at the TOP of
+ * the compositor's renderer section, before the first pass writes the atlas.
+ *
+ * Issues a **GPU-side** wait on the app's immediate context only — the
+ * no-CPU-wait-on-the-app-thread invariant stands. No-op in Option II (whose
+ * staging ring already gives the copy a private slot) and no-op when the app
+ * device could not open the producer fence (that case latches Option II).
+ */
+void
+comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb);
+
+/*!
  * Record and execute the three legs for one app frame. Returns immediately —
  * nothing on this thread ever waits.
  *
@@ -155,12 +170,24 @@ int32_t
 comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb);
 
 /*!
- * Queue a GPU-side wait for @p slot's completion on the output context. Free
- * when the slot was picked opportunistically (its fence already fired); the
- * ordering that makes the forced-depth mode correct.
+ * Queue a GPU-side wait for @p slot's completion on the output context (cached
+ * at create). Free when the slot was picked opportunistically (its fence
+ * already fired); the ordering that makes the forced-depth mode correct.
  */
 void
-comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, void *out_context, int32_t slot);
+comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, int32_t slot);
+
+/*!
+ * True when @p slot may be woven right now: either the output device took the
+ * GPU-side wait above (so the ordering is on the queue), or the consumer copy
+ * that filled the slot is CPU-verified complete.
+ *
+ * The repaint tick re-weaves a slot it did not pick itself, and without the
+ * GPU-side wait nothing else orders it against a consumer copy that is
+ * rewriting that same slot — so the repaint must check and bail (#918 F7).
+ */
+bool
+comp_d3d11_xbridge_slot_ready(struct comp_d3d11_xbridge *xb, int32_t slot);
 
 //! `ID3D11ShaderResourceView *` the DP samples for @p slot (NULL if invalid).
 void *
