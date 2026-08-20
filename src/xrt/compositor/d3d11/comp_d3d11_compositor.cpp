@@ -195,24 +195,46 @@ struct comp_d3d11_compositor
 	uint64_t split_recipe_refusals;
 	uint64_t split_recipe_logged_gen;
 	//! Per-plane DIAG deltas: the lifetime copy/skip totals as of the last line.
-	uint64_t split_plane_copies_prev[3];
-	uint64_t split_plane_skips_prev[3];
+	uint64_t split_plane_copies_prev[COMP_D3D11_XBRIDGE_PLANE_COUNT];
+	uint64_t split_plane_skips_prev[COMP_D3D11_XBRIDGE_PLANE_COUNT];
 	/*!
-	 * #918 Phase 2a — REGION-SIZED views of the two planes the DISPLAY PROCESSOR
+	 * #918 Phase 2a — REGION-SIZED views of the planes the DISPLAY PROCESSOR
 	 * consumes through its sideband entry points.
 	 *
 	 * The masked composite can sample a panel-sized plane over a sub-rect because
-	 * its shader takes a uv scale. The DP's `set_background_2d` and
-	 * `publish_local_zone_mask` take an SRV plus a width/height and no scale, so
-	 * handing them the panel-sized plane would tell a vendor the backdrop is
-	 * 1280x720 while giving it a 3840x2160 texture — it would minify the whole
-	 * panel into the region. One output-device copy of the region per frame is the
-	 * price of not changing a plug-in ABI for this.
+	 * its shader takes a uv scale. The DP's `set_background_2d` takes an SRV plus
+	 * a width/height and no scale, so handing it the panel-sized backdrop plane
+	 * would tell a vendor the backdrop is 1280x720 while giving it a 3840x2160
+	 * texture — it would minify the whole panel into the region.
+	 *
+	 * #918 review F8: this copy is SEQ-GATED and METERED. It used to run on every
+	 * weave AND every repaint tick, unconditionally, on the output device and
+	 * invisible to the bandwidth gate — 4K RGBA8 at panel rate is GB/s of iGPU
+	 * traffic, and re-copying an unchanged backdrop is precisely the per-tick
+	 * cost the split exists to remove. It now runs only when the source slot's
+	 * plane generation differs from the one the view already holds, and its bytes
+	 * appear in the DIAG line.
+	 *
+	 * Since the authored-mask plane is now MASK-sized (#918 review F5) rather than
+	 * panel-sized, the mask publish takes the passthrough path below and copies
+	 * nothing at all.
 	 */
-	ID3D11Texture2D *dp_bd_view;
-	ID3D11ShaderResourceView *dp_bd_view_srv;
-	ID3D11Texture2D *dp_mask_view;
-	ID3D11ShaderResourceView *dp_mask_view_srv;
+	struct d3d11_dp_plane_view
+	{
+		ID3D11Texture2D *tex;
+		ID3D11ShaderResourceView *srv;
+		//! Allocated extent, and the content generation the view holds.
+		uint32_t w, h;
+		uint64_t seq;
+		//! #918 review D7: one alloc-failure WARN per session, never per frame.
+		bool warned;
+	};
+	struct d3d11_dp_plane_view dp_bd_view;
+	struct d3d11_dp_plane_view dp_mask_view;
+	//! #918 review F8 — sideband copy bytes and count since the last DIAG line.
+	uint64_t split_sideband_bytes;
+	uint64_t split_sideband_copies;
+	uint64_t split_sideband_skips;
 	//! Frames where the split had nothing woven to show, so the Present was
 	//! skipped and the panel kept the previous frame (#918 F4). Reported at most
 	//! once a second — a skip is a per-frame event and must never WARN per frame.
@@ -736,9 +758,9 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c);
 // zone helpers near the bottom; called from d3d11_dp_weave above them.
 static ID3D11ShaderResourceView *
 d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
-                    ID3D11Texture2D **tex,
-                    ID3D11ShaderResourceView **srv,
+                    struct comp_d3d11_compositor::d3d11_dp_plane_view *v,
                     void *plane_srv,
+                    uint64_t content_seq,
                     uint32_t w,
                     uint32_t h,
                     DXGI_FORMAT fmt,
@@ -2194,12 +2216,15 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			if (comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &brec) && brec.bd_w > 0 && brec.bd_h > 0 &&
 			    (brec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_BACKDROP)) != 0) {
 				// Region-sized view: the DP's contract is an SRV plus the
-				// backdrop's real dims, and the plane is panel-sized.
-				bd_srv = d3d11_plane_dp_view(c, &c->dp_bd_view, &c->dp_bd_view_srv,
-				                             comp_d3d11_xbridge_get_plane_srv(
-				                                 c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_BACKDROP),
-				                             brec.bd_w, brec.bd_h, DXGI_FORMAT_R8G8B8A8_UNORM,
-				                             "2D-under backdrop");
+				// backdrop's real dims, and the plane is panel-sized. The copy
+				// is seq-gated on the slot's plane generation (#918 review F8),
+				// so an unchanged backdrop under a repaint costs nothing.
+				const uint64_t bd_seq = brec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_BACKDROP];
+				bd_srv = d3d11_plane_dp_view(
+				    c, &c->dp_bd_view,
+				    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot,
+				                                     COMP_D3D11_XBRIDGE_PLANE_BACKDROP, bd_seq),
+				    bd_seq, brec.bd_w, brec.bd_h, DXGI_FORMAT_R8G8B8A8_UNORM, "2D-under backdrop");
 			}
 			xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv,
 			                                              bd_srv != nullptr ? brec.bd_w : 0,
@@ -2248,39 +2273,57 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				 */
 				const double atlas_gbs =
 				    (double)comp_d3d11_xbridge_take_atlas_bytes(c->xbridge) / secs / 1.0e9;
-				double plane_gbs[3] = {0.0, 0.0, 0.0};
-				uint64_t plane_copies[3] = {0, 0, 0};
-				uint64_t plane_skips[3] = {0, 0, 0};
-				bool plane_half[3] = {false, false, false};
+				/*
+				 * #918 review D8: sized by the constant, not by the 3 that
+				 * happened to be true. A fourth plane used to compile clean and
+				 * vanish from the line — and since take_plane_stats is the only
+				 * thing that drains a plane's rolling byte window, an unvisited
+				 * index would never drain it either.
+				 */
+				char planes[512];
+				size_t off = 0;
 				double total_gbs = atlas_gbs;
-				for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT && p < 3; p++) {
+				for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
 					uint64_t pb = 0, pc = 0, ps = 0;
-					comp_d3d11_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps,
-					                                    &plane_half[p]);
-					plane_gbs[p] = (double)pb / secs / 1.0e9;
-					total_gbs += plane_gbs[p];
-					plane_copies[p] = pc - c->split_plane_copies_prev[p];
-					plane_skips[p] = ps - c->split_plane_skips_prev[p];
+					bool half = false;
+					comp_d3d11_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps, &half);
+					const double gbs = (double)pb / secs / 1.0e9;
+					total_gbs += gbs;
+					const int n = snprintf(
+					    planes + off, sizeof(planes) - off, "%s %.3f GB/s (%llu copies, %llu skips%s) |",
+					    comp_d3d11_xbridge_plane_label(p), gbs,
+					    (unsigned long long)(pc - c->split_plane_copies_prev[p]),
+					    (unsigned long long)(ps - c->split_plane_skips_prev[p]), half ? " HALF-RATE" : "");
+					if (n > 0 && (size_t)n < sizeof(planes) - off) {
+						off += (size_t)n;
+					}
 					c->split_plane_copies_prev[p] = pc;
 					c->split_plane_skips_prev[p] = ps;
 				}
+				/*
+				 * #918 review F8 — the DP SIDEBAND leg, which used to be
+				 * invisible here. It runs on the output device (so it is not
+				 * bridge traffic) but it is real per-tick bandwidth, and a
+				 * repaint with static content must show ~0 copies.
+				 */
+				const double side_gbs = (double)c->split_sideband_bytes / secs / 1.0e9;
+				const uint64_t side_copies = c->split_sideband_copies;
+				const uint64_t side_skips = c->split_sideband_skips;
+				c->split_sideband_bytes = 0;
+				c->split_sideband_copies = 0;
+				c->split_sideband_skips = 0;
 				U_LOG_W(
 				    "#918 DIAG: weave %ux%u tiles %ux%u (ring %ux%u) gap_max=%.1f ms "
 				    "stale-refusals=%llu recipe-refusals=%llu skipped-presents=%llu | "
-				    "atlas %.3f GB/s | local2d %.3f GB/s (%llu copies, %llu skips%s) | "
-				    "backdrop %.3f GB/s (%llu copies, %llu skips%s) | mask %.3f GB/s "
-				    "(%llu copies, %llu skips%s) | TOTAL %.3f GB/s",
+				    "atlas %.3f GB/s |%s sideband %.3f GB/s (%llu copies, %llu skips) | "
+				    "TOTAL %.3f GB/s (+sideband %.3f)",
 				    view_width, view_height, tile_columns, tile_rows, eg_w, eg_h,
 				    (double)c->split_weave_gap_max_ns / 1.0e6,
 				    (unsigned long long)c->split_stale_refusals,
 				    (unsigned long long)c->split_recipe_refusals,
-				    (unsigned long long)c->split_skip_present, atlas_gbs, plane_gbs[0],
-				    (unsigned long long)plane_copies[0], (unsigned long long)plane_skips[0],
-				    plane_half[0] ? " HALF-RATE" : "", plane_gbs[1],
-				    (unsigned long long)plane_copies[1], (unsigned long long)plane_skips[1],
-				    plane_half[1] ? " HALF-RATE" : "", plane_gbs[2],
-				    (unsigned long long)plane_copies[2], (unsigned long long)plane_skips[2],
-				    plane_half[2] ? " HALF-RATE" : "", total_gbs);
+				    (unsigned long long)c->split_skip_present, atlas_gbs, planes, side_gbs,
+				    (unsigned long long)side_copies, (unsigned long long)side_skips, total_gbs,
+				    total_gbs + side_gbs);
 			}
 		}
 	}
@@ -4668,21 +4711,18 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 		c->backdrop_scratch_share = nullptr;
 	}
 	// #918 Phase 2a — the region-sized DP views of the bridge planes.
-	if (c->dp_bd_view_srv != nullptr) {
-		c->dp_bd_view_srv->Release();
-		c->dp_bd_view_srv = nullptr;
-	}
-	if (c->dp_bd_view != nullptr) {
-		c->dp_bd_view->Release();
-		c->dp_bd_view = nullptr;
-	}
-	if (c->dp_mask_view_srv != nullptr) {
-		c->dp_mask_view_srv->Release();
-		c->dp_mask_view_srv = nullptr;
-	}
-	if (c->dp_mask_view != nullptr) {
-		c->dp_mask_view->Release();
-		c->dp_mask_view = nullptr;
+	for (struct comp_d3d11_compositor::d3d11_dp_plane_view *v : {&c->dp_bd_view, &c->dp_mask_view}) {
+		if (v->srv != nullptr) {
+			v->srv->Release();
+			v->srv = nullptr;
+		}
+		if (v->tex != nullptr) {
+			v->tex->Release();
+			v->tex = nullptr;
+		}
+		v->w = 0;
+		v->h = 0;
+		v->seq = 0;
 	}
 	if (c->implicit_mask_staged_srv != nullptr) {
 		c->implicit_mask_staged_srv->Release();
@@ -4744,18 +4784,35 @@ d3d11_zone_dp_supported(struct comp_d3d11_compositor *c)
 }
 
 /*!
- * #918 Phase 2a — a REGION-SIZED output-device view of a panel-sized bridge
- * plane, for the two DP sideband entry points that take dims but no uv scale.
+ * #918 Phase 2a — a REGION-SIZED output-device view of a bridge plane, for the
+ * DP sideband entry points that take dims but no uv scale.
  *
- * Reuses one texture per site (the region only changes on a resize). Returns
- * NULL on any failure, which the callers already treat as "no backdrop" / "skip
- * the publish" — a degraded feature, never a broken frame.
+ * Three properties the first cut did not have:
+ *
+ * - **Passthrough when the plane already IS the requested extent.** No texture,
+ *   no copy, no bytes. That is now the mask publish's normal path, because the
+ *   authored-mask plane is sized at the mask (#918 review F5).
+ * - **SEQ-GATED (#918 review F8).** The copy re-runs only when the slot's plane
+ *   generation differs from the one the view already holds. An unchanged
+ *   backdrop under a forced repaint copies NOTHING; the old code re-copied a
+ *   full 4K region on every weave AND every repaint tick, which at panel rate is
+ *   GB/s of output-device traffic that no meter could see.
+ * - **CLAMPED and METERED.** The box is min(src, dst) — an oversized
+ *   `CopySubresourceRegion` is silently DROPPED by D3D11, which would have left
+ *   a vendor sampling an uninitialised texture (#918 review F6) — and the bytes
+ *   land in the DIAG line.
+ *
+ * Returns NULL on any failure, which the callers already treat as "no backdrop"
+ * / "keep the previous publish" — a degraded feature, never a broken frame.
+ *
+ * @param content_seq The plane generation @p plane_srv carries, from the slot's
+ *        recipe. 0 means "unknown", which forces the copy.
  */
 static ID3D11ShaderResourceView *
 d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
-                    ID3D11Texture2D **tex,
-                    ID3D11ShaderResourceView **srv,
+                    struct comp_d3d11_compositor::d3d11_dp_plane_view *v,
                     void *plane_srv,
+                    uint64_t content_seq,
                     uint32_t w,
                     uint32_t h,
                     DXGI_FORMAT fmt,
@@ -4770,22 +4827,35 @@ d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
 	if (pres == nullptr) {
 		return nullptr;
 	}
-
-	bool need_alloc = (*tex == nullptr) || (*srv == nullptr);
-	if (!need_alloc) {
-		D3D11_TEXTURE2D_DESC cur;
-		(*tex)->GetDesc(&cur);
-		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != fmt);
+	ID3D11Texture2D *ptex = nullptr;
+	D3D11_TEXTURE2D_DESC pd = {};
+	if (FAILED(pres->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&ptex))) ||
+	    ptex == nullptr) {
+		pres->Release();
+		return nullptr;
 	}
+	ptex->GetDesc(&pd);
+	ptex->Release();
+
+	// Passthrough: the plane is exactly what the DP asked for.
+	if (pd.Width == w && pd.Height == h) {
+		pres->Release();
+		return psrv;
+	}
+
+	bool need_alloc = (v->tex == nullptr) || (v->srv == nullptr) || v->w != w || v->h != h;
 	if (need_alloc) {
-		if (*srv != nullptr) {
-			(*srv)->Release();
-			*srv = nullptr;
+		if (v->srv != nullptr) {
+			v->srv->Release();
+			v->srv = nullptr;
 		}
-		if (*tex != nullptr) {
-			(*tex)->Release();
-			*tex = nullptr;
+		if (v->tex != nullptr) {
+			v->tex->Release();
+			v->tex = nullptr;
 		}
+		v->w = 0;
+		v->h = 0;
+		v->seq = 0;
 		D3D11_TEXTURE2D_DESC td = {};
 		td.Width = w;
 		td.Height = h;
@@ -4795,26 +4865,50 @@ d3d11_plane_dp_view(struct comp_d3d11_compositor *c,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		HRESULT hr = d3d11_out_device(c)->CreateTexture2D(&td, nullptr, tex);
-		if (SUCCEEDED(hr) && *tex != nullptr) {
-			hr = d3d11_out_device(c)->CreateShaderResourceView(*tex, nullptr, srv);
+		HRESULT hr = d3d11_out_device(c)->CreateTexture2D(&td, nullptr, &v->tex);
+		if (SUCCEEDED(hr) && v->tex != nullptr) {
+			hr = d3d11_out_device(c)->CreateShaderResourceView(v->tex, nullptr, &v->srv);
 		}
-		if (FAILED(hr) || *srv == nullptr) {
-			U_LOG_W("%s: DP-view alloc (%ux%u) failed 0x%08x — that sideband degrades (#918)", what, w, h,
-			        hr);
-			if (*tex != nullptr) {
-				(*tex)->Release();
-				*tex = nullptr;
+		if (FAILED(hr) || v->srv == nullptr) {
+			// #918 review D7: latched. This runs on the frame path (and on
+			// every repaint tick), and the repo forbids a per-frame WARN.
+			if (!v->warned) {
+				v->warned = true;
+				U_LOG_W("%s: DP-view alloc (%ux%u) failed 0x%08x — that sideband degrades for this "
+				        "session (#918)",
+				        what, w, h, hr);
+			}
+			if (v->tex != nullptr) {
+				v->tex->Release();
+				v->tex = nullptr;
 			}
 			pres->Release();
 			return nullptr;
 		}
+		v->w = w;
+		v->h = h;
+	} else if (content_seq != 0 && v->seq == content_seq) {
+		// #918 review F8: same pixels, already copied. This is the steady state
+		// under a repaint — the whole reason the split is worth having.
+		c->split_sideband_skips++;
+		pres->Release();
+		return v->srv;
 	}
 
-	D3D11_BOX box = {0, 0, 0, w, h, 1};
-	d3d11_out_context(c)->CopySubresourceRegion(*tex, 0, 0, 0, 0, pres, 0, &box);
+	// #918 review F6: min(src, dst). D3D11 drops an oversized box silently.
+	uint32_t cw = (w < pd.Width) ? w : pd.Width;
+	uint32_t ch = (h < pd.Height) ? h : pd.Height;
+	if (cw == 0 || ch == 0) {
+		pres->Release();
+		return nullptr;
+	}
+	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
+	d3d11_out_context(c)->CopySubresourceRegion(v->tex, 0, 0, 0, 0, pres, 0, &box);
 	pres->Release();
-	return *srv;
+	v->seq = content_seq;
+	c->split_sideband_copies++;
+	c->split_sideband_bytes += (uint64_t)cw * ch * dxgi_format_bytes_per_pixel(fmt);
+	return v->srv;
 }
 
 /*!
@@ -4917,15 +5011,21 @@ d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_m
  *
  * @param slot Egress slot to read a bridged mask from; -1 asks for the published
  *        weave slot (what the DP sideband publish and a repaint want).
+ * @param out_seq Receives the plane generation the returned SRV carries (0 when
+ *        the mask did not come off the bridge), for the sideband's copy gate.
  */
 static ID3D11ShaderResourceView *
 d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
                             struct comp_d3d11_zone_mask *mask,
                             int32_t slot,
-                            uint32_t *out_kind)
+                            uint32_t *out_kind,
+                            uint64_t *out_seq)
 {
 	if (out_kind != nullptr) {
 		*out_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+	}
+	if (out_seq != nullptr) {
+		*out_seq = 0;
 	}
 	if (mask == nullptr) {
 		if (out_kind != nullptr) {
@@ -4952,8 +5052,24 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
 	if (slot < 0) {
 		slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
 	}
+	/*
+	 * #918 review F3 — the slot's own recipe says which generation its mask
+	 * plane holds, and whether those pixels are the ones its frame staged. Pass
+	 * that back into the bridge so mismatched pixels come back as NULL (the
+	 * callers' "not yet / keep the previous publish" path) rather than being
+	 * composited or published under the wrong recipe.
+	 */
+	struct comp_d3d11_xbridge_recipe rec = {};
+	if (!comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &rec) ||
+	    (rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_MASK)) == 0) {
+		return nullptr;
+	}
+	const uint64_t want = rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_MASK];
+	if (out_seq != nullptr) {
+		*out_seq = want;
+	}
 	return static_cast<ID3D11ShaderResourceView *>(
-	    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK));
+	    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK, want));
 }
 
 //! Refresh @p mask's staged snapshot on every device that consumes it.
@@ -4989,14 +5105,28 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	// (Tier 3). The publish's contract already took the context and the SRV as
 	// parameters, so there is no vtable change here at all.
 	uint32_t pub_kind = COMP_D3D11_XBRIDGE_MASK_NONE;
+	uint64_t pub_seq = 0;
+	/*
+	 * #918 review F9 — does this frame HAVE published mask content at all, per
+	 * the authoritative CPU-side state? That question, and only that question,
+	 * decides whether a clear is right. Whether the content's PIXELS have
+	 * finished crossing the bridge is a transient that decides nothing.
+	 */
+	bool have_content = false;
 	if (c->zones_frame) {
+		have_content = (c->frame_wish != nullptr) || (c->wish_mask_staged_srv != nullptr);
 		ID3D11ShaderResourceView *fw_srv =
-		    (c->frame_wish != nullptr) ? d3d11_zone_mask_consume_srv(c, c->frame_wish, -1, &pub_kind) : nullptr;
+		    (c->frame_wish != nullptr) ? d3d11_zone_mask_consume_srv(c, c->frame_wish, -1, &pub_kind, &pub_seq)
+		                               : nullptr;
 		if (fw_srv != nullptr) {
 			srv = fw_srv;
 			mask_w = c->frame_wish->w;
 			mask_h = c->frame_wish->h;
-		} else if (c->wish_mask_staged_srv != nullptr) {
+		} else if (c->frame_wish == nullptr && c->wish_mask_staged_srv != nullptr) {
+			// No explicit wish: the auto raster IS the published wish. (An
+			// explicit wish whose plane has not landed must NOT silently fall
+			// back to the auto raster — that would publish different geometry
+			// for one frame, which is a flicker, not a degradation.)
 			pub_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
 			srv = c->wish_mask_staged_srv;
 			mask_w = c->wish_mask_w;
@@ -5004,23 +5134,38 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 		}
 	} else {
 		struct comp_d3d11_zone_mask *mask = c->active_zone_mask;
-		if (mask != nullptr && mask->submitted) {
-			srv = d3d11_zone_mask_consume_srv(c, mask, -1, &pub_kind);
+		have_content = (mask != nullptr && mask->submitted);
+		if (have_content) {
+			srv = d3d11_zone_mask_consume_srv(c, mask, -1, &pub_kind, &pub_seq);
 			mask_w = mask->w;
 			mask_h = mask->h;
 		}
 	}
 	/*
-	 * #918 Phase 2a: a BRIDGED (Tier-3) mask arrives as a panel-sized plane while
-	 * the publish declares the mask's own dims — and the vtable has no scale. Give
-	 * the DP a region-sized view instead of changing a plug-in ABI for it.
+	 * #918 Phase 2a: a BRIDGED (Tier-3) mask arrives as an egress plane while the
+	 * publish declares the mask's own dims and the vtable has no scale. Since the
+	 * plane is now sized AT the mask (#918 review F5) this is normally a
+	 * passthrough that copies nothing; the helper still handles the case where a
+	 * publish asks for dims the plane does not have, seq-gated and clamped.
 	 */
 	if (srv != nullptr && pub_kind == COMP_D3D11_XBRIDGE_MASK_PLANE) {
-		srv = d3d11_plane_dp_view(c, &c->dp_mask_view, &c->dp_mask_view_srv, srv, mask_w, mask_h,
-		                          DXGI_FORMAT_R8_UNORM, "zone-mask publish");
+		srv = d3d11_plane_dp_view(c, &c->dp_mask_view, srv, pub_seq, mask_w, mask_h, DXGI_FORMAT_R8_UNORM,
+		                          "zone-mask publish");
 	}
 
 	if (srv == nullptr) {
+		/*
+		 * #918 review F9 — a NULL consume SRV is a NORMAL not-yet-landed state
+		 * under the split: a Tier-3 mask's plane crosses a frame behind the
+		 * authoring call, and any transport skip leaves it NULL for a frame.
+		 * Clearing on that told the DP the app had withdrawn its mask and then
+		 * republished it — a clear/republish cycle at frame rate, which is a
+		 * visible 2D/3D flicker. Only the CPU-side state can say the mask is
+		 * GONE; until it does, keep the DP's previous publish and try again.
+		 */
+		if (have_content) {
+			return;
+		}
 		if (c->zone_published) {
 			xrt_display_processor_d3d11_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
@@ -6273,7 +6418,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				return false;
 			}
 			mask_srv = static_cast<ID3D11ShaderResourceView *>(
-			    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK));
+			    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK,
+			                                     rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_MASK]));
 		} else {
 			mask_srv = c->repaint.mask_srv;
 		}
@@ -6314,7 +6460,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		// The plane was BOUND AND STAGED before this function ran, by
 		// d3d11_stage_mask_plane — the transport does not depend on whether the
 		// pixels have landed yet (#918 review F1/D6).
-		mask_srv = d3d11_zone_mask_consume_srv(c, mask, slot, &mask_kind);
+		mask_srv = d3d11_zone_mask_consume_srv(c, mask, slot, &mask_kind, nullptr);
 	} else {
 		struct xrt_rect rects[XRT_MAX_LAYERS];
 		uint32_t rect_count = 0;
@@ -6508,7 +6654,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			return false;
 		}
 		twod_srv = static_cast<ID3D11ShaderResourceView *>(
-		    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D));
+		    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
+		                                     rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_LOCAL2D]));
 		if (twod_srv == nullptr) {
 			c->repaint.composite_bail = 4;
 			return false;

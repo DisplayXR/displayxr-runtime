@@ -148,11 +148,19 @@ struct comp_d3d11_xbridge_recipe
 	//! Effective canvas sub-rect, already clamped to the region.
 	int32_t cx, cy;
 	uint32_t cw, ch;
-	//! Bit i set ⟹ plane i carries pixels valid for this slot.
+	/*!
+	 * Bit i set ⟹ plane i's pixels in this slot ARE the generation the frame
+	 * staged. A change-skip satisfies that by construction; a half-rate or
+	 * empty-box skip does not, and leaves the bit clear (#918 review F3).
+	 */
 	uint32_t plane_valid;
-	//! Content generation of each plane's pixels in this slot. A plane whose
-	//! copy was change-skipped keeps the seq it already held, so a stale plane
-	//! can never be mistaken for a fresh one.
+	/*!
+	 * Content generation of each plane's pixels in this slot — the generation
+	 * the slot actually HOLDS, which for a skipped plane is the older one it
+	 * still carries. Passed back to @ref comp_d3d11_xbridge_get_plane_srv as
+	 * `want_seq`, so the consume half proves the pixels it is about to sample
+	 * are still the ones its recipe describes rather than a later frame's.
+	 */
 	uint64_t plane_seq[COMP_D3D11_XBRIDGE_PLANE_COUNT];
 };
 
@@ -317,9 +325,21 @@ comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp
 bool
 comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, struct comp_d3d11_xbridge_recipe *out);
 
-//! `ID3D11ShaderResourceView *` of @p plane for @p slot (NULL when invalid).
+/*!
+ * `ID3D11ShaderResourceView *` of @p plane for @p slot (NULL when invalid).
+ *
+ * @param want_seq The content generation the caller's recipe says this slot
+ *        carries (`comp_d3d11_xbridge_recipe::plane_seq[plane]`), or 0 to skip
+ *        the test. A mismatch means a later submit has rewritten the plane under
+ *        this weave and returns NULL rather than mismatched pixels (#918 review
+ *        F3).
+ */
 void *
-comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane);
+comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq);
+
+//! Allocated extent of @p plane's chain. False when the plane is not live.
+bool
+comp_d3d11_xbridge_plane_extent(struct comp_d3d11_xbridge *xb, uint32_t plane, uint32_t *out_w, uint32_t *out_h);
 
 /*!
  * Per-plane transport counters for the once-a-second `#918 DIAG` line: bytes
@@ -337,6 +357,11 @@ comp_d3d11_xbridge_take_plane_stats(struct comp_d3d11_xbridge *xb,
 //! Atlas bytes copied since the last call — the DIAG line's denominator.
 uint64_t
 comp_d3d11_xbridge_take_atlas_bytes(struct comp_d3d11_xbridge *xb);
+
+//! Short name of @p plane for the DIAG line, so adding a plane cannot leave the
+//! log naming it by a stale index (#918 review D8).
+const char *
+comp_d3d11_xbridge_plane_label(uint32_t plane);
 
 /*!
  * Record and execute the three legs for one app frame. Returns immediately —

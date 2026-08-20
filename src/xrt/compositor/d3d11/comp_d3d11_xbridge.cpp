@@ -619,6 +619,19 @@ xb_plane_name(uint32_t p)
 	}
 }
 
+extern "C" const char *
+comp_d3d11_xbridge_plane_label(uint32_t plane)
+{
+	// #918 review D8: the DIAG line's names come from HERE, so adding a plane
+	// cannot leave the log naming it by an index that no longer means anything.
+	switch (plane) {
+	case COMP_D3D11_XBRIDGE_PLANE_LOCAL2D: return "local2d";
+	case COMP_D3D11_XBRIDGE_PLANE_BACKDROP: return "backdrop";
+	case COMP_D3D11_XBRIDGE_PLANE_MASK: return "mask";
+	default: return "plane?";
+	}
+}
+
 static uint32_t
 xb_format_bpp(uint32_t fmt)
 {
@@ -1021,7 +1034,7 @@ comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, stru
 }
 
 extern "C" void *
-comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane)
+comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
 {
 	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
 		return nullptr;
@@ -1030,7 +1043,34 @@ comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, ui
 	if (!pl.live || pl.slot_seq[slot] == 0) {
 		return nullptr;
 	}
+	/*
+	 * #918 review F3 — the STALE-PLANE test, and the reader `plane_seq` was
+	 * documented to have and did not. The caller passes the generation the
+	 * slot's recipe advertises; if the slot no longer holds it, a later submit
+	 * has rewritten the plane under this weave and these are not the pixels the
+	 * recipe describes. Refusing costs the 2D band one frame (the caller falls
+	 * back to the previous publish, or skips); compositing anyway puts one
+	 * frame's 2D over another frame's 3D.
+	 */
+	if (want_seq != 0 && pl.slot_seq[slot] != want_seq) {
+		return nullptr;
+	}
 	return pl.eg_srv[slot];
+}
+
+extern "C" bool
+comp_d3d11_xbridge_plane_extent(struct comp_d3d11_xbridge *xb, uint32_t plane, uint32_t *out_w, uint32_t *out_h)
+{
+	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
+		return false;
+	}
+	if (out_w != nullptr) {
+		*out_w = xb->plane[plane].alloc_w;
+	}
+	if (out_h != nullptr) {
+		*out_h = xb->plane[plane].alloc_h;
+	}
+	return true;
 }
 
 extern "C" void
@@ -2109,7 +2149,17 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
 		auto &pl = xb->plane[p];
 		xb->eg_recipe[eg].plane_seq[p] = pl.slot_seq[eg];
-		if (pl.live && pl.staged && pl.slot_seq[eg] != 0) {
+		/*
+		 * #918 review F3 — `plane_valid` means "this slot's pixels ARE the
+		 * generation the frame staged", not merely "this slot has some pixels".
+		 * A change-skip satisfies it by construction, which is the whole point
+		 * of the change-skip: the slot already holds exactly this generation.
+		 * A HALF-RATE skip or an untransportable (empty-box) skip does not —
+		 * those leave the slot on an older generation, and stamping them valid
+		 * is what let a stale 2D band composite under a current frame with
+		 * nothing anywhere able to tell.
+		 */
+		if (pl.live && pl.staged && pl.slot_seq[eg] != 0 && pl.slot_seq[eg] == pl.stage_seq) {
 			xb->eg_recipe[eg].plane_valid |= (1u << p);
 		}
 	}

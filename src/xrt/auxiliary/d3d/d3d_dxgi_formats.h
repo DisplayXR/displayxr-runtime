@@ -167,6 +167,8 @@ dxgi_format_bytes_per_pixel(DXGI_FORMAT format)
 		return 8;
 	case DXGI_FORMAT_D16_UNORM:
 		return 2;
+	case DXGI_FORMAT_R8_UNORM: // scalar zone masks (#918 Phase 2a)
+		return 1;
 	default:
 		return 4; // safe fallback
 	}
