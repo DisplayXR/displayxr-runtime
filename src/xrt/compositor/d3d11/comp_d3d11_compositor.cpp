@@ -12,6 +12,7 @@
 #include "comp_d3d11_target.h"
 #include "util/comp_display_refresh_win.h"
 #include "comp_d3d11_renderer.h"
+#include "comp_d3d11_outcomp.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
 #include "comp_d3d11_xbridge.h"
@@ -66,6 +67,7 @@
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 
+#include <stddef.h> // offsetof — the prefix-mirror tripwire below
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +219,11 @@ struct comp_d3d11_compositor
 	//! Renderer for layer compositing.
 	struct comp_d3d11_renderer *renderer;
 
+	//! #918 Phase 2a — the masked 2D-over-3D composite, on an EXPLICIT device.
+	//! Created on the app device here (behaviour-neutral); the split points it
+	//! at the output device once the composite's inputs cross (Phase 2a-2).
+	struct comp_d3d11_outcomp *outcomp;
+
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
 
@@ -257,13 +264,6 @@ struct comp_d3d11_compositor
 	//! cleared when that mask is destroyed. NOT owned — the oxr handle owns
 	//! the mask; lifetime is guaranteed by the destroy hook clearing this.
 	struct comp_d3d11_zone_mask *active_zone_mask;
-
-	//! SRV-capable scratch snapshot of the weave target's window region, for
-	//! the authored-mask lerp (the mask path reads the weave; the target is
-	//! RTV-only). Lazily (re)allocated window-sized (#464). Removed in
-	//! Phase 3 when the weave lands in an SRV-capable RT directly.
-	ID3D11Texture2D *weave_scratch;
-	ID3D11ShaderResourceView *weave_scratch_srv;
 
 	//! #439 Phase 3 — runtime-owned flatten target (RT+SRV) the masked
 	//! composite reads as `twod` when the frame carries
@@ -519,6 +519,33 @@ struct comp_d3d11_compositor
 	//! u_capture_intent.h.
 	struct u_capture_intent capture_intent;
 };
+
+/*
+ * TRIPWIRE for the prefix mirror in comp_d3d11_renderer.cpp.
+ *
+ * That file re-declares this struct's first five members as
+ * `comp_d3d11_compositor_internals` and reinterpret_casts a
+ * comp_d3d11_compositor* onto it to reach device/context/dxgi_factory from a
+ * TU that cannot see the real definition. Inserting ANY member into that
+ * prefix would shift the mirror and hand the renderer the wrong pointer,
+ * silently. The mirror itself cannot assert (it has no view of the real
+ * struct), so the assertion lives here, where the real struct IS visible: the
+ * prefix must be `base` followed by four naturally-packed pointers, in that
+ * order. Adding a member anywhere AFTER dxgi_factory is fine and fires
+ * nothing — that is the documented place to grow (#918 appended out_dev &co
+ * below mt_lock for exactly this reason).
+ */
+static_assert(offsetof(struct comp_d3d11_compositor, xdev) == sizeof(struct xrt_compositor_native),
+              "comp_d3d11_renderer.cpp's prefix mirror expects xdev right after base");
+static_assert(offsetof(struct comp_d3d11_compositor, device) ==
+                  offsetof(struct comp_d3d11_compositor, xdev) + sizeof(void *),
+              "comp_d3d11_renderer.cpp's prefix mirror expects device right after xdev");
+static_assert(offsetof(struct comp_d3d11_compositor, context) ==
+                  offsetof(struct comp_d3d11_compositor, device) + sizeof(void *),
+              "comp_d3d11_renderer.cpp's prefix mirror expects context right after device");
+static_assert(offsetof(struct comp_d3d11_compositor, dxgi_factory) ==
+                  offsetof(struct comp_d3d11_compositor, context) + sizeof(void *),
+              "comp_d3d11_renderer.cpp's prefix mirror expects dxgi_factory right after context");
 
 /*
  *
@@ -3277,6 +3304,10 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		comp_d3d11_renderer_destroy(&c->renderer);
 	}
 
+	// #918 Phase 2a: after the renderer (nothing else references it) and
+	// before the devices below — it borrows one of them.
+	comp_d3d11_outcomp_destroy(&c->outcomp);
+
 	if (c->target != nullptr) {
 		comp_d3d11_target_destroy(&c->target);
 	}
@@ -4076,6 +4107,22 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	/*
+	 * #918 Phase 2a — the masked 2D-over-3D composite unit. Created on the APP
+	 * device whether or not the split is active, which is exactly what the
+	 * renderer used to do with these same shaders and states: this PR only
+	 * makes the device a parameter. Phase 2a-2 flips it to the output device
+	 * once the composite's inputs cross the bridge.
+	 *
+	 * Fatal on failure, like the renderer's shader compile it replaces.
+	 */
+	xret = comp_d3d11_outcomp_create(c->device, c->context, &c->outcomp);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Failed to create the D3D11 output composite unit");
+		d3d11_compositor_destroy(&c->base.base);
+		return xret;
+	}
+
+	/*
 	 * #918 STAGE B — right-size the egress ring and bind the ingress, now that
 	 * the DP factory has returned and the vendor's ~200 ms async weaver create
 	 * is running in the background. A failure here is NOT fatal: Stage A already
@@ -4299,14 +4346,8 @@ d3d11_release_zone_state(struct comp_d3d11_compositor *c)
 	c->feather_mask_w = 0;
 	c->feather_mask_h = 0;
 	c->feather_rect_count = 0;
-	if (c->weave_scratch_srv != nullptr) {
-		c->weave_scratch_srv->Release();
-		c->weave_scratch_srv = nullptr;
-	}
-	if (c->weave_scratch != nullptr) {
-		c->weave_scratch->Release();
-		c->weave_scratch = nullptr;
-	}
+	// (#918 Phase 2a: the weave scratch moved to comp_d3d11_outcomp, which
+	// owns it on the composite's device and releases it in its own destroy.)
 
 	// #439 Phase 3 — runtime-owned Local2D flatten scratch + implicit mask.
 	if (c->local2d_scratch_rtv != nullptr) {
@@ -4462,66 +4503,17 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	}
 }
 
-// (Re)allocate an SRV-capable DEFAULT-usage scratch texture + SRV to the
-// given dims/format (no-op when it already matches). Returns false on
-// allocation failure (with *tex/*srv released and nulled).
+// #439 Phase 3 — like comp_d3d11_outcomp's SRV-only scratch but
+// RENDER_TARGET-capable, so the Local2D flatten can draw into it before the
+// masked composite samples it. Keeps the SRV and RTV in lockstep (both
+// (re)created on dims/format change). Kept separate from the weave snapshot's
+// allocator so that one stays SRV-only (no wasted RT bind on a pure snapshot).
+//
+// #918: the device is explicit — this scratch is written by the Local2D
+// flatten (app device today) and read by the composite, so which device owns
+// it is a decision, not a detail. Callers pass c->device.
 static bool
-d3d11_ensure_srv_scratch(struct comp_d3d11_compositor *c,
-                         ID3D11Texture2D **tex,
-                         ID3D11ShaderResourceView **srv,
-                         uint32_t w,
-                         uint32_t h,
-                         DXGI_FORMAT fmt,
-                         const char *what)
-{
-	bool need_alloc = *tex == nullptr;
-	if (!need_alloc) {
-		D3D11_TEXTURE2D_DESC cur;
-		(*tex)->GetDesc(&cur);
-		need_alloc = (cur.Width != w || cur.Height != h || cur.Format != fmt);
-	}
-	if (!need_alloc) {
-		return true;
-	}
-	if (*srv != nullptr) {
-		(*srv)->Release();
-		*srv = nullptr;
-	}
-	if (*tex != nullptr) {
-		(*tex)->Release();
-		*tex = nullptr;
-	}
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = w;
-	td.Height = h;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = fmt;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	HRESULT hr = c->device->CreateTexture2D(&td, nullptr, tex);
-	if (FAILED(hr) || *tex == nullptr) {
-		U_LOG_W("%s: scratch alloc (%ux%u fmt=%u) failed: 0x%08x", what, w, h, fmt, hr);
-		return false;
-	}
-	hr = c->device->CreateShaderResourceView(*tex, nullptr, srv);
-	if (FAILED(hr) || *srv == nullptr) {
-		U_LOG_W("%s: scratch SRV failed: 0x%08x", what, hr);
-		(*tex)->Release();
-		*tex = nullptr;
-		return false;
-	}
-	return true;
-}
-
-// #439 Phase 3 — like d3d11_ensure_srv_scratch but RENDER_TARGET-capable, so
-// the Local2D flatten can draw into it before the masked composite samples it.
-// Keeps the SRV and RTV in lockstep (both (re)created on dims/format change).
-// Kept separate from d3d11_ensure_srv_scratch so weave_scratch stays SRV-only
-// (no wasted RT bind on a pure snapshot).
-static bool
-d3d11_ensure_rt_srv_scratch(struct comp_d3d11_compositor *c,
+d3d11_ensure_rt_srv_scratch(ID3D11Device *device,
                             ID3D11Texture2D **tex,
                             ID3D11ShaderResourceView **srv,
                             ID3D11RenderTargetView **rtv,
@@ -4560,19 +4552,19 @@ d3d11_ensure_rt_srv_scratch(struct comp_d3d11_compositor *c,
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-	HRESULT hr = c->device->CreateTexture2D(&td, nullptr, tex);
+	HRESULT hr = device->CreateTexture2D(&td, nullptr, tex);
 	if (FAILED(hr) || *tex == nullptr) {
 		U_LOG_W("%s: RT scratch alloc (%ux%u fmt=%u) failed: 0x%08x", what, w, h, fmt, hr);
 		return false;
 	}
-	hr = c->device->CreateShaderResourceView(*tex, nullptr, srv);
+	hr = device->CreateShaderResourceView(*tex, nullptr, srv);
 	if (FAILED(hr) || *srv == nullptr) {
 		U_LOG_W("%s: RT scratch SRV failed: 0x%08x", what, hr);
 		(*tex)->Release();
 		*tex = nullptr;
 		return false;
 	}
-	hr = c->device->CreateRenderTargetView(*tex, nullptr, rtv);
+	hr = device->CreateRenderTargetView(*tex, nullptr, rtv);
 	if (FAILED(hr) || *rtv == nullptr) {
 		U_LOG_W("%s: RT scratch RTV failed: 0x%08x", what, hr);
 		(*srv)->Release();
@@ -4592,8 +4584,13 @@ d3d11_ensure_rt_srv_scratch(struct comp_d3d11_compositor *c,
 // Re-rasters only when the rect set or dims change (the common steady-state
 // frame reuses the staged SRV). Returns the staged SRV (sampled by the
 // composite) or nullptr on failure. Caller holds c->mutex.
+// #918: device/context are EXPLICIT. Every input of this raster is CPU-side
+// (rects, dims), so the mask can be built on whichever device consumes it —
+// which is the property Phase 2a-2 relies on. Callers pass c->device/c->context.
 static ID3D11ShaderResourceView *
 d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
+                           ID3D11Device *device,
+                           ID3D11DeviceContext *context,
                            const struct xrt_rect *rects,
                            uint32_t rect_count,
                            uint32_t w,
@@ -4647,17 +4644,17 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->implicit_mask_tex);
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &c->implicit_mask_tex);
 		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
-			hr = c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr, &c->implicit_mask_rtv);
+			hr = device->CreateRenderTargetView(c->implicit_mask_tex, nullptr, &c->implicit_mask_rtv);
 		}
 		if (SUCCEEDED(hr) && c->implicit_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = c->device->CreateTexture2D(&td, nullptr, &c->implicit_mask_staged);
+			hr = device->CreateTexture2D(&td, nullptr, &c->implicit_mask_staged);
 		}
 		if (SUCCEEDED(hr) && c->implicit_mask_staged != nullptr) {
-			hr = c->device->CreateShaderResourceView(c->implicit_mask_staged, nullptr,
-			                                         &c->implicit_mask_staged_srv);
+			hr = device->CreateShaderResourceView(c->implicit_mask_staged, nullptr,
+			                                      &c->implicit_mask_staged_srv);
 		}
 		if (FAILED(hr) || c->implicit_mask_staged_srv == nullptr) {
 			U_LOG_E("implicit zone mask: D3D resource creation failed: 0x%08x", hr);
@@ -4682,10 +4679,10 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 	// Raster: M=1 (keep weave) everywhere, then M=0 (show 2D) inside each
 	// clamped layer rect — the inverse of zone_mask_set_rects.
 	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(c->implicit_mask_rtv, all_3d);
+	context->ClearRenderTargetView(c->implicit_mask_rtv, all_3d);
 
 	ID3D11DeviceContext1 *ctx1 = nullptr;
-	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	HRESULT hr = context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("implicit zone mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
 		return nullptr;
@@ -4718,7 +4715,7 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 
 	// Stage the snapshot the composite samples (RT≠SRV; same decouple as the
 	// explicit mask's submit).
-	c->context->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+	context->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
 
 	// Cache the rect set for the next frame's dirty-check.
 	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
@@ -4742,8 +4739,13 @@ d3d11_update_implicit_mask(struct comp_d3d11_compositor *c,
 // the two never coexist in one frame but lifetimes differ). Dirty-checked on
 // the rect set + dims; bumps c->zone_publish_seq on re-raster. Caller holds
 // c->mutex. Returns the staged SRV or nullptr on failure.
+// #918: device/context are EXPLICIT. Every input of this raster is CPU-side
+// (rects, dims), so the mask can be built on whichever device consumes it —
+// which is the property Phase 2a-2 relies on. Callers pass c->device/c->context.
 static ID3D11ShaderResourceView *
 d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
+                            ID3D11Device *device,
+                            ID3D11DeviceContext *context,
                             const struct xrt_rect *rects,
                             uint32_t rect_count,
                             uint32_t w,
@@ -4809,17 +4811,16 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->wish_mask_tex);
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &c->wish_mask_tex);
 		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
-			hr = c->device->CreateRenderTargetView(c->wish_mask_tex, nullptr, &c->wish_mask_rtv);
+			hr = device->CreateRenderTargetView(c->wish_mask_tex, nullptr, &c->wish_mask_rtv);
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = c->device->CreateTexture2D(&td, nullptr, &c->wish_mask_staged);
+			hr = device->CreateTexture2D(&td, nullptr, &c->wish_mask_staged);
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
-			hr = c->device->CreateShaderResourceView(c->wish_mask_staged, nullptr,
-			                                         &c->wish_mask_staged_srv);
+			hr = device->CreateShaderResourceView(c->wish_mask_staged, nullptr, &c->wish_mask_staged_srv);
 		}
 		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
 			U_LOG_E("zone wish mask: D3D resource creation failed: 0x%08x", hr);
@@ -4842,10 +4843,10 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 	}
 
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(c->wish_mask_rtv, all_off);
+	context->ClearRenderTargetView(c->wish_mask_rtv, all_off);
 
 	ID3D11DeviceContext1 *ctx1 = nullptr;
-	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	HRESULT hr = context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("zone wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
 		return nullptr;
@@ -4876,7 +4877,7 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 	}
 	ctx1->Release();
 
-	c->context->CopyResource(c->wish_mask_staged, c->wish_mask_tex);
+	context->CopyResource(c->wish_mask_staged, c->wish_mask_tex);
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
@@ -4901,8 +4902,13 @@ d3d11_update_zone_wish_mask(struct comp_d3d11_compositor *c,
 // Dirty-checked on the rect set + radii + dims. Caller holds c->mutex.
 // Returns the staged SRV or nullptr on failure (caller falls back to the
 // binary mask — hard edges, never a lost frame).
+// #918: device/context are EXPLICIT. Every input of this raster is CPU-side
+// (rects, dims), so the mask can be built on whichever device consumes it —
+// which is the property Phase 2a-2 relies on. Callers pass c->device/c->context.
 static ID3D11ShaderResourceView *
 d3d11_update_zone_feather_mask(struct comp_d3d11_compositor *c,
+                               ID3D11Device *device,
+                               ID3D11DeviceContext *context,
                                const struct xrt_rect *rects,
                                const float *feather_px,
                                uint32_t rect_count,
@@ -4954,17 +4960,17 @@ d3d11_update_zone_feather_mask(struct comp_d3d11_compositor *c,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &c->feather_mask_tex);
+		HRESULT hr = device->CreateTexture2D(&td, nullptr, &c->feather_mask_tex);
 		if (SUCCEEDED(hr) && c->feather_mask_tex != nullptr) {
-			hr = c->device->CreateRenderTargetView(c->feather_mask_tex, nullptr, &c->feather_mask_rtv);
+			hr = device->CreateRenderTargetView(c->feather_mask_tex, nullptr, &c->feather_mask_rtv);
 		}
 		if (SUCCEEDED(hr) && c->feather_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = c->device->CreateTexture2D(&td, nullptr, &c->feather_mask_staged);
+			hr = device->CreateTexture2D(&td, nullptr, &c->feather_mask_staged);
 		}
 		if (SUCCEEDED(hr) && c->feather_mask_staged != nullptr) {
-			hr = c->device->CreateShaderResourceView(c->feather_mask_staged, nullptr,
-			                                         &c->feather_mask_staged_srv);
+			hr = device->CreateShaderResourceView(c->feather_mask_staged, nullptr,
+			                                      &c->feather_mask_staged_srv);
 		}
 		if (FAILED(hr) || c->feather_mask_staged_srv == nullptr) {
 			U_LOG_E("zone feather mask: D3D resource creation failed: 0x%08x", hr);
@@ -4987,10 +4993,10 @@ d3d11_update_zone_feather_mask(struct comp_d3d11_compositor *c,
 	}
 
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(c->feather_mask_rtv, all_off);
+	context->ClearRenderTargetView(c->feather_mask_rtv, all_off);
 
 	ID3D11DeviceContext1 *ctx1 = nullptr;
-	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	HRESULT hr = context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("zone feather mask: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
 		return nullptr;
@@ -5049,7 +5055,7 @@ d3d11_update_zone_feather_mask(struct comp_d3d11_compositor *c,
 	}
 	ctx1->Release();
 
-	c->context->CopyResource(c->feather_mask_staged, c->feather_mask_tex);
+	context->CopyResource(c->feather_mask_staged, c->feather_mask_tex);
 
 	memcpy(c->feather_rects, rects, sizeof(rects[0]) * rect_count);
 	memcpy(c->feather_radii, feather_px, sizeof(feather_px[0]) * rect_count);
@@ -5093,7 +5099,7 @@ d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 		}
 		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 	}
-	d3d11_update_zone_wish_mask(c, rects, rect_count, w, h);
+	d3d11_update_zone_wish_mask(c, c->device, c->context, rects, rect_count, w, h);
 
 	if (c->frame_wish != nullptr) {
 		struct comp_d3d11_zone_mask *fw = c->frame_wish;
@@ -5284,8 +5290,9 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	}
 
 	// Premultiplied RGBA, UNORM (sRGB-passthrough) like local2d_scratch.
-	if (!d3d11_ensure_rt_srv_scratch(c, &c->backdrop_scratch, &c->backdrop_scratch_srv, &c->backdrop_scratch_rtv,
-	                                 region_w, region_h, DXGI_FORMAT_R8G8B8A8_UNORM, "backdrop scratch")) {
+	if (!d3d11_ensure_rt_srv_scratch(c->device, &c->backdrop_scratch, &c->backdrop_scratch_srv,
+	                                 &c->backdrop_scratch_rtv, region_w, region_h, DXGI_FORMAT_R8G8B8A8_UNORM,
+	                                 "backdrop scratch")) {
 		return nullptr;
 	}
 
@@ -5358,7 +5365,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		return false;
 	}
 	if ((!is_repaint && !zones_frame && !have_explicit && !have_local_2d) || dst == nullptr ||
-	    c->renderer == nullptr) {
+	    c->renderer == nullptr || c->outcomp == nullptr) {
 		c->repaint.composite_bail = 2;
 		return false;
 	}
@@ -5429,8 +5436,8 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			zrects[zcount++] = c->layer_accum.layers[i].data.zone_3d.rect;
 		}
 		if (any_feather) {
-			ID3D11ShaderResourceView *fsrv =
-			    d3d11_update_zone_feather_mask(c, zrects, zfeather, zcount, region_w, region_h);
+			ID3D11ShaderResourceView *fsrv = d3d11_update_zone_feather_mask(
+			    c, c->device, c->context, zrects, zfeather, zcount, region_w, region_h);
 			if (fsrv != nullptr) {
 				mask_srv = fsrv;
 			} // raster failure: binary fallback — hard edges, never a lost frame
@@ -5449,7 +5456,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 			}
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
-		mask_srv = d3d11_update_implicit_mask(c, rects, rect_count, region_w, region_h);
+		mask_srv = d3d11_update_implicit_mask(c, c->device, c->context, rects, rect_count, region_w, region_h);
 	}
 	if (mask_srv == nullptr) {
 		c->repaint.composite_bail = 3;
@@ -5467,14 +5474,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		// operate on plain UNORM bytes (sRGB-passthrough), so both scratches
 		// use the UNORM sibling of the dst format — no implicit gamma.
 		DXGI_FORMAT unorm_fmt = d3d_dxgi_format_srgb_to_unorm(dd.Format);
-		if (!d3d11_ensure_rt_srv_scratch(c, &c->local2d_scratch, &c->local2d_scratch_srv,
+		if (!d3d11_ensure_rt_srv_scratch(c->device, &c->local2d_scratch, &c->local2d_scratch_srv,
 		                                 &c->local2d_scratch_rtv, region_w, region_h, unorm_fmt,
 		                                 "local2d scratch")) {
 			c->repaint.composite_bail = 4;
 			return false;
 		}
-		if (!d3d11_ensure_srv_scratch(c, &c->weave_scratch, &c->weave_scratch_srv, region_w, region_h,
-		                              unorm_fmt, "local2d weave")) {
+		if (!comp_d3d11_outcomp_ensure_weave_scratch(c->outcomp, region_w, region_h, (uint32_t)unorm_fmt)) {
 			c->repaint.composite_bail = 5;
 			return false;
 		}
@@ -5522,9 +5528,10 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	}
 
 	// Snapshot the window region of the weave (the DP wrote dst; RT≠SRV, so
-	// the lerp reads this copy — impl doc §3 step 2).
-	D3D11_BOX sbox = {0, 0, 0, region_w, region_h, 1};
-	c->context->CopySubresourceRegion(c->weave_scratch, 0, 0, 0, 0, dst, 0, &sbox);
+	// the lerp reads this copy — impl doc §3 step 2). Owned by the composite
+	// unit: source and destination are both its device's (#918 Phase 2a).
+	ID3D11ShaderResourceView *weave_srv = static_cast<ID3D11ShaderResourceView *>(
+	    comp_d3d11_outcomp_snapshot_weave(c->outcomp, dst, region_w, region_h));
 
 	// Effective canvas rect clamped to the window region (the shader ignores
 	// it on the mask path; kept coherent for the CB anyway). #439 Phase 2:
@@ -5565,9 +5572,9 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// flattened gate already completed against the captured desktop) and
 	// emits α=1. Opaque sessions keep today's behavior even with the env set.
 	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
-	xrt_result_t xret = comp_d3d11_renderer_composite_2d_masked(
-	    c->renderer, dst, twod_srv, mask_srv, c->weave_scratch_srv, region_w, region_h, (int32_t)cx_u,
-	    (int32_t)cy_u, cright - cx_u, cbottom - cy_u, composite_mode, opaque_present);
+	xrt_result_t xret = comp_d3d11_outcomp_composite_2d_masked(
+	    c->outcomp, dst, twod_srv, mask_srv, weave_srv, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u,
+	    cright - cx_u, cbottom - cy_u, composite_mode, opaque_present);
 
 	// One-shot lifecycle log (NOT per-frame): proves the masked composite ran +
 	// which mask source and mode resolved. WARN so it survives the hot-path
@@ -5583,6 +5590,127 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// #876 diag: 0 = composited, 6 = the draw itself failed.
 	c->repaint.composite_bail = (xret == XRT_SUCCESS) ? 0 : 6;
 	return xret == XRT_SUCCESS;
+}
+
+// #918: the authored-mask resource set, allocated on an EXPLICIT device.
+// A Tier-3 mask is drawn by the APP through the returned RTV, so this one is
+// pinned to the app device — but naming the device at the call site is what
+// makes that a stated rule instead of an accident of which struct member was
+// in scope. Callers pass c->device / c->context.
+static xrt_result_t
+d3d11_zone_mask_alloc(
+    ID3D11Device *device, ID3D11DeviceContext *context, uint32_t w, uint32_t h, struct comp_d3d11_zone_mask **out_mask)
+{
+	struct comp_d3d11_zone_mask *mask = U_TYPED_CALLOC(struct comp_d3d11_zone_mask);
+	if (mask == nullptr) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	mask->w = w;
+	mask->h = h;
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET;
+	HRESULT hr = device->CreateTexture2D(&td, nullptr, &mask->tex);
+	if (SUCCEEDED(hr) && mask->tex != nullptr) {
+		hr = device->CreateRenderTargetView(mask->tex, nullptr, &mask->rtv);
+	}
+	if (SUCCEEDED(hr) && mask->rtv != nullptr) {
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		hr = device->CreateTexture2D(&td, nullptr, &mask->staged);
+	}
+	if (SUCCEEDED(hr) && mask->staged != nullptr) {
+		hr = device->CreateShaderResourceView(mask->staged, nullptr, &mask->staged_srv);
+	}
+	if (FAILED(hr) || mask->staged_srv == nullptr) {
+		U_LOG_E("zone_mask_create: D3D resource creation failed: 0x%08x", hr);
+		if (mask->staged != nullptr) {
+			mask->staged->Release();
+		}
+		if (mask->rtv != nullptr) {
+			mask->rtv->Release();
+		}
+		if (mask->tex != nullptr) {
+			mask->tex->Release();
+		}
+		free(mask);
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	// Default to all-3D (M=1): an unauthored-but-submitted mask degrades to
+	// the full weave (the no-2D-declared analog), never a blanked canvas.
+	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	context->ClearRenderTargetView(mask->rtv, all_3d);
+	context->CopyResource(mask->staged, mask->tex);
+
+	*out_mask = mask;
+	return XRT_SUCCESS;
+}
+
+// #918 — Tier-1 authoring (whole mask 3D or 2D) on an EXPLICIT context.
+static void
+d3d11_zone_mask_fill_whole(ID3D11DeviceContext *context, struct comp_d3d11_zone_mask *mask, bool enable_3d)
+{
+	const float m[4] = {enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
+	context->ClearRenderTargetView(mask->rtv, m);
+	mask->author_seq++;
+}
+
+// #918 — Tier-2 authoring (M=1 inside each rect) on an EXPLICIT context. The
+// fourth mask rasterizer; like the other three its inputs are pure CPU rects.
+static xrt_result_t
+d3d11_zone_mask_fill_rects(ID3D11DeviceContext *context,
+                           struct comp_d3d11_zone_mask *mask,
+                           uint32_t count,
+                           const struct xrt_rect *rects)
+{
+	// M=0 everywhere, then M=1 inside each rect (client-window px, clamped).
+	const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	context->ClearRenderTargetView(mask->rtv, all_2d);
+
+	// ID3D11DeviceContext1::ClearView with rects — D3D11.1, present on every
+	// Win10/11 driver this runtime targets.
+	ID3D11DeviceContext1 *ctx1 = nullptr;
+	HRESULT hr = context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
+	if (FAILED(hr) || ctx1 == nullptr) {
+		U_LOG_E("zone_mask_set_rects: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+	for (uint32_t i = 0; i < count; i++) {
+		int32_t left = rects[i].offset.w;
+		int32_t top = rects[i].offset.h;
+		int32_t right = left + rects[i].extent.w;
+		int32_t bottom = top + rects[i].extent.h;
+		// Clamp to the mask; skip fully-outside / degenerate rects.
+		if (left < 0) {
+			left = 0;
+		}
+		if (top < 0) {
+			top = 0;
+		}
+		if (right > (int32_t)mask->w) {
+			right = (int32_t)mask->w;
+		}
+		if (bottom > (int32_t)mask->h) {
+			bottom = (int32_t)mask->h;
+		}
+		if (right <= left || bottom <= top) {
+			continue;
+		}
+		D3D11_RECT dr = {left, top, right, bottom};
+		ctx1->ClearView(mask->rtv, all_3d, &dr, 1);
+	}
+	ctx1->Release();
+	mask->author_seq++;
+	return XRT_SUCCESS;
 }
 
 extern "C" xrt_result_t
@@ -5617,53 +5745,11 @@ comp_d3d11_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	struct comp_d3d11_zone_mask *mask = U_TYPED_CALLOC(struct comp_d3d11_zone_mask);
-	if (mask == nullptr) {
-		return XRT_ERROR_ALLOCATION;
+	struct comp_d3d11_zone_mask *mask = nullptr;
+	xrt_result_t xret = d3d11_zone_mask_alloc(c->device, c->context, w, h, &mask);
+	if (xret != XRT_SUCCESS) {
+		return xret;
 	}
-	mask->w = w;
-	mask->h = h;
-
-	D3D11_TEXTURE2D_DESC td = {};
-	td.Width = w;
-	td.Height = h;
-	td.MipLevels = 1;
-	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8_UNORM;
-	td.SampleDesc.Count = 1;
-	td.Usage = D3D11_USAGE_DEFAULT;
-	td.BindFlags = D3D11_BIND_RENDER_TARGET;
-	HRESULT hr = c->device->CreateTexture2D(&td, nullptr, &mask->tex);
-	if (SUCCEEDED(hr) && mask->tex != nullptr) {
-		hr = c->device->CreateRenderTargetView(mask->tex, nullptr, &mask->rtv);
-	}
-	if (SUCCEEDED(hr) && mask->rtv != nullptr) {
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		hr = c->device->CreateTexture2D(&td, nullptr, &mask->staged);
-	}
-	if (SUCCEEDED(hr) && mask->staged != nullptr) {
-		hr = c->device->CreateShaderResourceView(mask->staged, nullptr, &mask->staged_srv);
-	}
-	if (FAILED(hr) || mask->staged_srv == nullptr) {
-		U_LOG_E("zone_mask_create: D3D resource creation failed: 0x%08x", hr);
-		if (mask->staged != nullptr) {
-			mask->staged->Release();
-		}
-		if (mask->rtv != nullptr) {
-			mask->rtv->Release();
-		}
-		if (mask->tex != nullptr) {
-			mask->tex->Release();
-		}
-		free(mask);
-		return XRT_ERROR_ALLOCATION;
-	}
-
-	// Default to all-3D (M=1): an unauthored-but-submitted mask degrades to
-	// the full weave (the no-2D-declared analog), never a blanked canvas.
-	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(mask->rtv, all_3d);
-	c->context->CopyResource(mask->staged, mask->tex);
 
 	// One-off lifecycle event (WARN per the debug-logging convention so it
 	// survives the hot-path INFO filter).
@@ -5683,9 +5769,7 @@ comp_d3d11_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	const float m[4] = {enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(mask->rtv, m);
-	mask->author_seq++;
+	d3d11_zone_mask_fill_whole(c->context, mask, enable_3d);
 	return XRT_SUCCESS;
 }
 
@@ -5703,47 +5787,7 @@ comp_d3d11_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	// M=0 everywhere, then M=1 inside each rect (client-window px, clamped).
-	const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->context->ClearRenderTargetView(mask->rtv, all_2d);
-
-	// ID3D11DeviceContext1::ClearView with rects — D3D11.1, present on every
-	// Win10/11 driver this runtime targets.
-	ID3D11DeviceContext1 *ctx1 = nullptr;
-	HRESULT hr = c->context->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&ctx1));
-	if (FAILED(hr) || ctx1 == nullptr) {
-		U_LOG_E("zone_mask_set_rects: ID3D11DeviceContext1 unavailable (hr=0x%08x)", hr);
-		return XRT_ERROR_D3D;
-	}
-
-	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-	for (uint32_t i = 0; i < count; i++) {
-		int32_t left = rects[i].offset.w;
-		int32_t top = rects[i].offset.h;
-		int32_t right = left + rects[i].extent.w;
-		int32_t bottom = top + rects[i].extent.h;
-		// Clamp to the mask; skip fully-outside / degenerate rects.
-		if (left < 0) {
-			left = 0;
-		}
-		if (top < 0) {
-			top = 0;
-		}
-		if (right > (int32_t)mask->w) {
-			right = (int32_t)mask->w;
-		}
-		if (bottom > (int32_t)mask->h) {
-			bottom = (int32_t)mask->h;
-		}
-		if (right <= left || bottom <= top) {
-			continue;
-		}
-		D3D11_RECT dr = {left, top, right, bottom};
-		ctx1->ClearView(mask->rtv, all_3d, &dr, 1);
-	}
-	ctx1->Release();
-	mask->author_seq++;
-	return XRT_SUCCESS;
+	return d3d11_zone_mask_fill_rects(c->context, mask, count, rects);
 }
 
 extern "C" xrt_result_t
