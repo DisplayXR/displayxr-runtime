@@ -431,6 +431,56 @@ one, so an Arch-A app, a second Arch-A app and an Arch-C present-owner can weave
 concurrently on one panel. D5's vendor-neutral visibility (L7) is still the
 outstanding item for A; it is unaffected by the merge.
 
+## Amendment (2026-08-20) — D5 is a *hard prerequisite* for Architecture A, not a tidiness goal (#1079)
+
+D5 framed the vendor `<queries><package>` lines as an ergonomics problem: they are
+vendor names leaking into a neutral client manifest, and a neutral intent action
+would remove them. That framing understated the stakes. **Without those lines an
+in-process app does not degrade — it dies.**
+
+**The failure.** Package visibility is enforced per *calling uid*. Out-of-process
+the vendor DP ran in the runtime service's uid, whose manifest declares the vendor
+service packages, so a client manifest never needed them. In-process (D2) the
+identical code runs in the **app's** uid. The vendor core loader calls
+`PackageManager.getPackageInfo(<vendor service>)`, gets `NameNotFoundException`,
+**does not clear it**, and makes one more JNI call with the resulting NULL
+jobject — which trips CheckJNI and aborts the process from inside closed vendor
+code, at `xrCreateSession`. The stack names `GetObjectClass` inside the vendor
+core loader and mentions neither a package nor a manifest.
+
+Note what this is *not*: `createPackageContext(<runtime pkg>, INCLUDE_CODE |
+IGNORE_SECURITY)` (D2's class-host Context, #1061) fixes class **loading** only.
+It transfers no visibility, and cannot — visibility is a property of the uid, and
+the uid is the app's by construction under Architecture A. The runtime cannot
+grant it on the app's behalf.
+
+**What changed here.** Three layers, because no single one of them suffices:
+
+1. **The app declares the packages.** This is the actual unblocker and it can
+   only live in the client manifest. Every Android demo now carries the same two
+   `<package>` lines the runtime's own test apps have carried since #1037.
+2. **The runtime stops contributing pending exceptions.** `context_package_name`
+   now NULL-checks its Context and clears any inherited pending exception before
+   `GetObjectClass`. Under CheckJNI either condition is an abort, not an error
+   return — so this is about the runtime never being the component that turns
+   someone else's unhandled exception into *our* crash.
+3. **The runtime lets a plug-in ask first.** New host-iface slot
+   `android_package_is_visible(const char *)`
+   (`XRT_PLUGIN_HOST_HAS_ANDROID_PACKAGE_VISIBILITY`), carved out of `reserved[]`
+   exactly as `get_android_class_host_context` was — `struct_size` is unchanged,
+   the slot was previously zero, no ABI major. A plug-in should probe every
+   package its SDK will bind **before** handing control to the vendor loader, and
+   on a miss fail cleanly (the loader already degrades to no-DP) while logging the
+   exact `<package>` lines the app is missing. Once execution is inside that
+   loader nothing can be caught, so asking first is the only available defence.
+
+D5 still stands and is still worth doing — a neutral
+`org.displayxr.action.VENDOR_DISPLAY_SERVICE` action deletes layer 1 outright and
+makes layers 2 and 3 belt-and-braces. Until it lands, treat the two `<package>`
+lines as **required boilerplate for any in-process Android DisplayXR client**, and
+layer 3 as what makes forgetting them survivable and self-diagnosing rather than
+a hard abort in someone else's code.
+
 ## External dependencies (vendor asks)
 
 Tracked runtime-side in **#1038**; anchors in report §11.

@@ -466,10 +466,51 @@ struct xrt_plugin_host_iface
 	void *(*get_android_class_host_context)(void);
 
 	/*!
+	 * Answer whether an Android package is VISIBLE to the calling process,
+	 * i.e. whether `PackageManager.getPackageInfo(package_name, 0)` resolves
+	 * rather than throwing `NameNotFoundException`. Returns false when it is
+	 * not visible, when the host cannot answer, or on any JNI trouble.
+	 *
+	 * **Why this exists (runtime#1079).** Android enforces package
+	 * visibility per CALLING UID. Out-of-process the vendor display
+	 * processor ran in the runtime service's uid, whose manifest declares
+	 * the vendor service packages in its `<queries>`. In-process
+	 * (Architecture A, ADR-036 D2) the very same code runs in the APP's uid,
+	 * so visibility is now the APP's manifest to declare — and the runtime
+	 * cannot grant it on the app's behalf. `createPackageContext(...,
+	 * CONTEXT_IGNORE_SECURITY)` (@ref get_android_class_host_context) fixes
+	 * class LOADING only; it transfers no visibility.
+	 *
+	 * The failure this prevents is brutally undiagnosable without it: a
+	 * vendor core loader queries its service package, ignores the thrown
+	 * `NameNotFoundException`, and hands the resulting NULL jobject to the
+	 * next JNI call — which trips CheckJNI and ABORTS the app from inside
+	 * closed vendor code, with a stack that names neither the package nor
+	 * the manifest. Once control is inside that loader nothing can catch it,
+	 * so the only defence is to ASK FIRST: a plug-in should probe every
+	 * package its SDK will bind, and on a miss fail cleanly (the loader then
+	 * degrades to no-DP) while logging the exact `<package>` lines the app
+	 * is missing.
+	 *
+	 * The probe runs against the APP's Context — which is the whole point,
+	 * since that is the uid whose visibility decides the outcome.
+	 *
+	 * @param package_name NUL-terminated Android package name, e.g.
+	 *                     `"com.example.display.config"`. Must not be NULL.
+	 *
+	 * Carved out of the former `reserved[]` block, exactly as
+	 * @ref get_android_class_host_context was: `struct_size` is unchanged
+	 * and the slot was previously zero-initialized, so older plug-ins are
+	 * unaffected and no @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed.
+	 * Plug-ins MUST NULL-check before calling.
+	 */
+	bool (*android_package_is_visible)(const char *package_name);
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[11];
+	void *reserved[10];
 };
 
 /*!
@@ -481,6 +522,14 @@ struct xrt_plugin_host_iface
  * #1037 / ADR-036 D2.
  */
 #define XRT_PLUGIN_HOST_HAS_CLASS_HOST_CONTEXT 1
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::android_package_is_visible slot, so a plug-in that
+ * must also compile against an older runtime header (which lacks the field) can
+ * `#ifdef`-guard its use. runtime#1079 / ADR-036 D2.
+ */
+#define XRT_PLUGIN_HOST_HAS_ANDROID_PACKAGE_VISIBILITY 1
 
 /*!
  * The plug-in's vtable. Filled in by the plug-in inside its
