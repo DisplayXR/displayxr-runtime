@@ -199,28 +199,49 @@ Not possible. `SurfaceControlViewHost` lets a *host* embed a surface that the
 *guest* explicitly hands over. There is no mechanism for an unrelated
 foreground app to adopt the launcher's or another app's layer.
 
-### (c) Privileged capture — `SurfaceControl.captureDisplay` + `setExcludeLayers`
+### (c) Privileged capture — and exactly which API, at exactly which tier
 
-The mechanism that is *actually correct*: exclude our own layer by
-`SurfaceControl`, capture everything else, no feedback, no consent dialog, one
-frame of latency, and the result is genuinely "what is behind us". It needs
-`READ_FRAME_BUFFER` / `CAPTURE_VIDEO_OUTPUT` / `ACCESS_SURFACE_FLINGER` — all
-`signature`-level.
+This is the mechanism that is *actually correct*, and the sub-questions matter,
+because the obvious phrasing of the ask ("`captureDisplay` with
+`setExcludeLayers`") **does not name a real API combination**. Verified against
+AOSP `android13-release`, which is what the NP02J runs:
 
-**"System app" is not sufficient, and this is the crux.** On the NP02J those
-permissions are held only by *platform-signed* ZTE/Qualcomm services
-(`cn.nubia.gamelab`, `com.qualcomm.wfd.service`). Every Leia/CNSDK service
-(`com.leialoft.display.config`, `com.leia.headtrackingservice`,
-`com.leiainc.media.service`) ships pre-installed as SYSTEM but signed with a
-**Leia** key and holds **zero** capture permissions. So the existing vendor
-services cannot be leveraged as-is — the gate is OEM signing (ZTE), not code.
+| | `captureDisplay(DisplayCaptureArgs)` | `captureLayers(LayerCaptureArgs)` |
+|---|---|---|
+| covers the whole display | **yes**, from a display token | only the subtree under a root `SurfaceControl` |
+| `setExcludeLayers(SurfaceControl[])` | **no** — the setter is on `LayerCaptureArgs` only | **yes** |
+| `CaptureArgs.setUid(long)` | yes — *"skip any surfaces that don't belong to the specified uid"* | yes |
+| `setSize(w, h)` downscale in SurfaceFlinger | yes | via `setFrameScale` |
 
-This is nonetheless the **product** answer on a vendor 3D device, and it is
-squarely a #1038-class ask: a small vendor capture service doing
-`captureDisplay(excludeLayers=[our layer])` and shipping frames over the
-`AHardwareBuffer`-over-IPC primitive the runtime already uses. The plug-in
-receives the AHB, imports it, and fills `bg2d_view` — the Linux `bg_capture`
-shape, unchanged.
+So the only display-wide filter available anywhere is **uid *inclusion***. There
+is no exclude-uid, and the real per-layer exclusion needs a display-root
+`SurfaceControl` that only the window manager owns. **No privilege tier fixes
+this** — it is an API-shape limit, not a permission one.
+
+The permission side is worse than "needs a system app", and worse than the
+earlier draft of this note implied:
+
+| permission | protectionLevel (AOSP 13) |
+|---|---|
+| `READ_FRAME_BUFFER` | `signature\|recents` |
+| `CAPTURE_VIDEO_OUTPUT` | `signature` |
+| `ACCESS_SURFACE_FLINGER` | `signature` |
+
+**None of the three is `signature|privileged`.** That kills the usual escape
+hatch: moving an APK into `/system/priv-app` and allowlisting it in
+`privapp-permissions` grants *nothing* here. The only holders are the platform
+signature and the `recents` role. `com.leialoft.display.config` is signed with a
+**Leia** key (CN=Sean Liu) and its firmware baseline lives in `/system/app` —
+SYSTEM, not privileged — so it cannot hold capture permission on any device,
+however it is installed. Vendor code cannot close this gap; only the OEM can,
+by platform-signing the capture service or hosting it inside a component that
+already is.
+
+What that leaves as the correct vendor ask is therefore *narrower and cheaper*
+than "give us READ_FRAME_BUFFER": either (i) platform-sign a small capture
+service, or (ii) add an **exclude-uid** filter beside the existing inclusion
+filter in SurfaceFlinger's layer traversal, which is where the correct
+primitive actually belongs. Filed as L10/L12 on #1038.
 
 ### (d) Wallpaper-only compose-under
 
@@ -299,7 +320,7 @@ That reframing is what makes tier 0 worth shipping.
 |---|---|---|---|---|
 | **T0** | Runtime-supplied backdrop through the existing `set_background_2d` slot; DP composes under, gate flattens to opaque in the band | runtime (colour / still / under-Local2D stack) | static or near-static backgrounds; **the whole workspace-overlay case** | **SHIPPED** — runtime #1073, plug-in `feat/t0-android-compose-under` |
 | **T1** | MediaProjection producer behind the same seam, dev-gated | `MediaProjection` + `VirtualDisplay` (+ hidden-API layer exclusion where the ROM allows) | lab validation, A/B of the compose pass against a real background | ~1 wk, **not shippable** |
-| **T2** | Vendor-privileged `captureDisplay(excludeLayers=…)` helper, frames over `AHardwareBuffer`, into the same seam | OEM/vendor system service | everything, incl. avatar over an arbitrary app | our side ~1 wk; vendor side is the schedule |
+| **T2** | Out-of-process capture producer feeding the same seam. Consumer shipped (`comp_multi_bg2d_capture.c`, `debug.dxr.bg2d=capture`); producer shipped in the vendor display-config APK with two entry points — a bound service for the day the platform permits it, and an `app_process` daemon at shell/root uid for now | vendor service (product) / permitted-uid daemon (dev) | `once`: complete and feedback-free, correct for a static background — the avatar-over-launcher case. `uid`: single-app backgrounds. Everything else needs the OEM | our side done; vendor side is the schedule |
 
 ### T0 as built (#1073)
 
@@ -386,8 +407,39 @@ literally true: an app that submits an under-layer gets compose-under with no
   fence)` / `get_view` / `destroy`), plus a delivery throttle.
 
 **Vendor (CNSDK / OEM)**
-- The privileged capture helper of §4(c). File as a new limitation under #1038
-  rather than a separate CNSDK issue, alongside L1/L2/L7.
+- The capture helper of §4(c), in the display-config APK
+  (`leia/device/android/service/.../capture/`, branch
+  `dxr/background-capture-service`): `ILeiaBackgroundCapture` (product shape,
+  `AHardwareBuffer` + fence + seq), `BackgroundCaptureService` (honest
+  `STATUS_NO_PERMISSION` on every build today), and `CaptureDaemonMain` (the
+  tier that runs now). Feature-flagged off by default
+  (`-PleiaBackgroundCapture=true`), so a device that does not want it does not
+  have the component.
+- The remaining OEM ask — platform signature, or an exclude-uid filter — is
+  L10/L12 on #1038, not a separate CNSDK issue.
+
+### T2 as built
+
+The consumer is a **listener**, not a client: the runtime opens an abstract
+unix socket (`@displayxr.bg2d`) and a producer connects to it. A producer that
+never appears, dies, or restarts costs nothing — no frame simply means no
+background, which is byte-for-byte the pre-#1073 path, so probe and fallback
+need no handshake and no timeout.
+
+Delivery is a plain RGBA byte stream rather than an `AHardwareBuffer`, and
+deliberately: the background exists to fill the thin de-occlusion band,
+SurfaceFlinger downscales for free via `setSize`, and 512x320 at <= 10 Hz reuses
+T0's staging upload verbatim — no JNI in the vendor APK, no cross-process image
+import, no fence protocol. The zero-copy shape is specified in the AIDL for when
+the producer is in-platform and the frame rate starts to matter.
+
+Modes, and what each is honestly correct for:
+
+| `--mode` | filter | correct when |
+|---|---|---|
+| `once` | none, captured **before** the overlay exists | the background is static — the launcher. Complete (wallpaper included) and feedback-free. **The default.** |
+| `uid` | `CaptureArgs.setUid` inclusion | the background is one app's window. Drops anything another uid drew, wallpaper included |
+| `all` | none, continuous | diagnostic only — includes our own layer, so it feeds back |
 
 ### Sequencing
 

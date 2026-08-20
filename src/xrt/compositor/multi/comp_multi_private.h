@@ -425,6 +425,9 @@ struct multi_compositor
 		VkDeviceMemory bg2d_staging_memory;
 		uint32_t bg2d_w, bg2d_h;
 		bool bg2d_initialized;
+		bool bg2d_uploaded_once; //!< Has content, so a refresh transitions from SHADER_READ_ONLY.
+		bool bg2d_logged;        //!< One "backdrop uploaded" line per session, not one per frame.
+		uint32_t bg2d_seq;       //!< #1073 T2: sequence of the captured frame currently uploaded.
 		bool bg2d_failed;   //!< Latched after a failed build, so we try once.
 		//! @}
 
