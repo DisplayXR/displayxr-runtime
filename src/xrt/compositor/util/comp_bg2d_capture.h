@@ -4,7 +4,7 @@
  * @file
  * @brief  External background-capture receiver for compose-under (#1073 T2).
  * @author David Fattal
- * @ingroup comp_multi
+ * @ingroup comp_util
  *
  * Tier 2 of `docs/roadmap/android-transparency-compose-under.md`: the *real*
  * background producer. T0 draws a static backdrop in the runtime; T2 receives
@@ -70,21 +70,21 @@ extern "C" {
 #endif
 
 //! Default abstract-socket name (without the leading NUL that marks it abstract).
-#define COMP_MULTI_BG2D_CAPTURE_SOCKET "displayxr.bg2d"
+#define COMP_BG2D_CAPTURE_SOCKET "displayxr.bg2d"
 
 //! Wire magics, little-endian u32 as written by the producer.
-#define COMP_MULTI_BG2D_CAPTURE_MAGIC_HELLO 0x42525844u // 'DXRB'
-#define COMP_MULTI_BG2D_CAPTURE_MAGIC_FRAME 0x46525844u // 'DXRF'
-#define COMP_MULTI_BG2D_CAPTURE_VERSION 1u
+#define COMP_BG2D_CAPTURE_MAGIC_HELLO 0x42525844u // 'DXRB'
+#define COMP_BG2D_CAPTURE_MAGIC_FRAME 0x46525844u // 'DXRF'
+#define COMP_BG2D_CAPTURE_VERSION 1u
 
 /*!
  * One received frame, borrowed from the receiver.
  *
- * Valid only between a successful @ref comp_multi_bg2d_capture_acquire and the
- * matching @ref comp_multi_bg2d_capture_release — the receiver's lock is held
+ * Valid only between a successful @ref comp_bg2d_capture_acquire and the
+ * matching @ref comp_bg2d_capture_release — the receiver's lock is held
  * across that window, so copy or upload and get out.
  */
-struct comp_multi_bg2d_capture_frame
+struct comp_bg2d_capture_frame
 {
 	const uint8_t *pixels; //!< Tightly packed RGBA8, `width * height * 4` bytes.
 	uint32_t width;
@@ -105,7 +105,7 @@ struct comp_multi_bg2d_capture_frame
  *         if no background were configured.
  */
 bool
-comp_multi_bg2d_capture_start(const char *socket_name);
+comp_bg2d_capture_start(const char *socket_name);
 
 /*!
  * Borrow the most recent frame.
@@ -116,18 +116,18 @@ comp_multi_bg2d_capture_start(const char *socket_name);
  * @return true when a frame newer than @p last_seq is available — and *only*
  *         then, so a steady producer at 10 Hz costs one upload per delivery,
  *         not one per compositor frame. The receiver lock is held on true and
- *         must be dropped with @ref comp_multi_bg2d_capture_release.
+ *         must be dropped with @ref comp_bg2d_capture_release.
  */
 bool
-comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint32_t last_seq);
+comp_bg2d_capture_acquire(struct comp_bg2d_capture_frame *out, uint32_t last_seq);
 
-//! Release the borrow taken by a successful @ref comp_multi_bg2d_capture_acquire.
+//! Release the borrow taken by a successful @ref comp_bg2d_capture_acquire.
 void
-comp_multi_bg2d_capture_release(void);
+comp_bg2d_capture_release(void);
 
 //! Stop the receiver and free its buffers. Idempotent.
 void
-comp_multi_bg2d_capture_stop(void);
+comp_bg2d_capture_stop(void);
 
 #ifdef __cplusplus
 }

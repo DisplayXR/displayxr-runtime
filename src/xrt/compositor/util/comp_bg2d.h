@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Runtime-supplied 2D backdrop for compose-under transparency (#1073 T0).
+ * @brief  2D backdrop producer for compose-under transparency (#1073).
  * @author David Fattal
- * @ingroup comp_multi
+ * @ingroup comp_util
  *
  * Tier 0 of `docs/roadmap/android-transparency-compose-under.md`: the
  * *producer* half of compose-under on Android.
@@ -47,7 +47,48 @@
 extern "C" {
 #endif
 
-struct multi_compositor;
+/*!
+ * Everything one consumer needs to own a backdrop image.
+ *
+ * Deliberately compositor-agnostic: the backdrop is produced identically for
+ * the out-of-process `comp_multi` session path and for the in-process
+ * `comp_vk_native` one, and duplicating 600 lines of Vulkan upload to say so
+ * twice would be the only difference between them. Zero-initialise it and hand
+ * the same pointer to every call; @ref comp_bg2d_teardown returns it to that
+ * state.
+ */
+struct comp_bg2d_state
+{
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	VkBuffer staging_buffer;
+	VkDeviceMemory staging_memory;
+	uint32_t w, h;
+	bool initialized;
+	bool uploaded_once; //!< Has content, so a refresh transitions from SHADER_READ_ONLY.
+	bool logged;        //!< One "backdrop uploaded" line per consumer, not one per frame.
+	uint32_t seq;       //!< T2: delivery counter of the captured frame currently uploaded.
+
+	//! #174 — a T2 producer sends whole-PANEL pixels but slot 16 promises the
+	//! canvas, so the receiver crops. Scratch for the repack, owned here and
+	//! freed by @ref comp_bg2d_teardown; unused by T0 (runtime-drawn, already
+	//! canvas-space).
+	uint8_t *crop_scratch;
+	size_t crop_capacity;
+	bool logged_crop; //!< One "cropped to the canvas" line per consumer.
+
+	//! Canvas rect the currently-uploaded backdrop was cropped for. A T2
+	//! producer in `once`
+	//! mode sends exactly ONE frame, and it usually lands before the app has
+	//! submitted the zone layer that establishes the canvas — so "re-upload
+	//! when a newer frame arrives" alone would freeze the very first,
+	//! canvas-less mapping in place forever.
+	struct xrt_rect canvas_used;
+	bool have_canvas_used;
+	bool failed; //!< Latched after a failed build, so we try once.
+};
+
 
 /*!
  * Is a runtime-supplied backdrop configured at all?
@@ -57,7 +98,7 @@ struct multi_compositor;
  * shipping default.
  */
 bool
-comp_multi_bg2d_enabled(void);
+comp_bg2d_enabled(void);
 
 /*!
  * Lazily build this session's backdrop image and return its view, or
@@ -93,8 +134,9 @@ comp_multi_bg2d_enabled(void);
  * matches Windows/Linux, where the capture module hands the DP a window sub-rect
  * rather than the DP reverse-engineering one.
  *
- * @param      mc     Session whose `session_render` owns the resources.
+ * @param      st     Caller-owned state; zero-initialised on first use.
  * @param      vk     The compositor's Vulkan bundle.
+ * @param      cmd_pool Pool for the one-shot upload command buffer.
  * @param      canvas_on_panel Canvas rect in panel pixels, or NULL / a
  *                    degenerate rect to use the frame whole (T0 always passes
  *                    NULL — a runtime-drawn backdrop is already canvas-space).
@@ -103,20 +145,21 @@ comp_multi_bg2d_enabled(void);
  * @param[out] out_h  Backdrop height in pixels (may be NULL).
  */
 VkImageView
-comp_multi_bg2d_ensure(struct multi_compositor *mc,
-                       struct vk_bundle *vk,
-                       const struct xrt_rect *canvas_on_panel,
-                       uint32_t panel_w,
-                       uint32_t panel_h,
-                       uint32_t *out_w,
-                       uint32_t *out_h);
+comp_bg2d_ensure(struct comp_bg2d_state *st,
+                 struct vk_bundle *vk,
+                 VkCommandPool cmd_pool,
+                 const struct xrt_rect *canvas_on_panel,
+                 uint32_t panel_w,
+                 uint32_t panel_h,
+                 uint32_t *out_w,
+                 uint32_t *out_h);
 
 /*!
  * Release the backdrop image/memory/staging buffer. Idempotent; safe with a
  * NULL @p vk (matches the rest of the session_render teardown).
  */
 void
-comp_multi_bg2d_teardown(struct multi_compositor *mc, struct vk_bundle *vk);
+comp_bg2d_teardown(struct comp_bg2d_state *st, struct vk_bundle *vk);
 
 #ifdef __cplusplus
 }

@@ -27,6 +27,7 @@
 
 #include "util/u_hud.h"
 #include "util/u_pacing.h"
+#include "util/comp_bg2d.h"
 #include "util/comp_target_service.h"
 #include "multi/comp_multi_interface.h"
 
@@ -409,41 +410,14 @@ struct multi_compositor
 		bool flip_initialized;
 		//! @}
 
-		//! @name Runtime-supplied 2D backdrop (#1073 T0, compose-under)
-		//! The *producer* for base-DP slot 16 `set_background_2d`. A tiny
-		//! static solid/gradient image the runtime rasterises itself, handed
-		//! to the vendor DP before every process_atlas so it can composite the
-		//! app's mixed-alpha band over an opaque backdrop BEFORE the weave —
-		//! which is the only place a per-subpixel weave and a one-alpha-per-
-		//! pixel buffer can be reconciled. Off unless `debug.dxr.bg2d` /
-		//! `DXR_BG2D` selects a colour. See comp_multi_bg2d.h.
-		//! @{
-		VkImage bg2d_image;
-		VkDeviceMemory bg2d_memory;
-		VkImageView bg2d_view;
-		VkBuffer bg2d_staging_buffer;
-		VkDeviceMemory bg2d_staging_memory;
-		uint32_t bg2d_w, bg2d_h;
-		bool bg2d_initialized;
-		bool bg2d_uploaded_once; //!< Has content, so a refresh transitions from SHADER_READ_ONLY.
-		bool bg2d_logged;        //!< One "backdrop uploaded" line per session, not one per frame.
-		uint32_t bg2d_seq;       //!< #1073 T2: sequence of the captured frame currently uploaded.
-		//! #174 — a T2 producer sends whole-PANEL pixels but slot 16 promises the
-		//! canvas, so the receiver crops. Scratch for the repack, owned here and
-		//! freed by comp_multi_bg2d_teardown; unused by T0 (runtime-drawn, already
-		//! canvas-space).
-		uint8_t *bg2d_crop_scratch;
-		size_t bg2d_crop_capacity;
-		bool bg2d_logged_crop; //!< One "cropped to the canvas" line per session.
-		//! Canvas rect the currently-uploaded backdrop was cropped for. A T2
-		//! producer in `once` mode sends exactly ONE frame, and it usually lands
-		//! before the app has submitted the zone layer that establishes the
-		//! canvas — so "re-upload when a newer frame arrives" alone would freeze
-		//! the very first, canvas-less mapping in place forever.
-		struct xrt_rect bg2d_canvas_used;
-		bool bg2d_have_canvas_used;
-		bool bg2d_failed;   //!< Latched after a failed build, so we try once.
-		//! @}
+		//! Runtime-supplied 2D backdrop (#1073, compose-under). The *producer*
+		//! for base-DP slot 16 `set_background_2d`: an image handed to the vendor
+		//! DP before every process_atlas so it can composite the app's mixed-alpha
+		//! band over an opaque backdrop BEFORE the weave — which is the only place
+		//! a per-subpixel weave and a one-alpha-per-pixel buffer can be
+		//! reconciled. Off unless `debug.dxr.bg2d` / `DXR_BG2D` selects a source.
+		//! See util/comp_bg2d.h.
+		struct comp_bg2d_state bg2d;
 
 #ifdef XRT_OS_WINDOWS
 		//! Self-created window when no external HWND provided (Windows only)

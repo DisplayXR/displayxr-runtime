@@ -34,7 +34,7 @@
 
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_workspace.h"
-#include "multi/comp_multi_bg2d.h"
+#include "util/comp_bg2d.h"
 #include "main/comp_target.h"
 
 // Vulkan helpers needed for Y-flip SBS cleanup (not Leia-specific)
@@ -1496,7 +1496,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		u_hud_destroy(&mc->session_render.hud);
 
 		// #1073 T0: release the runtime-supplied compose-under backdrop.
-		comp_multi_bg2d_teardown(mc, vk);
+		comp_bg2d_teardown(&mc->session_render.bg2d, vk);
 
 		// Destroy workspace chrome blend (#48) — its own flag, independent of
 		// the HUD (chrome can be present without the FPS HUD being enabled).

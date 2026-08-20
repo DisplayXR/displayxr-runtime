@@ -4,14 +4,14 @@
  * @file
  * @brief  External background-capture receiver for compose-under (#1073 T2).
  * @author David Fattal
- * @ingroup comp_multi
+ * @ingroup comp_util
  *
- * See comp_multi_bg2d_capture.h for the protocol and for why the runtime is the
+ * See comp_bg2d_capture.h for the protocol and for why the runtime is the
  * listener. This file is just the socket: accept one producer, read frames,
  * keep the newest.
  */
 
-#include "comp_multi_bg2d_capture.h"
+#include "comp_bg2d_capture.h"
 
 #include "os/os_threading.h"
 #include "util/u_logging.h"
@@ -41,14 +41,14 @@
  */
 
 bool
-comp_multi_bg2d_capture_start(const char *socket_name)
+comp_bg2d_capture_start(const char *socket_name)
 {
 	(void)socket_name;
 	return false;
 }
 
 bool
-comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint32_t last_seq)
+comp_bg2d_capture_acquire(struct comp_bg2d_capture_frame *out, uint32_t last_seq)
 {
 	(void)out;
 	(void)last_seq;
@@ -56,11 +56,11 @@ comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint3
 }
 
 void
-comp_multi_bg2d_capture_release(void)
+comp_bg2d_capture_release(void)
 {}
 
 void
-comp_multi_bg2d_capture_stop(void)
+comp_bg2d_capture_stop(void)
 {}
 
 #else
@@ -160,7 +160,7 @@ read_one_frame(struct bg2d_capture *c, int fd)
 	if (!read_full(c, fd, hdr, sizeof(hdr))) {
 		return false;
 	}
-	if (hdr[0] != COMP_MULTI_BG2D_CAPTURE_MAGIC_FRAME) {
+	if (hdr[0] != COMP_BG2D_CAPTURE_MAGIC_FRAME) {
 		U_LOG_E("bg2d capture: framing lost (magic 0x%08x) — dropping the producer", hdr[0]);
 		return false;
 	}
@@ -238,9 +238,9 @@ serve_producer(struct bg2d_capture *c, int fd)
 	if (!read_full(c, fd, hello, sizeof(hello))) {
 		return;
 	}
-	if (hello[0] != COMP_MULTI_BG2D_CAPTURE_MAGIC_HELLO || hello[1] != COMP_MULTI_BG2D_CAPTURE_VERSION) {
+	if (hello[0] != COMP_BG2D_CAPTURE_MAGIC_HELLO || hello[1] != COMP_BG2D_CAPTURE_VERSION) {
 		U_LOG_E("bg2d capture: bad hello (magic 0x%08x version %u) — expected 'DXRB' v%u", hello[0], hello[1],
-		        COMP_MULTI_BG2D_CAPTURE_VERSION);
+		        COMP_BG2D_CAPTURE_VERSION);
 		return;
 	}
 	U_LOG_W("bg2d capture(#1073 T2): producer connected (protocol v%u)", hello[1]);
@@ -287,7 +287,7 @@ capture_thread(void *ptr)
  */
 
 bool
-comp_multi_bg2d_capture_start(const char *socket_name)
+comp_bg2d_capture_start(const char *socket_name)
 {
 	struct bg2d_capture *c = &g_capture;
 	if (g_started) {
@@ -295,8 +295,7 @@ comp_multi_bg2d_capture_start(const char *socket_name)
 	}
 	c->listen_fd = -1;
 
-	const char *name =
-	    (socket_name != NULL && socket_name[0] != '\0') ? socket_name : COMP_MULTI_BG2D_CAPTURE_SOCKET;
+	const char *name = (socket_name != NULL && socket_name[0] != '\0') ? socket_name : COMP_BG2D_CAPTURE_SOCKET;
 
 	struct sockaddr_un addr = {0};
 	addr.sun_family = AF_UNIX;
@@ -345,7 +344,7 @@ comp_multi_bg2d_capture_start(const char *socket_name)
 }
 
 bool
-comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint32_t last_seq)
+comp_bg2d_capture_acquire(struct comp_bg2d_capture_frame *out, uint32_t last_seq)
 {
 	struct bg2d_capture *c = &g_capture;
 	if (!g_started || out == NULL) {
@@ -364,7 +363,7 @@ comp_multi_bg2d_capture_acquire(struct comp_multi_bg2d_capture_frame *out, uint3
 }
 
 void
-comp_multi_bg2d_capture_release(void)
+comp_bg2d_capture_release(void)
 {
 	if (!g_started) {
 		return;
@@ -373,7 +372,7 @@ comp_multi_bg2d_capture_release(void)
 }
 
 void
-comp_multi_bg2d_capture_stop(void)
+comp_bg2d_capture_stop(void)
 {
 	struct bg2d_capture *c = &g_capture;
 	if (!g_started) {
