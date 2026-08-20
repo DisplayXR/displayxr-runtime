@@ -37,7 +37,7 @@
  * comp_d3d11_composite_shaders.h / shaders/masked_composite.hlsl. 64 bytes;
  * HLSL packs as four float4 rows with no straddle (dst_dims.xy |
  * canvas_origin.xy , canvas_size.xy | mask | mode , opaque_present | pad0 |
- * twod_uv_scale.xy , mask_uv_scale.xy | pad) — note the deliberate `pad0`,
+ * twod_uv_scale.xy , weave_uv_scale.xy | pad) — note the deliberate `pad0`,
  * which is what keeps `twod_uv_scale` from straddling a 16-byte boundary.
  */
 struct CompositeParams
