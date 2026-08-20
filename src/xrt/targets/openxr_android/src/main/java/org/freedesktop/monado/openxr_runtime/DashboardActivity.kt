@@ -96,26 +96,26 @@ class DashboardActivity : AppCompatActivity() {
         findViewById<TextView>(R.id.textTitle).text = nameAndLogoProvider.getLocalizedRuntimeName()
         findViewById<ImageView>(R.id.imageLogo)
             .setImageDrawable(nameAndLogoProvider.getLogoDrawable())
-        findViewById<TextView>(R.id.textFlavor).text =
-            getString(
-                if (BuildConfig.inProcess) R.string.diag_flavor_in_process
-                else R.string.diag_flavor_out_of_process
-            )
+        // #1031: one hybrid APK — there is no flavor to report any more. Both
+        // deployments are present; which one a given app gets is decided per
+        // process at xrCreateInstance, not at build time.
+        findViewById<TextView>(R.id.textFlavor).text = getString(R.string.diag_flavor_hybrid)
 
         findViewById<Button>(R.id.btnRefresh).setOnClickListener { runQuery() }
         findViewById<Button>(R.id.btnCopyJson).setOnClickListener { copyJson() }
         findViewById<Button>(R.id.btnShare).setOnClickListener { shareJson() }
 
-        if (!BuildConfig.inProcess) {
-            findViewById<View>(R.id.cardLive).visibility = View.VISIBLE
-            findViewById<View>(R.id.drawOverOtherAppsFrame).visibility = View.VISIBLE
-            // The service shares the activity's (default) process, so a
-            // self-kill takes the whole runtime down — same behavior as the
-            // legacy About screen's shutdown button.
-            val shutdown = findViewById<Button>(R.id.btnShutdown)
-            shutdown.visibility = View.VISIBLE
-            shutdown.setOnClickListener { Process.killProcess(Process.myPid()) }
-        }
+        // The merged APK always ships the service, so the live card, the
+        // overlay-permission frame and the shutdown button are unconditional
+        // (they used to be gated on the outOfProcess flavor).
+        findViewById<View>(R.id.cardLive).visibility = View.VISIBLE
+        findViewById<View>(R.id.drawOverOtherAppsFrame).visibility = View.VISIBLE
+        // The service shares the activity's (default) process, so a
+        // self-kill takes the whole runtime down — same behavior as the
+        // legacy About screen's shutdown button.
+        val shutdown = findViewById<Button>(R.id.btnShutdown)
+        shutdown.visibility = View.VISIBLE
+        shutdown.setOnClickListener { Process.killProcess(Process.myPid()) }
 
         // Android status fragments — the existing android_common logic,
         // hosted in width-constrained card frames (this IS the fix for the
@@ -123,9 +123,7 @@ class DashboardActivity : AppCompatActivity() {
         val tx = supportFragmentManager.beginTransaction()
         val status = VrModeStatus.detectStatus(this, applicationContext.applicationInfo.packageName)
         tx.replace(R.id.statusFrame, VrModeStatus.newInstance(status), null)
-        if (!BuildConfig.inProcess) {
-            tx.replace(R.id.drawOverOtherAppsFrame, DisplayOverOtherAppsStatusFragment(), null)
-        }
+        tx.replace(R.id.drawOverOtherAppsFrame, DisplayOverOtherAppsStatusFragment(), null)
         tx.commit()
 
         runQuery()
@@ -202,9 +200,7 @@ class DashboardActivity : AppCompatActivity() {
         populateDisplay(info)
         populateModes(info)
         populateEyeTracking(info)
-        if (!BuildConfig.inProcess) {
-            populateLive(if (root.isNull("live")) null else root.optJSONObject("live"), info)
-        }
+        populateLive(if (root.isNull("live")) null else root.optJSONObject("live"), info)
     }
 
     private fun populateSelftest(selftest: JSONObject?) {

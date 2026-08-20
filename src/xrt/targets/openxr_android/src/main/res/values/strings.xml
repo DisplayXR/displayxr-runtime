@@ -23,8 +23,7 @@
     <string name="diag_btn_copy">Copy JSON</string>
     <string name="diag_btn_share">Share report</string>
     <string name="diag_btn_shutdown">Shut down runtime</string>
-    <string name="diag_flavor_in_process">in-process runtime</string>
-    <string name="diag_flavor_out_of_process">out-of-process runtime (service)</string>
+    <string name="diag_flavor_hybrid">hybrid runtime (in-process + service)</string>
     <string name="diag_live_service_not_running">service not running</string>
     <string name="diag_copied">Report JSON copied to clipboard</string>
 </resources>
