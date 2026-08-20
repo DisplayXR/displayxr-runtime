@@ -20,6 +20,14 @@ target_include_directories(cli_query PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # get_local_zone_caps without a GPU/display.
 if(WIN32)
 	target_link_libraries(cli_query PRIVATE d3d11)
+
+	# #918 GPU-topology section: DXGI adapter enumeration (dxgi + dxguid for
+	# IID_IDXGIFactory1 in C) plus aux_d3d's panel-rect -> scanout-adapter
+	# resolver. Same guarded link targets/common uses for the same resolver.
+	target_link_libraries(cli_query PRIVATE dxgi dxguid)
+	if(TARGET aux_d3d)
+		target_link_libraries(cli_query PRIVATE aux_d3d)
+	endif()
 endif()
 
 add_executable(

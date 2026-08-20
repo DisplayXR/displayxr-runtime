@@ -3769,6 +3769,79 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		        (int)c->split_active);
 	}
 
+	/*
+	 * #918 — ONE canonical weave-placement line per session, ALWAYS emitted,
+	 * in addition to (never instead of) the Stage-A detail lines above.
+	 *
+	 * The Stage-A lines only exist when DXR_WEAVE_ON_SCANOUT is set, so
+	 * without this a hybrid box silently paying the cross-adapter present
+	 * produced a log byte-identical to a single-adapter box that pays
+	 * nothing — the same blind spot #1000 closed for adapter SELECTION, now
+	 * closed for weave PLACEMENT. Costs one QueryDisplayConfig per session.
+	 */
+	{
+		DXGI_ADAPTER_DESC rdesc = {};
+		bool render_ok = false;
+		{
+			IDXGIDevice *dd = nullptr;
+			IDXGIAdapter *ra = nullptr;
+			if (SUCCEEDED(
+			        c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dd))) &&
+			    dd != nullptr) {
+				dd->GetAdapter(&ra);
+				dd->Release();
+			}
+			if (ra != nullptr) {
+				render_ok = SUCCEEDED(ra->GetDesc(&rdesc));
+				ra->Release();
+			}
+		}
+
+		DXGI_ADAPTER_DESC pdesc = {};
+		bool scanout_ok = false;
+		{
+			const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+			const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+			wil::com_ptr<IDXGIAdapter> panel = xrt::auxiliary::d3d::getScanoutAdapter(
+			    display_screen_left, display_screen_top, pw, ph, U_LOGGING_INFO);
+			scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
+		}
+
+		const WCHAR *rname = render_ok ? rdesc.Description : L"<unknown>";
+		const unsigned long rhi = (unsigned long)rdesc.AdapterLuid.HighPart;
+		const unsigned long rlo = (unsigned long)rdesc.AdapterLuid.LowPart;
+
+		if (!scanout_ok) {
+			// Say so — never guess. Without the scanout adapter there is no
+			// way to know whether this session crosses adapters at all.
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout=UNRESOLVED — cannot "
+			    "tell whether the weave crosses adapters (#918)",
+			    rname, rhi, rlo);
+		} else if (render_ok && pdesc.AdapterLuid.LowPart == rdesc.AdapterLuid.LowPart &&
+		           pdesc.AdapterLuid.HighPart == rdesc.AdapterLuid.HighPart) {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
+			    "LUID=%08lx:%08lx — render and scanout share one adapter; weave is local (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		} else if (c->split_active) {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
+			    "LUID=%08lx:%08lx — weave/present on the SCANOUT adapter (DXR_WEAVE_ON_SCANOUT "
+			    "split active) (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		} else {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
+			    "LUID=%08lx:%08lx — weave on the RENDER adapter; every present crosses adapters to "
+			    "reach scanout (set DXR_WEAVE_ON_SCANOUT=1 to move the weave) (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		}
+	}
+
 	// Create output target (DXGI swapchain) — skip if offscreen (no HWND).
 	// #918: under the split the swapchain, its waitable and its frame statistics
 	// all live on the SCANOUT adapter, which is what removes the cross-adapter

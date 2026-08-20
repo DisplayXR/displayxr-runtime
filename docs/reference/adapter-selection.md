@@ -168,6 +168,46 @@ the other: `DXR_D3D_FORCE_GPU=scanout` when the app can afford to render on the
 iGPU, `DXR_WEAVE_ON_SCANOUT=1` when it cannot and the dGPU has to keep the
 rendering.
 
+## Checking where the weave actually runs
+
+Neither variable has to be *guessed at*. Two places report the answer:
+
+- **`displayxr-cli info` → the `GPU topology` section.** Headless (no app, no
+  compositor): it lists the hardware adapters with their LUIDs and dedicated
+  VRAM, names the adapter that scans out the panel, names the adapter the
+  runtime would suggest for rendering by default, prints the verdict line
+  `weave-on-scanout topology: APPLIES (render != scanout)` / `does not apply
+  (single adapter / same adapter)`, and shows the current
+  `DXR_WEAVE_ON_SCANOUT` value. `displayxr-cli selftest` carries the same
+  verdict line as one informational (never-failing) check. On a hybrid box
+  with the panel on the iGPU it reads:
+
+  ```
+   :: GPU topology (#918 — does the weave cross adapters to reach the panel?)
+        adapters:     2
+          [0] NVIDIA GeForce RTX 3080 Laptop GPU LUID=00000000:00024f0b  dedicated VRAM 8018 MB
+          [1] Intel(R) UHD Graphics            LUID=00000000:00024bbf  dedicated VRAM 128 MB
+        panel scanout: 'Intel(R) UHD Graphics' LUID=00000000:00024bbf
+        render (default suggestion): 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00024f0b
+        weave-on-scanout topology: APPLIES (render != scanout)
+        DXR_WEAVE_ON_SCANOUT=<unset>
+  ```
+
+- **The session log**, for what a *specific* app actually got. Every D3D11
+  session logs exactly one `weave placement:` WARN naming the render adapter,
+  the panel's scanout adapter, and where the weave runs — in all three states
+  (`weave/present on the SCANOUT adapter`, `weave on the RENDER adapter; every
+  present crosses adapters to reach scanout`, `render and scanout share one
+  adapter; weave is local`), plus an explicit `panel scanout=UNRESOLVED` when
+  the panel's adapter cannot be determined. It is emitted whether or not
+  `DXR_WEAVE_ON_SCANOUT` is set, so a hybrid box quietly paying the
+  cross-adapter present no longer produces a log indistinguishable from a
+  single-adapter box that pays nothing. Grep the newest
+  `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log` for `weave placement`.
+
+  The `D3D11 output-device split ...` lines are separate and appear only when
+  the split was actually attempted; the `weave placement:` line is always there.
+
 ## Choosing a value
 
 - **Overlay-class / weaving apps on hybrid machines**: use `scanout`. It is the

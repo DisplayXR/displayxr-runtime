@@ -42,7 +42,10 @@
 #ifdef XRT_OS_WINDOWS
 #include <windows.h> // WIN32_LEAN_AND_MEAN + COBJMACROS are set at the top of the file
 #include <d3d11.h>   // WARP device for the headless zone-caps probe (#224 / ADR-027 P4)
+#include <dxgi.h>    // adapter enumeration for the #918 GPU-topology probe
+#include <stdlib.h>  // getenv (DXR_WEAVE_ON_SCANOUT)
 #include "xrt/xrt_display_processor_d3d11.h"
+#include "d3d/d3d_scanout_helpers.h" // panel rect -> scanout adapter LUID (#918)
 #endif
 
 
@@ -137,6 +140,129 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 	xrt_display_processor_d3d11_destroy(&xdp);
 	ID3D11DeviceContext_Release(context);
 	ID3D11Device_Release(device);
+}
+
+//! Pack a Windows LUID the way Vulkan reports deviceLUID (raw bytes, LowPart
+//! first) — the same packing @ref d3d_scanout_adapter_luid returns, so the two
+//! can be compared directly.
+static uint64_t
+pack_luid(LUID luid)
+{
+	uint64_t packed = 0;
+	memcpy(&packed, &luid, sizeof(packed));
+	return packed;
+}
+
+/*!
+ * #918 — GPU topology. Enumerates the hardware adapters, names the one that
+ * scans out the 3D panel, names the one the runtime would suggest to render
+ * on, and states whether the weave-on-scanout split has anything to do on this
+ * box (i.e. whether the session pays a cross-adapter present).
+ *
+ * The render suggestion mirrors `oxr_d3d.cpp`'s dGPU classification — the
+ * hardware adapter with the MOST dedicated VRAM — deliberately NOT
+ * EnumAdapterByGpuPreference, whose answer a per-app UserGpuPreferences
+ * registry entry can reorder.
+ *
+ * Purely informational: nothing here can fail the self-test. Unresolvable is
+ * reported as unresolvable, never guessed.
+ */
+static void
+probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_info *info)
+{
+	r->gpu_probed = true;
+
+	const char *env = getenv("DXR_WEAVE_ON_SCANOUT");
+	r->gpu_weave_env_set = env != NULL && env[0] != '\0';
+	if (r->gpu_weave_env_set) {
+		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
+	}
+
+	IDXGIFactory1 *factory = NULL;
+	if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)) || factory == NULL) {
+		snprintf(r->gpu_note, sizeof(r->gpu_note), "DXGI factory unavailable — adapters not enumerated");
+		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict),
+		         "weave-on-scanout topology: unknown (DXGI factory unavailable)");
+		return;
+	}
+
+	uint64_t best_vram = 0;
+	for (UINT i = 0;; i++) {
+		IDXGIAdapter1 *adapter = NULL;
+		if (FAILED(IDXGIFactory1_EnumAdapters1(factory, i, &adapter)) || adapter == NULL) {
+			break;
+		}
+		DXGI_ADAPTER_DESC1 d;
+		memset(&d, 0, sizeof(d));
+		if (SUCCEEDED(IDXGIAdapter1_GetDesc1(adapter, &d)) && (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+			const uint64_t luid = pack_luid(d.AdapterLuid);
+			const uint64_t vram = (uint64_t)d.DedicatedVideoMemory;
+
+			if (r->gpu_adapter_count < CLI_MAX_GPU_ADAPTERS) {
+				struct cli_gpu_adapter *e = &r->gpu_adapters[r->gpu_adapter_count++];
+				WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, e->name, (int)sizeof(e->name), NULL,
+				                    NULL);
+				e->luid = luid;
+				e->dedicated_vram_bytes = vram;
+			}
+
+			// Default render suggestion: most dedicated VRAM wins.
+			if (!r->gpu_render_resolved || vram > best_vram) {
+				r->gpu_render_resolved = true;
+				r->gpu_render_luid = luid;
+				best_vram = vram;
+				WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, r->gpu_render_name,
+				                    (int)sizeof(r->gpu_render_name), NULL, NULL);
+			}
+		}
+		IDXGIAdapter1_Release(adapter);
+	}
+	IDXGIFactory1_Release(factory);
+
+	// The panel's scanout adapter, from the plug-in's own panel rect.
+	uint64_t scanout_luid = 0;
+	if (info != NULL &&
+	    d3d_scanout_adapter_luid(info->display_screen_left, info->display_screen_top, info->display_pixel_width,
+	                             info->display_pixel_height, &scanout_luid)) {
+		r->gpu_scanout_resolved = true;
+		r->gpu_scanout_luid = scanout_luid;
+		for (uint32_t a = 0; a < r->gpu_adapter_count; a++) {
+			if (r->gpu_adapters[a].luid == scanout_luid) {
+				snprintf(r->gpu_scanout_name, sizeof(r->gpu_scanout_name), "%s",
+				         r->gpu_adapters[a].name);
+				break;
+			}
+		}
+	}
+
+	if (!r->gpu_scanout_resolved) {
+		if (r->gpu_note[0] == '\0') {
+			snprintf(r->gpu_note, sizeof(r->gpu_note),
+			         "panel's scanout adapter unresolvable (panel %ux%u at %d,%d)",
+			         info != NULL ? info->display_pixel_width : 0,
+			         info != NULL ? info->display_pixel_height : 0,
+			         info != NULL ? (int)info->display_screen_left : 0,
+			         info != NULL ? (int)info->display_screen_top : 0);
+		}
+		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict),
+		         "weave-on-scanout topology: unknown (scanout adapter unresolvable)");
+		return;
+	}
+
+	if (!r->gpu_render_resolved) {
+		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict),
+		         "weave-on-scanout topology: unknown (no hardware render adapter found)");
+		return;
+	}
+
+	r->gpu_split_applies = r->gpu_render_luid != r->gpu_scanout_luid;
+	if (r->gpu_split_applies) {
+		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict),
+		         "weave-on-scanout topology: APPLIES (render != scanout)");
+	} else {
+		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict), "weave-on-scanout topology: does not apply (%s)",
+		         r->gpu_adapter_count <= 1 ? "single adapter" : "same adapter");
+	}
 }
 
 static void
@@ -473,6 +599,15 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->display_info = info;
 	r->display_info_ok = true;
 
+	// #918 — GPU topology. Runs BEFORE the dims check so a box with a
+	// half-broken plug-in still gets its adapter list dumped; the scanout
+	// resolution simply reports "unresolvable" when the rect is unusable.
+#ifdef XRT_OS_WINDOWS
+	probe_gpu_topology(r, &r->display_info);
+#else
+	snprintf(r->gpu_verdict, sizeof(r->gpu_verdict), "weave-on-scanout topology: n/a (Windows-only)");
+#endif
+
 	if (!(info.display_width_m > 0.0f) || !(info.display_height_m > 0.0f) || info.display_pixel_width == 0 ||
 	    info.display_pixel_height == 0) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
@@ -576,6 +711,18 @@ eye_default_label(uint32_t def)
 }
 
 /*!
+ * Render a packed adapter LUID the same way the runtime's session logs do
+ * (`HighPart:LowPart`), so a CLI dump and an app log can be grepped against
+ * each other without conversion.
+ */
+static const char *
+luid_label(uint64_t packed, char *buf, size_t cap)
+{
+	snprintf(buf, cap, "%08lx:%08lx", (unsigned long)(packed >> 32), (unsigned long)(packed & 0xffffffffu));
+	return buf;
+}
+
+/*!
  * Decode the advisory switch-granularity value (xrt_dp_switch_granularity).
  */
 static const char *
@@ -663,6 +810,35 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		} else {
 			PT("paths agree.\n");
 		}
+	}
+
+	P(" :: GPU topology (#918 — does the weave cross adapters to reach the panel?)\n");
+	if (!r->gpu_probed) {
+		PT("%s\n", r->gpu_verdict[0] != '\0' ? r->gpu_verdict : "not evaluated");
+	} else {
+		char lb[32];
+		PT("adapters:     %u\n", r->gpu_adapter_count);
+		for (uint32_t a = 0; a < r->gpu_adapter_count; a++) {
+			const struct cli_gpu_adapter *g = &r->gpu_adapters[a];
+			PT("  [%u] %-32s LUID=%s  dedicated VRAM %llu MB\n", a, g->name,
+			   luid_label(g->luid, lb, sizeof(lb)),
+			   (unsigned long long)(g->dedicated_vram_bytes / (1024 * 1024)));
+		}
+		if (r->gpu_scanout_resolved) {
+			PT("panel scanout: '%s' LUID=%s\n",
+			   r->gpu_scanout_name[0] != '\0' ? r->gpu_scanout_name : "<not enumerated>",
+			   luid_label(r->gpu_scanout_luid, lb, sizeof(lb)));
+		} else {
+			PT("panel scanout: UNRESOLVED (%s)\n", or_q(r->gpu_note));
+		}
+		if (r->gpu_render_resolved) {
+			PT("render (default suggestion): '%s' LUID=%s\n", r->gpu_render_name,
+			   luid_label(r->gpu_render_luid, lb, sizeof(lb)));
+		} else {
+			PT("render (default suggestion): <none>\n");
+		}
+		PT("%s\n", r->gpu_verdict);
+		PT("DXR_WEAVE_ON_SCANOUT=%s\n", r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
 	}
 
 	P(" :: Input providers (ADR-034)\n");
@@ -794,6 +970,41 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(ds, "service_confidence", r->dp_sel_service_conf);
 		cJSON_AddNumberToObject(ds, "monitor_count", (double)r->dp_sel_monitor_count);
 		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
+	}
+
+	// #918 GPU topology.
+	{
+		char lb[32];
+		cJSON *gt = cJSON_AddObjectToObject(root, "gpu_topology");
+		cJSON_AddBoolToObject(gt, "probed", r->gpu_probed);
+		cJSON_AddStringToObject(gt, "verdict", r->gpu_verdict);
+		cJSON_AddBoolToObject(gt, "applies", r->gpu_split_applies);
+		cJSON_AddStringToObject(gt, "weave_on_scanout_env",
+		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		if (r->gpu_note[0] != '\0') {
+			cJSON_AddStringToObject(gt, "note", r->gpu_note);
+		}
+		cJSON *ads = cJSON_AddArrayToObject(gt, "adapters");
+		for (uint32_t a = 0; a < r->gpu_adapter_count; a++) {
+			const struct cli_gpu_adapter *g = &r->gpu_adapters[a];
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "name", g->name);
+			cJSON_AddStringToObject(o, "luid", luid_label(g->luid, lb, sizeof(lb)));
+			cJSON_AddNumberToObject(o, "dedicated_vram_bytes", (double)g->dedicated_vram_bytes);
+			cJSON_AddItemToArray(ads, o);
+		}
+		cJSON *sc = cJSON_AddObjectToObject(gt, "scanout");
+		cJSON_AddBoolToObject(sc, "resolved", r->gpu_scanout_resolved);
+		if (r->gpu_scanout_resolved) {
+			cJSON_AddStringToObject(sc, "name", r->gpu_scanout_name);
+			cJSON_AddStringToObject(sc, "luid", luid_label(r->gpu_scanout_luid, lb, sizeof(lb)));
+		}
+		cJSON *rn = cJSON_AddObjectToObject(gt, "render_suggestion");
+		cJSON_AddBoolToObject(rn, "resolved", r->gpu_render_resolved);
+		if (r->gpu_render_resolved) {
+			cJSON_AddStringToObject(rn, "name", r->gpu_render_name);
+			cJSON_AddStringToObject(rn, "luid", luid_label(r->gpu_render_luid, lb, sizeof(lb)));
+		}
 	}
 
 	// ADR-034 / #823 input-provider checks.
@@ -942,6 +1153,14 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	// A provider that IS present must yield left+right role devices —
 	// and (#825 Tier 2) hand-tracking roles wherever a role device
 	// advertises hand tracking.
+	// #918 — GPU topology. INFORMATIONAL ONLY: this check is always ok, it
+	// exists so `selftest` output carries the one verdict line that says
+	// whether this box pays a cross-adapter present to reach the panel.
+	c = &out[n++];
+	c->name = "gpu_topology";
+	c->ok = true;
+	snprintf(c->detail, sizeof(c->detail), "%s", r->gpu_verdict[0] != '\0' ? r->gpu_verdict : "not evaluated");
+
 	c = &out[n++];
 	c->name = "input_providers";
 	c->ok = !r->input_evaluated || (r->input_provider_active && r->input_left_ok && r->input_right_ok &&
