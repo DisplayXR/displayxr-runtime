@@ -268,7 +268,11 @@ is the only tier that requires no platform concession at all.
 `AccessibilityService.takeScreenshot()` is public and consent-once — but it is
 rate-limited to one shot per ~333 ms (≈3 Hz), still captures our own overlay,
 and repurposing accessibility is a Play-policy violation. `screencap` /
-`screenrecord` are shell-only (and blind to `TYPE_APPLICATION_OVERLAY` anyway).
+`screenrecord` are shell-only, and — contrary to an earlier claim in this note —
+they are **not** blind to `TYPE_APPLICATION_OVERLAY`: a `screencap` taken while
+the avatar overlay was up on the NP02J contains the avatar in full. So an
+unfiltered display capture really does feed back, which is what makes T2's
+`once` mode the correct dev tier rather than merely the convenient one.
 
 ---
 
