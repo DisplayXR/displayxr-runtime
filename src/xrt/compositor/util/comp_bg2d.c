@@ -574,6 +574,129 @@ bg2d_canvas_crop_rect(const struct xrt_rect *canvas_on_panel,
 	return true;
 }
 
+//! Does @p r fit entirely inside a @p w x @p h panel? A canvas rect and the panel
+//! extent it is expressed against always satisfy this; a rect sampled against a
+//! *different* rotation of the same panel generally does not, which is what makes
+//! this the discriminator below.
+static bool
+bg2d_rect_fits(const struct xrt_rect *r, uint32_t w, uint32_t h)
+{
+	if (r == NULL || w == 0 || h == 0) {
+		return false;
+	}
+	return r->offset.w >= 0 && r->offset.h >= 0 && r->extent.w > 0 && r->extent.h > 0 &&
+	       (int64_t)r->offset.w + r->extent.w <= (int64_t)w && (int64_t)r->offset.h + r->extent.h <= (int64_t)h;
+}
+
+/*!
+ * Pick the panel extent the canvas→frame mapping must go through (#1073).
+ *
+ * ## One convention, chosen by evidence rather than by source
+ *
+ * The crop maps a canvas rect onto a captured frame, and that is only defined
+ * when both are expressed against the *same* panel rotation. Two extents claim
+ * to be that rotation:
+ *
+ *  - the **capture-time** one the v2 producer states in the frame header, and
+ *  - the **session-side** one published alongside the window rect
+ *    (`xrSetAndroidWindowGeometryDXR` in process, `updateWindowRect` out of it).
+ *
+ * Both are sampled as "the panel right now", so they agree — except in the
+ * moments around a rotation, where either can be the stale half. Before this
+ * function existed the session-side value was trusted unconditionally and any
+ * disagreement was read as "the capture is stale", which is wrong exactly half
+ * the time: a landscape session whose panel field had not caught up dropped a
+ * perfectly good landscape capture and fell back to *no* background — i.e. to
+ * the pre-#1073 de-occlusion fringe — for the life of the session.
+ *
+ * The canvas rect settles it without guessing. It is measured in panel pixels,
+ * so it **fits inside its own rotation and, on a non-square panel, generally not
+ * inside the transposed one**. So:
+ *
+ *  - extents agree               → nothing to decide, use them.
+ *  - canvas fits the capture's only  → the session field is the stale half; map
+ *                                      through the capture's extent.
+ *  - canvas fits the session's only  → the capture really is from the other
+ *                                      orientation; no sub-rect of it depicts
+ *                                      this canvas, so drop it.
+ *  - canvas fits both (a small window on a rotated panel is ambiguous) → drop:
+ *                                      a mis-registered background is worse than
+ *                                      none, which is the #1073 rule.
+ *  - canvas fits neither          → the *window* sample is itself torn (observed
+ *                                      mid-rotation: window 1600x2560 published
+ *                                      against panel 2560x1600, which cropped a
+ *                                      square 320x320 out of the top-left of the
+ *                                      capture). No extent can map it; report
+ *                                      "no information this frame" so the caller
+ *                                      keeps whatever is already bound and the
+ *                                      next sample decides.
+ *
+ * @param      canvas    Canvas rect in panel pixels, or NULL (T0/no crop).
+ * @param      sess_w, sess_h Session-published panel extent (may be 0).
+ * @param      cap_w, cap_h   Capture-time panel extent, already defaulted by the
+ *                            caller when the producer speaks v1.
+ * @param[out] out_w, out_h   Extent to map through, on ACCEPT.
+ * @return the decision; see @ref bg2d_map_decision.
+ */
+enum bg2d_map_decision
+{
+	BG2D_MAP_ACCEPT, //!< Map the capture through *out_w x *out_h.
+	BG2D_MAP_DROP,   //!< The capture belongs to the other orientation.
+	BG2D_MAP_SKIP,   //!< Inconsistent geometry; change nothing this frame.
+};
+
+static enum bg2d_map_decision
+bg2d_pick_map_extent(const struct xrt_rect *canvas,
+                     uint32_t sess_w,
+                     uint32_t sess_h,
+                     uint32_t cap_w,
+                     uint32_t cap_h,
+                     uint32_t *out_w,
+                     uint32_t *out_h)
+{
+	// No capture-time extent at all (v1 producer with no session extent
+	// either): there is nothing to compare, and the whole-frame path is what
+	// v1 always did.
+	if (cap_w == 0 || cap_h == 0) {
+		*out_w = sess_w;
+		*out_h = sess_h;
+		return BG2D_MAP_ACCEPT;
+	}
+	if (sess_w == 0 || sess_h == 0 || (sess_w == cap_w && sess_h == cap_h)) {
+		*out_w = cap_w;
+		*out_h = cap_h;
+		return BG2D_MAP_ACCEPT;
+	}
+
+	// Same extent, different order == a rotation. Anything else is a genuine
+	// display-geometry change (an external panel, a resized emulator); treat it
+	// like a rotation for safety — the capture is not of this panel.
+	const bool fits_cap = bg2d_rect_fits(canvas, cap_w, cap_h);
+	const bool fits_sess = bg2d_rect_fits(canvas, sess_w, sess_h);
+
+	if (canvas == NULL || canvas->extent.w <= 0 || canvas->extent.h <= 0) {
+		// No canvas to arbitrate with — fall back to the pre-existing
+		// orientation compare, which is exactly right when the frame is used
+		// whole (no crop happens, so only the aspect matters).
+		if ((sess_w > sess_h) != (cap_w > cap_h)) {
+			return BG2D_MAP_DROP;
+		}
+		*out_w = cap_w;
+		*out_h = cap_h;
+		return BG2D_MAP_ACCEPT;
+	}
+
+	if (fits_cap && !fits_sess) {
+		*out_w = cap_w;
+		*out_h = cap_h;
+		return BG2D_MAP_ACCEPT;
+	}
+	if (!fits_cap && !fits_sess) {
+		return BG2D_MAP_SKIP;
+	}
+	return BG2D_MAP_DROP;
+}
+
 //! Repack a sub-rect of @p src into @p scratch (grown as needed). NULL on OOM.
 static const uint8_t *
 bg2d_repack_crop(const uint8_t *src,
@@ -655,9 +778,35 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 			// producer does today, but defeated by a square-ish panel or a
 			// cropped capture — which is precisely why v2 exists).
 			const bool have_cap_panel = f.panel_w != 0 && f.panel_h != 0;
-			const uint32_t cap_panel_w = have_cap_panel ? f.panel_w : panel_w;
-			const uint32_t cap_panel_h = have_cap_panel ? f.panel_h : panel_h;
-			const bool cap_landscape = have_cap_panel ? (f.panel_w > f.panel_h) : (f.width > f.height);
+			const uint32_t cap_panel_w =
+			    have_cap_panel ? f.panel_w : (f.width > f.height ? (panel_w > panel_h ? panel_w : panel_h)
+			                                                     : (panel_w > panel_h ? panel_h : panel_w));
+			const uint32_t cap_panel_h =
+			    have_cap_panel ? f.panel_h : (f.width > f.height ? (panel_w > panel_h ? panel_h : panel_w)
+			                                                     : (panel_w > panel_h ? panel_w : panel_h));
+
+			// ONE convention for both the accept/drop decision and the crop
+			// mapping: the panel rotation the canvas rect actually lives in,
+			// arbitrated by which candidate extent the canvas fits inside.
+			// See bg2d_pick_map_extent — the session-side panel field is no
+			// longer trusted on its own, because it is stale exactly as often
+			// as the capture is, and trusting it dropped good captures.
+			uint32_t map_w = cap_panel_w, map_h = cap_panel_h;
+			const enum bg2d_map_decision decision = bg2d_pick_map_extent(
+			    canvas_on_panel, panel_w, panel_h, cap_panel_w, cap_panel_h, &map_w, &map_h);
+
+			if (decision == BG2D_MAP_SKIP) {
+				// The window sample itself is torn — it fits neither
+				// rotation of the panel. Cropping it would upload a
+				// wrong sub-rect (measured: a square 320x320 out of the
+				// top-left of a 512x320 frame). Change nothing; the next
+				// sample resolves within a frame or two.
+				comp_bg2d_capture_release();
+				if (!st->initialized) {
+					return VK_NULL_HANDLE;
+				}
+				goto have_backdrop;
+			}
 
 			// A frame from the OTHER orientation cannot be cropped into this
 			// one at all: the canvas rect is expressed in today's panel
@@ -673,21 +822,24 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 			// The producer's job is to re-capture — until it does, this stays
 			// in the "no background" state and re-checks every frame, so the
 			// moment a correctly-oriented frame lands it is picked up.
-			if (panel_w != 0 && panel_h != 0 && f.width != 0 && f.height != 0 &&
-			    (panel_w > panel_h) != cap_landscape) {
+			if (decision == BG2D_MAP_DROP) {
 				if (!st->logged_stale) {
 					st->logged_stale = true;
 					U_LOG_W(
 					    "bg2d(#1073 T2): dropping the %ux%u capture — it was taken "
-					    "against a %ux%u panel%s and the panel is now %ux%u, so it "
-					    "belongs to the other orientation and no crop of it depicts "
-					    "this canvas. Falling back to no background until the producer "
-					    "re-captures.",
+					    "against a %ux%u panel%s and the canvas %d,%d %dx%d only fits "
+					    "the %ux%u panel the session publishes, so it belongs to the "
+					    "other orientation and no crop of it depicts this canvas. "
+					    "Falling back to no background until the producer re-captures.",
 					    f.width, f.height, cap_panel_w, cap_panel_h,
 					    have_cap_panel ? ""
 					                   : " (inferred from its aspect; a v2 producer "
 					                     "would state it)",
-					    panel_w, panel_h);
+					    canvas_on_panel != NULL ? canvas_on_panel->offset.w : 0,
+					    canvas_on_panel != NULL ? canvas_on_panel->offset.h : 0,
+					    canvas_on_panel != NULL ? canvas_on_panel->extent.w : 0,
+					    canvas_on_panel != NULL ? canvas_on_panel->extent.h : 0, panel_w,
+					    panel_h);
 				}
 				comp_bg2d_capture_release();
 				// Drop what is already bound too: it is the same stale frame,
@@ -702,14 +854,13 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 			// CANVAS. Crop before the upload so the DP's (0,0)-(1,1) tile
 			// mapping lands the backdrop exactly where the atlas depicts.
 			//
-			// Through the CAPTURE-time extent, not the current one: the frame
-			// is a downscale of the panel as it was, so that is the only ratio
-			// that maps panel pixels onto frame pixels. They agree except
-			// across a display-geometry change, and the one change that
-			// transposes them was refused just above.
+			// Through the extent just arbitrated, not the session's: the frame
+			// is a downscale of the panel in *its* rotation, so that is the
+			// only ratio that maps panel pixels onto frame pixels — and the
+			// canvas rect was proven above to live in that same rotation.
 			uint32_t cx = 0, cy = 0, up_w = f.width, up_h = f.height;
-			const bool crop = bg2d_canvas_crop_rect(canvas_on_panel, cap_panel_w, cap_panel_h, f.width,
-			                                        f.height, &cx, &cy, &up_w, &up_h);
+			const bool crop = bg2d_canvas_crop_rect(canvas_on_panel, map_w, map_h, f.width, f.height, &cx,
+			                                        &cy, &up_w, &up_h);
 
 			// Settle the upload dims BEFORE any teardown: the producer may
 			// re-negotiate its output size (a rotation, a different capture
@@ -737,8 +888,8 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 					    "bg2d(#1073 T2): cropped the %ux%u panel capture to the canvas"
 					    " %d,%d %dx%d on a %ux%u panel -> %ux%u at (%u,%u) (#174)",
 					    f.width, f.height, canvas_on_panel->offset.w, canvas_on_panel->offset.h,
-					    canvas_on_panel->extent.w, canvas_on_panel->extent.h, cap_panel_w,
-					    cap_panel_h, up_w, up_h, cx, cy);
+					    canvas_on_panel->extent.w, canvas_on_panel->extent.h, map_w, map_h,
+					    up_w, up_h, cx, cy);
 				}
 			}
 
@@ -766,6 +917,7 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 		if (!st->initialized) {
 			return VK_NULL_HANDLE;
 		}
+	have_backdrop:;
 	} else if (!st->initialized) {
 		// T0's backdrop is runtime-drawn, so it is canvas-space by
 		// construction and never cropped — canvas_on_panel is unused here.
