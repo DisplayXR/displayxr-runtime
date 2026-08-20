@@ -3415,21 +3415,37 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 				// Where this session's canvas sits on the panel. T2 sends a
 				// whole-panel capture while slot 16 promises the canvas, so
 				// the receiver crops to this rect (#174); T0 draws its own
-				// canvas-space backdrop and ignores it. The canvas rect is in
-				// target pixels, which on Android OOP are panel pixels, so the
-				// window origin is the only offset needed. A zero rect (plain
-				// projection layer, or no window rect reported yet) means "the
-				// whole window", which is the pre-#174 behaviour.
-				const bool have_win = mc->session_render.window_rect_generation != 0;
+				// canvas-space backdrop and is unaffected.
+				//
+				// The canvas rect is in TARGET pixels, and on Android OOP the
+				// target IS the panel — which is also the fallback when no
+				// window rect has been reported. That is not a corner case: in
+				// overlay mode the surface belongs to the SERVICE, so the client
+				// never calls updateWindowRect at all, and the weave likewise
+				// treats the canvas offset as a panel coordinate (see the
+				// screen-pos in HW_DBG_CNSDK). A reported rect wins, so a real
+				// windowed session still offsets correctly.
+				const uint32_t panel_w = mc->session_render.window_screen_disp_w != 0
+				                             ? mc->session_render.window_screen_disp_w
+				                             : framebufferWidth;
+				const uint32_t panel_h = mc->session_render.window_screen_disp_h != 0
+				                             ? mc->session_render.window_screen_disp_h
+				                             : framebufferHeight;
+				const uint32_t win_w = mc->session_render.window_screen_w != 0
+				                           ? mc->session_render.window_screen_w
+				                           : framebufferWidth;
+				const uint32_t win_h = mc->session_render.window_screen_h != 0
+				                           ? mc->session_render.window_screen_h
+				                           : framebufferHeight;
 				struct xrt_rect canvas_on_panel = {
 				    .offset = {.w = mc->session_render.window_screen_x + canvas_x,
 				               .h = mc->session_render.window_screen_y + canvas_y},
-				    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : mc->session_render.window_screen_w),
-				               .h = (int)(canvas_h != 0 ? canvas_h : mc->session_render.window_screen_h)},
+				    .extent = {.w = (int)(canvas_w != 0 ? canvas_w : win_w),
+				               .h = (int)(canvas_h != 0 ? canvas_h : win_h)},
 				};
 				uint32_t bg_w = 0, bg_h = 0;
 				VkImageView bg_view =
-				    comp_multi_bg2d_ensure(mc, vk, have_win ? &canvas_on_panel : NULL, &bg_w, &bg_h);
+				    comp_multi_bg2d_ensure(mc, vk, &canvas_on_panel, panel_w, panel_h, &bg_w, &bg_h);
 				xrt_display_processor_set_background_2d(mc->session_render.display_processor,
 				                                        bg_view, bg_w, bg_h);
 			} else {

@@ -435,6 +435,13 @@ struct multi_compositor
 		uint8_t *bg2d_crop_scratch;
 		size_t bg2d_crop_capacity;
 		bool bg2d_logged_crop; //!< One "cropped to the canvas" line per session.
+		//! Canvas rect the currently-uploaded backdrop was cropped for. A T2
+		//! producer in `once` mode sends exactly ONE frame, and it usually lands
+		//! before the app has submitted the zone layer that establishes the
+		//! canvas — so "re-upload when a newer frame arrives" alone would freeze
+		//! the very first, canvas-less mapping in place forever.
+		struct xrt_rect bg2d_canvas_used;
+		bool bg2d_have_canvas_used;
 		bool bg2d_failed;   //!< Latched after a failed build, so we try once.
 		//! @}
 
