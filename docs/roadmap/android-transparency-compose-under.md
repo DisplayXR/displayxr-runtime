@@ -332,6 +332,32 @@ That reframing is what makes tier 0 worth shipping.
   and becomes *the wrong colour* wherever the static backdrop disagrees with
   the real screen behind it. That is the whole of what T1/T2 buy.
 
+#### The app-supplied backdrop already has a channel — and it is not new API
+
+Worth recording, because it removes a question rather than opening one: an
+**app-supplied** backdrop needs **no new extension**. The channel is
+`XR_DXR_display_zones` Local2D layers plus `xrEndFrame` **list order** —
+Local2D layers submitted *before* the projection layer are "under" layers, and
+`comp_vk_native_compositor.c`'s `vk_flatten_backdrop_2d` (`:6309`) already
+flattens exactly those into a premultiplied scratch and hands it to
+`set_background_2d`. Slot 16's own doc comment describes this as its purpose.
+
+So the remaining T0 increment is a **port, not a design**: give `comp_multi`
+the same under/over split and pre-weave flatten, and prefer an app's under-layers
+over the runtime's synthetic colour. Two things it must solve that the
+in-process path did not:
+
+1. `comp_multi`'s Local2D path is a plain `vkCmdBlitImage` of *all* Local2D
+   layers post-weave — there is no under/over split and no
+   `vk_local2d_composite` flatten pipeline on this path yet.
+2. The flatten records into the frame command buffer, which is still
+   **unsubmitted** when a self-submitting Android DP samples the backdrop —
+   the same hazard `comp_multi_bg2d.c` sidesteps with its own one-shot submit.
+
+That increment is also what makes #1073's "reachable without a sysprop"
+literally true: an app that submits an under-layer gets compose-under with no
+`debug.dxr.bg2d` at all.
+
 ### Split of work
 
 **Runtime**
