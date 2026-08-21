@@ -247,6 +247,32 @@ bool
 comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t generation);
 
 /*!
+ * Select ingress Option II — the app-device NT-shared staging ring — UP FRONT,
+ * instead of reaching it only as the Option-I failure fallback.
+ *
+ * Option I binds ONE app-device atlas by NT handle and lets the producer read it
+ * in place, which is right for a compositor that owns its renderer atlas for the
+ * life of the session. A caller whose source texture changes IDENTITY between
+ * frames — the service's atlas is whichever focused client's surface it is
+ * compositing this tick — would instead re-open a shared handle per frame, and
+ * each re-open drains the producer queue (see
+ * @ref comp_d3d11_xbridge_bind_atlas). Such a caller wants the staging ring from
+ * the start: one extra same-adapter copy per frame, and the source texture may
+ * then be anything, re-created whenever.
+ *
+ * **Call right after @ref comp_d3d11_xbridge_create, before the first
+ * @ref comp_d3d11_xbridge_submit.** It allocates the staging ring, so calling it
+ * mid-flight would change ingress flavour under an in-flight producer copy.
+ * Idempotent, and a no-op returning true if the bridge already latched Option II
+ * on its own.
+ *
+ * @return false when the staging ring could not be allocated — the bridge is
+ *         then inoperative and the caller must not activate the split.
+ */
+bool
+comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb);
+
+/*!
  * Back-pressure for ingress Option I (#918 review F6). The producer's copy of
  * frame N-1 reads the app's atlas directly, so the renderer passes of frame N
  * must not start overwriting it until that copy has retired. Call at the TOP of
