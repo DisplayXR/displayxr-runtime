@@ -9840,6 +9840,247 @@ pipeline_dp_health_poll(struct d3d11_service_system *sys, struct d3d11_multi_com
 static void
 dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name, bool from_out = false);
 
+/*
+ * ---------------------------------------------------------------------------
+ * #918 — the BACK-BUFFER COVERAGE PROBE (diagnostic; DXR_SPLIT_COVER_DIAG).
+ *
+ * `process_atlas` returns void: the vtable has no way to say "I drew nothing
+ * this tick". The direct path therefore cannot tell a covered frame from an
+ * uncovered one, and presents either. This probe answers the question the
+ * vtable cannot, by SAMPLING the presenter's back buffer at five points:
+ *
+ *   - BEFORE the weave: what DXGI just handed us. FLIP_DISCARD is allowed to
+ *     hand back undefined content, and whether a given driver actually does is
+ *     the difference the split changes (the chain moves to another adapter).
+ *   - AFTER the weave: whether the DP covered those five points.
+ *
+ * `=2` additionally clears the back buffer to MAGENTA before the weave, which
+ * turns "did the DP draw here" into a yes/no the sample can read directly
+ * (magenta is channel-order invariant, so it survives an RGBA/BGRA staging
+ * without a swap). `=1` observes only and perturbs nothing but timing.
+ *
+ * Two 1x5 staging maps per frame on the render thread — a real stall, which is
+ * why this is env-gated and off by default. Never compiled out: the cost when
+ * the var is unset is one `getenv` at first use.
+ *
+ * What it found (#918, 2026-08-21), recorded because the counters alone read as
+ * "healthy" while the panel blinks: on the scanout adapter, with the eye pair
+ * collapsed (untracked), the DP COVERS every tick and its output is
+ * (0,0,0,0) for ~22 frames every ~1983 ms. Every input the runtime controls is
+ * invariant across that boundary, so nothing here is the cause — but nothing
+ * here could SEE it either, which is why the probe exists.
+ *
+ * All state below is function-local `static`: single-threaded by construction,
+ * since the only caller is the render thread holding `render_mutex`.
+ * ---------------------------------------------------------------------------
+ */
+enum split_cover_verdict
+{
+	SPLIT_COVER_OFF = 0,
+	SPLIT_COVER_FULL,    //!< none of the five sample points is still the sentinel
+	SPLIT_COVER_PARTIAL, //!< some are
+	SPLIT_COVER_NONE,    //!< all five are — the DP drew nothing at all
+};
+
+//! 0 = off, 1 = observe, 2 = observe + sentinel clear.
+static int
+dxr_split_cover_diag_mode(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		const char *e = getenv("DXR_SPLIT_COVER_DIAG");
+		mode = (e != nullptr) ? atoi(e) : 0;
+	}
+	return mode;
+}
+
+//! Sample five points of @p rtv's resource into @p out_rgba[5]. Returns false if
+//! anything about the copy/map failed (the caller then simply records nothing).
+//! Pass @p srv instead of @p rtv to sample the DP's INPUT (the egress slot).
+static bool
+dxr_split_cover_sample(struct d3d11_service_system *sys,
+                       ID3D11RenderTargetView *rtv,
+                       ID3D11ShaderResourceView *srv,
+                       uint32_t w,
+                       uint32_t h,
+                       uint32_t out_rgba[5])
+{
+	if (sys == nullptr || (rtv == nullptr && srv == nullptr) || w < 8 || h < 8) {
+		return false;
+	}
+	ID3D11Device *dev = svc_out_device(sys);
+	ID3D11DeviceContext *ctx = svc_out_context(sys);
+	if (dev == nullptr || ctx == nullptr) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Resource> res;
+	if (rtv != nullptr) {
+		rtv->GetResource(res.put());
+	} else {
+		srv->GetResource(res.put());
+	}
+	wil::com_ptr<ID3D11Texture2D> tex;
+	if (!res || FAILED(res->QueryInterface(IID_PPV_ARGS(tex.put())))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC desc = {};
+	tex->GetDesc(&desc);
+	// The source's OWN dims, not the caller's belief about them: the back buffer
+	// is panel-sized while the DP input is the content-sized egress slot.
+	w = desc.Width;
+	h = desc.Height;
+	if (w < 8 || h < 8) {
+		return false;
+	}
+
+	// A tiny 5x1 staging per (device, format). Two slots, because the back
+	// buffer and the egress slot can differ in format and this runs on both
+	// every frame; one slot would rebuild the texture twice per tick.
+	static wil::com_ptr<ID3D11Texture2D> s_staging[2];
+	static ID3D11Device *s_dev[2] = {nullptr, nullptr};
+	static DXGI_FORMAT s_fmt[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+	const int si = (rtv != nullptr) ? 0 : 1;
+	if (!s_staging[si] || s_dev[si] != dev || s_fmt[si] != desc.Format) {
+		s_staging[si].reset();
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = 5;
+		sd.Height = 1;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = desc.Format;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(dev->CreateTexture2D(&sd, nullptr, s_staging[si].put()))) {
+			return false;
+		}
+		s_dev[si] = dev;
+		s_fmt[si] = desc.Format;
+	}
+	ID3D11Texture2D *staging = s_staging[si].get();
+
+	const uint32_t px[5] = {2u, w - 3u, 2u, w - 3u, w / 2u};
+	const uint32_t py[5] = {2u, 2u, h - 3u, h - 3u, h / 2u};
+	for (uint32_t i = 0; i < 5; i++) {
+		D3D11_BOX box = {(UINT)px[i], (UINT)py[i], 0, (UINT)px[i] + 1, (UINT)py[i] + 1, 1};
+		ctx->CopySubresourceRegion(staging, 0, i, 0, 0, tex.get(), 0, &box);
+	}
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		return false;
+	}
+	const uint8_t *src = static_cast<const uint8_t *>(m.pData);
+	for (uint32_t i = 0; i < 5; i++) {
+		memcpy(&out_rgba[i], src + (size_t)i * 4u, 4u);
+	}
+	ctx->Unmap(staging, 0);
+	return true;
+}
+
+//! All five sample points have zero RGB.
+static bool
+dxr_split_cover_all_black(const uint32_t rgba[5])
+{
+	for (uint32_t i = 0; i < 5; i++) {
+		if ((rgba[i] & 0x00ffffffu) != 0u) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Rolling per-tick verdict ring, dumped at 1 Hz so the PATTERN (not just the
+//! rate) of uncovered ticks is readable in the log.
+static void
+dxr_split_cover_note(struct d3d11_service_system *sys,
+                     enum split_cover_verdict v,
+                     int pre_black,
+                     int post_black,
+                     int in_black,
+                     int is_tracking,
+                     const struct xrt_eye_positions *ep,
+                     uint64_t r_ns)
+{
+	static char ring[121] = {};
+	static uint32_t n = 0;
+	static int64_t last_ns = 0;
+	static uint32_t c_full = 0, c_part = 0, c_none = 0, c_pre = 0, c_post = 0, c_in = 0, c_ticks = 0;
+
+	/* One char per tick, most informative thing first:
+	 *   'B' the frame we are about to PRESENT is black, and so was its input
+	 *   'W' the frame we are about to present is black but the input was NOT
+	 *       (the weave blackened it)
+	 *   'X' / 'o' the DP covered nothing / partially
+	 *   'k' covered and non-black, but DXGI handed back a black buffer
+	 *   '.' covered, non-black, buffer preserved */
+	const char ch = post_black                   ? (in_black ? 'B' : 'W')
+	                : (v == SPLIT_COVER_NONE)    ? 'X'
+	                : (v == SPLIT_COVER_PARTIAL) ? 'o'
+	                : pre_black                  ? 'k'
+	                                             : '.';
+	ring[n % 120u] = ch;
+	n++;
+	c_ticks++;
+	if (v == SPLIT_COVER_FULL) {
+		c_full++;
+	} else if (v == SPLIT_COVER_PARTIAL) {
+		c_part++;
+	} else if (v == SPLIT_COVER_NONE) {
+		c_none++;
+	}
+	c_pre += pre_black ? 1u : 0u;
+	c_post += post_black ? 1u : 0u;
+	c_in += in_black ? 1u : 0u;
+
+	/* Burst edges, with wall-clock deltas — the PERIOD is what identifies the
+	 * thing driving this, and a 1 Hz histogram cannot resolve it. */
+	static int prev_post_black = 0;
+	static int64_t burst_start_ns = 0;
+	static int64_t last_burst_start_ns = 0;
+	static uint32_t burst_frames = 0;
+	const int64_t t_ns = (int64_t)os_monotonic_get_ns();
+	if (post_black && !prev_post_black) {
+		burst_start_ns = t_ns;
+		burst_frames = 0;
+		U_LOG_W(
+		    "[COVER] black burst START (tracking=%d, gap since previous start %.1f ms) R=%.2f ms "
+		    "eyes{valid=%d count=%u L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)}",
+		    is_tracking, last_burst_start_ns != 0 ? (double)(t_ns - last_burst_start_ns) / 1e6 : -1.0,
+		    (double)r_ns / 1e6, (int)ep->valid, ep->count, ep->eyes[0].x, ep->eyes[0].y, ep->eyes[0].z,
+		    ep->eyes[1].x, ep->eyes[1].y, ep->eyes[1].z);
+		last_burst_start_ns = t_ns;
+	}
+	if (post_black) {
+		burst_frames++;
+	}
+	if (!post_black && prev_post_black) {
+		U_LOG_W(
+		    "[COVER] black burst END (%u frames, %.1f ms) R=%.2f ms "
+		    "eyes{valid=%d count=%u L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)}",
+		    burst_frames, (double)(t_ns - burst_start_ns) / 1e6, (double)r_ns / 1e6, (int)ep->valid, ep->count,
+		    ep->eyes[0].x, ep->eyes[0].y, ep->eyes[0].z, ep->eyes[1].x, ep->eyes[1].y, ep->eyes[1].z);
+	}
+	prev_post_black = post_black;
+
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (now_ns - last_ns < 1000000000LL) {
+		return;
+	}
+	last_ns = now_ns;
+	const uint32_t len = n < 120u ? n : 120u;
+	char out[121];
+	for (uint32_t i = 0; i < len; i++) {
+		out[i] = ring[(n - len + i) % 120u];
+	}
+	out[len] = '\0';
+	U_LOG_W(
+	    "[COVER] split=%d tracking=%d ticks=%u full=%u partial=%u none=%u pre_black=%u post_black=%u in_black=%u | "
+	    "%s",
+	    (int)(sys != nullptr && sys->split_active), is_tracking, c_ticks, c_full, c_part, c_none, c_pre, c_post,
+	    c_in, out);
+	c_ticks = c_full = c_part = c_none = c_pre = c_post = c_in = 0;
+}
+
 /*!
  * #964: may the render thread touch this APP_HWND presenter's back buffer this
  * frame?
@@ -11076,6 +11317,20 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		dp = nullptr;
 	}
 
+	/* #918 diagnosis (DXR_SPLIT_COVER_DIAG): what DXGI handed us, and — with
+	 * `=2` — a magenta sentinel so the post-weave sample reads "the DP drew
+	 * here" directly. Off by default; two staging maps per frame when on. */
+	const int cover_mode = dxr_split_cover_diag_mode();
+	uint32_t cover_pre[5] = {};
+	bool cover_pre_ok = false;
+	if (cover_mode > 0) {
+		cover_pre_ok = dxr_split_cover_sample(sys, present_rtv, nullptr, target_w, target_h, cover_pre);
+		if (cover_mode >= 2) {
+			const float sentinel[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+			svc_out_context(sys)->ClearRenderTargetView(present_rtv, sentinel);
+		}
+	}
+
 	if (dp != nullptr && dp_input_srv != nullptr) {
 		svc_assert_same_device(present_rtv, svc_out_device(sys));
 		ID3D11RenderTargetView *rtvs[] = {present_rtv};
@@ -11149,6 +11404,63 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 
 	t_weave_ns = (int64_t)os_monotonic_get_ns();
+
+	if (cover_mode > 0) {
+		uint32_t cover_post[5] = {};
+		if (dxr_split_cover_sample(sys, present_rtv, nullptr, target_w, target_h, cover_post)) {
+			const int pre_black = cover_pre_ok && dxr_split_cover_all_black(cover_pre);
+			const int post_black = dxr_split_cover_all_black(cover_post);
+			// What the DP was HANDED. Black here means the black arrived from
+			// upstream (the crop, the crossing) rather than from the weave.
+			int in_black = 0;
+			if (dp_input_srv != nullptr) {
+				uint32_t cover_in[5] = {};
+				if (dxr_split_cover_sample(sys, nullptr, dp_input_srv, 0, 0, cover_in)) {
+					in_black = dxr_split_cover_all_black(cover_in);
+				}
+			}
+			int survivors = 0;
+			for (uint32_t i = 0; i < 5; i++) {
+				// mode 2: the sentinel is magenta (channel-order invariant).
+				// mode 1: "unchanged since before the weave" is the best proxy
+				// the observe-only arm has.
+				const bool untouched = (cover_mode >= 2)
+				                           ? ((cover_post[i] & 0x00ffffffu) == 0x00ff00ffu)
+				                           : (cover_pre_ok && cover_post[i] == cover_pre[i]);
+				if (untouched) {
+					survivors++;
+				}
+			}
+			struct xrt_eye_positions ep = {};
+			if (mc->display_processor != nullptr) {
+				xrt_display_processor_d3d11_get_predicted_eye_positions(mc->display_processor, &ep);
+			}
+			// One-shot picture of the very first black frame: the presented
+			// back buffer AND the atlas the DP was handed to make it.
+			static bool s_dumped = false;
+			if (post_black && !s_dumped && getenv("DXR_SPLIT_COVER_DUMP") != nullptr) {
+				s_dumped = true;
+				wil::com_ptr<ID3D11Resource> ores, ires;
+				present_rtv->GetResource(ores.put());
+				wil::com_ptr<ID3D11Texture2D> otex, itex;
+				if (ores && SUCCEEDED(ores->QueryInterface(IID_PPV_ARGS(otex.put())))) {
+					dxr_diag_dump_tex(sys, otex.get(), "cover_black_out", /*from_out*/ true);
+				}
+				if (dp_input_srv != nullptr) {
+					dp_input_srv->GetResource(ires.put());
+					if (ires && SUCCEEDED(ires->QueryInterface(IID_PPV_ARGS(itex.put())))) {
+						dxr_diag_dump_tex(sys, itex.get(), "cover_black_in", /*from_out*/ true);
+					}
+				}
+			}
+			dxr_split_cover_note(sys,
+			                     survivors == 0   ? SPLIT_COVER_FULL
+			                     : survivors == 5 ? SPLIT_COVER_NONE
+			                                      : SPLIT_COVER_PARTIAL,
+			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep,
+			                     g_weave_latency_workspace.measured_r_ns);
+		}
+	}
 
 	/* Atlas capture. The standalone poll lives past the commit's early return
 	 * and the compose poll past this branch, so the debug trigger would
