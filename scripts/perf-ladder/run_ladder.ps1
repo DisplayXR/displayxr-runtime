@@ -80,9 +80,17 @@ function Invoke-ArmSample {
     $appPids = @()
     $appProc = $null
     $batPath = $null
-    $appLogBefore = Get-LatestDxrLog $exeBase
 
     if ($arm.app) {
+        # Leak sweep: a prior arm whose instance started AFTER its poll gave
+        # up leaves a stray app that contaminates every later arm (measured:
+        # four instances alive by mid-rep-2 of the first full run).
+        $stray = @(Get-Process -Name $exeBase -ErrorAction SilentlyContinue)
+        if ($stray.Count -gt 0) {
+            $flags += 'STRAY_SWEPT'
+            $stray | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
         # Compose env into a launcher bat (env must be process-level; explorer
         # launch strips elevation so the loader honors the registry runtime).
         $batPath = Join-Path $env:TEMP ('ladder_arm_' + $arm.name + '.bat')
@@ -107,7 +115,14 @@ function Invoke-ArmSample {
             if ($appProc -ne $null) { break }
             Start-Sleep -Milliseconds 500
         }
-        if ($appProc -eq $null) { $flags += 'APP_NO_START'; return @{ ok = $false; flags = $flags } }
+        if ($appProc -eq $null) {
+            $flags += 'APP_NO_START'
+            # The launch may still land after the poll gave up - sweep so it
+            # cannot leak into the next arm.
+            Start-Sleep -Seconds 5
+            Get-Process -Name $exeBase -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            return @{ ok = $false; flags = $flags }
+        }
         $appPids = @($appProc.Id)
 
         $hwnd = Get-MainWindow -procId $appProc.Id -timeoutSec 15
@@ -121,7 +136,7 @@ function Invoke-ArmSample {
             $settled = $false
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds 6   # one witness interval
-                $wl = @(Get-WitnessLines (Get-LatestDxrLog $exeBase)) | Select-Object -Last 1
+                $wl = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id)) | Select-Object -Last 1
                 if ($wl -ne $null -and $wl.Mode -eq $arm.mode) { $settled = $true; break }
                 if ($wl -ne $null) { Send-KeyToWindow -hwnd $hwnd -vk 0x56 }  # 'V'
             }
@@ -140,7 +155,8 @@ function Invoke-ArmSample {
     }
 
     Start-Sleep -Seconds $warmupSec
-    $witBefore = @(Get-WitnessLines (Get-LatestDxrLog $exeBase)).Count
+    $witBefore = 0
+    if ($appProc -ne $null) { $witBefore = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id)).Count }
 
     $cpu0 = Get-CpuSnapshot -procIds $appPids
     $g0 = Get-GpuSnapshot
@@ -152,7 +168,7 @@ function Invoke-ArmSample {
     $wit = @()
     if ($arm.app) {
         # Witness lines that landed during the sample window (skip pre-window ones).
-        $all = @(Get-WitnessLines (Get-LatestDxrLog $exeBase))
+        $all = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id))
         if ($all.Count -gt $witBefore) { $wit = $all[$witBefore..($all.Count - 1)] }
         if ($wit.Count -eq 0) { $flags += 'NO_WITNESS' }
     }

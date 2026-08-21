@@ -192,11 +192,16 @@ function Send-KeyToWindow {
 }
 
 function Get-LatestDxrLog {
-    # Newest per-process runtime log for the given exe basename.
-    param([string]$exeBase)
+    # Runtime log for the exe - keyed by PID when known (the filename embeds
+    # it: DisplayXR_<exe>.exe.<pid>_<ts>.log). Newest-by-mtime is only a
+    # fallback: with several instances alive it picks the wrong one (measured
+    # in the first full run - a leaked instance shadowed every later arm).
+    param([string]$exeBase, [int]$procId = 0)
     $dir = Join-Path $env:LOCALAPPDATA 'DisplayXR'
     if (-not (Test-Path $dir)) { return $null }
-    $f = Get-ChildItem $dir -Filter ("DisplayXR_" + $exeBase + "*.log") -ErrorAction SilentlyContinue |
+    $pat = 'DisplayXR_' + $exeBase + '*.log'
+    if ($procId -gt 0) { $pat = 'DisplayXR_' + $exeBase + '.exe.' + $procId + '_*.log' }
+    $f = Get-ChildItem $dir -Filter $pat -ErrorAction SilentlyContinue |
          Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($f -eq $null) { return $null }
     return $f.FullName
