@@ -247,3 +247,72 @@ hosted arms sit at ≈2 refresh periods where the handle window sits at 1 (fulls
 independent-flip on the cross-adapter iGPU path is the suspect, not the compositor: legacy shows
 it too); no `D` (prediction-error) rows exist on the service paths. Repeat on a clean desktop and
 on an Intel-only present path before deleting the legacy code (#964 follow-up).
+
+## 6. The output-device split (#918 Phase 2b)
+
+On a non-MUX hybrid laptop the panel is scanned out by the iGPU while apps render on the dGPU, so
+every woven frame crosses the adapter boundary inside `Present`. `DXR_WEAVE_ON_SCANOUT=1` moves the
+**output half** of this pipeline — the presenter swap chains, their RTVs, the panel DP's weave and
+the present — onto the scanout adapter, and sends only the DP-INPUT ATLAS across, once per rendered
+frame, through a D3D12 cross-adapter heap (`comp_d3d11_xbridge`). Default off; PR 3 covers the
+DIRECT path only.
+
+Why the service is a simpler split than the in-process compositor was: Local2D, zones and the
+authored mask all composite into the CLIENT ATLAS pre-DP, and the service never calls
+`set_background_2d` — so there is exactly one image to carry, and no plane transport at all.
+
+### Presenter-kind eligibility
+
+| Presenter | Eligible | Why |
+|---|---|---|
+| `SERVICE_WINDOW` | yes | the runtime owns the window and presents it |
+| `APP_HWND` | yes | the runtime owns the chain on the app's window and presents it |
+| `CLIENT_TEXTURE` | **no** | ADR-029: the destination is a shared NT texture the client opened on the app adapter; shared textures do not cross adapters, and the client presents |
+| `SELF` | **no** | present-owner (#625): the client weaves synchronously and presents into its own window |
+
+Ineligibility is structural and permanent for Phase 2b (supervisor ruling D-b); changing ADR-029 is
+out of scope.
+
+### The bind key
+
+`mc->display_processor` is keyed on `(panel_dp_hwnd, panel_dp_device)`.
+
+- same device, different window → the free #1008 `set_window` re-point, unchanged;
+- same device, same window → no-op;
+- **different device** → retire first, then create on the new device (the shape a STALE backend
+  already used). The weaver's D3D11 objects belong to the device it was created on, and
+  `set_window` re-points a window, not an adapter.
+
+A device crossing happens on exactly one event: focus moving across the eligibility boundary — an
+Alt-Tab between a browser (present-owner) and a handle cube, say. A user can do that as fast as they
+can press keys, so crossings are limited by a **>= 1 s dwell** and counted as `pipe_dev_rebind`. A
+frame that finds the DP still on the wrong device does not weave through it: D3D11 drives a foreign
+resource silently rather than erroring, so the frame degrades to the raw copy instead.
+
+### The workspace suspend (PR 3 interim)
+
+The COMPOSE path is not split until PR 4, so while a controller is attached the split **suspends**:
+the panel DP and the service-window chain move back to the service device, `sys->split_active`
+(what every `svc_out_*` accessor reads) flips, and the shell behaves exactly as it does without the
+flag. Detach resumes. Counted as `split_suspend`.
+
+Client `APP_HWND` chains are not rebuilt by the transition — only the owning client's IPC thread may
+call `CreateSwapChainForHwnd` on the app's window (the DXGI/WM deadlock rule). They are left stale,
+the render thread skips a stale presenter, and the client's next commit rebuilds. Under a controller
+those clients are composed rather than presented, so the skip costs nothing there.
+
+### Reading it in the log
+
+```
+weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave/present on the SCANOUT adapter
+#918 output-device split ACTIVE: …
+[RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 split_suspend=0 flat_skip=0 maskpub_skip=0 no_slot=0 window_s=10
+```
+
+`split` is the EFFECTIVE state (0 while suspended). `no_slot` counts frames that skipped both the
+weave and the present because nothing of the current layout generation had landed — warmup, a mode
+switch, or a resize the R2 hysteresis parked at a worst-case ring (PR 3 has no output-device crop).
+`flat_skip` counts unfocused app-HWND courtesy repaints skipped under the split (supervisor ruling;
+those windows are parked anyway). `maskpub_skip` counts zone-mask publishes refused because the mask
+and the DP ended up on different devices — an ineligible presenter under an active split; PR 5 makes
+that case raster on the DP's device instead.

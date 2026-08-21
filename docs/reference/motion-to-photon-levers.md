@@ -119,7 +119,7 @@ considered for default-on.
 | `DXR_VK_BRIDGE_PACING` | governor | `0..3` pins the queue depth and disables governor transitions (#912) |
 | `DXR_PRESENT_OPAQUE` | `false` | Opaque flip chain instead of the composed chain. Different pacing source: `GetFrameStatistics` vs the DComp compositor clock |
 | `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` | unset | Which adapter renders and weaves (#821). See [adapter-selection.md](adapter-selection.md) |
-| `DXR_WEAVE_ON_SCANOUT` | off | **Prototype (#918 Phase 2a), D3D11 windowed path only.** Splits the output device off the app device on a hybrid: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. Covers **zones, Local2D, authored masks and the 2D-under backdrop** as of Phase 2a: the four mask rasterizers take pure CPU rects and are simply built on the output device, while the Local2D flatten, the backdrop and a Tier-3 app-drawn mask ride the same egress slot as the atlas as extra planes (dirty-box + change-skip; measured 3 copies per session at rest, and zero bridge traffic per repaint tick). No Phase-1 gates remain. No-op (one WARN) when the scanout adapter already is the app's. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick |
+| `DXR_WEAVE_ON_SCANOUT` | off | **Prototype (#918 Phase 2a/2b), D3D11 in-process windowed path + the D3D11 service's DIRECT path.** Splits the output device off the app device on a hybrid: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. Covers **zones, Local2D, authored masks and the 2D-under backdrop** as of Phase 2a: the four mask rasterizers take pure CPU rects and are simply built on the output device, while the Local2D flatten, the backdrop and a Tier-3 app-drawn mask ride the same egress slot as the atlas as extra planes (dirty-box + change-skip; measured 3 copies per session at rest, and zero bridge traffic per repaint tick). No Phase-1 gates remain. On the SERVICE (Phase 2b PR 3) it covers the direct path only — the focused client's cropped atlas crosses per rendered frame; the compose path (shell attached) suspends the split, and unfocused app-HWND flat repaints are skipped while it is on. No-op (one WARN) when the scanout adapter already is the app's, and refused outright under `DXR_LEGACY_STANDALONE`. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick; `DXR_TEST_SPLIT_FAIL_STAGEA=1` forces the service's Stage A to fail, for exercising the fallback |
 | `DXR_FRAME_STAGE_TIMING` | off | Per-stage CPU timing of the windowed commit. `composite=` is the GPU wait |
 
 ## Defaults by GPU topology
@@ -139,10 +139,22 @@ woven frame, and every repaint tick, crosses inside `Present`. Measured on the r
 16 ms for a scanout-local pipeline, and a forced repaint burning 327 ms/s of dGPU copy engine
 purely on re-transfer.
 
-The **output-device split** (`DXR_WEAVE_ON_SCANOUT=1`, above) is that scanout-local pipeline, and
-it exists today behind the flag on the D3D11 windowed path — #918 stays **open** because it is
-still opt-in and unverified beyond D3D11 (the service path and the auto-enable policy are the
-remaining phases; the projection-only limit was lifted in Phase 2a). Cross-adapter sharing has its own traps: D3D11 has no
+The **output-device split** (`DXR_WEAVE_ON_SCANOUT=1`, above) is that scanout-local pipeline. It
+exists behind the flag on the D3D11 windowed path and — as of #918 Phase 2b PR 3 — on the **D3D11
+service's DIRECT path** too, so a forced-IPC `_handle` app or a hosted client presenting through the
+service window weaves and presents on the scanout adapter. Under the service the eligible presenters
+are exactly the two the runtime owns the surface of (`SERVICE_WINDOW`, `APP_HWND`); `CLIENT_TEXTURE`
+and present-owner (`SELF`) clients are structurally ineligible — the weave destination is a texture
+the client opened on the app adapter and presents itself — so the panel display processor's bind key
+carries the device alongside the window, and migrates (dwell-limited) when focus crosses that
+boundary. The service's COMPOSE path (a workspace controller attached) is **not** split yet: the
+split suspends for as long as the shell is attached and resumes on detach. On split sessions
+`DXR_APP_HWND_LATENCY` defaults to **1** rather than 2, because depth 2 exists to hide a flip slot
+that did not return within a display period — and it did not return because the present crossed
+adapters.
+
+#918 stays **open**: the split is still opt-in everywhere and the compose path, the wish mask on the
+output device and the hardening pass are the remaining PRs. Cross-adapter sharing has its own traps: D3D11 has no
 cross-adapter texture path at all on this stack (all six share flavours fail at the open call, both
 directions), so the transport is a D3D12 `SHARED | SHARED_CROSS_ADAPTER` heap with D3D11 on both
 ends; KMT handles share no pixels on some integrated drivers, so use NT handles.

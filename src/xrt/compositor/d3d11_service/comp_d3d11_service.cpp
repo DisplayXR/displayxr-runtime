@@ -3249,12 +3249,37 @@ service_note_device_lost(struct d3d11_service_system *sys, HRESULT hr, const cha
 	bool expected = false;
 	if (sys->device_removed.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
 	                                                std::memory_order_acquire)) {
-		HRESULT reason = sys->device ? sys->device->GetDeviceRemovedReason() : hr;
+		/*
+		 * #918: ask BOTH devices. Under the output-device split the present, the
+		 * weave and the presenter chains live on the scanout device, so a removal
+		 * reported here can belong to either — and asking only the app device
+		 * would print S_OK as the "reason" for a scanout-adapter TDR, which is
+		 * the one number the report exists to carry. Whichever device is actually
+		 * gone wins; the app device is asked first so nothing about the non-split
+		 * case changes.
+		 *
+		 * The ACTION is unchanged, and is the supervisor ruling: the orderly
+		 * #1002 exit-and-relaunch. Recreating the output device live would mean
+		 * re-creating every presenter chain from the render thread, which is
+		 * exactly the DXGI/WM thread rule we may not break.
+		 */
+		HRESULT reason = sys->device ? sys->device->GetDeviceRemovedReason() : S_OK;
+		const char *which = "service";
+		if (reason == S_OK && sys->out_dev != nullptr) {
+			HRESULT out_reason = sys->out_dev->GetDeviceRemovedReason();
+			if (out_reason != S_OK) {
+				reason = out_reason;
+				which = "scanout";
+			}
+		}
+		if (reason == S_OK) {
+			reason = hr;
+		}
 		sys->device_removed_reason.store((int32_t)reason, std::memory_order_release);
 		sys->device_removed_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
-		U_LOG_E("[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX site=%s — the display processor will not be "
-		        "touched again; the service will exit for relaunch",
-		        (unsigned long)hr, (unsigned long)reason, site != nullptr ? site : "?");
+		U_LOG_E("[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX device=%s site=%s — the display processor will "
+		        "not be touched again; the service will exit for relaunch",
+		        (unsigned long)hr, (unsigned long)reason, which, site != nullptr ? site : "?");
 	}
 	return true;
 }
