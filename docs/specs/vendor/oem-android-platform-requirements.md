@@ -630,7 +630,30 @@ no firmware change (*The measured escape* below). We now ship that.
 What is left of this ask is genuinely narrower and should be read as two separate
 things: **per-pixel** precision (mechanism 3 — still blocked, still wanted), and
 click-through for apps that must keep a **foreground Activity** (mechanisms 1/2/4
-— now a nice-to-have, not a blocker). · **Traces to:** L13 · **Evidence:**
+— now a nice-to-have, not a blocker).
+
+**Update 2026-08-21 — how far we got without you, and what that leaves.** Human
+review of the shipped overlay build made the residual concrete: click-through
+works outside the overlay's frame, but every transparent pixel *inside* it still
+swallows the tap, and the frame was a full-band 1200×1600 rectangle. Since an
+overlay's touchable region **is** its frame (mechanism 3 is blocked for overlay
+windows too — the blocklist is per-API, not per-window-type), the only lever left
+was to shrink the frame onto the silhouette. That shipped as
+[displayxr-demo-avatar#67](https://github.com/DisplayXR/displayxr-demo-avatar/pull/67):
+the frame now tracks the union bounding box of the character and its speech
+bubble, 1200×1600 → 832×1600 on the reference NP02J, **31 % less screen eaten**,
+with the horizontal dead margin around the character down from ~600 px to
+~230 px. (Only the **width** is driven; under Architecture A the frame is also
+the render canvas, and the height is a feedback axis — see that PR.)
+
+So mechanism 3 now buys a **bounded, quantified** improvement rather than an
+unblocking: the residual is exactly the transparent corners of one rectangle. The
+only stock alternative is an in-app `AccessibilityService` re-dispatching
+misdirected taps ([#1114](https://github.com/DisplayXR/displayxr-runtime/issues/1114)),
+which costs a user-visible accessibility grant, ~50–100 ms of added tap latency
+and Play-policy exposure — acceptable for a sideloaded or OEM-bundled demo, not
+for a shipping product. **That trade is the argument for mechanism 3.** ·
+**Traces to:** L13 · **Evidence:**
 `displayxr-demo-avatar/docs/android-input-passthrough.md`, PRs
 [displayxr-demo-avatar#65](https://github.com/DisplayXR/displayxr-demo-avatar/pull/65)
 (blocked) and

@@ -95,6 +95,18 @@ struct comp_bg2d_state
 	uint32_t panel_used_w, panel_used_h;
 	bool have_canvas_used;
 	bool failed; //!< Latched after a failed build, so we try once.
+
+	//! T2 only. When the listener was armed, and whether we have already said
+	//! that nobody ever called. The producer is a SEPARATE process that has to
+	//! be started by hand (`scripts/android_bg_capture.sh`) until the vendor
+	//! service auto-starts it, and a producer that is simply not running looks
+	//! from in here EXACTLY like one that has not connected yet: the consumer
+	//! listens forever, `comp_bg2d_ensure` returns NULL forever, and the only
+	//! symptom is that transparent edges fringe again because there is no
+	//! backdrop to compose under. That silence cost a debugging session on
+	//! 2026-08-21, so it now announces itself once.
+	uint64_t capture_wait_since_ns;
+	bool logged_no_producer;
 };
 
 
