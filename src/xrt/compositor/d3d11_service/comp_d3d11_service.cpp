@@ -10870,8 +10870,11 @@ pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
  * is exactly as much of a recipe change as a focus change or a 3D<->2D flip. A
  * slot the direct path filled must never be woven for the compose geometry, or
  * the other way round.
+ *
+ * One past the last real index — deliberately NOT -1, which is the direct path's
+ * live "no focused slot" value.
  */
-static constexpr int32_t SPLIT_COMPOSE_SLOT = -1;
+static constexpr int32_t SPLIT_COMPOSE_SLOT = D3D11_MULTI_MAX_CLIENTS;
 
 /*!
  * #918 PR 4 — crop an egress slot to its own content box, ON THE OUTPUT DEVICE.
