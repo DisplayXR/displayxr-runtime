@@ -9127,7 +9127,7 @@ pipeline_dp_health_poll(struct d3d11_service_system *sys, struct d3d11_multi_com
 //! Defined further down (browser#73 diagnostic); used by the pipeline's
 //! screenshot file-trigger to dump the ACTIVE presenter's back buffer.
 static void
-dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name);
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name, bool from_out = false);
 
 /*!
  * #964: may the render thread touch this APP_HWND presenter's back buffer this
@@ -9402,7 +9402,8 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 			sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		sys->context->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
+		svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0,
+		                                            &box);
 	}
 	// Never vsync-pace an unfocused window: sync interval 0 either way.
 	(void)pipeline_present_app_hwnd(c, /*paced*/ false);
@@ -10114,8 +10115,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	fc->render.last_dp_content_h = fc->pipe_content_h;
 
 	if (dp != nullptr && dp_input_srv != nullptr) {
+		svc_assert_same_device(present_rtv, svc_out_device(sys));
 		ID3D11RenderTargetView *rtvs[] = {present_rtv};
-		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		svc_out_context(sys)->OMSetRenderTargets(1, rtvs, nullptr);
 		// Reset viewport AND scissor to the full target. The compose path does
 		// this every frame in its blit helpers; the direct path skipped it, so
 		// a canvas-sub-rect scissor latched on the shared immediate context by
@@ -10128,9 +10130,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		full_vp.Width = (float)target_w;
 		full_vp.Height = (float)target_h;
 		full_vp.MaxDepth = 1.0f;
-		sys->context->RSSetViewports(1, &full_vp);
+		svc_out_context(sys)->RSSetViewports(1, &full_vp);
 		D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
-		sys->context->RSSetScissorRects(1, &full_scissor);
+		svc_out_context(sys)->RSSetScissorRects(1, &full_scissor);
 		// #1016: this call site owns the DP's state. Three writers share one
 		// panel DP — the workspace compose, this path, and a present-owner's
 		// weave_submit — so neither the encoding nor the transparency mode may
@@ -10144,7 +10146,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		g_weave_latency_workspace.mark_weave("pipeline");
 		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_input_srv, fc->pipe_content_w,
+		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, fc->pipe_content_w,
 		                                          fc->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
 		                                          target_w, target_h, 0, 0, 0, 0);
 	} else if (fc->render.atlas_texture) {
@@ -10199,7 +10201,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 					present_rtv->GetResource(pres.put());
 					wil::com_ptr<ID3D11Texture2D> ptex;
 					if (pres && SUCCEEDED(pres->QueryInterface(IID_PPV_ARGS(ptex.put())))) {
-						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot");
+						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot",
+						                  /*from_out*/ true);
 					}
 				}
 				// (2) %TEMP%\workspace_screenshot_atlas*.png — the pre-weave
@@ -17881,11 +17884,16 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 //! or carries a duplicated band. Blocking Map on the immediate context — a
 //! one-shot debug path, never armed in a normal session.
 static void
-dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name)
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name, bool from_out)
 {
 	if (sys == nullptr || tex == nullptr) {
 		return;
 	}
+	// #918: the staging copy has to be made by the device that OWNS @p tex, so
+	// a caller dumping a woven back buffer says so. Same device both ways while
+	// the split is off.
+	ID3D11Device *dev = from_out ? svc_out_device(sys) : sys->device.get();
+	ID3D11DeviceContext *ctx = from_out ? svc_out_context(sys) : sys->context.get();
 	D3D11_TEXTURE2D_DESC desc = {};
 	tex->GetDesc(&desc);
 	if (desc.Width == 0 || desc.Height == 0) {
@@ -17898,15 +17906,15 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
 	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 	sd.MiscFlags = 0;
 	wil::com_ptr<ID3D11Texture2D> staging;
-	HRESULT hr = sys->device->CreateTexture2D(&sd, nullptr, staging.put());
+	HRESULT hr = dev->CreateTexture2D(&sd, nullptr, staging.put());
 	if (FAILED(hr)) {
 		U_LOG_W("#73 diag: CreateTexture2D(staging) failed for %s: 0x%08lx", name, hr);
 		return;
 	}
-	sys->context->CopyResource(staging.get(), tex);
+	ctx->CopyResource(staging.get(), tex);
 
 	D3D11_MAPPED_SUBRESOURCE m = {};
-	hr = sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
+	hr = ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
 	if (FAILED(hr)) {
 		U_LOG_W("#73 diag: Map(staging) failed for %s: 0x%08lx", name, hr);
 		return;
@@ -17919,7 +17927,7 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
 	for (uint32_t y = 0; y < h; y++) {
 		memcpy(buf.data() + (size_t)y * w * 4u, src + (size_t)y * m.RowPitch, (size_t)w * 4u);
 	}
-	sys->context->Unmap(staging.get(), 0);
+	ctx->Unmap(staging.get(), 0);
 
 	// BGRA staging (the browser's shared input is B8G8R8A8) needs the channel
 	// swap stb does not do; alpha is kept AS SUBMITTED — the transparent gaps
