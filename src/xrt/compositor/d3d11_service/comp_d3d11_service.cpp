@@ -8366,8 +8366,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				// Recreate swap chain
 				sc_desc.Width = actual_w;
 				sc_desc.Height = actual_h;
-				hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-				    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+				hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+				    svc_out_device(sys), mc->hwnd, &sc_desc, nullptr, nullptr,
 				    mc->swap_chain.put());
 				if (FAILED(hr)) {
 					U_LOG_E("Multi-comp: failed to recreate swap chain (hr=0x%08X)", hr);
@@ -8376,7 +8376,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 				wil::com_ptr<ID3D11Texture2D> bb;
 				mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-				sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+				                                            mc->back_buffer_rtv.put());
+				svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 
 				// Recreate DP with new window
 				dp_ret = factory(sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
@@ -10817,7 +10819,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				if (SUCCEEDED(hr)) {
 					wil::com_ptr<ID3D11Texture2D> bb;
 					mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-					sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+					svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+					                                            mc->back_buffer_rtv.put());
+					svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 				}
 			}
 		}
