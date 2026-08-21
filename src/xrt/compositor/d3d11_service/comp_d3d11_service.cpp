@@ -14298,6 +14298,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	/* #918 diagnosis (DXR_SPLIT_COVER_DIAG), the compose path's arm of the direct
+	 * path's probe: what DXGI handed us, and — with `=2` — a magenta sentinel, so
+	 * the post-weave sample reads "the DP drew here" directly rather than by
+	 * inference. Off by default; two staging maps per frame when on. */
+	const int compose_cover_mode = sys->split_active ? dxr_split_cover_diag_mode() : 0;
+	uint32_t compose_cover_pre[5] = {};
+	bool compose_cover_pre_ok = false;
+	uint32_t compose_bb_w = 0, compose_bb_h = 0;
+	if (compose_cover_mode > 0 && mc->back_buffer_rtv) {
+		pipeline_rtv_dims(mc->back_buffer_rtv.get(), &compose_bb_w, &compose_bb_h);
+		compose_cover_pre_ok = dxr_split_cover_sample(sys, mc->back_buffer_rtv.get(), nullptr, compose_bb_w,
+		                                              compose_bb_h, compose_cover_pre);
+		if (compose_cover_mode >= 2) {
+			const float sentinel[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+			svc_out_context(sys)->ClearRenderTargetView(mc->back_buffer_rtv.get(), sentinel);
+		}
+	}
+
 	// Run DP on cropped atlas → back buffer
 	if (compose_dp != nullptr && dp_input_srv && mc->back_buffer_rtv) {
 		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
@@ -14380,6 +14398,44 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		wil::com_ptr<ID3D11Resource> back_buffer;
 		mc->back_buffer_rtv->GetResource(back_buffer.put());
 		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
+	}
+
+	if (compose_cover_mode > 0 && mc->back_buffer_rtv) {
+		uint32_t cover_post[5] = {};
+		if (dxr_split_cover_sample(sys, mc->back_buffer_rtv.get(), nullptr, compose_bb_w, compose_bb_h,
+		                           cover_post)) {
+			const int pre_black = compose_cover_pre_ok && dxr_split_cover_all_black(compose_cover_pre);
+			const int post_black = dxr_split_cover_all_black(cover_post);
+			// What the DP was HANDED. Black here means the black arrived from
+			// upstream (the composite, the crop, the crossing) rather than from
+			// the weave.
+			int in_black = 0;
+			if (dp_input_srv != nullptr) {
+				uint32_t cover_in[5] = {};
+				if (dxr_split_cover_sample(sys, nullptr, dp_input_srv, 0, 0, cover_in)) {
+					in_black = dxr_split_cover_all_black(cover_in);
+				}
+			}
+			int survivors = 0;
+			for (uint32_t i = 0; i < 5; i++) {
+				const bool untouched = (compose_cover_mode >= 2)
+				                           ? ((cover_post[i] & 0x00ffffffu) == 0x00ff00ffu)
+				                           : (compose_cover_pre_ok && cover_post[i] == compose_cover_pre[i]);
+				if (untouched) {
+					survivors++;
+				}
+			}
+			struct xrt_eye_positions ep = {};
+			if (mc->display_processor != nullptr) {
+				xrt_display_processor_d3d11_get_predicted_eye_positions(mc->display_processor, &ep);
+			}
+			dxr_split_cover_note(sys,
+			                     survivors == 0   ? SPLIT_COVER_FULL
+			                     : survivors == 5 ? SPLIT_COVER_NONE
+			                                      : SPLIT_COVER_PARTIAL,
+			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep,
+			                     g_weave_latency_workspace.measured_r_ns);
+		}
 	}
 
 	// Phase 8: screenshot file-trigger now routes through the same capture path
