@@ -148,10 +148,11 @@ and present-owner (`SELF`) clients are structurally ineligible — the weave des
 the client opened on the app adapter and presents itself — so the panel display processor's bind key
 carries the device alongside the window, and migrates (dwell-limited) when focus crosses that
 boundary. The service's COMPOSE path (a workspace controller attached) is **not** split yet: the
-split suspends for as long as the shell is attached and resumes on detach. On split sessions
-`DXR_APP_HWND_LATENCY` defaults to **1** rather than 2, because depth 2 exists to hide a flip slot
-that did not return within a display period — and it did not return because the present crossed
-adapters.
+split suspends for as long as the shell is attached and resumes on detach. `DXR_APP_HWND_LATENCY` **stays at 2** on split
+sessions: the expectation was that a scanout-local chain no longer needs depth 2's slack, and the
+2x2 said the opposite — off the split depth makes no difference (16.56 / 16.57 ms p50), on the split
+depth 1 costs a whole extra refresh (32.70 ms p50) because the weave consumes a slot the bridge
+landed a frame ago and a single buffer serialises the present against the copy legs.
 
 #918 stays **open**: the split is still opt-in everywhere and the compose path, the wish mask on the
 output device and the hardening pass are the remaining PRs. Cross-adapter sharing has its own traps: D3D11 has no

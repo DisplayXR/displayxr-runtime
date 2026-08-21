@@ -173,23 +173,39 @@ dxr_late_weave_enabled()
  * without a rebuild.
  */
 /*
- * #918: and the DEFAULT is 1 again when the output-device split is on, because
- * the comment above describes precisely the tax the split removes. Depth 2 was
- * bought to hide a flip slot that did not come back within a display period —
- * and it did not come back because the present crossed adapters. With the chain
- * created on the SCANOUT device the flip is local, so the slack has nothing to
- * cover and costs a whole refresh of latency. Measured, not assumed: T3 in the
- * PR's hardware matrix holds `pipe_active_skip` at ~0 with ~600 presents/10 s at
- * depth 1; if it had not, the default would have stayed 2.
+ * #918: the default STAYS 2 under the output-device split — measured, and the
+ * measurement went the other way from the design's expectation, so this is worth
+ * stating precisely.
  *
- * Env still overrides in both directions, so the skip ratio in `[RENDER]` can be
- * A/B'd against either default without a rebuild.
+ * The expectation was that depth 2 exists only to hide a flip slot that did not
+ * come back within a display period, that it did not come back because the
+ * present crossed adapters, and that a scanout-local chain therefore wants depth
+ * 1 again. The 2×2 says otherwise (forced-IPC `cube_handle_d3d11_win`, APP_HWND
+ * presenter, R = weave→scanout p50/p95 over ~2000-2900 paired samples each):
+ *
+ *   |            | depth 1        | depth 2        |
+ *   |------------|----------------|----------------|
+ *   | split off  | 16.57 / 16.62  | 16.56 / 16.62  |
+ *   | split on   | 32.70 / 32.86  | 16.15 / 32.62  |
+ *
+ * Off the split, depth does not matter at all. ON the split, depth 1 costs a
+ * whole extra refresh: the weave consumes a slot the bridge landed a frame ago,
+ * and with a single buffer the present serialises against the copy legs instead
+ * of overlapping them. Depth 2 buys that overlap back (p50 16.15) at the cost of
+ * a bimodal tail (p95 32.62).
+ *
+ * So `split` is taken and deliberately NOT used to change the default; it stays
+ * a parameter because the moment PR 4/5 change what the split costs per frame,
+ * this is the decision that has to be re-measured, and a bool nobody passes is a
+ * decision nobody revisits. `DXR_APP_HWND_LATENCY=1` remains available for the
+ * A/B without a rebuild.
  */
 static UINT
 dxr_app_hwnd_latency(bool split)
 {
+	(void)split; // see the 2×2 above — measured, not assumed
 	const char *e = getenv("DXR_APP_HWND_LATENCY");
-	int v = (e != nullptr && e[0] != '\0') ? atoi(e) : (split ? 1 : 2);
+	int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 2;
 	if (v < 1) {
 		v = 1;
 	}
