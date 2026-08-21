@@ -8002,8 +8002,8 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
 			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u window_s=10",
 			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
-			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk,
-			    mk, ns, oc);
+			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk, mk,
+			    ns, oc);
 		}
 	}
 
@@ -14353,27 +14353,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// alpha-gate between compose ticks, and nothing flipped it back for
 		// the compose itself.
 		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
-		pipeline_dp_set_encoding(mc, compose_dp,
-		                         compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED,
-		                         "compose");
+		pipeline_dp_set_encoding(
+		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
 		g_weave_latency_workspace.mark_weave("workspace");
 		// Timing feedback: measured weave→scanout of the last completed frame
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
 		// predictor's exact horizon.
-		xrt_display_processor_d3d11_set_frame_timing(
-		    compose_dp, g_weave_latency_workspace.measured_r_ns,
-		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		xrt_display_processor_d3d11_set_frame_timing(compose_dp, g_weave_latency_workspace.measured_r_ns,
+		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		// #918: `weave_view_*` is `dp_view_*` off the split, and the dims of the
 		// slot actually being woven under it — which through a resize the R2
 		// hysteresis survived can be one frame behind the live box. The DP derives
 		// its tile stride from the atlas width, so weaving a surviving slot at the
 		// CURRENT box would slice every tile at the wrong offset.
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
-		xrt_display_processor_d3d11_process_atlas(
-		    compose_dp, svc_out_context(sys), dp_input_srv,
-		    weave_view_w, weave_view_h, sys->tile_columns, sys->tile_rows,
-		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
-		    0, 0, 0, 0);
+		xrt_display_processor_d3d11_process_atlas(compose_dp, svc_out_context(sys), dp_input_srv, weave_view_w,
+		                                          weave_view_h, sys->tile_columns, sys->tile_rows,
+		                                          DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h, 0, 0, 0, 0);
 	} else if (sys->split_active && dp_input_srv && mc->back_buffer_rtv) {
 		/*
 		 * #918 — the no-DP fallback UNDER THE SPLIT, the compose path's copy of
@@ -14393,7 +14389,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			uint32_t chh = (sys->tile_rows * weave_view_h) < bh ? (sys->tile_rows * weave_view_h) : bh;
 			if (cw > 0 && chh > 0) {
 				D3D11_BOX box = {0, 0, 0, cw, chh, 1};
-				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0, &box);
+				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0,
+				                                            &box);
 			}
 		}
 	} else if (mc->back_buffer_rtv && mc->combined_atlas && !sys->split_active) {
@@ -14421,9 +14418,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 			int survivors = 0;
 			for (uint32_t i = 0; i < 5; i++) {
-				const bool untouched = (compose_cover_mode >= 2)
-				                           ? ((cover_post[i] & 0x00ffffffu) == 0x00ff00ffu)
-				                           : (compose_cover_pre_ok && cover_post[i] == compose_cover_pre[i]);
+				const bool untouched =
+				    (compose_cover_mode >= 2)
+				        ? ((cover_post[i] & 0x00ffffffu) == 0x00ff00ffu)
+				        : (compose_cover_pre_ok && cover_post[i] == compose_cover_pre[i]);
 				if (untouched) {
 					survivors++;
 				}
