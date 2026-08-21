@@ -153,6 +153,22 @@ if ($caps -ne $null -and $caps.displayxr -ne $null -and $caps.displayxr.info) {
     if ($caps.displayxr.info -match "git-tag:\s+'([^']+)'") { $runtimeTag = $Matches[1] }
     if ($caps.displayxr.info -match "version='([^']+)'") { $pluginVer = $Matches[1] }
 }
+# Runtime UNDER TEST: the cli reports the INSTALLED runtime, which is not what
+# the arms loaded when runtimeJson pointed elsewhere (measured: a dev build in
+# Program Files leaked '-128-NOTFOUND' into cards whose arms ran the build
+# tree). The truth is the per-process 'loaded from:' WARN line in the
+# harvested app logs - authoritative by definition.
+$armRuntime = '?'
+$logDir = Join-Path $ResultsDir 'dxr-logs'
+if (Test-Path $logDir) {
+    foreach ($lf in (Get-ChildItem $logDir -Filter '*.log' | Sort-Object LastWriteTime -Descending)) {
+        $ln = (Select-String -Path $lf.FullName -Pattern "runtime .* '([^']+)' loaded from: (.+?) \(XR_RUNTIME_JSON" | Select-Object -First 1)
+        if ($ln -ne $null) {
+            $armRuntime = ($ln.Matches[0].Groups[1].Value + ' @ ' + $ln.Matches[0].Groups[2].Value)
+            break
+        }
+    }
+}
 $panel = '?'
 if ($caps -ne $null) {
     $act = @($caps.adapters | Where-Object { $_.activeMode -ne $null }) | Select-Object -First 1
@@ -181,7 +197,8 @@ $out += '|---|---|'
 $out += ('| host | ' + (CapStr $(if ($caps) { $caps.hostname } else { $null })) + ' |')
 $out += ('| date (UTC) | ' + (CapStr $(if ($caps) { $caps.probedAtUtc } else { $null })) + ' |')
 $out += ('| kit / results | ' + (CapStr $(if ($man) { $man.kit + ' ' + $man.version } else { $null })) + ' / ' + (Split-Path $ResultsDir -Leaf) + ' |')
-$out += ('| runtime | ' + $runtimeTag + ' |')
+$out += ('| runtime (arms loaded) | ' + $armRuntime + ' |')
+$out += ('| runtime (installed, via cli) | ' + $runtimeTag + ' |')
 $out += ('| display plug-in | ' + $pluginVer + ' |')
 $out += ('| scanout | ' + $panel + '  LUID ' + (CapStr $(if ($caps) { $caps.scanoutLuid } else { $null })) + ' |')
 $out += ('| SR Platform | ' + (CapStr $(if ($caps) { $caps.srPlatform } else { $null })) + ' |')
