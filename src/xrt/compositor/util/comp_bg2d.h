@@ -36,6 +36,20 @@
  *
  * The image is opaque, so premultiplied and straight RGBA agree — the slot's
  * premultiplied contract is satisfied by construction.
+ *
+ * ## Slot-16 lifetime (#1120)
+ *
+ * The view handed to `set_background_2d` is **borrowed**: the DP samples it in a
+ * compose pass it submits itself and, since L11, does not wait on. So every
+ * mutation of the image on this side is ordered against that in-flight read —
+ * a write-after-read barrier for a re-upload, a queue drain before a destroy.
+ * Two knobs exist around it, both off/inert by default:
+ *
+ *   `debug.dxr.bg2d.sync`   / `DXR_BG2D_SYNC`   0 → restore the pre-#1120 racy
+ *                                               ordering on the same build (A/B).
+ *   `debug.dxr.bg2d.jiggle` / `DXR_BG2D_JIGGLE` HZ → perturb the canvas rect at
+ *                                               HZ so the re-crop + teardown +
+ *                                               re-upload path runs every frame.
  */
 
 #pragma once

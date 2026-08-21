@@ -182,6 +182,93 @@ comp_bg2d_enabled(void)
 
 /*
  *
+ * Slot-16 lifetime synchronisation (#1120).
+ *
+ */
+
+//! Read a small integer knob: `debug.dxr.<prop>` on Android, `<env>` elsewhere.
+static int
+bg2d_int_knob(const char *prop, const char *env, int dflt)
+{
+#ifdef XRT_OS_ANDROID
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(prop, buf) > 0 && buf[0] != '\0') {
+		return atoi(buf);
+	}
+#else
+	(void)prop;
+#endif
+	const char *e = getenv(env);
+	if (e != NULL && e[0] != '\0') {
+		return atoi(e);
+	}
+	return dflt;
+}
+
+/*!
+ * Is the #1120 slot-16 lifetime synchronisation armed? On by default; set
+ * `debug.dxr.bg2d.sync` / `DXR_BG2D_SYNC` to 0 to restore the pre-#1120
+ * (racy) behaviour **on the same build**, which is what makes the A/B a
+ * one-binary experiment rather than a two-build one.
+ */
+static bool
+bg2d_sync_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		cached = bg2d_int_knob("debug.dxr.bg2d.sync", "DXR_BG2D_SYNC", 1) != 0 ? 1 : 0;
+		if (cached == 0) {
+			U_LOG_W(
+			    "bg2d(#1120): slot-16 sync DISABLED by request — the backdrop image may be "
+			    "destroyed/overwritten under an in-flight DP compose. A/B only.");
+		}
+	}
+	return cached == 1;
+}
+
+/*!
+ * Drain the queue the DP composes on, before this side mutates or frees the
+ * image the DP is sampling (#1120).
+ *
+ * ## Why a CPU wait, and why this queue
+ *
+ * Slot 16 hands the DP a **borrowed** `VkImageView` that it samples in its own,
+ * self-submitted compose pass. Since L11 (leia #176) that pass is GPU-synced —
+ * it signals a semaphore the weave waits on and arms a fence nobody waits until
+ * the *next* compose — so when control returns here, frame N's compose can still
+ * be reading `st->image`. Destroying it then is undefined behaviour, and it is
+ * reachable **per frame**: the `BG2D_MAP_DROP` branch and any change of the
+ * upload dims both tear down.
+ *
+ * A pipeline barrier cannot help a *destroy* (there is no object left to
+ * synchronise), so the wait is a real one. It is scoped to `vk->main_queue->queue`
+ * because that is the field `compose_pre_weave` reads at submit time, and both it
+ * and this run on the compositor thread under the same lock — so it is the same
+ * queue by construction, not by assumption. That is also exactly the scope
+ * `bg2d_build` has always waited on *after* its upload.
+ *
+ * Cost is zero in the steady state: nothing here mutates unless the capture
+ * geometry actually changed, and `uploaded_once` gates out every path where the
+ * DP was never handed a view in the first place.
+ */
+static void
+bg2d_sync_before_mutate(const struct comp_bg2d_state *st, struct vk_bundle *vk)
+{
+	if (st == NULL || vk == NULL || !st->uploaded_once || st->image == VK_NULL_HANDLE) {
+		return;
+	}
+	if (vk->main_queue == NULL || vk->main_queue->queue == VK_NULL_HANDLE) {
+		return;
+	}
+	if (!bg2d_sync_enabled()) {
+		return;
+	}
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+}
+
+
+/*
+ *
  * GPU resources.
  *
  */
@@ -192,6 +279,24 @@ comp_bg2d_teardown(struct comp_bg2d_state *st, struct vk_bundle *vk)
 	if (st == NULL) {
 		return;
 	}
+	// #1120 churn accounting. Every destroy here is one exposure of the
+	// lifetime race, so under `debug.dxr.bg2d.jiggle` this counter is what
+	// turns "we measured no flash" into "we measured no flash across N
+	// exposures" — without it the null result says nothing. Only counts a
+	// teardown that actually frees an image the DP was handed.
+	if (st->uploaded_once && st->image != VK_NULL_HANDLE) {
+		static uint32_t destroys = 0;
+		if (++destroys % 100u == 0u) {
+			U_LOG_W(
+			    "bg2d(#1120): %u live-image teardowns so far (each one destroys an image "
+			    "the DP may still be sampling; sync=%d)",
+			    destroys, (int)bg2d_sync_enabled());
+		}
+	}
+	// #1120 — the DP may still be sampling st->image from a compose it
+	// submitted for the previous frame and nobody has waited on. Drain first;
+	// no-op unless a view was actually handed out.
+	bg2d_sync_before_mutate(st, vk);
 	// #174 crop scratch — plain host memory, so it goes regardless of `vk`.
 	free(st->crop_scratch);
 	st->crop_scratch = NULL;
@@ -409,6 +514,23 @@ bg2d_build(struct comp_bg2d_state *st,
 	// SHADER_READ_ONLY_OPTIMAL from the previous upload; the very first one
 	// finds it UNDEFINED. Getting this wrong is a validation error and, on a
 	// tiler, a real corruption.
+	//
+	// #1120 — and on a refresh it is also still being READ. The DP's compose
+	// for the previous frame samples this exact image and, since L11, is not
+	// waited on, so this copy is a write-after-read hazard against it. The
+	// first synchronisation scope of a barrier includes everything submitted
+	// EARLIER ON THE SAME QUEUE, and the compose submits on the same
+	// `vk->main_queue->queue` this upload does — so naming the compose's stage
+	// here is a complete, zero-cost fix for the overwrite half of the race.
+	// `srcAccessMask` stays 0 deliberately: WAR needs an execution dependency,
+	// not a memory one, and a read has nothing to flush.
+	//
+	// The first upload has no previous reader, hence TOP_OF_PIPE there — and
+	// the same value is used throughout when the #1120 sync is switched off,
+	// so `debug.dxr.bg2d.sync=0` restores the old code path exactly.
+	const VkPipelineStageFlags upload_src_stage = (st->uploaded_once && bg2d_sync_enabled())
+	                                                  ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+	                                                  : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
 	VkImageMemoryBarrier to_dst = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = 0,
@@ -420,8 +542,8 @@ bg2d_build(struct comp_bg2d_state *st,
 	    .image = st->image,
 	    .subresourceRange = range,
 	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-	                         NULL, 1, &to_dst);
+	vk->vkCmdPipelineBarrier(cmd, upload_src_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+	                         &to_dst);
 
 	VkBufferImageCopy region = {
 	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -698,6 +820,59 @@ bg2d_pick_map_extent(const struct xrt_rect *canvas,
 	return BG2D_MAP_DROP;
 }
 
+/*!
+ * Deliberate canvas churn, for proving the #1120 lifetime race exists (and then
+ * that it is gone).
+ *
+ * `debug.dxr.bg2d.jiggle` / `DXR_BG2D_JIGGLE` = HZ. Off (0) by default and
+ * therefore inert in every shipping configuration; it exists because the race is
+ * only reachable when the canvas rect **moves**, and in the steady state it
+ * never does — a static canvas takes the no-op path in `comp_bg2d_ensure` and
+ * touches no Vulkan object at all. Real churn (a device rotation, the avatar's
+ * input-shaper resizing its overlay) is rare and hand-driven, which makes it a
+ * poor A/B instrument.
+ *
+ * The perturbation is chosen to fire BOTH mutation paths at HZ:
+ *   phase 0 → the caller's rect verbatim,
+ *   phase 1 → x + 16, w − 16 — a moved rect (so `geometry_moved` re-acquires and
+ *             re-uploads) whose *extent* also differs (so the crop dims change
+ *             and `comp_bg2d_ensure` tears the image down and rebuilds it).
+ *
+ * Writes into caller-owned scratch; the caller's rect is never mutated.
+ *
+ * @return true when @p out has been filled and should be used instead of @p in.
+ */
+static bool
+bg2d_jiggle_apply(const struct xrt_rect *in, struct xrt_rect *out)
+{
+	static int hz = -1;
+	if (hz < 0) {
+		hz = bg2d_int_knob("debug.dxr.bg2d.jiggle", "DXR_BG2D_JIGGLE", 0);
+		if (hz < 0) {
+			hz = 0;
+		}
+		if (hz > 0) {
+			U_LOG_W(
+			    "bg2d(#1120): JIGGLE TEST MODE at %d Hz — the canvas rect is being "
+			    "perturbed by +16/-16 px to force a re-crop and a teardown every "
+			    "toggle. This is a test knob; set debug.dxr.bg2d.jiggle 0 to stop.",
+			    hz);
+		}
+	}
+	if (hz == 0 || in == NULL || out == NULL) {
+		return false;
+	}
+	// Phase toggles at HZ, i.e. HZ geometry changes per second.
+	const uint64_t now = os_monotonic_get_ns();
+	const uint64_t phase = (now / (1000000000ULL / (uint64_t)hz)) & 1ULL;
+	*out = *in;
+	if (phase != 0 && in->extent.w > 32) {
+		out->offset.w = in->offset.w + 16;
+		out->extent.w = in->extent.w - 16;
+	}
+	return true;
+}
+
 //! Repack a sub-rect of @p src into @p scratch (grown as needed). NULL on OOM.
 static const uint8_t *
 bg2d_repack_crop(const uint8_t *src,
@@ -741,6 +916,14 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 	const struct bg2d_config *cfg = bg2d_config_get();
 	if (!cfg->enabled || st->failed) {
 		return VK_NULL_HANDLE;
+	}
+
+	// #1120 test churn. Inert unless debug.dxr.bg2d.jiggle is set; when it is,
+	// this is the ONLY input that has to move for the whole re-crop / teardown /
+	// re-upload path to run every frame.
+	struct xrt_rect jiggled = {0};
+	if (bg2d_jiggle_apply(canvas_on_panel, &jiggled)) {
+		canvas_on_panel = &jiggled;
 	}
 
 	if (cfg->capture) {
