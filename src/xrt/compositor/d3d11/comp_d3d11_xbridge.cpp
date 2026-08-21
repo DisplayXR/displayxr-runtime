@@ -1921,9 +1921,10 @@ xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
 		}
 	}
 	xb->ingress_mode = XB_INGRESS_STAGED;
-	U_LOG_W("d3d11 xbridge: %s — using the staged ingress ring "
-	        "(one extra app-device copy per frame) (#918)",
-	        why);
+	U_LOG_W(
+	    "d3d11 xbridge: %s — using the staged ingress ring "
+	    "(one extra app-device copy per frame) (#918)",
+	    why);
 	return true;
 }
 
