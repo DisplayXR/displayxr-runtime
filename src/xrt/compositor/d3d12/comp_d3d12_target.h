@@ -75,7 +75,7 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
  * DXR_WEAVE_LATENCY_CSV is set. No-op otherwise.
  */
 void
-comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns);
+comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns, bool mode_3d);
 
 /*!
  * #868: pace a repaint to the panel — the wait half of
@@ -100,7 +100,7 @@ comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target);
  * is @ref comp_d3d12_target_repaint_pace, called earlier and unlocked.
  */
 void
-comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target);
+comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target, bool mode_3d);
 
 /*!
  * Note that xrWaitFrame just returned, so the span to this frame's weave can

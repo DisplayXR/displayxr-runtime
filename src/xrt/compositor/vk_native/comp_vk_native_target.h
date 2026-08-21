@@ -110,7 +110,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
  * weave is recorded for the current frame. No-op when the harness is off.
  */
 void
-comp_vk_native_target_weave_mark(struct comp_vk_native_target *target);
+comp_vk_native_target_weave_mark(struct comp_vk_native_target *target, bool mode_3d);
 
 /*!
  * #868: repaint counterpart of @ref comp_vk_native_target_weave_mark.
@@ -122,7 +122,7 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target);
  * where it dropped the residual's agreement with reality from 93% to 2%.
  */
 void
-comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target);
+comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, bool mode_3d);
 
 /*!
  * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock.

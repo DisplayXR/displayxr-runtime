@@ -32,11 +32,13 @@
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 #include "util/comp_weave_latency_win.h"
+#include "util/comp_frame_witness.h"
 
 // One in-process D3D11 target per compositor per app process — file-scope
 // harness + late-weave state (mirrors comp_d3d12_target.cpp; the target
 // struct is memset-adjacent zero-init so C++ members live at file scope).
 static weave_latency_log g_weave_latency_d3d11;
+static comp_frame_witness g_frame_witness_d3d11{"d3d11"};
 
 static bool
 dxr_late_weave_enabled(void)
@@ -626,9 +628,10 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
  * this present, so there is nothing to score it against).
  */
 extern "C" void
-comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target)
+comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode_3d)
 {
 	(void)target;
+	g_frame_witness_d3d11.count_weave(true, mode_3d);
 	g_weave_latency_d3d11.mark_weave("d3d11", 0, true);
 	// Each repaint's Present releases a waitable token nobody waits for; the
 	// app's weave_mark drains the excess on its next frame (#868 interplay).
@@ -636,8 +639,9 @@ comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target)
 }
 
 extern "C" void
-comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns)
+comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
 {
+	g_frame_witness_d3d11.count_weave(false, mode_3d);
 	// Late-weave pacing, two stages. Stage 1: the waitable caps the queue.
 	// Stage 2 is chain-dependent — opaque flip chains wait on frame
 	// statistics until the previous present actually reaches glass (DWM
@@ -832,6 +836,11 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		}
 	}
 	g_present_wd_enter_ns.store(0, std::memory_order_release);
+	if (SUCCEEDED(hr)) {
+		// Witness counts frames that actually reached the chain — the 50 ms
+		// drop path above intentionally shows up as a lower presents/s.
+		g_frame_witness_d3d11.count_present();
+	}
 	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);
 	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&g_last_present_count);

@@ -1896,9 +1896,9 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// prediction ledger — it has no app frame and no promised photon time
 	// behind it.
 	if (is_repaint) {
-		comp_d3d12_target_weave_mark_repaint(c->target);
+		comp_d3d12_target_weave_mark_repaint(c->target, c->hardware_display_3d);
 	} else {
-		comp_d3d12_target_weave_mark(c->target, c->last_display_time_ns);
+		comp_d3d12_target_weave_mark(c->target, c->last_display_time_ns, c->hardware_display_3d);
 	}
 
 	// Timing feedback: hand the DP last frame's MEASURED weave→scanout residual

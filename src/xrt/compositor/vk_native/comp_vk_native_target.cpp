@@ -41,6 +41,11 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #endif
 #include "os/os_time.h"
 
+// Portable (all OSes) — the witness is exactly for paths/platforms the
+// Windows-only latency harness cannot measure.
+#include "util/comp_frame_witness.h"
+static comp_frame_witness g_frame_witness_vk{"vk"};
+
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -1897,19 +1902,24 @@ wl_get(struct comp_vk_native_target *target)
 	});
 
 	target->wl = wl;
-	U_LOG_W("Weave-latency harness: VK present_wait scanout timing active (%s)", path);
 	// #1044: the DComp bridge never presents through the VK swapchain the
 	// waiter watches (present dispatches to dcomp_present before the F-row
 	// writer), so on that path this CSV gets a header and nothing else. The
 	// bridge is set up in target_create, before any mark/present can reach
 	// this first wl_get, so dcomp_active is already settled here — one-shot
-	// by construction (wl_get creates the harness once per target).
+	// by construction (wl_get creates the harness once per target). Never
+	// claim "active" on that path: the first line is the one a log reader
+	// takes as the verdict (measured — the avatar dGPU ladder read the old
+	// "active" line as a working instrument over an empty CSV).
 	if (target->dcomp_active) {
 		U_LOG_W(
-		    "Weave-latency harness: DComp-bridge mode — %s will contain a "
-		    "header and NO rows; this path never presents through the VK "
-		    "swapchain the waiter watches (#1044)",
+		    "Weave-latency harness: ARMED-DORMANT — DComp-bridge presentation "
+		    "never reaches the VK swapchain the waiter watches; %s will "
+		    "contain a header and NO rows (#1044). Use DXR_FRAME_WITNESS=1 "
+		    "for rate counters on this path.",
 		    path);
+	} else {
+		U_LOG_W("Weave-latency harness: VK present_wait scanout timing active (%s)", path);
 	}
 	return wl;
 }
@@ -1944,8 +1954,9 @@ wl_teardown(struct comp_vk_native_target *target)
 #endif // XRT_OS_WINDOWS
 
 void
-comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target)
+comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, bool mode_3d)
 {
+	g_frame_witness_vk.count_weave(true, mode_3d);
 #ifdef XRT_OS_WINDOWS
 	/*
 	 * Deliberately NOT the app-frame mark. A repaint updates only
@@ -2060,8 +2071,9 @@ comp_vk_native_target_repaint_pace(struct comp_vk_native_target *target)
 }
 
 void
-comp_vk_native_target_weave_mark(struct comp_vk_native_target *target)
+comp_vk_native_target_weave_mark(struct comp_vk_native_target *target, bool mode_3d)
 {
+	g_frame_witness_vk.count_weave(false, mode_3d);
 #ifdef XRT_OS_WINDOWS
 	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
@@ -2498,6 +2510,11 @@ xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue)
 {
 	struct vk_bundle *vk = target->vk;
+
+	// Witness counts at the dispatch point so the DComp-bridge path (which
+	// never reaches the WSI present below) is counted too — the whole point
+	// of the witness is holding on paths the latency harness cannot see.
+	g_frame_witness_vk.count_present();
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {

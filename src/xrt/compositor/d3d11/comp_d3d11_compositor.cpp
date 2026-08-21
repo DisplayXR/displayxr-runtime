@@ -2072,9 +2072,9 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// repaint paced itself unlocked and stays out of the governor EMA and the
 	// #867 prediction ledger.
 	if (is_repaint) {
-		comp_d3d11_target_weave_mark_repaint(c->target);
+		comp_d3d11_target_weave_mark_repaint(c->target, c->hardware_display_3d);
 	} else {
-		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns);
+		comp_d3d11_target_weave_mark(c->target, c->last_display_time_ns, c->hardware_display_3d);
 	}
 
 	/*
