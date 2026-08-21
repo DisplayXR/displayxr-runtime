@@ -104,6 +104,14 @@ function Invoke-ArmSample {
         $devJson = $null
         if ($cfg.PSObject.Properties['runtimeJson'] -ne $null) { $devJson = $cfg.runtimeJson }
         if (-not [string]::IsNullOrEmpty($devJson)) { $lines += ('set "XR_RUNTIME_JSON={0}"' -f $devJson) }
+        # runtimeJson ALONE cannot drive a from-source runtime: the build-tree
+        # client DLL has no sibling dependency DLLs, so every registered
+        # plug-in fails LoadLibrary err=126 and the run silently degrades to
+        # no-DP on every app arm (Arc report 2026-08-21). runtimePath prepends
+        # the dev _packagein to PATH, mirroring the generated run_*.bat.
+        $devPath = $null
+        if ($cfg.PSObject.Properties['runtimePath'] -ne $null) { $devPath = $cfg.runtimePath }
+        if (-not [string]::IsNullOrEmpty($devPath)) { $lines += ('set "PATH={0};%PATH%"' -f $devPath) }
         foreach ($kv in $cfg.baseEnv.PSObject.Properties) { $lines += ('set "{0}={1}"' -f $kv.Name, $kv.Value) }
         foreach ($kv in $arm.env.PSObject.Properties)     { $lines += ('set "{0}={1}"' -f $kv.Name, $kv.Value) }
         if ($cfg.app.windowSize) { $lines += ('set "DXR_AVATAR_WINDOW={0}"' -f $cfg.app.windowSize) }
@@ -135,14 +143,24 @@ function Invoke-ArmSample {
         } else { $flags += 'NO_HWND' }
 
         # Mode set: closed loop on the witness (V toggles; witness verifies).
+        # Two rules from the Arc report's measured oscillation (3d -> mixed x4
+        # -> 3d -> ...): only act on a witness line STRICTLY NEWER than the
+        # last keypress, and treat mixed/idle as a transition in progress
+        # (wait), never as wrong-mode (press again).
         if ($arm.mode -ne $null -and $hwnd -ne [IntPtr]::Zero) {
-            $deadline = (Get-Date).AddSeconds(40)
+            $deadline = (Get-Date).AddSeconds(45)
             $settled = $false
+            $pressedAt = 0   # witness-line count when V was last sent
             while ((Get-Date) -lt $deadline) {
                 Start-Sleep -Seconds 6   # one witness interval
-                $wl = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id)) | Select-Object -Last 1
-                if ($wl -ne $null -and $wl.Mode -eq $arm.mode) { $settled = $true; break }
-                if ($wl -ne $null) { Send-KeyToWindow -hwnd $hwnd -vk 0x56 }  # 'V'
+                $all = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id))
+                if ($all.Count -eq 0) { continue }
+                $wl = $all[$all.Count - 1]
+                if ($wl.Mode -eq $arm.mode) { $settled = $true; break }
+                if ($all.Count -gt $pressedAt -and $wl.Mode -ne 'mixed' -and $wl.Mode -ne 'idle') {
+                    Send-KeyToWindow -hwnd $hwnd -vk 0x56   # 'V'
+                    $pressedAt = $all.Count
+                }
             }
             if (-not $settled) { $flags += ('MODE_UNSETTLED_want_' + $arm.mode) }
         }

@@ -16,7 +16,8 @@
     "DXR_FRAME_WITNESS": "5",
     "VK_LOADER_LAYERS_DISABLE": "*",
     "VK_LOADER_LAYERS_ENABLE": "VK_LAYER_DXR_queue_lock",
-    "DXR_AVATAR_IDLE_THROTTLE": "0"
+    "DXR_AVATAR_IDLE_THROTTLE": "0",
+    "DXR_VK_FORCE_GPU": "scanout"
   },
   "cursorOrbit": {
     "radiusPx": 200,
