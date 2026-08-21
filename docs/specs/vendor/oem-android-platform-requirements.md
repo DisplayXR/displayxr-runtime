@@ -59,7 +59,7 @@ Tiering:
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence | REQUIRED | **PLATFORM** | Works today — don't regress |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
-| **S2** | **Input-passthrough / trusted-overlay exemption** for region click-through at full opacity | STRONGLY REC. | **PLATFORM** | OPEN — *pending validation* |
+| **S2** | **Input-passthrough exemption** for region click-through at full opacity — *and* scoping the per-Activity input sink | STRONGLY REC. | **PLATFORM** | **OPEN — VALIDATED-BLOCKED** |
 | **S3** | **Wait-semaphore hook** into the vendor interlacer (keep compose→weave on-GPU) | STRONGLY REC. | VENDOR | In progress (ours) |
 | **S4** | **ADPF / PowerHAL hint sessions** (`APerformanceHint_createSession`) | STRONGLY REC. | **PLATFORM** | OPEN — unsupported on the reference device |
 | **S5** | Ship the **background-capture service** in firmware, auto-started | STRONGLY REC. | VENDOR + firmware | PRs open |
@@ -617,10 +617,14 @@ backdrop is directly readable by `screencap`.
 
 ### S2 — Input-passthrough / trusted-overlay exemption
 
-**Owner:** **PLATFORM** · **Status:** **OPEN — PENDING VALIDATION.** The
-mechanism list below is design intent derived from the AOSP read-through and from
-the reflection bypass being blocked on the reference ROM; no on-device A/B of an
-exemption has been run yet. · **Traces to:** L13
+**Owner:** **PLATFORM** · **Status:** **OPEN — VALIDATED-BLOCKED.** Measured
+end-to-end on the reference NP02J (Android 13 / SDK 33) against the Architecture-A
+avatar, 2026-08-20. Every mechanism below was exercised or ruled out on device,
+and the exercise turned up a **second, independent blocker the original ask did
+not cover** — see *The second blocker* below, which changes what an OEM has to
+grant. · **Traces to:** L13 · **Evidence:**
+`displayxr-demo-avatar/docs/android-input-passthrough.md`, PR
+[displayxr-demo-avatar#65](https://github.com/DisplayXR/displayxr-demo-avatar/pull/65)
 
 **Mechanism.** Allow a designated package (the runtime, or a signed DisplayXR
 application) to present a window that is **fully opaque** *and* passes touches
@@ -637,10 +641,62 @@ through everywhere except a declared sub-region. Any one of these satisfies it:
 3. **Public per-region touchability.** Promote the per-region touchable API to
    the public SDK, or unblock it for the package:
    `ViewTreeObserver.addOnComputeInternalInsetsListener` +
-   `InternalInsetsInfo.touchableRegion`. It is `@hide`, and the field is
-   blocklisted on Android 14; the well-known double-reflection
-   `VMRuntime.setHiddenApiExemptions` bootstrap is **blocked on the reference
-   ROM**, so there is no application-side route to it.
+   `InternalInsetsInfo.touchableRegion`. **Measured on the reference ROM:** the
+   setter reflects (`setTouchableInsets(I)V` — *"unsupported, reflection,
+   allowed"*) but the field does not — *"`max-target-r`, reflection, **denied**"*
+   — so an app targeting API ≥ 31 can never fill the region in. Blocklisted on
+   Android 13, not merely 14; the `VMRuntime.setHiddenApiExemptions`
+   double-reflection bootstrap is blocked too. No application-side route exists.
+
+4. **Scope the per-Activity input sink** for the package — see below. Without
+   this, mechanisms 1–3 are **necessary but not sufficient** for Architecture A.
+
+**The second blocker — `ActivityRecordInputSink` (new, and decisive).** Android
+12L+ parks an `ActivityRecordInputSink` immediately beneath **every** Activity,
+expressly to stop touches reaching a *different-uid* activity below. Measured
+with the avatar's own window frame deliberately shrunk to a centred 55 % slab:
+
+```
+13: name='… avatar_vk_android/.MainActivity',   frame=[0,576][1600,1984]
+                                                touchableRegion=[0,576][1600,1984]
+14: name='… ActivityRecordInputSink …/.MainActivity',
+        inputConfig=NO_INPUT_CHANNEL | NOT_FOCUSABLE, alpha=1.00,
+        touchableRegion=[-24000,-15999][27199,16000]      ← whole display
+19: name='… QuickstepLauncher',                 frame=[0,0][1600,2560]
+```
+
+A tap on a launcher icon **outside** the slab was swallowed: focus stayed on the
+avatar, the launcher never reacted, and — the tell — **no `Untrusted touch due to
+occlusion` warning was logged**, so this is not the opacity policy at all. The
+sink has `NO_INPUT_CHANNEL`, so the dispatcher selects it as the touched window
+and drops the event silently, and its region is **display-wide and independent of
+our frame** — shrinking the window cannot shrink the sink. (For *backgrounded*
+activities the same sink carries `NOT_TOUCHABLE`; ours does not, i.e. ours is
+live.)
+
+Two consequences an OEM has to act on:
+
+- **The sink sits in front of the untrusted-touch policy.** Granting mechanism 1
+  or 2 alone would change nothing for an Architecture-A app. The ask is therefore
+  *both*: an untrusted-touch/trusted-overlay exemption **and** scoping or
+  disabling `ActivityRecordInputSink` for the designated package.
+- **On stock Android, click-through and Architecture A's own-window are mutually
+  exclusive** — by design, not by omission. In-app input is unaffected; only
+  cross-uid pass-through to the desktop is blocked.
+
+Two collateral findings worth carrying:
+
+- A touch-**modal** window's touchable region is the **whole display** however
+  small its frame is (`WindowState.getSurfaceTouchableRegion` widens it unless
+  `FLAG_NOT_TOUCH_MODAL` or `FLAG_NOT_FOCUSABLE` is set). Any region or frame
+  work is a no-op without that flag; we hit it and it cost a debugging cycle.
+- Untrusted-touch occlusion tests the obscuring window's **frame**, never its
+  touchable region — so region-shaping alone could never have satisfied the
+  opacity rule even if the API had been reachable. An Activity window is
+  `touchOcclusionMode=BLOCK_UNTRUSTED`, the mode **no** window alpha softens;
+  only `TYPE_APPLICATION_OVERLAY` gets `USE_OPACITY` and its ≤ 0.80 escape.
+  (Confirmed on device: the only `USE_OPACITY` window present is the OEM's own
+  `FloatAssist`; `maximum_obscuring_opacity_for_touch = 0.8`.)
 
 **Consequence if absent.** A transparent 3D overlay must choose between two
 broken states:
@@ -664,7 +720,21 @@ the 20 % ghost is gone and transparency is correct. The price is that
 click-through is gone too — a normal app window consumes touches over its whole
 rect, so content behind it is unreachable while it is up. We shipped that trade
 deliberately (full-opacity transparency over click-through), and it is the trade
-this ask reverses.
+this ask reverses. The app-side machinery for the exempted case is implemented
+and shipped **inert** in the avatar demo (silhouette → touchable-region bands, a
+window-frame "slab", `FLAG_NOT_TOUCH_MODAL`), so on a platform that grants this
+ask, arming it is a `setprop` rather than a port.
+
+**One hypothesis to test before the ask is treated as the only route.** The 0.80
+ghost above is a consequence of the overlay being **full-screen**: occlusion
+opacity only accumulates for windows whose *frame* contains the tap. An
+**app-owned `TYPE_APPLICATION_OVERLAY` sized to a tight, screen-relative avatar
+rect** would need no alpha reduction — taps outside its frame are not obscured at
+all — and carries **no** `ActivityRecordInputSink`, because there is no Activity.
+That combination would deliver full opacity *and* click-through on **stock**
+Android, at the cost of `SYSTEM_ALERT_WINDOW`, a keep-alive service, and the
+backgrounding dance Architecture A removed. **Not measured** — recorded as the
+trade study to run, not as a result.
 
 **Acceptance test.**
 
@@ -679,6 +749,12 @@ adb shell dumpsys window windows | grep -A25 <pkg> | grep -iE 'alpha|touchable|t
 # 3. screencap: opaque app pixels contain ZERO launcher contribution
 #    (with the clamp, an 0.80 blend is trivially measurable against a known
 #    background colour).
+
+# AND, for an Architecture-A (Activity-owned) window, the sink must be scoped:
+adb shell dumpsys input | grep -A1 'ActivityRecordInputSink.*<pkg>'
+#   expect: absent, or NOT_TOUCHABLE, or a touchable region that does not cover
+#           the panel. A live sink (NO_INPUT_CHANNEL | NOT_FOCUSABLE with a
+#           display-wide region) silently eats step 2 with nothing in logcat.
 ```
 
 ---
@@ -903,7 +979,7 @@ what is genuinely still open:
 | L10 | "`captureDisplay` + `setExcludeLayers`, or priv-app" | **superseded by L12** | — | Both halves were **wrong**; see S1 |
 | L11 | No wait-semaphore into the interlacer | **S3** | Vendor | In progress (ours) |
 | L12 | No exclude-uid filter in SurfaceFlinger | **S1** | **PLATFORM** | **OPEN — headline** |
-| L13 | No input-passthrough / trusted-overlay exemption | **S2** | **PLATFORM** | OPEN — *pending validation* |
+| L13 | No input-passthrough exemption; **and** `ActivityRecordInputSink` blocks it independently | **S2** | **PLATFORM** | **OPEN — VALIDATED-BLOCKED** on device |
 | — | Orientation from window-adjusted metrics | **R4** | Vendor | **SOLVED** upstream |
 
 ---
