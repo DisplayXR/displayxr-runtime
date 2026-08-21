@@ -3429,9 +3429,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// repaint paced itself unlocked and stays out of the #867
 			// frame-cost ledger — it is not an app frame.
 			if (is_repaint) {
-				comp_vk_native_target_weave_mark_repaint(c->target);
+				comp_vk_native_target_weave_mark_repaint(c->target, c->hardware_display_3d);
 			} else {
-				comp_vk_native_target_weave_mark(c->target);
+				comp_vk_native_target_weave_mark(c->target, c->hardware_display_3d);
 			}
 
 			// Timing feedback: hand the DP last frame's MEASURED

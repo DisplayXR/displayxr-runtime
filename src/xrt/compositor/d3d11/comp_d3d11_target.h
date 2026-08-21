@@ -95,10 +95,11 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
  * Late-weave pacing + weave-latency harness mark. Call immediately before the
  * DP weave on the window path: paces on the previous present's actual scanout
  * when DXR_LATE_WEAVE=1, and timestamps T_weave when DXR_WEAVE_LATENCY_CSV is
- * set. No-op otherwise.
+ * set. No-op otherwise. @p mode_3d feeds the DXR_FRAME_WITNESS counters (was
+ * this a 3D weave or a 2D blit).
  */
 void
-comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns);
+comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d);
 
 /*!
  * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock, and never
@@ -112,7 +113,7 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
  * T_weave only, staying out of the saturation governor and the #867 ledger.
  */
 void
-comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target);
+comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode_3d);
 
 /*!
  * Note that xrWaitFrame just returned, so the span to this frame's weave can

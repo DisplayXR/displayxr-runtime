@@ -32,11 +32,13 @@
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque, "DXR_PRESENT_OPAQUE", false)
 
 #include "util/comp_weave_latency_win.h"
+#include "util/comp_frame_witness.h"
 
 // One in-process D3D12 target per compositor per app process — file-scope
 // harness instance (the target struct is memset after construction, which
 // would clobber the logger's -1 sentinel).
 static weave_latency_log g_weave_latency_d3d12;
+static comp_frame_witness g_frame_witness_d3d12{"d3d12"};
 
 // Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
 // auto-backoff. Lives at file scope for the same memset reason as the log.
@@ -744,9 +746,10 @@ comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target)
 }
 
 extern "C" void
-comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target)
+comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target, bool mode_3d)
 {
 	(void)target;
+	g_frame_witness_d3d12.count_weave(true, mode_3d);
 	g_weave_latency_d3d12.mark_weave("d3d12", 0, true);
 	// Each repaint's Present releases a waitable token nobody waits for; the
 	// app's weave_mark drains the excess on its next frame (#868 interplay).
@@ -754,8 +757,9 @@ comp_d3d12_target_weave_mark_repaint(struct comp_d3d12_target *target)
 }
 
 extern "C" void
-comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns)
+comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
 {
+	g_frame_witness_d3d12.count_weave(false, mode_3d);
 	bool wait_timed_out = false;
 	if (target->frame_latency_waitable != nullptr) {
 		// #868 interplay: repaint presents released tokens no one consumed —
@@ -900,6 +904,9 @@ extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {
 	HRESULT hr = target->swapchain->Present(sync_interval, 0);
+	if (SUCCEEDED(hr)) {
+		g_frame_witness_d3d12.count_present();
+	}
 	g_weave_latency_d3d12.after_present("d3d12", target->swapchain, &g_lw_gov_d3d12);
 	if (SUCCEEDED(hr) && target->frame_latency_waitable != nullptr) {
 		target->swapchain->GetLastPresentCount(&target->last_present_count);
