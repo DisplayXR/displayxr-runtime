@@ -71,7 +71,7 @@ $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $orbitCx = [int]($screen.Width / 2)
 $orbitCy = [int]($screen.Height / 2)
 
-'arm,rep,app_scanout,app_other,dwm,other_gpu,total_gpu,app_cpu,presents_s,weaves_s,repaints_s,mode,window_s,flags' |
+'arm,rep,app_scanout,app_other,dwm,other_gpu,total_gpu,app_cpu,presents_s,weaves_s,repaints_s,mode,window_s,top_other,flags' |
     Out-File -Encoding ascii $csvPath
 
 function Invoke-ArmSample {
@@ -158,12 +158,22 @@ function Invoke-ArmSample {
     $witBefore = 0
     if ($appProc -ne $null) { $witBefore = @(Get-WitnessLines (Get-LatestDxrLog $exeBase $appProc.Id)).Count }
 
-    $cpu0 = Get-CpuSnapshot -procIds $appPids
-    $g0 = Get-GpuSnapshot
-    if (-not $g0.ok) { $flags += 'GPU_COUNTER_FAIL' }
-    Start-Sleep -Seconds $windowSec
-    $g1 = Get-GpuSnapshot
-    $cpu1 = Get-CpuSnapshot -procIds $appPids
+    # The app is already running, so a failed counter sweep just re-samples a
+    # fresh window in place instead of surrendering the whole sample.
+    $g0 = $null; $g1 = $null; $cpu0 = $null; $cpu1 = $null
+    foreach ($attempt in 1..2) {
+        $cpu0 = Get-CpuSnapshot -procIds $appPids
+        $g0 = Get-GpuSnapshot
+        if (-not $g0.ok) { $flags += 'GPU_SWEEP0_RETRY'; continue }
+        Start-Sleep -Seconds $windowSec
+        $g1 = Get-GpuSnapshot
+        $cpu1 = Get-CpuSnapshot -procIds $appPids
+        if ($g1.ok) { break }
+        $flags += 'GPU_SWEEP1_RETRY'
+    }
+    if ($g0 -eq $null -or -not $g0.ok -or $g1 -eq $null -or -not $g1.ok) {
+        $flags += 'GPU_COUNTER_FAIL'
+    }
 
     $wit = @()
     if ($arm.app) {
@@ -176,6 +186,11 @@ function Invoke-ArmSample {
     if ($orbitProc -ne $null) { Stop-Process -Id $orbitProc.Id -Force -ErrorAction SilentlyContinue }
     if ($appProc -ne $null) { Stop-Process -Id $appProc.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
 
+    if ($flags -contains 'GPU_COUNTER_FAIL') {
+        # No usable GPU window - do NOT write a zero row (a zero row poisons
+        # the median; measured: SHIP-M folded to 0 total in the first run).
+        return @{ ok = $false; flags = $flags }
+    }
     $delta = Get-GpuDelta $g0 $g1
     if (-not $delta.ok) { $flags += 'GPU_DELTA_FAIL'; return @{ ok = $false; flags = $flags } }
     $col = Resolve-GpuColumns -deltaRows $delta.rows -appPids $appPids -scanoutLuid $scanoutLuid
@@ -189,9 +204,9 @@ function Invoke-ArmSample {
         $wm = ($wit | Select-Object -Last 1).Mode
     }
 
-    $row = ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}' -f `
+    $row = ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14}' -f `
         $arm.name, $rep, $col.app_scanout, $col.app_other, $col.dwm, $col.other, $col.total, `
-        $appCpu, $wp, $ww, $wr, $wm, $delta.elapsedSec, ($flags -join ';'))
+        $appCpu, $wp, $ww, $wr, $wm, $delta.elapsedSec, $col.top_other, ($flags -join ';'))
     Add-Content -Path $csvPath -Value $row
     Log ('  ' + $row)
     return @{ ok = $true; flags = $flags }
