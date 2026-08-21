@@ -525,6 +525,20 @@ struct multi_compositor
 		uint64_t window_id;   //!< Present-owner window id from bind (future phase use).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous on macOS.
 
+		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
+		//! Recorded here purely as the placement authority's report (ADR-033):
+		//! macOS derives its weave geometry from the input IOSurface, so nothing
+		//! feeds a DP phase slot — but a weave-only session has no
+		//! `session_render`, so this is the ONLY window rect
+		//! multi_compositor_get_window_metrics() can report (#1116).
+		//! @{
+		bool have_geometry;
+		int32_t win_x, win_y;
+		uint32_t win_w, win_h;
+		int32_t win_display_id;
+		bool metrics_logged; //!< One-shot log of the first metrics report.
+		//! @}
+
 		//! @name Cached input import (rebuilt when the IOSurfaceID changes)
 		//! @{
 		void *in_iosurface; //!< Retained IOSurfaceRef (adopted from the IPC receive).
@@ -625,6 +639,7 @@ struct multi_compositor
 		uint32_t win_w, win_h;
 		int32_t win_display_id;
 		bool geometry_dirty; //!< Log the change once, not per frame.
+		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
 		//! @}
 
 		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)

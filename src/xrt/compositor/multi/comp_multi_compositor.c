@@ -2227,6 +2227,111 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 #endif
 	}
 
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+	// XR_DXR_weave present-owner sessions (#1116).
+	//
+	// A weave-only session (`xrWeaveSubmitDXR` caller: its own window, its own
+	// present, no runtime swapchain) never brings up `session_render`, so every
+	// branch above is unreachable for it and the session used to fall out here
+	// with no metrics at all. Downstream that reads as "this session owns the
+	// whole panel": `ipc_try_get_oop_view_poses` takes have_wm=false, the
+	// XR_DXR_display_zones gate drops the chained zone rect, and the Kooima
+	// frustum is built display-scoped over the NATURAL-orientation panel — wrong
+	// aspect AND wrong centre for a rotated or sub-panel window.
+	//
+	// The geometry authority for exactly these sessions already exists: the rect
+	// `xrWeaveBindWindow2DXR` / `xrWeaveSetWindowGeometryDXR` publishes, which
+	// ADR-033 makes the placement owner's own report (the present-owner places
+	// its pixels, so it reports where they land). It was previously consumed only
+	// for the DP's per-window phase slot; the very same rect is what window
+	// metrics need. Geometry only — no phase is derived here, and none crosses
+	// the boundary.
+	//
+	// GUARD ORDER: this is deliberately the LAST resort. A vendor DP's precise
+	// report, the Win32 client rect and the Android present-target extent are all
+	// richer sources (live, and orientation-authoritative), so any session that
+	// has one keeps it; weave geometry only fills the hole they cannot.
+	//
+	// Read without the weave mutex on purpose — the same trade
+	// multi_compositor_get_window_screen_rect() and the DP phase feed already
+	// make. A torn read during a drag costs one frame of a stale rect, which the
+	// next locate corrects; taking the submit lock on the per-frame locate path
+	// would not.
+	if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0 && mc->msc != NULL) {
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		const int32_t win_x = mc->weave.win_x;
+		const int32_t win_y = mc->weave.win_y;
+		const uint32_t win_w = mc->weave.win_w;
+		const uint32_t win_h = mc->weave.win_h;
+
+		U_ZERO(out_metrics);
+
+		out_metrics->window_pixel_width = win_w;
+		out_metrics->window_pixel_height = win_h;
+		out_metrics->window_screen_left = win_x;
+		out_metrics->window_screen_top = win_y;
+		out_metrics->window_orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+
+		// The caller's rect is in the CURRENTLY HELD orientation; the runtime's
+		// display info is the natural-orientation panel (this class of device is
+		// natively portrait and is often run landscape). A window is always a
+		// sub-rect of its panel, so a rect that overflows the natural ordering
+		// proves the panel is held rotated — transpose the baseline to match,
+		// exactly as the display-zones rebase in ipc_server_handler.c does.
+		uint32_t panel_w = info->display_pixel_width;
+		uint32_t panel_h = info->display_pixel_height;
+		float panel_w_m = info->display_width_m;
+		float panel_h_m = info->display_height_m;
+		if (panel_w > 0 && panel_h > 0 && (win_w > panel_w || win_h > panel_h)) {
+			uint32_t t_px = panel_w;
+			panel_w = panel_h;
+			panel_h = t_px;
+			float t_m = panel_w_m;
+			panel_w_m = panel_h_m;
+			panel_h_m = t_m;
+		}
+		out_metrics->display_pixel_width = panel_w;
+		out_metrics->display_pixel_height = panel_h;
+		out_metrics->display_width_m = panel_w_m;
+		out_metrics->display_height_m = panel_h_m;
+		out_metrics->display_screen_left = 0;
+		out_metrics->display_screen_top = 0;
+
+		// Square-pixel pitch from the NATIVE dims — orientation-invariant, so it
+		// stays valid against the (possibly transposed) baseline above. Unknown
+		// physical size leaves the metres zeroed and reports pixels only, which is
+		// what the Android present-target branch above already does.
+		float pitch = 0.0f;
+		if (info->display_pixel_width > 0 && info->display_width_m > 0.0f) {
+			pitch = info->display_width_m / (float)info->display_pixel_width;
+		}
+		if (pitch > 0.0f && panel_w > 0 && panel_h > 0) {
+			out_metrics->window_width_m = (float)win_w * pitch;
+			out_metrics->window_height_m = (float)win_h * pitch;
+			const float win_center_x = (float)win_x + (float)win_w * 0.5f;
+			const float win_center_y = (float)win_y + (float)win_h * 0.5f;
+			// +x right in both frames; y negated because screen pixels are
+			// y-down and eye coordinates are y-up.
+			out_metrics->window_center_offset_x_m = (win_center_x - (float)panel_w * 0.5f) * pitch;
+			out_metrics->window_center_offset_y_m = -((win_center_y - (float)panel_h * 0.5f) * pitch);
+		}
+
+		out_metrics->valid = true;
+
+		// Lifecycle only: one line the first time a weave session sources its
+		// metrics this way. The rect itself is re-published every frame, and
+		// comp_multi_weave_*::set_window_geometry already logs the changes.
+		if (!mc->weave.metrics_logged) {
+			mc->weave.metrics_logged = true;
+			U_LOG_W(
+			    "weave(#1116): window metrics from bound geometry %d,%d %ux%u "
+			    "(panel %ux%u, %.4fx%.4fm)",
+			    win_x, win_y, win_w, win_h, panel_w, panel_h, (double)panel_w_m, (double)panel_h_m);
+		}
+		return true;
+	}
+#endif
+
 	// No main compositor available — metrics only from per-session paths above.
 	return false;
 }
