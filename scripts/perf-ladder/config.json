@@ -1,0 +1,216 @@
+{
+  "kit": "DXRPerfLadder",
+  "kitVersion": "0.1.0-dev",
+  "windowSeconds": 20,
+  "warmupSeconds": 6,
+  "reps": 3,
+  "witnessIntervalSeconds": 5,
+  "app": {
+    "exe": "avatar\\dxr_demo_avatar.exe",
+    "args": "",
+    "windowSize": "600x1051",
+    "windowPos": "center",
+    "startupTimeoutSec": 40
+  },
+  "baseEnv": {
+    "DXR_FRAME_WITNESS": "5",
+    "VK_LOADER_LAYERS_DISABLE": "*",
+    "VK_LOADER_LAYERS_ENABLE": "VK_LAYER_DXR_queue_lock",
+    "DXR_AVATAR_IDLE_THROTTLE": "0"
+  },
+  "cursorOrbit": {
+    "radiusPx": 200,
+    "hz": 0.5
+  },
+  "arms": [
+    {
+      "name": "IDLE-P",
+      "parent": null,
+      "app": false,
+      "cursor": "parked",
+      "mode": null,
+      "env": {}
+    },
+    {
+      "name": "IDLE-M",
+      "parent": "IDLE-P",
+      "app": false,
+      "cursor": "orbit",
+      "mode": null,
+      "env": {}
+    },
+    {
+      "name": "FLIP-2D",
+      "parent": "IDLE-P",
+      "app": true,
+      "cursor": "parked",
+      "mode": "2d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_OPAQUE_SESSION": "1",
+        "DXR_AVATAR_NO_REGION": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "FLIP-3D",
+      "parent": "FLIP-2D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_OPAQUE_SESSION": "1",
+        "DXR_AVATAR_NO_REGION": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "FLIP-3D-22",
+      "parent": "FLIP-3D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_OPAQUE_SESSION": "1",
+        "DXR_AVATAR_NO_REGION": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_AVATAR_PRESENT_HZ": "22",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "LIVE-3D",
+      "parent": "FLIP-3D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_NO_REGION": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "SHAPED-3D",
+      "parent": "LIVE-3D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "SHAPED-3D-M",
+      "parent": "SHAPED-3D",
+      "app": true,
+      "cursor": "orbit",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "SHAPED-3D-22",
+      "parent": "SHAPED-3D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_AVATAR_PRESENT_HZ": "22",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "REND-30",
+      "parent": "SHAPED-3D",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "30",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "REND-60",
+      "parent": "REND-30",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "60",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "REPAINT",
+      "parent": "SHAPED-3D-22",
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_REGION_STATIC": "1",
+        "DXR_AVATAR_RENDER_HZ": "5",
+        "DXR_AVATAR_PRESENT_HZ": "22",
+        "DXR_WEAVE_REPAINT": "1"
+      }
+    },
+    {
+      "name": "SHIP",
+      "parent": null,
+      "app": true,
+      "cursor": "parked",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_KEEP_TEXT": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_PRESENT_HZ": "22",
+        "DXR_AVATAR_REGION_ON_HOVER": "1",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    },
+    {
+      "name": "SHIP-M",
+      "parent": "SHIP",
+      "app": true,
+      "cursor": "orbit",
+      "mode": "3d",
+      "env": {
+        "DXR_AVATAR_MINIMAL": "1",
+        "DXR_AVATAR_KEEP_TEXT": "1",
+        "DXR_AVATAR_FORCE_TRANSPARENT": "1",
+        "DXR_AVATAR_PRESENT_HZ": "22",
+        "DXR_AVATAR_REGION_ON_HOVER": "1",
+        "DXR_WEAVE_REPAINT": "0"
+      }
+    }
+  ]
+}
