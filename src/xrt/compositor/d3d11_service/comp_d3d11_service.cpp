@@ -10840,21 +10840,44 @@ pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 }
 
 /*!
- * #918 — ship the focused client's cropped atlas across the adapter boundary and
- * hand back the OUTPUT-DEVICE shader resource view the panel DP should weave.
+ * #918 PR 4 — the layout signature's slot field for the COMPOSE path.
  *
- * Called by the direct path only, once per rendered frame, on the render thread
- * with `render_mutex` and the focused client's `atlas_read_guard` both held —
- * the guard because the staged (Option II) ingress copy reads @p crop_tex, which
- * for a full-atlas submission IS the client's atlas.
+ * The compose path has no focused slot: it weaves ONE combined atlas built from
+ * every client. It needs a value no real slot index can take, because attaching
+ * or detaching a controller switches which source the bridge carries, and that
+ * is exactly as much of a recipe change as a focus change or a 3D<->2D flip. A
+ * slot the direct path filled must never be woven for the compose geometry, or
+ * the other way round.
+ */
+static constexpr int32_t SPLIT_COMPOSE_SLOT = -1;
+
+/*!
+ * #918 — ship the cropped DP-input atlas across the adapter boundary and hand
+ * back the OUTPUT-DEVICE shader resource view the panel DP should weave.
+ *
+ * Called once per rendered frame by BOTH paths, on the render thread under
+ * `render_mutex`:
+ *
+ * - the DIRECT path submits the focused client's crop, and additionally holds
+ *   that client's `atlas_read_guard` — the staged (Option II) ingress copy reads
+ *   @p crop_tex, which for a full-atlas submission IS the client's atlas;
+ * - the COMPOSE path submits the crop of `mc->combined_atlas`, which this same
+ *   thread painted earlier in this same tick, so it needs no guard.
+ *
+ * One bridge instance serves both. That is what made Option-II (staged) ingress
+ * the right choice at Stage A: the submitted SOURCE changes identity — between
+ * clients on a focus change, and between a client atlas and the combined atlas
+ * on a controller attach — where Option I would re-open an NT handle each time.
  *
  * Nothing here waits on the CPU. The submit records three legs and returns; the
  * pick is a poll of already-fired fences, and the one ordering cost is a
  * GPU-side wait queued on the output context.
  *
+ * @param focused_slot The focused client's slot on the direct path,
+ *        @ref SPLIT_COMPOSE_SLOT on the compose path.
  * @param crop_tex The app-device texture the DP would have sampled without the
- *        split — the crop staging texture, or the client's atlas when the
- *        content already fills it.
+ *        split — the crop staging texture, or the source atlas when the content
+ *        already fills it.
  * @param io_view_w,io_view_h In: the per-view content dims this frame painted.
  *        Out: the dims of the slot actually being woven, which during a resize
  *        can be a frame behind (see #918 R2). The DP derives its tile stride
@@ -10891,10 +10914,12 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	 * at the box it was painted with).
 	 *
 	 * The service's signature carries one term the in-process compositor's does
-	 * not: the FOCUSED SLOT. In-process, the atlas belongs to one session for
-	 * life. Here it is whichever client won the presenter election, and a focus
-	 * change is exactly as much of a recipe change as a 3D<->2D flip — a slot
-	 * the previous app filled must never be woven for the new one's geometry.
+	 * not: the SOURCE. In-process, the atlas belongs to one session for life.
+	 * Here it is whichever client won the presenter election — or, under a
+	 * controller, the combined atlas (@ref SPLIT_COMPOSE_SLOT). A focus change
+	 * and a controller attach are each exactly as much of a recipe change as a
+	 * 3D<->2D flip: a slot the previous source filled must never be woven for
+	 * the new one's geometry.
 	 */
 	const uint64_t sig = ((uint64_t)(uint32_t)focused_slot << 44) | ((uint64_t)cols << 22) | (uint64_t)rows;
 	if (sig != sys->split_layout_sig) {
@@ -14123,8 +14148,71 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	/*
+	 * #918 PR 4 — THE SPLIT, on the compose path.
+	 *
+	 * Everything above this line is unchanged and stays on the APP device: the
+	 * per-client blits, the chrome, the title bars, the font, the logo, the
+	 * cursor and the ADR-030 crop all paint into `combined_atlas`, which is
+	 * where they have always painted. What changes is where the result goes.
+	 * The cropped composite crosses the SAME bridge instance the direct path
+	 * uses (one image per rendered frame — the service never calls
+	 * `set_background_2d`, and Local2D and zones composite into the client
+	 * atlas pre-DP, so there is no plane transport here at all), and the weave
+	 * and the present below run on the OUTPUT device.
+	 *
+	 * The source handed to the bridge is the crop texture when the crop ran,
+	 * and the combined atlas when it did not (content already fills it, or the
+	 * crop texture failed to allocate) — read off `dp_input_srv` rather than
+	 * re-deriving the condition, so the two can never disagree.
+	 */
+	struct xrt_display_processor_d3d11 *compose_dp = mc->display_processor;
+	uint32_t weave_view_w = dp_view_w;
+	uint32_t weave_view_h = dp_view_h;
+	bool split_no_weave = false;
+	if (sys->split_active) {
+		ID3D11Texture2D *split_src = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture)
+		                                 ? mc->crop_texture.get()
+		                                 : mc->combined_atlas.get();
+		dp_input_srv = pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns,
+		                                           sys->tile_rows, &weave_view_w, &weave_view_h);
+		if (dp_input_srv == nullptr) {
+			/*
+			 * Nothing weavable this frame — warmup, or a slot whose recipe the
+			 * DP has since left (the frame a controller attaches or detaches is
+			 * exactly that). Skipping the PRESENT too is deliberate: with
+			 * FLIP_DISCARD the panel keeps showing the last frame it was given,
+			 * where presenting the cleared back buffer would be a black flash.
+			 * Counted inside the helper, never logged per frame.
+			 */
+			split_no_weave = true;
+		}
+
+		/*
+		 * #918 — the same load-bearing tripwire the direct path carries. A DP on
+		 * the wrong device would drive `svc_out_context` resources that are not
+		 * its own: in D3D11 that is not an error, it is silence. The dwell
+		 * hysteresis in `pipeline_bind_panel_dp` can legitimately leave the DP
+		 * one rebind behind for up to a second, so this is a real state — degrade
+		 * to the egress copy below rather than hand the vendor a foreign SRV.
+		 */
+		if (compose_dp != nullptr && mc->panel_dp_device != svc_out_device(sys)) {
+			static std::atomic<int64_t> s_last_devlog_ns{0};
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_devlog_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_devlog_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_W(
+				    "Multi-comp: panel DP is on device %p but the service window's surface is on %p "
+				    "— not weaving (device rebind pending; #918, throttled)",
+				    (void *)mc->panel_dp_device, (void *)svc_out_device(sys));
+			}
+			compose_dp = nullptr;
+		}
+	}
+
 	// Run DP on cropped atlas → back buffer
-	if (mc->display_processor != nullptr && dp_input_srv && mc->back_buffer_rtv) {
+	if (compose_dp != nullptr && dp_input_srv && mc->back_buffer_rtv) {
 		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 		ID3D11RenderTargetView *out_rtvs[] = {mc->back_buffer_rtv.get()};
 		svc_out_context(sys)->OMSetRenderTargets(1, out_rtvs, nullptr);
@@ -14156,8 +14244,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// but a background present-owner's weave_submit flips the shared DP to
 		// alpha-gate between compose ticks, and nothing flipped it back for
 		// the compose itself.
-		pipeline_dp_set_transparency(mc, mc->display_processor, /*client_presents*/ false, "compose");
-		pipeline_dp_set_encoding(mc, mc->display_processor,
+		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
+		pipeline_dp_set_encoding(mc, compose_dp,
 		                         compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED,
 		                         "compose");
 		g_weave_latency_workspace.mark_weave("workspace");
@@ -14165,28 +14253,46 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
 		// predictor's exact horizon.
 		xrt_display_processor_d3d11_set_frame_timing(
-		    mc->display_processor, g_weave_latency_workspace.measured_r_ns,
+		    compose_dp, g_weave_latency_workspace.measured_r_ns,
 		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		// #918: `weave_view_*` is `dp_view_*` off the split, and the dims of the
+		// slot actually being woven under it — which through a resize the R2
+		// hysteresis survived can be one frame behind the live box. The DP derives
+		// its tile stride from the atlas width, so weaving a surviving slot at the
+		// CURRENT box would slice every tile at the wrong offset.
+		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
 		xrt_display_processor_d3d11_process_atlas(
-		    mc->display_processor, svc_out_context(sys), dp_input_srv,
-		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
+		    compose_dp, svc_out_context(sys), dp_input_srv,
+		    weave_view_w, weave_view_h, sys->tile_columns, sys->tile_rows,
 		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
 		    0, 0, 0, 0);
+	} else if (sys->split_active && dp_input_srv && mc->back_buffer_rtv) {
+		/*
+		 * #918 — the no-DP fallback UNDER THE SPLIT, the compose path's copy of
+		 * the direct path's. The combined atlas is an APP-device texture and the
+		 * back buffer is an OUT-device one, so the stock `CopyResource` below
+		 * would be a cross-device no-op — silence, not an error, and black on the
+		 * panel. The bridge's egress slot is already on the right device and the
+		 * pick resolved its content box, so copy THAT instead.
+		 */
+		wil::com_ptr<ID3D11Resource> bb, egress;
+		mc->back_buffer_rtv->GetResource(bb.put());
+		dp_input_srv->GetResource(egress.put());
+		if (bb && egress) {
+			uint32_t bw = 0, bh = 0;
+			pipeline_rtv_dims(mc->back_buffer_rtv.get(), &bw, &bh);
+			uint32_t cw = (sys->tile_columns * weave_view_w) < bw ? (sys->tile_columns * weave_view_w) : bw;
+			uint32_t chh = (sys->tile_rows * weave_view_h) < bh ? (sys->tile_rows * weave_view_h) : bh;
+			if (cw > 0 && chh > 0) {
+				D3D11_BOX box = {0, 0, 0, cw, chh, 1};
+				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0, &box);
+			}
+		}
 	} else if (mc->back_buffer_rtv && mc->combined_atlas && !sys->split_active) {
 		// Fallback: no DP — raw copy to back buffer
 		wil::com_ptr<ID3D11Resource> back_buffer;
 		mc->back_buffer_rtv->GetResource(back_buffer.put());
 		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
-	} else if (mc->back_buffer_rtv && mc->combined_atlas) {
-		/*
-		 * #918 — unreachable in PR 3 (a controller is attached here, and the
-		 * workspace rule SUSPENDS the split before the compose path can run), but
-		 * stated rather than assumed: the combined atlas is an APP-device texture
-		 * and the back buffer would be an OUT-device one, and a cross-device
-		 * CopyResource is silence, not an error. Skip and count; PR 4 brings the
-		 * compose path across properly.
-		 */
-		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// Phase 8: screenshot file-trigger now routes through the same capture path
@@ -14248,7 +14354,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Present
-	if (mc->swap_chain) {
+	//
+	// #918: `split_no_weave` means the bridge had nothing weavable this frame, so
+	// the back buffer holds no content of this generation. Presenting it is the
+	// black flash; skipping holds the last good frame under FLIP_DISCARD. The
+	// atlas above was still composited and the capture paths still saw it — only
+	// the flip is skipped.
+	if (mc->swap_chain && !split_no_weave) {
 		// #924: NEVER call a blocking Present without a free back buffer.
 		// With the frame-latency waitable (late-weave), the pacer's wait
 		// consumed the buffer-free signal and granted a one-present token.
