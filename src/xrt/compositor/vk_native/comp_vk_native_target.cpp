@@ -28,9 +28,6 @@
 // transitions, occlusion reset) is clock-source-agnostic. File scope for the
 // same memset reason as the weave-latency log.
 #include "util/comp_weave_latency_win.h"
-#include "util/comp_frame_witness.h"
-
-static comp_frame_witness g_frame_witness_vk{"vk"};
 static late_weave_governor g_lw_gov_vk_bridge;
 // Defined later in this file; dcomp_setup consults it at creation so the
 // bridge waitable is never built on devices where VK's own present_wait
@@ -43,6 +40,11 @@ target_present_wait_fn(struct comp_vk_native_target *target);
 static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #endif
 #include "os/os_time.h"
+
+// Portable (all OSes) — the witness is exactly for paths/platforms the
+// Windows-only latency harness cannot measure.
+#include "util/comp_frame_witness.h"
+static comp_frame_witness g_frame_witness_vk{"vk"};
 
 #include <cstring>
 #include <cstdio>
