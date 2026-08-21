@@ -1516,6 +1516,28 @@ struct d3d11_service_system
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t split_seq{0};
 
+	/*!
+	 * #918 PR 4 — the OUTPUT-DEVICE crop, and the one thing on the output half
+	 * that is not a presenter surface.
+	 *
+	 * The steady state needs none of this: the service crops on the app device
+	 * before the atlas ever crosses, so the egress ring is content-sized and the
+	 * DP samples it directly. But the R2 hysteresis deliberately parks the ring
+	 * at WORST-CASE through an interactive resize (rebuilding three NT-shared
+	 * textures per mouse event is what it exists to avoid), and the DP derives
+	 * its tile stride from the atlas width — so a worst-case ring holding a
+	 * smaller content box would slice every tile at the wrong offset.
+	 *
+	 * PR 3 refused those frames and held the last good one for the length of the
+	 * drag. This is the crop that makes them weavable: one same-device
+	 * `CopySubresourceRegion` of the slot's own content box, no shader, no second
+	 * crossing. Released before @ref out_dev is.
+	 */
+	wil::com_ptr<ID3D11Texture2D> split_out_crop_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> split_out_crop_srv;
+	uint32_t split_out_crop_w{0};
+	uint32_t split_out_crop_h{0};
+
 	/*! @name #918 — split counters on the `[RENDER]` 10 s window.
 	 * @{ */
 	//! Panel-DP rebinds that CROSSED devices (the eligibility boundary).
@@ -10852,6 +10874,74 @@ pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 static constexpr int32_t SPLIT_COMPOSE_SLOT = -1;
 
 /*!
+ * #918 PR 4 — crop an egress slot to its own content box, ON THE OUTPUT DEVICE.
+ *
+ * Only ever needed while the R2 hysteresis holds a worst-case egress ring (an
+ * interactive resize). Both the source and the destination are output-device
+ * textures, so this is a plain same-device sub-rect copy — the blit shaders all
+ * live on the app device and none of them are wanted here.
+ *
+ * Called on the render thread under `render_mutex`, after the GPU wait on the
+ * slot has been queued on the output context, so the copy is correctly ordered
+ * behind the cross-adapter consumer copy.
+ *
+ * @return an output-device SRV of a @p w x @p h texture holding the slot's
+ *         content, or NULL if the staging texture could not be made — in which
+ *         case the caller holds the last good frame exactly as PR 3 did.
+ */
+static ID3D11ShaderResourceView *
+pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
+                                  ID3D11ShaderResourceView *egress_srv,
+                                  uint32_t w,
+                                  uint32_t h)
+{
+	if (egress_srv == nullptr || w == 0 || h == 0) {
+		return nullptr;
+	}
+	if (sys->split_out_crop_w != w || sys->split_out_crop_h != h) {
+		sys->split_out_crop_srv.reset();
+		sys->split_out_crop_tex.reset();
+		sys->split_out_crop_w = 0;
+		sys->split_out_crop_h = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // the bridge's transport format
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, sys->split_out_crop_tex.put());
+		if (SUCCEEDED(hr)) {
+			hr = svc_out_device(sys)->CreateShaderResourceView(sys->split_out_crop_tex.get(), nullptr,
+			                                                   sys->split_out_crop_srv.put());
+		}
+		if (FAILED(hr)) {
+			sys->split_out_crop_srv.reset();
+			sys->split_out_crop_tex.reset();
+			U_LOG_W("#918: output-device crop texture %ux%u failed (0x%08lx) — holding the last good frame",
+			        w, h, (unsigned long)hr);
+			return nullptr;
+		}
+		sys->split_out_crop_w = w;
+		sys->split_out_crop_h = h;
+		U_LOG_W("#918: output-device crop staging at %ux%u (the egress ring is parked at worst-case)", w, h);
+	}
+
+	wil::com_ptr<ID3D11Resource> src;
+	egress_srv->GetResource(src.put());
+	if (!src) {
+		return nullptr;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	svc_out_context(sys)->CopySubresourceRegion(sys->split_out_crop_tex.get(), 0, 0, 0, 0, src.get(), 0, &box);
+	sys->render_diag_split_out_crop.fetch_add(1, std::memory_order_relaxed);
+	return sys->split_out_crop_srv.get();
+}
+
+/*!
  * #918 — ship the cropped DP-input atlas across the adapter boundary and hand
  * back the OUTPUT-DEVICE shader resource view the panel DP should weave.
  *
@@ -10970,38 +11060,35 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 		return nullptr;
 	}
 
-	/*
-	 * The egress ring must already BE the slot's content box. The service crops
-	 * on the app device before the atlas ever crosses, so the steady state is a
-	 * content-sized ring and no second crop is needed — but the R2 hysteresis
-	 * deliberately parks the ring at worst-case through a resize drag, and a
-	 * top-left crop of a worst-case ring would slice every tile at the wrong
-	 * stride. PR 3 has no output-device crop pass (the blit shaders are all on
-	 * the app device), so it refuses those frames and counts them: the panel
-	 * holds its last good frame for the length of the drag. PR 4 brings the
-	 * output-device composite that makes a crop available here.
-	 */
-	uint32_t eg_w = 0, eg_h = 0;
-	comp_d3d11_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
-	if (eg_w != slot_w || eg_h != slot_h) {
-		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
-		static std::atomic<int64_t> s_last_log_ns{0};
-		int64_t now_ns = (int64_t)os_monotonic_get_ns();
-		int64_t prev_ns = s_last_log_ns.load(std::memory_order_relaxed);
-		if (now_ns - prev_ns > 2000000000LL && s_last_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
-			U_LOG_W(
-			    "#918: egress ring is %ux%u but slot %d holds %ux%u content — no output-device crop on "
-			    "this path, holding the last good frame (throttled)",
-			    eg_w, eg_h, (int)slot, slot_w, slot_h);
-		}
-		return nullptr;
-	}
-
 	comp_d3d11_xbridge_gpu_wait_slot(sys->xbridge, slot);
 	auto *srv = static_cast<ID3D11ShaderResourceView *>(comp_d3d11_xbridge_get_srv(sys->xbridge, slot));
 	if (srv == nullptr) {
 		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
+	}
+
+	/*
+	 * What the DP is handed must BE the slot's content box, because it derives
+	 * its tile stride from the atlas width. The service crops on the app device
+	 * before the atlas ever crosses, so the steady state is a content-sized ring
+	 * and this costs nothing — but the R2 hysteresis deliberately parks the ring
+	 * at WORST-CASE through a resize drag, and a worst-case ring holding a
+	 * smaller content box would slice every tile at the wrong offset.
+	 *
+	 * PR 3 refused those frames and held the last good one for the length of the
+	 * drag. Now they are cropped on the output device instead — one same-device
+	 * sub-rect copy, no shader — so a correctly-sized weave lands every frame of
+	 * a resize with no ring rebuild at all, which is the trade the hysteresis was
+	 * written to make.
+	 */
+	uint32_t eg_w = 0, eg_h = 0;
+	comp_d3d11_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
+	if (eg_w != slot_w || eg_h != slot_h) {
+		srv = pipeline_split_crop_on_out_device(sys, srv, slot_w, slot_h);
+		if (srv == nullptr) {
+			sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
+			return nullptr;
+		}
 	}
 	comp_d3d11_xbridge_set_weave_slot(sys->xbridge, slot);
 
@@ -20959,6 +21046,11 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	if (sys->xbridge != nullptr) {
 		comp_d3d11_xbridge_destroy(&sys->xbridge);
 	}
+	// #918 PR 4: the output-device crop staging, before the device that owns it.
+	sys->split_out_crop_srv.reset();
+	sys->split_out_crop_tex.reset();
+	sys->split_out_crop_w = 0;
+	sys->split_out_crop_h = 0;
 	sys->split_active = false;
 	sys->split_available = false;
 	if (sys->out_factory != nullptr) {
