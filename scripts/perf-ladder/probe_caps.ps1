@@ -116,5 +116,8 @@ $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $caps.elevated = (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 $outPath = Join-Path $OutDir 'capabilities.json'
-$caps | ConvertTo-Json -Depth 6 | Out-File -Encoding utf8 $outPath
+# BOM-less UTF-8: PS 5.1's Out-File utf8 stamps a BOM and python json.load
+# then throws (Arc report kit-nit) - write via .NET with BOM disabled.
+$js = $caps | ConvertTo-Json -Depth 6
+[IO.File]::WriteAllText($outPath, $js, (New-Object Text.UTF8Encoding($false)))
 Write-Host ("capabilities.json written: " + $outPath)

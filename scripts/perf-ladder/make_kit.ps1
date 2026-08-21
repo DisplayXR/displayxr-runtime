@@ -41,7 +41,9 @@ Get-ChildItem $AvatarBuildDir -File |
 $cfgPath = Join-Path $kitDir 'config.json'
 $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
 $cfg.app.exe = ('avatar\' + $exe.Name)
-if ($cfg.PSObject.Properties['runtimeJson'] -ne $null) { $cfg.PSObject.Properties.Remove('runtimeJson') }
+foreach ($devKey in @('runtimeJson', 'runtimePath')) {
+    if ($cfg.PSObject.Properties[$devKey] -ne $null) { $cfg.PSObject.Properties.Remove($devKey) }
+}
 $cfg | ConvertTo-Json -Depth 8 | Out-File -Encoding ascii $cfgPath
 
 # Manifest: what this kit IS - results are only comparable per kit version.

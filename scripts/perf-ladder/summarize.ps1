@@ -39,8 +39,12 @@ foreach ($a in $armNames) {
         mode        = ($r | Select-Object -Last 1).mode
         flags       = (@($r | ForEach-Object { $_.flags } | Where-Object { $_ -ne '' }) -join ' ')
     }
-    # app+dwm convenience
+    # app+dwm convenience + per-rep spread (max-min): a derived component whose
+    # inputs' spreads exceed the effect is not resolvable at this n (Arc report
+    # rec 4) - surface the raw material for that judgment in the table.
     $med[$a].app_dwm = [math]::Round(($med[$a].app_scanout + $med[$a].app_other + $med[$a].dwm), 2)
+    $ad = @($r | ForEach-Object { [double]$_.app_scanout + [double]$_.app_other + [double]$_.dwm })
+    $med[$a].spread = if ($ad.Count -gt 1) { [math]::Round((($ad | Measure-Object -Maximum).Maximum - ($ad | Measure-Object -Minimum).Minimum), 2) } else { 0.0 }
 }
 
 function M { param([string]$a) if ($med.ContainsKey($a)) { return $med[$a] } return $null }
@@ -55,12 +59,12 @@ if ($caps -ne $null) {
 }
 $out += '## Per-arm medians (GPU busy %, Running-Time deltas)'
 $out += ''
-$out += '| arm | n | app@scanout | app@other | dwm | app+dwm | total | app CPU | presents/s | weaves/s | repaints/s | mode | flags |'
-$out += '|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+$out += '| arm | n | app@scanout | app@other | dwm | app+dwm | spread | total | app CPU | presents/s | weaves/s | repaints/s | mode | flags |'
+$out += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
 foreach ($a in $armNames) {
     $m = $med[$a]
-    $out += ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} |' -f `
-        $a, $m.n, $m.app_scanout, $m.app_other, $m.dwm, $m.app_dwm, $m.total, $m.app_cpu, `
+    $out += ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} | {13} |' -f `
+        $a, $m.n, $m.app_scanout, $m.app_other, $m.dwm, $m.app_dwm, $m.spread, $m.total, $m.app_cpu, `
         $m.presents, $m.weaves, $m.repaints, $m.mode, $m.flags)
 }
 $out += ''
