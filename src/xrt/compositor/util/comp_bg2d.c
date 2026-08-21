@@ -14,6 +14,7 @@
 #include "comp_bg2d_capture.h"
 
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -749,6 +750,25 @@ comp_bg2d_ensure(struct comp_bg2d_state *st,
 		// then re-upload only when a genuinely new frame has landed; a
 		// static screen therefore costs one upload, not one per frame.
 		comp_bg2d_capture_start(cfg->capture_sock);
+
+		// "Armed but nobody is producing" is the single most likely T2
+		// failure, because the producer is a hand-started process in
+		// another package: any reboot, adb drop or restage kills it and
+		// leaves this side listening in perfect silence. Say so once,
+		// naming the symptom the user will actually notice.
+		if (st->capture_wait_since_ns == 0) {
+			st->capture_wait_since_ns = os_monotonic_get_ns();
+		}
+		if (!st->uploaded_once && !st->logged_no_producer &&
+		    os_monotonic_get_ns() - st->capture_wait_since_ns > 5ULL * 1000 * 1000 * 1000) {
+			st->logged_no_producer = true;
+			U_LOG_W(
+			    "bg2d capture(#1073 T2): armed on '%s' but no producer has sent a frame "
+			    "in 5s — there is NO backdrop, so transparent edges will fringe. Start "
+			    "one with scripts/android_bg_capture.sh (or set debug.dxr.bg2d 0 to "
+			    "stop asking).",
+			    cfg->capture_sock);
+		}
 
 		// Re-crop when the canvas MOVES, not only when a newer frame lands.
 		// `once` mode sends exactly one frame and it typically arrives before
