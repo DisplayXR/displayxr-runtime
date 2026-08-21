@@ -68,6 +68,7 @@
 #include "stb_image_write.h"
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -1393,7 +1394,69 @@ struct d3d11_service_system
 	//! support Win32 events (currently macOS / Linux — wakeup event is a
 	//! Windows-only optimization).
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
+
+	/*!
+	 * #918 OUTPUT-DEVICE SPLIT. NULL/false in this build — nothing sets
+	 * @ref split_active yet, so every accessor below resolves to the app trio
+	 * (`device` / `context` / `dxgi_factory`) and the service behaves exactly as
+	 * it did. When the split is turned on these — not the app trio — own the
+	 * presenter swap chains, their RTVs, the display processor's weave and the
+	 * read-back of the woven back buffer, while the renderer, the atlases and
+	 * every client import stay on the app device.
+	 *
+	 * The in-process compositor's `out_dev` / `out_ctx` / `split_active` are the
+	 * same idea one layer down (`comp_d3d11_compositor.cpp`).
+	 */
+	ID3D11Device *out_dev;
+	ID3D11DeviceContext *out_ctx;
+	IDXGIFactory4 *out_factory;
+	bool split_active;
 };
+
+/*!
+ * #918: the device the OUTPUT half lives on — the presenter swap chains and
+ * their render targets, the display processor's weave, the zone-mask sideband
+ * and every read-back of a woven back buffer. The app device while the split is
+ * off, so each call site is written once and never re-audited.
+ */
+static inline ID3D11Device *
+svc_out_device(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_dev : sys->device.get();
+}
+
+static inline ID3D11DeviceContext *
+svc_out_context(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_ctx : sys->context.get();
+}
+
+static inline IDXGIFactory4 *
+svc_out_factory(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_factory : sys->dxgi_factory.get();
+}
+
+#ifndef NDEBUG
+/*!
+ * #918 debug tripwire: a resource handed to an output-half call must belong to
+ * the device that half runs on. Inert while the split is off (both sides of the
+ * comparison are the app device); load-bearing the moment it is not, because a
+ * D3D11 resource silently does nothing when driven by a foreign device.
+ */
+static inline void
+svc_assert_same_device(ID3D11View *resource, ID3D11Device *expected_dev)
+{
+	if (resource == nullptr || expected_dev == nullptr) {
+		return;
+	}
+	wil::com_ptr<ID3D11Device> owner;
+	resource->GetDevice(owner.put());
+	assert(owner.get() == expected_dev);
+}
+#else
+#define svc_assert_same_device(resource, expected_dev) ((void)0)
+#endif
 
 /*!
  * Fair acquire of sys->render_mutex for every contender EXCEPT the capture
