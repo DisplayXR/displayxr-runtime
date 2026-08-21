@@ -369,9 +369,10 @@ xb_hr(HRESULT hr, char *buf, size_t n)
 }
 
 //! Defined with the rest of the ingress code; create() needs it for the #918 F6
-//! fallback (no back-fence on the app device ⟹ Option I is unsafe).
+//! fallback (no back-fence on the app device ⟹ Option I is unsafe). @p why names
+//! the reason for the one WARN.
 static bool
-xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb);
+xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why);
 
 //! Bounded CPU wait cap for the structural-transition drains below.
 #define XB_DRAIN_TIMEOUT_MS 2000
@@ -1633,7 +1634,7 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 		    "d3d11 xbridge: the app device could not open the producer fence %s — ingress Option I "
 		    "has no back-pressure and is unsafe; latching the staged ingress ring (#918)",
 		    xb_hr(hr, b, sizeof(b)));
-		if (!xb_latch_staged_ingress(xb)) {
+		if (!xb_latch_staged_ingress(xb, "ingress Option I has no back-pressure on this device")) {
 			*out_reason = "ingress back-fence unavailable";
 			goto fail;
 		}
@@ -1881,9 +1882,12 @@ comp_d3d11_xbridge_slot_layout(
  * atlas could not be opened by the producer D3D12 device.
  */
 static bool
-xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb)
+xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
 {
 	char b[32];
+	if (xb->ingress_mode == XB_INGRESS_STAGED) {
+		return true;
+	}
 	for (int i = 0; i < XB_INGRESS_RING; i++) {
 		D3D11_TEXTURE2D_DESC td = {};
 		td.Width = xb->max_w;
@@ -1917,10 +1921,23 @@ xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb)
 		}
 	}
 	xb->ingress_mode = XB_INGRESS_STAGED;
-	U_LOG_W(
-	    "d3d11 xbridge: the renderer atlas could not be opened by the producer D3D12 device — "
-	    "falling back to the staged ingress ring (one extra app-device copy per frame) (#918)");
+	U_LOG_W("d3d11 xbridge: %s — using the staged ingress ring "
+	        "(one extra app-device copy per frame) (#918)",
+	        why);
 	return true;
+}
+
+/*!
+ * #918 Phase 2b — the same latch, chosen deliberately rather than fallen back
+ * to. See the header for who wants it and why the timing is load-bearing.
+ */
+extern "C" bool
+comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb)
+{
+	if (xb == nullptr) {
+		return false;
+	}
+	return xb_latch_staged_ingress(xb, "the caller selected staged ingress up front");
 }
 
 extern "C" bool
@@ -1934,7 +1951,7 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 		return true; // already latched; nothing to re-open
 	}
 	if (nt_handle == nullptr) {
-		return xb_latch_staged_ingress(xb);
+		return xb_latch_staged_ingress(xb, "the renderer atlas is not NT-shareable");
 	}
 	if (xb->atlas_12 != nullptr && xb->atlas_gen == generation) {
 		return true;
@@ -1963,7 +1980,8 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 	if (FAILED(hr) || xb->atlas_12 == nullptr) {
 		U_LOG_W("d3d11 xbridge: producer OpenSharedHandle(atlas gen=%llu) failed %s",
 		        (unsigned long long)generation, xb_hr(hr, b, sizeof(b)));
-		return xb_latch_staged_ingress(xb);
+		return xb_latch_staged_ingress(xb,
+		                               "the renderer atlas could not be opened by the producer D3D12 device");
 	}
 	xb->atlas_gen = generation;
 	U_LOG_W("d3d11 xbridge: producer bound the renderer atlas (generation %llu)", (unsigned long long)generation);
