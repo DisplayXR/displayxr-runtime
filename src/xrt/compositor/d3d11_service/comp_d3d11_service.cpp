@@ -12812,8 +12812,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Run DP on cropped atlas → back buffer
 	if (mc->display_processor != nullptr && dp_input_srv && mc->back_buffer_rtv) {
+		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 		ID3D11RenderTargetView *out_rtvs[] = {mc->back_buffer_rtv.get()};
-		sys->context->OMSetRenderTargets(1, out_rtvs, nullptr);
+		svc_out_context(sys)->OMSetRenderTargets(1, out_rtvs, nullptr);
 
 		// Get actual back buffer dimensions
 		uint32_t bb_w = sys->output_width;
@@ -12854,7 +12855,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		    mc->display_processor, g_weave_latency_workspace.measured_r_ns,
 		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(
-		    mc->display_processor, sys->context.get(), dp_input_srv,
+		    mc->display_processor, svc_out_context(sys), dp_input_srv,
 		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
 		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
 		    0, 0, 0, 0);
@@ -13760,18 +13761,18 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
+		HRESULT hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
 		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
-			hr = sys->device->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
-			                                         c->wish_mask_rtv.put());
+			hr = svc_out_device(sys)->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
+			                                                 c->wish_mask_rtv.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
+			hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
-			hr = sys->device->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
-			                                           c->wish_mask_staged_srv.put());
+			hr = svc_out_device(sys)->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
+			                                                   c->wish_mask_staged_srv.put());
 		}
 		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
 			U_LOG_E("ZONES SVC: wish mask D3D resource creation failed: 0x%08lx", hr);
@@ -13786,10 +13787,10 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 	}
 
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	sys->context->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
+	svc_out_context(sys)->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
 
 	wil::com_ptr<ID3D11DeviceContext1> ctx1;
-	HRESULT hr = sys->context->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
+	HRESULT hr = svc_out_context(sys)->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("ZONES SVC: wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08lx)", hr);
 		return nullptr;
@@ -13863,7 +13864,7 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		ctx1->ClearView(c->wish_mask_rtv.get(), all_off, &dr, 1);
 	}
 
-	sys->context->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
+	svc_out_context(sys)->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
@@ -13972,7 +13973,7 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	// seq is the content generation, so a vendor's content evaluation runs
 	// once per re-raster, not once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    dp, sys->context.get(), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
+	    dp, svc_out_context(sys), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
 	    c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
@@ -17759,7 +17760,7 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 		return;
 	}
 
-	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, sys->context.get(), srv, mask_w, mask_h,
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, svc_out_context(sys), srv, mask_w, mask_h,
 	                                                              (int32_t)origin.x, (int32_t)origin.y,
 	                                                              (uint32_t)cr.right, (uint32_t)cr.bottom,
 	                                                              c->zone_publish_seq);
