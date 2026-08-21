@@ -51,9 +51,13 @@ if (-not $caps.power.onAc) { Log 'FLAG: on battery - results will be invalid; pl
 # --- App exe -----------------------------------------------------------------
 $appExe = $cfg.app.exe
 if ($AppExeOverride -ne '') { $appExe = $AppExeOverride }
-# Relative paths resolve against the kit root (= this script's folder): the
-# shipped kit is flat - RUN-LADDER.cmd, the .ps1s and avatar\ side by side.
-if (-not [IO.Path]::IsPathRooted($appExe)) { $appExe = Join-Path $PSScriptRoot $appExe }
+# Relative paths resolve against the CONFIG file's folder - the shipped kit
+# is flat (config next to the scripts), and an app repo can carry its own
+# config (perf-ladder~/config-*.json) with a repo-relative exe while the
+# harness stays canonical in displayxr-runtime.
+if (-not [IO.Path]::IsPathRooted($appExe)) {
+    $appExe = Join-Path (Split-Path (Resolve-Path $ConfigPath) -Parent) $appExe
+}
 $needApp = $false
 foreach ($a in $cfg.arms) { if ($a.app) { $needApp = $true } }
 if ($Arms.Count -gt 0) {
