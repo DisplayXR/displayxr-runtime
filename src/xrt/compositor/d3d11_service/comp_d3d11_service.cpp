@@ -68,6 +68,7 @@
 #include "stb_image_write.h"
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -1393,7 +1394,76 @@ struct d3d11_service_system
 	//! support Win32 events (currently macOS / Linux — wakeup event is a
 	//! Windows-only optimization).
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
+
+	/*!
+	 * #918 OUTPUT-DEVICE SPLIT. NULL/false in this build — nothing sets
+	 * @ref split_active yet, so every accessor below resolves to the app trio
+	 * (`device` / `context` / `dxgi_factory`) and the service behaves exactly as
+	 * it did. When the split is turned on these — not the app trio — own the
+	 * presenter swap chains, their RTVs, the display processor's weave and the
+	 * read-back of the woven back buffer, while the renderer, the atlases and
+	 * every client import stay on the app device.
+	 *
+	 * The in-process compositor's `out_dev` / `out_ctx` / `split_active` are the
+	 * same idea one layer down (`comp_d3d11_compositor.cpp`).
+	 */
+	ID3D11Device *out_dev{nullptr};
+	ID3D11DeviceContext *out_ctx{nullptr};
+	IDXGIFactory4 *out_factory{nullptr};
+	bool split_active{false};
 };
+
+/*!
+ * #918: the device the OUTPUT half lives on — the presenter swap chains and
+ * their render targets, the display processor's weave, the zone-mask sideband
+ * and every read-back of a woven back buffer. The app device while the split is
+ * off, so each call site is written once and never re-audited.
+ */
+static inline ID3D11Device *
+svc_out_device(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_dev : sys->device.get();
+}
+
+static inline ID3D11DeviceContext *
+svc_out_context(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_ctx : sys->context.get();
+}
+
+static inline IDXGIFactory4 *
+svc_out_factory(struct d3d11_service_system *sys)
+{
+	return sys->split_active ? sys->out_factory : sys->dxgi_factory.get();
+}
+
+/*!
+ * #918 debug tripwire: a resource handed to an output-half call must belong to
+ * the device that half runs on. Inert while the split is off (both sides of the
+ * comparison are the app device); load-bearing the moment it is not, because a
+ * D3D11 resource silently does nothing when driven by a foreign device.
+ *
+ * The gate is a `constexpr` rather than an `#ifdef` around the body so release
+ * builds still COMPILE the check (a debug-only body rots unnoticed) while the
+ * constant early return folds the `GetDevice` round trip — a COM call on the
+ * render thread — away to nothing.
+ */
+#ifdef NDEBUG
+static constexpr bool k_svc_device_asserts = false;
+#else
+static constexpr bool k_svc_device_asserts = true;
+#endif
+
+static inline void
+svc_assert_same_device(ID3D11View *resource, ID3D11Device *expected_dev)
+{
+	if (!k_svc_device_asserts || resource == nullptr || expected_dev == nullptr) {
+		return;
+	}
+	wil::com_ptr<ID3D11Device> owner;
+	resource->GetDevice(owner.put());
+	assert(owner.get() == expected_dev);
+}
 
 /*!
  * Fair acquire of sys->render_mutex for every contender EXCEPT the capture
@@ -4759,8 +4829,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			// waitable chain, which is what actually paces the render thread.
 			sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
-			hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc, nullptr,
-			                                               nullptr, res->swap_chain.put());
+			hr = svc_out_factory(sys)->CreateSwapChainForHwnd(svc_out_device(sys), res->hwnd, &sc_desc,
+			                                                  nullptr, nullptr, res->swap_chain.put());
 			if (FAILED(hr)) {
 				// Some cross-process / legacy HWNDs refuse the waitable flag.
 				// Retry unpaced; the render thread then falls back to
@@ -4771,8 +4841,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				    res->hwnd, hr);
 				res->swap_chain.reset();
 				sc_desc.Flags = 0;
-				hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc,
-				                                               nullptr, nullptr, res->swap_chain.put());
+				hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+				    svc_out_device(sys), res->hwnd, &sc_desc, nullptr, nullptr, res->swap_chain.put());
 			}
 			if (FAILED(hr)) {
 				// Cross-process CreateSwapChainForHwnd is not categorically
@@ -4808,7 +4878,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				}
 				wil::com_ptr<ID3D11Texture2D> bb;
 				res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-				sys->device->CreateRenderTargetView(bb.get(), nullptr, res->back_buffer_rtv.put());
+				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+				                                            res->back_buffer_rtv.put());
+				svc_assert_same_device(res->back_buffer_rtv.get(), svc_out_device(sys));
 				if (res->frame_latency_waitable != nullptr) {
 					U_LOG_W(
 					    "[pipeline] presenter=APP_HWND hwnd=%p %ux%u (waitable, max "
@@ -7991,8 +8063,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
 
-	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+	HRESULT hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+	    svc_out_device(sys), mc->hwnd, &sc_desc, nullptr, nullptr,
 	    mc->swap_chain.put());
 	if (FAILED(hr)) {
 		service_note_device_lost(sys, hr, "multi_compositor_ensure_output/swapchain"); // #1002
@@ -8021,7 +8093,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	{
 		wil::com_ptr<ID3D11Texture2D> bb;
 		mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-		sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+		svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 	}
 
 	// Combined atlas texture (native display size to hold fullscreen app content)
@@ -8300,8 +8373,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				// Recreate swap chain
 				sc_desc.Width = actual_w;
 				sc_desc.Height = actual_h;
-				hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-				    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+				hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+				    svc_out_device(sys), mc->hwnd, &sc_desc, nullptr, nullptr,
 				    mc->swap_chain.put());
 				if (FAILED(hr)) {
 					U_LOG_E("Multi-comp: failed to recreate swap chain (hr=0x%08X)", hr);
@@ -8310,7 +8383,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 				wil::com_ptr<ID3D11Texture2D> bb;
 				mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-				sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+				                                            mc->back_buffer_rtv.put());
+				svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 
 				// Recreate DP with new window
 				dp_ret = factory(sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
@@ -9061,7 +9136,7 @@ pipeline_dp_health_poll(struct d3d11_service_system *sys, struct d3d11_multi_com
 //! Defined further down (browser#73 diagnostic); used by the pipeline's
 //! screenshot file-trigger to dump the ACTIVE presenter's back buffer.
 static void
-dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name);
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name, bool from_out = false);
 
 /*!
  * #964: may the render thread touch this APP_HWND presenter's back buffer this
@@ -9336,7 +9411,8 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 			sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
-		sys->context->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
+		svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0,
+		                                            &box);
 	}
 	// Never vsync-pace an unfocused window: sync interval 0 either way.
 	(void)pipeline_present_app_hwnd(c, /*paced*/ false);
@@ -10048,8 +10124,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	fc->render.last_dp_content_h = fc->pipe_content_h;
 
 	if (dp != nullptr && dp_input_srv != nullptr) {
+		svc_assert_same_device(present_rtv, svc_out_device(sys));
 		ID3D11RenderTargetView *rtvs[] = {present_rtv};
-		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		svc_out_context(sys)->OMSetRenderTargets(1, rtvs, nullptr);
 		// Reset viewport AND scissor to the full target. The compose path does
 		// this every frame in its blit helpers; the direct path skipped it, so
 		// a canvas-sub-rect scissor latched on the shared immediate context by
@@ -10062,9 +10139,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		full_vp.Width = (float)target_w;
 		full_vp.Height = (float)target_h;
 		full_vp.MaxDepth = 1.0f;
-		sys->context->RSSetViewports(1, &full_vp);
+		svc_out_context(sys)->RSSetViewports(1, &full_vp);
 		D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
-		sys->context->RSSetScissorRects(1, &full_scissor);
+		svc_out_context(sys)->RSSetScissorRects(1, &full_scissor);
 		// #1016: this call site owns the DP's state. Three writers share one
 		// panel DP — the workspace compose, this path, and a present-owner's
 		// weave_submit — so neither the encoding nor the transparency mode may
@@ -10078,7 +10155,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		g_weave_latency_workspace.mark_weave("pipeline");
 		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_input_srv, fc->pipe_content_w,
+		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, fc->pipe_content_w,
 		                                          fc->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
 		                                          target_w, target_h, 0, 0, 0, 0);
 	} else if (fc->render.atlas_texture) {
@@ -10133,7 +10210,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 					present_rtv->GetResource(pres.put());
 					wil::com_ptr<ID3D11Texture2D> ptex;
 					if (pres && SUCCEEDED(pres->QueryInterface(IID_PPV_ARGS(ptex.put())))) {
-						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot");
+						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot",
+						                  /*from_out*/ true);
 					}
 				}
 				// (2) %TEMP%\workspace_screenshot_atlas*.png — the pre-weave
@@ -10748,7 +10826,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				if (SUCCEEDED(hr)) {
 					wil::com_ptr<ID3D11Texture2D> bb;
 					mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-					sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+					svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+					                                            mc->back_buffer_rtv.put());
+					svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 				}
 			}
 		}
@@ -12743,8 +12823,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Run DP on cropped atlas → back buffer
 	if (mc->display_processor != nullptr && dp_input_srv && mc->back_buffer_rtv) {
+		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 		ID3D11RenderTargetView *out_rtvs[] = {mc->back_buffer_rtv.get()};
-		sys->context->OMSetRenderTargets(1, out_rtvs, nullptr);
+		svc_out_context(sys)->OMSetRenderTargets(1, out_rtvs, nullptr);
 
 		// Get actual back buffer dimensions
 		uint32_t bb_w = sys->output_width;
@@ -12785,7 +12866,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		    mc->display_processor, g_weave_latency_workspace.measured_r_ns,
 		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(
-		    mc->display_processor, sys->context.get(), dp_input_srv,
+		    mc->display_processor, svc_out_context(sys), dp_input_srv,
 		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
 		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
 		    0, 0, 0, 0);
@@ -13691,18 +13772,18 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
+		HRESULT hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
 		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
-			hr = sys->device->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
-			                                         c->wish_mask_rtv.put());
+			hr = svc_out_device(sys)->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
+			                                                 c->wish_mask_rtv.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = sys->device->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
+			hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
-			hr = sys->device->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
-			                                           c->wish_mask_staged_srv.put());
+			hr = svc_out_device(sys)->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
+			                                                   c->wish_mask_staged_srv.put());
 		}
 		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
 			U_LOG_E("ZONES SVC: wish mask D3D resource creation failed: 0x%08lx", hr);
@@ -13717,10 +13798,10 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 	}
 
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	sys->context->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
+	svc_out_context(sys)->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
 
 	wil::com_ptr<ID3D11DeviceContext1> ctx1;
-	HRESULT hr = sys->context->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
+	HRESULT hr = svc_out_context(sys)->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("ZONES SVC: wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08lx)", hr);
 		return nullptr;
@@ -13794,7 +13875,7 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		ctx1->ClearView(c->wish_mask_rtv.get(), all_off, &dr, 1);
 	}
 
-	sys->context->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
+	svc_out_context(sys)->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
@@ -13903,7 +13984,7 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	// seq is the content generation, so a vendor's content evaluation runs
 	// once per re-raster, not once per frame.
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    dp, sys->context.get(), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
+	    dp, svc_out_context(sys), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
 	    c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
@@ -17690,7 +17771,7 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 		return;
 	}
 
-	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, sys->context.get(), srv, mask_w, mask_h,
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, svc_out_context(sys), srv, mask_w, mask_h,
 	                                                              (int32_t)origin.x, (int32_t)origin.y,
 	                                                              (uint32_t)cr.right, (uint32_t)cr.bottom,
 	                                                              c->zone_publish_seq);
@@ -17815,11 +17896,16 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd)
 //! or carries a duplicated band. Blocking Map on the immediate context — a
 //! one-shot debug path, never armed in a normal session.
 static void
-dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name)
+dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const char *name, bool from_out)
 {
 	if (sys == nullptr || tex == nullptr) {
 		return;
 	}
+	// #918: the staging copy has to be made by the device that OWNS @p tex, so
+	// a caller dumping a woven back buffer says so. Same device both ways while
+	// the split is off.
+	ID3D11Device *dev = from_out ? svc_out_device(sys) : sys->device.get();
+	ID3D11DeviceContext *ctx = from_out ? svc_out_context(sys) : sys->context.get();
 	D3D11_TEXTURE2D_DESC desc = {};
 	tex->GetDesc(&desc);
 	if (desc.Width == 0 || desc.Height == 0) {
@@ -17832,15 +17918,15 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
 	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 	sd.MiscFlags = 0;
 	wil::com_ptr<ID3D11Texture2D> staging;
-	HRESULT hr = sys->device->CreateTexture2D(&sd, nullptr, staging.put());
+	HRESULT hr = dev->CreateTexture2D(&sd, nullptr, staging.put());
 	if (FAILED(hr)) {
 		U_LOG_W("#73 diag: CreateTexture2D(staging) failed for %s: 0x%08lx", name, hr);
 		return;
 	}
-	sys->context->CopyResource(staging.get(), tex);
+	ctx->CopyResource(staging.get(), tex);
 
 	D3D11_MAPPED_SUBRESOURCE m = {};
-	hr = sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
+	hr = ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
 	if (FAILED(hr)) {
 		U_LOG_W("#73 diag: Map(staging) failed for %s: 0x%08lx", name, hr);
 		return;
@@ -17853,7 +17939,7 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
 	for (uint32_t y = 0; y < h; y++) {
 		memcpy(buf.data() + (size_t)y * w * 4u, src + (size_t)y * m.RowPitch, (size_t)w * 4u);
 	}
-	sys->context->Unmap(staging.get(), 0);
+	ctx->Unmap(staging.get(), 0);
 
 	// BGRA staging (the browser's shared input is B8G8R8A8) needs the channel
 	// swap stb does not do; alpha is kept AS SUBMITTED — the transparent gaps
