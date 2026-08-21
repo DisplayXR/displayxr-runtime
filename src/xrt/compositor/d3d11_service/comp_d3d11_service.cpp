@@ -1437,26 +1437,33 @@ svc_out_factory(struct d3d11_service_system *sys)
 	return sys->split_active ? sys->out_factory : sys->dxgi_factory.get();
 }
 
-#ifndef NDEBUG
 /*!
  * #918 debug tripwire: a resource handed to an output-half call must belong to
  * the device that half runs on. Inert while the split is off (both sides of the
  * comparison are the app device); load-bearing the moment it is not, because a
  * D3D11 resource silently does nothing when driven by a foreign device.
+ *
+ * The gate is a `constexpr` rather than an `#ifdef` around the body so release
+ * builds still COMPILE the check (a debug-only body rots unnoticed) while the
+ * constant early return folds the `GetDevice` round trip — a COM call on the
+ * render thread — away to nothing.
  */
+#ifdef NDEBUG
+static constexpr bool k_svc_device_asserts = false;
+#else
+static constexpr bool k_svc_device_asserts = true;
+#endif
+
 static inline void
 svc_assert_same_device(ID3D11View *resource, ID3D11Device *expected_dev)
 {
-	if (resource == nullptr || expected_dev == nullptr) {
+	if (!k_svc_device_asserts || resource == nullptr || expected_dev == nullptr) {
 		return;
 	}
 	wil::com_ptr<ID3D11Device> owner;
 	resource->GetDevice(owner.put());
 	assert(owner.get() == expected_dev);
 }
-#else
-#define svc_assert_same_device(resource, expected_dev) ((void)0)
-#endif
 
 /*!
  * Fair acquire of sys->render_mutex for every contender EXCEPT the capture
