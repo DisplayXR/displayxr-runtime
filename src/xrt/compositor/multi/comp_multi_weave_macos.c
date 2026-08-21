@@ -915,19 +915,29 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
                                      uint32_t client_h,
                                      int32_t display_id)
 {
-	// Spec v7 (#1036): accepted and recorded, but macOS derives its geometry
-	// from the input IOSurface dims and sim_display's anaglyph has no interlace
-	// lattice to phase-align — so there is nothing to feed a DP slot with yet.
-	// Kept so a portable present-owner can publish unconditionally.
+	// Spec v7 (#1036): macOS derives its weave geometry from the input IOSurface
+	// dims and sim_display's anaglyph has no interlace lattice to phase-align, so
+	// there is still nothing to feed a DP *phase* slot with here.
+	//
+	// It IS stored, though (#1116): a weave-only present-owner has no
+	// session_render, so this report is the only window rect
+	// multi_compositor_get_window_metrics() can serve — without it the session
+	// falls back to a display-scoped Kooima and any chained display-zone rect is
+	// discarded. ADR-033: the placement authority reports geometry; recording it
+	// is geometry bookkeeping, not phase.
 	struct multi_compositor *mc = multi_compositor(xc);
-	if (mc == NULL || mc->msc == NULL) {
+	if (mc == NULL || mc->msc == NULL || client_w == 0 || client_h == 0) {
 		return false;
 	}
-	(void)origin_x;
-	(void)origin_y;
-	(void)client_w;
-	(void)client_h;
-	(void)display_id;
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.have_geometry = true;
+	mc->weave.win_x = origin_x;
+	mc->weave.win_y = origin_y;
+	mc->weave.win_w = client_w;
+	mc->weave.win_h = client_h;
+	mc->weave.win_display_id = display_id;
+	os_mutex_unlock(&mc->weave.mutex);
 	return true;
 }
 
