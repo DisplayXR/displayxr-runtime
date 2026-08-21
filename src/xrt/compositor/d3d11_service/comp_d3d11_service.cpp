@@ -8401,6 +8401,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 	}
 	mc->panel_dp_hwnd = nullptr;
+	mc->panel_dp_device = nullptr; // #918
 	// #964: the render thread is joined above, so nothing can still be reading
 	// a retired DP — drain the graveyard unconditionally.
 	pipeline_dp_graveyard_sweep(mc, /*force*/ true);
@@ -8469,11 +8470,16 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 			                                          COMP_DP_API_D3D11);
 			if (dp_fac != NULL) {
 				auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
-				xrt_result_t dp_ret = factory(
-				    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+				// #918: the service window is a SERVICE_WINDOW presenter, so the
+				// panel DP goes on the output device while the split is engaged.
+				xrt_result_t dp_ret =
+				    factory(svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW),
+				            svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW), mc->hwnd,
+				            &mc->display_processor);
 				if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 					U_LOG_W("Multi-comp: display processor recreated on live window");
 					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
+					mc->panel_dp_device = svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW);
 					if (mc->window != nullptr) {
 						comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 					}
@@ -8797,12 +8803,17 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 	if (dp_fac != NULL && pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
-		xrt_result_t dp_ret = factory(
-		    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+		// #918: SERVICE_WINDOW is an ELIGIBLE presenter, so under an engaged
+		// split the panel DP is created on the scanout device — the same device
+		// its back buffer and its egress atlas live on.
+		ID3D11Device *panel_dev = svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW);
+		ID3D11DeviceContext *panel_ctx = svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW);
+		xrt_result_t dp_ret = factory(panel_dev, panel_ctx, mc->hwnd, &mc->display_processor);
 
 		if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 			U_LOG_W("Multi-comp: display processor created");
 			mc->panel_dp_hwnd = mc->hwnd; // #964 D-4: the panel DP's bound window
+			mc->panel_dp_device = panel_dev; // #918: and the device half of the key
 
 			// Store DP on window for ESC/close 2D mode switch
 			if (mc->window != nullptr) {
@@ -8823,6 +8834,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				// Teardown and recreate at correct size
 				xrt_display_processor_d3d11_destroy(&mc->display_processor);
 				mc->panel_dp_hwnd = nullptr;
+				mc->panel_dp_device = nullptr; // #918
 				mc->back_buffer_rtv.reset();
 				mc->swap_chain.reset();
 				comp_d3d11_window_destroy(&mc->window);
@@ -8878,11 +8890,12 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 
 				// Recreate DP with new window
-				dp_ret = factory(sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+				dp_ret = factory(panel_dev, panel_ctx, mc->hwnd, &mc->display_processor);
 				if (dp_ret != XRT_SUCCESS) {
 					U_LOG_E("Multi-comp: failed to recreate DP");
 				} else {
 					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
+					mc->panel_dp_device = panel_dev; // #918
 					if (mc->window != nullptr) {
 						comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 					}
@@ -9070,7 +9083,10 @@ dxr_dp_graveyard_ns()
  * asking for 3D would fight the new one for its whole retirement.
  */
 static void
-pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_processor_d3d11 *old, HWND old_hwnd)
+pipeline_dp_retire(struct d3d11_multi_compositor *mc,
+                   struct xrt_display_processor_d3d11 *old,
+                   HWND old_hwnd,
+                   ID3D11Device *old_dev)
 {
 	if (old == nullptr) {
 		return;
@@ -9082,6 +9098,7 @@ pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_process
 			mc->dp_graveyard[i].dp = old;
 			mc->dp_graveyard[i].retire_ns = now_ns;
 			mc->dp_graveyard[i].hwnd = old_hwnd;
+			mc->dp_graveyard[i].dev = old_dev;
 			return;
 		}
 	}
@@ -9099,6 +9116,7 @@ pipeline_dp_retire(struct d3d11_multi_compositor *mc, struct xrt_display_process
 	mc->dp_graveyard[oldest].dp = old;
 	mc->dp_graveyard[oldest].retire_ns = now_ns;
 	mc->dp_graveyard[oldest].hwnd = old_hwnd;
+	mc->dp_graveyard[oldest].dev = old_dev;
 }
 
 /*!
@@ -9138,6 +9156,7 @@ pipeline_dp_graveyard_flush_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		mc->dp_graveyard[i].dp = nullptr;
 		mc->dp_graveyard[i].retire_ns = 0;
 		mc->dp_graveyard[i].hwnd = nullptr;
+		mc->dp_graveyard[i].dev = nullptr;
 	}
 	return clear;
 }
@@ -9163,6 +9182,7 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
 			mc->dp_graveyard[i].dp = nullptr;
 			mc->dp_graveyard[i].retire_ns = 0;
 			mc->dp_graveyard[i].hwnd = nullptr;
+			mc->dp_graveyard[i].dev = nullptr;
 		}
 	}
 }
@@ -9197,6 +9217,7 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		struct xrt_display_processor_d3d11 *old = mc->display_processor;
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr; // #918
 		(void)DP_REQUEST_DISPLAY_MODE(old, false);
 		xrt_display_processor_d3d11_destroy(&old);
 		U_LOG_W("[pipeline] panel DP released with its window hwnd=%p — rebinds on the next frame (#1014)",
@@ -9210,6 +9231,7 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		mc->dp_graveyard[i].dp = nullptr;
 		mc->dp_graveyard[i].retire_ns = 0;
 		mc->dp_graveyard[i].hwnd = nullptr;
+		mc->dp_graveyard[i].dev = nullptr;
 	}
 }
 
@@ -9371,18 +9393,29 @@ service_single_client_atlas_encoding(const struct d3d11_service_compositor *c)
 	return XRT_ATLAS_ENCODING_ENCODED;
 }
 
+/*!
+ * @param want_dev #918: the DEVICE the panel DP must live on to serve the
+ *        incoming presenter — `svc_panel_dp_device(sys, kind)`. Together with
+ *        @p hwnd this is the BIND KEY. NULL means "whatever it is on now" and
+ *        is only used by the health poll's forced recreate, which is re-binding
+ *        the same presenter to the same window.
+ */
 static void
 pipeline_bind_panel_dp(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
                        HWND hwnd,
                        bool client_presents,
-                       bool force_recreate)
+                       bool force_recreate,
+                       ID3D11Device *want_dev)
 {
 	if (sys == nullptr || mc == nullptr || hwnd == nullptr) {
 		return;
 	}
 	if (service_device_removed(sys)) {
 		return; // #1002: never build a DP on a dead device
+	}
+	if (want_dev == nullptr) {
+		want_dev = mc->panel_dp_device != nullptr ? mc->panel_dp_device : sys->device.get();
 	}
 
 	/*
@@ -9410,14 +9443,68 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_encoding = -1; // #1016: a fresh DP starts unknown
-		pipeline_dp_retire(mc, dead, dead_hwnd);
+		ID3D11Device *dead_dev = mc->panel_dp_device;
+		mc->panel_dp_device = nullptr;
+		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev);
 		U_LOG_W(
 		    "[pipeline] panel DP retired on a STALE vendor backend (hwnd=%p) — rebinding on a"
 		    " later frame",
 		    (void *)dead_hwnd);
 	}
 
-	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd) {
+	/*
+	 * #918 — the DEVICE half of the bind key.
+	 *
+	 * A presenter change that stays on ONE device keeps every shortcut below
+	 * (the no-op early-out and the free #1008 `set_window` re-point). A change
+	 * that CROSSES devices can use neither: the weaver's D3D11 objects belong to
+	 * the device it was created on, and `set_window` re-points the window, not
+	 * the adapter. So the instance has to go, exactly as a STALE backend forces.
+	 *
+	 * That crossing happens on precisely one event — focus moving across the
+	 * eligibility boundary (`svc_kind_eligible_for_split`), i.e. an Alt-Tab
+	 * between a present-owner / client-presents client and a hosted or app-HWND
+	 * one. A user can generate that as fast as they can press keys, so the
+	 * crossing is DWELL-limited: a second crossing inside the dwell window is
+	 * refused and the frame degrades (the direct path below refuses to weave
+	 * through a wrong-device DP and falls back to the raw copy) rather than
+	 * destroying and recreating the vendor weaver at Alt-Tab rate.
+	 */
+	const bool device_crossing = mc->display_processor != nullptr && mc->panel_dp_device != want_dev;
+	if (device_crossing) {
+		const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		if (mc->panel_dp_dev_rebind_ns != 0 &&
+		    now_ns - mc->panel_dp_dev_rebind_ns < DXR_SPLIT_DEV_REBIND_DWELL_NS) {
+			return; // still dwelling; try again on a later frame
+		}
+		mc->panel_dp_dev_rebind_ns = now_ns;
+		sys->render_diag_pipe_dev_rebind.fetch_add(1, std::memory_order_relaxed);
+
+		// Retire FIRST, for the same reason the STALE path does: this may be a
+		// rebind onto the SAME window (a client-presents client and an opaque
+		// one can share one HWND), and two live weavers on one HWND make the
+		// vendor's window-subclass chain self-referencing.
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *dead = mc->display_processor;
+		HWND dead_hwnd = mc->panel_dp_hwnd;
+		ID3D11Device *dead_dev = mc->panel_dp_device;
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr;
+		mc->panel_dp_encoding = -1;
+		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev);
+		U_LOG_W(
+		    "[pipeline] panel DP crossing devices: %p (hwnd=%p) retired, rebinding on device %p "
+		    "hwnd=%p (#918 split=%d)",
+		    (void *)dead_dev, (void *)dead_hwnd, (void *)want_dev, (void *)hwnd, (int)sys->split_active);
+		// Falls through: a DIFFERENT window creates immediately below; the same
+		// window is held off by the graveyard's ~250 ms grace and binds on a
+		// later frame, flat-blitting in between.
+	}
+
+	if (mc->display_processor != nullptr && mc->panel_dp_hwnd == hwnd && mc->panel_dp_device == want_dev) {
 		// Already bound where we want it -- but the presenter KIND may have
 		// changed on the same window (present-owner <-> opaque app): keep the
 		// DP's transparency mode in step with the presenter.
@@ -9457,8 +9544,13 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	 *
 	 * False (older plug-in, or a re-bind it cannot honour) falls through to
 	 * the recreate path below, unchanged.
+	 *
+	 * #918: unreachable on a device crossing — the block above already retired
+	 * the instance, so `display_processor` is NULL by the time control gets
+	 * here. Stated rather than relied on, because "re-point the window" would
+	 * silently leave the weaver on the wrong adapter if it ever were reachable.
 	 */
-	if (mc->display_processor != nullptr &&
+	if (mc->display_processor != nullptr && mc->panel_dp_device == want_dev &&
 	    xrt_display_processor_d3d11_set_window(mc->display_processor, (void *)hwnd)) {
 		mc->panel_dp_hwnd = hwnd;
 		pipeline_dp_set_transparency(mc, mc->display_processor, client_presents, "set_window");
@@ -9505,10 +9597,18 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	 */
 	struct xrt_display_processor_d3d11 *fresh = nullptr;
 	auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
-	xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), hwnd, &fresh);
+	// #918: created on the DEVICE the incoming presenter needs. Everything the
+	// weaver allocates — its render targets, its interlace shader resources —
+	// belongs to whichever device is handed in here, so this argument IS the
+	// device half of the bind key. `want_dev` resolves to the app device on
+	// every non-split build and for every ineligible presenter.
+	ID3D11DeviceContext *want_ctx = (want_dev == sys->out_dev && sys->out_ctx != nullptr)
+	                                    ? sys->out_ctx
+	                                    : static_cast<ID3D11DeviceContext *>(sys->context.get());
+	xrt_result_t dp_ret = factory(want_dev, want_ctx, hwnd, &fresh);
 	if (dp_ret != XRT_SUCCESS || fresh == nullptr) {
-		U_LOG_E("[pipeline] panel DP create on hwnd=%p failed (%d) — keeping the current one", (void *)hwnd,
-		        (int)dp_ret);
+		U_LOG_E("[pipeline] panel DP create on hwnd=%p dev=%p failed (%d) — keeping the current one",
+		        (void *)hwnd, (void *)want_dev, (int)dp_ret);
 		return; // the OLD DP stays published and usable; try again later
 	}
 
@@ -9526,6 +9626,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// runs on the WINDOW thread, which takes no lock of ours.
 	struct xrt_display_processor_d3d11 *old = mc->display_processor;
 	HWND old_hwnd = mc->panel_dp_hwnd;
+	ID3D11Device *old_dev = mc->panel_dp_device;
 	if (mc->window != nullptr) {
 		comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
 	}
@@ -9533,6 +9634,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	// PUBLISH. Single pointer store; readers load it once into a local.
 	mc->display_processor = fresh;
 	mc->panel_dp_hwnd = hwnd;
+	mc->panel_dp_device = want_dev; // #918: the other half of the bind key
 	mc->panel_dp_client_presents = client_presents;
 	// #1016: a fresh DP starts on the plug-in's ENCODED default and no writer
 	// has touched it yet — record "unknown" so the first process_atlas site
@@ -9544,11 +9646,11 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	}
 
 	// RETIRE. Destroyed by the render thread's sweep once the grace expires.
-	pipeline_dp_retire(mc, old, old_hwnd);
+	pipeline_dp_retire(mc, old, old_hwnd, old_dev);
 
 	sys->render_diag_pipe_rebind.fetch_add(1, std::memory_order_relaxed);
-	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p (client_presents=%d, hw3d=%d, old=%p retired)", (void *)hwnd,
-	        (int)client_presents, (int)want_3d, (void *)old);
+	U_LOG_W("[pipeline] panel DP re-bound to hwnd=%p dev=%p (client_presents=%d, hw3d=%d, old=%p retired)",
+	        (void *)hwnd, (void *)want_dev, (int)client_presents, (int)want_3d, (void *)old);
 }
 
 /*!
@@ -9619,8 +9721,10 @@ pipeline_dp_health_poll(struct d3d11_service_system *sys, struct d3d11_multi_com
 	sys->render_diag_dp_stale_recreate.fetch_add(1, std::memory_order_relaxed);
 	// The 1 Hz cadence rate-limits the retries; the graveyard grace and the
 	// factory backoff protect the rebind path itself.
+	// #918: same presenter, same window — so the same DEVICE. NULL asks the bind
+	// to keep whichever one the panel DP is already on.
 	pipeline_bind_panel_dp(sys, mc, mc->panel_dp_hwnd, mc->panel_dp_client_presents,
-	                       /*force_recreate*/ true);
+	                       /*force_recreate*/ true, /*want_dev*/ nullptr);
 }
 
 //! Defined further down (browser#73 diagnostic); used by the pipeline's
@@ -10533,7 +10637,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// captured background, never go opaque -- which is exactly the #551
 		// client_presents=true configuration legacy gave its per-client DP.
 		// Bound with false, the woven layer came out opaque and hid the page.
-		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true, /*force_recreate*/ false);
+		// #918: both of these presenter kinds are structurally INELIGIBLE for the
+		// split (the weave destination is a texture the client opened on the app
+		// adapter and presents itself), so the panel DP belongs on the app device
+		// even while the split is otherwise active.
+		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true, /*force_recreate*/ false,
+		                       svc_panel_dp_device(sys, kind));
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		// Tell the owner it holds the panel, so its next commit weaves.
 		fc->pipe_owns_panel.store(true, std::memory_order_release);
@@ -10583,7 +10692,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	}
 
 	/* (c) One DP per panel, bound to the active presenter's window. */
-	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE, /*force_recreate*/ false);
+	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE, /*force_recreate*/ false,
+	                       svc_panel_dp_device(sys, kind));
 	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
 
 	/* (e) Direct path: crop the focused client's atlas (ADR-030) and weave it
@@ -10876,6 +10986,7 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 		}
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr; // #918
 	}
 	mc->back_buffer_rtv.reset();
 	mc->combined_atlas_rtv.reset();
@@ -11173,7 +11284,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// can defer a frame or two (a just-retired DP still owns the
 			// window) and does nothing at all with no vendor plug-in, so the
 			// latch is deadline-bounded rather than "until it binds".
-			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false, /*force_recreate*/ false);
+			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false, /*force_recreate*/ false,
+		                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
 			const bool bound = mc->display_processor != nullptr && mc->panel_dp_hwnd == mc->hwnd;
 			if (bound || (int64_t)os_monotonic_get_ns() >= mc->foreground_override_restore_deadline_ns) {
 				mc->foreground_override_restore = false;
@@ -23527,7 +23639,8 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		}
 
 		// One DP per panel, back on the service window (D-4).
-		pipeline_bind_panel_dp(sys, pmc, pmc->hwnd, /*client_presents*/ false, /*force_recreate*/ false);
+		pipeline_bind_panel_dp(sys, pmc, pmc->hwnd, /*client_presents*/ false, /*force_recreate*/ false,
+		                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
 
 		if (pmc->hwnd != nullptr) {
 			if (!pmc->service_window_shown) {
@@ -23588,11 +23701,17 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		if (mc->display_processor == nullptr && dp_fac_resume != NULL && !service_device_removed(sys) &&
 		    pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) {
 			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_resume;
-			xrt_result_t dp_ret = factory(
-			    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+			// #918: a controller is attached, so the split is SUSPENDED and this
+			// resolves to the app device — the same one the service-window chain
+			// was just rebuilt on.
+			ID3D11Device *resume_dev = svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW);
+			xrt_result_t dp_ret = factory(resume_dev, svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW),
+			                              mc->hwnd, &mc->display_processor);
 
 			if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 				U_LOG_W("Workspace resume: display processor recreated");
+				mc->panel_dp_hwnd = mc->hwnd;   // #918: keep the bind key truthful
+				mc->panel_dp_device = resume_dev;
 				if (mc->window != nullptr) {
 					comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 				}
