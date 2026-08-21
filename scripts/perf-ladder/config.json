@@ -6,7 +6,7 @@
   "reps": 3,
   "witnessIntervalSeconds": 5,
   "app": {
-    "exe": "avatar\\dxr_demo_avatar.exe",
+    "exe": "avatar\\avatar_handle_vk_win.exe",
     "args": "",
     "windowSize": "600x1051",
     "windowPos": "center",

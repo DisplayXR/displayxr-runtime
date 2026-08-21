@@ -38,6 +38,9 @@ function Log { param([string]$m)
 }
 
 # --- Block 0: capabilities ---------------------------------------------------
+# Kit manifest rides along so the returned results self-identify.
+$man = Join-Path $PSScriptRoot 'kit-manifest.json'
+if (Test-Path $man) { Copy-Item $man $outDir }
 & (Join-Path $PSScriptRoot 'probe_caps.ps1') -OutDir $outDir
 $caps = Get-Content (Join-Path $outDir 'capabilities.json') -Raw | ConvertFrom-Json
 $scanoutLuid = ''
@@ -48,7 +51,9 @@ if (-not $caps.power.onAc) { Log 'FLAG: on battery - results will be invalid; pl
 # --- App exe -----------------------------------------------------------------
 $appExe = $cfg.app.exe
 if ($AppExeOverride -ne '') { $appExe = $AppExeOverride }
-if (-not [IO.Path]::IsPathRooted($appExe)) { $appExe = Join-Path (Split-Path $PSScriptRoot -Parent) $appExe }
+# Relative paths resolve against the kit root (= this script's folder): the
+# shipped kit is flat - RUN-LADDER.cmd, the .ps1s and avatar\ side by side.
+if (-not [IO.Path]::IsPathRooted($appExe)) { $appExe = Join-Path $PSScriptRoot $appExe }
 $needApp = $false
 foreach ($a in $cfg.arms) { if ($a.app) { $needApp = $true } }
 if ($Arms.Count -gt 0) {
