@@ -149,6 +149,85 @@ Capability-probed and benchmarked with purpose-built tools
 | Per repaint tick | 33.2 MB again, every tick | **0** — atlas already iGPU-resident |
 | Legacy apps (Case A compromise) | 33.2 MB | 33.2 MB *unless transferred post-downscale* (parity, not regression) |
 
+## What actually crosses, per plane (#918 Phase 2a, measured)
+
+Phase 1 shipped the split projection-only: the atlas crossed and everything else — zones,
+Local2D, authored masks, the 2D-under backdrop — was hard-gated off. Phase 2a carries the
+rest, and the per-plane inventory below is what makes that cheap. The reframe is that the
+masked composite has to run on the output device no matter what (its destination is the back
+buffer, which Phase 1 already moved), so the only real question is which *inputs* have to be
+transported — and for three of the four mask sources the answer is **none**.
+
+| Plane | Transport | Measured on the reference box |
+|---|---|---|
+| auto wish mask / implicit mask / feather mask / Tier-1-2 authored mask | **none** — every rasterizer takes pure CPU rects, so it is simply run again on the output device | 0 B/s |
+| Local2D OVER flatten (`local2d_scratch`) | bridge plane, RGBA8, panel-sized, per frame with dirty box + change-skip | **3 copies per session** at rest (see below) |
+| 2D-under backdrop (`backdrop_scratch`) | bridge plane, RGBA8, panel-sized, dirty box | **3 copies per session** at rest |
+| Tier-3 authored mask (app-drawn RT) | bridge plane, **R8**, **sized at the mask** (not the panel), on `author_seq` change only | one copy per re-authoring; R8 ROW_MAJOR cross-adapter **works** on this stack — no RGBA carrier needed |
+| weave snapshot (`weave_scratch`) | **none** — its source is the output-side back buffer, so it is output-local | 0 B/s |
+
+The planes ride the **same egress slot as the atlas**: parallel per-slot arrays, copies
+recorded into the same producer/consumer command lists before `Close()`, so atlas and planes
+land under one seq and one fence pair. That is not tidiness — it is what makes the Phase-1
+layout-generation refusal, the slot-readiness check and the repaint slot republish cover the
+planes for free.
+
+Measured with `DXR_XBRIDGE_DIAG=1` (windowed 1280×720 `cube_handle_d3d11_win`,
+`DXR_LOCAL2D_PANEL=1 DXR_LOCAL2D_BACKDROP=2`, 31 s, 1862 frames bridged):
+
+```
+atlas 0.111 GB/s | local2d 0.000 GB/s (0 copies, 61 skips) |
+backdrop 0.000 GB/s (0 copies, 61 skips) | mask 0.000 GB/s | TOTAL 0.111 GB/s
+…
+d3d11 xbridge: Local2D plane  — 3 copies, 1850 change-skips
+d3d11 xbridge: backdrop plane — 3 copies, 1850 change-skips
+```
+
+Three copies, not 1853: one per egress slot, and then the content hash stops matching nothing
+and every subsequent frame is skipped. The **change-skip is mandatory, not an optimisation** —
+a full-window RGBA plane at 4K60 is 1.99 GB/s on its own, which is the whole acceptance budget
+for one plane. The hash covers `{swapchain, image_index, source rect, norm_rect, flip_y,
+flags}` per layer; `image_index` is what makes it safe rather than optimistic, because
+`d3d11_swapchain_acquire_image` hands indices out round-robin, so an app that redraws hashes
+differently every frame and an app that stops acquiring genuinely has not changed.
+
+A bandwidth **gate** sums every leg over a rolling second and, above 2.0 GB/s, latches the
+largest plane to half rate with one WARN — never the split, whose win is the repaint arm and
+the iGPU-local present, neither of which a plane's rate affects. It did not fire in any
+session measured here.
+
+The gate aims at **plane-attributable** bytes: the over-budget test is on the transport total,
+but a plane is only throttled when the planes contribute at least 0.25 GB/s of it. Otherwise
+the atlas is the cost — a 4-view 4K atlas is ~4 GB/s at 120 Hz before any 2D content exists —
+and the gate has no lever on it, so it says so once and throttles nothing. The half-rate latch
+is pressure relief, not a session-long sentence: it clears once the transport has stayed inside
+budget for 5 s, and a plane re-bind clears its own.
+
+Under a forced repaint (`DXR_WEAVE_REPAINT_FORCE=1`, 960 repaints, backdrop active) the
+transport stayed at the app's frame rate — 0.055 GB/s against 30 app frames/s — so **repaint
+ticks add zero bridge traffic with the planes live**, exactly as they did projection-only.
+
+The two **2D** plane textures are **panel-sized once and never resized**, which puts them
+structurally outside the R2 churn hysteresis. A 3 s continuous resize with the Local2D plane
+active produced 6 egress rebuilds / 1 churn entry / 1 settle / 77.1 ms longest weave gap,
+against 6 / 1 / 1 / 76.8 ms for the same resize with no planes at all.
+
+The **mask** plane is the deliberate exception. An authored mask maps *stretch-to-region* —
+the whole mask texture over the whole composite region, whatever its own dimensions, which is
+also what the display processor does with the published mask — and an app picks those
+dimensions itself (the zones docs recommend a downsampled one). A panel-sized mask plane would
+therefore transport the mask into a corner of a texture the composite then stretches whole,
+sampling a band no copy ever wrote; for R8 that band reads as "2D everywhere", the exact
+inverse of an unauthored mask's all-3D default. So the mask plane is allocated **at the mask**,
+and it rebuilds only when the app creates a differently-sized one — an on-change event, like
+its transport, and so never the per-frame churn the 2D planes are protected from.
+
+The DP **sideband** views (`set_background_2d`, `publish_local_zone_mask`) are seq-gated on the
+slot's plane generation and metered in the DIAG line. They run on the output device rather than
+the bridge, so they are not bridge traffic — but they are real per-tick bandwidth, and an
+unchanged backdrop under a forced repaint must copy nothing. With the mask plane now
+mask-sized, the mask sideband is a passthrough and copies nothing at all.
+
 ## Not measured, and why
 
 - ~~Attended eye-pose latency under B~~ — **closed**: attended run with load active

@@ -75,6 +75,93 @@ struct comp_d3d11_xbridge_info
 	//! reallocates the heap mid-flight.
 	uint32_t max_width;
 	uint32_t max_height;
+
+	/*!
+	 * Panel extent (`xdev->hmd->screens[0]`). The two 2D PLANES are sized from
+	 * this ONCE and never resized — a window can never exceed the panel, so a
+	 * plane allocated here fits every region the session will ever composite.
+	 * That is deliberate: it puts them structurally outside the R2 churn
+	 * hysteresis and the #1091 resize path, where a per-size realloc of three
+	 * NT-shared textures on the frame path is exactly what cost 21 of 50 frames.
+	 *
+	 * The authored-MASK plane is the exception and is sized at the MASK — see
+	 * @ref comp_d3d11_xbridge_bind_plane.
+	 */
+	uint32_t panel_width;
+	uint32_t panel_height;
+};
+
+/*!
+ * #918 Phase 2a — the bridge PLANES. Beside the atlas, the masked composite
+ * needs three more app-device images on the scanout adapter. Each rides the
+ * SAME egress slot as the atlas (parallel per-slot arrays, copies recorded into
+ * the same producer/consumer command lists), so atlas + planes land atomically
+ * under one seq and one fence pair — which makes the layout-generation refusal,
+ * the slot-readiness check and the repaint slot republish cover them for free.
+ * @{
+ */
+//! Local2D OVER flatten (RGBA). Per frame, dirty-box + change-skip.
+#define COMP_D3D11_XBRIDGE_PLANE_LOCAL2D 0u
+//! 2D-under backdrop flatten (RGBA), handed to the DP's set_background_2d.
+#define COMP_D3D11_XBRIDGE_PLANE_BACKDROP 1u
+//! Tier-3 app-authored zone mask (R8). On `author_seq` change only.
+#define COMP_D3D11_XBRIDGE_PLANE_MASK 2u
+#define COMP_D3D11_XBRIDGE_PLANE_COUNT 3u
+/*! @} */
+
+//! @ref comp_d3d11_xbridge_recipe::mask_kind
+#define COMP_D3D11_XBRIDGE_MASK_NONE 0u
+//! An output-device raster (auto wish / implicit / feather / Tier-1-2 shadow).
+#define COMP_D3D11_XBRIDGE_MASK_OUT_RASTER 1u
+//! The bridged Tier-3 authored mask plane.
+#define COMP_D3D11_XBRIDGE_MASK_PLANE 2u
+
+/*!
+ * #918 Phase 2a — the COMPOSITE RECIPE stamped on an egress slot.
+ *
+ * Same defect class as the Phase-1 offset-cube fix, closed pre-emptively. Under
+ * the split the weave consumes a slot some EARLIER frame filled, so reading the
+ * composite's parameters from live CPU state can pair one frame's pixels with
+ * the next frame's recipe — exactly what `eg_gen` already forbids for the atlas.
+ * The consume half therefore reads these FROM THE SLOT.
+ */
+struct comp_d3d11_xbridge_recipe
+{
+	//! True when the frame that filled this slot ran the masked composite at
+	//! all. A projection-only frame stamps false and the consume half skips.
+	bool composite;
+	//! COMP_D3D11_COMPOSITE_MODE_* (LERP / ALPHA_OVER / ZONES).
+	uint32_t composite_mode;
+	//! COMP_D3D11_XBRIDGE_MASK_*.
+	uint32_t mask_kind;
+	//! #833/#116 opaque present on a transparent session.
+	bool opaque_present;
+	//! Composite region (window px inside the worst-case surface, #464).
+	uint32_t region_w, region_h;
+	/*!
+	 * The BACKDROP plane's own extent, which is NOT the composite region: a
+	 * frame can flatten a backdrop and then fail (or skip) the composite, and the
+	 * DP's `set_background_2d` contract takes the backdrop's real width/height.
+	 * 0 when the frame produced no backdrop.
+	 */
+	uint32_t bd_w, bd_h;
+	//! Effective canvas sub-rect, already clamped to the region.
+	int32_t cx, cy;
+	uint32_t cw, ch;
+	/*!
+	 * Bit i set ⟹ plane i's pixels in this slot ARE the generation the frame
+	 * staged. A change-skip satisfies that by construction; a half-rate or
+	 * empty-box skip does not, and leaves the bit clear (#918 review F3).
+	 */
+	uint32_t plane_valid;
+	/*!
+	 * Content generation of each plane's pixels in this slot — the generation
+	 * the slot actually HOLDS, which for a skipped plane is the older one it
+	 * still carries. Passed back to @ref comp_d3d11_xbridge_get_plane_srv as
+	 * `want_seq`, so the consume half proves the pixels it is about to sample
+	 * are still the ones its recipe describes rather than a later frame's.
+	 */
+	uint64_t plane_seq[COMP_D3D11_XBRIDGE_PLANE_COUNT];
 };
 
 /*!
@@ -172,6 +259,138 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
  */
 void
 comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb);
+
+/*!
+ * #918 Phase 2a — stand up the plane transport (panel-sized, once).
+ *
+ * Per-plane LAZY allocation: each plane gets its OWN cross-adapter heap + placed
+ * ring and its own egress textures, created on the first bind. A plane that
+ * cannot be allocated degrades THAT FEATURE with one WARN — Local2D stops
+ * compositing, say — and never the split, which is why the heaps are not one
+ * shared allocation.
+ *
+ * A plane that has failed once is never retried, so these calls are safe to make
+ * unconditionally on the frame path.
+ *
+ * Bind the APP-DEVICE source texture for @p plane. The producer opens it
+ * directly (the same Option-I shape as the atlas — no extra app-device copy),
+ * so the texture must have been created `SHARED | SHARED_NTHANDLE`.
+ *
+ * @param nt_handle `HANDLE` from `IDXGIResource1::CreateSharedHandle`, or NULL
+ *        to drop the plane.
+ * @param generation Bumped by the caller whenever the texture is REALLOCATED; a
+ *        change re-opens the handle (and drains the producer first).
+ * @param dxgi_format The plane's DXGI format — RGBA8 for the 2D planes, R8 for
+ *        the authored mask. Probed against the cross-adapter heap at first use;
+ *        a format the stack refuses disables that plane alone.
+ * @param w,h Extent to allocate the plane's chain at. The 2D planes pass the
+ *        PANEL and so never resize — that is what keeps them outside the R2
+ *        churn path. The authored MASK passes the MASK's own dims: it maps
+ *        stretch-to-region, so a panel-sized mask plane would leave the
+ *        composite stretching a never-written band over the region (#918 review
+ *        F5). A dims change rebuilds the chain, drained; for the mask that is an
+ *        on-change event, never a per-frame one.
+ *
+ * @return true when the plane is live.
+ */
+bool
+comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
+                              uint32_t plane,
+                              void *nt_handle,
+                              uint64_t generation,
+                              uint32_t dxgi_format,
+                              uint32_t w,
+                              uint32_t h);
+
+/*!
+ * Stage @p plane for the NEXT @ref comp_d3d11_xbridge_submit.
+ *
+ * @param content_seq A hash of the content the source texture now holds. The
+ *        copy is SKIPPED when the write slot already carries this exact seq —
+ *        mandatory, not an optimisation: a full-window RGBA plane at 4K60 is
+ *        1.99 GB/s on its own.
+ * @param x,y,w,h The DIRTY BOX in source pixels. The bridge accumulates it per
+ *        slot, so a slot that missed several changes is refreshed with the union
+ *        of all of them and never sees a partially-updated image.
+ */
+void
+comp_d3d11_xbridge_stage_plane(
+    struct comp_d3d11_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h);
+
+/*!
+ * #918 review F4 — drop every slot's pixels for @p plane and make each owe a
+ * FULL refresh of the plane extent.
+ *
+ * For the caller whose SOURCE content moved without the source texture being
+ * reallocated: a composite region change leaves stale pixels outside the new
+ * region in a panel-sized scratch, and the dirty-box union that follows would
+ * carry them across as if they were content. The caller clears its whole scratch
+ * and calls this, so the next copy is a full refresh of known-good pixels.
+ */
+void
+comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plane);
+
+/*!
+ * #918 review, R1-adjacent — order an app-device write to @p plane's SOURCE
+ * behind the producer's in-flight read of it.
+ *
+ * @ref comp_d3d11_xbridge_pre_render covers everything layer_commit writes, but
+ * the authored mask is staged from an OpenXR entry point of the app's, before
+ * layer_commit runs — so that write preceded the frame's back-fence in the
+ * command stream and raced the producer's copy of the previous seq. Call
+ * immediately before any such out-of-band write.
+ *
+ * GPU-side wait on the app's immediate context only; this thread never waits,
+ * and the wait is free after the first call for a given producer seq.
+ */
+void
+comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane);
+
+//! Stage the composite recipe the next submit stamps on its slot.
+void
+comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp_d3d11_xbridge_recipe *recipe);
+
+//! The recipe stamped on @p slot. False when the slot holds nothing.
+bool
+comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, struct comp_d3d11_xbridge_recipe *out);
+
+/*!
+ * `ID3D11ShaderResourceView *` of @p plane for @p slot (NULL when invalid).
+ *
+ * @param want_seq The content generation the caller's recipe says this slot
+ *        carries (`comp_d3d11_xbridge_recipe::plane_seq[plane]`), or 0 to skip
+ *        the test. A mismatch means a later submit has rewritten the plane under
+ *        this weave and returns NULL rather than mismatched pixels (#918 review
+ *        F3).
+ */
+void *
+comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq);
+
+//! Allocated extent of @p plane's chain. False when the plane is not live.
+bool
+comp_d3d11_xbridge_plane_extent(struct comp_d3d11_xbridge *xb, uint32_t plane, uint32_t *out_w, uint32_t *out_h);
+
+/*!
+ * Per-plane transport counters for the once-a-second `#918 DIAG` line: bytes
+ * copied and copies skipped since the last call, plus whether the plane has been
+ * latched to half rate by the bandwidth gate.
+ */
+void
+comp_d3d11_xbridge_take_plane_stats(struct comp_d3d11_xbridge *xb,
+                                    uint32_t plane,
+                                    uint64_t *out_bytes,
+                                    uint64_t *out_copies,
+                                    uint64_t *out_skips,
+                                    bool *out_half_rate);
+
+//! Atlas bytes copied since the last call — the DIAG line's denominator.
+uint64_t
+comp_d3d11_xbridge_take_atlas_bytes(struct comp_d3d11_xbridge *xb);
+
+//! Short name of @p plane for the DIAG line, so adding a plane cannot leave the
+//! log naming it by a stale index (#918 review D8).
+const char *
+comp_d3d11_xbridge_plane_label(uint32_t plane);
 
 /*!
  * Record and execute the three legs for one app frame. Returns immediately —

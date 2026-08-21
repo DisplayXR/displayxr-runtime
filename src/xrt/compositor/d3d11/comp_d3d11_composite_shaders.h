@@ -67,6 +67,20 @@ cbuffer CompositeParams : register(b0)
     uint   use_rect_mask;
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
     uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
+    uint   _pad0;
+    // #918 Phase 2a: region / texture extent, for the two inputs that are
+    // addressed BY PIXEL. The Local2D plane is PANEL-sized (allocated once so
+    // it never enters the resize churn path) and the weave scratch is
+    // grow-only, so each holds the region's content in a top-left sub-rect and
+    // its uv must be scaled into that sub-rect. 1.0 for an exactly
+    // region-sized input, which is every input on the non-split path.
+    //
+    // There is deliberately NO mask scale: an authored mask maps
+    // STRETCH-TO-REGION (the whole mask texture over the whole region), which
+    // is the pre-#918 behavior and the same mapping the display processor
+    // applies to the published mask. So the mask is always sampled at uv.
+    float2 twod_uv_scale;
+    float2 weave_uv_scale;
 };
 
 struct VS_OUTPUT
@@ -96,11 +110,11 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         float M = region_mask(px, input.uv);
         if (M >= 0.5)
             discard;
-        return twod_tex.Sample(samp, input.uv);
+        return twod_tex.Sample(samp, input.uv * twod_uv_scale);
     }
 
-    float4 twod  = twod_tex.Sample(samp, input.uv);
-    float4 weave = weave_tex.Sample(samp, input.uv);
+    float4 twod  = twod_tex.Sample(samp, input.uv * twod_uv_scale);
+    float4 weave = weave_tex.Sample(samp, input.uv * weave_uv_scale);
     if (opaque_present == 1)
     {
         // Opaque present (runtime #833 / plugin #116): DWM completes no

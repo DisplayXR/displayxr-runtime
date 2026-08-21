@@ -288,6 +288,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
         xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
+        xrGetInstanceProcAddr(xr.instance,
+                              "xrAcquireLocal3DZoneRenderTargetDXR",
+                              (PFN_xrVoidFunction *)&g_zone.pfnAcquire);
         xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnDestroy);
         if (!g_zone.pfnCreate || !g_zone.pfnSetRects || !g_zone.pfnSubmit || !g_zone.pfnDestroy) {

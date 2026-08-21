@@ -18,7 +18,11 @@
  *
  * AUTHORED-MASK PATH: `use_rect_mask` goes false; `mask_tex` (a separate scalar
  * R8 channel, NOT the 2D layer's alpha — see §4.0 of the spec) supplies M in
- * [0,1], and the blend follows `composite_mode`:
+ * [0,1]. THE MASK MAPS STRETCH-TO-REGION: the whole mask texture spans the whole
+ * composite region, whatever its own dimensions — an app authors a mask at a size
+ * of its choosing and the runtime never crops it, which is also the mapping the
+ * display processor applies to the published mask. The blend follows
+ * `composite_mode`:
  *     0 (LERP)       final = M·weave + (1-M)·twod         (explicit authored
  *                    mask — designer cutout/portal; both rgb and a)
  *     1 (ALPHA_OVER) final = twod + (1-twod.a)·weave      (#491 implicit
@@ -50,7 +54,15 @@ cbuffer CompositeParams : register(b0)
     float2 canvas_size;    // canvas sub-rect size (px)
     uint   use_rect_mask;  // 1 = Phase 0 analytic rect mask; 0 = sample mask_tex
     uint   composite_mode; // 0 = hard M-lerp, 1 = #491 premul over, 2 = zones (ADR-027)
-    uint   opaque_present; // #833/#116: 1 = flatten (DWM completes no blends)
+    uint   opaque_present;
+    uint   _pad0;
+    // #918 Phase 2a: region / texture extent, for the two inputs addressed BY
+    // PIXEL — the panel-sized Local2D bridge plane and the grow-only weave
+    // scratch. 1.0 for an exactly region-sized input (every input on the
+    // non-split path). There is deliberately NO mask scale: an authored mask
+    // maps STRETCH-TO-REGION, so it is always sampled at plain uv.
+    float2 twod_uv_scale;
+    float2 weave_uv_scale;
 };
 
 struct VS_OUTPUT
@@ -90,7 +102,7 @@ float region_mask(float2 px, float2 uv)
             px.y >= canvas_origin.y && px.y < canvas_origin.y + canvas_size.y;
         return inside ? 1.0 : 0.0;
     }
-    // Phase 1+: separate scalar mask, sampled 1:1.
+    // Phase 1+: separate scalar mask, STRETCHED over the whole region.
     return saturate(mask_tex.Sample(samp, uv).r);
 }
 
@@ -107,12 +119,12 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     {
         if (M >= 0.5)
             discard;                       // inside canvas: weave stays
-        return twod_tex.Sample(samp, input.uv);
+        return twod_tex.Sample(samp, input.uv * twod_uv_scale);
     }
 
     // Phase 1+ general path, by composite_mode (see the header comment).
-    float4 twod  = twod_tex.Sample(samp, input.uv);
-    float4 weave = weave_tex.Sample(samp, input.uv);
+    float4 twod  = twod_tex.Sample(samp, input.uv * twod_uv_scale);
+    float4 weave = weave_tex.Sample(samp, input.uv * weave_uv_scale);
     if (opaque_present == 1)
     {
         // #833/#116 flatten (see the header comment).
