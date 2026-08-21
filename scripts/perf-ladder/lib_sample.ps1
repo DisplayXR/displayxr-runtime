@@ -15,15 +15,21 @@ function Get-GpuSnapshot {
     # One counter sweep -> array of {pid; luid; engtype; raw100ns} + timestamp.
     # RawValue is the monotonic 100 ns busy accumulator; CookedValue for this
     # counter type is NOT (measured: idle desktop summed to 5000+ "percent").
+    # PDH quirks, all measured: with hundreds of churned pid_* instances a
+    # sweep routinely contains ONE invalid sample, and -ErrorAction Stop then
+    # throws away the whole sweep ("data ... is not valid"). Accept partial
+    # sweeps and keep only Status-0 samples; retry only a truly empty sweep.
     $c = $null
-    foreach ($try in 1..2) {
-        try { $c = Get-Counter '\GPU Engine(*)\Running Time' -ErrorAction Stop; break }
-        catch { Start-Sleep -Milliseconds 500 }
+    foreach ($try in 1..3) {
+        $c = Get-Counter '\GPU Engine(*)\Running Time' -ErrorAction SilentlyContinue
+        if ($c -ne $null -and $c.CounterSamples.Count -gt 0) { break }
+        $c = $null
+        Start-Sleep -Seconds 1
     }
     if ($c -eq $null) { return @{ ok = $false; time = (Get-Date); rows = @() } }
     $t = Get-Date   # stamp after the sweep (a wildcard sweep takes ~2 s)
     $rows = @()
-    foreach ($s in $c.CounterSamples) {
+    foreach ($s in ($c.CounterSamples | Where-Object { $_.Status -eq 0 })) {
         # InstanceName e.g. pid_1234_luid_0x00000000_0x0000C0DE_phys_0_eng_0_engtype_3D
         # Key on the FULL name: a (pid, luid) has several engines of the same
         # engtype (eng_0..eng_N) and collapsing them cross-diffs the wrong
@@ -77,7 +83,8 @@ function Resolve-GpuColumns {
     # appPids: pids of the app under test. scanoutLuid: '' = single-adapter box.
     param($deltaRows, [int[]]$appPids, [string]$scanoutLuid)
     $dwmPids = @(Get-Process -Name dwm -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-    $col = @{ app_scanout = 0.0; app_other = 0.0; dwm = 0.0; other = 0.0; total = 0.0 }
+    $col = @{ app_scanout = 0.0; app_other = 0.0; dwm = 0.0; other = 0.0; total = 0.0; top_other = '' }
+    $otherByPid = @{}
     foreach ($r in $deltaRows) {
         $col.total = $col.total + $r.BusyPct
         if ($appPids -contains $r.ProcId) {
@@ -87,9 +94,19 @@ function Resolve-GpuColumns {
             $col.dwm = $col.dwm + $r.BusyPct
         } else {
             $col.other = $col.other + $r.BusyPct
+            if (-not $otherByPid.ContainsKey($r.ProcId)) { $otherByPid[$r.ProcId] = 0.0 }
+            $otherByPid[$r.ProcId] = $otherByPid[$r.ProcId] + $r.BusyPct
         }
     }
-    foreach ($k in @($col.Keys)) { $col[$k] = [math]::Round($col[$k], 2) }
+    # Name the noise: top 'other' consumer, so a polluted arm says WHO polluted
+    # it (this box idled at 34% 'other' with no attribution - never again).
+    $topPid = $otherByPid.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+    if ($topPid -ne $null -and $topPid.Value -gt 1.0) {
+        $p = Get-Process -Id $topPid.Key -ErrorAction SilentlyContinue
+        $pname = if ($p -ne $null) { $p.ProcessName } else { 'pid' + $topPid.Key }
+        $col.top_other = ('{0}:{1}' -f $pname, [math]::Round($topPid.Value, 1))
+    }
+    foreach ($k in @($col.Keys)) { if ($k -ne 'top_other') { $col[$k] = [math]::Round($col[$k], 2) } }
     return $col
 }
 
@@ -157,6 +174,22 @@ public class LadderWin32 {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    static IntPtr found;
+    static uint wantPid;
+    static bool OnWindow(IntPtr h, IntPtr l) {
+        uint pid; GetWindowThreadProcessId(h, out pid);
+        if (pid == wantPid && IsWindowVisible(h)) { found = h; return false; }
+        return true;
+    }
+    public static IntPtr FirstVisibleWindowOfPid(int pid) {
+        found = IntPtr.Zero; wantPid = (uint)pid;
+        EnumWindows(OnWindow, IntPtr.Zero);
+        return found;
+    }
 }
 '@
     $script:Win32Loaded = $true
@@ -164,12 +197,17 @@ public class LadderWin32 {
 
 function Get-MainWindow {
     param([int]$procId, [int]$timeoutSec)
+    Ensure-Win32
     $end = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $end) {
         $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
         if ($p -eq $null) { return [IntPtr]::Zero }
         $p.Refresh()
         if ($p.MainWindowHandle -ne [IntPtr]::Zero) { return $p.MainWindowHandle }
+        # MainWindowHandle misses the borderless WS_POPUP some launches
+        # (measured NO_HWND on single-instance arms) - enumerate directly.
+        $h = [LadderWin32]::FirstVisibleWindowOfPid($procId)
+        if ($h -ne [IntPtr]::Zero) { return $h }
         Start-Sleep -Milliseconds 500
     }
     return [IntPtr]::Zero

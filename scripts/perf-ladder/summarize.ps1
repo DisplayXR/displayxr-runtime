@@ -9,7 +9,14 @@ $ErrorActionPreference = 'Continue'
 
 $csvPath = Join-Path $ResultsDir 'ladder.csv'
 if (-not (Test-Path $csvPath)) { Write-Host 'no ladder.csv'; exit 1 }
-$rows = Import-Csv $csvPath
+$allRows = Import-Csv $csvPath
+# Medians use CLEAN samples only: a zero-GPU row from a failed sweep folds a
+# 3-rep median to zero (measured). App arms additionally require a nonzero
+# GPU total.
+$rows = @($allRows | Where-Object {
+    ($_.flags -notmatch 'GPU_COUNTER_FAIL|GPU_DELTA_FAIL|APP_NO_START') -and
+    (([double]$_.total_gpu) -gt 0 -or $_.arm -like 'IDLE*')
+})
 $capsPath = Join-Path $ResultsDir 'capabilities.json'
 $caps = $null
 if (Test-Path $capsPath) { $caps = Get-Content $capsPath -Raw | ConvertFrom-Json }
@@ -67,18 +74,21 @@ $l3 = M 'LIVE-3D'; $s3 = M 'SHAPED-3D'; $s3m = M 'SHAPED-3D-M'
 $r30 = M 'REND-30'; $r60 = M 'REND-60'; $rp = M 'REPAINT'; $s322 = M 'SHAPED-3D-22'
 $ship = M 'SHIP'; $shipm = M 'SHIP-M'; $idle = M 'IDLE-P'; $idlem = M 'IDLE-M'
 
+# Component deltas difference app+dwm, NOT total: background box load lands
+# in the 'other' column and cross-arm total differences swing by +/-20 points
+# on a busy box (measured). our_margin keeps total (it is 'what the box pays').
 if ($f2 -ne $null -and $f3 -ne $null -and $f3.weaves -gt 0) {
     # points -> ms/cycle: 1% busy = 10 ms/s; per weave = 10*delta/rate
-    $unit1 = [math]::Round(10.0 * ($f3.total - $f2.total) / $f3.weaves, 3)
-    $d += ('- weave_unit_ms (FLIP-3D vs FLIP-2D @ {0}/s): **{1} ms**' -f $f3.weaves, $unit1)
+    $unit1 = [math]::Round(10.0 * ($f3.app_dwm - $f2.app_dwm) / $f3.weaves, 3)
+    $d += ('- weave_unit_ms (FLIP-3D vs FLIP-2D @ {0}/s, app+dwm): **{1} ms**' -f $f3.weaves, $unit1)
     if ($f322 -ne $null -and ($f3.weaves - $f322.weaves) -gt 5) {
-        $unit2 = [math]::Round(10.0 * ($f3.total - $f322.total) / ($f3.weaves - $f322.weaves), 3)
-        $d += ('- weave_unit_ms (rate cut {0} to {1}): **{2} ms** (cross-check)' -f $f3.weaves, $f322.weaves, $unit2)
+        $unit2 = [math]::Round(10.0 * ($f3.app_dwm - $f322.app_dwm) / ($f3.weaves - $f322.weaves), 3)
+        $d += ('- weave_unit_ms (rate cut {0} to {1}, app+dwm): **{2} ms** (cross-check)' -f $f3.weaves, $f322.weaves, $unit2)
     }
 }
 if ($l3 -ne $null -and $f3 -ne $null) { $d += ('- dwm_live_tax (LIVE-3D dwm - FLIP-3D dwm): **{0}**' -f [math]::Round($l3.dwm - $f3.dwm, 2)) }
-if ($s3 -ne $null -and $l3 -ne $null) { $d += ('- shaping_tax (SHAPED-3D - LIVE-3D, total): **{0}**' -f [math]::Round($s3.total - $l3.total, 2)) }
-if ($s3m -ne $null -and $s3 -ne $null) { $d += ('- motion_tax_shaped (SHAPED-3D-M - SHAPED-3D, total): **{0}**' -f [math]::Round($s3m.total - $s3.total, 2)) }
+if ($s3 -ne $null -and $l3 -ne $null) { $d += ('- shaping_tax (SHAPED-3D - LIVE-3D, app+dwm): **{0}**' -f [math]::Round($s3.app_dwm - $l3.app_dwm, 2)) }
+if ($s3m -ne $null -and $s3 -ne $null) { $d += ('- motion_tax_shaped (SHAPED-3D-M - SHAPED-3D, app+dwm): **{0}**' -f [math]::Round($s3m.app_dwm - $s3.app_dwm, 2)) }
 if ($r30 -ne $null -and $s3 -ne $null) { $d += ('- render_cost_30hz (REND-30 - SHAPED-3D, app): **{0}**' -f [math]::Round((AppTotal $r30) - (AppTotal $s3), 2)) }
 if ($r60 -ne $null -and $r30 -ne $null) { $d += ('- render_slope_30to60 (app): **{0}**' -f [math]::Round((AppTotal $r60) - (AppTotal $r30), 2)) }
 if ($rp -ne $null -and $s322 -ne $null) {
@@ -86,11 +96,11 @@ if ($rp -ne $null -and $s322 -ne $null) {
     # honest parent is the 22 Hz-present arm, same app cadence.
     $tier = 'unknown'
     if ($rp.repaints -gt 5) { $tier = 'active (see #868 tier lines in dxr-logs)' } else { $tier = 'NO REPAINTS COUNTED - arm invalid' }
-    $d += ('- repaint_tax (REPAINT - SHAPED-3D-22, total): **{0}** at {1} repaints/s [{2}]' -f [math]::Round($rp.total - $s322.total, 2), $rp.repaints, $tier)
+    $d += ('- repaint_tax (REPAINT - SHAPED-3D-22, app+dwm): **{0}** at {1} repaints/s [{2}]' -f [math]::Round($rp.app_dwm - $s322.app_dwm, 2), $rp.repaints, $tier)
 }
-if ($s322 -ne $null -and $s3 -ne $null) { $d += ('- present_cap_saving (SHAPED-3D-22 - SHAPED-3D, total): **{0}**' -f [math]::Round($s322.total - $s3.total, 2)) }
-if ($ship -ne $null -and $idle -ne $null) { $d += ('- our_margin (SHIP total - IDLE-P total): **{0}**' -f [math]::Round($ship.total - $idle.total, 2)) }
-if ($shipm -ne $null -and $ship -ne $null) { $d += ('- ship_motion_tax (SHIP-M - SHIP, total): **{0}** (the demo-honest delta)' -f [math]::Round($shipm.total - $ship.total, 2)) }
+if ($s322 -ne $null -and $s3 -ne $null) { $d += ('- present_cap_saving (SHAPED-3D-22 - SHAPED-3D, app+dwm): **{0}**' -f [math]::Round($s322.app_dwm - $s3.app_dwm, 2)) }
+if ($ship -ne $null -and $idle -ne $null) { $d += ('- our_margin (SHIP total - IDLE-P total): **{0}**  (app+dwm: {1})' -f [math]::Round($ship.total - $idle.total, 2), [math]::Round($ship.app_dwm - $idle.app_dwm, 2)) }
+if ($shipm -ne $null -and $ship -ne $null) { $d += ('- ship_motion_tax (SHIP-M - SHIP, app+dwm): **{0}** (the demo-honest delta)' -f [math]::Round($shipm.app_dwm - $ship.app_dwm, 2)) }
 if ($idlem -ne $null -and $idle -ne $null) { $d += ('- idle_motion_floor (IDLE-M - IDLE-P, total): **{0}** (not ours)' -f [math]::Round($idlem.total - $idle.total, 2)) }
 if ($d.Count -eq 0) { $d += '- (not enough arms present for derivations)' }
 $out += $d
@@ -104,9 +114,11 @@ if ($caps -ne $null) {
     if ($caps.power.onAc) { $g += '- PASS: on AC power' } else { $g += '- FLAG: ON BATTERY - all numbers suspect' }
     if ($caps.elevated) { $g += '- FLAG: harness ran elevated (loader may resolve a different runtime)' } else { $g += '- PASS: non-elevated' }
 }
+$dropped = $allRows.Count - $rows.Count
+if ($dropped -gt 0) { $g += ('- FLAG: ' + $dropped + ' sample(s) DROPPED from medians (failed GPU sweep / zero row)') }
 $flagged = @($rows | Where-Object { $_.flags -ne '' })
-if ($flagged.Count -eq 0) { $g += '- PASS: no per-sample flags' }
-else { $g += ('- FLAG: ' + $flagged.Count + ' sample(s) carry flags (see table + ladder.csv)') }
+if ($flagged.Count -eq 0 -and $dropped -eq 0) { $g += '- PASS: no per-sample flags' }
+elseif ($flagged.Count -gt 0) { $g += ('- FLAG: ' + $flagged.Count + ' kept sample(s) carry flags (see table + ladder.csv)') }
 $modeBad = @($rows | Where-Object { $_.mode -ne '' -and $_.arm -match '2D' -and $_.mode -ne '2d' })
 if ($modeBad.Count -gt 0) { $g += '- FLAG: a 2D arm measured in non-2d mode' }
 $out += $g
