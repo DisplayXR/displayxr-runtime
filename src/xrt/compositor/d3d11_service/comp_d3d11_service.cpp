@@ -4822,8 +4822,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			// waitable chain, which is what actually paces the render thread.
 			sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
-			hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc, nullptr,
-			                                               nullptr, res->swap_chain.put());
+			hr = svc_out_factory(sys)->CreateSwapChainForHwnd(svc_out_device(sys), res->hwnd, &sc_desc,
+			                                                  nullptr, nullptr, res->swap_chain.put());
 			if (FAILED(hr)) {
 				// Some cross-process / legacy HWNDs refuse the waitable flag.
 				// Retry unpaced; the render thread then falls back to
@@ -4834,8 +4834,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				    res->hwnd, hr);
 				res->swap_chain.reset();
 				sc_desc.Flags = 0;
-				hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), res->hwnd, &sc_desc,
-				                                               nullptr, nullptr, res->swap_chain.put());
+				hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+				    svc_out_device(sys), res->hwnd, &sc_desc, nullptr, nullptr, res->swap_chain.put());
 			}
 			if (FAILED(hr)) {
 				// Cross-process CreateSwapChainForHwnd is not categorically
@@ -4871,7 +4871,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				}
 				wil::com_ptr<ID3D11Texture2D> bb;
 				res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-				sys->device->CreateRenderTargetView(bb.get(), nullptr, res->back_buffer_rtv.put());
+				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
+				                                            res->back_buffer_rtv.put());
+				svc_assert_same_device(res->back_buffer_rtv.get(), svc_out_device(sys));
 				if (res->frame_latency_waitable != nullptr) {
 					U_LOG_W(
 					    "[pipeline] presenter=APP_HWND hwnd=%p %ux%u (waitable, max "
@@ -8054,8 +8056,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 	}
 
-	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+	HRESULT hr = svc_out_factory(sys)->CreateSwapChainForHwnd(
+	    svc_out_device(sys), mc->hwnd, &sc_desc, nullptr, nullptr,
 	    mc->swap_chain.put());
 	if (FAILED(hr)) {
 		service_note_device_lost(sys, hr, "multi_compositor_ensure_output/swapchain"); // #1002
@@ -8084,7 +8086,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	{
 		wil::com_ptr<ID3D11Texture2D> bb;
 		mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-		sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+		svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 	}
 
 	// Combined atlas texture (native display size to hold fullscreen app content)
