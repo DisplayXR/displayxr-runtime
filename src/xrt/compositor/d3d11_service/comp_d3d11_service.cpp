@@ -1407,10 +1407,10 @@ struct d3d11_service_system
 	 * The in-process compositor's `out_dev` / `out_ctx` / `split_active` are the
 	 * same idea one layer down (`comp_d3d11_compositor.cpp`).
 	 */
-	ID3D11Device *out_dev;
-	ID3D11DeviceContext *out_ctx;
-	IDXGIFactory4 *out_factory;
-	bool split_active;
+	ID3D11Device *out_dev{nullptr};
+	ID3D11DeviceContext *out_ctx{nullptr};
+	IDXGIFactory4 *out_factory{nullptr};
+	bool split_active{false};
 };
 
 /*!
