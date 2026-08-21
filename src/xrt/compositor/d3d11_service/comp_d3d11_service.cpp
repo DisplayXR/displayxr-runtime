@@ -1625,7 +1625,10 @@ dxr_test_split_fail_stage_a()
  * @param app_luid Its LUID — what the scanout adapter is compared against.
  */
 static void
-service_split_stage_a(struct d3d11_service_system *sys, struct xrt_device *xdev, IDXGIAdapter *app_adapter, LUID app_luid)
+service_split_stage_a(struct d3d11_service_system *sys,
+                      struct xrt_device *xdev,
+                      IDXGIAdapter *app_adapter,
+                      LUID app_luid)
 {
 	/*
 	 * The canonical weave-placement line is emitted UNCONDITIONALLY at the end
@@ -1694,11 +1697,12 @@ service_split_stage_a(struct d3d11_service_system *sys, struct xrt_device *xdev,
 			UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 			D3D_FEATURE_LEVEL got = {};
 			static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-			HRESULT hr = D3D11CreateDevice(scanout.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
-			                               ARRAYSIZE(levels), D3D11_SDK_VERSION, &sys->out_dev, &got,
-			                               &sys->out_ctx);
+			HRESULT hr =
+			    D3D11CreateDevice(scanout.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
+			                      ARRAYSIZE(levels), D3D11_SDK_VERSION, &sys->out_dev, &got, &sys->out_ctx);
 			if (FAILED(hr) || sys->out_dev == nullptr || sys->out_ctx == nullptr) {
-				U_LOG_W("#918 output-device split: D3D11CreateDevice failed 0x%08lx", (unsigned long)hr);
+				U_LOG_W("#918 output-device split: D3D11CreateDevice failed 0x%08lx",
+				        (unsigned long)hr);
 				reason = "D3D11CreateDevice failed";
 			}
 		}
@@ -1723,7 +1727,8 @@ service_split_stage_a(struct d3d11_service_system *sys, struct xrt_device *xdev,
 			}
 		}
 		if (reason == nullptr) {
-			HRESULT hr = scanout->GetParent(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&sys->out_factory));
+			HRESULT hr =
+			    scanout->GetParent(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&sys->out_factory));
 			if (FAILED(hr) || sys->out_factory == nullptr) {
 				U_LOG_W("#918 output-device split: scanout DXGI factory failed 0x%08lx",
 				        (unsigned long)hr);
@@ -1854,9 +1859,8 @@ service_split_stage_a(struct d3d11_service_system *sys, struct xrt_device *xdev,
 		DXGI_ADAPTER_DESC pdesc = {};
 		bool scanout_ok = false;
 		{
-			wil::com_ptr<IDXGIAdapter> panel =
-			    xrt::auxiliary::d3d::getScanoutAdapter(panel_left, panel_top, panel_w, panel_h,
-			                                           U_LOGGING_INFO);
+			wil::com_ptr<IDXGIAdapter> panel = xrt::auxiliary::d3d::getScanoutAdapter(
+			    panel_left, panel_top, panel_w, panel_h, U_LOGGING_INFO);
 			scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
 		}
 
@@ -3277,9 +3281,10 @@ service_note_device_lost(struct d3d11_service_system *sys, HRESULT hr, const cha
 		}
 		sys->device_removed_reason.store((int32_t)reason, std::memory_order_release);
 		sys->device_removed_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
-		U_LOG_E("[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX device=%s site=%s — the display processor will "
-		        "not be touched again; the service will exit for relaunch",
-		        (unsigned long)hr, (unsigned long)reason, which, site != nullptr ? site : "?");
+		U_LOG_E(
+		    "[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX device=%s site=%s — the display processor will "
+		    "not be touched again; the service will exit for relaunch",
+		    (unsigned long)hr, (unsigned long)reason, which, site != nullptr ? site : "?");
 	}
 	return true;
 }
@@ -5396,8 +5401,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 					wil::com_ptr<IDXGISwapChain2> sc2;
 					if (SUCCEEDED(res->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
 						// Per CHAIN, never the device (DXR_APP_HWND_LATENCY).
-						sc2->SetMaximumFrameLatency(
-						    dxr_app_hwnd_latency(sys->split_active));
+						sc2->SetMaximumFrameLatency(dxr_app_hwnd_latency(sys->split_active));
 						res->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 					}
 				}
@@ -8611,10 +8615,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
 				// #918: the service window is a SERVICE_WINDOW presenter, so the
 				// panel DP goes on the output device while the split is engaged.
-				xrt_result_t dp_ret =
-				    factory(svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW),
-				            svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW), mc->hwnd,
-				            &mc->display_processor);
+				xrt_result_t dp_ret = factory(svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW),
+				                              svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW),
+				                              mc->hwnd, &mc->display_processor);
 				if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 					U_LOG_W("Multi-comp: display processor recreated on live window");
 					mc->panel_dp_hwnd = mc->hwnd; // #964 D-4
@@ -9904,9 +9907,9 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 				// #918: the depth this chain was CREATED at, derived from its
 				// own device rather than the live split state — the workspace
 				// suspend can have moved the latter since.
-				sc2->SetMaximumFrameLatency(dxr_app_hwnd_latency(
-				    c->sys != nullptr && c->sys->out_dev != nullptr &&
-				    c->render.chain_device == c->sys->out_dev));
+				sc2->SetMaximumFrameLatency(
+				    dxr_app_hwnd_latency(c->sys != nullptr && c->sys->out_dev != nullptr &&
+				                         c->render.chain_device == c->sys->out_dev));
 			}
 			c->probe_miss_since_ns = 0;
 		}
@@ -10649,8 +10652,7 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	comp_d3d11_xbridge_set_content_size(sys->xbridge, content_w, content_h, sys->split_layout_gen);
 
 	sys->split_seq++;
-	comp_d3d11_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w,
-	                          content_h);
+	comp_d3d11_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
 
 	// Opportunistic: the newest slot whose consumer copy has already completed,
 	// CPU-verified, so this thread never waits. Falling back to the in-flight
@@ -11759,7 +11761,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// window) and does nothing at all with no vendor plug-in, so the
 			// latch is deadline-bounded rather than "until it binds".
 			pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false, /*force_recreate*/ false,
-		                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
+			                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
 			const bool bound = mc->display_processor != nullptr && mc->panel_dp_hwnd == mc->hwnd;
 			if (bound || (int64_t)os_monotonic_get_ns() >= mc->foreground_override_restore_deadline_ns) {
 				mc->foreground_override_restore = false;
@@ -24361,7 +24363,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 
 			if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 				U_LOG_W("Workspace resume: display processor recreated");
-				mc->panel_dp_hwnd = mc->hwnd;   // #918: keep the bind key truthful
+				mc->panel_dp_hwnd = mc->hwnd; // #918: keep the bind key truthful
 				mc->panel_dp_device = resume_dev;
 				if (mc->window != nullptr) {
 					comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
