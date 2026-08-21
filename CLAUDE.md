@@ -415,6 +415,7 @@ See `docs/README.md` for the full index. By task:
 | How Unity / engine D3D12 apps reach the runtime (hooked window-binding injection + overlay) | `docs/architecture/unity-d3d12-app-path.md` |
 | How Unreal D3D12 apps reach the runtime (first-class HMD plugin, direct runtime load + zero-copy atlas handoff, adaptive N-view) | `docs/architecture/unreal-d3d12-app-path.md` |
 | Eye-tracking MANAGED/MANUAL contract | `docs/specs/vendor/eye-tracking-modes.md` |
+| Bring up a 3D-display Android device as an OEM/ODM (what the platform must provide or not break: capture exclude-uid, input passthrough, 1:1 freeform pixels, vendor-service contract, ADPF) | `docs/specs/vendor/oem-android-platform-requirements.md` |
 | Why tracked hands follow WASD/mouse-look but NOT head parallax (rig rule — diverges from HMD VR) | `docs/adr/ADR-034-input-provider-plugins.md` § *Amendment 2* → `docs/specs/runtime/input-provider-discovery.md` §4a |
 | Tune or reason about motion-to-photon latency (late weave, repaint, VK queue tiers, deferred present, late latching) — and what the defaults are per GPU topology | `docs/reference/motion-to-photon-levers.md` |
 | GPU adapter selection on hybrid iGPU/dGPU machines (`DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU`, in-process `getenv` caveat) | `docs/reference/adapter-selection.md` |

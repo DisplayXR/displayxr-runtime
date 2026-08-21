@@ -79,6 +79,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoDXR` frozen at v13 (all future per-mode fields chain)
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
 - **[Eye Tracking Modes](specs/vendor/eye-tracking-modes.md)** — MANAGED vs MANUAL contract
+- **[OEM Android platform requirements](specs/vendor/oem-android-platform-requirements.md)** — what an OEM/ODM must provide (or must not break) to bring up an Android 3D display: tiered REQUIRED / RECOMMENDED / NICE-TO-HAVE asks with mechanism, consequence, fallback and acceptance test
 - **[ADR-003: Vendor Abstraction](adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md)** — why vendor code is isolated
 - **[ADR-007: Compositor Never Weaves](adr/ADR-007-compositor-never-weaves.md)** — compositor / DP boundary
 - **[ADR-015: Multi-Display Routing](adr/ADR-015-displayxr-owns-multi-display-vendor-routing.md)** — how multiple vendors coexist

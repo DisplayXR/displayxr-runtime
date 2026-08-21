@@ -485,6 +485,19 @@ a hard abort in someone else's code.
 
 Tracked runtime-side in **#1038**; anchors in report §11.
 
+> **Amendment (2026-08-20) — the asks are now an OEM-facing specification.**
+> The L-series grew past this table (L10/L12 background capture, L11 the
+> interlacer wait-semaphore, L13 the input-passthrough exemption), and it split
+> along a line this table does not express: some asks are **vendor-SDK** changes
+> that are already written and merged upstream, while others can only be answered
+> by the **OEM/ODM's platform** — SurfaceFlinger, the window manager, the signing
+> story, the PowerHAL. The full, tiered version — every ask with its exact
+> mechanism, the user-visible consequence of its absence, the degraded fallback
+> DisplayXR ships without it, and an acceptance test — is
+> [`docs/specs/vendor/oem-android-platform-requirements.md`](../specs/vendor/oem-android-platform-requirements.md).
+> That document is what we hand an OEM bringing up a 3D-display Android device;
+> the table below is kept as the ADR's own record of what D2/D5/D7 depend on.
+
 | # | Ask | Needed for |
 |---|---|---|
 | **L1** | Head-tracking **config** (orientation, tracked eyes, IPD, face count, fps, log level) is service-global, last-writer-wins — per-client scoping or aggregation, the way start/fps already aggregate. Runtime-side mitigation: never write config. | A and C (N cores) |
