@@ -60,6 +60,13 @@ target_link_libraries(
 		dcomp       # DirectComposition for transparent HWND-bound presentation
 	)
 
+# #918 Phase 2b: the cross-adapter atlas transport. PR 1/6 extracted it into its
+# own static lib precisely so the service can link it without dragging the whole
+# in-process compositor (renderer, swapchains, window, target) in. Unconditional:
+# this target already hard-requires D3D11 (${D3D11_LIBRARY}, <d3d11_4.h>), so the
+# guard that builds the bridge is satisfied wherever this library builds at all.
+target_link_libraries(comp_d3d11_service PRIVATE comp_d3d11_xbridge)
+
 target_include_directories(comp_d3d11_service PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/..
 	${CMAKE_CURRENT_SOURCE_DIR}/../d3d11

@@ -39,6 +39,11 @@
 
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "d3d/d3d_dxgi_formats.h"
+#include "d3d/d3d_scanout_helpers.hpp"
+
+// #918 Phase 2b: the cross-adapter atlas transport, shared with the in-process
+// compositor (PR 1/6 made it a standalone static lib for exactly this).
+#include "comp_d3d11_xbridge.h"
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
@@ -317,6 +322,24 @@ struct d3d11_client_render_resources
 
 	//! DXGI swap chain for display output
 	wil::com_ptr<IDXGISwapChain1> swap_chain;
+
+	/*!
+	 * #918 PR 3: the device @ref swap_chain (and @ref back_buffer_rtv) were
+	 * created on. NULL when there is no chain.
+	 *
+	 * Needed because the split can SUSPEND and RESUME under a long-lived client:
+	 * a workspace attach moves the output half back to the app device, and a
+	 * client that connects while the shell is up therefore gets an app-device
+	 * chain that is wrong again the moment the shell detaches. A swap chain's
+	 * device cannot be changed — `ResizeBuffers` will not do it — so the chain
+	 * has to be recreated, and only the CLIENT'S OWN IPC THREAD may do that (the
+	 * DXGI/WM deadlock rule: `CreateSwapChainForHwnd` on a foreign HWND can
+	 * dispatch into that window's thread, and the render thread holds
+	 * `render_mutex`). The render thread therefore only DETECTS the mismatch and
+	 * skips the presenter; the rebuild rides the resize pass in
+	 * `compositor_layer_commit`.
+	 */
+	ID3D11Device *chain_device;
 
 	//! #964: frame-latency waitable of an APP_HWND presenter's swap chain
 	//! (created with FRAME_LATENCY_WAITABLE_OBJECT + per-CHAIN max latency 1).
@@ -1396,13 +1419,16 @@ struct d3d11_service_system
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
 
 	/*!
-	 * #918 OUTPUT-DEVICE SPLIT. NULL/false in this build — nothing sets
-	 * @ref split_active yet, so every accessor below resolves to the app trio
-	 * (`device` / `context` / `dxgi_factory`) and the service behaves exactly as
-	 * it did. When the split is turned on these — not the app trio — own the
-	 * presenter swap chains, their RTVs, the display processor's weave and the
-	 * read-back of the woven back buffer, while the renderer, the atlases and
-	 * every client import stay on the app device.
+	 * #918 OUTPUT-DEVICE SPLIT. Stood up by Stage A in
+	 * `comp_d3d11_service_create_system` when `DXR_WEAVE_ON_SCANOUT=1` resolves
+	 * a scanout adapter that is not the app's; NULL/false otherwise, and then
+	 * every accessor below resolves to the app trio (`device` / `context` /
+	 * `dxgi_factory`) and the service behaves exactly as it did.
+	 *
+	 * When the split is on these — not the app trio — own the presenter swap
+	 * chains, their RTVs, the display processor's weave and the read-back of the
+	 * woven back buffer, while the renderer, the atlases and every client import
+	 * stay on the app device.
 	 *
 	 * The in-process compositor's `out_dev` / `out_ctx` / `split_active` are the
 	 * same idea one layer down (`comp_d3d11_compositor.cpp`).
@@ -1410,7 +1436,74 @@ struct d3d11_service_system
 	ID3D11Device *out_dev{nullptr};
 	ID3D11DeviceContext *out_ctx{nullptr};
 	IDXGIFactory4 *out_factory{nullptr};
+
+	/*!
+	 * #918 PR 3 — the EFFECTIVE split state, which is what every `svc_out_*`
+	 * accessor reads. Distinct from @ref split_available:
+	 *
+	 * - `split_available` is the STAGE-A verdict, latched for process lifetime.
+	 *   The out device, its factory and the bridge exist iff it is true.
+	 * - `split_active` is whether the output half is currently ON that device.
+	 *   The workspace-mode SUSPEND (PR 3's interim; PR 4 replaces it with the
+	 *   real compose-path split) drives it false while a controller is attached,
+	 *   having first moved the panel DP and the service-window chain back to the
+	 *   app device — so the accessors stay truthful about where the resources
+	 *   actually live, which is the whole point of routing ~150 sites through
+	 *   them in PR 2.
+	 *
+	 * Written ONLY by `service_split_sync_engagement`, on the render thread
+	 * under `render_mutex`, immediately after the resources have been rebuilt.
+	 */
 	bool split_active{false};
+	bool split_available{false};
+
+	//! #918: the scanout adapter's LUID, for the diagnostics line.
+	LUID out_luid{};
+	//! #918: the panel extent Stage A resolved (bridge plane sizing / logging).
+	uint32_t split_panel_w{0};
+	uint32_t split_panel_h{0};
+
+	/*!
+	 * #918: the cross-adapter atlas transport. Non-NULL exactly when
+	 * @ref split_available. Ingress is forced to Option II (a staged app-device
+	 * ring) at create: the service's source texture is whichever focused
+	 * client's crop it is weaving this tick, so its IDENTITY changes with focus,
+	 * and Option I would re-open an NT handle — draining the producer queue —
+	 * on every Alt-Tab.
+	 */
+	struct comp_d3d11_xbridge *xbridge{nullptr};
+
+	/*!
+	 * #918 R1 — the layout GENERATION stamped on every bridged slot, and the
+	 * signature it is derived from. "The atlas recipe IS the mode": under the
+	 * split the weave consumes a slot some EARLIER frame filled, so a slot whose
+	 * recipe the DP has since left must never be woven.
+	 *
+	 * The service's signature carries one term the in-process compositor's does
+	 * not — the FOCUSED SLOT. The in-process atlas belongs to one session for
+	 * life; the service's is whichever client won the presenter election, so a
+	 * focus change is exactly as much of a recipe change as a 3D->2D flip is.
+	 */
+	uint64_t split_layout_sig{0};
+	uint64_t split_layout_gen{0};
+	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
+	uint64_t split_seq{0};
+
+	/*! @name #918 PR 3 — split counters on the `[RENDER]` 10 s window.
+	 * @{ */
+	//! Workspace attaches that suspended the split (and detaches that resumed it).
+	std::atomic<uint32_t> render_diag_split_suspend{0};
+	//! Panel-DP rebinds that CROSSED devices (the eligibility boundary).
+	std::atomic<uint32_t> render_diag_pipe_dev_rebind{0};
+	//! Unfocused-APP_HWND flat repaints skipped because the split is on.
+	std::atomic<uint32_t> render_diag_flat_skip_split{0};
+	//! Zone-mask publishes skipped because the mask and the DP are on different
+	//! devices (an ineligible presenter under an active split). PR 5 removes it.
+	std::atomic<uint32_t> render_diag_maskpub_skip{0};
+	//! Frames the direct path could not weave because the bridge had no slot of
+	//! the current generation, or the egress ring was not content-sized.
+	std::atomic<uint32_t> render_diag_split_no_slot{0};
+	/*! @} */
 };
 
 /*!
@@ -1463,6 +1556,334 @@ svc_assert_same_device(ID3D11View *resource, ID3D11Device *expected_dev)
 	wil::com_ptr<ID3D11Device> owner;
 	resource->GetDevice(owner.put());
 	assert(owner.get() == expected_dev);
+}
+
+/*!
+ * #918: minimum dwell between two panel-DP rebinds that CROSS devices.
+ *
+ * A same-device presenter change is free (the #1008 `set_window` fast path). A
+ * device-crossing one is not: it retires the weaver and creates a new one, and
+ * an Alt-Tab ping-pong across the eligibility boundary — a browser (SELF, app
+ * device) against a handle cube (APP_HWND, out device) — would otherwise do that
+ * as fast as the user can press the keys. One second is far longer than any
+ * deliberate switch takes to settle and far shorter than a user notices.
+ */
+#define DXR_SPLIT_DEV_REBIND_DWELL_NS (1000LL * 1000000LL)
+
+//! #918: `DXR_WEAVE_ON_SCANOUT=1` asks for the output-device split. Default OFF
+//! for a release cycle (supervisor ruling); Phase 3 owns default-on.
+static bool
+dxr_weave_on_scanout_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WEAVE_ON_SCANOUT");
+		enabled =
+		    (e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
+	}
+	return enabled == 1;
+}
+
+//! #918: testability hook for the fallback matrix — forces Stage A to fail at
+//! the point the bridge would be created, so the "one WARN, stock path" degrade
+//! can be exercised without a machine that genuinely cannot allocate the heap.
+static bool
+dxr_test_split_fail_stage_a()
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_TEST_SPLIT_FAIL_STAGEA");
+		on = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+/*!
+ * #918 Phase 2b STAGE A — resolve the scanout adapter and, if it is not the
+ * app's, stand up the runtime-owned output device plus the cross-adapter atlas
+ * bridge.
+ *
+ * Everything here is best-effort: on ANY failure the exact reason is logged
+ * ONCE and the service falls through to the stock single-device path. The
+ * verdict is latched for process lifetime (`sys->split_available`) — the split
+ * is never toggled live, only SUSPENDED and RESUMED by the workspace rule,
+ * which moves resources rather than re-running this.
+ *
+ * Runs on the thread that creates the system compositor, before any client
+ * exists, so nothing here races anything.
+ *
+ * @param app_adapter The app device's adapter (borrowed).
+ * @param app_luid Its LUID — what the scanout adapter is compared against.
+ */
+static void
+service_split_stage_a(struct d3d11_service_system *sys, struct xrt_device *xdev, IDXGIAdapter *app_adapter, LUID app_luid)
+{
+	/*
+	 * The canonical weave-placement line is emitted UNCONDITIONALLY at the end
+	 * of this function, in every state — including the one where the env is not
+	 * set at all. Without it a hybrid box silently paying the cross-adapter
+	 * present produces a log byte-identical to a single-adapter box that pays
+	 * nothing; that is the same blind spot #1000 closed for adapter SELECTION,
+	 * now closed for weave PLACEMENT on the service path too.
+	 */
+	const uint32_t panel_w = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t panel_h = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].h_pixels : 0;
+
+	/*
+	 * The panel's screen ORIGIN. At this point in create_system
+	 * `sys->base.info.display_screen_left/top` are still the pre-DP zeros — the
+	 * real values arrive with the first display processor, which needs a window,
+	 * which needs a client. That is not the problem it looks like: the service's
+	 * display processor is created for COMP_DP_PRIMARY_MONITOR (see every
+	 * `comp_dp_factory_for_window` call in this file), and a 0,0 origin plus
+	 * `MONITOR_DEFAULTTONEAREST` resolves to exactly that monitor. If the
+	 * service ever drives a non-primary panel this has to move to the first
+	 * DP-backed frame; today it would be resolving a monitor the service never
+	 * presents to.
+	 */
+	const int32_t panel_left = sys->base.info.display_screen_left;
+	const int32_t panel_top = sys->base.info.display_screen_top;
+
+	if (dxr_weave_on_scanout_enabled()) {
+		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
+		double stage_a_bridge_ms = 0.0;
+		const char *reason = nullptr;
+
+		if (dxr_legacy_standalone_enabled()) {
+			// D-7: the legacy path is a byte-for-byte reproduction of the
+			// pre-#964 behaviour for the motion-to-photon A/B. Splitting it
+			// would defeat the only reason it still exists.
+			reason = "DXR_LEGACY_STANDALONE";
+		} else if (panel_w == 0 || panel_h == 0) {
+			reason = "no panel dimensions";
+		}
+
+		wil::com_ptr<IDXGIAdapter> scanout;
+		DXGI_ADAPTER_DESC sdesc{};
+		if (reason == nullptr) {
+			scanout = xrt::auxiliary::d3d::getScanoutAdapter(panel_left, panel_top, panel_w, panel_h,
+			                                                 U_LOGGING_INFO);
+			if (!scanout || FAILED(scanout->GetDesc(&sdesc))) {
+				reason = "scanout unresolvable";
+			} else if (sdesc.AdapterLuid.LowPart == app_luid.LowPart &&
+			           sdesc.AdapterLuid.HighPart == app_luid.HighPart) {
+				// Not a failure: on a MUX'd / single-GPU box — or under
+				// DXR_D3D_FORCE_GPU=scanout — the weave is already local, so
+				// the split has nothing to do. One INFO-shaped line, no
+				// fallback WARN.
+				U_LOG_W(
+				    "#918 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
+				    "service's adapter — split is a no-op",
+				    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+				    (unsigned long)sdesc.AdapterLuid.LowPart);
+				reason = ""; // handled; suppress the fallback WARN
+			}
+		}
+
+		// Runtime-owned D3D11 device on the scanout adapter.
+		if (reason == nullptr) {
+			UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+			D3D_FEATURE_LEVEL got = {};
+			static const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+			HRESULT hr = D3D11CreateDevice(scanout.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels,
+			                               ARRAYSIZE(levels), D3D11_SDK_VERSION, &sys->out_dev, &got,
+			                               &sys->out_ctx);
+			if (FAILED(hr) || sys->out_dev == nullptr || sys->out_ctx == nullptr) {
+				U_LOG_W("#918 output-device split: D3D11CreateDevice failed 0x%08lx", (unsigned long)hr);
+				reason = "D3D11CreateDevice failed";
+			}
+		}
+		if (reason == nullptr) {
+			/*
+			 * MANDATORY on the service, unlike the in-process compositor where
+			 * it is only prudence: an APP_HWND presenter's swap chain is
+			 * created on the CLIENT'S OWN IPC THREAD (the DXGI/WM deadlock
+			 * rule), so this device genuinely has N concurrent callers from the
+			 * first client onward — plus whatever threads the vendor DP runs.
+			 */
+			ID3D10Multithread *omt = nullptr;
+			if (SUCCEEDED(sys->out_dev->QueryInterface(__uuidof(ID3D10Multithread),
+			                                           reinterpret_cast<void **>(&omt))) &&
+			    omt != nullptr) {
+				omt->SetMultithreadProtected(TRUE);
+				omt->Release();
+			} else {
+				// Without it, 3+ simultaneous clients on one device is the
+				// #108 crash. Refuse the split rather than ship that.
+				reason = "ID3D10Multithread unavailable on the scanout device";
+			}
+		}
+		if (reason == nullptr) {
+			HRESULT hr = scanout->GetParent(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&sys->out_factory));
+			if (FAILED(hr) || sys->out_factory == nullptr) {
+				U_LOG_W("#918 output-device split: scanout DXGI factory failed 0x%08lx",
+				        (unsigned long)hr);
+				// Its own reason: the device came up fine; it is the adapter's
+				// IDXGIFactory4 parent that could not be reached, and the
+				// fallback WARN must not misname that.
+				reason = "scanout DXGI factory unavailable";
+			}
+		}
+
+		// The bridge: both D3D12 devices, both COPY queues, the cross-adapter
+		// heap + placed ring, every fence, and one probe egress round-trip.
+		if (reason == nullptr) {
+			uint32_t sys_w = 0, sys_h = 0;
+			if (xdev != nullptr && xdev->rendering_mode_count > 0) {
+				u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w,
+				                              &sys_h);
+			}
+			if (sys_w == 0 || sys_h == 0) {
+				sys_w = panel_w;
+				sys_h = panel_h;
+			}
+
+			struct comp_d3d11_xbridge_info xbi = {};
+			xbi.app_device = sys->device.get();
+			xbi.app_context = sys->context.get();
+			xbi.app_adapter = app_adapter;
+			xbi.out_device = sys->out_dev;
+			xbi.out_context = sys->out_ctx;
+			xbi.out_adapter = scanout.get();
+			xbi.max_width = sys_w;
+			xbi.max_height = sys_h;
+			// PR 3 bridges the ATLAS only. The service's Local2D / zones
+			// composite into the client atlas PRE-DP and it never calls
+			// set_background_2d, so no plane transport is needed at all — the
+			// panel extent is still handed over because the bridge sizes its
+			// (unused, lazily allocated) planes from it.
+			xbi.panel_width = panel_w;
+			xbi.panel_height = panel_h;
+
+			const char *xb_reason = nullptr;
+			const uint64_t xb_t0 = os_monotonic_get_ns();
+			if (dxr_test_split_fail_stage_a()) {
+				reason = "DXR_TEST_SPLIT_FAIL_STAGEA";
+			} else if (comp_d3d11_xbridge_create(&xbi, &sys->xbridge, &xb_reason) != XRT_SUCCESS) {
+				sys->xbridge = nullptr;
+				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
+			} else if (!comp_d3d11_xbridge_force_staged_ingress(sys->xbridge)) {
+				/*
+				 * Option II, chosen UP FRONT rather than reached as a
+				 * fallback. Option I binds ONE app-device atlas by NT handle;
+				 * the service's source is whichever focused client's crop it
+				 * is weaving this tick, so its identity changes with focus and
+				 * Option I would re-open a shared handle — draining the
+				 * producer queue — on every Alt-Tab. One extra same-adapter
+				 * copy per frame buys focus changes for free.
+				 */
+				reason = "staged ingress ring unavailable";
+			} else if (!comp_d3d11_xbridge_alloc_worstcase_egress(sys->xbridge)) {
+				/*
+				 * The egress ring is allocated HERE, not on the first frame:
+				 * the split must not be able to activate and THEN discover it
+				 * has nothing to weave into. Worst-case rather than the active
+				 * mode's box, because the service has no active client yet and
+				 * so no content dims to size it at; the first frame's
+				 * `set_content_size` refines it.
+				 */
+				reason = "egress share failed";
+			}
+			stage_a_bridge_ms = (double)(os_monotonic_get_ns() - xb_t0) / 1.0e6;
+		}
+
+		if (reason == nullptr) {
+			sys->split_available = true;
+			sys->split_active = true;
+			sys->out_luid = sdesc.AdapterLuid;
+			sys->split_panel_w = panel_w;
+			sys->split_panel_h = panel_h;
+			U_LOG_W(
+			    "#918 output-device split ACTIVE: weave/present move to '%ls' LUID=%08lx:%08lx "
+			    "(service device on LUID=%08lx:%08lx); the focused client's cropped atlas crosses via a "
+			    "D3D12 cross-adapter heap once per rendered frame",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart, (unsigned long)app_luid.HighPart,
+			    (unsigned long)app_luid.LowPart);
+		} else {
+			if (sys->xbridge != nullptr) {
+				comp_d3d11_xbridge_destroy(&sys->xbridge);
+			}
+			if (sys->out_factory != nullptr) {
+				sys->out_factory->Release();
+				sys->out_factory = nullptr;
+			}
+			if (sys->out_ctx != nullptr) {
+				sys->out_ctx->Release();
+				sys->out_ctx = nullptr;
+			}
+			if (sys->out_dev != nullptr) {
+				sys->out_dev->Release();
+				sys->out_dev = nullptr;
+			}
+			if (reason[0] != '\0') {
+				U_LOG_W(
+				    "#918 output-device split DISABLED (%s) — falling back to the stock single-device "
+				    "path",
+				    reason);
+			}
+		}
+		// Warmup budget: the session already shows a brief black window while
+		// the vendor weaver async-creates, and the investigation's constraint is
+		// that the split must not lengthen it. Both numbers are logged so a
+		// regression is visible rather than inferred.
+		U_LOG_W("#918 output-device split: stage A took %.1f ms (bridge %.1f ms, active=%d)",
+		        (double)(os_monotonic_get_ns() - stage_a_start_ns) / 1.0e6, stage_a_bridge_ms,
+		        (int)sys->split_active);
+	}
+
+	/*
+	 * ONE canonical weave-placement line per service process, ALWAYS emitted, in
+	 * addition to (never instead of) the Stage-A detail lines above. Wording is
+	 * deliberately identical to the in-process compositor's so one grep answers
+	 * the question on both paths.
+	 */
+	{
+		DXGI_ADAPTER_DESC rdesc = {};
+		const bool render_ok = app_adapter != nullptr && SUCCEEDED(app_adapter->GetDesc(&rdesc));
+
+		DXGI_ADAPTER_DESC pdesc = {};
+		bool scanout_ok = false;
+		{
+			wil::com_ptr<IDXGIAdapter> panel =
+			    xrt::auxiliary::d3d::getScanoutAdapter(panel_left, panel_top, panel_w, panel_h,
+			                                           U_LOGGING_INFO);
+			scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
+		}
+
+		const WCHAR *rname = render_ok ? rdesc.Description : L"<unknown>";
+		const unsigned long rhi = (unsigned long)rdesc.AdapterLuid.HighPart;
+		const unsigned long rlo = (unsigned long)rdesc.AdapterLuid.LowPart;
+
+		if (!scanout_ok) {
+			// Say so — never guess. Without the scanout adapter there is no way
+			// to know whether this session crosses adapters at all.
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout=UNRESOLVED — cannot tell "
+			    "whether the weave crosses adapters (#918)",
+			    rname, rhi, rlo);
+		} else if (render_ok && pdesc.AdapterLuid.LowPart == rdesc.AdapterLuid.LowPart &&
+		           pdesc.AdapterLuid.HighPart == rdesc.AdapterLuid.HighPart) {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
+			    "render and scanout share one adapter; weave is local (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		} else if (sys->split_available) {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
+			    "weave/present on the SCANOUT adapter (DXR_WEAVE_ON_SCANOUT split active) (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		} else {
+			U_LOG_W(
+			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
+			    "weave on the RENDER adapter; every present crosses adapters to reach scanout (set "
+			    "DXR_WEAVE_ON_SCANOUT=1 to move the weave) (#918)",
+			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
+			    (unsigned long)pdesc.AdapterLuid.LowPart);
+		}
+	}
 }
 
 /*!
@@ -2010,6 +2431,47 @@ enum d3d11_presenter_kind
 };
 
 /*!
+ * #918 PR 3 — PRESENTER-KIND ELIGIBILITY, the rule the whole split turns on.
+ *
+ * Eligible: the two presenters the RUNTIME owns the surface of. Their swap
+ * chains, their weave and their pacing move to the scanout adapter, which is
+ * what removes the cross-adapter present.
+ *
+ * Structurally ineligible, permanently (supervisor ruling D-b):
+ *  - `CLIENT_TEXTURE` (ADR-029) — the weave destination is a shared NT texture
+ *    the CLIENT opened on the app adapter and presents itself. Shared textures
+ *    do not cross adapters, and there would be no win if they did: the client
+ *    presents, so no present of ours crosses anything.
+ *  - `SELF` (present-owner / displayxr-browser) — same shape, one step further:
+ *    the client weaves synchronously through the panel DP on its own thread.
+ *
+ * So the panel DP's bind key is `(hwnd, device)`, not `hwnd` — see
+ * `pipeline_bind_panel_dp`.
+ */
+static inline bool
+svc_kind_eligible_for_split(enum d3d11_presenter_kind kind)
+{
+	return kind == PRESENTER_SERVICE_WINDOW || kind == PRESENTER_APP_HWND;
+}
+
+/*!
+ * #918: the device the panel display processor must be CREATED on to serve
+ * @p kind. The app device whenever the split is off (so every call site is
+ * written once), and whenever the presenter is ineligible.
+ */
+static inline ID3D11Device *
+svc_panel_dp_device(struct d3d11_service_system *sys, enum d3d11_presenter_kind kind)
+{
+	return (sys->split_active && svc_kind_eligible_for_split(kind)) ? sys->out_dev : sys->device.get();
+}
+
+static inline ID3D11DeviceContext *
+svc_panel_dp_context(struct d3d11_service_system *sys, enum d3d11_presenter_kind kind)
+{
+	return (sys->split_active && svc_kind_eligible_for_split(kind)) ? sys->out_ctx : sys->context.get();
+}
+
+/*!
  * Acked-flip + curtain state machine for workspace display-mode transitions
  * (issue #234). Replaces the historical "flip DP + sync_tile_layout
  * immediately, hope apps catch up" pattern that exposed a raw-atlas glitch
@@ -2382,6 +2844,12 @@ struct d3d11_multi_compositor
 		struct xrt_display_processor_d3d11 *dp;
 		int64_t retire_ns;
 		HWND hwnd; //!< the window it was CREATED against (see pipeline_dp_graveyard_flush_hwnd)
+		//! #918: the DEVICE it was created against. Diagnostic only — the
+		//! destroy path needs no device — but a graveyard entry that does not
+		//! record it makes "which adapter was that weaver on?" unanswerable
+		//! from a log, which is exactly the question a device-crossing rebind
+		//! raises.
+		ID3D11Device *dev;
 	} dp_graveyard[4];
 
 	//! #964 (D-4): the HWND `display_processor` was CREATED against. The D3D11
@@ -2390,6 +2858,28 @@ struct d3d11_multi_compositor
 	//! recreates the DP bound to the new one (pipeline_bind_panel_dp). NULL
 	//! when no DP exists. One DP per panel, always.
 	HWND panel_dp_hwnd;
+
+	/*!
+	 * #918 PR 3: the DEVICE `display_processor` was created against — the other
+	 * half of the bind key.
+	 *
+	 * A D3D11 resource driven by a foreign device does nothing, silently, so
+	 * "which device is the panel DP on?" has to be a fact the render thread can
+	 * read rather than infer from `sys->split_active` (which the workspace
+	 * suspend moves, and which the eligibility rule qualifies). Every
+	 * `process_atlas` site compares against it before weaving; a mismatch skips
+	 * the weave rather than handing the vendor a cross-device SRV.
+	 *
+	 * NULL when no DP exists. Equal to `sys->device` on every non-split build,
+	 * which is what keeps the comparison inert while the split is off.
+	 */
+	ID3D11Device *panel_dp_device;
+
+	//! #918: monotonic ns of the last DEVICE-CROSSING rebind, for the dwell
+	//! hysteresis (DXR_SPLIT_DEV_REBIND_DWELL_NS). Same-device rebinds do not
+	//! touch it — they are free and must never be throttled.
+	int64_t panel_dp_dev_rebind_ns;
+
 	//! #964: transparency mode the panel DP currently carries (true = alpha-gate only,
 	//! the presenter composes; false = opaque / DP owns see-through). Re-applied on a
 	//! same-window presenter-kind change (present-owner vs opaque app).
@@ -19603,6 +20093,14 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		delete sys;
 		return XRT_ERROR_D3D11;
 	}
+
+	// #918 Phase 2b — STAGE A. Deliberately HERE: after the app device exists
+	// (it is the producer side of the bridge and the LUID the scanout adapter is
+	// compared against) and before ANY client resource is built, because every
+	// presenter swap chain, RTV and DP creation downstream reads the split state
+	// through the `svc_out_*` accessors. Latched for process lifetime — the
+	// split is never stood up or torn down live.
+	service_split_stage_a(sys, xdev, adapter.get(), adapter_desc.AdapterLuid);
 
 	// Store system devices for passing to per-client windows
 	sys->xsysd = xsysd;
