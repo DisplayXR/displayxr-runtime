@@ -215,7 +215,18 @@ struct cli_query_result
 	char gpu_verdict[192]; //!< the one-line verdict, reused verbatim by selftest.
 	bool gpu_weave_env_set;
 	char gpu_weave_env[64]; //!< DXR_WEAVE_ON_SCANOUT value when set.
-	char gpu_note[128];     //!< why the probe could not answer, when it could not.
+	/*!
+	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
+	 * answer it: this process is not the service, holds no IPC connection, and
+	 * must not pretend to know what the running service decided. What it does
+	 * know is the two inputs — the topology verdict above and the flag — and
+	 * that the service's Stage A takes exactly those. So this is a WOULD-ENGAGE
+	 * statement, and it says so.
+	 */
+	char gpu_service_split[160];
+	//! DXR_SPLIT_INGRESS as set, or the default the service would pick.
+	char gpu_split_ingress[32];
+	char gpu_note[128]; //!< why the probe could not answer, when it could not.
 };
 
 /*!

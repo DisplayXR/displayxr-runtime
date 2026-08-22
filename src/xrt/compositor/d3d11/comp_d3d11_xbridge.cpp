@@ -133,6 +133,27 @@ enum xb_ingress_mode
  */
 #define XB_SRC_RETIRE 4
 
+/*!
+ * #918 PR 6 — the REBIND SETTLE window, and why adaptive ingress needs one.
+ *
+ * The service's Option-I sources are its CROP TEXTURES, and a crop texture is
+ * reallocated whenever the content box moves — which during an interactive
+ * resize drag is every mouse event. A new allocation is a new ingress key, so
+ * the naive rule ("key changed ⟹ re-open") turns a drag into one
+ * `OpenSharedHandle` and one retire-list push PER FRAME. The retire ring sweeps
+ * on every nomination and normally keeps up, but a producer that falls even
+ * slightly behind fills it, and the exhausted-ring fallback is the bounded
+ * drain — a 2 s CPU wait on the render thread under `render_mutex`. Dragging a
+ * window must not be able to reach that.
+ *
+ * So a key change RETIRES the old open once and then only ARMS the new key; the
+ * re-open happens after the key has held still this long. Through a drag there
+ * is simply no bound source and every frame stages, which is exactly what the
+ * bridge did before adaptive ingress existed and is the right degrade. Same
+ * shape as the R2 egress-ring hysteresis this sits beside (#1091).
+ */
+#define XB_SRC_SETTLE_NS (250ull * 1000ull * 1000ull)
+
 struct comp_d3d11_xbridge
 {
 	// --- D3D11 ends -----------------------------------------------------
@@ -353,8 +374,20 @@ struct comp_d3d11_xbridge
 		ID3D12Resource *res;
 		uint64_t prod_seq;
 	} src_retire[XB_SRC_RETIRE];
+	//! The key the caller has been nominating since @ref src_pending_since_ns,
+	//! and when it last CHANGED. The re-open waits for it to hold still — see
+	//! XB_SRC_SETTLE_NS.
+	uint64_t src_pending_key;
+	uint64_t src_pending_since_ns;
 	//! Window counters (drained by take_ingress_stats); `ing_rebind` is lifetime.
 	uint64_t ing_direct, ing_staged, ing_rebind;
+	//! Key changes that never became a re-open because the source kept moving —
+	//! a drag, counted rather than acted on.
+	uint64_t ing_churn;
+	//! Superseded opens DROPPED without release because the retire ring was
+	//! full. A tripwire: with the settle hysteresis in place this is
+	//! structurally unreachable, and any non-zero value is a bug.
+	uint64_t ing_leak;
 	//! One WARN for a source whose NT handle the producer refused, ever.
 	bool ing_open_warned;
 
@@ -2101,16 +2134,31 @@ xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res)
 		}
 	}
 	/*
-	 * Every slot busy — only reachable if the producer link has genuinely stopped
-	 * (the watchdog's territory) while the caller keeps changing source. Fall
-	 * back to the F2 rule: drain, and on timeout LEAK rather than hand the copy
-	 * queue a freed resource.
+	 * Every slot busy. Only reachable if the producer link has genuinely stopped
+	 * (the watchdog's territory) while the caller keeps changing source — and the
+	 * settle hysteresis above means a caller CANNOT keep changing source faster
+	 * than the ring drains. So this is a tripwire.
+	 *
+	 * It LEAKS. The obvious alternative — drain the producer, then release — is a
+	 * bounded CPU wait on the caller's thread, and the caller here is the
+	 * service's render thread holding `render_mutex`: a 2 s stall there is a
+	 * workspace-wide freeze, which is the entire #925 wedge class. "Unreachable"
+	 * is not a licence to keep such a wait; every wedge in that epic was on a
+	 * path someone believed unreachable. A dropped `ID3D12Resource` open is a
+	 * bounded, countable resource loss instead, and `ing_leak` is in the
+	 * telemetry precisely so it can be asserted zero.
 	 */
-	if (!xb_drain_fence(xb->f_xa_prod, want, "ingress source retire")) {
-		U_LOG_W("d3d11 xbridge: leaking a superseded ingress source — the producer would not drain (#918)");
-		return;
+	xb->ing_leak++;
+	static uint64_t s_last_log_ns = 0;
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (now_ns - s_last_log_ns > 5ull * 1000ull * 1000ull * 1000ull) {
+		s_last_log_ns = now_ns;
+		U_LOG_E(
+		    "[XBRIDGE] ingress retire ring full — DROPPING a superseded source open without release "
+		    "(leaks=%llu). The producer link has stalled; never wait here, the render thread holds "
+		    "render_mutex (#918 PR 6, throttled)",
+		    (unsigned long long)xb->ing_leak);
 	}
-	safe_release(res);
 }
 
 extern "C" bool
@@ -2141,16 +2189,14 @@ comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 
 	/*
 	 * The source CHANGED — a focus change, a controller attach or detach, or a
-	 * reallocation of the same slot's texture.
+	 * reallocation of the same slot's texture (which a resize drag does on every
+	 * mouse event).
 	 *
-	 * This frame STAGES. Not because reading the fresh open would be wrong (the
-	 * back-fence is a single monotonic value and covers the old source's copy
-	 * just as well), but because it is free to be conservative here: a source
-	 * change is by construction a LAYOUT-GENERATION change, and the weave is
-	 * already holding its last good frame while the new generation lands. Paying
-	 * one staged copy on that frame costs nothing anybody can see, and it keeps
-	 * the invariant simple — a source is only ever read in place on a frame that
-	 * had a full frame of back-fence behind it.
+	 * Drop the current binding immediately: from here until a new one settles,
+	 * every frame stages, which is exactly what the bridge did before adaptive
+	 * ingress and is the correct degrade. Then wait for the caller's key to hold
+	 * STILL before paying for a re-open — see XB_SRC_SETTLE_NS for why a drag
+	 * must not be able to drive one open per frame.
 	 */
 	xb->src_armed = false;
 	if (xb->atlas_12 != nullptr) {
@@ -2158,6 +2204,19 @@ comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 		xb->atlas_12 = nullptr;
 	}
 	xb->src_key = 0;
+
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (source_key != xb->src_pending_key) {
+		if (xb->src_pending_key != 0) {
+			xb->ing_churn++;
+		}
+		xb->src_pending_key = source_key;
+		xb->src_pending_since_ns = now_ns;
+		return false;
+	}
+	if (now_ns - xb->src_pending_since_ns < XB_SRC_SETTLE_NS) {
+		return false;
+	}
 
 	ID3D12Resource *opened = nullptr;
 	HRESULT hr = xb->prod_dev->OpenSharedHandle(static_cast<HANDLE>(nt_handle), __uuidof(ID3D12Resource),
@@ -2181,25 +2240,23 @@ comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 }
 
 extern "C" void
-comp_d3d11_xbridge_take_ingress_stats(
-    struct comp_d3d11_xbridge *xb, int *out_mode, uint64_t *out_direct, uint64_t *out_staged, uint64_t *out_rebind)
+comp_d3d11_xbridge_take_ingress_stats(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge_ingress_stats *out)
 {
-	if (out_mode != nullptr) {
-		*out_mode = (xb != nullptr) ? xb->ingress_mode : 0;
+	if (out == nullptr) {
+		return;
 	}
-	if (out_direct != nullptr) {
-		*out_direct = (xb != nullptr) ? xb->ing_direct : 0;
+	if (xb == nullptr) {
+		*out = {};
+		return;
 	}
-	if (out_staged != nullptr) {
-		*out_staged = (xb != nullptr) ? xb->ing_staged : 0;
-	}
-	if (out_rebind != nullptr) {
-		*out_rebind = (xb != nullptr) ? xb->ing_rebind : 0;
-	}
-	if (xb != nullptr) {
-		xb->ing_direct = 0;
-		xb->ing_staged = 0;
-	}
+	out->mode = xb->ingress_mode;
+	out->direct = xb->ing_direct;
+	out->staged = xb->ing_staged;
+	out->rebind = xb->ing_rebind;
+	out->churn = xb->ing_churn;
+	out->leak = xb->ing_leak;
+	xb->ing_direct = 0;
+	xb->ing_staged = 0;
 }
 
 extern "C" bool
@@ -2787,8 +2844,11 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 		    (unsigned long long)xb->churn_entries, (unsigned long long)xb->churn_settles);
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
-		U_LOG_W("d3d11 xbridge: adaptive ingress — %llu source re-binds over the session (#918 PR 6)",
-		        (unsigned long long)xb->ing_rebind);
+		U_LOG_W(
+		    "d3d11 xbridge: adaptive ingress — %llu settled source re-binds, %llu churn changes that never "
+		    "re-opened, %llu leaked opens (must be 0) (#918 PR 6)",
+		    (unsigned long long)xb->ing_rebind, (unsigned long long)xb->ing_churn,
+		    (unsigned long long)xb->ing_leak);
 	}
 	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
 		const auto &pl = xb->plane[p];

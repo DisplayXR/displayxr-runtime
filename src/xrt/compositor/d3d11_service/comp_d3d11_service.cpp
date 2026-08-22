@@ -8347,24 +8347,21 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			 * refused). `ing_rebind` is a LIFETIME total, so it reads as
 			 * "focus changes so far", not as churn per window.
 			 */
-			int ing_mode = 0;
-			uint64_t ing_direct = 0, ing_staged = 0, ing_rebind = 0;
-			if (sys->xbridge != nullptr) {
-				comp_d3d11_xbridge_take_ingress_stats(sys->xbridge, &ing_mode, &ing_direct, &ing_staged,
-				                                      &ing_rebind);
-			}
-			const char *ing_name = ing_mode == COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE ? "adaptive"
-			                       : ing_mode == COMP_D3D11_XBRIDGE_INGRESS_DIRECT ? "direct"
-			                       : ing_mode == COMP_D3D11_XBRIDGE_INGRESS_STAGED ? "staged"
+			struct comp_d3d11_xbridge_ingress_stats ing = {};
+			comp_d3d11_xbridge_take_ingress_stats(sys->xbridge, &ing);
+			const char *ing_name = ing.mode == COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE ? "adaptive"
+			                       : ing.mode == COMP_D3D11_XBRIDGE_INGRESS_DIRECT ? "direct"
+			                       : ing.mode == COMP_D3D11_XBRIDGE_INGRESS_STAGED ? "staged"
 			                                                                       : "none";
 			U_LOG_W(
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
 			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u ingress=%s ing_direct=%llu "
-			    "ing_staged=%llu ing_rebind=%llu window_s=10",
+			    "ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
 			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
 			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk, mk,
-			    ns, oc, ing_name, (unsigned long long)ing_direct, (unsigned long long)ing_staged,
-			    (unsigned long long)ing_rebind);
+			    ns, oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
+			    (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
+			    (unsigned long long)ing.leak);
 		}
 	}
 
