@@ -4,7 +4,7 @@
  * @file
  * @brief  Transport policy for the #918 bridge planes — pure, and therefore
  *         testable.
- * @ingroup comp_d3d11
+ * @ingroup comp_xbridge
  *
  * The plane transport's correctness is not in the D3D12 calls; it is in four
  * decisions taken around them, and every one of the #918 review's plane findings
@@ -20,7 +20,7 @@
  *     over-range box is silently DROPPED by the copy queue rather than failing.
  *
  * So the decisions live here, named, free of every graphics type, and covered by
- * `tests/tests_comp_d3d11_plane_policy.cpp`. The bridge calls them; it does not
+ * `tests/tests_comp_xbridge_plane_policy.cpp`. The bridge calls them; it does not
  * restate them.
  */
 

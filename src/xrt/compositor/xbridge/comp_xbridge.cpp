@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Cross-adapter atlas bridge for the D3D11 output-device split (#918).
- * @ingroup comp_d3d11
+ * @brief  Cross-adapter atlas bridge for the output-device split (#918).
+ * @ingroup comp_xbridge
  *
  * Mechanics ported from `scripts/hybrid_gpu_bench/xbridge12_bench.cpp`, the tool
  * that established on this hardware that D3D11 has no cross-adapter texture path
@@ -11,8 +11,8 @@
  * per-app-frame atlas needs at 60 Hz. See the header for the topology.
  */
 
-#include "comp_d3d11_xbridge.h"
-#include "comp_d3d11_plane_policy.h"
+#include "comp_xbridge.h"
+#include "comp_xbridge_plane_policy.h"
 
 #include "util/u_logging.h"
 #include "util/u_crash_guard.h"
@@ -154,7 +154,7 @@ enum xb_ingress_mode
  */
 #define XB_SRC_SETTLE_NS (250ull * 1000ull * 1000ull)
 
-struct comp_d3d11_xbridge
+struct comp_xbridge
 {
 	// --- D3D11 ends -----------------------------------------------------
 	ID3D11Device *app_dev;
@@ -261,8 +261,8 @@ struct comp_d3d11_xbridge
 	//! #918 Phase 2a — the composite recipe stamped on each slot, and the one
 	//! the next submit will stamp. Read back by the consume half so it never
 	//! composites a slot's pixels under a later frame's recipe.
-	struct comp_d3d11_xbridge_recipe eg_recipe[XB_EGRESS_RING];
-	struct comp_d3d11_xbridge_recipe staged_recipe;
+	struct comp_xbridge_recipe eg_recipe[XB_EGRESS_RING];
+	struct comp_xbridge_recipe staged_recipe;
 
 	// --- planes (#918 Phase 2a) -------------------------------------------
 	//! Panel extent — every plane is allocated here ONCE and never resized.
@@ -333,7 +333,7 @@ struct comp_d3d11_xbridge
 		//! Bandwidth gate: latched to submit every other frame.
 		bool half_rate;
 		uint64_t half_rate_parity;
-	} plane[COMP_D3D11_XBRIDGE_PLANE_COUNT];
+	} plane[COMP_XBRIDGE_PLANE_COUNT];
 	uint64_t atlas_bytes;
 	/*!
 	 * Rolling one-second window for the bandwidth gate (independent of the
@@ -447,13 +447,13 @@ xb_hr(HRESULT hr, char *buf, size_t n)
 //! fallback (no back-fence on the app device ⟹ Option I is unsafe). @p why names
 //! the reason for the one WARN.
 static bool
-xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why);
+xb_latch_staged_ingress(struct comp_xbridge *xb, const char *why);
 
 //! #918 PR 6 — defer the release of a superseded Option-I open behind the
 //! producer fence. Declared here because the staged-ingress latch demotes an
 //! adaptive bridge and must retire its source the same way.
 static void
-xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res);
+xb_retire_source(struct comp_xbridge *xb, ID3D12Resource *res);
 
 //! Bounded CPU wait cap for the structural-transition drains below.
 #define XB_DRAIN_TIMEOUT_MS 2000
@@ -513,7 +513,7 @@ xb_drain_fence(ID3D12Fence *fence, uint64_t target, const char *what)
  * on a D3D12 copy queue is not (#918 F1).
  */
 static void
-xb_release_egress(struct comp_d3d11_xbridge *xb)
+xb_release_egress(struct comp_xbridge *xb)
 {
 	bool in_flight_reachable = false;
 	for (int i = 0; i < XB_EGRESS_RING; i++) {
@@ -571,7 +571,7 @@ xb_release_egress(struct comp_d3d11_xbridge *xb)
  *         normal teardown so a partial chain is not leaked.
  */
 static HRESULT
-xb_make_egress_texture(struct comp_d3d11_xbridge *xb,
+xb_make_egress_texture(struct comp_xbridge *xb,
                        uint32_t w,
                        uint32_t h,
                        DXGI_FORMAT fmt,
@@ -631,7 +631,7 @@ xb_make_egress_texture(struct comp_d3d11_xbridge *xb,
  * @param out_heap_bytes Receives the heap size, for the one-shot log line.
  */
 static HRESULT
-xb_make_xa_slot(struct comp_d3d11_xbridge *xb,
+xb_make_xa_slot(struct comp_xbridge *xb,
                 uint32_t w,
                 uint32_t h,
                 DXGI_FORMAT fmt,
@@ -693,7 +693,7 @@ xb_make_xa_slot(struct comp_d3d11_xbridge *xb,
  * RTV bind the atlas egress has always carried.
  */
 static bool
-xb_make_egress_slot(struct comp_d3d11_xbridge *xb, int i, uint32_t w, uint32_t h, const char **out_reason)
+xb_make_egress_slot(struct comp_xbridge *xb, int i, uint32_t w, uint32_t h, const char **out_reason)
 {
 	char b[32];
 	HRESULT hr = xb_make_egress_texture(xb, w, h, XB_FORMAT, /*want_rtv=*/true, &xb->eg_tex[i], &xb->eg_srv[i],
@@ -716,22 +716,22 @@ static const char *
 xb_plane_name(uint32_t p)
 {
 	switch (p) {
-	case COMP_D3D11_XBRIDGE_PLANE_LOCAL2D: return "Local2D";
-	case COMP_D3D11_XBRIDGE_PLANE_BACKDROP: return "backdrop";
-	case COMP_D3D11_XBRIDGE_PLANE_MASK: return "authored mask";
+	case COMP_XBRIDGE_PLANE_LOCAL2D: return "Local2D";
+	case COMP_XBRIDGE_PLANE_BACKDROP: return "backdrop";
+	case COMP_XBRIDGE_PLANE_MASK: return "authored mask";
 	default: return "?";
 	}
 }
 
 extern "C" const char *
-comp_d3d11_xbridge_plane_label(uint32_t plane)
+comp_xbridge_plane_label(uint32_t plane)
 {
 	// #918 review D8: the DIAG line's names come from HERE, so adding a plane
 	// cannot leave the log naming it by an index that no longer means anything.
 	switch (plane) {
-	case COMP_D3D11_XBRIDGE_PLANE_LOCAL2D: return "local2d";
-	case COMP_D3D11_XBRIDGE_PLANE_BACKDROP: return "backdrop";
-	case COMP_D3D11_XBRIDGE_PLANE_MASK: return "mask";
+	case COMP_XBRIDGE_PLANE_LOCAL2D: return "local2d";
+	case COMP_XBRIDGE_PLANE_BACKDROP: return "backdrop";
+	case COMP_XBRIDGE_PLANE_MASK: return "mask";
 	default: return "plane?";
 	}
 }
@@ -761,7 +761,7 @@ xb_format_bpp(uint32_t fmt)
  * have.
  */
 static void
-xb_plane_invalidate_slots(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge::xb_plane &pl)
+xb_plane_invalidate_slots(struct comp_xbridge *xb, struct comp_xbridge::xb_plane &pl)
 {
 	(void)xb;
 	uint32_t w = pl.alloc_w;
@@ -790,7 +790,7 @@ xb_plane_invalidate_slots(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbrid
  * recoverable, a use-after-free on a copy queue is not (#918 F1).
  */
 static void
-xb_release_plane(struct comp_d3d11_xbridge *xb, uint32_t p, bool drained)
+xb_release_plane(struct comp_xbridge *xb, uint32_t p, bool drained)
 {
 	auto &pl = xb->plane[p];
 	for (int i = 0; i < XB_EGRESS_RING; i++) {
@@ -862,7 +862,7 @@ xb_release_plane(struct comp_d3d11_xbridge *xb, uint32_t p, bool drained)
  * and the feature that needs it degrades. The split is never affected.
  */
 static bool
-xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, uint32_t h)
+xb_plane_alloc(struct comp_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, uint32_t h)
 {
 	char b[32];
 	auto &pl = xb->plane[p];
@@ -935,16 +935,16 @@ xb_plane_alloc(struct comp_d3d11_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t
 }
 
 extern "C" bool
-comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
-                              uint32_t plane,
-                              void *nt_handle,
-                              uint64_t generation,
-                              uint32_t dxgi_format,
-                              uint32_t w,
-                              uint32_t h)
+comp_xbridge_bind_plane(struct comp_xbridge *xb,
+                        uint32_t plane,
+                        void *nt_handle,
+                        uint64_t generation,
+                        uint32_t dxgi_format,
+                        uint32_t w,
+                        uint32_t h)
 {
 	char b[32];
-	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT) {
 		return false;
 	}
 	auto &pl = xb->plane[plane];
@@ -1021,9 +1021,9 @@ comp_d3d11_xbridge_bind_plane(struct comp_d3d11_xbridge *xb,
 }
 
 extern "C" void
-comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plane)
+comp_xbridge_invalidate_plane(struct comp_xbridge *xb, uint32_t plane)
 {
-	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
 		return;
 	}
 	xb_plane_invalidate_slots(xb, xb->plane[plane]);
@@ -1031,7 +1031,7 @@ comp_d3d11_xbridge_invalidate_plane(struct comp_d3d11_xbridge *xb, uint32_t plan
 
 //! Slot @p i's pending dirty box, as the policy's box type.
 static inline struct xb_plane_box
-xb_plane_pend_box(const struct comp_d3d11_xbridge::xb_plane &pl, int i)
+xb_plane_pend_box(const struct comp_xbridge::xb_plane &pl, int i)
 {
 	struct xb_plane_box b = {pl.pend_x[i], pl.pend_y[i], pl.pend_w[i], pl.pend_h[i]};
 	return b;
@@ -1039,7 +1039,7 @@ xb_plane_pend_box(const struct comp_d3d11_xbridge::xb_plane &pl, int i)
 
 //! Fold @p (x,y,w,h) into slot @p i's pending dirty box.
 static void
-xb_plane_pend(struct comp_d3d11_xbridge::xb_plane &pl, int i, int32_t x, int32_t y, uint32_t w, uint32_t h)
+xb_plane_pend(struct comp_xbridge::xb_plane &pl, int i, int32_t x, int32_t y, uint32_t w, uint32_t h)
 {
 	struct xb_plane_box acc = xb_plane_pend_box(pl, i);
 	const struct xb_plane_box add = {x, y, w, h};
@@ -1051,10 +1051,10 @@ xb_plane_pend(struct comp_d3d11_xbridge::xb_plane &pl, int i, int32_t x, int32_t
 }
 
 extern "C" void
-comp_d3d11_xbridge_stage_plane(
-    struct comp_d3d11_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h)
+comp_xbridge_stage_plane(
+    struct comp_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h)
 {
-	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT) {
 		return;
 	}
 	auto &pl = xb->plane[plane];
@@ -1107,7 +1107,7 @@ comp_d3d11_xbridge_stage_plane(
 }
 
 extern "C" void
-comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp_d3d11_xbridge_recipe *recipe)
+comp_xbridge_stage_recipe(struct comp_xbridge *xb, const struct comp_xbridge_recipe *recipe)
 {
 	if (xb == nullptr || recipe == nullptr) {
 		return;
@@ -1116,7 +1116,7 @@ comp_d3d11_xbridge_stage_recipe(struct comp_d3d11_xbridge *xb, const struct comp
 }
 
 extern "C" bool
-comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, struct comp_d3d11_xbridge_recipe *out)
+comp_xbridge_slot_recipe(struct comp_xbridge *xb, int32_t slot, struct comp_xbridge_recipe *out)
 {
 	if (xb == nullptr || out == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
 		return false;
@@ -1126,9 +1126,9 @@ comp_d3d11_xbridge_slot_recipe(struct comp_d3d11_xbridge *xb, int32_t slot, stru
 }
 
 extern "C" void *
-comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
+comp_xbridge_get_plane_srv(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
 {
-	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || plane >= COMP_XBRIDGE_PLANE_COUNT) {
 		return nullptr;
 	}
 	auto &pl = xb->plane[plane];
@@ -1151,9 +1151,9 @@ comp_d3d11_xbridge_get_plane_srv(struct comp_d3d11_xbridge *xb, int32_t slot, ui
 }
 
 extern "C" bool
-comp_d3d11_xbridge_plane_extent(struct comp_d3d11_xbridge *xb, uint32_t plane, uint32_t *out_w, uint32_t *out_h)
+comp_xbridge_plane_extent(struct comp_xbridge *xb, uint32_t plane, uint32_t *out_w, uint32_t *out_h)
 {
-	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT || !xb->plane[plane].live) {
 		return false;
 	}
 	if (out_w != nullptr) {
@@ -1166,16 +1166,16 @@ comp_d3d11_xbridge_plane_extent(struct comp_d3d11_xbridge *xb, uint32_t plane, u
 }
 
 extern "C" void
-comp_d3d11_xbridge_take_plane_stats(struct comp_d3d11_xbridge *xb,
-                                    uint32_t plane,
-                                    uint64_t *out_bytes,
-                                    uint64_t *out_copies,
-                                    uint64_t *out_skips,
-                                    bool *out_half_rate)
+comp_xbridge_take_plane_stats(struct comp_xbridge *xb,
+                              uint32_t plane,
+                              uint64_t *out_bytes,
+                              uint64_t *out_copies,
+                              uint64_t *out_skips,
+                              bool *out_half_rate)
 {
 	uint64_t bytes = 0, copies = 0, skips = 0;
 	bool half = false;
-	if (xb != nullptr && plane < COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (xb != nullptr && plane < COMP_XBRIDGE_PLANE_COUNT) {
 		auto &pl = xb->plane[plane];
 		bytes = pl.bytes;
 		copies = pl.copies;
@@ -1198,7 +1198,7 @@ comp_d3d11_xbridge_take_plane_stats(struct comp_d3d11_xbridge *xb,
 }
 
 extern "C" uint64_t
-comp_d3d11_xbridge_take_atlas_bytes(struct comp_d3d11_xbridge *xb)
+comp_xbridge_take_atlas_bytes(struct comp_xbridge *xb)
 {
 	if (xb == nullptr) {
 		return 0;
@@ -1216,7 +1216,7 @@ comp_d3d11_xbridge_take_atlas_bytes(struct comp_d3d11_xbridge *xb)
  * @return the bytes copied (0 when skipped).
  */
 static uint64_t
-xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa, int eg)
+xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int eg)
 {
 	auto &pl = xb->plane[p];
 	if (!pl.live || !pl.src_bound || !pl.staged || pl.src12 == nullptr) {
@@ -1305,7 +1305,7 @@ xb_record_plane(struct comp_d3d11_xbridge *xb, uint32_t p, uint64_t seq, int xa,
  *    budget for @ref XB_GATE_UNLATCH_NS, and a plane re-bind clears its own.
  */
 static void
-xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
+xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
 {
 	const uint64_t now = os_monotonic_get_ns();
 	xb->gate_atlas_bytes += atlas_bytes;
@@ -1325,10 +1325,10 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t 
 	xb->gate_plane_bytes = 0;
 	xb->gate_window_ns = now;
 
-	uint32_t worst = COMP_D3D11_XBRIDGE_PLANE_COUNT;
+	uint32_t worst = COMP_XBRIDGE_PLANE_COUNT;
 	uint64_t worst_bytes = 0;
 	bool any_latched = false;
-	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 		if (xb->plane[p].half_rate) {
 			any_latched = true;
 		} else if (xb->plane[p].live && xb->plane[p].gate_bytes > worst_bytes) {
@@ -1346,7 +1346,7 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t 
 		if (xb->gate_under_since_ns == 0) {
 			xb->gate_under_since_ns = now;
 		} else if (any_latched && now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
-			for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+			for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 				xb->plane[p].half_rate = false;
 			}
 			xb->gate_under_since_ns = 0;
@@ -1374,7 +1374,7 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t 
 		}
 		return;
 	}
-	if (worst >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (worst >= COMP_XBRIDGE_PLANE_COUNT) {
 		return; // every live plane is already latched
 	}
 	xb->plane[worst].half_rate = true;
@@ -1403,7 +1403,7 @@ xb_bandwidth_gate(struct comp_d3d11_xbridge *xb, uint64_t atlas_bytes, uint64_t 
  * being ATTEMPTED and the consumer fence is not moving.
  */
 static void
-xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
+xb_watchdog_thread(struct comp_xbridge *xb)
 {
 	uint64_t last_prod_done = 0;
 	uint64_t last_cons_done = 0;
@@ -1487,7 +1487,7 @@ xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
 static void *
 xb_watchdog_entry(void *arg)
 {
-	xb_watchdog_thread(static_cast<struct comp_d3d11_xbridge *>(arg));
+	xb_watchdog_thread(static_cast<struct comp_xbridge *>(arg));
 	return nullptr;
 }
 
@@ -1499,9 +1499,7 @@ xb_watchdog_entry(void *arg)
  */
 
 extern "C" xrt_result_t
-comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
-                          struct comp_d3d11_xbridge **out_xb,
-                          const char **out_reason)
+comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **out_xb, const char **out_reason)
 {
 	char b[32];
 	HRESULT hr;
@@ -1510,7 +1508,7 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	// Value-init zero-fills every POD member before the implicit constructor
 	// runs (the std::thread / std::atomic members are what make it non-trivial),
 	// so no member below is read uninitialised on a failure path.
-	auto *xb = new comp_d3d11_xbridge();
+	auto *xb = new comp_xbridge();
 	xb->weave_slot = -1;
 	xb->last_submit_seq.store(0);
 	xb->prod_submit_seq.store(0);
@@ -1789,9 +1787,9 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	return XRT_SUCCESS;
 
 fail: {
-	struct comp_d3d11_xbridge *tmp = xb;
+	struct comp_xbridge *tmp = xb;
 	const char *keep = *out_reason;
-	comp_d3d11_xbridge_destroy(&tmp);
+	comp_xbridge_destroy(&tmp);
 	*out_reason = keep;
 }
 	return XRT_ERROR_D3D;
@@ -1806,7 +1804,7 @@ fail: {
 
 //! Rebuild the ring at @p w x @p h. On failure the ring is left released.
 static bool
-xb_alloc_egress(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, bool content_sized)
+xb_alloc_egress(struct comp_xbridge *xb, uint32_t w, uint32_t h, bool content_sized)
 {
 	xb_release_egress(xb);
 
@@ -1829,7 +1827,7 @@ xb_alloc_egress(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, bool cont
 }
 
 extern "C" bool
-comp_d3d11_xbridge_alloc_worstcase_egress(struct comp_d3d11_xbridge *xb)
+comp_xbridge_alloc_worstcase_egress(struct comp_xbridge *xb)
 {
 	if (xb == nullptr || xb->max_w == 0 || xb->max_h == 0) {
 		return false;
@@ -1838,7 +1836,7 @@ comp_d3d11_xbridge_alloc_worstcase_egress(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" bool
-comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, uint32_t h, uint64_t layout_gen)
+comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, uint64_t layout_gen)
 {
 	if (xb == nullptr || w == 0 || h == 0) {
 		return false;
@@ -1898,7 +1896,7 @@ comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, u
 				    "landing through the resize (#918)",
 				    w, h, (unsigned long long)((now - prev_change_ns) / (1000 * 1000)));
 				if (xb->eg_w != xb->max_w || xb->eg_h != xb->max_h) {
-					comp_d3d11_xbridge_alloc_worstcase_egress(xb);
+					comp_xbridge_alloc_worstcase_egress(xb);
 				}
 				return true;
 			}
@@ -1958,13 +1956,12 @@ comp_d3d11_xbridge_set_content_size(struct comp_d3d11_xbridge *xb, uint32_t w, u
 	    "d3d11 xbridge: egress ring could not be sized to %ux%u — keeping the worst-case ring and "
 	    "cropping on the output device; this size will not be retried (#918)",
 	    w, h);
-	comp_d3d11_xbridge_alloc_worstcase_egress(xb);
+	comp_xbridge_alloc_worstcase_egress(xb);
 	return false;
 }
 
 extern "C" bool
-comp_d3d11_xbridge_slot_layout(
-    struct comp_d3d11_xbridge *xb, int32_t slot, uint64_t *out_gen, uint32_t *out_w, uint32_t *out_h)
+comp_xbridge_slot_layout(struct comp_xbridge *xb, int32_t slot, uint64_t *out_gen, uint32_t *out_w, uint32_t *out_h)
 {
 	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
 		return false;
@@ -1981,7 +1978,7 @@ comp_d3d11_xbridge_slot_layout(
  * atlas could not be opened by the producer D3D12 device.
  */
 static bool
-xb_alloc_ingress_ring(struct comp_d3d11_xbridge *xb)
+xb_alloc_ingress_ring(struct comp_xbridge *xb)
 {
 	char b[32];
 	if (xb->in_12[0] != nullptr) {
@@ -2023,7 +2020,7 @@ xb_alloc_ingress_ring(struct comp_d3d11_xbridge *xb)
 }
 
 static bool
-xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
+xb_latch_staged_ingress(struct comp_xbridge *xb, const char *why)
 {
 	if (xb->ingress_mode == XB_INGRESS_STAGED) {
 		return true;
@@ -2055,7 +2052,7 @@ xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
  * to. See the header for who wants it and why the timing is load-bearing.
  */
 extern "C" bool
-comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb)
+comp_xbridge_force_staged_ingress(struct comp_xbridge *xb)
 {
 	if (xb == nullptr) {
 		return false;
@@ -2064,7 +2061,7 @@ comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" bool
-comp_d3d11_xbridge_enable_adaptive_ingress(struct comp_d3d11_xbridge *xb)
+comp_xbridge_enable_adaptive_ingress(struct comp_xbridge *xb)
 {
 	if (xb == nullptr) {
 		return false;
@@ -2104,7 +2101,7 @@ comp_d3d11_xbridge_enable_adaptive_ingress(struct comp_d3d11_xbridge *xb)
  * on the caller's thread from `set_source` (and at quiesce); never waits.
  */
 static void
-xb_sweep_retired_sources(struct comp_d3d11_xbridge *xb)
+xb_sweep_retired_sources(struct comp_xbridge *xb)
 {
 	if (xb->f_xa_prod == nullptr) {
 		return;
@@ -2119,7 +2116,7 @@ xb_sweep_retired_sources(struct comp_d3d11_xbridge *xb)
 }
 
 static void
-xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res)
+xb_retire_source(struct comp_xbridge *xb, ID3D12Resource *res)
 {
 	if (res == nullptr) {
 		return;
@@ -2162,7 +2159,7 @@ xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res)
 }
 
 extern "C" bool
-comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t source_key)
+comp_xbridge_set_source(struct comp_xbridge *xb, void *nt_handle, uint64_t source_key)
 {
 	char b[32];
 	if (xb == nullptr) {
@@ -2240,7 +2237,7 @@ comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 }
 
 extern "C" void
-comp_d3d11_xbridge_take_ingress_stats(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge_ingress_stats *out)
+comp_xbridge_take_ingress_stats(struct comp_xbridge *xb, struct comp_xbridge_ingress_stats *out)
 {
 	if (out == nullptr) {
 		return;
@@ -2260,7 +2257,7 @@ comp_d3d11_xbridge_take_ingress_stats(struct comp_d3d11_xbridge *xb, struct comp
 }
 
 extern "C" bool
-comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t generation)
+comp_xbridge_bind_atlas(struct comp_xbridge *xb, void *nt_handle, uint64_t generation)
 {
 	char b[32];
 	if (xb == nullptr) {
@@ -2271,7 +2268,7 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		// An adaptive caller nominates its source per frame through
-		// comp_d3d11_xbridge_set_source; the session-long bind is not its model.
+		// comp_xbridge_set_source; the session-long bind is not its model.
 		return true;
 	}
 	if (nt_handle == nullptr) {
@@ -2329,7 +2326,7 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
  * one free.
  */
 static int
-xb_egress_write_slot(struct comp_d3d11_xbridge *xb)
+xb_egress_write_slot(struct comp_xbridge *xb)
 {
 	const int32_t avoid = xb->weave_slot;
 	int best = -1;
@@ -2364,7 +2361,7 @@ xb_egress_write_slot(struct comp_d3d11_xbridge *xb)
  * guard, which makes repeat calls within a frame free.
  */
 static void
-xb_app_back_wait(struct comp_d3d11_xbridge *xb, uint64_t want)
+xb_app_back_wait(struct comp_xbridge *xb, uint64_t want)
 {
 	if (!xb->app_back_wait_ok) {
 		return;
@@ -2379,7 +2376,7 @@ xb_app_back_wait(struct comp_d3d11_xbridge *xb, uint64_t want)
 }
 
 extern "C" void
-comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
+comp_xbridge_pre_render(struct comp_xbridge *xb)
 {
 	if (xb == nullptr) {
 		return;
@@ -2401,9 +2398,9 @@ comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" void
-comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane)
+comp_xbridge_pre_plane_write(struct comp_xbridge *xb, uint32_t plane)
 {
-	if (xb == nullptr || plane >= COMP_D3D11_XBRIDGE_PLANE_COUNT) {
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT) {
 		return;
 	}
 	/*
@@ -2425,12 +2422,12 @@ comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane
 }
 
 extern "C" void
-comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
-                          uint64_t seq,
-                          uint64_t layout_gen,
-                          void *atlas_texture,
-                          uint32_t content_w,
-                          uint32_t content_h)
+comp_xbridge_submit(struct comp_xbridge *xb,
+                    uint64_t seq,
+                    uint64_t layout_gen,
+                    void *atlas_texture,
+                    uint32_t content_w,
+                    uint32_t content_h)
 {
 	if (xb == nullptr || seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
 		return;
@@ -2542,7 +2539,7 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 	xb->atlas_bytes += atlas_frame_bytes;
 
 	uint64_t plane_frame_bytes = 0;
-	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 		plane_frame_bytes += xb_record_plane(xb, p, seq, xa, eg);
 	}
 
@@ -2599,7 +2596,7 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 	 */
 	xb->eg_recipe[eg] = xb->staged_recipe;
 	xb->eg_recipe[eg].plane_valid = 0;
-	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 		auto &pl = xb->plane[p];
 		xb->eg_recipe[eg].plane_seq[p] = pl.slot_seq[eg];
 		/*
@@ -2631,7 +2628,7 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
  */
 
 extern "C" int32_t
-comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen)
+comp_xbridge_pick_slot(struct comp_xbridge *xb, uint64_t want_gen)
 {
 	if (xb == nullptr || xb->eg_w == 0) {
 		return -1;
@@ -2709,7 +2706,7 @@ comp_d3d11_xbridge_pick_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen)
 }
 
 extern "C" int32_t
-comp_d3d11_xbridge_pick_inflight_slot(struct comp_d3d11_xbridge *xb, uint64_t want_gen)
+comp_xbridge_pick_inflight_slot(struct comp_xbridge *xb, uint64_t want_gen)
 {
 	/*
 	 * #918 R1. Requires the GPU-side ordering: without the consumer fence open
@@ -2735,7 +2732,7 @@ comp_d3d11_xbridge_pick_inflight_slot(struct comp_d3d11_xbridge *xb, uint64_t wa
 }
 
 extern "C" void
-comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, int32_t slot)
+comp_xbridge_gpu_wait_slot(struct comp_xbridge *xb, int32_t slot)
 {
 	if (xb == nullptr || !xb->out_gpu_wait_ok || slot < 0 || slot >= XB_EGRESS_RING) {
 		return;
@@ -2749,7 +2746,7 @@ comp_d3d11_xbridge_gpu_wait_slot(struct comp_d3d11_xbridge *xb, int32_t slot)
 }
 
 extern "C" bool
-comp_d3d11_xbridge_slot_ready(struct comp_d3d11_xbridge *xb, int32_t slot)
+comp_xbridge_slot_ready(struct comp_xbridge *xb, int32_t slot)
 {
 	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING) {
 		return false;
@@ -2765,7 +2762,7 @@ comp_d3d11_xbridge_slot_ready(struct comp_d3d11_xbridge *xb, int32_t slot)
 }
 
 extern "C" void *
-comp_d3d11_xbridge_get_srv(struct comp_d3d11_xbridge *xb, int32_t slot)
+comp_xbridge_get_srv(struct comp_xbridge *xb, int32_t slot)
 {
 	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING) {
 		return nullptr;
@@ -2774,14 +2771,14 @@ comp_d3d11_xbridge_get_srv(struct comp_d3d11_xbridge *xb, int32_t slot)
 }
 
 extern "C" void
-comp_d3d11_xbridge_get_egress_dims(struct comp_d3d11_xbridge *xb, uint32_t *out_w, uint32_t *out_h)
+comp_xbridge_get_egress_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h)
 {
 	*out_w = (xb != nullptr) ? xb->eg_w : 0;
 	*out_h = (xb != nullptr) ? xb->eg_h : 0;
 }
 
 extern "C" void
-comp_d3d11_xbridge_set_weave_slot(struct comp_d3d11_xbridge *xb, int32_t slot)
+comp_xbridge_set_weave_slot(struct comp_xbridge *xb, int32_t slot)
 {
 	if (xb != nullptr) {
 		xb->weave_slot = slot;
@@ -2789,13 +2786,13 @@ comp_d3d11_xbridge_set_weave_slot(struct comp_d3d11_xbridge *xb, int32_t slot)
 }
 
 extern "C" int32_t
-comp_d3d11_xbridge_get_weave_slot(struct comp_d3d11_xbridge *xb)
+comp_xbridge_get_weave_slot(struct comp_xbridge *xb)
 {
 	return (xb != nullptr) ? xb->weave_slot : -1;
 }
 
 extern "C" bool
-comp_d3d11_xbridge_is_degraded(struct comp_d3d11_xbridge *xb)
+comp_xbridge_is_degraded(struct comp_xbridge *xb)
 {
 	return xb != nullptr && xb->degraded.load(std::memory_order_relaxed);
 }
@@ -2808,7 +2805,7 @@ comp_d3d11_xbridge_is_degraded(struct comp_d3d11_xbridge *xb)
  */
 
 extern "C" void
-comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
+comp_xbridge_quiesce(struct comp_xbridge *xb)
 {
 	// Idempotent: the compositor quiesces explicitly (before tearing the DP and
 	// the target down) and destroy calls it again.
@@ -2850,7 +2847,7 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 		    (unsigned long long)xb->ing_rebind, (unsigned long long)xb->ing_churn,
 		    (unsigned long long)xb->ing_leak);
 	}
-	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 		const auto &pl = xb->plane[p];
 		if (!pl.live && pl.copies == 0) {
 			continue;
@@ -2862,15 +2859,15 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" void
-comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
+comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 {
-	struct comp_d3d11_xbridge *xb = *xb_ptr;
+	struct comp_xbridge *xb = *xb_ptr;
 	if (xb == nullptr) {
 		return;
 	}
 	*xb_ptr = nullptr;
 
-	comp_d3d11_xbridge_quiesce(xb);
+	comp_xbridge_quiesce(xb);
 
 	/*
 	 * #918 F1/F2: if the bounded drain in quiesce timed out, copies may STILL be
@@ -2915,7 +2912,7 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 	{
 		const bool pl_drained = xb_drain_fence(
 		    xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "plane release");
-		for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+		for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 			xb_release_plane(xb, p, pl_drained);
 		}
 	}

@@ -43,7 +43,7 @@
 
 // #918 Phase 2b: the cross-adapter atlas transport, shared with the in-process
 // compositor (PR 1/6 made it a standalone static lib for exactly this).
-#include "comp_d3d11_xbridge.h"
+#include "comp_xbridge.h"
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
@@ -1574,7 +1574,7 @@ struct d3d11_service_system
 	 * and Option I would re-open an NT handle — draining the producer queue —
 	 * on every Alt-Tab.
 	 */
-	struct comp_d3d11_xbridge *xbridge{nullptr};
+	struct comp_xbridge *xbridge{nullptr};
 
 	/*!
 	 * #918 R1 — the layout GENERATION stamped on every bridged slot, and the
@@ -1684,7 +1684,7 @@ svc_out_factory(struct d3d11_service_system *sys)
  * legal Option-I source, and the rule is a correctness rule, not a
  * simplification. The producer's copy of frame N runs asynchronously into frame
  * N+1; the one thing that orders an app-device write against it is
- * `comp_d3d11_xbridge_pre_render`, which this path issues once at the top of the
+ * `comp_xbridge_pre_render`, which this path issues once at the top of the
  * render tick. That covers every write the RENDER THREAD makes — the ADR-030
  * crop, the whole compose pass — and covers nothing a CLIENT'S IPC THREAD makes.
  * A client's `atlas_texture` is written by `compositor_layer_commit` on that
@@ -1791,14 +1791,14 @@ svc_split_share_source(struct d3d11_service_system *sys, ID3D11Texture2D *tex, v
  * bridge is then inoperative under either policy and the split must not activate.
  */
 static bool
-svc_split_select_ingress(struct comp_d3d11_xbridge *xb)
+svc_split_select_ingress(struct comp_xbridge *xb)
 {
 	const char *e = getenv("DXR_SPLIT_INGRESS");
 	if (e != nullptr && strcmp(e, "staged") == 0) {
 		U_LOG_W("#918: DXR_SPLIT_INGRESS=staged — pinning the staged ingress ring (A/B control)");
-		return comp_d3d11_xbridge_force_staged_ingress(xb);
+		return comp_xbridge_force_staged_ingress(xb);
 	}
-	return comp_d3d11_xbridge_enable_adaptive_ingress(xb);
+	return comp_xbridge_enable_adaptive_ingress(xb);
 }
 
 //! Drop a source's share handle. Safe to call on a never-shared source, and
@@ -2029,7 +2029,7 @@ service_split_stage_a(struct d3d11_service_system *sys,
 				sys_h = panel_h;
 			}
 
-			struct comp_d3d11_xbridge_info xbi = {};
+			struct comp_xbridge_info xbi = {};
 			xbi.app_device = sys->device.get();
 			xbi.app_context = sys->context.get();
 			xbi.app_adapter = app_adapter;
@@ -2050,12 +2050,12 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			const uint64_t xb_t0 = os_monotonic_get_ns();
 			if (dxr_test_split_fail_stage_a()) {
 				reason = "DXR_TEST_SPLIT_FAIL_STAGEA";
-			} else if (comp_d3d11_xbridge_create(&xbi, &sys->xbridge, &xb_reason) != XRT_SUCCESS) {
+			} else if (comp_xbridge_create(&xbi, &sys->xbridge, &xb_reason) != XRT_SUCCESS) {
 				sys->xbridge = nullptr;
 				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
 			} else if (!svc_split_select_ingress(sys->xbridge)) {
 				reason = "staged ingress ring unavailable";
-			} else if (!comp_d3d11_xbridge_alloc_worstcase_egress(sys->xbridge)) {
+			} else if (!comp_xbridge_alloc_worstcase_egress(sys->xbridge)) {
 				/*
 				 * The egress ring is allocated HERE, not on the first frame:
 				 * the split must not be able to activate and THEN discover it
@@ -2084,7 +2084,7 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			    (unsigned long)app_luid.LowPart);
 		} else {
 			if (sys->xbridge != nullptr) {
-				comp_d3d11_xbridge_destroy(&sys->xbridge);
+				comp_xbridge_destroy(&sys->xbridge);
 			}
 			if (sys->out_factory != nullptr) {
 				sys->out_factory->Release();
@@ -5375,7 +5375,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_lat.close();
 	// #918 PR 6: retire this client's ingress identity with its texture. The
 	// bridge's own D3D12 open (if this was the bound source) is retired behind
-	// the producer fence by `comp_d3d11_xbridge_set_source` the next time a
+	// the producer fence by `comp_xbridge_set_source` the next time a
 	// source is nominated — releasing the D3D11 texture here does not free the
 	// underlying allocation while that open holds it.
 	svc_split_unshare_source(&res->split_share_handle, &res->split_share_key);
@@ -8336,7 +8336,7 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			uint32_t ns = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
 			uint32_t oc = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
 			const uint64_t xb_bytes =
-			    sys->xbridge != nullptr ? comp_d3d11_xbridge_take_atlas_bytes(sys->xbridge) : 0;
+			    sys->xbridge != nullptr ? comp_xbridge_take_atlas_bytes(sys->xbridge) : 0;
 			/*
 			 * #918 PR 6 — ingress, the term that says which half of the
 			 * transport each frame actually paid for. `ingress=direct` with
@@ -8347,19 +8347,19 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			 * refused). `ing_rebind` is a LIFETIME total, so it reads as
 			 * "focus changes so far", not as churn per window.
 			 */
-			struct comp_d3d11_xbridge_ingress_stats ing = {};
-			comp_d3d11_xbridge_take_ingress_stats(sys->xbridge, &ing);
-			const char *ing_name = ing.mode == COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE ? "adaptive"
-			                       : ing.mode == COMP_D3D11_XBRIDGE_INGRESS_DIRECT ? "direct"
-			                       : ing.mode == COMP_D3D11_XBRIDGE_INGRESS_STAGED ? "staged"
-			                                                                       : "none";
+			struct comp_xbridge_ingress_stats ing = {};
+			comp_xbridge_take_ingress_stats(sys->xbridge, &ing);
+			const char *ing_name = ing.mode == COMP_XBRIDGE_INGRESS_ADAPTIVE ? "adaptive"
+			                       : ing.mode == COMP_XBRIDGE_INGRESS_DIRECT ? "direct"
+			                       : ing.mode == COMP_XBRIDGE_INGRESS_STAGED ? "staged"
+			                                                                 : "none";
 			U_LOG_W(
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
 			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u ingress=%s ing_direct=%llu "
 			    "ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
 			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
-			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk, mk,
-			    ns, oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
+			    (int)(sys->xbridge != nullptr && comp_xbridge_is_degraded(sys->xbridge)), dr, fk, mk, ns,
+			    oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
 			    (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 			    (unsigned long long)ing.leak);
 		}
@@ -11471,7 +11471,7 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	// and the active mode. Internally hysteresis-guarded (#918 R2) — a size that
 	// keeps changing (a resize drag) parks the ring at worst-case instead of
 	// rebuilding three NT-shared textures per mouse event.
-	comp_d3d11_xbridge_set_content_size(sys->xbridge, content_w, content_h, sys->split_layout_gen);
+	comp_xbridge_set_content_size(sys->xbridge, content_w, content_h, sys->split_layout_gen);
 
 	/*
 	 * #918 PR 6 — nominate this frame's ingress source. The bridge answers
@@ -11482,23 +11482,23 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	 * in-place read safe was issued at the TOP of this render tick, before any
 	 * app-device write.
 	 */
-	(void)comp_d3d11_xbridge_set_source(sys->xbridge, src_share, src_key);
+	(void)comp_xbridge_set_source(sys->xbridge, src_share, src_key);
 
 	sys->split_seq++;
-	comp_d3d11_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
+	comp_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
 
 	// Opportunistic: the newest slot whose consumer copy has already completed,
 	// CPU-verified, so this thread never waits. Falling back to the in-flight
 	// slot of the CURRENT generation is what keeps a mode switch from leaving
 	// FLIP_DISCARD showing a frame woven for the mode the panel has just left.
-	int32_t slot = comp_d3d11_xbridge_pick_slot(sys->xbridge, sys->split_layout_gen);
+	int32_t slot = comp_xbridge_pick_slot(sys->xbridge, sys->split_layout_gen);
 	if (slot < 0) {
-		slot = comp_d3d11_xbridge_pick_inflight_slot(sys->xbridge, sys->split_layout_gen);
+		slot = comp_xbridge_pick_inflight_slot(sys->xbridge, sys->split_layout_gen);
 	}
 	if (slot < 0) {
 		// Warmup, or the ring was just rebuilt. Re-weave the last published
 		// slot; the generation test below vets it exactly the same.
-		slot = comp_d3d11_xbridge_get_weave_slot(sys->xbridge);
+		slot = comp_xbridge_get_weave_slot(sys->xbridge);
 	}
 	if (slot < 0) {
 		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
@@ -11507,7 +11507,7 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 
 	uint64_t slot_gen = 0;
 	uint32_t slot_w = 0, slot_h = 0;
-	if (!comp_d3d11_xbridge_slot_layout(sys->xbridge, slot, &slot_gen, &slot_w, &slot_h) ||
+	if (!comp_xbridge_slot_layout(sys->xbridge, slot, &slot_gen, &slot_w, &slot_h) ||
 	    slot_gen != sys->split_layout_gen) {
 		// A slot composited under a recipe the DP has since left. Weaving it is
 		// the one-frame offset artefact; presenting nothing holds the last good
@@ -11516,8 +11516,8 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 		return nullptr;
 	}
 
-	comp_d3d11_xbridge_gpu_wait_slot(sys->xbridge, slot);
-	auto *srv = static_cast<ID3D11ShaderResourceView *>(comp_d3d11_xbridge_get_srv(sys->xbridge, slot));
+	comp_xbridge_gpu_wait_slot(sys->xbridge, slot);
+	auto *srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_srv(sys->xbridge, slot));
 	if (srv == nullptr) {
 		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
@@ -11538,7 +11538,7 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	 * written to make.
 	 */
 	uint32_t eg_w = 0, eg_h = 0;
-	comp_d3d11_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
+	comp_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
 	if (eg_w != slot_w || eg_h != slot_h) {
 		srv = pipeline_split_crop_on_out_device(sys, srv, slot_w, slot_h);
 		if (srv == nullptr) {
@@ -11546,7 +11546,7 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 			return nullptr;
 		}
 	}
-	comp_d3d11_xbridge_set_weave_slot(sys->xbridge, slot);
+	comp_xbridge_set_weave_slot(sys->xbridge, slot);
 
 	// #918 R2: weave the slot at ITS OWN box. Equal to the live one in the
 	// steady state; a frame behind during a resize the ring survived.
@@ -12388,7 +12388,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	 * submit and waits for nothing else), and a no-op with the split off.
 	 */
 	if (sys->split_active && sys->xbridge != nullptr) {
-		comp_d3d11_xbridge_pre_render(sys->xbridge);
+		comp_xbridge_pre_render(sys->xbridge);
 	}
 
 	if (mc->suspended) {
@@ -21771,7 +21771,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	 * split is stood DOWN first and the DP torn down after.
 	 */
 	if (sys->xbridge != nullptr) {
-		comp_d3d11_xbridge_quiesce(sys->xbridge);
+		comp_xbridge_quiesce(sys->xbridge);
 	}
 
 	// Clean up multi-compositor
@@ -21783,7 +21783,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	// #918: now that the render thread is joined and the panel DP is gone,
 	// release the transport and the output device it lives on.
 	if (sys->xbridge != nullptr) {
-		comp_d3d11_xbridge_destroy(&sys->xbridge);
+		comp_xbridge_destroy(&sys->xbridge);
 	}
 	// #918 PR 4: the output-device crop staging, before the device that owns it.
 	sys->split_out_crop_srv.reset();

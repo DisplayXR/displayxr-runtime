@@ -339,6 +339,15 @@ target_link_libraries(
 	)
 
 ###
+# Cross-adapter transport (#918) — API-agnostic, linked by every native
+# compositor that can hit the split. Declared BEFORE its consumers so their
+# target_link_libraries() sees a defined target.
+#
+if(WIN32 AND XRT_HAVE_D3D11)
+	add_subdirectory(xbridge)
+endif()
+
+###
 # Native D3D11 compositor (bypasses Vulkan entirely)
 #
 if(WIN32 AND XRT_HAVE_D3D11)
