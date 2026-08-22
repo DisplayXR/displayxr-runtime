@@ -949,57 +949,20 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                         0, NULL, 0, NULL, 1, &sbs_to_read);
 		} // end !nview (legacy/batch SBS record)
 
-		// Gap alpha (#100, browser wall-3d/composition): the DP's full-target
-		// weave makes NO promise about alpha in regions no submitted rect covers,
-		// and the render pass LOADs. The D3D11 service clears its woven output at
-		// two sites (comp_d3d11_service.cpp ClearRenderTargetView) - this path
-		// never did, which a whole-window kSrcOver draw-back turns into the page
-		// being covered by garbage gaps. Clear the OUTPUT to premultiplied
-		// transparent on the frame's first chunk, exactly like the SBS scratch
-		// above, so gaps composite as holes.
-		if (weave_frame_first) {
-			VkImageMemoryBarrier out_to_clear = {
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = 0,
-			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			    .image = mc->weave.out_image,
-			    .subresourceRange = range,
-			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                         0, 0, NULL, 0, NULL, 1, &out_to_clear);
-			VkClearColorValue out_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-			vk->vkCmdClearColorImage(cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                         &out_transparent, 1, &range);
-			VkImageMemoryBarrier clear_to_attach = {
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			    .image = mc->weave.out_image,
-			    .subresourceRange = range,
-			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL,
-			                         1, &clear_to_attach);
-		} else {
-			// Output -> COLOR_ATTACHMENT (re-rendered where rects land; gaps keep
-			// the firstChunk-cleared transparent from this frame's first submit).
-			VkImageMemoryBarrier out_to_attach = {
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = 0,
-			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			    .image = mc->weave.out_image,
-			    .subresourceRange = range,
-			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
-			                         &out_to_attach);
-		}
+		// Output -> COLOR_ATTACHMENT (fully re-rendered every submit, so the
+		// discard from UNDEFINED is fine).
+		VkImageMemoryBarrier out_to_attach = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .image = mc->weave.out_image,
+		    .subresourceRange = range,
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+		                         &out_to_attach);
 
 		// Per-window weave phase (#1033 / ADR-036 D6): the interlace phase is
 		// absolute-screen, so hand the DP the present-owner's client rect on the
