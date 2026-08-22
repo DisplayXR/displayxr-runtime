@@ -250,6 +250,37 @@ cross-adapter transport (D3D12 heaps work at 3× required bandwidth); attended t
 degradation under B (checked at 78 % iGPU with a viewer present — held). No falsifier
 remains open on this topology.
 
+## As shipped
+
+This investigation ended at a recommendation and a proxy measurement. The thing it
+recommended now exists, so the honest close is to say where it went and stop treating
+this page as the current state of the work — the epic
+([#918](https://github.com/DisplayXR/displayxr-runtime/issues/918)) is that, and it
+carries the per-phase design comments and the merge evidence.
+
+| Phase | What landed |
+|---|---|
+| 0 | `scanout` keyword for `DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU` — the prerequisite this page names (#1078); weave-placement reporting in session logs and `displayxr-cli` (#1093) |
+| 1 | The in-process D3D11 output-device split behind `DXR_WEAVE_ON_SCANOUT=1`, projection weave only (#1083 + #1085) |
+| 2a | Zones, Local2D, the authored mask and the 2D-under backdrop across the bridge; every Phase-1 gate deleted (#1095 + #1106) |
+| 2b | The same split on the **D3D11 service** — direct path, compose/shell path, the zones wish mask on the DP's device, and the hardening pass (#1125, #1127, #1136, #1139, and this PR) |
+| 3 | Auto-enable policy, CASO-hardware revalidation, legacy-app post-downscale transfer — **open** |
+
+Two corrections this page's readers should carry forward:
+
+- **The proxy understated the win, as predicted, but the SERVICE numbers are their own
+  measurement.** The all-iGPU session measured here renders the app on the iGPU too; the
+  shipped split keeps app render on the dGPU. PR 3's rate-normalised service A/B is the
+  first real one, and it is not this page's numbers: 9.7 ms iGPU / 5.9 ms dGPU per weave
+  split-on against 5.2 / 10.6 split-off, with the delivered weave rate rising 33 → 50/s
+  because the split removes the cross-adapter present that was rate-limiting the stock
+  arm. Do not quote this page's figures for the service.
+- **Default-on is gated on the vendor stack, not on the runtime.** #1134 found the
+  scanout weave emitting transparent-black bursts while nobody is tracked — a
+  non-monotonic pulse-animation clock in the vendor weavers, not a runtime defect. Fixed
+  upstream (LeiaSR#190) and verified 0/40 against 8/40 pre-fix, so **Phase 3's default-on
+  requires SR Platform ≥ 1.37.0+1498**.
+
 ## Reproduction
 
 Tools in `scripts/hybrid_gpu_bench/` (`build.bat`; VS 2022): `gpu_loadgen`
