@@ -123,8 +123,8 @@ if ($m2d -ne $null -and $ship -ne $null -and $ship.weaves -gt 0 -and $f2 -eq $nu
     Add-Comp 'unit1_weave_increment' $u1 (10.0 * ($ship.spread + $m2d.spread) / $ship.weaves) 'ms' 'SHIP - MODE-2D, app+dwm, per weave' 'transparent-path variant: includes compose delta' @($ship, $m2d)
 }
 if ($l3 -ne $null -and $f3 -ne $null) { Add-Comp 'dwm_live_tax' ($l3.dwm - $f3.dwm) ($l3.spread + $f3.spread) 'pts' 'LIVE-3D dwm - FLIP-3D dwm' '' @($l3, $f3) }
-if ($s3 -ne $null -and $l3 -ne $null) { Add-Comp 'shaping_tax' ($s3.app_dwm - $l3.app_dwm) ($s3.spread + $l3.spread) 'pts' 'SHAPED-3D - LIVE-3D, app+dwm' '' @($s3, $l3) }
-if ($s3m -ne $null -and $s3 -ne $null) { Add-Comp 'motion_tax_shaped' ($s3m.app_dwm - $s3.app_dwm) ($s3m.spread + $s3.spread) 'pts' 'SHAPED-3D-M - SHAPED-3D, app+dwm' '' @($s3m, $s3) }
+if ($s3 -ne $null -and $l3 -ne $null) { Add-Comp 'shaping_tax' ($s3.app_dwm - $l3.app_dwm) ($s3.spread + $l3.spread) 'pts' 'SHAPED-3D - LIVE-3D, app+dwm' 'SIGN-UNSTABLE across runs on the reference box - noise, do not quote' @($s3, $l3) }
+if ($s3m -ne $null -and $s3 -ne $null) { Add-Comp 'motion_tax_shaped' ($s3m.app_dwm - $s3.app_dwm) ($s3m.spread + $s3.spread) 'pts' 'SHAPED-3D-M - SHAPED-3D, app+dwm' 'SIGN-UNSTABLE across runs on the reference box - noise, do not quote' @($s3m, $s3) }
 if ($r30 -ne $null -and $s3 -ne $null) { Add-Comp 'render_cost_30hz' ((AppTotal $r30) - (AppTotal $s3)) ($r30.spread + $s3.spread) 'pts' 'REND-30 - SHAPED-3D, app' '' @($r30, $s3) }
 if ($r60 -ne $null -and $r30 -ne $null) { Add-Comp 'render_slope_30to60' ((AppTotal $r60) - (AppTotal $r30)) ($r60.spread + $r30.spread) 'pts' 'REND-60 - REND-30, app' '' @($r60, $r30) }
 $rpArm = $rp; $rpBase = $s322
@@ -138,12 +138,12 @@ if ($rpArm -ne $null -and $rpBase -ne $null) {
         Add-Comp 'ms_per_repaint' (10.0 * ($rpArm.app_dwm - $rpBase.app_dwm) / $rpArm.repaints) (10.0 * ($rpArm.spread + $rpBase.spread) / $rpArm.repaints) 'ms' 'repaint_tax / repaint rate' '' @($rpArm, $rpBase)
     }
 }
-if ($s322 -ne $null -and $s3 -ne $null) { Add-Comp 'present_cap_saving' ($s322.app_dwm - $s3.app_dwm) ($s322.spread + $s3.spread) 'pts' 'SHAPED-3D-22 - SHAPED-3D, app+dwm' 'negative = the cap saves' @($s322, $s3) }
+if ($s322 -ne $null -and $s3 -ne $null) { Add-Comp 'present_cap_saving' ($s322.app_dwm - $s3.app_dwm) ($s322.spread + $s3.spread) 'pts' 'SHAPED-3D-22 - SHAPED-3D, app+dwm' 'negative = the cap saves; transparent-derived: session-bound' @($s322, $s3) }
 if ($ship -ne $null -and $idle -ne $null) {
     Add-Comp 'our_margin_total' ($ship.total - $idle.total) ($ship.tspread + $idle.tspread) 'pts' 'SHIP total - IDLE-P total' 'what the box pays over idle - closest to a partner KPI' @($ship, $idle)
     Add-Comp 'our_margin_app_dwm' ($ship.app_dwm - $idle.app_dwm) ($ship.spread + $idle.spread) 'pts' 'SHIP - IDLE-P, app+dwm' '' @($ship, $idle)
 }
-if ($shipm -ne $null -and $ship -ne $null) { Add-Comp 'ship_motion_tax' ($shipm.app_dwm - $ship.app_dwm) ($shipm.spread + $ship.spread) 'pts' 'SHIP-M - SHIP, app+dwm' 'the demo-honest delta' @($shipm, $ship) }
+if ($shipm -ne $null -and $ship -ne $null) { Add-Comp 'ship_motion_tax' ($shipm.app_dwm - $ship.app_dwm) ($shipm.spread + $ship.spread) 'pts' 'SHIP-M - SHIP, app+dwm' 'the demo-honest delta; transparent-derived: session-bound' @($shipm, $ship) }
 if ($idlem -ne $null -and $idle -ne $null) { Add-Comp 'idle_motion_floor' ($idlem.total - $idle.total) ($idlem.tspread + $idle.tspread) 'pts' 'IDLE-M - IDLE-P, total' 'control: ~0 expected (not ours)' @($idlem, $idle) }
 
 # --- Identity block ----------------------------------------------------------
@@ -206,7 +206,9 @@ $out += ('| power / elevation | ' + $(if ($caps -and $caps.power.onAc) { 'AC' } 
 $out += ('| background (worst top_other) | ' + $(if ($worstOther -ne '') { $worstOther } else { 'none > 1 pt' }) + ' |')
 $out += ''
 
-$out += '## Derived components (value +/- spread; app+dwm deltas unless stated)'
+$out += '## Derived components (value +/- WITHIN-RUN spread; app+dwm deltas unless stated)'
+$out += ''
+$out += 'Spread here is rep-to-rep PRECISION inside this one run. Reference-box measurement (Arc, 9 runs / 3 sessions): across-session reproducibility is ~2x wider for FLIP/opaque-derived components and ~5-6x wider for transparent-derived ones - single-run bars on transparent components are not reproducibility. FLIP-derived components travel across sessions/boxes; transparent-derived ones are session-bound and need a per-session anchor.'
 $out += ''
 $out += '| component | value | spread | unit | verdict | derivation | note |'
 $out += '|---|---:|---:|---|---|---|---|'
