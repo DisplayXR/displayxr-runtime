@@ -662,6 +662,22 @@ struct d3d11_service_compositor
 	uint32_t pipe_tile_rows;
 	bool pipe_frame_ready;
 
+	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
+	//! content dims and the view count of the last commit that PAINTED it.
+	//!
+	//! A commit can end without painting anything: the zones composite acquires
+	//! its sources all-or-nothing and bails when one is not ready, and a frame
+	//! with no projection and no placed layers never had content dims of its
+	//! own. The atlas is persistent, so those commits deliberately re-show the
+	//! last good composite — but `content_view_w/_h` are re-initialised from
+	//! `sys->view_*` on EVERY commit, so without this the recipe published
+	//! alongside those same pixels reverted to a display-canonical layout
+	//! nothing had ever painted. Held here so the recipe stale-reuses exactly
+	//! when the pixels do. Zero until the first painting commit.
+	uint32_t painted_content_w;
+	uint32_t painted_content_h;
+	uint32_t painted_view_count;
+
 	//! #1017: does this client currently OWN the panel, as decided by the
 	//! render thread's focus pick? Read by the CLIENT_TEXTURE weave on the
 	//! client's own IPC thread, which is why it is atomic. Only the owner
@@ -1513,6 +1529,13 @@ struct d3d11_service_system
 	 */
 	uint64_t split_layout_sig{0};
 	uint64_t split_layout_gen{0};
+	//! #1140: the tile grid the CURRENT generation was stamped with. The grid is
+	//! part of the signature, so every slot of this generation was painted with
+	//! exactly these — which makes it, together with the slot's own content box,
+	//! the whole DP recipe, sourced from the slot rather than from live state
+	//! that may have moved since the slot was filled.
+	uint32_t split_layout_cols{1};
+	uint32_t split_layout_rows{1};
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t split_seq{0};
 
@@ -1555,6 +1578,16 @@ struct d3d11_service_system
 	//! holding a worst-case egress ring (an interactive resize).
 	std::atomic<uint32_t> render_diag_split_out_crop{0};
 	/*! @} */
+
+	//! #1140: commits that PAINTED NOTHING and therefore re-published the
+	//! previous recipe alongside the previous pixels. A steady non-zero rate
+	//! means a client's sources are chronically late (see `zones_skip`), not
+	//! that anything is wrong with the hold itself.
+	std::atomic<uint32_t> render_diag_recipe_hold{0};
+	//! #1140: zones composites that bailed on the all-or-nothing source acquire
+	//! (a keyed-mutex timeout, or a client fence not yet complete). The tile
+	//! keeps last frame's composite; the dominant cause of `recipe_hold`.
+	std::atomic<uint32_t> render_diag_zones_skip{0};
 };
 
 /*!
@@ -7976,11 +8009,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		uint32_t sr = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
 		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
 		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
+		uint32_t rh = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
+		uint32_t zk = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
 		U_LOG_W(
 		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
 		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
-		    "atlas_contention=%u presenter=%d window_s=10",
-		    ap, as, ab, fp, fs, rb, sr, ac, pk);
+		    "atlas_contention=%u presenter=%d recipe_hold=%u zones_skip=%u window_s=10",
+		    ap, as, ab, fp, fs, rb, sr, ac, pk, rh, zk);
 
 		/*
 		 * #918: the split's own window. `xb_kb` is atlas transport per window,
@@ -10976,6 +11011,15 @@ pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
  *        can be a frame behind (see #918 R2). The DP derives its tile stride
  *        from the atlas width, so weaving a surviving slot at the CURRENT box
  *        would slice every tile at the wrong offset.
+ * @param out_cols,out_rows The tile grid the woven slot was stamped with. The
+ *        grid is part of the generation signature and a slot of a foreign
+ *        generation is refused above, so this is the grid that painted the slot
+ *        — never live `pipe_tile_*` state, which may have moved since. Optional.
+ *
+ * #1140 — SINGLE SOURCE. All four DP-recipe terms (view w/h, cols/rows) leave
+ * this helper together, describing the ONE slot being woven. Mixing a slot's
+ * content box with a live grid, or a live box with a slot's grid, is how a
+ * weave ends up slicing tiles the source never had.
  *
  * @return the egress SRV, or NULL when there is nothing weavable this frame —
  *         in which case the caller must skip the weave AND the present. With
@@ -10989,7 +11033,9 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
                             uint32_t cols,
                             uint32_t rows,
                             uint32_t *io_view_w,
-                            uint32_t *io_view_h)
+                            uint32_t *io_view_h,
+                            uint32_t *out_cols = nullptr,
+                            uint32_t *out_rows = nullptr)
 {
 	if (sys->xbridge == nullptr || crop_tex == nullptr || cols == 0 || rows == 0) {
 		return nullptr;
@@ -11018,6 +11064,8 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	if (sig != sys->split_layout_sig) {
 		sys->split_layout_sig = sig;
 		sys->split_layout_gen++;
+		sys->split_layout_cols = cols;
+		sys->split_layout_rows = rows;
 		U_LOG_W(
 		    "#918: layout generation %llu — slot %d, %ux%u tiles of %ux%u; slots from generation %llu are "
 		    "no longer weavable",
@@ -11097,8 +11145,19 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 
 	// #918 R2: weave the slot at ITS OWN box. Equal to the live one in the
 	// steady state; a frame behind during a resize the ring survived.
-	*io_view_w = slot_w / cols;
-	*io_view_h = slot_h / rows;
+	//
+	// #1140: and at its own GRID. Identical to the caller's by construction (the
+	// slot passed the generation test and the grid is in the signature), but
+	// handed back from the same place as the box so the DP call has ONE source
+	// for the whole recipe instead of two that can drift apart.
+	*io_view_w = slot_w / sys->split_layout_cols;
+	*io_view_h = slot_h / sys->split_layout_rows;
+	if (out_cols != nullptr) {
+		*out_cols = sys->split_layout_cols;
+	}
+	if (out_rows != nullptr) {
+		*out_rows = sys->split_layout_rows;
+	}
 	return srv;
 }
 
@@ -11399,9 +11458,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	 */
 	uint32_t weave_view_w = fc->pipe_content_w;
 	uint32_t weave_view_h = fc->pipe_content_h;
+	// #1140: the grid the DP is handed comes back from the woven slot too, so
+	// all four recipe terms describe the same image (see the helper).
+	uint32_t weave_cols = cols;
+	uint32_t weave_rows = rows;
 	if (sys->split_active) {
-		dp_input_srv =
-		    pipeline_split_bridge_atlas(sys, focused, crop_tex, cols, rows, &weave_view_w, &weave_view_h);
+		dp_input_srv = pipeline_split_bridge_atlas(sys, focused, crop_tex, cols, rows, &weave_view_w,
+		                                           &weave_view_h, &weave_cols, &weave_rows);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -11485,8 +11548,9 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
 		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, weave_view_w,
-		                                          weave_view_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
-		                                          target_w, target_h, 0, 0, 0, 0);
+		                                          weave_view_h, weave_cols, weave_rows,
+		                                          DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0,
+		                                          0);
 	} else if (sys->split_active && dp_input_srv != nullptr) {
 		/*
 		 * #918 — the no-DP fallback UNDER THE SPLIT. The back buffer is on the
@@ -11499,8 +11563,8 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		present_rtv->GetResource(bb.put());
 		dp_input_srv->GetResource(egress.put());
 		if (bb && egress) {
-			uint32_t cw = (cols * weave_view_w) < target_w ? (cols * weave_view_w) : target_w;
-			uint32_t chh = (rows * weave_view_h) < target_h ? (rows * weave_view_h) : target_h;
+			uint32_t cw = (weave_cols * weave_view_w) < target_w ? (weave_cols * weave_view_w) : target_w;
+			uint32_t chh = (weave_rows * weave_view_h) < target_h ? (weave_rows * weave_view_h) : target_h;
 			if (cw > 0 && chh > 0) {
 				D3D11_BOX box = {0, 0, 0, cw, chh, 1};
 				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0,
@@ -14259,13 +14323,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	struct xrt_display_processor_d3d11 *compose_dp = mc->display_processor;
 	uint32_t weave_view_w = dp_view_w;
 	uint32_t weave_view_h = dp_view_h;
+	// #1140: the whole DP recipe comes back from the woven slot (see the helper).
+	uint32_t weave_cols = sys->tile_columns;
+	uint32_t weave_rows = sys->tile_rows;
 	bool split_no_weave = false;
 	if (sys->split_active) {
 		ID3D11Texture2D *split_src = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture)
 		                                 ? mc->crop_texture.get()
 		                                 : mc->combined_atlas.get();
 		dp_input_srv = pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns,
-		                                           sys->tile_rows, &weave_view_w, &weave_view_h);
+		                                           sys->tile_rows, &weave_view_w, &weave_view_h, &weave_cols,
+		                                           &weave_rows);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -14368,7 +14436,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// CURRENT box would slice every tile at the wrong offset.
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
 		xrt_display_processor_d3d11_process_atlas(compose_dp, svc_out_context(sys), dp_input_srv, weave_view_w,
-		                                          weave_view_h, sys->tile_columns, sys->tile_rows,
+		                                          weave_view_h, weave_cols, weave_rows,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h, 0, 0, 0, 0);
 	} else if (sys->split_active && dp_input_srv && mc->back_buffer_rtv) {
 		/*
@@ -14385,8 +14453,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		if (bb && egress) {
 			uint32_t bw = 0, bh = 0;
 			pipeline_rtv_dims(mc->back_buffer_rtv.get(), &bw, &bh);
-			uint32_t cw = (sys->tile_columns * weave_view_w) < bw ? (sys->tile_columns * weave_view_w) : bw;
-			uint32_t chh = (sys->tile_rows * weave_view_h) < bh ? (sys->tile_rows * weave_view_h) : bh;
+			uint32_t cw = (weave_cols * weave_view_w) < bw ? (weave_cols * weave_view_w) : bw;
+			uint32_t chh = (weave_rows * weave_view_h) < bh ? (weave_rows * weave_view_h) : bh;
 			if (cw > 0 && chh > 0) {
 				D3D11_BOX box = {0, 0, 0, cw, chh, 1};
 				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0,
@@ -16906,6 +16974,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	uint32_t content_view_w = sys->view_width;
 	uint32_t content_view_h = sys->view_height;
 
+	// #1140: did anything actually PAINT the atlas this commit? The defaults
+	// above describe the display's canonical view grid — they are a placeholder,
+	// not a measurement, and no pixel in the atlas was ever laid out to them.
+	// Set true by the projection loop and by a zones composite that ran; when it
+	// stays false the atlas still holds the LAST good frame, so the recipe must
+	// be held with it (see the `painted_*` block below).
+	bool content_dims_painted = false;
+
 	// Bridge-relay: read active per-view tile dims pushed by the bridge.
 	// The bridge (as the sample's proxy) owns windowSize × viewScale and
 	// writes DXR_BridgeViewW/H via SetPropW each time the window or mode
@@ -17675,6 +17751,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (content_view_w > slot_w) content_view_w = slot_w;
 			if (content_view_h > slot_h) content_view_h = slot_h;
 		}
+		content_dims_painted = true; // #1140: these dims describe real pixels
 
 		// Track whether the bytes the raw-copy just placed in the atlas are
 		// gamma-encoded (SRGB swapchain) or linear (UNORM swapchain).
@@ -17719,12 +17796,56 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		uint32_t zones_content_w = 0;
 		uint32_t zones_content_h = 0;
 		if (service_composite_zones_frame(sys, c, projection_rendered,
-		                                  &zones_content_w, &zones_content_h) &&
-		    !projection_rendered) {
-			content_view_w = zones_content_w;
-			content_view_h = zones_content_h;
-			service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+		                                  &zones_content_w, &zones_content_h)) {
+			if (!projection_rendered) {
+				content_view_w = zones_content_w;
+				content_view_h = zones_content_h;
+				content_dims_painted = true;
+				service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+			}
+		} else {
+			// All-or-nothing acquire bailed: the tile keeps last frame's
+			// composite. Counted so a chronically late client is visible on
+			// the [RENDER] window rather than only as a held recipe (#1140).
+			sys->render_diag_zones_skip.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+
+	/*
+	 * #1140 — THE RECIPE FOLLOWS THE PIXELS.
+	 *
+	 * Every consumer below this line — the pipeline publish (`pipe_content_*`),
+	 * the legacy standalone crop + DP handoff, the atlas-capture crop — reads
+	 * `content_view_w/_h` as "the layout of what is in this client's atlas". The
+	 * atlas is PERSISTENT: a commit that painted nothing re-shows the last good
+	 * frame by design. But `content_view_w/_h` are re-seeded from `sys->view_*`
+	 * at the top of every commit, so an unpainted commit used to publish a
+	 * display-canonical layout describing pixels that were never laid out that
+	 * way.
+	 *
+	 * Measured (#918 split, opaque `cube_zones_d3d11_win`, one client): the
+	 * zones composite bailed on roughly every other commit, and the published
+	 * recipe alternated 1280x720 (the real zones canvas) with 960x1080
+	 * (`sys->view_*`) at ~50 Hz — one woven-3D frame, one flat frame, on a
+	 * whole-panel 3D lens. That is the blink. The split only exposed it: the
+	 * cross-adapter hop lengthens the client's fence latency, and the recipe
+	 * alternation is the same fiction on the same-device path.
+	 *
+	 * So: publish the recipe of what the atlas HOLDS. A painting commit records
+	 * it; a non-painting commit re-uses the record verbatim, and the recipe
+	 * stale-reuses exactly when the pixels do. Before the first painting commit
+	 * there is nothing to hold and the placeholder stands (the atlas is cleared
+	 * black — no layout is more correct than any other).
+	 */
+	if (content_dims_painted) {
+		c->painted_content_w = content_view_w;
+		c->painted_content_h = content_view_h;
+		c->painted_view_count = eff_view_count;
+	} else if (c->painted_content_w > 0 && c->painted_content_h > 0) {
+		content_view_w = c->painted_content_w;
+		content_view_h = c->painted_content_h;
+		eff_view_count = c->painted_view_count;
+		sys->render_diag_recipe_hold.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	// XR_DXR_display_zones (#551): standalone wish-over-IPC publish — the
