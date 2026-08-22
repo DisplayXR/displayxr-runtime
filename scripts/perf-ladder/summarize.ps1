@@ -96,7 +96,8 @@ $f2 = M 'FLIP-2D'; $f3 = M 'FLIP-3D'; $f322 = M 'FLIP-3D-22'
 $l3 = M 'LIVE-3D'; $s3 = M 'SHAPED-3D'; $s3m = M 'SHAPED-3D-M'
 $r30 = M 'REND-30'; $r60 = M 'REND-60'; $rp = M 'REPAINT'; $s322 = M 'SHAPED-3D-22'
 $ship = M 'SHIP'; $shipm = M 'SHIP-M'; $idle = M 'IDLE-P'; $idlem = M 'IDLE-M'
-$m2d = M 'MODE-2D'; $rpon = M 'REPAINT-ON'   # Phase-A app-repo arm names
+$m2d = M 'MODE-2D'; $rpon = M 'REPAINT-ON'   # app-repo arm names
+$noag = M 'SHIP-NOAGENT'; $p22 = M 'PRESENT-22'  # Phase B (3DLuma quadrant)
 
 # Component deltas difference app+dwm, NOT total: background box load lands in
 # 'other' and cross-arm total differences swing +/-20 points on a busy box.
@@ -128,7 +129,12 @@ if ($s3m -ne $null -and $s3 -ne $null) { Add-Comp 'motion_tax_shaped' ($s3m.app_
 if ($r30 -ne $null -and $s3 -ne $null) { Add-Comp 'render_cost_30hz' ((AppTotal $r30) - (AppTotal $s3)) ($r30.spread + $s3.spread) 'pts' 'REND-30 - SHAPED-3D, app' '' @($r30, $s3) }
 if ($r60 -ne $null -and $r30 -ne $null) { Add-Comp 'render_slope_30to60' ((AppTotal $r60) - (AppTotal $r30)) ($r60.spread + $r30.spread) 'pts' 'REND-60 - REND-30, app' '' @($r60, $r30) }
 $rpArm = $rp; $rpBase = $s322
-if ($rpArm -eq $null) { $rpArm = $rpon; $rpBase = $ship }   # Phase-A names
+if ($rpArm -eq $null) {
+    $rpArm = $rpon
+    # Phase B reparents REPAINT-ON onto the present-capped arm (the quiet-gate
+    # only opens under a cap); fall back to SHIP for legacy Phase-A results.
+    if ($p22 -ne $null) { $rpBase = $p22 } else { $rpBase = $ship }
+}
 if ($rpArm -ne $null -and $rpBase -ne $null) {
     $rpForce = ''
     $note = 'active'
@@ -143,6 +149,13 @@ if ($ship -ne $null -and $idle -ne $null) {
     Add-Comp 'our_margin_total' ($ship.total - $idle.total) ($ship.tspread + $idle.tspread) 'pts' 'SHIP total - IDLE-P total' 'what the box pays over idle - closest to a partner KPI' @($ship, $idle)
     Add-Comp 'our_margin_app_dwm' ($ship.app_dwm - $idle.app_dwm) ($ship.spread + $idle.spread) 'pts' 'SHIP - IDLE-P, app+dwm' '' @($ship, $idle)
 }
+# Phase B quadrant: the agent's cost per variant, GPU and CPU separately -
+# run on BOTH variants, these two rows ARE the CPU-gap attribution.
+if ($noag -ne $null -and $ship -ne $null) {
+    Add-Comp 'agent_cost_gpu' ($ship.app_dwm - $noag.app_dwm) ($ship.spread + $noag.spread) 'pts' 'SHIP - SHIP-NOAGENT, app+dwm' 'the live agent GPU cost' @($ship, $noag)
+    Add-Comp 'agent_cost_cpu' ($ship.app_cpu - $noag.app_cpu) 0 'cpu%' 'SHIP - SHIP-NOAGENT, app CPU' 'the live agent CPU cost (no spread propagated for CPU)' @($ship, $noag)
+}
+if ($p22 -ne $null -and $ship -ne $null) { Add-Comp 'present_cap_saving' ($p22.app_dwm - $ship.app_dwm) ($p22.spread + $ship.spread) 'pts' 'PRESENT-22 - SHIP, app+dwm' 'negative = the cap saves; transparent-derived: session-bound' @($p22, $ship) }
 if ($shipm -ne $null -and $ship -ne $null) { Add-Comp 'ship_motion_tax' ($shipm.app_dwm - $ship.app_dwm) ($shipm.spread + $ship.spread) 'pts' 'SHIP-M - SHIP, app+dwm' 'the demo-honest delta; transparent-derived: session-bound' @($shipm, $ship) }
 if ($idlem -ne $null -and $idle -ne $null) { Add-Comp 'idle_motion_floor' ($idlem.total - $idle.total) ($idlem.tspread + $idle.tspread) 'pts' 'IDLE-M - IDLE-P, total' 'control: ~0 expected (not ours)' @($idlem, $idle) }
 
