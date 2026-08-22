@@ -73,7 +73,13 @@ RULES = {
     "INV-11.6": "(Android) Opaque sRGB non-HDR buffers — no wide-gamut/HDR dataspace (setBuffersDataSpace, DATASPACE_BT2020, wide color gamut).",
     "INV-11.7": "(Android) No translucent app UI over the SurfaceView region — it alpha-blends over the woven, per-subpixel-interlaced pixels.",
     "INV-11.8": "(Android) Declare a full configChanges set so a relayout doesn't recreate the activity (and the OpenXR session) mid-session.",
+    "INV-11.9": "(Android) Declare a <queries> block for the vendor display services (neutral intent action, or the documented package names) — package visibility is per calling uid, so an in-process app that omits it aborts in the vendor loader.",
 }
+
+# INV-11.9: the vendor-neutral action a <queries><intent> should target (R1 / L7).
+NEUTRAL_VENDOR_ACTION = "org.displayxr.action.VENDOR_DISPLAY_SERVICE"
+# Packages in these namespaces are the runtime/loader, not a vendor display service.
+NON_VENDOR_PKG_PREFIXES = ("org.khronos.", "org.freedesktop.monado.", "org.displayxr.")
 
 # Manifest `id` / XrMCPAppInfoDXR appId slug (manifest spec §3.4).
 APP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -553,6 +559,39 @@ def check_android_manifest(mpath: Path, root: Path, findings: list) -> None:
             f"{SANDBOX_PROPERTY} is {prop_val!r}, not \"false\".",
             "Set android:value=\"false\" — \"true\" opts INTO window-relative "
             "getLocationOnScreen(), which breaks the weave phase anchor."))
+
+    # --- INV-11.9: per-uid package visibility for the vendor display services ---
+    # Visibility is enforced per CALLING uid; with the runtime in-process the vendor
+    # plug-in calls getPackageInfo() from THIS app's uid. Either form satisfies it:
+    # the neutral action (preferred) or literal <package> names.
+    queries = manifest.find("queries")
+    has_neutral = False
+    has_vendor_pkg = False
+    if queries is not None:
+        for act in queries.iter("action"):
+            if _attr(act, "name") == NEUTRAL_VENDOR_ACTION:
+                has_neutral = True
+        for pkg in queries.iter("package"):
+            nm = _attr(pkg, "name") or ""
+            # The runtime/loader packages are a different concern (finding the
+            # runtime at all); only a package outside those namespaces can be a
+            # vendor display service.
+            if nm and not nm.startswith(NON_VENDOR_PKG_PREFIXES):
+                has_vendor_pkg = True
+    if not has_neutral and not has_vendor_pkg:
+        findings.append(Finding(
+            INFO, "INV-11.9", rp, 1,
+            "<queries> names neither the vendor-neutral display-service action nor any vendor "
+            "package — Android 11+ enforces package visibility per CALLING uid, and "
+            "an in-process runtime makes the vendor display-processor plug-in call "
+            "PackageManager.getPackageInfo() from THIS app's uid. The runtime APK declaring the "
+            "packages does not help; visibility does not inherit.",
+            "Add to <queries> either <intent><action android:name=\""
+            + NEUTRAL_VENDOR_ACTION +
+            "\"/></intent> (preferred), or the vendor display-configuration + head-tracking "
+            "package names the vendor documents. Without it the process aborts ~150 ms after "
+            "plug-in load with a CheckJNI 'java_object == null' in GetObjectClass "
+            "(INV-11.9; L7 / ADR-036 D5)."))
 
     # --- INV-11.7: a translucent window theme blends over the weave ---
     for el, what in [(app, "<application>")] + [(a, "<activity>") for a in app.iter("activity")]:

@@ -778,6 +778,32 @@ macOS app (no manifest → no Android findings).
   what the PoC-0 side-by-side runs needed (#1032/#1053). Ref:
   `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml`. **Warning** in the linter.
 
+- **INV-11.9 [app] — Declare a `<queries>` block so the vendor display services are visible to
+  YOUR uid.** Android 11+ enforces package visibility **per calling uid**, and when the runtime
+  runs in-process the vendor display-processor plug-in calls
+  `PackageManager.getPackageInfo()` on the vendor services from *your* process. The runtime APK
+  declaring them does not help — visibility does not inherit. Declare either the neutral action
+  (preferred; needs no vendor package names) or, on a platform that hasn't adopted it, the two
+  literal packages the vendor documents:
+
+  ```xml
+  <queries>
+    <intent><action android:name="org.displayxr.action.VENDOR_DISPLAY_SERVICE"/></intent>
+    <!-- fallback while the platform lacks the neutral action: -->
+    <package android:name="<vendor display-configuration service package>"/>
+    <package android:name="<vendor head-tracking service package>"/>
+  </queries>
+  ```
+
+  Miss it and the process **aborts ~150 ms after the plug-in loads**, inside closed vendor code,
+  with a CheckJNI `java_object == null` in `GetObjectClass` and no package or manifest named
+  anywhere in the stack. Out-of-process (satellite) apps are unaffected. Three demos shipped this
+  bug (modelviewer#97, mediaplayer#49, earthview#42). Platform-side requirement + acceptance test:
+  [`docs/specs/vendor/oem-android-platform-requirements.md` §R1](../specs/vendor/oem-android-platform-requirements.md#r1--vendor-display-services-must-be-discoverable-by-a-neutral-intent-action)
+  (L7 / ADR-036 D5). Ref:
+  `test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml` (declares both vendor
+  packages today, alongside the Khronos-loader entries). **Info** in the linter.
+
 ---
 
 ## 12. Quick checklist (paste into a PR description)
@@ -802,6 +828,7 @@ macOS app (no manifest → no Android findings).
 - [ ] (Android, present-owner) swapchain `imageExtent == currentExtent` on every recreate; buffer transform hint honoured / preTransform pinned IDENTITY (INV-11.3/11.5)
 - [ ] (Android) plain sRGB non-HDR surface — no wide-gamut dataspace / `setBuffersDataSpace` (INV-11.6); no translucent UI over the SurfaceView (INV-11.7)
 - [ ] (Android) `PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS=false` (INV-1.4) + full `configChanges` (INV-11.8)
+- [ ] (Android) `<queries>` declares the vendor display services — neutral action, or the documented package names (INV-11.9)
 
 ---
 
