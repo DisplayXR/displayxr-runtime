@@ -44,6 +44,7 @@
 // #918 Phase 2b: the cross-adapter atlas transport, shared with the in-process
 // compositor (PR 1/6 made it a standalone static lib for exactly this).
 #include "comp_xbridge.h"
+#include "comp_split_gate.h"
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
@@ -1787,14 +1788,15 @@ svc_split_share_source(struct d3d11_service_system *sys, ID3D11Texture2D *tex, v
  * every frame — which is the A/B control the perf claim is measured against and
  * the one-line escape if adaptive ever misbehaves in the field.
  *
+ * @param policy The gate's parse of `DXR_SPLIT_INGRESS`.
+ *
  * Returns false only when the STAGING RING itself could not be allocated: the
  * bridge is then inoperative under either policy and the split must not activate.
  */
 static bool
-svc_split_select_ingress(struct comp_xbridge *xb)
+svc_split_select_ingress(struct comp_xbridge *xb, enum comp_split_ingress_policy policy)
 {
-	const char *e = getenv("DXR_SPLIT_INGRESS");
-	if (e != nullptr && strcmp(e, "staged") == 0) {
+	if (policy == COMP_SPLIT_INGRESS_POLICY_STAGED) {
 		U_LOG_W("#918: DXR_SPLIT_INGRESS=staged — pinning the staged ingress ring (A/B control)");
 		return comp_xbridge_force_staged_ingress(xb);
 	}
@@ -1855,32 +1857,14 @@ svc_assert_same_device(ID3D11View *resource, ID3D11Device *expected_dev)
  */
 #define DXR_SPLIT_DEV_REBIND_DWELL_NS (1000LL * 1000000LL)
 
-//! #918: `DXR_WEAVE_ON_SCANOUT=1` asks for the output-device split. Default OFF
-//! for a release cycle (supervisor ruling); Phase 3 owns default-on.
-static bool
-dxr_weave_on_scanout_enabled()
+//! Fill the gate's `<windows.h>`-free LUID mirror.
+static inline struct comp_split_luid
+svc_split_luid(LUID l)
 {
-	static int enabled = -1;
-	if (enabled < 0) {
-		const char *e = getenv("DXR_WEAVE_ON_SCANOUT");
-		enabled =
-		    (e != nullptr && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) ? 1 : 0;
-	}
-	return enabled == 1;
-}
-
-//! #918: testability hook for the fallback matrix — forces Stage A to fail at
-//! the point the bridge would be created, so the "one WARN, stock path" degrade
-//! can be exercised without a machine that genuinely cannot allocate the heap.
-static bool
-dxr_test_split_fail_stage_a()
-{
-	static int on = -1;
-	if (on < 0) {
-		const char *e = getenv("DXR_TEST_SPLIT_FAIL_STAGEA");
-		on = (e != nullptr && e[0] == '1') ? 1 : 0;
-	}
-	return on == 1;
+	struct comp_split_luid out = {};
+	out.low = l.LowPart;
+	out.high = l.HighPart;
+	return out;
 }
 
 /*!
@@ -1933,40 +1917,44 @@ service_split_stage_a(struct d3d11_service_system *sys,
 	const int32_t panel_left = sys->base.info.display_screen_left;
 	const int32_t panel_top = sys->base.info.display_screen_top;
 
-	if (dxr_weave_on_scanout_enabled()) {
+	if (comp_split_gate_env_requested()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
 		double stage_a_bridge_ms = 0.0;
-		const char *reason = nullptr;
 
+		struct comp_split_gate_inputs gin = {};
+		gin.requested = true;
 		if (dxr_legacy_standalone_enabled()) {
 			// D-7: the legacy path is a byte-for-byte reproduction of the
 			// pre-#964 behaviour for the motion-to-photon A/B. Splitting it
 			// would defeat the only reason it still exists.
-			reason = "DXR_LEGACY_STANDALONE";
+			gin.ineligible_reason = "DXR_LEGACY_STANDALONE";
 		} else if (panel_w == 0 || panel_h == 0) {
-			reason = "no panel dimensions";
+			gin.ineligible_reason = "no panel dimensions";
 		}
 
 		wil::com_ptr<IDXGIAdapter> scanout;
 		DXGI_ADAPTER_DESC sdesc{};
-		if (reason == nullptr) {
+		if (gin.ineligible_reason == nullptr) {
 			scanout = xrt::auxiliary::d3d::getScanoutAdapter(panel_left, panel_top, panel_w, panel_h,
 			                                                 U_LOGGING_INFO);
-			if (!scanout || FAILED(scanout->GetDesc(&sdesc))) {
-				reason = "scanout unresolvable";
-			} else if (sdesc.AdapterLuid.LowPart == app_luid.LowPart &&
-			           sdesc.AdapterLuid.HighPart == app_luid.HighPart) {
-				// Not a failure: on a MUX'd / single-GPU box — or under
-				// DXR_D3D_FORCE_GPU=scanout — the weave is already local, so
-				// the split has nothing to do. One INFO-shaped line, no
-				// fallback WARN.
-				U_LOG_W(
-				    "#918 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
-				    "service's adapter — split is a no-op",
-				    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-				    (unsigned long)sdesc.AdapterLuid.LowPart);
-				reason = ""; // handled; suppress the fallback WARN
-			}
+			gin.scanout_resolved = scanout && SUCCEEDED(scanout->GetDesc(&sdesc));
+			gin.render_luid = svc_split_luid(app_luid);
+			gin.scanout_luid = svc_split_luid(sdesc.AdapterLuid);
+		}
+
+		struct comp_split_gate_result gate = {};
+		comp_split_gate_evaluate(&gin, &gate);
+		const char *reason = gate.reason;
+		if (gate.same_adapter) {
+			// Not a failure: on a MUX'd / single-GPU box — or under
+			// DXR_D3D_FORCE_GPU=scanout — the weave is already local, so
+			// the split has nothing to do. One INFO-shaped line, no
+			// fallback WARN.
+			U_LOG_W(
+			    "#918 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
+			    "service's adapter — split is a no-op",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
 		}
 
 		// Runtime-owned D3D11 device on the scanout adapter.
@@ -2048,12 +2036,12 @@ service_split_stage_a(struct d3d11_service_system *sys,
 
 			const char *xb_reason = nullptr;
 			const uint64_t xb_t0 = os_monotonic_get_ns();
-			if (dxr_test_split_fail_stage_a()) {
+			if (comp_split_gate_env_test_fail_stage_a()) {
 				reason = "DXR_TEST_SPLIT_FAIL_STAGEA";
 			} else if (comp_xbridge_create(&xbi, &sys->xbridge, &xb_reason) != XRT_SUCCESS) {
 				sys->xbridge = nullptr;
 				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
-			} else if (!svc_split_select_ingress(sys->xbridge)) {
+			} else if (!svc_split_select_ingress(sys->xbridge, gate.ingress)) {
 				reason = "staged ingress ring unavailable";
 			} else if (!comp_xbridge_alloc_worstcase_egress(sys->xbridge)) {
 				/*
@@ -2072,7 +2060,8 @@ service_split_stage_a(struct d3d11_service_system *sys,
 		if (reason == nullptr) {
 			sys->split_available = true;
 			sys->split_active = true;
-			sys->out_luid = sdesc.AdapterLuid;
+			sys->out_luid.LowPart = gate.out_adapter_luid.low;
+			sys->out_luid.HighPart = gate.out_adapter_luid.high;
 			sys->split_panel_w = panel_w;
 			sys->split_panel_h = panel_h;
 			U_LOG_W(

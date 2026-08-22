@@ -16,6 +16,7 @@
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
 #include "comp_xbridge.h"
+#include "comp_split_gate.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -672,6 +673,16 @@ static inline ID3D11DeviceContext *
 d3d11_out_context(struct comp_d3d11_compositor *c)
 {
 	return c->split_active ? c->out_ctx : c->context;
+}
+
+//! Fill the split gate's `<windows.h>`-free LUID mirror.
+static inline struct comp_split_luid
+d3d11_split_luid(LUID l)
+{
+	struct comp_split_luid out = {};
+	out.low = l.LowPart;
+	out.high = l.HighPart;
+	return out;
 }
 
 /*
@@ -3881,19 +3892,32 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	if (debug_get_bool_option_weave_on_scanout()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
 		double stage_a_bridge_ms = 0.0;
-		const char *reason = nullptr;
+
+		/*
+		 * The gate's inputs are gathered in the ORIGINAL order and nothing is
+		 * resolved past the first refusal — an ineligible session must not go
+		 * near getScanoutAdapter, and a session whose own adapter would not
+		 * resolve has nothing to compare a scanout adapter against.
+		 *
+		 * `requested` is passed in rather than read from the gate's own
+		 * DXR_WEAVE_ON_SCANOUT helper: this site reads that variable through
+		 * DEBUG_GET_ONCE_BOOL_OPTION, whose parse differs, and unifying the two
+		 * is a behaviour change (see comp_split_gate.h).
+		 */
+		struct comp_split_gate_inputs gin = {};
+		gin.requested = true;
 
 		if (c->hwnd == nullptr) {
-			reason = "no HWND";
+			gin.ineligible_reason = "no HWND";
 		} else if (c->has_shared_texture) {
-			reason = "shared-texture session";
+			gin.ineligible_reason = "shared-texture session";
 		}
 
 		// The app device's adapter — the LUID the scanout adapter is compared
 		// against, and the producer side of the bridge.
 		IDXGIAdapter *app_adapter = nullptr;
 		LUID app_luid = {};
-		if (reason == nullptr) {
+		if (gin.ineligible_reason == nullptr) {
 			IDXGIDevice *dd = nullptr;
 			if (SUCCEEDED(c->device->QueryInterface(__uuidof(IDXGIDevice),
 			                                        reinterpret_cast<void **>(&dd))) &&
@@ -3903,7 +3927,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			}
 			DXGI_ADAPTER_DESC ad{};
 			if (app_adapter == nullptr || FAILED(app_adapter->GetDesc(&ad))) {
-				reason = "scanout unresolvable";
+				gin.ineligible_reason = COMP_SPLIT_REASON_SCANOUT_UNRESOLVABLE;
 			} else {
 				app_luid = ad.AdapterLuid;
 			}
@@ -3911,23 +3935,27 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 		wil::com_ptr<IDXGIAdapter> scanout;
 		DXGI_ADAPTER_DESC sdesc{};
-		if (reason == nullptr) {
+		if (gin.ineligible_reason == nullptr) {
 			scanout = xrt::auxiliary::d3d::getScanoutAdapter(
 			    display_screen_left, display_screen_top, xdev->hmd->screens[0].w_pixels,
 			    xdev->hmd->screens[0].h_pixels, U_LOGGING_INFO);
-			if (!scanout || FAILED(scanout->GetDesc(&sdesc))) {
-				reason = "scanout unresolvable";
-			} else if (sdesc.AdapterLuid.LowPart == app_luid.LowPart &&
-			           sdesc.AdapterLuid.HighPart == app_luid.HighPart) {
-				// Not a failure: on a MUX'd / single-GPU box the weave is
-				// already local, so the split has nothing to do. One INFO,
-				// no WARN.
-				U_LOG_W("D3D11 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
-				        "app's adapter — split is a no-op (#918)",
-				        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-				        (unsigned long)sdesc.AdapterLuid.LowPart);
-				reason = ""; // handled; suppress the fallback WARN
-			}
+			gin.scanout_resolved = scanout && SUCCEEDED(scanout->GetDesc(&sdesc));
+			gin.render_luid = d3d11_split_luid(app_luid);
+			gin.scanout_luid = d3d11_split_luid(sdesc.AdapterLuid);
+		}
+
+		struct comp_split_gate_result gate = {};
+		comp_split_gate_evaluate(&gin, &gate);
+		const char *reason = gate.reason;
+		if (gate.same_adapter) {
+			// Not a failure: on a MUX'd / single-GPU box the weave is
+			// already local, so the split has nothing to do. One INFO,
+			// no WARN.
+			U_LOG_W(
+			    "D3D11 output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the "
+			    "app's adapter — split is a no-op (#918)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
 		}
 
 		// Runtime-owned D3D11 device on the scanout adapter.
@@ -4052,7 +4080,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 		if (reason == nullptr) {
 			c->split_active = true;
-			c->out_luid = sdesc.AdapterLuid;
+			c->out_luid.LowPart = gate.out_adapter_luid.low;
+			c->out_luid.HighPart = gate.out_adapter_luid.high;
 			c->split_panel_w = xdev->hmd->screens[0].w_pixels;
 			c->split_panel_h = xdev->hmd->screens[0].h_pixels;
 			{

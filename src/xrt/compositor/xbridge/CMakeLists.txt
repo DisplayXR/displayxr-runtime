@@ -19,6 +19,8 @@
 if(WIN32 AND XRT_HAVE_D3D11)
 	add_library(
 		comp_xbridge STATIC
+		comp_split_gate.c
+		comp_split_gate.h
 		comp_xbridge.cpp
 		comp_xbridge.h
 		comp_xbridge_plane_policy.h
