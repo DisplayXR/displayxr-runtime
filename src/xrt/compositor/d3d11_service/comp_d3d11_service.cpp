@@ -15700,9 +15700,9 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	// #918 PR 5: the DP's own context and its own device — never the output
 	// half's. Handing a vendor a cross-device SRV is silent, not an error.
 	svc_assert_same_device(srv, mask_dev);
-	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    dp, svc_context_for_device(sys, mask_dev), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
-	    c->zone_publish_seq);
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, svc_context_for_device(sys, mask_dev), srv,
+	                                                              mask_w, mask_h, (int32_t)origin.x,
+	                                                              (int32_t)origin.y, w, h, c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
 			// #1017: this said "per-client DP", which does not exist on the
