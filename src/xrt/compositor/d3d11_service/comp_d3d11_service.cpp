@@ -450,6 +450,14 @@ struct d3d11_client_render_resources
 	//! string, so it is stored rather than rebuilt.
 	char weave_lat_site[24];
 
+	/*!
+	 * #918 PR 6 — this client's presenter chain and its RTV were created on the
+	 * OUTPUT device, so this client is one of the reasons that device may not be
+	 * released yet. Counted into `g_out_device_clients`; see the shutdown-order
+	 * check in `system_destroy`.
+	 */
+	bool holds_out_device;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -1700,6 +1708,38 @@ svc_out_factory(struct d3d11_service_system *sys)
  * alive) and bridging stale pixels with nothing able to tell.
  */
 static std::atomic<uint64_t> g_svc_ingress_key{1};
+
+/*!
+ * #918 PR 6 — how many clients currently hold OUTPUT-DEVICE resources (a
+ * presenter swap chain and its RTV, created on `sys->out_dev`).
+ *
+ * The output device must outlive every one of them. It does, by COM: an RTV
+ * holds its device alive, so releasing `sys->out_dev` while a client still has
+ * one is a refcount drop, not a dangling pointer. What the counter buys is the
+ * DIAGNOSTIC — a non-zero value at `system_destroy` means the IPC layer tore the
+ * system down before the clients, and the next thing that happens is a client's
+ * IPC thread touching a chain whose factory and adapter are already gone. That
+ * is a shutdown-ordering bug, and it is silent without this.
+ *
+ * File-scope because there is exactly one service system per process and
+ * `fini_client_render_resources` has 13 call sites and no `sys`.
+ */
+static std::atomic<int32_t> g_out_device_clients{0};
+
+//! Record that @p res's presenter chain lives on the output device (or no longer
+//! does). Idempotent — the rebuild path re-creates a chain that was already
+//! counted.
+static void
+svc_note_out_device_chain(struct d3d11_service_system *sys, struct d3d11_client_render_resources *res, bool holds)
+{
+	const bool real = holds && sys != nullptr && sys->split_active && sys->out_dev != nullptr &&
+	                  res->chain_device == sys->out_dev;
+	if (real == res->holds_out_device) {
+		return;
+	}
+	res->holds_out_device = real;
+	g_out_device_clients.fetch_add(real ? 1 : -1, std::memory_order_relaxed);
+}
 
 //! Extra `MiscFlags` a would-be ingress source needs. Strictly conditional on
 //! the split: a non-split session allocates exactly what it always did.
@@ -3467,22 +3507,41 @@ d3d11_hr_is_device_lost(HRESULT hr)
  * whole detect -> stop-driving-the-DP -> exit-for-relaunch path can be walked.
  * Guarded exactly like DXR_TEST_EXIT_ON_DISCONNECT: opt-in env, one shot.
  */
+//! @ref dxr_test_fake_device_removed arms.
+#define DXR_FAKE_DR_PRESENT 1
+#define DXR_FAKE_DR_OUT_CREATE 2
+
 static HRESULT
-dxr_test_fake_device_removed(HRESULT hr)
+dxr_test_fake_device_removed(HRESULT hr, int arm = DXR_FAKE_DR_PRESENT)
 {
-	static int enabled = -1;
-	if (enabled < 0) {
+	static int want = -1;
+	if (want < 0) {
 		const char *e = getenv("DXR_TEST_FAKE_DEVICE_REMOVED");
-		enabled = (e != nullptr && e[0] == '1') ? 1 : 0;
+		want = (e != nullptr && e[0] >= '1' && e[0] <= '2') ? (e[0] - '0') : 0;
 	}
-	if (enabled != 1 || FAILED(hr)) {
+	if (want != arm || FAILED(hr)) {
 		return hr;
 	}
 	static std::atomic_flag fired = ATOMIC_FLAG_INIT;
 	if (fired.test_and_set()) {
 		return hr;
 	}
-	U_LOG_W("DXR_TEST_FAKE_DEVICE_REMOVED=1: injecting DXGI_ERROR_DEVICE_REMOVED on this present (test)");
+	/*
+	 * #918 PR 6 — the two arms, and which half of the split each walks.
+	 *
+	 * `=1` (default) fires at the first successful PRESENT. Under the split the
+	 * pipeline's presents are already the OUTPUT device's — the presenter chains
+	 * moved there in PR 3/4 — so this arm exercises the out-device present path
+	 * as it stands, with no extra plumbing.
+	 *
+	 * `=2` fires at the first out-device BACK-BUFFER RTV REFRESH instead
+	 * (`svc_out_chain_refresh_rtv`). A real scanout-adapter TDR does not
+	 * politely wait for a present: a chain rebuild or a resize reaches a create
+	 * first, and until PR 6 every one of those HRESULTs was dropped. This arm is
+	 * how that half is walked.
+	 */
+	U_LOG_W("DXR_TEST_FAKE_DEVICE_REMOVED=%d: injecting DXGI_ERROR_DEVICE_REMOVED on this %s (test)", arm,
+	        arm == DXR_FAKE_DR_OUT_CREATE ? "output-device back-buffer RTV refresh" : "present");
 	return DXGI_ERROR_DEVICE_REMOVED;
 }
 
@@ -3535,6 +3594,54 @@ service_note_device_lost(struct d3d11_service_system *sys, HRESULT hr, const cha
 		    "[DEVICE_REMOVED] hr=0x%08lX reason=0x%08lX device=%s site=%s — the display processor will "
 		    "not be touched again; the service will exit for relaunch",
 		    (unsigned long)hr, (unsigned long)reason, which, site != nullptr ? site : "?");
+	}
+	return true;
+}
+
+/*!
+ * #918 PR 6 / #1002 — refresh a presenter chain's back-buffer RTV, with BOTH
+ * HRESULTs routed into the orderly exit.
+ *
+ * Every one of these sites used to drop its HRESULT. That was survivable while
+ * the only device in the process was the one whose `Present` already reported
+ * removal — but the split gives the output half its OWN device, and a scanout
+ * TDR surfaces here (`GetBuffer` / `CreateRenderTargetView` on a dead device)
+ * exactly as often as it surfaces at a present, and sometimes first: a resize
+ * or a chain rebuild reaches this code without presenting at all. A dropped
+ * DEVICE_REMOVED here leaves a NULL RTV and the render thread quietly weaving
+ * nothing forever, which is the failure mode #1002 exists to convert into a
+ * relaunch.
+ *
+ * @param dev The device that owns @p chain — NOT necessarily the output device
+ *        (a CLIENT_TEXTURE target and every legacy per-client chain stay on the
+ *        app device even while the split is engaged).
+ */
+static bool
+svc_out_chain_refresh_rtv(struct d3d11_service_system *sys,
+                          IDXGISwapChain1 *chain,
+                          ID3D11Device *dev,
+                          wil::com_ptr<ID3D11RenderTargetView> &out_rtv,
+                          const char *site)
+{
+	if (chain == nullptr || dev == nullptr) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Texture2D> bb;
+	HRESULT hr = chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+	if (SUCCEEDED(hr)) {
+		hr = dev->CreateRenderTargetView(bb.get(), nullptr, out_rtv.put());
+	}
+	// #1002 dev-only: DXR_TEST_FAKE_DEVICE_REMOVED=2 walks the CREATE half of
+	// the fault chain, which no present-site injection can reach.
+	if (sys != nullptr && dev == sys->out_dev) {
+		hr = dxr_test_fake_device_removed(hr, DXR_FAKE_DR_OUT_CREATE);
+	}
+	if (FAILED(hr)) {
+		out_rtv.reset();
+		if (!service_note_device_lost(sys, hr, site)) {
+			U_LOG_E("[pipeline] %s: back-buffer RTV refresh failed (0x%08lx)", site, (unsigned long)hr);
+		}
+		return false;
 	}
 	return true;
 }
@@ -5258,6 +5365,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->crop_texture.reset();
 	res->crop_width = 0;
 	res->crop_height = 0;
+	// #918 PR 6: this client is releasing its output-device presenter chain.
+	if (res->holds_out_device) {
+		res->holds_out_device = false;
+		g_out_device_clients.fetch_sub(1, std::memory_order_relaxed);
+	}
 	// #918 PR 6: close this client's per-chain weave-latency CSV, if one was
 	// opened. Its chain is going away with it.
 	res->weave_lat.close();
@@ -5664,15 +5776,14 @@ init_client_render_resources(struct d3d11_service_system *sys,
 						res->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 					}
 				}
-				wil::com_ptr<ID3D11Texture2D> bb;
-				res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
-				                                            res->back_buffer_rtv.put());
+				svc_out_chain_refresh_rtv(sys, res->swap_chain.get(), svc_out_device(sys),
+				                          res->back_buffer_rtv, "app_hwnd_chain_create"); // #1002
 				svc_assert_same_device(res->back_buffer_rtv.get(), svc_out_device(sys));
 				// #918: record WHICH device, so the wrong-device tripwires can
 				// tell (a chain's device cannot be changed — not even by
 				// ResizeBuffers, so the answer is always "recreate").
 				res->chain_device = svc_out_device(sys);
+				svc_note_out_device_chain(sys, res, true); // #918 PR 6
 				if (res->frame_latency_waitable != nullptr) {
 					U_LOG_W(
 					    "[pipeline] presenter=APP_HWND hwnd=%p %ux%u (waitable, max "
@@ -6134,11 +6245,12 @@ init_client_render_resources(struct d3d11_service_system *sys,
 							res->swap_chain->GetDesc1(&res_desc);
 							HRESULT rhr = res->swap_chain->ResizeBuffers(
 							    0, dp_px_w, dp_px_h, DXGI_FORMAT_UNKNOWN, res_desc.Flags);
+							(void)service_note_device_lost(sys, rhr,
+							                               "legacy_chain_resize"); // #1002
 							if (SUCCEEDED(rhr)) {
-								wil::com_ptr<ID3D11Texture2D> bb;
-								res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-								sys->device->CreateRenderTargetView(
-								    bb.get(), nullptr, res->back_buffer_rtv.put());
+								svc_out_chain_refresh_rtv(
+								    sys, res->swap_chain.get(), sys->device.get(),
+								    res->back_buffer_rtv, "legacy_chain_resize");
 								U_LOG_W("Swap chain resized to %ux%u to match display",
 								        dp_px_w, dp_px_h);
 							}
@@ -8858,9 +8970,10 @@ multi_compositor_create_service_chain(struct d3d11_service_system *sys,
 		}
 	}
 
-	wil::com_ptr<ID3D11Texture2D> bb;
-	mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-	svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+	if (!svc_out_chain_refresh_rtv(sys, mc->swap_chain.get(), svc_out_device(sys), mc->back_buffer_rtv,
+	                               "service_window_chain_create")) { // #1002
+		return E_FAIL;
+	}
 	svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 	return S_OK;
 }
@@ -11184,6 +11297,9 @@ pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
 			                                                   sys->split_out_crop_srv.put());
 		}
 		if (FAILED(hr)) {
+			// #1002: an OUT-DEVICE create, on the frame path. A scanout TDR
+			// shows up here as a failing create long before anything presents.
+			(void)service_note_device_lost(sys, hr, "split_out_crop_staging");
 			sys->split_out_crop_srv.reset();
 			sys->split_out_crop_tex.reset();
 			U_LOG_W("#918: output-device crop texture %ux%u failed (0x%08lx) — holding the last good frame",
@@ -12642,11 +12758,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// mismatch (#848; this chain is waitable under late-weave).
 				HRESULT hr = mc->swap_chain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, sc_desc.Flags);
 				if (SUCCEEDED(hr)) {
-					wil::com_ptr<ID3D11Texture2D> bb;
-					mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
-					svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
-					                                            mc->back_buffer_rtv.put());
+					svc_out_chain_refresh_rtv(sys, mc->swap_chain.get(), svc_out_device(sys),
+					                          mc->back_buffer_rtv,
+					                          "service_window_resize"); // #1002
 					svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
+				} else {
+					(void)service_note_device_lost(sys, hr,
+					                               "service_window_resize/ResizeBuffers"); // #1002
 				}
 			}
 		}
@@ -16643,12 +16761,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 							    nsc2->GetFrameLatencyWaitableObject();
 						}
 					}
-					wil::com_ptr<ID3D11Texture2D> nbb;
-					c->render.swap_chain->GetBuffer(0, IID_PPV_ARGS(nbb.put()));
-					svc_out_device(sys)->CreateRenderTargetView(nbb.get(), nullptr,
-					                                            c->render.back_buffer_rtv.put());
+					svc_out_chain_refresh_rtv(sys, c->render.swap_chain.get(), svc_out_device(sys),
+					                          c->render.back_buffer_rtv,
+					                          "app_hwnd_chain_rebuild"); // #1002
 					svc_assert_same_device(c->render.back_buffer_rtv.get(), svc_out_device(sys));
 					c->render.chain_device = svc_out_device(sys);
+					svc_note_out_device_chain(sys, &c->render, true); // #918 PR 6
 					c->render.swap_chain->GetDesc1(&sc_desc);
 				} else {
 					U_LOG_E("[pipeline] app-HWND swap chain rebuild failed (0x%08lx)",
@@ -16680,6 +16798,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				    client_height,
 				    DXGI_FORMAT_UNKNOWN,  // Keep format
 				    sc_desc.Flags);
+				// #1002: a resize is a create, and under the split it can be the
+				// FIRST place a scanout-adapter removal surfaces.
+				(void)service_note_device_lost(sys, hr, "client_chain_resize/ResizeBuffers");
 
 				if (SUCCEEDED(hr)) {
 					// Recreate back buffer RTV.
@@ -16695,10 +16816,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					ID3D11Device *rtv_dev = c->render.chain_device != nullptr
 					                            ? c->render.chain_device
 					                            : static_cast<ID3D11Device *>(sys->device.get());
-					wil::com_ptr<ID3D11Texture2D> back_buffer;
-					c->render.swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
-					rtv_dev->CreateRenderTargetView(back_buffer.get(), nullptr,
-					                                c->render.back_buffer_rtv.put());
+					svc_out_chain_refresh_rtv(sys, c->render.swap_chain.get(), rtv_dev,
+					                          c->render.back_buffer_rtv,
+					                          "client_chain_resize"); // #1002
 					svc_assert_same_device(c->render.back_buffer_rtv.get(), rtv_dev);
 
 					U_LOG_W("Swap chain resized successfully to %ux%u", client_width, client_height);
@@ -21675,6 +21795,31 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->split_out_crop_h = 0;
 	sys->split_active = false;
 	sys->split_available = false;
+	/*
+	 * #918 PR 6 — SHUTDOWN ORDER, with N clients.
+	 *
+	 * The output device must outlive every client's presenter chain and RTV. The
+	 * ordering that makes that true is: bridge quiesced, then
+	 * `multi_compositor_destroy` (which joins the render thread and tears the
+	 * panel DP down), then this. Client resources are freed on each client's own
+	 * `fini_client_render_resources` when it disconnects, which the IPC layer
+	 * does before it destroys the system.
+	 *
+	 * COM makes a violation non-fatal (an RTV holds its device alive, so the
+	 * release below is a refcount drop, not a dangling pointer) — which is
+	 * exactly why it needs saying out loud. A non-zero count here means clients
+	 * outlived the system, and the next thing those clients touch is a chain
+	 * whose factory and adapter have gone.
+	 */
+	{
+		const int32_t held = g_out_device_clients.load(std::memory_order_relaxed);
+		if (held != 0) {
+			U_LOG_E(
+			    "[SHUTDOWN] %d client(s) still hold output-device presenter chains at system destroy — "
+			    "the IPC layer tore the system down before its clients (#918 PR 6)",
+			    (int)held);
+		}
+	}
 	if (sys->out_factory != nullptr) {
 		sys->out_factory->Release();
 		sys->out_factory = nullptr;
