@@ -38,8 +38,11 @@ if(HEAD_CONTENTS MATCHES "ref")
         endif()
     endif()
 else()
-    # detached HEAD
-    configure_file("@GIT_DIR@/HEAD" "@GIT_DATA@/head-ref" COPYONLY)
+    # detached HEAD — use the HEAD copied from HEAD_SOURCE_FILE, which is the
+    # worktree-local HEAD for linked worktrees. @GIT_DIR@/HEAD would be the
+    # parent repo's HEAD ("ref: refs/heads/..."), yielding a bogus hash and a
+    # "-128-NOTFOUND" describe stamp.
+    configure_file("@HEAD_FILE@" "@GIT_DATA@/head-ref" COPYONLY)
 endif()
 
 if(NOT HEAD_HASH)
