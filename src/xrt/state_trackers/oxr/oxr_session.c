@@ -1998,26 +1998,48 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 #endif
 
-		// Legacy apps in 2D mode: override both eye positions to center.
-		// The compositor crops to the left view, so it must be rendered
-		// from center eye (matching the 2D mode's single-view spec).
-		if (have_eye_positions && eye_count >= 2 &&
-		    sess->sys->xsysc != NULL &&
-		    sess->sys->xsysc->info.legacy_app_tile_scaling) {
-			struct xrt_device *head_dev = GET_XDEV_BY_ROLE(sess->sys, head);
-			if (head_dev != NULL && head_dev->hmd != NULL) {
-				uint32_t midx = head_dev->hmd->active_rendering_mode_index;
-				if (midx < head_dev->rendering_mode_count &&
-				    head_dev->rendering_modes[midx].view_count == 1) {
-					struct xrt_eye_position center = {
-					    (adj_eyes[0].x + adj_eyes[1].x) * 0.5f,
-					    (adj_eyes[0].y + adj_eyes[1].y) * 0.5f,
-					    (adj_eyes[0].z + adj_eyes[1].z) * 0.5f,
-					};
-					for (uint32_t ei = 0; ei < eye_count; ei++) {
-						adj_eyes[ei] = center;
-					}
-				}
+		// 2D / mono render input: collapse the eye set to the CENTRE eye.
+		//
+		// A single-view mode has exactly one render eye, and the view fill
+		// below already sets XrView.pose to the CENTROID of the eyes for
+		// active_view_count == 1. The FOV must come from the same eye: it is
+		// taken verbatim from fovs[0] (the Kooima frustum built from
+		// adj_eyes[0]), so leaving the per-eye set in place pairs a centred
+		// pose with the LEFT eye's off-axis frustum — the image then shifts
+		// laterally (modelviewer#100: "2D mode shifts the asset left"; the
+		// shift is tan(frustum skew)/tan(half FOV) of the half width, ~14 %
+		// of the canvas at a 65 mm IPD over a 235 mm panel).
+		//
+		// This is the in-process twin of the collapse the service path has
+		// had since #521/#575 (ipc_server_handler.c: the mono branch of
+		// ipc_try_get_sr_view_poses and the render-input collapse keyed on
+		// ipc_view_rig_info::render_view_count). An app that used to run over
+		// IPC and now runs in-process lost it, which is why the bug surfaced
+		// on Android when the demo moved in-process.
+		//
+		// DP-agnostic: a DP that already reports one centred eye in 2D (the
+		// Windows Leia SR path) makes the centroid that same eye, so this is
+		// a no-op there. Untouched for active_view_count > 1 (per-eye
+		// off-axis frusta are the whole point of a 3D mode), and the
+		// XR_DXR_view_rig raw channel above was captured BEFORE this — it
+		// keeps reporting the DP's verbatim per-eye set (the app's face-dot
+		// HUD is unaffected). Supersedes the old legacy_app_tile_scaling-only
+		// override: legacy apps hit the same centroid through this gate (the
+		// compositor crops a legacy 2D app to the left view, which must
+		// therefore be rendered from the centre eye — unchanged behaviour).
+		if (have_eye_positions && eye_count >= 2 && active_view_count == 1) {
+			struct xrt_eye_position center = {0.0f, 0.0f, 0.0f};
+			for (uint32_t ei = 0; ei < eye_count; ei++) {
+				center.x += adj_eyes[ei].x;
+				center.y += adj_eyes[ei].y;
+				center.z += adj_eyes[ei].z;
+			}
+			const float inv = 1.0f / (float)eye_count;
+			center.x *= inv;
+			center.y *= inv;
+			center.z *= inv;
+			for (uint32_t ei = 0; ei < eye_count; ei++) {
+				adj_eyes[ei] = center;
 			}
 		}
 
