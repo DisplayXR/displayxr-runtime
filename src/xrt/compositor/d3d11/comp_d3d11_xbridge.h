@@ -273,6 +273,82 @@ bool
 comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb);
 
 /*!
+ * #918 Phase 2b PR 6 — ADAPTIVE ingress: Option I while the source holds still,
+ * Option II for the one frame a source change lands on.
+ *
+ * @ref comp_d3d11_xbridge_force_staged_ingress exists because the service's
+ * source texture changes IDENTITY between frames (whichever client won the
+ * presenter election, or the combined atlas under a controller) and a per-frame
+ * NT re-open is worse than a per-frame copy. But that identity only changes on a
+ * FOCUS CHANGE or a controller attach — user-speed events — and in between it is
+ * as stable as the in-process compositor's own atlas. Paying the extra
+ * full-content app-device copy on every frame to cover an event that happens
+ * once a minute is the wrong trade, and it is measurable: PR 3's rate-normalised
+ * A/B put the service split at 9.7 ms of iGPU and 5.9 ms of dGPU per weave with
+ * the app device's copy engine still at 254 ms/s.
+ *
+ * Adaptive keeps BOTH: the staging ring stays allocated as the per-frame
+ * fallback, and the caller nominates the frame's source with
+ * @ref comp_d3d11_xbridge_set_source. A source that matches the bound one is
+ * read in place; a source that does not stages this frame and is bound for the
+ * next.
+ *
+ * **Call right after @ref comp_d3d11_xbridge_create**, for the same reason
+ * `force_staged_ingress` must be: it allocates the staging ring. Refused (and
+ * the bridge left in plain Option II) when the app device could not open the
+ * producer fence — Option I has no back-pressure without it and is unsafe
+ * (#918 F6).
+ *
+ * The caller MUST call @ref comp_d3d11_xbridge_pre_render before the app device
+ * writes the frame's source, exactly as an Option-I caller does.
+ *
+ * @return false when the staging ring could not be allocated (the bridge is then
+ *         inoperative, as with `force_staged_ingress`) — a refusal to go adaptive
+ *         with a working staged ring still returns true.
+ */
+bool
+comp_d3d11_xbridge_enable_adaptive_ingress(struct comp_d3d11_xbridge *xb);
+
+/*!
+ * Nominate the source the NEXT @ref comp_d3d11_xbridge_submit will carry.
+ * Adaptive ingress only; a no-op elsewhere.
+ *
+ * @param nt_handle `HANDLE` from `IDXGIResource1::CreateSharedHandle` on the
+ *        app-device source texture, or NULL when the frame's source is not
+ *        NT-shareable (that frame stages).
+ * @param source_key A key that is UNIQUE PER ALLOCATION for the life of the
+ *        process — never a bare texture pointer. A freed texture's address is
+ *        recycled by the allocator, and a recycled address compared equal would
+ *        keep the producer reading the *previous* allocation (which this bridge's
+ *        own D3D12 open is still keeping alive) and bridge stale pixels with
+ *        nothing anywhere able to tell. 0 means "no source" and stages.
+ *
+ * @return true when the next submit will read the source IN PLACE (Option I).
+ *         False on the frame a source change lands on, on an open failure, and
+ *         whenever the caller passed no handle — all of which stage instead.
+ */
+bool
+comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t source_key);
+
+//! @ref comp_d3d11_xbridge_take_ingress_stats — @p out_mode.
+#define COMP_D3D11_XBRIDGE_INGRESS_DIRECT 1
+#define COMP_D3D11_XBRIDGE_INGRESS_STAGED 2
+#define COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE 3
+
+/*!
+ * Ingress telemetry for the caller's once-a-second diagnostic line.
+ *
+ * @param out_mode COMP_D3D11_XBRIDGE_INGRESS_*.
+ * @param out_direct,out_staged Submits of each flavour since the last call —
+ *        WINDOW counters, drained here.
+ * @param out_rebind LIFETIME count of source re-binds (NT re-opens). Not drained:
+ *        a monotonic total is what tells churn from a settled session at a glance.
+ */
+void
+comp_d3d11_xbridge_take_ingress_stats(
+    struct comp_d3d11_xbridge *xb, int *out_mode, uint64_t *out_direct, uint64_t *out_staged, uint64_t *out_rebind);
+
+/*!
  * Back-pressure for ingress Option I (#918 review F6). The producer's copy of
  * frame N-1 reads the app's atlas directly, so the renderer passes of frame N
  * must not start overwriting it until that copy has retired. Call at the TOP of
@@ -282,6 +358,10 @@ comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb);
  * no-CPU-wait-on-the-app-thread invariant stands. No-op in Option II (whose
  * staging ring already gives the copy a private slot) and no-op when the app
  * device could not open the producer fence (that case latches Option II).
+ *
+ * Under ADAPTIVE ingress the wait targets the producer seq of the last submit
+ * that actually read a source IN PLACE — the only submits that need the fence.
+ * A run of staged frames therefore costs nothing.
  */
 void
 comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb);

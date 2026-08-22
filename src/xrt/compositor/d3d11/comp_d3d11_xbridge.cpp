@@ -15,6 +15,7 @@
 #include "comp_d3d11_plane_policy.h"
 
 #include "util/u_logging.h"
+#include "util/u_crash_guard.h"
 #include "os/os_time.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -110,7 +111,27 @@ enum xb_ingress_mode
 {
 	XB_INGRESS_DIRECT = 1, //!< Option I — producer reads the renderer atlas itself.
 	XB_INGRESS_STAGED = 2, //!< Option II — app-device NT-shared staging ring.
+	/*!
+	 * #918 Phase 2b PR 6 — both, chosen per frame. The staging ring is
+	 * allocated (so any frame may fall back to it) AND a source may be bound
+	 * Option-I style. See the header for who wants this and why.
+	 */
+	XB_INGRESS_ADAPTIVE = 3,
 };
+
+/*!
+ * Superseded Option-I opens waiting on the producer, under adaptive ingress.
+ *
+ * Releasing the open of the source the producer's last copy is still reading is
+ * a use-after-free on the copy queue, and the existing fix for that (a bounded
+ * CPU drain, #918 F2) is not available here: a source change happens on the
+ * SERVICE's render thread under `render_mutex`, where an unbounded — or even a
+ * 2-second — stall is exactly the wedge class #925 exists for. Deferring the
+ * release behind the producer fence instead costs nothing and never blocks. Four
+ * is far more than a user can generate: each entry is one focus change, and one
+ * frame later the producer has retired it.
+ */
+#define XB_SRC_RETIRE 4
 
 struct comp_d3d11_xbridge
 {
@@ -316,6 +337,27 @@ struct comp_d3d11_xbridge
 	HANDLE in_h[XB_INGRESS_RING];
 	ID3D12Resource *in_12[XB_INGRESS_RING];
 
+	// --- adaptive ingress (#918 Phase 2b PR 6) ---------------------------
+	//! Caller-assigned key of the allocation `atlas_12` is an open of. Unique per
+	//! allocation for the life of the process — see the header on why a texture
+	//! pointer is not a legal key.
+	uint64_t src_key;
+	//! The next submit may read that source in place. Cleared by every source
+	//! change, so the CHANGE frame stages and the bind takes effect after it.
+	bool src_armed;
+	//! Producer seq of the last submit that DID read a source in place — the only
+	//! value the #918 F6 back-fence needs to cover under adaptive ingress.
+	uint64_t prod_direct_seq;
+	struct
+	{
+		ID3D12Resource *res;
+		uint64_t prod_seq;
+	} src_retire[XB_SRC_RETIRE];
+	//! Window counters (drained by take_ingress_stats); `ing_rebind` is lifetime.
+	uint64_t ing_direct, ing_staged, ing_rebind;
+	//! One WARN for a source whose NT handle the producer refused, ever.
+	bool ing_open_warned;
+
 	uint32_t max_w, max_h;
 
 	//! Published under the compositor lock: the slot the last app frame wove,
@@ -373,6 +415,12 @@ xb_hr(HRESULT hr, char *buf, size_t n)
 //! the reason for the one WARN.
 static bool
 xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why);
+
+//! #918 PR 6 — defer the release of a superseded Option-I open behind the
+//! producer fence. Declared here because the staged-ingress latch demotes an
+//! adaptive bridge and must retire its source the same way.
+static void
+xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res);
 
 //! Bounded CPU wait cap for the structural-transition drains below.
 #define XB_DRAIN_TIMEOUT_MS 2000
@@ -1392,6 +1440,24 @@ xb_watchdog_thread(struct comp_d3d11_xbridge *xb)
 	}
 }
 
+/*!
+ * #918 Phase 2b PR 6 — the watchdog runs inside the ALWAYS-ON service now, not
+ * just a session process. An exception escaping a thread entry has no handler
+ * anywhere above it, so it is `std::terminate` with no banner and no stack
+ * (#930/#950) — and taking the service down takes every client's session with
+ * it. `u_crash_guard_run` wraps the body in the same structured-exception filter
+ * the render thread already uses: the exception still propagates
+ * (`EXCEPTION_CONTINUE_SEARCH`), so nothing about the outcome changes, but a
+ * `[TERMINATE] thread 'xbridge-watchdog'` record with a module+offset stack
+ * lands in the log first. Diagnosis only — this is not a catch.
+ */
+static void *
+xb_watchdog_entry(void *arg)
+{
+	xb_watchdog_thread(static_cast<struct comp_d3d11_xbridge *>(arg));
+	return nullptr;
+}
+
 
 /*
  *
@@ -1683,7 +1749,7 @@ comp_d3d11_xbridge_create(const struct comp_d3d11_xbridge_info *info,
 	}
 
 	xb->quit.store(false);
-	xb->watchdog = std::thread(xb_watchdog_thread, xb);
+	xb->watchdog = std::thread([xb]() { (void)u_crash_guard_run("xbridge-watchdog", xb_watchdog_entry, xb); });
 
 	*out_xb = xb;
 	*out_reason = nullptr;
@@ -1882,11 +1948,11 @@ comp_d3d11_xbridge_slot_layout(
  * atlas could not be opened by the producer D3D12 device.
  */
 static bool
-xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
+xb_alloc_ingress_ring(struct comp_d3d11_xbridge *xb)
 {
 	char b[32];
-	if (xb->ingress_mode == XB_INGRESS_STAGED) {
-		return true;
+	if (xb->in_12[0] != nullptr) {
+		return true; // already standing
 	}
 	for (int i = 0; i < XB_INGRESS_RING; i++) {
 		D3D11_TEXTURE2D_DESC td = {};
@@ -1920,6 +1986,29 @@ xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
 			return false;
 		}
 	}
+	return true;
+}
+
+static bool
+xb_latch_staged_ingress(struct comp_d3d11_xbridge *xb, const char *why)
+{
+	if (xb->ingress_mode == XB_INGRESS_STAGED) {
+		return true;
+	}
+	if (!xb_alloc_ingress_ring(xb)) {
+		return false;
+	}
+	/*
+	 * #918 PR 6: latching STAGED from ADAPTIVE is a demotion — the bound source
+	 * is dropped, and dropping it means releasing an open the producer may still
+	 * be reading. Retire it behind the fence exactly as a source change does.
+	 */
+	if (xb->atlas_12 != nullptr && xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
+		xb_retire_source(xb, xb->atlas_12);
+		xb->atlas_12 = nullptr;
+		xb->src_key = 0;
+	}
+	xb->src_armed = false;
 	xb->ingress_mode = XB_INGRESS_STAGED;
 	U_LOG_W(
 	    "d3d11 xbridge: %s — using the staged ingress ring "
@@ -1942,6 +2031,178 @@ comp_d3d11_xbridge_force_staged_ingress(struct comp_d3d11_xbridge *xb)
 }
 
 extern "C" bool
+comp_d3d11_xbridge_enable_adaptive_ingress(struct comp_d3d11_xbridge *xb)
+{
+	if (xb == nullptr) {
+		return false;
+	}
+	// The staging ring is the per-frame fallback and is not optional: without it
+	// the frame a source change lands on has nothing to copy out of.
+	if (!xb_alloc_ingress_ring(xb)) {
+		return false;
+	}
+	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
+		return true;
+	}
+	/*
+	 * #918 F6 again: Option I lets the producer read a texture the app device
+	 * keeps writing, and the ONLY thing that orders those is the back-fence. No
+	 * fence ⟹ no Option I, ever — stay in plain Option II, which gives each copy
+	 * a private staging slot and needs no ordering at all. Working bridge, one
+	 * WARN, no adaptive.
+	 */
+	if (!xb->app_back_wait_ok) {
+		xb->ingress_mode = XB_INGRESS_STAGED;
+		U_LOG_W(
+		    "d3d11 xbridge: adaptive ingress refused — the app device has no producer back-fence, so "
+		    "reading a source in place is unsafe; staying on the staged ingress ring (#918 F6)");
+		return true;
+	}
+	xb->ingress_mode = XB_INGRESS_ADAPTIVE;
+	xb->src_armed = false;
+	U_LOG_W(
+	    "d3d11 xbridge: ADAPTIVE ingress — a stable source is read in place (Option I); the frame a "
+	    "source change lands on stages (Option II) and re-binds (#918 Phase 2b)");
+	return true;
+}
+
+/*!
+ * Release every deferred Option-I open whose producer copy has retired. Called
+ * on the caller's thread from `set_source` (and at quiesce); never waits.
+ */
+static void
+xb_sweep_retired_sources(struct comp_d3d11_xbridge *xb)
+{
+	if (xb->f_xa_prod == nullptr) {
+		return;
+	}
+	const uint64_t done = xb->f_xa_prod->GetCompletedValue();
+	for (int i = 0; i < XB_SRC_RETIRE; i++) {
+		if (xb->src_retire[i].res != nullptr && done >= xb->src_retire[i].prod_seq) {
+			safe_release(xb->src_retire[i].res);
+			xb->src_retire[i].prod_seq = 0;
+		}
+	}
+}
+
+static void
+xb_retire_source(struct comp_d3d11_xbridge *xb, ID3D12Resource *res)
+{
+	if (res == nullptr) {
+		return;
+	}
+	xb_sweep_retired_sources(xb);
+	const uint64_t want = xb->prod_submit_seq.load(std::memory_order_acquire);
+	for (int i = 0; i < XB_SRC_RETIRE; i++) {
+		if (xb->src_retire[i].res == nullptr) {
+			xb->src_retire[i].res = res;
+			xb->src_retire[i].prod_seq = want;
+			return;
+		}
+	}
+	/*
+	 * Every slot busy — only reachable if the producer link has genuinely stopped
+	 * (the watchdog's territory) while the caller keeps changing source. Fall
+	 * back to the F2 rule: drain, and on timeout LEAK rather than hand the copy
+	 * queue a freed resource.
+	 */
+	if (!xb_drain_fence(xb->f_xa_prod, want, "ingress source retire")) {
+		U_LOG_W("d3d11 xbridge: leaking a superseded ingress source — the producer would not drain (#918)");
+		return;
+	}
+	safe_release(res);
+}
+
+extern "C" bool
+comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t source_key)
+{
+	char b[32];
+	if (xb == nullptr) {
+		return false;
+	}
+	if (xb->ingress_mode != XB_INGRESS_ADAPTIVE) {
+		// Option I latched by `bind_atlas` reads in place unconditionally;
+		// Option II never does.
+		return xb->ingress_mode == XB_INGRESS_DIRECT;
+	}
+	xb_sweep_retired_sources(xb);
+
+	if (nt_handle == nullptr || source_key == 0) {
+		// This frame's source is not shareable (or the caller has none). Stage
+		// it, and keep the binding: the very next frame is usually the same
+		// stable source again, and dropping the open would cost a re-bind.
+		xb->src_armed = false;
+		return false;
+	}
+	if (xb->atlas_12 != nullptr && xb->src_key == source_key) {
+		xb->src_armed = true;
+		return true;
+	}
+
+	/*
+	 * The source CHANGED — a focus change, a controller attach or detach, or a
+	 * reallocation of the same slot's texture.
+	 *
+	 * This frame STAGES. Not because reading the fresh open would be wrong (the
+	 * back-fence is a single monotonic value and covers the old source's copy
+	 * just as well), but because it is free to be conservative here: a source
+	 * change is by construction a LAYOUT-GENERATION change, and the weave is
+	 * already holding its last good frame while the new generation lands. Paying
+	 * one staged copy on that frame costs nothing anybody can see, and it keeps
+	 * the invariant simple — a source is only ever read in place on a frame that
+	 * had a full frame of back-fence behind it.
+	 */
+	xb->src_armed = false;
+	if (xb->atlas_12 != nullptr) {
+		xb_retire_source(xb, xb->atlas_12);
+		xb->atlas_12 = nullptr;
+	}
+	xb->src_key = 0;
+
+	ID3D12Resource *opened = nullptr;
+	HRESULT hr = xb->prod_dev->OpenSharedHandle(static_cast<HANDLE>(nt_handle), __uuidof(ID3D12Resource),
+	                                            reinterpret_cast<void **>(&opened));
+	if (FAILED(hr) || opened == nullptr) {
+		// Not fatal, and not a demotion: this source stages forever (its key
+		// never binds), every other source still gets Option I.
+		if (!xb->ing_open_warned) {
+			xb->ing_open_warned = true;
+			U_LOG_W(
+			    "d3d11 xbridge: the producer could not open an ingress source %s — that source stages "
+			    "(#918 PR 6, once)",
+			    xb_hr(hr, b, sizeof(b)));
+		}
+		return false;
+	}
+	xb->atlas_12 = opened;
+	xb->src_key = source_key;
+	xb->ing_rebind++;
+	return false;
+}
+
+extern "C" void
+comp_d3d11_xbridge_take_ingress_stats(
+    struct comp_d3d11_xbridge *xb, int *out_mode, uint64_t *out_direct, uint64_t *out_staged, uint64_t *out_rebind)
+{
+	if (out_mode != nullptr) {
+		*out_mode = (xb != nullptr) ? xb->ingress_mode : 0;
+	}
+	if (out_direct != nullptr) {
+		*out_direct = (xb != nullptr) ? xb->ing_direct : 0;
+	}
+	if (out_staged != nullptr) {
+		*out_staged = (xb != nullptr) ? xb->ing_staged : 0;
+	}
+	if (out_rebind != nullptr) {
+		*out_rebind = (xb != nullptr) ? xb->ing_rebind : 0;
+	}
+	if (xb != nullptr) {
+		xb->ing_direct = 0;
+		xb->ing_staged = 0;
+	}
+}
+
+extern "C" bool
 comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, uint64_t generation)
 {
 	char b[32];
@@ -1950,6 +2211,11 @@ comp_d3d11_xbridge_bind_atlas(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 	}
 	if (xb->ingress_mode == XB_INGRESS_STAGED) {
 		return true; // already latched; nothing to re-open
+	}
+	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
+		// An adaptive caller nominates its source per frame through
+		// comp_d3d11_xbridge_set_source; the session-long bind is not its model.
+		return true;
 	}
 	if (nt_handle == nullptr) {
 		return xb_latch_staged_ingress(xb, "the renderer atlas is not NT-shareable");
@@ -2041,13 +2307,14 @@ xb_egress_write_slot(struct comp_d3d11_xbridge *xb)
  * guard, which makes repeat calls within a frame free.
  */
 static void
-xb_app_back_wait(struct comp_d3d11_xbridge *xb)
+xb_app_back_wait(struct comp_d3d11_xbridge *xb, uint64_t want)
 {
 	if (!xb->app_back_wait_ok) {
 		return;
 	}
-	const uint64_t want = xb->prod_submit_seq.load(std::memory_order_acquire);
-	if (want == 0 || want == xb->app_waited_seq) {
+	// Monotonic: the immediate context is one ordered stream, so a wait already
+	// issued for a LATER seq subsumes this one.
+	if (want == 0 || want <= xb->app_waited_seq) {
 		return;
 	}
 	xb->app_ctx4->Wait(xb->f_xa_app, want);
@@ -2057,10 +2324,23 @@ xb_app_back_wait(struct comp_d3d11_xbridge *xb)
 extern "C" void
 comp_d3d11_xbridge_pre_render(struct comp_d3d11_xbridge *xb)
 {
-	if (xb == nullptr || xb->ingress_mode != XB_INGRESS_DIRECT) {
+	if (xb == nullptr) {
 		return;
 	}
-	xb_app_back_wait(xb);
+	if (xb->ingress_mode == XB_INGRESS_DIRECT) {
+		xb_app_back_wait(xb, xb->prod_submit_seq.load(std::memory_order_acquire));
+		return;
+	}
+	/*
+	 * #918 PR 6 — adaptive. Only a submit that read its source IN PLACE has a
+	 * producer copy reading app-owned pixels, so only those need to be fenced
+	 * against this frame's writes. Targeting `prod_direct_seq` rather than the
+	 * last submitted seq is what keeps a run of staged frames free of any
+	 * ordering the staging ring already provides privately.
+	 */
+	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
+		xb_app_back_wait(xb, xb->prod_direct_seq);
+	}
 }
 
 extern "C" void
@@ -2084,7 +2364,7 @@ comp_d3d11_xbridge_pre_plane_write(struct comp_d3d11_xbridge *xb, uint32_t plane
 	if (!pl.live || !pl.src_bound) {
 		return;
 	}
-	xb_app_back_wait(xb);
+	xb_app_back_wait(xb, xb->prod_submit_seq.load(std::memory_order_acquire));
 }
 
 extern "C" void
@@ -2113,9 +2393,17 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 
 	ID3D12Resource *src12 = xb->atlas_12;
 
+	/*
+	 * #918 PR 6 — which ingress this ONE frame uses. Latched Option I always
+	 * reads in place; adaptive does so while the caller's nominated source
+	 * matched the bound one (`set_source` armed it); everything else stages.
+	 */
+	const bool use_direct = (xb->ingress_mode == XB_INGRESS_DIRECT) ||
+	                        (xb->ingress_mode == XB_INGRESS_ADAPTIVE && xb->src_armed && xb->atlas_12 != nullptr);
+
 	// Option II: stage the content box into an app-device NT-shared texture the
 	// producer can open. One extra same-adapter copy, still no CPU wait.
-	if (xb->ingress_mode == XB_INGRESS_STAGED) {
+	if (!use_direct) {
 		const int in = (int)(seq % XB_INGRESS_RING);
 		auto *atlas = static_cast<ID3D11Texture2D *>(atlas_texture);
 		if (atlas == nullptr || xb->in_tex[in] == nullptr) {
@@ -2216,6 +2504,16 @@ comp_d3d11_xbridge_submit(struct comp_d3d11_xbridge *xb,
 	// F6 back-fence — all of which need the last seq the producer queue was
 	// told to signal, never a seq that was skipped.
 	xb->prod_submit_seq.store(seq, std::memory_order_release);
+	// #918 PR 6: `prod_direct_seq` is the back-fence target under adaptive
+	// ingress and must only ever name a seq whose producer copy reads APP-OWNED
+	// pixels. Recorded here, past every early-out, so a frame that never reached
+	// leg 1 cannot arm a wait for pixels nothing is reading.
+	if (use_direct) {
+		xb->prod_direct_seq = seq;
+		xb->ing_direct++;
+	} else {
+		xb->ing_staged++;
+	}
 
 	// --- leg 2: cross-adapter ring -> egress (scanout adapter) ------------
 	// The ONE cross-adapter wait in the whole design, and it belongs to the
@@ -2488,6 +2786,10 @@ comp_d3d11_xbridge_quiesce(struct comp_d3d11_xbridge *xb)
 		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs,
 		    (unsigned long long)xb->churn_entries, (unsigned long long)xb->churn_settles);
 	}
+	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
+		U_LOG_W("d3d11 xbridge: adaptive ingress — %llu source re-binds over the session (#918 PR 6)",
+		        (unsigned long long)xb->ing_rebind);
+	}
 	for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
 		const auto &pl = xb->plane[p];
 		if (!pl.live && pl.copies == 0) {
@@ -2564,6 +2866,12 @@ comp_d3d11_xbridge_destroy(struct comp_d3d11_xbridge **xb_ptr)
 		safe_release(xb->in_tex[i]);
 	}
 	safe_release(xb->atlas_12);
+	// #918 PR 6: the deferred-retire list. The producer drained above, so every
+	// entry is provably past its copy; the leak branch above deliberately leaves
+	// them alone with the rest of the D3D12 side.
+	for (int i = 0; i < XB_SRC_RETIRE; i++) {
+		safe_release(xb->src_retire[i].res);
+	}
 
 	for (int i = 0; i < XB_XA_RING; i++) {
 		safe_release(xb->xa_cons[i]);
