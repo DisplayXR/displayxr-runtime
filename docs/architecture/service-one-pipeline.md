@@ -356,9 +356,39 @@ layout generation had landed — warmup, a mode switch, a focus change, or a con
 detaching. `out_crop` counts frames the output-device crop rescued from a parked worst-case ring
 (an interactive resize); a session that never resizes never sees one. `flat_skip` counts unfocused
 app-HWND courtesy repaints skipped under the split (supervisor ruling; those windows are parked
-anyway). `maskpub_skip` counts zone-mask publishes refused because the mask and the DP ended up on
-different devices — an ineligible presenter under an active split; PR 5 makes that case raster on
-the DP's device instead.
+anyway). `maskpub_skip` is a **tripwire and should read 0** — see the zones sideband below.
+
+### The zones sideband follows the DP, not the output half (PR 5)
+
+`XR_DXR_display_zones` and the `XR_DXR_weave` v8 wish publish the same thing: a ~64 KB `R8_UNORM`
+binary mask (ADR-027 D5) handed to the panel DP as a *hardware control signal*. It never crosses
+the bridge and it never touches a woven pixel, so nothing about it wants the scanout adapter — it
+only ever wanted **whichever device the panel DP is on**, which is the DP's bind key, not the
+output half.
+
+Those two diverge exactly where the eligibility table above does. A `CLIENT_TEXTURE` or `SELF`
+presenter keeps its DP on the APP device while the split is engaged, so PR 2's `svc_out_*` raster
+and PR 3's device comparison meant every publish from such a client was refused. The cost was
+worse than the PR 3 note recorded: both tier-1 blocks demote the whole-panel hardware 3D request
+on the strength of the DP merely *accepting* the mask slot (`mask_capable`), and neither can see a
+device skip — so a refused publish left the panel driven by **neither** the wish nor the
+whole-panel request, not "driven whole".
+
+PR 5 rasters and publishes on `svc_zone_mask_device()` = `mc->panel_dp_device`: the out device for
+an eligible presenter, the app device for an ineligible one, and nothing is refused on either side
+of the boundary. Two things make that safe:
+
+- **The device is a dirty-check term.** `wish_mask_device` sits beside `wish_mask_w/h` on the
+  client. Without it an unchanged rect list short-circuits the raster after a device-crossing
+  rebind and hands the fresh DP an SRV from the device it no longer runs on — which D3D11 does not
+  diagnose.
+- **The DP and its device are resolved under one lock.** The zones publisher now re-resolves
+  `panel_dp()` inside `render_mutex` (it used to resolve pre-lock, leaving a window for the render
+  thread's rebind); the weave publisher was already inside it.
+
+`maskpub_skip` therefore keeps its counter and changes meaning: from a reachable degrade to an
+unreachable tripwire for a silent cross-device hand-off. **Any non-zero value is a bug** — a call
+site that resolved the DP and the device under different locks — and the one-shot WARN says so.
 
 `DXR_SPLIT_COVER_DIAG=1` (observe) or `=2` (sentinel-clear the back buffer first) reports, on both
 paths, whether the DP actually covered the output-device back buffer and whether a black frame was
