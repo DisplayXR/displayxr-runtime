@@ -1,7 +1,7 @@
 ---
 status: Active (design note for #964; Phase 3 of ADR-035, epic #974)
 owner: David Fattal
-updated: 2026-08-17
+updated: 2026-08-21
 anchors: main @ 32cd9612d (comp_d3d11_service.cpp = 18,545 L)
 code-paths: [src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp, src/xrt/ipc/server/ipc_server_process.c, src/xrt/compositor/d3d11/comp_d3d11_window.cpp]
 ---
@@ -255,8 +255,10 @@ every woven frame crosses the adapter boundary inside `Present`. `DXR_WEAVE_ON_S
 **output half** of this pipeline — the presenter swap chains, their RTVs, the panel DP's weave and
 the present — onto the scanout adapter, and sends only the DP-INPUT ATLAS across, once per rendered
 frame, through a D3D12 cross-adapter heap (`comp_d3d11_xbridge`). Default off. PR 3 covered the
-DIRECT path; PR 4 adds the COMPOSE path, so **both** paths now weave and present on the scanout
-adapter.
+DIRECT path; PR 4 added the COMPOSE path, so **both** paths weave and present on the scanout
+adapter; PR 5 moved the zones wish mask onto the panel DP's device; PR 6 made the ingress adaptive,
+gave each presenter chain its own weave-latency ledger, and closed the DEVICE_REMOVED / watchdog /
+teardown gaps.
 
 Why the service is a simpler split than the in-process compositor was: Local2D, zones and the
 authored mask all composite into the CLIENT ATLAS pre-DP, and the service never calls
@@ -274,9 +276,9 @@ title bars, font, logo, cursor and the ADR-030 crop paint into `combined_atlas` 
 Only the destination moved: the cropped composite is submitted to the same bridge instance, and
 `process_atlas` plus the present run on the output device.
 
-One bridge, two sources, is what made **Option-II (staged) ingress** the right call at Stage A: the
-submitted texture changes IDENTITY on a focus change *and* on a controller attach, where Option I
-would re-open an NT handle each time.
+One bridge, two sources, is what made **Option-II (staged) ingress** the right call through PR 3-5:
+the submitted texture changes IDENTITY on a focus change *and* on a controller attach, where Option
+I would re-open an NT handle each time. PR 6 replaces that with an **adaptive** rule — see below.
 
 `split_active` is therefore Stage A's verdict for the life of the process. PR 3's workspace
 **suspend** — which moved the panel DP and the service-window chain back to the app device while a
@@ -296,14 +298,80 @@ The content box changes with the transition (compose = the canvas, direct = the 
 crop). The R2 hysteresis sees that as the single step it is — a resize DRAG is what it treats as
 churn — so it reallocates the ring once and settles.
 
+### Adaptive ingress (PR 6)
+
+Staging every frame costs one extra full-content copy on the APP device, per frame, forever — to
+cover an event that happens when a user changes focus or attaches the shell. PR 3's
+rate-normalised A/B put the price on the board: 9.7 ms of iGPU and 5.9 ms of dGPU per weave with
+the app device's copy engine still at 254 ms/s.
+
+Adaptive ingress keeps the staging ring allocated as the **per-frame fallback** and lets a source
+that has held still be read IN PLACE. Each frame nominates its source
+(`comp_d3d11_xbridge_set_source(nt_handle, key)`); a match with the bound source reads in place, a
+mismatch stages. Three rules make it safe, and each of them is load-bearing:
+
+- **Only a texture the RENDER THREAD alone writes may be nominated.** The producer's copy of frame
+  N is still running when frame N+1 starts, and the only thing that orders an app-device write
+  against it is the F6 back-fence, issued once at the top of `multi_compositor_render`. The
+  immediate context is one ordered stream, so that single wait covers every writer that follows it
+  *on that thread* — the ADR-030 crop on the direct path, the whole compose pass on the other — and
+  covers nothing a CLIENT'S IPC THREAD does. So the eligible sources are the focused client's
+  `crop_texture`, `mc->crop_texture` and `mc->combined_atlas`; a client's own `atlas_texture`
+  (written by `compositor_layer_commit` on that client's thread) is never nominated and stages.
+  `service_crop_atlas_for_dp` hands the atlas back only when the content exactly fills it, and
+  every 3D mode crops by construction — so the case that keeps staging is full-screen 2D.
+- **The key is per-ALLOCATION, never a pointer.** The allocator recycles addresses; a recycled
+  address compared equal would leave the producer reading the previous allocation, which the
+  bridge's own D3D12 open is still keeping alive, and bridge stale pixels with nothing able to tell.
+- **A superseded open is RETIRED BEHIND THE PRODUCER FENCE, never drained.** The obvious
+  alternative is a bounded CPU wait, and the caller is the render thread holding `render_mutex`:
+  that is the #925 wedge class. An exhausted retire ring **leaks** the open (counted, `[XBRIDGE]`
+  error) rather than waiting — "unreachable" is not a licence to keep such a wait.
+
+And one hysteresis, for the same reason the egress ring has one. A crop texture is reallocated
+whenever the content box moves, which during a resize drag is every mouse event, so "key changed ⟹
+re-open" would mean one `OpenSharedHandle` per frame through a drag. A key change therefore retires
+the old open **once** and only *arms* the new key; the re-open waits for it to hold still for
+250 ms. Through a drag there is no bound source at all and every frame stages — exactly the PR 3-5
+behaviour, and the right degrade.
+
+`DXR_SPLIT_INGRESS=staged` pins the old behaviour, which is the A/B control the perf claim is
+measured against.
+
+### Per-presenter weave latency (PR 6)
+
+`weave_latency_log` correlates a weave timestamp with the flip that carried it, through
+`GetLastPresentCount` — and **PresentCount is per chain**. The pipeline fed ONE file-scope log from
+three: the service window (compose always, direct whenever a hosted client presents) and every
+app-HWND client's own chain. A ring entry recorded against one chain then resolves against
+another's statistics, and the residual R that comes out is not a measurement of anything. R is not
+just a report — it is what `set_frame_timing` hands the vendor eye predictor.
+
+The ledgers now live on the chain owners: `mc->weave_lat` (site `workspace`) and
+`c->render.weave_lat` (site `apphwnd.sN`), resolved from the presenter kind *before* the weave so
+mark and `after_present` are the same ledger by construction. `mc->panel_r_ns` carries the panel's
+best-known residual — written by whichever chain actually wove AND presented — and is what the DP
+is fed, including on the ADR-029 `CLIENT_TEXTURE` path, which weaves through the panel DP and
+presents its own texture and so has no chain and no PresentCount of its own. The saturation
+governor stays shared: its inputs are the display period and the render-tick interval, properties
+of the panel and the loop rather than of a chain.
+
 ### The output-device crop
 
-While the R2 hysteresis holds a worst-case ring, the slot's content sits top-left inside a larger
-texture, and the DP derives its tile stride from the atlas width — so weaving it directly would
+Whenever the slot is larger than the content it holds, that content sits top-left inside the larger
+texture — and the DP derives its tile stride from the atlas width, so weaving it directly would
 slice every tile at the wrong offset. PR 3 refused those frames. PR 4 crops them on the output
 device instead: one same-device `CopySubresourceRegion` of the slot's own content box into an
 output-device staging texture, no shader (the blit shaders all live on the app device) and no second
 crossing. Counted as `out_crop`.
+
+Two things put a session in that state, and PR 4's own note recorded only the first. The R2
+hysteresis parks a **worst-case ring** through an interactive resize, deliberately — that is the
+trade the hysteresis exists to make. But a **zones-class client is there on every ordinary frame**:
+its slot is worst-case-sized while its content box is the active mode's, so the output-device crop
+is that session's steady state rather than a resize artefact (PR 5 measured `out_crop=600` per 10 s
+window on the eligible zones arm, with `no_slot=0`). Neither is a fault, and neither costs a second
+crossing.
 
 ### Presenter-kind eligibility
 
@@ -348,15 +416,35 @@ lost its cause when the suspend went away, and stays armed as a tripwire.
 ```
 weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave/present on the SCANOUT adapter
 #918 output-device split ACTIVE: …
-[RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 flat_skip=0 maskpub_skip=0 no_slot=0 out_crop=0 window_s=10
+[RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 flat_skip=0 maskpub_skip=0 no_slot=0
+         out_crop=0 ingress=adaptive ing_direct=598 ing_staged=0 ing_rebind=2 ing_churn=0
+         ing_leak=0 window_s=10
 ```
 
 `no_slot` counts frames that skipped both the weave and the present because nothing of the current
 layout generation had landed — warmup, a mode switch, a focus change, or a controller attaching or
-detaching. `out_crop` counts frames the output-device crop rescued from a parked worst-case ring
-(an interactive resize); a session that never resizes never sees one. `flat_skip` counts unfocused
-app-HWND courtesy repaints skipped under the split (supervisor ruling; those windows are parked
-anyway). `maskpub_skip` is a **tripwire and should read 0** — see the zones sideband below.
+detaching.
+
+`out_crop` counts frames the output-device crop rescued from a slot whose box is smaller than the
+ring holding it. Two populations, and PR 4's note named only the first:
+
+- **an interactive resize**, where the R2 hysteresis parks the ring at worst-case on purpose;
+- **every frame of a zones-class session**, structurally — a zones client's slot is worst-case
+  (`1920x2160` on the reference panel) while its content box is the mode's (`1280x720`), so the
+  crop is the steady state there rather than an artefact. Measured `out_crop=600` per 10 s window
+  on PR 5's eligible zones arm. It costs one same-device sub-rect copy and is not a fault.
+
+`flat_skip` counts unfocused app-HWND courtesy repaints skipped under the split (supervisor ruling;
+those windows are parked anyway). `maskpub_skip` is a **tripwire and should read 0** — see the
+zones sideband below.
+
+The `ing_*` terms are adaptive ingress. `ingress=adaptive` with `ing_staged=0` is the steady state;
+a standing `ing_staged` in a session nobody is Alt-Tabbing means a source that never binds (a
+full-screen 2D atlas submission, or a share the producer refused). `ing_rebind` counts SETTLED
+source changes and `ing_churn` counts key changes that never became one — a resize drag reads as
+churn climbing with rebind flat, then one rebind when it settles. **`ing_leak` is a tripwire and
+must read 0**: it counts superseded opens dropped without release because the retire ring was full,
+which the settle hysteresis makes unreachable.
 
 ### The zones sideband follows the DP, not the output half (PR 5)
 
