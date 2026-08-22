@@ -157,6 +157,42 @@ vendor loader, and fail cleanly with a log line naming the exact missing
 `<package>` lines. Once execution is inside the vendor loader nothing is
 catchable, so asking first is the only defence.
 
+**If the neutral action is not adopted — the fallback contract.** An OEM that
+ships without the `org.displayxr.action.VENDOR_DISPLAY_SERVICE` filters MUST
+instead **publish the exact package names** of the vendor display-configuration
+service and the vendor head-tracking service in its SDK documentation, and state
+that they are a per-app manifest obligation. The names are then not an
+implementation detail an app may ignore: because visibility is enforced per
+*calling* uid and the vendor loader runs in the app's uid under Architecture A,
+**every client APK's own manifest** must carry
+
+```xml
+<queries>
+    <package android:name="<vendor display-configuration service package>"/>
+    <package android:name="<vendor head-tracking service package>"/>
+</queries>
+```
+
+The runtime APK declaring them is **not** sufficient — visibility does not
+inherit across uids. Omitting them aborts the process roughly 150 ms after the
+plug-in loads, during head-tracking bring-up, with a CheckJNI
+`java_object == null` in `GetObjectClass` and no mention of a package or a
+manifest anywhere in the stack. Architecture C (satellite / out-of-process) is
+unaffected, because there the vendor core runs in the pre-declared service
+process whose manifest already carries the block. This is the whole reason L7 is
+a REQUIRED ask rather than an ergonomic one: the neutral action is what lets an
+app declare `<queries><intent>` and never name a vendor package
+([ADR-036 D5](../../adr/ADR-036-android-per-window-compositor-instances.md)).
+The client-side rule is restated for app authors as **INV-11.9** in
+[`docs/guides/displayxr-app-rules.md` §11](../../guides/displayxr-app-rules.md#11-android--pixel-exactness-rules).
+
+**Evidence.** Three shipping demo apps hit exactly this abort when run in-process
+on the reference device and were fixed only by adding the two `<package>` lines
+to their own manifests — `displayxr-demo-modelviewer#97`,
+`displayxr-demo-mediaplayer#49`, `displayxr-demo-earthview#42` (all merged
+2026-08-22). Three independent apps making the same mistake is the argument that
+this cannot be left to per-app diligence.
+
 **Acceptance test.**
 
 ```bash
