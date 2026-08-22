@@ -154,6 +154,43 @@ pack_luid(LUID luid)
 }
 
 /*!
+ * #918 Phase 2b PR 6 — the SERVICE output-device split, stated from the two
+ * inputs this process can legitimately see.
+ *
+ * `displayxr-cli` is HEADLESS: no compositor, no service, no IPC connection. It
+ * cannot report what the running service actually decided, and must not invent
+ * it. But the service's Stage A takes exactly two inputs — the topology (render
+ * adapter != scanout adapter, resolved above) and `DXR_WEAVE_ON_SCANOUT` — so
+ * "would it engage, given this environment" is answerable and is the question a
+ * bug report needs answered. The wording keeps the distinction visible.
+ *
+ * The ingress policy (`DXR_SPLIT_INGRESS`) rides along because it is the other
+ * env var that changes what the split costs, and reading it from a bug report is
+ * how a stray `staged` gets spotted.
+ */
+static void
+describe_service_split(struct cli_query_result *r)
+{
+	const char *ing = getenv("DXR_SPLIT_INGRESS");
+	const bool staged = ing != NULL && strcmp(ing, "staged") == 0;
+	snprintf(r->gpu_split_ingress, sizeof(r->gpu_split_ingress), "%s%s", staged ? "staged" : "adaptive",
+	         (ing != NULL && ing[0] != '\0') ? "" : " (default)");
+
+	const bool flag_on = r->gpu_weave_env_set && r->gpu_weave_env[0] == '1';
+	if (!flag_on) {
+		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
+		         "service split: OFF (DXR_WEAVE_ON_SCANOUT unset — default off through this release)");
+	} else if (!r->gpu_split_applies) {
+		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
+		         "service split: flag set but INERT (render and scanout are the same adapter — Stage A "
+		         "no-ops)");
+	} else {
+		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
+		         "service split: WOULD ENGAGE (flag set, render != scanout); ingress %s", r->gpu_split_ingress);
+	}
+}
+
+/*!
  * #918 — GPU topology. Enumerates the hardware adapters, names the one that
  * scans out the 3D panel, names the one the runtime would suggest to render
  * on, and states whether the weave-on-scanout split has anything to do on this
@@ -177,6 +214,9 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 	if (r->gpu_weave_env_set) {
 		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
 	}
+	// Answered from the env alone here, so every early return below still
+	// reports it; re-stated at the end once the topology is known.
+	describe_service_split(r);
 
 	IDXGIFactory1 *factory = NULL;
 	if (FAILED(CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory)) || factory == NULL) {
@@ -263,6 +303,7 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict), "weave-on-scanout topology: does not apply (%s)",
 		         r->gpu_adapter_count <= 1 ? "single adapter" : "same adapter");
 	}
+	describe_service_split(r);
 }
 
 static void
@@ -606,6 +647,7 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	probe_gpu_topology(r, &r->display_info);
 #else
 	snprintf(r->gpu_verdict, sizeof(r->gpu_verdict), "weave-on-scanout topology: n/a (Windows-only)");
+	snprintf(r->gpu_service_split, sizeof(r->gpu_service_split), "service split: n/a (Windows-only)");
 #endif
 
 	if (!(info.display_width_m > 0.0f) || !(info.display_height_m > 0.0f) || info.display_pixel_width == 0 ||
@@ -839,6 +881,7 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		}
 		PT("%s\n", r->gpu_verdict);
 		PT("DXR_WEAVE_ON_SCANOUT=%s\n", r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		PT("%s\n", r->gpu_service_split);
 	}
 
 	P(" :: Input providers (ADR-034)\n");
@@ -981,6 +1024,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(gt, "applies", r->gpu_split_applies);
 		cJSON_AddStringToObject(gt, "weave_on_scanout_env",
 		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		cJSON_AddStringToObject(gt, "service_split", r->gpu_service_split);
+		cJSON_AddStringToObject(gt, "split_ingress", r->gpu_split_ingress);
 		if (r->gpu_note[0] != '\0') {
 			cJSON_AddStringToObject(gt, "note", r->gpu_note);
 		}

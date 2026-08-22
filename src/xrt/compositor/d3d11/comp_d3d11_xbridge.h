@@ -335,18 +335,31 @@ comp_d3d11_xbridge_set_source(struct comp_d3d11_xbridge *xb, void *nt_handle, ui
 #define COMP_D3D11_XBRIDGE_INGRESS_STAGED 2
 #define COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE 3
 
-/*!
- * Ingress telemetry for the caller's once-a-second diagnostic line.
- *
- * @param out_mode COMP_D3D11_XBRIDGE_INGRESS_*.
- * @param out_direct,out_staged Submits of each flavour since the last call —
- *        WINDOW counters, drained here.
- * @param out_rebind LIFETIME count of source re-binds (NT re-opens). Not drained:
- *        a monotonic total is what tells churn from a settled session at a glance.
- */
+//! Ingress telemetry for the caller's once-a-second diagnostic line.
+struct comp_d3d11_xbridge_ingress_stats
+{
+	//! COMP_D3D11_XBRIDGE_INGRESS_*.
+	int mode;
+	//! Submits of each flavour since the last call — WINDOW counters, drained.
+	uint64_t direct, staged;
+	/*!
+	 * LIFETIME totals, not drained: a monotonic number is what tells a settled
+	 * session from a churning one at a glance.
+	 *
+	 * `rebind` counts SETTLED source changes (NT re-opens). `churn` counts key
+	 * changes that never became one because the source kept moving — a resize
+	 * drag reallocating its crop texture per mouse event. `leak` counts
+	 * superseded opens DROPPED without release because the retire ring was full,
+	 * and is a **tripwire: any non-zero value is a bug**. The settle hysteresis
+	 * makes it structurally unreachable, and the alternative to dropping is a
+	 * bounded CPU wait on a thread holding the service's `render_mutex` — which
+	 * #925 says may not exist, not merely may not be likely.
+	 */
+	uint64_t rebind, churn, leak;
+};
+
 void
-comp_d3d11_xbridge_take_ingress_stats(
-    struct comp_d3d11_xbridge *xb, int *out_mode, uint64_t *out_direct, uint64_t *out_staged, uint64_t *out_rebind);
+comp_d3d11_xbridge_take_ingress_stats(struct comp_d3d11_xbridge *xb, struct comp_d3d11_xbridge_ingress_stats *out);
 
 /*!
  * Back-pressure for ingress Option I (#918 review F6). The producer's copy of
