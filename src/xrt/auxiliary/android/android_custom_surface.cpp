@@ -251,9 +251,32 @@ android_custom_surface_wait_get_surface(struct android_custom_surface *custom_su
 	}
 
 	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf.object().makeLocalReference());
-	if (win != nullptr) {
-		android_globals_set_window((struct _ANativeWindow *)win);
+	if (win == nullptr) {
+		return nullptr;
 	}
+
+	/*
+	 * #1146: TWO references, not one.
+	 *
+	 * `ANativeWindow_fromSurface` produced exactly ONE reference. #1040 fixed
+	 * the reuse branch above to hand the caller its own, but left this branch
+	 * transferring that single reference TWICE: once into the globals here,
+	 * and again to the caller — whose `android_globals_store_window()` then
+	 * consumed it (`set_window` drops the window it replaces, which is this
+	 * same pointer). The globals were left holding a pointer with no
+	 * reference behind it, so the Java Surface's own reference became the
+	 * last one. On background the SurfaceView dropped it, the ANativeWindow
+	 * was freed, and the next publish on resume ran
+	 * `ANativeWindow_release()` over freed memory:
+	 * SIGSEGV in RefBase::decStrong, mRefs == 0.
+	 *
+	 * So: publish one reference, then acquire a second for the caller. Both
+	 * branches of this function now obey the same contract — the returned
+	 * pointer is OWNED by the caller and is independent of whatever the
+	 * globals hold.
+	 */
+	android_globals_set_window((struct _ANativeWindow *)win);
+	ANativeWindow_acquire(win);
 	return win;
 }
 

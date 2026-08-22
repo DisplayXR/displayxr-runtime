@@ -96,6 +96,13 @@ android_custom_surface_destroy(struct android_custom_surface **ptr_custom_surfac
  *
  * This may return NULL because the underlying operation is asynchronous.
  *
+ * OWNERSHIP (#1040 / #1146): the returned window carries an OWNED reference
+ * that is independent of the one `android_globals` holds. The caller must pair
+ * it with exactly one release — in practice by handing it to
+ * @ref android_globals_store_window, which consumes one reference. The window
+ * is also published into the globals as a side effect, using a separate
+ * reference of its own; do NOT assume the two are the same one.
+ *
  * @public @memberof android_custom_surface
  */
 ANativeWindow *
