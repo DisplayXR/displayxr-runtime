@@ -412,6 +412,15 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11RenderTargetView> crop_rtv; //!< For shader-blit Y-flip path
 	uint32_t crop_width;   //!< Current crop texture width (0 = not created)
 	uint32_t crop_height;  //!< Current crop texture height
+	/*!
+	 * #918 PR 6 — the crop texture as an ADAPTIVE-INGRESS SOURCE: its NT share
+	 * handle, and the process-unique key that names THIS allocation. Both are
+	 * dropped and re-made whenever the crop texture is, which is what stops a
+	 * recycled texture address from being mistaken for the same source.
+	 * NULL/0 when the split is off or the texture is not shareable.
+	 */
+	void *split_share_handle;
+	uint64_t split_share_key;
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
@@ -1632,6 +1641,113 @@ svc_out_factory(struct d3d11_service_system *sys)
 }
 
 /*!
+ * #918 PR 6 — ADAPTIVE INGRESS, service side: which app-device textures may be
+ * read IN PLACE by the bridge's producer, and how they are identified.
+ *
+ * Only a RUNTIME-OWNED texture written EXCLUSIVELY BY THE RENDER THREAD is a
+ * legal Option-I source, and the rule is a correctness rule, not a
+ * simplification. The producer's copy of frame N runs asynchronously into frame
+ * N+1; the one thing that orders an app-device write against it is
+ * `comp_d3d11_xbridge_pre_render`, which this path issues once at the top of the
+ * render tick. That covers every write the RENDER THREAD makes — the ADR-030
+ * crop, the whole compose pass — and covers nothing a CLIENT'S IPC THREAD makes.
+ * A client's `atlas_texture` is written by `compositor_layer_commit` on that
+ * client's own thread at arbitrary times, so it can never be nominated: it
+ * stages, exactly as everything did before this change.
+ *
+ * In practice that costs nothing where it matters. Every 3D mode crops (content
+ * is half the worst-case atlas by construction — ADR-010/ADR-030), so the direct
+ * path's source is the client's `crop_texture`; only a full-screen 2D submission
+ * that exactly fills the atlas falls back to staging. The compose path's two
+ * sources — `mc->crop_texture` and `mc->combined_atlas` — are both painted
+ * solely by the render thread and are both eligible.
+ *
+ * @{
+ */
+
+/*!
+ * Process-unique ingress keys. NEVER a texture pointer: the allocator recycles
+ * addresses, and a recycled address compared equal would leave the producer
+ * reading the PREVIOUS allocation (which the bridge's own D3D12 open keeps
+ * alive) and bridging stale pixels with nothing able to tell.
+ */
+static std::atomic<uint64_t> g_svc_ingress_key{1};
+
+//! Extra `MiscFlags` a would-be ingress source needs. Strictly conditional on
+//! the split: a non-split session allocates exactly what it always did.
+static inline UINT
+svc_split_source_misc_flags(struct d3d11_service_system *sys)
+{
+	return (sys != nullptr && sys->split_active)
+	           ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED)
+	           : 0u;
+}
+
+/*!
+ * Give @p tex an NT share handle and a fresh key, so the bridge can open it.
+ * Silent no-op (and a NULL handle ⟹ that source stages) when the split is off or
+ * the texture was not created shareable.
+ */
+static void
+svc_split_share_source(struct d3d11_service_system *sys, ID3D11Texture2D *tex, void **out_handle, uint64_t *out_key)
+{
+	*out_handle = nullptr;
+	*out_key = 0;
+	if (sys == nullptr || !sys->split_active || tex == nullptr) {
+		return;
+	}
+	wil::com_ptr<IDXGIResource1> dr;
+	if (FAILED(tex->QueryInterface(IID_PPV_ARGS(dr.put())))) {
+		return;
+	}
+	HANDLE h = nullptr;
+	// READ|WRITE, matching the in-process renderer atlas share: the producer only
+	// ever reads, but a read-only NT share is not a shape this stack was proved
+	// on and the access mask costs nothing.
+	if (FAILED(
+	        dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &h)) ||
+	    h == nullptr) {
+		return;
+	}
+	*out_handle = h;
+	*out_key = g_svc_ingress_key.fetch_add(1, std::memory_order_relaxed);
+}
+
+/*!
+ * Stage A's ingress choice. ADAPTIVE by default (#918 PR 6); `DXR_SPLIT_INGRESS=staged`
+ * pins the PR 3-5 behaviour — one extra full-content app-device copy per frame,
+ * every frame — which is the A/B control the perf claim is measured against and
+ * the one-line escape if adaptive ever misbehaves in the field.
+ *
+ * Returns false only when the STAGING RING itself could not be allocated: the
+ * bridge is then inoperative under either policy and the split must not activate.
+ */
+static bool
+svc_split_select_ingress(struct comp_d3d11_xbridge *xb)
+{
+	const char *e = getenv("DXR_SPLIT_INGRESS");
+	if (e != nullptr && strcmp(e, "staged") == 0) {
+		U_LOG_W("#918: DXR_SPLIT_INGRESS=staged — pinning the staged ingress ring (A/B control)");
+		return comp_d3d11_xbridge_force_staged_ingress(xb);
+	}
+	return comp_d3d11_xbridge_enable_adaptive_ingress(xb);
+}
+
+//! Drop a source's share handle. Safe to call on a never-shared source, and
+//! MUST be called wherever its texture is released — the key is what tells the
+//! bridge "this is a different allocation now".
+static void
+svc_split_unshare_source(void **io_handle, uint64_t *io_key)
+{
+	if (*io_handle != nullptr) {
+		CloseHandle((HANDLE)*io_handle);
+		*io_handle = nullptr;
+	}
+	*io_key = 0;
+}
+/*! @} */
+
+/*!
  * #918 debug tripwire: a resource handed to an output-half call must belong to
  * the device that half runs on. Inert while the split is off (both sides of the
  * comparison are the app device); load-bearing the moment it is not, because a
@@ -1869,16 +1985,7 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			} else if (comp_d3d11_xbridge_create(&xbi, &sys->xbridge, &xb_reason) != XRT_SUCCESS) {
 				sys->xbridge = nullptr;
 				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
-			} else if (!comp_d3d11_xbridge_force_staged_ingress(sys->xbridge)) {
-				/*
-				 * Option II, chosen UP FRONT rather than reached as a
-				 * fallback. Option I binds ONE app-device atlas by NT handle;
-				 * the service's source is whichever focused client's crop it
-				 * is weaving this tick, so its identity changes with focus and
-				 * Option I would re-open a shared handle — draining the
-				 * producer queue — on every Alt-Tab. One extra same-adapter
-				 * copy per frame buys focus changes for free.
-				 */
+			} else if (!svc_split_select_ingress(sys->xbridge)) {
 				reason = "staged ingress ring unavailable";
 			} else if (!comp_d3d11_xbridge_alloc_worstcase_egress(sys->xbridge)) {
 				/*
@@ -3041,6 +3148,12 @@ struct d3d11_multi_compositor
 	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
 	uint32_t crop_width;
 	uint32_t crop_height;
+	//! #918 PR 6 — adaptive-ingress source identity of @ref crop_texture.
+	void *crop_share_handle;
+	uint64_t crop_share_key;
+	//! #918 PR 6 — and of @ref combined_atlas, the compose path's other source.
+	void *atlas_share_handle;
+	uint64_t atlas_share_key;
 
 	//! Per-client slots.
 	struct d3d11_multi_client_slot clients[D3D11_MULTI_MAX_CLIENTS];
@@ -5101,6 +5214,12 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->crop_texture.reset();
 	res->crop_width = 0;
 	res->crop_height = 0;
+	// #918 PR 6: retire this client's ingress identity with its texture. The
+	// bridge's own D3D12 open (if this was the bound source) is retired behind
+	// the producer fence by `comp_d3d11_xbridge_set_source` the next time a
+	// source is nominated — releasing the D3D11 texture here does not free the
+	// underlying allocation while that open holds it.
+	svc_split_unshare_source(&res->split_share_handle, &res->split_share_key);
 	res->atlas_clear_signature = 0;
 	res->atlas_rtv.reset();
 	res->atlas_srv.reset();
@@ -7315,6 +7434,9 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 		res->crop_srv.reset();
 		res->crop_rtv.reset();
 		res->crop_texture.reset();
+		// #918 PR 6: the allocation is going away, so its ingress identity must
+		// too — a new crop texture at the same address is a DIFFERENT source.
+		svc_split_unshare_source(&res->split_share_handle, &res->split_share_key);
 
 		D3D11_TEXTURE2D_DESC crop_desc = {};
 		crop_desc.Width = expected_w;
@@ -7325,6 +7447,10 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 		crop_desc.SampleDesc.Count = 1;
 		crop_desc.Usage = D3D11_USAGE_DEFAULT;
 		crop_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		// #918 PR 6 — this is the direct path's adaptive-ingress source. Render
+		// thread writes only (see svc_split_share_source), so it is legal for the
+		// producer to read it in place. Flags are 0 while the split is off.
+		crop_desc.MiscFlags = svc_split_source_misc_flags(sys);
 
 		HRESULT hr = sys->device->CreateTexture2D(
 		    &crop_desc, nullptr, res->crop_texture.put());
@@ -7333,6 +7459,8 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 			    res->crop_texture.get(), nullptr, res->crop_srv.put());
 			sys->device->CreateRenderTargetView(
 			    res->crop_texture.get(), nullptr, res->crop_rtv.put());
+			svc_split_share_source(sys, res->crop_texture.get(), &res->split_share_handle,
+			                       &res->split_share_key);
 			res->crop_width = expected_w;
 			res->crop_height = expected_h;
 			U_LOG_I("Crop-blit: created %ux%u staging texture "
@@ -8050,12 +8178,34 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			uint32_t oc = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
 			const uint64_t xb_bytes =
 			    sys->xbridge != nullptr ? comp_d3d11_xbridge_take_atlas_bytes(sys->xbridge) : 0;
+			/*
+			 * #918 PR 6 — ingress, the term that says which half of the
+			 * transport each frame actually paid for. `ingress=direct` with
+			 * `ing_staged=0` is the steady state and the whole point of the
+			 * change; a standing `ing_staged` in a session nobody is
+			 * Alt-Tabbing means a source that never binds (a client atlas
+			 * submission — full-screen 2D — or a share that the producer
+			 * refused). `ing_rebind` is a LIFETIME total, so it reads as
+			 * "focus changes so far", not as churn per window.
+			 */
+			int ing_mode = 0;
+			uint64_t ing_direct = 0, ing_staged = 0, ing_rebind = 0;
+			if (sys->xbridge != nullptr) {
+				comp_d3d11_xbridge_take_ingress_stats(sys->xbridge, &ing_mode, &ing_direct, &ing_staged,
+				                                      &ing_rebind);
+			}
+			const char *ing_name = ing_mode == COMP_D3D11_XBRIDGE_INGRESS_ADAPTIVE ? "adaptive"
+			                       : ing_mode == COMP_D3D11_XBRIDGE_INGRESS_DIRECT ? "direct"
+			                       : ing_mode == COMP_D3D11_XBRIDGE_INGRESS_STAGED ? "staged"
+			                                                                       : "none";
 			U_LOG_W(
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
-			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u window_s=10",
+			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u ingress=%s ing_direct=%llu "
+			    "ing_staged=%llu ing_rebind=%llu window_s=10",
 			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
 			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk, mk,
-			    ns, oc);
+			    ns, oc, ing_name, (unsigned long long)ing_direct, (unsigned long long)ing_staged,
+			    (unsigned long long)ing_rebind);
 		}
 	}
 
@@ -8587,8 +8737,14 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
+	svc_split_unshare_source(&mc->atlas_share_handle, &mc->atlas_share_key); // #918 PR 6
 	mc->combined_atlas_dsv.reset();
 	mc->combined_atlas_depth.reset();
+	mc->crop_srv.reset();
+	mc->crop_texture.reset();
+	mc->crop_width = 0;
+	mc->crop_height = 0;
+	svc_split_unshare_source(&mc->crop_share_handle, &mc->crop_share_key); // #918 PR 6
 	mc->font_atlas_srv.reset();
 	mc->font_atlas.reset();
 	mc->logo_srv.reset();
@@ -8805,6 +8961,11 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		atlas_desc.SampleDesc.Count = 1;
 		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
 		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		// #918 PR 6 — the compose path's other adaptive-ingress source (used
+		// whenever the composite already fills the atlas and no crop runs). Every
+		// writer of this texture — per-client blits, chrome, cursor, the ADR-030
+		// crop — is the render thread. 0 while the split is off.
+		atlas_desc.MiscFlags = svc_split_source_misc_flags(sys);
 
 		hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, mc->combined_atlas.put());
 		if (FAILED(hr)) {
@@ -8814,6 +8975,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		}
 		sys->device->CreateShaderResourceView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_srv.put());
 		sys->device->CreateRenderTargetView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_rtv.put());
+		svc_split_share_source(sys, mc->combined_atlas.get(), &mc->atlas_share_handle, &mc->atlas_share_key);
 
 		// Phase 2.K: depth target sibling (D32_FLOAT). Per-eye tiles share
 		// the same depth buffer — depth values stay isolated per-pixel via
@@ -11009,10 +11171,14 @@ pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
  * - the COMPOSE path submits the crop of `mc->combined_atlas`, which this same
  *   thread painted earlier in this same tick, so it needs no guard.
  *
- * One bridge instance serves both. That is what made Option-II (staged) ingress
- * the right choice at Stage A: the submitted SOURCE changes identity — between
- * clients on a focus change, and between a client atlas and the combined atlas
- * on a controller attach — where Option I would re-open an NT handle each time.
+ * One bridge instance serves both, and the submitted SOURCE therefore changes
+ * IDENTITY — between clients on a focus change, and between a client's crop and
+ * the combined atlas on a controller attach. PR 3 answered that by staging every
+ * frame; PR 6 answers it per frame instead (@p src_share / @p src_key): a source
+ * that has held still since the last frame is read IN PLACE and the extra
+ * app-device copy disappears, and the frame a change lands on stages exactly as
+ * before. A source with no share handle (a client's own atlas — written by that
+ * client's IPC thread, so nothing orders it against the producer) always stages.
  *
  * Nothing here waits on the CPU. The submit records three legs and returns; the
  * pick is a poll of already-fired fences, and the one ordering cost is a
@@ -11023,6 +11189,10 @@ pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
  * @param crop_tex The app-device texture the DP would have sampled without the
  *        split — the crop staging texture, or the source atlas when the content
  *        already fills it.
+ * @param src_share @p crop_tex's NT share handle when it is a legal Option-I
+ *        source (runtime-owned, render-thread-written), else NULL.
+ * @param src_key The process-unique ingress key of @p crop_tex's ALLOCATION, or
+ *        0. Never a pointer — see `svc_split_share_source`.
  * @param io_view_w,io_view_h In: the per-view content dims this frame painted.
  *        Out: the dims of the slot actually being woven, which during a resize
  *        can be a frame behind (see #918 R2). The DP derives its tile stride
@@ -11047,6 +11217,8 @@ static ID3D11ShaderResourceView *
 pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
                             int32_t focused_slot,
                             ID3D11Texture2D *crop_tex,
+                            void *src_share,
+                            uint64_t src_key,
                             uint32_t cols,
                             uint32_t rows,
                             uint32_t *io_view_w,
@@ -11095,6 +11267,17 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	// keeps changing (a resize drag) parks the ring at worst-case instead of
 	// rebuilding three NT-shared textures per mouse event.
 	comp_d3d11_xbridge_set_content_size(sys->xbridge, content_w, content_h, sys->split_layout_gen);
+
+	/*
+	 * #918 PR 6 — nominate this frame's ingress source. The bridge answers
+	 * whether the next submit reads it in place; a mismatch (or no handle) simply
+	 * stages, so nothing here needs to branch on the answer at all — the counters
+	 * the [RENDER] line reports come from the bridge, which is the only place
+	 * that knows what a submit ACTUALLY did. The back-fence that makes an
+	 * in-place read safe was issued at the TOP of this render tick, before any
+	 * app-device write.
+	 */
+	(void)comp_d3d11_xbridge_set_source(sys->xbridge, src_share, src_key);
 
 	sys->split_seq++;
 	comp_d3d11_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
@@ -11480,8 +11663,22 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	uint32_t weave_cols = cols;
 	uint32_t weave_rows = rows;
 	if (sys->split_active) {
-		dp_input_srv = pipeline_split_bridge_atlas(sys, focused, crop_tex, cols, rows, &weave_view_w,
-		                                           &weave_view_h, &weave_cols, &weave_rows);
+		/*
+		 * #918 PR 6 — this frame's ingress source, and the ONE rule that decides
+		 * it: the producer may read a texture in place only if the render thread
+		 * is its only writer. `crop_tex` is the client's crop staging texture
+		 * (render-thread-only, nominated) EXCEPT when the content exactly filled
+		 * the atlas and `service_crop_atlas_for_dp` handed back the client's own
+		 * `atlas_texture` — which that client's IPC thread writes, so it is never
+		 * nominated and stages as it always did. Every 3D mode crops by
+		 * construction (ADR-010/ADR-030), so the case that stages is full-screen
+		 * 2D.
+		 */
+		const bool crop_is_source = (crop_tex != nullptr && crop_tex == fc->render.crop_texture.get());
+		dp_input_srv = pipeline_split_bridge_atlas(sys, focused, crop_tex,
+		                                           crop_is_source ? fc->render.split_share_handle : nullptr,
+		                                           crop_is_source ? fc->render.split_share_key : 0, cols, rows,
+		                                           &weave_view_w, &weave_view_h, &weave_cols, &weave_rows);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -11879,6 +12076,7 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
+	svc_split_unshare_source(&mc->atlas_share_handle, &mc->atlas_share_key); // #918 PR 6
 	mc->combined_atlas_dsv.reset();
 	mc->combined_atlas_depth.reset();
 	mc->swap_chain.reset();
@@ -11956,7 +12154,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	 * submitted to the bridge, and the layout generation (below) refuses the
 	 * other path's slots for one frame. `sys->split_active` is Stage A's verdict
 	 * for the life of the process.
+	 *
+	 * #918 PR 6 — the INGRESS BACK-FENCE, and the reason it belongs exactly here.
+	 * Under adaptive ingress the producer's copy of the previous frame reads an
+	 * app-device texture in place, and it is still running when this tick starts.
+	 * `pre_render` queues a GPU-side wait on the app's immediate context for that
+	 * copy, so nothing this tick writes can overwrite pixels it is still reading.
+	 * The immediate context is one ordered stream, so ONE wait at the top covers
+	 * every writer that follows — the ADR-030 crop on the direct path, the whole
+	 * compose pass on the other — which is why the source rule is "render thread
+	 * only": a client's IPC-thread blit into its own atlas is not behind this
+	 * wait, and a client atlas is therefore never nominated as a source.
+	 *
+	 * Free when the previous frames staged (the bridge tracks the last in-place
+	 * submit and waits for nothing else), and a no-op with the split off.
 	 */
+	if (sys->split_active && sys->xbridge != nullptr) {
+		comp_d3d11_xbridge_pre_render(sys->xbridge);
+	}
 
 	if (mc->suspended) {
 		// Workspace deactivated — don't render, wait for re-activation.
@@ -14278,6 +14493,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		if (mc->crop_width != content_w || mc->crop_height != content_h) {
 			mc->crop_srv.reset();
 			mc->crop_texture.reset();
+			svc_split_unshare_source(&mc->crop_share_handle, &mc->crop_share_key); // #918 PR 6
 			D3D11_TEXTURE2D_DESC crop_desc = {};
 			crop_desc.Width = content_w;
 			crop_desc.Height = content_h;
@@ -14287,9 +14503,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			crop_desc.SampleDesc.Count = 1;
 			crop_desc.Usage = D3D11_USAGE_DEFAULT;
 			crop_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			// #918 PR 6 — compose-path adaptive-ingress source; render thread
+			// writes only. 0 while the split is off.
+			crop_desc.MiscFlags = svc_split_source_misc_flags(sys);
 			HRESULT chr = sys->device->CreateTexture2D(&crop_desc, nullptr, mc->crop_texture.put());
 			if (SUCCEEDED(chr)) {
 				sys->device->CreateShaderResourceView(mc->crop_texture.get(), nullptr, mc->crop_srv.put());
+				svc_split_share_source(sys, mc->crop_texture.get(), &mc->crop_share_handle,
+				                       &mc->crop_share_key);
 				mc->crop_width = content_w;
 				mc->crop_height = content_h;
 				U_LOG_W("Multi-comp: created crop texture %ux%u (view=%ux%u)", content_w, content_h, dp_view_w, dp_view_h);
@@ -14345,12 +14566,19 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	uint32_t weave_rows = sys->tile_rows;
 	bool split_no_weave = false;
 	if (sys->split_active) {
-		ID3D11Texture2D *split_src = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture)
-		                                 ? mc->crop_texture.get()
-		                                 : mc->combined_atlas.get();
-		dp_input_srv =
-		    pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns, sys->tile_rows,
-		                                &weave_view_w, &weave_view_h, &weave_cols, &weave_rows);
+		const bool use_crop = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture);
+		ID3D11Texture2D *split_src = use_crop ? mc->crop_texture.get() : mc->combined_atlas.get();
+		/*
+		 * #918 PR 6 — BOTH compose sources are legal Option-I sources: every
+		 * writer of `combined_atlas` (per-client blits, chrome, title bars, font,
+		 * logo, cursor, the ADR-030 crop) and of `mc->crop_texture` (that crop) is
+		 * THIS thread, so the tick-top back-fence covers them.
+		 */
+		void *split_share = use_crop ? mc->crop_share_handle : mc->atlas_share_handle;
+		const uint64_t split_key = use_crop ? mc->crop_share_key : mc->atlas_share_key;
+		dp_input_srv = pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, split_share, split_key,
+		                                           sys->tile_columns, sys->tile_rows, &weave_view_w,
+		                                           &weave_view_h, &weave_cols, &weave_rows);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -25115,6 +25343,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		mc->combined_atlas_rtv.reset();
 		mc->combined_atlas_srv.reset();
 		mc->combined_atlas.reset();
+		svc_split_unshare_source(&mc->atlas_share_handle, &mc->atlas_share_key); // #918 PR 6
 		mc->combined_atlas_dsv.reset();
 		mc->combined_atlas_depth.reset();
 		mc->swap_chain.reset();
