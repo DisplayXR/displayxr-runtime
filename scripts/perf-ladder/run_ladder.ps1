@@ -25,6 +25,7 @@ $reps = $cfg.reps
 if ($Smoke) { $windowSec = 8; $warmupSec = 2; $reps = 1 }
 if ($RepsOverride -gt 0) { $reps = $RepsOverride }
 
+$runStart = Get-Date   # dxr-log harvest is anchored here, not a fixed 3 h net
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $outDir = Join-Path $OutRoot ($env:COMPUTERNAME + '-' + $stamp)
 New-Item -ItemType Directory -Force $outDir | Out-Null
@@ -108,7 +109,7 @@ function Invoke-ArmSample {
         # client DLL has no sibling dependency DLLs, so every registered
         # plug-in fails LoadLibrary err=126 and the run silently degrades to
         # no-DP on every app arm (Arc report 2026-08-21). runtimePath prepends
-        # the dev _packagein to PATH, mirroring the generated run_*.bat.
+        # the dev _package\bin to PATH, mirroring the generated run_*.bat.
         $devPath = $null
         if ($cfg.PSObject.Properties['runtimePath'] -ne $null) { $devPath = $cfg.runtimePath }
         if (-not [string]::IsNullOrEmpty($devPath)) { $lines += ('set "PATH={0};%PATH%"' -f $devPath) }
@@ -259,7 +260,7 @@ if (Test-Path $logDir) {
     $dst = Join-Path $outDir 'dxr-logs'
     New-Item -ItemType Directory -Force $dst | Out-Null
     Get-ChildItem $logDir -Filter '*.log' -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-3) } |
+        Where-Object { $_.LastWriteTime -gt $runStart } |
         Copy-Item -Destination $dst -ErrorAction SilentlyContinue
 }
 & (Join-Path $PSScriptRoot 'summarize.ps1') -ResultsDir $outDir
