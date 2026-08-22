@@ -349,15 +349,16 @@ struct d3d11_client_render_resources
 	wil::com_ptr<IDXGISwapChain1> swap_chain;
 
 	/*!
-	 * #918 PR 3: the device @ref swap_chain (and @ref back_buffer_rtv) were
-	 * created on. NULL when there is no chain.
+	 * #918: the device @ref swap_chain (and @ref back_buffer_rtv) were created
+	 * on. NULL when there is no chain.
 	 *
-	 * Needed because the split can SUSPEND and RESUME under a long-lived client:
-	 * a workspace attach moves the output half back to the app device, and a
-	 * client that connects while the shell is up therefore gets an app-device
-	 * chain that is wrong again the moment the shell detaches. A swap chain's
-	 * device cannot be changed — `ResizeBuffers` will not do it — so the chain
-	 * has to be recreated, and only the CLIENT'S OWN IPC THREAD may do that (the
+	 * PR 3 needed this because the split suspended under a workspace controller,
+	 * so a chain could outlive the device it was built for. PR 4 removed that
+	 * transition — Stage A's verdict now holds for the life of the process — and
+	 * this stays as the TRIPWIRE, because the failure it catches is silent: a
+	 * swap chain's device cannot be changed (`ResizeBuffers` will not do it), a
+	 * present into a foreign-device back buffer shows whatever the weave never
+	 * wrote, and only the CLIENT'S OWN IPC THREAD may rebuild one (the
 	 * DXGI/WM deadlock rule: `CreateSwapChainForHwnd` on a foreign HWND can
 	 * dispatch into that window's thread, and the render thread holds
 	 * `render_mutex`). The render thread therefore only DETECTS the mismatch and
@@ -1463,21 +1464,22 @@ struct d3d11_service_system
 	IDXGIFactory4 *out_factory{nullptr};
 
 	/*!
-	 * #918 PR 3 — the EFFECTIVE split state, which is what every `svc_out_*`
-	 * accessor reads. Distinct from @ref split_available:
+	 * #918 — the EFFECTIVE split state, which is what every `svc_out_*` accessor
+	 * reads. Distinct from @ref split_available only in principle:
 	 *
 	 * - `split_available` is the STAGE-A verdict, latched for process lifetime.
 	 *   The out device, its factory and the bridge exist iff it is true.
 	 * - `split_active` is whether the output half is currently ON that device.
-	 *   The workspace-mode SUSPEND (PR 3's interim; PR 4 replaces it with the
-	 *   real compose-path split) drives it false while a controller is attached,
-	 *   having first moved the panel DP and the service-window chain back to the
-	 *   app device — so the accessors stay truthful about where the resources
-	 *   actually live, which is the whole point of routing ~150 sites through
-	 *   them in PR 2.
 	 *
-	 * Written ONLY by `service_split_sync_engagement`, on the render thread
-	 * under `render_mutex`, immediately after the resources have been rebuilt.
+	 * PR 4 makes the two identical for the session's life. PR 3 drove
+	 * `split_active` false while a workspace controller was attached, because the
+	 * COMPOSE path was not split yet; now both paths cross the same bridge, so
+	 * there is no state in which the output half moves back. Attaching and
+	 * detaching a controller changes WHICH source is submitted, not WHERE the
+	 * weave and the present happen — one less rebind class, and the panel DP
+	 * stays put across the transition.
+	 *
+	 * Written ONLY by Stage A, before the first client exists.
 	 */
 	bool split_active{false};
 	bool split_available{false};
@@ -1514,10 +1516,30 @@ struct d3d11_service_system
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t split_seq{0};
 
-	/*! @name #918 PR 3 — split counters on the `[RENDER]` 10 s window.
+	/*!
+	 * #918 PR 4 — the OUTPUT-DEVICE crop, and the one thing on the output half
+	 * that is not a presenter surface.
+	 *
+	 * The steady state needs none of this: the service crops on the app device
+	 * before the atlas ever crosses, so the egress ring is content-sized and the
+	 * DP samples it directly. But the R2 hysteresis deliberately parks the ring
+	 * at WORST-CASE through an interactive resize (rebuilding three NT-shared
+	 * textures per mouse event is what it exists to avoid), and the DP derives
+	 * its tile stride from the atlas width — so a worst-case ring holding a
+	 * smaller content box would slice every tile at the wrong offset.
+	 *
+	 * PR 3 refused those frames and held the last good one for the length of the
+	 * drag. This is the crop that makes them weavable: one same-device
+	 * `CopySubresourceRegion` of the slot's own content box, no shader, no second
+	 * crossing. Released before @ref out_dev is.
+	 */
+	wil::com_ptr<ID3D11Texture2D> split_out_crop_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> split_out_crop_srv;
+	uint32_t split_out_crop_w{0};
+	uint32_t split_out_crop_h{0};
+
+	/*! @name #918 — split counters on the `[RENDER]` 10 s window.
 	 * @{ */
-	//! Workspace attaches that suspended the split (and detaches that resumed it).
-	std::atomic<uint32_t> render_diag_split_suspend{0};
 	//! Panel-DP rebinds that CROSSED devices (the eligibility boundary).
 	std::atomic<uint32_t> render_diag_pipe_dev_rebind{0};
 	//! Unfocused-APP_HWND flat repaints skipped because the split is on.
@@ -1525,9 +1547,13 @@ struct d3d11_service_system
 	//! Zone-mask publishes skipped because the mask and the DP are on different
 	//! devices (an ineligible presenter under an active split). PR 5 removes it.
 	std::atomic<uint32_t> render_diag_maskpub_skip{0};
-	//! Frames the direct path could not weave because the bridge had no slot of
-	//! the current generation, or the egress ring was not content-sized.
+	//! Frames EITHER path could not weave because the bridge had no slot of the
+	//! current generation (warmup, a mode switch, a focus change, a controller
+	//! attaching or detaching). Both paths hold the last good frame instead.
 	std::atomic<uint32_t> render_diag_split_no_slot{0};
+	//! Frames rescued by the output-device crop because the R2 hysteresis was
+	//! holding a worst-case egress ring (an interactive resize).
+	std::atomic<uint32_t> render_diag_split_out_crop{0};
 	/*! @} */
 };
 
@@ -1630,9 +1656,10 @@ dxr_test_split_fail_stage_a()
  *
  * Everything here is best-effort: on ANY failure the exact reason is logged
  * ONCE and the service falls through to the stock single-device path. The
- * verdict is latched for process lifetime (`sys->split_available`) — the split
- * is never toggled live, only SUSPENDED and RESUMED by the workspace rule,
- * which moves resources rather than re-running this.
+ * verdict is latched for process lifetime (`sys->split_available`) and is never
+ * toggled live: since PR 4 split BOTH the direct and the compose path, no event
+ * — a controller attaching, a focus change, a mode switch — moves the output
+ * half back.
  *
  * Runs on the thread that creates the system compositor, before any client
  * exists, so nothing here races anything.
@@ -2889,13 +2916,13 @@ struct d3d11_multi_compositor
 	HWND panel_dp_hwnd;
 
 	/*!
-	 * #918 PR 3: the DEVICE `display_processor` was created against — the other
-	 * half of the bind key.
+	 * #918: the DEVICE `display_processor` was created against — the other half
+	 * of the bind key.
 	 *
 	 * A D3D11 resource driven by a foreign device does nothing, silently, so
 	 * "which device is the panel DP on?" has to be a fact the render thread can
-	 * read rather than infer from `sys->split_active` (which the workspace
-	 * suspend moves, and which the eligibility rule qualifies). Every
+	 * read rather than infer from `sys->split_active` (which the eligibility rule
+	 * qualifies per presenter, and which a dwelling rebind lags). Every
 	 * `process_atlas` site compares against it before weaving; a mismatch skips
 	 * the weave rather than handing the vendor a cross-device SRV.
 	 *
@@ -5426,9 +5453,9 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				svc_out_device(sys)->CreateRenderTargetView(bb.get(), nullptr,
 				                                            res->back_buffer_rtv.put());
 				svc_assert_same_device(res->back_buffer_rtv.get(), svc_out_device(sys));
-				// #918: record WHICH device, so a later split suspend/resume can
-				// tell that this chain has to be rebuilt (a chain's device cannot
-				// be changed — not even by ResizeBuffers).
+				// #918: record WHICH device, so the wrong-device tripwires can
+				// tell (a chain's device cannot be changed — not even by
+				// ResizeBuffers, so the answer is always "recreate").
 				res->chain_device = svc_out_device(sys);
 				if (res->frame_latency_waitable != nullptr) {
 					U_LOG_W(
@@ -7956,28 +7983,27 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		    ap, as, ab, fp, fs, rb, sr, ac, pk);
 
 		/*
-		 * #918: the split's own window. `split` is the EFFECTIVE state (0 while a
-		 * controller is attached, even on a session that stood the split up);
-		 * `xb_kb` is atlas transport per window, which is the number that says
-		 * whether the bridge is carrying what it should; `xb_degraded` means the
-		 * cross-adapter fence watchdog gave up and the last good slot is being
-		 * re-woven. Emitted only when Stage A succeeded, so an ordinary session's
-		 * log is unchanged.
+		 * #918: the split's own window. `xb_kb` is atlas transport per window,
+		 * which is the number that says whether the bridge is carrying what it
+		 * should; `xb_degraded` means the cross-adapter fence watchdog gave up and
+		 * the last good slot is being re-woven; `out_crop` counts frames the
+		 * output-device crop rescued from a worst-case egress ring. Emitted only
+		 * when Stage A succeeded, so an ordinary session's log is unchanged.
 		 */
 		if (sys->split_available) {
 			uint32_t dr = sys->render_diag_pipe_dev_rebind.exchange(0, std::memory_order_relaxed);
-			uint32_t ss = sys->render_diag_split_suspend.exchange(0, std::memory_order_relaxed);
 			uint32_t fk = sys->render_diag_flat_skip_split.exchange(0, std::memory_order_relaxed);
 			uint32_t mk = sys->render_diag_maskpub_skip.exchange(0, std::memory_order_relaxed);
 			uint32_t ns = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
+			uint32_t oc = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
 			const uint64_t xb_bytes =
 			    sys->xbridge != nullptr ? comp_d3d11_xbridge_take_atlas_bytes(sys->xbridge) : 0;
 			U_LOG_W(
-			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u split_suspend=%u "
-			    "flat_skip=%u maskpub_skip=%u no_slot=%u window_s=10",
+			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
+			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u window_s=10",
 			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
-			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, ss, fk,
-			    mk, ns);
+			    (int)(sys->xbridge != nullptr && comp_d3d11_xbridge_is_degraded(sys->xbridge)), dr, fk, mk,
+			    ns, oc);
 		}
 	}
 
@@ -8528,11 +8554,10 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
  * The service window's swap chain, its late-weave waitable and its back-buffer
  * RTV, on whichever device the output half currently lives on.
  *
- * Extracted (#918) because there are now THREE reasons to build it: first
- * creation, the DP-reported-size recreate, and — new — a change of DEVICE, when
- * the workspace rule suspends or resumes the split under a live session. A swap
- * chain's device cannot be changed, so that third case is a recreate too, and
- * having one function means it can never drift from the other two.
+ * Extracted (#918) because there are two reasons to build it — first creation
+ * and the DP-reported-size recreate — and both must agree about which device
+ * owns the chain. (PR 3 had a third, a DEVICE change on workspace attach; PR 4
+ * deleted that transition, but one function is still the right shape.)
  *
  * Caller releases the previous chain (and its waitable) first; the render thread
  * must not be reading them.
@@ -10104,11 +10129,12 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 	c->force_unpaced_present = false;
 
 	/*
-	 * #918: this chain is on the wrong DEVICE — a split suspend or resume landed
-	 * under a live session and the client's own IPC thread has not rebuilt it
-	 * yet (only that thread may, per the DXGI/WM deadlock rule). Presenting into
-	 * it would drive a back buffer the weave never wrote. Not ready; its next
-	 * commit rebuilds and the frame after that lands normally.
+	 * #918: this chain is on the wrong DEVICE. Since PR 4 the split never moves
+	 * under a live session, so this is a tripwire rather than a routine state —
+	 * but it stays armed, because presenting into such a chain drives a back
+	 * buffer the weave never wrote and D3D11 reports nothing. Not ready; the
+	 * client's own IPC thread rebuilds on its next commit (only that thread may,
+	 * per the DXGI/WM deadlock rule) and the frame after that lands normally.
 	 */
 	if (c->sys != nullptr && c->render.chain_device != nullptr &&
 	    c->render.chain_device != svc_out_device(c->sys)) {
@@ -10162,8 +10188,9 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 			if (c->render.swap_chain &&
 			    SUCCEEDED(c->render.swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
 				// #918: the depth this chain was CREATED at, derived from its
-				// own device rather than the live split state — the workspace
-				// suspend can have moved the latter since.
+				// own device rather than the live split state — they agree
+				// since PR 4, and deriving it from the chain keeps the two
+				// facts from ever having to.
 				sc2->SetMaximumFrameLatency(
 				    dxr_app_hwnd_latency(c->sys != nullptr && c->sys->out_dev != nullptr &&
 				                         c->render.chain_device == c->sys->out_dev));
@@ -10835,21 +10862,115 @@ pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 }
 
 /*!
- * #918 — ship the focused client's cropped atlas across the adapter boundary and
- * hand back the OUTPUT-DEVICE shader resource view the panel DP should weave.
+ * #918 PR 4 — the layout signature's slot field for the COMPOSE path.
  *
- * Called by the direct path only, once per rendered frame, on the render thread
- * with `render_mutex` and the focused client's `atlas_read_guard` both held —
- * the guard because the staged (Option II) ingress copy reads @p crop_tex, which
- * for a full-atlas submission IS the client's atlas.
+ * The compose path has no focused slot: it weaves ONE combined atlas built from
+ * every client. It needs a value no real slot index can take, because attaching
+ * or detaching a controller switches which source the bridge carries, and that
+ * is exactly as much of a recipe change as a focus change or a 3D<->2D flip. A
+ * slot the direct path filled must never be woven for the compose geometry, or
+ * the other way round.
+ *
+ * One past the last real index — deliberately NOT -1, which is the direct path's
+ * live "no focused slot" value.
+ */
+static constexpr int32_t SPLIT_COMPOSE_SLOT = D3D11_MULTI_MAX_CLIENTS;
+
+/*!
+ * #918 PR 4 — crop an egress slot to its own content box, ON THE OUTPUT DEVICE.
+ *
+ * Only ever needed while the R2 hysteresis holds a worst-case egress ring (an
+ * interactive resize). Both the source and the destination are output-device
+ * textures, so this is a plain same-device sub-rect copy — the blit shaders all
+ * live on the app device and none of them are wanted here.
+ *
+ * Called on the render thread under `render_mutex`, after the GPU wait on the
+ * slot has been queued on the output context, so the copy is correctly ordered
+ * behind the cross-adapter consumer copy.
+ *
+ * @return an output-device SRV of a @p w x @p h texture holding the slot's
+ *         content, or NULL if the staging texture could not be made — in which
+ *         case the caller holds the last good frame exactly as PR 3 did.
+ */
+static ID3D11ShaderResourceView *
+pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
+                                  ID3D11ShaderResourceView *egress_srv,
+                                  uint32_t w,
+                                  uint32_t h)
+{
+	if (egress_srv == nullptr || w == 0 || h == 0) {
+		return nullptr;
+	}
+	if (sys->split_out_crop_w != w || sys->split_out_crop_h != h) {
+		sys->split_out_crop_srv.reset();
+		sys->split_out_crop_tex.reset();
+		sys->split_out_crop_w = 0;
+		sys->split_out_crop_h = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // the bridge's transport format
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, sys->split_out_crop_tex.put());
+		if (SUCCEEDED(hr)) {
+			hr = svc_out_device(sys)->CreateShaderResourceView(sys->split_out_crop_tex.get(), nullptr,
+			                                                   sys->split_out_crop_srv.put());
+		}
+		if (FAILED(hr)) {
+			sys->split_out_crop_srv.reset();
+			sys->split_out_crop_tex.reset();
+			U_LOG_W("#918: output-device crop texture %ux%u failed (0x%08lx) — holding the last good frame",
+			        w, h, (unsigned long)hr);
+			return nullptr;
+		}
+		sys->split_out_crop_w = w;
+		sys->split_out_crop_h = h;
+		U_LOG_W("#918: output-device crop staging at %ux%u (the egress ring is parked at worst-case)", w, h);
+	}
+
+	wil::com_ptr<ID3D11Resource> src;
+	egress_srv->GetResource(src.put());
+	if (!src) {
+		return nullptr;
+	}
+	D3D11_BOX box = {0, 0, 0, w, h, 1};
+	svc_out_context(sys)->CopySubresourceRegion(sys->split_out_crop_tex.get(), 0, 0, 0, 0, src.get(), 0, &box);
+	sys->render_diag_split_out_crop.fetch_add(1, std::memory_order_relaxed);
+	return sys->split_out_crop_srv.get();
+}
+
+/*!
+ * #918 — ship the cropped DP-input atlas across the adapter boundary and hand
+ * back the OUTPUT-DEVICE shader resource view the panel DP should weave.
+ *
+ * Called once per rendered frame by BOTH paths, on the render thread under
+ * `render_mutex`:
+ *
+ * - the DIRECT path submits the focused client's crop, and additionally holds
+ *   that client's `atlas_read_guard` — the staged (Option II) ingress copy reads
+ *   @p crop_tex, which for a full-atlas submission IS the client's atlas;
+ * - the COMPOSE path submits the crop of `mc->combined_atlas`, which this same
+ *   thread painted earlier in this same tick, so it needs no guard.
+ *
+ * One bridge instance serves both. That is what made Option-II (staged) ingress
+ * the right choice at Stage A: the submitted SOURCE changes identity — between
+ * clients on a focus change, and between a client atlas and the combined atlas
+ * on a controller attach — where Option I would re-open an NT handle each time.
  *
  * Nothing here waits on the CPU. The submit records three legs and returns; the
  * pick is a poll of already-fired fences, and the one ordering cost is a
  * GPU-side wait queued on the output context.
  *
+ * @param focused_slot The focused client's slot on the direct path,
+ *        @ref SPLIT_COMPOSE_SLOT on the compose path.
  * @param crop_tex The app-device texture the DP would have sampled without the
- *        split — the crop staging texture, or the client's atlas when the
- *        content already fills it.
+ *        split — the crop staging texture, or the source atlas when the content
+ *        already fills it.
  * @param io_view_w,io_view_h In: the per-view content dims this frame painted.
  *        Out: the dims of the slot actually being woven, which during a resize
  *        can be a frame behind (see #918 R2). The DP derives its tile stride
@@ -10886,10 +11007,12 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	 * at the box it was painted with).
 	 *
 	 * The service's signature carries one term the in-process compositor's does
-	 * not: the FOCUSED SLOT. In-process, the atlas belongs to one session for
-	 * life. Here it is whichever client won the presenter election, and a focus
-	 * change is exactly as much of a recipe change as a 3D<->2D flip — a slot
-	 * the previous app filled must never be woven for the new one's geometry.
+	 * not: the SOURCE. In-process, the atlas belongs to one session for life.
+	 * Here it is whichever client won the presenter election — or, under a
+	 * controller, the combined atlas (@ref SPLIT_COMPOSE_SLOT). A focus change
+	 * and a controller attach are each exactly as much of a recipe change as a
+	 * 3D<->2D flip: a slot the previous source filled must never be woven for
+	 * the new one's geometry.
 	 */
 	const uint64_t sig = ((uint64_t)(uint32_t)focused_slot << 44) | ((uint64_t)cols << 22) | (uint64_t)rows;
 	if (sig != sys->split_layout_sig) {
@@ -10940,38 +11063,35 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 		return nullptr;
 	}
 
-	/*
-	 * The egress ring must already BE the slot's content box. The service crops
-	 * on the app device before the atlas ever crosses, so the steady state is a
-	 * content-sized ring and no second crop is needed — but the R2 hysteresis
-	 * deliberately parks the ring at worst-case through a resize drag, and a
-	 * top-left crop of a worst-case ring would slice every tile at the wrong
-	 * stride. PR 3 has no output-device crop pass (the blit shaders are all on
-	 * the app device), so it refuses those frames and counts them: the panel
-	 * holds its last good frame for the length of the drag. PR 4 brings the
-	 * output-device composite that makes a crop available here.
-	 */
-	uint32_t eg_w = 0, eg_h = 0;
-	comp_d3d11_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
-	if (eg_w != slot_w || eg_h != slot_h) {
-		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
-		static std::atomic<int64_t> s_last_log_ns{0};
-		int64_t now_ns = (int64_t)os_monotonic_get_ns();
-		int64_t prev_ns = s_last_log_ns.load(std::memory_order_relaxed);
-		if (now_ns - prev_ns > 2000000000LL && s_last_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
-			U_LOG_W(
-			    "#918: egress ring is %ux%u but slot %d holds %ux%u content — no output-device crop on "
-			    "this path, holding the last good frame (throttled)",
-			    eg_w, eg_h, (int)slot, slot_w, slot_h);
-		}
-		return nullptr;
-	}
-
 	comp_d3d11_xbridge_gpu_wait_slot(sys->xbridge, slot);
 	auto *srv = static_cast<ID3D11ShaderResourceView *>(comp_d3d11_xbridge_get_srv(sys->xbridge, slot));
 	if (srv == nullptr) {
 		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
+	}
+
+	/*
+	 * What the DP is handed must BE the slot's content box, because it derives
+	 * its tile stride from the atlas width. The service crops on the app device
+	 * before the atlas ever crosses, so the steady state is a content-sized ring
+	 * and this costs nothing — but the R2 hysteresis deliberately parks the ring
+	 * at WORST-CASE through a resize drag, and a worst-case ring holding a
+	 * smaller content box would slice every tile at the wrong offset.
+	 *
+	 * PR 3 refused those frames and held the last good one for the length of the
+	 * drag. Now they are cropped on the output device instead — one same-device
+	 * sub-rect copy, no shader — so a correctly-sized weave lands every frame of
+	 * a resize with no ring rebuild at all, which is the trade the hysteresis was
+	 * written to make.
+	 */
+	uint32_t eg_w = 0, eg_h = 0;
+	comp_d3d11_xbridge_get_egress_dims(sys->xbridge, &eg_w, &eg_h);
+	if (eg_w != slot_w || eg_h != slot_h) {
+		srv = pipeline_split_crop_on_out_device(sys, srv, slot_w, slot_h);
+		if (srv == nullptr) {
+			sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
+			return nullptr;
+		}
 	}
 	comp_d3d11_xbridge_set_weave_slot(sys->xbridge, slot);
 
@@ -11692,110 +11812,6 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 }
 
 /*!
- * #918 PR 3 — the WORKSPACE SUSPEND, and its resume.
- *
- * PR 3 splits the DIRECT path only. When a workspace controller attaches, the
- * COMPOSE path takes over, and that path is not split yet (PR 4): it renders N
- * client atlases into an app-device combined atlas, and its DP and back buffer
- * would have to be on the scanout adapter with nothing to carry the combined
- * atlas across. So the split SUSPENDS while a controller is attached, and the
- * shell behaves exactly as it does on `main`.
- *
- * The move is:
- *   1. retire the panel DP — it belongs to the outgoing device;
- *   2. drop the service window's chain, waitable and RTV — same;
- *   3. flip `sys->split_active`, which is what every `svc_out_*` accessor reads,
- *      so from here on the whole file agrees about where things live;
- *   4. rebuild the service chain on the incoming device.
- *
- * Client APP_HWND chains are NOT rebuilt here. Only the owning client's IPC
- * thread may call `CreateSwapChainForHwnd` on the app's window (the DXGI/WM
- * deadlock rule — this is the render thread, holding `render_mutex`), so they
- * are left stale; `pipeline_app_hwnd_ready` skips a stale presenter and the
- * client's own next commit rebuilds it. Under a controller those clients are
- * composed rather than presented anyway, so the skip costs nothing there.
- *
- * The panel DP is deliberately NOT recreated here — `pipeline_bind_panel_dp` on
- * the next frame does it with the graveyard grace and the factory backoff that
- * every other rebind gets.
- *
- * Render thread, under `render_mutex`. Returns true when a transition happened.
- */
-static bool
-service_split_sync_engagement(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
-{
-	if (!sys->split_available || mc == nullptr) {
-		return false;
-	}
-	const bool want = !sys->workspace_mode;
-	if (want == sys->split_active) {
-		return false;
-	}
-
-	U_LOG_W("#918 output-device split %s: %s", want ? "RESUMING" : "SUSPENDING",
-	        want ? "controller detached — direct path moves back to the scanout device"
-	             : "controller attached — compose path is not split until PR 4, moving back to the service "
-	               "device");
-
-	// (1) The panel DP.
-	if (mc->display_processor != nullptr) {
-		if (mc->window != nullptr) {
-			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
-		}
-		struct xrt_display_processor_d3d11 *old = mc->display_processor;
-		HWND old_hwnd = mc->panel_dp_hwnd;
-		ID3D11Device *old_dev = mc->panel_dp_device;
-		mc->display_processor = nullptr;
-		mc->panel_dp_hwnd = nullptr;
-		mc->panel_dp_device = nullptr;
-		mc->panel_dp_encoding = -1;
-		pipeline_dp_retire(mc, old, old_hwnd, old_dev);
-	}
-
-	// (2) The service window's output objects.
-	mc->back_buffer_rtv.reset();
-	mc->swap_chain.reset();
-	mc->frame_latency_waitable = nullptr; // owned by the chain, released with it
-	// #1014 Bug B: a pacing token won on a chain that no longer exists is dead
-	// weight, and the pacer must not park on a freed waitable.
-	mc->pace_app_waitable = nullptr;
-	mc->pace_app_sc = nullptr;
-	mc->app_present_token.store(false, std::memory_order_release);
-	mc->app_present_token_sc = nullptr;
-
-	// (3) THE flip. Everything above released the outgoing device's objects;
-	// everything below allocates on the incoming one.
-	sys->split_active = want;
-	if (!want) {
-		sys->render_diag_split_suspend.fetch_add(1, std::memory_order_relaxed);
-	}
-	// A resumed split must not weave a slot the pre-suspend session filled: the
-	// generation bump refuses every one of them by construction (#918 R1).
-	sys->split_layout_sig = 0;
-
-	// (4) The service chain, on the incoming device.
-	if (mc->hwnd != nullptr) {
-		uint32_t w = sys->output_width, h = sys->output_height;
-		RECT cr;
-		if (GetClientRect(mc->hwnd, &cr)) {
-			uint32_t cw = (uint32_t)(cr.right - cr.left);
-			uint32_t ch = (uint32_t)(cr.bottom - cr.top);
-			if (cw > 0 && ch > 0) {
-				w = cw;
-				h = ch;
-			}
-		}
-		HRESULT hr = multi_compositor_create_service_chain(sys, mc, w, h);
-		if (FAILED(hr)) {
-			service_note_device_lost(sys, hr, "service_split_sync_engagement/swapchain"); // #1002
-			U_LOG_E("#918: service-window chain rebuild failed after a split transition (0x%08lx)",
-			        (unsigned long)hr);
-		}
-	}
-	return true;
-}
-
-/*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
  *
@@ -11853,18 +11869,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	/*
-	 * #918: engage or suspend the output-device split before anything reads a
-	 * presenter surface this frame. Deliberately AFTER the device-removed gate
-	 * (a transition allocates) and BEFORE the suspended / dismissed early-outs,
-	 * so a controller attaching while the pipeline is otherwise idle still moves
-	 * the output half back to the service device.
+	 * #918 PR 4: nothing to engage or suspend here any more. Both the direct and
+	 * the compose path weave and present on the output device, so a controller
+	 * attaching or detaching moves no resource: it changes which source is
+	 * submitted to the bridge, and the layout generation (below) refuses the
+	 * other path's slots for one frame. `sys->split_active` is Stage A's verdict
+	 * for the life of the process.
 	 */
-	if (service_split_sync_engagement(sys, mc)) {
-		// The panel DP and the service chain were just rebuilt on the other
-		// device. Let the next tick drive the frame — the DP rebind wants its
-		// graveyard grace, and there is nothing to present into yet.
-		return;
-	}
 
 	if (mc->suspended) {
 		// Workspace deactivated — don't render, wait for re-activation.
@@ -14227,8 +14238,89 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	/*
+	 * #918 PR 4 — THE SPLIT, on the compose path.
+	 *
+	 * Everything above this line is unchanged and stays on the APP device: the
+	 * per-client blits, the chrome, the title bars, the font, the logo, the
+	 * cursor and the ADR-030 crop all paint into `combined_atlas`, which is
+	 * where they have always painted. What changes is where the result goes.
+	 * The cropped composite crosses the SAME bridge instance the direct path
+	 * uses (one image per rendered frame — the service never calls
+	 * `set_background_2d`, and Local2D and zones composite into the client
+	 * atlas pre-DP, so there is no plane transport here at all), and the weave
+	 * and the present below run on the OUTPUT device.
+	 *
+	 * The source handed to the bridge is the crop texture when the crop ran,
+	 * and the combined atlas when it did not (content already fills it, or the
+	 * crop texture failed to allocate) — read off `dp_input_srv` rather than
+	 * re-deriving the condition, so the two can never disagree.
+	 */
+	struct xrt_display_processor_d3d11 *compose_dp = mc->display_processor;
+	uint32_t weave_view_w = dp_view_w;
+	uint32_t weave_view_h = dp_view_h;
+	bool split_no_weave = false;
+	if (sys->split_active) {
+		ID3D11Texture2D *split_src = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture)
+		                                 ? mc->crop_texture.get()
+		                                 : mc->combined_atlas.get();
+		dp_input_srv = pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns,
+		                                           sys->tile_rows, &weave_view_w, &weave_view_h);
+		if (dp_input_srv == nullptr) {
+			/*
+			 * Nothing weavable this frame — warmup, or a slot whose recipe the
+			 * DP has since left (the frame a controller attaches or detaches is
+			 * exactly that). Skipping the PRESENT too is deliberate: with
+			 * FLIP_DISCARD the panel keeps showing the last frame it was given,
+			 * where presenting the cleared back buffer would be a black flash.
+			 * Counted inside the helper, never logged per frame.
+			 */
+			split_no_weave = true;
+		}
+
+		/*
+		 * #918 — the same load-bearing tripwire the direct path carries. A DP on
+		 * the wrong device would drive `svc_out_context` resources that are not
+		 * its own: in D3D11 that is not an error, it is silence. The dwell
+		 * hysteresis in `pipeline_bind_panel_dp` can legitimately leave the DP
+		 * one rebind behind for up to a second, so this is a real state — degrade
+		 * to the egress copy below rather than hand the vendor a foreign SRV.
+		 */
+		if (compose_dp != nullptr && mc->panel_dp_device != svc_out_device(sys)) {
+			static std::atomic<int64_t> s_last_devlog_ns{0};
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_devlog_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_devlog_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_W(
+				    "Multi-comp: panel DP is on device %p but the service window's surface is on %p "
+				    "— not weaving (device rebind pending; #918, throttled)",
+				    (void *)mc->panel_dp_device, (void *)svc_out_device(sys));
+			}
+			compose_dp = nullptr;
+		}
+	}
+
+	/* #918 diagnosis (DXR_SPLIT_COVER_DIAG), the compose path's arm of the direct
+	 * path's probe: what DXGI handed us, and — with `=2` — a magenta sentinel, so
+	 * the post-weave sample reads "the DP drew here" directly rather than by
+	 * inference. Off by default; two staging maps per frame when on. */
+	const int compose_cover_mode = sys->split_active ? dxr_split_cover_diag_mode() : 0;
+	uint32_t compose_cover_pre[5] = {};
+	bool compose_cover_pre_ok = false;
+	uint32_t compose_bb_w = 0, compose_bb_h = 0;
+	if (compose_cover_mode > 0 && mc->back_buffer_rtv) {
+		pipeline_rtv_dims(mc->back_buffer_rtv.get(), &compose_bb_w, &compose_bb_h);
+		compose_cover_pre_ok = dxr_split_cover_sample(sys, mc->back_buffer_rtv.get(), nullptr, compose_bb_w,
+		                                              compose_bb_h, compose_cover_pre);
+		if (compose_cover_mode >= 2) {
+			const float sentinel[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+			svc_out_context(sys)->ClearRenderTargetView(mc->back_buffer_rtv.get(), sentinel);
+		}
+	}
+
 	// Run DP on cropped atlas → back buffer
-	if (mc->display_processor != nullptr && dp_input_srv && mc->back_buffer_rtv) {
+	if (compose_dp != nullptr && dp_input_srv && mc->back_buffer_rtv) {
 		svc_assert_same_device(mc->back_buffer_rtv.get(), svc_out_device(sys));
 		ID3D11RenderTargetView *out_rtvs[] = {mc->back_buffer_rtv.get()};
 		svc_out_context(sys)->OMSetRenderTargets(1, out_rtvs, nullptr);
@@ -14260,37 +14352,91 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// but a background present-owner's weave_submit flips the shared DP to
 		// alpha-gate between compose ticks, and nothing flipped it back for
 		// the compose itself.
-		pipeline_dp_set_transparency(mc, mc->display_processor, /*client_presents*/ false, "compose");
-		pipeline_dp_set_encoding(mc, mc->display_processor,
-		                         compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED,
-		                         "compose");
+		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
+		pipeline_dp_set_encoding(
+		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
 		g_weave_latency_workspace.mark_weave("workspace");
 		// Timing feedback: measured weave→scanout of the last completed frame
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
 		// predictor's exact horizon.
-		xrt_display_processor_d3d11_set_frame_timing(
-		    mc->display_processor, g_weave_latency_workspace.measured_r_ns,
-		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
-		xrt_display_processor_d3d11_process_atlas(
-		    mc->display_processor, svc_out_context(sys), dp_input_srv,
-		    dp_view_w, dp_view_h, sys->tile_columns, sys->tile_rows,
-		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
-		    0, 0, 0, 0);
+		xrt_display_processor_d3d11_set_frame_timing(compose_dp, g_weave_latency_workspace.measured_r_ns,
+		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		// #918: `weave_view_*` is `dp_view_*` off the split, and the dims of the
+		// slot actually being woven under it — which through a resize the R2
+		// hysteresis survived can be one frame behind the live box. The DP derives
+		// its tile stride from the atlas width, so weaving a surviving slot at the
+		// CURRENT box would slice every tile at the wrong offset.
+		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
+		xrt_display_processor_d3d11_process_atlas(compose_dp, svc_out_context(sys), dp_input_srv, weave_view_w,
+		                                          weave_view_h, sys->tile_columns, sys->tile_rows,
+		                                          DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h, 0, 0, 0, 0);
+	} else if (sys->split_active && dp_input_srv && mc->back_buffer_rtv) {
+		/*
+		 * #918 — the no-DP fallback UNDER THE SPLIT, the compose path's copy of
+		 * the direct path's. The combined atlas is an APP-device texture and the
+		 * back buffer is an OUT-device one, so the stock `CopyResource` below
+		 * would be a cross-device no-op — silence, not an error, and black on the
+		 * panel. The bridge's egress slot is already on the right device and the
+		 * pick resolved its content box, so copy THAT instead.
+		 */
+		wil::com_ptr<ID3D11Resource> bb, egress;
+		mc->back_buffer_rtv->GetResource(bb.put());
+		dp_input_srv->GetResource(egress.put());
+		if (bb && egress) {
+			uint32_t bw = 0, bh = 0;
+			pipeline_rtv_dims(mc->back_buffer_rtv.get(), &bw, &bh);
+			uint32_t cw = (sys->tile_columns * weave_view_w) < bw ? (sys->tile_columns * weave_view_w) : bw;
+			uint32_t chh = (sys->tile_rows * weave_view_h) < bh ? (sys->tile_rows * weave_view_h) : bh;
+			if (cw > 0 && chh > 0) {
+				D3D11_BOX box = {0, 0, 0, cw, chh, 1};
+				svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, egress.get(), 0,
+				                                            &box);
+			}
+		}
 	} else if (mc->back_buffer_rtv && mc->combined_atlas && !sys->split_active) {
 		// Fallback: no DP — raw copy to back buffer
 		wil::com_ptr<ID3D11Resource> back_buffer;
 		mc->back_buffer_rtv->GetResource(back_buffer.put());
 		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
-	} else if (mc->back_buffer_rtv && mc->combined_atlas) {
-		/*
-		 * #918 — unreachable in PR 3 (a controller is attached here, and the
-		 * workspace rule SUSPENDS the split before the compose path can run), but
-		 * stated rather than assumed: the combined atlas is an APP-device texture
-		 * and the back buffer would be an OUT-device one, and a cross-device
-		 * CopyResource is silence, not an error. Skip and count; PR 4 brings the
-		 * compose path across properly.
-		 */
-		sys->render_diag_split_no_slot.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	if (compose_cover_mode > 0 && mc->back_buffer_rtv) {
+		uint32_t cover_post[5] = {};
+		if (dxr_split_cover_sample(sys, mc->back_buffer_rtv.get(), nullptr, compose_bb_w, compose_bb_h,
+		                           cover_post)) {
+			const int pre_black = compose_cover_pre_ok && dxr_split_cover_all_black(compose_cover_pre);
+			const int post_black = dxr_split_cover_all_black(cover_post);
+			// What the DP was HANDED. Black here means the black arrived from
+			// upstream (the composite, the crop, the crossing) rather than from
+			// the weave.
+			int in_black = 0;
+			if (dp_input_srv != nullptr) {
+				uint32_t cover_in[5] = {};
+				if (dxr_split_cover_sample(sys, nullptr, dp_input_srv, 0, 0, cover_in)) {
+					in_black = dxr_split_cover_all_black(cover_in);
+				}
+			}
+			int survivors = 0;
+			for (uint32_t i = 0; i < 5; i++) {
+				const bool untouched =
+				    (compose_cover_mode >= 2)
+				        ? ((cover_post[i] & 0x00ffffffu) == 0x00ff00ffu)
+				        : (compose_cover_pre_ok && cover_post[i] == compose_cover_pre[i]);
+				if (untouched) {
+					survivors++;
+				}
+			}
+			struct xrt_eye_positions ep = {};
+			if (mc->display_processor != nullptr) {
+				xrt_display_processor_d3d11_get_predicted_eye_positions(mc->display_processor, &ep);
+			}
+			dxr_split_cover_note(sys,
+			                     survivors == 0   ? SPLIT_COVER_FULL
+			                     : survivors == 5 ? SPLIT_COVER_NONE
+			                                      : SPLIT_COVER_PARTIAL,
+			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep,
+			                     g_weave_latency_workspace.measured_r_ns);
+		}
 	}
 
 	// Phase 8: screenshot file-trigger now routes through the same capture path
@@ -14352,7 +14498,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Present
-	if (mc->swap_chain) {
+	//
+	// #918: `split_no_weave` means the bridge had nothing weavable this frame, so
+	// the back buffer holds no content of this generation. Presenting it is the
+	// black flash; skipping holds the last good frame under FLIP_DISCARD. The
+	// atlas above was still composited and the capture paths still saw it — only
+	// the flip is skipped.
+	if (mc->swap_chain && !split_no_weave) {
 		// #924: NEVER call a blocking Present without a free back buffer.
 		// With the frame-latency waitable (late-weave), the pacer's wait
 		// consumed the buffer-free signal and granted a one-present token.
@@ -15874,11 +16026,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	/*
-	 * #918: this client's swap chain is on the wrong DEVICE — the split suspended
-	 * or resumed under a live session. A chain's device cannot be changed, so it
-	 * has to be recreated, and only THIS thread (the client's own IPC thread) may
-	 * do that for the app's HWND. Flagged here and handled inside the resize pass,
-	 * which already takes render_mutex in the right order.
+	 * #918: this client's swap chain is on the wrong DEVICE. PR 4 removed the
+	 * transition that used to cause it (the workspace suspend), so this is the
+	 * recovery arm of a tripwire now — kept because a chain's device cannot be
+	 * changed, only recreated, and only THIS thread (the client's own IPC thread)
+	 * may do that for the app's HWND. Flagged here and handled inside the resize
+	 * pass, which already takes render_mutex in the right order.
 	 */
 	const bool chain_device_stale = c->render.hwnd != nullptr && c->render.swap_chain &&
 	                                c->presenter == PRESENTER_APP_HWND && pipeline_always_on(sys) &&
@@ -20950,6 +21103,11 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	if (sys->xbridge != nullptr) {
 		comp_d3d11_xbridge_destroy(&sys->xbridge);
 	}
+	// #918 PR 4: the output-device crop staging, before the device that owns it.
+	sys->split_out_crop_srv.reset();
+	sys->split_out_crop_tex.reset();
+	sys->split_out_crop_w = 0;
+	sys->split_out_crop_h = 0;
 	sys->split_active = false;
 	sys->split_available = false;
 	if (sys->out_factory != nullptr) {
@@ -24682,9 +24840,10 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		if (mc->display_processor == nullptr && dp_fac_resume != NULL && !service_device_removed(sys) &&
 		    pipeline_dp_graveyard_flush_hwnd(mc, mc->hwnd)) {
 			auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac_resume;
-			// #918: a controller is attached, so the split is SUSPENDED and this
-			// resolves to the app device — the same one the service-window chain
-			// was just rebuilt on.
+			// #918: SERVICE_WINDOW is an eligible presenter, so under an engaged
+			// split this resolves to the scanout device — the same one the
+			// service-window chain lives on. (PR 3 suspended the split here; PR 4
+			// splits the compose path too, so the panel DP stays put.)
 			ID3D11Device *resume_dev = svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW);
 			xrt_result_t dp_ret = factory(resume_dev, svc_panel_dp_context(sys, PRESENTER_SERVICE_WINDOW),
 			                              mc->hwnd, &mc->display_processor);

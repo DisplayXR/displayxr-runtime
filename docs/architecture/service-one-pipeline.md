@@ -254,12 +254,56 @@ On a non-MUX hybrid laptop the panel is scanned out by the iGPU while apps rende
 every woven frame crosses the adapter boundary inside `Present`. `DXR_WEAVE_ON_SCANOUT=1` moves the
 **output half** of this pipeline — the presenter swap chains, their RTVs, the panel DP's weave and
 the present — onto the scanout adapter, and sends only the DP-INPUT ATLAS across, once per rendered
-frame, through a D3D12 cross-adapter heap (`comp_d3d11_xbridge`). Default off; PR 3 covers the
-DIRECT path only.
+frame, through a D3D12 cross-adapter heap (`comp_d3d11_xbridge`). Default off. PR 3 covered the
+DIRECT path; PR 4 adds the COMPOSE path, so **both** paths now weave and present on the scanout
+adapter.
 
 Why the service is a simpler split than the in-process compositor was: Local2D, zones and the
 authored mask all composite into the CLIENT ATLAS pre-DP, and the service never calls
 `set_background_2d` — so there is exactly one image to carry, and no plane transport at all.
+
+### The two sources, one bridge
+
+| Path | When | What crosses |
+|---|---|---|
+| DIRECT | no controller attached | the focused client's cropped atlas |
+| COMPOSE | a workspace controller is attached | the crop of `mc->combined_atlas` |
+
+The compose path builds its frame exactly where it always did — every per-client blit, the chrome,
+title bars, font, logo, cursor and the ADR-030 crop paint into `combined_atlas` on the APP device.
+Only the destination moved: the cropped composite is submitted to the same bridge instance, and
+`process_atlas` plus the present run on the output device.
+
+One bridge, two sources, is what made **Option-II (staged) ingress** the right call at Stage A: the
+submitted texture changes IDENTITY on a focus change *and* on a controller attach, where Option I
+would re-open an NT handle each time.
+
+`split_active` is therefore Stage A's verdict for the life of the process. PR 3's workspace
+**suspend** — which moved the panel DP and the service-window chain back to the app device while a
+controller was attached — is deleted, along with its `split_suspend` counter. The panel DP stays on
+the output device across attach and detach: one fewer rebind class.
+
+### Transitions
+
+Attach and detach switch the path per frame under the machinery PR 3 already built. The layout
+SIGNATURE carries the source (`SPLIT_COMPOSE_SLOT` where the direct path puts the focused slot), so
+a transition bumps the generation and slots of the other path's recipe are refused — the panel holds
+its last good frame for a frame or two rather than weaving a compose atlas at a client's tile
+stride. Both the weave *and* the present are skipped on such a frame: under `FLIP_DISCARD`,
+presenting the cleared back buffer instead is the black flash.
+
+The content box changes with the transition (compose = the canvas, direct = the focused client's
+crop). The R2 hysteresis sees that as the single step it is — a resize DRAG is what it treats as
+churn — so it reallocates the ring once and settles.
+
+### The output-device crop
+
+While the R2 hysteresis holds a worst-case ring, the slot's content sits top-left inside a larger
+texture, and the DP derives its tile stride from the atlas width — so weaving it directly would
+slice every tile at the wrong offset. PR 3 refused those frames. PR 4 crops them on the output
+device instead: one same-device `CopySubresourceRegion` of the slot's own content box into an
+output-device staging texture, no shader (the blit shaders all live on the app device) and no second
+crossing. Counted as `out_crop`.
 
 ### Presenter-kind eligibility
 
@@ -289,30 +333,33 @@ can press keys, so crossings are limited by a **>= 1 s dwell** and counted as `p
 frame that finds the DP still on the wrong device does not weave through it: D3D11 drives a foreign
 resource silently rather than erroring, so the frame degrades to the raw copy instead.
 
-### The workspace suspend (PR 3 interim)
+### Wrong-device tripwires
 
-The COMPOSE path is not split until PR 4, so while a controller is attached the split **suspends**:
-the panel DP and the service-window chain move back to the service device, `sys->split_active`
-(what every `svc_out_*` accessor reads) flips, and the shell behaves exactly as it does without the
-flag. Detach resumes. Counted as `split_suspend`.
-
-Client `APP_HWND` chains are not rebuilt by the transition — only the owning client's IPC thread may
-call `CreateSwapChainForHwnd` on the app's window (the DXGI/WM deadlock rule). They are left stale,
-the render thread skips a stale presenter, and the client's next commit rebuilds. Under a controller
-those clients are composed rather than presented, so the skip costs nothing there.
+A swap chain's device cannot be changed, and D3D11 does not error on a foreign-device resource — it
+is silent. So both paths compare before they act: a presenter chain whose `chain_device` is not the
+output device is not ready (its owning client's IPC thread rebuilds it — only that thread may, per
+the DXGI/WM deadlock rule), and a panel DP whose `panel_dp_device` is not the output device does not
+get handed the SRV; the frame degrades to the egress copy. The DP case is a REAL state, not a
+should-never-happen: the ≥1 s dwell can legitimately leave the DP one rebind behind. The chain case
+lost its cause when the suspend went away, and stays armed as a tripwire.
 
 ### Reading it in the log
 
 ```
 weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave/present on the SCANOUT adapter
 #918 output-device split ACTIVE: …
-[RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 split_suspend=0 flat_skip=0 maskpub_skip=0 no_slot=0 window_s=10
+[RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 flat_skip=0 maskpub_skip=0 no_slot=0 out_crop=0 window_s=10
 ```
 
-`split` is the EFFECTIVE state (0 while suspended). `no_slot` counts frames that skipped both the
-weave and the present because nothing of the current layout generation had landed — warmup, a mode
-switch, or a resize the R2 hysteresis parked at a worst-case ring (PR 3 has no output-device crop).
-`flat_skip` counts unfocused app-HWND courtesy repaints skipped under the split (supervisor ruling;
-those windows are parked anyway). `maskpub_skip` counts zone-mask publishes refused because the mask
-and the DP ended up on different devices — an ineligible presenter under an active split; PR 5 makes
-that case raster on the DP's device instead.
+`no_slot` counts frames that skipped both the weave and the present because nothing of the current
+layout generation had landed — warmup, a mode switch, a focus change, or a controller attaching or
+detaching. `out_crop` counts frames the output-device crop rescued from a parked worst-case ring
+(an interactive resize); a session that never resizes never sees one. `flat_skip` counts unfocused
+app-HWND courtesy repaints skipped under the split (supervisor ruling; those windows are parked
+anyway). `maskpub_skip` counts zone-mask publishes refused because the mask and the DP ended up on
+different devices — an ineligible presenter under an active split; PR 5 makes that case raster on
+the DP's device instead.
+
+`DXR_SPLIT_COVER_DIAG=1` (observe) or `=2` (sentinel-clear the back buffer first) reports, on both
+paths, whether the DP actually covered the output-device back buffer and whether a black frame was
+already black upstream.
