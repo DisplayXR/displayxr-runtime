@@ -880,6 +880,21 @@ struct d3d11_service_compositor
 	wil::com_ptr<ID3D11ShaderResourceView> wish_mask_staged_srv;
 	uint32_t wish_mask_w;
 	uint32_t wish_mask_h;
+	/*!
+	 * #918 PR 5 — the DEVICE the four resources above were created on, and the
+	 * third term of the dirty check next to @ref wish_mask_w / @ref wish_mask_h.
+	 *
+	 * The mask is rastered on whichever device the PANEL DP lives on
+	 * (@ref svc_zone_mask_device), and under the output-device split that device
+	 * changes when focus crosses the presenter eligibility boundary. Without this
+	 * term an unchanged rect list short-circuits the raster and hands the freshly
+	 * rebound DP an SRV belonging to the device it no longer runs on — which
+	 * D3D11 does not diagnose, it just samples nothing.
+	 *
+	 * NULL until the first raster. Always `sys->device` while the split is off,
+	 * so the term never fires there.
+	 */
+	ID3D11Device *wish_mask_device;
 	struct xrt_rect wish_rects[XRT_MAX_LAYERS]; //!< last rasterized ON (3D) rects (dirty check)
 	uint32_t wish_rect_count;
 	uint64_t zone_publish_seq;  //!< mask content generation (bumped per re-raster)
@@ -1545,7 +1560,9 @@ struct d3d11_service_system
 	//! Unfocused-APP_HWND flat repaints skipped because the split is on.
 	std::atomic<uint32_t> render_diag_flat_skip_split{0};
 	//! Zone-mask publishes skipped because the mask and the DP are on different
-	//! devices (an ineligible presenter under an active split). PR 5 removes it.
+	//! devices. PR 3's cause (an ineligible presenter under an active split) is
+	//! gone since PR 5 rasters on the DP's own device, so this is now a TRIPWIRE
+	//! for a silent D3D11 cross-device hand-off: any non-zero value is a bug.
 	std::atomic<uint32_t> render_diag_maskpub_skip{0};
 	//! Frames EITHER path could not weave because the bridge had no slot of the
 	//! current generation (warmup, a mode switch, a focus change, a controller
@@ -15166,33 +15183,78 @@ service_dp_accepts_zone_mask(struct xrt_display_processor_d3d11 *xdp)
 }
 
 /*!
- * #918 PR 3 — may the zone WISH MASK be published to the panel DP right now?
+ * #918 PR 5 — the DEVICE the zone wish mask must be rastered on: the one the
+ * PANEL DP lives on, which is the DP's bind key and not the output half's.
  *
- * The mask is a CPU-rect raster built with `ClearView` on `svc_out_context`, so
- * PR 2 already put it on the OUTPUT device. The panel DP, however, follows the
- * PRESENTER: an ineligible presenter (a present-owner / browser, or an ADR-029
- * client-presents client) keeps its DP on the APP device even while the split is
- * engaged. Handing that DP an out-device SRV is a cross-device resource — in
- * D3D11 that is not an error, it is silence, and the vendor would sample
- * garbage or nothing.
+ * The two differ. `svc_out_device` follows the OUTPUT half unconditionally; the
+ * panel DP follows the PRESENTER, and an ineligible presenter (ADR-029
+ * client-presents — the zones cube — or a present-owner / browser) keeps its DP
+ * on the APP device while the split is engaged. PR 2 put the raster on the
+ * output device, so those clients' publishes had to be refused; this makes the
+ * raster follow the DP instead, so an eligible presenter gets an out-device mask
+ * and an ineligible one an app-device mask, and neither is refused.
  *
- * So: skip the publish, count it, and say so once. What the user sees is the
- * pre-ADR-027 behaviour for that client — the panel driven whole rather than
- * per-region — which is a documented degrade, not a fault. PR 5 removes this by
- * rastering the mask on whichever device the DP is on.
+ * The mask is a ~64 KB R8_UNORM control signal built by `ClearView` — it costs
+ * the same on either device, and it never crosses the bridge. Nothing about the
+ * sideband wants the output adapter; it only ever wanted the DP's.
  *
- * Inert while the split is off: `svc_out_device` is then the app device, which
- * is the only device any DP can be on.
+ * Reads `mc->panel_dp_device`, so callers MUST hold `sys->render_mutex` and MUST
+ * resolve the DP itself (`panel_dp`) under the SAME lock — the render thread can
+ * rebind the panel DP between the two reads, and a mask rastered for the new
+ * device published to the retired DP is exactly the cross-device hand-off this
+ * whole gate exists to prevent.
+ *
+ * Legacy path (no `multi_comp`): the client's own DP, always on `sys->device` —
+ * and the split is disabled under `DXR_LEGACY_STANDALONE` anyway (D-7).
+ */
+static inline ID3D11Device *
+svc_zone_mask_device(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = (sys != nullptr) ? sys->multi_comp : nullptr;
+	if (mc != nullptr && mc->panel_dp_device != nullptr) {
+		return mc->panel_dp_device;
+	}
+	return (sys != nullptr) ? sys->device.get() : nullptr;
+}
+
+//! #918 PR 5: the immediate context belonging to @p dev. There are only ever the
+//! two devices, so this is a comparison rather than a lookup.
+static inline ID3D11DeviceContext *
+svc_context_for_device(struct d3d11_service_system *sys, ID3D11Device *dev)
+{
+	if (sys->split_active && dev != nullptr && dev == sys->out_dev) {
+		return sys->out_ctx;
+	}
+	return sys->context.get();
+}
+
+/*!
+ * #918 — TRIPWIRE: the mask and the panel DP must be on one device.
+ *
+ * PR 3 introduced this as a real, reachable state and a documented degrade: the
+ * raster was pinned to the output device, so an ineligible presenter's
+ * app-device DP could not be handed the SRV and the publish was skipped (with
+ * `maskpub_skip` counting it). PR 5 removed the cause — @ref svc_zone_mask_device
+ * rasters on the DP's own device — so this can no longer fire from the
+ * eligibility boundary.
+ *
+ * It stays armed because the failure it catches is SILENT: D3D11 does not error
+ * on a foreign-device resource, so a future call site that resolves the DP and
+ * the device under different locks (or not under `render_mutex` at all) would
+ * hand the vendor a mask it samples as nothing, with no symptom but a flat
+ * panel. A non-zero `maskpub_skip` now means that bug, not the degrade.
+ *
+ * Inert while the split is off: both sides are then the app device.
  */
 static bool
-svc_zone_mask_publish_device_ok(struct d3d11_service_system *sys)
+svc_zone_mask_publish_device_ok(struct d3d11_service_system *sys, ID3D11Device *mask_dev)
 {
 	if (sys == nullptr || !sys->split_active) {
 		return true;
 	}
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	ID3D11Device *dp_dev = (mc != nullptr) ? mc->panel_dp_device : nullptr;
-	if (dp_dev == nullptr || dp_dev == svc_out_device(sys)) {
+	if (dp_dev == nullptr || mask_dev == nullptr || dp_dev == mask_dev) {
 		return true;
 	}
 	sys->render_diag_maskpub_skip.fetch_add(1, std::memory_order_relaxed);
@@ -15200,10 +15262,11 @@ svc_zone_mask_publish_device_ok(struct d3d11_service_system *sys)
 	bool expected = false;
 	if (s_logged.compare_exchange_strong(expected, true)) {
 		U_LOG_W(
-		    "ZONES SVC: wish-mask publish skipped — the mask is rastered on device %p and the panel DP is "
-		    "on %p (an ineligible presenter under an active output-device split). That client's panel is "
-		    "driven whole instead of per-region until PR 5 (#918; see [RENDER] maskpub_skip)",
-		    (void *)svc_out_device(sys), (void *)dp_dev);
+		    "ZONES SVC: wish-mask publish skipped — the mask is on device %p and the panel DP is on %p. "
+		    "Since #918 PR 5 the raster follows the DP, so this is a BUG (the DP and its device were "
+		    "resolved under different locks), not the PR 3 degrade; the panel is driven by neither the "
+		    "wish nor the whole-panel request (see [RENDER] maskpub_skip)",
+		    (void *)mask_dev, (void *)dp_dev);
 	}
 	return false;
 }
@@ -15290,8 +15353,11 @@ service_zone_caps(struct d3d11_service_compositor *c, struct xrt_display_process
  * leaving a flat region 3D is only the pre-v8 ghosting (visible, no worse than
  * shipped). The asymmetry is deliberate, not a rounding accident.
  *
- * Caller MUST hold sys->render_mutex — ClearView/CopyResource run on the
- * shared immediate context from the commit thread.
+ * Caller MUST hold sys->render_mutex — ClearView/CopyResource run on a shared
+ * immediate context from the commit thread — and MUST have resolved @p dp under
+ * that same lock: #918 PR 5 rasters on the device @p dp lives on
+ * (@ref svc_zone_mask_device), so a DP resolved outside the lock could be one
+ * rebind behind the device this picks.
  *
  * @param[out] out_mask_w Mask width actually rastered (the publish needs it).
  * @param[out] out_mask_h Mask height actually rastered.
@@ -15346,12 +15412,24 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		*out_mask_h = h;
 	}
 
+	// #918 PR 5: the raster follows the PANEL DP's device, not the output half's
+	// — see svc_zone_mask_device. Caller holds render_mutex, and resolved the DP
+	// under it, so this reads the same bind key that DP was resolved from.
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
+	ID3D11DeviceContext *mask_ctx = svc_context_for_device(sys, mask_dev);
+	if (mask_dev == nullptr || mask_ctx == nullptr) {
+		return nullptr;
+	}
+
 	// Dirty check covers BOTH rect lists AND the window dims: the mask is scaled
 	// from window space, so a resize changes the raster even when every raw rect
-	// is byte-identical.
+	// is byte-identical. #918 PR 5 adds the DEVICE: a panel-DP rebind that crossed
+	// the eligibility boundary invalidates resources nothing else in this check
+	// can see.
 	bool dirty = c->wish_mask_tex == nullptr || c->wish_mask_staged_srv == nullptr || c->wish_mask_w != w ||
-	             c->wish_mask_h != h || c->wish_win_w != win_w || c->wish_win_h != win_h ||
-	             c->wish_rect_count != rect_count || c->wish_flat_rect_count != flat_rect_count;
+	             c->wish_mask_h != h || c->wish_mask_device != mask_dev || c->wish_win_w != win_w ||
+	             c->wish_win_h != win_h || c->wish_rect_count != rect_count ||
+	             c->wish_flat_rect_count != flat_rect_count;
 	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
 		if (memcmp(&c->wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
 			dirty = true;
@@ -15366,13 +15444,15 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		return c->wish_mask_staged_srv.get();
 	}
 
-	if (c->wish_mask_tex == nullptr || c->wish_mask_w != w || c->wish_mask_h != h) {
+	if (c->wish_mask_tex == nullptr || c->wish_mask_w != w || c->wish_mask_h != h ||
+	    c->wish_mask_device != mask_dev) {
 		c->wish_mask_staged_srv.reset();
 		c->wish_mask_staged.reset();
 		c->wish_mask_rtv.reset();
 		c->wish_mask_tex.reset();
 		c->wish_mask_w = 0;
 		c->wish_mask_h = 0;
+		c->wish_mask_device = nullptr;
 
 		D3D11_TEXTURE2D_DESC td = {};
 		td.Width = w;
@@ -15383,18 +15463,17 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_RENDER_TARGET;
-		HRESULT hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
+		HRESULT hr = mask_dev->CreateTexture2D(&td, nullptr, c->wish_mask_tex.put());
 		if (SUCCEEDED(hr) && c->wish_mask_tex != nullptr) {
-			hr = svc_out_device(sys)->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr,
-			                                                 c->wish_mask_rtv.put());
+			hr = mask_dev->CreateRenderTargetView(c->wish_mask_tex.get(), nullptr, c->wish_mask_rtv.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_rtv != nullptr) {
 			td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-			hr = svc_out_device(sys)->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
+			hr = mask_dev->CreateTexture2D(&td, nullptr, c->wish_mask_staged.put());
 		}
 		if (SUCCEEDED(hr) && c->wish_mask_staged != nullptr) {
-			hr = svc_out_device(sys)->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
-			                                                   c->wish_mask_staged_srv.put());
+			hr = mask_dev->CreateShaderResourceView(c->wish_mask_staged.get(), nullptr,
+			                                        c->wish_mask_staged_srv.put());
 		}
 		if (FAILED(hr) || c->wish_mask_staged_srv == nullptr) {
 			U_LOG_E("ZONES SVC: wish mask D3D resource creation failed: 0x%08lx", hr);
@@ -15406,13 +15485,15 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		}
 		c->wish_mask_w = w;
 		c->wish_mask_h = h;
+		c->wish_mask_device = mask_dev;
+		svc_assert_same_device(c->wish_mask_staged_srv.get(), mask_dev);
 	}
 
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	svc_out_context(sys)->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
+	mask_ctx->ClearRenderTargetView(c->wish_mask_rtv.get(), all_off);
 
 	wil::com_ptr<ID3D11DeviceContext1> ctx1;
-	HRESULT hr = svc_out_context(sys)->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
+	HRESULT hr = mask_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), ctx1.put_void());
 	if (FAILED(hr) || ctx1 == nullptr) {
 		U_LOG_E("ZONES SVC: wish mask: ID3D11DeviceContext1 unavailable (hr=0x%08lx)", hr);
 		return nullptr;
@@ -15486,7 +15567,7 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 		ctx1->ClearView(c->wish_mask_rtv.get(), all_off, &dr, 1);
 	}
 
-	svc_out_context(sys)->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
+	mask_ctx->CopyResource(c->wish_mask_staged.get(), c->wish_mask_tex.get());
 
 	memcpy(c->wish_rects, rects, sizeof(rects[0]) * rect_count);
 	c->wish_rect_count = rect_count;
@@ -15553,9 +15634,6 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
 		return; // tier-1 global request owns the panel
 	}
-	if (!svc_zone_mask_publish_device_ok(sys)) {
-		return; // #918: mask and DP are on different devices
-	}
 
 	// Screen-anchor: client-area origin in physical screen pixels. No HWND
 	// (hosted/texture client) → nothing to anchor to; skip the publish.
@@ -15582,6 +15660,28 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	}
 
 	render_mutex_fair_lock lock(sys);
+
+	/*
+	 * #918 PR 5 — RE-RESOLVE the DP now that the lock is held, and take its
+	 * device from the same read.
+	 *
+	 * The gates above ran on the pre-lock resolve, which is fine for a
+	 * capability question. The RASTER is not: it is built on whichever device
+	 * `mc->panel_dp_device` names, and the render thread may have rebound the
+	 * panel DP across the eligibility boundary in the window between the two.
+	 * Resolving both under one lock is what makes the tripwire below
+	 * unreachable rather than merely unlikely. The unique other caller
+	 * (the weave path) is already inside render_mutex when it resolves.
+	 */
+	dp = panel_dp(sys, c);
+	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
+		return;
+	}
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
+	if (!svc_zone_mask_publish_device_ok(sys, mask_dev)) {
+		return; // #918 tripwire: mask and DP are on different devices
+	}
+
 	// No flat rects on the zones path: a zones frame's 3D rects ARE the wish, so
 	// this reduces to the pre-v8 union-of-zone-rects raster (browser#88). The
 	// mask may now be rastered smaller than the window — the DP anchors mask space
@@ -15597,8 +15697,11 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	// Published every zones commit: the screen anchor follows the window;
 	// seq is the content generation, so a vendor's content evaluation runs
 	// once per re-raster, not once per frame.
+	// #918 PR 5: the DP's own context and its own device — never the output
+	// half's. Handing a vendor a cross-device SRV is silent, not an error.
+	svc_assert_same_device(srv, mask_dev);
 	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
-	    dp, svc_out_context(sys), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
+	    dp, svc_context_for_device(sys, mask_dev), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y, w, h,
 	    c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
@@ -19436,8 +19539,12 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
 		return; // whole-panel force-3D owns the panel
 	}
-	if (!svc_zone_mask_publish_device_ok(sys)) {
-		return; // #918: mask and DP are on different devices
+	// #918 PR 5: the raster follows the panel DP's device. @p dp was resolved by
+	// the caller under the render_mutex this function is already inside, so this
+	// reads the same bind key — the tripwire below should never fire.
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
+	if (!svc_zone_mask_publish_device_ok(sys, mask_dev)) {
+		return; // #918 tripwire: mask and DP are on different devices
 	}
 
 	// Screen anchor: the client area's origin in physical screen pixels. The DP
@@ -19473,10 +19580,10 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 		return;
 	}
 
-	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(dp, svc_out_context(sys), srv, mask_w, mask_h,
-	                                                              (int32_t)origin.x, (int32_t)origin.y,
-	                                                              (uint32_t)cr.right, (uint32_t)cr.bottom,
-	                                                              c->zone_publish_seq);
+	svc_assert_same_device(srv, mask_dev);
+	bool ok = xrt_display_processor_d3d11_publish_local_zone_mask(
+	    dp, svc_context_for_device(sys, mask_dev), srv, mask_w, mask_h, (int32_t)origin.x, (int32_t)origin.y,
+	    (uint32_t)cr.right, (uint32_t)cr.bottom, c->zone_publish_seq);
 	if (ok) {
 		if (!c->zone_published) {
 			U_LOG_W("[weave_wish] published to the %s DP (%ux%u mask @ screen %ld,%ld %ldx%ld, "
