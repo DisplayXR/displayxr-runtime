@@ -97,13 +97,21 @@ extern "C" bool g_bridge_relay_active;
  *
  */
 
-// Weave-latency measurement harness — shared header (also used by the
-// D3D11/D3D12 in-process targets). Site files: <prefix>.workspace.csv /
-// <prefix>.standalone.csv here.
+/*
+ * Weave-latency measurement harness — shared header (also used by the
+ * D3D11/D3D12 in-process targets).
+ *
+ * #918 PR 6: the pipeline's ledgers are now PER PRESENTER CHAIN, because
+ * `GetLastPresentCount` is per chain and one ledger fed from several resolves
+ * a weave against a flip from a different chain's sequence. They live on the
+ * things that own the chains — `mc->weave_lat` (the service window) and
+ * `c->render.weave_lat` (an app-HWND client) — so the site files here are
+ * <prefix>.workspace.csv, <prefix>.apphwnd.sN.csv and, for the legacy
+ * standalone path below, <prefix>.standalone.csv.
+ */
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_display_refresh_win.h"
 
-static weave_latency_log g_weave_latency_workspace;
 static weave_latency_log g_weave_latency_standalone;
 
 // Latency governor (#850) for the workspace waitable chain:
@@ -421,6 +429,26 @@ struct d3d11_client_render_resources
 	 */
 	void *split_share_handle;
 	uint64_t split_share_key;
+
+	/*!
+	 * #918 PR 6 — this client's OWN weave→scanout ledger, for the APP_HWND
+	 * presenter chain below.
+	 *
+	 * `weave_latency_log` correlates a weave timestamp with the flip that
+	 * carried it through `IDXGISwapChain::GetLastPresentCount`, and PresentCount
+	 * is PER CHAIN. One global log fed from several chains therefore resolves a
+	 * ring entry against a count from a different chain's sequence and reports a
+	 * residual that is not a measurement of anything — which is exactly what the
+	 * service did, mixing every app window and the service window into
+	 * one file-scope log. One log per chain is the fix; the governor
+	 * stays shared because its inputs (display period, render-tick interval) are
+	 * chain-independent.
+	 */
+	weave_latency_log weave_lat;
+	//! CSV site name for @ref weave_lat — `apphwnd.sN`, so per-client CSVs do
+	//! not collide. Fixed at register time; mark and present must pass the same
+	//! string, so it is stored rather than rebuilt.
+	char weave_lat_site[24];
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
@@ -3148,6 +3176,22 @@ struct d3d11_multi_compositor
 	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
 	uint32_t crop_width;
 	uint32_t crop_height;
+	/*!
+	 * #918 PR 6 — the SERVICE-WINDOW chain's weave→scanout ledger. Both paths
+	 * present this chain (the compose path always, the direct path whenever the
+	 * presenter is a hosted client), and they are the same chain, so they share
+	 * one log — but no app window's chain feeds it any more.
+	 */
+	weave_latency_log weave_lat;
+	/*!
+	 * The panel's best-known weave→scanout residual: whatever the chain that
+	 * LAST ACTUALLY WOVE AND PRESENTED measured. It is what the DP's
+	 * `set_frame_timing` wants, and it is the only thing a presenter with no
+	 * runtime chain of its own — an ADR-029 CLIENT_TEXTURE client, which weaves
+	 * through the panel DP and presents the texture itself — can be given.
+	 */
+	uint64_t panel_r_ns;
+
 	//! #918 PR 6 — adaptive-ingress source identity of @ref crop_texture.
 	void *crop_share_handle;
 	uint64_t crop_share_key;
@@ -5214,6 +5258,9 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->crop_texture.reset();
 	res->crop_width = 0;
 	res->crop_height = 0;
+	// #918 PR 6: close this client's per-chain weave-latency CSV, if one was
+	// opened. Its chain is going away with it.
+	res->weave_lat.close();
 	// #918 PR 6: retire this client's ingress identity with its texture. The
 	// bridge's own D3D12 open (if this was the bound source) is retired behind
 	// the producer fence by `comp_d3d11_xbridge_set_source` the next time a
@@ -8303,7 +8350,8 @@ try {
 			// hosted m2p A/B measured R = 33 ms (2 periods) because of it.
 			const bool gov_sample =
 			    !pipeline_always_on(sys) || sys->workspace_mode || mc->service_window_shown;
-			const int tr = gov_sample ? g_lw_gov_workspace.on_mark(g_weave_latency_workspace.freq()) : 0;
+			// QPC frequency only — a machine constant, not a per-chain quantity.
+			const int tr = gov_sample ? g_lw_gov_workspace.on_mark(mc->weave_lat.freq()) : 0;
 			if (tr != 0) {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
@@ -11159,6 +11207,50 @@ pipeline_split_crop_on_out_device(struct d3d11_service_system *sys,
 }
 
 /*!
+ * #918 PR 6 — the weave→scanout ledger of the chain that is about to present.
+ *
+ * PresentCount is per swap chain, so a ledger may only ever see ONE chain's
+ * presents. This resolves which, from the presenter kind the caller already
+ * decided. Returns NULL for a presenter with no runtime-owned chain
+ * (CLIENT_TEXTURE, SELF) — those weave but do not present, and take their
+ * residual from `mc->panel_r_ns` instead.
+ */
+static weave_latency_log *
+svc_presenter_weave_lat(struct d3d11_multi_compositor *mc,
+                        struct d3d11_service_compositor *fc,
+                        enum d3d11_presenter_kind kind,
+                        int32_t slot,
+                        const char **out_site)
+{
+	if (kind == PRESENTER_SERVICE_WINDOW) {
+		*out_site = "workspace";
+		return &mc->weave_lat;
+	}
+	if (kind == PRESENTER_APP_HWND && fc != nullptr) {
+		if (fc->render.weave_lat_site[0] == '\0') {
+			snprintf(fc->render.weave_lat_site, sizeof(fc->render.weave_lat_site), "apphwnd.s%d",
+			         (int)slot);
+		}
+		*out_site = fc->render.weave_lat_site;
+		return &fc->render.weave_lat;
+	}
+	*out_site = "none";
+	return nullptr;
+}
+
+//! Resolve the flip that carried @p log's last weave. No-op when the presenter
+//! has no chain of its own. The saturation governor stays SHARED: its inputs
+//! (display period, render-tick interval) are properties of the panel and the
+//! loop, not of a chain, and it only ever re-latches the service window's depth.
+static inline void
+svc_after_present(weave_latency_log *log, const char *site, IDXGISwapChain1 *sc)
+{
+	if (log != nullptr && sc != nullptr) {
+		log->after_present(site, sc, &g_lw_gov_workspace);
+	}
+}
+
+/*!
  * #918 — ship the cropped DP-input atlas across the adapter boundary and hand
  * back the OUTPUT-DEVICE shader resource view the panel DP should weave.
  *
@@ -11611,6 +11703,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		return;
 	}
 
+	// #918 PR 6: the ledger of the chain this frame will present — resolved from
+	// the presenter kind, never shared across chains (PresentCount is per chain).
+	const char *weave_lat_site = "none";
+	weave_latency_log *weave_lat = svc_presenter_weave_lat(mc, fc, kind, focused, &weave_lat_site);
+
 	/* (c) One DP per panel, bound to the active presenter's window. */
 	pipeline_bind_panel_dp(sys, mc, present_hwnd, kind == PRESENTER_CLIENT_TEXTURE, /*force_recreate*/ false,
 	                       svc_panel_dp_device(sys, kind));
@@ -11757,8 +11854,17 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// a DP the browser had left in alpha-gate mode — washed-out WebXR.
 		pipeline_dp_set_transparency(mc, dp, kind == PRESENTER_CLIENT_TEXTURE, "direct");
 		pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(fc), "direct");
-		g_weave_latency_workspace.mark_weave("pipeline");
-		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
+		/*
+		 * #918 PR 6 — mark, and feed the DP, from THE CHAIN THIS FRAME IS ABOUT
+		 * TO PRESENT. `present_sc` is already resolved above, so the ledger is
+		 * known before the weave; a presenter with no chain of its own falls back
+		 * to whatever the panel last measured.
+		 */
+		if (weave_lat != nullptr) {
+			weave_lat->mark_weave(weave_lat_site);
+			mc->panel_r_ns = weave_lat->measured_r_ns;
+		}
+		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
 		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, weave_view_w,
@@ -11855,8 +11961,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			                     survivors == 0   ? SPLIT_COVER_FULL
 			                     : survivors == 5 ? SPLIT_COVER_NONE
 			                                      : SPLIT_COVER_PARTIAL,
-			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep,
-			                     g_weave_latency_workspace.measured_r_ns);
+			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep, mc->panel_r_ns);
 		}
 	}
 
@@ -11940,7 +12045,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			(void)service_note_device_lost(sys, phr, "pipeline/service_window_present"); // #1002
 			sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 			if (SUCCEEDED(phr)) {
-				g_weave_latency_workspace.after_present("pipeline", present_sc, &g_lw_gov_workspace);
+				svc_after_present(weave_lat, weave_lat_site, present_sc);
 			}
 		} else {
 			sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
@@ -11958,7 +12063,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		if (phr == DXGI_ERROR_WAS_STILL_DRAWING || phr == DXGI_STATUS_OCCLUDED) {
 			phr = S_OK; // frame skipped / window not on screen — not an error
 		} else if (SUCCEEDED(phr)) {
-			g_weave_latency_workspace.after_present("pipeline", present_sc, &g_lw_gov_workspace);
+			svc_after_present(weave_lat, weave_lat_site, present_sc);
 		}
 	}
 	t_present_ns = (int64_t)os_monotonic_get_ns();
@@ -14668,11 +14773,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
 		pipeline_dp_set_encoding(
 		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
-		g_weave_latency_workspace.mark_weave("workspace");
+		mc->weave_lat.mark_weave("workspace");
+		mc->panel_r_ns = mc->weave_lat.measured_r_ns;
 		// Timing feedback: measured weave→scanout of the last completed frame
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
 		// predictor's exact horizon.
-		xrt_display_processor_d3d11_set_frame_timing(compose_dp, g_weave_latency_workspace.measured_r_ns,
+		xrt_display_processor_d3d11_set_frame_timing(compose_dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		// #918: `weave_view_*` is `dp_view_*` off the split, and the dims of the
 		// slot actually being woven under it — which through a resize the R2
@@ -14747,8 +14853,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			                     survivors == 0   ? SPLIT_COVER_FULL
 			                     : survivors == 5 ? SPLIT_COVER_NONE
 			                                      : SPLIT_COVER_PARTIAL,
-			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep,
-			                     g_weave_latency_workspace.measured_r_ns);
+			                     pre_black, post_black, in_black, (int)ep.is_tracking, &ep, mc->panel_r_ns);
 		}
 	}
 
@@ -14853,8 +14958,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			HRESULT phr = mc->swap_chain->Present(1, 0);
 			phr = dxr_test_fake_device_removed(phr);
 			if (!service_note_device_lost(sys, phr, "compose/service_window_present")) {
-				g_weave_latency_workspace.after_present("workspace", mc->swap_chain.get(),
-				                                        &g_lw_gov_workspace);
+				svc_after_present(&mc->weave_lat, "workspace", mc->swap_chain.get());
 			}
 		}
 	}
@@ -16237,7 +16341,12 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		// #1016: this call site owns the DP's state.
 		pipeline_dp_set_transparency(mc, dp, /*client_presents*/ true, "client_texture");
 		pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(c), "client_texture");
-		xrt_display_processor_d3d11_set_frame_timing(dp, g_weave_latency_workspace.measured_r_ns,
+		// #918 PR 6: ADR-029 — this client weaves through the panel DP and
+		// presents the shared texture ITSELF, so there is no runtime chain here
+		// and no PresentCount to correlate against. The panel's last measured
+		// residual (from whichever chain last wove AND presented) is the honest
+		// input, and is what the shared file-scope log used to supply by accident.
+		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv, c->pipe_content_w,
 		                                          c->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
