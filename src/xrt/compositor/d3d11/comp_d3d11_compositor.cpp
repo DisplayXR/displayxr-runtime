@@ -8,6 +8,7 @@
  */
 
 #include "comp_d3d11_compositor.h"
+#include "comp_d3d11_compositor_internals.h"
 #include "comp_d3d11_swapchain.h"
 #include "comp_d3d11_target.h"
 #include "util/comp_display_refresh_win.h"
@@ -68,7 +69,6 @@
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 
-#include <stddef.h> // offsetof — the prefix-mirror tripwire below
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -147,12 +147,6 @@ struct comp_d3d11_compositor
 	 *
 	 * D3D12 needs no equivalent: it records into per-thread command lists and
 	 * allocators, so there is no shared immediate state to interleave with.
-	 *
-	 * MUST stay BELOW dxgi_factory: comp_d3d11_renderer.cpp mirrors the members
-	 * above as `comp_d3d11_compositor_internals` to reach them from C. A field
-	 * inserted into that prefix silently shifts the mirror and the renderer
-	 * reads the wrong pointer. (comp_d3d11_target.cpp no longer mirrors it —
-	 * the target is handed its device/context/factory explicitly, #918.)
 	 */
 	ID3D10Multithread *mt_lock;
 
@@ -163,10 +157,6 @@ struct comp_d3d11_compositor
 	 * `dxgi_factory` above — own the swapchain, the display processor, the HUD
 	 * and the repaint loop; the renderer and the atlas stay on the app device
 	 * and the composited atlas crosses once per frame through `xbridge`.
-	 *
-	 * Appended AFTER mt_lock deliberately: comp_d3d11_renderer.cpp still
-	 * mirrors the prefix up to dxgi_factory as
-	 * `comp_d3d11_compositor_internals`, so nothing may be inserted into it.
 	 */
 	ID3D11Device *out_dev;
 	ID3D11DeviceContext *out_ctx;
@@ -620,31 +610,22 @@ struct comp_d3d11_compositor
 };
 
 /*
- * TRIPWIRE for the prefix mirror in comp_d3d11_renderer.cpp.
- *
- * That file re-declares this struct's first five members as
- * `comp_d3d11_compositor_internals` and reinterpret_casts a
- * comp_d3d11_compositor* onto it to reach device/context/dxgi_factory from a
- * TU that cannot see the real definition. Inserting ANY member into that
- * prefix would shift the mirror and hand the renderer the wrong pointer,
- * silently. The mirror itself cannot assert (it has no view of the real
- * struct), so the assertion lives here, where the real struct IS visible: the
- * prefix must be `base` followed by four naturally-packed pointers, in that
- * order. Adding a member anywhere AFTER dxgi_factory is fine and fires
- * nothing — that is the documented place to grow (#918 appended out_dev &co
- * below mt_lock for exactly this reason).
+ * The renderer and the swapchain live in TUs that cannot see the definition
+ * above, and need four handles out of it. They are handed those handles here,
+ * BY VALUE — no cast, no mirrored layout, and therefore no tripwire: the
+ * member order of the struct above is once again nobody's business but this
+ * file's. See comp_d3d11_compositor_internals.h.
  */
-static_assert(offsetof(struct comp_d3d11_compositor, xdev) == sizeof(struct xrt_compositor_native),
-              "comp_d3d11_renderer.cpp's prefix mirror expects xdev right after base");
-static_assert(offsetof(struct comp_d3d11_compositor, device) ==
-                  offsetof(struct comp_d3d11_compositor, xdev) + sizeof(void *),
-              "comp_d3d11_renderer.cpp's prefix mirror expects device right after xdev");
-static_assert(offsetof(struct comp_d3d11_compositor, context) ==
-                  offsetof(struct comp_d3d11_compositor, device) + sizeof(void *),
-              "comp_d3d11_renderer.cpp's prefix mirror expects context right after device");
-static_assert(offsetof(struct comp_d3d11_compositor, dxgi_factory) ==
-                  offsetof(struct comp_d3d11_compositor, context) + sizeof(void *),
-              "comp_d3d11_renderer.cpp's prefix mirror expects dxgi_factory right after context");
+extern "C" struct comp_d3d11_compositor_internals
+comp_d3d11_compositor_get_internals(struct comp_d3d11_compositor *c)
+{
+	struct comp_d3d11_compositor_internals out = {};
+	out.xdev = c->xdev;
+	out.device = c->device;
+	out.context = c->context;
+	out.dxgi_factory = c->dxgi_factory;
+	return out;
+}
 
 /*
  *
