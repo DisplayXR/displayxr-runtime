@@ -110,6 +110,24 @@ struct weave_latency_log
 
 	void
 	after_present(const char *site, IDXGISwapChain *sc, struct late_weave_governor *gov = nullptr);
+
+	/*!
+	 * Close the CSV, if one was opened, and re-arm the probe.
+	 *
+	 * A file-scope log lives for the process and never needed this. #918 PR 6
+	 * gave the service one log PER PRESENTER CHAIN, and a chain belongs to a
+	 * client — so with `DXR_WEAVE_LATENCY_CSV` set, a session that connects and
+	 * disconnects clients would leak one `FILE *` per client without it.
+	 */
+	void
+	close()
+	{
+		if (f != nullptr) {
+			fclose(f);
+			f = nullptr;
+		}
+		enabled = -1;
+	}
 };
 
 /*!
