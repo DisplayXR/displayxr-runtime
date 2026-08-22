@@ -9,8 +9,11 @@
 
 #include "android_globals.h"
 
+#include "util/u_logging.h"
+
 #include <stddef.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <atomic>
 #include <mutex>
 #include <jni.h>
@@ -106,11 +109,23 @@ android_globals_get_window()
  * while the Java Surface still held its own, and the eventual
  * Surface.finalize() → nativeRelease() ran RefBase::incStrong() on freed
  * memory → SIGSEGV in FinalizerDaemon.
+ *
+ * #1146 — the same invariant, violated one level up. A publisher that hands the
+ * window to the globals AND to a caller off ONE
+ * `ANativeWindow_fromSurface()` transfers a single reference twice; the
+ * globals are then left holding a pointer with no reference behind it, and the
+ * `ANativeWindow_release(drop)` below eventually runs over freed memory. That
+ * is not detectable from in here (a reference nobody took looks exactly like a
+ * reference someone took), so it must be enforced at the publish site — see
+ * `android_custom_surface_wait_get_surface`. The `held=` field on the log lines
+ * below is the ledger you read on device: it is the number of references the
+ * globals BELIEVE they hold, and it must be 1 whenever `window` is non-NULL.
  */
 void
 android_globals_set_window(struct _ANativeWindow *window)
 {
 	struct _ANativeWindow *drop = nullptr;
+	uint64_t gen = 0;
 	{
 		std::lock_guard<std::mutex> lock(android_surface.mutex);
 		// Either the window we are replacing, or — when the same window is
@@ -121,7 +136,12 @@ android_globals_set_window(struct _ANativeWindow *window)
 		android_surface.window = window;
 		android_surface.valid = (window != nullptr);
 		android_surface.generation++;
+		gen = android_surface.generation;
 	}
+	// Lifecycle only (a publish/clear edge), never per frame: refresh_window
+	// de-duplicates an unchanged surface before it gets here.
+	U_LOG_W("android_globals window: publish %p (drop %p) gen=%" PRIu64 " held=%d (#1146)", (void *)window,
+	        (void *)drop, gen, window != nullptr ? 1 : 0);
 	if (drop != nullptr) {
 		ANativeWindow_release((ANativeWindow *)drop);
 	}
@@ -130,13 +150,27 @@ android_globals_set_window(struct _ANativeWindow *window)
 void
 android_globals_clear_window(void)
 {
-	std::lock_guard<std::mutex> lock(android_surface.mutex);
-	// Keep the pointer AND the globals' reference on it — that is what makes
-	// the stale pointer safe to compare against until the next publish (#1040).
-	// Mark it invalid + bump the generation so the next re-sync tears the
-	// surface down.
-	android_surface.valid = false;
-	android_surface.generation++;
+	uint64_t gen = 0;
+	struct _ANativeWindow *kept = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(android_surface.mutex);
+		// Keep the pointer AND the globals' reference on it — that is what makes
+		// the stale pointer safe to compare against until the next publish (#1040).
+		// Mark it invalid + bump the generation so the next re-sync tears the
+		// surface down.
+		if (!android_surface.valid && android_surface.generation != 0) {
+			// Already cleared — the #507 poll calls this every tick while
+			// backgrounded. Don't bump the generation (that would make the
+			// compositor re-run its teardown path forever) and don't log.
+			return;
+		}
+		android_surface.valid = false;
+		android_surface.generation++;
+		gen = android_surface.generation;
+		kept = android_surface.window;
+	}
+	U_LOG_W("android_globals window: clear (kept %p, still referenced) gen=%" PRIu64 " held=%d (#1146)",
+	        (void *)kept, gen, kept != nullptr ? 1 : 0);
 }
 
 struct _ANativeWindow *
