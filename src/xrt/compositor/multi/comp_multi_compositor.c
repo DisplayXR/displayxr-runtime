@@ -2054,13 +2054,25 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 		return false;
 	}
 
-	if (!mc->session_render.initialized || mc->session_render.display_processor == NULL) {
-		out_eye_pos->valid = false;
-		return false;
+	if (mc->session_render.initialized && mc->session_render.display_processor != NULL) {
+		return xrt_display_processor_get_predicted_eye_positions(mc->session_render.display_processor,
+		                                                         out_eye_pos);
 	}
 
-	return xrt_display_processor_get_predicted_eye_positions(
-	    mc->session_render.display_processor, out_eye_pos);
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
+	// #1116 sibling: a weave-only present-owner session has no session_render
+	// and therefore no per-session DP — but its weave engine holds the DP that
+	// is already steering the head-tracked weave. Without this, the view-pose
+	// path falls back to the nominal viewer and rig locates lose parallax while
+	// the weave itself visibly tracks the head. Same lock-free read trade as
+	// the weave-geometry metrics branch above.
+	if (mc->weave.dp != NULL) {
+		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
+	}
+#endif
+
+	out_eye_pos->valid = false;
+	return false;
 }
 
 #ifdef XRT_OS_WINDOWS
