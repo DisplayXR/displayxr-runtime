@@ -14331,9 +14331,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		ID3D11Texture2D *split_src = (dp_input_srv == mc->crop_srv.get() && mc->crop_texture)
 		                                 ? mc->crop_texture.get()
 		                                 : mc->combined_atlas.get();
-		dp_input_srv = pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns,
-		                                           sys->tile_rows, &weave_view_w, &weave_view_h, &weave_cols,
-		                                           &weave_rows);
+		dp_input_srv =
+		    pipeline_split_bridge_atlas(sys, SPLIT_COMPOSE_SLOT, split_src, sys->tile_columns, sys->tile_rows,
+		                                &weave_view_w, &weave_view_h, &weave_cols, &weave_rows);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
