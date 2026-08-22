@@ -11,7 +11,7 @@
  * current.
  */
 
-#include "comp_d3d11_plane_policy.h"
+#include "comp_xbridge_plane_policy.h"
 
 #include "catch_amalgamated.hpp"
 
@@ -297,7 +297,7 @@ TEST_CASE("a freshly authored plane transports on its own frame and lands on the
 
 		// Deposit: the frame stages the authored mask unconditionally. It does
 		// NOT consult any slot — that is the invariant under test. As in
-		// comp_d3d11_xbridge_stage_plane, only a CHANGE re-pends every slot.
+		// comp_xbridge_stage_plane, only a CHANGE re-pends every slot.
 		const uint64_t stage_seq = authored;
 		if (stage_seq != last_staged) {
 			last_staged = stage_seq;

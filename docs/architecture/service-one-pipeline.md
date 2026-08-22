@@ -254,7 +254,7 @@ On a non-MUX hybrid laptop the panel is scanned out by the iGPU while apps rende
 every woven frame crosses the adapter boundary inside `Present`. `DXR_WEAVE_ON_SCANOUT=1` moves the
 **output half** of this pipeline — the presenter swap chains, their RTVs, the panel DP's weave and
 the present — onto the scanout adapter, and sends only the DP-INPUT ATLAS across, once per rendered
-frame, through a D3D12 cross-adapter heap (`comp_d3d11_xbridge`). Default off. PR 3 covered the
+frame, through a D3D12 cross-adapter heap (`comp_xbridge`). Default off. PR 3 covered the
 DIRECT path; PR 4 added the COMPOSE path, so **both** paths weave and present on the scanout
 adapter; PR 5 moved the zones wish mask onto the panel DP's device; PR 6 made the ingress adaptive,
 gave each presenter chain its own weave-latency ledger, and closed the DEVICE_REMOVED / watchdog /
@@ -307,7 +307,7 @@ the app device's copy engine still at 254 ms/s.
 
 Adaptive ingress keeps the staging ring allocated as the **per-frame fallback** and lets a source
 that has held still be read IN PLACE. Each frame nominates its source
-(`comp_d3d11_xbridge_set_source(nt_handle, key)`); a match with the bound source reads in place, a
+(`comp_xbridge_set_source(nt_handle, key)`); a match with the bound source reads in place, a
 mismatch stages. Three rules make it safe, and each of them is load-bearing:
 
 - **Only a texture the RENDER THREAD alone writes may be nominated.** The producer's copy of frame

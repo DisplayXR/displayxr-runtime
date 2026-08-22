@@ -15,7 +15,7 @@
 #include "comp_d3d11_outcomp.h"
 #include "comp_d3d11_window.h"
 #include "comp_d3d11_state_guard.h"
-#include "comp_d3d11_xbridge.h"
+#include "comp_xbridge.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -171,7 +171,7 @@ struct comp_d3d11_compositor
 	ID3D11DeviceContext *out_ctx;
 	IDXGIFactory4 *out_factory;
 	LUID out_luid;
-	struct comp_d3d11_xbridge *xbridge;
+	struct comp_xbridge *xbridge;
 	bool split_active;
 	//! Monotonic app frame counter — the single seq every bridge fence uses.
 	uint64_t split_seq;
@@ -195,8 +195,8 @@ struct comp_d3d11_compositor
 	uint64_t split_recipe_refusals;
 	uint64_t split_recipe_logged_gen;
 	//! Per-plane DIAG deltas: the lifetime copy/skip totals as of the last line.
-	uint64_t split_plane_copies_prev[COMP_D3D11_XBRIDGE_PLANE_COUNT];
-	uint64_t split_plane_skips_prev[COMP_D3D11_XBRIDGE_PLANE_COUNT];
+	uint64_t split_plane_copies_prev[COMP_XBRIDGE_PLANE_COUNT];
+	uint64_t split_plane_skips_prev[COMP_XBRIDGE_PLANE_COUNT];
 	/*!
 	 * #918 Phase 2a — REGION-SIZED views of the planes the DISPLAY PROCESSOR
 	 * consumes through its sideband entry points.
@@ -2093,9 +2093,9 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		const uint64_t want_gen = c->split_layout_gen;
 		int32_t slot;
 		if (is_repaint) {
-			slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+			slot = comp_xbridge_get_weave_slot(c->xbridge);
 		} else {
-			slot = comp_d3d11_xbridge_pick_slot(c->xbridge, want_gen);
+			slot = comp_xbridge_pick_slot(c->xbridge, want_gen);
 			if (slot < 0) {
 				/*
 				 * #918 R1 — the transition frame. A layout change rebuilt
@@ -2107,18 +2107,18 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				 * order the weave behind it — the frame goes out one
 				 * transition-only wait late instead of one mode wrong.
 				 */
-				slot = comp_d3d11_xbridge_pick_inflight_slot(c->xbridge, want_gen);
+				slot = comp_xbridge_pick_inflight_slot(c->xbridge, want_gen);
 				if (slot >= 0) {
 					c->split_inflight_weaves++;
 				}
 			}
 			if (slot >= 0) {
-				comp_d3d11_xbridge_set_weave_slot(c->xbridge, slot);
+				comp_xbridge_set_weave_slot(c->xbridge, slot);
 			} else {
 				// Warmup: nothing has crossed yet. Keep weaving whatever the
 				// last good slot was rather than handing the DP a null atlas.
 				// (The generation test below vets it just the same.)
-				slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+				slot = comp_xbridge_get_weave_slot(c->xbridge);
 			}
 		}
 		/*
@@ -2148,7 +2148,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		if (slot >= 0) {
 			uint64_t slot_gen = 0;
 			uint32_t slot_cw = 0, slot_ch = 0;
-			if (!comp_d3d11_xbridge_slot_layout(c->xbridge, slot, &slot_gen, &slot_cw, &slot_ch) ||
+			if (!comp_xbridge_slot_layout(c->xbridge, slot, &slot_gen, &slot_cw, &slot_ch) ||
 			    slot_gen != want_gen) {
 				c->split_stale_refusals++;
 				// Once per TRANSITION — this names the exact frame that used
@@ -2199,11 +2199,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		 * mid-way through rewriting. (This runs on the repaint thread, never on
 		 * the app's render thread, and it is a single poll — not a wait.)
 		 */
-		if (is_repaint && !comp_d3d11_xbridge_slot_ready(c->xbridge, slot)) {
+		if (is_repaint && !comp_xbridge_slot_ready(c->xbridge, slot)) {
 			return false;
 		}
-		comp_d3d11_xbridge_gpu_wait_slot(c->xbridge, slot);
-		atlas_srv = comp_d3d11_xbridge_get_srv(c->xbridge, slot);
+		comp_xbridge_gpu_wait_slot(c->xbridge, slot);
+		atlas_srv = comp_xbridge_get_srv(c->xbridge, slot);
 		if (atlas_srv == nullptr) {
 			return false;
 		}
@@ -2217,19 +2217,18 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		 * traffic, which is the whole point of the split.
 		 */
 		{
-			struct comp_d3d11_xbridge_recipe brec = {};
+			struct comp_xbridge_recipe brec = {};
 			ID3D11ShaderResourceView *bd_srv = nullptr;
-			if (comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &brec) && brec.bd_w > 0 && brec.bd_h > 0 &&
-			    (brec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_BACKDROP)) != 0) {
+			if (comp_xbridge_slot_recipe(c->xbridge, slot, &brec) && brec.bd_w > 0 && brec.bd_h > 0 &&
+			    (brec.plane_valid & (1u << COMP_XBRIDGE_PLANE_BACKDROP)) != 0) {
 				// Region-sized view: the DP's contract is an SRV plus the
 				// backdrop's real dims, and the plane is panel-sized. The copy
 				// is seq-gated on the slot's plane generation (#918 review F8),
 				// so an unchanged backdrop under a repaint costs nothing.
-				const uint64_t bd_seq = brec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_BACKDROP];
+				const uint64_t bd_seq = brec.plane_seq[COMP_XBRIDGE_PLANE_BACKDROP];
 				bd_srv = d3d11_plane_dp_view(
 				    c, &c->dp_bd_view,
-				    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot,
-				                                     COMP_D3D11_XBRIDGE_PLANE_BACKDROP, bd_seq),
+				    comp_xbridge_get_plane_srv(c->xbridge, slot, COMP_XBRIDGE_PLANE_BACKDROP, bd_seq),
 				    bd_seq, brec.bd_w, brec.bd_h, DXGI_FORMAT_R8G8B8A8_UNORM, "2D-under backdrop");
 			}
 			xrt_display_processor_d3d11_set_background_2d(c->display_processor, bd_srv,
@@ -2248,7 +2247,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		 * painted at, which the block above already resolved.
 		 */
 		uint32_t eg_w = 0, eg_h = 0;
-		comp_d3d11_xbridge_get_egress_dims(c->xbridge, &eg_w, &eg_h);
+		comp_xbridge_get_egress_dims(c->xbridge, &eg_w, &eg_h);
 		if (content_w != eg_w || content_h != eg_h) {
 			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
 		}
@@ -2278,7 +2277,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				 * without saying which plane to fix.
 				 */
 				const double atlas_gbs =
-				    (double)comp_d3d11_xbridge_take_atlas_bytes(c->xbridge) / secs / 1.0e9;
+				    (double)comp_xbridge_take_atlas_bytes(c->xbridge) / secs / 1.0e9;
 				/*
 				 * #918 review D8: sized by the constant, not by the 3 that
 				 * happened to be true. A fourth plane used to compile clean and
@@ -2289,15 +2288,15 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 				char planes[512];
 				size_t off = 0;
 				double total_gbs = atlas_gbs;
-				for (uint32_t p = 0; p < COMP_D3D11_XBRIDGE_PLANE_COUNT; p++) {
+				for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 					uint64_t pb = 0, pc = 0, ps = 0;
 					bool half = false;
-					comp_d3d11_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps, &half);
+					comp_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps, &half);
 					const double gbs = (double)pb / secs / 1.0e9;
 					total_gbs += gbs;
 					const int n = snprintf(planes + off, sizeof(planes) - off,
 					                       "%s %.3f GB/s (%llu copies, %llu skips%s) |",
-					                       comp_d3d11_xbridge_plane_label(p), gbs,
+					                       comp_xbridge_plane_label(p), gbs,
 					                       (unsigned long long)(pc - c->split_plane_copies_prev[p]),
 					                       (unsigned long long)(ps - c->split_plane_skips_prev[p]),
 					                       half ? " HALF-RATE" : "");
@@ -2749,7 +2748,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			// was just reallocated by a mode switch / resize). Bail BEFORE the
 			// acquire — acquire clears the back buffer, and a present of that
 			// clear is exactly the black flash this guard exists to remove.
-			if (comp_d3d11_xbridge_get_weave_slot(c->xbridge) < 0) {
+			if (comp_xbridge_get_weave_slot(c->xbridge) < 0) {
 				c->repaint.bail_armed++;
 				continue;
 			}
@@ -3158,7 +3157,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * frame retired. GPU-side only — this thread does not wait.
 		 */
 		if (c->split_active) {
-			comp_d3d11_xbridge_pre_render(c->xbridge);
+			comp_xbridge_pre_render(c->xbridge);
 		}
 		xret = comp_d3d11_renderer_draw_projection_pass(
 		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
@@ -3217,8 +3216,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (c->repaint.backdrop_srv == nullptr && c->xbridge != nullptr) {
 				// No under-layers this frame — un-stage, so the recipe stamps
 				// the plane invalid instead of carrying stale pixels forward.
-				comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP, 0, 0, 0,
-				                               0, 0);
+				comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
 			}
 		}
 
@@ -3237,14 +3235,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			 * bootstrap. The mask plane's own publisher already un-stages it when
 			 * the frame genuinely has no authored mask.
 			 */
-			struct comp_d3d11_xbridge_recipe r = {};
+			struct comp_xbridge_recipe r = {};
 			r.composite = false;
 			// The backdrop is independent of the composite: a frame can have
 			// 2D-under layers and still not run the masked pass.
 			r.bd_w = c->repaint.backdrop_w;
 			r.bd_h = c->repaint.backdrop_h;
-			comp_d3d11_xbridge_stage_recipe(c->xbridge, &r);
-			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
+			comp_xbridge_stage_recipe(c->xbridge, &r);
+			comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
 		}
 	}
 
@@ -3287,16 +3285,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// The atlas is only reallocated on a genuine grow (mode switch,
 			// window resize); the generation is what tells the producer to
 			// re-open, and it never moves on the #602 fits-early-out.
-			comp_d3d11_xbridge_bind_atlas(c->xbridge,
-			                              comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
-			                              comp_d3d11_renderer_get_atlas_generation(c->renderer));
+			comp_xbridge_bind_atlas(c->xbridge, comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
+			                        comp_d3d11_renderer_get_atlas_generation(c->renderer));
 			// Live egress re-size: the content box follows the window and the
 			// active mode, so a V-key mode switch or a resize lands here.
-			comp_d3d11_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h, c->split_layout_gen);
+			comp_xbridge_set_content_size(c->xbridge, bridge_w, bridge_h, c->split_layout_gen);
 			c->split_seq++;
-			comp_d3d11_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
-			                          comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w,
-			                          bridge_h);
+			comp_xbridge_submit(c->xbridge, c->split_seq, c->split_layout_gen,
+			                    comp_d3d11_renderer_get_atlas_texture(c->renderer), bridge_w, bridge_h);
 		}
 	}
 
@@ -3533,7 +3529,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		    (unsigned long long)c->split_skip_present, (unsigned long long)c->split_stale_refusals,
 		    (unsigned long long)c->split_inflight_weaves, (unsigned long long)c->split_recipe_refusals,
 		    (double)c->split_weave_gap_max_ns / 1.0e6);
-		comp_d3d11_xbridge_quiesce(c->xbridge);
+		comp_xbridge_quiesce(c->xbridge);
 	}
 
 	U_LOG_I("Destroying D3D11 compositor");
@@ -3612,7 +3608,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	 * egress -> consumer -> cross-adapter heap -> producer -> fences.
 	 */
 	if (c->xbridge != nullptr) {
-		comp_d3d11_xbridge_destroy(&c->xbridge);
+		comp_xbridge_destroy(&c->xbridge);
 	}
 
 	if (c->out_factory != nullptr) {
@@ -3993,7 +3989,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 				sys_h = c->settings.preferred.height;
 			}
 
-			struct comp_d3d11_xbridge_info xbi = {};
+			struct comp_xbridge_info xbi = {};
 			xbi.app_device = c->device;
 			xbi.app_context = c->context;
 			xbi.app_adapter = app_adapter;
@@ -4014,7 +4010,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 			const char *xb_reason = nullptr;
 			const uint64_t xb_t0 = os_monotonic_get_ns();
-			if (comp_d3d11_xbridge_create(&xbi, &c->xbridge, &xb_reason) != XRT_SUCCESS) {
+			if (comp_xbridge_create(&xbi, &c->xbridge, &xb_reason) != XRT_SUCCESS) {
 				c->xbridge = nullptr;
 				reason = (xb_reason != nullptr) ? xb_reason : "cross-adapter heap unsupported";
 			} else {
@@ -4040,12 +4036,12 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 				if (eg_w > 0 && eg_h > 0) {
 					// Falls back to a worst-case ring internally if the
 					// content-sized allocation fails.
-					comp_d3d11_xbridge_set_content_size(c->xbridge, eg_w, eg_h, 0);
+					comp_xbridge_set_content_size(c->xbridge, eg_w, eg_h, 0);
 					uint32_t gw = 0, gh = 0;
-					comp_d3d11_xbridge_get_egress_dims(c->xbridge, &gw, &gh);
+					comp_xbridge_get_egress_dims(c->xbridge, &gw, &gh);
 					eg_ok = (gw > 0 && gh > 0);
 				} else {
-					eg_ok = comp_d3d11_xbridge_alloc_worstcase_egress(c->xbridge);
+					eg_ok = comp_xbridge_alloc_worstcase_egress(c->xbridge);
 				}
 				if (!eg_ok) {
 					reason = "egress share failed";
@@ -4071,7 +4067,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			        (unsigned long)app_luid.LowPart);
 		} else {
 			if (c->xbridge != nullptr) {
-				comp_d3d11_xbridge_destroy(&c->xbridge);
+				comp_xbridge_destroy(&c->xbridge);
 			}
 			if (c->out_factory != nullptr) {
 				c->out_factory->Release();
@@ -4447,7 +4443,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			cw = c->settings.preferred.width;
 			ch = c->settings.preferred.height;
 		}
-		if (!comp_d3d11_xbridge_set_content_size(c->xbridge, cw, ch, c->split_layout_gen)) {
+		if (!comp_xbridge_set_content_size(c->xbridge, cw, ch, c->split_layout_gen)) {
 			U_LOG_W("D3D11 output-device split: stage B could not size the egress ring to %ux%u — "
 			        "keeping the worst-case ring and cropping on the output device (#918)",
 			        cw, ch);
@@ -4455,8 +4451,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		// Ingress Option I: the producer reads the renderer's atlas directly.
 		// A NULL handle (or a failed D3D12 open) latches Option II inside the
 		// bridge, with its own one-off WARN.
-		comp_d3d11_xbridge_bind_atlas(c->xbridge, comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
-		                              comp_d3d11_renderer_get_atlas_generation(c->renderer));
+		comp_xbridge_bind_atlas(c->xbridge, comp_d3d11_renderer_get_atlas_shared_handle(c->renderer),
+		                        comp_d3d11_renderer_get_atlas_generation(c->renderer));
 	}
 
 	// Expose current window-scaled capture dims to xrCaptureAtlasDXR (#431).
@@ -4976,7 +4972,7 @@ d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_m
 	 */
 	const bool needs_plane = mask != nullptr && (mask->app_authored || mask->out_staged_srv == nullptr);
 	if (mask == nullptr || !needs_plane || mask->staged_share == nullptr) {
-		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
 		return;
@@ -4987,12 +4983,12 @@ d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_m
 	 * DP both stretch the whole mask over the region, so the whole mask is what
 	 * has to cross.
 	 */
-	if (!comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, mask->staged_share,
-	                                   mask->staged_gen, (uint32_t)DXGI_FORMAT_R8_UNORM, mask->w, mask->h)) {
+	if (!comp_xbridge_bind_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, mask->staged_share, mask->staged_gen,
+	                             (uint32_t)DXGI_FORMAT_R8_UNORM, mask->w, mask->h)) {
 		// Transport unavailable (no share handle, or the stack refused an R8
 		// cross-adapter heap). Tier-1/2 content still composites through the
 		// shadow; the Tier-3 strokes do not.
-		comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
 		return;
@@ -5011,14 +5007,14 @@ d3d11_stage_mask_plane(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_m
 	if (seq == 0) {
 		seq = 1; // 0 is reserved for "this frame does not use the plane"
 	}
-	comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, seq, 0, 0, mask->w, mask->h);
+	comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, seq, 0, 0, mask->w, mask->h);
 	c->mask_plane_live = true;
 	c->mask_plane_gen = mask->staged_gen;
 }
 
 /*!
  * #918 Phase 2a — the SRV of @p mask ON THE COMPOSITE DEVICE, plus how it got
- * there (a COMP_D3D11_XBRIDGE_MASK_* kind for the recipe stamp).
+ * there (a COMP_XBRIDGE_MASK_* kind for the recipe stamp).
  *
  * Three cases, and only one of them costs bandwidth:
  *   - split off → the app-device staged snapshot, verbatim.
@@ -5040,14 +5036,14 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
                             uint64_t *out_seq)
 {
 	if (out_kind != nullptr) {
-		*out_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+		*out_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
 	}
 	if (out_seq != nullptr) {
 		*out_seq = 0;
 	}
 	if (mask == nullptr) {
 		if (out_kind != nullptr) {
-			*out_kind = COMP_D3D11_XBRIDGE_MASK_NONE;
+			*out_kind = COMP_XBRIDGE_MASK_NONE;
 		}
 		return nullptr;
 	}
@@ -5065,10 +5061,10 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
 		return mask->out_staged_srv; // NULL when the shadow itself failed (#918 review D5)
 	}
 	if (out_kind != nullptr) {
-		*out_kind = COMP_D3D11_XBRIDGE_MASK_PLANE;
+		*out_kind = COMP_XBRIDGE_MASK_PLANE;
 	}
 	if (slot < 0) {
-		slot = comp_d3d11_xbridge_get_weave_slot(c->xbridge);
+		slot = comp_xbridge_get_weave_slot(c->xbridge);
 	}
 	/*
 	 * #918 review F3 — the slot's own recipe says which generation its mask
@@ -5077,17 +5073,17 @@ d3d11_zone_mask_consume_srv(struct comp_d3d11_compositor *c,
 	 * callers' "not yet / keep the previous publish" path) rather than being
 	 * composited or published under the wrong recipe.
 	 */
-	struct comp_d3d11_xbridge_recipe rec = {};
-	if (!comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &rec) ||
-	    (rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_MASK)) == 0) {
+	struct comp_xbridge_recipe rec = {};
+	if (!comp_xbridge_slot_recipe(c->xbridge, slot, &rec) ||
+	    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
 		return nullptr;
 	}
-	const uint64_t want = rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_MASK];
+	const uint64_t want = rec.plane_seq[COMP_XBRIDGE_PLANE_MASK];
 	if (out_seq != nullptr) {
 		*out_seq = want;
 	}
 	return static_cast<ID3D11ShaderResourceView *>(
-	    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK, want));
+	    comp_xbridge_get_plane_srv(c->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, want));
 }
 
 //! Refresh @p mask's staged snapshot on every device that consumes it.
@@ -5105,7 +5101,7 @@ d3d11_zone_mask_stage(struct comp_d3d11_compositor *c, struct comp_d3d11_zone_ma
 	 * from an OpenXR entry point BEFORE layer_commit does. GPU-side only.
 	 */
 	if (c->split_active && c->xbridge != nullptr) {
-		comp_d3d11_xbridge_pre_plane_write(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK);
+		comp_xbridge_pre_plane_write(c->xbridge, COMP_XBRIDGE_PLANE_MASK);
 	}
 	c->context->CopyResource(mask->staged, mask->tex);
 	if (c->split_active && mask->out_staged != nullptr && mask->out_tex != nullptr) {
@@ -5132,7 +5128,7 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	// mask resolves to its output-device shadow (Tier 1/2) or its bridge plane
 	// (Tier 3). The publish's contract already took the context and the SRV as
 	// parameters, so there is no vtable change here at all.
-	uint32_t pub_kind = COMP_D3D11_XBRIDGE_MASK_NONE;
+	uint32_t pub_kind = COMP_XBRIDGE_MASK_NONE;
 	uint64_t pub_seq = 0;
 	/*
 	 * #918 review F9 — does this frame HAVE published mask content at all, per
@@ -5155,7 +5151,7 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 			// explicit wish whose plane has not landed must NOT silently fall
 			// back to the auto raster — that would publish different geometry
 			// for one frame, which is a flicker, not a degradation.)
-			pub_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+			pub_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
 			srv = c->wish_mask_staged_srv;
 			mask_w = c->wish_mask_w;
 			mask_h = c->wish_mask_h;
@@ -5176,7 +5172,7 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c)
 	 * passthrough that copies nothing; the helper still handles the case where a
 	 * publish asks for dims the plane does not have, seq-gated and clamped.
 	 */
-	if (srv != nullptr && pub_kind == COMP_D3D11_XBRIDGE_MASK_PLANE) {
+	if (srv != nullptr && pub_kind == COMP_XBRIDGE_MASK_PLANE) {
 		srv = d3d11_plane_dp_view(c, &c->dp_mask_view, srv, pub_seq, mask_w, mask_h, DXGI_FORMAT_R8_UNORM,
 		                          "zone-mask publish");
 	}
@@ -6055,7 +6051,7 @@ d3d11_clear_scratch_region(struct comp_d3d11_compositor *c,
 	if (region_changed) {
 		c->context->ClearRenderTargetView(rtv, transparent);
 		if (c->split_active && c->xbridge != nullptr) {
-			comp_d3d11_xbridge_invalidate_plane(c->xbridge, plane);
+			comp_xbridge_invalidate_plane(c->xbridge, plane);
 		}
 		return;
 	}
@@ -6180,7 +6176,7 @@ static bool
 d3d11_flatten_local_2d_layers(struct comp_d3d11_compositor *c, uint32_t region_w, uint32_t region_h, int32_t proj_idx)
 {
 	d3d11_clear_scratch_region(c, c->local2d_scratch_rtv, region_w, region_h, &c->local2d_scratch_region_w,
-	                           &c->local2d_scratch_region_h, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D);
+	                           &c->local2d_scratch_region_h, COMP_XBRIDGE_PLANE_LOCAL2D);
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -6274,7 +6270,7 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 	}
 
 	d3d11_clear_scratch_region(c, c->backdrop_scratch_rtv, region_w, region_h, &c->backdrop_scratch_region_w,
-	                           &c->backdrop_scratch_region_h, COMP_D3D11_XBRIDGE_PLANE_BACKDROP);
+	                           &c->backdrop_scratch_region_h, COMP_XBRIDGE_PLANE_BACKDROP);
 
 	for (int32_t i = 0; i < proj_idx; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -6307,13 +6303,11 @@ d3d11_flatten_backdrop_2d(struct comp_d3d11_compositor *c, uint32_t dst_w, uint3
 		d3d11_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
 		// Panel-sized, always: never resized, so structurally outside the R2
 		// churn path (#918 Phase 2a).
-		if (comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP,
-		                                  c->backdrop_scratch_share, c->backdrop_scratch_gen,
-		                                  (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, c->split_panel_w,
-		                                  c->split_panel_h)) {
-			comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_BACKDROP, hash,
-			                               box.offset.w, box.offset.h, (uint32_t)box.extent.w,
-			                               (uint32_t)box.extent.h);
+		if (comp_xbridge_bind_plane(c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, c->backdrop_scratch_share,
+		                            c->backdrop_scratch_gen, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM,
+		                            c->split_panel_w, c->split_panel_h)) {
+			comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, hash, box.offset.w,
+			                         box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h);
 		}
 	}
 
@@ -6368,9 +6362,9 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	 * mode, this stops its pixels being composited under the wrong recipe.
 	 */
 	const bool split_consume = c->split_active && !prepare_only;
-	struct comp_d3d11_xbridge_recipe rec = {};
+	struct comp_xbridge_recipe rec = {};
 	if (split_consume) {
-		if (slot < 0 || !comp_d3d11_xbridge_slot_recipe(c->xbridge, slot, &rec)) {
+		if (slot < 0 || !comp_xbridge_slot_recipe(c->xbridge, slot, &rec)) {
 			c->repaint.composite_bail = 2;
 			return false;
 		}
@@ -6460,7 +6454,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	// mask from the OVER Local2D layer rects (Q3 — M=0 inside the rect
 	// union, M=1 elsewhere).
 	ID3D11ShaderResourceView *mask_srv = nullptr;
-	uint32_t mask_kind = COMP_D3D11_XBRIDGE_MASK_OUT_RASTER;
+	uint32_t mask_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
 	if (split_consume) {
 		/*
 		 * #918 Phase 2a — the consume half never re-derives the mask; it takes
@@ -6472,14 +6466,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 		 * a uv scale derived from that input's own extent, so the sub-rect sampled
 		 * is the right one either way.
 		 */
-		if (rec.mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE) {
-			if ((rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_MASK)) == 0) {
+		if (rec.mask_kind == COMP_XBRIDGE_MASK_PLANE) {
+			if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
 				c->repaint.composite_bail = 3;
 				return false;
 			}
-			mask_srv = static_cast<ID3D11ShaderResourceView *>(
-			    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_MASK,
-			                                     rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_MASK]));
+			mask_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
+			    c->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
 		} else {
 			mask_srv = c->repaint.mask_srv;
 		}
@@ -6547,7 +6540,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	 * ever. The first authoring frame now transports, and consumption starts
 	 * whenever the slot lands.
 	 */
-	const bool deposit_bridged_mask = prepare_only && c->split_active && mask_kind == COMP_D3D11_XBRIDGE_MASK_PLANE;
+	const bool deposit_bridged_mask = prepare_only && c->split_active && mask_kind == COMP_XBRIDGE_MASK_PLANE;
 	if (mask_srv == nullptr && !deposit_bridged_mask) {
 		c->repaint.composite_bail = 3;
 		return false;
@@ -6638,13 +6631,13 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				uint64_t hash = 0;
 				d3d11_local2d_digest(c, zones_frame ? -1 : proj_idx, /*over=*/true, region_w, region_h,
 				                     &box, &hash);
-				const bool twod_bound = comp_d3d11_xbridge_bind_plane(
-				    c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D, c->local2d_scratch_share,
+				const bool twod_bound = comp_xbridge_bind_plane(
+				    c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, c->local2d_scratch_share,
 				    c->local2d_scratch_gen, (uint32_t)unorm_fmt, c->split_panel_w, c->split_panel_h);
 				if (twod_bound) {
-					comp_d3d11_xbridge_stage_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
-					                               hash, box.offset.w, box.offset.h,
-					                               (uint32_t)box.extent.w, (uint32_t)box.extent.h);
+					comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, hash,
+					                         box.offset.w, box.offset.h, (uint32_t)box.extent.w,
+					                         (uint32_t)box.extent.h);
 				} else {
 					/*
 					 * #918 review D4: the Local2D plane IS the composite's
@@ -6669,7 +6662,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				}
 
 				// Stamp the recipe this frame's slot will carry.
-				struct comp_d3d11_xbridge_recipe r = {};
+				struct comp_xbridge_recipe r = {};
 				r.composite = true;
 				r.mask_kind = mask_kind;
 				r.region_w = region_w;
@@ -6691,7 +6684,7 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 				// the composite region, and the two can legitimately differ.
 				r.bd_w = c->repaint.backdrop_w;
 				r.bd_h = c->repaint.backdrop_h;
-				comp_d3d11_xbridge_stage_recipe(c->xbridge, &r);
+				comp_xbridge_stage_recipe(c->xbridge, &r);
 			}
 			c->repaint.composite_bail = 0; // deposit half completed
 			return true;
@@ -6708,13 +6701,12 @@ d3d11_composite_zone_mask(struct comp_d3d11_compositor *c,
 	 * never what the composite samples here.
 	 */
 	if (split_consume) {
-		if ((rec.plane_valid & (1u << COMP_D3D11_XBRIDGE_PLANE_LOCAL2D)) == 0) {
+		if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_LOCAL2D)) == 0) {
 			c->repaint.composite_bail = 4;
 			return false;
 		}
-		twod_srv = static_cast<ID3D11ShaderResourceView *>(
-		    comp_d3d11_xbridge_get_plane_srv(c->xbridge, slot, COMP_D3D11_XBRIDGE_PLANE_LOCAL2D,
-		                                     rec.plane_seq[COMP_D3D11_XBRIDGE_PLANE_LOCAL2D]));
+		twod_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
+		    c->xbridge, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]));
 		if (twod_srv == nullptr) {
 			c->repaint.composite_bail = 4;
 			return false;
@@ -7202,7 +7194,7 @@ comp_d3d11_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	// #918 review, R1-adjacent: order the write behind the producer's read of
 	// the previous seq — see d3d11_zone_mask_stage.
 	if (c->split_active && c->xbridge != nullptr) {
-		comp_d3d11_xbridge_pre_plane_write(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK);
+		comp_xbridge_pre_plane_write(c->xbridge, COMP_XBRIDGE_PLANE_MASK);
 	}
 	c->context->CopyResource(mask->staged, mask->tex);
 	// #918 Phase 2a: stage the shadow too, so a Tier-1/2 mask is consumable on
@@ -7253,8 +7245,8 @@ comp_d3d11_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	 */
 	if (c->split_active && c->xbridge != nullptr && mask->staged_share != nullptr &&
 	    c->mask_plane_gen == mask->staged_gen) {
-		comp_d3d11_xbridge_bind_plane(c->xbridge, COMP_D3D11_XBRIDGE_PLANE_MASK, nullptr, 0,
-		                              (uint32_t)DXGI_FORMAT_R8_UNORM, 0, 0);
+		comp_xbridge_bind_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, nullptr, 0, (uint32_t)DXGI_FORMAT_R8_UNORM,
+		                        0, 0);
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
 	}
