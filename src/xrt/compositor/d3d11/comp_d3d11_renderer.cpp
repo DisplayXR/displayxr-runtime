@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_compositor.h"
+#include "comp_d3d11_compositor_internals.h"
 #include "comp_d3d11_swapchain.h"
 
 #include "util/comp_layer_accum.h"
@@ -148,22 +149,12 @@ struct comp_d3d11_renderer
 	uint64_t atlas_generation;
 };
 
-// Access compositor internals
-extern "C" {
-struct comp_d3d11_compositor_internals
-{
-	struct xrt_compositor_native base;
-	struct xrt_device *xdev;
-	ID3D11Device *device;
-	ID3D11DeviceContext *context;
-	IDXGIFactory4 *dxgi_factory;
-};
-}
-
-static inline struct comp_d3d11_compositor_internals *
+// The compositor's borrowed handles, handed over explicitly — see
+// comp_d3d11_compositor_internals.h for what this replaced and why.
+static inline struct comp_d3d11_compositor_internals
 get_internals(struct comp_d3d11_compositor *c)
 {
-	return reinterpret_cast<struct comp_d3d11_compositor_internals *>(c);
+	return comp_d3d11_compositor_get_internals(c);
 }
 
 // Embedded HLSL shader source
@@ -432,14 +423,14 @@ create_shaders(struct comp_d3d11_renderer *r)
 	ID3DBlob *blob = nullptr;
 
 	// Compile vertex shader
-	xrt_result_t xret = compile_shader(internals->device, projection_vs_source, "VSMain", "vs_5_0", &blob);
+	xrt_result_t xret = compile_shader(internals.device, projection_vs_source, "VSMain", "vs_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile vertex shader");
 		return xret;
 	}
 
-	HRESULT hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                                    &r->projection_vs);
+	HRESULT hr = internals.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                                  &r->projection_vs);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create vertex shader: 0x%08x", hr);
@@ -447,14 +438,14 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Compile pixel shader
-	xret = compile_shader(internals->device, projection_ps_source, "PSMain", "ps_5_0", &blob);
+	xret = compile_shader(internals.device, projection_ps_source, "PSMain", "ps_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile pixel shader");
 		return xret;
 	}
 
-	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->projection_ps);
+	hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                         &r->projection_ps);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create pixel shader: 0x%08x", hr);
@@ -462,14 +453,14 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Compile layered (array) projection pixel shader variant
-	xret = compile_shader(internals->device, projection_ps_array_source, "PSMain", "ps_5_0", &blob);
+	xret = compile_shader(internals.device, projection_ps_array_source, "PSMain", "ps_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile array projection pixel shader");
 		return xret;
 	}
 
-	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->projection_ps_array);
+	hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                         &r->projection_ps_array);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create array projection pixel shader: 0x%08x", hr);
@@ -477,14 +468,14 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Compile quad vertex shader
-	xret = compile_shader(internals->device, quad_vs_source, "VSMain", "vs_5_0", &blob);
+	xret = compile_shader(internals.device, quad_vs_source, "VSMain", "vs_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile quad vertex shader");
 		return xret;
 	}
 
-	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                            &r->quad_vs);
+	hr =
+	    internals.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &r->quad_vs);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create quad vertex shader: 0x%08x", hr);
@@ -492,14 +483,13 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Compile quad pixel shader
-	xret = compile_shader(internals->device, quad_ps_source, "PSMain", "ps_5_0", &blob);
+	xret = compile_shader(internals.device, quad_ps_source, "PSMain", "ps_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile quad pixel shader");
 		return xret;
 	}
 
-	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->quad_ps);
+	hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &r->quad_ps);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create quad pixel shader: 0x%08x", hr);
@@ -507,13 +497,13 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Local2D flatten vertex shader (#439 Phase 3).
-	xret = compile_shader(internals->device, local2d_flatten_vs_source, "VSMain", "vs_5_0", &blob);
+	xret = compile_shader(internals.device, local2d_flatten_vs_source, "VSMain", "vs_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile Local2D flatten vertex shader");
 		return xret;
 	}
-	hr = internals->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                           &r->local2d_flatten_vs);
+	hr = internals.device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                          &r->local2d_flatten_vs);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create Local2D flatten vertex shader: 0x%08x", hr);
@@ -521,13 +511,13 @@ create_shaders(struct comp_d3d11_renderer *r)
 	}
 
 	// Local2D flatten pixel shader (#439 Phase 3).
-	xret = compile_shader(internals->device, local2d_flatten_ps_source, "PSMain", "ps_5_0", &blob);
+	xret = compile_shader(internals.device, local2d_flatten_ps_source, "PSMain", "ps_5_0", &blob);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to compile Local2D flatten pixel shader");
 		return xret;
 	}
-	hr = internals->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
-	                                          &r->local2d_flatten_ps);
+	hr = internals.device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                         &r->local2d_flatten_ps);
 	blob->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create Local2D flatten pixel shader: 0x%08x", hr);
@@ -593,7 +583,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	                        ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED)
 	                        : 0;
 
-	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->atlas_texture);
+	HRESULT hr = internals.device->CreateTexture2D(&texDesc, nullptr, &r->atlas_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -612,14 +602,14 @@ create_resources(struct comp_d3d11_renderer *r)
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
 
-	hr = internals->device->CreateShaderResourceView(r->atlas_texture, &srvDesc, &r->atlas_srv);
+	hr = internals.device->CreateShaderResourceView(r->atlas_texture, &srvDesc, &r->atlas_srv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Create RTV for atlas texture
-	hr = internals->device->CreateRenderTargetView(r->atlas_texture, nullptr, &r->atlas_rtv);
+	hr = internals.device->CreateRenderTargetView(r->atlas_texture, nullptr, &r->atlas_rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create atlas RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -631,14 +621,14 @@ create_resources(struct comp_d3d11_renderer *r)
 	texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 	texDesc.MiscFlags = 0;
 
-	hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->depth_texture);
+	hr = internals.device->CreateTexture2D(&texDesc, nullptr, &r->depth_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create depth texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Create DSV
-	hr = internals->device->CreateDepthStencilView(r->depth_texture, nullptr, &r->depth_dsv);
+	hr = internals.device->CreateDepthStencilView(r->depth_texture, nullptr, &r->depth_dsv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create depth DSV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -651,7 +641,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-	hr = internals->device->CreateBuffer(&cbDesc, nullptr, &r->constant_buffer);
+	hr = internals.device->CreateBuffer(&cbDesc, nullptr, &r->constant_buffer);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create constant buffer: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -663,7 +653,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	flattenCbDesc.Usage = D3D11_USAGE_DYNAMIC;
 	flattenCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 	flattenCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-	hr = internals->device->CreateBuffer(&flattenCbDesc, nullptr, &r->flatten_cb);
+	hr = internals.device->CreateBuffer(&flattenCbDesc, nullptr, &r->flatten_cb);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create flatten constant buffer: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -676,7 +666,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
 	sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 
-	hr = internals->device->CreateSamplerState(&sampDesc, &r->sampler_linear);
+	hr = internals.device->CreateSamplerState(&sampDesc, &r->sampler_linear);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create linear sampler: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -702,7 +692,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
 	blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
 
-	hr = internals->device->CreateBlendState(&blendDesc, &r->blend_alpha);
+	hr = internals.device->CreateBlendState(&blendDesc, &r->blend_alpha);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create alpha blend state: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -712,7 +702,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
 	blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
 
-	hr = internals->device->CreateBlendState(&blendDesc, &r->blend_premul);
+	hr = internals.device->CreateBlendState(&blendDesc, &r->blend_premul);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create premul blend state: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -721,7 +711,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	// Opaque
 	blendDesc.RenderTarget[0].BlendEnable = FALSE;
 
-	hr = internals->device->CreateBlendState(&blendDesc, &r->blend_opaque);
+	hr = internals.device->CreateBlendState(&blendDesc, &r->blend_opaque);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create opaque blend state: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -734,7 +724,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	rasterDesc.FrontCounterClockwise = FALSE;
 	rasterDesc.DepthClipEnable = TRUE;
 
-	hr = internals->device->CreateRasterizerState(&rasterDesc, &r->rasterizer_state);
+	hr = internals.device->CreateRasterizerState(&rasterDesc, &r->rasterizer_state);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create rasterizer state: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -745,7 +735,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	dsDesc.DepthEnable = FALSE;
 	dsDesc.StencilEnable = FALSE;
 
-	hr = internals->device->CreateDepthStencilState(&dsDesc, &r->depth_stencil_state);
+	hr = internals.device->CreateDepthStencilState(&dsDesc, &r->depth_stencil_state);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create depth stencil state: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -796,8 +786,8 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 
 	// Set projection shaders explicitly (must be done per-draw because quad layer
 	// rendering switches to quad shaders, and those persist to the next projection layer)
-	internals->context->VSSetShader(r->projection_vs, nullptr, 0);
-	internals->context->PSSetShader(is_layered ? r->projection_ps_array : r->projection_ps, nullptr, 0);
+	internals.context->VSSetShader(r->projection_vs, nullptr, 0);
+	internals.context->PSSetShader(is_layered ? r->projection_ps_array : r->projection_ps, nullptr, 0);
 
 	// Update constant buffer
 	LayerConstants constants = {};
@@ -852,26 +842,26 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 
 	// Map and update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
-	HRESULT hr = internals->context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 	if (SUCCEEDED(hr)) {
 		memcpy(mapped.pData, &constants, sizeof(constants));
-		internals->context->Unmap(r->constant_buffer, 0);
+		internals.context->Unmap(r->constant_buffer, 0);
 	}
 
 	// Set shader resources
-	internals->context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetSamplers(0, 1, &r->sampler_linear);
+	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
 	// Bind the swapchain texture as shader resource
-	internals->context->PSSetShaderResources(0, 1, &srv);
+	internals.context->PSSetShaderResources(0, 1, &srv);
 
 	// Draw fullscreen quad (triangle strip, 4 vertices)
-	internals->context->Draw(4, 0);
+	internals.context->Draw(4, 0);
 
 	// Unbind SRV to avoid resource hazards
 	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
 }
 
 static bool
@@ -992,39 +982,39 @@ render_quad_layer(struct comp_d3d11_renderer *r,
 
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
-	HRESULT hr = internals->context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 	if (SUCCEEDED(hr)) {
 		memcpy(mapped.pData, &constants, sizeof(constants));
-		internals->context->Unmap(r->constant_buffer, 0);
+		internals.context->Unmap(r->constant_buffer, 0);
 	}
 
 	// Set shaders - use quad shaders for proper 3D positioning
-	internals->context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals->context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
+	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
 
 	// Bind resources
-	internals->context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetShaderResources(0, 1, &srv);
-	internals->context->PSSetSamplers(0, 1, &r->sampler_linear);
+	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetShaderResources(0, 1, &srv);
+	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
 	// Set blend state for alpha blending (quads often have transparent areas)
 	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
 	if (is_premultiplied) {
-		internals->context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
+		internals.context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
 	} else {
-		internals->context->OMSetBlendState(r->blend_alpha, nullptr, 0xFFFFFFFF);
+		internals.context->OMSetBlendState(r->blend_alpha, nullptr, 0xFFFFFFFF);
 	}
 
 	// Draw quad (triangle strip, 4 vertices)
-	internals->context->Draw(4, 0);
+	internals.context->Draw(4, 0);
 
 	// Unbind SRV
 	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
 
 	// Restore opaque blend state for subsequent layers
-	internals->context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals.context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
 }
 
 /*!
@@ -1103,39 +1093,39 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 
 	// Update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
-	HRESULT hr = internals->context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	HRESULT hr = internals.context->Map(r->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 	if (SUCCEEDED(hr)) {
 		memcpy(mapped.pData, &constants, sizeof(constants));
-		internals->context->Unmap(r->constant_buffer, 0);
+		internals.context->Unmap(r->constant_buffer, 0);
 	}
 
 	// Set shaders - reuse quad shaders (screen-aligned quad with MVP)
-	internals->context->VSSetShader(r->quad_vs, nullptr, 0);
-	internals->context->PSSetShader(r->quad_ps, nullptr, 0);
+	internals.context->VSSetShader(r->quad_vs, nullptr, 0);
+	internals.context->PSSetShader(r->quad_ps, nullptr, 0);
 
 	// Bind resources
-	internals->context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
-	internals->context->PSSetShaderResources(0, 1, &srv);
-	internals->context->PSSetSamplers(0, 1, &r->sampler_linear);
+	internals.context->VSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetConstantBuffers(0, 1, &r->constant_buffer);
+	internals.context->PSSetShaderResources(0, 1, &srv);
+	internals.context->PSSetSamplers(0, 1, &r->sampler_linear);
 
 	// Set blend state for alpha blending
 	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
 	if (is_premultiplied) {
-		internals->context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
+		internals.context->OMSetBlendState(r->blend_premul, nullptr, 0xFFFFFFFF);
 	} else {
-		internals->context->OMSetBlendState(r->blend_alpha, nullptr, 0xFFFFFFFF);
+		internals.context->OMSetBlendState(r->blend_alpha, nullptr, 0xFFFFFFFF);
 	}
 
 	// Draw quad (triangle strip, 4 vertices)
-	internals->context->Draw(4, 0);
+	internals.context->Draw(4, 0);
 
 	// Unbind SRV
 	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
 
 	// Restore opaque blend state for subsequent layers
-	internals->context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals.context->OMSetBlendState(r->blend_opaque, nullptr, 0xFFFFFFFF);
 }
 
 extern "C" xrt_result_t
@@ -1156,11 +1146,11 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 
 	// Initialize tile layout from the active rendering mode
 	auto ci = get_internals(c);
-	if (ci->xdev != NULL && ci->xdev->hmd != NULL) {
-		uint32_t idx = ci->xdev->hmd->active_rendering_mode_index;
-		if (idx < ci->xdev->rendering_mode_count) {
-			r->tile_columns = ci->xdev->rendering_modes[idx].tile_columns;
-			r->tile_rows = ci->xdev->rendering_modes[idx].tile_rows;
+	if (ci.xdev != NULL && ci.xdev->hmd != NULL) {
+		uint32_t idx = ci.xdev->hmd->active_rendering_mode_index;
+		if (idx < ci.xdev->rendering_mode_count) {
+			r->tile_columns = ci.xdev->rendering_modes[idx].tile_columns;
+			r->tile_rows = ci.xdev->rendering_modes[idx].tile_rows;
 		}
 	}
 	// Default to 2x1 (stereo) if not set
@@ -1368,7 +1358,7 @@ set_view_viewport(struct comp_d3d11_renderer *renderer,
 	                  &viewport.TopLeftY, &viewport.Width, &viewport.Height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &viewport);
+	internals.context->RSSetViewports(1, &viewport);
 }
 
 extern "C" xrt_result_t
@@ -1395,7 +1385,7 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	}
 
 	// Set render target to atlas texture
-	internals->context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
+	internals.context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
 
 	// Clear to dark blue (similar to Vulkan compositor); transparent in
 	// zones frames.
@@ -1403,18 +1393,17 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 	if (zones_frame) {
 		clear_color[0] = clear_color[1] = clear_color[2] = clear_color[3] = 0.0f;
 	}
-	internals->context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
-	internals->context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f,
-	                                           0);
+	internals.context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
+	internals.context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
 	// Set common state
-	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	internals->context->IASetInputLayout(nullptr); // No vertex buffer, using SV_VertexID
-	internals->context->VSSetShader(renderer->projection_vs, nullptr, 0);
-	internals->context->PSSetShader(renderer->projection_ps, nullptr, 0);
-	internals->context->RSSetState(renderer->rasterizer_state);
-	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
-	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	internals.context->IASetInputLayout(nullptr); // No vertex buffer, using SV_VertexID
+	internals.context->VSSetShader(renderer->projection_vs, nullptr, 0);
+	internals.context->PSSetShader(renderer->projection_ps, nullptr, 0);
+	internals.context->RSSetState(renderer->rasterizer_state);
+	internals.context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 
 	// Default view poses and FOVs for non-projection 3D-positioned layers
 	// (quad / cylinder / equirect / cube). Projection layers carry their
@@ -1473,16 +1462,16 @@ comp_d3d11_renderer_draw_projection_pass(struct comp_d3d11_renderer *renderer,
 				if (zvp.Width <= 0.0f || zvp.Height <= 0.0f) {
 					break;
 				}
-				internals->context->RSSetViewports(1, &zvp);
+				internals.context->RSSetViewports(1, &zvp);
 				const bool unpremul =
 				    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-				internals->context->OMSetBlendState(
+				internals.context->OMSetBlendState(
 				    unpremul ? renderer->blend_alpha : renderer->blend_premul, nullptr, 0xFFFFFFFF);
 				// zone_3d.proj shares xrt_layer_projection_data's layout
 				// at union offset 0, so the projection draw body reads
 				// the right per-view sub/fov data unchanged.
 				render_projection_layer(renderer, layer, view_index, eye);
-				internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+				internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 				set_view_viewport(renderer, view_index, layout, target_width, target_height);
 				break;
 			}
@@ -1737,7 +1726,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	                        ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED)
 	                        : 0;
 
-	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->atlas_texture);
+	HRESULT hr = internals.device->CreateTexture2D(&texDesc, nullptr, &renderer->atlas_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -1754,14 +1743,14 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
 
-	hr = internals->device->CreateShaderResourceView(renderer->atlas_texture, &srvDesc, &renderer->atlas_srv);
+	hr = internals.device->CreateShaderResourceView(renderer->atlas_texture, &srvDesc, &renderer->atlas_srv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate atlas SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Recreate RTV
-	hr = internals->device->CreateRenderTargetView(renderer->atlas_texture, nullptr, &renderer->atlas_rtv);
+	hr = internals.device->CreateRenderTargetView(renderer->atlas_texture, nullptr, &renderer->atlas_rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate atlas RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -1772,14 +1761,14 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 	texDesc.MiscFlags = 0;
 
-	hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->depth_texture);
+	hr = internals.device->CreateTexture2D(&texDesc, nullptr, &renderer->depth_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate depth texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Recreate DSV
-	hr = internals->device->CreateDepthStencilView(renderer->depth_texture, nullptr, &renderer->depth_dsv);
+	hr = internals.device->CreateDepthStencilView(renderer->depth_texture, nullptr, &renderer->depth_dsv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate depth DSV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -1815,7 +1804,7 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
 
 	// Bind the scratch as the render target (the caller clears it transparent
 	// once before the layer loop). No depth — flatten is a flat over-blend.
-	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
+	internals.context->OMSetRenderTargets(1, &rtv, nullptr);
 
 	// Restrict output to the clipped dest sub-rect (window px). uv [0,1] over
 	// this viewport maps through src_rect into the source image.
@@ -1825,26 +1814,26 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
 	vp.Width = static_cast<float>(dst_w);
 	vp.Height = static_cast<float>(dst_h);
 	vp.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &vp);
+	internals.context->RSSetViewports(1, &vp);
 
-	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	internals->context->IASetInputLayout(nullptr);
-	internals->context->VSSetShader(renderer->local2d_flatten_vs, nullptr, 0);
-	internals->context->PSSetShader(renderer->local2d_flatten_ps, nullptr, 0);
-	internals->context->RSSetState(renderer->rasterizer_state);
-	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	internals.context->IASetInputLayout(nullptr);
+	internals.context->VSSetShader(renderer->local2d_flatten_vs, nullptr, 0);
+	internals.context->PSSetShader(renderer->local2d_flatten_ps, nullptr, 0);
+	internals.context->RSSetState(renderer->rasterizer_state);
+	internals.context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
 	// Premultiplied-over (default) vs straight/unpremultiplied-over
 	// (XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT). Both preserve dst.a
 	// via INV_SRC_ALPHA so stacked layers compose Porter-Duff "over".
-	internals->context->OMSetBlendState(unpremultiplied ? renderer->blend_alpha : renderer->blend_premul,
-	                                    nullptr, 0xFFFFFFFF);
+	internals.context->OMSetBlendState(unpremultiplied ? renderer->blend_alpha : renderer->blend_premul, nullptr,
+	                                   0xFFFFFFFF);
 	// Linear+clamp: the source SRV is the swapchain's UNORM sibling
 	// (sRGB-passthrough — no auto-decode); clamp keeps sub-rect sampling
 	// from bleeding past the layer's norm_rect edges.
-	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
+	internals.context->PSSetSamplers(0, 1, &renderer->sampler_linear);
 
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(src_srv);
-	internals->context->PSSetShaderResources(0, 1, &srv);
+	internals.context->PSSetShaderResources(0, 1, &srv);
 
 	FlattenParams params = {};
 	params.src_rect[0] = src_x;
@@ -1853,26 +1842,26 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
 	params.src_rect[3] = src_h;
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
-	HRESULT hr = internals->context->Map(renderer->flatten_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	HRESULT hr = internals.context->Map(renderer->flatten_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 	if (FAILED(hr)) {
 		U_LOG_E("flatten_local_2d: failed to map constant buffer: 0x%08x", hr);
 		ID3D11ShaderResourceView *null_srv = nullptr;
-		internals->context->PSSetShaderResources(0, 1, &null_srv);
+		internals.context->PSSetShaderResources(0, 1, &null_srv);
 		ID3D11RenderTargetView *null_rtv = nullptr;
-		internals->context->OMSetRenderTargets(1, &null_rtv, nullptr);
+		internals.context->OMSetRenderTargets(1, &null_rtv, nullptr);
 		return XRT_ERROR_D3D;
 	}
 	memcpy(mapped.pData, &params, sizeof(params));
-	internals->context->Unmap(renderer->flatten_cb, 0);
-	internals->context->PSSetConstantBuffers(0, 1, &renderer->flatten_cb);
+	internals.context->Unmap(renderer->flatten_cb, 0);
+	internals.context->PSSetConstantBuffers(0, 1, &renderer->flatten_cb);
 
-	internals->context->Draw(3, 0);
+	internals.context->Draw(3, 0);
 
 	// Unbind the source SRV. The caller unbinds the scratch RTV after the
 	// whole layer loop (or the masked composite rebinds dst as RTV, which
 	// drops this binding anyway — no scratch read/write overlap).
 	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
 	return XRT_SUCCESS;
 }
 
@@ -1891,34 +1880,34 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 
 	// Create temporary RTV for the back buffer
 	ID3D11RenderTargetView *rtv = nullptr;
-	HRESULT hr = internals->device->CreateRenderTargetView(bb, nullptr, &rtv);
+	HRESULT hr = internals.device->CreateRenderTargetView(bb, nullptr, &rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("blit_stretch: failed to create RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Bind back buffer as render target (no depth)
-	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
+	internals.context->OMSetRenderTargets(1, &rtv, nullptr);
 
 	// Set viewport to fill the entire back buffer
 	D3D11_VIEWPORT vp = {};
 	vp.Width = static_cast<float>(target_width);
 	vp.Height = static_cast<float>(target_height);
 	vp.MaxDepth = 1.0f;
-	internals->context->RSSetViewports(1, &vp);
+	internals.context->RSSetViewports(1, &vp);
 
 	// Set pipeline state (reuse renderer's existing objects)
-	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	internals->context->IASetInputLayout(nullptr);
-	internals->context->VSSetShader(renderer->projection_vs, nullptr, 0);
-	internals->context->PSSetShader(renderer->projection_ps, nullptr, 0);
-	internals->context->RSSetState(renderer->rasterizer_state);
-	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
-	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
-	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
+	internals.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	internals.context->IASetInputLayout(nullptr);
+	internals.context->VSSetShader(renderer->projection_vs, nullptr, 0);
+	internals.context->PSSetShader(renderer->projection_ps, nullptr, 0);
+	internals.context->RSSetState(renderer->rasterizer_state);
+	internals.context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals.context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals.context->PSSetSamplers(0, 1, &renderer->sampler_linear);
 
 	// Bind atlas texture SRV
-	internals->context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
+	internals.context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
 
 	// Set constant buffer: identity MVP, UV covers the mono-rendered region.
 	// In mono mode, the rendered content occupies the top-left
@@ -1953,20 +1942,20 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	constants.color_scale[3] = 1.0f;
 
 	D3D11_MAPPED_SUBRESOURCE mapped;
-	hr = internals->context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	hr = internals.context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 	if (SUCCEEDED(hr)) {
 		memcpy(mapped.pData, &constants, sizeof(constants));
-		internals->context->Unmap(renderer->constant_buffer, 0);
+		internals.context->Unmap(renderer->constant_buffer, 0);
 	}
-	internals->context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
-	internals->context->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+	internals.context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+	internals.context->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
 
 	// Draw fullscreen quad (triangle strip, 4 vertices)
-	internals->context->Draw(4, 0);
+	internals.context->Draw(4, 0);
 
 	// Unbind SRV to prevent hazard warnings
 	ID3D11ShaderResourceView *null_srv = nullptr;
-	internals->context->PSSetShaderResources(0, 1, &null_srv);
+	internals.context->PSSetShaderResources(0, 1, &null_srv);
 
 	rtv->Release();
 

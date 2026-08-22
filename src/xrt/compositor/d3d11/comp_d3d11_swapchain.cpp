@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_swapchain.h"
 #include "comp_d3d11_compositor.h"
+#include "comp_d3d11_compositor_internals.h"
 #include "d3d/d3d_dxgi_formats.h"
 
 #include "xrt/xrt_handles.h"
@@ -64,22 +65,12 @@ struct comp_d3d11_swapchain
 	uint32_t next_acquire;
 };
 
-// Access compositor internals
-extern "C" {
-struct comp_d3d11_compositor_internals
-{
-	struct xrt_compositor_native base;
-	struct xrt_device *xdev;
-	ID3D11Device *device;
-	ID3D11DeviceContext *context;
-	IDXGIFactory4 *dxgi_factory;
-};
-}
-
-static inline struct comp_d3d11_compositor_internals *
+// The compositor's borrowed handles, handed over explicitly — see
+// comp_d3d11_compositor_internals.h for what this replaced and why.
+static inline struct comp_d3d11_compositor_internals
 get_internals(struct comp_d3d11_compositor *c)
 {
-	return reinterpret_cast<struct comp_d3d11_compositor_internals *>(c);
+	return comp_d3d11_compositor_get_internals(c);
 }
 
 static inline struct comp_d3d11_swapchain *
@@ -198,7 +189,7 @@ d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direct
 	// only stall the app's render thread and destroy CPU/GPU overlap). Flush so
 	// the app's work reaches the GPU now rather than at our Present.
 	if (direction == XRT_BARRIER_TO_COMP && sc->c != nullptr) {
-		get_internals(sc->c)->context->Flush();
+		get_internals(sc->c).context->Flush();
 	}
 
 	return XRT_SUCCESS;
@@ -381,7 +372,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	texDesc.MiscFlags = 0;
 
 	for (uint32_t i = 0; i < image_count; i++) {
-		HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &sc->images[i]);
+		HRESULT hr = internals.device->CreateTexture2D(&texDesc, nullptr, &sc->images[i]);
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create swapchain texture %u: 0x%08x", i, hr);
 			d3d11_swapchain_destroy(&sc->base.base);
@@ -402,7 +393,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 				srvDesc.Texture2D.MipLevels = texDesc.MipLevels;
 			}
 
-			hr = internals->device->CreateShaderResourceView(sc->images[i], &srvDesc, &sc->srvs[i]);
+			hr = internals.device->CreateShaderResourceView(sc->images[i], &srvDesc, &sc->srvs[i]);
 			if (FAILED(hr)) {
 				U_LOG_W("Failed to create SRV for swapchain texture %u: 0x%08x", i, hr);
 				// Non-fatal, continue without SRV
@@ -421,7 +412,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
 				rtvDesc.Texture2D.MipSlice = 0;
 			}
-			hr = internals->device->CreateRenderTargetView(sc->images[i], &rtvDesc, &sc->rtvs[i]);
+			hr = internals.device->CreateRenderTargetView(sc->images[i], &rtvDesc, &sc->rtvs[i]);
 			if (FAILED(hr)) {
 				U_LOG_W("Failed to create RTV for swapchain texture %u: 0x%08x", i, hr);
 			}
