@@ -99,6 +99,35 @@ render; a software adapter never does. The scanout adapter is resolved by
 (`d3d_scanout_helpers`, #1078) — **never** by walking DXGI outputs, which
 misreports on Optimus.
 
+Implemented in `d3d_render_adapter` (the render-side sibling of the scanout
+helper). Three points where the prose above was under-specified, settled during
+implementation and recorded here so they are not re-litigated:
+
+- **"Cannot present" must NOT be read as "enumerates no DXGI outputs."** On
+  Optimus the render-only discrete GPU enumerates **zero** outputs and presents
+  perfectly well through the OS hybrid present. Implementing the literal reading
+  would exclude the dGPU and elect the *integrated* GPU as the render adapter —
+  inverting this ADR on exactly the laptop topology it exists to serve. The
+  exclusion means **no local presentation capability at all**: software
+  rasterizers and remote adapters. This is the same trap as the scanout-side
+  rule above, in the other direction: DXGI outputs describe *scanout*, and using
+  them to reason about *render* is a category error either way.
+- **Dedicated VRAM is the PRIMARY key**, not a co-equal input — it is the one
+  signal a `UserGpuPreferences` sweep cannot reorder, which matters on machines
+  whose per-exe pins are managed by policy. Adapter kind is a tiebreak, and
+  since DXGI reports no adapter kind it is inferred (software flag, Basic Render
+  Driver ids, and a 512 MB dedicated-VRAM watermark) — inference is allowed to
+  break a tie and never to exclude.
+- **Ties break on lowest enumeration index.** The ADR specified no tiebreak;
+  determinism requires one.
+
+Every choice carries a **provenance string** naming which rule decided it
+(`most VRAM`, `adapter type`, `lowest index (tie)`, `env-forced: …`,
+`only candidate`), logged once per process alongside adapter name and LUID, per
+the rule PR #1023 established. Provenance is diagnostic infrastructure, not
+decoration: with overrides sanctioned by §4, "why this adapter" must be
+answerable from a log.
+
 ### 3. Fallback ladder when the split is unavailable
 
 The split is not implemented for every graphics API, app class and layer type
