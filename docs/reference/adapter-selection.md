@@ -208,7 +208,7 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 
 | path | auto-engages? | `reason=` when it does not |
 |---|---|---|
-| In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
+| In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `dp_refused_scanout` (the plug-in declined a weaver on the scanout adapter — asked inside Stage A, so the split never engages, ADR-037 §3a) · `killed_by_env` |
 | **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
 | In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
 | In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
@@ -285,7 +285,10 @@ Neither variable has to be *guessed at*. Two places report the answer:
   D3D12 path can retire an engaged split mid-session (a zones/Local2D/mask
   frame, or a display processor that declines the scanout adapter) and emits
   `weave placement: CHANGED — … (split=0 reason=…)` when it does. Everything
-  else emits the line once, at session create.
+  else emits the line once, at session create — including the in-process D3D11
+  path on a `dp_refused_scanout`, which is discovered inside Stage A (the DP is
+  asked before the split commits) and so is already reflected in the first and
+  only line.
 
   The `#918 output-device split ...` lines are separate and appear only when
   Stage A actually ran; the `weave placement:` line is always there. The

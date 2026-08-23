@@ -106,12 +106,15 @@ session, on every graphics API including the two with no split, carrying
 (`comp_split_gate.h`). The old short reason `env_not_requested` is gone: it was
 the honest answer while the split was opt-in and would be a lie now.
 
-Not yet implemented, and not silently: the in-process **D3D11** leg has no §3a
-retire, so a display processor that declines the scanout adapter there leaves
-the session with no weave rather than falling back. Phase 3 makes that reachable
-without an env flag, so the site logs `U_LOG_E` naming this §, `reason=
-dp_refused_scanout`, and the kill switch. The in-process D3D12 leg does retire
-correctly (#1164).
+§3a is now honoured on **both** in-process legs, by two different mechanisms —
+and the difference is worth reading, because it is the difference between
+asking and undoing. The D3D12 leg RETIRES an engaged split when the plug-in
+declines the scanout adapter (#1164). The D3D11 leg NEGOTIATES instead: its
+display-processor create moved into Stage A, on the scanout device, as the last
+of Stage A's commit criteria, so a refusal is an ordinary Stage-A failure that
+the existing fall-through already handles (#1168). Both report
+`reason=dp_refused_scanout`; only the D3D12 one needs a `CHANGED` line, because
+only it can discover the refusal after the placement has been announced.
 
 ### 2. Capability, not "discrete"
 
@@ -202,6 +205,22 @@ a topology:
 - Corollary for vendor onboarding: a plug-in that can only weave on one specific
   adapter class must say so by failing weaver creation cleanly, not by weaving
   wrongly or crashing. See `docs/guides/vendor-plugin-onboarding.md`.
+
+**"Before the session commits" is a real ordering constraint, not a figure of
+speech** (#1168). Where a path can ask first, it must: the in-process D3D11 leg
+creates the weaver on the scanout device as the LAST of Stage A's commit
+criteria — after the bridge and the egress ring, immediately before
+`split_active` is set — so a refusal falls out through the same teardown as a
+failed heap allocation and needs no recovery code of its own. Where a path
+cannot (the in-process D3D12 leg builds its target first), a retire is the
+correct answer, and it must then re-emit the placement line. Both are
+conformant; the negotiation is cheaper, because a refusal it catches has
+nothing to undo.
+
+The bind key `(hwnd, device)` constrains either shape: a vendor weaver is
+one-per-HWND, so a second create against a window that still holds one is
+refused *silently*. A negotiation that creates a weaver must therefore keep it
+(it becomes the session's) or destroy it before anything else creates one.
 
 ### 4. The runtime decides; the app is not consulted
 
@@ -347,11 +366,13 @@ before it is attempted.
    the split is the default, so a path that cannot honestly answer "is the split
    implemented for me?" must answer NO and take rung 2, never half-engage.
    Status 2026-08-23:
-   - **shipped, and now auto-on**: in-process D3D11; the **service/IPC path for
-     every client API** (the split lives in the service's compositor, downstream
-     of IPC, so a D3D12/VK/GL client benefits whenever its presenter kind is
-     eligible); zones/Local2D and mask planes; recipe-with-pixels; transport
-     hardening.
+   - **shipped, and now auto-on**: in-process D3D11 — including the §3a
+     negotiation, which asks the plug-in for a weaver on the scanout adapter
+     inside Stage A and falls through to rung 2 (`reason=dp_refused_scanout`)
+     if it declines (#1168); the **service/IPC path for every client API** (the
+     split lives in the service's compositor, downstream of IPC, so a
+     D3D12/VK/GL client benefits whenever its presenter kind is eligible);
+     zones/Local2D and mask planes; recipe-with-pixels; transport hardening.
    - **shipped, auto-on, projection-only**: in-process D3D12 (Unity/Unreal) —
      ladder D12-0…D12-5, through D12-3 (#1150, #1151, #1164). A zones / Local2D
      / mask frame retires the split for the session
