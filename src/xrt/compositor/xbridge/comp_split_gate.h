@@ -173,12 +173,32 @@ enum comp_split_ingress_policy
  */
 #define COMP_SPLIT_REASON_DP_REFUSED_SCANOUT "dp_refused_scanout"
 /*!
- * The frame carries layers this rung's transport cannot move (the D3D12-ends
- * bridge is projection-only: zones, Local2D and authored masks have their
- * composite inputs on the app device). Retires the split for the session rather
- * than draw a half-split frame.
+ * The frame carries layers this leg's transport cannot move, so the composite's
+ * inputs are on one adapter and its target on the other. Retires the split for
+ * the session rather than draw a half-split frame.
+ *
+ * **Narrowed by #918 D12-4** and left deliberately generic. It covered zones,
+ * Local2D and authored masks on the D3D12 leg while that leg was
+ * projection-only; the plane transports moved zones and Local2D out of it, and
+ * an app-authored mask now carries @ref COMP_SPLIT_REASON_AUTHORED_MASK instead.
+ * Nothing on the D3D12 leg emits this token today — it stays because the token
+ * set is the support-facing vocabulary and other legs may still reach it.
  */
 #define COMP_SPLIT_REASON_LAYERS_UNSUPPORTED "layers_unsupported"
+/*!
+ * #918 D12-4 — the frame has an APP-AUTHORED zone mask (Tier 3), whose pixels the
+ * application draws into a texture of its own on the render adapter.
+ *
+ * Its own token rather than @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED, and the
+ * distinction is the whole point: after D12-4, zones and Local2D composite on the
+ * scanout adapter, so a support case that reads `layers_unsupported` from a
+ * D3D12 session is reading an OLD BUILD, while `authored_mask` says "this build
+ * does not transport an authored mask yet" — a statement about the feature, not
+ * about the binary. The transport is D12-5: the mask plane exists in the bridge
+ * (@ref COMP_XBRIDGE_PLANE_MASK) and needs the app-side bind plus the authored
+ * wish publish.
+ */
+#define COMP_SPLIT_REASON_AUTHORED_MASK "authored_mask"
 /*! @} */
 
 /*!
