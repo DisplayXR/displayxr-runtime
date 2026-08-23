@@ -61,6 +61,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
+
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
@@ -68,6 +69,16 @@
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_handles.h"
+#include "util/u_debug.h"
+
+// Kill-switch for the self-submitting-DP split submission (default ON).
+DEBUG_GET_ONCE_BOOL_OPTION(dxr_android_weave_split, "DXR_ANDROID_WEAVE_SPLIT", true)
+static inline bool
+weave_split_enabled(void)
+{
+	return debug_get_bool_option_dxr_android_weave_split();
+}
+
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_local2d_composite.h"
@@ -436,6 +447,10 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 	    .commandBufferCount = 1,
 	};
+	if (vk->vkAllocateCommandBuffers(vk->device, &cb_info, &mc->weave.cmd_post) != VK_SUCCESS) {
+		U_LOG_E("weave(#1036): vkAllocateCommandBuffers (post) failed");
+		return false;
+	}
 	if (vk->vkAllocateCommandBuffers(vk->device, &cb_info, &mc->weave.cmd) != VK_SUCCESS) {
 		U_LOG_E("weave(#1036): vkAllocateCommandBuffers failed");
 		return false;
@@ -977,6 +992,60 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			if (mc->weave.geometry_dirty) {
 				mc->weave.geometry_dirty = false;
 				U_LOG_W("weave(#1036): window rect %s the DP phase slot", fed ? "fed to" : "NOT accepted by");
+			}
+		}
+
+		// SELF-SUBMITTING DP ORDERING (the one-frame scroll-trail root cause).
+		// A self-submitting DP (Leia CNSDK: is_self_submitting == true) submits
+		// its interlace batch to the queue DURING process_atlas — i.e. BEFORE the
+		// cmd buffer holding THIS frame's input blits into the SBS scratch is
+		// submitted (below). Batches execute in submission order, so the
+		// interlacer sampled the scratch BEFORE this frame's blits executed and
+		// wove LAST frame's tiles at LAST frame's positions — a clean, exactly
+		// one-frame positional trail under scroll (invisible at rest because the
+		// scratch then holds identical pixels). sim_display records its weave
+		// INTO cmd and was never affected. Fix: flush the pre-weave batch to the
+		// queue first; same-queue submission order then guarantees the DP's
+		// self-submitted batch executes after it. No CPU wait needed here — the
+		// existing fence on the final batch still provides the synchronous
+		// completion contract for the whole frame.
+		// Kill-switch: debug.xrt.DXR_ANDROID_WEAVE_SPLIT=0 restores the old
+		// single-submission behaviour.
+		bool weave_split = weave_split_enabled() && xrt_display_processor_is_self_submitting(mc->weave.dp);
+		if (weave_split) {
+			if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+				U_LOG_E("weave(#1036): vkEndCommandBuffer (pre-weave) failed");
+				break;
+			}
+			VkSubmitInfo pre_submit = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			vk_queue_lock(vk->main_queue);
+			VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
+			vk_queue_unlock(vk->main_queue);
+			if (pre_ret != VK_SUCCESS) {
+				U_LOG_E("weave(#1036): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
+				break;
+			}
+			// Everything after the weave records into the second buffer; the
+			// final submit + fence + wait below then retire BOTH batches (same
+			// queue, in order), so next frame's reset of either is safe.
+			cmd = mc->weave.cmd_post;
+			vk->vkResetCommandBuffer(cmd, 0);
+			VkCommandBufferBeginInfo post_begin = {
+			    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			};
+			if (vk->vkBeginCommandBuffer(cmd, &post_begin) != VK_SUCCESS) {
+				U_LOG_E("weave(#1036): vkBeginCommandBuffer (post-weave) failed");
+				break;
+			}
+			static uint64_t split_frames = 0;
+			if ((split_frames++ % 300) == 0) {
+				U_LOG_W("weave(#1036): SELF-SUBMIT SPLIT active (frame=%llu): pre-weave batch flushed before process_atlas",
+				        (unsigned long long)split_frames);
 			}
 		}
 

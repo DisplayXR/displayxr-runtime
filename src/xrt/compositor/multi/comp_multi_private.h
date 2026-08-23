@@ -622,6 +622,9 @@ struct multi_compositor
 		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
 		VkCommandPool cmd_pool;
 		VkCommandBuffer cmd;
+		//! Post-weave half of the split submission (self-submitting DP
+		//! ordering fix): lets the pre-weave batch be flushed BEFORE process_atlas.
+		VkCommandBuffer cmd_post;
 		VkFence fence;
 		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, RGBA8).
 		struct xrt_display_processor *dp;
