@@ -71,12 +71,21 @@
  * What that buys, precisely: no NT share and no `OpenSharedHandle` on the atlas
  * (so no per-rebind producer drain), no NT share on the egress ring, and both
  * GPU-side waits become a direct `queue->Wait(fence)` on the fence's own device.
- * What it costs: the two 2D PLANES and the authored MASK plane are D3D11-only and
- * are REFUSED in this mode (see @ref comp_xbridge_bind_plane) — the D3D12 leg's
- * first rung is projection-only by design (#918 D12-3), and D12-4 takes the
- * planes. Everything else — the R2 resize hysteresis, the fence-deferred source
- * retire, leak-never-wait on ring exhaustion, the both-link watchdog and the
- * drain-or-leak teardown — is the SAME code on both flavours.
+ *
+ * **#918 D12-4 — the PLANES follow the same model.** D12-3a refused them: both
+ * halves of a plane's chain were D3D11-shaped, so that rung was projection-only.
+ * Neither half is any more. The egress was already device-flavoured (the atlas
+ * ring's own recipe, @ref xb_make_egress_texture), and the source is now bound BY
+ * POINTER through @ref comp_xbridge_bind_plane_resource — no NT share, no open,
+ * no re-open drain, exactly as @ref comp_xbridge_bind_atlas_resource does for the
+ * atlas. The consume half takes the egress as a resource
+ * (@ref comp_xbridge_get_plane_resource) rather than as an SRV, because a D3D12
+ * view is a descriptor in the consumer's own heap.
+ *
+ * Everything else — the R2 resize hysteresis, the fence-deferred source retire,
+ * leak-never-wait on ring exhaustion, the per-slot dirty-box union, the change
+ * skip, the bandwidth gate, the both-link watchdog and the drain-or-leak teardown
+ * — is the SAME code on both flavours, planes included.
  *
  * **INVARIANT: no CPU wait anywhere on the app render thread or the weave
  * path.** The only cross-adapter wait belongs to the consumer's own copy queue.
@@ -504,13 +513,11 @@ comp_xbridge_pre_render(struct comp_xbridge *xb);
  * A plane that has failed once is never retried, so these calls are safe to make
  * unconditionally on the frame path.
  *
- * **REFUSED on a D3D12-ends bridge (#918 D12-3a).** The plane chain's egress and
- * its source binding are both D3D11-shaped (an output-device `ID3D11Texture2D`
- * plus its SRV, and an NT-shared app-device source), and the D3D12 leg's first
- * rung is projection-only by design — a frame carrying zones / Local2D / an
- * authored mask falls the whole SESSION back to the single-adapter path rather
- * than half-splitting it. This returns false with one WARN per plane; D12-4
- * gives the planes D3D12 ends the way this rung gave them to the atlas.
+ * **Refused on a D3D12-ends bridge (#918 D12-4)** — the CALL, not the plane. The
+ * producer there IS the app device, so an NT handle has nothing to open; that
+ * bridge binds by pointer through @ref comp_xbridge_bind_plane_resource instead.
+ * Returns false with one WARN per plane and does NOT latch the plane failed, so
+ * a caller that reached the wrong entry point can still reach the right one.
  *
  * Bind the APP-DEVICE source texture for @p plane. The producer opens it
  * directly (the same Option-I shape as the atlas — no extra app-device copy),
@@ -541,6 +548,47 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
                         uint32_t dxgi_format,
                         uint32_t w,
                         uint32_t h);
+
+/*!
+ * #918 D12-4 — the D3D12-ends twin of @ref comp_xbridge_bind_plane: bind the
+ * plane's app-device source BY POINTER.
+ *
+ * There is no NT handle because there is nothing to share — with D3D12 ends the
+ * producer IS the app device, so the scratch the compositor flattens into is
+ * already a resource the producer's copy queue can read. Exactly the shape
+ * @ref comp_xbridge_bind_atlas_resource gives the atlas, and it removes the same
+ * two things: the open's failure mode, and the producer DRAIN a re-open needs
+ * (#918 F2). A superseded resource goes through the FENCE-DEFERRED retire ring,
+ * so a scratch realloc never blocks and never frees under a live copy — which
+ * matters more for a plane than for the atlas, because the D3D12 leg reaches this
+ * from the application's own render thread inside `xrEndFrame`.
+ *
+ * Everything else is @ref comp_xbridge_bind_plane: per-plane lazy allocation,
+ * one WARN and permanent degrade of THAT FEATURE on an allocation failure, never
+ * the split, and never a retry once failed. @p dxgi_format / @p w / @p h carry
+ * the meanings documented there (the 2D planes pass the PANEL and so never
+ * resize; the authored MASK passes the mask's own dims).
+ *
+ * @param resource `ID3D12Resource *` on the app device, or NULL to drop the
+ *        plane's source.
+ * @param generation Bumped by the caller whenever the resource is REALLOCATED. A
+ *        change re-binds. Both the pointer and the generation are compared: an
+ *        allocator that hands back a recycled address for a NEW allocation is the
+ *        exact trap `comp_xbridge_set_source`'s `source_key` documents.
+ *
+ * @return true when the producer will read @p resource on the next submit. False
+ *         when the bridge is not in D3D12-ends mode (use
+ *         @ref comp_xbridge_bind_plane), when @p resource is NULL, or when the
+ *         plane's own chain could not be allocated.
+ */
+bool
+comp_xbridge_bind_plane_resource(struct comp_xbridge *xb,
+                                 uint32_t plane,
+                                 void *resource,
+                                 uint64_t generation,
+                                 uint32_t dxgi_format,
+                                 uint32_t w,
+                                 uint32_t h);
 
 /*!
  * Stage @p plane for the NEXT @ref comp_xbridge_submit.
@@ -605,6 +653,26 @@ comp_xbridge_slot_recipe(struct comp_xbridge *xb, int32_t slot, struct comp_xbri
  */
 void *
 comp_xbridge_get_plane_srv(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq);
+
+/*!
+ * #918 D12-4 — `ID3D12Resource *` of @p plane's egress texture for @p slot, on
+ * the OUTPUT device (NULL when invalid).
+ *
+ * D3D12 ends only, and for the same reason @ref comp_xbridge_get_egress_resource
+ * is: on a D3D11-ends bridge the plane's `ID3D12Resource` is the CONSUMER's open,
+ * which belongs to the bridge's own consumer device rather than the caller's
+ * output device. That bridge returns NULL here; use the SRV twin.
+ *
+ * @p want_seq carries exactly the meaning it has in
+ * @ref comp_xbridge_get_plane_srv — the #918 review F3 stale-plane test.
+ *
+ * The resource is created with `ALLOW_SIMULTANEOUS_ACCESS`, so like the atlas
+ * egress it is COMMON at every submission boundary and promotes implicitly to
+ * COPY_DEST for the consumer's copy and to PIXEL_SHADER_RESOURCE for the
+ * composite's read. Do not transition it.
+ */
+void *
+comp_xbridge_get_plane_resource(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq);
 
 //! Allocated extent of @p plane's chain. False when the plane is not live.
 bool

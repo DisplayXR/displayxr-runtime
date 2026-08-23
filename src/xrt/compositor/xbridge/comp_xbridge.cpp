@@ -321,10 +321,21 @@ struct comp_xbridge
 		 */
 		uint32_t alloc_w, alloc_h;
 
-		//! Producer's open of the app-device source (Option-I shape).
+		/*!
+		 * The producer's view of the app-device source, Option-I shaped.
+		 *
+		 * D3D11 ends: the producer's OPEN of an NT-shared app-device texture.
+		 * D3D12 ends (#918 D12-4): the caller's own `ID3D12Resource`, AddRef'd —
+		 * there is nothing to open, because the producer IS the app device. Same
+		 * field, same copy, one fewer indirection; see
+		 * @ref comp_xbridge_bind_plane_resource.
+		 */
 		ID3D12Resource *src12;
 		uint64_t src_gen;
 		bool src_bound;
+		//! One WARN, ever, for a caller that used the wrong bind flavour for this
+		//! bridge's ends. Callers bind every frame, so this may not be per-frame.
+		bool bind_flavour_warned;
 		//! The source's own extent. NOT always the panel: an authored mask is
 		//! created at the app's chosen zone dims, and a copy box snapped out past
 		//! them is an out-of-bounds source region on the copy queue.
@@ -620,8 +631,14 @@ xb_release_egress(struct comp_xbridge *xb)
  * IS the output device, so the copy destination and the thing the display
  * processor samples are one committed resource, created here and handed back in
  * @p out_12 with the three D3D11 outputs left NULL. `out_tex`/`out_srv`/
- * `out_share` may be NULL in that mode (a plane never reaches here — planes are
- * refused on a D3D12-ends bridge — but the atlas ring passes its own slots).
+ * `out_share` may be NULL in that mode.
+ *
+ * #918 D12-4: the ATLAS ring and every PLANE ring both reach this in that mode.
+ * That is the whole reason the plane egress needed no new code — one recipe,
+ * already device-flavoured, and a plane slot differs from an atlas slot only in
+ * dims, format and the RTV bind. What D12-4 had to add was the plane's INGRESS
+ * (bound by pointer rather than by NT handle) and a way to hand the egress back
+ * as a resource (@ref comp_xbridge_get_plane_resource).
  *
  * @return the HRESULT of the first failing step (S_OK on success). The caller
  *         owns whatever was written, including on failure — release through its
@@ -1056,25 +1073,31 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 	}
 
 	/*
-	 * #918 D12-3a — planes are D3D11-only. Both halves of a plane's chain are:
-	 * the SOURCE is bound by NT handle from an app-device D3D11 texture, and the
-	 * EGRESS is an output-device `ID3D11Texture2D` plus the SRV the D3D11
-	 * composite samples. Neither shape exists on a D3D12-ends bridge, and giving
-	 * them one is D12-4's rung, not this one.
+	 * #918 D12-4 — WRONG BIND FLAVOUR, not an unsupported plane.
 	 *
-	 * Latched into the normal `failed` state rather than special-cased, so the
-	 * one-WARN-per-plane rule above covers it and a caller that binds every frame
-	 * pays one branch. The D3D12 compositor's contract is stricter than "this
-	 * plane degrades": a frame carrying zones / Local2D / an authored mask makes
-	 * the whole SESSION fall back to the single-adapter path, so this refusal is
-	 * a backstop, not the mechanism.
+	 * D12-3a refused planes outright here and LATCHED `failed`, because neither
+	 * half of a plane's chain existed on a D3D12-ends bridge. Both halves exist
+	 * now: the egress is the same device-flavoured recipe the atlas ring already
+	 * used (@ref xb_make_egress_texture), and the source is bound BY POINTER
+	 * through @ref comp_xbridge_bind_plane_resource. What is still impossible on
+	 * this flavour is the NT handle THIS entry point takes — the producer is the
+	 * app device, so there is nothing to open and no handle to open it from.
+	 *
+	 * Refuse the CALL without latching `failed`: latching it would make a caller
+	 * that reached the wrong entry point once permanently unable to use the right
+	 * one, which is the difference between "you called the wrong function" and
+	 * "this plane is dead". One WARN per plane, because the callers bind every
+	 * frame.
 	 */
 	if (xb->d3d12_ends) {
-		pl.failed = true;
-		U_LOG_W(
-		    "%s: the %s plane is D3D11-only and is refused on a D3D12-ends bridge — this rung is "
-		    "projection-only; D12-4 gives the planes D3D12 ends (#918 D12-3a)",
-		    XB_TAG(xb), xb_plane_name(plane));
+		if (!pl.bind_flavour_warned) {
+			pl.bind_flavour_warned = true;
+			U_LOG_W(
+			    "%s: the %s plane was bound by NT HANDLE on a D3D12-ends bridge — the producer is "
+			    "the app device and has nothing to open; use comp_xbridge_bind_plane_resource "
+			    "(#918 D12-4)",
+			    XB_TAG(xb), xb_plane_name(plane));
+		}
 		return false;
 	}
 
@@ -1138,6 +1161,90 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 	// A new source texture invalidates every slot's pixels, and each slot now
 	// owes a FULL refresh rather than just the next frame's dirty box.
 	xb_plane_invalidate_slots(xb, pl);
+	return true;
+}
+
+extern "C" bool
+comp_xbridge_bind_plane_resource(struct comp_xbridge *xb,
+                                 uint32_t plane,
+                                 void *resource,
+                                 uint64_t generation,
+                                 uint32_t dxgi_format,
+                                 uint32_t w,
+                                 uint32_t h)
+{
+	if (xb == nullptr || plane >= COMP_XBRIDGE_PLANE_COUNT || !xb->d3d12_ends) {
+		return false;
+	}
+	auto &pl = xb->plane[plane];
+	// Same never-retry rule as the NT-handle bind: the callers bind every frame.
+	if (pl.failed) {
+		return false;
+	}
+	auto *res = static_cast<ID3D12Resource *>(resource);
+
+	/*
+	 * Dropping a plane's source has the SAME #918 F2 hazard as replacing it — the
+	 * producer's copy of the last submitted seq reads exactly this resource — and
+	 * it is closed with the STRONGER of the two tools, exactly as
+	 * @ref comp_xbridge_bind_atlas_resource does. The NT-handle twin above takes a
+	 * bounded CPU drain because it must release its open synchronously or lose
+	 * track of it; here the fence-deferred retire ring (#918 PR 6) defers the
+	 * release behind the producer fence and costs no wait at all — which matters
+	 * more here than it does for the atlas, because a plane re-binds on a scratch
+	 * REALLOC and the D3D12 leg reaches this from the app's own render thread
+	 * inside xrEndFrame.
+	 */
+	auto drop_source = [&]() {
+		if (pl.src12 == nullptr) {
+			return;
+		}
+		xb_retire_source(xb, pl.src12);
+		pl.src12 = nullptr;
+		pl.src_w = 0;
+		pl.src_h = 0;
+		pl.src_bound = false;
+		xb_plane_invalidate_slots(xb, pl);
+	};
+
+	if (res == nullptr) {
+		drop_source();
+		return false;
+	}
+	if (!xb_plane_alloc(xb, plane, dxgi_format, w, h)) {
+		return false;
+	}
+	// Identity AND generation: a caller whose allocator handed back the same
+	// address for a new allocation still bumps its generation, and that is what
+	// the test is for (the same trap `src_key` documents for adaptive ingress).
+	if (pl.src_bound && pl.src12 == res && pl.src_gen == generation) {
+		return true;
+	}
+	drop_source();
+
+	/*
+	 * Our reference is not what keeps this alive — the caller owns the scratch and
+	 * holds its own. The AddRef is about not RELEASING under a live producer copy,
+	 * which is the same invariant the NT-handle path reaches through its open.
+	 */
+	res->AddRef();
+	pl.src12 = res;
+	{
+		// The source's real extent — the copy box is clamped to it, not just to
+		// the plane's allocation, because an authored mask is created at the app's
+		// own zone dims.
+		D3D12_RESOURCE_DESC sd = res->GetDesc();
+		pl.src_w = (uint32_t)sd.Width;
+		pl.src_h = sd.Height;
+	}
+	pl.src_gen = generation;
+	pl.src_bound = true;
+	// #918 review F7: a re-bind is a new source, so the rate history that earned
+	// the half-rate latch no longer describes this plane.
+	pl.half_rate = false;
+	xb_plane_invalidate_slots(xb, pl);
+	U_LOG_W("%s: producer bound the %s plane's source resource %p directly (generation %llu) — no share, no open, no drain (#918 D12-4)",
+	        XB_TAG(xb), xb_plane_name(plane), (void *)res, (unsigned long long)generation);
 	return true;
 }
 
@@ -1269,6 +1376,26 @@ comp_xbridge_get_plane_srv(struct comp_xbridge *xb, int32_t slot, uint32_t plane
 		return nullptr;
 	}
 	return pl.eg_srv[slot];
+}
+
+extern "C" void *
+comp_xbridge_get_plane_resource(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
+{
+	if (xb == nullptr || !xb->d3d12_ends || slot < 0 || slot >= XB_EGRESS_RING ||
+	    plane >= COMP_XBRIDGE_PLANE_COUNT) {
+		return nullptr;
+	}
+	auto &pl = xb->plane[plane];
+	if (!pl.live || pl.slot_seq[slot] == 0) {
+		return nullptr;
+	}
+	// The same #918 review F3 stale-plane test the SRV twin runs, and for the
+	// same reason — a later submit rewriting the plane under this weave would
+	// otherwise put one frame's 2D over another frame's 3D.
+	if (want_seq != 0 && pl.slot_seq[slot] != want_seq) {
+		return nullptr;
+	}
+	return pl.eg_12[slot];
 }
 
 extern "C" bool
