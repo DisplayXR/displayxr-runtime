@@ -503,6 +503,37 @@ struct d3d11_client_render_resources
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
 
+	/*!
+	 * #1172 — THIS CLIENT's own display processor on the INGEST (render) device.
+	 *
+	 * Created only for a presenter kind that is structurally ineligible for the
+	 * output-device split (`CLIENT_TEXTURE`, `SELF`) while the split is active,
+	 * and bound to this client's OWN window — never the service window, never a
+	 * window the panel DP holds, so the one-weaver-per-HWND rule is respected by
+	 * construction. Everything this client weaves (its atlas, its shared input,
+	 * its zone wish mask) lives on `sys->device`; the shared panel DP does not,
+	 * whenever an ELIGIBLE presenter currently owns the panel. See
+	 * @ref svc_client_weave_dp.
+	 *
+	 * Created and destroyed on the CLIENT's own thread, never under
+	 * `render_mutex` — creating a DP calls into the vendor SDK, and doing that
+	 * under the render lock is the #925 wedge class. NULL means "use the panel
+	 * DP", which is every other client and every split-off session.
+	 */
+	struct xrt_display_processor_d3d11 *weave_dp;
+
+	//! #1172: the HWND @ref weave_dp was created against (NULL if none).
+	HWND weave_dp_hwnd;
+
+	//! #1172: the factory already refused / no window yet — do not retry per frame.
+	bool weave_dp_refused;
+
+	//! #1172: last `client_presents` pushed to @ref weave_dp; -1 = unknown.
+	int weave_dp_client_presents;
+
+	//! #1172: last encoding pushed to @ref weave_dp; -1 = unknown (#1016 rule).
+	int weave_dp_encoding;
+
 	//! HUD overlay (runtime-owned windows only)
 	struct u_hud *hud;
 
@@ -4172,6 +4203,271 @@ panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 }
 
 /*!
+ * #1172 — dev-only injection arm for the ingest-DP path, so it can be walked on
+ * a box with no hybrid-GPU split at all. Same shape as
+ * `DXR_TEST_FAKE_DEVICE_REMOVED` / `DXR_TEST_FAKE_DP_REFUSE`: opt-in, read once,
+ * announced on the first read so a log can never look like a real session.
+ *
+ *   1 — force an ineligible presenter onto its OWN ingest-device DP even with
+ *       the split OFF. The whole fix path runs: create, bind to the client's own
+ *       window, weave through it, mask through it, destroy on disconnect.
+ *   2 — force that DP's creation to FAIL, so the REFUSAL guard is what runs.
+ *       Proves the guard degrades (named WARN, weave skipped) instead of handing
+ *       the vendor a foreign-device SRV.
+ *
+ * Pairs with `test_apps/probes/weave_rpc_probe_d3d11_win` — the in-tree,
+ * browser-free present-owner. See the file header there.
+ */
+static int
+dxr_test_weave_ingest_dp_arm(void)
+{
+	static int arm = -1;
+	if (arm >= 0) {
+		return arm;
+	}
+	const char *e = getenv("DXR_TEST_FORCE_WEAVE_INGEST_DP");
+	arm = 0;
+	if (e != nullptr && e[0] >= '1' && e[0] <= '2' && e[1] == '\0') {
+		arm = e[0] - '0';
+		U_LOG_W("DXR_TEST_FORCE_WEAVE_INGEST_DP=%d: %s (test)", arm,
+		        arm == 1 ? "forcing an ineligible client's weave onto its own INGEST-device DP"
+		                 : "forcing that DP's creation to FAIL, to exercise the refusal guard");
+	}
+	return arm;
+}
+
+/*!
+ * #1172 — does @p c's weave belong on a display processor of its OWN?
+ *
+ * TRUE exactly when the panel DP is not guaranteed to be on the device this
+ * client's pixels live on: the split is engaged (so the panel DP follows the
+ * presenter across the eligibility boundary) and THIS client is one of the
+ * structurally ineligible kinds, whose atlas, shared input and handback are all
+ * on `sys->device`. Note this is deliberately NOT "is this client the current
+ * presenter" — the whole bug was that the answer changed with focus while the
+ * client kept weaving.
+ *
+ * Legacy standalone is excluded because it already gives every client its own
+ * DP on `sys->device` (and the split is refused there anyway, D-7).
+ */
+static inline bool
+svc_client_wants_ingest_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (sys == nullptr || c == nullptr || !pipeline_always_on(sys)) {
+		return false;
+	}
+	if (svc_kind_eligible_for_split(c->presenter)) {
+		return false;
+	}
+	return sys->split_active || dxr_test_weave_ingest_dp_arm() > 0;
+}
+
+/*!
+ * #1172 — THE display processor that weaves THIS CLIENT's own pixels.
+ *
+ * `panel_dp()` answers "who drives the PANEL" — the lens mode, the vendor poll,
+ * the eye-position resolve. That is a panel-global question and its answer is
+ * rightly the shared DP wherever it currently lives. This answers a different
+ * one: "who may touch THIS client's textures", and the answer must follow the
+ * client's device, not the panel's presenter.
+ *
+ * Identical to `panel_dp()` for every eligible client and for every session with
+ * the split off, so nothing that shipped changes shape. Returns the client's own
+ * ingest-device DP only once @ref svc_ensure_client_weave_dp has built one.
+ */
+static inline struct xrt_display_processor_d3d11 *
+svc_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (c != nullptr && c->render.weave_dp != nullptr && !service_device_removed(sys)) {
+		return c->render.weave_dp;
+	}
+	return panel_dp(sys, c);
+}
+
+/*!
+ * #1172 — TRIPWIRE: never hand a scanout-adapter weaver a render-adapter image.
+ *
+ * The load-bearing companion to @ref svc_client_weave_dp, in the same spirit as
+ * the `panel DP is on device X but the presenter's surface is on Y` check on the
+ * direct path. @p dp is about to be given `sys->context` and resources created
+ * on `sys->device`; if @p dp is the shared panel DP and that DP is currently on
+ * the OUT device, the call is a cross-adapter use inside the vendor SDK. D3D11
+ * will not fail it — the Intel and NVIDIA UMDs both fault (#1172), which is why
+ * this refuses rather than trusts.
+ *
+ * Reachable states this legitimately catches: the DP factory refused (no plug-in
+ * for this window, `DXR_TEST_FORCE_WEAVE_INGEST_DP=2`), or the client has no
+ * window of its own yet. Both mean "skip this weave", never "weave anyway".
+ *
+ * Caller MUST hold `render_mutex` — `panel_dp_device` is the render thread's.
+ */
+static bool
+svc_weave_dp_device_ok(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       struct xrt_display_processor_d3d11 *dp,
+                       const char *who)
+{
+	if (sys == nullptr || dp == nullptr || !sys->split_active) {
+		return true; // both halves are the app device while the split is off
+	}
+	if (c != nullptr && dp == c->render.weave_dp) {
+		return true; // built on sys->device by construction
+	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	ID3D11Device *dp_dev = (mc != nullptr) ? mc->panel_dp_device : nullptr;
+	if (dp_dev == nullptr || dp_dev == sys->device.get()) {
+		return true;
+	}
+	static std::atomic<int64_t> s_last_ns{0};
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	int64_t prev_ns = s_last_ns.load(std::memory_order_relaxed);
+	if (now_ns - prev_ns > 1000000000LL && s_last_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		U_LOG_W(
+		    "[weave_dev] '%s' NOT weaved (%s UNAVAILABLE): the panel DP is on the SCANOUT device %p but "
+		    "this client's atlas is on the render device %p, and it has no ingest DP of its own — "
+		    "weaving would fault inside the vendor SDK (#1172, throttled)",
+		    who, COMP_SPLIT_REASON_WEAVE_ON_INGEST, (void *)dp_dev, (void *)sys->device.get());
+	}
+	return false;
+}
+
+/*!
+ * #1172 — build @p c's own INGEST-device display processor, once.
+ *
+ * MUST be called from the client's OWN thread and WITHOUT `render_mutex` held.
+ * Creating a display processor calls into the vendor SDK and can take seconds
+ * (SR weaver bring-up); doing that under the render lock would stall every other
+ * client behind one connecting browser — the #925 wedge class this whole epic
+ * exists to avoid. On the client's own thread the cost lands only on the client
+ * that caused it, exactly like every other bounded per-client call.
+ *
+ * ONE WEAVER PER HWND. The DP is bound to this client's own window — a
+ * present-owner's `weave_hwnd`, a client-texture client's `hwnd` — and refuses
+ * outright if that window is the service window or the window the panel DP
+ * currently holds. Those are the only two ways a second weaver could land on a
+ * window that already has one, and both are checked rather than assumed.
+ *
+ * Idempotent, one-shot on refusal (`weave_dp_refused`), and re-created if the
+ * client rebinds to a different window.
+ */
+static void
+svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!svc_client_wants_ingest_dp(sys, c) || service_device_removed(sys)) {
+		return;
+	}
+
+	HWND hwnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		return; // no window yet — the bind has not happened; retry next submit
+	}
+	if (c->render.weave_dp != nullptr) {
+		if (c->render.weave_dp_hwnd == hwnd) {
+			return; // already ours, on the right window
+		}
+		// Rebound to a different window: one weaver per HWND means destroy
+		// before recreate, never two live against the same client.
+		U_LOG_W("#1172 weave DP: client window moved %p -> %p — recreating its ingest DP",
+		        (void *)c->render.weave_dp_hwnd, (void *)hwnd);
+		xrt_display_processor_d3d11_destroy(&c->render.weave_dp);
+		c->render.weave_dp_hwnd = nullptr;
+		c->render.weave_dp_refused = false;
+	}
+	if (c->render.weave_dp_refused) {
+		return;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc != nullptr && (hwnd == mc->hwnd || hwnd == mc->panel_dp_hwnd)) {
+		/*
+		 * The panel DP already weaves this window. Two SR weavers on one HWND is
+		 * the one thing this must never do, so stay on the panel DP — which is
+		 * then correct anyway, since it is bound to THIS window and therefore on
+		 * this client's own device (`svc_panel_dp_device` of an ineligible kind).
+		 *
+		 * NOT sticky: the render thread's SELF/CLIENT_TEXTURE branch stops
+		 * binding the panel DP to an ineligible client's window as soon as
+		 * `svc_client_wants_ingest_dp` is true, so this is a startup-order
+		 * transient at worst and must be allowed to heal on the next submit.
+		 */
+		static std::atomic<int64_t> s_last_ns{0};
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = s_last_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL && s_last_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "#1172 weave DP: hwnd=%p is currently the panel DP's window — staying on the "
+			    "panel DP for now (one weaver per HWND; throttled)",
+			    (void *)hwnd);
+		}
+		return;
+	}
+
+	if (dxr_test_weave_ingest_dp_arm() == 2) {
+		c->render.weave_dp_refused = true;
+		U_LOG_W(
+		    "DXR_TEST_FORCE_WEAVE_INGEST_DP=2: refusing this client's ingest DP (test) — the weave "
+		    "must now be SKIPPED, not run on the panel DP");
+		return;
+	}
+
+	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
+	if (dp_fac == nullptr) {
+		c->render.weave_dp_refused = true;
+		U_LOG_W(
+		    "#1172 weave DP: no D3D11 display-processor factory — this client cannot weave while the "
+		    "panel DP is on the scanout device");
+		return;
+	}
+	auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
+	xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), hwnd, &c->render.weave_dp);
+	if (dp_ret != XRT_SUCCESS || c->render.weave_dp == nullptr) {
+		c->render.weave_dp = nullptr;
+		c->render.weave_dp_refused = true;
+		U_LOG_W(
+		    "#1172 weave DP: factory refused for hwnd=%p (error %d) — this client's weave will be "
+		    "SKIPPED rather than run on the scanout device",
+		    (void *)hwnd, (int)dp_ret);
+		return;
+	}
+
+	c->render.weave_dp_hwnd = hwnd;
+	// #1016: a fresh DP's state is unknown; the weave sites assert both.
+	c->render.weave_dp_client_presents = -1;
+	c->render.weave_dp_encoding = -1;
+	// Every ineligible presenter is client-presents by definition (that is WHY
+	// it is ineligible), so the alpha-gate policy is settled at create time.
+	(void)xrt_display_processor_d3d11_set_transparent_background(c->render.weave_dp, true, true);
+	U_LOG_W(
+	    "[pipeline] this client weaves on its OWN display processor on the RENDER device "
+	    "(split=0 reason=%s dp=%p hwnd=%p device=%p)",
+	    COMP_SPLIT_REASON_WEAVE_ON_INGEST, (void *)c->render.weave_dp, (void *)hwnd, (void *)sys->device.get());
+}
+
+/*!
+ * #1172 — assert @p c's own weave DP's state, the way `pipeline_dp_set_*` do for
+ * the panel DP. Same contract: every weave site states what it needs, no-op on
+ * no change (the plug-in logs every switch and these are per-frame paths).
+ */
+static void
+svc_client_weave_dp_assert_state(struct d3d11_service_compositor *c,
+                                 struct xrt_display_processor_d3d11 *dp,
+                                 enum xrt_atlas_encoding encoding)
+{
+	if (c == nullptr || dp == nullptr || dp != c->render.weave_dp) {
+		return; // the panel DP has its own asserters
+	}
+	if (c->render.weave_dp_client_presents != 1) {
+		if (xrt_display_processor_d3d11_set_transparent_background(dp, true, true)) {
+			c->render.weave_dp_client_presents = 1;
+		}
+	}
+	if (c->render.weave_dp_encoding != (int)encoding) {
+		xrt_display_processor_d3d11_set_atlas_encoding(dp, encoding);
+		c->render.weave_dp_encoding = (int)encoding;
+	}
+}
+
+/*!
  * #966: ask for a mode/geometry transition. THE entry point for every writer
  * that is not already the render thread.
  *
@@ -5402,6 +5698,22 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	}
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
+	/*
+	 * #1172 — LIFECYCLE. This client's own ingest-device DP dies WITH the
+	 * client, and nothing else moves: no `request_display_mode` (the panel's
+	 * lens belongs to the panel DP, and yanking it to 2D because a browser
+	 * closed would be a regression for every other client), no panel-DP retire,
+	 * no split state change. The split was decided once at system create and
+	 * stays exactly where it is — a present-owner connecting or disconnecting
+	 * is not a Stage A input, which is the whole point of putting the DP here
+	 * instead of refusing the split.
+	 */
+	xrt_display_processor_d3d11_destroy(&res->weave_dp);
+	res->weave_dp_hwnd = nullptr;
+	res->weave_dp_refused = false;
+	res->weave_dp_client_presents = -1;
+	res->weave_dp_encoding = -1;
+
 	res->back_buffer_rtv.reset();
 	res->crop_srv.reset();
 	res->crop_texture.reset();
@@ -5855,10 +6167,18 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		 * SERVICE holds an out-device on the scanout adapter; this client is still
 		 * weaving on the app device, and without this line the two facts looked
 		 * like a contradiction in the log rather than the documented §7 rule.
+		 *
+		 * #1172 adds the second token. "Ineligible" used to gate PRESENT placement
+		 * only, and the weave then went through whatever device the shared panel DP
+		 * happened to be on — the scanout one whenever an eligible presenter owned
+		 * the panel, which faulted inside the vendor SDK. `weave_on_ingest` names
+		 * the DEVICE choice that makes the first token's claim true: this client
+		 * gets its own display processor on the render device
+		 * (@ref svc_ensure_client_weave_dp).
 		 */
 		if (sys->split_available && !svc_kind_eligible_for_split(kind)) {
-			U_LOG_W("[pipeline] this presenter weaves on the RENDER adapter (split=0 reason=%s)",
-			        COMP_SPLIT_REASON_PRESENTER_INELIGIBLE);
+			U_LOG_W("[pipeline] this presenter weaves on the RENDER adapter (split=0 reason=%s,%s)",
+			        COMP_SPLIT_REASON_PRESENTER_INELIGIBLE, COMP_SPLIT_REASON_WEAVE_ON_INGEST);
 		}
 
 		if (c != nullptr) {
@@ -11912,8 +12232,26 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// split (the weave destination is a texture the client opened on the app
 		// adapter and presents itself), so the panel DP belongs on the app device
 		// even while the split is otherwise active.
-		pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true, /*force_recreate*/ false,
-		                       svc_panel_dp_device(sys, kind));
+		//
+		// #1172: ...but only while THIS client is the presenter, and the client
+		// weaves whether or not it is. So under an active split it now owns an
+		// ingest-device DP of its own, bound to this very window — and binding the
+		// panel DP here as well would put TWO SR weavers on ONE HWND, the one
+		// thing that is never allowed. Leave the panel DP where it is; it keeps
+		// serving the panel-global writers (lens mode, vendor poll, eye positions)
+		// from wherever it currently lives, and nothing here weaves through it.
+		if (svc_client_wants_ingest_dp(sys, fc)) {
+			static std::atomic_flag s_logged = ATOMIC_FLAG_INIT;
+			if (!s_logged.test_and_set()) {
+				U_LOG_W(
+				    "[pipeline] presenter weaves on its own ingest DP (hwnd=%p) — NOT binding "
+				    "the panel DP to it (one weaver per HWND; #1172)",
+				    (void *)present_hwnd);
+			}
+		} else {
+			pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true,
+			                       /*force_recreate*/ false, svc_panel_dp_device(sys, kind));
+		}
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		// Tell the owner it holds the panel, so its next commit weaves.
 		fc->pipe_owns_panel.store(true, std::memory_order_release);
@@ -15878,10 +16216,21 @@ service_dp_accepts_zone_mask(struct xrt_display_processor_d3d11 *xdp)
  *
  * Legacy path (no `multi_comp`): the client's own DP, always on `sys->device` —
  * and the split is disabled under `DXR_LEGACY_STANDALONE` anyway (D-7).
+ *
+ * #1172 — the paragraph above says an ineligible presenter "keeps its DP on the
+ * APP device while the split is engaged". That was only ever true while it was
+ * ALSO the current presenter; the panel DP follows focus, not the asking client.
+ * It is true again now, because such a client has a DP of its OWN on the app
+ * device (@ref svc_client_weave_dp) — so the rule this function encodes is
+ * unchanged and @p c is what makes it honest: raster on the device of the DP
+ * THIS client is about to publish to.
  */
 static inline ID3D11Device *
-svc_zone_mask_device(struct d3d11_service_system *sys)
+svc_zone_mask_device(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
+	if (sys != nullptr && c != nullptr && c->render.weave_dp != nullptr) {
+		return sys->device.get(); // #1172: built on the ingest device by construction
+	}
 	struct d3d11_multi_compositor *mc = (sys != nullptr) ? sys->multi_comp : nullptr;
 	if (mc != nullptr && mc->panel_dp_device != nullptr) {
 		return mc->panel_dp_device;
@@ -15919,10 +16268,15 @@ svc_context_for_device(struct d3d11_service_system *sys, ID3D11Device *dev)
  * Inert while the split is off: both sides are then the app device.
  */
 static bool
-svc_zone_mask_publish_device_ok(struct d3d11_service_system *sys, ID3D11Device *mask_dev)
+svc_zone_mask_publish_device_ok(struct d3d11_service_system *sys,
+                                struct d3d11_service_compositor *c,
+                                ID3D11Device *mask_dev)
 {
 	if (sys == nullptr || !sys->split_active) {
 		return true;
+	}
+	if (c != nullptr && c->render.weave_dp != nullptr) {
+		return true; // #1172: both halves are the ingest device by construction
 	}
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	ID3D11Device *dp_dev = (mc != nullptr) ? mc->panel_dp_device : nullptr;
@@ -16087,7 +16441,7 @@ service_update_zone_wish_mask(struct d3d11_service_system *sys,
 	// #918 PR 5: the raster follows the PANEL DP's device, not the output half's
 	// — see svc_zone_mask_device. Caller holds render_mutex, and resolved the DP
 	// under it, so this reads the same bind key that DP was resolved from.
-	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
 	ID3D11DeviceContext *mask_ctx = svc_context_for_device(sys, mask_dev);
 	if (mask_dev == nullptr || mask_ctx == nullptr) {
 		return nullptr;
@@ -16288,7 +16642,10 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 {
 	// #964 D-4: one DP per panel — the wish goes to the panel DP on the
 	// pipeline path, to the client's own DP on the legacy one.
-	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
+	// #1172: and to THIS CLIENT's ingest DP when it has one — the wish IS the
+	// weave mask, so it must land on the DP that performs this client's weave,
+	// never on a panel DP sitting on the other adapter.
+	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c);
 
 	if (!zones_frame) {
 		if (c->zone_published && dp != nullptr) {
@@ -16345,12 +16702,12 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	 * unreachable rather than merely unlikely. The unique other caller
 	 * (the weave path) is already inside render_mutex when it resolves.
 	 */
-	dp = panel_dp(sys, c);
+	dp = svc_client_weave_dp(sys, c); // #1172: the DP that weaves THIS client
 	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
 		return;
 	}
-	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
-	if (!svc_zone_mask_publish_device_ok(sys, mask_dev)) {
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
+	if (!svc_zone_mask_publish_device_ok(sys, c, mask_dev)) {
 		return; // #918 tripwire: mask and DP are on different devices
 	}
 
@@ -16578,6 +16935,13 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		return;
 	}
 
+	// #1172: same rule as the present-owner submit — an ineligible presenter's
+	// atlas and its shared output texture are both on `sys->device`, so it needs
+	// a display processor there rather than the shared panel DP, whose device
+	// follows the presenter. Built BEFORE the lock: the vendor SDK's DP create is
+	// unbounded, and this thread must never hold `render_mutex` across it (#925).
+	svc_ensure_client_weave_dp(sys, c);
+
 	render_mutex_fair_lock lock(sys);
 
 	// Re-check under the lock: focus can move between the load and here.
@@ -16597,7 +16961,20 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 
 	// The panel DP is bound to this client's window by the render thread's
 	// SELF/CLIENT_TEXTURE branch; resolve it INSIDE the lock (#964 D-4).
-	struct xrt_display_processor_d3d11 *dp = mc->display_processor;
+	// #1172: unless this client owns an ingest-device DP, in which case the
+	// render thread deliberately did NOT bind the panel DP here (one weaver per
+	// HWND) and this is the DP that holds the window.
+	struct xrt_display_processor_d3d11 *dp =
+	    c->render.weave_dp != nullptr ? c->render.weave_dp : mc->display_processor;
+	// #1172 TRIPWIRE: never hand a scanout-adapter weaver this client's
+	// render-adapter atlas. Skipping leaves the shared texture untouched, which
+	// the skip ladder above already documents as a visible-but-safe outcome.
+	if (!svc_weave_dp_device_ok(sys, c, dp, c->slot_app_name)) {
+		dp = nullptr;
+	}
+	if (dp != nullptr) {
+		svc_client_weave_dp_assert_state(c, dp, service_single_client_atlas_encoding(c));
+	}
 	if (dp != nullptr && in_srv != nullptr && target_w > 0 && target_h > 0) {
 		ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -16610,9 +16987,13 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		sys->context->RSSetViewports(1, &vp);
 		D3D11_RECT sc_rect = {0, 0, (LONG)target_w, (LONG)target_h};
 		sys->context->RSSetScissorRects(1, &sc_rect);
-		// #1016: this call site owns the DP's state.
-		pipeline_dp_set_transparency(mc, dp, /*client_presents*/ true, "client_texture");
-		pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(c), "client_texture");
+		// #1016: this call site owns the DP's state. #1172: on this client's own
+		// DP that was already asserted above, against ITS tracking — `mc`'s
+		// tracking describes the panel DP and must not be written from here.
+		if (dp != c->render.weave_dp) {
+			pipeline_dp_set_transparency(mc, dp, /*client_presents*/ true, "client_texture");
+			pipeline_dp_set_encoding(mc, dp, service_single_client_atlas_encoding(c), "client_texture");
+		}
 		// #918 PR 6: ADR-029 — this client weaves through the panel DP and
 		// presents the shared texture ITSELF, so there is no runtime chain here
 		// and no PresentCount to correlate against. The panel's last measured
@@ -17574,7 +17955,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				bool mask_capable;
 				{
 					render_mutex_fair_lock z_lock(sys);
-					mask_capable = service_dp_accepts_zone_mask(panel_dp(sys, c)) &&
+					// #1172: ask the DP that will RECEIVE the mask.
+					mask_capable = service_dp_accepts_zone_mask(svc_client_weave_dp(sys, c)) &&
 					               !c->zone_mask_dp_rejected;
 				}
 				// #961: DP first (unless the wish drives it), events after.
@@ -19722,7 +20104,7 @@ compositor_destroy(struct xrt_compositor *xc)
 		// every client after it — the exact silent-stale-mask case. panel_dp()
 		// resolves the right one on both paths. Already under render_mutex here.
 		if (c->zone_published) {
-			struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
+			struct xrt_display_processor_d3d11 *zdp = svc_client_weave_dp(sys, c); // #1172
 			if (zdp != nullptr) {
 				xrt_display_processor_d3d11_clear_local_zone_mask(zdp);
 				U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (client teardown)",
@@ -19772,7 +20154,7 @@ compositor_destroy(struct xrt_compositor *xc)
 		if (c->zone_published) {
 			// #1017: same as above — panel_dp() on both paths (legacy has no
 			// multi_comp, so this resolves to the client's own DP).
-			struct xrt_display_processor_d3d11 *zdp = panel_dp(sys, c);
+			struct xrt_display_processor_d3d11 *zdp = svc_client_weave_dp(sys, c); // #1172
 			if (zdp != nullptr) {
 				xrt_display_processor_d3d11_clear_local_zone_mask(zdp);
 				U_LOG_W("ZONES SVC: wish mask withdrawn (single-client teardown)");
@@ -20064,7 +20446,9 @@ weave_force_3d_if_needed(struct d3d11_service_system *sys, struct d3d11_service_
 	//
 	// This helper is deliberately kept GEOMETRY-FREE: it decides only "who drives
 	// the panel", never which regions — that is the wish's job alone.
-	bool mask_capable = service_dp_accepts_zone_mask(panel_dp(sys, c)) && !c->zone_mask_dp_rejected;
+	// #1172: ask the DP that will RECEIVE the mask — this client's own when it
+	// has one, the panel DP otherwise.
+	bool mask_capable = service_dp_accepts_zone_mask(svc_client_weave_dp(sys, c)) && !c->zone_mask_dp_rejected;
 	// #961: DP first, events after confirmation.
 	// #965/#966: the present-owner submit path must not mutate mode/geometry
 	// inline — it queues the request and returns; the panel owner applies it.
@@ -20285,8 +20669,8 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 	// #918 PR 5: the raster follows the panel DP's device. @p dp was resolved by
 	// the caller under the render_mutex this function is already inside, so this
 	// reads the same bind key — the tripwire below should never fire.
-	ID3D11Device *mask_dev = svc_zone_mask_device(sys);
-	if (!svc_zone_mask_publish_device_ok(sys, mask_dev)) {
+	ID3D11Device *mask_dev = svc_zone_mask_device(sys, c);
+	if (!svc_zone_mask_publish_device_ok(sys, c, mask_dev)) {
 		return; // #918 tripwire: mask and DP are on different devices
 	}
 
@@ -20386,7 +20770,7 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 	// Apply immediately when a wish is already live, so screen furniture goes flat
 	// without waiting for the next submit; otherwise there is nothing to
 	// republish and the next submit picks the latch up on its own.
-	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
+	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c); // #1172
 	HWND wnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
 	RECT cr = {};
 	if (c->zone_published && dp != nullptr && wnd != nullptr && c->wish_rect_count > 0 &&
@@ -20628,6 +21012,24 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		return false;
 	}
 
+	/*
+	 * #1172 — BEFORE the lock, and that placement is the point.
+	 *
+	 * Under an active output-device split the shared panel DP follows whichever
+	 * presenter owns the panel, and that is an ELIGIBLE presenter on the scanout
+	 * adapter most of the time (the service window at cold start, a workspace app
+	 * once one has focus). Everything below — the input open, the crop staging,
+	 * the handback — is created on `sys->device`, the render adapter. Weaving one
+	 * through the other is not a D3D11 error; it is an access violation inside
+	 * the vendor SDK. So this client gets a display processor of its OWN on the
+	 * render device, and builds it HERE: creating a DP calls into the vendor SDK
+	 * and can take seconds, which under `render_mutex` would stall every other
+	 * client behind one connecting browser (#925).
+	 *
+	 * No-op for every eligible client and every split-off session.
+	 */
+	svc_ensure_client_weave_dp(sys, c);
+
 	// Serialize with the render thread — sys->context is the (non-thread-safe)
 	// immediate context shared with multi_compositor_render.
 	//
@@ -20644,8 +21046,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// per-client DP (it has none). `panel_dp()` returns it; the fallback below
 	// stays for the legacy path, where a per-client DP may or may not exist.
 	// ONE load into a local, used for this whole bounded call sequence.
-	struct xrt_display_processor_d3d11 *dp = panel_dp(sys, c);
-	bool dp_is_shared = pipeline_always_on(sys) && dp != nullptr;
+	//
+	// #1172: except under an active split, where this client owns an
+	// ingest-device DP and `svc_client_weave_dp` returns THAT — see above.
+	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c);
+	const bool dp_is_own = (dp != nullptr && dp == c->render.weave_dp);
+	bool dp_is_shared = !dp_is_own && pipeline_always_on(sys) && dp != nullptr;
 	if (dp == nullptr && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 		dp_is_shared = (dp != nullptr);
@@ -20657,6 +21063,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			        "multi-compositor DP both null, workspace_mode=%d) — weave unavailable",
 			        (int)sys->workspace_mode);
 		}
+		return false;
+	}
+	// #1172 TRIPWIRE — the invariant, not an optimisation. If we fell back to the
+	// shared panel DP and it is on the SCANOUT device, this weave would hand the
+	// vendor SDK a render-adapter texture and fault. Skip the frame instead; the
+	// client's window keeps whatever it last presented and the next submit
+	// retries (the ingest DP may exist by then).
+	if (!svc_weave_dp_device_ok(sys, c, dp, "weave_submit")) {
 		return false;
 	}
 	// #964: a present-owner composes the woven output over its OWN window, so
@@ -20678,6 +21092,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// to a DP that had been told they were linear. A present-owner weave is
 		// single-layer Model A passthrough, exactly like the direct path.
 		pipeline_dp_set_encoding(sys->multi_comp, dp, service_single_client_atlas_encoding(c), "weave");
+	}
+	// #1172: the same two assertions on this client's OWN DP, tracked per client
+	// rather than on `mc` — nothing else ever touches it, so it only ever changes
+	// here and the on-change rule still holds.
+	if (dp_is_own) {
+		svc_client_weave_dp_assert_state(c, dp, service_single_client_atlas_encoding(c));
 	}
 	if (dp_is_shared) {
 		static std::atomic_flag s_logged = ATOMIC_FLAG_INIT;
