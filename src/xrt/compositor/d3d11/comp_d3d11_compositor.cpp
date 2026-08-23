@@ -3657,6 +3657,117 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	delete c;
 }
 
+/*!
+ * `DXR_TEST_FAKE_DP_REFUSE=1` — the POST-gate half of the fallback matrix, the
+ * D3D11 in-process twin of `d3d12_test_fake_dp_refuse` (#1164).
+ *
+ * Its sibling is `DXR_TEST_SPLIT_FAIL_STAGEA=1`, which fails Stage A at the
+ * bridge. This one makes the display processor DECLINE the scanout adapter,
+ * which is the one fallback row ADR-037 §3a describes and the only one whose
+ * recovery depends on a vendor answer rather than on our own allocations.
+ *
+ * THE ASYMMETRY IS THE POINT, and it is the same one #1164 established: the arm
+ * fires ONLY on the OUT-device create. What is under test is the RECOVERY —
+ * refuse on the scanout adapter, let Stage A fail, and let the app-device
+ * create succeed so the session still weaves. An arm that also failed the
+ * app-device create would leave no display processor anywhere and would be
+ * testing a different, less interesting thing.
+ *
+ * Latched on first read; opt-in env; never anything but a test.
+ */
+static bool
+d3d11_test_fake_dp_refuse(void)
+{
+	static int want = -1;
+	if (want < 0) {
+		const char *e = getenv("DXR_TEST_FAKE_DP_REFUSE");
+		want = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return want == 1;
+}
+
+/*!
+ * Create the display processor on the device the weave will run on, and apply
+ * the two session-level settings that have to follow it there.
+ *
+ * THE BIND KEY IS `(hwnd, device)`, NOT `hwnd` — a vendor weaver is
+ * one-per-HWND and holds device-scoped state, so a second create against a
+ * window that still has one is refused and the failure is SILENT weaving. This
+ * function is therefore the compositor's ONE creation point, and it is called
+ * at most once per session: either from Stage A on the scanout device (and then
+ * kept, never re-created), or from the stock path on the app device.
+ *
+ * The device and context are passed EXPLICITLY rather than read through
+ * `d3d11_out_device()`, because the Stage-A caller runs before `split_active`
+ * is set — the split has not committed yet, which is the whole point of asking
+ * the plug-in first (ADR-037 §3a).
+ *
+ * @param on_scanout the device being offered is the runtime's scanout-adapter
+ *        device, i.e. this call IS the §3a negotiation. Drives the test arm and
+ *        the log wording; a refusal here is recoverable, a refusal on the app
+ *        device is not.
+ * @return false when no display processor was created.
+ */
+static bool
+d3d11_make_dp(struct comp_d3d11_compositor *c,
+              void *dp_factory,
+              ID3D11Device *device,
+              ID3D11DeviceContext *context,
+              bool on_scanout)
+{
+	if (dp_factory == nullptr || device == nullptr || context == nullptr) {
+		return false;
+	}
+	auto factory = (xrt_dp_factory_d3d11_fn_t)dp_factory;
+	// Shared-texture sessions track position by the app's HWND; everyone else
+	// has a real window of their own. (A shared-texture session can never be on
+	// the scanout path — the gate refuses it with `shared_texture_session`.)
+	HWND dp_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+
+	// Dev-only injection — see d3d11_test_fake_dp_refuse. The factory is not
+	// called at all on this path, so no weaver can be left behind on the HWND.
+	const bool fake_refuse = on_scanout && d3d11_test_fake_dp_refuse();
+	if (fake_refuse) {
+		U_LOG_W("DXR_TEST_FAKE_DP_REFUSE=1: refusing the display processor on the SCANOUT device (test)");
+	}
+
+	xrt_result_t dp_ret =
+	    fake_refuse ? XRT_ERROR_DEVICE_CREATION_FAILED : factory(device, context, dp_hwnd, &c->display_processor);
+	if (dp_ret != XRT_SUCCESS) {
+		U_LOG_W("D3D11 display processor factory failed (error %d) on the %s device", (int)dp_ret,
+		        on_scanout ? "SCANOUT" : "app");
+		c->display_processor = nullptr;
+		return false;
+	}
+	U_LOG_W("D3D11 display processor created via factory on %s device (hwnd %p)",
+	        on_scanout ? "the SCANOUT" : "the app", (void *)dp_hwnd);
+
+	// Forward session-level transparency (#573 — chroma-key-free).
+	// client_presents=false — DELIBERATELY, and #904's true here was wrong for
+	// in-process (reverted after a hardware eyeball): the DE-OCCLUSION BAND
+	// (pixels where SOME but not all views are transparent — the parallax
+	// fringe around 3D content) cannot come from DWM live blending. The SR
+	// weaver destroys per-pixel alpha and the alpha-gate reconstructs only the
+	// binary all-views-transparent mask, so the band is either filled by the
+	// DP's compose-under-bg (~1-frame-stale bake, the product spec: live
+	// desktop in the holes, bake only in the band) or it is BLACK. #904
+	// disabled the compose calling it wasted work — the dwm saving it measured
+	// partly bought black de-occlusions. The WGC cost is attacked by capture
+	// throttling instead, not by dropping the band. client_presents=true
+	// remains correct for true client-side presents (#551 IPC) and for content
+	// with no partial-alpha band.
+	xrt_display_processor_d3d11_set_transparent_background(c->display_processor, c->transparent_background, false);
+
+	// #68: tell the DP whether the app self-presents only the canvas (a
+	// _texture app blits its shared texture's canvas to its own window) vs the
+	// runtime presenting the full target (handle apps). The DP uses this + its
+	// zones state to skip the compose-under-bg desktop-UV remap that would
+	// otherwise magnify the captured desktop. Replaces the
+	// DISPLAYXR_ZONES_TEXTURE_FIX prototype env flag.
+	xrt_display_processor_d3d11_set_shared_texture_present(c->display_processor, c->has_shared_texture);
+	return true;
+}
+
 /*
  *
  * Exported functions
@@ -3950,6 +4061,14 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		struct comp_split_gate_result gate = {};
 		comp_split_gate_evaluate(&gin, &gate);
 		const char *reason = gate.reason;
+		/*
+		 * The canonical token a Stage-A failure reports. NULL means "the
+		 * generic one" (`stage_a_failed`, whose prose is in the WARN one line
+		 * above the placement line). The §3a negotiation below overrides it,
+		 * because a plug-in that declined the scanout adapter is a different
+		 * support case from a heap we could not allocate.
+		 */
+		const char *stage_a_token = nullptr;
 		split_off_reason = gate.short_reason;
 		if (gate.same_adapter) {
 			// Not a failure: on a MUX'd / single-GPU box the weave is
@@ -4082,6 +4201,50 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			stage_a_bridge_ms = (double)(os_monotonic_get_ns() - xb_t0) / 1.0e6;
 		}
 
+		/*
+		 * ADR-037 §3a — ASK THE PLUG-IN BEFORE THE SPLIT COMMITS (#1168).
+		 *
+		 * The runtime picks the adapters; it does not get to assume the vendor
+		 * plug-in can weave on the one it picked. §3a frames placement as a
+		 * NEGOTIATION, and a weaver-creation failure on the scanout adapter as
+		 * a FALLBACK TRIGGER — never a session that survives without a weave,
+		 * which on a 3D panel is a flat or black picture and is strictly worse
+		 * than the rung-2 fallback the ADR mandates.
+		 *
+		 * So the negotiation is the LAST of Stage A's commit criteria, and it
+		 * happens HERE rather than at the stock display-processor site three
+		 * hundred lines below, which is after the point of no return: by then
+		 * the target, its RTVs and the repaint loop have all been built on the
+		 * out device and there is nothing left to fall back INTO. Asking first
+		 * means a refusal is just another Stage-A failure, and the existing,
+		 * well-tested teardown-and-fall-through below is the whole recovery —
+		 * no retire function, no half-built state to unwind, no second recovery
+		 * path to drift from the first.
+		 *
+		 * NO WEAVER CAN BE STRANDED ON THE HWND. One weaver per HWND, and this
+		 * is the compositor's single creation point (@ref d3d11_make_dp):
+		 *   - it SUCCEEDS  -> `c->display_processor` is the one the session
+		 *                     goes on to use; the stock site below sees it
+		 *                     already set and does not call the factory again;
+		 *   - it DECLINES  -> nothing was created (the factory returned no
+		 *                     object, or the test arm never called it), Stage A
+		 *                     fails, and the stock site creates the DP on the
+		 *                     app device against a window that holds none.
+		 * Nothing after this point in Stage A can fail, so a created weaver is
+		 * never orphaned by a later step; the teardown below destroys it anyway
+		 * so that stays true if a step is ever added.
+		 *
+		 * Cost: the negotiation is the DP create the session was going to pay
+		 * for regardless — it is MOVED, not added, so the Stage-A warmup budget
+		 * is unchanged.
+		 */
+		if (reason == nullptr && dp_factory_d3d11 != NULL) {
+			if (!d3d11_make_dp(c, dp_factory_d3d11, c->out_dev, c->out_ctx, true)) {
+				reason = "the display processor declined a weaver on the scanout adapter";
+				stage_a_token = COMP_SPLIT_REASON_DP_REFUSED_SCANOUT;
+			}
+		}
+
 		if (reason == nullptr) {
 			c->split_active = true;
 			split_off_reason = nullptr;
@@ -4100,6 +4263,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			        (unsigned long)sdesc.AdapterLuid.LowPart, (unsigned long)app_luid.HighPart,
 			        (unsigned long)app_luid.LowPart);
 		} else {
+			/*
+			 * (hwnd, device) bind key: any weaver the negotiation above created
+			 * belongs to a device that is about to be released, so it must not
+			 * outlive Stage A — the app-device create below would otherwise be
+			 * a SECOND weaver on this HWND and be refused, silently. A refusal
+			 * leaves this NULL and the destroy is a no-op; it is here so the
+			 * invariant survives any future step added between the two.
+			 */
+			xrt_display_processor_d3d11_destroy(&c->display_processor);
 			if (c->xbridge != nullptr) {
 				comp_xbridge_destroy(&c->xbridge);
 			}
@@ -4124,7 +4296,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 				 * line that names the token.
 				 */
 				if (gate.split_active) {
-					split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+					split_off_reason = (stage_a_token != nullptr)
+					                       ? stage_a_token
+					                       : COMP_SPLIT_REASON_STAGE_A_FAILED;
 				}
 				U_LOG_W("D3D11 output-device split DISABLED (%s) — falling back to the stock "
 				        "single-device path (#918)",
@@ -4286,77 +4460,31 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
 
-	// Create display processor via factory (set by the target builder at init time).
-	if (dp_factory_d3d11 != NULL) {
-		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_factory_d3d11;
-		// Use app HWND for position tracking in shared texture mode,
-		// otherwise use the compositor's own HWND
-		HWND dp_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-		// #918: under the split the weaver is created on the OUTPUT device, so
-		// it weaves and presents local to the panel. One weaver per HWND — this
-		// factory call is the single creation point and it runs exactly once,
-		// after out_dev exists.
-		xrt_result_t dp_ret =
-		    factory(d3d11_out_device(c), d3d11_out_context(c), dp_hwnd, &c->display_processor);
-		if (dp_ret != XRT_SUCCESS) {
-			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
-			        (int)dp_ret);
-			c->display_processor = nullptr;
-			/*
-			 * ADR-037 §3a GAP — NAMED, not silently absorbed.
-			 *
-			 * §3a says a weaver-creation failure on the scanout adapter is a
-			 * fallback trigger: retire the split and recreate the display
-			 * processor on the render adapter, where it demonstrably worked
-			 * before. The in-process D3D12 leg does exactly that
-			 * (`d3d12_split_retire`, #1164). This leg has no equivalent — the
-			 * target, its RTVs and the repaint loop were all built on the out
-			 * device several hundred lines above, and moving them back is a
-			 * retire function that does not exist yet.
-			 *
-			 * Weaving on the app device while presenting from the out device
-			 * would be a HALF-ENGAGED split, which is worse than either rung,
-			 * so it is not attempted. #918 Phase 3 makes the split the default
-			 * and therefore makes this reachable without an env flag, so it is
-			 * logged unmistakably rather than left to be inferred from a flat
-			 * panel. Kill switch: DXR_WEAVE_ON_SCANOUT=0.
-			 */
-			if (c->split_active) {
-				U_LOG_E(
-				    "#918/ADR-037 §3a: the display processor declined the SCANOUT device and this "
-				    "path has no split retire — the session continues WITHOUT a display processor "
-				    "(no weave). Re-run with DXR_WEAVE_ON_SCANOUT=0 to weave on the render "
-				    "adapter, and report this: split=1 reason=%s",
-				    COMP_SPLIT_REASON_DP_REFUSED_SCANOUT);
-			}
-		} else {
-			U_LOG_W("D3D11 display processor created via factory");
-			// Forward session-level transparency (#573 — chroma-key-free).
-			// client_presents=false — DELIBERATELY, and #904's true here was
-			// wrong for in-process (reverted after a hardware eyeball): the
-			// DE-OCCLUSION BAND (pixels where SOME but not all views are
-			// transparent — the parallax fringe around 3D content) cannot
-			// come from DWM live blending. The SR weaver destroys per-pixel
-			// alpha and the alpha-gate reconstructs only the binary
-			// all-views-transparent mask, so the band is either filled by
-			// the DP's compose-under-bg (~1-frame-stale bake, the product
-			// spec: live desktop in the holes, bake only in the band) or it
-			// is BLACK. #904 disabled the compose calling it wasted work —
-			// the dwm saving it measured partly bought black de-occlusions.
-			// The WGC cost is attacked by capture throttling instead, not by
-			// dropping the band. client_presents=true remains correct for
-			// true client-side presents (#551 IPC) and for content with no
-			// partial-alpha band.
-			xrt_display_processor_d3d11_set_transparent_background(
-			    c->display_processor, transparent_background, false);
-			// #68: tell the DP whether the app self-presents only the canvas (a
-			// _texture app blits its shared texture's canvas to its own window)
-			// vs the runtime presenting the full target (handle apps). The DP
-			// uses this + its zones state to skip the compose-under-bg desktop-UV
-			// remap that would otherwise magnify the captured desktop. Replaces
-			// the DISPLAYXR_ZONES_TEXTURE_FIX prototype env flag.
-			xrt_display_processor_d3d11_set_shared_texture_present(
-			    c->display_processor, c->has_shared_texture);
+	/*
+	 * Create the display processor via the factory the target builder set at
+	 * init time — unless Stage A already did.
+	 *
+	 * #1168 / ADR-037 §3a: under an ACTIVE split the weaver was created up in
+	 * Stage A, on the scanout device, as the last of the split's commit
+	 * criteria. Reaching here with `split_active` therefore means the plug-in
+	 * already said yes, and calling the factory a second time would be a second
+	 * weaver on the same HWND — refused, and refused SILENTLY. Reaching here
+	 * with the split OFF means either the split never engaged, or it engaged
+	 * and the plug-in declined the scanout adapter and Stage A fell through to
+	 * rung 2. Both take the same app-device create below, which is exactly what
+	 * the non-split path has always done, so the §3a fallback needs no code of
+	 * its own — the absence of a retire is the design, not a gap.
+	 */
+	if (c->display_processor != nullptr) {
+		U_LOG_I("D3D11 display processor already created on the scanout device by stage A (#918)");
+	} else if (dp_factory_d3d11 != NULL) {
+		// on_scanout=false: split_active is necessarily false here (see above),
+		// so `d3d11_out_device` collapses to the app device — the placement the
+		// non-split path has always used, and the one a §3a refusal degrades to.
+		if (!d3d11_make_dp(c, dp_factory_d3d11, d3d11_out_device(c), d3d11_out_context(c), false)) {
+			// End of the line: the app device is where the non-split path has
+			// always created it, so there is nothing left to fall back to.
+			U_LOG_W("D3D11 display processor unavailable on the app device — continuing without");
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");
