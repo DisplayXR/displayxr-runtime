@@ -141,9 +141,15 @@ enum comp_split_ingress_policy
 #define COMP_SPLIT_REASON_STAGE_A_FAILED "stage_a_failed"
 /*!
  * ADR-037 §3a — the display processor declined to create a weaver on the scanout
- * adapter. A vendor plug-in is allowed to; the split retires and the session
- * weaves on the render adapter, where the DP demonstrably worked before.
- * POST-activation, so it is not a Stage-A failure.
+ * adapter. A vendor plug-in is allowed to; the session then weaves on the render
+ * adapter, where the DP demonstrably worked before.
+ *
+ * WHEN it is discovered differs by leg, and the token deliberately does not:
+ * the in-process D3D12 leg asks after its target exists, so the refusal is
+ * POST-activation and the split RETIRES (#1164); the in-process D3D11 leg asks
+ * inside Stage A, before the split commits, so the refusal is PRE-activation
+ * and Stage A simply fails (#1168). One token, because a support case cares
+ * which adapter the plug-in refused, not which line of ours noticed.
  */
 #define COMP_SPLIT_REASON_DP_REFUSED_SCANOUT "dp_refused_scanout"
 /*!
@@ -277,14 +283,18 @@ comp_split_gate_parse_requested(const char *value);
  * WARN, stock path" degrade can be exercised without a machine that genuinely
  * cannot allocate the heap. Latched on first call.
  *
- * This is the PRE-activation half of the matrix. Its sibling is
- * `DXR_TEST_FAKE_DP_REFUSE=1` (D3D12 in-process compositor,
- * `d3d12_test_fake_dp_refuse`), which walks the POST-activation half: a display
- * processor that declines a weaver on the scanout adapter once the split is
- * already up. Named here rather than only there because a verification pass
- * that finds one arm and not the other covers half the matrix and reads as if
- * it covered all of it. The two are deliberately independent envs — they fail
- * at different points and are meant to be walked separately.
+ * This is the ALLOCATION-FAILURE half of the matrix. Its sibling is
+ * `DXR_TEST_FAKE_DP_REFUSE=1` (`d3d12_test_fake_dp_refuse`,
+ * `d3d11_test_fake_dp_refuse`), which walks the VENDOR-REFUSAL half: a display
+ * processor that declines a weaver on the scanout adapter. Both in-process legs
+ * implement that arm, and both do so with the same asymmetry — it fires ONLY on
+ * the out-device create, so the app-device fallback is allowed to succeed and
+ * what gets walked is the RECOVERY. What differs is where the recovery lands:
+ * D3D12 retires an already-engaged split (#1164), D3D11 fails Stage A before it
+ * engages (#1168). Named here rather than only there because a verification
+ * pass that finds one arm and not the other covers half the matrix and reads as
+ * if it covered all of it. The two are deliberately independent envs — they
+ * fail at different points and are meant to be walked separately.
  */
 bool
 comp_split_gate_env_test_fail_stage_a(void);
