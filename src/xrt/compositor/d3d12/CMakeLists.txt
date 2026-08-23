@@ -8,8 +8,11 @@
 if(WIN32 AND XRT_HAVE_D3D12)
 	add_library(
 		comp_d3d12 STATIC
+		../d3d_shared/comp_masked_composite_shaders.h
 		comp_d3d12_compositor.cpp
 		comp_d3d12_compositor.h
+		comp_d3d12_outcomp.cpp
+		comp_d3d12_outcomp.h
 		comp_d3d12_renderer.cpp
 		comp_d3d12_renderer.h
 		comp_d3d12_swapchain.cpp
