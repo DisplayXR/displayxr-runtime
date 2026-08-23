@@ -31,6 +31,11 @@ endif()
 if(XRT_HAVE_D3D12)
 	list(APPEND tests tests_comp_client_d3d12)
 endif()
+if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
+	# #918 D12-1 — the masked-composite HLSL that comp_d3d11_outcomp and
+	# comp_d3d12_outcomp both compile. D3DCompile/D3DReflect need no device.
+	list(APPEND tests tests_comp_masked_composite_shaders)
+endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
 endif()
@@ -95,6 +100,15 @@ if(XRT_HAVE_D3D11)
 	# bridge symbols defined in ipc_client_compositor.c. Add ipc_client to
 	# the link line so the unit test binary resolves them.
 	target_link_libraries(tests_comp_client_d3d11 PRIVATE comp_client comp_mock ipc_client)
+endif()
+
+if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
+	# The shader strings are a header of embedded HLSL — no compositor library
+	# to link, only the compiler/reflection the units themselves use.
+	target_include_directories(
+		tests_comp_masked_composite_shaders PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_comp_masked_composite_shaders PRIVATE d3dcompiler)
 endif()
 
 if(XRT_HAVE_D3D12)
