@@ -114,6 +114,44 @@ extern "C" bool g_bridge_relay_active;
 #include "util/comp_weave_latency_win.h"
 #include "util/comp_display_refresh_win.h"
 
+/*
+ * DXR_FRAME_WITNESS (#1044 / PR #1112) on the SERVICE path.
+ *
+ * #1112 wired the witness into the three in-process native compositors and
+ * deferred this one, which has its own present machinery — so on the
+ * service/IPC path presents/s and weaves/s were unmeasurable. Same header,
+ * therefore byte-identical output; only the counting sites differ.
+ *
+ * AGGREGATE, NOT PER-PRESENTER. One witness per service process, summed over
+ * every presenter family: the service window's chain, the focused APP_HWND
+ * client's chain, and (on DXR_LEGACY_STANDALONE) each client's own chain. The
+ * service shows exactly ONE presenter on the panel at a time, so the aggregate
+ * IS the panel rate; a per-presenter breakdown would only re-state
+ * `[RENDER] presenter=` and split a 5 s window across whichever chains the
+ * focus pick happened to visit. What the aggregate deliberately EXCLUDES:
+ *
+ *  - the unfocused courtesy flat repaints (`pipeline_flat_present`) — real
+ *    flips, but to windows that are not on the panel; counting them would put
+ *    presents/s above the panel rate for reasons that have nothing to do with
+ *    throughput. They already have `[RENDER] pipe_flat_present`.
+ *  - CLIENT_TEXTURE / XR_DXR_weave present-owners — the runtime signals a fence
+ *    and the CLIENT presents, so no present happens in this process. Their
+ *    weaves ARE counted (they are real DP weaves on the panel DP); their
+ *    presents are not ours to count. A session with only such clients therefore
+ *    emits no [WITNESS] line at all, which is the header's documented
+ *    "presents are the heartbeat" behaviour.
+ *
+ * PRESENTS, NOT TICKS. The service legitimately skips the flip on some ticks
+ * (invariant F4 — never present a cleared-unwoven buffer; and the free-buffer
+ * probes on both the service-window and APP_HWND chains). Every count_present()
+ * below sits behind a *succeeded* Present, never behind a tick, so a skip
+ * lowers presents/s instead of being counted as one. That distinction is the
+ * whole point on the split arm, where skips are not rare.
+ */
+#include "util/comp_frame_witness.h"
+
+static comp_frame_witness g_frame_witness_service{"d3d11_service"};
+
 static weave_latency_log g_weave_latency_standalone;
 
 // Latency governor (#850) for the workspace waitable chain:
@@ -724,6 +762,17 @@ struct d3d11_service_compositor
 	uint32_t painted_content_w;
 	uint32_t painted_content_h;
 	uint32_t painted_view_count;
+
+	//! DXR_FRAME_WITNESS: bumped by every commit that PAINTED this client's
+	//! atlas (the same `content_dims_painted` edge the recipe above holds on).
+	//! It is what lets the service tell #1112's two weave populations apart:
+	//! the render thread weaves on ITS clock, not the client's, so a weave with
+	//! no new paint behind it is precisely a #868 repaint. Written on the
+	//! client's IPC thread, read on the render thread — hence atomic, relaxed
+	//! (a ±1 window skew is irrelevant at a 5 s aggregate).
+	std::atomic<uint32_t> witness_paint_seq{0};
+	//! Render-thread-private high-water mark for @ref witness_paint_seq.
+	uint32_t witness_paint_seq_seen;
 
 	//! #1017: does this client currently OWN the panel, as decided by the
 	//! render thread's focus pick? Read by the CLIENT_TEXTURE weave on the
@@ -10717,6 +10766,52 @@ pipeline_slot_presenting(const struct d3d11_multi_client_slot *slot)
 }
 
 /*!
+ * DXR_FRAME_WITNESS: has @p c painted its atlas since the last time this was
+ * asked? Consumes the edge, so call it EXACTLY ONCE per weave of that client.
+ *
+ * `false` ⟹ the weave about to run re-weaves pixels the client did not change,
+ * which is #1112's `repaints` population; `true` ⟹ it is an app-frame weave.
+ * On the legacy standalone / CLIENT_TEXTURE / weave_submit paths the client's
+ * own call drives the weave, so this is almost always `true` — the exception is
+ * a non-painting commit re-showing the last good composite (#1140), which is a
+ * repaint by exactly the same definition.
+ */
+static bool
+witness_take_fresh_paint(struct d3d11_service_compositor *c)
+{
+	if (c == nullptr) {
+		return false;
+	}
+	const uint32_t seq = c->witness_paint_seq.load(std::memory_order_relaxed);
+	if (seq == c->witness_paint_seq_seen) {
+		return false;
+	}
+	c->witness_paint_seq_seen = seq;
+	return true;
+}
+
+/*!
+ * DXR_FRAME_WITNESS: the compose path weaves ONE atlas built from every
+ * composed client, so "was there an app frame behind this weave" is "did ANY of
+ * them paint". Every slot's edge must be consumed (no short-circuit) or a
+ * client that painted while another did not would stay 'fresh' forever.
+ */
+static bool
+witness_take_fresh_paint_any(struct d3d11_multi_compositor *mc)
+{
+	bool fresh = false;
+	if (mc == nullptr) {
+		return false;
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (mc->clients[s].active && mc->clients[s].compositor != nullptr) {
+			fresh |= witness_take_fresh_paint(mc->clients[s].compositor);
+		}
+	}
+	return fresh;
+}
+
+/*!
  * #964: the RTV's backing texture dimensions (the presenter's target size).
  */
 static void
@@ -12007,6 +12102,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		                                          weave_view_h, weave_cols, weave_rows,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0,
 		                                          0);
+		g_frame_witness_service.count_weave(!witness_take_fresh_paint(fc), sys->hardware_display_3d);
 	} else if (sys->split_active && dp_input_srv != nullptr) {
 		/*
 		 * #918 — the no-DP fallback UNDER THE SPLIT. The back buffer is on the
@@ -12182,8 +12278,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 			if (SUCCEEDED(phr)) {
 				svc_after_present(weave_lat, weave_lat_site, present_sc);
+				g_frame_witness_service.count_present();
 			}
 		} else {
+			// F4 / free-buffer probe: this tick did NOT present. Counted as a
+			// skip and deliberately NOT as a present — a tick-based proxy would
+			// overcount exactly here.
 			sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
 		}
 	} else if (kind == PRESENTER_APP_HWND && present_sc != nullptr) {
@@ -12197,9 +12297,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		fc->force_unpaced_present = false;
 		sys->render_diag_pipe_active_present.fetch_add(1, std::memory_order_relaxed);
 		if (phr == DXGI_ERROR_WAS_STILL_DRAWING || phr == DXGI_STATUS_OCCLUDED) {
+			// Not an error — but also not a flip. No count_present().
 			phr = S_OK; // frame skipped / window not on screen — not an error
 		} else if (SUCCEEDED(phr)) {
 			svc_after_present(weave_lat, weave_lat_site, present_sc);
+			g_frame_witness_service.count_present();
 		}
 	}
 	t_present_ns = (int64_t)os_monotonic_get_ns();
@@ -14927,6 +15029,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		xrt_display_processor_d3d11_process_atlas(compose_dp, svc_out_context(sys), dp_input_srv, weave_view_w,
 		                                          weave_view_h, weave_cols, weave_rows,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h, 0, 0, 0, 0);
+		g_frame_witness_service.count_weave(!witness_take_fresh_paint_any(mc), sys->hardware_display_3d);
 	} else if (sys->split_active && dp_input_srv && mc->back_buffer_rtv) {
 		/*
 		 * #918 — the no-DP fallback UNDER THE SPLIT, the compose path's copy of
@@ -15097,6 +15200,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			phr = dxr_test_fake_device_removed(phr);
 			if (!service_note_device_lost(sys, phr, "compose/service_window_present")) {
 				svc_after_present(&mc->weave_lat, "workspace", mc->swap_chain.get());
+				if (SUCCEEDED(phr)) {
+					g_frame_witness_service.count_present();
+				}
 			}
 		}
 	}
@@ -16489,6 +16595,9 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv, c->pipe_content_w,
 		                                          c->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
 		                                          target_w, target_h, 0, 0, 0, 0);
+		// ADR-029: a real weave on the panel DP. No matching count_present() —
+		// the CLIENT presents this shared texture itself (see the header note).
+		g_frame_witness_service.count_weave(!witness_take_fresh_paint(c), sys->hardware_display_3d);
 	}
 
 	{
@@ -18421,6 +18530,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		c->painted_content_w = content_view_w;
 		c->painted_content_h = content_view_h;
 		c->painted_view_count = eff_view_count;
+		// DXR_FRAME_WITNESS: a fresh app frame is now in this client's atlas.
+		// Unconditional (one relaxed increment per painting commit is cheaper
+		// than the env probe that would gate it).
+		c->witness_paint_seq.fetch_add(1, std::memory_order_relaxed);
 	} else if (c->painted_content_w > 0 && c->painted_content_h > 0) {
 		content_view_w = c->painted_content_w;
 		content_view_h = c->painted_content_h;
@@ -19127,6 +19240,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    // keeps its ENCODED default. Pass the real atlas format here.
 		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height,
 		    0, 0, 0, 0);
+		g_frame_witness_service.count_weave(!witness_take_fresh_paint(c), sys->hardware_display_3d);
 		weaving_done = true;
 	} else if (c->render.back_buffer_rtv && input_srv) {
 		// Fallback: no display processor — raw copy to back buffer
@@ -19255,6 +19369,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		if (SUCCEEDED(phr)) {
 			g_weave_latency_standalone.after_present("standalone", c->render.swap_chain.get());
+			// The 50 ms DO_NOT_WAIT deadline above breaks out with
+			// DXGI_ERROR_WAS_STILL_DRAWING — a dropped frame, not a present.
+			g_frame_witness_service.count_present();
 		}
 		// DComp path: publish the new frame to dwm.exe. Cheap — IPC of delta state,
 		// no GPU work. Only present on the transparent opt-in path.
@@ -20892,6 +21009,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                          layout->tile_columns, layout->tile_rows,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
 		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		// #625 present-owner: a real panel-DP weave, driven by the client's own
+		// synchronous submit. It presents the woven texture itself, so this
+		// contributes to weaves/s with no matching present (see header note).
+		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		if (acquired && in_km) {
 			in_km->ReleaseSync(0);
@@ -20952,6 +21073,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y,
 		                                          rect_w, rect_h);
+		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		if (acquired && in_km) {
 			in_km->ReleaseSync(0);
@@ -21086,6 +21208,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
 		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		// Batch phase split (throttled): blits (shared input -> SBS atlas,
 		// incl. mutex release) vs the single full-window weave.
