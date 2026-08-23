@@ -11,7 +11,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 
 	add_library(
 		comp_d3d11 STATIC
-		comp_d3d11_composite_shaders.h
+		../d3d_shared/comp_masked_composite_shaders.h
 		comp_d3d11_compositor.cpp
 		comp_d3d11_compositor.h
 		comp_d3d11_compositor_internals.h
