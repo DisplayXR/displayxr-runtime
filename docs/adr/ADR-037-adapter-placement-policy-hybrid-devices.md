@@ -1,4 +1,4 @@
-# ADR-037 — Adapter placement policy on hybrid-GPU devices
+# ADR-037: Adapter placement policy on hybrid-GPU devices
 
 **Status:** PROPOSED (2026-08-22; amended 2026-08-23 by the #918 owner — added
 §3a DP consent, corrected §7 to shipped, added the crossover instrument
