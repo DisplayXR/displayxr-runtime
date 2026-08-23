@@ -139,6 +139,20 @@ enum comp_split_ingress_policy
  * the caller's own WARN immediately above; this is the short form.
  */
 #define COMP_SPLIT_REASON_STAGE_A_FAILED "stage_a_failed"
+/*!
+ * ADR-037 §3a — the display processor declined to create a weaver on the scanout
+ * adapter. A vendor plug-in is allowed to; the split retires and the session
+ * weaves on the render adapter, where the DP demonstrably worked before.
+ * POST-activation, so it is not a Stage-A failure.
+ */
+#define COMP_SPLIT_REASON_DP_REFUSED_SCANOUT "dp_refused_scanout"
+/*!
+ * The frame carries layers this rung's transport cannot move (the D3D12-ends
+ * bridge is projection-only: zones, Local2D and authored masks have their
+ * composite inputs on the app device). Retires the split for the session rather
+ * than draw a half-split frame.
+ */
+#define COMP_SPLIT_REASON_LAYERS_UNSUPPORTED "layers_unsupported"
 /*! @} */
 
 /*!

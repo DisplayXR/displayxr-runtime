@@ -54,6 +54,7 @@
 #include "math/m_api.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "d3d/d3d_scanout_helpers.hpp"
+#include "d3d/d3d_weave_placement.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
@@ -3880,6 +3881,14 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	 * investigation's explicit constraint is that the split must not lengthen
 	 * it. Duration is logged so a regression is visible, not inferred.
 	 */
+	/*
+	 * #918 Phase 3 — the short reason the ONE canonical placement line below
+	 * prints when the split is not running. Initialised to the kill-switch
+	 * answer because that is the only way to skip Stage A entirely now that the
+	 * split is the default; every other rung overwrites it.
+	 */
+	const char *split_off_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
+
 	if (debug_get_bool_option_weave_on_scanout()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
 		double stage_a_bridge_ms = 0.0;
@@ -3899,9 +3908,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		gin.requested = true;
 
 		if (c->hwnd == nullptr) {
-			gin.ineligible_reason = "no HWND";
+			gin.ineligible_reason = COMP_SPLIT_REASON_NO_HWND;
 		} else if (c->has_shared_texture) {
-			gin.ineligible_reason = "shared-texture session";
+			gin.ineligible_reason = COMP_SPLIT_REASON_SHARED_TEXTURE;
 		}
 
 		// The app device's adapter — the LUID the scanout adapter is compared
@@ -3918,7 +3927,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			}
 			DXGI_ADAPTER_DESC ad{};
 			if (app_adapter == nullptr || FAILED(app_adapter->GetDesc(&ad))) {
-				gin.ineligible_reason = COMP_SPLIT_REASON_SCANOUT_UNRESOLVABLE;
+				// The RENDER side, not the scanout side — naming it
+				// "scanout unresolvable" sent support looking at the
+				// wrong adapter.
+				gin.ineligible_reason = COMP_SPLIT_REASON_RENDER_UNRESOLVABLE;
 			} else {
 				app_luid = ad.AdapterLuid;
 			}
@@ -3938,6 +3950,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		struct comp_split_gate_result gate = {};
 		comp_split_gate_evaluate(&gin, &gate);
 		const char *reason = gate.reason;
+		split_off_reason = gate.short_reason;
 		if (gate.same_adapter) {
 			// Not a failure: on a MUX'd / single-GPU box the weave is
 			// already local, so the split has nothing to do. One INFO,
@@ -4071,6 +4084,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 		if (reason == nullptr) {
 			c->split_active = true;
+			split_off_reason = nullptr;
 			c->out_luid.LowPart = gate.out_adapter_luid.low;
 			c->out_luid.HighPart = gate.out_adapter_luid.high;
 			c->split_panel_w = xdev->hmd->screens[0].w_pixels;
@@ -4102,6 +4116,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 				c->out_dev = nullptr;
 			}
 			if (reason[0] != '\0') {
+				/*
+				 * The gate's own refusals already carry a canonical
+				 * token; a Stage-A failure carries prose, and its
+				 * short form is `stage_a_failed` — the prose is right
+				 * here in this WARN, one line above the placement
+				 * line that names the token.
+				 */
+				if (gate.split_active) {
+					split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+				}
 				U_LOG_W("D3D11 output-device split DISABLED (%s) — falling back to the stock "
 				        "single-device path (#918)",
 				        reason);
@@ -4124,73 +4148,34 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	 * #918 — ONE canonical weave-placement line per session, ALWAYS emitted,
 	 * in addition to (never instead of) the Stage-A detail lines above.
 	 *
-	 * The Stage-A lines only exist when DXR_WEAVE_ON_SCANOUT is set, so
-	 * without this a hybrid box silently paying the cross-adapter present
-	 * produced a log byte-identical to a single-adapter box that pays
-	 * nothing — the same blind spot #1000 closed for adapter SELECTION, now
-	 * closed for weave PLACEMENT. Costs one QueryDisplayConfig per session.
+	 * The Stage-A lines exist only when Stage A ran, so without this a box that
+	 * killed the split, or one whose session was ineligible, produced a log
+	 * byte-identical to a single-adapter box that pays nothing — the same blind
+	 * spot #1000 closed for adapter SELECTION, now closed for weave PLACEMENT.
+	 * The formatting lives in aux_d3d so this line is one string across all five
+	 * compositors. Costs one QueryDisplayConfig per session.
 	 */
 	{
-		DXGI_ADAPTER_DESC rdesc = {};
-		bool render_ok = false;
-		{
-			IDXGIDevice *dd = nullptr;
-			IDXGIAdapter *ra = nullptr;
-			if (SUCCEEDED(
-			        c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dd))) &&
-			    dd != nullptr) {
-				dd->GetAdapter(&ra);
-				dd->Release();
+		uint64_t render_packed_luid = 0;
+		IDXGIDevice *dd = nullptr;
+		IDXGIAdapter *ra = nullptr;
+		if (SUCCEEDED(c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dd))) &&
+		    dd != nullptr) {
+			dd->GetAdapter(&ra);
+			dd->Release();
+		}
+		if (ra != nullptr) {
+			DXGI_ADAPTER_DESC rdesc = {};
+			if (SUCCEEDED(ra->GetDesc(&rdesc))) {
+				memcpy(&render_packed_luid, &rdesc.AdapterLuid, sizeof(render_packed_luid));
 			}
-			if (ra != nullptr) {
-				render_ok = SUCCEEDED(ra->GetDesc(&rdesc));
-				ra->Release();
-			}
+			ra->Release();
 		}
 
-		DXGI_ADAPTER_DESC pdesc = {};
-		bool scanout_ok = false;
-		{
-			const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
-			const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
-			wil::com_ptr<IDXGIAdapter> panel = xrt::auxiliary::d3d::getScanoutAdapter(
-			    display_screen_left, display_screen_top, pw, ph, U_LOGGING_INFO);
-			scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
-		}
-
-		const WCHAR *rname = render_ok ? rdesc.Description : L"<unknown>";
-		const unsigned long rhi = (unsigned long)rdesc.AdapterLuid.HighPart;
-		const unsigned long rlo = (unsigned long)rdesc.AdapterLuid.LowPart;
-
-		if (!scanout_ok) {
-			// Say so — never guess. Without the scanout adapter there is no
-			// way to know whether this session crosses adapters at all.
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout=UNRESOLVED — cannot "
-			    "tell whether the weave crosses adapters (#918)",
-			    rname, rhi, rlo);
-		} else if (render_ok && pdesc.AdapterLuid.LowPart == rdesc.AdapterLuid.LowPart &&
-		           pdesc.AdapterLuid.HighPart == rdesc.AdapterLuid.HighPart) {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
-			    "LUID=%08lx:%08lx — render and scanout share one adapter; weave is local (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		} else if (c->split_active) {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
-			    "LUID=%08lx:%08lx — weave/present on the SCANOUT adapter (DXR_WEAVE_ON_SCANOUT "
-			    "split active) (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		} else {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' "
-			    "LUID=%08lx:%08lx — weave on the RENDER adapter; every present crosses adapters to "
-			    "reach scanout (set DXR_WEAVE_ON_SCANOUT=1 to move the weave) (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		}
+		const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph,
+		                        c->split_active, split_off_reason);
 	}
 
 	// Create output target (DXGI swapchain) — skip if offscreen (no HWND).
@@ -4317,6 +4302,33 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);
 			c->display_processor = nullptr;
+			/*
+			 * ADR-037 §3a GAP — NAMED, not silently absorbed.
+			 *
+			 * §3a says a weaver-creation failure on the scanout adapter is a
+			 * fallback trigger: retire the split and recreate the display
+			 * processor on the render adapter, where it demonstrably worked
+			 * before. The in-process D3D12 leg does exactly that
+			 * (`d3d12_split_retire`, #1164). This leg has no equivalent — the
+			 * target, its RTVs and the repaint loop were all built on the out
+			 * device several hundred lines above, and moving them back is a
+			 * retire function that does not exist yet.
+			 *
+			 * Weaving on the app device while presenting from the out device
+			 * would be a HALF-ENGAGED split, which is worse than either rung,
+			 * so it is not attempted. #918 Phase 3 makes the split the default
+			 * and therefore makes this reachable without an env flag, so it is
+			 * logged unmistakably rather than left to be inferred from a flat
+			 * panel. Kill switch: DXR_WEAVE_ON_SCANOUT=0.
+			 */
+			if (c->split_active) {
+				U_LOG_E(
+				    "#918/ADR-037 §3a: the display processor declined the SCANOUT device and this "
+				    "path has no split retire — the session continues WITHOUT a display processor "
+				    "(no weave). Re-run with DXR_WEAVE_ON_SCANOUT=0 to weave on the render "
+				    "adapter, and report this: split=1 reason=%s",
+				    COMP_SPLIT_REASON_DP_REFUSED_SCANOUT);
+			}
 		} else {
 			U_LOG_W("D3D11 display processor created via factory");
 			// Forward session-level transparency (#573 — chroma-key-free).
