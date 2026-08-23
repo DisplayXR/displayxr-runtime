@@ -20949,6 +20949,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                const struct xrt_weave_atlas_layout *layout,
                                uint32_t flat_rect_count,
                                const struct xrt_rect *flat_rects,
+                               uint32_t source_rect_count,
+                               const struct xrt_weave_source_rect *source_rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
@@ -20982,6 +20984,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	if (rect_count > 0 && rects == nullptr) {
 		return false;
+	}
+	// v10 (browser#143): source rects are strictly parallel to the batch rects.
+	// The wire is not trusted, so normalise once here and every later use is safe.
+	if (source_rects == nullptr || source_rect_count != rect_count) {
+		source_rect_count = 0;
+		source_rects = nullptr;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
@@ -21215,6 +21223,49 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	D3D11_TEXTURE2D_DESC idesc = {};
 	in_tex->GetDesc(&idesc);
+
+	/*
+	 * v10 (browser#143): the one source-rect rule that needs the input texture.
+	 *
+	 * Everything structural (parallel count, positive extents, non-negative
+	 * offsets, not-with-v6) was rejected as XR_ERROR_VALIDATION_FAILURE back in
+	 * oxr_weave.c. "Inside the input" can only be checked HERE, because only here
+	 * is the texture open and its size known — the caller-side layer holds a bare
+	 * shared handle.
+	 *
+	 * A violation REFUSES the whole submit rather than clamping the rect, skipping
+	 * the entry, or letting the sampler wrap: a source rect is an explicit caller
+	 * input, and silently weaving something other than what was asked for is how
+	 * an eye-inconsistency bug hides. Before AcquireSync on purpose, so there is no
+	 * keyed mutex to unwind. Refusal is the transient class (retried next frame),
+	 * so a persistent caller bug logs once per distinct offence instead of flooding.
+	 */
+	if (source_rects != nullptr) {
+		for (uint32_t i = 0; i < source_rect_count; i++) {
+			const struct xrt_rect *pair[2] = {&source_rects[i].left, &source_rects[i].right};
+			for (uint32_t e = 0; e < 2; e++) {
+				const int64_t sx = pair[e]->offset.w;
+				const int64_t sy = pair[e]->offset.h;
+				const int64_t sw = pair[e]->extent.w;
+				const int64_t sh = pair[e]->extent.h;
+				if (sx < 0 || sy < 0 || sw <= 0 || sh <= 0 || sx + sw > (int64_t)idesc.Width ||
+				    sy + sh > (int64_t)idesc.Height) {
+					static uint32_t s_last_i = 0xFFFFFFFFu;
+					static int64_t s_last_x = INT64_MIN;
+					if (s_last_i != i || s_last_x != sx) {
+						s_last_i = i;
+						s_last_x = sx;
+						U_LOG_E("#143 weave v10: source_rects[%u].%s = %lld,%lld %lldx%lld "
+						        "lies outside the %ux%u input texture — submit REFUSED "
+						        "(not clamped)",
+						        i, e == 0 ? "left" : "right", (long long)sx, (long long)sy,
+						        (long long)sw, (long long)sh, idesc.Width, idesc.Height);
+					}
+					return false;
+				}
+			}
+		}
+	}
 
 	// DIAGNOSTIC ONLY (browser#73). Armed by creating
 	// %TEMP%\dxr_weave_dump_trigger; consumed (deleted) by the first submit that
@@ -21604,6 +21655,13 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			for (uint32_t i = 0; i < rect_count; i++) {
 				U_LOG_W("#73 diag:   rect[%u] = %d,%d %dx%d", i, rects[i].offset.w,
 				        rects[i].offset.h, rects[i].extent.w, rects[i].extent.h);
+				if (source_rects != nullptr) {
+					U_LOG_W("#73 diag:     src[%u] L=%d,%d %dx%d R=%d,%d %dx%d", i,
+					        source_rects[i].left.offset.w, source_rects[i].left.offset.h,
+					        source_rects[i].left.extent.w, source_rects[i].left.extent.h,
+					        source_rects[i].right.offset.w, source_rects[i].right.offset.h,
+					        source_rects[i].right.extent.w, source_rects[i].right.extent.h);
+				}
 			}
 			dxr_diag_dump_tex(sys, in_tex, "dxr73_weave_input");
 		}
@@ -21618,13 +21676,29 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			if (rw <= 0.0f || rh <= 0.0f) {
 				continue;
 			}
-			// Left view: the rect's left half -> the left tile, at the
-			// rect's own window position, stretched to full rect width.
-			blit_to_atlas_texture(sys, &c->render, in_srv, rx, ry, rw / 2.0f, rh, src_tw, src_th,
+			// v10 (browser#143): WHERE we sample, decoupled from where we
+			// draw. Absent source rects the derivation is the pre-v10 one,
+			// expression for expression — the rect's own left/right halves
+			// at its own position in the window-sized input.
+			float lx = rx, ly = ry, lw = rw / 2.0f, lh = rh;
+			float sx2 = rx + rw / 2.0f, sy2 = ry, sw2 = rw / 2.0f, sh2 = rh;
+			if (source_rects != nullptr) {
+				lx = (float)source_rects[i].left.offset.w;
+				ly = (float)source_rects[i].left.offset.h;
+				lw = (float)source_rects[i].left.extent.w;
+				lh = (float)source_rects[i].left.extent.h;
+				sx2 = (float)source_rects[i].right.offset.w;
+				sy2 = (float)source_rects[i].right.offset.h;
+				sw2 = (float)source_rects[i].right.extent.w;
+				sh2 = (float)source_rects[i].right.extent.h;
+			}
+			// Left view -> the left tile, at the rect's own window position,
+			// stretched to full rect width.
+			blit_to_atlas_texture(sys, &c->render, in_srv, lx, ly, lw, lh, src_tw, src_th,
 			                      rx, ry, rw, rh, /*is_srgb*/ false, /*blend*/ nullptr,
 			                      c->render.weave_sbs_rtv.get(), (float)(win_w * 2), (float)win_h);
-			// Right view: the rect's right half -> the right tile.
-			blit_to_atlas_texture(sys, &c->render, in_srv, rx + rw / 2.0f, ry, rw / 2.0f, rh, src_tw,
+			// Right view -> the right tile.
+			blit_to_atlas_texture(sys, &c->render, in_srv, sx2, sy2, sw2, sh2, src_tw,
 			                      src_th, (float)win_w + rx, ry, rw, rh, /*is_srgb*/ false,
 			                      /*blend*/ nullptr, c->render.weave_sbs_rtv.get(),
 			                      (float)(win_w * 2), (float)win_h);

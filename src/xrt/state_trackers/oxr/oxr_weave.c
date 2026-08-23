@@ -98,6 +98,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t source_rect_count,
+                                        const struct xrt_weave_source_rect *source_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -399,6 +401,72 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		layout.content_view_h = lay->contentViewHeight;
 	}
 
+	// Spec v10 (browser#143): a chained XrWeaveSubmitSourceRectsDXR names, per
+	// batch entry, WHERE IN THE INPUT each eye samples — decoupled from where the
+	// entry draws. Without it the runtime derives the split from the destination
+	// rect (left half / right half), which is why a rect could be trimmed in rows
+	// but not in columns. Absent chain = byte-for-byte pre-v10.
+	//
+	// Everything checkable without the input texture is checked HERE, so a caller
+	// mistake is a clean XR_ERROR_VALIDATION_FAILURE. The one rule that needs the
+	// texture's dimensions — "inside the input" — is enforced in the service,
+	// where the texture is opened; see the struct doc.
+	uint32_t source_rect_count = 0;
+	struct xrt_weave_source_rect source_rects[XR_WEAVE_SUBMIT_MAX_RECTS_DXR];
+	const XrWeaveSubmitSourceRectsDXR *src = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_SOURCE_RECTS_DXR, XrWeaveSubmitSourceRectsDXR);
+	if (src != NULL && src->sourceCount > 0) {
+		if (rect_count == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitSourceRectsDXR requires a chained "
+			                 "XrWeaveSubmitRectsDXR (source rects redirect the BATCH layout's "
+			                 "per-entry unpack; there is none on the legacy single-rect path)");
+		}
+		if (layout.view_count > 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitSourceRectsDXR must not be combined with "
+			                 "XrWeaveSubmitLayoutDXR — the N-view path does no per-rect unpack, so "
+			                 "source rects would be silently ignored");
+		}
+		if (src->sourceCount != rect_count) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitSourceRectsDXR::sourceCount (%u) must "
+			                 "equal XrWeaveSubmitRectsDXR::rectCount (%u)",
+			                 src->sourceCount, rect_count);
+		}
+		OXR_VERIFY_ARG_NOT_NULL(&log, src->sources);
+		for (uint32_t i = 0; i < rect_count; i++) {
+			const XrRect2Di *pair[2] = {&src->sources[i].leftRect, &src->sources[i].rightRect};
+			for (uint32_t e = 0; e < 2; e++) {
+				if (pair[e]->extent.width <= 0 || pair[e]->extent.height <= 0) {
+					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+					                 "xrWeaveSubmitDXR: XrWeaveSubmitSourceRectsDXR::sources[%u]"
+					                 ".%s extent (%dx%d) must be positive",
+					                 i, e == 0 ? "leftRect" : "rightRect",
+					                 pair[e]->extent.width, pair[e]->extent.height);
+				}
+				if (pair[e]->offset.x < 0 || pair[e]->offset.y < 0) {
+					return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+					                 "xrWeaveSubmitDXR: XrWeaveSubmitSourceRectsDXR::sources[%u]"
+					                 ".%s offset (%d,%d) must be non-negative",
+					                 i, e == 0 ? "leftRect" : "rightRect", pair[e]->offset.x,
+					                 pair[e]->offset.y);
+				}
+			}
+			// xrt_offset names its fields w/h (see the @todo in xrt_defines.h);
+			// they are x/y here.
+			source_rects[i].left.offset.w = src->sources[i].leftRect.offset.x;
+			source_rects[i].left.offset.h = src->sources[i].leftRect.offset.y;
+			source_rects[i].left.extent.w = (int)src->sources[i].leftRect.extent.width;
+			source_rects[i].left.extent.h = (int)src->sources[i].leftRect.extent.height;
+			source_rects[i].right.offset.w = src->sources[i].rightRect.offset.x;
+			source_rects[i].right.offset.h = src->sources[i].rightRect.offset.y;
+			source_rects[i].right.extent.w = (int)src->sources[i].rightRect.extent.width;
+			source_rects[i].right.extent.h = (int)src->sources[i].rightRect.extent.height;
+		}
+		source_rect_count = rect_count;
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
@@ -410,7 +478,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 	    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-	    &have_out, &w, &h, &fence_value, &eyes);
+	    source_rect_count, source_rect_count > 0 ? source_rects : NULL, &have_out, &w, &h, &fence_value, &eyes);
 	// XRT_ERROR_WEAVE_REFUSED (the service said "not this frame") lands on the
 	// non-fatal branch; only a dead pipe loses the session. See the file header.
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);

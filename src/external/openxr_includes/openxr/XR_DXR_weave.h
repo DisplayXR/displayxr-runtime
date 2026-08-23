@@ -170,6 +170,48 @@
  * marking a working 3D region flat is a mono regression, marking a flat region 3D
  * is only the pre-v8 ghosting. Omitting both = byte-for-byte pre-v8.
  *
+ * Per-entry SOURCE rects (SPEC_VERSION 10, browser#143). Until v10 every
+ * submitted rect said only WHERE TO DRAW; WHERE TO SAMPLE was derived from it.
+ * On the batch (v3) path the runtime takes the rect's own left half as the left
+ * view and its right half as the right view, at the rect's own position in the
+ * window-sized input. That derivation makes the destination rect and the sample
+ * geometry the same object, with a consequence that is a hard constraint rather
+ * than an implementation detail:
+ *
+ *  - Trimming a rect in ROWS is safe — the horizontal midpoint does not move, so
+ *    each eye still samples its own half.
+ *  - Trimming a rect in COLUMNS is NOT — it moves the midpoint, so each eye
+ *    samples the wrong half and the two eyes disagree.
+ *
+ * So a present-owner that must withhold part of a tile (an occluding element on
+ * top of it) can only subtract whole row BANDS, and an occluder covering part of
+ * a tile's width costs the entire band — including the un-occluded pixels beside
+ * the occluder, which flatten to 2D for no reason.
+ *
+ * v10 breaks the coupling. Chain an XrWeaveSubmitSourceRectsDXR carrying one
+ * XrWeaveSourceRectDXR per submitted rect, each naming the LEFT-view and
+ * RIGHT-view source regions IN THE INPUT TEXTURE explicitly. The two are
+ * INDEPENDENT rects, not two halves of one region — that is the whole point.
+ * Under the v3 identity layout the two eye sources for a sub-rect of a tile are
+ * half a tile-width apart, so any "one rect split at its own midpoint" scheme
+ * would still be inexpressible without the caller re-packing its input; naming
+ * both regions costs the caller nothing but arithmetic and needs no repack.
+ *
+ * For a tile at window rect T (squeezed SBS at its own position, the v3 identity
+ * layout) and a piece P of it the caller wants woven:
+ *
+ *   leftRect  = { T.x + (P.x - T.x)/2,           P.y, P.width/2, P.height }
+ *   rightRect = { T.x + T.width/2 + (P.x-T.x)/2, P.y, P.width/2, P.height }
+ *   rects[i]  = P
+ *
+ * An L-shaped remainder is then two or three entries, each fully stereo, and
+ * only the genuinely occluded pixels are lost — which is what z-order means.
+ *
+ * Absent the chain the derivation is EXACTLY as before (leftRect = the
+ * destination rect's left half, rightRect = its right half, in the input at the
+ * destination's own position), so every pre-v10 caller is byte-for-byte
+ * unchanged. Source rects apply to the BATCH layout only; see the struct.
+ *
  * Version history: 1 = initial (pre-rename numbering carried over); 2 =
  * inputIsDxgi legacy-DXGI handle tagging; 3 = XrWeaveSubmitRectsDXR batched
  * submit; 4 = XrWeaveSubmitOverlaysDXR DP-composited 2D overlay atlas; 5 =
@@ -182,7 +224,10 @@
  * xrWeaveExportIpcConnectionDXR + XrWeaveIpcConnectionDXR, brokering a runtime
  * IPC endpoint to a sandboxed sibling process (browser#103), plus the §4b error
  * table (a dead connection now reports XR_ERROR_INSTANCE_LOST /
- * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE).
+ * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE); 10 =
+ * XrWeaveSubmitSourceRectsDXR per-entry source rects, decoupling where a batch
+ * entry SAMPLES from where it DRAWS so a rect can be trimmed in columns
+ * (browser#143).
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -195,7 +240,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 9
+#define XR_DXR_weave_SPEC_VERSION 10
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -216,6 +261,7 @@ extern "C" {
 // Reserved 1004999240..249 — a fresh decade for spec v9+ additions, because the
 // 190..199 block above is exhausted (199 is spoken for). Same registry.
 #define XR_TYPE_WEAVE_IPC_CONNECTION_DXR ((XrStructureType)1004999240)
+#define XR_TYPE_WEAVE_SUBMIT_SOURCE_RECTS_DXR ((XrStructureType)1004999241)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -350,6 +396,81 @@ typedef struct XrWeaveSubmitRectsDXR {
     uint32_t                 rectCount; //!< 1..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
     const XrRect2Di*         rects;     //!< window-relative sub-rects, device px (y-down)
 } XrWeaveSubmitRectsDXR;
+
+/*!
+ * @brief Where ONE batch entry SAMPLES its two views (spec v10, browser#143).
+ *
+ * Both rects are in the INPUT TEXTURE's own device pixels (y-down) — a different
+ * space from XrWeaveSubmitRectsDXR::rects, which are window-relative DESTINATION
+ * rects. Under the v3 batch layout the input is window-sized, so the two spaces
+ * happen to coincide numerically; they are still separate concepts and v10 exists
+ * precisely so a caller can move one without the other.
+ *
+ * @c leftRect and @c rightRect are INDEPENDENT. They are deliberately not "the
+ * two halves of one region": under the identity layout the left- and right-eye
+ * sources for a *sub-rect* of a tile sit half a TILE width apart, not half a
+ * sub-rect width apart, so a single-rect-plus-midpoint-split encoding could not
+ * express a column trim at all without the caller re-packing its input texture —
+ * and a caller that can re-pack never needed a source rect in the first place.
+ *
+ * Each is stretched to the entry's destination rect for its eye, exactly as the
+ * derived halves were: the horizontal 2x upscale the weaver would apply anyway is
+ * unchanged, so quality is unchanged. Nothing requires the two to be the same
+ * size, or either to be half the destination's width — the mapping is a plain
+ * stretch blit.
+ */
+typedef struct XrWeaveSourceRectDXR {
+    XrRect2Di leftRect;  //!< left-view source region in the input texture, device px (y-down)
+    XrRect2Di rightRect; //!< right-view source region in the input texture, device px (y-down)
+} XrWeaveSourceRectDXR;
+
+/*!
+ * @brief Per-entry SOURCE rects for a batched submit (spec v10, browser#143).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next ALONGSIDE XrWeaveSubmitRectsDXR. @c
+ * sources is parallel to XrWeaveSubmitRectsDXR::rects — entry i draws at
+ * rects[i] and samples at sources[i]. See the file header for the tile/piece
+ * arithmetic and why this is the durable fix for an occluded tile.
+ *
+ * RULES (all of them XR_ERROR_VALIDATION_FAILURE, never a crash and never a
+ * silent clamp — the v7 handle-kind precedent):
+ *
+ *  - @c sourceCount MUST equal XrWeaveSubmitRectsDXR::rectCount, and that struct
+ *    MUST be chained. This is the BATCH layout's feature: with no batch chain
+ *    there is no per-entry unpack to redirect.
+ *  - @c sources MUST be non-NULL when @c sourceCount is non-zero.
+ *  - Every rect's extent must be POSITIVE and its offset non-negative.
+ *  - Every rect must lie wholly INSIDE the input texture. The API layer cannot
+ *    see the texture's dimensions (it holds only a handle), so this one rule is
+ *    enforced where the texture is opened: a submit naming a source rect outside
+ *    the input is REFUSED whole (XR_ERROR_RUNTIME_FAILURE, the same non-fatal
+ *    class as an input-sync refusal, with the offending index logged) rather
+ *    than clamped, skipped or sampled out of bounds.
+ *  - MUST NOT be combined with XrWeaveSubmitLayoutDXR (spec v6). On that path the
+ *    caller packs its own N-view atlas and the runtime does no per-rect unpack,
+ *    so there is nothing to redirect; accepting the chain there would silently
+ *    ignore it, which for a geometry input (unlike v8's advisory flat regions) is
+ *    a wrong-pixels bug rather than a missed optimisation.
+ *
+ * @c sourceCount 0 (or omitting the struct) = derive from the destination, i.e.
+ * byte-for-byte pre-v10.
+ *
+ * CROSS-VERSION. A pre-v10 runtime does not know this structure type and SKIPS
+ * it in the chain — it would then weave the caller's column-trimmed rects with
+ * the old derived split, which is exactly the eye-inconsistent result v10 exists
+ * to remove, and it would do so silently. A caller that trims columns MUST
+ * therefore gate on the runtime's reported
+ * XrExtensionProperties::extensionVersion >= 10 (xrEnumerateInstanceExtension-
+ * Properties) and fall back to whole-row-band subtraction below that. The reverse
+ * direction is free: a v9 caller on a v10 runtime never chains the struct and is
+ * unchanged.
+ */
+typedef struct XrWeaveSubmitSourceRectsDXR {
+    XrStructureType             type;        //!< XR_TYPE_WEAVE_SUBMIT_SOURCE_RECTS_DXR
+    const void* XR_MAY_ALIAS    next;
+    uint32_t                    sourceCount; //!< MUST equal XrWeaveSubmitRectsDXR::rectCount (0 = no source rects)
+    const XrWeaveSourceRectDXR* sources;     //!< parallel to XrWeaveSubmitRectsDXR::rects
+} XrWeaveSubmitSourceRectsDXR;
 
 /*!
  * @brief N-view worst-case atlas input layout (spec v6, #774).

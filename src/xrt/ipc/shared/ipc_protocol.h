@@ -31,7 +31,16 @@
 
 
 #define IPC_CRED_SIZE 1    // auth not implemented
-#define IPC_BUF_SIZE 1024  // must be >= largest message length in bytes
+// must be >= largest message length in bytes.
+//
+// Raised 1024 -> 2048 for XR_DXR_weave spec v10 (browser#143): a batched submit
+// may now carry a per-entry SOURCE rect beside each of its 32 destination rects
+// (2 rects * 16 B * 32 entries = 1024 B), which no longer fits the old bound.
+// It is a buffer ceiling, not an ABI version: the client DLL and the service are
+// gated to the same u_git_tag at xrCreateInstance, so a mismatched pair never
+// connects. On Windows the value only sizes the named pipe's buffer HINTS and
+// the per-client read buffer; on POSIX it sizes the read buffer alone.
+#define IPC_BUF_SIZE 2048
 #define IPC_MAX_VIEWS 8    // max views we will return configs for
 #define IPC_MAX_FORMATS 32 // max formats our server-side compositor supports
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem
@@ -820,6 +829,20 @@ struct ipc_weave_rect
 };
 
 /*!
+ * XR_DXR_weave v10 (browser#143): where ONE batch entry SAMPLES its two views,
+ * in the INPUT TEXTURE's own pixels (y-down). Mirrors XrWeaveSourceRectDXR /
+ * @ref xrt_weave_source_rect. The two rects are independent — see the extension
+ * header for why "one rect split at its midpoint" cannot express a column trim.
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_source_rect
+{
+	struct ipc_weave_rect left;  //!< Left-view source region in the input texture
+	struct ipc_weave_rect right; //!< Right-view source region in the input texture
+};
+
+/*!
  * XR_DXR_weave over IPC (#625): per-frame weave_submit arguments. The pre-weave
  * input texture rides as an in_handle (xrt_graphics_buffer_handle_t); this POD
  * carries the window-relative output sub-rect(s). The interlace is DP-internal
@@ -892,6 +915,24 @@ struct ipc_arg_weave_submit
 	//! xrCreateInstance, so a mismatched pair never connects in the first place.
 	uint32_t flat_rect_count; //!< 0..IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX (0 = no flat regions)
 	struct ipc_weave_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX]; //!< first flat_rect_count valid
+
+	//! XR_DXR_weave v10 (browser#143): per-entry SOURCE rects, parallel to
+	//! @c rects. Entry i draws at rects[i] and SAMPLES at source_rects[i] —
+	//! two independent regions of the input texture, one per eye. Without them
+	//! the source is derived from the destination (left half / right half at the
+	//! destination's own position), which couples the eye split to the
+	//! destination geometry and makes a COLUMN trim eye-inconsistent.
+	//!
+	//! @c source_rect_count is 0 or exactly @c rect_count; 0 (a pre-v10 caller)
+	//! is byte-for-byte the previous behaviour. Only meaningful on the BATCH
+	//! layout — @c view_count must be 0 (validated in oxr_weave.c, re-checked
+	//! server-side because the wire is not trusted).
+	//!
+	//! APPENDED AT THE END, like the v8 block above, and size-accounted the same
+	//! way: 828 B through v8 + 4 (source_rect_count) + 1024 (32 * 32 B) = 1856 B
+	//! plus the 4 B command word = 1860, which is why IPC_BUF_SIZE moved to 2048.
+	uint32_t source_rect_count; //!< 0 = derive from the destination rects; else == rect_count
+	struct ipc_weave_source_rect source_rects[IPC_WEAVE_SUBMIT_RECTS_MAX]; //!< first source_rect_count valid
 };
 
 /*!

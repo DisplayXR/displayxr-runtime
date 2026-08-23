@@ -528,6 +528,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t source_rect_count,
+                                        const struct xrt_weave_source_rect *source_rects,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
@@ -545,6 +547,11 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX || (flat_rect_count > 0 && flat_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// v10 (browser#143): source rects are strictly parallel to the batch rects —
+	// either none at all, or exactly one per rect.
+	if (source_rect_count > 0 && (source_rect_count != rect_count || source_rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_have_output = false;
@@ -610,6 +617,21 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 		args.flat_rects[i].y = flat_rects[i].offset.h;
 		args.flat_rects[i].w = (uint32_t)flat_rects[i].extent.w;
 		args.flat_rects[i].h = (uint32_t)flat_rects[i].extent.h;
+	}
+
+	// v10 (browser#143): where each entry SAMPLES, decoupled from where it draws.
+	// count 0 — a pre-v10 caller — leaves the field zeroed and the service derives
+	// the source from the destination exactly as before.
+	args.source_rect_count = source_rect_count;
+	for (uint32_t i = 0; i < source_rect_count; i++) {
+		args.source_rects[i].left.x = source_rects[i].left.offset.w; // xrt_offset fields are named w/h
+		args.source_rects[i].left.y = source_rects[i].left.offset.h;
+		args.source_rects[i].left.w = (uint32_t)source_rects[i].left.extent.w;
+		args.source_rects[i].left.h = (uint32_t)source_rects[i].left.extent.h;
+		args.source_rects[i].right.x = source_rects[i].right.offset.w;
+		args.source_rects[i].right.y = source_rects[i].right.offset.h;
+		args.source_rects[i].right.w = (uint32_t)source_rects[i].right.extent.w;
+		args.source_rects[i].right.h = (uint32_t)source_rects[i].right.extent.h;
 	}
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};

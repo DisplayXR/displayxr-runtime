@@ -1106,6 +1106,17 @@ comp_d3d11_service_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
  * instead of holding the whole panel behind the lens. ADVISORY and HARDWARE-ONLY:
  * nothing here changes a woven pixel (ADR-027 D6 / ADR-030), and
  * @p flat_rect_count 0 with no latch is byte-for-byte the pre-v8 behaviour.
+ *
+ * v10 per-entry source rects (browser#143): @p source_rects is parallel to
+ * @p rects — entry i draws at rects[i] and SAMPLES at source_rects[i], two
+ * independent regions of the input texture (one per eye). It exists so a batch
+ * entry can be trimmed in COLUMNS: with the source derived from the destination
+ * the eye split moves with the rect, so trimming columns makes the two eyes
+ * disagree, and a present-owner had to withhold a tile's whole row band around an
+ * occluder. Only the BATCH layout (@p rect_count > 0, @p layout NULL) — the v6
+ * path does no per-rect unpack. NULL / count 0 derives the source from the
+ * destination exactly as before, byte-for-byte pre-v10. A source rect outside the
+ * input texture REFUSES the submit (never a clamp, never a skip).
  */
 bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
@@ -1125,6 +1136,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                const struct xrt_weave_atlas_layout *layout,
                                uint32_t flat_rect_count,
                                const struct xrt_rect *flat_rects,
+                               uint32_t source_rect_count,
+                               const struct xrt_weave_source_rect *source_rects,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,

@@ -42,7 +42,7 @@ Rules:
 | 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
 | 1004999220–229 | `XR_DXR_android_surface_binding` | 220 = `XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR` (#1037). The extension's `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR` keeps **1004999005** — one of the two unused gaps in the `XR_DXR_display_info` decade — because that value was already published in the (then unimplemented) sketch in `docs/specs/extensions/XR_DXR_display_info.md` §4 |
 | 1004999230–239 | `XR_DXR_result_codes` | Not an extension — runtime-wide `XrResult` values returned from core entry points, where no extension can have been enabled. 230 = `XR_ERROR_RUNTIME_VERSION_SKEW_DXR` (browser#103), an **error**-class result, so it appears in the header negated as `-1004999230` |
-| 1004999240–249 | `XR_DXR_weave` (v9+ additions) | 240 = `XR_TYPE_WEAVE_IPC_CONNECTION_DXR` (`xrWeaveExportIpcConnectionDXR`, spec v9, browser#103). A fresh decade because the original 190–199 block is exhausted (199 is reserved for the wish mask) |
+| 1004999240–249 | `XR_DXR_weave` (v9+ additions) | 240 = `XR_TYPE_WEAVE_IPC_CONNECTION_DXR` (`xrWeaveExportIpcConnectionDXR`, spec v9, browser#103); 241 = `XR_TYPE_WEAVE_SUBMIT_SOURCE_RECTS_DXR` (per-entry source rects, spec v10, browser#143). A fresh decade because the original 190–199 block is exhausted (199 is reserved for the wish mask) |
 | 1004999250+ | **next free** | |
 
 `XR_DXR_android_surface_binding` was implemented in #1037 and now has its own

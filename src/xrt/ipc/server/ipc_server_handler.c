@@ -6282,6 +6282,27 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		flat_rects[i].extent.h = (int)args->flat_rects[i].h;
 	}
 
+	// v10 (browser#143): per-entry SOURCE rects, parallel to rects[]. Structural
+	// validation (parallel count, positive extents, non-negative offsets) already
+	// ran in oxr_weave.c; re-checked here because the wire is not trusted. The
+	// "inside the input texture" rule lives one layer down, where the texture is
+	// opened.
+	if (args->source_rect_count > 0 &&
+	    (args->source_rect_count != args->rect_count || args->view_count > 0)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_weave_source_rect source_rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->source_rect_count; i++) {
+		source_rects[i].left.offset.w = args->source_rects[i].left.x; // xrt_offset fields are named w/h
+		source_rects[i].left.offset.h = args->source_rects[i].left.y;
+		source_rects[i].left.extent.w = (int)args->source_rects[i].left.w;
+		source_rects[i].left.extent.h = (int)args->source_rects[i].left.h;
+		source_rects[i].right.offset.w = args->source_rects[i].right.x;
+		source_rects[i].right.offset.h = args->source_rects[i].right.y;
+		source_rects[i].right.extent.w = (int)args->source_rects[i].right.w;
+		source_rects[i].right.extent.h = (int)args->source_rects[i].right.h;
+	}
+
 	// v4 overlay atlas (browser#18): when have_overlay is set the second
 	// in_handle is a window-sized premul-RGBA atlas the runtime composites over
 	// the weave. Decode its DXGI-vs-NT tag like the input handle. Per-overlay
@@ -6329,6 +6350,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    layout.view_count > 0 ? &layout : NULL,                 //
 	    args->flat_rect_count,                                  //
 	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
+	    args->source_rect_count,                                //
+	    args->source_rect_count > 0 ? source_rects : NULL,       //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		// TRANSIENT, and the distinction is load-bearing (browser#103): the
@@ -6416,6 +6439,29 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 		layout.content_view_h = args->content_view_h;
 	}
 
+	// v10 (browser#143): per-entry SOURCE rects, parallel to rects[]. Same
+	// contract as the Windows arm — the macOS / Android weave engines honour them
+	// in their own per-rect unpack blits.
+	if (args->source_rect_count > 0 && (args->source_rect_count != args->rect_count || args->view_count > 0)) {
+		xrt_graphics_buffer_handle_t reject = handles[0];
+		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
+		if (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+			u_graphics_buffer_unref(&overlay_handle); // nor the overlay ref
+		}
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_weave_source_rect source_rects[IPC_WEAVE_SUBMIT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->source_rect_count; i++) {
+		source_rects[i].left.offset.w = args->source_rects[i].left.x; // xrt_offset fields are named w/h
+		source_rects[i].left.offset.h = args->source_rects[i].left.y;
+		source_rects[i].left.extent.w = (int)args->source_rects[i].left.w;
+		source_rects[i].left.extent.h = (int)args->source_rects[i].left.h;
+		source_rects[i].right.offset.w = args->source_rects[i].right.x;
+		source_rects[i].right.offset.h = args->source_rects[i].right.y;
+		source_rects[i].right.extent.w = (int)args->source_rects[i].right.w;
+		source_rects[i].right.extent.h = (int)args->source_rects[i].right.h;
+	}
+
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
@@ -6427,6 +6473,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    layout.view_count > 0 ? &layout : NULL,                 //
 	    args->flat_rect_count,                                  //
 	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
+	    args->source_rect_count,                                //
+	    args->source_rect_count > 0 ? source_rects : NULL,       //
 	    &w, &h, &fv, &eyes);
 	if (!ok) {
 		// Transient engine refusal, not a dead pipe (browser#103).

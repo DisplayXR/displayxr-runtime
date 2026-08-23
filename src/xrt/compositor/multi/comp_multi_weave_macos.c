@@ -955,6 +955,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         const struct xrt_weave_atlas_layout *layout,
                         uint32_t flat_rect_count,
                         const struct xrt_rect *flat_rects,
+                        uint32_t source_rect_count,
+                        const struct xrt_weave_source_rect *source_rects,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
@@ -967,6 +969,15 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	// panel simply stays as 3D as it was pre-v8.
 	(void)flat_rect_count;
 	(void)flat_rects;
+
+	// v10 (browser#143): source rects are strictly parallel to the batch rects and
+	// only meaningful on the batch layout. Normalise the untrusted pair once so
+	// every later use is safe without re-checking.
+	if (source_rects == NULL || source_rect_count != rect_count || rect_count == 0 ||
+	    (layout != NULL && layout->view_count > 0)) {
+		source_rect_count = 0;
+		source_rects = NULL;
+	}
 
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || mc->msc == NULL || in_handle == NULL) {
@@ -1019,6 +1030,40 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				overlay = NULL; // ownership transferred
 				U_LOG_W("weave(#759) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
 				        mc->weave.overlay_h);
+			}
+		}
+
+		// v10 (browser#143): the one source-rect rule that needs the input.
+		// Everything structural was rejected as XR_ERROR_VALIDATION_FAILURE in
+		// oxr_weave.c; "inside the input" can only be checked once the input is
+		// imported and its size known. A violation REFUSES the whole submit —
+		// never a clamp, never a skipped entry: a source rect is an explicit
+		// caller input, and quietly weaving something else is how an
+		// eye-inconsistency bug hides. Before the command buffer is recorded, so
+		// the ordinary `break` failure exit is safe.
+		if (source_rects != NULL) {
+			bool src_ok = true;
+			for (uint32_t i = 0; i < source_rect_count && src_ok; i++) {
+				const struct xrt_rect *pair[2] = {&source_rects[i].left, &source_rects[i].right};
+				for (uint32_t e = 0; e < 2; e++) {
+					// xrt_offset names its fields w/h; they hold x/y here.
+					const int64_t sx = pair[e]->offset.w;
+					const int64_t sy = pair[e]->offset.h;
+					const int64_t sw = pair[e]->extent.w;
+					const int64_t sh = pair[e]->extent.h;
+					if (sx < 0 || sy < 0 || sw <= 0 || sh <= 0 ||
+					    sx + sw > (int64_t)mc->weave.in_w || sy + sh > (int64_t)mc->weave.in_h) {
+						U_LOG_E("#143 weave v10: source_rects[%u].%s = %lld,%lld %lldx%lld "
+						        "lies outside the %ux%u input — submit REFUSED (not clamped)",
+						        i, e == 0 ? "left" : "right", (long long)sx, (long long)sy,
+						        (long long)sw, (long long)sh, mc->weave.in_w, mc->weave.in_h);
+						src_ok = false;
+						break;
+					}
+				}
+			}
+			if (!src_ok) {
+				break;
 			}
 		}
 
@@ -1296,18 +1341,38 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				continue;
 			}
 
+			// v10 (browser#143): WHERE this entry samples, decoupled from
+			// where it draws. Absent source rects the derivation is the
+			// pre-v10 one, expression for expression (left = [rx, rx+half),
+			// right = [rx+half, rx+rw) at the rect's own position).
+			int32_t lx = rx, ly = ry, lw = half, lh = rh;
+			int32_t sx = rx + half, sy = ry, sw = rw - half, sh = rh;
+			if (source_rects != NULL) {
+				lx = source_rects[i].left.offset.w; // xrt_offset fields are named w/h
+				ly = source_rects[i].left.offset.h;
+				lw = source_rects[i].left.extent.w;
+				lh = source_rects[i].left.extent.h;
+				sx = source_rects[i].right.offset.w;
+				sy = source_rects[i].right.offset.h;
+				sw = source_rects[i].right.extent.w;
+				sh = source_rects[i].right.extent.h;
+				// Bounds were proved against the input BEFORE the record
+				// began (a violation refuses the whole submit there), so
+				// nothing here can sample outside it.
+			}
+
 			VkImageBlit blits[2] = {
-			    // Left eye: input rect's left half -> left tile, unsqueezed.
+			    // Left eye -> left tile, unsqueezed.
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
+			        .srcOffsets = {{lx, ly, 0}, {lx + lw, ly + lh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
 			    },
-			    // Right eye: input rect's right half -> right tile (+out_w).
+			    // Right eye -> right tile (+out_w).
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
+			        .srcOffsets = {{sx, sy, 0}, {sx + sw, sy + sh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
 			                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},

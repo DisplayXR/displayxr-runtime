@@ -86,6 +86,29 @@ struct xrt_weave_atlas_layout
 };
 
 /*!
+ * Per-entry SOURCE rects for an XR_DXR_weave batch submission (spec v10,
+ * browser#143).
+ *
+ * One of these accompanies each window-relative DESTINATION rect of a batched
+ * submit. Both members are regions of the caller's INPUT TEXTURE (device pixels,
+ * y-down) and are INDEPENDENT of each other — they are not two halves of one
+ * region. Each is stretched to the entry's destination rect for its eye, which
+ * is exactly what the derived halves did, so nothing about the weave geometry
+ * downstream changes.
+ *
+ * Absent (a NULL source-rect array) the runtime derives them from the
+ * destination rect exactly as it did before v10 — left = the rect's left half,
+ * right = its right half, at the rect's own position in the window-sized input.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_source_rect
+{
+	struct xrt_rect left;  //!< Left-view source region in the input texture
+	struct xrt_rect right; //!< Right-view source region in the input texture
+};
+
+/*!
  * Window metrics for adaptive FOV calculation and eye position adjustment.
  *
  * Contains display and window geometry needed to compute window-adaptive

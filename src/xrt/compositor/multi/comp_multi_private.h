@@ -1035,6 +1035,15 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
  * channel, which has no macOS / Android counterpart yet. Same shape as v7's
  * Windows-only handle kinds — the parameter exists so the wire and the call
  * signature stay one thing across platforms.
+ *
+ * @p source_rect_count / @p source_rects (spec v10, browser#143) are HONOURED
+ * here, unlike the flat regions above: they are geometry, not a hardware hint,
+ * and both engines run the same per-rect squeezed-SBS unpack the Windows batch
+ * path does. Entry i draws at rects[i] and samples at source_rects[i] — two
+ * independent input regions, one per eye — so a batch entry can be trimmed in
+ * COLUMNS without the two eyes disagreeing. NULL / count 0 derives the source
+ * from the destination exactly as before, byte-for-byte pre-v10. Only valid on
+ * the batch layout (@p layout NULL); a rect outside the input REFUSES the submit.
  */
 bool
 comp_multi_weave_submit(struct xrt_compositor *xc,
@@ -1050,6 +1059,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         const struct xrt_weave_atlas_layout *layout,
                         uint32_t flat_rect_count,
                         const struct xrt_rect *flat_rects,
+                        uint32_t source_rect_count,
+                        const struct xrt_weave_source_rect *source_rects,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
