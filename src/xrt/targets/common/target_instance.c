@@ -44,6 +44,8 @@
 #ifdef XRT_OS_WINDOWS
 // The one place that answers "which adapter scans out the 3D panel?" (#918).
 #include "d3d/d3d_scanout_helpers.h"
+// ...and its render-side sibling, "which adapter should render?" (ADR-037 §2).
+#include "d3d/d3d_render_adapter.h"
 #endif
 
 #include <assert.h>
@@ -79,6 +81,7 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
                                         uint32_t recommended_height,
                                         float refresh_rate_hz,
                                         uint64_t scanout_adapter_luid,
+                                        uint64_t render_adapter_luid,
                                         struct xrt_system_compositor **out_xsysc);
 
 
@@ -218,6 +221,48 @@ resolve_scanout_adapter_luid(const struct xrt_plugin_display_info *pdi)
 #endif
 }
 
+/*!
+ * ADR-037 §2 (#918): resolve the LUID of the adapter the runtime's capability
+ * ranking chose to RENDER on, so the Vulkan device selection down in aux_vk —
+ * which can see neither the display-processor plug-in nor DXGI — has something
+ * to rank against besides its own `device_type_priority()`.
+ *
+ * Same layering argument as @ref resolve_scanout_adapter_luid above, and the
+ * same one-WARN-then-fall-back failure policy: a machine we cannot read cannot
+ * be allowed to break device selection. Unlike the scanout resolve, this one
+ * runs unconditionally on Windows — it is policy, not an override, and the
+ * resolver memoizes its only expensive step so the cost is paid once.
+ *
+ * @param pdi The plug-in's display info, or NULL if it could not be obtained.
+ *        Only `DXR_D3D_FORCE_GPU=scanout` needs it; the ranking does not.
+ * @return the packed LUID, or 0 when not resolvable.
+ */
+static uint64_t
+resolve_render_adapter_luid(const struct xrt_plugin_display_info *pdi)
+{
+#ifdef XRT_OS_WINDOWS
+	uint64_t luid = 0;
+	const char *provenance = NULL;
+	int32_t left = pdi != NULL ? pdi->display_screen_left : 0;
+	int32_t top = pdi != NULL ? pdi->display_screen_top : 0;
+	uint32_t width = pdi != NULL ? pdi->display_pixel_width : 0;
+	uint32_t height = pdi != NULL ? pdi->display_pixel_height : 0;
+
+	if (!d3d_render_adapter_luid(left, top, width, height, &luid, &provenance) || luid == 0) {
+		U_LOG_W("ADR-037: could not resolve a render adapter — Vulkan keeps its device-type priority");
+		return 0;
+	}
+
+	U_LOG_W("ADR-037 render adapter for Vulkan selection: LUID=%08lx:%08lx (%s)", (unsigned long)(luid >> 32),
+	        (unsigned long)(luid & 0xffffffffu), provenance != NULL ? provenance : "unknown");
+	return luid;
+#else
+	// No DXGI, no LUIDs: aux_vk's own ranking is the only answer there is.
+	(void)pdi;
+	return 0;
+#endif
+}
+
 static xrt_result_t
 t_instance_create_system(struct xrt_instance *xinst,
                          struct xrt_system **out_xsys,
@@ -279,6 +324,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// unless the keyword is actually asked for, so the DXGI walk costs nothing
 	// in the normal case.
 	uint64_t scanout_adapter_luid = 0;
+	uint64_t render_adapter_luid = 0;
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
 		if (rr_plugin != NULL &&
@@ -291,11 +337,14 @@ t_instance_create_system(struct xrt_instance *xinst,
 					sr_refresh_rate_hz = (float)rr_pdi.refresh_mhz / 1000.0f;
 				}
 				scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
+				render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
 			} else {
 				resolve_scanout_adapter_luid(NULL);
+				render_adapter_luid = resolve_render_adapter_luid(NULL);
 			}
 		} else {
 			resolve_scanout_adapter_luid(NULL);
+			render_adapter_luid = resolve_render_adapter_luid(NULL);
 		}
 	}
 	U_LOG_W("Null-compositor frame pacing: %.2f Hz", (double)sr_refresh_rate_hz);
@@ -303,7 +352,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
 		xret = null_compositor_create_system_with_dims(head, 0, 0, sr_refresh_rate_hz, scanout_adapter_luid,
-		                                               &xsysc);
+		                                               render_adapter_luid, &xsysc);
 	}
 #else
 	if (use_null) {

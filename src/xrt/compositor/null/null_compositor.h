@@ -103,6 +103,15 @@ struct null_compositor
 		 * `DXR_VK_FORCE_GPU=scanout` consumes it. @see #918
 		 */
 		uint64_t scanout_adapter_luid;
+
+		/*!
+		 * Packed LUID of the adapter the runtime's ADR-037 §2 capability
+		 * ranking chose to render on, 0 if unknown. Supplied by the
+		 * caller (only the instance layer sees DXGI) and forwarded to
+		 * the Vulkan bundle, where it selects the physical device.
+		 * @see #918
+		 */
+		uint64_t render_adapter_luid;
 	} settings;
 
 	// Kept here for convenience.

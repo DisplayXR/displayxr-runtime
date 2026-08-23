@@ -396,9 +396,11 @@ comp_vulkan_init_bundle(struct vk_bundle *vk,
 		return false;
 	}
 
-	// Must be in place before device selection: env_forced_gpu_index() reads it
-	// when DXR_VK_FORCE_GPU=scanout (#918).
+	// Must be in place before device selection: env_forced_gpu_index() reads
+	// the scanout LUID when DXR_VK_FORCE_GPU=scanout, and select_physical_device
+	// reads the render LUID as its ranking (#918 / ADR-037 §2).
 	vk->scanout_adapter_luid = vk_args->scanout_adapter_luid;
+	vk->render_adapter_luid = vk_args->render_adapter_luid;
 
 	ret = create_device(vk, vk_args);
 	if (ret != VK_SUCCESS) {

@@ -65,6 +65,14 @@ struct comp_vulkan_arguments
 	 * Windows-only in practice. @see #918
 	 */
 	uint64_t scanout_adapter_luid;
+
+	/*!
+	 * Packed LUID of the adapter the runtime's ADR-037 §2 capability ranking
+	 * chose to render on, 0 if unknown. Resolved by the layer that owns DXGI
+	 * (aux_vk has none) and used to pick the matching `VkPhysicalDevice`.
+	 * Windows-only in practice. @see #918
+	 */
+	uint64_t render_adapter_luid;
 };
 
 /*!

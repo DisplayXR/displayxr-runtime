@@ -45,6 +45,11 @@ null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_composi
  *        panel, or 0 if unknown/not needed. Only the instance layer can resolve
  *        this (it owns the panel rect); it is forwarded to the Vulkan bundle,
  *        where `DXR_VK_FORCE_GPU=scanout` consumes it. @see #918
+ * @param render_adapter_luid Packed LUID of the adapter the runtime's ADR-037
+ *        §2 capability ranking chose to render on, or 0 if unknown. Same
+ *        reason it arrives from here: aux_vk can see neither DXGI nor the
+ *        plug-in. Forwarded to the Vulkan bundle, where it selects the
+ *        physical device. @see #918
  * @param out_xsysc Pointer to receive the created system compositor.
  *
  * @ingroup comp_null
@@ -55,6 +60,7 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
                                         uint32_t recommended_height,
                                         float refresh_rate_hz,
                                         uint64_t scanout_adapter_luid,
+                                        uint64_t render_adapter_luid,
                                         struct xrt_system_compositor **out_xsysc);
 
 

@@ -552,6 +552,48 @@ device_debug_print(struct vk_bundle *vk, const VkPhysicalDeviceProperties *pdp, 
 	vk_print_device_info(vk, U_LOGGING_DEBUG, pdp, index, title);
 }
 
+/*!
+ * Index of the physical device whose `VkPhysicalDeviceIDProperties::deviceLUID`
+ * matches @p packed_luid, or -1.
+ *
+ * LUID is the only identifier shared between the Windows adapter world (DXGI,
+ * `QueryDisplayConfig`) and Vulkan, so this is how the codebase matches an
+ * adapter across the two APIs; `deviceLUID` carries the raw 8 bytes of the
+ * Windows LUID, which is exactly the packing both `d3d_scanout_adapter_luid`
+ * and `d3d_render_adapter_luid` return.
+ *
+ * Needs `VK_KHR_external_memory_capabilities` (core in 1.1) for
+ * `vkGetPhysicalDeviceProperties2`; without it there is nothing to match on.
+ */
+static int
+device_index_by_luid(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count, uint64_t packed_luid)
+{
+	if (packed_luid == 0 || vk->vkGetPhysicalDeviceProperties2 == NULL) {
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < device_count; i++) {
+		VkPhysicalDeviceIDProperties pdidp = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+		};
+		VkPhysicalDeviceProperties2 pdp2 = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		    .pNext = &pdidp,
+		};
+		vk->vkGetPhysicalDeviceProperties2(devices[i], &pdp2);
+		if (pdidp.deviceLUIDValid != VK_TRUE) {
+			continue;
+		}
+		uint64_t packed = 0;
+		memcpy(&packed, pdidp.deviceLUID, sizeof(packed));
+		if (packed == packed_luid) {
+			return (int)i;
+		}
+	}
+
+	return -1;
+}
+
 /*
  * DXR_VK_FORCE_GPU: external override for the physical-device choice, needed
  * because device_type_priority() ranks DISCRETE above INTEGRATED
@@ -596,27 +638,13 @@ env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t d
 			VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: no vkGetPhysicalDeviceProperties2 — ignoring");
 			return -1;
 		}
-		for (uint32_t i = 0; i < device_count; i++) {
-			VkPhysicalDeviceIDProperties pdidp = {
-			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
-			};
-			VkPhysicalDeviceProperties2 pdp2 = {
-			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-			    .pNext = &pdidp,
-			};
-			vk->vkGetPhysicalDeviceProperties2(devices[i], &pdp2);
-			if (pdidp.deviceLUIDValid != VK_TRUE) {
-				continue;
-			}
-			uint64_t packed = 0;
-			memcpy(&packed, pdidp.deviceLUID, sizeof(packed));
-			if (packed == vk->scanout_adapter_luid) {
-				VK_WARN(vk,
-				        "DXR_VK_FORCE_GPU=scanout: selecting device %u (%s), the panel's "
-				        "scanout adapter",
-				        i, pdp2.properties.deviceName);
-				return (int)i;
-			}
+		int scanout_index = device_index_by_luid(vk, devices, device_count, vk->scanout_adapter_luid);
+		if (scanout_index >= 0) {
+			VkPhysicalDeviceProperties pdp;
+			vk->vkGetPhysicalDeviceProperties(devices[scanout_index], &pdp);
+			VK_WARN(vk, "DXR_VK_FORCE_GPU=scanout: selecting device %d (%s), the panel's scanout adapter",
+			        scanout_index, pdp.deviceName);
+			return scanout_index;
 		}
 		VK_WARN(vk,
 		        "DXR_VK_FORCE_GPU=scanout: no Vulkan device on the panel's scanout adapter — using "
@@ -727,6 +755,39 @@ select_physical_device(struct vk_bundle *vk, int forced_index)
 	} else {
 		VK_DEBUG(vk, "Available GPUs");
 		gpu_index = select_preferred_device(vk, physical_devices, gpu_count);
+
+		/*
+		 * ADR-037 §2 / #918: "most capable render adapter" is resolved by the
+		 * runtime's capability ranking (dedicated VRAM, then adapter type,
+		 * excluding software and sub-feature-level adapters), not by this
+		 * file's device_type_priority(), which ranks DISCRETE above INTEGRATED
+		 * unconditionally and cannot see VRAM, feature level or the software
+		 * flag at all.
+		 *
+		 * This supplies the CHOICE, never a bypass: the match runs over the
+		 * physical devices Vulkan already enumerated, so every requirement the
+		 * VK path imposes still holds. When the resolved adapter exposes no
+		 * Vulkan device — no ICD on it, or it never enumerated — the
+		 * type-priority answer stands untouched.
+		 *
+		 * Zero everywhere the layer above could not resolve one, which includes
+		 * every non-Windows platform, so this is a no-op off Windows.
+		 */
+		int ranked = device_index_by_luid(vk, physical_devices, gpu_count, vk->render_adapter_luid);
+		if (ranked >= 0 && (uint32_t)ranked != gpu_index) {
+			VkPhysicalDeviceProperties ranked_pdp;
+			vk->vkGetPhysicalDeviceProperties(physical_devices[ranked], &ranked_pdp);
+			VK_WARN(vk,
+			        "ADR-037 render adapter: selecting device %d (%s) over the device-type-priority "
+			        "pick %u",
+			        ranked, ranked_pdp.deviceName, gpu_index);
+			gpu_index = (uint32_t)ranked;
+		} else if (vk->render_adapter_luid != 0 && ranked < 0) {
+			VK_WARN(vk,
+			        "ADR-037 render adapter: no Vulkan device on the resolved render adapter — keeping "
+			        "the device-type-priority pick %u",
+			        gpu_index);
+		}
 	}
 
 	// Setup the physical device on the bundle.
