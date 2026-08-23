@@ -71,6 +71,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <ctype.h>
 
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
@@ -90,6 +91,9 @@
 #include <dwmapi.h>      // DwmFlush (late-weave pacing — no DXGI stats on GL)
 #pragma comment(lib, "dwmapi.lib")
 #include <d3dcompiler.h> // D3DCompile (inline blit shader for the DComp present path)
+// ADR-037 §2 render-adapter resolver — the shared one (#1161). The GL interop
+// devices consult it rather than growing a second placement rule (#1159).
+#include "d3d/d3d_render_adapter.hpp"
 // GUID for ID3D11Texture2D (needed for OpenSharedResource in C)
 static const IID IID_ID3D11Texture2D_local = {
     0x6f15aaf2, 0xd208, 0x4e89,
@@ -595,6 +599,16 @@ struct comp_gl_compositor
 	ID3D11Texture2D *dcomp_readback_tex; //!< DYNAMIC RGBA source uploaded each frame.
 	ID3D11ShaderResourceView *dcomp_readback_srv;
 	uint8_t *dcomp_readback_cpu;         //!< glReadPixels CPU target (w*h*4 bytes).
+
+	// --- Interop-device adapter placement (ADR-037 §5, #1159) ---
+	//! Panel origin in OS virtual-screen coordinates, kept so the ADR-037 §2
+	//! resolver can be called from anywhere in this file. Only
+	//! `DXR_D3D_FORCE_GPU=scanout` actually reads it.
+	int32_t panel_screen_left, panel_screen_top;
+	//! LUID of the adapter the compositor's GL context runs on, when the driver
+	//! reports one. See gl_query_context_luid().
+	LUID gl_context_luid;
+	bool gl_context_luid_valid;
 #endif
 };
 
@@ -603,6 +617,487 @@ gl_comp(struct xrt_compositor *xc)
 {
 	return (struct comp_gl_compositor *)xc;
 }
+
+
+#ifdef XRT_OS_WINDOWS
+/*
+ *
+ * Interop-device adapter placement (ADR-037 §5, #1159).
+ *
+ * This compositor creates D3D11 devices in two places — the transparency
+ * (DComp) present bridge and the device that opens the app's shared texture.
+ * Both used to pass a NULL adapter to D3D11CreateDevice, i.e. "whatever DXGI
+ * hands back first", which is a placement decision made by nobody: on a hybrid
+ * box that adapter need not be the one the GL context lives on, and a
+ * cross-adapter WGL_NV_DX_interop share is a per-frame copy through the OS.
+ *
+ * What GL can and cannot have. ADR-037 §5 puts OpenGL in the "OS, advisory" row
+ * for a hard reason: there is no GL analogue of `suggested_d3d_luid` or
+ * `select_physical_device`, so the runtime CANNOT place the GL context. The
+ * driver does, steered only by the per-exe `UserGpuPreferences` pin and the
+ * `NvOptimusEnablement` export. So the goal here is the reachable one: put the
+ * interop devices on *whatever adapter the GL context already landed on*, and
+ * say so in the log — including when we could not tell.
+ *
+ * How the GL context's adapter is determined, best evidence first:
+ *   1. `GL_EXT_memory_object_win32` → `glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT)`.
+ *      This is the driver reporting its own D3D LUID through a Khronos
+ *      extension; it is exact, not a guess. Present on current NVIDIA, Intel
+ *      and AMD Windows drivers.
+ *   2. `GL_VENDOR` → PCI vendor id, matched against the DXGI adapters. Only
+ *      trusted when it names exactly one adapter (the common iGPU+dGPU split is
+ *      two different vendors, so it usually does). Heuristic.
+ *   3. `GL_RENDERER` compared against the DXGI adapter descriptions, to
+ *      separate two adapters from the same vendor. Heuristic.
+ *   4. No evidence at all → the ADR-037 §2 resolver's answer. Deliberate and
+ *      logged as a fallback — still strictly better than NULL, because the
+ *      ranking and the `DXR_D3D_FORCE_GPU` override channel both apply.
+ *
+ */
+
+//! One resolved interop-device adapter, plus the reason it was chosen.
+struct gl_interop_adapter
+{
+	//! AddRef'd, or NULL when nothing could be resolved (caller passes NULL to
+	//! D3D11CreateDevice and keeps today's behaviour).
+	IDXGIAdapter *adapter;
+	LUID luid;
+	WCHAR description[128];
+	//! Short static string naming the rule that decided. Never NULL.
+	const char *provenance;
+	//! True only when the GL context's LUID is KNOWN and equals `luid`. False
+	//! also means "unknown" — never read it as "known to differ".
+	bool confirmed_same_as_gl;
+};
+
+/*!
+ * The LUID of the adapter the *current* GL context runs on, as reported by the
+ * driver via GL_EXT_memory_object_win32. Returns false when the extension is
+ * absent or the query errors — that is a legitimate outcome, not a failure.
+ */
+static bool
+gl_query_context_luid(LUID *out_luid)
+{
+	if (out_luid == NULL) {
+		return false;
+	}
+	if (!GLAD_GL_EXT_memory_object_win32 || glad_glGetUnsignedBytevEXT == NULL) {
+		return false;
+	}
+
+	// Drain any pre-existing error so the one we check below is ours. Bounded:
+	// with no current context glGetError() is not required to ever return
+	// GL_NO_ERROR, and this must not become a hang at session create.
+	for (int drain = 0; drain < 16 && glGetError() != GL_NO_ERROR; drain++) {
+	}
+
+	GLubyte bytes[GL_LUID_SIZE_EXT] = {0};
+	glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT, bytes);
+	if (glGetError() != GL_NO_ERROR) {
+		return false;
+	}
+
+	static_assert(sizeof(LUID) == GL_LUID_SIZE_EXT, "GL_DEVICE_LUID_EXT is not LUID-sized");
+	memcpy(out_luid, bytes, sizeof(LUID));
+	return true;
+}
+
+//! The PCI vendor id GL_VENDOR implies, or 0 when it names no adapter vendor.
+static UINT
+gl_vendor_id_from_gl_strings(void)
+{
+	const char *vendor = glGetString != NULL ? (const char *)glGetString(GL_VENDOR) : NULL;
+	if (vendor == NULL) {
+		return 0;
+	}
+	if (strstr(vendor, "NVIDIA") != NULL || strstr(vendor, "nvidia") != NULL) {
+		return 0x10DE;
+	}
+	if (strstr(vendor, "Intel") != NULL || strstr(vendor, "INTEL") != NULL) {
+		return 0x8086;
+	}
+	if (strstr(vendor, "AMD") != NULL || strstr(vendor, "ATI") != NULL ||
+	    strstr(vendor, "Advanced Micro") != NULL) {
+		return 0x1002;
+	}
+	return 0;
+}
+
+//! Case-insensitive "does GL_RENDERER mention this DXGI description?", ignoring
+//! the `(R)` / `(TM)` noise DXGI puts in descriptions and GL usually does not.
+static bool
+gl_renderer_mentions(const WCHAR *dxgi_description)
+{
+	const char *renderer = glGetString != NULL ? (const char *)glGetString(GL_RENDERER) : NULL;
+	if (renderer == NULL || dxgi_description == NULL) {
+		return false;
+	}
+
+	char needle[128] = {0};
+	size_t n = 0;
+	for (size_t i = 0; dxgi_description[i] != L'\0' && n + 1 < sizeof(needle); i++) {
+		WCHAR wc = dxgi_description[i];
+		// Drop the parens and anything non-ASCII (the (R) / (TM) marks DXGI
+		// carries and GL_RENDERER usually does not).
+		if (wc == L'(' || wc == L')' || wc > 0x7F) {
+			continue;
+		}
+		if (wc == L'R' && i > 0 && dxgi_description[i - 1] == L'(') {
+			continue;
+		}
+		needle[n++] = (char)tolower((unsigned char)wc);
+	}
+	if (n == 0) {
+		return false;
+	}
+
+	char hay[512] = {0};
+	size_t h = 0;
+	for (size_t i = 0; renderer[i] != '\0' && h + 1 < sizeof(hay); i++) {
+		char ch = renderer[i];
+		if (ch == '(' || ch == ')') {
+			continue;
+		}
+		if (ch == 'R' && i > 0 && renderer[i - 1] == '(') {
+			continue;
+		}
+		hay[h++] = (char)tolower((unsigned char)ch);
+	}
+
+	// Both sides normalise to "intel uhd graphics 770" / "nvidia geforce rtx
+	// 3080", so a plain substring test is enough — GL_RENDERER's extra tail
+	// ("/PCIe/SSE2") does not defeat it.
+	return strstr(hay, needle) != NULL;
+}
+
+/*!
+ * Resolve the adapter one of this compositor's D3D11 interop devices should be
+ * created on. @p purpose names the device in the log ("transparency present
+ * bridge", "shared-texture upload"). Never returns an adapter the caller must
+ * use: a NULL `adapter` means "no better answer than DXGI's default".
+ */
+static struct gl_interop_adapter
+gl_resolve_interop_adapter(struct comp_gl_compositor *c, const char *purpose)
+{
+	struct gl_interop_adapter out = {};
+	out.provenance = "unresolved";
+
+	IDXGIFactory1 *factory = NULL;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) || factory == NULL) {
+		U_LOG_W(
+		    "ADR-037 §5 GL interop device (%s): no DXGI factory — falling back to the DXGI "
+		    "default adapter (#1159)",
+		    purpose);
+		return out;
+	}
+
+	// Pass 1 — the driver's own answer. Exact when it is available.
+	if (c->gl_context_luid_valid) {
+		IDXGIAdapter1 *a = NULL;
+		for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d = {};
+			if (SUCCEEDED(a->GetDesc1(&d)) && d.AdapterLuid.HighPart == c->gl_context_luid.HighPart &&
+			    d.AdapterLuid.LowPart == c->gl_context_luid.LowPart) {
+				out.adapter = a; // keep the reference
+				out.luid = d.AdapterLuid;
+				wcsncpy_s(out.description, d.Description, _TRUNCATE);
+				out.provenance = "GL context LUID (GL_EXT_memory_object_win32)";
+				out.confirmed_same_as_gl = true;
+				factory->Release();
+				return out;
+			}
+			a->Release();
+		}
+	}
+
+	// Pass 2/3 — vendor id, then the renderer string to split a vendor tie.
+	const UINT want_vendor = gl_vendor_id_from_gl_strings();
+	if (want_vendor != 0) {
+		IDXGIAdapter1 *vendor_hit = NULL;
+		DXGI_ADAPTER_DESC1 vendor_desc = {};
+		int vendor_count = 0;
+		IDXGIAdapter1 *renderer_hit = NULL;
+		DXGI_ADAPTER_DESC1 renderer_desc = {};
+		int renderer_count = 0;
+
+		IDXGIAdapter1 *a = NULL;
+		for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d = {};
+			if (FAILED(a->GetDesc1(&d)) || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0 ||
+			    d.VendorId != want_vendor) {
+				a->Release();
+				continue;
+			}
+			vendor_count++;
+			if (vendor_hit == NULL) {
+				a->AddRef();
+				vendor_hit = a;
+				vendor_desc = d;
+			}
+			if (gl_renderer_mentions(d.Description)) {
+				renderer_count++;
+				if (renderer_hit == NULL) {
+					a->AddRef();
+					renderer_hit = a;
+					renderer_desc = d;
+				}
+			}
+			a->Release();
+		}
+
+		// A renderer-string match is only trusted when it is unambiguous, and so
+		// is the vendor match. Two same-vendor adapters that GL_RENDERER cannot
+		// separate is exactly the case where guessing would be worse than saying
+		// "unknown" and taking the §2 answer.
+		if (renderer_count == 1) {
+			out.adapter = renderer_hit;
+			out.luid = renderer_desc.AdapterLuid;
+			wcsncpy_s(out.description, renderer_desc.Description, _TRUNCATE);
+			out.provenance = "GL_RENDERER description match (heuristic)";
+			if (vendor_hit != NULL) {
+				vendor_hit->Release();
+			}
+			factory->Release();
+			return out;
+		}
+		if (renderer_hit != NULL) {
+			renderer_hit->Release();
+		}
+		if (vendor_count == 1) {
+			out.adapter = vendor_hit;
+			out.luid = vendor_desc.AdapterLuid;
+			wcsncpy_s(out.description, vendor_desc.Description, _TRUNCATE);
+			out.provenance = "GL_VENDOR PCI vendor-id match (heuristic)";
+			factory->Release();
+			return out;
+		}
+		if (vendor_hit != NULL) {
+			vendor_hit->Release();
+		}
+	}
+
+	factory->Release();
+
+	/*
+	 * Pass 4 — no GL evidence. Take the ADR-037 §2 answer rather than NULL.
+	 * It is not "the GL adapter"; it is a deliberate, ranked, overridable
+	 * choice instead of DXGI enumeration order, and the log says which it is.
+	 */
+	const uint32_t panel_w =
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? (uint32_t)c->xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t panel_h =
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? (uint32_t)c->xdev->hmd->screens[0].h_pixels : 0;
+	xrt::auxiliary::d3d::RenderAdapterChoice choice = xrt::auxiliary::d3d::getRenderAdapter(
+	    c->panel_screen_left, c->panel_screen_top, panel_w, panel_h, D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
+	if (choice.adapter != nullptr) {
+		DXGI_ADAPTER_DESC d = {};
+		if (SUCCEEDED(choice.adapter->GetDesc(&d))) {
+			out.adapter = choice.adapter.detach();
+			out.luid = d.AdapterLuid;
+			wcsncpy_s(out.description, d.Description, _TRUNCATE);
+			out.provenance = choice.from_env ? "ADR-037 §2 fallback, env-forced (GL adapter unknown)"
+			                                 : "ADR-037 §2 fallback (GL adapter unknown)";
+		}
+	}
+	return out;
+}
+
+/*!
+ * Log which adapter an interop device actually landed on, with LUID and
+ * provenance (the rule PR #1023 established), and shout when it is not the GL
+ * context's adapter. A cross-adapter WGL_NV_DX_interop share is a real
+ * performance cliff, and before #1159 it was completely invisible.
+ */
+static void
+gl_log_interop_placement(struct comp_gl_compositor *c, const char *purpose, const struct gl_interop_adapter *chosen)
+{
+	if (chosen->adapter == NULL) {
+		U_LOG_W(
+		    "ADR-037 §5 GL interop device (%s): adapter UNRESOLVED — created on the DXGI default "
+		    "(#1159)",
+		    purpose);
+		return;
+	}
+
+	U_LOG_W("ADR-037 §5 GL interop device (%s): '%ls' LUID=%08lx:%08lx (%s) (#1159)", purpose, chosen->description,
+	        (unsigned long)chosen->luid.HighPart, (unsigned long)chosen->luid.LowPart, chosen->provenance);
+
+	if (c->gl_context_luid_valid && !chosen->confirmed_same_as_gl) {
+		U_LOG_W(
+		    "ADR-037 §5: GL interop device (%s) is on LUID=%08lx:%08lx but the GL context runs on "
+		    "LUID=%08lx:%08lx — CROSS-ADAPTER interop; every share/copy crosses the bus, every frame "
+		    "(#1159)",
+		    purpose, (unsigned long)chosen->luid.HighPart, (unsigned long)chosen->luid.LowPart,
+		    (unsigned long)c->gl_context_luid.HighPart, (unsigned long)c->gl_context_luid.LowPart);
+	}
+}
+
+/*!
+ * Once per GL session: what the GL context landed on, what ADR-037 §2 would
+ * have picked, and the standing limitation that the runtime cannot make those
+ * two agree. Without this line a GL session's placement reads like an
+ * unexplained fallback instead of a documented one (ADR-037 §5).
+ */
+static void
+gl_log_placement_advisory_once(struct comp_gl_compositor *c, int32_t screen_left, int32_t screen_top)
+{
+	c->panel_screen_left = screen_left;
+	c->panel_screen_top = screen_top;
+	c->gl_context_luid_valid = gl_query_context_luid(&c->gl_context_luid);
+
+	const uint32_t panel_w =
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? (uint32_t)c->xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t panel_h =
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? (uint32_t)c->xdev->hmd->screens[0].h_pixels : 0;
+	xrt::auxiliary::d3d::RenderAdapterChoice render = xrt::auxiliary::d3d::getRenderAdapter(
+	    screen_left, screen_top, panel_w, panel_h, D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
+
+	DXGI_ADAPTER_DESC rdesc = {};
+	bool have_render = render.adapter != nullptr && SUCCEEDED(render.adapter->GetDesc(&rdesc));
+
+	if (c->gl_context_luid_valid) {
+		const bool same = have_render && rdesc.AdapterLuid.HighPart == c->gl_context_luid.HighPart &&
+		                  rdesc.AdapterLuid.LowPart == c->gl_context_luid.LowPart;
+		U_LOG_W(
+		    "ADR-037 §5 GL placement is OS-ADVISORY: OpenGL exposes no adapter-selection API, so the "
+		    "driver (+ the per-exe UserGpuPreferences pin) decides. GL context is on LUID=%08lx:%08lx "
+		    "(%s); ADR-037 §2 would pick '%ls' LUID=%08lx:%08lx (%s) — %s. The runtime follows the GL "
+		    "context with its interop devices; it cannot move the context. (#1159)",
+		    (unsigned long)c->gl_context_luid.HighPart, (unsigned long)c->gl_context_luid.LowPart,
+		    glGetString != NULL ? (const char *)glGetString(GL_RENDERER) : "unknown renderer",
+		    have_render ? rdesc.Description : L"<unavailable>",
+		    have_render ? (unsigned long)rdesc.AdapterLuid.HighPart : 0UL,
+		    have_render ? (unsigned long)rdesc.AdapterLuid.LowPart : 0UL,
+		    have_render ? render.provenance : "unresolved",
+		    same ? "MATCH" : (have_render ? "DIVERGES" : "unverified"));
+	} else {
+		U_LOG_W(
+		    "ADR-037 §5 GL placement is OS-ADVISORY: OpenGL exposes no adapter-selection API, so the "
+		    "driver (+ the per-exe UserGpuPreferences pin) decides. This driver does not report "
+		    "GL_DEVICE_LUID_EXT (no GL_EXT_memory_object_win32), so the GL context's adapter is NOT "
+		    "reliably knowable here — interop devices fall back to the GL_VENDOR/GL_RENDERER match, "
+		    "then to ADR-037 §2 ('%ls', %s). Renderer: %s. (#1159)",
+		    have_render ? rdesc.Description : L"<unavailable>", have_render ? render.provenance : "unresolved",
+		    glGetString != NULL ? (const char *)glGetString(GL_RENDERER) : "unknown renderer");
+	}
+}
+
+//! One (create device on `adapter`, open the app's shared texture) attempt.
+//! Leaves nothing behind on failure.
+static bool
+gl_try_shared_texture_device(struct comp_gl_compositor *c, IDXGIAdapter *adapter, void *shared_texture_handle)
+{
+	ID3D11Device *dev = NULL;
+	ID3D11DeviceContext *ctx = NULL;
+	HRESULT hr = D3D11CreateDevice(adapter, adapter != NULL ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+	                               NULL, 0, NULL, 0, D3D11_SDK_VERSION, &dev, NULL, &ctx);
+	if (FAILED(hr) || dev == NULL) {
+		if (ctx != NULL) {
+			ctx->Release();
+		}
+		if (dev != NULL) {
+			dev->Release();
+		}
+		return false;
+	}
+
+	ID3D11Texture2D *tex = NULL;
+	hr = dev->OpenSharedResource((HANDLE)shared_texture_handle, __uuidof(ID3D11Texture2D), (void **)&tex);
+	if (FAILED(hr) || tex == NULL) {
+		ctx->Release();
+		dev->Release();
+		return false;
+	}
+
+	c->dx_device = dev;
+	c->dx_context = ctx;
+	c->dx_shared_texture = tex;
+	return true;
+}
+
+/*!
+ * Create the D3D11 device that opens and uploads the app's shared texture, on a
+ * deliberately chosen adapter (#1159), and open the texture with it.
+ *
+ * `OpenSharedResource` is itself the placement oracle here: a D3D11 shared
+ * handle can only be opened by a device on the **same adapter as the device
+ * that created it**. So "the right adapter" for this device is not a
+ * preference, it is a hard requirement set by the app — and success is proof.
+ * The preferred adapter (the GL context's, per gl_resolve_interop_adapter) is
+ * tried first because that is the one the rest of the compositor works on;
+ * every other hardware adapter is then tried in turn, so a mismatch degrades to
+ * a loud cross-adapter warning instead of a dead session. Before #1159 this was
+ * a single NULL-adapter attempt: right by luck, or fatal.
+ */
+static bool
+gl_create_shared_texture_device(struct comp_gl_compositor *c, void *shared_texture_handle)
+{
+	struct gl_interop_adapter placed = gl_resolve_interop_adapter(c, "shared-texture upload");
+	gl_log_interop_placement(c, "shared-texture upload", &placed);
+
+	bool tried_placed = false;
+	if (placed.adapter != NULL) {
+		bool ok = gl_try_shared_texture_device(c, placed.adapter, shared_texture_handle);
+		placed.adapter->Release();
+		placed.adapter = NULL;
+		tried_placed = true;
+		if (ok) {
+			return true;
+		}
+		U_LOG_W(
+		    "GL shared texture: could not be opened on the resolved adapter '%ls' LUID=%08lx:%08lx — "
+		    "the app created it on a DIFFERENT adapter; searching (#1159)",
+		    placed.description, (unsigned long)placed.luid.HighPart, (unsigned long)placed.luid.LowPart);
+	}
+
+	IDXGIFactory1 *factory = NULL;
+	if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) && factory != NULL) {
+		IDXGIAdapter1 *a = NULL;
+		for (UINT i = 0; factory->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+			DXGI_ADAPTER_DESC1 d = {};
+			if (FAILED(a->GetDesc1(&d)) || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+				a->Release();
+				continue;
+			}
+			if (tried_placed && d.AdapterLuid.HighPart == placed.luid.HighPart &&
+			    d.AdapterLuid.LowPart == placed.luid.LowPart) {
+				a->Release(); // already tried above
+				continue;
+			}
+			bool ok = gl_try_shared_texture_device(c, a, shared_texture_handle);
+			a->Release();
+			if (ok) {
+				factory->Release();
+				/*
+				 * Loud on purpose. The upload itself still works (it goes
+				 * through system memory), but the app's present surface and
+				 * the GL context are on different GPUs, so the frame crosses
+				 * the bus once more than it should — and that is a placement
+				 * fact about the app, not about us.
+				 */
+				U_LOG_W(
+				    "ADR-037 §5: GL shared-texture device landed on '%ls' LUID=%08lx:%08lx, "
+				    "which is NOT the GL context's adapter — CROSS-ADAPTER handoff; the app "
+				    "created its present surface on another GPU (#1159)",
+				    d.Description, (unsigned long)d.AdapterLuid.HighPart,
+				    (unsigned long)d.AdapterLuid.LowPart);
+				return true;
+			}
+		}
+		factory->Release();
+	}
+
+	// Last resort: exactly the pre-#1159 call, so nothing that used to work stops.
+	if (gl_try_shared_texture_device(c, NULL, shared_texture_handle)) {
+		U_LOG_W(
+		    "GL shared texture: opened on the DXGI default adapter after the resolved and enumerated "
+		    "adapters all failed (#1159)");
+		return true;
+	}
+
+	return false;
+}
+#endif // XRT_OS_WINDOWS
 
 
 /*
@@ -709,10 +1204,23 @@ gl_destroy_dcomp_present(struct comp_gl_compositor *c)
 static bool
 gl_setup_dcomp_common(struct comp_gl_compositor *c, HWND hwnd, uint32_t w, uint32_t h)
 {
-	// 1. Dedicated D3D11 device for the present bridge.
-	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
-	                               D3D11_SDK_VERSION, &c->dcomp_dx_device, NULL,
-	                               &c->dcomp_dx_context);
+	// 1. Dedicated D3D11 device for the present bridge, on a DELIBERATELY chosen
+	//    adapter (#1159). This device is handed to wglDXOpenDeviceNV by the
+	//    interop path, so it has to be the GL context's adapter or the share is
+	//    cross-adapter — and on the readback fallback it is the device that
+	//    receives every uploaded frame. Passing NULL here used to let DXGI
+	//    enumeration order decide. An unresolved adapter (NULL) still works:
+	//    that is exactly today's behaviour, and it is logged as such.
+	struct gl_interop_adapter placed = gl_resolve_interop_adapter(c, "transparency present bridge");
+	gl_log_interop_placement(c, "transparency present bridge", &placed);
+	// D3D_DRIVER_TYPE_UNKNOWN is mandatory when an adapter is supplied.
+	HRESULT hr = D3D11CreateDevice(
+	    placed.adapter, placed.adapter != NULL ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL,
+	    0, D3D11_SDK_VERSION, &c->dcomp_dx_device, NULL, &c->dcomp_dx_context);
+	if (placed.adapter != NULL) {
+		placed.adapter->Release();
+		placed.adapter = NULL;
+	}
 	if (FAILED(hr) || c->dcomp_dx_device == NULL) {
 		U_LOG_W("Transparent GL: D3D11CreateDevice failed: 0x%08x — staying opaque", (unsigned)hr);
 		gl_destroy_dcomp_present(c);
@@ -4629,6 +5137,13 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 	         GLAD_VERSION_MAJOR(gl_result), GLAD_VERSION_MINOR(gl_result),
 	         glGetString ? (const char *)glGetString(GL_RENDERER) : "unknown");
 
+	// #1159: latch the GL context's adapter (when the driver reports it) and
+	// state, once per session, that GL placement is OS-advisory (ADR-037 §5).
+	// Must be here: the context is current and GLAD is loaded, and it runs for
+	// EVERY GL session, including ones that create no interop device at all —
+	// the limitation is a property of the session, not of the bridge.
+	gl_log_placement_advisory_once(c, screen_left, screen_top);
+
 	return true;
 }
 #endif // XRT_OS_WINDOWS
@@ -5202,34 +5717,6 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		height = xdev->hmd->screens[0].h_pixels;
 	}
 
-#ifdef XRT_OS_WINDOWS
-	/*
-	 * #918 Phase 3 / ADR-037 §3 — THE OPENGL ANSWER, STATED.
-	 *
-	 * There is no output-device split for OpenGL, and per ADR-037 §5 there
-	 * cannot be one on the runtime's terms: OpenGL exposes **no adapter
-	 * identity and no device-selection API**, so the runtime can neither learn
-	 * which adapter WGL picked nor ask for a different one — the per-exe
-	 * `UserGpuPreferences` entry is the only lever, and it is the OS's, advisory.
-	 *
-	 * So this path takes rung 2 unconditionally, and says so with the same one
-	 * line every other compositor emits. `render=UNKNOWN` is the literal truth
-	 * here, not a lookup that failed: a guessed render adapter would be worse
-	 * than an admitted unknown, and the interop D3D11 device that appears later
-	 * in this function is a present-path detail, not the GL renderer's adapter.
-	 *
-	 * There is no half-engaged state to reach: nothing in this compositor
-	 * consults a scanout adapter or creates a second device for the weave.
-	 */
-	{
-		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
-		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
-		d3d_log_weave_placement(/* render_packed_luid, unknowable for GL */ 0, display_screen_left,
-		                        display_screen_top, pw, ph, /* split_active */ false,
-		                        COMP_SPLIT_REASON_API_UNSUPPORTED);
-	}
-#endif
-
 	// Save caller's GL context so we can restore after init
 #ifdef XRT_OS_WINDOWS
 	HDC caller_hdc = wglGetCurrentDC();
@@ -5246,6 +5733,39 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_OPENGL;
 	}
 
+	/*
+	 * #918 Phase 3 / ADR-037 §3 — THE OPENGL ANSWER, STATED.
+	 *
+	 * There is no output-device split for OpenGL, and per ADR-037 §5 there
+	 * cannot be one on the runtime's terms: OpenGL exposes **no device-selection
+	 * API**, so the runtime cannot ask WGL for a different adapter — the per-exe
+	 * `UserGpuPreferences` entry is the only lever, and it is the OS's, advisory.
+	 *
+	 * It CAN, however, usually learn which adapter WGL picked, which is what
+	 * #1159 corrected: `GL_EXT_memory_object_win32` has the driver report its own
+	 * D3D LUID via `glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT)`. So `render=` is
+	 * the real GL adapter whenever the driver answers, and only falls back to
+	 * `UNKNOWN` when it does not — an admitted unknown, never a guess. (This is
+	 * why the call moved below gl_create_window_and_context: the query needs a
+	 * current context and a loaded GLAD.)
+	 *
+	 * Either way the split stays disengaged — knowing the adapter is not being
+	 * able to choose one — so this path takes rung 2 unconditionally and says so
+	 * with the same one line every other compositor emits. There is no
+	 * half-engaged state to reach: nothing in this compositor consults a scanout
+	 * adapter or creates a second device for the weave.
+	 */
+	{
+		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		uint64_t gl_packed_luid = 0;
+		if (c->gl_context_luid_valid) {
+			memcpy(&gl_packed_luid, &c->gl_context_luid, sizeof(gl_packed_luid));
+		}
+		d3d_log_weave_placement(gl_packed_luid, display_screen_left, display_screen_top, pw, ph,
+		                        /* split_active */ false, COMP_SPLIT_REASON_API_UNSUPPORTED);
+	}
+
 	// Set up the GL→D3D shared-texture present path if a handle was provided.
 	// NOTE: this does NOT use WGL_NV_DX_interop2 to weave directly into the
 	// shared surface. GL interop write-BACK into the app's shared D3D texture
@@ -5255,25 +5775,14 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	// shared surface with glReadPixels → UpdateSubresource (gl_shared_readback_upload),
 	// mirroring the runtime's no-interop DComp readback present path.
 	if (shared_texture_handle != NULL) {
-		// D3D11 device used only to open + upload the app's shared texture.
-		HRESULT hr = D3D11CreateDevice(
-		    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-		    NULL, 0, D3D11_SDK_VERSION,
-		    &c->dx_device, NULL, &c->dx_context);
-		if (FAILED(hr)) {
-			U_LOG_E("Failed to create D3D11 device for GL shared texture: 0x%08x", hr);
-			free(c);
-			return XRT_ERROR_OPENGL;
-		}
-
-		// Open the app's shared D3D11 texture (its present surface).
-		hr = c->dx_device->OpenSharedResource(
-		    (HANDLE)shared_texture_handle,
-		    __uuidof(ID3D11Texture2D), (void **)&c->dx_shared_texture);
-		if (FAILED(hr)) {
-			U_LOG_E("Failed to open shared D3D11 texture: 0x%08x", hr);
-			c->dx_context->Release();
-			c->dx_device->Release();
+		// D3D11 device used only to open + upload the app's shared texture, on
+		// a deliberately resolved adapter rather than DXGI's default (#1159).
+		// Opening the shared resource is the placement oracle — see the comment
+		// on gl_create_shared_texture_device().
+		if (!gl_create_shared_texture_device(c, shared_texture_handle)) {
+			U_LOG_E(
+			    "Failed to create a D3D11 device that can open the GL shared texture on ANY "
+			    "adapter");
 			free(c);
 			return XRT_ERROR_OPENGL;
 		}
