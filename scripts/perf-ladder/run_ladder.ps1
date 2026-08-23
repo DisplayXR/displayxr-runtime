@@ -238,20 +238,72 @@ function Invoke-ArmSample {
 # --- Main loop: interleaved reps --------------------------------------------
 $armList = @($cfg.arms)
 if ($Arms.Count -gt 0) { $armList = @($cfg.arms | Where-Object { $Arms -contains $_.name }) }
+# Per-exe GPU preference preflight. Engines that create their graphics device
+# BEFORE consulting the runtime (Unity) pick their own adapter, and a
+# DXR_*_FORCE_GPU=scanout mismatch then kills the session - the app silently
+# falls back to a 2D window while the ladder keeps emitting plausible rows
+# (measured twice: Suki's Arc, and this box when the pin FLIPPED 1 -> 2 between
+# runs). The pin lives in HKCU, so the harness can just assert it.
+if ($cfg.PSObject.Properties['gpuPreference'] -ne $null -and $needApp) {
+    $want = [string]$cfg.gpuPreference     # "1" = integrated, "2" = high-performance
+    $gpuKey = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
+    if (-not (Test-Path $gpuKey)) { New-Item -Path $gpuKey -Force | Out-Null }
+    $wantVal = 'GpuPreference=' + $want + ';'
+    $cur = $null
+    try { $cur = (Get-ItemProperty -Path $gpuKey -Name $appExe -ErrorAction Stop).$appExe } catch { }
+    if ($cur -ne $wantVal) {
+        Set-ItemProperty -Path $gpuKey -Name $appExe -Value $wantVal
+        Log ("PREFLIGHT: GPU preference pin set to '" + $wantVal + "' for " + (Split-Path $appExe -Leaf) +
+             " (was '" + $(if ($cur) { $cur } else { '<unset>' }) + "')")
+    } else {
+        Log ("PREFLIGHT: GPU preference pin already '" + $wantVal + "'")
+    }
+}
+
 Log ('Ladder start: ' + $armList.Count + ' arms x ' + $reps + ' reps, window ' + $windowSec + ' s, warmup ' + $warmupSec + ' s')
 
+$script:firstAppArmSeen = $false
+$script:aborted = $false
 for ($rep = 1; $rep -le $reps; $rep++) {
+    if ($script:aborted) { break }
     foreach ($arm in $armList) {
         Log ('arm ' + $arm.name + ' rep ' + $rep)
         try {
             $r = Invoke-ArmSample -arm $arm -rep $rep
             if (-not $r.ok) { Log ('  FAILED: ' + ($r.flags -join ';')) }
+            # Fail fast: if the FIRST app arm produced no witness lines the app
+            # never formed a session (silent 2D fallback / no-DP / wrong
+            # runtime). Every later arm would be garbage too, so stop now with
+            # something actionable instead of burning the full run - measured
+            # twice today at ~25 min each.
+            if ($arm.app -and -not $script:firstAppArmSeen) {
+                $script:firstAppArmSeen = $true
+                if ($r.flags -contains 'NO_WITNESS') {
+                    Log ''
+                    Log 'ABORT: the first app arm produced NO witness lines - the app is not'
+                    Log '  running a DisplayXR session (it is most likely up as a plain 2D window).'
+                    Log '  Check, in order:'
+                    Log '   1. app@scanout ~0 with cost in app@other => the app built its graphics'
+                    Log '      device on the WRONG adapter. Set "gpuPreference" in the config (1 ='
+                    Log '      integrated, 2 = high-performance) to whichever adapter scans out the'
+                    Log '      panel; engines like Unity pick before the runtime is consulted.'
+                    Log '   2. The installed runtime predates DXR_FRAME_WITNESS, or runtimeJson/'
+                    Log '      runtimePath point at a build that does. Check the app log line'
+                    Log '      "loaded from:" for which runtime actually loaded.'
+                    Log '   3. A display processor failed to load (plug-in LoadLibrary err=126)'
+                    Log '      => runtimePath is missing next to a from-source runtimeJson.'
+                    Log ''
+                    $script:aborted = $true
+                    break
+                }
+            }
         } catch {
             Log ('  ERROR: ' + $_.Exception.Message)
             Get-Process -Name $exeBase -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         }
         Start-Sleep -Seconds 3   # settle between arms
     }
+    if ($script:aborted) { break }
 }
 
 # --- Harvest runtime logs + summarize ---------------------------------------
