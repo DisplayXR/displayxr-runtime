@@ -1,6 +1,8 @@
 # ADR-037 — Adapter placement policy on hybrid-GPU devices
 
-**Status:** PROPOSED (2026-08-22) · supersedes the implicit "everything on
+**Status:** PROPOSED (2026-08-22; amended 2026-08-23 by the #918 owner — added
+§3a DP consent, corrected §7 to shipped, added the crossover instrument
+constraint and current split coverage) · supersedes the implicit "everything on
 HIGH_PERFORMANCE" default · depends on the #918 output-device split
 · related: [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md),
 [`docs/reference/adapter-selection.md`](../reference/adapter-selection.md),
@@ -25,7 +27,13 @@ one it is on.
 
 The weave constraint is not a preference. The panel's framebuffer lives on the
 scanout adapter, so weaving anywhere else means a full-frame cross-adapter copy
-inside the present path, every frame.
+inside the present path, every frame. (Weaving elsewhere is *possible* — it is
+what we shipped for years and what fallback rung 2 below still does — but it is
+never free, and the copy is invisible, unpipelined and inside `Present`.)
+
+There is a fourth constraint the table cannot express, because it is not ours:
+**the display processor is a vendor plug-in, and its ability to weave on a given
+adapter is a plug-in property, not a runtime choice.** See §3a.
 
 ### What we do today, and why
 
@@ -109,6 +117,28 @@ cube, and losing render throughput is worse than paying transfer cost. Rung 3
 is the correct answer only for light, latency-critical content — see *Open
 questions*.
 
+### 3a. The display processor must consent to the placement
+
+The runtime picks the adapters; it does **not** get to assume the vendor
+plug-in can weave on the one it picked. Placement is therefore a *negotiation*
+with the DP, and the negotiation must happen **before** the session commits to
+a topology:
+
+- The runtime resolves the scanout adapter, then asks the plug-in to create its
+  weaver on a device on that adapter. A plug-in may legitimately fail: its SDK
+  may not support that vendor's GPU, that driver, or that API on that adapter.
+- **A weaver-creation failure on the scanout adapter is a fallback trigger, not
+  a session failure** — degrade to rung 2 (everything on the render adapter,
+  where the DP demonstrably worked before) and log the plug-in's reason.
+- This is not hypothetical. Weaving Vulkan on an Intel iGPU was *unproven* until
+  it was measured on 2026-08-22 (it works — clean, zero errors, maintainer-
+  eyeballed); the D3D11 path was proven earlier. Each (vendor × API × adapter)
+  cell is an empirical question, and the policy must treat an unproven cell as
+  "ask, then fall back", never as "assume".
+- Corollary for vendor onboarding: a plug-in that can only weave on one specific
+  adapter class must say so by failing weaver creation cleanly, not by weaving
+  wrongly or crashing. See `docs/guides/vendor-plugin-onboarding.md`.
+
 ### 4. The runtime decides; the app is not consulted
 
 No manifest field, no app setting, no per-app policy file in the default path.
@@ -162,9 +192,22 @@ Under the rule the service holds devices on **both** adapters: ingest and
 composite on the render adapter (where client swapchain images live), weave and
 present on the scanout adapter. The "client and service must share one adapter"
 constraint that motivated the original HIGH_PERFORMANCE pin applies to the
-*ingest* device only. The service's own `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`
-pin (`comp_d3d11_service.cpp`) must become the same resolved render adapter, and
-its DP device must be scanout — this is #918 Phase 2 work.
+*ingest* device only.
+
+**This is SHIPPED, not planned** (#918 Phase 2b, PRs #1083…#1143, merged
+2026-08-22): the service holds an out-device on the scanout adapter, composites
+and crops on it, binds the DP by `(hwnd, device)` with dwell hysteresis, carries
+the recipe with the pixels (#1140), and hardens the transport (adaptive
+in-place ingress, per-presenter weave ledgers, DEVICE_REMOVED completeness).
+Eligibility is by **presenter kind**, which is the service-path expression of
+§3's ladder: `SERVICE_WINDOW` and `APP_HWND` presenters split;
+`CLIENT_TEXTURE` and self-presenting clients are *structurally* ineligible
+because the client owns the present, so they take rung 2.
+
+What remains here is narrow: the service's own
+`DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE` pin (`comp_d3d11_service.cpp`) should be
+replaced by the resolved render adapter rather than a hardcoded preference, so
+that §2's capability ranking — not DXGI's idea of "high performance" — decides.
 
 ### 8. Window moves between panels
 
@@ -172,6 +215,14 @@ The scanout adapter is a property of *the panel the window is on*. If a window
 moves to a panel driven by a different adapter, the weave target changes. Until
 live re-placement exists, the runtime resolves scanout at session creation,
 logs the panel identity, and warns when the window's panel no longer matches.
+
+Live re-placement is **not** a small feature, and the ADR should not imply it
+is: changing the weave target means destroying and recreating the vendor
+weaver mid-session (the Leia SR weaver is one-per-HWND and must be destroyed
+before recreation), and weaver recreation under load is precisely the failure
+class behind the workspace-wedge epic (#925 / leia#144). Any future live
+migration needs that teardown to be provably non-blocking on the render thread
+before it is attempted.
 
 ## Consequences
 
@@ -195,12 +246,38 @@ logs the panel identity, and warns when the window's panel no longer matches.
    all-on-scanout, and is it low enough that "always split" is right for light
    content too? The perf-ladder can produce this: adapter-placement arms
    (scanout / render / split) across a light app and a heavy one.
+
+   **Instrument constraint that shapes the experiment — read before building
+   arms.** Motion-to-photon (R) is *not* measurable on the all-on-scanout arm:
+   the harness derives scanout truth from `VK_KHR_present_wait`, and Intel
+   iGPUs expose no Vulkan presentation-timing extensions at all, so the pacing
+   instrument is dormant there by construction. In-process Vulkan additionally
+   emits no steady-state per-frame R even on the discrete arm (measured
+   2026-08-22 — only a first-frame outlier), so a latency-framed crossover is
+   currently unmeasurable for VK on either side. Therefore: **frame the
+   crossover in throughput and frame-time under load (witness counters), not in
+   R**, or fund the VK-0 instrumentation first and frame it in R afterwards.
+   The endpoints should also be matched on *graphics API*, not just weight — a
+   light-D3D11 vs heavy-VK pair would confound API with weight.
 2. **Battery and thermals.** On DC power, is waking the discrete GPU for a light
    overlay a net loss? On shared-package-power parts (Meteor Lake) the CPU/GPU
    budget interacts. If the answer is yes, power state becomes a policy input
    and rung 3 becomes the DC default for light content.
-3. **Split coverage.** Phase 1 is D3D11, in-process, projection-only. Vulkan,
-   D3D12, the service path, zones/Local2D and mask planes each need the bridge
-   before the rule stops falling back for them.
+3. **Split coverage** — the rule falls back for whatever the bridge does not
+   yet cover. Status 2026-08-23:
+   - **shipped**: in-process D3D11; the **service/IPC path for every client
+     API** (the split lives in the service's compositor, downstream of IPC, so a
+     D3D12/VK/GL client benefits whenever its presenter kind is eligible);
+     zones/Local2D and mask planes; recipe-with-pixels; transport hardening.
+   - **in progress**: in-process D3D12 (Unity/Unreal) — ladder D12-0…D12-5,
+     rungs 0 and 1 merged (#1150, #1151).
+   - **pending a decision, not just work**: in-process Vulkan. The cheap
+     alternative measured well — whole-app placement on the scanout adapter via
+     `DXR_VK_FORCE_GPU=scanout` eliminated *all* of the app's discrete-GPU work
+     including the cross-adapter copy engine, ran clean, and was maintainer-
+     eyeballed — so for light VK content the rule's rung-3 answer may simply be
+     correct and a VK bridge unnecessary. The VK split's value case now rests on
+     heavy-render VK content, which is question 1 above.
+   - **n/a**: Metal / Android (single-adapter; the rule degenerates).
 4. **Multi-3D-panel machines** — per-panel scanout adapters, and whether a
    session can migrate its weave target live.
