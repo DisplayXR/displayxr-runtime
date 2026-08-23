@@ -34,6 +34,16 @@ $man = $null
 $manPath = Join-Path $ResultsDir 'kit-manifest.json'
 if (Test-Path $manPath) { $man = Get-Content $manPath -Raw | ConvertFrom-Json }
 
+# Old result dirs predate the #1154 bucket columns; read tolerantly so a stale
+# ladder.csv still summarizes instead of throwing.
+function ColOf {
+    param($row, [string]$name)
+    if ($row.PSObject.Properties[$name] -eq $null) { return 0.0 }
+    $v = $row.$name
+    if ([string]::IsNullOrEmpty($v)) { return 0.0 }
+    return [double]$v
+}
+
 # --- Per-arm medians + per-rep spread ---------------------------------------
 $armNames = @($rows | ForEach-Object { $_.arm } | Select-Object -Unique)
 $med = @{}
@@ -52,8 +62,13 @@ foreach ($a in $armNames) {
         mode        = ($r | Select-Object -Last 1).mode
         flags       = (@($r | ForEach-Object { $_.flags } | Where-Object { $_ -ne '' }) -join ' ')
     }
-    $med[$a].app_dwm = [math]::Round(($med[$a].app_scanout + $med[$a].app_other + $med[$a].dwm), 2)
-    $ad = @($r | ForEach-Object { [double]$_.app_scanout + [double]$_.app_other + [double]$_.dwm })
+    # SUBJECT = client + service-side buckets (composite/weave/bridge live in the
+    # service on the IPC path), so app_dwm folds svc_* in when present.
+    $med[$a].svc = Get-TrueMedian @($r | ForEach-Object { (ColOf $_ 'svc_scanout') + (ColOf $_ 'svc_other') })
+    $med[$a].tot_scanout = Get-TrueMedian @($r | ForEach-Object { (ColOf $_ 'tot_scanout') })
+    $med[$a].tot_other = Get-TrueMedian @($r | ForEach-Object { (ColOf $_ 'tot_other') })
+    $med[$a].app_dwm = [math]::Round(($med[$a].app_scanout + $med[$a].app_other + $med[$a].svc + $med[$a].dwm), 2)
+    $ad = @($r | ForEach-Object { [double]$_.app_scanout + [double]$_.app_other + (ColOf $_ 'svc_scanout') + (ColOf $_ 'svc_other') + [double]$_.dwm })
     $med[$a].spread = if ($ad.Count -gt 1) {
         [math]::Round((($ad | Measure-Object -Maximum).Maximum - ($ad | Measure-Object -Minimum).Minimum), 2)
     } else { 0.0 }
@@ -236,12 +251,15 @@ $out += ''
 
 $out += '## Per-arm medians (GPU busy %, Running-Time deltas; spread = max-min across kept reps, app+dwm)'
 $out += ''
-$out += '| arm | n | app@scanout | app@other | dwm | app+dwm | spread | total | app CPU | presents/s | weaves/s | repaints/s | mode | flags |'
-$out += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
+$out += 'app+dwm is the SUBJECT (client + svc + dwm). **tot@scanout / tot@other are adapter totals across ALL processes** and are first-class, not noise: the same physical cross-adapter transfer is charged to the SERVICE when a bridge issues it explicitly, but to dwm/System when it happens implicitly inside Present - so subject-only accounting flatters the implicit arm and biases against the split (#1154).'
+$out += ''
+$out += '| arm | n | app@scanout | app@other | svc | dwm | app+dwm | spread | tot@scanout | tot@other | total | app CPU | presents/s | weaves/s | repaints/s | mode | flags |'
+$out += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
 foreach ($a in $armNames) {
     $m = $med[$a]
-    $out += ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} | {13} |' -f `
-        $a, $m.n, $m.app_scanout, $m.app_other, $m.dwm, $m.app_dwm, $m.spread, $m.total, $m.app_cpu, `
+    $out += ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} | {13} | {14} | {15} | {16} |' -f `
+        $a, $m.n, $m.app_scanout, $m.app_other, $m.svc, $m.dwm, $m.app_dwm, $m.spread, `
+        $m.tot_scanout, $m.tot_other, $m.total, $m.app_cpu, `
         $m.presents, $m.weaves, $m.repaints, $m.mode, $m.flags)
 }
 $out += ''
