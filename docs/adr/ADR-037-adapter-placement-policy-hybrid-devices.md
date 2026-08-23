@@ -388,17 +388,21 @@ before it is attempted.
      split lives in the service's compositor, downstream of IPC, so a
      D3D12/VK/GL client benefits whenever its presenter kind is eligible);
      zones/Local2D and mask planes; recipe-with-pixels; transport hardening.
-   - **shipped, auto-on**: in-process D3D12 (Unity/Unreal) — ladder D12-0…D12-5,
-     through D12-4 (#1150, #1151, #1164, D12-4). D12-3 shipped it projection-only
-     and D12-4 added the plane transports, so **zones and Local2D now composite on
-     the scanout adapter** — which is what the flagship Unity path needed, since
-     the shipping avatar sample carries zones plus a Local2D band every session
-     and used to retire on frame one. Two things still retire the split for the
-     session: an **app-authored (Tier-3) zone mask**, whose pixels the application
-     draws on the render adapter and which has no transport yet
-     (`reason=authored_mask`, D12-5), and a DP that declines the scanout adapter
-     (`reason=dp_refused_scanout`, §3a). `reason=layers_unsupported` is no longer
-     emitted by this leg — a D3D12 session reporting it is a pre-D12-4 build.
+   - **shipped, auto-on**: in-process D3D12 (Unity/Unreal) — ladder D12-0…D12-5
+     COMPLETE (#1150, #1151, #1164, D12-4, D12-5). D12-3 shipped it
+     projection-only, D12-4 added the 2D plane transports so **zones and Local2D
+     composite on the scanout adapter** — which is what the flagship Unity path
+     needed, since the shipping avatar sample carries zones plus a Local2D band
+     every session and used to retire on frame one — and D12-5 added the
+     **app-authored (Tier-3) mask plane** plus the zone-wish publish on the
+     DP+target path (#1175), which had been inert on exactly the path an active
+     split takes. Every layer kind this leg can submit now composites and
+     publishes on the scanout adapter. What still retires the split for the
+     session is a **failure**, never a feature: a mask plane this machine could
+     not allocate (`reason=authored_mask`) and a DP that declines the scanout
+     adapter (`reason=dp_refused_scanout`, §3a). `reason=layers_unsupported` is no
+     longer emitted by this leg — a D3D12 session reporting it is a pre-D12-4
+     build.
    - **pending a decision, not just work**: in-process Vulkan. The cheap
      alternative measured well — whole-app placement on the scanout adapter via
      `DXR_VK_FORCE_GPU=scanout` eliminated *all* of the app's discrete-GPU work
