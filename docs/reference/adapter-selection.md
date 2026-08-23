@@ -212,13 +212,57 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 | **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
 | In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
 | In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
-| In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-selection API at all |
+| In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
 | Metal / Android | n/a | single-adapter; the rule degenerates |
 
 Vulkan and OpenGL take rung 2 **unconditionally**, and neither can reach a
 half-engaged state: nothing in either compositor consults a scanout adapter,
 allocates a bridge, or creates a second device. They log the placement line and
 render exactly as before.
+
+### OpenGL: identity yes, selection no (#1159)
+
+The GL compositor creates D3D11 devices for two interop paths — the
+transparency (DComp) present bridge and the device that opens the app's shared
+texture. Both used to pass a **NULL adapter**, i.e. DXGI enumeration order, so
+on a hybrid box the interop could silently become a cross-adapter copy. They now
+resolve an adapter deliberately, best evidence first:
+
+1. **`GL_EXT_memory_object_win32` → `glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT)`.**
+   The driver reporting its own D3D LUID. Exact, not a guess; available on
+   current NVIDIA / Intel / AMD Windows drivers. This is also what the GL
+   `weave placement:` line prints as `render=`.
+2. **`GL_VENDOR` → PCI vendor id**, used only when it names exactly one adapter
+   (the usual iGPU+dGPU box is two different vendors, so it does). Heuristic.
+3. **`GL_RENDERER` vs the DXGI descriptions**, to split a same-vendor tie. Used
+   only when unambiguous. Heuristic.
+4. **The ADR-037 §2 resolver.** Not "the GL adapter" — a ranked, overridable
+   choice instead of enumeration order, and logged as a fallback.
+
+Grep a GL session's log for `#1159`:
+
+```
+ADR-037 §5 GL placement is OS-ADVISORY: … GL context is on LUID=… (NVIDIA GeForce RTX 3080/PCIe/SSE2); ADR-037 §2 would pick 'NVIDIA …' LUID=… (most VRAM) — MATCH. …
+ADR-037 §5 GL interop device (transparency present bridge): 'NVIDIA …' LUID=… (GL context LUID (GL_EXT_memory_object_win32)) (#1159)
+ADR-037 §5 GL interop device (shared-texture upload): 'NVIDIA …' LUID=… (GL context LUID (GL_EXT_memory_object_win32)) (#1159)
+```
+
+and, when they genuinely differ, one WARN naming both:
+
+```
+ADR-037 §5: GL interop device (transparency present bridge) is on LUID=… but the GL context runs on LUID=… — CROSS-ADAPTER interop; every share/copy crosses the bus, every frame (#1159)
+```
+
+For the shared-texture device the adapter is not a preference but a
+**requirement**: a D3D11 shared handle can only be opened by a device on the
+adapter that created it, so `OpenSharedResource` succeeding is itself the proof.
+If the resolved adapter cannot open it, the remaining hardware adapters are
+tried in turn and the one that works is reported as a `CROSS-ADAPTER handoff` —
+a mismatch degrades loudly instead of failing session creation.
+
+None of this makes GL placement enforceable. The runtime still cannot move a GL
+context; the per-exe `UserGpuPreferences` pin and `NvOptimusEnablement` remain
+the only levers, and they are the OS's.
 
 ## Checking where the weave actually runs
 
@@ -279,7 +323,9 @@ Neither variable has to be *guessed at*. Two places report the answer:
   ```
 
   `render=UNKNOWN` is OpenGL only, and is the literal truth rather than a
-  failed lookup — see ADR-037 §5.
+  failed lookup — see ADR-037 §5. Since #1159 it is also **rare**: GL prints the
+  real render LUID whenever the driver reports `GL_DEVICE_LUID_EXT`, and
+  `UNKNOWN` means the driver did not.
 
   **The LAST `weave placement:` line in a log is the truth.** The in-process
   D3D12 path can retire an engaged split mid-session (a zones/Local2D/mask
