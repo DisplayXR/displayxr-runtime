@@ -8,10 +8,10 @@
  * @defgroup comp_xbridge Cross-adapter transport
  * @ingroup comp
  *
- * The transport is NOT D3D11 — it only has D3D11 at its ends today. See the
- * diagram below: the middle is D3D12 cross-adapter heaps, because D3D11 has no
- * cross-adapter texture path on this stack at all. That is why it lives outside
- * `d3d11/` and carries no API in its name.
+ * The transport is NOT D3D11 — the middle is D3D12 cross-adapter heaps, because
+ * D3D11 has no cross-adapter texture path on this stack at all. That is why it
+ * lives outside `d3d11/` and carries no API in its name. Its ENDS come in two
+ * flavours, selected by @ref comp_xbridge_info::d3d12_ends.
  *
  * On a non-MUX hybrid laptop the 3D panel is scanned out by the iGPU while the
  * app renders on the dGPU. Today's placement weaves and presents on the app's
@@ -45,6 +45,39 @@
  *                                          each with an SRV the DP samples.
  * @endverbatim
  *
+ * **D3D12 ENDS (#918 D12-3a).** When the caller is already D3D12 at both ends —
+ * the in-process D3D12 compositor, whose app device is the application's own and
+ * whose output device the runtime creates on the scanout adapter — the same
+ * transport REMOVES a layer rather than adding one. There is no interop left to
+ * do, so the bridge borrows the caller's devices instead of standing its own up:
+ *
+ * @verbatim
+ *   app D3D12 atlas  --(no share: the producer IS the app device)-->
+ *        |                                   producer = the APP's ID3D12Device
+ *        | f_app (plain D3D12 fence,               | its own COPY queue
+ *        |  app queue -> producer queue)           v
+ *        |                                   cross-adapter placed ring x2
+ *        |                                   (unchanged — the middle never moves)
+ *        |                                              | f_xa
+ *        |                                              v
+ *        |                                   consumer = the OUT ID3D12Device
+ *        |                                              | COPY queue
+ *        |                                              v
+ *        +----------------------------->  egress ring x3: plain committed
+ *                                          ID3D12Resources on the OUT device,
+ *                                          handed to the caller as resources.
+ * @endverbatim
+ *
+ * What that buys, precisely: no NT share and no `OpenSharedHandle` on the atlas
+ * (so no per-rebind producer drain), no NT share on the egress ring, and both
+ * GPU-side waits become a direct `queue->Wait(fence)` on the fence's own device.
+ * What it costs: the two 2D PLANES and the authored MASK plane are D3D11-only and
+ * are REFUSED in this mode (see @ref comp_xbridge_bind_plane) — the D3D12 leg's
+ * first rung is projection-only by design (#918 D12-3), and D12-4 takes the
+ * planes. Everything else — the R2 resize hysteresis, the fence-deferred source
+ * retire, leak-never-wait on ring exhaustion, the both-link watchdog and the
+ * drain-or-leak teardown — is the SAME code on both flavours.
+ *
  * **INVARIANT: no CPU wait anywhere on the app render thread or the weave
  * path.** The only cross-adapter wait belongs to the consumer's own copy queue.
  * The weave picks the newest egress slot whose completion fence has already
@@ -71,12 +104,51 @@ extern "C" {
  */
 struct comp_xbridge_info
 {
-	void *app_device;  //!< `ID3D11Device *` on the app (render) adapter.
-	void *app_context; //!< `ID3D11DeviceContext *`, the app's immediate context.
+	/*!
+	 * #918 D12-3a — which flavour of ends this bridge has. See the topology in
+	 * the file comment.
+	 *
+	 * false (the default, and every caller before D12-3): D3D11 ends. The bridge
+	 * creates its OWN producer and consumer D3D12 devices from @ref app_adapter
+	 * and @ref out_adapter, and reaches the caller's D3D11 textures by NT share.
+	 * @ref app_device / @ref out_device are `ID3D11Device *`, @ref app_context /
+	 * @ref out_context are their immediate contexts, and @ref app_queue /
+	 * @ref out_queue are ignored.
+	 *
+	 * true: D3D12 ends. The producer IS @ref app_device and the consumer IS
+	 * @ref out_device — no device is created, nothing is NT-shared, and the
+	 * adapters are used only for the LUID sanity the caller already resolved.
+	 * @ref app_device / @ref out_device are `ID3D12Device *`, @ref app_queue /
+	 * @ref out_queue are the `ID3D12CommandQueue *` the caller submits atlas work
+	 * and weave work on, and @ref app_context / @ref out_context are ignored.
+	 */
+	bool d3d12_ends;
+
+	void *app_device;  //!< `ID3D11Device *`, or `ID3D12Device *` when @ref d3d12_ends.
+	void *app_context; //!< `ID3D11DeviceContext *`, the app's immediate context. D3D11 ends only.
 	void *app_adapter; //!< `IDXGIAdapter *` the app device lives on.
-	void *out_device;  //!< `ID3D11Device *` on the scanout adapter.
-	void *out_context; //!< `ID3D11DeviceContext *` of @ref out_device.
+	void *out_device;  //!< `ID3D11Device *`, or `ID3D12Device *` when @ref d3d12_ends.
+	void *out_context; //!< `ID3D11DeviceContext *` of @ref out_device. D3D11 ends only.
 	void *out_adapter; //!< `IDXGIAdapter *` that scans out the panel.
+
+	/*!
+	 * @ref d3d12_ends only — the app's own `ID3D12CommandQueue *`, the one every
+	 * atlas-side command list executes on.
+	 *
+	 * The bridge SIGNALS it (inside @ref comp_xbridge_submit, the twin of the
+	 * D3D11 path's immediate-context signal) and queues GPU-side WAITS on it
+	 * (@ref comp_xbridge_pre_render). Both are queue operations; neither is ever
+	 * a CPU wait, and neither can ever be made to cover output-queue work — the
+	 * only fence the app queue is told to wait on is the PRODUCER copy queue's,
+	 * which lives on the app adapter and itself waits on nothing but this queue.
+	 */
+	void *app_queue;
+	/*!
+	 * @ref d3d12_ends only — the output `ID3D12CommandQueue *` the weave records
+	 * onto, on the scanout adapter. @ref comp_xbridge_gpu_wait_slot queues its
+	 * GPU-side wait here.
+	 */
+	void *out_queue;
 
 	//! Worst-case system atlas (u_tiling_compute_system_atlas) — the
 	//! cross-adapter ring is sized for this once, so a mode switch never
@@ -252,6 +324,29 @@ bool
 comp_xbridge_bind_atlas(struct comp_xbridge *xb, void *nt_handle, uint64_t generation);
 
 /*!
+ * #918 D12-3a — the D3D12-ends twin of @ref comp_xbridge_bind_atlas: bind the
+ * caller's atlas BY POINTER.
+ *
+ * There is no NT handle because there is nothing to share: with D3D12 ends the
+ * producer IS the app device, so the atlas the app renders into is already a
+ * resource the producer's copy queue can read. This is ingress Option I with the
+ * open removed — which also removes the open's failure mode (there is no
+ * fallback to Option II here; see @ref comp_xbridge_force_staged_ingress) and
+ * the producer DRAIN a re-open needed (#918 F2). A superseded resource is
+ * instead routed through the same FENCE-DEFERRED retire ring adaptive ingress
+ * uses, so a generation change never blocks and never frees under a live copy.
+ *
+ * @param resource `ID3D12Resource *` on the app device, or NULL to unbind.
+ * @param generation The caller's atlas generation; a change re-binds.
+ *
+ * @return true when the producer will read @p resource on the next submit.
+ *         False when the bridge is not in D3D12-ends mode (the caller must use
+ *         @ref comp_xbridge_bind_atlas), or when @p resource is NULL.
+ */
+bool
+comp_xbridge_bind_atlas_resource(struct comp_xbridge *xb, void *resource, uint64_t generation);
+
+/*!
  * Select ingress Option II — the app-device NT-shared staging ring — UP FRONT,
  * instead of reaching it only as the Option-I failure fallback.
  *
@@ -273,6 +368,12 @@ comp_xbridge_bind_atlas(struct comp_xbridge *xb, void *nt_handle, uint64_t gener
  *
  * @return false when the staging ring could not be allocated — the bridge is
  *         then inoperative and the caller must not activate the split.
+ *
+ * **Refused on a D3D12-ends bridge**, and not for want of effort: Option II
+ * exists because a source may be un-openable or may change identity per frame,
+ * and with D3D12 ends there is no open at all — the producer reads the caller's
+ * own resource. Its staging copy would also have to be recorded somewhere, and
+ * the bridge owns no command list on the app's DIRECT queue. Returns false.
  */
 bool
 comp_xbridge_force_staged_ingress(struct comp_xbridge *xb);
@@ -310,6 +411,13 @@ comp_xbridge_force_staged_ingress(struct comp_xbridge *xb);
  * @return false when the staging ring could not be allocated (the bridge is then
  *         inoperative, as with `force_staged_ingress`) — a refusal to go adaptive
  *         with a working staged ring still returns true.
+ *
+ * **Refused on a D3D12-ends bridge** for the same reason
+ * @ref comp_xbridge_force_staged_ingress is: adaptive is Option I plus an
+ * Option-II fallback, and there is no Option II there. Returns false. Note that
+ * a D3D12-ends caller loses nothing by it — adaptive exists for a source whose
+ * IDENTITY changes per frame, and the fence-deferred retire that made that safe
+ * is exactly what @ref comp_xbridge_bind_atlas_resource already runs.
  */
 bool
 comp_xbridge_enable_adaptive_ingress(struct comp_xbridge *xb);
@@ -395,6 +503,14 @@ comp_xbridge_pre_render(struct comp_xbridge *xb);
  *
  * A plane that has failed once is never retried, so these calls are safe to make
  * unconditionally on the frame path.
+ *
+ * **REFUSED on a D3D12-ends bridge (#918 D12-3a).** The plane chain's egress and
+ * its source binding are both D3D11-shaped (an output-device `ID3D11Texture2D`
+ * plus its SRV, and an NT-shared app-device source), and the D3D12 leg's first
+ * rung is projection-only by design — a frame carrying zones / Local2D / an
+ * authored mask falls the whole SESSION back to the single-adapter path rather
+ * than half-splitting it. This returns false with one WARN per plane; D12-4
+ * gives the planes D3D12 ends the way this rung gave them to the atlas.
  *
  * Bind the APP-DEVICE source texture for @p plane. The producer opens it
  * directly (the same Option-I shape as the atlas — no extra app-device copy),
@@ -526,7 +642,13 @@ comp_xbridge_plane_label(uint32_t plane);
  *        so a later weave can tell whether the slot's pixels still belong to the
  *        recipe the DP is running (#918 R1).
  * @param atlas_texture `ID3D11Texture2D *` of the renderer atlas. Only read in
- *        Option II (the ingress staging copy); ignored in Option I.
+ *        Option II (the ingress staging copy); ignored in Option I, and
+ *        therefore always ignored on a D3D12-ends bridge (Option I only).
+ *
+ * **D3D12 ends:** the caller must have executed the frame's atlas work on
+ * @ref comp_xbridge_info::app_queue BEFORE calling this — the ordering signal
+ * the producer waits on is taken on that queue here, exactly where the D3D11
+ * path signals the immediate context.
  * @param content_w/content_h The content box actually painted this frame.
  */
 void
@@ -585,8 +707,29 @@ bool
 comp_xbridge_slot_ready(struct comp_xbridge *xb, int32_t slot);
 
 //! `ID3D11ShaderResourceView *` the DP samples for @p slot (NULL if invalid).
+//! D3D11 ends only — a D3D12-ends bridge has no D3D11 view to hand out and
+//! always returns NULL. Use @ref comp_xbridge_get_egress_resource there.
 void *
 comp_xbridge_get_srv(struct comp_xbridge *xb, int32_t slot);
+
+/*!
+ * #918 D12-3a — `ID3D12Resource *` of @p slot's egress texture, on the OUTPUT
+ * device (NULL if invalid).
+ *
+ * D3D12 ends only, and deliberately so: on a D3D11-ends bridge the egress
+ * resource that exists as an `ID3D12Resource` is the CONSUMER's open, which
+ * belongs to the bridge's own consumer device and not to the caller's output
+ * device — handing it out would give the caller a resource from the wrong
+ * device. That bridge returns NULL here.
+ *
+ * The resource is created with `ALLOW_SIMULTANEOUS_ACCESS`, so it behaves the
+ * way the D3D11-ends egress texture does: it is COMMON at every submission
+ * boundary and promotes implicitly to COPY_DEST for the consumer's copy and to
+ * PIXEL_SHADER_RESOURCE for the display processor's read, with no barrier owed
+ * by anyone. Do not transition it.
+ */
+void *
+comp_xbridge_get_egress_resource(struct comp_xbridge *xb, int32_t slot);
 
 //! Allocated extent of the egress ring (content-sized after Stage B).
 void

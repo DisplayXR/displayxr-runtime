@@ -156,6 +156,29 @@ enum xb_ingress_mode
 
 struct comp_xbridge
 {
+	/*!
+	 * #918 D12-3a — the ends are D3D12, not D3D11. See the header's topology.
+	 *
+	 * The invariant that makes the branching below tractable: in D3D12 mode every
+	 * `ID3D11*` member of this struct stays NULL, and `prod_dev` / `cons_dev` are
+	 * AddRef'd ALIASES of `app_dev12` / `out_dev12` rather than devices the bridge
+	 * created. Everything between them — the cross-adapter heap ring, the placed
+	 * resources, both copy queues, the allocator rings, the fences f_xa_* and
+	 * f_out_cons, the watchdog and the bandwidth gate — is bit-for-bit the same
+	 * code on both flavours, because the middle of the transport never moves.
+	 */
+	bool d3d12_ends;
+
+	// --- D3D12 ends (#918 D12-3a) — NULL unless d3d12_ends ---------------
+	//! The application's device. `prod_dev` is an alias of this.
+	ID3D12Device *app_dev12;
+	//! The application's own queue: signalled in submit, GPU-waited in pre_render.
+	ID3D12CommandQueue *app_q12;
+	//! The runtime's scanout-adapter device. `cons_dev` is an alias of this.
+	ID3D12Device *out_dev12;
+	//! The queue the weave records onto; gpu_wait_slot's GPU-side wait lands here.
+	ID3D12CommandQueue *out_q12;
+
 	// --- D3D11 ends -----------------------------------------------------
 	ID3D11Device *app_dev;
 	ID3D11Device5 *app_dev5;
@@ -181,6 +204,9 @@ struct comp_xbridge
 
 	// --- fences (one monotonic seq: the app frame counter) --------------
 	//! App D3D11 -> producer queue. Signalled on the app's immediate context.
+	//! D3D12 ends: `f_app` / `f_app_h` stay NULL and `f_app_prod` is a plain
+	//! unshared fence on the app device (== the producer device), signalled from
+	//! `app_q12`. Same fence, same seq, one fewer share.
 	ID3D11Fence *f_app;
 	ID3D12Fence *f_app_prod;
 	HANDLE f_app_h;
@@ -192,12 +218,18 @@ struct comp_xbridge
 	//! producer). The back-fence of ingress Option I: the app's renderer passes
 	//! GPU-wait on it so frame N cannot overwrite an atlas the producer's copy
 	//! of N-1 may still be reading (#918 F6).
+	//! D3D12 ends: NULL. The app device IS the producer device, so `f_xa_prod`
+	//! itself is the back-fence and `app_back_wait_ok` is unconditionally true —
+	//! there is no open that can fail and therefore no unsafe-Option-I case.
 	ID3D11Fence *f_xa_app;
 	bool app_back_wait_ok;
 	uint64_t app_waited_seq;
 	//! Consumer completion. Polled CPU-side to pick a slot; ALSO opened on the
 	//! output D3D11 device so the weave can take a GPU-side wait (never a CPU
 	//! one) on the slot it picked.
+	//! D3D12 ends: `f_out_out11` / `f_out_h` stay NULL — the out queue lives on
+	//! the consumer device, so it waits on `f_out_cons` directly and
+	//! `out_gpu_wait_ok` is unconditionally true.
 	ID3D12Fence *f_out_cons;
 	ID3D11Fence *f_out_out11;
 	HANDLE f_out_h;
@@ -211,6 +243,10 @@ struct comp_xbridge
 	ID3D12Resource *xa_cons[XB_XA_RING];
 
 	// --- egress ring (output D3D11, opened by the consumer) --------------
+	//! D3D12 ends: `eg_tex` / `eg_srv` / `eg_share` stay NULL and `eg_12` holds
+	//! plain committed ALLOW_SIMULTANEOUS_ACCESS resources created straight on
+	//! the consumer (== output) device. Same slot indices, same seq/gen stamps,
+	//! same release path — `safe_release` / `safe_close` on a NULL is a no-op.
 	ID3D11Texture2D *eg_tex[XB_EGRESS_RING];
 	ID3D11ShaderResourceView *eg_srv[XB_EGRESS_RING];
 	HANDLE eg_share[XB_EGRESS_RING]; //!< NT share handles of eg_tex
@@ -436,6 +472,18 @@ struct comp_xbridge
  *
  */
 
+/*!
+ * The log prefix, which now has to name WHICH bridge is talking (#918 D12-3a).
+ *
+ * One unit, two flavours of ends, one set of field-log greps. A D3D12-split
+ * session emitting `d3d11 xbridge:` would send a reader looking at the wrong
+ * compositor. The D3D11 string is unchanged BYTE FOR BYTE — every line that used
+ * to be a literal `"d3d11 xbridge: …"` is now `"%s: …"` with this as its first
+ * argument, so a D3D11-ends session's log is identical to the one before this
+ * change and every existing grep keeps working.
+ */
+#define XB_TAG(xb) ((xb)->d3d12_ends ? "d3d12 xbridge" : "d3d11 xbridge")
+
 static const char *
 xb_hr(HRESULT hr, char *buf, size_t n)
 {
@@ -472,7 +520,7 @@ xb_retire_source(struct comp_xbridge *xb, ID3D12Resource *res);
  *         the caller must LEAK the resources rather than free them.
  */
 static bool
-xb_drain_fence(ID3D12Fence *fence, uint64_t target, const char *what)
+xb_drain_fence(struct comp_xbridge *xb, ID3D12Fence *fence, uint64_t target, const char *what)
 {
 	if (fence == nullptr || target == 0 || fence->GetCompletedValue() >= target) {
 		return true;
@@ -497,9 +545,10 @@ xb_drain_fence(ID3D12Fence *fence, uint64_t target, const char *what)
 		return true;
 	}
 	U_LOG_W(
-	    "d3d11 xbridge: %s drain timed out at %llu/%llu after %d ms — LEAKING the resources "
+	    "%s: %s drain timed out at %llu/%llu after %d ms — LEAKING the resources "
 	    "rather than freeing them under an in-flight copy (#918)",
-	    what, (unsigned long long)fence->GetCompletedValue(), (unsigned long long)target, XB_DRAIN_TIMEOUT_MS);
+	    XB_TAG(xb), what, (unsigned long long)fence->GetCompletedValue(), (unsigned long long)target,
+	    XB_DRAIN_TIMEOUT_MS);
 	return false;
 }
 
@@ -524,12 +573,13 @@ xb_release_egress(struct comp_xbridge *xb)
 	}
 	const bool drained =
 	    !in_flight_reachable ||
-	    xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "egress release");
+	    xb_drain_fence(xb, xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "egress release");
 	if (!drained && !xb->degraded.load(std::memory_order_relaxed)) {
 		xb->degraded.store(true, std::memory_order_release);
 		U_LOG_W(
-		    "d3d11 xbridge: DEGRADED — the consumer queue would not drain for an egress "
-		    "realloc; no further submissions (#918)");
+		    "%s: DEGRADED — the consumer queue would not drain for an egress "
+		    "realloc; no further submissions (#918)",
+		    XB_TAG(xb));
 	}
 
 	for (int i = 0; i < XB_EGRESS_RING; i++) {
@@ -566,6 +616,13 @@ xb_release_egress(struct comp_xbridge *xb)
  * needs an RTV; two copies of a five-call sequence with a share handle in the
  * middle is exactly where the two rings would drift apart.
  *
+ * #918 D12-3a: with D3D12 ends the whole share disappears. The consumer device
+ * IS the output device, so the copy destination and the thing the display
+ * processor samples are one committed resource, created here and handed back in
+ * @p out_12 with the three D3D11 outputs left NULL. `out_tex`/`out_srv`/
+ * `out_share` may be NULL in that mode (a plane never reaches here — planes are
+ * refused on a D3D12-ends bridge — but the atlas ring passes its own slots).
+ *
  * @return the HRESULT of the first failing step (S_OK on success). The caller
  *         owns whatever was written, including on failure — release through its
  *         normal teardown so a partial chain is not leaked.
@@ -581,6 +638,47 @@ xb_make_egress_texture(struct comp_xbridge *xb,
                        HANDLE *out_share,
                        ID3D12Resource **out_12)
 {
+	if (xb->d3d12_ends) {
+		/*
+		 * ALLOW_SIMULTANEOUS_ACCESS is load-bearing, not a habit. It reproduces
+		 * exactly the state discipline the D3D11-ends egress texture gets for
+		 * free: a D3D11-created shared texture opened in D3D12 must be left in
+		 * COMMON, so the consumer's COPY-queue write and the display processor's
+		 * DIRECT-queue read each promote implicitly and decay back, and nobody
+		 * owes a barrier.
+		 *
+		 * A plain committed texture does NOT decay after a read on a direct
+		 * queue — the display processor's sample would leave it in
+		 * PIXEL_SHADER_RESOURCE, and the next consumer copy would then use a
+		 * non-COMMON texture on a COPY queue, which is invalid. Fixing that with
+		 * explicit barriers is not available to us: the display processor is a
+		 * vendor plug-in (ADR-019) that is free to leave the resources it touches
+		 * in any state and offers no way to query one back (the same unsoundness
+		 * #747 tracks on the back buffer). Simultaneous access removes the
+		 * question instead of guessing at the answer.
+		 */
+		D3D12_RESOURCE_DESC rd{};
+		rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		rd.Width = w;
+		rd.Height = h;
+		rd.DepthOrArraySize = 1;
+		rd.MipLevels = 1;
+		rd.Format = fmt;
+		rd.SampleDesc.Count = 1;
+		rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+		if (want_rtv) {
+			rd.Flags = (D3D12_RESOURCE_FLAGS)(rd.Flags | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+		}
+
+		D3D12_HEAP_PROPERTIES hp{};
+		hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		return xb->cons_dev->CreateCommittedResource(
+		    &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+		    reinterpret_cast<void **>(out_12));
+	}
+
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w;
 	td.Height = h;
@@ -699,7 +797,7 @@ xb_make_egress_slot(struct comp_xbridge *xb, int i, uint32_t w, uint32_t h, cons
 	HRESULT hr = xb_make_egress_texture(xb, w, h, XB_FORMAT, /*want_rtv=*/true, &xb->eg_tex[i], &xb->eg_srv[i],
 	                                    &xb->eg_share[i], &xb->eg_12[i]);
 	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: egress slot %d (%ux%u) failed %s", i, w, h, xb_hr(hr, b, sizeof(b)));
+		U_LOG_W("%s: egress slot %d (%ux%u) failed %s", XB_TAG(xb), i, w, h, xb_hr(hr, b, sizeof(b)));
 		*out_reason = "egress share failed";
 		return false;
 	}
@@ -885,8 +983,8 @@ xb_plane_alloc(struct comp_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, ui
 		 * be copying into the old egress; drain before releasing, and leak on
 		 * timeout exactly as every other structural transition does.
 		 */
-		const bool drained = xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire),
-		                                    "plane re-size");
+		const bool drained = xb_drain_fence(
+		    xb, xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "plane re-size");
 		xb_release_plane(xb, p, drained);
 	}
 	if (w == 0 || h == 0) {
@@ -917,10 +1015,10 @@ xb_plane_alloc(struct comp_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, ui
 
 	if (FAILED(hr)) {
 		U_LOG_W(
-		    "d3d11 xbridge: the %s plane could not allocate its %s at %ux%u fmt=%u %s — THAT FEATURE "
+		    "%s: the %s plane could not allocate its %s at %ux%u fmt=%u %s — THAT FEATURE "
 		    "is unavailable under the output-device split for this session; the split itself is "
 		    "unaffected (#918 Phase 2a)",
-		    xb_plane_name(p), what, w, h, fmt, xb_hr(hr, b, sizeof(b)));
+		    XB_TAG(xb), xb_plane_name(p), what, w, h, fmt, xb_hr(hr, b, sizeof(b)));
 		xb_release_plane(xb, p, /*drained=*/true);
 		pl.failed = true;
 		return false;
@@ -929,7 +1027,7 @@ xb_plane_alloc(struct comp_xbridge *xb, uint32_t p, uint32_t fmt, uint32_t w, ui
 	pl.live = true;
 	// Fresh egress textures hold nothing: every slot owes a full refresh.
 	xb_plane_invalidate_slots(xb, pl);
-	U_LOG_W("d3d11 xbridge: %s plane up — %ux%u fmt=%u, heap %llu bytes x%d + egress x%d (#918 Phase 2a)",
+	U_LOG_W("%s: %s plane up — %ux%u fmt=%u, heap %llu bytes x%d + egress x%d (#918 Phase 2a)", XB_TAG(xb),
 	        xb_plane_name(p), w, h, fmt, (unsigned long long)heap_bytes, XB_XA_RING, XB_EGRESS_RING);
 	return true;
 }
@@ -958,6 +1056,29 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 	}
 
 	/*
+	 * #918 D12-3a — planes are D3D11-only. Both halves of a plane's chain are:
+	 * the SOURCE is bound by NT handle from an app-device D3D11 texture, and the
+	 * EGRESS is an output-device `ID3D11Texture2D` plus the SRV the D3D11
+	 * composite samples. Neither shape exists on a D3D12-ends bridge, and giving
+	 * them one is D12-4's rung, not this one.
+	 *
+	 * Latched into the normal `failed` state rather than special-cased, so the
+	 * one-WARN-per-plane rule above covers it and a caller that binds every frame
+	 * pays one branch. The D3D12 compositor's contract is stricter than "this
+	 * plane degrades": a frame carrying zones / Local2D / an authored mask makes
+	 * the whole SESSION fall back to the single-adapter path, so this refusal is
+	 * a backstop, not the mechanism.
+	 */
+	if (xb->d3d12_ends) {
+		pl.failed = true;
+		U_LOG_W(
+		    "%s: the %s plane is D3D11-only and is refused on a D3D12-ends bridge — this rung is "
+		    "projection-only; D12-4 gives the planes D3D12 ends (#918 D12-3a)",
+		    XB_TAG(xb), xb_plane_name(plane));
+		return false;
+	}
+
+	/*
 	 * Same #918 F2 hazard as the atlas re-bind, and it applies to DROPPING the
 	 * binding as much as to replacing it: the producer's copy of the last
 	 * submitted seq reads exactly this resource, and the caller is about to
@@ -968,7 +1089,7 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 		if (pl.src12 == nullptr) {
 			return;
 		}
-		if (!xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire),
+		if (!xb_drain_fence(xb, xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire),
 		                    "plane re-bind")) {
 			pl.src12 = nullptr; // deliberate leak — a UAF is not recoverable
 		}
@@ -994,9 +1115,9 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 	                                            reinterpret_cast<void **>(&pl.src12));
 	if (FAILED(hr) || pl.src12 == nullptr) {
 		U_LOG_W(
-		    "d3d11 xbridge: the producer could not open the %s plane's source %s — that feature "
+		    "%s: the producer could not open the %s plane's source %s — that feature "
 		    "degrades for this session (#918 Phase 2a)",
-		    xb_plane_name(plane), xb_hr(hr, b, sizeof(b)));
+		    XB_TAG(xb), xb_plane_name(plane), xb_hr(hr, b, sizeof(b)));
 		pl.failed = true;
 		pl.src_bound = false;
 		return false;
@@ -1351,9 +1472,9 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 			}
 			xb->gate_under_since_ns = 0;
 			U_LOG_W(
-			    "d3d11 xbridge: transport has been inside the %.1f GB/s gate for %llu s — "
+			    "%s: transport has been inside the %.1f GB/s gate for %llu s — "
 			    "releasing the half-rate latch on every plane (#918 Phase 2a)",
-			    (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
+			    XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
 			    (unsigned long long)(XB_GATE_UNLATCH_NS / 1000000000ull));
 		}
 		return;
@@ -1366,10 +1487,10 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		if (!xb->gate_atlas_only_warned) {
 			xb->gate_atlas_only_warned = true;
 			U_LOG_W(
-			    "d3d11 xbridge: transport measured %.2f GB/s, above the %.1f GB/s acceptance gate, "
+			    "%s: transport measured %.2f GB/s, above the %.1f GB/s acceptance gate, "
 			    "but the planes account for only %.2f GB/s of it — the atlas is the cost and the "
 			    "gate has no lever on it, so nothing is throttled (#918 Phase 2a)",
-			    (double)total_rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
+			    XB_TAG(xb), (double)total_rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
 			    (double)plane_rate / 1.0e9);
 		}
 		return;
@@ -1380,11 +1501,11 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 	xb->plane[worst].half_rate = true;
 	xb->plane[worst].half_rate_parity = seq & 1ull;
 	U_LOG_W(
-	    "d3d11 xbridge: transport measured %.2f GB/s over the last second (planes %.2f GB/s), above "
+	    "%s: transport measured %.2f GB/s over the last second (planes %.2f GB/s), above "
 	    "the %.1f GB/s acceptance gate — latching the %s plane to HALF RATE until the transport "
 	    "settles. The split stays on (#918 Phase 2a)",
-	    (double)total_rate / 1.0e9, (double)plane_rate / 1.0e9, (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
-	    xb_plane_name(worst));
+	    XB_TAG(xb), (double)total_rate / 1.0e9, (double)plane_rate / 1.0e9,
+	    (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9, xb_plane_name(worst));
 }
 
 
@@ -1433,7 +1554,7 @@ xb_watchdog_thread(struct comp_xbridge *xb)
 
 		if (advanced || !(prod_stall || cons_stall || attempt_stall)) {
 			if (stage > 0) {
-				U_LOG_W("d3d11 xbridge: bridge recovered at prod=%llu cons=%llu (#1017)",
+				U_LOG_W("%s: bridge recovered at prod=%llu cons=%llu (#1017)", XB_TAG(xb),
 				        (unsigned long long)prod_done, (unsigned long long)cons_done);
 			}
 			last_prod_done = prod_done;
@@ -1459,15 +1580,17 @@ xb_watchdog_thread(struct comp_xbridge *xb)
 			                                            : "CONSUMER link (frames attempted, no egress "
 			                                              "progress — allocators never free)");
 			U_LOG_W(
-			    "d3d11 xbridge: %s stalled for %lld ms — submitted=%llu prod=%llu cons=%llu "
+			    "%s: %s stalled for %lld ms — submitted=%llu prod=%llu cons=%llu "
 			    "attempts=%llu (#1017)",
-			    link, (long long)ms, (unsigned long long)prod_target, (unsigned long long)prod_done,
-			    (unsigned long long)cons_done, (unsigned long long)attempted);
+			    XB_TAG(xb), link, (long long)ms, (unsigned long long)prod_target,
+			    (unsigned long long)prod_done, (unsigned long long)cons_done,
+			    (unsigned long long)attempted);
 			if (want >= 2 && !xb->degraded.load(std::memory_order_relaxed)) {
 				xb->degraded.store(true, std::memory_order_release);
 				U_LOG_W(
-				    "d3d11 xbridge: DEGRADED — no further submissions; the last good "
-				    "egress slot keeps being woven (#1017)");
+				    "%s: DEGRADED — no further submissions; the last good "
+				    "egress slot keeps being woven (#1017)",
+				    XB_TAG(xb));
 			}
 		}
 	}
@@ -1531,53 +1654,91 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		}
 	}
 
-	xb->app_dev = static_cast<ID3D11Device *>(info->app_device);
-	xb->app_ctx = static_cast<ID3D11DeviceContext *>(info->app_context);
-	xb->out_dev = static_cast<ID3D11Device *>(info->out_device);
-	xb->out_ctx = static_cast<ID3D11DeviceContext *>(info->out_context);
-	xb->app_dev->AddRef();
-	xb->app_ctx->AddRef();
-	xb->out_dev->AddRef();
-	if (xb->out_ctx != nullptr) {
-		xb->out_ctx->AddRef();
-		// Cached once: gpu_wait_slot runs on the weave path, which must not QI
-		// per frame (#918 F9). A failure here only costs the GPU-side wait.
-		if (FAILED(xb->out_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
-		                                       reinterpret_cast<void **>(&xb->out_ctx4)))) {
-			xb->out_ctx4 = nullptr;
+	xb->d3d12_ends = info->d3d12_ends;
+
+	if (xb->d3d12_ends) {
+		/*
+		 * #918 D12-3a — D3D12 ends. The producer and the consumer are not devices
+		 * the bridge creates; they ARE the caller's two devices. That is the whole
+		 * saving: every NT share below exists only to reach across an API
+		 * boundary, and with D3D12 on both ends there is no boundary left.
+		 *
+		 * `prod_dev` / `cons_dev` are AddRef'd aliases, so all the middle code —
+		 * heaps, placed resources, queues, allocators, lists, the watchdog — is
+		 * reached completely unchanged.
+		 */
+		// Validated BEFORE anything is stored: `fail` releases every member, so
+		// a pointer parked in the struct without its AddRef would be released on
+		// a reference the bridge never took.
+		if (info->app_device == nullptr || info->app_queue == nullptr || info->out_device == nullptr ||
+		    info->out_queue == nullptr) {
+			U_LOG_W("%s: D3D12 ends require app/out device AND queue", XB_TAG(xb));
+			*out_reason = "D3D12 ends incomplete";
+			goto fail;
 		}
-	}
+		xb->app_dev12 = static_cast<ID3D12Device *>(info->app_device);
+		xb->app_q12 = static_cast<ID3D12CommandQueue *>(info->app_queue);
+		xb->out_dev12 = static_cast<ID3D12Device *>(info->out_device);
+		xb->out_q12 = static_cast<ID3D12CommandQueue *>(info->out_queue);
+		xb->app_dev12->AddRef();
+		xb->app_q12->AddRef();
+		xb->out_dev12->AddRef();
+		xb->out_q12->AddRef();
 
-	hr = xb->app_dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&xb->app_dev5));
-	if (SUCCEEDED(hr)) {
-		hr = xb->app_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
-		                                 reinterpret_cast<void **>(&xb->app_ctx4));
-	}
-	if (FAILED(hr) || xb->app_dev5 == nullptr || xb->app_ctx4 == nullptr) {
-		U_LOG_W("d3d11 xbridge: app device has no ID3D11Device5/Context4 %s", xb_hr(hr, b, sizeof(b)));
-		*out_reason = "app device lacks D3D11.4 fences";
-		goto fail;
-	}
-	hr = xb->out_dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&xb->out_dev5));
-	if (FAILED(hr)) {
-		xb->out_dev5 = nullptr; // non-fatal: only costs the GPU-side egress wait
-	}
+		xb->prod_dev = xb->app_dev12;
+		xb->prod_dev->AddRef();
+		xb->cons_dev = xb->out_dev12;
+		xb->cons_dev->AddRef();
+	} else {
+		xb->app_dev = static_cast<ID3D11Device *>(info->app_device);
+		xb->app_ctx = static_cast<ID3D11DeviceContext *>(info->app_context);
+		xb->out_dev = static_cast<ID3D11Device *>(info->out_device);
+		xb->out_ctx = static_cast<ID3D11DeviceContext *>(info->out_context);
+		xb->app_dev->AddRef();
+		xb->app_ctx->AddRef();
+		xb->out_dev->AddRef();
+		if (xb->out_ctx != nullptr) {
+			xb->out_ctx->AddRef();
+			// Cached once: gpu_wait_slot runs on the weave path, which must not QI
+			// per frame (#918 F9). A failure here only costs the GPU-side wait.
+			if (FAILED(xb->out_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
+			                                       reinterpret_cast<void **>(&xb->out_ctx4)))) {
+				xb->out_ctx4 = nullptr;
+			}
+		}
 
-	// --- D3D12 devices + COPY queues -------------------------------------
-	hr = D3D12CreateDevice(static_cast<IDXGIAdapter *>(info->app_adapter), D3D_FEATURE_LEVEL_11_0,
-	                       __uuidof(ID3D12Device), reinterpret_cast<void **>(&xb->prod_dev));
-	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: D3D12CreateDevice(producer/app adapter) failed %s", xb_hr(hr, b, sizeof(b)));
-		*out_reason = "D3D12CreateDevice failed";
-		goto fail;
-	}
-	hr = D3D12CreateDevice(static_cast<IDXGIAdapter *>(info->out_adapter), D3D_FEATURE_LEVEL_11_0,
-	                       __uuidof(ID3D12Device), reinterpret_cast<void **>(&xb->cons_dev));
-	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: D3D12CreateDevice(consumer/scanout adapter) failed %s",
-		        xb_hr(hr, b, sizeof(b)));
-		*out_reason = "D3D12CreateDevice failed";
-		goto fail;
+		hr = xb->app_dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&xb->app_dev5));
+		if (SUCCEEDED(hr)) {
+			hr = xb->app_ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
+			                                 reinterpret_cast<void **>(&xb->app_ctx4));
+		}
+		if (FAILED(hr) || xb->app_dev5 == nullptr || xb->app_ctx4 == nullptr) {
+			U_LOG_W("%s: app device has no ID3D11Device5/Context4 %s", XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
+			*out_reason = "app device lacks D3D11.4 fences";
+			goto fail;
+		}
+		hr = xb->out_dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&xb->out_dev5));
+		if (FAILED(hr)) {
+			xb->out_dev5 = nullptr; // non-fatal: only costs the GPU-side egress wait
+		}
+
+		// --- D3D12 devices + COPY queues ---------------------------------
+		hr = D3D12CreateDevice(static_cast<IDXGIAdapter *>(info->app_adapter), D3D_FEATURE_LEVEL_11_0,
+		                       __uuidof(ID3D12Device), reinterpret_cast<void **>(&xb->prod_dev));
+		if (FAILED(hr)) {
+			U_LOG_W("%s: D3D12CreateDevice(producer/app adapter) failed %s", XB_TAG(xb),
+			        xb_hr(hr, b, sizeof(b)));
+			*out_reason = "D3D12CreateDevice failed";
+			goto fail;
+		}
+		hr = D3D12CreateDevice(static_cast<IDXGIAdapter *>(info->out_adapter), D3D_FEATURE_LEVEL_11_0,
+		                       __uuidof(ID3D12Device), reinterpret_cast<void **>(&xb->cons_dev));
+		if (FAILED(hr)) {
+			U_LOG_W("%s: D3D12CreateDevice(consumer/scanout adapter) failed %s", XB_TAG(xb),
+			        xb_hr(hr, b, sizeof(b)));
+			*out_reason = "D3D12CreateDevice failed";
+			goto fail;
+		}
 	}
 
 	{
@@ -1614,7 +1775,7 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			xb->cons_list->Close();
 		}
 		if (FAILED(hr)) {
-			U_LOG_W("d3d11 xbridge: D3D12 copy queue/allocator/list failed %s", xb_hr(hr, b, sizeof(b)));
+			U_LOG_W("%s: D3D12 copy queue/allocator/list failed %s", XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 			*out_reason = "D3D12CreateDevice failed";
 			goto fail;
 		}
@@ -1646,8 +1807,8 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
 		                              D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
 
-		U_LOG_W("d3d11 xbridge: cross-adapter ring %ux%u rowPitch=%u heap=%llu bytes x%d", xb->max_w, xb->max_h,
-		        fp.Footprint.RowPitch, (unsigned long long)hd.SizeInBytes, XB_XA_RING);
+		U_LOG_W("%s: cross-adapter ring %ux%u rowPitch=%u heap=%llu bytes x%d", XB_TAG(xb), xb->max_w,
+		        xb->max_h, fp.Footprint.RowPitch, (unsigned long long)hd.SizeInBytes, XB_XA_RING);
 
 		for (int i = 0; i < XB_XA_RING; i++) {
 			hr = xb->prod_dev->CreateHeap(&hd, __uuidof(ID3D12Heap),
@@ -1671,7 +1832,7 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 				    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&xb->xa_cons[i]));
 			}
 			if (FAILED(hr)) {
-				U_LOG_W("d3d11 xbridge: cross-adapter heap/placed texture %d failed %s", i,
+				U_LOG_W("%s: cross-adapter heap/placed texture %d failed %s", XB_TAG(xb), i,
 				        xb_hr(hr, b, sizeof(b)));
 				*out_reason = "cross-adapter heap unsupported";
 				goto fail;
@@ -1680,17 +1841,26 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 	}
 
 	// --- fences -----------------------------------------------------------
-	hr = xb->app_dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
-	                               reinterpret_cast<void **>(&xb->f_app));
-	if (SUCCEEDED(hr)) {
-		hr = xb->f_app->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &xb->f_app_h);
-	}
-	if (SUCCEEDED(hr)) {
-		hr = xb->prod_dev->OpenSharedHandle(xb->f_app_h, __uuidof(ID3D12Fence),
-		                                    reinterpret_cast<void **>(&xb->f_app_prod));
+	if (xb->d3d12_ends) {
+		// The app queue and the producer queue are on the SAME device, so the
+		// app->producer ordering fence needs no share at all: one plain
+		// ID3D12Fence, signalled from `app_q12` in submit and waited on by
+		// `prod_q` there too. Same fence role, same seq, one API call.
+		hr = xb->prod_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+		                               reinterpret_cast<void **>(&xb->f_app_prod));
+	} else {
+		hr = xb->app_dev5->CreateFence(0, D3D11_FENCE_FLAG_SHARED, __uuidof(ID3D11Fence),
+		                               reinterpret_cast<void **>(&xb->f_app));
+		if (SUCCEEDED(hr)) {
+			hr = xb->f_app->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &xb->f_app_h);
+		}
+		if (SUCCEEDED(hr)) {
+			hr = xb->prod_dev->OpenSharedHandle(xb->f_app_h, __uuidof(ID3D12Fence),
+			                                    reinterpret_cast<void **>(&xb->f_app_prod));
+		}
 	}
 	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: app fence share failed %s", xb_hr(hr, b, sizeof(b)));
+		U_LOG_W("%s: app fence share failed %s", XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		*out_reason = "app fence share failed";
 		goto fail;
 	}
@@ -1706,7 +1876,7 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		                                    reinterpret_cast<void **>(&xb->f_xa_cons));
 	}
 	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: cross-adapter fence share failed %s", xb_hr(hr, b, sizeof(b)));
+		U_LOG_W("%s: cross-adapter fence share failed %s", XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		*out_reason = "cross-adapter heap unsupported";
 		goto fail;
 	}
@@ -1722,45 +1892,64 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 	 * ingress ring is latched instead, whose per-seq slot gives the copy a full
 	 * ring of margin.
 	 */
-	hr = xb->app_dev5->OpenSharedFence(xb->f_xa_h, __uuidof(ID3D11Fence), reinterpret_cast<void **>(&xb->f_xa_app));
-	if (SUCCEEDED(hr) && xb->f_xa_app != nullptr) {
+	if (xb->d3d12_ends) {
+		/*
+		 * #918 D12-3a — with D3D12 ends the back-fence needs no re-open: the app
+		 * device IS the producer device, so `f_xa_prod` is already a fence the
+		 * app's own queue can wait on. The failure mode this branch exists to
+		 * handle therefore cannot occur, which is why Option I is unconditionally
+		 * safe here and the staged fallback is unreachable (and refused).
+		 */
+		xb->app_back_wait_ok = true;
+	} else if (SUCCEEDED(hr = xb->app_dev5->OpenSharedFence(xb->f_xa_h, __uuidof(ID3D11Fence),
+	                                                        reinterpret_cast<void **>(&xb->f_xa_app))) &&
+	           xb->f_xa_app != nullptr) {
 		xb->app_back_wait_ok = true;
 	} else {
 		xb->app_back_wait_ok = false;
 		U_LOG_W(
-		    "d3d11 xbridge: the app device could not open the producer fence %s — ingress Option I "
+		    "%s: the app device could not open the producer fence %s — ingress Option I "
 		    "has no back-pressure and is unsafe; latching the staged ingress ring (#918)",
-		    xb_hr(hr, b, sizeof(b)));
+		    XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		if (!xb_latch_staged_ingress(xb, "ingress Option I has no back-pressure on this device")) {
 			*out_reason = "ingress back-fence unavailable";
 			goto fail;
 		}
 	}
 
-	hr = xb->cons_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence),
-	                               reinterpret_cast<void **>(&xb->f_out_cons));
-	if (SUCCEEDED(hr)) {
+	// D3D12 ends: the out queue lives on the consumer device, so the fence needs
+	// no share and no second open — hence FLAG_NONE and no CreateSharedHandle.
+	hr = xb->cons_dev->CreateFence(0, xb->d3d12_ends ? D3D12_FENCE_FLAG_NONE : D3D12_FENCE_FLAG_SHARED,
+	                               __uuidof(ID3D12Fence), reinterpret_cast<void **>(&xb->f_out_cons));
+	if (SUCCEEDED(hr) && !xb->d3d12_ends) {
 		hr = xb->cons_dev->CreateSharedHandle(xb->f_out_cons, nullptr, GENERIC_ALL, nullptr, &xb->f_out_h);
 	}
 	if (FAILED(hr)) {
-		U_LOG_W("d3d11 xbridge: consumer fence share failed %s", xb_hr(hr, b, sizeof(b)));
+		U_LOG_W("%s: consumer fence share failed %s", XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		*out_reason = "egress share failed";
 		goto fail;
 	}
 	// Same-adapter open on the OUTPUT D3D11 device. Optional: without it the
 	// slot pick is still CPU-verified complete before the weave, we simply lose
 	// the belt-and-braces GPU ordering (and the forced-depth mode's guarantee).
-	xb->out_gpu_wait_ok = false;
-	if (xb->out_dev5 != nullptr && xb->out_ctx4 != nullptr) {
+	//
+	// D3D12 ends: unconditionally available. `out_q12` is on the consumer device,
+	// so it waits on `f_out_cons` itself — the optionality here was never about
+	// the hardware, only about whether the fence could be re-opened across the
+	// API boundary, and there is no boundary. That in turn makes
+	// comp_xbridge_pick_inflight_slot (the #918 R1 transition pick) always
+	// available on this path rather than conditionally.
+	xb->out_gpu_wait_ok = xb->d3d12_ends;
+	if (!xb->d3d12_ends && xb->out_dev5 != nullptr && xb->out_ctx4 != nullptr) {
 		hr = xb->out_dev5->OpenSharedFence(xb->f_out_h, __uuidof(ID3D11Fence),
 		                                   reinterpret_cast<void **>(&xb->f_out_out11));
 		if (SUCCEEDED(hr) && xb->f_out_out11 != nullptr) {
 			xb->out_gpu_wait_ok = true;
 		} else {
 			U_LOG_W(
-			    "d3d11 xbridge: output device could not open the consumer fence %s — "
+			    "%s: output device could not open the consumer fence %s — "
 			    "slot picks stay CPU-verified only",
-			    xb_hr(hr, b, sizeof(b)));
+			    XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		}
 	}
 
@@ -1777,6 +1966,15 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		safe_close(xb->eg_share[0]);
 		safe_release(xb->eg_srv[0]);
 		safe_release(xb->eg_tex[0]);
+	}
+
+	if (xb->d3d12_ends) {
+		U_LOG_W(
+		    "%s: D3D12 ends — the producer IS the app device and the consumer IS the output device, "
+		    "so the atlas and the egress ring are unshared, ingress is Option I with no open to fail, "
+		    "and both GPU-side waits are direct queue waits. Planes are refused on this path "
+		    "(#918 D12-3a)",
+		    XB_TAG(xb));
 	}
 
 	xb->quit.store(false);
@@ -1820,7 +2018,7 @@ xb_alloc_egress(struct comp_xbridge *xb, uint32_t w, uint32_t h, bool content_si
 	xb->eg_content_sized = content_sized;
 	xb->weave_slot = -1;
 	xb->eg_reallocs++;
-	U_LOG_W("d3d11 xbridge: egress ring x%d at %ux%u on the scanout adapter (%s), rebuild #%llu (#918)",
+	U_LOG_W("%s: egress ring x%d at %ux%u on the scanout adapter (%s), rebuild #%llu (#918)", XB_TAG(xb),
 	        XB_EGRESS_RING, w, h, content_sized ? "content-sized" : "worst-case",
 	        (unsigned long long)xb->eg_reallocs);
 	return true;
@@ -1891,10 +2089,10 @@ comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, u
 				xb->churn = true;
 				xb->churn_entries++;
 				U_LOG_W(
-				    "d3d11 xbridge: content box is churning (%ux%u after %llu ms) — holding a "
+				    "%s: content box is churning (%ux%u after %llu ms) — holding a "
 				    "WORST-CASE egress ring and cropping on the output device so weaves keep "
 				    "landing through the resize (#918)",
-				    w, h, (unsigned long long)((now - prev_change_ns) / (1000 * 1000)));
+				    XB_TAG(xb), w, h, (unsigned long long)((now - prev_change_ns) / (1000 * 1000)));
 				if (xb->eg_w != xb->max_w || xb->eg_h != xb->max_h) {
 					comp_xbridge_alloc_worstcase_egress(xb);
 				}
@@ -1909,9 +2107,9 @@ comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, u
 			xb->churn = false;
 			xb->churn_settles++;
 			U_LOG_W(
-			    "d3d11 xbridge: content box settled at %ux%u — one realloc back to a "
+			    "%s: content box settled at %ux%u — one realloc back to a "
 			    "content-sized egress ring (#918)",
-			    w, h);
+			    XB_TAG(xb), w, h);
 			// Fall through: eg_* still holds the worst-case ring, so the
 			// equality shortcut below cannot swallow this.
 		}
@@ -1927,9 +2125,9 @@ comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, u
 		if (!xb->eg_content_sized) {
 			xb->eg_content_sized = true;
 			U_LOG_W(
-			    "d3d11 xbridge: egress ring %ux%u already matches the content box — "
+			    "%s: egress ring %ux%u already matches the content box — "
 			    "no crop needed (#918)",
-			    w, h);
+			    XB_TAG(xb), w, h);
 		}
 		return true;
 	}
@@ -1953,9 +2151,9 @@ comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, u
 	xb->eg_fail_w = w;
 	xb->eg_fail_h = h;
 	U_LOG_W(
-	    "d3d11 xbridge: egress ring could not be sized to %ux%u — keeping the worst-case ring and "
+	    "%s: egress ring could not be sized to %ux%u — keeping the worst-case ring and "
 	    "cropping on the output device; this size will not be retried (#918)",
-	    w, h);
+	    XB_TAG(xb), w, h);
 	comp_xbridge_alloc_worstcase_egress(xb);
 	return false;
 }
@@ -2011,7 +2209,7 @@ xb_alloc_ingress_ring(struct comp_xbridge *xb)
 			                                    reinterpret_cast<void **>(&xb->in_12[i]));
 		}
 		if (FAILED(hr)) {
-			U_LOG_W("d3d11 xbridge: Option II ingress ring failed %s — bridge inoperative",
+			U_LOG_W("%s: Option II ingress ring failed %s — bridge inoperative", XB_TAG(xb),
 			        xb_hr(hr, b, sizeof(b)));
 			return false;
 		}
@@ -2024,6 +2222,29 @@ xb_latch_staged_ingress(struct comp_xbridge *xb, const char *why)
 {
 	if (xb->ingress_mode == XB_INGRESS_STAGED) {
 		return true;
+	}
+	/*
+	 * #918 D12-3a — there is no Option II with D3D12 ends, and the honest answer
+	 * is to say so rather than to build one nothing needs.
+	 *
+	 * Option II exists for two reasons, and neither survives the move: the source
+	 * may be un-openable (there is no open — the producer reads the caller's own
+	 * resource), or its identity may change per frame (the fence-deferred retire
+	 * in comp_xbridge_bind_atlas_resource already covers that, and covers it
+	 * without a per-frame copy). Building it anyway would also need a command
+	 * list on the app's DIRECT queue, which the bridge does not own and must not
+	 * start owning — recording onto the caller's list is a contract change.
+	 *
+	 * Reaching here at all would mean a caller asked for staged ingress on this
+	 * path; refusing keeps Option I, which is unconditionally safe here (the
+	 * back-fence cannot fail — see the create path).
+	 */
+	if (xb->d3d12_ends) {
+		U_LOG_W(
+		    "%s: staged ingress is not available with D3D12 ends (%s) — staying on Option I, which "
+		    "needs no share and no back-fence open on this path (#918 D12-3a)",
+		    XB_TAG(xb), why);
+		return false;
 	}
 	if (!xb_alloc_ingress_ring(xb)) {
 		return false;
@@ -2041,9 +2262,9 @@ xb_latch_staged_ingress(struct comp_xbridge *xb, const char *why)
 	xb->src_armed = false;
 	xb->ingress_mode = XB_INGRESS_STAGED;
 	U_LOG_W(
-	    "d3d11 xbridge: %s — using the staged ingress ring "
+	    "%s: %s — using the staged ingress ring "
 	    "(one extra app-device copy per frame) (#918)",
-	    why);
+	    XB_TAG(xb), why);
 	return true;
 }
 
@@ -2066,6 +2287,17 @@ comp_xbridge_enable_adaptive_ingress(struct comp_xbridge *xb)
 	if (xb == nullptr) {
 		return false;
 	}
+	// #918 D12-3a: adaptive is Option I plus an Option-II fallback, and there is
+	// no Option II with D3D12 ends. Refused, and nothing is lost — the thing
+	// adaptive exists to make safe (a source whose identity changes) is exactly
+	// what comp_xbridge_bind_atlas_resource's fence-deferred retire already does.
+	if (xb->d3d12_ends) {
+		U_LOG_W(
+		    "%s: adaptive ingress is not available with D3D12 ends — Option I already handles a "
+		    "changing source through the deferred-retire ring (#918 D12-3a)",
+		    XB_TAG(xb));
+		return false;
+	}
 	// The staging ring is the per-frame fallback and is not optional: without it
 	// the frame a source change lands on has nothing to copy out of.
 	if (!xb_alloc_ingress_ring(xb)) {
@@ -2084,15 +2316,17 @@ comp_xbridge_enable_adaptive_ingress(struct comp_xbridge *xb)
 	if (!xb->app_back_wait_ok) {
 		xb->ingress_mode = XB_INGRESS_STAGED;
 		U_LOG_W(
-		    "d3d11 xbridge: adaptive ingress refused — the app device has no producer back-fence, so "
-		    "reading a source in place is unsafe; staying on the staged ingress ring (#918 F6)");
+		    "%s: adaptive ingress refused — the app device has no producer back-fence, so "
+		    "reading a source in place is unsafe; staying on the staged ingress ring (#918 F6)",
+		    XB_TAG(xb));
 		return true;
 	}
 	xb->ingress_mode = XB_INGRESS_ADAPTIVE;
 	xb->src_armed = false;
 	U_LOG_W(
-	    "d3d11 xbridge: ADAPTIVE ingress — a stable source is read in place (Option I); the frame a "
-	    "source change lands on stages (Option II) and re-binds (#918 Phase 2b)");
+	    "%s: ADAPTIVE ingress — a stable source is read in place (Option I); the frame a "
+	    "source change lands on stages (Option II) and re-binds (#918 Phase 2b)",
+	    XB_TAG(xb));
 	return true;
 }
 
@@ -2224,9 +2458,9 @@ comp_xbridge_set_source(struct comp_xbridge *xb, void *nt_handle, uint64_t sourc
 		if (!xb->ing_open_warned) {
 			xb->ing_open_warned = true;
 			U_LOG_W(
-			    "d3d11 xbridge: the producer could not open an ingress source %s — that source stages "
+			    "%s: the producer could not open an ingress source %s — that source stages "
 			    "(#918 PR 6, once)",
-			    xb_hr(hr, b, sizeof(b)));
+			    XB_TAG(xb), xb_hr(hr, b, sizeof(b)));
 		}
 		return false;
 	}
@@ -2263,6 +2497,11 @@ comp_xbridge_bind_atlas(struct comp_xbridge *xb, void *nt_handle, uint64_t gener
 	if (xb == nullptr) {
 		return false;
 	}
+	// #918 D12-3a: an NT handle is the D3D11-ends way in. A D3D12-ends caller
+	// binds its atlas by pointer instead — see comp_xbridge_bind_atlas_resource.
+	if (xb->d3d12_ends) {
+		return false;
+	}
 	if (xb->ingress_mode == XB_INGRESS_STAGED) {
 		return true; // already latched; nothing to re-open
 	}
@@ -2286,26 +2525,80 @@ comp_xbridge_bind_atlas(struct comp_xbridge *xb, void *nt_handle, uint64_t gener
 	 * than hand the copy queue a freed resource (same rationale as F1).
 	 */
 	if (xb->atlas_12 != nullptr &&
-	    !xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire), "atlas re-bind")) {
+	    !xb_drain_fence(xb, xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire), "atlas re-bind")) {
 		xb->atlas_12 = nullptr; // deliberate leak — a UAF is not recoverable
 		if (!xb->degraded.load(std::memory_order_relaxed)) {
 			xb->degraded.store(true, std::memory_order_release);
 			U_LOG_W(
-			    "d3d11 xbridge: DEGRADED — the producer queue would not drain for an atlas "
-			    "re-bind; no further submissions (#918)");
+			    "%s: DEGRADED — the producer queue would not drain for an atlas "
+			    "re-bind; no further submissions (#918)",
+			    XB_TAG(xb));
 		}
 	}
 	safe_release(xb->atlas_12);
 	HRESULT hr = xb->prod_dev->OpenSharedHandle(static_cast<HANDLE>(nt_handle), __uuidof(ID3D12Resource),
 	                                            reinterpret_cast<void **>(&xb->atlas_12));
 	if (FAILED(hr) || xb->atlas_12 == nullptr) {
-		U_LOG_W("d3d11 xbridge: producer OpenSharedHandle(atlas gen=%llu) failed %s",
+		U_LOG_W("%s: producer OpenSharedHandle(atlas gen=%llu) failed %s", XB_TAG(xb),
 		        (unsigned long long)generation, xb_hr(hr, b, sizeof(b)));
 		return xb_latch_staged_ingress(xb,
 		                               "the renderer atlas could not be opened by the producer D3D12 device");
 	}
 	xb->atlas_gen = generation;
-	U_LOG_W("d3d11 xbridge: producer bound the renderer atlas (generation %llu)", (unsigned long long)generation);
+	U_LOG_W("%s: producer bound the renderer atlas (generation %llu)", XB_TAG(xb), (unsigned long long)generation);
+	return true;
+}
+
+extern "C" bool
+comp_xbridge_bind_atlas_resource(struct comp_xbridge *xb, void *resource, uint64_t generation)
+{
+	if (xb == nullptr || !xb->d3d12_ends) {
+		return false;
+	}
+	auto *res = static_cast<ID3D12Resource *>(resource);
+	if (res == nullptr) {
+		// Unbind. Same deferred retire as a re-bind: the producer's copy of the
+		// last submitted seq may still be reading it.
+		if (xb->atlas_12 != nullptr) {
+			xb_retire_source(xb, xb->atlas_12);
+			xb->atlas_12 = nullptr;
+			xb->atlas_gen = 0;
+		}
+		return false;
+	}
+	if (xb->atlas_12 == res && xb->atlas_gen == generation) {
+		return true;
+	}
+
+	/*
+	 * Same #918 F2 hazard as the NT-handle bind — the producer's copy of the last
+	 * submitted seq reads exactly the resource we are dropping — but handled with
+	 * the STRONGER of the two tools the bridge already owns, not the weaker one.
+	 *
+	 * The D3D11 path above takes a bounded CPU DRAIN because it must release the
+	 * open synchronously or lose track of it. Here there is nothing to drain FOR:
+	 * this is a fence-deferred retire, the exact mechanism #918 PR 6 built for
+	 * adaptive ingress precisely because a drain on a caller's frame thread is
+	 * the #925 wedge class. So it costs no wait at all, and the ring-exhaustion
+	 * tripwire (`ing_leak`, leak-never-wait) carries over unchanged.
+	 *
+	 * Note also what our reference means here: the app owns the atlas and keeps
+	 * its own reference, so ours is not what keeps the resource alive — the
+	 * retire is about not RELEASING under a live copy, which is the same
+	 * invariant, reached without blocking anybody.
+	 */
+	if (xb->atlas_12 != nullptr) {
+		xb_retire_source(xb, xb->atlas_12);
+		xb->atlas_12 = nullptr;
+		xb->ing_rebind++;
+	}
+	res->AddRef();
+	xb->atlas_12 = res;
+	xb->atlas_gen = generation;
+	U_LOG_W(
+	    "%s: producer bound the app's atlas resource %p directly (generation %llu) — no share, no "
+	    "open, no drain (#918 D12-3a)",
+	    XB_TAG(xb), (void *)res, (unsigned long long)generation);
 	return true;
 }
 
@@ -2371,7 +2664,25 @@ xb_app_back_wait(struct comp_xbridge *xb, uint64_t want)
 	if (want == 0 || want <= xb->app_waited_seq) {
 		return;
 	}
-	xb->app_ctx4->Wait(xb->f_xa_app, want);
+	if (xb->d3d12_ends) {
+		/*
+		 * #918 D12-3a. Same wait, one indirection fewer: `f_xa_prod` lives on the
+		 * producer device, which IS the app device, so the app's own queue waits
+		 * on it directly instead of on a re-opened D3D11 mirror.
+		 *
+		 * This is a GPU-side wait ON THE APP QUEUE, and it must not be mistaken
+		 * for the thing D12-2 forbids. What it waits for is the PRODUCER copy
+		 * queue, on the app's own adapter; the producer in turn waits only on
+		 * `f_app_prod`, which this same app queue signals. The output queue
+		 * appears nowhere in that chain, so no app-side wait can ever be made to
+		 * cover out-queue work — the data flows app -> out and the only
+		 * cross-adapter ordering is `cons_q->Wait(f_xa_cons)`, never the inverse.
+		 * And it is a queue wait, never a CPU one, so this thread does not block.
+		 */
+		xb->app_q12->Wait(xb->f_xa_prod, want);
+	} else {
+		xb->app_ctx4->Wait(xb->f_xa_app, want);
+	}
 	xb->app_waited_seq = want;
 }
 
@@ -2457,6 +2768,8 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 
 	// Option II: stage the content box into an app-device NT-shared texture the
 	// producer can open. One extra same-adapter copy, still no CPU wait.
+	// Unreachable with D3D12 ends — `use_direct` is always true there, because
+	// the only mode is DIRECT and every latch to STAGED is refused at create.
 	if (!use_direct) {
 		const int in = (int)(seq % XB_INGRESS_RING);
 		auto *atlas = static_cast<ID3D11Texture2D *>(atlas_texture);
@@ -2474,8 +2787,18 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	// The app's writes to the atlas complete before the producer reads it. This
 	// is a fence SIGNAL on the immediate context — no CPU wait. The Flush is
 	// what makes the signal reach the GPU now rather than at the next present.
-	xb->app_ctx4->Signal(xb->f_app, seq);
-	xb->app_ctx->Flush();
+	//
+	// D3D12 ends: the same signal on the app's own queue. There is no Flush
+	// because there is nothing deferred — a queue Signal is already submitted
+	// work — and no share, because the fence lives on the app device. The caller
+	// owes us only that it executed the frame's atlas work on this queue first,
+	// which is the header's stated contract.
+	if (xb->d3d12_ends) {
+		xb->app_q12->Signal(xb->f_app_prod, seq);
+	} else {
+		xb->app_ctx4->Signal(xb->f_app, seq);
+		xb->app_ctx->Flush();
+	}
 
 	const int pa = (int)(seq % XB_ALLOC_RING);
 	const int ca = pa;
@@ -2696,11 +3019,12 @@ comp_xbridge_pick_slot(struct comp_xbridge *xb, uint64_t want_gen)
 	const uint64_t total = xb->pick_now + xb->pick_prev + xb->pick_older + xb->pick_none;
 	if (total > 0 && (total % 1000) == 0) {
 		U_LOG_I(
-		    "d3d11 xbridge: pick distribution over %llu weaves — seq=%llu seq-1=%llu older=%llu "
+		    "%s: pick distribution over %llu weaves — seq=%llu seq-1=%llu older=%llu "
 		    "none=%llu (of which stale-layout refusals %llu; alloc-busy skips %llu)",
-		    (unsigned long long)total, (unsigned long long)xb->pick_now, (unsigned long long)xb->pick_prev,
-		    (unsigned long long)xb->pick_older, (unsigned long long)xb->pick_none,
-		    (unsigned long long)xb->pick_stale_gen, (unsigned long long)xb->skip_alloc_busy);
+		    XB_TAG(xb), (unsigned long long)total, (unsigned long long)xb->pick_now,
+		    (unsigned long long)xb->pick_prev, (unsigned long long)xb->pick_older,
+		    (unsigned long long)xb->pick_none, (unsigned long long)xb->pick_stale_gen,
+		    (unsigned long long)xb->skip_alloc_busy);
 	}
 	return pick;
 }
@@ -2741,6 +3065,13 @@ comp_xbridge_gpu_wait_slot(struct comp_xbridge *xb, int32_t slot)
 	if (want == 0) {
 		return;
 	}
+	if (xb->d3d12_ends) {
+		// The out queue is on the consumer device, so it waits on the consumer's
+		// own fence — no mirror, no open, and (unlike the D3D11 path) never
+		// unavailable. Still a GPU-side wait: the weave thread does not block.
+		xb->out_q12->Wait(xb->f_out_cons, want);
+		return;
+	}
 	// out_ctx4 is cached at create — out_gpu_wait_ok implies it is non-NULL.
 	xb->out_ctx4->Wait(xb->f_out_out11, want);
 }
@@ -2767,7 +3098,27 @@ comp_xbridge_get_srv(struct comp_xbridge *xb, int32_t slot)
 	if (xb == nullptr || slot < 0 || slot >= XB_EGRESS_RING) {
 		return nullptr;
 	}
-	return xb->eg_srv[slot];
+	// D3D12 ends have no D3D11 view; `eg_srv` is NULL there anyway, but say so
+	// rather than rely on that — see comp_xbridge_get_egress_resource.
+	return xb->d3d12_ends ? nullptr : xb->eg_srv[slot];
+}
+
+extern "C" void *
+comp_xbridge_get_egress_resource(struct comp_xbridge *xb, int32_t slot)
+{
+	if (xb == nullptr || !xb->d3d12_ends || slot < 0 || slot >= XB_EGRESS_RING) {
+		return nullptr;
+	}
+	/*
+	 * Guarded on `d3d12_ends` deliberately, not merely because the other path
+	 * would return something odd: on a D3D11-ends bridge `eg_12[slot]` is the
+	 * CONSUMER's open of an output-device D3D11 texture, and the consumer is a
+	 * device the bridge created — not the caller's output device. Handing it back
+	 * would give a caller a resource belonging to a device it has never seen,
+	 * which is the exact class of mistake the #918 Phase 2 plane transports exist
+	 * to prevent.
+	 */
+	return xb->eg_12[slot];
 }
 
 extern "C" void
@@ -2823,28 +3174,31 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 	// hybrid stack that has wedged must not turn a session teardown into a hang —
 	// but a timeout here means the releases below are unsafe, so it also latches
 	// `drain_failed` and the destroy leaks instead of freeing (#918 F1/F2).
-	if (!xb_drain_fence(xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire), "teardown producer") ||
-	    !xb_drain_fence(xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "teardown consumer")) {
+	if (!xb_drain_fence(xb, xb->f_xa_prod, xb->prod_submit_seq.load(std::memory_order_acquire),
+	                    "teardown producer") ||
+	    !xb_drain_fence(xb, xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire),
+	                    "teardown consumer")) {
 		xb->drain_failed = true;
 	}
 
 	const uint64_t total = xb->pick_now + xb->pick_prev + xb->pick_older + xb->pick_none;
 	if (total > 0) {
 		U_LOG_W(
-		    "d3d11 xbridge: %llu frames bridged; picks seq=%llu seq-1=%llu older=%llu none=%llu "
+		    "%s: %llu frames bridged; picks seq=%llu seq-1=%llu older=%llu none=%llu "
 		    "in-flight=%llu (stale-layout refusals %llu; alloc-busy skips %llu); egress rebuilds %llu "
 		    "(resize-churn entries %llu, settles %llu)",
-		    (unsigned long long)xb->frames, (unsigned long long)xb->pick_now, (unsigned long long)xb->pick_prev,
-		    (unsigned long long)xb->pick_older, (unsigned long long)xb->pick_none,
-		    (unsigned long long)xb->pick_inflight, (unsigned long long)xb->pick_stale_gen,
-		    (unsigned long long)xb->skip_alloc_busy, (unsigned long long)xb->eg_reallocs,
-		    (unsigned long long)xb->churn_entries, (unsigned long long)xb->churn_settles);
+		    XB_TAG(xb), (unsigned long long)xb->frames, (unsigned long long)xb->pick_now,
+		    (unsigned long long)xb->pick_prev, (unsigned long long)xb->pick_older,
+		    (unsigned long long)xb->pick_none, (unsigned long long)xb->pick_inflight,
+		    (unsigned long long)xb->pick_stale_gen, (unsigned long long)xb->skip_alloc_busy,
+		    (unsigned long long)xb->eg_reallocs, (unsigned long long)xb->churn_entries,
+		    (unsigned long long)xb->churn_settles);
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		U_LOG_W(
-		    "d3d11 xbridge: adaptive ingress — %llu settled source re-binds, %llu churn changes that never "
+		    "%s: adaptive ingress — %llu settled source re-binds, %llu churn changes that never "
 		    "re-opened, %llu leaked opens (must be 0) (#918 PR 6)",
-		    (unsigned long long)xb->ing_rebind, (unsigned long long)xb->ing_churn,
+		    XB_TAG(xb), (unsigned long long)xb->ing_rebind, (unsigned long long)xb->ing_churn,
 		    (unsigned long long)xb->ing_leak);
 	}
 	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
@@ -2852,7 +3206,7 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 		if (!pl.live && pl.copies == 0) {
 			continue;
 		}
-		U_LOG_W("d3d11 xbridge: %s plane — %llu copies, %llu change-skips%s (#918 Phase 2a)", xb_plane_name(p),
+		U_LOG_W("%s: %s plane — %llu copies, %llu change-skips%s (#918 Phase 2a)", XB_TAG(xb), xb_plane_name(p),
 		        (unsigned long long)pl.copies, (unsigned long long)pl.skips,
 		        pl.half_rate ? ", LATCHED to half rate by the bandwidth gate" : "");
 	}
@@ -2880,9 +3234,10 @@ comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 	 */
 	if (xb->drain_failed) {
 		U_LOG_W(
-		    "d3d11 xbridge: teardown drain never completed — LEAKING the D3D12 side "
+		    "%s: teardown drain never completed — LEAKING the D3D12 side "
 		    "(both devices, queues, the cross-adapter ring and the egress opens) rather than "
-		    "freeing resources under in-flight copies (#918)");
+		    "freeing resources under in-flight copies (#918)",
+		    XB_TAG(xb));
 		safe_release(xb->f_out_out11);
 		safe_release(xb->f_xa_app);
 		safe_release(xb->out_ctx4);
@@ -2893,6 +3248,21 @@ comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 		safe_release(xb->app_ctx);
 		safe_release(xb->app_dev5);
 		safe_release(xb->app_dev);
+		/*
+		 * #918 D12-3a — the ENDS are the caller's objects and our references on
+		 * them are safe to drop (the caller holds its own), exactly as the D3D11
+		 * ends above are. What is leaked is the D3D12 SIDE, and on this path
+		 * `prod_dev` / `cons_dev` are aliases of these two devices — so leaking
+		 * the D3D12 side leaks ONE reference on each of the app's and the
+		 * runtime's device. That is the intended trade and it is not new: every
+		 * queue, allocator and heap being leaked already holds a device reference
+		 * internally, so the devices were going to outlive this teardown either
+		 * way. A recoverable leak beats a use-after-free on a live copy queue.
+		 */
+		safe_release(xb->out_q12);
+		safe_release(xb->out_dev12);
+		safe_release(xb->app_q12);
+		safe_release(xb->app_dev12);
 		delete xb;
 		return;
 	}
@@ -2911,7 +3281,7 @@ comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 	 */
 	{
 		const bool pl_drained = xb_drain_fence(
-		    xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "plane release");
+		    xb, xb->f_out_cons, xb->last_submit_seq.load(std::memory_order_acquire), "plane release");
 		for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 			xb_release_plane(xb, p, pl_drained);
 		}
@@ -2968,6 +3338,14 @@ comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 	safe_release(xb->app_ctx);
 	safe_release(xb->app_dev5);
 	safe_release(xb->app_dev);
+
+	// #918 D12-3a — the D3D12 ends. Last, for the same reason the D3D11 ends are
+	// last: `prod_dev` / `cons_dev` above are aliases of these, so the second
+	// reference must not go until every child object has.
+	safe_release(xb->out_q12);
+	safe_release(xb->out_dev12);
+	safe_release(xb->app_q12);
+	safe_release(xb->app_dev12);
 
 	delete xb;
 }
