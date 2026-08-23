@@ -95,7 +95,7 @@ this sentence was true of the design and false of the code: the bridge *was* a
 mode to opt into, behind `DXR_WEAVE_ON_SCANOUT=1`, off by default for a release
 cycle. It now engages automatically wherever the two adapters differ and the
 path implements it — in-process D3D11, the D3D11 service (eligible presenter
-kinds per §7), in-process D3D12 (projection-only). `DXR_WEAVE_ON_SCANOUT` is
+kinds per §7), in-process D3D12. `DXR_WEAVE_ON_SCANOUT` is
 retained as a **kill switch** (`=0`), not an opt-in; `=1` still parses and is a
 no-op restatement of the default.
 
@@ -388,11 +388,17 @@ before it is attempted.
      split lives in the service's compositor, downstream of IPC, so a
      D3D12/VK/GL client benefits whenever its presenter kind is eligible);
      zones/Local2D and mask planes; recipe-with-pixels; transport hardening.
-   - **shipped, auto-on, projection-only**: in-process D3D12 (Unity/Unreal) —
-     ladder D12-0…D12-5, through D12-3 (#1150, #1151, #1164). A zones / Local2D
-     / mask frame retires the split for the session
-     (`reason=layers_unsupported`), as does a DP that declines the scanout
-     adapter (`reason=dp_refused_scanout`, §3a).
+   - **shipped, auto-on**: in-process D3D12 (Unity/Unreal) — ladder D12-0…D12-5,
+     through D12-4 (#1150, #1151, #1164, D12-4). D12-3 shipped it projection-only
+     and D12-4 added the plane transports, so **zones and Local2D now composite on
+     the scanout adapter** — which is what the flagship Unity path needed, since
+     the shipping avatar sample carries zones plus a Local2D band every session
+     and used to retire on frame one. Two things still retire the split for the
+     session: an **app-authored (Tier-3) zone mask**, whose pixels the application
+     draws on the render adapter and which has no transport yet
+     (`reason=authored_mask`, D12-5), and a DP that declines the scanout adapter
+     (`reason=dp_refused_scanout`, §3a). `reason=layers_unsupported` is no longer
+     emitted by this leg — a D3D12 session reporting it is a pre-D12-4 build.
    - **pending a decision, not just work**: in-process Vulkan. The cheap
      alternative measured well — whole-app placement on the scanout adapter via
      `DXR_VK_FORCE_GPU=scanout` eliminated *all* of the app's discrete-GPU work
