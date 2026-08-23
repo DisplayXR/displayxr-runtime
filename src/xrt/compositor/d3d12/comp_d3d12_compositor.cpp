@@ -985,6 +985,44 @@ d3d12_make_target(struct comp_d3d12_compositor *c, bool transparent)
 }
 
 /*!
+ * THE OUTPUT-DEVICE SPLIT'S TWO DEV-ONLY FAULT-INJECTION ARMS (#918 D12-3).
+ * Documented together because they walk the two HALVES of the same fallback
+ * matrix, and finding one without the other is how a verification pass ends up
+ * covering half of it.
+ *
+ *   `DXR_TEST_SPLIT_FAIL_STAGEA=1` — the PRE-activation half. Fails Stage A at
+ *       the point the bridge would be created, so "one WARN, stock path" is
+ *       walked without a machine that genuinely cannot allocate a cross-adapter
+ *       heap. Read by @ref comp_split_gate_env_test_fail_stage_a (it is shared
+ *       with the D3D11 legs); used in @ref d3d12_split_stage_a.
+ *
+ *   `DXR_TEST_FAKE_DP_REFUSE=1` — the POST-activation half, below. Makes the
+ *       display processor decline a weaver on the SCANOUT adapter, which is the
+ *       one fallback row that can only fire after the split is already up and
+ *       the target already lives on the other device (ADR-037 §3a).
+ *
+ * Same shape as `DXR_TEST_FAKE_DEVICE_REMOVED` in the D3D11 service: opt-in
+ * env, latched on first read, never anything but a test.
+ *
+ * The arm fires ONLY while the split is active — i.e. only on the OUT-device
+ * create — and that asymmetry is the whole point. What is under test is the
+ * RECOVERY: refuse on the scanout adapter, retire the split, and let the
+ * app-device rebuild succeed, so the session ends up weaving. An arm that also
+ * failed the rebuild would leave no display processor anywhere and would be
+ * testing a different (and less interesting) thing.
+ */
+static bool
+d3d12_test_fake_dp_refuse(void)
+{
+	static int want = -1;
+	if (want < 0) {
+		const char *e = getenv("DXR_TEST_FAKE_DP_REFUSE");
+		want = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return want == 1;
+}
+
+/*!
  * Create the display processor on the device the weave will run on, and apply
  * the three session-level settings that have to follow it there.
  *
@@ -994,20 +1032,36 @@ d3d12_make_target(struct comp_d3d12_compositor *c, bool transparent)
  * and in that order, because a second weaver on the same window is refused. The
  * service leg learned this the same way; @ref d3d12_split_retire is the only
  * place the device half of the key ever changes after session start.
+ *
+ * @return false when no display processor was created. The CALLER decides what
+ *         that means, because the answer differs by placement: a refusal on the
+ *         SCANOUT device is recoverable (retire the split and try the app
+ *         device — ADR-037 §3a), a refusal on the app device is not.
  */
-static void
+static bool
 d3d12_make_dp(struct comp_d3d12_compositor *c)
 {
 	if (c->dp_factory == nullptr) {
-		return;
+		return false;
 	}
 	auto factory = (xrt_dp_factory_d3d12_fn_t)c->dp_factory;
 	HWND dp_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	xrt_result_t dp_ret = factory(d3d12_out_device(c), d3d12_out_queue(c), dp_hwnd, &c->display_processor);
+
+	// Dev-only injection — see d3d12_test_fake_dp_refuse. The factory is not
+	// called at all on this path, so no weaver can be left behind on the HWND.
+	const bool fake_refuse = c->split_active && d3d12_test_fake_dp_refuse();
+	if (fake_refuse) {
+		U_LOG_W("DXR_TEST_FAKE_DP_REFUSE=1: refusing the display processor on the SCANOUT device (test)");
+	}
+
+	xrt_result_t dp_ret = fake_refuse
+	                          ? XRT_ERROR_DEVICE_CREATION_FAILED
+	                          : factory(d3d12_out_device(c), d3d12_out_queue(c), dp_hwnd, &c->display_processor);
 	if (dp_ret != XRT_SUCCESS) {
-		U_LOG_W("D3D12 display processor factory failed (error %d), continuing without", (int)dp_ret);
+		U_LOG_W("D3D12 display processor factory failed (error %d) on the %s device", (int)dp_ret,
+		        c->split_active ? "SCANOUT" : "app");
 		c->display_processor = nullptr;
-		return;
+		return false;
 	}
 	U_LOG_W("D3D12 display processor created via factory on %s device (hwnd %p)",
 	        c->split_active ? "the SCANOUT" : "the app", (void *)dp_hwnd);
@@ -1030,6 +1084,7 @@ d3d12_make_dp(struct comp_d3d12_compositor *c)
 	// #68: tell the DP whether the app self-presents only the canvas (texture
 	// app) vs the runtime presenting the full target (handle).
 	xrt_display_processor_d3d12_set_shared_texture_present(c->display_processor, c->has_shared_texture);
+	return true;
 }
 
 //! Release everything Stage A built. Idempotent; leaves `split_active` alone
@@ -1097,8 +1152,32 @@ d3d12_split_release_out(struct comp_d3d12_compositor *c)
  * there. Once, guarded by `split_active`; a session that never composites never
  * reaches it. D12-4 gives the planes D3D12 ends and this stops firing for zones.
  *
- * Called from layer_commit BEFORE any of the frame's work is recorded, and with
- * `c->mutex` held, so no repaint can be part-way through the old placement.
+ * THE SECOND TRIGGER is a display processor that DECLINES a weaver on the
+ * scanout adapter (ADR-037 §3a). Same recovery, same reason it is a recovery
+ * rather than a session failure — but note that it is the only trigger that
+ * fires during session create rather than mid-frame.
+ *
+ * THE CPU WAITS BELOW ARE REACHED FROM THE FRAME PATH, AND THAT IS ALLOWED
+ * HERE — AND ONLY HERE. `gpu_wait_idle_out` / `gpu_wait_idle_app` are bounded
+ * CPU idle waits, and the mid-frame trigger reaches them from the application's
+ * own render thread inside xrEndFrame, not from teardown. Three things make
+ * that defensible in the IN-PROCESS compositor: the thread belongs to ONE
+ * application (its own frame is the only thing that can be delayed), it happens
+ * AT MOST ONCE per session (`split_active` latches false before the rebuild),
+ * and no lock anyone else is queued behind is held across it — `c->mutex`
+ * serialises this compositor's own repaint thread and nothing more.
+ *
+ * The D3D11 SERVICE must not copy this shape, and the difference is not a
+ * matter of degree. Its frame thread holds `render_mutex`, which EVERY client
+ * is queued behind, so the same two waits there would stall every app in the
+ * workspace at once for as long as the slower adapter took to drain — the #925
+ * wedge class exactly. If the service ever needs an equivalent retire it has to
+ * be driven off the frame path entirely.
+ *
+ * Locking: the CALLER holds `c->mutex` — layer_commit already does, and the
+ * create-time site takes it — so no repaint can be part-way through the old
+ * placement. This function never takes it itself (`std::mutex` is not
+ * recursive, and layer_commit's call would deadlock on the spot if it did).
  */
 static void
 d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why)
@@ -1173,7 +1252,16 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why)
 	if (c->target != nullptr && c->display_refresh_rate > 1.0f) {
 		comp_d3d12_target_set_display_period(c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 	}
-	d3d12_make_dp(c);
+	if (!d3d12_make_dp(c)) {
+		// End of the line: the app device is where the non-split path has
+		// always created it, so there is nothing left to fall back to. ERROR
+		// rather than WARN — a session with no display processor anywhere shows
+		// unwoven content on a 3D panel, and that must not be inferred from the
+		// absence of a line.
+		U_LOG_E(
+		    "#918: no display processor on the app device either, after retiring the split — this "
+		    "session will not weave");
+	}
 }
 
 /*!
@@ -4530,7 +4618,31 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// format, transparency, shared-texture-present) moved in there with it.
 	c->dp_factory = dp_factory_d3d12;
 	if (dp_factory_d3d12 != NULL) {
-		d3d12_make_dp(c);
+		if (!d3d12_make_dp(c) && c->split_active) {
+			/*
+			 * ADR-037 §3a — A WEAVER-CREATION FAILURE IS A FALLBACK TRIGGER,
+			 * NEVER A SESSION FAILURE, and "never a session failure" has to
+			 * mean the session still WEAVES. Continuing here without a display
+			 * processor satisfies the letter and fails the effect: on a 3D
+			 * panel that is a flat or black experience, which is worse than the
+			 * single-adapter fallback the ADR mandates.
+			 *
+			 * The refusal is specifically about the SCANOUT adapter — the
+			 * vendor may have no weaver for that GPU, or the panel may not be
+			 * reachable from it — so retire the split and rebuild the display
+			 * processor on the app device, where the non-split path has always
+			 * created it. The `(hwnd, device)` bind key is honoured by the
+			 * retire: the (absent) scanout weaver is destroyed before the app
+			 * one is created, so the HWND is never asked to hold two.
+			 *
+			 * Under c->mutex for the same reason layer_commit's call is: the
+			 * repaint thread is already running by this point (it starts before
+			 * the display processor exists and idles until the first frame
+			 * arms it), and retire's contract is that its caller holds the lock.
+			 */
+			std::lock_guard<std::mutex> retire_lock(c->mutex);
+			d3d12_split_retire(c, "the display processor declined a weaver on the scanout adapter");
+		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");
 	}

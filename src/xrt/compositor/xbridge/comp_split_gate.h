@@ -165,6 +165,15 @@ comp_split_gate_env_requested(void);
  * Forces Stage A to fail at the point the bridge would be created, so the "one
  * WARN, stock path" degrade can be exercised without a machine that genuinely
  * cannot allocate the heap. Latched on first call.
+ *
+ * This is the PRE-activation half of the matrix. Its sibling is
+ * `DXR_TEST_FAKE_DP_REFUSE=1` (D3D12 in-process compositor,
+ * `d3d12_test_fake_dp_refuse`), which walks the POST-activation half: a display
+ * processor that declines a weaver on the scanout adapter once the split is
+ * already up. Named here rather than only there because a verification pass
+ * that finds one arm and not the other covers half the matrix and reads as if
+ * it covered all of it. The two are deliberately independent envs — they fail
+ * at different points and are meant to be walked separately.
  */
 bool
 comp_split_gate_env_test_fail_stage_a(void);
