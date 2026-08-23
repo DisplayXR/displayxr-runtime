@@ -40,3 +40,4 @@
 - [ADR-034](ADR-034-input-provider-plugins.md) — Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 - [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) — The Service Owns Arbitration, Runs One Compositor Pipeline, and Isolates Its Satellites
 - [ADR-036](ADR-036-android-per-window-compositor-instances.md) — Android: per-window compositor instances; the workspace overlay is an optional mode
+- [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement on hybrid-GPU devices: render on the best render adapter, weave on scanout, runtime decides (PROPOSED)
