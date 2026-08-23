@@ -114,7 +114,7 @@ def main() -> int:
             for p in stale:
                 print(f"  - {p.relative_to(REPO)}")
             return 1
-        print(f"ADR index up to date ({len(entries)} ADRs). ✓")
+        print(f"ADR index up to date ({len(entries)} ADRs). OK")
         return 0
 
     for p, want in targets:

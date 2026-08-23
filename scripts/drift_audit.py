@@ -627,7 +627,7 @@ def main() -> int:
     print("DisplayXR cross-repo drift audit")
     print("=" * 70)
     if not report.findings:
-        print("No drift detected. ✓")
+        print("No drift detected. OK")
     for repo, fs in sorted(by_repo.items()):
         print(f"\n{repo}:")
         for f in fs:

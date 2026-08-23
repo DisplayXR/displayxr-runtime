@@ -85,7 +85,7 @@ def main() -> int:
         for src, target in missing:
             print(f"  {src} -> {target}")
         return 1
-    print(f"All {checked} relative doc links resolve. ✓")
+    print(f"All {checked} relative doc links resolve. OK")
     return 0
 
 
