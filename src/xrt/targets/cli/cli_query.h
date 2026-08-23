@@ -226,6 +226,20 @@ struct cli_query_result
 	char gpu_service_split[160];
 	//! DXR_SPLIT_INGRESS as set, or the default the service would pick.
 	char gpu_split_ingress[32];
+	/*!
+	 * ADR-037 §7 / #1153 — the adapter the service creates its INGEST device
+	 * on, i.e. the adapter clients' shared textures must land on. Resolved by
+	 * the same `d3d_render_adapter` unit the service itself calls, so
+	 * `DXR_D3D_FORCE_GPU` shows up here exactly as the service would honour it
+	 * (which is the point: the override arm has to be checkable before the
+	 * service is started). Distinct from `gpu_render_*` above, which is the
+	 * unforced "most dedicated VRAM" default suggestion.
+	 */
+	bool gpu_ingest_resolved;
+	uint64_t gpu_ingest_luid;
+	char gpu_ingest_name[128];
+	char gpu_ingest_provenance[64]; //!< which rule decided ("most VRAM", "env-forced: scanout", …).
+	char gpu_service_ingest[224];   //!< the composed one-liner both serializers print.
 	char gpu_note[128]; //!< why the probe could not answer, when it could not.
 };
 

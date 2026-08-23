@@ -233,10 +233,25 @@ Eligibility is by **presenter kind**, which is the service-path expression of
 `CLIENT_TEXTURE` and self-presenting clients are *structurally* ineligible
 because the client owns the present, so they take rung 2.
 
-What remains here is narrow: the service's own
-`DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE` pin (`comp_d3d11_service.cpp`) should be
-replaced by the resolved render adapter rather than a hardcoded preference, so
-that §2's capability ranking — not DXGI's idea of "high performance" — decides.
+The service's own `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE` pin
+(`comp_d3d11_service.cpp`) is **also done** (#1153): `create_system` calls the
+§2 resolver, so the capability ranking — not DXGI's idea of "high performance"
+— decides where ingest lands, and the choice is logged once with name, LUID,
+provenance, and an explicit MATCH/DIVERGES assertion against what the old
+hardcode would have picked.
+
+`DXR_D3D_FORCE_GPU` reaches the ingest device too, which is what makes the
+all-on-scanout arm of Open Q1 buildable for the service family. **A forced
+ingest is never refused.** Ingest is the one device that must share an adapter
+with clients, so forcing it to the scanout adapter while the clients stay on
+the render adapter is exactly the cross-adapter configuration the arm exists to
+measure; the divergence is logged loudly on both sides — `ADR-037 §7: the
+service INGEST device was FORCED …` in the service, `CROSS-ADAPTER by explicit
+override; proceeding` in `oxr_d3d_get_requirements` — and proceeds. An
+eligibility check that assumed the two always agree would have deleted the arm,
+so §4's override outranks the assumption. `displayxr-cli info` reports the
+resolved ingest adapter next to the split line, so an arm can be verified
+before the service is started.
 
 ### 8. Window moves between panels
 
