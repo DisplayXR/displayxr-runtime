@@ -228,8 +228,23 @@ speculatively.
 |---|---|---|
 | D3D11 / D3D12 | `suggested_d3d_luid` via `xrGetD3D*GraphicsRequirementsKHR`; `oxr_d3d_check_luid` rejects mismatches | runtime, hard |
 | Vulkan | runtime selects the `VkPhysicalDevice` (`select_physical_device`) | runtime, hard |
-| OpenGL | **no LUID/device-selection API exists** — the per-exe `UserGpuPreferences` entry is the only lever | OS, advisory |
+| OpenGL | **no device-selection API exists** — the per-exe `UserGpuPreferences` entry is the only lever. Adapter *identity* usually IS readable: `GL_EXT_memory_object_win32` → `glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT)` (#1159) | OS, advisory |
 | Metal / Android | single-adapter in practice; rule degenerates | n/a |
+
+**Amendment (#1159): identity and selection are separate questions for GL, and
+only selection is genuinely missing.** This row originally read "no
+LUID/device-selection API exists". The selection half stands — nothing lets the
+runtime move a GL context. The identity half was wrong: `GL_EXT_memory_object_win32`
+has the driver report its own D3D LUID, so the runtime can *read* which adapter
+WGL picked on any current NVIDIA / Intel / AMD Windows driver. That matters
+because it is what lets the GL compositor place its D3D11 interop devices on the
+GL context's adapter instead of on `D3D11CreateDevice(NULL, …)` — DXGI
+enumeration order — and it is what makes a cross-adapter GL interop *loggable*
+rather than invisible. The GL `weave placement:` line therefore prints the real
+`render=` LUID when the driver answers and `render=UNKNOWN` only when it does
+not. Where identity is unavailable the compositor degrades explicitly:
+`GL_VENDOR` PCI-vendor match, then a `GL_RENDERER`-vs-description match (both
+used only when unambiguous), then the §2 resolver — never NULL.
 
 **OpenGL and pick-first engines are the two cases that still need the registry
 pin**, because the runtime cannot enforce placement for them. For those:
@@ -368,10 +383,13 @@ before it is attempted.
      (`reason=api_unsupported`), which is the same placement it had before, now
      visible in the log instead of inferred from its absence.
    - **not implementable on the runtime's terms**: in-process OpenGL. §5 — no
-     adapter identity, no device-selection API, so the runtime can neither learn
-     which adapter WGL chose nor ask for another. Rung 2, logged with
-     `render=UNKNOWN` and `reason=api_unsupported`; the honest unknown is the
-     point, a guessed render adapter would be worse.
+     device-selection API, so the runtime cannot ask WGL for another adapter.
+     Rung 2, `reason=api_unsupported`. Amended by #1159: the runtime *can*
+     usually learn which adapter WGL chose (`GL_DEVICE_LUID_EXT`), so `render=`
+     names it and `render=UNKNOWN` is now reserved for drivers that do not
+     report it — still an honest unknown, never a guess. Knowing the adapter
+     does not make the split implementable; it only makes the interop devices
+     placeable and the placement legible.
    - **n/a**: Metal / Android (single-adapter; the rule degenerates).
 4. **Multi-3D-panel machines** — per-panel scanout adapters, and whether a
    session can migrate its weave target live.
