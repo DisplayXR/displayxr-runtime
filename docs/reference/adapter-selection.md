@@ -11,8 +11,13 @@ user-facing *Target GPU* setting, displayxr-unity#242) may build on them.
 ## Why they exist
 
 On a hybrid (iGPU + dGPU) machine the runtime's default adapter suggestion is
-the discrete GPU (`EnumAdapterByGpuPreference(0, HIGH_PERFORMANCE)` on D3D;
-`device_type_priority()` ranks `DISCRETE_GPU` first on Vulkan). A client that
+the **render adapter** resolved by the ADR-037 §2 capability ranking —
+dedicated VRAM, then adapter type, excluding software/remote adapters and
+anything below the required feature level — which on such a machine is the
+discrete GPU. (Before #918 this was `EnumAdapterByGpuPreference(0,
+HIGH_PERFORMANCE)` on D3D and `device_type_priority()` on Vulkan; both are now
+downstream of the one resolver, `src/xrt/auxiliary/d3d/d3d_render_adapter.*`.)
+A client that
 renders on the *other* adapter then diverges from the session device and the
 cross-adapter eye bridge presents black (displayxr-unity#240). These variables
 steer the runtime's choice so client and session land on the same silicon.
@@ -21,7 +26,11 @@ steer the runtime's choice so client and session land on the same silicon.
 
 Overrides the adapter LUID the runtime suggests via
 `xrGetD3D11GraphicsRequirementsKHR` / `xrGetD3D12GraphicsRequirementsKHR`.
-Read in `env_forced_d3d_adapter()` (`src/xrt/state_trackers/oxr/oxr_d3d.cpp`).
+Read in `env_forced_adapter()`
+(`src/xrt/auxiliary/d3d/d3d_render_adapter.cpp`), i.e. *inside* the render
+adapter resolver — so the override travels through the same code path as the
+default policy rather than around it, and the resulting choice reports whether
+the override or the ranking decided.
 
 | Value | Meaning |
 |---|---|
@@ -120,10 +129,12 @@ scaled display. A centre point plus `DEFAULTTONEAREST` tolerates that error.
 
 ### Where each variable consumes it
 
-- **D3D** — `env_forced_d3d_adapter()` in
-  `src/xrt/state_trackers/oxr/oxr_d3d.cpp` calls the resolver directly: by
-  `xrGetD3D11/12GraphicsRequirementsKHR` time the panel rect is already on
-  `xsysc->info`.
+- **D3D** — `oxr_d3d_get_requirements()`
+  (`src/xrt/state_trackers/oxr/oxr_d3d.cpp`) calls `getRenderAdapter()` and
+  passes the panel rect straight through: by
+  `xrGetD3D11/12GraphicsRequirementsKHR` time it is already on `xsysc->info`.
+  The resolver forwards `scanout` to `getScanoutAdapter()`, so there is still
+  exactly one `QueryDisplayConfig` implementation.
 - **Vulkan** — `env_forced_gpu_index()` lives in `aux_vk`
   (`src/xrt/auxiliary/vk/vk_bundle_init.c`), which can see neither the plug-in
   nor DXGI. So the layer that owns both — `target_instance.c`, which already
@@ -131,7 +142,12 @@ scaled display. A centre point plus `DEFAULTTONEAREST` tolerates that error.
   compositor — resolves the LUID and passes it down the existing creation path
   (`null_compositor_create_system_with_dims` → `comp_vulkan_arguments` →
   `vk_bundle::scanout_adapter_luid`). `env_forced_gpu_index()` then only
-  compares LUIDs, staying free of any Win32 dependency. That single hook
+  compares LUIDs, staying free of any Win32 dependency. The **default**
+  (non-override) ranking arrives by the same route: `target_instance.c` also
+  resolves `d3d_render_adapter_luid()` into `vk_bundle::render_adapter_luid`,
+  which `select_physical_device()` matches against
+  `VkPhysicalDeviceIDProperties::deviceLUID` — among the physical devices
+  Vulkan enumerated, so it ranks rather than bypasses VK's own requirements. That single hook
   covers both the app suggestion (`xrGetVulkanGraphicsDeviceKHR`, which reports
   the runtime's `client_vk_deviceUUID`) and the compositor's own `vk_bundle`,
   so client and session land on the same silicon.
