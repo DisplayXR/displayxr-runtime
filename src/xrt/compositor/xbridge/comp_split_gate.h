@@ -134,6 +134,26 @@ enum comp_split_ingress_policy
  */
 #define COMP_SPLIT_REASON_PRESENTER_INELIGIBLE "presenter_ineligible"
 /*!
+ * #1172 — the OTHER half of @ref COMP_SPLIT_REASON_PRESENTER_INELIGIBLE, and the
+ * one that had no name.
+ *
+ * "Ineligible" has to mean "this client never TOUCHES the scanout device", not
+ * merely "this client is not placed next to scanout". An ineligible presenter's
+ * atlas, its shared input texture and its handback all live on the RENDER
+ * (ingest) device, so the display processor that weaves them must live there
+ * too — which means its OWN display processor on the ingest device rather than
+ * the shared panel DP, because the panel DP follows whichever presenter
+ * currently owns the panel and that one may well be an eligible presenter on
+ * the scanout adapter. Handing a scanout-adapter weaver a render-adapter
+ * texture is not an error in D3D11; it is an access violation inside the vendor
+ * SDK (#1172, and the shape #1023 was hunting).
+ *
+ * This token names the DEVICE CHOICE for one client, so the log says both
+ * halves: the presenter cannot split (`presenter_ineligible`) AND its weaver
+ * follows it home (`weave_on_ingest`).
+ */
+#define COMP_SPLIT_REASON_WEAVE_ON_INGEST "weave_on_ingest"
+/*!
  * The gate said proceed and Stage A then failed — device creation, the DXGI
  * factory, the cross-adapter heap, the egress ring. The specific failure is in
  * the caller's own WARN immediately above; this is the short form.
