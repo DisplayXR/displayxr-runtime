@@ -63,6 +63,12 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "d3d11/comp_d3d11_window.h"
+// #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
+// tokens. Header-only from here: this compositor has NO output-device split (see
+// the placement block in comp_vk_native_compositor_create), so it never links
+// comp_xbridge, it only needs to name itself the same way the split paths do.
+#include "d3d/d3d_weave_placement.h"
+#include "comp_split_gate.h"
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -4696,6 +4702,48 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		free(c);
 		return XRT_ERROR_VULKAN;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 Phase 3 / ADR-037 §3 — THE VULKAN ANSWER, STATED.
+	 *
+	 * There is no output-device split for in-process Vulkan (ADR-037 open
+	 * question 3: pending a decision, not just work — whole-app placement on the
+	 * scanout adapter measured well enough that a VK bridge may never be worth
+	 * building). So this path takes rung 2 unconditionally: everything on the
+	 * render adapter, the OS carries the cross-adapter present.
+	 *
+	 * Rung 2 is a legitimate outcome; being SILENT about it is not, and until
+	 * Phase 3 this path was. A hybrid box paying the cross-adapter present
+	 * produced a Vulkan log byte-identical to a single-adapter box that pays
+	 * nothing. It now emits the same one line the D3D paths do, with
+	 * `reason=api_unsupported` — which is an honest NO, not a guess: the split
+	 * is not implemented here, so the answer cannot be anything else.
+	 *
+	 * There is no half-engaged state to reach: nothing below this line consults
+	 * a scanout adapter, allocates a bridge, or creates a second device.
+	 */
+	{
+		uint64_t render_packed_luid = 0;
+		if (c->vk.vkGetPhysicalDeviceProperties2 != NULL) {
+			VkPhysicalDeviceIDProperties pdidp = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+			};
+			VkPhysicalDeviceProperties2 pdp2 = {
+			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			    .pNext = &pdidp,
+			};
+			c->vk.vkGetPhysicalDeviceProperties2(c->vk.physical_device, &pdp2);
+			if (pdidp.deviceLUIDValid == VK_TRUE) {
+				memcpy(&render_packed_luid, pdidp.deviceLUID, sizeof(render_packed_luid));
+			}
+		}
+		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph,
+		                        /* split_active */ false, COMP_SPLIT_REASON_API_UNSUPPORTED);
+	}
+#endif
 
 #ifdef XRT_OS_MACOS
 	// Import shared IOSurface if provided

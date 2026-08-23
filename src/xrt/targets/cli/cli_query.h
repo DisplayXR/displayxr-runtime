@@ -201,7 +201,10 @@ struct cli_query_result
 	 *           EnumAdapterByGpuPreference, which a per-app
 	 *           UserGpuPreferences entry can reorder).
 	 * applies — render != scanout, i.e. the session pays the cross-adapter
-	 *           present and DXR_WEAVE_ON_SCANOUT has something to move. */
+	 *           present unless the split moves the weave. Since #918 Phase 3
+	 *           the split is ON by default, so `applies` is now "the split has
+	 *           something to do here", not "the flag would have something to
+	 *           move if it were set". */
 	bool gpu_probed;
 	uint32_t gpu_adapter_count;
 	struct cli_gpu_adapter gpu_adapters[CLI_MAX_GPU_ADAPTERS];
@@ -214,7 +217,9 @@ struct cli_query_result
 	bool gpu_split_applies;
 	char gpu_verdict[192]; //!< the one-line verdict, reused verbatim by selftest.
 	bool gpu_weave_env_set;
-	char gpu_weave_env[64]; //!< DXR_WEAVE_ON_SCANOUT value when set.
+	//! DXR_WEAVE_ON_SCANOUT value when set. Since #918 Phase 3 this is a KILL
+	//! SWITCH, not an opt-in — unset means the split is allowed.
+	char gpu_weave_env[64];
 	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and

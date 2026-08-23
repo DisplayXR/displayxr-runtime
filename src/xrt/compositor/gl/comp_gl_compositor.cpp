@@ -19,6 +19,12 @@
 #include "util/comp_layer_accum.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
+// #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
+// tokens. Header-only from comp_xbridge: this compositor has NO output-device
+// split (ADR-037 §5 — OpenGL exposes no device-selection API at all), so it
+// never links the transport, it only names itself the way the split paths do.
+#include "d3d/d3d_weave_placement.h"
+#include "comp_split_gate.h"
 #endif
 
 #include "xrt/xrt_device.h"
@@ -5195,6 +5201,34 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		width = xdev->hmd->screens[0].w_pixels;
 		height = xdev->hmd->screens[0].h_pixels;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 Phase 3 / ADR-037 §3 — THE OPENGL ANSWER, STATED.
+	 *
+	 * There is no output-device split for OpenGL, and per ADR-037 §5 there
+	 * cannot be one on the runtime's terms: OpenGL exposes **no adapter
+	 * identity and no device-selection API**, so the runtime can neither learn
+	 * which adapter WGL picked nor ask for a different one — the per-exe
+	 * `UserGpuPreferences` entry is the only lever, and it is the OS's, advisory.
+	 *
+	 * So this path takes rung 2 unconditionally, and says so with the same one
+	 * line every other compositor emits. `render=UNKNOWN` is the literal truth
+	 * here, not a lookup that failed: a guessed render adapter would be worse
+	 * than an admitted unknown, and the interop D3D11 device that appears later
+	 * in this function is a present-path detail, not the GL renderer's adapter.
+	 *
+	 * There is no half-engaged state to reach: nothing in this compositor
+	 * consults a scanout adapter or creates a second device for the weave.
+	 */
+	{
+		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		d3d_log_weave_placement(/* render_packed_luid, unknowable for GL */ 0, display_screen_left,
+		                        display_screen_top, pw, ph, /* split_active */ false,
+		                        COMP_SPLIT_REASON_API_UNSUPPORTED);
+	}
+#endif
 
 	// Save caller's GL context so we can restore after init
 #ifdef XRT_OS_WINDOWS
