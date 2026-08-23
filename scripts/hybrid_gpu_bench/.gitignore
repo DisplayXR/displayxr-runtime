@@ -1,0 +1,5 @@
+# Local build outputs of the hybrid-GPU bench tools (built via build.bat)
+*.exe
+*.pdb
+*.ilk
+obj/

@@ -1,0 +1,21 @@
+{
+  "experiment": "1154-adapter-placement-crossover",
+  "reps": 3,
+  "windowSeconds": 20,
+  "warmupSeconds": 6,
+  "duties": [
+    0,
+    10,
+    25,
+    40,
+    55,
+    70,
+    85
+  ],
+  "treeRoot": "_package",
+  "clientExe": "test_apps\\build\\bin\\cube_handle_d3d11_win.exe",
+  "loadExe": "scripts\\hybrid_gpu_bench\\gpu_loadgen.exe",
+  "runtimeJson": "build\\Release\\openxr_displayxr-dev.json",
+  "loadAdapter": "dgpu",
+  "loadRes": "1920x1080"
+}
