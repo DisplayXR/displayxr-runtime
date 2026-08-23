@@ -604,18 +604,128 @@ d3d12_phase_debug_dump(struct comp_d3d12_compositor *c, const char *where)
 	}
 }
 
+/*
+ *
+ * GPU timelines — device-scoped idle waits (#918 D12-2).
+ *
+ */
+
 /*!
- * Wait for GPU to finish all submitted work.
+ * ONE queue, ONE fence, ONE event, and the device they all belong to.
+ *
+ * There is no back-pointer to the compositor here, and no pointer to any other
+ * timeline. That absence is the point of the type: a `comp_d3d12_timeline` names
+ * a single GPU execution scope and gives its holder no way to reach a second
+ * one. See @ref gpu_wait_idle_on for the invariant it exists to enforce.
+ *
+ * Passed BY VALUE (six words). `value` is a pointer into the owner's storage, so
+ * a copy still advances the one real counter.
+ */
+struct comp_d3d12_timeline
+{
+	//! "app" / "out" — names the scope in the device-removed report.
+	const char *name;
+	//! The device the queue and the fence belong to. NOT owned.
+	ID3D12Device *device;
+	//! The queue signalled and waited on. NOT owned.
+	ID3D12CommandQueue *queue;
+	//! The fence signalled from @ref queue. NOT owned.
+	ID3D12Fence *fence;
+	//! Points at the owner's monotonic counter for @ref fence.
+	UINT64 *value;
+	//! Auto-reset event @ref fence completion is signalled onto.
+	HANDLE event;
+};
+
+/*!
+ * The app-adapter timeline: the device the application handed us, the queue the
+ * renderer and every atlas-side command list execute on.
+ */
+static struct comp_d3d12_timeline
+d3d12_app_timeline(struct comp_d3d12_compositor *c)
+{
+	return {"app", c->device, c->command_queue, c->fence, &c->fence_value, c->fence_event};
+}
+
+/*!
+ * True when the output timeline is a DIFFERENT queue from the app timeline, so
+ * a caller that must quiesce EVERYTHING (only teardown) knows to wait twice.
+ *
+ * Always false today: no output device exists until #918 D12-3 creates one, and
+ * a second wait on the same queue would be a behaviour change, not a no-op.
+ */
+static bool
+d3d12_out_timeline_is_separate(struct comp_d3d12_compositor *c)
+{
+	(void)c;
+	return false;
+}
+
+/*!
+ * The output-adapter timeline: the device the weave records on, the swapchain
+ * presents from, and the display processor talks to.
+ *
+ * Resolves to the app timeline while @ref d3d12_out_timeline_is_separate is
+ * false — which is every build up to and including this one, so every wait
+ * routed here is bit-for-bit the wait that was there before. D12-3 makes this
+ * return the scanout device's own queue + fence when the split is active.
+ */
+static struct comp_d3d12_timeline
+d3d12_out_timeline(struct comp_d3d12_compositor *c)
+{
+	return d3d12_app_timeline(c);
+}
+
+/*!
+ * Signal @p tl's fence from @p tl's queue and CPU-wait for it. The ONLY CPU
+ * idle wait in this compositor.
+ *
+ * THE INVARIANT — an app-thread wait must never cover out-queue work.
+ * ---------------------------------------------------------------------------
+ * Under the output-device split there are two queues: the app queue, driven by
+ * the application's own render thread through xrEndFrame, and the out queue on
+ * the scanout adapter, which weaves and presents. The app queue's waits sit
+ * directly on the app's frame loop. If one of them could only complete after
+ * the OUT queue had drained, then a slow or stalled panel-side present would
+ * block the application inside an OpenXR call — a CPU wait on the render path
+ * that can stall the workspace, which is the #925 wedge class exactly.
+ *
+ * WHY IT CANNOT HAPPEN HERE, rather than merely does not:
+ *
+ *  1. This function takes a `comp_d3d12_timeline`, not the compositor. A
+ *     timeline holds one queue and one fence and NOTHING that names another
+ *     timeline, so the wait below is reachable only by that queue's own Signal.
+ *     There is no "wait for the GPU" entry point left to call: the old
+ *     compositor-wide `gpu_wait_idle(c)` is gone, and every call site names its
+ *     scope.
+ *  2. A fence wait can only be delayed by work AHEAD of its Signal in the SAME
+ *     queue. So the only way to make an app-side wait cover out-queue work is
+ *     to record `app_queue->Wait(out_fence)` — a cross-queue GPU wait in the
+ *     app→out direction. Nothing does, and nothing may: the data flows the
+ *     other way (the app renders the atlas, the out side consumes it), so the
+ *     legal direction is `out_queue->Wait(app_fence)`, and D12-3's cross-adapter
+ *     ordering runs that way through the bridge. Adding the inverse means
+ *     writing a new call against a fence this file hands to nobody — a
+ *     reviewable act, not an accident at a call site.
+ *
+ * The wait is INFINITE, unchanged from the single wait it replaces. That is
+ * defensible only because of the above: it is bounded in practice by the
+ * completion of work this same queue already holds, and D3D12 has no
+ * partial-timeout idle primitive that would leave the command allocator safe to
+ * reset. Two of the four escalating present watchdogs (#1000, in the target)
+ * cover the case where the OUT side is the thing that never returns; that is
+ * the out timeline's problem to report, and — by (2) — never the app's to wait
+ * for.
  */
 static void
-gpu_wait_idle(struct comp_d3d12_compositor *c)
+gpu_wait_idle_on(struct comp_d3d12_timeline tl)
 {
-	c->fence_value++;
-	c->command_queue->Signal(c->fence, c->fence_value);
+	(*tl.value)++;
+	tl.queue->Signal(tl.fence, *tl.value);
 
-	if (c->fence->GetCompletedValue() < c->fence_value) {
-		c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
-		WaitForSingleObject(c->fence_event, INFINITE);
+	if (tl.fence->GetCompletedValue() < *tl.value) {
+		tl.fence->SetEventOnCompletion(*tl.value, tl.event);
+		WaitForSingleObject(tl.event, INFINITE);
 	}
 
 	// #747: report a device reset the moment WE can see it, and dump DRED.
@@ -634,17 +744,46 @@ gpu_wait_idle(struct comp_d3d12_compositor *c)
 	// dump would bury the one interesting readout.
 	{
 		static bool s_reported = false;
-		if (!s_reported && c->device != nullptr) {
-			HRESULT rr = c->device->GetDeviceRemovedReason();
+		if (!s_reported && tl.device != nullptr) {
+			HRESULT rr = tl.device->GetDeviceRemovedReason();
 			if (rr != S_OK) {
 				s_reported = true;
-				U_LOG_E("#747 DEVICE REMOVED observed by the compositor at gpu_wait_idle: "
-				        "GetDeviceRemovedReason=0x%08x",
-				        (unsigned)rr);
-				comp_d3d12_log_dred_state(c->device, "gpu_wait_idle/device-removed");
+				U_LOG_E(
+				    "#747 DEVICE REMOVED observed by the compositor at gpu_wait_idle: "
+				    "GetDeviceRemovedReason=0x%08x (%s timeline)",
+				    (unsigned)rr, tl.name);
+				comp_d3d12_log_dred_state(tl.device, "gpu_wait_idle/device-removed");
 			}
 		}
 	}
+}
+
+/*!
+ * Drain the APP adapter: everything this compositor recorded onto the
+ * application's queue is complete on return. Use before reading an app-device
+ * resource back, before resetting the shared command allocator, and before
+ * handing an app-device texture to something that will read it without a fence.
+ *
+ * Never covers out-queue work — see @ref gpu_wait_idle_on.
+ */
+static void
+gpu_wait_idle_app(struct comp_d3d12_compositor *c)
+{
+	gpu_wait_idle_on(d3d12_app_timeline(c));
+}
+
+/*!
+ * Drain the OUTPUT adapter: the weave and the present are complete on return.
+ * Use for frame pacing behind Present, and before anything that perturbs the
+ * display (a 2D/3D mode switch, teardown).
+ *
+ * Today this resolves to the same queue as @ref gpu_wait_idle_app — see
+ * @ref d3d12_out_timeline.
+ */
+static void
+gpu_wait_idle_out(struct comp_d3d12_compositor *c)
+{
+	gpu_wait_idle_on(d3d12_out_timeline(c));
 }
 
 /*
@@ -843,8 +982,8 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Check for window resize — resize immediately to keep backbuffer in sync.
-	// The GPU is already idle here: layer_commit() calls gpu_wait_idle() at
-	// the end of every frame, so no additional GPU drain is needed.
+	// The GPU is already idle here: layer_commit() ends every frame with a
+	// scoped idle wait, so no additional GPU drain is needed.
 	// Immediate resize is critical for 3D displays: the weaver outputs
 	// pixel-precise interlacing patterns, and any DXGI stretching (from a
 	// backbuffer/window size mismatch) destroys the interlacing.
@@ -1471,8 +1610,9 @@ d3d12_compositor_capture_dims_provider(void *userdata,
 // write @p path as PNG. D3D12 renderer uses DXGI_FORMAT_R8G8B8A8_UNORM so no
 // channel swap is needed.
 //
-// Caller must ensure the GPU is idle on entry (gpu_wait_idle has been called
-// or the existing layer_commit fence-waits before returning). On exit the
+// Caller must ensure the APP timeline is idle on entry (gpu_wait_idle_app has
+// been called, or the existing layer_commit fence-waits before returning) —
+// everything read back here is an app-device resource. On exit the
 // atlas is left in PIXEL_SHADER_RESOURCE state (matching the renderer's
 // expected steady state between frames).
 static bool
@@ -1574,7 +1714,7 @@ d3d12_compositor_capture_atlas_to_png(struct comp_d3d12_compositor *c, const cha
 	c->cmd_list->Close();
 	ID3D12CommandList *lists[] = {c->cmd_list};
 	c->command_queue->ExecuteCommandLists(1, lists);
-	gpu_wait_idle(c);
+	gpu_wait_idle_app(c);
 
 	// Map readback, repack to tightly-packed rows, encode PNG.
 	bool ok = false;
@@ -1686,7 +1826,7 @@ d3d12_capture_backbuffer_to_png(struct comp_d3d12_compositor *c,
 	c->cmd_list->Close();
 	ID3D12CommandList *lists[] = {c->cmd_list};
 	c->command_queue->ExecuteCommandLists(1, lists);
-	gpu_wait_idle(c);
+	gpu_wait_idle_app(c);
 
 	bool ok = false;
 	void *mapped = nullptr;
@@ -1982,7 +2122,10 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	xrt_result_t xret = comp_d3d12_target_present(c->target, 1);
 
 	// Wait for frame completion (frame pacing)
-	gpu_wait_idle(c);
+	// Out scope: this wait paces the frame behind the Present above. Under
+	// the split the weave list and the swapchain both live on the output
+	// device, so the whole tail below the atlas is the out timeline's.
+	gpu_wait_idle_out(c);
 
 	// Only a real frame resets the quiet-gate; see d3d12_repaint_thread.
 	if (!is_repaint) {
@@ -2476,7 +2619,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->cmd_list->Close();
 			ID3D12CommandList *flush_lists[] = {c->cmd_list};
 			c->command_queue->ExecuteCommandLists(1, flush_lists);
-			gpu_wait_idle(c);
+			gpu_wait_idle_app(c);
 
 			// Capture handles its own cmd_list reset + barriers (PSR↔COPY_SOURCE).
 			d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
@@ -2515,7 +2658,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->cmd_list->Close();
 			ID3D12CommandList *copy_lists[] = {c->cmd_list};
 			c->command_queue->ExecuteCommandLists(1, copy_lists);
-			gpu_wait_idle(c);
+			gpu_wait_idle_app(c);
 
 			// Fresh command list for weaver
 			c->cmd_allocator->Reset();
@@ -2639,7 +2782,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				c->cmd_list->Close();
 				ID3D12CommandList *tap_lists[] = {c->cmd_list};
 				c->command_queue->ExecuteCommandLists(1, tap_lists);
-				gpu_wait_idle(c);
+				gpu_wait_idle_app(c);
 				char tap_path[MAX_PATH];
 				snprintf(tap_path, sizeof(tap_path),
 				         "%s\\dxr_tap_f%03ld_a_postweave.png", tap_tmp, tap_idx);
@@ -2698,13 +2841,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		ID3D12CommandList *lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, lists);
 
-		// Signal fence and wait for frame completion
-		c->fence_value++;
-		c->command_queue->Signal(c->fence, c->fence_value);
-		if (c->fence->GetCompletedValue() < c->fence_value) {
-			c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
-			WaitForSingleObject(c->fence_event, INFINITE);
-		}
+		// Signal fence and wait for frame completion. App scope: the shared
+		// texture and the list that wrote it are both on the app device, and
+		// this path has no swapchain at all.
+		gpu_wait_idle_app(c);
 
 		// #727 dual tap, second point: composite is GPU-complete here.
 		if (c->tap_postcomposite_pending) {
@@ -2749,7 +2889,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->cmd_list->Close();
 		ID3D12CommandList *copy_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, copy_lists);
-		gpu_wait_idle(c);
+		gpu_wait_idle_app(c);
 
 		// Give the weaver a fresh command list
 		c->cmd_allocator->Reset();
@@ -2803,7 +2943,8 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			ID3D12CommandList *weave_lists[] = {c->cmd_list};
 			c->command_queue->ExecuteCommandLists(1, weave_lists);
 			comp_d3d12_target_present(c->target, 1);
-			gpu_wait_idle(c);
+			// Out scope: pacing behind Present, as in d3d12_dp_weave_and_present.
+			gpu_wait_idle_out(c);
 		}
 
 		// Post-compose capture (#210) — fully composed atlas as DP saw it.
@@ -2875,13 +3016,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_d3d11_window_signal_paint_done(c->own_window);
 		}
 
-		// Signal fence and wait for frame completion (frame pacing)
-		c->fence_value++;
-		c->command_queue->Signal(c->fence, c->fence_value);
-		if (c->fence->GetCompletedValue() < c->fence_value) {
-			c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
-			WaitForSingleObject(c->fence_event, INFINITE);
-		}
+		// Signal fence and wait for frame completion (frame pacing).
+		// Out scope: pacing behind the Present above.
+		gpu_wait_idle_out(c);
 
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to present");
@@ -2937,9 +3074,16 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
-	// Wait for GPU idle
+	// Wait for GPU idle. Teardown is one of the only two places that must
+	// quiesce BOTH scopes, and it does so as two INDEPENDENT waits, each on
+	// its own queue's fence — never one wait covering both queues. Off the
+	// frame path by definition; see gpu_wait_idle_on for why the frame path
+	// may not do this.
 	if (c->fence != nullptr && c->command_queue != nullptr) {
-		gpu_wait_idle(c);
+		gpu_wait_idle_app(c);
+		if (d3d12_out_timeline_is_separate(c)) {
+			gpu_wait_idle_out(c);
+		}
 	}
 
 	// Destroy DP input crop resource
@@ -3633,7 +3777,15 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	// device internally. If the GPU has pending work (e.g. DXGI Present
 	// scan-out), this can cause DXGI_ERROR_DEVICE_REMOVED on some GPUs
 	// (observed on Intel Iris Xe with hosted D3D12 apps).
-	gpu_wait_idle(c);
+	//
+	// The pending work that matters is the present, so the OUT scope leads;
+	// and this is the second of the two places that quiesce both scopes (see
+	// destroy), again as two independent waits and again off the frame path —
+	// a mode switch is a user action, not a per-frame one.
+	gpu_wait_idle_out(c);
+	if (d3d12_out_timeline_is_separate(c)) {
+		gpu_wait_idle_app(c);
+	}
 
 	return xrt_display_processor_d3d12_request_display_mode(c->display_processor, enable_3d);
 }
@@ -3706,7 +3858,7 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
  *
  * D3D12 specifics vs the D3D11 reference:
  *  - No immediate context: each authoring op re-arms c->cmd_allocator /
- *    c->cmd_list (Reset → record → Close → Execute → gpu_wait_idle) under
+ *    c->cmd_list (Reset → record → Close → Execute → gpu_wait_idle_app) under
  *    c->mutex — the same pattern d3d12_compositor_capture_atlas_to_png uses;
  *    the list is provably idle whenever an entry point holds the mutex
  *    (every layer_commit exit closes + executes + fence-waits).
@@ -3972,7 +4124,7 @@ d3d12_zone_cmd_execute(struct comp_d3d12_compositor *c)
 	c->cmd_list->Close();
 	ID3D12CommandList *lists[] = {c->cmd_list};
 	c->command_queue->ExecuteCommandLists(1, lists);
-	gpu_wait_idle(c);
+	gpu_wait_idle_app(c);
 }
 
 // #439 Phase 3 — (re)allocate the dedicated Local2D flatten scratch
