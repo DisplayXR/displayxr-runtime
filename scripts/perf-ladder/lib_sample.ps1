@@ -79,21 +79,42 @@ function Get-GpuDelta {
 }
 
 function Resolve-GpuColumns {
-    # Delta rows -> named columns for one arm sample.
-    # appPids: pids of the app under test. scanoutLuid: '' = single-adapter box.
-    param($deltaRows, [int[]]$appPids, [string]$scanoutLuid)
+    # Delta rows -> per-BUCKET x per-ADAPTER columns for one arm sample.
+    #
+    # Why buckets and not just "the app": the same physical work is charged to
+    # different processes depending on the arm (#918/#1154). With an explicit
+    # cross-adapter bridge the transfer is a copy the SERVICE issues, so it
+    # lands on the service pid. With the implicit path it happens inside
+    # Present, executed by the display UMD on behalf of the compositing stack,
+    # and is charged to dwm/System - NOT to the app or the service. Accounting
+    # only the subject therefore flatters the implicit arm by hiding a real
+    # per-frame cost (~6.4 ms/frame of scanout-adapter time, measured in #918)
+    # in a bucket a naive harness calls noise. So: every bucket is reported,
+    # `other` is a REPORTED QUANTITY and never a dropped residual, and adapter
+    # TOTALS across all processes are first-class.
+    #
+    # appPids: the client under test. svcPids: other processes that are part of
+    # the subject (e.g. displayxr-service, which hosts composite + weave +
+    # bridge). scanoutLuid: '' = single-adapter box.
+    param($deltaRows, [int[]]$appPids, [int[]]$svcPids, [string]$scanoutLuid)
     $dwmPids = @(Get-Process -Name dwm -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-    $col = @{ app_scanout = 0.0; app_other = 0.0; dwm = 0.0; other = 0.0; total = 0.0; top_other = '' }
+    $sysPids = @(0, 4)   # Idle + System; driver/kernel contexts land here
+    $buckets = @('app', 'svc', 'dwm', 'sys', 'oth')
+    $col = @{}
+    foreach ($b in $buckets) { $col[$b + '_scanout'] = 0.0; $col[$b + '_other'] = 0.0 }
+    $col['tot_scanout'] = 0.0; $col['tot_other'] = 0.0; $col['top_other'] = ''
     $otherByPid = @{}
     foreach ($r in $deltaRows) {
-        $col.total = $col.total + $r.BusyPct
-        if ($appPids -contains $r.ProcId) {
-            if ($scanoutLuid -eq '' -or $r.Luid -eq $scanoutLuid) { $col.app_scanout = $col.app_scanout + $r.BusyPct }
-            else { $col.app_other = $col.app_other + $r.BusyPct }
-        } elseif ($dwmPids -contains $r.ProcId) {
-            $col.dwm = $col.dwm + $r.BusyPct
-        } else {
-            $col.other = $col.other + $r.BusyPct
+        $b = 'oth'
+        if ($appPids -contains $r.ProcId) { $b = 'app' }
+        elseif ($svcPids -contains $r.ProcId) { $b = 'svc' }
+        elseif ($dwmPids -contains $r.ProcId) { $b = 'dwm' }
+        elseif ($sysPids -contains $r.ProcId) { $b = 'sys' }
+        $onScanout = ($scanoutLuid -eq '' -or $r.Luid -eq $scanoutLuid)
+        $suffix = if ($onScanout) { '_scanout' } else { '_other' }
+        $col[$b + $suffix] = $col[$b + $suffix] + $r.BusyPct
+        $col['tot' + $suffix] = $col['tot' + $suffix] + $r.BusyPct
+        if ($b -eq 'oth') {
             if (-not $otherByPid.ContainsKey($r.ProcId)) { $otherByPid[$r.ProcId] = 0.0 }
             $otherByPid[$r.ProcId] = $otherByPid[$r.ProcId] + $r.BusyPct
         }
@@ -104,9 +125,15 @@ function Resolve-GpuColumns {
     if ($topPid -ne $null -and $topPid.Value -gt 1.0) {
         $p = Get-Process -Id $topPid.Key -ErrorAction SilentlyContinue
         $pname = if ($p -ne $null) { $p.ProcessName } else { 'pid' + $topPid.Key }
-        $col.top_other = ('{0}:{1}' -f $pname, [math]::Round($topPid.Value, 1))
+        $col['top_other'] = ('{0}:{1}' -f $pname, [math]::Round($topPid.Value, 1))
     }
     foreach ($k in @($col.Keys)) { if ($k -ne 'top_other') { $col[$k] = [math]::Round($col[$k], 2) } }
+    # Back-compat aliases for the pre-#1154 column names.
+    $col['app_scanout_compat'] = $col['app_scanout']
+    $col['app_other_compat'] = $col['app_other']
+    $col['dwm'] = [math]::Round($col['dwm_scanout'] + $col['dwm_other'], 2)
+    $col['other'] = [math]::Round($col['oth_scanout'] + $col['oth_other'] + $col['sys_scanout'] + $col['sys_other'], 2)
+    $col['total'] = [math]::Round($col['tot_scanout'] + $col['tot_other'], 2)
     return $col
 }
 

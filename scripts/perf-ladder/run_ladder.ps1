@@ -76,7 +76,7 @@ $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $orbitCx = [int]($screen.Width / 2)
 $orbitCy = [int]($screen.Height / 2)
 
-'arm,rep,app_scanout,app_other,dwm,other_gpu,total_gpu,app_cpu,presents_s,weaves_s,repaints_s,mode,window_s,top_other,flags' |
+'arm,rep,app_scanout,app_other,svc_scanout,svc_other,dwm_scanout,dwm_other,sys_scanout,sys_other,oth_scanout,oth_other,tot_scanout,tot_other,dwm,other_gpu,total_gpu,app_cpu,presents_s,weaves_s,repaints_s,mode,window_s,top_other,flags' |
     Out-File -Encoding ascii $csvPath
 
 function Invoke-ArmSample {
@@ -185,12 +185,16 @@ function Invoke-ArmSample {
     # fresh window in place instead of surrendering the whole sample.
     $g0 = $null; $g1 = $null; $cpu0 = $null; $cpu1 = $null
     foreach ($attempt in 1..2) {
-        $cpu0 = Get-CpuSnapshot -procIds $appPids
+        $cpuPids = @($appPids)
+    foreach ($nm in $subjectNames) {
+        $cpuPids += @(Get-Process -Name $nm -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    }
+    $cpu0 = Get-CpuSnapshot -procIds $cpuPids
         $g0 = Get-GpuSnapshot
         if (-not $g0.ok) { $flags += 'GPU_SWEEP0_RETRY'; continue }
         Start-Sleep -Seconds $windowSec
         $g1 = Get-GpuSnapshot
-        $cpu1 = Get-CpuSnapshot -procIds $appPids
+        $cpu1 = Get-CpuSnapshot -procIds $cpuPids
         if ($g1.ok) { break }
         $flags += 'GPU_SWEEP1_RETRY'
     }
@@ -214,9 +218,13 @@ function Invoke-ArmSample {
         # the median; measured: SHIP-M folded to 0 total in the first run).
         return @{ ok = $false; flags = $flags }
     }
+    $svcPids = @()
+    foreach ($nm in $subjectNames) {
+        $svcPids += @(Get-Process -Name $nm -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    }
     $delta = Get-GpuDelta $g0 $g1
     if (-not $delta.ok) { $flags += 'GPU_DELTA_FAIL'; return @{ ok = $false; flags = $flags } }
-    $col = Resolve-GpuColumns -deltaRows $delta.rows -appPids $appPids -scanoutLuid $scanoutLuid
+    $col = Resolve-GpuColumns -deltaRows $delta.rows -appPids $appPids -svcPids $svcPids -scanoutLuid $scanoutLuid
     $appCpu = Get-CpuDeltaPct $cpu0 $cpu1
 
     $wp = 0.0; $ww = 0.0; $wr = 0.0; $wm = ''
@@ -227,8 +235,11 @@ function Invoke-ArmSample {
         $wm = ($wit | Select-Object -Last 1).Mode
     }
 
-    $row = ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14}' -f `
-        $arm.name, $rep, $col.app_scanout, $col.app_other, $col.dwm, $col.other, $col.total, `
+    $row = ('{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15},{16},{17},{18},{19},{20},{21},{22},{23},{24}' -f `
+        $arm.name, $rep, $col.app_scanout, $col.app_other, $col.svc_scanout, $col.svc_other, `
+        $col.dwm_scanout, $col.dwm_other, $col.sys_scanout, $col.sys_other, `
+        $col.oth_scanout, $col.oth_other, $col.tot_scanout, $col.tot_other, `
+        $col.dwm, $col.other, $col.total, `
         $appCpu, $wp, $ww, $wr, $wm, $delta.elapsedSec, $col.top_other, ($flags -join ';'))
     Add-Content -Path $csvPath -Value $row
     Log ('  ' + $row)
@@ -261,6 +272,13 @@ if ($cfg.PSObject.Properties['gpuPreference'] -ne $null -and $needApp) {
 }
 
 Log ('Ladder start: ' + $armList.Count + ' arms x ' + $reps + ' reps, window ' + $windowSec + ' s, warmup ' + $warmupSec + ' s')
+
+# Subject processes beyond the client: on the service path composite + weave +
+# bridge live in displayxr-service.exe, so accounting only the client puts the
+# entire subject of the experiment into the noise bucket (#1154).
+$subjectNames = @()
+if ($cfg.PSObject.Properties['subjectProcesses'] -ne $null) { $subjectNames = @($cfg.subjectProcesses) }
+if ($subjectNames.Count -gt 0) { Log ('Subject processes (besides the client): ' + ($subjectNames -join ', ')) }
 
 $script:firstAppArmSeen = $false
 $script:aborted = $false
