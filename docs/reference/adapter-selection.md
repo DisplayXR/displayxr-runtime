@@ -209,7 +209,7 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 | path | auto-engages? | `reason=` when it does not |
 |---|---|---|
 | In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `dp_refused_scanout` (the plug-in declined a weaver on the scanout adapter — asked inside Stage A, so the split never engages, ADR-037 §3a) · `killed_by_env` |
-| **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
+| **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible,weave_on_ingest` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7, and its display processor follows it onto the render device, #1172) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
 | In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
 | In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
 | In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
@@ -344,9 +344,21 @@ Neither variable has to be *guessed at*. Two places report the answer:
   The reason tokens are a closed set (`comp_split_gate.h`): `killed_by_env`,
   `same_adapter`, `scanout_unresolvable`, `render_unresolvable`, `no_hwnd`,
   `shared_texture_session`, `no_panel_dimensions`, `legacy_standalone`,
-  `api_unsupported`, `presenter_ineligible`, `stage_a_failed`,
-  `dp_refused_scanout`, `layers_unsupported`. `stage_a_failed` always has the
-  specific failure spelled out in the WARN immediately above it.
+  `api_unsupported`, `presenter_ineligible`, `weave_on_ingest`,
+  `stage_a_failed`, `dp_refused_scanout`, `layers_unsupported`.
+  `stage_a_failed` always has the specific failure spelled out in the WARN
+  immediately above it.
+
+  `weave_on_ingest` is the companion of `presenter_ineligible` and names the
+  **device** half rather than the placement half (#1172). An ineligible
+  presenter must not merely be *placed* off the scanout adapter, it must never
+  **touch** it: its atlas, its shared input texture and its handback all live on
+  the render device, so the display processor that weaves them does too — a
+  display processor of its own, on its own window, rather than the shared panel
+  DP (whose device follows whichever presenter currently owns the panel, and is
+  the scanout one whenever that is an eligible presenter). Handing a
+  scanout-adapter weaver a render-adapter texture is not a D3D11 error; it
+  faults inside the vendor SDK.
 
 ## Choosing a value
 

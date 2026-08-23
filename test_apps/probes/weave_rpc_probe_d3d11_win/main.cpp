@@ -28,6 +28,25 @@
  * Run forced-IPC: set XRT_FORCE_MODE=ipc process-level, start displayxr-service,
  * then launch this exe.
  *
+ * ── #1172: walking the ingest-DP path without a browser ─────────────────────
+ *
+ * This probe IS a present-owner (`PRESENTER_SELF`), so it is the browser-free
+ * way to exercise the rule that an ineligible client's weave must never touch
+ * the scanout device. On a hybrid box with a real output-device split it walks
+ * the path by itself. On a single-adapter box (or to test it deterministically
+ * anywhere) arm the service with:
+ *
+ *   set DXR_TEST_FORCE_WEAVE_INGEST_DP=1   -- force the ingest-device DP on
+ *   set DXR_TEST_FORCE_WEAVE_INGEST_DP=2   -- force its creation to FAIL
+ *
+ * With `=1` the service log must show
+ * `[pipeline] this client weaves on its OWN display processor on the RENDER
+ * device (split=0 reason=weave_on_ingest ...)` plus
+ * `NOT binding the panel DP to it (one weaver per HWND; #1172)` — and the probe
+ * must keep weaving. With `=2` the weave must be SKIPPED with the `[weave_dev]`
+ * WARN rather than run on the panel DP. Closing the probe must destroy only its
+ * own DP: the panel keeps its mode and the split does not change.
+ *
  * ── Spec v8 per-region hardware wish (browser#88) ────────────────────────────
  *
  * Two flags drive the two ways to declare a region PHYSICALLY FLAT, so the wish
