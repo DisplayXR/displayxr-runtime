@@ -1243,8 +1243,10 @@ comp_xbridge_bind_plane_resource(struct comp_xbridge *xb,
 	// the half-rate latch no longer describes this plane.
 	pl.half_rate = false;
 	xb_plane_invalidate_slots(xb, pl);
-	U_LOG_W("%s: producer bound the %s plane's source resource %p directly (generation %llu) — no share, no open, no drain (#918 D12-4)",
-	        XB_TAG(xb), xb_plane_name(plane), (void *)res, (unsigned long long)generation);
+	U_LOG_W(
+	    "%s: producer bound the %s plane's source resource %p directly (generation %llu) — no share, no open, no "
+	    "drain (#918 D12-4)",
+	    XB_TAG(xb), xb_plane_name(plane), (void *)res, (unsigned long long)generation);
 	return true;
 }
 

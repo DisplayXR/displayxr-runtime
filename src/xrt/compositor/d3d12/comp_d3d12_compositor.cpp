@@ -130,14 +130,15 @@ struct comp_d3d12_compositor
 	IDXGIFactory4 *dxgi_factory;
 
 	/*!
-	 * #918 D12-3 — THE OUTPUT-DEVICE SPLIT.
+	 * #918 D12-3 / D12-4 — THE OUTPUT-DEVICE SPLIT.
 	 *
 	 * Everything in this block is NULL/false unless `DXR_WEAVE_ON_SCANOUT=1`
 	 * resolved a scanout adapter that differs from the app's AND every step of
-	 * Stage A succeeded. When it is live, the weave, the HUD, the repaint loop
-	 * and the present all move to `out_dev` on the scanout adapter, and the only
-	 * thing that crosses the adapter boundary is the ATLAS, once per app frame
-	 * through @ref xbridge — never once per present and never per repaint.
+	 * Stage A succeeded. When it is live, the weave, the HUD, the 2D/3D
+	 * composite, the repaint loop and the present all move to `out_dev` on the
+	 * scanout adapter, and the only things that cross the adapter boundary are the
+	 * ATLAS and — since D12-4 — the two 2D PLANES, once per app frame through
+	 * @ref xbridge, never once per present and never per repaint.
 	 *
 	 * The app device keeps the renderer, the swapchains and the app's own
 	 * command list. Nothing here is reachable from the app's frame path except
@@ -216,17 +217,63 @@ struct comp_d3d12_compositor
 	 * are, and it is wired at every one of them (see
 	 * @ref d3d12_outcomp_note_execute).
 	 *
-	 * The unit itself is NOT created on this rung, and that is a warmup decision
-	 * rather than an oversight: `comp_d3d12_outcomp_create` runs `D3DCompile` on
-	 * the masked-composite shaders and builds a PSO per target format, and Stage
-	 * A's explicit constraint is that it must not lengthen the session warmup the
-	 * investigation measured. This rung is projection-only — a frame that would
-	 * composite retires the split (see @ref d3d12_split_retire) — so it could
-	 * never reach the unit. D12-4 creates it on `out_dev`, which is the
-	 * device-explicit create D12-1 exists for, and finds the boundary reporting
-	 * already complete.
+	 * D12-3 did not create the unit at all, and that was a warmup decision rather
+	 * than an oversight: `comp_d3d12_outcomp_create` runs `D3DCompile` on the
+	 * masked-composite shaders and builds a PSO per target format, and Stage A's
+	 * explicit constraint is that it must not lengthen the session warmup the
+	 * hybrid-iGPU investigation measured.
+	 *
+	 * #918 D12-4 creates it and KEEPS that constraint rather than relaxing it: the
+	 * create is LAZY, on `out_dev` (the device-explicit create D12-1 exists for),
+	 * taken from the DEPOSIT half of the first frame that actually composites. A
+	 * session that never composites never pays it; one that does pays it once, on
+	 * its own render thread, well past warmup. See @ref d3d12_ensure_outcomp.
 	 */
 	struct comp_d3d12_outcomp *outcomp;
+	//! The lazy create was attempted and failed. Never retried, never re-WARNed —
+	//! the deposit half runs every frame.
+	bool outcomp_failed;
+	//! One WARN, ever, for a session whose Local2D plane could not be bound.
+	bool local2d_plane_warned;
+
+	/*!
+	 * #918 D12-4 — the mask raster the CONSUME half owes, captured at DEPOSIT.
+	 *
+	 * THE ORDERING THIS EXISTS FOR, because it is the one thing the D3D11 leg
+	 * never had to solve. Both legs rebuild an auto/implicit/feather mask on the
+	 * OUTPUT device rather than transporting it — it is pure CPU rects in, so it
+	 * is built where the composite consumes it. D3D11 can do that inline in the
+	 * deposit half, because it records onto an IMMEDIATE CONTEXT and the work is
+	 * submitted as it is written. D3D12 records into a command list, and the
+	 * out-device list is `Reset()` AFTER the deposit half runs (layer_commit closes
+	 * and executes the APP list first, then arms the weave list) — so a raster
+	 * recorded at deposit onto the weave list would be thrown away by that Reset,
+	 * and one recorded onto the app list would be built on the wrong device.
+	 *
+	 * So the deposit half captures the raster REQUEST (rects and dims: CPU data,
+	 * no device in sight) and the consume half records it onto the weave list, on
+	 * the output device, immediately before the composite that samples it. Do not
+	 * "tidy" this back to a deposit-time raster.
+	 *
+	 * Only an APP FRAME fills this. A repaint replays rendering and never state
+	 * transitions, so it composites from @ref repaint.mask_res — the resource the
+	 * last app frame's consume half rastered.
+	 * @{
+	 */
+	//! @ref out_mask_req::kind
+#define D3D12_OUT_MASK_NONE 0u
+#define D3D12_OUT_MASK_IMPLICIT 1u     //!< #439 Local2D rect union (ALPHA_OVER).
+#define D3D12_OUT_MASK_ZONE_BINARY 2u  //!< ADR-027 auto wish; ALSO the published wish.
+#define D3D12_OUT_MASK_ZONE_FEATHER 3u //!< #803 per-zone ramp; the wish stays binary.
+	struct
+	{
+		uint32_t kind;
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		float feather[XRT_MAX_LAYERS];
+		uint32_t count;
+		uint32_t w, h;
+	} out_mask_req;
+	/*! @} */
 	/*! @} */
 
 	//! The DP factory, kept so the display processor can be re-created on the
@@ -420,20 +467,35 @@ struct comp_d3d12_compositor
 	struct xrt_rect zone_wish_rects[XRT_MAX_LAYERS];
 	uint32_t zone_wish_rect_count;
 
-	//! Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
-	//! target — dedicated. Lazily (re)allocated window-sized.
+	/*!
+	 * Flattened Local2D layers (the `twod` source). R8G8B8A8_UNORM render
+	 * target — dedicated. Lazily (re)allocated window-sized.
+	 *
+	 * #918 D12-4: under the split this is a BRIDGE PLANE SOURCE and is allocated
+	 * at the PANEL instead — once, and then never resized, which is what keeps it
+	 * structurally outside the R2 resize-churn path (a per-size realloc of a plane
+	 * chain on the frame path is what cost 21 of 50 frames in #1091). The flatten
+	 * still writes only the window region at the top-left, exactly as #464 has it.
+	 * @ref local2d_scratch_gen is bumped on every REALLOCATION so the bridge
+	 * re-binds; a bare pointer compare is not enough, because an allocator that
+	 * recycles an address would otherwise keep the producer reading the previous
+	 * allocation (the trap `comp_xbridge_set_source`'s `source_key` documents).
+	 */
 	ID3D12Resource *local2d_scratch;
 	ID3D12DescriptorHeap *local2d_scratch_rtv_heap;
 	uint32_t local2d_scratch_w, local2d_scratch_h;
+	uint64_t local2d_scratch_gen;
 
 	//! #491 part 3 — 2D-under backdrop flatten target (same trio as
-	//! local2d_scratch). UNDER Local2D layers (before the projection in list
-	//! order) flatten here PRE-weave, left in PIXEL_SHADER_RESOURCE; the
-	//! ID3D12Resource* is handed to the DP via set_background_2d (the DP creates
-	//! its own shader-visible SRV). Compositor-owned so it outlives process_atlas.
+	//! local2d_scratch, and the same #918 D12-4 panel-sizing under the split).
+	//! UNDER Local2D layers (before the projection in list order) flatten here
+	//! PRE-weave, left in PIXEL_SHADER_RESOURCE; the ID3D12Resource* is handed to
+	//! the DP via set_background_2d (the DP creates its own shader-visible SRV).
+	//! Compositor-owned so it outlives process_atlas.
 	ID3D12Resource *backdrop_scratch;
 	ID3D12DescriptorHeap *backdrop_scratch_rtv_heap;
 	uint32_t backdrop_scratch_w, backdrop_scratch_h;
+	uint64_t backdrop_scratch_gen;
 
 	//! HUD overlay.
 	struct u_hud *hud;
@@ -587,15 +649,31 @@ d3d12_comp(struct xrt_compositor *xc)
 // #439 authored zone-mask helpers (XR_DXR_local_3d_zone). Defined near the
 // bottom of the file alongside the comp_d3d12_compositor_zone_mask_* entry
 // points, called from the layer-commit paths + destroy above them.
-static bool d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
-                                      bool reuse_mask,
-                                      bool prepare_only,
-                                       ID3D12Resource *dst,
-                                       uint64_t dst_rtv,
-                                       D3D12_RESOURCE_STATES dst_pre_state,
-                                       D3D12_RESOURCE_STATES dst_post_state,
-                                       uint32_t dst_w, uint32_t dst_h,
-                                       const struct u_canvas_rect *eff_canvas);
+static bool
+d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
+                          bool reuse_mask,
+                          bool prepare_only,
+                          ID3D12Resource *dst,
+                          uint64_t dst_rtv,
+                          D3D12_RESOURCE_STATES dst_pre_state,
+                          D3D12_RESOURCE_STATES dst_post_state,
+                          uint32_t dst_w,
+                          uint32_t dst_h,
+                          const struct u_canvas_rect *eff_canvas,
+                          int32_t slot,
+                          bool is_repaint);
+// #918 D12-4 — the plane-transport helpers, defined with the Local2D helpers
+// near the bottom and called from layer_commit + the backdrop flatten above them.
+static void
+d3d12_local2d_digest(struct comp_d3d12_compositor *c,
+                     int32_t proj_idx,
+                     bool over,
+                     uint32_t region_w,
+                     uint32_t region_h,
+                     struct xrt_rect *out_box,
+                     uint64_t *out_hash);
+static void
+d3d12_clamp_region_to_panel(struct comp_d3d12_compositor *c, uint32_t *w, uint32_t *h);
 // #491 part 3 — pre-weave 2D-under backdrop flatten (defined with the Local2D
 // helpers near the bottom; called from the process_atlas sites above).
 static ID3D12Resource *d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint32_t dst_h,
@@ -1096,6 +1174,104 @@ d3d12_make_dp(struct comp_d3d12_compositor *c)
 	return true;
 }
 
+/*!
+ * #918 D12-4 — create the output composite unit, LAZILY, on the first frame that
+ * actually composites.
+ *
+ * WHERE THIS IS, AND WHY IT IS NOT IN STAGE A. `comp_d3d12_outcomp_create` runs
+ * `D3DCompile` on the masked-composite shaders and builds a PSO per target
+ * format. Stage A's explicit constraint is that it must not lengthen the session
+ * warmup the hybrid-iGPU investigation measured, and D12-3 declined to create the
+ * unit there for exactly that reason. That constraint has not changed, so the
+ * create moved rather than being relaxed: it happens on the app's own render
+ * thread, inside the first `xrEndFrame` that carries zones or Local2D, and costs
+ * that one frame a shader compile. A session that never composites never pays it,
+ * and a session that does pays it once and off the warmup path.
+ *
+ * Called from the DEPOSIT half rather than the consume half deliberately. The
+ * deposit half is what stamps the slot's recipe, so a create failure there stamps
+ * `composite=false` and the frame ships as projection-only; discovering it in the
+ * consume half would mean a slot already stamped compositable that nothing can
+ * composite, and the consume half would bail on it every frame afterwards.
+ *
+ * Never retried after a failure and never re-WARNed: the deposit half runs every
+ * frame, and the logging law forbids a per-frame WARN outright.
+ */
+static bool
+d3d12_ensure_outcomp(struct comp_d3d12_compositor *c)
+{
+	if (c->outcomp != nullptr) {
+		return true;
+	}
+	if (c->outcomp_failed) {
+		return false;
+	}
+	const uint64_t start_ns = os_monotonic_get_ns();
+	if (comp_d3d12_outcomp_create(d3d12_out_device(c), &c->outcomp) != XRT_SUCCESS || c->outcomp == nullptr) {
+		c->outcomp_failed = true;
+		c->outcomp = nullptr;
+		U_LOG_W(
+		    "#918 D12-4: the output composite unit could not be created on the scanout device — 2D "
+		    "content does not composite under the split for this session; the 3D weave is unaffected");
+		return false;
+	}
+	U_LOG_W(
+	    "#918 D12-4: output composite unit up on the %s device in %.1f ms (lazy — first compositing frame, off the "
+	    "warmup path)",
+	    c->split_active ? "SCANOUT" : "app", (double)(os_monotonic_get_ns() - start_ns) / 1.0e6);
+	return true;
+}
+
+/*!
+ * #918 D12-4 — drop the mask rasters that belong to whichever device the
+ * composite last ran on.
+ *
+ * The implicit / binary-zone / feather rasters are created on the device the
+ * COMPOSITE consumes them on, which the split moves. Retiring the split changes
+ * that device, so these have to go with it — they are not merely stale, they are
+ * resources of a device that is about to be released. The published wish borrows
+ * one of them, so that borrow is dropped here too, as is the repaint's cached
+ * mask.
+ *
+ * Deliberately NOT @ref d3d12_release_zone_state: that one also detaches the
+ * app's active mask, which is session state a mid-session retire must not touch.
+ */
+static void
+d3d12_release_out_device_masks(struct comp_d3d12_compositor *c)
+{
+	c->zone_publish_res = nullptr;
+	c->repaint.mask_res = nullptr;
+	if (c->implicit_mask_staged != nullptr) {
+		c->implicit_mask_staged->Release();
+		c->implicit_mask_staged = nullptr;
+	}
+	if (c->implicit_mask_rtv_heap != nullptr) {
+		c->implicit_mask_rtv_heap->Release();
+		c->implicit_mask_rtv_heap = nullptr;
+	}
+	if (c->implicit_mask_tex != nullptr) {
+		c->implicit_mask_tex->Release();
+		c->implicit_mask_tex = nullptr;
+	}
+	c->implicit_mask_w = 0;
+	c->implicit_mask_h = 0;
+	c->implicit_rect_count = 0;
+	if (c->feather_mask_staged != nullptr) {
+		c->feather_mask_staged->Release();
+		c->feather_mask_staged = nullptr;
+	}
+	if (c->feather_mask_rtv_heap != nullptr) {
+		c->feather_mask_rtv_heap->Release();
+		c->feather_mask_rtv_heap = nullptr;
+	}
+	if (c->feather_mask_tex != nullptr) {
+		c->feather_mask_tex->Release();
+		c->feather_mask_tex = nullptr;
+	}
+	c->feather_mask_w = 0;
+	c->feather_mask_h = 0;
+}
+
 //! Release everything Stage A built. Idempotent; leaves `split_active` alone
 //! (the caller owns that flag and the ordering around it).
 static void
@@ -1147,19 +1323,27 @@ d3d12_split_release_out(struct comp_d3d12_compositor *c)
  * back on the app device.
  *
  * WHY THIS EXISTS RATHER THAN A PER-FRAME DEGRADE. This rung transports the
- * ATLAS and nothing else: the #918 Phase-2a PLANES (Local2D, the 2D-under
- * backdrop, the Tier-3 authored mask) are D3D11-only and the D3D12-ends bridge
- * refuses them (D12-3a). So a frame carrying zones / Local2D / an authored mask
- * has composite inputs on the app device and a composite target on the scanout
- * device, and there is no honest frame to draw. The two dishonest options are
- * both worse than this: presenting the weave without its 2D regions is a silent
- * visual regression, and half-splitting the frame is the class of bug #918's
- * whole recipe/slot machinery exists to prevent.
+ * ATLAS, the two 2D PLANES and — after D12-4 — nothing else. What is left
+ * un-transportable is the Tier-3 APP-AUTHORED zone mask: the application draws
+ * its pixels into a texture of its own on the render adapter, and the bridge's
+ * mask plane is not wired to it yet (that is D12-5). So a frame with an authored
+ * mask still has a composite input on the app device and a composite target on
+ * the scanout device, and there is no honest frame to draw. The two dishonest
+ * options are both worse than this: presenting the weave without its 2D regions
+ * is a silent visual regression, and half-splitting the frame is the class of bug
+ * #918's whole recipe/slot machinery exists to prevent.
  *
  * So the session goes back to the single-adapter path — target, display
- * processor, HUD staging and DP crop all rebuilt on the app device — and stays
- * there. Once, guarded by `split_active`; a session that never composites never
- * reaches it. D12-4 gives the planes D3D12 ends and this stops firing for zones.
+ * processor, HUD staging, DP crop and the composite's own mask rasters all
+ * rebuilt on the app device — and stays there. Once, guarded by `split_active`.
+ *
+ * **D12-4 NARROWED THIS, it did not delete it.** Zones and Local2D no longer
+ * reach here at all: their planes cross with the atlas, their masks rebuild
+ * output-side, and their composite runs on the scanout adapter. What still
+ * retires keeps its OWN token (@ref COMP_SPLIT_REASON_AUTHORED_MASK) rather than
+ * the generic @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED, so a support case can
+ * tell "this build does not transport an authored mask yet" from "you are reading
+ * an old build".
  *
  * THE SECOND TRIGGER is a display processor that DECLINES a weaver on the
  * scanout adapter (ADR-037 §3a). Same recovery, same reason it is a recovery
@@ -1196,9 +1380,9 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
 	}
 
 	U_LOG_W(
-	    "#918 output-device split RETIRED (%s) — this rung transports the atlas only, and the "
-	    "composite's inputs live on the app device; moving the weave back to the app adapter for the "
-	    "rest of the session (#918 D12-3)",
+	    "#918 output-device split RETIRED (%s) — that input lives on the app device and the composite's "
+	    "target is on the scanout one; moving the weave back to the app adapter for the rest of the "
+	    "session (#918 D12-4)",
 	    why);
 
 	/*
@@ -1262,6 +1446,17 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
 		c->hud_upload_buffer = nullptr;
 	}
 	c->hud_initialized = false;
+
+	/*
+	 * #918 D12-4 — the composite's own device-scoped resources go with the
+	 * placement. The mask rasters were built on the scanout device; the outcomp
+	 * (released inside d3d12_split_release_out) was created there too. Dropping
+	 * them here is not tidying: keeping a resource of a device that is about to be
+	 * released and then sampling it from the app device is a use-after-free with a
+	 * plausible-looking pointer.
+	 */
+	d3d12_release_out_device_masks(c);
+	c->outcomp_failed = false;
 
 	// Nothing above may run after this: every "which device?" accessor keys off
 	// it, so the rebuild below must see the app placement.
@@ -1465,9 +1660,8 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		xbi.out_adapter = nullptr;
 		xbi.max_width = sys_w;
 		xbi.max_height = sys_h;
-		// The planes are refused on a D3D12-ends bridge (projection-only rung),
-		// so the panel extent buys nothing here — passed for completeness and so
-		// D12-4 does not have to come back and add it.
+		// #918 D12-4: the 2D planes are sized from the PANEL, once, and never
+		// resized — that is what keeps them out of the R2 resize-churn path.
 		xbi.panel_width = xdev->hmd->screens[0].w_pixels;
 		xbi.panel_height = xdev->hmd->screens[0].h_pixels;
 
@@ -1621,6 +1815,24 @@ d3d12_split_render_diag(struct comp_d3d12_compositor *c)
 	    (unsigned long long)no_slot, (unsigned long long)out_crop, ing_name, (unsigned long long)ing.direct,
 	    (unsigned long long)ing.staged, (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 	    (unsigned long long)ing.leak);
+
+	/*
+	 * #918 D12-4 — one line per live PLANE, same shape and same field names as
+	 * the D3D11 leg's, so one parser reads both. Emitted only for a plane that
+	 * has actually transported something, so a projection-only session's log is
+	 * byte-identical to what it was before the planes existed.
+	 */
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		uint64_t pb = 0, pc = 0, ps = 0;
+		bool half = false;
+		comp_xbridge_take_plane_stats(c->xbridge, p, &pb, &pc, &ps, &half);
+		if (pc == 0 && ps == 0) {
+			continue;
+		}
+		U_LOG_W("[RENDER] plane=%s kb=%llu copies=%llu skips=%llu half_rate=%d window_s=10",
+		        comp_xbridge_plane_label(p), (unsigned long long)(pb / 1024u), (unsigned long long)pc,
+		        (unsigned long long)ps, (int)half);
+	}
 }
 
 /*
@@ -2838,9 +3050,11 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	uint32_t weave_cols = c->repaint.cols;
 	uint32_t weave_rows = c->repaint.rows;
 
+	// #918 D12-4: hoisted out of the block below — the composite and the DP
+	// backdrop both need the slot the weave settled on, and both live past it.
+	int32_t slot = -1;
 	if (c->split_active) {
 		const uint64_t want_gen = c->split_layout_gen;
-		int32_t slot;
 		if (is_repaint) {
 			// A repaint re-weaves exactly the slot the last app frame wove,
 			// with zero bridge traffic — and must prove nothing is rewriting
@@ -2994,12 +3208,12 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	 * the 2D flicker — see the composite.)
 	 */
 	//
-	// #918 D12-3: the flatten reads the app own Local2D swapchain images and
-	// writes an APP-device scratch, so it cannot run against an output-device
-	// list -- and it has nothing to do here anyway: a frame carrying Local2D
-	// retires the split before it ever reaches the weave (see
-	// d3d12_split_retire). Skipped rather than guarded downstream, so no
-	// app-device resource is ever handed to the out-device display processor.
+	// #918 D12-4: under the split the flatten does not run HERE — it reads the
+	// app's own Local2D swapchain images and writes an app-device scratch, so it
+	// belongs to the deposit half, where it now runs (see layer_commit). What the
+	// display processor is handed here is the BACKDROP PLANE of the slot being
+	// woven: the same pixels, on the device the DP actually lives on, and stamped
+	// with the recipe that describes them.
 	if (!is_repaint && !c->split_active) {
 		uint32_t bd_w = 0, bd_h = 0;
 		c->repaint.backdrop = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
@@ -3007,7 +3221,29 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 		c->repaint.backdrop_h = bd_h;
 	}
 	if (c->split_active) {
-		xrt_display_processor_d3d12_set_background_2d(c->display_processor, nullptr, 0, 0);
+		/*
+		 * The backdrop's dims come from the SLOT's recipe, not from
+		 * `c->repaint.backdrop_w/h`: the DP declares the backdrop's own extent
+		 * separately from the composite region, and under the split the pixels
+		 * being handed over belong to whichever frame filled this slot — which is
+		 * not necessarily the one whose dims live in CPU state (#1140, the recipe
+		 * travels with the pixels). A slot with no backdrop, or one whose plane is
+		 * stale, clears the DP's background rather than showing an older frame's.
+		 */
+		ID3D12Resource *bd = nullptr;
+		uint32_t bd_w = 0, bd_h = 0;
+		struct comp_xbridge_recipe brec = {};
+		if (slot >= 0 && comp_xbridge_slot_recipe(c->xbridge, slot, &brec) && brec.bd_w > 0 && brec.bd_h > 0 &&
+		    (brec.plane_valid & (1u << COMP_XBRIDGE_PLANE_BACKDROP)) != 0) {
+			bd = static_cast<ID3D12Resource *>(
+			    comp_xbridge_get_plane_resource(c->xbridge, slot, COMP_XBRIDGE_PLANE_BACKDROP,
+			                                    brec.plane_seq[COMP_XBRIDGE_PLANE_BACKDROP]));
+			if (bd != nullptr) {
+				bd_w = brec.bd_w;
+				bd_h = brec.bd_h;
+			}
+		}
+		xrt_display_processor_d3d12_set_background_2d(c->display_processor, bd, bd_w, bd_h);
 	} else {
 		xrt_display_processor_d3d12_set_background_2d(c->display_processor, c->repaint.backdrop,
 		                                              c->repaint.backdrop_w, c->repaint.backdrop_h);
@@ -3065,18 +3301,16 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// transition (below) proceeds unchanged. No-op when this frame carries no
 	// zones / Local2D / explicit mask.
 	//
-	// #918 D12-3: NOT under the split. Every input this composite reads -- the
-	// flattened Local2D scratch, the zone/Local2D mask, the weave snapshot -- is
-	// an app-device resource, and its output-device twin
-	// (@ref comp_d3d12_outcomp, D12-1) needs the #918 Phase-2a plane transports
-	// to be fed. Those are D12-4. This rung is projection-only and a frame that
-	// would composite retires the split instead of half-splitting itself, so the
-	// call is skipped rather than made safe piecemeal.
-	if (!c->split_active) {
-		d3d12_composite_zone_mask(c, /*reuse_mask=*/true, /*prepare_only=*/false, back_buffer, rtv_handle.ptr,
-		                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
-		                          tgt_width, tgt_height, &eff_canvas);
-	}
+	// #918 D12-4: this now runs under the split too, and it is the rung. The
+	// inputs it reads there are all output-device resources — the Local2D plane
+	// the bridge landed beside this slot's atlas, a mask rastered on the out
+	// device a few instructions earlier, and the composite unit's own weave
+	// snapshot — and every parameter comes from the SLOT's recipe rather than
+	// from live CPU state. `slot` is what carries both; -1 off the split, which
+	// the callee reads as "not a bridged consume".
+	d3d12_composite_zone_mask(c, /*reuse_mask=*/true, /*prepare_only=*/false, back_buffer, rtv_handle.ptr,
+	                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width,
+	                          tgt_height, &eff_canvas, slot, is_repaint);
 
 
 	// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
@@ -3430,30 +3664,28 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// — "any zone active => request 3D" once on the rising edge, no forced
 	// 2D on the falling edge.
 	/*
-	 * #918 D12-3 — THE FALLBACK TRIGGER, and the earliest point it can be made.
+	 * #918 D12-4 — THE FALLBACK TRIGGER, and the earliest point it can be made.
 	 *
 	 * The scan above is the frame's one coherent answer to "does this frame
-	 * composite?". This rung transports the ATLAS only — the Phase-2a planes are
-	 * D3D11-only and the D3D12-ends bridge refuses them — so a frame carrying
-	 * zones, Local2D or a sticky authored mask has its composite inputs on the
-	 * app device and its composite target on the scanout device. Retire the
-	 * split for the session rather than draw a half-split frame; see
-	 * d3d12_split_retire for why that is the only honest option here.
+	 * composite?". D12-3 retired the split for ANY compositing frame, because the
+	 * D3D12-ends bridge was projection-only. D12-4 transports the Local2D and
+	 * backdrop planes and rebuilds the auto/implicit/feather masks output-side, so
+	 * zones and Local2D no longer belong here — they composite on the scanout
+	 * adapter, which is the whole point of the rung and what the shipping Unity
+	 * avatar sample (zones + a Local2D band, auto wish) needs to see any benefit
+	 * from the split at all.
+	 *
+	 * WHAT IS LEFT is the Tier-3 APP-AUTHORED mask. Its pixels are drawn by the
+	 * application into a texture on the RENDER adapter, so it is a genuine
+	 * transport gap rather than a device-placement one, and closing it means
+	 * wiring COMP_XBRIDGE_PLANE_MASK plus the authored wish publish — D12-5. It
+	 * keeps its own reason token so it cannot be mistaken for the old blanket
+	 * refusal; see d3d12_split_retire.
 	 *
 	 * Before any of this frame's work is recorded, and under c->mutex.
 	 */
-	if (c->split_active) {
-		const char *why = nullptr;
-		if (c->zones_frame) {
-			why = "the frame carries display zones";
-		} else if (c->local_2d_last_frame) {
-			why = "the frame carries Local2D layers";
-		} else if (c->active_zone_mask != nullptr || c->frame_wish != nullptr) {
-			why = "an authored zone mask is active";
-		}
-		if (why != nullptr) {
-			d3d12_split_retire(c, why, COMP_SPLIT_REASON_LAYERS_UNSUPPORTED);
-		}
+	if (c->split_active && (c->active_zone_mask != nullptr || c->frame_wish != nullptr)) {
+		d3d12_split_retire(c, "the frame carries an app-authored zone mask", COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
 
 	if (c->zones_frame && !c->zones_mode_requested && !d3d12_zone_dp_supported(c)) {
@@ -3866,10 +4098,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// COMMON (just transitioned above); leave it in COMMON after.
 			// No-op when this frame carries no zones / Local2D / explicit
 			// mask, leaving the woven texture as-is.
-			d3d12_composite_zone_mask(
-			    c, false, false, c->shared_texture, st_rtv.ptr,
-			    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON,
-			    dp_target_w, dp_target_h, &eff_canvas);
+			d3d12_composite_zone_mask(c, false, false, c->shared_texture, st_rtv.ptr,
+			                          D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, dp_target_w,
+			                          dp_target_h, &eff_canvas, /*slot=*/-1,
+			                          /*is_repaint=*/false);
 
 			// #727 dual tap, second point: after the composite lands (needs
 			// the close/execute/fence below to have run — defer via flag).
@@ -3945,12 +4177,96 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_logged = true;
 		}
 
+		/*
+		 * #918 D12-4 — the 2D-UNDER BACKDROP, under the split, is deposited HERE.
+		 *
+		 * Off the split it is flattened inside the weave, immediately before the
+		 * display processor is told about it, and that is still where it happens.
+		 * It cannot stay there under the split for two independent reasons: it
+		 * samples the app's own Local2D swapchain images (app device), and the
+		 * weave records onto the OUT device's list. So the flatten runs on the app
+		 * list here, the pixels cross as the BACKDROP plane, and the weave hands
+		 * the DP the egress plane of the slot it is weaving.
+		 *
+		 * Before the composite's deposit half, because that half stamps the
+		 * recipe and the recipe carries the backdrop's own extent.
+		 */
+		if (c->split_active) {
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D12Resource *bd = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
+			c->repaint.backdrop = bd;
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+			if (bd != nullptr && bd_w > 0 && bd_h > 0) {
+				/*
+				 * The flatten left it in PIXEL_SHADER_RESOURCE for a display
+				 * processor that, under the split, lives on the other adapter and
+				 * will never sample it. The producer's COPY queue reads it
+				 * instead, and that requires COMMON.
+				 */
+				D3D12_RESOURCE_BARRIER to_common = {};
+				to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				to_common.Transition.pResource = bd;
+				to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+				to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				c->cmd_list->ResourceBarrier(1, &to_common);
+
+				int32_t bproj = -1;
+				for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+					enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+					if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+						bproj = (int32_t)i;
+						break;
+					}
+				}
+				struct xrt_rect box = {};
+				uint64_t hash = 0;
+				d3d12_local2d_digest(c, bproj, /*over=*/false, bd_w, bd_h, &box, &hash);
+				// Panel-sized, always: never resized, so structurally outside the
+				// R2 churn path (#918 Phase 2a).
+				if (comp_xbridge_bind_plane_resource(
+				        c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, bd, c->backdrop_scratch_gen,
+				        (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, c->split_panel_w, c->split_panel_h)) {
+					comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, hash,
+					                         box.offset.w, box.offset.h, (uint32_t)box.extent.w,
+					                         (uint32_t)box.extent.h);
+				} else {
+					// The backdrop degrades on its own — a session without one
+					// simply has no 2D-under band, and the weave is unaffected.
+					// Stamped invalid so the weave clears the DP background
+					// rather than showing an older frame's.
+					c->repaint.backdrop_w = 0;
+					c->repaint.backdrop_h = 0;
+				}
+			} else {
+				comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
+			}
+		}
+
 		// #875 DEPOSIT half: mask resolve + Local2D flatten, recorded into the
 		// list that is closed/executed/synced immediately below.
-		d3d12_composite_zone_mask(c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0,
-		                          D3D12_RESOURCE_STATE_RENDER_TARGET,
-		                          D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width, tgt_height,
-		                          &eff_canvas);
+		const bool deposited = d3d12_composite_zone_mask(
+		    c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		    D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width, tgt_height, &eff_canvas, /*slot=*/-1,
+		    /*is_repaint=*/false);
+
+		/*
+		 * #918 D12-4 — the ONE place "this frame does not composite" is decided.
+		 *
+		 * A frame whose deposit half did not complete (projection-only, or a plane
+		 * that could not be bound) must stamp `composite = false` and UN-STAGE the
+		 * Local2D plane, or the consume half reads a slot claiming a composite it
+		 * has no pixels for. Mirrors the D3D11 leg's `!deposited` branch.
+		 */
+		if (c->split_active && !deposited && c->xbridge != nullptr) {
+			struct comp_xbridge_recipe r = {};
+			r.composite = false;
+			r.bd_w = c->repaint.backdrop_w;
+			r.bd_h = c->repaint.backdrop_h;
+			comp_xbridge_stage_recipe(c->xbridge, &r);
+			comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
+		}
 
 		// Execute atlas copy so the texture is ready for the weaver
 		c->cmd_list->Close();
@@ -5320,6 +5636,10 @@ d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32
 	                                  c->local2d_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 	c->local2d_scratch_w = w;
 	c->local2d_scratch_h = h;
+	// #918 D12-4: a REALLOCATION, which the bridge must re-bind to. Bumped on
+	// every one — never a pointer compare, because a recycled address would
+	// otherwise leave the producer copying the previous allocation.
+	c->local2d_scratch_gen++;
 	return true;
 }
 
@@ -5334,6 +5654,8 @@ d3d12_ensure_local2d_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint32
 // nullptr on failure. Caller holds c->mutex.
 static ID3D12Resource *
 d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
+                           ID3D12Device *dev,
+                           ID3D12GraphicsCommandList *list,
                            const struct xrt_rect *rects,
                            uint32_t rect_count,
                            uint32_t w,
@@ -5389,24 +5711,26 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 		clear.Format = DXGI_FORMAT_R8_UNORM;
 		clear.Color[0] = 1.0f;
 
-		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
-		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
-	if (c->implicit_mask_tex != nullptr) c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
+		HRESULT hr =
+		    dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                                 &clear, IID_PPV_ARGS(&c->implicit_mask_tex));
+		if (c->implicit_mask_tex != nullptr)
+			c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
 		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
 			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
 			rtv_desc.NumDescriptors = 1;
 			rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-			hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
+			hr = dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
 		}
 		if (SUCCEEDED(hr) && c->implicit_mask_rtv_heap != nullptr) {
-			c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
-			                                  c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+			dev->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
+			                            c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 			td.Flags = D3D12_RESOURCE_FLAG_NONE;
-			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
-	if (c->implicit_mask_staged != nullptr) c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
+			hr = dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+			                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+			                                  IID_PPV_ARGS(&c->implicit_mask_staged));
+			if (c->implicit_mask_staged != nullptr)
+				c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
 		}
 		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
 			U_LOG_E("implicit zone mask: D3D12 resource creation failed: 0x%08x", hr);
@@ -5460,10 +5784,10 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 	// takes the rect array natively (one call vs D3D11's per-rect ClearView).
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-	c->cmd_list->ClearRenderTargetView(rtv, all_3d, 0, nullptr);
+	list->ClearRenderTargetView(rtv, all_3d, 0, nullptr);
 	if (n > 0) {
 		const float all_2d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-		c->cmd_list->ClearRenderTargetView(rtv, all_2d, n, drs);
+		list->ClearRenderTargetView(rtv, all_2d, n, drs);
 	}
 
 	// Stage the snapshot the composite samples (RT≠SRV; decouple as the
@@ -5479,13 +5803,13 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
-	c->cmd_list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+	list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
 
 	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
 	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
 	memcpy(c->implicit_rects, rects, sizeof(rects[0]) * rect_count);
 	c->implicit_rect_count = rect_count;
@@ -5506,10 +5830,12 @@ d3d12_update_implicit_mask(struct comp_d3d12_compositor *c,
 // implicit-mask R8 resources (the implicit rule is inert in zones frames) and
 // re-rasters every zones frame, VK-style — a handful of rect clears — while
 // invalidating the implicit rect cache so a later legacy frame re-rasters.
-// Records onto the OPEN c->cmd_list. Caller holds c->mutex. Returns the
+// Records onto the OPEN list. Caller holds c->mutex. Returns the
 // staged R8 resource (steady PIXEL_SHADER_RESOURCE) or nullptr on failure.
 static ID3D12Resource *
 d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
+                            ID3D12Device *dev,
+                            ID3D12GraphicsCommandList *list,
                             const struct xrt_rect *rects,
                             uint32_t rect_count,
                             uint32_t w,
@@ -5556,24 +5882,26 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 		clear.Format = DXGI_FORMAT_R8_UNORM;
 		clear.Color[0] = 1.0f;
 
-		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
-		                                                IID_PPV_ARGS(&c->implicit_mask_tex));
-	if (c->implicit_mask_tex != nullptr) c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
+		HRESULT hr =
+		    dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                                 &clear, IID_PPV_ARGS(&c->implicit_mask_tex));
+		if (c->implicit_mask_tex != nullptr)
+			c->implicit_mask_tex->SetName(L"DXR.implicit_mask_tex"); // #747 attribution
 		if (SUCCEEDED(hr) && c->implicit_mask_tex != nullptr) {
 			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
 			rtv_desc.NumDescriptors = 1;
 			rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-			hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
+			hr = dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->implicit_mask_rtv_heap));
 		}
 		if (SUCCEEDED(hr) && c->implicit_mask_rtv_heap != nullptr) {
-			c->device->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
-			                                  c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+			dev->CreateRenderTargetView(c->implicit_mask_tex, nullptr,
+			                            c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 			td.Flags = D3D12_RESOURCE_FLAG_NONE;
-			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-			                                        IID_PPV_ARGS(&c->implicit_mask_staged));
-	if (c->implicit_mask_staged != nullptr) c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
+			hr = dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+			                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+			                                  IID_PPV_ARGS(&c->implicit_mask_staged));
+			if (c->implicit_mask_staged != nullptr)
+				c->implicit_mask_staged->SetName(L"DXR.implicit_mask_staged"); // #747 attribution
 		}
 		if (FAILED(hr) || c->implicit_mask_staged == nullptr) {
 			U_LOG_E("zone wish mask: D3D12 resource creation failed: 0x%08x", hr);
@@ -5599,7 +5927,7 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 	// natively).
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->implicit_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->cmd_list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
+	list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
 	{
 		const float all_on[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 		D3D12_RECT drs[XRT_MAX_LAYERS];
@@ -5631,7 +5959,7 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 			n++;
 		}
 		if (n > 0) {
-			c->cmd_list->ClearRenderTargetView(rtv, all_on, n, drs);
+			list->ClearRenderTargetView(rtv, all_on, n, drs);
 		}
 	}
 
@@ -5648,13 +5976,13 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
-	c->cmd_list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
+	list->CopyResource(c->implicit_mask_staged, c->implicit_mask_tex);
 
 	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
 	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
 	static bool wish_logged = false;
 	if (!wish_logged) {
@@ -5674,12 +6002,14 @@ d3d12_update_zone_wish_mask(struct comp_d3d12_compositor *c,
 // can differ. Only called when a frame's zones request feather — all-hard
 // frames sample the binary raster instead, and the published wish stays
 // binary regardless (cosmetics never enter the wish). Re-rasters every
-// feathered zones frame (VK-style); records onto the OPEN c->cmd_list.
+// feathered zones frame (VK-style); records onto the OPEN list.
 // Caller holds c->mutex. Returns the staged R8 resource (steady
 // PIXEL_SHADER_RESOURCE) or nullptr on failure (caller falls back to the
 // binary mask — hard edges, never a lost frame).
 static ID3D12Resource *
 d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
+                               ID3D12Device *dev,
+                               ID3D12GraphicsCommandList *list,
                                const struct xrt_rect *rects,
                                const float *feather_px,
                                uint32_t rect_count,
@@ -5727,23 +6057,23 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 		clear.Format = DXGI_FORMAT_R8_UNORM;
 		clear.Color[0] = 1.0f;
 
-		HRESULT hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-		                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
-		                                                IID_PPV_ARGS(&c->feather_mask_tex));
+		HRESULT hr =
+		    dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                                 &clear, IID_PPV_ARGS(&c->feather_mask_tex));
 		if (c->feather_mask_tex != nullptr) c->feather_mask_tex->SetName(L"DXR.feather_mask_tex"); // #747 attribution
 		if (SUCCEEDED(hr) && c->feather_mask_tex != nullptr) {
 			D3D12_DESCRIPTOR_HEAP_DESC rtv_desc = {};
 			rtv_desc.NumDescriptors = 1;
 			rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-			hr = c->device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->feather_mask_rtv_heap));
+			hr = dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&c->feather_mask_rtv_heap));
 		}
 		if (SUCCEEDED(hr) && c->feather_mask_rtv_heap != nullptr) {
-			c->device->CreateRenderTargetView(c->feather_mask_tex, nullptr,
-			                                  c->feather_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+			dev->CreateRenderTargetView(c->feather_mask_tex, nullptr,
+			                            c->feather_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 			td.Flags = D3D12_RESOURCE_FLAG_NONE;
-			hr = c->device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-			                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-			                                        IID_PPV_ARGS(&c->feather_mask_staged));
+			hr = dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+			                                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+			                                  IID_PPV_ARGS(&c->feather_mask_staged));
 			if (c->feather_mask_staged != nullptr) c->feather_mask_staged->SetName(L"DXR.feather_mask_staged"); // #747 attribution
 		}
 		if (FAILED(hr) || c->feather_mask_staged == nullptr) {
@@ -5769,7 +6099,7 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 	// values and the core reaches 1.
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = c->feather_mask_rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	const float all_off[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	c->cmd_list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
+	list->ClearRenderTargetView(rtv, all_off, 0, nullptr);
 	for (uint32_t i = 0; i < rect_count; i++) {
 		const float radius = feather_px[i];
 		const bool feathered = radius > 0.0f;
@@ -5819,7 +6149,7 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 			}
 			const float val[4] = {v, 0.0f, 0.0f, 0.0f};
 			D3D12_RECT dr = {left, top, right, bottom};
-			c->cmd_list->ClearRenderTargetView(rtv, val, 1, &dr);
+			list->ClearRenderTargetView(rtv, val, 1, &dr);
 		}
 	}
 
@@ -5836,13 +6166,13 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
-	c->cmd_list->CopyResource(c->feather_mask_staged, c->feather_mask_tex);
+	list->CopyResource(c->feather_mask_staged, c->feather_mask_tex);
 
 	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
 	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	list->ResourceBarrier(2, to_copy);
 
 	static bool feather_logged = false;
 	if (!feather_logged) {
@@ -5864,7 +6194,11 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 // route it to the publish (zone_publish_res) only.
 // Returns the staged BINARY R8 resource (the composite mask) or nullptr.
 static ID3D12Resource *
-d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h)
+d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c,
+                             ID3D12Device *dev,
+                             ID3D12GraphicsCommandList *list,
+                             uint32_t region_w,
+                             uint32_t region_h)
 {
 	// Binary auto raster first — the composite gate regardless of the
 	// publish source.
@@ -5876,7 +6210,7 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w,
 		}
 		rects[rect_count++] = c->layer_accum.layers[i].data.zone_3d.rect;
 	}
-	ID3D12Resource *staged = d3d12_update_zone_wish_mask(c, rects, rect_count, region_w, region_h);
+	ID3D12Resource *staged = d3d12_update_zone_wish_mask(c, dev, list, rects, rect_count, region_w, region_h);
 
 	if (c->frame_wish != nullptr && c->frame_wish->tex != nullptr && c->frame_wish->staged != nullptr) {
 		struct comp_d3d12_zone_mask *fw = c->frame_wish;
@@ -5895,13 +6229,13 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c, uint32_t region_w,
 		to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 		to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 		to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		c->cmd_list->ResourceBarrier(2, to_copy);
+		list->ResourceBarrier(2, to_copy);
 
-		c->cmd_list->CopyResource(fw->staged, fw->tex);
+		list->CopyResource(fw->staged, fw->tex);
 
 		std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
 		std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-		c->cmd_list->ResourceBarrier(2, to_copy);
+		list->ResourceBarrier(2, to_copy);
 
 		// P4 publish source + seq: the staged explicit wish. Bump the
 		// generation on a source change (pointer flip; D3D12 masks carry
@@ -6111,6 +6445,8 @@ d3d12_ensure_backdrop_scratch(struct comp_d3d12_compositor *c, uint32_t w, uint3
 	                                  c->backdrop_scratch_rtv_heap->GetCPUDescriptorHandleForHeapStart());
 	c->backdrop_scratch_w = w;
 	c->backdrop_scratch_h = h;
+	// #918 D12-4 — see d3d12_ensure_local2d_scratch.
+	c->backdrop_scratch_gen++;
 	return true;
 }
 
@@ -6169,7 +6505,18 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 		return nullptr;
 	}
 
-	if (!d3d12_ensure_backdrop_scratch(c, region_w, region_h)) {
+	d3d12_clamp_region_to_panel(c, &region_w, &region_h);
+
+	/*
+	 * #918 D12-4: under the split this is a BRIDGE PLANE SOURCE — panel-sized
+	 * once (so it never enters the R2 churn path) and bound by pointer, with no
+	 * NT share because the producer IS this device. The flatten below still
+	 * writes only the region at the top-left, and the DP is told the region's
+	 * dims separately, exactly as it is off the split.
+	 */
+	const uint32_t bd_alloc_w = c->split_active ? c->split_panel_w : region_w;
+	const uint32_t bd_alloc_h = c->split_active ? c->split_panel_h : region_h;
+	if (!d3d12_ensure_backdrop_scratch(c, bd_alloc_w, bd_alloc_h)) {
 		return nullptr;
 	}
 
@@ -6285,6 +6632,129 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
  */
 #define ZC_BAIL(reason)                                                                                                	do {                                                                                                           		static bool _zc_logged = false;                                                                        		if (!_zc_logged) {                                                                                     			_zc_logged = true;                                                                             			U_LOG_W("#875 composite bail[%s] reuse=%d prepare=%d", reason, (int)reuse_mask,                			        (int)prepare_only);                                                                    		}                                                                                                      		return false;                                                                                          	} while (0)
 
+/*!
+ * #918 D12-4 — CHANGE-SKIP key and DIRTY BOX for a Local2D flatten. Port of
+ * `d3d11_local2d_digest`, and it must stay one: the two legs feed the same
+ * bridge, so a divergence here is a divergence in what "the plane changed" means.
+ *
+ * The hash covers everything that can change the flattened pixels without
+ * changing the rect: the swapchain a layer draws from, the image index inside
+ * it, the source sub-rect, the flip and the blend flags. The image index is what
+ * makes this safe rather than optimistic — the swapchain hands out indices
+ * round-robin, so an app that redraws hashes differently every frame and an app
+ * that stops acquiring keeps the index (and genuinely has not changed).
+ *
+ * @param over true for the OVER layers (the composite's `twod`), false for the
+ *        2D-under backdrop.
+ */
+static void
+d3d12_local2d_digest(struct comp_d3d12_compositor *c,
+                     int32_t proj_idx,
+                     bool over,
+                     uint32_t region_w,
+                     uint32_t region_h,
+                     struct xrt_rect *out_box,
+                     uint64_t *out_hash)
+{
+	uint64_t h = 1469598103934665603ull; // FNV-1a offset basis
+	auto mix = [&h](const void *ptr, size_t n) {
+		const uint8_t *b = static_cast<const uint8_t *>(ptr);
+		for (size_t i = 0; i < n; i++) {
+			h ^= b[i];
+			h *= 1099511628211ull;
+		}
+	};
+	mix(&region_w, sizeof(region_w));
+	mix(&region_h, sizeof(region_h));
+
+	int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		const bool is_under = (proj_idx >= 0 && (int32_t)i < proj_idx);
+		if (is_under == over) {
+			continue;
+		}
+		mix(&i, sizeof(i));
+		void *sc = layer->sc_array[0];
+		mix(&sc, sizeof(sc));
+		mix(&layer->data.local_2d.sub.image_index, sizeof(layer->data.local_2d.sub.image_index));
+		mix(&layer->data.local_2d.sub.rect, sizeof(layer->data.local_2d.sub.rect));
+		mix(&layer->data.local_2d.sub.norm_rect, sizeof(layer->data.local_2d.sub.norm_rect));
+		mix(&layer->data.local_2d.rect, sizeof(layer->data.local_2d.rect));
+		mix(&layer->data.flip_y, sizeof(layer->data.flip_y));
+		mix(&layer->data.flags, sizeof(layer->data.flags));
+
+		const struct xrt_rect *dr = &layer->data.local_2d.rect;
+		if (dr->extent.w <= 0 || dr->extent.h <= 0) {
+			continue;
+		}
+		if (dr->offset.w < x0) {
+			x0 = dr->offset.w;
+		}
+		if (dr->offset.h < y0) {
+			y0 = dr->offset.h;
+		}
+		if (dr->offset.w + dr->extent.w > x1) {
+			x1 = dr->offset.w + dr->extent.w;
+		}
+		if (dr->offset.h + dr->extent.h > y1) {
+			y1 = dr->offset.h + dr->extent.h;
+		}
+	}
+
+	if (x1 <= x0 || y1 <= y0) {
+		// No layers on this side: the plane is a cleared region, and the clear
+		// itself is what has to reach the other adapter.
+		x0 = 0;
+		y0 = 0;
+		x1 = (int32_t)region_w;
+		y1 = (int32_t)region_h;
+	}
+	if (x0 < 0) {
+		x0 = 0;
+	}
+	if (y0 < 0) {
+		y0 = 0;
+	}
+	if (x1 > (int32_t)region_w) {
+		x1 = (int32_t)region_w;
+	}
+	if (y1 > (int32_t)region_h) {
+		y1 = (int32_t)region_h;
+	}
+	out_box->offset.w = x0;
+	out_box->offset.h = y0;
+	out_box->extent.w = (x1 > x0) ? (x1 - x0) : 0;
+	out_box->extent.h = (y1 > y0) ? (y1 - y0) : 0;
+	// 0 is reserved for "the frame does not use this plane".
+	*out_hash = (h != 0) ? h : 1ull;
+}
+
+/*!
+ * #918 D12-4 — clamp a composite region to the panel.
+ *
+ * Under the split the flatten scratches are PANEL-sized once (that is what keeps
+ * them out of the R2 churn path), so a region larger than the panel would index
+ * outside them. A window cannot exceed the panel in practice; this is the
+ * structural guarantee rather than the practical one. No-op off the split.
+ */
+static void
+d3d12_clamp_region_to_panel(struct comp_d3d12_compositor *c, uint32_t *w, uint32_t *h)
+{
+	if (!c->split_active || c->split_panel_w == 0 || c->split_panel_h == 0) {
+		return;
+	}
+	if (*w > c->split_panel_w) {
+		*w = c->split_panel_w;
+	}
+	if (*h > c->split_panel_h) {
+		*h = c->split_panel_h;
+	}
+}
+
 static bool
 d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           bool reuse_mask,
@@ -6295,7 +6765,9 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           D3D12_RESOURCE_STATES dst_post_state,
                           uint32_t dst_w,
                           uint32_t dst_h,
-                          const struct u_canvas_rect *eff_canvas)
+                          const struct u_canvas_rect *eff_canvas,
+                          int32_t slot,
+                          bool is_repaint)
 {
 	// #439 Phase 3: run when EITHER an explicit submitted mask exists OR this
 	// frame carries Local2D layers (the layers supply both the 2D pixels and
@@ -6308,6 +6780,34 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	const bool zones_frame = c->zones_frame;
 	const bool have_explicit = !zones_frame && (mask != nullptr && mask->submitted);
 	const bool have_local_2d = c->local_2d_last_frame;
+
+	/*
+	 * #918 D12-4 — THE DEPOSIT / CONSUME SEAM IS ALSO THE DEVICE SEAM.
+	 *
+	 * The deposit half (prepare_only) reads app-owned resources — the Local2D
+	 * swapchain images — and stays on the app device, recording into the app's
+	 * command list, unchanged. The consume half writes `dst`, which the split
+	 * moved to the scanout adapter, so it runs on the OUTPUT device against the
+	 * plane pixels that crossed with this slot's atlas, and it reads its
+	 * PARAMETERS from the slot's recipe stamp rather than from live CPU state.
+	 * That is the Phase-1 offset-cube defect class closed one level down: the
+	 * atlas generation stops a slot being woven under the wrong mode, this stops
+	 * its pixels being composited under the wrong recipe.
+	 */
+	const bool split_deposit = c->split_active && prepare_only;
+	const bool split_consume = c->split_active && !prepare_only;
+	struct comp_xbridge_recipe rec = {};
+	if (split_consume) {
+		if (slot < 0 || !comp_xbridge_slot_recipe(c->xbridge, slot, &rec)) {
+			ZC_BAIL("slot");
+		}
+		if (!rec.composite) {
+			// A projection-only frame filled this slot — nothing to composite,
+			// and that is the correct answer, not a bail.
+			return false;
+		}
+	}
+
 	if (!prepare_only && (dst == nullptr || dst_rtv == 0)) {
 		ZC_BAIL("dst");
 	}
@@ -6317,10 +6817,10 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// #868: a repaint composites from the mask the last app frame resolved, so
 	// the per-frame predicates below do not apply to it — only the presence of
 	// that cached mask does.
-	if (!reuse_mask && !zones_frame && !have_explicit && !have_local_2d) {
+	if (!reuse_mask && !split_consume && !zones_frame && !have_explicit && !have_local_2d) {
 		ZC_BAIL("g1");
 	}
-	if (reuse_mask && c->repaint.mask_res == nullptr) {
+	if (reuse_mask && !split_consume && c->repaint.mask_res == nullptr) {
 		ZC_BAIL("g2");
 	}
 
@@ -6334,6 +6834,34 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
 			region_w = ((uint32_t)r.right < dst_w) ? (uint32_t)r.right : dst_w;
 			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
+		}
+	}
+	d3d12_clamp_region_to_panel(c, &region_w, &region_h);
+	if (split_consume) {
+		/*
+		 * The recipe's region is the one the plane pixels were flattened at. It
+		 * lags the window by at most the one frame the bridge always costs — the
+		 * same lag the R2 hysteresis already accepts for the atlas — and using it
+		 * is what keeps every input sampled at the scale it was drawn at.
+		 *
+		 * A region LAG is deliberately not a refusal. The uv scales are derived
+		 * per input from that input's own extent, so an out-device mask rasterized
+		 * at the live region and a plane flattened at the slot's region are BOTH
+		 * addressed by window pixel and both come out geometrically right; only
+		 * the 2D content's scale trails by a frame, exactly as the 3D content's
+		 * does. Refusing here instead would drop the 2D band on every frame of a
+		 * resize drag, which is strictly worse and buys no correctness.
+		 */
+		region_w = rec.region_w;
+		region_h = rec.region_h;
+		if (region_w > dst_w) {
+			region_w = dst_w;
+		}
+		if (region_h > dst_h) {
+			region_h = dst_h;
+		}
+		if (region_w == 0 || region_h == 0) {
+			ZC_BAIL("region");
 		}
 	}
 
@@ -6367,6 +6895,25 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		}
 	}
 
+	// The frame's zone rects + feather radii, gathered once (both the raster
+	// REQUEST under the split and the inline raster off it want them).
+	struct xrt_rect zrects[XRT_MAX_LAYERS];
+	float zfeather[XRT_MAX_LAYERS];
+	uint32_t zcount = 0;
+	bool any_feather = false;
+	if (zones_frame) {
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && zcount < XRT_MAX_LAYERS; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			zfeather[zcount] = c->layer_accum.layers[i].data.zone_3d.feather_px;
+			if (zfeather[zcount] > 0.0f) {
+				any_feather = true;
+			}
+			zrects[zcount++] = c->layer_accum.layers[i].data.zone_3d.rect;
+		}
+	}
+
 	// Zones frame (XR_DXR_display_zones, #801): the mask is ALWAYS the
 	// BINARY zone raster — an explicit frame wish is staged for the publish
 	// only (never a compositor blend gate). #803: when any zone requests
@@ -6374,7 +6921,90 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// mask instead; the published wish stays binary regardless (cosmetics
 	// never enter the wish).
 	ID3D12Resource *mask_res = nullptr;
-	if (reuse_mask) {
+	if (split_deposit) {
+		/*
+		 * #918 D12-4 — THE DEPOSIT HALF RESOLVES NO MASK, IT CAPTURES A REQUEST.
+		 * See `out_mask_req`: the raster belongs on the OUTPUT device (it is pure
+		 * CPU rects in, so it is built where the composite consumes it rather than
+		 * transported), and the out-device command list does not exist yet at this
+		 * point in layer_commit — it is Reset AFTER this half runs. The consume
+		 * half records the raster from what is captured here.
+		 *
+		 * An app-authored (Tier-3) mask never reaches this branch: it retires the
+		 * split at the top of layer_commit, with its own reason token (D12-5 is
+		 * where it gets a transport).
+		 */
+		c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+		c->out_mask_req.count = 0;
+		c->out_mask_req.w = region_w;
+		c->out_mask_req.h = region_h;
+		if (zones_frame) {
+			c->out_mask_req.kind = any_feather ? D3D12_OUT_MASK_ZONE_FEATHER : D3D12_OUT_MASK_ZONE_BINARY;
+			c->out_mask_req.count = zcount;
+			for (uint32_t i = 0; i < zcount; i++) {
+				c->out_mask_req.rects[i] = zrects[i];
+				c->out_mask_req.feather[i] = zfeather[i];
+			}
+		} else if (have_local_2d) {
+			uint32_t rect_count = 0;
+			for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
+				if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
+					continue;
+				}
+				if (proj_idx >= 0 && (int32_t)i < proj_idx) {
+					continue; // under-layer (backdrop) — not part of the overlay mask
+				}
+				c->out_mask_req.rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
+			}
+			c->out_mask_req.kind = D3D12_OUT_MASK_IMPLICIT;
+			c->out_mask_req.count = rect_count;
+		}
+		if (c->out_mask_req.kind == D3D12_OUT_MASK_NONE || c->out_mask_req.count == 0) {
+			ZC_BAIL("g4");
+		}
+	} else if (split_consume) {
+		/*
+		 * #918 D12-4 — RECORD THE REQUESTED RASTER, HERE, ON THE OUTPUT DEVICE.
+		 *
+		 * This is the one place the D3D12 leg is structurally different from the
+		 * D3D11 one, and the difference is the command list, not the algorithm.
+		 * D3D11 rasters output-side inside its DEPOSIT half, because it records
+		 * onto an immediate context; a D3D12 raster recorded there would go onto a
+		 * list that layer_commit `Reset()`s before it ever executes. So it lands
+		 * here instead, on the weave list, immediately before the composite that
+		 * samples it and inside the same submission. Do not move it back.
+		 *
+		 * A REPAINT does not raster. Rastering re-runs a once-per-app-frame state
+		 * machine at panel rate, which is the #868 rule; it composites from the
+		 * resource the last app frame's consume half produced.
+		 */
+		if (!is_repaint && c->out_mask_req.kind != D3D12_OUT_MASK_NONE) {
+			ID3D12Device *odev = d3d12_out_device(c);
+			ID3D12GraphicsCommandList *olist = d3d12_weave_list(c);
+			ID3D12Resource *r = nullptr;
+			const uint32_t mw = c->out_mask_req.w;
+			const uint32_t mh = c->out_mask_req.h;
+			if (c->out_mask_req.kind == D3D12_OUT_MASK_IMPLICIT) {
+				r = d3d12_update_implicit_mask(c, odev, olist, c->out_mask_req.rects,
+				                               c->out_mask_req.count, mw, mh);
+			} else {
+				r = d3d12_update_zone_wish_mask(c, odev, olist, c->out_mask_req.rects,
+				                                c->out_mask_req.count, mw, mh);
+				if (c->out_mask_req.kind == D3D12_OUT_MASK_ZONE_FEATHER) {
+					ID3D12Resource *fres = d3d12_update_zone_feather_mask(
+					    c, odev, olist, c->out_mask_req.rects, c->out_mask_req.feather,
+					    c->out_mask_req.count, mw, mh);
+					if (fres != nullptr) {
+						r = fres;
+					} // raster failure: binary fallback — hard edges, never a lost frame
+				}
+			}
+			if (r != nullptr) {
+				c->repaint.mask_res = r;
+			}
+		}
+		mask_res = c->repaint.mask_res;
+	} else if (reuse_mask) {
 		/*
 		 * A repaint replays RENDERING, never STATE TRANSITIONS.
 		 *
@@ -6392,25 +7022,10 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 */
 		mask_res = c->repaint.mask_res;
 	} else if (zones_frame) {
-		mask_res = d3d12_update_zone_wish_state(c, region_w, region_h);
-
-		struct xrt_rect zrects[XRT_MAX_LAYERS];
-		float zfeather[XRT_MAX_LAYERS];
-		uint32_t zcount = 0;
-		bool any_feather = false;
-		for (uint32_t i = 0; i < c->layer_accum.layer_count && zcount < XRT_MAX_LAYERS; i++) {
-			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
-				continue;
-			}
-			zfeather[zcount] = c->layer_accum.layers[i].data.zone_3d.feather_px;
-			if (zfeather[zcount] > 0.0f) {
-				any_feather = true;
-			}
-			zrects[zcount++] = c->layer_accum.layers[i].data.zone_3d.rect;
-		}
+		mask_res = d3d12_update_zone_wish_state(c, c->device, c->cmd_list, region_w, region_h);
 		if (any_feather) {
-			ID3D12Resource *fres =
-			    d3d12_update_zone_feather_mask(c, zrects, zfeather, zcount, region_w, region_h);
+			ID3D12Resource *fres = d3d12_update_zone_feather_mask(c, c->device, c->cmd_list, zrects,
+			                                                      zfeather, zcount, region_w, region_h);
 			if (fres != nullptr) {
 				mask_res = fres;
 			} // raster failure: binary fallback — hard edges, never a lost frame
@@ -6429,12 +7044,12 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			}
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
-		mask_res = d3d12_update_implicit_mask(c, rects, rect_count, region_w, region_h);
+		mask_res = d3d12_update_implicit_mask(c, c->device, c->cmd_list, rects, rect_count, region_w, region_h);
 	}
-	if (mask_res == nullptr) {
+	if (mask_res == nullptr && !split_deposit) {
 		ZC_BAIL("g4");
 	}
-	if (!reuse_mask) {
+	if (!reuse_mask && !split_deposit && !split_consume) {
 		// Hand the repaint path a mask that is already resolved and published.
 		c->repaint.mask_res = mask_res;
 	}
@@ -6446,12 +7061,24 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	// clear-only flatten — MODE_ZONES then writes M·weave (zone interior)
 	// over transparent, so pixels outside every zone present alpha 0.
 	ID3D12Resource *twod_res = nullptr;
-	if (!d3d12_ensure_local2d_scratch(c, region_w, region_h)) {
-		ZC_BAIL("g5");
+	if (!split_consume) {
+		/*
+		 * #918 D12-4: under the split this scratch is a BRIDGE PLANE SOURCE, and
+		 * is allocated at the PANEL rather than the region — once, then never
+		 * resized, which is what keeps it structurally outside the R2 churn path
+		 * and #1091. The flatten still writes only the window region at the
+		 * top-left, and the composite derives the plane's uv scale from its own
+		 * extent, so a panel-sized plane samples the region 1:1.
+		 */
+		const uint32_t alloc_w = c->split_active ? c->split_panel_w : region_w;
+		const uint32_t alloc_h = c->split_active ? c->split_panel_h : region_h;
+		if (!d3d12_ensure_local2d_scratch(c, alloc_w, alloc_h)) {
+			ZC_BAIL("g5");
+		}
 	}
 	// Zones frame: flatten ALL Local2D layers (no under/over split —
 	// 2D-under is reserved in v1).
-	if (!reuse_mask) {
+	if (!reuse_mask && !split_consume) {
 		if (!d3d12_flatten_local_2d_layers(c, region_w, region_h, zones_frame ? -1 : proj_idx)) {
 			ZC_BAIL("g7");
 		}
@@ -6477,8 +7104,223 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 
 	// #875: the DEPOSIT half ends here — every read of an app-owned resource is
 	// done and its result lives in compositor-owned scratch.
+	//
+	// #918 D12-4: this is ALSO the device seam. Everything above ran on the app
+	// device; everything below runs on the output device, reading the plane
+	// pixels the bridge landed beside this slot's atlas.
 	if (prepare_only) {
+		if (split_deposit) {
+			/*
+			 * The flatten left the scratch in PIXEL_SHADER_RESOURCE for a
+			 * composite that, under the split, does not run on this device. The
+			 * producer's COPY queue reads it instead, and a copy queue requires
+			 * COMMON — so put it back where the next flatten expects to find it
+			 * and where the copy can promote from. Off the split this is the
+			 * composite's own `restore` barrier below; there is no third place
+			 * the steady state is decided.
+			 */
+			D3D12_RESOURCE_BARRIER to_common = {};
+			to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			to_common.Transition.pResource = c->local2d_scratch;
+			to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			c->cmd_list->ResourceBarrier(1, &to_common);
+
+			/*
+			 * The unit the CONSUME half will need. Created here rather than there
+			 * because this half stamps the recipe: a create failure stamps
+			 * `composite = false` and the frame ships projection-only, where
+			 * discovering it in the consume half would leave a slot marked
+			 * compositable that nothing can composite. See d3d12_ensure_outcomp
+			 * for why the create is lazy at all.
+			 */
+			if (!d3d12_ensure_outcomp(c)) {
+				c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+				return false;
+			}
+
+			struct xrt_rect box = {};
+			uint64_t hash = 0;
+			d3d12_local2d_digest(c, zones_frame ? -1 : proj_idx, /*over=*/true, region_w, region_h, &box,
+			                     &hash);
+			const bool twod_bound = comp_xbridge_bind_plane_resource(
+			    c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, c->local2d_scratch, c->local2d_scratch_gen,
+			    (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, c->split_panel_w, c->split_panel_h);
+			if (!twod_bound) {
+				/*
+				 * #918 review D4: the Local2D plane IS the composite's `twod`
+				 * under the split, so a frame that could not bind it has no
+				 * composite to stamp. Claiming otherwise stamps `composite=true`
+				 * on a slot whose plane the submit then marks invalid, and the
+				 * consume half bails on every frame afterwards with no log.
+				 */
+				if (!c->local2d_plane_warned) {
+					c->local2d_plane_warned = true;
+					U_LOG_W(
+					    "#918 D12-4: the Local2D plane could not be bound — 2D content does "
+					    "not composite under the split for this session; the 3D weave is "
+					    "unaffected");
+				}
+				c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+				ZC_BAIL("plane");
+			}
+			comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, hash, box.offset.w,
+			                         box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h);
+
+			// Stamp the recipe this frame's slot will carry (#918 Phase 2a): the
+			// consume half reads its parameters from HERE, never from live CPU
+			// state, so a slot's pixels can never be composited under a later
+			// frame's recipe.
+			struct comp_xbridge_recipe r = {};
+			r.composite = true;
+			// D12-4 transports no authored mask, so every mask under the split is
+			// an output-device raster. D12-5 makes this conditional.
+			r.mask_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
+			r.region_w = region_w;
+			r.region_h = region_h;
+			if (zones_frame) {
+				r.composite_mode = COMP_D3D12_COMPOSITE_MODE_ZONES;
+			} else if (have_explicit) {
+				r.composite_mode = COMP_D3D12_COMPOSITE_MODE_LERP;
+			} else {
+				r.composite_mode = COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
+			}
+			r.opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+			r.cx = eff_canvas->valid ? eff_canvas->x : 0;
+			r.cy = eff_canvas->valid ? eff_canvas->y : 0;
+			r.cw = eff_canvas->valid ? eff_canvas->w : region_w;
+			r.ch = eff_canvas->valid ? eff_canvas->h : region_h;
+			// The backdrop's OWN extent — the DP declares it separately from the
+			// composite region, and the two can legitimately differ. Filled by
+			// the pre-weave backdrop flatten, which ran before this.
+			r.bd_w = c->repaint.backdrop_w;
+			r.bd_h = c->repaint.backdrop_h;
+			comp_xbridge_stage_recipe(c->xbridge, &r);
+		}
 		return true;
+	}
+
+	/*
+	 * #918 D12-4: under the split `twod` is the LOCAL2D PLANE that landed with
+	 * this slot — the app-device scratch above lives on the wrong adapter and is
+	 * never what the composite samples here.
+	 */
+	if (split_consume) {
+		if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_LOCAL2D)) == 0) {
+			ZC_BAIL("plane_invalid");
+		}
+		twod_res = static_cast<ID3D12Resource *>(comp_xbridge_get_plane_resource(
+		    c->xbridge, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]));
+		if (twod_res == nullptr) {
+			ZC_BAIL("plane_stale");
+		}
+		if (mask_res == nullptr) {
+			ZC_BAIL("g4");
+		}
+	}
+
+	// Effective canvas rect clamped to the window region (the shader ignores
+	// it on the mask path; kept coherent for the constants anyway). Phase 2:
+	// this is the window rect while the mask is active.
+	// #918 D12-4: under the split these come FROM THE SLOT, not from live CPU
+	// state — see split_consume above.
+	int32_t cx = split_consume ? rec.cx : (eff_canvas->valid ? eff_canvas->x : 0);
+	int32_t cy = split_consume ? rec.cy : (eff_canvas->valid ? eff_canvas->y : 0);
+	uint32_t cw = split_consume ? rec.cw : (eff_canvas->valid ? eff_canvas->w : region_w);
+	uint32_t ch = split_consume ? rec.ch : (eff_canvas->valid ? eff_canvas->h : region_h);
+	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
+	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
+	if (cx_u > region_w)
+		cx_u = region_w;
+	if (cy_u > region_h)
+		cy_u = region_h;
+	uint32_t cright = (cx_u + cw > region_w) ? region_w : cx_u + cw;
+	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
+
+	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
+	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
+	// explicit authored mask keeps the hard M-lerp.
+	// XR_DXR_display_zones: MODE_ZONES (twod + (1−a)·(M·weave)) — the binary
+	// zone raster (or the #803 feather ramp) gates only the WEAVE; Local2D
+	// content composites on top by its own alpha (ADR-027/#801: the wish is
+	// hardware-only; composition follows zone geometry + alpha). Formerly
+	// the hard M-lerp, which multiplied overlays away inside zones and
+	// dimmed the feathered edge.
+	uint32_t composite_mode;
+	if (split_consume) {
+		composite_mode = rec.composite_mode;
+	} else if (zones_frame) {
+		composite_mode = COMP_D3D12_COMPOSITE_MODE_ZONES;
+	} else if (have_explicit) {
+		composite_mode = COMP_D3D12_COMPOSITE_MODE_LERP;
+	} else {
+		composite_mode = COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
+	}
+
+	// #833/#116 — opaque present on a transparent session: DWM completes no
+	// blends, so the composite flattens against the weave (which the DP's
+	// flattened gate already completed against the captured desktop) and
+	// emits α=1. Opaque sessions keep today's behavior even with the env set.
+	const bool opaque_present = split_consume
+	                                ? rec.opaque_present
+	                                : (c->transparent_background && debug_get_bool_option_present_opaque_comp());
+
+	// One-shot proof-of-life (capture is pre-weave, #492 — this is how we
+	// confirm the post-weave composite ran without a live eyeball).
+	static bool composite_logged = false;
+	if (!composite_logged) {
+		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=%s (mode=%u split=%d)", region_w,
+		        region_h, zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"),
+		        split_consume ? "bridged Local2D plane" : "local2d layers", composite_mode, (int)split_consume);
+		composite_logged = true;
+	}
+
+	if (split_consume) {
+		/*
+		 * #918 D12-4 — the whole tail on the OUTPUT device, through the unit
+		 * D12-1 built for exactly this. Every resource handed in belongs to the
+		 * out device: `dst` is the scanout swapchain's back buffer, `twod_res` is
+		 * the egress plane, `mask_res` is the raster recorded a few lines up, and
+		 * the weave snapshot is the unit's own scratch.
+		 */
+		ID3D12GraphicsCommandList *olist = d3d12_weave_list(c);
+		/*
+		 * The deposit half creates the unit and stamps `composite = false` if it
+		 * cannot, so reaching here without one should be impossible. Checked
+		 * anyway, because "impossible" here means dereferencing a null on the
+		 * weave thread rather than dropping one frame's 2D band.
+		 */
+		if (c->outcomp == nullptr) {
+			ZC_BAIL("outcomp");
+		}
+		if (!comp_d3d12_outcomp_ensure_weave_scratch(c->outcomp, region_w, region_h, (uint32_t)dd.Format)) {
+			ZC_BAIL("g6");
+		}
+		void *weave_res = comp_d3d12_outcomp_snapshot_weave(c->outcomp, olist, dst, (uint32_t)dst_pre_state,
+		                                                    region_w, region_h);
+		if (weave_res == nullptr) {
+			ZC_BAIL("snapshot");
+		}
+		xrt_result_t oxret = comp_d3d12_outcomp_composite_2d_masked(
+		    c->outcomp, olist, dst, (uint32_t)dst_pre_state, twod_res, mask_res, weave_res, region_w, region_h,
+		    (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u, composite_mode, opaque_present);
+		/*
+		 * The unit round-trips `dst` back into `dst_pre_state`. The caller's
+		 * post-state contract is honoured because both split call sites pass
+		 * RENDER_TARGET for pre and post; assert that rather than emit a barrier
+		 * from a state the unit has already restored.
+		 */
+		if (dst_post_state != dst_pre_state) {
+			D3D12_RESOURCE_BARRIER fix = {};
+			fix.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			fix.Transition.pResource = dst;
+			fix.Transition.StateBefore = dst_pre_state;
+			fix.Transition.StateAfter = dst_post_state;
+			fix.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			olist->ResourceBarrier(1, &fix);
+		}
+		return oxret == XRT_SUCCESS;
 	}
 
 	// RENDER half only. This snapshot target is sized/typed from the render
@@ -6529,55 +7371,6 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	weave_exit[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	c->cmd_list->ResourceBarrier(2, weave_exit);
 
-	// Effective canvas rect clamped to the window region (the shader ignores
-	// it on the mask path; kept coherent for the constants anyway). Phase 2:
-	// this is the window rect while the mask is active.
-	int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
-	int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
-	uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
-	uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
-	uint32_t cx_u = (cx < 0) ? 0u : (uint32_t)cx;
-	uint32_t cy_u = (cy < 0) ? 0u : (uint32_t)cy;
-	if (cx_u > region_w)
-		cx_u = region_w;
-	if (cy_u > region_h)
-		cy_u = region_h;
-	uint32_t cright = (cx_u + cw > region_w) ? region_w : cx_u + cw;
-	uint32_t cbottom = (cy_u + ch > region_h) ? region_h : cy_u + ch;
-
-	// #491: the implicit (auto) Local2D mask composites the 2D over the weave by
-	// its own premultiplied alpha (translucent 2D reveals the 3D scene). The
-	// explicit authored mask keeps the hard M-lerp.
-	// XR_DXR_display_zones: MODE_ZONES (twod + (1−a)·(M·weave)) — the binary
-	// zone raster (or the #803 feather ramp) gates only the WEAVE; Local2D
-	// content composites on top by its own alpha (ADR-027/#801: the wish is
-	// hardware-only; composition follows zone geometry + alpha). Formerly
-	// the hard M-lerp, which multiplied overlays away inside zones and
-	// dimmed the feathered edge.
-	uint32_t composite_mode;
-	if (zones_frame) {
-		composite_mode = COMP_D3D12_COMPOSITE_MODE_ZONES;
-	} else if (have_explicit) {
-		composite_mode = COMP_D3D12_COMPOSITE_MODE_LERP;
-	} else {
-		composite_mode = COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
-	}
-
-	// One-shot proof-of-life (capture is pre-weave, #492 — this is how we
-	// confirm the post-weave composite ran without a live eyeball).
-	static bool composite_logged = false;
-	if (!composite_logged) {
-		U_LOG_W("D3D12 Local2D composite: %ux%u region, %s mask, twod=local2d layers (mode=%u)",
-		        region_w, region_h, zones_frame ? "zone" : (have_explicit ? "explicit" : "implicit"),
-		        composite_mode);
-		composite_logged = true;
-	}
-
-	// #833/#116 — opaque present on a transparent session: DWM completes no
-	// blends, so the composite flattens against the weave (which the DP's
-	// flattened gate already completed against the captured desktop) and
-	// emits α=1. Opaque sessions keep today's behavior even with the env set.
-	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque_comp();
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
 	    c->renderer, c->cmd_list, dst_rtv, static_cast<uint32_t>(dd.Format), twod_res, mask_res,
 	    c->weave_scratch, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u, cright - cx_u, cbottom - cy_u,
