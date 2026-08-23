@@ -113,6 +113,14 @@ struct comp_d3d12_compositor
 	//! Fence event handle.
 	HANDLE fence_event;
 
+	//! DXGI factory the output target's swapchain is created from. Owned
+	//! (released in destroy). Created here rather than inside the target
+	//! because under the output-device split (#918) only the compositor knows
+	//! which adapter scans out, and the target is handed the factory to use.
+	//! CreateDXGIFactory2 is adapter-independent, so a session-lived factory
+	//! is the same object the target used to make and destroy per create.
+	IDXGIFactory4 *dxgi_factory;
+
 	//! Output target (DXGI swapchain).
 	struct comp_d3d12_target *target;
 
@@ -2975,6 +2983,14 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		comp_d3d12_target_destroy(&c->target);
 	}
 
+	// After the target — the swapchain the factory made outlives nothing here,
+	// but releasing the factory first would be releasing the maker before the
+	// made.
+	if (c->dxgi_factory != nullptr) {
+		c->dxgi_factory->Release();
+		c->dxgi_factory = nullptr;
+	}
+
 	if (c->fence_event != nullptr) {
 		CloseHandle(c->fence_event);
 	}
@@ -3048,6 +3064,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	memset(&c->base, 0, sizeof(c->base));
 
 	c->xdev = xdev;
+	c->dxgi_factory = nullptr;
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->hardware_display_3d = true;
@@ -3246,11 +3263,20 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		c->target = nullptr;
 		U_LOG_I("Skipping DXGI swapchain (shared texture mode — compositor renders to shared texture)");
 	} else if (c->hwnd != nullptr) {
-		xret = comp_d3d12_target_create(c, c->hwnd,
-		                                              c->settings.preferred.width,
-		                                              c->settings.preferred.height,
-		                                              transparent_background,
-		                                              &c->target);
+		// The target is handed its device, queue and factory explicitly
+		// (#918 D12-2). Today all three name the app's adapter; D12-3
+		// swaps in the scanout device/queue/factory when the split is
+		// active, and nothing inside the target has to change for that.
+		HRESULT fhr =
+		    CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void **>(&c->dxgi_factory));
+		if (FAILED(fhr) || c->dxgi_factory == nullptr) {
+			U_LOG_E("Failed to create DXGI factory: 0x%08x", fhr);
+			d3d12_compositor_destroy(&c->base.base);
+			return XRT_ERROR_D3D;
+		}
+		xret = comp_d3d12_target_create(c->hwnd, c->device, c->command_queue, c->dxgi_factory,
+		                                c->settings.preferred.width, c->settings.preferred.height,
+		                                transparent_background, &c->target);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create D3D12 target");
 			d3d12_compositor_destroy(&c->base.base);
