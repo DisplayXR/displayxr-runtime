@@ -26,7 +26,9 @@ set(tests
     tests_space_overseer_rig
 	)
 if(XRT_HAVE_D3D11)
-	list(APPEND tests tests_aux_d3d_d3d11 tests_comp_client_d3d11 tests_comp_xbridge_plane_policy)
+	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
+	     tests_comp_xbridge_plane_policy
+		)
 endif()
 if(XRT_HAVE_D3D12)
 	list(APPEND tests tests_comp_client_d3d12)
@@ -90,6 +92,9 @@ endif()
 
 if(XRT_HAVE_D3D11)
 	target_link_libraries(tests_aux_d3d_d3d11 PRIVATE aux_d3d)
+	# ADR-037 §2 render-adapter resolver — DXGI enumeration plus a driverless
+	# feature-level probe; no compositor, no window, no panel.
+	target_link_libraries(tests_aux_d3d_render_adapter PRIVATE aux_d3d)
 	# #918 bridge-plane transport policy — a header of pure decisions, no D3D
 	# link needed (the point of extracting it was that none of these need a GPU).
 	target_include_directories(

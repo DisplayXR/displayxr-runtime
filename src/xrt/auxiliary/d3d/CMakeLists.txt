@@ -6,6 +6,9 @@ add_library(
 	d3d_dxgi_formats.h
 	d3d_dxgi_helpers.cpp
 	d3d_dxgi_helpers.hpp
+	d3d_render_adapter.cpp
+	d3d_render_adapter.h
+	d3d_render_adapter.hpp
 	d3d_scanout_helpers.cpp
 	d3d_scanout_helpers.h
 	d3d_scanout_helpers.hpp
