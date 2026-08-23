@@ -36,13 +36,18 @@ extern int32_t g_displayScreenTop;
 extern bool g_hasViewRigExt;
 
 // XR_DXR_local_3d_zone harness (mask handle + entry points). Prerequisite for
-// XR_DXR_display_zones; the zones path here uses AUTO wish (wishMask = NULL,
-// runtime auto-derives), so the mask entry points are resolved but the mask is
-// left unused — enabling the extension is what the runtime gates on.
+// XR_DXR_display_zones, and — since #918 D12-5 — the source of this app's
+// EXPLICIT per-frame wish: the mask is referenced from the xrEndFrame chain
+// (XrDisplayZonesFrameEndInfoDXR.wishMask), NOT through the sticky
+// xrSubmitLocal3DZoneDXR channel, which is inert in zones frames. Mirrors the
+// sibling cube_zones_texture_d3d12_win harness so the two apps read alike.
+// pfnAcquire is the Tier-3 freeform render-target entry and is OPTIONAL — wish
+// mode 2 is skipped when it is unresolved.
 struct ZoneMaskHarness {
     bool available = false;
     PFN_xrCreateLocal3DZoneMaskDXR pfnCreate = nullptr;
     PFN_xrSetLocal3DZoneFromRectsDXR pfnSetRects = nullptr;
+    PFN_xrAcquireLocal3DZoneRenderTargetDXR pfnAcquire = nullptr;
     PFN_xrSubmitLocal3DZoneDXR pfnSubmit = nullptr;
     PFN_xrDestroyLocal3DZoneMaskDXR pfnDestroy = nullptr;
     XrLocal3DZoneMaskDXR mask = XR_NULL_HANDLE;

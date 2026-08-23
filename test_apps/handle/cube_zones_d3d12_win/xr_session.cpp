@@ -329,14 +329,16 @@ bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueu
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
 
-    // XR_DXR_local_3d_zone entry points (prerequisite for display_zones). The
-    // zones path here uses AUTO wish, so these are resolved but the mask stays
-    // unused; enabling the extension is what the runtime gates display_zones on.
+    // XR_DXR_local_3d_zone entry points (prerequisite for display_zones, and
+    // the source of this app's EXPLICIT wish — see the M key in main.cpp).
+    // pfnAcquire is optional: without it wish mode 2 (Tier-3) is skipped.
     if (g_zone.available) {
         xrGetInstanceProcAddr(xr.instance, "xrCreateLocal3DZoneMaskDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnCreate);
         xrGetInstanceProcAddr(xr.instance, "xrSetLocal3DZoneFromRectsDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnSetRects);
+        xrGetInstanceProcAddr(xr.instance, "xrAcquireLocal3DZoneRenderTargetDXR",
+            (PFN_xrVoidFunction*)&g_zone.pfnAcquire);
         xrGetInstanceProcAddr(xr.instance, "xrSubmitLocal3DZoneDXR",
             (PFN_xrVoidFunction*)&g_zone.pfnSubmit);
         xrGetInstanceProcAddr(xr.instance, "xrDestroyLocal3DZoneMaskDXR",

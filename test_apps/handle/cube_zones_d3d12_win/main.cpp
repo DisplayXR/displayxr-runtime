@@ -30,9 +30,29 @@
  *     0.6 + perspectiveFactor 0.5 (visibly different framing), spin phase
  *     +1.5 rad, fully-transparent clear (cube floats over the desktop).
  *
- * Wish mode is AUTO (XrDisplayZonesFrameEndInfoDXR chained with
- * wishMask = XR_NULL_HANDLE → the runtime auto-derives the wish from the zone
- * rects). Set DXR_ZONES_VALIDATE=1 to also chain the validate bit.
+ * WISH MODE — cycled on the M key, exactly as the sibling
+ * cube_zones_texture_d3d12_win does, so the two apps read alike:
+ *   - 0 AUTO   : wishMask = XR_NULL_HANDLE — the runtime auto-derives the wish
+ *                from the zone rects. The default.
+ *   - 1 Tier-2 : an explicit mask filled from the zone rects via
+ *                xrSetLocal3DZoneFromRectsDXR.
+ *   - 2 Tier-3 : an explicit mask the APP paints — a CPU feathered-rect ramp at
+ *                the zone rects, uploaded onto the runtime-owned R8 resource
+ *                from xrAcquireLocal3DZoneRenderTargetDXR.
+ * Modes 1 and 2 chain the mask as XrDisplayZonesFrameEndInfoDXR.wishMask.
+ * DXR_ZONES_WISH=0|1|2 picks the mode at launch, so the explicit legs are
+ * reachable without a keypress (an unattended or remote run has no keyboard).
+ *
+ * WHY THIS APP CARRIES IT (#918 D12-5). This is the ONLY in-tree app that can
+ * exercise an explicit wish against the in-process D3D12 output-device split.
+ * cube_zones_texture_d3d12_win has the same three modes but is a _texture app,
+ * which the split gate refuses outright (COMP_SPLIT_REASON_SHARED_TEXTURE) —
+ * structurally, by the same rule that protects the browser (#1172). This app is
+ * _handle, so the split activates and the authored mask genuinely crosses the
+ * adapter boundary as COMP_XBRIDGE_PLANE_MASK. Without these modes the
+ * frame-wish leg of that transport could only be verified by argument.
+ *
+ * Set DXR_ZONES_VALIDATE=1 to also chain the validate bit.
  *
  * When the runtime doesn't advertise XR_DXR_display_zones (P2 dev gate:
  * DISPLAYXR_ZONES=1) the app logs an error once and submits empty frames.
@@ -123,6 +143,21 @@ static bool g_zonesActive = false;
 static bool g_zonesAttempted = false;
 static long g_zonesFrameCounter = 0;
 static const long kZonesActivationFrame = 10;
+
+// Wish mode: 0 AUTO / 1 explicit Tier-2 rects / 2 explicit Tier-3 feathered
+// render-target mask. Cycled on M; seeded from DXR_ZONES_WISH so an unattended
+// run can start in an explicit mode. Mirrors cube_zones_texture_d3d12_win.
+static int g_wishMode = 0;
+
+// DXR_ZONES_WISH=0|1|2 — initial wish mode (default 0 = AUTO).
+static int ZonesInitialWishMode() {
+    static const int m = []() {
+        const char* v = getenv("DXR_ZONES_WISH");
+        if (v == nullptr || *v < '0' || *v > '2') return 0;
+        return (int)(*v - '0');
+    }();
+    return m;
+}
 
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
@@ -413,6 +448,201 @@ static bool CreateZoneResources(XrSessionManager& xr, D3D12Renderer& renderer,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Explicit wish authoring (#918 D12-5) — the mask referenced from
+// XrDisplayZonesFrameEndInfoDXR.wishMask in modes 1 and 2. Ported from
+// cube_zones_texture_d3d12_win so the two apps stay recognisably siblings; the
+// difference that matters is that THIS app is _handle, so the mask actually
+// crosses the output-device split as COMP_XBRIDGE_PLANE_MASK.
+// ---------------------------------------------------------------------------
+
+// Lazily create the one mask handle shared by wish modes 1 and 2.
+static bool EnsureWishMask(XrSessionManager& xr) {
+    if (g_zone.mask != XR_NULL_HANDLE) return true;
+    if (!g_zone.pfnCreate) return false;
+    XrLocal3DZoneMaskCreateInfoDXR mci = {(XrStructureType)XR_TYPE_LOCAL_3D_ZONE_MASK_CREATE_INFO_DXR};
+    mci.maskWidth = 0; // runtime picks the window backing size
+    mci.maskHeight = 0;
+    XrResult r = g_zone.pfnCreate(xr.session, &mci, &g_zone.mask);
+    if (XR_FAILED(r)) {
+        LOG_ERROR("[zones] xrCreateLocal3DZoneMaskDXR failed (0x%x)", (unsigned)r);
+        g_zone.mask = XR_NULL_HANDLE;
+        return false;
+    }
+    LOG_INFO("[zones] wish mask created (window backing size)");
+    return true;
+}
+
+// Tier-3: acquire the freeform R8 D3D12 resource (runtime-owned), CPU-paint a
+// feathered-rect mask at the zone rects (rings ramping M 0->1 over 24 px, solid
+// core), upload it via CopyTextureRegion, then leave it in RENDER_TARGET.
+//
+// The resource is handed out in RENDER_TARGET and MUST be returned to
+// RENDER_TARGET before the frame references the mask (the D3D12 Tier-3 state
+// contract). Same device AND queue as the compositor in-process, so submission
+// order is the sync — no fence. Verbatim port of the sibling's routine.
+static bool ApplyTier3FreeformWish(XrSessionManager& xr, D3D12Renderer& renderer) {
+    if (!g_zone.pfnAcquire || g_zone.mask == XR_NULL_HANDLE) return false;
+    XrLocal3DZoneRenderTargetD3D12DXR binding = {
+        (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_D3D12_DXR};
+    XrResult r = g_zone.pfnAcquire(g_zone.mask, &binding);
+    if (XR_FAILED(r) || binding.resource == nullptr || binding.width == 0 || binding.height == 0) {
+        LOG_ERROR("[zones] xrAcquireLocal3DZoneRenderTargetDXR failed (0x%x)", (unsigned)r);
+        return false;
+    }
+    ID3D12Resource* maskRes = static_cast<ID3D12Resource*>(binding.resource);
+    const uint32_t mw = binding.width;
+    const uint32_t mh = binding.height;
+    const uint32_t pitch = (mw + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+
+    // Mask pixels are client-window pixels; scale in case the runtime's backing
+    // size differs from the live client size.
+    const float sx = (g_windowWidth > 0) ? (float)mw / (float)g_windowWidth : 1.0f;
+    const float sy = (g_windowHeight > 0) ? (float)mh / (float)g_windowHeight : 1.0f;
+
+    std::vector<uint8_t> pixels((size_t)pitch * mh, 0);
+    const int kRings = 8;
+    const int kRingStep = 3;  // px per ring (window pixels)
+    const int kFeather = 24;  // solid-core inset
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        const XrRect2Di& zr = g_zonesArr[zi].rect;
+        for (int step = 0; step <= kRings; step++) {
+            const bool core = (step == kRings);
+            const float m = core ? 1.0f : (float)(step + 1) / (float)kRings;
+            const int inset = core ? kFeather : step * kRingStep;
+            int l = (int)((zr.offset.x + inset) * sx);
+            int t = (int)((zr.offset.y + inset) * sy);
+            int rg = (int)((zr.offset.x + zr.extent.width - inset) * sx);
+            int b = (int)((zr.offset.y + zr.extent.height - inset) * sy);
+            l = (std::max)(l, 0);
+            t = (std::max)(t, 0);
+            rg = (std::min)(rg, (int)mw);
+            b = (std::min)(b, (int)mh);
+            if (rg <= l || b <= t) continue;
+            const uint8_t mv = (uint8_t)(m * 255.0f + 0.5f);
+            for (int y = t; y < b; y++) {
+                uint8_t* prow = pixels.data() + (size_t)y * pitch;
+                for (int x = l; x < rg; x++) prow[x] = mv;
+            }
+        }
+    }
+
+    // Transient UPLOAD buffer (alive through the WaitForGpu below).
+    ComPtr<ID3D12Resource> upload;
+    D3D12_HEAP_PROPERTIES up = {};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = (UINT64)pitch * mh;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(renderer.device->CreateCommittedResource(
+            &up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&upload)))) {
+        LOG_WARN("[zones] Tier-3: upload buffer creation failed");
+        return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(upload->Map(0, nullptr, &mapped)) || mapped == nullptr) {
+        LOG_WARN("[zones] Tier-3: upload buffer map failed");
+        return false;
+    }
+    memcpy(mapped, pixels.data(), pixels.size());
+    upload->Unmap(0, nullptr);
+
+    // Safe here: RenderScene leaves the list CLOSED (it Resets, records, closes
+    // and executes per zone), and this runs between BeginFrame and the frame's
+    // zone renders.
+    renderer.commandAllocator->Reset();
+    renderer.commandList->Reset(renderer.commandAllocator.Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = maskRes;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    renderer.commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = maskRes;
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint.Offset = 0;
+    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    srcLoc.PlacedFootprint.Footprint.Width = mw;
+    srcLoc.PlacedFootprint.Footprint.Height = mh;
+    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.RowPitch = pitch;
+    renderer.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    // Back to RENDER_TARGET per the Tier-3 state contract.
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    renderer.commandList->ResourceBarrier(1, &barrier);
+
+    renderer.commandList->Close();
+    ID3D12CommandList* lists[] = {renderer.commandList.Get()};
+    renderer.commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu(renderer); // keeps `upload` alive until the copy lands
+
+    LOG_INFO("[zones] Tier-3 freeform mask painted at zone rects (%ux%u)", mw, mh);
+    return true;
+}
+
+// Re-author the wish for the current mode. Mode 0 authors nothing (AUTO).
+static void ApplyWishAuthoring(XrSessionManager& xr, D3D12Renderer& renderer) {
+    if (g_wishMode == 1) {
+        if (!EnsureWishMask(xr)) return;
+        XrRect2Di rects[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) rects[zi] = g_zonesArr[zi].rect;
+        XrResult r = g_zone.pfnSetRects(g_zone.mask, kNumZones, rects);
+        if (XR_FAILED(r)) {
+            LOG_ERROR("[zones] xrSetLocal3DZoneFromRectsDXR failed (0x%x)", (unsigned)r);
+        }
+    } else if (g_wishMode == 2) {
+        if (!EnsureWishMask(xr)) return;
+        if (!ApplyTier3FreeformWish(xr, renderer)) {
+            LOG_ERROR("[zones] Tier-3 unavailable — staying on AUTO wish");
+            g_wishMode = 0;
+        }
+    }
+}
+
+static const char* WishModeName(int mode) {
+    switch (mode) {
+    case 1: return "explicit Tier-2 rects";
+    case 2: return "explicit Tier-3 feathered";
+    default: return "AUTO";
+    }
+}
+
+// Edge-triggered M (wish mode cycle). This app has no O rect toggle — its zone
+// rects are fixed #672 repro geometry — so M is the whole key surface.
+static void HandleZoneKeys(XrSessionManager& xr, D3D12Renderer& renderer) {
+    static bool mPrev = false;
+
+    const bool mNow = (GetAsyncKeyState('M') & 0x8000) != 0;
+    if (mNow && !mPrev) {
+        g_wishMode = (g_wishMode + 1) % 3;
+        if (g_wishMode == 2 && !g_zone.pfnAcquire) {
+            // Tier-3 entry point unresolved — skip to AUTO.
+            LOG_WARN("[zones] Tier-3 entry point unresolved — skipping wish mode 2");
+            g_wishMode = 0;
+        }
+        LOG_INFO("[zones] wish mode %d (%s)", g_wishMode, WishModeName(g_wishMode));
+        ApplyWishAuthoring(xr, renderer);
+    }
+    mPrev = mNow;
+}
+
 // One-time zones activation: capabilities check + per-zone array swapchains.
 // On any failure the zones path is permanently disabled (empty-frame fallback).
 static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
@@ -479,13 +709,24 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
     }
 
     g_zonesActive = true;
+
+    // Seed the wish mode from DXR_ZONES_WISH and author it now, so an explicit
+    // mode is live from the FIRST zones frame rather than from the first M
+    // press — an unattended or remote run has no keyboard (#918 D12-5).
+    g_wishMode = ZonesInitialWishMode();
+    if (g_wishMode == 2 && !g_zone.pfnAcquire) {
+        LOG_WARN("[zones] DXR_ZONES_WISH=2 but the Tier-3 entry point is unresolved — falling back to AUTO");
+        g_wishMode = 0;
+    }
+    ApplyWishAuthoring(xr, renderer);
+
     LOG_INFO("[zones] ACTIVE: zone A %d,%d %dx%d + zone B %d,%d %dx%d "
-             "(ARRAY layout, arraySize=%u, wish mode AUTO, validate=%d)",
+             "(ARRAY layout, arraySize=%u, wish mode %d (%s), validate=%d)",
              g_zonesArr[0].rect.offset.x, g_zonesArr[0].rect.offset.y,
              g_zonesArr[0].rect.extent.width, g_zonesArr[0].rect.extent.height,
              g_zonesArr[1].rect.offset.x, g_zonesArr[1].rect.offset.y,
              g_zonesArr[1].rect.extent.width, g_zonesArr[1].rect.extent.height,
-             kZoneArraySlices, (int)ZonesValidateEnabled());
+             kZoneArraySlices, g_wishMode, WishModeName(g_wishMode), (int)ZonesValidateEnabled());
 }
 
 // The environment blend mode for zones submission (resolved once).
@@ -675,11 +916,17 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
     endInfo.layerCount = layerCount;
     endInfo.layers = layers;
 
-    // Per-frame wish reference: AUTO (wishMask = XR_NULL_HANDLE → the runtime
-    // auto-derives the wish from the zone rects). Chained on FrameEndInfo.next.
+    // Per-frame wish reference, chained on FrameEndInfo.next. Mode 0 leaves it
+    // XR_NULL_HANDLE and the runtime auto-derives the wish from the zone rects;
+    // modes 1/2 make the authored mask the frame's wish, atomic with the layer
+    // set. #918 D12-5: under the output-device split that mask is what crosses
+    // as COMP_XBRIDGE_PLANE_MASK and is published to the display processor.
     XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = ZonesValidateEnabled() ? XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR : 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
+    if (g_wishMode >= 1 && g_zone.mask != XR_NULL_HANDLE) {
+        zonesEnd.wishMask = g_zone.mask;
+    }
     endInfo.next = &zonesEnd;
 
     xrEndFrame(xr.session, &endInfo);
@@ -711,6 +958,12 @@ static void RenderThreadFunc(HWND hwnd, XrSessionManager* xr, D3D12Renderer* ren
         if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
             g_zonesFrameCounter >= kZonesActivationFrame) {
             TryActivateZones(*xr, *renderer);
+        }
+
+        // M cycles the wish mode. Between BeginFrame and the zone renders, where
+        // the command list is closed — Tier-3 authoring records and drains on it.
+        if (g_zonesActive && g_hasDisplayZonesExt) {
+            HandleZoneKeys(*xr, *renderer);
         }
 
         if (g_zonesActive && frameState.shouldRender) {
@@ -850,6 +1103,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("Main thread: render thread joined");
 
     LOG_INFO("=== Shutting down ===");
+    // Destroy the wish mask before the session goes: it is the bridge's
+    // authored-mask plane source under the split, and destroy is what drops
+    // that binding and withdraws this client's DP zone contribution.
+    if (g_zone.mask != XR_NULL_HANDLE && g_zone.pfnDestroy) {
+        g_zone.pfnDestroy(g_zone.mask);
+        g_zone.mask = XR_NULL_HANDLE;
+    }
     g_zoneRtvHeap.Reset();
     g_xr = nullptr;
     CleanupOpenXR(xr);
