@@ -251,10 +251,11 @@ on an Intel-only present path before deleting the legacy code (#964 follow-up).
 ## 6. The output-device split (#918 Phase 2b)
 
 On a non-MUX hybrid laptop the panel is scanned out by the iGPU while apps render on the dGPU, so
-every woven frame crosses the adapter boundary inside `Present`. `DXR_WEAVE_ON_SCANOUT=1` moves the
+every woven frame crosses the adapter boundary inside `Present`. The split moves the
 **output half** of this pipeline — the presenter swap chains, their RTVs, the panel DP's weave and
 the present — onto the scanout adapter, and sends only the DP-INPUT ATLAS across, once per rendered
-frame, through a D3D12 cross-adapter heap (`comp_xbridge`). Default off. PR 3 covered the
+frame, through a D3D12 cross-adapter heap (`comp_xbridge`). **Default ON since #918 Phase 3**
+(ADR-037 §1); `DXR_WEAVE_ON_SCANOUT=0` is the kill switch. PR 3 covered the
 DIRECT path; PR 4 added the COMPOSE path, so **both** paths weave and present on the scanout
 adapter; PR 5 moved the zones wish mask onto the panel DP's device; PR 6 made the ingress adaptive,
 gave each presenter chain its own weave-latency ledger, and closed the DEVICE_REMOVED / watchdog /
@@ -414,7 +415,7 @@ lost its cause when the suspend went away, and stays armed as a tripwire.
 ### Reading it in the log
 
 ```
-weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave/present on the SCANOUT adapter
+weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave/present on the SCANOUT adapter (split=1) (#918)
 #918 output-device split ACTIVE: …
 [RENDER] split=1 xb_kb=… xb_degraded=0 pipe_dev_rebind=0 flat_skip=0 maskpub_skip=0 no_slot=0
          out_crop=0 ingress=adaptive ing_direct=598 ing_staged=0 ing_rebind=2 ing_churn=0

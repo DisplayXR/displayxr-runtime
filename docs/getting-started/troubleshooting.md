@@ -42,8 +42,11 @@ plug-in ABI, the active plug-in's identity and display info, and the Windows
 `ActiveRuntime` value.
 
 On a hybrid iGPU/dGPU machine, `info`'s **`GPU topology`** section (and the matching
-one-line `weave placement:` WARN every D3D11 session logs) tells you whether the weave
-runs on the adapter that scans out the panel or has to cross adapters to reach it — see
+one-line `weave placement:` WARN **every** session logs — D3D11, D3D12, the service,
+Vulkan and OpenGL alike) tells you whether the weave runs on the adapter that scans out
+the panel or has to cross adapters to reach it, and when it does not, a
+`split=0 reason=<token>` naming why. The split is ON by default since #918 Phase 3;
+`DXR_WEAVE_ON_SCANOUT=0` is the kill switch. See
 [Adapter selection](../reference/adapter-selection.md#checking-where-the-weave-actually-runs).
 
 **Which runtime DLL actually loaded?** Every `xrCreateInstance` logs it. Open the newest

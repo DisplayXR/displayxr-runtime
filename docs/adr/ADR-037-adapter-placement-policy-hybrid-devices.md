@@ -2,8 +2,10 @@
 
 **Status:** PROPOSED (2026-08-22; amended 2026-08-23 by the #918 owner — added
 §3a DP consent, corrected §7 to shipped, added the crossover instrument
-constraint and current split coverage) · supersedes the implicit "everything on
-HIGH_PERFORMANCE" default · depends on the #918 output-device split
+constraint and current split coverage; amended again 2026-08-23 — **§1 is now
+IMPLEMENTED for the covered paths**, see the implementation note below) ·
+supersedes the implicit "everything on HIGH_PERFORMANCE" default · depends on
+the #918 output-device split
 · related: [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md),
 [`docs/reference/adapter-selection.md`](../reference/adapter-selection.md),
 [`docs/investigations/hybrid-igpu-weave.md`](../investigations/hybrid-igpu-weave.md)
@@ -88,6 +90,29 @@ there is only one:
 The bridge is not a special mode to opt into: it is what the rule degenerates
 to when the two adapters differ.
 
+**IMPLEMENTED for the covered paths (#918 Phase 3, 2026-08-23).** Until Phase 3
+this sentence was true of the design and false of the code: the bridge *was* a
+mode to opt into, behind `DXR_WEAVE_ON_SCANOUT=1`, off by default for a release
+cycle. It now engages automatically wherever the two adapters differ and the
+path implements it — in-process D3D11, the D3D11 service (eligible presenter
+kinds per §7), in-process D3D12 (projection-only). `DXR_WEAVE_ON_SCANOUT` is
+retained as a **kill switch** (`=0`), not an opt-in; `=1` still parses and is a
+no-op restatement of the default.
+
+Everything else takes §3's ladder, and — this is the part the default flip made
+load-bearing — **every rung names itself**. One `weave placement:` line per
+session, on every graphics API including the two with no split, carrying
+`split=1` or `split=0 reason=<token>` from a closed set of snake_case tokens
+(`comp_split_gate.h`). The old short reason `env_not_requested` is gone: it was
+the honest answer while the split was opt-in and would be a lie now.
+
+Not yet implemented, and not silently: the in-process **D3D11** leg has no §3a
+retire, so a display processor that declines the scanout adapter there leaves
+the session with no weave rather than falling back. Phase 3 makes that reachable
+without an env flag, so the site logs `U_LOG_E` naming this §, `reason=
+dp_refused_scanout`, and the kill switch. The in-process D3D12 leg does retire
+correctly (#1164).
+
 ### 2. Capability, not "discrete"
 
 "Most capable render adapter" is resolved by the runtime, not hardcoded to
@@ -145,6 +170,16 @@ Rung 2 is chosen over rung 3 deliberately: real content is heavier than a test
 cube, and losing render throughput is worse than paying transfer cost. Rung 3
 is the correct answer only for light, latency-critical content — see *Open
 questions*.
+
+**"Log the degradation explicitly, naming why" is IMPLEMENTED (#918 Phase 3).**
+Each rung emits exactly one `weave placement:` line naming both adapters, the
+resulting regime, and `split=0 reason=<token>` from a closed set defined in
+`comp_split_gate.h`. The line is formatted in one place (`aux_d3d`) and emitted
+on every graphics API — including Vulkan and OpenGL, which have no split and so
+always report rung 2. The service repeats the live token on its periodic
+`[RENDER] split=0 reason=` line, and the in-process D3D12 path re-emits
+`weave placement: CHANGED` when it retires an engaged split mid-session, so the
+LAST placement line in a log is always the truth.
 
 ### 3a. The display processor must consent to the placement
 
@@ -308,20 +343,35 @@ before it is attempted.
    budget interacts. If the answer is yes, power state becomes a policy input
    and rung 3 becomes the DC default for light content.
 3. **Split coverage** — the rule falls back for whatever the bridge does not
-   yet cover. Status 2026-08-23:
-   - **shipped**: in-process D3D11; the **service/IPC path for every client
-     API** (the split lives in the service's compositor, downstream of IPC, so a
-     D3D12/VK/GL client benefits whenever its presenter kind is eligible);
-     zones/Local2D and mask planes; recipe-with-pixels; transport hardening.
-   - **in progress**: in-process D3D12 (Unity/Unreal) — ladder D12-0…D12-5,
-     rungs 0 and 1 merged (#1150, #1151).
+   yet cover, and **since Phase 3 the coverage boundary IS the safety story**:
+   the split is the default, so a path that cannot honestly answer "is the split
+   implemented for me?" must answer NO and take rung 2, never half-engage.
+   Status 2026-08-23:
+   - **shipped, and now auto-on**: in-process D3D11; the **service/IPC path for
+     every client API** (the split lives in the service's compositor, downstream
+     of IPC, so a D3D12/VK/GL client benefits whenever its presenter kind is
+     eligible); zones/Local2D and mask planes; recipe-with-pixels; transport
+     hardening.
+   - **shipped, auto-on, projection-only**: in-process D3D12 (Unity/Unreal) —
+     ladder D12-0…D12-5, through D12-3 (#1150, #1151, #1164). A zones / Local2D
+     / mask frame retires the split for the session
+     (`reason=layers_unsupported`), as does a DP that declines the scanout
+     adapter (`reason=dp_refused_scanout`, §3a).
    - **pending a decision, not just work**: in-process Vulkan. The cheap
      alternative measured well — whole-app placement on the scanout adapter via
      `DXR_VK_FORCE_GPU=scanout` eliminated *all* of the app's discrete-GPU work
      including the cross-adapter copy engine, ran clean, and was maintainer-
      eyeballed — so for light VK content the rule's rung-3 answer may simply be
      correct and a VK bridge unnecessary. The VK split's value case now rests on
-     heavy-render VK content, which is question 1 above.
+     heavy-render VK content, which is question 1 above. Phase 3 does **not**
+     pre-empt that decision: VK takes rung 2 explicitly and says so
+     (`reason=api_unsupported`), which is the same placement it had before, now
+     visible in the log instead of inferred from its absence.
+   - **not implementable on the runtime's terms**: in-process OpenGL. §5 — no
+     adapter identity, no device-selection API, so the runtime can neither learn
+     which adapter WGL chose nor ask for another. Rung 2, logged with
+     `render=UNKNOWN` and `reason=api_unsupported`; the honest unknown is the
+     point, a guessed render adapter would be worse.
    - **n/a**: Metal / Android (single-adapter; the rule degenerates).
 4. **Multi-3D-panel machines** — per-panel scanout adapters, and whether a
    session can migrate its weave target live.

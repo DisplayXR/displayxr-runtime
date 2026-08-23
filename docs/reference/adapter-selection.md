@@ -180,22 +180,45 @@ adapter to resolve; `DXR_VK_FORCE_GPU=scanout` WARNs once and is ignored.
 
 ## Interaction with the output-device split (`DXR_WEAVE_ON_SCANOUT`)
 
+> **`DXR_WEAVE_ON_SCANOUT` is a KILL SWITCH, not an opt-in — since #918 Phase 3.**
+> The output-device split now engages **automatically** wherever the scanout
+> adapter differs from the render adapter and the path implements it (ADR-037
+> §1: the split is not a mode to opt into, it is what the placement rule
+> degenerates to when the two adapters differ). Set `DXR_WEAVE_ON_SCANOUT=0` —
+> or `f…`, `n…`, `off` — to force the old single-adapter behaviour. `=1` still
+> works and is now a no-op restatement of the default, so nothing that already
+> sets it changed meaning.
+
 These two variables answer *different* questions and can cancel each other out.
 `DXR_D3D_FORCE_GPU` decides which adapter the **whole session** — app render,
-weave and present — lives on. `DXR_WEAVE_ON_SCANOUT=1` (#918 Phase 1, D3D11)
-instead **splits** them: the app keeps rendering wherever its device already is,
-while the swapchain, the display processor, the HUD and the repaint loop move to
-the scanout adapter, with the composited atlas crossing once per app frame.
+weave and present — lives on. The split instead **separates** them: the app keeps
+rendering wherever its device already is, while the swapchain, the display
+processor, the HUD and the repaint loop move to the scanout adapter, with the
+composited atlas crossing once per app frame.
 
 The split's activation gate is a LUID comparison, so **forcing the app onto the
-scanout adapter makes the split a no-op**: `DXR_WEAVE_ON_SCANOUT=1` together with
-`DXR_D3D_FORCE_GPU=scanout` (or `=igpu` where those are the same adapter) logs
-`scanout adapter ... IS the app's adapter — split is a no-op` and takes the stock
-single-device path. That is correct, not a failure — everything is already local
-to the panel, which is exactly what the split was going to arrange. Use one or
-the other: `DXR_D3D_FORCE_GPU=scanout` when the app can afford to render on the
-iGPU, `DXR_WEAVE_ON_SCANOUT=1` when it cannot and the dGPU has to keep the
-rendering.
+scanout adapter makes the split a no-op**: `DXR_D3D_FORCE_GPU=scanout` (or
+`=igpu` where those are the same adapter) logs `split=0 reason=same_adapter` and
+takes the stock single-device path. That is correct, not a failure — everything
+is already local to the panel, which is exactly what the split was going to
+arrange. Use `DXR_D3D_FORCE_GPU=scanout` when the app can afford to render on
+the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
+
+### Where the split engages automatically
+
+| path | auto-engages? | `reason=` when it does not |
+|---|---|---|
+| In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
+| **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
+| In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
+| In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
+| In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-selection API at all |
+| Metal / Android | n/a | single-adapter; the rule degenerates |
+
+Vulkan and OpenGL take rung 2 **unconditionally**, and neither can reach a
+half-engaged state: nothing in either compositor consults a scanout adapter,
+allocates a bridge, or creates a second device. They log the placement line and
+render exactly as before.
 
 ## Checking where the weave actually runs
 
@@ -208,8 +231,10 @@ Neither variable has to be *guessed at*. Two places report the answer:
   `weave-on-scanout topology: APPLIES (render != scanout)` / `does not apply
   (single adapter / same adapter)`, and shows the current
   `DXR_WEAVE_ON_SCANOUT` value. `displayxr-cli selftest` carries the same
-  verdict line as one informational (never-failing) check. On a hybrid box
-  with the panel on the iGPU it reads:
+  verdict line as one informational (never-failing) check. Since Phase 3 the
+  `service split:` line answers "did anyone turn it **off**", so on an ordinary
+  box it reads `WOULD ENGAGE` and the interesting bug report is the one that
+  says `KILLED`. On a hybrid box with the panel on the iGPU it reads:
 
   ```
    :: GPU topology (#918 — does the weave cross adapters to reach the panel?)
@@ -219,8 +244,8 @@ Neither variable has to be *guessed at*. Two places report the answer:
         panel scanout: 'Intel(R) UHD Graphics' LUID=00000000:00024bbf
         render (default suggestion): 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00024f0b
         weave-on-scanout topology: APPLIES (render != scanout)
-        DXR_WEAVE_ON_SCANOUT=<unset>
-        service split: OFF (DXR_WEAVE_ON_SCANOUT unset — default off through this release)
+        DXR_WEAVE_ON_SCANOUT=<unset> (kill switch; the split is ON by default)
+        service split: WOULD ENGAGE (default on, render != scanout); ingress adaptive (default)
         service ingest: 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00024f0b (most VRAM) — the adapter clients must share (ADR-037 §7)
   ```
 
@@ -237,20 +262,42 @@ Neither variable has to be *guessed at*. Two places report the answer:
   not off the environment, so a value the resolver rejected (a stray trailing
   space is enough) reports as rejected instead of as applied.
 
-- **The session log**, for what a *specific* app actually got. Every D3D11
-  session logs exactly one `weave placement:` WARN naming the render adapter,
-  the panel's scanout adapter, and where the weave runs — in all three states
-  (`weave/present on the SCANOUT adapter`, `weave on the RENDER adapter; every
-  present crosses adapters to reach scanout`, `render and scanout share one
-  adapter; weave is local`), plus an explicit `panel scanout=UNRESOLVED` when
-  the panel's adapter cannot be determined. It is emitted whether or not
-  `DXR_WEAVE_ON_SCANOUT` is set, so a hybrid box quietly paying the
-  cross-adapter present no longer produces a log indistinguishable from a
-  single-adapter box that pays nothing. Grep the newest
-  `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log` for `weave placement`.
+- **The session log**, for what a *specific* app actually got. **Every** session
+  — D3D11, D3D12, the service, Vulkan and OpenGL — logs exactly one
+  `weave placement:` WARN, formatted in one place (`aux_d3d`) so it is literally
+  the same string on every path. Grep the newest
+  `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.*.log` for `weave placement`. It
+  names the render adapter, the panel's scanout adapter, the regime, and — when
+  the split is off — **why**:
 
-  The `D3D11 output-device split ...` lines are separate and appear only when
-  the split was actually attempted; the `weave placement:` line is always there.
+  ```
+  weave placement: render='NVIDIA …' LUID=…, panel scanout='Intel …' LUID=… — weave/present on the SCANOUT adapter (split=1) (#918)
+  weave placement: render='…' LUID=…, panel scanout='…' LUID=… — render and scanout share one adapter; weave is local (split=0 reason=same_adapter) (#918)
+  weave placement: render='…' LUID=…, panel scanout='…' LUID=… — weave on the RENDER adapter; every present crosses adapters to reach scanout (split=0 reason=api_unsupported) (#918)
+  weave placement: render='…' LUID=…, panel scanout=UNRESOLVED — cannot tell whether the weave crosses adapters (split=0 reason=scanout_unresolvable) (#918)
+  weave placement: render=UNKNOWN, panel scanout='…' LUID=… — weave on the RENDER adapter; … (split=0 reason=api_unsupported) (#918)
+  ```
+
+  `render=UNKNOWN` is OpenGL only, and is the literal truth rather than a
+  failed lookup — see ADR-037 §5.
+
+  **The LAST `weave placement:` line in a log is the truth.** The in-process
+  D3D12 path can retire an engaged split mid-session (a zones/Local2D/mask
+  frame, or a display processor that declines the scanout adapter) and emits
+  `weave placement: CHANGED — … (split=0 reason=…)` when it does. Everything
+  else emits the line once, at session create.
+
+  The `#918 output-device split ...` lines are separate and appear only when
+  Stage A actually ran; the `weave placement:` line is always there. The
+  service additionally reports the live state on its periodic
+  `[RENDER] split=0 reason=<token>` line, using the same tokens.
+
+  The reason tokens are a closed set (`comp_split_gate.h`): `killed_by_env`,
+  `same_adapter`, `scanout_unresolvable`, `render_unresolvable`, `no_hwnd`,
+  `shared_texture_session`, `no_panel_dimensions`, `legacy_standalone`,
+  `api_unsupported`, `presenter_ineligible`, `stage_a_failed`,
+  `dp_refused_scanout`, `layers_unsupported`. `stage_a_failed` always has the
+  specific failure spelled out in the WARN immediately above it.
 
 ## Choosing a value
 
