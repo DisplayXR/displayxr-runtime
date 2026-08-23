@@ -192,17 +192,25 @@ enum comp_split_ingress_policy
  */
 #define COMP_SPLIT_REASON_LAYERS_UNSUPPORTED "layers_unsupported"
 /*!
- * #918 D12-4 — the frame has an APP-AUTHORED zone mask (Tier 3), whose pixels the
- * application draws into a texture of its own on the render adapter.
+ * An APP-AUTHORED zone mask (Tier 3) could not be moved to the scanout adapter.
  *
- * Its own token rather than @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED, and the
- * distinction is the whole point: after D12-4, zones and Local2D composite on the
- * scanout adapter, so a support case that reads `layers_unsupported` from a
- * D3D12 session is reading an OLD BUILD, while `authored_mask` says "this build
- * does not transport an authored mask yet" — a statement about the feature, not
- * about the binary. The transport is D12-5: the mask plane exists in the bridge
- * (@ref COMP_XBRIDGE_PLANE_MASK) and needs the app-side bind plus the authored
- * wish publish.
+ * **ITS MEANING NARROWED IN #918 D12-5, and the token deliberately did not
+ * change.** In D12-4 it meant "this build does not transport an authored mask
+ * yet" — a statement about the feature — and it fired on the mere PRESENCE of
+ * one. D12-5 transports it (@ref COMP_XBRIDGE_PLANE_MASK, bound by pointer on the
+ * D3D12 leg), so the presence of an authored mask is no longer a reason for
+ * anything. What is left is the machine: an R8 cross-adapter heap the stack
+ * refuses, or an egress the driver will not hand over. The token still names what
+ * the SESSION lost, which is the only thing a support case can act on.
+ *
+ * It stays its own token rather than @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED
+ * for the reason D12-4 gave and D12-5 keeps: `layers_unsupported` from a D3D12
+ * session means an old build.
+ *
+ * Why a retire rather than a per-frame degrade: the D3D12 leg has no
+ * output-device SHADOW of the mask the way the D3D11 leg does, so with no
+ * transport there is no mask on the scanout adapter at all — the choice is the
+ * app device or wrong pixels, and there is no third option to degrade into.
  */
 #define COMP_SPLIT_REASON_AUTHORED_MASK "authored_mask"
 /*! @} */
