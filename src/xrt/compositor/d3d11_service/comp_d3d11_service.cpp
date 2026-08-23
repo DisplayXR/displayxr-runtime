@@ -1611,6 +1611,20 @@ struct d3d11_service_system
 	bool split_active{false};
 	bool split_available{false};
 
+	/*!
+	 * #918 — WHY the split is not available, for the `[RENDER] split=0 reason=`
+	 * line. Without it a control run can only observe the ABSENCE of the split
+	 * diagnostic, which is indistinguishable from "the diagnostic regressed".
+	 *
+	 * Comes from @ref comp_split_gate_result::reason (plus the two states the
+	 * gate reports as flags rather than strings) — never re-derived here, so the
+	 * log cannot disagree with the decision. COPIED rather than aliased: most of
+	 * those strings are literals, but `comp_xbridge_create`'s `out_reason` has
+	 * no documented lifetime contract and this is read minutes later on another
+	 * thread. Written once, by Stage A, before any client exists.
+	 */
+	char split_off_reason[80] = "env_not_requested";
+
 	//! #918: the scanout adapter's LUID, for the diagnostics line.
 	LUID out_luid{};
 	//! #918: the panel extent Stage A resolved (bridge plane sizing / logging).
@@ -2122,6 +2136,18 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			    (unsigned long)sdesc.AdapterLuid.LowPart, (unsigned long)app_luid.HighPart,
 			    (unsigned long)app_luid.LowPart);
 		} else {
+			/*
+			 * Retain the gate's own words for `[RENDER] split=0 reason=`. The
+			 * gate reports the same-adapter no-op as a FLAG (its reason is then
+			 * COMP_SPLIT_REASON_HANDLED, "nothing to say"), so that one case is
+			 * named here; everything else — the caller's ineligibility verdict,
+			 * "scanout unresolvable", and each Stage-A failure — is passed
+			 * through verbatim.
+			 */
+			snprintf(sys->split_off_reason, sizeof(sys->split_off_reason), "%s",
+			         gate.same_adapter     ? "same_adapter"
+			         : (reason[0] != '\0') ? reason
+			                               : "unknown");
 			if (sys->xbridge != nullptr) {
 				comp_xbridge_destroy(&sys->xbridge);
 			}
@@ -8401,6 +8427,19 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			    oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
 			    (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
 			    (unsigned long long)ing.leak);
+		} else {
+			/*
+			 * SPLIT OFF — say so, and say why. Without this the whole
+			 * `split=` line is simply absent, so a control run can only
+			 * assert an absence, which is indistinguishable from the
+			 * diagnostic having regressed.
+			 *
+			 * SHORT FORM deliberately: the ingress / xb_kb / no_slot terms
+			 * describe a transport that does not exist here, and emitting
+			 * them as zeros would put eleven meaningless fields into every
+			 * 10 s window on every single-GPU box.
+			 */
+			U_LOG_W("[RENDER] split=0 reason=%s", sys->split_off_reason);
 		}
 	}
 
