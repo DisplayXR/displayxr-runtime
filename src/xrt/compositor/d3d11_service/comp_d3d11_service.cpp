@@ -41,6 +41,7 @@
 #include "d3d/d3d_dxgi_formats.h"
 #include "d3d/d3d_render_adapter.hpp"
 #include "d3d/d3d_scanout_helpers.hpp"
+#include "d3d/d3d_weave_placement.h"
 
 // #918 Phase 2b: the cross-adapter atlas transport, shared with the in-process
 // compositor (PR 1/6 made it a standalone static lib for exactly this).
@@ -1617,14 +1618,18 @@ struct d3d11_service_system
 	 * line. Without it a control run can only observe the ABSENCE of the split
 	 * diagnostic, which is indistinguishable from "the diagnostic regressed".
 	 *
-	 * Comes from @ref comp_split_gate_result::reason (plus the two states the
-	 * gate reports as flags rather than strings) — never re-derived here, so the
-	 * log cannot disagree with the decision. COPIED rather than aliased: most of
-	 * those strings are literals, but `comp_xbridge_create`'s `out_reason` has
-	 * no documented lifetime contract and this is read minutes later on another
-	 * thread. Written once, by Stage A, before any client exists.
+	 * Comes from @ref comp_split_gate_result::short_reason — never re-derived
+	 * here, so the log cannot disagree with the decision. Always one of the
+	 * canonical `COMP_SPLIT_REASON_*` tokens. COPIED rather than aliased: they
+	 * are all literals today, but this is read minutes later on another thread
+	 * and the field predates that guarantee. Written once, by Stage A, before
+	 * any client exists.
+	 *
+	 * #918 Phase 3 default: `killed_by_env`, not `env_not_requested` — the split
+	 * is now on unless something turned it off, so the only way Stage A is
+	 * skipped entirely is the kill switch.
 	 */
-	char split_off_reason[80] = "env_not_requested";
+	char split_off_reason[80] = COMP_SPLIT_REASON_KILLED_BY_ENV;
 
 	//! #918: the scanout adapter's LUID, for the diagnostics line.
 	LUID out_luid{};
@@ -1992,9 +1997,9 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			// D-7: the legacy path is a byte-for-byte reproduction of the
 			// pre-#964 behaviour for the motion-to-photon A/B. Splitting it
 			// would defeat the only reason it still exists.
-			gin.ineligible_reason = "DXR_LEGACY_STANDALONE";
+			gin.ineligible_reason = COMP_SPLIT_REASON_LEGACY_STANDALONE;
 		} else if (panel_w == 0 || panel_h == 0) {
-			gin.ineligible_reason = "no panel dimensions";
+			gin.ineligible_reason = COMP_SPLIT_REASON_NO_PANEL_DIMS;
 		}
 
 		wil::com_ptr<IDXGIAdapter> scanout;
@@ -2138,17 +2143,16 @@ service_split_stage_a(struct d3d11_service_system *sys,
 			    (unsigned long)app_luid.LowPart);
 		} else {
 			/*
-			 * Retain the gate's own words for `[RENDER] split=0 reason=`. The
-			 * gate reports the same-adapter no-op as a FLAG (its reason is then
-			 * COMP_SPLIT_REASON_HANDLED, "nothing to say"), so that one case is
-			 * named here; everything else — the caller's ineligibility verdict,
-			 * "scanout unresolvable", and each Stage-A failure — is passed
-			 * through verbatim.
+			 * The gate's canonical token for `[RENDER] split=0 reason=`. Every
+			 * refusal it can make — the kill switch, the caller's eligibility
+			 * verdict, an unresolvable adapter, the same-adapter no-op — already
+			 * carries one. A Stage-A failure is the one case the gate cannot
+			 * name, because it happened after the gate said proceed; its short
+			 * form is `stage_a_failed` and its prose is in the WARN below.
 			 */
 			snprintf(sys->split_off_reason, sizeof(sys->split_off_reason), "%s",
-			         gate.same_adapter     ? "same_adapter"
-			         : (reason[0] != '\0') ? reason
-			                               : "unknown");
+			         gate.split_active ? COMP_SPLIT_REASON_STAGE_A_FAILED
+			                           : (gate.short_reason != nullptr ? gate.short_reason : "unknown"));
 			if (sys->xbridge != nullptr) {
 				comp_xbridge_destroy(&sys->xbridge);
 			}
@@ -2182,54 +2186,26 @@ service_split_stage_a(struct d3d11_service_system *sys,
 
 	/*
 	 * ONE canonical weave-placement line per service process, ALWAYS emitted, in
-	 * addition to (never instead of) the Stage-A detail lines above. Wording is
-	 * deliberately identical to the in-process compositor's so one grep answers
-	 * the question on both paths.
+	 * addition to (never instead of) the Stage-A detail lines above. Formatted by
+	 * aux_d3d so it is literally the same string the in-process D3D11, D3D12,
+	 * Vulkan and OpenGL compositors emit — one grep answers the question on every
+	 * path.
+	 *
+	 * The service-wide line reports the PROCESS's placement. Per-presenter
+	 * eligibility (ADR-037 §7: `CLIENT_TEXTURE` and self-presenting clients are
+	 * structurally ineligible, see @ref svc_kind_eligible_for_split) is a
+	 * per-client fact and is logged with each `[pipeline] presenter=` line, not
+	 * here — the process really is holding an out-device on the scanout adapter
+	 * even while an ineligible client is the one being weaved.
 	 */
 	{
+		uint64_t render_packed_luid = 0;
 		DXGI_ADAPTER_DESC rdesc = {};
-		const bool render_ok = app_adapter != nullptr && SUCCEEDED(app_adapter->GetDesc(&rdesc));
-
-		DXGI_ADAPTER_DESC pdesc = {};
-		bool scanout_ok = false;
-		{
-			wil::com_ptr<IDXGIAdapter> panel = xrt::auxiliary::d3d::getScanoutAdapter(
-			    panel_left, panel_top, panel_w, panel_h, U_LOGGING_INFO);
-			scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
+		if (app_adapter != nullptr && SUCCEEDED(app_adapter->GetDesc(&rdesc))) {
+			memcpy(&render_packed_luid, &rdesc.AdapterLuid, sizeof(render_packed_luid));
 		}
-
-		const WCHAR *rname = render_ok ? rdesc.Description : L"<unknown>";
-		const unsigned long rhi = (unsigned long)rdesc.AdapterLuid.HighPart;
-		const unsigned long rlo = (unsigned long)rdesc.AdapterLuid.LowPart;
-
-		if (!scanout_ok) {
-			// Say so — never guess. Without the scanout adapter there is no way
-			// to know whether this session crosses adapters at all.
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout=UNRESOLVED — cannot tell "
-			    "whether the weave crosses adapters (#918)",
-			    rname, rhi, rlo);
-		} else if (render_ok && pdesc.AdapterLuid.LowPart == rdesc.AdapterLuid.LowPart &&
-		           pdesc.AdapterLuid.HighPart == rdesc.AdapterLuid.HighPart) {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
-			    "render and scanout share one adapter; weave is local (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		} else if (sys->split_available) {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
-			    "weave/present on the SCANOUT adapter (DXR_WEAVE_ON_SCANOUT split active) (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		} else {
-			U_LOG_W(
-			    "weave placement: render='%ls' LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
-			    "weave on the RENDER adapter; every present crosses adapters to reach scanout (set "
-			    "DXR_WEAVE_ON_SCANOUT=1 to move the weave) (#918)",
-			    rname, rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-			    (unsigned long)pdesc.AdapterLuid.LowPart);
-		}
+		d3d_log_weave_placement(render_packed_luid, panel_left, panel_top, panel_w, panel_h,
+		                        sys->split_available, sys->split_off_reason);
 	}
 }
 
@@ -5871,6 +5847,18 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			canvas_w = atlas_w;
 			canvas_h = atlas_h;
 			U_LOG_W("[pipeline] presenter=SERVICE_WINDOW (canvas %ux%u)", canvas_w, canvas_h);
+		}
+
+		/*
+		 * #918 Phase 3 / ADR-037 §3 — a presenter that cannot split says so, once,
+		 * naming itself. The process-wide `weave placement:` line reports that the
+		 * SERVICE holds an out-device on the scanout adapter; this client is still
+		 * weaving on the app device, and without this line the two facts looked
+		 * like a contradiction in the log rather than the documented §7 rule.
+		 */
+		if (sys->split_available && !svc_kind_eligible_for_split(kind)) {
+			U_LOG_W("[pipeline] this presenter weaves on the RENDER adapter (split=0 reason=%s)",
+			        COMP_SPLIT_REASON_PRESENTER_INELIGIBLE);
 		}
 
 		if (c != nullptr) {

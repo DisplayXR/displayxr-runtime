@@ -60,6 +60,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "d3d/d3d_scanout_helpers.hpp"
+#include "d3d/d3d_weave_placement.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -163,6 +164,14 @@ struct comp_d3d12_compositor
 	struct comp_xbridge *xbridge;
 	//! True once Stage A completed. The single predicate every split branch reads.
 	bool split_active;
+	/*!
+	 * #918 Phase 3 — the canonical short reason the `weave placement:` line
+	 * prints while @ref split_active is false. One of the
+	 * `COMP_SPLIT_REASON_*` tokens; NULL while the split is up. Written by
+	 * Stage A and by @ref d3d12_split_retire, which is the only thing that can
+	 * turn the split off after Stage A said yes.
+	 */
+	const char *split_off_reason;
 	//! The scanout adapter, for the one canonical placement line.
 	LUID out_luid;
 	//! Panel extent Stage A resolved. A window can never exceed it, so it is
@@ -1180,7 +1189,7 @@ d3d12_split_release_out(struct comp_d3d12_compositor *c)
  * recursive, and layer_commit's call would deadlock on the spot if it did).
  */
 static void
-d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why)
+d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char *short_reason)
 {
 	if (!c->split_active) {
 		return;
@@ -1191,6 +1200,23 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why)
 	    "composite's inputs live on the app device; moving the weave back to the app adapter for the "
 	    "rest of the session (#918 D12-3)",
 	    why);
+
+	/*
+	 * #918 Phase 3 — CORRECT THE CANONICAL LINE. `weave placement:` was already
+	 * emitted at session create, saying split=1, and it stopped being true one
+	 * line ago. Support greps for that string and reads the LAST one, so a
+	 * retire that left the old line standing alone would be a log that lies.
+	 *
+	 * Deliberately does NOT re-resolve the adapters: this can run on the frame
+	 * path (layer_commit) under `c->mutex`, and a QueryDisplayConfig there is a
+	 * cost with no new information — the adapters are the ones the create-time
+	 * line already named. What changed is the REGIME, and that is what this says.
+	 */
+	c->split_off_reason = (short_reason != nullptr) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+	U_LOG_W(
+	    "weave placement: CHANGED — weave/present move back to the RENDER adapter for the rest of this "
+	    "session (split=0 reason=%s) (#918)",
+	    c->split_off_reason);
 
 	/*
 	 * Quiesce BOTH scopes before anything is torn down — teardown is one of the
@@ -1295,15 +1321,18 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	struct comp_split_gate_inputs gin = {};
 	gin.requested = comp_split_gate_env_requested();
 	if (!gin.requested) {
+		// #918 Phase 3: the ONLY way to get here now. The placement line still
+		// runs and names the kill switch.
+		c->split_off_reason = COMP_SPLIT_REASON_KILLED_BY_ENV;
 		return;
 	}
 
 	if (c->hwnd == nullptr) {
-		gin.ineligible_reason = "no HWND";
+		gin.ineligible_reason = COMP_SPLIT_REASON_NO_HWND;
 	} else if (c->has_shared_texture) {
-		gin.ineligible_reason = "shared-texture session";
+		gin.ineligible_reason = COMP_SPLIT_REASON_SHARED_TEXTURE;
 	} else if (xdev->hmd == NULL || xdev->hmd->screens[0].w_pixels == 0 || xdev->hmd->screens[0].h_pixels == 0) {
-		gin.ineligible_reason = "no panel dimensions";
+		gin.ineligible_reason = COMP_SPLIT_REASON_NO_PANEL_DIMS;
 	}
 
 	// The app device's adapter. D3D12 hands us the LUID directly — there is no
@@ -1330,6 +1359,7 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
 	const char *reason = gate.reason;
+	c->split_off_reason = gate.short_reason;
 	if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already local,
 		// so the split has nothing to do.
@@ -1485,6 +1515,7 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 
 	if (reason == nullptr) {
 		c->split_active = true;
+		c->split_off_reason = nullptr;
 		c->out_luid.LowPart = gate.out_adapter_luid.low;
 		c->out_luid.HighPart = gate.out_adapter_luid.high;
 		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
@@ -1500,6 +1531,11 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	} else {
 		d3d12_split_release_out(c);
 		if (reason[0] != '\0') {
+			// The gate's refusals already carry a canonical token; a Stage-A
+			// failure carries prose, and `stage_a_failed` is its short form.
+			if (gate.split_active) {
+				c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+			}
 			U_LOG_W(
 			    "#918 output-device split DISABLED (%s) — falling back to the stock single-device "
 			    "path (#918)",
@@ -1518,11 +1554,19 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
  * #918 — ONE canonical weave-placement line per session, ALWAYS emitted, in
  * addition to (never instead of) the Stage-A detail lines above.
  *
- * The Stage-A lines only exist when DXR_WEAVE_ON_SCANOUT is set, so without this
- * a hybrid box silently paying the cross-adapter present produces a log
+ * The Stage-A lines exist only when Stage A ran, so without this a box that
+ * killed the split, or one whose session was ineligible, produces a log
  * byte-identical to a single-adapter box that pays nothing — the same blind spot
- * #1000 closed for adapter SELECTION, now closed for weave PLACEMENT. Costs one
- * QueryDisplayConfig per session.
+ * #1000 closed for adapter SELECTION, now closed for weave PLACEMENT. The
+ * formatting is aux_d3d's, so this is literally the same string the D3D11,
+ * service, Vulkan and OpenGL paths emit. Costs one QueryDisplayConfig per call.
+ *
+ * Called TWICE in the worst case — once after Stage A, and again from
+ * @ref d3d12_split_retire when a display processor declines the scanout adapter
+ * (ADR-037 §3a) or a zones/Local2D/mask frame retires the split. That is
+ * deliberate: the retire happens AFTER the first line was emitted, so without a
+ * second line the log's only placement statement would be the one that stopped
+ * being true. The LAST `weave placement:` line in a log is always the truth.
  */
 static void
 d3d12_log_weave_placement(struct comp_d3d12_compositor *c,
@@ -1531,46 +1575,13 @@ d3d12_log_weave_placement(struct comp_d3d12_compositor *c,
                           int32_t display_screen_top)
 {
 	const LUID rl = c->device->GetAdapterLuid();
-	const unsigned long rhi = (unsigned long)rl.HighPart;
-	const unsigned long rlo = (unsigned long)rl.LowPart;
+	uint64_t render_packed_luid = 0;
+	memcpy(&render_packed_luid, &rl, sizeof(render_packed_luid));
 
-	DXGI_ADAPTER_DESC pdesc = {};
-	bool scanout_ok = false;
-	{
-		const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
-		const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
-		wil::com_ptr<IDXGIAdapter> panel = xrt::auxiliary::d3d::getScanoutAdapter(
-		    display_screen_left, display_screen_top, pw, ph, U_LOGGING_INFO);
-		scanout_ok = panel != nullptr && SUCCEEDED(panel->GetDesc(&pdesc));
-	}
-
-	if (!scanout_ok) {
-		// Say so — never guess. Without the scanout adapter there is no way to
-		// know whether this session crosses adapters at all.
-		U_LOG_W(
-		    "weave placement: render LUID=%08lx:%08lx, panel scanout=UNRESOLVED — cannot tell whether "
-		    "the weave crosses adapters (#918)",
-		    rhi, rlo);
-	} else if (pdesc.AdapterLuid.LowPart == rl.LowPart && pdesc.AdapterLuid.HighPart == rl.HighPart) {
-		U_LOG_W(
-		    "weave placement: render LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — render "
-		    "and scanout share one adapter; weave is local (#918)",
-		    rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-		    (unsigned long)pdesc.AdapterLuid.LowPart);
-	} else if (c->split_active) {
-		U_LOG_W(
-		    "weave placement: render LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — "
-		    "weave/present on the SCANOUT adapter (DXR_WEAVE_ON_SCANOUT split active) (#918)",
-		    rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-		    (unsigned long)pdesc.AdapterLuid.LowPart);
-	} else {
-		U_LOG_W(
-		    "weave placement: render LUID=%08lx:%08lx, panel scanout='%ls' LUID=%08lx:%08lx — weave on "
-		    "the RENDER adapter; every present crosses adapters to reach scanout (set "
-		    "DXR_WEAVE_ON_SCANOUT=1 to move the weave) (#918)",
-		    rhi, rlo, pdesc.Description, (unsigned long)pdesc.AdapterLuid.HighPart,
-		    (unsigned long)pdesc.AdapterLuid.LowPart);
-	}
+	const uint32_t pw = (xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+	const uint32_t ph = (xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+	d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph, c->split_active,
+	                        c->split_off_reason);
 }
 
 /*!
@@ -3441,7 +3452,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			why = "an authored zone mask is active";
 		}
 		if (why != nullptr) {
-			d3d12_split_retire(c, why);
+			d3d12_split_retire(c, why, COMP_SPLIT_REASON_LAYERS_UNSUPPORTED);
 		}
 	}
 
@@ -4641,7 +4652,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			 * arms it), and retire's contract is that its caller holds the lock.
 			 */
 			std::lock_guard<std::mutex> retire_lock(c->mutex);
-			d3d12_split_retire(c, "the display processor declined a weaver on the scanout adapter");
+			d3d12_split_retire(c, "the display processor declined a weaver on the scanout adapter",
+			                   COMP_SPLIT_REASON_DP_REFUSED_SCANOUT);
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");
