@@ -188,6 +188,30 @@ struct comp_d3d12_outcomp
 	uint32_t ring_next;
 
 	/*!
+	 * #1151 — the SRV-ring tripwire.
+	 *
+	 * `ring_next` wraps at kSrvRingSets, and a wrap is only safe once the set
+	 * being reused has finished EXECUTING. This unit is a pure recorder: it owns
+	 * no queue and no fence, so it cannot see a submission boundary and cannot
+	 * make a wrap safe. What it CAN do is refuse to wrap silently — count
+	 * composites since the caller last said "I submitted" (@ref
+	 * comp_d3d12_outcomp_note_execute) and report when that count reaches the
+	 * ring depth.
+	 *
+	 * The count lives HERE, beside `kSrvRingSets`, rather than in the caller
+	 * that owns the boundary: a caller-side copy of the ring depth is a constant
+	 * that can drift from the ring it describes, and this tripwire exists
+	 * precisely because a silent drift is the failure mode.
+	 *
+	 * It is an ERROR, never a wait. The fix is a deeper ring or an earlier
+	 * submit; blocking the weave thread here would trade a visible corruption
+	 * for an invisible stall, which is the #925 wedge class. One WARN per unit,
+	 * because a caller that trips it trips it every frame.
+	 */
+	uint32_t since_execute;
+	bool ring_warned;
+
+	/*!
 	 * Sampleable scratch snapshot of the weave target's window region, for the
 	 * authored-mask lerp (the mask path reads the weave; the target is the
 	 * pass's render target). Lazily allocated window-sized (#464) and then
@@ -484,6 +508,18 @@ comp_d3d12_outcomp_create(void *device, struct comp_d3d12_outcomp **out_outcomp)
 }
 
 extern "C" void
+comp_d3d12_outcomp_note_execute(struct comp_d3d12_outcomp *outcomp)
+{
+	// NULL-tolerant on purpose: a caller that has not (yet) created the unit
+	// still calls this at its submission boundaries, so the boundary reporting
+	// cannot be forgotten later when it does. See `since_execute`.
+	if (outcomp == nullptr) {
+		return;
+	}
+	outcomp->since_execute = 0;
+}
+
+extern "C" void
 comp_d3d12_outcomp_destroy(struct comp_d3d12_outcomp **outcomp_ptr)
 {
 	if (outcomp_ptr == nullptr || *outcomp_ptr == nullptr) {
@@ -680,6 +716,17 @@ comp_d3d12_outcomp_composite_2d_masked(struct comp_d3d12_outcomp *outcomp,
 
 	const uint32_t set = outcomp->ring_next;
 	outcomp->ring_next = (outcomp->ring_next + 1) % kSrvRingSets;
+
+	// #1151: the wrap the caller cannot see. See `since_execute`.
+	if (++outcomp->since_execute > kSrvRingSets && !outcomp->ring_warned) {
+		outcomp->ring_warned = true;
+		U_LOG_E(
+		    "#1151 outcomp: %u composites recorded since the caller last reported an execute, with a "
+		    "%u-set SRV ring — this call is overwriting descriptors a set that may still be in flight "
+		    "owns. Submit more often, or grow kSrvRingSets. Deliberately NOT waiting: a stall on the "
+		    "weave thread is the #925 wedge class.",
+		    (unsigned)outcomp->since_execute, (unsigned)kSrvRingSets);
+	}
 
 	// RTV on the weave target (which already holds the weave), from its own
 	// format — the D3D12 spelling of D3D11's CreateRenderTargetView(dst,
