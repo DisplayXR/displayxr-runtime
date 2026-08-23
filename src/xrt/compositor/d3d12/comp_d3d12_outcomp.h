@@ -124,6 +124,31 @@ xrt_result_t
 comp_d3d12_outcomp_create(void *device, struct comp_d3d12_outcomp **out_outcomp);
 
 /*!
+ * #1151 — tell the unit that everything recorded so far has been SUBMITTED, so
+ * its descriptor ring may safely wrap past this point.
+ *
+ * The unit hands out one descriptor set per composite from a ring of four and
+ * wraps when it runs out. A wrap is only safe once the set being reused has
+ * finished executing — and this unit is a pure recorder (point 1 of the file
+ * comment): it owns no queue and no fence, so it cannot see a submission
+ * boundary and cannot tell a safe wrap from one that overwrites descriptors the
+ * GPU is still reading. Only the caller knows where its `ExecuteCommandLists`
+ * are.
+ *
+ * Call it wherever the list the composites were recorded into is executed. Too
+ * many composites between two calls is then reported (once, as an ERROR) rather
+ * than silently corrupting a frame; the unit never waits, because a stall on the
+ * weave thread would be worse than the corruption it is warning about.
+ *
+ * NULL-tolerant, so a caller can wire its submission boundaries before it wires
+ * its first composite.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_outcomp_note_execute(struct comp_d3d12_outcomp *outcomp);
+
+/*!
  * Destroy the unit and everything it owns (including the weave scratch).
  * Idempotent; nulls the caller's pointer.
  *

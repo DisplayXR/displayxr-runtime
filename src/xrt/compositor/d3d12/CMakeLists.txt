@@ -30,6 +30,13 @@ if(WIN32 AND XRT_HAVE_D3D12)
 			aux_util
 			aux_os
 			aux_math
+			# #918 D12-3: aux_d3d supplies the scanout-adapter resolver, and
+			# comp_xbridge is the cross-adapter atlas transport. Same two
+			# dependencies the D3D11 compositor takes, for the same reason —
+			# the bridge is a standalone unit precisely so each compositor can
+			# link it without dragging the other one in.
+			aux_d3d
+			comp_xbridge
 			xrt-external-stb
 			d3d12
 			dxgi
