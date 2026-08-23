@@ -177,12 +177,18 @@ enum comp_split_ingress_policy
  * inputs are on one adapter and its target on the other. Retires the split for
  * the session rather than draw a half-split frame.
  *
- * **Narrowed by #918 D12-4** and left deliberately generic. It covered zones,
- * Local2D and authored masks on the D3D12 leg while that leg was
- * projection-only; the plane transports moved zones and Local2D out of it, and
- * an app-authored mask now carries @ref COMP_SPLIT_REASON_AUTHORED_MASK instead.
- * Nothing on the D3D12 leg emits this token today — it stays because the token
- * set is the support-facing vocabulary and other legs may still reach it.
+ * **RETIRED as an emitted token by #918 D12-4, and kept on purpose.** It was the
+ * D3D12 leg's blanket refusal while that leg was projection-only, covering zones,
+ * Local2D and authored masks alike. The plane transports moved zones and Local2D
+ * out of it, and an app-authored mask now carries
+ * @ref COMP_SPLIT_REASON_AUTHORED_MASK. NOTHING emits this today.
+ *
+ * Do not delete it as an unused macro. This token set is the support-facing
+ * vocabulary for the `weave placement:` line, and field logs from builds before
+ * D12-4 still carry this string — its meaning has to stay written down somewhere
+ * a support case can find it. It is also the right token for any future leg whose
+ * transport genuinely cannot move a frame's layers, which is a different
+ * statement from "this leg has not implemented the mask plane yet".
  */
 #define COMP_SPLIT_REASON_LAYERS_UNSUPPORTED "layers_unsupported"
 /*!
