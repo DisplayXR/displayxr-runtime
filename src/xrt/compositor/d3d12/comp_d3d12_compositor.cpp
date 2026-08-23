@@ -237,6 +237,25 @@ struct comp_d3d12_compositor
 	bool local2d_plane_warned;
 
 	/*!
+	 * #918 D12-5 — the app-authored (Tier-3) mask's transport state, written by
+	 * the ONE per-frame publisher (@ref d3d12_bind_mask_plane) and read by
+	 * everything that consumes an authored mask under the split.
+	 *
+	 * @ref mask_plane_live is "this frame's authoritative authored mask is
+	 * riding @ref COMP_XBRIDGE_PLANE_MASK". @ref mask_plane_gen is the mask
+	 * OBJECT generation it is riding for, so a session that hands the single
+	 * plane two different masks cannot have one of them consume the other's
+	 * pixels — the pointer alone is not enough, because a freed mask's address
+	 * can be recycled.
+	 * @{
+	 */
+	bool mask_plane_live;
+	uint64_t mask_plane_gen;
+	//! Monotonic source of @ref comp_d3d12_zone_mask::res_gen. Never reset.
+	uint64_t zone_mask_gen_next;
+	/*! @} */
+
+	/*!
 	 * #918 D12-4 — the mask raster the CONSUME half owes, captured at DEPOSIT.
 	 *
 	 * THE ORDERING THIS EXISTS FOR, because it is the one thing the D3D11 leg
@@ -684,6 +703,16 @@ static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
 // near the bottom; called after each path's fence wait in layer_commit.
 static bool d3d12_zone_dp_supported(struct comp_d3d12_compositor *c);
 static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
+// #918 D12-5 — the app-authored (Tier-3) mask's bridge transport. Defined with
+// the zone helpers near the bottom; both are called from layer_commit's DP+target
+// path above them, and only from there (see d3d12_bind_mask_plane).
+struct comp_d3d12_zone_mask;
+static struct comp_d3d12_zone_mask *
+d3d12_frame_authored_mask(struct comp_d3d12_compositor *c);
+static bool
+d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask);
+static void
+d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask);
 // #740 diagnostic (DXR_PHASE_DEBUG=1): dump the geometry that seeds the weave
 // interlace phase, to localize the position/size-dependent phase offset.
 static void d3d12_phase_debug_dump(struct comp_d3d12_compositor *c, const char *where);
@@ -1241,6 +1270,11 @@ d3d12_release_out_device_masks(struct comp_d3d12_compositor *c)
 {
 	c->zone_publish_res = nullptr;
 	c->repaint.mask_res = nullptr;
+	// #918 D12-5: the authored mask's transport is bridge-scoped, and the bridge
+	// goes with the placement. A retire re-resolves it on the app device, where
+	// `mask->staged` is simply read directly.
+	c->mask_plane_live = false;
+	c->mask_plane_gen = 0;
 	if (c->implicit_mask_staged != nullptr) {
 		c->implicit_mask_staged->Release();
 		c->implicit_mask_staged = nullptr;
@@ -1322,28 +1356,28 @@ d3d12_split_release_out(struct comp_d3d12_compositor *c)
  * #918 D12-3 — retire the split for the rest of the session and put the weave
  * back on the app device.
  *
- * WHY THIS EXISTS RATHER THAN A PER-FRAME DEGRADE. This rung transports the
- * ATLAS, the two 2D PLANES and — after D12-4 — nothing else. What is left
- * un-transportable is the Tier-3 APP-AUTHORED zone mask: the application draws
- * its pixels into a texture of its own on the render adapter, and the bridge's
- * mask plane is not wired to it yet (that is D12-5). So a frame with an authored
- * mask still has a composite input on the app device and a composite target on
- * the scanout device, and there is no honest frame to draw. The two dishonest
- * options are both worse than this: presenting the weave without its 2D regions
- * is a silent visual regression, and half-splitting the frame is the class of bug
- * #918's whole recipe/slot machinery exists to prevent.
+ * WHY THIS EXISTS RATHER THAN A PER-FRAME DEGRADE. A frame whose composite has an
+ * input on the app device and a target on the scanout device has no honest
+ * version to draw. The two dishonest options are both worse than this: presenting
+ * the weave without its 2D regions is a silent visual regression, and
+ * half-splitting the frame is the class of bug #918's whole recipe/slot machinery
+ * exists to prevent.
  *
  * So the session goes back to the single-adapter path — target, display
  * processor, HUD staging, DP crop and the composite's own mask rasters all
  * rebuilt on the app device — and stays there. Once, guarded by `split_active`.
  *
- * **D12-4 NARROWED THIS, it did not delete it.** Zones and Local2D no longer
- * reach here at all: their planes cross with the atlas, their masks rebuild
- * output-side, and their composite runs on the scanout adapter. What still
- * retires keeps its OWN token (@ref COMP_SPLIT_REASON_AUTHORED_MASK) rather than
- * the generic @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED, so a support case can
- * tell "this build does not transport an authored mask yet" from "you are reading
- * an old build".
+ * **D12-4 NARROWED THIS AND D12-5 NARROWED IT AGAIN, neither deleted it.** D12-4
+ * moved zones and Local2D out: their planes cross with the atlas, their masks
+ * rebuild output-side, and their composite runs on the scanout adapter. D12-5
+ * moved the last one out — the Tier-3 APP-AUTHORED mask, whose pixels the
+ * application draws into a texture of its own on the render adapter, now crosses
+ * as @ref COMP_XBRIDGE_PLANE_MASK. So the PRESENCE of an authored mask no longer
+ * retires anything; only a mask whose plane this MACHINE could not allocate does,
+ * and it keeps the same @ref COMP_SPLIT_REASON_AUTHORED_MASK token because the
+ * token names what the session lost. A support case can still tell that apart
+ * from the generic @ref COMP_SPLIT_REASON_LAYERS_UNSUPPORTED, which from a D3D12
+ * session means an old build.
  *
  * THE SECOND TRIGGER is a display processor that DECLINES a weaver on the
  * scanout adapter (ADR-037 §3a). Same recovery, same reason it is a recovery
@@ -1380,9 +1414,8 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
 	}
 
 	U_LOG_W(
-	    "#918 output-device split RETIRED (%s) — that input lives on the app device and the composite's "
-	    "target is on the scanout one; moving the weave back to the app adapter for the rest of the "
-	    "session (#918 D12-4)",
+	    "#918 output-device split RETIRED (%s) — moving the weave back to the app adapter for the rest of "
+	    "the session (#918 D12-5)",
 	    why);
 
 	/*
@@ -3664,7 +3697,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// — "any zone active => request 3D" once on the rising edge, no forced
 	// 2D on the falling edge.
 	/*
-	 * #918 D12-4 — THE FALLBACK TRIGGER, and the earliest point it can be made.
+	 * #918 D12-5 — THE AUTHORED MASK'S TRANSPORT, and the last fallback trigger.
 	 *
 	 * The scan above is the frame's one coherent answer to "does this frame
 	 * composite?". D12-3 retired the split for ANY compositing frame, because the
@@ -3675,17 +3708,27 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * avatar sample (zones + a Local2D band, auto wish) needs to see any benefit
 	 * from the split at all.
 	 *
-	 * WHAT IS LEFT is the Tier-3 APP-AUTHORED mask. Its pixels are drawn by the
-	 * application into a texture on the RENDER adapter, so it is a genuine
-	 * transport gap rather than a device-placement one, and closing it means
-	 * wiring COMP_XBRIDGE_PLANE_MASK plus the authored wish publish — D12-5. It
-	 * keeps its own reason token so it cannot be mistaken for the old blanket
-	 * refusal; see d3d12_split_retire.
+	 * **D12-5 CLOSED THE LAST ONE.** The Tier-3 APP-AUTHORED mask — pixels the
+	 * application draws into a texture of its own on the RENDER adapter — now
+	 * crosses as COMP_XBRIDGE_PLANE_MASK, so "this frame has an authored mask" is
+	 * no longer a reason to retire anything. What remains is the honest residue:
+	 * a mask whose plane the machine could not ALLOCATE (an R8 cross-adapter heap
+	 * the stack refuses, or an egress the driver will not share). That keeps the
+	 * SAME token, because the token names the thing the session lost, not the
+	 * line of ours that noticed — and there is no half-measure available: the
+	 * D3D12 leg has no output-device shadow to fall back on the way the D3D11 one
+	 * does, so the choice is the app device or wrong pixels.
 	 *
-	 * Before any of this frame's work is recorded, and under c->mutex.
+	 * THE BIND IS MADE HERE, before any of this frame's work is recorded and under
+	 * c->mutex, precisely because its failure branch is this retire — which
+	 * quiesces both devices and rebuilds the target, and so cannot be taken from
+	 * the middle of a recorded frame. Binding records nothing; the frame's staging
+	 * happens later, in the deposit half (@ref d3d12_stage_mask_plane).
 	 */
-	if (c->split_active && (c->active_zone_mask != nullptr || c->frame_wish != nullptr)) {
-		d3d12_split_retire(c, "the frame carries an app-authored zone mask", COMP_SPLIT_REASON_AUTHORED_MASK);
+	struct comp_d3d12_zone_mask *const authored_mask = d3d12_frame_authored_mask(c);
+	if (c->split_active && !d3d12_bind_mask_plane(c, authored_mask)) {
+		d3d12_split_retire(c, "the app-authored zone mask could not be transported to the scanout adapter",
+		                   COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
 
 	if (c->zones_frame && !c->zones_mode_requested && !d3d12_zone_dp_supported(c)) {
@@ -3695,10 +3738,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->zones_mode_requested = false;
 	}
 
-	// Reset this frame's resolved wish source — d3d12_update_zone_wish_state
-	// sets it in zones frames; a stale pointer from an earlier frame must
-	// never publish. (zone_publish_w/h persist as the previous raster's dims
-	// for the auto-wish seq dirty-check.)
+	// Reset this frame's resolved wish source — d3d12_note_auto_wish_publish
+	// sets it in zones frames, from d3d12_update_zone_wish_state off the split
+	// and from the consume half's out-device raster under it (#1175). A stale
+	// pointer from an earlier frame must never publish. (zone_publish_w/h persist
+	// as the previous raster's dims for the auto-wish seq dirty-check.)
 	c->zone_publish_res = nullptr;
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
@@ -4244,6 +4288,19 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
+		/*
+		 * #918 D12-5 — stage the authored-mask plane ONCE per frame, BEFORE the
+		 * deposit half asks anything about it. This is the only site that stages
+		 * PLANE_MASK, and it deliberately does not depend on whether the plane's
+		 * pixels have landed: the frame that authors a mask transports it, and
+		 * consumption starts on whichever later frame the slot lands.
+		 *
+		 * `authored_mask` was resolved and BOUND at the top of this function; this
+		 * records the frame-wish snapshot onto the still-open app list and hands
+		 * the bridge the content generation.
+		 */
+		d3d12_stage_mask_plane(c, authored_mask);
+
 		// #875 DEPOSIT half: mask resolve + Local2D flatten, recorded into the
 		// list that is closed/executed/synced immediately below.
 		const bool deposited = d3d12_composite_zone_mask(
@@ -4258,6 +4315,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		 * that could not be bound) must stamp `composite = false` and UN-STAGE the
 		 * Local2D plane, or the consume half reads a slot claiming a composite it
 		 * has no pixels for. Mirrors the D3D11 leg's `!deposited` branch.
+		 *
+		 * #918 D12-5 (the D3D11 leg's #918 review F1) — the MASK plane is
+		 * deliberately NOT un-staged here. It is staged above, before the deposit
+		 * runs, and this branch fires on exactly the frame whose transport the
+		 * NEXT frame needs; reverting it is half of what makes a Tier-3 mask
+		 * unable to bootstrap. Its own publisher un-stages it when the frame
+		 * genuinely has no authored mask.
 		 */
 		if (c->split_active && !deposited && c->xbridge != nullptr) {
 			struct comp_xbridge_recipe r = {};
@@ -4380,6 +4444,27 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// Out scope: pacing behind Present, as in d3d12_dp_weave_and_present.
 			gpu_wait_idle_out(c);
 		}
+
+		/*
+		 * #224 / ADR-027 P4: sideband-sync this client's zone state with the DP.
+		 *
+		 * #1175 — THIS CALL SITE WAS MISSING, and this is the exit an active
+		 * output-device split takes, so the zone wish publish was inert on
+		 * exactly the path #918 built. Both weave branches above end in their own
+		 * fence wait (d3d12_dp_weave_and_present's post-Present gpu_wait_idle_out,
+		 * or the no-atlas branch's), so the resource resolved here is GPU-complete
+		 * — the same publish contract the other two exits satisfy.
+		 *
+		 * The weave, not the deposit, is what has to have finished: under the
+		 * split the auto wish is rastered by the CONSUME half onto the weave list,
+		 * and an authored mask's egress plane is filled by the consumer copy the
+		 * weave took its GPU-side wait on. Publishing before the weave would hand
+		 * the DP a resource nothing had written yet.
+		 *
+		 * A REPAINT never reaches here — the publish is a once-per-app-frame state
+		 * transition, and repaints replay rendering only (#868).
+		 */
+		d3d12_sync_zone_mask_to_dp(c);
 
 		// Post-compose capture (#210) — fully composed atlas as DP saw it.
 		// DP path returns early; mirror the fallback path's call site so the
@@ -5347,6 +5432,32 @@ struct comp_d3d12_zone_mask
 	uint32_t w, h;
 	//! True once submitted at least once (an unsubmitted mask is invisible).
 	bool submitted;
+	/*!
+	 * #918 D12-5 — the CONTENT generation of @ref staged, bumped by every
+	 * authoring op that can change what a later stage copies into it.
+	 *
+	 * This is the bridge plane's change-skip key, so it is deliberately
+	 * CONSERVATIVE: Tier-1/2 write @ref tex and only a submit (or a zones
+	 * frame's wish stage) reaches @ref staged, so a `set_rects` with no submit
+	 * behind it bumps a generation whose pixels did not move. That costs one
+	 * R8 copy the bridge could have skipped. The opposite error — a mask whose
+	 * pixels changed under an unchanged seq — is a silently wrong weave, and
+	 * the two are not comparable.
+	 */
+	uint64_t author_seq;
+	/*!
+	 * #918 D12-5 — this mask OBJECT's generation, fixed at create from
+	 * @ref comp_d3d12_compositor::zone_mask_gen_next.
+	 *
+	 * The D3D12 mask never reallocates its resources, so this is not the
+	 * "realloc counter" @ref comp_xbridge_bind_plane_resource documents for the
+	 * 2D scratches — it is the OBJECT identity that a recycled address cannot
+	 * forge. Binding compares pointer AND generation, which is exactly the trap
+	 * `comp_xbridge_set_source`'s `source_key` exists for: destroy a mask,
+	 * create another, and the allocator can hand back the same address for
+	 * genuinely different pixels.
+	 */
+	uint64_t res_gen;
 };
 
 // #224 / ADR-027 hardware-DP zone leg (P4) — one-time DP zone-capability
@@ -5375,14 +5486,255 @@ d3d12_zone_dp_supported(struct comp_d3d12_compositor *c)
 	return c->zone_dp_state == 1;
 }
 
-// Keep the DP's view of this client's zone mask in sync with the
-// compositor's — the D3D12 clone of d3d11_sync_zone_mask_to_dp. Called once
-// per layer_commit AFTER the path's ExecuteCommandLists + fence wait, so
-// whatever staged resource we hand over is GPU-complete and in its steady
-// PIXEL_SHADER_RESOURCE state (the publish contract). Zones frame: the WISH
-// this frame's composite resolved (explicit staged or the auto raster);
-// legacy frame: the sticky submitted mask. No resolvable source drives the
-// clear-on-deactivate edge, once. Caller holds c->mutex.
+/*!
+ * Record @p mask's authoring texture into its staged snapshot on @p list.
+ *
+ * The ONE place the tex(RENDER_TARGET) -> staged(PIXEL_SHADER_RESOURCE) copy is
+ * written. Every consumer reads `staged` and never `tex` — the composite, the DP
+ * publish, and since #918 D12-5 the bridge's mask plane — so in-progress Tier-3
+ * drawing can never tear into a frame. Caller holds c->mutex.
+ */
+static void
+d3d12_zone_mask_snapshot(struct comp_d3d12_zone_mask *mask, ID3D12GraphicsCommandList *list)
+{
+	if (mask == nullptr || mask->tex == nullptr || mask->staged == nullptr || list == nullptr) {
+		return;
+	}
+	D3D12_RESOURCE_BARRIER to_copy[2] = {};
+	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[0].Transition.pResource = mask->tex;
+	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	to_copy[1].Transition.pResource = mask->staged;
+	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	list->ResourceBarrier(2, to_copy);
+
+	list->CopyResource(mask->staged, mask->tex);
+
+	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
+	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
+	list->ResourceBarrier(2, to_copy);
+}
+
+/*!
+ * #918 D12-5 — the frame's AUTHORITATIVE app-authored mask, or NULL.
+ *
+ * A zones frame's is its explicit frame wish; a legacy frame's is the sticky
+ * submitted mask. They are mutually exclusive by construction, and that is
+ * exactly why the single authored-mask plane needs one arbiter rather than two
+ * independent binders (the D3D11 leg's #918 review D6, ported).
+ *
+ * Caller holds c->mutex, and @ref comp_d3d12_compositor::zones_frame must
+ * already be resolved for this frame.
+ */
+static struct comp_d3d12_zone_mask *
+d3d12_frame_authored_mask(struct comp_d3d12_compositor *c)
+{
+	if (c->zones_frame) {
+		struct comp_d3d12_zone_mask *fw = c->frame_wish;
+		return (fw != nullptr && fw->tex != nullptr && fw->staged != nullptr) ? fw : nullptr;
+	}
+	struct comp_d3d12_zone_mask *m = c->active_zone_mask;
+	return (m != nullptr && m->submitted && m->staged != nullptr) ? m : nullptr;
+}
+
+/*!
+ * #918 D12-5 — bind @p mask's staged snapshot as the bridge's MASK plane source.
+ *
+ * THE TRANSPORT DECISION, AND WHY IT IS MADE HERE. This runs at the TOP of
+ * layer_commit, before a single command of the frame is recorded, because its
+ * failure branch is a RETIRE and a retire quiesces both devices and rebuilds the
+ * target — which cannot be done half way through a recorded frame. Nothing here
+ * records: a bind is an allocation plus an AddRef.
+ *
+ * Sized at the MASK, never the panel (#918 review F5). Both consumers stretch the
+ * whole mask over the composite region — the shader gives t1 no uv scale at all
+ * (see comp_d3d12_outcomp) and the DP publish declares the mask's own dims — so a
+ * panel-sized plane would leave both sampling a never-written band.
+ *
+ * @return false ONLY when @p mask is non-NULL and its plane could not be bound.
+ *         A frame with no authored mask returns true, having declared the plane
+ *         not live.
+ */
+static bool
+d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
+{
+	if (!c->split_active || c->xbridge == nullptr) {
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return true;
+	}
+	if (mask == nullptr) {
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return true;
+	}
+	/*
+	 * A dims change rebuilds the plane's chain and drains the consumer fence
+	 * inside the bridge — a bounded CPU wait, reached here from the app's own
+	 * render thread. It is an ON-CHANGE event (the app created a
+	 * differently-sized mask), never a per-frame one: the steady-state call is
+	 * the pointer+generation early-out in comp_xbridge_bind_plane_resource. The
+	 * authoring entry points that produce such a mask already drain the app
+	 * queue outright (d3d12_zone_cmd_execute), so this adds no new class of
+	 * wait to the leg.
+	 */
+	if (!comp_xbridge_bind_plane_resource(c->xbridge, COMP_XBRIDGE_PLANE_MASK, mask->staged, mask->res_gen,
+	                                      (uint32_t)DXGI_FORMAT_R8_UNORM, mask->w, mask->h)) {
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		return false;
+	}
+	c->mask_plane_live = true;
+	c->mask_plane_gen = mask->res_gen;
+	return true;
+}
+
+/*!
+ * #918 D12-5 — stage the MASK plane's content for the next submit, and refresh
+ * the snapshot the plane transports. The ONE site that stages PLANE_MASK.
+ *
+ * DEPOSIT, NOT CONSUME — and for this plane the reason is the opposite of the
+ * mask RASTER's. A raster is CPU rects in, so it is built where it is consumed
+ * (the output device, in the consume half, on the weave list). An authored mask
+ * is PIXELS THE APP DREW on the render adapter: the only device that can read
+ * them is the app's, the only list that reaches the producer's copy in time is
+ * the app list, and both are the deposit half's. The consume half then merely
+ * SAMPLES the egress resource the bridge landed beside this slot's atlas.
+ *
+ * Two properties this ordering buys, neither of which survived being folded into
+ * the composite (the D3D11 leg's #918 review D6/F1, and the same trap here):
+ *
+ *  1. **One producer.** Binding one plane from two sites with two generations
+ *     re-opens it on alternating frames, each re-open a full re-transport.
+ *  2. **Staging does not depend on consumption.** The transport is set up before
+ *     anything asks whether the plane's pixels have landed — so the frame that
+ *     authors a mask transports it, and consumption starts on whichever later
+ *     frame the slot lands. Gating this on the composite instead is what makes a
+ *     Tier-3 mask unable to bootstrap: no deposit, no recipe, no transport, no
+ *     mask next frame either, for ever.
+ *
+ * Caller holds c->mutex and has the app command list OPEN.
+ */
+static void
+d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
+{
+	if (!c->split_active || c->xbridge == nullptr) {
+		return;
+	}
+	if (mask == nullptr || !c->mask_plane_live) {
+		// 0 is the bridge's "this frame does not use the plane" — the recipe
+		// then stamps it invalid instead of lending an older frame's pixels.
+		comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		return;
+	}
+
+	/*
+	 * Refresh the snapshot the plane carries. A SUBMITTED sticky mask already
+	 * staged itself in zone_mask_submit; a zones frame's explicit wish did not,
+	 * because the entry point that hands it in only stores a pointer
+	 * (comp_d3d12_compositor_zones_set_frame_wish) and the frame path that
+	 * normally stages it — d3d12_update_zone_wish_state — is exactly the
+	 * function the split does not run (the consume half rasters on the out
+	 * device instead; #1175). So it is staged HERE, on the app list, before the
+	 * submit that transports it.
+	 *
+	 * Ordering against the producer's in-flight read is comp_xbridge_pre_render's
+	 * back-fence, which layer_commit already took for everything it writes this
+	 * frame. The out-of-band twin — an authoring call that stages OUTSIDE
+	 * layer_commit — takes comp_xbridge_pre_plane_write itself.
+	 */
+	if (c->zones_frame) {
+		d3d12_zone_mask_snapshot(mask, c->cmd_list);
+		// P4 publish generation: bump on a SOURCE change (a different mask
+		// object), the same rule d3d12_update_zone_wish_state applies off the
+		// split. The authored pixels' own changes ride author_seq below.
+		if (c->zone_frame_wish_last != mask) {
+			c->zone_frame_wish_last = mask;
+			c->zone_publish_seq++;
+		}
+	}
+
+	/*
+	 * Content generation, unique across mask OBJECTS as well as across authoring
+	 * calls on one: a session can hand this single plane two different masks, and
+	 * two masks both at author_seq 1 must not look like the same pixels.
+	 */
+	uint64_t seq = 1469598103934665603ull;
+	seq = (seq ^ mask->res_gen) * 1099511628211ull;
+	seq = (seq ^ mask->author_seq) * 1099511628211ull;
+	if (seq == 0) {
+		seq = 1; // 0 is reserved for "this frame does not use the plane"
+	}
+	comp_xbridge_stage_plane(c->xbridge, COMP_XBRIDGE_PLANE_MASK, seq, 0, 0, mask->w, mask->h);
+}
+
+/*!
+ * #918 D12-5 — @p mask's pixels ON THE DEVICE THE DISPLAY PROCESSOR LIVES ON.
+ *
+ * Off the split that is the app-device staged snapshot, verbatim. Under the split
+ * the DP was created on the SCANOUT device (see d3d12_make_dp), so handing it an
+ * app-device resource would be a cross-device pointer the vendor plug-in cannot
+ * sample — the mask has to come off the bridge, from the slot the weave settled
+ * on, seq-tested against that slot's own recipe (#918 review F3).
+ *
+ * The plane is allocated at exactly (mask->w, mask->h), so the publish's declared
+ * dims describe the egress resource verbatim and there is no rescale here.
+ *
+ * @return NULL when the mask's pixels have not landed on the DP's device yet.
+ *         That is a NORMAL transient under the split, never a withdrawal — see
+ *         the have_content rule in d3d12_sync_zone_mask_to_dp.
+ */
+static ID3D12Resource *
+d3d12_zone_mask_publish_res(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
+{
+	if (mask == nullptr) {
+		return nullptr;
+	}
+	if (!c->split_active) {
+		return mask->staged;
+	}
+	if (!c->mask_plane_live || c->mask_plane_gen != mask->res_gen || c->xbridge == nullptr) {
+		return nullptr;
+	}
+	const int32_t slot = comp_xbridge_get_weave_slot(c->xbridge);
+	struct comp_xbridge_recipe rec = {};
+	if (slot < 0 || !comp_xbridge_slot_recipe(c->xbridge, slot, &rec) ||
+	    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
+		return nullptr;
+	}
+	return static_cast<ID3D12Resource *>(comp_xbridge_get_plane_resource(c->xbridge, slot, COMP_XBRIDGE_PLANE_MASK,
+	                                                                     rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
+}
+
+/*!
+ * Keep the DP's view of this client's zone mask in sync with the compositor's —
+ * the D3D12 clone of d3d11_sync_zone_mask_to_dp. Zones frame: the WISH (the app's
+ * explicit one, or the auto raster); legacy frame: the sticky submitted mask.
+ * Caller holds c->mutex.
+ *
+ * **Called once per layer_commit, from EACH of its three exits**, always AFTER
+ * that path's ExecuteCommandLists + fence wait, so the resource handed over is
+ * GPU-complete and in its steady PIXEL_SHADER_RESOURCE state — that is the
+ * publish contract, and it is why this is not simply hoisted to the top of
+ * layer_commit the way the D3D11 leg's twin is (D3D11 records onto an immediate
+ * context, where "recorded" and "submitted" are the same instant).
+ *
+ * #1175 — THE DP+TARGET EXIT USED TO BE MISSING, and it is the one an active
+ * output-device split takes. The wish publish was therefore inert on exactly the
+ * path #918 built, so a transported mask would have crossed the adapter
+ * boundary correctly and then reached nothing. The wish IS the weave mask; a
+ * dropped publish is not a cosmetic loss. Do not remove any of the three.
+ *
+ * #918 D12-5 — under the split the display processor was created on the SCANOUT
+ * device, so every resource published from here has to be one of ITS: the auto
+ * raster is already rastered there by the consume half, and an authored mask
+ * comes off the bridge (@ref d3d12_zone_mask_publish_res).
+ */
 static void
 d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 {
@@ -5393,20 +5745,49 @@ d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c)
 	ID3D12Resource *res = nullptr;
 	uint32_t mask_w = 0;
 	uint32_t mask_h = 0;
+	/*
+	 * #918 D12-5 (the D3D12 twin of the D3D11 leg's #918 review F9) — does this
+	 * frame HAVE published content at all, per the authoritative CPU-side state?
+	 * That question, and only that question, decides whether a CLEAR is right.
+	 * Whether the content's PIXELS have finished crossing the bridge is a
+	 * transient that decides nothing: an authored mask's plane lands a frame
+	 * behind the call that authored it, and a slot-less frame (#918 F4) resolves
+	 * nothing at all. Clearing on those tells the DP the app withdrew its mask
+	 * and then republished it — a clear/republish cycle at frame rate, which is a
+	 * visible 2D/3D flicker rather than a degradation.
+	 */
+	bool have_content = false;
 	if (c->zones_frame) {
-		res = c->zone_publish_res;
-		mask_w = c->zone_publish_w;
-		mask_h = c->zone_publish_h;
+		// A zones frame always has a wish: the app's explicit one, or the auto
+		// union of its zone rects. Both are content; only which one varies.
+		have_content = true;
+		struct comp_d3d12_zone_mask *fw = c->frame_wish;
+		if (fw != nullptr) {
+			// An explicit wish that has not landed must NOT silently fall back
+			// to the auto raster — that publishes different geometry for one
+			// frame, which is a flicker, not a degradation.
+			res = d3d12_zone_mask_publish_res(c, fw);
+			mask_w = fw->w;
+			mask_h = fw->h;
+		} else {
+			res = c->zone_publish_res;
+			mask_w = c->zone_publish_w;
+			mask_h = c->zone_publish_h;
+		}
 	} else {
 		struct comp_d3d12_zone_mask *mask = c->active_zone_mask;
-		if (mask != nullptr && mask->submitted && mask->staged != nullptr) {
-			res = mask->staged;
+		have_content = (mask != nullptr && mask->submitted && mask->staged != nullptr);
+		if (have_content) {
+			res = d3d12_zone_mask_publish_res(c, mask);
 			mask_w = mask->w;
 			mask_h = mask->h;
 		}
 	}
 
 	if (res == nullptr) {
+		if (have_content) {
+			return; // not landed yet — keep the DP's previous publish, retry next frame
+		}
 		if (c->zone_published) {
 			xrt_display_processor_d3d12_clear_local_zone_mask(c->display_processor);
 			c->zone_published = false;
@@ -5448,6 +5829,9 @@ d3d12_release_zone_state(struct comp_d3d12_compositor *c)
 	c->zone_frame_wish_last = nullptr;
 	c->zone_publish_res = nullptr;
 	c->zones_frame = false;
+	// #918 D12-5 — the authored mask's plane borrow.
+	c->mask_plane_live = false;
+	c->mask_plane_gen = 0;
 	if (c->weave_scratch != nullptr) {
 		c->weave_scratch->Release();
 		c->weave_scratch = nullptr;
@@ -6183,6 +6567,51 @@ d3d12_update_zone_feather_mask(struct comp_d3d12_compositor *c,
 	return c->feather_mask_staged;
 }
 
+/*!
+ * #224 / ADR-027 P4 — note the AUTO wish raster as this frame's published wish
+ * source, bumping the content generation only when the geometry actually changed
+ * (the raster re-records every zones frame, but an identical rect set at
+ * identical dims is identical content, and a vendor treats a new seq as new
+ * pixels to upload).
+ *
+ * #1175 — extracted from @ref d3d12_update_zone_wish_state so the OUTPUT-DEVICE
+ * raster can note it too. Under the split that function never runs: the consume
+ * half rasters directly on the out device (see d3d12_composite_zone_mask), so
+ * without this the split's published wish source was never set and the publish
+ * was inert even once its call site existed. Both sites must agree on what "the
+ * wish changed" means, or the seq the DP sees lies about the pixels.
+ */
+static void
+d3d12_note_auto_wish_publish(struct comp_d3d12_compositor *c,
+                             ID3D12Resource *staged,
+                             const struct xrt_rect *rects,
+                             uint32_t rect_count,
+                             uint32_t region_w,
+                             uint32_t region_h)
+{
+	if (staged == nullptr) {
+		return;
+	}
+	bool wish_dirty = c->zone_frame_wish_last != nullptr || c->zone_wish_rect_count != rect_count ||
+	                  c->zone_publish_w != region_w || c->zone_publish_h != region_h;
+	for (uint32_t i = 0; !wish_dirty && i < rect_count; i++) {
+		if (memcmp(&c->zone_wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			wish_dirty = true;
+		}
+	}
+	if (wish_dirty) {
+		c->zone_frame_wish_last = nullptr;
+		if (rect_count > 0) {
+			memcpy(c->zone_wish_rects, rects, sizeof(rects[0]) * rect_count);
+		}
+		c->zone_wish_rect_count = rect_count;
+		c->zone_publish_seq++;
+	}
+	c->zone_publish_res = staged;
+	c->zone_publish_w = region_w;
+	c->zone_publish_h = region_h;
+}
+
 // Resolve the zones frame's wish/composite state (called from the composite,
 // mid-recording; caller holds c->mutex). The BINARY auto raster is ALWAYS
 // maintained and returned — it is the MODE_ZONES composite's weave gate
@@ -6217,25 +6646,10 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c,
 
 		// tex steady RENDER_TARGET, staged steady PIXEL_SHADER_RESOURCE
 		// (see comp_d3d12_zone_mask) — same dance as zone_mask_submit,
-		// recorded into the open frame cmd list.
-		D3D12_RESOURCE_BARRIER to_copy[2] = {};
-		to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		to_copy[0].Transition.pResource = fw->tex;
-		to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-		to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		to_copy[1].Transition.pResource = fw->staged;
-		to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-		to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-		to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		list->ResourceBarrier(2, to_copy);
-
-		list->CopyResource(fw->staged, fw->tex);
-
-		std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
-		std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-		list->ResourceBarrier(2, to_copy);
+		// recorded into the open frame cmd list. Under the split the SAME
+		// snapshot is taken by d3d12_stage_mask_plane instead, on the app list,
+		// because this function does not run there (#1175).
+		d3d12_zone_mask_snapshot(fw, list);
 
 		// P4 publish source + seq: the staged explicit wish. Bump the
 		// generation on a source change (pointer flip; D3D12 masks carry
@@ -6253,28 +6667,7 @@ d3d12_update_zone_wish_state(struct comp_d3d12_compositor *c,
 		return staged;
 	}
 
-	if (staged != nullptr) {
-		// P4 publish source + seq: the auto raster. It re-records every
-		// zones frame, but identical rect set + dims = identical content —
-		// bump the generation only when something actually changed (or the
-		// source flipped explicit -> auto).
-		bool wish_dirty = c->zone_frame_wish_last != nullptr || c->zone_wish_rect_count != rect_count ||
-		                  c->zone_publish_w != region_w || c->zone_publish_h != region_h;
-		for (uint32_t i = 0; !wish_dirty && i < rect_count; i++) {
-			if (memcmp(&c->zone_wish_rects[i], &rects[i], sizeof(rects[i])) != 0) {
-				wish_dirty = true;
-			}
-		}
-		if (wish_dirty) {
-			c->zone_frame_wish_last = nullptr;
-			memcpy(c->zone_wish_rects, rects, sizeof(rects[0]) * rect_count);
-			c->zone_wish_rect_count = rect_count;
-			c->zone_publish_seq++;
-		}
-		c->zone_publish_res = staged;
-		c->zone_publish_w = region_w;
-		c->zone_publish_h = region_h;
-	}
+	d3d12_note_auto_wish_publish(c, staged, rects, rect_count, region_w, region_h);
 	return staged;
 }
 
@@ -6930,14 +7323,19 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 * point in layer_commit — it is Reset AFTER this half runs. The consume
 		 * half records the raster from what is captured here.
 		 *
-		 * An app-authored (Tier-3) mask never reaches this branch: it retires the
-		 * split at the top of layer_commit, with its own reason token (D12-5 is
-		 * where it gets a transport).
+		 * #918 D12-5 — AN APP-AUTHORED (Tier-3) MASK CAPTURES NOTHING HERE, and
+		 * that asymmetry is the point. A raster is CPU rects in, so it is built
+		 * where it is consumed; an authored mask is pixels the app DREW on the
+		 * render adapter, so it is TRANSPORTED instead — bound and staged as
+		 * COMP_XBRIDGE_PLANE_MASK by d3d12_stage_mask_plane, which ran before
+		 * this half, on the app list, with the app device in hand. The recipe
+		 * stamp below records which of the two this frame's composite gets.
 		 */
 		c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
 		c->out_mask_req.count = 0;
 		c->out_mask_req.w = region_w;
 		c->out_mask_req.h = region_h;
+		const bool bridged_authored = have_explicit && c->mask_plane_live;
 		if (zones_frame) {
 			c->out_mask_req.kind = any_feather ? D3D12_OUT_MASK_ZONE_FEATHER : D3D12_OUT_MASK_ZONE_BINARY;
 			c->out_mask_req.count = zcount;
@@ -6945,6 +7343,10 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 				c->out_mask_req.rects[i] = zrects[i];
 				c->out_mask_req.feather[i] = zfeather[i];
 			}
+		} else if (bridged_authored) {
+			// Nothing to raster: the mask is riding the plane. Falls through to
+			// the plane bind + recipe stamp below with kind == NONE, which is
+			// why the guard that follows exempts it rather than bailing.
 		} else if (have_local_2d) {
 			uint32_t rect_count = 0;
 			for (uint32_t i = 0; i < c->layer_accum.layer_count && rect_count < XRT_MAX_LAYERS; i++) {
@@ -6959,7 +7361,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			c->out_mask_req.kind = D3D12_OUT_MASK_IMPLICIT;
 			c->out_mask_req.count = rect_count;
 		}
-		if (c->out_mask_req.kind == D3D12_OUT_MASK_NONE || c->out_mask_req.count == 0) {
+		if (!bridged_authored && (c->out_mask_req.kind == D3D12_OUT_MASK_NONE || c->out_mask_req.count == 0)) {
 			ZC_BAIL("g4");
 		}
 	} else if (split_consume) {
@@ -6977,8 +7379,32 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 * A REPAINT does not raster. Rastering re-runs a once-per-app-frame state
 		 * machine at panel rate, which is the #868 rule; it composites from the
 		 * resource the last app frame's consume half produced.
+		 *
+		 * #918 D12-5 — AND SOME MASKS ARE NOT RASTERED AT ALL. An app-authored
+		 * (Tier-3) mask's pixels were drawn by the application on the render
+		 * adapter, so the deposit half bound and staged them as
+		 * COMP_XBRIDGE_PLANE_MASK and this half only SAMPLES the egress resource
+		 * that landed beside this slot's atlas. Which of the two kinds this frame
+		 * gets comes FROM THE SLOT'S RECIPE, never from live CPU state — a mask a
+		 * later frame authored must not be composited over these pixels.
 		 */
-		if (!is_repaint && c->out_mask_req.kind != D3D12_OUT_MASK_NONE) {
+		if (rec.mask_kind == COMP_XBRIDGE_MASK_PLANE) {
+			if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
+				ZC_BAIL("mask_plane_invalid");
+			}
+			/*
+			 * Resolved from the SLOT on repaints too, rather than cached in
+			 * repaint.mask_res: a repaint re-weaves the slot the last app frame
+			 * wove (comp_xbridge_get_weave_slot), so the same call returns the
+			 * same resource under the same seq test — and a cached pointer would
+			 * be the one thing that could outlive its seq.
+			 */
+			mask_res = static_cast<ID3D12Resource *>(comp_xbridge_get_plane_resource(
+			    c->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
+			if (mask_res == nullptr) {
+				ZC_BAIL("mask_plane_stale");
+			}
+		} else if (!is_repaint && c->out_mask_req.kind != D3D12_OUT_MASK_NONE) {
 			ID3D12Device *odev = d3d12_out_device(c);
 			ID3D12GraphicsCommandList *olist = d3d12_weave_list(c);
 			ID3D12Resource *r = nullptr;
@@ -6988,8 +7414,23 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 				r = d3d12_update_implicit_mask(c, odev, olist, c->out_mask_req.rects,
 				                               c->out_mask_req.count, mw, mh);
 			} else {
-				r = d3d12_update_zone_wish_mask(c, odev, olist, c->out_mask_req.rects,
-				                                c->out_mask_req.count, mw, mh);
+				ID3D12Resource *binary = d3d12_update_zone_wish_mask(
+				    c, odev, olist, c->out_mask_req.rects, c->out_mask_req.count, mw, mh);
+				r = binary;
+				/*
+				 * #1175 — THE PUBLISHED WISH, on the path an active split
+				 * takes. Off the split d3d12_update_zone_wish_state does this;
+				 * that function never runs here, so without this line the
+				 * split's wish source stayed NULL and the publish had nothing
+				 * to hand the DP. The BINARY raster, never the feather one:
+				 * cosmetics never enter the wish (#803). Skipped when the app
+				 * supplied an explicit wish — that publishes verbatim off the
+				 * mask plane, and must not silently fall back to this geometry.
+				 */
+				if (c->frame_wish == nullptr) {
+					d3d12_note_auto_wish_publish(c, binary, c->out_mask_req.rects,
+					                             c->out_mask_req.count, mw, mh);
+				}
 				if (c->out_mask_req.kind == D3D12_OUT_MASK_ZONE_FEATHER) {
 					ID3D12Resource *fres = d3d12_update_zone_feather_mask(
 					    c, odev, olist, c->out_mask_req.rects, c->out_mask_req.feather,
@@ -7002,8 +7443,14 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			if (r != nullptr) {
 				c->repaint.mask_res = r;
 			}
+			mask_res = c->repaint.mask_res;
+		} else {
+			// A repaint, or a frame whose deposit half requested no raster:
+			// composite from the resource the last app frame's consume half
+			// produced. Only ever an OUT-DEVICE RASTER — a transported mask is
+			// resolved from the slot above, on every frame kind.
+			mask_res = c->repaint.mask_res;
 		}
-		mask_res = c->repaint.mask_res;
 	} else if (reuse_mask) {
 		/*
 		 * A repaint replays RENDERING, never STATE TRANSITIONS.
@@ -7174,9 +7621,21 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			// frame's recipe.
 			struct comp_xbridge_recipe r = {};
 			r.composite = true;
-			// D12-4 transports no authored mask, so every mask under the split is
-			// an output-device raster. D12-5 makes this conditional.
-			r.mask_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
+			/*
+			 * #918 D12-5 — WHICH KIND OF MASK THIS SLOT'S COMPOSITE GETS, decided
+			 * here and read from the slot there. D12-4 stamped OUT_RASTER
+			 * unconditionally because it transported no authored mask at all.
+			 *
+			 * Only a LEGACY frame's sticky authored mask rides the plane as a
+			 * composite input. A ZONES frame's explicit wish deliberately does
+			 * not: per ADR-027/#801 the wish is HARDWARE-only, so the composite's
+			 * gate there is always the binary zone raster and the wish's own
+			 * pixels reach the display processor through the publish instead —
+			 * which is why the plane is still bound and staged for a zones frame
+			 * even though this stamps OUT_RASTER.
+			 */
+			r.mask_kind = (have_explicit && c->mask_plane_live) ? COMP_XBRIDGE_MASK_PLANE
+			                                                    : COMP_XBRIDGE_MASK_OUT_RASTER;
 			r.region_w = region_w;
 			r.region_h = region_h;
 			if (zones_frame) {
@@ -7443,6 +7902,10 @@ comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 	}
 	mask->w = w;
 	mask->h = h;
+	// #918 D12-5 — the object identity the bridge binds against, and the first
+	// content generation. Both monotonic; see comp_d3d12_zone_mask.
+	mask->res_gen = ++c->zone_mask_gen_next;
+	mask->author_seq = 1;
 
 	// Authoring texture: committed R8_UNORM render target, steady state
 	// RENDER_TARGET, optimized clear = all-3D (matches the default fill).
@@ -7505,25 +7968,10 @@ comp_d3d12_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, ui
 	d3d12_zone_cmd_begin(c);
 	const float all_3d[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 	c->cmd_list->ClearRenderTargetView(mask->rtv_heap->GetCPUDescriptorHandleForHeapStart(), all_3d, 0, nullptr);
-
-	D3D12_RESOURCE_BARRIER to_copy[2] = {};
-	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[0].Transition.pResource = mask->tex;
-	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[1].Transition.pResource = mask->staged;
-	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, to_copy);
-
-	c->cmd_list->CopyResource(mask->staged, mask->tex);
-
-	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
-	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	// No comp_xbridge_pre_plane_write here: a mask this call is still building
+	// cannot be the plane's bound source, so there is no in-flight producer read
+	// of it to order behind.
+	d3d12_zone_mask_snapshot(mask, c->cmd_list);
 	d3d12_zone_cmd_execute(c);
 
 	// One-off lifecycle event (WARN per the debug-logging convention so it
@@ -7549,6 +7997,7 @@ comp_d3d12_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_
 	const float m[4] = {enable_3d ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
 	c->cmd_list->ClearRenderTargetView(mask->rtv_heap->GetCPUDescriptorHandleForHeapStart(), m, 0, nullptr);
 	d3d12_zone_cmd_execute(c);
+	mask->author_seq++; // #918 D12-5 — see comp_d3d12_zone_mask::author_seq
 	return XRT_SUCCESS;
 }
 
@@ -7614,6 +8063,7 @@ comp_d3d12_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 		c->cmd_list->ClearRenderTargetView(rtv, all_3d, n, drs);
 	}
 	d3d12_zone_cmd_execute(c);
+	mask->author_seq++; // #918 D12-5 — see comp_d3d12_zone_mask::author_seq
 
 	free(drs);
 	return XRT_SUCCESS;
@@ -7641,6 +8091,14 @@ comp_d3d12_compositor_zone_mask_acquire_rt(
 	*out_resource = mask->tex;
 	*out_w = mask->w;
 	*out_h = mask->h;
+	/*
+	 * #918 D12-5 — the app is about to draw pixels the runtime will never see
+	 * being drawn, so THIS is the honest hook for "the authored content changed":
+	 * a Tier-3 app makes no other runtime call between acquiring the target and
+	 * submitting. The submit that follows bumps it again, which is one redundant
+	 * transport at worst and never a stale one.
+	 */
+	mask->author_seq++;
 	return XRT_SUCCESS;
 }
 
@@ -7663,27 +8121,23 @@ comp_d3d12_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr
 	// authoring the app already submitted (no fence — same queue).
 	d3d12_zone_cmd_begin(c);
 
-	D3D12_RESOURCE_BARRIER to_copy[2] = {};
-	to_copy[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[0].Transition.pResource = mask->tex;
-	to_copy[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	to_copy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	to_copy[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	to_copy[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	to_copy[1].Transition.pResource = mask->staged;
-	to_copy[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	to_copy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	to_copy[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	c->cmd_list->ResourceBarrier(2, to_copy);
-
-	c->cmd_list->CopyResource(mask->staged, mask->tex);
-
-	std::swap(to_copy[0].Transition.StateBefore, to_copy[0].Transition.StateAfter);
-	std::swap(to_copy[1].Transition.StateBefore, to_copy[1].Transition.StateAfter);
-	c->cmd_list->ResourceBarrier(2, to_copy);
+	/*
+	 * #918 D12-5 (the D3D11 leg's #918 review, R1-adjacent) — `mask->staged` is a
+	 * bridge PLANE SOURCE the producer reads directly, and this write runs from an
+	 * OpenXR entry point of the app's, BEFORE layer_commit and therefore before
+	 * the frame's comp_xbridge_pre_render back-fence. Nothing else orders it
+	 * against the producer's in-flight read of the previous seq. Same fence, same
+	 * mechanism, applied at the write instead — GPU-side on the app queue, so this
+	 * thread does not block, and it must precede the ExecuteCommandLists below.
+	 */
+	if (c->split_active && c->xbridge != nullptr) {
+		comp_xbridge_pre_plane_write(c->xbridge, COMP_XBRIDGE_PLANE_MASK);
+	}
+	d3d12_zone_mask_snapshot(mask, c->cmd_list);
 	d3d12_zone_cmd_execute(c);
 
 	mask->submitted = true;
+	mask->author_seq++; // #918 D12-5 — staged now holds new pixels
 	c->active_zone_mask = mask;
 	c->zone_publish_seq++; // #224 P4: new content generation for the DP publish
 	return XRT_SUCCESS;
@@ -7703,7 +8157,8 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	if (c->frame_wish == mask) {
 		c->frame_wish = nullptr;
 	}
-	if (c->active_zone_mask == mask) {
+	const bool was_active = c->active_zone_mask == mask;
+	if (was_active) {
 		c->active_zone_mask = nullptr; // revert to full-weave behavior
 	}
 	// #224 P4: drop the seq-dedup cache (pointer may be reused by a future
@@ -7713,6 +8168,29 @@ comp_d3d12_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mask_pt
 	}
 	if (c->zone_publish_res == mask->staged) {
 		c->zone_publish_res = nullptr;
+	}
+	if (was_active) {
+		// #224 / #1175: withdraw this client's DP zone contribution NOW. The
+		// session may never commit another frame (a teardown-path destroy), and
+		// the per-frame sync would then leave the panel pinned by a dead client.
+		// The CPU-side state above already says the mask is gone, so the resolve
+		// comes back empty and this takes the clear edge exactly once.
+		d3d12_sync_zone_mask_to_dp(c);
+	}
+	/*
+	 * #918 D12-5: the bridge's producer may be reading mask->staged as the
+	 * authored-mask plane source. Drop the binding BEFORE releasing the texture
+	 * under it — fence-deferred, so this costs no wait.
+	 *
+	 * Only when the plane is bound to THIS mask (`res_gen` is unique per mask
+	 * object, so the test is exact). Without that, destroying any other mask
+	 * would unbind the live one and cost a full re-transport for nothing.
+	 */
+	if (c->split_active && c->xbridge != nullptr && c->mask_plane_gen == mask->res_gen) {
+		comp_xbridge_bind_plane_resource(c->xbridge, COMP_XBRIDGE_PLANE_MASK, nullptr, 0,
+		                                 (uint32_t)DXGI_FORMAT_R8_UNORM, 0, 0);
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
 	}
 	// The frame that might still reference these resources has fence-waited
 	// before layer_commit returned (the mutex we hold serializes us behind
