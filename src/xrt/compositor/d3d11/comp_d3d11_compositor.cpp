@@ -105,15 +105,25 @@ DEBUG_GET_ONCE_BOOL_OPTION(present_opaque_comp, "DXR_PRESENT_OPAQUE", false)
  * #918 output-device split. On a non-MUX hybrid the panel is scanned out by the
  * iGPU while the app renders on the dGPU, so today's placement pays ~42 ms of
  * present-to-display and re-crosses the whole woven frame on every repaint tick
- * (docs/investigations/hybrid-igpu-weave.md). Opting in moves the target, the
+ * (docs/investigations/hybrid-igpu-weave.md). The split moves the target, the
  * display processor, the HUD and the repaint loop onto the SCANOUT adapter and
  * ships only the atlas across, once per app frame.
  *
- * Prototype, off by default. Silent no-op when the scanout adapter IS the app's
- * adapter; any setup failure falls back to the stock single-device path with one
- * WARN naming the reason — it must never brick a session.
+ * **DEFAULT ON since #918 Phase 3** (ADR-037 §1): the split is not a mode to opt
+ * into, it is what the placement rule degenerates to whenever render and scanout
+ * differ. `DXR_WEAVE_ON_SCANOUT=0` is the kill switch; `=1` still works and is
+ * now a no-op restatement of the default.
+ *
+ * Silent no-op when the scanout adapter IS the app's adapter; any setup failure
+ * falls back to the stock single-device path with one WARN naming the reason —
+ * it must never brick a session.
+ *
+ * NOTE the parser: `DEBUG_GET_ONCE_BOOL_OPTION` uses `debug_string_to_bool`,
+ * which is NOT the leading-character test `comp_split_gate_env_requested` uses.
+ * The two still disagree on non-boolean values, exactly as D12-0 left them; only
+ * the DEFAULT flipped here (see comp_split_gate.h).
  */
-DEBUG_GET_ONCE_BOOL_OPTION(weave_on_scanout, "DXR_WEAVE_ON_SCANOUT", false)
+DEBUG_GET_ONCE_BOOL_OPTION(weave_on_scanout, "DXR_WEAVE_ON_SCANOUT", true)
 
 struct comp_d3d11_compositor
 {

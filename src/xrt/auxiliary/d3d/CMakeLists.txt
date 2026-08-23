@@ -12,6 +12,8 @@ add_library(
 	d3d_scanout_helpers.cpp
 	d3d_scanout_helpers.h
 	d3d_scanout_helpers.hpp
+	d3d_weave_placement.cpp
+	d3d_weave_placement.h
 	)
 # user32: MonitorFromPoint / GetMonitorInfoW / QueryDisplayConfig, used by the
 # scanout-adapter resolver. Linked explicitly rather than leaning on MSVC's
