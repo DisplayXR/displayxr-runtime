@@ -78,6 +78,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <deque>
@@ -10391,6 +10392,19 @@ dxr_split_cover_note(struct d3d11_service_system *sys,
 	static uint32_t n = 0;
 	static int64_t last_ns = 0;
 	static uint32_t c_full = 0, c_part = 0, c_none = 0, c_pre = 0, c_post = 0, c_in = 0, c_ticks = 0;
+	/*
+	 * #918: the window's weave→scanout residuals, so a HEALTHY run says what R
+	 * was. R used to appear only on the black-burst START/END lines, i.e.
+	 * exactly when the run was broken — a passing arm printed no latency at
+	 * all and every measurement needed an offline join against the per-client
+	 * CSV. Percentiles, not a mean, because p50/p95 is how R is quoted
+	 * everywhere else and a mean here would silently be a different metric.
+	 * Zero means "not measured this tick" (no weave, or a chain with no
+	 * present-completion signal) and is excluded rather than averaged in as a
+	 * fast frame.
+	 */
+	static uint32_t r_us_ring[256] = {};
+	static uint32_t r_n = 0;
 
 	/* One char per tick, most informative thing first:
 	 *   'B' the frame we are about to PRESENT is black, and so was its input
@@ -10417,6 +10431,13 @@ dxr_split_cover_note(struct d3d11_service_system *sys,
 	c_pre += pre_black ? 1u : 0u;
 	c_post += post_black ? 1u : 0u;
 	c_in += in_black ? 1u : 0u;
+	if (r_ns != 0) {
+		// Keeps the LAST 256 of the window; at 60 Hz a 10 s window holds ~600
+		// ticks, so this is a tail sample, not the whole window. Said plainly
+		// in the emit below via r_n rather than implied.
+		r_us_ring[r_n % 256u] = (uint32_t)(r_ns / 1000u);
+		r_n++;
+	}
 
 	/* Burst edges, with wall-clock deltas — the PERIOD is what identifies the
 	 * thing driving this, and a 1 Hz histogram cannot resolve it. */
@@ -10459,12 +10480,25 @@ dxr_split_cover_note(struct d3d11_service_system *sys,
 		out[i] = ring[(n - len + i) % 120u];
 	}
 	out[len] = '\0';
+	// R percentiles over the window's sampled residuals. r_n is the SAMPLE
+	// count, not the tick count: 0 means nothing wove with a measurable
+	// residual, and the percentiles then read 0.00 — unambiguous together.
+	double r_p50_ms = 0.0, r_p95_ms = 0.0;
+	const uint32_t r_len = r_n < 256u ? r_n : 256u;
+	if (r_len > 0) {
+		uint32_t sorted[256];
+		memcpy(sorted, r_us_ring, r_len * sizeof(sorted[0]));
+		std::sort(sorted, sorted + r_len);
+		r_p50_ms = (double)sorted[(size_t)(r_len - 1) / 2] / 1000.0;
+		r_p95_ms = (double)sorted[(size_t)((r_len - 1) * 95) / 100] / 1000.0;
+	}
 	U_LOG_W(
-	    "[COVER] split=%d tracking=%d ticks=%u full=%u partial=%u none=%u pre_black=%u post_black=%u in_black=%u | "
-	    "%s",
+	    "[COVER] split=%d tracking=%d ticks=%u full=%u partial=%u none=%u pre_black=%u post_black=%u in_black=%u "
+	    "r_p50=%.2f r_p95=%.2f r_n=%u | %s",
 	    (int)(sys != nullptr && sys->split_active), is_tracking, c_ticks, c_full, c_part, c_none, c_pre, c_post,
-	    c_in, out);
+	    c_in, r_p50_ms, r_p95_ms, r_len, out);
 	c_ticks = c_full = c_part = c_none = c_pre = c_post = c_in = 0;
+	r_n = 0;
 }
 
 /*!
