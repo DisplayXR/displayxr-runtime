@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Embedded HLSL for the masked 2D-over-3D composite (D3D11).
+ * @brief  Embedded HLSL for the masked 2D-over-3D composite (D3D11 + D3D12).
  * @author David Fattal
- * @ingroup comp_d3d11
+ * @ingroup comp_util
  *
- * INTERNAL to the D3D11 compositor library — not part of any public interface.
+ * INTERNAL to the native D3D compositor libraries — not part of any public
+ * interface.
  *
  * The masked composite is compiled per DEVICE, and #918 Phase 2 gives the
  * compositor two of them (the app device and, under the output-device split,
@@ -15,8 +16,17 @@
  * weave one device's frames with a different shader than the other's, which is
  * exactly the class of bug the split cannot afford.
  *
- * Keep byte-aligned with the reference `shaders/masked_composite.hlsl` (that
- * file documents the pass; these strings are what actually compiles).
+ * #918 D12-1 widened that "second consumer" from a second DEVICE to a second
+ * GRAPHICS API: comp_d3d12_outcomp is the D3D12 twin of comp_d3d11_outcomp and
+ * compiles these same strings. The HLSL is API-agnostic (SM 5.0, t0..t2 / s0 /
+ * b0, no D3D11-only construct), so the twin is a shader REUSE, not a port —
+ * which is what makes "the two APIs composite identically" checkable by
+ * inspection instead of by pixel diff. Hence the API-neutral home: a
+ * `comp_d3d11_*` name for a file D3D12 also compiles would be exactly the
+ * prefix pun D12-0 removed.
+ *
+ * Keep byte-aligned with the reference `../d3d11/shaders/masked_composite.hlsl`
+ * (that file documents the pass; these strings are what actually compiles).
  */
 
 #pragma once

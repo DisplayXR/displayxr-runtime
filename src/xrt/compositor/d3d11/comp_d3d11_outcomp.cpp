@@ -18,7 +18,7 @@
  */
 
 #include "comp_d3d11_outcomp.h"
-#include "comp_d3d11_composite_shaders.h"
+#include "d3d_shared/comp_masked_composite_shaders.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -34,8 +34,8 @@
 /*!
  * Masked 2D-over-3D composite constant buffer (unified-2d-3d-compositing #439,
  * Phase 0). Matches `cbuffer CompositeParams : register(b0)` in
- * comp_d3d11_composite_shaders.h / shaders/masked_composite.hlsl. 64 bytes;
- * HLSL packs as four float4 rows with no straddle (dst_dims.xy |
+ * d3d_shared/comp_masked_composite_shaders.h / shaders/masked_composite.hlsl.
+ * 64 bytes; HLSL packs as four float4 rows with no straddle (dst_dims.xy |
  * canvas_origin.xy , canvas_size.xy | mask | mode , opaque_present | pad0 |
  * twod_uv_scale.xy , weave_uv_scale.xy | pad) — note the deliberate `pad0`,
  * which is what keeps `twod_uv_scale` from straddling a 16-byte boundary.
