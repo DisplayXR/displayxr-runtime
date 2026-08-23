@@ -285,6 +285,7 @@ compositor_init_vulkan(struct null_compositor *c)
 	    .client_gpu_index = -1,                                   // Auto
 	    .timeline_semaphore = true,                               // Flag is optional, not a hard requirement.
 	    .scanout_adapter_luid = c->settings.scanout_adapter_luid, // 0 unless resolved, #918
+	    .render_adapter_luid = c->settings.render_adapter_luid,   // 0 unless resolved, ADR-037 §2
 	};
 
 	struct comp_vulkan_results vk_res = {0};
@@ -992,7 +993,7 @@ xrt_result_t
 null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_compositor **out_xsysc)
 {
 	// Use default dimensions (0, 0) and default refresh rate (0 = 20 FPS)
-	return null_compositor_create_system_with_dims(xdev, 0, 0, 0.0f, 0, out_xsysc);
+	return null_compositor_create_system_with_dims(xdev, 0, 0, 0.0f, 0, 0, out_xsysc);
 }
 
 xrt_result_t
@@ -1001,6 +1002,7 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
                                         uint32_t recommended_height,
                                         float refresh_rate_hz,
                                         uint64_t scanout_adapter_luid,
+                                        uint64_t render_adapter_luid,
                                         struct xrt_system_compositor **out_xsysc)
 {
 	struct null_compositor *c = U_TYPED_CALLOC(struct null_compositor);
@@ -1018,6 +1020,7 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	c->base.base.base.request_display_refresh_rate = null_compositor_request_display_refresh_rate;
 	c->settings.log_level = debug_get_log_option_log();
 	c->settings.scanout_adapter_luid = scanout_adapter_luid;
+	c->settings.render_adapter_luid = render_adapter_luid;
 	c->frame.waited.id = -1;
 	c->frame.rendering.id = -1;
 

@@ -584,6 +584,15 @@ struct vk_bundle
 	// before device selection; 0 = unknown / not resolved. Read only by
 	// DXR_VK_FORCE_GPU=scanout — every other selection path ignores it.
 	uint64_t scanout_adapter_luid;
+
+	// ADR-037 §2 / #918 — appended for the same append-only reason as the
+	// fields above. Packed LUID (same packing as the field above) of the
+	// adapter the runtime's capability ranking chose to RENDER on. Written by
+	// the layer that owns the panel rect and DXGI, before device selection;
+	// 0 = unknown / not resolved, and selection then falls back to the local
+	// device-type priority. This is the ranking, not a hard constraint: it can
+	// only pick among the physical devices Vulkan actually enumerated.
+	uint64_t render_adapter_luid;
 };
 
 struct vk_buffer
