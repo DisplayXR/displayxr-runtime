@@ -39,6 +39,7 @@
 
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "d3d/d3d_dxgi_formats.h"
+#include "d3d/d3d_render_adapter.hpp"
 #include "d3d/d3d_scanout_helpers.hpp"
 
 // #918 Phase 2b: the cross-adapter atlas transport, shared with the in-process
@@ -22142,26 +22143,102 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	wil::com_ptr<ID3D11Device> device_base;
 	wil::com_ptr<ID3D11DeviceContext> context_base;
 
-	// Pin the service to the high-performance (discrete) GPU on hybrid laptops.
-	// IPC shared textures cannot bridge two physical adapters, so picking dGPU
-	// here keeps both the compositor and any well-behaved client (which honours
-	// the LUID we publish below) on the same GPU.
+	/*
+	 * The service's INGEST device (ADR-037 §2 + §7, #1153).
+	 *
+	 * This is the device clients' shared textures land on, so its adapter is
+	 * the one §7 says client and service must share — and the LUID published
+	 * as `client_d3d_deviceLUID` a few lines below is exactly this adapter.
+	 *
+	 * It used to be `EnumAdapterByGpuPreference(0, HIGH_PERFORMANCE)`. That is
+	 * DXGI's policy, not ours: it cannot express §2's capability ranking, a
+	 * per-app `UserGpuPreferences` entry silently reorders it, and — the
+	 * reason #1153 exists — it left no way to point ingest at the scanout
+	 * adapter, so the all-on-scanout arm of the §7 / Open-Q1 crossover was
+	 * unbuildable for the service family. The shared resolver answers both
+	 * halves: the ranking AND the `DXR_D3D_FORCE_GPU` override channel §4
+	 * sanctions. Nothing about the ranking or the override is re-derived here.
+	 */
 	wil::com_ptr<IDXGIAdapter> preferred_adapter;
 	{
-		wil::com_ptr<IDXGIFactory6> factory6;
-		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory6.put()))) && factory6) {
-			wil::com_ptr<IDXGIAdapter1> high_perf;
-			if (SUCCEEDED(factory6->EnumAdapterByGpuPreference(
-			        0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
-			        IID_PPV_ARGS(high_perf.put())))) {
-				DXGI_ADAPTER_DESC1 desc1{};
-				if (SUCCEEDED(high_perf->GetDesc1(&desc1)) &&
-				    (desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
-					preferred_adapter = high_perf;
-					U_LOG_W("D3D11 service: preferring high-performance adapter '%ls'",
-					        desc1.Description);
+		/*
+		 * Panel rect. Only `DXR_D3D_FORCE_GPU=scanout` reads it. The extent
+		 * comes from the device; the ORIGIN is still the pre-DP zero (the real
+		 * one arrives with the first display processor, which needs a window,
+		 * which needs a client), and 0,0 + MONITOR_DEFAULTTONEAREST resolves to
+		 * the primary monitor — which is the monitor the service's DP is
+		 * created for. Same reasoning and same limitation as
+		 * service_split_stage_a(), deliberately spelled the same way.
+		 */
+		const uint32_t panel_w = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t panel_h = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].h_pixels : 0;
+
+		xrt::auxiliary::d3d::RenderAdapterChoice ingest = xrt::auxiliary::d3d::getRenderAdapter(
+		    sys->base.info.display_screen_left, sys->base.info.display_screen_top, panel_w, panel_h,
+		    D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
+
+		/*
+		 * Assert §2's answer against the preference this site used to hardcode
+		 * rather than assuming the two agree. On the reference box they do; a
+		 * box where they diverge then SAYS so instead of silently moving where
+		 * the service ingests. The resolver makes the same assertion for its
+		 * ranked path, but only once per process and never when the override
+		 * answered — and the override arm is precisely when a divergence is
+		 * expected and has to be legible.
+		 */
+		DXGI_ADAPTER_DESC hp_desc{};
+		bool have_hp = false;
+		{
+			wil::com_ptr<IDXGIFactory6> factory6;
+			if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory6.put()))) && factory6) {
+				wil::com_ptr<IDXGIAdapter> high_perf;
+				if (SUCCEEDED(factory6->EnumAdapterByGpuPreference(
+				        0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(high_perf.put()))) &&
+				    high_perf) {
+					have_hp = SUCCEEDED(high_perf->GetDesc(&hp_desc));
 				}
 			}
+		}
+
+		DXGI_ADAPTER_DESC idesc{};
+		if (ingest.adapter != nullptr && SUCCEEDED(ingest.adapter->GetDesc(&idesc))) {
+			preferred_adapter = ingest.adapter;
+		}
+
+		if (preferred_adapter) {
+			const bool same = have_hp && hp_desc.AdapterLuid.HighPart == idesc.AdapterLuid.HighPart &&
+			                  hp_desc.AdapterLuid.LowPart == idesc.AdapterLuid.LowPart;
+			U_LOG_W(
+			    "ADR-037 service ingest adapter: '%ls' LUID=%08lx:%08lx (%s); DXGI "
+			    "HIGH_PERFORMANCE picks '%ls' — %s (#1153)",
+			    idesc.Description, (unsigned long)idesc.AdapterLuid.HighPart,
+			    (unsigned long)idesc.AdapterLuid.LowPart, ingest.provenance,
+			    have_hp ? hp_desc.Description : L"<unavailable>",
+			    same ? "MATCH" : (have_hp ? "DIVERGES" : "unverified"));
+
+			if (ingest.from_env) {
+				/*
+				 * Loud, and it PROCEEDS. Ingest is the one device that must
+				 * share an adapter with clients, so forcing it (to `scanout`,
+				 * say) while the clients stay on the render adapter is a
+				 * deliberately cross-adapter configuration — the third arm of
+				 * the ADR-037 Open-Q1 crossover, which is the measurement
+				 * #1153 unblocks. No eligibility check may refuse it: an
+				 * explicit §4 override outranks the consistency assumption.
+				 */
+				U_LOG_W(
+				    "ADR-037 §7: the service INGEST device was FORCED by DXR_D3D_FORCE_GPU "
+				    "(%s). Clients that do not carry the same override will ingest ACROSS "
+				    "adapters — intended for measurement, proceeding (#1153)",
+				    ingest.provenance);
+			}
+		} else {
+			// DXGI broken, or every adapter excluded. Keep the old last resort
+			// (D3D_DRIVER_TYPE_HARDWARE, below) rather than failing the service.
+			U_LOG_W(
+			    "ADR-037 service ingest adapter: UNRESOLVED (%s) — falling back to "
+			    "D3D_DRIVER_TYPE_HARDWARE (#1153)",
+			    ingest.provenance);
 		}
 	}
 

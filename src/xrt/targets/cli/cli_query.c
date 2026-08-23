@@ -46,6 +46,7 @@
 #include <stdlib.h>  // getenv (DXR_WEAVE_ON_SCANOUT)
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "d3d/d3d_scanout_helpers.h" // panel rect -> scanout adapter LUID (#918)
+#include "d3d/d3d_render_adapter.h"  // ADR-037 §2 resolver — the service's ingest adapter (#1153)
 #endif
 
 
@@ -153,6 +154,10 @@ pack_luid(LUID luid)
 	return packed;
 }
 
+//! Defined with the serializers below; the probe composes a LUID-bearing line too.
+static const char *
+luid_label(uint64_t packed, char *buf, size_t cap);
+
 /*!
  * #918 Phase 2b PR 6 — the SERVICE output-device split, stated from the two
  * inputs this process can legitimately see.
@@ -191,6 +196,64 @@ describe_service_split(struct cli_query_result *r)
 }
 
 /*!
+ * ADR-037 §7 / #1153 — which adapter the service will create its INGEST device
+ * on, resolved with the same `d3d_render_adapter` unit the service itself calls.
+ *
+ * Unlike the split line above, this is not a "would" statement: the resolver is
+ * deterministic and reads the same environment the service reads, so running it
+ * here answers the question exactly. That matters most for the override arm —
+ * `DXR_D3D_FORCE_GPU=scanout` deliberately puts ingest on a different adapter
+ * from the clients, and being able to confirm the override took effect BEFORE
+ * starting the service is what makes the arm buildable.
+ *
+ * @param panel_left/@param panel_top/@param panel_w/@param panel_h The panel
+ *        rect, consulted only by the `scanout` keyword (zeroes are fine).
+ */
+static void
+describe_service_ingest(
+    struct cli_query_result *r, int32_t panel_left, int32_t panel_top, uint32_t panel_w, uint32_t panel_h)
+{
+	uint64_t luid = 0;
+	const char *provenance = NULL;
+	if (!d3d_render_adapter_luid(panel_left, panel_top, panel_w, panel_h, &luid, &provenance)) {
+		snprintf(r->gpu_service_ingest, sizeof(r->gpu_service_ingest),
+		         "service ingest: UNRESOLVED — the service would fall back to D3D_DRIVER_TYPE_HARDWARE");
+		return;
+	}
+
+	r->gpu_ingest_resolved = true;
+	r->gpu_ingest_luid = luid;
+	snprintf(r->gpu_ingest_provenance, sizeof(r->gpu_ingest_provenance), "%s",
+	         provenance != NULL ? provenance : "unknown");
+	for (uint32_t a = 0; a < r->gpu_adapter_count; a++) {
+		if (r->gpu_adapters[a].luid == luid) {
+			snprintf(r->gpu_ingest_name, sizeof(r->gpu_ingest_name), "%s", r->gpu_adapters[a].name);
+			break;
+		}
+	}
+
+	/*
+	 * The forced case is called out because it is the one configuration in
+	 * which ingest may legitimately NOT be the adapter the clients are on.
+	 *
+	 * "Was it forced" is read off the PROVENANCE, never off getenv: the
+	 * resolver ignores a value it cannot parse (and a stray trailing space is
+	 * enough — observed while testing this line), and a report that says
+	 * "FORCED" for an override that did not take is worse than no report.
+	 */
+	const char *force = getenv("DXR_D3D_FORCE_GPU");
+	const bool env_set = force != NULL && force[0] != '\0';
+	const bool honoured = strncmp(r->gpu_ingest_provenance, "env-forced", 10) == 0;
+	char lb[32];
+	snprintf(r->gpu_service_ingest, sizeof(r->gpu_service_ingest),
+	         "service ingest: '%s' LUID=%s (%s) — the adapter clients must share (ADR-037 §7)%s%s%s",
+	         r->gpu_ingest_name[0] != '\0' ? r->gpu_ingest_name : "<not enumerated>",
+	         luid_label(luid, lb, sizeof(lb)), r->gpu_ingest_provenance, env_set ? "; DXR_D3D_FORCE_GPU=" : "",
+	         env_set ? force : "",
+	         !env_set ? "" : (honoured ? " HONOURED" : " set but NOT honoured — see the resolver's WARN"));
+}
+
+/*!
  * #918 — GPU topology. Enumerates the hardware adapters, names the one that
  * scans out the 3D panel, names the one the runtime would suggest to render
  * on, and states whether the weave-on-scanout split has anything to do on this
@@ -223,6 +286,8 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 		snprintf(r->gpu_note, sizeof(r->gpu_note), "DXGI factory unavailable — adapters not enumerated");
 		snprintf(r->gpu_verdict, sizeof(r->gpu_verdict),
 		         "weave-on-scanout topology: unknown (DXGI factory unavailable)");
+		snprintf(r->gpu_service_ingest, sizeof(r->gpu_service_ingest),
+		         "service ingest: unknown (DXGI factory unavailable)");
 		return;
 	}
 
@@ -258,6 +323,13 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 		IDXGIAdapter1_Release(adapter);
 	}
 	IDXGIFactory1_Release(factory);
+
+	// #1153 — resolved HERE, above every remaining early return, so the ingest
+	// line survives an unresolvable panel rect: the ranking needs nothing but
+	// DXGI, and only the `scanout` keyword degrades without the rect.
+	describe_service_ingest(
+	    r, info != NULL ? info->display_screen_left : 0, info != NULL ? info->display_screen_top : 0,
+	    info != NULL ? info->display_pixel_width : 0, info != NULL ? info->display_pixel_height : 0);
 
 	// The panel's scanout adapter, from the plug-in's own panel rect.
 	uint64_t scanout_luid = 0;
@@ -648,6 +720,7 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 #else
 	snprintf(r->gpu_verdict, sizeof(r->gpu_verdict), "weave-on-scanout topology: n/a (Windows-only)");
 	snprintf(r->gpu_service_split, sizeof(r->gpu_service_split), "service split: n/a (Windows-only)");
+	snprintf(r->gpu_service_ingest, sizeof(r->gpu_service_ingest), "service ingest: n/a (Windows-only)");
 #endif
 
 	if (!(info.display_width_m > 0.0f) || !(info.display_height_m > 0.0f) || info.display_pixel_width == 0 ||
@@ -882,6 +955,7 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->gpu_verdict);
 		PT("DXR_WEAVE_ON_SCANOUT=%s\n", r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
 		PT("%s\n", r->gpu_service_split);
+		PT("%s\n", r->gpu_service_ingest);
 	}
 
 	P(" :: Input providers (ADR-034)\n");
@@ -1026,6 +1100,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
 		cJSON_AddStringToObject(gt, "service_split", r->gpu_service_split);
 		cJSON_AddStringToObject(gt, "split_ingress", r->gpu_split_ingress);
+		cJSON_AddStringToObject(gt, "service_ingest", r->gpu_service_ingest);
 		if (r->gpu_note[0] != '\0') {
 			cJSON_AddStringToObject(gt, "note", r->gpu_note);
 		}
@@ -1049,6 +1124,16 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		if (r->gpu_render_resolved) {
 			cJSON_AddStringToObject(rn, "name", r->gpu_render_name);
 			cJSON_AddStringToObject(rn, "luid", luid_label(r->gpu_render_luid, lb, sizeof(lb)));
+		}
+		// ADR-037 §7 / #1153 — the service's ingest adapter, as the resolver
+		// answers it in THIS environment (so a DXR_D3D_FORCE_GPU arm is
+		// verifiable without starting the service).
+		cJSON *ig = cJSON_AddObjectToObject(gt, "service_ingest_adapter");
+		cJSON_AddBoolToObject(ig, "resolved", r->gpu_ingest_resolved);
+		if (r->gpu_ingest_resolved) {
+			cJSON_AddStringToObject(ig, "name", r->gpu_ingest_name);
+			cJSON_AddStringToObject(ig, "luid", luid_label(r->gpu_ingest_luid, lb, sizeof(lb)));
+			cJSON_AddStringToObject(ig, "provenance", r->gpu_ingest_provenance);
 		}
 	}
 

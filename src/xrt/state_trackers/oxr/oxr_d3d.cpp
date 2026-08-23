@@ -86,6 +86,31 @@ oxr_d3d_get_requirements(struct oxr_logger *log,
 			have_desc = true;
 			sys->suggested_d3d_luid = desc.AdapterLuid;
 			provenance = choice.provenance;
+			/*
+			 * ADR-037 §7 / #1153: `client_d3d_deviceLUID` is the compositor's
+			 * INGEST adapter, and ingest is the one device that must share an
+			 * adapter with its clients. An override that points this session
+			 * elsewhere is therefore a deliberate cross-adapter configuration
+			 * (the all-on-scanout crossover arm). It is logged LOUDLY and it
+			 * PROCEEDS — the branch order above already makes `from_env`
+			 * outrank the compositor's LUID; this only makes the divergence
+			 * visible instead of silent, so a black session is diagnosable
+			 * from the log rather than from a dump.
+			 */
+			if (sys->xsysc->info.client_d3d_deviceLUID_valid) {
+				const LUID &comp_luid =
+				    reinterpret_cast<const LUID &>(sys->xsysc->info.client_d3d_deviceLUID);
+				if (comp_luid.HighPart != desc.AdapterLuid.HighPart ||
+				    comp_luid.LowPart != desc.AdapterLuid.LowPart) {
+					U_LOG_W(
+					    "DXR_D3D_FORCE_GPU (%s) puts this session on LUID=%08lx:%08lx while the "
+					    "compositor ingests on LUID=%08lx:%08lx — CROSS-ADAPTER by explicit "
+					    "override; proceeding (ADR-037 §4/§7, #1153)",
+					    provenance, (unsigned long)desc.AdapterLuid.HighPart,
+					    (unsigned long)desc.AdapterLuid.LowPart, (unsigned long)comp_luid.HighPart,
+					    (unsigned long)comp_luid.LowPart);
+				}
+			}
 		} else if (sys->xsysc->info.client_d3d_deviceLUID_valid) {
 			sys->suggested_d3d_luid =
 			    reinterpret_cast<const LUID &>(sys->xsysc->info.client_d3d_deviceLUID);

@@ -135,6 +135,19 @@ scaled display. A centre point plus `DEFAULTTONEAREST` tolerates that error.
   `xrGetD3D11/12GraphicsRequirementsKHR` time it is already on `xsysc->info`.
   The resolver forwards `scanout` to `getScanoutAdapter()`, so there is still
   exactly one `QueryDisplayConfig` implementation.
+- **The D3D11 service's own ingest device** — `comp_d3d11_service.cpp`'s
+  `create_system` calls the same `getRenderAdapter()` (#1153), so the service's
+  ingest adapter — the one ADR-037 §7 says clients must share, and the LUID the
+  service publishes as `client_d3d_deviceLUID` — is resolved by the ranking
+  rather than pinned to `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`. **The override
+  reaches it too**, which is what makes an all-on-scanout service arm buildable:
+  `DXR_D3D_FORCE_GPU=scanout` in the *service's* environment moves ingest to the
+  scanout adapter, and if the clients are not forced the same way the
+  configuration is deliberately cross-adapter. That is logged loudly on both
+  sides (`ADR-037 §7: the service INGEST device was FORCED …` in the service
+  log, `CROSS-ADAPTER by explicit override; proceeding` in the client's) and
+  **never blocked** — an explicit §4 override outranks the shared-adapter
+  assumption.
 - **Vulkan** — `env_forced_gpu_index()` lives in `aux_vk`
   (`src/xrt/auxiliary/vk/vk_bundle_init.c`), which can see neither the plug-in
   nor DXGI. So the layer that owns both — `target_instance.c`, which already
@@ -207,7 +220,22 @@ Neither variable has to be *guessed at*. Two places report the answer:
         render (default suggestion): 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00024f0b
         weave-on-scanout topology: APPLIES (render != scanout)
         DXR_WEAVE_ON_SCANOUT=<unset>
+        service split: OFF (DXR_WEAVE_ON_SCANOUT unset — default off through this release)
+        service ingest: 'NVIDIA GeForce RTX 3080 Laptop GPU' LUID=00000000:00024f0b (most VRAM) — the adapter clients must share (ADR-037 §7)
   ```
+
+  The `service ingest` line (#1153) is the one that answers *"where will the
+  service put the device my shared textures have to land on?"* — it runs the
+  same resolver the service runs, in the same environment, so an override arm
+  is verifiable **before** the service is started:
+
+  ```
+        service ingest: 'Intel(R) UHD Graphics' LUID=00000000:00024bbf (env-forced: scanout) — the adapter clients must share (ADR-037 §7); DXR_D3D_FORCE_GPU=scanout HONOURED
+  ```
+
+  `HONOURED` / `set but NOT honoured` is read off the resolver's provenance,
+  not off the environment, so a value the resolver rejected (a stray trailing
+  space is enough) reports as rejected instead of as applied.
 
 - **The session log**, for what a *specific* app actually got. Every D3D11
   session logs exactly one `weave placement:` WARN naming the render adapter,
