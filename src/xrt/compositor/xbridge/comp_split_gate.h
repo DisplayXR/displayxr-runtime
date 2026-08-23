@@ -11,7 +11,9 @@
  * stand it up is not. It is four questions, and every consumer of the bridge
  * asks the same four:
  *
- *   1. Did anyone ASK for the split (`DXR_WEAVE_ON_SCANOUT`)?
+ *   1. Has anyone KILLED the split (`DXR_WEAVE_ON_SCANOUT=0`)? Since #918
+ *      Phase 3 the split is the DEFAULT (ADR-037 §1), so this question is the
+ *      kill switch, not an opt-in.
  *   2. Is this session ELIGIBLE at all? (Each caller has its own list — no
  *      HWND, a shared-texture session, `DXR_LEGACY_STANDALONE`, no panel
  *      dimensions — so the caller passes its verdict in rather than the gate
@@ -75,14 +77,69 @@ enum comp_split_ingress_policy
 
 /*!
  * The gate's answer when it has nothing for the caller to log: either the split
- * was never asked for, or the caller has already logged the situation itself
+ * was killed outright, or the caller has already logged the situation itself
  * (the same-adapter no-op). Distinct from NULL, which means "proceed".
+ *
+ * Note this is the PROSE channel only — @ref comp_split_gate_result::short_reason
+ * is never empty, precisely so that "nothing to say to a human" and "nothing to
+ * report to a support case" stop being the same thing.
  */
 #define COMP_SPLIT_REASON_HANDLED ""
 
-//! The scanout adapter (or the render adapter it is compared against) could not
-//! be resolved, so there is no way to tell whether this session crosses adapters.
-#define COMP_SPLIT_REASON_SCANOUT_UNRESOLVABLE "scanout unresolvable"
+/*!
+ * @name Canonical short reasons (ADR-037 §3)
+ *
+ * ONE snake_case token per fallback rung, so `[RENDER] split=0 reason=<token>`
+ * and the `weave placement:` line always name the same thing and a support case
+ * can be grepped with a fixed string. Never a phrase, never with spaces: the
+ * token is a parse target.
+ *
+ * Since #918 Phase 3 the split is the DEFAULT, so `env_not_requested` — which
+ * used to be the overwhelmingly common answer — is gone. Anything that is not
+ * one of these tokens is a caller-specific detail string and belongs in that
+ * caller's own WARN, with @ref COMP_SPLIT_REASON_STAGE_A_FAILED as the short
+ * form.
+ * @{
+ */
+//! `DXR_WEAVE_ON_SCANOUT=0` (or another false spelling) — the kill switch.
+#define COMP_SPLIT_REASON_KILLED_BY_ENV "killed_by_env"
+//! Render adapter IS the scanout adapter; the split has nothing to do.
+#define COMP_SPLIT_REASON_SAME_ADAPTER "same_adapter"
+//! The scanout adapter could not be resolved, so there is no way to tell
+//! whether this session crosses adapters at all.
+#define COMP_SPLIT_REASON_SCANOUT_UNRESOLVABLE "scanout_unresolvable"
+//! The RENDER adapter could not be identified, so there is nothing to compare
+//! the scanout adapter against. The mirror image of the token above.
+#define COMP_SPLIT_REASON_RENDER_UNRESOLVABLE "render_unresolvable"
+//! No window to present into — an offscreen session.
+#define COMP_SPLIT_REASON_NO_HWND "no_hwnd"
+//! The app owns the present (shared-texture handoff), so the runtime has no
+//! present path to move.
+#define COMP_SPLIT_REASON_SHARED_TEXTURE "shared_texture_session"
+//! The panel extent is unknown, so the scanout adapter cannot be located.
+#define COMP_SPLIT_REASON_NO_PANEL_DIMS "no_panel_dimensions"
+//! `DXR_LEGACY_STANDALONE` — the byte-for-byte pre-#964 A/B reference path.
+#define COMP_SPLIT_REASON_LEGACY_STANDALONE "legacy_standalone"
+/*!
+ * The graphics API this session runs on has no split implementation, so
+ * ADR-037 §3 rung 2 applies: everything on the render adapter. Vulkan and
+ * OpenGL. This is a HONEST NO, not a guess — a path that cannot answer "is the
+ * split implemented for me?" must report this rather than half-engage.
+ */
+#define COMP_SPLIT_REASON_API_UNSUPPORTED "api_unsupported"
+/*!
+ * This presenter is structurally unable to split: the client owns the present
+ * (`CLIENT_TEXTURE`, self-presenting clients), so there is no runtime present
+ * to move to the scanout adapter. ADR-037 §7.
+ */
+#define COMP_SPLIT_REASON_PRESENTER_INELIGIBLE "presenter_ineligible"
+/*!
+ * The gate said proceed and Stage A then failed — device creation, the DXGI
+ * factory, the cross-adapter heap, the egress ring. The specific failure is in
+ * the caller's own WARN immediately above; this is the short form.
+ */
+#define COMP_SPLIT_REASON_STAGE_A_FAILED "stage_a_failed"
+/*! @} */
 
 /*!
  * What the caller knows before the gate decides. Everything here is resolved by
@@ -90,12 +147,17 @@ enum comp_split_ingress_policy
  */
 struct comp_split_gate_inputs
 {
-	//! `DXR_WEAVE_ON_SCANOUT` — see @ref comp_split_gate_env_requested.
+	/*!
+	 * The split has NOT been killed by `DXR_WEAVE_ON_SCANOUT` — see
+	 * @ref comp_split_gate_env_requested. TRUE by default since #918 Phase 3;
+	 * a caller that leaves this false is asking for the kill-switch branch.
+	 */
 	bool requested;
 	/*!
-	 * The caller's own eligibility verdict: a static string naming why this
-	 * session cannot split, or NULL when it can. Checked FIRST, so a caller
-	 * that is ineligible need not resolve any adapter at all.
+	 * The caller's own eligibility verdict: one of the canonical short-reason
+	 * tokens above naming why this session cannot split, or NULL when it can.
+	 * Checked FIRST, so a caller that is ineligible need not resolve any
+	 * adapter at all.
 	 */
 	const char *ineligible_reason;
 	//! The caller resolved the scanout adapter AND read its description.
@@ -136,6 +198,18 @@ struct comp_split_gate_result
 	 * fallback WARN.
 	 */
 	const char *reason;
+	/*!
+	 * The canonical short reason, ALWAYS set when @ref split_active is false and
+	 * always NULL when it is true. Never empty and never a phrase — this is what
+	 * `[RENDER] split=0 reason=` and the `weave placement:` line print, and what
+	 * a support case is grepped for.
+	 *
+	 * Distinct from @ref reason only in the two states the gate reports as flags
+	 * rather than prose (killed by env, same adapter), where @ref reason is
+	 * @ref COMP_SPLIT_REASON_HANDLED because there is nothing for a human to
+	 * read but there is very much something for a log to say.
+	 */
+	const char *short_reason;
 };
 
 /*!
@@ -146,19 +220,42 @@ void
 comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct comp_split_gate_result *out_result);
 
 /*!
- * `DXR_WEAVE_ON_SCANOUT=1` asks for the output-device split. Default OFF for a
- * release cycle (supervisor ruling); #918 Phase 3 owns default-on. Latched on
+ * Is the output-device split allowed to engage? **TRUE by default** since #918
+ * Phase 3 (ADR-037 §1: the split is not a mode to opt into, it is what the
+ * placement rule degenerates to when render and scanout differ). Latched on
  * first call for process lifetime.
  *
+ * `DXR_WEAVE_ON_SCANOUT` is therefore a **kill switch**, not an opt-in:
+ *
+ * | value | meaning |
+ * |---|---|
+ * | unset | split allowed (the default) |
+ * | `0` / `f…` / `F…` / `n…` / `N…` / `off` / `OFF` | split KILLED — old single-adapter behaviour |
+ * | `1` / anything else | split allowed (so every existing `=1` script and doc still works) |
+ *
  * **The in-process D3D11 compositor deliberately does NOT call this.** It reads
- * the same variable through `DEBUG_GET_ONCE_BOOL_OPTION`, whose parse of a
- * non-boolean value differs from this one's leading-character test, and
- * unifying the two is a behaviour change that does not belong in a mechanical
- * refactor. It passes its own answer in as
+ * the same variable through `DEBUG_GET_ONCE_BOOL_OPTION`, and the two parsers
+ * still disagree on non-boolean values — `debug_string_to_bool` matches whole
+ * strings exactly (`"nope"` → true), this one tests the leading character
+ * (`"nope"` → false/killed). D12-0 declined to unify them because that is a
+ * behaviour change; Phase 3 flips the DEFAULT of each in its own idiom and
+ * leaves the disagreement exactly where it was. Both now default to allowed.
+ * The compositor passes its own answer in as
  * @ref comp_split_gate_inputs::requested instead.
  */
 bool
 comp_split_gate_env_requested(void);
+
+/*!
+ * The unlatched parser behind @ref comp_split_gate_env_requested, exposed so the
+ * default flip is unit-testable (the latched wrapper answers once per process
+ * and so can only ever be tested for one value).
+ *
+ * @param value the raw environment value, or NULL when unset.
+ * @return true when the split is allowed.
+ */
+bool
+comp_split_gate_parse_requested(const char *value);
 
 /*!
  * `DXR_TEST_SPLIT_FAIL_STAGEA=1` — testability hook for the fallback matrix.
