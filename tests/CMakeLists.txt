@@ -27,7 +27,7 @@ set(tests
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
-	     tests_comp_xbridge_plane_policy
+	     tests_comp_xbridge_plane_policy tests_comp_split_gate
 		)
 endif()
 if(XRT_HAVE_D3D12)
@@ -100,6 +100,15 @@ if(XRT_HAVE_D3D11)
 	target_include_directories(
 		tests_comp_xbridge_plane_policy PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/xbridge
 		)
+	# #918 Phase 3 — the split's activation decision. Pure C, no device, no
+	# graphics types at all (the reason it was extracted), so the unit links the
+	# gate's own static lib and nothing else.
+	target_include_directories(
+		tests_comp_split_gate PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/xbridge
+		)
+	if(TARGET comp_xbridge)
+		target_link_libraries(tests_comp_split_gate PRIVATE comp_xbridge)
+	endif()
 	# Phase 2 — comp_d3d11_client.cpp now references the
 	# comp_ipc_client_compositor_{get,set}_workspace_sync_fence{,_value}
 	# bridge symbols defined in ipc_client_compositor.c. Add ipc_client to

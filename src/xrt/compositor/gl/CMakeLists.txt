@@ -46,6 +46,11 @@ if(WIN32)
 	target_link_libraries(
 		comp_gl PRIVATE opengl32 d3d11 dxgi dcomp d3dcompiler comp_win32_window
 		)
+	# #918 Phase 3: the canonical `weave placement:` line. aux_d3d is LINKED (the
+	# formatter lives there); comp_xbridge is INCLUDED ONLY — this compositor has
+	# no split, so all it takes from the gate is the reason tokens.
+	target_link_libraries(comp_gl PRIVATE aux_d3d)
+	target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../xbridge)
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
 endif()

@@ -169,6 +169,10 @@ luid_label(uint64_t packed, char *buf, size_t cap);
  * "would it engage, given this environment" is answerable and is the question a
  * bug report needs answered. The wording keeps the distinction visible.
  *
+ * #918 Phase 3 inverted the env's role: it is a KILL SWITCH now, not an opt-in,
+ * so on an ordinary box with no env set the answer is "would engage", and the
+ * interesting bug report is the one where it says KILLED.
+ *
  * The ingress policy (`DXR_SPLIT_INGRESS`) rides along because it is the other
  * env var that changes what the split costs, and reading it from a bug report is
  * how a stray `staged` gets spotted.
@@ -181,17 +185,30 @@ describe_service_split(struct cli_query_result *r)
 	snprintf(r->gpu_split_ingress, sizeof(r->gpu_split_ingress), "%s%s", staged ? "staged" : "adaptive",
 	         (ing != NULL && ing[0] != '\0') ? "" : " (default)");
 
-	const bool flag_on = r->gpu_weave_env_set && r->gpu_weave_env[0] == '1';
-	if (!flag_on) {
+	/*
+	 * #918 Phase 3 — the split is the DEFAULT (ADR-037 §1), so the question this
+	 * answers inverted: not "did someone turn it on" but "did someone turn it
+	 * off". The kill switch is a false spelling of DXR_WEAVE_ON_SCANOUT; every
+	 * other value, including unset, leaves the split allowed.
+	 *
+	 * Mirrors comp_split_gate_parse_requested's leading-character test rather
+	 * than calling it, for the same reason this whole file re-derives the
+	 * service's Stage A: displayxr-cli is headless and links no compositor.
+	 */
+	const char *w = r->gpu_weave_env_set ? r->gpu_weave_env : NULL;
+	const bool killed = w != NULL && (w[0] == '0' || w[0] == 'f' || w[0] == 'F' || w[0] == 'n' || w[0] == 'N' ||
+	                                  strcmp(w, "off") == 0 || strcmp(w, "OFF") == 0);
+	if (killed) {
 		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
-		         "service split: OFF (DXR_WEAVE_ON_SCANOUT unset — default off through this release)");
+		         "service split: KILLED (DXR_WEAVE_ON_SCANOUT=%s — the default is ON since #918 Phase 3)", w);
 	} else if (!r->gpu_split_applies) {
 		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
-		         "service split: flag set but INERT (render and scanout are the same adapter — Stage A "
-		         "no-ops)");
+		         "service split: allowed but INERT (render and scanout are the same adapter — Stage A "
+		         "no-ops, reason=same_adapter)");
 	} else {
 		snprintf(r->gpu_service_split, sizeof(r->gpu_service_split),
-		         "service split: WOULD ENGAGE (flag set, render != scanout); ingress %s", r->gpu_split_ingress);
+		         "service split: WOULD ENGAGE (default on, render != scanout); ingress %s",
+		         r->gpu_split_ingress);
 	}
 }
 
@@ -953,7 +970,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 			PT("render (default suggestion): <none>\n");
 		}
 		PT("%s\n", r->gpu_verdict);
-		PT("DXR_WEAVE_ON_SCANOUT=%s\n", r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		PT("DXR_WEAVE_ON_SCANOUT=%s (kill switch; the split is ON by default)\n",
+		   r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
 		PT("%s\n", r->gpu_service_split);
 		PT("%s\n", r->gpu_service_ingest);
 	}
