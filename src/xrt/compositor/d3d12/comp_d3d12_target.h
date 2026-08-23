@@ -17,7 +17,6 @@
 
 // Forward declarations (C++ structs)
 struct comp_d3d12_target;
-struct comp_d3d12_compositor;
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,8 +25,21 @@ extern "C" {
 /*!
  * Create a D3D12 output target (DXGI swapchain).
  *
- * @param c The D3D12 compositor.
+ * The device, the queue the swapchain is created against and the DXGI factory
+ * are passed explicitly — the target does NOT own them (no AddRef/Release), it
+ * only borrows them for the lifetime of the caller-owned swapchain. This is the
+ * D3D12 twin of @ref comp_d3d11_target_create's post-#918 shape, and the reason
+ * for it is the same: under the output-device split the presentation target
+ * belongs on the SCANOUT adapter, so the target must be creatable from a
+ * device/queue/factory triple the caller chooses, with no route back into the
+ * app-device compositor. There is deliberately no compositor parameter.
+ *
  * @param hwnd The window handle to present to.
+ * @param device The ID3D12Device* the RTV heap and the back-buffer RTVs are
+ *               created on.
+ * @param command_queue The ID3D12CommandQueue* the swapchain is created against
+ *                      (DXGI flushes and presents through it).
+ * @param dxgi_factory The IDXGIFactory4* the swapchain is created from.
  * @param width Preferred width.
  * @param height Preferred height.
  * @param transparent When true (and hwnd != NULL), use BitBlt swap effect so DWM
@@ -40,8 +52,10 @@ extern "C" {
  * @ingroup comp_d3d12
  */
 xrt_result_t
-comp_d3d12_target_create(struct comp_d3d12_compositor *c,
-                         void *hwnd,
+comp_d3d12_target_create(void *hwnd,
+                         void *device,
+                         void *command_queue,
+                         void *dxgi_factory,
                          uint32_t width,
                          uint32_t height,
                          bool transparent,

@@ -7,8 +7,9 @@
  * @ingroup comp_d3d12
  */
 
+// No comp_d3d12_compositor.h: the target is handed its device, queue and DXGI
+// factory explicitly (#918 D12-2) and reaches into no compositor at all.
 #include "comp_d3d12_target.h"
-#include "comp_d3d12_compositor.h"
 
 #include "util/u_logging.h"
 #include "util/u_debug.h"
@@ -77,8 +78,14 @@ dxr_late_weave_enabled(void)
  */
 struct comp_d3d12_target
 {
-	//! Parent compositor.
-	struct comp_d3d12_compositor *c;
+	//! Device the RTV heap and the back-buffer RTVs are created on, and the
+	//! queue the swapchain was created against. Handed in at create and NOT
+	//! owned — no AddRef/Release; the caller outlives the target. There is no
+	//! compositor back-pointer on purpose: under the output-device split
+	//! (#918) this triple may name the SCANOUT adapter, and the target must
+	//! have no way to reach the app-device compositor from here.
+	ID3D12Device *dev;
+	ID3D12CommandQueue *queue;
 
 	//! DXGI swapchain.
 	IDXGISwapChain3 *swapchain;
@@ -130,23 +137,6 @@ struct comp_d3d12_target
 	IDCompositionTarget *dcomp_target;
 	IDCompositionVisual *dcomp_visual;
 };
-
-// Access compositor internals
-extern "C" {
-struct comp_d3d12_compositor_internals
-{
-	struct xrt_compositor_native base;
-	struct xrt_device *xdev;
-	ID3D12Device *device;
-	ID3D12CommandQueue *command_queue;
-};
-}
-
-static inline struct comp_d3d12_compositor_internals *
-get_internals(struct comp_d3d12_compositor *c)
-{
-	return reinterpret_cast<struct comp_d3d12_compositor_internals *>(c);
-}
 
 static void
 release_back_buffers(struct comp_d3d12_target *target)
@@ -346,11 +336,10 @@ acquire_back_buffers(struct comp_d3d12_target *target)
 	}
 
 	// Create RTVs for each back buffer
-	auto internals = get_internals(target->c);
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = target->rtv_heap->GetCPUDescriptorHandleForHeapStart();
 
 	for (uint32_t i = 0; i < BACK_BUFFER_COUNT; i++) {
-		internals->device->CreateRenderTargetView(target->back_buffers[i], nullptr, rtv_handle);
+		target->dev->CreateRenderTargetView(target->back_buffers[i], nullptr, rtv_handle);
 		rtv_handle.ptr += target->rtv_descriptor_size;
 	}
 
@@ -358,18 +347,20 @@ acquire_back_buffers(struct comp_d3d12_target *target)
 }
 
 extern "C" xrt_result_t
-comp_d3d12_target_create(struct comp_d3d12_compositor *c,
-                         void *hwnd,
+comp_d3d12_target_create(void *hwnd,
+                         void *device,
+                         void *command_queue,
+                         void *dxgi_factory,
                          uint32_t width,
                          uint32_t height,
                          bool transparent,
                          struct comp_d3d12_target **out_target)
 {
-	auto internals = get_internals(c);
-
 	comp_d3d12_target *target = new comp_d3d12_target();
 	memset(target, 0, sizeof(*target));
-	target->c = c;
+	// Borrowed, not owned — the caller keeps the references.
+	target->dev = static_cast<ID3D12Device *>(device);
+	target->queue = static_cast<ID3D12CommandQueue *>(command_queue);
 	target->hwnd = static_cast<HWND>(hwnd);
 	target->width = width;
 	target->height = height;
@@ -403,17 +394,15 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 	rtv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
-	HRESULT hr = internals->device->CreateDescriptorHeap(
-	    &rtv_heap_desc, __uuidof(ID3D12DescriptorHeap),
-	    reinterpret_cast<void **>(&target->rtv_heap));
+	HRESULT hr = target->dev->CreateDescriptorHeap(&rtv_heap_desc, __uuidof(ID3D12DescriptorHeap),
+	                                               reinterpret_cast<void **>(&target->rtv_heap));
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create RTV descriptor heap: 0x%08x", hr);
 		delete target;
 		return XRT_ERROR_D3D;
 	}
 
-	target->rtv_descriptor_size = internals->device->GetDescriptorHandleIncrementSize(
-	    D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	target->rtv_descriptor_size = target->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
 	// Create DXGI swapchain
 	DXGI_SWAP_CHAIN_DESC1 desc = {};
@@ -445,19 +434,18 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
 	fs_desc.Windowed = TRUE;
 
-	// Get DXGI factory.
-	// Note: ID3D12Device does NOT implement IDXGIDevice (unlike D3D11),
-	// so we must get the factory via the device's adapter LUID.
-	IDXGIFactory4 *dxgi_factory = nullptr;
-	{
-		LUID adapter_luid = internals->device->GetAdapterLuid();
-		hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void **>(&dxgi_factory));
-		if (FAILED(hr) || dxgi_factory == nullptr) {
-			U_LOG_E("Failed to create DXGI factory: 0x%08x", hr);
-			target->rtv_heap->Release();
-			delete target;
-			return XRT_ERROR_D3D;
-		}
+	// The DXGI factory is handed in (borrowed, never released here). It used
+	// to be created inline from CreateDXGIFactory2 — which is device- and
+	// adapter-independent, so nothing about the swapchain depended on the
+	// factory's provenance and the caller can just as well own one for the
+	// session. Under the output-device split (#918) it must, because the
+	// caller is the only party that knows which adapter is scanning out.
+	IDXGIFactory4 *factory = static_cast<IDXGIFactory4 *>(dxgi_factory);
+	if (factory == nullptr) {
+		U_LOG_E("comp_d3d12_target_create: no DXGI factory");
+		target->rtv_heap->Release();
+		delete target;
+		return XRT_ERROR_D3D;
 	}
 
 	// Create swapchain. Default: bound to the app's HWND via CreateSwapChainForHwnd
@@ -467,14 +455,13 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	HWND swapchain_hwnd = target->hwnd;
 
 	if (use_transparent) {
-		hr = dxgi_factory->CreateSwapChainForComposition(
-		    internals->command_queue, &desc, nullptr, &swapchain1);
+		hr = factory->CreateSwapChainForComposition(target->queue, &desc, nullptr, &swapchain1);
 		U_LOG_W("Transparent HWND opt-in: DComp + flip-model swapchain "
 		        "(FLIP_DISCARD + PREMULTIPLIED, bc=%u)",
 		        (unsigned)BACK_BUFFER_COUNT);
 	} else {
-		hr = dxgi_factory->CreateSwapChainForHwnd(
-		    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+		hr = factory->CreateSwapChainForHwnd(target->queue, swapchain_hwnd, &desc, &fs_desc, nullptr,
+		                                     &swapchain1);
 
 		// HWND already has a swapchain — fall back to child window.
 		// DXGI enforces one swapchain per HWND for D3D12, so if the app
@@ -486,7 +473,6 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 
 			target->child_ctx = create_child_window_threaded(target->hwnd, width, height);
 			if (target->child_ctx == nullptr) {
-				dxgi_factory->Release();
 				target->rtv_heap->Release();
 				delete target;
 				return XRT_ERROR_D3D;
@@ -494,14 +480,13 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 
 			swapchain_hwnd = target->child_ctx->child_hwnd;
 
-			hr = dxgi_factory->CreateSwapChainForHwnd(
-			    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+			hr = factory->CreateSwapChainForHwnd(target->queue, swapchain_hwnd, &desc, &fs_desc, nullptr,
+			                                     &swapchain1);
 		}
 
 		// Disable Alt-Enter fullscreen toggle (HWND-bound only).
-		dxgi_factory->MakeWindowAssociation(swapchain_hwnd, DXGI_MWA_NO_ALT_ENTER);
+		factory->MakeWindowAssociation(swapchain_hwnd, DXGI_MWA_NO_ALT_ENTER);
 	}
-	dxgi_factory->Release();
 
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
