@@ -19,6 +19,7 @@
 struct comp_vk_native_renderer;
 struct comp_vk_native_compositor;
 struct comp_layer_accum;
+struct comp_vk_deposit;
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,9 @@ struct comp_vk_native_eff_layout
  * @param view_height Height of one view.
  * @param atlas_width Width of the atlas texture (worst-case across modes).
  * @param atlas_height Height of the atlas texture (worst-case across modes).
+ * @param app_timeline_semaphores The app's VkDevice has VK_KHR_timeline_semaphore
+ *        enabled. Only consulted by the VK-0 deposit (#1178), which cannot exist
+ *        without it — see comp_vk_native_deposit.h.
  * @param out_renderer Pointer to receive the created renderer.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -62,6 +66,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t view_height,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
+                                bool app_timeline_semaphores,
                                 struct comp_vk_native_renderer **out_renderer);
 
 /*!
@@ -197,6 +202,18 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *renderer,
                                         uint64_t dst_image,
                                         uint32_t dst_width,
                                         uint32_t dst_height);
+
+/*!
+ * VK-0 (#1178): the deposit this renderer's atlas lives in, or NULL.
+ *
+ * Non-NULL only under `DXR_VK_DEPOSIT=1` on a device that can carry it. This is
+ * the handle VK-1 takes the D3D11 texture + fence off — see
+ * @ref comp_vk_deposit_get_handoff.
+ *
+ * @ingroup comp_vk_native
+ */
+struct comp_vk_deposit *
+comp_vk_native_renderer_get_deposit(struct comp_vk_native_renderer *renderer);
 
 /*!
  * Blit the atlas texture to a shared (non-swapchain) image.
