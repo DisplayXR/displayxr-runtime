@@ -13,9 +13,17 @@ tag per DisplayXR component:
   "shell":       "v1.3.1",
   "leia_plugin": "v1.0.7",
   "mcp_tools":   "v0.3.2",
+  "browser":     "preview-0.1.16",
   "gauss_demo":  "v1.4.3"
 }
 ```
+
+Membership is decided by **"can the orchestrator install it as a
+released asset?"**, not by "is it part of the product?". That is why
+the Unity and Unreal plug-ins are deliberately absent (a UPM `.tgz`
+and a plugin folder are not installable this way) while the browser,
+which ships a Windows NSIS installer and writes its own `HKLM` marker,
+is present. See "The browser field" below for its two carve-outs.
 
 Historically this file was manually curated and drifted constantly —
 the runtime field was stuck at `v1.5.0` for three releases (v1.5.1,
@@ -138,6 +146,12 @@ Release. `components.sh` carries the macOS glob + install marker
 POSIX mirror of the Windows REG_DWORD), so `setup-displayxr.sh --with
 mcp` works on a clean Mac.
 
+### `displayxr-browser`
+
+Same snippet, with `field: "browser"`. Fired from
+`displayxr-browser/scripts/release.sh` (the script that actually creates
+the release), not from a tag-push trigger — the browser has none.
+
 ### `displayxr-demo-*`
 
 Same snippet, with `field: "<demo_name>"`. The schema is flat — each
@@ -168,6 +182,43 @@ version bump. `displayxr-website` is added to the App token's
 `repositories:` list in both jobs. The website ignores the payload (it
 regenerates wholesale) but receives `{field, tag, source_repo}` for log
 context. Full design: `displayxr-website/docs/org-sync.md`.
+
+## The browser field
+
+The browser joined the matrix once it stopped being an experiment
+(2026-08). It is a normal component in every respect except two, both
+of which are deliberate.
+
+**1. Its tags are `preview-X.Y.Z`, not `vX.Y.Z`.** `versions-bump.yml`
+therefore validates the tag shape **per field** rather than globally.
+The prefix is not cosmetic: it marks a build that is rebased ~monthly
+onto Chrome stable but is **not** patched to Chrome's mid-cycle
+security cadence, it is what the in-browser update check and
+`displayxr-web/js/version-check.js` read, and it predates this field.
+Renaming the channel so the matrix could keep one regex would have
+destroyed a user-facing safety signal to save a `case` statement. The
+validator accepts three- or four-part versions (`preview-0.1.16`, and
+the Chromium-versioned `preview-150.0.7871.129` shape the early builds
+used).
+
+**2. It is opt-in, never default.** `--with browser` on both
+orchestrators, mirroring `--with mcp`. For the same security-cadence
+reason, a preview browser must be something a user asks for by name.
+
+Note also that the **meta-bundle is unaffected by the field's
+existence**: `displayxr-installer`'s `build-bundle.sh` / `.bat` read
+five pins by name (`runtime`, `shell`, `leia_plugin`, `mcp_tools`,
+`gauss_demo`), so adding a key here does not enroll a component in
+`DisplayXRBundle-*.exe`. Enrolling it is a separate, deliberate edit
+there.
+
+One asset-naming note, because it reads like a trap and isn't:
+`displayxr-browser/scripts/release.sh` uploads
+`"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The text after `#` is gh's
+*display label*, not the filename — the asset still lands under its
+versioned real name, so the ordinary
+`DisplayXR-Browser-Preview-Setup-*.exe` glob in `components.sh` is
+correct.
 
 ## ABI gate (the one carve-out)
 

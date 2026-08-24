@@ -13,6 +13,7 @@ REM
 REM Usage:
 REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia
 REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Tools
+REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (developer preview)
 REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
 REM   scripts\setup-displayxr.bat --with-demo-sources  :: also clone each demo's source into demos\
 REM   scripts\setup-displayxr.bat --dry-run            :: print plan, install nothing
@@ -47,6 +48,14 @@ set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
 set "COMPONENT_MARKER_mcp_tools=HKLM\Software\DisplayXR\Capabilities\MCP"
 
+REM Browser: opt-in only (--with browser). The preview is rebased ~monthly onto
+REM Chrome stable but NOT patched to Chrome's mid-cycle security cadence, so it is
+REM never part of the default install. Its pin in versions.json is preview-X.Y.Z,
+REM not vX.Y.Z -- see versions-bump.yml's per-field tag validation.
+set "COMPONENT_REPO_browser=DisplayXR/displayxr-browser"
+set "COMPONENT_EXE_browser=DisplayXR-Browser-Preview-Setup-*.exe"
+set "COMPONENT_MARKER_browser=HKLM\Software\DisplayXR\Browser"
+
 set "COMPONENT_REPO_gauss_demo=DisplayXR/displayxr-demo-gaussiansplat"
 set "COMPONENT_EXE_gauss_demo=DisplayXRGaussianSplatSetup-*.exe"
 set "COMPONENT_MARKER_gauss_demo=HKLM\Software\DisplayXR\Demos\GaussianSplat"
@@ -75,6 +84,7 @@ set "COMPONENT_MARKER_earthview_demo=HKLM\Software\DisplayXR\Demos\EarthView"
 
 REM --- Default flag state ---
 set "WITH_MCP=0"
+set "WITH_BROWSER=0"
 set "WITH_DEMOS=0"
 set "WITH_DEMO_SOURCES=0"
 set "DRY_RUN=0"
@@ -97,9 +107,10 @@ exit /b 2
 
 :arg_with
 shift
-if "%~1"=="" echo ERROR: --with requires an argument (currently: mcp) 1>&2 & exit /b 2
+if "%~1"=="" echo ERROR: --with requires an argument (one of: mcp, browser) 1>&2 & exit /b 2
 if /i "%~1"=="mcp" set "WITH_MCP=1" & shift & goto :argloop
-echo ERROR: Unknown --with target: %~1 (supported: mcp) 1>&2
+if /i "%~1"=="browser" set "WITH_BROWSER=1" & shift & goto :argloop
+echo ERROR: Unknown --with target: %~1 (supported: mcp, browser) 1>&2
 exit /b 2
 
 :argdone
@@ -150,6 +161,7 @@ call :read_pin runtime RUNTIME_TAG
 call :read_pin shell SHELL_TAG
 call :read_pin leia_plugin LEIA_TAG
 call :read_pin mcp_tools MCP_TAG
+call :read_pin browser BROWSER_TAG
 
 REM --- Staging dir ---
 set "STAGING=%TEMP%\dxr-setup-%RANDOM%%RANDOM%"
@@ -160,6 +172,7 @@ call :install_component runtime "%RUNTIME_TAG%"
 call :install_component shell "%SHELL_TAG%"
 call :install_component leia_plugin "%LEIA_TAG%"
 if "%WITH_MCP%"=="1" call :install_component mcp_tools "%MCP_TAG%"
+if "%WITH_BROWSER%"=="1" call :install_component browser "%BROWSER_TAG%"
 
 REM --- --with-demos: install each demo's prebuilt release asset ---
 REM After the core components so demo installers that require the runtime
@@ -212,6 +225,9 @@ echo.
 echo Usage: scripts\setup-displayxr.bat [flags]
 echo.
 echo   --with mcp        Also install DisplayXR MCP Tools.
+echo   --with browser    Also install the DisplayXR Browser developer preview.
+echo                     ^(opt-in: rebased ~monthly onto Chrome stable, but not
+echo                     patched to Chrome's mid-cycle security cadence^).
 echo   --with-demos      Also install each demo's prebuilt release installer
 echo                     ^(no build needed; demos with no Windows asset skip^).
 echo   --with-demo-sources
@@ -231,7 +247,7 @@ echo write to HKLM and Program Files.
 exit /b 0
 
 :usage
-echo Usage: scripts\setup-displayxr.bat [--with mcp] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
+echo Usage: scripts\setup-displayxr.bat [--with mcp^|browser] [--with-demos] [--with-demo-sources] [--dry-run] [--uninstall] [-h^|--help]
 exit /b 0
 
 REM Read a pinned tag from versions.json into the named env var.
