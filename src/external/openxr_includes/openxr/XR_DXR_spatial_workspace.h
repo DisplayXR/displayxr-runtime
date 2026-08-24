@@ -251,7 +251,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityDXR)(
  * out_wake_time_ns and out_predicted_display_period_ns returned by the
  * IPC predict_frame path. The client sleeps client-side; no server
  * thread is parked. Effective only for IPC-mode (workspace) clients —
- * in-process compositor consumers (e.g. WebXR bridge) are not affected.
+ * in-process compositor consumers are not affected.
  *
  * Policy is the controller's. A typical workspace controller might call
  *   xrSetWorkspaceClientFrameRateCapDXR(session, prev_focus, 30.0f);

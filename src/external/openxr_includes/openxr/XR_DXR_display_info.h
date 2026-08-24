@@ -456,7 +456,7 @@ typedef enum XrDisplayModeDenialReasonDXR {
     XR_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED_DXR = 2,                //!< no controller; only the focused session may request
     XR_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR_DXR = 3,       //!< nothing to apply the request to
     XR_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED_DXR = 4, //!< the display hardware refused the state
-    XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR = 5,            //!< a relay (WebXR bridge) owns this session's mode
+    XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR = 5,            //!< a relay owns this session's mode (mechanism reserved; no relay ships today)
     XR_DISPLAY_MODE_DENIAL_REASON_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrDisplayModeDenialReasonDXR;
 

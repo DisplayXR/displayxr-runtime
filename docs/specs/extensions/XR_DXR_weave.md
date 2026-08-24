@@ -12,7 +12,7 @@
 ## 1. What it is
 
 A weave *service* for **present-owners**: callers that own their OS window and present
-themselves (a browser, the CEF host, the WebXR bridge), but want the runtime's display
+themselves (a browser, the CEF host), but want the runtime's display
 processor to weave sub-rects of their window for them. The caller never weaves
 (ADR-007/ADR-019): it hands the runtime pre-weave side-by-side stereo pixels + window-relative
 rect(s) and composites back a weaved shared texture, gated on a fence. Eyes flow **out**
@@ -404,7 +404,6 @@ implicit. §4c's entry point + struct settle it: **v9**.
 |---|---|---|
 | DisplayXR Browser (Chromium fork) | GPU-process sync weave | Batch (v3) when the runtime reports spec ≥ 3; per-element legacy loop otherwise |
 | CEF weave host (Step A) | Browser-process sync | Legacy |
-| `displayxr-webxr-bridge` | Service client | Legacy |
 | DisplayXR Browser on Android | Chromium GPU process → satellite compositor (ADR-036 D3) | Batch (v3/v7) — AHardwareBuffer handles + published window geometry |
 
 When changing the header, byte-sync every consumer's vendored copy and rebuild it

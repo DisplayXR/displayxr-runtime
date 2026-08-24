@@ -22,7 +22,7 @@
  * re-implementing the view math from raw eye positions. A separate raw-result
  * struct exposes the complete rig inputs (display-space eyes, display plane,
  * canvas rect, sample time, tracking lock) for aware consumers that keep doing
- * their own math (e.g. the WebXR bridge).
+ * their own math (e.g. a present-owning browser).
  *
  * Two rigs exist, matching the two canonical pipelines:
  *  - display rig (display-centric): the window/canvas is a portal into the
