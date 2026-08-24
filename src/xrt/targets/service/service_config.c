@@ -35,7 +35,6 @@ static void
 config_defaults(struct service_config *cfg)
 {
 	cfg->workspace = SERVICE_CHILD_AUTO;
-	cfg->bridge = SERVICE_CHILD_AUTO;
 	cfg->start_on_login = true;
 	// Empty = orchestrator picks the first registered workspace controller
 	// from HKLM\Software\DisplayXR\WorkspaceControllers. The runtime owns no
@@ -192,11 +191,6 @@ service_config_load(struct service_config *cfg)
 		         "%s", workspace_binary->valuestring);
 	}
 
-	cJSON *bridge = cJSON_GetObjectItemCaseSensitive(root, "bridge");
-	if (cJSON_IsString(bridge)) {
-		cfg->bridge = str_to_mode(bridge->valuestring);
-	}
-
 	cJSON *sol = cJSON_GetObjectItemCaseSensitive(root, "start_on_login");
 	if (cJSON_IsBool(sol)) {
 		cfg->start_on_login = cJSON_IsTrue(sol);
@@ -222,7 +216,6 @@ service_config_save(const struct service_config *cfg)
 
 	cJSON_AddStringToObject(root, "workspace", mode_to_str(cfg->workspace));
 	cJSON_AddStringToObject(root, "workspace_binary", cfg->workspace_binary);
-	cJSON_AddStringToObject(root, "bridge", mode_to_str(cfg->bridge));
 	cJSON_AddBoolToObject(root, "start_on_login", cfg->start_on_login);
 
 	char *json_str = cJSON_Print(root);

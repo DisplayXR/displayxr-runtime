@@ -65,7 +65,7 @@ Use WASD + mouse to move the simulated eye position and observe perspective-corr
 
 ## Production Components
 
-The diagram above shows the in-process path — a single app talking directly to the display. In production, DisplayXR also includes a **service** (for multi-app and sandboxed browsers) and a **WebXR bridge** (metadata sideband for Chrome). A privileged client can act as a **workspace controller** via the `XR_DXR_spatial_workspace` extensions, composing multiple apps in a shared 3D space — the **DisplayXR Shell** is our reference workspace controller. See [Production Components](../architecture/production-components.md) for how all the pieces fit together.
+The diagram above shows the in-process path — a single app talking directly to the display. In production, DisplayXR also includes a **service** (for multi-app and sandboxed browsers). A privileged client can act as a **workspace controller** via the `XR_DXR_spatial_workspace` extensions, composing multiple apps in a shared 3D space — the **DisplayXR Shell** is our reference workspace controller. See [Production Components](../architecture/production-components.md) for how all the pieces fit together.
 
 ## Next Steps
 

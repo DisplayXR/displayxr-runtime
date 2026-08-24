@@ -208,7 +208,7 @@ app survives without a render hitch**. Acceptance criteria:
   frame-loop gap in the service log, no black frame.
 - A Chrome WebXR session survives the same. If Chrome's JS loop is the fragile
   part, the runtime should still emit the transition cleanly and the sample
-  (`webxr-bridge/sample`) should be hardened to re-enumerate input sources
+  (the retired `webxr-bridge/sample`, removed in #1180) should be hardened to re-enumerate input sources
   without dropping its `requestAnimationFrame` loop.
 
 ## 4. Recommendation / open decision

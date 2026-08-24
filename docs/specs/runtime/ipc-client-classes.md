@@ -19,7 +19,7 @@ quotas, authorization and (Phase 2, #961) lease priority. This is ADR-035 D1/D6.
 | `APP` | 0 | any ordinary OpenXR app | default (zeroed struct) | — |
 | `CONTROLLER` | 1 | the workspace controller (shell) | `XR_DXR_spatial_workspace` enabled | peer pid == orchestrator-spawned pid, **or** peer exe path == a registered controller `Binary` (`HKLM\Software\DisplayXR\WorkspaceControllers\*`, POSIX manifests, or the orchestrator's `workspace_binary` dev override), **or** `DXR_ALLOW_UNVERIFIED_CONTROLLER=1` on the service (dev; loud WARN) |
 | `PRESENT_OWNER` | 2 | `XR_DXR_weave` present-owner (displayxr-browser) | `XR_DXR_weave` enabled | by use — only this class may call `weave_*` |
-| `RELAY` | 3 | headless relay (WebXR bridge OpenXR session) | `XR_MND_headless` + `XR_DXR_display_info` | by use — may never create a compositor (`session_create` refuses) |
+| `RELAY` | 3 | headless relay — **no claimant since the WebXR bridge was retired (#1180); slot reserved, do not renumber** | `XR_MND_headless` + `XR_DXR_display_info` | by use — may never create a compositor (`session_create` refuses) |
 | `PROVIDER_HOST` | 4 | service-spawned input-provider host (Phase 4, #968) | reserved | not yet verifiable → demoted |
 | `DIAG` | 5 | read-only diagnostics: `displayxr-cli clients`, the bridge's introspection connection | set explicitly by runtime-internal tools | peer exe lives in the service's own directory |
 

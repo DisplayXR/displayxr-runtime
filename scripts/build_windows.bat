@@ -121,8 +121,8 @@ if not exist "%OPENXR_SDK%\x64\lib\openxr_loader.lib" (
 )
 
 :: --- OpenXR loader short-path copy (avoids spaces-in-path linker issues) ---
-:: The in-tree webxr_bridge target and the standalone test apps both link
-:: against the OpenXR loader via a short path with no spaces. Versioned so
+:: The standalone test apps link against the OpenXR loader via a short path
+:: with no spaces. Versioned so
 :: bumping OPENXR_VERSION doesn't silently reuse an older cached loader.
 set OPENXR_SDK_SHORT=C:\dev\openxr_sdk_%OPENXR_VERSION%
 if not exist "%OPENXR_SDK_SHORT%\x64\lib\openxr_loader.lib" (
@@ -301,15 +301,6 @@ if exist "%TA_BIN%" (
             echo set "PATH=%PKG%\bin;%%PATH%%"
             echo "%%E" %%*
         )
-    )
-)
-
-:: Run script for the WebXR Bridge v2 host (in-tree target, installed into _package)
-if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
-    > "%PKG%\run_webxr_bridge.bat" (
-        echo @echo off
-        echo set "XR_RUNTIME_JSON=%RT_JSON%"
-        echo "%PKG%\bin\displayxr-webxr-bridge.exe" %%*
     )
 )
 

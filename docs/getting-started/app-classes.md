@@ -144,7 +144,7 @@ The bullets below add detail per class.
 
 - **Multi-app / shell / WebXR?** The **IPC/Service** path is used internally by the [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases) and WebXR browsers. Apps don't need to target IPC directly — the shell launches standard handle apps and manages multi-app compositing transparently.
 
-- **Building a WebXR app and want DisplayXR awareness?** WebXR pages automatically run as hosted legacy apps via Chrome's built-in WebXR implementation. To access display info, rendering-mode events, eye-tracked poses, window metadata, HUD overlay, and forwarded input, install the WebXR Bridge v2 Chrome extension. The bridge exposes a `session.displayXR` namespace on the standard WebXR session. Start with the [WebXR Bridge developer guide](../../webxr-bridge/DEVELOPER.md) — it covers integration, the `session.displayXR` API, Kooima projection, common pitfalls, and links to a runnable [minimal example](../../webxr-bridge/examples/minimal.html) and the [full reference sample](../../webxr-bridge/sample/sample.js).
+- **Building web content and want DisplayXR awareness?** Target **inline 3D** in the [DisplayXR Browser](https://github.com/DisplayXR/displayxr-browser) — a weaved 3D element living inside an ordinary page, authored against the `inline3d.js` SDK in [`displayxr-web`](https://github.com/DisplayXR/displayxr-web). This is the supported path. Plain WebXR pages still run as hosted legacy apps via Chromium's built-in WebXR implementation, but get no display info, mode events, or tracked eye poses — the `session.displayXR` metadata sideband that used to supply those was retired in #1180 (see [WebXR Support](../roadmap/webxr-support.md)).
 
 ## Code Paths
 

@@ -32,7 +32,7 @@ echo "== build tag in _package: $(tag_of "$PKG/DisplayXRClient.dll")"
 # 2. Kill client processes that hold DisplayXRClient.dll (NOT the service).
 for exe in chrome.exe cube_handle_d3d11_win.exe cube_hosted_d3d11_win.exe \
            cube_handle_d3d12_win.exe cube_handle_gl_win.exe cube_handle_vk_win.exe \
-           displayxr-webxr-bridge.exe displayxr-shell.exe; do
+           displayxr-shell.exe; do
   taskkill //F //IM "$exe" >/dev/null 2>&1 || true
 done
 sleep 1

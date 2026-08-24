@@ -14,7 +14,7 @@
 
 DisplayXR breaks that pattern. The DisplayXR runtime is a lightweight OpenXR implementation purpose-built for 3D displays — installable on its own, useful on its own, vendor-agnostic at every layer. Application developers write standard OpenXR. Display vendors (Leia, BOE, and others making the lightfield / autostereo panels) implement a documented integration interface. OEMs (Lenovo, Samsung, ZTE, and others integrating displays into finished laptops, monitors, tablets, phones, and TVs) ship the runtime as part of their product. And on top of the runtime, an optional **workspace controller** layer adds spatial-desktop features — windowing, multi-app composition, launcher UX — through open extensions any party can implement.
 
-A reference workspace controller, **DisplayXR Shell**, ships alongside the runtime from the DisplayXR project as a proprietary, polished example of what's possible on the platform. It is also entirely optional. Install the DisplayXR runtime by itself and you get a standards-compliant OpenXR + WebXR bridge for your 3D display — no shell, no spatial desktop. Install a different controller (third-party, vertical integrator, your own) and the runtime treats it as a first-class citizen with the same authority as the reference shell.
+A reference workspace controller, **DisplayXR Shell**, ships alongside the runtime from the DisplayXR project as a proprietary, polished example of what's possible on the platform. It is also entirely optional. Install the DisplayXR runtime by itself and you get a standards-compliant OpenXR implementation for your 3D display — no shell, no spatial desktop. Install a different controller (third-party, vertical integrator, your own) and the runtime treats it as a first-class citizen with the same authority as the reference shell.
 
 "We brought our spatial-3D laptop SKU to market in weeks, not quarters, because we didn't have to build the OpenXR layer or the windowing system from scratch," said a hypothetical OEM partner who has not yet given us a real quote. "We bundled the reference shell, dropped a sidecar manifest to brand the tray for our product, and shipped. The DisplayXR runtime authenticated and composited it without modification."
 
@@ -51,7 +51,7 @@ Opt into `XR_DXR_display_info` for display dimensions, eye-tracking modes, and t
 No. The runtime serves apps the same way whether the user is running the bare runtime, the DisplayXR Shell, or a third-party controller. Apps in a workspace get composited as one of N tiles; apps without a workspace render full-screen. From the app's perspective, OpenXR's session-state machine drives both cases identically.
 
 **Q: I'm using WebXR in Chrome. How does that work?**
-DisplayXR ships a WebXR bridge that connects Chrome's native WebXR implementation to the runtime. No extension to install in Chrome — the bridge runs as a separate process, started on-demand by the service when a WebXR app requests it. Standard WebXR session APIs work on a 3D display the same way they work on a headset.
+Chromium's native WebXR implementation speaks standard OpenXR, so a WebXR page reaches the runtime through the loader and the service with nothing extra installed — standard WebXR session APIs work on a 3D display the same way they work on a headset, on a compromise-scaled framebuffer. For DisplayXR-aware web content the supported path is **inline 3D** in the DisplayXR Browser: weaved 3D elements inside an ordinary page, rather than an exclusive immersive session.
 
 ### For 3D display vendors
 

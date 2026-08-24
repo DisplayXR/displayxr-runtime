@@ -2,53 +2,90 @@
 
 Single source of truth for how DisplayXR supports the browser. Two chapters:
 
-1. **Shipped today** — the *WebXR Bridge v2* metadata/control sideband (Chrome extension + headless companion process). Leaves the frame path untouched.
-2. **Roadmap** — *inline 3D in ordinary web pages* via a `session.displayXR.weave()` frame-path API, delivered through Chromium patches.
+1. **Retired** — the *WebXR Bridge v2* metadata/control sideband (Chrome extension + headless companion process), removed in #1180.
+2. **The supported path** — *inline 3D in ordinary web pages*, delivered by the **DisplayXR Browser** (a Chromium fork) over the `XR_DXR_weave` frame-path API.
 
 **Related docs:**
-- Developer/usage docs for the shipped bridge: [`webxr-bridge/README.md`](../../webxr-bridge/README.md) (setup), [`webxr-bridge/DEVELOPER.md`](../../webxr-bridge/DEVELOPER.md) (integration), [`webxr-bridge/PROTOCOL.md`](../../webxr-bridge/PROTOCOL.md) (wire schema).
 - App-class mechanics (Texture / present-ownership): [App Classes](../getting-started/app-classes.md).
 - Why a WebXR session is "legacy" at the OpenXR level: [legacy-app-support](../specs/runtime/legacy-app-support.md), [extension-vs-legacy](../architecture/extension-vs-legacy.md).
 - Layout model the browser path piggybacks on: [display zones](display-zones.md), [local 3D zones](local-3d-zones.md).
-
-> History note: this consolidates and supersedes the temporary `webxr-bridge-v2-plan.md` agent-guidance doc (Bridge v2 is shipped — its phase plan lived only to coordinate the build).
-
----
-
-## Chapter 1 — Shipped today: the WebXR Bridge v2 (metadata sideband)
-
-WebXR already runs on DisplayXR with **no bridge at all**: Chromium's built-in WebXR speaks standard OpenXR, goes through the loader into `displayxr-service`, and renders via the D3D11 service compositor. Frames are standard OpenXR swapchain images on shared DXGI handles — zero-copy, no WebSocket. That bare path has one structural limitation: Chrome does not enable `XR_DXR_display_info`, so every WebXR session is a **legacy app** at the OpenXR level and gets a compromise-scaled framebuffer (`oxr_system.c` legacy branch), with no display geometry, rendering-mode catalogue, mode-change events, or tracked eye poses surfaced to JS.
-
-**The Bridge v2 fixes the *metadata* gap without touching frames.** A Chrome MV3 extension plus a small headless companion (`displayxr-webxr-bridge.exe`) act as a sideband. A DisplayXR-aware page then behaves like a handle app — display-info aware, mode-event aware, dynamically sized render targets, tracked eyes — while still rendering through Chrome's normal WebXR frame path.
-
-```
-Chrome MV3 extension ──── WebSocket 127.0.0.1:9014 ──── displayxr-webxr-bridge.exe
-  MAIN world:                JSON metadata + input         (headless OpenXR client:
-    navigator.xr Proxy       (display-info, mode-changed,   XR_DXR_display_info +
-    session.displayXR         eye-poses, window-info, …)    XR_MND_headless; WS server)
-  ISOLATED world:                                                   │ xrLocateViews / xrPollEvent
-    WebSocket client                                                ▼
-Chrome WebXR session ──── OpenXR loader ──── IPC ──── displayxr-service.exe
-(frames, UNCHANGED, on shared DXGI handles)            (D3D11 service compositor, runs DP)
-```
-
-Two **separate OpenXR sessions** hit the same service: Chrome's (renders frames, never sees `session.displayXR` at the OpenXR level — the extension wraps it client-side) and the bridge's (headless, no swapchain; queries display info, polls events + eye poses, relays over WebSocket). The service is multi-client; it spawns the bridge **on demand** the first time a page touches the `session.displayXR` getter, so legacy pages never trigger a spawn.
-
-**What the page gets** (`session.displayXR`, after `await session.displayXR.ready`): physical display geometry in meters, the rendering-mode catalogue + current mode + per-view tile dims, `renderingmodechange` events, tracked eye poses (for Kooima off-axis projection), window metadata, a compositor HUD, and forwarded keyboard/mouse input. Pages without the extension see `session.displayXR === undefined` and fall back to standard WebXR. Full surface + integration in [`DEVELOPER.md`](../../webxr-bridge/DEVELOPER.md).
-
-**What is deliberately *not* touched:** the WebXR frame pipeline (Chrome WebXR → loader → IPC → service compositor → DP, frames on shared DXGI handles); the `oxr_system.c` legacy compromise branch (still the fallback); existing IPC apps. Vendor-agnostic — the bridge talks to the service compositor, not to any DP.
-
-**Status:** shipped on Windows / D3D11 service compositor. macOS + shell-hosting deferred.
+- The weave service the browser calls: [`XR_DXR_weave`](../specs/extensions/XR_DXR_weave.md).
 
 ---
 
-## Chapter 2 — Roadmap: inline 3D in ordinary web pages
+## Chapter 1 — Retired: the WebXR Bridge v2 (metadata sideband)
+
+> **Status: removed in #1180.** `displayxr-webxr-bridge.exe`, the MV3 extension, the
+> `session.displayXR` JS surface, the service's `:9014` spawn trampoline, and the tray's
+> "WebXR Bridge" submenu are all gone. This section is kept so the design is not
+> re-derived; it does not describe anything that ships.
+
+### What still works without it
+
+**WebXR runs on DisplayXR with no bridge at all**, and that is unchanged. Chromium's
+built-in WebXR speaks standard OpenXR, goes through the loader into `displayxr-service`,
+and renders via the D3D11 service compositor. Frames are standard OpenXR swapchain images
+on shared DXGI handles — zero-copy, no WebSocket. That bare path has one structural
+limitation: Chrome does not enable `XR_DXR_display_info`, so every WebXR session is a
+**legacy app** at the OpenXR level and gets a compromise-scaled framebuffer
+(`oxr_system.c` legacy branch), with no display geometry, rendering-mode catalogue,
+mode-change events, or tracked eye poses surfaced to JS.
+
+### What the bridge did, and why it was retired
+
+The bridge closed that *metadata* gap without touching frames. A Chrome MV3 extension plus
+a small headless companion (`displayxr-webxr-bridge.exe`, an `XR_MND_headless` +
+`XR_DXR_display_info` OpenXR client) acted as a sideband over a loopback WebSocket on
+`127.0.0.1:9014`, exposing a `session.displayXR` namespace: physical display geometry,
+the rendering-mode catalogue, `renderingmodechange` events, tracked eye poses for Kooima
+off-axis projection, window metadata, a compositor HUD, and forwarded input. Two separate
+OpenXR sessions hit the same service — Chrome's (frames) and the bridge's (metadata) —
+and the service spawned the bridge on demand the first time a page touched the
+`session.displayXR` getter.
+
+**The decisive fact: it only ever helped pages explicitly rewritten to use
+`session.displayXR`.** A page without the extension saw `session.displayXR === undefined`
+and fell back to standard WebXR. So the bridge never upgraded the existing
+headset-authored WebXR corpus — its entire population was *DisplayXR-aware web
+developers*, which is exactly the audience Chapter 2 serves better.
+
+A DisplayXR-aware web developer has no reason to choose the headset session model.
+Immersive is the *headset's* model — exclusive, owns present, **is** the display. A
+glasses-free display sits on a desk surrounded by ordinary 2D content, so its natural
+model is inline (§2.1). Retiring the bridge is therefore a deliberate scope decision:
+**immersive WebXR is no longer a first-class authoring target.** It still runs, bare and
+unaugmented, on the legacy compromise branch — which is retained precisely for that.
+
+Supporting reasons, recorded for the archaeology: the bridge was Windows-only while the
+browser now covers Windows and Android; it had been in maintenance-only mode, costing
+cross-cutting refactors (#960 client classes, #734 extension rename) without gaining
+features; it was the sole reason the service carried a `:9014` spawn/supervise/restart
+axis, which ADR-035 wants less of; and "install an MV3 extension *and* trust a companion
+exe on loopback" is not an easier ask than installing a browser.
+
+### Residual mechanism still in the tree
+
+Removing the component left the *relay client* mechanism it used behind, because that
+surface is on the IPC wire and the published extension ABI and wants its own pass:
+`XRT_CLIENT_CLASS_RELAY`, the `is_relay` flags on session/compositor,
+`XR_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE_DXR`, the bridge HUD shared-memory block
+(`u_bridge_hud_shared.h`, gated on `g_bridge_relay_active`), the qwerty relay
+suppression, and the service-window HWND props the bridge read. Nothing claims the
+RELAY class any more, so all of it is currently inert. Tracked on #1180.
+
+---
+
+## Chapter 2 — The supported path: inline 3D in ordinary web pages
+
+> **Status: shipping** as the DisplayXR Browser (`displayxr-browser`, Windows + Android),
+> pinned in `versions.json` as `browser`. Sections below retain the original roadmap
+> framing; §2.5–2.6 record how the fork was scoped and why.
 
 ### 2.1 Thesis — the web's natural model for a *display* is inline, not immersive
 
 WebXR on a headset is **immersive**: you enter an exclusive session that owns present, because the headset *is* the display. A glasses-free 3D display sits on the desk all day, surrounded by ordinary 2D content. Its natural model is **inline** — a 3D element living *inside* a normal page, surrounded by HTML, scrolling with the rest of the content: a product page whose model is 3D among the reviews and the buy button; a 3D photo in a feed; a 3D chart in a dashboard.
 
-Chapter 1's bridge runs WebXR **hosted/immersive** — the runtime owns present and takes the whole screen. That is right for "enter XR" but structurally cannot place weaved 3D in *one element* among the DOM. Inline 3D is a **present-ownership problem**: Chrome's compositor owns the page surface, and we want a weaved region inside it. This is exactly the reason the **Texture / present-ownership** app class exists (see [App Classes](../getting-started/app-classes.md)); the browser is where present-ownership finally pays off.
+The bare WebXR path runs **hosted/immersive** — the runtime owns present and takes the whole screen. That is right for "enter XR" but structurally cannot place weaved 3D in *one element* among the DOM. Inline 3D is a **present-ownership problem**: Chrome's compositor owns the page surface, and we want a weaved region inside it. This is exactly the reason the **Texture / present-ownership** app class exists (see [App Classes](../getting-started/app-classes.md)); the browser is where present-ownership finally pays off.
 
 ### 2.2 The hard constraint — weave is per-subpixel and must reach the panel losslessly
 

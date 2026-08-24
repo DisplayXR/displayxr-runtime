@@ -175,12 +175,11 @@ Run key with `--autostart` **exits immediately** when `start_on_login=false`
 | Hybrid entry | `src/xrt/targets/openxr/target.c` | `xrt_instance_create()` — picks native vs IPC |
 | Service entry | `src/xrt/targets/service/main.c` | Service process with tray icon and IPC mainloop |
 | Workspace controller entry | `displayxr-shell-pvt/src/main.c` (private repo) | Reference workspace controller — hotkeys, launcher, 2D capture. This repo builds no shell binary. |
-| Child-process orchestration | `src/xrt/targets/service/service_orchestrator.c` | Spawns and supervises the workspace controller and the WebXR bridge; Ctrl+Space hook; :9014 trampoline |
+| Child-process orchestration | `src/xrt/targets/service/service_orchestrator.c` | Spawns and supervises the workspace controller; Ctrl+Space hook |
 | Controller discovery | `src/xrt/targets/service/service_workspace_registry.c` | Enumerates registered workspace controllers and their published actions |
 | Tray UI | `src/xrt/targets/service/service_tray_win.c` | Tray menu, published-actions rendering, Exit |
-| Service config | `src/xrt/targets/service/service_config.c` | `service.json` — `workspace` / `bridge` child modes, `start_on_login` |
+| Service config | `src/xrt/targets/service/service_config.c` | `service.json` — `workspace` child mode, `start_on_login` |
 | Service compositor | `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` | The Windows server compositor (workspace and standalone modes) |
-| Bridge entry | `src/xrt/targets/webxr_bridge/main.cpp` | WebSocket server + headless OpenXR client |
 | Installer | `installer/DisplayXRInstaller.nsi` | NSIS script — registry, Run key, shortcuts |
 | IPC security | `src/xrt/ipc/server/ipc_server_mainloop_windows.cpp` | Named pipe DACL (AppContainer access) |
 
