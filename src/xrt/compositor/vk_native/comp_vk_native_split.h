@@ -47,17 +47,48 @@
  * follows it. The compositor sees an opaque handle and a dozen C entry points,
  * and the ~40 D3D call sites stay in one reviewable file.
  *
- * ## What this rung does NOT do (VK-2)
+ * ## The PLANES — and why Vulkan is the only leg that had to build them
  *
- * Projection layers only. The bridge PLANES (Local2D, the 2D-under backdrop, a
- * Tier-3 authored zone mask) are not transported, so a frame that carries any of
- * them **retires** the split for the session with
- * `reason=layers_unsupported` — see @ref comp_vk_split_retire. Window-space
- * layers are unaffected: the Vulkan compositor already composites those INTO the
- * atlas pre-weave, on the app device, so they ride across for free.
+ * Beside the atlas, the masked composite needs three more app-device images on
+ * the scanout adapter: the Local2D over-flatten, the 2D-under backdrop and a
+ * Tier-3 authored zone mask. @ref comp_xbridge has transported all three since
+ * Phase 2a — but its D3D11-ends flavour binds a plane by NT handle to an
+ * `ID3D11Texture2D` and its D3D12-ends flavour binds an `ID3D12Resource` by
+ * pointer, and **both assume the compositor's flatten scratch already IS a D3D
+ * resource**. The D3D11 leg's is (`local2d_scratch_share`); the D3D12 leg's is.
+ * This compositor's is a plain `VkImage`, so there is nothing to bind.
  *
- * The diagnostic HUD is likewise app-device Vulkan and is skipped while the split
- * is up.
+ * That is the asymmetry to keep in mind reading this file, and it is not
+ * over-engineering: VK-1a needed no transport change only because VK-0 had
+ * *already* made the atlas a D3D11 texture. The planes had no VK-0, so VK-1b is
+ * VK-0 again — the flatten renders straight into a deposit-backed, NT-shared
+ * `ID3D11Texture2D` (@ref comp_vk_deposit_plane_ensure), zero copies, same fence.
+ *
+ * Window-space layers need none of this: the Vulkan compositor composites those
+ * INTO the atlas pre-weave, on the app device, so they ride across for free.
+ *
+ * ## The plane back-fence, which is NOT the bridge's
+ *
+ * A plane's ingress is Option I — the bridge's producer copy queue opens the
+ * app-device texture and reads it in place. The bridge's own back-fence for that
+ * (`comp_xbridge_pre_plane_write`) issues a GPU-side wait **on the app's D3D11
+ * immediate context**, which is exactly right for the two D3D legs because the
+ * immediate context is what writes their scratch. Here the plane is written by
+ * the **Vulkan queue**, which that wait does not order at all.
+ *
+ * @ref comp_vk_split_submit_atlas therefore takes the bridge's wait and then
+ * signals the deposit's shared fence on that same immediate context, so the value
+ * is unreachable until the producer's read has resolved; Vulkan's next flatten
+ * waits for it on the timeline. One queued signal, one queued wait, no deeper
+ * ring and no change of ingress mode. See @ref comp_vk_deposit_note_planes_consumed.
+ *
+ * ## The HUD is NOT a plane, and is not skipped either
+ *
+ * `u_hud` rasterises to a CPU pixel buffer, so it belongs to no device: the
+ * out-device half simply uploads it to a scanout-adapter texture and copies it
+ * onto the back buffer, which is what the D3D11 and D3D12 legs already do
+ * (`d3d11_render_hud_overlay(c, d3d11_out_device(c), …)`). Nothing crosses the
+ * bridge for it and there is no reason token — the HUD is never a split obstacle.
  *
  * ## Synchronisation — no CPU wait on the app thread or the weave path
  *
@@ -264,6 +295,59 @@ comp_vk_split_submit_atlas(struct comp_vk_split *split,
                            uint32_t rows,
                            uint32_t view_w,
                            uint32_t view_h);
+
+/*!
+ * VK-1b (#1178) — publish this frame's 2D-under BACKDROP plane.
+ *
+ * Call once per app frame, BEFORE @ref comp_vk_split_submit_atlas: that call
+ * stamps the slot's recipe, and the recipe carries the backdrop's own extent.
+ *
+ * The plane's SOURCE is a deposit-backed surface — an NT-shared `ID3D11Texture2D`
+ * on the app adapter that the Vulkan flatten renders straight into
+ * (@ref comp_vk_deposit_plane_ensure). That is what this rung had to build and
+ * the two D3D legs did not: their flatten scratch was already a D3D resource.
+ *
+ * @param nt_handle The plane surface's NT share, or NULL to drop the plane.
+ * @param generation The surface's ALLOCATION generation. A change re-opens the
+ *        handle inside the bridge (and drains the producer first), so it must
+ *        never move per frame.
+ * @param alloc_w,alloc_h The plane chain's extent — the PANEL, always, so the
+ *        plane stays outside the R2 resize hysteresis.
+ * @param content_seq A hash of the pixels the surface now holds; 0 means "this
+ *        frame does not use the plane". The bridge SKIPS the copy when the write
+ *        slot already carries this exact seq, which is mandatory rather than an
+ *        optimisation — a full-window RGBA plane at 4K60 is ~2 GB/s on its own.
+ * @param dirty_x,dirty_y,dirty_w,dirty_h This frame's dirty box in source pixels.
+ * @param bd_w,bd_h The backdrop's OWN extent (the composite region), which is not
+ *        the plane's extent. 0 ⟹ the frame produced no backdrop and the weave
+ *        clears the display processor's background.
+ */
+void
+comp_vk_split_stage_backdrop(struct comp_vk_split *split,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t bd_w,
+                             uint32_t bd_h);
+
+/*!
+ * #918 review F4 — the composite REGION moved, so drop every slot's pixels for
+ * @p plane and make each owe a full refresh of the plane extent.
+ *
+ * The plane surfaces are panel-sized; a region that shrinks leaves stale pixels
+ * outside the new one, and the per-slot dirty-box union would carry them across
+ * as if they were content. The caller clears its whole surface and calls this.
+ *
+ * @param plane A `COMP_XBRIDGE_PLANE_*` index.
+ */
+void
+comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane);
 
 /*!
  * Weave one frame on the scanout adapter and present it.
