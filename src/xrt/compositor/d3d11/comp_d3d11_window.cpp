@@ -58,6 +58,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", fals
 // exe has created its headless OpenXR session; NOT a signal that the
 // compositor should divert input away from qwerty. Kept as the outer fast
 // exit so there's zero overhead when no bridge process is running.
+// NOTE (#1180): the WebXR bridge was retired, and it was the only process that
+// ever claimed the RELAY client class or read the DXR_BridgeClientActive /
+// DXR_InSizeMove side of this contract. g_bridge_relay_active is therefore
+// never true today and every bridge-gated branch below is inert — kept, with
+// the relay class itself, until the wire-ABI sweep that removes them together.
+// Behaviour is unchanged: these paths simply never run.
 extern "C" bool g_bridge_relay_active;
 
 // True iff a bridge relay session exists AND a page has attached to the
@@ -2175,9 +2181,9 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 	// drag/rotate), so moving a WebXR window drags its content instead
 	// of the window itself. The native WM_ENTERSIZEMOVE path also sets
 	// this prop directly; reusing the prop keeps one gate on the bridge
-	// side. Semantically DXR_InSizeMove now means "compositor is in a
-	// modal-like interaction (native OR workspace-virtual)" — document in
-	// webxr-bridge/DEVELOPER.md alongside the Phase-5 description.
+	// side. Semantically DXR_InSizeMove means "compositor is in a
+	// modal-like interaction (native OR workspace-virtual)".
+	// The prop is write-only since #1180 — the bridge was its only reader.
 	if (window->hwnd != NULL) {
 		if (suppress) {
 			SetPropW(window->hwnd, L"DXR_InSizeMove", (HANDLE)(uintptr_t)1);

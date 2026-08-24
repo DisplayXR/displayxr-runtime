@@ -51,9 +51,6 @@ if(WIN32)
 	# discovers any installed workspace controller via the registry
 	# contract; see docs/specs/runtime/workspace-controller-registration.md.
 
-	# DisplayXR WebXR bridge host (metadata sideband for Chrome's native WebXR)
-	add_subdirectory(webxr_bridge)
-
 	# Strip any bundled vulkan-1.dll from the install bin dir. The runtime +
 	# service /DELAYLOAD vulkan-1.dll, so vcpkg's applocal-deps install copies
 	# it next to the exes even though the runtime target's own dependency

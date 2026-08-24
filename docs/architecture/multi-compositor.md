@@ -116,9 +116,6 @@ workspace-specific composition (controller poses, chrome, per-tile alpha):
   under workspace mode.
 - **Chrome / Edge WebXR** — frames come from Chrome's own OpenXR client (AppContainer → IPC), which is a
   regular IPC client of the service.
-- **WebXR bridge** — **headless, metadata-only, submits no frames** (`webxr_bridge/main.cpp`, session
-  created with `XR_MND_headless`). It carries display info, modes, eye poses, and input; it is not a
-  compositing consumer.
 - **`displayxr-browser`** — a present-owner via `XR_DXR_weave`.
 
 Having two structurally different service compositor modes is the arbitration hole tracked as #939;

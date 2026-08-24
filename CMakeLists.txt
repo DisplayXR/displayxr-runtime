@@ -582,8 +582,10 @@ endif()
 #      displayxr-common) → "target was not found". Reconcile the two fetches /
 #      reuse the runtime's displayxr::common.
 #   2. The test app's OpenXR import is single-config; under the multi-config VS
-#      generator it errors "IMPORTED_IMPLIB not set … MinSizeRel". Apply the
-#      same all-configs backfill used in targets/webxr_bridge/CMakeLists.txt.
+#      generator it errors "IMPORTED_IMPLIB not set … MinSizeRel". Backfill
+#      IMPORTED_IMPLIB_<CONFIG>/IMPORTED_LOCATION_<CONFIG> for every configuration
+#      the build generates — the prebuilt OpenXR config package declares only
+#      RelWithDebInfo, and one prebuilt loader DLL serves all configs.
 #   3. openxr_loader.dll isn't copied next to the folded exe (only
 #      build_windows.bat does that today) → add a POST_BUILD copy, and rely on
 #      VS_DEBUGGER_ENVIRONMENT below for XR_RUNTIME_JSON (so F5, not a bare run).

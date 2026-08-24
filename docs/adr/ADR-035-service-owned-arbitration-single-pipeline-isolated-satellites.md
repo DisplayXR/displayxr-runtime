@@ -253,3 +253,21 @@ in `docs/specs/runtime/`), the provider-host ring format (Phase 4 spec), or whet
 - #939 (arbitration), #943 (provider isolation), #925 (stability epic; S1–S5 are the workspace-path groundwork this builds on), #929, #930, #924, #944, #761, #762, #510.
 - `docs/adr/ADR-016` (controllers own tray/lifecycle — the orderly-shutdown item lands here), `ADR-019` (vendor plug-in boundary; process isolation is its next step), `ADR-025` (Android app↔service split; clarified: the DP is in the service), `ADR-028` (mode recipe vs hardware state — the lease is its owner), `ADR-029` (client-presents strategy), `ADR-033` (weaver owns phase), `ADR-034` (input provider plug-ins; the host is where they live next).
 - `docs/reference/workspace-stability.md`, `docs/reference/motion-to-photon-levers.md`.
+
+## Amendment 1 — The WebXR bridge satellite is gone, not isolated (2026-08-23)
+
+The Context above cites the WebXR bridge twice as a satellite this ADR must contain:
+problem 4 (it never exits when the service dies and squats on `:9014`) and problem 5
+(it burns 2 of the 8 connections, so the target scenario does not fit).
+
+Both are **resolved by deletion, not by isolation.** #1180 retired the bridge — the
+metadata sideband it provided only ever reached pages explicitly written against
+`session.displayXR`, and that audience is served by `displayxr-browser` inline 3D
+instead. Removing it also removed the orchestrator's whole `:9014` spawn → supervise →
+restart axis, which is the smallest possible version of what §"isolated satellites"
+asks for.
+
+Net effect on this ADR: the satellite inventory is now the workspace controller plus
+(per #943) input-provider hosts. The baseline slot census drops from 5-before-any-app
+to 3. Nothing else in the decision changes — the arbitration and single-pipeline
+halves stand as written.

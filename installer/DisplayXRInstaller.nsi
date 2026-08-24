@@ -678,8 +678,10 @@ Section "DisplayXR Runtime" SecRuntime
 	; docs/specs/workspace-controller-registration.md. The runtime owns no
 	; specific workspace app and has nothing to install here.
 
-	; Install WebXR Bridge v2 host (metadata sideband for Chrome's native WebXR, issue #139)
-	File /nonfatal "${BIN_DIR}\displayxr-webxr-bridge.exe"
+	; The WebXR Bridge v2 metadata sideband was retired (#1180) — inline 3D via
+	; the DisplayXR Browser is the supported authoring path. Sweep the orphan so
+	; an upgrade over an install that shipped it does not leave a dead exe.
+	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 
 	; Diagnostics CLI + Control Panel GUI (the Control Panel shells out to the
 	; CLI; both replace the retired DisplayXRSwitcher — #378). SDL2.dll (the
@@ -1105,6 +1107,7 @@ Section "Uninstall"
 	; $INSTDIR across versions if we don't sweep them.
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
+	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
 	Delete "$INSTDIR\displayxr-control-panel.exe"

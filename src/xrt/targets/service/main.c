@@ -127,7 +127,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	u_file_logging_init();
 	u_crash_guard_install_exit_tripwire();
 
-	// Load orchestrator config (workspace/bridge modes, start-on-login)
+	// Load orchestrator config (workspace mode, start-on-login)
 	struct service_config cfg;
 	service_config_load(&cfg);
 
@@ -157,19 +157,19 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	}
 
 	// #975: become the singleton BEFORE touching the tray, the Ctrl+Space hook,
-	// :9014 or any child process. The pipe's FILE_FLAG_FIRST_PIPE_INSTANCE inside
+	// or any child process. The pipe's FILE_FLAG_FIRST_PIPE_INSTANCE inside
 	// ipc_server_main stays the authoritative gate; this earlier check keeps a
 	// second instance (client auto-launch racing a dev restart, a logon race)
-	// from stealing the bridge trampoline port for a few seconds and then dying
-	// on its own teardown. A dying owner abandons the mutex within the wait, so
-	// a fast restart still comes up. The handle is intentionally held for life.
+	// from briefly grabbing tray/hotkey ownership and then dying on its own
+	// teardown. A dying owner abandons the mutex within the wait, so a fast
+	// restart still comes up. The handle is intentionally held for life.
 	HANDLE singleton = CreateMutexW(NULL, TRUE, L"Local\\DisplayXR.Service.Singleton");
 	if (singleton != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
 		DWORD w = WaitForSingleObject(singleton, 3000);
 		if (w != WAIT_OBJECT_0 && w != WAIT_ABANDONED) {
 			U_LOG_W(
 			    "Another displayxr-service instance owns the singleton mutex; this instance exits "
-			    "without touching the tray, hotkey or :9014 (#975).");
+			    "without touching the tray or hotkey (#975).");
 			u_crash_guard_mark_orderly_exit();
 			return 0;
 		}

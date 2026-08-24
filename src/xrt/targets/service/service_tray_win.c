@@ -24,9 +24,6 @@
 #define IDM_WORKSPACE_ENABLE    1010
 #define IDM_WORKSPACE_DISABLE   1011
 #define IDM_WORKSPACE_AUTO      1012
-#define IDM_BRIDGE_ENABLE   1020
-#define IDM_BRIDGE_DISABLE  1021
-#define IDM_BRIDGE_AUTO     1022
 #define IDM_START_ON_LOGIN  1030
 #define IDM_CONTROL_PANEL   1002
 #define IDM_EXIT            1001
@@ -172,17 +169,6 @@ append_published_actions(HMENU sub, const struct workspace_controller_entry *ent
 	return appended > 0;
 }
 
-//! Map service_child_mode to the corresponding menu ID for the bridge submenu.
-static UINT
-bridge_mode_to_id(enum service_child_mode m)
-{
-	switch (m) {
-	case SERVICE_CHILD_ENABLE: return IDM_BRIDGE_ENABLE;
-	case SERVICE_CHILD_DISABLE: return IDM_BRIDGE_DISABLE;
-	default: return IDM_BRIDGE_AUTO;
-	}
-}
-
 //! Resolve a binary that ships next to displayxr-service.exe (same Runtime
 //! dir) into @p out. Returns true and a NUL-terminated path on success.
 static bool
@@ -242,14 +228,6 @@ show_context_menu(HWND hwnd)
 	// walk per menu open is cheap.
 	service_orchestrator_refresh_workspace_controller();
 
-	// Bridge submenu (radio group: Enable, Auto, Disable)
-	HMENU bridge_sub = CreatePopupMenu();
-	AppendMenuW(bridge_sub, MF_STRING, IDM_BRIDGE_ENABLE, L"Enable");
-	AppendMenuW(bridge_sub, MF_STRING, IDM_BRIDGE_AUTO, L"Auto");
-	AppendMenuW(bridge_sub, MF_STRING, IDM_BRIDGE_DISABLE, L"Disable");
-	CheckMenuRadioItem(bridge_sub, IDM_BRIDGE_ENABLE, IDM_BRIDGE_AUTO,
-	                   bridge_mode_to_id(s_config.bridge), MF_BYCOMMAND);
-
 	// Main menu
 	HMENU menu = CreatePopupMenu();
 
@@ -263,7 +241,7 @@ show_context_menu(HWND hwnd)
 	}
 
 	// Workspace submenu — only built when a controller binary is detected.
-	// Bare runtime (no controller installed) gets just the Bridge entry,
+	// Bare runtime (no controller installed) gets no workspace entry at all,
 	// which is the honest reflection of what the runtime can do on its own.
 	//
 	// The submenu items themselves come from the controller's published
@@ -295,7 +273,6 @@ show_context_menu(HWND hwnd)
 		AppendMenuW(menu, MF_POPUP, (UINT_PTR)workspace_sub, name_wide);
 	}
 
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)bridge_sub, L"WebXR Bridge");
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING | (s_config.start_on_login ? MF_CHECKED : MF_UNCHECKED),
 	            IDM_START_ON_LOGIN, L"Start on Windows login");
@@ -376,20 +353,6 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			break;
 		case IDM_WORKSPACE_DISABLE:
 			s_config.workspace = SERVICE_CHILD_DISABLE;
-			config_changed();
-			break;
-
-		// Bridge mode radio group
-		case IDM_BRIDGE_ENABLE:
-			s_config.bridge = SERVICE_CHILD_ENABLE;
-			config_changed();
-			break;
-		case IDM_BRIDGE_AUTO:
-			s_config.bridge = SERVICE_CHILD_AUTO;
-			config_changed();
-			break;
-		case IDM_BRIDGE_DISABLE:
-			s_config.bridge = SERVICE_CHILD_DISABLE;
 			config_changed();
 			break;
 
@@ -519,7 +482,6 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 		s_config = *initial_cfg;
 	} else {
 		s_config.workspace = SERVICE_CHILD_AUTO;
-		s_config.bridge = SERVICE_CHILD_AUTO;
 		s_config.start_on_login = true;
 	}
 

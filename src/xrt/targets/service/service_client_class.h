@@ -12,8 +12,8 @@
  *     (`HKLM\Software\DisplayXR\WorkspaceControllers\<id>\Binary` on Windows, the
  *     JSON manifests on POSIX) or the orchestrator's selected entry (which covers
  *     the `workspace_binary` dev override).
- *   - DIAG: the peer executable lives in the service's own directory (displayxr-cli,
- *     the WebXR bridge's introspection connection).
+ *   - DIAG: the peer executable lives in the service's own directory (e.g. the
+ *     displayxr-cli read-only introspection connection).
  *
  * @ingroup ipc_server
  */

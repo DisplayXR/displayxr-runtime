@@ -97,8 +97,8 @@ Companion references: [workspace-stability.md](../reference/workspace-stability.
 > in-process (fault-contained); #943's exit source waits for the armed tripwire.
 
 **One-paragraph summary.** The service is a single-process, no-isolation host. `WinMain`
-starts a tray/message-pump thread, an orchestrator that spawns two children (workspace
-controller, WebXR bridge) with **no job object**, and then blocks forever in
+starts a tray/message-pump thread, an orchestrator that spawns the workspace controller
+with **no job object**, and then blocks forever in
 `ipc_server_main` — a 20 Hz poll loop on the main thread. Everything else runs *in* that
 process: the vendor DP plug-in DLL, every input-provider DLL, the D3D11 service compositor
 with its window and render threads, and one IPC thread per client (≤ 8). The IPC core is
@@ -124,8 +124,7 @@ Windows only.
    │ displayxr-service.exe  (ONE process, ONE heap)                                       │
    │  main thread ─ ipc_server_main → main_loop (20 Hz)            ipc_server_process.c:537│
    │  tray thread ─ message pump + WH_KEYBOARD_LL Ctrl+Space hook   service_tray_win.c:514 │
-   │  trampoline thread ─ 127.0.0.1:9014 select() loop              service_orchestrator.c:634│
-   │  watchdog threads ─ WaitForSingleObject(child, INFINITE) ×2   :418, :510            │
+   │  watchdog thread ─ WaitForSingleObject(child, INFINITE)         service_orchestrator.c:418│
    │  per-client IPC threads ×N (≤ IPC_MAX_CLIENTS 8)               ipc_server_process.c:1029│
    │  D3D11 window thread (service-owned HWND)                      comp_d3d11_window.cpp:1650│
    │  capture/render thread (workspace mode only)                   comp_d3d11_service.cpp:6186│
@@ -133,13 +132,13 @@ Windows only.
    │  WinRT capture pool threads (2D window capture)               d3d11_capture.cpp:285   │
    │  IN-PROCESS DLLs: vendor DP (leaked HMODULE), input providers (leaked), LeapC.dll     │
    └──┬──────────────────────┬────────────────────────────────────────────────────────────┘
-      │ CreateProcessA        │ CreateProcessA (on first :9014 accept)
-      ▼                       ▼
-   displayxr-shell.exe     displayxr-webxr-bridge.exe
-   --service-managed       (2 IPC connections, headless)
-   (privileged IPC client)     ▲ WebSocket :9014
-      │ CreateProcessA          │
-      ▼                     Chrome extension
+      │ CreateProcessA
+      ▼
+   displayxr-shell.exe
+   --service-managed
+   (privileged IPC client)
+      │ CreateProcessA
+      ▼
    apps (DISPLAYXR_WORKSPACE_SESSION=1)     Chrome WebXR (AppContainer → IPC)     displayxr-browser GPU proc (Low IL → IPC)
 ```
 
@@ -151,7 +150,6 @@ Windows only.
 | Any IPC client → service | pipe missing ⇒ `CreateProcessA(displayxr-service.exe)` → `service\` sibling → `ShellExecuteExA` (works from AppContainer). **No arguments** — workspace mode is entered later by `workspace_activate`, never by launch | `ipc_client_connection.c:195-262` |
 | Singleton | the named pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE`; the pidfile path is a libbsd-only no-op on Windows | `ipc_server_mainloop_windows.cpp:153-155,184-198`; `u_process.c:86-91` |
 | Service → shell | `WH_KEYBOARD_LL` hook on the **tray** thread → `PostMessage(WM_ORCHESTRATOR_SPAWN_WORKSPACE)` → `spawn_workspace()` → `CreateProcessA("<binary> --service-managed", CREATE_NO_WINDOW, inherited env)`. Hook is **uninstalled while the shell runs** (#344) and re-armed by the watchdog on exit | `service_orchestrator.c:700-779, 388, 267, 409-412, 358-362` |
-| Service → bridge | trampoline binds `127.0.0.1:9014`, on first `accept()` closes the listener and `spawn_bridge()`; bind failure = "bridge already running externally", WARN only | `service_orchestrator.c:527-638` |
 | Shell → apps | `CreateProcessA` with `DISPLAYXR_WORKSPACE_SESSION=1`, `CREATE_NEW_CONSOLE`, **no job object**; the shell reaps them only on its own orderly exit (`request_client_exit` → 1 s → `TerminateProcess`) | `displayxr-shell-pvt/src/main.c:3519-3599, 7106-7145` |
 | Shell → voice | `CreateProcessA(displayxr-voice.exe)`, MCP client only, never touches the service | `displayxr-shell-pvt/src/shell_voice.c:652-767` |
 | Tray → control panel | `ShellExecuteW`, untracked | `service_tray_win.c:227` |
@@ -161,15 +159,14 @@ Windows only.
 
 | Process dies | Who notices | What happens | Backoff / crash-loop detection |
 |---|---|---|---|
-| **service** | nobody supervises it. Children keep running (no job object anywhere: `grep JobObject src/` = 0) | shell: `xrPollEvent` → `XR_ERROR_INSTANCE_LOST` → exits cleanly (`shell-pvt src/shell_openxr.cpp:519-528`, `main.c:6541`). **bridge: never exits** — spins on `XR_ERROR_INSTANCE_LOST` with `Sleep(100)` forever, still bound to :9014 (`webxr_bridge/main.cpp:2084-2086`) → a restarted service cannot re-arm its trampoline. Apps: `XR_ERROR_INSTANCE_LOST` on the next call, no `XrEventDataInstanceLossPending` (`oxr_xret.h:22-32`); no reconnect exists anywhere in `ipc_client_*` | n/a |
+| **service** | nobody supervises it. Children keep running (no job object anywhere: `grep JobObject src/` = 0) | shell: `xrPollEvent` → `XR_ERROR_INSTANCE_LOST` → exits cleanly (`shell-pvt src/shell_openxr.cpp:519-528`, `main.c:6541`). Apps: `XR_ERROR_INSTANCE_LOST` on the next call, no `XrEventDataInstanceLossPending` (`oxr_xret.h:22-32`); no reconnect exists anywhere in `ipc_client_*` | n/a |
 | shell (ENABLE) | `workspace_watch_thread_func` | immediate relaunch, recursive watchdog | **none** — a crash-on-launch shell spins (`service_orchestrator.c:365-372`) |
 | shell (AUTO, default) | same | re-install the Ctrl+Space hook; service clears `workspace_mode`/`workspace_controller_pid` and calls `deactivate_workspace` on the dying client's IPC thread | `service_orchestrator.c:358-362`; `ipc_server_per_client_thread.c:186-200` |
-| bridge (ENABLE / AUTO) | `bridge_watch_thread_func` | relaunch / re-arm the trampoline | **none**; exit code never read (`:432-475`) |
 | a client app | its IPC thread's `ReadFile` breaks → `common_shutdown` | see §2.4 | n/a |
 | macOS shell | `posix_spawn` + waitpid respawn | 1 s settle | `service_orchestrator.c:1385-1395` |
 
-Windows service defaults: `workspace=auto`, `bridge=auto`, `start_on_login=true`
-(`service_config.c:37-39`); `workspace_binary` containing a path separator is a dev
+Windows service defaults: `workspace=auto`, `start_on_login=true`
+(`service_config.c:36-38`); `workspace_binary` containing a path separator is a dev
 override that bypasses the registry (`service_orchestrator.c:146-186`).
 
 ### 1.3 Exit paths and crash handling
@@ -252,7 +249,6 @@ per call site from three client-controlled signals (§4.1). This table is what t
 | **Shell-launched app** | env → IPC | ordinary; gets a multi-comp slot at session create (`comp_d3d11_service.cpp:14335-14444`) | tile → service render thread | 1 each | its mode requests are dropped under workspace mode (`:10316`) | `INSTANCE_LOST`, app-specific |
 | **Forced-IPC standalone** (`hosted`/`handle`/`texture`) | `XRT_FORCE_MODE=ipc` | ordinary; **captured into a slot if workspace mode is on, regardless of who launched it** (`:14338`) | standalone: own swap chain + own DP, present on its IPC thread (`:12713-12745`) | 1 | writes process-global mode/geometry (§4.2) | `INSTANCE_LOST` |
 | **Chrome legacy WebXR** | AppContainer auto | ordinary + `ext_win32_appcontainer_compatible_enabled` (the sole "is Chrome" discriminator, `ipc_server_handler.c:591-594`) | NULL binding ⇒ **service creates the HWND** (`:3648-3668`, becomes `sys->compositor_hwnd`); standalone present, or a slot under a workspace | 1 | same as standalone | Chrome-side not read |
-| **WebXR bridge** | forces `XRT_FORCE_MODE=ipc` on itself | **two** connections: its headless `XrInstance` (`XR_MND_headless`+`XR_DXR_display_info`) and a raw `ipc_client_connection_init` for client enumeration (`webxr_bridge/main.cpp:1085-1105, 1610-1631`); flagged `is_bridge_relay`, excluded from slots (`:14222-14236`) | **never presents**; metadata via `SetPropW` on the service window (`DXR_RequestMode` etc., `main.cpp:1258-1266`) — not IPC | **2** | mode requests via window props (`comp_d3d11_service.cpp:10736-10775`); no input/HT features | **zombie** (§1.2) |
 | **displayxr-browser** (CEF) | GPU process, `XRT_FORCE_MODE=ipc` pre-sandbox, **Low IL + restricted token** (`displayxr-browser/patches/0023…`) | present-owner: `xrWeaveBindWindowDXR(browser frame HWND)`; gets a slot under a workspace (never submits layers → empty tile) | `xrWeaveSubmitDXR` on Viz's present thread; server holds `render_mutex` end-to-end (`:13496`); under a workspace it drives the **workspace's own DP** (`:13448-13487`) | ≥1 | holds the panel in 3D by existing (`weave_force_3d_if_needed`, `:13242-13307`); explicit `SetDisplayMode` from tab policy | not read |
 | **MCP adapter / voice** | not OpenXR clients | per-app / shell pipes | — | 0 | — | unaffected |
 | **Input providers, vendor DP** | in-process DLLs | — | — | 0 | roles via the arbiter (`target_input_arbiter.c`) | **they are the service** |
@@ -265,7 +261,7 @@ pipe `nMaxInstances` (`ipc_server.h:388,419`; `ipc_server_mainloop_windows.cpp:1
 a **connection** cap — sessions and compositors are not the limit (`D3D11_MULTI_MAX_CLIENTS
 24`, `comp_d3d11_service.cpp:1435`; `MULTI_MAX_CLIENTS 64`, `comp_multi_private.h:67`).
 
-shell (1) + Chrome WebXR (1) + bridge (**2**) + browser (1) = **5 before a single app
+shell (1) + Chrome WebXR (1) + browser (1) = **3 before a single app
 launches**; three shell apps exhaust 8. At the cap on Windows the listener instance is
 dropped and re-armed later (`ipc_server_mainloop_windows.cpp:220-234`) — the `ics`-full
 branch (`ipc_server_process.c:970-978`) is effectively dead; the client sees
@@ -380,6 +376,8 @@ may re-send at any time. There is **no `GetNamedPipeClientProcessId` / `SO_PEERC
 (`ipc_server_process.c:1002`) is the one field the client cannot forge and is not what the
 gates use. `ext_win32_appcontainer_compatible_enabled` (the "is Chrome" discriminator) and
 `is_bridge_relay`/`is_workspace_controller` (session-info flags) are equally client-asserted.
+(`is_bridge_relay` is **inert since #1180** — the WebXR bridge was its only claimant; the flag
+and the relay client class are retained because they sit on the IPC wire.)
 
 Authorization census over the 131 handlers (`ipc_server_handler.c`): **111 have none**;
 13 check the orchestrator-spawned PID (`get_orchestrator_workspace_pid()`, which is **0** —
@@ -426,7 +424,7 @@ numeric id moves.
 | State | Writers (class → anchor) | Rule today |
 |---|---|---|
 | **Workspace mode on/off** (`sys->workspace_mode`, `xsysc->info.workspace_mode`, `s->workspace_mode`) | activate: controller (or first-claim) `ipc_server_handler.c:3516-3519`; **deactivate: any client, no auth** `:3552-3577`; controller pipe break `per_client_thread.c:186-199`; late-arriving client latch `comp_d3d11_service.cpp:14257-14261` | one process-global bool; unlocked writes from IPC threads read per frame by the render thread; `xsysc->info` is copied by value to every client at connect and never re-broadcast (`ipc_server_handler.c:1703`) |
-| **Hardware 2D/3D (lens)** | any client `compositor_request_display_mode` `:2581`; controller `workspace_request_display_mode` `:3581` (PID-gated) + `force_display_3d` on activate `:3507`; standalone `[force_3d]` re-assert `comp_d3d11_service.cpp:10971-10992`; deferred-3D kick `:11179-11221`; zones tier-1 `:10796-10826`; present-owner `weave_force_3d_if_needed` **every submit** while SR reads 2D `:13242-13307`; vendor-drift follow `:10994-11041`; window `WM_CLOSE` `comp_d3d11_window.cpp:643-650`; #814 teardown failsafe `:12883-12941`; workspace deactivate `:18013` | last-writer-wins on `sys->hardware_display_3d` with **one downstream veto**: `service_apply_pending_mode` returns early under `workspace_mode || bridge_live` (`:10316-10318`) — but the pending values are **not cleared** on the veto, so a request made during workspace mode replays on deactivate |
+| **Hardware 2D/3D (lens)** | any client `compositor_request_display_mode` `:2581`; controller `workspace_request_display_mode` `:3581` (PID-gated) + `force_display_3d` on activate `:3507`; standalone `[force_3d]` re-assert `comp_d3d11_service.cpp:10971-10992`; deferred-3D kick `:11179-11221`; zones tier-1 `:10796-10826`; present-owner `weave_force_3d_if_needed` **every submit** while SR reads 2D `:13242-13307`; vendor-drift follow `:10994-11041`; window `WM_CLOSE` `comp_d3d11_window.cpp:643-650`; #814 teardown failsafe `:12883-12941`; workspace deactivate `:18013` | last-writer-wins on `sys->hardware_display_3d` with **one downstream veto**: `service_apply_pending_mode` returns early under `workspace_mode || bridge_live` (`:10316-10318`; `bridge_live` can no longer be true since #1180) — but the pending values are **not cleared** on the veto, so a request made during workspace mode replays on deactivate |
 | **Content rendering mode / atlas grid** (`head->hmd->active_rendering_mode_index`, `sys->tile_*`, `sys->view_*`) | any client `compositor_request_rendering_mode` `:2601` → `:10346-10360` + `broadcast_rendering_mode_change` to **every** session; every standalone writer above; `sync_tile_layout` on the commit thread **outside `render_mutex`** (`:10693-10700`, the scope ends at `:10691`) | process-global device field, no owner; #761: the event fires before the DP call and is never reverted (`:2182-2210`; `dp_request_display_mode_checked` knows the vendor rejected, no caller acts, `:2314-2332`) |
 | **Display processor** | workspace: ONE shared `mc->display_processor` (`:6873-6877`); standalone: **one per client** (`:3958-4079`, N clients ⇒ N weavers on one panel — the config `:3953-3957` says causes SR recalibration); present-owner under a workspace: the workspace's DP from an IPC thread (`:13448-13487`); dismiss/hot-switch creates per-client DPs on the render thread (`:7181-7191`) or the IPC thread (`:12493-12507`) | no lease; DP calls happen on render, IPC and window threads with different lock rules |
 | **Focus** | controller `workspace_set_focused_client` `:4029` (writes both authorities); `system_set_focused_client`/`system_set_primary_client` **any client** `:3433/:3423` (IPC authority only); **any client's first `predict_frame`** promotes itself via `ipc_server_activate_session` `:2482`; `session_end` clears compositor focus only `comp_d3d11_service.cpp:4756-4774` | **two authorities** (`s->global_state.active_client_index` vs `mc->focused_slot`) partially reconciled; under workspace mode the IPC one is forced visible+focused for everyone (`ipc_server_process.c:620-626`) |
@@ -453,7 +451,7 @@ other client's name/pid/geometry.
 (`comp_d3d11_service.cpp:2057-2063`; callers `:7220, 14260, 16096, 17811, 17828, 17955`).
 `sys->multi_comp` exists **only** under workspace mode. Slot membership is decided **once,
 at session create** (`:14335-14444`) by that global bool: connect-before-shell ⇒ never joins;
-connect-after ⇒ always joins (bridge relay and controller excluded, browser and Chrome
+connect-after ⇒ always joins (relay — no claimant since #1180 — and controller excluded, browser and Chrome
 **included**).
 
 | | Workspace / multi-comp | Standalone per-client | Weave present-owner (#625) | Client-transparent (ADR-029) |
@@ -506,7 +504,7 @@ HRESULT.
 | render thread | workspace stops compositing; clients keep sessions | — | contained, not self-healing | — |
 | per-client IPC thread | that client — unless inside `global_state.lock`/`g_arb_mutex`/`g_refresh_mutex`/`render_mutex` | whole service | terminate | — |
 | main thread | no new clients; existing keep running; mode-index push stops | whole service | terminate | — |
-| shell / bridge (separate processes) | nothing blocks in the service; a hung shell keeps the Ctrl+Space hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
+| shell (separate process) | nothing blocks in the service; a hung shell keeps the Ctrl+Space hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
 
 **On #943's mechanism.** The filed chain (last-client teardown → `xrt_system_devices_feature_dec`
 → refcount 0 → provider `end_feature` → `exit()`) is **not live at this commit**: `feature_inc`
@@ -642,7 +640,6 @@ Numbered for reference from the ADR and the issue plan.
 9. Present-owner drives the workspace's DP from an IPC thread under `render_mutex` (`:13448-13487`); `weave_force_3d_if_needed` fires every submit while SR reads 2D.
 10. #814 failsafe survivor scan ignores standalone clients (INFERRED flattening) (`:12929-12953`).
 11. N standalone clients ⇒ N DPs, shared qwerty camera, shared `set_fullscreen` statics, `compositor_hwnd` pinned to the first client, `active_compositor` last-writer.
-12. WebXR bridge never exits on `INSTANCE_LOST` and squats on :9014; costs 2 of 8 slots.
 13. No job objects; no restart backoff; child exit codes never read; `teardown_all` doesn't join client threads.
 14. No `set_terminate`/UEF; five catch-alls total; render thread not self-healing; window-op worker permanently dead after one throw; no `DEVICE_REMOVED` handling; `Present` HRESULT dropped.
 15. Provider `get_presence` called under `g_arb_mutex` on every client's `xrSyncActions`; qwerty integrator unlocked and destructive across N consumers; `iface->destroy` never called; `xrt_device_begin/end_feature` NULL-unsafe; providers also loaded in every in-process app.
@@ -654,8 +651,7 @@ Numbered for reference from the ADR and the issue plan.
 
 Doc corrections applied alongside this map: `workspace-stability.md` (S3/S4/S5 shipped, #929
 tier-1 fixed, missing rows), `production-components.md` (auto-start, names, paths),
-`multi-compositor.md` (Windows uses `d3d11_service`; the standalone mode; the bridge is
-headless), `in-process-vs-service.md` (superseded banner + the env-var/vendor-symbol
+`multi-compositor.md` (Windows uses `d3d11_service`; the standalone mode), `in-process-vs-service.md` (superseded banner + the env-var/vendor-symbol
 corrections), `separation-of-concerns.md` (vendor rule inverted by ADR-019, dead shell paths),
 `workspace-runtime-contract.md`/ADR-016/ADR-019/ADR-034 status lines, `plugin-discovery.md`
 (ABI v5, Linux ships), `input-provider-discovery.md` (header vs §5), ADR-025 clarification.

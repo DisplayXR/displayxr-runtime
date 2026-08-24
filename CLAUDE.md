@@ -291,8 +291,7 @@ sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=fals
 By default `handle`/`hosted` apps run **in-process** (local compositor, app- or
 runtime-owned window) — a running `displayxr-service.exe` does *not* by itself
 make an app an IPC client. To put **any** existing app on the IPC path, start the
-service and launch the app with `XRT_FORCE_MODE=ipc` (read by the runtime DLL;
-this is exactly what `webxr_bridge` sets via `force_ipc_mode_env()`):
+service and launch the app with `XRT_FORCE_MODE=ipc` (read by the runtime DLL):
 ```cmd
 _package\bin\displayxr-service.exe                            REM D3D11 service compositor
 set XRT_FORCE_MODE=ipc && test_apps\build\bin\cube_handle_d3d11_win.exe

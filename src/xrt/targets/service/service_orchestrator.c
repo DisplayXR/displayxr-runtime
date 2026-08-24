@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Service orchestrator — manages workspace controller and bridge child processes.
+ * @brief  Service orchestrator — manages the workspace controller child process.
  * @ingroup ipc
  */
 
@@ -15,8 +15,6 @@
 #include "util/u_logging.h"
 
 #ifdef XRT_OS_WINDOWS
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
@@ -31,10 +29,6 @@
 // respawns itself.
 static DWORD WINAPI
 workspace_watch_thread_func(LPVOID param);
-static DWORD WINAPI
-bridge_watch_thread_func(LPVOID param);
-static DWORD WINAPI
-trampoline_thread_func(LPVOID param);
 #endif
 
 DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGGING_WARN)
@@ -94,20 +88,6 @@ static HHOOK s_kbd_hook = NULL;
 // docs/specs/runtime/workspace-controller-registration.md.
 static bool s_workspace_available = false;
 static struct workspace_controller_entry s_workspace_active = {0};
-
-static PROCESS_INFORMATION s_bridge_pi;
-static bool s_bridge_running = false;
-static HANDLE s_bridge_watch_thread = NULL;
-static CRITICAL_SECTION s_bridge_lock;
-static bool s_bridge_lock_inited = false;
-
-#define BRIDGE_TRAMPOLINE_PORT 9014
-
-static SOCKET s_trampoline_sock = INVALID_SOCKET;
-static HANDLE s_trampoline_thread = NULL;
-static HANDLE s_trampoline_quit_event = NULL;
-static bool s_trampoline_running = false;
-static bool s_wsa_started = false;
 
 
 /*
@@ -435,280 +415,6 @@ spawn_workspace(void)
 
 /*
  *
- * Bridge watchdog thread — monitors webxr bridge, restarts in Enable mode,
- * restarts the trampoline in Auto mode.
- *
- */
-
-// Forward decls — trampoline helpers defined below.
-static void start_bridge_trampoline(void);
-
-static DWORD WINAPI
-bridge_watch_thread_body(LPVOID param)
-{
-	(void)param;
-
-	WaitForSingleObject(s_bridge_pi.hProcess, INFINITE);
-
-	EnterCriticalSection(&s_bridge_lock);
-	CloseHandle(s_bridge_pi.hProcess);
-	s_bridge_pi.hProcess = NULL;
-	s_bridge_running = false;
-	enum service_child_mode mode = s_cfg.bridge;
-	LeaveCriticalSection(&s_bridge_lock);
-
-	OW("WebXR bridge process exited");
-
-	// In Enable mode, restart the bridge
-	if (mode == SERVICE_CHILD_ENABLE) {
-		char bridge_path[MAX_PATH];
-		char log_path[MAX_PATH];
-		const char *log = NULL;
-		if (appdata_log_path("webxr-bridge", log_path, sizeof(log_path))) {
-			log = log_path;
-		}
-		if (sibling_exe_path("displayxr-webxr-bridge.exe", bridge_path, sizeof(bridge_path))) {
-			EnterCriticalSection(&s_bridge_lock);
-			if (launch_child_with_log(bridge_path, NULL, log, &s_bridge_pi)) {
-				s_bridge_running = true;
-				OW("Restarted WebXR bridge (Enable mode)");
-				s_bridge_watch_thread =
-				    CreateThread(NULL, 0, bridge_watch_thread_func, NULL, 0, NULL);
-			}
-			LeaveCriticalSection(&s_bridge_lock);
-		}
-	}
-
-	// In Auto mode, restart the trampoline so the next webXR app trigger
-	// can respawn the bridge.
-	if (mode == SERVICE_CHILD_AUTO) {
-		start_bridge_trampoline();
-	}
-
-	return 0;
-}
-
-//! Spawn the webxr bridge and start watching it. Safe to call concurrently.
-static void
-spawn_bridge(void)
-{
-	EnterCriticalSection(&s_bridge_lock);
-	if (s_bridge_running) {
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	char bridge_path[MAX_PATH];
-	if (!sibling_exe_path("displayxr-webxr-bridge.exe", bridge_path, sizeof(bridge_path))) {
-		OW("Cannot find displayxr-webxr-bridge.exe next to service");
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	char log_path[MAX_PATH];
-	const char *log = NULL;
-	if (appdata_log_path("webxr-bridge", log_path, sizeof(log_path))) {
-		log = log_path;
-	}
-	if (!launch_child_with_log(bridge_path, NULL, log, &s_bridge_pi)) {
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	s_bridge_running = true;
-	OW("Launched WebXR bridge (PID %lu)", (unsigned long)s_bridge_pi.dwProcessId);
-
-	if (s_bridge_watch_thread) {
-		CloseHandle(s_bridge_watch_thread);
-	}
-	s_bridge_watch_thread = CreateThread(NULL, 0, bridge_watch_thread_func, NULL, 0, NULL);
-	LeaveCriticalSection(&s_bridge_lock);
-}
-
-
-/*
- *
- * Bridge trampoline — listens on 127.0.0.1:9014 in Auto mode. A TCP
- * connection attempt means the Chrome extension (driven by a webXR app
- * that reads session.displayXR) wants the bridge. On first accept we
- * close our listener + the accepted socket and spawn the bridge; the
- * extension's exponential-backoff reconnect lands on the bridge once
- * it binds the port.
- *
- */
-
-//! Worker thread — select() loop, spawns bridge on first connection.
-static DWORD WINAPI
-trampoline_thread_body(LPVOID param)
-{
-	(void)param;
-
-	// #975: this thread OWNS the listener. Nobody else may closesocket() it — a
-	// closesocket() from the stopper while this thread sat between select() and
-	// accept() raised STATUS_INVALID_HANDLE inside mswsock!SockImportHandle and
-	// killed the process (ten WER dumps in one day, every one a 2-10 s-old
-	// second instance shutting down). Stoppers only signal the quit event; we
-	// wake within one select() timeout, re-check it, and close the socket here.
-	EnterCriticalSection(&s_bridge_lock);
-	SOCKET sock = s_trampoline_sock;
-	LeaveCriticalSection(&s_bridge_lock);
-	if (sock == INVALID_SOCKET) {
-		return 0;
-	}
-
-	bool spawn = false;
-	for (;;) {
-		if (WaitForSingleObject(s_trampoline_quit_event, 0) == WAIT_OBJECT_0) {
-			break;
-		}
-
-		fd_set readfds;
-		FD_ZERO(&readfds);
-		FD_SET(sock, &readfds);
-		struct timeval tv = {0, 500000}; // 500 ms
-
-		int r = select(0, &readfds, NULL, NULL, &tv);
-		if (r == SOCKET_ERROR) {
-			break;
-		}
-		if (r == 0) {
-			continue; // timeout, re-check quit event
-		}
-
-		// A stop can race the readable wake-up: re-check before touching the
-		// socket again.
-		if (WaitForSingleObject(s_trampoline_quit_event, 0) == WAIT_OBJECT_0) {
-			break;
-		}
-
-		SOCKET accepted = accept(sock, NULL, NULL);
-		if (accepted == INVALID_SOCKET) {
-			break;
-		}
-
-		// Release the port immediately so the bridge can bind it.
-		closesocket(accepted);
-		spawn = true;
-		break;
-	}
-
-	// Retire the listener on the owning thread, then close it. Publishing
-	// INVALID_SOCKET first means a concurrent start_bridge_trampoline() sees a
-	// free slot only after the port is really about to be released.
-	EnterCriticalSection(&s_bridge_lock);
-	if (s_trampoline_sock == sock) {
-		s_trampoline_sock = INVALID_SOCKET;
-	}
-	s_trampoline_running = false;
-	LeaveCriticalSection(&s_bridge_lock);
-	closesocket(sock);
-
-	if (spawn) {
-		OW("Bridge trampoline accepted — launching WebXR bridge");
-		spawn_bridge();
-	}
-	return 0;
-}
-
-static void
-start_bridge_trampoline(void)
-{
-	EnterCriticalSection(&s_bridge_lock);
-	if (s_trampoline_running || s_bridge_running) {
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	if (!s_wsa_started) {
-		WSADATA wsa;
-		if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-			OW("Bridge trampoline: WSAStartup failed (%d)", WSAGetLastError());
-			LeaveCriticalSection(&s_bridge_lock);
-			return;
-		}
-		s_wsa_started = true;
-	}
-
-	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (sock == INVALID_SOCKET) {
-		OW("Bridge trampoline: socket() failed (%d)", WSAGetLastError());
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	int opt = 1;
-	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
-
-	struct sockaddr_in addr;
-	ZeroMemory(&addr, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	addr.sin_port = htons(BRIDGE_TRAMPOLINE_PORT);
-
-	if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
-		OW("Bridge trampoline: bind(127.0.0.1:%d) failed (%d). Bridge may already "
-		   "be running externally.",
-		   BRIDGE_TRAMPOLINE_PORT, WSAGetLastError());
-		closesocket(sock);
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	if (listen(sock, 1) == SOCKET_ERROR) {
-		OW("Bridge trampoline: listen() failed (%d)", WSAGetLastError());
-		closesocket(sock);
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-
-	if (!s_trampoline_quit_event) {
-		s_trampoline_quit_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-	} else {
-		ResetEvent(s_trampoline_quit_event);
-	}
-
-	s_trampoline_sock = sock;
-	s_trampoline_running = true;
-	s_trampoline_thread = CreateThread(NULL, 0, trampoline_thread_func, NULL, 0, NULL);
-
-	OW("Bridge trampoline listening on 127.0.0.1:%d (Auto mode)", BRIDGE_TRAMPOLINE_PORT);
-	LeaveCriticalSection(&s_bridge_lock);
-}
-
-static void
-stop_bridge_trampoline(void)
-{
-	HANDLE thread = NULL;
-
-	EnterCriticalSection(&s_bridge_lock);
-	if (!s_trampoline_running && s_trampoline_thread == NULL) {
-		LeaveCriticalSection(&s_bridge_lock);
-		return;
-	}
-	// #975: never closesocket() the listener from here — the trampoline thread
-	// owns it and closes it on its way out. Signal and join (it wakes within
-	// one 500 ms select() timeout).
-	if (s_trampoline_quit_event) {
-		SetEvent(s_trampoline_quit_event);
-	}
-	thread = s_trampoline_thread;
-	s_trampoline_thread = NULL;
-	LeaveCriticalSection(&s_bridge_lock);
-
-	if (thread) {
-		if (WaitForSingleObject(thread, 3000) != WAIT_OBJECT_0) {
-			OW("Bridge trampoline thread did not exit within 3 s; leaving its listener to it");
-		}
-		CloseHandle(thread);
-	}
-	EnterCriticalSection(&s_bridge_lock);
-	s_trampoline_running = false;
-	LeaveCriticalSection(&s_bridge_lock);
-}
-
-
-/*
- *
  * Hotkey handling — low-level keyboard hook (WH_KEYBOARD_LL).
  *
  * RegisterHotKey turned out unreliable on systems where Windows IME or
@@ -928,33 +634,6 @@ apply_workspace_mode(enum service_child_mode mode)
 	}
 }
 
-static void
-apply_bridge_mode(enum service_child_mode mode)
-{
-	switch (mode) {
-	case SERVICE_CHILD_ENABLE:
-		stop_bridge_trampoline();
-		spawn_bridge();
-		break;
-
-	case SERVICE_CHILD_DISABLE:
-		stop_bridge_trampoline();
-		EnterCriticalSection(&s_bridge_lock);
-		if (s_bridge_running) {
-			terminate_child(&s_bridge_pi, &s_bridge_running);
-			OW("Terminated WebXR bridge (Disable mode)");
-		}
-		LeaveCriticalSection(&s_bridge_lock);
-		break;
-
-	case SERVICE_CHILD_AUTO:
-		// Listen on 9014 until a webXR app (via the extension) requests the
-		// bridge. No-op if bridge is already running.
-		start_bridge_trampoline();
-		break;
-	}
-}
-
 
 /*
  *
@@ -967,12 +646,6 @@ service_orchestrator_init(const struct service_config *cfg)
 {
 	s_cfg = *cfg;
 	ZeroMemory(&s_workspace_pi, sizeof(s_workspace_pi));
-	ZeroMemory(&s_bridge_pi, sizeof(s_bridge_pi));
-
-	if (!s_bridge_lock_inited) {
-		InitializeCriticalSection(&s_bridge_lock);
-		s_bridge_lock_inited = true;
-	}
 
 	// Subclass the tray HWND to intercept WM_HOTKEY
 	HWND hwnd = (HWND)service_tray_get_hwnd();
@@ -987,7 +660,6 @@ service_orchestrator_init(const struct service_config *cfg)
 	detect_workspace_controller(cfg);
 
 	apply_workspace_mode(cfg->workspace);
-	apply_bridge_mode(cfg->bridge);
 
 	return true;
 }
@@ -1092,15 +764,10 @@ void
 service_orchestrator_apply_config(const struct service_config *cfg)
 {
 	enum service_child_mode old_workspace = s_cfg.workspace;
-	enum service_child_mode old_bridge = s_cfg.bridge;
 	s_cfg = *cfg;
 
 	if (cfg->workspace != old_workspace) {
 		apply_workspace_mode(cfg->workspace);
-	}
-
-	if (cfg->bridge != old_bridge) {
-		apply_bridge_mode(cfg->bridge);
 	}
 }
 
@@ -1132,46 +799,6 @@ service_orchestrator_shutdown(void)
 		CloseHandle(s_workspace_watch_thread);
 		s_workspace_watch_thread = NULL;
 	}
-
-	// Stop the trampoline and terminate the bridge. Flip mode to DISABLE
-	// first so the watchdog, when it sees the process exit, does not try
-	// to respawn or relaunch the trampoline.
-	if (s_bridge_lock_inited) {
-		EnterCriticalSection(&s_bridge_lock);
-		s_cfg.bridge = SERVICE_CHILD_DISABLE;
-		LeaveCriticalSection(&s_bridge_lock);
-	}
-
-	stop_bridge_trampoline();
-
-	if (s_bridge_lock_inited) {
-		EnterCriticalSection(&s_bridge_lock);
-		if (s_bridge_running) {
-			terminate_child(&s_bridge_pi, &s_bridge_running);
-		}
-		LeaveCriticalSection(&s_bridge_lock);
-	}
-
-	if (s_bridge_watch_thread) {
-		WaitForSingleObject(s_bridge_watch_thread, 3000);
-		CloseHandle(s_bridge_watch_thread);
-		s_bridge_watch_thread = NULL;
-	}
-
-	if (s_trampoline_quit_event) {
-		CloseHandle(s_trampoline_quit_event);
-		s_trampoline_quit_event = NULL;
-	}
-
-	if (s_wsa_started) {
-		WSACleanup();
-		s_wsa_started = false;
-	}
-
-	if (s_bridge_lock_inited) {
-		DeleteCriticalSection(&s_bridge_lock);
-		s_bridge_lock_inited = false;
-	}
 }
 
 /*
@@ -1192,30 +819,6 @@ workspace_watch_thread_func(LPVOID param)
 	return (DWORD)(uintptr_t)u_crash_guard_run("workspace_watch_thread_func", workspace_watch_thread_body_adapter, (void *)param);
 }
 
-static void *
-bridge_watch_thread_body_adapter(void *p)
-{
-	return (void *)(uintptr_t)bridge_watch_thread_body((LPVOID)p);
-}
-
-static DWORD WINAPI
-bridge_watch_thread_func(LPVOID param)
-{
-	return (DWORD)(uintptr_t)u_crash_guard_run("bridge_watch_thread_func", bridge_watch_thread_body_adapter, (void *)param);
-}
-
-static void *
-trampoline_thread_body_adapter(void *p)
-{
-	return (void *)(uintptr_t)trampoline_thread_body((LPVOID)p);
-}
-
-static DWORD WINAPI
-trampoline_thread_func(LPVOID param)
-{
-	return (DWORD)(uintptr_t)u_crash_guard_run("trampoline_thread_func", trampoline_thread_body_adapter, (void *)param);
-}
-
 #elif defined(XRT_OS_MACOS)
 
 /*
@@ -1227,9 +830,7 @@ trampoline_thread_func(LPVOID param)
  * it with "--service-managed", and respawn it on crash via a waitpid watcher
  * thread. None of this touches the main thread, so it is safe w.r.t. the
  * kqueue/AppKit main-thread-ownership hazard (only the deferred Piece 3 global
- * Ctrl+Space hotkey would re-enter that). The WebXR-bridge trampoline (also
- * Windows-only today) is intentionally not ported here — the macOS bridge mode
- * stays a no-op for now.
+ * Ctrl+Space hotkey would re-enter that).
  *
  */
 
