@@ -108,6 +108,10 @@ struct comp_vk_split
 	ID3D11Texture2D *dp_input_tex;
 	ID3D11ShaderResourceView *dp_input_srv;
 	uint32_t dp_input_w, dp_input_h;
+	//! #1178 — the format the crop scratch was created in, which must track the
+	//! EGRESS's rather than be assumed: the copy that fills it is dropped in
+	//! silence if the two are different DXGI typeless families.
+	DXGI_FORMAT dp_input_fmt;
 
 	/*!
 	 * VK-1b — a REGION-SIZED output-device view of a panel-sized bridge plane,
@@ -121,6 +125,9 @@ struct comp_vk_split
 		uint32_t w, h;
 		uint64_t seq;
 		bool warned;
+		//! #1178 — one WARN, ever, for a caller whose requested format is not the
+		//! plane's own. This runs per frame; the repo forbids a per-frame WARN.
+		bool fmt_warned;
 	};
 	struct split_plane_view dp_bd_view;
 
@@ -357,6 +364,24 @@ split_plane_dp_view(struct comp_vk_split *s,
 		pres->Release();
 		return psrv;
 	}
+
+	/*
+	 * #1178 — the view is filled by a CopySubresourceRegion out of `ptex`, so its
+	 * format is the SOURCE's and not the caller's wish. The two agree today (the
+	 * planes are bound BGRA and the mask R8, and the bridge now refuses a bind
+	 * whose source disagrees), and taking it from the source anyway is what stops
+	 * them silently disagreeing tomorrow: a cross-family copy here would be
+	 * dropped, not failed, and the display processor would sample a never-written
+	 * texture with every counter healthy.
+	 */
+	if (fmt != pd.Format && !v->fmt_warned) {
+		v->fmt_warned = true;
+		U_LOG_W(
+		    "%s: DP-view format 0x%x requested but the plane is 0x%x — using the plane's, because a "
+		    "cross-family CopySubresourceRegion is silently dropped (#1178)",
+		    what, (unsigned)fmt, (unsigned)pd.Format);
+	}
+	fmt = pd.Format;
 
 	const bool need_alloc = (v->tex == nullptr) || (v->srv == nullptr) || v->w != w || v->h != h;
 	if (need_alloc) {
@@ -863,6 +888,23 @@ comp_vk_split_wire_bridge(struct comp_vk_split *s, const struct comp_vk_deposit_
 	xbi.max_height = sys_h;
 	xbi.panel_width = s->panel_w;
 	xbi.panel_height = s->panel_h;
+	/*
+	 * #1178 — THE ATLAS FORMAT, and the whole of this bug.
+	 *
+	 * The deposit's D3D11 texture takes its format from the VULKAN atlas, which on
+	 * this stack is `VK_FORMAT_B8G8R8A8_UNORM` -> `DXGI_FORMAT_B8G8R8A8_UNORM`.
+	 * The bridge used to build its rings in a hardcoded `R8G8B8A8`, and
+	 * `CopySubresourceRegion` between two different DXGI typeless families is not
+	 * an error Windows reports — it is DROPPED. Every counter stayed green, the
+	 * egress kept its zero-fill, and the panel was black.
+	 *
+	 * Declaring the format here (rather than coercing the Vulkan atlas to RGBA) is
+	 * the right direction: the atlas format is chosen upstream by the swapchain,
+	 * and forcing it would either swizzle the channels or break the VK render
+	 * path. Everything downstream of this — the cross-adapter heap, the egress
+	 * ring, the display processor's SRV — is already format-agnostic.
+	 */
+	xbi.atlas_format = handoff->dxgi_format;
 
 	// The bridge's out_adapter is used for its own consumer D3D12 device, so it
 	// must be the scanout adapter the out device lives on.
@@ -1808,7 +1850,38 @@ split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, ui
 		return nullptr;
 	}
 
-	if (s->dp_input_tex == nullptr || s->dp_input_w != content_w || s->dp_input_h != content_h) {
+	/*
+	 * #1178 — the crop texture's format is the EGRESS's, read off the source,
+	 * never a constant. This was the second live instance of the defect: the
+	 * egress ring is BGRA on the Vulkan leg, this scratch was hardcoded
+	 * `R8G8B8A8_UNORM`, and the CopySubresourceRegion below across two DXGI
+	 * typeless families is silently dropped rather than failed. It only fires when
+	 * the R2 resize hysteresis is holding a worst-case ring, which is exactly the
+	 * kind of conditional path a byte counter can never speak for.
+	 */
+	DXGI_FORMAT src_fmt = DXGI_FORMAT_UNKNOWN;
+	{
+		ID3D11Resource *probe_res = nullptr;
+		src_srv->GetResource(&probe_res);
+		if (probe_res == nullptr) {
+			return src_srv;
+		}
+		ID3D11Texture2D *probe_tex = nullptr;
+		if (SUCCEEDED(probe_res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&probe_tex)) &&
+		    probe_tex != nullptr) {
+			D3D11_TEXTURE2D_DESC pd = {};
+			probe_tex->GetDesc(&pd);
+			src_fmt = pd.Format;
+			probe_tex->Release();
+		}
+		probe_res->Release();
+	}
+	if (src_fmt == DXGI_FORMAT_UNKNOWN) {
+		return src_srv;
+	}
+
+	if (s->dp_input_tex == nullptr || s->dp_input_w != content_w || s->dp_input_h != content_h ||
+	    s->dp_input_fmt != src_fmt) {
 		if (s->dp_input_srv != nullptr) {
 			s->dp_input_srv->Release();
 			s->dp_input_srv = nullptr;
@@ -1823,7 +1896,7 @@ split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, ui
 		desc.Height = content_h;
 		desc.MipLevels = 1;
 		desc.ArraySize = 1;
-		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.Format = src_fmt;
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1841,6 +1914,7 @@ split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, ui
 		}
 		s->dp_input_w = content_w;
 		s->dp_input_h = content_h;
+		s->dp_input_fmt = src_fmt;
 	}
 
 	ID3D11Resource *src_res = nullptr;
@@ -1921,6 +1995,15 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		s->no_slot++;
 		return false;
 	}
+
+	/*
+	 * #1178 — the CONTENT probe, off unless DXR_SPLIT_CONTENT_PROBE=1. This is the
+	 * weave thread, which is where it has to run: it drives the output immediate
+	 * context. It reads the EGRESS slot rather than the (possibly cropped) SRV
+	 * above, because the destination of the bridge's own copy is the thing whose
+	 * emptiness no other diagnostic can see.
+	 */
+	comp_xbridge_content_probe(s->xbridge, slot);
 
 	/*
 	 * #1140 — the weave's geometry comes from the snapshot minted with the

@@ -40,7 +40,21 @@
 //! Option II ingress staging ring on the app device.
 #define XB_INGRESS_RING 2
 
-#define XB_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
+/*!
+ * #1178 — the atlas format a caller that names none gets. It is a DEFAULT, not
+ * the format: the whole atlas chain is now allocated in
+ * @ref comp_xbridge_info::atlas_format, because a copy between two DXGI typeless
+ * families is silently dropped rather than reported (see the header).
+ */
+#define XB_FORMAT_DEFAULT DXGI_FORMAT_R8G8B8A8_UNORM
+
+//! #1178 — how often a refused submit may re-log. The first refusal logs at
+//! once; after that this bounds an otherwise per-frame U_LOG_E.
+#define XB_FMT_REFUSE_LOG_NS (5ull * 1000ull * 1000ull * 1000ull)
+
+//! #1178 content probe — the readback square, and how often it may report.
+#define XB_PROBE_EXTENT 64u
+#define XB_PROBE_PERIOD_NS (1000ull * 1000ull * 1000ull)
 
 /*!
  * #918 Phase 2a bandwidth gate. The acceptance number for the whole transport,
@@ -440,6 +454,40 @@ struct comp_xbridge
 
 	uint32_t max_w, max_h;
 
+	/*!
+	 * #1178 — the DXGI format of the WHOLE atlas chain: the ingress staging ring,
+	 * the cross-adapter placed ring and the egress ring, which are three copies
+	 * deep and so must every one of them share a typeless family with the source.
+	 * Taken from @ref comp_xbridge_info::atlas_format at create and never changed
+	 * afterwards — a format change would be a full chain rebuild, and no caller
+	 * has one.
+	 */
+	DXGI_FORMAT fmt;
+	//! Bytes per pixel of @ref fmt — the bandwidth gate's and the DIAG line's
+	//! multiplier, which used to be a hardcoded 4.
+	uint32_t bpp;
+	//! #1178 — submits REFUSED because the source's format was not @ref fmt, and
+	//! when that was last logged. Any non-zero refusal count is a bug in the
+	//! CALLER, not in the bridge; it is counted rather than only logged so the
+	//! quiesce summary carries it too.
+	uint64_t fmt_refused;
+	uint64_t fmt_refuse_log_ns;
+
+	// --- #1178 content probe (DXR_SPLIT_CONTENT_PROBE=1) -------------------
+	//! Off unless the env var is set; read once at create.
+	bool probe_on;
+	//! One WARN when the probe is asked for on a bridge that cannot serve it.
+	bool probe_unavailable_warned;
+	//! CPU-readable out-device staging square, allocated on first use.
+	ID3D11Texture2D *probe_stage;
+	//! A copy has been recorded into @ref probe_stage and is awaiting its Map.
+	bool probe_pending;
+	//! Slot and extent the pending copy was taken from, for the report.
+	int32_t probe_slot;
+	uint32_t probe_w, probe_h;
+	//! When the probe last REPORTED — the once-a-second clock.
+	uint64_t probe_last_ns;
+
 	//! Published under the compositor lock: the slot the last app frame wove,
 	//! which every repaint re-weaves with zero bridge traffic.
 	int32_t weave_slot;
@@ -811,7 +859,7 @@ static bool
 xb_make_egress_slot(struct comp_xbridge *xb, int i, uint32_t w, uint32_t h, const char **out_reason)
 {
 	char b[32];
-	HRESULT hr = xb_make_egress_texture(xb, w, h, XB_FORMAT, /*want_rtv=*/true, &xb->eg_tex[i], &xb->eg_srv[i],
+	HRESULT hr = xb_make_egress_texture(xb, w, h, xb->fmt, /*want_rtv=*/true, &xb->eg_tex[i], &xb->eg_srv[i],
 	                                    &xb->eg_share[i], &xb->eg_12[i]);
 	if (FAILED(hr)) {
 		U_LOG_W("%s: egress slot %d (%ux%u) failed %s", XB_TAG(xb), i, w, h, xb_hr(hr, b, sizeof(b)));
@@ -860,6 +908,73 @@ xb_format_bpp(uint32_t fmt)
 	case DXGI_FORMAT_B8G8R8A8_UNORM: return 4;
 	default: return 4;
 	}
+}
+
+/*!
+ * #1178 — a DXGI format's name for the log.
+ *
+ * A format mismatch is reported by NAME and not only by number, because the
+ * whole failure mode is that the two look interchangeable: `0x1c` and `0x57`
+ * say nothing, `R8G8B8A8_UNORM` beside `B8G8R8A8_UNORM` says everything. The
+ * numeric value is printed alongside for a format this list does not know.
+ */
+static const char *
+xb_fmt_name(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_UNKNOWN: return "UNKNOWN";
+	case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "R8G8B8A8_TYPELESS";
+	case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return "B8G8R8A8_TYPELESS";
+	case DXGI_FORMAT_R8_UNORM: return "R8_UNORM";
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
+	default: return "?";
+	}
+}
+
+/*!
+ * #1178 — THE SUBMIT GUARD. True when @p src_fmt may legally be copied into the
+ * bridge's chain; false, loudly, when it may not.
+ *
+ * This is the part that matters more than the fix. `CopySubresourceRegion` and
+ * `CopyTextureRegion` across two DXGI typeless families do not fail, do not warn
+ * and do not set an HRESULT — Windows drops the copy and leaves the destination
+ * holding whatever it held. Every counter this unit keeps is incremented by the
+ * ACT of issuing the copy, so `xb_kb`, `ing_staged`, `no_slot=0` and
+ * `ing_leak=0` all read healthy while the panel is black. That is precisely how
+ * #1178 got as far as a maintainer's eyeball.
+ *
+ * So a mismatch REFUSES the frame instead of transporting nothing: a refused
+ * frame leaves the weave holding the last good slot (`no_slot` rises, which is a
+ * visible symptom) and prints a line naming both formats, rather than issuing a
+ * copy that will succeed at doing nothing.
+ *
+ * Logged on the first refusal and at most every @ref XB_FMT_REFUSE_LOG_NS
+ * afterwards — loud, but never the per-frame U_LOG_E the repo forbids.
+ */
+static bool
+xb_check_source_format(struct comp_xbridge *xb, DXGI_FORMAT chain_fmt, DXGI_FORMAT src_fmt, const char *where)
+{
+	if (src_fmt == chain_fmt) {
+		return true;
+	}
+	xb->fmt_refused++;
+	const uint64_t now = os_monotonic_get_ns();
+	if (xb->fmt_refuse_log_ns == 0 || now - xb->fmt_refuse_log_ns >= XB_FMT_REFUSE_LOG_NS) {
+		xb->fmt_refuse_log_ns = now;
+		U_LOG_E(
+		    "%s: ATLAS FORMAT MISMATCH at %s — the source is %s (0x%x) but that chain is %s "
+		    "(0x%x). A D3D copy across DXGI typeless families is SILENTLY DROPPED, not failed, so the "
+		    "frame is REFUSED rather than transported as nothing. Fix the caller's "
+		    "comp_xbridge_info::atlas_format (#1178). %llu refusals so far.",
+		    XB_TAG(xb), where, xb_fmt_name(src_fmt), (unsigned)src_fmt, xb_fmt_name(chain_fmt),
+		    (unsigned)chain_fmt, (unsigned long long)xb->fmt_refused);
+	}
+	return false;
 }
 
 /*!
@@ -1149,6 +1264,20 @@ comp_xbridge_bind_plane(struct comp_xbridge *xb,
 		// The source's real extent — the copy box is clamped to it, not just to
 		// the panel, because an authored mask is created at the app's zone dims.
 		D3D12_RESOURCE_DESC sd = pl.src12->GetDesc();
+		/*
+		 * #1178 — the same guard the atlas gets, for the same reason. A plane's
+		 * chain is allocated in the format the CALLER declared, and its producer
+		 * copy is a CopyTextureRegion out of the source the caller just opened;
+		 * if the two are different typeless families that copy is dropped in
+		 * silence and the plane transports nothing, forever, with `copies` rising.
+		 * Degrade the plane loudly instead.
+		 */
+		if (!xb_check_source_format(xb, (DXGI_FORMAT)pl.fmt, sd.Format, xb_plane_name(plane))) {
+			safe_release(pl.src12);
+			pl.failed = true;
+			pl.src_bound = false;
+			return false;
+		}
 		pl.src_w = (uint32_t)sd.Width;
 		pl.src_h = sd.Height;
 	}
@@ -1227,6 +1356,17 @@ comp_xbridge_bind_plane_resource(struct comp_xbridge *xb,
 	 * holds its own. The AddRef is about not RELEASING under a live producer copy,
 	 * which is the same invariant the NT-handle path reaches through its open.
 	 */
+	{
+		// #1178 — the guard, before the AddRef: a cross-family producer copy is
+		// dropped in silence, so this plane must degrade loudly rather than
+		// transport nothing at a perfectly healthy `copies` count.
+		const D3D12_RESOURCE_DESC sd = res->GetDesc();
+		if (!xb_check_source_format(xb, (DXGI_FORMAT)pl.fmt, sd.Format, xb_plane_name(plane))) {
+			pl.failed = true;
+			pl.src_bound = false;
+			return false;
+		}
+	}
 	res->AddRef();
 	pl.src12 = res;
 	{
@@ -1782,6 +1922,40 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			xb->force_depth = 1;
 		}
 	}
+	{
+		// #1178 — the content probe. Off by default and read once, so the frame
+		// path's test is a bool rather than a getenv.
+		const char *e = getenv("DXR_SPLIT_CONTENT_PROBE");
+		xb->probe_on = (e != nullptr && e[0] == '1');
+	}
+
+	/*
+	 * #1178 — THE ATLAS FORMAT, carried rather than assumed.
+	 *
+	 * Every hop of the atlas chain is a copy, and both `CopySubresourceRegion`
+	 * and `CopyTextureRegion` require source and destination to share a DXGI
+	 * TYPELESS FAMILY. `B8G8R8A8` and `R8G8B8A8` do not share one, and a copy
+	 * across families is not an error either API reports — it is dropped, and the
+	 * destination keeps whatever it held. The chain therefore has to be built in
+	 * the caller's own format; anything else transports a perfectly-accounted
+	 * nothing.
+	 *
+	 * Refusing an unknown format rather than defaulting it is deliberate: the
+	 * bandwidth gate, the DIAG line and the cross-adapter heap footprint all
+	 * depend on a bytes-per-pixel this unit can state, and a bridge that cannot
+	 * state one has no business sizing a heap.
+	 */
+	xb->fmt = (info->atlas_format != 0) ? (DXGI_FORMAT)info->atlas_format : XB_FORMAT_DEFAULT;
+	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+		U_LOG_E(
+		    "%s: unsupported atlas format %s (0x%x) — the bridge builds its ingress, cross-adapter and "
+		    "egress rings in the CALLER's format and only the 8-bit BGRA/RGBA UNORM pair is supported "
+		    "(#1178)",
+		    XB_TAG(xb), xb_fmt_name(xb->fmt), (unsigned)xb->fmt);
+		*out_reason = "unsupported atlas format";
+		goto fail;
+	}
+	xb->bpp = xb_format_bpp((uint32_t)xb->fmt);
 
 	xb->d3d12_ends = info->d3d12_ends;
 
@@ -1918,7 +2092,7 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		td.Height = xb->max_h;
 		td.DepthOrArraySize = 1;
 		td.MipLevels = 1;
-		td.Format = XB_FORMAT;
+		td.Format = xb->fmt;
 		td.SampleDesc.Count = 1;
 		td.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; // required for cross-adapter
 		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
@@ -1936,8 +2110,12 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 		hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
 		                              D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES);
 
-		U_LOG_W("%s: cross-adapter ring %ux%u rowPitch=%u heap=%llu bytes x%d", XB_TAG(xb), xb->max_w,
-		        xb->max_h, fp.Footprint.RowPitch, (unsigned long long)hd.SizeInBytes, XB_XA_RING);
+		// #1178: the FORMAT is on this line because it is now a property of the
+		// caller rather than of the unit, and a mis-declared one is invisible in
+		// every other diagnostic the transport emits.
+		U_LOG_W("%s: cross-adapter ring %ux%u %s rowPitch=%u heap=%llu bytes x%d", XB_TAG(xb), xb->max_w,
+		        xb->max_h, xb_fmt_name(xb->fmt), fp.Footprint.RowPitch, (unsigned long long)hd.SizeInBytes,
+		        XB_XA_RING);
 
 		for (int i = 0; i < XB_XA_RING; i++) {
 			hr = xb->prod_dev->CreateHeap(&hd, __uuidof(ID3D12Heap),
@@ -2317,7 +2495,7 @@ xb_alloc_ingress_ring(struct comp_xbridge *xb)
 		td.Height = xb->max_h;
 		td.MipLevels = 1;
 		td.ArraySize = 1;
-		td.Format = XB_FORMAT;
+		td.Format = xb->fmt;
 		td.SampleDesc.Count = 1;
 		td.Usage = D3D11_USAGE_DEFAULT;
 		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -2905,12 +3083,36 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		if (atlas == nullptr || xb->in_tex[in] == nullptr) {
 			return;
 		}
+		/*
+		 * #1178 — GUARD THE COPY. `xb->in_tex[in]` is allocated in `xb->fmt`; if
+		 * the caller's atlas is a different typeless family this
+		 * CopySubresourceRegion does nothing at all and says nothing at all.
+		 * Refuse the frame instead.
+		 */
+		D3D11_TEXTURE2D_DESC ad = {};
+		atlas->GetDesc(&ad);
+		if (!xb_check_source_format(xb, xb->fmt, ad.Format, "ingress stage (Option II)")) {
+			return;
+		}
 		D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
 		xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		src12 = xb->in_12[in];
 	}
 	if (src12 == nullptr) {
 		return;
+	}
+	/*
+	 * #1178 — and guard the D3D12 leg too. Option I hands the producer the
+	 * caller's OWN resource, whose format nothing has ever checked against the
+	 * cross-adapter ring's; Option II arrives here already checked, and re-testing
+	 * its (bridge-owned) staging texture is free.
+	 */
+	{
+		const D3D12_RESOURCE_DESC sd = src12->GetDesc();
+		if (!xb_check_source_format(xb, xb->fmt, sd.Format,
+		                            use_direct ? "atlas source (Option I)" : "ingress ring")) {
+			return;
+		}
 	}
 
 	// The app's writes to the atlas complete before the producer reads it. This
@@ -2987,7 +3189,9 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	}
 	// #918 review F7: atlas and plane bytes stay separate all the way into the
 	// gate — the gate can only throttle planes, so it must know which is which.
-	const uint64_t atlas_frame_bytes = (uint64_t)content_w * content_h * 4ull;
+	// #1178: the multiplier is the CHAIN's bytes-per-pixel, not a hardcoded 4 —
+	// the chain is built in the caller's format now, so the gate must be too.
+	const uint64_t atlas_frame_bytes = (uint64_t)content_w * content_h * (uint64_t)xb->bpp;
 	xb->atlas_bytes += atlas_frame_bytes;
 
 	uint64_t plane_frame_bytes = 0;
@@ -3257,6 +3461,139 @@ comp_xbridge_get_egress_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t 
 	*out_h = (xb != nullptr) ? xb->eg_h : 0;
 }
 
+/*!
+ * #1178 — read the destination back and say what is actually in it.
+ *
+ * Two-phase and non-blocking. Phase one records a small `CopySubresourceRegion`
+ * from the egress slot into a CPU-readable staging square and flushes; phase two,
+ * on a LATER call, maps it with `DO_NOT_WAIT` and reports. A copy that has not
+ * landed is simply retried next call — nothing here ever waits, which is the
+ * bridge's standing invariant and not negotiable even for a diagnostic.
+ *
+ * What it reports is deliberately not a pixel dump: `nonzero` (how many of the
+ * sampled pixels are not fully black) and a cheap additive checksum. Those two
+ * numbers are all it takes to separate the three states the byte counters cannot
+ * — transported content (nonzero high, sum moving frame to frame), transported a
+ * static image (nonzero high, sum steady) and transported NOTHING (nonzero 0,
+ * sum 0), which is what #1178 looked like from the inside.
+ */
+static void
+xb_content_probe(struct comp_xbridge *xb, int32_t slot)
+{
+	if (xb->d3d12_ends) {
+		if (!xb->probe_unavailable_warned) {
+			xb->probe_unavailable_warned = true;
+			U_LOG_W(
+			    "%s: DXR_SPLIT_CONTENT_PROBE is set but this bridge has D3D12 ends, whose egress "
+			    "readback needs a readback heap and a copy-queue round trip — probe not run (#1178)",
+			    XB_TAG(xb));
+		}
+		return;
+	}
+	if (xb->out_ctx == nullptr) {
+		return;
+	}
+
+	// --- phase two: the map, if a copy is already sitting in the staging square.
+	if (xb->probe_pending) {
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		HRESULT hr = xb->out_ctx->Map(xb->probe_stage, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			return; // not landed yet — try again next call, never wait
+		}
+		if (FAILED(hr) || m.pData == nullptr) {
+			xb->probe_pending = false;
+			return;
+		}
+		uint64_t nonzero = 0, sum = 0, total = 0;
+		const auto *base = static_cast<const uint8_t *>(m.pData);
+		for (uint32_t y = 0; y < xb->probe_h; y++) {
+			const uint8_t *row = base + (size_t)y * m.RowPitch;
+			for (uint32_t x = 0; x < xb->probe_w; x++) {
+				const uint8_t *p = row + (size_t)x * xb->bpp;
+				// Colour channels only — an opaque-black pixel has alpha 255 and
+				// would otherwise count as content on every one of the three legs.
+				const uint32_t lum = (uint32_t)p[0] + p[1] + p[2];
+				total++;
+				sum += lum;
+				if (lum != 0) {
+					nonzero++;
+				}
+			}
+		}
+		xb->out_ctx->Unmap(xb->probe_stage, 0);
+		xb->probe_pending = false;
+		xb->probe_last_ns = os_monotonic_get_ns();
+		U_LOG_W(
+		    "%s: CONTENT PROBE slot=%d %s %ux%u — nonzero=%llu/%llu sum=%llu (#1178). nonzero=0 means "
+		    "the destination received NOTHING, however healthy the byte counters look.",
+		    XB_TAG(xb), xb->probe_slot, xb_fmt_name(xb->fmt), xb->probe_w, xb->probe_h,
+		    (unsigned long long)nonzero, (unsigned long long)total, (unsigned long long)sum);
+		return;
+	}
+
+	// --- phase one: record the copy, at most once a period, on a landed slot.
+	const uint64_t now = os_monotonic_get_ns();
+	if (xb->probe_last_ns != 0 && now - xb->probe_last_ns < XB_PROBE_PERIOD_NS) {
+		return;
+	}
+	if (slot < 0 || slot >= XB_EGRESS_RING || xb->eg_tex[slot] == nullptr || xb->eg_seq[slot] == 0) {
+		return;
+	}
+	// Only a slot whose consumer copy is CPU-verified complete: reading one the
+	// consumer is still writing would report a tear as a defect.
+	if (xb->f_out_cons == nullptr || xb->f_out_cons->GetCompletedValue() < xb->eg_seq[slot]) {
+		return;
+	}
+
+	const uint32_t pw = (xb->eg_w < XB_PROBE_EXTENT) ? xb->eg_w : XB_PROBE_EXTENT;
+	const uint32_t ph = (xb->eg_h < XB_PROBE_EXTENT) ? xb->eg_h : XB_PROBE_EXTENT;
+	if (pw == 0 || ph == 0) {
+		return;
+	}
+	if (xb->probe_stage == nullptr || xb->probe_w != pw || xb->probe_h != ph) {
+		safe_release(xb->probe_stage);
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = pw;
+		td.Height = ph;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = xb->fmt;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(xb->out_dev->CreateTexture2D(&td, nullptr, &xb->probe_stage))) {
+			xb->probe_stage = nullptr;
+			// Latch off — one failed allocation must not be retried per frame.
+			xb->probe_on = false;
+			U_LOG_W("%s: content-probe staging texture could not be created — probe off (#1178)",
+			        XB_TAG(xb));
+			return;
+		}
+		xb->probe_w = pw;
+		xb->probe_h = ph;
+	}
+
+	// The CENTRE of the atlas, not its corner: a tiled atlas's top-left is a view's
+	// own edge and is legitimately black in plenty of scenes.
+	const uint32_t x0 = (xb->eg_w - pw) / 2u;
+	const uint32_t y0 = (xb->eg_h - ph) / 2u;
+	D3D11_BOX box = {x0, y0, 0, x0 + pw, y0 + ph, 1};
+	xb->out_ctx->CopySubresourceRegion(xb->probe_stage, 0, 0, 0, 0, xb->eg_tex[slot], 0, &box);
+	xb->out_ctx->Flush();
+	xb->probe_slot = slot;
+	xb->probe_pending = true;
+}
+
+extern "C" void
+comp_xbridge_content_probe(struct comp_xbridge *xb, int32_t slot)
+{
+	if (xb == nullptr || !xb->probe_on) {
+		return;
+	}
+	xb_content_probe(xb, slot);
+}
+
 extern "C" void
 comp_xbridge_set_weave_slot(struct comp_xbridge *xb, int32_t slot)
 {
@@ -3323,6 +3660,13 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 		    (unsigned long long)xb->eg_reallocs, (unsigned long long)xb->churn_entries,
 		    (unsigned long long)xb->churn_settles);
 	}
+	// #1178 — a session that refused anything ends by saying so. A refusal means
+	// frames were NOT transported, and that must not be recoverable only from a
+	// log line that scrolled past five seconds into the session.
+	if (xb->fmt_refused > 0) {
+		U_LOG_E("%s: %llu submits/binds REFUSED on a DXGI format mismatch — the chain is %s (0x%x) (#1178)",
+		        XB_TAG(xb), (unsigned long long)xb->fmt_refused, xb_fmt_name(xb->fmt), (unsigned)xb->fmt);
+	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		U_LOG_W(
 		    "%s: adaptive ingress — %llu settled source re-binds, %llu churn changes that never "
@@ -3351,6 +3695,13 @@ comp_xbridge_destroy(struct comp_xbridge **xb_ptr)
 	*xb_ptr = nullptr;
 
 	comp_xbridge_quiesce(xb);
+
+	/*
+	 * #1178 — the content probe's staging square. Output-device, CPU-readable and
+	 * written only by an out-context copy this thread already issued, so it is
+	 * outside the D3D12 drain-or-leak question below entirely.
+	 */
+	safe_release(xb->probe_stage);
 
 	/*
 	 * #918 F1/F2: if the bounded drain in quiesce timed out, copies may STILL be

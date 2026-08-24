@@ -990,6 +990,7 @@ comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_
 	out->width = dep->width;
 	out->height = dep->height;
 	out->slot = dep->slot;
+	out->dxgi_format = (uint32_t)deposit_dxgi_format(dep->format);
 	return true;
 }
 
