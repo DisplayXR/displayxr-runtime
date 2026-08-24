@@ -107,6 +107,28 @@ struct comp_vk_split
 	ID3D11ShaderResourceView *dp_input_srv;
 	uint32_t dp_input_w, dp_input_h;
 
+	/*!
+	 * VK-1b — a REGION-SIZED output-device view of a panel-sized bridge plane,
+	 * for the display-processor sideband entry points that take dims but no uv
+	 * scale. See @ref split_plane_dp_view.
+	 */
+	struct split_plane_view
+	{
+		ID3D11Texture2D *tex;
+		ID3D11ShaderResourceView *srv;
+		uint32_t w, h;
+		uint64_t seq;
+		bool warned;
+	};
+	struct split_plane_view dp_bd_view;
+
+	//! @name VK-1b — this frame's BACKDROP plane, staged before the submit.
+	//! @{
+	bool bd_plane_live;
+	uint32_t bd_w, bd_h;
+	uint64_t sideband_copies, sideband_skips, sideband_bytes;
+	//! @}
+
 	//! @name Counters for the `[RENDER]` line and the F4/R1 tripwires.
 	//! @{
 	uint64_t no_slot;
@@ -206,6 +228,152 @@ split_make_dp(struct comp_vk_split *s)
 	return true;
 }
 
+/*!
+ * VK-1b — a region-sized OUTPUT-DEVICE view of a panel-sized bridge plane.
+ *
+ * The 2D planes are allocated at the panel and the composite writes only the
+ * region's top-left sub-rect (#464), but the display processor's
+ * `set_background_2d` takes width/height and no uv scale — hand it the panel-sized
+ * egress and it stretches a mostly-empty texture over the region. So the sub-rect
+ * is copied into a right-sized texture on the device that samples it.
+ *
+ * Three properties, each of which the D3D11 leg learned in review:
+ *   - **Passthrough** when the plane already IS the requested extent (no texture,
+ *     no copy, no bytes).
+ *   - **Seq-gated** (#918 review F8): the copy re-runs only when the slot's plane
+ *     generation differs from the one this view already holds. Without it a
+ *     forced repaint re-copies a full region on every panel-rate tick.
+ *   - **Clamped and metered** (#918 review F6): the box is min(src, dst), because
+ *     D3D11 DROPS an oversized `CopySubresourceRegion` silently and would leave
+ *     the vendor sampling an uninitialised texture.
+ *
+ * TODO(#1178 VK-1b): a near-duplicate of `d3d11_plane_dp_view`
+ * (src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp:4975), which is `static`
+ * and wired to `struct comp_d3d11_compositor`. Extracting the two into one unit
+ * is tracked separately — it touches the shipped D3D11 leg, and this epic's rule
+ * is land-before-restructure.
+ *
+ * Returns NULL on any failure, which the caller treats as "no backdrop" — a
+ * degraded feature, never a broken frame.
+ */
+static ID3D11ShaderResourceView *
+split_plane_dp_view(struct comp_vk_split *s,
+                    struct comp_vk_split::split_plane_view *v,
+                    void *plane_srv,
+                    uint64_t content_seq,
+                    uint32_t w,
+                    uint32_t h,
+                    DXGI_FORMAT fmt,
+                    const char *what)
+{
+	auto *psrv = static_cast<ID3D11ShaderResourceView *>(plane_srv);
+	if (psrv == nullptr || w == 0 || h == 0) {
+		return nullptr;
+	}
+	ID3D11Resource *pres = nullptr;
+	psrv->GetResource(&pres);
+	if (pres == nullptr) {
+		return nullptr;
+	}
+	ID3D11Texture2D *ptex = nullptr;
+	D3D11_TEXTURE2D_DESC pd = {};
+	if (FAILED(pres->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&ptex)) || ptex == nullptr) {
+		pres->Release();
+		return nullptr;
+	}
+	ptex->GetDesc(&pd);
+	ptex->Release();
+
+	// Passthrough: the plane is exactly what the display processor asked for.
+	if (pd.Width == w && pd.Height == h) {
+		pres->Release();
+		return psrv;
+	}
+
+	const bool need_alloc = (v->tex == nullptr) || (v->srv == nullptr) || v->w != w || v->h != h;
+	if (need_alloc) {
+		if (v->srv != nullptr) {
+			v->srv->Release();
+			v->srv = nullptr;
+		}
+		if (v->tex != nullptr) {
+			v->tex->Release();
+			v->tex = nullptr;
+		}
+		v->w = 0;
+		v->h = 0;
+		v->seq = 0;
+
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = fmt;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT hr = s->out_dev->CreateTexture2D(&td, nullptr, &v->tex);
+		if (SUCCEEDED(hr) && v->tex != nullptr) {
+			hr = s->out_dev->CreateShaderResourceView(v->tex, nullptr, &v->srv);
+		}
+		if (FAILED(hr) || v->srv == nullptr) {
+			// Latched: this runs on the frame path and on every repaint tick,
+			// and the repo forbids a per-frame WARN (#918 review D7).
+			if (!v->warned) {
+				v->warned = true;
+				U_LOG_W(
+				    "%s: DP-view alloc (%ux%u) failed 0x%08lx — that sideband degrades for "
+				    "this session (#918)",
+				    what, w, h, (unsigned long)hr);
+			}
+			if (v->tex != nullptr) {
+				v->tex->Release();
+				v->tex = nullptr;
+			}
+			pres->Release();
+			return nullptr;
+		}
+		v->w = w;
+		v->h = h;
+	} else if (content_seq != 0 && v->seq == content_seq) {
+		// Same pixels, already copied — the steady state under a repaint.
+		s->sideband_skips++;
+		pres->Release();
+		return v->srv;
+	}
+
+	const uint32_t cw = (w < pd.Width) ? w : pd.Width;
+	const uint32_t ch = (h < pd.Height) ? h : pd.Height;
+	if (cw == 0 || ch == 0) {
+		pres->Release();
+		return nullptr;
+	}
+	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
+	s->out_ctx->CopySubresourceRegion(v->tex, 0, 0, 0, 0, pres, 0, &box);
+	pres->Release();
+	v->seq = content_seq;
+	s->sideband_copies++;
+	s->sideband_bytes += (uint64_t)cw * ch * 4u;
+	return v->srv;
+}
+
+static void
+split_release_plane_view(struct comp_vk_split::split_plane_view *v)
+{
+	if (v->srv != nullptr) {
+		v->srv->Release();
+		v->srv = nullptr;
+	}
+	if (v->tex != nullptr) {
+		v->tex->Release();
+		v->tex = nullptr;
+	}
+	v->w = 0;
+	v->h = 0;
+	v->seq = 0;
+}
+
 //! Release the output half. Idempotent; leaves the borrowed app end alone.
 static void
 split_release_out(struct comp_vk_split *s)
@@ -214,6 +382,7 @@ split_release_out(struct comp_vk_split *s)
 		comp_xbridge_quiesce(s->xbridge);
 		comp_xbridge_destroy(&s->xbridge);
 	}
+	split_release_plane_view(&s->dp_bd_view);
 	if (s->dp_input_srv != NULL) {
 		s->dp_input_srv->Release();
 		s->dp_input_srv = NULL;
@@ -647,6 +816,73 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
  */
 
 extern "C" void
+comp_vk_split_stage_backdrop(struct comp_vk_split *s,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t bd_w,
+                             uint32_t bd_h)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return;
+	}
+
+	/*
+	 * 0 is the bridge's "this frame does not use the plane", and it is what the
+	 * recipe then stamps invalid — which is the honest answer rather than
+	 * lending the weave an older frame's backdrop.
+	 */
+	if (nt_handle == nullptr || content_seq == 0 || bd_w == 0 || bd_h == 0) {
+		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
+		s->bd_plane_live = false;
+		s->bd_w = 0;
+		s->bd_h = 0;
+		return;
+	}
+
+	/*
+	 * Panel-sized, always. The steady-state call is the handle+generation
+	 * early-out inside the bridge; a generation change re-opens the handle and
+	 * drains the producer first, which is why the surface is allocated once at
+	 * the panel and never at the region.
+	 */
+	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, nt_handle, generation,
+	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+		/*
+		 * The backdrop degrades on its OWN — a session without one simply has
+		 * no 2D-under band, and the 3D weave is untouched. Never a reason to
+		 * give the scanout adapter back.
+		 */
+		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, 0, 0, 0, 0, 0);
+		s->bd_plane_live = false;
+		s->bd_w = 0;
+		s->bd_h = 0;
+		return;
+	}
+
+	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, content_seq, dirty_x, dirty_y, dirty_w,
+	                         dirty_h);
+	s->bd_plane_live = true;
+	s->bd_w = bd_w;
+	s->bd_h = bd_h;
+}
+
+extern "C" void
+comp_vk_split_invalidate_plane(struct comp_vk_split *s, uint32_t plane)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return;
+	}
+	comp_xbridge_invalidate_plane(s->xbridge, plane);
+}
+
+extern "C" void
 comp_vk_split_submit_atlas(struct comp_vk_split *s,
                            const struct comp_vk_deposit_handoff *handoff,
                            uint32_t cols,
@@ -712,19 +948,47 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	comp_xbridge_set_content_size(s->xbridge, content_w, content_h, s->layout_gen);
 
 	/*
-	 * #1140 — the recipe travels with the pixels. This rung composites nothing
-	 * on the output device, so the stamp is a projection-only one; a consume
-	 * half can then never read a slot claiming a composite it has no pixels
-	 * for, and every `plane_valid` test fails closed.
+	 * #1140 — the recipe travels with the pixels. `composite` stays false until
+	 * VK-1b-2 puts the masked composite on the output device; what this rung
+	 * adds is the BACKDROP's own extent, which the recipe carries separately
+	 * from the composite for exactly this case: a frame can flatten a backdrop
+	 * and run no composite at all, and `set_background_2d` still needs its real
+	 * width and height. A consume half can never read a slot claiming pixels it
+	 * does not have — every `plane_valid` test fails closed.
 	 */
 	struct comp_xbridge_recipe r = {};
 	r.composite = false;
 	r.region_w = content_w;
 	r.region_h = content_h;
+	r.bd_w = s->bd_w;
+	r.bd_h = s->bd_h;
 	comp_xbridge_stage_recipe(s->xbridge, &r);
 
 	s->seq++;
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
+
+	/*
+	 * VK-1b — THE PLANE BACK-FENCE, and the one place this leg diverges from
+	 * the two D3D ones.
+	 *
+	 * A plane's ingress is Option I: the producer's copy queue opened the
+	 * app-device texture above and reads it in place. `pre_plane_write` makes
+	 * the app IMMEDIATE CONTEXT wait for that read — which is all the D3D legs
+	 * need, because the immediate context is also what WRITES their scratch.
+	 * Here the plane is written by the Vulkan queue, so this wait on its own
+	 * orders nothing; it is the first half of a pair. The second half is the
+	 * caller's `comp_vk_deposit_note_planes_consumed`, which signals the shared
+	 * fence on this same context — behind this wait, one ordered stream — and
+	 * which Vulkan's next flatten waits for on the timeline.
+	 *
+	 * Without the pair, Vulkan laps the bridge and tears the 2D band: the same
+	 * defect VK-1a's atlas release edge closed, one level down. It costs one
+	 * queued wait and one queued signal — no deeper ring, and no change to the
+	 * staged ingress the atlas depends on.
+	 */
+	if (s->bd_plane_live) {
+		comp_xbridge_pre_plane_write(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP);
+	}
 }
 
 /*!
@@ -898,6 +1162,36 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 
 	comp_d3d11_target_bind(s->target);
 
+	/*
+	 * VK-1b — hand the display processor THIS SLOT's backdrop, read from the
+	 * slot's own recipe rather than from live CPU state (#1140). The slot the
+	 * weave is consuming was filled by an earlier frame, so a backdrop resolved
+	 * from the current frame would pair one frame's pixels with another's
+	 * extent. Must precede process_atlas.
+	 *
+	 * A NULL SRV here is the correct clear, not a failure: it means the frame
+	 * that filled this slot produced no 2D-under layers, and the display
+	 * processor falls back to the captured desktop alone.
+	 */
+	{
+		struct comp_xbridge_recipe rec = {};
+		ID3D11ShaderResourceView *bd_srv = nullptr;
+		uint32_t bd_w = 0, bd_h = 0;
+		if (comp_xbridge_slot_recipe(s->xbridge, slot, &rec) && rec.bd_w > 0 && rec.bd_h > 0 &&
+		    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_BACKDROP)) != 0) {
+			const uint64_t bd_seq = rec.plane_seq[COMP_XBRIDGE_PLANE_BACKDROP];
+			bd_srv = split_plane_dp_view(
+			    s, &s->dp_bd_view,
+			    comp_xbridge_get_plane_srv(s->xbridge, slot, COMP_XBRIDGE_PLANE_BACKDROP, bd_seq), bd_seq,
+			    rec.bd_w, rec.bd_h, DXGI_FORMAT_B8G8R8A8_UNORM, "backdrop publish");
+			if (bd_srv != nullptr) {
+				bd_w = rec.bd_w;
+				bd_h = rec.bd_h;
+			}
+		}
+		xrt_display_processor_d3d11_set_background_2d(s->dp, bd_srv, bd_w, bd_h);
+	}
+
 	struct xrt_rect cv = {};
 	if (canvas != nullptr) {
 		cv = *canvas;
@@ -943,12 +1237,39 @@ comp_vk_split_render_diag(struct comp_vk_split *s)
 	                       : ing.mode == COMP_XBRIDGE_INGRESS_STAGED ? "staged"
 	                                                                 : "none";
 
-	U_LOG_W("[RENDER] split=1 xb_kb=%llu xb_degraded=%d no_slot=%llu out_crop=%llu ingress=%s "
-	        "ing_direct=%llu ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
-	        (unsigned long long)(xb_bytes / 1024u), (int)comp_xbridge_is_degraded(s->xbridge),
-	        (unsigned long long)s->no_slot, (unsigned long long)s->out_crop, ing_name,
-	        (unsigned long long)ing.direct, (unsigned long long)ing.staged, (unsigned long long)ing.rebind,
-	        (unsigned long long)ing.churn, (unsigned long long)ing.leak);
+	U_LOG_W(
+	    "[RENDER] split=1 xb_kb=%llu xb_degraded=%d no_slot=%llu out_crop=%llu ingress=%s "
+	    "ing_direct=%llu ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
+	    (unsigned long long)(xb_bytes / 1024u), (int)comp_xbridge_is_degraded(s->xbridge),
+	    (unsigned long long)s->no_slot, (unsigned long long)s->out_crop, ing_name, (unsigned long long)ing.direct,
+	    (unsigned long long)ing.staged, (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
+	    (unsigned long long)ing.leak);
+
+	/*
+	 * VK-1b — one line per live PLANE, in the same shape and with the same field
+	 * names as the two D3D legs', so one parser reads all three. Emitted only for
+	 * a plane that has actually transported something, so a projection-only
+	 * session's log is byte-identical to what it was before the planes existed.
+	 */
+	for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+		uint64_t pb = 0, pc = 0, ps = 0;
+		bool half = false;
+		comp_xbridge_take_plane_stats(s->xbridge, p, &pb, &pc, &ps, &half);
+		if (pc == 0 && ps == 0) {
+			continue;
+		}
+		U_LOG_W("[RENDER] plane=%s kb=%llu copies=%llu skips=%llu half_rate=%d window_s=10",
+		        comp_xbridge_plane_label(p), (unsigned long long)(pb / 1024u), (unsigned long long)pc,
+		        (unsigned long long)ps, (int)half);
+	}
+	if (s->sideband_copies != 0 || s->sideband_skips != 0) {
+		U_LOG_W("[RENDER] sideband copies=%llu skips=%llu kb=%llu window_s=10",
+		        (unsigned long long)s->sideband_copies, (unsigned long long)s->sideband_skips,
+		        (unsigned long long)(s->sideband_bytes / 1024u));
+		s->sideband_copies = 0;
+		s->sideband_skips = 0;
+		s->sideband_bytes = 0;
+	}
 }
 
 
@@ -1060,6 +1381,41 @@ comp_vk_split_submit_atlas(struct comp_vk_split *split,
 	(void)rows;
 	(void)view_w;
 	(void)view_h;
+}
+
+extern "C" void
+comp_vk_split_stage_backdrop(struct comp_vk_split *split,
+                             void *nt_handle,
+                             uint64_t generation,
+                             uint32_t alloc_w,
+                             uint32_t alloc_h,
+                             uint64_t content_seq,
+                             int32_t dirty_x,
+                             int32_t dirty_y,
+                             uint32_t dirty_w,
+                             uint32_t dirty_h,
+                             uint32_t bd_w,
+                             uint32_t bd_h)
+{
+	(void)split;
+	(void)nt_handle;
+	(void)generation;
+	(void)alloc_w;
+	(void)alloc_h;
+	(void)content_seq;
+	(void)dirty_x;
+	(void)dirty_y;
+	(void)dirty_w;
+	(void)dirty_h;
+	(void)bd_w;
+	(void)bd_h;
+}
+
+extern "C" void
+comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane)
+{
+	(void)split;
+	(void)plane;
 }
 
 extern "C" bool

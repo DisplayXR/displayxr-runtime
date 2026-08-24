@@ -67,11 +67,13 @@
 #include <windows.h>
 #include "d3d11/comp_d3d11_window.h"
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
-// tokens. Header-only from here: this compositor has NO output-device split (see
-// the placement block in comp_vk_native_compositor_create), so it never links
-// comp_xbridge, it only needs to name itself the same way the split paths do.
+// tokens. This compositor DOES have an output-device split (VK-1, #1178), but
+// every call into the transport goes through comp_vk_native_split.h; what is
+// needed here are the reason tokens and, since VK-1b, the PLANE indices the
+// plane pass stages against. Both are macros — still no direct bridge call.
 #include "d3d/d3d_weave_placement.h"
 #include "comp_split_gate.h"
+#include "comp_xbridge.h"
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -207,6 +209,12 @@ struct comp_vk_settings
 };
 
 /*!
+ * VK-1b (#1178) — depth of the plane pass's command-buffer ring. See
+ * `plane_cmd` for why it is a ring rather than one buffer freed per frame.
+ */
+#define VK_SPLIT_PLANE_CMD_RING 3
+
+/*!
  * The Vulkan native compositor structure.
  */
 struct comp_vk_native_compositor
@@ -279,6 +287,48 @@ struct comp_vk_native_compositor
 	bool transparent_background_saved;
 	uint32_t queue_index_saved;
 	void *app_hwnd_saved;
+
+	/*!
+	 * @name VK-1b (#1178) — the bridge PLANES.
+	 *
+	 * Under the split the 2D flattens cannot stay in their private VkImage
+	 * scratches: their pixels have to reach the scanout adapter. They are
+	 * therefore redirected into deposit-backed, NT-shared D3D11 textures
+	 * (comp_vk_deposit_plane_ensure) that the flatten renders straight into.
+	 *
+	 * The framebuffer is compositor-owned rather than deposit-owned because it
+	 * is built over the local2d flatten RENDER PASS, which lives here.
+	 * @{
+	 */
+	VkFramebuffer plane_bd_fb;
+	//! The view plane_bd_fb was built over — rebuilt when the plane realloc.
+	VkImageView plane_bd_fb_view;
+
+	/*!
+	 * The plane pass records into its own command buffers, and it may not free
+	 * or reset one that is still executing — nor may it WAIT for one, which is
+	 * the whole invariant of this ladder. So they ride a small ring whose entries
+	 * are recycled against the deposit's TIMELINE: each submit signals a value,
+	 * and an entry is reusable once `vkGetSemaphoreCounterValue` has passed the
+	 * value that entry last signalled. That query does not block.
+	 *
+	 * Three deep because the deposit ring is two and the bridge's egress is
+	 * three; in practice entry N is long retired by the time the ring comes back
+	 * round, and an entry that is somehow still busy costs a SKIPPED plane update
+	 * for one frame (the bridge change-skips and the previous backdrop stands),
+	 * never a stall and never a torn plane.
+	 */
+	VkCommandPool plane_cmd_pool;
+	VkCommandBuffer plane_cmd[VK_SPLIT_PLANE_CMD_RING];
+	uint64_t plane_cmd_value[VK_SPLIT_PLANE_CMD_RING];
+	uint32_t plane_cmd_next;
+	/*!
+	 * Last frame's composite region. A change means the panel-sized plane holds
+	 * stale pixels outside the new region, so the whole surface is re-cleared and
+	 * every egress slot is told it owes a full refresh (#918 review F4).
+	 */
+	uint32_t plane_region_w, plane_region_h;
+	//! @}
 	//! @}
 #endif
 
@@ -3003,6 +3053,7 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 static VkImageView
 vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
                        VkCommandBuffer cmd,
+                       const struct comp_vk_deposit_plane *plane,
                        uint32_t dst_w,
                        uint32_t dst_h,
                        uint32_t *out_w,
@@ -3018,6 +3069,15 @@ vk_update_present_origin(struct comp_vk_native_compositor *c);
 //! the frame path far above them.
 static void
 vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, const char *short_reason);
+//! VK-1b (#1178) — flatten this frame's 2D planes into their deposit-backed
+//! surfaces and publish them to the bridge. Defined beside the flatten it drives.
+static void
+vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint32_t tgt_h);
+//! True when this frame carries Local2D content the OUT-DEVICE composite would
+//! have to run for — as opposed to a pure 2D-UNDER backdrop, which is a plane and
+//! nothing else. Defined with the other layer-scan helpers.
+static bool
+vk_frame_has_over_local2d(struct comp_vk_native_compositor *c);
 #endif
 // #224 / ADR-027 hardware-DP zone leg (P4): one-time caps probe + per-frame
 // sideband publish of the wish / sticky mask. Defined with the other zone
@@ -3509,7 +3569,8 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				bd_w = c->repaint.backdrop_w;
 				bd_h = c->repaint.backdrop_h;
 			} else {
-				bd_view = vk_flatten_backdrop_2d(c, cmd, tgt_width, tgt_height, &bd_w, &bd_h);
+				bd_view =
+				    vk_flatten_backdrop_2d(c, cmd, /*plane=*/NULL, tgt_width, tgt_height, &bd_w, &bd_h);
 				c->repaint.backdrop_view = (uint64_t)(uintptr_t)bd_view;
 				c->repaint.backdrop_w = bd_w;
 				c->repaint.backdrop_h = bd_h;
@@ -4081,15 +4142,25 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 #ifdef XRT_OS_WINDOWS
 	/*
-	 * #918 VK-1 (#1178) — this rung transports the ATLAS and nothing else.
+	 * #918 VK-1b (#1178) — what this rung's transport still cannot move.
 	 *
-	 * A Local2D layer, a 2D-under backdrop or a Tier-3 authored zone mask each
-	 * need their own bridge PLANE on the scanout adapter, and VK-1 has none, so
-	 * the composite's inputs would be on the app adapter with its target on the
-	 * other one. Retire the split for the session rather than draw a half-split
-	 * frame or drop the 2D — `layers_unsupported` is the token that has always
-	 * meant exactly this (comp_split_gate.h), and the D3D12 leg emitted it for
-	 * the same reason while IT was projection-only.
+	 * VK-1 was projection-only and retired on ANY 2D. VK-1b transports the
+	 * 2D-under BACKDROP: it is a bridge plane and nothing else — the display
+	 * processor composites it under the 3D on the output device, so no composite
+	 * pass has to follow the pixels across. That arm is gone from this test.
+	 *
+	 * What is left needs the masked COMPOSITE on the output device, which the
+	 * next rung adds: a Local2D OVER layer (the `twod` source), a zones frame
+	 * (which always composites, feathered wish edge or not) and an authored zone
+	 * mask. Their inputs would be on the app adapter with the target on the
+	 * other one, and there is no honest frame to draw from that — so retire for
+	 * the session rather than half-split the frame or silently drop the 2D.
+	 *
+	 * `layers_unsupported` is exactly the token for this: comp_split_gate.h keeps
+	 * it as "the right token for any future leg whose transport genuinely cannot
+	 * move a frame's layers", which is a different statement from a plane that
+	 * failed to allocate (`authored_mask`) or a leg with no split at all
+	 * (`api_unsupported`).
 	 *
 	 * Placed HERE, immediately after the scan that resolves the flags and before
 	 * a single command is recorded or a single bridge copy is staged, so the
@@ -4098,13 +4169,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	 * Window-space layers are deliberately NOT in this test: the Vulkan
 	 * compositor composites them INTO the atlas pre-weave, on the app device, so
 	 * they cross the bridge with the pixels they were merged into.
-	 *
-	 * VK-2 transports the planes and deletes this block.
 	 */
-	if (c->split != NULL && (c->local_2d_last_frame || c->zones_frame || c->active_zone_mask != NULL)) {
+	if (c->split != NULL && (vk_frame_has_over_local2d(c) || c->zones_frame || c->active_zone_mask != NULL)) {
 		vk_split_retire_locked(c,
-		                       "the frame carries 2D or zone-mask layers this rung's transport "
-		                       "cannot move to the scanout adapter",
+		                       "the frame carries 2D-over or zone-mask layers whose composite this "
+		                       "rung cannot run on the scanout adapter",
 		                       COMP_SPLIT_REASON_LAYERS_UNSUPPORTED);
 	}
 #endif
@@ -4485,7 +4554,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// non-self-submit path the flatten's SHADER_READ barrier orders it
 			// within the one submit. VK_NULL_HANDLE ⟹ no under-layers this frame.
 			uint32_t bd_w = 0, bd_h = 0;
-			VkImageView bd_view = vk_flatten_backdrop_2d(c, cmd, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			VkImageView bd_view =
+			    vk_flatten_backdrop_2d(c, cmd, /*plane=*/NULL, dp_target_w, dp_target_h, &bd_w, &bd_h);
 
 			// #1073 — same precedence as the window path: the captured desktop
 			// only fills the slot the app's own Local2D backdrop declined. The
@@ -4598,6 +4668,18 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		c->repaint.cols = c->eff_layout.cols;
 		c->repaint.rows = c->eff_layout.rows;
 
+		/*
+		 * VK-1b — the PLANE pass, before the handoff is taken.
+		 *
+		 * Order matters twice. It flattens into deposit-backed surfaces and
+		 * claims a timeline value for that submit, so the handoff read below
+		 * carries a `fence_value` that covers the planes as well as the atlas —
+		 * one GPU-side consumer wait for both. And it stages the plane and the
+		 * backdrop extent that comp_vk_split_submit_atlas then stamps onto the
+		 * slot's recipe.
+		 */
+		vk_split_stage_planes(c, tgt_width, tgt_height);
+
 		struct comp_vk_deposit_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
@@ -4610,6 +4692,14 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			 * Queued signal; nothing waits here.
 			 */
 			comp_vk_deposit_note_consumed(dep, handoff.slot);
+			/*
+			 * VK-1b — the same edge for the PLANES, and it has to be here
+			 * rather than inside the split: comp_vk_split_submit_atlas has
+			 * just taken the bridge's `pre_plane_write` wait on this app
+			 * immediate context, and this signal must land BEHIND it in that
+			 * one ordered stream. Vulkan's next flatten waits for the value.
+			 */
+			comp_vk_deposit_note_planes_consumed(dep);
 		}
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
@@ -4797,6 +4887,22 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	 * joined at the top of this function, which is what makes that safe.
 	 */
 	comp_vk_split_destroy(&c->split);
+
+	/*
+	 * VK-1b — the plane pass's own objects. The framebuffer is built over the
+	 * deposit's imported image, so it must go before the renderer frees the
+	 * deposit below; the command buffers are freed with their pool, and the
+	 * device was drained by the repaint join plus the split teardown above.
+	 */
+	if (c->plane_bd_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, c->plane_bd_fb, NULL);
+		c->plane_bd_fb = VK_NULL_HANDLE;
+		c->plane_bd_fb_view = VK_NULL_HANDLE;
+	}
+	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
+		c->plane_cmd_pool = VK_NULL_HANDLE;
+	}
 #endif
 
 	// Destroy display processor
@@ -5228,6 +5334,22 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 
 	comp_vk_split_retire(&c->split, why, short_reason);
 	c->split_off_reason = short_reason;
+
+	/*
+	 * VK-1b — the plane framebuffer is built over the deposit plane's imported
+	 * image and is only ever used by the split's plane pass. Drop it here, in
+	 * the ONE recovery path, so the app-device flatten below goes back to its
+	 * private scratch and no stale framebuffer can outlive the transport that
+	 * gave it its attachment. `comp_vk_split_retire` has already quiesced the
+	 * bridge, so nothing is still reading it.
+	 */
+	if (c->plane_bd_fb != VK_NULL_HANDLE) {
+		c->vk.vkDestroyFramebuffer(c->vk.device, c->plane_bd_fb, NULL);
+		c->plane_bd_fb = VK_NULL_HANDLE;
+		c->plane_bd_fb_view = VK_NULL_HANDLE;
+	}
+	c->plane_region_w = 0;
+	c->plane_region_h = 0;
 
 	(void)vk_make_dp_vk(c, c->dp_factory_vk_saved, c->queue_family_index, c->queue_index_saved,
 	                    c->transparent_background_saved);
@@ -6904,6 +7026,57 @@ vk_destroy_rt(struct comp_vk_native_compositor *c,
 	}
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * VK-1b (#1178) — (re)build the flatten framebuffer over a bridge PLANE's image.
+ *
+ * The plane's image and view belong to the deposit (they are an imported D3D11
+ * texture); the FRAMEBUFFER does not, because it is built over the local2d
+ * flatten render pass, which lives on the compositor. Keyed on the VIEW, so a
+ * plane reallocation — the only thing that changes the view — rebuilds it and a
+ * steady-state frame costs a pointer compare.
+ */
+static bool
+vk_plane_ensure_fb(struct comp_vk_native_compositor *c,
+                   VkFramebuffer *fb,
+                   VkImageView *fb_view,
+                   VkImageView view,
+                   uint32_t w,
+                   uint32_t h,
+                   const char *what)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (view == VK_NULL_HANDLE || w == 0 || h == 0 || c->local2d.flatten_rp == VK_NULL_HANDLE) {
+		return false;
+	}
+	if (*fb != VK_NULL_HANDLE && *fb_view == view) {
+		return true;
+	}
+	if (*fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, *fb, NULL);
+		*fb = VK_NULL_HANDLE;
+	}
+	*fb_view = VK_NULL_HANDLE;
+
+	VkFramebufferCreateInfo fb_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = c->local2d.flatten_rp,
+	    .attachmentCount = 1,
+	    .pAttachments = &view,
+	    .width = w,
+	    .height = h,
+	    .layers = 1,
+	};
+	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, fb) != VK_SUCCESS) {
+		U_LOG_E("[local2d] %s: plane framebuffer %ux%u failed", what, w, h);
+		*fb = VK_NULL_HANDLE;
+		return false;
+	}
+	*fb_view = view;
+	return true;
+}
+#endif
+
 // #439 Phase 2/3 effective canvas: an active mask or a Local2D-carrying frame
 // supersedes the canvas output rect with the client-window rect (the weave
 // region, composite region, and view dims share one authority). With neither,
@@ -7046,6 +7219,7 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 static VkImageView
 vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
                        VkCommandBuffer cmd,
+                       const struct comp_vk_deposit_plane *plane,
                        uint32_t dst_w,
                        uint32_t dst_h,
                        uint32_t *out_w,
@@ -7054,6 +7228,7 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	struct vk_bundle *vk = &c->vk;
 	*out_w = 0;
 	*out_h = 0;
+	(void)plane;
 
 	if (!c->local2d_initialized || !c->local_2d_last_frame) {
 		return VK_NULL_HANDLE;
@@ -7090,25 +7265,59 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	}
 
 	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM;
-	if (!vk_ensure_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
-	                  &c->backdrop_scratch_fb, &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w,
-	                  region_h, scratch_fmt,
-	                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-	                  c->local2d.flatten_rp, "backdrop scratch")) {
-		return VK_NULL_HANDLE;
+
+	/*
+	 * VK-1b (#1178) — WHERE THIS FLATTENS.
+	 *
+	 * Off the split it is the private `backdrop_scratch`, region-sized, exactly
+	 * as it always was. Under the split the pixels have to reach the SCANOUT
+	 * adapter, so the target is the bridge BACKDROP plane's deposit-backed
+	 * VkImage instead — a D3D11 texture Vulkan renders straight into, with no
+	 * copy anywhere (comp_vk_native_deposit.h). The plane is PANEL-sized and the
+	 * draws stay region-sized: `vk_local2d_composite_flatten_draw` sets the
+	 * render area from the region it is passed, so the content is anchored
+	 * top-left inside the larger surface, which is the layout the bridge and the
+	 * output-device composite both assume (#464).
+	 */
+	VkImage bd_image;
+	VkFramebuffer bd_fb;
+	VkImageView bd_view;
+#ifdef XRT_OS_WINDOWS
+	if (plane != NULL) {
+		bd_image = (VkImage)(uintptr_t)plane->image;
+		bd_view = (VkImageView)(uintptr_t)plane->view;
+		if (!vk_plane_ensure_fb(c, &c->plane_bd_fb, &c->plane_bd_fb_view, bd_view, plane->width, plane->height,
+		                        "backdrop plane")) {
+			return VK_NULL_HANDLE;
+		}
+		bd_fb = c->plane_bd_fb;
+	} else
+#endif
+	{
+		if (!vk_ensure_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+		                  &c->backdrop_scratch_fb, &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w,
+		                  region_h, scratch_fmt,
+		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		                  c->local2d.flatten_rp, "backdrop scratch")) {
+			return VK_NULL_HANDLE;
+		}
+		bd_image = c->backdrop_scratch;
+		bd_view = c->backdrop_scratch_view;
+		bd_fb = c->backdrop_scratch_fb;
 	}
 
 	vk_local2d_begin_frame_once(c);
 
 	// Clear transparent + → COLOR_ATTACHMENT (mirrors the local2d_scratch prep).
-	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	// The clear covers the WHOLE surface, which on the panel-sized plane is also
+	// what keeps pixels outside a shrinking region from surviving as content.
+	vk_cmd_image_barrier_locked(vk, cmd, bd_image, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
 	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-	vk->vkCmdClearColorImage(cmd, c->backdrop_scratch, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1,
-	                         &k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+	vk->vkCmdClearColorImage(cmd, bd_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -7120,12 +7329,11 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		vk_flatten_one_local2d_layer(c, cmd, c->backdrop_scratch_fb, layer, region_w, region_h);
+		vk_flatten_one_local2d_layer(c, cmd, bd_fb, layer, region_w, region_h);
 	}
 
-	vk_cmd_image_barrier_locked(vk, cmd, c->backdrop_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
 
@@ -7138,8 +7346,422 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 
 	*out_w = region_w;
 	*out_h = region_h;
-	return c->backdrop_scratch_view;
+	return bd_view;
 }
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * VK-1b (#1178) — the index of this frame's projection layer, or -1.
+ *
+ * The under/over split is list order around the projection (#491 part 3), so both
+ * the backdrop flatten and the over-layer test need this same scan.
+ */
+static int32_t
+vk_frame_proj_index(struct comp_vk_native_compositor *c)
+{
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			return (int32_t)i;
+		}
+	}
+	return -1;
+}
+
+static bool
+vk_frame_has_over_local2d(struct comp_vk_native_compositor *c)
+{
+	if (!c->local_2d_last_frame) {
+		return false;
+	}
+	/*
+	 * A zones frame has no under/over split (2D-under is reserved in v1), so
+	 * every Local2D layer in one is an over-layer.
+	 */
+	if (c->zones_frame) {
+		return true;
+	}
+	const int32_t proj_idx = vk_frame_proj_index(c);
+	if (proj_idx < 0) {
+		// No projection ⟹ nothing is "under" it ⟹ everything is an overlay.
+		return true;
+	}
+	for (uint32_t i = (uint32_t)proj_idx; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * VK-1b (#1178) — a content digest and destination box for one side of the
+ * frame's Local2D layers.
+ *
+ * The digest is the bridge's change-skip key, and it is not an optimisation: a
+ * full-window RGBA plane at 4K60 is ~2 GB/s on its own, so a plane that did not
+ * change must not be copied. The IMAGE INDEX is what makes it safe rather than
+ * optimistic — the swapchain hands indices out round-robin, so an app that
+ * redraws hashes differently every frame while an app that has stopped acquiring
+ * keeps its index and genuinely has not changed.
+ *
+ * TODO(#1178 VK-1b): the third copy of this. `d3d11_local2d_digest`
+ * (src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp) and `d3d12_local2d_digest`
+ * (src/xrt/compositor/d3d12/comp_d3d12_compositor.cpp:7043) are the other two,
+ * and all three feed the SAME bridge — a divergence here is a divergence in what
+ * "the plane changed" means. Extraction into one shared helper is tracked
+ * separately; it touches two shipped legs, and this epic's rule is
+ * land-before-restructure.
+ *
+ * @param proj_idx This frame's projection index, or -1.
+ * @param over false selects the UNDER layers (the backdrop), true the OVER ones.
+ * @param[out] out_box The union destination box, in region pixels. When the side
+ *        carries no layers this is the WHOLE region: the plane is then a cleared
+ *        region, and the clear itself is what has to reach the other adapter.
+ */
+static void
+vk_local2d_digest(struct comp_vk_native_compositor *c,
+                  int32_t proj_idx,
+                  bool over,
+                  uint32_t region_w,
+                  uint32_t region_h,
+                  struct xrt_rect *out_box,
+                  uint64_t *out_hash)
+{
+	uint64_t hash = 1469598103934665603ull;
+#define VK_DIGEST_MIX(v)                                                                                               \
+	do {                                                                                                           \
+		hash = (hash ^ (uint64_t)(v)) * 1099511628211ull;                                                      \
+	} while (0)
+
+	VK_DIGEST_MIX(region_w);
+	VK_DIGEST_MIX(region_h);
+
+	int32_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+	uint32_t counted = 0;
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		// Zones frames have no under/over split — every layer is an overlay.
+		const bool is_under = !c->zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx;
+		if (is_under == over) {
+			continue;
+		}
+		counted++;
+
+		const struct xrt_rect r = layer->data.local_2d.rect;
+		const struct xrt_normalized_rect nr = layer->data.local_2d.sub.norm_rect;
+		VK_DIGEST_MIX((uint64_t)(uintptr_t)layer->sc_array[0]);
+		VK_DIGEST_MIX(layer->data.local_2d.sub.image_index);
+		VK_DIGEST_MIX((uint32_t)r.offset.w);
+		VK_DIGEST_MIX((uint32_t)r.offset.h);
+		VK_DIGEST_MIX((uint32_t)r.extent.w);
+		VK_DIGEST_MIX((uint32_t)r.extent.h);
+		VK_DIGEST_MIX((uint32_t)layer->data.local_2d.sub.rect.offset.w);
+		VK_DIGEST_MIX((uint32_t)layer->data.local_2d.sub.rect.offset.h);
+		VK_DIGEST_MIX((uint32_t)layer->data.local_2d.sub.rect.extent.w);
+		VK_DIGEST_MIX((uint32_t)layer->data.local_2d.sub.rect.extent.h);
+		VK_DIGEST_MIX((uint32_t)(nr.x * 65536.0f));
+		VK_DIGEST_MIX((uint32_t)(nr.y * 65536.0f));
+		VK_DIGEST_MIX((uint32_t)(nr.w * 65536.0f));
+		VK_DIGEST_MIX((uint32_t)(nr.h * 65536.0f));
+		VK_DIGEST_MIX((uint32_t)layer->data.flip_y);
+		VK_DIGEST_MIX((uint32_t)layer->data.flags);
+
+		if (r.offset.w < x0) {
+			x0 = r.offset.w;
+		}
+		if (r.offset.h < y0) {
+			y0 = r.offset.h;
+		}
+		if (r.offset.w + r.extent.w > x1) {
+			x1 = r.offset.w + r.extent.w;
+		}
+		if (r.offset.h + r.extent.h > y1) {
+			y1 = r.offset.h + r.extent.h;
+		}
+	}
+#undef VK_DIGEST_MIX
+
+	if (counted == 0 || x1 <= x0 || y1 <= y0) {
+		out_box->offset.w = 0;
+		out_box->offset.h = 0;
+		out_box->extent.w = (int32_t)region_w;
+		out_box->extent.h = (int32_t)region_h;
+	} else {
+		if (x0 < 0) {
+			x0 = 0;
+		}
+		if (y0 < 0) {
+			y0 = 0;
+		}
+		if (x1 > (int32_t)region_w) {
+			x1 = (int32_t)region_w;
+		}
+		if (y1 > (int32_t)region_h) {
+			y1 = (int32_t)region_h;
+		}
+		out_box->offset.w = x0;
+		out_box->offset.h = y0;
+		out_box->extent.w = (x1 > x0) ? (x1 - x0) : 0;
+		out_box->extent.h = (y1 > y0) ? (y1 - y0) : 0;
+	}
+
+	// 0 is the bridge's reserved "this frame does not use the plane".
+	*out_hash = (hash == 0) ? 1u : hash;
+}
+
+//! Allocate the plane pass's own pool + command-buffer ring. Idempotent.
+static bool
+vk_plane_cmd_ring_ensure(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
+		return true;
+	}
+	VkCommandPoolCreateInfo pool_ci = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+	    .queueFamilyIndex = vk->main_queue->family_index,
+	};
+	if (vk->vkCreateCommandPool(vk->device, &pool_ci, NULL, &c->plane_cmd_pool) != VK_SUCCESS) {
+		c->plane_cmd_pool = VK_NULL_HANDLE;
+		U_LOG_W(
+		    "#918 VK-1b: the plane command pool could not be created — the 2D planes do not "
+		    "transport this session; the weave is unaffected");
+		return false;
+	}
+	VkCommandBufferAllocateInfo cba = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = c->plane_cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = VK_SPLIT_PLANE_CMD_RING,
+	};
+	if (vk->vkAllocateCommandBuffers(vk->device, &cba, c->plane_cmd) != VK_SUCCESS) {
+		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
+		c->plane_cmd_pool = VK_NULL_HANDLE;
+		return false;
+	}
+	for (uint32_t i = 0; i < VK_SPLIT_PLANE_CMD_RING; i++) {
+		c->plane_cmd_value[i] = 0;
+	}
+	c->plane_cmd_next = 0;
+	return true;
+}
+
+/*!
+ * Take the next ring entry whose last submit has RETIRED, or -1 when every entry
+ * is still in flight.
+ *
+ * The retirement test is a non-blocking timeline query, never a wait: resetting a
+ * command buffer the GPU is still executing is undefined behaviour, and blocking
+ * until it is not is the #925 wedge class.
+ */
+static int32_t
+vk_plane_cmd_ring_take(struct comp_vk_native_compositor *c, struct comp_vk_deposit *dep)
+{
+	struct vk_bundle *vk = &c->vk;
+	const VkSemaphore timeline = comp_vk_deposit_get_timeline(dep);
+
+	for (uint32_t n = 0; n < VK_SPLIT_PLANE_CMD_RING; n++) {
+		const uint32_t i = (c->plane_cmd_next + n) % VK_SPLIT_PLANE_CMD_RING;
+		if (c->plane_cmd_value[i] == 0) {
+			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+			return (int32_t)i; // never used
+		}
+		if (timeline == VK_NULL_HANDLE || vk->vkGetSemaphoreCounterValue == NULL) {
+			// No timeline to ask. The deposit then has no working sync at
+			// all, so nothing is racing this buffer either.
+			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+			return (int32_t)i;
+		}
+		uint64_t now = 0;
+		if (vk->vkGetSemaphoreCounterValue(vk->device, timeline, &now) != VK_SUCCESS) {
+			return -1;
+		}
+		if (now >= c->plane_cmd_value[i]) {
+			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+			return (int32_t)i;
+		}
+	}
+	return -1;
+}
+
+static void
+vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint32_t tgt_h)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (c->split == NULL || c->renderer == NULL) {
+		return;
+	}
+	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+	if (dep == NULL || !c->local2d_initialized) {
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+
+	/*
+	 * Sized at the PANEL, once. `comp_xbridge_info::panel_width/height` states
+	 * the rule: a window can never exceed the panel, so a plane allocated here
+	 * fits every region the session will ever composite — and allocating once
+	 * keeps the plane structurally outside the R2 resize hysteresis, where a
+	 * per-size realloc of NT-shared textures on the frame path is exactly what
+	 * cost 21 of 50 frames on the D3D11 leg (#1091).
+	 */
+	uint32_t panel_w = 0, panel_h = 0;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		panel_w = c->xdev->hmd->screens[0].w_pixels;
+		panel_h = c->xdev->hmd->screens[0].h_pixels;
+	}
+	if (panel_w == 0 || panel_h == 0) {
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+
+	if (!comp_vk_deposit_plane_ensure(dep, COMP_VK_DEPOSIT_PLANE_BACKDROP, panel_w, panel_h,
+	                                  VK_FORMAT_B8G8R8A8_UNORM)) {
+		// Feature-local degrade: no 2D-under band this session, weave untouched.
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+	struct comp_vk_deposit_plane pl = {0};
+	if (!comp_vk_deposit_plane_get(dep, COMP_VK_DEPOSIT_PLANE_BACKDROP, &pl)) {
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+
+	/*
+	 * #918 review F4 — the composite REGION moved. The plane is panel-sized, so
+	 * a shrink leaves stale pixels outside the new region and the per-slot dirty
+	 * box union would carry them across as content. The flatten below re-clears
+	 * the whole surface every frame, so all that is owed here is telling every
+	 * egress slot it needs a FULL refresh rather than this frame's box.
+	 */
+	uint32_t region_w = 0, region_h = 0;
+	vk_window_region(c, tgt_w, tgt_h, &region_w, &region_h);
+	if (region_w != c->plane_region_w || region_h != c->plane_region_h) {
+		c->plane_region_w = region_w;
+		c->plane_region_h = region_h;
+		comp_vk_split_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_BACKDROP);
+	}
+
+	/*
+	 * The plane pass gets its OWN command buffer and its own submit, for one
+	 * reason: the atlas submit has already happened inside
+	 * comp_vk_native_renderer_draw, and the deposit's timeline value it claimed
+	 * is what the bridge waits on. Claiming a SECOND value here — after it, on
+	 * the same monotonic timeline — makes the handoff's `fence_value` cover the
+	 * planes as well as the atlas, so the single `ID3D11DeviceContext4::Wait`
+	 * comp_vk_split_submit_atlas already takes orders BOTH.
+	 */
+	if (!vk_plane_cmd_ring_ensure(c)) {
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+	const int32_t ring = vk_plane_cmd_ring_take(c, dep);
+	if (ring < 0) {
+		/*
+		 * Every entry is still in flight. Skip the plane update for this frame
+		 * rather than stall: the bridge change-skips on the unchanged seq and
+		 * the previous backdrop stands, which is one frame stale at worst. The
+		 * plane is NOT un-staged — un-staging would stamp it invalid and blank
+		 * the 2D-under band for a frame, which is a flicker, not a degradation.
+		 */
+		return;
+	}
+	const VkCommandBuffer cmd = c->plane_cmd[ring];
+
+	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+	uint32_t bd_w = 0, bd_h = 0;
+	const VkImageView bd_view = vk_flatten_backdrop_2d(c, cmd, &pl, tgt_w, tgt_h, &bd_w, &bd_h);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	if (bd_view == VK_NULL_HANDLE) {
+		/*
+		 * The frame has no 2D-under layers. Nothing was recorded worth
+		 * submitting, and — critically — no timeline value was claimed, so
+		 * nothing can be left waiting on one. Un-stage: the weave then CLEARS
+		 * the display processor's background, which is what "this frame has no
+		 * backdrop" means.
+		 */
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+
+	/*
+	 * Signal the deposit timeline so the bridge's read of the plane is ordered
+	 * behind this flatten, and WAIT on the plane release value so this flatten is
+	 * ordered behind the bridge's read of the PREVIOUS frame's. Both halves are
+	 * queue operations on one bidirectional fence; neither is a CPU wait, and
+	 * they are what let the plane be single-buffered.
+	 */
+	VkSemaphore sem = VK_NULL_HANDLE;
+	uint64_t signal_value = 0;
+	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
+	const uint64_t wait_value = comp_vk_deposit_plane_wait_value(dep);
+	VkPipelineStageFlags wait_stage =
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+	VkTimelineSemaphoreSubmitInfo timeline_info = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+	};
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (sem != VK_NULL_HANDLE) {
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues = &signal_value;
+		submit_info.pNext = &timeline_info;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores = &sem;
+		if (wait_value != 0) {
+			timeline_info.waitSemaphoreValueCount = 1;
+			timeline_info.pWaitSemaphoreValues = &wait_value;
+			submit_info.waitSemaphoreCount = 1;
+			submit_info.pWaitSemaphores = &sem;
+			submit_info.pWaitDstStageMask = &wait_stage;
+		}
+	}
+
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+		/*
+		 * The submit never reached the queue, so the value it claimed will never
+		 * be signalled — and a consumer waiting on a value nothing will signal
+		 * hangs forever. Give it back.
+		 */
+		if (sem != VK_NULL_HANDLE) {
+			comp_vk_deposit_abandon_signal(dep);
+		}
+		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		return;
+	}
+	// The entry is reusable once the timeline passes this value.
+	c->plane_cmd_value[ring] = signal_value;
+
+	struct xrt_rect box = {0};
+	uint64_t hash = 0;
+	vk_local2d_digest(c, vk_frame_proj_index(c), /*over=*/false, region_w, region_h, &box, &hash);
+
+	comp_vk_split_stage_backdrop(c->split, pl.shared_handle, pl.generation, pl.width, pl.height, hash, box.offset.w,
+	                             box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h, bd_w, bd_h);
+}
+#endif /* XRT_OS_WINDOWS */
 
 // #439 Phase 3 — masked 2D-over-3D composite, POST-weave. The DP has woven the
 // 3D into `dst`; this overlays the frame's 2D content where the zone mask says
