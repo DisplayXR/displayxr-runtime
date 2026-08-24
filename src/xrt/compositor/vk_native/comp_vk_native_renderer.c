@@ -24,6 +24,7 @@
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
+#include "comp_vk_native_deposit.h"
 
 #include "util/comp_layer_accum.h"
 
@@ -100,7 +101,17 @@ struct comp_vk_native_renderer
 	struct
 	{
 		VkRenderPass render_pass;
+		//! Framebuffer for the CURRENT atlas view — one of @ref fb below.
 		VkFramebuffer framebuffer;
+		/*!
+		 * One framebuffer per atlas view. With the renderer's own atlas
+		 * there is exactly one and this behaves as a single framebuffer
+		 * did; with the VK-0 deposit ring (#1178) the atlas view
+		 * alternates every frame, and rebuilding the framebuffer each
+		 * time would be pure churn on the render path.
+		 */
+		VkFramebuffer fb[COMP_VK_DEPOSIT_RING];
+		VkImageView fb_view[COMP_VK_DEPOSIT_RING];
 		VkDescriptorSetLayout set_layout;
 		VkPipelineLayout pipeline_layout;
 		VkSampler sampler;
@@ -110,6 +121,16 @@ struct comp_vk_native_renderer
 		bool ready;
 		bool failed; //!< init failed once — stay on the blit fallback
 	} zone;
+
+	/*!
+	 * VK-0 (#1178) — when non-NULL the atlas is NOT owned by this renderer:
+	 * @ref atlas_image / @ref atlas_view point at the deposit's current ring
+	 * slot, which is a same-adapter D3D11 shared texture imported as a
+	 * renderable VkImage. Nothing else about the draw path changes; the atlas
+	 * is written in place exactly as before, it just lives somewhere D3D can
+	 * reach. NULL (the default) restores the owned-atlas path verbatim.
+	 */
+	struct comp_vk_deposit *deposit;
 };
 
 static void
@@ -117,10 +138,14 @@ zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	if (r->zone.framebuffer != VK_NULL_HANDLE) {
-		vk->vkDestroyFramebuffer(vk->device, r->zone.framebuffer, NULL);
-		r->zone.framebuffer = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (r->zone.fb[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, r->zone.fb[i], NULL);
+			r->zone.fb[i] = VK_NULL_HANDLE;
+		}
+		r->zone.fb_view[i] = VK_NULL_HANDLE;
 	}
+	r->zone.framebuffer = VK_NULL_HANDLE;
 }
 
 static void
@@ -169,6 +194,16 @@ destroy_atlas_resources(struct comp_vk_native_renderer *r)
 	// rest of the zone bundle is atlas-independent and survives resizes.
 	zone_draw_destroy_framebuffer(r);
 
+	// VK-0 (#1178): the deposit owns its ring, image, view and memory. Let
+	// go of the borrowed handles; comp_vk_deposit_resize / _destroy frees
+	// them (and idles the device first, which this path does not).
+	if (r->deposit != NULL) {
+		r->atlas_image = VK_NULL_HANDLE;
+		r->atlas_view = VK_NULL_HANDLE;
+		r->atlas_memory = VK_NULL_HANDLE;
+		return;
+	}
+
 	if (r->atlas_view != VK_NULL_HANDLE) {
 		vk->vkDestroyImageView(vk->device, r->atlas_view, NULL);
 		r->atlas_view = VK_NULL_HANDLE;
@@ -197,6 +232,33 @@ create_atlas_resources(struct comp_vk_native_renderer *r,
 	r->texture_height = view_height;
 	r->atlas_alloc_width = atlas_width;
 	r->atlas_alloc_height = atlas_height;
+
+	/*
+	 * VK-0 (#1178) — the atlas lives in the deposit's D3D11 texture.
+	 *
+	 * Nothing is allocated here and nothing is copied later: the imported
+	 * image carries VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, so the draw path
+	 * below writes the D3D11 texture directly. The slot is picked per frame
+	 * in comp_vk_native_renderer_draw.
+	 */
+	if (r->deposit != NULL) {
+		if (comp_vk_deposit_resize(r->deposit, atlas_width, atlas_height) != XRT_SUCCESS) {
+			U_LOG_W("VK-0 deposit: could not size the deposit to %ux%u — dropping back to the "
+			        "renderer's own atlas",
+			        atlas_width, atlas_height);
+			comp_vk_deposit_destroy(&r->deposit);
+			// Fall through to the owned-atlas allocation below.
+		} else {
+			uint64_t dep_image = 0;
+			uint64_t dep_view = 0;
+			comp_vk_deposit_get_current(r->deposit, &dep_image, &dep_view);
+			r->atlas_image = (VkImage)(uintptr_t)dep_image;
+			r->atlas_view = (VkImageView)(uintptr_t)dep_view;
+			U_LOG_I("VK-0 deposit atlas: %ux%u (view %ux%u, tiles %ux%u)", atlas_width, atlas_height,
+			        view_width, view_height, r->tile_columns, r->tile_rows);
+			return XRT_SUCCESS;
+		}
+	}
 
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -286,6 +348,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t view_height,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
+                                bool app_timeline_semaphores,
                                 struct comp_vk_native_renderer **out_renderer)
 {
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
@@ -314,8 +377,23 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 
+	/*
+	 * VK-0 (#1178) — stand the D3D11 deposit up BEFORE the atlas, so
+	 * create_atlas_resources can adopt it instead of allocating. Requested
+	 * with DXR_VK_DEPOSIT=1 and nothing else; every failure inside is
+	 * non-fatal and leaves r->deposit NULL, i.e. the byte-identical
+	 * owned-atlas path.
+	 */
+	if (comp_vk_deposit_requested()) {
+		if (comp_vk_deposit_create(vk, app_timeline_semaphores, atlas_width, atlas_height, r->format,
+		                           &r->deposit) != XRT_SUCCESS) {
+			r->deposit = NULL;
+		}
+	}
+
 	xrt_result_t xret = create_atlas_resources(r, view_width, view_height, atlas_width, atlas_height);
 	if (xret != XRT_SUCCESS) {
+		comp_vk_deposit_destroy(&r->deposit);
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
 		free(r);
 		return xret;
@@ -339,6 +417,9 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 
 	destroy_atlas_resources(r);
 	zone_draw_destroy(r);
+	// After destroy_atlas_resources — that call drops the borrowed handles
+	// into the deposit's ring, this one frees the ring itself.
+	comp_vk_deposit_destroy(&r->deposit);
 
 	if (r->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
@@ -712,14 +793,90 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	return true;
 }
 
+/*!
+ * VK-0 (#1178) — chain the deposit's timeline signal onto an atlas submit.
+ *
+ * The submit that finishes writing the atlas is the one whose completion a D3D
+ * consumer has to see, so the semaphore is signalled from exactly there and
+ * nowhere else. This is the ONLY synchronisation the deposit adds, and it is
+ * entirely GPU-side: the consumer's `ID3D11DeviceContext4::Wait(fence, value)`
+ * orders its reads behind this signal without any CPU blocking on Vulkan. In
+ * particular the deposit does NOT lean on the pre-existing per-frame
+ * `vkQueueWaitIdle` below (#837's to remove) — take that wait away and the
+ * ordering guarantee here is unchanged.
+ *
+ * No-op, leaving @p submit_info untouched, when there is no deposit.
+ *
+ * @param[out] sem_storage,value_storage Caller-owned storage that must outlive
+ *        the vkQueueSubmit call — VkSubmitInfo only borrows pointers.
+ */
+static void
+deposit_chain_signal(struct comp_vk_native_renderer *r,
+                     VkSubmitInfo *submit_info,
+                     VkTimelineSemaphoreSubmitInfo *timeline_info,
+                     VkSemaphore *sem_storage,
+                     uint64_t *value_storage)
+{
+	*sem_storage = VK_NULL_HANDLE;
+	*value_storage = 0;
+
+	if (r->deposit == NULL) {
+		return;
+	}
+
+	comp_vk_deposit_claim_signal(r->deposit, sem_storage, value_storage);
+	if (*sem_storage == VK_NULL_HANDLE) {
+		return;
+	}
+
+	timeline_info->sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+	timeline_info->pNext = submit_info->pNext;
+	timeline_info->waitSemaphoreValueCount = 0;
+	timeline_info->pWaitSemaphoreValues = NULL;
+	timeline_info->signalSemaphoreValueCount = 1;
+	timeline_info->pSignalSemaphoreValues = value_storage;
+
+	submit_info->pNext = timeline_info;
+	submit_info->signalSemaphoreCount = 1;
+	submit_info->pSignalSemaphores = sem_storage;
+}
+
 //! (Re)create the framebuffer over the current atlas view.
 static bool
 zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	if (r->zone.framebuffer != VK_NULL_HANDLE) {
-		return true;
+	if (r->atlas_view == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	// Already have one for this view? (Always true after the first zones
+	// frame on the owned atlas; alternates between two entries on the
+	// VK-0 deposit ring.)
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (r->zone.fb[i] != VK_NULL_HANDLE && r->zone.fb_view[i] == r->atlas_view) {
+			r->zone.framebuffer = r->zone.fb[i];
+			return true;
+		}
+	}
+
+	uint32_t slot = 0;
+	bool found_free = false;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (r->zone.fb[i] == VK_NULL_HANDLE) {
+			slot = i;
+			found_free = true;
+			break;
+		}
+	}
+	if (!found_free) {
+		// Cache is sized to the ring, so this is unreachable in practice;
+		// evict rather than leak if the atlas view set ever grows.
+		vk->vkDestroyFramebuffer(vk->device, r->zone.fb[0], NULL);
+		r->zone.fb[0] = VK_NULL_HANDLE;
+		r->zone.fb_view[0] = VK_NULL_HANDLE;
+		slot = 0;
 	}
 
 	VkFramebufferCreateInfo fb_ci = {
@@ -732,11 +889,14 @@ zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
 	    .layers = 1,
 	};
 
-	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.framebuffer);
+	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.fb[slot]);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to create framebuffer: %d", res);
+		r->zone.fb[slot] = VK_NULL_HANDLE;
 		return false;
 	}
+	r->zone.fb_view[slot] = r->atlas_view;
+	r->zone.framebuffer = r->zone.fb[slot];
 	return true;
 }
 
@@ -1080,9 +1240,17 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	    .pCommandBuffers = &cmd,
 	};
 
+	VkTimelineSemaphoreSubmitInfo deposit_timeline = {0};
+	VkSemaphore deposit_sem = VK_NULL_HANDLE;
+	uint64_t deposit_value = 0;
+	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value);
+
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
+		// The claimed value will never be signalled — give it back, or a
+		// consumer waiting on it waits forever.
+		comp_vk_deposit_abandon_signal(r->deposit);
 		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
 		return XRT_ERROR_VULKAN;
 	}
@@ -1111,6 +1279,22 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	struct vk_bundle *vk = r->vk;
 	(void)left_eye;
 	(void)right_eye;
+
+	/*
+	 * VK-0 (#1178) — take the next deposit slot for this APP frame.
+	 *
+	 * Only here: a repaint replays the atlas the last app frame left behind
+	 * and never reaches this function, so the slot (and the timeline value a
+	 * consumer is waiting on) stays put across repaints, which is exactly
+	 * what a replay means.
+	 */
+	if (r->deposit != NULL) {
+		uint64_t dep_image = 0;
+		uint64_t dep_view = 0;
+		comp_vk_deposit_advance(r->deposit, &dep_image, &dep_view);
+		r->atlas_image = (VkImage)(uintptr_t)dep_image;
+		r->atlas_view = (VkImageView)(uintptr_t)dep_view;
+	}
 
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must stay
@@ -1359,9 +1543,17 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	    .pCommandBuffers = &cmd,
 	};
 
+	VkTimelineSemaphoreSubmitInfo deposit_timeline = {0};
+	VkSemaphore deposit_sem = VK_NULL_HANDLE;
+	uint64_t deposit_value = 0;
+	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value);
+
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
+		// The claimed value will never be signalled — give it back, or a
+		// consumer waiting on it waits forever.
+		comp_vk_deposit_abandon_signal(r->deposit);
 		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
 		return XRT_ERROR_VULKAN;
 	}
@@ -1370,6 +1562,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
 
 	return XRT_SUCCESS;
+}
+
+struct comp_vk_deposit *
+comp_vk_native_renderer_get_deposit(struct comp_vk_native_renderer *r)
+{
+	return r != NULL ? r->deposit : NULL;
 }
 
 uint64_t
