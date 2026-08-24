@@ -331,10 +331,6 @@ comp_vk_split_get_display_pixel_info(struct comp_vk_split *split,
                                      int32_t *out_top);
 
 bool
-comp_vk_split_get_window_metrics(
-    struct comp_vk_split *split, int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h);
-
-bool
 comp_vk_split_request_display_mode(struct comp_vk_split *split, bool enable_3d);
 
 void
