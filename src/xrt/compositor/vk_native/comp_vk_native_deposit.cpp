@@ -48,6 +48,12 @@ struct comp_vk_deposit_slot
 	VkImage image;
 	VkImageView view;
 	VkDeviceMemory memory;
+	/*!
+	 * VK-1 (#1178) — the timeline value the app-end D3D11 context signals once
+	 * a consumer has finished reading this slot. Vulkan's next write into it
+	 * waits for exactly this. 0 while no consumer has taken it.
+	 */
+	uint64_t release_value;
 };
 
 struct comp_vk_deposit
@@ -692,6 +698,54 @@ comp_vk_deposit_abandon_signal(struct comp_vk_deposit *dep)
 	dep->value -= 1;
 }
 
+extern "C" void
+comp_vk_deposit_note_consumed(struct comp_vk_deposit *dep, uint32_t slot)
+{
+	if (dep == NULL || dep->fence == NULL || dep->ctx == NULL || slot >= COMP_VK_DEPOSIT_RING) {
+		return;
+	}
+
+	ID3D11DeviceContext4 *ctx4 = NULL;
+	if (FAILED(dep->ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&ctx4)) || ctx4 == NULL) {
+		/*
+		 * Without ID3D11DeviceContext4 there is no queued signal to give, and
+		 * a value RECORDED but never signalled would hang Vulkan forever —
+		 * strictly worse than no back-pressure. Leave release_value at 0: the
+		 * ring then keeps VK-0's timing-only separation, which is what a
+		 * machine lacking the interface had anyway.
+		 */
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W("vk deposit: no ID3D11DeviceContext4 — the ring keeps VK-0's timing-only "
+			        "separation instead of a queued release (#1178)");
+		}
+		return;
+	}
+
+	// Past every value claimed so far, so a release can never be mistaken for
+	// (or overtaken by) one of Vulkan's own atlas signals on the same timeline.
+	dep->value += 1;
+	ctx4->Signal(dep->fence, dep->value);
+	dep->ring[slot].release_value = dep->value;
+	ctx4->Release();
+}
+
+extern "C" uint64_t
+comp_vk_deposit_current_slot_wait(struct comp_vk_deposit *dep)
+{
+	if (dep == NULL || dep->timeline == VK_NULL_HANDLE) {
+		return 0;
+	}
+	return dep->ring[dep->slot].release_value;
+}
+
+extern "C" VkSemaphore
+comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
+{
+	return dep != NULL ? dep->timeline : VK_NULL_HANDLE;
+}
+
 extern "C" bool
 comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out)
 {
@@ -949,6 +1003,27 @@ extern "C" void
 comp_vk_deposit_abandon_signal(struct comp_vk_deposit *dep)
 {
 	(void)dep;
+}
+
+extern "C" void
+comp_vk_deposit_note_consumed(struct comp_vk_deposit *dep, uint32_t slot)
+{
+	(void)dep;
+	(void)slot;
+}
+
+extern "C" uint64_t
+comp_vk_deposit_current_slot_wait(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+	return 0;
+}
+
+extern "C" VkSemaphore
+comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+	return VK_NULL_HANDLE;
 }
 
 extern "C" bool

@@ -54,6 +54,11 @@ struct comp_vk_native_eff_layout
  * @param app_timeline_semaphores The app's VkDevice has VK_KHR_timeline_semaphore
  *        enabled. Only consulted by the VK-0 deposit (#1178), which cannot exist
  *        without it — see comp_vk_native_deposit.h.
+ * @param deposit_required The #918 output-device split (VK-1) has already taken
+ *        the HWND and cannot function without the deposit, so create it whether
+ *        or not `DXR_VK_DEPOSIT` asked for one. That env var stays the gate for
+ *        the standalone VK-0 probe; the split turning the deposit on is not an
+ *        opt-in but a structural dependency.
  * @param out_renderer Pointer to receive the created renderer.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -67,6 +72,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
                                 bool app_timeline_semaphores,
+                                bool deposit_required,
                                 struct comp_vk_native_renderer **out_renderer);
 
 /*!

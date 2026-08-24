@@ -39,6 +39,13 @@ extern "C" {
  * @param queue_family_index Queue family index for graphics.
  * @param queue_index Queue index within the family.
  * @param dp_factory_vk Display processor factory (xrt_dp_factory_vk_fn_t), or NULL.
+ * @param dp_factory_d3d11 Display processor factory (xrt_dp_factory_d3d11_fn_t), or
+ *        NULL. Windows only, and read ONLY by the #918 output-device split (VK-1,
+ *        #1178): when the weave moves to the scanout adapter it stops being a
+ *        Vulkan weave — the target there is a DXGI swapchain on a runtime-owned
+ *        `ID3D11Device`, so the plug-in is asked for a D3D11 weaver instead. With
+ *        the split off (or on any other platform) this is ignored and the session
+ *        weaves through @p dp_factory_vk exactly as before.
  * @param shared_texture_handle Shared texture HANDLE for offscreen mode, or NULL.
  * @param transparent_background Request transparent (PRE_MULTIPLIED) compositeAlpha
  *        on the presented swapchain. Forwarded to the display processor as the
@@ -65,6 +72,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t runtime_queue_family,
                                  int32_t runtime_queue_index,
                                  void *dp_factory_vk,
+                                 void *dp_factory_d3d11,
                                  void *shared_texture_handle,
                                  bool transparent_background,
                                  int32_t display_screen_left,
