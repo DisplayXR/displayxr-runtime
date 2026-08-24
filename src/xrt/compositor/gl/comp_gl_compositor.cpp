@@ -39,6 +39,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+#include "util/u_weave_scope.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
@@ -5906,6 +5907,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		xrt_result_t dp_ret = factory(dp_window, &c->display_processor);
 		if (dp_ret == XRT_SUCCESS && c->display_processor != NULL) {
 			U_LOG_W("GL compositor: display processor created via factory");
+			// Weave scope, once — see the D3D11 leg. GL output is a window.
+			(void)u_weave_scope_report(xrt_display_processor_gl_get_weave_scope(c->display_processor),
+			                           "GL", /* panel_scoped */ false);
 			// Forward session-level transparency (#573 — chroma-key-free;
 			// mirrors the D3D11/D3D12/VK legs). client_presents=false: the DP
 			// owns see-through (compose-under-bg from the atlas alpha). The GL

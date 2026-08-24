@@ -22,6 +22,7 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_color.h"
 #include "xrt/xrt_display_zones.h"
+#include "xrt/xrt_display_scanout.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -288,7 +289,49 @@ struct xrt_display_processor_metal
 	 * @return true if the clear was accepted.
 	 */
 	bool (*clear_local_zone_mask)(struct xrt_display_processor_metal *xdp);
+
+	/*!
+	 * Declare how much of the panel this DP's output transform covers
+	 * (@ref xrt_dp_weave_scope) — i.e. whether the runtime may present it in
+	 * a window at all.
+	 *
+	 * A GPU weaver produces final pixels for the canvas it was handed and
+	 * leaves the rest of the screen alone, so it is windowable by
+	 * construction: it leaves this slot NULL and the runtime reads
+	 * @ref XRT_DP_WEAVE_SCOPE_CANVAS. A DP driving a display that weaves in
+	 * its own hardware is instead emitting a PACKED frame (the atlas repacked
+	 * into the layout its chip expects, per the tile geometry the plug-in
+	 * already declares in @ref xrt_rendering_mode) and must say whether that
+	 * chip can be pointed at a rectangle (@ref XRT_DP_WEAVE_SCOPE_REGION —
+	 * windowed output is fine) or transforms the whole scanout
+	 * (@ref XRT_DP_WEAVE_SCOPE_SCANOUT — only a panel-scoped, fullscreen
+	 * presentation can be correct).
+	 *
+	 * The caller pre-sets @ref xrt_dp_scanout_caps::struct_size; the DP writes
+	 * only fields within it and MUST zero @ref xrt_dp_scanout_caps::reserved.
+	 * Cheap — queried once at DP setup, never per frame.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`), NULL, or a false
+	 * return all mean @ref XRT_DP_WEAVE_SCOPE_CANVAS, which is exactly the
+	 * behaviour every existing plug-in already has. Appended per ADR-020
+	 * (append-only within a major; no version bump).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param[out] out_caps  Filled by the DP (struct_size pre-set by caller).
+	 * @return true if @p out_caps was filled.
+	 */
+	bool (*get_scanout_caps)(struct xrt_display_processor_metal *xdp, struct xrt_dp_scanout_caps *out_caps);
+
 };
+
+
+/*!
+ * Defined when this header carries the @ref xrt_display_processor_metal::get_scanout_caps
+ * slot, so a plug-in that must also compile against an older runtime header can
+ * `#ifdef`-guard its implementation — the coupled-ABI-addition pattern used by
+ * the other appended slots.
+ */
+#define XRT_DP_METAL_HAS_SCANOUT_CAPS 1
 
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
@@ -335,7 +378,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, set_eye_tracking_
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_local_zone_caps)          == XRT_DP_METAL_BASE_OFF + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, publish_local_zone_mask)      == XRT_DP_METAL_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, clear_local_zone_mask)        == XRT_DP_METAL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_scanout_caps)             == XRT_DP_METAL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -627,6 +671,43 @@ xrt_display_processor_metal_destroy(struct xrt_display_processor_metal **xdp_ptr
 	*xdp_ptr = NULL;
 }
 
+
+/*!
+ * @copydoc xrt_display_processor_metal::get_scanout_caps
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL, or
+ * the DP declined — in every one of those cases the caller must read the scope
+ * as @ref XRT_DP_WEAVE_SCOPE_CANVAS. Prefer
+ * @ref xrt_display_processor_metal_get_weave_scope, which does that for you.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_get_scanout_caps(struct xrt_display_processor_metal *xdp,
+                                             struct xrt_dp_scanout_caps *out_caps)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_scanout_caps) || xdp->get_scanout_caps == NULL) {
+		return false;
+	}
+	return xdp->get_scanout_caps(xdp, out_caps);
+}
+
+/*!
+ * The DP's @ref xrt_dp_weave_scope, with every "didn't answer" case resolved to
+ * @ref XRT_DP_WEAVE_SCOPE_CANVAS. This is the accessor call sites should use.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline enum xrt_dp_weave_scope
+xrt_display_processor_metal_get_weave_scope(struct xrt_display_processor_metal *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_metal_get_scanout_caps(xdp, &caps)) {
+		return XRT_DP_WEAVE_SCOPE_CANVAS;
+	}
+	return xrt_dp_weave_scope_clamp(caps.weave_scope);
+}
 
 #ifdef __cplusplus
 }

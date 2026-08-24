@@ -244,6 +244,126 @@ logs a one-shot WARN at init if violated. Full contract:
 
 Only fill in the `create_dp_<api>` factories your SDK actually supports. NULL means "this graphics API isn't supported on this platform by this plug-in." The runtime gracefully falls back to the sim-display DP for any API your plug-in doesn't cover, so a vendor with only D3D11 + D3D12 weavers can still ship a useful plug-in — Vulkan / OpenGL / Metal apps just transparently use sim-display while DX apps use your weaver.
 
+### Displays that weave in hardware (FPGA / ASIC)
+
+Everything above assumes your plug-in runs the lens math on the GPU. If your
+display does the weave **in its own silicon** — an FPGA or ASIC on the scaler
+board, fed an ordinary video frame — your plug-in is *smaller*, not bigger, but
+it has to declare one thing the GPU-weaving shape never had to.
+
+**`process_atlas` becomes a repack, not a weave.** You are not producing final
+subpixels; you are producing the packed frame your chip expects, and the chip
+weaves it during scanout. The layout is not a new concept — it is the tile
+geometry you already declare per rendering mode:
+
+| Chip input | `view_count` | `tile_columns` × `tile_rows` | `view_scale_x`, `view_scale_y` |
+|---|---|---|---|
+| Side-by-side, half width | 2 | 2 × 1 | 0.5, 1.0 |
+| Top-and-bottom, half height | 2 | 1 × 2 | 1.0, 0.5 |
+| Full-resolution frame packing | 2 | 1 × 2 | 1.0, 1.0 (needs a double-height video timing — see below) |
+| N-view quilt | N ≤ 8 | any grid | 1/cols, 1/rows |
+
+`XRT_MAX_VIEWS` is **8**; it is embedded by value in `xrt_device`, so a chip
+wanting more views than that is a runtime ABI change, not a plug-in.
+
+The reference implementation is already in the tree: `sim_display`'s
+`shaders/squeezed_sbs.frag` (2 × 1), `shaders/sbs.frag` (1 × 2) and
+`shaders/quad.frag` (2 × 2 quilt) are exactly these repacks.
+
+**A free optimization.** Declare `2D = 1×1 @ 1.0,1.0` and `3D = 2×1 @ 0.5,1.0`
+and the worst-case swapchain envelope becomes `W × H`, which *both* modes fill
+exactly — so `u_tiling_can_zero_copy()` fires full-screen in both and the app's
+swapchain reaches your DP with no crop at all. A `0.5 × 0.5` 3D mode never
+achieves this. See [ADR-030](../adr/ADR-030-crop-before-dp-zero-copy-only-when-swapchain-equals-atlas.md).
+
+#### Declare your weave scope — this is the required part
+
+The runtime cannot infer how much of the panel your chip transforms, and it
+changes what presentations can be correct. Implement `get_scanout_caps` on each
+`create_dp_<api>` vtable you ship (`xrt/xrt_display_scanout.h`):
+
+| `weave_scope` | Your chip | Windowed apps |
+|---|---|---|
+| `XRT_DP_WEAVE_SCOPE_CANVAS` | GPU weaver — you produce final pixels for the canvas you were handed | native; nothing to do |
+| `XRT_DP_WEAVE_SCOPE_REGION` | takes a "weave only this rect, pass the rest through" descriptor | native — see below |
+| `XRT_DP_WEAVE_SCOPE_SCANOUT` | transforms the whole incoming frame; no rect | require a panel-scoped presentation |
+
+Leaving the slot NULL means `CANVAS`, which is why no existing plug-in needs to
+change, rebuild, or bump ABI. Declare honestly: `SCANOUT` is what makes the
+runtime say plainly in the log that a windowed session cannot resolve, instead
+of shipping a frame your chip will shred into crosstalk with nothing anywhere
+to explain it.
+
+**A `REGION` chip is an [ADR-027](../adr/ADR-027-display-zones.md) zones DP.**
+That is the whole implementation, and it needs no other new mechanism:
+
+- `get_local_zone_caps` → `zone_grid_width/height` is your chip's addressable
+  region granularity;
+- `publish_local_zone_mask` → the runtime hands you a per-pixel wish mask
+  **already anchored in panel pixels** (`screen_x/y/w/h`); quantise to your
+  cells and push the region over your sideband channel;
+- `process_atlas` → write the packed frame into the canvas, which is already at
+  window resolution with your declared tile geometry;
+- `snap_window_rect` → return the nearest placement your lens phase / cell grid
+  actually supports. The runtime calls it for placement, drag and resize, and
+  for present-owning apps through `XR_DXR_weave`.
+
+**A `SCANOUT` chip needs the runtime to own the whole panel.** That is the
+fullscreen, panel-native composition the service compositor already performs
+for a workspace: one fullscreen window at native panel resolution, a combined
+atlas at native display dims with per-window slot rects, one present. Under a
+workspace controller a scanout-scoped plug-in works with no further runtime
+support. What it cannot do is float a single app over the Windows desktop —
+there is no supported way to make the OS compositor emit a packed scanout, and
+your DP is not handed the desktop's pixels.
+
+#### Telling the panel a frame is 3D
+
+Do not plan on HDMI signalling. The 1.4a Vendor-Specific InfoFrame carries a
+`3D_Structure` field, but no userspace process can emit one — it is driver
+territory, and consumer GPU drivers no longer expose it. Working options, in
+rough order of how often they are used:
+
+1. **Sideband command** — USB HID / CDC-serial / I²C to the scaler board, or
+   DDC-CI. Drive it from `request_display_mode()` and report the result from
+   `get_hardware_3d_state()`.
+2. **In-band watermark** — a reserved row or corner block of magic pixels your
+   FPGA sniffs. Free to implement: your DP owns every pixel of the output
+   target during `process_atlas`.
+3. **A dedicated EDID timing** that is implicitly 3D.
+
+The mode flip is already choreographed: the runtime broadcasts
+`XrEventDataRenderingModeChangedDXR`, holds a curtain while clients ack, and
+polls `get_hardware_3d_state` through your hardware transition before lifting
+it. Your sideband command slots into that; you do not need your own.
+
+#### What the runtime will not do for you
+
+- **Set the display timing.** Nothing in the runtime changes display modes. If
+  your 3D mode needs a special timing (frame packing at double height, a
+  different refresh), your installer or vendor service establishes it.
+- **Give you depth.** `process_atlas` is colour-only; there is no depth surface
+  anywhere in the DP ABI. A chip that synthesises views from 2D + depth has no
+  path today — open an issue before you build against one.
+- **Present more than once per frame.** A frame-sequential chip that needs L and
+  R in consecutive fields has no way to request a second present. Running the
+  compositor at 2× and alternating in `process_atlas` works, but there is no
+  parity or genlock signal — treat it as a prototype, not a product.
+
+#### Testing before hardware exists
+
+`sim_display` doubles for all of it, on any machine:
+
+```bat
+set SIM_DISPLAY_FORCE_MODE=3        REM pin Squeezed SBS — a real 2x1 packed frame
+set SIM_DISPLAY_WEAVE_SCOPE=region  REM or scanout: claim a scope, exercise the routing
+```
+
+`SIM_DISPLAY_WEAVE_SCOPE` changes only what the DP *claims*, which is the
+surface under test. Grep your app's log for `DP weave scope:` to see what the
+runtime read, and for the follow-up warning when a scanout-scoped DP lands on a
+windowed path.
+
 ### Plug-in lifetime + threading
 
 - `xrtPluginNegotiate` is called exactly once per process, at first `xrCreateInstance`.
@@ -294,4 +414,5 @@ Document your implementation internals in your plug-in repo's `docs/`, then add 
 - [ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md) — why the runtime DLL holds zero vendor identifiers and how the aux import-library boundary works
 - [`XR_DXR_display_info` spec](../specs/extensions/XR_DXR_display_info.md) — display info + eye-tracking mode contract
 - [Eye tracking modes spec](../specs/vendor/eye-tracking-modes.md) — MANAGED vs MANUAL contract
+- [ADR-027](../adr/ADR-027-display-zones.md) + [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md) — the zones contract a region-scoped hardware weaver implements
 - [Legacy in-tree integration model](../archive/vendor-integration-historical.md) — historical reference for the pre-#263 in-tree integration shape

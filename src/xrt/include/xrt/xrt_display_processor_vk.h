@@ -335,6 +335,39 @@ struct xrt_display_processor_vk
 	 * @return true when @p out_state was written.
 	 */
 	bool (*get_backend_state)(struct xrt_display_processor_vk *xdp, uint32_t *out_state);
+
+	/*!
+	 * Declare how much of the panel this DP's output transform covers
+	 * (@ref xrt_dp_weave_scope) — i.e. whether the runtime may present it in
+	 * a window at all.
+	 *
+	 * A GPU weaver produces final pixels for the canvas it was handed and
+	 * leaves the rest of the screen alone, so it is windowable by
+	 * construction: it leaves this slot NULL and the runtime reads
+	 * @ref XRT_DP_WEAVE_SCOPE_CANVAS. A DP driving a display that weaves in
+	 * its own hardware is instead emitting a PACKED frame (the atlas repacked
+	 * into the layout its chip expects, per the tile geometry the plug-in
+	 * already declares in @ref xrt_rendering_mode) and must say whether that
+	 * chip can be pointed at a rectangle (@ref XRT_DP_WEAVE_SCOPE_REGION —
+	 * windowed output is fine) or transforms the whole scanout
+	 * (@ref XRT_DP_WEAVE_SCOPE_SCANOUT — only a panel-scoped, fullscreen
+	 * presentation can be correct).
+	 *
+	 * The caller pre-sets @ref xrt_dp_scanout_caps::struct_size; the DP writes
+	 * only fields within it and MUST zero @ref xrt_dp_scanout_caps::reserved.
+	 * Cheap — queried once at DP setup, never per frame.
+	 *
+	 * Optional — absent slot (the plug-in's `base.struct_size` doesn't cover
+	 * it), NULL, or a false return all mean @ref XRT_DP_WEAVE_SCOPE_CANVAS,
+	 * which is exactly the behaviour every existing plug-in already has.
+	 * Appended per ADR-020 (append-only within a major; no version bump).
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param[out] out_caps  Filled by the DP (struct_size pre-set by caller).
+	 * @return true if @p out_caps was filled.
+	 */
+	bool (*get_scanout_caps)(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps);
+
 };
 
 /*!
@@ -377,6 +410,15 @@ struct xrt_display_processor_vk
  */
 #define XRT_DP_VK_HAS_BACKEND_STATE 1
 
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::get_scanout_caps slot — same coupled-ABI-
+ * addition pattern as @ref XRT_DP_VK_HAS_PRESENT_ORIGIN, for the weave-scope
+ * declaration a hardware-weaving plug-in needs in order to be routed correctly.
+ */
+#define XRT_DP_VK_HAS_SCANOUT_CAPS 1
+
 /*
  * ── Plug-in ABI tripwire (ADR-020) ─────────────────────────────────────────
  *
@@ -407,7 +449,8 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_frame_timing)   
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)             == sizeof(struct xrt_display_processor) + 5 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_window_screen_rect)      == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_backend_state)          == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_scanout_caps)           == sizeof(struct xrt_display_processor) + 8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -612,6 +655,48 @@ xrt_display_processor_vk_get_backend_state(struct xrt_display_processor_vk *xdp,
 		return false;
 	}
 	return xdp->get_backend_state(xdp, out_state);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_scanout_caps
+ *
+ * Returns false when the slot is absent, NULL, or the DP declined — in every
+ * one of those cases the caller must read the scope as
+ * @ref XRT_DP_WEAVE_SCOPE_CANVAS. Prefer
+ * @ref xrt_display_processor_vk_get_weave_scope, which does that for you. Like
+ * the wrappers above, the presence check reads `xdp->base.struct_size` because
+ * the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_scanout_caps(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_scanout_caps + sizeof(xdp->get_scanout_caps);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->get_scanout_caps == NULL) {
+		return false;
+	}
+	return xdp->get_scanout_caps(xdp, out_caps);
+}
+
+/*!
+ * The DP's @ref xrt_dp_weave_scope, with every "didn't answer" case resolved to
+ * @ref XRT_DP_WEAVE_SCOPE_CANVAS. This is the accessor call sites should use.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline enum xrt_dp_weave_scope
+xrt_display_processor_vk_get_weave_scope(struct xrt_display_processor_vk *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_vk_get_scanout_caps(xdp, &caps)) {
+		return XRT_DP_WEAVE_SCOPE_CANVAS;
+	}
+	return xrt_dp_weave_scope_clamp(caps.weave_scope);
 }
 
 #ifdef __cplusplus

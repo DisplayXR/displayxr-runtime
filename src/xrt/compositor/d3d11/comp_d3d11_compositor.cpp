@@ -27,6 +27,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -3741,6 +3742,13 @@ d3d11_make_dp(struct comp_d3d11_compositor *c,
 	}
 	U_LOG_W("D3D11 display processor created via factory on %s device (hwnd %p)",
 	        on_scanout ? "the SCANOUT" : "the app", (void *)dp_hwnd);
+
+	// Report the DP's weave scope once (no-op for every GPU weaver, which
+	// reads as canvas). In-process output is a WINDOW's client area, so a
+	// scanout-scoped hardware weaver gets told here that it cannot be correct
+	// — instead of silently shredding the whole panel with nothing in the log.
+	(void)u_weave_scope_report(xrt_display_processor_d3d11_get_weave_scope(c->display_processor), "D3D11",
+	                           /* panel_scoped */ false);
 
 	// Forward session-level transparency (#573 — chroma-key-free).
 	// client_presents=false — DELIBERATELY, and #904's true here was wrong for

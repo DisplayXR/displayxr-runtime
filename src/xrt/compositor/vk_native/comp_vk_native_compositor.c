@@ -36,6 +36,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
@@ -5073,6 +5074,12 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			c->display_processor = NULL;
 		} else {
 			U_LOG_W("VK display processor created via factory");
+			// Weave scope, once — see the D3D11 leg. VK output is a window.
+			// The scope slot lives on the VK VARIANT (the base vtable is
+			// embedded by value, so it cannot grow — ADR-020).
+			(void)u_weave_scope_report(xrt_display_processor_vk_get_weave_scope(
+			                               (struct xrt_display_processor_vk *)c->display_processor),
+			                           "VK", /* panel_scoped */ false);
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");
