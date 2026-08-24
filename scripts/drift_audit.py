@@ -177,7 +177,14 @@ _tag_cache: dict[str, list[str]] = {}
 _tag_sha_cache: dict[str, dict[str, str]] = {}  # repo -> {commit sha: semver tag}
 
 
-def _gh(args: list[str]) -> str | None:
+def _gh_full(args: list[str]) -> tuple[int, str, str]:
+    """Run gh and return (returncode, stdout, stderr).
+
+    Read paths deliberately swallow failure (a repo the token can't see is a
+    "skipped", not an error). WRITE paths must not: discarding stderr here is
+    what let issue emission fail silently every week for two months. Anything
+    that mutates state should use this and check.
+    """
     try:
         out = subprocess.run(
             ["gh", *args],
@@ -187,9 +194,12 @@ def _gh(args: list[str]) -> str | None:
         )
     except FileNotFoundError:
         sys.exit("error: the 'gh' CLI is required and was not found on PATH")
-    if out.returncode != 0:
-        return None
-    return out.stdout
+    return out.returncode, out.stdout, out.stderr
+
+
+def _gh(args: list[str]) -> str | None:
+    rc, out, _ = _gh_full(args)
+    return None if rc != 0 else out
 
 
 def gh_raw(repo: str, path: str, ref: str = "HEAD") -> str | None:
@@ -317,20 +327,34 @@ def extract_fetchcontent_pins(cmake_text: str) -> dict[str, str]:
     return pins
 
 
-def strip_license_header(text: str) -> str:
-    """Drop a leading comment/license block so bodies compare fairly."""
+def strip_doc_banner(text: str) -> str:
+    """Drop a leading provenance banner so two copies of a doc compare fairly.
+
+    A vendored copy legitimately carries a banner the canonical file must not
+    have -- "> **Vendored copy.** … Last synced: <date>" -- and the canonical
+    one does not. Everything above the first real paragraph is provenance.
+
+    This replaces an earlier version that also stripped lines beginning `#`,
+    `*` and `//`. In a MARKDOWN doc those are content, not comments: it ate the
+    canonical file's `# Title` and its `**Status:**` paragraph while stopping
+    dead at the vendored copy's `>` banner. The two could therefore never hash
+    equal no matter how faithfully the copy was synced, so the finding it
+    raised was permanently un-actionable -- verified by re-hashing a
+    byte-perfect re-sync, which still compared unequal.
+    """
     lines = text.splitlines()
     i = 0
-    while i < len(lines) and (
-        not lines[i].strip()
-        or lines[i].lstrip().startswith(("<!--", "//", "#", "*", "/*", "SPDX"))
-    ):
-        i += 1
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith(("<!--", ">", "SPDX")):
+            i += 1
+            continue
+        break
     return "\n".join(lines[i:]).strip()
 
 
 def body_md5(text: str) -> str:
-    return hashlib.md5(strip_license_header(text).encode("utf-8")).hexdigest()
+    return hashlib.md5(strip_doc_banner(text).encode("utf-8")).hexdigest()
 
 
 def find_xr_version(text: str) -> str | None:
@@ -729,7 +753,16 @@ def render_body(findings: list[Finding]) -> str:
     return "\n".join(lines)
 
 
-def emit_issue(repo: str, findings: list[Finding]) -> None:
+def _first_error_line(stderr: str) -> str:
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return "no stderr"
+
+
+def emit_issue(repo: str, findings: list[Finding]) -> bool:
+    """Open/update the drift issue on `repo`. True iff it actually landed."""
     title = "Drift audit: pin/spec/version drift detected"
     body = render_body(findings)
     existing = _gh(
@@ -750,22 +783,76 @@ def emit_issue(repo: str, findings: list[Finding]) -> None:
     )
     num = (existing or "").strip()
     if num:
-        _gh(["issue", "edit", num, "--repo", f"{ORG}/{repo}", "--body", body])
+        rc, _, err = _gh_full(
+            ["issue", "edit", num, "--repo", f"{ORG}/{repo}", "--body", body]
+        )
+        if rc != 0:
+            print(f"  FAILED to update {ORG}/{repo}#{num}: {_first_error_line(err)}")
+            return False
         print(f"  updated {ORG}/{repo}#{num}")
+        return True
+
+    rc, _, err = _gh_full(
+        ["issue", "create", "--repo", f"{ORG}/{repo}", "--title", title, "--body", body]
+    )
+    if rc != 0:
+        print(f"  FAILED to open an issue on {ORG}/{repo}: {_first_error_line(err)}")
+        return False
+    print(f"  opened new issue on {ORG}/{repo}")
+    return True
+
+
+def emit_aggregate_issue(by_repo: dict[str, list[Finding]]) -> bool:
+    """Fallback channel: one issue on THIS repo covering every offender.
+
+    Per-repo issues need a cross-repo token. The default GITHUB_TOKEN cannot
+    write to sibling repos, and the displayxr-publish-bot App has no `issues`
+    permission at all -- so without DRIFT_AUDIT_TOKEN the designed channel
+    cannot work. It reported success anyway. This fallback always works,
+    because a workflow's own token can always file an issue on its own repo.
+    """
+    title = "Drift audit: pin/spec/version drift detected across the org"
+    lines = [
+        ISSUE_MARKER,
+        "",
+        "Aggregated because per-repo issue emission is unavailable — see the",
+        "workflow log for the exact error. To restore per-repo issues, set the",
+        "`DRIFT_AUDIT_TOKEN` secret to an org-scoped PAT with `issues: write`,",
+        "or grant the `displayxr-publish-bot` App the `issues` permission.",
+        "",
+    ]
+    for repo, findings in sorted(by_repo.items()):
+        lines.append(f"### `{repo}`")
+        for f in findings:
+            lines.append(f"- **{f.category}** — {f.detail}")
+        lines.append("")
+    body = "\n".join(lines)
+
+    existing = _gh(
+        [
+            "issue", "list", "--repo", f"{ORG}/displayxr-runtime", "--state", "open",
+            "--search", ISSUE_MARKER, "--json", "number", "--jq", ".[0].number",
+        ]
+    )
+    num = (existing or "").strip()
+    if num:
+        rc, _, err = _gh_full(
+            ["issue", "edit", num, "--repo", f"{ORG}/displayxr-runtime", "--body", body]
+        )
+        target = f"{ORG}/displayxr-runtime#{num}"
     else:
-        _gh(
+        rc, _, err = _gh_full(
             [
-                "issue",
-                "create",
-                "--repo",
-                f"{ORG}/{repo}",
-                "--title",
-                title,
-                "--body",
-                body,
+                "issue", "create", "--repo", f"{ORG}/displayxr-runtime",
+                "--title", title, "--body", body,
             ]
         )
-        print(f"  opened new issue on {ORG}/{repo}")
+        target = f"{ORG}/displayxr-runtime"
+    if rc != 0:
+        print(f"  FAILED to file the aggregate issue on {target}: {_first_error_line(err)}")
+        return False
+    print(f"  filed the aggregate drift issue on {target}")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -809,11 +896,32 @@ def main() -> int:
             print(f"  - {n}")
 
     if args.emit_issues and not args.dry_run:
+        if not by_repo:
+            print("\nNo findings — nothing to emit.")
+            return 0
+
         print("\nEmitting issues:")
-        for repo, fs in sorted(by_repo.items()):
-            emit_issue(repo, fs)
-        # In emit mode the issues ARE the deliverable — don't also fail the job.
-        return 0
+        failed = {repo: fs for repo, fs in sorted(by_repo.items()) if not emit_issue(repo, fs)}
+
+        # In emit mode the issues ARE the deliverable, so the job's exit code
+        # tracks whether the findings actually reached a human -- NOT whether
+        # drift exists. Previously it returned 0 unconditionally while
+        # emit_issue printed "opened new issue" without checking, so two
+        # months of weekly runs went green having filed precisely nothing.
+        if not failed:
+            return 0
+
+        print(
+            f"::warning::per-repo issue emission failed for "
+            f"{', '.join(sorted(failed))} — falling back to one aggregate issue "
+            f"on displayxr-runtime. Set DRIFT_AUDIT_TOKEN (org-scoped PAT with "
+            f"issues:write) to restore per-repo issues."
+        )
+        if emit_aggregate_issue(failed):
+            return 0
+
+        print("::error::drift was found but could not be reported anywhere.")
+        return 1
 
     # Report / dry-run mode: non-zero exit is the gate signal.
     return 1 if report.findings else 0

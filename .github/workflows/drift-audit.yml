@@ -10,9 +10,23 @@ name: drift-audit
 #
 # TOKEN: reading private org repos (displayxr-shell-pvt) and opening issues on
 # *other* repos both need more than the default GITHUB_TOKEN. Set an org-scoped
-# PAT as the `DRIFT_AUDIT_TOKEN` secret. Without it the run still works but
-# silently skips repos the default token can't reach (the script degrades to
-# "could not fetch … skipped" notes rather than failing).
+# PAT as the `DRIFT_AUDIT_TOKEN` secret. Without it READS degrade to
+# "could not fetch … skipped" notes rather than failing.
+#
+# WRITES used to degrade far worse than that. `DRIFT_AUDIT_TOKEN` has never
+# been set, so this ran on GITHUB_TOKEN, which cannot open an issue on a
+# sibling repo -- and emit_issue printed "opened new issue on …" without
+# checking, while main() returned 0 unconditionally in emit mode. Result:
+# every weekly run from 2026-07-06 to 2026-08-24 reported success having filed
+# nothing, and real drift (a displayxr-common pin spread, a stale vendored
+# spec) accumulated unseen behind a green check.
+#
+# Now: emission failure is printed with the real gh error, the run annotates a
+# ::warning::, and the findings still land as ONE aggregate issue on this repo
+# (a workflow token can always write to its own repo). The job fails only if
+# the findings reached nobody at all. Setting DRIFT_AUDIT_TOKEN -- or granting
+# the displayxr-publish-bot App the `issues` permission it currently lacks
+# entirely -- restores per-repo issues.
 
 on:
   schedule:
