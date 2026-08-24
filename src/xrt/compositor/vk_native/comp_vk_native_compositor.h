@@ -43,6 +43,10 @@ extern "C" {
  * @param transparent_background Request transparent (PRE_MULTIPLIED) compositeAlpha
  *        on the presented swapchain. Forwarded to the display processor as the
  *        transparency enable (set_transparent_background).
+ * @param app_timeline_semaphores The app's VkDevice has VK_KHR_timeline_semaphore
+ *        enabled. Read only by the VK-0 deposit (#1178) — the runtime cannot
+ *        turn the feature on after device creation, and the deposit's D3D-fence
+ *        sync has no correct fallback without it.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -65,6 +69,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  bool transparent_background,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
+                                 bool app_timeline_semaphores,
                                  struct xrt_compositor_native **out_xc);
 
 /*!

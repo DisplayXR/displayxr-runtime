@@ -201,6 +201,14 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
  */
 DEBUG_GET_ONCE_BOOL_OPTION(enable_vk_native_compositor, "OXR_ENABLE_VK_NATIVE_COMPOSITOR", true)
 
+/*
+ * Same override the client path already honours, reachable from the in-process
+ * VK native path too. Only consumed by the VK-0 deposit (#1178) — an app that
+ * enabled VK_KHR_timeline_semaphore without the runtime being able to observe it
+ * (enable1, where the app builds its own device) can say so here.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(force_timeline_semaphores_vk_deposit, "OXR_DEBUG_FORCE_TIMELINE_SEMAPHORES", false)
+
 bool
 oxr_vk_native_compositor_supported(struct oxr_system *sys, void *window_handle)
 {
@@ -361,6 +369,11 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    dp_factory_vk, shared_texture_handle,
 	    transparent_background,
 	    display_screen_left, display_screen_top,
+	    // VK-0 (#1178): does the APP's device carry VK_KHR_timeline_semaphore?
+	    // Only the D3D11 deposit reads this, and only under DXR_VK_DEPOSIT=1 —
+	    // its GPU-side sync is a D3D fence imported as a timeline semaphore,
+	    // which cannot be created on a device that never enabled the feature.
+	    sess->sys->vk.timeline_semaphore_enabled || debug_get_bool_option_force_timeline_semaphores_vk_deposit(),
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
