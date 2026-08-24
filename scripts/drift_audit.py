@@ -157,7 +157,7 @@ SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 DXR_SPEC_RE = re.compile(
     r"^\s*#\s*define\s+XR_DXR_([A-Za-z0-9_]+?)_SPEC_VERSION\s+(\d+)\s*$", re.M | re.I
 )
-NSIS_DEFINE_RE = "define\s+{key}\s+\"([0-9][0-9.]*)\""
+NSIS_DEFINE_RE = r'define\s+{key}\s+"([0-9][0-9.]*)"'
 RUNTIME_EXT_HEADER = "src/external/openxr_includes/openxr/XR_DXR_{ext}.h"
 GIT_REPO_RE = re.compile(r"GIT_REPOSITORY\s+(\S+)")
 GIT_TAG_RE = re.compile(r"GIT_TAG\s+([^\s)]+)")
