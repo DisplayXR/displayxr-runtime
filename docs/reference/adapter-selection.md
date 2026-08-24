@@ -220,6 +220,46 @@ half-engaged state: nothing in either compositor consults a scanout adapter,
 allocates a bridge, or creates a second device. They log the placement line and
 render exactly as before.
 
+#### `DXR_VK_DEPOSIT` — the first rung of the Vulkan ladder (#1178, VK-0)
+
+Not a split, and it does **not** change the `weave placement:` line: in-process
+Vulkan still logs `split=0 reason=api_unsupported` with the flag set. What it
+does is move the Vulkan compositor's **atlas** into a same-adapter D3D11 shared
+texture, so a later rung can hand that texture to the existing cross-adapter
+bridge. Vulkan never touches a cross-adapter object — it has no way to; the
+bridge does the crossing, exactly as it already does for the D3D11 split.
+
+| Variable | Meaning |
+|---|---|
+| `DXR_VK_DEPOSIT=1` | Allocate the deposit: a LUID-matched D3D11 device, an NT-shared texture ring the atlas renders straight into (`VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` — no copies), and a shared `ID3D11Fence` imported as a Vulkan timeline semaphore that the atlas submit signals |
+| `DXR_VK_DEPOSIT_PROBE=1` | One-shot proof, after a frame has presented: take the consumer's GPU-side `ID3D11DeviceContext4::Wait` for real, read the texture back once and report the non-black pixel count. Diagnostic only |
+| unset (the default) | No deposit, no D3D11 device, no fence. The compositor runs the path it ran before the flag existed |
+
+The deposit adds **no CPU wait**, and — this is the point of the rung, not a
+detail — it does not depend on the ones already there. The in-process Vulkan
+path still does a per-frame `vkQueueWaitIdle` after the atlas submit (#837's to
+remove); take that away and the deposit's ordering guarantee is unchanged,
+because the guarantee is the timeline semaphore, not the drain. That is what
+keeps this ladder out of the wedge family the D3D legs designed themselves out
+of. It is also why the deposit is NOT built on the DComp transparency bridge's
+`IDXGIKeyedMutex::AcquireSync`: that acquire blocks the CPU on the render
+thread.
+
+One line says whether it took, in the style of `weave placement:`:
+
+```
+vk deposit: deposit adapter LUID=0x0000000000012ab5 ('Intel(R) UHD Graphics'),
+            VkDevice LUID=0x0000000000012ab5, match=YES — same-adapter D3D11 deposit, 3840x1080 x2 ring
+```
+
+`match=NO` (or no adapter at all) disables the deposit and says so — a deposit on
+a different adapter than the VkDevice shares no pixels, which is the failure the
+DComp bridge's own LUID match exists to prevent. The deposit also refuses to
+start when the app's `VkDevice` never enabled `VK_KHR_timeline_semaphore`, since
+its only GPU-side sync is a D3D fence imported as one and a CPU wait is not an
+acceptable substitute. (`OXR_DEBUG_FORCE_TIMELINE_SEMAPHORES=1` asserts the
+feature is there for an app that enabled it where the runtime cannot observe it.)
+
 ### OpenGL: identity yes, selection no (#1159)
 
 The GL compositor creates D3D11 devices for two interop paths — the
