@@ -166,6 +166,33 @@ struct comp_xbridge_info
 	uint32_t max_height;
 
 	/*!
+	 * #1178 — the `DXGI_FORMAT` of the ATLAS this caller will submit, as an
+	 * integer so this header stays free of `dxgi.h`. 0 (`DXGI_FORMAT_UNKNOWN`)
+	 * means `DXGI_FORMAT_R8G8B8A8_UNORM`, which is what every caller before the
+	 * Vulkan leg submitted and what the bridge used to hardcode.
+	 *
+	 * **The bridge allocates its whole atlas chain — the ingress staging ring, the
+	 * cross-adapter placed ring and the egress ring — in THIS format**, because
+	 * every hop between them is a copy, and a copy is not format-agnostic:
+	 * `ID3D11DeviceContext::CopySubresourceRegion` and
+	 * `ID3D12GraphicsCommandList::CopyTextureRegion` both require source and
+	 * destination to share a **typeless family**, and `B8G8R8A8` and `R8G8B8A8`
+	 * do not.
+	 *
+	 * A cross-family copy is not an error the API reports. It is **dropped**, and
+	 * the destination keeps whatever it held — so every byte counter, every fence
+	 * and every slot stamp stays green while nothing at all crosses. That is
+	 * exactly how #1178 reached a maintainer's eyeball as a black panel, so the
+	 * format is carried here rather than assumed, and the actual source is
+	 * re-checked against it at every @ref comp_xbridge_submit.
+	 *
+	 * Only `DXGI_FORMAT_R8G8B8A8_UNORM` and `DXGI_FORMAT_B8G8R8A8_UNORM` are
+	 * accepted; anything else fails @ref comp_xbridge_create with a reason rather
+	 * than being transported at a byte count the bridge cannot account for.
+	 */
+	uint32_t atlas_format;
+
+	/*!
 	 * Panel extent (`xdev->hmd->screens[0]`). The two 2D PLANES are sized from
 	 * this ONCE and never resized — a window can never exceed the panel, so a
 	 * plane allocated here fits every region the session will ever composite.
@@ -802,6 +829,36 @@ comp_xbridge_get_egress_resource(struct comp_xbridge *xb, int32_t slot);
 //! Allocated extent of the egress ring (content-sized after Stage B).
 void
 comp_xbridge_get_egress_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h);
+
+/*!
+ * #1178 — the CONTENT probe: read pixels back out of @p slot's egress texture
+ * and log what actually arrived. **Off unless `DXR_SPLIT_CONTENT_PROBE=1`**, and
+ * a no-op returning immediately when it is off.
+ *
+ * The lesson this exists for is the whole of #1178. The transport's diagnostic
+ * line — `split=1 xb_kb=153000 … no_slot=0 ing_leak=0` — cannot distinguish
+ * "transported the frame's pixels" from "faithfully transported nothing": every
+ * one of those counters is incremented by the ACT of issuing a copy, and a copy
+ * across a DXGI typeless family is silently dropped. Only reading the
+ * destination back can tell the two apart, so the bridge ships the means to.
+ *
+ * Cost when enabled: one small `CopySubresourceRegion` on the output device and
+ * one `Map`, at most once a second and never on a slot whose consumer fence has
+ * not already fired CPU-side. The `Map` is `DO_NOT_WAIT`; a copy that has not
+ * landed is retried on a later call rather than waited for, so this never blocks
+ * the weave.
+ *
+ * **D3D11 ends only.** A D3D12-ends bridge's egress is an `ID3D12Resource` whose
+ * readback needs a readback heap and a copy-queue round trip; it logs once that
+ * the probe is unavailable rather than pretending. That still covers the
+ * in-process D3D11 compositor, the service and the Vulkan leg — including the
+ * leg the defect shipped on.
+ *
+ * Call from the WEAVE thread (it drives the output immediate context, which is
+ * not thread-safe), with a slot the caller has just picked.
+ */
+void
+comp_xbridge_content_probe(struct comp_xbridge *xb, int32_t slot);
 
 /*!
  * Publish the slot the last app frame wove, so a repaint re-weaves exactly that

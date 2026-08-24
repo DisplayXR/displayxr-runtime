@@ -118,6 +118,19 @@ struct comp_vk_deposit_handoff
 	uint32_t width;
 	uint32_t height;
 	uint32_t slot; //!< Ring index of @ref texture.
+	/*!
+	 * The `DXGI_FORMAT` of @ref texture, as an integer so this header stays
+	 * free of `dxgi.h`.
+	 *
+	 * Published because a CONSUMER's copy of this texture is format-checked,
+	 * not merely size-checked: `ID3D11DeviceContext::CopySubresourceRegion`
+	 * requires source and destination to share a typeless family, and
+	 * `B8G8R8A8` and `R8G8B8A8` do not. A cross-family copy is not an error the
+	 * API reports — it is dropped, and the destination keeps whatever it held
+	 * (#1178). Consumers must compare this against their own chain's format
+	 * rather than assume.
+	 */
+	uint32_t dxgi_format;
 };
 
 /*!
