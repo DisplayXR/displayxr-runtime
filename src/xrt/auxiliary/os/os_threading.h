@@ -17,6 +17,8 @@
 
 #include "os/os_time.h"
 
+#include <time.h> // timespec_get, for os_cond_wait_timeout_ns
+
 #if defined(XRT_OS_LINUX) || defined(XRT_ENV_MINGW)
 #include <pthread.h>
 #include <semaphore.h>
@@ -257,6 +259,33 @@ os_cond_wait(struct os_cond *oc, struct os_mutex *om)
 {
 	assert(oc->initialized);
 	pthread_cond_wait(&oc->cond, &om->mutex);
+}
+
+/*!
+ * Wait with a timeout, in nanoseconds from now.
+ *
+ * Same contract as @ref os_cond_wait — call it in a loop testing the real
+ * condition, with @p om locked; the mutex is released for the duration and
+ * re-acquired before this returns — plus a bound: returns true if the wait
+ * ended by signal (or spuriously), false if the timeout elapsed first. Either
+ * way the caller owns the lock again and must re-check its condition.
+ *
+ * Absolute deadline is built on the realtime clock because that is what
+ * pthread_cond_timedwait consumes by default; timespec_get(TIME_UTC) is the
+ * portable spelling (the tree avoids clock_gettime for MinGW/MSVC parity).
+ *
+ * @public @memberof os_cond
+ */
+static inline bool
+os_cond_wait_timeout_ns(struct os_cond *oc, struct os_mutex *om, uint64_t timeout_ns)
+{
+	assert(oc->initialized);
+	struct timespec ts;
+	timespec_get(&ts, TIME_UTC);
+	uint64_t nsec = (uint64_t)ts.tv_nsec + timeout_ns;
+	ts.tv_sec += (time_t)(nsec / 1000000000ull);
+	ts.tv_nsec = (long)(nsec % 1000000000ull);
+	return pthread_cond_timedwait(&oc->cond, &om->mutex, &ts) == 0;
 }
 
 /*!
