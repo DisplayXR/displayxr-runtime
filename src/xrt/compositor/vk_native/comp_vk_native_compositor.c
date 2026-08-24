@@ -43,6 +43,9 @@
 #include "util/u_hud.h"
 #include "os/os_time.h"
 #include "os/os_threading.h"
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
@@ -559,6 +562,42 @@ struct comp_vk_native_compositor
 
 		uint64_t count, ticks;          //!< Diagnostics.
 	} repaint;
+
+	/*!
+	 * #1196: single-weave-thread hand-off.
+	 *
+	 * The vendor DP may be thread-affine. The Leia CNSDK interlacer binds to
+	 * the thread that first calls it and then REJECTS every call from any
+	 * other thread (`CHECK_INTERLACER_THREAD` — not log-only, it returns
+	 * before weaving). Driving the DP from both the app's xrEndFrame thread
+	 * (layer_commit) and the repaint thread therefore silently discards one
+	 * of the two weave streams, while the present still runs — measured as
+	 * a 60 Hz stream of stale frames interleaved with real ones (judder),
+	 * and as which stream dies flipping on every surface recreate.
+	 *
+	 * Fix: while a repaint thread exists, the app frame's weave is executed
+	 * BY the repaint thread. layer_commit publishes the call's arguments
+	 * here, wakes the thread, and waits (c->mutex released) for the result.
+	 * One OS thread ever touches the DP; xrEndFrame keeps its blocking
+	 * semantics and the app's queue is still only used while the app is
+	 * inside xrEndFrame. Without a repaint thread nothing changes — that
+	 * path is single-threaded already.
+	 */
+	struct
+	{
+		int enabled;            //!< Resolved once at init; see the gate.
+		bool pending;           //!< A request is posted and not yet served.
+		bool zero_copy;
+		uint64_t zc_image_u64, zc_view_u64;
+		int32_t zc_format;
+		uint32_t zc_width, zc_height, tgt_width, tgt_height;
+		bool ftime;
+		uint64_t *fp;           //!< Caller-owned; valid while it waits.
+		xrt_result_t result;
+		bool skip_frame;
+		uint64_t served;        //!< Diagnostics.
+	} weave_hand;
+	struct os_cond weave_cond;  //!< Paired with c->mutex.
 
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
@@ -3960,7 +3999,38 @@ vk_repaint_thread(void *ptr)
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
-		os_nanosleep((int64_t)(period_ns / 4));
+		/*
+		 * #1196: this wait doubles as the request inbox. Sleep at most a
+		 * quarter period (the old cadence), but wake immediately when
+		 * layer_commit posts an app frame, and serve it FIRST — under the
+		 * lock, unconditionally: it is not gated by armed / quiet /
+		 * app_frame_in_progress, all of which describe REPAINTS. The app
+		 * frame is the real thing the repaint exists to keep alive.
+		 */
+		os_mutex_lock(&c->mutex);
+		if (!c->weave_hand.pending) {
+			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, period_ns / 4);
+		}
+		if (c->weave_hand.pending) {
+			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
+			    c->target != NULL) {
+				c->weave_hand.result = vk_dp_weave_and_present(
+				    c, /*is_repaint=*/false, c->weave_hand.zero_copy, c->weave_hand.zc_image_u64,
+				    c->weave_hand.zc_view_u64, c->weave_hand.zc_format, c->weave_hand.zc_width,
+				    c->weave_hand.zc_height, c->weave_hand.tgt_width, c->weave_hand.tgt_height,
+				    c->weave_hand.ftime, c->weave_hand.fp, &c->weave_hand.skip_frame);
+			} else {
+				// Torn down under the waiter: fail the frame, never strand it.
+				c->weave_hand.result = XRT_ERROR_VULKAN;
+				c->weave_hand.skip_frame = true;
+			}
+			c->weave_hand.served++;
+			c->weave_hand.pending = false;
+			os_cond_broadcast(&c->weave_cond);
+			os_mutex_unlock(&c->mutex);
+			continue; // an app frame just presented; no repaint this tick
+		}
+		os_mutex_unlock(&c->mutex);
 		if (!os_thread_helper_is_running(&c->repaint_thread)) {
 			break;
 		}
@@ -4138,6 +4208,16 @@ vk_repaint_thread(void *ptr)
 		}
 	}
 
+	// #1196: a request posted after the loop saw `running == false` would
+	// otherwise wait forever on a thread that has left. Fail it and wake it.
+	os_mutex_lock(&c->mutex);
+	if (c->weave_hand.pending) {
+		c->weave_hand.result = XRT_ERROR_VULKAN;
+		c->weave_hand.skip_frame = true;
+		c->weave_hand.pending = false;
+		os_cond_broadcast(&c->weave_cond);
+	}
+	os_mutex_unlock(&c->mutex);
 	return NULL;
 }
 
@@ -4795,9 +4875,38 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			c->repaint.armed = !zero_copy;
 
 			bool skip_frame = false;
-			xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64, zc_view_u64,
-			                               zc_format, zc_width, zc_height, tgt_width, tgt_height, ftime, fp,
-			                               &skip_frame);
+			if (c->weave_hand.enabled == 1 && os_thread_helper_is_running(&c->repaint_thread)) {
+				/*
+				 * #1196: publish, wake, wait. c->mutex is held here (we are
+				 * _locked); os_cond_wait releases it for the duration so the
+				 * repaint thread can take it to run the weave, and hands it
+				 * back before returning. Loop on `pending`: cond waits wake
+				 * spuriously.
+				 */
+				c->weave_hand.pending = true;
+				c->weave_hand.zero_copy = zero_copy;
+				c->weave_hand.zc_image_u64 = zc_image_u64;
+				c->weave_hand.zc_view_u64 = zc_view_u64;
+				c->weave_hand.zc_format = zc_format;
+				c->weave_hand.zc_width = zc_width;
+				c->weave_hand.zc_height = zc_height;
+				c->weave_hand.tgt_width = tgt_width;
+				c->weave_hand.tgt_height = tgt_height;
+				c->weave_hand.ftime = ftime;
+				c->weave_hand.fp = fp;
+				c->weave_hand.result = XRT_SUCCESS;
+				c->weave_hand.skip_frame = false;
+				os_cond_broadcast(&c->weave_cond);
+				while (c->weave_hand.pending) {
+					os_cond_wait(&c->weave_cond, &c->mutex);
+				}
+				xret = c->weave_hand.result;
+				skip_frame = c->weave_hand.skip_frame;
+			} else {
+				xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64,
+				                               zc_view_u64, zc_format, zc_width, zc_height, tgt_width,
+				                               tgt_height, ftime, fp, &skip_frame);
+			}
 			if (skip_frame) {
 				return XRT_SUCCESS;
 			}
@@ -5037,6 +5146,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// vk_bundle cleanup is minimal (just mutexes).
 
 	// #868: last, after the repaint thread has been joined above.
+	os_cond_destroy(&c->weave_cond);
 	os_mutex_destroy(&c->mutex);
 
 	free(c);
@@ -5493,6 +5603,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// even on the earliest create failure. os_thread_helper_init only prepares
 	// the handle; the loop is started later, once the target exists.
 	os_mutex_init(&c->mutex);
+	os_cond_init(&c->weave_cond);
 	os_thread_helper_init(&c->repaint_thread);
 
 	// Initialize vk_bundle from the app's existing VkDevice
@@ -6002,6 +6113,41 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT");
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+
+		/*
+		 * #1196: single weave thread. Default ON where the thread-affine DP
+		 * is proven (Android, in-process Leia CNSDK); opt-in elsewhere so a
+		 * shipping desktop VK path does not change thread ownership without
+		 * having been validated there. Env wins; on Android an app cannot
+		 * set env for the in-process runtime, so the same knob is accepted as
+		 * a sysprop for `adb shell setprop` — the kill switch has to be
+		 * reachable on the device that exhibits the bug.
+		 */
+		{
+#ifdef XRT_OS_ANDROID
+			int single = 1;
+#else
+			int single = 0;
+#endif
+			const char *se = getenv("DXR_WEAVE_SINGLE_THREAD");
+			if (se != NULL && se[0] != '\0') {
+				single = (se[0] == '0') ? 0 : 1;
+			}
+#ifdef XRT_OS_ANDROID
+			else {
+				char sp[PROP_VALUE_MAX] = {0};
+				if (__system_property_get("debug.dxr.weave_single_thread", sp) > 0 &&
+				    sp[0] != '\0') {
+					single = (sp[0] == '0') ? 0 : 1;
+				}
+			}
+#endif
+			c->weave_hand.enabled = single;
+			U_LOG_W("#1196: weave thread ownership: %s (DXR_WEAVE_SINGLE_THREAD / "
+			        "debug.dxr.weave_single_thread; 0 disables)",
+			        single ? "single — app frames weave on the repaint thread"
+			               : "legacy — app thread and repaint thread both weave");
+		}
 
 		/*
 		 * #902: tier selection. DXR_VK_QUEUE_MODE:
