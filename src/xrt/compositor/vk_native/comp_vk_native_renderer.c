@@ -349,6 +349,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
                                 bool app_timeline_semaphores,
+                                bool deposit_required,
                                 struct comp_vk_native_renderer **out_renderer)
 {
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
@@ -380,11 +381,13 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	/*
 	 * VK-0 (#1178) — stand the D3D11 deposit up BEFORE the atlas, so
 	 * create_atlas_resources can adopt it instead of allocating. Requested
-	 * with DXR_VK_DEPOSIT=1 and nothing else; every failure inside is
-	 * non-fatal and leaves r->deposit NULL, i.e. the byte-identical
-	 * owned-atlas path.
+	 * with DXR_VK_DEPOSIT=1, or REQUIRED by an already-committed VK-1 split
+	 * (which has taken the HWND and has nothing to bridge without it); every
+	 * failure inside is non-fatal and leaves r->deposit NULL, i.e. the
+	 * byte-identical owned-atlas path. A split that reaches that state retires
+	 * cold, before its first present.
 	 */
-	if (comp_vk_deposit_requested()) {
+	if (comp_vk_deposit_requested() || deposit_required) {
 		if (comp_vk_deposit_create(vk, app_timeline_semaphores, atlas_width, atlas_height, r->format,
 		                           &r->deposit) != XRT_SUCCESS) {
 			r->deposit = NULL;
@@ -805,20 +808,33 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  * `vkQueueWaitIdle` below (#837's to remove) — take that wait away and the
  * ordering guarantee here is unchanged.
  *
+ * **VK-1 (#1178) — the same submit takes the ring's back-pressure WAIT.** The
+ * deposit ring is bidirectional: a consumer signals the shared fence past its
+ * read (@ref comp_vk_deposit_note_consumed) and this submit waits for that value
+ * before overwriting the slot. Without it the split's frame loop — which no
+ * longer blocks on a Vulkan present — can lap the bridge's copy and tear the
+ * atlas. Also GPU-side; the wait costs nothing on the frames it is already
+ * satisfied.
+ *
  * No-op, leaving @p submit_info untouched, when there is no deposit.
  *
  * @param[out] sem_storage,value_storage Caller-owned storage that must outlive
  *        the vkQueueSubmit call — VkSubmitInfo only borrows pointers.
+ * @param[out] wait_value_storage,wait_stage_storage Likewise, for the wait half.
  */
 static void
 deposit_chain_signal(struct comp_vk_native_renderer *r,
                      VkSubmitInfo *submit_info,
                      VkTimelineSemaphoreSubmitInfo *timeline_info,
                      VkSemaphore *sem_storage,
-                     uint64_t *value_storage)
+                     uint64_t *value_storage,
+                     uint64_t *wait_value_storage,
+                     VkPipelineStageFlags *wait_stage_storage)
 {
 	*sem_storage = VK_NULL_HANDLE;
 	*value_storage = 0;
+	*wait_value_storage = 0;
+	*wait_stage_storage = 0;
 
 	if (r->deposit == NULL) {
 		return;
@@ -839,6 +855,27 @@ deposit_chain_signal(struct comp_vk_native_renderer *r,
 	submit_info->pNext = timeline_info;
 	submit_info->signalSemaphoreCount = 1;
 	submit_info->pSignalSemaphores = sem_storage;
+
+	/*
+	 * The wait rides the SAME semaphore object, so it is added to the same
+	 * submit rather than a second one. 0 means no consumer has taken this slot
+	 * yet (warmup, or the split is off) and no wait is owed.
+	 *
+	 * The stage mask names where the slot is WRITTEN — the atlas is a colour
+	 * attachment on the draw path and a transfer destination on the blit/clear
+	 * path — so earlier stages of this submit still overlap the wait.
+	 */
+	const uint64_t release = comp_vk_deposit_current_slot_wait(r->deposit);
+	if (release != 0) {
+		*wait_value_storage = release;
+		*wait_stage_storage =
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+		timeline_info->waitSemaphoreValueCount = 1;
+		timeline_info->pWaitSemaphoreValues = wait_value_storage;
+		submit_info->waitSemaphoreCount = 1;
+		submit_info->pWaitSemaphores = sem_storage;
+		submit_info->pWaitDstStageMask = wait_stage_storage;
+	}
 }
 
 //! (Re)create the framebuffer over the current atlas view.
@@ -1243,7 +1280,10 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	VkTimelineSemaphoreSubmitInfo deposit_timeline = {0};
 	VkSemaphore deposit_sem = VK_NULL_HANDLE;
 	uint64_t deposit_value = 0;
-	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value);
+	uint64_t deposit_wait_value = 0;
+	VkPipelineStageFlags deposit_wait_stage = 0;
+	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
+	                     &deposit_wait_stage);
 
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (res != VK_SUCCESS) {
@@ -1546,7 +1586,10 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	VkTimelineSemaphoreSubmitInfo deposit_timeline = {0};
 	VkSemaphore deposit_sem = VK_NULL_HANDLE;
 	uint64_t deposit_value = 0;
-	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value);
+	uint64_t deposit_wait_value = 0;
+	VkPipelineStageFlags deposit_wait_stage = 0;
+	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
+	                     &deposit_wait_stage);
 
 	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (res != VK_SUCCESS) {

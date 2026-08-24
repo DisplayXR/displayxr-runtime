@@ -199,6 +199,52 @@ void
 comp_vk_deposit_abandon_signal(struct comp_vk_deposit *dep);
 
 /*!
+ * VK-1 (#1178) — the consumer has taken its copy of @p slot; release it back to
+ * Vulkan.
+ *
+ * Signals the shared fence from the D3D11 immediate context to a fresh value past
+ * every claim so far, and remembers it as @p slot's release value. Purely a queue
+ * operation: this thread does not wait, and neither does the GPU until something
+ * asks it to.
+ *
+ * **Why the ring needs this at all.** VK-0's two-slot ring separates a producer
+ * reading slot N from Vulkan writing slot N+1, which is enough while Vulkan is
+ * also the thing that weaves and presents — the frame loop is self-pacing. Under
+ * the split it is not: Vulkan renders the atlas and returns, and the present it
+ * used to block behind now belongs to the output device. Vulkan can then reach
+ * slot N again (two frames later) while the bridge's copy of the older slot N is
+ * still executing, and nothing anywhere would order them. That is a torn atlas,
+ * not a stall, so it cannot be left to timing.
+ *
+ * Deliberately NOT a CPU wait, an `IDXGIKeyedMutex::AcquireSync`, or a deeper
+ * ring: the imported semaphore is a D3D12 fence and is therefore bidirectional,
+ * so the correct answer costs one queued signal and one queued wait.
+ *
+ * No-op when the deposit has no working sync.
+ */
+void
+comp_vk_deposit_note_consumed(struct comp_vk_deposit *dep, uint32_t slot);
+
+/*!
+ * The value the CURRENT slot's last @ref comp_vk_deposit_note_consumed signalled,
+ * or 0 when nothing has consumed this slot yet (warmup, or no consumer at all).
+ *
+ * Vulkan's next submit into this slot waits for it on the timeline semaphore —
+ * see the back-pressure argument above. Call after
+ * @ref comp_vk_deposit_advance has chosen the frame's slot.
+ */
+uint64_t
+comp_vk_deposit_current_slot_wait(struct comp_vk_deposit *dep);
+
+/*!
+ * The imported timeline semaphore, or `VK_NULL_HANDLE` when the deposit has no
+ * working sync. Exposed for the wait half above; the signal half claims it
+ * through @ref comp_vk_deposit_claim_signal.
+ */
+VkSemaphore
+comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep);
+
+/*!
  * Fill @p out with everything a D3D consumer needs. This is the VK-1 entry
  * point; nothing in the runtime calls it yet.
  *

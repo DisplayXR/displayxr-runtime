@@ -271,10 +271,20 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 
 	// Get VK display processor factory and display top-left from system compositor info
 	void *dp_factory_vk = NULL;
+	/*
+	 * #918 VK-1 (#1178): the D3D11 factory travels beside the Vulkan one on
+	 * Windows. It is NOT a second weaver — the compositor asks exactly one
+	 * factory per session, and which one depends on where the weave lands.
+	 * Under the output-device split the target is a DXGI swapchain on a
+	 * runtime-owned scanout-adapter device, so the plug-in is asked for a
+	 * D3D11 weaver; with the split off this stays unread.
+	 */
+	void *dp_factory_d3d11 = NULL;
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	if (sys->xsysc != NULL) {
 		dp_factory_vk = sys->xsysc->info.dp_factory_vk;
+		dp_factory_d3d11 = sys->xsysc->info.dp_factory_d3d11;
 		display_screen_left = sys->xsysc->info.display_screen_left;
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
@@ -366,7 +376,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    // ask for one. -1 = none, and the repaint stays off (see oxr_vulkan.c).
 	    sess->sys->vulkan_runtime_queue_family,
 	    sess->sys->vulkan_runtime_queue_index,
-	    dp_factory_vk, shared_texture_handle,
+	    dp_factory_vk, dp_factory_d3d11, shared_texture_handle,
 	    transparent_background,
 	    display_screen_left, display_screen_top,
 	    // VK-0 (#1178): does the APP's device carry VK_KHR_timeline_semaphore?
