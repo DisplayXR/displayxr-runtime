@@ -12,6 +12,7 @@
 # Usage:
 #   ./scripts/setup-displayxr.sh                     # runtime (+ bundled sim-display)
 #   ./scripts/setup-displayxr.sh --with mcp          # also DisplayXR MCP Tools
+#   ./scripts/setup-displayxr.sh --with browser      # also DisplayXR Browser (Windows-only today)
 #   ./scripts/setup-displayxr.sh --with-demos        # also install each demo's prebuilt release
 #   ./scripts/setup-displayxr.sh --with-demo-sources # also clone each demo's source into demos/
 #   ./scripts/setup-displayxr.sh --dry-run           # print plan, install nothing
@@ -42,6 +43,7 @@ ok()   { printf '%s OK %s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 
 # --- arg parsing ---
 WITH_MCP=0
+WITH_BROWSER=0
 WITH_DEMOS=0
 WITH_DEMO_SOURCES=0
 DRY_RUN=0
@@ -55,6 +57,11 @@ Usage: $0 [flags]
 
   --with mcp        Also install DisplayXR MCP Tools (when a macOS
                     asset is available; warn+skip otherwise).
+  --with browser    Also install the DisplayXR Browser developer preview.
+                    Windows-only today, so this warn+skips here. Opt-in on
+                    purpose: the preview is rebased ~monthly onto Chrome
+                    stable but is NOT patched to Chrome's mid-cycle security
+                    cadence, so it is never installed by default.
   --with-demos      Also install each demo's prebuilt release asset
                     (no build needed — same install path as the runtime).
                     Demos without a release asset for this OS are skipped.
@@ -79,9 +86,10 @@ while [ $# -gt 0 ]; do
         --with)
             shift
             case "${1:-}" in
-                mcp) WITH_MCP=1 ;;
-                "") err "--with requires an argument (currently: mcp)"; exit 2 ;;
-                *)  err "Unknown --with target: $1 (supported: mcp)"; exit 2 ;;
+                mcp)     WITH_MCP=1 ;;
+                browser) WITH_BROWSER=1 ;;
+                "") err "--with requires an argument (one of: mcp, browser)"; exit 2 ;;
+                *)  err "Unknown --with target: $1 (supported: mcp, browser)"; exit 2 ;;
             esac
             ;;
         --with-demos)        WITH_DEMOS=1 ;;
@@ -200,6 +208,7 @@ fi
 # Build the install list. Runtime is always in. Opt-ins gated by flags.
 COMPONENTS=(runtime)
 [ "$WITH_MCP" -eq 1 ] && COMPONENTS+=(mcp_tools)
+[ "$WITH_BROWSER" -eq 1 ] && COMPONENTS+=(browser)
 
 install_component() {
     local name="$1"

@@ -82,6 +82,28 @@ COMPONENT_EXE_WINDOWS_mcp_tools="DisplayXRMCPSetup-*.exe"
 COMPONENT_INSTALL_MARKER_MACOS_mcp_tools="/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled"
 COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilities\\MCP"
 
+# --- browser ---
+# DisplayXR Browser (developer preview) — Windows-only, and deliberately an
+# opt-in (`--with browser`), never part of the default install: it is rebased
+# ~monthly onto Chrome stable but NOT patched to Chrome's mid-cycle security
+# cadence, so it must be a thing a user asks for by name.
+#
+# Asset naming: displayxr-browser/scripts/release.sh uploads
+# `"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The part after `#` is the gh
+# *display label*, not the filename — the asset lands under its versioned real
+# name (`…-Setup-0.1.16.exe`), which is what this glob matches.
+#
+# The pin is `preview-X.Y.Z`, not `vX.Y.Z` — see versions-bump.yml's per-field
+# tag validation. Nothing here parses the tag, it is passed to `gh release
+# download` verbatim.
+COMPONENT_REPO_browser="DisplayXR/displayxr-browser"
+COMPONENT_PKG_MACOS_browser=""
+COMPONENT_EXE_WINDOWS_browser="DisplayXR-Browser-Preview-Setup-*.exe"
+COMPONENT_DEB_LINUX_browser=""
+COMPONENT_INSTALL_MARKER_MACOS_browser=""
+COMPONENT_INSTALL_MARKER_WINDOWS_browser="HKLM\\Software\\DisplayXR\\Browser"
+COMPONENT_INSTALL_MARKER_LINUX_browser=""
+
 # --- gauss_demo ---
 # Gaussian-splat viewer demo. macOS .pkg first shipped in
 # displayxr-demo-gaussiansplat v1.4.0 (2026-05-24, #311). Both installers
