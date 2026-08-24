@@ -22,6 +22,8 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		${VK_NATIVE_SHADER_HEADERS}
 		comp_vk_native_compositor.c
 		comp_vk_native_compositor.h
+		comp_vk_native_deposit.cpp
+		comp_vk_native_deposit.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
 		comp_vk_native_swapchain.c
