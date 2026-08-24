@@ -56,10 +56,35 @@ jobs:
         with:
           python-version: '3.x'
 
+      # Mint an installation token for the publish-bot App. `owner:` with no
+      # `repositories:` scopes it to every repo the App is installed on, which
+      # is the whole org (repository_selection=all) -- so this ALREADY beats
+      # GITHUB_TOKEN for reads: the default token cannot see displayxr-shell-pvt
+      # at all, and the audit was silently degrading those to "could not fetch".
+      #
+      # It does NOT yet fix issue emission: the App's permissions are
+      # {actions:read, contents:write, metadata:read} -- no `issues` at all. Grant
+      # the App `issues: write` (and approve it on the org installation) and
+      # per-repo drift issues start working with no further change here.
+      # Until then emission falls back to one aggregate issue on this repo,
+      # loudly, and the job says so.
+      #
+      # continue-on-error so a token hiccup degrades to GITHUB_TOKEN rather than
+      # failing the audit outright.
+      - name: Mint App installation token
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+
       - name: Run drift audit
         env:
-          # Prefer the org-scoped PAT; fall back to the default token.
-          GH_TOKEN: ${{ secrets.DRIFT_AUDIT_TOKEN || secrets.GITHUB_TOKEN }}
+          # Order of preference: explicit PAT (if someone sets one) > App
+          # installation token (org-wide reads) > the default repo token.
+          GH_TOKEN: ${{ secrets.DRIFT_AUDIT_TOKEN || steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
           # schedule -> emit issues; manual dispatch honours the input.
           if [ "${{ github.event_name }}" = "schedule" ] || \
