@@ -208,7 +208,17 @@ tag-chasing**: a release that changes no plug-in ABI is skipped, because a vendo
 would make its installer reject a runtime it works fine against. A track (e.g. leia's
 Linux pin) can be marked manual and is then never touched. `pin-rot-canary.yml` weekly-checks
 each pinned third-party SDK still resolves **and still unpacks `Include/`+`Lib/`** — a URL
-check alone passes a pin that cannot build. Spec: `docs/specs/runtime/downstream-pin-bump.md`.
+check alone passes a pin that cannot build.
+
+A third block, **`consumer_floors`**, covers what neither pin does: the oldest runtime a
+*shipped* consumer still works on. The browser and the engine plug-ins never compile against
+the runtime — they meet it over the wire — so their real coupling is the extension
+`SPEC_VERSION`s they were built for. `drift_audit.py::check_consumer_floors` re-derives that
+weekly (binary-searching release tags for the first one shipping each required spec) and
+compares it against whatever minimum the consumer advertises. **Record where to look, never
+the numbers** — they are read live from the consumer's headers, which is why this can't rot
+the way `displayxr-browser`'s hand-typed `MIN_RUNTIME_VERSION` did (it claimed 2.2.3 while
+needing v2.8.0). Spec: `docs/specs/runtime/downstream-pin-bump.md`.
 
 ### Release code-signing
 CI builds are **unsigned** (contributors need no signing access). Signed

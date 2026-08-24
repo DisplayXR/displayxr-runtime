@@ -99,7 +99,60 @@ much later at `find_package(Vulkan)`. A URL check alone would therefore pass a
 pin that cannot build. Failure updates ONE tracking issue rather than opening a
 new one per run.
 
+## Consumer floors — the axis the pins miss
+
+A build pin answers *"what did this repo compile against?"*. It says nothing
+about a consumer that never compiles against the runtime at all — the browser
+and the engine plug-ins reach it purely over the OpenXR wire, and their real
+coupling is the set of extension `SPEC_VERSION`s they were built for.
+
+That gap was not theoretical. `displayxr-browser` hand-typed
+`MIN_RUNTIME_VERSION "2.2.3"` in its NSIS while actually requiring
+`XR_DXR_weave` spec 8, which first shipped in runtime **v2.8.0**. Every user
+between those two versions was told the prerequisite was satisfied and got a
+browser whose weave path could not work — the precise failure the check was
+added (browser#68) to prevent, reintroduced by the check's own literal going
+stale.
+
+`downstream-pins.json`'s `consumer_floors` block closes it, and
+`scripts/drift_audit.py::check_consumer_floors` enforces it weekly:
+
+1. **Resolve what each consumer requires.** Scan its `spec_sources` for
+   `#define XR_DXR_<ext>_SPEC_VERSION <n>`, live, on every run.
+2. **Can the runtime still serve it?** Compare against the runtime's current
+   header. A consumer needing a spec the runtime has dropped, or has not
+   reached, is a finding.
+3. **Derive the true floor.** Binary-search the runtime's release tags for the
+   earliest one shipping each required spec; the newest of those is the floor.
+4. **Compare against what the consumer advertises.** Under-declaring is a
+   finding (users get a broken install told it is fine); over-declaring is only
+   a note (needless upgrades, nobody breaks).
+
+### The rule that keeps it honest
+
+**Record where to look, never the version numbers.** The manifest holds file
+paths; the numbers are re-read from the consumer's own headers every run, so
+the manifest cannot drift from them the way the NSIS literal did. The one
+exception is `displayxr-browser`, which vendors no header *file* — it is a
+patch series, so `XR_DXR_weave.h` exists only after the patches apply. Its
+number is written down, and the audit cross-checks it against prose in
+`patches/README.md` (`requires_anchor`), emitting a note when it cannot
+confirm it.
+
+Two consequences worth knowing:
+
+- **The binary search assumes `SPEC_VERSION`s never decrease** across
+  releases. That is the intended contract and has held for every `XR_DXR_*`
+  extension; walking one back would make the search report a wrong floor.
+- **`gate` decides how loud a violation is.** `hard` (the browser: its
+  installer refuses or chains an upgrade) is worth acting on. `soft` (the
+  engine plug-ins: name-based detection, degrade with a warning) is worth
+  reporting. Vendor plug-ins are deliberately **excluded** — they have a build
+  pin their installer derives its minimum from, so `runtime_tag_pins` already
+  covers them and listing them here would double-report.
+
 ## Invariant
 
 A pin that no job verifies is a pin that rots silently until a release train
-trips over it. Every pin in the manifest is either auto-bumped or canary-checked.
+trips over it. Every pin in the manifest is either auto-bumped or
+canary-checked — and every consumer floor is re-derived rather than trusted.
