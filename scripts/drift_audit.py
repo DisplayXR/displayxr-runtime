@@ -149,6 +149,16 @@ PROSE_CHECKS = [
 ]
 
 SEMVER_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+# `#define XR_DXR_<ext>_SPEC_VERSION <n>`. The ext segment is spelled
+# inconsistently across consumers (Unity shouts DISPLAY_INFO, the runtime and
+# Unreal use display_info), so match loosely and normalise to lowercase --
+# which is also how the runtime names the header files.
+DXR_SPEC_RE = re.compile(
+    r"^\s*#\s*define\s+XR_DXR_([A-Za-z0-9_]+?)_SPEC_VERSION\s+(\d+)\s*$", re.M | re.I
+)
+NSIS_DEFINE_RE = "define\s+{key}\s+\"([0-9][0-9.]*)\""
+RUNTIME_EXT_HEADER = "src/external/openxr_includes/openxr/XR_DXR_{ext}.h"
 GIT_REPO_RE = re.compile(r"GIT_REPOSITORY\s+(\S+)")
 GIT_TAG_RE = re.compile(r"GIT_TAG\s+([^\s)]+)")
 XR_VER_RE = re.compile(
@@ -541,6 +551,166 @@ def check_prose_versions(report: Report, versions: dict[str, str]) -> None:
             )
 
 
+def _dxr_specs(text: str) -> dict[str, int]:
+    """{ext_lowercase: spec_version} from any C header-ish blob."""
+    out: dict[str, int] = {}
+    for ext, ver in DXR_SPEC_RE.findall(text or ""):
+        ext = ext.lower()
+        # A file may mention an extension more than once (a struct comment
+        # re-stating an older SPEC_VERSION); the #define wins by being the only
+        # thing this regex matches, and the highest wins if there are several.
+        out[ext] = max(out.get(ext, 0), int(ver))
+    return out
+
+
+def runtime_spec(ext: str, ref: str = "HEAD") -> int | None:
+    text = gh_raw("displayxr-runtime", RUNTIME_EXT_HEADER.format(ext=ext), ref)
+    if text is None:
+        return None
+    return _dxr_specs(text).get(ext)
+
+
+def first_release_with_spec(ext: str, want: int, tags: list[str]) -> str | None:
+    """Earliest release tag whose XR_DXR_<ext> spec is >= want.
+
+    Binary search, so this costs ~log2(len(tags)) fetches rather than one per
+    tag -- the runtime has enough releases that the linear form would dominate
+    the whole audit's request budget. Valid because SPEC_VERSIONs only ever
+    climb (see _monotonicity in downstream-pins.json).
+    """
+    lo, hi, best = 0, len(tags) - 1, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        got = runtime_spec(ext, tags[mid])
+        # Extension absent at that tag == predates it entirely: search right.
+        if got is not None and got >= want:
+            best = tags[mid]
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    return best
+
+
+def check_consumer_floors(report: Report) -> None:
+    """Reconcile each wire-protocol consumer's real extension requirements
+    against the runtime, and against whatever minimum it advertises.
+
+    See the consumer_floors block in downstream-pins.json for why this axis
+    exists and what it caught.
+    """
+    manifest = json.loads((REPO_ROOT / "downstream-pins.json").read_text())
+    floors = manifest.get("consumer_floors", {})
+
+    tags = sorted(
+        (t for t in list_tags("displayxr-runtime") if SEMVER_TAG.match(t)),
+        key=semver_key,
+    )
+    if not tags:
+        report.note("consumer-floors: could not list runtime release tags — skipped")
+        return
+
+    for repo, spec in floors.items():
+        if repo.startswith("_"):
+            continue
+
+        # 1. What does this consumer actually require?
+        requires: dict[str, int] = dict(spec.get("requires") or {})
+        for path in spec.get("spec_sources") or []:
+            text = gh_raw(repo, path)
+            if text is None:
+                report.note(f"consumer-floors: could not fetch {repo}:{path} — skipped")
+                continue
+            for ext, ver in _dxr_specs(text).items():
+                requires[ext] = max(requires.get(ext, 0), ver)
+
+        if not requires:
+            report.note(f"consumer-floors: no requirements resolved for {repo} — skipped")
+            continue
+
+        # A hand-maintained number is the thing this block exists to distrust,
+        # so anchor it to prose in the consumer's own tree where one is named.
+        anchor_path = spec.get("requires_anchor")
+        if anchor_path and spec.get("requires"):
+            anchor_text = gh_raw(repo, anchor_path) or ""
+            for ext, ver in (spec.get("requires") or {}).items():
+                if not re.search(rf"v?{ver}\b", anchor_text):
+                    report.note(
+                        f"consumer-floors: {repo} declares {ext} spec {ver} in "
+                        f"downstream-pins.json but {anchor_path} does not mention "
+                        f"it — re-derive from the source of truth"
+                    )
+
+        # 2. Can the runtime still serve it?
+        derived: list[tuple[str, str]] = []
+        for ext, want in sorted(requires.items()):
+            have = runtime_spec(ext)
+            if have is None:
+                report.add(
+                    repo,
+                    "consumer-floor-extension-gone",
+                    f"requires XR_DXR_{ext} spec {want} but the runtime no longer "
+                    f"ships that extension header",
+                )
+                continue
+            if have < want:
+                report.add(
+                    repo,
+                    "consumer-floor-unsatisfiable",
+                    f"requires XR_DXR_{ext} spec {want} but runtime HEAD is at "
+                    f"spec {have} — the runtime cannot serve this consumer",
+                )
+                continue
+            tag = first_release_with_spec(ext, want, tags)
+            if tag:
+                derived.append((tag, f"XR_DXR_{ext} spec {want}"))
+
+        if not derived:
+            continue
+
+        # 3. Does the advertised minimum match the real one?
+        floor_tag, floor_why = max(derived, key=lambda dv: semver_key(dv[0]))
+        decl = spec.get("declared_floor")
+        if not decl:
+            continue
+        text = gh_raw(repo, decl["file"])
+        if text is None:
+            report.note(
+                f"consumer-floors: could not fetch {repo}:{decl['file']} — "
+                f"declared floor unchecked (derived floor is {floor_tag})"
+            )
+            continue
+        m = re.search(NSIS_DEFINE_RE.format(key=re.escape(decl["key"])), text)
+        if not m:
+            report.add(
+                repo,
+                "consumer-floor-unreadable",
+                f"{decl['file']} has no {decl['key']} literal to check "
+                f"(derived floor is {floor_tag}, from {floor_why})",
+            )
+            continue
+        declared = m.group(1)
+        if semver_key(f"v{declared}") is None:
+            report.note(f"consumer-floors: {repo} {decl['key']}={declared} is not vX.Y.Z — skipped")
+            continue
+        if semver_key(f"v{declared}") < semver_key(floor_tag):
+            # Under-declared is the dangerous direction: the consumer installs
+            # happily onto a runtime it cannot actually work against.
+            report.add(
+                repo,
+                "consumer-floor-understated",
+                f"{decl['file']} declares {decl['key']}={declared}, but "
+                f"{floor_why} first shipped in runtime {floor_tag} — users "
+                f"between {declared} and {floor_tag} are told the prerequisite "
+                f"is satisfied and get a broken install",
+            )
+        elif semver_key(f"v{declared}") > semver_key(floor_tag):
+            # Overstated only costs needless upgrades, so it is a note.
+            report.note(
+                f"consumer-floors: {repo} {decl['key']}={declared} is stricter "
+                f"than needed ({floor_why} shipped in {floor_tag})"
+            )
+
+
 # --------------------------------------------------------------------------
 # Issue emission.
 # --------------------------------------------------------------------------
@@ -617,6 +787,7 @@ def main() -> int:
     check_openxr_matrix(report)
     check_demo_three_pins(report)
     check_prose_versions(report, versions)
+    check_consumer_floors(report)
 
     # Report
     by_repo: dict[str, list[Finding]] = {}

@@ -86,5 +86,95 @@
   "excluded": {
     "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029).",
     "displayxr-runtime/.gitlab-ci/windows/monado_deps_build.ps1": "Inert Monado-era leftover carrying a stale LunarG URL. Not on any active CI path -- excluded so the canary does not report a failure nothing can act on."
+  },
+
+  "consumer_floors": {
+    "_comment": [
+      "The THIRD axis, and the one the other two miss.",
+      "",
+      "  versions.json     -- what each component last RELEASED.",
+      "  runtime_tag_pins  -- where a repo pins the runtime to BUILD against.",
+      "  consumer_floors   -- the OLDEST runtime a shipped consumer still WORKS on.",
+      "",
+      "A vendor plug-in derives its floor from its build pin, so the first two",
+      "axes already cover it. A consumer that talks to the runtime purely over",
+      "the OpenXR wire -- the browser, the engine plug-ins, the CEF host -- has",
+      "no build pin at all: its real coupling is the extension SPEC_VERSIONs it",
+      "was compiled against. Nothing reconciled those against the runtime until",
+      "this block existed, and the cost was concrete. displayxr-browser shipped",
+      "a hand-typed MIN_RUNTIME_VERSION of 2.2.3 while actually requiring",
+      "XR_DXR_weave spec 8, which first shipped in runtime v2.8.0 -- so users on",
+      "v2.2.3..v2.7.x were told the prerequisite was satisfied and got a browser",
+      "whose weave path could not work. That is the exact failure the NSIS check",
+      "was added (browser#68) to prevent.",
+      "",
+      "Consumed by scripts/drift_audit.py::check_consumer_floors, weekly via",
+      ".github/workflows/drift-audit.yml. Spec: docs/specs/runtime/downstream-pin-bump.md.",
+      "",
+      "DESIGN RULE -- record WHERE TO LOOK, never the version numbers. They are",
+      "read live from each consumer's own headers on every audit, so this file",
+      "cannot drift from them. `requires` is spelled out ONLY for a consumer with",
+      "no readable header file (the browser -- see its entry)."
+    ],
+
+    "_schema": {
+      "gate": "How the consumer behaves against a too-old runtime. hard = refuses or chains an upgrade. soft = degrades with a warning. none = no check at all.",
+      "spec_sources": "Files to scan for `#define XR_DXR_<ext>_SPEC_VERSION <n>`. The ext segment is matched case-insensitively -- Unity writes XR_DXR_DISPLAY_INFO_SPEC_VERSION, the runtime writes XR_DXR_display_info_SPEC_VERSION -- and normalised to the runtime's lowercase header naming.",
+      "declared_floor": "Where the consumer writes its minimum-runtime literal, if it has one. The audit compares it against the floor DERIVED from spec_sources.",
+      "requires": "Escape hatch: an explicit {ext: version} map for a consumer whose headers are not readable files. Prefer spec_sources.",
+      "_monotonicity": [
+        "Deriving 'which release first shipped spec N' binary-searches the runtime's",
+        "release tags, which assumes a SPEC_VERSION never decreases from one release",
+        "to the next. That has held for every XR_DXR_* extension and is the intended",
+        "contract; if one is ever walked back, the search reports the wrong floor."
+      ]
+    },
+
+    "displayxr-browser": {
+      "role": "Chromium fork; drives the display-processor weave over XR_DXR_weave. Windows + Android.",
+      "gate": "hard",
+      "declared_floor": { "file": "installer/DisplayXRBrowserInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" },
+      "requires": { "weave": 8 },
+      "requires_anchor": "patches/README.md",
+      "requires_note": [
+        "Spelled out because this consumer vendors no header FILE -- it is a patch",
+        "series against Chromium, so XR_DXR_weave.h exists only after the patches",
+        "are applied. Re-derive with:",
+        "  git grep -h '^+#define XR_DXR_weave_SPEC_VERSION' main -- patches | sort -u | tail -1",
+        "The audit cross-checks this number against requires_anchor's prose and",
+        "emits a note (not a finding) when it cannot confirm it there."
+      ]
+    },
+
+    "displayxr-unity": {
+      "role": "IUnityXRDisplay provider; loads the runtime directly and consumes XR_DXR_view_rig render-ready views.",
+      "gate": "soft",
+      "gate_note": "Detection is name-based, not version-gated: against a runtime missing XR_DXR_view_rig the plug-in emits a one-shot WARN and passes raw views through (no stereo). A floor violation degrades rather than fails -- worth reporting, not worth blocking.",
+      "spec_sources": [ "native~/displayxr_extensions.h" ]
+    },
+
+    "displayxr-unreal": {
+      "role": "First-class UE HMD plug-in; direct runtime load + zero-copy atlas handoff.",
+      "gate": "soft",
+      "spec_sources": [
+        "Source/DisplayXRCore/Private/Native/openxr/XR_DXR_display_info.h",
+        "Source/DisplayXRCore/Private/Native/openxr/XR_DXR_view_rig.h",
+        "Source/DisplayXRCore/Private/Native/openxr/XR_DXR_win32_window_binding.h",
+        "Source/DisplayXRCore/Private/Native/openxr/XR_DXR_atlas_capture.h",
+        "Source/DisplayXRCore/Private/Native/openxr/XR_DXR_cocoa_window_binding.h"
+      ]
+    },
+
+    "displayxr-cef-host": {
+      "role": "Smallest worked example of driving the weave from an external present-owner. A reference to read, not a shipping product.",
+      "gate": "none",
+      "spec_sources": [ "third_party/displayxr_openxr_includes/openxr/XR_DXR_weave.h" ]
+    },
+
+    "_excluded": {
+      "displayxr-leia-plugin": "Has a BUILD pin (DXR_RUNTIME_GIT_TAG) that its installer regex-derives MIN_RUNTIME_VERSION from, so runtime_tag_pins above already covers it. Listing it here would double-report.",
+      "displayxr-vendor-template": "Same -- covered by runtime_tag_pins.",
+      "displayxr-demo-*": "Built against a pinned runtime in their own CI and shipped as whole installers; no independent wire-protocol floor."
+    }
   }
 }
