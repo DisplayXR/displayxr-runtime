@@ -18,6 +18,17 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_color.h"
 #include "xrt/xrt_display_zones.h"
+#include "xrt/xrt_display_scanout.h"
+
+/*
+ * NOTE: the weave-scope query (`get_scanout_caps`) deliberately does NOT live
+ * on this base vtable — it is appended to each per-API variant instead. This
+ * struct is embedded BY VALUE in @ref xrt_display_processor_vk, so appending
+ * here would move every slot that variant appends after it and misdispatch
+ * calls into any already-built VK plug-in (the exact silent break ADR-020
+ * exists to prevent). Vulkan callers use
+ * @ref xrt_display_processor_vk_get_weave_scope.
+ */
 
 #include <stdbool.h>
 #include <stdint.h>

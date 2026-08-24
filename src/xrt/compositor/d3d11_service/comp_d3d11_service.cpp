@@ -23,6 +23,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_weave_scope.h"
 #include "util/u_misc.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
@@ -6528,6 +6529,13 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		} else {
 			U_LOG_W("D3D11 display processor created via factory for client");
 
+			// Weave scope, once. This DP only exists for a STANDALONE
+			// client (workspace mode skips it above), which presents its
+			// own window — so it is canvas-scoped like the in-process legs.
+			(void)u_weave_scope_report(
+			    xrt_display_processor_d3d11_get_weave_scope(res->display_processor), "D3D11 service client",
+			    /* panel_scoped */ false);
+
 			// #551: enable the DP's transparent compose-under-bg for a
 			// transparent client. The runtime already hands the DP a
 			// premultiplied-transparent atlas; this is the policy signal that
@@ -9714,6 +9722,14 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 		if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 			U_LOG_W("Multi-comp: display processor created");
+
+			// Weave scope, once. The multi-compositor presents the WHOLE
+			// panel (fullscreen window, combined atlas at native display
+			// dims), which is the one path a scanout-scoped hardware
+			// weaver can be correct on — so no warning fires here.
+			(void)u_weave_scope_report(
+			    xrt_display_processor_d3d11_get_weave_scope(mc->display_processor), "D3D11 workspace",
+			    /* panel_scoped */ true);
 			mc->panel_dp_hwnd = mc->hwnd; // #964 D-4: the panel DP's bound window
 			mc->panel_dp_device = panel_dev; // #918: and the device half of the key
 

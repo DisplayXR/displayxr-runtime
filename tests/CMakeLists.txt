@@ -23,6 +23,7 @@ set(tests
     tests_pose
     tests_vec3_angle
     tests_u_multi_display
+    tests_dp_weave_scope
     tests_space_overseer_rig
 	)
 if(XRT_HAVE_D3D11)

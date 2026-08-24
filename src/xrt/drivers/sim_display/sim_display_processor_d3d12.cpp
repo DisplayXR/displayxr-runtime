@@ -17,6 +17,7 @@
 
 #include "sim_display_interface.h"
 #include "sim_display_zone_common.h"
+#include "sim_display_scanout_common.h"
 
 #include "xrt/xrt_display_processor_d3d12.h"
 #include "xrt/xrt_display_metrics.h"
@@ -593,6 +594,20 @@ sim_dp_d3d12_clear_local_zone_mask(struct xrt_display_processor_d3d12 *xdp)
 }
 
 
+/*!
+ * Declare the simulated weave scope (`SIM_DISPLAY_WEAVE_SCOPE`, default
+ * canvas). sim_display writes final pixels itself, so canvas is the honest
+ * answer; the knob exists so the region / scanout routing and diagnostics can
+ * be exercised with no hardware. See sim_display_scanout_common.h.
+ */
+static bool
+sim_dp_d3d12_get_scanout_caps(struct xrt_display_processor_d3d12 *xdp, struct xrt_dp_scanout_caps *out_caps)
+{
+	(void)xdp;
+	return sim_scanout_fill_caps(out_caps, "D3D12");
+}
+
+
 /*
  *
  * Exported creation function.
@@ -631,6 +646,7 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	sdp->base.get_local_zone_caps = sim_dp_d3d12_get_local_zone_caps;         // #224 / ADR-027
 	sdp->base.publish_local_zone_mask = sim_dp_d3d12_publish_local_zone_mask; // #224 / ADR-027
 	sdp->base.clear_local_zone_mask = sim_dp_d3d12_clear_local_zone_mask;     // #224 / ADR-027
+	sdp->base.get_scanout_caps = sim_dp_d3d12_get_scanout_caps;
 
 	// #224 / ADR-027 zone test double config (shared parser).
 	sim_zone_config_from_env(&sdp->zone_cfg, "D3D12");
