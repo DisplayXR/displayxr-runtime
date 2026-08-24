@@ -12,6 +12,7 @@
  */
 
 #include "comp_vk_native_compositor.h"
+#include "comp_vk_native_deposit.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
@@ -225,6 +226,10 @@ struct comp_vk_native_compositor
 
 	//! Renderer for layer compositing.
 	struct comp_vk_native_renderer *renderer;
+
+	//! VK-0 (#1178): the app's VkDevice has VK_KHR_timeline_semaphore enabled.
+	//! Read only by the deposit, which cannot exist without it.
+	bool app_timeline_semaphores;
 
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
@@ -3649,6 +3654,16 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	// Present
 	xret = comp_vk_native_target_present(c->target, queue);
 
+	/*
+	 * VK-0 (#1178) — one-shot deposit proof, DXR_VK_DEPOSIT_PROBE=1 only.
+	 *
+	 * Deliberately AFTER the present: it takes the consumer's GPU-side fence
+	 * wait for real and then reads the texture back once, so its single CPU
+	 * map is off the frame's critical path. No-op with the probe env unset,
+	 * with the deposit off, and on every non-Windows platform.
+	 */
+	comp_vk_deposit_probe_once(comp_vk_native_renderer_get_deposit(c->renderer), queue);
+
 	if (ftime && fp[1] != 0) {
 		fp[6] = os_monotonic_get_ns();
 		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRE, fp[0], fp[1]);
@@ -4651,6 +4666,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  bool transparent_background,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
+                                 bool app_timeline_semaphores,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -4672,6 +4688,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	c->repaint_queue_family = runtime_queue_family;
 	c->repaint_queue_index = runtime_queue_index;
 	c->shared_texture_handle = shared_texture_handle;
+	// VK-0 (#1178): only the deposit reads this. Deliberately NOT forwarded to
+	// vk_init_from_given below — that call keeps saying `timeline_semaphore_enabled
+	// = false`, which is the runtime declaring what IT uses the bundle for, and
+	// changing it would move behaviour on the flag-off path.
+	c->app_timeline_semaphores = app_timeline_semaphores;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -5476,7 +5497,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 	// Create renderer with active mode atlas
 	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height,
-	                                                     atlas_width, atlas_height, &c->renderer);
+	                                                     atlas_width, atlas_height,
+	                                                     c->app_timeline_semaphores, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);
