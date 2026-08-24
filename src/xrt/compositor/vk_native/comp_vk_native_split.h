@@ -404,6 +404,11 @@ comp_vk_split_raster_mask(struct comp_vk_split *split,
  * finishing was filled by an earlier frame.
  *
  * @param composite_mode A `COMP_D3D11_COMPOSITE_MODE_*`.
+ * @param mask_is_plane VK-1b-3 — the composite's mask is the bridged Tier-3
+ *        plane rather than an out-device raster. A ZONES frame passes false even
+ *        with a live plane: per ADR-027/#801 an explicit wish is PUBLISH-only and
+ *        never a blend gate, so the composite there always gates on the binary
+ *        zone raster.
  */
 void
 comp_vk_split_stage_local2d(struct comp_vk_split *split,
@@ -423,7 +428,8 @@ comp_vk_split_stage_local2d(struct comp_vk_split *split,
                             uint32_t cw,
                             uint32_t ch,
                             uint32_t composite_mode,
-                            bool opaque_present);
+                            bool opaque_present,
+                            bool mask_is_plane);
 
 /*!
  * This frame runs NO composite. Stamps `composite=false` on the slot and
@@ -462,6 +468,56 @@ comp_vk_split_publish_zone_wish(struct comp_vk_split *split, uint64_t seq);
 /*! Withdraw this client's zone contribution (the clear edge). */
 void
 comp_vk_split_clear_zone_wish(struct comp_vk_split *split);
+
+/*!
+ * VK-1b-3 — bind the app-AUTHORED (Tier-3) zone mask's transport.
+ *
+ * The one mask whose pixels the APP drew, and therefore the one that cannot be
+ * rebuilt from CPU rects on the scanout device the way every other kind is. It
+ * has to cross, as `COMP_XBRIDGE_PLANE_MASK`.
+ *
+ * Sized at the **MASK**, not the panel (#918 review F5): the composite and the
+ * display processor both stretch the whole mask over the region, so a
+ * panel-sized mask plane would leave them stretching a never-written band. That
+ * makes a dims change a real reallocation — but an ON-CHANGE one, never
+ * per-frame, because the steady-state call is the handle+generation early-out
+ * inside the bridge.
+ *
+ * Call once per app frame from `layer_commit`, BEFORE any command is recorded,
+ * with the frame's authoritative mask. A false return is the ONE remaining
+ * reason this leg retires the split (`authored_mask`): with no transport there is
+ * no mask on the scanout adapter at all, and the choice is the app device or
+ * wrong pixels. Retiring there is honest; a silent difference would put different
+ * pixels on a hybrid box than on a single-GPU one.
+ *
+ * @param nt_handle The mask's staging surface, or NULL to drop the plane (which
+ *        is not a failure — a frame with no authored mask passes NULL).
+ * @return false only when a bind that was ASKED FOR could not be made.
+ */
+bool
+comp_vk_split_bind_mask_plane(
+    struct comp_vk_split *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h);
+
+/*!
+ * VK-1b-3 — stage the authored mask plane for the next submit.
+ *
+ * Deliberately separate from the bind, and in that order, for the two properties
+ * the D3D legs learned:
+ *
+ *  1. **One producer.** Binding one plane from two sites with two generations
+ *     re-opens it on alternating frames, each re-open a full re-transport.
+ *  2. **Staging does not depend on consumption.** The transport is set up before
+ *     anything asks whether the pixels have landed, so the frame that AUTHORS a
+ *     mask transports it and consumption starts on whichever later frame the slot
+ *     lands. Gating this on the composite instead is what makes a Tier-3 mask
+ *     unable to bootstrap: no deposit, no recipe, no transport, no mask next
+ *     frame either, for ever.
+ *
+ * @param content_seq 0 ⟹ this frame does not use the plane; the recipe then
+ *        stamps it invalid rather than lending an older frame's pixels.
+ */
+void
+comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq, uint32_t w, uint32_t h);
 
 /*!
  * VK-1b-2 — hand the split this frame's diagnostic HUD bitmap.

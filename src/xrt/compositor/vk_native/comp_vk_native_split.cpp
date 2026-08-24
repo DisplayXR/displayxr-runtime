@@ -183,6 +183,14 @@ struct comp_vk_split
 	bool hud_live;
 	//! @}
 
+	//! @name VK-1b-3 — the app-authored (Tier-3) mask plane.
+	//! @{
+	bool mask_plane_live;
+	uint64_t mask_plane_gen;
+	//! The region-sized out-device view of the mask plane, for the wish publish.
+	struct split_plane_view dp_mask_view;
+	//! @}
+
 	//! ADR-027 P4 — the scanout weaver's zone capability, probed once.
 	int zone_dp_state;
 	bool zone_published;
@@ -567,6 +575,7 @@ split_release_out(struct comp_vk_split *s)
 	}
 	s->hud_live = false;
 	split_release_plane_view(&s->dp_bd_view);
+	split_release_plane_view(&s->dp_mask_view);
 	if (s->dp_input_srv != NULL) {
 		s->dp_input_srv->Release();
 		s->dp_input_srv = NULL;
@@ -1269,7 +1278,8 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
                             uint32_t cw,
                             uint32_t ch,
                             uint32_t composite_mode,
-                            bool opaque_present)
+                            bool opaque_present,
+                            bool mask_is_plane)
 {
 	if (s == nullptr || s->xbridge == nullptr) {
 		return;
@@ -1318,10 +1328,51 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 	s->comp_ch = ch;
 	s->comp_mode = composite_mode;
 	s->comp_opaque = opaque_present;
-	// VK-1b-2 rasters every mask it consumes; the bridged Tier-3 plane is
-	// VK-1b-3, and stamping OUT_RASTER here is the honest description of what
-	// the consume half will actually sample.
-	s->comp_mask_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
+	/*
+	 * VK-1b-3 — which mask the consume half will actually SAMPLE, which is the
+	 * only thing this stamp may describe. A bridged Tier-3 mask reads the plane
+	 * that landed with this slot; every other kind is the out-device raster.
+	 */
+	s->comp_mask_kind = mask_is_plane ? COMP_XBRIDGE_MASK_PLANE : COMP_XBRIDGE_MASK_OUT_RASTER;
+}
+
+extern "C" bool
+comp_vk_split_bind_mask_plane(struct comp_vk_split *s, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return true; // nothing to bind against, and nothing broken
+	}
+	if (nt_handle == nullptr || w == 0 || h == 0) {
+		s->mask_plane_live = false;
+		s->mask_plane_gen = 0;
+		return true; // no authored mask this frame — not a failure
+	}
+
+	// Sized at the MASK (#918 review F5), so a dims change rebuilds the chain.
+	// On-change only: the steady-state call is the bridge's own early-out.
+	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, nt_handle, generation,
+	                             (uint32_t)DXGI_FORMAT_R8_UNORM, w, h)) {
+		s->mask_plane_live = false;
+		s->mask_plane_gen = 0;
+		return false;
+	}
+	s->mask_plane_live = true;
+	s->mask_plane_gen = generation;
+	return true;
+}
+
+extern "C" void
+comp_vk_split_stage_mask_plane(struct comp_vk_split *s, uint64_t content_seq, uint32_t w, uint32_t h)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return;
+	}
+	if (!s->mask_plane_live || content_seq == 0) {
+		// 0 is the bridge's "this frame does not use the plane".
+		comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, 0, 0, 0, 0, 0);
+		return;
+	}
+	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_MASK, content_seq, 0, 0, w, h);
 }
 
 extern "C" bool
@@ -1355,7 +1406,53 @@ comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
 	 * composite sampled the feather mask still publishes the binary one — which
 	 * is why the publish reads the raster's KIND rather than just its SRV.
 	 */
-	if (s->mask.srv == nullptr || s->mask.kind != COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+	ID3D11ShaderResourceView *srv = nullptr;
+	uint32_t mw = 0, mh = 0;
+	if (s->mask_plane_live) {
+		/*
+		 * VK-1b-3 - an APP-AUTHORED wish publishes VERBATIM, off the plane it
+		 * crossed on. That is the whole point of a Tier-3 wish: the app chose the
+		 * geometry and the runtime must not substitute its own. Falling back to
+		 * the auto raster when the plane has not landed would publish DIFFERENT
+		 * geometry for one frame, which is a flicker rather than a degradation -
+		 * so a not-yet-landed authored wish publishes nothing and the vendor keeps
+		 * the one it already has.
+		 */
+		const int32_t wslot = comp_xbridge_get_weave_slot(s->xbridge);
+		struct comp_xbridge_recipe rec = {};
+		if (wslot < 0 || !comp_xbridge_slot_recipe(s->xbridge, wslot, &rec) ||
+		    (rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
+			return;
+		}
+		const uint64_t want = rec.plane_seq[COMP_XBRIDGE_PLANE_MASK];
+		void *plane_srv = comp_xbridge_get_plane_srv(s->xbridge, wslot, COMP_XBRIDGE_PLANE_MASK, want);
+		uint32_t pw = 0, ph = 0;
+		if (plane_srv == nullptr || !comp_xbridge_plane_extent(s->xbridge, COMP_XBRIDGE_PLANE_MASK, &pw, &ph) ||
+		    pw == 0 || ph == 0) {
+			return;
+		}
+		// Normally a passthrough - the mask plane is sized AT the mask (#918
+		// review F5) - but the helper still handles a publish that asks for dims
+		// the plane does not have, seq-gated and clamped.
+		srv = split_plane_dp_view(s, &s->dp_mask_view, plane_srv, want, pw, ph, DXGI_FORMAT_R8_UNORM,
+		                          "zone-mask publish");
+		mw = pw;
+		mh = ph;
+	} else {
+		/*
+		 * The BINARY raster and nothing else. A feather ramp is a cosmetic
+		 * composite opt-in (#803) and must never reach the vendor as geometry, so
+		 * a frame whose composite sampled the feather mask still publishes the
+		 * binary one - which is why this reads the raster's KIND, not just its SRV.
+		 */
+		if (s->mask.srv == nullptr || s->mask.kind != COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+			return;
+		}
+		srv = s->mask.srv;
+		mw = s->mask.w;
+		mh = s->mask.h;
+	}
+	if (srv == nullptr || mw == 0 || mh == 0) {
 		return;
 	}
 
@@ -1364,8 +1461,8 @@ comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
 	if (!GetClientRect(s->hwnd, &r) || r.right <= 0 || r.bottom <= 0 || !ClientToScreen(s->hwnd, &origin)) {
 		return;
 	}
-	if (xrt_display_processor_d3d11_publish_local_zone_mask(s->dp, s->out_ctx, s->mask.srv, s->mask.w, s->mask.h,
-	                                                        (int32_t)origin.x, (int32_t)origin.y, (uint32_t)r.right,
+	if (xrt_display_processor_d3d11_publish_local_zone_mask(s->dp, s->out_ctx, srv, mw, mh, (int32_t)origin.x,
+	                                                        (int32_t)origin.y, (uint32_t)r.right,
 	                                                        (uint32_t)r.bottom, seq)) {
 		s->zone_published = true;
 	}
@@ -1539,6 +1636,9 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	if (s->l2d_plane_live) {
 		comp_xbridge_pre_plane_write(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D);
 	}
+	if (s->mask_plane_live) {
+		comp_xbridge_pre_plane_write(s->xbridge, COMP_XBRIDGE_PLANE_MASK);
+	}
 }
 
 /*!
@@ -1607,7 +1707,25 @@ split_composite(struct comp_vk_split *s, int32_t slot, bool is_repaint, ID3D11Te
 	 * wish publish, and driving that at panel rate desynchronises the sideband.
 	 */
 	(void)is_repaint;
-	ID3D11ShaderResourceView *mask_srv = s->repaint_mask_srv;
+	ID3D11ShaderResourceView *mask_srv = nullptr;
+	if (rec.mask_kind == COMP_XBRIDGE_MASK_PLANE) {
+		/*
+		 * VK-1b-3 — the app drew these pixels, so they crossed as a plane and
+		 * are proved against the slot's own generation like every other plane.
+		 * Resolved FROM THE SLOT on a repaint too, rather than cached: a repaint
+		 * re-weaves the slot the last app frame wove, so the same call returns
+		 * the same resource under the same seq test — and a cached pointer would
+		 * be the one thing that could outlive its seq.
+		 */
+		if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_MASK)) == 0) {
+			s->composite_bails++;
+			return false;
+		}
+		mask_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
+		    s->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
+	} else {
+		mask_srv = s->repaint_mask_srv;
+	}
 	if (mask_srv == nullptr) {
 		s->composite_bails++;
 		return false;
@@ -2156,7 +2274,8 @@ comp_vk_split_stage_local2d(struct comp_vk_split *split,
                             uint32_t cw,
                             uint32_t ch,
                             uint32_t composite_mode,
-                            bool opaque_present)
+                            bool opaque_present,
+                            bool mask_is_plane)
 {
 	(void)split;
 	(void)nt_handle;
@@ -2176,12 +2295,33 @@ comp_vk_split_stage_local2d(struct comp_vk_split *split,
 	(void)ch;
 	(void)composite_mode;
 	(void)opaque_present;
+	(void)mask_is_plane;
 }
 
 extern "C" void
 comp_vk_split_stage_no_composite(struct comp_vk_split *split)
 {
 	(void)split;
+}
+
+extern "C" bool
+comp_vk_split_bind_mask_plane(struct comp_vk_split *split, void *nt_handle, uint64_t generation, uint32_t w, uint32_t h)
+{
+	(void)split;
+	(void)nt_handle;
+	(void)generation;
+	(void)w;
+	(void)h;
+	return true;
+}
+
+extern "C" void
+comp_vk_split_stage_mask_plane(struct comp_vk_split *split, uint64_t content_seq, uint32_t w, uint32_t h)
+{
+	(void)split;
+	(void)content_seq;
+	(void)w;
+	(void)h;
 }
 
 extern "C" bool

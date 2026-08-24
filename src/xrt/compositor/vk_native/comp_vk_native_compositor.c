@@ -3101,6 +3101,21 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 //! surfaces and publish them to the bridge. Defined beside the flatten it drives.
 static void
 vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint32_t tgt_h);
+//! VK-1b-3 - this frame's authoritative app-authored mask, and the ensure that
+//! must run BEFORE any command is recorded. Defined with the zone helpers.
+struct comp_vk_native_zone_mask;
+static struct comp_vk_native_zone_mask *
+vk_frame_authored_mask(struct comp_vk_native_compositor *c);
+static bool
+vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_native_zone_mask *mask);
+struct comp_vk_deposit_plane;
+static void
+vk_split_snapshot_mask_plane(struct comp_vk_native_compositor *c,
+                             VkCommandBuffer cmd,
+                             const struct comp_vk_deposit_plane *plane,
+                             struct comp_vk_native_zone_mask *mask);
+static uint64_t
+vk_mask_plane_seq(const struct comp_vk_deposit_plane *plane, const struct comp_vk_native_zone_mask *mask);
 //! True when this frame carries Local2D content the OUT-DEVICE composite would
 //! have to run for — as opposed to a pure 2D-UNDER backdrop, which is a plane and
 //! nothing else. Defined with the other layer-scan helpers.
@@ -4170,45 +4185,38 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 #ifdef XRT_OS_WINDOWS
 	/*
-	 * #918 VK-1b (#1178) — what this rung's transport still cannot move.
+	 * #918 VK-1b-3 (#1178) - the LAST layer-kind gate, and it is now about the
+	 * MACHINE rather than the feature.
 	 *
 	 * VK-1 was projection-only and retired on ANY 2D. VK-1b-1 moved the 2D-under
-	 * BACKDROP across as a bridge plane; VK-1b-2 moved the Local2D OVER flatten
-	 * across too and put the masked composite on the output device
-	 * (comp_d3d11_outcomp), which covers zones frames with it. Neither is in this
-	 * test any more.
+	 * backdrop across as a bridge plane; VK-1b-2 moved the Local2D OVER flatten
+	 * across and put the masked composite on the output device; this rung moves
+	 * the app-AUTHORED (Tier-3) zone mask, the one mask whose pixels the app drew
+	 * itself and which therefore cannot be rebuilt from CPU rects over there.
 	 *
-	 * What is left is an APP-AUTHORED (Tier-3) zone mask: pixels the app drew
-	 * itself, which unlike every other mask cannot be rebuilt from CPU rects on
-	 * the scanout device and genuinely have to be transported. That is
-	 * COMP_XBRIDGE_PLANE_MASK and VK-1b-3.
+	 * So no LAYER KIND retires any more. What is left is an allocation failure:
+	 * an R8 cross-adapter heap the stack refuses, or an egress the driver will not
+	 * hand over. `authored_mask` is exactly that token - comp_split_gate.h records
+	 * that its meaning narrowed the same way on the D3D12 leg in D12-5.
 	 *
-	 * It retires rather than degrades because the split must be VISUALLY
-	 * TRANSPARENT — it changes WHERE the weave happens, never WHAT the user sees.
-	 * Compositing a Tier-3 frame with the wrong mask, or with none, would put
-	 * different pixels on the panel on a hybrid box than on a single-GPU one,
-	 * keyed on hardware topology the user cannot see. Retiring is honest; a
-	 * silent difference is a bug report nobody can act on.
+	 * It RETIRES rather than degrades because the split must be VISUALLY
+	 * TRANSPARENT: it changes WHERE the weave happens, never WHAT the user sees.
+	 * With no transport there is no mask on the scanout adapter at all, so the
+	 * choice is the app device or wrong pixels - and wrong pixels here would mean
+	 * a different picture on a hybrid box than on a single-GPU one, keyed on
+	 * hardware topology the user cannot see.
 	 *
-	 * `layers_unsupported` is exactly the token for this: comp_split_gate.h keeps
-	 * it as "the right token for any future leg whose transport genuinely cannot
-	 * move a frame's layers", which is a different statement from a plane that
-	 * failed to ALLOCATE (`authored_mask`) or a leg with no split at all
-	 * (`api_unsupported`).
+	 * Placed HERE, immediately after the scan that resolves the frame's flags and
+	 * before a single command is recorded or a single bridge copy is staged, so
+	 * the teardown never runs against half-built frame state - which is also what
+	 * lets the bind live in the same call as the ensure.
 	 *
-	 * Placed HERE, immediately after the scan that resolves the flags and before
-	 * a single command is recorded or a single bridge copy is staged, so the
-	 * teardown never runs against half-built frame state.
-	 *
-	 * Window-space layers are deliberately NOT in this test: the Vulkan
-	 * compositor composites them INTO the atlas pre-weave, on the app device, so
-	 * they cross the bridge with the pixels they were merged into.
-	 */
-	if (c->split != NULL && (c->active_zone_mask != NULL || c->frame_wish != NULL)) {
-		vk_split_retire_locked(c,
-		                       "the frame carries an app-authored zone mask, whose pixels this rung "
-		                       "cannot move to the scanout adapter",
-		                       COMP_SPLIT_REASON_LAYERS_UNSUPPORTED);
+	 * Window-space layers were never in this test: the Vulkan compositor
+	 * composites them INTO the atlas pre-weave, on the app device, so they cross
+	 * the bridge with the pixels they were merged into.	 */
+	if (c->split != NULL && !vk_split_ensure_mask_plane(c, vk_frame_authored_mask(c))) {
+		vk_split_retire_locked(c, "the app-authored zone mask could not be transported to the scanout adapter",
+		                       COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
 #endif
 
@@ -6946,6 +6954,13 @@ struct comp_vk_native_zone_mask
 	VkImageView staged_view;
 	VkImageLayout tex_layout;
 	bool submitted;
+	/*!
+	 * VK-1b-3 - bumped on every AUTHORING call. The bridged mask plane's
+	 * content seq is a hash of this and the plane's allocation generation, so
+	 * two different masks that are both at author 1 cannot look like the same
+	 * pixels to the change-skip.
+	 */
+	uint64_t author_seq;
 };
 
 static const VkImageSubresourceRange k_color_sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -7901,18 +7916,38 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * writes M·weave over transparent, and pixels outside every zone present
 	 * alpha 0), which is why the test is not simply "are there over-layers".
 	 */
-	const bool want_composite = have_l2d && (c->zones_frame || vk_frame_has_over_local2d(c));
+	// A legacy AUTHORED mask composites even with zero Local2D layers - it is a
+	// designer cutout over the weave, and its `twod` side is then a cleared
+	// region, which is itself content that has to reach the other adapter.
+	const bool want_composite =
+	    have_l2d && (c->zones_frame || vk_frame_has_over_local2d(c) || vk_frame_authored_mask(c) != NULL);
 	bool l2d_ok = false;
 	if (want_composite) {
 		l2d_ok = vk_split_flatten_local2d(c, cmd, &pl2d, proj_idx, region_w, region_h);
 	}
 
+	/*
+	 * VK-1b-3 - the authored mask's snapshot, into the SAME command buffer.
+	 * The plane was bound at the top of layer_commit (before anything was
+	 * recorded, so a bind failure could retire cleanly); this is the copy that
+	 * fills it, and riding the plane pass is what gives it the pass's own
+	 * timeline wait against the producer's read of the previous frame.
+	 */
+	struct comp_vk_native_zone_mask *const amask = vk_frame_authored_mask(c);
+	struct comp_vk_deposit_plane plmask = {0};
+	bool mask_ok = false;
+	if (amask != NULL && comp_vk_deposit_plane_get(dep, COMP_VK_DEPOSIT_PLANE_MASK, &plmask)) {
+		vk_split_snapshot_mask_plane(c, cmd, &plmask, amask);
+		mask_ok = true;
+	}
+
 	vk->vkEndCommandBuffer(cmd);
 
-	if (bd_view == VK_NULL_HANDLE && !l2d_ok) {
+	if (bd_view == VK_NULL_HANDLE && !l2d_ok && !mask_ok) {
 		/*
-		 * The frame has no 2D at all. Nothing was recorded worth submitting,
-		 * and — critically — no timeline value was claimed, so nothing can be
+		 * The frame has no 2D and no authored mask. Nothing was recorded worth
+		 * submitting,
+		 * and - critically - no timeline value was claimed, so nothing can be
 		 * left waiting on one. Un-stage: the weave then CLEARS the display
 		 * processor's background and skips the composite, which is what "this
 		 * frame has no 2D" means.
@@ -7984,6 +8019,28 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	}
 
+	/*
+	 * Stage the mask plane BEFORE the composite decision, and independently of
+	 * it (#918 review F1/D6). The transport must not depend on whether anything
+	 * consumes it this frame: gating it on the composite is what makes a Tier-3
+	 * mask unable to bootstrap - no deposit, no recipe, no transport, no mask
+	 * next frame either, for ever.
+	 */
+	bool mask_is_plane = false;
+	if (mask_ok) {
+		comp_vk_split_stage_mask_plane(c->split, vk_mask_plane_seq(&plmask, amask), plmask.width,
+		                               plmask.height);
+		/*
+		 * ADR-027/#801 - in a ZONES frame an explicit wish is PUBLISH-only and
+		 * never a blend gate, so the composite there still gates on the binary
+		 * zone raster and the plane feeds only the wish publish below. A legacy
+		 * (non-zones) authored mask IS the composite's gate.
+		 */
+		mask_is_plane = !c->zones_frame;
+	} else {
+		comp_vk_split_stage_mask_plane(c->split, 0, 0, 0);
+	}
+
 	if (!l2d_ok) {
 		comp_vk_split_stage_no_composite(c->split);
 		return;
@@ -7996,10 +8053,17 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * `is_repaint` explicitly rather than inferring it from a reuse flag — the
 	 * raster is not merely a draw, it also feeds the zone wish publish below.
 	 */
-	const uint32_t mask_kind = vk_split_raster_frame_mask(c, proj_idx, region_w, region_h);
-	if (mask_kind == COMP_VK_SPLIT_MASK_NONE) {
-		comp_vk_split_stage_no_composite(c->split);
-		return;
+	/*
+	 * A legacy authored mask is the composite's own gate and needs no raster -
+	 * its pixels are on the plane. Every other kind is rebuilt out-side.
+	 */
+	uint32_t mask_kind = COMP_VK_SPLIT_MASK_NONE;
+	if (!mask_is_plane) {
+		mask_kind = vk_split_raster_frame_mask(c, proj_idx, region_w, region_h);
+		if (mask_kind == COMP_VK_SPLIT_MASK_NONE) {
+			comp_vk_split_stage_no_composite(c->split);
+			return;
+		}
 	}
 
 	const struct u_canvas_rect ec = vk_effective_canvas(c);
@@ -8013,9 +8077,10 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint32_t composite_mode;
 	if (c->zones_frame) {
 		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_ZONES;
+	} else if (mask_is_plane) {
+		// An explicit authored mask keeps the hard M-lerp (designer cutout/portal).
+		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_LERP;
 	} else {
-		// An explicit authored mask is VK-1b-3; until then a split frame that
-		// carries one has already retired above, so this cannot be MODE_LERP.
 		composite_mode = VK_LOCAL2D_COMPOSITE_MODE_ALPHA_OVER;
 	}
 	const bool opaque_present = c->transparent_background && debug_get_bool_option_present_opaque();
@@ -8027,7 +8092,7 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	comp_vk_split_stage_local2d(c->split, pl2d.shared_handle, pl2d.generation, pl2d.width, pl2d.height, l2d_hash,
 	                            l2d_box.offset.w, l2d_box.offset.h, (uint32_t)l2d_box.extent.w,
 	                            (uint32_t)l2d_box.extent.h, region_w, region_h, cx, cy, cw, ch, composite_mode,
-	                            opaque_present);
+	                            opaque_present, mask_is_plane);
 
 	/*
 	 * ADR-027 P4 — the hardware zone WISH, on the path an active split takes.
@@ -8037,10 +8102,12 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * silently inert and the vendor never learns the zone geometry. That is the
 	 * #1175 shape the D3D12 leg hit, and this is its exit.
 	 *
-	 * Skipped for a feathered frame: the wish is hardware geometry and stays
-	 * binary (#800/#803), and this rung rasters one mask per frame.
+	 * An APP-AUTHORED wish publishes VERBATIM off its plane (VK-1b-3); the auto
+	 * wish publishes the binary raster. Skipped for a feathered AUTO frame: the
+	 * wish is hardware geometry and stays binary (#800/#803), and this rung
+	 * rasters one mask per frame.
 	 */
-	if (c->zones_frame && mask_kind == COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+	if (c->zones_frame && (mask_ok || mask_kind == COMP_VK_SPLIT_MASK_ZONE_BINARY)) {
 		c->zone_publish_seq++;
 		comp_vk_split_publish_zone_wish(c->split, c->zone_publish_seq);
 	} else if (!c->zones_frame) {
@@ -8894,6 +8961,132 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c)
 #endif
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * VK-1b-3 - the frame's AUTHORITATIVE app-authored mask, or NULL.
+ *
+ * A zones frame's is its explicit frame wish; a legacy frame's is the sticky
+ * submitted mask. They are mutually exclusive by construction, which is exactly
+ * why the single authored-mask plane needs ONE arbiter rather than two
+ * independent binders (#918 review D6): binding one plane from two sites with two
+ * generations re-opens it on alternating frames, each re-open a full
+ * re-transport.
+ */
+static struct comp_vk_native_zone_mask *
+vk_frame_authored_mask(struct comp_vk_native_compositor *c)
+{
+	if (c->zones_frame) {
+		struct comp_vk_native_zone_mask *fw = c->frame_wish;
+		return (fw != NULL && fw->tex != VK_NULL_HANDLE) ? fw : NULL;
+	}
+	struct comp_vk_native_zone_mask *m = c->active_zone_mask;
+	return (m != NULL && m->submitted && m->tex != VK_NULL_HANDLE) ? m : NULL;
+}
+
+/*!
+ * VK-1b-3 - allocate and bind the authored mask's transport, at the MASK's own
+ * dims (#918 review F5).
+ *
+ * Called from layer_commit BEFORE a single command is recorded, which is what
+ * lets a failure retire cleanly: nothing of this frame exists yet to unwind. A
+ * dims change reallocates the surface and rebinds - an ON-CHANGE event, never a
+ * per-frame one, because the steady-state call is the size compare inside
+ * comp_vk_deposit_plane_ensure and the handle+generation early-out inside the
+ * bridge.
+ *
+ * @return false only when a transport that was ASKED FOR could not be made.
+ */
+static bool
+vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_native_zone_mask *mask)
+{
+	if (c->split == NULL) {
+		return true;
+	}
+	struct comp_vk_deposit *dep = (c->renderer != NULL) ? comp_vk_native_renderer_get_deposit(c->renderer) : NULL;
+	if (mask == NULL || dep == NULL) {
+		// No authored mask this frame: drop the plane. Not a failure.
+		return comp_vk_split_bind_mask_plane(c->split, NULL, 0, 0, 0);
+	}
+	if (!comp_vk_deposit_plane_ensure(dep, COMP_VK_DEPOSIT_PLANE_MASK, mask->w, mask->h, VK_FORMAT_R8_UNORM)) {
+		return false;
+	}
+	struct comp_vk_deposit_plane pl = {0};
+	if (!comp_vk_deposit_plane_get(dep, COMP_VK_DEPOSIT_PLANE_MASK, &pl)) {
+		return false;
+	}
+	return comp_vk_split_bind_mask_plane(c->split, pl.shared_handle, pl.generation, pl.width, pl.height);
+}
+
+/*!
+ * VK-1b-3 - snapshot the authored mask into its bridge plane, in the frame's own
+ * plane command buffer.
+ *
+ * A snapshot rather than a direct bind, for the same reason the non-split path
+ * keeps `staged` beside `tex`: the app may still be drawing into `tex`, and
+ * in-progress authoring must not tear into the frame. Under the split the plane
+ * IS that snapshot, so the private `staged` image is simply not used.
+ *
+ * Recording it HERE, in the plane pass, is also what makes the ordering free:
+ * the pass's own timeline wait and signal already bound this write against the
+ * producer's read of the previous frame. The D3D legs needed
+ * `comp_xbridge_pre_plane_write` at the authoring entry point because THEIR mask
+ * snapshot runs out of band, from an OpenXR call of the app's, before
+ * layer_commit takes the frame's back-fence. Ours never does.
+ */
+static void
+vk_split_snapshot_mask_plane(struct comp_vk_native_compositor *c,
+                             VkCommandBuffer cmd,
+                             const struct comp_vk_deposit_plane *plane,
+                             struct comp_vk_native_zone_mask *mask)
+{
+	struct vk_bundle *vk = &c->vk;
+	const VkImage dst = (VkImage)(uintptr_t)plane->image;
+
+	vk_cmd_image_barrier_locked(
+	    vk, cmd, mask->tex, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	    mask->tex_layout != VK_IMAGE_LAYOUT_UNDEFINED ? mask->tex_layout : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, dst, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {mask->w < plane->width ? mask->w : plane->width,
+	               mask->h < plane->height ? mask->h : plane->height, 1},
+	};
+	vk->vkCmdCopyImage(cmd, mask->tex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	vk_cmd_image_barrier_locked(vk, cmd, dst, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	// tex returns to COLOR_ATTACHMENT for the next authoring round.
+	vk_cmd_image_barrier_locked(vk, cmd, mask->tex, VK_ACCESS_TRANSFER_READ_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+}
+
+/*!
+ * The bridged mask's CONTENT generation.
+ *
+ * Unique across mask OBJECTS as well as across authoring calls on one, since a
+ * session can hand this single plane two different masks and two masks both at
+ * author_seq 1 must not look like the same pixels to the change-skip. Mixed
+ * rather than bit-tagged, so no bit budget is spent on which call site produced
+ * it.
+ */
+static uint64_t
+vk_mask_plane_seq(const struct comp_vk_deposit_plane *plane, const struct comp_vk_native_zone_mask *mask)
+{
+	uint64_t seq = 1469598103934665603ull;
+	seq = (seq ^ plane->generation) * 1099511628211ull;
+	seq = (seq ^ mask->author_seq) * 1099511628211ull;
+	return (seq == 0) ? 1u : seq; // 0 is reserved for "not used this frame"
+}
+#endif /* XRT_OS_WINDOWS */
 xrt_result_t
 comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
 {
@@ -8988,6 +9181,7 @@ comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *m
 	vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, mask->fb, mask->w, mask->h,
 	                                 enable_3d ? 1.0f : 0.0f, NULL, 0, 0.0f);
 	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	mask->author_seq++;
 	vk_oneshot_end(c, cmd);
 	return XRT_SUCCESS;
 }
@@ -9016,6 +9210,7 @@ comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
 	vk_local2d_composite_raster_mask(&c->local2d, vk, cmd, mask->fb, mask->w, mask->h, 0.0f, rects, count,
 	                                 1.0f);
 	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	mask->author_seq++;
 	vk_oneshot_end(c, cmd);
 	return XRT_SUCCESS;
 }
@@ -9047,6 +9242,9 @@ comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
 		vk_oneshot_end(c, cmd);
 		mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	}
+	// The app is about to draw into it, so the pixels change from here even
+	// without a submit (a frame wish is referenced-at-frame-end).
+	mask->author_seq++;
 	*out_image = (void *)(uintptr_t)mask->tex;
 	*out_image_view = (void *)(uintptr_t)mask->tex_view;
 	*out_w = mask->w;
@@ -9098,6 +9296,7 @@ comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask
 
 	mask->tex_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 	mask->submitted = true;
+	mask->author_seq++;
 	c->active_zone_mask = mask; // sticky last-submit-wins
 	c->zone_publish_seq++;      // #224 P4: new content generation for the DP publish
 	return XRT_SUCCESS;
