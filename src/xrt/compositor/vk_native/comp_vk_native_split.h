@@ -337,6 +337,150 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *split,
                              uint32_t bd_h);
 
 /*!
+ * @name VK-1b-2 — the output-device masked composite.
+ *
+ * The composite's destination is the WEAVE TARGET, which the split moved to the
+ * scanout adapter, so the pass has to run there. @ref comp_d3d11_outcomp is the
+ * unit for exactly that and is reused verbatim, as both D3D legs do; what this
+ * rung supplies are its three inputs on that device — the `twod` layer (the
+ * LOCAL2D bridge plane), the mask (rastered here) and the weave snapshot
+ * (unit-owned).
+ * @{
+ */
+//! No mask this frame — the composite runs Phase 0's analytic canvas-rect path.
+#define COMP_VK_SPLIT_MASK_NONE 0u
+//! #439 — M=1 everywhere, M=0 inside the OVER Local2D rects (ALPHA_OVER).
+#define COMP_VK_SPLIT_MASK_IMPLICIT 1u
+//! ADR-027 auto wish — M=0 everywhere, M=1 inside each zone rect. ALSO the
+//! published wish: cosmetics never enter it (#800/#801).
+#define COMP_VK_SPLIT_MASK_ZONE_BINARY 2u
+//! #803 per-zone opt-in inward ramp. COMPOSITE-only; the wish stays binary.
+#define COMP_VK_SPLIT_MASK_ZONE_FEATHER 3u
+
+/*!
+ * Raster this app frame's zone/Local2D mask **on the scanout device**.
+ *
+ * Every input is CPU-side — rects, radii, dims — which is the whole reason the
+ * mask is REBUILT on the device that consumes it rather than transported. Only
+ * an app-AUTHORED (Tier-3) mask has pixels the app drew, and that one is a bridge
+ * plane (VK-1b-3).
+ *
+ * **Why this runs in the deposit half and not, as on the D3D12 leg, from a
+ * captured request in the consume half.** D12-4 could not raster at deposit
+ * because it records into a command list and `layer_commit` `Reset()`s the
+ * out-device list *after* the deposit half runs, so the work would be thrown
+ * away; hence its `out_mask_req`. This leg's out device is a **D3D11 device with
+ * an immediate context** (@ref comp_vk_split_stage_a creates it), so work is
+ * submitted as it is written and there is no Reset to lose it to. The raster runs
+ * inline, exactly as the shipped D3D11 leg's does. Do not "align" this with the
+ * D3D12 shape — the difference is real and it is on this side.
+ *
+ * Dirty-checked on the rect set, the radii and the dims, so a steady-state frame
+ * costs a compare. The result is cached as the REPAINT mask: a repaint replays
+ * rendering and never re-rasters (#868), because rastering re-runs a
+ * once-per-app-frame state machine at panel rate.
+ *
+ * @return true when a mask is available for this frame's composite.
+ */
+bool
+comp_vk_split_raster_mask(struct comp_vk_split *split,
+                          uint32_t kind,
+                          const struct xrt_rect *rects,
+                          const float *feather_px,
+                          uint32_t rect_count,
+                          uint32_t region_w,
+                          uint32_t region_h);
+
+/*!
+ * VK-1b-2 — publish this frame's LOCAL2D plane and the COMPOSITE recipe.
+ *
+ * Call once per app frame from the deposit half, before
+ * @ref comp_vk_split_submit_atlas. @p nt_handle / @p generation / @p content_seq
+ * and the dirty box carry the meanings documented on
+ * @ref comp_vk_split_stage_backdrop.
+ *
+ * The rest is the recipe (#1140): the consume half reads every composite
+ * parameter FROM THE SLOT, never from live CPU state, because the slot it is
+ * finishing was filled by an earlier frame.
+ *
+ * @param composite_mode A `COMP_D3D11_COMPOSITE_MODE_*`.
+ */
+void
+comp_vk_split_stage_local2d(struct comp_vk_split *split,
+                            void *nt_handle,
+                            uint64_t generation,
+                            uint32_t alloc_w,
+                            uint32_t alloc_h,
+                            uint64_t content_seq,
+                            int32_t dirty_x,
+                            int32_t dirty_y,
+                            uint32_t dirty_w,
+                            uint32_t dirty_h,
+                            uint32_t region_w,
+                            uint32_t region_h,
+                            int32_t cx,
+                            int32_t cy,
+                            uint32_t cw,
+                            uint32_t ch,
+                            uint32_t composite_mode,
+                            bool opaque_present);
+
+/*!
+ * This frame runs NO composite. Stamps `composite=false` on the slot and
+ * un-stages the Local2D plane, so a consume half can never read a slot claiming
+ * a composite it has no pixels for.
+ */
+void
+comp_vk_split_stage_no_composite(struct comp_vk_split *split);
+
+/*!
+ * True when the scanout-adapter display processor advertises hardware zone
+ * slots. Probed once; the answer is the D3D11 weaver's, not the Vulkan one's,
+ * which is why the compositor cannot answer it for a split session.
+ */
+bool
+comp_vk_split_zone_dp_supported(struct comp_vk_split *split);
+
+/*!
+ * ADR-027 P4 — publish the last @ref COMP_VK_SPLIT_MASK_ZONE_BINARY raster as
+ * this client's hardware zone WISH, screen-anchored to the split's own HWND.
+ *
+ * The BINARY raster, never the feather one: feather is a cosmetic composite
+ * opt-in and never enters the wish (#800/#803).
+ *
+ * This exists because the compositor's own sideband
+ * (`xrt_display_processor_publish_local_zone_mask`) takes the **Vulkan** display
+ * processor, which a split session does not have — leaving the publish silently
+ * inert, which is the shape #1175 found on the D3D12 leg.
+ *
+ * @param seq The client's publish generation; a vendor treats an unchanged seq
+ *        as an anchor-only update.
+ */
+void
+comp_vk_split_publish_zone_wish(struct comp_vk_split *split, uint64_t seq);
+
+/*! Withdraw this client's zone contribution (the clear edge). */
+void
+comp_vk_split_clear_zone_wish(struct comp_vk_split *split);
+
+/*!
+ * VK-1b-2 — hand the split this frame's diagnostic HUD bitmap.
+ *
+ * `u_hud` rasterises to a CPU pixel buffer, so the HUD belongs to no graphics
+ * device: there is nothing to transport and no bridge plane involved. The
+ * out-device half uploads @p pixels to a scanout-adapter texture and copies it
+ * onto the back buffer after the composite — which is exactly what both D3D legs
+ * already do (`d3d11_render_hud_overlay(c, d3d11_out_device(c), …)`). The HUD is
+ * therefore never a reason to retire.
+ *
+ * @param pixels RGBA8, @p w x @p h, or NULL to stop drawing the HUD.
+ * @param dirty The bitmap changed since the last call and must be re-uploaded.
+ */
+void
+comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t w, uint32_t h, bool dirty);
+/*! @} */
+
+/*!
  * #918 review F4 — the composite REGION moved, so drop every slot's pixels for
  * @p plane and make each owe a full refresh of the plane extent.
  *

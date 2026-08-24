@@ -14,6 +14,7 @@
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_processor_d3d11.h"
+#include "xrt/xrt_limits.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -46,6 +47,7 @@
 
 #include "comp_split_gate.h"
 #include "comp_xbridge.h"
+#include "d3d11/comp_d3d11_outcomp.h"
 #include "d3d11/comp_d3d11_target.h"
 #include "d3d/d3d_scanout_helpers.hpp"
 
@@ -128,6 +130,64 @@ struct comp_vk_split
 	uint32_t bd_w, bd_h;
 	uint64_t sideband_copies, sideband_skips, sideband_bytes;
 	//! @}
+
+	/*!
+	 * VK-1b-2 — one out-device R8 mask raster. RTV texture plus a staged SRV
+	 * sibling, because an RT is not an SRV; the same decouple the D3D11 leg's
+	 * four rasterisers use.
+	 */
+	struct split_mask_raster
+	{
+		ID3D11Texture2D *tex;
+		ID3D11Texture2D *staged;
+		ID3D11RenderTargetView *rtv;
+		ID3D11ShaderResourceView *srv;
+		uint32_t w, h;
+		//! Dirty-check cache — re-rasters only on a real change.
+		uint32_t kind;
+		uint32_t rect_count;
+		struct xrt_rect rects[XRT_MAX_LAYERS];
+		float feather[XRT_MAX_LAYERS];
+		bool warned;
+	};
+	struct split_mask_raster mask;
+
+	/*!
+	 * The raster the LAST APP FRAME produced. #868: a repaint replays
+	 * RENDERING, never state transitions, so it composites from this instead of
+	 * re-rastering — re-rastering drives a once-per-app-frame machine (including
+	 * the wish publish) at panel rate.
+	 */
+	ID3D11ShaderResourceView *repaint_mask_srv;
+
+	//! The masked composite, on the OUT device. Created lazily on the first
+	//! frame that needs it — see @ref split_ensure_outcomp.
+	struct comp_d3d11_outcomp *outcomp;
+	bool outcomp_failed;
+
+	//! @name VK-1b-2 — the composite recipe this frame stages.
+	//! @{
+	bool l2d_plane_live;
+	uint32_t comp_region_w, comp_region_h;
+	int32_t comp_cx, comp_cy;
+	uint32_t comp_cw, comp_ch;
+	uint32_t comp_mode;
+	uint32_t comp_mask_kind;
+	bool comp_opaque;
+	//! @}
+
+	//! @name VK-1b-2 — the CPU-rastered diagnostic HUD, on the OUT device.
+	//! @{
+	ID3D11Texture2D *hud_tex;
+	uint32_t hud_w, hud_h;
+	bool hud_live;
+	//! @}
+
+	//! ADR-027 P4 — the scanout weaver's zone capability, probed once.
+	int zone_dp_state;
+	bool zone_published;
+
+	uint64_t composites, composite_bails;
 
 	//! @name Counters for the `[RENDER]` line and the F4/R1 tripwires.
 	//! @{
@@ -358,6 +418,116 @@ split_plane_dp_view(struct comp_vk_split *s,
 	return v->srv;
 }
 
+/*
+ *
+ * VK-1b-2 — the OUT-DEVICE mask raster.
+ *
+ */
+
+//! Free the raster's four D3D objects. Idempotent.
+static void
+split_release_mask(struct comp_vk_split::split_mask_raster *m)
+{
+	if (m->srv != nullptr) {
+		m->srv->Release();
+		m->srv = nullptr;
+	}
+	if (m->staged != nullptr) {
+		m->staged->Release();
+		m->staged = nullptr;
+	}
+	if (m->rtv != nullptr) {
+		m->rtv->Release();
+		m->rtv = nullptr;
+	}
+	if (m->tex != nullptr) {
+		m->tex->Release();
+		m->tex = nullptr;
+	}
+	m->w = 0;
+	m->h = 0;
+	m->kind = COMP_VK_SPLIT_MASK_NONE;
+	m->rect_count = 0;
+}
+
+//! (Re)allocate the R8 RTV + staged SRV pair at @p w x @p h on the OUT device.
+static bool
+split_mask_ensure(struct comp_vk_split *s, uint32_t w, uint32_t h)
+{
+	struct comp_vk_split::split_mask_raster *m = &s->mask;
+	if (m->tex != nullptr && m->w == w && m->h == h) {
+		return true;
+	}
+	split_release_mask(m);
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET;
+	HRESULT hr = s->out_dev->CreateTexture2D(&td, nullptr, &m->tex);
+	if (SUCCEEDED(hr) && m->tex != nullptr) {
+		hr = s->out_dev->CreateRenderTargetView(m->tex, nullptr, &m->rtv);
+	}
+	if (SUCCEEDED(hr) && m->rtv != nullptr) {
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		hr = s->out_dev->CreateTexture2D(&td, nullptr, &m->staged);
+	}
+	if (SUCCEEDED(hr) && m->staged != nullptr) {
+		hr = s->out_dev->CreateShaderResourceView(m->staged, nullptr, &m->srv);
+	}
+	if (FAILED(hr) || m->srv == nullptr) {
+		// Latched: this is on the frame path and the repo forbids a per-frame WARN.
+		if (!m->warned) {
+			m->warned = true;
+			U_LOG_W(
+			    "#918 VK-1b: the out-device mask raster (%ux%u) could not be allocated 0x%08lx — 2D "
+			    "content does not composite under the split for this session; the 3D weave is "
+			    "unaffected",
+			    w, h, (unsigned long)hr);
+		}
+		split_release_mask(m);
+		return false;
+	}
+	m->w = w;
+	m->h = h;
+	return true;
+}
+
+//! One `ClearView` of @p value over @p r, clamped into the raster.
+static void
+split_mask_fill(
+    struct comp_vk_split *s, ID3D11DeviceContext1 *ctx1, const struct xrt_rect *r, int32_t inset, float value)
+{
+	struct comp_vk_split::split_mask_raster *m = &s->mask;
+	int32_t left = r->offset.w + inset;
+	int32_t top = r->offset.h + inset;
+	int32_t right = r->offset.w + r->extent.w - inset;
+	int32_t bottom = r->offset.h + r->extent.h - inset;
+	if (left < 0) {
+		left = 0;
+	}
+	if (top < 0) {
+		top = 0;
+	}
+	if (right > (int32_t)m->w) {
+		right = (int32_t)m->w;
+	}
+	if (bottom > (int32_t)m->h) {
+		bottom = (int32_t)m->h;
+	}
+	if (right <= left || bottom <= top) {
+		return;
+	}
+	const float val[4] = {value, 0.0f, 0.0f, 0.0f};
+	D3D11_RECT dr = {left, top, right, bottom};
+	ctx1->ClearView(m->rtv, val, &dr, 1);
+}
+
 static void
 split_release_plane_view(struct comp_vk_split::split_plane_view *v)
 {
@@ -382,6 +552,20 @@ split_release_out(struct comp_vk_split *s)
 		comp_xbridge_quiesce(s->xbridge);
 		comp_xbridge_destroy(&s->xbridge);
 	}
+	/*
+	 * VK-1b-2 — the zone contribution is withdrawn BEFORE the weaver goes away
+	 * (#224 P4's clear edge). A session that just disappears leaves the vendor
+	 * unioning a mask nobody owns.
+	 */
+	comp_vk_split_clear_zone_wish(s);
+	comp_d3d11_outcomp_destroy(&s->outcomp);
+	split_release_mask(&s->mask);
+	s->repaint_mask_srv = NULL;
+	if (s->hud_tex != NULL) {
+		s->hud_tex->Release();
+		s->hud_tex = NULL;
+	}
+	s->hud_live = false;
 	split_release_plane_view(&s->dp_bd_view);
 	if (s->dp_input_srv != NULL) {
 		s->dp_input_srv->Release();
@@ -771,11 +955,13 @@ comp_vk_split_destroy(struct comp_vk_split **split_ptr)
 	}
 	*split_ptr = nullptr;
 
-	U_LOG_W("VK output-device split: %llu frames bridged, %llu weaves with no usable slot, %llu stale-slot "
-	        "refusals, %llu in-flight (transition) weaves, %llu output-device crops (#918)",
-	        (unsigned long long)s->seq, (unsigned long long)s->no_slot,
-	        (unsigned long long)s->stale_refusals, (unsigned long long)s->inflight_weaves,
-	        (unsigned long long)s->out_crop);
+	U_LOG_W(
+	    "VK output-device split: %llu frames bridged, %llu weaves with no usable slot, %llu stale-slot "
+	    "refusals, %llu in-flight (transition) weaves, %llu output-device crops, %llu composites, %llu "
+	    "composite bails (#918)",
+	    (unsigned long long)s->seq, (unsigned long long)s->no_slot, (unsigned long long)s->stale_refusals,
+	    (unsigned long long)s->inflight_weaves, (unsigned long long)s->out_crop, (unsigned long long)s->composites,
+	    (unsigned long long)s->composite_bails);
 
 	split_release_out(s);
 	free(s);
@@ -882,6 +1068,358 @@ comp_vk_split_invalidate_plane(struct comp_vk_split *s, uint32_t plane)
 	comp_xbridge_invalidate_plane(s->xbridge, plane);
 }
 
+extern "C" bool
+comp_vk_split_raster_mask(struct comp_vk_split *s,
+                          uint32_t kind,
+                          const struct xrt_rect *rects,
+                          const float *feather_px,
+                          uint32_t rect_count,
+                          uint32_t region_w,
+                          uint32_t region_h)
+{
+	if (s == nullptr || s->out_dev == nullptr || region_w == 0 || region_h == 0) {
+		return false;
+	}
+	if (kind == COMP_VK_SPLIT_MASK_NONE || rect_count == 0 || rects == nullptr) {
+		s->repaint_mask_srv = nullptr;
+		return false;
+	}
+	if (rect_count > XRT_MAX_LAYERS) {
+		rect_count = XRT_MAX_LAYERS;
+	}
+
+	struct comp_vk_split::split_mask_raster *m = &s->mask;
+
+	// Dirty-check on everything the raster is a function of. The steady-state
+	// frame reuses the staged SRV and touches the GPU not at all.
+	bool dirty =
+	    m->srv == nullptr || m->w != region_w || m->h != region_h || m->kind != kind || m->rect_count != rect_count;
+	for (uint32_t i = 0; !dirty && i < rect_count; i++) {
+		if (memcmp(&m->rects[i], &rects[i], sizeof(rects[i])) != 0) {
+			dirty = true;
+		}
+		if (kind == COMP_VK_SPLIT_MASK_ZONE_FEATHER && feather_px != nullptr &&
+		    m->feather[i] != feather_px[i]) {
+			dirty = true;
+		}
+	}
+	if (!dirty) {
+		s->repaint_mask_srv = m->srv;
+		return true;
+	}
+
+	if (!split_mask_ensure(s, region_w, region_h)) {
+		s->repaint_mask_srv = nullptr;
+		return false;
+	}
+
+	ID3D11DeviceContext1 *ctx1 = nullptr;
+	if (FAILED(s->out_ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void **)&ctx1)) || ctx1 == nullptr) {
+		if (!m->warned) {
+			m->warned = true;
+			U_LOG_W(
+			    "#918 VK-1b: the out device has no ID3D11DeviceContext1, so the mask raster has no "
+			    "ClearView — 2D content does not composite under the split for this session");
+		}
+		s->repaint_mask_srv = nullptr;
+		return false;
+	}
+
+	/*
+	 * The three rasters, and all three are pure CLEARS — no shader, no draw.
+	 * That is what makes "rebuild the mask where it is consumed" cheap enough to
+	 * be the rule rather than a transport.
+	 *
+	 * TODO(#1178 VK-1b): duplicates of `d3d11_update_implicit_mask`
+	 * (src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp:5502),
+	 * `d3d11_update_zone_wish_mask` (:5652) and `d3d11_update_zone_feather_mask`
+	 * (:5820). Those are `static` and wired to `struct comp_d3d11_compositor`;
+	 * extracting all four into one unit touches the shipped D3D11 leg, so it is
+	 * tracked as its own change rather than folded into new Vulkan transport.
+	 */
+	const float base = (kind == COMP_VK_SPLIT_MASK_IMPLICIT) ? 1.0f : 0.0f;
+	const float all[4] = {base, 0.0f, 0.0f, 0.0f};
+	s->out_ctx->ClearRenderTargetView(m->rtv, all);
+
+	for (uint32_t i = 0; i < rect_count; i++) {
+		if (kind == COMP_VK_SPLIT_MASK_IMPLICIT) {
+			// Inverse of the zone raster: M=0 (show the flattened 2D) inside
+			// each Local2D rect, M=1 (keep the weave) everywhere else.
+			split_mask_fill(s, ctx1, &rects[i], 0, 0.0f);
+			continue;
+		}
+		if (kind == COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+			split_mask_fill(s, ctx1, &rects[i], 0, 1.0f);
+			continue;
+		}
+
+		/*
+		 * #803 — the per-zone inward ramp, by the rings idiom: ascending value
+		 * WITH ascending inset, so later, deeper, higher-value clears overwrite
+		 * the inner part of earlier ones. The edge keeps the low values and the
+		 * core reaches 1. 2px steps, capped at a 64px ramp (beyond which the
+		 * step widens instead), and the inset is clamped so a small zone's
+		 * centre still reaches 1.
+		 */
+		const float radius = (feather_px != nullptr) ? feather_px[i] : 0.0f;
+		const bool feathered = radius > 0.0f;
+		int32_t steps = 1;
+		int32_t step_px = 0;
+		if (feathered) {
+			step_px = 2;
+			steps = (int32_t)(radius / (float)step_px + 0.5f);
+			if (steps < 1) {
+				steps = 1;
+			}
+			if (steps > 32) {
+				step_px = (int32_t)(radius / 32.0f + 0.5f);
+				steps = 32;
+			}
+		}
+		const int32_t min_ext = rects[i].extent.w < rects[i].extent.h ? rects[i].extent.w : rects[i].extent.h;
+		int32_t max_inset = (min_ext - 1) / 2;
+		if (max_inset < 0) {
+			max_inset = 0;
+		}
+		for (int32_t st = 1; st <= steps; st++) {
+			const float v = (float)st / (float)steps; // 1.0 for the hard single step
+			int32_t inset = feathered ? st * step_px : 0;
+			if (inset > max_inset) {
+				inset = max_inset;
+			}
+			split_mask_fill(s, ctx1, &rects[i], inset, v);
+		}
+	}
+	ctx1->Release();
+
+	// Stage the snapshot the composite samples (RT is not an SRV).
+	s->out_ctx->CopyResource(m->staged, m->tex);
+
+	m->kind = kind;
+	m->rect_count = rect_count;
+	memcpy(m->rects, rects, sizeof(rects[0]) * rect_count);
+	if (feather_px != nullptr) {
+		memcpy(m->feather, feather_px, sizeof(feather_px[0]) * rect_count);
+	} else {
+		memset(m->feather, 0, sizeof(m->feather));
+	}
+
+	// On a rect/dims change only, never per frame.
+	U_LOG_W("#918 VK-1b: out-device mask raster kind=%u %ux%u, %u rect(s)", kind, region_w, region_h, rect_count);
+
+	s->repaint_mask_srv = m->srv;
+	return true;
+}
+
+/*!
+ * The masked composite unit, on the OUT device.
+ *
+ * LAZY, following the D3D12 leg rather than the D3D11 one: the create compiles
+ * shaders, and paying that inside Stage A would add it to the session-warmup
+ * critical path for every split session, including the projection-only ones that
+ * never composite anything. A failure here is feature-local — one latched WARN,
+ * `composite=false` on the recipe, projection-only frames — and never a retire.
+ */
+static bool
+split_ensure_outcomp(struct comp_vk_split *s)
+{
+	if (s->outcomp != nullptr) {
+		return true;
+	}
+	if (s->outcomp_failed) {
+		return false;
+	}
+	if (comp_d3d11_outcomp_create(s->out_dev, s->out_ctx, &s->outcomp) != XRT_SUCCESS || s->outcomp == nullptr) {
+		s->outcomp_failed = true;
+		s->outcomp = nullptr;
+		U_LOG_W(
+		    "#918 VK-1b: the output composite unit could not be created on the scanout device — 2D "
+		    "content does not composite under the split for this session; the 3D weave is unaffected");
+		return false;
+	}
+	U_LOG_W("#918 VK-1b: output composite unit up on the scanout device");
+	return true;
+}
+
+extern "C" void
+comp_vk_split_stage_no_composite(struct comp_vk_split *s)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return;
+	}
+	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, 0, 0, 0, 0, 0);
+	s->l2d_plane_live = false;
+}
+
+extern "C" void
+comp_vk_split_stage_local2d(struct comp_vk_split *s,
+                            void *nt_handle,
+                            uint64_t generation,
+                            uint32_t alloc_w,
+                            uint32_t alloc_h,
+                            uint64_t content_seq,
+                            int32_t dirty_x,
+                            int32_t dirty_y,
+                            uint32_t dirty_w,
+                            uint32_t dirty_h,
+                            uint32_t region_w,
+                            uint32_t region_h,
+                            int32_t cx,
+                            int32_t cy,
+                            uint32_t cw,
+                            uint32_t ch,
+                            uint32_t composite_mode,
+                            bool opaque_present)
+{
+	if (s == nullptr || s->xbridge == nullptr) {
+		return;
+	}
+
+	/*
+	 * The unit the CONSUME half will need is created HERE rather than there,
+	 * because this half stamps the recipe: a create failure stamps
+	 * `composite = false` and the frame ships projection-only, where discovering
+	 * it in the consume half would leave a slot marked compositable that nothing
+	 * can composite.
+	 */
+	if (nt_handle == nullptr || content_seq == 0 || region_w == 0 || region_h == 0 || !split_ensure_outcomp(s)) {
+		comp_vk_split_stage_no_composite(s);
+		return;
+	}
+
+	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, nt_handle, generation,
+	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+		/*
+		 * #918 review D4 — the Local2D plane IS the composite's `twod` under the
+		 * split, so a frame that could not bind it has no composite to stamp.
+		 * Claiming otherwise stamps `composite=true` on a slot whose plane the
+		 * submit then marks invalid, and the consume half bails on every frame
+		 * afterwards with no log.
+		 */
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W(
+			    "#918 VK-1b: the Local2D plane could not be bound — 2D content does not composite "
+			    "under the split for this session; the 3D weave is unaffected");
+		}
+		comp_vk_split_stage_no_composite(s);
+		return;
+	}
+
+	comp_xbridge_stage_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, content_seq, dirty_x, dirty_y, dirty_w,
+	                         dirty_h);
+	s->l2d_plane_live = true;
+	s->comp_region_w = region_w;
+	s->comp_region_h = region_h;
+	s->comp_cx = cx;
+	s->comp_cy = cy;
+	s->comp_cw = cw;
+	s->comp_ch = ch;
+	s->comp_mode = composite_mode;
+	s->comp_opaque = opaque_present;
+	// VK-1b-2 rasters every mask it consumes; the bridged Tier-3 plane is
+	// VK-1b-3, and stamping OUT_RASTER here is the honest description of what
+	// the consume half will actually sample.
+	s->comp_mask_kind = COMP_XBRIDGE_MASK_OUT_RASTER;
+}
+
+extern "C" bool
+comp_vk_split_zone_dp_supported(struct comp_vk_split *s)
+{
+	if (s == nullptr || s->dp == nullptr) {
+		return false;
+	}
+	if (s->zone_dp_state == 0) {
+		struct xrt_dp_local_zone_caps caps = {};
+		caps.struct_size = sizeof(caps);
+		const bool ok = xrt_display_processor_d3d11_get_local_zone_caps(s->dp, &caps) && caps.supported != 0;
+		s->zone_dp_state = ok ? 1 : 2;
+		if (ok) {
+			U_LOG_W("#918 VK-1b: scanout weaver supports local zones — grid %ux%u max_mask %ux%u",
+			        caps.zone_grid_width, caps.zone_grid_height, caps.max_mask_width, caps.max_mask_height);
+		}
+	}
+	return s->zone_dp_state == 1;
+}
+
+extern "C" void
+comp_vk_split_publish_zone_wish(struct comp_vk_split *s, uint64_t seq)
+{
+	if (s == nullptr || s->dp == nullptr || s->hwnd == nullptr || !comp_vk_split_zone_dp_supported(s)) {
+		return;
+	}
+	/*
+	 * The BINARY raster and nothing else. A feather ramp is a cosmetic composite
+	 * opt-in (#803) and must never reach the vendor as geometry, so a frame whose
+	 * composite sampled the feather mask still publishes the binary one — which
+	 * is why the publish reads the raster's KIND rather than just its SRV.
+	 */
+	if (s->mask.srv == nullptr || s->mask.kind != COMP_VK_SPLIT_MASK_ZONE_BINARY) {
+		return;
+	}
+
+	RECT r;
+	POINT origin = {0, 0};
+	if (!GetClientRect(s->hwnd, &r) || r.right <= 0 || r.bottom <= 0 || !ClientToScreen(s->hwnd, &origin)) {
+		return;
+	}
+	if (xrt_display_processor_d3d11_publish_local_zone_mask(s->dp, s->out_ctx, s->mask.srv, s->mask.w, s->mask.h,
+	                                                        (int32_t)origin.x, (int32_t)origin.y, (uint32_t)r.right,
+	                                                        (uint32_t)r.bottom, seq)) {
+		s->zone_published = true;
+	}
+}
+
+extern "C" void
+comp_vk_split_clear_zone_wish(struct comp_vk_split *s)
+{
+	if (s == nullptr || s->dp == nullptr || !s->zone_published) {
+		return;
+	}
+	xrt_display_processor_d3d11_clear_local_zone_mask(s->dp);
+	s->zone_published = false;
+}
+
+extern "C" void
+comp_vk_split_set_hud(struct comp_vk_split *s, const void *pixels, uint32_t w, uint32_t h, bool dirty)
+{
+	if (s == nullptr || s->out_dev == nullptr) {
+		return;
+	}
+	if (pixels == nullptr || w == 0 || h == 0) {
+		s->hud_live = false;
+		return;
+	}
+
+	if (s->hud_tex == nullptr || s->hud_w != w || s->hud_h != h) {
+		if (s->hud_tex != nullptr) {
+			s->hud_tex->Release();
+			s->hud_tex = nullptr;
+		}
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = w;
+		td.Height = h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DEFAULT;
+		if (FAILED(s->out_dev->CreateTexture2D(&td, nullptr, &s->hud_tex)) || s->hud_tex == nullptr) {
+			s->hud_tex = nullptr;
+			s->hud_live = false;
+			return;
+		}
+		s->hud_w = w;
+		s->hud_h = h;
+		dirty = true; // a fresh texture holds nothing
+	}
+	if (dirty) {
+		s->out_ctx->UpdateSubresource(s->hud_tex, 0, nullptr, pixels, w * 4u, 0);
+	}
+	s->hud_live = true;
+}
+
 extern "C" void
 comp_vk_split_submit_atlas(struct comp_vk_split *s,
                            const struct comp_vk_deposit_handoff *handoff,
@@ -957,11 +1495,20 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	 * does not have — every `plane_valid` test fails closed.
 	 */
 	struct comp_xbridge_recipe r = {};
-	r.composite = false;
-	r.region_w = content_w;
-	r.region_h = content_h;
+	r.composite = s->l2d_plane_live;
+	r.region_w = s->l2d_plane_live ? s->comp_region_w : content_w;
+	r.region_h = s->l2d_plane_live ? s->comp_region_h : content_h;
 	r.bd_w = s->bd_w;
 	r.bd_h = s->bd_h;
+	if (s->l2d_plane_live) {
+		r.composite_mode = s->comp_mode;
+		r.mask_kind = s->comp_mask_kind;
+		r.opaque_present = s->comp_opaque;
+		r.cx = s->comp_cx;
+		r.cy = s->comp_cy;
+		r.cw = s->comp_cw;
+		r.ch = s->comp_ch;
+	}
 	comp_xbridge_stage_recipe(s->xbridge, &r);
 
 	s->seq++;
@@ -989,6 +1536,147 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	if (s->bd_plane_live) {
 		comp_xbridge_pre_plane_write(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP);
 	}
+	if (s->l2d_plane_live) {
+		comp_xbridge_pre_plane_write(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D);
+	}
+}
+
+/*!
+ * VK-1b-2 — the masked 2D-over-3D composite, on the OUT device, over the frame
+ * the display processor has just woven into @p dst.
+ *
+ * Every parameter comes FROM THE SLOT (#1140). The slot was filled by an earlier
+ * frame, so reading the composite's recipe from live CPU state would pair one
+ * frame's pixels with another frame's blend — exactly what `eg_gen` already
+ * forbids for the atlas, one level down.
+ *
+ * Returns false on every "no composite this frame" path, which is a normal
+ * outcome and never a broken frame: the weave has already gone into @p dst and
+ * is presented regardless.
+ */
+static bool
+split_composite(struct comp_vk_split *s, int32_t slot, bool is_repaint, ID3D11Texture2D *dst)
+{
+	if (s->outcomp == nullptr || dst == nullptr) {
+		return false;
+	}
+
+	struct comp_xbridge_recipe rec = {};
+	if (!comp_xbridge_slot_recipe(s->xbridge, slot, &rec) || !rec.composite) {
+		// A projection-only frame filled this slot. The correct answer, not a bail.
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC dd = {};
+	dst->GetDesc(&dd);
+	uint32_t region_w = rec.region_w;
+	uint32_t region_h = rec.region_h;
+	if (region_w > dd.Width) {
+		region_w = dd.Width;
+	}
+	if (region_h > dd.Height) {
+		region_h = dd.Height;
+	}
+	if (region_w == 0 || region_h == 0) {
+		s->composite_bails++;
+		return false;
+	}
+
+	/*
+	 * The `twod` source is the LOCAL2D PLANE that landed with THIS slot, proved
+	 * against the recipe's own generation (#918 review F3) — a later submit that
+	 * rewrote the plane under this weave comes back NULL rather than as
+	 * mismatched pixels.
+	 */
+	if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_LOCAL2D)) == 0) {
+		s->composite_bails++;
+		return false;
+	}
+	auto *twod_srv = static_cast<ID3D11ShaderResourceView *>(comp_xbridge_get_plane_srv(
+	    s->xbridge, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]));
+	if (twod_srv == nullptr) {
+		s->composite_bails++;
+		return false;
+	}
+
+	/*
+	 * The mask is the OUT-DEVICE raster the last app frame produced. A repaint
+	 * reads the same pointer without re-rastering (#868), which is the whole
+	 * reason `is_repaint` is an explicit parameter of the weave rather than
+	 * inferred: the raster is not just a draw, it feeds the once-per-app-frame
+	 * wish publish, and driving that at panel rate desynchronises the sideband.
+	 */
+	(void)is_repaint;
+	ID3D11ShaderResourceView *mask_srv = s->repaint_mask_srv;
+	if (mask_srv == nullptr) {
+		s->composite_bails++;
+		return false;
+	}
+
+	const DXGI_FORMAT unorm_fmt = (dd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)   ? DXGI_FORMAT_B8G8R8A8_UNORM
+	                              : (dd.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) ? DXGI_FORMAT_R8G8B8A8_UNORM
+	                                                                               : dd.Format;
+	if (!comp_d3d11_outcomp_ensure_weave_scratch(s->outcomp, region_w, region_h, (uint32_t)unorm_fmt)) {
+		s->composite_bails++;
+		return false;
+	}
+	// The display processor wrote dst and an RT is not an SRV, so the lerp reads
+	// a snapshot. Unit-owned: source and destination are both its device's.
+	void *weave_srv = comp_d3d11_outcomp_snapshot_weave(s->outcomp, dst, region_w, region_h);
+	if (weave_srv == nullptr) {
+		s->composite_bails++;
+		return false;
+	}
+
+	uint32_t cx_u = (rec.cx < 0) ? 0u : (uint32_t)rec.cx;
+	uint32_t cy_u = (rec.cy < 0) ? 0u : (uint32_t)rec.cy;
+	if (cx_u > region_w) {
+		cx_u = region_w;
+	}
+	if (cy_u > region_h) {
+		cy_u = region_h;
+	}
+	const uint32_t cright = (cx_u + rec.cw > region_w) ? region_w : cx_u + rec.cw;
+	const uint32_t cbottom = (cy_u + rec.ch > region_h) ? region_h : cy_u + rec.ch;
+
+	const xrt_result_t xret = comp_d3d11_outcomp_composite_2d_masked(
+	    s->outcomp, dst, twod_srv, mask_srv, weave_srv, region_w, region_h, (int32_t)cx_u, (int32_t)cy_u,
+	    cright - cx_u, cbottom - cy_u, rec.composite_mode, rec.opaque_present);
+	if (xret != XRT_SUCCESS) {
+		s->composite_bails++;
+		return false;
+	}
+
+	s->composites++;
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("#918 VK-1b: Local2D composite on the SCANOUT device — %ux%u region, mode=%u mask_kind=%u",
+		        region_w, region_h, rec.composite_mode, rec.mask_kind);
+	}
+	return true;
+}
+
+/*!
+ * VK-1b-2 — the diagnostic HUD, copied onto the back buffer after the composite.
+ *
+ * Not a bridge plane and not transported: `u_hud` rasterises to a CPU buffer, so
+ * the bitmap was uploaded straight to an out-device texture by
+ * @ref comp_vk_split_set_hud. Same shape as `d3d11_render_hud_overlay`'s.
+ */
+static void
+split_draw_hud(struct comp_vk_split *s, ID3D11Texture2D *dst, uint32_t tgt_w, uint32_t tgt_h)
+{
+	if (!s->hud_live || s->hud_tex == nullptr || dst == nullptr) {
+		return;
+	}
+	if (tgt_w < s->hud_w + 10u || tgt_h < s->hud_h + 10u) {
+		return;
+	}
+	const uint32_t dst_x = 10u;
+	const uint32_t dst_y = tgt_h - s->hud_h - 10u;
+	D3D11_BOX src = {0, 0, 0, s->hud_w, s->hud_h, 1};
+	s->out_ctx->CopySubresourceRegion(dst, 0, dst_x, dst_y, 0, s->hud_tex, 0, &src);
 }
 
 /*!
@@ -1196,10 +1884,23 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	if (canvas != nullptr) {
 		cv = *canvas;
 	}
-	xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h,
-	                                          weave_cols, weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM,
-	                                          tgt_w, tgt_h, cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
+	xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h, weave_cols,
+	                                          weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, tgt_w, tgt_h,
+	                                          cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
 	                                          (uint32_t)cv.extent.h);
+
+	/*
+	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
+	 * device and both over the frame the weave has just written. This is the tail
+	 * the split moved to the scanout adapter along with the weave itself; every
+	 * input belongs to that device, which is the single rule
+	 * comp_d3d11_outcomp states and the plane transports exist to satisfy.
+	 */
+	{
+		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
+		(void)split_composite(s, slot, is_repaint, dst);
+		split_draw_hud(s, dst, tgt_w, tgt_h);
+	}
 
 	if (!is_repaint) {
 		// Publish the slot the app frame wove, so a repaint replays exactly
@@ -1416,6 +2117,101 @@ comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane)
 {
 	(void)split;
 	(void)plane;
+}
+
+extern "C" bool
+comp_vk_split_raster_mask(struct comp_vk_split *split,
+                          uint32_t kind,
+                          const struct xrt_rect *rects,
+                          const float *feather_px,
+                          uint32_t rect_count,
+                          uint32_t region_w,
+                          uint32_t region_h)
+{
+	(void)split;
+	(void)kind;
+	(void)rects;
+	(void)feather_px;
+	(void)rect_count;
+	(void)region_w;
+	(void)region_h;
+	return false;
+}
+
+extern "C" void
+comp_vk_split_stage_local2d(struct comp_vk_split *split,
+                            void *nt_handle,
+                            uint64_t generation,
+                            uint32_t alloc_w,
+                            uint32_t alloc_h,
+                            uint64_t content_seq,
+                            int32_t dirty_x,
+                            int32_t dirty_y,
+                            uint32_t dirty_w,
+                            uint32_t dirty_h,
+                            uint32_t region_w,
+                            uint32_t region_h,
+                            int32_t cx,
+                            int32_t cy,
+                            uint32_t cw,
+                            uint32_t ch,
+                            uint32_t composite_mode,
+                            bool opaque_present)
+{
+	(void)split;
+	(void)nt_handle;
+	(void)generation;
+	(void)alloc_w;
+	(void)alloc_h;
+	(void)content_seq;
+	(void)dirty_x;
+	(void)dirty_y;
+	(void)dirty_w;
+	(void)dirty_h;
+	(void)region_w;
+	(void)region_h;
+	(void)cx;
+	(void)cy;
+	(void)cw;
+	(void)ch;
+	(void)composite_mode;
+	(void)opaque_present;
+}
+
+extern "C" void
+comp_vk_split_stage_no_composite(struct comp_vk_split *split)
+{
+	(void)split;
+}
+
+extern "C" bool
+comp_vk_split_zone_dp_supported(struct comp_vk_split *split)
+{
+	(void)split;
+	return false;
+}
+
+extern "C" void
+comp_vk_split_publish_zone_wish(struct comp_vk_split *split, uint64_t seq)
+{
+	(void)split;
+	(void)seq;
+}
+
+extern "C" void
+comp_vk_split_clear_zone_wish(struct comp_vk_split *split)
+{
+	(void)split;
+}
+
+extern "C" void
+comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t w, uint32_t h, bool dirty)
+{
+	(void)split;
+	(void)pixels;
+	(void)w;
+	(void)h;
+	(void)dirty;
 }
 
 extern "C" bool
