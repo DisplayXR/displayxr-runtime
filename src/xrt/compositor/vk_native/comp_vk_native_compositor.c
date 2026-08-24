@@ -1466,6 +1466,69 @@ vk_repaint_disarm_locked(struct comp_vk_native_compositor *c)
 	c->repaint.atlas_view = 0;
 }
 
+/*!
+ * #1178 — THE WINDOW-FOLLOW. Resize whichever object owns the present.
+ *
+ * This compositor has two possible presentation surfaces and exactly one of them
+ * exists at a time:
+ *
+ *  - the **Vulkan swapchain** on the app's own adapter (`c->target`), or
+ *  - under the output-device split (#918 VK-1), a **DXGI swapchain on the SCANOUT
+ *    adapter**, owned by `c->split`. There `c->target` is NULL for the entire
+ *    session — not transiently, by construction (see the `c->split == NULL`
+ *    guards around the Vulkan weaver and target creation in the session setup).
+ *
+ * The resize path used to be spelled `if (c->target != NULL) { resize it }`,
+ * which reads like a null check and is really a MODE test — and under the split
+ * it silently selected "resize nothing". Nothing else on the path noticed:
+ * `settings.preferred` still followed the window, so the view dims, the content
+ * box, the bridge's egress ring and every `[RENDER]` counter tracked it frame by
+ * frame. The one thing left behind was the surface actually being scanned out,
+ * so the picture kept its old geometry with DXGI scaling or clipping it into the
+ * new window — a defect no counter in the pipeline can see.
+ *
+ * So the dispatch lives here, in one function whose contract is the whole
+ * invariant: **the output follows the window**. A third output owner has to be
+ * added to this function or it will present at the wrong size — and the tripwire
+ * in `comp_vk_split_weave_and_present` says so out loud if one ever is not.
+ *
+ * Caller MUST hold c->mutex.
+ */
+static void
+vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t width, uint32_t height)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		// The scanout chain is the runtime's own, on the runtime's own
+		// device; no Vulkan object is involved and there is nothing to
+		// drain on the app's Vulkan device.
+		(void)comp_vk_split_resize_target(c->split, width, height);
+		return;
+	}
+#endif
+
+	if (c->target != NULL) {
+		comp_vk_native_target_resize(c->target, width, height);
+		/*
+		 * #602: drain the GPU after recreating the swapchain. The
+		 * steady-state per-frame path no longer calls vkDeviceWaitIdle (it
+		 * used to, incidentally, via the renderer resize), so without this
+		 * an in-flight frame can present/sample a just-destroyed swapchain
+		 * image → VK_ERROR_DEVICE_LOST. Window resizes are rare, so the
+		 * stall here is fine.
+		 *
+		 * #602: the DP's target-handle-keyed caches are now stale. The
+		 * notification is NOT issued here — it is issued once, for every
+		 * recreate, at the acquire boundary in vk_dp_weave_and_present (see
+		 * dp_notified_target_generation). Notifying only here missed the
+		 * recreate that target_acquire performs on VK_ERROR_OUT_OF_DATE_KHR,
+		 * which is how a stale cache reached the GPU and lost the device.
+		 * Deferring to the acquire is safe: nothing uses the DP in between.
+		 */
+		c->vk.vkDeviceWaitIdle(c->vk.device);
+	}
+}
+
 static xrt_result_t
 vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
@@ -1508,26 +1571,9 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				        c->settings.preferred.width, c->settings.preferred.height,
 				        new_width, new_height);
 
-				if (c->target != NULL) {
-					comp_vk_native_target_resize(c->target, new_width, new_height);
-					// #602: drain the GPU after recreating the swapchain. The
-					// steady-state per-frame path no longer calls
-					// vkDeviceWaitIdle (it used to, incidentally, via the
-					// renderer resize), so without this an in-flight frame can
-					// present/sample a just-destroyed swapchain image →
-					// VK_ERROR_DEVICE_LOST. Window resizes are rare, so the
-					// stall here is fine.
-					c->vk.vkDeviceWaitIdle(c->vk.device);
-					// #602: the DP's target-handle-keyed caches are now
-					// stale. The notification is NOT issued here — it is
-					// issued once, for every recreate, at the acquire
-					// boundary in vk_dp_weave_and_present (see
-					// dp_notified_target_generation). Notifying only here
-					// missed the recreate that target_acquire performs on
-					// VK_ERROR_OUT_OF_DATE_KHR, which is how a stale cache
-					// reached the GPU and lost the device. Deferring to the
-					// acquire is safe: nothing uses the DP in between.
-				}
+				// #1178: whichever surface owns the present — the Vulkan
+				// swapchain, or the split's chain on the scanout adapter.
+				vk_output_follow_window_locked(c, new_width, new_height);
 				c->settings.preferred.width = new_width;
 				c->settings.preferred.height = new_height;
 
@@ -1574,13 +1620,9 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			// bounds before recreating the swapchain (#524).
 			comp_vk_native_window_macos_sync_drawable_size(c->macos_window);
 
-			if (c->target != NULL) {
-				comp_vk_native_target_resize(c->target, new_width, new_height);
-				// #602: drain after swapchain recreate (see Windows branch).
-				c->vk.vkDeviceWaitIdle(c->vk.device);
-				// #602: DP cache invalidation happens at the acquire boundary
-				// for every recreate path (see Windows branch).
-			}
+			// #1178: one window-follow for every platform (there is no split
+			// off Windows, so this resolves to the Vulkan target here).
+			vk_output_follow_window_locked(c, new_width, new_height);
 			c->settings.preferred.width = new_width;
 			c->settings.preferred.height = new_height;
 
@@ -1623,13 +1665,8 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 			        c->settings.preferred.width, c->settings.preferred.height,
 			        new_width, new_height);
 
-			if (c->target != NULL) {
-				comp_vk_native_target_resize(c->target, new_width, new_height);
-				// #602: drain after swapchain recreate (see Windows branch).
-				c->vk.vkDeviceWaitIdle(c->vk.device);
-				// #602: DP cache invalidation happens at the acquire boundary
-				// for every recreate path (see Windows branch).
-			}
+			// #1178: one window-follow for every platform (see the Windows branch).
+			vk_output_follow_window_locked(c, new_width, new_height);
 			c->settings.preferred.width = new_width;
 			c->settings.preferred.height = new_height;
 

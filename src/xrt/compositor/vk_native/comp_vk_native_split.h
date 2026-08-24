@@ -550,6 +550,23 @@ void
 comp_vk_split_invalidate_plane(struct comp_vk_split *split, uint32_t plane);
 
 /*!
+ * #1178 — make the scanout swapchain follow the window.
+ *
+ * Under the split there is no VkSwapchain: the surface the panel actually shows
+ * is a DXGI chain on the SCANOUT adapter that this unit owns and the Vulkan side
+ * never sees. Nothing else can resize it, so this is not an optional leg of the
+ * caller's resize path — it IS the resize path whenever the split is up, and
+ * omitting it leaves a frozen-size back buffer that DXGI scales or clips into the
+ * window while every counter reads healthy. That was #1178.
+ *
+ * Idempotent: a call at the size the chain already has does nothing and succeeds.
+ *
+ * @return true when the chain is at @p width x @p height afterwards.
+ */
+bool
+comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_t height);
+
+/*!
  * Weave one frame on the scanout adapter and present it.
  *
  * Picks the newest egress slot whose consumer copy has landed AND whose stamped

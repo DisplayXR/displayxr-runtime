@@ -472,6 +472,12 @@ struct comp_xbridge
 	//! quiesce summary carries it too.
 	uint64_t fmt_refused;
 	uint64_t fmt_refuse_log_ns;
+	//! #1178 — submits REFUSED because the copy box did not fit its source or its
+	//! destination, and when that was last logged. Same contract as the format
+	//! pair above: any non-zero count is a caller bug, and it survives into the
+	//! quiesce summary rather than living only in a line that scrolled past.
+	uint64_t ext_refused;
+	uint64_t ext_refuse_log_ns;
 
 	// --- #1178 content probe (DXR_SPLIT_CONTENT_PROBE=1) -------------------
 	//! Off unless the env var is set; read once at create.
@@ -973,6 +979,66 @@ xb_check_source_format(struct comp_xbridge *xb, DXGI_FORMAT chain_fmt, DXGI_FORM
 		    "comp_xbridge_info::atlas_format (#1178). %llu refusals so far.",
 		    XB_TAG(xb), where, xb_fmt_name(src_fmt), (unsigned)src_fmt, xb_fmt_name(chain_fmt),
 		    (unsigned)chain_fmt, (unsigned long long)xb->fmt_refused);
+	}
+	return false;
+}
+
+/*!
+ * #1178 — THE EXTENT GUARD, sibling of @ref xb_check_source_format and there for
+ * the same reason: a D3D copy has a second way to transport nothing while every
+ * counter reads healthy.
+ *
+ * `CopySubresourceRegion` SILENTLY CLIPS a box that overhangs its source or its
+ * destination — the pixels outside simply do not move and the destination keeps
+ * what it held — and `CopyTextureRegion` drops such a call with nothing louder
+ * than a debug-layer message. Neither returns an HRESULT, so the bytes counted
+ * into `xb_kb`, the slot stamped with the box the caller ASKED for and the
+ * `[RENDER]` line that reads off them are all unaffected by whether the pixels
+ * arrived. A slot stamped with a box its pixels do not have is worse than an
+ * empty one: the weave slices tiles at the wrong stride.
+ *
+ * The dimensions on the two sides of this bridge are computed by DIFFERENT
+ * OWNERS — the source atlas from the renderer's worst-case allocation, the
+ * egress ring from the window-derived content box, the cross-adapter ring once
+ * at the panel's worst case — and each moves on its own schedule. "They agree"
+ * is therefore an assumption, not an invariant, and an assumption on the far
+ * side of the bridge that nothing revalidates is exactly the shape of #1178.
+ *
+ * A dimension of 0 means "not known here" and is not checked.
+ *
+ * @return true when the box fits both ends; false, loudly and throttled, when it
+ *         does not — the caller then REFUSES the frame rather than issuing a copy
+ *         that will succeed at doing part of the job.
+ */
+static bool
+xb_check_copy_extent(struct comp_xbridge *xb,
+                     const char *where,
+                     uint32_t box_w,
+                     uint32_t box_h,
+                     uint32_t src_w,
+                     uint32_t src_h,
+                     uint32_t dst_w,
+                     uint32_t dst_h)
+{
+	const bool src_ok = (src_w == 0 || box_w <= src_w) && (src_h == 0 || box_h <= src_h);
+	const bool dst_ok = (dst_w == 0 || box_w <= dst_w) && (dst_h == 0 || box_h <= dst_h);
+	if (src_ok && dst_ok) {
+		return true;
+	}
+
+	xb->ext_refused++;
+	const uint64_t now = os_monotonic_get_ns();
+	if (xb->ext_refuse_log_ns == 0 || now - xb->ext_refuse_log_ns >= XB_FMT_REFUSE_LOG_NS) {
+		xb->ext_refuse_log_ns = now;
+		U_LOG_E(
+		    "%s: COPY EXTENT MISMATCH at %s — the copy box is %ux%u but the source is %ux%u and the "
+		    "destination is %ux%u (%s does not fit). A D3D copy region that overhangs is CLIPPED or "
+		    "DROPPED in silence, not failed, so the frame is REFUSED rather than transported in part. "
+		    "The two ends of this chain are sized by different owners and one of them stopped "
+		    "following the other (#1178). %llu refusals so far.",
+		    XB_TAG(xb), where, box_w, box_h, src_w, src_h, dst_w, dst_h,
+		    !src_ok ? (!dst_ok ? "neither end" : "the source") : "the destination",
+		    (unsigned long long)xb->ext_refused);
 	}
 	return false;
 }
@@ -3056,11 +3122,23 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	// Counted BEFORE the allocator-busy early-outs below: the watchdog's whole
 	// point is that a skipped frame is still an attempted frame (#918 F3).
 	xb->attempted.fetch_add(1, std::memory_order_release);
-	if (content_w > xb->eg_w) {
-		content_w = xb->eg_w;
-	}
-	if (content_h > xb->eg_h) {
-		content_h = xb->eg_h;
+
+	/*
+	 * #1178 — the content box must FIT the egress ring, and saying so is not the
+	 * same as making it fit. This used to clamp, silently, which stamps the slot
+	 * with the box the caller asked for while transporting a sub-rect of it — the
+	 * weave then slices tiles at a stride the pixels do not have, and no counter
+	 * anywhere records that anything went wrong.
+	 *
+	 * `comp_xbridge_set_content_size` runs immediately before every submit and
+	 * either sizes the ring to the content box or holds the worst-case ring
+	 * (which is >= any content box, since the box is clamped to `max_*` there),
+	 * so this is unreachable by construction. That is precisely why it must say
+	 * so out loud rather than paper over it if the construction ever changes.
+	 */
+	if (!xb_check_copy_extent(xb, "atlas submit (content box vs egress ring)", content_w, content_h,
+	                          /*src=*/0, 0, xb->eg_w, xb->eg_h)) {
+		return;
 	}
 
 	ID3D12Resource *src12 = xb->atlas_12;
@@ -3094,6 +3172,12 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		if (!xb_check_source_format(xb, xb->fmt, ad.Format, "ingress stage (Option II)")) {
 			return;
 		}
+		// #1178 — and the same question about EXTENT. The atlas is the caller's
+		// own texture, sized by the renderer; the staging ring is `max_*`.
+		if (!xb_check_copy_extent(xb, "ingress stage (Option II)", content_w, content_h, (uint32_t)ad.Width,
+		                          ad.Height, xb->max_w, xb->max_h)) {
+			return;
+		}
 		D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
 		xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		src12 = xb->in_12[in];
@@ -3109,8 +3193,18 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	 */
 	{
 		const D3D12_RESOURCE_DESC sd = src12->GetDesc();
-		if (!xb_check_source_format(xb, xb->fmt, sd.Format,
-		                            use_direct ? "atlas source (Option I)" : "ingress ring")) {
+		const char *where = use_direct ? "atlas source (Option I)" : "ingress ring";
+		if (!xb_check_source_format(xb, xb->fmt, sd.Format, where)) {
+			return;
+		}
+		/*
+		 * #1178 — leg 1's extent. Under Option I this source is the CALLER's own
+		 * atlas, whose size is the renderer's worst-case allocation and moves on
+		 * the renderer's schedule, not the window's; the cross-adapter ring is
+		 * `max_*`, fixed at create. Nothing before this ever compared them.
+		 */
+		if (!xb_check_copy_extent(xb, where, content_w, content_h, (uint32_t)sd.Width, sd.Height, xb->max_w,
+		                          xb->max_h)) {
 			return;
 		}
 	}
@@ -3183,6 +3277,10 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 	}
 	{
+		// #1178 — leg 2's extent was checked at the top of this function (`content
+		// box vs egress ring`), which had to happen before either command list was
+		// opened; its source is the `max_*` cross-adapter ring that leg 1 just
+		// checked against. Both ends of this copy are therefore already proven.
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(xb->eg_12[eg]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(xb->xa_cons[xa]);
 		xb->cons_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
@@ -3666,6 +3764,12 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 	if (xb->fmt_refused > 0) {
 		U_LOG_E("%s: %llu submits/binds REFUSED on a DXGI format mismatch — the chain is %s (0x%x) (#1178)",
 		        XB_TAG(xb), (unsigned long long)xb->fmt_refused, xb_fmt_name(xb->fmt), (unsigned)xb->fmt);
+	}
+	if (xb->ext_refused > 0) {
+		U_LOG_E(
+		    "%s: %llu submits REFUSED on a copy-extent mismatch — the chain is %ux%u worst-case / %ux%u "
+		    "egress (#1178)",
+		    XB_TAG(xb), (unsigned long long)xb->ext_refused, xb->max_w, xb->max_h, xb->eg_w, xb->eg_h);
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		U_LOG_W(

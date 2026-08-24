@@ -212,6 +212,16 @@ struct comp_vk_split
 	uint64_t inflight_weaves;
 	uint64_t diag_window_ns;
 	//! @}
+
+	//! @name #1178 — the swapchain-follows-the-window tripwire.
+	//! @{
+	//! When the swapchain and the window client rect FIRST disagreed, or 0
+	//! while they agree. A live drag legitimately disagrees for a frame or two,
+	//! so the complaint waits out @ref SPLIT_DRIFT_GRACE_NS of continuous drift.
+	uint64_t tgt_drift_since_ns;
+	uint64_t tgt_drift_log_ns;
+	uint64_t tgt_drift_frames;
+	//! @}
 };
 
 
@@ -220,6 +230,11 @@ struct comp_vk_split
  * Helpers.
  *
  */
+
+//! #1178 — how long the swapchain may lag the window before the tripwire says so.
+#define SPLIT_DRIFT_GRACE_NS (500 * 1000 * 1000ULL)
+//! ...and how often it may repeat itself. Never per frame; the repo forbids that.
+#define SPLIT_DRIFT_LOG_NS (5 * 1000 * 1000 * 1000ULL)
 
 //! windows.h-free mirror, for @ref comp_split_gate_inputs.
 static struct comp_split_luid
@@ -1930,6 +1945,103 @@ split_crop_for_dp(struct comp_vk_split *s, ID3D11ShaderResourceView *src_srv, ui
 }
 
 extern "C" bool
+comp_vk_split_resize_target(struct comp_vk_split *s, uint32_t width, uint32_t height)
+{
+	if (s == nullptr || s->target == nullptr || width == 0 || height == 0) {
+		return false;
+	}
+
+	uint32_t cur_w = 0, cur_h = 0;
+	comp_d3d11_target_get_dimensions(s->target, &cur_w, &cur_h);
+	if (cur_w == width && cur_h == height) {
+		return true;
+	}
+
+	/*
+	 * No ID3D10Multithread bracket here, and that is the split's whole point:
+	 * this swapchain lives on the runtime's OWN output device, which the app's
+	 * render thread never touches. The non-split D3D11 leg takes one at its
+	 * equivalent site precisely because there the chain shares the app's
+	 * immediate context (`resize_needs_lock` in d3d11_compositor_begin_frame),
+	 * and it too drops the bracket once the split is active.
+	 *
+	 * The caller holds the compositor mutex, which is what keeps the #868
+	 * repaint thread — the other user of this target — out for the duration.
+	 */
+	const xrt_result_t xret = comp_d3d11_target_resize(s->target, width, height);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E(
+		    "VK output-device split: the scanout swapchain REFUSED %ux%u (%d) and stays at %ux%u — "
+		    "the present will keep the OLD geometry (#1178)",
+		    width, height, (int)xret, cur_w, cur_h);
+		return false;
+	}
+
+	// A window resize, not a frame event.
+	U_LOG_W("VK output-device split: scanout swapchain follows the window, %ux%u -> %ux%u (#1178)", cur_w, cur_h,
+	        width, height);
+	s->tgt_drift_since_ns = 0;
+	return true;
+}
+
+/*!
+ * #1178 — THE TRIPWIRE, at the point of use.
+ *
+ * The fix one level up makes the swapchain follow the window; this makes a
+ * failure to do so DIAGNOSABLE, which is the part that outlives the instance.
+ * Nothing in the pipeline can see this defect: the atlas, the content box, the
+ * egress ring and every `[RENDER]` counter follow the window correctly, so the
+ * only witness is the geometry of the surface being presented against the
+ * geometry of the window presenting it. #1178 shipped with `split=1 no_slot=0
+ * ing_leak=0 out_crop=0` and a visibly wrong picture.
+ *
+ * Grace before complaint, because a real drag DOES disagree briefly: a repaint
+ * tick can weave between the window changing and the next `begin_frame`
+ * observing it. Only drift that persists past @ref SPLIT_DRIFT_GRACE_NS is a
+ * defect rather than a frame of latency.
+ */
+static void
+split_check_target_follows_window(struct comp_vk_split *s, uint32_t tgt_w, uint32_t tgt_h)
+{
+	if (s->hwnd == nullptr) {
+		return;
+	}
+	RECT rc = {};
+	if (!GetClientRect(s->hwnd, &rc)) {
+		return;
+	}
+	const uint32_t win_w = (uint32_t)(rc.right - rc.left);
+	const uint32_t win_h = (uint32_t)(rc.bottom - rc.top);
+	if (win_w == 0 || win_h == 0 || (win_w == tgt_w && win_h == tgt_h)) {
+		s->tgt_drift_since_ns = 0;
+		return;
+	}
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (s->tgt_drift_since_ns == 0) {
+		s->tgt_drift_since_ns = now;
+		return;
+	}
+	s->tgt_drift_frames++;
+	if (now - s->tgt_drift_since_ns < SPLIT_DRIFT_GRACE_NS) {
+		return;
+	}
+	if (s->tgt_drift_log_ns != 0 && now - s->tgt_drift_log_ns < SPLIT_DRIFT_LOG_NS) {
+		return;
+	}
+	s->tgt_drift_log_ns = now;
+	U_LOG_E(
+	    "VK output-device split: THE SCANOUT SWAPCHAIN IS NOT FOLLOWING THE WINDOW — the window's client "
+	    "rect is %ux%u but the chain is %ux%u, and has been for %llu ms / %llu frames. Every weave is "
+	    "composed for the CHAIN's geometry and DXGI then scales or clips it into the window, so the picture "
+	    "keeps the old size while the atlas, the content box, the egress ring and every [RENDER] counter "
+	    "track the window correctly and read healthy. Whatever moved the window did not reach "
+	    "comp_vk_split_resize_target (#1178).",
+	    win_w, win_h, tgt_w, tgt_h, (unsigned long long)((now - s->tgt_drift_since_ns) / (1000 * 1000)),
+	    (unsigned long long)s->tgt_drift_frames);
+}
+
+extern "C" bool
 comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const struct xrt_rect *canvas)
 {
 	if (s == nullptr || s->xbridge == nullptr || s->target == nullptr || s->dp == nullptr) {
@@ -2036,6 +2148,7 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 
 	uint32_t tgt_w = 0, tgt_h = 0;
 	comp_d3d11_target_get_dimensions(s->target, &tgt_w, &tgt_h);
+	split_check_target_follows_window(s, tgt_w, tgt_h);
 
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
@@ -2435,6 +2548,15 @@ comp_vk_split_set_hud(struct comp_vk_split *split, const void *pixels, uint32_t 
 	(void)w;
 	(void)h;
 	(void)dirty;
+}
+
+extern "C" bool
+comp_vk_split_resize_target(struct comp_vk_split *split, uint32_t width, uint32_t height)
+{
+	(void)split;
+	(void)width;
+	(void)height;
+	return false;
 }
 
 extern "C" bool
