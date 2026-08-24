@@ -13,6 +13,7 @@
 
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_deposit.h"
+#include "comp_vk_native_split.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
@@ -246,6 +247,38 @@ struct comp_vk_native_compositor
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+	/*!
+	 * @name #918 output-device split (VK-1, #1178)
+	 *
+	 * Non-NULL ⟹ the weave, the repaint tick and the present live on the
+	 * SCANOUT adapter and this compositor's Vulkan display processor and
+	 * Vulkan target were never created. Everything the split owns is behind
+	 * the opaque handle — see comp_vk_native_split.h.
+	 * @{
+	 */
+	struct comp_vk_split *split;
+
+	//! Packed LUID of the VkPhysicalDevice — the split's gate and the
+	//! `weave placement:` line both need it, resolved once.
+	uint64_t render_packed_luid;
+
+	/*!
+	 * The canonical short reason the ONE `weave placement:` line prints when
+	 * the split is not running, and what `[RENDER] split=0 reason=` names.
+	 * NULL while the split is active.
+	 */
+	const char *split_off_reason;
+
+	/*!
+	 * Kept so the RETIRE can build the Vulkan weaver the split skipped, and
+	 * the Vulkan target with it. Not read while the split is up.
+	 */
+	void *dp_factory_vk_saved;
+	bool transparent_background_saved;
+	uint32_t queue_index_saved;
+	void *app_hwnd_saved;
+	//! @}
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -1942,6 +1975,78 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
  * Uses vkCmdBlitImage for an opaque blit (no alpha blending).
  * The u_hud pixel buffer has pre-composited semi-transparent background.
  */
+/*!
+ * @name "The display processor, whichever one this session has" (#918 VK-1)
+ *
+ * Under the output-device split the weaver is an `xrt_display_processor_d3d11`
+ * on the scanout adapter — a different vtable TYPE from the Vulkan
+ * `xrt_display_processor` this compositor holds everywhere else, so
+ * `c->display_processor` is legitimately NULL. These four forward the
+ * graphics-API-free queries that must keep working either way: without them a
+ * split session silently loses its eye positions, its panel geometry and its
+ * 2D/3D mode control, and the Kooima projection quietly falls back to
+ * display-scoped.
+ *
+ * Everything VULKAN-shaped about a display processor — render passes,
+ * self-submission, target-recreate notifications — has no D3D11 counterpart and
+ * no caller while the split is up, so nothing is forwarded for it.
+ * @{
+ */
+static bool
+vk_dp_display_pixel_info(
+    struct comp_vk_native_compositor *c, uint32_t *out_w, uint32_t *out_h, int32_t *out_left, int32_t *out_top)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_vk_split_get_display_pixel_info(c->split, out_w, out_h, out_left, out_top);
+	}
+#endif
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	return xrt_display_processor_get_display_pixel_info(c->display_processor, out_w, out_h, out_left, out_top);
+}
+
+static bool
+vk_dp_display_dimensions(struct comp_vk_native_compositor *c, float *out_w_m, float *out_h_m)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_vk_split_get_display_dimensions(c->split, out_w_m, out_h_m);
+	}
+#endif
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	return xrt_display_processor_get_display_dimensions(c->display_processor, out_w_m, out_h_m);
+}
+
+static bool
+vk_dp_predicted_eyes(struct comp_vk_native_compositor *c, struct xrt_eye_positions *out_eye_pos)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_vk_split_get_predicted_eye_positions(c->split, out_eye_pos);
+	}
+#endif
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	return xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+}
+
+static bool
+vk_dp_has_any(struct comp_vk_native_compositor *c)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return true;
+	}
+#endif
+	return c->display_processor != NULL;
+}
+/*! @} */
+
 static void
 vk_compositor_render_hud(struct comp_vk_native_compositor *c,
                           VkCommandBuffer cmd,
@@ -1977,7 +2082,7 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
 		nom_z = c->sys_info.nominal_viewer_z_m * 1000.0f;
 	} else if (c->display_processor != NULL) {
 		float dw_m = 0, dh_m = 0;
-		if (xrt_display_processor_get_display_dimensions(c->display_processor, &dw_m, &dh_m)) {
+		if (vk_dp_display_dimensions(c, &dw_m, &dh_m)) {
 			disp_w_mm = dw_m * 1000.0f;
 			disp_h_mm = dh_m * 1000.0f;
 		}
@@ -1986,7 +2091,7 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
 	// Eye positions from display processor
 	struct xrt_eye_positions eye_pos = {0};
 	if (c->display_processor != NULL) {
-		xrt_display_processor_get_predicted_eye_positions(c->display_processor, &eye_pos);
+		vk_dp_predicted_eyes(c, &eye_pos);
 	}
 	if (!eye_pos.valid) {
 		eye_pos.count = 2;
@@ -2907,6 +3012,12 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c);
 // (windowed-weaving phase anchor). Defined below, next to get_window_metrics.
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c);
+#ifdef XRT_OS_WINDOWS
+//! #918 VK-1 (#1178) — defined beside the two creates it re-runs; called from
+//! the frame path far above them.
+static void
+vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, const char *short_reason);
+#endif
 // #224 / ADR-027 hardware-DP zone leg (P4): one-time caps probe + per-frame
 // sideband publish of the wish / sticky mask. Defined with the other zone
 // helpers near the bottom.
@@ -3773,6 +3884,50 @@ vk_repaint_thread(void *ptr)
 			continue;
 		}
 
+#ifdef XRT_OS_WINDOWS
+		/*
+		 * #918 VK-1 — THE ARM THE SPLIT EXISTS FOR.
+		 *
+		 * The replay re-weaves the egress slot the last app frame published,
+		 * entirely on the scanout adapter, with ZERO bridge traffic: no atlas
+		 * crosses, no Vulkan work is recorded, no Vulkan queue is touched. That
+		 * is the whole #918 claim — the atlas crosses once per APP frame and
+		 * never per repaint tick.
+		 *
+		 * Takes the lock only for the replay (the pacing above already ran
+		 * unlocked) and, unlike the Vulkan arm below, needs neither the target
+		 * generation dance nor the Local2D pool reset — it touches no VkSwapchain
+		 * and allocates no descriptor sets.
+		 */
+		if (c->split != NULL) {
+			// Bail BEFORE pacing+acquire when there is nothing published to
+			// replay (warmup, or an app frame that refused its slot).
+			if (!comp_vk_split_has_weave_slot(c->split)) {
+				continue;
+			}
+			os_mutex_lock(&c->mutex);
+			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
+			    c->repaint.app_frame_in_progress || c->split == NULL) {
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
+			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
+			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
+			c->repaint.count++;
+			os_mutex_unlock(&c->mutex);
+
+			static bool split_repaint_logged = false;
+			if (!split_repaint_logged) {
+				split_repaint_logged = true;
+				U_LOG_W(
+				    "#868/#918: repainting the published egress slot on the scanout "
+				    "adapter at %.1f Hz — no bridge traffic per tick",
+				    hz);
+			}
+			continue;
+		}
+#endif
+
 		struct comp_vk_native_target *tgt = c->target;
 		if (tgt == NULL) {
 			continue;
@@ -3923,6 +4078,36 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		}
 	}
 
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 VK-1 (#1178) — this rung transports the ATLAS and nothing else.
+	 *
+	 * A Local2D layer, a 2D-under backdrop or a Tier-3 authored zone mask each
+	 * need their own bridge PLANE on the scanout adapter, and VK-1 has none, so
+	 * the composite's inputs would be on the app adapter with its target on the
+	 * other one. Retire the split for the session rather than draw a half-split
+	 * frame or drop the 2D — `layers_unsupported` is the token that has always
+	 * meant exactly this (comp_split_gate.h), and the D3D12 leg emitted it for
+	 * the same reason while IT was projection-only.
+	 *
+	 * Placed HERE, immediately after the scan that resolves the flags and before
+	 * a single command is recorded or a single bridge copy is staged, so the
+	 * teardown never runs against half-built frame state.
+	 *
+	 * Window-space layers are deliberately NOT in this test: the Vulkan
+	 * compositor composites them INTO the atlas pre-weave, on the app device, so
+	 * they cross the bridge with the pixels they were merged into.
+	 *
+	 * VK-2 transports the planes and deletes this block.
+	 */
+	if (c->split != NULL && (c->local_2d_last_frame || c->zones_frame || c->active_zone_mask != NULL)) {
+		vk_split_retire_locked(c,
+		                       "the frame carries 2D or zone-mask layers this rung's transport "
+		                       "cannot move to the scanout adapter",
+		                       COMP_SPLIT_REASON_LAYERS_UNSUPPORTED);
+	}
+#endif
+
 	// XR_DXR_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish at the end of this commit drives the per-region switch —
 	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
@@ -3975,8 +4160,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	if (c->display_processor != NULL) {
 		struct xrt_eye_positions eyes;
-		if (xrt_display_processor_get_predicted_eye_positions(c->display_processor, &eyes) &&
-		    eyes.valid) {
+		if (vk_dp_predicted_eyes(c, &eyes) && eyes.valid) {
 			left_eye.x = eyes.eyes[0].x;
 			left_eye.y = eyes.eyes[0].y;
 			left_eye.z = eyes.eyes[0].z;
@@ -4144,6 +4328,22 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			}
 		}
 	}
+
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 — zero-copy hands the display processor the APP's own swapchain
+	 * image, which under the split lives on the wrong adapter and, worse, is
+	 * never written into the deposit at all — so no atlas would cross the
+	 * bridge and every frame would present nothing (F4).
+	 *
+	 * `u_tiling_can_zero_copy()` REMAINS the sole eligibility gate (ADR-030);
+	 * this is a placement fact applied to its RESULT, not a second gate folded
+	 * into the test. Same shape as the D3D12 leg's.
+	 */
+	if (c->split != NULL) {
+		zero_copy = false;
+	}
+#endif
 
 	// Record the frame's effective capture source = exactly what the DP will
 	// receive (renderer atlas, or the zero-copy app swapchain). The atlas
@@ -4381,33 +4581,83 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		return XRT_SUCCESS;
 	}
 
-	// If we have a target (window), present to it
-	if (c->target != NULL) {
-		// #868: publish what the repaint thread needs to replay this weave.
-		// Armed only off the zero-copy path: there the atlas IS the app's own
-		// swapchain image, which it reacquires and overwrites, so replaying it
-		// would weave whatever the app has drawn since.
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 VK-1 — hand this frame's deposit slot to the bridge, then weave and
+	 * present it on the SCANOUT adapter.
+	 *
+	 * Everything below the Vulkan atlas submit is replaced: no VkSwapchain
+	 * acquire, no Vulkan weave, no vkQueuePresentKHR. The atlas Vulkan just
+	 * rendered is already sitting in the D3D11 deposit (VK-0), so the whole
+	 * output half is D3D on the other adapter.
+	 */
+	if (c->split != NULL) {
 		c->repaint.view_w = c->eff_layout.tile_w;
 		c->repaint.view_h = c->eff_layout.tile_h;
 		c->repaint.cols = c->eff_layout.cols;
 		c->repaint.rows = c->eff_layout.rows;
-		c->repaint.armed = !zero_copy;
 
-		bool skip_frame = false;
-		xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64,
-		                               zc_view_u64, zc_format, zc_width, zc_height, tgt_width,
-		                               tgt_height, ftime, fp, &skip_frame);
-		if (skip_frame) {
-			return XRT_SUCCESS;
-		}
-		if (xret != XRT_SUCCESS) {
-			return xret;
+		struct comp_vk_deposit_handoff handoff = {0};
+		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
+			comp_vk_split_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
+			                           c->eff_layout.tile_w, c->eff_layout.tile_h);
+			/*
+			 * The slot is free again the instant the bridge's staging copy
+			 * has been recorded on this same immediate context — release it
+			 * so Vulkan's next write into it is ordered, not merely likely.
+			 * Queued signal; nothing waits here.
+			 */
+			comp_vk_deposit_note_consumed(dep, handoff.slot);
 		}
 
-		// Only a REAL frame resets the quiet-gate. A repaint must not, or
-		// repaints would pace off their own timestamps and free-run.
-		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
-	}
+		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
+		const bool wove = comp_vk_split_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+
+		/*
+		 * #918 F4 — a frame with nothing woven presents NOTHING. With
+		 * FLIP_DISCARD the panel keeps the last woven frame, which beats a
+		 * cleared one every time. The repaint stays disarmed for that frame so
+		 * the replay tick cannot pick up a slot the app frame just refused.
+		 */
+		c->repaint.armed = wove;
+		if (wove) {
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		}
+		comp_vk_split_render_diag(c->split);
+
+		if (c->owns_window && c->own_window != NULL) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
+		}
+	} else
+#endif
+		// If we have a target (window), present to it
+		if (c->target != NULL) {
+			// #868: publish what the repaint thread needs to replay this weave.
+			// Armed only off the zero-copy path: there the atlas IS the app's own
+			// swapchain image, which it reacquires and overwrites, so replaying it
+			// would weave whatever the app has drawn since.
+			c->repaint.view_w = c->eff_layout.tile_w;
+			c->repaint.view_h = c->eff_layout.tile_h;
+			c->repaint.cols = c->eff_layout.cols;
+			c->repaint.rows = c->eff_layout.rows;
+			c->repaint.armed = !zero_copy;
+
+			bool skip_frame = false;
+			xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64, zc_view_u64,
+			                               zc_format, zc_width, zc_height, tgt_width, tgt_height, ftime, fp,
+			                               &skip_frame);
+			if (skip_frame) {
+				return XRT_SUCCESS;
+			}
+			if (xret != XRT_SUCCESS) {
+				return xret;
+			}
+
+			// Only a REAL frame resets the quiet-gate. A repaint must not, or
+			// repaints would pace off their own timestamps and free-run.
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		}
 
 	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
 	// — in zones frames this publishes the WISH the composite just resolved
@@ -4533,6 +4783,20 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->dp_input_memory != VK_NULL_HANDLE) {
 		vk->vkFreeMemory(vk->device, c->dp_input_memory, NULL);
 	}
+
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 VK-1 — the split goes FIRST among the output-side objects.
+	 *
+	 * It owns a display processor that is still sampling the bridge's egress
+	 * slots and writing the scanout swapchain's back buffer, so its own
+	 * teardown order (quiesce the bridge, then the weaver, then the swapchain,
+	 * then the device) has to complete before the renderer below frees the
+	 * deposit those slots were copied FROM. The repaint thread was already
+	 * joined at the top of this function, which is what makes that safe.
+	 */
+	comp_vk_split_destroy(&c->split);
+#endif
 
 	// Destroy display processor
 	// #224 P4: withdraw this client's zone contribution from the vendor's
@@ -4679,6 +4943,299 @@ apply_window_pos_override(int32_t *left, int32_t *top)
 #endif
 
 
+/*!
+ * Create the session's VULKAN display processor on the app device.
+ *
+ * Extracted from @ref comp_vk_native_compositor_create so it has TWO callers
+ * (#918 VK-1, #1178): the session create, and the split's retire — a session
+ * that gives the scanout adapter back has to build the Vulkan weaver it
+ * originally skipped. One function means the recovery cannot drift from the
+ * create.
+ *
+ * Failure to create the weaver is NOT fatal (the session runs unwoven, exactly
+ * as before); only failing to create the command pool it needs is.
+ */
+static xrt_result_t
+vk_make_dp_vk(struct comp_vk_native_compositor *c,
+              void *dp_factory_vk,
+              uint32_t queue_family_index,
+              uint32_t queue_index,
+              bool transparent_background)
+{
+	// Create display processor via factory FIRST — the SR weaver creates
+	// its own VkSwapchain on the HWND, so we must not also create one.
+	if (dp_factory_vk != NULL) {
+		xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)dp_factory_vk;
+
+		// Create command pool for display processor (SR weaver needs it)
+		VkCommandPoolCreateInfo pool_ci = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		    .queueFamilyIndex = c->queue_family_index,
+		};
+		VkResult pool_ret = c->vk.vkCreateCommandPool(c->vk.device, &pool_ci, NULL, &c->cmd_pool);
+		if (pool_ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create command pool for display processor: %d", pool_ret);
+			return XRT_ERROR_VULKAN;
+		}
+
+		// Window handed to the DP → the SR weaver. It is NOT for swapchain
+		// creation (the Linux/Vulkan weaver makes none — it renders into our
+		// framebuffer); it is the weaver's window-GEOMETRY input for
+		// getDrawRegions() — the per-view interlacing draw-regions AND the
+		// window-anchored eye-tracked steering. Passing NULL selects the srSDK's
+		// windowless/display-scoped path (constructedWithoutWindow=true), which
+		// weaves for the DEFAULT viewpoint with no window geometry (#778: view
+		// swap on Linux). The working srSDK vulkan_weaving_linux example passes
+		// the real X11 window here, which is why it tracks. So on desktop-Linux
+		// pass the XCB window XID (populated for BOTH the self-created/hosted and
+		// the app-provided/handle window via c->xcb_handle above). macOS keeps
+		// NULL — its weave is the IOSurface shared-surface path, no window.
+		void *dp_window_handle = NULL;
+#ifdef XRT_OS_WINDOWS
+		dp_window_handle = c->hwnd;
+#elif defined(XRT_OS_LINUX_DESKTOP)
+		dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
+		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
+		        (unsigned long)c->xcb_handle.window);
+#endif
+		/*
+		 * #868: resolve the runtime-owned queue BEFORE the display processor
+		 * is created — the DP captures whichever queue it is shown here, once,
+		 * and never re-reads it.
+		 */
+		/*
+		 * Belt and braces: refuse a "runtime-owned" queue that is actually the
+		 * APP's. Defaulting these to 0 instead of -1 once made them name
+		 * family 0 / queue 0 under vulkan_enable1 — the app's own queue — and
+		 * the repaint lost the device submitting to it. An identity check costs
+		 * nothing and makes that unrepeatable.
+		 */
+		if (c->repaint_queue_family == (int32_t)queue_family_index &&
+		    c->repaint_queue_index == (int32_t)queue_index) {
+			U_LOG_W(
+			    "#868: refusing repaint queue (family %d index %d) — that is the APP's "
+			    "own queue, not a runtime-owned one",
+			    c->repaint_queue_family, c->repaint_queue_index);
+			c->repaint_queue_family = -1;
+			c->repaint_queue_index = -1;
+		}
+		if (c->repaint_queue_family >= 0 && c->repaint_queue_index >= 0) {
+			c->vk.vkGetDeviceQueue(c->vk.device, (uint32_t)c->repaint_queue_family,
+			                       (uint32_t)c->repaint_queue_index, &c->repaint_queue);
+		}
+
+		/*
+		 * #868: hand the display processor the RUNTIME-OWNED queue, not the
+		 * app's.
+		 *
+		 * The vendor DP reads vk->main_queue->queue ONCE, here at creation, and
+		 * the SR weaver captures it internally for its own submits — the
+		 * correction-texture upload, which vkQueueSubmit()s and waits from
+		 * inside weave(). weave() is called from the repaint thread too, so
+		 * with the app's queue captured, the SDK submits to the APP's queue off
+		 * the app's thread. A VkQueue is externally synchronised, so that is
+		 * undefined behaviour, and it is what validation reports as
+		 * "UNASSIGNED-Threading-MultipleThreads-Write". Confirmed by handle:
+		 * the queue named in the error is the app's, never the repaint one.
+		 *
+		 * The runtime's own submits already moved to the repaint queue, but
+		 * that never covered the SDK's internal ones. Since the capture happens
+		 * exactly once and reads this pointer, pointing it at the runtime queue
+		 * across the factory call moves every weaver-internal submit onto a
+		 * queue only the runtime touches, serialised by c->mutex.
+		 *
+		 * Safe: both queues live in the SAME family, so images need no
+		 * queue-family ownership transfer, and the weaver vkQueueWaitIdle()s
+		 * its own queue before returning, which CPU-orders those uploads ahead
+		 * of whichever queue we later submit the recorded weave on.
+		 *
+		 * The app frame keeps submitting on the APP's queue deliberately — that
+		 * is what orders the compositor's work after the app's own rendering
+		 * into the swapchain images it just released. Moving the app path to
+		 * the runtime queue would silently drop that ordering.
+		 *
+		 * Restored immediately; the repaint thread does not exist yet.
+		 */
+		VkQueue saved_main_queue = c->vk.main_queue->queue;
+		if (c->repaint_queue != VK_NULL_HANDLE) {
+			c->vk.main_queue->queue = c->repaint_queue;
+			U_LOG_W(
+			    "#868: creating the display processor against the runtime-owned queue %p "
+			    "(app queue %p stays the app frame's)",
+			    (void *)c->repaint_queue, (void *)saved_main_queue);
+		}
+		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
+		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
+		c->vk.main_queue->queue = saved_main_queue;
+		if (dp_ret != XRT_SUCCESS) {
+			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
+			c->display_processor = NULL;
+		} else {
+			U_LOG_W("VK display processor created via factory");
+		}
+	} else {
+		U_LOG_W("No VK display processor factory provided");
+	}
+
+	// Forward transparent_background to the display processor (#573 —
+	// chroma-key-free). Safe no-op if the DP lacks the slot (sim_display) or
+	// display_processor is NULL.
+	//
+	// client_presents=false — DELIBERATELY; #904's true was reverted after a
+	// hardware eyeball. The de-occlusion band (pixels where SOME but not all
+	// views are transparent — the parallax fringe around 3D content) cannot
+	// come from DWM live blending: the SR weaver destroys per-pixel alpha and
+	// the alpha-gate reconstructs only the binary all-views-transparent mask.
+	// The band is either the DP's compose-under-bg (~1-frame bake — the
+	// product spec: live desktop in the holes, bake only in the band) or it
+	// is BLACK. #904 disabled the compose calling it wasted work; the dwm
+	// saving partly bought black de-occlusions. WGC cost is attacked via
+	// capture throttling instead. client_presents=true remains correct for
+	// true client-side presents (#551 IPC) and bandless content.
+	if (c->display_processor != NULL) {
+		xrt_display_processor_vk_set_transparent_background(
+		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
+
+		// #613 / #68 — tell the DP whether the app self-presents only the canvas
+		// (shared-texture apps) vs the full target (handle apps). Gates the
+		// compose-under-bg desktop-UV remap skip for `_texture` zones frames so
+		// the captured desktop isn't magnified. Set once here; safe no-op if the
+		// DP lacks the slot (sim_display / older plug-in).
+		xrt_display_processor_vk_set_shared_texture_present(
+		    (struct xrt_display_processor_vk *)c->display_processor, c->has_shared_texture);
+	}
+
+	return XRT_SUCCESS;
+}
+
+
+/*!
+ * Create the session's VULKAN present target (VkSwapchainKHR) on the app device.
+ *
+ * Two callers, for the reason @ref vk_make_dp_vk has two: the session create and
+ * the #918 split's retire.
+ */
+static xrt_result_t
+vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transparent_background)
+{
+	// Create output target (VkSwapchainKHR) for presentation.
+	// The compositor owns the swapchain — the weaver (display processor)
+	// records interlacing commands into a caller-provided command buffer +
+	// framebuffer via setCommandBuffer / setOutputFrameBuffer. It does NOT
+	// create its own swapchain. The HWND passed to CreateVulkanWeaver is
+	// used only for monitor detection and draw-region calculation.
+	if (hwnd != NULL
+#ifdef XRT_OS_WINDOWS
+	    || c->owns_window
+#endif
+#ifdef XRT_OS_MACOS
+	    || c->owns_window
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	    || c->owns_window
+#endif
+	) {
+		xrt_result_t xret;
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+		if (c->direct_window != NULL) {
+			// Direct scanout: the backend already built the display-plane
+			// surface — hand it straight to the target (no hwnd).
+			xret = comp_vk_native_target_create_from_surface(
+			    c, comp_vk_native_window_direct_get_surface(c->direct_window), c->settings.preferred.width,
+			    c->settings.preferred.height, &c->target);
+		} else
+#endif
+		{
+			void *target_hwnd = hwnd;
+			bool target_is_wayland = false;
+#ifdef XRT_OS_WINDOWS
+			if (target_hwnd == NULL)
+				target_hwnd = c->hwnd;
+#endif
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (target_hwnd == NULL && c->xcb_window != NULL)
+				target_hwnd = &c->xcb_handle;
+#endif
+#ifdef XRT_HAVE_WAYLAND
+			if (c->use_wayland) {
+				target_hwnd = &c->wayland_handle;
+				target_is_wayland = true;
+			}
+#endif
+			xret = comp_vk_native_target_create(c, target_hwnd, target_is_wayland,
+			                                    c->settings.preferred.width, c->settings.preferred.height,
+			                                    transparent_background, &c->target);
+		}
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to create VK target");
+			return xret;
+		}
+		// Seed the display period measured above — the two detection blocks
+		// run before the target exists, so seeding there was dead code and
+		// left period_hint_ns at 0 (no #867 lookahead, and the #912 pacing
+		// governor gated itself off entirely: period 0 reads as "unknown").
+		if (c->display_refresh_rate > 0.0f) {
+			comp_vk_native_target_set_display_period(c->target,
+			                                         (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+		}
+	} else {
+		c->target = NULL;
+		U_LOG_I("No VK target — offscreen shared texture mode");
+	}
+
+	return XRT_SUCCESS;
+}
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #918 VK-1 (#1178) — give the scanout adapter back and move the weave home for
+ * the rest of the session.
+ *
+ * Two triggers, both routed here so there is ONE recovery and not two:
+ *   - Stage A2 could not wire the transport (cold: nothing has presented yet);
+ *   - a frame arrived carrying a layer this rung's transport cannot move
+ *     (`layers_unsupported`) — Local2D, a 2D-under backdrop, or a Tier-3
+ *     authored zone mask. VK-2 transports those and deletes this trigger.
+ *
+ * Order matters. The split's own teardown destroys the D3D11 weaver BEFORE its
+ * device and before the DXGI swapchain it was writing into, because the vendor
+ * bind key is (hwnd, device) — a weaver left alive here would make the Vulkan
+ * create below the SECOND weaver on this HWND and be refused silently. Only then
+ * is the Vulkan half rebuilt, on the app device, by exactly the functions the
+ * session create would have used.
+ *
+ * The caller must hold `c->mutex` (or be in create, before any other thread
+ * exists). Deliberately never takes it here: the layer_commit trigger already
+ * holds it.
+ *
+ * A failure to rebuild the Vulkan weaver is logged at ERROR, not WARN — a
+ * session that weaves nowhere must not have to be INFERRED from an absent line.
+ */
+static void
+vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, const char *short_reason)
+{
+	if (c->split == NULL) {
+		return;
+	}
+
+	comp_vk_split_retire(&c->split, why, short_reason);
+	c->split_off_reason = short_reason;
+
+	(void)vk_make_dp_vk(c, c->dp_factory_vk_saved, c->queue_family_index, c->queue_index_saved,
+	                    c->transparent_background_saved);
+	if (c->display_processor == NULL) {
+		U_LOG_E(
+		    "#918: no display processor on the app device either, after retiring the split — this "
+		    "session will not weave");
+	}
+	if (vk_make_target_vk(c, c->app_hwnd_saved, c->transparent_background_saved) != XRT_SUCCESS) {
+		U_LOG_E("#918: could not rebuild the VK target on the app device after retiring the split");
+	}
+}
+#endif
+
+
 /*
  *
  * Exported functions
@@ -4740,20 +5297,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	os_thread_helper_init(&c->repaint_thread);
 
 	// Initialize vk_bundle from the app's existing VkDevice
-	VkResult vk_ret = vk_init_from_given(
-	    &c->vk,
-	    vkGetInstanceProcAddr,
-	    (VkInstance)vk_instance,
-	    (VkPhysicalDevice)vk_physical_device,
-	    (VkDevice)vk_device,
-	    queue_family_index,
-	    queue_index,
-	    false,  // external_fence_fd_enabled
-	    false,  // external_semaphore_fd_enabled
-	    false,  // timeline_semaphore_enabled
-	    false,  // image_format_list_enabled
-	    false,  // debug_utils_enabled
-	    U_LOGGING_INFO);
+	VkResult vk_ret = vk_init_from_given(&c->vk, vkGetInstanceProcAddr, (VkInstance)vk_instance,
+	                                     (VkPhysicalDevice)vk_physical_device, (VkDevice)vk_device,
+	                                     queue_family_index, queue_index,
+	                                     false, // external_fence_fd_enabled
+	                                     false, // external_semaphore_fd_enabled
+	                                     false, // timeline_semaphore_enabled
+	                                     false, // image_format_list_enabled
+	                                     false, // debug_utils_enabled
+	                                     U_LOGGING_INFO);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to initialize vk_bundle from app device: %d", vk_ret);
 		free(c);
@@ -4762,44 +5314,33 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 #ifdef XRT_OS_WINDOWS
 	/*
-	 * #918 Phase 3 / ADR-037 §3 — THE VULKAN ANSWER, STATED.
+	 * #918 VK-1 (#1178) — the render adapter's LUID, resolved once.
 	 *
-	 * There is no output-device split for in-process Vulkan (ADR-037 open
-	 * question 3: pending a decision, not just work — whole-app placement on the
-	 * scanout adapter measured well enough that a VK bridge may never be worth
-	 * building). So this path takes rung 2 unconditionally: everything on the
-	 * render adapter, the OS carries the cross-adapter present.
-	 *
-	 * Rung 2 is a legitimate outcome; being SILENT about it is not, and until
-	 * Phase 3 this path was. A hybrid box paying the cross-adapter present
-	 * produced a Vulkan log byte-identical to a single-adapter box that pays
-	 * nothing. It now emits the same one line the D3D paths do, with
-	 * `reason=api_unsupported` — which is an honest NO, not a guess: the split
-	 * is not implemented here, so the answer cannot be anything else.
-	 *
-	 * There is no half-engaged state to reach: nothing below this line consults
-	 * a scanout adapter, allocates a bridge, or creates a second device.
+	 * Feeds two things: the output-device split's gate (is the panel scanned
+	 * out by a DIFFERENT adapter than the one this VkDevice lives on?) and the
+	 * canonical `weave placement:` line further down, which is emitted whatever
+	 * the answer turns out to be.
 	 */
-	{
-		uint64_t render_packed_luid = 0;
-		if (c->vk.vkGetPhysicalDeviceProperties2 != NULL) {
-			VkPhysicalDeviceIDProperties pdidp = {
-			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
-			};
-			VkPhysicalDeviceProperties2 pdp2 = {
-			    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-			    .pNext = &pdidp,
-			};
-			c->vk.vkGetPhysicalDeviceProperties2(c->vk.physical_device, &pdp2);
-			if (pdidp.deviceLUIDValid == VK_TRUE) {
-				memcpy(&render_packed_luid, pdidp.deviceLUID, sizeof(render_packed_luid));
-			}
+	if (c->vk.vkGetPhysicalDeviceProperties2 != NULL) {
+		VkPhysicalDeviceIDProperties pdidp = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+		};
+		VkPhysicalDeviceProperties2 pdp2 = {
+		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		    .pNext = &pdidp,
+		};
+		c->vk.vkGetPhysicalDeviceProperties2(c->vk.physical_device, &pdp2);
+		if (pdidp.deviceLUIDValid == VK_TRUE) {
+			memcpy(&c->render_packed_luid, pdidp.deviceLUID, sizeof(c->render_packed_luid));
 		}
-		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
-		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
-		d3d_log_weave_placement(render_packed_luid, display_screen_left, display_screen_top, pw, ph,
-		                        /* split_active */ false, COMP_SPLIT_REASON_API_UNSUPPORTED);
 	}
+	/*
+	 * Until VK-1 this path took ADR-037 §3 rung 2 unconditionally and said so
+	 * with `reason=api_unsupported` — an honest NO while no Vulkan split
+	 * existed. One does now, so the answer is no longer a constant and the
+	 * placement line moved below Stage A, where the real one is known.
+	 */
+	c->split_off_reason = COMP_SPLIT_REASON_API_UNSUPPORTED;
 #endif
 
 #ifdef XRT_OS_MACOS
@@ -5019,6 +5560,69 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+#ifdef XRT_OS_WINDOWS
+	/*
+	 * #918 VK-1 (#1178) — STAGE A1 of the output-device split.
+	 *
+	 * Here, and not at the D3D legs' position, because of a Vulkan-specific
+	 * ordering fact: this compositor's display processor and target are created
+	 * far below, and the display processor takes the HWND. The decision has to
+	 * be made before that, or the session ends up with a Vulkan weaver bound to
+	 * a window the split would then have to evict — and one weaver per HWND is
+	 * a hard rule, not a preference.
+	 *
+	 * So A1 decides and takes the HWND (out device, the plug-in's D3D11 weaver
+	 * per ADR-037 §3a, the scanout-adapter swapchain); A2, once the renderer's
+	 * deposit exists, wires the transport. Everything here is best-effort: on
+	 * ANY failure the reason is logged once and the session runs the stock
+	 * single-device Vulkan path it always did.
+	 */
+	{
+		struct comp_vk_split_info si = {
+		    .xdev = xdev,
+		    .hwnd = c->hwnd,
+		    .dp_factory_d3d11 = dp_factory_d3d11,
+		    .has_shared_texture = c->has_shared_texture,
+		    .transparent_background = transparent_background,
+		    .app_timeline_semaphores = app_timeline_semaphores,
+		    .render_packed_luid = c->render_packed_luid,
+		    .display_screen_left = display_screen_left,
+		    .display_screen_top = display_screen_top,
+		    .preferred_width = c->settings.preferred.width,
+		    .preferred_height = c->settings.preferred.height,
+		};
+		comp_vk_split_stage_a(&si, &c->split, &c->split_off_reason);
+	}
+	/*
+	 * What a RETIRE needs to rebuild the Vulkan half this session may never
+	 * create. Saved unconditionally: a retire can fire on any frame, from a
+	 * call site that has none of `comp_vk_native_compositor_create`'s locals.
+	 */
+	c->dp_factory_vk_saved = dp_factory_vk;
+	c->transparent_background_saved = transparent_background;
+	c->queue_index_saved = queue_index;
+	c->app_hwnd_saved = hwnd;
+
+	/*
+	 * #918 — ONE canonical weave-placement line per session, ALWAYS emitted,
+	 * in addition to (never instead of) Stage A's own detail lines.
+	 *
+	 * Without it a hybrid box paying a cross-adapter present produced a Vulkan
+	 * log byte-identical to a single-adapter box that pays nothing. The
+	 * formatting lives in aux_d3d so this line is one string across all five
+	 * compositors. Costs one QueryDisplayConfig per session.
+	 *
+	 * A later RETIRE emits its own `weave placement: CHANGED …` correction, so
+	 * the LAST such line in a log is always the truth.
+	 */
+	{
+		const uint32_t pw = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].w_pixels : 0;
+		const uint32_t ph = (xdev != NULL && xdev->hmd != NULL) ? xdev->hmd->screens[0].h_pixels : 0;
+		d3d_log_weave_placement(c->render_packed_luid, display_screen_left, display_screen_top, pw, ph,
+		                        c->split != NULL, c->split_off_reason);
+	}
+#endif
+
 #ifdef XRT_OS_MACOS
 	if (c->macos_window != NULL) {
 		uint32_t mac_w = 0, mac_h = 0;
@@ -5109,217 +5713,46 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 
 
-	// Create display processor via factory FIRST — the SR weaver creates
-	// its own VkSwapchain on the HWND, so we must not also create one.
-	if (dp_factory_vk != NULL) {
-		xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)dp_factory_vk;
-
-		// Create command pool for display processor (SR weaver needs it)
-		VkCommandPoolCreateInfo pool_ci = {
-		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-		    .queueFamilyIndex = c->queue_family_index,
-		};
-		VkResult pool_ret = c->vk.vkCreateCommandPool(
-		    c->vk.device, &pool_ci, NULL, &c->cmd_pool);
-		if (pool_ret != VK_SUCCESS) {
-			U_LOG_E("Failed to create command pool for display processor: %d", pool_ret);
-			vk_compositor_destroy(&c->base.base);
-			return XRT_ERROR_VULKAN;
-		}
-
-		// Window handed to the DP → the SR weaver. It is NOT for swapchain
-		// creation (the Linux/Vulkan weaver makes none — it renders into our
-		// framebuffer); it is the weaver's window-GEOMETRY input for
-		// getDrawRegions() — the per-view interlacing draw-regions AND the
-		// window-anchored eye-tracked steering. Passing NULL selects the srSDK's
-		// windowless/display-scoped path (constructedWithoutWindow=true), which
-		// weaves for the DEFAULT viewpoint with no window geometry (#778: view
-		// swap on Linux). The working srSDK vulkan_weaving_linux example passes
-		// the real X11 window here, which is why it tracks. So on desktop-Linux
-		// pass the XCB window XID (populated for BOTH the self-created/hosted and
-		// the app-provided/handle window via c->xcb_handle above). macOS keeps
-		// NULL — its weave is the IOSurface shared-surface path, no window.
-		void *dp_window_handle = NULL;
+	/*
+	 * Create display processor via factory FIRST — the SR weaver creates its
+	 * own VkSwapchain on the HWND, so we must not also create one.
+	 * See vk_make_dp_vk.
+	 *
+	 * #918 VK-1: skipped entirely when Stage A1 activated the split. The
+	 * session's weaver is then the D3D11 one the plug-in already handed us on
+	 * the scanout adapter, and creating a SECOND weaver on this HWND would be
+	 * refused — silently — by the vendor SDK's (hwnd, device) bind key.
+	 */
 #ifdef XRT_OS_WINDOWS
-		dp_window_handle = c->hwnd;
-#elif defined(XRT_OS_LINUX_DESKTOP)
-		dp_window_handle = (void *)(uintptr_t)c->xcb_handle.window;
-		U_LOG_W("VK DP factory: passing X11 window XID 0x%lx to the weaver (0 = windowless/display-scoped)",
-		        (unsigned long)c->xcb_handle.window);
+	if (c->split == NULL)
 #endif
-		/*
-		 * #868: resolve the runtime-owned queue BEFORE the display processor
-		 * is created — the DP captures whichever queue it is shown here, once,
-		 * and never re-reads it.
-		 */
-		/*
-		 * Belt and braces: refuse a "runtime-owned" queue that is actually the
-		 * APP's. Defaulting these to 0 instead of -1 once made them name
-		 * family 0 / queue 0 under vulkan_enable1 — the app's own queue — and
-		 * the repaint lost the device submitting to it. An identity check costs
-		 * nothing and makes that unrepeatable.
-		 */
-		if (c->repaint_queue_family == (int32_t)queue_family_index &&
-		    c->repaint_queue_index == (int32_t)queue_index) {
-			U_LOG_W("#868: refusing repaint queue (family %d index %d) — that is the APP's "
-			        "own queue, not a runtime-owned one",
-			        c->repaint_queue_family, c->repaint_queue_index);
-			c->repaint_queue_family = -1;
-			c->repaint_queue_index = -1;
+	{
+		xrt_result_t dp_ret2 =
+		    vk_make_dp_vk(c, dp_factory_vk, queue_family_index, queue_index, transparent_background);
+		if (dp_ret2 != XRT_SUCCESS) {
+			vk_compositor_destroy(&c->base.base);
+			return dp_ret2;
 		}
-		if (c->repaint_queue_family >= 0 && c->repaint_queue_index >= 0) {
-			c->vk.vkGetDeviceQueue(c->vk.device, (uint32_t)c->repaint_queue_family,
-			                       (uint32_t)c->repaint_queue_index, &c->repaint_queue);
-		}
-
-		/*
-		 * #868: hand the display processor the RUNTIME-OWNED queue, not the
-		 * app's.
-		 *
-		 * The vendor DP reads vk->main_queue->queue ONCE, here at creation, and
-		 * the SR weaver captures it internally for its own submits — the
-		 * correction-texture upload, which vkQueueSubmit()s and waits from
-		 * inside weave(). weave() is called from the repaint thread too, so
-		 * with the app's queue captured, the SDK submits to the APP's queue off
-		 * the app's thread. A VkQueue is externally synchronised, so that is
-		 * undefined behaviour, and it is what validation reports as
-		 * "UNASSIGNED-Threading-MultipleThreads-Write". Confirmed by handle:
-		 * the queue named in the error is the app's, never the repaint one.
-		 *
-		 * The runtime's own submits already moved to the repaint queue, but
-		 * that never covered the SDK's internal ones. Since the capture happens
-		 * exactly once and reads this pointer, pointing it at the runtime queue
-		 * across the factory call moves every weaver-internal submit onto a
-		 * queue only the runtime touches, serialised by c->mutex.
-		 *
-		 * Safe: both queues live in the SAME family, so images need no
-		 * queue-family ownership transfer, and the weaver vkQueueWaitIdle()s
-		 * its own queue before returning, which CPU-orders those uploads ahead
-		 * of whichever queue we later submit the recorded weave on.
-		 *
-		 * The app frame keeps submitting on the APP's queue deliberately — that
-		 * is what orders the compositor's work after the app's own rendering
-		 * into the swapchain images it just released. Moving the app path to
-		 * the runtime queue would silently drop that ordering.
-		 *
-		 * Restored immediately; the repaint thread does not exist yet.
-		 */
-		VkQueue saved_main_queue = c->vk.main_queue->queue;
-		if (c->repaint_queue != VK_NULL_HANDLE) {
-			c->vk.main_queue->queue = c->repaint_queue;
-			U_LOG_W("#868: creating the display processor against the runtime-owned queue %p "
-			        "(app queue %p stays the app frame's)",
-			        (void *)c->repaint_queue, (void *)saved_main_queue);
-		}
-		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
-		                               dp_window_handle,
-		                               (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
-		                               &c->display_processor);
-		c->vk.main_queue->queue = saved_main_queue;
-		if (dp_ret != XRT_SUCCESS) {
-			U_LOG_W("VK display processor factory failed (error %d), continuing without",
-			        (int)dp_ret);
-			c->display_processor = NULL;
-		} else {
-			U_LOG_W("VK display processor created via factory");
-		}
-	} else {
-		U_LOG_W("No VK display processor factory provided");
 	}
 
-	// Forward transparent_background to the display processor (#573 —
-	// chroma-key-free). Safe no-op if the DP lacks the slot (sim_display) or
-	// display_processor is NULL.
-	//
-	// client_presents=false — DELIBERATELY; #904's true was reverted after a
-	// hardware eyeball. The de-occlusion band (pixels where SOME but not all
-	// views are transparent — the parallax fringe around 3D content) cannot
-	// come from DWM live blending: the SR weaver destroys per-pixel alpha and
-	// the alpha-gate reconstructs only the binary all-views-transparent mask.
-	// The band is either the DP's compose-under-bg (~1-frame bake — the
-	// product spec: live desktop in the holes, bake only in the band) or it
-	// is BLACK. #904 disabled the compose calling it wasted work; the dwm
-	// saving partly bought black de-occlusions. WGC cost is attacked via
-	// capture throttling instead. client_presents=true remains correct for
-	// true client-side presents (#551 IPC) and bandless content.
-	if (c->display_processor != NULL) {
-		xrt_display_processor_vk_set_transparent_background(
-		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background,
-		    false);
-
-		// #613 / #68 — tell the DP whether the app self-presents only the canvas
-		// (shared-texture apps) vs the full target (handle apps). Gates the
-		// compose-under-bg desktop-UV remap skip for `_texture` zones frames so
-		// the captured desktop isn't magnified. Set once here; safe no-op if the
-		// DP lacks the slot (sim_display / older plug-in).
-		xrt_display_processor_vk_set_shared_texture_present(
-		    (struct xrt_display_processor_vk *)c->display_processor, c->has_shared_texture);
-	}
-
-	// Create output target (VkSwapchainKHR) for presentation.
-	// The compositor owns the swapchain — the weaver (display processor)
-	// records interlacing commands into a caller-provided command buffer +
-	// framebuffer via setCommandBuffer / setOutputFrameBuffer. It does NOT
-	// create its own swapchain. The HWND passed to CreateVulkanWeaver is
-	// used only for monitor detection and draw-region calculation.
-	if (hwnd != NULL
+	/*
+	 * Create output target (VkSwapchainKHR) for presentation. See
+	 * vk_make_target_vk.
+	 *
+	 * #918 VK-1: skipped under the split — the present lives on the scanout
+	 * adapter now, in a DXGI swapchain Stage A1 already created on this same
+	 * HWND. Two swapchains of different flavours on one window is not a
+	 * thing to have.
+	 */
 #ifdef XRT_OS_WINDOWS
-	    || c->owns_window
+	if (c->split == NULL)
 #endif
-#ifdef XRT_OS_MACOS
-	    || c->owns_window
-#endif
-#ifdef XRT_OS_LINUX_DESKTOP
-	    || c->owns_window
-#endif
-	) {
-		xrt_result_t xret;
-#ifdef DXR_HAVE_DIRECT_SCANOUT
-		if (c->direct_window != NULL) {
-			// Direct scanout: the backend already built the display-plane
-			// surface — hand it straight to the target (no hwnd).
-			xret = comp_vk_native_target_create_from_surface(
-			    c, comp_vk_native_window_direct_get_surface(c->direct_window),
-			    c->settings.preferred.width, c->settings.preferred.height, &c->target);
-		} else
-#endif
-		{
-			void *target_hwnd = hwnd;
-			bool target_is_wayland = false;
-#ifdef XRT_OS_WINDOWS
-			if (target_hwnd == NULL) target_hwnd = c->hwnd;
-#endif
-#ifdef XRT_OS_LINUX_DESKTOP
-			if (target_hwnd == NULL && c->xcb_window != NULL) target_hwnd = &c->xcb_handle;
-#endif
-#ifdef XRT_HAVE_WAYLAND
-			if (c->use_wayland) {
-				target_hwnd = &c->wayland_handle;
-				target_is_wayland = true;
-			}
-#endif
-			xret = comp_vk_native_target_create(c, target_hwnd, target_is_wayland,
-			                                    c->settings.preferred.width,
-			                                    c->settings.preferred.height,
-			                                    transparent_background, &c->target);
-		}
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to create VK target");
+	{
+		xrt_result_t tgt_ret = vk_make_target_vk(c, hwnd, transparent_background);
+		if (tgt_ret != XRT_SUCCESS) {
 			vk_compositor_destroy(&c->base.base);
-			return xret;
+			return tgt_ret;
 		}
-		// Seed the display period measured above — the two detection blocks
-		// run before the target exists, so seeding there was dead code and
-		// left period_hint_ns at 0 (no #867 lookahead, and the #912 pacing
-		// governor gated itself off entirely: period 0 reads as "unknown").
-		if (c->display_refresh_rate > 0.0f) {
-			comp_vk_native_target_set_display_period(
-			    c->target, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
-		}
-	} else {
-		c->target = NULL;
-		U_LOG_I("No VK target — offscreen shared texture mode");
 	}
 
 	/*
@@ -5462,7 +5895,18 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "
 			        "of app rate. Correctness probe; it WILL cost frame rate.");
 		}
-		if (c->repaint.enabled == 1 && c->target != NULL) {
+		/*
+		 * #918 VK-1: under the split there IS no VkSwapchain target — the
+		 * present is a DXGI one on the scanout adapter — so gating the loop on
+		 * c->target would silently disable the repaint tick for exactly the
+		 * topology it buys the most on. The split's own arm inside the thread
+		 * needs no Vulkan target at all.
+		 */
+		bool have_present_target = (c->target != NULL);
+#ifdef XRT_OS_WINDOWS
+		have_present_target = have_present_target || (c->split != NULL);
+#endif
+		if (c->repaint.enabled == 1 && have_present_target) {
 			// Seed the quiet-gate key so the first force-probe counter row
 			// doesn't log a garbage quiet_ns (now − 0) before the first app
 			// frame publishes (#902 Windows validation, cosmetic).
@@ -5499,10 +5943,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	if (c->display_processor != NULL) {
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h,
-		        &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
+		if (vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top) && disp_px_w > 0 &&
+		    disp_px_h > 0) {
 			uint32_t base_vw = disp_px_w / 2;
 			uint32_t base_vh = disp_px_h;
 
@@ -5532,14 +5974,52 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	uint32_t atlas_height = tile_rows * view_height;
 
 	// Create renderer with active mode atlas
-	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height,
-	                                                     atlas_width, atlas_height,
-	                                                     c->app_timeline_semaphores, &c->renderer);
+	/*
+	 * #918 VK-1: an active split has already taken the HWND and has nothing to
+	 * bridge without the deposit, so it REQUIRES one whether or not
+	 * DXR_VK_DEPOSIT asked. A deposit that then fails to create leaves the
+	 * split with no app end, and Stage A2 below retires it cold.
+	 */
+	bool deposit_required = false;
+#ifdef XRT_OS_WINDOWS
+	deposit_required = (c->split != NULL);
+#endif
+	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height, atlas_width, atlas_height,
+	                                                   c->app_timeline_semaphores, deposit_required, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);
 		return xret;
 	}
+
+	/*
+	 * #918 VK-1 (#1178) — STAGE A2: wire the bridge between the deposit and the
+	 * scanout adapter.
+	 *
+	 * Split from A1 only because the deposit is the RENDERER's and the renderer
+	 * could not be created before the display processor. Failing here is not a
+	 * weaker guarantee than the D3D legs': nothing has been submitted and
+	 * nothing has been presented, so the retire below restores exactly the state
+	 * A1 skipped, through the one recovery path a mid-session retire also uses.
+	 */
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		struct comp_vk_deposit_handoff handoff = {0};
+		bool ok = comp_vk_deposit_get_handoff(comp_vk_native_renderer_get_deposit(c->renderer), &handoff) &&
+		          comp_vk_split_wire_bridge(c->split, &handoff);
+		if (!ok) {
+			vk_split_retire_locked(c,
+			                       "the cross-adapter transport could not be wired to the "
+			                       "VK-0 deposit",
+			                       COMP_SPLIT_REASON_STAGE_A_FAILED);
+			if (c->target == NULL && c->hwnd != NULL) {
+				U_LOG_E("Failed to rebuild the VK target after a cold split retire");
+				vk_compositor_destroy(&c->base.base);
+				return XRT_ERROR_VULKAN;
+			}
+		}
+	}
+#endif
 
 	// Clear the atlas transparent (alpha=0) instead of opaque black when a
 	// transparent background was requested, so app alpha<1 regions survive
@@ -5655,11 +6135,8 @@ comp_vk_native_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
-	if (c->display_processor != NULL) {
-		if (xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
-		    out_eye_pos->valid) {
-			return true;
-		}
+	if (vk_dp_predicted_eyes(c, out_eye_pos) && out_eye_pos->valid) {
+		return true;
 	}
 
 	return false;
@@ -5672,11 +6149,8 @@ comp_vk_native_compositor_get_display_dimensions(struct xrt_compositor *xc,
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
-	if (c->display_processor != NULL) {
-		if (xrt_display_processor_get_display_dimensions(
-		        c->display_processor, out_width_m, out_height_m)) {
-			return true;
-		}
+	if (vk_dp_display_dimensions(c, out_width_m, out_height_m)) {
+		return true;
 	}
 
 	// Fallback to system compositor info (sim_display DP doesn't implement get_display_dimensions)
@@ -5704,22 +6178,23 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	memset(out_metrics, 0, sizeof(*out_metrics));
 
 #ifdef XRT_OS_WINDOWS
-	if (c->display_processor == NULL || c->hwnd == NULL) {
+	// #918 VK-1: under the split the weaver is the D3D11 one on the scanout
+	// adapter, so `display_processor` is legitimately NULL. Gating on it here
+	// would drop windowed weaving back to a display-scoped Kooima (#396 W7)
+	// for exactly the sessions the split is meant to improve.
+	if (!vk_dp_has_any(c) || c->hwnd == NULL) {
 		return false;
 	}
 
 	uint32_t disp_px_w = 0, disp_px_h = 0;
 	int32_t disp_left = 0, disp_top = 0;
-	if (!xrt_display_processor_get_display_pixel_info(
-	        c->display_processor, &disp_px_w, &disp_px_h,
-	        &disp_left, &disp_top)) {
+	if (!vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top)) {
 		return false;
 	}
 	if (disp_px_w == 0 || disp_px_h == 0) return false;
 
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!xrt_display_processor_get_display_dimensions(
-	        c->display_processor, &disp_w_m, &disp_h_m)) {
+	if (!vk_dp_display_dimensions(c, &disp_w_m, &disp_h_m)) {
 		return false;
 	}
 
@@ -5776,14 +6251,9 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	int32_t disp_left = 0, disp_top = 0;
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
 	bool have_disp = false;
-	if (c->display_processor != NULL &&
-	    xrt_display_processor_get_display_pixel_info(
-	        c->display_processor, &disp_px_w, &disp_px_h,
-	        &disp_left, &disp_top) &&
-	    disp_px_w > 0 && disp_px_h > 0 &&
-	    xrt_display_processor_get_display_dimensions(
-	        c->display_processor, &disp_w_m, &disp_h_m) &&
-	    disp_w_m > 0.0f && disp_h_m > 0.0f) {
+	if (vk_dp_has_any(c) && vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
+	    disp_px_w > 0 && disp_px_h > 0 && vk_dp_display_dimensions(c, &disp_w_m, &disp_h_m) && disp_w_m > 0.0f &&
+	    disp_h_m > 0.0f) {
 		have_disp = true;
 	}
 	if (!have_disp && c->sys_info_set &&
@@ -5872,14 +6342,9 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	int32_t disp_left = 0, disp_top = 0;
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
 	bool have_disp = false;
-	if (c->display_processor != NULL &&
-	    xrt_display_processor_get_display_pixel_info(
-	        c->display_processor, &disp_px_w, &disp_px_h,
-	        &disp_left, &disp_top) &&
-	    disp_px_w > 0 && disp_px_h > 0 &&
-	    xrt_display_processor_get_display_dimensions(
-	        c->display_processor, &disp_w_m, &disp_h_m) &&
-	    disp_w_m > 0.0f && disp_h_m > 0.0f) {
+	if (vk_dp_has_any(c) && vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
+	    disp_px_w > 0 && disp_px_h > 0 && vk_dp_display_dimensions(c, &disp_w_m, &disp_h_m) && disp_w_m > 0.0f &&
+	    disp_h_m > 0.0f) {
 		have_disp = true;
 	}
 	if (!have_disp && c->sys_info_set &&
@@ -6156,6 +6621,12 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	if (c->display_processor != NULL) {
 		return xrt_display_processor_request_display_mode(c->display_processor, enable_3d);
 	}
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: the split's D3D11 weaver owns the panel's 2D/3D state.
+	if (c->split != NULL) {
+		return comp_vk_split_request_display_mode(c->split, enable_3d);
+	}
+#endif
 	return false;
 }
 
@@ -6168,6 +6639,13 @@ comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint3
 	if (c->display_processor != NULL) {
 		xrt_display_processor_set_eye_tracking_mode(c->display_processor, mode);
 	}
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: under the split the weaver is the D3D11 one on the scanout
+	// adapter, and it owns the vendor's eye-tracking mode for this session.
+	if (c->split != NULL) {
+		comp_vk_split_set_eye_tracking_mode(c->split, mode);
+	}
+#endif
 }
 
 void

@@ -988,16 +988,6 @@ comp_vk_split_get_display_pixel_info(
 }
 
 extern "C" bool
-comp_vk_split_get_window_metrics(
-    struct comp_vk_split *s, int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h)
-{
-	if (s == nullptr || s->dp == nullptr) {
-		return false;
-	}
-	return xrt_display_processor_d3d11_get_window_metrics(s->dp, out_x, out_y, out_w, out_h);
-}
-
-extern "C" bool
 comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 {
 	if (s == nullptr || s->dp == nullptr) {
@@ -1123,18 +1113,6 @@ comp_vk_split_get_display_pixel_info(struct comp_vk_split *split,
 	(void)out_height_px;
 	(void)out_left;
 	(void)out_top;
-	return false;
-}
-
-extern "C" bool
-comp_vk_split_get_window_metrics(
-    struct comp_vk_split *split, int32_t *out_x, int32_t *out_y, uint32_t *out_w, uint32_t *out_h)
-{
-	(void)split;
-	(void)out_x;
-	(void)out_y;
-	(void)out_w;
-	(void)out_h;
 	return false;
 }
 
