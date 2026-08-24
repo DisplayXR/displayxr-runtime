@@ -511,8 +511,16 @@ struct comp_vk_native_compositor
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
 	//! Cached framebuffer for atlas window-space pass (one per atlas view).
+	/*!
+	 * Framebuffer for the window-space-into-atlas pass, keyed by the atlas
+	 * view it wraps. Sized to the VK-0 deposit ring (#1178): with the
+	 * renderer's own atlas exactly one entry is ever used, but under the
+	 * deposit the atlas view alternates every frame, and a single slot would
+	 * mean a destroy+create per frame on the render path.
+	 */
 	VkFramebuffer atlas_ws_fb;
-	VkImageView atlas_ws_fb_view;
+	VkFramebuffer atlas_ws_fb_ring[COMP_VK_DEPOSIT_RING];
+	VkImageView atlas_ws_fb_ring_view[COMP_VK_DEPOSIT_RING];
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
 	//! Mirrors the pattern in comp_metal/gl/d3d11_compositor. See issue #210.
@@ -1733,10 +1741,31 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		return;
 	}
 
-	if (c->atlas_ws_fb == VK_NULL_HANDLE || c->atlas_ws_fb_view != atlas_view) {
-		if (c->atlas_ws_fb != VK_NULL_HANDLE) {
-			vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb, NULL);
-			c->atlas_ws_fb = VK_NULL_HANDLE;
+	c->atlas_ws_fb = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (c->atlas_ws_fb_ring[i] != VK_NULL_HANDLE && c->atlas_ws_fb_ring_view[i] == atlas_view) {
+			c->atlas_ws_fb = c->atlas_ws_fb_ring[i];
+			break;
+		}
+	}
+	if (c->atlas_ws_fb == VK_NULL_HANDLE) {
+		uint32_t slot = 0;
+		bool found_free = false;
+		for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+			if (c->atlas_ws_fb_ring[i] == VK_NULL_HANDLE) {
+				slot = i;
+				found_free = true;
+				break;
+			}
+		}
+		if (!found_free) {
+			// Atlas resize: the old views are gone, so evict. Safe here
+			// only because the previous frame's submit is already waited
+			// on before this recording begins.
+			vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb_ring[0], NULL);
+			c->atlas_ws_fb_ring[0] = VK_NULL_HANDLE;
+			c->atlas_ws_fb_ring_view[0] = VK_NULL_HANDLE;
+			slot = 0;
 		}
 		VkFramebufferCreateInfo fb_ci = {
 		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
@@ -1747,14 +1776,16 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		    .height = atlas_h,
 		    .layers = 1,
 		};
-		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->atlas_ws_fb) != VK_SUCCESS) {
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->atlas_ws_fb_ring[slot]) != VK_SUCCESS) {
 			U_LOG_E("[VK native] atlas framebuffer creation failed (%ux%u); "
 			        "window-space layers will be skipped",
 			        atlas_w, atlas_h);
+			c->atlas_ws_fb_ring[slot] = VK_NULL_HANDLE;
 			c->atlas_ws_fb = VK_NULL_HANDLE;
 			return;
 		}
-		c->atlas_ws_fb_view = atlas_view;
+		c->atlas_ws_fb_ring_view[slot] = atlas_view;
+		c->atlas_ws_fb = c->atlas_ws_fb_ring[slot];
 	}
 
 	// Atlas: SHADER_READ_ONLY_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL.
@@ -4462,10 +4493,14 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	u_hud_destroy(&c->hud);
 
 	// Destroy window-space (HUD) alpha-blend pipeline + cached atlas FB
-	if (c->atlas_ws_fb != VK_NULL_HANDLE) {
-		vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb, NULL);
-		c->atlas_ws_fb = VK_NULL_HANDLE;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (c->atlas_ws_fb_ring[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb_ring[i], NULL);
+			c->atlas_ws_fb_ring[i] = VK_NULL_HANDLE;
+		}
+		c->atlas_ws_fb_ring_view[i] = VK_NULL_HANDLE;
 	}
+	c->atlas_ws_fb = VK_NULL_HANDLE;
 	vk_hud_blend_fini(&c->window_space_blend, vk);
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
