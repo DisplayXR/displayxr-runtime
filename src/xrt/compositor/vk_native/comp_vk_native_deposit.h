@@ -254,6 +254,144 @@ bool
 comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out);
 
 /*!
+ * @name VK-1b (#1178) — the PLANE deposits.
+ *
+ * ## Why these exist at all, and why only the Vulkan leg needs them
+ *
+ * The masked composite needs three more app-device images on the scanout
+ * adapter beside the atlas: the Local2D over-flatten, the 2D-under backdrop and
+ * a Tier-3 authored mask (`COMP_XBRIDGE_PLANE_*`). @ref comp_xbridge transports
+ * all three already — but its D3D11-ends flavour binds a plane by NT handle to an
+ * `ID3D11Texture2D`, and the D3D12-ends flavour binds an `ID3D12Resource` by
+ * pointer. **Both flavours assume the compositor's flatten scratch already IS a
+ * D3D resource.** For the two D3D legs it is, for free. For Vulkan it is a plain
+ * `VkImage` and there is nothing to bind.
+ *
+ * That asymmetry is the whole reason VK-1b is a rung of its own rather than a
+ * transcription of the D3D12 leg's D12-4: VK-1a needed no transport change only
+ * because VK-0 had *already* made the atlas a D3D11 texture. The planes have no
+ * VK-0. So this is VK-0 again, three more times — same recipe (NT-shared
+ * `SHARED | SHARED_NTHANDLE` D3D11 texture, imported as a **renderable**
+ * `VkImage`), same zero copies, same fence.
+ *
+ * ## Not a ring, and why that is safe
+ *
+ * The atlas deposit is a ring because the atlas is rewritten every frame while a
+ * consumer may still be reading the previous one. A plane is single-buffered,
+ * exactly as the D3D11 leg's `local2d_scratch` / `backdrop_scratch` are — the
+ * back-pressure is a fence edge, not a spare texture. See
+ * @ref comp_vk_deposit_note_planes_consumed for the edge and why the app
+ * immediate context is the only place it can be taken.
+ *
+ * ## Sized ONCE at the panel (the two 2D planes)
+ *
+ * `comp_xbridge_info::panel_width/height` documents the rule and the reason: a
+ * window can never exceed the panel, so a panel-sized plane fits every region the
+ * session will ever composite, and allocating once puts the planes structurally
+ * outside the R2 resize hysteresis. The composite writes only the region's
+ * top-left sub-rect (#464). The authored MASK is the documented exception and is
+ * sized at the mask.
+ * @{
+ */
+//! Local2D OVER flatten (RGBA). Mirrors `COMP_XBRIDGE_PLANE_LOCAL2D`.
+#define COMP_VK_DEPOSIT_PLANE_LOCAL2D 0u
+//! 2D-under backdrop flatten (RGBA). Mirrors `COMP_XBRIDGE_PLANE_BACKDROP`.
+#define COMP_VK_DEPOSIT_PLANE_BACKDROP 1u
+//! Tier-3 app-authored zone mask (R8). Mirrors `COMP_XBRIDGE_PLANE_MASK`.
+#define COMP_VK_DEPOSIT_PLANE_MASK 2u
+#define COMP_VK_DEPOSIT_PLANE_COUNT 3u
+
+/*!
+ * One plane surface, as both halves see it: Vulkan renders into @ref image, the
+ * bridge opens @ref shared_handle. Pointers are BORROWED and live as long as the
+ * deposit does.
+ */
+struct comp_vk_deposit_plane
+{
+	void *texture;       //!< `ID3D11Texture2D *` — what the bridge's producer opens.
+	void *shared_handle; //!< `HANDLE` for `comp_xbridge_bind_plane`.
+	uint64_t image;      //!< `VkImage` the flatten renders into.
+	uint64_t view;       //!< `VkImageView` over @ref image.
+	uint32_t width;      //!< Allocated extent — the PANEL for the 2D planes.
+	uint32_t height;
+	/*!
+	 * Bumped on every REALLOCATION, never on a content change. This is what
+	 * `comp_xbridge_bind_plane`'s @p generation wants: a change re-opens the
+	 * handle (and drains the producer first), so bumping it per frame would
+	 * re-transport the whole plane every frame.
+	 */
+	uint64_t generation;
+};
+
+/*!
+ * Allocate (or keep) @p plane at @p width x @p height @p format.
+ *
+ * A no-op returning true when the plane already matches. A reallocation frees the
+ * old surface and bumps @ref comp_vk_deposit_plane::generation, so it must not be
+ * called at a size that changes per frame — the 2D planes pass the PANEL for
+ * exactly that reason.
+ *
+ * @return false when the plane could not be allocated. That degrades THAT
+ *         FEATURE and nothing else: the caller stops staging the plane, the
+ *         recipe stamps it invalid, and the 3D weave is untouched.
+ */
+bool
+comp_vk_deposit_plane_ensure(
+    struct comp_vk_deposit *dep, uint32_t plane, uint32_t width, uint32_t height, VkFormat format);
+
+/*!
+ * Fill @p out with @p plane's surface. False when the plane is not allocated.
+ */
+bool
+comp_vk_deposit_plane_get(struct comp_vk_deposit *dep, uint32_t plane, struct comp_vk_deposit_plane *out);
+
+/*!
+ * VK-1b — release every plane back to Vulkan, and the ONE ordering edge that
+ * makes the plane transport correct on this leg.
+ *
+ * ## The hole this closes
+ *
+ * A plane's ingress is **Option I**: the bridge's producer copy queue opens the
+ * app-device texture and reads it in place (see `comp_xbridge_bind_plane`). The
+ * bridge's own back-fence for that — `comp_xbridge_pre_render` /
+ * `comp_xbridge_pre_plane_write` — issues a GPU-side wait **on the app's D3D11
+ * immediate context**, which is exactly right for the two D3D legs because the
+ * immediate context is what writes their scratch. On this leg the plane is
+ * written by the **Vulkan queue**, which that wait does not order at all. Left
+ * alone, Vulkan's next flatten would race the producer's in-flight read and tear
+ * the 2D band — the same defect class VK-1a's atlas release edge closed, one
+ * level down.
+ *
+ * ## How it closes, without a deeper ring or a different ingress mode
+ *
+ * The imported semaphore is a D3D12 fence and is therefore bidirectional, so the
+ * answer is one queued signal and one queued wait, as it was for the atlas:
+ *
+ *  1. the caller takes `comp_xbridge_pre_plane_write` for each live plane, which
+ *     makes the app immediate context wait for the producer's read;
+ *  2. this call signals the shared fence past every claim so far **on that same
+ *     immediate context**, so the value is unreachable until (1) has resolved;
+ *  3. Vulkan's next flatten submit waits for that value on the timeline —
+ *     @ref comp_vk_deposit_plane_wait_value.
+ *
+ * The immediate context being one ordered stream is what makes a single signal
+ * cover every plane, and is why this is not a per-plane call.
+ *
+ * No-op when the deposit has no working sync. Never a CPU wait.
+ */
+void
+comp_vk_deposit_note_planes_consumed(struct comp_vk_deposit *dep);
+
+/*!
+ * The value Vulkan's next write to ANY plane must wait for on the timeline, or 0
+ * when nothing has consumed a plane yet (warmup, or no consumer at all).
+ */
+uint64_t
+comp_vk_deposit_plane_wait_value(struct comp_vk_deposit *dep);
+
+/*! @} */
+
+/*!
  * `DXR_VK_DEPOSIT_PROBE=1` — one-shot proof, off by default.
  *
  * Takes the GPU-side consumer wait for real (`ID3D11DeviceContext4::Wait` on the

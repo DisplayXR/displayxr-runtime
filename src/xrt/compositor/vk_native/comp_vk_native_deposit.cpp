@@ -18,6 +18,7 @@
 #include "util/u_debug.h"
 #include "util/u_misc.h"
 
+#include <stdio.h>
 #include <string.h>
 
 // The deposit is a Windows mechanism end to end (D3D11 shared textures,
@@ -56,6 +57,24 @@ struct comp_vk_deposit_slot
 	uint64_t release_value;
 };
 
+/*!
+ * VK-1b (#1178) — one PLANE surface. Single-buffered on purpose; see
+ * @ref comp_vk_deposit_note_planes_consumed for the fence edge that replaces the
+ * spare texture a ring would be.
+ */
+struct comp_vk_deposit_plane_slot
+{
+	ID3D11Texture2D *tex;
+	HANDLE share_nt;
+	VkImage image;
+	VkImageView view;
+	VkDeviceMemory memory;
+	uint32_t width, height;
+	VkFormat format;
+	//! Bumped on REALLOCATION only — `comp_xbridge_bind_plane`'s re-open key.
+	uint64_t generation;
+};
+
 struct comp_vk_deposit
 {
 	struct vk_bundle *vk;
@@ -68,6 +87,10 @@ struct comp_vk_deposit
 
 	struct comp_vk_deposit_slot ring[COMP_VK_DEPOSIT_RING];
 	uint32_t slot;
+
+	//! VK-1b — the plane surfaces, and the one release value they all share.
+	struct comp_vk_deposit_plane_slot plane[COMP_VK_DEPOSIT_PLANE_COUNT];
+	uint64_t plane_release_value;
 
 	//! Shared D3D11 fence, imported into Vulkan as a timeline semaphore.
 	ID3D11Fence *fence;
@@ -120,6 +143,8 @@ deposit_dxgi_format(VkFormat vk_format)
 	switch (vk_format) {
 	case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
 	case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	// VK-1b: the authored zone mask is a scalar coverage plane, R8 on both ends.
+	case VK_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
 	default: return DXGI_FORMAT_UNKNOWN;
 	}
 }
@@ -164,10 +189,17 @@ deposit_free_ring(struct comp_vk_deposit *dep)
  * comp_vk_native_target.cpp, which is the import proven on this hardware.
  */
 static bool
-deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
+deposit_import_shared(struct comp_vk_deposit *dep,
+                      HANDLE share_nt,
+                      uint32_t width,
+                      uint32_t height,
+                      VkFormat format,
+                      const char *what,
+                      VkImage *out_image,
+                      VkDeviceMemory *out_memory,
+                      VkImageView *out_view)
 {
 	struct vk_bundle *vk = dep->vk;
-	struct comp_vk_deposit_slot *s = &dep->ring[i];
 
 	VkExternalMemoryImageCreateInfo external_ci = {
 	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -180,8 +212,8 @@ deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
 	    .pNext = &external_ci,
 	    .flags = 0,
 	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = dep->format,
-	    .extent = {dep->width, dep->height, 1},
+	    .format = format,
+	    .extent = {width, height, 1},
 	    .mipLevels = 1,
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -192,25 +224,25 @@ deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 
-	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &s->image);
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, out_image);
 	if (res != VK_SUCCESS) {
-		U_LOG_W("vk deposit: vkCreateImage[%u] failed: %d", i, res);
+		U_LOG_W("vk deposit: vkCreateImage(%s) failed: %d", what, res);
 		return false;
 	}
 
 	VkMemoryRequirements requirements = {};
-	vk->vkGetImageMemoryRequirements(vk->device, s->image, &requirements);
+	vk->vkGetImageMemoryRequirements(vk->device, *out_image, &requirements);
 
 	VkImportMemoryWin32HandleInfoKHR import_info = {
 	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
 	    .pNext = NULL,
 	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
-	    .handle = s->share_nt,
+	    .handle = share_nt,
 	};
 	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
 	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
 	    .pNext = &import_info,
-	    .image = s->image,
+	    .image = *out_image,
 	    .buffer = VK_NULL_HANDLE,
 	};
 
@@ -224,7 +256,7 @@ deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
 		}
 	}
 	if (memory_type_index == UINT32_MAX) {
-		U_LOG_W("vk deposit: no compatible memory type for slot %u", i);
+		U_LOG_W("vk deposit: no compatible memory type for %s", what);
 		return false;
 	}
 
@@ -234,32 +266,121 @@ deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
 	    .allocationSize = requirements.size,
 	    .memoryTypeIndex = memory_type_index,
 	};
-	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &s->memory);
+	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, out_memory);
 	if (res != VK_SUCCESS) {
-		U_LOG_W("vk deposit: vkAllocateMemory[%u] failed: %d", i, res);
+		U_LOG_W("vk deposit: vkAllocateMemory(%s) failed: %d", what, res);
 		return false;
 	}
 
-	res = vk->vkBindImageMemory(vk->device, s->image, s->memory, 0);
+	res = vk->vkBindImageMemory(vk->device, *out_image, *out_memory, 0);
 	if (res != VK_SUCCESS) {
-		U_LOG_W("vk deposit: vkBindImageMemory[%u] failed: %d", i, res);
+		U_LOG_W("vk deposit: vkBindImageMemory(%s) failed: %d", what, res);
 		return false;
 	}
 
 	VkImageViewCreateInfo view_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = s->image,
+	    .image = *out_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = dep->format,
+	    .format = format,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &s->view);
+	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, out_view);
 	if (res != VK_SUCCESS) {
-		U_LOG_W("vk deposit: vkCreateImageView[%u] failed: %d", i, res);
+		U_LOG_W("vk deposit: vkCreateImageView(%s) failed: %d", what, res);
 		return false;
 	}
 
 	return true;
+}
+
+static bool
+deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
+{
+	struct comp_vk_deposit_slot *s = &dep->ring[i];
+	char what[32];
+	snprintf(what, sizeof(what), "atlas slot %u", i);
+	return deposit_import_shared(dep, s->share_nt, dep->width, dep->height, dep->format, what, &s->image,
+	                             &s->memory, &s->view);
+}
+
+/*!
+ * Create ONE `SHARED | SHARED_NTHANDLE` D3D11 texture on the deposit's device and
+ * return it with its NT handle. The share flags are the atlas ring's, verbatim:
+ * fence-synchronised NT sharing, never `SHARED_KEYEDMUTEX` (a keyed mutex is
+ * acquired from the CPU, and this ladder eliminated CPU waits by construction).
+ */
+static bool
+deposit_make_shared_texture(struct comp_vk_deposit *dep,
+                            uint32_t width,
+                            uint32_t height,
+                            DXGI_FORMAT dxgi_format,
+                            const char *what,
+                            ID3D11Texture2D **out_tex,
+                            HANDLE *out_share)
+{
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = width;
+	td.Height = height;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = dxgi_format;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+	HRESULT hr = dep->dx->CreateTexture2D(&td, NULL, out_tex);
+	if (FAILED(hr) || *out_tex == NULL) {
+		U_LOG_W("vk deposit: CreateTexture2D(%s) failed: 0x%08lx", what, (unsigned long)hr);
+		return false;
+	}
+
+	IDXGIResource1 *dxgi_res = NULL;
+	hr = (*out_tex)->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res);
+	if (FAILED(hr) || dxgi_res == NULL) {
+		U_LOG_W("vk deposit: QueryInterface(IDXGIResource1)(%s) failed: 0x%08lx", what, (unsigned long)hr);
+		return false;
+	}
+	hr =
+	    dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL, out_share);
+	dxgi_res->Release();
+	if (FAILED(hr) || *out_share == NULL) {
+		U_LOG_W("vk deposit: CreateSharedHandle(%s) failed: 0x%08lx", what, (unsigned long)hr);
+		return false;
+	}
+	return true;
+}
+
+//! Free one plane surface. Idempotent. The caller has already idled the device.
+static void
+deposit_free_plane(struct comp_vk_deposit *dep, uint32_t plane)
+{
+	struct vk_bundle *vk = dep->vk;
+	struct comp_vk_deposit_plane_slot *p = &dep->plane[plane];
+
+	if (p->view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, p->view, NULL);
+		p->view = VK_NULL_HANDLE;
+	}
+	if (p->image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, p->image, NULL);
+		p->image = VK_NULL_HANDLE;
+	}
+	if (p->memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, p->memory, NULL);
+		p->memory = VK_NULL_HANDLE;
+	}
+	if (p->share_nt != NULL) {
+		CloseHandle(p->share_nt);
+		p->share_nt = NULL;
+	}
+	if (p->tex != NULL) {
+		p->tex->Release();
+		p->tex = NULL;
+	}
+	p->width = 0;
+	p->height = 0;
 }
 
 /*!
@@ -289,34 +410,10 @@ deposit_alloc_ring(struct comp_vk_deposit *dep)
 	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
 		struct comp_vk_deposit_slot *s = &dep->ring[i];
 
-		D3D11_TEXTURE2D_DESC td = {};
-		td.Width = dep->width;
-		td.Height = dep->height;
-		td.MipLevels = 1;
-		td.ArraySize = 1;
-		td.Format = dxgi_format;
-		td.SampleDesc.Count = 1;
-		td.Usage = D3D11_USAGE_DEFAULT;
-		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-		td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-
-		HRESULT hr = dep->dx->CreateTexture2D(&td, NULL, &s->tex);
-		if (FAILED(hr)) {
-			U_LOG_W("vk deposit: CreateTexture2D[%u] failed: 0x%08lx", i, (unsigned long)hr);
-			return false;
-		}
-
-		IDXGIResource1 *dxgi_res = NULL;
-		hr = s->tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res);
-		if (FAILED(hr) || dxgi_res == NULL) {
-			U_LOG_W("vk deposit: QueryInterface(IDXGIResource1)[%u] failed: 0x%08lx", i, (unsigned long)hr);
-			return false;
-		}
-		hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL,
-		                                  &s->share_nt);
-		dxgi_res->Release();
-		if (FAILED(hr) || s->share_nt == NULL) {
-			U_LOG_W("vk deposit: CreateSharedHandle[%u] failed: 0x%08lx", i, (unsigned long)hr);
+		char what[32];
+		snprintf(what, sizeof(what), "atlas slot %u", i);
+		if (!deposit_make_shared_texture(dep, dep->width, dep->height, dxgi_format, what, &s->tex,
+		                                 &s->share_nt)) {
 			return false;
 		}
 
@@ -573,6 +670,9 @@ comp_vk_deposit_destroy(struct comp_vk_deposit **deposit_ptr)
 	}
 
 	deposit_free_ring(dep);
+	for (uint32_t p = 0; p < COMP_VK_DEPOSIT_PLANE_COUNT; p++) {
+		deposit_free_plane(dep, p);
+	}
 
 	if (dep->timeline != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, dep->timeline, NULL);
@@ -744,6 +844,127 @@ extern "C" VkSemaphore
 comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
 {
 	return dep != NULL ? dep->timeline : VK_NULL_HANDLE;
+}
+
+
+/*
+ *
+ * VK-1b — the plane surfaces.
+ *
+ */
+
+extern "C" bool
+comp_vk_deposit_plane_ensure(
+    struct comp_vk_deposit *dep, uint32_t plane, uint32_t width, uint32_t height, VkFormat format)
+{
+	if (dep == NULL || dep->dx == NULL || plane >= COMP_VK_DEPOSIT_PLANE_COUNT || width == 0 || height == 0) {
+		return false;
+	}
+	struct comp_vk_deposit_plane_slot *p = &dep->plane[plane];
+
+	// The steady-state call. The 2D planes are panel-sized once, so after
+	// warmup this is every frame's answer and it costs a compare.
+	if (p->image != VK_NULL_HANDLE && p->width == width && p->height == height && p->format == format) {
+		return true;
+	}
+
+	const DXGI_FORMAT dxgi_format = deposit_dxgi_format(format);
+	if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
+		U_LOG_W("vk deposit: plane %u — no DXGI equivalent for VkFormat %d", plane, (int)format);
+		return false;
+	}
+
+	/*
+	 * A REALLOCATION. The old surface is imported memory the GPU may still be
+	 * reading (Vulkan's flatten, or the bridge producer's copy), so idle before
+	 * freeing — the same reason comp_vk_deposit_resize does. This is an
+	 * on-change event: the 2D planes reach it once, and the authored mask only
+	 * when the app authors one at new dims.
+	 */
+	struct vk_bundle *vk = dep->vk;
+	if (p->image != VK_NULL_HANDLE && vk->vkDeviceWaitIdle != NULL) {
+		vk->vkDeviceWaitIdle(vk->device);
+	}
+	deposit_free_plane(dep, plane);
+
+	char what[40];
+	snprintf(what, sizeof(what), "plane %u", plane);
+	if (!deposit_make_shared_texture(dep, width, height, dxgi_format, what, &p->tex, &p->share_nt) ||
+	    !deposit_import_shared(dep, p->share_nt, width, height, format, what, &p->image, &p->memory, &p->view)) {
+		// Feature-local: the caller stops staging this plane and the 3D weave
+		// is untouched. Never a reason to give the scanout adapter back.
+		U_LOG_W(
+		    "vk deposit: plane %u could not be allocated at %ux%u — THAT FEATURE is off for this "
+		    "session; the weave is unaffected (#1178 VK-1b)",
+		    plane, width, height);
+		deposit_free_plane(dep, plane);
+		return false;
+	}
+
+	p->width = width;
+	p->height = height;
+	p->format = format;
+	p->generation++;
+	U_LOG_W("vk deposit: plane %u up — %ux%u, generation %llu (#1178 VK-1b)", plane, width, height,
+	        (unsigned long long)p->generation);
+	return true;
+}
+
+extern "C" bool
+comp_vk_deposit_plane_get(struct comp_vk_deposit *dep, uint32_t plane, struct comp_vk_deposit_plane *out)
+{
+	if (dep == NULL || out == NULL || plane >= COMP_VK_DEPOSIT_PLANE_COUNT) {
+		return false;
+	}
+	const struct comp_vk_deposit_plane_slot *p = &dep->plane[plane];
+	if (p->image == VK_NULL_HANDLE || p->tex == NULL) {
+		return false;
+	}
+	out->texture = p->tex;
+	out->shared_handle = p->share_nt;
+	out->image = (uint64_t)(uintptr_t)p->image;
+	out->view = (uint64_t)(uintptr_t)p->view;
+	out->width = p->width;
+	out->height = p->height;
+	out->generation = p->generation;
+	return true;
+}
+
+extern "C" void
+comp_vk_deposit_note_planes_consumed(struct comp_vk_deposit *dep)
+{
+	if (dep == NULL || dep->fence == NULL || dep->ctx == NULL) {
+		return;
+	}
+
+	ID3D11DeviceContext4 *ctx4 = NULL;
+	if (FAILED(dep->ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void **)&ctx4)) || ctx4 == NULL) {
+		// Same reasoning as comp_vk_deposit_note_consumed's: a value RECORDED
+		// but never signalled hangs Vulkan forever, which is strictly worse
+		// than the timing-only separation a machine without the interface had.
+		return;
+	}
+
+	/*
+	 * Past every value claimed so far, on the APP IMMEDIATE CONTEXT — which is
+	 * the whole mechanism. The caller has just taken
+	 * `comp_xbridge_pre_plane_write` for every live plane on this same context,
+	 * so this signal sits behind the producer's read of them in one ordered
+	 * stream. One signal covers every plane for exactly that reason.
+	 */
+	dep->value += 1;
+	ctx4->Signal(dep->fence, dep->value);
+	dep->plane_release_value = dep->value;
+	ctx4->Release();
+}
+
+extern "C" uint64_t
+comp_vk_deposit_plane_wait_value(struct comp_vk_deposit *dep)
+{
+	if (dep == NULL || dep->timeline == VK_NULL_HANDLE) {
+		return 0;
+	}
+	return dep->plane_release_value;
 }
 
 extern "C" bool
@@ -1032,6 +1253,40 @@ comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_
 	(void)dep;
 	(void)out;
 	return false;
+}
+
+extern "C" bool
+comp_vk_deposit_plane_ensure(
+    struct comp_vk_deposit *dep, uint32_t plane, uint32_t width, uint32_t height, VkFormat format)
+{
+	(void)dep;
+	(void)plane;
+	(void)width;
+	(void)height;
+	(void)format;
+	return false;
+}
+
+extern "C" bool
+comp_vk_deposit_plane_get(struct comp_vk_deposit *dep, uint32_t plane, struct comp_vk_deposit_plane *out)
+{
+	(void)dep;
+	(void)plane;
+	(void)out;
+	return false;
+}
+
+extern "C" void
+comp_vk_deposit_note_planes_consumed(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+}
+
+extern "C" uint64_t
+comp_vk_deposit_plane_wait_value(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+	return 0;
 }
 
 extern "C" void
