@@ -178,8 +178,14 @@ questions*.
 Each rung emits exactly one `weave placement:` line naming both adapters, the
 resulting regime, and `split=0 reason=<token>` from a closed set defined in
 `comp_split_gate.h`. The line is formatted in one place (`aux_d3d`) and emitted
-on every graphics API — including Vulkan and OpenGL, which have no split and so
-always report rung 2. The service repeats the live token on its periodic
+on every graphics API — including OpenGL, which has no split (no
+adapter-selection API exists, so the runtime cannot place a GL context) and so
+always reports rung 2. **Vulkan DOES have a split as of #1178** (shipped
+v2.12.1/v2.13.0, all layer kinds): it reaches it via a same-adapter D3D11
+deposit the compositor renders its atlas straight into, so the cross-adapter
+transport is unchanged and no cross-adapter Vulkan work was needed. A VK session
+reports rung 2 only when the app's `VkDevice` lacks `VK_KHR_timeline_semaphore`
+(`reason=no_timeline_semaphore`). The service repeats the live token on its periodic
 `[RENDER] split=0 reason=` line, and the in-process D3D12 path re-emits
 `weave placement: CHANGED` when it retires an engaged split mid-session, so the
 LAST placement line in a log is always the truth.
