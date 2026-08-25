@@ -3603,7 +3603,7 @@ xb_content_probe(struct comp_xbridge *xb, int32_t slot)
 			xb->probe_pending = false;
 			return;
 		}
-		uint64_t nonzero = 0, sum = 0, total = 0;
+		uint64_t nonzero = 0, nonzero_a = 0, sum = 0, total = 0;
 		const auto *base = static_cast<const uint8_t *>(m.pData);
 		for (uint32_t y = 0; y < xb->probe_h; y++) {
 			const uint8_t *row = base + (size_t)y * m.RowPitch;
@@ -3617,16 +3617,42 @@ xb_content_probe(struct comp_xbridge *xb, int32_t slot)
 				if (lum != 0) {
 					nonzero++;
 				}
+				// ...and alpha SEPARATELY. See the verdict below: colour alone
+				// cannot tell a transparent region from an unwritten one.
+				if (xb->bpp >= 4 && p[3] != 0) {
+					nonzero_a++;
+				}
 			}
 		}
 		xb->out_ctx->Unmap(xb->probe_stage, 0);
 		xb->probe_pending = false;
 		xb->probe_last_ns = os_monotonic_get_ns();
+		/*
+		 * #1178 — say what was measured, and be honest about what it does and does
+		 * not prove. The first cut of this line asserted "nonzero=0 means the
+		 * destination received NOTHING", and that is a FALSE ALARM on any app with
+		 * a transparent background: the sampled square is premultiplied-transparent
+		 * there, so colour is legitimately 0 and so is alpha. Measured on the
+		 * gaussian-splat demo, which reads nonzero=0/4096 sum=0 on every sample of
+		 * a completely healthy transport (the model viewer, opaque, reads
+		 * 4096/4096). A diagnostic that cries transport failure at a correct
+		 * transparent frame sends the next reader hunting a bug that is not there.
+		 *
+		 * The verdict is therefore three-way, and the all-zero case is reported as
+		 * the ambiguity it actually is.
+		 */
+		const char *verdict = (nonzero != 0)     ? "CONTENT (colour present)"
+		                      : (nonzero_a != 0) ? "OPAQUE BLACK (alpha written, colour zero)"
+		                                         : "EMPTY OR TRANSPARENT — ambiguous";
 		U_LOG_W(
-		    "%s: CONTENT PROBE slot=%d %s %ux%u — nonzero=%llu/%llu sum=%llu (#1178). nonzero=0 means "
-		    "the destination received NOTHING, however healthy the byte counters look.",
+		    "%s: CONTENT PROBE slot=%d %s %ux%u — nonzero=%llu/%llu alpha_nonzero=%llu sum=%llu — %s "
+		    "(#1178). A moving `sum` across samples is the strongest evidence of live transport; all-zero "
+		    "means EITHER the destination received nothing OR the sampled square is legitimately "
+		    "transparent, which is the normal reading for a transparent-background app. This probe watches "
+		    "the EGRESS only — it cannot see anything that goes wrong between there and the panel.",
 		    XB_TAG(xb), xb->probe_slot, xb_fmt_name(xb->fmt), xb->probe_w, xb->probe_h,
-		    (unsigned long long)nonzero, (unsigned long long)total, (unsigned long long)sum);
+		    (unsigned long long)nonzero, (unsigned long long)total, (unsigned long long)nonzero_a,
+		    (unsigned long long)sum, verdict);
 		return;
 	}
 
