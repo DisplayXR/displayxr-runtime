@@ -23,10 +23,30 @@ $allRows = Import-Csv $csvPath
 # Medians use CLEAN samples only: a zero-GPU row from a failed sweep folds a
 # 3-rep median to zero (measured). App arms additionally require a nonzero
 # GPU total.
-$rows = @($allRows | Where-Object {
-    ($_.flags -notmatch 'GPU_COUNTER_FAIL|GPU_DELTA_FAIL|APP_NO_START') -and
-    (([double]$_.total_gpu) -gt 0 -or $_.arm -like 'IDLE*')
-})
+#
+# NO_WITNESS / MODE_UNSETTLED are VOID rows, not merely annotated ones, and must
+# not contribute: a silently-2D app (session died, plain window, see the abort in
+# run_ladder.ps1) still reports a healthy nonzero GPU total - 61.51 pts measured
+# on the Lenovo box - so the nonzero gate below does NOT catch it. Keeping such a
+# row averages it into the derived components, where the flag no longer travels
+# with the number. That is the failure the ladder is built against: prefer an
+# instrument that voids a sample over one that emits a caveated row, because
+# caveats get stripped in transit and drops do not. MODE_UNSETTLED is void for
+# the same reason plus a worse one - an unconfirmed 3D arm is most likely running
+# 2D, so its error correlates with the hypothesis under test and biases every
+# mode-differenced component toward zero.
+# Ordered so the gates breakdown can attribute each dropped row to exactly ONE
+# reason (a breakdown whose parts do not sum to the total invites the reader to
+# hunt for the missing row). Defined once and used by both the filter and the
+# tally so the two can never drift apart.
+$script:VoidReasons = @('NO_WITNESS', 'MODE_UNSETTLED', 'GPU_COUNTER_FAIL', 'GPU_DELTA_FAIL', 'APP_NO_START')
+function Get-DropReason {
+    param($row)
+    foreach ($rsn in $script:VoidReasons) { if ($row.flags -match $rsn) { return $rsn } }
+    if (-not ((([double]$row.total_gpu) -gt 0) -or ($row.arm -like 'IDLE*'))) { return 'zero-GPU row' }
+    return $null   # kept
+}
+$rows = @($allRows | Where-Object { (Get-DropReason $_) -eq $null })
 $caps = $null
 $capsPath = Join-Path $ResultsDir 'capabilities.json'
 if (Test-Path $capsPath) { $caps = Get-Content $capsPath -Raw | ConvertFrom-Json }
@@ -273,7 +293,24 @@ if ($caps -ne $null) {
     if ($caps.elevated) { $g += '- FLAG: harness ran elevated (loader may resolve a different runtime)' } else { $g += '- PASS: non-elevated' }
 }
 $dropped = $allRows.Count - $rows.Count
-if ($dropped -gt 0) { $g += ('- FLAG: ' + $dropped + ' sample(s) DROPPED from medians (failed GPU sweep / zero row)') }
+if ($dropped -gt 0) {
+    # Name WHY, per reason: "4 dropped" reads as noise, "4 dropped: NO_WITNESS"
+    # tells the reader the app was not in a session for half the run.
+    $tally = [ordered]@{}
+    foreach ($r0 in $allRows) {
+        $rsn = Get-DropReason $r0
+        if ($rsn -eq $null) { continue }
+        if ($tally.Contains($rsn)) { $tally[$rsn] = $tally[$rsn] + 1 } else { $tally[$rsn] = 1 }
+    }
+    $why = @()
+    foreach ($k in ($script:VoidReasons + 'zero-GPU row')) { if ($tally.Contains($k)) { $why += ($k + ' x' + $tally[$k]) } }
+    $g += ('- FLAG: ' + $dropped + ' sample(s) DROPPED from medians (' + ($why -join ', ') + ')')
+    if ($tally.Contains('NO_WITNESS') -or $tally.Contains('MODE_UNSETTLED')) {
+        $g += '- FLAG: a VOID app sample (no witness / unconfirmed mode) means the app was not provably'
+        $g += '  compositing through the runtime for that arm. Components derived from the surviving arms'
+        $g += '  are still valid; any component whose arms were dropped is ABSENT, not zero.'
+    }
+}
 $flagged = @($rows | Where-Object { $_.flags -ne '' })
 if ($flagged.Count -eq 0 -and $dropped -eq 0) { $g += '- PASS: no per-sample flags' }
 elseif ($flagged.Count -gt 0) { $g += ('- FLAG: ' + $flagged.Count + ' kept sample(s) carry flags (see table + ladder.csv)') }
