@@ -1036,16 +1036,21 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 
 	NULL_DEBUG(c, "Doing init %p", (void *)c);
 
+	/*
+	 * DisplayXR: this is NOT the Monado "you built without the main
+	 * compositor" case. Here the null compositor IS the system-level
+	 * `xrt_system_compositor` on every path — it carries the scanout/render
+	 * adapter LUIDs and the panel refresh rate (`target_instance.c` ->
+	 * `null_compositor_create_system_with_dims`) — and the per-API NATIVE
+	 * compositor (D3D11/D3D12/Metal/GL/VK) is created later at
+	 * `xrCreateSession`. The inherited Monado banner claimed a broken build
+	 * and cost a lab box real time diagnosing a healthy runtime, so it now
+	 * says what is actually true.
+	 */
 	NULL_INFO(c,
-	          "\n"
-	          "################################################################################\n"
-	          "# Null compositor starting, if you intended to use the null compositor (for CI #\n"
-	          "# integration) then everything is mostly likely setup correctly. But if you    #\n"
-	          "# intended to use Monado with real hardware it you probably built Monado       #\n"
-	          "# without the main compositor, please check your build config and make sure    #\n"
-	          "# that the main compositor is being built. Also make sure that the environment #\n"
-	          "# variable XRT_COMPOSITOR_NULL is not set.                                     #\n"
-	          "################################################################################");
+	          "Null compositor: acting as the system compositor (carries the adapter LUIDs and the "
+	          "panel refresh rate). The per-API native compositor is created at xrCreateSession — "
+	          "this line is EXPECTED and does not indicate a misconfigured build.");
 
 	// Do this as early as possible
 	comp_base_init(&c->base);
