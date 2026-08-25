@@ -279,7 +279,7 @@ A from-source runtime that's **ahead of the released ABI** will ABI-reject an *i
 
 ### Headless diagnostics (`displayxr-cli`)
 `displayxr-cli` runs the runtime **without a compositor/GPU/window** — it exercises the real plug-in discovery + display-processor path in-process (`target_instance_no_comp`), so it's the fastest way to check "did the runtime start, find a DP, and get sane display info?" without launching an app.
-- `displayxr-cli selftest` — asserts a DP-backed head device exists, a vendor plug-in is active (the loader rejects ABI-mismatched plug-ins, so this *is* an ABI check), and display dims are valid. Strict exit code; this is what the CI gate runs.
+- `displayxr-cli selftest` — asserts a DP-backed head device exists, a vendor plug-in is active (the loader rejects ABI-mismatched plug-ins, so this *is* an ABI check), and display dims are **proven** — equal to `EnumDisplaySettingsW`'s current mode, not just non-zero — plus that the process is per-monitor DPI aware (#1201; every DisplayXR executable embeds `src/xrt/targets/common/dpi_aware.manifest`, and an unaware process reads DPI-virtualised geometry). Strict exit code; this is what the CI gate runs.
 - `displayxr-cli info` — bug-report dump: runtime version/git-tag, plug-in ABI, active plug-in identity + display info (dims, viewer, eye-tracking modes), and the Windows `ActiveRuntime` value.
 
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.

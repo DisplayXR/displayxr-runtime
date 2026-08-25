@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "cli_dims_check.h"
+
 #include "xrt/xrt_plugin.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
@@ -56,6 +58,18 @@ enum cli_selftest_result
 	//! *absence* never fails — qwerty keeping the hand roles is the
 	//! normal no-provider configuration.
 	CLI_SELFTEST_BAD_INPUT = 5,
+	//! The plug-in's reported panel pixels do NOT match the authoritative
+	//! display mode (#1201). The classic cause is a DPI-unaware process
+	//! reading virtualised coordinates, but any divergence fails: the whole
+	//! point of the check is that `display_dims` must PROVE its number
+	//! rather than print it. Absence of an authoritative mode (non-Windows,
+	//! monitor unresolvable) never fails.
+	CLI_SELFTEST_DIMS_MISMATCH = 6,
+	//! This process is not per-monitor DPI aware, so every pixel dimension
+	//! it reports came through DPI virtualisation (#1201). Caught even on a
+	//! 100%-scaled box, where the numbers happen to come out right and the
+	//! dims check above therefore cannot see the regression. Windows-only.
+	CLI_SELFTEST_NOT_DPI_AWARE = 7,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -118,6 +132,37 @@ struct cli_query_result
 
 	/* Vendor-neutral display info (valid iff display_info_ok). */
 	struct xrt_plugin_display_info display_info;
+
+	/* #1201 — the authoritative panel mode, so `display_dims` can PROVE the
+	 * plug-in's `display_pixel_*` instead of printing it. Windows-only:
+	 * `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` on the monitor the
+	 * plug-in points at (`display_screen_left/top`, else the primary),
+	 * which returns TRUE pixels regardless of this process's DPI awareness
+	 * — that is exactly what makes it a usable oracle for a bug whose whole
+	 * signature is DPI-virtualised coordinates.
+	 *
+	 * native_probed — a mode was read (false ⟹ non-Windows, or the monitor
+	 *                 could not be resolved; NEVER a failure).
+	 * dims_verdict  — the comparison (@ref cli_dims_compare); MISMATCH is
+	 *                 the only value that fails, as DIMS_MISMATCH.
+	 * dims_note     — human-readable outcome, reused by both serializers. */
+	bool native_probed;
+	uint32_t native_pixel_width;
+	uint32_t native_pixel_height;
+	uint32_t native_refresh_hz;
+	char native_device[40]; //!< GDI device name, e.g. DISPLAY1.
+	enum cli_dims_verdict dims_verdict;
+	char dims_note[224];
+
+	/* #1201 — this process's own DPI awareness, so the tool's output says
+	 * whether it is entitled to be believed. Windows-only ("n/a" elsewhere).
+	 * A tool that reports the panel MUST report this too: it is the single
+	 * fact that separates "the panel is 2560x1440" from "I am not allowed to
+	 * see that the panel is 3840x2160". */
+	char dpi_awareness[32];
+	//! False only on Windows, and only when the process is NOT per-monitor
+	//! aware. Non-Windows leaves it true — awareness is a Windows concept.
+	bool dpi_aware_ok;
 
 	/* #224 / ADR-027 P4 zone-caps probe (Windows-only: WARP D3D11 device +
 	 * the plug-in's create_dp_d3d11 + get_local_zone_caps, headless).

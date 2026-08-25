@@ -92,6 +92,15 @@ target_link_libraries(workspace_minimal_d3d11_win PRIVATE
     dxgi
 )
 
+# Embed the per-monitor-v2 DPI manifest (#1201) — copy to the build dir and use
+# a relative path, the same spaces-in-path dodge the other test apps use.
+if(MSVC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/workspace_minimal.manifest" "${CMAKE_CURRENT_BINARY_DIR}/workspace_minimal.manifest" COPYONLY)
+    set_target_properties(workspace_minimal_d3d11_win PROPERTIES
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:workspace_minimal.manifest"
+    )
+endif()
+
 if(TARGET OpenXR::openxr_loader)
     get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)
     if(_loader_location)

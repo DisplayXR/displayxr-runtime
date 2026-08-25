@@ -25,6 +25,7 @@ set(tests
     tests_u_multi_display
     tests_dp_weave_scope
     tests_space_overseer_rig
+    tests_cli_dims_check
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
@@ -78,6 +79,11 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
+
+# #1201 — the self-test rule that makes `display_dims` prove its number instead
+# of printing it. A header of pure integer decisions (the probe that feeds it is
+# Windows-only, the rule is not), so there is nothing to link but the include.
+target_include_directories(tests_cli_dims_check PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/targets/cli)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
