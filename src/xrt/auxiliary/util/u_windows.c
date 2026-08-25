@@ -298,3 +298,118 @@ u_win_try_privilege_or_priority_from_args(enum u_logging_level log_level, int ar
 		u_win_raise_cpu_priority(log_level);
 	}
 }
+
+
+/*
+ *
+ * DPI awareness (#1201).
+ *
+ * A DPI-unaware process is handed VIRTUALISED coordinates by every GDI entry
+ * point, so on a 4K panel at 150% scaling it "sees" a 2560x1440 display. That
+ * is how `displayxr-cli` came to report — and its self-test to ASSERT —
+ * the wrong panel resolution on a scaled box while DPI-aware apps on the same
+ * machine at the same moment read the panel correctly. Awareness is a process
+ * property, so it is the EXE's to declare; every DisplayXR executable now
+ * declares the same one (per-monitor v2), by manifest first and by this call
+ * as the backstop.
+ *
+ * The APIs are resolved dynamically: SetProcessDpiAwarenessContext is Win10
+ * 1607+, SetProcessDpiAwareness is 8.1+, and SetProcessDPIAware is Vista+ —
+ * we try them in that order and stop at the first that takes.
+ *
+ */
+
+// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the opaque handle value -4.
+#define U_WIN_DPI_CTX_PER_MONITOR_AWARE_V2 ((HANDLE)(intptr_t)-4)
+
+typedef BOOL(WINAPI *pfn_set_process_dpi_awareness_context)(HANDLE);
+typedef HANDLE(WINAPI *pfn_get_thread_dpi_awareness_context)(void);
+typedef int(WINAPI *pfn_get_awareness_from_dpi_awareness_context)(HANDLE);
+typedef BOOL(WINAPI *pfn_set_process_dpi_aware)(void);
+typedef HRESULT(WINAPI *pfn_set_process_dpi_awareness)(int);
+
+enum u_win_dpi_awareness
+u_win_get_process_dpi_awareness(void)
+{
+	HMODULE user32 = GetModuleHandleA("user32.dll");
+	if (user32 == NULL) {
+		return U_WIN_DPI_UNKNOWN;
+	}
+
+	// GetThreadDpiAwarenessContext reports the process default for a thread
+	// that never overrode it, which is what every DisplayXR EXE's main
+	// thread is. Both entry points are Win10 1607+, same as the setter.
+	pfn_get_thread_dpi_awareness_context get_ctx =
+	    (pfn_get_thread_dpi_awareness_context)GetProcAddress(user32, "GetThreadDpiAwarenessContext");
+	pfn_get_awareness_from_dpi_awareness_context to_awareness =
+	    (pfn_get_awareness_from_dpi_awareness_context)GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext");
+	if (get_ctx == NULL || to_awareness == NULL) {
+		return U_WIN_DPI_UNKNOWN;
+	}
+
+	// DPI_AWARENESS: INVALID = -1, UNAWARE = 0, SYSTEM_AWARE = 1,
+	// PER_MONITOR_AWARE = 2 (v2 reports as PER_MONITOR_AWARE too).
+	switch (to_awareness(get_ctx())) {
+	case 0: return U_WIN_DPI_UNAWARE;
+	case 1: return U_WIN_DPI_SYSTEM_AWARE;
+	case 2: return U_WIN_DPI_PER_MONITOR_AWARE;
+	default: return U_WIN_DPI_UNKNOWN;
+	}
+}
+
+const char *
+u_win_dpi_awareness_to_string(enum u_win_dpi_awareness awareness)
+{
+	switch (awareness) {
+	case U_WIN_DPI_UNAWARE: return "unaware";
+	case U_WIN_DPI_SYSTEM_AWARE: return "system-aware";
+	case U_WIN_DPI_PER_MONITOR_AWARE: return "per-monitor-aware";
+	default: return "unknown";
+	}
+}
+
+bool
+u_win_make_process_dpi_aware(bool *out_was_already_aware)
+{
+	bool already = u_win_get_process_dpi_awareness() == U_WIN_DPI_PER_MONITOR_AWARE;
+	if (out_was_already_aware != NULL) {
+		*out_was_already_aware = already;
+	}
+	if (already) {
+		// The manifest did the job before a single instruction of ours ran.
+		return true;
+	}
+
+	HMODULE user32 = GetModuleHandleA("user32.dll");
+	if (user32 != NULL) {
+		pfn_set_process_dpi_awareness_context set_ctx =
+		    (pfn_set_process_dpi_awareness_context)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+		if (set_ctx != NULL && set_ctx(U_WIN_DPI_CTX_PER_MONITOR_AWARE_V2)) {
+			return true;
+		}
+	}
+
+	// Win8.1 fallback. PROCESS_PER_MONITOR_DPI_AWARE = 2.
+	HMODULE shcore = LoadLibraryA("shcore.dll");
+	if (shcore != NULL) {
+		pfn_set_process_dpi_awareness set_awareness =
+		    (pfn_set_process_dpi_awareness)GetProcAddress(shcore, "SetProcessDpiAwareness");
+		bool ok = set_awareness != NULL && SUCCEEDED(set_awareness(2));
+		FreeLibrary(shcore);
+		if (ok) {
+			return true;
+		}
+	}
+
+	// Last resort: system-aware. Better than virtualised coordinates, but it
+	// is NOT per-monitor, so report the truth rather than claim success.
+	if (user32 != NULL) {
+		pfn_set_process_dpi_aware set_aware =
+		    (pfn_set_process_dpi_aware)GetProcAddress(user32, "SetProcessDPIAware");
+		if (set_aware != NULL) {
+			set_aware();
+		}
+	}
+
+	return u_win_get_process_dpi_awareness() == U_WIN_DPI_PER_MONITOR_AWARE;
+}

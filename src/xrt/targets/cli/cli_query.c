@@ -27,6 +27,9 @@
 
 #include "os/os_display_edid.h"
 #include "util/u_git_tag.h"
+#ifdef XRT_OS_WINDOWS
+#include "util/u_windows.h" // #1201 DPI awareness reporting
+#endif
 
 #include "target_plugin_loader.h"
 #include "target_input_plugin_loader.h"
@@ -55,6 +58,14 @@
  * Query.
  *
  */
+
+//! Placeholder for an empty/absent string, shared by the query core (whose
+//! notes quote device names) and the serializers below.
+static const char *
+or_q(const char *s)
+{
+	return (s != NULL && s[0] != '\0') ? s : "?";
+}
 
 #ifdef XRT_OS_WINDOWS
 /*!
@@ -268,6 +279,59 @@ describe_service_ingest(
 	         luid_label(luid, lb, sizeof(lb)), r->gpu_ingest_provenance, env_set ? "; DXR_D3D_FORCE_GPU=" : "",
 	         env_set ? force : "",
 	         !env_set ? "" : (honoured ? " HONOURED" : " set but NOT honoured — see the resolver's WARN"));
+}
+
+/*!
+ * #1201 — read the AUTHORITATIVE current display mode for the panel the
+ * plug-in describes, so the `display_dims` check can prove its number.
+ *
+ * `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` reports the mode the adapter
+ * is actually scanning out, in true pixels, *regardless of the calling
+ * process's DPI awareness* — unlike the GDI monitor rects the EDID enumerator
+ * reads, which a DPI-unaware process is handed pre-divided by the scale
+ * factor. That independence is the whole reason it is usable as the oracle
+ * here: were it DPI-sensitive too, both sides of the comparison would be wrong
+ * together and the check would pass on a scaled box exactly as before.
+ *
+ * The monitor is picked by the plug-in's own `display_screen_left/top`, so a
+ * DP that claims a secondary display is compared against THAT display; both
+ * zero means "no preference" and resolves to the primary monitor, which is
+ * what such a plug-in (sim_display) sizes itself from.
+ *
+ * Sets `native_probed` false and returns quietly when the monitor cannot be
+ * resolved — absence never fails.
+ */
+static void
+probe_native_display_mode(struct cli_query_result *r, const struct xrt_plugin_display_info *info)
+{
+	POINT pt = {(LONG)info->display_screen_left, (LONG)info->display_screen_top};
+	HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+	if (mon == NULL) {
+		return;
+	}
+
+	MONITORINFOEXW mi;
+	memset(&mi, 0, sizeof(mi));
+	mi.cbSize = sizeof(mi);
+	if (!GetMonitorInfoW(mon, (LPMONITORINFO)&mi)) {
+		return;
+	}
+
+	DEVMODEW dm;
+	memset(&dm, 0, sizeof(dm));
+	dm.dmSize = sizeof(dm);
+	if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+		return;
+	}
+	if (dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0) {
+		return;
+	}
+
+	r->native_probed = true;
+	r->native_pixel_width = (uint32_t)dm.dmPelsWidth;
+	r->native_pixel_height = (uint32_t)dm.dmPelsHeight;
+	r->native_refresh_hz = (uint32_t)dm.dmDisplayFrequency;
+	WideCharToMultiByte(CP_UTF8, 0, mi.szDevice, -1, r->native_device, (int)sizeof(r->native_device), NULL, NULL);
 }
 
 /*!
@@ -654,6 +718,17 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 
 #ifdef XRT_OS_WINDOWS
 	read_active_runtime(r);
+	// #1201 — record what this process is entitled to SEE before it looks at
+	// anything. `unaware` here is the tell that every pixel dimension below
+	// came through DPI virtualisation.
+	{
+		enum u_win_dpi_awareness aware = u_win_get_process_dpi_awareness();
+		snprintf(r->dpi_awareness, sizeof(r->dpi_awareness), "%s", u_win_dpi_awareness_to_string(aware));
+		r->dpi_aware_ok = aware == U_WIN_DPI_PER_MONITOR_AWARE;
+	}
+#else
+	snprintf(r->dpi_awareness, sizeof(r->dpi_awareness), "n/a");
+	r->dpi_aware_ok = true;
 #endif
 
 	// xrt_instance_create takes a non-const ii but only reads it.
@@ -743,8 +818,57 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	if (!(info.display_width_m > 0.0f) || !(info.display_height_m > 0.0f) || info.display_pixel_width == 0 ||
 	    info.display_pixel_height == 0) {
 		r->result_code = CLI_SELFTEST_BAD_INFO;
+		snprintf(r->dims_note, sizeof(r->dims_note), "reported dimensions are not sane");
 		return;
 	}
+
+	// #1201 — sane is not the same as CORRECT. Prove the reported pixel size
+	// against the mode the adapter is actually scanning out; a check that
+	// passes on a wrong number is worse than no check.
+#ifdef XRT_OS_WINDOWS
+	probe_native_display_mode(r, &info);
+#endif
+	r->dims_verdict = cli_dims_compare(r->native_probed, info.display_pixel_width, info.display_pixel_height,
+	                                   r->native_pixel_width, r->native_pixel_height);
+	switch (r->dims_verdict) {
+	case CLI_DIMS_MATCH:
+		snprintf(r->dims_note, sizeof(r->dims_note), "%ux%u px == %s current mode (%ux%u @ %u Hz)",
+		         info.display_pixel_width, info.display_pixel_height, or_q(r->native_device),
+		         r->native_pixel_width, r->native_pixel_height, r->native_refresh_hz);
+		break;
+	case CLI_DIMS_MISMATCH: {
+		uint32_t pct = cli_dims_scaling_percent(info.display_pixel_width, info.display_pixel_height,
+		                                        r->native_pixel_width, r->native_pixel_height);
+		if (pct != 0) {
+			snprintf(r->dims_note, sizeof(r->dims_note),
+			         "reported %ux%u px but %s is %ux%u — exactly %u%% scaling, i.e. LOGICAL "
+			         "coordinates (process is %s)",
+			         info.display_pixel_width, info.display_pixel_height, or_q(r->native_device),
+			         r->native_pixel_width, r->native_pixel_height, pct, or_q(r->dpi_awareness));
+		} else {
+			snprintf(r->dims_note, sizeof(r->dims_note), "reported %ux%u px but %s is %ux%u @ %u Hz",
+			         info.display_pixel_width, info.display_pixel_height, or_q(r->native_device),
+			         r->native_pixel_width, r->native_pixel_height, r->native_refresh_hz);
+		}
+		break;
+	}
+	default:
+		snprintf(r->dims_note, sizeof(r->dims_note), "%ux%u px (no authoritative mode to compare: %s)",
+		         info.display_pixel_width, info.display_pixel_height,
+#ifdef XRT_OS_WINDOWS
+		         "monitor unresolvable"
+#else
+		         "Windows-only probe"
+#endif
+		);
+		break;
+	}
+
+	if (r->dims_verdict == CLI_DIMS_MISMATCH) {
+		r->result_code = CLI_SELFTEST_DIMS_MISMATCH;
+		return;
+	}
+
 	r->dims_ok = true;
 	r->result_code = CLI_SELFTEST_PASS;
 
@@ -767,6 +891,15 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	// false and pass: the arbiter giving the roles to qwerty is the
 	// correct outcome there, not a fault. Applied last so display
 	// failures keep their more fundamental codes.
+
+	// #1201 — a DPI-unaware process reads VIRTUALISED geometry, so every
+	// pixel dimension above is suspect. On a 100%-scaled box the numbers come
+	// out right anyway and the dims check cannot see the regression, which is
+	// exactly why awareness is asserted in its own right.
+	if (r->result_code == CLI_SELFTEST_PASS && !r->dpi_aware_ok) {
+		r->result_code = CLI_SELFTEST_NOT_DPI_AWARE;
+	}
+
 	if (r->result_code == CLI_SELFTEST_PASS && r->input_evaluated &&
 	    !(r->input_provider_active && r->input_left_ok && r->input_right_ok &&
 	      (!r->input_ht_expected_left || r->input_ht_left_ok) &&
@@ -801,12 +934,6 @@ cli_query_run(struct cli_query_result *r)
 
 #define P(...) printf(__VA_ARGS__)
 #define PT(...) printf("\t" __VA_ARGS__)
-
-static const char *
-or_q(const char *s)
-{
-	return (s != NULL && s[0] != '\0') ? s : "?";
-}
 
 /*!
  * Decode the eye-tracking-mode bitmask into a human label. Bits per
@@ -905,6 +1032,21 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	const struct xrt_plugin_display_info *i = &r->display_info;
 	PT("physical:     %.4fm x %.4fm\n", (double)i->display_width_m, (double)i->display_height_m);
 	PT("pixels:       %ux%u\n", i->display_pixel_width, i->display_pixel_height);
+	// #1201 — the reported pixels CHECKED against the mode the adapter is
+	// actually scanning out, plus this process's own DPI awareness. A bug
+	// report that quotes a panel resolution has to carry the evidence for it;
+	// this tool used to quote a DPI-virtualised number with none.
+	if (r->native_probed) {
+		PT("panel mode:   %ux%u @ %u Hz on %s  [%s]\n", r->native_pixel_width, r->native_pixel_height,
+		   r->native_refresh_hz, or_q(r->native_device),
+		   r->dims_verdict == CLI_DIMS_MATCH ? "matches reported pixels" : "** MISMATCH vs reported pixels **");
+	} else {
+		PT("panel mode:   not probed\n");
+	}
+	PT("DPI aware:    %s\n", or_q(r->dpi_awareness));
+	if (r->dims_verdict == CLI_DIMS_MISMATCH) {
+		PT("** %s\n", r->dims_note);
+	}
 	PT("viewer:       (%.4f, %.4f, %.4f) m\n", (double)i->nominal_viewer_x_m, (double)i->nominal_viewer_y_m,
 	   (double)i->nominal_viewer_z_m);
 	// Baseline hint only — the authoritative scale is per rendering mode (below).
@@ -1091,9 +1233,27 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(et, "supported_label",
 		                        eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)));
 		cJSON_AddStringToObject(et, "default_label", eye_default_label(i->default_eye_tracking_mode));
+
+		// #1201 — the proof behind `pixel_width`/`pixel_height`: the mode the
+		// adapter is scanning out, and whether the plug-in's number equals it.
+		cJSON *nm = cJSON_AddObjectToObject(d, "native_mode");
+		cJSON_AddBoolToObject(nm, "probed", r->native_probed);
+		if (r->native_probed) {
+			cJSON_AddStringToObject(nm, "device", r->native_device);
+			cJSON_AddNumberToObject(nm, "pixel_width", (double)r->native_pixel_width);
+			cJSON_AddNumberToObject(nm, "pixel_height", (double)r->native_pixel_height);
+			cJSON_AddNumberToObject(nm, "refresh_hz", (double)r->native_refresh_hz);
+		}
+		cJSON_AddBoolToObject(nm, "matches_reported", r->dims_verdict == CLI_DIMS_MATCH);
+		cJSON_AddStringToObject(nm, "note", r->dims_note);
 	} else {
 		cJSON_AddNullToObject(root, "display");
 	}
+
+	// #1201 — this process's DPI awareness. Anything but "per-monitor-aware"
+	// on Windows means every pixel dimension above came through DPI
+	// virtualisation and must not be trusted.
+	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 
 	// DP-selection divergence probe (in-process vs service/shell).
 	{
@@ -1275,16 +1435,30 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	snprintf(c->detail, sizeof(c->detail), "%s",
 	         r->display_info_ok ? "get_display_info returned valid struct" : "get_display_info missing/false");
 
+	// #1201 — this check PROVES the pixel dimensions against the display
+	// mode the adapter is scanning out; it does not merely print them. It
+	// FAILS on a mismatch, which is how a DPI-awareness regression (or any
+	// other divergence) gets caught instead of laundered into a green PASS.
+	// Absence of an authoritative mode never fails.
 	c = &out[n++];
 	c->name = "display_dims";
 	c->ok = r->dims_ok;
 	if (r->display_info_ok) {
 		const struct xrt_plugin_display_info *i = &r->display_info;
-		snprintf(c->detail, sizeof(c->detail), "%.4fm x %.4fm, %ux%u px", (double)i->display_width_m,
-		         (double)i->display_height_m, i->display_pixel_width, i->display_pixel_height);
+		snprintf(c->detail, sizeof(c->detail), "%.4fm x %.4fm, %s", (double)i->display_width_m,
+		         (double)i->display_height_m,
+		         r->dims_note[0] != '\0' ? r->dims_note : "dimensions not evaluated");
 	} else {
 		snprintf(c->detail, sizeof(c->detail), "%s", "not evaluated");
 	}
+
+	// #1201 — the tool's own entitlement to the numbers above. FAILS when
+	// Windows says this process is not per-monitor aware; "n/a" elsewhere.
+	c = &out[n++];
+	c->name = "dpi_awareness";
+	c->ok = r->dpi_aware_ok;
+	snprintf(c->detail, sizeof(c->detail), "process is %s%s", or_q(r->dpi_awareness),
+	         r->dpi_aware_ok ? "" : " — Win32/GDI geometry is DPI-virtualised, panel dims cannot be trusted");
 
 	// #224 / ADR-027 P4 — zone-caps probe. ABSENCE NEVER FAILS: ok stays
 	// true for legacy plug-ins / no factory / non-Windows; only a
@@ -1324,7 +1498,7 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 {
 	P(" :: DisplayXR CLI self-test (headless, no compositor)\n");
 
-	struct check checks[10];
+	struct check checks[12];
 	int n = build_checks(r, checks);
 	for (int i = 0; i < n; i++) {
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
@@ -1342,7 +1516,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
-	struct check checks[10];
+	struct check checks[12];
 	int n = build_checks(r, checks);
 	cJSON *arr = cJSON_AddArrayToObject(root, "checks");
 	for (int i = 0; i < n; i++) {
@@ -1353,6 +1527,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddItemToArray(arr, c);
 	}
 
+	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 

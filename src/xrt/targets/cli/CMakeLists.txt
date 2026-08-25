@@ -49,6 +49,19 @@ add_sanitizers(cli)
 if(WIN32)
 	# Embedded Explorer icon (shared across DisplayXR executables).
 	target_sources(cli PRIVATE ../common/app_icon.rc)
+
+	# #1201 — embed the shared per-monitor-v2 DPI manifest (merged with the
+	# default UAC manifest). Without it this process is handed VIRTUALISED
+	# coordinates, so on a scaled panel `info`/`displays` report the logical
+	# resolution (2560x1440 on a 4K panel at 150%) and `selftest` asserts it.
+	# cli_main.c also calls u_win_make_process_dpi_aware() as the backstop for
+	# toolchains that cannot embed a manifest.
+	if(MSVC)
+		target_link_options(
+			cli PRIVATE "/MANIFEST:EMBED"
+			"/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../common/dpi_aware.manifest"
+			)
+	endif()
 endif()
 
 set_target_properties(cli PROPERTIES OUTPUT_NAME displayxr-cli PREFIX "")

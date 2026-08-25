@@ -20,7 +20,17 @@ it tells you in seconds whether the runtime itself is healthy:
 ```
 
 A healthy run ends with `:: SELF-TEST PASSED` and asserts a display device exists, a
-vendor plug-in is active (with a matching ABI), and the display dimensions are valid.
+vendor plug-in is active (with a matching ABI), and the display dimensions are valid —
+*valid* meaning **equal to the mode the adapter is actually scanning out**
+(`EnumDisplaySettingsW`), not merely non-zero. Two checks carry that (#1201):
+
+- `display_dims` fails when the plug-in's pixel size differs from the panel's current
+  mode, and names the ratio when it is a round scaling step
+  (`reported 2560x1440 px but \\.\DISPLAY1 is 3840x2160 — exactly 150% scaling`).
+- `dpi_awareness` fails when the process is not per-monitor DPI aware, because a
+  DPI-unaware process is handed virtualised coordinates and none of its geometry can be
+  trusted. This one fires even at 100% scaling, where the numbers coincide and
+  `display_dims` cannot see the problem.
 
 **The single most useful diagnostic split:** the runtime ships a hardware-free
 **sim-display** plug-in alongside the real vendor plug-in. Force each and compare:
@@ -39,7 +49,8 @@ displayxr-cli.exe dp reset             &&  displayxr-cli.exe selftest   :: real 
 
 `displayxr-cli.exe info` prints a fuller dump for bug reports: runtime version/git tag,
 plug-in ABI, the active plug-in's identity and display info, and the Windows
-`ActiveRuntime` value.
+`ActiveRuntime` value. Its `panel mode:` and `DPI aware:` lines are the evidence behind
+the `pixels:` line above them — quote all three when reporting a resolution.
 
 On a hybrid iGPU/dGPU machine, `info`'s **`GPU topology`** section (and the matching
 one-line `weave placement:` WARN **every** session logs — D3D11, D3D12, the service,

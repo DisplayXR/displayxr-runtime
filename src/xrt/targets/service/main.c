@@ -86,22 +86,14 @@ tray_config_change_callback(const struct service_config *new_cfg)
 static void
 setup_dpi_awareness(void)
 {
-	// Enable per-monitor DPI awareness FIRST, before any window/display operations.
-	// This is critical for high-DPI displays like Leia (7680x4320 at 300% scaling).
-	// Without this, Windows reports scaled logical resolution (2560x1440) instead of
-	// physical resolution, breaking SR weaver which needs true pixel dimensions.
-	//
-	// SetProcessDpiAwarenessContext is Win10 1607+ (SDK 10.0.14393+)
-	typedef BOOL(WINAPI * PFN_SetProcessDpiAwarenessContext)(HANDLE);
-	HMODULE user32 = GetModuleHandleA("user32.dll");
-	if (user32) {
-		PFN_SetProcessDpiAwarenessContext fn =
-		    (PFN_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-		if (fn) {
-			// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
-			fn((HANDLE)(intptr_t)-4);
-		}
-	}
+	// Per-monitor DPI awareness FIRST, before any window/display operation.
+	// Without it Windows reports scaled LOGICAL resolution (2560x1440 on a 4K
+	// panel at 150%) instead of physical, breaking the weaver, which needs true
+	// pixel dimensions. Since #1201 the embedded manifest
+	// (targets/common/dpi_aware.manifest) normally has this in force before a
+	// single instruction of ours runs; this call is the backstop for builds
+	// that could not embed one, and is a no-op when the manifest applied.
+	u_win_make_process_dpi_aware(NULL);
 }
 
 // GUI subsystem entry point (no console window).

@@ -10,6 +10,10 @@
 
 #include "xrt/xrt_config_os.h"
 
+#ifdef XRT_OS_WINDOWS
+#include "util/u_windows.h"
+#endif
+
 #include <string.h>
 #include <stdio.h>
 
@@ -49,6 +53,15 @@ cli_print_help(int argc, const char **argv)
 int
 main(int argc, const char **argv)
 {
+#ifdef XRT_OS_WINDOWS
+	// #1201 — FIRST, before anything touches GDI. A DPI-unaware process is
+	// handed virtualised coordinates, so on a 4K panel at 150% scaling this
+	// tool would report (and `selftest` would ASSERT) a 2560x1440 display
+	// while every DPI-aware app on the same box reads 3840x2160. The embedded
+	// manifest normally has this in force already; the call is the backstop.
+	u_win_make_process_dpi_aware(NULL);
+#endif
+
 	if (argc <= 1) {
 		return cli_print_help(argc, argv);
 	}

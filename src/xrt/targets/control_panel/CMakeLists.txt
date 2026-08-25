@@ -32,12 +32,15 @@ if(WIN32)
 	target_compile_options(control_panel PRIVATE "$<$<C_COMPILER_ID:MSVC>:/utf-8>")
 	# SDL2 supplies the WinMain entry point via SDL2main.
 	target_link_libraries(control_panel PRIVATE SDL2::SDL2main)
-	# Embed the per-monitor-v2 DPI manifest (merged with the default UAC
-	# manifest) so the window is sized in real pixels and fits the display.
+	# Embed the SHARED per-monitor-v2 DPI manifest (merged with the default
+	# UAC manifest) so the window is sized in real pixels (no OS bitmap
+	# upscaling/blur), SDL2's HighDPI drawable matches 1:1, and
+	# SDL_GetDisplayDPI drives crisp font scaling. #1201 made this one file
+	# for every DisplayXR executable rather than a per-target copy.
 	if(MSVC)
 		target_link_options(
 			control_panel PRIVATE "/MANIFEST:EMBED"
-			"/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/control_panel.manifest"
+			"/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../common/dpi_aware.manifest"
 			)
 	endif()
 endif()

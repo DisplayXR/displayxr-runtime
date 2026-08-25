@@ -49,6 +49,18 @@ if(WIN32)
 		service_resources.rc
 	)
 	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
+
+	# #1201 — embed the shared per-monitor-v2 DPI manifest. The service already
+	# called SetProcessDpiAwarenessContext at the top of WinMain (now
+	# u_win_make_process_dpi_aware()); the manifest moves that guarantee ahead
+	# of every static initialiser and DllMain, and makes the declaration
+	# identical across all DisplayXR executables.
+	if(MSVC)
+		target_link_options(
+			displayxr-service PRIVATE "/MANIFEST:EMBED"
+			"/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../common/dpi_aware.manifest"
+			)
+	endif()
 endif()
 
 # macOS orchestrator (#61): the service auto-spawns + crash-respawns the
