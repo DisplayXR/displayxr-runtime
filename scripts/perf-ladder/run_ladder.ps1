@@ -280,7 +280,6 @@ $subjectNames = @()
 if ($cfg.PSObject.Properties['subjectProcesses'] -ne $null) { $subjectNames = @($cfg.subjectProcesses) }
 if ($subjectNames.Count -gt 0) { Log ('Subject processes (besides the client): ' + ($subjectNames -join ', ')) }
 
-$script:firstAppArmSeen = $false
 $script:aborted = $false
 for ($rep = 1; $rep -le $reps; $rep++) {
     if ($script:aborted) { break }
@@ -289,16 +288,22 @@ for ($rep = 1; $rep -le $reps; $rep++) {
         try {
             $r = Invoke-ArmSample -arm $arm -rep $rep
             if (-not $r.ok) { Log ('  FAILED: ' + ($r.flags -join ';')) }
-            # Fail fast: if the FIRST app arm produced no witness lines the app
-            # never formed a session (silent 2D fallback / no-DP / wrong
-            # runtime). Every later arm would be garbage too, so stop now with
-            # something actionable instead of burning the full run - measured
-            # twice today at ~25 min each.
-            if ($arm.app -and -not $script:firstAppArmSeen) {
-                $script:firstAppArmSeen = $true
+            # Fail fast on ANY app arm with no witness lines: the app is not in a
+            # session (silent 2D fallback / no-DP / wrong runtime), so the row is
+            # void and every later arm is likely void too. Stop with something
+            # actionable instead of burning the full run - measured twice at ~25
+            # min each.
+            #
+            # This deliberately is NOT latched to the first app arm. The per-exe
+            # HKCU GpuPreference pin has been observed flipping between runs with
+            # no known cause, and =2 reproduces the silent-2D fallback exactly -
+            # so a session can die at arm 5 of 8. A first-arm-only check lets that
+            # run finish with all 8 rows present, which LOOKS like a complete
+            # dataset. Aborting costs arms; not aborting costs the report.
+            if ($arm.app) {
                 if ($r.flags -contains 'NO_WITNESS') {
                     Log ''
-                    Log 'ABORT: the first app arm produced NO witness lines - the app is not'
+                    Log ('ABORT at arm ' + $arm.name + ' (rep ' + $rep + '): NO witness lines - the app is not')
                     Log '  running a DisplayXR session (it is most likely up as a plain 2D window).'
                     Log '  Check, in order:'
                     Log '   1. app@scanout ~0 with cost in app@other => the app built its graphics'
@@ -310,6 +315,13 @@ for ($rep = 1; $rep -le $reps; $rep++) {
                     Log '      "loaded from:" for which runtime actually loaded.'
                     Log '   3. A display processor failed to load (plug-in LoadLibrary err=126)'
                     Log '      => runtimePath is missing next to a from-source runtimeJson.'
+                    Log '   4. DXR_D3D_FORCE_GPU is set for an engine that builds its D3D device'
+                    Log '      BEFORE calling the runtime (Unity). That kills xrCreateSession even'
+                    Log '      when the pin already has it on the right adapter - the tell is a'
+                    Log '      healthy app@scanout with no witness, and Player.log carrying'
+                    Log '      "Error on graphics thread" then GfxStop. Pin via HKCU only.'
+                    Log '      If earlier arms DID produce a witness, suspect the HKCU pin flipped'
+                    Log '      mid-run (it has, cause unknown); re-check it before re-running.'
                     Log ''
                     $script:aborted = $true
                     break
