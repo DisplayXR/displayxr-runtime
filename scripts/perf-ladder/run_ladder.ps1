@@ -213,6 +213,31 @@ function Invoke-ArmSample {
     if ($orbitProc -ne $null) { Stop-Process -Id $orbitProc.Id -Force -ErrorAction SilentlyContinue }
     if ($appProc -ne $null) { Stop-Process -Id $appProc.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 }
 
+    # Unity ROTATES Player.log per launch, so by the time the run-end harvest
+    # below runs, only the last arm's log still exists - and the run-end harvest
+    # covers DisplayXR logs only, which are run-anchored and survive. Copy the
+    # app log per arm, while it exists.
+    #
+    # This is the receipt that separates "the runtime never loaded" from "the
+    # runtime loaded fine and the session died" (Error on graphics thread ->
+    # GfxStop): the DisplayXR log reads perfectly healthy in BOTH cases, so it
+    # cannot answer the question on its own. On a partner box nobody can re-run a
+    # 25-minute ladder to recover it, and no one can look over their shoulder.
+    # Native (non-Unity) arms have no Player.log; copying nothing is correct.
+    if ($arm.app -and $t0 -ne $null) {
+        $lowDir = Join-Path $env:USERPROFILE 'AppData\LocalLow'
+        if (Test-Path $lowDir) {
+            $plog = Get-ChildItem $lowDir -Filter 'Player.log' -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -gt $t0 } |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($plog -ne $null) {
+                $adst = Join-Path $outDir 'app-logs'
+                New-Item -ItemType Directory -Force $adst | Out-Null
+                Copy-Item $plog.FullName (Join-Path $adst ($arm.name + '-rep' + $rep + '-Player.log')) -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     if ($flags -contains 'GPU_COUNTER_FAIL') {
         # No usable GPU window - do NOT write a zero row (a zero row poisons
         # the median; measured: SHIP-M folded to 0 total in the first run).
@@ -322,6 +347,11 @@ for ($rep = 1; $rep -le $reps; $rep++) {
                     Log '      "Error on graphics thread" then GfxStop. Pin via HKCU only.'
                     Log '      If earlier arms DID produce a witness, suspect the HKCU pin flipped'
                     Log '      mid-run (it has, cause unknown); re-check it before re-running.'
+                    Log ''
+                    Log '  The app log for this arm has been copied to app-logs\ in the results'
+                    Log '  folder (Unity rotates it per launch, so it would not survive to the end'
+                    Log '  of the run). "Error on graphics thread" followed by GfxStop there means'
+                    Log '  the runtime loaded and the SESSION died - cause 1 or 4, not 2 or 3.'
                     Log ''
                     $script:aborted = $true
                     break
