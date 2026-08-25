@@ -20784,13 +20784,40 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 	U_LOG_W("[weave_wish] sticky screen flat regions latched: %u rect(s)", rect_count);
 
 	// Apply immediately when a wish is already live, so screen furniture goes flat
-	// without waiting for the next submit; otherwise there is nothing to
-	// republish and the next submit picks the latch up on its own.
+	// without waiting for the next submit.
+	//
+	// #1203: "the next submit picks the latch up on its own" was the old reason
+	// for skipping quietly, and it is the bug. When the client's 3D content goes
+	// away its producer STOPS SUBMITTING, so there is no next submit — and this
+	// channel is then the only thing still speaking. That is exactly the case its
+	// contract advertises: applied immediately, no submit required, "it works
+	// while the page is IDLE and producing no frames at all". Left as it was, a
+	// browser leaving an inline-3D page held the panel in 3D over ordinary 2D
+	// content forever (measured: latch arrives, no publish ever follows).
+	//
+	// So the gate no longer requires cached 3D geometry. `wish_rect_count == 0`
+	// is a legitimate republish — service_weave_publish_wish() already treats a
+	// zero-rect publish as a WITHDRAWAL, which is precisely the retraction that
+	// was missing. `zone_published` still gates it, so a client that never
+	// published cannot withdraw something it does not own.
 	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c); // #1172
 	HWND wnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
 	RECT cr = {};
-	if (c->zone_published && dp != nullptr && wnd != nullptr && c->wish_rect_count > 0 &&
-	    GetClientRect(wnd, &cr) && cr.right > 0 && cr.bottom > 0) {
+	// Named individually so a skip can SAY WHY. Five ANDed conditions with no
+	// diagnostic is how this cost a day: from outside the runtime it is not
+	// possible to tell a disabled feature from a working one that declined.
+	const bool have_published = c->zone_published;
+	const bool have_dp = dp != nullptr;
+	const bool have_window = wnd != nullptr && GetClientRect(wnd, &cr) && cr.right > 0 && cr.bottom > 0;
+	if (!(have_published && have_dp && have_window)) {
+		U_LOG_W("[weave_wish] sticky latch stored but NOT republished: %s%s%s— the next submit "
+		        "would pick it up, and if the client has stopped submitting there is no next submit "
+		        "(#1203)",
+		        have_published ? "" : "no wish published by this client ",
+		        have_dp ? "" : "no display processor ",
+		        have_window ? "" : "no usable window rect ");
+	}
+	if (have_published && have_dp && have_window) {
 		// Republish from the LAST submitted 3D rects — they are still the active
 		// geometry; only the flat set moved. Force the re-raster: the sticky list
 		// is merged in from a source the dirty check cannot see, so without this
@@ -20798,7 +20825,11 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 		c->wish_win_w = 0;
 		c->wish_win_h = 0;
 
-		struct xrt_rect last_rects[XRT_MAX_LAYERS];
+		// Zero-initialised: last_count may legitimately be 0 now (#1203), and a
+		// zero-rect publish is the withdrawal path — nothing reads the array in
+		// that case, but leaving it indeterminate invites a warning and a future
+		// reader's doubt.
+		struct xrt_rect last_rects[XRT_MAX_LAYERS] = {};
 		uint32_t last_count = c->wish_rect_count;
 		if (last_count > XRT_MAX_LAYERS) {
 			last_count = XRT_MAX_LAYERS;
