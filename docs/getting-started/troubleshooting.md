@@ -224,6 +224,55 @@ directory you've added to `PATH`.
 
 ---
 
+## Panel stuck in 3D after an app crashed
+
+**Symptom.** An app crashed (rather than exiting cleanly) and the panel is still latched in
+3D / weaving mode, indefinitely. Every place you would naturally look is clean:
+
+```
+> displayxr-cli clients
+service: connected, workspace_mode=off, clients=1
+id    pid     class          name                             session  io
+6     6676    DIAG           displayxr-cli                    ---      y  (self)
+```
+
+No app client, `workspace_mode=off`, and `displayxr-cli selftest` passes. The service is
+idle and healthy — because it is not the thing holding the panel.
+
+**Cause.** The `SwitchableLensHint` lives in the **SR platform** (`SRService.exe`), not in
+the DisplayXR runtime. A clean app teardown releases it; an access violation never does, so
+the platform keeps the lens enabled with no owner left to release it. For an **in-process**
+app (`_handle` class — every standalone demo) the runtime service was never involved at
+all: the app process created the display processor itself, and the only code that could
+have released the hint died with the app.
+
+**What does NOT fix it — try neither of these first:**
+
+- **Restarting `displayxr-service` does nothing.** The runtime never held the hint. This is
+  the first instinct and it is wrong.
+- **Killing orphaned app processes does nothing** — there are none; the app is already gone.
+
+**Fix.** Restart the SR platform services, elevated. Stop `displayxr-service` first so it is
+not holding an SR context across the restart, then bring it back:
+
+```bat
+taskkill /IM displayxr-service.exe /F
+net stop "SR Eye Tracker"  &  net stop "SR Service"
+net start "SR Service"     &  net start "SR Eye Tracker"
+start "" "C:\Program Files\DisplayXR\Runtime\displayxr-service.exe"
+```
+
+Bring the service back **non-elevated** (`start ""` from a normal prompt, or via
+`explorer.exe`) — it is the on-demand orchestrator for the shell and the WebXR bridge, and
+leaving it down or elevated breaks those until next logon.
+
+> If you are measuring anything after this, treat the panel as a fresh baseline: a latched
+> lens is exactly the kind of state that makes a later run look inexplicably different.
+
+Tracked as [#1205](https://github.com/DisplayXR/displayxr-runtime/issues/1205).
+
+---
+
 ## Eye tracking doesn't work, or the app hangs waiting for tracking
 
 **Symptom.** 3D looks wrong / doesn't follow your head, tracking never engages, or the app
