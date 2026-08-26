@@ -21668,6 +21668,38 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	const uint32_t ring = c->render.weave_ring_requested > 0 ? c->render.weave_ring_requested : 1u;
 
+	/*
+	 * #1213's lesson, applied here BEFORE this ring ships anywhere: never assume
+	 * the consumer keeps up — bound it. The ADR-029 twin shipped with "the
+	 * indices provably never coincide", which was false: `completed <= value`
+	 * bounds the consumer from above only, the slices collide at
+	 * `completed == value + 1 - RING`, and a depth-N ring tolerates the consumer
+	 * at most N-2 behind. The consumer here is Viz, whose reply loop takes stale
+	 * graced-target replies by design, so "more than one behind" is not
+	 * hypothetical traffic.
+	 *
+	 * A full ring drops the frame: skip the weave, do not rotate, do not signal.
+	 * The caller sees XRT_ERROR_WEAVE_REFUSED, which the browser already
+	 * classifies as transient (browser#103) and retries next frame — the same
+	 * degradation `atlas_read_guard` chose, and nothing that can deadlock.
+	 */
+	if (ring > 1 && c->render.weave_fence != nullptr) {
+		const uint64_t next = c->render.weave_fence_value + 1;
+		const uint64_t completed = c->render.weave_fence->GetCompletedValue();
+		if (next - completed >= ring) {
+			static std::atomic<int64_t> s_last_full_ns{0};
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			int64_t prev_ns = s_last_full_ns.load(std::memory_order_relaxed);
+			if (now_ns - prev_ns > 1000000000LL &&
+			    s_last_full_ns.compare_exchange_strong(prev_ns, now_ns)) {
+				U_LOG_W("#625 weave: output ring FULL (next=%llu completed=%llu ring=%u) — "
+				        "dropping the frame; the caller keeps its last woven output",
+				        (unsigned long long)next, (unsigned long long)completed, ring);
+			}
+			return false;
+		}
+	}
+
 	if (!weave_ensure_output(c, win_w, win_h, ring)) {
 		return false;
 	}
