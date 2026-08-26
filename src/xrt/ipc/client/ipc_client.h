@@ -250,10 +250,13 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t requested_ring_slices,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
+                                        uint32_t *out_array_slice,
+                                        uint32_t *out_slice_count,
                                         struct xrt_eye_positions *out_eyes);
 
 xrt_result_t

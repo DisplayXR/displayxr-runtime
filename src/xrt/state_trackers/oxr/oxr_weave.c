@@ -98,10 +98,13 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t requested_ring_slices,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
+                                        uint32_t *out_array_slice,
+                                        uint32_t *out_slice_count,
                                         struct xrt_eye_positions *out_eyes);
 
 xrt_result_t
@@ -399,9 +402,35 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		layout.content_view_h = lay->contentViewHeight;
 	}
 
+	/*
+	 * #625 spec v10: the caller opts into the weaved-output RING by chaining
+	 * XrWeaveRingRequestDXR. Presence is the opt-in — absence keeps the pre-v10
+	 * single-buffer shape byte for byte, which is what every shipped consumer
+	 * still expects.
+	 *
+	 * Why an opt-in at all: with one buffer the runtime overwrites the frame the
+	 * caller is reading, every frame (the weave for v+1 is performed inside this
+	 * very call, and the caller then reads a value it was told about earlier). But
+	 * turning the output into a Texture2DArray unilaterally would make every
+	 * existing caller read subresource 0 forever and show a frame `sliceCount`
+	 * submits old, so the shape change has to be negotiated.
+	 */
+	uint32_t requested_ring = 0;
+	for (const XrBaseInStructure *e = (const XrBaseInStructure *)submitInfo->next; e != NULL; e = e->next) {
+		if (e->type == XR_TYPE_WEAVE_RING_REQUEST_DXR) {
+			const XrWeaveRingRequestDXR *rr = (const XrWeaveRingRequestDXR *)e;
+			// 0 means "runtime picks"; anything non-zero is a hint the service
+			// clamps. Either way a chained struct = opted in, so floor it at 1
+			// so the request survives as non-zero on the wire.
+			requested_ring = rr->requestedSliceCount > 0 ? rr->requestedSliceCount : 1u;
+			break;
+		}
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
+	uint32_t array_slice = 0, slice_count = 1;
 	struct xrt_eye_positions eyes = {0};
 	xrt_result_t xret = comp_ipc_client_compositor_weave_submit(
 	    &sess->xcn->base, (xrt_graphics_buffer_handle_t)submitInfo->inputTexture,
@@ -410,13 +439,25 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 	    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-	    &have_out, &w, &h, &fence_value, &eyes);
+	    requested_ring, &have_out, &w, &h, &fence_value, &array_slice, &slice_count, &eyes);
 	// XRT_ERROR_WEAVE_REFUSED (the service said "not this frame") lands on the
 	// non-fatal branch; only a dead pipe loses the session. See the file header.
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
 
 	// Per-frame scalars are always valid; the shared HANDLEs are handed back
 	// only on the first submit and on re-allocation (resize → dims change).
+	// #625 spec v10: report the slice this fence value names, if the caller
+	// chained somewhere to receive it. Filled even without the ring opt-in
+	// (0 of 1), so a caller can read it unconditionally.
+	for (XrBaseOutStructure *e = (XrBaseOutStructure *)output->next; e != NULL; e = e->next) {
+		if (e->type == XR_TYPE_WEAVE_OUTPUT_SLICE_DXR) {
+			XrWeaveOutputSliceDXR *os = (XrWeaveOutputSliceDXR *)e;
+			os->arraySlice = array_slice;
+			os->sliceCount = slice_count > 0 ? slice_count : 1u;
+			break;
+		}
+	}
+
 	output->weavedTexture = NULL;
 	output->width = w;
 	output->height = h;

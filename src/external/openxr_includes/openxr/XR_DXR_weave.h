@@ -195,7 +195,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 9
+#define XR_DXR_weave_SPEC_VERSION 10
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -209,6 +209,8 @@ extern "C" {
 #define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
 #define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
 #define XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR ((XrStructureType)1004999198)
+#define XR_TYPE_WEAVE_RING_REQUEST_DXR    ((XrStructureType)1004999199)
+#define XR_TYPE_WEAVE_OUTPUT_SLICE_DXR    ((XrStructureType)1004999200)
 // 1004999199 is RESERVED for a per-submit wish MASK (an R8 texture handle
 // instead of a rect list, for callers whose flat geometry is not rectangular —
 // rounded corners, arbitrary CSS clip paths). Do not assign it to anything else.
@@ -500,6 +502,69 @@ typedef struct XrWeaveOutputDXR {
     XrBool32           eyesValid;
     XrBool32           eyesTracking;
 } XrWeaveOutputDXR;
+
+/*!
+ * @brief Opt in to a RING of weaved outputs (spec v10, #625).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next on EVERY submit. Presence is the opt-in;
+ * absence keeps the pre-v10 behaviour byte for byte.
+ *
+ * ## Why this exists
+ *
+ * Without it the runtime weaves into ONE texture that the caller reads while the
+ * runtime is already weaving the next frame into it. That is not an unlucky
+ * interleaving, it is the steady state: xrWeaveSubmitDXR performs the weave for
+ * value `v+1` and returns, and the caller then waits the fence to a value it has
+ * already been told about (at most `v`) and reads — so the producer is always a
+ * frame ahead of the consumer at read time. The woven image is view-interlaced,
+ * so a torn read is not a displaced edge but a band in which both eyes get the
+ * wrong view, i.e. a flash rather than a tear.
+ *
+ * ## The contract
+ *
+ * When this struct is chained, the runtime allocates
+ * @ref XrWeaveOutputSliceDXR::sliceCount array slices instead of one, weaves
+ * frame `v` into slice `v % sliceCount`, and reports that index back in a chained
+ * @ref XrWeaveOutputSliceDXR. Because the caller only ever reads a fence value the
+ * runtime has already published, the slice it reads can never be the slice being
+ * written.
+ *
+ * The caller MUST then read the reported slice — `weavedTexture` is a
+ * `Texture2DArray` and its subresource 0 is no longer "the frame". A caller that
+ * chains this and keeps reading subresource 0 will show a frame `sliceCount`
+ * submits old, two times out of three at the default depth.
+ *
+ * @note @p requestedSliceCount is a HINT. The runtime clamps it to what it
+ *       supports and reports the actual depth in XrWeaveOutputSliceDXR::sliceCount,
+ *       which is the only value the caller may index against. Pass 0 for "runtime
+ *       picks".
+ */
+typedef struct XrWeaveRingRequestDXR {
+    XrStructureType          type;                 //!< XR_TYPE_WEAVE_RING_REQUEST_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 requestedSliceCount;  //!< desired depth, or 0 for runtime default
+} XrWeaveRingRequestDXR;
+
+/*!
+ * @brief Which slice of the weaved output this frame landed in (spec v10, #625).
+ *
+ * Chain onto XrWeaveOutputDXR::next to receive it. Only meaningful when
+ * @ref XrWeaveRingRequestDXR was chained on the submit; without that opt-in the
+ * runtime allocates a single slice and fills `arraySlice = 0, sliceCount = 1`.
+ *
+ * This is a CHAINED struct rather than new fields on XrWeaveOutputDXR on purpose:
+ * XrWeaveOutputDXR is fixed-size and written BY the runtime, so appending to it
+ * would write past the end of an older caller's allocation.
+ *
+ * `arraySlice` corresponds to the XrWeaveOutputDXR::fenceValue returned by the
+ * same call — read that slice once the fence reaches that value.
+ */
+typedef struct XrWeaveOutputSliceDXR {
+    XrStructureType    type;        //!< XR_TYPE_WEAVE_OUTPUT_SLICE_DXR
+    void* XR_MAY_ALIAS next;
+    uint32_t           arraySlice;  //!< slice this frame was woven into
+    uint32_t           sliceCount;  //!< total slices in weavedTexture (1 = not a ring)
+} XrWeaveOutputSliceDXR;
 
 /*!
  * @brief Explicit on-screen window geometry (spec v7, #1036).
