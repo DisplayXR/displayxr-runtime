@@ -429,6 +429,8 @@ See `docs/README.md` for the full index. By task:
 | Why tracked hands follow WASD/mouse-look but NOT head parallax (rig rule — diverges from HMD VR) | `docs/adr/ADR-034-input-provider-plugins.md` § *Amendment 2* → `docs/specs/runtime/input-provider-discovery.md` §4a |
 | Tune or reason about motion-to-photon latency (late weave, repaint, VK queue tiers, deferred present, late latching) — and what the defaults are per GPU topology | `docs/reference/motion-to-photon-levers.md` |
 | GPU adapter selection on hybrid iGPU/dGPU machines (`DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU`, in-process `getenv` caveat) | `docs/reference/adapter-selection.md` |
+| Install / release DisplayXR on Android (released APKs, the two variants, the launch-once broker trap) | `docs/getting-started/android-build-guide.md` § *Installing from released artifacts* → `scripts/install-android.sh` |
+| Why the Android vendor plug-in is bundled in the runtime APK rather than installed separately | `docs/adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
 | Leia implementation internals (weaver, transparency/WGC bg-capture, chroma-key fallback, phase-snapping, 2D/3D mode switching) | `displayxr-leia-plugin` repo, [`docs/`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md) (migrated from `docs/vendors/leia/`) |

@@ -1,14 +1,71 @@
 # Android Build & Test Guide
 
-Build and deploy DisplayXR on an Android device with a Leia 3D display (Lume Pad-class hardware: Lume Pad 2, Nubia Pad 2).
+Build and deploy DisplayXR on an Android device with a Leia 3D display.
+
+> **You probably do not need this page.** Since #1212 the runtime ships
+> **released APKs**, so installing is no longer a build exercise — see
+> [Installing from released artifacts](#installing-from-released-artifacts)
+> immediately below. Everything after that is the from-source bring-up
+> path, for people changing the runtime itself.
+
+## Installing from released artifacts
+
+Every `v*` release carries two Android APKs:
+
+| asset | contents | use it when |
+|---|---|---|
+| `DisplayXR-Runtime-<ver>-android-arm64.apk` | sim-display only | no vendor display; hardware-free testing |
+| `DisplayXR-Runtime-Leia-<ver>-android-arm64.apk` | + the Leia CNSDK plug-in | **a Leia device** |
+
+Install the runtime **and** an app with:
+
+```bash
+./scripts/install-android.sh \
+    DisplayXR-Runtime-Leia-2.13.5-android-arm64.apk \
+    DisplayXRModelViewer-0.24.2.apk
+```
+
+Use the script rather than `adb install`. Two device-state requirements are
+invisible, are dropped by every reinstall, and both fail with symptoms that
+point somewhere else:
+
+- **The runtime app must be launched once.** Uninstalling it deregisters its
+  `OpenXRRuntimeBroker` ContentProvider, and Android's `FLAG_STOPPED` keeps
+  that provider unresolvable by other packages until the app is opened. Every
+  OpenXR app then dies at instance creation with
+  `Failed to find provider info for org.khronos.openxr.runtime_broker` /
+  `XR_ERROR_RUNTIME_UNAVAILABLE` — which reads as a broken runtime rather
+  than "nobody opened it". There is no `BOOT_COMPLETED` receiver to clear it.
+- **`SYSTEM_ALERT_WINDOW` must be re-granted.** It is an app-op, never granted
+  at install, and dropped by uninstall+install. Without it see-through apps
+  render on a **black background** while 3D and weaving keep working, so it
+  looks like a content bug.
+
+Then open the **DisplayXR** app on the device: its dashboard runs the same
+self-test as `displayxr-cli selftest`. On a vendor display the active plug-in
+must not be `sim-display`; a failing `vendor_dp` check means a vendor plug-in
+was present but could not load, usually an ABI mismatch between the APK and
+the plug-in inside it.
+
+Which plug-in is inside a given APK is determined by `versions.json`'s
+`leia_plugin` field at the runtime tag, so the whole stack is reproducible
+from a version string. Why the vendor plug-in is bundled rather than
+separately installed:
+[ADR-037](../adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md).
+
+---
+
+## Building from source
+
+Everything below is the from-source path.
 
 > **Plug-in split (post-#268):** the CNSDK display-processor plug-in
 > now lives in [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin)
 > and builds to `libdxrp050_leia_cnsdk.so`, which is dropped into the
 > runtime APK's `jniLibs/<ABI>/` for the runtime's plug-in loader to
-> discover at `xrCreateInstance`. The CNSDK SDK setup + AAR Gradle
-> wiring described below applies to the plug-in build, not the runtime
-> APK build. The runtime APK builds without CNSDK in scope.
+> discover at `xrCreateInstance`. That repo builds it in CI now
+> (`build-android.yml`) and attaches it to its own `v*` releases, so a
+> hand build is only needed when you are changing the plug-in.
 
 Companion docs:
 - [`android-bringup-checklist.md`](android-bringup-checklist.md) — A→B→C→D step-by-step test procedure once both APKs are built.
@@ -49,36 +106,54 @@ adb devices
 > need the runtime APK, skip to Step 2; CNSDK is pulled in when you
 > build the plug-in's `libdxrp050_leia_cnsdk.so`.
 
-The plug-in's Gradle build expects CNSDK as an extracted release tree at the plug-in repo root in `cnsdk/`. We currently pin **CNSDK 0.7.28**.
+The plug-in's CMake build expects CNSDK as an extracted release tree; point `CNSDK_ROOT` at it. Minimum **0.10.54** — 0.7.28 predates the loader architecture the plug-in compiles against and fails at runtime with "Missing required service: InterlacingService".
 
-### Fetch CNSDK 0.7.28
+### Fetch CNSDK
 
-CNSDK ships as a GitHub LFS-backed zip at
-`https://github.com/LeiaInc/leiainc.github.io/tree/master/CNSDK/cnsdk-android-0.7.28.zip`.
-
-Direct raw URLs 404 (LFS); fetch via the GitHub contents API:
+> The public `leiainc.github.io` copy is stuck at **0.7.28 and no longer
+> works**. Fetch a current build from the private `LeiaInc/CNSDK` repo
+> (needs LeiaInc org read access) — this is the same source CI uses:
 ```bash
-gh api repos/LeiaInc/leiainc.github.io/contents/CNSDK/cnsdk-android-0.7.28.zip \
-    --jq .download_url | xargs curl -L -o cnsdk-android-0.7.28.zip
-unzip cnsdk-android-0.7.28.zip -d cnsdk
+gh release download v0.10.61 -R LeiaInc/CNSDK -p 'cnsdk-android-*.zip'
+unzip cnsdk-android-*.zip -d cnsdk
 ```
 
 Result: `cnsdk/` contains
 ```
 cnsdk/
-  VERSION.txt                                       # "0.7.28"
+  VERSION.txt                                       # e.g. "0.10.61"
   android/
-    sdk-faceTrackingInApp-0.7.28.aar                # JNI lib bundled here
+    sdk-<ver>.aar                                   # Java glue + the two transitive .so
   include/leia/{common,device,headTracking,sdk}/    # C headers
-  lib/arm64-v8a/                                    # .so files
+  lib/arm64-v8a/
+    libleiaCore-loader.so                           # the shim the plug-in DT_NEEDEDs
+    libleiaSDK-jni.so                               # Java<->native bridge
   share/cmake/CNSDK/                                # find_package(CNSDK CONFIG) target
 ```
 
 The `.gitignore` already excludes `/cnsdk/`, so don't commit it.
 
+**CNSDK is a build-time dependency, not a redistributable engine.**
+`libleiaCore-loader.so` is a shim: at runtime it builds a `DexClassLoader`
+over the on-device package `com.leialoft.display.config`, reads its
+`nativeLibraryDir`, and `dlopen`s `libleiaCore-impl.so` **from there**. The
+real core, face tracking and per-device calibration live on the device — the
+same relationship Windows has with an installed `LeiaSR_runtime.dll`. What
+must ship in the APK is only the shim plus the AAR's Java glue, because
+Android has no system-wide search path for third-party natives. See
+[ADR-037](../adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md).
+
+Never republish the CNSDK zip: Leia's Creator Toolkit licence permits
+distribution "as incorporated into your Products" (§3) but forbids
+distributing the materials standalone (§4b).
+
 ### Other CNSDK versions
 
-The Gradle build is version-agnostic — it reads `cnsdk/VERSION.txt` and substitutes into AAR paths. The AAR lookup falls back through `sdk-faceTrackingInApp-<ver>.aar` → `sdk-faceTrackingService-<ver>.aar` → `sdk-<ver>.aar` so newer CNSDK packagings work without code changes. Note that 0.10+ may also require updating the CNSDK link target from `CNSDK::leiaSDK` to `CNSDK::leiaCore` in the plug-in's `drv_leia_android` CMakeLists (in `displayxr-leia-plugin`).
+The build reads `cnsdk/VERSION.txt` and substitutes it into the AAR path, and
+`find_package(CNSDK 0.10.54 ...)` enforces the floor via the SDK's own
+`CNSDKConfigVersion.cmake`. The runtime APK's gradle AAR lookup falls back
+through `sdk-faceTrackingInApp-<ver>.aar` → `sdk-faceTrackingService-<ver>.aar`
+→ `sdk-<ver>.aar`, so newer packagings work without code changes.
 
 ## Step 2: Configure `local.properties`
 
