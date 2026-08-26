@@ -234,15 +234,29 @@ comp_d3d_transparent_presenter_present(struct comp_d3d_transparent_presenter *p)
 	p->presented_value = completed;
 	p->last_present_ns = (int64_t)os_monotonic_get_ns();
 
+	/*
+	 * #1208: copy the slice this fence value names, NOT the whole resource.
+	 *
+	 * The service weaves value v+1 into slice (v+1) % RING and only THEN does this
+	 * call happen (the weave runs inside the layer-commit RPC we just returned
+	 * from). `completed` here is at most v, so the slice we read is never the one
+	 * being written. That is the entire synchronisation scheme - no keyed mutex,
+	 * no ack, nothing that can deadlock. With the old single-slice texture the
+	 * service was overwriting these exact pixels mid-copy, every frame.
+	 *
+	 * MipLevels == 1, so the subresource index IS the array slice.
+	 */
+	const UINT slice = (UINT)(completed % COMP_TRANSPARENT_OUTPUT_RING);
 	com_ptr<ID3D11Texture2D> back;
 	if (SUCCEEDED(p->swapchain->GetBuffer(0, IID_PPV_ARGS(back.put()))) && back) {
-		p->context->CopyResource(back.get(), p->output_texture.get());
+		p->context->CopySubresourceRegion(back.get(), 0, 0, 0, 0, p->output_texture.get(), slice, nullptr);
 	}
 	HRESULT phr = p->swapchain->Present(1, 0);
 	if (!p->first_present_logged) {
 		p->first_present_logged = true;
-		U_LOG_W("[ADR-029] first transparent present landed (fence=%llu hr=0x%08lx)",
-		        (unsigned long long)completed, phr);
+		U_LOG_W("[ADR-029] first transparent present landed (fence=%llu slice=%u/%u hr=0x%08lx)",
+		        (unsigned long long)completed, (unsigned)slice, (unsigned)COMP_TRANSPARENT_OUTPUT_RING,
+		        phr);
 	}
 	// Publish the new frame to dwm.exe (cheap delta-state IPC, no GPU work).
 	if (p->dcomp_device) {

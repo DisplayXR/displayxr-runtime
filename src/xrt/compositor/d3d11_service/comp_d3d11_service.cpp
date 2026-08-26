@@ -35,6 +35,11 @@
 
 #include "comp_d3d11_window.h"
 
+// #1208: COMP_TRANSPARENT_OUTPUT_RING — the service→client output ring depth. The
+// producer (here) and the consumer (the client-side presenter) must agree on it, so
+// it is defined once, in the consumer's header.
+#include "client/comp_d3d_transparent_present.h"
+
 #include "math/m_api.h"
 #include "math/m_vec3.h"
 
@@ -573,6 +578,33 @@ struct d3d11_client_render_resources
 	//! of workspace_sync_fence (service signals, client waits); both bump once
 	//! per commit, so the value stays in lockstep without per-frame IPC.
 	wil::com_ptr<ID3D11Texture2D>        transparent_output_texture;
+	//! #1208: one RTV per ring slice of @ref transparent_output_texture (which is a
+	//! COMP_TRANSPARENT_OUTPUT_RING-deep 2D ARRAY). The weave writes slice
+	//! `(transparent_output_value + 1) % RING`; the client reads `completed % RING`.
+	//! Since the client only ever copies a value the fence has already completed, and
+	//! the producer runs inside the client's own commit (so it is always ahead), those
+	//! two indices can never coincide — which is the whole synchronisation scheme. See
+	//! the constant's comment in comp_d3d_transparent_present.h.
+	//! These are used ONLY by the flat repaint, which writes a slice directly.
+	//! The weave goes through @ref transparent_weave_scratch instead — see below.
+	wil::com_ptr<ID3D11RenderTargetView> transparent_output_rtvs[COMP_TRANSPARENT_OUTPUT_RING];
+	//! #1208: the surface the DISPLAY PROCESSOR actually weaves into - a private,
+	//! NON-shared, single-slice texture, plus its RTV (which is what
+	//! `back_buffer_rtv` points at for a CLIENT_TEXTURE client).
+	//!
+	//! The DP must never be handed a slice of the ring. It resolves its output by
+	//! calling `GetResource()` on whatever RTV is bound and then operating on the
+	//! WHOLE resource as a single-slice texture - the Leia D3D11 DP, for one, does
+	//! `CopyResource(ck_strip_tex, back_buffer)` into a 1-slice staging texture,
+	//! and `CopyResource` requires identical descs, so an ArraySize=3 target makes
+	//! that copy fail silently and the pass then draws BLACK. That contract is
+	//! shipped, versioned and ABI-gated per vendor, so the runtime works around it
+	//! rather than changing it: weave into this scratch exactly as before, then
+	//! `CopySubresourceRegion` the finished frame into the ring slice. One extra
+	//! same-device full-target copy per frame, and the ring stays invisible to
+	//! every plug-in.
+	wil::com_ptr<ID3D11Texture2D>        transparent_weave_scratch;
+	wil::com_ptr<ID3D11RenderTargetView> transparent_weave_scratch_rtv;
 	HANDLE                                transparent_output_texture_handle; //!< NT handle for IPC export
 	wil::com_ptr<ID3D11Fence>            transparent_output_fence;
 	HANDLE                                transparent_output_fence_handle;   //!< NT handle for IPC export
@@ -814,6 +846,14 @@ struct d3d11_service_compositor
 	//! weaves — a background transparent client must not drive the shared
 	//! panel DP out from under whoever holds it.
 	std::atomic<bool> pipe_owns_panel{false};
+
+	//! #1208: throttles for pipeline_client_texture_weave's two 1 Hz lines. These
+	//! used to be FILE-SCOPE statics, i.e. shared by every client and every skip
+	//! reason — with two clients up, one client's skips silenced the other's line
+	//! for a whole second, so the counted "N skips" was really "N one-second windows
+	//! in which SOMEBODY skipped". Per-client, they mean what they say.
+	std::atomic<int64_t> client_texture_last_skip_ns{0};
+	std::atomic<int64_t> client_texture_last_ok_ns{0};
 
 	//! #964: pacing state for this client's presenter when it is an APP_HWND —
 	//! a foreign, frequently occluded window the render thread must never
@@ -5757,6 +5797,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 		res->transparent_output_fence_handle = nullptr;
 	}
 	res->transparent_output_fence.reset();
+	for (uint32_t i = 0; i < COMP_TRANSPARENT_OUTPUT_RING; i++) {
+		res->transparent_output_rtvs[i].reset();
+	}
+	res->transparent_weave_scratch_rtv.reset();
+	res->transparent_weave_scratch.reset();
 	res->transparent_output_texture.reset();
 
 	// #625 weave service: close the source NT handles + release resources.
@@ -5801,6 +5846,57 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->window = nullptr;
 	res->hwnd = nullptr;
 	res->owns_window = false;
+}
+
+/*!
+ * #1208: build the per-slice RTVs for a service→client transparent output ring.
+ *
+ * The output texture is a COMP_TRANSPARENT_OUTPUT_RING-deep 2D array, so each slice
+ * needs its own TEXTURE2DARRAY RTV (a NULL-desc RTV on an array texture covers ALL
+ * slices, which would put the weave in every one of them and defeat the ring).
+ *
+ * `back_buffer_rtv` is aimed at the single-slice weave SCRATCH, not at the ring, so
+ * every consumer that does not know the ring exists — `pipeline_rtv_dims`, the
+ * presenter switch's `present_rtv`, the legacy path's weave + HUD, and above all any
+ * vendor display processor calling `GetResource()` on the bound RTV — sees a plain
+ * ArraySize=1 texture exactly as before.
+ */
+static HRESULT
+svc_transparent_output_make_rtvs(struct d3d11_service_system *sys, struct d3d11_client_render_resources *res)
+{
+	D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+	rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+	rd.Texture2DArray.MipSlice = 0;
+	rd.Texture2DArray.ArraySize = 1;
+	for (uint32_t i = 0; i < COMP_TRANSPARENT_OUTPUT_RING; i++) {
+		rd.Texture2DArray.FirstArraySlice = i;
+		HRESULT hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(), &rd,
+		                                                 res->transparent_output_rtvs[i].put());
+		if (FAILED(hr)) {
+			return hr;
+		}
+	}
+	// The private weave target. Same dims/format as one ring slice, but ArraySize=1
+	// and NOT shared - this is the only thing a display processor ever sees.
+	D3D11_TEXTURE2D_DESC rd_src = {};
+	res->transparent_output_texture->GetDesc(&rd_src);
+	D3D11_TEXTURE2D_DESC sd = rd_src;
+	sd.ArraySize = 1;
+	sd.MiscFlags = 0;
+	HRESULT shr = sys->device->CreateTexture2D(&sd, nullptr, res->transparent_weave_scratch.put());
+	if (SUCCEEDED(shr)) {
+		shr = sys->device->CreateRenderTargetView(res->transparent_weave_scratch.get(), nullptr,
+		                                          res->transparent_weave_scratch_rtv.put());
+	}
+	if (FAILED(shr)) {
+		return shr;
+	}
+	// Everything generic (pipeline_rtv_dims, the presenter switch, the legacy
+	// path's weave + HUD) targets the scratch, so none of it has to know the ring
+	// exists. Only the ring-slice copy below does.
+	res->back_buffer_rtv = res->transparent_weave_scratch_rtv;
+	return S_OK;
 }
 
 /*!
@@ -6012,16 +6108,32 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			od.Width = canvas_w;
 			od.Height = canvas_h;
 			od.MipLevels = 1;
-			od.ArraySize = 1;
+			// #1208: a RING of slices, not one buffer. The weave for value v+1 is
+			// submitted INSIDE this client's commit and the client only copies a
+			// value the fence has already completed, so the producer is always
+			// ahead of the consumer — with one slice it was overwriting the pixels
+			// being copied out, every frame. Writing (v+1)%RING while the consumer
+			// reads completed%RING keeps them apart with no mutex and nothing that
+			// can deadlock. See COMP_TRANSPARENT_OUTPUT_RING.
+			od.ArraySize = COMP_TRANSPARENT_OUTPUT_RING;
 			od.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			od.SampleDesc.Count = 1;
 			od.Usage = D3D11_USAGE_DEFAULT;
 			od.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 			od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 			hr = sys->device->CreateTexture2D(&od, nullptr, res->transparent_output_texture.put());
+			if (FAILED(hr)) {
+				// #1208: name the array case explicitly. Cross-process sharing of
+				// an ArraySize>1 texture is what compositor_create_swapchain
+				// already does (ADR-032), so this should not fire — but if a
+				// driver ever refuses it, the ring is the reason and the fix is
+				// N separate textures + N handles (an IPC change), not a silent
+				// retreat to one buffer.
+				U_LOG_E("[pipeline] client-presents output: %u-slice array create failed (0x%08lx)",
+				        (unsigned)COMP_TRANSPARENT_OUTPUT_RING, hr);
+			}
 			if (SUCCEEDED(hr)) {
-				hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(), nullptr,
-				                                         res->back_buffer_rtv.put());
+				hr = svc_transparent_output_make_rtvs(sys, res);
 			}
 			wil::com_ptr<IDXGIResource1> dxgi_res1;
 			if (SUCCEEDED(hr)) {
@@ -6283,7 +6395,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		od.Width = actual_width;
 		od.Height = actual_height;
 		od.MipLevels = 1;
-		od.ArraySize = 1;
+		od.ArraySize = COMP_TRANSPARENT_OUTPUT_RING; // #1208 — see the pipeline site above
 		od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied-alpha output the client presents
 		od.SampleDesc.Count = 1;
 		od.Usage = D3D11_USAGE_DEFAULT;
@@ -6291,8 +6403,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
 		hr = sys->device->CreateTexture2D(&od, nullptr, res->transparent_output_texture.put());
 		if (SUCCEEDED(hr)) {
-			hr = sys->device->CreateRenderTargetView(res->transparent_output_texture.get(), nullptr,
-			                                         res->back_buffer_rtv.put());
+			hr = svc_transparent_output_make_rtvs(sys, res);
 		}
 		wil::com_ptr<IDXGIResource1> dxgi_res1;
 		if (SUCCEEDED(hr)) {
@@ -11198,10 +11309,82 @@ pipeline_rtv_dims(ID3D11RenderTargetView *rtv, uint32_t *out_w, uint32_t *out_h)
 }
 
 /*!
+ * #964 / #1208: copy view 0 of @p c's atlas into @p dst — the FLAT 2D repaint.
+ *
+ * "Flat" means no display processor and no weave: exactly one view, no interlace,
+ * so it carries no phase and is safe for a client that does not own the panel.
+ *
+ * Shared by the two callers that need it, on purpose — they run on DIFFERENT
+ * threads and against different destinations, and the clamping is the fiddly part:
+ *   - `pipeline_flat_present` (render thread) → an unfocused APP_HWND's back buffer
+ *   - `pipeline_client_texture_weave` (the client's own IPC thread) → the current
+ *     ring slice of a non-owning CLIENT_TEXTURE client's shared output
+ *
+ * @param ctx        Context to record the copy on — the caller's device, not ours.
+ * @param dst        Destination resource.
+ * @param dst_subres Destination subresource (the ring slice, or 0).
+ * @param dst_w,dst_h Destination dimensions, already resolved by the caller.
+ * @param clear_rtv  Optional RTV over @p dst_subres to wipe to premultiplied-
+ *                   transparent immediately before the copy, for a destination that
+ *                   may hold older content outside the clamped content rect (a ring
+ *                   slice does; a swap-chain back buffer does not). Cleared ONLY on
+ *                   the path that goes on to copy - a clear followed by a skip would
+ *                   leave the slice wiped, and the client would present that
+ *                   transparent frame a few commits later. That is a flash, i.e.
+ *                   precisely the defect this ring exists to remove.
+ * @return true if the copy was recorded. False means "skipped, nothing written" —
+ *         including the #1018 atlas-contention case, where losing the try_lock
+ *         costs one frame rather than tearing.
+ */
+static bool
+svc_flat_blit_view0(struct d3d11_service_system *sys,
+                    struct d3d11_service_compositor *c,
+                    ID3D11DeviceContext *ctx,
+                    ID3D11Resource *dst,
+                    uint32_t dst_subres,
+                    uint32_t dst_w,
+                    uint32_t dst_h,
+                    ID3D11RenderTargetView *clear_rtv)
+{
+	if (ctx == nullptr || dst == nullptr || dst_w == 0 || dst_h == 0 || c->render.atlas_texture == nullptr) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC ad = {};
+	c->render.atlas_texture->GetDesc(&ad);
+
+	uint32_t cw = c->pipe_content_w < dst_w ? c->pipe_content_w : dst_w;
+	uint32_t ch = c->pipe_content_h < dst_h ? c->pipe_content_h : dst_h;
+	if (cw == 0 || ch == 0 || cw > ad.Width || ch > ad.Height) {
+		return false;
+	}
+	// Atlas storage is R8G8B8A8_TYPELESS and the destination R8G8B8A8_UNORM —
+	// same format family, so a box copy is legal and needs no shader pass.
+	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
+	// #1018: skip rather than tear — the writing client takes render_mutex inside
+	// its own commit, so blocking here would deadlock.
+	atlas_read_guard flat_guard(sys, c);
+	if (!flat_guard.held) {
+		return false;
+	}
+	// Past every early-out: the copy WILL be recorded, so wiping first is safe.
+	if (clear_rtv != nullptr) {
+		const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		ctx->ClearRenderTargetView(clear_rtv, transparent);
+	}
+	ctx->CopySubresourceRegion(dst, dst_subres, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
+	return true;
+}
+
+/*!
  * #964 (D-3): non-focused APP_HWND presenters get a FLAT 2D present — view 0
  * of their atlas, no DP. Their windows are then neither frozen (stale pixels
  * for as long as they are unfocused) nor woven (only one client can own the
- * panel's lens at a time). Hosted / client-texture slots are simply not shown.
+ * panel's lens at a time).
+ *
+ * #1208: CLIENT_TEXTURE slots get the same courtesy now, but NOT from here —
+ * see `pipeline_client_texture_weave`. Their fence Signal must not be issued
+ * from the render thread (#1017), so their flat repaint rides their own commit.
+ * Hosted slots are still simply not shown.
  */
 static void
 pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
@@ -11256,31 +11439,14 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	if (bb_w == 0 || bb_h == 0) {
 		return;
 	}
-	D3D11_TEXTURE2D_DESC ad = {};
-	c->render.atlas_texture->GetDesc(&ad);
-
-	uint32_t cw = c->pipe_content_w < bb_w ? c->pipe_content_w : bb_w;
-	uint32_t ch = c->pipe_content_h < bb_h ? c->pipe_content_h : bb_h;
-	if (cw == 0 || ch == 0 || cw > ad.Width || ch > ad.Height) {
-		return;
-	}
 	wil::com_ptr<ID3D11Resource> bb;
 	c->render.back_buffer_rtv->GetResource(bb.put());
 	if (!bb) {
 		return;
 	}
-	// Atlas storage is R8G8B8A8_TYPELESS and the back buffer R8G8B8A8_UNORM —
-	// same format family, so a box copy is legal and needs no shader pass.
-	D3D11_BOX box = {0, 0, 0, cw, ch, 1};
-	{
-		// #1018: same rule for the courtesy repaint — skip rather than tear.
-		atlas_read_guard flat_guard(sys, c);
-		if (!flat_guard.held) {
-			sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
-		svc_out_context(sys)->CopySubresourceRegion(bb.get(), 0, 0, 0, 0, c->render.atlas_texture.get(), 0,
-		                                            &box);
+	if (!svc_flat_blit_view0(sys, c, svc_out_context(sys), bb.get(), 0, bb_w, bb_h, /*clear_rtv*/ nullptr)) {
+		sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
+		return;
 	}
 	// Never vsync-pace an unfocused window: sync interval 0 either way.
 	(void)pipeline_present_app_hwnd(c, /*paced*/ false);
@@ -12635,8 +12801,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	 * surfaced at 1 Hz rather than discarded. */
 	HRESULT phr = S_OK;
 	if (kind == PRESENTER_CLIENT_TEXTURE) {
-		// ADR-029: no Present. Signal the service->client fence; the app
-		// GPU-waits on it and presents the shared texture itself.
+			// ADR-029: no Present. #1208: UNREACHABLE under the pipeline - the
+			// PRESENTER_SELF/CLIENT_TEXTURE branch above returns before this
+			// switch, and a CLIENT_TEXTURE client's weave + Signal now happen on
+			// its OWN IPC thread in pipeline_client_texture_weave (#1017). Left
+			// in place for the switch's shape; do NOT revive it into a second
+			// producer for the shared output - it would write no slice and
+			// advance the fence past one.
 		if (fc->render.transparent_output_fence != nullptr) {
 			fc->render.transparent_output_value++;
 			sys->context->Signal(fc->render.transparent_output_fence.get(),
@@ -16901,6 +17072,80 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
  * it is serialized against the render thread exactly like weave_submit, and it
  * asserts its own DP state per #1016 rather than inheriting it.
  */
+//! #1208: which ring slice the NEXT weave/repaint writes. The client reads
+//! `completed % RING`, and `completed` can only be a value already signalled, so
+//! writing `(value + 1) % RING` is never the slice being copied out.
+static inline uint32_t
+svc_transparent_next_slice(const struct d3d11_client_render_resources *res)
+{
+	return (uint32_t)((res->transparent_output_value + 1) % COMP_TRANSPARENT_OUTPUT_RING);
+}
+
+/*!
+ * #1208: give a CLIENT_TEXTURE client a FLAT 2D frame instead of a woven one, and
+ * signal its fence so it actually presents it. Caller holds `render_mutex`.
+ *
+ * This is what a client that does not own the panel gets. It cannot be woven - the
+ * interlace phase follows the OWNER's window, so weaving here would stamp the wrong
+ * phase on this client's pixels - but "cannot be woven" was implemented as "gets
+ * nothing at all", which froze the window on its last frame for as long as another
+ * app held focus. A flat view-0 blit carries no phase, so it is always safe, and a
+ * live 2D window beats a frozen 3D one.
+ *
+ * The slice is cleared to premultiplied-transparent first: the flat content is
+ * clamped to the atlas' content rect, and this slice still holds a woven frame from
+ * RING commits ago that would otherwise show through around the edges.
+ */
+static void
+pipeline_client_texture_flat_locked(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	/*
+	 * Only for a window that is actually ON SCREEN.
+	 *
+	 * The point of this repaint is to keep a visible window live. Under a
+	 * workspace controller the client's own window is parked and the controller
+	 * composites this client's ATLAS into the panel itself, so the shared output
+	 * is not on screen at all - and measured on the live panel, repainting it
+	 * anyway costs a blit here plus a CopySubresourceRegion + `Present(1, 0)` +
+	 * DComp Commit per frame in the client, which paces that client's frame
+	 * thread to vsync for pixels nobody sees. `IsWindowVisible` is the same
+	 * cheap, non-blocking style read `pipeline_park_app_hwnd` uses to answer this
+	 * exact question, and it covers parking however it happened.
+	 */
+	if (c->render.hwnd == nullptr || !IsWindow(c->render.hwnd) || !IsWindowVisible(c->render.hwnd) ||
+	    IsIconic(c->render.hwnd)) {
+		return;
+	}
+
+	const uint32_t slice = svc_transparent_next_slice(&c->render);
+	ID3D11RenderTargetView *rtv = c->render.transparent_output_rtvs[slice].get();
+	if (rtv == nullptr || c->render.transparent_output_texture == nullptr) {
+		return;
+	}
+	uint32_t tw = 0, th = 0;
+	pipeline_rtv_dims(rtv, &tw, &th);
+
+	if (!svc_flat_blit_view0(sys, c, sys->context.get(), c->render.transparent_output_texture.get(), slice, tw,
+	                         th, rtv)) {
+		// Nothing written - do NOT advance the fence, and note that the helper did
+		// not clear either, so this slice still holds its previous frame rather than
+		// a transparent hole waiting to come round again. The client keeps showing
+		// whatever it last presented.
+		return;
+	}
+	c->render.transparent_output_value++;
+	sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
+
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	int64_t prev_ns = c->client_texture_last_skip_ns.load(std::memory_order_relaxed);
+	if (now_ns - prev_ns > 1000000000LL &&
+	    c->client_texture_last_skip_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		U_LOG_W("[client_texture] '%s' repainted FLAT (2D, no weave) - not the panel owner; "
+		        "slice=%u fence_v=%llu",
+		        c->slot_app_name, slice, (unsigned long long)c->render.transparent_output_value);
+	}
+}
+
 static void
 pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
@@ -16910,20 +17155,17 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 
 	/*
 	 * Every `return` below leaves this client's shared texture UNTOUCHED, and a
-	 * CLIENT_TEXTURE client presents that texture itself — so a silent skip here
+	 * CLIENT_TEXTURE client presents that texture itself, so a silent skip here
 	 * reads to the user as an all-transparent window with no other symptom. Name
 	 * the reason, once a second, so it can never be silent again. (The blank
 	 * window that motivated this was actually a missing client-side present, and
 	 * hunting it would have been minutes rather than hours with this line.)
+	 *
+	 * #1208: "not the panel owner" is NOT in this ladder any more. It is not a
+	 * missing resource, it is a different MODE - see the flat branch below.
 	 */
 	const char *skip = nullptr;
-	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
-		// A background transparent client must not drive the shared panel DP: the
-		// interlace phase follows the OWNER's window, so weaving here would put
-		// the wrong phase on this client's pixels. Known gap — a non-owning
-		// CLIENT_TEXTURE client's own window goes stale.
-		skip = "not the panel owner";
-	} else if (c->render.transparent_output_fence == nullptr) {
+	if (c->render.transparent_output_fence == nullptr) {
 		skip = "no service->client fence";
 	} else if (c->render.back_buffer_rtv == nullptr) {
 		skip = "no shared-texture RTV";
@@ -16931,12 +17173,14 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		skip = "no atlas texture";
 	}
 	if (skip != nullptr) {
-		static std::atomic<int64_t> s_last_skip_ns{0};
+		// #1208: per-client throttle. This was a file-scope static shared by every
+		// client and every reason, which made its own counts unreadable.
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
-		int64_t prev_ns = s_last_skip_ns.load(std::memory_order_relaxed);
-		if (now_ns - prev_ns > 1000000000LL && s_last_skip_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		int64_t prev_ns = c->client_texture_last_skip_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL &&
+		    c->client_texture_last_skip_ns.compare_exchange_strong(prev_ns, now_ns)) {
 			U_LOG_W(
-			    "[client_texture] '%s' NOT weaved — %s; its window shows whatever it last "
+			    "[client_texture] '%s' NOT weaved - %s; its window shows whatever it last "
 			    "presented (transparent, if it never got a frame)",
 			    c->slot_app_name, skip);
 		}
@@ -16951,6 +17195,15 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		return;
 	}
 
+	// #1208: not the panel owner => flat 2D instead of nothing. Still on THIS
+	// client's own IPC thread, which is the part that matters: the fence Signal
+	// inside is the call that wedged the render thread in #1017.
+	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
+		render_mutex_fair_lock flat_lock(sys);
+		pipeline_client_texture_flat_locked(sys, c);
+		return;
+	}
+
 	// #1172: same rule as the present-owner submit — an ineligible presenter's
 	// atlas and its shared output texture are both on `sys->device`, so it needs
 	// a display processor there rather than the shared panel DP, whose device
@@ -16960,8 +17213,11 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 
 	render_mutex_fair_lock lock(sys);
 
-	// Re-check under the lock: focus can move between the load and here.
+	// Re-check under the lock: focus can move between the load and here. #1208: we
+	// already hold render_mutex, so take the locked form directly - this client is
+	// still owed a frame, it just no longer gets a woven one.
 	if (!c->pipe_owns_panel.load(std::memory_order_acquire)) {
+		pipeline_client_texture_flat_locked(sys, c);
 		return;
 	}
 
@@ -16974,6 +17230,11 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 
 	uint32_t target_w = 0, target_h = 0;
 	pipeline_rtv_dims(c->render.back_buffer_rtv.get(), &target_w, &target_h);
+
+	// #1208: only advance the fence if this slice was actually written. It used
+	// to be signalled unconditionally, which told the client "here is a new
+	// frame" while pointing it at a slice holding a frame RING commits old.
+	bool wove = false;
 
 	// The panel DP is bound to this client's window by the render thread's
 	// SELF/CLIENT_TEXTURE branch; resolve it INSIDE the lock (#964 D-4).
@@ -16992,7 +17253,12 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		svc_client_weave_dp_assert_state(c, dp, service_single_client_atlas_encoding(c));
 	}
 	if (dp != nullptr && in_srv != nullptr && target_w > 0 && target_h > 0) {
-		ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
+		// #1208: the DP weaves into the private single-slice SCRATCH. It must not
+		// see the ring - it resolves its target with `GetResource()` and treats the
+		// whole resource as a 1-slice texture, so an array target makes its internal
+		// `CopyResource` staging fail and the pass draws black. The finished frame
+		// is copied into the ring slice below, where the DP cannot observe it.
+		ID3D11RenderTargetView *rtvs[] = {c->render.transparent_weave_scratch_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 		// #1013: own viewport AND scissor — a present-owner's alpha-gate pass
 		// leaves a window-sized scissor latched on this shared context.
@@ -17023,25 +17289,50 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		// ADR-029: a real weave on the panel DP. No matching count_present() —
 		// the CLIENT presents this shared texture itself (see the header note).
 		g_frame_witness_service.count_weave(!witness_take_fresh_paint(c), sys->hardware_display_3d);
+		// #1208: publish the woven frame into the slice the client will read for
+		// this fence value. Same device, GPU-local, one full-target copy - the price
+		// of keeping the ring invisible to every display processor.
+		const uint32_t slice = svc_transparent_next_slice(&c->render);
+		sys->context->CopySubresourceRegion(c->render.transparent_output_texture.get(), slice, 0, 0, 0,
+		                                    c->render.transparent_weave_scratch.get(), 0, nullptr);
+		wove = true;
 	}
 
-	{
-		static std::atomic<int64_t> s_last_ok_ns{0};
+	if (wove) {
+		// #1208: per-client throttle (was a file-scope static shared by all clients).
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
-		int64_t prev_ns = s_last_ok_ns.load(std::memory_order_relaxed);
-		if (now_ns - prev_ns > 1000000000LL && s_last_ok_ns.compare_exchange_strong(prev_ns, now_ns)) {
+		int64_t prev_ns = c->client_texture_last_ok_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL &&
+		    c->client_texture_last_ok_ns.compare_exchange_strong(prev_ns, now_ns)) {
 			U_LOG_W(
-			    "[client_texture] '%s' weaved: content=%ux%u grid=%ux%u -> target=%ux%u dp=%p fence_v=%llu",
+			    "[client_texture] '%s' weaved: content=%ux%u grid=%ux%u -> target=%ux%u dp=%p "
+			    "slice=%u fence_v=%llu",
 			    c->slot_app_name, c->pipe_content_w, c->pipe_content_h, cols, rows, target_w, target_h,
-			    (void *)dp, (unsigned long long)(c->render.transparent_output_value + 1));
+			    (void *)dp, (unsigned)svc_transparent_next_slice(&c->render),
+			    (unsigned long long)(c->render.transparent_output_value + 1));
+		}
+	} else {
+		// Nothing reached the slice (no usable DP, no crop SRV, or a zero-sized
+		// target). Leave the fence where it is; the client keeps its last good
+		// frame rather than being pointed at a slice RING commits old.
+		int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t prev_ns = c->client_texture_last_skip_ns.load(std::memory_order_relaxed);
+		if (now_ns - prev_ns > 1000000000LL &&
+		    c->client_texture_last_skip_ns.compare_exchange_strong(prev_ns, now_ns)) {
+			U_LOG_W(
+			    "[client_texture] '%s' NOT weaved - no usable display processor or atlas crop; "
+			    "fence held at %llu, its window keeps its last frame",
+			    c->slot_app_name, (unsigned long long)c->render.transparent_output_value);
 		}
 	}
 
-	// ADR-029: signal the service->client fence; the app GPU-waits on it and
-	// presents the shared texture itself. THE call that wedged the render
-	// thread — bounded here to this client's own thread.
-	c->render.transparent_output_value++;
-	sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
+	// ADR-029: signal the service->client fence. The client polls it with
+	// GetCompletedValue() and copies the matching ring slice out - THE call that
+	// wedged the render thread in #1017, bounded here to this client's own thread.
+	if (wove) {
+		c->render.transparent_output_value++;
+		sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
+	}
 }
 
 static xrt_result_t
@@ -19610,6 +19901,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	c->render.last_dp_content_w = input_view_w;
 	c->render.last_dp_content_h = input_view_h;
 
+	// #1208: nothing to rotate here - `back_buffer_rtv` IS the private weave
+	// scratch, which is exactly what the DP, the HUD pass and the no-DP fallback
+	// below all expect: a plain single-slice texture whose `GetResource()` is that
+	// texture. The finished frame is copied into the ring slice at the fence
+	// signal at the bottom of this function - the only place that knows the ring
+	// exists.
+
 	// Always pass through the display processor — both 3D (weaving) and 2D
 	// (stretch-blit). This matches the in-process compositor path where
 	// process_atlas() handles all display modes. No separate mono blit needed.
@@ -19678,7 +19976,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    back_buffer.get(), 0, 0, 0, 0,
 			    zc_tex, 0, &src_box);
 		} else if (c->render.atlas_texture) {
-			sys->context->CopyResource(back_buffer.get(), c->render.atlas_texture.get());
+			// CopySubresourceRegion, not CopyResource: the destination may be a
+			// #1208 ring array, whose desc no longer matches the 1-slice atlas.
+			sys->context->CopySubresourceRegion(back_buffer.get(), 0, 0, 0, 0,
+			                                    c->render.atlas_texture.get(), 0, nullptr);
 		}
 	}
 
@@ -19752,6 +20053,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// transparent DComp swap chain on the app's own window. Bumped once per
 	// commit, in lockstep with the client's wait counter (no per-frame IPC).
 	if (c->render.transparent_output_texture != nullptr && c->render.transparent_output_fence != nullptr) {
+		// #1208: publish the woven frame into the slice this fence value names.
+		const uint32_t pub_slice = svc_transparent_next_slice(&c->render);
+		if (c->render.transparent_weave_scratch != nullptr) {
+			sys->context->CopySubresourceRegion(c->render.transparent_output_texture.get(), pub_slice,
+			                                    0, 0, 0, c->render.transparent_weave_scratch.get(), 0,
+			                                    nullptr);
+		}
 		c->render.transparent_output_value++;
 		sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
 	}
