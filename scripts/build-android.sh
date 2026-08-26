@@ -132,6 +132,22 @@ echo "Installed $VARIANT on device."
 # back to publishing its own opaque surface, and the app renders on a BLACK
 # background with no other symptom (3D/weave keeps working). Re-grant on every
 # install so a reinstall can't silently regress transparency.
+# ---- clear FLAG_STOPPED so the runtime broker resolves ----------------------
+# Uninstalling the runtime deregisters its OpenXRRuntimeBroker ContentProvider,
+# and until the app is launched at least once Android's FLAG_STOPPED keeps that
+# provider unresolvable by OTHER packages. Every OpenXR app then dies at
+# instance creation with "Failed to find provider info for
+# org.khronos.openxr.runtime_broker" / XR_ERROR_RUNTIME_UNAVAILABLE, which reads
+# as a broken runtime rather than "nobody opened it". There is no
+# BOOT_COMPLETED receiver to clear the flag, so a silent `adb install` leaves
+# the device in a state where everything fails for a reason nothing explains.
+echo ">> adb shell am start (launch once to register the runtime broker)"
+if ! "$ADB" "${DEVICE_ARGS[@]}" shell am start \
+        -n "$PKG/org.freedesktop.monado.openxr_runtime.DashboardActivity" >/dev/null 2>&1; then
+    echo "WARN: could not launch $PKG — open the DisplayXR app on the device once," >&2
+    echo "      or every OpenXR app will fail with XR_ERROR_RUNTIME_UNAVAILABLE." >&2
+fi
+
 echo ">> adb shell appops set $PKG SYSTEM_ALERT_WINDOW allow"
 if "$ADB" "${DEVICE_ARGS[@]}" shell appops set "$PKG" SYSTEM_ALERT_WINDOW allow; then
     echo "Overlay permission (SYSTEM_ALERT_WINDOW) granted to $PKG."
