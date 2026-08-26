@@ -7,7 +7,7 @@
 # scriptable install path (#1212).
 #
 # Usage:
-#   ./scripts/install-android.sh <runtime.apk> [app.apk ...]
+#   ./scripts/install-android.sh [--force-reinstall] <runtime.apk> [app.apk ...]
 #   ./scripts/install-android.sh --uninstall
 #
 # Example, entirely from GitHub release assets:
@@ -44,6 +44,14 @@
 #
 # Order matters: runtime first, then apps. An app installed first simply
 # finds no runtime.
+#
+# SIGNING CHANGE (#1212). Released runtime APKs are signed with the DisplayXR
+# release key. Every runtime built before that was signed with the Android
+# DEBUG key, and Android refuses to upgrade an app across a signature change:
+#     INSTALL_FAILED_UPDATE_INCOMPATIBLE
+# So the first install of a released APK over a dev build needs an uninstall,
+# which drops app data AND the broker registration + the app-op — both of which
+# the steps below then restore. Pass --force-reinstall to do it automatically.
 # ============================================================
 
 set -euo pipefail
@@ -93,8 +101,14 @@ if [ "${1:-}" = "--uninstall" ]; then
     exit 0
 fi
 
+FORCE_REINSTALL=false
+if [ "${1:-}" = "--force-reinstall" ]; then
+    FORCE_REINSTALL=true
+    shift
+fi
+
 if [ $# -lt 1 ]; then
-    echo "usage: $(basename "$0") <runtime.apk> [app.apk ...]" >&2
+    echo "usage: $(basename "$0") [--force-reinstall] <runtime.apk> [app.apk ...]" >&2
     echo "       $(basename "$0") --uninstall" >&2
     exit 2
 fi
@@ -123,7 +137,34 @@ esac
 # SILENTLY (it prints only "Performing Streamed Install").
 echo
 echo ">> [1/4] installing runtime: $(basename "$RUNTIME_APK")"
-adbsh install -r -d "$RUNTIME_APK"
+if ! out="$(adbsh install -r -d "$RUNTIME_APK" 2>&1)"; then
+    echo "$out"
+    if printf '%s' "$out" | grep -q INSTALL_FAILED_UPDATE_INCOMPATIBLE; then
+        echo
+        echo "-- signature mismatch --"
+        echo "The installed $PKG was signed with a DIFFERENT key (almost always a"
+        echo "local debug build; released APKs are signed with the DisplayXR release"
+        echo "key). Android cannot upgrade across a signature change."
+        if [ "$FORCE_REINSTALL" = true ]; then
+            echo "--force-reinstall given: uninstalling and retrying."
+            adbsh uninstall "$PKG" || true
+            adbsh install -r -d "$RUNTIME_APK"
+        else
+            echo
+            echo "Re-run with --force-reinstall, or uninstall by hand:"
+            echo "    adb uninstall $PKG"
+            echo
+            echo "This drops the app's data along with the broker registration and the"
+            echo "overlay app-op — steps 2 and 3 below restore both, which is exactly"
+            echo "why you should come back through this script rather than adb install."
+            exit 1
+        fi
+    else
+        exit 1
+    fi
+else
+    echo "$out"
+fi
 
 # ---- 2. clear FLAG_STOPPED so the broker resolves ---------------------------
 echo
