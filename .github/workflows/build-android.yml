@@ -67,7 +67,7 @@ jobs:
     needs: DetectChanges
     runs-on: ubuntu-latest
 
-    # TWO APKs from ONE gradle project (#1212, ADR-037). Deliberately a CI
+    # TWO APKs from ONE gradle project (#1212, ADR-038). Deliberately a CI
     # matrix and NOT gradle product flavors — #1031 removed those on purpose,
     # because two flavors declared the same runtime_broker ContentProvider
     # authority and so could never be installed side by side.
