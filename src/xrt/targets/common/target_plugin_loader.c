@@ -71,6 +71,78 @@ static struct os_mutex g_refresh_mutex;
 static int g_refresh_mutex_initialized = 0;
 
 /*!
+ * Discovery outcome, for the `vendor_dp` self-test check (#1212).
+ *
+ * The problem it solves: `target_plugin_get_active()` returning non-NULL says
+ * only that SOMETHING claimed the system — including the vendor-neutral
+ * sim_display fallback at ProbeOrder 200. On a device that has a vendor
+ * display, that is the correct answer to the wrong question, and the self-test
+ * reported a green PASS over a black screen.
+ *
+ * Discovery attempts candidates in ascending ProbeOrder and returns on the
+ * first success, so ANY candidate attempted before the winner is by
+ * construction a better-ranked plug-in that failed to load — an ABI reject
+ * (the exact "hand-built plug-ins rot against the ABI gate" failure), a
+ * dlopen/LoadLibrary failure, or a declined probe. Counting those is therefore
+ * sufficient; no vendor names are involved, so this stays vendor-neutral and
+ * works identically on Windows, POSIX and Android.
+ *
+ * Deliberately NOT built on @ref target_plugin_enumerate: that is a stub
+ * returning 0 on Android, which is precisely the platform this check exists
+ * for.
+ */
+static int g_rejected_count = 0;   //!< better-ranked candidates that FAILED TO LOAD
+static int g_declined_count = 0;   //!< better-ranked candidates that loaded and declined
+static uint32_t g_best_rejected_order = 0xFFFFFFFFu;
+static char g_best_rejected_id[64] = {0};
+static char g_best_rejected_reason[128] = {0};
+/*! Set by try_load_one's failure paths, consumed by the discovery loop. */
+static char g_last_reject_reason[128] = {0};
+/*!
+ * True when the most recent failure was a plug-in that loaded cleanly and then
+ * DECLINED its probe. That is correct behaviour on hardware the plug-in does
+ * not serve, not a misconfiguration, so it must not fail the self-test — the
+ * distinction that keeps a dev box with a vendor plug-in registered but no
+ * panel attached from going red.
+ */
+static bool g_last_reject_declined = false;
+
+static void
+plugin_note_reject(const char *id, uint32_t probe_order)
+{
+	if (g_last_reject_declined) {
+		/* Loaded fine, said "not my hardware". Not a fault. */
+		g_declined_count++;
+		g_last_reject_declined = false;
+		g_last_reject_reason[0] = '\0';
+		return;
+	}
+	g_rejected_count++;
+	if (probe_order < g_best_rejected_order) {
+		g_best_rejected_order = probe_order;
+		snprintf(g_best_rejected_id, sizeof(g_best_rejected_id), "%s", id != NULL ? id : "?");
+		snprintf(g_best_rejected_reason, sizeof(g_best_rejected_reason), "%s",
+		         g_last_reject_reason[0] != '\0' ? g_last_reject_reason : "load or probe failed");
+	}
+	g_last_reject_reason[0] = '\0';
+}
+
+void
+target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	memset(out, 0, sizeof(*out));
+	out->rejected_count = g_rejected_count;
+	out->declined_count = g_declined_count;
+	out->active_probe_order = g_active_probe_order;
+	out->best_rejected_order = g_best_rejected_order;
+	snprintf(out->best_rejected_id, sizeof(out->best_rejected_id), "%s", g_best_rejected_id);
+	snprintf(out->best_rejected_reason, sizeof(out->best_rejected_reason), "%s", g_best_rejected_reason);
+}
+
+/*!
  * Max plug-in sources consulted when building the per-display registry
  * (issue #69 / ADR-015). One per registered plug-in — a handful in practice.
  */
@@ -444,6 +516,11 @@ load_and_probe_one(const struct plugin_entry *e,
 		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
 		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
 		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		/* #1212: carry the reason to the self-test, so a rejected vendor
+		 * plug-in reads as an ABI mismatch rather than a bare failure. */
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
+		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
+		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
 		FreeLibrary(dll);
 		return NULL;
 	}
@@ -452,6 +529,12 @@ load_and_probe_one(const struct plugin_entry *e,
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
+			/* #1212: a plug-in that LOADED and then said "not my
+			 * hardware" is behaving correctly on a box without that
+			 * panel. Only a failed LOAD is a misconfiguration, so
+			 * mark this so the vendor_dp self-test does not fail a
+			 * dev box that merely has a vendor plug-in registered. */
+			g_last_reject_declined = true;
 			FreeLibrary(dll);
 			return NULL;
 		}
@@ -644,6 +727,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
+		/* #1212: attempted in ascending ProbeOrder and failed, so this is
+		 * by construction a better-ranked plug-in than whatever wins
+		 * below. The self-test's vendor_dp check keys off this. */
+		plugin_note_reject(entries[i].id, entries[i].probe_order);
 	}
 
 	// A refresh (max_probe_order bounded by the current winner) legitimately
@@ -1485,6 +1572,11 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
 		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
 		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		/* #1212: carry the reason to the self-test, so a rejected vendor
+		 * plug-in reads as an ABI mismatch rather than a bare failure. */
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
+		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
+		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
 		dlclose(handle);
 		return NULL;
 	}
@@ -1493,6 +1585,12 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
+			/* #1212: a plug-in that LOADED and then said "not my
+			 * hardware" is behaving correctly on a box without that
+			 * panel. Only a failed LOAD is a misconfiguration, so
+			 * mark this so the vendor_dp self-test does not fail a
+			 * dev box that merely has a vendor plug-in registered. */
+			g_last_reject_declined = true;
 			dlclose(handle);
 			return NULL;
 		}
@@ -1567,6 +1665,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
+		/* #1212: attempted in ascending ProbeOrder and failed, so this is
+		 * by construction a better-ranked plug-in than whatever wins
+		 * below. The self-test's vendor_dp check keys off this. */
+		plugin_note_reject(entries[i].id, entries[i].probe_order);
 	}
 
 	// A refresh (max_probe_order bounded by the current winner) legitimately
@@ -2018,6 +2120,11 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
 		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
 		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
+		/* #1212: carry the reason to the self-test, so a rejected vendor
+		 * plug-in reads as an ABI mismatch rather than a bare failure. */
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
+		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
+		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
 		dlclose(handle);
 		return NULL;
 	}
@@ -2026,6 +2133,12 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
+			/* #1212: a plug-in that LOADED and then said "not my
+			 * hardware" is behaving correctly on a box without that
+			 * panel. Only a failed LOAD is a misconfiguration, so
+			 * mark this so the vendor_dp self-test does not fail a
+			 * dev box that merely has a vendor plug-in registered. */
+			g_last_reject_declined = true;
 			dlclose(handle);
 			return NULL;
 		}
@@ -2110,6 +2223,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 			g_active_probe_order = entries[i].probe_order;
 			return iface;
 		}
+		/* #1212: attempted in ascending ProbeOrder and failed, so this is
+		 * by construction a better-ranked plug-in than whatever wins
+		 * below. The self-test's vendor_dp check keys off this. */
+		plugin_note_reject(entries[i].id, entries[i].probe_order);
 	}
 
 	// A refresh (max_probe_order bounded by the current winner) legitimately

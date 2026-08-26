@@ -38,6 +38,7 @@
 #include "xrt/xrt_plugin.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 
 #ifdef __cplusplus
@@ -130,6 +131,47 @@ target_plugin_clear_preferred(void);
  */
 const struct xrt_plugin_iface *
 target_plugin_get_active(void);
+
+/*!
+ * Outcome of the most recent discovery pass, for the `vendor_dp` self-test
+ * check (#1212).
+ *
+ * `target_plugin_get_active()` returning non-NULL says only that SOMETHING
+ * claimed the system — including the vendor-neutral sim_display fallback at
+ * ProbeOrder 200. On hardware that has a vendor display that is the right
+ * answer to the wrong question, and the self-test reported a green PASS over
+ * a black screen.
+ *
+ * Discovery attempts candidates in ascending ProbeOrder and returns on the
+ * first success, so a non-zero @ref rejected_count means a BETTER-RANKED
+ * plug-in was present and failed to load — ABI reject, load failure, or a
+ * declined probe. That is a misconfiguration, not a pass.
+ */
+struct target_plugin_discovery_summary
+{
+	//! Better-ranked candidates that FAILED TO LOAD (ABI reject, load error,
+	//! probe error). These are misconfigurations and fail the self-test.
+	int rejected_count;
+	//! Better-ranked candidates that loaded cleanly and DECLINED their probe.
+	//! Correct behaviour on hardware they do not serve — informational only,
+	//! never a failure.
+	int declined_count;
+	//! Winning ProbeOrder, or UINT32_MAX when no plug-in is active.
+	uint32_t active_probe_order;
+	//! Best (lowest) ProbeOrder among the rejected, or UINT32_MAX if none.
+	uint32_t best_rejected_order;
+	//! Plug-in id of that best rejected candidate; empty when none.
+	char best_rejected_id[64];
+	//! Why it was rejected — ABI mismatch text where known.
+	char best_rejected_reason[128];
+};
+
+/*!
+ * Fill @p out with the discovery summary. Always safe to call; yields a
+ * zeroed struct with `rejected_count == 0` when discovery never ran.
+ */
+void
+target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out);
 
 /*!
  * Returns the @ref xrt_plugin_instance handle returned by the active
