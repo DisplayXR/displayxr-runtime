@@ -32,6 +32,23 @@ vendor plug-in is active (with a matching ABI), and the display dimensions are v
   trusted. This one fires even at 100% scaling, where the numbers coincide and
   `display_dims` cannot see the problem.
 
+A third check exists for the same reason — a green PASS that answers the wrong question
+(#1212):
+
+- `vendor_dp` fails when a **better-ranked plug-in was present at discovery and failed to
+  load**, so the runtime silently fell back to a worse one (in practice the vendor-neutral
+  sim-display). `active_plugin` cannot express this: it passes for *any* plug-in that wins
+  discovery, which is why an Android device whose vendor plug-in had rotted against the
+  ABI gate used to report a passing self-test over a black screen. The detail line names
+  the rejected plug-in, its ProbeOrder and why it was rejected — an ABI mismatch says so
+  explicitly.
+
+  **A plug-in that loads and then declines its probe is not a failure** and never trips
+  this check: declining is the correct answer on hardware that plug-in does not serve, so
+  a dev box with a vendor plug-in registered but no panel attached stays green. Likewise
+  a machine that legitimately has only sim-display: absence of a better-ranked candidate
+  never fails.
+
 **The single most useful diagnostic split:** the runtime ships a hardware-free
 **sim-display** plug-in alongside the real vendor plug-in. Force each and compare:
 

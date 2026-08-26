@@ -70,6 +70,14 @@ enum cli_selftest_result
 	//! 100%-scaled box, where the numbers happen to come out right and the
 	//! dims check above therefore cannot see the regression. Windows-only.
 	CLI_SELFTEST_NOT_DPI_AWARE = 7,
+	//! A better-ranked plug-in was present at discovery and failed to load,
+	//! so the runtime silently fell back to a worse one — in practice the
+	//! vendor-neutral sim_display (#1212). Absence of a better-ranked
+	//! candidate never fails, so hardware-free dev boxes and CI stay green;
+	//! what fails is the case where a vendor plug-in WAS there and got
+	//! rejected (the classic being an ABI-rotted hand-built plug-in), which
+	//! previously reported PASS over a black screen.
+	CLI_SELFTEST_VENDOR_DP_REJECTED = 8,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -121,6 +129,12 @@ struct cli_query_result
 	char plugin_name[128];
 	char plugin_vendor[64];
 	char plugin_version[64];
+
+	/* Discovery outcome (#1212). `vendor_dp_ok` is false only when a
+	 * BETTER-RANKED plug-in than the active one was attempted and failed —
+	 * i.e. the runtime fell back. Absence of such a candidate is fine. */
+	bool vendor_dp_ok;
+	char vendor_dp_note[256];
 
 	/* Head/display device description (valid iff head_ok). */
 	char head_str[256];

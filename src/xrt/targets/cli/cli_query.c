@@ -773,6 +773,33 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		return;
 	}
 	r->plugin_ok = true;
+
+	/* #1212 — was a BETTER-ranked plug-in present and rejected?
+	 *
+	 * plugin_ok above is true for ANY plug-in that wins discovery, including
+	 * the vendor-neutral sim_display at ProbeOrder 200. That is why a Leia
+	 * device whose vendor plug-in failed to load used to report a green PASS
+	 * while rendering nothing. Discovery attempts in ascending ProbeOrder and
+	 * returns on first success, so anything it rejected out-ranked the winner.
+	 *
+	 * ABSENCE NEVER FAILS — same rule zone_caps and input_providers already
+	 * follow — so a hardware-free dev box, CI, and a machine that legitimately
+	 * has only sim_display all stay green. */
+	struct target_plugin_discovery_summary disc;
+	target_plugin_get_discovery_summary(&disc);
+	r->vendor_dp_ok = (disc.rejected_count == 0);
+	if (r->vendor_dp_ok) {
+		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
+		         "no better-ranked plug-in failed to load (active ProbeOrder=%u, %d declined their probe)",
+		         (unsigned)disc.active_probe_order, disc.declined_count);
+	} else {
+		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
+		         "'%s' (ProbeOrder=%u) out-ranks the active plug-in but was rejected: %s — the runtime "
+		         "fell back to '%s'",
+		         disc.best_rejected_id, (unsigned)disc.best_rejected_order, disc.best_rejected_reason,
+		         iface->id ? iface->id : "?");
+	}
+
 	snprintf(r->plugin_id, sizeof(r->plugin_id), "%s", iface->id ? iface->id : "");
 	snprintf(r->plugin_name, sizeof(r->plugin_name), "%s", iface->display_name ? iface->display_name : "");
 	snprintf(r->plugin_vendor, sizeof(r->plugin_vendor), "%s", iface->vendor ? iface->vendor : "");
@@ -905,6 +932,15 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	      (!r->input_ht_expected_left || r->input_ht_left_ok) &&
 	      (!r->input_ht_expected_right || r->input_ht_right_ok))) {
 		r->result_code = CLI_SELFTEST_BAD_INPUT;
+	}
+
+	// #1212 — a better-ranked plug-in was present and rejected, so the
+	// runtime is running on a fallback DP. Applied last so a more
+	// fundamental display failure keeps its own code: this is a
+	// misconfiguration verdict, not a broken-runtime one, and everything
+	// above it still describes a runtime that came up.
+	if (r->result_code == CLI_SELFTEST_PASS && !r->vendor_dp_ok) {
+		r->result_code = CLI_SELFTEST_VENDOR_DP_REJECTED;
 	}
 }
 
@@ -1429,6 +1465,16 @@ build_checks(const struct cli_query_result *r, struct check *out)
 		snprintf(c->detail, sizeof(c->detail), "%s", "no active vendor plug-in");
 	}
 
+	// #1212 — the check that stops a sim fallback reporting PASS. See
+	// cli_query_fill() for why plugin_ok alone cannot express this.
+	// ABSENCE NEVER FAILS: ok stays true when nothing better-ranked was
+	// rejected, so hardware-free boxes and CI are unaffected.
+	c = &out[n++];
+	c->name = "vendor_dp";
+	c->ok = !r->plugin_ok || r->vendor_dp_ok;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->vendor_dp_note[0] != '\0' ? r->vendor_dp_note : "not evaluated");
+
 	c = &out[n++];
 	c->name = "display_info";
 	c->ok = r->display_info_ok;
@@ -1498,7 +1544,7 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 {
 	P(" :: DisplayXR CLI self-test (headless, no compositor)\n");
 
-	struct check checks[12];
+	struct check checks[16];
 	int n = build_checks(r, checks);
 	for (int i = 0; i < n; i++) {
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
@@ -1516,7 +1562,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
-	struct check checks[12];
+	struct check checks[16];
 	int n = build_checks(r, checks);
 	cJSON *arr = cJSON_AddArrayToObject(root, "checks");
 	for (int i = 0; i < n; i++) {
