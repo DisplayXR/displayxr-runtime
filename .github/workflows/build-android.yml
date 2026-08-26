@@ -10,6 +10,13 @@ on:
     tags:
       - 'v*'
   pull_request: {}
+  # Manual re-run. Needed because versions-bump.yml commits its
+  # `chore(versions): bump leia_plugin -> vX.Y.Z` with [skip ci], so the push
+  # that makes a NEW plug-in release visible to the leia APK leg fires no CI at
+  # all. Without this the first build of that leg after a plug-in release would
+  # be the release tag itself -- i.e. the first time it runs for real would be
+  # the one time a failure produces a broken public release.
+  workflow_dispatch: {}
 
 # Cancel any in-progress run for the same PR (or branch) when a new
 # push comes in. Only the latest commit's CI completes.
