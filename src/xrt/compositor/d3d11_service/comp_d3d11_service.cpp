@@ -21603,6 +21603,36 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	 * racy single buffer and hand the caller a slice index it can no longer trust.
 	 * Zero request + never latched = pre-v10 behaviour, byte for byte.
 	 */
+	/*
+	 * DEV-ONLY: force the ring on without the extension opt-in.
+	 *
+	 * The ring is negotiated, so until a consumer ships the opt-in the >1 path has
+	 * no way to be exercised on real hardware — and an unexercised weave-target
+	 * shape change is exactly what shipped a black window in #1208. This makes it
+	 * reachable from any existing caller.
+	 *
+	 * It deliberately BREAKS a caller that has not opted in: that caller keeps
+	 * reading subresource 0 while the runtime writes 0,1,2,… so its picture goes
+	 * stale/wrong. That is the point — it is the proof that the opt-in gate is
+	 * load-bearing rather than decorative.
+	 */
+	{
+		static int s_force = -1;
+		if (s_force < 0) {
+			const char *e = getenv("DXR_WEAVE_RING_FORCE");
+			s_force = (e != nullptr && e[0] != 0) ? atoi(e) : 0;
+			if (s_force > 0) {
+				U_LOG_W("#625 DXR_WEAVE_RING_FORCE=%d — forcing the output ring on WITHOUT the "
+				        "XrWeaveRingRequestDXR opt-in. A caller that reads subresource 0 will "
+				        "show stale frames; that is expected and is the point of the flag.",
+				        s_force);
+			}
+		}
+		if (s_force > 0 && requested_ring_slices == 0) {
+			requested_ring_slices = (uint32_t)s_force;
+		}
+	}
+
 	if (requested_ring_slices > 0) {
 		uint32_t want = requested_ring_slices;
 		if (want > COMP_WEAVE_OUTPUT_RING_MAX) {

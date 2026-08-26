@@ -2453,6 +2453,11 @@ struct oxr_session
 		bool exported;
 		uint32_t last_w;
 		uint32_t last_h;
+		//! #625 spec v10: slice count of the last exported weavedTexture. A ring
+		//! depth change REALLOCATES the output (and closes the old NT handle)
+		//! without changing its dimensions, so keying re-export on dims alone
+		//! would leave the caller holding a handle to a destroyed texture.
+		uint32_t last_slice_count;
 	} weave;
 #endif
 

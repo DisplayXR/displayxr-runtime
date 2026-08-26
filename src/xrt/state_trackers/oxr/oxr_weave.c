@@ -480,7 +480,10 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
 	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
 
-	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
+	// #625 spec v10: a ring-depth change reallocates the output WITHOUT changing
+	// its dimensions, so slice_count is part of "are my handles still valid".
+	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h ||
+	                   slice_count != sess->weave.last_slice_count;
 	if (have_out && w != 0 && h != 0 && need_export) {
 		bool have_tex = false;
 		uint32_t gw = 0, gh = 0;
@@ -505,6 +508,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		sess->weave.exported = true;
 		sess->weave.last_w = w;
 		sess->weave.last_h = h;
+		sess->weave.last_slice_count = slice_count;
 	}
 
 	return XR_SUCCESS;
