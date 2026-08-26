@@ -193,12 +193,21 @@ jobs:
 
           # 2. CNSDK, for the AAR (Java glue + the two transitive .so).
           mkdir -p _cnsdk_zip _cnsdk
+          # The [0-9] is load-bearing: the release also carries
+          # cnsdk-android-symbols-<ver>.zip, so a bare cnsdk-android-*.zip
+          # downloads BOTH, and unzip then reads the second path as a filter
+          # argument for the first archive and exits 11.
           if ! GH_TOKEN="$LEIA_TOKEN" gh release download "$CNSDK_TAG" -R LeiaInc/CNSDK \
-                 -p 'cnsdk-android-*.zip' -D _cnsdk_zip; then
-            echo "::error::Could not download cnsdk-android-*.zip from LeiaInc/CNSDK@$CNSDK_TAG. Check the tag and that LEIALOFT_GITHUB_TOKEN can read LeiaInc/CNSDK."
+                 -p 'cnsdk-android-[0-9]*.zip' -D _cnsdk_zip; then
+            echo "::error::Could not download cnsdk-android-[0-9]*.zip from LeiaInc/CNSDK@$CNSDK_TAG. Check the tag and that LEIALOFT_GITHUB_TOKEN can read LeiaInc/CNSDK."
             exit 1
           fi
-          unzip -q _cnsdk_zip/cnsdk-android-*.zip -d _cnsdk
+          n=$(ls _cnsdk_zip/*.zip 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$n" != 1 ]; then
+            echo "::error::expected exactly 1 CNSDK zip, got $n:"; ls -la _cnsdk_zip
+            exit 1
+          fi
+          unzip -q "$(ls _cnsdk_zip/*.zip)" -d _cnsdk
           # Derive the root from VERSION.txt so the zip's top-level layout
           # (flat vs nested) does not matter. build.gradle's resolveCnsdkDir
           # wants <dir>/VERSION.txt + <dir>/android/sdk-<ver>.aar.
