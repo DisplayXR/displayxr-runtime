@@ -11285,6 +11285,14 @@ pipeline_rtv_dims(ID3D11RenderTargetView *rtv, uint32_t *out_w, uint32_t *out_h)
  * @param dst        Destination resource.
  * @param dst_subres Destination subresource (the ring slice, or 0).
  * @param dst_w,dst_h Destination dimensions, already resolved by the caller.
+ * @param clear_rtv  Optional RTV over @p dst_subres to wipe to premultiplied-
+ *                   transparent immediately before the copy, for a destination that
+ *                   may hold older content outside the clamped content rect (a ring
+ *                   slice does; a swap-chain back buffer does not). Cleared ONLY on
+ *                   the path that goes on to copy - a clear followed by a skip would
+ *                   leave the slice wiped, and the client would present that
+ *                   transparent frame a few commits later. That is a flash, i.e.
+ *                   precisely the defect this ring exists to remove.
  * @return true if the copy was recorded. False means "skipped, nothing written" —
  *         including the #1018 atlas-contention case, where losing the try_lock
  *         costs one frame rather than tearing.
@@ -11296,7 +11304,8 @@ svc_flat_blit_view0(struct d3d11_service_system *sys,
                     ID3D11Resource *dst,
                     uint32_t dst_subres,
                     uint32_t dst_w,
-                    uint32_t dst_h)
+                    uint32_t dst_h,
+                    ID3D11RenderTargetView *clear_rtv)
 {
 	if (ctx == nullptr || dst == nullptr || dst_w == 0 || dst_h == 0 || c->render.atlas_texture == nullptr) {
 		return false;
@@ -11317,6 +11326,11 @@ svc_flat_blit_view0(struct d3d11_service_system *sys,
 	atlas_read_guard flat_guard(sys, c);
 	if (!flat_guard.held) {
 		return false;
+	}
+	// Past every early-out: the copy WILL be recorded, so wiping first is safe.
+	if (clear_rtv != nullptr) {
+		const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		ctx->ClearRenderTargetView(clear_rtv, transparent);
 	}
 	ctx->CopySubresourceRegion(dst, dst_subres, 0, 0, 0, c->render.atlas_texture.get(), 0, &box);
 	return true;
@@ -11391,7 +11405,7 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 	if (!bb) {
 		return;
 	}
-	if (!svc_flat_blit_view0(sys, c, svc_out_context(sys), bb.get(), 0, bb_w, bb_h)) {
+	if (!svc_flat_blit_view0(sys, c, svc_out_context(sys), bb.get(), 0, bb_w, bb_h, /*clear_rtv*/ nullptr)) {
 		sys->render_diag_pipe_flat_skip.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
@@ -17046,6 +17060,24 @@ svc_transparent_next_slice(const struct d3d11_client_render_resources *res)
 static void
 pipeline_client_texture_flat_locked(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
+	/*
+	 * Only for a window that is actually ON SCREEN.
+	 *
+	 * The point of this repaint is to keep a visible window live. Under a
+	 * workspace controller the client's own window is parked and the controller
+	 * composites this client's ATLAS into the panel itself, so the shared output
+	 * is not on screen at all - and measured on the live panel, repainting it
+	 * anyway costs a blit here plus a CopySubresourceRegion + `Present(1, 0)` +
+	 * DComp Commit per frame in the client, which paces that client's frame
+	 * thread to vsync for pixels nobody sees. `IsWindowVisible` is the same
+	 * cheap, non-blocking style read `pipeline_park_app_hwnd` uses to answer this
+	 * exact question, and it covers parking however it happened.
+	 */
+	if (c->render.hwnd == nullptr || !IsWindow(c->render.hwnd) || !IsWindowVisible(c->render.hwnd) ||
+	    IsIconic(c->render.hwnd)) {
+		return;
+	}
+
 	const uint32_t slice = svc_transparent_next_slice(&c->render);
 	ID3D11RenderTargetView *rtv = c->render.transparent_output_rtvs[slice].get();
 	if (rtv == nullptr || c->render.transparent_output_texture == nullptr) {
@@ -17054,12 +17086,12 @@ pipeline_client_texture_flat_locked(struct d3d11_service_system *sys, struct d3d
 	uint32_t tw = 0, th = 0;
 	pipeline_rtv_dims(rtv, &tw, &th);
 
-	const float transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-	sys->context->ClearRenderTargetView(rtv, transparent);
 	if (!svc_flat_blit_view0(sys, c, sys->context.get(), c->render.transparent_output_texture.get(), slice, tw,
-	                         th)) {
-		// Nothing written - do NOT advance the fence, or the client would present a
-		// cleared slice and flash to transparent. It keeps its last frame instead.
+	                         th, rtv)) {
+		// Nothing written - do NOT advance the fence, and note that the helper did
+		// not clear either, so this slice still holds its previous frame rather than
+		// a transparent hole waiting to come round again. The client keeps showing
+		// whatever it last presented.
 		return;
 	}
 	c->render.transparent_output_value++;
