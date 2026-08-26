@@ -17072,13 +17072,54 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
  * it is serialized against the render thread exactly like weave_submit, and it
  * asserts its own DP state per #1016 rather than inheriting it.
  */
-//! #1208: which ring slice the NEXT weave/repaint writes. The client reads
-//! `completed % RING`, and `completed` can only be a value already signalled, so
-//! writing `(value + 1) % RING` is never the slice being copied out.
+//! #1208: which ring slice the NEXT weave/repaint writes.
 static inline uint32_t
 svc_transparent_next_slice(const struct d3d11_client_render_resources *res)
 {
 	return (uint32_t)((res->transparent_output_value + 1) % COMP_TRANSPARENT_OUTPUT_RING);
+}
+
+/*!
+ * #1208 follow-up: is the ring FULL — i.e. would the next write land on a slice
+ * the client may still be copying out?
+ *
+ * The original ring shipped with a claimed invariant: "the client reads
+ * `completed % RING`, and `completed` can only be a value already signalled, so
+ * writing `(value + 1) % RING` is never the slice being copied out." That is
+ * FALSE, and the error is instructive: `completed <= value` bounds the consumer
+ * from ABOVE only. It says nothing about how far BEHIND it can fall, and that is
+ * the whole question.
+ *
+ * The slices collide when `completed ≡ value + 1 (mod RING)`, whose first case is
+ * `completed == value + 1 - RING` — at RING 3, the consumer exactly two signals
+ * behind. So a ring of depth N tolerates the consumer being at most **N-2**
+ * behind, not N-1: depth 3 tolerates ONE. The original reasoning had that off by
+ * one in the dangerous direction and called the result "provable", when it was an
+ * assumption that the GPU never falls two signals behind CPU submission.
+ *
+ * That assumption also got weaker, not stronger, when the weave moved to
+ * scratch-then-publish: the publish adds a full-target copy per frame (~132 MB
+ * per client per frame at 7680x4320), and deeper GPU queueing is exactly what
+ * reaches `completed == value - 2`.
+ *
+ * So bound it explicitly instead of assuming it. This is real back-pressure and
+ * it costs nothing structural: no mutex, no cross-process wait, nothing that can
+ * deadlock. A full ring degrades to a DROPPED FRAME — the same deliberate failure
+ * mode `atlas_read_guard` already uses — and the client simply keeps showing the
+ * frame it last presented.
+ *
+ * Found by the 8k-box agent reviewing the merged #1209.
+ */
+static inline bool
+svc_transparent_ring_full(const struct d3d11_client_render_resources *res)
+{
+	if (res->transparent_output_fence == nullptr) {
+		return false;
+	}
+	// `completed` never exceeds the last signalled value, so this cannot wrap.
+	const uint64_t next = res->transparent_output_value + 1;
+	const uint64_t completed = res->transparent_output_fence->GetCompletedValue();
+	return (next - completed) >= COMP_TRANSPARENT_OUTPUT_RING;
 }
 
 /*!
@@ -17114,6 +17155,11 @@ pipeline_client_texture_flat_locked(struct d3d11_service_system *sys, struct d3d
 	 */
 	if (c->render.hwnd == nullptr || !IsWindow(c->render.hwnd) || !IsWindowVisible(c->render.hwnd) ||
 	    IsIconic(c->render.hwnd)) {
+		return;
+	}
+
+	// #1208 follow-up: never write the slice the client may still be reading.
+	if (svc_transparent_ring_full(&c->render)) {
 		return;
 	}
 
@@ -17171,6 +17217,12 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		skip = "no shared-texture RTV";
 	} else if (c->render.atlas_texture == nullptr) {
 		skip = "no atlas texture";
+	}
+	// #1208 follow-up: the ring is full — the client has not consumed enough for
+	// the next write to be safe. Drop this frame rather than overwrite a slice
+	// being copied out; the client keeps showing its last presented frame.
+	if (skip == nullptr && svc_transparent_ring_full(&c->render)) {
+		skip = "ring full (client behind)";
 	}
 	if (skip != nullptr) {
 		// #1208: per-client throttle. This was a file-scope static shared by every
@@ -20052,7 +20104,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// service→client fence so the CLIENT can GPU-wait then present it via a
 	// transparent DComp swap chain on the app's own window. Bumped once per
 	// commit, in lockstep with the client's wait counter (no per-frame IPC).
-	if (c->render.transparent_output_texture != nullptr && c->render.transparent_output_fence != nullptr) {
+	// #1208 follow-up: same back-pressure as the pipeline path — a full ring means
+	// the next publish would land on a slice the client may still be copying out,
+	// so drop the frame instead. The weave itself has already run into the private
+	// scratch; only the publish + signal are skipped, so nothing half-written
+	// reaches the client and it keeps showing its last presented frame.
+	if (c->render.transparent_output_texture != nullptr && c->render.transparent_output_fence != nullptr &&
+	    !svc_transparent_ring_full(&c->render)) {
 		// #1208: publish the woven frame into the slice this fence value names.
 		const uint32_t pub_slice = svc_transparent_next_slice(&c->render);
 		if (c->render.transparent_weave_scratch != nullptr) {
