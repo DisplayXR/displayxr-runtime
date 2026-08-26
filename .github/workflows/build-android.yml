@@ -18,7 +18,10 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  # write: the APK is attached to v* releases alongside the Windows .exe,
+  # the macOS .pkg and the Linux .deb (#1212). Android was the only platform
+  # whose artifact existed solely as an expiring workflow artifact.
+  contents: write
 
 jobs:
   DetectChanges:
@@ -64,11 +67,40 @@ jobs:
     needs: DetectChanges
     runs-on: ubuntu-latest
 
+    # TWO APKs from ONE gradle project (#1212, ADR-038). Deliberately a CI
+    # matrix and NOT gradle product flavors — #1031 removed those on purpose,
+    # because two flavors declared the same runtime_broker ContentProvider
+    # authority and so could never be installed side by side.
+    #
+    #   neutral : sim-display only. Keeps the ADR-019 "no vendor material in
+    #             the runtime" guard, and is the hardware-free CI smoke build.
+    #   leia    : carries the Leia CNSDK plug-in .so + the CNSDK Java glue.
+    #             This is the APK that can actually weave on a Leia device.
+    #
+    # Why bundling is correct on Android (and not a weakening of ADR-019):
+    # the plug-in loader resolves its search root with dladdr() on its own
+    # code and scans only that directory, and target_plugin_loader.c defers
+    # multi-APK discovery as "a v2 problem requiring PackageManager queries
+    # via JNI". Independently, CNSDK's Java glue must resolve from the RUNTIME
+    # APK's classloader (#1037). A separate vendor APK is therefore not
+    # implementable today; keeping the neutral variant preserves the boundary
+    # the ADR actually cares about.
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [neutral, leia]
+
     env:
       DOCS_ONLY: ${{ needs.DetectChanges.outputs.docs_only }}
       # Pin NDK to the version openxr_android/build.gradle reads from
       # gradle.properties. Bump together.
       ANDROID_NDK_VERSION: '26.3.11579264'
+      # CNSDK release on the private LeiaInc/CNSDK repo, for the leia variant.
+      # CNSDK is a BUILD/PACKAGING dependency only: libleiaCore-loader.so is a
+      # shim that dlopens libleiaCore-impl.so out of the ON-DEVICE package, so
+      # the real core, face tracking and per-device calibration are never
+      # redistributed. Same shape as Windows assuming an installed SR runtime.
+      CNSDK_TAG: v0.10.61
 
     steps:
 
@@ -120,11 +152,96 @@ jobs:
           restore-keys: |
             gradle-android-${{ runner.os }}-
 
-      - name: Build runtime APK
-        if: needs.DetectChanges.outputs.docs_only != 'true'
+      # ---- leia variant only: assemble the vendor payload ----------------
+      #
+      # Two independent fetches, both soft-skipping when unavailable so fork
+      # PRs stay green:
+      #   1. libdxrp050_leia_cnsdk.so from the displayxr-leia-plugin release
+      #      named by versions.json's `leia_plugin` field. Reading the PIN —
+      #      rather than "latest" — is what makes this APK reproducible:
+      #      (runtime tag, versions.json) determines exactly what is inside it.
+      #   2. The CNSDK tree, for the Java glue + the two transitive .so files
+      #      the AAR carries (libleiaCore-loader.so, libleiaSDK-jni.so).
+      - name: Resolve leia payload
+        id: payload
+        if: matrix.variant == 'leia' && needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEIA_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PIN=$(python3 -c "import json;print(json.load(open('versions.json'))['leia_plugin'])")
+          echo "versions.json leia_plugin pin: $PIN"
+
+          if [ -z "${LEIA_TOKEN:-}" ]; then
+            echo "::warning::LEIALOFT_GITHUB_TOKEN absent (fork PR?) — skipping the leia APK variant. Add the secret to build it."
+            echo "have_payload=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 1. plug-in .so, from the pinned plug-in release.
+          mkdir -p _plugin
+          if ! gh release download "$PIN" -R DisplayXR/displayxr-leia-plugin \
+                 -p 'displayxr-leia-cnsdk-*-android-arm64-v8a.tar.gz' -D _plugin; then
+            echo "::warning::No Android plug-in asset on displayxr-leia-plugin@$PIN — that release predates the plug-in's Android CI. Skipping the leia variant."
+            echo "have_payload=no" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tar -xzf _plugin/*.tar.gz -C _plugin
+          PLUGIN_SO=$(find _plugin -name libdxrp050_leia_cnsdk.so | head -1)
+          test -n "$PLUGIN_SO" || { echo "::error::tarball has no libdxrp050_leia_cnsdk.so"; exit 1; }
+
+          # 2. CNSDK, for the AAR (Java glue + the two transitive .so).
+          mkdir -p _cnsdk_zip _cnsdk
+          if ! GH_TOKEN="$LEIA_TOKEN" gh release download "$CNSDK_TAG" -R LeiaInc/CNSDK \
+                 -p 'cnsdk-android-*.zip' -D _cnsdk_zip; then
+            echo "::error::Could not download cnsdk-android-*.zip from LeiaInc/CNSDK@$CNSDK_TAG. Check the tag and that LEIALOFT_GITHUB_TOKEN can read LeiaInc/CNSDK."
+            exit 1
+          fi
+          unzip -q _cnsdk_zip/cnsdk-android-*.zip -d _cnsdk
+          # Derive the root from VERSION.txt so the zip's top-level layout
+          # (flat vs nested) does not matter. build.gradle's resolveCnsdkDir
+          # wants <dir>/VERSION.txt + <dir>/android/sdk-<ver>.aar.
+          VF=$(find _cnsdk -name VERSION.txt | head -1)
+          test -n "$VF" || { echo "::error::CNSDK VERSION.txt not found — layout changed"; exit 1; }
+          CNSDK_DIR=$(cd "$(dirname "$VF")" && pwd)
+          CNSDK_VER=$(tr -d '[:space:]' < "$VF")
+          test -f "$CNSDK_DIR/android/sdk-${CNSDK_VER}.aar" \
+            || { echo "::error::$CNSDK_DIR/android/sdk-${CNSDK_VER}.aar missing"; exit 1; }
+
+          # Drop the plug-in .so into the (gitignored) jniLibs dir. The AAR
+          # supplies libleiaCore-loader.so + libleiaSDK-jni.so, so they are
+          # deliberately NOT copied here — one source, no duplicates.
+          JNI=src/xrt/targets/openxr_android/src/main/jniLibs/arm64-v8a
+          mkdir -p "$JNI"
+          cp "$PLUGIN_SO" "$JNI/"
+
+          echo "have_payload=yes" >> "$GITHUB_OUTPUT"
+          echo "plugin_pin=$PIN" >> "$GITHUB_OUTPUT"
+          echo "cnsdk_dir=$CNSDK_DIR" >> "$GITHUB_OUTPUT"
+          echo "cnsdk_version=$CNSDK_VER" >> "$GITHUB_OUTPUT"
+          echo "leia plug-in $PIN + CNSDK $CNSDK_VER staged"
+
+      # Never publish an unsigned APK. The decode writes ANDROID_KEYSTORE_FILE
+      # to $GITHUB_ENV, which build.gradle reads and the attach step gates on.
+      - name: Decode release keystore
+        id: keystore
+        if: needs.DetectChanges.outputs.docs_only != 'true' && env.ANDROID_KEYSTORE_BASE64 != ''
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      - name: Build runtime APK (${{ matrix.variant }})
+        id: build
+        if: needs.DetectChanges.outputs.docs_only != 'true' && (matrix.variant == 'neutral' || steps.payload.outputs.have_payload == 'yes')
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           # Gradle wrapper reads sdk.dir from local.properties OR
           # ANDROID_HOME/ANDROID_SDK_ROOT env vars. nttld/setup-ndk
@@ -133,37 +250,110 @@ jobs:
           # we pass via ANDROID_NDK_HOME above). The build.gradle's
           # externalNativeBuild block uses ANDROID_NDK_HOME to resolve
           # the toolchain.
+          #
+          # assembleRelease on EVERY run, not just tags: building the release
+          # variant only at tag time would make the first tag the first test
+          # of it. Without a keystore gradle emits an unsigned release APK
+          # rather than failing, which is what keeps fork PRs green.
           chmod +x ./gradlew
-          ./gradlew :src:xrt:targets:openxr_android:assembleDebug --no-daemon --stacktrace
+          ARGS=""
+          if [ "${{ matrix.variant }}" = "leia" ]; then
+            ARGS="-PcnsdkDir=${{ steps.payload.outputs.cnsdk_dir }}"
+          fi
+          ./gradlew :src:xrt:targets:openxr_android:assembleRelease --no-daemon --stacktrace $ARGS
 
-      - name: Inspect APK contents
-        if: needs.DetectChanges.outputs.docs_only != 'true'
+      - name: Inspect APK contents (${{ matrix.variant }})
+        if: steps.build.outcome == 'success'
         run: |
-          APK=src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
-          echo "APK size: $(du -h "$APK" | cut -f1)"
+          set -euo pipefail
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
           echo "Native libs:"
           unzip -l "$APK" | grep '\.so$' || echo "(none)"
+
+          need() {
+            if ! unzip -l "$APK" | grep -q "lib/arm64-v8a/$1"; then
+              echo "::error::APK is missing lib/arm64-v8a/$1 — $2"
+              exit 1
+            fi
+            echo "  ok: $1"
+          }
+
           # Sanity: confirm the .so name in the APK matches what the
           # AndroidManifest expects. Mismatch silently fails on device.
-          MANIFEST_SO=openxr_displayxr.so
-          if ! unzip -l "$APK" | grep -q "lib/arm64-v8a/$MANIFEST_SO"; then
-            echo "::error::APK is missing lib/arm64-v8a/$MANIFEST_SO — manifest references it but it's not bundled"
-            exit 1
-          fi
-          # ADR-019 guard: post-restructure, no CNSDK .so may be packaged
-          # in the runtime APK (the plug-in repo handles CNSDK delivery).
-          # Hard-fail to mirror build-windows.yml's vendor-symbol assertion —
-          # a warning would let a re-added CNSDK AAR dep slip through CI.
-          if unzip -l "$APK" | grep -q 'libleiaSDK'; then
-            echo "::error::CNSDK .so leaked into runtime APK — openxr_android/build.gradle must not re-add a CNSDK AAR dep (ADR-019). CNSDK ships from displayxr-leia-plugin as libdxrp050_leia_cnsdk.so."
-            exit 1
+          need openxr_displayxr.so "the manifest references it but it is not bundled"
+          # The neutral fallback DP. Asserted because src/xrt/drivers/CMakeLists
+          # documents an if(TARGET ...) ordering hazard that has ALREADY
+          # silently dropped this plug-in from a build once — and without this
+          # line CI would not have noticed a device with zero plug-ins.
+          need libdxrp200_sim_display.so "drv_sim_display_plugin dropped out of the CMake target list"
+
+          if [ "${{ matrix.variant }}" = "neutral" ]; then
+            # ADR-019 guard for the vendor-neutral APK. Note this is the EXACT
+            # filename, not a substring: 'libleiaSDK' also matches the
+            # legitimate AAR-supplied libleiaSDK-jni.so, so a substring grep
+            # would make the leia variant unbuildable and was only ever green
+            # because jniLibs/ is gitignored and empty on a runner.
+            if unzip -l "$APK" | grep -qE 'lib/arm64-v8a/(libleiaSDK\.so|libleia|libdxrp050)'; then
+              echo "::error::vendor material leaked into the NEUTRAL runtime APK (ADR-019). The neutral variant must carry sim-display only."
+              unzip -l "$APK" | grep -E 'libleia|libdxrp'
+              exit 1
+            fi
+            echo "  ok: no vendor material (ADR-019)"
+          else
+            # Positive assertions for the vendor APK: the plug-in and the
+            # loader shim it DT_NEEDEDs must both be present, or the plug-in
+            # silently fails to dlopen and the runtime falls back to
+            # sim-display — the exact black-screen-with-a-passing-selftest
+            # failure #1212 describes.
+            need libdxrp050_leia_cnsdk.so "the leia payload did not reach jniLibs"
+            need libleiaCore-loader.so "the CNSDK AAR did not contribute its native libs"
           fi
 
+      - name: Stage the APK with a release name
+        id: stage
+        if: steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="dev-${GITHUB_SHA::8}"
+          case "${{ matrix.variant }}" in
+            neutral) NAME="DisplayXR-Runtime-${VER}-android-arm64.apk" ;;
+            leia)    NAME="DisplayXR-Runtime-Leia-${VER}-android-arm64.apk" ;;
+          esac
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          mkdir -p out
+          cp "$APK" "out/$NAME"
+          # An -unsigned.apk basename is gradle telling us no keystore was
+          # applied. Surface it here rather than at the attach step.
+          case "$(basename "$APK")" in
+            *unsigned*) echo "signed=no"  >> "$GITHUB_OUTPUT" ;;
+            *)          echo "signed=yes" >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          ls -la out
+
       - name: Upload APK
-        if: needs.DetectChanges.outputs.docs_only != 'true'
+        if: steps.stage.outcome == 'success'
         uses: actions/upload-artifact@v6
         with:
-          name: DisplayXR-Android-debug
-          path: src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
+          name: DisplayXR-Android-${{ matrix.variant }}
+          path: out/*.apk
           if-no-files-found: error
           retention-days: 14
+
+      # NOTE: no generate_release_notes — build-windows.yml owns that flag.
+      # The action create-or-updates, so whichever platform workflow finishes
+      # first on the tag creates the release and the rest append assets.
+      - name: Attach APK to GitHub release on tag
+        if: steps.stage.outcome == 'success' && startsWith(github.ref, 'refs/tags/v') && steps.stage.outputs.signed == 'yes'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: out/*.apk
+          fail_on_unmatched_files: true
+
+      - name: Refusing to publish an unsigned APK
+        if: steps.stage.outcome == 'success' && startsWith(github.ref, 'refs/tags/v') && steps.stage.outputs.signed != 'yes'
+        run: |
+          echo "::error::Tag build produced an UNSIGNED ${{ matrix.variant }} APK — not attaching it to the release. Set the ANDROID_KEYSTORE_* secrets on this repo."
+          exit 1

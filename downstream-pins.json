@@ -80,7 +80,31 @@
     { "repo": "displayxr-demo-mediaplayer",   "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
     { "repo": "displayxr-demo-modelviewer",   "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
     { "repo": "displayxr-leia-plugin",        "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
-    { "repo": "displayxr-vendor-template",    "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" }
+    { "repo": "displayxr-vendor-template",    "file": ".github/workflows/build-windows.yml", "kind": "lunarg_vulkan" },
+
+    { "_comment_cnsdk": [
+        "CNSDK is the Android counterpart of the SR SDK: a BUILD-TIME dependency of the",
+        "Leia plug-in, and a PACKAGING dependency of the runtime's leia APK variant (it",
+        "supplies the Java glue AAR + libleiaCore-loader.so + libleiaSDK-jni.so). The real",
+        "core, libleiaCore-impl.so, is dlopen'd from the on-device package and is never",
+        "redistributed -- so this pin governs the shim, not the engine.",
+        "",
+        "Recorded here because nothing else tracks it: versions.json's membership rule is",
+        "'installable released asset', which CNSDK is not (it is not ours). Without this",
+        "entry the CNSDK version baked into a released APK is untraceable.",
+        "",
+        "It is pinned in TWO workflows that must agree -- the plug-in builds against it and",
+        "the runtime packages it -- so a bump has to write both.",
+        "",
+        "NOT CANARIED YET: pin-rot-canary.yml selects kind==lunarg_vulkan, so these rows",
+        "are recorded but unchecked. Adding a check is a follow-on and needs care -- the",
+        "release lives on the PRIVATE repo LeiaInc/CNSDK, so resolving it requires",
+        "LEIALOFT_GITHUB_TOKEN, and a 404 without that token is an auth failure, not a",
+        "rotted pin. Reporting the latter as the former is exactly the false-green this",
+        "file exists to prevent."
+      ],
+      "repo": "displayxr-leia-plugin", "file": ".github/workflows/build-android.yml", "kind": "cnsdk_release", "key": "CNSDK_TAG", "source_repo": "LeiaInc/CNSDK", "private": true },
+    { "repo": "displayxr-runtime",     "file": ".github/workflows/build-android.yml", "kind": "cnsdk_release", "key": "CNSDK_TAG", "source_repo": "LeiaInc/CNSDK", "private": true }
   ],
 
   "excluded": {

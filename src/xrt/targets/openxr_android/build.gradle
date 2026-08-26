@@ -481,6 +481,33 @@ if (keystorePropertiesFilename) {
     }
 }
 
+// Org-standard release signing (#1212). Parallel to the Monado-inherited
+// properties-file mechanism above, NOT a replacement — that one resolves
+// storeFile relative to ${project.repoRoot}, so it cannot take the absolute
+// $RUNNER_TEMP path CI decodes the keystore to.
+//
+// This is the same env-driven shape every displayxr-demo-* repo already uses:
+// CI decodes ANDROID_KEYSTORE_BASE64 to a file and exports
+// ANDROID_KEYSTORE_FILE. The double guard (the null check INSIDE the config,
+// and the conditional signingConfig assignment) is what makes a keyless build
+// — a fork PR, or any contributor — emit an UNSIGNED release APK rather than
+// failing. CI then refuses to attach an unsigned APK to a release.
+def dxrKeystoreFile = System.getenv("ANDROID_KEYSTORE_FILE")
+if (dxrKeystoreFile != null && !dxrKeystoreFile.isEmpty() && file(dxrKeystoreFile).exists()) {
+    println("openxr_android: release signing ENABLED (ANDROID_KEYSTORE_FILE)")
+    android.signingConfigs {
+        release {
+            storeFile file(dxrKeystoreFile)
+            storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
+            keyAlias System.getenv("ANDROID_KEY_ALIAS")
+            keyPassword System.getenv("ANDROID_KEY_PASSWORD")
+        }
+    }
+    android.buildTypes.release.signingConfig android.signingConfigs.release
+} else {
+    println("openxr_android: release signing disabled (no ANDROID_KEYSTORE_FILE) — release APK will be UNSIGNED")
+}
+
 // CNSDK AAR is no longer included here — the Leia CNSDK plug-in repo
 // (displayxr-leia-plugin) builds libdxrp050_leia_cnsdk.so and bundles
 // the CNSDK runtime; that .so is dropped into this APK's jniLibs/<ABI>/
