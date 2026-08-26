@@ -585,9 +585,26 @@ struct d3d11_client_render_resources
 	//! the producer runs inside the client's own commit (so it is always ahead), those
 	//! two indices can never coincide — which is the whole synchronisation scheme. See
 	//! the constant's comment in comp_d3d_transparent_present.h.
-	//! `back_buffer_rtv` stays aimed at slice 0 so every generic RTV consumer
-	//! (pipeline_rtv_dims, the presenter switch) keeps working unchanged.
+	//! These are used ONLY by the flat repaint, which writes a slice directly.
+	//! The weave goes through @ref transparent_weave_scratch instead — see below.
 	wil::com_ptr<ID3D11RenderTargetView> transparent_output_rtvs[COMP_TRANSPARENT_OUTPUT_RING];
+	//! #1208: the surface the DISPLAY PROCESSOR actually weaves into - a private,
+	//! NON-shared, single-slice texture, plus its RTV (which is what
+	//! `back_buffer_rtv` points at for a CLIENT_TEXTURE client).
+	//!
+	//! The DP must never be handed a slice of the ring. It resolves its output by
+	//! calling `GetResource()` on whatever RTV is bound and then operating on the
+	//! WHOLE resource as a single-slice texture - the Leia D3D11 DP, for one, does
+	//! `CopyResource(ck_strip_tex, back_buffer)` into a 1-slice staging texture,
+	//! and `CopyResource` requires identical descs, so an ArraySize=3 target makes
+	//! that copy fail silently and the pass then draws BLACK. That contract is
+	//! shipped, versioned and ABI-gated per vendor, so the runtime works around it
+	//! rather than changing it: weave into this scratch exactly as before, then
+	//! `CopySubresourceRegion` the finished frame into the ring slice. One extra
+	//! same-device full-target copy per frame, and the ring stays invisible to
+	//! every plug-in.
+	wil::com_ptr<ID3D11Texture2D>        transparent_weave_scratch;
+	wil::com_ptr<ID3D11RenderTargetView> transparent_weave_scratch_rtv;
 	HANDLE                                transparent_output_texture_handle; //!< NT handle for IPC export
 	wil::com_ptr<ID3D11Fence>            transparent_output_fence;
 	HANDLE                                transparent_output_fence_handle;   //!< NT handle for IPC export
@@ -5783,6 +5800,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	for (uint32_t i = 0; i < COMP_TRANSPARENT_OUTPUT_RING; i++) {
 		res->transparent_output_rtvs[i].reset();
 	}
+	res->transparent_weave_scratch_rtv.reset();
+	res->transparent_weave_scratch.reset();
 	res->transparent_output_texture.reset();
 
 	// #625 weave service: close the source NT handles + release resources.
@@ -5836,9 +5855,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
  * needs its own TEXTURE2DARRAY RTV (a NULL-desc RTV on an array texture covers ALL
  * slices, which would put the weave in every one of them and defeat the ring).
  *
- * `back_buffer_rtv` is left aimed at slice 0 so the generic RTV consumers that do not
- * know about the ring — `pipeline_rtv_dims`, the presenter switch's `present_rtv` —
- * keep resolving to the right resource. Only the weave picks a rotating slice.
+ * `back_buffer_rtv` is aimed at the single-slice weave SCRATCH, not at the ring, so
+ * every consumer that does not know the ring exists — `pipeline_rtv_dims`, the
+ * presenter switch's `present_rtv`, the legacy path's weave + HUD, and above all any
+ * vendor display processor calling `GetResource()` on the bound RTV — sees a plain
+ * ArraySize=1 texture exactly as before.
  */
 static HRESULT
 svc_transparent_output_make_rtvs(struct d3d11_service_system *sys, struct d3d11_client_render_resources *res)
@@ -5856,7 +5877,25 @@ svc_transparent_output_make_rtvs(struct d3d11_service_system *sys, struct d3d11_
 			return hr;
 		}
 	}
-	res->back_buffer_rtv = res->transparent_output_rtvs[0];
+	// The private weave target. Same dims/format as one ring slice, but ArraySize=1
+	// and NOT shared - this is the only thing a display processor ever sees.
+	D3D11_TEXTURE2D_DESC rd_src = {};
+	res->transparent_output_texture->GetDesc(&rd_src);
+	D3D11_TEXTURE2D_DESC sd = rd_src;
+	sd.ArraySize = 1;
+	sd.MiscFlags = 0;
+	HRESULT shr = sys->device->CreateTexture2D(&sd, nullptr, res->transparent_weave_scratch.put());
+	if (SUCCEEDED(shr)) {
+		shr = sys->device->CreateRenderTargetView(res->transparent_weave_scratch.get(), nullptr,
+		                                          res->transparent_weave_scratch_rtv.put());
+	}
+	if (FAILED(shr)) {
+		return shr;
+	}
+	// Everything generic (pipeline_rtv_dims, the presenter switch, the legacy
+	// path's weave + HUD) targets the scratch, so none of it has to know the ring
+	// exists. Only the ring-slice copy below does.
+	res->back_buffer_rtv = res->transparent_weave_scratch_rtv;
 	return S_OK;
 }
 
@@ -17214,11 +17253,12 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		svc_client_weave_dp_assert_state(c, dp, service_single_client_atlas_encoding(c));
 	}
 	if (dp != nullptr && in_srv != nullptr && target_w > 0 && target_h > 0) {
-		// #1208: weave into the NEXT ring slice, never the one the client may
-		// still be copying out. `back_buffer_rtv` (slice 0) is only the generic
-		// handle for consumers that do not know about the ring.
-		const uint32_t slice = svc_transparent_next_slice(&c->render);
-		ID3D11RenderTargetView *rtvs[] = {c->render.transparent_output_rtvs[slice].get()};
+		// #1208: the DP weaves into the private single-slice SCRATCH. It must not
+		// see the ring - it resolves its target with `GetResource()` and treats the
+		// whole resource as a 1-slice texture, so an array target makes its internal
+		// `CopyResource` staging fail and the pass draws black. The finished frame
+		// is copied into the ring slice below, where the DP cannot observe it.
+		ID3D11RenderTargetView *rtvs[] = {c->render.transparent_weave_scratch_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 		// #1013: own viewport AND scissor — a present-owner's alpha-gate pass
 		// leaves a window-sized scissor latched on this shared context.
@@ -17249,6 +17289,12 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		// ADR-029: a real weave on the panel DP. No matching count_present() —
 		// the CLIENT presents this shared texture itself (see the header note).
 		g_frame_witness_service.count_weave(!witness_take_fresh_paint(c), sys->hardware_display_3d);
+		// #1208: publish the woven frame into the slice the client will read for
+		// this fence value. Same device, GPU-local, one full-target copy - the price
+		// of keeping the ring invisible to every display processor.
+		const uint32_t slice = svc_transparent_next_slice(&c->render);
+		sys->context->CopySubresourceRegion(c->render.transparent_output_texture.get(), slice, 0, 0, 0,
+		                                    c->render.transparent_weave_scratch.get(), 0, nullptr);
 		wove = true;
 	}
 
@@ -19855,19 +19901,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	c->render.last_dp_content_w = input_view_w;
 	c->render.last_dp_content_h = input_view_h;
 
-	// #1208: a legacy-standalone CLIENT_TEXTURE client weaves through
-	// `back_buffer_rtv` directly, so rotate IT onto the slice this frame writes -
-	// the HUD pass and the no-DP fallback below both target it too, and they must
-	// all land in the same slice the fence at the bottom is about to advertise.
-	// (The pipeline path picks its slice at the weave site instead; the two paths
-	// are mutually exclusive - pipeline_always_on() is !legacy_standalone.)
-	uint32_t transparent_slice = 0;
-	if (c->render.transparent_output_texture != nullptr) {
-		transparent_slice = svc_transparent_next_slice(&c->render);
-		if (c->render.transparent_output_rtvs[transparent_slice] != nullptr) {
-			c->render.back_buffer_rtv = c->render.transparent_output_rtvs[transparent_slice];
-		}
-	}
+	// #1208: nothing to rotate here - `back_buffer_rtv` IS the private weave
+	// scratch, which is exactly what the DP, the HUD pass and the no-DP fallback
+	// below all expect: a plain single-slice texture whose `GetResource()` is that
+	// texture. The finished frame is copied into the ring slice at the fence
+	// signal at the bottom of this function - the only place that knows the ring
+	// exists.
 
 	// Always pass through the display processor — both 3D (weaving) and 2D
 	// (stretch-blit). This matches the in-process compositor path where
@@ -19934,12 +19973,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (use_zero_copy && zc_tex) {
 			D3D11_BOX src_box = {0, 0, 0, eff_tile_columns * input_view_w, eff_tile_rows * input_view_h, 1};
 			sys->context->CopySubresourceRegion(
-			    back_buffer.get(), transparent_slice, 0, 0, 0,
+			    back_buffer.get(), 0, 0, 0, 0,
 			    zc_tex, 0, &src_box);
 		} else if (c->render.atlas_texture) {
 			// CopySubresourceRegion, not CopyResource: the destination may be a
 			// #1208 ring array, whose desc no longer matches the 1-slice atlas.
-			sys->context->CopySubresourceRegion(back_buffer.get(), transparent_slice, 0, 0, 0,
+			sys->context->CopySubresourceRegion(back_buffer.get(), 0, 0, 0, 0,
 			                                    c->render.atlas_texture.get(), 0, nullptr);
 		}
 	}
@@ -20014,6 +20053,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// transparent DComp swap chain on the app's own window. Bumped once per
 	// commit, in lockstep with the client's wait counter (no per-frame IPC).
 	if (c->render.transparent_output_texture != nullptr && c->render.transparent_output_fence != nullptr) {
+		// #1208: publish the woven frame into the slice this fence value names.
+		const uint32_t pub_slice = svc_transparent_next_slice(&c->render);
+		if (c->render.transparent_weave_scratch != nullptr) {
+			sys->context->CopySubresourceRegion(c->render.transparent_output_texture.get(), pub_slice,
+			                                    0, 0, 0, c->render.transparent_weave_scratch.get(), 0,
+			                                    nullptr);
+		}
 		c->render.transparent_output_value++;
 		sys->context->Signal(c->render.transparent_output_fence.get(), c->render.transparent_output_value);
 	}
