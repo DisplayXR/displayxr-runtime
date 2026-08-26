@@ -51,7 +51,7 @@ Which plug-in is inside a given APK is determined by `versions.json`'s
 `leia_plugin` field at the runtime tag, so the whole stack is reproducible
 from a version string. Why the vendor plug-in is bundled rather than
 separately installed:
-[ADR-037](../adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md).
+[ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md).
 
 ---
 
@@ -141,7 +141,7 @@ real core, face tracking and per-device calibration live on the device — the
 same relationship Windows has with an installed `LeiaSR_runtime.dll`. What
 must ship in the APK is only the shim plus the AAR's Java glue, because
 Android has no system-wide search path for third-party natives. See
-[ADR-037](../adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md).
+[ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md).
 
 Never republish the CNSDK zip: Leia's Creator Toolkit licence permits
 distribution "as incorporated into your Products" (§3) but forbids

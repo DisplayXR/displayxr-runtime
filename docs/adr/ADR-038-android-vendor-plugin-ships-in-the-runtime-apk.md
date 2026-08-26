@@ -2,7 +2,7 @@
 status: Accepted
 date: 2026-08-26
 ---
-# ADR-037: On Android the Vendor Plug-in Ships Inside the Runtime APK
+# ADR-038: On Android the Vendor Plug-in Ships Inside the Runtime APK
 
 ## Context
 
