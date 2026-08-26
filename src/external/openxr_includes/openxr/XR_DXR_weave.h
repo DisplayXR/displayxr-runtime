@@ -209,6 +209,11 @@ extern "C" {
 #define XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR  ((XrStructureType)1004999196)
 #define XR_TYPE_WEAVE_SUBMIT_HANDLES_DXR   ((XrStructureType)1004999197)
 #define XR_TYPE_WEAVE_SUBMIT_FLAT_REGIONS_DXR ((XrStructureType)1004999198)
+//! Cap on the weaved-output ring depth (spec v10, #625). A window-sized output is
+//! ~132 MB at 8K, so the runtime clamps a request to this and reports what it
+//! actually allocated.
+#define XR_WEAVE_MAX_OUTPUTS_DXR 4
+
 #define XR_TYPE_WEAVE_RING_REQUEST_DXR    ((XrStructureType)1004999199)
 #define XR_TYPE_WEAVE_OUTPUT_SLICE_DXR    ((XrStructureType)1004999200)
 // 1004999199 is RESERVED for a per-submit wish MASK (an R8 texture handle
@@ -523,21 +528,25 @@ typedef struct XrWeaveOutputDXR {
  * ## The contract
  *
  * When this struct is chained, the runtime allocates
- * @ref XrWeaveOutputSliceDXR::sliceCount array slices instead of one, weaves
- * frame `v` into slice `v % sliceCount`, and reports that index back in a chained
- * @ref XrWeaveOutputSliceDXR. Because the caller only ever reads a fence value the
- * runtime has already published, the slice it reads can never be the slice being
- * written.
+ * @ref XrWeaveOutputSliceDXR::outputCount SEPARATE window-sized output textures
+ * and composites each FRAME into one of them in rotation, reporting which one in
+ * a chained @ref XrWeaveOutputSliceDXR. Because the caller only ever reads a
+ * fence value the runtime has already published, the output it reads is never the
+ * one being written.
  *
- * The caller MUST then read the reported slice — `weavedTexture` is a
- * `Texture2DArray` and its subresource 0 is no longer "the frame". A caller that
- * chains this and keeps reading subresource 0 will show a frame `sliceCount`
- * submits old, two times out of three at the default depth.
+ * They are separate textures rather than array slices of one texture on purpose:
+ * the consumer imports the woven output through its compositor's shared-image
+ * layer, and those import paths take a handle plus a 2D size with nowhere to name
+ * an array slice. N plain 2D textures are importable unchanged.
+ *
+ * The caller MUST therefore import ALL @c outputCount handles (they are handed
+ * back together, on the same occasions @c weavedTexture is) and draw the one
+ * named per frame.
  *
  * @note @p requestedSliceCount is a HINT. The runtime clamps it to what it
- *       supports and reports the actual depth in XrWeaveOutputSliceDXR::sliceCount,
- *       which is the only value the caller may index against. Pass 0 for "runtime
- *       picks".
+ *       supports and reports the actual depth in
+ *       XrWeaveOutputSliceDXR::outputCount, which is the only value the caller
+ *       may index against. Pass 0 for "runtime picks".
  */
 typedef struct XrWeaveRingRequestDXR {
     XrStructureType          type;                 //!< XR_TYPE_WEAVE_RING_REQUEST_DXR
@@ -546,24 +555,34 @@ typedef struct XrWeaveRingRequestDXR {
 } XrWeaveRingRequestDXR;
 
 /*!
- * @brief Which slice of the weaved output this frame landed in (spec v10, #625).
+ * @brief Which of the weaved outputs this frame landed in (spec v10, #625).
  *
- * Chain onto XrWeaveOutputDXR::next to receive it. Only meaningful when
- * @ref XrWeaveRingRequestDXR was chained on the submit; without that opt-in the
- * runtime allocates a single slice and fills `arraySlice = 0, sliceCount = 1`.
+ * Chain onto XrWeaveOutputDXR::next to receive it. Without the
+ * @ref XrWeaveRingRequestDXR opt-in the runtime fills `outputIndex = 0,
+ * outputCount = 1` and @c outputTextures[0] mirrors XrWeaveOutputDXR::weavedTexture
+ * — i.e. it is always safe to read, on any runtime that fills it at all.
  *
  * This is a CHAINED struct rather than new fields on XrWeaveOutputDXR on purpose:
  * XrWeaveOutputDXR is fixed-size and written BY the runtime, so appending to it
  * would write past the end of an older caller's allocation.
  *
- * `arraySlice` corresponds to the XrWeaveOutputDXR::fenceValue returned by the
- * same call — read that slice once the fence reaches that value.
+ * @c outputIndex corresponds to the XrWeaveOutputDXR::fenceValue returned by the
+ * same call — draw that output once the fence reaches that value.
+ *
+ * @c outputTextures follows the same handback rule as
+ * XrWeaveOutputDXR::weavedTexture: the handles are non-NULL on the first submit
+ * and again on re-allocation (a resize, or a change of depth), and NULL on
+ * steady-state frames where the caller reuses what it already imported. The
+ * caller owns every handle it is given.
  */
 typedef struct XrWeaveOutputSliceDXR {
-    XrStructureType    type;        //!< XR_TYPE_WEAVE_OUTPUT_SLICE_DXR
+    XrStructureType    type;         //!< XR_TYPE_WEAVE_OUTPUT_SLICE_DXR
     void* XR_MAY_ALIAS next;
-    uint32_t           arraySlice;  //!< slice this frame was woven into
-    uint32_t           sliceCount;  //!< total slices in weavedTexture (1 = not a ring)
+    uint32_t           outputIndex;  //!< which output this frame was woven into
+    uint32_t           outputCount;  //!< how many outputs exist (1 = not a ring)
+    //! Shared HANDLEs for each of the @c outputCount outputs, or all NULL on a
+    //! steady-state frame. Index with @c outputIndex.
+    void*              outputTextures[XR_WEAVE_MAX_OUTPUTS_DXR];
 } XrWeaveOutputSliceDXR;
 
 /*!

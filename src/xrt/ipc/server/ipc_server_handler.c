@@ -6458,6 +6458,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 
 xrt_result_t
 ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
+                            uint32_t slice_index,
                             bool *out_have_output,
                             uint32_t *out_width,
                             uint32_t *out_height,
@@ -6483,7 +6484,7 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	uint32_t w = 0, ht = 0;
-	if (comp_d3d11_service_weave_export_output(ics->xc, &h, &w, &ht)) {
+	if (comp_d3d11_service_weave_export_output(ics->xc, slice_index, &h, &w, &ht)) {
 		out_handles[0] = h;
 		*out_handle_count = 1;
 		*out_have_output = true;

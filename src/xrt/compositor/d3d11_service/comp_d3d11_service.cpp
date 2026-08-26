@@ -41,7 +41,12 @@
 //! the consumer, and depth 3 also covers a consumer two behind.
 #define COMP_WEAVE_OUTPUT_RING_DEFAULT 3
 //! Cap on what a caller may request, so a hostile/absurd value cannot allocate
-//! window-sized slices without bound (8K fullscreen is ~132 MB per slice).
+//! window-sized outputs without bound (8K fullscreen is ~132 MB per output).
+//! MUST equal XR_WEAVE_MAX_OUTPUTS_DXR — the extension struct carries a
+//! fixed-size handle array of exactly that length.
+//! Kept in step with XR_WEAVE_MAX_OUTPUTS_DXR by the state tracker, which CLAMPS
+//! the reported count to the extension array's length before filling it — so a
+//! drift here truncates nothing, it just caps what a caller is told about.
 #define COMP_WEAVE_OUTPUT_RING_MAX 4
 
 // #1208: COMP_TRANSPARENT_OUTPUT_RING — the service→client output ring depth. The
@@ -632,30 +637,40 @@ struct d3d11_client_render_resources
 	//! service-signals / caller-waits (like transparent_output_fence) and bumps
 	//! once per submit.
 	HWND                                 weave_hwnd;
-	//! The texture EXPORTED to the caller. With a ring (#625 spec v10) this is a
-	//! `weave_ring_slices`-deep 2D ARRAY; without one it is a single slice and is
-	//! also the composite target, exactly as before v10.
-	wil::com_ptr<ID3D11Texture2D>        weave_output_texture;
-	//! #625: the private single-slice surface the whole composite pipeline targets
-	//! when a ring is active (clear -> process_atlas -> overlay composite), copied
-	//! into the ring slice at the fence signal. NULL when no ring is active.
+	//! #625 spec v10 — the RING of weaved outputs.
 	//!
-	//! It exists for the same reason the ADR-029 ring has one (#1208): a display
-	//! processor resolves its output by calling `GetResource()` on the bound RTV
-	//! and then operating on the WHOLE resource as a single-slice texture, so
-	//! binding a slice of an array makes its internal staging `CopyResource` fail
-	//! silently and the pass draw BLACK. That contract is shipped and ABI-gated
-	//! per vendor, so the ring stays invisible to every plug-in.
-	wil::com_ptr<ID3D11Texture2D>        weave_scratch;
-	//! Composite target's RTV — the scratch's when a ring is active, otherwise the
-	//! exported texture's. Every stage of the composite writes through this.
-	wil::com_ptr<ID3D11RenderTargetView> weave_output_rtv;
-	//! Ring depth of @ref weave_output_texture. 1 = no ring (pre-v10 behaviour:
-	//! the caller reads subresource 0 and the runtime overwrites it under them).
+	//! N SEPARATE single-slice textures, not one N-deep array. The only consumer
+	//! (displayxr-browser) imports the woven output through Chromium's SharedImage
+	//! system — `gfx::DXGIHandle` -> `SharedImageInfo(format, gfx::Size)` ->
+	//! `CreateSharedImage()` — and that path has NO slice parameter anywhere, so an
+	//! array texture is simply unaddressable by it. N plain 2D textures are the
+	//! shape both the importer and every display processor already expect, so the
+	//! ring needs no scratch and no plug-in ever sees anything new.
+	//!
+	//! Rotation is per FRAME, not per submit: a >MAX-rect frame arrives as several
+	//! chunks that ACCUMULATE into one output, so all chunks of a frame must land
+	//! in the same texture. The rotation therefore rides `clear_output`, which is
+	//! already the frame boundary (firstChunk, or the rule-2 fallback for callers
+	//! that never send it).
+	wil::com_ptr<ID3D11Texture2D>        weave_output_ring[COMP_WEAVE_OUTPUT_RING_MAX];
+	wil::com_ptr<ID3D11RenderTargetView> weave_output_ring_rtvs[COMP_WEAVE_OUTPUT_RING_MAX];
+	HANDLE                                weave_output_ring_handles[COMP_WEAVE_OUTPUT_RING_MAX];
+	//! How many of the above are live. 1 = no ring (pre-v10: one output the caller
+	//! reads while the runtime overwrites it).
 	uint32_t                              weave_ring_slices;
+	//! Which output THIS FRAME composites into, and therefore which index the
+	//! caller is told to read for this fence value.
+	uint32_t                              weave_active_slice;
 	//! Depth the caller asked for via XrWeaveRingRequestDXR, latched so a resize
 	//! re-allocates with the same shape. 0 = caller never opted in.
 	uint32_t                              weave_ring_requested;
+
+	//! The ACTIVE output + its RTV + its NT handle — aliases into the ring above,
+	//! repointed on every rotation. Everything downstream (the DP handoff, the HUD
+	//! pass, the overlay composite, the no-DP fallback, the diagnostic dump) reads
+	//! these and is completely unaware the ring exists.
+	wil::com_ptr<ID3D11Texture2D>        weave_output_texture;
+	wil::com_ptr<ID3D11RenderTargetView> weave_output_rtv;
 	HANDLE                                weave_output_handle; //!< NT handle for IPC export
 	wil::com_ptr<ID3D11Fence>            weave_fence;
 	HANDLE                                weave_fence_handle;  //!< NT handle for IPC export
@@ -5836,18 +5851,25 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->transparent_output_texture.reset();
 
 	// #625 weave service: close the source NT handles + release resources.
-	if (res->weave_output_handle != nullptr) {
-		CloseHandle(res->weave_output_handle);
-		res->weave_output_handle = nullptr;
+	// #625: the RING owns the handles; weave_output_handle is only an alias into
+	// it, so closing it here as well would be a double close.
+	for (uint32_t i = 0; i < COMP_WEAVE_OUTPUT_RING_MAX; i++) {
+		if (res->weave_output_ring_handles[i] != nullptr) {
+			CloseHandle(res->weave_output_ring_handles[i]);
+			res->weave_output_ring_handles[i] = nullptr;
+		}
+		res->weave_output_ring_rtvs[i].reset();
+		res->weave_output_ring[i].reset();
 	}
+	res->weave_output_handle = nullptr;
 	if (res->weave_fence_handle != nullptr) {
 		CloseHandle(res->weave_fence_handle);
 		res->weave_fence_handle = nullptr;
 	}
 	res->weave_output_rtv.reset();
-	res->weave_scratch.reset();
 	res->weave_output_texture.reset();
 	res->weave_ring_slices = 0;
+	res->weave_active_slice = 0;
 	res->weave_ring_requested = 0;
 	res->weave_fence.reset();
 	res->weave_sbs_srv.reset();
@@ -20673,53 +20695,54 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h, 
 		return true; // already sized + same shape
 	}
 
-	// Tear down the old output texture/RTV/handle (fence is kept across resize —
-	// its value must stay monotonic for the caller's GPU wait).
-	if (c->render.weave_output_handle != nullptr) {
-		CloseHandle(c->render.weave_output_handle);
-		c->render.weave_output_handle = nullptr;
+	// Tear down the old ring (fence is kept across resize — its value must stay
+	// monotonic for the caller's GPU wait).
+	for (uint32_t i = 0; i < COMP_WEAVE_OUTPUT_RING_MAX; i++) {
+		if (c->render.weave_output_ring_handles[i] != nullptr) {
+			CloseHandle(c->render.weave_output_ring_handles[i]);
+			c->render.weave_output_ring_handles[i] = nullptr;
+		}
+		c->render.weave_output_ring_rtvs[i].reset();
+		c->render.weave_output_ring[i].reset();
 	}
 	c->render.weave_output_rtv.reset();
-	c->render.weave_scratch.reset();
 	c->render.weave_output_texture.reset();
+	c->render.weave_output_handle = nullptr; // alias — the ring owns the handles
+	c->render.weave_active_slice = 0;
 
 	D3D11_TEXTURE2D_DESC od = {};
 	od.Width = w;
 	od.Height = h;
 	od.MipLevels = 1;
-	od.ArraySize = ring;
+	od.ArraySize = 1; // N SEPARATE textures, never an array — see weave_output_ring
 	od.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied-alpha output the caller presents
 	od.SampleDesc.Count = 1;
 	od.Usage = D3D11_USAGE_DEFAULT;
 	od.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	od.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-	HRESULT hr = sys->device->CreateTexture2D(&od, nullptr, c->render.weave_output_texture.put());
-	if (SUCCEEDED(hr)) {
-		if (ring > 1) {
-			// The composite pipeline (and therefore the DP) targets a private
-			// single-slice scratch — never a slice of the array. See the
-			// weave_scratch field comment.
-			D3D11_TEXTURE2D_DESC sd = od;
-			sd.ArraySize = 1;
-			sd.MiscFlags = 0;
-			hr = sys->device->CreateTexture2D(&sd, nullptr, c->render.weave_scratch.put());
-			if (SUCCEEDED(hr)) {
-				hr = sys->device->CreateRenderTargetView(c->render.weave_scratch.get(), nullptr,
-				                                         c->render.weave_output_rtv.put());
-			}
-		} else {
-			hr = sys->device->CreateRenderTargetView(c->render.weave_output_texture.get(), nullptr,
-			                                         c->render.weave_output_rtv.put());
+	HRESULT hr = S_OK;
+	for (uint32_t i = 0; i < ring && SUCCEEDED(hr); i++) {
+		hr = sys->device->CreateTexture2D(&od, nullptr, c->render.weave_output_ring[i].put());
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateRenderTargetView(c->render.weave_output_ring[i].get(), nullptr,
+			                                         c->render.weave_output_ring_rtvs[i].put());
+		}
+		wil::com_ptr<IDXGIResource1> dxgi_res1;
+		if (SUCCEEDED(hr)) {
+			hr = c->render.weave_output_ring[i]->QueryInterface(IID_PPV_ARGS(dxgi_res1.put()));
+		}
+		if (SUCCEEDED(hr)) {
+			hr = dxgi_res1->CreateSharedHandle(nullptr,
+			                                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+			                                   nullptr, &c->render.weave_output_ring_handles[i]);
 		}
 	}
-	wil::com_ptr<IDXGIResource1> dxgi_res1;
 	if (SUCCEEDED(hr)) {
-		hr = c->render.weave_output_texture->QueryInterface(IID_PPV_ARGS(dxgi_res1.put()));
-	}
-	if (SUCCEEDED(hr)) {
-		hr = dxgi_res1->CreateSharedHandle(nullptr,
-		                                   DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
-		                                   &c->render.weave_output_handle);
+		// Aim the aliases at output 0 — the first frame composites there.
+		c->render.weave_output_texture = c->render.weave_output_ring[0];
+		c->render.weave_output_rtv = c->render.weave_output_ring_rtvs[0];
+		c->render.weave_output_handle = c->render.weave_output_ring_handles[0];
+		c->render.weave_active_slice = 0;
 	}
 	// Service→caller fence: signaled after each weave, caller waits before present.
 	if (SUCCEEDED(hr) && c->render.weave_fence == nullptr) {
@@ -20730,14 +20753,18 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h, 
 		}
 	}
 	if (FAILED(hr)) {
-		U_LOG_E("#625 weave: output texture/fence create failed: 0x%08lx", hr);
-		if (c->render.weave_output_handle != nullptr) {
-			CloseHandle(c->render.weave_output_handle);
-			c->render.weave_output_handle = nullptr;
+		U_LOG_E("#625 weave: output texture/fence create failed: 0x%08lx (ring=%u)", hr, ring);
+		for (uint32_t i = 0; i < COMP_WEAVE_OUTPUT_RING_MAX; i++) {
+			if (c->render.weave_output_ring_handles[i] != nullptr) {
+				CloseHandle(c->render.weave_output_ring_handles[i]);
+				c->render.weave_output_ring_handles[i] = nullptr;
+			}
+			c->render.weave_output_ring_rtvs[i].reset();
+			c->render.weave_output_ring[i].reset();
 		}
 		c->render.weave_output_rtv.reset();
-		c->render.weave_scratch.reset();
 		c->render.weave_output_texture.reset();
+		c->render.weave_output_handle = nullptr;
 		return false;
 	}
 	// #1058: a freshly created texture's contents are undefined, and the weave
@@ -20748,24 +20775,20 @@ weave_ensure_output(struct d3d11_service_compositor *c, uint32_t w, uint32_t h, 
 	// frame-boundary state: the previous generation's handles described a
 	// texture that no longer exists.
 	{
+		// Every output starts premultiplied-transparent, not driver garbage: the
+		// caller blits whichever one it is pointed at back over its window.
 		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
-		// With a ring the clear above only reached the scratch, so seed every
-		// exported slice from it. Each slice IS written before the caller can be
-		// told to read it (slice `v % ring` is copied at the same submit that
-		// signals `v`), so this is belt-and-braces against a driver handing back
-		// garbage — cheap, once per allocation.
-		for (uint32_t i = 0; i < ring && c->render.weave_scratch != nullptr; i++) {
-			sys->context->CopySubresourceRegion(c->render.weave_output_texture.get(), i, 0, 0, 0,
-			                                    c->render.weave_scratch.get(), 0, nullptr);
+		for (uint32_t i = 0; i < ring; i++) {
+			sys->context->ClearRenderTargetView(c->render.weave_output_ring_rtvs[i].get(),
+			                                    out_transparent);
 		}
 		c->render.weave_gen_count = 0;
 	}
 	c->render.weave_output_w = w;
 	c->render.weave_output_h = h;
 	c->render.weave_ring_slices = ring;
-	U_LOG_W("#625 weave: server output %ux%u shared texture + service→caller fence ready (ring=%u%s)", w, h,
-	        ring, ring > 1 ? ", composite via private scratch" : ", no ring — pre-v10 single buffer");
+	U_LOG_W("#625 weave: server output %ux%u + service→caller fence ready (%u output%s%s)", w, h, ring,
+	        ring == 1 ? "" : "s", ring > 1 ? ", rotated per frame" : " — pre-v10 single buffer");
 	return true;
 }
 
@@ -21822,6 +21845,31 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 		c->render.weave_gen_inputs[c->render.weave_gen_count++] = in;
 	}
+	/*
+	 * #625 spec v10: rotate the ring on the FRAME boundary.
+	 *
+	 * Per frame, not per submit. A frame with more than IPC_WEAVE_SUBMIT_RECTS_MAX
+	 * rects arrives as several chunks that ACCUMULATE into one output, so every
+	 * chunk of a frame has to land in the same texture — rotating per submit would
+	 * scatter one frame's tiles across the ring and hand the caller a third of them.
+	 *
+	 * `clear_output` IS that boundary: it is true exactly when this submit starts a
+	 * new frame's output (spec-v5 firstChunk, or the rule-2 fallback for callers
+	 * that never send it), which is the same question. Riding it means the ring
+	 * cannot disagree with the clear about where a frame begins.
+	 *
+	 * The clear below then targets the freshly-selected output, which is what makes
+	 * a rotated frame start transparent instead of showing what it held RING frames
+	 * ago.
+	 */
+	if (clear_output && c->render.weave_ring_slices > 1) {
+		c->render.weave_active_slice = (c->render.weave_active_slice + 1) % c->render.weave_ring_slices;
+		const uint32_t a = c->render.weave_active_slice;
+		c->render.weave_output_texture = c->render.weave_output_ring[a];
+		c->render.weave_output_rtv = c->render.weave_output_ring_rtvs[a];
+		c->render.weave_output_handle = c->render.weave_output_ring_handles[a];
+	}
+
 	if (clear_output && c->render.weave_output_rtv) {
 		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
@@ -22277,32 +22325,17 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		dxr_diag_dump_tex(sys, c->render.weave_output_texture.get(), "dxr73_weave_output");
 	}
 
-	/*
-	 * #625 spec v10: publish the finished frame into the slice this fence value
-	 * names, BEFORE signalling it. The caller only ever reads a value the runtime
-	 * has already published, so the slice it reads can never be the slice the next
-	 * submit writes.
-	 *
-	 * No-op when no ring is active — the composite already targeted the exported
-	 * texture directly, which is the pre-v10 shape.
-	 */
-	const uint32_t publish_slice =
-	    c->render.weave_ring_slices > 1
-	        ? (uint32_t)((c->render.weave_fence_value + 1) % c->render.weave_ring_slices)
-	        : 0u;
-	if (c->render.weave_ring_slices > 1 && c->render.weave_scratch != nullptr) {
-		sys->context->CopySubresourceRegion(c->render.weave_output_texture.get(), publish_slice, 0, 0, 0,
-		                                    c->render.weave_scratch.get(), 0, nullptr);
-	}
-
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
 	// no Present to flush this standalone path), then the caller's Wait completes.
 	c->render.weave_fence_value++;
 	sys->context->Signal(c->render.weave_fence.get(), c->render.weave_fence_value);
 	sys->context->Flush();
 
+	// #625 spec v10: which of the N outputs this frame composited into, and
+	// therefore which one the caller reads for this fence value. No copy is
+	// involved — the composite targeted it directly.
 	if (out_array_slice != nullptr) {
-		*out_array_slice = publish_slice;
+		*out_array_slice = c->render.weave_active_slice;
 	}
 	if (out_slice_count != nullptr) {
 		*out_slice_count = c->render.weave_ring_slices > 0 ? c->render.weave_ring_slices : 1u;
@@ -22363,6 +22396,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 extern "C" bool
 comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
+                                      uint32_t slice_index,
                                       xrt_graphics_buffer_handle_t *out_handle,
                                       uint32_t *out_width,
                                       uint32_t *out_height)
@@ -22375,10 +22409,13 @@ comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-	if (c->render.weave_output_handle == nullptr) {
+	if (slice_index >= c->render.weave_ring_slices) {
 		return false;
 	}
-	*out_handle = (xrt_graphics_buffer_handle_t)c->render.weave_output_handle;
+	if (c->render.weave_output_ring_handles[slice_index] == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)c->render.weave_output_ring_handles[slice_index];
 	if (out_width != nullptr) {
 		*out_width = c->render.weave_output_w;
 	}

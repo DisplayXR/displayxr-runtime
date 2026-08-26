@@ -739,6 +739,9 @@
 	},
 
 	"weave_get_output": {
+		"in": [
+			{"name": "slice_index", "type": "uint32_t"}
+		],
 		"out": [
 			{"name": "have_output", "type": "bool"},
 			{"name": "width", "type": "uint32_t"},

@@ -701,6 +701,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            uint32_t slice_index,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -723,7 +724,7 @@ comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
 	bool have = false;
 	uint32_t w = 0, h = 0;
 	xrt_graphics_buffer_handle_t handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, &have, &w, &h, &handle, 1);
+	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, slice_index, &have, &w, &h, &handle, 1);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}

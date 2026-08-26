@@ -1163,6 +1163,7 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
  */
 bool
 comp_d3d11_service_weave_export_output(struct xrt_compositor *xc,
+                                       uint32_t slice_index,
                                        xrt_graphics_buffer_handle_t *out_handle,
                                        uint32_t *out_width,
                                        uint32_t *out_height);

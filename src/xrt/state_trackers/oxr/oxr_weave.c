@@ -114,6 +114,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            uint32_t slice_index,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -446,15 +447,36 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 
 	// Per-frame scalars are always valid; the shared HANDLEs are handed back
 	// only on the first submit and on re-allocation (resize → dims change).
-	// #625 spec v10: report the slice this fence value names, if the caller
-	// chained somewhere to receive it. Filled even without the ring opt-in
-	// (0 of 1), so a caller can read it unconditionally.
+	/*
+	 * #625 spec v10: tell the caller which of the N outputs this frame landed in.
+	 *
+	 * Filled even without the ring opt-in (0 of 1, mirroring `weavedTexture`), so a
+	 * caller can read it unconditionally and a runtime that never rings still gives
+	 * a truthful answer.
+	 *
+	 * The count is CLAMPED to the extension array's length. The service's own cap
+	 * is a separate constant on the far side of an IPC boundary that carries no
+	 * OpenXR headers, so clamping here is what makes a drift between the two
+	 * impossible to turn into a truncated handback — the caller is simply told
+	 * about fewer outputs than exist, never handed a short array it believes is
+	 * full.
+	 */
+	XrWeaveOutputSliceDXR *out_slice = NULL;
 	for (XrBaseOutStructure *e = (XrBaseOutStructure *)output->next; e != NULL; e = e->next) {
 		if (e->type == XR_TYPE_WEAVE_OUTPUT_SLICE_DXR) {
-			XrWeaveOutputSliceDXR *os = (XrWeaveOutputSliceDXR *)e;
-			os->arraySlice = array_slice;
-			os->sliceCount = slice_count > 0 ? slice_count : 1u;
+			out_slice = (XrWeaveOutputSliceDXR *)e;
 			break;
+		}
+	}
+	if (out_slice != NULL) {
+		uint32_t n = slice_count > 0 ? slice_count : 1u;
+		if (n > XR_WEAVE_MAX_OUTPUTS_DXR) {
+			n = XR_WEAVE_MAX_OUTPUTS_DXR;
+		}
+		out_slice->outputCount = n;
+		out_slice->outputIndex = array_slice < n ? array_slice : 0u;
+		for (uint32_t i = 0; i < XR_WEAVE_MAX_OUTPUTS_DXR; i++) {
+			out_slice->outputTextures[i] = NULL;
 		}
 	}
 
@@ -488,10 +510,33 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		bool have_tex = false;
 		uint32_t gw = 0, gh = 0;
 		xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-		if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h) ==
+		if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, 0, &have_tex, &gw, &gh, &tex_h) ==
 		        XRT_SUCCESS &&
 		    have_tex && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
 			output->weavedTexture = (void *)tex_h;
+		}
+
+		/*
+		 * v10: the caller must import EVERY output, not just the one this frame
+		 * used — it will be pointed at the others on later frames, and the
+		 * handles are only handed back on this same first-export / re-allocation
+		 * occasion. Output 0 is the one `weavedTexture` already carries, so it is
+		 * reused rather than exported twice (two handles to one texture would
+		 * both have to be closed, and a caller that closes one and imports the
+		 * other has a use-after-close waiting for it).
+		 */
+		if (out_slice != NULL && out_slice->outputCount > 0) {
+			out_slice->outputTextures[0] = output->weavedTexture;
+			for (uint32_t i = 1; i < out_slice->outputCount; i++) {
+				bool have_i = false;
+				uint32_t iw = 0, ih = 0;
+				xrt_graphics_buffer_handle_t ih_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+				if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, i, &have_i, &iw,
+				                                                &ih, &ih_h) == XRT_SUCCESS &&
+				    have_i && ih_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+					out_slice->outputTextures[i] = (void *)ih_h;
+				}
+			}
 		}
 
 		bool have_fence = false;
