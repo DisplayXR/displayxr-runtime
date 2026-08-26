@@ -6002,6 +6002,40 @@ ipc_handle_compositor_get_workspace_sync_fence(volatile struct ipc_client_state 
 }
 
 xrt_result_t
+ipc_handle_compositor_get_read_done_fence(volatile struct ipc_client_state *ics,
+                                          bool *out_have_fence,
+                                          uint32_t max_handle_count,
+                                          xrt_graphics_sync_handle_t *out_handles,
+                                          uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_have_fence = false;
+	*out_handle_count = 0;
+
+	if (ics->xc == NULL || max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #1215 -- reverse-direction twin of the workspace_sync_fence export just
+	// above: the service signals, the client waits in wait_image. Same
+	// ownership rules (source handle stays with the compositor, IPC machinery
+	// DuplicateHandle's a copy into the client).
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (comp_d3d11_service_compositor_export_read_done_fence(ics->xc, &h)) {
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_fence = true;
+	}
+#else
+	(void)out_handles;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_get_transparent_output(volatile struct ipc_client_state *ics,
                                              bool *out_have_output,
                                              uint32_t *out_width,

@@ -992,6 +992,10 @@ comp_d3d11_service_set_capture_client_style(struct xrt_system_compositor *xsysc,
  * in effect and the IPC handler emits zero handles to the client.
  */
 bool
+comp_d3d11_service_compositor_export_read_done_fence(struct xrt_compositor *xc,
+                                                     xrt_graphics_sync_handle_t *out_handle);
+
+bool
 comp_d3d11_service_compositor_export_workspace_sync_fence(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
 

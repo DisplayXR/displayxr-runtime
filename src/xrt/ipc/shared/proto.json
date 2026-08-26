@@ -689,6 +689,13 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"compositor_get_read_done_fence": {
+		"out": [
+			{"name": "have_fence", "type": "bool"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
 	"compositor_get_transparent_output": {
 		"out": [
 			{"name": "have_output", "type": "bool"},
