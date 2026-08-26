@@ -703,7 +703,19 @@ create_swapchain(struct comp_vk_native_target *target)
 	}
 
 	// Create image views
-	return create_swapchain_views(target);
+	xrt_result_t vres = create_swapchain_views(target);
+	if (vres == XRT_SUCCESS) {
+		// #602: a new image set. Bumped HERE, not at the call sites, so every
+		// rebuild -- resize, the Android surface re-sync (#507), the
+		// acquire-side VK_ERROR_OUT_OF_DATE_KHR retry -- reaches the DP through
+		// vk_dp_weave_and_present's generation check (notify_target_recreated).
+		// The re-sync and acquire paths never bumped it before, and a DP that
+		// keys caches on our VkImageView handles (the driver recycles them) then
+		// hit stale entries: one swapchain slot weaving into a dead image after
+		// every Android background/resume cycle.
+		target->generation++;
+	}
+	return vres;
 }
 
 #ifdef XRT_OS_WINDOWS
@@ -1788,7 +1800,11 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 	}
 
 	target->surface_lost = false;
-	U_LOG_I("Android output surface recreated %ux%u (#507)", target->width, target->height);
+	// create_swapchain bumped target->generation: the DP is told about this
+	// image set on the next weave (notify_target_recreated). This path used to
+	// be the one rebuild that never bumped it -- see create_swapchain.
+	U_LOG_I("Android output surface recreated %ux%u (#507), image set generation %u",
+	        target->width, target->height, target->generation);
 	return COMP_VK_NATIVE_TARGET_SURFACE_RECREATED;
 #endif
 }
@@ -2775,11 +2791,7 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	target->width = width;
 	target->height = height;
 
-	xrt_result_t scres = create_swapchain(target);
-	if (scres == XRT_SUCCESS) {
-		target->generation++; // #602: image set rebuilt — invalidate DP caches.
-	}
-	return scres;
+	return create_swapchain(target); // bumps target->generation on success (#602)
 }
 
 uint32_t
