@@ -10,9 +10,14 @@
  * (`E_ACCESSDENIED` on the client's HWND), so the *client* must own the present
  * (ADR-029). The service hands over a shared D3D11 NT-handle texture (premultiplied
  * `R8G8B8A8`) plus a service→client `ID3D11Fence`; this helper imports both, stands up
- * a transparent DComp swap chain on the app's HWND, and per frame waits the fence,
- * copies the shared output into the back buffer, and `Present` + `Commit` so DWM blends
- * the live desktop into the holes.
+ * a transparent DComp swap chain on the app's HWND, and per frame polls the fence,
+ * copies the matching slice of the shared output into the back buffer, and `Present` +
+ * `Commit` so DWM blends the live desktop into the holes.
+ *
+ * The shared texture is a ring of COMP_TRANSPARENT_OUTPUT_RING array slices rather than
+ * a single image (#1208) - the producer is structurally one value ahead of this consumer,
+ * so with one slice it overwrote the pixels being copied out. Both sides index the ring
+ * off the fence value, which is the one number they already share exactly.
  *
  * The present is pure D3D11 + DirectComposition and is **independent of the app's render
  * API**: the shared handles are openable by any D3D11 device. A D3D11 client can pass its
@@ -33,6 +38,36 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*!
+ * Depth of the service→client output ring (#1208).
+ *
+ * The producer runs INSIDE the consumer's commit: `client_*_compositor_layer_commit`
+ * makes the layer-commit RPC — which weaves value `v+1` on this client's IPC thread in
+ * the service and signals the fence — and only THEN calls the present below, which
+ * copies whatever `GetCompletedValue()` reports (at most `v`). So the producer is
+ * always at least one value ahead of the consumer at copy time, and with a single
+ * `ArraySize=1` texture it was overwriting the very pixels being copied out. That is
+ * not an unlucky interleaving; it is the steady state.
+ *
+ * The fix needs no mutual exclusion at all — just somewhere else to write. Both sides
+ * derive the array slice from the fence value, which is the one number they already
+ * share exactly:
+ *
+ *   producer writes slice (v + 1) % RING, then signals v + 1
+ *   consumer reads   slice completed % RING, where completed <= v
+ *
+ * Depth 2 already separates a consumer exactly one value behind. Depth 3 also covers a
+ * consumer two behind — its `CopySubresourceRegion` still in flight two commits later —
+ * which is the only lag the coupling above permits. Raise this if a diagnostic ever
+ * shows the consumer lagging further; nothing else has to change with it.
+ *
+ * NOTE: the service and the client must agree on this value. They ship in lockstep (the
+ * client↔service git-tag gate rejects a mismatched pair at xrCreateInstance), so a bump
+ * here needs no negotiation — unlike the XR_DXR_weave twin, whose consumer is
+ * out-of-tree.
+ */
+#define COMP_TRANSPARENT_OUTPUT_RING 3
 
 /*!
  * Opaque transparent-present helper. Owns the imported shared texture + fence, the DComp
@@ -68,8 +103,8 @@ comp_d3d_transparent_presenter_create(void *existing_d3d11_device,
 
 /*!
  * Per-frame present. Call once after the layer-commit RPC returns (the service has weaved
- * and signaled). GPU-waits the lockstep fence, copies the shared output into the DComp
- * back buffer, and `Present` + `Commit`. No-op if @p p is NULL.
+ * and signaled). Polls the fence, copies the ring slice that fence value names into the
+ * DComp back buffer, and `Present` + `Commit`. No-op if @p p is NULL.
  */
 void
 comp_d3d_transparent_presenter_present(struct comp_d3d_transparent_presenter *p);
