@@ -138,8 +138,8 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-034](adr/ADR-034-input-provider-plugins.md) — Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 - [ADR-035](adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) — The Service Owns Arbitration, Runs One Compositor Pipeline, and Isolates Its Satellites
 - [ADR-036](adr/ADR-036-android-per-window-compositor-instances.md) — Android: per-window compositor instances; the workspace overlay is an optional mode
-- [ADR-037](adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md) — Android: the vendor plug-in ships inside the runtime APK (two variants), not as a separate install
 - [ADR-037](adr/ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement policy on hybrid-GPU devices
+- [ADR-037](adr/ADR-037-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
 <!-- END ADR INDEX -->
 
 ---
