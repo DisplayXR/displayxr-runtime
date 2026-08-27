@@ -134,7 +134,37 @@ dxr_present_alpha_mode(void)
 #define VK_USE_PLATFORM_ANDROID_KHR
 #include <vulkan/vulkan_android.h>
 #include <android/native_window.h>
+#include <sys/system_properties.h>
 #include "android/android_globals.h"
+
+/*!
+ * #1146 secondary — latch a hard acquire failure until the next surface
+ * generation, instead of re-attempting it every frame.
+ *
+ * Between `surfaceDestroyed` on the Java UI thread and the #507 poll running
+ * `android_custom_surface_refresh_window()` on the app thread, the render /
+ * repaint path keeps acquiring against a BufferQueue that has already been
+ * abandoned. `vkAcquireNextImageKHR` returns VK_ERROR_SURFACE_LOST_KHR
+ * (-1000000000) and nothing latches, so the loop spins at frame rate and emits
+ * hundreds of `dequeueBuffer: BufferQueue has been abandoned` /
+ * `Failed to acquire target` lines per second. comp_target_swapchain's #528
+ * path already does exactly this ("give up until the next generation instead
+ * of spinning a hot recreate-fail loop"); this brings the #507 in-process
+ * target in line.
+ *
+ * Kill switch: `setprop debug.dxr.surface_lost_latch 0` restores the
+ * retry-every-frame behaviour. Read once per process.
+ */
+static bool
+dxr_surface_lost_latch_enabled(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		char prop[PROP_VALUE_MAX] = {0};
+		cached = (__system_property_get("debug.dxr.surface_lost_latch", prop) > 0 && prop[0] == '0') ? 0 : 1;
+	}
+	return cached != 0;
+}
 #endif
 
 // Desktop Linux (X11/XCB). Android also defines XRT_OS_LINUX but uses
@@ -2499,6 +2529,27 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			return XRT_ERROR_VULKAN;
 		}
 	} else if (res != VK_SUCCESS) {
+#ifdef XRT_OS_ANDROID
+		// #1146 secondary: the SurfaceView's surface is gone but the #507 poll
+		// has not published the clear yet. Latch, so comp_vk_native_target_sync_surface
+		// returns SURFACE_LOST on the following frames and the compositor skips
+		// them — instead of hammering an abandoned BufferQueue at frame rate.
+		// The latch is released by the next generation bump (clear or resume),
+		// which is the same recovery edge sync_surface already implements.
+		//
+		// Narrow on purpose: only VK_ERROR_SURFACE_LOST_KHR is definitionally
+		// unrecoverable without a new surface. Any other code keeps the old
+		// retry-every-frame behaviour, so a transient failure can still heal.
+		if (res == VK_ERROR_SURFACE_LOST_KHR && dxr_surface_lost_latch_enabled() && !target->surface_lost) {
+			target->surface_lost = true;
+			U_LOG_W(
+			    "Failed to acquire swapchain image: %d — output surface latched LOST until the "
+			    "next surface generation (#1146; setprop debug.dxr.surface_lost_latch 0 to "
+			    "disable)",
+			    res);
+			return XRT_ERROR_VULKAN;
+		}
+#endif
 		U_LOG_E("Failed to acquire swapchain image: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
