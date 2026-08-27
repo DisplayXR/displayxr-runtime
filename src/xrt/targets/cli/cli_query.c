@@ -706,6 +706,183 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	}
 }
 
+#ifdef XRT_OS_WINDOWS
+//! UTF-16 -> UTF-8 into a caller buffer. Empty string on any failure.
+static void
+w_to_utf8(const WCHAR *w, char *out, int out_size)
+{
+	out[0] = '\0';
+	if (w == NULL) {
+		return;
+	}
+	int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, out, out_size, NULL, NULL);
+	if (n <= 0) {
+		out[0] = '\0';
+	}
+}
+
+/*!
+ * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` still reachable by the Vulkan
+ * loader on this box?
+ *
+ * Deliberately answered from the REGISTRATION, not by loading `vulkan-1.dll`
+ * and enumerating. Two reasons: this tool's whole value is that it needs no
+ * GPU and no Vulkan, and post-#1229 a tool that loads `vulkan-1` is one more
+ * process a stray loader beside the runtime can poison. The cost is that this
+ * reimplements a slice of loader lookup rather than asking the loader — so it
+ * checks the three things that actually rot (the value, the manifest, the
+ * library path) and reports what it found rather than claiming a verdict the
+ * loader would necessarily agree with.
+ *
+ * INFORMATIONAL ONLY — see the field comment in cli_query.h. Every exit path
+ * writes `vk_layer_note`.
+ */
+static void
+probe_vk_queue_lock_layer(struct cli_query_result *r)
+{
+	r->vk_layer_probed = true;
+
+	HKEY key = NULL;
+	// KEY_WOW64_64KEY: the loader reads the 64-bit view, and so must we —
+	// a 32-bit build of this tool would otherwise look in the WOW6432Node
+	// redirect and report a perfectly registered layer as missing.
+	LSTATUS ls = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Khronos\\Vulkan\\ExplicitLayers", 0,
+	                           KEY_READ | KEY_WOW64_64KEY, &key);
+	if (ls != ERROR_SUCCESS) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "NOT registered: no HKLM\\Software\\Khronos\\Vulkan\\ExplicitLayers key "
+		         "(#868 late-weave repaint unavailable on a single-graphics-queue GPU)");
+		return;
+	}
+
+	// The value NAME is the manifest path; the DWORD data is the enable flag
+	// (0 = enabled). Ours is whatever path the installer wrote, so match on
+	// the filename rather than assuming an install directory.
+	static const WCHAR *k_manifest_leaf = L"VkLayer_DXR_queue_lock.json";
+	WCHAR name[1024];
+	DWORD enable_data = 0;
+	bool found = false;
+	for (DWORD i = 0;; i++) {
+		DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+		DWORD type = 0;
+		DWORD data = 0;
+		DWORD data_len = sizeof(data);
+		ls = RegEnumValueW(key, i, name, &name_len, NULL, &type, (LPBYTE)&data, &data_len);
+		if (ls == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (ls != ERROR_SUCCESS) {
+			continue; // a value we cannot read is not a reason to stop looking
+		}
+		size_t len = wcslen(name);
+		size_t leaf = wcslen(k_manifest_leaf);
+		if (len >= leaf && _wcsicmp(name + (len - leaf), k_manifest_leaf) == 0) {
+			found = true;
+			enable_data = (type == REG_DWORD) ? data : 0;
+			w_to_utf8(name, r->vk_layer_manifest, (int)sizeof(r->vk_layer_manifest));
+			break;
+		}
+	}
+	RegCloseKey(key);
+
+	if (!found) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "NOT registered: no ExplicitLayers value names %s "
+		         "(#868 late-weave repaint unavailable on a single-graphics-queue GPU)",
+		         "VkLayer_DXR_queue_lock.json");
+		return;
+	}
+	r->vk_layer_registered = true;
+	r->vk_layer_enabled = (enable_data == 0);
+
+	FILE *f = fopen(r->vk_layer_manifest, "rb");
+	if (f == NULL) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "registered but the manifest is MISSING: %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+	char json[4096];
+	size_t got = fread(json, 1, sizeof(json) - 1, f);
+	fclose(f);
+	json[got] = '\0';
+
+	cJSON *root = cJSON_Parse(json);
+	cJSON *layer = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, "layer") : NULL;
+	cJSON *lib = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "library_path") : NULL;
+	if (!cJSON_IsString(lib) || lib->valuestring == NULL || lib->valuestring[0] == '\0') {
+		cJSON_Delete(root);
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "registered but the manifest has no usable layer.library_path: %s", r->vk_layer_manifest);
+		return;
+	}
+	r->vk_layer_manifest_ok = true;
+	snprintf(r->vk_layer_library, sizeof(r->vk_layer_library), "%s", lib->valuestring);
+	cJSON_Delete(root);
+
+	// What the loader accepts is narrower than "a path", and NOT simply
+	// "absolute only" - see the measured note in
+	// src/xrt/targets/vk_layer/CMakeLists.txt. library_path is resolved
+	// against the manifest's own directory ONLY when it contains the platform
+	// directory symbol, which on Windows is a BACKSLASH. So:
+	//   "C:\\dir\\x.dll"  absolute            -> ok
+	//   ".\\x.dll"          relative + backslash -> ok (joined to the manifest dir)
+	//   "./x.dll" / "x.dll"  no backslash        -> handed to LoadLibraryEx verbatim,
+	//                                              which rejects it with error 87 and
+	//                                              surfaces as VK_ERROR_OUT_OF_HOST_MEMORY
+	//                                              naming neither layer nor path.
+	// Flagging the second form would be a FALSE ALARM against the shape the
+	// package deliberately ships, and would invite someone to "fix" a working
+	// manifest into a broken one.
+	const char *p = r->vk_layer_library;
+	bool absolute = (p[0] != '\0' && p[1] == ':') || (p[0] == '\\' && p[1] == '\\');
+	char resolved[1024];
+	if (absolute) {
+		snprintf(resolved, sizeof(resolved), "%s", p);
+	} else if (strchr(p, '\\') != NULL) {
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", r->vk_layer_manifest);
+		char *slash = strrchr(dir, '\\');
+		if (slash != NULL) {
+			*slash = '\0';
+		} else {
+			dir[0] = '\0';
+		}
+		// Drop a leading ".\\" so the reported path reads as a path and not
+		// as "...\\.\\name.dll"; both resolve, only one is legible in a bug report.
+		const char *rel = p;
+		if (rel[0] == '.' && rel[1] == '\\') {
+			rel += 2;
+		}
+		snprintf(resolved, sizeof(resolved), "%s\\%s", dir, rel);
+	} else {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "registered but library_path '%s' has no directory separator — the loader "
+		         "hands it to LoadLibraryEx verbatim, which fails with error 87 (the app sees "
+		         "VK_ERROR_OUT_OF_HOST_MEMORY naming neither layer nor path)",
+		         r->vk_layer_library);
+		return;
+	}
+	if (GetFileAttributesA(resolved) == INVALID_FILE_ATTRIBUTES) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "registered but the layer DLL is MISSING: %s",
+		         resolved);
+		return;
+	}
+	r->vk_layer_library_ok = true;
+
+	if (!r->vk_layer_enabled) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "registered and present but DISABLED (ExplicitLayers value is non-zero): %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+
+	// Reachable. Deliberately not phrased as "repaint is on": the tier also
+	// depends on whether the driver hands out a dedicated queue, which is a
+	// device-time fact this headless tool cannot see.
+	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "VK_LAYER_DXR_queue_lock reachable (%s)", resolved);
+}
+#endif
+
 void
 cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
@@ -908,6 +1085,16 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	}
 #else
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
+#endif
+
+	// #1234 / #902 — can the Vulkan loader still reach the queue-lock layer?
+	// Pure reporting: never touches result_code. See the field comment in
+	// cli_query.h for why this must not be fatal.
+#ifdef XRT_OS_WINDOWS
+	probe_vk_queue_lock_layer(r);
+#else
+	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+	         "not probed: the queue-lock layer is a Windows-only registration (OK)");
 #endif
 
 	// ADR-034 / #823 — a registered, non-overridden input provider whose
@@ -1154,6 +1341,16 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->gpu_service_ingest);
 	}
 
+	// #1234 / #902 - VK late-weave repaint reachability.
+	P(" :: VK late-weave repaint (#868/#902)\n");
+	PT("%s\n", r->vk_layer_note[0] != '\0' ? r->vk_layer_note : "not evaluated");
+	if (r->vk_layer_registered) {
+		PT("manifest:     %s%s\n", r->vk_layer_manifest, r->vk_layer_enabled ? "" : "  (DISABLED)");
+		if (r->vk_layer_library[0] != '\0') {
+			PT("library_path: %s%s\n", r->vk_layer_library, r->vk_layer_library_ok ? "" : "  (UNUSABLE)");
+		}
+	}
+
 	P(" :: Input providers (ADR-034)\n");
 	PT("registered:   %d%s\n", r->input_provider_count,
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
@@ -1301,6 +1498,19 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(ds, "service_confidence", r->dp_sel_service_conf);
 		cJSON_AddNumberToObject(ds, "monitor_count", (double)r->dp_sel_monitor_count);
 		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
+	}
+
+	// #1234 / #902 - VK late-weave repaint reachability (informational).
+	{
+		cJSON *vl = cJSON_AddObjectToObject(root, "vk_repaint_tier");
+		cJSON_AddBoolToObject(vl, "probed", r->vk_layer_probed);
+		cJSON_AddBoolToObject(vl, "registered", r->vk_layer_registered);
+		cJSON_AddBoolToObject(vl, "enabled", r->vk_layer_enabled);
+		cJSON_AddBoolToObject(vl, "manifest_ok", r->vk_layer_manifest_ok);
+		cJSON_AddBoolToObject(vl, "library_ok", r->vk_layer_library_ok);
+		cJSON_AddStringToObject(vl, "manifest", r->vk_layer_manifest);
+		cJSON_AddStringToObject(vl, "library_path", r->vk_layer_library);
+		cJSON_AddStringToObject(vl, "note", r->vk_layer_note);
 	}
 
 	// #918 GPU topology.
@@ -1528,6 +1738,17 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->name = "gpu_topology";
 	c->ok = true;
 	snprintf(c->detail, sizeof(c->detail), "%s", r->gpu_verdict[0] != '\0' ? r->gpu_verdict : "not evaluated");
+
+	// #1234 - VK late-weave repaint reachability. INFORMATIONAL ONLY, for the
+	// same reason gpu_topology is: the tier also depends on whether the driver
+	// hands out a dedicated queue, which is decided at compositor create on a
+	// real device and is invisible from here. A from-source build and CI's own
+	// selftest gate both legitimately lack the registration, so failing on it
+	// would break the very gate this check exists to sharpen.
+	c = &out[n++];
+	c->name = "vk_repaint_tier";
+	c->ok = true;
+	snprintf(c->detail, sizeof(c->detail), "%s", r->vk_layer_note[0] != '\0' ? r->vk_layer_note : "not evaluated");
 
 	c = &out[n++];
 	c->name = "input_providers";
