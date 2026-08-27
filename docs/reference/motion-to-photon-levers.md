@@ -21,7 +21,7 @@ a stack:
 
 | | Approach | What it costs |
 |---|---|---|
-| **A** | Let frames queue (`DXR_DEFER_PRESENT`) so that a DP capable of re-sampling the pose at submit time has something to correct | +1 frame of eye-pose staleness, which the DP-side correction is supposed to pay back. Measured null twice. |
+| **A** | Let frames queue (`DXR_DEFER_PRESENT`, since **removed** — see below) so that a DP capable of re-sampling the pose at submit time has something to correct | +1 frame of eye-pose staleness, which the DP-side correction is supposed to pay back. Measured null twice. |
 | **B** | Never let the weave go stale in the first place — **repaint** re-weaves the last atlas at display rate with a **fresh** eye pose | A repaint costs GPU time even when the app has produced nothing new |
 
 **We ship B.** Repaint runs at the display rate, so the woven pose is at most one refresh old
@@ -89,7 +89,12 @@ meant tier 2 was unreachable on every single-queue GPU and those machines silent
 Overrides: `queue` = tier 1 only · `layer` = force tier 2 even where a queue exists, so the layer
 path is testable on multi-queue GPUs · `off` = no layer injection, no repaint.
 
-### `DXR_DEFER_PRESENT` — **default OFF** (#837)
+### `DXR_DEFER_PRESENT` — **REMOVED from the code; kept here as the measurement record** (#837)
+
+> **The variable no longer exists.** `grep -rn DEFER_PRESENT src/` returns nothing — the
+> mechanism was measured as a null twice (below) and deleted. Setting it does nothing.
+> The section stays because the *result* is what stops someone re-deriving it; do not
+> read it as a lever you can turn on.
 
 Return from the weave without waiting on the submit fence, parking the frame's command buffer,
 framebuffer and fence and retiring exactly that predecessor at the top of the next call. Net
@@ -108,9 +113,9 @@ The runtime feeds the DP a **measured weave→scanout residual** through its fra
 that predicts eye position can use that instead of assuming a fixed pipeline depth, which means a
 change in real present latency is largely self-correcting without any runtime knob.
 
-**Unverified:** whether that residual still means what the DP thinks it means when
-`DXR_DEFER_PRESENT` moves the present into the following call. Check before that flag is ever
-considered for default-on.
+**Moot since the removal:** the open question used to be whether that residual still means what
+the DP thinks it means when `DXR_DEFER_PRESENT` moves the present into the following call. Nothing
+moves the present any more. Re-open it only if a deferred-present mechanism is ever reintroduced.
 
 ### Adjacent levers that change the picture
 
@@ -129,7 +134,7 @@ considered for default-on.
 |---|---|---|---|
 | Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
 | Repaint | **on**, tier 1 dedicated queue | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) | on; follows the adapter the session was created on |
-| `DXR_DEFER_PRESENT` | off | off | off |
+| `DXR_DEFER_PRESENT` | *removed from the code* | *removed* | *removed* |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
 **Hybrid is the one still being settled — but the answer is now measured.** On this class of laptop
@@ -206,6 +211,7 @@ are unavailable there (#1044); the plain-swapchain paths are the instrumented on
 
 ## See also
 
+- [`docs/roadmap/control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md) — the full census of **every** `DXR_*` lever (read site, mechanism, default, tier), and the design for surfacing a small subset in the Control Panel
 - [`docs/adr/ADR-007`](../adr/ADR-007-compositor-never-weaves.md) — the compositor never weaves; the DP does
 - [`docs/architecture/compositor-pipeline.md`](../architecture/compositor-pipeline.md)
 - [`docs/reference/adapter-selection.md`](adapter-selection.md) — GPU placement on hybrid machines

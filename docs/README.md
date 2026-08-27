@@ -188,6 +188,7 @@ Cross-cutting references that don't belong to a single audience.
 - [Debug Logging](reference/debug-logging.md) — log level conventions
 - [Motion-to-Photon Levers](reference/motion-to-photon-levers.md) — every latency knob (late weave, repaint, queue tiers, deferred present, late latching) with its default, and the defaults per GPU topology (dGPU / iGPU / hybrid)
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
+- [Control Panel performance settings](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
 - [Workspace Stability](reference/workspace-stability.md) — the wedge family (lock starvation, fence jams, blocking presents, vendor-DP and MCP write wedges), the no-unbounded-work principle (#925), and the diagnostic toolkit ([RENDER] tell, PDBs, wedge captures, close gauntlet)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).
