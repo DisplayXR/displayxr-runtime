@@ -485,18 +485,40 @@ client_vk_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, ui
 		    .pSemaphores = &c->read_done_semaphore,
 		    .pValues = &c->workspace_sync_fence_value,
 		};
-		uint64_t cap_ns = 1000000000ULL; // 1 s -- far beyond any healthy frame
-		uint64_t wait_ns = (timeout_ns > 0 && (uint64_t)timeout_ns < cap_ns) ? (uint64_t)timeout_ns : cap_ns;
+		/*
+		 * Three explicit timeout cases (review on #1217 caught the zero case
+		 * falling through to the cap and BLOCKING 1 s on what the spec defines
+		 * as a poll):
+		 *   timeout_ns == 0  -> POLL: wait 0, return XRT_TIMEOUT quietly if the
+		 *                       read has not executed (a poll timing out is the
+		 *                       caller's expected path, not a fault to log);
+		 *   timeout_ns  < 0  -> treated as infinite, CAPPED at 1 s (a dead
+		 *                       service surfaces as XRT_TIMEOUT plus a named
+		 *                       1/s log, never a wedge -- #922 rule);
+		 *   timeout_ns  > 0  -> min(timeout, cap).
+		 */
+		const uint64_t cap_ns = 1000000000ULL; // 1 s -- far beyond any healthy frame
+		uint64_t wait_ns;
+		bool is_poll = (timeout_ns == 0);
+		if (is_poll) {
+			wait_ns = 0;
+		} else if (timeout_ns < 0) {
+			wait_ns = cap_ns;
+		} else {
+			wait_ns = (uint64_t)timeout_ns < cap_ns ? (uint64_t)timeout_ns : cap_ns;
+		}
 		VkResult vres = c->vk.vkWaitSemaphores(c->vk.device, &wait_info, wait_ns);
 		if (vres == VK_TIMEOUT) {
-			int64_t now_ns = (int64_t)os_monotonic_get_ns();
-			if (now_ns - c->read_done_timeout_last_log_ns > 1000000000LL) {
-				c->read_done_timeout_last_log_ns = now_ns;
-				U_LOG_W("#1215: wait_image timed out waiting for the service's read of "
-				        "commit value %llu (service dead or stalled) -- returning "
-				        "XRT_TIMEOUT rather than letting the app overwrite a frame "
-				        "the service may still read",
-				        (unsigned long long)c->workspace_sync_fence_value);
+			if (!is_poll) {
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				if (now_ns - c->read_done_timeout_last_log_ns > 1000000000LL) {
+					c->read_done_timeout_last_log_ns = now_ns;
+					U_LOG_W("#1215: wait_image timed out waiting for the service's read of "
+					        "commit value %llu (service dead or stalled) -- returning "
+					        "XRT_TIMEOUT rather than letting the app overwrite a frame "
+					        "the service may still read",
+					        (unsigned long long)c->workspace_sync_fence_value);
+				}
 			}
 			return XRT_TIMEOUT;
 		}

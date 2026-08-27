@@ -17498,6 +17498,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			xrt_session_event_sink_push(c->xses, &xse);
 			c->exit_request_sent = true;
 		}
+		// #1215: this early return skips the blits, so no read of this commit's
+		// images will EVER happen (every later commit takes this same branch).
+		// Signal read_done anyway -- truthfully -- or the app eats a 1 s
+		// wait_image timeout on every frame of its teardown window (review note
+		// on #1217: degradations are named or removed, never silent).
+		if (c->read_done_fence) {
+			uint64_t rd_v = c->last_signaled_fence_value.load(std::memory_order_acquire);
+			if (rd_v > c->read_done_value) {
+				sys->context->Signal(c->read_done_fence.get(), rd_v);
+				c->read_done_value = rd_v;
+			}
+		}
 		// Return success so the error doesn't propagate as XR_ERROR_INSTANCE_LOST.
 		// The EXIT_REQUEST event drives the session to STOPPING so the app
 		// calls xrEndSession and continues running.
@@ -22674,6 +22686,10 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 
 		// #1215 -- the reverse-direction "read executed" fence. Only useful to
 		// clients on the fence path, so gate on the forward fence existing.
+		// NOTE: the VK client is currently the only importer/waiter; a fence-path
+		// D3D11 client gets this fence exported and signaled into the void -- the
+		// handle count and the log line below do NOT imply the handshake is
+		// load-bearing for that client (D3D12/GL/D3D11 wait halves are follow-ups).
 		// Failure is non-fatal: the client sees have_fence=false and leaves
 		// wait_image a pass-through (the pre-#1215 behavior, race included).
 		c->read_done_fence_handle = nullptr;
