@@ -45,6 +45,12 @@
 # Order matters: runtime first, then apps. An app installed first simply
 # finds no runtime.
 #
+# Apps also need two things the installer cannot do for them, both of which
+# present as "the app is broken" rather than as a permissions problem:
+#   * the same signature-mismatch uninstall as the runtime (--force-reinstall);
+#   * runtime permission grants -- without CAMERA, Gaussian Splat and Avatar
+#     open on a consent dialog instead of content.
+#
 # SIGNING CHANGE (#1212). Released runtime APKs are signed with the DisplayXR
 # release key. Every runtime built before that was signed with the Android
 # DEBUG key, and Android refuses to upgrade an app across a signature change:
@@ -90,6 +96,48 @@ else
 fi
 
 adbsh() { "$ADB" "${DEVICE_ARGS[@]}" "$@"; }
+
+# Read the package name out of an APK so we can uninstall/grant against it.
+# Deliberately NOT derived from the filename: the Gaussian Splat package is
+# com.displayxr.gausssplat_vk_android -- three s -- matching neither the repo
+# name nor the asset name, so any name-guessing loop silently targets a package
+# that does not exist.
+apk_pkg() {
+    local aapt sdk
+    # PATH first, then every SDK location that is actually conventional.
+    # Probing only $ANDROID_HOME/$ANDROID_SDK_ROOT is not enough: neither is set
+    # on a default macOS or Linux box, so this returned empty and the permission
+    # grants below silently no-opped -- in exactly the unattended install this
+    # function exists to serve.
+    aapt="$(command -v aapt2 2>/dev/null || command -v aapt 2>/dev/null || true)"
+    if [ -z "$aapt" ]; then
+        for sdk in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+                   "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" \
+                   "${LOCALAPPDATA:-$HOME/AppData/Local}/Android/Sdk"; do
+            [ -n "$sdk" ] && [ -d "$sdk/build-tools" ] || continue
+            aapt="$(find "$sdk/build-tools" -name aapt2 2>/dev/null | sort -V | tail -1)"
+            [ -n "$aapt" ] && break
+        done
+    fi
+    [ -n "$aapt" ] || return 0
+    "$aapt" dump packagename "$1" 2>/dev/null | head -1
+}
+
+# Demo apps need runtime permissions the installer cannot grant. Without these,
+# Gaussian Splat and Avatar open on a CAMERA consent dialog instead of content,
+# so an unattended install looks like a broken app rather than an ungranted
+# permission. All are no-ops for apps that do not declare them.
+grant_app_perms() {
+    local pkg
+    pkg="$(apk_pkg "$1")"
+    [ -n "$pkg" ] || { echo "     (could not read package name; skipping permission grants)"; return 0; }
+    for perm in android.permission.CAMERA android.permission.POST_NOTIFICATIONS; do
+        adbsh shell pm grant "$pkg" "$perm" >/dev/null 2>&1 || true
+    done
+    # Avatar's float mode draws over other apps, same app-op the runtime needs.
+    adbsh shell appops set "$pkg" SYSTEM_ALERT_WINDOW allow >/dev/null 2>&1 || true
+    echo "     granted CAMERA / POST_NOTIFICATIONS / SYSTEM_ALERT_WINDOW to $pkg (where declared)"
+}
 
 # ---- uninstall --------------------------------------------------------------
 if [ "${1:-}" = "--uninstall" ]; then
@@ -200,7 +248,27 @@ else
     for apk in "$@"; do
         [ -f "$apk" ] || { echo "ERROR: $apk not found." >&2; exit 1; }
         echo "   - $(basename "$apk")"
-        adbsh install -r -d "$apk"
+        if ! out="$(adbsh install -r -d "$apk" 2>&1)"; then
+            echo "$out"
+            # Apps hit the same signature wall as the runtime: a released APK
+            # cannot upgrade a locally-built one. Handling it only for the
+            # runtime left the app leg dying here on any dev-built device.
+            if printf '%s' "$out" | grep -q INSTALL_FAILED_UPDATE_INCOMPATIBLE; then
+                pkg="$(apk_pkg "$apk")"
+                echo "     signature mismatch on $(basename "$apk")${pkg:+ (}${pkg}${pkg:+)}"
+                if [ "$FORCE_REINSTALL" = true ] && [ -n "$pkg" ]; then
+                    echo "     --force-reinstall: uninstalling $pkg and retrying"
+                    adbsh uninstall "$pkg" || true
+                    adbsh install -r -d "$apk"
+                else
+                    echo "     re-run with --force-reinstall, or: adb uninstall ${pkg:-<package>}" >&2
+                    exit 1
+                fi
+            else
+                exit 1
+            fi
+        fi
+        grant_app_perms "$apk"
     done
 fi
 
