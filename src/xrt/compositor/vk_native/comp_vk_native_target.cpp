@@ -2245,7 +2245,11 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 #ifdef XRT_OS_ANDROID
 		// Latch so sync_surface reports LOST and the compositor skips frames until
 		// the next surface generation, rather than retrying into the same hole.
-		if (!target->surface_lost) {
+		// Honours the same kill switch as the other two latch sites. Note the
+		// GUARD above is not optional and is deliberately outside it: refusing a
+		// NULL acquire IS the crash fix. The switch only controls whether we also
+		// latch, so `debug.dxr.surface_lost_latch 0` means what it says.
+		if (dxr_surface_lost_latch_enabled() && !target->surface_lost) {
 			target->surface_lost = true;
 			U_LOG_W("acquire with no swapchain — surface latched LOST until the next "
 			        "generation (#1236)");
