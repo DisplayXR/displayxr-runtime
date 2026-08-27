@@ -375,11 +375,18 @@ The runner already fail-closed-verifies `Status=Valid` AND signer contains
 elsewhere trust the runner's gate.)
 
 ### Step 4.5.3: Replace the CI asset on the release
-**The delete is load-bearing, not tidy-up.** `--clobber` cannot replace the CI asset:
-the signing runner rebuilds with build number `0` (`DisplayXRSetup-2.0.4.0.exe`) while CI
-stamps the run number (`DisplayXRSetup-2.0.4.1883.exe`), so the names never collide. Skip
-the delete and the release ships a signed **and** an unsigned installer side by side —
-exactly the outcome this phase exists to prevent.
+**The delete is a safety net, not the normal path.** The NSI now names the installer
+`DisplayXRSetup-${VERSION}.exe` — version only, **no** build number — so the signing
+runner's output has the SAME name as CI's and `--clobber` replaces it in place. The delete
+then finds nothing and correctly prints its NOTE.
+
+Keep it anyway, because the failure it guards is silent and expensive. If the NSI ever
+regresses to stamping a build number, the runner rebuilds with `0`
+(`DisplayXRSetup-2.0.4.0.exe`) while CI stamps the run number
+(`DisplayXRSetup-2.0.4.1883.exe`), the names never collide, `--clobber` cannot replace the
+CI asset, and the release ships a signed **and** an unsigned installer side by side —
+exactly the outcome this phase exists to prevent. The asset-count assertion is what
+actually catches that; verify it rather than assuming the delete did its job.
 
 Note the jq filter uses `startswith`/`endswith`, NOT `test("...\\.exe$")`. The regex form
 needs a `\\` that survives intact only in single quotes; one extra layer of double-quoting
@@ -518,7 +525,7 @@ Build:     Windows CI run #RUN_ID — Runtime + cube test apps passed
 Signing:   [signed → "runtime installer built + signed on the signing runner (full chain incl. uninstaller, run $SIGN_RUN), re-uploaded over the CI asset"]
            [none   → "⚠ UNSIGNED — signing runner unreachable; re-run /release from a box whose gh can dispatch build-signed-release.yml on the signing runner"]
 Release:   https://github.com/DisplayXR/displayxr-runtime/releases/tag/[FULL_TAG]
-Assets:    DisplayXRSetup-X.Y.Z.BUILD.exe (~N MB)
+Assets:    DisplayXRSetup-X.Y.Z.exe (~N MB, signed — exactly one .exe)
            DisplayXR-Installer-X.Y.Z.pkg (~N MB)  [or "skipped — macOS run did not produce .pkg"]
 Commits:   N commits since $PREV_TAG
 
