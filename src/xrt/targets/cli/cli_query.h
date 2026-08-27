@@ -304,7 +304,51 @@ struct cli_query_result
 	char gpu_ingest_name[128];
 	char gpu_ingest_provenance[64]; //!< which rule decided ("most VRAM", "env-forced: scanout", …).
 	char gpu_service_ingest[224];   //!< the composed one-liner both serializers print.
-	char gpu_note[128]; //!< why the probe could not answer, when it could not.
+	char gpu_note[128];             //!< why the probe could not answer, when it could not.
+
+	/*!
+	 * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` reachable by the Vulkan
+	 * loader? INFORMATIONAL ONLY, and Windows-only (`vk_layer_probed` stays
+	 * false elsewhere).
+	 *
+	 * The layer is what lets the #868 late-weave repaint share the app's
+	 * VkQueue on a GPU whose graphics family exposes a single queue. Without
+	 * it the compositor falls to tier 3 — pacing only, no repaint — and says
+	 * so once, in an app log nobody aggregates. Selftest is headless, so it
+	 * can never observe the tier decision itself (that happens at compositor
+	 * create, on a real device); what it CAN do is answer whether the input
+	 * the tier decision depends on is intact on this box.
+	 *
+	 * This is a REPORTING field. It never changes tier selection, and it must
+	 * never fail the run: a from-source build has no registration at all (the
+	 * installer writes it, `build_windows.bat` does not), and CI's selftest
+	 * gate registers only the sim-display plug-in — so a fatal check here
+	 * would fail the very gate it is meant to protect.
+	 *
+	 * registered  — an `ExplicitLayers` value names our manifest.
+	 * enabled     — …and its DWORD data is 0 (non-zero disables it).
+	 * manifest_ok — the named .json exists and parses.
+	 * library_ok  — its `library_path` resolves to a file that exists.
+	 *               "Relative" is NOT the broken shape — the loader joins
+	 *               library_path to the manifest's directory whenever it
+	 *               contains the platform directory symbol, a BACKSLASH on
+	 *               Windows. So ".\\x.dll" is fine and is what the package
+	 *               ships. What breaks is a path with NO separator ("x.dll",
+	 *               or "./x.dll", whose slash is not the Windows symbol):
+	 *               that goes to LoadLibraryEx verbatim, fails with error 87,
+	 *               and reaches the app as VK_ERROR_OUT_OF_HOST_MEMORY naming
+	 *               neither the layer nor the path. Measured note:
+	 *               src/xrt/targets/vk_layer/CMakeLists.txt.
+	 * note        — the one-line verdict, reused verbatim by selftest.
+	 */
+	bool vk_layer_probed;
+	bool vk_layer_registered;
+	bool vk_layer_enabled;
+	bool vk_layer_manifest_ok;
+	bool vk_layer_library_ok;
+	char vk_layer_manifest[512];
+	char vk_layer_library[512];
+	char vk_layer_note[256];
 };
 
 /*!
