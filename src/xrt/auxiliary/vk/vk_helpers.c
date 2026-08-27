@@ -1844,3 +1844,9 @@ vk_cmd_image_barrier_gpu_locked(struct vk_bundle *vk,
 	    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, // dst_stage_mask
 	    subresource_range);                 // subresource_range
 }
+
+uint32_t
+vk_bundle_get_abi_size(void)
+{
+	return (uint32_t)sizeof(struct vk_bundle);
+}
