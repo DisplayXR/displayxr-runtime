@@ -14698,8 +14698,30 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// non-blocking guard as the direct path. Scope is deliberately
 				// just the bind+draw: the surrounding loop takes
 				// ws_snapshot_mutex, and holding a leaf across another lock is
-				// what the field comment forbids. On a miss this slot keeps last
-				// frame's pixels in the combined atlas.
+				// what the field comment forbids.
+				//
+				// GAUSS BLINK FIX: this guard used to `continue` on a miss, on
+				// the assumption that "this slot keeps last frame's pixels in
+				// the combined atlas". That assumption is FALSE -- the combined
+				// atlas is cleared to the backdrop at the top of this very tick,
+				// so a skipped draw showed the BACKDROP in this window's rect
+				// for one presented frame: a user-visible one-frame blink, at
+				// the atlas_contention rate (~1/s for a heavy continuously-
+				// committing client like the 3DGS demo; instrumented dropout
+				// frames carried exactly the clear color, and the rate scales
+				// with commit-blit size x refresh rate -- visible at 8K@60 and
+				// 4K@165, below threshold at 4K@60). Same false-persistence-
+				// over-a-clear class as the standalone present strobe fixed in
+				// compositor_layer_commit and the zones all-or-nothing acquire.
+				//
+				// The trade inverts: draw WITHOUT the lock rather than not at
+				// all. The per-client atlas is persistent and single-buffered,
+				// so an unguarded read races only the client's in-flight blit
+				// sequence -- worst case one view samples a frame older than the
+				// other for one tick, imperceptible next to a full-tile backdrop
+				// flash. Still counted (the counter now means "unguarded draws",
+				// not dropouts), never blocking, no lock-ordering change (the
+				// leaf is simply not held).
 				struct d3d11_service_compositor *slot_cc = mc->clients[s].compositor;
 				std::unique_lock<std::mutex> slot_atlas_lock;
 				if (slot_cc != nullptr) {
@@ -14708,7 +14730,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					if (!slot_atlas_lock.owns_lock()) {
 						sys->render_diag_atlas_contention.fetch_add(1,
 						                                            std::memory_order_relaxed);
-						continue;
+						// fall through: draw unguarded (see above).
 					}
 				}
 				ID3D11ShaderResourceView *content_srvs[2] = {slot_srv, hud_srv_to_bind};
