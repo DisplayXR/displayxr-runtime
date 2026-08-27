@@ -183,3 +183,12 @@ Released plug-ins from v2.6.1 onward are unaffected.
 **Weave looks doubled in portrait but correct in landscape.** Fixed in plug-in **v2.6.1**
 ([#196](https://github.com/DisplayXR/displayxr-leia-plugin/pull/196)). If you see it, the runtime
 APK predates that plug-in.
+
+> **Why the launch-once step matters (two mechanisms).** Opening the DisplayXR
+> app once after install arms **both** discovery paths: it clears the package's
+> stopped state so the OpenXR **broker provider** answers loaders, and (since
+> #1246) it also starts the runtime's **IPC service** in the foreground — on
+> OEM ROMs with background-start restrictions, a client app (the DisplayXR
+> Browser's inline-3D, `XRT_FORCE_MODE=ipc` apps) cannot create that service
+> itself and would otherwise silently run without a runtime connection (#1245).
+> Skipping this step is the #1 cause of "installed everything, still 2D".
