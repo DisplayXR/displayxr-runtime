@@ -35,6 +35,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #include "xrt/xrt_plugin.h"
 
 #include <stddef.h>
@@ -44,6 +46,17 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct xrt_plugin_iface;
+
+/*!
+ * #1243/#1244: true when the plug-in's `struct vk_bundle` layout matches ours,
+ * so its VK DP factory may be used. MUST gate every site that captures
+ * `create_dp_vk` — a config-skewed table dispatches the wrong driver entries
+ * and faults inside the GPU driver. Logs the reason when it returns false.
+ */
+bool
+xrt_plugin_vk_abi_compatible(const struct xrt_plugin_iface *iface, const char *plugin_id);
 
 /*!
  * Vendor-neutral descriptor for one registered plug-in, as discovered
