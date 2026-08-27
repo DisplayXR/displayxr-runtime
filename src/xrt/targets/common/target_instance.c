@@ -105,7 +105,11 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (info == NULL || plugin == NULL) {
 		return;
 	}
-	if (plugin->create_dp_vk != NULL) {
+	// #1243/#1244: this is the path Android takes, and it was NOT covered by the
+	// original guard — a config-skewed plug-in reached the compositor here and
+	// faulted inside the Adreno driver instead of being refused. Same check as
+	// the per-display-claims path in target_plugin_loader.c.
+	if (plugin->create_dp_vk != NULL && xrt_plugin_vk_abi_compatible(plugin, plugin->id)) {
 		info->dp_factory_vk = (void *)plugin->create_dp_vk;
 	}
 #ifdef XRT_OS_WINDOWS
