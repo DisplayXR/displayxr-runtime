@@ -13,6 +13,33 @@ For building from source instead, see [android-build-guide.md](android-build-gui
 
 ## What you install
 
+## One command (recommended) — the Android "bundle"
+
+The desktop bundle installer (`DisplayXRBundle-*.exe/.pkg/.tar.gz`) has **no
+Android counterpart**: Android ships one APK per component, each on its own
+GitHub release. `scripts/install-android-bundle.sh` is that counterpart — it
+downloads every component at its `versions.json` pin and installs the set:
+
+```bash
+# needs: gh (authenticated), adb, device connected
+curl -fsSLO https://raw.githubusercontent.com/DisplayXR/displayxr-runtime/main/scripts/install-android-bundle.sh
+chmod +x install-android-bundle.sh
+./install-android-bundle.sh                 # runtime (Leia) + all five demos
+./install-android-bundle.sh --list          # show what would install, install nothing
+./install-android-bundle.sh --with-browser  # + DisplayXR Browser preview
+```
+
+It works from a clone or standalone (it fetches `versions.json` and
+`install-android.sh` from GitHub when run outside a checkout).
+
+> **`--force-reinstall` wipes app data**, including EarthView's saved Google
+> Maps API key. Without it, installs are `adb install -r` upgrades and app data
+> is preserved.
+
+`install-android.sh` (below) remains the lower-level path: it installs APKs you
+already have and does **not** download anything.
+
+
 **One runtime APK, plus one APK per demo.** That is the whole list.
 
 The vendor plug-in is **inside the runtime APK** ([ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md)) — there is no
