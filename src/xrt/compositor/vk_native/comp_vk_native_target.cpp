@@ -2241,7 +2241,17 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// faults inside the Adreno driver (SIGSEGV at 0x0 in AcquireNextImageKHR, reached
 	// from vk_repaint_thread). Every caller already handles the error return, so
 	// failing here is strictly better than a null dereference one frame later.
-	if (target->swapchain == VK_NULL_HANDLE) {
+	//
+	// EXCEPTION — the Windows DComp bridge. On that path VK never goes through WSI
+	// at all (see the @ref dcomp_active doc block): the compositor renders into the
+	// imported ring and the branch below returns a ring index without ever calling
+	// vkAcquireNextImageKHR, so target->swapchain is legitimately VK_NULL_HANDLE.
+	// Guarding it there fails EVERY frame of EVERY transparent-window app.
+	bool needs_vk_swapchain = true;
+#ifdef XRT_OS_WINDOWS
+	needs_vk_swapchain = !target->dcomp_active;
+#endif
+	if (needs_vk_swapchain && target->swapchain == VK_NULL_HANDLE) {
 #ifdef XRT_OS_ANDROID
 		// Latch so sync_surface reports LOST and the compositor skips frames until
 		// the next surface generation, rather than retrying into the same hole.
