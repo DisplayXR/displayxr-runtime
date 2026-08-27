@@ -133,6 +133,15 @@ HW_GEO: view=1800x810 (aspect 2.222) tiles=2x1 atlas=3600x810 target=1080x2400
 | EarthView | **Requires your own Google Map Tiles API key**, prompted on first run. Without it the app runs but shows no globe. |
 | Avatar | Renders after camera permission. Floats over other apps when `SYSTEM_ALERT_WINDOW` is allowed — seeing another app behind it is correct. |
 
+## Known limitation of this validation
+
+This document was validated end-to-end on an LPD-20W against **non-stock CNSDK services** —
+`com.leialoft.display.config` 0.10.64, built from an unreleased branch. The newest *published*
+CNSDK is 0.10.61, so a device set up purely from released artifacts runs a different service
+version than the one this was tested on. The install mechanics are unaffected, but "verified" here
+does not yet mean "verified against what a user would have". Tracked in
+[runtime#1232](https://github.com/DisplayXR/displayxr-runtime/issues/1232).
+
 ## Troubleshooting
 
 **Every app fails with `XR_ERROR_RUNTIME_UNAVAILABLE`.** The runtime is installed but has never
@@ -153,6 +162,18 @@ no glue it falls back to `dlopen`ing an impl that in-service CNSDK builds do not
 plug-in returns `-22` → no display processor → black. Native libraries being present is **not**
 evidence the glue is: check for `com.leia.sdk.internal.Plugin` in the APK's `classes*.dex`. A
 released APK always carries it; a hand-built one may not.
+
+**An app is black and logcat shows `leia_cnsdk_create failed (-22)`.** The plug-in and the CNSDK
+loader disagree on version:
+
+```
+[Core-Loader] Invalid load request: apiVersion (0.10.61) does not match the loader version (0.10.64)
+```
+
+The loader bundled in the runtime APK is authoritative, and the plug-in must have been built
+against the same CNSDK. Mixing them produces no display processor and a silent black screen —
+the `-22` in logcat is the only symptom. A released runtime APK is internally consistent; this
+only arises with hand-assembled builds.
 
 **A demo dies immediately with `SIGSEGV` in `vulkan.adreno.so`.** Plug-in build-configuration
 issue, not an install problem — see
