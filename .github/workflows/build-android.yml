@@ -122,7 +122,12 @@ jobs:
       # shim that dlopens libleiaCore-impl.so out of the ON-DEVICE package, so
       # the real core, face tracking and per-device calibration are never
       # redistributed. Same shape as Windows assuming an installed SR runtime.
-      CNSDK_TAG: v0.10.61
+      # >= 0.10.62 is the FLOOR (#1232). 0.10.61 and earlier mis-detect device
+      # orientation in a non-fullscreen window, corrupting the interlacer's
+      # viewport-to-panel mapping so the DP's weave framebuffer faults inside
+      # vkCreateFramebuffer. Measured: the runtime fixes alone still crash on
+      # 0.10.61. The assertion in Inspect APK checks the APK really contains it.
+      CNSDK_TAG: v0.10.62
 
     steps:
 
