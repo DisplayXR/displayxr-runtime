@@ -689,6 +689,22 @@ Section "DisplayXR Runtime" SecRuntime
 	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
 	File /nonfatal "${BIN_DIR}\displayxr-control-panel.exe"
 
+	; Sweep a STRAY vulkan-1.dll left by any pre-#105 install (#1229).
+	;
+	; Excluding it from the File sweep below stops us SHIPPING one, but it
+	; never removed one that is already there — so a box that ever ran a
+	; pre-#105 runtime (or took a vcpkg applocal hand-copy) stayed poisoned
+	; across every subsequent upgrade. The runtime /DELAYLOADs vulkan-1.dll,
+	; and delay-load resolution finds the copy next to DisplayXRClient.dll
+	; before C:\Windows\System32 — so the stale loader wins forever.
+	;
+	; Observed on a lab box: a 1.3.290 stray from April shadowed the 1.4.341
+	; system loader and access-violated inside the NVIDIA ICD during
+	; vkEnumeratePhysicalDevices. EVERY Vulkan app died, the Windows event
+	; log blamed nvoglv64.dll, and it survived a driver update, a runtime
+	; update and a plug-in update because none of them touch this file.
+	Delete "$INSTDIR\vulkan-1.dll"
+
 	; Install runtime DLL dependencies (exclude vulkan-1.dll — the system copy
 	; in SYSTEM32 is sufficient, and shipping our own risks version conflicts
 	; and interaction with third-party Vulkan implicit layers. See issue #105.

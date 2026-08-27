@@ -351,6 +351,39 @@ oxr_instance_create(struct oxr_logger *log,
 		U_LOG_W("DisplayXR runtime v%u.%u.%u '%s' loaded from: %ls (XR_RUNTIME_JSON=%ls)",
 		        u_version_major, u_version_minor, u_version_patch, u_git_tag,
 		        path[0] ? path : L"<unknown>", env ? env : L"<unset>");
+
+		// #1229: a vulkan-1.dll sitting NEXT TO this DLL shadows the system
+		// loader. The runtime /DELAYLOADs vulkan-1.dll, and delay-load
+		// resolution searches this directory before C:\Windows\System32, so a
+		// stray left by a pre-#105 install wins forever — every Vulkan app
+		// access-violates inside the vendor ICD, the Windows event log blames
+		// the GPU driver, and no driver/runtime/plug-in update ever clears it.
+		// Cheap existence check: the DLL is delay-loaded, so at this point it
+		// may not be mapped yet and enumerating loaded modules would miss it.
+		if (path[0]) {
+			// L"vulkan-1.dll" is 12 chars + NUL. memcpy rather than
+			// wcsncpy/wcscat: those are C4996-deprecated under MSVC.
+			static const wchar_t vk_name[] = L"vulkan-1.dll";
+			const size_t vk_len = (sizeof(vk_name) / sizeof(vk_name[0])); // incl. NUL
+			wchar_t stray[MAX_PATH] = {0};
+			size_t n = wcslen(path);
+			while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') {
+				n--;
+			}
+			if (n > 0 && n + vk_len <= MAX_PATH) {
+				memcpy(stray, path, n * sizeof(wchar_t));
+				memcpy(stray + n, vk_name, vk_len * sizeof(wchar_t));
+				if (GetFileAttributesW(stray) != INVALID_FILE_ATTRIBUTES) {
+					U_LOG_W(
+					    "#1229: STRAY vulkan-1.dll found beside the runtime: %ls — it SHADOWS "
+					    "the system loader in C:\\Windows\\System32 and is a known cause of "
+					    "access violations inside the GPU vendor's ICD (which the event log "
+					    "misattributes to the driver). DELETE IT; the runtime uses the system "
+					    "loader.",
+					    stray);
+				}
+			}
+		}
 	}
 
 	// Raise the process timer resolution to 1ms for the in-process runtime's
