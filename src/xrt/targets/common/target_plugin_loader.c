@@ -2635,10 +2635,12 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 			        "VK DP factory; the session will run UNWOVEN. Update the plug-in.",
 			        e->plugin_id);
 #else
-			U_LOG_W("plugin loader:   %s: plug-in predates the vk_bundle ABI guard "
-			        "(#1243) — layout compatibility unverified; proceeding for "
-			        "desktop back-compat. If weaving crashes in vkCreateFramebuffer, "
-			        "rebuild the plug-in with this runtime's build config.",
+			U_LOG_W("plugin loader:   %s: plug-in has no vk_bundle_abi_size (predates "
+			        "the #1243 ABI guard) — layout compatibility UNVERIFIED; proceeding "
+			        "for desktop back-compat (shipped Linux .debs are Release-built on "
+			        "both sides). IF THIS PROCESS LATER CRASHES INSIDE A VULKAN DRIVER "
+			        "CALL (e.g. vkCreateFramebuffer), THIS IS WHY: rebuild the plug-in "
+			        "with the same build config (NDEBUG) as this runtime.",
 			        e->plugin_id);
 			e->dp_factory_vk = (void *)iface->create_dp_vk;
 #endif
