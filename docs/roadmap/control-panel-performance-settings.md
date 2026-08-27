@@ -4,7 +4,8 @@
 > runtime's performance levers be exposed as toggles in the DisplayXR Control Panel",
 > censuses every lever, and proposes the mechanism. Related: #378 (panel
 > architecture — *the GUI is dumb, `displayxr-cli` is the brain*), #793 (make the
-> panel's override state loud), #918 / ADR-037,
+> panel's override state loud), #918 /
+> [ADR-037](../adr/ADR-037-adapter-placement-policy-hybrid-devices.md),
 > [`motion-to-photon-levers.md`](../reference/motion-to-photon-levers.md),
 > [`adapter-selection.md`](../reference/adapter-selection.md).
 
