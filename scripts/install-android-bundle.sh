@@ -97,7 +97,25 @@ for c in "${COMPONENTS[@]}"; do
     A=$(ls -t "$WORK"/apk/*.apk | command grep -viE "android-arm64.apk$" | head -1)
     [ -n "$A" ] && { APPS+=("$A"); echo "   $NAME: $(basename "$A")"; }
   else
-    echo "   $NAME: $TAG has no .apk asset — skipped (not published for Android)"
+    # The pinned release may be desktop-only. The browser is the live case:
+    # only preview-0.1.17 ever published an Android APK, so every later pin
+    # (0.1.18+) would silently install nothing. Fall back to the newest
+    # release that actually HAS one, and say so — an older-but-present
+    # browser beats "--with-browser installed no browser".
+    FB_TAG=""; FB_ASSET=""
+    for t in $(gh release list -R "$REPO" --limit 15 --json tagName -q '.[].tagName' 2>/dev/null); do
+      a=$(gh release view "$t" -R "$REPO" --json assets \
+            --jq '[.assets[].name|select(endswith(".apk"))]|first // empty' 2>/dev/null)
+      [ -n "$a" ] && { FB_TAG="$t"; FB_ASSET="$a"; break; }
+    done
+    if [ -n "$FB_TAG" ]; then
+      echo "   $NAME: $TAG publishes no Android APK — falling back to $FB_TAG"
+      gh release download "$FB_TAG" -R "$REPO" -p "$FB_ASSET" -D "$WORK/apk" --clobber 2>/dev/null || true
+      A="$WORK/apk/$FB_ASSET"
+      [ -f "$A" ] && { APPS+=("$A"); echo "   $NAME: $FB_ASSET (from $FB_TAG, older than the $TAG pin)"; }
+    else
+      echo "   $NAME: no release in the last 15 publishes an Android APK — skipped"
+    fi
   fi
 done
 
