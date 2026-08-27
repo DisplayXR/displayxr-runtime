@@ -88,7 +88,7 @@ Resolve the new version:
 
 - If version-spec is `vN.N.N`, use it verbatim. Set FULL_TAG = the same `vN.N.N`.
 - If `patch|minor|major`:
-  - Find the latest **canonical** tag: `git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1`.
+  - Find the latest **canonical** tag: `git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1`.
   - The strict `\.` pattern is intentional — it ignores oddballs like component-prefixed (`demo-x/v1.0.0`), pre-release (`v1.0.0-rc1`), or stale legacy lineages. The runtime carries one canonical lineage at a time.
   - Strip the leading `v`, split on `.`, bump the requested component, re-prepend `v`. Set FULL_TAG = the bumped value.
 - If no canonical tag exists, start at `v1.0.0`.
@@ -126,7 +126,7 @@ Run: `git branch --show-current`
 - `git ls-remote --tags origin "[FULL_TAG]"` — if non-empty, STOP (remote tag exists).
 
 ### Step 1.4: Previous tag for release notes
-PREV_TAG = `git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1`.
+PREV_TAG = `git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1`.
 If empty, PREV_TAG=<empty> → use "Initial release" in notes.
 
 ---
@@ -601,6 +601,6 @@ Report the error and that the tag has been deleted. STOP.
 
 ## Lineage / tag hygiene notes
 
-- The repo has had multiple tag lineages over its lifetime (Monado-era v25.x, pre-1.0 v0.5.0, current v1.x). Stale lineages were cleaned on 2026-05-04. The auto-bump regex `^v[0-9]+\.[0-9]+\.[0-9]+$` is intentionally strict to prevent picking up reintroduced stragglers.
+- **Sort by `-creatordate`, never `-v:refname`.** The repo still carries a Monado-era `v21.0.0` (2021) that IS an ancestor of `main`, and version-sort ranks `21 > 2`, so `-v:refname` returns it ahead of the live `v2.14.x` lineage — `/release patch` computed `v21.0.1` on 2026-08-27 and was caught only by a pre-flight read. Tags are sticky and a bad one publishes a release AND bumps `versions.json[runtime]` + the installer mirror, so this is expensive to undo. Creation order tracks the live lineage; a cleanup of the stale tag is NOT a prerequisite. `/dxr-release` already sorted this way.
 - If you need to release a candidate (`-rc1`, `-beta`, etc.), pass it explicitly — auto-bump will not pick those up by design.
 - Demo and SR SDK pin tags (`demo-gaussiansplat/*`, `sr-sdk-*`) live in their own namespaces and are never picked up by this skill.
