@@ -38,11 +38,22 @@ done
 sleep 1
 
 # 3. Full copy, with exclusions.
+#
+# vulkan-1.dll is NEVER copied, and any stray already in PF is removed (#1229).
+# The runtime /DELAYLOADs vulkan-1.dll and delay-load resolution prefers the
+# copy next to DisplayXRClient.dll over C:\Windows\System32, so a stale loader
+# sitting in the Runtime dir shadows the system one and access-violates inside
+# the vendor ICD — presenting as a driver crash that no driver update fixes.
+if [ -f "$PF/vulkan-1.dll" ]; then
+  echo "== removing stray vulkan-1.dll from $PF (#1229 — shadows the system loader)"
+  rm -f "$PF/vulkan-1.dll" || { echo "ERROR: could not remove stray vulkan-1.dll (locked?)" >&2; exit 1; }
+fi
+
 copied=0
 for f in "$PKG"/*.dll "$PKG"/*.exe "$PKG"/*.json; do
   [ -f "$f" ] || continue
   base="$(basename "$f")"
-  case "$base" in displayxr-shell.exe|displayxr-mcp.exe) continue ;; esac
+  case "$base" in displayxr-shell.exe|displayxr-mcp.exe|vulkan-1.dll) continue ;; esac
   cp -f "$f" "$PF/$base" || { echo "ERROR: could not copy $base (locked?) — PF may be INCONSISTENT; rerun until clean" >&2; exit 1; }
   copied=$((copied+1))
 done
