@@ -505,10 +505,15 @@ fi
 if [ "$SIGNED" = yes ]; then
   # The runner already fail-closed-verified Status=Valid AND signer=Leia.
   #
-  # The delete is LOAD-BEARING: --clobber cannot replace the CI asset, because the runner
-  # rebuilds with build number 0 (Setup-2.0.4.0.exe) while CI stamps the run number
-  # (Setup-2.0.4.1883.exe) — the names never collide. Skip it and the release ships a signed
-  # AND an unsigned installer side by side.
+  # The delete is a SAFETY NET, not the normal path. Every component's NSI now names its
+  # installer `<Name>Setup-${VERSION}.exe` — version only, NO build number — so the runner's
+  # output has the SAME name as CI's and `--clobber` replaces it in place. This block then
+  # finds nothing to delete and correctly prints its NOTE.
+  # It stays because the failure it guards is silent and expensive: if a component ever
+  # regresses to stamping a build number (the runner rebuilds with 0, CI stamps the run
+  # number, so `Setup-2.0.4.0.exe` vs `Setup-2.0.4.1883.exe` never collide), --clobber cannot
+  # replace the CI asset and the release ships a signed AND an unsigned installer side by
+  # side. The asset-count assertion below is what actually catches that — trust it, not this.
   #
   # ASSET OPS TARGET $REL_REPO, NOT $REPO. For most components they are the
   # same repo, which is why this block long read `$REPO` — but `shell` is the

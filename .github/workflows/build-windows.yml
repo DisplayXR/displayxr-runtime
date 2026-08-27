@@ -170,11 +170,11 @@ jobs:
       # Sync CMakeLists.txt VERSION to the most recent vX.Y.Z tag on every
       # run. The installer's OutFile name comes from CMake's project(VERSION),
       # which is wired through installer/CMakeLists.txt → NSIS as
-      # `DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe`. Without this, the
-      # source-tree VERSION drives the filename on PR / main builds — easy
-      # to drift if /release ever forgets to bump it before tagging
+      # `DisplayXRSetup-${VERSION}.exe`. Without this, the source-tree
+      # VERSION drives the filename on PR / main builds — easy to drift if
+      # /release ever forgets to bump it before tagging
       # (cf. displayxr-shell-pvt#33, where source pinned at 1.2.3 while the
-      # latest tag was v1.3.0, producing `DisplayXRShellSetup-1.2.3.<run>.exe`
+      # latest tag was v1.3.0, producing `DisplayXRShellSetup-1.2.3.exe`
       # in every PR artifact).
       #
       # `git describe --tags --abbrev=0 --match 'v[0-9]*'` resolves to the
@@ -419,7 +419,11 @@ jobs:
       # Attach the Windows installer to the v* GitHub release (#290).
       # First workflow to complete on the tag creates the release; the
       # macOS BuildInstaller appends its .pkg. Filename is
-      # DisplayXRSetup-X.Y.Z.BUILD.exe from the NSI's OutFile.
+      # DisplayXRSetup-X.Y.Z.exe from the NSI's OutFile — version only, NO
+      # build number, so the signed installer the release skill uploads has
+      # the SAME name as CI's and --clobber replaces it in place. Stamping
+      # the run number here would make the two names differ, and the release
+      # would ship a signed AND an unsigned installer side by side.
       - name: Attach Windows installer to GitHub release on tag
         if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3

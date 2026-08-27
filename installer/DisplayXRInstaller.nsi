@@ -64,7 +64,7 @@ Name "DisplayXR ${VERSION}"
 	OutFile "$%TEMP%\DisplayXRSetup_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Runtime"
