@@ -51,6 +51,13 @@ comp_ipc_client_compositor_get_workspace_sync_fence(struct xrt_compositor *xc,
                                                     xrt_graphics_sync_handle_t *out_handle);
 extern void
 comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
+// #1215 -- reverse-direction "read executed" fence fetch; same forward-decl
+// pattern as the pair above (the missing decl here is what failed the POSIX
+// CI legs: MSVC tolerated the implicit declaration, clang -Werror did not).
+extern xrt_result_t
+comp_ipc_client_compositor_get_read_done_fence(struct xrt_compositor *xc,
+                                               bool *out_have_fence,
+                                               xrt_graphics_sync_handle_t *out_handle);
 
 // Prefixed with OXR since the only user right now is the OpenXR state tracker.
 DEBUG_GET_ONCE_LOG_OPTION(vulkan_log, "OXR_VULKAN_LOG", U_LOGGING_INFO)
