@@ -91,6 +91,23 @@ class DashboardActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_dashboard)
+
+        // #1245: create the IPC service NOW, while this activity makes us a
+        // foreground app. On OEM ROMs with background-start restrictions
+        // (AutoLaunchManagerService class), a CLIENT app's bindService cannot
+        // CREATE our service — AMS "Skip bringUpServiceLocked" — so after a
+        // fresh install every OOP client (DisplayXR Browser inline-3D, force-ipc
+        // apps) silently gets no runtime socket until something else creates the
+        // service. MonadoService self-foregrounds with a sticky notification on
+        // its first start (see its onCreate/handleStart), so one foreground
+        // start here is all it takes; later client binds then attach to the
+        // live service instead of being refused. The launch-once ritual already
+        // required for the broker provider (docs #1223) thus also arms the
+        // service side.
+        startService(
+            Intent(this, org.freedesktop.monado.ipc.MonadoService::class.java)
+                .setAction(org.freedesktop.monado.ipc.BuildConfig.SERVICE_ACTION)
+        )
         AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
 
         findViewById<TextView>(R.id.textTitle).text = nameAndLogoProvider.getLocalizedRuntimeName()
