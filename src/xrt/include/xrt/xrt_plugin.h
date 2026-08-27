@@ -295,6 +295,14 @@ struct xrt_display_claim
  * also newly guarantees the dma-buf import extension set on the app device
  * (VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier,
  * desktop-background capture).
+ *
+ * v5 addendum (#1243, additive — NOT a bump): the v5 "identical across
+ * configs" guarantee for `vk_bundle` has holes — `os_mutex` (embedded via
+ * `vk_bundle_queue queues[2]`) carries `#ifndef NDEBUG` fields, and several
+ * `#if defined(VK_*)` members lack the parity `#else` (they track the Vulkan
+ * headers version, not our config). Until a major closes those holes, the
+ * iface's appended `vk_bundle_abi_size` fingerprint lets the loader refuse a
+ * mismatched pairing instead of dispatching through a skewed table.
  */
 #define XRT_PLUGIN_API_VERSION_1 1
 #define XRT_PLUGIN_API_VERSION_2 2
@@ -726,6 +734,42 @@ struct xrt_plugin_iface
 	                           uint32_t display_count,
 	                           struct xrt_display_claim *out_claims,
 	                           uint32_t max_claims);
+
+	/*!
+	 * `sizeof(struct vk_bundle)` as compiled into THIS plug-in — the ABI
+	 * fingerprint of the raw `vk_bundle*` that @ref create_dp_vk receives
+	 * (#1243). The v5 parity work (#757) made `vk_bundle` invariant across
+	 * *feature-detection* configs, but the layout still varies with the
+	 * build config (`os_mutex`'s `#ifndef NDEBUG` debug fields — 16 bytes,
+	 * exactly two function-pointer slots) and with Vulkan-header-version
+	 * gates. A Debug-config plug-in against a Release-config runtime reads
+	 * `vkCreateFramebuffer` where it expects `vkCreateRenderPass` and
+	 * crashes inside the driver — the cause of every broken v2.14.x
+	 * Android release. The loader compares this against its own
+	 * `sizeof(struct vk_bundle)` and refuses the VK DP factory on
+	 * mismatch: an unwoven session plus an actionable error instead of
+	 * memory corruption.
+	 *
+	 * Set to `(uint32_t)sizeof(struct vk_bundle)`. 0 (or a plug-in whose
+	 * `struct_size` predates this field) means "unknown": the loader
+	 * refuses the VK factory on Android (every pre-guard pairing there is
+	 * the crash class above) and proceeds with a loud warning on desktop
+	 * (working Linux pairings must not regress). Appended per ADR-020
+	 * (append-only within a major; gated by @ref struct_size).
+	 */
+	uint32_t vk_bundle_abi_size;
+
+	/*!
+	 * `offsetof(struct vk_bundle, vkGetInstanceProcAddr)` — where the
+	 * function-pointer table starts, as compiled into THIS plug-in. The
+	 * second half of the #1243 fingerprint: `sizeof` alone cannot see two
+	 * header-gated members changing in compensating directions (total size
+	 * unchanged, table moved). Any shift of the table start — the invariant
+	 * that actually breaks — is caught by this field regardless. Same
+	 * gating and absent-field semantics as @ref vk_bundle_abi_size.
+	 * Set to `(uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr)`.
+	 */
+	uint32_t vk_bundle_fn_table_offset;
 };
 
 

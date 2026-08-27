@@ -25,6 +25,7 @@
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_handles.h"
+#include "vk/vk_abi_fingerprint.h" // #1243 fingerprint accessors
 #include "util/u_logging.h"
 #include "util/u_string_list.h"
 #include "os/os_threading.h"

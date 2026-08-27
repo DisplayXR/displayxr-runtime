@@ -21,6 +21,13 @@
  */
 
 #include "target_plugin_loader.h"
+#include "xrt/xrt_config_have.h"
+
+#ifdef XRT_HAVE_VULKAN
+/* #1243 — Vulkan-free prototypes shared with the defining TU (vk_helpers.c),
+ * so the declarations cannot silently diverge from the definitions. */
+#include "vk/vk_abi_fingerprint.h"
+#endif
 #include "target_plugin_preload_sanitize.h"
 #include "target_plugin_path_guard.h"
 
@@ -2593,7 +2600,57 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 	snprintf(e->serial, sizeof(e->serial), "%s", claim->serial);
 
 	if ((claim->supported_apis & XRT_DP_API_BIT_VK) && iface->create_dp_vk != NULL) {
+#ifdef XRT_HAVE_VULKAN
+		/*
+		 * #1243: the VK DP factory hands the plug-in a raw `vk_bundle*`,
+		 * and `struct vk_bundle`'s layout varies with build config
+		 * (os_mutex `#ifndef NDEBUG` fields = a 2-slot function-table
+		 * skew between Debug and Release). Dispatching through a skewed
+		 * table calls the WRONG driver entry points (observed:
+		 * vkCreateRenderPass landing in vkCreateFramebuffer → SIGSEGV in
+		 * every v2.14.x Android release). Compare fingerprints and
+		 * refuse the factory rather than corrupt: the session runs
+		 * unwoven with an actionable error.
+		 */
+		const uint32_t rt_vkb = vk_bundle_get_abi_size();
+		const uint32_t rt_fto = vk_bundle_get_fn_table_offset();
+		const bool have_field =
+		    iface->struct_size >=
+		    (uint32_t)(offsetof(struct xrt_plugin_iface, vk_bundle_fn_table_offset) +
+		               sizeof(uint32_t));
+		const uint32_t pl_vkb = have_field ? iface->vk_bundle_abi_size : 0;
+		const uint32_t pl_fto = have_field ? iface->vk_bundle_fn_table_offset : 0;
+		if (pl_vkb == rt_vkb && pl_fto == rt_fto && pl_vkb != 0) {
+			e->dp_factory_vk = (void *)iface->create_dp_vk;
+		} else if (pl_vkb != 0) {
+			U_LOG_E("plugin loader:   %s: vk_bundle ABI mismatch — plug-in compiled "
+			        "sizeof=%u fn_table_offset=%u, runtime sizeof=%u fn_table_offset=%u "
+			        "(build-config skew: NDEBUG/os_mutex or Vulkan-header gates, #1243). "
+			        "Refusing the VK DP factory; the session will run UNWOVEN. Rebuild "
+			        "the plug-in with the same build config (NDEBUG) and Vulkan headers "
+			        "as this runtime.",
+			        e->plugin_id, pl_vkb, pl_fto, rt_vkb, rt_fto);
+		} else {
+#ifdef XRT_OS_ANDROID
+			U_LOG_E("plugin loader:   %s: plug-in predates the vk_bundle ABI guard "
+			        "(#1243) — cannot verify layout compatibility, and every pre-guard "
+			        "Android pairing is the Debug-vs-Release crash class. Refusing the "
+			        "VK DP factory; the session will run UNWOVEN. Update the plug-in.",
+			        e->plugin_id);
+#else
+			U_LOG_W("plugin loader:   %s: plug-in has no vk_bundle_abi_size (predates "
+			        "the #1243 ABI guard) — layout compatibility UNVERIFIED; proceeding "
+			        "for desktop back-compat (shipped Linux .debs are Release-built on "
+			        "both sides). IF THIS PROCESS LATER CRASHES INSIDE A VULKAN DRIVER "
+			        "CALL (e.g. vkCreateFramebuffer), THIS IS WHY: rebuild the plug-in "
+			        "with the same build config (NDEBUG) as this runtime.",
+			        e->plugin_id);
+			e->dp_factory_vk = (void *)iface->create_dp_vk;
+#endif
+		}
+#else
 		e->dp_factory_vk = (void *)iface->create_dp_vk;
+#endif
 	}
 #ifdef XRT_OS_WINDOWS
 	if ((claim->supported_apis & XRT_DP_API_BIT_D3D11) && iface->create_dp_d3d11 != NULL) {
