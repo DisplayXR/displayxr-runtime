@@ -216,8 +216,9 @@ static struct xrt_plugin_iface g_sim_display_iface = {
      */
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
     .create_dp_vk = sim_display_dp_factory_vk,
-    /* #1243: vk_bundle ABI fingerprint — see xrt_plugin_iface. */
+    /* #1243: vk_bundle ABI fingerprint (size + table offset) — see xrt_plugin_iface. */
     .vk_bundle_abi_size = (uint32_t)sizeof(struct vk_bundle),
+    .vk_bundle_fn_table_offset = (uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr),
 #else
     .create_dp_vk = NULL,
 #endif

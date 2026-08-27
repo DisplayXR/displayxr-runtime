@@ -24,10 +24,9 @@
 #include "xrt/xrt_config_have.h"
 
 #ifdef XRT_HAVE_VULKAN
-/* #1243 — implemented in aux/vk/vk_helpers.c; declared here to avoid pulling
- * Vulkan headers into the loader TU. */
-uint32_t
-vk_bundle_get_abi_size(void);
+/* #1243 — Vulkan-free prototypes shared with the defining TU (vk_helpers.c),
+ * so the declarations cannot silently diverge from the definitions. */
+#include "vk/vk_abi_fingerprint.h"
 #endif
 #include "target_plugin_preload_sanitize.h"
 #include "target_plugin_path_guard.h"
@@ -2614,19 +2613,23 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 		 * unwoven with an actionable error.
 		 */
 		const uint32_t rt_vkb = vk_bundle_get_abi_size();
+		const uint32_t rt_fto = vk_bundle_get_fn_table_offset();
 		const bool have_field =
 		    iface->struct_size >=
-		    (uint32_t)(offsetof(struct xrt_plugin_iface, vk_bundle_abi_size) + sizeof(uint32_t));
+		    (uint32_t)(offsetof(struct xrt_plugin_iface, vk_bundle_fn_table_offset) +
+		               sizeof(uint32_t));
 		const uint32_t pl_vkb = have_field ? iface->vk_bundle_abi_size : 0;
-		if (pl_vkb == rt_vkb && pl_vkb != 0) {
+		const uint32_t pl_fto = have_field ? iface->vk_bundle_fn_table_offset : 0;
+		if (pl_vkb == rt_vkb && pl_fto == rt_fto && pl_vkb != 0) {
 			e->dp_factory_vk = (void *)iface->create_dp_vk;
 		} else if (pl_vkb != 0) {
 			U_LOG_E("plugin loader:   %s: vk_bundle ABI mismatch — plug-in compiled "
-			        "sizeof(vk_bundle)=%u, runtime %u (build-config skew: NDEBUG/os_mutex "
-			        "or Vulkan-header gates, #1243). Refusing the VK DP factory; the "
-			        "session will run UNWOVEN. Rebuild the plug-in with the same build "
-			        "config (NDEBUG) and Vulkan headers as this runtime.",
-			        e->plugin_id, pl_vkb, rt_vkb);
+			        "sizeof=%u fn_table_offset=%u, runtime sizeof=%u fn_table_offset=%u "
+			        "(build-config skew: NDEBUG/os_mutex or Vulkan-header gates, #1243). "
+			        "Refusing the VK DP factory; the session will run UNWOVEN. Rebuild "
+			        "the plug-in with the same build config (NDEBUG) and Vulkan headers "
+			        "as this runtime.",
+			        e->plugin_id, pl_vkb, pl_fto, rt_vkb, rt_fto);
 		} else {
 #ifdef XRT_OS_ANDROID
 			U_LOG_E("plugin loader:   %s: plug-in predates the vk_bundle ABI guard "

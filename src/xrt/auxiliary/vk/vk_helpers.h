@@ -25,6 +25,7 @@
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_handles.h"
+#include "vk/vk_abi_fingerprint.h" // #1243 fingerprint accessors
 #include "util/u_logging.h"
 #include "util/u_string_list.h"
 #include "os/os_threading.h"
@@ -74,17 +75,6 @@ struct vk_bundle_queue
  *
  * @ingroup aux_vk
  */
-/*!
- * `sizeof(struct vk_bundle)` as compiled into this translation unit's side of
- * the ABI — the fingerprint the plug-in loader compares against a plug-in's
- * `xrt_plugin_iface::vk_bundle_abi_size` (#1243). Lives in vk_helpers.c so the
- * loader can use it without pulling Vulkan headers into its own TU.
- *
- * @ingroup aux_vk
- */
-uint32_t
-vk_bundle_get_abi_size(void);
-
 struct vk_bundle
 {
 	enum u_logging_level log_level;

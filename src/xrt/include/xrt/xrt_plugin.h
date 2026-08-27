@@ -758,7 +758,18 @@ struct xrt_plugin_iface
 	 * (append-only within a major; gated by @ref struct_size).
 	 */
 	uint32_t vk_bundle_abi_size;
-	uint32_t reserved_abi_0;
+
+	/*!
+	 * `offsetof(struct vk_bundle, vkGetInstanceProcAddr)` — where the
+	 * function-pointer table starts, as compiled into THIS plug-in. The
+	 * second half of the #1243 fingerprint: `sizeof` alone cannot see two
+	 * header-gated members changing in compensating directions (total size
+	 * unchanged, table moved). Any shift of the table start — the invariant
+	 * that actually breaks — is caught by this field regardless. Same
+	 * gating and absent-field semantics as @ref vk_bundle_abi_size.
+	 * Set to `(uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr)`.
+	 */
+	uint32_t vk_bundle_fn_table_offset;
 };
 
 

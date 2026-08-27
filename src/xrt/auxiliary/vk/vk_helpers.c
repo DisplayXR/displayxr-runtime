@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1849,4 +1850,10 @@ uint32_t
 vk_bundle_get_abi_size(void)
 {
 	return (uint32_t)sizeof(struct vk_bundle);
+}
+
+uint32_t
+vk_bundle_get_fn_table_offset(void)
+{
+	return (uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr);
 }
