@@ -87,15 +87,18 @@ class OpenXRRuntimeBroker : ContentProvider() {
                 // requested (Android filtered at install).
                 info.nativeLibraryDir,
                 // CMake sets PREFIX "" on the runtime target, so the
-                // file on disk is `openxr_displayxr.so` (not the
-                // Android-default `libopenxr_displayxr.so`). Match
+                // file on disk is `libopenxr_displayxr.so` -- the
+                // Android-default prefix, which is MANDATORY here:
+                // NativeLibraryHelper only extracts lib*.so from an
+                // APK, so a prefix-less name never reaches the
+                // installed nativeLibraryDir at all (#1226). Match
                 // exactly what shipped in the APK's jniLibs/.
-                "openxr_displayxr.so",
+                "libopenxr_displayxr.so",
                 // No custom function mappings.
                 0,
             ),
         )
-        Log.i(TAG, "Active runtime resolved: ${ctx.packageName}/openxr_displayxr.so in ${info.nativeLibraryDir}")
+        Log.i(TAG, "Active runtime resolved: ${ctx.packageName}/libopenxr_displayxr.so in ${info.nativeLibraryDir}")
         return cursor
     }
 

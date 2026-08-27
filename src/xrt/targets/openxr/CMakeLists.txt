@@ -32,6 +32,28 @@ add_library(${RUNTIME_TARGET} SHARED target.c libopenxr.def)
 # libraries so the produced file matches the historical MODULE name
 # (`openxr_displayxr.so` / `.dylib`) and the existing OpenXR loader manifest.
 set_target_properties(${RUNTIME_TARGET} PROPERTIES PREFIX "")
+if(ANDROID)
+	# ANDROID IS THE EXCEPTION AND THE PREFIX IS LOAD-BEARING (#1226).
+	#
+	# Android's package installer (NativeLibraryHelper) only extracts entries
+	# under lib/<abi>/ whose names match `lib*.so`. A prefix-less .so is packaged
+	# into the APK perfectly happily and then simply never appears in the
+	# installed nativeLibraryDir -- so the Khronos broker hands every client a
+	# path that does not exist and xrCreateInstance fails with
+	# XR_ERROR_RUNTIME_UNAVAILABLE.
+	#
+	# This hid for the entire life of the Android port because **debuggable
+	# packages bypass that filter**: every dev build extracted it, and the first
+	# non-debuggable build ever installed on a device was the v2.14.0 release.
+	# That is also why upstream Monado ships libopenxr_monado.so.
+	#
+	# Changing this string is a CONTRACT change: it must move together with
+	# OpenXRRuntimeBroker's so_filename and both OpenXRRuntime[.SoFilename]
+	# meta-data values in the runtime AndroidManifest. Desktop keeps the bare
+	# name -- its loader reads an explicit path from a JSON manifest and applies
+	# no such filter.
+	set_target_properties(${RUNTIME_TARGET} PROPERTIES PREFIX "lib")
+endif()
 if(WIN32)
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES OUTPUT_NAME "DisplayXRClient")
 

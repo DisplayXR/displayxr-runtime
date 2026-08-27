@@ -126,6 +126,14 @@ jobs:
         with:
           submodules: recursive
           lfs: true
+          # Tags are required, not optional. openxr_android/build.gradle derives
+          # BOTH versionCode and versionName by shelling out to
+          # `git describe --match 'v*'`; on a shallow clone that has no tags the
+          # describe degrades to --always and yields a bare SHA, so the release
+          # APK ships versionName='<sha>' and an EMPTY versionCode -- which means
+          # Android cannot compare versions for in-place upgrade and a user
+          # cannot tell what they installed. v2.14.0 shipped exactly that.
+          fetch-depth: 0
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -307,7 +315,11 @@ jobs:
 
           # Sanity: confirm the .so name in the APK matches what the
           # AndroidManifest expects. Mismatch silently fails on device.
-          need openxr_displayxr.so "the manifest references it but it is not bundled"
+          # The lib prefix is mandatory, not cosmetic: Android extracts only
+          # lib*.so from an APK, so a prefix-less runtime is packaged fine and
+          # then absent on device (#1226). Must match the broker's so_filename
+          # and both AndroidManifest meta-data values.
+          need libopenxr_displayxr.so "the manifest references it but it is not bundled"
           # The neutral fallback DP. Asserted because src/xrt/drivers/CMakeLists
           # documents an if(TARGET ...) ordering hazard that has ALREADY
           # silently dropped this plug-in from a build once — and without this
