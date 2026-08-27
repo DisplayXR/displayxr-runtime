@@ -2236,6 +2236,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 {
 	struct vk_bundle *vk = target->vk;
 
+	// #1236: refuse to enter the driver with a destroyed swapchain. A failed
+	// recreate below leaves this NULL, and vkAcquireNextImageKHR(…, VK_NULL_HANDLE, …)
+	// faults inside the Adreno driver (SIGSEGV at 0x0 in AcquireNextImageKHR, reached
+	// from vk_repaint_thread). Every caller already handles the error return, so
+	// failing here is strictly better than a null dereference one frame later.
+	if (target->swapchain == VK_NULL_HANDLE) {
+#ifdef XRT_OS_ANDROID
+		// Latch so sync_surface reports LOST and the compositor skips frames until
+		// the next surface generation, rather than retrying into the same hole.
+		if (!target->surface_lost) {
+			target->surface_lost = true;
+			U_LOG_W("acquire with no swapchain — surface latched LOST until the next "
+			        "generation (#1236)");
+		}
+#else
+		U_LOG_E("acquire with no swapchain (#1236)");
+#endif
+		return XRT_ERROR_VULKAN;
+	}
+
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
 		// #870 — late-weave pacing for the bridge. Block until DXGI says the
@@ -2515,7 +2535,21 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 			xrt_result_t xret = create_swapchain(target);
 			if (xret != XRT_SUCCESS) {
+				// #1236: the old swapchain is already destroyed, so returning
+				// here leaves target->swapchain NULL. On Android that is the
+				// backgrounding race — the surface died between the
+				// OUT_OF_DATE and this recreate — so latch, exactly as the
+				// VK_ERROR_SURFACE_LOST_KHR path below does. Without the latch
+				// the repaint thread comes straight back and acquires from a
+				// NULL swapchain.
 				U_LOG_E("Failed to recreate swapchain");
+#ifdef XRT_OS_ANDROID
+				if (dxr_surface_lost_latch_enabled() && !target->surface_lost) {
+					target->surface_lost = true;
+					U_LOG_W("swapchain recreate failed — output surface latched "
+					        "LOST until the next surface generation (#1236)");
+				}
+#endif
 				return XRT_ERROR_VULKAN;
 			}
 		}
@@ -2526,6 +2560,14 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		                                 VK_NULL_HANDLE, &target->current_index);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
+#ifdef XRT_OS_ANDROID
+			// #1236: same reasoning as the primary acquire path — a surface that
+			// died under the recreate is unrecoverable without a new generation.
+			if (res == VK_ERROR_SURFACE_LOST_KHR && dxr_surface_lost_latch_enabled() &&
+			    !target->surface_lost) {
+				target->surface_lost = true;
+			}
+#endif
 			return XRT_ERROR_VULKAN;
 		}
 	} else if (res != VK_SUCCESS) {
