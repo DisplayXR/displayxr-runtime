@@ -15,7 +15,7 @@ For building from source instead, see [android-build-guide.md](android-build-gui
 
 **One runtime APK, plus one APK per demo.** That is the whole list.
 
-The vendor plug-in is **inside the runtime APK** ([ADR-038](../adr/ADR-038-the-android-vendor-plugin-ships-in-the-runtime-apk.md)) — there is no
+The vendor plug-in is **inside the runtime APK** ([ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md)) — there is no
 separate plug-in install step on Android, unlike Windows and Linux. The
 `displayxr-leia-cnsdk-*-android-arm64-v8a.tar.gz` asset on the plug-in release exists for CI to
 consume; **do not hand it to a user**.
