@@ -103,9 +103,22 @@ adbsh() { "$ADB" "${DEVICE_ARGS[@]}" "$@"; }
 # name nor the asset name, so any name-guessing loop silently targets a package
 # that does not exist.
 apk_pkg() {
-    local aapt
-    aapt="$(find "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/nonexistent}}/build-tools" \
-             -name aapt2 2>/dev/null | sort -V | tail -1)"
+    local aapt sdk
+    # PATH first, then every SDK location that is actually conventional.
+    # Probing only $ANDROID_HOME/$ANDROID_SDK_ROOT is not enough: neither is set
+    # on a default macOS or Linux box, so this returned empty and the permission
+    # grants below silently no-opped -- in exactly the unattended install this
+    # function exists to serve.
+    aapt="$(command -v aapt2 2>/dev/null || command -v aapt 2>/dev/null || true)"
+    if [ -z "$aapt" ]; then
+        for sdk in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+                   "$HOME/Library/Android/sdk" "$HOME/Android/Sdk" \
+                   "${LOCALAPPDATA:-$HOME/AppData/Local}/Android/Sdk"; do
+            [ -n "$sdk" ] && [ -d "$sdk/build-tools" ] || continue
+            aapt="$(find "$sdk/build-tools" -name aapt2 2>/dev/null | sort -V | tail -1)"
+            [ -n "$aapt" ] && break
+        done
+    fi
     [ -n "$aapt" ] || return 0
     "$aapt" dump packagename "$1" 2>/dev/null | head -1
 }
