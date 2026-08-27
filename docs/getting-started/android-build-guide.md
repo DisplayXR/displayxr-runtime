@@ -1,5 +1,10 @@
 # Android Build & Test Guide
 
+> **Just want to install and run it?** You do not need this document. See
+> [android-install-demos.md](android-install-demos.md) for the end-to-end path from published
+> release artifacts to five running demos, no build environment required.
+
+
 Build and deploy DisplayXR on an Android device with a Leia 3D display.
 
 > **You probably do not need this page.** Since #1212 the runtime ships
