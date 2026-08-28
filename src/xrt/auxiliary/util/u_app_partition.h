@@ -65,6 +65,18 @@ u_app_partition_divisor(void)
 	return (uint32_t)cached;
 }
 
+//! Cached probe of the DXR_APP_FRAME_DIVISOR_ANY_TIER bring-up override.
+static inline bool
+u_app_partition_any_tier(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_APP_FRAME_DIVISOR_ANY_TIER");
+		cached = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 //! Per-compositor throttle state. Zero-init is a valid initial state.
 struct u_app_partition
 {
@@ -112,12 +124,7 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 	 * overrides for the follow-up bring-up work.
 	 */
 	if (!tier_supported) {
-		static int any_tier = -1;
-		if (any_tier < 0) {
-			const char *e = getenv("DXR_APP_FRAME_DIVISOR_ANY_TIER");
-			any_tier = (e != NULL && e[0] == '1') ? 1 : 0;
-		}
-		if (any_tier != 1) {
+		if (!u_app_partition_any_tier()) {
 			if (!p->logged) {
 				p->logged = 1;
 				U_LOG_W("#1257 partition: DXR_APP_FRAME_DIVISOR=%u REFUSED on this "

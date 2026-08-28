@@ -6243,6 +6243,34 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #else
 			int single = 0;
 #endif
+			/*
+			 * #1261: auto-enable single ownership when the slot partition
+			 * will engage on an IN-PROCESS tier. The measured A/B (VK
+			 * pinned, D=3): dual-thread ticks 122-161/s with 8-18 ms
+			 * intervals and fills 18-21; single-thread ticks 176-205/s at
+			 * 3.4-4.4 ms, fills +30%, slips and cadence jitter halved, and
+			 * the APP's own weave rate went UP — the mutex convoy between
+			 * the app-thread weave and the fill loop is a large piece of
+			 * that tier's starvation, with no observed downside. Scoped
+			 * tightly: never on the split/bridge path (verified four-for-
+			 * four under legacy ownership — do not change a passing
+			 * config), and only when the throttle can actually engage here
+			 * (bring-up override present; keep this condition in sync with
+			 * the tier gate if in-process tiers are ever marked supported).
+			 * The explicit env below still wins in both directions.
+			 */
+			bool split_active = false;
+#ifdef XRT_OS_WINDOWS
+			split_active = (c->split != NULL);
+#endif
+			if (u_app_partition_divisor() >= 2 && !split_active &&
+			    u_app_partition_any_tier()) {
+				single = 1;
+				U_LOG_W("#1261: slot partition on an in-process tier — single "
+				        "weave-thread ownership auto-enabled (measured: removes "
+				        "the app/fill mutex convoy; DXR_WEAVE_SINGLE_THREAD=0 "
+				        "overrides)");
+			}
 			const char *se = getenv("DXR_WEAVE_SINGLE_THREAD");
 			if (se != NULL && se[0] != '\0') {
 				single = (se[0] == '0') ? 0 : 1;
