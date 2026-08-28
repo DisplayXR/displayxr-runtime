@@ -368,6 +368,23 @@ struct xrt_display_processor_vk
 	 */
 	bool (*get_scanout_caps)(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps);
 
+	/*!
+	 * #206: the FORWARD-computed weave→scanout time of THIS weave, from the
+	 * runtime's vsync-locked vblank grid — the exact per-weave horizon for
+	 * the vendor eye predictor, to be fed RAW (no smoothing, no deadband).
+	 * 0 = no trusted grid this frame ⟹ the DP keeps its retrospective
+	 * heuristic. Called after @ref set_frame_timing, before
+	 * @ref xrt_display_processor::process_atlas. Full contract: the D3D11
+	 * variant's doc. Appended after @ref get_scanout_caps per ADR-020
+	 * (append-only within a major; no version bump — gated by the variant's
+	 * `base.struct_size`).
+	 *
+	 * @param xdp                            Pointer to self.
+	 * @param predicted_weave_to_scanout_ns  Forward horizon; 0 = unknown.
+	 */
+	void (*set_predicted_scanout)(struct xrt_display_processor_vk *xdp,
+	                              uint64_t predicted_weave_to_scanout_ns);
+
 };
 
 /*!
@@ -450,6 +467,14 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)    
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_window_screen_rect)      == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_backend_state)          == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_scanout_caps)           == sizeof(struct xrt_display_processor) + 8 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_predicted_scanout)     == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::set_predicted_scanout slot (#206) — same
+ * coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_FRAME_TIMING.
+ */
+#define XRT_DP_VK_HAS_PREDICTED_SCANOUT 1
 XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
@@ -577,6 +602,27 @@ xrt_display_processor_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
 		return;
 	}
 	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_predicted_scanout
+ * No-op if not supported (slot absent or NULL) — the DP then keeps its
+ * retrospective horizon heuristic.
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_set_predicted_scanout(struct xrt_display_processor_vk *xdp,
+                                               uint64_t predicted_weave_to_scanout_ns)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end =
+	    (const char *)&xdp->set_predicted_scanout + sizeof(xdp->set_predicted_scanout);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_predicted_scanout == NULL) {
+		return;
+	}
+	xdp->set_predicted_scanout(xdp, predicted_weave_to_scanout_ns);
 }
 
 /*!

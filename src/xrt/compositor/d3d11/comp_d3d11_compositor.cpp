@@ -2376,6 +2376,12 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 	}
 
+	// #206: forward-computed horizon for THIS weave, from the vsync-locked
+	// vblank grid — exact per weave, no estimator lag under variable
+	// cadence. 0 = no trusted grid ⟹ DP keeps the retrospective value.
+	xrt_display_processor_d3d11_set_predicted_scanout(
+	    c->display_processor, comp_d3d11_target_predict_weave_to_scanout_ns(c->target));
+
 	xrt_display_processor_d3d11_process_atlas(
 	    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
 	    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,

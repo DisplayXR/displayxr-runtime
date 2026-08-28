@@ -885,6 +885,13 @@ comp_d3d12_target_get_measured_weave_ns(struct comp_d3d12_target *target)
 	return g_weave_latency_d3d12.measured_r_ns;
 }
 
+extern "C" uint64_t
+comp_d3d12_target_predict_weave_to_scanout_ns(struct comp_d3d12_target *target)
+{
+	(void)target;
+	return g_weave_latency_d3d12.predict_weave_to_scanout_ns();
+}
+
 extern "C" xrt_result_t
 comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interval)
 {

@@ -3347,6 +3347,12 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	                                             comp_d3d12_target_get_measured_weave_ns(c->target),
 	                                             (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 
+	// #206: forward-computed horizon for THIS weave, from the vsync-locked
+	// vblank grid — exact per weave, no estimator lag under variable
+	// cadence. 0 = no trusted grid ⟹ DP keeps the retrospective value.
+	xrt_display_processor_d3d12_set_predicted_scanout(
+	    c->display_processor, comp_d3d12_target_predict_weave_to_scanout_ns(c->target));
+
 	// Pass actual backbuffer dimensions to the DP. Canvas offset and size are
 	// passed separately — the DP uses them to set a viewport sub-rect for
 	// correct interlacing phase.

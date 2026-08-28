@@ -2162,6 +2162,13 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	// residual, so it runs with an exact horizon (0 = unknown, DP heuristic).
 	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target), 0);
 
+	// #206: and the FORWARD-computed horizon for THIS weave, from the
+	// vsync-locked vblank grid — exact per weave, no estimator lag under
+	// variable cadence. 0 = no trusted grid; the DP then keeps the
+	// retrospective value above.
+	xrt_display_processor_d3d11_set_predicted_scanout(
+	    s->dp, comp_d3d11_target_predict_weave_to_scanout_ns(s->target));
+
 	comp_d3d11_target_bind(s->target);
 
 	/*
