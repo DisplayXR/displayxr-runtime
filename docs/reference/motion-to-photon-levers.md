@@ -62,8 +62,22 @@ produces 15 atlases a second but the panel still gets ~60 correctly-phased weave
 
 A repaint replays *rendering state only* — it never touches app-owned state.
 
+**The quiet gate is interval-aware (#1257).** A repaint must never compete with an
+imminent app frame, and the loops originally enforced that with a fixed constant: repaint
+only after ≥ 2 panel periods of app silence. That constant made panel rate structurally
+unreachable for a present-capped app — at 20 Hz it forbids repainting the first missed
+vblank of *every* app frame (measured ceiling ~1 repaint/app frame instead of 2), and at
+30 Hz (interval = exactly 2 periods) the gate never opens at all (measured repaints/s
+0.0). Since #1257 the gate measures the app's inter-frame cadence (EMA + jitter,
+`u_repaint_gate.h`): when the cadence is stable and ≥ 1.5 periods, the repaint window
+opens after **one** missed vblank and closes half a period before the predicted next app
+frame, at most one repaint per panel period; when the cadence is unstable or near panel
+rate it degrades to the legacy 2-period behavior — a 46.7 fps app on a 60 Hz panel (the
+measured case the old constant protected) still never repaints.
+
 | Probe | Purpose |
 |---|---|
+| `DXR_WEAVE_REPAINT_GATE=legacy` | Pin the pre-#1257 fixed 2-period quiet gate, for A/B. |
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 

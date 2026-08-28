@@ -52,6 +52,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -539,6 +540,7 @@ struct comp_vk_native_compositor
 		bool armed;                     //!< False on zero-copy: the atlas IS the app's image.
 		bool app_frame_in_progress;     //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
+		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
 
 		//! Effective content layout the last app frame actually painted.
 		uint32_t view_w, view_h, cols, rows;
@@ -4090,10 +4092,14 @@ vk_repaint_thread(void *ptr)
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			continue;
 		}
-		// Keyed on the last APP frame, never on the last repaint — otherwise
-		// repaints pace off their own timestamps and free-run.
+		// #1257: interval-aware gate. Keyed on the last APP frame, never on
+		// the last repaint — otherwise repaints pace off their own timestamps
+		// and free-run. With a stable measured app cadence the window opens
+		// after ONE missed vblank and closes before the predicted next app
+		// frame; otherwise it is the legacy fixed 2-period gate. See
+		// u_repaint_gate.h for the full design.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			continue;
 		}
 
@@ -4127,6 +4133,7 @@ vk_repaint_thread(void *ptr)
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
 			c->repaint.count++;
+			u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 			os_mutex_unlock(&c->mutex);
 
 			static bool split_repaint_logged = false;
@@ -4235,6 +4242,7 @@ vk_repaint_thread(void *ptr)
 		}
 
 		c->repaint.count++;
+		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -4892,6 +4900,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		c->repaint.armed = wove;
 		if (wove) {
 			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 		comp_vk_split_render_diag(c->split);
 
@@ -4955,6 +4964,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			// Only a REAL frame resets the quiet-gate. A repaint must not, or
 			// repaints would pace off their own timestamps and free-run.
 			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 
 	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
@@ -6295,8 +6305,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		if (c->repaint.enabled == 1 && have_present_target) {
 			// Seed the quiet-gate key so the first force-probe counter row
 			// doesn't log a garbage quiet_ns (now − 0) before the first app
-			// frame publishes (#902 Windows validation, cosmetic).
+			// frame publishes (#902 Windows validation, cosmetic). The gate's
+			// own seed adds no interval sample (and a >1 s startup gap resets
+			// its stats anyway).
 			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 			int sret = os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
 			U_LOG_W("#868: repaint loop start ret=%d (target=%p)", sret, (void *)c->target);
 		} else {

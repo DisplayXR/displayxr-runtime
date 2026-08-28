@@ -61,6 +61,7 @@
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_capture_dims.h"
+#include "util/u_repaint_gate.h"
 #include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -561,6 +562,7 @@ struct comp_d3d11_compositor
 		bool armed;   //!< Last frame was DP-woven and not zero-copy.
 		bool app_frame_in_progress; //!< layer_begin .. layer_commit.
 		uint64_t last_app_frame_ns;
+		struct u_repaint_gate gate; //!< #1257 interval-aware quiet gate.
 		uint64_t count, ticks;
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -2661,6 +2663,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// would pace off their own timestamps and drift below panel rate.
 	if (!is_repaint) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	return true;
@@ -2690,8 +2693,11 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			c->repaint.bail_armed++;
 			continue;
 		}
+		// #1257: interval-aware gate — one missed vblank when the measured
+		// app cadence is stable and slow, the legacy 2-period constant
+		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -2790,6 +2796,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 
 		c->repaint.count++;
+		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
