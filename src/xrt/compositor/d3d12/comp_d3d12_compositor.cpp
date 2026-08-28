@@ -639,6 +639,9 @@ struct comp_d3d12_compositor
 		//! #1257 interval-aware quiet gate.
 		struct u_repaint_gate gate;
 
+		//! #1257 slot partition: xrWaitFrame throttle state.
+		struct u_app_partition partition;
+
 		//! Diagnostics: where the loop goes, counted so a repaint that never
 		//! fires can be told apart from one that fires and does nothing.
 		uint64_t count;      // repaints actually issued
@@ -1991,7 +1994,12 @@ d3d12_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	*out_predicted_display_period_ns = period_ns;
+	// #1257 partition: report the app's honest frame period (see wait_frame).
+	{
+		const uint32_t part_d = u_app_partition_divisor();
+		*out_predicted_display_period_ns =
+		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
+	}
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
 
@@ -2027,6 +2035,11 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE the lock —
+	// the repaint loop keeps weaving the other slots underneath this
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
@@ -2044,7 +2057,14 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	*out_predicted_display_period_ns = period_ns;
+	// #1257 partition: the app's frames genuinely display for D panel
+	// periods (repaints re-weave the same atlas in between) — report the
+	// honest period so animation deltas stay correct.
+	{
+		const uint32_t part_d = u_app_partition_divisor();
+		*out_predicted_display_period_ns =
+		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
+	}
 
 	// The spec requires predictedDisplayTime to strictly increase across
 	// xrWaitFrame calls, and CTS enforces it. The old period*2 constant
@@ -3484,7 +3504,9 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		// Tick well inside a period so "the app went quiet" is noticed near the
 		// refresh it matters for, rather than up to a full period late.
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		os_nanosleep((int64_t)((u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4));
 
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;

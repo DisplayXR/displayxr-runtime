@@ -358,6 +358,7 @@ struct comp_gl_compositor
 		bool app_frame_in_progress;  //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;  //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;  //!< #1257 interval-aware quiet gate.
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! The 2D-under backdrop the last app frame DEPOSITED. Reused, never
 		//! re-flattened — the flatten samples the app's Local2D textures.
@@ -1983,7 +1984,14 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = now_ns + period_ns / 2;
 	*out_predicted_display_time_ns = now_ns + period_ns;
-	*out_predicted_display_period_ns = period_ns;
+	// #1257 partition: the app's frames genuinely display for D panel
+	// periods (repaints re-weave the same atlas in between) — report the
+	// honest period so animation deltas stay correct.
+	{
+		const uint32_t part_d = u_app_partition_divisor();
+		*out_predicted_display_period_ns =
+		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
+	}
 
 	return XRT_SUCCESS;
 }
@@ -2007,6 +2015,22 @@ gl_compositor_wait_frame(struct xrt_compositor *xc,
                           int64_t *out_predicted_display_time,
                           int64_t *out_predicted_display_period)
 {
+	// #1257 partition: block until the app's next slot BEFORE anything else
+	// — the repaint loop keeps weaving the other slots underneath this
+	// sleep. Only here, never in predict_frame (wait_frame carries the
+	// blocking semantic). No-op unless DXR_APP_FRAME_DIVISOR >= 2.
+	{
+		struct comp_gl_compositor *c = gl_comp(xc);
+		int64_t period_ns = (int64_t)(1000000000.0 / 60.0);
+#ifdef XRT_OS_WINDOWS
+		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		if (hz > 1.0f) {
+			period_ns = (int64_t)(1000000000.0 / hz);
+		}
+#endif
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+	}
+
 	int64_t wake, gpu_time;
 	return gl_compositor_predict_frame(xc, out_frame_id, &wake, &gpu_time,
 	                                    out_predicted_display_time,
@@ -3974,7 +3998,9 @@ gl_repaint_thread(void *ptr)
 #endif
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		os_nanosleep((int64_t)((u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4));
 		if (!os_thread_helper_is_running(&c->repaint_thread)) {
 			break;
 		}

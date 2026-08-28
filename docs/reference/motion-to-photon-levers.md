@@ -104,6 +104,25 @@ is entitled to assume a weave cadence tied to app frames, and one that does may 
 silently — when repaint drives extra weaves. That is a per-vendor contract question, not a runtime
 one; if you change repaint's cadence, re-check it against each vendor's documented constraints.
 
+### `DXR_APP_FRAME_DIVISOR` — **default off** (#1257 slot partition)
+
+The productized form of what five gap-filling repaint schedules could not do: a SLOW app
+with a PANEL-RATE weave. `D` (2..8) makes xrWaitFrame — the spec's throttle point — block
+until the app's next slot, releasing the app every Dth vblank; the repaint loop fills the
+other D−1 slots per frame with a **known** N=D schedule (no cadence estimation, so the
+output cadence is steady — the visual requirement) and commits are phase-locked to the
+runtime's own schedule, so the fire/commit collision that sank the gap-filling variants
+never exists by construction. The app is told the truth: `predictedDisplayPeriod` reports
+D × panel period. Measured precursors (the FORCE probe, which is this mechanism minus the
+deliberate release): render-30/weave-60 on Arc at −9.5 GPU pts "really crisp"; Unity
+iGPU-pinned at −14.5 GPU pts with the display rate untouched — and it paces runtime-side,
+so it works where an app-side cap (`targetFrameRate`) is box-dependent. The repaint
+governor stays armed underneath as the acceptance-pair enforcement (app weave rate must
+hold at panel/D). Not wired into Metal (no repaint loop — throttling there would slow the
+app with nothing filling the panel) or the IPC/service path yet. The future face-tracking
+correlation (drop D when no face is tracked, restore on face) drives exactly this one
+lever.
+
 ### `DXR_VK_QUEUE_MODE` — **default `auto`** (#902)
 
 Repaint needs somewhere to submit from. Three tiers, resolved automatically:

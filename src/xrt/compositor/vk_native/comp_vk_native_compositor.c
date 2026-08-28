@@ -542,6 +542,7 @@ struct comp_vk_native_compositor
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
 		uint32_t view_w, view_h, cols, rows;
@@ -1351,7 +1352,12 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	*out_predicted_display_period_ns = period_ns;
+	// #1257 partition: report the app's honest frame period (see wait_frame).
+	{
+		const uint32_t part_d = u_app_partition_divisor();
+		*out_predicted_display_period_ns =
+		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
+	}
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
 
@@ -1406,6 +1412,11 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE taking any
+	// lock — the repaint loop keeps weaving the other slots underneath
+	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
 
@@ -1421,7 +1432,11 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	*out_predicted_display_period_ns = period_ns;
+	// Under the partition the app's frames genuinely display for D panel
+	// periods (repaints re-weave the same atlas in between) — report the
+	// honest period so animation deltas stay correct.
+	const uint32_t part_d = u_app_partition_divisor();
+	*out_predicted_display_period_ns = (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
 	// xrWaitFrame calls, and CTS enforces it. The old period*2 constant
@@ -4048,9 +4063,14 @@ vk_repaint_thread(void *ptr)
 		 * app_frame_in_progress, all of which describe REPAINTS. The app
 		 * frame is the real thing the repaint exists to keep alive.
 		 */
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		const uint64_t tick_ns =
+		    (u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4;
+
 		os_mutex_lock(&c->mutex);
 		if (!c->weave_hand.pending) {
-			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, period_ns / 4);
+			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, tick_ns);
 		}
 		if (c->weave_hand.pending) {
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
