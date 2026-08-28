@@ -35,13 +35,13 @@ App (any graphics API)
 
 Every graphics API gets its own native compositor — no Vulkan intermediary, no interop overhead. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
 
-| API | Windows | macOS | Linux |
-|-----|---------|-------|-------|
-| D3D11 | Shipping | — | — |
-| D3D12 | Shipping | — | — |
-| Metal | — | Shipping | — |
-| OpenGL | Shipping | Shipping | — |
-| Vulkan | Shipping | Shipping | Preview |
+| API | Windows | macOS | Linux | Android |
+|-----|---------|-------|-------|---------|
+| D3D11 | Shipping | — | — | — |
+| D3D12 | Shipping | — | — | — |
+| Metal | — | Shipping | — | — |
+| OpenGL | Shipping | Shipping | — | — |
+| Vulkan | Shipping | Shipping | Preview | Shipping |
 
 Linux is **Vulkan-only** (native compositor over an X11/XCB surface) and in **Preview** — hardware-validated on NVIDIA / Ubuntu 22.04, not yet GA. See [Linux Support](docs/roadmap/linux-support.md).
 
@@ -145,18 +145,35 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./test_apps/build/bin/cube_han
 
 ## Related Repos
 
+The full, always-current map is the [org profile](https://github.com/DisplayXR) — its
+table is regenerated daily from the live org, so this one is a convenience copy.
+
 | Repo | Description |
 |------|-------------|
-| [displayxr-installer](https://github.com/DisplayXR/displayxr-installer) | Meta-installer — one bundle that installs runtime + Shell + plug-ins |
-| [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases) | DisplayXR Shell — spatial workspace controller (installer + bug reports) |
-| [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin) | Leia SR display-processor plug-in (`DisplayXRLeiaSRSetup-*.exe`) |
+| **The standard** | |
 | [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions) | OpenXR extension specs and headers |
+| **Runtime & platform** | |
+| [displayxr-installer](https://github.com/DisplayXR/displayxr-installer) | Meta-installer — one bundle that installs runtime + Shell + plug-in + MCP Tools + demos |
+| [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases) | DisplayXR Shell — spatial workspace controller (installer + bug reports) |
 | [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) | Embeddable MCP server framework + **DisplayXR MCP Tools** installer (end-user opt-in for agent / voice control) |
-| [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |
+| [displayxr-common](https://github.com/DisplayXR/displayxr-common) | Generalized off-axis frustum projection math library (`displayxr::math` + `displayxr::common`) |
+| **Vendor integration** | |
+| [displayxr-vendor-template](https://github.com/DisplayXR/displayxr-vendor-template) | Zero-SDK starter kit for a display-processor plug-in — fork it to bring up new hardware |
+| [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin) | Leia SR display-processor plug-in (`DisplayXRLeiaSRSetup-*.exe`) |
+| **Engine plug-ins** | |
 | [displayxr-unity](https://github.com/DisplayXR/displayxr-unity) | Unity engine plugin (UPM package) |
 | [displayxr-unity-samples](https://github.com/DisplayXR/displayxr-unity-samples) | Unity sample projects + shared installer (consolidates the archived `displayxr-unity-test*` repos) |
 | [displayxr-unreal](https://github.com/DisplayXR/displayxr-unreal) | Unreal Engine plugin |
-| [displayxr-common](https://github.com/DisplayXR/displayxr-common) | Generalized off-axis frustum projection math library (`displayxr::math` + `displayxr::common`) |
+| **Web** | |
+| [displayxr-browser](https://github.com/DisplayXR/displayxr-browser) | Developer-preview Chromium that weaves glasses-free inline 3D (Windows · Android) |
+| [displayxr-web](https://github.com/DisplayXR/displayxr-web) | Inline-3D web samples + the `@displayxr/inline3d` JS SDK |
+| [displayxr-gallery](https://github.com/DisplayXR/displayxr-gallery) | DisplayXR Gallery — social wall of 3D photography (feedback + bug reports) |
+| **Demos** | |
+| [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |
+| [displayxr-demo-modelviewer](https://github.com/DisplayXR/displayxr-demo-modelviewer) | glTF 2.0 PBR model viewer |
+| [displayxr-demo-mediaplayer](https://github.com/DisplayXR/displayxr-demo-mediaplayer) | Stereo photo + video player |
+| [displayxr-demo-avatar](https://github.com/DisplayXR/displayxr-demo-avatar) | Transparent click-through desktop avatar |
+| [displayxr-demo-earthview](https://github.com/DisplayXR/displayxr-demo-earthview) | Streaming 3D city viewer on Google Photorealistic 3D Tiles |
 
 ## Contributing
 
