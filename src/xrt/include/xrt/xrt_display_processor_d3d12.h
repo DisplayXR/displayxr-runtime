@@ -447,6 +447,22 @@ struct xrt_display_processor_d3d12
 	 */
 	bool (*get_scanout_caps)(struct xrt_display_processor_d3d12 *xdp, struct xrt_dp_scanout_caps *out_caps);
 
+	/*!
+	 * #206: the FORWARD-computed weave→scanout time of THIS weave, from the
+	 * runtime's vsync-locked vblank grid — the exact per-weave horizon for
+	 * the vendor eye predictor, to be fed RAW (no smoothing, no deadband).
+	 * 0 = no trusted grid this frame ⟹ the DP keeps its retrospective
+	 * heuristic. Called after @ref set_frame_timing, before
+	 * @ref xrt_display_processor::process_atlas. Full contract: the D3D11
+	 * variant's doc. Appended after @ref get_scanout_caps per ADR-020
+	 * (append-only within a major; no version bump).
+	 *
+	 * @param xdp                            Pointer to self.
+	 * @param predicted_weave_to_scanout_ns  Forward horizon; 0 = unknown.
+	 */
+	void (*set_predicted_scanout)(struct xrt_display_processor_d3d12 *xdp,
+	                              uint64_t predicted_weave_to_scanout_ns);
+
 };
 
 
@@ -510,7 +526,14 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_shared_textur
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_frame_timing)            == XRT_DP_D3D12_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, get_backend_state)           == XRT_DP_D3D12_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, get_scanout_caps)            == XRT_DP_D3D12_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d12, set_predicted_scanout)       == XRT_DP_D3D12_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the set_predicted_scanout slot (#206) —
+ * same coupled-ABI-addition pattern as @ref XRT_DP_D3D12_HAS_FRAME_TIMING.
+ */
+#define XRT_DP_D3D12_HAS_PREDICTED_SCANOUT 1
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d12)                                == XRT_DP_D3D12_BASE_OFF + 23 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_frame_timing slot, so a plug-in
@@ -887,6 +910,21 @@ xrt_display_processor_d3d12_set_frame_timing(struct xrt_display_processor_d3d12 
 		return;
 	}
 	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d12::set_predicted_scanout
+ * No-op if not supported (slot absent or NULL).
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline void
+xrt_display_processor_d3d12_set_predicted_scanout(struct xrt_display_processor_d3d12 *xdp,
+                                                  uint64_t predicted_weave_to_scanout_ns)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_predicted_scanout) || xdp->set_predicted_scanout == NULL) {
+		return;
+	}
+	xdp->set_predicted_scanout(xdp, predicted_weave_to_scanout_ns);
 }
 
 /*!

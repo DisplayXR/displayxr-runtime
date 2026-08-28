@@ -173,6 +173,23 @@ proven live (`#837: first frame PARKED`), 15 fps and identical results either wa
 app frames (`!is_repaint`), so with repaint on it affects roughly 15 of every 60 weaves. Keep it
 off.
 
+### `DXR_DP_FORWARD_HORIZON` — **default on** (#206 per-weave forward horizon)
+
+The vendor eye predictor extrapolates to whatever horizon the DP feeds it, and it consumes
+that value raw and per-call — so a smoothed retrospective estimate is the wrong feed the
+moment weave cadence varies (the leia-plugin#206 stutter: an EMA of a non-constant
+quantity puts ±~8 ms of horizon error on every weave at 28–50 Hz breathing). The runtime
+therefore computes each weave's **forward** present-to-photon time from the vsync-locked
+vblank grid — DXGI frame statistics give a vblank timestamp and a **measured** refresh
+period (59.94 vs 60.00 is measured, not assumed; the #1257 partition v3 post-mortem shows
+what an open-loop nominal-rate clock does) — and hands it to the DP via the appended
+`set_predicted_scanout` slot, per weave, immediately before `process_atlas`. The DP feeds
+it raw: no smoothing, no deadband. When no trusted grid exists (statistics unavailable on
+a composition swapchain, stalled >500 ms, warm-up), the value is 0 and the DP falls back
+to the retrospective `set_frame_timing` heuristic — the pre-#206 behavior. Wired on the
+split/bridge, d3d11, and d3d12 weave paths; the in-process VK dcomp path has no vblank
+source (no statistics, no `present_wait` on Intel) and honestly reports 0.
+
 ### Prediction horizon — computed by the DP, no runtime env var
 
 The runtime feeds the DP a **measured weave→scanout residual** through its frame-timing loop. A DP
