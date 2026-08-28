@@ -32,13 +32,18 @@
  *    coherent-mean ladder over round(interval / period) — immune to
  *    vsync quantization, to displaced-commit pairs, and to the
  *    feature's own perturbation (see u_repaint_gate_cadence_n).
- *  - When N >= 2 with a 60% majority, each app frame gets a BUDGET of
- *    N-1 repaints — one per missed vblank, which is what the FIFO queue
- *    fills — spaced ~a period apart, opening at half a period of quiet
- *    and closing a quarter period before the (N-1)-period queue
- *    boundary. A repaint presented past that boundary lands in the slot
- *    the app's next frame needs and pushes the app out a whole vblank
- *    (measured in round 2 as weaves/s < presents/s + inflated jitter).
+ *  - When the cadence is trusted with N >= 2, each app frame gets a
+ *    BUDGET of N-1 repaints — one per missed vblank, which is what the
+ *    FIFO queue fills — spaced ~a period apart, opening at half a
+ *    period of quiet and closing before the EARLIEST PLAUSIBLE next
+ *    commit (a displaced commit arrives a vblank early). A repaint
+ *    presented or lock-held past that lands where the app's next frame
+ *    needs to be and costs the app a whole vblank (measured in rounds
+ *    2 and 4 as weaves/s < presents/s + degraded cadence).
+ *  - A closed-loop governor sheds budget by the ring's own slipped-
+ *    interval count, so if repaints still displace app frames the
+ *    feature backs itself off until the app holds its target rate —
+ *    repaints that trade away app frames are worse than none.
  *  - If the app's predicted frame goes a full period overdue, the app
  *    is hitching, not pacing — the gate falls OPEN at panel-rate
  *    spacing (the original #868 use case; the steady window must never
@@ -300,17 +305,53 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 		return since_rp_ns >= (period_ns * 9) / 10;
 	}
 
-	// Steady state: budget of N-1 repaints per app frame...
-	if (g->fires_since_app >= n - 1) {
+	/*
+	 * Closed-loop budget governor (#1257 round 4). A replay's lock hold
+	 * that overlaps an app commit costs a FULL vblank, not the hold: the
+	 * commit waits ~5 ms, misses its vblank, and vsync snaps the slip to
+	 * 16.7 ms. Measured: the first build whose adaptive schedule really
+	 * ran at hz20 degraded the app from a 50 ms to a true ~60 ms cadence
+	 * (weaves/s 20 -> 16.6) — repaints that displace app frames make the
+	 * panel fresher but the CONTENT staler, strictly worse than doing
+	 * nothing. The ring already records the damage as slipped intervals
+	 * (>= N+0.5 beats), so the budget sheds one repaint per three slips
+	 * in the last 16 app frames and restores itself as the ring cleans
+	 * (~1 s). The acceptance pair this enforces: repaints up AND app
+	 * weave rate at target.
+	 */
+	uint32_t slips = 0;
+	const uint64_t slip_floor_ns = (uint64_t)n * period_ns + period_ns / 2;
+	const uint32_t ring_have = g->samples < 16 ? g->samples : 16;
+	for (uint32_t i = 0; i < ring_have; i++) {
+		if (g->recent_iv_ns[i] >= slip_floor_ns) {
+			slips++;
+		}
+	}
+	const uint32_t shed = slips / 3;
+	const uint32_t budget = (n - 1) > shed ? (n - 1) - shed : 0;
+
+	// Steady state: the governed budget of repaints per app frame...
+	if (g->fires_since_app >= budget) {
 		return false;
 	}
 	// ...not so early the eye pose would be staler than useful...
 	if (quiet_ns < period_ns / 2) {
 		return false;
 	}
-	// ...presented before the (N-1)-period queue boundary, minus a quarter
-	// period for the replay itself...
-	if (quiet_ns + period_ns / 4 >= (uint64_t)(n - 1) * period_ns) {
+	/*
+	 * ...presented clear of the EARLIEST PLAUSIBLE next commit, not the
+	 * nominal one. Displaced-commit pairs mean a commit can arrive a
+	 * whole vblank early — at (N-1) periods — and a fire started just
+	 * under a boundary computed for the nominal beat still holds the
+	 * lock when that early commit lands (round 4's hz20 regression). So
+	 * the last fire must END before (N-1) periods: close half a period
+	 * before it (hold measured 3.5-7.5 ms). N=2's window is already a
+	 * sliver ending at the first missed vblank; it keeps the quarter-
+	 * period margin (hz30 measured healthy with it) and the governor
+	 * guards the residual.
+	 */
+	const uint64_t close_margin_ns = (n == 2) ? period_ns / 4 : period_ns / 2;
+	if (quiet_ns + close_margin_ns >= (uint64_t)(n - 1) * period_ns) {
 		return false;
 	}
 	// ...and spaced ~a period apart so the queue fills one slot per vblank.
@@ -452,13 +493,24 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	const double secs = (double)elapsed / 1e9;
 	uint32_t votes = 0, have = 0;
 	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
+	uint32_t slips = 0, budget = 0;
+	if (n >= 2 && period_ns > 0) {
+		const uint64_t slip_floor_ns = (uint64_t)n * period_ns + period_ns / 2;
+		for (uint32_t i = 0; i < have; i++) {
+			if (g->recent_iv_ns[i] >= slip_floor_ns) {
+				slips++;
+			}
+		}
+		const uint32_t shed = slips / 3;
+		budget = (n - 1) > shed ? (n - 1) - shed : 0;
+	}
 	U_LOG_W("#1257 trace site=%s: ticks/s=%.1f fires/s=%.1f tick_iv=%.2fms fire=%.2fms "
 	        "pace=%.2fms bail{armed=%u gate=%u race=%u} gate{mode=%s N=%u votes=%u/%u "
-	        "ema=%.1fms jit=%.1fms samples=%u}",
+	        "slips=%u budget=%u ema=%.1fms jit=%.1fms samples=%u}",
 	        site, (double)t->ticks / secs, (double)t->fires / secs,
 	        (double)t->tick_iv_ema_ns / 1e6, (double)t->fire_ema_ns / 1e6,
 	        (double)t->pace_ema_ns / 1e6, t->bail_armed, t->bail_gate, t->bail_race,
-	        g->mode == 2 ? "legacy" : "adaptive", n, votes, have,
+	        g->mode == 2 ? "legacy" : "adaptive", n, votes, have, slips, budget,
 	        (double)g->interval_ema_ns / 1e6, (double)g->jitter_ema_ns / 1e6, g->samples);
 	t->ticks = 0;
 	t->fires = 0;
