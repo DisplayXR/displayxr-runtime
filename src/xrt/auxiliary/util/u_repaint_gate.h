@@ -336,83 +336,58 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 * Explicit DXR_WEAVE_REPAINT_GATE=legacy outranks everything.
 	 */
 	const uint32_t part = u_app_partition_divisor();
+	const bool part_on = part >= 2 && g->mode != 2;
 
 	/*
-	 * GRID FILL (#1257 partition v3). The first fill scheduled the window
-	 * relative to the last COMMIT, which reopened two failure modes the
-	 * partition exists to exclude: a late or missed app slot opened a
-	 * dead zone of no fills (measured as the panel breathing 45-50 on
-	 * the VK tier), and the budget/governor arithmetic — anti-queue-theft
-	 * machinery for ESTIMATED cadences — had nothing to protect against
-	 * here but still cost fills. The throttle owns an absolute release
-	 * grid, so schedule against IT:
-	 *
-	 *   - the app owns [release - p/2, release + p] (its render + commit
-	 *     land there; fills keep out, so the collision channel stays
-	 *     closed and the app's scanout slot stays free);
-	 *   - fills own everything else, one per ~3/4 period — including
-	 *     while the app OVERRUNS its slot (release overdue), which is
-	 *     exactly when the panel must not go dark;
-	 *   - no budget, no governor: the spacing and the app-slot guard
-	 *     already bound the rate at panel rate, and queue theft is
-	 *     impossible when fills never enter the app's slot.
+	 * COMMIT-RELATIVE fill under the partition — deliberately, and the
+	 * lesson is load-bearing (#1257 partition v3 post-mortem): an
+	 * absolute release-grid fill was tried and it regressed EVERY tier,
+	 * including the four-for-four bridge config, with a slow breathing
+	 * pattern (presents climbing 48 -> 57.5 across windows). The grid
+	 * ran on the monotonic clock times the NOMINAL refresh rate, which
+	 * is open-loop against the real vsync — a 59.94 Hz panel walks such
+	 * a grid a full period every ~16 s, beating the fill schedule
+	 * against the scanout. Commit-relative scheduling is vsync-LOCKED
+	 * for free: the app's present blocks on vsync, so its commit times
+	 * inherit the true vblank phase and every window below inherits it
+	 * too. Do not rebuild an absolute grid without real vblank
+	 * timestamps (DXGI frame statistics / present feedback) as its
+	 * clock. @p ps stays in the signature for that future.
 	 */
-	if (part >= 2 && g->mode != 2 && ps != NULL && ps->next_release_ns != 0) {
-		const uint64_t stride_ns = (uint64_t)part * period_ns;
-		const uint64_t last_release_ns =
-		    ps->next_release_ns > stride_ns ? ps->next_release_ns - stride_ns : 0;
-
-		// The app's slot: from its last release until a period later
-		// (render + weave + commit live here).
-		if (now_ns >= last_release_ns && now_ns - last_release_ns < period_ns) {
-			return false;
-		}
-		// Clear of the NEXT release by half a period (a fill's lock hold
-		// is 3.5-7.5 ms measured). An overdue release (until == 0 because
-		// the app is stuck mid-cycle) does NOT close the fill — the panel
-		// stays fed through app stalls.
-		if (ps->next_release_ns > now_ns &&
-		    ps->next_release_ns - now_ns < period_ns / 2) {
-			return false;
-		}
-		// Just-committed guard (the commit itself holds the lock).
-		if (quiet_ns < period_ns / 4) {
-			return false;
-		}
-		// One fill per vblank-ish.
-		if (since_rp_ns < (period_ns * 3) / 4) {
-			return false;
-		}
-		if (!g->adaptive_logged) {
-			g->adaptive_logged = true;
-			U_LOG_W("#1257 partition fill: absolute grid — app owns its release slot, "
-			        "fills own the other %u vblank(s) per stride, continuing through "
-			        "app overruns (DXR_APP_FRAME_DIVISOR=%u)",
-			        part - 1, part);
-		}
-		return true;
-	}
+	(void)ps;
 
 	uint32_t votes = 0, have = 0;
-	// Trust decision (mode-majority / coherent-mean ladder) lives
-	// inside cadence_n — it returns 0 when there is no trusted cadence.
-	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
-	const bool engaged = g->mode == 1 && n == 2;
+	uint32_t n;
+	bool engaged;
+	if (part_on) {
+		// The divisor is a KNOWN schedule — no estimation, no flapping.
+		n = part > 9 ? 9 : part;
+		engaged = true;
+	} else {
+		// Trust decision (mode-majority / coherent-mean ladder) lives
+		// inside cadence_n — it returns 0 when there is no trusted cadence.
+		n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
+		engaged = g->mode == 1 && n == 2;
+	}
 
 	if (!engaged) {
 		// Legacy: only once the app has already missed a FULL refresh.
-		// (Also the partition's fallback when no throttle state exists on
-		// this path.)
 		return quiet_ns >= period_ns * 2;
 	}
 
 	/*
-	 * Stall branch: the app's predicted frame is a full period overdue —
-	 * it is hitching, not pacing. This is the case #868 exists for; the
+	 * Stall branch: the app's predicted frame is overdue — it is
+	 * hitching, not pacing. This is the case #868 exists for; the
 	 * steady-state window below must not close it (v1/v2 silently did).
-	 * Behaves like the legacy gate plus panel-rate spacing.
+	 * Behaves like the legacy gate plus panel-rate spacing. Under the
+	 * partition the app's slot is a KNOWN schedule, so "overdue" starts
+	 * a quarter period past its slot rather than a full period past an
+	 * estimated one — an app that misses its slot must not leave the
+	 * panel dark while the gate waits out an extra period.
 	 */
-	if (quiet_ns >= (uint64_t)(n + 1) * period_ns) {
+	const uint64_t stall_ns = part_on ? (uint64_t)n * period_ns + period_ns / 4
+	                                  : (uint64_t)(n + 1) * period_ns;
+	if (quiet_ns >= stall_ns) {
 		return since_rp_ns >= (period_ns * 9) / 10;
 	}
 
@@ -438,19 +413,30 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 			slips++;
 		}
 	}
-	// (The partition never reaches this path — its grid branch above has
-	// no governor: fills that never enter the app's slot cannot displace
-	// anything, and slips there mean the app missed its OWN slot, when
-	// repaints are exactly what keeps the panel fed.)
-	const uint32_t shed = slips / 3;
+	/*
+	 * No shed under the partition: the governor exists to catch repaints
+	 * DISPLACING app frames, and the partition excludes that channel by
+	 * construction (the runtime paces the app; commits are phase-locked).
+	 * A slipped interval there means the app missed its own slot — and
+	 * then repaints are exactly what keeps the panel fed; shedding them
+	 * collapses the display for nothing (measured: panel at ~19/s while
+	 * the governor shed against self-inflicted "slips").
+	 */
+	const uint32_t shed = part_on ? 0 : slips / 3;
 	const uint32_t budget = (n - 1) > shed ? (n - 1) - shed : 0;
 
 	// Steady state: the governed budget of repaints per app frame...
 	if (g->fires_since_app >= budget) {
 		return false;
 	}
-	// ...not so early the eye pose would be staler than useful...
-	if (quiet_ns < period_ns / 2) {
+	// ...not so early the eye pose would be staler than useful. Under the
+	// partition the commits are phase-locked and every slot must be
+	// filled STEADILY, so the window opens earlier and fires pack
+	// tighter — slot coverage outranks marginal eye freshness (FORCE,
+	// which fires with no regard for freshness, eyeballed "really
+	// crisp")...
+	const uint64_t open_ns = part_on ? period_ns / 4 : period_ns / 2;
+	if (quiet_ns < open_ns) {
 		return false;
 	}
 	/*
@@ -469,17 +455,27 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	if (quiet_ns + close_margin_ns >= (uint64_t)(n - 1) * period_ns) {
 		return false;
 	}
-	// ...and spaced ~a period apart so the queue fills one slot per vblank.
-	if (since_rp_ns < (period_ns * 9) / 10) {
+	// ...and spaced ~a period apart so the queue fills one slot per vblank
+	// (3/4 under the partition, so a tick landing late still fits the
+	// window's last slot).
+	const uint64_t spacing_ns = part_on ? (period_ns * 3) / 4 : (period_ns * 9) / 10;
+	if (since_rp_ns < spacing_ns) {
 		return false;
 	}
 
 	if (!g->adaptive_logged) {
 		g->adaptive_logged = true;
-		U_LOG_W("#1257: repaint gate ADAPTIVE — app presents every %u vblanks "
-		        "(%u/%u votes); budget %u repaint(s) per app frame, presented clear "
-		        "of the app's own queue slot (DXR_WEAVE_REPAINT_GATE=legacy reverts)",
-		        n, votes, have, n - 1);
+		if (part_on) {
+			U_LOG_W("#1257 partition fill: known schedule — app every %u vblanks, "
+			        "budget %u repaint(s) per app frame filling the other slots at "
+			        "panel rate (DXR_APP_FRAME_DIVISOR=%u)",
+			        n, n - 1, part);
+		} else {
+			U_LOG_W("#1257: repaint gate ADAPTIVE — app presents every %u vblanks "
+			        "(%u/%u votes); budget %u repaint(s) per app frame, presented clear "
+			        "of the app's own queue slot (DXR_WEAVE_REPAINT_GATE=legacy reverts)",
+			        n, votes, have, n - 1);
+		}
 	}
 	return true;
 }
