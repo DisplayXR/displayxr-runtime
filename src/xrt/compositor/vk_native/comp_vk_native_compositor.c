@@ -542,6 +542,7 @@ struct comp_vk_native_compositor
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
 		uint32_t view_w, view_h, cols, rows;
@@ -1351,6 +1352,8 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -1406,6 +1409,19 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE taking any
+	// lock — the repaint loop keeps weaving the other slots underneath
+	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier
+	// = the #918 split (d3d11 bridge) only — the measured config; the
+	// throttle refuses cleanly elsewhere (see u_app_partition.h).
+	{
+		bool part_tier_ok = false;
+#ifdef XRT_OS_WINDOWS
+		part_tier_ok = (c->split != NULL);
+#endif
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, part_tier_ok);
+	}
+
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
 
@@ -1421,6 +1437,14 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period.
+	// Reporting the stretched period made well-behaved apps pace themselves
+	// by it ON TOP of the wait_frame throttle; with a vsync-blocking present
+	// the two stacked into ~(stride + period) cycles and the app slid off
+	// its slots (measured: 14/s against a 20/s schedule on this tier, while
+	// the non-blocking bridge held 20.0). Pacing lives in exactly one place
+	// — the throttle — and animation steps by predictedDisplayTime deltas,
+	// which stride honestly under the partition.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -4048,9 +4072,16 @@ vk_repaint_thread(void *ptr)
 		 * app_frame_in_progress, all of which describe REPAINTS. The app
 		 * frame is the real thing the repaint exists to keep alive.
 		 */
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env —
+		// a refused tier keeps stock behavior.
+		const uint64_t tick_ns =
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
+
 		os_mutex_lock(&c->mutex);
 		if (!c->weave_hand.pending) {
-			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, period_ns / 4);
+			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, tick_ns);
 		}
 		if (c->weave_hand.pending) {
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
@@ -4080,7 +4111,8 @@ vk_repaint_thread(void *ptr)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns);
+			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
 		}
 
 		// #868 diag: where the loop actually goes. A repaint that never fires
@@ -4107,7 +4139,7 @@ vk_repaint_thread(void *ptr)
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
@@ -4173,10 +4205,16 @@ vk_repaint_thread(void *ptr)
 		// replay would use belongs to the generation sampled here.
 		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
 
-		const uint64_t pace_t0 = os_monotonic_get_ns();
-		comp_vk_native_target_repaint_pace(tgt);
-		const uint64_t pace_t1 = os_monotonic_get_ns();
-		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots (measured on d3d12: fill at ~8/s). Under
+		// an ENGAGED partition the schedule IS the pacing; skip it.
+		if (c->repaint.partition.next_release_ns == 0) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
+			comp_vk_native_target_repaint_pace(tgt);
+			const uint64_t pace_t1 = os_monotonic_get_ns();
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		}
 
 		os_mutex_lock(&c->mutex);
 
@@ -4202,7 +4240,7 @@ vk_repaint_thread(void *ptr)
 		// `quiet < period` floor; the #1257 adaptive window opens at half a
 		// period, which that floor would kill.)
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;

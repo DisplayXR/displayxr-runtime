@@ -564,6 +564,7 @@ struct comp_d3d11_compositor
 		uint64_t last_app_frame_ns;
 		struct u_repaint_gate gate;   //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace; //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 		uint64_t count, ticks;
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -946,6 +947,8 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_d3d11_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -1001,6 +1004,15 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// adding one would eat into the vsync margin and cause the pipeline
 	// to miss vsync deadlines during window drag (dropping from 60→30Hz).
 
+	// #1257 partition: the exception to the note above — an EXPLICITLY
+	// requested app slow-down (DXR_APP_FRAME_DIVISOR >= 2). Blocks until
+	// the app's next slot BEFORE the lock; the repaint loop keeps weaving
+	// the other slots underneath this sleep. No-op when unset. This
+	// in-process tier is UNSUPPORTED (fill loop tick starvation, #1257
+	// follow-up) — the throttle refuses cleanly unless the bring-up env
+	// override is set.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
@@ -1020,6 +1032,11 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_d3d11_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period
+	// — the stretched period made well-behaved apps pace themselves on top
+	// of the throttle (double pacing; the app slid off its slots on vsync-
+	// blocking tiers). Pacing lives in the throttle alone; animation steps
+	// by predictedDisplayTime deltas, which stride honestly.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -2684,7 +2701,12 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env.
+		const uint64_t tick_ns =
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
+		os_nanosleep((int64_t)tick_ns);
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
 		}
@@ -2693,7 +2715,8 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
@@ -2705,14 +2728,20 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// app cadence is stable and slow, the legacy 2-period constant
 		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots. Under an ENGAGED partition the schedule
+		// IS the pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		comp_d3d11_target_repaint_pace(c->target);
+		if (c->repaint.partition.next_release_ns == 0) {
+			comp_d3d11_target_repaint_pace(c->target);
+		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 
@@ -2731,7 +2760,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
 		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;

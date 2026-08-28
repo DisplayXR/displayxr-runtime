@@ -639,6 +639,9 @@ struct comp_d3d12_compositor
 		//! #1257 interval-aware quiet gate.
 		struct u_repaint_gate gate;
 
+		//! #1257 slot partition: xrWaitFrame throttle state.
+		struct u_app_partition partition;
+
 		//! Diagnostics: where the loop goes, counted so a repaint that never
 		//! fires can be told apart from one that fires and does nothing.
 		uint64_t count;      // repaints actually issued
@@ -1991,6 +1994,8 @@ d3d12_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -2027,6 +2032,13 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE the lock —
+	// the repaint loop keeps weaving the other slots underneath this
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. This in-process tier
+	// is UNSUPPORTED (fill loop tick starvation, #1257 follow-up) — the
+	// throttle refuses cleanly unless the bring-up env override is set.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
@@ -2044,6 +2056,11 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period
+	// — the stretched period made well-behaved apps pace themselves on top
+	// of the throttle (double pacing; measured 14/s on a 20/s schedule on
+	// this tier). Pacing lives in the throttle alone; animation steps by
+	// predictedDisplayTime deltas, which stride honestly.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -3484,7 +3501,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		// Tick well inside a period so "the app went quiet" is noticed near the
 		// refresh it matters for, rather than up to a full period late.
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
+		                                                                   : period_ns / 4));
 
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
@@ -3525,7 +3545,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// the app SLOWER (it is meant to) — it is a correctness probe, never a
 		// perf setting.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -3533,7 +3553,13 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// Pace to the panel BEFORE taking the lock — this blocks for up to a
 		// few periods, and holding the lock across it would stall an arriving
 		// app frame for exactly that long.
-		comp_d3d12_target_repaint_pace(c->target);
+		// #1257 partition: SKIPPED under the partition — this pacer is for
+		// occasional repaints and its multi-period blocks were the measured
+		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
+		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
+		if (c->repaint.partition.next_release_ns == 0) {
+			comp_d3d12_target_repaint_pace(c->target);
+		}
 
 		std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -3552,7 +3578,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
 		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
 			continue;
 		}
