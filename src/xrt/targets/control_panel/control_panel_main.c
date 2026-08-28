@@ -189,6 +189,16 @@ struct claim_row
 	int pw, ph, left, top;
 };
 
+//! One hardware adapter from the #918 GPU-topology probe (`info --json` → `gpu.adapters`).
+struct gpu_row
+{
+	char name[128];
+	char luid[32]; // "00000000:00024f0b"
+	int vram_mb;
+};
+
+#define MAX_GPUS 8
+
 struct panel_state
 {
 	// info
@@ -207,6 +217,24 @@ struct panel_state
 	double vx, vy, vz;
 	int et_modes, et_def;
 	char et_supported_label[64], et_default_label[32];
+
+	// GPU topology (#918). Machine facts…
+	bool gpu_probed;
+	char gpu_note[128];
+	char gpu_verdict[192];
+	bool gpu_split_applies;
+	int n_gpus;
+	struct gpu_row gpus[MAX_GPUS];
+	bool gpu_scanout_resolved, gpu_render_resolved, gpu_ingest_resolved;
+	char gpu_scanout_name[128], gpu_scanout_luid[32];
+	char gpu_render_name[128], gpu_render_luid[32];
+	char gpu_ingest_name[128], gpu_ingest_luid[32], gpu_ingest_provenance[64];
+	// …and, kept separate on purpose, the values that came from the CLI
+	// child's environment rather than from the machine. See draw_gpu().
+	char gpu_env_weave[64]; // empty = unset
+	bool gpu_env_weave_set;
+	char gpu_env_ingress[32];
+	char gpu_env_service_split[160];
 
 	// selftest
 	bool have_selftest;
@@ -259,6 +287,19 @@ refresh_info(struct panel_state *s)
 	s->have_display = false;
 	s->ar_queried = false;
 	s->info_err[0] = '\0';
+	// Refresh is idempotent: n_gpus must be cleared or every click appends
+	// another copy of the adapter list until MAX_GPUS.
+	s->gpu_probed = false;
+	s->n_gpus = 0;
+	s->gpu_scanout_resolved = false;
+	s->gpu_render_resolved = false;
+	s->gpu_ingest_resolved = false;
+	s->gpu_env_weave_set = false;
+	s->gpu_env_weave[0] = '\0';
+	s->gpu_env_ingress[0] = '\0';
+	s->gpu_env_service_split[0] = '\0';
+	s->gpu_note[0] = '\0';
+	s->gpu_verdict[0] = '\0';
 
 	char out[16384];
 	if (!run_cli("info --json", out, sizeof(out)) || out[0] == '\0') {
@@ -317,6 +358,57 @@ refresh_info(struct panel_state *s)
 			s->et_def = (int)get_num(et, "default_mode");
 			cpy_str(s->et_supported_label, sizeof(s->et_supported_label), et, "supported_label");
 			cpy_str(s->et_default_label, sizeof(s->et_default_label), et, "default_label");
+		}
+	}
+
+	// #918 GPU topology. Absent off-Windows, and `probed` false when DXGI
+	// could not answer — both render as one line rather than an empty table.
+	const cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "gpu");
+	if (cJSON_IsObject(g)) {
+		s->gpu_probed = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "probed"));
+		cpy_str(s->gpu_note, sizeof(s->gpu_note), g, "note");
+		cpy_str(s->gpu_verdict, sizeof(s->gpu_verdict), g, "verdict");
+		s->gpu_split_applies = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "split_applies"));
+
+		const cJSON *arr = cJSON_GetObjectItemCaseSensitive(g, "adapters");
+		const cJSON *it = NULL;
+		cJSON_ArrayForEach(it, arr)
+		{
+			if (s->n_gpus >= MAX_GPUS) {
+				break;
+			}
+			struct gpu_row *row = &s->gpus[s->n_gpus++];
+			cpy_str(row->name, sizeof(row->name), it, "name");
+			cpy_str(row->luid, sizeof(row->luid), it, "luid");
+			row->vram_mb = (int)get_num(it, "dedicated_vram_mb");
+		}
+
+		const cJSON *sc = cJSON_GetObjectItemCaseSensitive(g, "scanout");
+		if (sc != NULL) {
+			s->gpu_scanout_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(sc, "resolved"));
+			cpy_str(s->gpu_scanout_name, sizeof(s->gpu_scanout_name), sc, "name");
+			cpy_str(s->gpu_scanout_luid, sizeof(s->gpu_scanout_luid), sc, "luid");
+		}
+		const cJSON *rd = cJSON_GetObjectItemCaseSensitive(g, "render");
+		if (rd != NULL) {
+			s->gpu_render_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rd, "resolved"));
+			cpy_str(s->gpu_render_name, sizeof(s->gpu_render_name), rd, "name");
+			cpy_str(s->gpu_render_luid, sizeof(s->gpu_render_luid), rd, "luid");
+		}
+		const cJSON *ig = cJSON_GetObjectItemCaseSensitive(g, "service_ingest");
+		if (ig != NULL) {
+			s->gpu_ingest_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ig, "resolved"));
+			cpy_str(s->gpu_ingest_name, sizeof(s->gpu_ingest_name), ig, "name");
+			cpy_str(s->gpu_ingest_luid, sizeof(s->gpu_ingest_luid), ig, "luid");
+			cpy_str(s->gpu_ingest_provenance, sizeof(s->gpu_ingest_provenance), ig, "provenance");
+		}
+		const cJSON *ev = cJSON_GetObjectItemCaseSensitive(g, "env_scoped");
+		if (ev != NULL) {
+			s->gpu_env_weave_set =
+			    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ev, "weave_on_scanout_set"));
+			cpy_str(s->gpu_env_weave, sizeof(s->gpu_env_weave), ev, "weave_on_scanout");
+			cpy_str(s->gpu_env_ingress, sizeof(s->gpu_env_ingress), ev, "split_ingress");
+			cpy_str(s->gpu_env_service_split, sizeof(s->gpu_env_service_split), ev, "service_split");
 		}
 	}
 
@@ -669,6 +761,62 @@ draw_panel(struct panel_state *s)
 		igSameLine(0.0f, -1.0f);
 		igTextDisabled("[%s]  apis=%s%s%s%s", r->confidence, r->apis, r->serial[0] ? "  serial=" : "",
 		               r->serial, forced ? "   (forced by override)" : "");
+	}
+
+	// ---- GPU topology (#918) ----
+	//
+	// Two kinds of fact, and the section keeps them visibly apart. The adapter
+	// list, the scanout/render/ingest adapters and the verdict are properties
+	// of the MACHINE. `DXR_WEAVE_ON_SCANOUT`, the ingress policy and the
+	// "service split" line are read from the environment of the displayxr-cli
+	// CHILD THIS PANEL SPAWNED, which inherits the panel's environment and has
+	// nothing to do with the environment a running app or the DisplayXR service
+	// was started in. Rendering the second kind as machine state is the trap
+	// docs/roadmap/control-panel-performance-settings.md exists to prevent — so
+	// it is drawn dimmed, under its own labelled sub-heading, and never in the
+	// same visual weight as the adapter list.
+	igSeparatorText("GPU topology");
+	if (igIsItemHovered(0)) {
+		igSetTooltip(
+		    "Does the woven frame have to cross adapters to reach the panel? On a hybrid "
+		    "laptop the panel is often scanned out by the integrated GPU while the app "
+		    "renders on the discrete one (#918 / ADR-037).");
+	}
+	if (!s->gpu_probed) {
+		igTextDisabled("(not probed — %s)", s->gpu_note[0] ? s->gpu_note : "Windows-only");
+	} else if (s->n_gpus <= 1) {
+		// One adapter: the whole question is moot. A table here would be noise.
+		igTextColored(COL_GREEN, "Single adapter — the weave never crosses GPUs.");
+		if (s->n_gpus == 1) {
+			igTextDisabled("%s  LUID=%s", s->gpus[0].name, s->gpus[0].luid);
+		}
+	} else {
+		for (int i = 0; i < s->n_gpus; i++) {
+			struct gpu_row *g = &s->gpus[i];
+			bool is_scanout = s->gpu_scanout_resolved && strcmp(g->luid, s->gpu_scanout_luid) == 0;
+			bool is_render = s->gpu_render_resolved && strcmp(g->luid, s->gpu_render_luid) == 0;
+			igText("[%d] %s", i, g->name);
+			igTextDisabled("    LUID=%s  %d MB dedicated%s%s", g->luid, g->vram_mb,
+			               is_scanout ? "   <- panel scanout" : "",
+			               is_render ? "   <- render (default)" : "");
+		}
+		igTextColored(s->gpu_split_applies ? COL_AMBER : COL_GREEN, "%s", s->gpu_verdict);
+		if (s->gpu_ingest_resolved) {
+			igTextDisabled("service ingest: %s (%s)", s->gpu_ingest_name, s->gpu_ingest_provenance);
+		}
+	}
+	if (s->gpu_probed) {
+		// The env-scoped half. Dimmed and explicitly scoped — see the note above.
+		igTextDisabled("From this panel's environment (NOT the app's or the service's):");
+		igTextDisabled("    DXR_WEAVE_ON_SCANOUT=%s   ingress=%s",
+		               s->gpu_env_weave_set ? s->gpu_env_weave : "<unset>",
+		               s->gpu_env_ingress[0] ? s->gpu_env_ingress : "?");
+		if (s->gpu_env_service_split[0] != '\0') {
+			igTextDisabled("    %s", s->gpu_env_service_split);
+		}
+		igTextDisabled(
+		    "A running app's real placement is the 'weave placement:' line in its log "
+		    "(%%LOCALAPPDATA%%\\DisplayXR\\DisplayXR_<exe>.*.log).");
 	}
 
 	// ---- Self-test ----

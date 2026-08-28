@@ -1608,6 +1608,85 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		}
 	}
 
+	/*
+	 * #918 GPU topology. Printed in the human dump since Phase 0; serialized
+	 * here so the Control Panel (which only parses `--json`) can show the same
+	 * answer instead of being blind to the one thing a hybrid box needs.
+	 *
+	 * The split is deliberate and load-bearing: everything at the top level is
+	 * a MACHINE fact — the same in any process on this box — while everything
+	 * under `env_scoped` is read from THIS process's environment and is only
+	 * true of a process launched the same way. A GUI that renders the second
+	 * kind as if it were the first is exactly the trap
+	 * `docs/roadmap/control-panel-performance-settings.md` is about, so the
+	 * grouping (and its `scope` string) is what stops a consumer conflating
+	 * them. Do not flatten this object.
+	 */
+	{
+		char lb[32];
+		cJSON *g = cJSON_AddObjectToObject(root, "gpu");
+		cJSON_AddBoolToObject(g, "probed", r->gpu_probed);
+		cJSON_AddStringToObject(g, "note", r->gpu_note);
+
+		if (r->gpu_probed) {
+			cJSON_AddStringToObject(g, "verdict", r->gpu_verdict);
+			cJSON_AddBoolToObject(g, "split_applies", r->gpu_split_applies);
+
+			cJSON *arr = cJSON_AddArrayToObject(g, "adapters");
+			for (uint32_t a = 0; a < r->gpu_adapter_count; a++) {
+				const struct cli_gpu_adapter *ga = &r->gpu_adapters[a];
+				cJSON *o = cJSON_CreateObject();
+				cJSON_AddNumberToObject(o, "index", (double)a);
+				cJSON_AddStringToObject(o, "name", ga->name);
+				cJSON_AddStringToObject(o, "luid", luid_label(ga->luid, lb, sizeof(lb)));
+				cJSON_AddNumberToObject(o, "dedicated_vram_mb",
+				                        (double)(ga->dedicated_vram_bytes / (1024 * 1024)));
+				cJSON_AddItemToArray(arr, o);
+			}
+
+			cJSON *sc = cJSON_AddObjectToObject(g, "scanout");
+			cJSON_AddBoolToObject(sc, "resolved", r->gpu_scanout_resolved);
+			if (r->gpu_scanout_resolved) {
+				cJSON_AddStringToObject(sc, "name", r->gpu_scanout_name);
+				cJSON_AddStringToObject(sc, "luid", luid_label(r->gpu_scanout_luid, lb, sizeof(lb)));
+			}
+
+			cJSON *rd = cJSON_AddObjectToObject(g, "render");
+			cJSON_AddBoolToObject(rd, "resolved", r->gpu_render_resolved);
+			if (r->gpu_render_resolved) {
+				cJSON_AddStringToObject(rd, "name", r->gpu_render_name);
+				cJSON_AddStringToObject(rd, "luid", luid_label(r->gpu_render_luid, lb, sizeof(lb)));
+			}
+
+			// #1153 — the adapter clients must share (ADR-037 §7). Its
+			// `provenance` already names the rule that decided ("most VRAM" /
+			// "env-forced: scanout"), which is the shape every other setting
+			// wants; surface it rather than re-deriving.
+			cJSON *ig = cJSON_AddObjectToObject(g, "service_ingest");
+			cJSON_AddBoolToObject(ig, "resolved", r->gpu_ingest_resolved);
+			if (r->gpu_ingest_resolved) {
+				cJSON_AddStringToObject(ig, "name", r->gpu_ingest_name);
+				cJSON_AddStringToObject(ig, "luid", luid_label(r->gpu_ingest_luid, lb, sizeof(lb)));
+			}
+			cJSON_AddStringToObject(ig, "provenance", r->gpu_ingest_provenance);
+			cJSON_AddStringToObject(ig, "line", r->gpu_service_ingest);
+
+			cJSON *ev = cJSON_AddObjectToObject(g, "env_scoped");
+			cJSON_AddStringToObject(ev, "scope",
+			                        "Read from THIS process's environment (displayxr-cli's). True of a "
+			                        "process launched the same way — NOT of a running app or of the "
+			                        "DisplayXR service, whose environments this process cannot see.");
+			cJSON_AddBoolToObject(ev, "weave_on_scanout_set", r->gpu_weave_env_set);
+			if (r->gpu_weave_env_set) {
+				cJSON_AddStringToObject(ev, "weave_on_scanout", r->gpu_weave_env);
+			} else {
+				cJSON_AddNullToObject(ev, "weave_on_scanout");
+			}
+			cJSON_AddStringToObject(ev, "split_ingress", r->gpu_split_ingress);
+			cJSON_AddStringToObject(ev, "service_split", r->gpu_service_split);
+		}
+	}
+
 	return root;
 }
 
