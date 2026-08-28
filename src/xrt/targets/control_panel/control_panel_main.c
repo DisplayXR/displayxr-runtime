@@ -865,7 +865,7 @@ draw_panel(struct panel_state *s)
 	// ---- Connected displays (EDID, vendor-neutral) ----
 	igSeparatorText("Connected displays (EDID)");
 	if (s->n_displays == 0) {
-		igTextDisabled("(none enumerated — Windows-only)");
+		igTextDisabled("(none enumerated - Windows-only)");
 	}
 	for (int i = 0; i < s->n_displays; i++) {
 		struct disp_row *d = &s->displays[i];
@@ -876,13 +876,14 @@ draw_panel(struct panel_state *s)
 	// ---- Resolved display → DP binding (#793) ----
 	igSeparatorText("Display -> DP binding (resolved)");
 	if (igIsItemHovered(0)) {
-		igSetTooltip("Which display processor the runtime bound to each monitor, from the per-monitor "
-		             "registry — by EDID claim confidence, or forced by the PreferredPlugin override "
-		             "below. This is the DP the compositor actually weaves with.");
+		igSetTooltip(
+		    "Which display processor the runtime bound to each monitor, from the per-monitor "
+		    "registry - by EDID claim confidence, or forced by the PreferredPlugin override "
+		    "below. This is the DP the compositor actually weaves with.");
 	}
 	if (s->n_claims == 0) {
 		igTextDisabled("(no monitor claimed by any plug-in%s)",
-		               s->claims_monitor_count > 0 ? "" : " — Windows-only");
+		               s->claims_monitor_count > 0 ? "" : " - Windows-only");
 	}
 	for (int i = 0; i < s->n_claims; i++) {
 		struct claim_row *r = &s->claims[i];
@@ -914,10 +915,10 @@ draw_panel(struct panel_state *s)
 		    "renders on the discrete one (#918 / ADR-037).");
 	}
 	if (!s->gpu_probed) {
-		igTextDisabled("(not probed — %s)", s->gpu_note[0] ? s->gpu_note : "Windows-only");
+		igTextDisabled("(not probed - %s)", s->gpu_note[0] ? s->gpu_note : "Windows-only");
 	} else if (s->n_gpus <= 1) {
 		// One adapter: the whole question is moot. A table here would be noise.
-		igTextColored(COL_GREEN, "Single adapter — the weave never crosses GPUs.");
+		igTextColored(COL_GREEN, "Single adapter - the weave never crosses GPUs.");
 		if (s->n_gpus == 1) {
 			igTextDisabled("%s  LUID=%s", s->gpus[0].name, s->gpus[0].luid);
 		}
@@ -970,11 +971,11 @@ draw_panel(struct panel_state *s)
 	if (igIsItemHovered(0)) {
 		igSetTooltip(
 		    "Settings the runtime reads inside each app's own process. They apply to apps "
-		    "started AFTER the change — the panel cannot reach into a running app.");
+		    "started AFTER the change - the panel cannot reach into a running app.");
 	}
 
 	if (!s->have_info) {
-		igTextDisabled("(unavailable — displayxr-cli did not report)");
+		igTextDisabled("(unavailable - displayxr-cli did not report)");
 	} else {
 		// -- 1. Target GPU. Only a real choice on a multi-adapter box; on a
 		//    single-GPU machine there is nothing to choose, so don't offer it.
@@ -1042,7 +1043,7 @@ draw_panel(struct panel_state *s)
 			perf_action(s, "perf set DXR_WEAVE_ON_SCANOUT 0");
 			perf_action(s, "perf set DXR_WEAVE_REPAINT 0");
 		}
-		igTextDisabled("    Compatibility turns off the cross-adapter weave split and the repaint —");
+		igTextDisabled("    Compatibility turns off the cross-adapter weave split and the repaint -");
 		igTextDisabled("    for 'the 3D looks wrong, is it the pipeline?'. It COSTS latency; it is not");
 		igTextDisabled("    a faster setting. Leave it on Balanced unless you are diagnosing.");
 		igSpacing();
@@ -1126,7 +1127,7 @@ draw_panel(struct panel_state *s)
 	if (igButton("Reset to default discovery", (ImVec2){0, 0})) {
 		dp_action(s, "dp reset");
 	}
-	igTextDisabled("Switching takes effect on the next process — restart the service or relaunch your app.");
+	igTextDisabled("Switching takes effect on the next process - restart the service or relaunch your app.");
 
 	if (s->last_action[0] != '\0') {
 		igSpacing();
@@ -1219,10 +1220,54 @@ main(int argc, char *argv[])
 	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-	SDL_Window *win = SDL_CreateWindow("DisplayXR Control Panel", SDL_WINDOWPOS_CENTERED,
-	                                   SDL_WINDOWPOS_CENTERED, 760, 820,
-	                                   SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
-	                                       SDL_WINDOW_ALLOW_HIGHDPI);
+	/*
+	 * Default window size.
+	 *
+	 * The base is in 100%-DPI units and is SCALED BY THE DISPLAY's DPI, because
+	 * `io->FontGlobalScale` below scales the content: a fixed pixel size holds
+	 * only ~1/2.5 as much on a 250% display as it does at 100%, which is
+	 * exactly the "the window is too small" report this fixes. Scaling the
+	 * window the same way the content is scaled makes it hold the same amount
+	 * of panel at any DPI.
+	 *
+	 * Then clamped to the display's USABLE bounds (work area, taskbar
+	 * excluded), so a high scale factor can never open a window bigger than the
+	 * screen it opens on. Display 0 because the window is centred there; the
+	 * font scale below re-queries whichever display it actually landed on, and
+	 * a mismatch on a mixed-DPI multi-monitor box only affects the initial
+	 * size of a window the user can resize.
+	 */
+	int win_w = 900;
+	int win_h = 1000;
+	{
+		float dpi = 96.0f;
+		if (SDL_GetDisplayDPI(0, &dpi, NULL, NULL) == 0 && dpi > 0.0f) {
+			float s = dpi / 96.0f;
+			if (s < 1.0f) {
+				s = 1.0f;
+			}
+			if (s > 3.0f) {
+				s = 3.0f;
+			}
+			win_w = (int)((float)win_w * s);
+			win_h = (int)((float)win_h * s);
+		}
+		SDL_Rect usable;
+		if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+			const int max_w = (int)((float)usable.w * 0.9f);
+			const int max_h = (int)((float)usable.h * 0.9f);
+			if (win_w > max_w) {
+				win_w = max_w;
+			}
+			if (win_h > max_h) {
+				win_h = max_h;
+			}
+		}
+	}
+
+	SDL_Window *win =
+	    SDL_CreateWindow("DisplayXR Control Panel", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,
+	                     SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (win == NULL) {
 		SDL_Quit();
 		return 1;
@@ -1271,7 +1316,7 @@ main(int argc, char *argv[])
 
 	struct panel_state state;
 	memset(&state, 0, sizeof(state));
-	snprintf(state.info_err, sizeof(state.info_err), "Loading… (querying displayxr-cli)");
+	snprintf(state.info_err, sizeof(state.info_err), "Loading... (querying displayxr-cli)");
 
 	// The first query (and every Refresh) spawns displayxr-cli, which loads
 	// the vendor plug-in — up to a second or two. Present one frame first so
