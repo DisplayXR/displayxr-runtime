@@ -22,6 +22,57 @@ Every `v*` release carries two Android APKs:
 | `DisplayXR-Runtime-<ver>-android-arm64.apk` | sim-display only | no vendor display; hardware-free testing |
 | `DisplayXR-Runtime-Leia-<ver>-android-arm64.apk` | + the Leia CNSDK plug-in | **a Leia device** |
 
+**There is no separate vendor plug-in APK on Android.** On Windows the Leia plug-in
+is its own installer; on Android it is compiled *into* the runtime APK, which is why
+the choice is a choice of APK rather than a second install ([ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md)).
+Pick by what the device has:
+
+- **Device with the Leia/CNSDK on-device services** (NP02J, LPD-20W …) → the **Leia**
+  APK. This is the installer's default; it is what weaves glasses-free 3D.
+- **Any other device, or hardware-free testing** → `--neutral`. The runtime comes up
+  and OpenXR apps run against `sim-display`, but nothing weaves — there is no vendor
+  display to drive.
+
+Installing the Leia APK on a device *without* those services does not give you
+weaving; the plug-in has nothing to bind to and the runtime falls back to
+sim-display. Check which one is actually live from the DisplayXR app's dashboard
+(below) — on a vendor display the active plug-in must not read `sim-display`.
+
+### The one-command install (what you almost always want)
+
+There is no `DisplayXRBundle-*.exe` for Android — every component ships as its own
+APK on its own GitHub release. `install-android-bundle.sh` is that missing
+counterpart: it reads the pins from `versions.json`, **downloads** every component
+at those versions, and hands them to `install-android.sh`.
+
+```bash
+curl -sSLO https://raw.githubusercontent.com/DisplayXR/displayxr-runtime/main/scripts/install-android-bundle.sh
+bash install-android-bundle.sh --with-browser
+```
+
+No clone needed — it fetches `versions.json` from GitHub when run outside a
+checkout. Requires `gh` (authenticated), `adb`, and a connected device.
+
+| flag | effect |
+|---|---|
+| *(none)* | runtime (**Leia** variant) + all five demos |
+| `--with-browser` | also installs the DisplayXR Browser APK |
+| `--neutral` | installs the vendor-neutral runtime instead of the Leia one |
+| `--list` | print what *would* install and exit — no device writes |
+| `--force-reinstall` | uninstall first. **Wipes app data**, including EarthView's saved Google Maps API key. Without it installs are `adb install -r` upgrades and the key survives. |
+
+Start with `--list`; it resolves every pin and prints the exact versions, so a
+wrong `versions.json` is visible before anything touches the device.
+
+**Browser fallback.** The browser's Android APK is not published on every
+release — several previews have been Windows-only. When the pinned tag carries
+no APK the script scans back through recent releases for the newest one that
+does, says so, and installs that instead. So `--with-browser` keeps working, but
+the browser version you get may lag the pin; the line it prints tells you when
+that happened.
+
+### Installing APKs you already have
+
 Install the runtime **and** an app with:
 
 ```bash
