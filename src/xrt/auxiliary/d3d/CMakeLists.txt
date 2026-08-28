@@ -18,7 +18,10 @@ add_library(
 # user32: MonitorFromPoint / GetMonitorInfoW / QueryDisplayConfig, used by the
 # scanout-adapter resolver. Linked explicitly rather than leaning on MSVC's
 # default library set.
-target_link_libraries(aux_d3d PUBLIC aux-includes xrt-interfaces ${DXGI_LIBRARY} WIL::WIL user32)
+# aux_util: u_logging (long-standing, previously resolved only at final link)
+# and, since #1252, u_setting for the DXR_D3D_FORCE_GPU settings chain. No
+# cycle — aux_util does not link aux_d3d.
+target_link_libraries(aux_d3d PUBLIC aux-includes xrt-interfaces aux_util ${DXGI_LIBRARY} WIL::WIL user32)
 
 # needed for format includes
 target_include_directories(aux_d3d PUBLIC ${Vulkan_INCLUDE_DIR})

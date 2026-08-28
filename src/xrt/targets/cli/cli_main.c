@@ -34,6 +34,8 @@ cli_print_help(int argc, const char **argv)
 	P("  info [--json]     - Print runtime, plug-in, and display info (for bug reporting).\n");
 	P("  selftest [--json] - Headless self-test: discover a display processor and validate\n");
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
+	P("  perf <...>        - Performance settings the runtime reads inside each app.\n");
+	P("                      'perf list [--json]', 'perf set <name> <value>', 'perf reset'.\n");
 	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
@@ -74,6 +76,9 @@ main(int argc, const char **argv)
 	}
 	if (strcmp(argv[1], "dp") == 0) {
 		return cli_cmd_dp(argc, argv);
+	}
+	if (strcmp(argv[1], "perf") == 0) {
+		return cli_cmd_perf(argc, argv);
 	}
 	if (strcmp(argv[1], "input") == 0) {
 		return cli_cmd_input(argc, argv);
