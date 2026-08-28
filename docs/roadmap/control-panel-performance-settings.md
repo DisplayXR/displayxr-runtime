@@ -296,7 +296,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **72 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **73 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -312,6 +312,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_WEAVE_REPAINT` | `compositor/d3d11/comp_d3d11_compositor.cpp:4450`; `d3d12/…:5014`; `gl/…:6039`; `vk_native/…:6151` | `getenv` at compositor create | **on** | App | 1 | Master switch for #868 repaint. Decides whether the repaint thread is spawned |
 | `DXR_WEAVE_REPAINT_FORCE` | same four files, next line (`:4452`, `:5016`, `:6041`, `:6274`) | `getenv` at create | off | App | 4 | Repaint every refresh regardless of app rate. Correctness probe; **will** cost frame rate |
 | `DXR_WEAVE_REPAINT_GATE` | `auxiliary/util/u_repaint_gate.h` (`u_repaint_gate_open`, consumed by all four repaint loops) | `getenv`, cached in gate state | adaptive | App | 4 | `legacy` pins the pre-#1257 fixed 2-period quiet gate for A/B. Adaptive opens the repaint window after ONE missed vblank when the measured app cadence is stable and ≥ 1.5 periods (present-capped apps), and IS the legacy gate otherwise |
+| `DXR_WEAVE_REPAINT_TRACE` | `auxiliary/util/u_repaint_gate.h` (`u_repaint_trace_*`, wired into the vk_native + d3d11 repaint loops) | `getenv`, cached | off | App | 4 | #1257 verification instrumentation: one WARN row per ~5 s per loop with real tick cadence, replay/pace durations, and per-gate bail counts. Says where missing repaints went; the witness only says how many landed |
 | `DXR_WEAVE_REPAINT_HASH` | `compositor/d3d11/comp_d3d11_compositor.cpp:4454` | `getenv` at create | off | App | 4 | Content-identity hash probe on repainted frames |
 | `DXR_WEAVE_REPAINT_APPTHREAD` | `compositor/gl/comp_gl_compositor.cpp:4788` | `getenv`, cached | off | App | 4 | #885 bisect: replay the repaint path on the app thread to separate "replay broken" from "DP is thread-affine" |
 | `DXR_WEAVE_REPAINT_DIAG` | `compositor/gl/comp_gl_compositor.cpp:3117, 3324, 3434` | `getenv`, cached per site | off | App | 4 | #885 per-thread FBO / blit-error / texel probe |
@@ -427,7 +428,7 @@ grep -rhoE '"DXR_[A-Z0-9_]+"' src/xrt \
   | sort -u
 ```
 
-As of this writing that yields **72** names, all present above. Read sites and mechanisms
+As of this writing that yields **73** names, all present above. Read sites and mechanisms
 were machine-derived by intersecting that list with lines containing `getenv`,
 `GetEnvironmentVariable` or `DEBUG_GET_ONCE`, then spot-verified line by line. If the
 count changes, the table is stale.

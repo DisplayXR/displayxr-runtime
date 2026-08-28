@@ -541,6 +541,7 @@ struct comp_vk_native_compositor
 		bool app_frame_in_progress;     //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
+		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
 
 		//! Effective content layout the last app frame actually painted.
 		uint32_t view_w, view_h, cols, rows;
@@ -4076,6 +4077,12 @@ vk_repaint_thread(void *ptr)
 		}
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate);
+		}
+
 		// #868 diag: where the loop actually goes. A repaint that never fires
 		// is indistinguishable from one that fires and produces nothing unless
 		// the gate state is sampled — this is what caught the loop never
@@ -4090,6 +4097,7 @@ vk_repaint_thread(void *ptr)
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
 		// #1257: interval-aware gate. Keyed on the last APP frame, never on
@@ -4100,6 +4108,7 @@ vk_repaint_thread(void *ptr)
 		// u_repaint_gate.h for the full design.
 		if (c->repaint.force != 1 &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
@@ -4124,16 +4133,20 @@ vk_repaint_thread(void *ptr)
 			if (!comp_vk_split_has_weave_slot(c->split)) {
 				continue;
 			}
+			const uint64_t fire_t0 = os_monotonic_get_ns();
 			os_mutex_lock(&c->mutex);
 			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 			    c->repaint.app_frame_in_progress || c->split == NULL) {
+				u_repaint_trace_bail_race(&c->repaint.trace);
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
 			c->repaint.count++;
-			u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
+			const uint64_t fire_t1 = os_monotonic_get_ns();
+			u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+			u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 			os_mutex_unlock(&c->mutex);
 
 			static bool split_repaint_logged = false;
@@ -4160,7 +4173,10 @@ vk_repaint_thread(void *ptr)
 		// replay would use belongs to the generation sampled here.
 		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
 
+		const uint64_t pace_t0 = os_monotonic_get_ns();
 		comp_vk_native_target_repaint_pace(tgt);
+		const uint64_t pace_t1 = os_monotonic_get_ns();
+		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 
 		os_mutex_lock(&c->mutex);
 
@@ -4169,6 +4185,7 @@ vk_repaint_thread(void *ptr)
 		// layer_accum does not exercise the feature, it corrupts the frame.
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == NULL) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4182,6 +4199,7 @@ vk_repaint_thread(void *ptr)
 		}
 		if (c->repaint.force != 1 &&
 		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4233,6 +4251,7 @@ vk_repaint_thread(void *ptr)
 
 		uint64_t fp[8] = {0};
 		bool skip_frame = false;
+		const uint64_t fire_t0 = os_monotonic_get_ns();
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
@@ -4242,7 +4261,9 @@ vk_repaint_thread(void *ptr)
 		}
 
 		c->repaint.count++;
-		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;

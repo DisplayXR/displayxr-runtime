@@ -78,6 +78,7 @@ measured case the old constant protected) still never repaints.
 | Probe | Purpose |
 |---|---|
 | `DXR_WEAVE_REPAINT_GATE=legacy` | Pin the pre-#1257 fixed 2-period quiet gate, for A/B. |
+| `DXR_WEAVE_REPAINT_TRACE=1` | One WARN row per ~5 s per loop: real tick cadence, replay/pace durations, per-gate bail counts (#1257 instrumentation). |
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 

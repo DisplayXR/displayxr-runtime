@@ -562,7 +562,8 @@ struct comp_d3d11_compositor
 		bool armed;   //!< Last frame was DP-woven and not zero-copy.
 		bool app_frame_in_progress; //!< layer_begin .. layer_commit.
 		uint64_t last_app_frame_ns;
-		struct u_repaint_gate gate; //!< #1257 interval-aware quiet gate.
+		struct u_repaint_gate gate;   //!< #1257 interval-aware quiet gate.
+		struct u_repaint_trace trace; //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
 		uint64_t count, ticks;
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -2689,8 +2690,15 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate);
+		}
+
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
 		// #1257: interval-aware gate — one missed vblank when the measured
@@ -2699,11 +2707,16 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (c->repaint.force != 1 &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
+		const uint64_t pace_t0 = os_monotonic_get_ns();
 		comp_d3d11_target_repaint_pace(c->target);
+		const uint64_t pace_t1 = os_monotonic_get_ns();
+		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 
+		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
 
 		// app_frame_in_progress is load-bearing and is NOT bypassed by the
@@ -2712,10 +2725,12 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
 			c->repaint.bail_race++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 
@@ -2796,7 +2811,9 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 
 		c->repaint.count++;
-		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
