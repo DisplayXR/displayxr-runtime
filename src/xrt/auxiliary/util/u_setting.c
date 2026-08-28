@@ -25,10 +25,12 @@
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
 #include <shlobj.h> // SHGetFolderPathA
-#elif defined XRT_OS_ANDROID
-#include <sys/system_properties.h>
 #else
-#include <sys/stat.h> // mkdir
+#include <sys/stat.h> // mkdir — needed on Android too, which also takes the
+                      // POSIX path for the per-user file.
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 #endif
 
 
@@ -160,6 +162,23 @@ managed_index(const char *name)
  *
  */
 
+#ifdef XRT_OS_ANDROID
+struct android_read_arg
+{
+	char *chars;
+	size_t char_count;
+};
+
+static void
+android_on_property_read(void *cookie, const char *name, const char *value, uint32_t serial)
+{
+	(void)name;
+	(void)serial;
+	struct android_read_arg *a = (struct android_read_arg *)cookie;
+	snprintf(a->chars, a->char_count, "%s", value);
+}
+#endif
+
 static const char *
 env_get_raw(char *chars, size_t char_count, const char *name)
 {
@@ -174,6 +193,11 @@ env_get_raw(char *chars, size_t char_count, const char *name)
 #elif defined XRT_OS_ANDROID
 	// Android has always had an out-of-process channel for these; it is a
 	// system property rather than an environment variable.
+	//
+	// The CALLBACK form, not __system_property_read: the latter writes up to
+	// PROP_VALUE_MAX into the caller's buffer with no way to bound it, and
+	// several call sites here pass a 64-byte buffer. This mirrors what
+	// u_debug.c did before the read moved into this file.
 	char prefixed[1024];
 	snprintf(prefixed, sizeof(prefixed), "debug.xrt.%s", name);
 
@@ -181,9 +205,10 @@ env_get_raw(char *chars, size_t char_count, const char *name)
 	if (pi == NULL) {
 		return NULL;
 	}
-	if (__system_property_read(pi, NULL, chars) <= 0) {
-		return NULL;
-	}
+
+	struct android_read_arg a = {.chars = chars, .char_count = char_count};
+	__system_property_read_callback(pi, &android_on_property_read, &a);
+
 	return chars;
 
 #else
