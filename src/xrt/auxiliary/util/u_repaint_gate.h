@@ -53,7 +53,11 @@
  *  - With no trusted cadence (startup, erratic app, a >1 s pause) it
  *    degrades to the legacy 2-period behavior, byte for byte.
  *
- * DXR_WEAVE_REPAINT_GATE=legacy pins the old behavior for A/B runs.
+ * DXR_WEAVE_REPAINT_GATE=adaptive opts in to the N == 2 window — it is
+ * NOT the default: its intermittent engagement failed the hz30 visual
+ * check (panel cadence oscillating 28-50 updates/s reads as judder
+ * where a steady 33 does not; the eye grades cadence stability, not
+ * average rate). Default behavior is the legacy schedule.
  * DXR_WEAVE_REPAINT_FORCE=1 bypasses this gate entirely (unchanged —
  * the backends check it before consulting the gate).
  * DXR_WEAVE_REPAINT_TRACE=1 emits the loop instrumentation below.
@@ -257,11 +261,23 @@ static inline bool
 u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_ns)
 {
 	if (g->mode == 0) {
+		/*
+		 * Default is the LEGACY schedule. The N=2 adaptive window won its
+		 * perf numbers (hz30: 0 -> ~15 repaints/s) but FAILED the human
+		 * eyeball: the trust ladder engages intermittently, the panel rate
+		 * breathes 28-50 updates/s, and an oscillating cadence reads as
+		 * judder where a steady 33 does not — the eye grades cadence
+		 * STABILITY, not average rate (#1257 hz30 visual verdict). Both
+		 * schedules humans liked (steady legacy, FORCE partition) were
+		 * steady. Adaptive stays opt-in until either engagement hysteresis
+		 * proves a steady win or the slot-partition mode replaces it.
+		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT_GATE");
-		g->mode = (e != NULL && strcmp(e, "legacy") == 0) ? 2 : 1;
-		if (g->mode == 2) {
-			U_LOG_W("#1257: DXR_WEAVE_REPAINT_GATE=legacy — fixed 2-period repaint gate "
-			        "(present-capped apps will repaint below panel rate)");
+		g->mode = (e != NULL && strcmp(e, "adaptive") == 0) ? 1 : 2;
+		if (g->mode == 1) {
+			U_LOG_W("#1257: DXR_WEAVE_REPAINT_GATE=adaptive — EXPERIMENTAL N=2 window; "
+			        "its intermittent engagement failed the hz30 visual check "
+			        "(oscillating panel cadence reads as judder), default is legacy");
 		}
 	}
 
