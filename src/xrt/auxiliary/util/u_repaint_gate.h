@@ -528,8 +528,12 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	        site, (double)t->ticks / secs, (double)t->fires / secs,
 	        (double)t->tick_iv_ema_ns / 1e6, (double)t->fire_ema_ns / 1e6,
 	        (double)t->pace_ema_ns / 1e6, t->bail_armed, t->bail_gate, t->bail_race,
-	        g->mode == 2 ? "legacy" : "adaptive", n, votes, have, slips, budget,
-	        (double)g->interval_ema_ns / 1e6, (double)g->jitter_ema_ns / 1e6, g->samples);
+	        // Three states so a reader isn't puzzled by "adaptive" rows with
+	        // legacy numbers: env-pinned legacy, engaged (N==2), or the
+	        // deliberate N!=2 fallback.
+	        g->mode == 2 ? "legacy" : (n == 2 ? "adaptive" : "adaptive-fallback"), n, votes,
+	        have, slips, budget, (double)g->interval_ema_ns / 1e6,
+	        (double)g->jitter_ema_ns / 1e6, g->samples);
 	t->ticks = 0;
 	t->fires = 0;
 	t->bail_armed = 0;
