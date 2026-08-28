@@ -302,9 +302,17 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 	 * own ticks starve on the convoy (56-95 ticks/s vs 149-163 in the
 	 * same build's legacy run), and the shed/restore governor limit-
 	 * cycles instead of converging (its ~1 s restore equals the ring
-	 * window at the degraded rate). Re-opening N >= 3 requires shrinking
-	 * the replay's lock hold (partial replay / present outside the
-	 * lock), not another schedule. Full evidence chain: issue #1257.
+	 * window at the degraded rate). Two routes back into N >= 3, in
+	 * order of promise: (a) PARTITION the vblank slots up front — app
+	 * every Nth vblank, repaints the rest — so the app vsync-quantizes
+	 * onto its own slots and the collision never exists by construction
+	 * (this is why the FORCE probe succeeds where all five gap-filling
+	 * schedules failed; independently measured twice: render-30/weave-60
+	 * on Arc at -9.5 GPU pts, and Unity 15.6 app weaves + 44.3 repaints
+	 * at -14.5 GPU pts with the display rate untouched); (b) shrink the
+	 * replay's lock hold (partial replay / present outside the lock) so
+	 * a collision stops costing a vblank. Not another gap-filling
+	 * schedule. Full evidence chain: issue #1257.
 	 */
 	const bool engaged = g->mode != 2 && n == 2;
 

@@ -81,9 +81,13 @@ intervals. That is the measured ceiling: at N = 2 the win is clean (hz30: 0.0 �
 repaints/s, app at full rate), while at **N ≥ 3 five schedule variants lost to the legacy
 gate on hardware** — multiple fires per gap collide with displaced-early commits, each
 ~5 ms replay lock hold vsync-snaps into a 16.7 ms app slip, and the loop's own ticks
-starve on the convoy. N ≥ 3 therefore deliberately falls back to legacy; re-opening it
-requires shrinking the replay's lock hold (partial replay / present outside the lock), not
-another schedule (evidence chain: #1257). An app whose predicted frame goes a full period
+starve on the convoy. N ≥ 3 therefore deliberately falls back to legacy; the promising
+route back is a **slot partition** (app every Nth vblank, repaints the rest — the app
+vsync-quantizes onto its own slots, so the fire/commit collision never exists by
+construction; this is why the FORCE probe succeeds where every gap-filling schedule
+failed, measured independently on Arc at −9.5 GPU pts and on Unity at −14.5 GPU pts with
+the display rate untouched), with shrinking the replay's lock hold as the alternative
+(evidence chain: #1257). An app whose predicted frame goes a full period
 overdue is hitching, not pacing — the gate then falls open at panel-rate spacing (the
 original #868 case). Without a trusted cadence (startup, erratic app, N = 1 — e.g. the
 measured 46.7 fps case the old constant protected) it degrades to the legacy 2-period
