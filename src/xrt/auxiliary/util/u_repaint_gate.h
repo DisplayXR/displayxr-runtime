@@ -27,9 +27,11 @@
  * and the #1257 issue thread):
  *
  *  - Per app frame it records the raw inter-frame interval in a small
- *    ring (single writer: the commit path). The cadence is the MODE of
- *    round(interval / period): "the app presents every N vblanks" —
- *    immune to vsync quantization and to the feature's own perturbation.
+ *    ring (single writer: the commit path). The cadence is "the app
+ *    presents every N vblanks", estimated by a mode-majority /
+ *    coherent-mean ladder over round(interval / period) — immune to
+ *    vsync quantization, to displaced-commit pairs, and to the
+ *    feature's own perturbation (see u_repaint_gate_cadence_n).
  *  - When N >= 2 with a 60% majority, each app frame gets a BUDGET of
  *    N-1 repaints — one per missed vblank, which is what the FIFO queue
  *    fills — spaced ~a period apart, opening at half a period of quiet
@@ -149,19 +151,36 @@ u_repaint_gate_note_repaint(struct u_repaint_gate *g, uint64_t now_ns)
 }
 
 /*!
- * The app's cadence in VBLANK COUNTS: the mode (most common value) of
- * round(interval / period) over the recent ring. Returns 0 when there is
- * no trusted cadence; otherwise N >= 1 with @p out_votes / @p out_have
- * saying how dominant it is.
+ * The app's cadence in VBLANK COUNTS: "the app presents every N vblanks".
+ * Returns 0 when there is no trusted cadence; otherwise N >= 1 with
+ * @p out_votes / @p out_have reporting the mode's dominance (diagnostic).
  *
  * Why counts and not milliseconds: a present-capped app on a vsynced
  * present path is QUANTIZED — its intervals are multiples of the panel
  * period (measured at hz20: nominal 50 ms arriving as 33/50/67 mixes,
  * "jitter" EMA 12-23 ms on a metronomic app). Any ms-domain mean±jitter
  * model reads that as noise and strangles the window (#1257 round 2:
- * adaptive 3.3/s vs legacy 9.5/s). The mode of the vblank count is
- * immune to the quantization AND to the feature's own perturbation (a
- * slipped frame votes N+1 without moving the mode).
+ * adaptive 3.3/s vs legacy 9.5/s).
+ *
+ * Two estimators, because the #1257 round-3 runs proved each fails alone:
+ *
+ *  - The MODE of round(interval / period). Clean when commits arrive on
+ *    the true beat (hz30 measured 10-13/16), but a displaced commit
+ *    produces a COMPENSATING PAIR (a 67 ms interval followed by a 33 ms
+ *    one around a 50 ms beat), and enough pairs dilute the mode to a
+ *    flapping plurality (hz20 measured 5-7/16, N flapping 2<->3, in
+ *    ADAPTIVE AND LEGACY alike — so it is the commit stream itself, not
+ *    the feature).
+ *  - The MEAN over the ring. Displacement pairs cancel exactly (the late
+ *    commit shortens the next interval), so the mean holds the true beat
+ *    through the chaos that destroys the mode — but it drifts when the
+ *    app's rate genuinely sags (hz30 measured mean 30-42 ms while the
+ *    mode stayed a clean 2).
+ *
+ * So: a strong mode majority (>= 60%) wins; otherwise the mean-rounded N
+ * is used when the mean sits coherently near a beat (within a third of a
+ * period); otherwise there is no trusted cadence and the caller falls
+ * back to the legacy gate.
  */
 static inline uint32_t
 u_repaint_gate_cadence_n(const struct u_repaint_gate *g,
@@ -176,8 +195,11 @@ u_repaint_gate_cadence_n(const struct u_repaint_gate *g,
 		return 0;
 	}
 	uint32_t votes[10] = {0};
+	uint64_t sum_ns = 0;
 	for (uint32_t i = 0; i < have; i++) {
-		uint64_t n = (g->recent_iv_ns[i] + period_ns / 2) / period_ns;
+		const uint64_t iv = g->recent_iv_ns[i];
+		sum_ns += iv;
+		uint64_t n = (iv + period_ns / 2) / period_ns;
 		if (n < 1) {
 			n = 1;
 		}
@@ -193,7 +215,29 @@ u_repaint_gate_cadence_n(const struct u_repaint_gate *g,
 		}
 	}
 	*out_votes = votes[best_n];
-	return best_n;
+
+	// Strong majority: the commits are on the beat — trust the mode.
+	if (votes[best_n] * 10 >= have * 6) {
+		return best_n;
+	}
+
+	// Diluted mode: displacement pairs. The mean still holds the beat if
+	// there is one — accept it only when it sits near a whole vblank count.
+	const uint64_t mean_ns = sum_ns / have;
+	uint64_t mean_n = (mean_ns + period_ns / 2) / period_ns;
+	if (mean_n < 1) {
+		mean_n = 1;
+	}
+	if (mean_n > 9) {
+		mean_n = 9;
+	}
+	const uint64_t beat_ns = mean_n * period_ns;
+	const uint64_t off_ns = mean_ns > beat_ns ? mean_ns - beat_ns : beat_ns - mean_ns;
+	if (off_ns <= period_ns / 3) {
+		return (uint32_t)mean_n;
+	}
+
+	return 0; // no trusted cadence
 }
 
 /*!
@@ -236,8 +280,10 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 	 *    before that boundary, and the budget caps the queue depth.
 	 */
 	uint32_t votes = 0, have = 0;
+	// Trust decision (mode-majority / coherent-mean ladder) lives inside
+	// cadence_n — it returns 0 when there is no trusted cadence.
 	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
-	const bool engaged = g->mode != 2 && n >= 2 && votes * 10 >= have * 6;
+	const bool engaged = g->mode != 2 && n >= 2;
 
 	if (!engaged) {
 		// Legacy: only once the app has already missed a FULL refresh.
