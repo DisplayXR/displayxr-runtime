@@ -347,12 +347,19 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 	}
 
 	/*
-	 * Stall branch: the app's predicted frame is a full period overdue —
-	 * it is hitching, not pacing. This is the case #868 exists for; the
+	 * Stall branch: the app's predicted frame is overdue — it is
+	 * hitching, not pacing. This is the case #868 exists for; the
 	 * steady-state window below must not close it (v1/v2 silently did).
-	 * Behaves like the legacy gate plus panel-rate spacing.
+	 * Behaves like the legacy gate plus panel-rate spacing. Under the
+	 * partition the app's slot is a KNOWN grid time, so "overdue" starts
+	 * a quarter period past its slot rather than a full period past an
+	 * estimated one — an app that misses its slot must not leave the
+	 * panel dark while the gate waits out an extra period.
 	 */
-	if (quiet_ns >= (uint64_t)(n + 1) * period_ns) {
+	const uint64_t stall_ns = (part >= 2)
+	                              ? (uint64_t)n * period_ns + period_ns / 4
+	                              : (uint64_t)(n + 1) * period_ns;
+	if (quiet_ns >= stall_ns) {
 		return since_rp_ns >= (period_ns * 9) / 10;
 	}
 
@@ -378,7 +385,16 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 			slips++;
 		}
 	}
-	const uint32_t shed = slips / 3;
+	/*
+	 * No shed under the partition: the governor exists to catch repaints
+	 * DISPLACING app frames, and the partition excludes that channel by
+	 * construction (the runtime paces the app; commits are phase-locked).
+	 * A slipped interval there means the app missed its own slot — and
+	 * then repaints are exactly what keeps the panel fed; shedding them
+	 * collapses the display for nothing (measured: panel at ~19/s while
+	 * the governor shed against self-inflicted "slips").
+	 */
+	const uint32_t shed = (part >= 2) ? 0 : slips / 3;
 	const uint32_t budget = (n - 1) > shed ? (n - 1) - shed : 0;
 
 	// Steady state: the governed budget of repaints per app frame...

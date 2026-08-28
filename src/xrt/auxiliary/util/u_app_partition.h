@@ -78,11 +78,18 @@ struct u_app_partition
  * — this sleeps up to D-1 panel periods, and the repaint loop must keep
  * weaving underneath it.
  *
- * Scheduling: releases are one divisor-stride apart, anchored to the
- * first call. An app that runs slower than its slot (heavy frame,
- * debugger, hitch) does not accumulate a backlog — missed slots are
- * skipped and the schedule re-anchors, so the app is never released
- * into a burst.
+ * Scheduling: releases sit on a FIXED GRID of divisor-strides anchored
+ * at the first call — never re-anchored. This is load-bearing: the
+ * first partition cut re-anchored on overrun, and on tiers whose
+ * present blocks on vsync the app's cycle (its own pacing + the vsync
+ * quantization) ran just past the stride, so every frame re-anchored
+ * and the schedule SLID — the app measured 14/s against a 20/s
+ * schedule (70 ms cycles: ~50 ms of app-side pacing + a 16.7 ms vsync
+ * snap) while the non-blocking bridge tier held 20.0 exactly. On a
+ * fixed grid a late app is released immediately and the NEXT release
+ * is the next grid slot, so the phase holds and the app converges back
+ * onto its slots instead of free-running at cycle + stride. Missed
+ * slots are skipped in O(1), never bursted.
  */
 static inline void
 u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns)
@@ -95,7 +102,7 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns)
 	uint64_t now_ns = os_monotonic_get_ns();
 
 	if (p->next_release_ns == 0) {
-		// First frame passes immediately; the schedule anchors here.
+		// First frame passes immediately; the grid anchors here.
 		p->next_release_ns = now_ns + stride_ns;
 		if (!p->logged) {
 			p->logged = 1;
@@ -115,10 +122,13 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns)
 		now_ns = os_monotonic_get_ns();
 	}
 
-	p->next_release_ns += stride_ns;
-	if (p->next_release_ns <= now_ns) {
-		// The app overran its slot: skip the missed release(s), never burst.
-		p->next_release_ns = now_ns + stride_ns;
+	// Advance to the next GRID slot strictly after now — phase preserved,
+	// missed slots skipped in one step, no burst, no re-anchor.
+	if (now_ns >= p->next_release_ns) {
+		const uint64_t behind = now_ns - p->next_release_ns;
+		p->next_release_ns += (behind / stride_ns + 1) * stride_ns;
+	} else {
+		p->next_release_ns += stride_ns;
 	}
 }
 

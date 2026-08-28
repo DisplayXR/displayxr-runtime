@@ -1352,12 +1352,9 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	// #1257 partition: report the app's honest frame period (see wait_frame).
-	{
-		const uint32_t part_d = u_app_partition_divisor();
-		*out_predicted_display_period_ns =
-		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
-	}
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
+	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
 
@@ -1432,11 +1429,15 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
-	// Under the partition the app's frames genuinely display for D panel
-	// periods (repaints re-weave the same atlas in between) — report the
-	// honest period so animation deltas stay correct.
-	const uint32_t part_d = u_app_partition_divisor();
-	*out_predicted_display_period_ns = (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period.
+	// Reporting the stretched period made well-behaved apps pace themselves
+	// by it ON TOP of the wait_frame throttle; with a vsync-blocking present
+	// the two stacked into ~(stride + period) cycles and the app slid off
+	// its slots (measured: 14/s against a 20/s schedule on this tier, while
+	// the non-blocking bridge held 20.0). Pacing lives in exactly one place
+	// — the throttle — and animation steps by predictedDisplayTime deltas,
+	// which stride honestly under the partition.
+	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
 	// xrWaitFrame calls, and CTS enforces it. The old period*2 constant

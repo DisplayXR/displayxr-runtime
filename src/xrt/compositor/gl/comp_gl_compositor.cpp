@@ -1984,14 +1984,10 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = now_ns + period_ns / 2;
 	*out_predicted_display_time_ns = now_ns + period_ns;
-	// #1257 partition: the app's frames genuinely display for D panel
-	// periods (repaints re-weave the same atlas in between) — report the
-	// honest period so animation deltas stay correct.
-	{
-		const uint32_t part_d = u_app_partition_divisor();
-		*out_predicted_display_period_ns =
-		    (part_d >= 2) ? period_ns * (int64_t)part_d : period_ns;
-	}
+	// #1257 partition: panel period on purpose — reporting D x period made
+	// apps pace themselves on top of the throttle (double pacing); pacing
+	// lives in the throttle alone.
+	*out_predicted_display_period_ns = period_ns;
 
 	return XRT_SUCCESS;
 }

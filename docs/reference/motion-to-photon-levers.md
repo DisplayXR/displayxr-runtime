@@ -112,8 +112,13 @@ until the app's next slot, releasing the app every Dth vblank; the repaint loop 
 other D−1 slots per frame with a **known** N=D schedule (no cadence estimation, so the
 output cadence is steady — the visual requirement) and commits are phase-locked to the
 runtime's own schedule, so the fire/commit collision that sank the gap-filling variants
-never exists by construction. The app is told the truth: `predictedDisplayPeriod` reports
-D × panel period. Measured precursors (the FORCE probe, which is this mechanism minus the
+never exists by construction. Pacing lives in the throttle **alone**: `predictedDisplayPeriod`
+deliberately stays the panel period (reporting D × period made well-behaved apps pace
+themselves on top of the throttle — double pacing; on vsync-blocking tiers the app slid
+off its slots to cycle + stride, measured 14/s on a 20/s schedule), and animation steps
+by `predictedDisplayTime` deltas, which stride honestly. Releases sit on a fixed grid —
+never re-anchored — so a late app converges back onto its slots. Measured precursors
+(the FORCE probe, which is this mechanism minus the
 deliberate release): render-30/weave-60 on Arc at −9.5 GPU pts "really crisp"; Unity
 iGPU-pinned at −14.5 GPU pts with the display rate untouched — and it paces runtime-side,
 so it works where an app-side cap (`targetFrameRate`) is box-dependent. The repaint
