@@ -3542,7 +3542,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// the app SLOWER (it is meant to) — it is a correctness probe, never a
 		// perf setting.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -3550,7 +3550,13 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// Pace to the panel BEFORE taking the lock — this blocks for up to a
 		// few periods, and holding the lock across it would stall an arriving
 		// app frame for exactly that long.
-		comp_d3d12_target_repaint_pace(c->target);
+		// #1257 partition: SKIPPED under the partition — this pacer is for
+		// occasional repaints and its multi-period blocks were the measured
+		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
+		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
+		if (u_app_partition_divisor() < 2) {
+			comp_d3d12_target_repaint_pace(c->target);
+		}
 
 		std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -3569,7 +3575,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
 		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
 			continue;
 		}

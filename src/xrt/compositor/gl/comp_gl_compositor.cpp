@@ -4015,7 +4015,7 @@ gl_repaint_thread(void *ptr)
 		// app cadence is stable and slow, the legacy 2-period constant
 		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			continue;
 		}
 
@@ -4030,7 +4030,7 @@ gl_repaint_thread(void *ptr)
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
 		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}

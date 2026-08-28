@@ -4128,7 +4128,7 @@ vk_repaint_thread(void *ptr)
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
@@ -4194,10 +4194,16 @@ vk_repaint_thread(void *ptr)
 		// replay would use belongs to the generation sampled here.
 		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
 
-		const uint64_t pace_t0 = os_monotonic_get_ns();
-		comp_vk_native_target_repaint_pace(tgt);
-		const uint64_t pace_t1 = os_monotonic_get_ns();
-		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots (measured on d3d12: fill at ~8/s). Under
+		// the partition the grid IS the pacing; skip it.
+		if (u_app_partition_divisor() < 2) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
+			comp_vk_native_target_repaint_pace(tgt);
+			const uint64_t pace_t1 = os_monotonic_get_ns();
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		}
 
 		os_mutex_lock(&c->mutex);
 
@@ -4223,7 +4229,7 @@ vk_repaint_thread(void *ptr)
 		// `quiet < period` floor; the #1257 adaptive window opens at half a
 		// period, which that floor would kill.)
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;

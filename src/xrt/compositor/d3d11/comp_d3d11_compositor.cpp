@@ -2723,14 +2723,20 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// app cadence is stable and slow, the legacy 2-period constant
 		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots. Under the partition the grid IS the
+		// pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		comp_d3d11_target_repaint_pace(c->target);
+		if (u_app_partition_divisor() < 2) {
+			comp_d3d11_target_repaint_pace(c->target);
+		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 
@@ -2749,7 +2755,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
 		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
