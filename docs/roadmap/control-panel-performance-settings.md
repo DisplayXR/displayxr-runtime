@@ -1,6 +1,6 @@
 # Runtime performance settings in the Control Panel — census + design
 
-> **Status: DESIGN ONLY.** Nothing here is implemented. This doc answers "can the
+> **Status: Phases 0 and 1 SHIPPED** (#1252); Phases 2-3 are still design. This doc answers "can the
 > runtime's performance levers be exposed as toggles in the DisplayXR Control Panel",
 > censuses every lever, and proposes the mechanism. Related: #378 (panel
 > architecture — *the GUI is dumb, `displayxr-cli` is the brain*), #793 (make the
@@ -147,6 +147,17 @@ the only manifest it embeds is `common/dpi_aware.manifest`. Today that is why
 `displayxr-cli dp use` reports *"run from an elevated terminal (HKLM needs admin)"*
 (`cli_cmd_dp.c:124-129`). The per-user file gives the panel a store it can actually write.
 
+**Only allow-listed names resolve from the stores — a safety property, not
+tidiness.** `u_setting_is_managed()` gates steps 2 and 3; an unmanaged name
+resolves from the environment alone, exactly as before. This exists because
+several `DXR_*` variables gate authorization rather than performance
+(`DXR_ALLOW_UNVERIFIED_CONTROLLER`), and wiring `get_option_raw` to a per-user
+file would otherwise have made every one of them settable from a GUI-writable
+file. `DXR_ALLOW_DEV_PLUGIN_PATHS` is doubly safe: it reads via
+`GetEnvironmentVariableW`, outside this machinery entirely. The list starts as
+exactly the six levers the three controls drive; extending it is a deliberate
+act, and the Tier-4 names below must never appear on it.
+
 **Robustness.** Parsed lazily, exactly once per process, behind `InitOnceExecuteOnce` /
 `pthread_once`. Every failure — file absent, unreadable, malformed, or a low-integrity /
 AppContainer process denied `%LOCALAPPDATA%` — returns "not found" silently and falls
@@ -246,12 +257,39 @@ process resolves the same chain. Three surfaces, in order of value:
 
 ## Phasing
 
-| Phase | Content | Ships value alone? |
+| Phase | Content | Status |
 |---|---|---|
-| **0** | Read-only effective state + provenance in `displayxr-cli info --json` and the panel. No behaviour change at all. | Yes — it fixes the misleading report described in §4 |
-| **1** | `u_setting` chain; Target GPU control; Compatibility preset | Yes |
-| **2** | Gated "Developer settings" list (Tier 1 + Tier 2, with provenance) | Yes |
-| **3** | Tier-2 live service settings over the existing `DIAG` IPC path | Yes |
+| **0** | GPU topology + provenance in `displayxr-cli info --json`, rendered by the panel. No behaviour change. | **SHIPPED** |
+| **1** | `u_setting` chain + allow-list; the three user controls; `displayxr-cli perf`; the anti-stale banner. | **SHIPPED** |
+| **2** | Gated "Developer settings" list (Tier 1 + Tier 2, with provenance). Wants the panel on **tabs** first — it is nine sections in one scroll column now, and at 250 % DPI you see about a third of it. | design |
+| **3** | Tier-2 live service settings over the existing `DIAG` IPC path. | design |
+
+### The three controls, as shipped
+
+Deliberately three, not one dropdown: they are unrelated axes, and folding them
+together produces a combinatorial menu that is both larger and less clear. There
+is **no quality-versus-performance dial** in this runtime — the defaults *are*
+the tuned configuration — so a Quality/Balanced/Performance menu would be
+fiction.
+
+| Control | Levers | Notes |
+|---|---|---|
+| **Target GPU** — Auto / Panel's display adapter / High performance / Power saving | `DXR_D3D_FORCE_GPU` + `DXR_VK_FORCE_GPU` | Hidden entirely on single-adapter boxes; there is nothing to choose. A documented supported contract (#845) |
+| **Mode** — Balanced / Compatibility | `DXR_WEAVE_ON_SCANOUT=0` + `DXR_WEAVE_REPAINT=0` | Both change **what the display processor is asked to do**, which is where compatibility problems actually live |
+| **Diagnostics** — Off / On | `DXR_FRAME_WITNESS=5` + `DXR_FRAME_STAGE_TIMING=1` | Pure observers; they change no behaviour, which is what makes them safe to hand a user |
+
+**`DXR_LATE_WEAVE` is deliberately *not* in the Compatibility bundle.** It only
+changes *when* we present on our own swapchain, it already self-disables where
+the platform gives no present-timing feedback ("dormant rather than wrong"), and
+it is the single largest latency win we have (96 → 17 ms on VK). Bundling it
+would charge every Compatibility click a ~5× latency regression on the lever
+least likely to be the culprit. It belongs in the Phase-2 developer list, for
+bisecting.
+
+Compatibility mode is **derived from the resolved lever values**, not stored as
+its own key: a preset that stored its own name would drift from what the levers
+say the moment anything else wrote one of them. Deriving it means the UI can
+never claim a mode the runtime is not in, and "Custom" falls out for free.
 
 ---
 

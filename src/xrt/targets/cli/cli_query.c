@@ -27,6 +27,7 @@
 
 #include "os/os_display_edid.h"
 #include "util/u_git_tag.h"
+#include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h" // #1201 DPI awareness reporting
 #endif
@@ -191,7 +192,8 @@ luid_label(uint64_t packed, char *buf, size_t cap);
 static void
 describe_service_split(struct cli_query_result *r)
 {
-	const char *ing = getenv("DXR_SPLIT_INGRESS");
+	char ing_buf[64];
+	const char *ing = u_setting_get_raw("DXR_SPLIT_INGRESS", ing_buf, sizeof(ing_buf), NULL);
 	const bool staged = ing != NULL && strcmp(ing, "staged") == 0;
 	snprintf(r->gpu_split_ingress, sizeof(r->gpu_split_ingress), "%s%s", staged ? "staged" : "adaptive",
 	         (ing != NULL && ing[0] != '\0') ? "" : " (default)");
@@ -269,9 +271,15 @@ describe_service_ingest(
 	 * enough — observed while testing this line), and a report that says
 	 * "FORCED" for an override that did not take is worse than no report.
 	 */
-	const char *force = getenv("DXR_D3D_FORCE_GPU");
+	// #1252: "was it set" now spans the whole settings chain, not just getenv —
+	// otherwise a value set from the Control Panel would read as unset here.
+	// The provenance the resolver returned names the source it actually used
+	// ("env-forced:" / "user-forced:" / "machine-forced:"), so match the shared
+	// "-forced" suffix rather than one specific source.
+	char force_buf[64];
+	const char *force = u_setting_get_raw("DXR_D3D_FORCE_GPU", force_buf, sizeof(force_buf), NULL);
 	const bool env_set = force != NULL && force[0] != '\0';
-	const bool honoured = strncmp(r->gpu_ingest_provenance, "env-forced", 10) == 0;
+	const bool honoured = strstr(r->gpu_ingest_provenance, "-forced") != NULL;
 	char lb[32];
 	snprintf(r->gpu_service_ingest, sizeof(r->gpu_service_ingest),
 	         "service ingest: '%s' LUID=%s (%s) — the adapter clients must share (ADR-037 §7)%s%s%s",
@@ -353,11 +361,17 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 {
 	r->gpu_probed = true;
 
-	const char *env = getenv("DXR_WEAVE_ON_SCANOUT");
+	// #1252: through the settings chain, not getenv alone — otherwise this
+	// report would disagree with what the runtime does the moment anyone sets
+	// the lever from the Control Panel instead of the environment.
+	char weave_buf[64];
+	enum u_setting_source weave_src = U_SETTING_SOURCE_DEFAULT;
+	const char *env = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", weave_buf, sizeof(weave_buf), &weave_src);
 	r->gpu_weave_env_set = env != NULL && env[0] != '\0';
 	if (r->gpu_weave_env_set) {
 		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
 	}
+	snprintf(r->gpu_weave_source, sizeof(r->gpu_weave_source), "%s", u_setting_source_str(weave_src));
 	// Answered from the env alone here, so every early return below still
 	// reports it; re-stated at the end once the topology is known.
 	describe_service_split(r);
@@ -507,6 +521,54 @@ read_plugin_version_from_registry(const char *id, char *out, size_t cap)
 	RegCloseKey(key);
 }
 #endif
+
+/*!
+ * #1252 — resolve every allow-listed performance setting through the same chain
+ * the runtime uses, recording where each value came from.
+ *
+ * The provenance is the point. Without it a reader cannot tell a value that is
+ * merely this process's environment (and therefore says nothing about any other
+ * process) from one in the per-user or machine store (which every app on the
+ * box will see). Flattening those two into "the current value" is exactly the
+ * trap `docs/roadmap/control-panel-performance-settings.md` is about.
+ *
+ * Platform-independent on purpose — it sits outside the Windows-only block
+ * above, because the per-user store works everywhere the runtime does.
+ */
+static void
+collect_settings(struct cli_query_result *r)
+{
+	r->setting_count = 0;
+
+	char path[512];
+	if (u_setting_user_path(path, sizeof(path))) {
+		snprintf(r->settings_user_file, sizeof(r->settings_user_file), "%s", path);
+	}
+	char written[32];
+	if (u_setting_user_written(written, sizeof(written)) != NULL) {
+		snprintf(r->settings_user_written, sizeof(r->settings_user_written), "%s", written);
+	}
+
+	uint32_t n = u_setting_managed_count();
+	for (uint32_t i = 0; i < n && r->setting_count < CLI_MAX_SETTINGS; i++) {
+		const char *name = u_setting_managed_name(i);
+		if (name == NULL) {
+			continue;
+		}
+		struct cli_setting_row *row = &r->settings[r->setting_count++];
+		memset(row, 0, sizeof(*row));
+		snprintf(row->name, sizeof(row->name), "%s", name);
+
+		char buf[128];
+		enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+		const char *val = u_setting_get_raw(name, buf, sizeof(buf), &src);
+		if (val != NULL && val[0] != '\0') {
+			snprintf(row->value, sizeof(row->value), "%s", val);
+			row->set = true;
+		}
+		snprintf(row->source, sizeof(row->source), "%s", u_setting_source_str(src));
+	}
+}
 
 //! Human label for an xrt_display_claim_confidence value.
 static const char *
@@ -1007,6 +1069,11 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	}
 	r->display_info = info;
 	r->display_info_ok = true;
+
+	// #1252 — the allow-listed performance settings, resolved through the same
+	// chain the runtime uses. Platform-independent, and deliberately BEFORE the
+	// GPU probe so it is reported even where that probe does not run.
+	collect_settings(r);
 
 	// #918 — GPU topology. Runs BEFORE the dims check so a box with a
 	// half-broken plug-in still gets its adapter list dumped; the scanout
@@ -1671,19 +1738,58 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddStringToObject(ig, "provenance", r->gpu_ingest_provenance);
 			cJSON_AddStringToObject(ig, "line", r->gpu_service_ingest);
 
-			cJSON *ev = cJSON_AddObjectToObject(g, "env_scoped");
-			cJSON_AddStringToObject(ev, "scope",
-			                        "Read from THIS process's environment (displayxr-cli's). True of a "
-			                        "process launched the same way — NOT of a running app or of the "
-			                        "DisplayXR service, whose environments this process cannot see.");
-			cJSON_AddBoolToObject(ev, "weave_on_scanout_set", r->gpu_weave_env_set);
+			// Derived from the topology AND the resolved kill switch, so it
+			// lives here rather than under `performance`. `weave_on_scanout`
+			// carries its own source: "env" means this process's environment
+			// and says nothing about another process, while "user"/"machine"
+			// are shared and do describe what other apps will see.
+			cJSON *sp = cJSON_AddObjectToObject(g, "split");
+			cJSON_AddBoolToObject(sp, "weave_on_scanout_set", r->gpu_weave_env_set);
 			if (r->gpu_weave_env_set) {
-				cJSON_AddStringToObject(ev, "weave_on_scanout", r->gpu_weave_env);
+				cJSON_AddStringToObject(sp, "weave_on_scanout", r->gpu_weave_env);
 			} else {
-				cJSON_AddNullToObject(ev, "weave_on_scanout");
+				cJSON_AddNullToObject(sp, "weave_on_scanout");
 			}
-			cJSON_AddStringToObject(ev, "split_ingress", r->gpu_split_ingress);
-			cJSON_AddStringToObject(ev, "service_split", r->gpu_service_split);
+			cJSON_AddStringToObject(sp, "weave_on_scanout_source", r->gpu_weave_source);
+			cJSON_AddStringToObject(sp, "ingress", r->gpu_split_ingress);
+			cJSON_AddStringToObject(sp, "service_split", r->gpu_service_split);
+		}
+	}
+
+	/*
+	 * #1252 — the allow-listed performance settings, resolved through the same
+	 * chain the runtime uses (env > per-user file > machine default). This is
+	 * what the Control Panel's three controls read and write.
+	 *
+	 * Every row carries its `source`, and consumers must not drop it: a value
+	 * sourced from `env` is a property of THIS process and says nothing about
+	 * any other, while `user` / `machine` / `default` are machine-wide.
+	 */
+	{
+		cJSON *pf = cJSON_AddObjectToObject(root, "performance");
+		cJSON_AddStringToObject(pf, "note",
+		                        "Resolved as a process starting now would resolve it: environment first, "
+		                        "then the per-user file, then the machine default. A row whose source is "
+		                        "\"env\" reflects THIS process's environment only.");
+		cJSON_AddStringToObject(pf, "user_file", r->settings_user_file);
+		if (r->settings_user_written[0] != '\0') {
+			cJSON_AddStringToObject(pf, "user_written", r->settings_user_written);
+		} else {
+			cJSON_AddNullToObject(pf, "user_written");
+		}
+
+		cJSON *arr = cJSON_AddArrayToObject(pf, "levers");
+		for (uint32_t i = 0; i < r->setting_count; i++) {
+			const struct cli_setting_row *row = &r->settings[i];
+			cJSON *o = cJSON_CreateObject();
+			cJSON_AddStringToObject(o, "name", row->name);
+			if (row->set) {
+				cJSON_AddStringToObject(o, "value", row->value);
+			} else {
+				cJSON_AddNullToObject(o, "value");
+			}
+			cJSON_AddStringToObject(o, "source", row->source);
+			cJSON_AddItemToArray(arr, o);
 		}
 	}
 

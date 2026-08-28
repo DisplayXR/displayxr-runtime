@@ -83,6 +83,22 @@ enum cli_selftest_result
 //! Hardware adapters reported by the GPU-topology probe (#918).
 #define CLI_MAX_GPU_ADAPTERS 8
 
+//! Room for every allow-listed name in @ref u_setting (#1252), with headroom.
+#define CLI_MAX_SETTINGS 32
+
+/*!
+ * One allow-listed performance setting, resolved exactly as a process starting
+ * now would resolve it (#1252).
+ */
+struct cli_setting_row
+{
+	char name[64];
+	char value[128]; //!< Empty when nothing set it.
+	bool set;
+	//! "env" / "user" / "machine" / "default" — see @ref u_setting_source_str.
+	char source[16];
+};
+
 /*!
  * One hardware DXGI adapter, as reported by the #918 GPU-topology probe.
  * Software adapters (WARP / Basic Render Driver) are skipped.
@@ -277,8 +293,12 @@ struct cli_query_result
 	char gpu_verdict[192]; //!< the one-line verdict, reused verbatim by selftest.
 	bool gpu_weave_env_set;
 	//! DXR_WEAVE_ON_SCANOUT value when set. Since #918 Phase 3 this is a KILL
-	//! SWITCH, not an opt-in — unset means the split is allowed.
+	//! SWITCH, not an opt-in — unset means the split is allowed. Since #1252 it
+	//! is resolved through the settings chain, not `getenv` alone, so it agrees
+	//! with what the runtime will actually do; `gpu_weave_source` says where it
+	//! came from.
 	char gpu_weave_env[64];
+	char gpu_weave_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and
@@ -305,6 +325,22 @@ struct cli_query_result
 	char gpu_ingest_provenance[64]; //!< which rule decided ("most VRAM", "env-forced: scanout", …).
 	char gpu_service_ingest[224];   //!< the composed one-liner both serializers print.
 	char gpu_note[128];             //!< why the probe could not answer, when it could not.
+
+	/*!
+	 * #1252 — the allow-listed performance settings, resolved through the same
+	 * chain (env > per-user file > machine default) the runtime itself uses, so
+	 * this report says what a process starting now would actually get rather
+	 * than only what this process's environment holds.
+	 *
+	 * A row whose `source` is `"env"` came from THIS process's environment and
+	 * says nothing about any other process; `"user"` / `"machine"` / `"default"`
+	 * are machine-wide and do describe what another app will see. The Control
+	 * Panel renders that distinction rather than flattening it.
+	 */
+	uint32_t setting_count;
+	struct cli_setting_row settings[CLI_MAX_SETTINGS];
+	char settings_user_file[512];   //!< Path of the per-user store (may not exist).
+	char settings_user_written[32]; //!< ISO date it was last written, or empty.
 
 	/*!
 	 * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` reachable by the Vulkan

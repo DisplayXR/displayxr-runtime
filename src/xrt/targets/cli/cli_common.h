@@ -26,6 +26,10 @@ cli_cmd_selftest(int argc, const char **argv);
 int
 cli_cmd_dp(int argc, const char **argv);
 
+//! `perf` - read/write the persisted performance settings (#1252).
+int
+cli_cmd_perf(int argc, const char **argv);
+
 int
 cli_cmd_input(int argc, const char **argv);
 

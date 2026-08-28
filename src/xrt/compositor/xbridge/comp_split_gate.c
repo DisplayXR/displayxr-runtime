@@ -8,6 +8,8 @@
 
 #include "comp_split_gate.h"
 
+#include "util/u_setting.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -49,7 +51,13 @@ comp_split_gate_env_requested(void)
 {
 	static int enabled = -1;
 	if (enabled < 0) {
-		enabled = comp_split_gate_parse_requested(getenv("DXR_WEAVE_ON_SCANOUT")) ? 1 : 0;
+		// #1252: resolved through the settings chain (env > per-user >
+		// machine), but still handed to THIS file's parser — the leading-
+		// character test below is deliberately not debug_string_to_bool, and
+		// centralising the parse would silently change what "off" means here.
+		char buf[64];
+		const char *v = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", buf, sizeof(buf), NULL);
+		enabled = comp_split_gate_parse_requested(v) ? 1 : 0;
 	}
 	return enabled == 1;
 }

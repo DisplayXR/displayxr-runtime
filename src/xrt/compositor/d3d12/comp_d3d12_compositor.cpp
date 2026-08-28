@@ -29,6 +29,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -5011,7 +5012,10 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// DP frame and is inert until then, so starting it here (before the display
 	// processor exists) is safe.
 	{
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: settings chain (env > per-user > machine) — the Control
+		// Panel's Compatibility mode turns this off. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), nullptr);
 		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;

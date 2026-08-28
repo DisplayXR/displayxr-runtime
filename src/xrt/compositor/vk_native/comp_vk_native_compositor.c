@@ -36,6 +36,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -6148,7 +6149,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * The loop is gated on actually having one of the two, not merely on
 		 * the env var.
 		 */
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: settings chain (env > per-user > machine) — the Control
+		// Panel's Compatibility mode turns this off. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), NULL);
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 
 		/*

@@ -94,6 +94,8 @@ add_library(
 	u_sandbox.h
 	u_session.c
 	u_session.h
+	u_setting.c
+	u_setting.h
 	u_space_overseer.c
 	u_space_overseer.h
 	u_string_list.cpp
