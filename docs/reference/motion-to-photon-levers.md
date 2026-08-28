@@ -73,17 +73,21 @@ quantized to period multiples, so honest jitter reads 12–23 ms on a metronomic
 repaints presented late in the gap steal the app's own FIFO queue slot — inflating the
 jitter the gate was reading (a feedback loop). Since #1257 the gate (`u_repaint_gate.h`)
 estimates the cadence in vblank counts — "the app presents every N vblanks", via a
-mode-majority / coherent-mean ladder over round(interval/period) — and gives each app
-frame a **budget of N−1 repaints**, one per missed vblank, spaced ~a period apart and
-scheduled clear of the *earliest plausible* next commit (a displaced commit arrives a
-vblank early). A **closed-loop governor** sheds budget by the ring's own slipped-interval
-count: if repaints still displace app frames, the feature backs itself off until the app
-holds its target rate — repaints that trade away app frames make the panel fresher but the
-content staler, which is worse than doing nothing. An app whose predicted frame goes a
-full period overdue is hitching, not pacing — the gate then falls open at panel-rate
-spacing (the original #868 case). Without a trusted cadence (startup, erratic app, N = 1 —
-e.g. the measured 46.7 fps case the old constant protected) it degrades to the legacy
-2-period behavior.
+mode-majority / coherent-mean ladder over round(interval/period) — and engages an adaptive
+window **at N = 2 only**: one repaint fills the one missed vblank, scheduled clear of the
+*earliest plausible* next commit (a displaced commit arrives a vblank early), with a
+closed-loop governor that sheds the budget whenever the ring records slipped app
+intervals. That is the measured ceiling: at N = 2 the win is clean (hz30: 0.0 → ~15-17
+repaints/s, app at full rate), while at **N ≥ 3 five schedule variants lost to the legacy
+gate on hardware** — multiple fires per gap collide with displaced-early commits, each
+~5 ms replay lock hold vsync-snaps into a 16.7 ms app slip, and the loop's own ticks
+starve on the convoy. N ≥ 3 therefore deliberately falls back to legacy; re-opening it
+requires shrinking the replay's lock hold (partial replay / present outside the lock), not
+another schedule (evidence chain: #1257). An app whose predicted frame goes a full period
+overdue is hitching, not pacing — the gate then falls open at panel-rate spacing (the
+original #868 case). Without a trusted cadence (startup, erratic app, N = 1 — e.g. the
+measured 46.7 fps case the old constant protected) it degrades to the legacy 2-period
+behavior.
 
 | Probe | Purpose |
 |---|---|

@@ -32,14 +32,16 @@
  *    coherent-mean ladder over round(interval / period) — immune to
  *    vsync quantization, to displaced-commit pairs, and to the
  *    feature's own perturbation (see u_repaint_gate_cadence_n).
- *  - When the cadence is trusted with N >= 2, each app frame gets a
- *    BUDGET of N-1 repaints — one per missed vblank, which is what the
- *    FIFO queue fills — spaced ~a period apart, opening at half a
- *    period of quiet and closing before the EARLIEST PLAUSIBLE next
- *    commit (a displaced commit arrives a vblank early). A repaint
- *    presented or lock-held past that lands where the app's next frame
- *    needs to be and costs the app a whole vblank (measured in rounds
- *    2 and 4 as weaves/s < presents/s + degraded cadence).
+ *  - When the cadence is trusted at N == 2 (the measured ceiling — see
+ *    the ledger note at the engagement site), the app frame gets a
+ *    budget of one repaint filling the one missed vblank via the FIFO
+ *    queue, opening at half a period of quiet and closing before the
+ *    EARLIEST PLAUSIBLE next commit (a displaced commit arrives a
+ *    vblank early). A repaint presented or lock-held past that lands
+ *    where the app's next frame needs to be and costs the app a whole
+ *    vblank (measured as weaves/s < presents/s + degraded cadence).
+ *    N >= 3 deliberately falls back to the legacy gate — five schedule
+ *    variants lost to it on hardware (#1257).
  *  - A closed-loop governor sheds budget by the ring's own slipped-
  *    interval count, so if repaints still displace app frames the
  *    feature backs itself off until the app holds its target rate —
@@ -288,7 +290,23 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 	// Trust decision (mode-majority / coherent-mean ladder) lives inside
 	// cadence_n — it returns 0 when there is no trusted cadence.
 	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
-	const bool engaged = g->mode != 2 && n >= 2;
+
+	/*
+	 * N == 2 ONLY — the measured ceiling (#1257, five schedule variants
+	 * on hardware). At N == 2 the adaptive window is a clean win: hz30
+	 * went from a structural dead zone (repaints/s exactly 0.0) to
+	 * ~15-17/s with the app holding full rate. At N >= 3 every variant
+	 * LOST to the legacy gate on both queue placements: the budget's
+	 * multiple fires per gap collide with displaced-early commits, each
+	 * ~5 ms lock hold vsync-snaps into a 16.7 ms app slip, the loop's
+	 * own ticks starve on the convoy (56-95 ticks/s vs 149-163 in the
+	 * same build's legacy run), and the shed/restore governor limit-
+	 * cycles instead of converging (its ~1 s restore equals the ring
+	 * window at the degraded rate). Re-opening N >= 3 requires shrinking
+	 * the replay's lock hold (partial replay / present outside the
+	 * lock), not another schedule. Full evidence chain: issue #1257.
+	 */
+	const bool engaged = g->mode != 2 && n == 2;
 
 	if (!engaged) {
 		// Legacy: only once the app has already missed a FULL refresh.
