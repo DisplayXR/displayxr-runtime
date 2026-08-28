@@ -1411,8 +1411,16 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 
 	// #1257 partition: block until the app's next slot BEFORE taking any
 	// lock — the repaint loop keeps weaving the other slots underneath
-	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier
+	// = the #918 split (d3d11 bridge) only — the measured config; the
+	// throttle refuses cleanly elsewhere (see u_app_partition.h).
+	{
+		bool part_tier_ok = false;
+#ifdef XRT_OS_WINDOWS
+		part_tier_ok = (c->split != NULL);
+#endif
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, part_tier_ok);
+	}
 
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
@@ -4066,8 +4074,10 @@ vk_repaint_thread(void *ptr)
 		 */
 		// #1257 partition: with a known fill schedule the window segments
 		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env —
+		// a refused tier keeps stock behavior.
 		const uint64_t tick_ns =
-		    (u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4;
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
 
 		os_mutex_lock(&c->mutex);
 		if (!c->weave_hand.pending) {
@@ -4101,7 +4111,8 @@ vk_repaint_thread(void *ptr)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns);
+			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
 		}
 
 		// #868 diag: where the loop actually goes. A repaint that never fires
@@ -4197,8 +4208,8 @@ vk_repaint_thread(void *ptr)
 		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
 		// it can block for periods, which throttles a grid fill to a
 		// fraction of its slots (measured on d3d12: fill at ~8/s). Under
-		// the partition the grid IS the pacing; skip it.
-		if (u_app_partition_divisor() < 2) {
+		// an ENGAGED partition the schedule IS the pacing; skip it.
+		if (c->repaint.partition.next_release_ns == 0) {
 			const uint64_t pace_t0 = os_monotonic_get_ns();
 			comp_vk_native_target_repaint_pace(tgt);
 			const uint64_t pace_t1 = os_monotonic_get_ns();

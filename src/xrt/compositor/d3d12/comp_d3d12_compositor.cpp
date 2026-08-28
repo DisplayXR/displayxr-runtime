@@ -2034,8 +2034,10 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	// #1257 partition: block until the app's next slot BEFORE the lock —
 	// the repaint loop keeps weaving the other slots underneath this
-	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. This in-process tier
+	// is UNSUPPORTED (fill loop tick starvation, #1257 follow-up) — the
+	// throttle refuses cleanly unless the bring-up env override is set.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -3501,7 +3503,8 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// refresh it matters for, rather than up to a full period late.
 		// #1257 partition: with a known fill schedule the window segments
 		// are only a few ms wide, so tick fine enough to land in them.
-		os_nanosleep((int64_t)((u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4));
+		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
+		                                                                   : period_ns / 4));
 
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
@@ -3554,7 +3557,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// occasional repaints and its multi-period blocks were the measured
 		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
 		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
-		if (u_app_partition_divisor() < 2) {
+		if (c->repaint.partition.next_release_ns == 0) {
 			comp_d3d12_target_repaint_pace(c->target);
 		}
 

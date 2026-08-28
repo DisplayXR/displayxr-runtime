@@ -336,7 +336,12 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 * Explicit DXR_WEAVE_REPAINT_GATE=legacy outranks everything.
 	 */
 	const uint32_t part = u_app_partition_divisor();
-	const bool part_on = part >= 2 && g->mode != 2;
+	// part_on requires the throttle to have actually ENGAGED (next_release
+	// set): on a tier where the throttle refused, the app runs unthrottled
+	// at panel rate and the partition fill must stay out of the way —
+	// single point of tier control, in the throttle.
+	const bool part_on =
+	    part >= 2 && g->mode != 2 && ps != NULL && ps->next_release_ns != 0;
 
 	/*
 	 * COMMIT-RELATIVE fill under the partition — deliberately, and the
@@ -352,10 +357,8 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 * inherit the true vblank phase and every window below inherits it
 	 * too. Do not rebuild an absolute grid without real vblank
 	 * timestamps (DXGI frame statistics / present feedback) as its
-	 * clock. @p ps stays in the signature for that future.
+	 * clock.
 	 */
-	(void)ps;
-
 	uint32_t votes = 0, have = 0;
 	uint32_t n;
 	bool engaged;
@@ -588,7 +591,8 @@ u_repaint_trace_report(struct u_repaint_trace *t,
                        uint64_t now_ns,
                        const char *site,
                        const struct u_repaint_gate *g,
-                       uint64_t period_ns)
+                       uint64_t period_ns,
+                       const struct u_app_partition *ps)
 {
 	if (t->enabled != 1) {
 		return;
@@ -605,7 +609,8 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	uint32_t votes = 0, have = 0;
 	uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
 	const uint32_t part = u_app_partition_divisor();
-	const bool part_on = part >= 2 && g->mode != 2;
+	const bool part_on =
+	    part >= 2 && g->mode != 2 && ps != NULL && ps->next_release_ns != 0;
 	uint32_t slips = 0, budget = 0;
 	// Mirror the ENGAGED path, not just the estimator — earlier revisions
 	// printed the estimator's numbers under the partition and twice sent

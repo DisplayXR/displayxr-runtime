@@ -2024,7 +2024,10 @@ gl_compositor_wait_frame(struct xrt_compositor *xc,
 			period_ns = (int64_t)(1000000000.0 / hz);
 		}
 #endif
-		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+		// This in-process tier is UNSUPPORTED (see u_app_partition.h) —
+		// the throttle refuses cleanly unless the bring-up override is set.
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns,
+		                         /*tier_supported=*/false);
 	}
 
 	int64_t wake, gpu_time;
@@ -3996,7 +3999,8 @@ gl_repaint_thread(void *ptr)
 
 		// #1257 partition: with a known fill schedule the window segments
 		// are only a few ms wide, so tick fine enough to land in them.
-		os_nanosleep((int64_t)((u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4));
+		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
+		                                                                   : period_ns / 4));
 		if (!os_thread_helper_is_running(&c->repaint_thread)) {
 			break;
 		}

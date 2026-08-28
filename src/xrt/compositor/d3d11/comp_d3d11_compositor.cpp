@@ -1007,8 +1007,11 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// #1257 partition: the exception to the note above — an EXPLICITLY
 	// requested app slow-down (DXR_APP_FRAME_DIVISOR >= 2). Blocks until
 	// the app's next slot BEFORE the lock; the repaint loop keeps weaving
-	// the other slots underneath this sleep. No-op when unset.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns);
+	// the other slots underneath this sleep. No-op when unset. This
+	// in-process tier is UNSUPPORTED (fill loop tick starvation, #1257
+	// follow-up) — the throttle refuses cleanly unless the bring-up env
+	// override is set.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -2700,8 +2703,9 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 
 		// #1257 partition: with a known fill schedule the window segments
 		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env.
 		const uint64_t tick_ns =
-		    (u_app_partition_divisor() >= 2) ? period_ns / 12 : period_ns / 4;
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
 		os_nanosleep((int64_t)tick_ns);
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
@@ -2711,7 +2715,8 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
@@ -2731,10 +2736,10 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 
 		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
 		// it can block for periods, which throttles a grid fill to a
-		// fraction of its slots. Under the partition the grid IS the
-		// pacing; skip it.
+		// fraction of its slots. Under an ENGAGED partition the schedule
+		// IS the pacing; skip it.
 		const uint64_t pace_t0 = os_monotonic_get_ns();
-		if (u_app_partition_divisor() < 2) {
+		if (c->repaint.partition.next_release_ns == 0) {
 			comp_d3d11_target_repaint_pace(c->target);
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();

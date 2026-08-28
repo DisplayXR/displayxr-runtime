@@ -118,6 +118,16 @@ themselves on top of the throttle — double pacing; on vsync-blocking tiers the
 off its slots to cycle + stride, measured 14/s on a 20/s schedule), and animation steps
 by `predictedDisplayTime` deltas, which stride honestly. Releases sit on a fixed grid —
 never re-anchored — so a late app converges back onto its slots. Measured precursors
+**Supported tier: the #918 split (d3d11 bridge / hybrid) only** — the acceptance record is
+steady 60.0 presents across long runs, exact weave/repaint pair, GPU 25.5→19.0%, and the
+eyeball verdicts "tracking is great no stutter very good experience" / "looks great this
+run". The in-process vk_native/d3d12/gl tiers **refuse the throttle cleanly** (app runs
+unthrottled) rather than collapse the panel: their fill loops tick at 100–175/s with
+17–19 ms intervals against the bridge's ~400/s at 1.8–2.3 ms — same build, same box — and
+cannot sustain the fill schedule. That tick starvation is the strongest single correlate
+in the whole dataset; the follow-up targets loop cadence (candidate: #1196 single-thread
+weave ownership), not schedule shape. `DXR_APP_FRAME_DIVISOR_ANY_TIER=1` re-enables those
+tiers for bring-up. Measured precursors
 (the FORCE probe, which is this mechanism minus the
 deliberate release): render-30/weave-60 on Arc at −9.5 GPU pts "really crisp"; Unity
 iGPU-pinned at −14.5 GPU pts with the display rate untouched — and it paces runtime-side,
