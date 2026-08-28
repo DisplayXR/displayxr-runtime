@@ -21,25 +21,33 @@
  * repaints/s = 0.0).
  *
  * This helper keeps the constant's INTENT — never compete with an
- * imminent app frame — but derives "imminent" from the app's measured
- * cadence instead:
+ * imminent app frame — but reasons in VBLANK COUNTS over the FIFO
+ * present queue instead of wall-clock margins (two measured rounds of
+ * ms-domain mean±jitter prediction failed; see u_repaint_gate_cadence_n
+ * and the #1257 issue thread):
  *
- *  - Per app frame it maintains an EMA of the inter-frame interval and
- *    of its jitter (single writer: the commit path).
- *  - When the cadence is STABLE and genuinely slow (interval >= 1.5
- *    periods — the same threshold the margin below implies), the window
- *    opens after ONE period of quiet (a vblank was truly missed) and
- *    closes half a period before the predicted next app frame, which
- *    covers the replay's own duration plus the race the old constant
- *    guarded against. One repaint per panel period at most, so the
- *    window fills missed vblanks instead of bunching at tick rate.
- *  - With no stable measurement (startup, jittery app, mode switch,
- *    a >1 s pause) it degrades to the legacy 2-period behavior, byte
- *    for byte — a near-panel-rate app never sees a difference.
+ *  - Per app frame it records the raw inter-frame interval in a small
+ *    ring (single writer: the commit path). The cadence is the MODE of
+ *    round(interval / period): "the app presents every N vblanks" —
+ *    immune to vsync quantization and to the feature's own perturbation.
+ *  - When N >= 2 with a 60% majority, each app frame gets a BUDGET of
+ *    N-1 repaints — one per missed vblank, which is what the FIFO queue
+ *    fills — spaced ~a period apart, opening at half a period of quiet
+ *    and closing a quarter period before the (N-1)-period queue
+ *    boundary. A repaint presented past that boundary lands in the slot
+ *    the app's next frame needs and pushes the app out a whole vblank
+ *    (measured in round 2 as weaves/s < presents/s + inflated jitter).
+ *  - If the app's predicted frame goes a full period overdue, the app
+ *    is hitching, not pacing — the gate falls OPEN at panel-rate
+ *    spacing (the original #868 use case; the steady window must never
+ *    close it).
+ *  - With no trusted cadence (startup, erratic app, a >1 s pause) it
+ *    degrades to the legacy 2-period behavior, byte for byte.
  *
  * DXR_WEAVE_REPAINT_GATE=legacy pins the old behavior for A/B runs.
  * DXR_WEAVE_REPAINT_FORCE=1 bypasses this gate entirely (unchanged —
  * the backends check it before consulting the gate).
+ * DXR_WEAVE_REPAINT_TRACE=1 emits the loop instrumentation below.
  *
  * Threading: on_app_frame is called only from the frame path,
  * note_repaint only from the repaint thread, open reads both — the
@@ -70,9 +78,12 @@ struct u_repaint_gate
 {
 	uint64_t last_app_frame_ns; //!< Stamp of the last REAL app frame.
 	uint64_t last_repaint_ns;   //!< Stamp of the last repaint (adaptive spacing only).
-	uint64_t interval_ema_ns;   //!< EMA of the app inter-frame interval.
-	uint64_t jitter_ema_ns;     //!< EMA of |interval - interval_ema|.
+	uint64_t interval_ema_ns;   //!< EMA of the app inter-frame interval (TRACE readout only).
+	uint64_t jitter_ema_ns;     //!< EMA of |interval - interval_ema| (TRACE readout only).
+	uint64_t recent_iv_ns[16];  //!< Ring of raw intervals; the gate buckets these per tick.
 	uint32_t samples;           //!< Interval samples since the last reset (capped).
+	uint8_t iv_head;            //!< Ring write position.
+	uint8_t fires_since_app;    //!< Repaints since the last app frame (budget = N-1).
 	int mode;                   //!< 0 = unprobed, 1 = adaptive, 2 = legacy (env-pinned).
 	bool adaptive_logged;       //!< One-shot "adaptive engaged" log.
 };
@@ -80,7 +91,7 @@ struct u_repaint_gate
 //! Intervals above this are an app pause / startup gap, not cadence — restart measurement.
 #define U_REPAINT_GATE_MAX_INTERVAL_NS (1000ull * 1000 * 1000)
 
-//! Samples required before the measured cadence is trusted.
+//! Ring samples required before the measured cadence is trusted.
 #define U_REPAINT_GATE_MIN_SAMPLES 8
 
 /*!
@@ -99,33 +110,90 @@ u_repaint_gate_on_app_frame(struct u_repaint_gate *g, uint64_t now_ns)
 			g->interval_ema_ns = 0;
 			g->jitter_ema_ns = 0;
 			g->samples = 0;
-		} else if (g->interval_ema_ns == 0) {
-			g->interval_ema_ns = iv;
-			g->jitter_ema_ns = 0;
-			g->samples = 1;
+			g->iv_head = 0;
 		} else {
-			const uint64_t ema = g->interval_ema_ns;
-			const uint64_t dev = iv > ema ? iv - ema : ema - iv;
-			// Alpha 1/8: settles in ~1 s at 20 Hz, still tracks a cap change.
-			g->interval_ema_ns = (uint64_t)((int64_t)ema + ((int64_t)iv - (int64_t)ema) / 8);
-			g->jitter_ema_ns =
-			    (uint64_t)((int64_t)g->jitter_ema_ns +
-			               ((int64_t)dev - (int64_t)g->jitter_ema_ns) / 8);
+			g->recent_iv_ns[g->iv_head] = iv;
+			g->iv_head = (uint8_t)((g->iv_head + 1) % 16);
 			if (g->samples < 255) {
 				g->samples++;
+			}
+			// EMA/jitter are kept ONLY for the trace row; nothing gates
+			// on them (see the vblank-count model in _open).
+			if (g->interval_ema_ns == 0) {
+				g->interval_ema_ns = iv;
+			} else {
+				const uint64_t ema = g->interval_ema_ns;
+				const uint64_t dev = iv > ema ? iv - ema : ema - iv;
+				g->interval_ema_ns =
+				    (uint64_t)((int64_t)ema + ((int64_t)iv - (int64_t)ema) / 8);
+				g->jitter_ema_ns =
+				    (uint64_t)((int64_t)g->jitter_ema_ns +
+				               ((int64_t)dev - (int64_t)g->jitter_ema_ns) / 8);
 			}
 		}
 	}
 	g->last_app_frame_ns = now_ns;
+	g->fires_since_app = 0;
 }
 
 /*!
- * Record that a repaint fired at @p now_ns (adaptive spacing key).
+ * Record that a repaint fired at @p now_ns (adaptive spacing + budget key).
  */
 static inline void
 u_repaint_gate_note_repaint(struct u_repaint_gate *g, uint64_t now_ns)
 {
 	g->last_repaint_ns = now_ns;
+	if (g->fires_since_app < 255) {
+		g->fires_since_app++;
+	}
+}
+
+/*!
+ * The app's cadence in VBLANK COUNTS: the mode (most common value) of
+ * round(interval / period) over the recent ring. Returns 0 when there is
+ * no trusted cadence; otherwise N >= 1 with @p out_votes / @p out_have
+ * saying how dominant it is.
+ *
+ * Why counts and not milliseconds: a present-capped app on a vsynced
+ * present path is QUANTIZED — its intervals are multiples of the panel
+ * period (measured at hz20: nominal 50 ms arriving as 33/50/67 mixes,
+ * "jitter" EMA 12-23 ms on a metronomic app). Any ms-domain mean±jitter
+ * model reads that as noise and strangles the window (#1257 round 2:
+ * adaptive 3.3/s vs legacy 9.5/s). The mode of the vblank count is
+ * immune to the quantization AND to the feature's own perturbation (a
+ * slipped frame votes N+1 without moving the mode).
+ */
+static inline uint32_t
+u_repaint_gate_cadence_n(const struct u_repaint_gate *g,
+                         uint64_t period_ns,
+                         uint32_t *out_votes,
+                         uint32_t *out_have)
+{
+	const uint32_t have = g->samples < 16 ? g->samples : 16;
+	*out_votes = 0;
+	*out_have = have;
+	if (have < U_REPAINT_GATE_MIN_SAMPLES || period_ns == 0) {
+		return 0;
+	}
+	uint32_t votes[10] = {0};
+	for (uint32_t i = 0; i < have; i++) {
+		uint64_t n = (g->recent_iv_ns[i] + period_ns / 2) / period_ns;
+		if (n < 1) {
+			n = 1;
+		}
+		if (n > 9) {
+			n = 9;
+		}
+		votes[n]++;
+	}
+	uint32_t best_n = 1;
+	for (uint32_t n = 2; n <= 9; n++) {
+		if (votes[n] > votes[best_n]) {
+			best_n = n;
+		}
+	}
+	*out_votes = votes[best_n];
+	return best_n;
 }
 
 /*!
@@ -147,54 +215,69 @@ u_repaint_gate_open(struct u_repaint_gate *g, uint64_t now_ns, uint64_t period_n
 	}
 
 	const uint64_t quiet_ns = now_ns - g->last_app_frame_ns;
+	const uint64_t since_rp_ns =
+	    (g->last_repaint_ns != 0 && now_ns > g->last_repaint_ns) ? now_ns - g->last_repaint_ns
+	                                                             : UINT64_MAX;
 
 	/*
-	 * Jitter narrows the window, it must not cliff the gate. The first
-	 * cut required `jitter * 6 < ema` for the adaptive branch, and the
-	 * hz20 verification run measured jitter 7.7 ms against a 48.3 ms
-	 * interval — 4% below the cliff — so the gate silently oscillated
-	 * between adaptive and legacy per tick and delivered exactly the
-	 * legacy rate (#1257 run 1 vs run 5: 8.4-9.4 vs 8.3-8.9). Worse, the
-	 * jitter is partly the feature's own doing (a replay holding the lock
-	 * delays a commit), which makes a jitter cliff a feedback loop.
-	 * Instead the measured jitter is added to the closing margin below:
-	 * noisy cadence = a narrower window, smoothly, never a mode flip.
+	 * Vblank-count model (see u_repaint_gate_cadence_n): the app presents
+	 * every N panel periods. The window and budget follow from the FIFO
+	 * present queue, not from wall-clock margins:
+	 *
+	 *  - The app's frame occupies one scanout slot; each repaint queued
+	 *    behind it fills the NEXT slot. N-1 repaints fill the N-1 missed
+	 *    vblanks exactly — a budget, not a rate.
+	 *  - A repaint PRESENTED after (N-1) periods lands in the slot the
+	 *    app's next frame needs, pushing the app out a whole vblank.
+	 *    That queue theft is what round 2 measured as weaves/s <
+	 *    presents/s AND as the inflated "jitter": the feature was
+	 *    displacing the very cadence it was predicting. So the window
+	 *    closes a quarter period (≈ one replay, measured 3.5-7.5 ms)
+	 *    before that boundary, and the budget caps the queue depth.
 	 */
-	const uint64_t ema = g->interval_ema_ns;
-	const bool stable = g->samples >= U_REPAINT_GATE_MIN_SAMPLES &&
-	                    ema >= period_ns + period_ns / 2; // genuinely slow: >= 1.5 periods
+	uint32_t votes = 0, have = 0;
+	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
+	const bool engaged = g->mode != 2 && n >= 2 && votes * 10 >= have * 6;
 
-	if (g->mode == 2 || !stable) {
+	if (!engaged) {
 		// Legacy: only once the app has already missed a FULL refresh.
 		return quiet_ns >= period_ns * 2;
 	}
 
-	// Adaptive: a vblank must actually have been missed...
-	if (quiet_ns < period_ns) {
+	/*
+	 * Stall branch: the app's predicted frame is a full period overdue —
+	 * it is hitching, not pacing. This is the case #868 exists for; the
+	 * steady-state window below must not close it (v1/v2 silently did).
+	 * Behaves like the legacy gate plus panel-rate spacing.
+	 */
+	if (quiet_ns >= (uint64_t)(n + 1) * period_ns) {
+		return since_rp_ns >= (period_ns * 9) / 10;
+	}
+
+	// Steady state: budget of N-1 repaints per app frame...
+	if (g->fires_since_app >= n - 1) {
 		return false;
 	}
-	// ...the predicted next app frame must be at least half a period out
-	// (covers the replay's duration and the lock race the legacy constant
-	// guarded against), plus the measured jitter so a frame arriving early
-	// still finds the lock free...
-	if (quiet_ns + period_ns / 2 + g->jitter_ema_ns >= ema) {
+	// ...not so early the eye pose would be staler than useful...
+	if (quiet_ns < period_ns / 2) {
 		return false;
 	}
-	// ...and at most ~one repaint per panel period, so a wide window fills
-	// its missed vblanks instead of firing at tick rate. 3/4 rather than a
-	// full period so a tick landing slightly late still fits the window's
-	// second vblank.
-	if (g->last_repaint_ns != 0 && now_ns > g->last_repaint_ns &&
-	    now_ns - g->last_repaint_ns < (period_ns * 3) / 4) {
+	// ...presented before the (N-1)-period queue boundary, minus a quarter
+	// period for the replay itself...
+	if (quiet_ns + period_ns / 4 >= (uint64_t)(n - 1) * period_ns) {
+		return false;
+	}
+	// ...and spaced ~a period apart so the queue fills one slot per vblank.
+	if (since_rp_ns < (period_ns * 9) / 10) {
 		return false;
 	}
 
 	if (!g->adaptive_logged) {
 		g->adaptive_logged = true;
-		U_LOG_W("#1257: repaint gate ADAPTIVE — app interval %.1f ms (jitter %.1f ms) is "
-		        "stable and slow; repainting after 1 missed vblank instead of 2 "
-		        "(DXR_WEAVE_REPAINT_GATE=legacy reverts)",
-		        (double)ema / 1e6, (double)g->jitter_ema_ns / 1e6);
+		U_LOG_W("#1257: repaint gate ADAPTIVE — app presents every %u vblanks "
+		        "(%u/%u votes); budget %u repaint(s) per app frame, presented clear of "
+		        "the app's own queue slot (DXR_WEAVE_REPAINT_GATE=legacy reverts)",
+		        n, votes, have, n - 1);
 	}
 	return true;
 }
@@ -306,7 +389,8 @@ static inline void
 u_repaint_trace_report(struct u_repaint_trace *t,
                        uint64_t now_ns,
                        const char *site,
-                       const struct u_repaint_gate *g)
+                       const struct u_repaint_gate *g,
+                       uint64_t period_ns)
 {
 	if (t->enabled != 1) {
 		return;
@@ -320,14 +404,16 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 		return;
 	}
 	const double secs = (double)elapsed / 1e9;
+	uint32_t votes = 0, have = 0;
+	const uint32_t n = u_repaint_gate_cadence_n(g, period_ns, &votes, &have);
 	U_LOG_W("#1257 trace site=%s: ticks/s=%.1f fires/s=%.1f tick_iv=%.2fms fire=%.2fms "
-	        "pace=%.2fms bail{armed=%u gate=%u race=%u} gate{mode=%s ema=%.1fms jit=%.1fms "
-	        "samples=%u}",
+	        "pace=%.2fms bail{armed=%u gate=%u race=%u} gate{mode=%s N=%u votes=%u/%u "
+	        "ema=%.1fms jit=%.1fms samples=%u}",
 	        site, (double)t->ticks / secs, (double)t->fires / secs,
 	        (double)t->tick_iv_ema_ns / 1e6, (double)t->fire_ema_ns / 1e6,
 	        (double)t->pace_ema_ns / 1e6, t->bail_armed, t->bail_gate, t->bail_race,
-	        g->mode == 2 ? "legacy" : "adaptive", (double)g->interval_ema_ns / 1e6,
-	        (double)g->jitter_ema_ns / 1e6, g->samples);
+	        g->mode == 2 ? "legacy" : "adaptive", n, votes, have,
+	        (double)g->interval_ema_ns / 1e6, (double)g->jitter_ema_ns / 1e6, g->samples);
 	t->ticks = 0;
 	t->fires = 0;
 	t->bail_armed = 0;

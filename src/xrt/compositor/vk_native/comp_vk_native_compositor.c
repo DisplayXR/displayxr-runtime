@@ -4080,7 +4080,7 @@ vk_repaint_thread(void *ptr)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate);
+			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns);
 		}
 
 		// #868 diag: where the loop actually goes. A repaint that never fires
@@ -4100,12 +4100,12 @@ vk_repaint_thread(void *ptr)
 			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
-		// #1257: interval-aware gate. Keyed on the last APP frame, never on
+		// #1257: cadence-aware gate. Keyed on the last APP frame, never on
 		// the last repaint — otherwise repaints pace off their own timestamps
-		// and free-run. With a stable measured app cadence the window opens
-		// after ONE missed vblank and closes before the predicted next app
-		// frame; otherwise it is the legacy fixed 2-period gate. See
-		// u_repaint_gate.h for the full design.
+		// and free-run. With a trusted vblank-count cadence (app presents
+		// every N vblanks) each app frame gets a budget of N-1 repaints,
+		// presented clear of the app's own queue slot; otherwise it is the
+		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 		if (c->repaint.force != 1 &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
@@ -4197,8 +4197,12 @@ vk_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+		// Re-run the gate under the lock: an app frame that landed while we
+		// paced resets its quiet key, so this is the race check. (Was a bare
+		// `quiet < period` floor; the #1257 adaptive window opens at half a
+		// period, which that floor would kill.)
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;

@@ -62,18 +62,24 @@ produces 15 atlases a second but the panel still gets ~60 correctly-phased weave
 
 A repaint replays *rendering state only* — it never touches app-owned state.
 
-**The quiet gate is interval-aware (#1257).** A repaint must never compete with an
-imminent app frame, and the loops originally enforced that with a fixed constant: repaint
-only after ≥ 2 panel periods of app silence. That constant made panel rate structurally
-unreachable for a present-capped app — at 20 Hz it forbids repainting the first missed
-vblank of *every* app frame (measured ceiling ~1 repaint/app frame instead of 2), and at
-30 Hz (interval = exactly 2 periods) the gate never opens at all (measured repaints/s
-0.0). Since #1257 the gate measures the app's inter-frame cadence (EMA + jitter,
-`u_repaint_gate.h`): when the cadence is stable and ≥ 1.5 periods, the repaint window
-opens after **one** missed vblank and closes half a period before the predicted next app
-frame, at most one repaint per panel period; when the cadence is unstable or near panel
-rate it degrades to the legacy 2-period behavior — a 46.7 fps app on a 60 Hz panel (the
-measured case the old constant protected) still never repaints.
+**The quiet gate is cadence-aware, in vblank counts (#1257).** A repaint must never
+compete with an imminent app frame, and the loops originally enforced that with a fixed
+constant: repaint only after ≥ 2 panel periods of app silence. That constant made panel
+rate structurally unreachable for a present-capped app — at 20 Hz it forbids repainting
+the first missed vblank of *every* app frame, and at 30 Hz (interval = exactly 2 periods)
+the gate never opens at all (measured repaints/s 0.0). Two rounds of ms-domain
+"EMA ± jitter" prediction also failed measurably: a vsynced capped app's intervals are
+quantized to period multiples, so honest jitter reads 12–23 ms on a metronomic app, and
+repaints presented late in the gap steal the app's own FIFO queue slot — inflating the
+jitter the gate was reading (a feedback loop). Since #1257 the gate (`u_repaint_gate.h`)
+estimates the cadence as the **mode of round(interval/period)** — "the app presents every
+N vblanks" — and gives each app frame a **budget of N−1 repaints**, one per missed vblank,
+spaced ~a period apart and presented clear of the (N−1)-period queue boundary so the app's
+next frame always finds its scanout slot free. An app whose predicted frame goes a full
+period overdue is hitching, not pacing — the gate then falls open at panel-rate spacing
+(the original #868 case). Without a trusted cadence (startup, erratic app, N = 1 — e.g.
+the measured 46.7 fps case the old constant protected) it degrades to the legacy 2-period
+behavior.
 
 | Probe | Purpose |
 |---|---|

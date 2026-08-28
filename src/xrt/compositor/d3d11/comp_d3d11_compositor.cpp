@@ -2693,7 +2693,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
-			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns);
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
@@ -2728,7 +2728,10 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_race++;
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;

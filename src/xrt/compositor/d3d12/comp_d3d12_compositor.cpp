@@ -3504,7 +3504,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// otherwise repaints would pace off their own timestamps and drift below
 		// panel rate. Their cadence comes from the scanout wait instead.
 		//
-		// #1257: the fixed margin became interval-aware. The old constant —
+		// #1257: the fixed margin became cadence-aware. The old constant —
 		// two periods, not one-and-a-bit — existed because an app whose
 		// interval merely straddles a period (measured: the Unity avatar at
 		// 46.7 fps on this 60 Hz panel, a 1.28-period interval) is about to
@@ -3513,11 +3513,12 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// panel rate unreachable for a present-capped app (hz20: the first
 		// missed vblank of EVERY app frame is unrepaintable; hz30: interval
 		// = exactly 2 periods, the gate never opens — measured repaints/s
-		// 0.0). u_repaint_gate keeps the intent by prediction instead: with
-		// a stable measured cadence >= 1.5 periods the window opens after
-		// ONE missed vblank and closes half a period before the predicted
-		// next app frame (the 46.7 fps case therefore still never repaints);
-		// without a stable measurement it IS the legacy 2-period constant.
+		// 0.0). u_repaint_gate keeps the intent in vblank counts instead:
+		// when the app provably presents every N vblanks, each app frame
+		// gets a budget of N-1 repaints presented clear of the app's own
+		// FIFO queue slot (the 46.7 fps case rounds to N=1 and therefore
+		// still never repaints); without a trusted cadence it IS the legacy
+		// 2-period constant.
 		//
 		// DXR_WEAVE_REPAINT_FORCE=1 bypasses the gate so the repaint path can be
 		// exercised on hardware where no app is slow enough to trip it. It makes
@@ -3548,7 +3549,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			c->repaint.bail_armed++;
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_race++;
 			continue;
 		}
