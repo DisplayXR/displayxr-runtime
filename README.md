@@ -167,7 +167,6 @@ table is regenerated daily from the live org, so this one is a convenience copy.
 | **Web** | |
 | [displayxr-browser](https://github.com/DisplayXR/displayxr-browser) | Developer-preview Chromium that weaves glasses-free inline 3D (Windows · Android) |
 | [displayxr-web](https://github.com/DisplayXR/displayxr-web) | Inline-3D web samples + the `@displayxr/inline3d` JS SDK |
-| [displayxr-gallery](https://github.com/DisplayXR/displayxr-gallery) | DisplayXR Gallery — social wall of 3D photography (feedback + bug reports) |
 | **Demos** | |
 | [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |
 | [displayxr-demo-modelviewer](https://github.com/DisplayXR/displayxr-demo-modelviewer) | glTF 2.0 PBR model viewer |
