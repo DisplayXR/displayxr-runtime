@@ -43,6 +43,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
 #include "util/u_capture_dims.h"
 #include "util/u_image_capture.h"
 #include "util/u_hud.h"
@@ -634,6 +635,9 @@ struct comp_d3d12_compositor
 		//! Gates the repaint so it only fires once the app has actually gone
 		//! quiet. Deliberately not touched by repaints — see the thread.
 		uint64_t last_app_frame_ns;
+
+		//! #1257 interval-aware quiet gate.
+		struct u_repaint_gate gate;
 
 		//! Diagnostics: where the loop goes, counted so a repaint that never
 		//! fires can be told apart from one that fires and does nothing.
@@ -3415,6 +3419,7 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// Only a real frame resets the quiet-gate; see d3d12_repaint_thread.
 	if (!is_repaint) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	// #672 diag: file-triggered WOVEN back-buffer capture (post-DP). Shows the
@@ -3499,22 +3504,28 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// otherwise repaints would pace off their own timestamps and drift below
 		// panel rate. Their cadence comes from the scanout wait instead.
 		//
-		// Two periods, not one-and-a-bit, and that margin is the whole design.
-		// An app whose interval merely straddles a period (measured: the Unity
-		// avatar at 46.7 fps on this 60 Hz panel, a 1.28-period interval) is
-		// about to submit anyway: by the time a repaint paces and takes the
-		// lock, the real frame has landed, so it bails having bought nothing —
-		// and on the ticks where it does not bail it is competing with the app
-		// for the same GPU to fill a gap that was closing on its own. The win
-		// only exists when a refresh is genuinely unclaimed, which is what
-		// >= 2 periods means. That is also exactly the case #868 is FOR: a
-		// 60 fps app on a 240 Hz panel sits at 4 periods.
+		// #1257: the fixed margin became cadence-aware. The old constant —
+		// two periods, not one-and-a-bit — existed because an app whose
+		// interval merely straddles a period (measured: the Unity avatar at
+		// 46.7 fps on this 60 Hz panel, a 1.28-period interval) is about to
+		// submit anyway: a repaint racing it steals the lock and the GPU to
+		// fill a gap that was closing on its own. But the same constant made
+		// panel rate unreachable for a present-capped app (hz20: the first
+		// missed vblank of EVERY app frame is unrepaintable; hz30: interval
+		// = exactly 2 periods, the gate never opens — measured repaints/s
+		// 0.0). u_repaint_gate keeps the intent in vblank counts instead:
+		// when the app provably presents every N vblanks, each app frame
+		// gets a budget of N-1 repaints presented clear of the app's own
+		// FIFO queue slot (the 46.7 fps case rounds to N=1 and therefore
+		// still never repaints); without a trusted cadence it IS the legacy
+		// 2-period constant.
 		//
 		// DXR_WEAVE_REPAINT_FORCE=1 bypasses the gate so the repaint path can be
 		// exercised on hardware where no app is slow enough to trip it. It makes
 		// the app SLOWER (it is meant to) — it is a correctness probe, never a
 		// perf setting.
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_gate++;
 			continue;
 		}
@@ -3538,7 +3549,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			c->repaint.bail_armed++;
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_race++;
 			continue;
 		}
@@ -3558,6 +3572,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		d3d12_dp_weave_and_present(c, true, nullptr);
 
 		c->repaint.count++;
+		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 		static bool logged = false;
 		if (!logged) {
 			logged = true;

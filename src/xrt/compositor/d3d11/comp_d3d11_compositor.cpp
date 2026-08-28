@@ -61,6 +61,7 @@
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_capture_dims.h"
+#include "util/u_repaint_gate.h"
 #include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -561,6 +562,8 @@ struct comp_d3d11_compositor
 		bool armed;   //!< Last frame was DP-woven and not zero-copy.
 		bool app_frame_in_progress; //!< layer_begin .. layer_commit.
 		uint64_t last_app_frame_ns;
+		struct u_repaint_gate gate;   //!< #1257 interval-aware quiet gate.
+		struct u_repaint_trace trace; //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
 		uint64_t count, ticks;
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -2661,6 +2664,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// would pace off their own timestamps and drift below panel rate.
 	if (!is_repaint) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	return true;
@@ -2686,18 +2690,33 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns);
+		}
+
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
+		// #1257: interval-aware gate — one missed vblank when the measured
+		// app cadence is stable and slow, the legacy 2-period constant
+		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
+		const uint64_t pace_t0 = os_monotonic_get_ns();
 		comp_d3d11_target_repaint_pace(c->target);
+		const uint64_t pace_t1 = os_monotonic_get_ns();
+		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 
+		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
 
 		// app_frame_in_progress is load-bearing and is NOT bypassed by the
@@ -2706,10 +2725,15 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			c->repaint.bail_race++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 
@@ -2790,6 +2814,9 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 
 		c->repaint.count++;
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;

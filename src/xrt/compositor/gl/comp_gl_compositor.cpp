@@ -45,6 +45,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
 #include "util/u_image_capture.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
@@ -356,6 +357,7 @@ struct comp_gl_compositor
 		bool armed;                  //!< False on zero-copy: the atlas IS the app's texture.
 		bool app_frame_in_progress;  //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;  //!< Quiet-gate key. Never touched by a repaint.
+		struct u_repaint_gate gate;  //!< #1257 interval-aware quiet gate.
 
 		//! The 2D-under backdrop the last app frame DEPOSITED. Reused, never
 		//! re-flattened — the flatten samples the app's Local2D textures.
@@ -3987,8 +3989,11 @@ gl_repaint_thread(void *ptr)
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			continue;
 		}
+		// #1257: interval-aware gate — one missed vblank when the measured
+		// app cadence is stable and slow, the legacy 2-period constant
+		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			continue;
 		}
 
@@ -4000,8 +4005,10 @@ gl_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns)) {
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4053,6 +4060,7 @@ gl_repaint_thread(void *ptr)
 #endif
 
 		c->repaint.count++;
+		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -4796,6 +4804,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 		// Only a REAL frame resets the quiet-gate.
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	// Cache eye positions AFTER process_atlas (which updates the SR weaver's

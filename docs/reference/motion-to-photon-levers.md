@@ -62,8 +62,40 @@ produces 15 atlases a second but the panel still gets ~60 correctly-phased weave
 
 A repaint replays *rendering state only* — it never touches app-owned state.
 
+**The quiet gate is cadence-aware, in vblank counts (#1257).** A repaint must never
+compete with an imminent app frame, and the loops originally enforced that with a fixed
+constant: repaint only after ≥ 2 panel periods of app silence. That constant made panel
+rate structurally unreachable for a present-capped app — at 20 Hz it forbids repainting
+the first missed vblank of *every* app frame, and at 30 Hz (interval = exactly 2 periods)
+the gate never opens at all (measured repaints/s 0.0). Two rounds of ms-domain
+"EMA ± jitter" prediction also failed measurably: a vsynced capped app's intervals are
+quantized to period multiples, so honest jitter reads 12–23 ms on a metronomic app, and
+repaints presented late in the gap steal the app's own FIFO queue slot — inflating the
+jitter the gate was reading (a feedback loop). Since #1257 the gate (`u_repaint_gate.h`)
+estimates the cadence in vblank counts — "the app presents every N vblanks", via a
+mode-majority / coherent-mean ladder over round(interval/period). An adaptive N = 2 window
+exists behind `DXR_WEAVE_REPAINT_GATE=adaptive` (one repaint fills the one missed vblank,
+governor-guarded) but is **not the default**: its perf win was real (hz30: 0.0 → ~15-17
+repaints/s) yet the trust ladder engages intermittently, the panel cadence breathes
+28-50 updates/s, and the eyeball verdict was judder — **the eye grades cadence stability,
+not average rate**; a steady 33 beats an oscillating 28-50. At **N ≥ 3 five schedule
+variants lost to the legacy gate on hardware** — fires collide with displaced-early
+commits, each ~5 ms replay lock hold vsync-snaps into a 16.7 ms app slip, and the loop's
+ticks starve on the convoy. The route to panel-rate weaving under a slow app is a **slot
+partition** (app every Nth vblank, repaints the rest — the app vsync-quantizes onto its
+own slots, so the fire/commit collision never exists by construction, and the schedule is
+steady, which is what the eye wants; this is why the FORCE probe succeeds where every
+gap-filling schedule failed, measured independently on Arc at −9.5 GPU pts "really crisp"
+and on Unity at −14.5 GPU pts with the display rate untouched). Evidence chain: #1257. An app whose predicted frame goes a full period
+overdue is hitching, not pacing — the gate then falls open at panel-rate spacing (the
+original #868 case). Without a trusted cadence (startup, erratic app, N = 1 — e.g. the
+measured 46.7 fps case the old constant protected) it degrades to the legacy 2-period
+behavior.
+
 | Probe | Purpose |
 |---|---|
+| `DXR_WEAVE_REPAINT_GATE=legacy` | Pin the pre-#1257 fixed 2-period quiet gate, for A/B. |
+| `DXR_WEAVE_REPAINT_TRACE=1` | One WARN row per ~5 s per loop: real tick cadence, replay/pace durations, per-gate bail counts (#1257 instrumentation). |
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 
