@@ -475,7 +475,7 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_predicted_scanou
  * coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_FRAME_TIMING.
  */
 #define XRT_DP_VK_HAS_PREDICTED_SCANOUT 1
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 10 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!

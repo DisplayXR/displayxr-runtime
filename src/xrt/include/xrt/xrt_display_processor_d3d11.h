@@ -611,7 +611,7 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_predicted_sca
  * @ref XRT_DP_D3D11_HAS_FRAME_TIMING (#206).
  */
 #define XRT_DP_D3D11_HAS_PREDICTED_SCANOUT 1
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 23 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_frame_timing slot, so a plug-in
