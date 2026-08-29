@@ -640,6 +640,11 @@ struct comp_d3d12_compositor
 		//! #1257 interval-aware quiet gate.
 		struct u_repaint_gate gate;
 
+		//! DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation (#1264 Phase B:
+		//! this arm was the one fill loop with no trace rows — blind
+		//! exactly where the same-adapter bring-up needed eyes).
+		struct u_repaint_trace trace;
+
 		//! #1257 slot partition: xrWaitFrame throttle state.
 		struct u_app_partition partition;
 
@@ -3540,10 +3545,18 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d12", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
+		}
+
 		// Cheap unlocked pre-check, re-tested under the lock below. Avoids
 		// paying the pacing wait on every tick of an app that is making rate.
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
 		// Fire only once the app has ALREADY missed a full refresh — i.e. the
@@ -3575,6 +3588,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		if (c->repaint.force != 1 &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
@@ -3586,7 +3600,9 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
 		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
 		if (c->repaint.partition.next_release_ns == 0) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
 			comp_d3d12_target_repaint_pace(c->target);
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, os_monotonic_get_ns());
 		}
 
 		std::lock_guard<std::mutex> lock(c->mutex);
@@ -3601,6 +3617,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr ||
 		    c->repaint.atlas == nullptr) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
 		// Re-run the gate under the lock (was a bare `quiet < period` floor;
@@ -3608,6 +3625,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		if (c->repaint.force != 1 &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 
@@ -3615,6 +3633,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// list — the out device's under the split. This is the arm the split
 		// exists for: a repaint re-weaves a slot already on the scanout adapter
 		// and costs no cross-adapter traffic at all.
+		const uint64_t fire_t0 = os_monotonic_get_ns();
 		if (c->split_active) {
 			c->out_cmd_allocator->Reset();
 			c->out_cmd_list->Reset(c->out_cmd_allocator, nullptr);
@@ -3626,7 +3645,9 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		d3d12_dp_weave_and_present(c, true, nullptr);
 
 		c->repaint.count++;
-		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
