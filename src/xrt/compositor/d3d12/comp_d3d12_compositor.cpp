@@ -1647,8 +1647,47 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	if (reason == nullptr) {
 		D3D12_COMMAND_QUEUE_DESC qd = {};
 		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		/*
+		 * #1264 Phase B: SAME-ADAPTER only, the out queue asks for
+		 * scheduler-level priority. Measured (v2.14.11-4, Unity vs cube on
+		 * one iGPU): with both direct queues at NORMAL the app's render
+		 * work sits in front of every weave — fire= balloons 3.5-5x
+		 * (7-10 ms vs the cube's 2 ms), which at 40 target fires/s is
+		 * arithmetically unfillable; the app's own weaves suffer the same
+		 * (13-16 of 20 granted). The contention pre-exists the split
+		 * (stock in-process leg is statistically identical), so isolation
+		 * is the fix class, and PRIORITY_HIGH is the documented,
+		 * unprivileged rung (GLOBAL_REALTIME needs privilege; a compute-
+		 * queue weave is the deeper fallback). Hybrid keeps NORMAL — its
+		 * out queue owns a whole adapter and the accepted record was
+		 * measured there at NORMAL. DXR_SPLIT_QUEUE_HIGH=0 forces NORMAL
+		 * for A/B. Refusal falls back to NORMAL with one WARN.
+		 */
+		bool want_high = gate.same_adapter;
+		{
+			const char *e = getenv("DXR_SPLIT_QUEUE_HIGH");
+			if (e != nullptr && e[0] == '0') {
+				want_high = false;
+			}
+		}
+		if (want_high) {
+			qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		}
 		hr = c->out_dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
 		                                    reinterpret_cast<void **>(&c->out_queue));
+		if (want_high && (FAILED(hr) || c->out_queue == nullptr)) {
+			U_LOG_W(
+			    "#1264: PRIORITY_HIGH out queue refused (0x%08lx) — falling back to NORMAL "
+			    "(expect app-vs-fill queue contention on this adapter)",
+			    (unsigned long)hr);
+			qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+			hr = c->out_dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+			                                    reinterpret_cast<void **>(&c->out_queue));
+		} else if (want_high && SUCCEEDED(hr)) {
+			U_LOG_W("#1264: same-adapter out queue at D3D12_COMMAND_QUEUE_PRIORITY_HIGH — "
+			        "weave submissions preempt the app's NORMAL direct queue "
+			        "(DXR_SPLIT_QUEUE_HIGH=0 reverts)");
+		}
 		if (SUCCEEDED(hr)) {
 			hr = c->out_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
 			                                        __uuidof(ID3D12CommandAllocator),
