@@ -1696,6 +1696,11 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
 	}
 
+	// This tier's flatten family is RGBA (the atlas ring's, and the scratch
+	// the plane copies promote from) — the arm's chains must match or the
+	// bind refuses on the typeless-family check.
+	comp_vk_split_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+
 	c->reroute.active = true;
 	c->split_off_reason = NULL;
 	U_LOG_W(

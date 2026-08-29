@@ -114,6 +114,16 @@ struct comp_vk_split
 	DXGI_FORMAT dp_input_fmt;
 
 	/*!
+	 * #1264 — the format of the CALLER's 2D plane surfaces (Local2D +
+	 * backdrop), which the bridge chains must match for the same
+	 * typeless-family reason as dp_input_fmt. The VK deposit's planes are
+	 * BGRA (the default); the d3d12 reroute's are RGBA (its atlas/flatten
+	 * family) and it says so via comp_vk_split_set_plane_format. The mask
+	 * plane stays R8 regardless.
+	 */
+	DXGI_FORMAT plane_fmt;
+
+	/*!
 	 * VK-1b — a REGION-SIZED output-device view of a panel-sized bridge plane,
 	 * for the display-processor sideband entry points that take dims but no uv
 	 * scale. See @ref split_plane_dp_view.
@@ -1079,6 +1089,26 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
  *
  */
 
+//! #1264 — the caller's 2D-plane format, defaulting to the VK deposit's BGRA
+//! for every session that never says otherwise (zero-init reads as unset).
+static inline DXGI_FORMAT
+split_plane_fmt(struct comp_vk_split *s)
+{
+	return (s->plane_fmt != DXGI_FORMAT_UNKNOWN) ? s->plane_fmt : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+extern "C" void
+comp_vk_split_set_plane_format(struct comp_vk_split *s, uint32_t dxgi_format)
+{
+	if (s == nullptr) {
+		return;
+	}
+	// Before the first bind, by contract (see the header): a chain already
+	// created in another family would need a drain+re-open this setter
+	// deliberately does not do.
+	s->plane_fmt = (DXGI_FORMAT)dxgi_format;
+}
+
 extern "C" void
 comp_vk_split_stage_backdrop(struct comp_vk_split *s,
                              void *nt_handle,
@@ -1117,7 +1147,7 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *s,
 	 * the panel and never at the region.
 	 */
 	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, nt_handle, generation,
-	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
 		/*
 		 * The backdrop degrades on its OWN — a session without one simply has
 		 * no 2D-under band, and the 3D weave is untouched. Never a reason to
@@ -1367,7 +1397,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 	}
 
 	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, nt_handle, generation,
-	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
 		/*
 		 * #918 review D4 — the Local2D plane IS the composite's `twod` under the
 		 * split, so a frame that could not bind it has no composite to stamp.
