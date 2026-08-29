@@ -63,6 +63,21 @@ comp_split_gate_env_requested(void)
 }
 
 bool
+comp_split_gate_env_same_adapter(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		// ADR-039 Phase A bring-up switch. Default OFF until the tier
+		// passes the #1260 acceptance matrix at >=5-minute legs; the
+		// default then flips together with the partition tier gate, in
+		// one commit, and this inverts into a kill switch.
+		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+bool
 comp_split_gate_env_test_fail_stage_a(void)
 {
 	static int on = -1;
@@ -114,14 +129,23 @@ comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct com
 	}
 
 	if (comp_split_luid_equal(inputs->render_luid, inputs->scanout_luid)) {
-		// Not a failure: on a MUX'd / single-GPU box — or under a forced
-		// scanout-adapter selection — the weave is already local, so the split
-		// has nothing to do. The caller says so in its own words; nothing here
-		// should follow it with a fallback WARN.
 		out_result->same_adapter = true;
-		out_result->reason = COMP_SPLIT_REASON_HANDLED;
-		out_result->short_reason = COMP_SPLIT_REASON_SAME_ADAPTER;
-		return;
+		if (!inputs->allow_same_adapter) {
+			// Not a failure: on a MUX'd / single-GPU box — or under a forced
+			// scanout-adapter selection — the weave is already local, so the
+			// CROSS-ADAPTER purpose of the split has nothing to do. The
+			// caller says so in its own words; nothing here should follow it
+			// with a fallback WARN. (ADR-039 makes this branch a per-tier
+			// policy rather than a law: see allow_same_adapter.)
+			out_result->reason = COMP_SPLIT_REASON_HANDLED;
+			out_result->short_reason = COMP_SPLIT_REASON_SAME_ADAPTER;
+			return;
+		}
+		// ADR-039: engage. The split's load-bearing property is the
+		// decoupled fill engine, not the copy it was built to remove; the
+		// "bridge" ingress becomes a same-adapter shared-texture open
+		// (strictly cheaper — no PCIe hop) and everything downstream is
+		// the byte-identical hybrid arm.
 	}
 
 	out_result->out_adapter_luid = inputs->scanout_luid;
