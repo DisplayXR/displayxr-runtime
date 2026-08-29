@@ -109,9 +109,12 @@ compositor), so the two flip together by construction. Phases B/C re-run the sam
 matrix per tier before consulting the switch.
 
 The VK tier's acceptance ran in the deposit's KEYED-MUTEX mode (the bring-up box's
-ICD imports no D3D12_FENCE; see the mode selection in `comp_vk_native_deposit.cpp`),
-which carries one Phase A limitation: plane deposits (Local2D / backdrop / mask) are
-refused in that mode — tracked on #1264.
+ICD imports no D3D12_FENCE; see the mode selection in `comp_vk_native_deposit.cpp`).
+Plane deposits in that mode run TIMING-ONLY (#1274): their fence edges no-op and
+ordering rides the frame path's per-frame CPU wait (#837) plus the planes' on-change
+cadence — the same degrade family as the missing-`ID3D11DeviceContext4` rung. If #837
+removes that wait, the keyed-mutex atlas and the timing-only planes must be revisited
+together.
 
 ## Consequences
 
