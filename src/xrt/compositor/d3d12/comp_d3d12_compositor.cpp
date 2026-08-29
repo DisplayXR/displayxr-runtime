@@ -644,6 +644,8 @@ struct comp_d3d12_compositor
 		//! this arm was the one fill loop with no trace rows — blind
 		//! exactly where the same-adapter bring-up needed eyes).
 		struct u_repaint_trace trace;
+		//! #1264 event-absorption shed (DXR_FILL_SHED_FIRE_MS, opt-in).
+		struct u_fill_shed shed;
 
 		//! #1257 slot partition: xrWaitFrame throttle state.
 		struct u_app_partition partition;
@@ -3631,6 +3633,15 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			continue;
 		}
 
+		// #1264 event-absorption shed (opt-in): an expensive fire opened a
+		// shed window — skip this fill; app frames are untouched by
+		// construction (this is the FILL loop).
+		if (u_fill_shed_active(&c->repaint.shed, os_monotonic_get_ns())) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
+
 		// Pace to the panel BEFORE taking the lock — this blocks for up to a
 		// few periods, and holding the lock across it would stall an arriving
 		// app frame for exactly that long.
@@ -3687,6 +3698,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		const uint64_t fire_t1 = os_monotonic_get_ns();
 		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+		u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;

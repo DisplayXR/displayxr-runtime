@@ -658,6 +658,91 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	t->last_report_ns = now_ns;
 }
 
+/*
+ *
+ * #1264 — the event-absorption shed (opt-in).
+ *
+ */
+
+/*!
+ * Fire-cost-keyed fill shedding, from the ~105 s box event's measured two-phase
+ * signature (epic #1264, the Unity-d3d11 leg-A trace):
+ *
+ *  - PHASE 1 (onset): the GPU slows and weaves suddenly cost 6x (fire= 14 ms vs
+ *    a 1.5-2.9 ms baseline) while the fill loop still ticks fine.
+ *  - PHASE 2 (feedback): stretched weaves collide with the app's slots, races
+ *    spike (49/5 s), the loop loses its cadence, and presents dip — the part
+ *    that actually reads as judder.
+ *
+ * The shed breaks the phase-1 -> phase-2 coupling: after a fill whose fire
+ * exceeded the threshold, SKIP fills for two panel periods, then let one
+ * through as a probe; while the GPU stays slow every probe re-opens the window,
+ * so the fill duty-cycles at ~1 per 3 periods instead of racing the app. App
+ * frames never consult this — their slots stay sacrosanct, which is the point.
+ *
+ * Deliberately keyed on MEASURED fire duration (a leading indicator, monotone,
+ * bounded) rather than slips or races (trailing) — the #1257 governor rounds
+ * showed trailing-indicator feedback loops limit-cycle. Off by default:
+ * `DXR_FILL_SHED_FIRE_MS=<n>` arms it with an n-millisecond threshold (6 is the
+ * measured gap between healthy fires and event-onset fires on the bring-up
+ * box); unset or 0 compiles the checks down to one branch.
+ */
+struct u_fill_shed
+{
+	int enabled; //!< 0 = unprobed (zero-init), then 1 = on / 2 = off from DXR_FILL_SHED_FIRE_MS.
+	uint64_t thresh_ns;
+	uint64_t shed_until_ns;
+	uint64_t sheds;    //!< Fills suppressed (diagnostics).
+	uint32_t episodes; //!< Threshold crossings (an episode may span many sheds).
+};
+
+static inline bool
+u_fill_shed_enabled(struct u_fill_shed *s)
+{
+	if (s->enabled == 0) {
+		const char *e = getenv("DXR_FILL_SHED_FIRE_MS");
+		long v = (e != NULL) ? strtol(e, NULL, 10) : 0;
+		if (v > 0) {
+			s->thresh_ns = (uint64_t)v * 1000000u;
+			s->enabled = 1;
+		} else {
+			s->enabled = 2;
+		}
+	}
+	return s->enabled == 1;
+}
+
+/*!
+ * Before firing a FILL: true = shed it (the caller bails this tick). Counts the
+ * shed. App frames never call this.
+ */
+static inline bool
+u_fill_shed_active(struct u_fill_shed *s, uint64_t now_ns)
+{
+	if (!u_fill_shed_enabled(s) || s->shed_until_ns == 0 || now_ns >= s->shed_until_ns) {
+		return false;
+	}
+	s->sheds++;
+	return true;
+}
+
+/*!
+ * After every FILL completes: an expensive fire opens (or re-opens) the shed
+ * window. Cheap fires do nothing, so recovery is one probe away by
+ * construction — no hysteresis state to mis-tune.
+ */
+static inline void
+u_fill_shed_note_fire(struct u_fill_shed *s, uint64_t start_ns, uint64_t end_ns, uint64_t period_ns)
+{
+	if (!u_fill_shed_enabled(s)) {
+		return;
+	}
+	if (end_ns > start_ns && (end_ns - start_ns) > s->thresh_ns) {
+		s->shed_until_ns = end_ns + 2 * period_ns;
+		s->episodes++;
+	}
+}
+
 #ifdef __cplusplus
 }
 #endif
