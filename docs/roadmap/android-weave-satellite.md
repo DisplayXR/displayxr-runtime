@@ -89,6 +89,38 @@ browser ──xrWeaveSubmitDXR──▶ service ──weave──▶ service-own
 - OEM z-order guarantees (overlay vs system chrome/caption) — recorded as an
   OEM ask, accepted as best-effort in P0.
 
+## P0 STATUS (2026-08-29, overnight session)
+
+**Core parity: PASSED, human-verified** — the satellite-presented weave was judged
+"clean" against the in-app golden reference (NP02J, landscape fullscreen; see the
+golden-standard memory/fingerprint). The bring-up found and fixed, in order:
+the overlay's own origin inset (60-row phase beat), whole-output blits copying the
+DP's compose-under backdrop (dark film → per-rect blits, which is also
+occlusion-lite), SUBOPTIMAL-as-recreate thrash (→ tolerate; IN_USE → bounded retry),
+and the decisive one — **Android's anti-tapjacking clamp composited the overlay at
+alpha 0.8**, blending 20% of the under-content through the weave (per-eye
+crosstalk). Dev unlock: `settings put global maximum_obscuring_opacity_for_touch
+1.0`; the ship requirement (trusted overlay / per-package exemption) is now in
+`oem-android-platform-requirements.md`. Diagnostic lesson that generalizes:
+screencap cross-correlation proved content+placement identical, isolating the fault
+to scanout composition — **screenshots cannot see HWC-level blending; dump the HWC
+layer list.**
+
+**Physical-rect weave: implemented, smoke-passed** (`debug.dxr.satellite_scale`;
+scale=1 bit-path-identical, scale=0.67 weaves at exactly logical×0.67 with the DP
+fed the physical rect). Mini-window crispness awaits a human eyeball with the scale
+prop set — the acceptance case below.
+
+**#1278 weave-idle lens release: shipped and OS-verified** on the same branch
+(lens vote released 2.0 s after the last submit — the OEM backlight service logs
+`Disable` — and re-asserted on the next weave). Two structural findings recorded in
+the commit: the multi main loop is parked for pure present-owner clients (the pass
+is now also driven from the IPC 20 Hz loop), and the release must hit the weave's
+own DP directly (no dp_visibility edge exists for a present-owner).
+
+**Overnight soak: 14/14 PASS** — overlay lifecycle ×4 (appear/teardown, no leaks),
+prop toggle, idle-release ×3, rotation ×2.
+
 ## P0 acceptance test
 
 On NP02J, `debug.dxr.weave_satellite=1`, browser at hello-cube:
