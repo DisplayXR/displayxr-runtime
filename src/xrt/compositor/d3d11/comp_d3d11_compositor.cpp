@@ -62,6 +62,7 @@
 #include "util/u_capture_intent.h"
 #include "util/u_capture_dims.h"
 #include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -2703,6 +2704,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 static void
 d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 {
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("d3d11");
+#endif
+
 	while (!c->repaint_quit.load(std::memory_order_relaxed)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);

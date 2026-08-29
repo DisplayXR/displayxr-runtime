@@ -46,6 +46,7 @@
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
@@ -3984,6 +3985,11 @@ static void *
 gl_repaint_thread(void *ptr)
 {
 	struct comp_gl_compositor *c = (struct comp_gl_compositor *)ptr;
+
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("gl");
+#endif
 
 	while (os_thread_helper_is_running(&c->repaint_thread)) {
 		// GL keeps no cached refresh rate; query the window's (cheap, cached
