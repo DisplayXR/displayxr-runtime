@@ -725,11 +725,23 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 		gin.scanout_luid = split_luid(sdesc.AdapterLuid);
 	}
 
+	// ADR-039 Phase A: the VK tier consults the same-adapter bring-up switch.
+	gin.allow_same_adapter = comp_split_gate_env_same_adapter();
+
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
 	*out_short_reason = gate.short_reason;
 
-	if (gate.same_adapter) {
+	if (gate.same_adapter && gate.split_active) {
+		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
+		// the point, not the copy. The ingress below is a same-adapter
+		// shared-texture open (no PCIe hop).
+		U_LOG_W("VK output-device split: ADR-039 same-adapter ENGAGE on '%ls' "
+		        "LUID=%08lx:%08lx — one fill engine for every tier "
+		        "(DXR_SPLIT_SAME_ADAPTER)",
+		        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		        (unsigned long)sdesc.AdapterLuid.LowPart);
+	} else if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already
 		// local, so the split has nothing to do. One line, no WARN storm.
 		U_LOG_W("VK output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the app's adapter — "

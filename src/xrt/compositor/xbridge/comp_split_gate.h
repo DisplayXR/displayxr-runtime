@@ -251,6 +251,18 @@ struct comp_split_gate_inputs
 	struct comp_split_luid render_luid;
 	//! The adapter that scans out the panel. Only read when @ref scanout_resolved.
 	struct comp_split_luid scanout_luid;
+	/*!
+	 * ADR-039: engage the split even when render == scanout. The
+	 * same-adapter decline reflected the split's original purpose
+	 * (removing the cross-adapter copy); its measured load-bearing
+	 * property is the DECOUPLED FILL ENGINE — own device, own timeline,
+	 * the headroom that keeps panel-rate fill through system-wide
+	 * slowdowns — which same-adapter sessions need just as much
+	 * (#1264 S4). Caller-set (per-tier rollout: the VK compositor reads
+	 * @ref comp_split_gate_env_same_adapter; other tiers pass false
+	 * until their phase). Zero-init = false = the pre-ADR-039 decline.
+	 */
+	bool allow_same_adapter;
 };
 
 //! The gate's verdict — pure data, no side effects taken on the caller's behalf.
@@ -330,6 +342,15 @@ comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct com
  */
 bool
 comp_split_gate_env_requested(void);
+
+/*!
+ * ADR-039 Phase A bring-up: `DXR_SPLIT_SAME_ADAPTER=1` engages the split when
+ * render == scanout (default off). Latched once per process. Feed it into
+ * @ref comp_split_gate_inputs::allow_same_adapter — per-tier: only the tier
+ * whose ADR-039 phase is active should consult it.
+ */
+bool
+comp_split_gate_env_same_adapter(void);
 
 /*!
  * The unlatched parser behind @ref comp_split_gate_env_requested, exposed so the
