@@ -14,7 +14,16 @@
  *
  * avrt.dll is loaded dynamically — no new link dependency, and a system
  * without MMCSS (or a denied join) degrades silently to the old
- * behavior. DXR_FILL_MMCSS=0 kills it for A/B.
+ * behavior.
+ *
+ * DEFAULT OFF (DXR_FILL_MMCSS=1 opts in). The #1264 matrix measured a
+ * NEGATIVE INTERACTION with the S1 fence-park: alone, MMCSS was neutral
+ * (fills 29.0-37.6 vs baseline 32.7-36.6); combined with the park it
+ * collapsed the tier below strikes-off entirely (presents declining
+ * 47->29, tick_iv 24.9 ms — plausibly the Pro Audio class penalizing a
+ * thread that now parks/wakes on every fence, exactly the yield-heavy
+ * pattern MMCSS deprioritizes). The park is the shipping default; this
+ * stays an experiment.
  *
  * @ingroup aux_util
  */
@@ -41,10 +50,9 @@ static inline void
 u_fill_thread_join_mmcss(const char *site)
 {
 	{
+		// Opt-in only — see the negative-interaction note in the header doc.
 		const char *e = getenv("DXR_FILL_MMCSS");
-		if (e != NULL && e[0] == '0') {
-			U_LOG_W("#1264 S2: DXR_FILL_MMCSS=0 — fill thread '%s' stays a plain thread",
-			        site);
+		if (e == NULL || e[0] != '1') {
 			return;
 		}
 	}
