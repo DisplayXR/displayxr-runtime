@@ -8383,6 +8383,24 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		vk_split_unstage_planes(c);
 		return;
 	}
+
+	/*
+	 * #1274 — TIMING-ONLY mode's missing forward edge, made explicit.
+	 *
+	 * With no timeline (keyed-mutex deposits), nothing orders the bridge's
+	 * plane copy — recorded at submit_atlas time on the D3D11 context —
+	 * behind THIS flatten still executing on the Vulkan queue. The frame's
+	 * pre-existing CPU wait covers the ATLAS (its submit precedes that
+	 * wait) but not the planes: this submit happens after it. First eyeball
+	 * of the timing-only planes showed exactly the race — the transported
+	 * bubble alternated complete/blank as the copy won or lost, a fast
+	 * periodic blink. So in fence-less mode the flatten takes its own
+	 * bounded CPU wait here; frames with no 2D never reach this line, and
+	 * fence mode is untouched. Revisited with #837 like every wait.
+	 */
+	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
 	// The entry is reusable once the timeline passes this value.
 	c->plane_cmd_value[ring] = signal_value;
 
