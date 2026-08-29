@@ -1814,6 +1814,17 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		mc->weave.fence_value++;
+		mc->weave.last_submit_ns = os_monotonic_get_ns(); // #1278 idle tracking
+		if (mc->weave.idle_released) {
+			// #1278: weaving resumed after an idle release. The lens re-binds
+			// via this weave's own apply path; on_resume keeps the DP contract
+			// symmetric (a vendor may re-assert more than the lens).
+			mc->weave.idle_released = false;
+			if (mc->weave.dp != NULL) {
+				xrt_display_processor_on_resume(mc->weave.dp);
+			}
+			U_LOG_W("weave(#1278): weave resumed after idle release — lens re-asserted");
+		}
 
 		// Arch-C satellite (#1277 P0): present the woven output ourselves.
 		// Best-effort AFTER the weave is complete — a satellite failure logs,

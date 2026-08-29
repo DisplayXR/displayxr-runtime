@@ -23,6 +23,11 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "os/os_time.h"
+
+#ifdef XRT_OS_ANDROID
+#include <stdlib.h>
+#include <sys/system_properties.h>
+#endif
 #include "os/os_threading.h"
 
 #include "util/u_var.h"
@@ -5878,17 +5883,82 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 	// surface AND that session is running: end_session takes the window
 	// away just as surely as surfaceDestroyed does, and folding both into
 	// one convergent decision here is what keeps this the SINGLE writer.
+	// #1278 weave-idle lens release: a live session that STOPS weaving (a
+	// backgrounded 3D tab, a page that navigated to 2D content while the
+	// session lingers, the satellite's scaled-refusal states) held its lens
+	// vote forever — 3D lens over 2D content until teardown. Fold "the weave
+	// has been idle" into the same convergent visibility decision: idle >
+	// threshold reads as not-visible for lens purposes (on_pause releases the
+	// binder vote), and the next successful submit flips it back (on_resume +
+	// the per-weave re-assert). debug.dxr.weave_idle_release_ms tunes the
+	// threshold; 0 disables. Prop re-read every ~4 s at 60 Hz.
+	int64_t idle_thresh_ns = 2000 * 1000000LL;
+	{
+		static int64_t cached_ns = 2000 * 1000000LL;
+		static int refresh = 0;
+		if ((refresh++ & 0xFF) == 0) {
+			char v[92] = {0};
+			if (__system_property_get("debug.dxr.weave_idle_release_ms", v) > 0 && v[0] != '\0') {
+				cached_ns = (int64_t)atoll(v) * 1000000LL;
+			}
+		}
+		idle_thresh_ns = cached_ns;
+	}
+	const int64_t now_ns = os_monotonic_get_ns();
+
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
 		if (mc == NULL) {
 			continue;
 		}
 		const bool active = mc->state.session_active;
-		multi_compositor_set_window_visible_locked(mc, visible && active,
-		                                           !visible ? "surface lost"
-		                                                    : (active ? "surface live, session active"
-		                                                              : "session not active"));
+		bool weave_idle = false;
+		if (idle_thresh_ns > 0 && mc->weave.engine_initialized && mc->weave.last_submit_ns != 0 &&
+		    (now_ns - mc->weave.last_submit_ns) > idle_thresh_ns) {
+			weave_idle = true;
+		}
+		// #1278: the weave DP's lens vote is re-bound per WEAVE (not per the
+		// session-render visibility state, which a pure present-owner may
+		// never enter), so the idle release must hit the weave's own DP
+		// directly — an edge here, cleared by the next submit. The weave
+		// mutex guards mc->weave.dp against fini; the submit path never
+		// takes list_and_timing_lock inside it, so the order is safe.
+		if (weave_idle && !mc->weave.idle_released && mc->weave.mutex_initialized) {
+			os_mutex_lock(&mc->weave.mutex);
+			if (!mc->weave.idle_released && mc->weave.dp != NULL) {
+				mc->weave.idle_released = true;
+				xrt_display_processor_on_pause(mc->weave.dp);
+				U_LOG_W("weave(#1278): idle %.1fs — lens vote RELEASED (next weave re-asserts)",
+				        (double)(now_ns - mc->weave.last_submit_ns) / 1e9);
+			}
+			os_mutex_unlock(&mc->weave.mutex);
+		}
+		multi_compositor_set_window_visible_locked(
+		    mc, visible && active && !weave_idle,
+		    !visible ? "surface lost"
+		             : (!active ? "session not active"
+		                        : (weave_idle ? "weave idle (#1278)" : "surface live, session active")));
 	}
+}
+
+/*!
+ * #1278: external tick for the convergent visibility pass. The multi main
+ * loop only runs while a composited session is active — a PURE present-owner
+ * weave client (the browser) leaves it parked, so the per-frame pass above
+ * never ran for exactly the client the weave-idle release exists for. The IPC
+ * server's 20 Hz mainloop calls this instead; the pass is convergent and
+ * idempotent, so being driven from both contexts is safe.
+ */
+void
+multi_system_compositor_android_visibility_tick(struct xrt_system_compositor *xsysc)
+{
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	if (msc == NULL) {
+		return;
+	}
+	os_mutex_lock(&msc->list_and_timing_lock);
+	android_window_transition_locked(msc);
+	os_mutex_unlock(&msc->list_and_timing_lock);
 }
 #endif // XRT_OS_ANDROID
 

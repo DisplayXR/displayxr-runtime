@@ -12,6 +12,7 @@
  */
 
 #include "xrt/xrt_device.h"
+#include "multi/comp_multi_interface.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_compositor.h"
@@ -711,6 +712,16 @@ main_loop(struct ipc_server *s)
 
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
+
+#ifdef XRT_OS_ANDROID
+		// #1278: drive the visibility/weave-idle convergent pass from THIS
+		// always-running 20 Hz loop. The multi main loop is parked for a pure
+		// present-owner weave client (the browser), which is exactly the
+		// client whose stale lens vote the weave-idle release exists to drop.
+		if (s->xsysc != NULL) {
+			multi_system_compositor_android_visibility_tick(s->xsysc);
+		}
+#endif
 
 		// Check polling.
 		ipc_server_mainloop_poll(s, &s->ml);
