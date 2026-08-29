@@ -1,6 +1,10 @@
 # ADR-039: One fill engine for every tier (same-adapter split)
 
-**Status:** PROPOSED (2026-08-28; design commissioned as epic #1264 workstream S4 —
+**Status:** ACCEPTED for the VK tier (Phase A, 2026-08-29 — full acceptance record on
+#1264: keyed-mutex smoke, partition D=3 exact, 68-window ≥5-min event-immunity leg,
+eyeball on the #1257-opening configuration; `DXR_SPLIT_SAME_ADAPTER` default flipped
+on, `=0` is the kill switch). Phases B (d3d12) / C (gl, d3d11-in-process) remain
+PROPOSED. (Designed 2026-08-28; commissioned as epic #1264 workstream S4 —
 directive: *"one fill engine for every tier will be the key"*) · extends the #918
 output-device split beyond hybrid topologies · depends on the #1257 slot partition and
 the #868 repaint fill
@@ -81,12 +85,19 @@ including when render and scanout are the same adapter.**
 
 ### Rollout
 
-`DXR_SPLIT_SAME_ADAPTER` (default **off** initially): `1` enables the same-adapter split
-for bring-up. Acceptance per tier is the #1260 matrix — steady presents at panel rate,
-weave/repaint pair exact, then the eyeball — measured over **≥3 of the ~105 s events
-(≈5 min) per leg** (the #1264 method law). On pass: default flips on for that tier and
-the partition's `tier_supported` flips with it, in the same commit as the tier-gate
-condition (the coupling documented at the gate). The env then inverts into a kill switch.
+`DXR_SPLIT_SAME_ADAPTER` (default **on** since the VK tier's acceptance; `=0` is the
+kill switch, restoring the same-adapter decline). Acceptance per tier is the #1260
+matrix — steady presents at panel rate, weave/repaint pair exact, then the eyeball —
+measured over **≥3 of the ~105 s events (≈5 min) per leg** (the #1264 method law).
+The VK tier passed the full matrix 2026-08-29 (record on #1264). The partition's
+`tier_supported` follows the split's own activity (`c->split != NULL` in the VK
+compositor), so the two flip together by construction. Phases B/C re-run the same
+matrix per tier before consulting the switch.
+
+The VK tier's acceptance ran in the deposit's KEYED-MUTEX mode (the bring-up box's
+ICD imports no D3D12_FENCE; see the mode selection in `comp_vk_native_deposit.cpp`),
+which carries one Phase A limitation: plane deposits (Local2D / backdrop / mask) are
+refused in that mode — tracked on #1264.
 
 ## Consequences
 

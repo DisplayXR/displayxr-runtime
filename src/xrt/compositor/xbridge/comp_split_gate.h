@@ -344,10 +344,11 @@ bool
 comp_split_gate_env_requested(void);
 
 /*!
- * ADR-039 Phase A bring-up: `DXR_SPLIT_SAME_ADAPTER=1` engages the split when
- * render == scanout (default off). Latched once per process. Feed it into
- * @ref comp_split_gate_inputs::allow_same_adapter — per-tier: only the tier
- * whose ADR-039 phase is active should consult it.
+ * ADR-039: the same-adapter split is DEFAULT ON (accepted for the VK tier,
+ * #1264 Phase A); `DXR_SPLIT_SAME_ADAPTER=0` is the kill switch, restoring
+ * the old same-adapter decline. Latched once per process. Feed it into
+ * @ref comp_split_gate_inputs::allow_same_adapter — per-tier: only a tier
+ * whose ADR-039 phase is accepted (or in bring-up) should consult it.
  */
 bool
 comp_split_gate_env_same_adapter(void);
