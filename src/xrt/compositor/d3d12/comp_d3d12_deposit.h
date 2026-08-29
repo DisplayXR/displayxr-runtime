@@ -137,6 +137,64 @@ comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_vk_de
 void
 comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
 
+/*!
+ * @name The PLANE surfaces (#1264 reroute plane transport)
+ *
+ * The VK deposit's VK-1b, D3D12 flavour: single-buffered NT-shared D3D11
+ * textures for the masked composite's inputs — the Local2D OVER flatten and
+ * the 2D-under backdrop — opened on the app's D3D12 device so the compositor
+ * COPIES its flatten scratch into them on content change (planes are
+ * on-change surfaces; the levers doc measured 3 copies per session at rest).
+ * Panel-sized once, outside the resize churn, exactly per the VK rule.
+ *
+ * Sync mirrors VK-1b: the one deposit fence covers plane writes (the copy
+ * rides the same app-queue signal as the atlas), and the back edge is
+ * @ref comp_d3d12_deposit_note_planes_consumed → the app queue waits
+ * @ref comp_d3d12_deposit_plane_wait_value before the next plane copy.
+ * @{
+ */
+#define COMP_D3D12_DEPOSIT_PLANE_LOCAL2D 0u
+#define COMP_D3D12_DEPOSIT_PLANE_BACKDROP 1u
+#define COMP_D3D12_DEPOSIT_PLANE_COUNT 2u
+
+/*!
+ * One plane surface, both halves: the compositor copies into @ref resource12,
+ * the d3d11 arm opens @ref shared_handle. BORROWED pointers.
+ */
+struct comp_d3d12_deposit_plane
+{
+	void *shared_handle; //!< `HANDLE` for comp_vk_split_stage_*.
+	void *resource12;    //!< `ID3D12Resource *` — the copy destination (COMMON at rest).
+	uint32_t width;
+	uint32_t height;
+	uint64_t generation; //!< Bumped on REALLOCATION only (the re-open key).
+};
+
+//! Allocate (or keep) @p plane at @p width x @p height (RGBA8). No-op returning
+//! true when it already matches. False degrades THAT FEATURE only.
+bool
+comp_d3d12_deposit_plane_ensure(struct comp_d3d12_deposit *dep, uint32_t plane, uint32_t width, uint32_t height);
+
+//! Fill @p out with @p plane's surface; false when not allocated.
+bool
+comp_d3d12_deposit_plane_get(struct comp_d3d12_deposit *dep, uint32_t plane, struct comp_d3d12_deposit_plane *out);
+
+/*!
+ * The d3d11 arm's producer has recorded its reads of every live plane (the
+ * caller has just run comp_vk_split_submit_atlas, whose pre_plane_write wait
+ * sits ahead on the same D3D11 immediate context) — signal the shared fence
+ * past every claim so far on that context. One signal covers all planes.
+ */
+void
+comp_d3d12_deposit_note_planes_consumed(struct comp_d3d12_deposit *dep);
+
+//! Queue the GPU-side wait for the last plane release on @p app_queue
+//! (`ID3D12CommandQueue *`) — call before executing a list that copies into
+//! any plane. No-op while nothing has consumed a plane.
+void
+comp_d3d12_deposit_plane_wait(struct comp_d3d12_deposit *dep, void *app_queue);
+/*! @} */
+
 #ifdef __cplusplus
 }
 #endif

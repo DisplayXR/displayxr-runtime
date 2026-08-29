@@ -33,6 +33,15 @@ struct comp_d3d12_deposit_slot
 	uint64_t release_value;
 };
 
+struct comp_d3d12_deposit_plane_slot
+{
+	ID3D11Texture2D *tex;
+	HANDLE share_nt;
+	ID3D12Resource *res12;
+	uint32_t width, height;
+	uint64_t generation;
+};
+
 struct comp_d3d12_deposit
 {
 	ID3D12Device *app_dev; //!< BORROWED — the app's device, used for opens only.
@@ -47,6 +56,10 @@ struct comp_d3d12_deposit
 	struct comp_d3d12_deposit_slot ring[COMP_D3D12_DEPOSIT_RING];
 	uint32_t slot;
 
+	//! #1264 plane transport — single-buffered, panel-sized once.
+	struct comp_d3d12_deposit_plane_slot plane[COMP_D3D12_DEPOSIT_PLANE_COUNT];
+	uint64_t plane_release_value;
+
 	//! Shared D3D11 fence; the SAME object opened on the app device as fence12.
 	ID3D11Fence *fence11;
 	HANDLE fence_nt;
@@ -60,6 +73,9 @@ struct comp_d3d12_deposit
 	uint32_t width;
 	uint32_t height;
 };
+
+static void
+deposit_free_plane(struct comp_d3d12_deposit *dep, uint32_t plane);
 
 static void
 deposit_free_ring(struct comp_d3d12_deposit *dep)
@@ -265,6 +281,9 @@ comp_d3d12_deposit_destroy(struct comp_d3d12_deposit **deposit_ptr)
 	struct comp_d3d12_deposit *dep = *deposit_ptr;
 
 	deposit_free_ring(dep);
+	for (uint32_t p = 0; p < COMP_D3D12_DEPOSIT_PLANE_COUNT; p++) {
+		deposit_free_plane(dep, p);
+	}
 
 	if (dep->fence12 != NULL) {
 		dep->fence12->Release();
@@ -409,4 +428,121 @@ comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot)
 	dep->value += 1;
 	dep->ctx4->Signal(dep->fence11, dep->value);
 	dep->ring[slot].release_value = dep->value;
+}
+
+static void
+deposit_free_plane(struct comp_d3d12_deposit *dep, uint32_t plane)
+{
+	struct comp_d3d12_deposit_plane_slot *p = &dep->plane[plane];
+	if (p->res12 != NULL) {
+		p->res12->Release();
+		p->res12 = NULL;
+	}
+	if (p->share_nt != NULL) {
+		CloseHandle(p->share_nt);
+		p->share_nt = NULL;
+	}
+	if (p->tex != NULL) {
+		p->tex->Release();
+		p->tex = NULL;
+	}
+	p->width = 0;
+	p->height = 0;
+}
+
+extern "C" bool
+comp_d3d12_deposit_plane_ensure(struct comp_d3d12_deposit *dep, uint32_t plane, uint32_t width, uint32_t height)
+{
+	if (dep == NULL || dep->dx == NULL || plane >= COMP_D3D12_DEPOSIT_PLANE_COUNT || width == 0 || height == 0) {
+		return false;
+	}
+	struct comp_d3d12_deposit_plane_slot *p = &dep->plane[plane];
+	// Steady state after warmup: a compare (panel-sized once).
+	if (p->tex != NULL && p->width == width && p->height == height) {
+		return true;
+	}
+	// A REALLOCATION — an on-change event. The caller has idled the queues
+	// (the same discipline every shared-surface realloc in this tree follows).
+	deposit_free_plane(dep, plane);
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = width;
+	td.Height = height;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+	HRESULT hr = dep->dx->CreateTexture2D(&td, NULL, &p->tex);
+	IDXGIResource1 *dxgi_res = NULL;
+	if (SUCCEEDED(hr) && p->tex != NULL &&
+	    SUCCEEDED(p->tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&dxgi_res)) && dxgi_res != NULL) {
+		hr = dxgi_res->CreateSharedHandle(NULL, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, NULL,
+		                                  &p->share_nt);
+		dxgi_res->Release();
+	} else if (SUCCEEDED(hr)) {
+		hr = E_FAIL;
+	}
+	if (SUCCEEDED(hr) && p->share_nt != NULL) {
+		hr = dep->app_dev->OpenSharedHandle(p->share_nt, __uuidof(ID3D12Resource), (void **)&p->res12);
+	}
+	if (FAILED(hr) || p->res12 == NULL) {
+		// Feature-local: the caller stops staging this plane; the 3D weave is
+		// untouched — the same degrade contract as the VK deposit's planes.
+		U_LOG_W("d3d12 deposit: plane %u could not be allocated at %ux%u (0x%08lx) — that feature is "
+		        "off for this session; the weave is unaffected (#1264)",
+		        plane, width, height, (unsigned long)hr);
+		deposit_free_plane(dep, plane);
+		return false;
+	}
+	p->res12->SetName(L"DXR.d3d12_deposit_plane");
+	p->width = width;
+	p->height = height;
+	p->generation++;
+	U_LOG_W("d3d12 deposit: plane %u up — %ux%u, generation %llu (#1264)", plane, width, height,
+	        (unsigned long long)p->generation);
+	return true;
+}
+
+extern "C" bool
+comp_d3d12_deposit_plane_get(struct comp_d3d12_deposit *dep, uint32_t plane, struct comp_d3d12_deposit_plane *out)
+{
+	if (dep == NULL || out == NULL || plane >= COMP_D3D12_DEPOSIT_PLANE_COUNT) {
+		return false;
+	}
+	const struct comp_d3d12_deposit_plane_slot *p = &dep->plane[plane];
+	if (p->tex == NULL || p->res12 == NULL) {
+		return false;
+	}
+	out->shared_handle = p->share_nt;
+	out->resource12 = p->res12;
+	out->width = p->width;
+	out->height = p->height;
+	out->generation = p->generation;
+	return true;
+}
+
+extern "C" void
+comp_d3d12_deposit_note_planes_consumed(struct comp_d3d12_deposit *dep)
+{
+	if (dep == NULL || dep->ctx4 == NULL || dep->fence11 == NULL) {
+		return;
+	}
+	// One signal covers every plane: the immediate context is one ordered
+	// stream and the producer's reads were just recorded ahead of it.
+	dep->value += 1;
+	dep->ctx4->Signal(dep->fence11, dep->value);
+	dep->plane_release_value = dep->value;
+}
+
+extern "C" void
+comp_d3d12_deposit_plane_wait(struct comp_d3d12_deposit *dep, void *app_queue)
+{
+	if (dep == NULL || app_queue == NULL || dep->fence12 == NULL || dep->plane_release_value == 0) {
+		return;
+	}
+	((ID3D12CommandQueue *)app_queue)->Wait(dep->fence12, dep->plane_release_value);
 }
