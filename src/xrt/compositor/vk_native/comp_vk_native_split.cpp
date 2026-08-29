@@ -65,6 +65,18 @@ struct comp_vk_split
 	void *dp_factory_d3d11;
 	bool transparent_background;
 
+	/*!
+	 * The panel's requested 2D/3D state, latched from every successful
+	 * request_display_mode forward. Sessions begin 3D (begin_session
+	 * requests it), so it initializes true at stage A. Feeds the weave
+	 * marks' mode_3d — which were HARDCODED true here, so under the split
+	 * the frame witness could never report mode=2d and the perf ladder's
+	 * MODE-2D gate flagged MODE_UNSETTLED on every rep once the
+	 * same-adapter split became the default path (latent since #918
+	 * hybrid; the panel itself switched fine — the flag lied).
+	 */
+	bool mode_3d;
+
 	//! @name The SCANOUT adapter — everything the weave and the present touch.
 	//! @{
 	ID3D11Device *out_dev;
@@ -772,6 +784,9 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 	s->hwnd = (HWND)info->hwnd;
 	s->dp_factory_d3d11 = info->dp_factory_d3d11;
 	s->transparent_background = info->transparent_background;
+	// Sessions begin 3D (begin_session requests it right after create);
+	// zero-init would make every weave mark read 2D until the first request.
+	s->mode_3d = true;
 	s->render_luid = render_luid;
 	s->out_luid = sdesc.AdapterLuid;
 	s->panel_w = panel_w;
@@ -2222,9 +2237,9 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
 	if (is_repaint) {
-		comp_d3d11_target_weave_mark_repaint(s->target, /*mode_3d=*/true);
+		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
-		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, /*mode_3d=*/true);
+		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
 	}
 
 	// Hand the vendor eye predictor last frame's MEASURED weave->scanout
@@ -2405,7 +2420,12 @@ comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 	if (s == nullptr || s->dp == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	const bool ok = xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	if (ok) {
+		// The weave marks' mode_3d source — see the field doc.
+		s->mode_3d = enable_3d;
+	}
+	return ok;
 }
 
 extern "C" void
