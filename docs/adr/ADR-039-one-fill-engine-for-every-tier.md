@@ -110,11 +110,12 @@ matrix per tier before consulting the switch.
 
 The VK tier's acceptance ran in the deposit's KEYED-MUTEX mode (the bring-up box's
 ICD imports no D3D12_FENCE; see the mode selection in `comp_vk_native_deposit.cpp`).
-Plane deposits in that mode run TIMING-ONLY (#1274): their fence edges no-op and
-ordering rides the frame path's per-frame CPU wait (#837) plus the planes' on-change
-cadence — the same degrade family as the missing-`ID3D11DeviceContext4` rung. If #837
-removes that wait, the keyed-mutex atlas and the timing-only planes must be revisited
-together.
+Plane deposits in that mode run TIMING-ONLY (#1274): their fence edges no-op; the
+flatten submit takes its own bounded CPU wait (the frame's pre-existing #837 wait
+covers only the atlas — the first eyeball showed the missing plane edge as a fast
+periodic bubble blink), and the reverse edge rides the planes' on-change cadence —
+the same degrade family as the missing-`ID3D11DeviceContext4` rung. If #837 removes
+the per-frame wait, the keyed-mutex atlas and these planes are revisited together.
 
 ## Consequences
 

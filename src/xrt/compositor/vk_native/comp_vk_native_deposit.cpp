@@ -991,15 +991,16 @@ comp_vk_deposit_plane_ensure(
 		/*
 		 * #1274 — TIMING-ONLY planes. The planes' fence edges (the flatten's
 		 * timeline signal/wait, note_planes_consumed's release) all no-op
-		 * naturally in this mode, and what carries correctness instead is
-		 * the frame path's structure: the flatten submits BEFORE the frame's
-		 * per-frame CPU wait (#837), so the bridge's read — recorded at
-		 * submit_atlas time on the D3D11 immediate context — always sees a
-		 * complete plane; and the reverse edge (the next flatten overwriting
-		 * an in-flight read) has a full app-frame period of separation on an
-		 * ON-CHANGE surface. The same argument, weaker inputs, than the KM
-		 * atlas ring's — and the same degrade family as the missing-ctx4
-		 * rung. If #837's wait is ever removed, revisit both together.
+		 * naturally in this mode, and correctness is carried by two explicit
+		 * structural facts: the flatten submit takes ITS OWN bounded CPU
+		 * wait in fence-less mode (vk_split_stage_planes — the frame's
+		 * pre-existing wait covers only the atlas, and the first eyeball
+		 * showed the missing plane edge as a fast periodic bubble blink),
+		 * so the bridge's read always sees a complete plane; and the
+		 * reverse edge (the next flatten overwriting an in-flight read) has
+		 * a full app-frame period of separation on an ON-CHANGE surface.
+		 * Same degrade family as the missing-ctx4 rung; revisited with #837
+		 * like every wait.
 		 */
 		static bool km_plane_logged = false;
 		if (!km_plane_logged) {
