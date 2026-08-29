@@ -565,6 +565,7 @@ struct comp_d3d11_compositor
 		uint64_t last_app_frame_ns;
 		struct u_repaint_gate gate;   //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace; //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		struct u_fill_shed shed;      //!< #1264 event-absorption shed (DXR_FILL_SHED_FIRE_MS, opt-in).
 		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 		uint64_t count, ticks;
 
@@ -2746,6 +2747,16 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			continue;
 		}
 
+		// #1264 event-absorption shed (opt-in): an expensive fire opened a
+		// shed window — skip this fill so stretched weaves never enter the
+		// app's slots and the phase-2 race feedback never starts. App
+		// frames are untouched by construction (this is the FILL loop).
+		if (u_fill_shed_active(&c->repaint.shed, os_monotonic_get_ns())) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
+
 		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
 		// it can block for periods, which throttles a grid fill to a
 		// fraction of its slots. Under an ENGAGED partition the schedule
@@ -2858,6 +2869,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		const uint64_t fire_t1 = os_monotonic_get_ns();
 		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+		u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
