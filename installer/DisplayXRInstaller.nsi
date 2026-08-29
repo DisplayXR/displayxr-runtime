@@ -641,6 +641,89 @@ Function un.DumpLog
 FunctionEnd
 
 ;--------------------------------
+; #1268: nothing may hold DisplayXRClient.dll when we overwrite it.
+;
+; Killing displayxr-service.exe is not enough. EVERY OpenXR client keeps the
+; runtime DLL mapped for the life of its process, and now that the DisplayXR
+; Browser is a first-class client that is the common case, not an exotic one.
+; A mapped image is opened without FILE_SHARE_WRITE, so `File` hits a sharing
+; violation -- and under /S (how the bundle drives this installer) NSIS SKIPS
+; the file, sets the error flag, and still reports success. The install then
+; stamps Software\DisplayXR\Runtime\Version anyway, so the bundle's version
+; gate treats the runtime as current and skips the component on every later
+; run: the skew becomes permanent and no amount of reinstalling clears it.
+;
+; So: close the clients WE own, then refuse to write anything at all -- file
+; or registry -- if a holder survives.
+
+; Close every DisplayXR-owned process that could hold the runtime DLL.
+;
+; Path-scoped on purpose. The DisplayXR Browser's process is named chrome.exe,
+; so a plain `taskkill /im chrome.exe` would take the user's own Google Chrome
+; down with it. We only kill what runs out of a directory we installed:
+; $INSTDIR, plus the browser's own registered root.
+Function CloseRuntimeClients
+	Push $0
+	Push $1
+
+	; The service is ours unconditionally and maps the DLL every time.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	Pop $0
+
+	; The browser records its own root; a missing key just means not installed,
+	; and the empty entry is filtered out below.
+	ReadRegStr $1 HKLM "Software\DisplayXR\Browser" "InstallPath"
+
+	; One sweep over both roots. `$$` is a literal '$' for PowerShell.
+	;
+	; Win32_Process.ExecutablePath, NOT Get-Process().Path, on purpose: an NSIS
+	; installer is a 32-bit process, and a 32-bit process cannot read the module
+	; list of a 64-bit one. Get-Process().Path therefore throws for every 64-bit
+	; process -- which, swallowed by SilentlyContinue, yields an EMPTY match set
+	; and kills nothing at all, silently. Measured on 8k-box: the .Path form
+	; matched 0 of 10 live browser processes under SysWOW64 PowerShell while the
+	; CIM form matched all 10. WMI is bitness-agnostic, so this works whether the
+	; installer stays 32-bit or is ever built 64-bit.
+	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') }) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+	Pop $0
+
+	; Process exit and image unmap are not instantaneous even after
+	; Stop-Process returns.
+	Sleep 2000
+
+	Pop $1
+	Pop $0
+FunctionEnd
+
+; $R0 = "1" when DisplayXRClient.dll can be replaced, "0" when a process still
+; has it mapped.
+;
+; Opening for append needs FILE_SHARE_WRITE, which a mapped image never grants
+; -- so this is a reliable lock test in pure NSIS with no plugin dependency,
+; and it tests the exact operation `File` is about to perform.
+Function ClientDllWritable
+	Push $0
+
+	; A fresh install has no DLL yet, so nothing can be holding one.
+	IfFileExists "$INSTDIR\DisplayXRClient.dll" 0 cdw_free
+
+	ClearErrors
+	FileOpen $0 "$INSTDIR\DisplayXRClient.dll" a
+	IfErrors cdw_held
+	FileClose $0
+
+cdw_free:
+	StrCpy $R0 "1"
+	Goto cdw_done
+cdw_held:
+	StrCpy $R0 "0"
+cdw_done:
+	ClearErrors
+	Pop $0
+FunctionEnd
+
+
+;--------------------------------
 ; Installer Sections
 
 Section "DisplayXR Runtime" SecRuntime
@@ -654,18 +737,48 @@ Section "DisplayXR Runtime" SecRuntime
 
 	SetOutPath "$INSTDIR"
 
-	; Kill any running DisplayXR processes before overwriting (avoids write/sharing error).
+	; Close DisplayXR processes holding the runtime, then PROVE the client DLL
+	; is writable before touching a single file or registry value (#1268).
 	; Workspace controllers (e.g. the DisplayXR shell) are installed as separate
 	; products and have their own installers; we don't reach into their processes
-	; here. The uninstall path runs cascade-uninstall first which handles their
-	; lifecycle.
-	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	Pop $0
-	; Wait for processes to fully exit and release pipe/file handles
-	Sleep 2000
+	; beyond what runs from a directory we installed. The uninstall path runs
+	; cascade-uninstall first which handles their lifecycle.
+	Call CloseRuntimeClients
 
-	; Install runtime files
+	Call ClientDllWritable
+	StrCmp $R0 "1" dll_writable
+
+	; Give a straggler a second chance -- a process can be gone from the task
+	; list a moment before its image is unmapped.
+	Sleep 3000
+	Call ClientDllWritable
+	StrCmp $R0 "1" dll_writable
+
+	; A holder we do NOT own is still running: a Unity editor, a customer app,
+	; an engine plug-in. Killing arbitrary user processes is not acceptable, so
+	; fail loudly instead. Aborting HERE is what makes this recoverable -- no
+	; file is written and, crucially, no Version stamp is left behind, so the
+	; bundle sees a real failure and its next run retries the component rather
+	; than skipping it forever.
+	SetErrorLevel 2
+	DetailPrint "FATAL: DisplayXRClient.dll is in use and cannot be replaced."
+	DetailPrint "Close every OpenXR application (the DisplayXR Browser included) and run this installer again."
+	MessageBox MB_OK|MB_ICONSTOP "DisplayXR cannot update: DisplayXRClient.dll is still in use by another program.$\n$\nClose every running OpenXR application -- including the DisplayXR Browser -- then run this installer again.$\n$\nNothing has been changed." /SD IDOK
+	Abort "DisplayXRClient.dll is in use -- installation aborted, nothing was changed."
+
+dll_writable:
+
+	; Install runtime files. The client DLL is the one file whose silent loss
+	; produces the client/service skew, so verify this specific write landed
+	; before anything downstream (above all the Version stamp) can run.
+	ClearErrors
 	File "${BIN_DIR}\DisplayXRClient.dll"
+	IfErrors 0 client_dll_ok
+	SetErrorLevel 2
+	DetailPrint "FATAL: failed to write DisplayXRClient.dll."
+	MessageBox MB_OK|MB_ICONSTOP "DisplayXR could not replace DisplayXRClient.dll.$\n$\nInstallation has been stopped rather than leave a runtime whose client and service are different builds." /SD IDOK
+	Abort "Failed to write DisplayXRClient.dll -- installation aborted."
+client_dll_ok:
 
 	; Install service (needed for Chrome WebXR and other sandboxed apps)
 	File /nonfatal "${BIN_DIR}\displayxr-service.exe"
