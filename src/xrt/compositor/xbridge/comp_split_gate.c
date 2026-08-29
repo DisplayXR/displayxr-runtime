@@ -106,6 +106,27 @@ comp_split_gate_env_same_adapter_d3d12(void)
 }
 
 bool
+comp_split_gate_env_same_adapter_d3d11(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		/*
+		 * ADR-039 Phase C bring-up switch (the in-process D3D11 tier) —
+		 * same contract as the Phase B one below: default OFF, collapses
+		 * into comp_split_gate_env_same_adapter on that tier's own
+		 * acceptance. Pulled forward of Phase B's reroute build because
+		 * it doubles as the reroute's hypothesis probe: it puts a REAL
+		 * D3D11 app on the d3d11 out arm, measuring whether that arm's
+		 * scheduler immunity (Phase A: 0.8-1.4 ms fires under app load)
+		 * survives a same-API contender.
+		 */
+		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER_D3D11");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+bool
 comp_split_gate_env_test_fail_stage_a(void)
 {
 	static int on = -1;

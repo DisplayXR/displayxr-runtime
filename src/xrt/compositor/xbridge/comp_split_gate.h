@@ -354,6 +354,15 @@ bool
 comp_split_gate_env_same_adapter(void);
 
 /*!
+ * ADR-039 Phase C bring-up (the in-process D3D11 tier):
+ * `DXR_SPLIT_SAME_ADAPTER_D3D11=1` lets the D3D11 leg engage the same-adapter
+ * split (default off until that tier's acceptance; then it collapses into
+ * @ref comp_split_gate_env_same_adapter and this env retires). Latched.
+ */
+bool
+comp_split_gate_env_same_adapter_d3d11(void);
+
+/*!
  * ADR-039 Phase B bring-up (the D3D12 tier): `DXR_SPLIT_SAME_ADAPTER_D3D12=1`
  * lets the D3D12 leg engage the same-adapter split (default off until that
  * tier's own acceptance matrix passes; then it collapses into

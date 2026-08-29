@@ -4135,6 +4135,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			gin.scanout_luid = d3d11_split_luid(sdesc.AdapterLuid);
 		}
 
+		// ADR-039 Phase C bring-up: the D3D11 tier consults its OWN switch
+		// (default off) — never the accepted Phase A default, which belongs
+		// to the VK tier until this one earns its matrix.
+		gin.allow_same_adapter = comp_split_gate_env_same_adapter_d3d11();
+
 		struct comp_split_gate_result gate = {};
 		comp_split_gate_evaluate(&gin, &gate);
 		const char *reason = gate.reason;
@@ -4147,7 +4152,18 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		 */
 		const char *stage_a_token = nullptr;
 		split_off_reason = gate.short_reason;
-		if (gate.same_adapter) {
+		if (gate.same_adapter && gate.split_active) {
+			// ADR-039: same adapter, split ENGAGED anyway — the fill
+			// engine is the point, not the copy. The bridge's NT-share
+			// open is a same-adapter open (no PCIe hop), exactly the
+			// shape the VK tier's accepted Phase A record runs.
+			U_LOG_W(
+			    "D3D11 output-device split: ADR-039 same-adapter ENGAGE (Phase C bring-up) on "
+			    "'%ls' LUID=%08lx:%08lx — one fill engine for every tier "
+			    "(DXR_SPLIT_SAME_ADAPTER_D3D11)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
+		} else if (gate.same_adapter) {
 			// Not a failure: on a MUX'd / single-GPU box the weave is
 			// already local, so the split has nothing to do. One INFO,
 			// no WARN.
