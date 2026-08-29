@@ -3,8 +3,17 @@
 **Status:** ACCEPTED for the VK tier (Phase A, 2026-08-29 — full acceptance record on
 #1264: keyed-mutex smoke, partition D=3 exact, 68-window ≥5-min event-immunity leg,
 eyeball on the #1257-opening configuration; `DXR_SPLIT_SAME_ADAPTER` default flipped
-on, `=0` is the kill switch). Phases B (d3d12) / C (gl, d3d11-in-process) remain
-PROPOSED. (Designed 2026-08-28; commissioned as epic #1264 workstream S4 —
+on, `=0` is the kill switch) **and for the in-process D3D11 tier** (Phase C,
+2026-08-29 — pulled forward as Phase B's reroute hypothesis probe and passed on first
+contact: engage clean, partition exact, acceptance leg with the event-immunity profile,
+eyeball with the planes verified; the tier consults the same accepted switch, and its
+bring-up env retired). Phase B (d3d12) remains bring-up: its own-legs arm is
+cube-class-accepted but serializes under real app load (3-of-3 ~105 s event dips;
+Intel preemption is draw-granular, so a HIGH-priority queue measured null), and its
+route for heavy apps is the PROVEN reroute through the d3d11 arm — hypothesis confirmed
+by the Phase C probe (fire= 2.3 ms flat under a same-API contender), build pending.
+The gl tier remains PROPOSED. (Designed 2026-08-28; commissioned as epic #1264
+workstream S4 —
 directive: *"one fill engine for every tier will be the key"*) · extends the #918
 output-device split beyond hybrid topologies · depends on the #1257 slot partition and
 the #868 repaint fill
