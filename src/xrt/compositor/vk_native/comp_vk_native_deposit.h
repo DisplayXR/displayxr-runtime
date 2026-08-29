@@ -59,7 +59,9 @@
  * create), bounded timeouts, skip-on-timeout. The consumer's acquire IS a
  * short CPU block on the frame thread, comparable to the per-frame CPU wait
  * the VK path already carries (#837) — accepted for Phase A bring-up, revisited
- * if #837 lands. Plane deposits are unsupported in this mode.
+ * if #837 lands. Plane deposits run TIMING-ONLY in this mode (#1274): their
+ * fence edges no-op and ordering rides the #837 wait plus the on-change
+ * cadence — see the note at comp_vk_deposit_plane_ensure.
  *
  * ## Gate
  *

@@ -8024,8 +8024,12 @@ vk_plane_cmd_ring_take(struct comp_vk_native_compositor *c, struct comp_vk_depos
 			return (int32_t)i; // never used
 		}
 		if (timeline == VK_NULL_HANDLE || vk->vkGetSemaphoreCounterValue == NULL) {
-			// No timeline to ask. The deposit then has no working sync at
-			// all, so nothing is racing this buffer either.
+			// No timeline to ask — fence-less (keyed-mutex, #1274) mode.
+			// Reuse is safe by frame structure, not by nothing running:
+			// this frame's submits sit behind the PREVIOUS frame's
+			// per-frame CPU wait (#837), so an entry submitted last frame
+			// has retired by the time this frame asks for it. If #837's
+			// wait is removed, this branch needs a real retirement test.
 			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i;
 		}

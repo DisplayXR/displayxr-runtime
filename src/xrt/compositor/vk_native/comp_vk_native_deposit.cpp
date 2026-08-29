@@ -733,7 +733,7 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 		    "vk deposit: ACTIVE (KEYED-MUTEX mode, ADR-039 Phase A) — atlas renders straight into the "
 		    "D3D11 texture (COLOR_ATTACHMENT, zero copies); no D3D12_FENCE import on this driver, so "
 		    "each side brackets its access with the slot's keyed mutex (key 0, bounded, "
-		    "skip-on-timeout) instead of a timeline signal. Plane deposits are OFF in this mode.");
+		    "skip-on-timeout) instead of a timeline signal. Plane deposits run timing-only (#1274).");
 	} else {
 		U_LOG_W(
 		    "vk deposit: ACTIVE — atlas renders straight into the D3D11 texture "
@@ -989,21 +989,26 @@ comp_vk_deposit_plane_ensure(
 	}
 	if (dep->keyed_mutex_mode) {
 		/*
-		 * ADR-039 Phase A limitation: the planes' transport back-fence
-		 * (note_planes_consumed) IS the shared fence, and this mode exists
-		 * precisely because the driver cannot import one. Refusing here fails
-		 * closed the same way an allocation failure does — the caller stops
-		 * staging the plane and the 3D weave is untouched.
+		 * #1274 — TIMING-ONLY planes. The planes' fence edges (the flatten's
+		 * timeline signal/wait, note_planes_consumed's release) all no-op
+		 * naturally in this mode, and what carries correctness instead is
+		 * the frame path's structure: the flatten submits BEFORE the frame's
+		 * per-frame CPU wait (#837), so the bridge's read — recorded at
+		 * submit_atlas time on the D3D11 immediate context — always sees a
+		 * complete plane; and the reverse edge (the next flatten overwriting
+		 * an in-flight read) has a full app-frame period of separation on an
+		 * ON-CHANGE surface. The same argument, weaker inputs, than the KM
+		 * atlas ring's — and the same degrade family as the missing-ctx4
+		 * rung. If #837's wait is ever removed, revisit both together.
 		 */
-		static bool warned = false;
-		if (!warned) {
-			warned = true;
+		static bool km_plane_logged = false;
+		if (!km_plane_logged) {
+			km_plane_logged = true;
 			U_LOG_W(
-			    "vk deposit: plane deposits are unsupported in KEYED-MUTEX mode (ADR-039 Phase A) — "
-			    "Local2D/backdrop/mask stay off under the same-adapter split; the 3D weave is "
-			    "unaffected (#1264)");
+			    "vk deposit: plane deposits run TIMING-ONLY in KEYED-MUTEX mode (#1274) — "
+			    "Local2D/backdrop/mask transport with no fence edges; ordering rides the "
+			    "per-frame CPU wait (#837)");
 		}
-		return false;
 	}
 	struct comp_vk_deposit_plane_slot *p = &dep->plane[plane];
 
