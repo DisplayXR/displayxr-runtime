@@ -681,6 +681,136 @@ weave_satellite_release(struct vk_bundle *vk, struct multi_compositor *mc)
 	mc->weave.sat_image_count = 0;
 }
 
+/*!
+ * (Re)build the swapchain on the EXISTING surface, chaining oldSwapchain —
+ * the canonical Vulkan resize path. Keeping the VkSurface + MonadoView alive
+ * avoids Android's asynchronous BufferQueue producer disconnect, which made a
+ * destroy-then-recreate race VK_ERROR_NATIVE_WINDOW_IN_USE for ~2 s (121
+ * retry frames measured on a rotation) and latch the satellite off.
+ */
+static bool
+weave_satellite_build_swapchain(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	VkSurfaceCapabilitiesKHR caps = {0};
+	VkResult ret =
+	    vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device, mc->weave.sat_surface, &caps);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): surface caps: %s", vk_result_string(ret));
+		return false;
+	}
+
+	VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	char opq[PROP_VALUE_MAX] = {0};
+	const bool force_opaque = __system_property_get("debug.dxr.satellite_opaque", opq) > 0 && opq[0] == '1';
+	if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)) {
+		alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+	} else if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)) {
+		alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+	}
+
+	// Prefer PASS_THROUGH (no compositor CSC — the weave output is calibrated
+	// panel values); see the long comment at the first ensure.
+	VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	{
+		VkSurfaceFormatKHR formats[16];
+		uint32_t n_formats = ARRAY_SIZE(formats);
+		VkResult fret = vk->vkGetPhysicalDeviceSurfaceFormatsKHR(vk->physical_device, mc->weave.sat_surface,
+		                                                         &n_formats, formats);
+		if (fret == VK_SUCCESS || fret == VK_INCOMPLETE) {
+			for (uint32_t i = 0; i < n_formats; i++) {
+				if (formats[i].format == WEAVE_VK_FORMAT &&
+				    formats[i].colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+					colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+				}
+			}
+		}
+	}
+
+	uint32_t min_images = caps.minImageCount + 1;
+	if (caps.maxImageCount != 0 && min_images > caps.maxImageCount) {
+		min_images = caps.maxImageCount;
+	}
+
+	VkSwapchainKHR old_sc = mc->weave.sat_swapchain;
+	if (old_sc != VK_NULL_HANDLE) {
+		// Nothing may be in flight against the old images.
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+	}
+
+	VkSwapchainCreateInfoKHR sc_info = {
+	    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+	    .surface = mc->weave.sat_surface,
+	    .minImageCount = min_images,
+	    .imageFormat = WEAVE_VK_FORMAT,
+	    .imageColorSpace = colorspace,
+	    .imageExtent = caps.currentExtent,
+	    .imageArrayLayers = 1,
+	    .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+	    .compositeAlpha = alpha,
+	    .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+	    .clipped = VK_TRUE,
+	    .oldSwapchain = old_sc,
+	};
+	VkSwapchainKHR new_sc = VK_NULL_HANDLE;
+	ret = vk->vkCreateSwapchainKHR(vk->device, &sc_info, NULL, &new_sc);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): vkCreateSwapchainKHR: %s", vk_result_string(ret));
+		return false;
+	}
+	if (old_sc != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, old_sc, NULL);
+	}
+	mc->weave.sat_swapchain = new_sc;
+	mc->weave.sat_w = caps.currentExtent.width;
+	mc->weave.sat_h = caps.currentExtent.height;
+
+	mc->weave.sat_image_count = ARRAY_SIZE(mc->weave.sat_images);
+	ret = vk->vkGetSwapchainImagesKHR(vk->device, mc->weave.sat_swapchain, &mc->weave.sat_image_count,
+	                                  mc->weave.sat_images);
+	if (ret != VK_SUCCESS && ret != VK_INCOMPLETE) {
+		U_LOG_E("weave satellite(#1277): vkGetSwapchainImagesKHR: %s", vk_result_string(ret));
+		vk->vkDestroySwapchainKHR(vk->device, mc->weave.sat_swapchain, NULL);
+		mc->weave.sat_swapchain = VK_NULL_HANDLE;
+		return false;
+	}
+	for (uint32_t i = 0; i < mc->weave.sat_image_count; i++) {
+		mc->weave.sat_image_first[i] = true;
+	}
+
+	// Overlay origin (see the header comment): recompute per build — the
+	// inset can change with orientation.
+	mc->weave.sat_off_x = 0;
+	mc->weave.sat_off_y = 0;
+	{
+		struct xrt_android_display_metrics metrics = {0};
+		struct _JavaVM *mvm = android_globals_get_vm();
+		void *mctx = android_globals_get_context();
+		if (mvm != NULL && mctx != NULL &&
+		    android_custom_surface_get_display_metrics(mvm, mctx, &metrics)) {
+			int32_t pw = metrics.width_pixels, ph = metrics.height_pixels;
+			if ((mc->weave.sat_w > mc->weave.sat_h) != (pw > ph)) {
+				int32_t t = pw;
+				pw = ph;
+				ph = t;
+			}
+			if (ph > (int32_t)mc->weave.sat_h) {
+				mc->weave.sat_off_y = ph - (int32_t)mc->weave.sat_h;
+			}
+			if (pw > (int32_t)mc->weave.sat_w) {
+				mc->weave.sat_off_x = pw - (int32_t)mc->weave.sat_w;
+			}
+		}
+	}
+	U_LOG_W("weave satellite(#1277): swapchain %s %ux%u images=%u origin (%d,%d)",
+	        old_sc != VK_NULL_HANDLE ? "REBUILT" : "live", mc->weave.sat_w, mc->weave.sat_h,
+	        mc->weave.sat_image_count, mc->weave.sat_off_x, mc->weave.sat_off_y);
+	return true;
+}
+
 static bool
 weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 {
@@ -739,147 +869,8 @@ weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 			goto fail;
 		}
 
-		VkSurfaceCapabilitiesKHR caps = {0};
-		ret = vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device, mc->weave.sat_surface,
-		                                                    &caps);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave satellite(#1277): surface caps: %s; disabled", vk_result_string(ret));
+		if (!weave_satellite_build_swapchain(vk, mc)) {
 			goto fail;
-		}
-
-		// Translucency is load-bearing: everything outside the woven rect must
-		// show the desktop through. Prefer pre-multiplied, then inherit (the
-		// window's own TRANSLUCENT format then decides), and only fall back to
-		// opaque with a loud log (a fully-opaque black overlay would "work" but
-		// blank the launcher — better visible in the log than mysterious).
-		VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-		// debug.dxr.satellite_opaque=1: A/B knob — composite the overlay OPAQUE
-		// (alpha ignored; surround is black, page hidden). Diagnostic for the
-		// woven-alpha under-blend theory: the DP writes per-pixel alpha in the
-		// compose-under model, and a premultiplied overlay then BLENDS the
-		// woven rect with whatever the caller drew beneath (its mono scratch),
-		// which reads as single-eye crosstalk. Opaque compositing makes that
-		// blend impossible; if the crosstalk vanishes, the fix is forcing the
-		// woven rect's alpha to 1 in the satellite copy.
-		char opq[PROP_VALUE_MAX] = {0};
-		const bool force_opaque =
-		    __system_property_get("debug.dxr.satellite_opaque", opq) > 0 && opq[0] == '1';
-		if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)) {
-			alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-		} else if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)) {
-			alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-		} else if (force_opaque) {
-			U_LOG_W("weave satellite(#1277): OPAQUE composite forced (debug.dxr.satellite_opaque)");
-		} else {
-			U_LOG_W("weave satellite(#1277): no translucent compositeAlpha; overlay will be OPAQUE");
-		}
-
-		// Colorspace: the weave output is CALIBRATED PANEL VALUES (the
-		// anti-crosstalk precompensation is baked in), so any compositor
-		// color transform after the weave breaks eye separation. The in-app
-		// path's buffer rides dataspace UNKNOWN (no CSC); an explicit
-		// SRGB_NONLINEAR swapchain may be color-managed by the DPU. Prefer
-		// PASS_THROUGH (no CSC, matching the in-app path); fall back to
-		// whatever the surface offers, loudly.
-		VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-		{
-			VkSurfaceFormatKHR formats[16];
-			uint32_t n_formats = ARRAY_SIZE(formats);
-			VkResult fret = vk->vkGetPhysicalDeviceSurfaceFormatsKHR(
-			    vk->physical_device, mc->weave.sat_surface, &n_formats, formats);
-			if (fret == VK_SUCCESS || fret == VK_INCOMPLETE) {
-				bool has_pass_through = false;
-				for (uint32_t i = 0; i < n_formats; i++) {
-					U_LOG_W("weave satellite(#1277): surface format[%u] vkformat=%d colorspace=%d",
-					        i, (int)formats[i].format, (int)formats[i].colorSpace);
-					if (formats[i].format == WEAVE_VK_FORMAT &&
-					    formats[i].colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT) {
-						has_pass_through = true;
-					}
-				}
-				if (has_pass_through) {
-					colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
-					U_LOG_W("weave satellite(#1277): using PASS_THROUGH colorspace (no compositor CSC)");
-				}
-			}
-		}
-
-		uint32_t min_images = caps.minImageCount + 1;
-		if (caps.maxImageCount != 0 && min_images > caps.maxImageCount) {
-			min_images = caps.maxImageCount;
-		}
-
-		VkSwapchainCreateInfoKHR sc_info = {
-		    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-		    .surface = mc->weave.sat_surface,
-		    .minImageCount = min_images,
-		    .imageFormat = WEAVE_VK_FORMAT,
-		    .imageColorSpace = colorspace,
-		    .imageExtent = caps.currentExtent,
-		    .imageArrayLayers = 1,
-		    .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-		    .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-		    .compositeAlpha = alpha,
-		    .presentMode = VK_PRESENT_MODE_FIFO_KHR,
-		    .clipped = VK_TRUE,
-		};
-		ret = vk->vkCreateSwapchainKHR(vk->device, &sc_info, NULL, &mc->weave.sat_swapchain);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave satellite(#1277): vkCreateSwapchainKHR: %s; disabled",
-			        vk_result_string(ret));
-			goto fail;
-		}
-		mc->weave.sat_w = caps.currentExtent.width;
-		mc->weave.sat_h = caps.currentExtent.height;
-
-		// Overlay-local vs panel coordinates. The overlay view is inset by the
-		// system bars, so window-rect (panel) coordinates must be shifted by
-		// the overlay's own origin before blitting. Only the size difference
-		// is queryable from here; ASSUME the inset is top/left (the status bar
-		// on this hardware — landscape top bar measured 60 px, matching
-		// panel_h - extent). Wrong on a bottom-inset device by exactly the
-		// inset; revisit with a real view-origin query when the Java side
-		// grows one.
-		mc->weave.sat_off_x = 0;
-		mc->weave.sat_off_y = 0;
-		{
-			struct xrt_android_display_metrics metrics = {0};
-			struct _JavaVM *mvm = android_globals_get_vm();
-			void *mctx = android_globals_get_context();
-			if (mvm != NULL && mctx != NULL &&
-			    android_custom_surface_get_display_metrics(mvm, mctx, &metrics)) {
-				int32_t pw = metrics.width_pixels, ph = metrics.height_pixels;
-				// Metrics are natural-orientation; match against the
-				// current-extent orientation.
-				if ((mc->weave.sat_w > mc->weave.sat_h) != (pw > ph)) {
-					int32_t t = pw;
-					pw = ph;
-					ph = t;
-				}
-				if (ph > (int32_t)mc->weave.sat_h) {
-					mc->weave.sat_off_y = ph - (int32_t)mc->weave.sat_h;
-				}
-				if (pw > (int32_t)mc->weave.sat_w) {
-					mc->weave.sat_off_x = pw - (int32_t)mc->weave.sat_w;
-				}
-				U_LOG_W("weave satellite(#1277): overlay origin on panel: (%d,%d) "
-				        "(panel %dx%d, extent %ux%u)",
-				        mc->weave.sat_off_x, mc->weave.sat_off_y, pw, ph, mc->weave.sat_w,
-				        mc->weave.sat_h);
-			}
-		}
-
-		mc->weave.sat_image_count = ARRAY_SIZE(mc->weave.sat_images);
-		ret = vk->vkGetSwapchainImagesKHR(vk->device, mc->weave.sat_swapchain,
-		                                  &mc->weave.sat_image_count, mc->weave.sat_images);
-		if (ret != VK_SUCCESS && ret != VK_INCOMPLETE) {
-			U_LOG_E("weave satellite(#1277): vkGetSwapchainImagesKHR: %s; disabled",
-			        vk_result_string(ret));
-			goto fail;
-		}
-		for (uint32_t i = 0; i < mc->weave.sat_image_count; i++) {
-			mc->weave.sat_image_first[i] = true;
 		}
 	}
 
@@ -932,12 +923,37 @@ weave_satellite_present(struct vk_bundle *vk,
 		return;
 	}
 
+	// Rotation: tolerating SUBOPTIMAL (correct — it is Android's steady state
+	// on a rotated panel) also removed the only rotation signal, so a
+	// portrait swapchain survived into landscape and Android SCALED its
+	// content into the re-laid-out overlay view — a squished stale weave over
+	// the caller's mono draw (field report, morning after). The reliable
+	// signal is the weave itself: the output tracks the caller's reported
+	// geometry, so an orientation mismatch between output and swapchain means
+	// the panel rotated — release and recreate at the new extent.
+	if (mc->weave.out_w != 0 && mc->weave.out_h != 0 &&
+	    ((mc->weave.out_w > mc->weave.out_h) != (mc->weave.sat_w > mc->weave.sat_h))) {
+		U_LOG_W("weave satellite(#1277): orientation changed (out %ux%u vs overlay %ux%u) — recreating",
+		        mc->weave.out_w, mc->weave.out_h, mc->weave.sat_w, mc->weave.sat_h);
+		// Swapchain-only rebuild: the overlay view survives rotation with a
+		// surfaceChanged in place (same holder, new extent — measured), so the
+		// VkSurface stays valid. A full release/re-ensure here destroys a live
+		// view and collides with the #558 single-window globals (stale window
+		// republished -> VK_ERROR_NATIVE_WINDOW_IN_USE latch).
+		if (!weave_satellite_build_swapchain(vk, mc)) {
+			weave_satellite_release(vk, mc);
+			return;
+		}
+	}
+
 	uint32_t idx = 0;
 	VkResult ret = vk->vkAcquireNextImageKHR(vk->device, mc->weave.sat_swapchain, 100ULL * 1000ULL * 1000ULL,
 	                                         mc->weave.sat_acquire_sem, VK_NULL_HANDLE, &idx);
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
-		U_LOG_W("weave satellite(#1277): swapchain out of date — recreating next frame");
-		weave_satellite_release(vk, mc);
+		U_LOG_W("weave satellite(#1277): swapchain out of date — rebuilding");
+		if (!weave_satellite_build_swapchain(vk, mc)) {
+			weave_satellite_release(vk, mc);
+		}
 		return;
 	}
 	// SUBOPTIMAL is Android's steady state on a rotated panel when the
