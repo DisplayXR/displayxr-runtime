@@ -1224,3 +1224,24 @@ works but weakens tapjacking protection system-wide — a per-package exemption
 is the right shape. The satellite also benefits from the overlay being
 DEVICE-composited (it is on NP02J) — forcing it through GPU client composition
 adds latency and a resample risk.
+
+## Container-scale visibility (mini/freeform windows, runtime#1277 P1)
+
+The OEM "mini window" presents a fixed phone-profile task (sw540dp →
+1080×1685 logical on NP02J) through a SurfaceFlinger leash scale
+(`tr=[0.67,0][0,0.67]` measured). That factor is **invisible to apps**: the
+task/window bounds are a hybrid (physical origin + logical size), the
+Configuration carries no compat scale, accessibility bounds are logical-clipped,
+and no setting or property exposes it (all probed on NP02J firmware). A weave
+must know the physical pixel footprint exactly — a container-scaled weave that
+guesses wrong by even a few px per thousand lands subpixels on the wrong lens.
+
+The runtime currently *infers* scaling from the hybrid-bounds tell (the
+reported rect exceeds the panel) and applies a per-device constant — correct
+only because the mini window's scale is fixed on current firmware.
+
+**The platform must expose the effective presentation scale (or equivalently
+the physical on-screen bounds) of a task to the app owning it, and changes to
+it, via a queryable API or the window Configuration.** Alternatives that also
+satisfy this: report the task's true physical bounds in `WindowMetrics`, or
+guarantee 1:1 presentation (no leash scale) for packages that request it.

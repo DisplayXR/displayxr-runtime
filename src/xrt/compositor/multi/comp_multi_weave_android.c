@@ -803,12 +803,84 @@ weave_satellite_build_swapchain(struct vk_bundle *vk, struct multi_compositor *m
 			if (pw > (int32_t)mc->weave.sat_w) {
 				mc->weave.sat_off_x = pw - (int32_t)mc->weave.sat_w;
 			}
+			mc->weave.sat_panel_w = (uint32_t)pw;
+			mc->weave.sat_panel_h = (uint32_t)ph;
 		}
 	}
 	U_LOG_W("weave satellite(#1277): swapchain %s %ux%u images=%u origin (%d,%d)",
 	        old_sc != VK_NULL_HANDLE ? "REBUILT" : "live", mc->weave.sat_w, mc->weave.sat_h,
 	        mc->weave.sat_image_count, mc->weave.sat_off_x, mc->weave.sat_off_y);
 	return true;
+}
+
+/*!
+ * P1 auto-derivation of the container scale (#1277). Per WINDOW, not global:
+ *
+ *   1. `debug.dxr.satellite_scale` != 1.0 -> diagnostic override, wins.
+ *   2. The OEM-scaled tell fires -> `debug.dxr.satellite_miniwindow_scale`
+ *      (default 0.67, the leash factor measured on NP02J).
+ *   3. Otherwise 1.0 (fullscreen / unscaled windows).
+ *
+ * The tell (measured, browser#128/#186 + dumpsys on NP02J): an OEM "mini
+ * window" is a fixed phone-profile task (sw540dp -> 1080x1685 logical here)
+ * whose WM bounds are a HYBRID — physical origin + LOGICAL size — while the
+ * leash scales presentation (tr=[0.67,0][0,0.67]). So the caller-reported
+ * rect EXCEEDS the panel while its origin lies inside: that is app-visibly
+ * unique to a container-scaled window on this platform. The factor itself is
+ * app-invisible (leash-only; a11y bounds are logical-clipped, no config /
+ * settings / prop carries it — all probed), hence the per-device default
+ * until the OEM exposes it (platform-requirements ask).
+ *
+ * Caveat, direction-of-failure: an unscaled freeform window dragged off-edge
+ * would also trip the tell and get wrongly scale-woven — but this OEM clamps
+ * mini windows inside the panel and offers no unscaled-freeform UX, and the
+ * satellite is gated off elsewhere. Revisit if either changes.
+ *
+ * Call with mc->weave.mutex held (reads the geometry fields).
+ */
+static float
+weave_satellite_effective_scale(struct multi_compositor *mc)
+{
+	const float override = weave_satellite_scale();
+	if (override != 1.0f) {
+		return override;
+	}
+	if (!mc->weave.have_geometry) {
+		return 1.0f;
+	}
+	uint32_t pw = mc->weave.sat_panel_w, ph = mc->weave.sat_panel_h;
+	bool exceeds;
+	if (pw != 0 && ph != 0) {
+		exceeds = (mc->weave.win_x + (int32_t)mc->weave.win_w > (int32_t)pw) ||
+		          (mc->weave.win_y + (int32_t)mc->weave.win_h > (int32_t)ph);
+	} else {
+		// Satellite swapchain not up yet: rotation unknown, so only trust a
+		// rect that exceeds the panel in BOTH orientations (the measured mini
+		// case does). Ambiguous fits stay 1.0 until the panel extent lands.
+		struct xrt_android_display_metrics metrics = {0};
+		struct _JavaVM *vm = android_globals_get_vm();
+		void *ctx = android_globals_get_context();
+		if (vm == NULL || ctx == NULL ||
+		    !android_custom_surface_get_display_metrics(vm, ctx, &metrics)) {
+			return 1.0f;
+		}
+		const int32_t a = metrics.width_pixels, b = metrics.height_pixels;
+		const int32_t rx = mc->weave.win_x + (int32_t)mc->weave.win_w;
+		const int32_t ry = mc->weave.win_y + (int32_t)mc->weave.win_h;
+		exceeds = (rx > a || ry > b) && (rx > b || ry > a);
+	}
+	if (!exceeds || mc->weave.win_x < 0 || mc->weave.win_y < 0) {
+		return 1.0f;
+	}
+	float s = 0.67f;
+	char v[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.satellite_miniwindow_scale", v) > 0 && v[0] != '\0') {
+		float parsed = strtof(v, NULL);
+		if (parsed > 0.05f && parsed <= 1.0f) {
+			s = parsed;
+		}
+	}
+	return s;
 }
 
 static bool
@@ -1310,13 +1382,16 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// Batch path only: legacy clients keep logical semantics.
 		float sat_pscale = 1.0f;
 		if (weave_satellite_wanted(mc) && rect_count > 0) {
-			sat_pscale = weave_satellite_scale();
+			sat_pscale = weave_satellite_effective_scale(mc);
 			if (sat_pscale != 1.0f) {
 				static float logged_pscale = -1.0f;
 				if (logged_pscale != sat_pscale) {
 					logged_pscale = sat_pscale;
-					U_LOG_W("weave satellite(#1277): PHYSICAL-RECT weave, scale %.3f",
-					        (double)sat_pscale);
+					U_LOG_W("weave satellite(#1277): PHYSICAL-RECT weave, scale %.3f "
+					        "(window %d,%d %ux%u vs panel %ux%u)",
+					        (double)sat_pscale, mc->weave.win_x, mc->weave.win_y,
+					        mc->weave.win_w, mc->weave.win_h, mc->weave.sat_panel_w,
+					        mc->weave.sat_panel_h);
 				}
 			}
 		}

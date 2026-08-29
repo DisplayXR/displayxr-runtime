@@ -147,6 +147,34 @@ On NP02J, `debug.dxr.weave_satellite=1`, browser at hello-cube:
    rebuild on orientation change; no per-cycle state in the client-facing path).
 4. `debug.dxr.weave_satellite=0` restores today's behaviour bit-for-bit.
 
+## P1 STATUS (2026-08-29)
+
+**Per-window container-scale auto-derivation: SHIPPED, human-verified.** The
+global `debug.dxr.satellite_scale` knob is demoted to a diagnostic override;
+the satellite now derives the scale per window at submit:
+
+- **The tell** (all field-measured on NP02J): an OEM mini window is a fixed
+  phone-profile task (sw540dp → 1080×1685 logical) whose WM bounds are a
+  hybrid — physical origin + logical size — while a SurfaceFlinger leash
+  (`tr=[0.67,0][0,0.67]`) scales presentation. So the caller-reported rect
+  EXCEEDS the panel while its origin lies inside; that is app-visibly unique
+  to a container-scaled window. The factor itself is app-invisible (leash-only;
+  a11y bounds logical-clipped; no config/settings/prop — all probed), so the
+  tell selects a per-device constant: `debug.dxr.satellite_miniwindow_scale`,
+  default 0.67.
+- **Verified end-to-end with zero props set**: fullscreen weaves at derived
+  1.0 (golden), the dragged mini window logs `PHYSICAL-RECT weave, scale
+  0.670 (window 1757,236 1080x1685 vs panel 2560x1600)` and weaves crisp —
+  both correct simultaneously, which the global knob could never do.
+- **Ship ask filed**: `oem-android-platform-requirements.md` § *Container-scale
+  visibility* — the platform must expose the presentation scale (the constant
+  is correct only while the OEM mini-window scale stays fixed).
+- Caveat (direction of failure): an unscaled freeform window dragged off-edge
+  would trip the tell and be wrongly scale-woven; this OEM clamps mini windows
+  in-panel and has no unscaled-freeform UX, so not reachable today.
+
+Remaining P1: occlusion, input routing.
+
 ## Risks / open questions
 
 - Does the OEM allow a `TYPE_APPLICATION_OVERLAY` surface to cover a freeform
