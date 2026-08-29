@@ -1033,6 +1033,17 @@ draw_panel(struct panel_state *s)
 		//    and it is the single largest latency win (96->17 ms on VK), so
 		//    bundling it would charge every compatibility click a 5x latency
 		//    regression on the lever least likely to be the culprit.
+		//
+		//    THE REPAINT HALF IS IN-PROCESS ONLY, and the text below says so.
+		//    `DXR_WEAVE_REPAINT` has no reader in comp_d3d11_service.cpp,
+		//    and wiring one in would be wrong rather than merely missing: the
+		//    service's render thread weaves on ITS OWN clock, so "a weave with
+		//    no new paint behind it is precisely a #868 repaint"
+		//    (comp_d3d11_service.cpp, witness_paint_seq). Repaint is what the
+		//    service pipeline IS, not a feature it opts into, so there is no
+		//    flag that could switch it off without redesigning the pacing.
+		//    Under a workspace controller only the split half of this preset
+		//    takes effect.
 		const bool compat = compat_mode_on(s);
 		igText("Mode");
 		if (igRadioButton_Bool("Balanced (default)##mode", !compat) && compat) {
@@ -1046,6 +1057,8 @@ draw_panel(struct panel_state *s)
 		igTextDisabled("    Compatibility turns off the cross-adapter weave split and the repaint -");
 		igTextDisabled("    for 'the 3D looks wrong, is it the pipeline?'. It COSTS latency; it is not");
 		igTextDisabled("    a faster setting. Leave it on Balanced unless you are diagnosing.");
+		igTextDisabled("    Under the workspace/shell only the split half applies: the service weaves");
+		igTextDisabled("    on its own clock, so its repaint is structural rather than a setting.");
 		igSpacing();
 
 		// -- 3. Diagnostics. Pure observers: they change no behaviour, which is
