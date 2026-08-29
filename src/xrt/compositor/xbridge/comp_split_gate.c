@@ -85,6 +85,27 @@ comp_split_gate_env_same_adapter(void)
 }
 
 bool
+comp_split_gate_env_same_adapter_d3d12(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		/*
+		 * ADR-039 Phase B bring-up switch (the D3D12 tier). Default OFF —
+		 * the tier consults the accepted default only after it passes its
+		 * own #1260 matrix at >=5-minute legs (ADR-039 §Rollout: its
+		 * baselines need REPEATED legs); on acceptance this collapses
+		 * into comp_split_gate_env_same_adapter and the env retires.
+		 * Deliberately not the Phase A switch: that one is default-ON
+		 * for the accepted VK tier, and bring-up must never ride an
+		 * acceptance it has not earned.
+		 */
+		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER_D3D12");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+bool
 comp_split_gate_env_test_fail_stage_a(void)
 {
 	static int on = -1;

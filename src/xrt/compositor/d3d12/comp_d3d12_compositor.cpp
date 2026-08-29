@@ -1601,11 +1601,25 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		gin.scanout_luid.high = sdesc.AdapterLuid.HighPart;
 	}
 
+	// ADR-039 Phase B bring-up: the D3D12 tier consults its OWN switch
+	// (default off) — never the accepted Phase A default, which belongs to
+	// the VK tier until this one earns its matrix.
+	gin.allow_same_adapter = comp_split_gate_env_same_adapter_d3d12();
+
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
-	if (gate.same_adapter) {
+	if (gate.same_adapter && gate.split_active) {
+		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
+		// the point, not the copy. The "cross-adapter" heap below is simply
+		// a shared heap when both LUIDs match.
+		U_LOG_W(
+		    "#918 output-device split: ADR-039 same-adapter ENGAGE (Phase B bring-up) on '%ls' "
+		    "LUID=%08lx:%08lx — one fill engine for every tier (DXR_SPLIT_SAME_ADAPTER_D3D12)",
+		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		    (unsigned long)sdesc.AdapterLuid.LowPart);
+	} else if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already local,
 		// so the split has nothing to do.
 		U_LOG_W(
@@ -2035,9 +2049,11 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	// #1257 partition: block until the app's next slot BEFORE the lock —
 	// the repaint loop keeps weaving the other slots underneath this
-	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. This in-process tier
-	// is UNSUPPORTED (fill loop tick starvation, #1257 follow-up) — the
-	// throttle refuses cleanly unless the bring-up env override is set.
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. This tier is
+	// UNSUPPORTED until ADR-039 Phase B passes its acceptance matrix
+	// (bring-up runs under DXR_APP_FRAME_DIVISOR_ANY_TIER=1); on
+	// acceptance this flips to c->split_active, the same structural
+	// coupling the VK tier ships.
 	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
