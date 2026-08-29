@@ -286,6 +286,21 @@ would charge every Compatibility click a ~5× latency regression on the lever
 least likely to be the culprit. It belongs in the Phase-2 developer list, for
 bisecting.
 
+**Compatibility's repaint half is in-process only, and cannot be otherwise.**
+`DXR_WEAVE_REPAINT` has no reader in `comp_d3d11_service.cpp`, and adding one
+would be *wrong* rather than merely missing: the service's render thread weaves
+on **its own** clock, which is exactly why the code defines a service repaint as
+*"a weave with no new paint behind it"* (`comp_d3d11_service.cpp`,
+`witness_paint_seq`). Repaint is what the service pipeline **is**, not a feature
+it opts into, so no flag can switch it off without redesigning the pacing. Under
+a workspace controller, only the split half of the preset takes effect — the UI
+says so rather than quietly over-promising.
+
+This also bounds **Phase 3**: of the levers the service actually reads
+(`DXR_WEAVE_ON_SCANOUT`, `DXR_D3D_FORCE_GPU` for its ingest device per #1153,
+and `DXR_FRAME_WITNESS`), only the first and last are candidates for going live.
+`DXR_D3D_FORCE_GPU` selects a device at service startup and can never be live.
+
 Compatibility mode is **derived from the resolved lever values**, not stored as
 its own key: a preset that stored its own name would drift from what the levers
 say the moment anything else wrote one of them. Deriving it means the UI can
