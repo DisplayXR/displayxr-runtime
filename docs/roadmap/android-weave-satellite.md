@@ -173,7 +173,40 @@ the satellite now derives the scale per window at submit:
   would trip the tell and be wrongly scale-woven; this OEM clamps mini windows
   in-panel and has no unscaled-freeform UX, so not reachable today.
 
-Remaining P1: occlusion, input routing.
+**P1 occlusion + input + full-panel overlay: SHIPPED (same day).**
+
+- **Input passthrough: verified, zero code** — FLAG_NOT_TOUCHABLE passes
+  touches through the overlay to the client, and the OS unscales them into the
+  window's logical space itself (verified with injected scroll: page scrolled,
+  weave tracked).
+- **Full-panel overlay** (`span_system_bars` on `android_custom_surface`):
+  the overlay now lays out edge-to-edge (measured 2560x1600, origin 0,0)
+  instead of inset below the status bar. Fixes the immersive-toggle bug ("tap
+  the fullscreen browser -> broken weave"): the tap flips Chrome edge-to-edge
+  (window 0,0 2560x1600), and the inset overlay's present clamped dst_y=-60 to
+  0 without shifting the source — the whole weave landed 60 rows low. The blit
+  path now also clips in DST space with source compensation, so partial
+  off-panel rects map correctly in general.
+- **Occlusion: a11y-fed window subtraction.** `WindowWatcherService`
+  (AccessibilityService in the runtime APK, adb/user-enabled, OFF by default)
+  serializes the interactive window list {type, layer, bounds} to
+  `files/dxr_occlusion.bin` (atomic rename; the file transport crosses slot
+  processes with zero IPC). The satellite subtracts occluders above the client
+  from each blit rect (band decomposition, <=64 pieces): IME always; app
+  windows by a11y layer vs the origin-matched client (fullscreen clients use
+  the non-fullscreen-window rule); scaled occluders corrected by the same
+  hybrid-bounds tell as the client scale. Verified on device: with the OEM
+  split keyboard summoned over the cube, the weave clipped exactly at the
+  IME's top edge (before the feed: cube drew over the keys). Watcher disabled
+  or dead -> no occluders -> exactly the pre-P1 behavior.
+- Dev trap: `am force-stop` on the runtime package kills the a11y watcher and
+  Android only rebinds it on a settings retoggle — after a force-stop, retoggle
+  `enabled_accessibility_services`.
+
+Remaining for P2: N-window policy (ADR-025), the OEM platform asks (filed in
+`oem-android-platform-requirements.md` + the KBXR OEM brief), a11y-independent
+occlusion if the platform ever exposes window geometry directly.
+
 
 ## Risks / open questions
 

@@ -330,7 +330,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 			                 (void *)vm, activity);
 		}
 		struct android_custom_surface *cs = android_custom_surface_async_start(
-		    vm, activity, /*display_id*/ 0, "DisplayXR", /*preferred_display_mode_id*/ 0);
+		    vm, activity, /*display_id*/ 0, "DisplayXR", /*preferred_display_mode_id*/ 0, false);
 		if (cs == NULL) {
 			return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 			                 "Android: android_custom_surface_async_start failed");

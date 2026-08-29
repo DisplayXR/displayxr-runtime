@@ -94,6 +94,10 @@ weave_split_enabled(void)
 
 #include <android/native_window.h>
 #include <sys/system_properties.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 
 #include <android/hardware_buffer.h>
@@ -903,7 +907,8 @@ weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 			goto fail;
 		}
 		mc->weave.sat_csurface =
-		    android_custom_surface_async_start(vm, ctx, /*display_id=*/0, "DisplayXR Weave Satellite", 0);
+		    android_custom_surface_async_start(vm, ctx, /*display_id=*/0, "DisplayXR Weave Satellite", 0,
+		                                       /*span_system_bars=*/true);
 		if (mc->weave.sat_csurface == NULL) {
 			U_LOG_E("weave satellite(#1277): overlay surface start failed; disabled");
 			goto fail;
@@ -976,6 +981,258 @@ fail:
 	weave_satellite_release(vk, mc);
 	mc->weave.sat_failed = true;
 	return false;
+}
+
+/*
+ *
+ * Occlusion (#1277 P1) — a11y-fed window subtraction.
+ *
+ * The satellite overlay sits above the entire app window stack, so a 2D window
+ * overlapping the woven client would be painted over by the weave. The only
+ * app-reachable source of other windows' rects + z-order is an
+ * AccessibilityService: WindowWatcherService (runtime APK, user/adb-enabled)
+ * serializes every interactive window as {type, layer, bounds} into
+ * files/dxr_occlusion.bin (atomic rename) on every windows-changed event. The
+ * file transport crosses the slot processes for free. Service absent/disabled
+ * -> zero occluders -> exactly today's behavior.
+ *
+ * Rules (v1):
+ *  - IME windows always occlude (they layer above apps, and the overlay
+ *    layers above THEM).
+ *  - Application windows occlude when their a11y layer is above the client's.
+ *    The client's a11y window is matched by exact origin (+-4 px) — reliable
+ *    for freeform/mini windows, whose reported origin is physical. A client
+ *    that covers >=90% of the panel (fullscreen) instead treats every
+ *    intersecting NON-fullscreen application window as an occluder (a mini
+ *    window floating over a fullscreen client is always presented above it on
+ *    this OEM, but its a11y layer ordering is not trustworthy).
+ *  - A scaled occluder (OEM mini window) reports hybrid bounds — physical
+ *    origin + logical size (same tell as the client derivation) — so its
+ *    extent is corrected by the mini-window factor before subtraction.
+ */
+
+#define DXR_SAT_MAX_PIECES 64
+#define DXR_SAT_MAX_OCCLUDERS 24
+
+#define DXR_A11Y_TYPE_APPLICATION 1
+#define DXR_A11Y_TYPE_INPUT_METHOD 2
+
+struct dxr_occ_window
+{
+	int32_t type;
+	int32_t layer;
+	int32_t l, t, r, b;
+};
+
+static struct
+{
+	pthread_mutex_t mutex;
+	bool path_resolved;
+	char path[256];
+	int64_t last_mtime_ns;
+	int64_t last_size;
+	uint32_t count;
+	struct dxr_occ_window win[DXR_SAT_MAX_OCCLUDERS];
+} g_dxr_occ = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+
+static void
+dxr_occ_resolve_path(void)
+{
+	if (g_dxr_occ.path_resolved) {
+		return;
+	}
+	g_dxr_occ.path_resolved = true;
+	char cmdline[256] = {0};
+	FILE *f = fopen("/proc/self/cmdline", "r");
+	if (f == NULL) {
+		return;
+	}
+	size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+	fclose(f);
+	if (n == 0) {
+		return;
+	}
+	char *colon = strchr(cmdline, ':');
+	if (colon != NULL) {
+		*colon = 0; // slot process "<pkg>:dxrN" -> "<pkg>"
+	}
+	snprintf(g_dxr_occ.path, sizeof(g_dxr_occ.path), "/data/user/0/%s/files/dxr_occlusion.bin", cmdline);
+	struct stat st;
+	if (stat(g_dxr_occ.path, &st) != 0) {
+		// Not written yet (or legacy layout); /data/data is a compat symlink.
+		snprintf(g_dxr_occ.path, sizeof(g_dxr_occ.path), "/data/data/%s/files/dxr_occlusion.bin", cmdline);
+	}
+}
+
+//! Refresh the cached window list if the a11y service rewrote the file.
+static void
+dxr_occ_refresh(void)
+{
+	dxr_occ_resolve_path();
+	if (g_dxr_occ.path[0] == 0) {
+		return;
+	}
+	struct stat st;
+	if (stat(g_dxr_occ.path, &st) != 0) {
+		g_dxr_occ.count = 0;
+		return;
+	}
+	const int64_t mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+	if (mtime_ns == g_dxr_occ.last_mtime_ns && (int64_t)st.st_size == g_dxr_occ.last_size) {
+		return;
+	}
+	g_dxr_occ.last_mtime_ns = mtime_ns;
+	g_dxr_occ.last_size = (int64_t)st.st_size;
+	g_dxr_occ.count = 0;
+
+	FILE *f = fopen(g_dxr_occ.path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	uint32_t hdr[3] = {0};
+	if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == 0x434f5844 /*'DXOC'*/ && hdr[1] == 1) {
+		uint32_t count = hdr[2];
+		if (count > DXR_SAT_MAX_OCCLUDERS) {
+			count = DXR_SAT_MAX_OCCLUDERS;
+		}
+		if (fread(g_dxr_occ.win, sizeof(struct dxr_occ_window), count, f) == count) {
+			g_dxr_occ.count = count;
+		}
+	}
+	fclose(f);
+}
+
+//! Subtract rect o from every rect in list (dst space); returns new count.
+static uint32_t
+dxr_occ_subtract(struct xrt_rect *list, uint32_t count, int32_t ol, int32_t ot, int32_t or_, int32_t ob)
+{
+	struct xrt_rect out[DXR_SAT_MAX_PIECES];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const int32_t pl = list[i].offset.w, pt = list[i].offset.h;
+		const int32_t pr = pl + (int32_t)list[i].extent.w, pb = pt + (int32_t)list[i].extent.h;
+		if (or_ <= pl || ol >= pr || ob <= pt || ot >= pb) {
+			if (n < DXR_SAT_MAX_PIECES) {
+				out[n++] = list[i];
+			}
+			continue;
+		}
+		// Up to 4 bands around the occluder.
+		if (ot > pt && n < DXR_SAT_MAX_PIECES) { // top
+			out[n++] = (struct xrt_rect){{pl, pt}, {(uint32_t)(pr - pl), (uint32_t)(ot - pt)}};
+		}
+		if (ob < pb && n < DXR_SAT_MAX_PIECES) { // bottom
+			out[n++] = (struct xrt_rect){{pl, ob}, {(uint32_t)(pr - pl), (uint32_t)(pb - ob)}};
+		}
+		const int32_t mt = ot > pt ? ot : pt, mb = ob < pb ? ob : pb;
+		if (ol > pl && mb > mt && n < DXR_SAT_MAX_PIECES) { // left
+			out[n++] = (struct xrt_rect){{pl, mt}, {(uint32_t)(ol - pl), (uint32_t)(mb - mt)}};
+		}
+		if (or_ < pr && mb > mt && n < DXR_SAT_MAX_PIECES) { // right
+			out[n++] = (struct xrt_rect){{or_, mt}, {(uint32_t)(pr - or_), (uint32_t)(mb - mt)}};
+		}
+	}
+	memcpy(list, out, n * sizeof(*out));
+	return n;
+}
+
+/*!
+ * Clip one dst-space blit rect to the overlay and subtract occluding windows.
+ * Returns the number of pieces written to out (up to DXR_SAT_MAX_PIECES).
+ * Called with the weave mutex held (reads the geometry fields).
+ */
+static uint32_t
+weave_satellite_clip_and_occlude(
+    struct multi_compositor *mc, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, struct xrt_rect *out)
+{
+	if (dx0 < 0) dx0 = 0;
+	if (dy0 < 0) dy0 = 0;
+	if (dx1 > (int32_t)mc->weave.sat_w) dx1 = (int32_t)mc->weave.sat_w;
+	if (dy1 > (int32_t)mc->weave.sat_h) dy1 = (int32_t)mc->weave.sat_h;
+	if (dx1 <= dx0 || dy1 <= dy0) {
+		return 0;
+	}
+	out[0] = (struct xrt_rect){{dx0, dy0}, {(uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0)}};
+	uint32_t n = 1;
+
+	pthread_mutex_lock(&g_dxr_occ.mutex);
+	dxr_occ_refresh();
+	if (g_dxr_occ.count == 0 || !mc->weave.have_geometry) {
+		pthread_mutex_unlock(&g_dxr_occ.mutex);
+		return n;
+	}
+
+	const int32_t pw = (int32_t)mc->weave.sat_panel_w, ph = (int32_t)mc->weave.sat_panel_h;
+	// Client identification: exact-origin match, else the fullscreen rule.
+	int32_t client_layer = INT32_MIN;
+	for (uint32_t i = 0; i < g_dxr_occ.count; i++) {
+		const struct dxr_occ_window *w = &g_dxr_occ.win[i];
+		if (w->type != DXR_A11Y_TYPE_APPLICATION) {
+			continue;
+		}
+		if (w->l >= mc->weave.win_x - 4 && w->l <= mc->weave.win_x + 4 && w->t >= mc->weave.win_y - 4 &&
+		    w->t <= mc->weave.win_y + 4 && w->layer > client_layer) {
+			client_layer = w->layer;
+		}
+	}
+	const bool client_fullscreen = pw > 0 && ph > 0 &&
+	                               (int64_t)mc->weave.win_w * mc->weave.win_h * 10 >= (int64_t)pw * ph * 9;
+
+	static bool logged_active = false;
+	for (uint32_t i = 0; i < g_dxr_occ.count && n > 0; i++) {
+		const struct dxr_occ_window *w = &g_dxr_occ.win[i];
+		bool occludes = false;
+		if (w->type == DXR_A11Y_TYPE_INPUT_METHOD) {
+			occludes = true;
+		} else if (w->type == DXR_A11Y_TYPE_APPLICATION) {
+			// Skip the client's own window (origin match).
+			const bool is_client = w->l >= mc->weave.win_x - 4 && w->l <= mc->weave.win_x + 4 &&
+			                       w->t >= mc->weave.win_y - 4 && w->t <= mc->weave.win_y + 4;
+			if (is_client) {
+				continue;
+			}
+			if (client_layer != INT32_MIN) {
+				occludes = w->layer > client_layer;
+			} else if (client_fullscreen && pw > 0 && ph > 0) {
+				const bool w_fullscreen =
+				    (int64_t)(w->r - w->l) * (w->b - w->t) * 10 >= (int64_t)pw * ph * 9;
+				occludes = !w_fullscreen;
+			}
+		}
+		if (!occludes) {
+			continue;
+		}
+		int32_t wl = w->l, wt = w->t, wr = w->r, wb = w->b;
+		// Scaled-occluder correction: hybrid bounds (same tell as the client
+		// scale derivation) -> physical extent = logical * miniwindow factor.
+		if (pw > 0 && ph > 0 && wl >= 0 && wt >= 0 && (wr > pw || wb > ph)) {
+			float ms = 0.67f;
+			char v[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.satellite_miniwindow_scale", v) > 0 &&
+			    v[0] != 0) {
+				float parsed = strtof(v, NULL);
+				if (parsed > 0.05f && parsed <= 1.0f) {
+					ms = parsed;
+				}
+			}
+			wr = wl + (int32_t)((float)(wr - wl) * ms + 0.5f);
+			wb = wt + (int32_t)((float)(wb - wt) * ms + 0.5f);
+		}
+		// Panel -> overlay coords.
+		wl -= mc->weave.sat_off_x;
+		wr -= mc->weave.sat_off_x;
+		wt -= mc->weave.sat_off_y;
+		wb -= mc->weave.sat_off_y;
+		if (!logged_active) {
+			logged_active = true;
+			U_LOG_W("weave satellite(#1277): occlusion ACTIVE — first occluder type=%d layer=%d "
+			        "%d,%d-%d,%d (client layer %d)",
+			        w->type, w->layer, wl, wt, wr, wb, client_layer);
+		}
+		n = dxr_occ_subtract(out, n, wl, wt, wr, wb);
+	}
+	pthread_mutex_unlock(&g_dxr_occ.mutex);
+	return n;
 }
 
 /*!
@@ -1127,10 +1384,11 @@ weave_satellite_present(struct vk_bundle *vk,
 			dst_h = (int32_t)((float)mc->weave.win_h * scale + 0.5f);
 		}
 	}
-	if (dst_x < 0) dst_x = 0;
-	if (dst_y < 0) dst_y = 0;
-	if (dst_x + dst_w > (int32_t)mc->weave.sat_w) dst_w = (int32_t)mc->weave.sat_w - dst_x;
-	if (dst_y + dst_h > (int32_t)mc->weave.sat_h) dst_h = (int32_t)mc->weave.sat_h - dst_y;
+	// dst_x/dst_y may be negative and dst rect may exceed the overlay (an
+	// off-edge window, or a transitional geometry): the mapping stays linear
+	// and each blit below is clipped in DST space with source compensation.
+	// Pre-loop clamping here broke that linearity (the immersive-toggle bug:
+	// dst_y = -inset clamped to 0 shifted the whole weave by the inset).
 
 	// Per-RECT blits, not the whole output: the DP's non-tile region carries a
 	// low-alpha backdrop (the compose-under transparency model), and copying it
@@ -1169,23 +1427,40 @@ weave_satellite_present(struct vk_bundle *vk,
 		int32_t dy0 = dst_y + (int32_t)((float)sy0 * sy + 0.5f);
 		int32_t dx1 = dst_x + (int32_t)((float)sx1 * sx + 0.5f);
 		int32_t dy1 = dst_y + (int32_t)((float)sy1 * sy + 0.5f);
-		if (dx1 > (int32_t)mc->weave.sat_w) dx1 = (int32_t)mc->weave.sat_w;
-		if (dy1 > (int32_t)mc->weave.sat_h) dy1 = (int32_t)mc->weave.sat_h;
-		if (dx1 <= dx0 || dy1 <= dy0) {
-			continue;
+
+		// Clip in DST space (overlay bounds now; occlusion pieces subtract
+		// here too), then derive the source by the INVERSE mapping so a
+		// clipped edge shifts the source with it instead of smearing.
+		struct xrt_rect pieces[DXR_SAT_MAX_PIECES];
+		uint32_t n_pieces = weave_satellite_clip_and_occlude(mc, dx0, dy0, dx1, dy1, pieces);
+		for (uint32_t pi = 0; pi < n_pieces; pi++) {
+			const struct xrt_rect *p = &pieces[pi];
+			const int32_t px0 = p->offset.w, py0 = p->offset.h;
+			const int32_t px1 = px0 + (int32_t)p->extent.w, py1 = py0 + (int32_t)p->extent.h;
+			int32_t qx0 = (int32_t)((float)(px0 - dst_x) / sx + 0.5f);
+			int32_t qy0 = (int32_t)((float)(py0 - dst_y) / sy + 0.5f);
+			int32_t qx1 = (int32_t)((float)(px1 - dst_x) / sx + 0.5f);
+			int32_t qy1 = (int32_t)((float)(py1 - dst_y) / sy + 0.5f);
+			if (qx0 < 0) qx0 = 0;
+			if (qy0 < 0) qy0 = 0;
+			if (qx1 > (int32_t)mc->weave.out_w) qx1 = (int32_t)mc->weave.out_w;
+			if (qy1 > (int32_t)mc->weave.out_h) qy1 = (int32_t)mc->weave.out_h;
+			if (qx1 <= qx0 || qy1 <= qy0) {
+				continue;
+			}
+			VkImageBlit blit = {
+			    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			    .srcOffsets = {{qx0, qy0, 0}, {qx1, qy1, 1}},
+			    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			    .dstOffsets = {{px0, py0, 0}, {px1, py1, 1}},
+			};
+			// NEAREST: at 1:1 this is exact-copy semantics with zero filter
+			// risk; under a scale the physical-size weave is the real answer,
+			// not a nicer filter.
+			vk->vkCmdBlitImage(cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			                   VK_FILTER_NEAREST);
 		}
-		VkImageBlit blit = {
-		    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-		    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
-		    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-		    .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
-		};
-		// NEAREST: at 1:1 this is exact-copy semantics with zero filter risk;
-		// under a scale the physical-size weave (the pending P0 half) is the
-		// real answer, not a nicer filter.
-		vk->vkCmdBlitImage(cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-		                   VK_FILTER_NEAREST);
 	}
 
 	// Output back to what the next weave's render pass LOADs; swapchain image

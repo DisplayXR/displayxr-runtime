@@ -160,6 +160,25 @@
             android:name="org.freedesktop.monado.openxr_runtime.OpenXRRuntimeBroker"
             android:authorities="org.khronos.openxr.runtime_broker"
             android:exported="true" />
+            <!--
+            Weave satellite occlusion feed (#1277 P1). An AccessibilityService
+            is the only app-reachable source of other windows' rects + z-order;
+            the satellite clips the weave under overlapping 2D windows with it.
+            Opt-in (accessibility settings / adb on a dev box); disabled means
+            no occlusion, nothing else changes.
+        -->
+        <service
+            android:name=".WindowWatcherService"
+            android:exported="false"
+            android:label="DisplayXR Window Watcher"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/dxr_window_watcher" />
+        </service>
     </application>
 
 </manifest>

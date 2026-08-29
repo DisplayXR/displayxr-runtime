@@ -81,7 +81,8 @@ android_custom_surface::~android_custom_surface()
 
 struct android_custom_surface *
 android_custom_surface_async_start(
-    struct _JavaVM *vm, void *context, int32_t display_id, const char *surface_title, int32_t preferred_display_mode_id)
+    struct _JavaVM *vm, void *context, int32_t display_id, const char *surface_title, int32_t preferred_display_mode_id,
+                                   bool span_system_bars)
 {
 	jni::init(vm);
 	try {
@@ -121,6 +122,13 @@ android_custom_surface_async_start(
 		// (#499, e.g. cube_handle_vk_android).
 		int32_t flags =
 		    WindowManager_LayoutParams::FLAG_FULLSCREEN() | WindowManager_LayoutParams::FLAG_NOT_FOCUSABLE();
+		if (span_system_bars) {
+			// FLAG_LAYOUT_IN_SCREEN (0x100) | FLAG_LAYOUT_NO_LIMITS (0x200):
+			// lay the window out over the FULL panel, ignoring system-bar
+			// insets (no jni-wrap accessors for these; the constants are
+			// stable public API). See the header comment.
+			flags |= 0x00000100 | 0x00000200;
+		}
 
 		if (android_globals_is_instance_of_activity(android_globals_get_vm(), context)) {
 			displayContext = ctx;
