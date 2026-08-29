@@ -5509,7 +5509,16 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
 			        "rate. This is a correctness probe and WILL cost frame rate.");
 		}
-		if (c->repaint.enabled == 1 && c->target != nullptr) {
+		// #1264 reroute: there is deliberately no app-side target — the fill
+		// replays through the d3d11 arm — but the fill LOOP is still this
+		// thread. Gating on the target alone left the reroute with a working
+		// partition and zero fills: a 20 Hz panel, worse than every config
+		// this campaign measured (found on the first Unity verdict run).
+		bool have_fill_surface = c->target != nullptr;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		have_fill_surface = have_fill_surface || c->reroute.active;
+#endif
+		if (c->repaint.enabled == 1 && have_fill_surface) {
 			c->repaint_quit.store(false);
 			c->repaint_thread = std::thread(d3d12_repaint_thread, c);
 		} else if (c->repaint.enabled == 0) {
