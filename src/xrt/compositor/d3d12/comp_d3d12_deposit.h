@@ -155,7 +155,10 @@ comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
  */
 #define COMP_D3D12_DEPOSIT_PLANE_LOCAL2D 0u
 #define COMP_D3D12_DEPOSIT_PLANE_BACKDROP 1u
-#define COMP_D3D12_DEPOSIT_PLANE_COUNT 2u
+//! Tier-3 app-authored zone mask (R8 — the one non-RGBA plane). Sized at the
+//! MASK, the documented exception to panel-sizing.
+#define COMP_D3D12_DEPOSIT_PLANE_MASK 2u
+#define COMP_D3D12_DEPOSIT_PLANE_COUNT 3u
 
 /*!
  * One plane surface, both halves: the compositor copies into @ref resource12,

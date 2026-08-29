@@ -470,7 +470,9 @@ comp_d3d12_deposit_plane_ensure(struct comp_d3d12_deposit *dep, uint32_t plane, 
 	td.Height = height;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	// The mask is a scalar coverage plane, R8 on both ends (mirrors the VK
+	// deposit's PLANE_MASK); the 2D planes are the tier's RGBA family.
+	td.Format = (plane == COMP_D3D12_DEPOSIT_PLANE_MASK) ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;

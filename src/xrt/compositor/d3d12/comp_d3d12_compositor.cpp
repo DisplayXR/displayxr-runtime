@@ -340,7 +340,9 @@ struct comp_d3d12_compositor
 		uint64_t bd_copied_hash;
 		//! ADR-027 P4 wish publish sequence on this route.
 		uint64_t wish_seq;
-		bool authored_mask_warned;
+		//! Change-detection for the authored-mask staged->plane copy
+		//! ((res_gen << 48) | author_seq — either half moving re-copies).
+		uint64_t mask_copied_key;
 	} reroute;
 
 	//! Output target (DXGI swapchain).
@@ -1765,18 +1767,6 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
                             const struct u_canvas_rect *eff_canvas,
                             int32_t digest_proj_idx)
 {
-	if (bridged_authored || (have_explicit && !bridged_authored)) {
-		// Tier-3 authored masks have no transport on this route yet (the
-		// same follow-up class as the VK tier's #1274); the un-bridged
-		// explicit case is its bootstrap frame. 2D drops for these frames
-		// only; the 3D weave is unaffected.
-		if (!c->reroute.authored_mask_warned) {
-			c->reroute.authored_mask_warned = true;
-			U_LOG_W("#1264 reroute: app-authored masks are unsupported on this route yet — "
-			        "explicit-mask composites drop (tracked on #1264); the 3D weave is unaffected");
-		}
-		return false;
-	}
 	if (c->split_panel_w == 0 || c->split_panel_h == 0) {
 		return false;
 	}
@@ -1798,19 +1788,26 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	}
 
 	// The captured mask request rasters on the ARM (out_mask_req kinds ==
-	// COMP_VK_SPLIT_MASK_* numerically).
+	// COMP_VK_SPLIT_MASK_* numerically). A BRIDGED authored mask captured no
+	// raster and gates the composite off its plane instead — the own-legs
+	// capture block's exact exemption.
 	bool mask_ok = false;
 	if (c->out_mask_req.kind != D3D12_OUT_MASK_NONE && c->out_mask_req.count > 0) {
 		mask_ok = comp_vk_split_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
 		                                    c->out_mask_req.feather, c->out_mask_req.count,
 		                                    c->out_mask_req.w, c->out_mask_req.h);
 	}
-	if (!mask_ok) {
+	if (!mask_ok && !bridged_authored) {
 		return false;
 	}
 
-	const uint32_t mode =
-	    zones_frame ? COMP_D3D12_COMPOSITE_MODE_ZONES : COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
+	// ADR-027/#801 — a ZONES frame's explicit wish is PUBLISH-only, never a
+	// blend gate: the composite gates on the binary zone raster there. A
+	// legacy (non-zones) authored mask IS the gate — the hard M-lerp.
+	const bool mask_is_plane = bridged_authored && !zones_frame;
+	const uint32_t mode = zones_frame ? COMP_D3D12_COMPOSITE_MODE_ZONES
+	                     : mask_is_plane ? COMP_D3D12_COMPOSITE_MODE_LERP
+	                                     : COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
 	const bool opaque = c->transparent_background && debug_get_bool_option_present_opaque_comp();
 	const int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
 	const int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
@@ -1819,8 +1816,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 
 	comp_vk_split_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
 	                            box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
-	                            region_w, region_h, cx, cy, cw, ch, mode, opaque,
-	                            /*mask_is_plane=*/false);
+	                            region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane);
 
 	/*
 	 * ADR-027 P4 — the hardware zone WISH on this route (the VK caller's
@@ -4240,7 +4236,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * happens later, in the deposit half (@ref d3d12_stage_mask_plane).
 	 */
 	struct comp_d3d12_zone_mask *const authored_mask = d3d12_frame_authored_mask(c);
-	if (c->split_active && !d3d12_bind_mask_plane(c, authored_mask)) {
+	// #1264 reroute: the bind forks inside — a reroute bind failure degrades
+	// the mask feature (returns true), never the session, so this retire is
+	// own-legs-only by construction.
+	if ((c->split_active || d3d12_fill_arm_active(c)) && !d3d12_bind_mask_plane(c, authored_mask)) {
 		d3d12_split_retire(c, "the app-authored zone mask could not be transported to the scanout adapter",
 		                   COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
@@ -4636,6 +4635,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				c->repaint.backdrop_w = 0;
 				c->repaint.backdrop_h = 0;
 			}
+
+			// The MASK plane, staged before the composite decision and
+			// independently of it (#918 F1/D6 — a Tier-3 mask must be able
+			// to bootstrap). Fork inside stages the arm.
+			d3d12_stage_mask_plane(c, authored_mask);
 
 			// The Local2D/mask deposit half (fork inside stages the arm).
 			const bool deposited = d3d12_composite_zone_mask(
@@ -6373,6 +6377,32 @@ d3d12_frame_authored_mask(struct comp_d3d12_compositor *c)
 static bool
 d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
 {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (d3d12_fill_arm_active(c)) {
+		/*
+		 * #1264 reroute — the mask travels as a DEPOSIT plane (R8, sized at
+		 * the mask), bound on the arm by NT handle. A failure degrades THAT
+		 * FEATURE (mask_plane_live=false; the stage un-stages, and the
+		 * composite falls to the raster kinds), never the session — so this
+		 * always returns true on the reroute.
+		 */
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		if (mask == nullptr || c->reroute.dep == NULL || c->reroute.split == NULL) {
+			return true;
+		}
+		struct comp_d3d12_deposit_plane mp = {};
+		if (comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, mask->w,
+		                                    mask->h) &&
+		    comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, &mp) &&
+		    comp_vk_split_bind_mask_plane(c->reroute.split, mp.shared_handle, mp.generation, mp.width,
+		                                  mp.height)) {
+			c->mask_plane_live = true;
+			c->mask_plane_gen = mask->res_gen;
+		}
+		return true;
+	}
+#endif
 	if (!c->split_active || c->xbridge == nullptr) {
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
@@ -6433,6 +6463,62 @@ d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_ma
 static void
 d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
 {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (d3d12_fill_arm_active(c)) {
+		if (mask == nullptr || !c->mask_plane_live || c->reroute.split == NULL ||
+		    c->reroute.dep == NULL) {
+			// 0 un-stages: the recipe stamps the plane invalid rather than
+			// lending an older frame's pixels — the arm's exact contract.
+			if (c->reroute.split != NULL) {
+				comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+			}
+			return;
+		}
+		// A zones frame's explicit wish snapshot — the same refresh the
+		// own-legs stage does, for the same #1175 reason (the off-split
+		// stager never runs here).
+		if (c->zones_frame) {
+			d3d12_zone_mask_snapshot(mask, c->cmd_list);
+			if (c->zone_frame_wish_last != mask) {
+				c->zone_frame_wish_last = mask;
+			}
+		}
+		// The transport IS the copy: staged (PSR at rest) -> deposit plane
+		// (COMMON at rest), on content change only.
+		const uint64_t key = (mask->res_gen << 48) | (mask->author_seq & 0xFFFFFFFFFFFFull);
+		struct comp_d3d12_deposit_plane mp = {};
+		if (comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, &mp) &&
+		    mp.width == mask->w && mp.height == mask->h) {
+			if (key != c->reroute.mask_copied_key) {
+				D3D12_RESOURCE_BARRIER pre[2] = {};
+				pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				pre[0].Transition.pResource = mask->staged;
+				pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				pre[1] = pre[0];
+				pre[1].Transition.pResource = (ID3D12Resource *)mp.resource12;
+				pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+				pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+				c->cmd_list->ResourceBarrier(2, pre);
+				c->cmd_list->CopyResource((ID3D12Resource *)mp.resource12, mask->staged);
+				D3D12_RESOURCE_BARRIER post[2] = {};
+				post[0] = pre[0];
+				post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				post[1] = pre[1];
+				post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+				c->cmd_list->ResourceBarrier(2, post);
+				c->reroute.mask_copied_key = key;
+			}
+			comp_vk_split_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
+		} else {
+			comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+		}
+		return;
+	}
+#endif
 	if (!c->split_active || c->xbridge == nullptr) {
 		return;
 	}
