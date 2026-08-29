@@ -18,6 +18,14 @@
 // cross-adapter transport, both shared with the D3D11 legs.
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
+#include "comp_d3d12_deposit.h"
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+// #1264 heavy-d3d12 reroute: the same-adapter fill arm. Vulkan-free D3D11 code
+// that lives in comp_vk_native; consumes only the pure-D3D11 handoff struct.
+#include "vk_native/comp_vk_native_split.h"
+#else
+struct comp_vk_split; // the reroute fields exist either way; the code does not
+#endif
 
 #include "d3d11/comp_d3d11_window.h"
 
@@ -303,6 +311,30 @@ struct comp_d3d12_compositor
 	//! APP device if the split has to be retired mid-session (#918 D12-3). Not
 	//! owned — it is a function pointer supplied at create.
 	void *dp_factory;
+
+	//! #1264 heavy-d3d12 reroute: the D3D11 DP factory the d3d11 fill arm's
+	//! Stage A asks for a weaver with. Not owned; NULL means the reroute
+	//! refuses (`dp_refused_scanout`) and the tier keeps its own arm.
+	void *dp_factory_d3d11;
+
+	/*!
+	 * #1264 / ADR-039 heavy-d3d12 reroute. When ACTIVE this session's fill,
+	 * weave and present all belong to the d3d11 fill arm (`comp_vk_split` —
+	 * the measured event-immune engine): the renderer's atlas is an imported
+	 * D3D11 deposit slot, the compositor's own DP / target / out-device split
+	 * machinery is never created (one weaver per HWND — the split took it),
+	 * and the frame path exits through comp_vk_split_weave_and_present. The
+	 * own-legs arm remains the hybrid path and the DXR_SPLIT_D3D12_ROUTE=own
+	 * A/B control.
+	 */
+	struct
+	{
+		struct comp_vk_split *split;
+		struct comp_d3d12_deposit *dep;
+		bool active;
+		//! The DP canvas rect the frame path last published (repaint replays it).
+		struct xrt_rect canvas;
+	} reroute;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d12_target *target;
@@ -1553,6 +1585,100 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
  * explicit constraint is that the split must not lengthen it. Duration is
  * logged so a regression is visible rather than inferred.
  */
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+/*!
+ * #1264 heavy-d3d12: which arm does a SAME-ADAPTER engage run on? Default is
+ * the d3d11 fill arm (the measured winner — 2.2–2.9 ms fires under real app
+ * load where the d3d12 arm serializes at 8–9 ms; Intel preemption is
+ * draw-granular). `DXR_SPLIT_D3D12_ROUTE=own` keeps the tier's own out-arm,
+ * as the A/B control and for the cube-class record.
+ */
+static bool
+d3d12_reroute_route_d3d11(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_SPLIT_D3D12_ROUTE");
+		on = (e != NULL && strcmp(e, "own") == 0) ? 0 : 1;
+	}
+	return on == 1;
+}
+
+/*!
+ * #1264 heavy-d3d12 reroute Stage A: stand the d3d11 fill arm up for this
+ * session — comp_vk_split's Stage A1 (out device, HWND target, D3D11 DP per
+ * ADR-037 §3a), then the deposit ring, then wire the transport. Mirrors the VK
+ * compositor's A1/A2 split. Best-effort: any failure leaves the session on its
+ * stock path with the reason logged; nothing half-engages.
+ */
+static void
+d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
+                      struct xrt_device *xdev,
+                      int32_t display_screen_left,
+                      int32_t display_screen_top)
+{
+	const LUID app_luid = c->device->GetAdapterLuid();
+	struct comp_vk_split_info si = {};
+	si.xdev = xdev;
+	si.hwnd = c->hwnd;
+	si.dp_factory_d3d11 = c->dp_factory_d3d11;
+	si.has_shared_texture = c->has_shared_texture;
+	si.transparent_background = c->transparent_background;
+	// The gate this bool exists for is Vulkan's (a timeline semaphore the
+	// runtime cannot enable after the fact); D3D12 fences always interop.
+	si.app_timeline_semaphores = true;
+	si.render_packed_luid =
+	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
+	si.display_screen_left = display_screen_left;
+	si.display_screen_top = display_screen_top;
+	si.preferred_width = c->settings.preferred.width;
+	si.preferred_height = c->settings.preferred.height;
+
+	const char *short_reason = NULL;
+	if (comp_vk_split_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS ||
+	    c->reroute.split == NULL) {
+		c->split_off_reason = (short_reason != NULL) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — stock path",
+		        c->split_off_reason != NULL ? c->split_off_reason : "?");
+		return;
+	}
+
+	// The deposit ring at the worst-case system atlas (ADR-010's sizing rule,
+	// same numbers the own-legs arm bridges at).
+	uint32_t sys_w = 0, sys_h = 0;
+	if (xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
+	}
+	if (sys_w == 0 || sys_h == 0) {
+		sys_w = c->settings.preferred.width;
+		sys_h = c->settings.preferred.height;
+	}
+	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
+	    c->reroute.dep == NULL) {
+		comp_vk_split_retire(&c->reroute.split, "deposit creation failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+		return;
+	}
+
+	struct comp_vk_deposit_handoff handoff = {};
+	if (!comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
+	    !comp_vk_split_wire_bridge(c->reroute.split, &handoff)) {
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+		comp_vk_split_retire(&c->reroute.split, "bridge wire failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+		return;
+	}
+
+	c->reroute.active = true;
+	c->split_off_reason = NULL;
+	U_LOG_W(
+	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
+	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
+	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
+	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
+}
+#endif // COMP_D3D12_HAVE_D3D11_FILL_ARM
+
 static void
 d3d12_split_stage_a(struct comp_d3d12_compositor *c,
                     struct xrt_device *xdev,
@@ -1618,6 +1744,22 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
 	if (gate.same_adapter && gate.split_active) {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		if (d3d12_reroute_route_d3d11()) {
+			// #1264 heavy-d3d12: the same-adapter engage runs on the d3d11
+			// fill arm, not this tier's own out-device machinery — the
+			// measured route for real app load. Nothing of the own-legs
+			// Stage A below is created.
+			U_LOG_W(
+			    "#918 output-device split: ADR-039 same-adapter ENGAGE via the d3d11 fill arm on "
+			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute; DXR_SPLIT_D3D12_ROUTE=own for "
+			    "the own-legs arm)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
+			d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top);
+			return;
+		}
+#endif
 		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
 		// the point, not the copy. The "cross-adapter" heap below is simply
 		// a shared heap when both LUIDs match.
@@ -2007,6 +2149,11 @@ d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_request_display_mode(c->display_processor, true);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_request_display_mode(c->reroute.split, true);
+	}
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -2022,6 +2169,11 @@ d3d12_compositor_end_session(struct xrt_compositor *xc)
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_request_display_mode(c->display_processor, false);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_request_display_mode(c->reroute.split, false);
+	}
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -3649,13 +3801,57 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// occasional repaints and its multi-period blocks were the measured
 		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
 		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
-		if (c->repaint.partition.next_release_ns == 0) {
+		// #1264 reroute: no app-side target to pace against — the d3d11
+		// arm's own flip chain paces its weave.
+		if (c->repaint.partition.next_release_ns == 0 && c->target != nullptr) {
 			const uint64_t pace_t0 = os_monotonic_get_ns();
 			comp_d3d12_target_repaint_pace(c->target);
 			u_repaint_trace_pace(&c->repaint.trace, pace_t0, os_monotonic_get_ns());
 		}
 
 		std::lock_guard<std::mutex> lock(c->mutex);
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		/*
+		 * #1264 reroute: the fill IS the d3d11 arm's replay of the published
+		 * egress slot — zero bridge traffic, no app-device command list, no
+		 * DP or target on this side to test for. Same re-test discipline,
+		 * then the arm's own weave.
+		 */
+		if (c->reroute.active) {
+			if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
+			    c->repaint.app_frame_in_progress || c->reroute.split == NULL ||
+			    !comp_vk_split_has_weave_slot(c->reroute.split)) {
+				c->repaint.bail_armed++;
+				u_repaint_trace_bail_armed(&c->repaint.trace);
+				continue;
+			}
+			if (c->repaint.force != 1 &&
+			    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns,
+			                         &c->repaint.partition)) {
+				c->repaint.bail_race++;
+				u_repaint_trace_bail_race(&c->repaint.trace);
+				continue;
+			}
+
+			const uint64_t fire_t0 = os_monotonic_get_ns();
+			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
+			                                &c->reroute.canvas);
+			c->repaint.count++;
+			const uint64_t fire_t1 = os_monotonic_get_ns();
+			u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+			u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+			u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
+			static bool rr_logged = false;
+			if (!rr_logged) {
+				rr_logged = true;
+				U_LOG_W("#1264 reroute: filling via the d3d11 arm at %.1f Hz while the app is "
+				        "between frames",
+				        hz);
+			}
+			continue;
+		}
+#endif
 
 		// Re-test everything: a real frame may have landed while we paced, in
 		// which case it just did this work and there is nothing stale to fix.
@@ -4022,7 +4218,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
-						if (!c->split_active &&
+						// #1264 reroute: zero-copy hands the DP the APP's
+						// swapchain image; under the reroute the atlas MUST
+						// be the deposit slot the d3d11 arm ingests — a
+						// placement fact applied to the result, same as the
+						// split's (ADR-030's gate stays the sole eligibility
+						// test).
+						if (!c->split_active && !c->reroute.active &&
 						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
 							zc_resource = comp_d3d12_swapchain_get_resource(layer->sc_array[0], img_idx);
 							if (zc_resource != nullptr)
@@ -4084,6 +4286,42 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->split_active) {
 			comp_xbridge_pre_render(c->xbridge);
 		}
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		if (c->reroute.active && c->reroute.dep != NULL) {
+			/*
+			 * #1264 reroute — this frame's atlas IS a deposit slot. Ring
+			 * advance takes the GPU-side back-pressure wait on the app
+			 * queue (the d3d11 arm's release of the slot), and the renderer
+			 * is re-pointed at the slot's imported resource before any draw
+			 * records. A content growth past the ring (a mode change) grows
+			 * the ring first, under an app-queue idle — rare by
+			 * construction (the ring is worst-case-sized, ADR-010).
+			 */
+			uint32_t dep_w = 0, dep_h = 0;
+			comp_d3d12_deposit_get_dims(c->reroute.dep, &dep_w, &dep_h);
+			const uint32_t need_w = c->eff_layout.cols * c->eff_layout.tile_w;
+			const uint32_t need_h = c->eff_layout.rows * c->eff_layout.tile_h;
+			if (need_w > dep_w || need_h > dep_h) {
+				gpu_wait_idle_app(c);
+				comp_d3d12_deposit_resize(c->reroute.dep, need_w > dep_w ? need_w : dep_w,
+				                          need_h > dep_h ? need_h : dep_h);
+				comp_d3d12_deposit_get_dims(c->reroute.dep, &dep_w, &dep_h);
+			}
+			comp_d3d12_deposit_advance(c->reroute.dep, c->command_queue);
+			void *slot_res = comp_d3d12_deposit_current_resource(c->reroute.dep);
+			if (slot_res == NULL ||
+			    comp_d3d12_renderer_set_external_atlas(c->renderer, slot_res, dep_w, dep_h) !=
+			        XRT_SUCCESS) {
+				static bool bind_warned = false;
+				if (!bind_warned) {
+					bind_warned = true;
+					U_LOG_W("#1264 reroute: external atlas bind failed — this frame renders "
+					        "into the owned atlas and the arm weaves a stale slot");
+				}
+			}
+		}
+#endif
 		xret = comp_d3d12_renderer_draw_projection_pass(
 		    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
@@ -4132,6 +4370,89 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			return xret;
 		}
 	}
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	/*
+	 * #1264 reroute — THE frame exit. Execute the atlas work on the app queue,
+	 * signal the deposit fence past it, and hand the slot to the d3d11 fill
+	 * arm; nothing below (this tier's weave, crop, HUD, present) runs — the
+	 * arm owns all of it, exactly as it does for the VK tier. The CPU
+	 * idle-wait mirrors the VK path's post-submit wait (#837's, to remove on
+	 * both together): it is what lets the arm's ingress `Wait` always find
+	 * the atlas complete.
+	 */
+	if (c->reroute.active && c->reroute.split != NULL && c->reroute.dep != NULL) {
+		c->cmd_list->Close();
+		ID3D12CommandList *rr_lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, rr_lists);
+		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
+		gpu_wait_idle_app(c);
+
+		// Bring-up scope: projection-only. Zones / Local2D / authored-mask
+		// content has no plane transport on this route yet — say so once
+		// rather than tear or half-composite.
+		{
+			bool frame_has_2d = false;
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+				if (t != XRT_LAYER_PROJECTION && t != XRT_LAYER_PROJECTION_DEPTH) {
+					frame_has_2d = true;
+					break;
+				}
+			}
+			static bool warned_2d = false;
+			if (frame_has_2d && !warned_2d) {
+				warned_2d = true;
+				U_LOG_W("#1264 reroute: non-projection layers present — Local2D/zones/mask "
+				        "content is DROPPED on this route (bring-up limitation, tracked on "
+				        "#1264); the 3D weave is unaffected");
+			}
+		}
+		comp_vk_split_stage_no_composite(c->reroute.split);
+
+		struct comp_vk_deposit_handoff rr_handoff = {};
+		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
+			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
+			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
+			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
+		}
+
+		// The DP canvas: the effective canvas sub-rect when one is active,
+		// else the full target — the same answer the own weave computes.
+		struct xrt_rect rr_canvas = {};
+		if (eff_canvas.valid) {
+			rr_canvas.offset.w = eff_canvas.x;
+			rr_canvas.offset.h = eff_canvas.y;
+			rr_canvas.extent.w = (int32_t)eff_canvas.w;
+			rr_canvas.extent.h = (int32_t)eff_canvas.h;
+		} else {
+			rr_canvas.extent.w = (int32_t)tgt_width;
+			rr_canvas.extent.h = (int32_t)tgt_height;
+		}
+		c->reroute.canvas = rr_canvas;
+
+		const bool rr_wove = comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/false,
+		                                                     &rr_canvas);
+
+		// #868: arm the repaint replay exactly as the VK tier does — a frame
+		// that wove nothing keeps the panel's last woven frame and stays
+		// disarmed for the tick.
+		c->repaint.tgt_w = tgt_width;
+		c->repaint.tgt_h = tgt_height;
+		c->repaint.view_w = c->eff_layout.tile_w;
+		c->repaint.view_h = c->eff_layout.tile_h;
+		c->repaint.cols = c->eff_layout.cols;
+		c->repaint.rows = c->eff_layout.rows;
+		c->repaint.armed = rr_wove;
+		if (rr_wove) {
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+		}
+
+		comp_vk_split_render_diag(c->reroute.split);
+		return XRT_SUCCESS;
+	}
+#endif
 
 	// Shared texture mode: weave (or copy) atlas into shared texture, skip window present
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
@@ -4746,6 +5067,19 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #1264 reroute teardown: the arm first (its consumer holds NT opens of
+	// the deposit slots and quiesces its own device), then the deposit —
+	// AFTER the repaint join above, since the fill ticks drive the arm.
+	if (c->reroute.split != NULL) {
+		comp_vk_split_destroy(&c->reroute.split);
+	}
+	if (c->reroute.dep != NULL) {
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+	}
+	c->reroute.active = false;
+#endif
+
 	// Wait for GPU idle. Teardown is one of the only two places that must
 	// quiesce BOTH scopes, and it does so as two INDEPENDENT waits, each on
 	// its own queue's fence — never one wait covering both queues. Off the
@@ -4878,6 +5212,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *d3d12_device,
                              void *d3d12_command_queue,
                              void *dp_factory_d3d12,
+                             void *dp_factory_d3d11,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
@@ -4905,6 +5240,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
+	c->dp_factory_d3d11 = dp_factory_d3d11;
 	c->hud = NULL;
 	c->hud_texture = nullptr;
 	c->hud_upload_buffer = nullptr;
@@ -5120,11 +5456,20 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			d3d12_compositor_destroy(&c->base.base);
 			return XRT_ERROR_D3D;
 		}
-		xret = d3d12_make_target(c, transparent_background);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to create D3D12 target");
-			d3d12_compositor_destroy(&c->base.base);
-			return xret;
+		if (c->reroute.active) {
+			// #1264 reroute: the d3d11 fill arm owns the HWND's swapchain
+			// and present. The factory above stays — a future retire
+			// rebuilds the app-side target with it, exactly as a split
+			// retire does.
+			c->target = nullptr;
+			U_LOG_I("Skipping app-side DXGI swapchain (reroute — the d3d11 arm presents)");
+		} else {
+			xret = d3d12_make_target(c, transparent_background);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Failed to create D3D12 target");
+				d3d12_compositor_destroy(&c->base.base);
+				return xret;
+			}
 		}
 	} else {
 		c->target = nullptr;
@@ -5182,7 +5527,13 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// cannot drift apart. Everything the DP is told after creation (output
 	// format, transparency, shared-texture-present) moved in there with it.
 	c->dp_factory = dp_factory_d3d12;
-	if (dp_factory_d3d12 != NULL) {
+	if (c->reroute.active) {
+		// #1264 reroute: the d3d11 fill arm's Stage A already created the
+		// session's ONE weaver on the HWND (ADR-037 §3a negotiated in
+		// there); creating this tier's own DP too would put two weavers on
+		// one window — the hard rule d3d12_make_dp's doc carries.
+		U_LOG_I("Skipping app-side display processor (reroute — the d3d11 arm's weaver owns the HWND)");
+	} else if (dp_factory_d3d12 != NULL) {
 		if (!d3d12_make_dp(c) && c->split_active) {
 			/*
 			 * ADR-037 §3a — A WEAVER-CREATION FAILURE IS A FALLBACK TRIGGER,
@@ -5215,13 +5566,23 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 
 	// If display processor is available, query display pixel info to compute
 	// optimal view dimensions (scaled to window size, matching D3D11 model).
-	// Do NOT resize the app's window — _ext apps own their window.
-	if (c->display_processor != nullptr) {
+	// Do NOT resize the app's window — _ext apps own their window. Under the
+	// #1264 reroute the session's weaver lives in the d3d11 arm; ask it.
+	{
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_d3d12_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
+		bool px_ok = false;
+		if (c->display_processor != nullptr) {
+			px_ok = xrt_display_processor_d3d12_get_display_pixel_info(
+			    c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top);
+		}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		else if (c->reroute.active && c->reroute.split != NULL) {
+			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                             &disp_left, &disp_top);
+		}
+#endif
+		if (px_ok && disp_px_w > 0 && disp_px_h > 0) {
 			// Use half display width as base view dims
 			uint32_t base_vw = disp_px_w / 2;
 			uint32_t base_vh = disp_px_h;
@@ -5342,6 +5703,12 @@ comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 			return true;
 		}
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_get_predicted_eye_positions(c->reroute.split, out_eye_pos) &&
+		       out_eye_pos->valid;
+	}
+#endif
 
 	return false;
 }
@@ -5353,6 +5720,11 @@ comp_d3d12_compositor_get_display_dimensions(struct xrt_compositor *xc,
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_get_display_dimensions(c->reroute.split, out_width_m, out_height_m);
+	}
+#endif
 	return xrt_display_processor_d3d12_get_display_dimensions(
 	    c->display_processor, out_width_m, out_height_m);
 }
@@ -5385,23 +5757,34 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 		// Shared-texture (texture-app) sessions carry the app's window in
 		// app_hwnd (c->hwnd stays null); their metrics come from that window.
 		HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-		if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
+		bool have_dp = c->display_processor != nullptr;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		const bool have_reroute_dp = c->reroute.active && c->reroute.split != NULL;
+		have_dp = have_dp || have_reroute_dp;
+#endif
+		if (!have_dp || metrics_hwnd == nullptr) {
 			return false;
 		}
 
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (!xrt_display_processor_d3d12_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top)) {
-			return false;
-		}
-		if (disp_px_w == 0 || disp_px_h == 0) {
-			return false;
-		}
-
+		bool px_ok = false;
 		float disp_w_m = 0.0f, disp_h_m = 0.0f;
-		if (!xrt_display_processor_d3d12_get_display_dimensions(
-		        c->display_processor, &disp_w_m, &disp_h_m)) {
+		bool dim_ok = false;
+		if (c->display_processor != nullptr) {
+			px_ok = xrt_display_processor_d3d12_get_display_pixel_info(
+			    c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top);
+			dim_ok = xrt_display_processor_d3d12_get_display_dimensions(c->display_processor, &disp_w_m,
+			                                                            &disp_h_m);
+		}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		else if (have_reroute_dp) {
+			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                             &disp_left, &disp_top);
+			dim_ok = comp_vk_split_get_display_dimensions(c->reroute.split, &disp_w_m, &disp_h_m);
+		}
+#endif
+		if (!px_ok || disp_px_w == 0 || disp_px_h == 0 || !dim_ok) {
 			return false;
 		}
 
@@ -5477,6 +5860,14 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 		gpu_wait_idle_app(c);
 	}
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		// The d3d11 arm owns the weaver; it quiesces its own device around
+		// the switch, exactly as the VK tier's forward does.
+		return comp_vk_split_request_display_mode(c->reroute.split, enable_3d) ? XRT_SUCCESS
+		                                                                       : XRT_ERROR_D3D12;
+	}
+#endif
 	return xrt_display_processor_d3d12_request_display_mode(c->display_processor, enable_3d);
 }
 
@@ -5492,6 +5883,11 @@ comp_d3d12_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_set_eye_tracking_mode(c->display_processor, mode);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_set_eye_tracking_mode(c->reroute.split, mode);
+	}
+#endif
 }
 
 extern "C" void

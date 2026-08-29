@@ -237,6 +237,26 @@ void *
 comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 
 /*!
+ * #1264 heavy-d3d12 reroute: make @p resource (`ID3D12Resource *` — a D3D11
+ * deposit slot opened via OpenSharedHandle, BORROWED) the atlas render target.
+ * Call once per app frame BEFORE the draw as the deposit ring alternates; the
+ * two atlas views are re-pointed on change. In this mode the draw's atlas
+ * barriers run COMMON -> RENDER_TARGET -> COMMON (imported cross-API resources
+ * decay to COMMON, and COMMON is what the D3D11 reader consumes), the renderer
+ * never Release()s the atlas, and resize keeps bookkeeping only — the
+ * compositor grows the deposit ring instead. There is deliberately no way
+ * back to an owned atlas mid-session: a reroute retire tears the renderer
+ * down with the rest of the session state.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_set_external_atlas(struct comp_d3d12_renderer *renderer,
+                                       void *resource,
+                                       uint32_t alloc_w,
+                                       uint32_t alloc_h);
+
+/*!
  * Masked 2D-over-3D composite (#439, XR_DXR_local_3d_zone): records a
  * fullscreen-triangle draw into @p cmd_list that writes every pixel of the
  * window region per @p composite_mode: LERP = `M*weave + (1-M)*twod`
