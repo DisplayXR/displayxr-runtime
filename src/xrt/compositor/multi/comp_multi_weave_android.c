@@ -1028,8 +1028,16 @@ weave_satellite_present(struct vk_bundle *vk,
 		// Panel coordinates -> overlay-local (see sat_off_* in the header).
 		dst_x = mc->weave.win_x - mc->weave.sat_off_x + nudge_x;
 		dst_y = mc->weave.win_y - mc->weave.sat_off_y + nudge_y;
-		dst_w = (int32_t)((float)mc->weave.win_w * scale + 0.5f);
-		dst_h = (int32_t)((float)mc->weave.win_h * scale + 0.5f);
+		// Physical-rect mode weaves at win*scale already, so the output IS the
+		// on-panel size: present 1:1. (scale re-applied only if the weave ran
+		// logical — the legacy/pre-physical behaviour.)
+		if (mc->weave.out_w != mc->weave.win_w || mc->weave.out_h != mc->weave.win_h) {
+			dst_w = (int32_t)mc->weave.out_w;
+			dst_h = (int32_t)mc->weave.out_h;
+		} else {
+			dst_w = (int32_t)((float)mc->weave.win_w * scale + 0.5f);
+			dst_h = (int32_t)((float)mc->weave.win_h * scale + 0.5f);
+		}
 	}
 	if (dst_x < 0) dst_x = 0;
 	if (dst_y < 0) dst_y = 0;
@@ -1044,13 +1052,24 @@ weave_satellite_present(struct vk_bundle *vk,
 	// the overlay only ever owns pixels a weave actually claimed this frame.
 	const float sx = (dst_w > 0 && mc->weave.out_w > 0) ? (float)dst_w / (float)mc->weave.out_w : 1.0f;
 	const float sy = (dst_h > 0 && mc->weave.out_h > 0) ? (float)dst_h / (float)mc->weave.out_h : 1.0f;
+	// Physical-rect mode: the submitted rects are LOGICAL window coords, but the
+	// woven output is physical-sized — scale the source rects by out/logical.
+	// Identity in normal mode (out == logical).
+	const float rrx = (mc->weave.have_geometry && mc->weave.win_w > 0)
+	                      ? (float)mc->weave.out_w / (float)mc->weave.win_w
+	                      : 1.0f;
+	const float rry = (mc->weave.have_geometry && mc->weave.win_h > 0)
+	                      ? (float)mc->weave.out_h / (float)mc->weave.win_h
+	                      : 1.0f;
 	for (uint32_t i = 0; i < rect_count && rects != NULL; i++) {
 		const struct xrt_rect *r = &rects[i];
 		if (r->extent.w <= 0 || r->extent.h <= 0) {
 			continue;
 		}
-		int32_t sx0 = r->offset.w, sy0 = r->offset.h;
-		int32_t sx1 = sx0 + (int32_t)r->extent.w, sy1 = sy0 + (int32_t)r->extent.h;
+		int32_t sx0 = (int32_t)((float)r->offset.w * rrx + 0.5f);
+		int32_t sy0 = (int32_t)((float)r->offset.h * rry + 0.5f);
+		int32_t sx1 = sx0 + (int32_t)((float)r->extent.w * rrx + 0.5f);
+		int32_t sy1 = sy0 + (int32_t)((float)r->extent.h * rry + 0.5f);
 		if (sx0 < 0) sx0 = 0;
 		if (sy0 < 0) sy0 = 0;
 		if (sx1 > (int32_t)mc->weave.out_w) sx1 = (int32_t)mc->weave.out_w;
@@ -1262,6 +1281,30 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
+		// Satellite physical-rect weave (#1277 P0, second half): under an OEM
+		// container scale the window's PIXELS ON PANEL are logical*scale, and a
+		// weave computed at logical size then resampled is destroyed. When the
+		// satellite presents (and only then — the in-app path returns the
+		// output to a caller that expects logical dims), weave at the PHYSICAL
+		// size: output + scratch sized *scale, content blits scaled INTO the
+		// atlas, the DP phase slot fed the physical rect, and the overlay blit
+		// becomes 1:1 (the present path's ratios collapse automatically since
+		// out dims == physical). Factor from debug.dxr.satellite_scale until
+		// the platform exposes the real container scale (OEM-asks list).
+		// Batch path only: legacy clients keep logical semantics.
+		float sat_pscale = 1.0f;
+		if (weave_satellite_wanted(mc) && rect_count > 0) {
+			sat_pscale = weave_satellite_scale();
+			if (sat_pscale != 1.0f) {
+				static float logged_pscale = -1.0f;
+				if (logged_pscale != sat_pscale) {
+					logged_pscale = sat_pscale;
+					U_LOG_W("weave satellite(#1277): PHYSICAL-RECT weave, scale %.3f",
+					        (double)sat_pscale);
+				}
+			}
+		}
+
 		// Output dims: v6 = one content view; batch = the (window-client-sized)
 		// input; legacy = rect offset+extent.
 		uint32_t want_w = 0, want_h = 0;
@@ -1269,8 +1312,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			want_w = cvw;
 			want_h = cvh;
 		} else if (rect_count > 0) {
-			want_w = mc->weave.in_w;
-			want_h = mc->weave.in_h;
+			want_w = (uint32_t)((float)mc->weave.in_w * sat_pscale + 0.5f);
+			want_h = (uint32_t)((float)mc->weave.in_h * sat_pscale + 0.5f);
 		} else {
 			want_w = (uint32_t)rect_x + rect_w;
 			want_h = (uint32_t)rect_y + rect_h;
@@ -1509,21 +1552,27 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				continue;
 			}
 
+			// Physical-rect mode: content lands in the (physical-sized) atlas
+			// at scaled coordinates; identity when sat_pscale == 1.
+			const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+			const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+			const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+			const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
 			VkImageBlit blits[2] = {
 			    // Left eye: input rect's left half -> left tile, unsqueezed.
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
+			        .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
 			    },
 			    // Right eye: input rect's right half -> right tile (+out_w).
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
-			                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},
+			        .dstOffsets = {{(int32_t)mc->weave.out_w + dx0, dy0, 0},
+			                       {(int32_t)mc->weave.out_w + dx1, dy1, 1}},
 			    },
 			};
 			vk->vkCmdBlitImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
@@ -1566,9 +1615,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// geometry (or a DP without the slot) = display-scoped, which is correct
 		// only for a full-screen window at the panel origin.
 		if (mc->weave.have_geometry) {
+			// Physical-rect mode scales the on-panel client size; origin is
+			// already physical (the geometry feed reports screen coordinates).
+			const uint32_t dp_w = (uint32_t)((float)mc->weave.win_w * sat_pscale + 0.5f);
+			const uint32_t dp_h = (uint32_t)((float)mc->weave.win_h * sat_pscale + 0.5f);
 			bool fed = xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)mc->weave.dp, mc->weave.win_x, mc->weave.win_y,
-			    mc->weave.win_w, mc->weave.win_h, mc->weave.win_display_id);
+			    dp_w, dp_h, mc->weave.win_display_id);
 			if (mc->weave.geometry_dirty) {
 				mc->weave.geometry_dirty = false;
 				U_LOG_W("weave(#1036): window rect %s the DP phase slot", fed ? "fed to" : "NOT accepted by");
