@@ -4269,6 +4269,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint32_t tgt_height = c->settings.preferred.height;
 	if (c->target != nullptr) {
 		comp_d3d12_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+	} else if (d3d12_fill_arm_active(c) && c->hwnd != nullptr) {
+		/*
+		 * #1264 reroute: there is no app-side target, so the WINDOW itself
+		 * is the authority — and it moves: 3DLuma launches at its args size
+		 * and Screen.SetResolution()s to its authored size within seconds,
+		 * and users drag-resize. Falling back to settings.preferred here
+		 * froze the weave target at the launch size and the composite
+		 * clipped to the intersection (the rung-4 "bottom of the zone is
+		 * cut" finding — the bottom 448 px of an 840x1448 window never
+		 * composited). The arm's own chain follows via the per-frame
+		 * comp_vk_split_resize_target below, which early-outs on same dims.
+		 */
+		RECT rr;
+		if (GetClientRect(c->hwnd, &rr) && rr.right > 0 && rr.bottom > 0) {
+			tgt_width = (uint32_t)rr.right;
+			tgt_height = (uint32_t)rr.bottom;
+		}
 	} else if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
 		tgt_width = eff_canvas.w;
 		tgt_height = eff_canvas.h;
@@ -4540,6 +4557,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * the atlas complete.
 	 */
 	if (c->reroute.active && c->reroute.split != NULL && c->reroute.dep != NULL) {
+		// Follow the window FIRST — the weave target, the composite region
+		// and the canvas below all derive from this frame's dims, and the
+		// call early-outs on same size (steady state costs a compare).
+		(void)comp_vk_split_resize_target(c->reroute.split, tgt_width, tgt_height);
+
 		/*
 		 * #1264 plane transport — the same deposit half the own-legs split
 		 * runs, with the transport forked to the arm inside it. Recorded onto
