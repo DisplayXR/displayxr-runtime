@@ -232,7 +232,7 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay(JNIEnv *en
 
 	struct android_custom_surface *cs =
 	    android_custom_surface_async_start(vm, context, /*display_id*/ 0, "DisplayXR",
-	                                       /*preferred_display_mode_id*/ 0);
+	                                       /*preferred_display_mode_id*/ 0, false);
 	if (cs == nullptr) {
 		U_LOG_E("service: android_custom_surface_async_start failed (overlay mode)");
 		return;

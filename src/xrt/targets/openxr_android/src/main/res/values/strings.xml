@@ -26,4 +26,6 @@
     <string name="diag_flavor_hybrid">hybrid runtime (in-process + service)</string>
     <string name="diag_live_service_not_running">service not running</string>
     <string name="diag_copied">Report JSON copied to clipboard</string>
+    <!-- Weave satellite occlusion feed (#1277 P1) -->
+    <string name="dxr_window_watcher_desc">Lets DisplayXR clip glasses-free 3D content under overlapping windows. Reads only window positions, never content.</string>
 </resources>
