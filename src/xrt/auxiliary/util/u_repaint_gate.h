@@ -705,6 +705,13 @@ u_fill_shed_enabled(struct u_fill_shed *s)
 		if (v > 0) {
 			s->thresh_ns = (uint64_t)v * 1000000u;
 			s->enabled = 1;
+			// One-shot per loop, deliberately: the first shed A/B ran
+			// with no way to tell "armed but never tripped" from "the
+			// env never reached this loop" — a null that cannot name
+			// its own cause is not a measurement (#1264).
+			U_LOG_W("#1264 shed ARMED in this fill loop: fires > %ld ms shed fills for 2 periods "
+			        "(DXR_FILL_SHED_FIRE_MS)",
+			        v);
 		} else {
 			s->enabled = 2;
 		}
@@ -740,6 +747,15 @@ u_fill_shed_note_fire(struct u_fill_shed *s, uint64_t start_ns, uint64_t end_ns,
 	if (end_ns > start_ns && (end_ns - start_ns) > s->thresh_ns) {
 		s->shed_until_ns = end_ns + 2 * period_ns;
 		s->episodes++;
+		// The first few episodes in full, then sampled — an event window
+		// produces a burst of these and the absorption verdict needs the
+		// engagement visible, not the log flooded.
+		if (s->episodes <= 3 || (s->episodes % 32u) == 0u) {
+			U_LOG_W("#1264 shed: episode %u — fire %.2f ms > threshold; shedding fills "
+			        "for 2 periods (%llu fills shed so far)",
+			        s->episodes, (double)(end_ns - start_ns) / 1.0e6,
+			        (unsigned long long)s->sheds);
+		}
 	}
 }
 
