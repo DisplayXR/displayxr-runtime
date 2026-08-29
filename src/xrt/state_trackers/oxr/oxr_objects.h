@@ -1990,6 +1990,7 @@ struct oxr_system
 		bool external_fence_fd_enabled;
 		bool external_semaphore_fd_enabled;
 		bool timeline_semaphore_enabled;
+		bool win32_keyed_mutex_enabled;
 		bool debug_utils_enabled;
 		bool image_format_list_enabled;
 	} vk;

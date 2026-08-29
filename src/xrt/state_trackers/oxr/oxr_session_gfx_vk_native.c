@@ -384,6 +384,10 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    // its GPU-side sync is a D3D fence imported as a timeline semaphore,
 	    // which cannot be created on a device that never enabled the feature.
 	    sess->sys->vk.timeline_semaphore_enabled || debug_get_bool_option_force_timeline_semaphores_vk_deposit(),
+	    // ADR-039: was VK_KHR_win32_keyed_mutex enabled on the app's device?
+	    // The deposit's same-adapter sync rung needs the submit-time
+	    // keyed-mutex handshake, which is invalid without the extension.
+	    sess->sys->vk.win32_keyed_mutex_enabled,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

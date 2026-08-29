@@ -52,6 +52,15 @@
  * transparency bridge is (that acquire is a CPU-blocking call on the render
  * thread).
  *
+ * **KEYED-MUTEX mode (ADR-039 Phase A)** is the documented exception: a driver
+ * that exposes no D3D12_FENCE import at all (this box's Intel UHD VK ICD) gets
+ * a per-slot keyed mutex instead — key 0 on both sides (mutual exclusion, not a
+ * ready-handshake; the wedge argument lives at the mode selection in the
+ * create), bounded timeouts, skip-on-timeout. The consumer's acquire IS a
+ * short CPU block on the frame thread, comparable to the per-frame CPU wait
+ * the VK path already carries (#837) — accepted for Phase A bring-up, revisited
+ * if #837 lands. Plane deposits are unsupported in this mode.
+ *
  * ## Gate
  *
  * Everything here is behind `DXR_VK_DEPOSIT=1`. With the flag off no deposit is
@@ -104,6 +113,18 @@ struct comp_vk_deposit_handoff
 	void *texture;       //!< `ID3D11Texture2D *` — the slot Vulkan last wrote.
 	void *shared_handle; //!< `HANDLE` — NT share of @ref texture.
 
+	/*!
+	 * `IDXGIKeyedMutex *` of @ref texture, or NULL in fence mode. Non-NULL
+	 * means the deposit is in KEYED-MUTEX mode (no D3D12_FENCE import on this
+	 * driver — ADR-039 Phase A): @ref fence is NULL, and the consumer MUST
+	 * bracket its read with `AcquireSync(0, bounded_timeout)` /
+	 * `ReleaseSync(0)` — key 0, and SKIP the frame on timeout rather than
+	 * wait. The rationale for key 0 both sides (mutual exclusion, never a 0/1
+	 * ready-handshake) lives at the mode selection in
+	 * @ref comp_vk_deposit_create.
+	 */
+	void *keyed_mutex;
+
 	void *fence;               //!< `ID3D11Fence *` Vulkan signals from the atlas submit.
 	void *fence_shared_handle; //!< `HANDLE` — NT share of @ref fence.
 
@@ -145,7 +166,12 @@ struct comp_vk_deposit_handoff
  * @param app_timeline_semaphores The app's device has `VK_KHR_timeline_semaphore`
  *        enabled. The runtime cannot turn it on after the fact, and creating a
  *        timeline semaphore without it is undefined — so this is a hard gate,
- *        not a hint. False fails the create with a stated reason.
+ *        not a hint. False fails the create with a stated reason. FENCE mode
+ *        only: keyed-mutex mode does not create a timeline and ignores it.
+ * @param app_keyed_mutex The app's device has `VK_KHR_win32_keyed_mutex`
+ *        enabled. Consulted only when the device cannot import a D3D12_FENCE
+ *        (ADR-039 Phase A): true selects KEYED-MUTEX mode, false fails the
+ *        create with a stated reason.
  * @param width  Atlas width in pixels.
  * @param height Atlas height in pixels.
  * @param format The atlas `VkFormat` (must have a DXGI equivalent; only
@@ -157,6 +183,7 @@ struct comp_vk_deposit_handoff
 xrt_result_t
 comp_vk_deposit_create(struct vk_bundle *vk,
                        bool app_timeline_semaphores,
+                       bool app_keyed_mutex,
                        uint32_t width,
                        uint32_t height,
                        VkFormat format,
@@ -210,6 +237,17 @@ comp_vk_deposit_claim_signal(struct comp_vk_deposit *dep, VkSemaphore *out_semap
  */
 void
 comp_vk_deposit_abandon_signal(struct comp_vk_deposit *dep);
+
+/*!
+ * KEYED-MUTEX mode only (ADR-039 Phase A): chain the current slot's keyed-mutex
+ * acquire/release (key 0 both, bounded timeout) onto @p submit_info's pNext.
+ * No-op in fence mode or with no deposit — the caller invokes it unconditionally
+ * wherever @ref comp_vk_deposit_claim_signal returned no semaphore. The chain
+ * storage lives in the deposit and must not be raced by a second concurrent
+ * submit build (the renderer builds one at a time).
+ */
+void
+comp_vk_deposit_chain_km(struct comp_vk_deposit *dep, VkSubmitInfo *submit_info);
 
 /*!
  * VK-1 (#1178) — the consumer has taken its copy of @p slot; release it back to

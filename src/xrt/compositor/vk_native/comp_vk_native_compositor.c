@@ -247,6 +247,10 @@ struct comp_vk_native_compositor
 	//! Read only by the deposit, which cannot exist without it.
 	bool app_timeline_semaphores;
 
+	//! ADR-039: the app's VkDevice has VK_KHR_win32_keyed_mutex enabled.
+	//! Read only by the deposit's same-adapter sync rung.
+	bool app_keyed_mutex;
+
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
 
@@ -5753,6 +5757,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
+                                 bool app_keyed_mutex,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -5779,6 +5784,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// = false`, which is the runtime declaring what IT uses the bundle for, and
 	// changing it would move behaviour on the flag-off path.
 	c->app_timeline_semaphores = app_timeline_semaphores;
+	c->app_keyed_mutex = app_keyed_mutex;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -6548,7 +6554,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	deposit_required = (c->split != NULL);
 #endif
 	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height, atlas_width, atlas_height,
-	                                                   c->app_timeline_semaphores, deposit_required, &c->renderer);
+	                                                   c->app_timeline_semaphores, c->app_keyed_mutex,
+	                                                   deposit_required, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);

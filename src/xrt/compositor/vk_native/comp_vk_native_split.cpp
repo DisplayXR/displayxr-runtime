@@ -1677,8 +1677,35 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	}
 	comp_xbridge_stage_recipe(s->xbridge, &r);
 
+	/*
+	 * KEYED-MUTEX mode (ADR-039 Phase A): no importable fence on this driver,
+	 * so the ingress copy is bracketed by the slot's mutex instead — key 0 on
+	 * both sides, plain mutual exclusion against Vulkan's next rewrite of the
+	 * slot. The acquire is BOUNDED and a timeout SKIPS the frame (the fill arm
+	 * keeps re-weaving the previous egress slot): never an unbounded wait on
+	 * this thread (#925). Ordering of write-before-read is carried by the
+	 * frame path's per-frame CPU wait after the atlas submit (#837), so a
+	 * successful acquire here always sees a complete atlas.
+	 */
+	IDXGIKeyedMutex *km = (IDXGIKeyedMutex *)handoff->keyed_mutex;
+	if (km != nullptr) {
+		const HRESULT km_hr = km->AcquireSync(0, 100);
+		if (km_hr != S_OK) {
+			static uint32_t km_skips = 0;
+			if ((km_skips++ % 300u) == 0u) {
+				U_LOG_W(
+				    "#1264: deposit keyed-mutex AcquireSync did not resolve (hr=0x%08lx) — "
+				    "atlas ingress skipped this frame (%u skips so far)",
+				    (unsigned long)km_hr, km_skips);
+			}
+			return;
+		}
+	}
 	s->seq++;
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
+	if (km != nullptr) {
+		km->ReleaseSync(0);
+	}
 
 	/*
 	 * VK-1b — THE PLANE BACK-FENCE, and the one place this leg diverges from

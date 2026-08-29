@@ -72,6 +72,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
                                 bool app_timeline_semaphores,
+                                bool app_keyed_mutex,
                                 bool deposit_required,
                                 struct comp_vk_native_renderer **out_renderer);
 
