@@ -706,6 +706,16 @@ struct multi_compositor
 		//! (browser#173/#186); here the weave lands after that transform.
 		//! Every failure latches sat_failed and falls back bit-for-bit.
 		//! @{
+		//! Monotonic time of the last successful weave submit (#1278). Read
+		//! by the visibility pass on the multi main loop without the weave
+		//! mutex — an aligned 64-bit read on arm64 is atomic, and the 2 s
+		//! idle threshold dwarfs any tearing/jitter concern.
+		int64_t last_submit_ns;
+		//! #1278: the idle release already fired for the current idle period.
+		//! Cleared by the next successful submit (whose weave re-asserts the
+		//! lens on its own, so no explicit resume is required for the vote).
+		bool idle_released;
+
 		bool sat_checked; //!< Prop read once per client.
 		bool sat_enabled;
 		bool sat_failed; //!< One-shot: bring-up failed, use the return path.
