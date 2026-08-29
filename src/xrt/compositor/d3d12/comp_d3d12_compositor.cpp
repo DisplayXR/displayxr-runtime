@@ -334,6 +334,13 @@ struct comp_d3d12_compositor
 		bool active;
 		//! The DP canvas rect the frame path last published (repaint replays it).
 		struct xrt_rect canvas;
+		//! Change-detection for the scratch->plane copies (planes are
+		//! on-change surfaces; a steady frame costs a compare).
+		uint64_t l2d_copied_hash;
+		uint64_t bd_copied_hash;
+		//! ADR-027 P4 wish publish sequence on this route.
+		uint64_t wish_seq;
+		bool authored_mask_warned;
 	} reroute;
 
 	//! Output target (DXGI swapchain).
@@ -1585,6 +1592,19 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
  * explicit constraint is that the split must not lengthen it. Duration is
  * logged so a regression is visible rather than inferred.
  */
+//! #1264: the reroute is live for this session (always-defined so panel-sizing
+//! conditions read cleanly on builds without the arm).
+static inline bool
+d3d12_fill_arm_active(struct comp_d3d12_compositor *c)
+{
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	return c->reroute.active;
+#else
+	(void)c;
+	return false;
+#endif
+}
+
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 /*!
  * #1264 heavy-d3d12: which arm does a SAME-ADAPTER engage run on? Default is
@@ -1669,6 +1689,13 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 		return;
 	}
 
+	// The plane machinery's panel-sizing rule reads these (same source the
+	// own-legs Stage A fills them from).
+	if (xdev->hmd != NULL) {
+		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
+	}
+
 	c->reroute.active = true;
 	c->split_off_reason = NULL;
 	U_LOG_W(
@@ -1676,6 +1703,132 @@ d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
 	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
 	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
 	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
+}
+/*!
+ * Record a scratch -> deposit-plane copy on the app list. Both resources sit
+ * in COMMON at rest (the scratch's deposit-half steady state; the imported
+ * plane's cross-API decay state); the copy brackets its own states. Requires
+ * identical extents — both are panel-sized by the widened alloc conditions.
+ */
+static void
+d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scratch, ID3D12Resource *plane)
+{
+	D3D12_RESOURCE_BARRIER pre[2] = {};
+	pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	pre[0].Transition.pResource = scratch;
+	pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	pre[1] = pre[0];
+	pre[1].Transition.pResource = plane;
+	pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	c->cmd_list->ResourceBarrier(2, pre);
+
+	c->cmd_list->CopyResource(plane, scratch);
+
+	D3D12_RESOURCE_BARRIER post[2] = {};
+	post[0] = pre[0];
+	post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	post[1] = pre[1];
+	post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	c->cmd_list->ResourceBarrier(2, post);
+}
+
+/*!
+ * #1264 — the reroute's LOCAL2D staging: the transport fork of the deposit
+ * half. Everything semantic (the mask capture into out_mask_req, the Local2D
+ * flatten into the panel-sized scratch, the guards) already ran exactly as the
+ * own-legs split's; this copies the flatten into the deposit plane on content
+ * change, rasters the captured mask on the d3d11 arm (whose immediate-context
+ * device rasters inline, the shipped D3D11 leg's shape), and stamps the arm's
+ * recipe. Mode and mask-kind vocabularies are numerically identical across the
+ * legs (LERP/ALPHA_OVER/ZONES = 0/1/2; NONE/IMPLICIT/ZONE_BINARY/ZONE_FEATHER
+ * = 0/1/2/3), so both pass through.
+ *
+ * @return false when this frame cannot composite on the route — the caller
+ *         stamps no-composite, exactly like a failed own-legs deposit.
+ */
+static bool
+d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
+                            uint32_t region_w,
+                            uint32_t region_h,
+                            bool zones_frame,
+                            bool bridged_authored,
+                            bool have_explicit,
+                            const struct u_canvas_rect *eff_canvas,
+                            int32_t digest_proj_idx)
+{
+	if (bridged_authored || (have_explicit && !bridged_authored)) {
+		// Tier-3 authored masks have no transport on this route yet (the
+		// same follow-up class as the VK tier's #1274); the un-bridged
+		// explicit case is its bootstrap frame. 2D drops for these frames
+		// only; the 3D weave is unaffected.
+		if (!c->reroute.authored_mask_warned) {
+			c->reroute.authored_mask_warned = true;
+			U_LOG_W("#1264 reroute: app-authored masks are unsupported on this route yet — "
+			        "explicit-mask composites drop (tracked on #1264); the 3D weave is unaffected");
+		}
+		return false;
+	}
+	if (c->split_panel_w == 0 || c->split_panel_h == 0) {
+		return false;
+	}
+	if (!comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, c->split_panel_w,
+	                                     c->split_panel_h)) {
+		return false;
+	}
+	struct comp_d3d12_deposit_plane pl = {};
+	if (!comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, &pl)) {
+		return false;
+	}
+
+	struct xrt_rect box = {};
+	uint64_t hash = 0;
+	d3d12_local2d_digest(c, digest_proj_idx, /*over=*/true, region_w, region_h, &box, &hash);
+	if (hash != c->reroute.l2d_copied_hash) {
+		d3d12_reroute_copy_to_plane(c, c->local2d_scratch, (ID3D12Resource *)pl.resource12);
+		c->reroute.l2d_copied_hash = hash;
+	}
+
+	// The captured mask request rasters on the ARM (out_mask_req kinds ==
+	// COMP_VK_SPLIT_MASK_* numerically).
+	bool mask_ok = false;
+	if (c->out_mask_req.kind != D3D12_OUT_MASK_NONE && c->out_mask_req.count > 0) {
+		mask_ok = comp_vk_split_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
+		                                    c->out_mask_req.feather, c->out_mask_req.count,
+		                                    c->out_mask_req.w, c->out_mask_req.h);
+	}
+	if (!mask_ok) {
+		return false;
+	}
+
+	const uint32_t mode =
+	    zones_frame ? COMP_D3D12_COMPOSITE_MODE_ZONES : COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
+	const bool opaque = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+	const int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
+	const int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
+	const uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
+	const uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
+
+	comp_vk_split_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
+	                            box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
+	                            region_w, region_h, cx, cy, cw, ch, mode, opaque,
+	                            /*mask_is_plane=*/false);
+
+	/*
+	 * ADR-027 P4 — the hardware zone WISH on this route (the VK caller's
+	 * exact pattern): a zones frame publishes the binary raster the arm just
+	 * built; a non-zones frame clears.
+	 */
+	if (zones_frame) {
+		c->reroute.wish_seq++;
+		comp_vk_split_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
+	} else {
+		comp_vk_split_clear_zone_wish(c->reroute.split);
+	}
+	return true;
 }
 #endif // COMP_D3D12_HAVE_D3D11_FILL_ARM
 
@@ -4382,39 +4535,101 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * the atlas complete.
 	 */
 	if (c->reroute.active && c->reroute.split != NULL && c->reroute.dep != NULL) {
+		/*
+		 * #1264 plane transport — the same deposit half the own-legs split
+		 * runs, with the transport forked to the arm inside it. Recorded onto
+		 * the still-open app list so the flattens and the scratch->plane
+		 * copies ride this frame's execute + fence signal, and one fence
+		 * value covers planes AND atlas (the VK tier's exact pattern).
+		 */
+		{
+			// The 2D-UNDER backdrop, first — its extent rides the recipe.
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D12Resource *bd = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
+			c->repaint.backdrop = bd;
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+			bool bd_staged = false;
+			if (bd != nullptr && bd_w > 0 && bd_h > 0 && c->split_panel_w > 0 &&
+			    comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_BACKDROP,
+			                                    c->split_panel_w, c->split_panel_h)) {
+				struct comp_d3d12_deposit_plane bp = {};
+				if (comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_BACKDROP,
+				                                 &bp)) {
+					// The flatten leaves the scratch in PSR for a DP that,
+					// on this route, lives on the arm and never samples it —
+					// COMMON is where the copy promotes from.
+					D3D12_RESOURCE_BARRIER to_common = {};
+					to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					to_common.Transition.pResource = bd;
+					to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+					to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					c->cmd_list->ResourceBarrier(1, &to_common);
+
+					int32_t bproj = -1;
+					for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+						enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+						if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+							bproj = (int32_t)i;
+							break;
+						}
+					}
+					struct xrt_rect bd_box = {};
+					uint64_t bd_hash = 0;
+					d3d12_local2d_digest(c, bproj, /*over=*/false, bd_w, bd_h, &bd_box,
+					                     &bd_hash);
+					if (bd_hash != c->reroute.bd_copied_hash) {
+						d3d12_reroute_copy_to_plane(c, bd,
+						                            (ID3D12Resource *)bp.resource12);
+						c->reroute.bd_copied_hash = bd_hash;
+					}
+					comp_vk_split_stage_backdrop(c->reroute.split, bp.shared_handle,
+					                             bp.generation, bp.width, bp.height, bd_hash,
+					                             bd_box.offset.w, bd_box.offset.h,
+					                             (uint32_t)bd_box.extent.w,
+					                             (uint32_t)bd_box.extent.h, bd_w, bd_h);
+					bd_staged = true;
+				}
+			}
+			if (!bd_staged) {
+				// The NULL drop — un-stages the plane so a slot can never
+				// claim a backdrop it has no pixels for.
+				comp_vk_split_stage_backdrop(c->reroute.split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+				c->repaint.backdrop_w = 0;
+				c->repaint.backdrop_h = 0;
+			}
+
+			// The Local2D/mask deposit half (fork inside stages the arm).
+			const bool deposited = d3d12_composite_zone_mask(
+			    c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0,
+			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width,
+			    tgt_height, &eff_canvas, /*slot=*/-1, /*is_repaint=*/false);
+			if (!deposited) {
+				comp_vk_split_stage_no_composite(c->reroute.split);
+			}
+		}
+
+		// Plane back-pressure: nothing in this frame's execute may rewrite a
+		// plane the arm's producer is still reading. GPU-side, usually
+		// already satisfied.
+		comp_d3d12_deposit_plane_wait(c->reroute.dep, c->command_queue);
+
 		c->cmd_list->Close();
 		ID3D12CommandList *rr_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, rr_lists);
 		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
 		gpu_wait_idle_app(c);
 
-		// Bring-up scope: projection-only. Zones / Local2D / authored-mask
-		// content has no plane transport on this route yet — say so once
-		// rather than tear or half-composite.
-		{
-			bool frame_has_2d = false;
-			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-				enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
-				if (t != XRT_LAYER_PROJECTION && t != XRT_LAYER_PROJECTION_DEPTH) {
-					frame_has_2d = true;
-					break;
-				}
-			}
-			static bool warned_2d = false;
-			if (frame_has_2d && !warned_2d) {
-				warned_2d = true;
-				U_LOG_W("#1264 reroute: non-projection layers present — Local2D/zones/mask "
-				        "content is DROPPED on this route (bring-up limitation, tracked on "
-				        "#1264); the 3D weave is unaffected");
-			}
-		}
-		comp_vk_split_stage_no_composite(c->reroute.split);
-
 		struct comp_vk_deposit_handoff rr_handoff = {};
 		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
 			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
 			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
 			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
+			// The PLANE release edge, behind the pre_plane_write wait
+			// submit_atlas just recorded on the same D3D11 immediate
+			// context — one ordered stream, one signal for every plane.
+			comp_d3d12_deposit_note_planes_consumed(c->reroute.dep);
 		}
 
 		// The DP canvas: the effective canvas sub-rect when one is active,
@@ -7465,8 +7680,8 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 	 * writes only the region at the top-left, and the DP is told the region's
 	 * dims separately, exactly as it is off the split.
 	 */
-	const uint32_t bd_alloc_w = c->split_active ? c->split_panel_w : region_w;
-	const uint32_t bd_alloc_h = c->split_active ? c->split_panel_h : region_h;
+	const uint32_t bd_alloc_w = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_w : region_w;
+	const uint32_t bd_alloc_h = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_h : region_h;
 	if (!d3d12_ensure_backdrop_scratch(c, bd_alloc_w, bd_alloc_h)) {
 		return nullptr;
 	}
@@ -7695,7 +7910,7 @@ d3d12_local2d_digest(struct comp_d3d12_compositor *c,
 static void
 d3d12_clamp_region_to_panel(struct comp_d3d12_compositor *c, uint32_t *w, uint32_t *h)
 {
-	if (!c->split_active || c->split_panel_w == 0 || c->split_panel_h == 0) {
+	if ((!c->split_active && !d3d12_fill_arm_active(c)) || c->split_panel_w == 0 || c->split_panel_h == 0) {
 		return;
 	}
 	if (*w > c->split_panel_w) {
@@ -7745,7 +7960,11 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	 * atlas generation stops a slot being woven under the wrong mode, this stops
 	 * its pixels being composited under the wrong recipe.
 	 */
-	const bool split_deposit = c->split_active && prepare_only;
+	// #1264: the reroute runs the SAME deposit half (capture + flatten +
+	// stage), with the transport forked to the d3d11 arm at the staging
+	// site; the consume half stays own-legs-only (the arm composites on its
+	// own device).
+	const bool split_deposit = (c->split_active || d3d12_fill_arm_active(c)) && prepare_only;
 	const bool split_consume = c->split_active && !prepare_only;
 	struct comp_xbridge_recipe rec = {};
 	if (split_consume) {
@@ -8075,8 +8294,8 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 * top-left, and the composite derives the plane's uv scale from its own
 		 * extent, so a panel-sized plane samples the region 1:1.
 		 */
-		const uint32_t alloc_w = c->split_active ? c->split_panel_w : region_w;
-		const uint32_t alloc_h = c->split_active ? c->split_panel_h : region_h;
+		const uint32_t alloc_w = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_w : region_w;
+		const uint32_t alloc_h = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_h : region_h;
 		if (!d3d12_ensure_local2d_scratch(c, alloc_w, alloc_h)) {
 			ZC_BAIL("g5");
 		}
@@ -8140,6 +8359,20 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			 * compositable that nothing can composite. See d3d12_ensure_outcomp
 			 * for why the create is lazy at all.
 			 */
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+			if (d3d12_fill_arm_active(c)) {
+				// #1264 — the transport fork: the arm rasters the captured
+				// mask itself and composites on its own device, so the
+				// own-legs outcomp/xbridge below never runs.
+				if (!d3d12_reroute_stage_local2d(c, region_w, region_h, zones_frame,
+				                                 have_explicit && c->mask_plane_live, have_explicit,
+				                                 eff_canvas, zones_frame ? -1 : proj_idx)) {
+					c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+					return false;
+				}
+				return true;
+			}
+#endif
 			if (!d3d12_ensure_outcomp(c)) {
 				c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
 				return false;
