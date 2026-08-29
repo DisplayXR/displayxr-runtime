@@ -7,12 +7,17 @@ on, `=0` is the kill switch) **and for the in-process D3D11 tier** (Phase C,
 2026-08-29 — pulled forward as Phase B's reroute hypothesis probe and passed on first
 contact: engage clean, partition exact, acceptance leg with the event-immunity profile,
 eyeball with the planes verified; the tier consults the same accepted switch, and its
-bring-up env retired). Phase B (d3d12) remains bring-up: its own-legs arm is
-cube-class-accepted but serializes under real app load (3-of-3 ~105 s event dips;
-Intel preemption is draw-granular, so a HIGH-priority queue measured null), and its
-route for heavy apps is the PROVEN reroute through the d3d11 arm — hypothesis confirmed
-by the Phase C probe (fire= 2.3 ms flat under a same-API contender), build pending.
-The gl tier remains PROPOSED. (Designed 2026-08-28; commissioned as epic #1264
+bring-up env retired) **and for the D3D12 tier via the heavy-d3d12 reroute** (2026-08-29
+— the tier's own-legs arm serializes under real app load (3-of-3 ~105 s event dips;
+Intel preemption is draw-granular, so a HIGH-priority queue measured null), so a
+same-adapter d3d12 engage routes through the d3d11 fill arm by default
+(`DXR_SPLIT_D3D12_ROUTE=own` keeps the own-legs arm as the A/B control and the hybrid
+arm): full ladder — own-arm 8–9 ms fires to 1.4 ms through the arm at 60 flat,
+acceptance leg with events absorbed, planes bound with correct on-change copy cadence,
+and the eyeball including live drag-resize. The tier consults the same accepted switch;
+its bring-up env retired. The partition's `tier_supported` on d3d12 keys on the REROUTE
+being active — the own-legs arm still refuses the partition, since its event record
+never passed the matrix. The gl tier remains PROPOSED. (Designed 2026-08-28; commissioned as epic #1264
 workstream S4 —
 directive: *"one fill engine for every tier will be the key"*) · extends the #918
 output-device split beyond hybrid topologies · depends on the #1257 slot partition and

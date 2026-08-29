@@ -1892,10 +1892,17 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		gin.scanout_luid.high = sdesc.AdapterLuid.HighPart;
 	}
 
-	// ADR-039 Phase B bring-up: the D3D12 tier consults its OWN switch
-	// (default off) — never the accepted Phase A default, which belongs to
-	// the VK tier until this one earns its matrix.
-	gin.allow_same_adapter = comp_split_gate_env_same_adapter_d3d12();
+	// ADR-039 ACCEPTED for this tier via the heavy-d3d12 reroute (#1264,
+	// 2026-08-29: the full ladder — 8-9 ms own-arm fires to 1.4 ms through
+	// the d3d11 arm at 60 flat, acceptance leg with events absorbed, planes
+	// bound, and the eyeball incl. live resize — "ship it"). The tier now
+	// consults the accepted default (on; DXR_SPLIT_SAME_ADAPTER=0 is the
+	// shared kill switch); the DXR_SPLIT_SAME_ADAPTER_D3D12 bring-up env
+	// retired with the acceptance, as its contract said it would. The
+	// engage routes to the d3d11 fill arm by default
+	// (DXR_SPLIT_D3D12_ROUTE=own keeps the own-legs arm — the A/B control
+	// and the hybrid arm, whose partition record did NOT pass).
+	gin.allow_same_adapter = comp_split_gate_env_same_adapter();
 
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
@@ -1910,8 +1917,8 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			// Stage A below is created.
 			U_LOG_W(
 			    "#918 output-device split: ADR-039 same-adapter ENGAGE via the d3d11 fill arm on "
-			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute; DXR_SPLIT_D3D12_ROUTE=own for "
-			    "the own-legs arm)",
+			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute, accepted default; "
+			    "DXR_SPLIT_SAME_ADAPTER=0 reverts, DXR_SPLIT_D3D12_ROUTE=own for the own-legs arm)",
 			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
 			    (unsigned long)sdesc.AdapterLuid.LowPart);
 			d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top);
@@ -1922,8 +1929,9 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		// the point, not the copy. The "cross-adapter" heap below is simply
 		// a shared heap when both LUIDs match.
 		U_LOG_W(
-		    "#918 output-device split: ADR-039 same-adapter ENGAGE (Phase B bring-up) on '%ls' "
-		    "LUID=%08lx:%08lx — one fill engine for every tier (DXR_SPLIT_SAME_ADAPTER_D3D12)",
+		    "#918 output-device split: ADR-039 same-adapter ENGAGE on the OWN-LEGS arm on '%ls' "
+		    "LUID=%08lx:%08lx (DXR_SPLIT_D3D12_ROUTE=own — the A/B control; its event record did "
+		    "not pass the matrix, so the partition refuses on this arm)",
 		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
 		    (unsigned long)sdesc.AdapterLuid.LowPart);
 	} else if (gate.same_adapter) {
@@ -2405,12 +2413,14 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	// #1257 partition: block until the app's next slot BEFORE the lock —
 	// the repaint loop keeps weaving the other slots underneath this
-	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. This tier is
-	// UNSUPPORTED until ADR-039 Phase B passes its acceptance matrix
-	// (bring-up runs under DXR_APP_FRAME_DIVISOR_ANY_TIER=1); on
-	// acceptance this flips to c->split_active, the same structural
-	// coupling the VK tier ships.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier =
+	// the #1264 REROUTE only (the d3d11 fill arm, whose acceptance record
+	// carried the tier) — keying on the reroute being ACTIVE couples this
+	// gate to the accepted default by construction, the same structural
+	// coupling the VK and d3d11 tiers ship. The own-legs arm (hybrid, or
+	// DXR_SPLIT_D3D12_ROUTE=own) still refuses cleanly: its event record
+	// (3-of-3 deep dips) never passed the matrix.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, d3d12_fill_arm_active(c));
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 

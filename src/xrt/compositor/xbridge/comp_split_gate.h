@@ -354,16 +354,6 @@ bool
 comp_split_gate_env_same_adapter(void);
 
 /*!
- * ADR-039 Phase B bring-up (the D3D12 tier): `DXR_SPLIT_SAME_ADAPTER_D3D12=1`
- * lets the D3D12 leg engage the same-adapter split (default off until that
- * tier's own acceptance matrix passes; then it collapses into
- * @ref comp_split_gate_env_same_adapter and this env retires). Latched once
- * per process.
- */
-bool
-comp_split_gate_env_same_adapter_d3d12(void);
-
-/*!
  * The unlatched parser behind @ref comp_split_gate_env_requested, exposed so the
  * default flip is unit-testable (the latched wrapper answers once per process
  * and so can only ever be tested for one value).
