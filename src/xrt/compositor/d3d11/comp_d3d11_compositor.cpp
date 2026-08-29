@@ -1009,11 +1009,13 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// #1257 partition: the exception to the note above — an EXPLICITLY
 	// requested app slow-down (DXR_APP_FRAME_DIVISOR >= 2). Blocks until
 	// the app's next slot BEFORE the lock; the repaint loop keeps weaving
-	// the other slots underneath this sleep. No-op when unset. This
-	// in-process tier is UNSUPPORTED (fill loop tick starvation, #1257
-	// follow-up) — the throttle refuses cleanly unless the bring-up env
-	// override is set.
-	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, /*tier_supported=*/false);
+	// the other slots underneath this sleep. No-op when unset. Supported
+	// tier = the #918 split's d3d11 fill arm (ADR-039 Phase C accepted for
+	// this leg, #1264) — keying on the split being ACTIVE couples this
+	// gate to DXR_SPLIT_SAME_ADAPTER's default by construction, exactly
+	// as the VK tier ships. In-process (split-off) sessions still refuse
+	// cleanly.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, c->split_active);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -4147,10 +4149,14 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			gin.scanout_luid = d3d11_split_luid(sdesc.AdapterLuid);
 		}
 
-		// ADR-039 Phase C bring-up: the D3D11 tier consults its OWN switch
-		// (default off) — never the accepted Phase A default, which belongs
-		// to the VK tier until this one earns its matrix.
-		gin.allow_same_adapter = comp_split_gate_env_same_adapter_d3d11();
+		// ADR-039 Phase C ACCEPTED (#1264, 2026-08-29: engage clean,
+		// partition exact, the event-immunity leg — 1-of-3 dips, steady
+		// 54-60 otherwise — and the eyeball with the planes verified:
+		// "looks good -- and ye bubble shows"). The tier now consults the
+		// accepted default (on; DXR_SPLIT_SAME_ADAPTER=0 is the kill
+		// switch); the DXR_SPLIT_SAME_ADAPTER_D3D11 bring-up env retired
+		// with the acceptance, as its contract said it would.
+		gin.allow_same_adapter = comp_split_gate_env_same_adapter();
 
 		struct comp_split_gate_result gate = {};
 		comp_split_gate_evaluate(&gin, &gate);
@@ -4170,9 +4176,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			// open is a same-adapter open (no PCIe hop), exactly the
 			// shape the VK tier's accepted Phase A record runs.
 			U_LOG_W(
-			    "D3D11 output-device split: ADR-039 same-adapter ENGAGE (Phase C bring-up) on "
+			    "D3D11 output-device split: ADR-039 same-adapter ENGAGE on "
 			    "'%ls' LUID=%08lx:%08lx — one fill engine for every tier "
-			    "(DXR_SPLIT_SAME_ADAPTER_D3D11)",
+			    "(DXR_SPLIT_SAME_ADAPTER=0 reverts)",
 			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
 			    (unsigned long)sdesc.AdapterLuid.LowPart);
 		} else if (gate.same_adapter) {
