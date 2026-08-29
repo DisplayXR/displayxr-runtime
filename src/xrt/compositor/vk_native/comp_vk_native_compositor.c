@@ -1427,8 +1427,11 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 	// #1257 partition: block until the app's next slot BEFORE taking any
 	// lock — the repaint loop keeps weaving the other slots underneath
 	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier
-	// = the #918 split (d3d11 bridge) only — the measured config; the
-	// throttle refuses cleanly elsewhere (see u_app_partition.h).
+	// = the #918 split's d3d11 fill arm, hybrid OR same-adapter (ADR-039
+	// Phase A accepted) — the measured configs; the throttle refuses
+	// cleanly elsewhere (see u_app_partition.h). Keying on the split
+	// being ACTIVE is what couples this gate to DXR_SPLIT_SAME_ADAPTER's
+	// default by construction.
 	{
 		bool part_tier_ok = false;
 #ifdef XRT_OS_WINDOWS

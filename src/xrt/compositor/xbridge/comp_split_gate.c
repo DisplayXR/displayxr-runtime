@@ -67,12 +67,19 @@ comp_split_gate_env_same_adapter(void)
 {
 	static int on = -1;
 	if (on < 0) {
-		// ADR-039 Phase A bring-up switch. Default OFF until the tier
-		// passes the #1260 acceptance matrix at >=5-minute legs; the
-		// default then flips together with the partition tier gate, in
-		// one commit, and this inverts into a kill switch.
+		/*
+		 * ADR-039 Phase A: DEFAULT ON — the kill switch is `=0`.
+		 *
+		 * Flipped on the complete acceptance record (#1264, 2026-08-29):
+		 * keyed-mutex smoke clean, partition D=3 exact on both bring-up
+		 * apps, the 68-window >=5-minute leg flat through 3+ of the
+		 * ~105 s events, and the eyeball on the configuration that
+		 * opened #1257. The VK tier's partition support keys on the
+		 * split being active (comp_vk_native_compositor.c), so this
+		 * default and that gate flip together by construction.
+		 */
 		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER");
-		on = (e != NULL && e[0] == '1') ? 1 : 0;
+		on = (e != NULL && e[0] == '0') ? 0 : 1;
 	}
 	return on == 1;
 }

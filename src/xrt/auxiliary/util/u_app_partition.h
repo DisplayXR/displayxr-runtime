@@ -113,9 +113,10 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 	/*
 	 * Tier gate: refuse cleanly, never collapse the display. The
 	 * measured supported tier is the VK compositor over the #918
-	 * output-device split (the d3d11 bridge): its fill loop ticks at
-	 * ~400/s and its schedule is vsync-locked — verified steady 60 with
-	 * the eyeball sign-off. The in-process vk_native/d3d12 tiers tick at
+	 * output-device split's d3d11 fill arm — hybrid AND same-adapter
+	 * (ADR-039 Phase A, #1264): the arm ticks at ~400-585/s and its
+	 * schedule is vsync-locked — verified steady 60 with the eyeball
+	 * sign-off in both topologies. Purely in-process tiers tick at
 	 * 100-175/s (17-19 ms intervals, same build, same box) and cannot
 	 * fill the schedule; throttling the app there collapses the panel to
 	 * ~35 updates/s, strictly worse than stock. So on an unsupported
@@ -129,7 +130,8 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 				p->logged = 1;
 				U_LOG_W("#1257 partition: DXR_APP_FRAME_DIVISOR=%u REFUSED on this "
 				        "tier (fill loop cannot sustain the schedule; measured "
-				        "supported tier is the d3d11-bridge/hybrid path). App runs "
+				        "supported tier is the #918 split's d3d11 fill arm — hybrid "
+				        "or same-adapter, ADR-039). App runs "
 				        "unthrottled; DXR_APP_FRAME_DIVISOR_ANY_TIER=1 overrides "
 				        "for bring-up",
 				        d);
