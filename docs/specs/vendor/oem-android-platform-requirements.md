@@ -1204,3 +1204,23 @@ vendor asks before committing to a firmware spin.
   (compose-under transparency), [#1087](https://github.com/DisplayXR/displayxr-runtime/issues/1087)
   (WM↔SF desync), [#1090](https://github.com/DisplayXR/displayxr-runtime/issues/1090),
   [#663](https://github.com/DisplayXR/displayxr-runtime/issues/663) (ADPF finding)
+
+## Trusted weave overlay (weave satellite, runtime#1277)
+
+The runtime's weave-satellite present surface is a `TYPE_APPLICATION_OVERLAY`
+window with `FLAG_NOT_TOUCHABLE` (input must pass through to the apps beneath).
+Stock Android's anti-tapjacking policy clamps such an overlay to **0.8 window
+alpha**, which blends 20% of the content beneath into the woven output — on a
+lenticular panel that reads as per-eye crosstalk and destroys the weave
+(field-measured on NP02J: HWC `alpha: 204` vs the required 255; lifting the
+clamp restored a weave indistinguishable from the in-app golden reference).
+
+**The platform must compose the runtime's satellite overlay at full opacity.**
+Acceptable implementations: grant the runtime's overlay trusted-overlay status
+(`setTrustedOverlay`), whitelist its package from the obscuring-opacity clamp,
+or ship `maximum_obscuring_opacity_for_touch=1.0` for the runtime's windows.
+The device-global `settings put global maximum_obscuring_opacity_for_touch 1.0`
+works but weakens tapjacking protection system-wide — a per-package exemption
+is the right shape. The satellite also benefits from the overlay being
+DEVICE-composited (it is on NP02J) — forcing it through GPU client composition
+adds latency and a resample risk.

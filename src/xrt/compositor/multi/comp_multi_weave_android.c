@@ -753,12 +753,55 @@ weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 		// opaque with a loud log (a fully-opaque black overlay would "work" but
 		// blank the launcher — better visible in the log than mysterious).
 		VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-		if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+		// debug.dxr.satellite_opaque=1: A/B knob — composite the overlay OPAQUE
+		// (alpha ignored; surround is black, page hidden). Diagnostic for the
+		// woven-alpha under-blend theory: the DP writes per-pixel alpha in the
+		// compose-under model, and a premultiplied overlay then BLENDS the
+		// woven rect with whatever the caller drew beneath (its mono scratch),
+		// which reads as single-eye crosstalk. Opaque compositing makes that
+		// blend impossible; if the crosstalk vanishes, the fix is forcing the
+		// woven rect's alpha to 1 in the satellite copy.
+		char opq[PROP_VALUE_MAX] = {0};
+		const bool force_opaque =
+		    __system_property_get("debug.dxr.satellite_opaque", opq) > 0 && opq[0] == '1';
+		if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)) {
 			alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-		} else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR) {
+		} else if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)) {
 			alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+		} else if (force_opaque) {
+			U_LOG_W("weave satellite(#1277): OPAQUE composite forced (debug.dxr.satellite_opaque)");
 		} else {
 			U_LOG_W("weave satellite(#1277): no translucent compositeAlpha; overlay will be OPAQUE");
+		}
+
+		// Colorspace: the weave output is CALIBRATED PANEL VALUES (the
+		// anti-crosstalk precompensation is baked in), so any compositor
+		// color transform after the weave breaks eye separation. The in-app
+		// path's buffer rides dataspace UNKNOWN (no CSC); an explicit
+		// SRGB_NONLINEAR swapchain may be color-managed by the DPU. Prefer
+		// PASS_THROUGH (no CSC, matching the in-app path); fall back to
+		// whatever the surface offers, loudly.
+		VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+		{
+			VkSurfaceFormatKHR formats[16];
+			uint32_t n_formats = ARRAY_SIZE(formats);
+			VkResult fret = vk->vkGetPhysicalDeviceSurfaceFormatsKHR(
+			    vk->physical_device, mc->weave.sat_surface, &n_formats, formats);
+			if (fret == VK_SUCCESS || fret == VK_INCOMPLETE) {
+				bool has_pass_through = false;
+				for (uint32_t i = 0; i < n_formats; i++) {
+					U_LOG_W("weave satellite(#1277): surface format[%u] vkformat=%d colorspace=%d",
+					        i, (int)formats[i].format, (int)formats[i].colorSpace);
+					if (formats[i].format == WEAVE_VK_FORMAT &&
+					    formats[i].colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+						has_pass_through = true;
+					}
+				}
+				if (has_pass_through) {
+					colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+					U_LOG_W("weave satellite(#1277): using PASS_THROUGH colorspace (no compositor CSC)");
+				}
+			}
 		}
 
 		uint32_t min_images = caps.minImageCount + 1;
@@ -771,7 +814,7 @@ weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 		    .surface = mc->weave.sat_surface,
 		    .minImageCount = min_images,
 		    .imageFormat = WEAVE_VK_FORMAT,
-		    .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+		    .imageColorSpace = colorspace,
 		    .imageExtent = caps.currentExtent,
 		    .imageArrayLayers = 1,
 		    .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -789,6 +832,43 @@ weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
 		}
 		mc->weave.sat_w = caps.currentExtent.width;
 		mc->weave.sat_h = caps.currentExtent.height;
+
+		// Overlay-local vs panel coordinates. The overlay view is inset by the
+		// system bars, so window-rect (panel) coordinates must be shifted by
+		// the overlay's own origin before blitting. Only the size difference
+		// is queryable from here; ASSUME the inset is top/left (the status bar
+		// on this hardware — landscape top bar measured 60 px, matching
+		// panel_h - extent). Wrong on a bottom-inset device by exactly the
+		// inset; revisit with a real view-origin query when the Java side
+		// grows one.
+		mc->weave.sat_off_x = 0;
+		mc->weave.sat_off_y = 0;
+		{
+			struct xrt_android_display_metrics metrics = {0};
+			struct _JavaVM *mvm = android_globals_get_vm();
+			void *mctx = android_globals_get_context();
+			if (mvm != NULL && mctx != NULL &&
+			    android_custom_surface_get_display_metrics(mvm, mctx, &metrics)) {
+				int32_t pw = metrics.width_pixels, ph = metrics.height_pixels;
+				// Metrics are natural-orientation; match against the
+				// current-extent orientation.
+				if ((mc->weave.sat_w > mc->weave.sat_h) != (pw > ph)) {
+					int32_t t = pw;
+					pw = ph;
+					ph = t;
+				}
+				if (ph > (int32_t)mc->weave.sat_h) {
+					mc->weave.sat_off_y = ph - (int32_t)mc->weave.sat_h;
+				}
+				if (pw > (int32_t)mc->weave.sat_w) {
+					mc->weave.sat_off_x = pw - (int32_t)mc->weave.sat_w;
+				}
+				U_LOG_W("weave satellite(#1277): overlay origin on panel: (%d,%d) "
+				        "(panel %dx%d, extent %ux%u)",
+				        mc->weave.sat_off_x, mc->weave.sat_off_y, pw, ph, mc->weave.sat_w,
+				        mc->weave.sat_h);
+			}
+		}
 
 		mc->weave.sat_image_count = ARRAY_SIZE(mc->weave.sat_images);
 		ret = vk->vkGetSwapchainImagesKHR(vk->device, mc->weave.sat_swapchain,
@@ -921,11 +1001,33 @@ weave_satellite_present(struct vk_bundle *vk,
 	// Placement: caller-reported window geometry x the container-scale prop,
 	// clamped to the panel. No geometry yet -> panel origin at output size.
 	const float scale = weave_satellite_scale();
+	// Phase-meter nudge (diagnostic): debug.dxr.satellite_shift_x / _y shift the
+	// blit destination by whole pixels (may be negative). A left/right-asymmetric
+	// crosstalk that a +-1..3 px x-nudge cures IS a sub-lens-pitch displacement,
+	// and the value that cures it measures the displacement directly.
+	int32_t nudge_x = 0, nudge_y = 0;
+	{
+		char v[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.satellite_shift_x", v) > 0) {
+			nudge_x = atoi(v);
+		}
+		v[0] = 0;
+		if (__system_property_get("debug.dxr.satellite_shift_y", v) > 0) {
+			nudge_y = atoi(v);
+		}
+		static int32_t last_nx = INT32_MIN, last_ny = INT32_MIN;
+		if (nudge_x != last_nx || nudge_y != last_ny) {
+			last_nx = nudge_x;
+			last_ny = nudge_y;
+			U_LOG_W("weave satellite(#1277): blit nudge (%d,%d)", nudge_x, nudge_y);
+		}
+	}
 	int32_t dst_x = 0, dst_y = 0;
 	int32_t dst_w = (int32_t)mc->weave.out_w, dst_h = (int32_t)mc->weave.out_h;
 	if (mc->weave.have_geometry) {
-		dst_x = mc->weave.win_x;
-		dst_y = mc->weave.win_y;
+		// Panel coordinates -> overlay-local (see sat_off_* in the header).
+		dst_x = mc->weave.win_x - mc->weave.sat_off_x + nudge_x;
+		dst_y = mc->weave.win_y - mc->weave.sat_off_y + nudge_y;
 		dst_w = (int32_t)((float)mc->weave.win_w * scale + 0.5f);
 		dst_h = (int32_t)((float)mc->weave.win_h * scale + 0.5f);
 	}
@@ -971,9 +1073,12 @@ weave_satellite_present(struct vk_bundle *vk,
 		    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 		    .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
 		};
+		// NEAREST: at 1:1 this is exact-copy semantics with zero filter risk;
+		// under a scale the physical-size weave (the pending P0 half) is the
+		// real answer, not a nicer filter.
 		vk->vkCmdBlitImage(cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		                   mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-		                   VK_FILTER_LINEAR);
+		                   VK_FILTER_NEAREST);
 	}
 
 	// Output back to what the next weave's render pass LOADs; swapchain image

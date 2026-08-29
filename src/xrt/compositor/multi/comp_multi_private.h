@@ -720,6 +720,15 @@ struct multi_compositor
 		VkSemaphore sat_done_sem;
 		VkFence sat_fence;
 		VkCommandBuffer sat_cmd;
+		//! The overlay surface's own on-screen origin. The MonadoView is laid
+		//! out BELOW the status bar (CUTOUT_SHORT_EDGES), so its swapchain is
+		//! panel-minus-insets (measured 2560x1540 on the 2560x1600 NP02J) and
+		//! its local (0,0) is NOT the panel origin. Blitting window-rect
+		//! coordinates without subtracting this displaced the weave by the
+		//! inset — a subpixel-grid mismatch that showed as a low-frequency
+		//! view-alternation beat (field report). Inferred as panel - extent,
+		//! top/left-inset assumption documented at the computation.
+		int32_t sat_off_x, sat_off_y;
 		//! @}
 	} weave;
 #endif
