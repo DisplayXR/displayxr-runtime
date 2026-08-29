@@ -106,10 +106,23 @@ screencap cross-correlation proved content+placement identical, isolating the fa
 to scanout composition — **screenshots cannot see HWC-level blending; dump the HWC
 layer list.**
 
-**Physical-rect weave: implemented, smoke-passed** (`debug.dxr.satellite_scale`;
-scale=1 bit-path-identical, scale=0.67 weaves at exactly logical×0.67 with the DP
-fed the physical rect). Mini-window crispness awaits a human eyeball with the scale
-prop set — the acceptance case below.
+**Physical-rect weave: ACCEPTED, human-verified (2026-08-29 morning)** — with
+`debug.dxr.satellite_scale=0.67` and the browser dragged to the OEM mini-window,
+the cube was judged **"crisp 3D"** on NP02J: the P0 acceptance case (test 2 below),
+the one no app-side weave can do. Expected artifact while the knob is set globally:
+a *fullscreen* window then shows a 0.67-size woven rect over the browser's own mono
+draw — the prop is a stand-in for the real per-window scale, which is the P1
+auto-derivation item (fullscreen→1.0, each freeform window→its true OS scale).
+
+**Rotation: fixed post-soak** — the overnight rotation check was a false green (it
+asserted only no-failures and could not see rendering). Portrait→landscape left the
+stale portrait swapchain on screen (squished duplicate over the fresh frame) because
+tolerating SUBOPTIMAL had removed the only rotation signal. Fix: detect the
+out-vs-overlay orientation mismatch and **rebuild only the swapchain with
+`oldSwapchain` chaining** — the overlay view survives rotation via
+surfaceChanged-in-place (measured), and a full view release/re-ensure collides with
+the #558 single-window globals (stale published window → IN_USE latch, 121 retry
+frames measured). Round-trip rebuild ~55 ms/direction, clean both ways.
 
 **#1278 weave-idle lens release: shipped and OS-verified** on the same branch
 (lens vote released 2.0 s after the last submit — the OEM backlight service logs
@@ -125,13 +138,13 @@ prop toggle, idle-release ×3, rotation ×2.
 
 On NP02J, `debug.dxr.weave_satellite=1`, browser at hello-cube:
 
-1. Fullscreen: crisp 3D via the overlay (parity with today).
-2. **OEM mini-window: crisp 3D** — the case no app-side weave can ever do,
+1. ✅ Fullscreen: crisp 3D via the overlay (parity with today) — "yes clean !!" / golden.
+2. ✅ **OEM mini-window: crisp 3D** — "cube is crisp 3D !" (scale prop 0.67) — the case no app-side weave can ever do,
    and the entire point (browser#186's wedge and #173's phase class are both
    structurally impossible here: the satellite target is never scaled and
    never resizes with the window).
-3. Freeform→fullscreen→freeform cycling: stable (no per-cycle state in the
-   client-facing path).
+3. ✅ Freeform→fullscreen→freeform cycling + rotation: stable (swapchain-only
+   rebuild on orientation change; no per-cycle state in the client-facing path).
 4. `debug.dxr.weave_satellite=0` restores today's behaviour bit-for-bit.
 
 ## Risks / open questions
