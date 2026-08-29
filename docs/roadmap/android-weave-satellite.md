@@ -22,6 +22,27 @@ Architecture C's P0 is therefore **not** a new IPC design. It is a
 present-mode flip inside the service: weave into a surface the *service* owns
 and presents, instead of into an output buffer returned to the client.
 
+## Second P0 reduction (recon, same night): the overlay half already ships
+
+`Java_org_freedesktop_monado_ipc_MonadoImpl_nativeCreateServiceOverlay`
+(`service_target.cpp`) is the #558 avatar-over-launcher machinery: the SERVICE
+self-creates a `TYPE_APPLICATION_OVERLAY` surface with **no Activity** via
+`android_custom_surface` (works from the service Context; `debug.dxr.transparent`
+makes it TRANSLUCENT; `android_custom_surface_can_draw_overlays` gates it;
+the #558 stale-overlay heal covers client restarts), publishes it through
+`android_globals`, and the compositor presents into it. So the satellite's
+present surface, permission handling, translucency and lifecycle are shipped,
+field-tested code.
+
+**P0's entire remaining delta is the weave divert** in
+`comp_multi_weave_android.c`: on `debug.dxr.weave_satellite=1`, acquire the
+overlay window (same `android_custom_surface` path), build a
+`VK_KHR_android_surface` swapchain on it (`comp_window_android` shows the
+recipe), and per submit blit the woven output into it at the window's physical
+rect instead of returning `weavedTexture`. One blit + present per frame, all
+inside machinery this file already owns (it has the vk bundle, the queue-lock
+discipline, and the geometry via `set_window_geometry`).
+
 ## P0 scope: one browser window, satellite-presented weave
 
 ```
