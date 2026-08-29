@@ -397,6 +397,18 @@ struct comp_d3d12_renderer
 	uint32_t atlas_alloc_width;
 	uint32_t atlas_alloc_height;
 
+	/*!
+	 * #1264 heavy-d3d12 reroute: the atlas is an EXTERNAL, imported resource
+	 * (a D3D11 deposit slot opened via OpenSharedHandle) the renderer does
+	 * NOT own — never Release()d here, swapped per frame by
+	 * comp_d3d12_renderer_set_external_atlas as the deposit ring alternates.
+	 * Imported cross-API resources decay to COMMON at command-list
+	 * boundaries, so in this mode the draw enters COMMON -> RENDER_TARGET
+	 * and exits back to COMMON (the cross-API-safe state the D3D11 reader
+	 * sees), instead of the owned atlas's PIXEL_SHADER_RESOURCE round trip.
+	 */
+	bool external_atlas;
+
 	//! When true, view dims are fixed at legacy compromise scale and
 	//! set_tile_layout must not recompute them.
 	bool legacy_app_tile_scaling;
@@ -1400,7 +1412,8 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->root_signature != nullptr) {
 		r->root_signature->Release();
 	}
-	if (r->atlas_texture != nullptr) {
+	if (r->atlas_texture != nullptr && !r->external_atlas) {
+		// An external atlas is a BORROWED deposit slot — the deposit owns it.
 		r->atlas_texture->Release();
 	}
 	if (r->srv_heap != nullptr) {
@@ -1460,11 +1473,14 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
-	// Transition atlas to RENDER_TARGET for shader-based stretch-blit
+	// Transition atlas to RENDER_TARGET for shader-based stretch-blit.
+	// External (imported) atlases live in COMMON between draws — see the
+	// external_atlas field doc.
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = renderer->atlas_texture;
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.StateBefore = renderer->external_atlas ? D3D12_RESOURCE_STATE_COMMON
+	                                                          : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
@@ -1786,12 +1802,14 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
-	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE for DP
+	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE for the DP —
+	// or back to COMMON for an external atlas (the D3D11 reader's state).
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = renderer->atlas_texture;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	barrier.Transition.StateAfter = renderer->external_atlas ? D3D12_RESOURCE_STATE_COMMON
+	                                                         : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
 
@@ -1939,6 +1957,54 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer)
 }
 
 extern "C" xrt_result_t
+comp_d3d12_renderer_set_external_atlas(struct comp_d3d12_renderer *renderer,
+                                       void *resource,
+                                       uint32_t alloc_w,
+                                       uint32_t alloc_h)
+{
+	if (renderer == nullptr || resource == nullptr || alloc_w == 0 || alloc_h == 0) {
+		return XRT_ERROR_D3D12;
+	}
+	ID3D12Resource *res = (ID3D12Resource *)resource;
+
+	// Steady state: the deposit ring alternates between two resources, so
+	// after warmup this is a pointer compare on every other frame.
+	if (renderer->external_atlas && renderer->atlas_texture == res &&
+	    renderer->atlas_alloc_width == alloc_w && renderer->atlas_alloc_height == alloc_h) {
+		return XRT_SUCCESS;
+	}
+
+	// Crossing INTO external mode drops the owned atlas once; every later
+	// call is a borrow swap and releases nothing.
+	if (!renderer->external_atlas && renderer->atlas_texture != nullptr) {
+		renderer->atlas_texture->Release();
+	}
+	renderer->atlas_texture = res;
+	renderer->external_atlas = true;
+	renderer->atlas_alloc_width = alloc_w;
+	renderer->atlas_alloc_height = alloc_h;
+
+	// Re-point the two atlas views (RTV heap slot 0, SRV heap slot 0) at the
+	// new resource — the same views create_atlas_texture builds for the owned
+	// atlas, byte for byte.
+	auto internals = get_internals(renderer->c);
+	ID3D12Device *device = internals->device;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = renderer->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	device->CreateRenderTargetView(res, nullptr, rtv_handle);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Texture2D.MipLevels = 1;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	device->CreateShaderResourceView(res, &srv_desc, srv_cpu);
+
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
 comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
                            uint32_t new_view_width,
                            uint32_t new_view_height,
@@ -1970,6 +2036,16 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 	bool fits = have_atlas && req_w <= renderer->atlas_alloc_width &&
 	            req_h <= renderer->atlas_alloc_height;
 	if (fits) {
+		renderer->view_width = new_view_width;
+		renderer->view_height = new_view_height;
+		renderer->texture_height = new_texture_height;
+		return XRT_SUCCESS;
+	}
+
+	// #1264 external-atlas mode: the allocation belongs to the deposit — the
+	// compositor grows the deposit ring and re-binds BEFORE the draw; this
+	// function only keeps the view bookkeeping honest.
+	if (renderer->external_atlas) {
 		renderer->view_width = new_view_width;
 		renderer->view_height = new_view_height;
 		renderer->texture_height = new_texture_height;

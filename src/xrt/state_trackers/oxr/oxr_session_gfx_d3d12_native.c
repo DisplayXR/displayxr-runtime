@@ -100,10 +100,14 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 
 	// Get D3D12 display processor factory and display top-left from system compositor info
 	void *dp_factory_d3d12 = NULL;
+	// #1264 heavy-d3d12 reroute: the d3d11 fill arm asks the plug-in for a
+	// D3D11 weaver, so the D3D11 factory rides along; NULL keeps it off.
+	void *dp_factory_d3d11 = NULL;
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	if (sys->xsysc != NULL) {
 		dp_factory_d3d12 = sys->xsysc->info.dp_factory_d3d12;
+		dp_factory_d3d11 = sys->xsysc->info.dp_factory_d3d11;
 		display_screen_left = sys->xsysc->info.display_screen_left;
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
@@ -112,7 +116,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
 	xrt_result_t xret = comp_d3d12_compositor_create(
 	    xdev, window_handle, shared_texture_handle,
 	    (void *)next->device, (void *)next->queue,
-	    dp_factory_d3d12, transparent_background,
+	    dp_factory_d3d12, dp_factory_d3d11, transparent_background,
 	    display_screen_left, display_screen_top, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

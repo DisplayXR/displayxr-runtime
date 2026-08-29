@@ -34,6 +34,10 @@ extern "C" {
  * @param d3d12_device The D3D12 device from the application's graphics binding (ID3D12Device*).
  * @param d3d12_command_queue The D3D12 command queue from the graphics binding (ID3D12CommandQueue*).
  * @param dp_factory_d3d12 Display processor factory (xrt_dp_factory_d3d12_fn_t), or NULL.
+ * @param dp_factory_d3d11 D3D11 display processor factory (xrt_dp_factory_d3d11_fn_t),
+ *                         or NULL — consumed only by the #1264 heavy-d3d12 reroute,
+ *                         whose d3d11 fill arm asks the plug-in for a D3D11 weaver.
+ *                         NULL simply keeps the reroute off.
  * @param transparent_background When true (and hwnd != NULL), bind the swapchain via
  *                               DirectComposition with ALPHA_MODE_PREMULTIPLIED for
  *                               desktop transparency. Otherwise opaque (#163 default).
@@ -53,6 +57,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *d3d12_device,
                              void *d3d12_command_queue,
                              void *dp_factory_d3d12,
+                             void *dp_factory_d3d11,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
