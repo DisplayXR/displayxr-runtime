@@ -296,7 +296,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **76 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **78 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -316,6 +316,8 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_APP_FRAME_DIVISOR` | `auxiliary/util/u_app_partition.h` (`u_app_partition_throttle` in each in-process wait_frame; engagement read by the repaint gate + loop tick) | `getenv`, cached | off (1) | App | 2 | #1257 slot partition: xrWaitFrame releases the app every Dth vblank (D=2..8) and the repaint loop fills the other slots at panel rate with a KNOWN N=D schedule — steady output cadence, no fire/commit collision by construction. **Supported tier: the #918 split (d3d11 bridge / hybrid) only** — verified steady 60 with eyeball sign-off; in-process vk_native/d3d12/gl tiers REFUSE cleanly (fill-loop tick starvation, 17-19 ms vs 1.8-2.3 ms on the bridge; follow-up). The natural Control Panel "smooth motion, lower app rate" control and the hook for face-tracking-driven rate later. Not wired into Metal or the IPC/service path |
 | `DXR_APP_FRAME_DIVISOR_ANY_TIER` | `auxiliary/util/u_app_partition.h` (`u_app_partition_throttle` tier gate) | `getenv`, cached | off | App | 4 | Bring-up override: lets the partition throttle engage on an UNSUPPORTED tier (which collapses the panel there today). For the in-process-tier follow-up work only |
 | `DXR_DP_FORWARD_HORIZON` | `compositor/util/comp_weave_latency_win.h` (`predict_weave_to_scanout_ns`, feeds the DP `set_predicted_scanout` slot from the split + d3d11 + d3d12 weave paths) | `getenv`, cached | **on** (kill switch) | App | 1 | #206: per-weave FORWARD horizon for the vendor eye predictor, computed from the vsync-locked vblank grid (DXGI frame statistics — measured period, not nominal). `0` disables → the DP falls back to its retrospective smoothed heuristic, the pre-#206 behavior |
+| `DXR_FILL_FENCE_PARK` | `compositor/vk_native/comp_vk_native_compositor.c` (fill path of `vk_dp_weave_and_present`) | `getenv`, cached | **on** (kill switch) | App | 1 | #1264 S1: a fill's GPU fence wait releases the compositor lock (re-validated on retake; superseded fills are dropped). `0` restores the lock-held synchronous wait |
+| `DXR_FILL_MMCSS` | `auxiliary/util/u_fill_thread_win.h` (`u_fill_thread_join_mmcss`, all four fill threads) | `getenv` at thread start | **on** (kill switch) | App | 1 | #1264 S2: fill threads join MMCSS "Pro Audio" (avrt loaded dynamically). `0` keeps them plain threads |
 | `DXR_WEAVE_REPAINT_HASH` | `compositor/d3d11/comp_d3d11_compositor.cpp:4454` | `getenv` at create | off | App | 4 | Content-identity hash probe on repainted frames |
 | `DXR_WEAVE_REPAINT_APPTHREAD` | `compositor/gl/comp_gl_compositor.cpp:4788` | `getenv`, cached | off | App | 4 | #885 bisect: replay the repaint path on the app thread to separate "replay broken" from "DP is thread-affine" |
 | `DXR_WEAVE_REPAINT_DIAG` | `compositor/gl/comp_gl_compositor.cpp:3117, 3324, 3434` | `getenv`, cached per site | off | App | 4 | #885 per-thread FBO / blit-error / texel probe |
@@ -431,7 +433,7 @@ grep -rhoE '"DXR_[A-Z0-9_]+"' src/xrt \
   | sort -u
 ```
 
-As of this writing that yields **76** names, all present above. Read sites and mechanisms
+As of this writing that yields **78** names, all present above. Read sites and mechanisms
 were machine-derived by intersecting that list with lines containing `getenv`,
 `GetEnvironmentVariable` or `DEBUG_GET_ONCE`, then spot-verified line by line. If the
 count changes, the table is stale.

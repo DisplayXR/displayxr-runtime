@@ -53,6 +53,7 @@
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -519,6 +520,16 @@ struct comp_vk_native_compositor
 	 */
 	VkFence repaint_fence;
 	VkCommandPool repaint_cmd_pool;
+
+	/*!
+	 * #1264 S1: count of successful presents through vk_dp_weave_and_present
+	 * (both frame classes; c->mutex held at every increment). The fence-park
+	 * path snapshots it before releasing the lock across a fill's GPU wait
+	 * and DROPS the fill's present if it moved — a fresher frame reached the
+	 * screen while we waited, and presenting an older fill behind it would
+	 * step the panel backwards.
+	 */
+	uint64_t present_serial;
 
 	/*!
 	 * #868: everything the repaint thread needs to replay the last app frame's
@@ -3981,16 +3992,70 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (struct xrt_display_processor_vk *)c->display_processor, queue);
 		}
 
+		bool cmd_freed = false;
 		if (res == VK_SUCCESS) {
 			if (*fence_p != VK_NULL_HANDLE) {
-				vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
-				vk->vkResetFences(vk->device, 1, fence_p);
+				/*
+				 * #1264 S1 fence-park: a FILL must not hold the compositor
+				 * lock across its own GPU execution — that hold is the
+				 * measured 17-23 ms scheduling hole starving the in-process
+				 * fill loops (and it blocks the app's commit path for the
+				 * GPU's duration). Release the lock for the wait, retake it,
+				 * and re-validate: if the world moved while we waited (a
+				 * fresher present landed, the target was recreated, or the
+				 * session is tearing down) the fill's present is DROPPED —
+				 * a stale fill behind a fresher frame steps the panel
+				 * backwards. App frames keep the synchronous wait: their
+				 * pacing depends on it (#837 is the separate project that
+				 * would change that). DXR_FILL_FENCE_PARK=0 reverts.
+				 */
+				static int park = -1;
+				if (park < 0) {
+					const char *pe = getenv("DXR_FILL_FENCE_PARK");
+					park = (pe != NULL && pe[0] == '0') ? 0 : 1;
+				}
+				if (is_repaint && park == 1 && c->target != NULL) {
+					const uint32_t gen_park =
+					    comp_vk_native_target_get_generation(c->target);
+					const uint64_t serial_park = c->present_serial;
+					os_mutex_unlock(&c->mutex);
+					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, fence_p);
+					os_mutex_lock(&c->mutex);
+					// GPU is done — the command buffer is free regardless of
+					// what the validation below decides.
+					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+					cmd_freed = true;
+					static bool park_logged = false;
+					if (!park_logged) {
+						park_logged = true;
+						U_LOG_W("#1264 S1: fill fence-park engaged — the fill's "
+						        "GPU wait no longer holds the compositor lock "
+						        "(DXR_FILL_FENCE_PARK=0 reverts)");
+					}
+					if (!os_thread_helper_is_running(&c->repaint_thread) ||
+					    c->display_processor == NULL || c->target == NULL ||
+					    comp_vk_native_target_get_generation(c->target) != gen_park ||
+					    c->present_serial != serial_park) {
+						if (target_fb != VK_NULL_HANDLE) {
+							vk->vkDestroyFramebuffer(vk->device, target_fb,
+							                         NULL);
+						}
+						*out_skip_frame = true;
+						return XRT_SUCCESS;
+					}
+				} else {
+					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, fence_p);
+				}
 			} else {
 				vk->vkQueueWaitIdle(queue);
 			}
 		}
 
-		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		if (!cmd_freed) {
+			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		}
 	}
 
 	// Destroy temporary framebuffer after GPU is done
@@ -4004,6 +4069,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 	// Present
 	xret = comp_vk_native_target_present(c->target, queue);
+	if (xret == XRT_SUCCESS) {
+		c->present_serial++; // #1264 S1: the fence-park's drop-if-superseded key
+	}
 
 	/*
 	 * VK-0 (#1178) — one-shot deposit proof, DXR_VK_DEPOSIT_PROBE=1 only.
@@ -4059,6 +4127,11 @@ static void *
 vk_repaint_thread(void *ptr)
 {
 	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)ptr;
+
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("vk");
+#endif
 
 	while (os_thread_helper_is_running(&c->repaint_thread)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
