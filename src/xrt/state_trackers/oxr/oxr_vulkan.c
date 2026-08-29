@@ -221,6 +221,15 @@ static const char *optional_device_extensions[] = {
     VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
 #endif
 
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // ADR-039 same-adapter deposit sync: on drivers that cannot import a
+    // D3D12_FENCE timeline semaphore (Intel iGPU), the VK side of the
+    // keyed-mutex handshake rides the atlas submit
+    // (VkWin32KeyedMutexAcquireReleaseInfoKHR) — which requires this
+    // extension enabled on the APP's device.
+    VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME,
+#endif
+
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     // Desktop-background capture (runtime#757): dma-buf import on the app's
     // VkDevice so the display processor can consume PipeWire screencast
@@ -555,6 +564,9 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	bool external_semaphore_fd_enabled = false;
 #endif
 	bool image_format_list_enabled = false;
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	bool win32_keyed_mutex_enabled = false;
+#endif
 #if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
 	bool present_id_in_list = false;
 	bool present_wait_in_list = false;
@@ -581,6 +593,12 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 		if (strcmp(optional_device_extensions[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME) == 0) {
 			image_format_list_enabled = true;
 		}
+
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+		if (strcmp(optional_device_extensions[i], VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0) {
+			win32_keyed_mutex_enabled = true;
+		}
+#endif
 
 #if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
 		if (strcmp(optional_device_extensions[i], VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) {
@@ -841,6 +859,12 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 #ifdef VK_KHR_image_format_list
 	if (*vulkanResult == VK_SUCCESS) {
 		sys->vk.image_format_list_enabled = image_format_list_enabled;
+	}
+#endif
+
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	if (*vulkanResult == VK_SUCCESS) {
+		sys->vk.win32_keyed_mutex_enabled = win32_keyed_mutex_enabled;
 	}
 #endif
 

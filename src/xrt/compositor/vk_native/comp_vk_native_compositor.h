@@ -78,6 +78,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
+                                 bool app_keyed_mutex,
                                  struct xrt_compositor_native **out_xc);
 
 /*!

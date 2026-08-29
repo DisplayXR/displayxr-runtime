@@ -49,6 +49,8 @@ struct comp_vk_deposit_slot
 	VkImage image;
 	VkImageView view;
 	VkDeviceMemory memory;
+	//! KEYED-MUTEX mode only (ADR-039 Phase A): the slot's mutex, else NULL.
+	IDXGIKeyedMutex *km;
 	/*!
 	 * VK-1 (#1178) — the timeline value the app-end D3D11 context signals once
 	 * a consumer has finished reading this slot. Vulkan's next write into it
@@ -96,6 +98,20 @@ struct comp_vk_deposit
 	ID3D11Fence *fence;
 	HANDLE fence_nt;
 	VkSemaphore timeline;
+
+	/*!
+	 * KEYED-MUTEX mode (ADR-039 Phase A): the driver exposes no D3D12_FENCE
+	 * import, so the ring slots are SHARED_KEYEDMUTEX and each side brackets
+	 * its access with key 0 instead of signalling a timeline. See the mode
+	 * selection in comp_vk_deposit_create for why it is NOT a 0/1 ping-pong.
+	 */
+	bool keyed_mutex_mode;
+	//! Chain storage for @ref comp_vk_deposit_chain_km — must outlive the
+	//! vkQueueSubmit it is chained into; one submit is built at a time.
+	VkWin32KeyedMutexAcquireReleaseInfoKHR km_chain;
+	VkDeviceMemory km_chain_mem;
+	uint64_t km_chain_key;
+	uint32_t km_chain_timeout_ms;
 
 	//! Last value CLAIMED for a submit (== last value that will be signalled).
 	uint64_t value;
@@ -171,6 +187,10 @@ deposit_free_ring(struct comp_vk_deposit *dep)
 		if (s->share_nt != NULL) {
 			CloseHandle(s->share_nt);
 			s->share_nt = NULL;
+		}
+		if (s->km != NULL) {
+			s->km->Release();
+			s->km = NULL;
 		}
 		if (s->tex != NULL) {
 			s->tex->Release();
@@ -305,16 +325,20 @@ deposit_import_one(struct comp_vk_deposit *dep, uint32_t i)
 }
 
 /*!
- * Create ONE `SHARED | SHARED_NTHANDLE` D3D11 texture on the deposit's device and
- * return it with its NT handle. The share flags are the atlas ring's, verbatim:
+ * Create ONE NT-shared D3D11 texture on the deposit's device and return it with
+ * its NT handle. In FENCE mode the share flags are the atlas ring's, verbatim:
  * fence-synchronised NT sharing, never `SHARED_KEYEDMUTEX` (a keyed mutex is
  * acquired from the CPU, and this ladder eliminated CPU waits by construction).
+ * KEYED-MUTEX mode (ADR-039 Phase A) is the exception that proves the rule: on
+ * a driver with no D3D12_FENCE import there is no fence to synchronise with,
+ * and the mutex — bounded, skip-on-timeout — is the rung below nothing at all.
  */
 static bool
 deposit_make_shared_texture(struct comp_vk_deposit *dep,
                             uint32_t width,
                             uint32_t height,
                             DXGI_FORMAT dxgi_format,
+                            bool keyed_mutex,
                             const char *what,
                             ID3D11Texture2D **out_tex,
                             HANDLE *out_share)
@@ -328,7 +352,8 @@ deposit_make_shared_texture(struct comp_vk_deposit *dep,
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+	td.MiscFlags = keyed_mutex ? (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
+	                           : (D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED);
 
 	HRESULT hr = dep->dx->CreateTexture2D(&td, NULL, out_tex);
 	if (FAILED(hr) || *out_tex == NULL) {
@@ -412,9 +437,18 @@ deposit_alloc_ring(struct comp_vk_deposit *dep)
 
 		char what[32];
 		snprintf(what, sizeof(what), "atlas slot %u", i);
-		if (!deposit_make_shared_texture(dep, dep->width, dep->height, dxgi_format, what, &s->tex,
-		                                 &s->share_nt)) {
+		if (!deposit_make_shared_texture(dep, dep->width, dep->height, dxgi_format, dep->keyed_mutex_mode,
+		                                 what, &s->tex, &s->share_nt)) {
 			return false;
+		}
+
+		if (dep->keyed_mutex_mode) {
+			HRESULT hr = s->tex->QueryInterface(__uuidof(IDXGIKeyedMutex), (void **)&s->km);
+			if (FAILED(hr) || s->km == NULL) {
+				U_LOG_W("vk deposit: QueryInterface(IDXGIKeyedMutex)(%s) failed: 0x%08lx", what,
+				        (unsigned long)hr);
+				return false;
+			}
 		}
 
 		// The handle stays OPEN: Vulkan does not adopt NT handles on import,
@@ -442,45 +476,56 @@ deposit_alloc_ring(struct comp_vk_deposit *dep)
  * `timeline_semaphore_enabled = false` to `vk_init_from_given`). The capability
  * gate here is the app's ACTUAL device state, plumbed in from the session.
  */
+/*!
+ * Is a TIMELINE semaphore importable from a D3D12 fence on this device?
+ *
+ * Asked BEFORE anything is created — the answer picks the deposit's sync mode
+ * (a false yes becomes a consumer that waits forever). A missing query entry
+ * point is treated as importable, exactly as the original setup did.
+ */
+static bool
+deposit_fence_importable(struct vk_bundle *vk)
+{
+	if (vk->vkImportSemaphoreWin32HandleKHR == NULL) {
+		U_LOG_W(
+		    "vk deposit: no vkImportSemaphoreWin32HandleKHR "
+		    "(VK_KHR_external_semaphore_win32 missing) — no D3D fence import");
+		return false;
+	}
+	if (vk->vkGetPhysicalDeviceExternalSemaphorePropertiesKHR == NULL) {
+		return true;
+	}
+	VkSemaphoreTypeCreateInfo type_query = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+	    .pNext = NULL,
+	    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	    .initialValue = 0,
+	};
+	VkPhysicalDeviceExternalSemaphoreInfo query = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+	    .pNext = &type_query,
+	    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+	};
+	VkExternalSemaphoreProperties props = {
+	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
+	};
+	vk->vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(vk->physical_device, &query, &props);
+	if ((props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) == 0) {
+		U_LOG_W(
+		    "vk deposit: device cannot import a D3D12_FENCE timeline semaphore "
+		    "(features=0x%x)",
+		    (unsigned)props.externalSemaphoreFeatures);
+		return false;
+	}
+	return true;
+}
+
 static bool
 deposit_setup_sync(struct comp_vk_deposit *dep)
 {
 	struct vk_bundle *vk = dep->vk;
 
-	if (vk->vkImportSemaphoreWin32HandleKHR == NULL) {
-		U_LOG_W(
-		    "vk deposit: no vkImportSemaphoreWin32HandleKHR "
-		    "(VK_KHR_external_semaphore_win32 missing) — no GPU-side sync");
-		return false;
-	}
-
-	// Is a TIMELINE semaphore importable from a D3D12 fence on this device?
-	// Ask before creating anything: a false yes here becomes a consumer that
-	// waits forever.
-	if (vk->vkGetPhysicalDeviceExternalSemaphorePropertiesKHR != NULL) {
-		VkSemaphoreTypeCreateInfo type_query = {
-		    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
-		    .pNext = NULL,
-		    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
-		    .initialValue = 0,
-		};
-		VkPhysicalDeviceExternalSemaphoreInfo query = {
-		    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
-		    .pNext = &type_query,
-		    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
-		};
-		VkExternalSemaphoreProperties props = {
-		    .sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES,
-		};
-		vk->vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(vk->physical_device, &query, &props);
-		if ((props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) == 0) {
-			U_LOG_W(
-			    "vk deposit: device cannot import a D3D12_FENCE timeline semaphore "
-			    "(features=0x%x) — no GPU-side sync",
-			    (unsigned)props.externalSemaphoreFeatures);
-			return false;
-		}
-	}
+	// FENCE mode only, and create() has already run deposit_fence_importable.
 
 	HRESULT hr = dep->dx->QueryInterface(__uuidof(ID3D11Device5), (void **)&dep->dx5);
 	if (FAILED(hr) || dep->dx5 == NULL) {
@@ -553,6 +598,7 @@ comp_vk_deposit_requested(void)
 extern "C" xrt_result_t
 comp_vk_deposit_create(struct vk_bundle *vk,
                        bool app_timeline_semaphores,
+                       bool app_keyed_mutex,
                        uint32_t width,
                        uint32_t height,
                        VkFormat format,
@@ -611,11 +657,47 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 	    (unsigned long long)got_luid, desc, (unsigned long long)want_luid, width, height,
 	    (unsigned)COMP_VK_DEPOSIT_RING);
 
-	if (!app_timeline_semaphores) {
+	/*
+	 * Pick the SYNC MODE before anything is allocated — the ring's share flags
+	 * depend on it.
+	 *
+	 * FENCE mode is the design (header §Synchronisation): zero CPU waits, a
+	 * shared D3D11 fence imported as a timeline semaphore. Some drivers (this
+	 * box's Intel UHD VK ICD, ADR-039 Phase A) expose no D3D12_FENCE import at
+	 * all; the rung below is KEYED-MUTEX mode — every ring slot is
+	 * SHARED_KEYEDMUTEX and both sides bracket their access with KEY 0.
+	 *
+	 * Key 0 on both sides is deliberate: plain GPU-scoped mutual exclusion, NOT
+	 * a 0/1 ready-handshake. A ping-pong wedges the queue the first time either
+	 * side skips a beat (consumer acquire timeout, split retirement) because
+	 * the slot is left at the key the other side will never release — and a
+	 * timed-out in-submit Vulkan acquire is effectively device loss. Mutual
+	 * exclusion alone closes the one edge the 2-slot ring cannot (a slot
+	 * REWRITE overtaking the bridge's in-flight copy, VK-1's tear); the
+	 * write-before-read direction is carried by the frame path's existing
+	 * per-frame CPU wait (the vkQueueWaitIdle after every atlas submit, #837).
+	 * If #837 ever removes that wait, the worst case here becomes a
+	 * one-frame-stale copy — never a tear, never a wedge (#925: no unbounded
+	 * waits).
+	 */
+	const bool fence_importable = deposit_fence_importable(vk);
+	bool keyed_mutex_mode = false;
+	if (fence_importable) {
+		if (!app_timeline_semaphores) {
+			U_LOG_W(
+			    "vk deposit: the app's VkDevice has no VK_KHR_timeline_semaphore — the deposit's only "
+			    "GPU-side sync is a D3D fence imported as a timeline semaphore, and a CPU wait is not "
+			    "an acceptable substitute (#1178). Deposit DISABLED.");
+			adapter->Release();
+			return XRT_ERROR_VULKAN;
+		}
+	} else if (app_keyed_mutex) {
+		keyed_mutex_mode = true;
+	} else {
 		U_LOG_W(
-		    "vk deposit: the app's VkDevice has no VK_KHR_timeline_semaphore — the deposit's only "
-		    "GPU-side sync is a D3D fence imported as a timeline semaphore, and a CPU wait is not an "
-		    "acceptable substitute (#1178). Deposit DISABLED.");
+		    "vk deposit: device can import neither a D3D12_FENCE timeline semaphore nor bracket a "
+		    "keyed mutex (VK_KHR_win32_keyed_mutex not enabled on the app's VkDevice) — no GPU-side "
+		    "sync. Deposit DISABLED.");
 		adapter->Release();
 		return XRT_ERROR_VULKAN;
 	}
@@ -631,6 +713,7 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 	dep->width = width;
 	dep->height = height;
 	dep->format = format;
+	dep->keyed_mutex_mode = keyed_mutex_mode;
 
 	HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL,
 	                               0, D3D11_SDK_VERSION, &dep->dx, NULL, &dep->ctx);
@@ -640,15 +723,23 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 		return XRT_ERROR_VULKAN;
 	}
 
-	if (!deposit_alloc_ring(dep) || !deposit_setup_sync(dep)) {
+	if (!deposit_alloc_ring(dep) || (!keyed_mutex_mode && !deposit_setup_sync(dep))) {
 		comp_vk_deposit_destroy(&dep);
 		return XRT_ERROR_VULKAN;
 	}
 
-	U_LOG_W(
-	    "vk deposit: ACTIVE — atlas renders straight into the D3D11 texture "
-	    "(COLOR_ATTACHMENT, zero copies), completion published on a shared ID3D11Fence "
-	    "imported as a VK timeline semaphore. No CPU wait added.");
+	if (keyed_mutex_mode) {
+		U_LOG_W(
+		    "vk deposit: ACTIVE (KEYED-MUTEX mode, ADR-039 Phase A) — atlas renders straight into the "
+		    "D3D11 texture (COLOR_ATTACHMENT, zero copies); no D3D12_FENCE import on this driver, so "
+		    "each side brackets its access with the slot's keyed mutex (key 0, bounded, "
+		    "skip-on-timeout) instead of a timeline signal. Plane deposits are OFF in this mode.");
+	} else {
+		U_LOG_W(
+		    "vk deposit: ACTIVE — atlas renders straight into the D3D11 texture "
+		    "(COLOR_ATTACHMENT, zero copies), completion published on a shared ID3D11Fence "
+		    "imported as a VK timeline semaphore. No CPU wait added.");
+	}
 
 	*out_deposit = dep;
 	return XRT_SUCCESS;
@@ -799,6 +890,42 @@ comp_vk_deposit_abandon_signal(struct comp_vk_deposit *dep)
 }
 
 extern "C" void
+comp_vk_deposit_chain_km(struct comp_vk_deposit *dep, VkSubmitInfo *submit_info)
+{
+	if (dep == NULL || !dep->keyed_mutex_mode || submit_info == NULL) {
+		return;
+	}
+	struct comp_vk_deposit_slot *s = &dep->ring[dep->slot];
+	if (s->memory == VK_NULL_HANDLE) {
+		return;
+	}
+
+	/*
+	 * Key 0 on both acquire and release — mutual exclusion, not a handshake;
+	 * the mode-selection comment in comp_vk_deposit_create carries the wedge
+	 * argument. The timeout bounds the acquire against a consumer copy that is
+	 * milliseconds long, so it is generous without being INFINITE (a timed-out
+	 * in-submit acquire is not a recoverable event, and must never happen).
+	 */
+	dep->km_chain_mem = s->memory;
+	dep->km_chain_key = 0;
+	dep->km_chain_timeout_ms = 512;
+	VkWin32KeyedMutexAcquireReleaseInfoKHR info = {
+	    .sType = VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR,
+	    .pNext = submit_info->pNext,
+	    .acquireCount = 1,
+	    .pAcquireSyncs = &dep->km_chain_mem,
+	    .pAcquireKeys = &dep->km_chain_key,
+	    .pAcquireTimeouts = &dep->km_chain_timeout_ms,
+	    .releaseCount = 1,
+	    .pReleaseSyncs = &dep->km_chain_mem,
+	    .pReleaseKeys = &dep->km_chain_key,
+	};
+	dep->km_chain = info;
+	submit_info->pNext = &dep->km_chain;
+}
+
+extern "C" void
 comp_vk_deposit_note_consumed(struct comp_vk_deposit *dep, uint32_t slot)
 {
 	if (dep == NULL || dep->fence == NULL || dep->ctx == NULL || slot >= COMP_VK_DEPOSIT_RING) {
@@ -860,6 +987,24 @@ comp_vk_deposit_plane_ensure(
 	if (dep == NULL || dep->dx == NULL || plane >= COMP_VK_DEPOSIT_PLANE_COUNT || width == 0 || height == 0) {
 		return false;
 	}
+	if (dep->keyed_mutex_mode) {
+		/*
+		 * ADR-039 Phase A limitation: the planes' transport back-fence
+		 * (note_planes_consumed) IS the shared fence, and this mode exists
+		 * precisely because the driver cannot import one. Refusing here fails
+		 * closed the same way an allocation failure does — the caller stops
+		 * staging the plane and the 3D weave is untouched.
+		 */
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W(
+			    "vk deposit: plane deposits are unsupported in KEYED-MUTEX mode (ADR-039 Phase A) — "
+			    "Local2D/backdrop/mask stay off under the same-adapter split; the 3D weave is "
+			    "unaffected (#1264)");
+		}
+		return false;
+	}
 	struct comp_vk_deposit_plane_slot *p = &dep->plane[plane];
 
 	// The steady-state call. The 2D planes are panel-sized once, so after
@@ -889,7 +1034,7 @@ comp_vk_deposit_plane_ensure(
 
 	char what[40];
 	snprintf(what, sizeof(what), "plane %u", plane);
-	if (!deposit_make_shared_texture(dep, width, height, dxgi_format, what, &p->tex, &p->share_nt) ||
+	if (!deposit_make_shared_texture(dep, width, height, dxgi_format, false, what, &p->tex, &p->share_nt) ||
 	    !deposit_import_shared(dep, p->share_nt, width, height, format, what, &p->image, &p->memory, &p->view)) {
 		// Feature-local: the caller stops staging this plane and the 3D weave
 		// is untouched. Never a reason to give the scanout adapter back.
@@ -983,6 +1128,7 @@ comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_
 	out->dxgi_adapter = dep->adapter;
 	out->texture = s->tex;
 	out->shared_handle = s->share_nt;
+	out->keyed_mutex = s->km;
 	out->fence = dep->fence;
 	out->fence_shared_handle = dep->fence_nt;
 	out->fence_value = dep->value;
@@ -1162,6 +1308,7 @@ comp_vk_deposit_requested(void)
 extern "C" xrt_result_t
 comp_vk_deposit_create(struct vk_bundle *vk,
                        bool app_timeline_semaphores,
+                       bool app_keyed_mutex,
                        uint32_t width,
                        uint32_t height,
                        VkFormat format,
@@ -1169,11 +1316,19 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 {
 	(void)vk;
 	(void)app_timeline_semaphores;
+	(void)app_keyed_mutex;
 	(void)width;
 	(void)height;
 	(void)format;
 	*out_deposit = NULL;
 	return XRT_ERROR_VULKAN;
+}
+
+extern "C" void
+comp_vk_deposit_chain_km(struct comp_vk_deposit *dep, VkSubmitInfo *submit_info)
+{
+	(void)dep;
+	(void)submit_info;
 }
 
 extern "C" void

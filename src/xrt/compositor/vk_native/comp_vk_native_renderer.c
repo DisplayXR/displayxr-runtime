@@ -349,6 +349,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t atlas_width,
                                 uint32_t atlas_height,
                                 bool app_timeline_semaphores,
+                                bool app_keyed_mutex,
                                 bool deposit_required,
                                 struct comp_vk_native_renderer **out_renderer)
 {
@@ -388,7 +389,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	 * cold, before its first present.
 	 */
 	if (comp_vk_deposit_requested() || deposit_required) {
-		if (comp_vk_deposit_create(vk, app_timeline_semaphores, atlas_width, atlas_height, r->format,
+		if (comp_vk_deposit_create(vk, app_timeline_semaphores, app_keyed_mutex, atlas_width, atlas_height, r->format,
 		                           &r->deposit) != XRT_SUCCESS) {
 			r->deposit = NULL;
 		}
@@ -842,6 +843,9 @@ deposit_chain_signal(struct comp_vk_native_renderer *r,
 
 	comp_vk_deposit_claim_signal(r->deposit, sem_storage, value_storage);
 	if (*sem_storage == VK_NULL_HANDLE) {
+		// KEYED-MUTEX mode (ADR-039 Phase A): no timeline to signal — the
+		// slot's mutex brackets this submit instead. No-op in fence mode.
+		comp_vk_deposit_chain_km(r->deposit, submit_info);
 		return;
 	}
 
