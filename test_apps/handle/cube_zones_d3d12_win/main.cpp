@@ -159,6 +159,29 @@ static int ZonesInitialWishMode() {
     return m;
 }
 
+// DXR_ZONES_FEATHER=<px> — chain XrDisplayZoneFeatherDXR (radiusPx) on every
+// zone at xrEndFrame. 0/unset = hard edges, the spec default. Added for #1264:
+// no fixture in the tree chained the struct, so the composite-feather visual
+// was unexercisable on any path (feathering is per-zone OPT-IN per SPEC v3 /
+// runtime#800 — the published wish stays binary regardless).
+static float ZonesFeatherRadiusPx() {
+    static const float r = []() {
+        const char* v = getenv("DXR_ZONES_FEATHER");
+        return (v != nullptr) ? (float)atof(v) : 0.0f;
+    }();
+    return r;
+}
+
+// #1264 fixture-completeness: the always-on Local2D checker strip the d3d11
+// sibling has carried all along (its absence made "no 2D zone" a fixture
+// property, not a transport result). Same geometry + content, filled ONCE.
+static const XrRect2Di kStripRect = {{0, 0}, {1280, 180}};
+struct StripLayer {
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+static StripLayer g_strip;
+
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
     static const bool e = []() {
@@ -643,6 +666,159 @@ static void HandleZoneKeys(XrSessionManager& xr, D3D12Renderer& renderer) {
     mPrev = mNow;
 }
 
+// Pick the strip's swapchain format: BGRA (sRGB preferred), else first offered.
+static int64_t PickStripFormat(XrSessionManager& xr) {
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(xr.session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(xr.session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) return f;
+    }
+    for (int64_t f : formats) {
+        if (f == (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM) return f;
+    }
+    return formats.empty() ? (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM : formats[0];
+}
+
+// Create the always-on Local2D strip swapchain and fill it once (static
+// content: acquire/fill/release once; the layer references the released image
+// every frame). Checker + a solid label band; OPAQUE alpha. D3D12 flavour of
+// the d3d11 sibling's CreateAndFillStrip: the fill goes up through a transient
+// UPLOAD buffer + CopyTextureRegion (the Tier-3 mask paint's exact pattern),
+// with the swapchain image's RENDER_TARGET initial-state contract bracketed.
+static bool CreateAndFillStrip(XrSessionManager& xr, D3D12Renderer& renderer) {
+    const uint32_t w = (uint32_t)kStripRect.extent.width;
+    const uint32_t h = (uint32_t)kStripRect.extent.height;
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = PickStripFormat(xr);
+    sci.sampleCount = 1;
+    sci.width = w;
+    sci.height = h;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_strip.swapchain))) {
+        LOG_ERROR("[zones] strip: xrCreateSwapchain failed");
+        return false;
+    }
+    g_strip.w = w;
+    g_strip.h = h;
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_strip.swapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageD3D12KHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_strip.swapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        LOG_ERROR("[zones] strip: xrEnumerateSwapchainImages failed");
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_strip.swapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_strip.swapchain, &wi);
+    ID3D12Resource* stripRes = imgs[idx].texture;
+
+    // Checker + label pixels, BGRA bytes, pitch-aligned for the placed copy.
+    const uint32_t pitch = ((w * 4) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    std::vector<uint8_t> buf((size_t)pitch * h, 0);
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t* row = buf.data() + (size_t)y * pitch;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t* px = row + (size_t)x * 4; // B,G,R,A
+            bool label = (x >= 40 && x < 360 && y >= 70 && y < 110);
+            if (label) {
+                px[0] = 0;   // B
+                px[1] = 170; // G
+                px[2] = 255; // R
+                px[3] = 255;
+            } else {
+                bool check = (((x / 24) + (y / 24)) & 1) != 0;
+                uint8_t v = check ? 210 : 60;
+                px[0] = v;
+                px[1] = v;
+                px[2] = v;
+                px[3] = 255;
+            }
+        }
+    }
+
+    ComPtr<ID3D12Resource> upload;
+    D3D12_HEAP_PROPERTIES up = {};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = (UINT64)pitch * h;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(renderer.device->CreateCommittedResource(
+            &up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&upload)))) {
+        LOG_ERROR("[zones] strip: upload buffer creation failed");
+        return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(upload->Map(0, nullptr, &mapped)) || mapped == nullptr) {
+        LOG_ERROR("[zones] strip: upload buffer map failed");
+        return false;
+    }
+    memcpy(mapped, buf.data(), buf.size());
+    upload->Unmap(0, nullptr);
+
+    renderer.commandAllocator->Reset();
+    renderer.commandList->Reset(renderer.commandAllocator.Get(), nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = stripRes;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    renderer.commandList->ResourceBarrier(1, &barrier);
+
+    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+    dstLoc.pResource = stripRes;
+    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLoc.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint.Offset = 0;
+    srcLoc.PlacedFootprint.Footprint.Format = (DXGI_FORMAT)sci.format;
+    srcLoc.PlacedFootprint.Footprint.Width = w;
+    srcLoc.PlacedFootprint.Footprint.Height = h;
+    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+    srcLoc.PlacedFootprint.Footprint.RowPitch = pitch;
+    renderer.commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    renderer.commandList->ResourceBarrier(1, &barrier);
+
+    renderer.commandList->Close();
+    ID3D12CommandList* lists[] = {renderer.commandList.Get()};
+    renderer.commandQueue->ExecuteCommandLists(1, lists);
+    WaitForGpu(renderer); // keeps `upload` alive until the copy lands
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_strip.swapchain, &ri);
+    LOG_INFO("[zones] strip: Local2D checker filled once (%ux%u)", w, h);
+    return true;
+}
+
 // One-time zones activation: capabilities check + per-zone array swapchains.
 // On any failure the zones path is permanently disabled (empty-frame fallback).
 static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
@@ -708,6 +884,11 @@ static void TryActivateZones(XrSessionManager& xr, D3D12Renderer& renderer) {
         }
     }
 
+    if (!CreateAndFillStrip(xr, renderer)) {
+        g_hasDisplayZonesExt = false;
+        return;
+    }
+
     g_zonesActive = true;
 
     // Seed the wish mode from DXR_ZONES_WISH and author it now, so an explicit
@@ -764,6 +945,11 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
     // points (locate and xrEndFrame) — same instances within the frame.
     XrDisplayZoneDXR zoneStructs[kNumZones];
     XrDisplayRigDXR rigStructs[kNumZones];
+    // #1264 fixture-completeness: DXR_ZONES_FEATHER=<px> chains the per-zone
+    // COMPOSITE feather (spec-default is hard; the wish stays binary). Same
+    // struct instances serve locate + submit — the locate side ignores them.
+    XrDisplayZoneFeatherDXR featherStructs[kNumZones];
+    const float featherPx = ZonesFeatherRadiusPx();
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
@@ -778,7 +964,14 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
         zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
-        zoneStructs[zi].next = &rigStructs[zi];
+        if (featherPx > 0.0f) {
+            featherStructs[zi] = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+            featherStructs[zi].radiusPx = featherPx;
+            featherStructs[zi].next = &rigStructs[zi];
+            zoneStructs[zi].next = &featherStructs[zi];
+        } else {
+            zoneStructs[zi].next = &rigStructs[zi];
+        }
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
 
@@ -895,7 +1088,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
 
     // Layer list: [projA (zone A chained), projB (zone B chained)].
     XrCompositionLayerProjection projLayers[kNumZones];
-    const XrCompositionLayerBaseHeader* layers[kNumZones] = {};
+    XrCompositionLayerLocal2DDXR stripLayer = {(XrStructureType)XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR};
+    const XrCompositionLayerBaseHeader* layers[kNumZones + 1] = {};
     uint32_t layerCount = 0;
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
@@ -908,6 +1102,18 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         projLayers[zi].viewCount = submitViewCounts[zi];
         projLayers[zi].views = projViews[zi].data();
         layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&projLayers[zi];
+    }
+
+    // #1264 fixture-completeness: the always-on Local2D checker strip (the
+    // d3d11 sibling's), so Local2D + zones + authored mask exercise together.
+    if (g_strip.swapchain != XR_NULL_HANDLE) {
+        stripLayer.layerFlags = 0; // opaque content
+        stripLayer.subImage.swapchain = g_strip.swapchain;
+        stripLayer.subImage.imageRect.offset = {0, 0};
+        stripLayer.subImage.imageRect.extent = {(int32_t)g_strip.w, (int32_t)g_strip.h};
+        stripLayer.subImage.imageArrayIndex = 0;
+        stripLayer.rect = kStripRect;
+        layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&stripLayer;
     }
 
     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
