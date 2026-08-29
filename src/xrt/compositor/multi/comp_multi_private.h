@@ -44,6 +44,7 @@
 struct comp_target;
 struct xrt_eye_positions;
 struct xrt_weave_atlas_layout;
+struct android_custom_surface;
 struct xrt_window_metrics;
 struct xrt_system_devices;
 
@@ -693,6 +694,32 @@ struct multi_compositor
 		bool overlay_first_use;
 		struct vk_local2d_composite overlay_blend;
 		bool overlay_blend_initialized;
+		//! @}
+
+		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
+		//! `debug.dxr.weave_satellite=1`: the woven output is blitted onto a
+		//! SERVICE-owned full-panel overlay surface (the #558 machinery) and
+		//! presented by the service; export_output then reports none, so the
+		//! caller's over-plane draws nothing and its 2D shows under the
+		//! overlay. The overlay is never container-scaled — the point: an OEM
+		//! freeform mini-window scales an in-app weave after submission
+		//! (browser#173/#186); here the weave lands after that transform.
+		//! Every failure latches sat_failed and falls back bit-for-bit.
+		//! @{
+		bool sat_checked; //!< Prop read once per client.
+		bool sat_enabled;
+		bool sat_failed; //!< One-shot: bring-up failed, use the return path.
+		struct android_custom_surface *sat_csurface;
+		VkSurfaceKHR sat_surface;
+		VkSwapchainKHR sat_swapchain;
+		VkImage sat_images[8];
+		bool sat_image_first[8];
+		uint32_t sat_image_count;
+		uint32_t sat_w, sat_h;
+		VkSemaphore sat_acquire_sem;
+		VkSemaphore sat_done_sem;
+		VkFence sat_fence;
+		VkCommandBuffer sat_cmd;
 		//! @}
 	} weave;
 #endif
