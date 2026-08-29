@@ -128,3 +128,67 @@ removed the `inProcess`/`outOfProcess` flavors precisely because two flavors dec
 the same `org.khronos.openxr.runtime_broker` ContentProvider authority and so could
 never be installed side by side. Re-introducing a flavor dimension would re-create
 that problem. A CI matrix over one gradle project has neither issue.
+
+## Amendment 1 — Publish ONE APK; the neutral build stays, as a CI artifact (2026-08-28)
+
+**Decision: the vendor-carrying APK is the only published Android release asset.** The
+vendor-neutral variant continues to be *built* on every release; it is no longer
+*attached* to one.
+
+This reverses the "One APK, always vendor-carrying" rejection above, because that
+rejection rests on a step the original ADR did not separate: it assumed *not publishing*
+the neutral variant meant *not building* it. It does not. Keeping the neutral build as a
+CI artifact preserves both reasons it was rejected for — the ADR-019 guard on Android
+still has a vendor-free binary to assert against, and forks without vendor SDK access
+still get a green build via the existing soft-skip.
+
+### Why the second APK was never load-bearing at run time
+
+The runtime already does what the neutral variant was published to provide. Both plug-ins
+ship *inside* the vendor APK:
+
+```
+lib/arm64-v8a/libdxrp050_leia_cnsdk.so     ProbeOrder 050
+lib/arm64-v8a/libdxrp200_sim_display.so    ProbeOrder 200
+```
+
+and `target_plugin_loader.c` states the resolution rule: *"Discovery attempts candidates
+in ascending ProbeOrder and returns on the first success."* On a device with no vendor
+services the vendor probe declines, discovery continues, and sim_display claims the
+system. Choosing an APK at download time was therefore choosing something the loader
+already decides correctly at run time, with better information.
+
+Measured cost of carrying the vendor payload everywhere (v2.14.10): **33 MB neutral vs
+36 MB vendor**, i.e. ~3.4 MB of APK delta — `libleiaSDK-jni.so` (6.4 MB),
+`libdxrp050_leia_cnsdk.so` (1.9 MB) and `libleiaCore-loader.so` (1.1 MB) uncompressed.
+`libleiaCore-impl.so`, the actual engine, is never shipped; it is `dlopen`'d from the
+on-device package. The APK carries a **shim**, not an SDK.
+
+### What this buys
+
+One asset to link, one to sideload on a device with no adb, and no "which APK do I
+download?" question in front of a first-time user — which is the first thing the install
+guide currently has to explain.
+
+### What it costs, and what must move with it
+
+1. **Vendor manifest material reaches every device.** The vendor AAR merges real
+   components into the runtime manifest (`com.leia.sdk.internal.DebugActivity`) plus
+   vendor `<queries>` entries. Functionally inert on non-vendor hardware, but it is the
+   same redistribution question that governs multi-vendor packing, and it should be
+   answered per vendor rather than assumed.
+2. **The silent-fallback failure mode becomes the common one.** Today "you installed the
+   neutral APK" explains a 2D screen. With one APK, a vendor plug-in that fails to load is
+   indistinguishable from correct sim_display fallback — a green PASS over a black screen,
+   the exact case the `vendor_dp` self-test (#1212) exists to catch. That check moves from
+   backstop to primary diagnostic and **must** be surfaced in the dashboard's default view
+   before this lands, not left to whoever thinks to run a self-test.
+
+### Scope
+
+This amendment changes *what is published*, not the packaging model. §1 still holds: a
+separate vendor APK remains unimplemented loader work, and a second Android vendor is
+still the trigger to build PackageManager-based discovery — at which point the published
+artifact question should be revisited again.
+
+Tracking: [#1265](https://github.com/DisplayXR/displayxr-runtime/issues/1265).
