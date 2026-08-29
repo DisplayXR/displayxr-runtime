@@ -42,3 +42,4 @@
 - [ADR-036](ADR-036-android-per-window-compositor-instances.md) — Android: per-window compositor instances; the workspace overlay is an optional mode
 - [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement policy on hybrid-GPU devices
 - [ADR-038](ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
+- [ADR-039](ADR-039-one-fill-engine-for-every-tier.md) — One Fill Engine for Every Tier (same-adapter split)
