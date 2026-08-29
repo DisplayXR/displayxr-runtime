@@ -646,6 +646,11 @@ struct multi_compositor
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
 		//! @}
 
+		//! Full panel extent in the CURRENT rotation (overlay extent + inset),
+		//! recorded by weave_satellite_build_swapchain. 0 until the satellite
+		//! swapchain first comes up. Feeds the OEM container-scale tell.
+		uint32_t sat_panel_w, sat_panel_h;
+
 		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)
 		//! @{
 		void *in_ahb; //!< Acquired AHardwareBuffer * (adopted from the IPC receive).
