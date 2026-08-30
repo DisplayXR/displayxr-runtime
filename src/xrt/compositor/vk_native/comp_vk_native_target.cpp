@@ -47,6 +47,8 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
+#include <dlfcn.h>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -1496,6 +1498,62 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 
+	/*
+	 * Ask the platform to hold the panel at ONE refresh rate.
+	 *
+	 * The panel is variable-refresh and the platform moves it between 59.86
+	 * and 119.71 Hz on interaction — a policy tuned for scroll smoothness,
+	 * where more updates are strictly better. A 3D weave wants the opposite:
+	 * the eye grades CADENCE STABILITY, and every switch is a discontinuity
+	 * in the schedule the weave is phase-locked to. Measured across every
+	 * scheduling arm tried on this device, interval CoV sat at ~34%
+	 * regardless of what the repaint loop did; the one run that reached panel
+	 * rate (59.9 fps) was the one where no switch occurred.
+	 *
+	 * `debug.dxr.pin_frame_rate` = Hz. Unset or 0 leaves platform policy
+	 * alone, which is today's behaviour.
+	 *
+	 * HONEST LIMIT: setFrameRate is a HINT, not a pin. The platform may
+	 * ignore it, and FIXED_SOURCE at 60 can legitimately be served by a
+	 * 120 Hz mode showing each frame twice — stable, which is what we
+	 * actually want, but it will read as 119.71 in the grid. A hard pin needs
+	 * WindowManager.LayoutParams.preferredDisplayModeId on the Java side.
+	 * Resolved by dlsym because minSdk is 29 and this is API 30/31.
+	 */
+	{
+		const float want_hz = get_prop_float_local("debug.dxr.pin_frame_rate", 0.0f);
+		if (want_hz > 0.0f) {
+			void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+			bool applied = false;
+			if (lib != NULL) {
+				// API 31: lets us say "change modes even if not seamless",
+				// which is the whole point — a seamless-only hint is exactly
+				// what the platform is already doing.
+				using PFN_setRateCS = int32_t (*)(ANativeWindow *, float, int8_t, int8_t);
+				PFN_setRateCS with_strategy = (PFN_setRateCS)dlsym(
+				    lib, "ANativeWindow_setFrameRateWithChangeStrategy");
+				if (with_strategy != NULL) {
+					applied = with_strategy((ANativeWindow *)hwnd, want_hz,
+					                        1 /*COMPATIBILITY_FIXED_SOURCE*/,
+					                        1 /*CHANGE_FRAME_RATE_ALWAYS*/) == 0;
+				} else {
+					using PFN_setRate = int32_t (*)(ANativeWindow *, float, int8_t);
+					PFN_setRate set_rate =
+					    (PFN_setRate)dlsym(lib, "ANativeWindow_setFrameRate");
+					if (set_rate != NULL) {
+						applied = set_rate((ANativeWindow *)hwnd, want_hz,
+						                   1 /*COMPATIBILITY_FIXED_SOURCE*/) == 0;
+					}
+				}
+				dlclose(lib);
+			}
+			U_LOG_W("#902: frame-rate pin requested %.2f Hz — %s "
+			        "(debug.dxr.pin_frame_rate; a HINT, verify against the grid's "
+			        "measured refresh)",
+			        (double)want_hz, applied ? "accepted by the platform" : "NOT applied");
+		}
+	}
+
 	VkBool32 present_support = VK_FALSE;
 	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
 	                                          queue_family_index,
@@ -1895,6 +1953,21 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 #endif
 }
 
+#ifdef XRT_OS_ANDROID
+//! Float-valued sysprop; default on unset or unparseable.
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(name, buf) <= 0) {
+		return default_val;
+	}
+	char *end = NULL;
+	const float v = strtof(buf, &end);
+	return (end == buf || !std::isfinite(v)) ? default_val : v;
+}
+#endif
+
 /*!
  * Late-weave master switch. Product behaviour on every path (measured
  * 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17 workspace);
@@ -1952,6 +2025,26 @@ dxr_late_weave_enabled()
  * not substitute their own fallback for a 0 return — that is what the
  * open-loop path already did, and it is what this exists to replace.
  */
+/*!
+ * #206: the measured weave->scanout residual in ns, or 0 if not yet measured.
+ *
+ * NOT the same as the grid's time-to-next-vblank, and the difference is the
+ * whole point. That projection assumes the frame scans out at the very next
+ * vblank — a lower bound that only holds when nothing is queued ahead of it.
+ * Measured here at 2.5-3.4 refresh periods, so the projection would be 3x
+ * short. A vendor eye predictor fed the short value extrapolates nowhere near
+ * far enough, which presents as under-prediction: the image trailing the
+ * viewer under motion.
+ */
+extern "C" uint64_t
+comp_vk_native_target_weave_to_scanout_ns(struct comp_vk_native_target *target)
+{
+	if (target == NULL) {
+		return 0;
+	}
+	return target->residual_ns;
+}
+
 extern "C" uint64_t
 comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
 {

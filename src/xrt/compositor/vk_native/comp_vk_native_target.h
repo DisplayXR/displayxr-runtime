@@ -97,6 +97,17 @@ uint64_t
 comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target);
 
 /*!
+ * #206: the MEASURED weave->scanout residual in ns, 0 if unknown.
+ *
+ * The quantity a vendor eye predictor needs — how far past the weave its pose
+ * should be valid. Measured by correlating our presentID with the driver's
+ * reported actualPresentTime, so it includes queueing rather than assuming the
+ * frame lands on the next vblank (measured 2.5-3.4 periods, not 1).
+ */
+uint64_t
+comp_vk_native_target_weave_to_scanout_ns(struct comp_vk_native_target *target);
+
+/*!
  * Acquire the next swapchain image for rendering.
  *
  * @param target The target.
