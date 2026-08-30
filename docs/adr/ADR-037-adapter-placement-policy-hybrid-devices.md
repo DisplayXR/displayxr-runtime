@@ -414,6 +414,26 @@ before it is attempted.
    R**, or fund the VK-0 instrumentation first and frame it in R afterwards.
    The endpoints should also be matched on *graphics API*, not just weight — a
    light-D3D11 vs heavy-VK pair would confound API with weight.
+   **FAMILY B — in-process Vulkan — ANSWERED 2026-08-31 (#1154): the answer
+   FLIPS with render weight, so rung 3 stays a lever and never becomes the
+   in-process VK default.** Framed in throughput and GPU busy, never R (see the
+   instrument constraint below). Endpoints matched on graphics API:
+
+   | app | rung 2 (render) | rung 3 (`DXR_VK_FORCE_GPU=scanout`) |
+   |---|---|---|
+   | light (`cube_handle_vk_win`) | 60.0 presents/s, dGPU ~70 ms/s | **60.0 presents/s, dGPU 0** |
+   | heavy (gaussian splat) | 59.9 presents/s, 59.9 weaves/s | **51.4 presents/s, 15.1 weaves/s** |
+
+   For LIGHT Vulkan content rung 3 is free: identical throughput while the
+   discrete GPU goes to exactly zero (the iGPU roughly doubles, to ~134 ms/s,
+   nowhere near saturation) — the case that matters on battery and for
+   thermals, and overlay-class apps should take it. For HEAVY content the
+   scanout adapter cannot carry the app's render *and* the weave at 4K60: it
+   holds ~68% busy while presents fall to ~51/s and **weaves collapse to ~15/s**,
+   a three-quarters cut in real 3D update rate that a presents-only view
+   understates. So the crossover hypothesised above is real and sits between
+   these endpoints; two points bracket it rather than locate it.
+
 2. **Battery and thermals.** On DC power, is waking the discrete GPU for a light
    overlay a net loss? On shared-package-power parts (Meteor Lake) the CPU/GPU
    budget interacts. If the answer is yes, power state becomes a policy input
