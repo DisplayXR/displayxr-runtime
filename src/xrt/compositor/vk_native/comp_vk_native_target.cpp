@@ -47,6 +47,24 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+
+//! Float-valued sysprop; default on unset or unparseable.
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(name, buf) <= 0) {
+		return default_val;
+	}
+	char *end = NULL;
+	const float v = strtof(buf, &end);
+	return (end == buf || !std::isfinite(v)) ? default_val : v;
+}
+#endif
+
+
 #include <dlfcn.h>
 #include <cmath>
 #include <cstring>
@@ -1952,21 +1970,6 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 	return COMP_VK_NATIVE_TARGET_SURFACE_RECREATED;
 #endif
 }
-
-#ifdef XRT_OS_ANDROID
-//! Float-valued sysprop; default on unset or unparseable.
-static float
-get_prop_float_local(const char *name, float default_val)
-{
-	char buf[PROP_VALUE_MAX] = {0};
-	if (__system_property_get(name, buf) <= 0) {
-		return default_val;
-	}
-	char *end = NULL;
-	const float v = strtof(buf, &end);
-	return (end == buf || !std::isfinite(v)) ? default_val : v;
-}
-#endif
 
 /*!
  * Late-weave master switch. Product behaviour on every path (measured
