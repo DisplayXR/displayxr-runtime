@@ -540,6 +540,7 @@ struct vk_bundle
 #endif // defined(VK_EXT_calibrated_timestamps)
 
 	PFN_vkGetPastPresentationTimingGOOGLE vkGetPastPresentationTimingGOOGLE;
+	PFN_vkGetRefreshCycleDurationGOOGLE vkGetRefreshCycleDurationGOOGLE;
 
 #if defined(VK_EXT_display_control)
 	PFN_vkGetSwapchainCounterEXT vkGetSwapchainCounterEXT;
