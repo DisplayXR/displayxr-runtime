@@ -84,7 +84,25 @@ comp_vblank_grid_set_period(struct comp_vblank_grid *g, uint64_t period_ns)
 	    period_ns > COMP_VBLANK_GRID_MAX_PERIOD_NS) {
 		return false;
 	}
-	if (g->period_ns != 0 && g->period_ns != period_ns) {
+	if (g->period_ns != 0) {
+		/*
+		 * Treat only a MEANINGFUL difference as a mode change.
+		 *
+		 * The driver's reported duration jitters by a few nanoseconds between
+		 * reads of the same mode (16706999 vs 16707001 …). A bare `!=` counts
+		 * every poll as a switch, which churns the grid and makes
+		 * period_changes meaningless as a diagnostic — observed on device as a
+		 * [CHANGED] line twice a second at a rock-steady 59.86 Hz.
+		 *
+		 * 1% separates that jitter from a real switch by a wide margin: the
+		 * narrowest adjacent pair this panel exposes is 120 -> 144 Hz, a 20%
+		 * step.
+		 */
+		const uint64_t a = g->period_ns < period_ns ? g->period_ns : period_ns;
+		const uint64_t b = g->period_ns < period_ns ? period_ns : g->period_ns;
+		if ((b - a) * 100 < b) {
+			return true; // same mode; keep the established value
+		}
 		// The platform switched the panel mode. Keep the anchor: it is still
 		// a real vblank, and the new period steps correctly from it.
 		g->period_changes++;

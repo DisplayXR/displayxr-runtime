@@ -1115,6 +1115,7 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 	    timeline_semaphore_enabled,    // timeline_semaphore_enabled
 	    image_format_list_enabled,     // image_format_list_enabled
 	    debug_utils_enabled,           // debug_utils_enabled
+	    false,                         // display_timing_enabled (#902: presenting paths only)
 	    log_level);                    // log_level
 	if (ret != VK_SUCCESS) {
 		goto err_free;

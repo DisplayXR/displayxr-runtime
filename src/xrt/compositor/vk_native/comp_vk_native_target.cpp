@@ -382,6 +382,16 @@ struct comp_vk_native_target
 	struct comp_vblank_grid vblank_grid;
 	//! Cached vkGetRefreshCycleDurationGOOGLE result; re-read on recreate.
 	bool refresh_cycle_probed;
+	//! One-shot check that the driver's present timestamps share our clock.
+	bool timebase_checked;
+	bool timebase_ok;
+	//! Present id for VkPresentTimesInfoGOOGLE tagging. Cross-platform: the
+	//! present_id_counter below is inside the Windows block, and this path is
+	//! specifically for platforms that have no present_wait.
+	uint32_t display_timing_present_id;
+	//! When the refresh period was last re-read (ns). The panel is
+	//! variable-refresh, so this is polled rather than latched.
+	uint64_t refresh_last_probe_ns;
 
 #ifdef XRT_OS_WINDOWS
 	//! Weave-latency harness state (nullptr unless DXR_WEAVE_LATENCY_CSV set).
@@ -1876,19 +1886,57 @@ static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {
 	struct vk_bundle *vk = target->vk;
+	{
+		// One-shot: say WHY the grid never populated. A silent bail here is
+		// indistinguishable from "the extension works but the panel is idle",
+		// which is a slow thing to diagnose from the outside.
+		static bool announced = false;
+		if (!announced) {
+			announced = true;
+			U_LOG_W("#902: display-timing feeder — vk=%d has_ext=%d swapchain=%d "
+			        "get_past=%d get_refresh=%d",
+			        vk != NULL, vk != NULL ? (int)vk->has_GOOGLE_display_timing : -1,
+			        target->swapchain != VK_NULL_HANDLE,
+			        (vk != NULL && vk->vkGetPastPresentationTimingGOOGLE != NULL),
+			        (vk != NULL && vk->vkGetRefreshCycleDurationGOOGLE != NULL));
+		}
+	}
 	if (vk == NULL || !vk->has_GOOGLE_display_timing || target->swapchain == VK_NULL_HANDLE) {
 		return;
 	}
 
-	// The period, once per swapchain: it cannot change without a recreate, so
-	// there is no reason to re-ask every frame.
-	if (!target->refresh_cycle_probed && vk->vkGetRefreshCycleDurationGOOGLE != NULL) {
+	/*
+	 * Re-probe the period PERIODICALLY, not once.
+	 *
+	 * The first version asked once per swapchain on the reasoning that the
+	 * period cannot change without a recreate. That is wrong on this hardware:
+	 * the panel is variable-refresh and the platform moves it between 60 and
+	 * 120 on interaction, with no swapchain recreate involved. A once-only
+	 * probe would latch whichever rate happened to be live at startup — and
+	 * since the boost is touch-triggered, launching the app is exactly the
+	 * moment most likely to sample the WRONG one.
+	 *
+	 * Every ~500 ms: far cheaper than a frame, and fast enough that a stale
+	 * period cannot survive long enough to matter.
+	 */
+	const uint64_t probe_now_ns = os_monotonic_get_ns();
+	const bool due = !target->refresh_cycle_probed ||
+	                 (probe_now_ns - target->refresh_last_probe_ns) > (500ULL * 1000 * 1000);
+	if (due && vk->vkGetRefreshCycleDurationGOOGLE != NULL) {
 		target->refresh_cycle_probed = true;
+		target->refresh_last_probe_ns = probe_now_ns;
 		VkRefreshCycleDurationGOOGLE rc = {};
 		if (vk->vkGetRefreshCycleDurationGOOGLE(vk->device, target->swapchain, &rc) == VK_SUCCESS) {
+			const uint64_t prev = target->vblank_grid.period_ns;
 			if (comp_vblank_grid_set_period(&target->vblank_grid, rc.refreshDuration)) {
-				U_LOG_W("#902: display-timing grid — measured refresh %.3f ms (%.2f Hz)",
-				        rc.refreshDuration / 1e6, 1e9 / (double)rc.refreshDuration);
+				// Only on a CHANGE: this now runs twice a second, and a
+				// per-probe line would bury the thing worth seeing, which is
+				// the panel actually moving between rates.
+				if (prev != target->vblank_grid.period_ns) {
+					U_LOG_W("#902: display-timing grid — refresh %.3f ms (%.2f Hz)%s",
+					        rc.refreshDuration / 1e6, 1e9 / (double)rc.refreshDuration,
+					        prev == 0 ? " [initial]" : " [CHANGED]");
+				}
 			} else {
 				U_LOG_W("#902: display-timing reported an implausible refresh "
 				        "duration (%llu ns) — grid stays untrusted",
@@ -1915,6 +1963,35 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 	VkPastPresentationTimingGOOGLE timings[16] = {};
 	if (vk->vkGetPastPresentationTimingGOOGLE(vk->device, target->swapchain, &count, timings) !=
 	    VK_SUCCESS) {
+		return;
+	}
+
+	/*
+	 * TIMEBASE GUARD. The grid projects forward from these timestamps using
+	 * os_monotonic_get_ns() as "now", which is only meaningful if the driver
+	 * reports actualPresentTime in the SAME clock. The spec ties it to
+	 * VkPresentTimeGOOGLE::desiredPresentTime, CLOCK_MONOTONIC on Android — but
+	 * a driver reporting in another domain would leave the grid looking
+	 * perfectly trusted and being entirely wrong, projecting vblanks into a
+	 * clock nobody else uses. That is the single failure this module cannot
+	 * detect on its own, so check it once, out loud, and refuse the feed
+	 * rather than schedule against a clock we do not share.
+	 */
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (!target->timebase_checked && count > 0 && timings[count - 1].actualPresentTime != 0) {
+		target->timebase_checked = true;
+		const uint64_t t = timings[count - 1].actualPresentTime;
+		const int64_t delta_ms = ((int64_t)t - (int64_t)now_ns) / 1000000;
+		// A present that already happened sits slightly BEHIND now. Anything
+		// beyond a second either way is a different clock, not jitter.
+		target->timebase_ok = (delta_ms > -1000 && delta_ms < 1000);
+		U_LOG_W("#902: display-timing timebase check — actualPresentTime %llu vs "
+		        "os_monotonic %llu (delta %lld ms) => %s",
+		        (unsigned long long)t, (unsigned long long)now_ns, (long long)delta_ms,
+		        target->timebase_ok ? "SAME CLOCK, grid usable"
+		                            : "DIFFERENT CLOCK — grid refused");
+	}
+	if (target->timebase_checked && !target->timebase_ok) {
 		return;
 	}
 
@@ -2766,6 +2843,34 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 		present_info.pNext = &present_id;
 	}
 #endif
+
+	/*
+	 * #902: tag the present so the driver RECORDS its timing.
+	 *
+	 * vkGetPastPresentationTimingGOOGLE only reports presents that carried a
+	 * VkPresentTimesInfoGOOGLE — an untagged present is simply not recorded,
+	 * which is why the feeder can read a valid refresh period and still never
+	 * receive a single observation. That failure is silent and looks exactly
+	 * like an idle panel.
+	 *
+	 * desiredPresentTime stays 0: we are asking for FEEDBACK, not scheduling.
+	 * Supplying a target here would make the driver hold the frame, which is
+	 * the opposite of what late weave wants.
+	 *
+	 * Mutually exclusive with the VkPresentIdKHR chain above by construction —
+	 * that one only builds on a path where present_wait resolved, and this
+	 * extension only matters where it did not.
+	 */
+	VkPresentTimeGOOGLE present_time = {};
+	VkPresentTimesInfoGOOGLE present_times = {};
+	if (vk->has_GOOGLE_display_timing && present_info.pNext == NULL) {
+		present_time.presentID = ++target->display_timing_present_id;
+		present_time.desiredPresentTime = 0;
+		present_times.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
+		present_times.swapchainCount = 1;
+		present_times.pTimes = &present_time;
+		present_info.pNext = &present_times;
+	}
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 

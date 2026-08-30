@@ -1895,6 +1895,7 @@ vk_init_from_given(struct vk_bundle *vk,
                    bool timeline_semaphore_enabled,
                    bool image_format_list_enabled,
                    bool debug_utils_enabled,
+                   bool display_timing_enabled,
                    enum u_logging_level log_level)
 {
 	VkResult ret;
@@ -1937,6 +1938,14 @@ vk_init_from_given(struct vk_bundle *vk,
 	// Vulkan does not let us read what extensions was enabled.
 	if (image_format_list_enabled) {
 		vk->has_KHR_image_format_list = image_format_list_enabled;
+	}
+
+	// Vulkan does not let us read what extensions was enabled. #902: the
+	// Android pacing source — without this the vblank grid's feeder bails on
+	// a device that supports display timing perfectly well, because an ADOPTED
+	// device never runs build_device_extensions and so never sets this flag.
+	if (display_timing_enabled) {
+		vk->has_GOOGLE_display_timing = true;
 	}
 
 #ifdef VK_KHR_timeline_semaphore
