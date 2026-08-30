@@ -5928,6 +5928,10 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 			if (!mc->weave.idle_released && mc->weave.dp != NULL) {
 				mc->weave.idle_released = true;
 				xrt_display_processor_on_pause(mc->weave.dp);
+				// #1277 P2: also wipe the satellite overlay — an idle
+				// client's last woven frame otherwise stays frozen on
+				// screen, painted over whatever now owns the panel.
+				comp_multi_weave_android_satellite_clear(mc);
 				U_LOG_W("weave(#1278): idle %.1fs — lens vote RELEASED (next weave re-asserts)",
 				        (double)(now_ns - mc->weave.last_submit_ns) / 1e9);
 			}

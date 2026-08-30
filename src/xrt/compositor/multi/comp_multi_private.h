@@ -1106,6 +1106,19 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes);
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * Clear the weave satellite overlay to transparent (#1277 P2 lifecycle).
+ * Called on the #1278 weave-idle edge WITH mc->weave.mutex held: a client that
+ * stops submitting (covered, backgrounded, tab hidden) otherwise leaves its
+ * LAST woven frame frozen on the overlay, painted over whatever now owns the
+ * screen (measured: a stopped browser's cube floating over a fullscreen
+ * modelviewer). No-op when the satellite is not live.
+ */
+void
+comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
+#endif
+
 bool
 comp_multi_weave_export_output(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t *out_handle,

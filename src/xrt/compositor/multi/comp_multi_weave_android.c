@@ -1235,6 +1235,97 @@ weave_satellite_clip_and_occlude(
 	return n;
 }
 
+void
+comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
+{
+	if (mc->weave.sat_swapchain == VK_NULL_HANDLE || mc->weave.sat_cmd == VK_NULL_HANDLE) {
+		return;
+	}
+	struct vk_bundle *vk = weave_get_vk(mc);
+	if (vk == NULL) {
+		return;
+	}
+
+	uint32_t idx = 0;
+	VkResult ret = vk->vkAcquireNextImageKHR(vk->device, mc->weave.sat_swapchain, 50ULL * 1000ULL * 1000ULL,
+	                                         mc->weave.sat_acquire_sem, VK_NULL_HANDLE, &idx);
+	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		// Transient (timeout / out-of-date): the overlay stays stale one
+		// more tick; the 20 Hz caller retries while the client stays idle.
+		return;
+	}
+
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+	VkCommandBuffer cmd = mc->weave.sat_cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo begin = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin);
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+	mc->weave.sat_image_first[idx] = false;
+	VkClearColorValue clear = {.float32 = {0.f, 0.f, 0.f, 0.f}};
+	vk->vkCmdClearColorImage(cmd, mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1,
+	                         &range);
+	VkImageMemoryBarrier to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &to_present);
+	vk->vkEndCommandBuffer(cmd);
+
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &mc->weave.sat_acquire_sem,
+	    .pWaitDstStageMask = &wait_stage,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &mc->weave.sat_done_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	vk->vkResetFences(vk->device, 1, &mc->weave.sat_fence);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.sat_fence);
+	if (ret == VK_SUCCESS) {
+		vk->vkWaitForFences(vk->device, 1, &mc->weave.sat_fence, VK_TRUE, 100ULL * 1000ULL * 1000ULL);
+		VkPresentInfoKHR present = {
+		    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		    .waitSemaphoreCount = 1,
+		    .pWaitSemaphores = &mc->weave.sat_done_sem,
+		    .swapchainCount = 1,
+		    .pSwapchains = &mc->weave.sat_swapchain,
+		    .pImageIndices = &idx,
+		};
+		vk->vkQueuePresentKHR(vk->main_queue->queue, &present);
+	}
+	vk_queue_unlock(vk->main_queue);
+	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
+}
+
 /*!
  * Blit the completed woven output onto the overlay at the window's physical
  * rect and present. Called with the weave mutex held, AFTER the weave fence
