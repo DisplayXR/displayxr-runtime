@@ -1882,6 +1882,27 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
  * grid untrusted, and an untrusted grid makes its consumers keep exactly
  * today's behaviour rather than schedule against a fabricated clock.
  */
+/*!
+ * #902: the measured panel period, or 0 when the grid cannot vouch for one.
+ *
+ * The 0 is the contract: the repaint loop keeps its existing behaviour rather
+ * than pacing against a value this module cannot stand behind. Callers must
+ * not substitute their own fallback for a 0 return — that is what the
+ * open-loop path already did, and it is what this exists to replace.
+ */
+extern "C" uint64_t
+comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
+{
+	if (target == NULL) {
+		return 0;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (!comp_vblank_grid_trusted(&target->vblank_grid, now_ns)) {
+		return 0;
+	}
+	return target->vblank_grid.period_ns;
+}
+
 static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {

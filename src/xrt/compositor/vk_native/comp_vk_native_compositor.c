@@ -557,6 +557,10 @@ struct comp_vk_native_compositor
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		//! #902: last measured grid period the loop paced on; 0 = assumed rate.
+		//! Only used to log the transitions, so a variable-refresh panel does
+		//! not produce a line per tick.
+		uint64_t last_grid_period_ns;
 		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
@@ -4130,6 +4134,44 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
  * Paces itself with the lock RELEASED, then takes it for the whole replay, so
  * the queue and the vendor weaver only ever see one caller.
  */
+/*!
+ * #902 kill switch: pace the repaint loop on the MEASURED vblank grid instead
+ * of the compositor's assumed refresh rate.
+ *
+ * Default ON where a grid exists — but a grid only exists where the driver
+ * supplies display timing, so on every other platform this is inert and the
+ * loop keeps its current behaviour untouched.
+ *
+ * The switch is here because repaint scheduling has a bad track record: five
+ * gap-filling variants looked right and lost on hardware before the #1257 slot
+ * partition worked, and the failure mode was cadence instability that only an
+ * eyeball caught. This one is A/B-able without a rebuild.
+ *
+ * DXR_VBLANK_GRID_PACING=0 / debug.dxr.vblank_grid_pacing 0 restores the
+ * assumed-rate behaviour.
+ */
+static bool
+dxr_vblank_grid_pacing_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 1;
+		const char *e = getenv("DXR_VBLANK_GRID_PACING");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.vblank_grid_pacing", sp) > 0 && sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 static void *
 vk_repaint_thread(void *ptr)
 {
@@ -4142,7 +4184,41 @@ vk_repaint_thread(void *ptr)
 
 	while (os_thread_helper_is_running(&c->repaint_thread)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
-		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+		uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		/*
+		 * #902: prefer the MEASURED panel period over the assumed one.
+		 *
+		 * `hz` above is what the compositor was told at create time. On a
+		 * variable-refresh panel that is a snapshot, not a fact: measured on
+		 * the NP02J moving 59.86 <-> 119.71 Hz inside one session with no
+		 * swapchain recreate, while this loop paced a hardcoded 60 — so it
+		 * targeted half the real rate for as long as the boost lasted, which
+		 * is precisely the interactive stretch where cadence matters most.
+		 *
+		 * 0 means the grid cannot vouch for a period (no display-timing, no
+		 * fresh anchor, feed stopped), and then the assumed rate stands. That
+		 * is deliberately the ONLY fallback: substituting anything else here
+		 * would rebuild the open-loop guess this replaces.
+		 */
+		if (dxr_vblank_grid_pacing_enabled() && c->target != NULL) {
+			const uint64_t measured_ns = comp_vk_native_target_vblank_period_ns(c->target);
+			if (measured_ns != 0) {
+				if (measured_ns != c->repaint.last_grid_period_ns) {
+					U_LOG_W("#902: repaint pacing on the measured grid — %.3f ms "
+					        "(%.2f Hz); assumed was %.3f ms (%.2f Hz)",
+					        measured_ns / 1e6, 1e9 / (double)measured_ns,
+					        period_ns / 1e6, hz);
+					c->repaint.last_grid_period_ns = measured_ns;
+				}
+				period_ns = measured_ns;
+			} else if (c->repaint.last_grid_period_ns != 0) {
+				U_LOG_W("#902: repaint pacing fell back to the assumed rate "
+				        "(%.2f Hz) — grid no longer trusted",
+				        hz);
+				c->repaint.last_grid_period_ns = 0;
+			}
+		}
 
 		/*
 		 * #1196: this wait doubles as the request inbox. Sleep at most a
