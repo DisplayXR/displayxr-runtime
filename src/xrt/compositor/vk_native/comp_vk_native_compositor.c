@@ -5595,6 +5595,55 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
  * Two callers, for the reason @ref vk_make_dp_vk has two: the session create and
  * the #918 split's retire.
  */
+/*!
+ * #902: does this physical device advertise VK_GOOGLE_display_timing?
+ *
+ * The app creates the VkDevice, and Vulkan offers no way to read back which
+ * extensions were enabled on it — which is why vk_init_from_given takes a
+ * boolean per extension rather than discovering them. The runtime lists this
+ * one in the optional set it hands the app (oxr_vulkan.c), filtered against
+ * driver support, so "the device advertises it" is the honest proxy for "the
+ * app enabled it" on this path.
+ *
+ * Enumerated straight off the physical device: no VkDevice needed, and the
+ * instance-level entry point is always resolvable.
+ */
+static bool
+comp_vk_physical_device_has_display_timing(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                                           VkInstance instance,
+                                           VkPhysicalDevice physical_device)
+{
+	if (get_instance_proc_addr == NULL || instance == VK_NULL_HANDLE ||
+	    physical_device == VK_NULL_HANDLE) {
+		return false;
+	}
+	PFN_vkEnumerateDeviceExtensionProperties enumerate =
+	    (PFN_vkEnumerateDeviceExtensionProperties)get_instance_proc_addr(
+	        instance, "vkEnumerateDeviceExtensionProperties");
+	if (enumerate == NULL) {
+		return false;
+	}
+	uint32_t count = 0;
+	if (enumerate(physical_device, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+		return false;
+	}
+	VkExtensionProperties *props = U_TYPED_ARRAY_CALLOC(VkExtensionProperties, count);
+	if (props == NULL) {
+		return false;
+	}
+	bool found = false;
+	if (enumerate(physical_device, NULL, &count, props) == VK_SUCCESS) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (strcmp(props[i].extensionName, "VK_GOOGLE_display_timing") == 0) {
+				found = true;
+				break;
+			}
+		}
+	}
+	free(props);
+	return found;
+}
+
 static xrt_result_t
 vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transparent_background)
 {
@@ -5605,6 +5654,7 @@ vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transpar
 	// create its own swapchain. The HWND passed to CreateVulkanWeaver is
 	// used only for monitor detection and draw-region calculation.
 	if (hwnd != NULL
+
 #ifdef XRT_OS_WINDOWS
 	    || c->owns_window
 #endif
@@ -5691,6 +5741,8 @@ vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transpar
  * A failure to rebuild the Vulkan weaver is logged at ERROR, not WARN — a
  * session that weaves nowhere must not have to be INFERRED from an absent line.
  */
+
+
 static void
 vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, const char *short_reason)
 {
@@ -5808,6 +5860,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	                                     false, // timeline_semaphore_enabled
 	                                     false, // image_format_list_enabled
 	                                     false, // debug_utils_enabled
+	                                     // #902: display_timing_enabled. The runtime lists
+	                                     // VK_GOOGLE_display_timing in the optional set it hands
+	                                     // the app (oxr_vulkan.c), filtered against driver
+	                                     // support — so on a device that advertises it, the app's
+	                                     // device has it. Adopted devices never run
+	                                     // build_device_extensions, so nothing else would ever
+	                                     // set this and the Android vblank grid would stay dark
+	                                     // on hardware that supports it.
+	                                     comp_vk_physical_device_has_display_timing(
+	                                         vkGetInstanceProcAddr, (VkInstance)vk_instance,
+	                                         (VkPhysicalDevice)vk_physical_device),
 	                                     U_LOGGING_INFO);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to initialize vk_bundle from app device: %d", vk_ret);

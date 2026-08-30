@@ -138,6 +138,33 @@ TEST_CASE("vblank grid: survives a platform refresh-rate switch")
 	CHECK(g.period_changes == 1);
 }
 
+TEST_CASE("vblank grid: driver jitter is not a mode change")
+{
+	// Measured on device: the driver returns a slightly different
+	// refreshDuration on each read of the SAME mode, so a bare != counted
+	// every poll as a switch and churned the grid twice a second at a
+	// rock-steady 59.86 Hz.
+	struct comp_vblank_grid g = {};
+	REQUIRE(comp_vblank_grid_set_period(&g, 16706999));
+	REQUIRE(comp_vblank_grid_observe(&g, 1000 * MS));
+	const uint64_t established = g.period_ns;
+
+	for (uint64_t jitter = 1; jitter < 5000; jitter += 977) {
+		REQUIRE(comp_vblank_grid_set_period(&g, 16706999 + jitter));
+		REQUIRE(comp_vblank_grid_set_period(&g, 16706999 - jitter));
+	}
+	CHECK(g.period_changes == 0);
+	CHECK(g.period_ns == established); // and it keeps the first value, not the last
+
+	// A real switch still registers. The narrowest adjacent pair this panel
+	// exposes is 120 -> 144 Hz, a 20% step — far outside the 1% band.
+	REQUIRE(comp_vblank_grid_set_period(&g, P120));
+	CHECK(g.period_changes == 1);
+	CHECK(g.period_ns == P120);
+	REQUIRE(comp_vblank_grid_set_period(&g, 6944444)); // 144 Hz
+	CHECK(g.period_changes == 2);
+}
+
 TEST_CASE("vblank grid: phase reset keeps the period")
 {
 	struct comp_vblank_grid g = {};

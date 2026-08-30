@@ -1240,6 +1240,7 @@ vk_init_from_given(struct vk_bundle *vk,
                    bool timeline_semaphore_enabled,
                    bool image_format_list_enabled,
                    bool debug_utils_enabled,
+                   bool display_timing_enabled,
                    enum u_logging_level log_level);
 
 
