@@ -219,19 +219,6 @@ dxr_surface_lost_latch_enabled(void)
  * D3D11 frame-latency waitable. The whole record+weave+submit+present then
  * runs inside one refresh interval and the FIFO queue stays empty.
  */
-static bool
-dxr_late_weave_enabled()
-{
-	static int enabled = -1;
-	if (enabled < 0) {
-		// Default ON: late-weave is the product behavior on every path
-		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
-		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
-	}
-	return enabled == 1;
-}
 
 // #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1). N>1 paces on the
 // present N-1 back, restoring N-1 frames of CPU/GPU overlap on a saturated
@@ -389,6 +376,23 @@ struct comp_vk_native_target
 	//! present_id_counter below is inside the Windows block, and this path is
 	//! specifically for platforms that have no present_wait.
 	uint32_t display_timing_present_id;
+	/*!
+	 * #902 late weave: a DECAYING HIGH-WATER estimate of how long a weave
+	 * takes, acquire to present-return.
+	 *
+	 * Deliberately not an EMA. This is a BUDGET, and the cost of
+	 * underestimating it is asymmetric: too small and the weave misses the
+	 * vblank it was aimed at, costing a whole frame; too large and it merely
+	 * starts a little early, which is exactly today's behaviour. A mean would
+	 * miss roughly half the time. The slow decay lets it come back down when
+	 * the scene gets cheaper without tracking every dip.
+	 */
+	uint64_t weave_cost_ns;
+	//! Set at acquire, consumed after present, to measure the above.
+	uint64_t weave_start_ns;
+	//! One-shot log guard for the late-weave tier engaging.
+	bool late_weave_grid_logged;
+
 	//! When the refresh period was last re-read (ns). The panel is
 	//! variable-refresh, so this is polled rather than latched.
 	uint64_t refresh_last_probe_ns;
@@ -1866,6 +1870,38 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 }
 
 /*!
+ * Late-weave master switch. Product behaviour on every path (measured
+ * 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17 workspace);
+ * DXR_LATE_WEAVE=0 opts out for A/B or triage.
+ *
+ * Lives at top level rather than inside the Windows block because the #902
+ * grid tier is the Android substitute for the same lever and consults the same
+ * switch — one knob, both mechanisms, so an A/B means the same thing on either
+ * platform. Also reads the Android sysprop, since getenv reaches nothing there.
+ */
+static bool
+dxr_late_weave_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = 1;
+		const char *e = getenv("DXR_LATE_WEAVE");
+		if (e != nullptr && e[0] != '\0') {
+			enabled = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.late_weave", sp) > 0 && sp[0] != '\0') {
+				enabled = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return enabled == 1;
+}
+
+/*!
  * #868/#902: pump the vblank grid from VK_GOOGLE_display_timing.
  *
  * Sits next to the present_wait probe above because it is the OTHER pacing
@@ -2456,6 +2492,61 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		return XRT_ERROR_VULKAN;
 	}
 
+	/*
+	 * #902 LATE WEAVE, grid flavour.
+	 *
+	 * The present_wait tier BLOCKS until the previous present hits glass and
+	 * weaves immediately after. Display timing cannot block — it is
+	 * retrospective — so the equivalent is to compute where the next vblank
+	 * is and sleep until just enough time remains to weave into it.
+	 *
+	 * Unlike the repaint pacing change, this adds NO GPU work: it moves when
+	 * a weave starts, not how many happen. The failure mode is therefore
+	 * bounded — a bad estimate weaves early, which is precisely the current
+	 * behaviour — and it cannot overcommit the queue the way chasing the
+	 * panel's boost did.
+	 *
+	 * Skipped entirely where present_wait exists; that tier is better (it is
+	 * a real sync point rather than a projection) and this is its substitute,
+	 * not its competitor.
+	 */
+	bool have_present_wait = false;
+#ifdef XRT_OS_WINDOWS
+	// present_wait is the better tier where it exists — a real sync point
+	// rather than a projection — so the grid stands down for it.
+	have_present_wait = (target_present_wait_fn(target) != NULL);
+#endif
+	if (dxr_late_weave_enabled() && !have_present_wait) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const uint64_t next_vblank =
+		    comp_vblank_grid_next_vblank_after(&target->vblank_grid, now_ns);
+		const uint64_t period_ns = target->vblank_grid.period_ns;
+		if (next_vblank != 0 && period_ns != 0) {
+			// Margin covers scheduler wake jitter. Cheap insurance: being a
+			// millisecond early costs a millisecond of staleness, being a
+			// millisecond late costs a whole refresh.
+			const uint64_t margin_ns = 1500ULL * 1000;
+			const uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+			if (next_vblank > now_ns + budget_ns) {
+				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
+				// Never sleep past one period, whatever the grid says. A
+				// wrong anchor must cost at most a frame, not a stall — the
+				// lesson from the boost-chasing wedge.
+				if (sleep_ns > period_ns) {
+					sleep_ns = period_ns;
+				}
+				os_nanosleep((int64_t)sleep_ns);
+			}
+			if (!target->late_weave_grid_logged) {
+				target->late_weave_grid_logged = true;
+				U_LOG_W("#902: late weave on the measured grid — period %.3f ms, "
+				        "weave budget %.3f ms (no present_wait on this device)",
+				        period_ns / 1e6, budget_ns / 1e6);
+			}
+		}
+		target->weave_start_ns = os_monotonic_get_ns();
+	}
+
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
 		// #870 — late-weave pacing for the bridge. Block until DXGI says the
@@ -2900,6 +2991,29 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	// failure here never affects the present's own result.
 	if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
 		target_feed_vblank_grid(target);
+
+		/*
+		 * #902: update the weave-cost budget the late-weave sleep aims with.
+		 *
+		 * Decaying high-water rather than a mean, because this is a deadline:
+		 * overshooting the vblank costs a whole refresh, undershooting costs
+		 * only a little staleness. Rise immediately to any larger cost; decay
+		 * ~2% per frame so a cheaper scene is followed within a second or so
+		 * without chasing individual dips.
+		 */
+		if (target->weave_start_ns != 0) {
+			const uint64_t cost = os_monotonic_get_ns() - target->weave_start_ns;
+			// Ignore absurd samples: a preempted thread or a swapchain
+			// recreate mid-frame is not a weave cost.
+			if (cost < 100ULL * 1000 * 1000) {
+				if (cost > target->weave_cost_ns) {
+					target->weave_cost_ns = cost;
+				} else {
+					target->weave_cost_ns -= target->weave_cost_ns / 50;
+				}
+			}
+			target->weave_start_ns = 0;
+		}
 	}
 
 #ifdef XRT_OS_WINDOWS
