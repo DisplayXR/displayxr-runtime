@@ -298,6 +298,15 @@ SurfaceFlinger's own content detection. It re-decides the rate from observed GPU
 which is why declaring a content rate and requesting a display mode are both honoured and then
 overridden. All read-only props.
 
+**UPDATE — the Settings UI toggle DOES work, and it disproved the hypothesis.** Setting Screen
+refresh rate to 60 by hand pins the panel: the grid saw exactly one value, `16.707 ms (59.86 Hz)`,
+across a 12-swipe touch-heavy run, against 3-9 switch events in every prior run. **But the jitter
+was unchanged** — 34.3 fps, SD 13.80 ms, CoV 47.3%, statistically identical to unpinned. So panel
+switching was a real defect and *not* the dominant one; with the panel provably steady the ~47%
+interval CoV remains. The claim earlier in this file that pinning was "likely worth more than any
+scheduling change" is wrong. Where the variance actually comes from — app frame delivery, the
+repaint loop's own scheduling, or GPU contention — is the open question.
+
 **Classification: not fixable from the runtime or the vendor plug-in on this device.** The
 practical answer is to RECORD the rate rather than fight it, so a mid-run switch is visible as
 itself instead of surfacing as unexplained variance — it is the discriminator between a prediction
