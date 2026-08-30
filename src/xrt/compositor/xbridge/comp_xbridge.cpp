@@ -1094,7 +1094,33 @@ xb_plane_invalidate_slots(struct comp_xbridge *xb, struct comp_xbridge::xb_plane
 		h = pl.src_h;
 	}
 	for (int i = 0; i < XB_EGRESS_RING; i++) {
-		pl.slot_seq[i] = 0;
+		/*
+		 * #1298: make every slot owe a FULL refresh on its next WRITE -- but do
+		 * NOT zero `slot_seq`, i.e. do not revoke READ access to pixels this
+		 * call never touched.
+		 *
+		 * Zeroing it was the Local2D resize blink. A composite region change
+		 * (every frame of an interactive resize) revoked all three slots while
+		 * only the slot written that frame was refreshed, and that one is a
+		 * fence latency away from being consumable. So on many frames NO slot
+		 * was acceptable: `comp_xbridge_get_plane_srv` refused whichever the
+		 * pick or the repaint landed on (`slot_seq == 0`), the masked composite
+		 * hard-bailed (`composite_bail = 4`), and the 2D band vanished for that
+		 * frame. Measured at 77-346 bails per resize session, on app frames and
+		 * repaint ticks alike, and maintainer-eyeballed as a blink.
+		 *
+		 * Not zeroing is safe on both halves:
+		 * - READ: an untouched slot still holds the plane pixels its own recipe
+		 *   describes -- region and canvas travel with the pixels (#1297) -- so
+		 *   consuming it is the bridge's ordinary one-frame lag, not a stale
+		 *   composite. The real hazard, a slot REWRITTEN under an in-flight
+		 *   weave, is still caught: the rewrite moves `slot_seq` and the
+		 *   reader's `want_seq` no longer matches.
+		 * - WRITE: the full-extent pend below is what forces the next copy to
+		 *   refresh the whole plane, and the change-skip cannot swallow it --
+		 *   the Local2D digest mixes the region into its hash, so a region
+		 *   change always produces a new `stage_seq`.
+		 */
 		pl.pend_x[i] = 0;
 		pl.pend_y[i] = 0;
 		pl.pend_w[i] = w;

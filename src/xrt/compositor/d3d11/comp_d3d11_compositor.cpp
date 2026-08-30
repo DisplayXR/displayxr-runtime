@@ -2465,6 +2465,26 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	}
 	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d, target_width,
 	                          target_height, &eff_canvas, weave_slot);
+	/*
+	 * #1298 probe (DXR_ZONE_BLINK_PROBE=1) — one line per frame whose masked
+	 * composite did NOT run, with the #876 bail code (2 = zero region, 4 =
+	 * Local2D unavailable, 6 = draw failed, 7 = recipe mismatch). This is the
+	 * instrument that localised the Local2D resize blink: every aggregate
+	 * counter read healthy while 77-346 frames per drag bailed with code 4.
+	 * Kept, gated and off by default, because a dropped 2D band is otherwise
+	 * invisible outside the #876 diag.
+	 */
+	{
+		static int probe_b = -1;
+		if (probe_b < 0) {
+			const char *e = getenv("DXR_ZONE_BLINK_PROBE");
+			probe_b = (e != nullptr && e[0] == '1') ? 1 : 0;
+		}
+		if (probe_b == 1 && c->split_active && c->repaint.composite_bail != 0) {
+			U_LOG_W("#1298 BAIL code=%d slot=%d (no 2D composited this frame)",
+			        (int)c->repaint.composite_bail, (int)weave_slot);
+		}
+	}
 
 	/*
 	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the

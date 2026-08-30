@@ -633,8 +633,16 @@ comp_xbridge_stage_plane(
     struct comp_xbridge *xb, uint32_t plane, uint64_t content_seq, int32_t x, int32_t y, uint32_t w, uint32_t h);
 
 /*!
- * #918 review F4 — drop every slot's pixels for @p plane and make each owe a
- * FULL refresh of the plane extent.
+ * #918 review F4 — make every slot owe a FULL refresh of the plane extent on
+ * its next WRITE.
+ *
+ * #1298: this deliberately does NOT revoke READ access to the slots' current
+ * pixels. An untouched slot still holds the plane its own recipe describes
+ * (region and canvas travel with the pixels, #1297), so consuming it is the
+ * bridge's ordinary one-frame lag. The original "drop every slot's pixels"
+ * semantics revoked all three slots on every frame of a resize drag while only
+ * one was rewritten, which blanked the 2D band on every frame whose pick landed
+ * elsewhere.
  *
  * For the caller whose SOURCE content moved without the source texture being
  * reallocated: a composite region change leaves stale pixels outside the new
