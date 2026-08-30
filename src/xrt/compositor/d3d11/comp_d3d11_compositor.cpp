@@ -1990,7 +1990,10 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 {
 	const bool zero_copy = c->repaint.zero_copy;
 	void *zc_srv = c->repaint.zc_srv;
-	const struct u_canvas_rect eff_canvas = c->repaint.canvas;
+	// #1091: not const — under the split a slot woven at its own (older) content
+	// box must be mapped onto the canvas THAT slot was painted for, never the
+	// live one. See the override in the split block below.
+	struct u_canvas_rect eff_canvas = c->repaint.canvas;
 
 	// Re-bind target RTV before DP — the renderer may have changed it to the atlas RTV.
 	// The DP writes to the currently bound render target (see xrt_display_processor_d3d11.h).
@@ -2265,6 +2268,27 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			                                              bd_srv != nullptr ? brec.bd_h : 0);
 			if (bd_srv != nullptr) {
 				comp_d3d11_target_bind(c->target);
+			}
+			/*
+			 * #1091: the canvas travels WITH the pixels. This weave is about to
+			 * map the slot's content onto a canvas rect; the slot may have been
+			 * painted for a different window size (the R2 scale-lag branch above
+			 * deliberately weaves it at its OWN content box), and mapping stale
+			 * content onto the LIVE canvas mis-magnifies it by one frame of
+			 * resize motion. That error changes every frame of a drag, which is
+			 * seen as the 3D shimmering while the window resizes smoothly —
+			 * maintainer-confirmed against a split-off control, which does not
+			 * shimmer because there the weave always consumes its own frame.
+			 * The masked composite already single-sources this from the slot
+			 * (Phase 2a / #1140, "the recipe travels with the pixels"); this is
+			 * the same rule applied to the DP call itself.
+			 */
+			if (brec.cw > 0 && brec.ch > 0) {
+				eff_canvas.valid = true;
+				eff_canvas.x = brec.cx;
+				eff_canvas.y = brec.cy;
+				eff_canvas.w = brec.cw;
+				eff_canvas.h = brec.ch;
 			}
 		}
 		/*
@@ -3324,6 +3348,23 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			 */
 			struct comp_xbridge_recipe r = {};
 			r.composite = false;
+			/*
+			 * #1091: stamp the CANVAS even though this frame runs no composite.
+			 * The consume half weaves a slot at the content box that slot was
+			 * painted at (the R2 scale-lag branch); if the canvas it maps that
+			 * content onto is the LIVE one, the magnification is wrong by
+			 * exactly one frame of resize motion — and since that error changes
+			 * every frame of a drag, the 3D shimmers while the window itself
+			 * moves smoothly. Carrying the canvas with the pixels makes the
+			 * woven frame internally consistent: uniformly one frame old, which
+			 * is just latency, instead of self-inconsistent, which is stutter.
+			 * The composite path already stamped this (Phase 2a); only the
+			 * projection-only path did not, so a plain 3D app got the mismatch.
+			 */
+			r.cx = eff_canvas.valid ? eff_canvas.x : 0;
+			r.cy = eff_canvas.valid ? eff_canvas.y : 0;
+			r.cw = eff_canvas.valid ? eff_canvas.w : 0;
+			r.ch = eff_canvas.valid ? eff_canvas.h : 0;
 			// The backdrop is independent of the composite: a frame can have
 			// 2D-under layers and still not run the masked pass.
 			r.bd_w = c->repaint.backdrop_w;
