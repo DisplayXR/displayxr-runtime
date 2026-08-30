@@ -561,6 +561,9 @@ struct comp_vk_native_compositor
 		//! Only used to log the transitions, so a variable-refresh panel does
 		//! not produce a line per tick.
 		uint64_t last_grid_period_ns;
+		//! #902: one-shot guard for the clamp log, so a panel that boosts
+		//! repeatedly does not produce a line per boost.
+		bool grid_clamp_logged;
 		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
@@ -4202,7 +4205,40 @@ vk_repaint_thread(void *ptr)
 		 * would rebuild the open-loop guess this replaces.
 		 */
 		if (dxr_vblank_grid_pacing_enabled() && c->target != NULL) {
-			const uint64_t measured_ns = comp_vk_native_target_vblank_period_ns(c->target);
+			bool clamped = false;
+			uint64_t measured_ns = comp_vk_native_target_vblank_period_ns(c->target);
+			/*
+			 * FLOOR THE PERIOD AT THE ASSUMED ONE — never pace FASTER than
+			 * the compositor was sized for.
+			 *
+			 * This is a hang fix, not a tuning choice. Following the panel's
+			 * touch-triggered 60 -> 120 boost asks for a weave every 8.35 ms
+			 * while a weave costs ~21 ms of GPU at these clocks: a ~2.5x
+			 * overcommit. The submissions back up until a fence inside the
+			 * vendor weaver stops signalling, and the whole session wedges —
+			 * captured on device as the repaint thread parked in
+			 * process_atlas_weave -> vkWaitForFences while the app thread sat
+			 * in layer_commit's os_cond_wait waiting for it. Reproduced by
+			 * rotating the model, which is exactly what triggers the boost.
+			 *
+			 * So the grid's value here is correcting the period we already
+			 * planned for (59.86 vs an assumed 60.00, and any mode change
+			 * DOWNWARD in rate), not chasing every boost the platform offers.
+			 * Pacing faster needs a measured sustainable-rate budget, which
+			 * does not exist yet; until it does, refusing to chase is the only
+			 * honest option.
+			 */
+			if (measured_ns != 0 && measured_ns < period_ns) {
+				if (!c->repaint.grid_clamp_logged) {
+					c->repaint.grid_clamp_logged = true;
+					U_LOG_W("#902: measured %.3f ms is FASTER than the assumed %.3f ms — "
+					        "clamping. Chasing the panel's boost overcommits the GPU "
+					        "and wedges the weave; see the comment at this site.",
+					        measured_ns / 1e6, period_ns / 1e6);
+				}
+				measured_ns = 0; // keep the assumed period
+				clamped = true;
+			}
 			if (measured_ns != 0) {
 				if (measured_ns != c->repaint.last_grid_period_ns) {
 					U_LOG_W("#902: repaint pacing on the measured grid — %.3f ms "
@@ -4213,9 +4249,13 @@ vk_repaint_thread(void *ptr)
 				}
 				period_ns = measured_ns;
 			} else if (c->repaint.last_grid_period_ns != 0) {
-				U_LOG_W("#902: repaint pacing fell back to the assumed rate "
-				        "(%.2f Hz) — grid no longer trusted",
-				        hz);
+				// Two very different reasons to be on the assumed rate, and
+				// conflating them sent me looking for a lost feed when the
+				// grid was working perfectly and simply being clamped.
+				U_LOG_W("#902: repaint pacing back on the assumed rate (%.2f Hz) — %s",
+				        hz,
+				        clamped ? "measured rate clamped (panel faster than we can sustain)"
+				                : "grid no longer trusted (feed stopped or stale)");
 				c->repaint.last_grid_period_ns = 0;
 			}
 		}
