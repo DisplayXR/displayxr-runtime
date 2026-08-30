@@ -40,6 +40,10 @@
 #include "util/u_logging.h"
 
 #include <stdint.h>
+
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 #include <stdlib.h>
 
 #ifdef __cplusplus
@@ -53,6 +57,15 @@ u_app_partition_divisor(void)
 	static int cached = -1;
 	if (cached < 0) {
 		const char *e = getenv("DXR_APP_FRAME_DIVISOR");
+#ifdef XRT_OS_ANDROID
+		// getenv reaches nothing on Android; the partition would be
+		// permanently unreachable there without this.
+		char sp_div[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') &&
+		    __system_property_get("debug.dxr.app_frame_divisor", sp_div) > 0) {
+			e = sp_div;
+		}
+#endif
 		int v = (e != NULL) ? atoi(e) : 0;
 		if (v < 2) {
 			v = 0; // off
@@ -72,6 +85,13 @@ u_app_partition_any_tier(void)
 	static int cached = -1;
 	if (cached < 0) {
 		const char *e = getenv("DXR_APP_FRAME_DIVISOR_ANY_TIER");
+#ifdef XRT_OS_ANDROID
+		char sp_any[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') &&
+		    __system_property_get("debug.dxr.app_frame_divisor_any_tier", sp_any) > 0) {
+			e = sp_any;
+		}
+#endif
 		cached = (e != NULL && e[0] == '1') ? 1 : 0;
 	}
 	return cached == 1;

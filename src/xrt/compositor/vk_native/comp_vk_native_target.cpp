@@ -393,6 +393,32 @@ struct comp_vk_native_target
 	//! One-shot log guard for the late-weave tier engaging.
 	bool late_weave_grid_logged;
 
+	/*!
+	 * #206-on-Android: the TRUE weave->scanout residual.
+	 *
+	 * Not the same as the grid's time-to-next-vblank. That is a lower bound —
+	 * it assumes the frame scans out at the very next vblank, which only holds
+	 * when nothing is queued ahead of it. Whenever presents queue (and at ~36
+	 * fps on a 60 Hz panel they do) the real residual is one or more whole
+	 * periods larger.
+	 *
+	 * This is the quantity the vendor eye predictor actually needs: CNSDK's
+	 * facePredictLatencyMs is "how far past NOW to extrapolate", measured from
+	 * the GetPrimaryFace call inside the weave to the moment those pixels are
+	 * lit. Measured by correlating our own presentID with the actualPresentTime
+	 * the driver later reports for it — the same shape as the R measurement
+	 * comp_weave_latency_win.h derives from DXGI statistics.
+	 */
+	struct
+	{
+		uint32_t id;
+		uint64_t weave_start_ns;
+	} residual_ring[16];
+	//! Decaying-high-water residual, ns. 0 = not yet measured.
+	uint64_t residual_ns;
+	uint32_t residual_samples;
+	uint64_t residual_last_log_ns;
+
 	//! When the refresh period was last re-read (ns). The panel is
 	//! variable-refresh, so this is polled rather than latched.
 	uint64_t refresh_last_probe_ns;
@@ -2056,6 +2082,45 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 	// forward, so feeding them in whatever order the driver returns is safe.
 	for (uint32_t i = 0; i < count; i++) {
 		comp_vblank_grid_observe(&target->vblank_grid, timings[i].actualPresentTime);
+
+		// #206: resolve this record against the weave that produced it.
+		const uint32_t slot = timings[i].presentID % 16;
+		if (target->residual_ring[slot].id != timings[i].presentID) {
+			continue; // ring wrapped past it; not an error, just too old
+		}
+		const uint64_t started = target->residual_ring[slot].weave_start_ns;
+		if (started == 0 || timings[i].actualPresentTime <= started) {
+			continue;
+		}
+		const uint64_t r = timings[i].actualPresentTime - started;
+		if (r > 200ULL * 1000 * 1000) {
+			continue; // a stalled frame is not a latency measurement
+		}
+		// High-water with slow decay, same reasoning as the weave budget: this
+		// feeds a predictor, and under-predicting is what produces visible
+		// judder, so bias toward the pessimistic end of the distribution.
+		if (r > target->residual_ns) {
+			target->residual_ns = r;
+		} else {
+			target->residual_ns -= target->residual_ns / 50;
+		}
+		target->residual_samples++;
+	}
+
+	// Report it periodically. This is the number the whole CNSDK horizon
+	// question turns on — whether the vendor's hardcoded 40 ms matches what
+	// this pipeline actually does — so it is worth saying out loud rather
+	// than only exposing through an accessor nobody reads yet.
+	if (target->residual_samples > 0 && target->vblank_grid.period_ns != 0) {
+		const uint64_t now2 = os_monotonic_get_ns();
+		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
+			target->residual_last_log_ns = now2;
+			U_LOG_W("#206: measured weave->scanout residual %.2f ms "
+			        "(%.2f refresh periods, n=%u)",
+			        target->residual_ns / 1e6,
+			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
+			        target->residual_samples);
+		}
 	}
 }
 
@@ -2982,6 +3047,11 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 		present_times.swapchainCount = 1;
 		present_times.pTimes = &present_time;
 		present_info.pNext = &present_times;
+		// Remember when THIS present's weave began, so the timing record the
+		// driver publishes for this id can be turned into a real residual.
+		const uint32_t slot = present_time.presentID % 16;
+		target->residual_ring[slot].id = present_time.presentID;
+		target->residual_ring[slot].weave_start_ns = target->weave_start_ns;
 	}
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);

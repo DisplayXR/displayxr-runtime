@@ -1444,6 +1444,28 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 #ifdef XRT_OS_WINDOWS
 		part_tier_ok = (c->split != NULL);
 #endif
+#ifdef XRT_OS_ANDROID
+		/*
+		 * #902 + #1257: the partition's precondition is a STEADY, KNOWN
+		 * schedule — which is why it was gated on the #918 split, the only
+		 * arm that had one. Purely in-process tiers were refused because they
+		 * tick with 17-23 ms holes and cannot hold a fill schedule.
+		 *
+		 * The vblank grid supplies that schedule on Android for the first
+		 * time: a measured period and a real phase anchor from
+		 * VK_GOOGLE_display_timing, rather than an assumed rate. The
+		 * supporting evidence that this tier can now sustain it is the grid
+		 * pacing result — a panel-rate 59.9 fps against a 59.86 Hz panel,
+		 * from an app running at ~28. Serving a known schedule is strictly
+		 * less work than discovering one.
+		 *
+		 * Still gated on the grid actually being trusted, not merely on the
+		 * platform: with no display timing this is exactly the in-process
+		 * tier the original gate refused, and it should keep refusing.
+		 */
+		part_tier_ok = (c->target != NULL &&
+		                comp_vk_native_target_vblank_period_ns(c->target) != 0);
+#endif
 		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, part_tier_ok);
 	}
 
