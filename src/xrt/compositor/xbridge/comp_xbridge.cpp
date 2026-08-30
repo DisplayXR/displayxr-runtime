@@ -79,9 +79,25 @@
 //! #918 R2: two content-box changes closer together than this are a drag, not a
 //! mode switch — stop reallocating the egress ring per size.
 #define XB_CHURN_WINDOW_NS (500ull * 1000ull * 1000ull)
-//! …and this long without a change is the drag ending: one realloc back to a
-//! content-sized ring.
-#define XB_SETTLE_NS (500ull * 1000ull * 1000ull)
+/*!
+ * …and this long without a change is the drag ending: one realloc back to a
+ * content-sized ring.
+ *
+ * #1091: was 500 ms, which is SHORTER THAN A HUMAN DRAG PAUSE. An acceptance
+ * drag settled and re-entered churn three times inside ~1.1 s — and since each
+ * settle is itself a rebuild on the frame path, the hysteresis was generating
+ * the very cost it exists to avoid (16 egress rebuilds, 90.8 ms longest weave
+ * gap). Two seconds sits past the pauses a person makes mid-drag while still
+ * releasing the worst-case ring promptly once they are done.
+ */
+#define XB_SETTLE_NS (2000ull * 1000ull * 1000ull)
+
+/*!
+ * #1091: after this many churn entries in one session the ring stops settling
+ * back at all (see @ref comp_xbridge::churn_latched). Three says "this is a
+ * session that resizes", which the first two entries alone do not.
+ */
+#define XB_CHURN_LATCH_ENTRIES 3ull
 
 namespace {
 
@@ -307,6 +323,15 @@ struct comp_xbridge
 	uint64_t churn_entries; //!< times churn mode engaged
 	uint64_t churn_settles; //!< times it settled back to a content-sized ring
 	uint64_t eg_reallocs;   //!< egress ring rebuilds (the thing R2 minimises)
+	/*!
+	 * #1091: a drag that keeps re-entering churn is a drag the settle window is
+	 * too short for, and every settle is itself a rebuild ON THE FRAME PATH.
+	 * After this many entries in one session, stop settling back at all and keep
+	 * the worst-case ring for good: the output-device crop it costs is ~1 ms a
+	 * frame, which the measured budget allows, and it takes the rebuild out of
+	 * the interactive path entirely rather than making it rarer.
+	 */
+	bool churn_latched;
 
 	//! #918 Phase 2a — the composite recipe stamped on each slot, and the one
 	//! the next submit will stamp. Read back by the consume half so it never
@@ -2477,6 +2502,22 @@ comp_xbridge_set_content_size(struct comp_xbridge *xb, uint32_t w, uint32_t h, u
 			if ((now - xb->dims_change_ns) < XB_SETTLE_NS) {
 				return true; // still inside the settle window
 			}
+			/*
+			 * #1091: a session that has entered churn this many times will
+			 * enter it again, and the settle we are about to do is a rebuild on
+			 * the frame path — the exact cost being tuned away. Latch on the
+			 * worst-case ring instead and stop paying it.
+			 */
+			if (xb->churn_entries >= XB_CHURN_LATCH_ENTRIES) {
+				if (!xb->churn_latched) {
+					xb->churn_latched = true;
+					U_LOG_W("%s: %llu churn entries this session — LATCHING the worst-case "
+					        "egress ring for good; the output-device crop replaces every "
+					        "further resize rebuild (#1091)",
+					        XB_TAG(xb), (unsigned long long)xb->churn_entries);
+				}
+				return true;
+			}
 			xb->churn = false;
 			xb->churn_settles++;
 			U_LOG_W(
@@ -3776,13 +3817,13 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 		U_LOG_W(
 		    "%s: %llu frames bridged; picks seq=%llu seq-1=%llu older=%llu none=%llu "
 		    "in-flight=%llu (stale-layout refusals %llu; alloc-busy skips %llu); egress rebuilds %llu "
-		    "(resize-churn entries %llu, settles %llu)",
+		    "(resize-churn entries %llu, settles %llu%s)",
 		    XB_TAG(xb), (unsigned long long)xb->frames, (unsigned long long)xb->pick_now,
 		    (unsigned long long)xb->pick_prev, (unsigned long long)xb->pick_older,
 		    (unsigned long long)xb->pick_none, (unsigned long long)xb->pick_inflight,
 		    (unsigned long long)xb->pick_stale_gen, (unsigned long long)xb->skip_alloc_busy,
 		    (unsigned long long)xb->eg_reallocs, (unsigned long long)xb->churn_entries,
-		    (unsigned long long)xb->churn_settles);
+		    (unsigned long long)xb->churn_settles, xb->churn_latched ? ", LATCHED worst-case" : "");
 	}
 	// #1178 — a session that refused anything ends by saying so. A refusal means
 	// frames were NOT transported, and that must not be recoverable only from a
