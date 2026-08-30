@@ -271,6 +271,42 @@ turned a stalled weave into a frozen app rather than a dropped frame, and it vio
 no-unbounded-work principle in [`workspace-stability.md`](workspace-stability.md) (#925). Any
 future weave stall — vendor bug, driver hiccup, lost fence — hangs the app the same way.
 
+#### The panel rate cannot be pinned on this device — three mechanisms, three nulls
+
+The dominant remaining cadence instability is the platform moving the panel between 59.86 and
+119.71 Hz on interaction (interval CoV ~34-47% in *every* scheduling arm measured). Every standard
+Android way to stop it was tried and **accepted-then-ignored**:
+
+| Mechanism | Layer | Result |
+|---|---|---|
+| `ANativeWindow_setFrameRate(60, FIXED_SOURCE, CHANGE_FRAME_RATE_ALWAYS)` | native | returns success, panel still switches |
+| `WindowManager.LayoutParams.preferredDisplayModeId` | Java | applies with no exception, panel still switches |
+| `Settings.System peak/min_refresh_rate` | system | *does* flip `dumpsys display` to mode 4 (60 Hz) at idle — still overridden under touch |
+
+The likely reason, from `getprop`:
+
+```
+ro.surface_flinger.use_content_detection_for_refresh_rate  true
+ro.vendor.feature.over_scroll_adjust_fps_enabled           true
+ro.vendor.feature.zte_feature_fps_control_vk_cmdcount      true
+ro.vendor.feature.zte_feature_fps_control_draw_call        true
+ro.vendor.feature.zte_feature_fps_control_limit_frame      true      (+4 more)
+```
+
+A vendor fps-control stack inspecting **Vulkan command counts and draw calls**, above
+SurfaceFlinger's own content detection. It re-decides the rate from observed GPU work every frame,
+which is why declaring a content rate and requesting a display mode are both honoured and then
+overridden. All read-only props.
+
+**Classification: not fixable from the runtime or the vendor plug-in on this device.** The
+practical answer is to RECORD the rate rather than fight it, so a mid-run switch is visible as
+itself instead of surfacing as unexplained variance — it is the discriminator between a prediction
+error and a cadence discontinuity. The one untried lever is the device's own Settings UI "Screen
+refresh rate" toggle, which neither layer can reach programmatically.
+
+Note this is a *device* finding, not an Android one. `preferredDisplayModeId` remains the correct
+mechanism and would be expected to work on hardware without this vendor stack.
+
 #### Still open
 
 - **A sustainable-rate budget**, so the boost can be followed rather than refused.
