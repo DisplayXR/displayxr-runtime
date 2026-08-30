@@ -12,6 +12,8 @@ Purpose-built for `docs/investigations/hybrid-igpu-weave.md`. Windows-only.
   `--mode=full|copyonly|sample --paced=0|1`. `copyonly --paced=0` prints bandwidth.
 - `gpusample.ps1` — per-process/per-adapter/per-engine GPU busy from
   `\GPU Engine(*)\Running Time` deltas (never `Utilization Percentage`).
-  Adapter-LUID names are hardcoded for the reference box — edit `$names`.
+  Adapter-LUID names come from a map that is specific to one box AND one boot
+  (LUIDs are reassigned across reboots): pass `-Names @{ '0X000XXXXX' = 'iGPU'; ... }`,
+  or accept the default and read the warning it prints for any unmapped LUID.
 
 `build.bat` locates VS 2022 via vswhere and builds all three tools.
