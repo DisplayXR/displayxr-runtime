@@ -35,7 +35,26 @@
 struct weave_latency_log
 {
 	FILE *f = nullptr;
-	int enabled = -1; // -1 = unprobed (CSV only; R-tracking is always on)
+	/*!
+	 * CSV state (the CSV only; R-tracking is always on).
+	 *
+	 * ZERO MUST MEAN "UNPROBED" (#1128). Instances of this type live inside
+	 * C-style structs that are `std::memset(0)` on init — the per-client
+	 * `d3d11_client_render_resources` and the multi-compositor — which wipes
+	 * any non-zero default member initializer. A `-1 = unprobed` sentinel
+	 * therefore silently became `probed, disabled` for every service-side
+	 * ledger, and `DXR_WEAVE_LATENCY_CSV` produced no rows for the workspace
+	 * or app-HWND presenters no matter how it was set. Keeping the unprobed
+	 * state at 0 makes the type correct under memset by construction rather
+	 * than by remembering to re-arm it at each site.
+	 */
+	enum csv_state
+	{
+		CSV_UNPROBED = 0,
+		CSV_OFF = 1,
+		CSV_ON = 2,
+	};
+	int enabled = CSV_UNPROBED;
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
 	uint64_t qpc_freq = 0;
@@ -95,20 +114,20 @@ struct weave_latency_log
 	bool
 	on(const char *site)
 	{
-		if (enabled < 0) {
+		if (enabled == CSV_UNPROBED) {
 			const char *prefix = getenv("DXR_WEAVE_LATENCY_CSV");
-			enabled = 0;
+			enabled = CSV_OFF;
 			if (prefix != nullptr && prefix[0] != '\0') {
 				char path[MAX_PATH];
 				snprintf(path, sizeof(path), "%s.%s.csv", prefix, site);
 				f = fopen(path, "a");
 				if (f != nullptr) {
 					fprintf(f, "H,%lld\n", (long long)freq());
-					enabled = 1;
+					enabled = CSV_ON;
 				}
 			}
 		}
-		return enabled == 1;
+		return enabled == CSV_ON;
 	}
 
 	//! @p predicted_display_time_ns is the value xrWaitFrame handed the app
@@ -199,7 +218,7 @@ struct weave_latency_log
 			fclose(f);
 			f = nullptr;
 		}
-		enabled = -1;
+		enabled = CSV_UNPROBED;
 	}
 };
 
