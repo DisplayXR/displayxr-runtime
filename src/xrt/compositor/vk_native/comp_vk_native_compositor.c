@@ -557,6 +557,11 @@ struct comp_vk_native_compositor
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
 		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
 		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		//! #902: EMA of the app's own frame interval, for repaint phase placement.
+		uint64_t app_interval_ns;
+		//! #902: one-shot log for the phase target engaging.
+		bool phase_logged;
+
 		//! #902: last measured grid period the loop paced on; 0 = assumed rate.
 		//! Only used to log the transitions, so a variable-refresh panel does
 		//! not produce a line per tick.
@@ -3489,6 +3494,89 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         uint64_t *fp,
                         bool *out_skip_frame)
 {
+	/*
+	 * #902 cadence census. Every weave — app frame and repaint alike — passes
+	 * through here, so this is the one place the OUTPUT stream can be split by
+	 * kind.
+	 *
+	 * The question it answers: with the panel provably pinned (Settings-UI 60
+	 * Hz, grid sees a single refresh value all run) the interval CoV is still
+	 * ~47%. Three candidates — app delivery, repaint scheduling, or the two
+	 * INTERLEAVING badly — and they are indistinguishable from the combined
+	 * on-screen interval alone. A stream can have the right rate and the wrong
+	 * spacing: repaints that land just after an app frame instead of midway
+	 * between them produce exactly this signature, and no amount of counting
+	 * weaves reveals it.
+	 *
+	 * Reports mean and SD per kind, plus the app->repaint phase, i.e. where in
+	 * the app's own interval the repaint actually fell (0.5 = ideally midway).
+	 */
+	{
+		static uint64_t last_any_ns = 0, last_app_ns = 0;
+		static double s_any = 0, q_any = 0, s_app = 0, q_app = 0, s_ph = 0, q_ph = 0;
+		static uint32_t n_any = 0, n_app = 0, n_rep = 0, n_ph = 0;
+		static uint64_t last_report_ns = 0;
+		const uint64_t t = os_monotonic_get_ns();
+
+		if (last_any_ns != 0) {
+			const double d = (double)(t - last_any_ns) / 1e6;
+			if (d > 0.0 && d < 500.0) {
+				n_any++;
+				s_any += d;
+				q_any += d * d;
+			}
+		}
+		last_any_ns = t;
+
+		if (!is_repaint) {
+			if (last_app_ns != 0) {
+				const double d = (double)(t - last_app_ns) / 1e6;
+				if (d > 0.0 && d < 500.0) {
+					n_app++;
+					s_app += d;
+					q_app += d * d;
+				}
+			}
+			last_app_ns = t;
+		} else {
+			n_rep++;
+			// Phase of this repaint within the app's current interval, using
+			// the app's measured mean as the denominator. >1 means the app is
+			// late, which is itself informative.
+			if (last_app_ns != 0 && n_app > 4) {
+				const double mean_app = s_app / (double)n_app;
+				if (mean_app > 0.0) {
+					const double ph = ((double)(t - last_app_ns) / 1e6) / mean_app;
+					if (ph > 0.0 && ph < 4.0) {
+						n_ph++;
+						s_ph += ph;
+						q_ph += ph * ph;
+					}
+				}
+			}
+		}
+
+		if (last_report_ns == 0) {
+			last_report_ns = t;
+		} else if (t - last_report_ns > (5ULL * 1000 * 1000 * 1000) && n_any > 8) {
+			const double m_any = s_any / n_any;
+			const double sd_any = sqrt(q_any / n_any - m_any * m_any);
+			const double m_app = n_app > 1 ? s_app / n_app : 0.0;
+			const double sd_app = n_app > 1 ? sqrt(q_app / n_app - m_app * m_app) : 0.0;
+			const double m_ph = n_ph > 0 ? s_ph / n_ph : 0.0;
+			const double sd_ph = n_ph > 0 ? sqrt(q_ph / n_ph - m_ph * m_ph) : 0.0;
+			U_LOG_W("#902 CADENCE: all n=%u mean %.2f ms SD %.2f (CoV %.0f%%) | "
+			        "app n=%u mean %.2f ms SD %.2f (CoV %.0f%%) | repaints=%u | "
+			        "repaint phase %.2f SD %.2f (0.5=midway)",
+			        n_any, m_any, sd_any, 100.0 * sd_any / (m_any > 0 ? m_any : 1),
+			        n_app, m_app, sd_app, 100.0 * sd_app / (m_app > 0 ? m_app : 1), n_rep,
+			        m_ph, sd_ph);
+			s_any = q_any = s_app = q_app = s_ph = q_ph = 0;
+			n_any = n_app = n_rep = n_ph = 0;
+			last_report_ns = t;
+		}
+	}
+
 	struct vk_bundle *vk = &c->vk;
 	xrt_result_t xret = XRT_SUCCESS;
 
@@ -4175,6 +4263,69 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
  * DXR_VBLANK_GRID_PACING=0 / debug.dxr.vblank_grid_pacing 0 restores the
  * assumed-rate behaviour.
  */
+/*!
+ * #902: place the repaint at the MIDPOINT of the app's interval, not merely
+ * wherever the quiet gate first allows it.
+ *
+ * Measured cause of this device's cadence problem, and it is not instability.
+ * With the panel pinned and the app metronomic (CoV 3%), the repaint was
+ * landing at phase 0.70 of the app's interval with SD 0.02 — so the on-screen
+ * stream alternated 41.4 ms / 17.7 ms forever. Mean 29.56 ms and SD 11.87 both
+ * fall straight out of that alternation; the entire ~40% interval CoV was
+ * MISPLACEMENT, not variance.
+ *
+ * The quiet gate answers "is it safe to repaint yet", which was the right
+ * question when the app's cadence was unknown. It is known now — to 3% — and
+ * the grid supplies real vblanks, so the midpoint is a schedulable target
+ * rather than a guess. Same weave count, same GPU cost; the weaves are simply
+ * placed where the eye wants them.
+ *
+ * DEFAULT OFF, because as written this CANNOT WORK, and the reason is worth
+ * more than the code. A hold can only ever DELAY a fire, never advance one —
+ * and the repaint already fires LATE, at 0.70. So the hold is a no-op in the
+ * best case (measured: phase 0.71 -> 0.70, unchanged) and a cost in the worst
+ * (35.1 -> 28.6 fps, since retries burn ticks).
+ *
+ * Two attempts, both instructive:
+ *   1. Hold placed AFTER the pacing block and under the lock. Strictly worse —
+ *      phase 0.71 -> 0.83, CoV 41% -> 65% — because each rejected attempt paid
+ *      another full pacing block before re-testing, so the retry itself
+ *      dragged the fire later. Hold before the thing that blocks, or the hold
+ *      becomes a delay.
+ *   2. Hold moved above the pacing. Correct placement, still a no-op, for the
+ *      structural reason above.
+ *
+ * What would actually work: the repaint sits at 0.70 because the #1257 gate's
+ * WINDOW is placed there, and the fix is to move that window, not to add a
+ * second gate downstream of it. That is the code with the five-failed-variant
+ * history, so it wants a deliberate session and its own A/B rather than a
+ * late-night patch.
+ *
+ * DXR_REPAINT_PHASE=1 / debug.dxr.repaint_phase 1 re-enables, for anyone who
+ * wants to reproduce the above rather than take it on faith.
+ */
+static bool
+dxr_repaint_phase_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0; // DEFAULT OFF — see the header comment: it cannot work as written.
+		const char *e = getenv("DXR_REPAINT_PHASE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.repaint_phase", sp) > 0 && sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 static bool
 dxr_vblank_grid_pacing_enabled(void)
 {
@@ -4360,6 +4511,43 @@ vk_repaint_thread(void *ptr)
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
+		}
+
+		/*
+		 * #902 PHASE HOLD. The gate above says "allowed"; this says "not yet".
+		 *
+		 * Hold until the midpoint of the app's interval so the two streams
+		 * interleave evenly instead of clustering. Measured cause of this
+		 * device's cadence problem: with the panel pinned and the app
+		 * metronomic (CoV 3%), the repaint landed at phase 0.70 (SD 0.02), so
+		 * the on-screen stream alternated 41.4 / 17.7 ms forever. The whole
+		 * ~40% interval CoV was MISPLACEMENT, not variance.
+		 *
+		 * MUST sit here, above the pacing, not below it. The first version put
+		 * it after the pacing block and under the lock, which made things
+		 * strictly worse — phase 0.71 -> 0.83, CoV 41% -> 65% — because every
+		 * rejected attempt paid another full pacing block before re-testing,
+		 * so the retry itself dragged the fire later. Hold BEFORE the thing
+		 * that blocks, or the hold becomes a delay.
+		 *
+		 * Escape hatch: once the app is a full interval overdue it is
+		 * hitching, not pacing, and the original #868 case applies — fill
+		 * immediately rather than waiting for a midpoint that will not come.
+		 */
+		if (dxr_repaint_phase_enabled() && c->repaint.force != 1 &&
+		    c->repaint.app_interval_ns != 0 && c->repaint.last_app_frame_ns != 0) {
+			const uint64_t now_ph = os_monotonic_get_ns();
+			const uint64_t since = now_ph - c->repaint.last_app_frame_ns;
+			const uint64_t target = c->repaint.app_interval_ns / 2;
+			if (since < target && since < c->repaint.app_interval_ns) {
+				continue;
+			}
+			if (!c->repaint.phase_logged) {
+				c->repaint.phase_logged = true;
+				U_LOG_W("#902: repaint phase target engaged — app interval %.2f ms, "
+				        "aiming the fill at %.2f ms (debug.dxr.repaint_phase=0 restores)",
+				        c->repaint.app_interval_ns / 1e6, target / 1e6);
+			}
 		}
 
 #ifdef XRT_OS_WINDOWS
@@ -5180,7 +5368,24 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		 */
 		c->repaint.armed = wove;
 		if (wove) {
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 		comp_vk_split_render_diag(c->split);
@@ -5244,7 +5449,24 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 			// Only a REAL frame resets the quiet-gate. A repaint must not, or
 			// repaints would pace off their own timestamps and free-run.
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 
@@ -6682,7 +6904,24 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			// frame publishes (#902 Windows validation, cosmetic). The gate's
 			// own seed adds no interval sample (and a >1 s startup gap resets
 			// its stats anyway).
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 			int sret = os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
 			U_LOG_W("#868: repaint loop start ret=%d (target=%p)", sret, (void *)c->target);
