@@ -115,6 +115,7 @@ public class MonadoView extends SurfaceView
             hostActivity = activity;
             systemUiController = new SystemUiController(activity.getWindow().getDecorView());
             systemUiController.hide();
+            pinDisplayModeIfRequested(activity);
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
@@ -739,4 +740,83 @@ public class MonadoView extends SurfaceView
         //        currentSurfaceHolder = surfaceHolder;
         Log.i(TAG, "surfaceRedrawNeeded");
     }
+
+    /**
+     * Ask the platform to hold ONE display mode, so the weave's schedule is not
+     * re-based mid-session.
+     *
+     * <p>The panel here is variable-refresh and the platform re-rates it on
+     * interaction — policy tuned for scrolling, where more updates are strictly
+     * better. A 3D weave wants the opposite: the eye grades cadence stability,
+     * and a rate switch is a discontinuity in the schedule the weave is
+     * phase-locked to.
+     *
+     * <p>This is the Java-side mechanism, and it is the CORRECT one — it selects
+     * an actual display mode rather than declaring a content rate the way
+     * ANativeWindow_setFrameRate does. It is applied here rather than natively
+     * because only the Activity's window can carry it.
+     *
+     * <p><b>Measured caveat, so nobody re-derives it:</b> on the nubia NP02J this
+     * is ACCEPTED AND IGNORED. Verified independently twice, and the reason
+     * appears to be a vendor fps-control stack
+     * ({@code ro.vendor.feature.zte_feature_fps_control_*}, which inspects Vulkan
+     * command counts and draw calls) sitting above SurfaceFlinger's content
+     * detection and re-deciding the rate every frame. On that device the only
+     * lever that works is the Settings UI "Screen refresh rate" toggle, which is
+     * not reachable from an app. This code is here for hardware WITHOUT that
+     * stack, where it is expected to work.
+     *
+     * <p>{@code debug.dxr.pin_display_mode_hz} = Hz; unset or 0 leaves platform
+     * policy alone, which is the default.
+     */
+    private void pinDisplayModeIfRequested(Activity activity) {
+        float wantHz = 0.0f;
+        try {
+            // Same hidden-API route isTransparentSpikeEnabled() already uses.
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String prop =
+                    (String) sp.getMethod("get", String.class)
+                            .invoke(null, "debug.dxr.pin_display_mode_hz");
+            if (prop != null && !prop.isEmpty()) {
+                wantHz = Float.parseFloat(prop);
+            }
+        } catch (Exception e) {
+            // A typo, or no hidden API, reads as "not set" rather than 0 Hz.
+            return;
+        }
+        if (wantHz <= 0.0f) {
+            return;
+        }
+        try {
+            Display display = activity.getWindowManager().getDefaultDisplay();
+            Display.Mode current = display.getMode();
+            Display.Mode best = null;
+            for (Display.Mode m : display.getSupportedModes()) {
+                // Only ever switch the REFRESH RATE. Matching the current
+                // resolution keeps this from silently changing the panel
+                // geometry the weave is calibrated against, which would be a
+                // far worse bug than the jitter it is trying to fix.
+                if (m.getPhysicalWidth() != current.getPhysicalWidth()
+                        || m.getPhysicalHeight() != current.getPhysicalHeight()) {
+                    continue;
+                }
+                if (Math.abs(m.getRefreshRate() - wantHz) < 1.0f) {
+                    best = m;
+                    break;
+                }
+            }
+            if (best == null) {
+                Log.w(TAG, "MonadoView: no display mode near " + wantHz + " Hz at the current resolution; leaving platform policy alone");
+                return;
+            }
+            WindowManager.LayoutParams lp = activity.getWindow().getAttributes();
+            lp.preferredDisplayModeId = best.getModeId();
+            activity.getWindow().setAttributes(lp);
+            Log.w(TAG, "MonadoView: requested display mode " + best.getModeId() + " (" + best.getRefreshRate() + " Hz) — VERIFY it held; some vendor builds accept and ignore this");
+        } catch (Exception e) {
+            // Never let a display-policy nicety take down session creation.
+            Log.w(TAG, "MonadoView: display-mode pin failed: " + e);
+        }
+    }
+
 }
