@@ -175,7 +175,7 @@ jobs:
 
       - name: Upload tarball artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: displayxr-runtime-linux-tarball
           path: dist/displayxr-runtime-linux-*.tar.gz
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload .deb artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: displayxr-runtime-deb
           path: dist/displayxr-runtime_*_amd64.deb
