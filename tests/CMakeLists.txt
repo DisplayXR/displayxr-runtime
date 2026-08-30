@@ -26,6 +26,7 @@ set(tests
     tests_dp_weave_scope
     tests_space_overseer_rig
     tests_cli_dims_check
+    tests_comp_vblank_grid
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
@@ -84,6 +85,12 @@ target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
 # of printing it. A header of pure integer decisions (the probe that feeds it is
 # Windows-only, the rule is not), so there is nothing to link but the include.
 target_include_directories(tests_cli_dims_check PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/targets/cli)
+
+# Android late-weave / repaint pacing (#868/#902). The vblank grid is
+# header-only and deliberately free of Vulkan and DXGI types — that is what
+# lets its drift / staleness / mode-switch logic be tested on the host, where
+# those bugs are actually findable.
+target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
