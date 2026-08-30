@@ -337,6 +337,7 @@ are unavailable there (#1044); the plain-swapchain paths are the instrumented on
 ## See also
 
 - [`docs/roadmap/control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md) — the full census of **every** `DXR_*` lever (read site, mechanism, default, tier), and the design for surfacing a small subset in the Control Panel
+- [`weave-cadence-vs-eye-prediction.md`](weave-cadence-vs-eye-prediction.md) — how these levers relate to vendor-side late latching and the eye predictor, what exists on Android (short version: #206, the split and the slot partition do not), and the CNSDK prediction measurement plan
 - [`docs/adr/ADR-007`](../adr/ADR-007-compositor-never-weaves.md) — the compositor never weaves; the DP does
 - [`docs/architecture/compositor-pipeline.md`](../architecture/compositor-pipeline.md)
 - [`docs/reference/adapter-selection.md`](adapter-selection.md) — GPU placement on hybrid machines
