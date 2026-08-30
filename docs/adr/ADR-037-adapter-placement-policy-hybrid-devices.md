@@ -361,10 +361,46 @@ before it is attempted.
 
 ## Open questions (each needs a measurement, not an argument)
 
-1. **Where is the render-weight crossover** at which the split beats
+1. ~~**Where is the render-weight crossover** at which the split beats
    all-on-scanout, and is it low enough that "always split" is right for light
-   content too? The perf-ladder can produce this: adapter-placement arms
-   (scanout / render / split) across a light app and a heavy one.
+   content too?~~ **ANSWERED for the service/D3D family, 2026-08-30 (#1154):
+   there is no crossover in favour of all-on-scanout — the split wins or ties at
+   every render weight measured, so "always split" stands and §3's ladder needs
+   no light-content exception.**
+
+   Measured on the reference box with one fullscreen 3840x2160 client
+   (`cube_hosted_d3d11_win`, forced IPC), queue depth pinned across arms
+   (`DXR_APP_HWND_LATENCY=2`), render weight swept with `gpu_loadgen` on **each
+   arm's own render adapter**, 2 reps x 3 duties, presenter kind and split state
+   asserted per run. R is quoted as the fraction of frames landing on ONE
+   refresh period (`q1`), because R on this path is bimodal — it quantises to
+   whole refresh periods and a mean of it describes no real frame.
+
+   | render weight | render (no split) | **split** | all-on-scanout |
+   |---|---|---|---|
+   | idle | 54.5 w/s, q1 85% | **70.7 w/s, q1 100%** | 64.4 w/s, q1 99% |
+   | 40% duty | 64.0 w/s, q1 92% | 60.2 w/s, q1 90% | 62.7 w/s, q1 93% |
+   | 85% duty | **28.7 w/s, q1 2%** | **66.2 w/s, q1 94%** | 50.7 w/s, q1 63% |
+
+   Three things follow. **(a)** All-on-scanout never wins: split R p50 is
+   16.00/16.01/16.09 ms against scanout's 16.38/16.41/16.44 at the three
+   weights, and split leads on throughput everywhere except the 40% tie — so
+   **rung 3 does not earn a default**, at any weight, on this family. **(b)**
+   The split's margin is a *load* effect: at 85% duty the scanout adapter runs
+   out of headroom carrying the app's render as well as the weave (50.7 w/s,
+   q1 63%), while the split keeps the two on separate adapters and holds 66.2
+   w/s at q1 94%. **(c)** The no-split arm **collapses** under heavy render
+   weight — 28.7 w/s with 2% of frames at one refresh (p50 41.54 ms, and 62% of
+   frames at *three* refresh periods in the worse rep) — which is the strongest
+   measured argument for Phase 3's default-on.
+
+   Limits that travel with the numbers: n=2 reps over 0/40/85% duty, so the
+   claim is "no crossover found between idle and 85%", not "none exists"; the
+   40% row is a three-way tie within noise; and the standing
+   `UserGpuPreferences` caveat in *Consequences* applies, so directions hold
+   while magnitudes are partly a property of this machine. **Family B
+   (in-process Vulkan, rung 2 vs rung 3, framed in throughput) is still open**
+   — the instrument constraint below is why it must not be framed in R.
 
    **Instrument constraint that shapes the experiment — read before building
    arms.** Motion-to-photon (R) is *not* measurable on the all-on-scanout arm:
