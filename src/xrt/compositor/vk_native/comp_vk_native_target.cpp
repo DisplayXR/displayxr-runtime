@@ -43,6 +43,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 
 // Portable (all OSes) — the witness is exactly for paths/platforms the
 // Windows-only latency harness cannot measure.
+#include "util/comp_vblank_grid.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -366,6 +367,21 @@ struct comp_vk_native_target
 	//! decide whether to recreate, which every extent change requires.
 	int last_display_landscape;
 #endif
+
+	/*!
+	 * #868/#902 Android: the vblank grid fed from VK_GOOGLE_display_timing.
+	 *
+	 * Adreno exposes no VK_KHR_present_wait, so the blocking pacing primitive
+	 * below never resolves there and both late weave and the repaint loop fall
+	 * back to an open-loop guess against a hardcoded refresh rate — while the
+	 * platform switches the panel across [60, 90, 120, 144] underneath them.
+	 * This is the retrospective substitute: where presents actually landed,
+	 * plus a measured period, projected forward. Untrusted until both halves
+	 * exist and are fresh; see comp_vblank_grid.h.
+	 */
+	struct comp_vblank_grid vblank_grid;
+	//! Cached vkGetRefreshCycleDurationGOOGLE result; re-read on recreate.
+	bool refresh_cycle_probed;
 
 #ifdef XRT_OS_WINDOWS
 	//! Weave-latency harness state (nullptr unless DXR_WEAVE_LATENCY_CSV set).
@@ -1839,6 +1855,76 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 #endif
 }
 
+/*!
+ * #868/#902: pump the vblank grid from VK_GOOGLE_display_timing.
+ *
+ * Sits next to the present_wait probe above because it is the OTHER pacing
+ * source, chosen by what the driver offers. Two reads, called after present:
+ *
+ *  - vkGetRefreshCycleDurationGOOGLE, once per swapchain — the MEASURED panel
+ *    period. This is the half the open-loop path guessed at, and guessed wrong:
+ *    the repaint loop announces 60 Hz while the platform runs the panel at 120.
+ *  - vkGetPastPresentationTimingGOOGLE, every present — where presents ACTUALLY
+ *    landed, which anchors the grid's phase.
+ *
+ * Deliberately best-effort and non-blocking: display timing is an optimisation
+ * source, never a correctness dependency. Every failure path here leaves the
+ * grid untrusted, and an untrusted grid makes its consumers keep exactly
+ * today's behaviour rather than schedule against a fabricated clock.
+ */
+static void
+target_feed_vblank_grid(struct comp_vk_native_target *target)
+{
+	struct vk_bundle *vk = target->vk;
+	if (vk == NULL || !vk->has_GOOGLE_display_timing || target->swapchain == VK_NULL_HANDLE) {
+		return;
+	}
+
+	// The period, once per swapchain: it cannot change without a recreate, so
+	// there is no reason to re-ask every frame.
+	if (!target->refresh_cycle_probed && vk->vkGetRefreshCycleDurationGOOGLE != NULL) {
+		target->refresh_cycle_probed = true;
+		VkRefreshCycleDurationGOOGLE rc = {};
+		if (vk->vkGetRefreshCycleDurationGOOGLE(vk->device, target->swapchain, &rc) == VK_SUCCESS) {
+			if (comp_vblank_grid_set_period(&target->vblank_grid, rc.refreshDuration)) {
+				U_LOG_W("#902: display-timing grid — measured refresh %.3f ms (%.2f Hz)",
+				        rc.refreshDuration / 1e6, 1e9 / (double)rc.refreshDuration);
+			} else {
+				U_LOG_W("#902: display-timing reported an implausible refresh "
+				        "duration (%llu ns) — grid stays untrusted",
+				        (unsigned long long)rc.refreshDuration);
+			}
+		}
+	}
+
+	if (vk->vkGetPastPresentationTimingGOOGLE == NULL) {
+		return;
+	}
+
+	// Ask for the count first rather than guessing a fixed size, which would
+	// silently truncate on a driver that batches more than expected.
+	uint32_t count = 0;
+	if (vk->vkGetPastPresentationTimingGOOGLE(vk->device, target->swapchain, &count, NULL) !=
+	        VK_SUCCESS ||
+	    count == 0) {
+		return;
+	}
+	if (count > 16) {
+		count = 16;
+	}
+	VkPastPresentationTimingGOOGLE timings[16] = {};
+	if (vk->vkGetPastPresentationTimingGOOGLE(vk->device, target->swapchain, &count, timings) !=
+	    VK_SUCCESS) {
+		return;
+	}
+
+	// Records can arrive out of order; observe() only ever moves the anchor
+	// forward, so feeding them in whatever order the driver returns is safe.
+	for (uint32_t i = 0; i < count; i++) {
+		comp_vblank_grid_observe(&target->vblank_grid, timings[i].actualPresentTime);
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
 /*
  * Lazily create the harness on first present (env-gated). Returns nullptr
@@ -1864,6 +1950,8 @@ target_present_wait_fn(struct comp_vk_native_target *target)
 	}
 	return target->present_wait_fn;
 }
+
+
 
 static struct wl_harness *
 wl_get(struct comp_vk_native_target *target)
@@ -2529,6 +2617,13 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		target->last_present_id = 0;
 #endif
 
+		// #902: the grid's PHASE is meaningless across a new swapchain, but
+		// the panel's period usually is not — reset_phase keeps the period so
+		// the grid re-anchors on the first present instead of re-probing.
+		// refresh_cycle_probed clears too: a recreate can follow a mode change.
+		comp_vblank_grid_reset_phase(&target->vblank_grid);
+		target->refresh_cycle_probed = false;
+
 		{
 			// Same lifetime guard as comp_vk_native_target_resize. This
 			// path runs under the compositor lock, but the compositor
@@ -2673,6 +2768,13 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 #endif
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
+
+	// #868/#902: anchor the vblank grid on what actually reached the panel.
+	// After the present, so the driver has the record; best-effort, so a
+	// failure here never affects the present's own result.
+	if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
+		target_feed_vblank_grid(target);
+	}
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
@@ -2877,6 +2979,13 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	target->present_id_counter = 0;
 	target->last_present_id = 0;
 #endif
+
+	// #902: the grid's PHASE is meaningless across a new swapchain, but
+	// the panel's period usually is not — reset_phase keeps the period so
+	// the grid re-anchors on the first present instead of re-probing.
+	// refresh_cycle_probed clears too: a recreate can follow a mode change.
+	comp_vblank_grid_reset_phase(&target->vblank_grid);
+	target->refresh_cycle_probed = false;
 
 	// The crash this exists to stop: below, target->swapchain is set to
 	// VK_NULL_HANDLE before create_swapchain repopulates it, and the repaint

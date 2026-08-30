@@ -170,6 +170,7 @@ def get_device_cmds():
         Cmd("vkGetCalibratedTimestampsEXT", requires=("VK_EXT_calibrated_timestamps",)),
         None,
         Cmd("vkGetPastPresentationTimingGOOGLE"),
+        Cmd("vkGetRefreshCycleDurationGOOGLE"),
         None,
         Cmd("vkGetSwapchainCounterEXT", requires=("VK_EXT_display_control",)),
         Cmd("vkRegisterDeviceEventEXT", requires=("VK_EXT_display_control",)),

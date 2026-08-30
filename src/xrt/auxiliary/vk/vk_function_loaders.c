@@ -339,6 +339,7 @@ vk_get_device_functions(struct vk_bundle *vk)
 #endif // defined(VK_EXT_calibrated_timestamps)
 
 	vk->vkGetPastPresentationTimingGOOGLE           = GET_DEV_PROC(vk, vkGetPastPresentationTimingGOOGLE);
+	vk->vkGetRefreshCycleDurationGOOGLE             = GET_DEV_PROC(vk, vkGetRefreshCycleDurationGOOGLE);
 
 #if defined(VK_EXT_display_control)
 	vk->vkGetSwapchainCounterEXT                    = GET_DEV_PROC(vk, vkGetSwapchainCounterEXT);
