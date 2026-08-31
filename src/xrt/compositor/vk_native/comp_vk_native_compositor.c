@@ -150,6 +150,40 @@ DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
 // logs a one-line summary ~1/sec (WARN so it survives the hot-path filter).
 DEBUG_GET_ONCE_BOOL_OPTION(frame_stage_timing, "DXR_FRAME_STAGE_TIMING", false)
 
+/*!
+ * #837 timing knob, reachable on Android.
+ *
+ * DEBUG_GET_ONCE_BOOL_OPTION resolves through u_setting, which on Android looks
+ * up the system property `debug.xrt.<NAME>`. PROP_NAME_MAX is 32 INCLUDING the
+ * NUL, so a name has 31 usable characters and that prefix eats 10 — leaving 21.
+ * "DXR_FRAME_STAGE_TIMING" is 22, so `debug.xrt.DXR_FRAME_STAGE_TIMING` is 32
+ * and cannot be found. Nothing logs and nothing errors; the knob just reads as
+ * unset, which is exactly how it behaved when it was needed on device.
+ *
+ * The short alias below (28 chars) fits. Env still wins, per the resolution
+ * order in u_setting.h. 33 of the runtime's 80 option knobs have this problem;
+ * the census in docs/roadmap/control-panel-performance-settings.md lists them.
+ */
+static bool
+dxr_frame_stage_timing_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = debug_get_bool_option_frame_stage_timing() ? 1 : 0;
+#ifdef XRT_OS_ANDROID
+		if (on == 0) {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.frame_stage_timing", sp) > 0 &&
+			    (sp[0] == '1' || sp[0] == 't' || sp[0] == 'T' || sp[0] == 'y' ||
+			     sp[0] == 'Y')) {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 enum vk_frame_stage
 {
 	VK_FSTAGE_PRE = 0,      // commit entry → pre-DP cmd recorded (renderer, accum, crops)
@@ -4799,7 +4833,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	// #837 frame-stage timing (env-gated) — see vk_frame_timing above. fp[]
 	// marks are taken at the windowed-DP path's stage boundaries.
-	const bool ftime = debug_get_bool_option_frame_stage_timing();
+	const bool ftime = dxr_frame_stage_timing_enabled();
 	uint64_t fp[7] = {0};
 	if (ftime) {
 		fp[0] = os_monotonic_get_ns();
