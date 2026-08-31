@@ -569,6 +569,15 @@ struct comp_vk_native_compositor
 		//! #902: one-shot guard for the clamp log, so a panel that boosts
 		//! repeatedly does not produce a line per boost.
 		bool grid_clamp_logged;
+
+		//! Last target image-set generation this loop observed, and when it
+		//! last moved. Keys the recreate-quiescence guard at the fire site.
+		uint32_t last_gen;
+		uint64_t last_gen_change_ns;
+		//! One-shot guard for the quiescence log — launch extent churn
+		//! produces a burst of recreates and one line per skipped tick
+		//! would bury the trace.
+		bool gen_quiesce_logged;
 		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
@@ -4610,6 +4619,47 @@ vk_repaint_thread(void *ptr)
 		// either side and drop the replay if it moved — every handle the
 		// replay would use belongs to the generation sampled here.
 		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
+
+		/*
+		 * RECREATE QUIESCENCE. Do not weave across a target-generation
+		 * flip: hold the repaint off until the generation has been stable
+		 * for 100 ms.
+		 *
+		 * The gen_before/gen_after pair above and below only catches a
+		 * recreate that lands INSIDE this iteration. It does not stop a
+		 * repaint from weaving immediately AFTER one, and that is where
+		 * the vendor weaver loses a fence: measured under
+		 * DXR_WEAVE_REPAINT_FORCE=1, the session wedged in 3.4 s with the
+		 * repaint thread parked in CNSDK -> Adreno vkWaitForFences while
+		 * the GPU sat at busy=0, after three swapchain recreations in
+		 * three seconds (launch extent churn 1600 -> 1540 -> 1600). It is
+		 * the same signature as the earlier rotation freeze — a fence
+		 * that never signals because it belongs to a generation that is
+		 * gone.
+		 *
+		 * Only the REPAINT path is held. App frames never consult this;
+		 * their weave runs through the hand-off above and is untouched,
+		 * so a recreate costs at most a few skipped fills, never a frame.
+		 */
+		{
+			const uint64_t gen_now_ns = os_monotonic_get_ns();
+			if (gen_before != c->repaint.last_gen) {
+				c->repaint.last_gen = gen_before;
+				c->repaint.last_gen_change_ns = gen_now_ns;
+			}
+			if (c->repaint.last_gen_change_ns != 0 &&
+			    gen_now_ns - c->repaint.last_gen_change_ns < 100ULL * 1000 * 1000) {
+				if (!c->repaint.gen_quiesce_logged) {
+					c->repaint.gen_quiesce_logged = true;
+					U_LOG_W("#868: holding repaints for 100 ms after a target "
+					        "recreate (generation %u) — weaving across a "
+					        "generation flip loses a fence inside the vendor "
+					        "weaver and wedges the session",
+					        gen_before);
+				}
+				continue;
+			}
+		}
 
 		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
 		// it can block for periods, which throttles a grid fill to a
