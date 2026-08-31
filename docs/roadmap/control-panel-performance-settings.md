@@ -43,9 +43,10 @@ sets an env var" is wrong on Windows unless it also says who launches the app.
 
 Three facts that constrain any redesign:
 
-- **`get_option_raw` already has an out-of-process channel on Android**: it reads the
+- **`get_option_raw` has an out-of-process channel on Android**: it reads the
   system property `debug.xrt.<NAME>` rather than the environment (`u_debug.c:66-78`).
-  Android is the platform where this problem is already solved.
+  **But it is NOT "already solved" — see the name-length trap below; 33 of the 80
+  option knobs are silently unreachable through it.**
 - **The parsers are deliberately not unified.** `comp_split_gate.c:20-44` carries an
   explicit note — the leading-character test is *"deliberately NOT
   `debug_string_to_bool`"*. A design that re-parses centrally silently changes
@@ -376,8 +377,38 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 
 ### Android
 
-All five also accept `debug.xrt.<NAME>` as a system property, for free, via
-`get_option_raw`'s Android branch.
+All five also accept `debug.xrt.<NAME>` as a system property via
+`get_option_raw`'s Android branch — but **not for free, and not for every knob.**
+
+#### TRAP: the `debug.xrt.` prefix strands long names, silently
+
+Android's `PROP_NAME_MAX` is 32 *including* the NUL, so a property name has 31
+usable characters. The `debug.xrt.` prefix consumes 10 of them, leaving 21 for the
+knob — and **33 of the runtime's 80 option knobs are longer than that**, so they
+cannot be reached through this channel at all. `__system_property_get` simply does
+not find them; nothing logs, nothing errors, and the knob reads as unset.
+
+Observed: setting `debug.xrt.DXR_FRAME_STAGE_TIMING` (32 chars prefixed) produced no
+`[FRAME_STAGES]` rows whatsoever. The name-length arithmetic is the likely mechanism
+and matches every symptom, but a direct `getprop` round-trip on the long name has not
+been run — confirm that before quoting this as settled.
+
+Stranded knobs include several that matter most for on-device tuning:
+`DXR_FRAME_STAGE_TIMING`, `DXR_VBLANK_GRID_PACING`, `DXR_WEAVE_REPAINT_TRACE` /
+`_FORCE` / `_GATE`, `DXR_SPLIT_SAME_ADAPTER`, `DXR_DP_FORWARD_HORIZON`,
+`DXR_LATE_WEAVE_MAX_LATENCY`, `DXR_APP_FRAME_DIVISOR_ANY_TIER`.
+
+**The workaround already in use, and the pattern to copy:** give the knob an explicit
+SHORT sysprop alias under `debug.dxr.*` at its own read site, with the environment
+variable still winning when set. `debug.dxr.weave_repaint_trace` (29) fits where
+`debug.xrt.DXR_WEAVE_REPAINT_TRACE` (33) cannot. Every knob wired that way this
+cycle — `weave_repaint_{trace,force,gate}`, `vblank_grid_pacing`, `repaint_phase`,
+`app_frame_divisor`, `pin_frame_rate`, `late_weave` — works on device; the ones left
+on the generic path do not.
+
+A general fix would be a shorter prefix (`dxr.` leaves 27) or a hash/alias table, but
+either changes the documented contract, so it wants its own decision rather than a
+drive-by.
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
 |---|---|---|---|---|---|---|
