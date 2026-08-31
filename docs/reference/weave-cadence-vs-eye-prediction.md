@@ -355,6 +355,48 @@ head-tracking service's cpuset confinement: a platform scheduling decision, not
 runtime code. ADPF is unsupported on this device (#663), which is why nothing in the
 runtime is currently able to ask for the clock it needs.
 
+#### Where the fire's cost actually goes — and a `vkDeviceWaitIdle` worth questioning
+
+Decomposed at the default governor (`debug.dxr.frame_stage_timing 1`):
+
+```
+pre 3.03   preflush 1.36   weave 0.39   postwait 3.29   composite 0.84   present 0.52
+```
+
+`postwait` is 35% of the fire, and it is a single call:
+
+```c
+if (dp_self_submits) {
+        vk->vkDeviceWaitIdle(vk->device);      // measured 3.29 ms
+        ... free + reallocate the post-DP command buffer ...
+}
+```
+
+A full device idle — the heaviest sync primitive Vulkan has — once per weave. Its own
+comment says:
+
+> *"On Android the HUD is `c->hud==NULL` and this overlay is a no-op, so the wait costs
+> nothing in practice — but keep it for safety when HUD eventually wires up."*
+
+**That assumption is measurably false.** `u_hud_create` is inside
+`#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)`,
+so `c->hud` is indeed always NULL on Android — but the `vkDeviceWaitIdle` sits
+unconditionally inside `if (dp_self_submits)` and does not test for a HUD. Android pays
+3.29 ms per fire for it.
+
+**Do NOT simply guard it on `c->hud != NULL`.** The comment attributes the wait to the
+HUD, but the reallocated command buffer is also what `vk_composite_local_2d` records
+into, and that writes `target_image` as well. The drain is therefore protecting more
+than the comment claims, and removing it for the no-HUD case risks a `target_image`
+race against the vendor's still-in-flight weave submit — an intermittent corruption
+bug, the worst kind to trade a latency win for.
+
+The prize is real: removing or narrowing it takes the fire from ~9.4 ms to ~6.1 ms,
+which is what would let two weaves fit inside one 16.7 ms panel period — the standing
+precondition for panel-rate fill. But the correct fix is a narrower sync (a fence on
+the DP's own submit, or a queue wait) rather than a conditional skip, and it needs
+device verification with zones/Local2D active rather than reasoning alone.
+
 #### Still open
 
 - **A sustainable-rate budget**, so the boost can be followed rather than refused.
