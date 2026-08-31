@@ -58,6 +58,16 @@
  * check (panel cadence oscillating 28-50 updates/s reads as judder
  * where a steady 33 does not; the eye grades cadence stability, not
  * average rate). Default behavior is the legacy schedule.
+ *
+ * DXR_WEAVE_REPAINT_GATE=fill is the ANDROID DEFAULT (#1257 NP02J
+ * measurement, see the engagement site below): the legacy gate opening
+ * at two periods, plus a fire that itself blocks 9-18 ms in the FIFO
+ * acquire, deterministically yields exactly ONE repaint per app frame at
+ * phase ~0.70 — the panel then alternates ~41/18 ms (interval CoV ~40%)
+ * on a panel provably pinned at 59.86 Hz. Fill schedules against the
+ * MEASURED interval EMA instead of a vblank count, and is scoped to the
+ * apps for which that EMA is trustworthy. Windows/macOS/Linux keep the
+ * legacy default; fill is opt-in there via the env var.
  * DXR_WEAVE_REPAINT_FORCE=1 bypasses this gate entirely (unchanged —
  * the backends check it before consulting the gate).
  * DXR_WEAVE_REPAINT_TRACE=1 emits the loop instrumentation below.
@@ -101,14 +111,14 @@ struct u_repaint_gate
 {
 	uint64_t last_app_frame_ns; //!< Stamp of the last REAL app frame.
 	uint64_t last_repaint_ns;   //!< Stamp of the last repaint (adaptive spacing only).
-	uint64_t interval_ema_ns;   //!< EMA of the app inter-frame interval (TRACE readout only).
-	uint64_t jitter_ema_ns;     //!< EMA of |interval - interval_ema| (TRACE readout only).
+	uint64_t interval_ema_ns;   //!< EMA of the app inter-frame interval (fill mode + TRACE).
+	uint64_t jitter_ema_ns;     //!< EMA of |interval - interval_ema| (fill-mode trust key + TRACE).
 	uint64_t recent_iv_ns[16];  //!< Ring of raw intervals; the gate buckets these per tick.
 	uint32_t samples;           //!< Interval samples since the last reset (capped).
 	uint8_t iv_head;            //!< Ring write position.
 	uint8_t fires_since_app;    //!< Repaints since the last app frame (budget = N-1).
-	int mode;                   //!< 0 = unprobed, 1 = adaptive, 2 = legacy (env-pinned).
-	bool adaptive_logged;       //!< One-shot "adaptive engaged" log.
+	int mode;                   //!< 0 = unprobed, 1 = adaptive, 2 = legacy (env-pinned), 3 = default, 4 = fill.
+	bool adaptive_logged;       //!< One-shot "adaptive/fill engaged" log.
 };
 
 //! Intervals above this are an app pause / startup gap, not cadence — restart measurement.
@@ -140,8 +150,11 @@ u_repaint_gate_on_app_frame(struct u_repaint_gate *g, uint64_t now_ns)
 			if (g->samples < 255) {
 				g->samples++;
 			}
-			// EMA/jitter are kept ONLY for the trace row; nothing gates
-			// on them (see the vblank-count model in _open).
+			// EMA/jitter feed the FILL schedule (mode 4) and the trace
+			// row. The vblank-count model in _open (legacy/adaptive/
+			// partition) still gates on counts, not on these — the ms
+			// domain is only trustworthy for a GPU-bound metronomic app,
+			// which is exactly the scope fill checks jitter_ema for.
 			if (g->interval_ema_ns == 0) {
 				g->interval_ema_ns = iv;
 			} else {
@@ -262,6 +275,79 @@ u_repaint_gate_cadence_n(const struct u_repaint_gate *g,
 }
 
 /*!
+ * Is the FILL schedule (mode 4) trustworthy right now?
+ *
+ * Fill schedules in the MILLISECOND domain off interval_ema_ns, and that
+ * domain is only honest for a GPU-bound metronomic app — one whose frame
+ * time is set by its own render cost, so its intervals are a smooth
+ * distribution around a mean. A PRESENT-CAPPED app is vsync-QUANTIZED
+ * instead: its intervals are multiples of the panel period (hz20
+ * measured as a 33/50/67 mix), which reads as a jitter EMA of 12-23 ms
+ * on an app that is in fact perfectly regular. Feeding that into a
+ * ms-domain schedule is the failure the vblank-count model exists to
+ * avoid (#1257 round 2), so the jitter <= period/4 test is the scope
+ * fence: above it, fill declines and the caller keeps the vblank-count /
+ * legacy path unchanged.
+ */
+static inline bool
+u_repaint_gate_fill_ok(const struct u_repaint_gate *g, uint64_t period_ns)
+{
+	return g->mode == 4 &&                                    //
+	       g->samples >= U_REPAINT_GATE_MIN_SAMPLES &&        //
+	       period_ns != 0 &&                                  //
+	       g->interval_ema_ns >= period_ns &&                 //
+	       g->interval_ema_ns <= U_REPAINT_GATE_MAX_INTERVAL_NS && //
+	       g->jitter_ema_ns <= period_ns / 4;
+}
+
+/*!
+ * Fill mode's governed budget: how many repaints one app interval has
+ * room for. Single source for the gate and the trace row — printing a
+ * separately-derived budget is what twice sent the #1257 verification
+ * chasing a shed that only existed in the log.
+ *
+ * Each fire's present lands on the next free vblank, so fires+1 presents
+ * (the app's own frame plus its fills) must all fit strictly inside the
+ * app interval with half a period of guard, or the last repaint steals
+ * the slot the app's next frame needs. Hence
+ * budget = floor((interval_ema - period/2) / period) - shed:
+ * a 35 ms interval (the known-good 59.9 fps config) yields 1, a 58 ms
+ * one yields 2.
+ *
+ * The governor is the #1257 round-4 one, re-floored for the ms domain:
+ * an interval half a period past the EMA is a slip, and one repaint is
+ * shed per three slips in the last 16 app frames.
+ */
+static inline uint32_t
+u_repaint_gate_fill_budget(const struct u_repaint_gate *g,
+                           uint64_t period_ns,
+                           uint32_t *out_slips,
+                           uint32_t *out_shed)
+{
+	uint32_t slips = 0;
+	const uint64_t slip_floor_ns = g->interval_ema_ns + period_ns / 2;
+	const uint32_t have = g->samples < 16 ? g->samples : 16;
+	for (uint32_t i = 0; i < have; i++) {
+		if (g->recent_iv_ns[i] >= slip_floor_ns) {
+			slips++;
+		}
+	}
+	const uint32_t shed = slips / 3;
+	uint32_t budget = 0;
+	// Unsigned domain: interval_ema >= period > period/2 is already
+	// established by _fill_ok, but this is a header compiled by MSVC and
+	// mingw too — never let the subtraction wrap on a caller that skipped
+	// the trust check (the trace row can).
+	if (period_ns != 0 && g->interval_ema_ns > period_ns / 2) {
+		const uint64_t fits = (g->interval_ema_ns - period_ns / 2) / period_ns;
+		budget = fits > (uint64_t)shed ? (uint32_t)(fits - (uint64_t)shed) : 0;
+	}
+	*out_slips = slips;
+	*out_shed = shed;
+	return budget;
+}
+
+/*!
  * May a repaint fire at @p now_ns? Replaces the loop's
  * `quiet < period * 2` primary gate (the re-check under the lock stays
  * with the caller). Never consulted under DXR_WEAVE_REPAINT_FORCE=1 —
@@ -294,22 +380,39 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 #ifdef XRT_OS_ANDROID
 		// getenv reaches nothing on Android; the schedule selector would
 		// be permanently unreachable there without this. Env still wins,
-		// and the prop carries the same "adaptive"/"legacy" strings.
+		// and the prop carries the same "adaptive"/"legacy"/"fill" strings.
 		char sp_gate[PROP_VALUE_MAX] = {0};
 		if ((e == NULL || e[0] == '\0') &&
 		    __system_property_get("debug.dxr.weave_repaint_gate", sp_gate) > 0) {
 			e = sp_gate;
 		}
 #endif
-		if (e != NULL && strcmp(e, "adaptive") == 0) {
+		if (e != NULL && strcmp(e, "legacy") == 0) {
+			// Checked FIRST: explicit legacy outranks everything,
+			// including the partition fill and the Android default.
+			g->mode = 2;
+		} else if (e != NULL && strcmp(e, "adaptive") == 0) {
 			g->mode = 1;
 			U_LOG_W("#1257: DXR_WEAVE_REPAINT_GATE=adaptive — EXPERIMENTAL N=2 window; "
 			        "its intermittent engagement failed the hz30 visual check "
 			        "(oscillating panel cadence reads as judder), default is legacy");
-		} else if (e != NULL && strcmp(e, "legacy") == 0) {
-			g->mode = 2; // explicit legacy: outranks even the partition fill
+		} else if (e != NULL && strcmp(e, "fill") == 0) {
+			g->mode = 4;
 		} else {
+#ifdef XRT_OS_ANDROID
+			g->mode = 4; // Android default: fill (see the log below)
+#else
 			g->mode = 3; // default: legacy schedule unless the partition engages
+#endif
+		}
+		if (g->mode == 4) {
+			U_LOG_W("#1257: repaint gate FILL — the legacy 2-period gate plus a fire that "
+			        "itself blocks ~9-18 ms in the FIFO acquire yields exactly ONE repaint "
+			        "per app frame at phase ~0.70, so the panel alternates ~41/18 ms "
+			        "(interval CoV ~40%%) against a panel pinned at 59.86 Hz. Fill budgets "
+			        "off the measured app interval so every vblank slot gets filled "
+			        "(DXR_WEAVE_REPAINT_GATE=legacy / debug.dxr.weave_repaint_gate legacy "
+			        "reverts)");
 		}
 	}
 
@@ -361,6 +464,87 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	// single point of tier control, in the throttle.
 	const bool part_on =
 	    part >= 2 && g->mode != 2 && ps != NULL && ps->next_release_ns != 0;
+
+	/*
+	 * FILL (mode 4) — the measured Android default. The partition still
+	 * outranks it: a KNOWN schedule beats an estimated one, so when
+	 * part_on the engaged path below runs unchanged.
+	 *
+	 * Why a second schedule at all. On the NP02J the loss is not variance
+	 * and not instability — it is placement, and it is DETERMINISTIC:
+	 *
+	 *   - The legacy gate opens at quiet >= 2 * period, i.e. ~33.4 ms into
+	 *     a ~58 ms app interval.
+	 *   - The one fire it then permits blocks 9-18 ms inside the FIFO
+	 *     acquire (trace fire_ema), completing right as the next app frame
+	 *     lands — so no open tick ever survives to fire again.
+	 *
+	 * The result is exactly 1:1 repaints:app-frames at phase 0.70, the
+	 * on-screen stream alternating ~41/18 ms (panel interval CoV ~40%)
+	 * while the panel is provably pinned at 59.86 Hz and the app is
+	 * metronomic (interval EMA 50-59 ms, jitter EMA 1-2 ms). The trace
+	 * carries all the losses on bail_gate (~600-710 per 5 s), with
+	 * bail_armed = 0 after startup, bail_race = 0 and pace = 0: nothing is
+	 * racing or blocking, the gate is simply shut.
+	 *
+	 * So fill budgets off the MEASURED interval rather than a vblank
+	 * count, and fires as many repaints as the interval has room for: at a
+	 * 58 ms interval two fills put presents at ~16.7 / 33.4 / 50.1 / 66.8
+	 * ms and the panel runs ~60 from an app running ~17.
+	 *
+	 * Scope fence (u_repaint_gate_fill_ok): a vsync-quantized app has a
+	 * jitter EMA far above period/4 and keeps the vblank-count/legacy path
+	 * untouched. Anything that fails the trust test falls through to the
+	 * EXACT prior behavior below.
+	 */
+	if (!part_on && u_repaint_gate_fill_ok(g, period_ns)) {
+		// STALL: the app is hitching, not pacing — the original #868 case.
+		// Same treatment as the engaged stall branch: panel-rate fill.
+		if (quiet_ns >= g->interval_ema_ns + period_ns) {
+			return since_rp_ns >= (period_ns * 9) / 10;
+		}
+
+		uint32_t fill_slips = 0, fill_shed = 0;
+		const uint32_t fill_budget =
+		    u_repaint_gate_fill_budget(g, period_ns, &fill_slips, &fill_shed);
+
+		/*
+		 * BUDGET. Each fire's present lands on the next free vblank, so
+		 * this fire plus every fire already spent plus the app's own
+		 * frame must all fit strictly inside the app interval with half
+		 * a period of guard — otherwise the last repaint steals the slot
+		 * the app's next frame needs (the queue theft the #1257 rounds
+		 * measured as weaves/s < presents/s). interval_ema >= period is
+		 * established by _fill_ok, and period/2 < period, so the
+		 * subtraction cannot wrap; the explicit test keeps that true for
+		 * any future caller.
+		 */
+		const uint64_t want_ns =
+		    ((uint64_t)g->fires_since_app + 1u + (uint64_t)fill_shed) * period_ns;
+		if (g->interval_ema_ns <= period_ns / 2 ||
+		    want_ns > g->interval_ema_ns - period_ns / 2) {
+			return false;
+		}
+		// OPEN: not so early the replayed eye pose is staler than useful.
+		if (quiet_ns < period_ns / 2) {
+			return false;
+		}
+		// SPACING: coarse on purpose — the FIFO acquire does the fine
+		// pacing (it is what blocks 9-18 ms per fire), so a tight spacing
+		// here would only re-close the window it is trying to open.
+		if (since_rp_ns < (period_ns * 3) / 4) {
+			return false;
+		}
+		if (!g->adaptive_logged) {
+			g->adaptive_logged = true;
+			U_LOG_W("#1257 fill: app interval EMA %.2f ms (jitter %.2f ms) at a %.2f ms "
+			        "panel period — budget %u repaint(s) per app frame filling the "
+			        "remaining vblank slots (DXR_WEAVE_REPAINT_GATE=legacy reverts)",
+			        (double)g->interval_ema_ns / 1e6, (double)g->jitter_ema_ns / 1e6,
+			        (double)period_ns / 1e6, fill_budget);
+		}
+		return true;
+	}
 
 	/*
 	 * COMMIT-RELATIVE fill under the partition — deliberately, and the
@@ -658,6 +842,14 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	if (part_on) {
 		n = part;
 		budget = part - 1;
+	} else if (u_repaint_gate_fill_ok(g, period_ns)) {
+		// Mirror the ENGAGED fill path, same reason as the partition arm
+		// above: fill's budget comes from the interval EMA, not from the
+		// vblank-count estimator, and its slips use the EMA-relative
+		// floor. N stays the estimator's reading — a diagnostic here, not
+		// an input to this schedule.
+		uint32_t fill_shed = 0;
+		budget = u_repaint_gate_fill_budget(g, period_ns, &slips, &fill_shed);
 	} else if (n >= 2) {
 		const uint32_t shed = slips / 3;
 		budget = (n - 1) > shed ? (n - 1) - shed : 0;
@@ -671,11 +863,15 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	        // Distinct states so a reader isn't puzzled by rows whose label
 	        // and numbers disagree: partition (known schedule), env-pinned
 	        // legacy, engaged adaptive (N==2), the deliberate N!=2 adaptive
-	        // fallback, or the plain default.
+	        // fallback, engaged fill, the untrusted-EMA fill fallback, or
+	        // the plain default.
 	        part_on ? "partition"
-	                : (g->mode == 2 ? "legacy"
-	                                : (g->mode == 1 ? (n == 2 ? "adaptive" : "adaptive-fallback")
-	                                                : "default")),
+	                : (g->mode == 2
+	                       ? "legacy"
+	                       : (g->mode == 4
+	                              ? (u_repaint_gate_fill_ok(g, period_ns) ? "fill" : "fill-fallback")
+	                              : (g->mode == 1 ? (n == 2 ? "adaptive" : "adaptive-fallback")
+	                                              : "default"))),
 	        n, votes, have, slips, budget, (double)g->interval_ema_ns / 1e6,
 	        (double)g->jitter_ema_ns / 1e6, g->samples);
 	t->ticks = 0;
