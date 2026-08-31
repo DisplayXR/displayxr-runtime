@@ -7157,6 +7157,20 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 			}
 			xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)c->display_processor, x, y, w, h, display_id);
+			/*
+			 * The panel size in the CURRENT orientation, from the same
+			 * site and the same display_id so the two always agree. A
+			 * windowed weave needs it to know which panel dimension is
+			 * "height" right now; a vendor SDK may only report
+			 * orientation-blind native metrics, and deriving it from the
+			 * window's aspect is wrong whenever the window's shape
+			 * disagrees with the panel's.
+			 */
+			if (disp_w != 0 && disp_h != 0) {
+				xrt_display_processor_vk_set_panel_size(
+				    (struct xrt_display_processor_vk *)c->display_processor, disp_w, disp_h,
+				    display_id);
+			}
 		}
 	}
 	return;
