@@ -316,6 +316,45 @@ refresh rate" toggle, which neither layer can reach programmatically.
 Note this is a *device* finding, not an Android one. `preferredDisplayModeId` remains the correct
 mechanism and would be expected to work on hardware without this vendor stack.
 
+#### THE ROOT CAUSE: the GPU governor, not the repaint schedule
+
+Measured with `[FRAME_STAGES]` + the per-kind census, same app, same panel (pinned
+59.86 Hz), only the GPU governor changed:
+
+| | GPU @ 295 MHz (default) | GPU @ 680 MHz (pinned) |
+|---|---|---|
+| app frame interval | 51.53 ms (19.4 fps) | **28.45 ms (35.2 fps)** |
+| repaints fired | 97 per report | **0** |
+| on-screen interval CoV | **61%** | **16%** |
+| weaves that are stale replays | half of them | none — `app n` == `all n` |
+
+At the higher clock the app is fast enough that the legacy gate's two-period quiet
+window never elapses, so **no repaint ever fires**, and the on-screen stream is simply
+the app's own cadence. The 41/18 alternation does not need to be scheduled better; at
+adequate clock it does not exist.
+
+That reframes every negative result on this branch. Grid pacing, the slot partition,
+the phase hold and fill mode were all attempts to place a repaint that only exists
+because the app is slow — and the app is slow because the GPU sits at 295 MHz of a
+possible 680. The scheduling work was optimising a symptom.
+
+Per-stage decomposition at default clock also kills the "the weave is expensive" idea:
+
+```
+pre 3.03   preflush 1.36   weave 0.39   postwait 3.29   composite 0.84   present 0.52
+```
+
+`weave` — the vendor's `process_atlas`, SDK-internal submit and wait included — is
+**0.39 ms, about 4% of the fire**, matching the plug-in's own 0.42-0.48 ms measurement
+of `do_post_process`. An earlier figure of 7.69 ms for this stage came from a wedged
+FORCE run and was degenerate; it is withdrawn. The runtime's own `pre` + `postwait`
+are two thirds of the cost.
+
+**So the lever is the governor**, and it is the same class of finding as the
+head-tracking service's cpuset confinement: a platform scheduling decision, not
+runtime code. ADPF is unsupported on this device (#663), which is why nothing in the
+runtime is currently able to ask for the clock it needs.
+
 #### Still open
 
 - **A sustainable-rate budget**, so the boost can be followed rather than refused.
