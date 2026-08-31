@@ -191,7 +191,7 @@ done
 
 ```bash
 gh release view "$TAG" -R DisplayXR/displayxr-installer \
-  --json tagName,name,assets,prerelease
+  --json tagName,name,assets,isPrerelease
 ```
 
 Confirm:
@@ -199,7 +199,8 @@ Confirm:
 - Assets contain `DisplayXRBundle-*.pkg` (macOS, non-zero size)
 - Assets contain `DisplayXRBundle-*.exe` (Windows, non-zero size)
 - Assets contain `DisplayXRBundle-*-linux-amd64.tar.gz` (non-zero size)
-- Prerelease flag matches input
+- Prerelease flag matches input (the gh field is `isPrerelease`, NOT `prerelease` —
+  the latter is rejected as an invalid field and the whole query fails)
 
 ---
 
@@ -308,9 +309,13 @@ a signature and errors out if not, so a mis-fire can't push an unsigned bundle.
 
 ```bash
 if [ "$SIGNED" = yes ]; then
+  # Stamp SINCE *BEFORE* the dispatch. Stamping it after means every candidate
+  # run has createdAt < SINCE, the filter matches nothing, and the loop burns its
+  # 20 tries and reports the mirror as failed even when it succeeded (hit for real
+  # on bundle v2.3.2). The same ordering applies to the Phase 4.5 loop above.
+  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag="$TAG"
   # Locate + watch the dispatched run so the report reflects the real outcome.
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   OD_RUN=""
   for _ in $(seq 1 20); do
     OD_RUN=$(gh run list -R DisplayXR/displayxr-installer --workflow upload-bundle-onedrive.yml \
