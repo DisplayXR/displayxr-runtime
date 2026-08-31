@@ -6882,6 +6882,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			}
 		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+#ifdef XRT_OS_ANDROID
+		// getenv reaches nothing on Android; the correctness probe would
+		// be permanently unreachable there without this. Env still wins.
+		char sp_force[PROP_VALUE_MAX] = {0};
+		if ((fe == NULL || fe[0] == '\0') &&
+		    __system_property_get("debug.dxr.weave_repaint_force", sp_force) > 0) {
+			fe = sp_force;
+		}
+#endif
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "

@@ -62,6 +62,11 @@
  * the backends check it before consulting the gate).
  * DXR_WEAVE_REPAINT_TRACE=1 emits the loop instrumentation below.
  *
+ * On Android getenv() reaches nothing, so all three also read a
+ * sysprop fallback carrying the same values — debug.dxr.weave_repaint_gate,
+ * debug.dxr.weave_repaint_trace, debug.dxr.weave_repaint_force. The
+ * environment variable always wins when it is set and non-empty.
+ *
  * Threading: on_app_frame is called only from the frame path,
  * note_repaint only from the repaint thread, open reads both — the
  * same benign unlocked 64-bit reads the loops already did on
@@ -79,6 +84,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -282,6 +291,16 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 		 * proves a steady win or the slot-partition mode replaces it.
 		 */
 		const char *e = getenv("DXR_WEAVE_REPAINT_GATE");
+#ifdef XRT_OS_ANDROID
+		// getenv reaches nothing on Android; the schedule selector would
+		// be permanently unreachable there without this. Env still wins,
+		// and the prop carries the same "adaptive"/"legacy" strings.
+		char sp_gate[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') &&
+		    __system_property_get("debug.dxr.weave_repaint_gate", sp_gate) > 0) {
+			e = sp_gate;
+		}
+#endif
 		if (e != NULL && strcmp(e, "adaptive") == 0) {
 			g->mode = 1;
 			U_LOG_W("#1257: DXR_WEAVE_REPAINT_GATE=adaptive — EXPERIMENTAL N=2 window; "
@@ -513,6 +532,15 @@ u_repaint_trace_enabled(struct u_repaint_trace *t)
 {
 	if (t->enabled == 0) {
 		const char *e = getenv("DXR_WEAVE_REPAINT_TRACE");
+#ifdef XRT_OS_ANDROID
+		// getenv reaches nothing on Android; the trace would be
+		// permanently unreachable there without this. Env still wins.
+		char sp_tr[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') &&
+		    __system_property_get("debug.dxr.weave_repaint_trace", sp_tr) > 0) {
+			e = sp_tr;
+		}
+#endif
 		t->enabled = (e != NULL && e[0] == '1') ? 1 : 2;
 	}
 	return t->enabled == 1;
