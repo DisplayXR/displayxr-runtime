@@ -3522,6 +3522,57 @@ vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
  * The crop IS re-done: it reads the compositor-owned atlas and writes
  * compositor-owned scratch, and skipping it hands the DP a stale image.
  */
+/*!
+ * #837 prototype: narrow the post-weave drain from the DEVICE to the DP's QUEUE.
+ *
+ * `postwait` measures 3.29 ms of a ~9.4 ms fire — 35% — and it is one
+ * `vkDeviceWaitIdle`. Its comment says the wait "costs nothing in practice" on
+ * Android because `c->hud == NULL` there; the first half is true (u_hud_create
+ * is compiled out on Android) but the wait does not test for a HUD, so the cost
+ * is real and was never measured.
+ *
+ * What it must actually guarantee: the vendor's weave submit has finished
+ * writing `target_image` before we record and submit post-DP work that writes
+ * the same image (the HUD on desktop, and `vk_composite_local_2d` everywhere —
+ * which is why simply skipping the wait when there is no HUD would be wrong).
+ *
+ * The DP submits on ONE known queue. `vk_make_dp_vk` creates it with
+ * `vk.main_queue->queue` temporarily swapped to `c->repaint_queue`, so that is
+ * the queue the vendor's weave goes to. Waiting on that queue therefore gives
+ * the identical ordering guarantee, while a device-wide wait ALSO drains the
+ * app's own queue — its scene rendering, which never touches `target_image`.
+ * On this device that is the majority of the wait.
+ *
+ * Falls back to the passed-in queue on the shared-queue tier, where there is no
+ * runtime-owned queue and the DP submits on the app's.
+ *
+ * DEFAULT OFF — prototype. A/B it before trusting it: getting this wrong is an
+ * intermittent `target_image` race, which is a bad trade for 3.3 ms.
+ * DXR_WEAVE_POSTWAIT_QUEUE=1 / debug.dxr.weave_postwait_queue 1 enables.
+ */
+static bool
+dxr_postwait_queue_only(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0;
+		const char *e = getenv("DXR_WEAVE_POSTWAIT_QUEUE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.weave_postwait_queue", sp) > 0 &&
+			    sp[0] == '1') {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 static xrt_result_t
 vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         bool is_repaint,
@@ -4008,7 +4059,16 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				// and this overlay is a no-op, so the wait costs
 				// nothing in practice — but keep it for safety when
 				// HUD eventually wires up.
-				vk->vkDeviceWaitIdle(vk->device);
+				if (dxr_postwait_queue_only()) {
+					// #837: drain only the queue the DP actually
+					// submits on (see dxr_postwait_queue_only).
+					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE)
+					                   ? c->repaint_queue
+					                   : queue;
+					vk->vkQueueWaitIdle(dp_q);
+				} else {
+					vk->vkDeviceWaitIdle(vk->device);
+				}
 
 				// Allocate a fresh cmd buffer for any post-DP
 				// overlays (HUD), then fall through to the shared
