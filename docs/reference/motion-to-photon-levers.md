@@ -182,6 +182,39 @@ proven live (`#837: first frame PARKED`), 15 fps and identical results either wa
 app frames (`!is_repaint`), so with repaint on it affects roughly 15 of every 60 weaves. Keep it
 off.
 
+### The recurring bug: a fixed constant standing in for a platform-varying quantity
+
+`DXR_DP_FORWARD_HORIZON` below is one instance of a defect shape that has now been
+found independently **four times in this stack**, three of them in a single week
+(2026-08). Recording it here because each discovery cost days, and each was found by
+measurement after being invisible to review:
+
+| instance | the constant | what actually varies |
+|---|---|---|
+| leia-plugin#206 | an EMA of weave cadence | per-weave present-to-photon time |
+| CNSDK `facePredictLatencyMs` | hardcoded 40 ms prediction horizon | real weave→photon time, per frame |
+| leia-plugin#211 | a 100 ms eye-pair holdover window | the tier asymmetry it compensates for |
+| CNSDK filter `R` | a synthetic noise prior | real, correlated detector noise |
+
+**The shape.** A quantity that genuinely varies gets replaced by a constant (or a
+smoothed estimate, which is a constant that lies more slowly). The code is correct
+at the calibration point and wrong everywhere else, proportionally to how far the
+real value has drifted.
+
+**Why it survives review.** The failure is not a crash or a wrong answer — it is a
+*breathing* output: judder, stutter, an intermittent geometry error. That reads as
+noise from the layer below, so it is attributed to tracking jitter, thermals, or the
+panel, and never investigated. leia-plugin#211's worst case was a fallback tier that
+only runs during dropouts, which is the most hostile version of this: an intermittent
+error in a rarely-exercised path, blamed on the sensor.
+
+**What to do instead.** Consume the per-sample value **raw**, and when it is
+unavailable report that honestly (0, `false`) so the consumer can take a documented
+fallback — rather than substituting a plausible number. If a constant is genuinely
+unavoidable, its comment must say what varies, what the constant was calibrated
+against, and what breaks when the platform moves — so the next person measuring a
+breathing output has somewhere to look.
+
 ### `DXR_DP_FORWARD_HORIZON` — **default on** (#206 per-weave forward horizon)
 
 The vendor eye predictor extrapolates to whatever horizon the DP feeds it, and it consumes
