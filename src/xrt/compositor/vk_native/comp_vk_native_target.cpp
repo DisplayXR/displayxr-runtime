@@ -50,6 +50,33 @@ static comp_frame_witness g_frame_witness_vk{"vk"};
 #ifdef XRT_OS_ANDROID
 #include <sys/system_properties.h>
 
+//! Diagnostic gate for the periodic #206 residual row — see the compositor's
+//! dxr_weave_cadence_trace() for the reasoning. The residual MEASUREMENT is
+//! always taken (it feeds comp_vk_native_target_weave_to_scanout_ns); only the
+//! ~5 s WARN row is gated, since WARN is reserved for one-off events.
+static bool
+dxr_weave_cadence_trace_target(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0;
+		const char *e = getenv("DXR_WEAVE_CADENCE_TRACE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.weave_cadence_trace", sp) > 0 &&
+			    sp[0] == '1') {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 //! Float-valued sysprop; default on unset or unparseable.
 static float
 get_prop_float_local(const char *name, float default_val)
@@ -2207,7 +2234,8 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 	// question turns on — whether the vendor's hardcoded 40 ms matches what
 	// this pipeline actually does — so it is worth saying out loud rather
 	// than only exposing through an accessor nobody reads yet.
-	if (target->residual_samples > 0 && target->vblank_grid.period_ns != 0) {
+	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
+	    target->vblank_grid.period_ns != 0) {
 		const uint64_t now2 = os_monotonic_get_ns();
 		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
 			target->residual_last_log_ns = now2;

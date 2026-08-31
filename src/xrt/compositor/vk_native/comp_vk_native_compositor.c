@@ -3523,6 +3523,45 @@ vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
  * compositor-owned scratch, and skipping it hands the DP a stale image.
  */
 /*!
+ * Diagnostic gate for the per-kind cadence census and the #206 residual report.
+ *
+ * Both are PERIODIC (~5 s) WARN rows, so they must not ship on by default —
+ * docs/reference/debug-logging.md reserves WARN for one-off init/error/lifecycle
+ * events. Everything else this branch logs is one-shot or on-change and stays
+ * unconditional.
+ *
+ * Turn it on when grading ANY change to weave scheduling. The census is the only
+ * instrument that separates a live stream from a frozen one: panel-interval
+ * statistics improved on every axis (34.4 -> 39.7 fps, CoV 46.8% -> 33.2%) during
+ * a run where the app had stopped submitting entirely and the compositor was
+ * re-weaving a stale atlas. `app n` is what catches that; smoothness cannot.
+ *
+ * DXR_WEAVE_CADENCE_TRACE=1 / debug.dxr.weave_cadence_trace 1.
+ */
+static bool
+dxr_weave_cadence_trace(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0;
+		const char *e = getenv("DXR_WEAVE_CADENCE_TRACE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.weave_cadence_trace", sp) > 0 &&
+			    sp[0] == '1') {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
+/*!
  * #837 prototype: narrow the post-weave drain from the DEVICE to the DP's QUEUE.
  *
  * `postwait` measures 3.29 ms of a ~9.4 ms fire — 35% — and it is one
@@ -3605,7 +3644,7 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 * Reports mean and SD per kind, plus the app->repaint phase, i.e. where in
 	 * the app's own interval the repaint actually fell (0.5 = ideally midway).
 	 */
-	{
+	if (dxr_weave_cadence_trace()) {
 		static uint64_t last_any_ns = 0, last_app_ns = 0;
 		static double s_any = 0, q_any = 0, s_app = 0, q_app = 0, s_ph = 0, q_ph = 0;
 		static uint32_t n_any = 0, n_app = 0, n_rep = 0, n_ph = 0;
