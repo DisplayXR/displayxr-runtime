@@ -3585,16 +3585,31 @@ dxr_weave_cadence_trace(void)
  * Falls back to the passed-in queue on the shared-queue tier, where there is no
  * runtime-owned queue and the DP submits on the app's.
  *
- * DEFAULT OFF — prototype. A/B it before trusting it: getting this wrong is an
- * intermittent `target_image` race, which is a bad trade for 3.3 ms.
- * DXR_WEAVE_POSTWAIT_QUEUE=1 / debug.dxr.weave_postwait_queue 1 enables.
+ * DEFAULT ON (2026-08-31), on three independent lines of evidence:
+ *   - Queue identity, confirmed on-device rather than by reading this comment:
+ *     `#868: queue handles — app=0x..ad0 repaint=0x..b70` and `creating the
+ *     display processor against the runtime-owned queue 0x..b70` — the DP's
+ *     queue IS `c->repaint_queue`, so this drain covers the vendor weave.
+ *   - A/B on NP02J, identical conditions: postwait 3.25 ms -> 0.04 ms with the
+ *     weave itself unchanged (0.43 -> 0.47 ms), zero discards, zero validation
+ *     errors. The stall cost ~7x the weave it was protecting.
+ *   - Human eyeball, 90 s of head motion + model rotation: no bad frame.
+ *
+ * NOT empirically covered: the `vk_composite_local_2d` consumer is inert in
+ * every Android demo on hand (`#879: ... local2d_scratch=0x0`), so no test here
+ * has exercised the read-after-weave hazard this wait exists for. State that
+ * rather than imply otherwise. The correctness argument does not rest on it:
+ * the wait is on the PRODUCER's queue and is host-blocking, so the weave is
+ * complete before any consumer's command buffer is even recorded.
+ *
+ * Kill switch: DXR_WEAVE_POSTWAIT_QUEUE=0 / debug.dxr.weave_postwait_queue 0.
  */
 static bool
 dxr_postwait_queue_only(void)
 {
 	static int on = -1;
 	if (on < 0) {
-		on = 0;
+		on = 1; // default ON — see the evidence in the comment above
 		const char *e = getenv("DXR_WEAVE_POSTWAIT_QUEUE");
 		if (e != NULL && e[0] != '\0') {
 			on = (e[0] == '0') ? 0 : 1;
@@ -3602,12 +3617,21 @@ dxr_postwait_queue_only(void)
 #ifdef XRT_OS_ANDROID
 		else {
 			char sp[PROP_VALUE_MAX] = {0};
+			// Now that the default is ON the prop must be able to turn it
+			// OFF, so test for '0' rather than only honouring '1'.
 			if (__system_property_get("debug.dxr.weave_postwait_queue", sp) > 0 &&
-			    sp[0] == '1') {
-				on = 1;
+			    sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
 			}
 		}
 #endif
+		/*
+		 * Say which drain is live, exactly once. A switch guarding a data
+		 * race with no engagement log made a clean QA pass unattributable:
+		 * the props had been cleared afterwards and nothing in the log could
+		 * establish whether the narrow drain had ever actually run.
+		 */
+		U_LOG_W("#837: post-weave drain = %s", on ? "QUEUE (narrow)" : "DEVICE (wide)");
 	}
 	return on == 1;
 }
