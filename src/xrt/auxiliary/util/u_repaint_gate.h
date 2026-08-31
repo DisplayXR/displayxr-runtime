@@ -529,6 +529,9 @@ u_repaint_gate_open(struct u_repaint_gate *g,
  *      sess->frame_started never clears, so EVERY subsequent xrBeginFrame
  *      discards. One recoverable discard latches into a permanent trap,
  *      and the ~12k/s "spam" is that early return logging itself.
+ *      Re-verified on a known-good matched pair: fill selected, census
+ *      app n=0 across every report, 2.5M discards, and the app process
+ *      ultimately DIES rather than merely stalling.
  *
  * So fill's actual defect is only step 1: it can cause a discard. Steps
  * 2-3 are conformant runtime behaviour meeting a non-conformant app. A
