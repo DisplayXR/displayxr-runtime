@@ -516,7 +516,27 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 *     34.4 / 47% — because it is re-weaving a STALE frame. The metric
 	 *     improved while the product broke.
 	 *
-	 * That last line is the reason this comment is long. Panel-interval
+	 * FULL CHAIN, traced afterwards — the runtime's part is far smaller than
+ * the outcome suggests, and the distinction matters to anyone reviving it:
+ *
+ *   1. Fill authorises extra fires. Each takes c->mutex, so it can delay
+ *      one xrEndFrame past the two-wait window.
+ *   2. oxr_session.c then returns XR_FRAME_DISCARDED for that ONE frame.
+ *      That is a SUCCESS code and a normal, recoverable event.
+ *   3. The app under test treats it as failure — `if (res != XR_SUCCESS)
+ *      { return false; }` — and returns WITHOUT calling xrEndFrame
+ *      (displayxr-demo-modelviewer android/src/main/cpp/main.cpp:1087).
+ *      sess->frame_started never clears, so EVERY subsequent xrBeginFrame
+ *      discards. One recoverable discard latches into a permanent trap,
+ *      and the ~12k/s "spam" is that early return logging itself.
+ *
+ * So fill's actual defect is only step 1: it can cause a discard. Steps
+ * 2-3 are conformant runtime behaviour meeting a non-conformant app. A
+ * spec-compliant app would drop one frame and continue — which is a
+ * HYPOTHESIS about fill's viability, not a result. No such app has been
+ * measured here.
+ *
+ * That last line is the reason this comment is long. Panel-interval
 	 * statistics cannot distinguish a well-paced live stream from a
 	 * well-paced frozen one; only the per-kind census (app n) can, and any
 	 * future scheduling change here must be graded on it.
