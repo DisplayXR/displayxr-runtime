@@ -399,20 +399,19 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 		} else if (e != NULL && strcmp(e, "fill") == 0) {
 			g->mode = 4;
 		} else {
-#ifdef XRT_OS_ANDROID
-			g->mode = 4; // Android default: fill (see the log below)
-#else
+			// DEFAULT IS NEVER FILL. Fill was briefly the Android default and
+			// it REGRESSED — see the header comment on mode 4. Opt-in only.
 			g->mode = 3; // default: legacy schedule unless the partition engages
-#endif
 		}
 		if (g->mode == 4) {
-			U_LOG_W("#1257: repaint gate FILL — the legacy 2-period gate plus a fire that "
-			        "itself blocks ~9-18 ms in the FIFO acquire yields exactly ONE repaint "
-			        "per app frame at phase ~0.70, so the panel alternates ~41/18 ms "
-			        "(interval CoV ~40%%) against a panel pinned at 59.86 Hz. Fill budgets "
-			        "off the measured app interval so every vblank slot gets filled "
-			        "(DXR_WEAVE_REPAINT_GATE=legacy / debug.dxr.weave_repaint_gate legacy "
-			        "reverts)");
+			U_LOG_W("#1257: repaint gate FILL — OPT-IN AND MEASURED HARMFUL on the "
+			        "in-process Android tier. Repaints and app frames are SERIALISED on "
+			        "one thread there (#1196 single weave ownership: the repaint thread "
+			        "is also the app's weave server), so a budget above 1 starves the "
+			        "hand-off: measured app frame delivery stopping ~10 s in, "
+			        "xrBeginFrame returning XR_FRAME_DISCARDED at ~12k/s, and a panel "
+			        "that looks SMOOTHER only because it is re-weaving a frozen frame. "
+			        "Use only where repaints have their own weave thread");
 		}
 	}
 
@@ -496,6 +495,37 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 * jitter EMA far above period/4 and keeps the vblank-count/legacy path
 	 * untouched. Anything that fails the trust test falls through to the
 	 * EXACT prior behavior below.
+	 */
+	/*
+	 * MODE 4 — "fill". OPT-IN ONLY; it was the Android default for one commit
+	 * and that was WRONG. Read this before enabling it anywhere.
+	 *
+	 * The budget arithmetic below is correct and does what it says: at a
+	 * 62 ms app interval it authorises 3 repaints, at 45 ms it authorises 2,
+	 * and the fires land. What the arithmetic ASSUMES is that a repaint and an
+	 * app frame are independent work. On the in-process Android tier they are
+	 * not: #1196 single weave ownership makes the repaint thread the app's
+	 * weave server too (it serves weave_hand.pending), so every authorised
+	 * repaint is time the app's posted frame cannot be served.
+	 *
+	 * Measured consequence, NP02J, panel pinned 59.86 Hz:
+	 *   - app frame delivery stops ~10 s after launch (census app n=0 from the
+	 *     second report onward, gate EMA frozen at samples=39)
+	 *   - xrBeginFrame returns XR_FRAME_DISCARDED continuously, ~12k/s
+	 *   - the panel reads BETTER — 39.7 fps / CoV 33% against legacy's
+	 *     34.4 / 47% — because it is re-weaving a STALE frame. The metric
+	 *     improved while the product broke.
+	 *
+	 * That last line is the reason this comment is long. Panel-interval
+	 * statistics cannot distinguish a well-paced live stream from a
+	 * well-paced frozen one; only the per-kind census (app n) can, and any
+	 * future scheduling change here must be graded on it.
+	 *
+	 * This is the sixth member of the #1257 fire/commit collision family. The
+	 * five gap-filling variants before it failed for the same underlying
+	 * reason on Windows tiers; the fix that worked there — the slot partition
+	 * — works by giving the app a guaranteed release slot rather than by
+	 * authorising more fires.
 	 */
 	if (!part_on && u_repaint_gate_fill_ok(g, period_ns)) {
 		// STALL: the app is hitching, not pacing — the original #868 case.
