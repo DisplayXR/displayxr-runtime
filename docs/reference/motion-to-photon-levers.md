@@ -195,6 +195,7 @@ measurement after being invisible to review:
 | CNSDK `facePredictLatencyMs` | hardcoded 40 ms prediction horizon | real weave→photon time, per frame |
 | leia-plugin#211 | a 100 ms eye-pair holdover window | the tier asymmetry it compensates for |
 | CNSDK filter `R` | a synthetic noise prior | real, correlated detector noise |
+| #868 repaint loop (Android) | a hardcoded 60 Hz panel period | a variable-refresh panel the platform moves 59.86 ⇄ 119.71 Hz mid-session |
 
 **The shape.** A quantity that genuinely varies gets replaced by a constant (or a
 smoothed estimate, which is a constant that lies more slowly). The code is correct
@@ -214,6 +215,52 @@ fallback — rather than substituting a plausible number. If a constant is genui
 unavoidable, its comment must say what varies, what the constant was calibrated
 against, and what breaks when the platform moves — so the next person measuring a
 breathing output has somewhere to look.
+
+#### CAVEAT: finding the constant is not the same as it being the constraint
+
+The list above identifies a real defect class. It does **not** establish that any
+given instance is what limits the system — and the fifth instance is the cautionary
+data, because most of the work that followed from it measured null.
+
+The repaint loop's hardcoded 60 Hz *was* genuinely wrong: the panel is
+variable-refresh and the platform re-rates it on interaction. Replacing it with a
+measured vblank grid (`comp_vblank_grid.h`, fed from `VK_GOOGLE_display_timing`) was
+correct and paid: 34.0 → 59.9 fps against a steady panel, with a human verdict of
+"fluid, tracking feels faster". That is the pattern working as advertised.
+
+Then everything built on top of it measured null:
+
+| follow-on | result |
+|---|---|
+| grid-based late-weave tier | **null** — the weave budget already exceeds a refresh period, so there is no slack to weave late into |
+| slot partition on Android | **null** — CoV 34.9 / 33.5 / 33.2% at D=1/2/3, inside the D=1 run-to-run spread |
+| repaint phase hold (aim the fill at the midpoint) | **null** — a hold can only delay a fire, and the fire was already late |
+| `setFrameRate` / `preferredDisplayModeId` panel pin | **null** — accepted by the platform and ignored, twice, on two different APIs |
+| "fill" gate mode (budget repaints off the measured interval) | **harmful** — see the mode-4 comment in `u_repaint_gate.h` |
+
+The binding constraint was none of them. It was the **GPU governor**: at the default
+governor this device runs its GPU at 295 MHz of a possible 680, and pinning the clock
+moved the app from 51.53 ms to 28.45 ms per frame, took on-screen interval CoV from
+61% to 16%, and made the repaint loop stop firing entirely — because an app that fast
+never opens the quiet gate. The 41/18 ms alternation everything above was trying to
+schedule around **does not exist at adequate clock.**
+
+Note the shape: CNSDK's 40 ms `facePredictLatencyMs` is a genuine instance of the
+defect *and* was not what limited this device — the measured weave→scanout residual is
+28–47 ms, so 40 ms is a well-chosen centre whose defect is that it cannot move. Both
+things are true at once, and only measurement separates them.
+
+**So: identify the constant, then measure whether it is load-bearing before building
+on it.** The pattern is a hypothesis generator, not a work queue.
+
+#### And beware the metric that hides the answer
+
+"Fill" mode improved every panel statistic it was graded on — 34.4 → 39.7 fps, interval
+CoV 46.8% → 33.2%, SD 13.60 → 8.35 ms — while the app had stopped submitting frames
+entirely and the compositor was re-weaving a frozen atlas. Panel-interval statistics
+cannot distinguish a well-paced live stream from a well-paced dead one. Only a
+per-kind census (how many weaves carried a *new* app frame) can, and any scheduling
+change here must be graded on that rather than on smoothness.
 
 ### `DXR_DP_FORWARD_HORIZON` — **default on** (#206 per-weave forward horizon)
 
