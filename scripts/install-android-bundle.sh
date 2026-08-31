@@ -16,6 +16,15 @@
 #   ./scripts/install-android-bundle.sh --neutral       # vendor-neutral runtime
 #   ./scripts/install-android-bundle.sh --force-reinstall
 #   ./scripts/install-android-bundle.sh --list          # show what WOULD install
+#   ./scripts/install-android-bundle.sh --links         # print tap-ready download
+#                                                       # URLs (no device needed)
+#
+# --links exists because the people who most need a correct install are the ones
+# who CANNOT run this script: a non-developer holding only a tablet, who gets a
+# list of links pasted into chat. Hand-writing that list is how runtime and
+# browser drift apart, and a mismatched pair blacks out all 3D in the browser
+# while every other app keeps working (runtime#1302). Generate the list; never
+# retype it.
 #
 # --force-reinstall UNINSTALLS first, which WIPES APP DATA — including
 # EarthView's saved Google Maps API key. Without it, installs are `adb
@@ -30,27 +39,35 @@ set -euo pipefail
 
 REPO_RUNTIME=DisplayXR/displayxr-runtime
 REF="${DXR_REF:-main}"
-WITH_BROWSER=0; VARIANT=Leia; FORCE=(); LIST_ONLY=0
+WITH_BROWSER=0; VARIANT=Leia; FORCE=(); LIST_ONLY=0; LINKS_ONLY=0
 for a in "$@"; do
   case "$a" in
     --with-browser)    WITH_BROWSER=1 ;;
     --neutral)         VARIANT=neutral ;;
     --force-reinstall) FORCE=(--force-reinstall) ;;
     --list)            LIST_ONLY=1 ;;
+    --links)           LINKS_ONLY=1; WITH_BROWSER=1 ;;
     -h|--help)         sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
 
 command -v gh  >/dev/null || { echo "gh CLI required (https://cli.github.com)"; exit 1; }
-command -v adb >/dev/null || ADB="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb"
-ADB="${ADB:-adb}"; command -v "$ADB" >/dev/null || { echo "adb not found"; exit 1; }
+if [ "$LINKS_ONLY" != 1 ]; then
+  command -v adb >/dev/null || ADB="${ANDROID_HOME:-$HOME/Library/Android/sdk}/platform-tools/adb"
+  ADB="${ADB:-adb}"; command -v "$ADB" >/dev/null || { echo "adb not found"; exit 1; }
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
 # versions.json: local checkout if present, else straight from GitHub.
-if [ -f "$HERE/versions.json" ]; then
+# --links emits URLs that get pasted to other people, so it always reads the
+# PUBLISHED pins: a local checkout can be an old branch, and the stale links it
+# would print are indistinguishable from correct ones at the far end. (Caught
+# in review: a branch based on an older main emitted runtime v2.15.1 while main
+# pinned v2.15.2.) Installing locally still prefers the checkout.
+if [ -f "$HERE/versions.json" ] && [ "$LINKS_ONLY" != 1 ]; then
   cp "$HERE/versions.json" "$WORK/versions.json"; SRC="local checkout"
 else
   gh api "repos/$REPO_RUNTIME/contents/versions.json?ref=$REF" --jq '.content' | base64 -d > "$WORK/versions.json"
@@ -77,6 +94,43 @@ for c in "${COMPONENTS[@]}"; do
   printf "  %-18s %s\n" "$NAME" "$(pin "$FIELD")"
 done
 [ "$LIST_ONLY" = 1 ] && exit 0
+
+# --links: resolve each pin to its real release asset and print download URLs.
+# Ordered runtime-first, with the launch-once step called out between runtime
+# and apps, because that order is itself a requirement (install-android.sh).
+if [ "$LINKS_ONLY" = 1 ]; then
+  asset_url() { # repo tag pattern -> browser_download_url of the first match
+    gh release view "$2" -R "$1" --json assets \
+      --jq "[.assets[].name | select(test(\"$3\"))] | .[0] // empty" 2>/dev/null \
+      | while read -r n; do [ -n "$n" ] && echo "https://github.com/$1/releases/download/$2/$n"; done
+  }
+  echo
+  echo "=== Matched Android install set (generated from versions.json — do not hand-edit) ==="
+  echo
+  RT_PAT="DisplayXR-Runtime-$([ "$VARIANT" = Leia ] && echo 'Leia-' || echo '')[0-9].*android-arm64[.]apk"
+  echo "1. Runtime $RUNTIME_TAG ($VARIANT)"
+  echo "   $(asset_url "$REPO_RUNTIME" "$RUNTIME_TAG" "$RT_PAT")"
+  echo
+  echo "2. Open the \"DisplayXR\" app once before installing anything else."
+  echo "   (Skipping this leaves every app failing with XR_ERROR_RUNTIME_UNAVAILABLE.)"
+  echo
+  echo "3. Allow: Settings > Apps > DisplayXR > Display over other apps."
+  echo
+  echo "4. Apps:"
+  for c in "${COMPONENTS[@]}"; do
+    IFS='|' read -r NAME REPO FIELD <<< "$c"
+    TAG=$(pin "$FIELD"); [ -n "$TAG" ] || continue
+    U=$(asset_url "$REPO" "$TAG" "[.]apk$")
+    [ -n "$U" ] && printf "   %-14s %s\n" "$NAME" "$U" \
+                || printf "   %-14s (no APK on %s)\n" "$NAME" "$TAG"
+  done
+  echo
+  echo "Requires on-device Leia services 0.10.54 or newer (0.10.56+ recommended)."
+  echo "The runtime and browser above are a MATCHED PAIR — the runtime<->browser"
+  echo "IPC check is an exact version match, so do not mix in versions from"
+  echo "another message or all 3D content in the browser renders black."
+  exit 0
+fi
 
 echo
 echo ">> downloading (this is the part install-android.sh does NOT do)"

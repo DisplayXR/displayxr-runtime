@@ -71,6 +71,37 @@ does, says so, and installs that instead. So `--with-browser` keeps working, but
 the browser version you get may lag the pin; the line it prints tells you when
 that happened.
 
+### Sending someone else an install list (non-developers)
+
+The people who most need a correct install are the ones who cannot run any of
+the above: a colleague holding only a tablet, who gets a list of links pasted
+into chat and taps them. **Generate that list, never retype it:**
+
+```bash
+./scripts/install-android-bundle.sh --links
+```
+
+It needs no device and no adb — it resolves every `versions.json` pin to its
+real release asset and prints tap-ready URLs in install order, with the
+launch-once and overlay-permission steps in place. It deliberately reads the
+**published** pins rather than the local checkout, because a stale branch would
+emit stale links that look perfectly correct at the far end.
+
+**Why this matters more than it looks.** The runtime and the browser must come
+from a *matched pair*: the client↔service check in
+`ipc_client_connection.c::ipc_client_check_git_tag` is an exact string compare,
+not a minimum-version floor. A hand-assembled list that pairs, say, runtime
+v2.14.10 with browser preview-0.1.22 fails every `xrCreateInstance` from the
+browser — and because Android demo apps run **in-process** and never cross that
+IPC boundary, the demos keep weaving while only the browser goes black. It reads
+as "the browser is broken", not "these two builds disagree". Two testers hit
+exactly this (runtime#1302).
+
+Also tell them the device floor: the Android plug-in needs on-device **Leia
+services 0.10.54+** (0.10.56+ is what we test). An older services generation
+gives the same black-3D-in-the-browser symptom from a completely different
+cause.
+
 ### Installing APKs you already have
 
 Install the runtime **and** an app with:
