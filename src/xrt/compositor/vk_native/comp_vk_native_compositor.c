@@ -5465,6 +5465,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				 * repaint thread can take it to run the weave, and hands it
 				 * back before returning. Loop on `pending`: cond waits wake
 				 * spuriously.
+				 *
+				 * BOUNDED, per the no-unbounded-work rule
+				 * (docs/reference/workspace-stability.md, #925). The wait
+				 * used to be an os_cond_wait with no deadline, so a weave
+				 * thread that never comes back froze the app forever —
+				 * captured twice as a double backtrace: the repaint thread
+				 * parked in the vendor weaver's vkWaitForFences after a
+				 * target recreate, this thread parked here behind it. Two
+				 * seconds is deliberately generous: it must never fire on a
+				 * merely slow frame, only convert a permanent wedge into one
+				 * failed frame. The abandon below is race-free — both sides
+				 * run under c->mutex and the serve site re-tests `pending`
+				 * under the lock before writing anything, so a request
+				 * withdrawn here is simply never served.
 				 */
 				c->weave_hand.pending = true;
 				c->weave_hand.zero_copy = zero_copy;
@@ -5480,8 +5494,27 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				c->weave_hand.result = XRT_SUCCESS;
 				c->weave_hand.skip_frame = false;
 				os_cond_broadcast(&c->weave_cond);
+				const uint64_t hand_deadline_ns =
+				    (uint64_t)os_monotonic_get_ns() + 2ULL * 1000 * 1000 * 1000;
 				while (c->weave_hand.pending) {
-					os_cond_wait(&c->weave_cond, &c->mutex);
+					os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex,
+					                        100ULL * 1000 * 1000);
+					if (!c->weave_hand.pending ||
+					    (uint64_t)os_monotonic_get_ns() < hand_deadline_ns) {
+						continue;
+					}
+					// Wedged. Withdraw the request, fail this frame the
+					// same way a torn-down weave thread fails it, and
+					// disarm the repaint so the replay path — which weaves
+					// through the same wedged DP — is not re-entered.
+					c->weave_hand.pending = false;
+					c->weave_hand.result = XRT_ERROR_VULKAN;
+					c->weave_hand.skip_frame = true;
+					c->repaint.armed = false;
+					U_LOG_E("#1196: weave thread unresponsive for 2 s — failing this frame "
+					        "instead of freezing the app. Known signature: the vendor weave "
+					        "stuck in vkWaitForFences after a target recreate (see "
+					        "docs/reference/workspace-stability.md, #925).");
 				}
 				xret = c->weave_hand.result;
 				skip_frame = c->weave_hand.skip_frame;
