@@ -1935,9 +1935,27 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	comp_split_gate_evaluate(&gin, &gate);
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
-	// PROTOTYPE: the reroute is same-adapter by acceptance; the opt-in extends it
-	// to the hybrid topology the VK tier already serves on this same arm.
-	const bool reroute_topology_ok = gate.same_adapter || d3d12_reroute_hybrid_optin();
+	/*
+	 * PROTOTYPE: the reroute is same-adapter by acceptance; the opt-in extends it
+	 * to the hybrid topology the VK tier already serves on this same arm.
+	 *
+	 * The hybrid engage ALSO requires the partition to be requested, and that is
+	 * the whole reason it can be considered for default-on. Measured on a real
+	 * client: the reroute's BENEFIT needs the divisor (-42% app iGPU at D=3),
+	 * while its COST is paid either way (+19 CPU points with the reroute alone,
+	 * `C-REROUTE-NODIV`). Engaging it for a session that never asked for the
+	 * partition is therefore all cost and no benefit.
+	 *
+	 * That cost is probably not removable: it is not the staged ingress (the
+	 * deposit is a RING, so adaptive ingress would stage every frame anyway) and
+	 * not the fill loop (both arms tick on a byte-identical formula). What is
+	 * left is the D3D11 device + immediate context this arm submits through
+	 * every frame, against the own-legs path's pure D3D12 -- structural, not a
+	 * bug. So scope the engage to the sessions that pay for it rather than chase
+	 * the cost.
+	 */
+	const bool reroute_topology_ok =
+	    gate.same_adapter || (d3d12_reroute_hybrid_optin() && u_app_partition_divisor() >= 2);
 	if (reroute_topology_ok && gate.split_active) {
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 		if (d3d12_reroute_route_d3d11()) {
