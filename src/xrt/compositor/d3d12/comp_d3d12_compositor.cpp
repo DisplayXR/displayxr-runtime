@@ -760,6 +760,7 @@ static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
 // sideband publish of the wish / sticky mask. Defined with the zone helpers
 // near the bottom; called after each path's fence wait in layer_commit.
 static bool d3d12_zone_dp_supported(struct comp_d3d12_compositor *c);
+static bool d3d12_zone_dp_supported_weaving_arm(struct comp_d3d12_compositor *c);
 static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
 // #918 D12-5 — the app-authored (Tier-3) mask's bridge transport. Defined with
 // the zone helpers near the bottom; both are called from layer_commit's DP+target
@@ -4280,7 +4281,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		                   COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
 
-	if (c->zones_frame && !c->zones_mode_requested && !d3d12_zone_dp_supported(c)) {
+	if (c->zones_frame && !c->zones_mode_requested && !d3d12_zone_dp_supported_weaving_arm(c)) {
 		c->zones_mode_requested = true;
 		comp_d3d12_compositor_request_display_mode(&c->base.base, true);
 	} else if (!c->zones_frame) {
@@ -6334,6 +6335,33 @@ d3d12_zone_dp_supported(struct comp_d3d12_compositor *c)
 		}
 	}
 	return c->zone_dp_state == 1;
+}
+
+/*!
+ * The ADR-027 tier-1 gate's real question: does the display processor that
+ * actually weaves THIS session consume zone masks?
+ *
+ * @ref d3d12_zone_dp_supported can only answer for the tier's OWN DP, and on the
+ * #1264 reroute there is no own DP -- the weaver lives on the d3d11 fill arm and
+ * `c->display_processor` is NULL by construction, so it answers "legacy DP" for a
+ * weaver that in fact advertises zone slots. The tier-1 fallback then fires on the
+ * first zones frame and requests hardware 3D, which silently overrides an app's 2D
+ * rendering mode for the rest of the session (the mask leg itself was never
+ * affected: it publishes through the arm, @ref comp_vk_split_publish_zone_wish).
+ *
+ * So ask whichever arm owns the weaver. `comp_vk_split_zone_dp_supported` exists
+ * for exactly this question -- its own doc says the compositor cannot answer it for
+ * a split session.
+ */
+static bool
+d3d12_zone_dp_supported_weaving_arm(struct comp_d3d12_compositor *c)
+{
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_zone_dp_supported(c->reroute.split);
+	}
+#endif
+	return d3d12_zone_dp_supported(c);
 }
 
 /*!

@@ -3249,6 +3249,8 @@ vk_frame_has_over_local2d(struct comp_vk_native_compositor *c);
 // helpers near the bottom.
 static bool
 vk_zone_dp_supported(struct comp_vk_native_compositor *c);
+static bool
+vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c);
 static void
 vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
 
@@ -4494,7 +4496,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	// skip the global fallback. Legacy DP (no zone slots): tier-1 fallback —
 	// "any zone active => request 3D" once on the rising edge, no forced 2D
 	// on the falling edge.
-	if (c->zones_frame && !c->zones_mode_requested && !vk_zone_dp_supported(c)) {
+	if (c->zones_frame && !c->zones_mode_requested && !vk_zone_dp_supported_weaving_arm(c)) {
 		c->zones_mode_requested = true;
 		comp_vk_native_compositor_request_display_mode(&c->base.base, true);
 	} else if (!c->zones_frame) {
@@ -9303,6 +9305,34 @@ vk_zone_dp_supported(struct comp_vk_native_compositor *c)
 		}
 	}
 	return c->zone_dp_state == 1;
+}
+
+/*!
+ * What the ADR-027 tier-1 gate actually needs to know: does the display processor
+ * that WEAVES this session consume zone masks?
+ *
+ * @ref vk_zone_dp_supported can only answer for the Vulkan DP, and under the #918
+ * split there is none -- the weaver is the scanout adapter's D3D11 one and
+ * `c->display_processor` stays NULL by construction (its create is guarded on
+ * `c->split == NULL`). It therefore answers "legacy DP" for a weaver that does
+ * advertise zone slots, the tier-1 fallback fires on the first zones frame, and the
+ * hardware-3D request it makes silently overrides the app's 2D rendering mode for
+ * the rest of the session. The mask leg itself was never affected -- it publishes
+ * through the arm (@ref comp_vk_split_publish_zone_wish), which is why this only
+ * ever showed up as "2D does not stick", never as a lost mask.
+ *
+ * `comp_vk_split_zone_dp_supported` exists for exactly this question; its doc says
+ * outright that the compositor cannot answer it for a split session.
+ */
+static bool
+vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c)
+{
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_vk_split_zone_dp_supported(c->split);
+	}
+#endif
+	return vk_zone_dp_supported(c);
 }
 
 // Keep the DP's view of this client's zone mask in sync with the
