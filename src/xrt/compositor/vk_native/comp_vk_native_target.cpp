@@ -2250,14 +2250,37 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		if (r > 200ULL * 1000 * 1000) {
 			continue; // a stalled frame is not a latency measurement
 		}
-		// High-water with slow decay, same reasoning as the weave budget: this
-		// feeds a predictor, and under-predicting is what produces visible
-		// judder, so bias toward the pessimistic end of the distribution.
-		if (r > target->residual_ns) {
-			target->residual_ns = r;
-		} else {
-			target->residual_ns -= target->residual_ns / 50;
-		}
+		/*
+		 * The LAST MEASURED sample, per frame — not a high-water.
+		 *
+		 * This previously kept a high-water with slow decay, on the reasoning
+		 * that under-predicting produces visible judder so the estimate should
+		 * lean pessimistic. That reasoning is correct for a WEAVE BUDGET
+		 * (reserving too much time is safe; missing a deadline is not) and
+		 * WRONG for a PREDICTION HORIZON, where the asymmetry runs the other
+		 * way: over-predicting extrapolates the head past where it actually
+		 * goes and overshoots at every turnaround, which reads as a hard 3D
+		 * break, while under-predicting merely lags and reads as softness.
+		 *
+		 * Measured, not assumed. With the true horizon fixed at 35 ms and the
+		 * value FED to the predictor swept, over a labelled capture set (171
+		 * turnaround + 26 onset events, both light levels), turnaround p90:
+		 *
+		 *     fed 25 ms (-10)  0.096      fed 35 ms (truth)  0.073
+		 *     fed 45 ms (+10)  0.109      fed 50 ms (+15)    0.139
+		 *
+		 * The minimum sits at the truth, and a +10 ms error costs ~13% more
+		 * than a -10 ms one. Rest jitter also rises monotonically with the fed
+		 * value (0.777 -> 0.921 across the sweep), so an inflated horizon costs
+		 * even when nothing is moving. A high-water is biased in the expensive
+		 * direction by construction.
+		 *
+		 * Deliberately unsmoothed: the residual is bimodal on GPU governor
+		 * state (p50 42.9 ms vs 29.1 ms) and shifts mid-session, so an average
+		 * over a window spanning a governor change is a number that was never
+		 * true at any instant.
+		 */
+		target->residual_ns = r;
 		target->residual_samples++;
 	}
 
@@ -2270,7 +2293,7 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		const uint64_t now2 = os_monotonic_get_ns();
 		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
 			target->residual_last_log_ns = now2;
-			U_LOG_W("#206: measured weave->scanout residual %.2f ms "
+			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
 			        "(%.2f refresh periods, n=%u)",
 			        target->residual_ns / 1e6,
 			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
