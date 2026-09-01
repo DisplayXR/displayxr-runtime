@@ -120,11 +120,22 @@ typedef struct XrDisplayDesktopPositionDXR {
  *
  * ## Coordinate contract — read this before using desktopRect
  *
- * @ref desktopRect is in PHYSICAL virtual-desktop pixels: the coordinate space
- * a per-monitor-DPI-aware-v2 process sees. The origin is the primary monitor's
- * top-left, and monitors left of or above it have NEGATIVE offsets. The runtime
- * pins a per-monitor-v2 DPI context while resolving it, so the value is
- * physical regardless of the host process's own DPI awareness.
+ * @ref desktopRect is in THE COORDINATE SPACE THE OS PLACES WINDOWS IN, which
+ * is what a client needs and which differs per platform:
+ *
+ * - Windows: physical virtual-screen pixels (what a per-monitor-DPI-aware-v2
+ *   process sees). The runtime pins a per-monitor-v2 DPI context while
+ *   resolving, so the value is physical regardless of the host process's own
+ *   DPI awareness.
+ * - macOS: POINTS in the global display space, NOT backing pixels — a Retina
+ *   panel's backing store is 2x this. Read displayPixelWidth/Height for pixels.
+ * - Linux/X11: device pixels in root-window coordinates.
+ *
+ * All three are TOP-DOWN with the origin at the primary/main display's
+ * top-left, and monitors left of or above it have NEGATIVE offsets. On macOS
+ * that is deliberately the CoreGraphics convention, not Cocoa's — an app
+ * placing an NSWindow must flip into NSScreen's bottom-up space itself, and one
+ * that forgets will mirror its position vertically on any multi-display setup.
  *
  * A consumer MUST act in that same space. A DPI-UNAWARE process that passes
  * these coordinates to SetWindowPos (or any managed wrapper over it) is handed
@@ -159,9 +170,10 @@ typedef struct XrDisplayDesktopInfoDXR {
      * to EnumDisplayDevices, or match it against DXGI_OUTPUT_DESC::DeviceName).
      *
      * Windows: the GDI name, e.g. `\\.\DISPLAY1`.
-     * Empty string when the platform has no equivalent yet — the macOS
-     * (CGDirectDisplayID) and Linux (XRandR output) identifiers are the
-     * follow-on.
+     * macOS: the display UUID — deliberately not the CGDirectDisplayID, which
+     * is reassigned across reboots and replug and so cannot survive the very
+     * event this field exists for. Linux/X11: the RandR output name, e.g.
+     * `HDMI-1`. Empty string when the runtime could not resolve one.
      */
     char                        deviceName[XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR];
     /*!

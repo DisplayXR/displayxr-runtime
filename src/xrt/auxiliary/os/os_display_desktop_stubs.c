@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Non-Windows stub for the desktop-rect resolver.
+ * @brief  Stub desktop-rect resolver for platforms with no desktop.
  * @ingroup aux_os
  *
- * Reports failure so the runtime publishes a zeroed rect and an empty device
- * name, which `XR_DXR_display_info` defines as "unknown". Apps fall back to
- * whatever placement they used before.
+ * Windows, macOS and desktop Linux each have a real implementation; this covers
+ * Android and anything else.
  *
- * macOS would resolve this through `NSScreen`/`CGDirectDisplayID` and desktop
- * Linux through XRandR; both are the follow-on noted in #1301, and both need
- * the panel origin to be real first (#715 — the Linux and macOS hosted-window
- * paths still hardcode their position).
+ * Android is not an oversight — it has no virtual desktop and no window the
+ * runtime places by coordinate, so there is nothing to report. Reporting
+ * failure makes the runtime publish a zeroed rect and an empty device name,
+ * which `XR_DXR_display_info` defines as "unknown", and apps keep whatever
+ * placement they already used.
  */
 
 #include "os_display_desktop.h"
