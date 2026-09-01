@@ -53,3 +53,14 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 #ifdef __cplusplus
 }
 #endif
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * #1278: drive the Android visibility/weave-idle convergent pass from an
+ * always-running context (the IPC server 20 Hz mainloop). The multi main loop
+ * only runs with composited sessions; a pure present-owner weave client
+ * leaves it parked. Safe to call from any thread; takes the system lock.
+ */
+void
+multi_system_compositor_android_visibility_tick(struct xrt_system_compositor *xsysc);
+#endif

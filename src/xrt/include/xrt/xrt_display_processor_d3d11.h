@@ -511,6 +511,32 @@ struct xrt_display_processor_d3d11
 	 */
 	bool (*get_scanout_caps)(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_scanout_caps *out_caps);
 
+	/*!
+	 * #206: the FORWARD-computed weave→scanout time of THIS weave, from the
+	 * runtime's vsync-locked vblank grid (DXGI frame statistics). Unlike
+	 * @ref set_frame_timing's retrospective residual — an estimate of a
+	 * quantity that is not constant under variable weave cadence — this is
+	 * the exact per-weave horizon the vendor eye predictor wants: the DP
+	 * should feed it RAW (no smoothing, no deadband) to its predictor's
+	 * latency input for the weave that immediately follows. Called at most
+	 * once per weave, after @ref set_frame_timing and before
+	 * @ref xrt_display_processor::process_atlas.
+	 *
+	 * 0 = no trusted grid this frame (statistics unavailable or stalled) —
+	 * the DP falls back to its @ref set_frame_timing-based heuristic.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP keeps its heuristic. Appended after @ref get_scanout_caps per
+	 * ADR-020 (append-only within a major; no version bump — gated by the
+	 * variant's `base.struct_size`).
+	 *
+	 * @param xdp                            Pointer to self.
+	 * @param predicted_weave_to_scanout_ns  Forward horizon for this weave;
+	 *                                       0 = unknown.
+	 */
+	void (*set_predicted_scanout)(struct xrt_display_processor_d3d11 *xdp,
+	                              uint64_t predicted_weave_to_scanout_ns);
+
 };
 
 
@@ -576,7 +602,16 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_frame_timing)
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_window)                  == XRT_DP_D3D11_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_backend_state)           == XRT_DP_D3D11_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_scanout_caps)            == XRT_DP_D3D11_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 23 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_predicted_scanout)       == XRT_DP_D3D11_BASE_OFF + 23 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the set_predicted_scanout slot, so a plug-in
+ * can compile its per-weave forward-horizon support only where the runtime
+ * headers announce it — same coupled-ABI-addition pattern as
+ * @ref XRT_DP_D3D11_HAS_FRAME_TIMING (#206).
+ */
+#define XRT_DP_D3D11_HAS_PREDICTED_SCANOUT 1
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the set_frame_timing slot, so a plug-in
@@ -966,6 +1001,22 @@ xrt_display_processor_d3d11_set_frame_timing(struct xrt_display_processor_d3d11 
 		return;
 	}
 	xdp->set_frame_timing(xdp, weave_to_scanout_ns, frame_period_ns);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_predicted_scanout
+ * No-op if not supported (slot absent or NULL) — the DP then keeps its
+ * retrospective horizon heuristic.
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_predicted_scanout(struct xrt_display_processor_d3d11 *xdp,
+                                                  uint64_t predicted_weave_to_scanout_ns)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_predicted_scanout) || xdp->set_predicted_scanout == NULL) {
+		return;
+	}
+	xdp->set_predicted_scanout(xdp, predicted_weave_to_scanout_ns);
 }
 
 /*!

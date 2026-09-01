@@ -39,11 +39,14 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_misc.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
@@ -355,6 +358,8 @@ struct comp_gl_compositor
 		bool armed;                  //!< False on zero-copy: the atlas IS the app's texture.
 		bool app_frame_in_progress;  //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;  //!< Quiet-gate key. Never touched by a repaint.
+		struct u_repaint_gate gate;  //!< #1257 interval-aware quiet gate.
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! The 2D-under backdrop the last app frame DEPOSITED. Reused, never
 		//! re-flattened — the flatten samples the app's Local2D textures.
@@ -1980,6 +1985,9 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = now_ns + period_ns / 2;
 	*out_predicted_display_time_ns = now_ns + period_ns;
+	// #1257 partition: panel period on purpose — reporting D x period made
+	// apps pace themselves on top of the throttle (double pacing); pacing
+	// lives in the throttle alone.
 	*out_predicted_display_period_ns = period_ns;
 
 	return XRT_SUCCESS;
@@ -2004,6 +2012,25 @@ gl_compositor_wait_frame(struct xrt_compositor *xc,
                           int64_t *out_predicted_display_time,
                           int64_t *out_predicted_display_period)
 {
+	// #1257 partition: block until the app's next slot BEFORE anything else
+	// — the repaint loop keeps weaving the other slots underneath this
+	// sleep. Only here, never in predict_frame (wait_frame carries the
+	// blocking semantic). No-op unless DXR_APP_FRAME_DIVISOR >= 2.
+	{
+		struct comp_gl_compositor *c = gl_comp(xc);
+		int64_t period_ns = (int64_t)(1000000000.0 / 60.0);
+#ifdef XRT_OS_WINDOWS
+		const float hz = comp_display_refresh_hz_win(c->hwnd);
+		if (hz > 1.0f) {
+			period_ns = (int64_t)(1000000000.0 / hz);
+		}
+#endif
+		// This in-process tier is UNSUPPORTED (see u_app_partition.h) —
+		// the throttle refuses cleanly unless the bring-up override is set.
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns,
+		                         /*tier_supported=*/false);
+	}
+
 	int64_t wake, gpu_time;
 	return gl_compositor_predict_frame(xc, out_frame_id, &wake, &gpu_time,
 	                                    out_predicted_display_time,
@@ -3959,6 +3986,11 @@ gl_repaint_thread(void *ptr)
 {
 	struct comp_gl_compositor *c = (struct comp_gl_compositor *)ptr;
 
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("gl");
+#endif
+
 	while (os_thread_helper_is_running(&c->repaint_thread)) {
 		// GL keeps no cached refresh rate; query the window's (cheap, cached
 		// inside the helper) and fall back to 60 Hz off-Windows / on failure.
@@ -3971,7 +4003,10 @@ gl_repaint_thread(void *ptr)
 #endif
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
+		                                                                   : period_ns / 4));
 		if (!os_thread_helper_is_running(&c->repaint_thread)) {
 			break;
 		}
@@ -3986,8 +4021,11 @@ gl_repaint_thread(void *ptr)
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			continue;
 		}
+		// #1257: interval-aware gate — one missed vblank when the measured
+		// app cadence is stable and slow, the legacy 2-period constant
+		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			continue;
 		}
 
@@ -3999,8 +4037,10 @@ gl_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4052,6 +4092,7 @@ gl_repaint_thread(void *ptr)
 #endif
 
 		c->repaint.count++;
+		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -4795,6 +4836,7 @@ gl_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 		// Only a REAL frame resets the quiet-gate.
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	// Cache eye positions AFTER process_atlas (which updates the SR weaver's
@@ -6036,7 +6078,10 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		 * With the race closed, 8/8 automated launch verifications + hardware
 		 * eyeball pass; the old eliminated-suspects list lives in #885.
 		 */
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: settings chain (env > per-user > machine) — the Control
+		// Panel's Compatibility mode turns this off. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), NULL);
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;

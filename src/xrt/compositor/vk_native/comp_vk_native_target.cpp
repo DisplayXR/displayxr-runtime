@@ -43,9 +43,88 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 
 // Portable (all OSes) — the witness is exactly for paths/platforms the
 // Windows-only latency harness cannot measure.
+#include "util/comp_vblank_grid.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+
+
+//! Float-valued sysprop; default on unset or unparseable.
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(name, buf) <= 0) {
+		return default_val;
+	}
+	char *end = NULL;
+	const float v = strtof(buf, &end);
+	return (end == buf || !std::isfinite(v)) ? default_val : v;
+}
+#else
+/*
+ * Non-Android: there are no sysprops, so every lookup is the default. Defined
+ * rather than left absent because the CALL SITES are unconditional — a helper
+ * that exists only under XRT_OS_ANDROID while its callers do not is a build
+ * break on every other platform, which is exactly how this file reached CI
+ * broken (the Android-only local builds could never see it).
+ */
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	(void)name;
+	return default_val;
+}
+#endif
+
+
+//! Diagnostic gate for the periodic #206 residual row — see the compositor's
+//! dxr_weave_cadence_trace() for the reasoning. The residual MEASUREMENT is
+//! always taken (it feeds comp_vk_native_target_weave_to_scanout_ns); only the
+//! ~5 s WARN row is gated, since WARN is reserved for one-off events.
+static bool
+dxr_weave_cadence_trace_target(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0;
+		const char *e = getenv("DXR_WEAVE_CADENCE_TRACE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.weave_cadence_trace", sp) > 0 &&
+			    sp[0] == '1') {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
+/*
+ * Forward declaration: the Windows-only late-weave call sites (the earliest is
+ * ~line 713) precede this helper's definition further down the file. Android
+ * and macOS compile those sites out, so their first use already followed the
+ * definition and the omission was invisible on both — it broke only the Windows
+ * build, which is why local Android/macOS builds could not catch it.
+ */
+static bool
+dxr_late_weave_enabled();
+
+#ifdef XRT_OS_ANDROID
+// POSIX, and used ONLY by the Android frame-rate pin below
+// (dlopen("libandroid.so") for ANativeWindow_setFrameRate, which is API 30/31
+// against minSdk 29). Unguarded it breaks the Windows build, which has no
+// dlfcn.h — and this file IS compiled on Windows.
+#include <dlfcn.h>
+#endif
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -218,19 +297,6 @@ dxr_surface_lost_latch_enabled(void)
  * D3D11 frame-latency waitable. The whole record+weave+submit+present then
  * runs inside one refresh interval and the FIFO queue stays empty.
  */
-static bool
-dxr_late_weave_enabled()
-{
-	static int enabled = -1;
-	if (enabled < 0) {
-		// Default ON: late-weave is the product behavior on every path
-		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
-		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
-	}
-	return enabled == 1;
-}
 
 // #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1). N>1 paces on the
 // present N-1 back, restoring N-1 frames of CPU/GPU overlap on a saturated
@@ -366,6 +432,74 @@ struct comp_vk_native_target
 	//! decide whether to recreate, which every extent change requires.
 	int last_display_landscape;
 #endif
+
+	/*!
+	 * #868/#902 Android: the vblank grid fed from VK_GOOGLE_display_timing.
+	 *
+	 * Adreno exposes no VK_KHR_present_wait, so the blocking pacing primitive
+	 * below never resolves there and both late weave and the repaint loop fall
+	 * back to an open-loop guess against a hardcoded refresh rate — while the
+	 * platform switches the panel across [60, 90, 120, 144] underneath them.
+	 * This is the retrospective substitute: where presents actually landed,
+	 * plus a measured period, projected forward. Untrusted until both halves
+	 * exist and are fresh; see comp_vblank_grid.h.
+	 */
+	struct comp_vblank_grid vblank_grid;
+	//! Cached vkGetRefreshCycleDurationGOOGLE result; re-read on recreate.
+	bool refresh_cycle_probed;
+	//! One-shot check that the driver's present timestamps share our clock.
+	bool timebase_checked;
+	bool timebase_ok;
+	//! Present id for VkPresentTimesInfoGOOGLE tagging. Cross-platform: the
+	//! present_id_counter below is inside the Windows block, and this path is
+	//! specifically for platforms that have no present_wait.
+	uint32_t display_timing_present_id;
+	/*!
+	 * #902 late weave: a DECAYING HIGH-WATER estimate of how long a weave
+	 * takes, acquire to present-return.
+	 *
+	 * Deliberately not an EMA. This is a BUDGET, and the cost of
+	 * underestimating it is asymmetric: too small and the weave misses the
+	 * vblank it was aimed at, costing a whole frame; too large and it merely
+	 * starts a little early, which is exactly today's behaviour. A mean would
+	 * miss roughly half the time. The slow decay lets it come back down when
+	 * the scene gets cheaper without tracking every dip.
+	 */
+	uint64_t weave_cost_ns;
+	//! Set at acquire, consumed after present, to measure the above.
+	uint64_t weave_start_ns;
+	//! One-shot log guard for the late-weave tier engaging.
+	bool late_weave_grid_logged;
+
+	/*!
+	 * #206-on-Android: the TRUE weave->scanout residual.
+	 *
+	 * Not the same as the grid's time-to-next-vblank. That is a lower bound —
+	 * it assumes the frame scans out at the very next vblank, which only holds
+	 * when nothing is queued ahead of it. Whenever presents queue (and at ~36
+	 * fps on a 60 Hz panel they do) the real residual is one or more whole
+	 * periods larger.
+	 *
+	 * This is the quantity the vendor eye predictor actually needs: CNSDK's
+	 * facePredictLatencyMs is "how far past NOW to extrapolate", measured from
+	 * the GetPrimaryFace call inside the weave to the moment those pixels are
+	 * lit. Measured by correlating our own presentID with the actualPresentTime
+	 * the driver later reports for it — the same shape as the R measurement
+	 * comp_weave_latency_win.h derives from DXGI statistics.
+	 */
+	struct
+	{
+		uint32_t id;
+		uint64_t weave_start_ns;
+	} residual_ring[16];
+	//! Decaying-high-water residual, ns. 0 = not yet measured.
+	uint64_t residual_ns;
+	uint32_t residual_samples;
+	uint64_t residual_last_log_ns;
+
+	//! When the refresh period was last re-read (ns). The panel is
+	//! variable-refresh, so this is polled rather than latched.
+	uint64_t refresh_last_probe_ns;
 
 #ifdef XRT_OS_WINDOWS
 	//! Weave-latency harness state (nullptr unless DXR_WEAVE_LATENCY_CSV set).
@@ -1440,6 +1574,62 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 
+	/*
+	 * Ask the platform to hold the panel at ONE refresh rate.
+	 *
+	 * The panel is variable-refresh and the platform moves it between 59.86
+	 * and 119.71 Hz on interaction — a policy tuned for scroll smoothness,
+	 * where more updates are strictly better. A 3D weave wants the opposite:
+	 * the eye grades CADENCE STABILITY, and every switch is a discontinuity
+	 * in the schedule the weave is phase-locked to. Measured across every
+	 * scheduling arm tried on this device, interval CoV sat at ~34%
+	 * regardless of what the repaint loop did; the one run that reached panel
+	 * rate (59.9 fps) was the one where no switch occurred.
+	 *
+	 * `debug.dxr.pin_frame_rate` = Hz. Unset or 0 leaves platform policy
+	 * alone, which is today's behaviour.
+	 *
+	 * HONEST LIMIT: setFrameRate is a HINT, not a pin. The platform may
+	 * ignore it, and FIXED_SOURCE at 60 can legitimately be served by a
+	 * 120 Hz mode showing each frame twice — stable, which is what we
+	 * actually want, but it will read as 119.71 in the grid. A hard pin needs
+	 * WindowManager.LayoutParams.preferredDisplayModeId on the Java side.
+	 * Resolved by dlsym because minSdk is 29 and this is API 30/31.
+	 */
+	{
+		const float want_hz = get_prop_float_local("debug.dxr.pin_frame_rate", 0.0f);
+		if (want_hz > 0.0f) {
+			void *lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+			bool applied = false;
+			if (lib != NULL) {
+				// API 31: lets us say "change modes even if not seamless",
+				// which is the whole point — a seamless-only hint is exactly
+				// what the platform is already doing.
+				using PFN_setRateCS = int32_t (*)(ANativeWindow *, float, int8_t, int8_t);
+				PFN_setRateCS with_strategy = (PFN_setRateCS)dlsym(
+				    lib, "ANativeWindow_setFrameRateWithChangeStrategy");
+				if (with_strategy != NULL) {
+					applied = with_strategy((ANativeWindow *)hwnd, want_hz,
+					                        1 /*COMPATIBILITY_FIXED_SOURCE*/,
+					                        1 /*CHANGE_FRAME_RATE_ALWAYS*/) == 0;
+				} else {
+					using PFN_setRate = int32_t (*)(ANativeWindow *, float, int8_t);
+					PFN_setRate set_rate =
+					    (PFN_setRate)dlsym(lib, "ANativeWindow_setFrameRate");
+					if (set_rate != NULL) {
+						applied = set_rate((ANativeWindow *)hwnd, want_hz,
+						                   1 /*COMPATIBILITY_FIXED_SOURCE*/) == 0;
+					}
+				}
+				dlclose(lib);
+			}
+			U_LOG_W("#902: frame-rate pin requested %.2f Hz — %s "
+			        "(debug.dxr.pin_frame_rate; a HINT, verify against the grid's "
+			        "measured refresh)",
+			        (double)want_hz, applied ? "accepted by the platform" : "NOT applied");
+		}
+	}
+
 	VkBool32 present_support = VK_FALSE;
 	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
 	                                          queue_family_index,
@@ -1839,6 +2029,279 @@ comp_vk_native_target_sync_surface(struct comp_vk_native_target *target)
 #endif
 }
 
+/*!
+ * Late-weave master switch. Product behaviour on every path (measured
+ * 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17 workspace);
+ * DXR_LATE_WEAVE=0 opts out for A/B or triage.
+ *
+ * Lives at top level rather than inside the Windows block because the #902
+ * grid tier is the Android substitute for the same lever and consults the same
+ * switch — one knob, both mechanisms, so an A/B means the same thing on either
+ * platform. Also reads the Android sysprop, since getenv reaches nothing there.
+ */
+static bool
+dxr_late_weave_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		enabled = 1;
+		const char *e = getenv("DXR_LATE_WEAVE");
+		if (e != nullptr && e[0] != '\0') {
+			enabled = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.late_weave", sp) > 0 && sp[0] != '\0') {
+				enabled = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return enabled == 1;
+}
+
+/*!
+ * #868/#902: pump the vblank grid from VK_GOOGLE_display_timing.
+ *
+ * Sits next to the present_wait probe above because it is the OTHER pacing
+ * source, chosen by what the driver offers. Two reads, called after present:
+ *
+ *  - vkGetRefreshCycleDurationGOOGLE, once per swapchain — the MEASURED panel
+ *    period. This is the half the open-loop path guessed at, and guessed wrong:
+ *    the repaint loop announces 60 Hz while the platform runs the panel at 120.
+ *  - vkGetPastPresentationTimingGOOGLE, every present — where presents ACTUALLY
+ *    landed, which anchors the grid's phase.
+ *
+ * Deliberately best-effort and non-blocking: display timing is an optimisation
+ * source, never a correctness dependency. Every failure path here leaves the
+ * grid untrusted, and an untrusted grid makes its consumers keep exactly
+ * today's behaviour rather than schedule against a fabricated clock.
+ */
+/*!
+ * #902: the measured panel period, or 0 when the grid cannot vouch for one.
+ *
+ * The 0 is the contract: the repaint loop keeps its existing behaviour rather
+ * than pacing against a value this module cannot stand behind. Callers must
+ * not substitute their own fallback for a 0 return — that is what the
+ * open-loop path already did, and it is what this exists to replace.
+ */
+/*!
+ * #206: the measured weave->scanout residual in ns, or 0 if not yet measured.
+ *
+ * NOT the same as the grid's time-to-next-vblank, and the difference is the
+ * whole point. That projection assumes the frame scans out at the very next
+ * vblank — a lower bound that only holds when nothing is queued ahead of it.
+ * Measured here at 2.5-3.4 refresh periods, so the projection would be 3x
+ * short. A vendor eye predictor fed the short value extrapolates nowhere near
+ * far enough, which presents as under-prediction: the image trailing the
+ * viewer under motion.
+ */
+extern "C" uint64_t
+comp_vk_native_target_weave_to_scanout_ns(struct comp_vk_native_target *target)
+{
+	if (target == NULL) {
+		return 0;
+	}
+	return target->residual_ns;
+}
+
+extern "C" uint64_t
+comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
+{
+	if (target == NULL) {
+		return 0;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (!comp_vblank_grid_trusted(&target->vblank_grid, now_ns)) {
+		return 0;
+	}
+	return target->vblank_grid.period_ns;
+}
+
+static void
+target_feed_vblank_grid(struct comp_vk_native_target *target)
+{
+	struct vk_bundle *vk = target->vk;
+	{
+		// One-shot: say WHY the grid never populated. A silent bail here is
+		// indistinguishable from "the extension works but the panel is idle",
+		// which is a slow thing to diagnose from the outside.
+		static bool announced = false;
+		if (!announced) {
+			announced = true;
+			U_LOG_W("#902: display-timing feeder — vk=%d has_ext=%d swapchain=%d "
+			        "get_past=%d get_refresh=%d",
+			        vk != NULL, vk != NULL ? (int)vk->has_GOOGLE_display_timing : -1,
+			        target->swapchain != VK_NULL_HANDLE,
+			        (vk != NULL && vk->vkGetPastPresentationTimingGOOGLE != NULL),
+			        (vk != NULL && vk->vkGetRefreshCycleDurationGOOGLE != NULL));
+		}
+	}
+	if (vk == NULL || !vk->has_GOOGLE_display_timing || target->swapchain == VK_NULL_HANDLE) {
+		return;
+	}
+
+	/*
+	 * Re-probe the period PERIODICALLY, not once.
+	 *
+	 * The first version asked once per swapchain on the reasoning that the
+	 * period cannot change without a recreate. That is wrong on this hardware:
+	 * the panel is variable-refresh and the platform moves it between 60 and
+	 * 120 on interaction, with no swapchain recreate involved. A once-only
+	 * probe would latch whichever rate happened to be live at startup — and
+	 * since the boost is touch-triggered, launching the app is exactly the
+	 * moment most likely to sample the WRONG one.
+	 *
+	 * Every ~500 ms: far cheaper than a frame, and fast enough that a stale
+	 * period cannot survive long enough to matter.
+	 */
+	const uint64_t probe_now_ns = os_monotonic_get_ns();
+	const bool due = !target->refresh_cycle_probed ||
+	                 (probe_now_ns - target->refresh_last_probe_ns) > (500ULL * 1000 * 1000);
+	if (due && vk->vkGetRefreshCycleDurationGOOGLE != NULL) {
+		target->refresh_cycle_probed = true;
+		target->refresh_last_probe_ns = probe_now_ns;
+		VkRefreshCycleDurationGOOGLE rc = {};
+		if (vk->vkGetRefreshCycleDurationGOOGLE(vk->device, target->swapchain, &rc) == VK_SUCCESS) {
+			const uint64_t prev = target->vblank_grid.period_ns;
+			if (comp_vblank_grid_set_period(&target->vblank_grid, rc.refreshDuration)) {
+				// Only on a CHANGE: this now runs twice a second, and a
+				// per-probe line would bury the thing worth seeing, which is
+				// the panel actually moving between rates.
+				if (prev != target->vblank_grid.period_ns) {
+					U_LOG_W("#902: display-timing grid — refresh %.3f ms (%.2f Hz)%s",
+					        rc.refreshDuration / 1e6, 1e9 / (double)rc.refreshDuration,
+					        prev == 0 ? " [initial]" : " [CHANGED]");
+				}
+			} else {
+				U_LOG_W("#902: display-timing reported an implausible refresh "
+				        "duration (%llu ns) — grid stays untrusted",
+				        (unsigned long long)rc.refreshDuration);
+			}
+		}
+	}
+
+	if (vk->vkGetPastPresentationTimingGOOGLE == NULL) {
+		return;
+	}
+
+	// Ask for the count first rather than guessing a fixed size, which would
+	// silently truncate on a driver that batches more than expected.
+	uint32_t count = 0;
+	if (vk->vkGetPastPresentationTimingGOOGLE(vk->device, target->swapchain, &count, NULL) !=
+	        VK_SUCCESS ||
+	    count == 0) {
+		return;
+	}
+	if (count > 16) {
+		count = 16;
+	}
+	VkPastPresentationTimingGOOGLE timings[16] = {};
+	if (vk->vkGetPastPresentationTimingGOOGLE(vk->device, target->swapchain, &count, timings) !=
+	    VK_SUCCESS) {
+		return;
+	}
+
+	/*
+	 * TIMEBASE GUARD. The grid projects forward from these timestamps using
+	 * os_monotonic_get_ns() as "now", which is only meaningful if the driver
+	 * reports actualPresentTime in the SAME clock. The spec ties it to
+	 * VkPresentTimeGOOGLE::desiredPresentTime, CLOCK_MONOTONIC on Android — but
+	 * a driver reporting in another domain would leave the grid looking
+	 * perfectly trusted and being entirely wrong, projecting vblanks into a
+	 * clock nobody else uses. That is the single failure this module cannot
+	 * detect on its own, so check it once, out loud, and refuse the feed
+	 * rather than schedule against a clock we do not share.
+	 */
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (!target->timebase_checked && count > 0 && timings[count - 1].actualPresentTime != 0) {
+		target->timebase_checked = true;
+		const uint64_t t = timings[count - 1].actualPresentTime;
+		const int64_t delta_ms = ((int64_t)t - (int64_t)now_ns) / 1000000;
+		// A present that already happened sits slightly BEHIND now. Anything
+		// beyond a second either way is a different clock, not jitter.
+		target->timebase_ok = (delta_ms > -1000 && delta_ms < 1000);
+		U_LOG_W("#902: display-timing timebase check — actualPresentTime %llu vs "
+		        "os_monotonic %llu (delta %lld ms) => %s",
+		        (unsigned long long)t, (unsigned long long)now_ns, (long long)delta_ms,
+		        target->timebase_ok ? "SAME CLOCK, grid usable"
+		                            : "DIFFERENT CLOCK — grid refused");
+	}
+	if (target->timebase_checked && !target->timebase_ok) {
+		return;
+	}
+
+	// Records can arrive out of order; observe() only ever moves the anchor
+	// forward, so feeding them in whatever order the driver returns is safe.
+	for (uint32_t i = 0; i < count; i++) {
+		comp_vblank_grid_observe(&target->vblank_grid, timings[i].actualPresentTime);
+
+		// #206: resolve this record against the weave that produced it.
+		const uint32_t slot = timings[i].presentID % 16;
+		if (target->residual_ring[slot].id != timings[i].presentID) {
+			continue; // ring wrapped past it; not an error, just too old
+		}
+		const uint64_t started = target->residual_ring[slot].weave_start_ns;
+		if (started == 0 || timings[i].actualPresentTime <= started) {
+			continue;
+		}
+		const uint64_t r = timings[i].actualPresentTime - started;
+		if (r > 200ULL * 1000 * 1000) {
+			continue; // a stalled frame is not a latency measurement
+		}
+		/*
+		 * The LAST MEASURED sample, per frame — not a high-water.
+		 *
+		 * This previously kept a high-water with slow decay, on the reasoning
+		 * that under-predicting produces visible judder so the estimate should
+		 * lean pessimistic. That reasoning is correct for a WEAVE BUDGET
+		 * (reserving too much time is safe; missing a deadline is not) and
+		 * WRONG for a PREDICTION HORIZON, where the asymmetry runs the other
+		 * way: over-predicting extrapolates the head past where it actually
+		 * goes and overshoots at every turnaround, which reads as a hard 3D
+		 * break, while under-predicting merely lags and reads as softness.
+		 *
+		 * Measured, not assumed. With the true horizon fixed at 35 ms and the
+		 * value FED to the predictor swept, over a labelled capture set (171
+		 * turnaround + 26 onset events, both light levels), turnaround p90:
+		 *
+		 *     fed 25 ms (-10)  0.096      fed 35 ms (truth)  0.073
+		 *     fed 45 ms (+10)  0.109      fed 50 ms (+15)    0.139
+		 *
+		 * The minimum sits at the truth, and a +10 ms error costs ~13% more
+		 * than a -10 ms one. Rest jitter also rises monotonically with the fed
+		 * value (0.777 -> 0.921 across the sweep), so an inflated horizon costs
+		 * even when nothing is moving. A high-water is biased in the expensive
+		 * direction by construction.
+		 *
+		 * Deliberately unsmoothed: the residual is bimodal on GPU governor
+		 * state (p50 42.9 ms vs 29.1 ms) and shifts mid-session, so an average
+		 * over a window spanning a governor change is a number that was never
+		 * true at any instant.
+		 */
+		target->residual_ns = r;
+		target->residual_samples++;
+	}
+
+	// Report it periodically. This is the number the whole CNSDK horizon
+	// question turns on — whether the vendor's hardcoded 40 ms matches what
+	// this pipeline actually does — so it is worth saying out loud rather
+	// than only exposing through an accessor nobody reads yet.
+	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
+	    target->vblank_grid.period_ns != 0) {
+		const uint64_t now2 = os_monotonic_get_ns();
+		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
+			target->residual_last_log_ns = now2;
+			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
+			        "(%.2f refresh periods, n=%u)",
+			        target->residual_ns / 1e6,
+			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
+			        target->residual_samples);
+		}
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
 /*
  * Lazily create the harness on first present (env-gated). Returns nullptr
@@ -1864,6 +2327,8 @@ target_present_wait_fn(struct comp_vk_native_target *target)
 	}
 	return target->present_wait_fn;
 }
+
+
 
 static struct wl_harness *
 wl_get(struct comp_vk_native_target *target)
@@ -2241,7 +2706,17 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// faults inside the Adreno driver (SIGSEGV at 0x0 in AcquireNextImageKHR, reached
 	// from vk_repaint_thread). Every caller already handles the error return, so
 	// failing here is strictly better than a null dereference one frame later.
-	if (target->swapchain == VK_NULL_HANDLE) {
+	//
+	// EXCEPTION — the Windows DComp bridge. On that path VK never goes through WSI
+	// at all (see the @ref dcomp_active doc block): the compositor renders into the
+	// imported ring and the branch below returns a ring index without ever calling
+	// vkAcquireNextImageKHR, so target->swapchain is legitimately VK_NULL_HANDLE.
+	// Guarding it there fails EVERY frame of EVERY transparent-window app.
+	bool needs_vk_swapchain = true;
+#ifdef XRT_OS_WINDOWS
+	needs_vk_swapchain = !target->dcomp_active;
+#endif
+	if (needs_vk_swapchain && target->swapchain == VK_NULL_HANDLE) {
 #ifdef XRT_OS_ANDROID
 		// Latch so sync_surface reports LOST and the compositor skips frames until
 		// the next surface generation, rather than retrying into the same hole.
@@ -2258,6 +2733,61 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		U_LOG_E("acquire with no swapchain (#1236)");
 #endif
 		return XRT_ERROR_VULKAN;
+	}
+
+	/*
+	 * #902 LATE WEAVE, grid flavour.
+	 *
+	 * The present_wait tier BLOCKS until the previous present hits glass and
+	 * weaves immediately after. Display timing cannot block — it is
+	 * retrospective — so the equivalent is to compute where the next vblank
+	 * is and sleep until just enough time remains to weave into it.
+	 *
+	 * Unlike the repaint pacing change, this adds NO GPU work: it moves when
+	 * a weave starts, not how many happen. The failure mode is therefore
+	 * bounded — a bad estimate weaves early, which is precisely the current
+	 * behaviour — and it cannot overcommit the queue the way chasing the
+	 * panel's boost did.
+	 *
+	 * Skipped entirely where present_wait exists; that tier is better (it is
+	 * a real sync point rather than a projection) and this is its substitute,
+	 * not its competitor.
+	 */
+	bool have_present_wait = false;
+#ifdef XRT_OS_WINDOWS
+	// present_wait is the better tier where it exists — a real sync point
+	// rather than a projection — so the grid stands down for it.
+	have_present_wait = (target_present_wait_fn(target) != NULL);
+#endif
+	if (dxr_late_weave_enabled() && !have_present_wait) {
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const uint64_t next_vblank =
+		    comp_vblank_grid_next_vblank_after(&target->vblank_grid, now_ns);
+		const uint64_t period_ns = target->vblank_grid.period_ns;
+		if (next_vblank != 0 && period_ns != 0) {
+			// Margin covers scheduler wake jitter. Cheap insurance: being a
+			// millisecond early costs a millisecond of staleness, being a
+			// millisecond late costs a whole refresh.
+			const uint64_t margin_ns = 1500ULL * 1000;
+			const uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+			if (next_vblank > now_ns + budget_ns) {
+				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
+				// Never sleep past one period, whatever the grid says. A
+				// wrong anchor must cost at most a frame, not a stall — the
+				// lesson from the boost-chasing wedge.
+				if (sleep_ns > period_ns) {
+					sleep_ns = period_ns;
+				}
+				os_nanosleep((int64_t)sleep_ns);
+			}
+			if (!target->late_weave_grid_logged) {
+				target->late_weave_grid_logged = true;
+				U_LOG_W("#902: late weave on the measured grid — period %.3f ms, "
+				        "weave budget %.3f ms (no present_wait on this device)",
+				        period_ns / 1e6, budget_ns / 1e6);
+			}
+		}
+		target->weave_start_ns = os_monotonic_get_ns();
 	}
 
 #ifdef XRT_OS_WINDOWS
@@ -2519,6 +3049,13 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		target->last_present_id = 0;
 #endif
 
+		// #902: the grid's PHASE is meaningless across a new swapchain, but
+		// the panel's period usually is not — reset_phase keeps the period so
+		// the grid re-anchors on the first present instead of re-probing.
+		// refresh_cycle_probed clears too: a recreate can follow a mode change.
+		comp_vblank_grid_reset_phase(&target->vblank_grid);
+		target->refresh_cycle_probed = false;
+
 		{
 			// Same lifetime guard as comp_vk_native_target_resize. This
 			// path runs under the compositor lock, but the compositor
@@ -2662,7 +3199,70 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 #endif
 
+	/*
+	 * #902: tag the present so the driver RECORDS its timing.
+	 *
+	 * vkGetPastPresentationTimingGOOGLE only reports presents that carried a
+	 * VkPresentTimesInfoGOOGLE — an untagged present is simply not recorded,
+	 * which is why the feeder can read a valid refresh period and still never
+	 * receive a single observation. That failure is silent and looks exactly
+	 * like an idle panel.
+	 *
+	 * desiredPresentTime stays 0: we are asking for FEEDBACK, not scheduling.
+	 * Supplying a target here would make the driver hold the frame, which is
+	 * the opposite of what late weave wants.
+	 *
+	 * Mutually exclusive with the VkPresentIdKHR chain above by construction —
+	 * that one only builds on a path where present_wait resolved, and this
+	 * extension only matters where it did not.
+	 */
+	VkPresentTimeGOOGLE present_time = {};
+	VkPresentTimesInfoGOOGLE present_times = {};
+	if (vk->has_GOOGLE_display_timing && present_info.pNext == NULL) {
+		present_time.presentID = ++target->display_timing_present_id;
+		present_time.desiredPresentTime = 0;
+		present_times.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
+		present_times.swapchainCount = 1;
+		present_times.pTimes = &present_time;
+		present_info.pNext = &present_times;
+		// Remember when THIS present's weave began, so the timing record the
+		// driver publishes for this id can be turned into a real residual.
+		const uint32_t slot = present_time.presentID % 16;
+		target->residual_ring[slot].id = present_time.presentID;
+		target->residual_ring[slot].weave_start_ns = target->weave_start_ns;
+	}
+
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
+
+	// #868/#902: anchor the vblank grid on what actually reached the panel.
+	// After the present, so the driver has the record; best-effort, so a
+	// failure here never affects the present's own result.
+	if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
+		target_feed_vblank_grid(target);
+
+		/*
+		 * #902: update the weave-cost budget the late-weave sleep aims with.
+		 *
+		 * Decaying high-water rather than a mean, because this is a deadline:
+		 * overshooting the vblank costs a whole refresh, undershooting costs
+		 * only a little staleness. Rise immediately to any larger cost; decay
+		 * ~2% per frame so a cheaper scene is followed within a second or so
+		 * without chasing individual dips.
+		 */
+		if (target->weave_start_ns != 0) {
+			const uint64_t cost = os_monotonic_get_ns() - target->weave_start_ns;
+			// Ignore absurd samples: a preempted thread or a swapchain
+			// recreate mid-frame is not a weave cost.
+			if (cost < 100ULL * 1000 * 1000) {
+				if (cost > target->weave_cost_ns) {
+					target->weave_cost_ns = cost;
+				} else {
+					target->weave_cost_ns -= target->weave_cost_ns / 50;
+				}
+			}
+			target->weave_start_ns = 0;
+		}
+	}
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
@@ -2867,6 +3467,13 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	target->present_id_counter = 0;
 	target->last_present_id = 0;
 #endif
+
+	// #902: the grid's PHASE is meaningless across a new swapchain, but
+	// the panel's period usually is not — reset_phase keeps the period so
+	// the grid re-anchors on the first present instead of re-probing.
+	// refresh_cycle_probed clears too: a recreate can follow a mode change.
+	comp_vblank_grid_reset_phase(&target->vblank_grid);
+	target->refresh_cycle_probed = false;
 
 	// The crash this exists to stop: below, target->swapchain is set to
 	// VK_NULL_HANDLE before create_swapchain repopulates it, and the repaint

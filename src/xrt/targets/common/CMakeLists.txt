@@ -17,6 +17,12 @@ add_library(
 			    target_plugin_path_guard.c target_plugin_path_guard.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
+# #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
+# aux_vk) to fingerprint-check VK DP plug-ins. Linked here so every consumer
+# of the loader resolves it; guarded because aux_vk only exists with Vulkan.
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(target_lists PRIVATE aux_vk)
+endif()
 target_include_directories(target_lists PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # target_plugin_loader.c uses dlopen/dlsym on non-Windows for the

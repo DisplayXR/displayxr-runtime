@@ -11,6 +11,8 @@
  *
  *   Tier 0  runtime / plug-in / display dashboard + self-test + copy diagnostics
  *   Tier 1  display-processor switch via the PreferredPlugin override
+ *   #918    GPU topology — does the weave cross adapters to reach the panel?
+ *   #1252   Performance: Target GPU, Mode, Diagnostics (via `displayxr-cli perf`)
  *
  * @author David Fattal
  */
@@ -189,6 +191,35 @@ struct claim_row
 	int pw, ph, left, top;
 };
 
+//! One hardware adapter from the #918 GPU-topology probe (`info --json` → `gpu.adapters`).
+struct gpu_row
+{
+	char name[128];
+	char luid[32]; // "00000000:00024f0b"
+	int vram_mb;
+};
+
+#define MAX_GPUS 8
+
+/*!
+ * One allow-listed performance lever (`info --json` → `performance.levers`).
+ *
+ * `source` is carried, never dropped: "env" means the value came from the
+ * environment of the `displayxr-cli` child this panel spawned — which inherits
+ * the panel's own environment and says nothing about any other process —
+ * whereas "user" / "machine" / "default" are machine-wide and DO describe what
+ * a newly launched app will see. The UI states which.
+ */
+struct setting_row
+{
+	char name[64];
+	char value[128]; // empty = unset
+	bool set;
+	char source[16];
+};
+
+#define MAX_SETTINGS 16
+
 struct panel_state
 {
 	// info
@@ -207,6 +238,34 @@ struct panel_state
 	double vx, vy, vz;
 	int et_modes, et_def;
 	char et_supported_label[64], et_default_label[32];
+
+	// GPU topology (#918). Machine facts…
+	bool gpu_probed;
+	char gpu_note[128];
+	char gpu_verdict[192];
+	bool gpu_split_applies;
+	int n_gpus;
+	struct gpu_row gpus[MAX_GPUS];
+	bool gpu_scanout_resolved, gpu_render_resolved, gpu_ingest_resolved;
+	char gpu_scanout_name[128], gpu_scanout_luid[32];
+	char gpu_render_name[128], gpu_render_luid[32];
+	char gpu_ingest_name[128], gpu_ingest_luid[32], gpu_ingest_provenance[64];
+	// …and, kept separate on purpose, the CONFIGURED half: resolved through
+	// the settings chain, so each carries a source. "env" means the CLI
+	// child's environment (which is this panel's) and describes no other
+	// process; the rest are machine-wide. The GPU section states which.
+	char gpu_weave[64]; // empty = unset
+	bool gpu_weave_set;
+	char gpu_weave_source[16]; // env / user / machine / default
+	char gpu_ingress[32];
+	char gpu_service_split[160];
+
+	// Performance settings (#1252) — what the three controls below read and
+	// write. Each row carries its provenance.
+	int n_settings;
+	struct setting_row settings[MAX_SETTINGS];
+	char settings_user_file[512];
+	char settings_user_written[32];
 
 	// selftest
 	bool have_selftest;
@@ -259,6 +318,22 @@ refresh_info(struct panel_state *s)
 	s->have_display = false;
 	s->ar_queried = false;
 	s->info_err[0] = '\0';
+	// Refresh is idempotent: n_gpus must be cleared or every click appends
+	// another copy of the adapter list until MAX_GPUS.
+	s->gpu_probed = false;
+	s->n_gpus = 0;
+	s->gpu_scanout_resolved = false;
+	s->gpu_render_resolved = false;
+	s->gpu_ingest_resolved = false;
+	s->gpu_weave_set = false;
+	s->gpu_weave[0] = '\0';
+	s->gpu_weave_source[0] = '\0';
+	s->gpu_ingress[0] = '\0';
+	s->gpu_service_split[0] = '\0';
+	s->n_settings = 0;
+	s->settings_user_written[0] = '\0';
+	s->gpu_note[0] = '\0';
+	s->gpu_verdict[0] = '\0';
 
 	char out[16384];
 	if (!run_cli("info --json", out, sizeof(out)) || out[0] == '\0') {
@@ -317,6 +392,77 @@ refresh_info(struct panel_state *s)
 			s->et_def = (int)get_num(et, "default_mode");
 			cpy_str(s->et_supported_label, sizeof(s->et_supported_label), et, "supported_label");
 			cpy_str(s->et_default_label, sizeof(s->et_default_label), et, "default_label");
+		}
+	}
+
+	// #918 GPU topology. Absent off-Windows, and `probed` false when DXGI
+	// could not answer — both render as one line rather than an empty table.
+	const cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "gpu");
+	if (cJSON_IsObject(g)) {
+		s->gpu_probed = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "probed"));
+		cpy_str(s->gpu_note, sizeof(s->gpu_note), g, "note");
+		cpy_str(s->gpu_verdict, sizeof(s->gpu_verdict), g, "verdict");
+		s->gpu_split_applies = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(g, "split_applies"));
+
+		const cJSON *arr = cJSON_GetObjectItemCaseSensitive(g, "adapters");
+		const cJSON *it = NULL;
+		cJSON_ArrayForEach(it, arr)
+		{
+			if (s->n_gpus >= MAX_GPUS) {
+				break;
+			}
+			struct gpu_row *row = &s->gpus[s->n_gpus++];
+			cpy_str(row->name, sizeof(row->name), it, "name");
+			cpy_str(row->luid, sizeof(row->luid), it, "luid");
+			row->vram_mb = (int)get_num(it, "dedicated_vram_mb");
+		}
+
+		const cJSON *sc = cJSON_GetObjectItemCaseSensitive(g, "scanout");
+		if (sc != NULL) {
+			s->gpu_scanout_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(sc, "resolved"));
+			cpy_str(s->gpu_scanout_name, sizeof(s->gpu_scanout_name), sc, "name");
+			cpy_str(s->gpu_scanout_luid, sizeof(s->gpu_scanout_luid), sc, "luid");
+		}
+		const cJSON *rd = cJSON_GetObjectItemCaseSensitive(g, "render");
+		if (rd != NULL) {
+			s->gpu_render_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(rd, "resolved"));
+			cpy_str(s->gpu_render_name, sizeof(s->gpu_render_name), rd, "name");
+			cpy_str(s->gpu_render_luid, sizeof(s->gpu_render_luid), rd, "luid");
+		}
+		const cJSON *ig = cJSON_GetObjectItemCaseSensitive(g, "service_ingest");
+		if (ig != NULL) {
+			s->gpu_ingest_resolved = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ig, "resolved"));
+			cpy_str(s->gpu_ingest_name, sizeof(s->gpu_ingest_name), ig, "name");
+			cpy_str(s->gpu_ingest_luid, sizeof(s->gpu_ingest_luid), ig, "luid");
+			cpy_str(s->gpu_ingest_provenance, sizeof(s->gpu_ingest_provenance), ig, "provenance");
+		}
+		const cJSON *sp = cJSON_GetObjectItemCaseSensitive(g, "split");
+		if (sp != NULL) {
+			s->gpu_weave_set = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(sp, "weave_on_scanout_set"));
+			cpy_str(s->gpu_weave, sizeof(s->gpu_weave), sp, "weave_on_scanout");
+			cpy_str(s->gpu_weave_source, sizeof(s->gpu_weave_source), sp, "weave_on_scanout_source");
+			cpy_str(s->gpu_ingress, sizeof(s->gpu_ingress), sp, "ingress");
+			cpy_str(s->gpu_service_split, sizeof(s->gpu_service_split), sp, "service_split");
+		}
+	}
+
+	// #1252 performance levers, each with its provenance.
+	const cJSON *pf = cJSON_GetObjectItemCaseSensitive(root, "performance");
+	if (cJSON_IsObject(pf)) {
+		cpy_str(s->settings_user_file, sizeof(s->settings_user_file), pf, "user_file");
+		cpy_str(s->settings_user_written, sizeof(s->settings_user_written), pf, "user_written");
+		const cJSON *arr = cJSON_GetObjectItemCaseSensitive(pf, "levers");
+		const cJSON *it = NULL;
+		cJSON_ArrayForEach(it, arr)
+		{
+			if (s->n_settings >= MAX_SETTINGS) {
+				break;
+			}
+			struct setting_row *row = &s->settings[s->n_settings++];
+			cpy_str(row->name, sizeof(row->name), it, "name");
+			cpy_str(row->value, sizeof(row->value), it, "value");
+			cpy_str(row->source, sizeof(row->source), it, "source");
+			row->set = row->value[0] != '\0';
 		}
 	}
 
@@ -499,6 +645,83 @@ dp_action(struct panel_state *s, const char *args)
 	refresh_claims(s); // the override changed which DP binds each display (#793)
 }
 
+/*!
+ * Write one performance lever through `displayxr-cli perf` (#1252).
+ *
+ * The panel deliberately does not write the settings file itself: one writer,
+ * the same shape as `dp use` / `dp reset`, and the GUI keeps no runtime
+ * knowledge (#378). `refresh_info` afterwards re-reads the resolved state, so
+ * what the UI shows is always what the chain resolved — never what we assumed
+ * the click did.
+ */
+static void
+perf_action(struct panel_state *s, const char *args)
+{
+	char out[2048];
+	if (run_cli(args, out, sizeof(out))) {
+		char *nl = strchr(out, '\n');
+		if (nl != NULL) {
+			*nl = '\0';
+		}
+		snprintf(s->last_action, sizeof(s->last_action), "%s", out[0] ? out : "(done)");
+	} else {
+		snprintf(s->last_action, sizeof(s->last_action), "Failed to run: displayxr-cli %s", args);
+	}
+	refresh_info(s);
+}
+
+//! Resolved value of one lever, or "" when nothing set it.
+static const char *
+setting_value(const struct panel_state *s, const char *name)
+{
+	for (int i = 0; i < s->n_settings; i++) {
+		if (strcmp(s->settings[i].name, name) == 0) {
+			return s->settings[i].value;
+		}
+	}
+	return "";
+}
+
+//! Provenance of one lever ("env"/"user"/"machine"/"default"), or "".
+static const char *
+setting_source(const struct panel_state *s, const char *name)
+{
+	for (int i = 0; i < s->n_settings; i++) {
+		if (strcmp(s->settings[i].name, name) == 0) {
+			return s->settings[i].source;
+		}
+	}
+	return "";
+}
+
+//! Is any lever set by something other than the runtime's own default?
+static bool
+any_setting_non_default(const struct panel_state *s)
+{
+	for (int i = 0; i < s->n_settings; i++) {
+		if (s->settings[i].set) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * Is Compatibility mode in force?
+ *
+ * Derived from the resolved values rather than stored as its own key. A preset
+ * that stored its own name would drift from what the levers actually say the
+ * moment anything else wrote one of them; deriving it means the UI can never
+ * claim a mode the runtime is not in, and "Custom" falls out for free.
+ */
+static bool
+compat_mode_on(const struct panel_state *s)
+{
+	const char *split = setting_value(s, "DXR_WEAVE_ON_SCANOUT");
+	const char *repaint = setting_value(s, "DXR_WEAVE_REPAINT");
+	return split[0] == '0' && repaint[0] == '0';
+}
+
 
 /*
  *
@@ -642,7 +865,7 @@ draw_panel(struct panel_state *s)
 	// ---- Connected displays (EDID, vendor-neutral) ----
 	igSeparatorText("Connected displays (EDID)");
 	if (s->n_displays == 0) {
-		igTextDisabled("(none enumerated — Windows-only)");
+		igTextDisabled("(none enumerated - Windows-only)");
 	}
 	for (int i = 0; i < s->n_displays; i++) {
 		struct disp_row *d = &s->displays[i];
@@ -653,13 +876,14 @@ draw_panel(struct panel_state *s)
 	// ---- Resolved display → DP binding (#793) ----
 	igSeparatorText("Display -> DP binding (resolved)");
 	if (igIsItemHovered(0)) {
-		igSetTooltip("Which display processor the runtime bound to each monitor, from the per-monitor "
-		             "registry — by EDID claim confidence, or forced by the PreferredPlugin override "
-		             "below. This is the DP the compositor actually weaves with.");
+		igSetTooltip(
+		    "Which display processor the runtime bound to each monitor, from the per-monitor "
+		    "registry - by EDID claim confidence, or forced by the PreferredPlugin override "
+		    "below. This is the DP the compositor actually weaves with.");
 	}
 	if (s->n_claims == 0) {
 		igTextDisabled("(no monitor claimed by any plug-in%s)",
-		               s->claims_monitor_count > 0 ? "" : " — Windows-only");
+		               s->claims_monitor_count > 0 ? "" : " - Windows-only");
 	}
 	for (int i = 0; i < s->n_claims; i++) {
 		struct claim_row *r = &s->claims[i];
@@ -669,6 +893,209 @@ draw_panel(struct panel_state *s)
 		igSameLine(0.0f, -1.0f);
 		igTextDisabled("[%s]  apis=%s%s%s%s", r->confidence, r->apis, r->serial[0] ? "  serial=" : "",
 		               r->serial, forced ? "   (forced by override)" : "");
+	}
+
+	// ---- GPU topology (#918) ----
+	//
+	// Two kinds of fact, and the section keeps them visibly apart. The adapter
+	// list, the scanout/render/ingest adapters and the verdict are properties
+	// of the MACHINE. `DXR_WEAVE_ON_SCANOUT`, the ingress policy and the
+	// "service split" line are read from the environment of the displayxr-cli
+	// CHILD THIS PANEL SPAWNED, which inherits the panel's environment and has
+	// nothing to do with the environment a running app or the DisplayXR service
+	// was started in. Rendering the second kind as machine state is the trap
+	// docs/roadmap/control-panel-performance-settings.md exists to prevent — so
+	// it is drawn dimmed, under its own labelled sub-heading, and never in the
+	// same visual weight as the adapter list.
+	igSeparatorText("GPU topology");
+	if (igIsItemHovered(0)) {
+		igSetTooltip(
+		    "Does the woven frame have to cross adapters to reach the panel? On a hybrid "
+		    "laptop the panel is often scanned out by the integrated GPU while the app "
+		    "renders on the discrete one (#918 / ADR-037).");
+	}
+	if (!s->gpu_probed) {
+		igTextDisabled("(not probed - %s)", s->gpu_note[0] ? s->gpu_note : "Windows-only");
+	} else if (s->n_gpus <= 1) {
+		// One adapter: the whole question is moot. A table here would be noise.
+		igTextColored(COL_GREEN, "Single adapter - the weave never crosses GPUs.");
+		if (s->n_gpus == 1) {
+			igTextDisabled("%s  LUID=%s", s->gpus[0].name, s->gpus[0].luid);
+		}
+	} else {
+		for (int i = 0; i < s->n_gpus; i++) {
+			struct gpu_row *g = &s->gpus[i];
+			bool is_scanout = s->gpu_scanout_resolved && strcmp(g->luid, s->gpu_scanout_luid) == 0;
+			bool is_render = s->gpu_render_resolved && strcmp(g->luid, s->gpu_render_luid) == 0;
+			igText("[%d] %s", i, g->name);
+			igTextDisabled("    LUID=%s  %d MB dedicated%s%s", g->luid, g->vram_mb,
+			               is_scanout ? "   <- panel scanout" : "",
+			               is_render ? "   <- render (default)" : "");
+		}
+		igTextColored(s->gpu_split_applies ? COL_AMBER : COL_GREEN, "%s", s->gpu_verdict);
+		if (s->gpu_ingest_resolved) {
+			igTextDisabled("service ingest: %s (%s)", s->gpu_ingest_name, s->gpu_ingest_provenance);
+		}
+	}
+	if (s->gpu_probed) {
+		// The configured half, dimmed and with its provenance stated. "env"
+		// means THIS panel's environment, which says nothing about another
+		// process; every other source is machine-wide and does.
+		const bool weave_from_env = strcmp(s->gpu_weave_source, "env") == 0;
+		igTextDisabled("DXR_WEAVE_ON_SCANOUT=%s [%s]%s   ingress=%s",
+		               s->gpu_weave_set ? s->gpu_weave : "<unset>",
+		               s->gpu_weave_source[0] ? s->gpu_weave_source : "?",
+		               weave_from_env ? "  <- this panel's environment only" : "",
+		               s->gpu_ingress[0] ? s->gpu_ingress : "?");
+		if (s->gpu_service_split[0] != '\0') {
+			igTextDisabled("%s", s->gpu_service_split);
+		}
+		igTextDisabled(
+		    "A running app's real placement is the 'weave placement:' line in its log "
+		    "(%%LOCALAPPDATA%%\\DisplayXR\\DisplayXR_<exe>.*.log).");
+	}
+
+	// ---- Performance (#1252) ----
+	//
+	// Three controls, deliberately. There is no quality-vs-performance dial in
+	// this runtime — the defaults ARE the tuned configuration — so a
+	// Quality/Balanced/Performance menu would be fiction. What users actually
+	// have is three unrelated needs: which GPU, "is the pipeline the problem",
+	// and "I am filing a bug". They are separate axes, so they are separate
+	// controls; folding them into one dropdown would produce a combinatorial
+	// menu that is both larger and less clear.
+	//
+	// Every write goes through `displayxr-cli perf`, and the state shown is
+	// re-read from the resolved chain afterwards — never assumed from the click.
+	igSeparatorText("Performance");
+	if (igIsItemHovered(0)) {
+		igSetTooltip(
+		    "Settings the runtime reads inside each app's own process. They apply to apps "
+		    "started AFTER the change - the panel cannot reach into a running app.");
+	}
+
+	if (!s->have_info) {
+		igTextDisabled("(unavailable - displayxr-cli did not report)");
+	} else {
+		// -- 1. Target GPU. Only a real choice on a multi-adapter box; on a
+		//    single-GPU machine there is nothing to choose, so don't offer it.
+		if (s->n_gpus > 1) {
+			const char *gpu_now = setting_value(s, "DXR_D3D_FORCE_GPU");
+			igText("Target GPU");
+			igTextDisabled(
+			    "    Which adapter apps render on. 'Panel's adapter' keeps the weave local "
+			    "to the display.");
+			struct
+			{
+				const char *label;
+				const char *value; // "" = Auto (clear the setting)
+			} gpu_opts[] = {
+			    {"Auto (recommended)", ""},
+			    {"Panel's display adapter", "scanout"},
+			    {"High performance (discrete)", "dgpu"},
+			    {"Power saving (integrated)", "igpu"},
+			};
+			for (int i = 0; i < (int)(sizeof(gpu_opts) / sizeof(gpu_opts[0])); i++) {
+				const bool active = (gpu_opts[i].value[0] == '\0')
+				                        ? (gpu_now[0] == '\0')
+				                        : (strcmp(gpu_now, gpu_opts[i].value) == 0);
+				char id[96];
+				snprintf(id, sizeof(id), "%s##gpu%d", gpu_opts[i].label, i);
+				if (igRadioButton_Bool(id, active) && !active) {
+					char args[160];
+					if (gpu_opts[i].value[0] == '\0') {
+						// Both variables, so a mixed D3D/VK state cannot linger.
+						perf_action(s, "perf reset DXR_D3D_FORCE_GPU");
+						perf_action(s, "perf reset DXR_VK_FORCE_GPU");
+					} else {
+						snprintf(args, sizeof(args), "perf set DXR_D3D_FORCE_GPU %s",
+						         gpu_opts[i].value);
+						perf_action(s, args);
+						snprintf(args, sizeof(args), "perf set DXR_VK_FORCE_GPU %s",
+						         gpu_opts[i].value);
+						perf_action(s, args);
+					}
+				}
+			}
+			const char *gpu_src = setting_source(s, "DXR_D3D_FORCE_GPU");
+			if (strcmp(gpu_src, "env") == 0) {
+				igTextColored(COL_AMBER,
+				              "    An environment variable is setting this and OUTRANKS the panel.");
+			}
+			igSpacing();
+		}
+
+		// -- 2. Mode. Compatibility turns off the two levers that change what
+		//    the DISPLAY PROCESSOR is asked to do — the scanout split and the
+		//    repaint. Late weave is deliberately NOT in the bundle: it only
+		//    changes when we present on our own swapchain, it already
+		//    self-disables where the platform gives no present-timing feedback,
+		//    and it is the single largest latency win (96->17 ms on VK), so
+		//    bundling it would charge every compatibility click a 5x latency
+		//    regression on the lever least likely to be the culprit.
+		//
+		//    THE REPAINT HALF IS IN-PROCESS ONLY, and the text below says so.
+		//    `DXR_WEAVE_REPAINT` has no reader in comp_d3d11_service.cpp,
+		//    and wiring one in would be wrong rather than merely missing: the
+		//    service's render thread weaves on ITS OWN clock, so "a weave with
+		//    no new paint behind it is precisely a #868 repaint"
+		//    (comp_d3d11_service.cpp, witness_paint_seq). Repaint is what the
+		//    service pipeline IS, not a feature it opts into, so there is no
+		//    flag that could switch it off without redesigning the pacing.
+		//    Under a workspace controller only the split half of this preset
+		//    takes effect.
+		const bool compat = compat_mode_on(s);
+		igText("Mode");
+		if (igRadioButton_Bool("Balanced (default)##mode", !compat) && compat) {
+			perf_action(s, "perf reset DXR_WEAVE_ON_SCANOUT");
+			perf_action(s, "perf reset DXR_WEAVE_REPAINT");
+		}
+		if (igRadioButton_Bool("Compatibility##mode", compat) && !compat) {
+			perf_action(s, "perf set DXR_WEAVE_ON_SCANOUT 0");
+			perf_action(s, "perf set DXR_WEAVE_REPAINT 0");
+		}
+		igTextDisabled("    Compatibility turns off the cross-adapter weave split and the repaint -");
+		igTextDisabled("    for 'the 3D looks wrong, is it the pipeline?'. It COSTS latency; it is not");
+		igTextDisabled("    a faster setting. Leave it on Balanced unless you are diagnosing.");
+		igTextDisabled("    Under the workspace/shell only the split half applies: the service weaves");
+		igTextDisabled("    on its own clock, so its repaint is structural rather than a setting.");
+		igSpacing();
+
+		// -- 3. Diagnostics. Pure observers: they change no behaviour, which is
+		//    exactly what makes them safe to hand a user.
+		const bool diag = setting_value(s, "DXR_FRAME_WITNESS")[0] != '\0' ||
+		                  setting_value(s, "DXR_FRAME_STAGE_TIMING")[0] != '\0';
+		igText("Diagnostics");
+		if (igRadioButton_Bool("Off##diag", !diag) && diag) {
+			perf_action(s, "perf reset DXR_FRAME_WITNESS");
+			perf_action(s, "perf reset DXR_FRAME_STAGE_TIMING");
+		}
+		if (igRadioButton_Bool("On (for bug reports)##diag", diag) && !diag) {
+			perf_action(s, "perf set DXR_FRAME_WITNESS 5");
+			perf_action(s, "perf set DXR_FRAME_STAGE_TIMING 1");
+		}
+		igTextDisabled("    Adds frame/weave/present counters to each app's log. Changes no behaviour.");
+
+		// -- The anti-stale banner. A setting nobody remembers making is the
+		//    failure mode this whole surface has to defend against, so it is
+		//    stated loudly with the date and a one-click way out.
+		if (any_setting_non_default(s)) {
+			igSpacing();
+			igTextColored(COL_AMBER, "[!] Non-default performance settings are in force%s%s.",
+			              s->settings_user_written[0] ? " since " : "",
+			              s->settings_user_written[0] ? s->settings_user_written : "");
+			for (int i = 0; i < s->n_settings; i++) {
+				if (s->settings[i].set) {
+					igTextDisabled("      %s = %s [%s]", s->settings[i].name, s->settings[i].value,
+					               s->settings[i].source);
+				}
+			}
+			if (igButton("Reset all performance settings", (ImVec2){0, 0})) {
+				perf_action(s, "perf reset");
+			}
+			igTextDisabled("    Applies to apps started after the change. Values shown as [env] come");
+			igTextDisabled("    from an environment variable and cannot be reset from here.");
+		}
 	}
 
 	// ---- Self-test ----
@@ -713,7 +1140,7 @@ draw_panel(struct panel_state *s)
 	if (igButton("Reset to default discovery", (ImVec2){0, 0})) {
 		dp_action(s, "dp reset");
 	}
-	igTextDisabled("Switching takes effect on the next process — restart the service or relaunch your app.");
+	igTextDisabled("Switching takes effect on the next process - restart the service or relaunch your app.");
 
 	if (s->last_action[0] != '\0') {
 		igSpacing();
@@ -806,10 +1233,54 @@ main(int argc, char *argv[])
 	SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-	SDL_Window *win = SDL_CreateWindow("DisplayXR Control Panel", SDL_WINDOWPOS_CENTERED,
-	                                   SDL_WINDOWPOS_CENTERED, 760, 820,
-	                                   SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE |
-	                                       SDL_WINDOW_ALLOW_HIGHDPI);
+	/*
+	 * Default window size.
+	 *
+	 * The base is in 100%-DPI units and is SCALED BY THE DISPLAY's DPI, because
+	 * `io->FontGlobalScale` below scales the content: a fixed pixel size holds
+	 * only ~1/2.5 as much on a 250% display as it does at 100%, which is
+	 * exactly the "the window is too small" report this fixes. Scaling the
+	 * window the same way the content is scaled makes it hold the same amount
+	 * of panel at any DPI.
+	 *
+	 * Then clamped to the display's USABLE bounds (work area, taskbar
+	 * excluded), so a high scale factor can never open a window bigger than the
+	 * screen it opens on. Display 0 because the window is centred there; the
+	 * font scale below re-queries whichever display it actually landed on, and
+	 * a mismatch on a mixed-DPI multi-monitor box only affects the initial
+	 * size of a window the user can resize.
+	 */
+	int win_w = 900;
+	int win_h = 1000;
+	{
+		float dpi = 96.0f;
+		if (SDL_GetDisplayDPI(0, &dpi, NULL, NULL) == 0 && dpi > 0.0f) {
+			float s = dpi / 96.0f;
+			if (s < 1.0f) {
+				s = 1.0f;
+			}
+			if (s > 3.0f) {
+				s = 3.0f;
+			}
+			win_w = (int)((float)win_w * s);
+			win_h = (int)((float)win_h * s);
+		}
+		SDL_Rect usable;
+		if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.w > 0 && usable.h > 0) {
+			const int max_w = (int)((float)usable.w * 0.9f);
+			const int max_h = (int)((float)usable.h * 0.9f);
+			if (win_w > max_w) {
+				win_w = max_w;
+			}
+			if (win_h > max_h) {
+				win_h = max_h;
+			}
+		}
+	}
+
+	SDL_Window *win =
+	    SDL_CreateWindow("DisplayXR Control Panel", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h,
+	                     SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (win == NULL) {
 		SDL_Quit();
 		return 1;
@@ -858,7 +1329,7 @@ main(int argc, char *argv[])
 
 	struct panel_state state;
 	memset(&state, 0, sizeof(state));
-	snprintf(state.info_err, sizeof(state.info_err), "Loading… (querying displayxr-cli)");
+	snprintf(state.info_err, sizeof(state.info_err), "Loading... (querying displayxr-cli)");
 
 	// The first query (and every Refresh) spawns displayxr-cli, which loads
 	// the vendor plug-in — up to a second or two. Present one frame first so

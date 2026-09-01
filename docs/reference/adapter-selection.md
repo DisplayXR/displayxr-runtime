@@ -346,6 +346,15 @@ Neither variable has to be *guessed at*. Two places report the answer:
   not off the environment, so a value the resolver rejected (a stray trailing
   space is enough) reports as rejected instead of as applied.
 
+  **Since #1252 the provenance also names WHICH source forced it** —
+  `env-forced:` (an environment variable), `user-forced:` (the per-user store
+  the Control Panel writes) or `machine-forced:`
+  (`HKLM\Software\DisplayXR\Settings`). The variable is resolved through that
+  chain with the environment still winning, so nothing that set it before
+  changed meaning; the prefix simply stops the line claiming "env" for a value
+  that came from the panel. `displayxr-cli perf list` prints the same source
+  labels for every managed lever.
+
 - **The session log**, for what a *specific* app actually got. **Every** session
   — D3D11, D3D12, the service, Vulkan and OpenGL — logs exactly one
   `weave placement:` WARN, formatted in one place (`aux_d3d`) so it is literally
@@ -388,6 +397,14 @@ Neither variable has to be *guessed at*. Two places report the answer:
   `stage_a_failed`, `dp_refused_scanout`, `layers_unsupported`.
   `stage_a_failed` always has the specific failure spelled out in the WARN
   immediately above it.
+
+  **`killed_by_env` no longer implies an environment variable (#1252).** The
+  kill switch is resolved through the settings chain — environment, then the
+  per-user store the Control Panel writes, then the machine default — so a log
+  can read `killed_by_env` on a box where nothing sets `DXR_WEAVE_ON_SCANOUT` in
+  any environment. The token keeps its name because shipped field logs and this
+  doc are grepped for it; run `displayxr-cli perf list` to see which source
+  actually set it.
 
   `weave_on_ingest` is the companion of `presenter_ineligible` and names the
   **device** half rather than the placement half (#1172). An ineligible

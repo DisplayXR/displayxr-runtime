@@ -101,7 +101,18 @@ enum comp_split_ingress_policy
  * form.
  * @{
  */
-//! `DXR_WEAVE_ON_SCANOUT=0` (or another false spelling) — the kill switch.
+/*!
+ * `DXR_WEAVE_ON_SCANOUT=0` (or another false spelling) — the kill switch.
+ *
+ * **The token name predates #1252 and is now slightly narrower than the truth:**
+ * the kill switch is resolved through the settings chain, so it can also come
+ * from the per-user store the Control Panel writes or from the machine default,
+ * with no environment variable set anywhere. The token is deliberately NOT
+ * renamed — it is a closed-set identifier that shipped field logs and
+ * `docs/reference/adapter-selection.md` are grepped for. To find out WHICH
+ * source set it, ask `displayxr-cli perf list` (or the Control Panel), which
+ * reports the provenance.
+ */
 #define COMP_SPLIT_REASON_KILLED_BY_ENV "killed_by_env"
 //! Render adapter IS the scanout adapter; the split has nothing to do.
 #define COMP_SPLIT_REASON_SAME_ADAPTER "same_adapter"
@@ -240,6 +251,18 @@ struct comp_split_gate_inputs
 	struct comp_split_luid render_luid;
 	//! The adapter that scans out the panel. Only read when @ref scanout_resolved.
 	struct comp_split_luid scanout_luid;
+	/*!
+	 * ADR-039: engage the split even when render == scanout. The
+	 * same-adapter decline reflected the split's original purpose
+	 * (removing the cross-adapter copy); its measured load-bearing
+	 * property is the DECOUPLED FILL ENGINE — own device, own timeline,
+	 * the headroom that keeps panel-rate fill through system-wide
+	 * slowdowns — which same-adapter sessions need just as much
+	 * (#1264 S4). Caller-set (per-tier rollout: the VK compositor reads
+	 * @ref comp_split_gate_env_same_adapter; other tiers pass false
+	 * until their phase). Zero-init = false = the pre-ADR-039 decline.
+	 */
+	bool allow_same_adapter;
 };
 
 //! The gate's verdict — pure data, no side effects taken on the caller's behalf.
@@ -319,6 +342,16 @@ comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct com
  */
 bool
 comp_split_gate_env_requested(void);
+
+/*!
+ * ADR-039: the same-adapter split is DEFAULT ON (accepted for the VK tier,
+ * #1264 Phase A); `DXR_SPLIT_SAME_ADAPTER=0` is the kill switch, restoring
+ * the old same-adapter decline. Latched once per process. Feed it into
+ * @ref comp_split_gate_inputs::allow_same_adapter — per-tier: only a tier
+ * whose ADR-039 phase is accepted (or in bring-up) should consult it.
+ */
+bool
+comp_split_gate_env_same_adapter(void);
 
 /*!
  * The unlatched parser behind @ref comp_split_gate_env_requested, exposed so the

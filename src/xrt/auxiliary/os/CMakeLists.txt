@@ -33,6 +33,16 @@ else()
 	target_sources(aux_os PRIVATE os_display_edid_stubs.c)
 endif()
 
+# Desktop rect + device name of the monitor the 3D panel is on (#1301). Plain
+# MonitorFromPoint/GetMonitorInfoW, no SetupAPI, so it cannot fail the way the
+# EDID correlation can.
+target_sources(aux_os PRIVATE os_display_desktop.h)
+if(WIN32)
+	target_sources(aux_os PRIVATE os_display_desktop_win32.c)
+else()
+	target_sources(aux_os PRIVATE os_display_desktop_stubs.c)
+endif()
+
 if(APPLE)
 	target_sources(aux_os PRIVATE os_macos.c)
 endif()

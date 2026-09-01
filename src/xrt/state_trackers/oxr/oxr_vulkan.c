@@ -221,6 +221,36 @@ static const char *optional_device_extensions[] = {
     VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
 #endif
 
+#if defined(VK_GOOGLE_display_timing)
+    // The Android arm of the same lever. Adreno exposes NO present_wait /
+    // present_id (measured on the NP02J: 113 device extensions, present_wait=0,
+    // display_timing=1), so the pair above never resolves there and late weave
+    // — the single largest motion-to-photon win we have — stays dormant on the
+    // one platform that cannot fall back to a DXGI path.
+    //
+    // This extension is the Android equivalent SOURCE, but NOT an equivalent
+    // mechanism: vkWaitForPresentKHR BLOCKS until a present reaches glass,
+    // whereas display timing is retrospective — vkGetPastPresentationTimingGOOGLE
+    // reports when past presents landed and vkGetRefreshCycleDurationGOOGLE gives
+    // a measured refresh period. The consumer therefore cannot wait on it; it
+    // builds a vblank grid and schedules against it, the same shape
+    // comp_weave_latency_win.h already derives from DXGI frame statistics.
+    //
+    // Listing it here only makes it AVAILABLE to that consumer: this is the
+    // optional list, filtered against what the driver actually reports, so a
+    // device without it is unaffected. Enabling without a consumer is inert.
+    VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+#endif
+
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // ADR-039 same-adapter deposit sync: on drivers that cannot import a
+    // D3D12_FENCE timeline semaphore (Intel iGPU), the VK side of the
+    // keyed-mutex handshake rides the atlas submit
+    // (VkWin32KeyedMutexAcquireReleaseInfoKHR) — which requires this
+    // extension enabled on the APP's device.
+    VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME,
+#endif
+
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     // Desktop-background capture (runtime#757): dma-buf import on the app's
     // VkDevice so the display processor can consume PipeWire screencast
@@ -555,6 +585,9 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	bool external_semaphore_fd_enabled = false;
 #endif
 	bool image_format_list_enabled = false;
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	bool win32_keyed_mutex_enabled = false;
+#endif
 #if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
 	bool present_id_in_list = false;
 	bool present_wait_in_list = false;
@@ -581,6 +614,12 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 		if (strcmp(optional_device_extensions[i], VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME) == 0) {
 			image_format_list_enabled = true;
 		}
+
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+		if (strcmp(optional_device_extensions[i], VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) == 0) {
+			win32_keyed_mutex_enabled = true;
+		}
+#endif
 
 #if defined(VK_KHR_present_id) && defined(VK_KHR_present_wait)
 		if (strcmp(optional_device_extensions[i], VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) {
@@ -841,6 +880,12 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 #ifdef VK_KHR_image_format_list
 	if (*vulkanResult == VK_SUCCESS) {
 		sys->vk.image_format_list_enabled = image_format_list_enabled;
+	}
+#endif
+
+#if defined(VK_KHR_win32_keyed_mutex) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	if (*vulkanResult == VK_SUCCESS) {
+		sys->vk.win32_keyed_mutex_enabled = win32_keyed_mutex_enabled;
 	}
 #endif
 

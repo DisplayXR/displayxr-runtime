@@ -27,6 +27,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -60,6 +61,8 @@
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
 #include "util/u_capture_dims.h"
+#include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -560,6 +563,10 @@ struct comp_d3d11_compositor
 		bool armed;   //!< Last frame was DP-woven and not zero-copy.
 		bool app_frame_in_progress; //!< layer_begin .. layer_commit.
 		uint64_t last_app_frame_ns;
+		struct u_repaint_gate gate;   //!< #1257 interval-aware quiet gate.
+		struct u_repaint_trace trace; //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		struct u_fill_shed shed;      //!< #1264 event-absorption shed (DXR_FILL_SHED_FIRE_MS, opt-in).
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 		uint64_t count, ticks;
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -942,6 +949,8 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_d3d11_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -997,6 +1006,17 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// adding one would eat into the vsync margin and cause the pipeline
 	// to miss vsync deadlines during window drag (dropping from 60→30Hz).
 
+	// #1257 partition: the exception to the note above — an EXPLICITLY
+	// requested app slow-down (DXR_APP_FRAME_DIVISOR >= 2). Blocks until
+	// the app's next slot BEFORE the lock; the repaint loop keeps weaving
+	// the other slots underneath this sleep. No-op when unset. Supported
+	// tier = the #918 split's d3d11 fill arm (ADR-039 Phase C accepted for
+	// this leg, #1264) — keying on the split being ACTIVE couples this
+	// gate to DXR_SPLIT_SAME_ADAPTER's default by construction, exactly
+	// as the VK tier ships. In-process (split-off) sessions still refuse
+	// cleanly.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, c->split_active);
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
@@ -1016,6 +1036,11 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_d3d11_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period
+	// — the stretched period made well-behaved apps pace themselves on top
+	// of the throttle (double pacing; the app slid off its slots on vsync-
+	// blocking tiers). Pacing lives in the throttle alone; animation steps
+	// by predictedDisplayTime deltas, which stride honestly.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -1965,7 +1990,10 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 {
 	const bool zero_copy = c->repaint.zero_copy;
 	void *zc_srv = c->repaint.zc_srv;
-	const struct u_canvas_rect eff_canvas = c->repaint.canvas;
+	// #1091: not const — under the split a slot woven at its own (older) content
+	// box must be mapped onto the canvas THAT slot was painted for, never the
+	// live one. See the override in the split block below.
+	struct u_canvas_rect eff_canvas = c->repaint.canvas;
 
 	// Re-bind target RTV before DP — the renderer may have changed it to the atlas RTV.
 	// The DP writes to the currently bound render target (see xrt_display_processor_d3d11.h).
@@ -2241,6 +2269,27 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 			if (bd_srv != nullptr) {
 				comp_d3d11_target_bind(c->target);
 			}
+			/*
+			 * #1091: the canvas travels WITH the pixels. This weave is about to
+			 * map the slot's content onto a canvas rect; the slot may have been
+			 * painted for a different window size (the R2 scale-lag branch above
+			 * deliberately weaves it at its OWN content box), and mapping stale
+			 * content onto the LIVE canvas mis-magnifies it by one frame of
+			 * resize motion. That error changes every frame of a drag, which is
+			 * seen as the 3D shimmering while the window resizes smoothly —
+			 * maintainer-confirmed against a split-off control, which does not
+			 * shimmer because there the weave always consumes its own frame.
+			 * The masked composite already single-sources this from the slot
+			 * (Phase 2a / #1140, "the recipe travels with the pixels"); this is
+			 * the same rule applied to the DP call itself.
+			 */
+			if (brec.cw > 0 && brec.ch > 0) {
+				eff_canvas.valid = true;
+				eff_canvas.x = brec.cx;
+				eff_canvas.y = brec.cy;
+				eff_canvas.w = brec.cw;
+				eff_canvas.h = brec.ch;
+			}
 		}
 		/*
 		 * Crop only when the slot's content does not already fill it. A
@@ -2355,6 +2404,12 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 		    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 	}
 
+	// #206: forward-computed horizon for THIS weave, from the vsync-locked
+	// vblank grid — exact per weave, no estimator lag under variable
+	// cadence. 0 = no trusted grid ⟹ DP keeps the retrospective value.
+	xrt_display_processor_d3d11_set_predicted_scanout(
+	    c->display_processor, comp_d3d11_target_predict_weave_to_scanout_ns(c->target));
+
 	xrt_display_processor_d3d11_process_atlas(
 	    c->display_processor, d3d11_out_context(c), atlas_srv, view_width, view_height,
 	    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
@@ -2410,6 +2465,26 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	}
 	d3d11_composite_zone_mask(c, /*is_repaint=*/true, /*prepare_only=*/false, back_buffer_2d, target_width,
 	                          target_height, &eff_canvas, weave_slot);
+	/*
+	 * #1298 probe (DXR_ZONE_BLINK_PROBE=1) — one line per frame whose masked
+	 * composite did NOT run, with the #876 bail code (2 = zero region, 4 =
+	 * Local2D unavailable, 6 = draw failed, 7 = recipe mismatch). This is the
+	 * instrument that localised the Local2D resize blink: every aggregate
+	 * counter read healthy while 77-346 frames per drag bailed with code 4.
+	 * Kept, gated and off by default, because a dropped 2D band is otherwise
+	 * invisible outside the #876 diag.
+	 */
+	{
+		static int probe_b = -1;
+		if (probe_b < 0) {
+			const char *e = getenv("DXR_ZONE_BLINK_PROBE");
+			probe_b = (e != nullptr && e[0] == '1') ? 1 : 0;
+		}
+		if (probe_b == 1 && c->split_active && c->repaint.composite_bail != 0) {
+			U_LOG_W("#1298 BAIL code=%d slot=%d (no 2D composited this frame)",
+			        (int)c->repaint.composite_bail, (int)weave_slot);
+		}
+	}
 
 	/*
 	 * #868 diag: adjacent-pair hash comparison. A repaint should reproduce the
@@ -2660,6 +2735,7 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	// would pace off their own timestamps and drift below panel rate.
 	if (!is_repaint) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	return true;
@@ -2675,28 +2751,70 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 static void
 d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 {
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("d3d11");
+#endif
+
 	while (!c->repaint_quit.load(std::memory_order_relaxed)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env.
+		const uint64_t tick_ns =
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
+		os_nanosleep((int64_t)tick_ns);
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
 		}
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
+		}
+
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
+		// #1257: interval-aware gate — one missed vblank when the measured
+		// app cadence is stable and slow, the legacy 2-period constant
+		// otherwise. See u_repaint_gate.h.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
-		comp_d3d11_target_repaint_pace(c->target);
+		// #1264 event-absorption shed (opt-in): an expensive fire opened a
+		// shed window — skip this fill so stretched weaves never enter the
+		// app's slots and the phase-2 race feedback never starts. App
+		// frames are untouched by construction (this is the FILL loop).
+		if (u_fill_shed_active(&c->repaint.shed, os_monotonic_get_ns())) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
 
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots. Under an ENGAGED partition the schedule
+		// IS the pacing; skip it.
+		const uint64_t pace_t0 = os_monotonic_get_ns();
+		if (c->repaint.partition.next_release_ns == 0) {
+			comp_d3d11_target_repaint_pace(c->target);
+		}
+		const uint64_t pace_t1 = os_monotonic_get_ns();
+		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+
+		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
 
 		// app_frame_in_progress is load-bearing and is NOT bypassed by the
@@ -2705,10 +2823,15 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 
@@ -2789,6 +2912,10 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 
 		c->repaint.count++;
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+		u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
@@ -3241,6 +3368,23 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			 */
 			struct comp_xbridge_recipe r = {};
 			r.composite = false;
+			/*
+			 * #1091: stamp the CANVAS even though this frame runs no composite.
+			 * The consume half weaves a slot at the content box that slot was
+			 * painted at (the R2 scale-lag branch); if the canvas it maps that
+			 * content onto is the LIVE one, the magnification is wrong by
+			 * exactly one frame of resize motion — and since that error changes
+			 * every frame of a drag, the 3D shimmers while the window itself
+			 * moves smoothly. Carrying the canvas with the pixels makes the
+			 * woven frame internally consistent: uniformly one frame old, which
+			 * is just latency, instead of self-inconsistent, which is stutter.
+			 * The composite path already stamped this (Phase 2a); only the
+			 * projection-only path did not, so a plain 3D app got the mismatch.
+			 */
+			r.cx = eff_canvas.valid ? eff_canvas.x : 0;
+			r.cy = eff_canvas.valid ? eff_canvas.y : 0;
+			r.cw = eff_canvas.valid ? eff_canvas.w : 0;
+			r.ch = eff_canvas.valid ? eff_canvas.h : 0;
 			// The backdrop is independent of the composite: a frame can have
 			// 2D-under layers and still not run the masked pass.
 			r.bd_w = c->repaint.backdrop_w;
@@ -4066,6 +4210,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			gin.scanout_luid = d3d11_split_luid(sdesc.AdapterLuid);
 		}
 
+		// ADR-039 Phase C ACCEPTED (#1264, 2026-08-29: engage clean,
+		// partition exact, the event-immunity leg — 1-of-3 dips, steady
+		// 54-60 otherwise — and the eyeball with the planes verified:
+		// "looks good -- and ye bubble shows"). The tier now consults the
+		// accepted default (on; DXR_SPLIT_SAME_ADAPTER=0 is the kill
+		// switch); the DXR_SPLIT_SAME_ADAPTER_D3D11 bring-up env retired
+		// with the acceptance, as its contract said it would.
+		gin.allow_same_adapter = comp_split_gate_env_same_adapter();
+
 		struct comp_split_gate_result gate = {};
 		comp_split_gate_evaluate(&gin, &gate);
 		const char *reason = gate.reason;
@@ -4078,7 +4231,18 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		 */
 		const char *stage_a_token = nullptr;
 		split_off_reason = gate.short_reason;
-		if (gate.same_adapter) {
+		if (gate.same_adapter && gate.split_active) {
+			// ADR-039: same adapter, split ENGAGED anyway — the fill
+			// engine is the point, not the copy. The bridge's NT-share
+			// open is a same-adapter open (no PCIe hop), exactly the
+			// shape the VK tier's accepted Phase A record runs.
+			U_LOG_W(
+			    "D3D11 output-device split: ADR-039 same-adapter ENGAGE on "
+			    "'%ls' LUID=%08lx:%08lx — one fill engine for every tier "
+			    "(DXR_SPLIT_SAME_ADAPTER=0 reverts)",
+			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+			    (unsigned long)sdesc.AdapterLuid.LowPart);
+		} else if (gate.same_adapter) {
 			// Not a failure: on a MUX'd / single-GPU box the weave is
 			// already local, so the split has nothing to do. One INFO,
 			// no WARN.
@@ -4447,7 +4611,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		 * disabled (134 vs 141 dropouts). The app is now focus-gated and the
 		 * repaint exonerated.
 		 */
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: resolved through the settings chain (env > per-user >
+		// machine) so the Control Panel's Compatibility mode can turn the
+		// repaint off for an app it never launched. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), nullptr);
 		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;

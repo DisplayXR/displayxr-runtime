@@ -13,15 +13,12 @@
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef XRT_OS_ANDROID
-#include <sys/system_properties.h>
-#endif
 
 
 DEBUG_GET_ONCE_BOOL_OPTION(print, "XRT_PRINT_OPTIONS", false)
@@ -33,72 +30,25 @@ DEBUG_GET_ONCE_BOOL_OPTION(print, "XRT_PRINT_OPTIONS", false)
  *
  */
 
-#if defined XRT_OS_WINDOWS
-
+/*!
+ * The one place every `DEBUG_GET_ONCE_*` option is read from.
+ *
+ * Since #1252 this defers to @ref u_setting_get_raw, which checks the
+ * environment FIRST and only then the persisted stores the Control Panel
+ * writes, and only for allow-listed names. For every name not on that list —
+ * which is nearly all of them — the behaviour is bit-identical to the plain
+ * `getenv`/system-property read this used to do, because that read is now step
+ * one of the same chain.
+ *
+ * The per-platform bodies (`getenv_s`, `debug.xrt.<NAME>`, `getenv`) moved into
+ * `u_setting.c` so the hand-rolled `getenv` call sites that do NOT come through
+ * this macro family get identical platform behaviour when they are converted.
+ */
 static const char *
 get_option_raw(char *chars, size_t char_count, const char *name)
 {
-	size_t required_size;
-
-	getenv_s(&required_size, chars, char_count, name);
-	if (required_size == 0) {
-		return NULL;
-	}
-
-	return chars;
+	return u_setting_get_raw(name, chars, char_count, NULL);
 }
-
-#elif defined XRT_OS_ANDROID
-
-struct android_read_arg
-{
-	char *chars;
-	size_t char_count;
-};
-
-static void
-android_on_property_read(void *cookie, const char *name, const char *value, uint32_t serial)
-{
-	struct android_read_arg *a = (struct android_read_arg *)cookie;
-
-	snprintf(a->chars, a->char_count, "%s", value);
-}
-
-static const char *
-get_option_raw(char *chars, size_t char_count, const char *name)
-{
-	char prefixed[1024];
-	snprintf(prefixed, ARRAY_SIZE(prefixed), "debug.xrt.%s", name);
-
-	const struct prop_info *pi = __system_property_find(prefixed);
-	if (pi == NULL) {
-		return NULL;
-	}
-
-	struct android_read_arg a = {.chars = chars, .char_count = char_count};
-	__system_property_read_callback(pi, &android_on_property_read, &a);
-
-	return chars;
-}
-
-#elif defined XRT_OS_LINUX || defined XRT_OS_MACOS
-
-static const char *
-get_option_raw(char *chars, size_t char_count, const char *name)
-{
-	const char *raw = getenv(name);
-
-	if (raw == NULL) {
-		return NULL;
-	} else {
-		snprintf(chars, char_count, "%s", raw);
-		return chars;
-	}
-}
-
-#else
-#error "Please provide port of this function!"
-#endif
 
 
 static const char *

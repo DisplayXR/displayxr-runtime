@@ -1,5 +1,10 @@
 # Android Build & Test Guide
 
+> **Just want to install and run it?** You do not need this document. See
+> [android-install-demos.md](android-install-demos.md) for the end-to-end path from published
+> release artifacts to five running demos, no build environment required.
+
+
 Build and deploy DisplayXR on an Android device with a Leia 3D display.
 
 > **You probably do not need this page.** Since #1212 the runtime ships
@@ -16,6 +21,88 @@ Every `v*` release carries two Android APKs:
 |---|---|---|
 | `DisplayXR-Runtime-<ver>-android-arm64.apk` | sim-display only | no vendor display; hardware-free testing |
 | `DisplayXR-Runtime-Leia-<ver>-android-arm64.apk` | + the Leia CNSDK plug-in | **a Leia device** |
+
+**There is no separate vendor plug-in APK on Android.** On Windows the Leia plug-in
+is its own installer; on Android it is compiled *into* the runtime APK, which is why
+the choice is a choice of APK rather than a second install ([ADR-038](../adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md)).
+Pick by what the device has:
+
+- **Device with the Leia/CNSDK on-device services** (NP02J, LPD-20W …) → the **Leia**
+  APK. This is the installer's default; it is what weaves glasses-free 3D.
+- **Any other device, or hardware-free testing** → `--neutral`. The runtime comes up
+  and OpenXR apps run against `sim-display`, but nothing weaves — there is no vendor
+  display to drive.
+
+Installing the Leia APK on a device *without* those services does not give you
+weaving; the plug-in has nothing to bind to and the runtime falls back to
+sim-display. Check which one is actually live from the DisplayXR app's dashboard
+(below) — on a vendor display the active plug-in must not read `sim-display`.
+
+### The one-command install (what you almost always want)
+
+There is no `DisplayXRBundle-*.exe` for Android — every component ships as its own
+APK on its own GitHub release. `install-android-bundle.sh` is that missing
+counterpart: it reads the pins from `versions.json`, **downloads** every component
+at those versions, and hands them to `install-android.sh`.
+
+```bash
+curl -sSLO https://raw.githubusercontent.com/DisplayXR/displayxr-runtime/main/scripts/install-android-bundle.sh
+bash install-android-bundle.sh --with-browser
+```
+
+No clone needed — it fetches `versions.json` from GitHub when run outside a
+checkout. Requires `gh` (authenticated), `adb`, and a connected device.
+
+| flag | effect |
+|---|---|
+| *(none)* | runtime (**Leia** variant) + all five demos |
+| `--with-browser` | also installs the DisplayXR Browser APK |
+| `--neutral` | installs the vendor-neutral runtime instead of the Leia one |
+| `--list` | print what *would* install and exit — no device writes |
+| `--force-reinstall` | uninstall first. **Wipes app data**, including EarthView's saved Google Maps API key. Without it installs are `adb install -r` upgrades and the key survives. |
+
+Start with `--list`; it resolves every pin and prints the exact versions, so a
+wrong `versions.json` is visible before anything touches the device.
+
+**Browser fallback.** The browser's Android APK is not published on every
+release — several previews have been Windows-only. When the pinned tag carries
+no APK the script scans back through recent releases for the newest one that
+does, says so, and installs that instead. So `--with-browser` keeps working, but
+the browser version you get may lag the pin; the line it prints tells you when
+that happened.
+
+### Sending someone else an install list (non-developers)
+
+The people who most need a correct install are the ones who cannot run any of
+the above: a colleague holding only a tablet, who gets a list of links pasted
+into chat and taps them. **Generate that list, never retype it:**
+
+```bash
+./scripts/install-android-bundle.sh --links
+```
+
+It needs no device and no adb — it resolves every `versions.json` pin to its
+real release asset and prints tap-ready URLs in install order, with the
+launch-once and overlay-permission steps in place. It deliberately reads the
+**published** pins rather than the local checkout, because a stale branch would
+emit stale links that look perfectly correct at the far end.
+
+**Why this matters more than it looks.** The runtime and the browser must come
+from a *matched pair*: the client↔service check in
+`ipc_client_connection.c::ipc_client_check_git_tag` is an exact string compare,
+not a minimum-version floor. A hand-assembled list that pairs, say, runtime
+v2.14.10 with browser preview-0.1.22 fails every `xrCreateInstance` from the
+browser — and because Android demo apps run **in-process** and never cross that
+IPC boundary, the demos keep weaving while only the browser goes black. It reads
+as "the browser is broken", not "these two builds disagree". Two testers hit
+exactly this (runtime#1302).
+
+Also tell them the device floor: the Android plug-in needs on-device **Leia
+services 0.10.54+** (0.10.56+ is what we test). An older services generation
+gives the same black-3D-in-the-browser symptom from a completely different
+cause.
+
+### Installing APKs you already have
 
 Install the runtime **and** an app with:
 

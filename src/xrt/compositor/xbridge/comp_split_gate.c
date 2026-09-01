@@ -8,6 +8,8 @@
 
 #include "comp_split_gate.h"
 
+#include "util/u_setting.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -49,9 +51,37 @@ comp_split_gate_env_requested(void)
 {
 	static int enabled = -1;
 	if (enabled < 0) {
-		enabled = comp_split_gate_parse_requested(getenv("DXR_WEAVE_ON_SCANOUT")) ? 1 : 0;
+		// #1252: resolved through the settings chain (env > per-user >
+		// machine), but still handed to THIS file's parser — the leading-
+		// character test below is deliberately not debug_string_to_bool, and
+		// centralising the parse would silently change what "off" means here.
+		char buf[64];
+		const char *v = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", buf, sizeof(buf), NULL);
+		enabled = comp_split_gate_parse_requested(v) ? 1 : 0;
 	}
 	return enabled == 1;
+}
+
+bool
+comp_split_gate_env_same_adapter(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		/*
+		 * ADR-039 Phase A: DEFAULT ON — the kill switch is `=0`.
+		 *
+		 * Flipped on the complete acceptance record (#1264, 2026-08-29):
+		 * keyed-mutex smoke clean, partition D=3 exact on both bring-up
+		 * apps, the 68-window >=5-minute leg flat through 3+ of the
+		 * ~105 s events, and the eyeball on the configuration that
+		 * opened #1257. The VK tier's partition support keys on the
+		 * split being active (comp_vk_native_compositor.c), so this
+		 * default and that gate flip together by construction.
+		 */
+		const char *e = getenv("DXR_SPLIT_SAME_ADAPTER");
+		on = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return on == 1;
 }
 
 bool
@@ -106,14 +136,23 @@ comp_split_gate_evaluate(const struct comp_split_gate_inputs *inputs, struct com
 	}
 
 	if (comp_split_luid_equal(inputs->render_luid, inputs->scanout_luid)) {
-		// Not a failure: on a MUX'd / single-GPU box — or under a forced
-		// scanout-adapter selection — the weave is already local, so the split
-		// has nothing to do. The caller says so in its own words; nothing here
-		// should follow it with a fallback WARN.
 		out_result->same_adapter = true;
-		out_result->reason = COMP_SPLIT_REASON_HANDLED;
-		out_result->short_reason = COMP_SPLIT_REASON_SAME_ADAPTER;
-		return;
+		if (!inputs->allow_same_adapter) {
+			// Not a failure: on a MUX'd / single-GPU box — or under a forced
+			// scanout-adapter selection — the weave is already local, so the
+			// CROSS-ADAPTER purpose of the split has nothing to do. The
+			// caller says so in its own words; nothing here should follow it
+			// with a fallback WARN. (ADR-039 makes this branch a per-tier
+			// policy rather than a law: see allow_same_adapter.)
+			out_result->reason = COMP_SPLIT_REASON_HANDLED;
+			out_result->short_reason = COMP_SPLIT_REASON_SAME_ADAPTER;
+			return;
+		}
+		// ADR-039: engage. The split's load-bearing property is the
+		// decoupled fill engine, not the copy it was built to remove; the
+		// "bridge" ingress becomes a same-adapter shared-texture open
+		// (strictly cheaper — no PCIe hop) and everything downstream is
+		// the byte-identical hybrid arm.
 	}
 
 	out_result->out_adapter_luid = inputs->scanout_luid;

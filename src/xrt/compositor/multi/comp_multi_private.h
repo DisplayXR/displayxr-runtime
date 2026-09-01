@@ -44,6 +44,7 @@
 struct comp_target;
 struct xrt_eye_positions;
 struct xrt_weave_atlas_layout;
+struct android_custom_surface;
 struct xrt_window_metrics;
 struct xrt_system_devices;
 
@@ -645,6 +646,11 @@ struct multi_compositor
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
 		//! @}
 
+		//! Full panel extent in the CURRENT rotation (overlay extent + inset),
+		//! recorded by weave_satellite_build_swapchain. 0 until the satellite
+		//! swapchain first comes up. Feeds the OEM container-scale tell.
+		uint32_t sat_panel_w, sat_panel_h;
+
 		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)
 		//! @{
 		void *in_ahb; //!< Acquired AHardwareBuffer * (adopted from the IPC receive).
@@ -693,6 +699,51 @@ struct multi_compositor
 		bool overlay_first_use;
 		struct vk_local2d_composite overlay_blend;
 		bool overlay_blend_initialized;
+		//! @}
+
+		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
+		//! `debug.dxr.weave_satellite=1`: the woven output is blitted onto a
+		//! SERVICE-owned full-panel overlay surface (the #558 machinery) and
+		//! presented by the service; export_output then reports none, so the
+		//! caller's over-plane draws nothing and its 2D shows under the
+		//! overlay. The overlay is never container-scaled — the point: an OEM
+		//! freeform mini-window scales an in-app weave after submission
+		//! (browser#173/#186); here the weave lands after that transform.
+		//! Every failure latches sat_failed and falls back bit-for-bit.
+		//! @{
+		//! Monotonic time of the last successful weave submit (#1278). Read
+		//! by the visibility pass on the multi main loop without the weave
+		//! mutex — an aligned 64-bit read on arm64 is atomic, and the 2 s
+		//! idle threshold dwarfs any tearing/jitter concern.
+		int64_t last_submit_ns;
+		//! #1278: the idle release already fired for the current idle period.
+		//! Cleared by the next successful submit (whose weave re-asserts the
+		//! lens on its own, so no explicit resume is required for the vote).
+		bool idle_released;
+
+		bool sat_checked; //!< Prop read once per client.
+		bool sat_enabled;
+		bool sat_failed; //!< One-shot: bring-up failed, use the return path.
+		struct android_custom_surface *sat_csurface;
+		VkSurfaceKHR sat_surface;
+		VkSwapchainKHR sat_swapchain;
+		VkImage sat_images[8];
+		bool sat_image_first[8];
+		uint32_t sat_image_count;
+		uint32_t sat_w, sat_h;
+		VkSemaphore sat_acquire_sem;
+		VkSemaphore sat_done_sem;
+		VkFence sat_fence;
+		VkCommandBuffer sat_cmd;
+		//! The overlay surface's own on-screen origin. The MonadoView is laid
+		//! out BELOW the status bar (CUTOUT_SHORT_EDGES), so its swapchain is
+		//! panel-minus-insets (measured 2560x1540 on the 2560x1600 NP02J) and
+		//! its local (0,0) is NOT the panel origin. Blitting window-rect
+		//! coordinates without subtracting this displaced the weave by the
+		//! inset — a subpixel-grid mismatch that showed as a low-frequency
+		//! view-alternation beat (field report). Inferred as panel - extent,
+		//! top/left-inset assumption documented at the computation.
+		int32_t sat_off_x, sat_off_y;
 		//! @}
 	} weave;
 #endif
@@ -1054,6 +1105,19 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes);
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * Clear the weave satellite overlay to transparent (#1277 P2 lifecycle).
+ * Called on the #1278 weave-idle edge WITH mc->weave.mutex held: a client that
+ * stops submitting (covered, backgrounded, tab hidden) otherwise leaves its
+ * LAST woven frame frozen on the overlay, painted over whatever now owns the
+ * screen (measured: a stopped browser's cube floating over a fullscreen
+ * modelviewer). No-op when the satellite is not live.
+ */
+void
+comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
+#endif
 
 bool
 comp_multi_weave_export_output(struct xrt_compositor *xc,

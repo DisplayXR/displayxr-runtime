@@ -149,10 +149,11 @@ marker push.
 
 ## PHASE 3: WATCH THE BUILD
 
-Three jobs in parallel: `assert-versions-in-sync` (the drift guard
-we already pre-checked locally), `build-macos`, `build-windows`.
-Then a fourth `release` job that downloads both artifacts and
-publishes.
+Four jobs in parallel: `assert-versions-in-sync` (the drift guard
+we already pre-checked locally), `build-linux`, `build-macos`,
+`build-windows`. Then a fifth `release` job that downloads the
+artifacts and publishes. (`build-linux` was added after this skill
+was first written; v2.2.7 ran five jobs, not four.)
 
 ```bash
 # Find the workflow_dispatch run we just fired
@@ -172,10 +173,12 @@ done
 ```
 
 ### Step 3.x: Branch on per-job outcome
-- All four green → Phase 4
+- All five green → Phase 4
 - `assert-versions-in-sync` fails → STOP. Drift detected post-pre-check
   (race: someone else pushed to runtime/main between our 1.3 check and
   the CI run). User decides whether to re-run.
+- `build-linux` only fails → the `.tar.gz` is missing; re-run that job. The
+  release exists (the other build path created it). Flag.
 - `build-macos` only fails → release was already created by the
   build-windows path's `softprops/action-gh-release@v2`. Re-run macOS
   manually to attach the `.pkg`. Flag.
@@ -188,14 +191,16 @@ done
 
 ```bash
 gh release view "$TAG" -R DisplayXR/displayxr-installer \
-  --json tagName,name,assets,prerelease
+  --json tagName,name,assets,isPrerelease
 ```
 
 Confirm:
 - Tag matches `$TAG`
 - Assets contain `DisplayXRBundle-*.pkg` (macOS, non-zero size)
 - Assets contain `DisplayXRBundle-*.exe` (Windows, non-zero size)
-- Prerelease flag matches input
+- Assets contain `DisplayXRBundle-*-linux-amd64.tar.gz` (non-zero size)
+- Prerelease flag matches input (the gh field is `isPrerelease`, NOT `prerelease` —
+  the latter is rejected as an invalid field and the whole query fails)
 
 ---
 
@@ -304,9 +309,13 @@ a signature and errors out if not, so a mis-fire can't push an unsigned bundle.
 
 ```bash
 if [ "$SIGNED" = yes ]; then
+  # Stamp SINCE *BEFORE* the dispatch. Stamping it after means every candidate
+  # run has createdAt < SINCE, the filter matches nothing, and the loop burns its
+  # 20 tries and reports the mirror as failed even when it succeeded (hit for real
+  # on bundle v2.3.2). The same ordering applies to the Phase 4.5 loop above.
+  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag="$TAG"
   # Locate + watch the dispatched run so the report reflects the real outcome.
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   OD_RUN=""
   for _ in $(seq 1 20); do
     OD_RUN=$(gh run list -R DisplayXR/displayxr-installer --workflow upload-bundle-onedrive.yml \
@@ -348,6 +357,7 @@ Build:      CI run #RUN_ID  ← all 4 jobs green
 Release:    https://github.com/DisplayXR/displayxr-installer/releases/tag/$TAG
 Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
+            DisplayXRBundle-X.Y.Z-linux-amd64.tar.gz (~N MB)
 Prerelease: true/false
 Signing:    [signed → "bundle .exe signed on the provider runner (run $RID) and re-uploaded"] | [none → "⚠ bundle UNSIGNED — provider unreachable; set DXR_SIGN_REPO or ship unsigned"]  (macOS .pkg: unsigned, TODO)
 OneDrive:   [synced → "signed bundle mirrored to OneDrive (upload-bundle-onedrive.yml run $OD_RUN)"] | [failed → "⚠ OneDrive mirror failed — signed GitHub release is authoritative; retry the dispatch"] | [skipped → "not mirrored (bundle unsigned)"]

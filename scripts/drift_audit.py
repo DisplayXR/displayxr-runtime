@@ -615,6 +615,60 @@ def first_release_with_spec(ext: str, want: int, tags: list[str]) -> str | None:
     return best
 
 
+def check_unregistered_pins(report: Report) -> None:
+    """Runtime pins that exist downstream but no downstream-pins.json track claims (#1247).
+
+    The bump job only ever touches locations the manifest names, and it does so
+    silently -- an unclaimed pin is not "skipped", it is invisible. That is how
+    displayxr-leia-plugin's Android track sat at v2.8.0 while its Windows track
+    tracked current releases, and it surfaced only because a human went looking
+    after a near-miss. This check turns "someone happened to look" into a
+    standing weekly one.
+
+    We deliberately scan only repos ALREADY in the manifest: the question is not
+    "which repos pin the runtime" (that is a human decision) but "does a
+    registered repo pin it somewhere we are not maintaining".
+    """
+    import re as _re
+
+    man = json.loads((REPO_ROOT / "downstream-pins.json").read_text(encoding="utf-8"))
+    pins = man.get("runtime_tag_pins", {})
+
+    # set(KEY "v1.2.3"  /  KEY: v1.2.3 -- the two shapes the bump job understands.
+    cmake_rx = _re.compile(r'set\(\s*(DXR_RUNTIME_GIT_TAG[A-Z0-9_]*)\s+"([^"]+)"')
+    yaml_rx = _re.compile(r"(?m)^\s*(RUNTIME_REF[A-Z0-9_]*):\s*(\S+)")
+
+    for repo, spec in sorted(pins.items()):
+        claimed: set[tuple[str, str]] = set()
+        files: set[str] = {"CMakeLists.txt"}
+        for track in spec.get("tracks", {}).values():
+            for loc in track.get("locations", []):
+                claimed.add((loc["file"], loc["key"]))
+                files.add(loc["file"])
+        # Also look where a pin would plausibly be added without telling us.
+        files.update(
+            ".github/workflows/build-%s.yml" % p for p in ("windows", "linux", "android", "macos")
+        )
+
+        for f in sorted(files):
+            text = gh_raw(repo, f)
+            if text is None:
+                continue  # absent workflow (or unreadable) -- not a finding
+            rx = cmake_rx if f.endswith(("CMakeLists.txt", ".cmake")) else yaml_rx
+            for m in rx.finditer(text):
+                key, val = m.group(1), m.group(2)
+                if (f, key) in claimed:
+                    continue
+                report.add(
+                    repo,
+                    "unregistered-runtime-pin",
+                    "%s defines %s = %s, but no downstream-pins.json track claims it -- "
+                    "runtime-pin-bump.yml will never repin it and nothing will notice it "
+                    "going stale. Add a track (auto_bump=true), or auto_bump=false WITH a "
+                    "recorded reason if it is meant to lag. See #1247." % (f, key, val),
+                )
+
+
 def check_consumer_floors(report: Report) -> None:
     """Reconcile each wire-protocol consumer's real extension requirements
     against the runtime, and against whatever minimum it advertises.
@@ -875,6 +929,7 @@ def main() -> int:
     check_demo_three_pins(report)
     check_prose_versions(report, versions)
     check_consumer_floors(report)
+    check_unregistered_pins(report)
 
     # Report
     by_repo: dict[str, list[Finding]] = {}

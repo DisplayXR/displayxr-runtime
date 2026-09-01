@@ -19,6 +19,7 @@
 #include "cli_dims_check.h"
 
 #include "xrt/xrt_plugin.h"
+#include "os/os_display_desktop.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
 
@@ -78,10 +79,41 @@ enum cli_selftest_result
 	//! rejected (the classic being an ABI-rotted hand-built plug-in), which
 	//! previously reported PASS over a black screen.
 	CLI_SELFTEST_VENDOR_DP_REJECTED = 8,
+
+	/*!
+	 * Another OpenXR runtime holds `ActiveRuntime`, so apps on this box
+	 * reach IT and never reach DisplayXR — however healthy everything the
+	 * other checks probe happens to be.
+	 *
+	 * ABSENCE NEVER FAILS: an UNSET key is a PASS, which keeps CI and
+	 * from-source dev boxes (no installed runtime, no key) green. Only a
+	 * key that is set and points somewhere that is not this DisplayXR
+	 * install fails. Without this check the self-test reported a clean
+	 * sweep on a box where every app was silently loading a competing
+	 * runtime, which is exactly the report that sent someone hunting
+	 * through the compositor for a fault that was one registry value.
+	 */
+	CLI_SELFTEST_RUNTIME_HIJACKED = 9,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
 #define CLI_MAX_GPU_ADAPTERS 8
+
+//! Room for every allow-listed name in @ref u_setting (#1252), with headroom.
+#define CLI_MAX_SETTINGS 32
+
+/*!
+ * One allow-listed performance setting, resolved exactly as a process starting
+ * now would resolve it (#1252).
+ */
+struct cli_setting_row
+{
+	char name[64];
+	char value[128]; //!< Empty when nothing set it.
+	bool set;
+	//! "env" / "user" / "machine" / "default" — see @ref u_setting_source_str.
+	char source[16];
+};
 
 /*!
  * One hardware DXGI adapter, as reported by the #918 GPU-topology probe.
@@ -114,6 +146,10 @@ struct cli_query_result
 	bool active_runtime_queried;
 	bool active_runtime_set;
 	char active_runtime[1024];
+	//! False only when the key is SET and points away from this install.
+	bool active_runtime_ok;
+	//! Human verdict for the `active_runtime` self-test check.
+	char active_runtime_note[512];
 
 	/* Per-stage outcomes (mirror the self-test checks). */
 	bool instance_ok;
@@ -146,6 +182,18 @@ struct cli_query_result
 
 	/* Vendor-neutral display info (valid iff display_info_ok). */
 	struct xrt_plugin_display_info display_info;
+
+	/* #1301 — the panel monitor's FULL desktop rect + stable device name,
+	 * resolved from `display_info.display_screen_left/top` exactly the way
+	 * the runtime resolves it for `XR_DXR_display_info`. Lets `info` show
+	 * what an app would be told about where to put its window, and whether
+	 * that is a real panel or a primary-monitor fallback.
+	 * Valid iff desktop_info_ok. */
+	struct os_display_desktop_info desktop_info;
+	bool desktop_info_ok;
+	/* True when the resolved monitor's mode equals the plug-in's reported
+	 * native panel resolution — i.e. we really did land on the 3D panel. */
+	bool desktop_info_is_panel;
 
 	/* #1201 — the authoritative panel mode, so `display_dims` can PROVE the
 	 * plug-in's `display_pixel_*` instead of printing it. Windows-only:
@@ -277,8 +325,12 @@ struct cli_query_result
 	char gpu_verdict[192]; //!< the one-line verdict, reused verbatim by selftest.
 	bool gpu_weave_env_set;
 	//! DXR_WEAVE_ON_SCANOUT value when set. Since #918 Phase 3 this is a KILL
-	//! SWITCH, not an opt-in — unset means the split is allowed.
+	//! SWITCH, not an opt-in — unset means the split is allowed. Since #1252 it
+	//! is resolved through the settings chain, not `getenv` alone, so it agrees
+	//! with what the runtime will actually do; `gpu_weave_source` says where it
+	//! came from.
 	char gpu_weave_env[64];
+	char gpu_weave_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and
@@ -305,6 +357,22 @@ struct cli_query_result
 	char gpu_ingest_provenance[64]; //!< which rule decided ("most VRAM", "env-forced: scanout", …).
 	char gpu_service_ingest[224];   //!< the composed one-liner both serializers print.
 	char gpu_note[128];             //!< why the probe could not answer, when it could not.
+
+	/*!
+	 * #1252 — the allow-listed performance settings, resolved through the same
+	 * chain (env > per-user file > machine default) the runtime itself uses, so
+	 * this report says what a process starting now would actually get rather
+	 * than only what this process's environment holds.
+	 *
+	 * A row whose `source` is `"env"` came from THIS process's environment and
+	 * says nothing about any other process; `"user"` / `"machine"` / `"default"`
+	 * are machine-wide and do describe what another app will see. The Control
+	 * Panel renders that distinction rather than flattening it.
+	 */
+	uint32_t setting_count;
+	struct cli_setting_row settings[CLI_MAX_SETTINGS];
+	char settings_user_file[512];   //!< Path of the per-user store (may not exist).
+	char settings_user_written[32]; //!< ISO date it was last written, or empty.
 
 	/*!
 	 * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` reachable by the Vulkan

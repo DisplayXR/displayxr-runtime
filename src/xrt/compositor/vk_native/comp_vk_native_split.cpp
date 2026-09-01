@@ -65,6 +65,18 @@ struct comp_vk_split
 	void *dp_factory_d3d11;
 	bool transparent_background;
 
+	/*!
+	 * The panel's requested 2D/3D state, latched from every successful
+	 * request_display_mode forward. Sessions begin 3D (begin_session
+	 * requests it), so it initializes true at stage A. Feeds the weave
+	 * marks' mode_3d — which were HARDCODED true here, so under the split
+	 * the frame witness could never report mode=2d and the perf ladder's
+	 * MODE-2D gate flagged MODE_UNSETTLED on every rep once the
+	 * same-adapter split became the default path (latent since #918
+	 * hybrid; the panel itself switched fine — the flag lied).
+	 */
+	bool mode_3d;
+
 	//! @name The SCANOUT adapter — everything the weave and the present touch.
 	//! @{
 	ID3D11Device *out_dev;
@@ -112,6 +124,16 @@ struct comp_vk_split
 	//! EGRESS's rather than be assumed: the copy that fills it is dropped in
 	//! silence if the two are different DXGI typeless families.
 	DXGI_FORMAT dp_input_fmt;
+
+	/*!
+	 * #1264 — the format of the CALLER's 2D plane surfaces (Local2D +
+	 * backdrop), which the bridge chains must match for the same
+	 * typeless-family reason as dp_input_fmt. The VK deposit's planes are
+	 * BGRA (the default); the d3d12 reroute's are RGBA (its atlas/flatten
+	 * family) and it says so via comp_vk_split_set_plane_format. The mask
+	 * plane stays R8 regardless.
+	 */
+	DXGI_FORMAT plane_fmt;
 
 	/*!
 	 * VK-1b — a REGION-SIZED output-device view of a panel-sized bridge plane,
@@ -725,11 +747,23 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 		gin.scanout_luid = split_luid(sdesc.AdapterLuid);
 	}
 
+	// ADR-039 Phase A: the VK tier consults the same-adapter bring-up switch.
+	gin.allow_same_adapter = comp_split_gate_env_same_adapter();
+
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
 	*out_short_reason = gate.short_reason;
 
-	if (gate.same_adapter) {
+	if (gate.same_adapter && gate.split_active) {
+		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
+		// the point, not the copy. The ingress below is a same-adapter
+		// shared-texture open (no PCIe hop).
+		U_LOG_W("VK output-device split: ADR-039 same-adapter ENGAGE on '%ls' "
+		        "LUID=%08lx:%08lx — one fill engine for every tier "
+		        "(DXR_SPLIT_SAME_ADAPTER)",
+		        sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		        (unsigned long)sdesc.AdapterLuid.LowPart);
+	} else if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already
 		// local, so the split has nothing to do. One line, no WARN storm.
 		U_LOG_W("VK output-device split: scanout adapter '%ls' LUID=%08lx:%08lx IS the app's adapter — "
@@ -750,6 +784,9 @@ comp_vk_split_stage_a(const struct comp_vk_split_info *info,
 	s->hwnd = (HWND)info->hwnd;
 	s->dp_factory_d3d11 = info->dp_factory_d3d11;
 	s->transparent_background = info->transparent_background;
+	// Sessions begin 3D (begin_session requests it right after create);
+	// zero-init would make every weave mark read 2D until the first request.
+	s->mode_3d = true;
 	s->render_luid = render_luid;
 	s->out_luid = sdesc.AdapterLuid;
 	s->panel_w = panel_w;
@@ -1067,6 +1104,26 @@ comp_vk_split_retire(struct comp_vk_split **split_ptr, const char *why, const ch
  *
  */
 
+//! #1264 — the caller's 2D-plane format, defaulting to the VK deposit's BGRA
+//! for every session that never says otherwise (zero-init reads as unset).
+static inline DXGI_FORMAT
+split_plane_fmt(struct comp_vk_split *s)
+{
+	return (s->plane_fmt != DXGI_FORMAT_UNKNOWN) ? s->plane_fmt : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+extern "C" void
+comp_vk_split_set_plane_format(struct comp_vk_split *s, uint32_t dxgi_format)
+{
+	if (s == nullptr) {
+		return;
+	}
+	// Before the first bind, by contract (see the header): a chain already
+	// created in another family would need a drain+re-open this setter
+	// deliberately does not do.
+	s->plane_fmt = (DXGI_FORMAT)dxgi_format;
+}
+
 extern "C" void
 comp_vk_split_stage_backdrop(struct comp_vk_split *s,
                              void *nt_handle,
@@ -1105,7 +1162,7 @@ comp_vk_split_stage_backdrop(struct comp_vk_split *s,
 	 * the panel and never at the region.
 	 */
 	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_BACKDROP, nt_handle, generation,
-	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
 		/*
 		 * The backdrop degrades on its OWN — a session without one simply has
 		 * no 2D-under band, and the 3D weave is untouched. Never a reason to
@@ -1355,7 +1412,7 @@ comp_vk_split_stage_local2d(struct comp_vk_split *s,
 	}
 
 	if (!comp_xbridge_bind_plane(s->xbridge, COMP_XBRIDGE_PLANE_LOCAL2D, nt_handle, generation,
-	                             (uint32_t)DXGI_FORMAT_B8G8R8A8_UNORM, alloc_w, alloc_h)) {
+	                             (uint32_t)split_plane_fmt(s), alloc_w, alloc_h)) {
 		/*
 		 * #918 review D4 — the Local2D plane IS the composite's `twod` under the
 		 * split, so a frame that could not bind it has no composite to stamp.
@@ -1665,8 +1722,35 @@ comp_vk_split_submit_atlas(struct comp_vk_split *s,
 	}
 	comp_xbridge_stage_recipe(s->xbridge, &r);
 
+	/*
+	 * KEYED-MUTEX mode (ADR-039 Phase A): no importable fence on this driver,
+	 * so the ingress copy is bracketed by the slot's mutex instead — key 0 on
+	 * both sides, plain mutual exclusion against Vulkan's next rewrite of the
+	 * slot. The acquire is BOUNDED and a timeout SKIPS the frame (the fill arm
+	 * keeps re-weaving the previous egress slot): never an unbounded wait on
+	 * this thread (#925). Ordering of write-before-read is carried by the
+	 * frame path's per-frame CPU wait after the atlas submit (#837), so a
+	 * successful acquire here always sees a complete atlas.
+	 */
+	IDXGIKeyedMutex *km = (IDXGIKeyedMutex *)handoff->keyed_mutex;
+	if (km != nullptr) {
+		const HRESULT km_hr = km->AcquireSync(0, 100);
+		if (km_hr != S_OK) {
+			static uint32_t km_skips = 0;
+			if ((km_skips++ % 300u) == 0u) {
+				U_LOG_W(
+				    "#1264: deposit keyed-mutex AcquireSync did not resolve (hr=0x%08lx) — "
+				    "atlas ingress skipped this frame (%u skips so far)",
+				    (unsigned long)km_hr, km_skips);
+			}
+			return;
+		}
+	}
 	s->seq++;
 	comp_xbridge_submit(s->xbridge, s->seq, s->layout_gen, handoff->texture, content_w, content_h);
+	if (km != nullptr) {
+		km->ReleaseSync(0);
+	}
 
 	/*
 	 * VK-1b — THE PLANE BACK-FENCE, and the one place this leg diverges from
@@ -2153,14 +2237,21 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
 	if (is_repaint) {
-		comp_d3d11_target_weave_mark_repaint(s->target, /*mode_3d=*/true);
+		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
-		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, /*mode_3d=*/true);
+		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
 	}
 
 	// Hand the vendor eye predictor last frame's MEASURED weave->scanout
 	// residual, so it runs with an exact horizon (0 = unknown, DP heuristic).
 	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target), 0);
+
+	// #206: and the FORWARD-computed horizon for THIS weave, from the
+	// vsync-locked vblank grid — exact per weave, no estimator lag under
+	// variable cadence. 0 = no trusted grid; the DP then keeps the
+	// retrospective value above.
+	xrt_display_processor_d3d11_set_predicted_scanout(
+	    s->dp, comp_d3d11_target_predict_weave_to_scanout_ns(s->target));
 
 	comp_d3d11_target_bind(s->target);
 
@@ -2329,7 +2420,12 @@ comp_vk_split_request_display_mode(struct comp_vk_split *s, bool enable_3d)
 	if (s == nullptr || s->dp == nullptr) {
 		return false;
 	}
-	return xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	const bool ok = xrt_display_processor_d3d11_request_display_mode(s->dp, enable_3d);
+	if (ok) {
+		// The weave marks' mode_3d source — see the field doc.
+		s->mode_3d = enable_3d;
+	}
+	return ok;
 }
 
 extern "C" void

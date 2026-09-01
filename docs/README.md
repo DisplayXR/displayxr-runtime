@@ -140,6 +140,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-036](adr/ADR-036-android-per-window-compositor-instances.md) — Android: per-window compositor instances; the workspace overlay is an optional mode
 - [ADR-037](adr/ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement policy on hybrid-GPU devices
 - [ADR-038](adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
+- [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 <!-- END ADR INDEX -->
 
 ---
@@ -187,7 +188,10 @@ Cross-cutting references that don't belong to a single audience.
 - [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
 - [Debug Logging](reference/debug-logging.md) — log level conventions
 - [Motion-to-Photon Levers](reference/motion-to-photon-levers.md) — every latency knob (late weave, repaint, queue tiers, deferred present, late latching) with its default, and the defaults per GPU topology (dGPU / iGPU / hybrid)
+- [Weave Cadence vs. Eye Prediction](reference/weave-cadence-vs-eye-prediction.md) — how late weave / repaint / slot partition / adapter split relate to vendor-side late latching and the eye predictor, which of them exist on Android, and the CNSDK prediction measurement plan
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
+- [DPI Awareness](reference/dpi-awareness.md) — the DLL rule: Win32 geometry read inside the runtime answers in the HOST app's DPI space, so publish-worthy rects must pin a per-monitor-v2 thread context
+- [Control Panel performance settings](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
 - [Workspace Stability](reference/workspace-stability.md) — the wedge family (lock starvation, fence jams, blocking presents, vendor-DP and MCP write wedges), the no-unbounded-work principle (#925), and the diagnostic toolkit ([RENDER] tell, PDBs, wedge captures, close gauntlet)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).

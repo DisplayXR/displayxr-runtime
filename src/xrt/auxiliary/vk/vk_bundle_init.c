@@ -22,6 +22,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "util/u_pretty_print.h"
+#include "util/u_setting.h"
 #include "vk/vk_helpers.h"
 
 #include <stdio.h>
@@ -622,7 +623,11 @@ device_index_by_luid(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t d
 static int
 env_forced_gpu_index(struct vk_bundle *vk, VkPhysicalDevice *devices, uint32_t device_count)
 {
-	const char *val = getenv("DXR_VK_FORCE_GPU");
+	// #1252: settings chain (env > per-user file > machine) — the Control
+	// Panel's Target GPU control. The environment still wins, so the
+	// documented in-process `_putenv_s` route keeps working.
+	char gpu_buf[64];
+	const char *val = u_setting_get_raw("DXR_VK_FORCE_GPU", gpu_buf, sizeof(gpu_buf), NULL);
 	if (val == NULL || val[0] == '\0') {
 		return -1;
 	}
@@ -1890,6 +1895,7 @@ vk_init_from_given(struct vk_bundle *vk,
                    bool timeline_semaphore_enabled,
                    bool image_format_list_enabled,
                    bool debug_utils_enabled,
+                   bool display_timing_enabled,
                    enum u_logging_level log_level)
 {
 	VkResult ret;
@@ -1932,6 +1938,14 @@ vk_init_from_given(struct vk_bundle *vk,
 	// Vulkan does not let us read what extensions was enabled.
 	if (image_format_list_enabled) {
 		vk->has_KHR_image_format_list = image_format_list_enabled;
+	}
+
+	// Vulkan does not let us read what extensions was enabled. #902: the
+	// Android pacing source — without this the vblank grid's feeder bails on
+	// a device that supports display timing perfectly well, because an ADOPTED
+	// device never runs build_device_extensions and so never sets this flag.
+	if (display_timing_enabled) {
+		vk->has_GOOGLE_display_timing = true;
 	}
 
 #ifdef VK_KHR_timeline_semaphore

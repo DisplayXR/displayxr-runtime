@@ -27,6 +27,7 @@
 #include "xrt/xrt_config_have.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include <dxgi1_6.h>
 #include <wil/com.h>
@@ -54,11 +55,40 @@ namespace {
 	constexpr const char *kProvMostVram = "most VRAM";
 	constexpr const char *kProvAdapterType = "adapter type";
 	constexpr const char *kProvIndexTiebreak = "lowest index (tie)";
-	constexpr const char *kProvEnvScanout = "env-forced: scanout";
-	constexpr const char *kProvEnvIgpu = "env-forced: igpu";
-	constexpr const char *kProvEnvDgpu = "env-forced: dgpu";
-	constexpr const char *kProvEnvIndex = "env-forced: index";
 	constexpr const char *kProvUnresolved = "unresolved";
+	/*
+	 * #1252: the override can now come from the per-user store the Control
+	 * Panel writes or from the machine default, not only from the environment.
+	 * This string lands in `displayxr-cli info`'s `service ingest:` line — the
+	 * one people paste into bug reports — so it names the ACTUAL source. A
+	 * hardcoded "env-forced" would send a reader hunting for an environment
+	 * variable that does not exist.
+	 *
+	 * A static table rather than a formatted buffer: RenderAdapterChoice
+	 * carries a `const char *` that outlives the call and is read on other
+	 * threads, so these need process lifetime. The source labels match the ones
+	 * `displayxr-cli perf list` prints, so the two surfaces agree.
+	 */
+	enum ForcedKeyword
+	{
+		kFwScanout = 0,
+		kFwIgpu,
+		kFwDgpu,
+		kFwIndex,
+	};
+
+	const char *
+	prov_forced(u_setting_source src, ForcedKeyword kw)
+	{
+		static const char *const table[3][4] = {
+		    {"env-forced: scanout", "env-forced: igpu", "env-forced: dgpu", "env-forced: index"},
+		    {"user-forced: scanout", "user-forced: igpu", "user-forced: dgpu", "user-forced: index"},
+		    {"machine-forced: scanout", "machine-forced: igpu", "machine-forced: dgpu",
+		     "machine-forced: index"},
+		};
+		const int row = src == U_SETTING_SOURCE_USER ? 1 : (src == U_SETTING_SOURCE_MACHINE ? 2 : 0);
+		return table[row][(int)kw];
+	}
 
 	/*!
 	 * Dedicated-VRAM watermark separating "discrete" from "integrated" for the
@@ -300,7 +330,14 @@ namespace {
 	{
 		RenderAdapterChoice none{nullptr, LUID{}, kProvUnresolved, false};
 
-		const char *val = getenv("DXR_D3D_FORCE_GPU");
+		// #1252: resolved through the settings chain (env > per-user file >
+		// machine) so the Control Panel's Target GPU control reaches apps it
+		// never launched. The environment still wins, so the documented
+		// in-process `_putenv_s` route (#845, displayxr-unity#243) and every
+		// launcher script keep working exactly as before.
+		char gpu_buf[64];
+		u_setting_source forced_src = U_SETTING_SOURCE_DEFAULT;
+		const char *val = u_setting_get_raw("DXR_D3D_FORCE_GPU", gpu_buf, sizeof(gpu_buf), &forced_src);
 		if (val == nullptr || val[0] == '\0') {
 			return none;
 		}
@@ -335,10 +372,11 @@ namespace {
 				U_LOG_W("DXR_D3D_FORCE_GPU=scanout: the scanout adapter has no description — ignoring");
 				return none;
 			}
-			U_LOG_W("%s: adapter '%ls' (scans out the panel %ux%u at %d,%d)", kProvEnvScanout,
-			        sdesc.Description, panel_pixel_width, panel_pixel_height, (int)panel_screen_left,
-			        (int)panel_screen_top);
-			return RenderAdapterChoice{adapter, sdesc.AdapterLuid, kProvEnvScanout, true};
+			U_LOG_W("%s: adapter '%ls' (scans out the panel %ux%u at %d,%d)",
+			        prov_forced(forced_src, kFwScanout), sdesc.Description, panel_pixel_width,
+			        panel_pixel_height, (int)panel_screen_left, (int)panel_screen_top);
+			return RenderAdapterChoice{adapter, sdesc.AdapterLuid, prov_forced(forced_src, kFwScanout),
+			                           true};
 		}
 
 		if (candidates.empty()) {
@@ -353,17 +391,20 @@ namespace {
 			// GPU first (observed on HW). Classify by dedicated VRAM
 			// instead — the integrated GPU is the hardware adapter with the
 			// least of it — which no registry state can reorder.
-			return pick_by_vram_extreme(candidates, /* want_igpu */ true, kProvEnvIgpu);
+			return pick_by_vram_extreme(candidates, /* want_igpu */ true, prov_forced(forced_src, kFwIgpu));
 		}
 		if (strcmp(val, "dgpu") == 0 || strcmp(val, "discrete") == 0) {
-			return pick_by_vram_extreme(candidates, /* want_igpu */ false, kProvEnvDgpu);
+			return pick_by_vram_extreme(candidates, /* want_igpu */ false,
+			                            prov_forced(forced_src, kFwDgpu));
 		}
 		if (val[0] >= '0' && val[0] <= '9') {
 			UINT want = (UINT)atoi(val);
 			for (const Candidate &c : candidates) {
 				if (c.index == want) {
-					U_LOG_W("%s: adapter[%u] '%ls'", kProvEnvIndex, c.index, c.desc.Description);
-					return RenderAdapterChoice{c.adapter, c.desc.AdapterLuid, kProvEnvIndex, true};
+					U_LOG_W("%s: adapter[%u] '%ls'", prov_forced(forced_src, kFwIndex), c.index,
+					        c.desc.Description);
+					return RenderAdapterChoice{c.adapter, c.desc.AdapterLuid,
+					                           prov_forced(forced_src, kFwIndex), true};
 				}
 			}
 			U_LOG_W("DXR_D3D_FORCE_GPU=%s: no usable adapter at that index — ignoring", val);

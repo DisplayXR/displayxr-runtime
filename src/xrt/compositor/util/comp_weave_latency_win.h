@@ -35,7 +35,26 @@
 struct weave_latency_log
 {
 	FILE *f = nullptr;
-	int enabled = -1; // -1 = unprobed (CSV only; R-tracking is always on)
+	/*!
+	 * CSV state (the CSV only; R-tracking is always on).
+	 *
+	 * ZERO MUST MEAN "UNPROBED" (#1128). Instances of this type live inside
+	 * C-style structs that are `std::memset(0)` on init — the per-client
+	 * `d3d11_client_render_resources` and the multi-compositor — which wipes
+	 * any non-zero default member initializer. A `-1 = unprobed` sentinel
+	 * therefore silently became `probed, disabled` for every service-side
+	 * ledger, and `DXR_WEAVE_LATENCY_CSV` produced no rows for the workspace
+	 * or app-HWND presenters no matter how it was set. Keeping the unprobed
+	 * state at 0 makes the type correct under memset by construction rather
+	 * than by remembering to re-arm it at each site.
+	 */
+	enum csv_state
+	{
+		CSV_UNPROBED = 0,
+		CSV_OFF = 1,
+		CSV_ON = 2,
+	};
+	int enabled = CSV_UNPROBED;
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
 	uint64_t qpc_freq = 0;
@@ -64,6 +83,23 @@ struct weave_latency_log
 	int ring_count = 0;
 	uint64_t measured_r_ns = 0; // last completed frame's weave→scanout; 0 = unknown
 
+	/*
+	 * #206 forward horizon — the vblank GRID, captured always-on from DXGI
+	 * frame statistics (not the CSV-gated last_s_sync_qpc above). The
+	 * retrospective measured_r_ns is an estimator of a quantity that is
+	 * not constant under variable cadence; these fields let the runtime
+	 * compute THIS weave's present-to-photon time forward instead:
+	 * vblanks sit on last_sync_qpc + k * refresh_period_qpc, and the
+	 * period is measured from the statistics themselves (SyncQPCTime
+	 * deltas over SyncRefreshCount deltas), so the grid is vsync-LOCKED —
+	 * the #1257 partition v3 post-mortem is exactly what happens to a
+	 * grid built from the monotonic clock times a nominal rate instead.
+	 */
+	uint64_t last_sync_qpc = 0;      // newest vblank timestamp seen; monotone
+	uint64_t last_sync_refresh = 0;  // SyncRefreshCount at that vblank
+	uint64_t refresh_period_qpc = 0; // TRUE measured vblank period; 0 = unknown
+	uint64_t headroom_qpc = 0;       // last frame's mark→present-return cost
+
 	uint64_t
 	freq()
 	{
@@ -78,20 +114,20 @@ struct weave_latency_log
 	bool
 	on(const char *site)
 	{
-		if (enabled < 0) {
+		if (enabled == CSV_UNPROBED) {
 			const char *prefix = getenv("DXR_WEAVE_LATENCY_CSV");
-			enabled = 0;
+			enabled = CSV_OFF;
 			if (prefix != nullptr && prefix[0] != '\0') {
 				char path[MAX_PATH];
 				snprintf(path, sizeof(path), "%s.%s.csv", prefix, site);
 				f = fopen(path, "a");
 				if (f != nullptr) {
 					fprintf(f, "H,%lld\n", (long long)freq());
-					enabled = 1;
+					enabled = CSV_ON;
 				}
 			}
 		}
-		return enabled == 1;
+		return enabled == CSV_ON;
 	}
 
 	//! @p predicted_display_time_ns is the value xrWaitFrame handed the app
@@ -112,6 +148,62 @@ struct weave_latency_log
 	after_present(const char *site, IDXGISwapChain *sc, struct late_weave_governor *gov = nullptr);
 
 	/*!
+	 * #206: forward-predict the weave→scanout time of a weave RECORDED NOW,
+	 * from the vsync-locked vblank grid. Returns ns, or 0 when no trusted
+	 * grid exists (no statistics yet, statistics stalled >500 ms, or the
+	 * period unmeasured) — callers hand 0 to the DP as "unknown" and the
+	 * plug-in falls back to its retrospective heuristic.
+	 *
+	 * The prediction is the first vblank after now + headroom, where the
+	 * headroom is the measured cost of getting a weave from its record
+	 * mark through submit and present into the queue (last frame's value,
+	 * clamped to [1 ms, one refresh]). A stale-but-on-grid SyncQPCTime is
+	 * harmless: it only shifts the base by whole periods, and the period
+	 * itself is measured, not nominal, so the grid does not drift.
+	 */
+	uint64_t
+	predict_weave_to_scanout_ns()
+	{
+		// Kill switch: DXR_DP_FORWARD_HORIZON=0 returns "unknown" everywhere,
+		// so the plug-in falls back to its retrospective heuristic — the
+		// pre-#206 behavior, byte for byte.
+		static int fh_enabled = -1;
+		if (fh_enabled < 0) {
+			const char *e = getenv("DXR_DP_FORWARD_HORIZON");
+			fh_enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
+		}
+		if (fh_enabled == 0) {
+			return 0;
+		}
+		if (last_sync_qpc == 0 || refresh_period_qpc == 0) {
+			return 0;
+		}
+		const uint64_t f2 = freq();
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		const uint64_t nowq = (uint64_t)now.QuadPart;
+		if (nowq <= last_sync_qpc) {
+			return 0; // clock weirdness — refuse rather than guess
+		}
+		if (nowq - last_sync_qpc > f2 / 2) {
+			return 0; // statistics stalled >500 ms — grid not trusted
+		}
+		uint64_t head = headroom_qpc;
+		const uint64_t head_min = f2 / 1000; // 1 ms
+		if (head < head_min) {
+			head = head_min;
+		}
+		if (head > refresh_period_qpc) {
+			head = refresh_period_qpc;
+		}
+		const uint64_t ready = nowq + head;
+		// First vblank strictly after `ready`.
+		const uint64_t target =
+		    last_sync_qpc + ((ready - last_sync_qpc) / refresh_period_qpc + 1) * refresh_period_qpc;
+		return (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
+	}
+
+	/*!
 	 * Close the CSV, if one was opened, and re-arm the probe.
 	 *
 	 * A file-scope log lives for the process and never needed this. #918 PR 6
@@ -126,7 +218,7 @@ struct weave_latency_log
 			fclose(f);
 			f = nullptr;
 		}
-		enabled = -1;
+		enabled = CSV_UNPROBED;
 	}
 };
 
@@ -595,6 +687,12 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 		sc->GetLastPresentCount(&present_count);
 
 		if (qpc_weave != 0) {
+			// #206: the mark→present-return cost of the frame just pushed —
+			// the headroom the forward predictor adds before snapping to the
+			// next vblank.
+			if ((uint64_t)now.QuadPart > qpc_weave) {
+				headroom_qpc = (uint64_t)now.QuadPart - qpc_weave;
+			}
 			// Track for the timing loop.
 			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns, pending_repaint};
 			ring_head = (ring_head + 1) % 8;
@@ -617,6 +715,26 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 		if (SUCCEEDED(sc->GetFrameStatistics(&stats))) {
 			if (gov != nullptr) {
 				gov->on_stats(stats, freq());
+			}
+			// #206: capture the vsync-locked vblank grid, always-on. The
+			// period comes from the statistics themselves — SyncQPCTime
+			// delta over SyncRefreshCount delta — so 59.94 vs 60.00 is
+			// measured, not assumed. Monotone guard mirrors the #1051 CSV
+			// rule: a repeated/stale sync sample must not move the grid.
+			if ((uint64_t)stats.SyncQPCTime.QuadPart > last_sync_qpc) {
+				const uint64_t sync = (uint64_t)stats.SyncQPCTime.QuadPart;
+				const uint64_t refresh = (uint64_t)stats.SyncRefreshCount;
+				if (last_sync_qpc != 0 && refresh > last_sync_refresh) {
+					const uint64_t cand =
+					    (sync - last_sync_qpc) / (refresh - last_sync_refresh);
+					// Sanity: 1..50 ms per vblank (20-1000 Hz panels).
+					const uint64_t f2 = freq();
+					if (cand > f2 / 1000 && cand < f2 / 20) {
+						refresh_period_qpc = cand;
+					}
+				}
+				last_sync_qpc = sync;
+				last_sync_refresh = refresh;
 			}
 			// Resolve the newest ring entry whose present has flipped.
 			for (int i = 0; i < ring_count; i++) {

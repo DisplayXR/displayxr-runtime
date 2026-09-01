@@ -81,6 +81,33 @@ void
 comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr);
 
 /*!
+ * #902: the MEASURED panel refresh period in ns, or 0 when unavailable.
+ *
+ * Fed from VK_GOOGLE_display_timing where the driver offers it. Returns 0
+ * unless the grid holds both a measured period and a fresh phase anchor — and
+ * a 0 means "keep your existing behaviour", never "substitute a default". The
+ * open-loop guess this replaces is exactly what a caller-side fallback would
+ * reintroduce.
+ *
+ * Relevant because the panel is variable-refresh: measured on the NP02J
+ * switching 59.86 <-> 119.71 Hz within a single session, with no swapchain
+ * recreate, while the repaint loop paced a hardcoded 60.
+ */
+uint64_t
+comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target);
+
+/*!
+ * #206: the MEASURED weave->scanout residual in ns, 0 if unknown.
+ *
+ * The quantity a vendor eye predictor needs — how far past the weave its pose
+ * should be valid. Measured by correlating our presentID with the driver's
+ * reported actualPresentTime, so it includes queueing rather than assuming the
+ * frame lands on the next vblank (measured 2.5-3.4 periods, not 1).
+ */
+uint64_t
+comp_vk_native_target_weave_to_scanout_ns(struct comp_vk_native_target *target);
+
+/*!
  * Acquire the next swapchain image for rendering.
  *
  * @param target The target.

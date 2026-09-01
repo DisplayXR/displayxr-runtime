@@ -36,6 +36,7 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -51,6 +52,8 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -146,6 +149,40 @@ DEBUG_GET_ONCE_BOOL_OPTION(local2d_clip, "DXR_L2D_CLIP", true)
 // path — where does the non-GPU-busy frame time go? Accumulates per stage and
 // logs a one-line summary ~1/sec (WARN so it survives the hot-path filter).
 DEBUG_GET_ONCE_BOOL_OPTION(frame_stage_timing, "DXR_FRAME_STAGE_TIMING", false)
+
+/*!
+ * #837 timing knob, reachable on Android.
+ *
+ * DEBUG_GET_ONCE_BOOL_OPTION resolves through u_setting, which on Android looks
+ * up the system property `debug.xrt.<NAME>`. PROP_NAME_MAX is 32 INCLUDING the
+ * NUL, so a name has 31 usable characters and that prefix eats 10 — leaving 21.
+ * "DXR_FRAME_STAGE_TIMING" is 22, so `debug.xrt.DXR_FRAME_STAGE_TIMING` is 32
+ * and cannot be found. Nothing logs and nothing errors; the knob just reads as
+ * unset, which is exactly how it behaved when it was needed on device.
+ *
+ * The short alias below (28 chars) fits. Env still wins, per the resolution
+ * order in u_setting.h. 33 of the runtime's 80 option knobs have this problem;
+ * the census in docs/roadmap/control-panel-performance-settings.md lists them.
+ */
+static bool
+dxr_frame_stage_timing_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = debug_get_bool_option_frame_stage_timing() ? 1 : 0;
+#ifdef XRT_OS_ANDROID
+		if (on == 0) {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.frame_stage_timing", sp) > 0 &&
+			    (sp[0] == '1' || sp[0] == 't' || sp[0] == 'T' || sp[0] == 'y' ||
+			     sp[0] == 'Y')) {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
 
 enum vk_frame_stage
 {
@@ -243,6 +280,10 @@ struct comp_vk_native_compositor
 	//! VK-0 (#1178): the app's VkDevice has VK_KHR_timeline_semaphore enabled.
 	//! Read only by the deposit, which cannot exist without it.
 	bool app_timeline_semaphores;
+
+	//! ADR-039: the app's VkDevice has VK_KHR_win32_keyed_mutex enabled.
+	//! Read only by the deposit's same-adapter sync rung.
+	bool app_keyed_mutex;
 
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
@@ -519,6 +560,16 @@ struct comp_vk_native_compositor
 	VkCommandPool repaint_cmd_pool;
 
 	/*!
+	 * #1264 S1: count of successful presents through vk_dp_weave_and_present
+	 * (both frame classes; c->mutex held at every increment). The fence-park
+	 * path snapshots it before releasing the lock across a fill's GPU wait
+	 * and DROPS the fill's present if it moved — a fresher frame reached the
+	 * screen while we waited, and presenting an older fill behind it would
+	 * step the panel backwards.
+	 */
+	uint64_t present_serial;
+
+	/*!
 	 * #868: everything the repaint thread needs to replay the last app frame's
 	 * weave WITHOUT touching app-owned state. Published by layer_commit.
 	 */
@@ -538,6 +589,30 @@ struct comp_vk_native_compositor
 		bool armed;                     //!< False on zero-copy: the atlas IS the app's image.
 		bool app_frame_in_progress;     //!< Set by layer_begin, cleared by layer_commit.
 		uint64_t last_app_frame_ns;     //!< Quiet-gate key. Never touched by a repaint.
+		struct u_repaint_gate gate;     //!< #1257 interval-aware quiet gate.
+		struct u_repaint_trace trace;   //!< DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation.
+		//! #902: EMA of the app's own frame interval, for repaint phase placement.
+		uint64_t app_interval_ns;
+		//! #902: one-shot log for the phase target engaging.
+		bool phase_logged;
+
+		//! #902: last measured grid period the loop paced on; 0 = assumed rate.
+		//! Only used to log the transitions, so a variable-refresh panel does
+		//! not produce a line per tick.
+		uint64_t last_grid_period_ns;
+		//! #902: one-shot guard for the clamp log, so a panel that boosts
+		//! repeatedly does not produce a line per boost.
+		bool grid_clamp_logged;
+
+		//! Last target image-set generation this loop observed, and when it
+		//! last moved. Keys the recreate-quiescence guard at the fire site.
+		uint32_t last_gen;
+		uint64_t last_gen_change_ns;
+		//! One-shot guard for the quiescence log — launch extent churn
+		//! produces a burst of recreates and one line per skipped tick
+		//! would bury the trace.
+		bool gen_quiesce_logged;
+		struct u_app_partition partition; //!< #1257 slot partition: xrWaitFrame throttle state.
 
 		//! Effective content layout the last app frame actually painted.
 		uint32_t view_w, view_h, cols, rows;
@@ -1347,6 +1422,8 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -1402,6 +1479,44 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE taking any
+	// lock — the repaint loop keeps weaving the other slots underneath
+	// this sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier
+	// = the #918 split's d3d11 fill arm, hybrid OR same-adapter (ADR-039
+	// Phase A accepted) — the measured configs; the throttle refuses
+	// cleanly elsewhere (see u_app_partition.h). Keying on the split
+	// being ACTIVE is what couples this gate to DXR_SPLIT_SAME_ADAPTER's
+	// default by construction.
+	{
+		bool part_tier_ok = false;
+#ifdef XRT_OS_WINDOWS
+		part_tier_ok = (c->split != NULL);
+#endif
+#ifdef XRT_OS_ANDROID
+		/*
+		 * #902 + #1257: the partition's precondition is a STEADY, KNOWN
+		 * schedule — which is why it was gated on the #918 split, the only
+		 * arm that had one. Purely in-process tiers were refused because they
+		 * tick with 17-23 ms holes and cannot hold a fill schedule.
+		 *
+		 * The vblank grid supplies that schedule on Android for the first
+		 * time: a measured period and a real phase anchor from
+		 * VK_GOOGLE_display_timing, rather than an assumed rate. The
+		 * supporting evidence that this tier can now sustain it is the grid
+		 * pacing result — a panel-rate 59.9 fps against a 59.86 Hz panel,
+		 * from an app running at ~28. Serving a known schedule is strictly
+		 * less work than discovering one.
+		 *
+		 * Still gated on the grid actually being trusted, not merely on the
+		 * platform: with no display timing this is exactly the in-process
+		 * tier the original gate refused, and it should keep refusing.
+		 */
+		part_tier_ok = (c->target != NULL &&
+		                comp_vk_native_target_vblank_period_ns(c->target) != 0);
+#endif
+		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, part_tier_ok);
+	}
+
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
 
@@ -1417,6 +1532,14 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period.
+	// Reporting the stretched period made well-behaved apps pace themselves
+	// by it ON TOP of the wait_frame throttle; with a vsync-blocking present
+	// the two stacked into ~(stride + period) cycles and the app slid off
+	// its slots (measured: 14/s against a 20/s schedule on this tier, while
+	// the non-blocking bridge held 20.0). Pacing lives in exactly one place
+	// — the throttle — and animation steps by predictedDisplayTime deltas,
+	// which stride honestly under the partition.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -3399,6 +3522,120 @@ vk_bg2d_backdrop(struct comp_vk_native_compositor *c, uint32_t *w, uint32_t *h)
  * The crop IS re-done: it reads the compositor-owned atlas and writes
  * compositor-owned scratch, and skipping it hands the DP a stale image.
  */
+/*!
+ * Diagnostic gate for the per-kind cadence census and the #206 residual report.
+ *
+ * Both are PERIODIC (~5 s) WARN rows, so they must not ship on by default —
+ * docs/reference/debug-logging.md reserves WARN for one-off init/error/lifecycle
+ * events. Everything else this branch logs is one-shot or on-change and stays
+ * unconditional.
+ *
+ * Turn it on when grading ANY change to weave scheduling. The census is the only
+ * instrument that separates a live stream from a frozen one: panel-interval
+ * statistics improved on every axis (34.4 -> 39.7 fps, CoV 46.8% -> 33.2%) during
+ * a run where the app had stopped submitting entirely and the compositor was
+ * re-weaving a stale atlas. `app n` is what catches that; smoothness cannot.
+ *
+ * DXR_WEAVE_CADENCE_TRACE=1 / debug.dxr.weave_cadence_trace 1.
+ */
+static bool
+dxr_weave_cadence_trace(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0;
+		const char *e = getenv("DXR_WEAVE_CADENCE_TRACE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.weave_cadence_trace", sp) > 0 &&
+			    sp[0] == '1') {
+				on = 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
+/*!
+ * #837 prototype: narrow the post-weave drain from the DEVICE to the DP's QUEUE.
+ *
+ * `postwait` measures 3.29 ms of a ~9.4 ms fire — 35% — and it is one
+ * `vkDeviceWaitIdle`. Its comment says the wait "costs nothing in practice" on
+ * Android because `c->hud == NULL` there; the first half is true (u_hud_create
+ * is compiled out on Android) but the wait does not test for a HUD, so the cost
+ * is real and was never measured.
+ *
+ * What it must actually guarantee: the vendor's weave submit has finished
+ * writing `target_image` before we record and submit post-DP work that writes
+ * the same image (the HUD on desktop, and `vk_composite_local_2d` everywhere —
+ * which is why simply skipping the wait when there is no HUD would be wrong).
+ *
+ * The DP submits on ONE known queue. `vk_make_dp_vk` creates it with
+ * `vk.main_queue->queue` temporarily swapped to `c->repaint_queue`, so that is
+ * the queue the vendor's weave goes to. Waiting on that queue therefore gives
+ * the identical ordering guarantee, while a device-wide wait ALSO drains the
+ * app's own queue — its scene rendering, which never touches `target_image`.
+ * On this device that is the majority of the wait.
+ *
+ * Falls back to the passed-in queue on the shared-queue tier, where there is no
+ * runtime-owned queue and the DP submits on the app's.
+ *
+ * DEFAULT ON (2026-08-31), on three independent lines of evidence:
+ *   - Queue identity, confirmed on-device rather than by reading this comment:
+ *     `#868: queue handles — app=0x..ad0 repaint=0x..b70` and `creating the
+ *     display processor against the runtime-owned queue 0x..b70` — the DP's
+ *     queue IS `c->repaint_queue`, so this drain covers the vendor weave.
+ *   - A/B on NP02J, identical conditions: postwait 3.25 ms -> 0.04 ms with the
+ *     weave itself unchanged (0.43 -> 0.47 ms), zero discards, zero validation
+ *     errors. The stall cost ~7x the weave it was protecting.
+ *   - Human eyeball, 90 s of head motion + model rotation: no bad frame.
+ *
+ * NOT empirically covered: the `vk_composite_local_2d` consumer is inert in
+ * every Android demo on hand (`#879: ... local2d_scratch=0x0`), so no test here
+ * has exercised the read-after-weave hazard this wait exists for. State that
+ * rather than imply otherwise. The correctness argument does not rest on it:
+ * the wait is on the PRODUCER's queue and is host-blocking, so the weave is
+ * complete before any consumer's command buffer is even recorded.
+ *
+ * Kill switch: DXR_WEAVE_POSTWAIT_QUEUE=0 / debug.dxr.weave_postwait_queue 0.
+ */
+static bool
+dxr_postwait_queue_only(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 1; // default ON — see the evidence in the comment above
+		const char *e = getenv("DXR_WEAVE_POSTWAIT_QUEUE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			// Now that the default is ON the prop must be able to turn it
+			// OFF, so test for '0' rather than only honouring '1'.
+			if (__system_property_get("debug.dxr.weave_postwait_queue", sp) > 0 &&
+			    sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+		/*
+		 * Say which drain is live, exactly once. A switch guarding a data
+		 * race with no engagement log made a clean QA pass unattributable:
+		 * the props had been cleared afterwards and nothing in the log could
+		 * establish whether the narrow drain had ever actually run.
+		 */
+		U_LOG_W("#837: post-weave drain = %s", on ? "QUEUE (narrow)" : "DEVICE (wide)");
+	}
+	return on == 1;
+}
+
 static xrt_result_t
 vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         bool is_repaint,
@@ -3414,6 +3651,89 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         uint64_t *fp,
                         bool *out_skip_frame)
 {
+	/*
+	 * #902 cadence census. Every weave — app frame and repaint alike — passes
+	 * through here, so this is the one place the OUTPUT stream can be split by
+	 * kind.
+	 *
+	 * The question it answers: with the panel provably pinned (Settings-UI 60
+	 * Hz, grid sees a single refresh value all run) the interval CoV is still
+	 * ~47%. Three candidates — app delivery, repaint scheduling, or the two
+	 * INTERLEAVING badly — and they are indistinguishable from the combined
+	 * on-screen interval alone. A stream can have the right rate and the wrong
+	 * spacing: repaints that land just after an app frame instead of midway
+	 * between them produce exactly this signature, and no amount of counting
+	 * weaves reveals it.
+	 *
+	 * Reports mean and SD per kind, plus the app->repaint phase, i.e. where in
+	 * the app's own interval the repaint actually fell (0.5 = ideally midway).
+	 */
+	if (dxr_weave_cadence_trace()) {
+		static uint64_t last_any_ns = 0, last_app_ns = 0;
+		static double s_any = 0, q_any = 0, s_app = 0, q_app = 0, s_ph = 0, q_ph = 0;
+		static uint32_t n_any = 0, n_app = 0, n_rep = 0, n_ph = 0;
+		static uint64_t last_report_ns = 0;
+		const uint64_t t = os_monotonic_get_ns();
+
+		if (last_any_ns != 0) {
+			const double d = (double)(t - last_any_ns) / 1e6;
+			if (d > 0.0 && d < 500.0) {
+				n_any++;
+				s_any += d;
+				q_any += d * d;
+			}
+		}
+		last_any_ns = t;
+
+		if (!is_repaint) {
+			if (last_app_ns != 0) {
+				const double d = (double)(t - last_app_ns) / 1e6;
+				if (d > 0.0 && d < 500.0) {
+					n_app++;
+					s_app += d;
+					q_app += d * d;
+				}
+			}
+			last_app_ns = t;
+		} else {
+			n_rep++;
+			// Phase of this repaint within the app's current interval, using
+			// the app's measured mean as the denominator. >1 means the app is
+			// late, which is itself informative.
+			if (last_app_ns != 0 && n_app > 4) {
+				const double mean_app = s_app / (double)n_app;
+				if (mean_app > 0.0) {
+					const double ph = ((double)(t - last_app_ns) / 1e6) / mean_app;
+					if (ph > 0.0 && ph < 4.0) {
+						n_ph++;
+						s_ph += ph;
+						q_ph += ph * ph;
+					}
+				}
+			}
+		}
+
+		if (last_report_ns == 0) {
+			last_report_ns = t;
+		} else if (t - last_report_ns > (5ULL * 1000 * 1000 * 1000) && n_any > 8) {
+			const double m_any = s_any / n_any;
+			const double sd_any = sqrt(q_any / n_any - m_any * m_any);
+			const double m_app = n_app > 1 ? s_app / n_app : 0.0;
+			const double sd_app = n_app > 1 ? sqrt(q_app / n_app - m_app * m_app) : 0.0;
+			const double m_ph = n_ph > 0 ? s_ph / n_ph : 0.0;
+			const double sd_ph = n_ph > 0 ? sqrt(q_ph / n_ph - m_ph * m_ph) : 0.0;
+			U_LOG_W("#902 CADENCE: all n=%u mean %.2f ms SD %.2f (CoV %.0f%%) | "
+			        "app n=%u mean %.2f ms SD %.2f (CoV %.0f%%) | repaints=%u | "
+			        "repaint phase %.2f SD %.2f (0.5=midway)",
+			        n_any, m_any, sd_any, 100.0 * sd_any / (m_any > 0 ? m_any : 1),
+			        n_app, m_app, sd_app, 100.0 * sd_app / (m_app > 0 ? m_app : 1), n_rep,
+			        m_ph, sd_ph);
+			s_any = q_any = s_app = q_app = s_ph = q_ph = 0;
+			n_any = n_app = n_rep = n_ph = 0;
+			last_report_ns = t;
+		}
+	}
+
 	struct vk_bundle *vk = &c->vk;
 	xrt_result_t xret = XRT_SUCCESS;
 
@@ -3775,6 +4095,68 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (struct xrt_display_processor_vk *)c->display_processor,
 			    comp_vk_native_target_get_measured_weave_ns(c->target),
 			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+			/*
+			 * #206: the MEASURED weave→scanout residual, per frame.
+			 *
+			 * This is the horizon a vendor eye predictor must extrapolate
+			 * to. Until now the VK path measured it and dropped it on the
+			 * floor — only D3D11/D3D12 fed the slot — so on Android the
+			 * vendor SDK fell back to a hardcoded constant.
+			 *
+			 * That constant is not merely imprecise, it inverts our own
+			 * platform work. Measured on an NP02J, the residual is BIMODAL
+			 * on GPU governor state: p50 42.9 ms at the default governor,
+			 * 29.1 ms with the clock pinned. Scored in lenticular phase
+			 * units over 170 labelled turnaround events, a correct horizon
+			 * at 29 ms scores 0.038 median against 0.054 at 43 ms — a ~30%
+			 * win. But pinning the clock while the predictor still assumes
+			 * 40 ms scores 0.065, i.e. ~20% WORSE than not pinning at all,
+			 * because it then overshoots an 11 ms shorter reality.
+			 *
+			 * So this feed is the precondition for the GPU-clock platform
+			 * ask paying off rather than regressing. It must stay per-frame:
+			 * a session-start calibration cannot track a governor that
+			 * changes state mid-session, and the measured run-to-run spread
+			 * on a single configuration (7 ms) already exceeds the 40→29
+			 * difference being chased.
+			 *
+			 * 0 = no trusted measurement yet ⟹ the DP keeps its own
+			 * heuristic, so an unmeasured frame never injects a wrong value.
+			 */
+			{
+				/*
+				 * Bound it HERE, at the source, not at the consumer.
+				 * A consumer clamp can only fall back to its constant —
+				 * it cannot tell anyone the measurement went bad. Bounding
+				 * at publish means an absurd residual is both suppressed
+				 * AND logged, so a broken correlation shows up as a
+				 * diagnosable event instead of a silent reversion to the
+				 * vendor's hardcoded horizon.
+				 *
+				 * [0, 200] ms matches the vendor-side bound. A sane
+				 * residual here is 2.5-3.4 refresh periods (22-48 ms
+				 * measured), so the ceiling is ~4x the worst legitimate
+				 * value: loose enough never to clip a real slow frame,
+				 * tight enough to catch a correlation that has gone wrong.
+				 */
+				const uint64_t horizon_ns = comp_vk_native_target_weave_to_scanout_ns(c->target);
+				const uint64_t horizon_max_ns = 200 * U_TIME_1MS_IN_NS;
+				if (horizon_ns > horizon_max_ns) {
+					// Lifecycle-rare by construction; never per frame.
+					static uint64_t s_last_bad_ns = 0;
+					if (horizon_ns != s_last_bad_ns) {
+						s_last_bad_ns = horizon_ns;
+						U_LOG_W("#206: measured weave->scanout residual %" PRIu64
+						        " ms is outside [0, 200] — NOT published; the DP keeps "
+						        "its own heuristic. A value this large means the "
+						        "presentID/actualPresentTime correlation is wrong.",
+						        horizon_ns / U_TIME_1MS_IN_NS);
+					}
+				} else {
+					xrt_display_processor_vk_set_predicted_scanout(
+					    (struct xrt_display_processor_vk *)c->display_processor, horizon_ns);
+				}
+			}
 
 			// Call display processor with atlas (or zero-copy swapchain) texture.
 			// The canvas sub-rect comes from vk_dp_canvas_rect() — the same
@@ -3802,7 +4184,16 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				// and this overlay is a no-op, so the wait costs
 				// nothing in practice — but keep it for safety when
 				// HUD eventually wires up.
-				vk->vkDeviceWaitIdle(vk->device);
+				if (dxr_postwait_queue_only()) {
+					// #837: drain only the queue the DP actually
+					// submits on (see dxr_postwait_queue_only).
+					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE)
+					                   ? c->repaint_queue
+					                   : queue;
+					vk->vkQueueWaitIdle(dp_q);
+				} else {
+					vk->vkDeviceWaitIdle(vk->device);
+				}
 
 				// Allocate a fresh cmd buffer for any post-DP
 				// overlays (HUD), then fall through to the shared
@@ -3953,16 +4344,70 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (struct xrt_display_processor_vk *)c->display_processor, queue);
 		}
 
+		bool cmd_freed = false;
 		if (res == VK_SUCCESS) {
 			if (*fence_p != VK_NULL_HANDLE) {
-				vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
-				vk->vkResetFences(vk->device, 1, fence_p);
+				/*
+				 * #1264 S1 fence-park: a FILL must not hold the compositor
+				 * lock across its own GPU execution — that hold is the
+				 * measured 17-23 ms scheduling hole starving the in-process
+				 * fill loops (and it blocks the app's commit path for the
+				 * GPU's duration). Release the lock for the wait, retake it,
+				 * and re-validate: if the world moved while we waited (a
+				 * fresher present landed, the target was recreated, or the
+				 * session is tearing down) the fill's present is DROPPED —
+				 * a stale fill behind a fresher frame steps the panel
+				 * backwards. App frames keep the synchronous wait: their
+				 * pacing depends on it (#837 is the separate project that
+				 * would change that). DXR_FILL_FENCE_PARK=0 reverts.
+				 */
+				static int park = -1;
+				if (park < 0) {
+					const char *pe = getenv("DXR_FILL_FENCE_PARK");
+					park = (pe != NULL && pe[0] == '0') ? 0 : 1;
+				}
+				if (is_repaint && park == 1 && c->target != NULL) {
+					const uint32_t gen_park =
+					    comp_vk_native_target_get_generation(c->target);
+					const uint64_t serial_park = c->present_serial;
+					os_mutex_unlock(&c->mutex);
+					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, fence_p);
+					os_mutex_lock(&c->mutex);
+					// GPU is done — the command buffer is free regardless of
+					// what the validation below decides.
+					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+					cmd_freed = true;
+					static bool park_logged = false;
+					if (!park_logged) {
+						park_logged = true;
+						U_LOG_W("#1264 S1: fill fence-park engaged — the fill's "
+						        "GPU wait no longer holds the compositor lock "
+						        "(DXR_FILL_FENCE_PARK=0 reverts)");
+					}
+					if (!os_thread_helper_is_running(&c->repaint_thread) ||
+					    c->display_processor == NULL || c->target == NULL ||
+					    comp_vk_native_target_get_generation(c->target) != gen_park ||
+					    c->present_serial != serial_park) {
+						if (target_fb != VK_NULL_HANDLE) {
+							vk->vkDestroyFramebuffer(vk->device, target_fb,
+							                         NULL);
+						}
+						*out_skip_frame = true;
+						return XRT_SUCCESS;
+					}
+				} else {
+					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
+					vk->vkResetFences(vk->device, 1, fence_p);
+				}
 			} else {
 				vk->vkQueueWaitIdle(queue);
 			}
 		}
 
-		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		if (!cmd_freed) {
+			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		}
 	}
 
 	// Destroy temporary framebuffer after GPU is done
@@ -3976,6 +4421,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 	// Present
 	xret = comp_vk_native_target_present(c->target, queue);
+	if (xret == XRT_SUCCESS) {
+		c->present_serial++; // #1264 S1: the fence-park's drop-if-superseded key
+	}
 
 	/*
 	 * VK-0 (#1178) — one-shot deposit proof, DXR_VK_DEPOSIT_PROBE=1 only.
@@ -4027,14 +4475,191 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
  * Paces itself with the lock RELEASED, then takes it for the whole replay, so
  * the queue and the vendor weaver only ever see one caller.
  */
+/*!
+ * #902 kill switch: pace the repaint loop on the MEASURED vblank grid instead
+ * of the compositor's assumed refresh rate.
+ *
+ * Default ON where a grid exists — but a grid only exists where the driver
+ * supplies display timing, so on every other platform this is inert and the
+ * loop keeps its current behaviour untouched.
+ *
+ * The switch is here because repaint scheduling has a bad track record: five
+ * gap-filling variants looked right and lost on hardware before the #1257 slot
+ * partition worked, and the failure mode was cadence instability that only an
+ * eyeball caught. This one is A/B-able without a rebuild.
+ *
+ * DXR_VBLANK_GRID_PACING=0 / debug.dxr.vblank_grid_pacing 0 restores the
+ * assumed-rate behaviour.
+ */
+/*!
+ * #902: place the repaint at the MIDPOINT of the app's interval, not merely
+ * wherever the quiet gate first allows it.
+ *
+ * Measured cause of this device's cadence problem, and it is not instability.
+ * With the panel pinned and the app metronomic (CoV 3%), the repaint was
+ * landing at phase 0.70 of the app's interval with SD 0.02 — so the on-screen
+ * stream alternated 41.4 ms / 17.7 ms forever. Mean 29.56 ms and SD 11.87 both
+ * fall straight out of that alternation; the entire ~40% interval CoV was
+ * MISPLACEMENT, not variance.
+ *
+ * The quiet gate answers "is it safe to repaint yet", which was the right
+ * question when the app's cadence was unknown. It is known now — to 3% — and
+ * the grid supplies real vblanks, so the midpoint is a schedulable target
+ * rather than a guess. Same weave count, same GPU cost; the weaves are simply
+ * placed where the eye wants them.
+ *
+ * DEFAULT OFF, because as written this CANNOT WORK, and the reason is worth
+ * more than the code. A hold can only ever DELAY a fire, never advance one —
+ * and the repaint already fires LATE, at 0.70. So the hold is a no-op in the
+ * best case (measured: phase 0.71 -> 0.70, unchanged) and a cost in the worst
+ * (35.1 -> 28.6 fps, since retries burn ticks).
+ *
+ * Two attempts, both instructive:
+ *   1. Hold placed AFTER the pacing block and under the lock. Strictly worse —
+ *      phase 0.71 -> 0.83, CoV 41% -> 65% — because each rejected attempt paid
+ *      another full pacing block before re-testing, so the retry itself
+ *      dragged the fire later. Hold before the thing that blocks, or the hold
+ *      becomes a delay.
+ *   2. Hold moved above the pacing. Correct placement, still a no-op, for the
+ *      structural reason above.
+ *
+ * What would actually work: the repaint sits at 0.70 because the #1257 gate's
+ * WINDOW is placed there, and the fix is to move that window, not to add a
+ * second gate downstream of it. That is the code with the five-failed-variant
+ * history, so it wants a deliberate session and its own A/B rather than a
+ * late-night patch.
+ *
+ * DXR_REPAINT_PHASE=1 / debug.dxr.repaint_phase 1 re-enables, for anyone who
+ * wants to reproduce the above rather than take it on faith.
+ */
+static bool
+dxr_repaint_phase_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 0; // DEFAULT OFF — see the header comment: it cannot work as written.
+		const char *e = getenv("DXR_REPAINT_PHASE");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.repaint_phase", sp) > 0 && sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
+static bool
+dxr_vblank_grid_pacing_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		on = 1;
+		const char *e = getenv("DXR_VBLANK_GRID_PACING");
+		if (e != NULL && e[0] != '\0') {
+			on = (e[0] == '0') ? 0 : 1;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.vblank_grid_pacing", sp) > 0 && sp[0] != '\0') {
+				on = (sp[0] == '0') ? 0 : 1;
+			}
+		}
+#endif
+	}
+	return on == 1;
+}
+
 static void *
 vk_repaint_thread(void *ptr)
 {
 	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)ptr;
 
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("vk");
+#endif
+
 	while (os_thread_helper_is_running(&c->repaint_thread)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
-		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+		uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
+
+		/*
+		 * #902: prefer the MEASURED panel period over the assumed one.
+		 *
+		 * `hz` above is what the compositor was told at create time. On a
+		 * variable-refresh panel that is a snapshot, not a fact: measured on
+		 * the NP02J moving 59.86 <-> 119.71 Hz inside one session with no
+		 * swapchain recreate, while this loop paced a hardcoded 60 — so it
+		 * targeted half the real rate for as long as the boost lasted, which
+		 * is precisely the interactive stretch where cadence matters most.
+		 *
+		 * 0 means the grid cannot vouch for a period (no display-timing, no
+		 * fresh anchor, feed stopped), and then the assumed rate stands. That
+		 * is deliberately the ONLY fallback: substituting anything else here
+		 * would rebuild the open-loop guess this replaces.
+		 */
+		if (dxr_vblank_grid_pacing_enabled() && c->target != NULL) {
+			bool clamped = false;
+			uint64_t measured_ns = comp_vk_native_target_vblank_period_ns(c->target);
+			/*
+			 * FLOOR THE PERIOD AT THE ASSUMED ONE — never pace FASTER than
+			 * the compositor was sized for.
+			 *
+			 * This is a hang fix, not a tuning choice. Following the panel's
+			 * touch-triggered 60 -> 120 boost asks for a weave every 8.35 ms
+			 * while a weave costs ~21 ms of GPU at these clocks: a ~2.5x
+			 * overcommit. The submissions back up until a fence inside the
+			 * vendor weaver stops signalling, and the whole session wedges —
+			 * captured on device as the repaint thread parked in
+			 * process_atlas_weave -> vkWaitForFences while the app thread sat
+			 * in layer_commit's os_cond_wait waiting for it. Reproduced by
+			 * rotating the model, which is exactly what triggers the boost.
+			 *
+			 * So the grid's value here is correcting the period we already
+			 * planned for (59.86 vs an assumed 60.00, and any mode change
+			 * DOWNWARD in rate), not chasing every boost the platform offers.
+			 * Pacing faster needs a measured sustainable-rate budget, which
+			 * does not exist yet; until it does, refusing to chase is the only
+			 * honest option.
+			 */
+			if (measured_ns != 0 && measured_ns < period_ns) {
+				if (!c->repaint.grid_clamp_logged) {
+					c->repaint.grid_clamp_logged = true;
+					U_LOG_W("#902: measured %.3f ms is FASTER than the assumed %.3f ms — "
+					        "clamping. Chasing the panel's boost overcommits the GPU "
+					        "and wedges the weave; see the comment at this site.",
+					        measured_ns / 1e6, period_ns / 1e6);
+				}
+				measured_ns = 0; // keep the assumed period
+				clamped = true;
+			}
+			if (measured_ns != 0) {
+				if (measured_ns != c->repaint.last_grid_period_ns) {
+					U_LOG_W("#902: repaint pacing on the measured grid — %.3f ms "
+					        "(%.2f Hz); assumed was %.3f ms (%.2f Hz)",
+					        measured_ns / 1e6, 1e9 / (double)measured_ns,
+					        period_ns / 1e6, hz);
+					c->repaint.last_grid_period_ns = measured_ns;
+				}
+				period_ns = measured_ns;
+			} else if (c->repaint.last_grid_period_ns != 0) {
+				// Two very different reasons to be on the assumed rate, and
+				// conflating them sent me looking for a lost feed when the
+				// grid was working perfectly and simply being clamped.
+				U_LOG_W("#902: repaint pacing back on the assumed rate (%.2f Hz) — %s",
+				        hz,
+				        clamped ? "measured rate clamped (panel faster than we can sustain)"
+				                : "grid no longer trusted (feed stopped or stale)");
+				c->repaint.last_grid_period_ns = 0;
+			}
+		}
 
 		/*
 		 * #1196: this wait doubles as the request inbox. Sleep at most a
@@ -4044,9 +4669,16 @@ vk_repaint_thread(void *ptr)
 		 * app_frame_in_progress, all of which describe REPAINTS. The app
 		 * frame is the real thing the repaint exists to keep alive.
 		 */
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		// Keyed on the throttle actually being ENGAGED, not the raw env —
+		// a refused tier keeps stock behavior.
+		const uint64_t tick_ns =
+		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
+
 		os_mutex_lock(&c->mutex);
 		if (!c->weave_hand.pending) {
-			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, period_ns / 4);
+			os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex, tick_ns);
 		}
 		if (c->weave_hand.pending) {
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
@@ -4073,6 +4705,13 @@ vk_repaint_thread(void *ptr)
 		}
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
+		}
+
 		// #868 diag: where the loop actually goes. A repaint that never fires
 		// is indistinguishable from one that fires and produces nothing unless
 		// the gate state is sampled — this is what caught the loop never
@@ -4087,13 +4726,56 @@ vk_repaint_thread(void *ptr)
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
-		// Keyed on the last APP frame, never on the last repaint — otherwise
-		// repaints pace off their own timestamps and free-run.
+		// #1257: cadence-aware gate. Keyed on the last APP frame, never on
+		// the last repaint — otherwise repaints pace off their own timestamps
+		// and free-run. With a trusted vblank-count cadence (app presents
+		// every N vblanks) each app frame gets a budget of N-1 repaints,
+		// presented clear of the app's own queue slot; otherwise it is the
+		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
+		}
+
+		/*
+		 * #902 PHASE HOLD. The gate above says "allowed"; this says "not yet".
+		 *
+		 * Hold until the midpoint of the app's interval so the two streams
+		 * interleave evenly instead of clustering. Measured cause of this
+		 * device's cadence problem: with the panel pinned and the app
+		 * metronomic (CoV 3%), the repaint landed at phase 0.70 (SD 0.02), so
+		 * the on-screen stream alternated 41.4 / 17.7 ms forever. The whole
+		 * ~40% interval CoV was MISPLACEMENT, not variance.
+		 *
+		 * MUST sit here, above the pacing, not below it. The first version put
+		 * it after the pacing block and under the lock, which made things
+		 * strictly worse — phase 0.71 -> 0.83, CoV 41% -> 65% — because every
+		 * rejected attempt paid another full pacing block before re-testing,
+		 * so the retry itself dragged the fire later. Hold BEFORE the thing
+		 * that blocks, or the hold becomes a delay.
+		 *
+		 * Escape hatch: once the app is a full interval overdue it is
+		 * hitching, not pacing, and the original #868 case applies — fill
+		 * immediately rather than waiting for a midpoint that will not come.
+		 */
+		if (dxr_repaint_phase_enabled() && c->repaint.force != 1 &&
+		    c->repaint.app_interval_ns != 0 && c->repaint.last_app_frame_ns != 0) {
+			const uint64_t now_ph = os_monotonic_get_ns();
+			const uint64_t since = now_ph - c->repaint.last_app_frame_ns;
+			const uint64_t target = c->repaint.app_interval_ns / 2;
+			if (since < target && since < c->repaint.app_interval_ns) {
+				continue;
+			}
+			if (!c->repaint.phase_logged) {
+				c->repaint.phase_logged = true;
+				U_LOG_W("#902: repaint phase target engaged — app interval %.2f ms, "
+				        "aiming the fill at %.2f ms (debug.dxr.repaint_phase=0 restores)",
+				        c->repaint.app_interval_ns / 1e6, target / 1e6);
+			}
 		}
 
 #ifdef XRT_OS_WINDOWS
@@ -4117,15 +4799,20 @@ vk_repaint_thread(void *ptr)
 			if (!comp_vk_split_has_weave_slot(c->split)) {
 				continue;
 			}
+			const uint64_t fire_t0 = os_monotonic_get_ns();
 			os_mutex_lock(&c->mutex);
 			if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 			    c->repaint.app_frame_in_progress || c->split == NULL) {
+				u_repaint_trace_bail_race(&c->repaint.trace);
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
 			c->repaint.count++;
+			const uint64_t fire_t1 = os_monotonic_get_ns();
+			u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+			u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 			os_mutex_unlock(&c->mutex);
 
 			static bool split_repaint_logged = false;
@@ -4152,7 +4839,57 @@ vk_repaint_thread(void *ptr)
 		// replay would use belongs to the generation sampled here.
 		const uint32_t gen_before = comp_vk_native_target_get_generation(tgt);
 
-		comp_vk_native_target_repaint_pace(tgt);
+		/*
+		 * RECREATE QUIESCENCE. Do not weave across a target-generation
+		 * flip: hold the repaint off until the generation has been stable
+		 * for 100 ms.
+		 *
+		 * The gen_before/gen_after pair above and below only catches a
+		 * recreate that lands INSIDE this iteration. It does not stop a
+		 * repaint from weaving immediately AFTER one, and that is where
+		 * the vendor weaver loses a fence: measured under
+		 * DXR_WEAVE_REPAINT_FORCE=1, the session wedged in 3.4 s with the
+		 * repaint thread parked in CNSDK -> Adreno vkWaitForFences while
+		 * the GPU sat at busy=0, after three swapchain recreations in
+		 * three seconds (launch extent churn 1600 -> 1540 -> 1600). It is
+		 * the same signature as the earlier rotation freeze — a fence
+		 * that never signals because it belongs to a generation that is
+		 * gone.
+		 *
+		 * Only the REPAINT path is held. App frames never consult this;
+		 * their weave runs through the hand-off above and is untouched,
+		 * so a recreate costs at most a few skipped fills, never a frame.
+		 */
+		{
+			const uint64_t gen_now_ns = os_monotonic_get_ns();
+			if (gen_before != c->repaint.last_gen) {
+				c->repaint.last_gen = gen_before;
+				c->repaint.last_gen_change_ns = gen_now_ns;
+			}
+			if (c->repaint.last_gen_change_ns != 0 &&
+			    gen_now_ns - c->repaint.last_gen_change_ns < 100ULL * 1000 * 1000) {
+				if (!c->repaint.gen_quiesce_logged) {
+					c->repaint.gen_quiesce_logged = true;
+					U_LOG_W("#868: holding repaints for 100 ms after a target "
+					        "recreate (generation %u) — weaving across a "
+					        "generation flip loses a fence inside the vendor "
+					        "weaver and wedges the session",
+					        gen_before);
+				}
+				continue;
+			}
+		}
+
+		// #1257 partition: the late-weave pacer is for OCCASIONAL repaints —
+		// it can block for periods, which throttles a grid fill to a
+		// fraction of its slots (measured on d3d12: fill at ~8/s). Under
+		// an ENGAGED partition the schedule IS the pacing; skip it.
+		if (c->repaint.partition.next_release_ns == 0) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
+			comp_vk_native_target_repaint_pace(tgt);
+			const uint64_t pace_t1 = os_monotonic_get_ns();
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		}
 
 		os_mutex_lock(&c->mutex);
 
@@ -4161,6 +4898,7 @@ vk_repaint_thread(void *ptr)
 		// layer_accum does not exercise the feature, it corrupts the frame.
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == NULL) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4172,8 +4910,13 @@ vk_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+		// Re-run the gate under the lock: an app frame that landed while we
+		// paced resets its quiet key, so this is the race check. (Was a bare
+		// `quiet < period` floor; the #1257 adaptive window opens at half a
+		// period, which that floor would kill.)
 		if (c->repaint.force != 1 &&
-		    os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
@@ -4225,6 +4968,7 @@ vk_repaint_thread(void *ptr)
 
 		uint64_t fp[8] = {0};
 		bool skip_frame = false;
+		const uint64_t fire_t0 = os_monotonic_get_ns();
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
@@ -4234,6 +4978,9 @@ vk_repaint_thread(void *ptr)
 		}
 
 		c->repaint.count++;
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -4271,7 +5018,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 	// #837 frame-stage timing (env-gated) — see vk_frame_timing above. fp[]
 	// marks are taken at the windowed-DP path's stage boundaries.
-	const bool ftime = debug_get_bool_option_frame_stage_timing();
+	const bool ftime = dxr_frame_stage_timing_enabled();
 	uint64_t fp[7] = {0};
 	if (ftime) {
 		fp[0] = os_monotonic_get_ns();
@@ -4890,7 +5637,25 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		 */
 		c->repaint.armed = wove;
 		if (wove) {
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 		comp_vk_split_render_diag(c->split);
 
@@ -4919,6 +5684,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				 * repaint thread can take it to run the weave, and hands it
 				 * back before returning. Loop on `pending`: cond waits wake
 				 * spuriously.
+				 *
+				 * BOUNDED, per the no-unbounded-work rule
+				 * (docs/reference/workspace-stability.md, #925). The wait
+				 * used to be an os_cond_wait with no deadline, so a weave
+				 * thread that never comes back froze the app forever —
+				 * captured twice as a double backtrace: the repaint thread
+				 * parked in the vendor weaver's vkWaitForFences after a
+				 * target recreate, this thread parked here behind it. Two
+				 * seconds is deliberately generous: it must never fire on a
+				 * merely slow frame, only convert a permanent wedge into one
+				 * failed frame. The abandon below is race-free — both sides
+				 * run under c->mutex and the serve site re-tests `pending`
+				 * under the lock before writing anything, so a request
+				 * withdrawn here is simply never served.
 				 */
 				c->weave_hand.pending = true;
 				c->weave_hand.zero_copy = zero_copy;
@@ -4934,8 +5713,27 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 				c->weave_hand.result = XRT_SUCCESS;
 				c->weave_hand.skip_frame = false;
 				os_cond_broadcast(&c->weave_cond);
+				const uint64_t hand_deadline_ns =
+				    (uint64_t)os_monotonic_get_ns() + 2ULL * 1000 * 1000 * 1000;
 				while (c->weave_hand.pending) {
-					os_cond_wait(&c->weave_cond, &c->mutex);
+					os_cond_wait_timeout_ns(&c->weave_cond, &c->mutex,
+					                        100ULL * 1000 * 1000);
+					if (!c->weave_hand.pending ||
+					    (uint64_t)os_monotonic_get_ns() < hand_deadline_ns) {
+						continue;
+					}
+					// Wedged. Withdraw the request, fail this frame the
+					// same way a torn-down weave thread fails it, and
+					// disarm the repaint so the replay path — which weaves
+					// through the same wedged DP — is not re-entered.
+					c->weave_hand.pending = false;
+					c->weave_hand.result = XRT_ERROR_VULKAN;
+					c->weave_hand.skip_frame = true;
+					c->repaint.armed = false;
+					U_LOG_E("#1196: weave thread unresponsive for 2 s — failing this frame "
+					        "instead of freezing the app. Known signature: the vendor weave "
+					        "stuck in vkWaitForFences after a target recreate (see "
+					        "docs/reference/workspace-stability.md, #925).");
 				}
 				xret = c->weave_hand.result;
 				skip_frame = c->weave_hand.skip_frame;
@@ -4953,7 +5751,25 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 			// Only a REAL frame resets the quiet-gate. A repaint must not, or
 			// repaints would pace off their own timestamps and free-run.
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
 
 	// #224 / ADR-027 P4: sideband-sync this client's zone state with the DP
@@ -5441,6 +6257,55 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
  * Two callers, for the reason @ref vk_make_dp_vk has two: the session create and
  * the #918 split's retire.
  */
+/*!
+ * #902: does this physical device advertise VK_GOOGLE_display_timing?
+ *
+ * The app creates the VkDevice, and Vulkan offers no way to read back which
+ * extensions were enabled on it — which is why vk_init_from_given takes a
+ * boolean per extension rather than discovering them. The runtime lists this
+ * one in the optional set it hands the app (oxr_vulkan.c), filtered against
+ * driver support, so "the device advertises it" is the honest proxy for "the
+ * app enabled it" on this path.
+ *
+ * Enumerated straight off the physical device: no VkDevice needed, and the
+ * instance-level entry point is always resolvable.
+ */
+static bool
+comp_vk_physical_device_has_display_timing(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                                           VkInstance instance,
+                                           VkPhysicalDevice physical_device)
+{
+	if (get_instance_proc_addr == NULL || instance == VK_NULL_HANDLE ||
+	    physical_device == VK_NULL_HANDLE) {
+		return false;
+	}
+	PFN_vkEnumerateDeviceExtensionProperties enumerate =
+	    (PFN_vkEnumerateDeviceExtensionProperties)get_instance_proc_addr(
+	        instance, "vkEnumerateDeviceExtensionProperties");
+	if (enumerate == NULL) {
+		return false;
+	}
+	uint32_t count = 0;
+	if (enumerate(physical_device, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+		return false;
+	}
+	VkExtensionProperties *props = U_TYPED_ARRAY_CALLOC(VkExtensionProperties, count);
+	if (props == NULL) {
+		return false;
+	}
+	bool found = false;
+	if (enumerate(physical_device, NULL, &count, props) == VK_SUCCESS) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (strcmp(props[i].extensionName, "VK_GOOGLE_display_timing") == 0) {
+				found = true;
+				break;
+			}
+		}
+	}
+	free(props);
+	return found;
+}
+
 static xrt_result_t
 vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transparent_background)
 {
@@ -5451,6 +6316,7 @@ vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transpar
 	// create its own swapchain. The HWND passed to CreateVulkanWeaver is
 	// used only for monitor detection and draw-region calculation.
 	if (hwnd != NULL
+
 #ifdef XRT_OS_WINDOWS
 	    || c->owns_window
 #endif
@@ -5537,6 +6403,8 @@ vk_make_target_vk(struct comp_vk_native_compositor *c, void *hwnd, bool transpar
  * A failure to rebuild the Vulkan weaver is logged at ERROR, not WARN — a
  * session that weaves nowhere must not have to be INFERRED from an absent line.
  */
+
+
 static void
 vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, const char *short_reason)
 {
@@ -5606,6 +6474,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_left,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
+                                 bool app_keyed_mutex,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -5632,6 +6501,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// = false`, which is the runtime declaring what IT uses the bundle for, and
 	// changing it would move behaviour on the flag-off path.
 	c->app_timeline_semaphores = app_timeline_semaphores;
+	c->app_keyed_mutex = app_keyed_mutex;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -5652,6 +6522,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	                                     false, // timeline_semaphore_enabled
 	                                     false, // image_format_list_enabled
 	                                     false, // debug_utils_enabled
+	                                     // #902: display_timing_enabled. The runtime lists
+	                                     // VK_GOOGLE_display_timing in the optional set it hands
+	                                     // the app (oxr_vulkan.c), filtered against driver
+	                                     // support — so on a device that advertises it, the app's
+	                                     // device has it. Adopted devices never run
+	                                     // build_device_extensions, so nothing else would ever
+	                                     // set this and the Android vblank grid would stay dark
+	                                     // on hardware that supports it.
+	                                     comp_vk_physical_device_has_display_timing(
+	                                         vkGetInstanceProcAddr, (VkInstance)vk_instance,
+	                                         (VkPhysicalDevice)vk_physical_device),
 	                                     U_LOGGING_INFO);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to initialize vk_bundle from app device: %d", vk_ret);
@@ -6148,7 +7029,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * The loop is gated on actually having one of the two, not merely on
 		 * the env var.
 		 */
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: settings chain (env > per-user > machine) — the Control
+		// Panel's Compatibility mode turns this off. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), NULL);
 		c->repaint.enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 
 		/*
@@ -6166,6 +7050,34 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #else
 			int single = 0;
 #endif
+			/*
+			 * #1261: auto-enable single ownership when the slot partition
+			 * will engage on an IN-PROCESS tier. The measured A/B (VK
+			 * pinned, D=3): dual-thread ticks 122-161/s with 8-18 ms
+			 * intervals and fills 18-21; single-thread ticks 176-205/s at
+			 * 3.4-4.4 ms, fills +30%, slips and cadence jitter halved, and
+			 * the APP's own weave rate went UP — the mutex convoy between
+			 * the app-thread weave and the fill loop is a large piece of
+			 * that tier's starvation, with no observed downside. Scoped
+			 * tightly: never on the split/bridge path (verified four-for-
+			 * four under legacy ownership — do not change a passing
+			 * config), and only when the throttle can actually engage here
+			 * (bring-up override present; keep this condition in sync with
+			 * the tier gate if in-process tiers are ever marked supported).
+			 * The explicit env below still wins in both directions.
+			 */
+			bool split_active = false;
+#ifdef XRT_OS_WINDOWS
+			split_active = (c->split != NULL);
+#endif
+			if (u_app_partition_divisor() >= 2 && !split_active &&
+			    u_app_partition_any_tier()) {
+				single = 1;
+				U_LOG_W("#1261: slot partition on an in-process tier — single "
+				        "weave-thread ownership auto-enabled (measured: removes "
+				        "the app/fill mutex convoy; DXR_WEAVE_SINGLE_THREAD=0 "
+				        "overrides)");
+			}
 			const char *se = getenv("DXR_WEAVE_SINGLE_THREAD");
 			if (se != NULL && se[0] != '\0') {
 				single = (se[0] == '0') ? 0 : 1;
@@ -6272,6 +7184,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			}
 		}
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
+#ifdef XRT_OS_ANDROID
+		// getenv reaches nothing on Android; the correctness probe would
+		// be permanently unreachable there without this. Env still wins.
+		char sp_force[PROP_VALUE_MAX] = {0};
+		if ((fe == NULL || fe[0] == '\0') &&
+		    __system_property_get("debug.dxr.weave_repaint_force", sp_force) > 0) {
+			fe = sp_force;
+		}
+#endif
 		c->repaint.force = (fe != NULL && fe[0] == '1') ? 1 : 0;
 		if (c->repaint.force == 1) {
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless "
@@ -6291,8 +7212,28 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		if (c->repaint.enabled == 1 && have_present_target) {
 			// Seed the quiet-gate key so the first force-probe counter row
 			// doesn't log a garbage quiet_ns (now − 0) before the first app
-			// frame publishes (#902 Windows validation, cosmetic).
-			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			// frame publishes (#902 Windows validation, cosmetic). The gate's
+			// own seed adds no interval sample (and a >1 s startup gap resets
+			// its stats anyway).
+			{
+				// #902: the app's own interval, for placing the repaint at
+				// the MIDPOINT rather than merely "after it goes quiet".
+				// Measured metronomic (CoV 3%), so a light EMA is safe here
+				// — this is not the varying quantity the #206 lesson warns
+				// about smoothing.
+				const uint64_t now_af = os_monotonic_get_ns();
+				if (c->repaint.last_app_frame_ns != 0) {
+					const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+					if (d > 1000000ULL && d < 500000000ULL) {
+						c->repaint.app_interval_ns =
+						    c->repaint.app_interval_ns == 0
+						        ? d
+						        : (c->repaint.app_interval_ns * 7 + d) / 8;
+					}
+				}
+				c->repaint.last_app_frame_ns = now_af;
+			}
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 			int sret = os_thread_helper_start(&c->repaint_thread, vk_repaint_thread, c);
 			U_LOG_W("#868: repaint loop start ret=%d (target=%p)", sret, (void *)c->target);
 		} else {
@@ -6367,7 +7308,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	deposit_required = (c->split != NULL);
 #endif
 	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height, atlas_width, atlas_height,
-	                                                   c->app_timeline_semaphores, deposit_required, &c->renderer);
+	                                                   c->app_timeline_semaphores, c->app_keyed_mutex,
+	                                                   deposit_required, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);
@@ -6966,6 +7908,20 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 			}
 			xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)c->display_processor, x, y, w, h, display_id);
+			/*
+			 * The panel size in the CURRENT orientation, from the same
+			 * site and the same display_id so the two always agree. A
+			 * windowed weave needs it to know which panel dimension is
+			 * "height" right now; a vendor SDK may only report
+			 * orientation-blind native metrics, and deriving it from the
+			 * window's aspect is wrong whenever the window's shape
+			 * disagrees with the panel's.
+			 */
+			if (disp_w != 0 && disp_h != 0) {
+				xrt_display_processor_vk_set_panel_size(
+				    (struct xrt_display_processor_vk *)c->display_processor, disp_w, disp_h,
+				    display_id);
+			}
 		}
 	}
 	return;
@@ -7833,8 +8789,12 @@ vk_plane_cmd_ring_take(struct comp_vk_native_compositor *c, struct comp_vk_depos
 			return (int32_t)i; // never used
 		}
 		if (timeline == VK_NULL_HANDLE || vk->vkGetSemaphoreCounterValue == NULL) {
-			// No timeline to ask. The deposit then has no working sync at
-			// all, so nothing is racing this buffer either.
+			// No timeline to ask — fence-less (keyed-mutex, #1274) mode.
+			// Reuse is safe by frame structure, not by nothing running:
+			// this frame's submits sit behind the PREVIOUS frame's
+			// per-frame CPU wait (#837), so an entry submitted last frame
+			// has retired by the time this frame asks for it. If #837's
+			// wait is removed, this branch needs a real retirement test.
 			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i;
 		}
@@ -8187,6 +9147,24 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		}
 		vk_split_unstage_planes(c);
 		return;
+	}
+
+	/*
+	 * #1274 — TIMING-ONLY mode's missing forward edge, made explicit.
+	 *
+	 * With no timeline (keyed-mutex deposits), nothing orders the bridge's
+	 * plane copy — recorded at submit_atlas time on the D3D11 context —
+	 * behind THIS flatten still executing on the Vulkan queue. The frame's
+	 * pre-existing CPU wait covers the ATLAS (its submit precedes that
+	 * wait) but not the planes: this submit happens after it. First eyeball
+	 * of the timing-only planes showed exactly the race — the transported
+	 * bubble alternated complete/blank as the copy won or lost, a fast
+	 * periodic blink. So in fence-less mode the flatten takes its own
+	 * bounded CPU wait here; frames with no 2D never reach this line, and
+	 * fence mode is untouched. Revisited with #837 like every wait.
+	 */
+	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
 	}
 	// The entry is reusable once the timeline passes this value.
 	c->plane_cmd_value[ring] = signal_value;

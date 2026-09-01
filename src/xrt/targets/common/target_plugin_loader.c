@@ -21,6 +21,13 @@
  */
 
 #include "target_plugin_loader.h"
+#include "xrt/xrt_config_have.h"
+
+#ifdef XRT_HAVE_VULKAN
+/* #1243 — Vulkan-free prototypes shared with the defining TU (vk_helpers.c),
+ * so the declarations cannot silently diverge from the definitions. */
+#include "vk/vk_abi_fingerprint.h"
+#endif
 #include "target_plugin_preload_sanitize.h"
 #include "target_plugin_path_guard.h"
 
@@ -2575,6 +2582,78 @@ query_source_claims(const struct plugin_display_source *src,
  * into a registry entry. Mirrors the platform gating of
  * `fill_dp_factories_from_plugin` in target_instance.c.
  */
+/*!
+ * #1243/#1244: is this plug-in's `struct vk_bundle` layout compatible with ours?
+ *
+ * The VK DP factory hands the plug-in a raw `vk_bundle *`, and that struct's
+ * layout varies with BUILD CONFIG (`os_mutex` carries `#ifndef NDEBUG` fields,
+ * and `vk_bundle` embeds two of them via `queues[2]` — 16 bytes, exactly two
+ * function-pointer slots) as well as with Vulkan-header gates. Dispatching
+ * through a skewed table calls the WRONG driver entry points; the observed
+ * failure is a SIGSEGV inside the Adreno driver from `process_atlas_weave`.
+ *
+ * Lives here, called from EVERY site that captures `create_dp_vk` — originally
+ * only the per-display-claims path below was guarded, which left
+ * `target_instance.c`'s `fill_dp_factories_from_plugin()` (the path Android
+ * actually takes) unprotected, so the guard never stood between an Android
+ * device and the crash it was written for. One function, all call sites.
+ *
+ * @param iface      The negotiated plug-in interface.
+ * @param plugin_id  For logging only.
+ * @return true if the factory may be used.
+ */
+bool
+xrt_plugin_vk_abi_compatible(const struct xrt_plugin_iface *iface, const char *plugin_id)
+{
+	if (iface == NULL) {
+		return false;
+	}
+	const char *id = (plugin_id != NULL) ? plugin_id : "(unknown)";
+#ifdef XRT_HAVE_VULKAN
+	const uint32_t rt_vkb = vk_bundle_get_abi_size();
+	const uint32_t rt_fto = vk_bundle_get_fn_table_offset();
+	const bool have_field =
+	    iface->struct_size >=
+	    (uint32_t)(offsetof(struct xrt_plugin_iface, vk_bundle_fn_table_offset) + sizeof(uint32_t));
+	const uint32_t pl_vkb = have_field ? iface->vk_bundle_abi_size : 0;
+	const uint32_t pl_fto = have_field ? iface->vk_bundle_fn_table_offset : 0;
+
+	if (pl_vkb == rt_vkb && pl_fto == rt_fto && pl_vkb != 0) {
+		return true;
+	}
+	if (pl_vkb != 0) {
+		U_LOG_E("plugin loader:   %s: vk_bundle ABI mismatch — plug-in compiled "
+		        "sizeof=%u fn_table_offset=%u, runtime sizeof=%u fn_table_offset=%u "
+		        "(build-config skew: NDEBUG/os_mutex or Vulkan-header gates, #1243). "
+		        "Refusing the VK DP factory; the session will run UNWOVEN. Rebuild "
+		        "the plug-in with the same build config (NDEBUG) and Vulkan headers "
+		        "as this runtime.",
+		        id, pl_vkb, pl_fto, rt_vkb, rt_fto);
+		return false;
+	}
+#ifdef XRT_OS_ANDROID
+	U_LOG_E("plugin loader:   %s: plug-in predates the vk_bundle ABI guard (#1243) — "
+	        "cannot verify layout compatibility, and every pre-guard Android pairing "
+	        "is the Debug-vs-Release crash class. Refusing the VK DP factory; the "
+	        "session will run UNWOVEN. Update the plug-in.",
+	        id);
+	return false;
+#else
+	U_LOG_W("plugin loader:   %s: plug-in has no vk_bundle_abi_size (predates the "
+	        "#1243 ABI guard) — layout compatibility UNVERIFIED; proceeding for "
+	        "desktop back-compat (shipped Linux .debs are Release-built on both "
+	        "sides). IF THIS PROCESS LATER CRASHES INSIDE A VULKAN DRIVER CALL "
+	        "(e.g. vkCreateFramebuffer), THIS IS WHY: rebuild the plug-in with the "
+	        "same build config (NDEBUG) as this runtime.",
+	        id);
+	return true;
+#endif
+#else
+	(void)id;
+	return true;
+#endif
+}
+
 static void
 fill_registry_entry(struct xrt_dp_registry_entry *e,
                     const struct xrt_display_descriptor *desc,
@@ -2593,7 +2672,10 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 	snprintf(e->serial, sizeof(e->serial), "%s", claim->serial);
 
 	if ((claim->supported_apis & XRT_DP_API_BIT_VK) && iface->create_dp_vk != NULL) {
-		e->dp_factory_vk = (void *)iface->create_dp_vk;
+		// #1243/#1244 — shared check, see xrt_plugin_vk_abi_compatible().
+		if (xrt_plugin_vk_abi_compatible(iface, e->plugin_id)) {
+			e->dp_factory_vk = (void *)iface->create_dp_vk;
+		}
 	}
 #ifdef XRT_OS_WINDOWS
 	if ((claim->supported_apis & XRT_DP_API_BIT_D3D11) && iface->create_dp_d3d11 != NULL) {

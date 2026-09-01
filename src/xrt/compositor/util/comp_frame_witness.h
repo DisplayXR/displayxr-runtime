@@ -42,6 +42,7 @@
 
 #include "os/os_time.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 struct comp_frame_witness
 {
@@ -59,7 +60,10 @@ struct comp_frame_witness
 	{
 		int e = enabled.load(std::memory_order_relaxed);
 		if (e < 0) {
-			const char *v = getenv("DXR_FRAME_WITNESS");
+			// #1252: settings chain (env > per-user > machine). This is one of
+			// the two levers the Control Panel's Diagnostics toggle drives.
+			char buf[64];
+			const char *v = u_setting_get_raw("DXR_FRAME_WITNESS", buf, sizeof(buf), nullptr);
 			long secs = (v != nullptr && v[0] != '\0') ? atol(v) : 0;
 			if (secs < 0 || secs > 60) {
 				secs = 0;

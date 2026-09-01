@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 17
+#define XR_DXR_display_info_SPEC_VERSION 18
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -92,6 +92,100 @@ typedef struct XrDisplayDesktopPositionDXR {
     int32_t                     left;       //!< Panel left edge in virtual-desktop pixels
     int32_t                     top;        //!< Panel top edge in virtual-desktop pixels
 } XrDisplayDesktopPositionDXR;
+
+// ---- v18: Full panel desktop rect + stable device name (#1301) ----
+
+#define XR_TYPE_DISPLAY_DESKTOP_INFO_DXR ((XrStructureType)1004999211)
+
+//! Size of XrDisplayDesktopInfoDXR::deviceName, in bytes, including the NUL.
+#define XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR 128
+
+/*!
+ * @brief Desktop geometry and stable identity of the monitor the 3D panel is
+ * on, returned by xrGetSystemProperties (v18 addition).
+ *
+ * Supersedes XrDisplayDesktopPositionDXR, which carries only the origin. That
+ * struct keeps working unchanged — this is a SEPARATE chained struct rather
+ * than extra fields on it, because the runtime writes chained output structs
+ * with its own compiled layout and appending to a published struct would write
+ * past an app allocation compiled against v16.
+ *
+ * ## What it is for
+ *
+ * Nothing else in the wire protocol says WHERE the panel is, so a client that
+ * creates its own window has to guess, and typically lands on the OS primary
+ * monitor (see displayxr-unity#266). Matching displayPixelWidth/Height against
+ * the OS monitor list is ambiguous the moment two monitors share a resolution.
+ * Chain this struct instead, then place the window inside @ref desktopRect.
+ *
+ * ## Coordinate contract — read this before using desktopRect
+ *
+ * @ref desktopRect is in PHYSICAL virtual-desktop pixels: the coordinate space
+ * a per-monitor-DPI-aware-v2 process sees. The origin is the primary monitor's
+ * top-left, and monitors left of or above it have NEGATIVE offsets. The runtime
+ * pins a per-monitor-v2 DPI context while resolving it, so the value is
+ * physical regardless of the host process's own DPI awareness.
+ *
+ * A consumer MUST act in that same space. A DPI-UNAWARE process that passes
+ * these coordinates to SetWindowPos (or any managed wrapper over it) is handed
+ * virtualised coordinates by the OS and will place the window wrong by the
+ * ratio of the two monitors' scale factors — correct on a single-monitor box,
+ * wrong on exactly the mixed-DPI multi-monitor rigs this struct exists to
+ * serve. Either declare per-monitor-v2 awareness for the process, or wrap the
+ * placement call in SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2).
+ *
+ * ## desktopRect is not displayPixelWidth/Height
+ *
+ * XrDisplayInfoDXR::displayPixelWidth/Height are the panel's NATIVE
+ * resolution. @ref desktopRect.extent is the monitor's CURRENT desktop mode.
+ * They differ whenever the user runs a non-native mode. Use @ref desktopRect
+ * for placement and displayPixel* for render sizing.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrDisplayDesktopInfoDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_DESKTOP_INFO_DXR
+    void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
+    /*!
+     * The panel monitor's full desktop rect in physical virtual-desktop
+     * pixels. `offset` is the signed top-left; `extent` is the current desktop
+     * mode's size. An all-zero rect means the runtime could not resolve it —
+     * treat the geometry as unknown and fall back to your previous placement.
+     */
+    XrRect2Di                   desktopRect;
+    /*!
+     * Stable OS device name of the panel's monitor, NUL-terminated UTF-8, for
+     * re-resolving the monitor after a hotplug or arrangement change (feed it
+     * to EnumDisplayDevices, or match it against DXGI_OUTPUT_DESC::DeviceName).
+     *
+     * Windows: the GDI name, e.g. `\\.\DISPLAY1`.
+     * Empty string when the platform has no equivalent yet — the macOS
+     * (CGDirectDisplayID) and Linux (XRandR output) identifiers are the
+     * follow-on.
+     */
+    char                        deviceName[XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR];
+    /*!
+     * XR_TRUE when the panel's monitor is the desktop's primary monitor, in
+     * which case a client that only wants "open on the panel" can skip moving
+     * its window entirely. Common in the field: making the 3D panel the
+     * Windows primary is the standing workaround for the absence of this
+     * struct, so machines that already worked around it report XR_TRUE.
+     */
+    XrBool32                    isPrimary;
+    /*!
+     * XR_TRUE when the resolved monitor's current mode matches the panel's
+     * reported native resolution — i.e. the runtime genuinely located the 3D
+     * panel.
+     *
+     * XR_FALSE means the display processor expressed no position and the
+     * runtime fell back to the primary monitor. That happens with
+     * `sim_display` (hardware-free development) and on the platforms whose
+     * panel-origin plumbing is still open (#715). The rect is still a valid,
+     * placeable monitor rect — it is just not evidence that a 3D panel is
+     * there, so a client may prefer to leave its window where it is.
+     */
+    XrBool32                    isPanelConfirmed;
+} XrDisplayDesktopInfoDXR;
 
 /*!
  * @brief Hardware display state for xrRequestDisplayModeDXR (v15 repurpose).

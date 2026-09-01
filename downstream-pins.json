@@ -32,6 +32,14 @@
       "the bump is ABI-gated, since raising the pin raises that installer's minimum",
       "runtime floor."
     ],
+    "_key_suffixes_are_safe": [
+      "Tracks deliberately use SUFFIXED keys (DXR_RUNTIME_GIT_TAG vs _ANDROID vs _LINUX;",
+      "RUNTIME_REF vs _ANDROID). Bumping one can never rewrite another, because both",
+      "rewriters in scripts/downstream_pin_bump.py require a delimiter an underscore",
+      "cannot satisfy: cmake_set matches set(KEY followed by whitespace then a quote,",
+      "and yaml_env matches KEY followed immediately by a colon. Verified before the",
+      "android track was added (#1247) -- preserve this property if those regexes change."
+    ],
     "_shape_constraint": [
       "The downstream Rule-5 checks regex the literal set(DXR_RUNTIME_GIT_TAG \"vX.Y.Z\"",
       "shape. Rewrites must preserve it exactly -- no computed values, no indirection."
@@ -47,6 +55,14 @@
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
+          ]
+        },
+        "android": {
+          "auto_bump": true,
+          "reason": "The runtime's Android APK BUNDLES this plug-in (ADR-038), so the two ship as one artifact and must stay ABI- and build-config-matched. Unlike the windows track, no installer derives a MIN_RUNTIME_VERSION floor from this pin, so repinning costs nothing; the ABI gate still skips releases that change no plug-in ABI.",
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG_ANDROID" },
+            { "file": ".github/workflows/build-android.yml", "kind": "yaml_env", "key": "RUNTIME_REF_ANDROID" }
           ]
         },
         "linux": {

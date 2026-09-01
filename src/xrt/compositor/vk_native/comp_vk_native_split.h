@@ -440,6 +440,19 @@ void
 comp_vk_split_stage_no_composite(struct comp_vk_split *split);
 
 /*!
+ * #1264 — declare the DXGI format of the caller's 2D plane surfaces (Local2D +
+ * backdrop). The plane chains must share the source's typeless family — a
+ * cross-family copy is DROPPED in silence, which is why the bind refuses
+ * instead. Default (never calling this) is `DXGI_FORMAT_B8G8R8A8_UNORM`, the
+ * VK deposit's family; the d3d12 reroute passes `R8G8B8A8`. Call once, after
+ * @ref comp_vk_split_wire_bridge and BEFORE the first backdrop/Local2D stage —
+ * changing an already-bound chain's family is not supported. The mask plane is
+ * R8 regardless.
+ */
+void
+comp_vk_split_set_plane_format(struct comp_vk_split *split, uint32_t dxgi_format);
+
+/*!
  * True when the scanout-adapter display processor advertises hardware zone
  * slots. Probed once; the answer is the D3D11 weaver's, not the Vulkan one's,
  * which is why the compositor cannot answer it for a split session.

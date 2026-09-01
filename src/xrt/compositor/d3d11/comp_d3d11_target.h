@@ -147,6 +147,14 @@ uint64_t
 comp_d3d11_target_get_measured_weave_ns(struct comp_d3d11_target *target);
 
 /*!
+ * #206: FORWARD-computed weave→scanout for a weave recorded now, from the
+ * vsync-locked vblank grid (0 = no trusted grid — DP falls back to the
+ * retrospective heuristic). Feeds the DP's set_predicted_scanout slot.
+ */
+uint64_t
+comp_d3d11_target_predict_weave_to_scanout_ns(struct comp_d3d11_target *target);
+
+/*!
  * Get target dimensions.
  *
  * @ingroup comp_d3d11

@@ -18,6 +18,14 @@
 // cross-adapter transport, both shared with the D3D11 legs.
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
+#include "comp_d3d12_deposit.h"
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+// #1264 heavy-d3d12 reroute: the same-adapter fill arm. Vulkan-free D3D11 code
+// that lives in comp_vk_native; consumes only the pure-D3D11 handoff struct.
+#include "vk_native/comp_vk_native_split.h"
+#else
+struct comp_vk_split; // the reroute fields exist either way; the code does not
+#endif
 
 #include "d3d11/comp_d3d11_window.h"
 
@@ -29,6 +37,7 @@
 #include "xrt/xrt_display_metrics.h"
 
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
 #include "util/u_debug.h"
 #include "util/u_misc.h"
@@ -42,6 +51,8 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_repaint_gate.h"
+#include "util/u_fill_thread_win.h"
 #include "util/u_capture_dims.h"
 #include "util/u_image_capture.h"
 #include "util/u_hud.h"
@@ -300,6 +311,39 @@ struct comp_d3d12_compositor
 	//! APP device if the split has to be retired mid-session (#918 D12-3). Not
 	//! owned — it is a function pointer supplied at create.
 	void *dp_factory;
+
+	//! #1264 heavy-d3d12 reroute: the D3D11 DP factory the d3d11 fill arm's
+	//! Stage A asks for a weaver with. Not owned; NULL means the reroute
+	//! refuses (`dp_refused_scanout`) and the tier keeps its own arm.
+	void *dp_factory_d3d11;
+
+	/*!
+	 * #1264 / ADR-039 heavy-d3d12 reroute. When ACTIVE this session's fill,
+	 * weave and present all belong to the d3d11 fill arm (`comp_vk_split` —
+	 * the measured event-immune engine): the renderer's atlas is an imported
+	 * D3D11 deposit slot, the compositor's own DP / target / out-device split
+	 * machinery is never created (one weaver per HWND — the split took it),
+	 * and the frame path exits through comp_vk_split_weave_and_present. The
+	 * own-legs arm remains the hybrid path and the DXR_SPLIT_D3D12_ROUTE=own
+	 * A/B control.
+	 */
+	struct
+	{
+		struct comp_vk_split *split;
+		struct comp_d3d12_deposit *dep;
+		bool active;
+		//! The DP canvas rect the frame path last published (repaint replays it).
+		struct xrt_rect canvas;
+		//! Change-detection for the scratch->plane copies (planes are
+		//! on-change surfaces; a steady frame costs a compare).
+		uint64_t l2d_copied_hash;
+		uint64_t bd_copied_hash;
+		//! ADR-027 P4 wish publish sequence on this route.
+		uint64_t wish_seq;
+		//! Change-detection for the authored-mask staged->plane copy
+		//! ((res_gen << 48) | author_seq — either half moving re-copies).
+		uint64_t mask_copied_key;
+	} reroute;
 
 	//! Output target (DXGI swapchain).
 	struct comp_d3d12_target *target;
@@ -633,6 +677,19 @@ struct comp_d3d12_compositor
 		//! Gates the repaint so it only fires once the app has actually gone
 		//! quiet. Deliberately not touched by repaints — see the thread.
 		uint64_t last_app_frame_ns;
+
+		//! #1257 interval-aware quiet gate.
+		struct u_repaint_gate gate;
+
+		//! DXR_WEAVE_REPAINT_TRACE=1 loop instrumentation (#1264 Phase B:
+		//! this arm was the one fill loop with no trace rows — blind
+		//! exactly where the same-adapter bring-up needed eyes).
+		struct u_repaint_trace trace;
+		//! #1264 event-absorption shed (DXR_FILL_SHED_FIRE_MS, opt-in).
+		struct u_fill_shed shed;
+
+		//! #1257 slot partition: xrWaitFrame throttle state.
+		struct u_app_partition partition;
 
 		//! Diagnostics: where the loop goes, counted so a repaint that never
 		//! fires can be told apart from one that fires and does nothing.
@@ -1537,6 +1594,276 @@ d3d12_split_retire(struct comp_d3d12_compositor *c, const char *why, const char 
  * explicit constraint is that the split must not lengthen it. Duration is
  * logged so a regression is visible rather than inferred.
  */
+//! #1264: the reroute is live for this session (always-defined so panel-sizing
+//! conditions read cleanly on builds without the arm).
+static inline bool
+d3d12_fill_arm_active(struct comp_d3d12_compositor *c)
+{
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	return c->reroute.active;
+#else
+	(void)c;
+	return false;
+#endif
+}
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+/*!
+ * #1264 heavy-d3d12: which arm does a SAME-ADAPTER engage run on? Default is
+ * the d3d11 fill arm (the measured winner — 2.2–2.9 ms fires under real app
+ * load where the d3d12 arm serializes at 8–9 ms; Intel preemption is
+ * draw-granular). `DXR_SPLIT_D3D12_ROUTE=own` keeps the tier's own out-arm,
+ * as the A/B control and for the cube-class record.
+ */
+/*!
+ * PROTOTYPE (#1261 follow-up): route a HYBRID (cross-adapter) d3d12 session
+ * onto the d3d11 fill arm too, instead of its own-legs D3D12 arm.
+ *
+ * The VK tier already does exactly this in BOTH topologies -- its partition
+ * gate reads "the #918 split's d3d11 fill arm, hybrid OR same-adapter". The
+ * d3d12 reroute was accepted same-adapter-only (#1264), so a hybrid d3d12
+ * session falls through to the own-legs arm, whose partition record did not
+ * pass -- which is why the #1257 divisor lever does not exist for Unity on a
+ * hybrid box today.
+ *
+ * Nothing structural blocks it: the deposit ring is app-adapter-local in both
+ * designs (D3D12 renders into NT-shared D3D11 textures on its OWN adapter),
+ * and the cross-adapter hop belongs to the xbridge downstream -- the same
+ * xbridge the VK tier already crosses on hybrid hardware.
+ *
+ * OPT-IN and default OFF: this is a bring-up flag, exactly as
+ * DXR_SPLIT_SAME_ADAPTER_D3D12 was for Phase C. It does not become a default
+ * without its own measured acceptance record.
+ */
+static bool
+d3d12_reroute_hybrid_optin(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_SPLIT_D3D12_HYBRID_REROUTE");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+static bool
+d3d12_reroute_route_d3d11(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_SPLIT_D3D12_ROUTE");
+		on = (e != NULL && strcmp(e, "own") == 0) ? 0 : 1;
+	}
+	return on == 1;
+}
+
+/*!
+ * #1264 heavy-d3d12 reroute Stage A: stand the d3d11 fill arm up for this
+ * session — comp_vk_split's Stage A1 (out device, HWND target, D3D11 DP per
+ * ADR-037 §3a), then the deposit ring, then wire the transport. Mirrors the VK
+ * compositor's A1/A2 split. Best-effort: any failure leaves the session on its
+ * stock path with the reason logged; nothing half-engages.
+ */
+static void
+d3d12_reroute_stage_a(struct comp_d3d12_compositor *c,
+                      struct xrt_device *xdev,
+                      int32_t display_screen_left,
+                      int32_t display_screen_top)
+{
+	const LUID app_luid = c->device->GetAdapterLuid();
+	struct comp_vk_split_info si = {};
+	si.xdev = xdev;
+	si.hwnd = c->hwnd;
+	si.dp_factory_d3d11 = c->dp_factory_d3d11;
+	si.has_shared_texture = c->has_shared_texture;
+	si.transparent_background = c->transparent_background;
+	// The gate this bool exists for is Vulkan's (a timeline semaphore the
+	// runtime cannot enable after the fact); D3D12 fences always interop.
+	si.app_timeline_semaphores = true;
+	si.render_packed_luid =
+	    ((uint64_t)(uint32_t)app_luid.HighPart << 32) | (uint64_t)(uint32_t)app_luid.LowPart;
+	si.display_screen_left = display_screen_left;
+	si.display_screen_top = display_screen_top;
+	si.preferred_width = c->settings.preferred.width;
+	si.preferred_height = c->settings.preferred.height;
+
+	const char *short_reason = NULL;
+	if (comp_vk_split_stage_a(&si, &c->reroute.split, &short_reason) != XRT_SUCCESS ||
+	    c->reroute.split == NULL) {
+		c->split_off_reason = (short_reason != NULL) ? short_reason : COMP_SPLIT_REASON_STAGE_A_FAILED;
+		U_LOG_W("#1264 reroute: d3d11 fill arm Stage A refused (%s) — stock path",
+		        c->split_off_reason != NULL ? c->split_off_reason : "?");
+		return;
+	}
+
+	// The deposit ring at the worst-case system atlas (ADR-010's sizing rule,
+	// same numbers the own-legs arm bridges at).
+	uint32_t sys_w = 0, sys_h = 0;
+	if (xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(xdev->rendering_modes, xdev->rendering_mode_count, &sys_w, &sys_h);
+	}
+	if (sys_w == 0 || sys_h == 0) {
+		sys_w = c->settings.preferred.width;
+		sys_h = c->settings.preferred.height;
+	}
+	if (comp_d3d12_deposit_create(c->device, sys_w, sys_h, &c->reroute.dep) != XRT_SUCCESS ||
+	    c->reroute.dep == NULL) {
+		comp_vk_split_retire(&c->reroute.split, "deposit creation failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+		return;
+	}
+
+	struct comp_vk_deposit_handoff handoff = {};
+	if (!comp_d3d12_deposit_get_handoff(c->reroute.dep, &handoff) ||
+	    !comp_vk_split_wire_bridge(c->reroute.split, &handoff)) {
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+		comp_vk_split_retire(&c->reroute.split, "bridge wire failed", COMP_SPLIT_REASON_STAGE_A_FAILED);
+		c->split_off_reason = COMP_SPLIT_REASON_STAGE_A_FAILED;
+		return;
+	}
+
+	// The plane machinery's panel-sizing rule reads these (same source the
+	// own-legs Stage A fills them from).
+	if (xdev->hmd != NULL) {
+		c->split_panel_w = xdev->hmd->screens[0].w_pixels;
+		c->split_panel_h = xdev->hmd->screens[0].h_pixels;
+	}
+
+	// This tier's flatten family is RGBA (the atlas ring's, and the scratch
+	// the plane copies promote from) — the arm's chains must match or the
+	// bind refuses on the typeless-family check.
+	comp_vk_split_set_plane_format(c->reroute.split, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM);
+
+	c->reroute.active = true;
+	c->split_off_reason = NULL;
+	U_LOG_W(
+	    "#1264 heavy-d3d12 reroute ACTIVE: this session's fill/weave/present run on the d3d11 fill "
+	    "arm (ADR-039 — one fill engine); the atlas renders into a D3D11 deposit ring opened on the "
+	    "app's D3D12 device, %ux%u x%u. DXR_SPLIT_D3D12_ROUTE=own reverts to the tier's own arm.",
+	    sys_w, sys_h, (unsigned)COMP_D3D12_DEPOSIT_RING);
+}
+/*!
+ * Record a scratch -> deposit-plane copy on the app list. Both resources sit
+ * in COMMON at rest (the scratch's deposit-half steady state; the imported
+ * plane's cross-API decay state); the copy brackets its own states. Requires
+ * identical extents — both are panel-sized by the widened alloc conditions.
+ */
+static void
+d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scratch, ID3D12Resource *plane)
+{
+	D3D12_RESOURCE_BARRIER pre[2] = {};
+	pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	pre[0].Transition.pResource = scratch;
+	pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	pre[1] = pre[0];
+	pre[1].Transition.pResource = plane;
+	pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	c->cmd_list->ResourceBarrier(2, pre);
+
+	c->cmd_list->CopyResource(plane, scratch);
+
+	D3D12_RESOURCE_BARRIER post[2] = {};
+	post[0] = pre[0];
+	post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	post[1] = pre[1];
+	post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	c->cmd_list->ResourceBarrier(2, post);
+}
+
+/*!
+ * #1264 — the reroute's LOCAL2D staging: the transport fork of the deposit
+ * half. Everything semantic (the mask capture into out_mask_req, the Local2D
+ * flatten into the panel-sized scratch, the guards) already ran exactly as the
+ * own-legs split's; this copies the flatten into the deposit plane on content
+ * change, rasters the captured mask on the d3d11 arm (whose immediate-context
+ * device rasters inline, the shipped D3D11 leg's shape), and stamps the arm's
+ * recipe. Mode and mask-kind vocabularies are numerically identical across the
+ * legs (LERP/ALPHA_OVER/ZONES = 0/1/2; NONE/IMPLICIT/ZONE_BINARY/ZONE_FEATHER
+ * = 0/1/2/3), so both pass through.
+ *
+ * @return false when this frame cannot composite on the route — the caller
+ *         stamps no-composite, exactly like a failed own-legs deposit.
+ */
+static bool
+d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
+                            uint32_t region_w,
+                            uint32_t region_h,
+                            bool zones_frame,
+                            bool bridged_authored,
+                            bool have_explicit,
+                            const struct u_canvas_rect *eff_canvas,
+                            int32_t digest_proj_idx)
+{
+	if (c->split_panel_w == 0 || c->split_panel_h == 0) {
+		return false;
+	}
+	if (!comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, c->split_panel_w,
+	                                     c->split_panel_h)) {
+		return false;
+	}
+	struct comp_d3d12_deposit_plane pl = {};
+	if (!comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, &pl)) {
+		return false;
+	}
+
+	struct xrt_rect box = {};
+	uint64_t hash = 0;
+	d3d12_local2d_digest(c, digest_proj_idx, /*over=*/true, region_w, region_h, &box, &hash);
+	if (hash != c->reroute.l2d_copied_hash) {
+		d3d12_reroute_copy_to_plane(c, c->local2d_scratch, (ID3D12Resource *)pl.resource12);
+		c->reroute.l2d_copied_hash = hash;
+	}
+
+	// The captured mask request rasters on the ARM (out_mask_req kinds ==
+	// COMP_VK_SPLIT_MASK_* numerically). A BRIDGED authored mask captured no
+	// raster and gates the composite off its plane instead — the own-legs
+	// capture block's exact exemption.
+	bool mask_ok = false;
+	if (c->out_mask_req.kind != D3D12_OUT_MASK_NONE && c->out_mask_req.count > 0) {
+		mask_ok = comp_vk_split_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
+		                                    c->out_mask_req.feather, c->out_mask_req.count,
+		                                    c->out_mask_req.w, c->out_mask_req.h);
+	}
+	if (!mask_ok && !bridged_authored) {
+		return false;
+	}
+
+	// ADR-027/#801 — a ZONES frame's explicit wish is PUBLISH-only, never a
+	// blend gate: the composite gates on the binary zone raster there. A
+	// legacy (non-zones) authored mask IS the gate — the hard M-lerp.
+	const bool mask_is_plane = bridged_authored && !zones_frame;
+	const uint32_t mode = zones_frame ? COMP_D3D12_COMPOSITE_MODE_ZONES
+	                     : mask_is_plane ? COMP_D3D12_COMPOSITE_MODE_LERP
+	                                     : COMP_D3D12_COMPOSITE_MODE_ALPHA_OVER;
+	const bool opaque = c->transparent_background && debug_get_bool_option_present_opaque_comp();
+	const int32_t cx = eff_canvas->valid ? eff_canvas->x : 0;
+	const int32_t cy = eff_canvas->valid ? eff_canvas->y : 0;
+	const uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
+	const uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
+
+	comp_vk_split_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
+	                            box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
+	                            region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane);
+
+	/*
+	 * ADR-027 P4 — the hardware zone WISH on this route (the VK caller's
+	 * exact pattern): a zones frame publishes the binary raster the arm just
+	 * built; a non-zones frame clears.
+	 */
+	if (zones_frame) {
+		c->reroute.wish_seq++;
+		comp_vk_split_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
+	} else {
+		comp_vk_split_clear_zone_wish(c->reroute.split);
+	}
+	return true;
+}
+#endif // COMP_D3D12_HAVE_D3D11_FILL_ARM
+
 static void
 d3d12_split_stage_a(struct comp_d3d12_compositor *c,
                     struct xrt_device *xdev,
@@ -1592,11 +1919,72 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 		gin.scanout_luid.high = sdesc.AdapterLuid.HighPart;
 	}
 
+	// ADR-039 ACCEPTED for this tier via the heavy-d3d12 reroute (#1264,
+	// 2026-08-29: the full ladder — 8-9 ms own-arm fires to 1.4 ms through
+	// the d3d11 arm at 60 flat, acceptance leg with events absorbed, planes
+	// bound, and the eyeball incl. live resize — "ship it"). The tier now
+	// consults the accepted default (on; DXR_SPLIT_SAME_ADAPTER=0 is the
+	// shared kill switch); the DXR_SPLIT_SAME_ADAPTER_D3D12 bring-up env
+	// retired with the acceptance, as its contract said it would. The
+	// engage routes to the d3d11 fill arm by default
+	// (DXR_SPLIT_D3D12_ROUTE=own keeps the own-legs arm — the A/B control
+	// and the hybrid arm, whose partition record did NOT pass).
+	gin.allow_same_adapter = comp_split_gate_env_same_adapter();
+
 	struct comp_split_gate_result gate = {};
 	comp_split_gate_evaluate(&gin, &gate);
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
-	if (gate.same_adapter) {
+	/*
+	 * PROTOTYPE: the reroute is same-adapter by acceptance; the opt-in extends it
+	 * to the hybrid topology the VK tier already serves on this same arm.
+	 *
+	 * The hybrid engage ALSO requires the partition to be requested, and that is
+	 * the whole reason it can be considered for default-on. Measured on a real
+	 * client: the reroute's BENEFIT needs the divisor (-42% app iGPU at D=3),
+	 * while its COST is paid either way (+19 CPU points with the reroute alone,
+	 * `C-REROUTE-NODIV`). Engaging it for a session that never asked for the
+	 * partition is therefore all cost and no benefit.
+	 *
+	 * That cost is probably not removable: it is not the staged ingress (the
+	 * deposit is a RING, so adaptive ingress would stage every frame anyway) and
+	 * not the fill loop (both arms tick on a byte-identical formula). What is
+	 * left is the D3D11 device + immediate context this arm submits through
+	 * every frame, against the own-legs path's pure D3D12 -- structural, not a
+	 * bug. So scope the engage to the sessions that pay for it rather than chase
+	 * the cost.
+	 */
+	const bool reroute_topology_ok =
+	    gate.same_adapter || (d3d12_reroute_hybrid_optin() && u_app_partition_divisor() >= 2);
+	if (reroute_topology_ok && gate.split_active) {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		if (d3d12_reroute_route_d3d11()) {
+			// #1264 heavy-d3d12: the same-adapter engage runs on the d3d11
+			// fill arm, not this tier's own out-device machinery — the
+			// measured route for real app load. Nothing of the own-legs
+			// Stage A below is created.
+			U_LOG_W(
+			    "#918 output-device split: ADR-039 %s ENGAGE via the d3d11 fill arm on "
+			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute%s; "
+			    "DXR_SPLIT_SAME_ADAPTER=0 reverts, DXR_SPLIT_D3D12_ROUTE=own for the own-legs arm)",
+			    gate.same_adapter ? "same-adapter" : "HYBRID (cross-adapter)", sdesc.Description,
+			    (unsigned long)sdesc.AdapterLuid.HighPart, (unsigned long)sdesc.AdapterLuid.LowPart,
+			    gate.same_adapter ? ", accepted default"
+			                      : ", PROTOTYPE opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1");
+			d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top);
+			return;
+		}
+#endif
+		// ADR-039: same adapter, split ENGAGED anyway — the fill engine is
+		// the point, not the copy. The "cross-adapter" heap below is simply
+		// a shared heap when both LUIDs match.
+		U_LOG_W(
+		    "#918 output-device split: ADR-039 same-adapter ENGAGE on the OWN-LEGS arm on '%ls' "
+		    "LUID=%08lx:%08lx (DXR_SPLIT_D3D12_ROUTE=own — the A/B control; its event record did "
+		    "not pass the matrix, so the partition refuses on this arm)",
+		    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
+		    (unsigned long)sdesc.AdapterLuid.LowPart);
+	} else if (gate.same_adapter) {
 		// Not a failure: on a MUX'd / single-GPU box the weave is already local,
 		// so the split has nothing to do.
 		U_LOG_W(
@@ -1619,8 +2007,47 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	if (reason == nullptr) {
 		D3D12_COMMAND_QUEUE_DESC qd = {};
 		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+		/*
+		 * #1264 Phase B: SAME-ADAPTER only, the out queue asks for
+		 * scheduler-level priority. Measured (v2.14.11-4, Unity vs cube on
+		 * one iGPU): with both direct queues at NORMAL the app's render
+		 * work sits in front of every weave — fire= balloons 3.5-5x
+		 * (7-10 ms vs the cube's 2 ms), which at 40 target fires/s is
+		 * arithmetically unfillable; the app's own weaves suffer the same
+		 * (13-16 of 20 granted). The contention pre-exists the split
+		 * (stock in-process leg is statistically identical), so isolation
+		 * is the fix class, and PRIORITY_HIGH is the documented,
+		 * unprivileged rung (GLOBAL_REALTIME needs privilege; a compute-
+		 * queue weave is the deeper fallback). Hybrid keeps NORMAL — its
+		 * out queue owns a whole adapter and the accepted record was
+		 * measured there at NORMAL. DXR_SPLIT_QUEUE_HIGH=0 forces NORMAL
+		 * for A/B. Refusal falls back to NORMAL with one WARN.
+		 */
+		bool want_high = gate.same_adapter;
+		{
+			const char *e = getenv("DXR_SPLIT_QUEUE_HIGH");
+			if (e != nullptr && e[0] == '0') {
+				want_high = false;
+			}
+		}
+		if (want_high) {
+			qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_HIGH;
+		}
 		hr = c->out_dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
 		                                    reinterpret_cast<void **>(&c->out_queue));
+		if (want_high && (FAILED(hr) || c->out_queue == nullptr)) {
+			U_LOG_W(
+			    "#1264: PRIORITY_HIGH out queue refused (0x%08lx) — falling back to NORMAL "
+			    "(expect app-vs-fill queue contention on this adapter)",
+			    (unsigned long)hr);
+			qd.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+			hr = c->out_dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+			                                    reinterpret_cast<void **>(&c->out_queue));
+		} else if (want_high && SUCCEEDED(hr)) {
+			U_LOG_W("#1264: same-adapter out queue at D3D12_COMMAND_QUEUE_PRIORITY_HIGH — "
+			        "weave submissions preempt the app's NORMAL direct queue "
+			        "(DXR_SPLIT_QUEUE_HIGH=0 reverts)");
+		}
 		if (SUCCEEDED(hr)) {
 			hr = c->out_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
 			                                        __uuidof(ID3D12CommandAllocator),
@@ -1938,6 +2365,11 @@ d3d12_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_request_display_mode(c->display_processor, true);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_request_display_mode(c->reroute.split, true);
+	}
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -1953,6 +2385,11 @@ d3d12_compositor_end_session(struct xrt_compositor *xc)
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_request_display_mode(c->display_processor, false);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_request_display_mode(c->reroute.split, false);
+	}
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -1986,6 +2423,8 @@ d3d12_compositor_predict_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: panel period on purpose — see wait_frame's note on
+	// the double-pacing failure.
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
@@ -2022,6 +2461,17 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
+	// #1257 partition: block until the app's next slot BEFORE the lock —
+	// the repaint loop keeps weaving the other slots underneath this
+	// sleep. No-op unless DXR_APP_FRAME_DIVISOR >= 2. Supported tier =
+	// the #1264 REROUTE only (the d3d11 fill arm, whose acceptance record
+	// carried the tier) — keying on the reroute being ACTIVE couples this
+	// gate to the accepted default by construction, the same structural
+	// coupling the VK and d3d11 tiers ship. The own-legs arm (hybrid, or
+	// DXR_SPLIT_D3D12_ROUTE=own) still refuses cleanly: its event record
+	// (3-of-3 deep dips) never passed the matrix.
+	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, d3d12_fill_arm_active(c));
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
@@ -2039,6 +2489,11 @@ d3d12_compositor_wait_frame(struct xrt_compositor *xc,
 		comp_d3d12_target_mark_wait_frame(c->target);
 	}
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
+	// #1257 partition: deliberately still the PANEL period, never D x period
+	// — the stretched period made well-behaved apps pace themselves on top
+	// of the throttle (double pacing; measured 14/s on a 20/s schedule on
+	// this tier). Pacing lives in the throttle alone; animation steps by
+	// predictedDisplayTime deltas, which stride honestly.
 	*out_predicted_display_period_ns = period_ns;
 
 	// The spec requires predictedDisplayTime to strictly increase across
@@ -3325,6 +3780,12 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	                                             comp_d3d12_target_get_measured_weave_ns(c->target),
 	                                             (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
 
+	// #206: forward-computed horizon for THIS weave, from the vsync-locked
+	// vblank grid — exact per weave, no estimator lag under variable
+	// cadence. 0 = no trusted grid ⟹ DP keeps the retrospective value.
+	xrt_display_processor_d3d12_set_predicted_scanout(
+	    c->display_processor, comp_d3d12_target_predict_weave_to_scanout_ns(c->target));
+
 	// Pass actual backbuffer dimensions to the DP. Canvas offset and size are
 	// passed separately — the DP uses them to set a viewport sub-rect for
 	// correct interlacing phase.
@@ -3414,6 +3875,7 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	// Only a real frame resets the quiet-gate; see d3d12_repaint_thread.
 	if (!is_repaint) {
 		c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+		u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 	}
 
 	// #672 diag: file-triggered WOVEN back-buffer capture (post-DP). Shows the
@@ -3472,13 +3934,21 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 static void
 d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 {
+#ifdef XRT_OS_WINDOWS
+	// #1264 S2: real-time-media scheduling for the fill thread.
+	u_fill_thread_join_mmcss("d3d12");
+#endif
+
 	while (!c->repaint_quit.load(std::memory_order_relaxed)) {
 		const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
 		const uint64_t period_ns = (uint64_t)(U_TIME_1S_IN_NS / hz);
 
 		// Tick well inside a period so "the app went quiet" is noticed near the
 		// refresh it matters for, rather than up to a full period late.
-		os_nanosleep((int64_t)(period_ns / 4));
+		// #1257 partition: with a known fill schedule the window segments
+		// are only a few ms wide, so tick fine enough to land in them.
+		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
+		                                                                   : period_ns / 4));
 
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
@@ -3486,10 +3956,18 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 
 		c->repaint.ticks++;
 
+		if (u_repaint_trace_enabled(&c->repaint.trace)) {
+			const uint64_t tn = os_monotonic_get_ns();
+			u_repaint_trace_tick(&c->repaint.trace, tn);
+			u_repaint_trace_report(&c->repaint.trace, tn, "d3d12", &c->repaint.gate, period_ns,
+			                       &c->repaint.partition);
+		}
+
 		// Cheap unlocked pre-check, re-tested under the lock below. Avoids
 		// paying the pacing wait on every tick of an app that is making rate.
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
 		// Fire only once the app has ALREADY missed a full refresh — i.e. the
@@ -3498,32 +3976,100 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// otherwise repaints would pace off their own timestamps and drift below
 		// panel rate. Their cadence comes from the scanout wait instead.
 		//
-		// Two periods, not one-and-a-bit, and that margin is the whole design.
-		// An app whose interval merely straddles a period (measured: the Unity
-		// avatar at 46.7 fps on this 60 Hz panel, a 1.28-period interval) is
-		// about to submit anyway: by the time a repaint paces and takes the
-		// lock, the real frame has landed, so it bails having bought nothing —
-		// and on the ticks where it does not bail it is competing with the app
-		// for the same GPU to fill a gap that was closing on its own. The win
-		// only exists when a refresh is genuinely unclaimed, which is what
-		// >= 2 periods means. That is also exactly the case #868 is FOR: a
-		// 60 fps app on a 240 Hz panel sits at 4 periods.
+		// #1257: the fixed margin became cadence-aware. The old constant —
+		// two periods, not one-and-a-bit — existed because an app whose
+		// interval merely straddles a period (measured: the Unity avatar at
+		// 46.7 fps on this 60 Hz panel, a 1.28-period interval) is about to
+		// submit anyway: a repaint racing it steals the lock and the GPU to
+		// fill a gap that was closing on its own. But the same constant made
+		// panel rate unreachable for a present-capped app (hz20: the first
+		// missed vblank of EVERY app frame is unrepaintable; hz30: interval
+		// = exactly 2 periods, the gate never opens — measured repaints/s
+		// 0.0). u_repaint_gate keeps the intent in vblank counts instead:
+		// when the app provably presents every N vblanks, each app frame
+		// gets a budget of N-1 repaints presented clear of the app's own
+		// FIFO queue slot (the 46.7 fps case rounds to N=1 and therefore
+		// still never repaints); without a trusted cadence it IS the legacy
+		// 2-period constant.
 		//
 		// DXR_WEAVE_REPAINT_FORCE=1 bypasses the gate so the repaint path can be
 		// exercised on hardware where no app is slow enough to trip it. It makes
 		// the app SLOWER (it is meant to) — it is a correctness probe, never a
 		// perf setting.
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns * 2) {
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
+
+		// #1264 event-absorption shed (opt-in): an expensive fire opened a
+		// shed window — skip this fill; app frames are untouched by
+		// construction (this is the FILL loop).
+		if (u_fill_shed_active(&c->repaint.shed, os_monotonic_get_ns())) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 
 		// Pace to the panel BEFORE taking the lock — this blocks for up to a
 		// few periods, and holding the lock across it would stall an arriving
 		// app frame for exactly that long.
-		comp_d3d12_target_repaint_pace(c->target);
+		// #1257 partition: SKIPPED under the partition — this pacer is for
+		// occasional repaints and its multi-period blocks were the measured
+		// reason the d3d12 grid fill sat at ~8/s while VK's (whose pacer is
+		// a no-op on Intel) reached 27-31/s. The grid IS the pacing.
+		// #1264 reroute: no app-side target to pace against — the d3d11
+		// arm's own flip chain paces its weave.
+		if (c->repaint.partition.next_release_ns == 0 && c->target != nullptr) {
+			const uint64_t pace_t0 = os_monotonic_get_ns();
+			comp_d3d12_target_repaint_pace(c->target);
+			u_repaint_trace_pace(&c->repaint.trace, pace_t0, os_monotonic_get_ns());
+		}
 
 		std::lock_guard<std::mutex> lock(c->mutex);
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		/*
+		 * #1264 reroute: the fill IS the d3d11 arm's replay of the published
+		 * egress slot — zero bridge traffic, no app-device command list, no
+		 * DP or target on this side to test for. Same re-test discipline,
+		 * then the arm's own weave.
+		 */
+		if (c->reroute.active) {
+			if (c->repaint_quit.load(std::memory_order_relaxed) || !c->repaint.armed ||
+			    c->repaint.app_frame_in_progress || c->reroute.split == NULL ||
+			    !comp_vk_split_has_weave_slot(c->reroute.split)) {
+				c->repaint.bail_armed++;
+				u_repaint_trace_bail_armed(&c->repaint.trace);
+				continue;
+			}
+			if (c->repaint.force != 1 &&
+			    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns,
+			                         &c->repaint.partition)) {
+				c->repaint.bail_race++;
+				u_repaint_trace_bail_race(&c->repaint.trace);
+				continue;
+			}
+
+			const uint64_t fire_t0 = os_monotonic_get_ns();
+			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
+			                                &c->reroute.canvas);
+			c->repaint.count++;
+			const uint64_t fire_t1 = os_monotonic_get_ns();
+			u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+			u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+			u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
+			static bool rr_logged = false;
+			if (!rr_logged) {
+				rr_logged = true;
+				U_LOG_W("#1264 reroute: filling via the d3d11 arm at %.1f Hz while the app is "
+				        "between frames",
+				        hz);
+			}
+			continue;
+		}
+#endif
 
 		// Re-test everything: a real frame may have landed while we paced, in
 		// which case it just did this work and there is nothing stale to fix.
@@ -3535,10 +4081,15 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		    c->repaint.app_frame_in_progress || c->display_processor == NULL || c->target == nullptr ||
 		    c->repaint.atlas == nullptr) {
 			c->repaint.bail_armed++;
+			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
-		if (c->repaint.force != 1 && os_monotonic_get_ns() - c->repaint.last_app_frame_ns < period_ns) {
+		// Re-run the gate under the lock (was a bare `quiet < period` floor;
+		// the #1257 adaptive window opens at half a period).
+		if (c->repaint.force != 1 &&
+		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
 
@@ -3546,6 +4097,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// list — the out device's under the split. This is the arm the split
 		// exists for: a repaint re-weaves a slot already on the scanout adapter
 		// and costs no cross-adapter traffic at all.
+		const uint64_t fire_t0 = os_monotonic_get_ns();
 		if (c->split_active) {
 			c->out_cmd_allocator->Reset();
 			c->out_cmd_list->Reset(c->out_cmd_allocator, nullptr);
@@ -3557,6 +4109,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		d3d12_dp_weave_and_present(c, true, nullptr);
 
 		c->repaint.count++;
+		const uint64_t fire_t1 = os_monotonic_get_ns();
+		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+		u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 		static bool logged = false;
 		if (!logged) {
 			logged = true;
@@ -3734,7 +4290,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	 * happens later, in the deposit half (@ref d3d12_stage_mask_plane).
 	 */
 	struct comp_d3d12_zone_mask *const authored_mask = d3d12_frame_authored_mask(c);
-	if (c->split_active && !d3d12_bind_mask_plane(c, authored_mask)) {
+	// #1264 reroute: the bind forks inside — a reroute bind failure degrades
+	// the mask feature (returns true), never the session, so this retire is
+	// own-legs-only by construction.
+	if ((c->split_active || d3d12_fill_arm_active(c)) && !d3d12_bind_mask_plane(c, authored_mask)) {
 		d3d12_split_retire(c, "the app-authored zone mask could not be transported to the scanout adapter",
 		                   COMP_SPLIT_REASON_AUTHORED_MASK);
 	}
@@ -3773,6 +4332,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint32_t tgt_height = c->settings.preferred.height;
 	if (c->target != nullptr) {
 		comp_d3d12_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+	} else if (d3d12_fill_arm_active(c) && c->hwnd != nullptr) {
+		/*
+		 * #1264 reroute: there is no app-side target, so the WINDOW itself
+		 * is the authority — and it moves: 3DLuma launches at its args size
+		 * and Screen.SetResolution()s to its authored size within seconds,
+		 * and users drag-resize. Falling back to settings.preferred here
+		 * froze the weave target at the launch size and the composite
+		 * clipped to the intersection (the rung-4 "bottom of the zone is
+		 * cut" finding — the bottom 448 px of an 840x1448 window never
+		 * composited). The arm's own chain follows via the per-frame
+		 * comp_vk_split_resize_target below, which early-outs on same dims.
+		 */
+		RECT rr;
+		if (GetClientRect(c->hwnd, &rr) && rr.right > 0 && rr.bottom > 0) {
+			tgt_width = (uint32_t)rr.right;
+			tgt_height = (uint32_t)rr.bottom;
+		}
 	} else if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
 		tgt_width = eff_canvas.w;
 		tgt_height = eff_canvas.h;
@@ -3880,7 +4456,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
 							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
 						}
-						if (!c->split_active &&
+						// #1264 reroute: zero-copy hands the DP the APP's
+						// swapchain image; under the reroute the atlas MUST
+						// be the deposit slot the d3d11 arm ingests — a
+						// placement fact applied to the result, same as the
+						// split's (ADR-030's gate stays the sole eligibility
+						// test).
+						if (!c->split_active && !c->reroute.active &&
 						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
 							zc_resource = comp_d3d12_swapchain_get_resource(layer->sc_array[0], img_idx);
 							if (zc_resource != nullptr)
@@ -3942,6 +4524,42 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (c->split_active) {
 			comp_xbridge_pre_render(c->xbridge);
 		}
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		if (c->reroute.active && c->reroute.dep != NULL) {
+			/*
+			 * #1264 reroute — this frame's atlas IS a deposit slot. Ring
+			 * advance takes the GPU-side back-pressure wait on the app
+			 * queue (the d3d11 arm's release of the slot), and the renderer
+			 * is re-pointed at the slot's imported resource before any draw
+			 * records. A content growth past the ring (a mode change) grows
+			 * the ring first, under an app-queue idle — rare by
+			 * construction (the ring is worst-case-sized, ADR-010).
+			 */
+			uint32_t dep_w = 0, dep_h = 0;
+			comp_d3d12_deposit_get_dims(c->reroute.dep, &dep_w, &dep_h);
+			const uint32_t need_w = c->eff_layout.cols * c->eff_layout.tile_w;
+			const uint32_t need_h = c->eff_layout.rows * c->eff_layout.tile_h;
+			if (need_w > dep_w || need_h > dep_h) {
+				gpu_wait_idle_app(c);
+				comp_d3d12_deposit_resize(c->reroute.dep, need_w > dep_w ? need_w : dep_w,
+				                          need_h > dep_h ? need_h : dep_h);
+				comp_d3d12_deposit_get_dims(c->reroute.dep, &dep_w, &dep_h);
+			}
+			comp_d3d12_deposit_advance(c->reroute.dep, c->command_queue);
+			void *slot_res = comp_d3d12_deposit_current_resource(c->reroute.dep);
+			if (slot_res == NULL ||
+			    comp_d3d12_renderer_set_external_atlas(c->renderer, slot_res, dep_w, dep_h) !=
+			        XRT_SUCCESS) {
+				static bool bind_warned = false;
+				if (!bind_warned) {
+					bind_warned = true;
+					U_LOG_W("#1264 reroute: external atlas bind failed — this frame renders "
+					        "into the owned atlas and the arm weaves a stale slot");
+				}
+			}
+		}
+#endif
 		xret = comp_d3d12_renderer_draw_projection_pass(
 		    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
@@ -3990,6 +4608,161 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			return xret;
 		}
 	}
+
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	/*
+	 * #1264 reroute — THE frame exit. Execute the atlas work on the app queue,
+	 * signal the deposit fence past it, and hand the slot to the d3d11 fill
+	 * arm; nothing below (this tier's weave, crop, HUD, present) runs — the
+	 * arm owns all of it, exactly as it does for the VK tier. The CPU
+	 * idle-wait mirrors the VK path's post-submit wait (#837's, to remove on
+	 * both together): it is what lets the arm's ingress `Wait` always find
+	 * the atlas complete.
+	 */
+	if (c->reroute.active && c->reroute.split != NULL && c->reroute.dep != NULL) {
+		// Follow the window FIRST — the weave target, the composite region
+		// and the canvas below all derive from this frame's dims, and the
+		// call early-outs on same size (steady state costs a compare).
+		(void)comp_vk_split_resize_target(c->reroute.split, tgt_width, tgt_height);
+
+		/*
+		 * #1264 plane transport — the same deposit half the own-legs split
+		 * runs, with the transport forked to the arm inside it. Recorded onto
+		 * the still-open app list so the flattens and the scratch->plane
+		 * copies ride this frame's execute + fence signal, and one fence
+		 * value covers planes AND atlas (the VK tier's exact pattern).
+		 */
+		{
+			// The 2D-UNDER backdrop, first — its extent rides the recipe.
+			uint32_t bd_w = 0, bd_h = 0;
+			ID3D12Resource *bd = d3d12_flatten_backdrop_2d(c, tgt_width, tgt_height, &bd_w, &bd_h);
+			c->repaint.backdrop = bd;
+			c->repaint.backdrop_w = bd_w;
+			c->repaint.backdrop_h = bd_h;
+			bool bd_staged = false;
+			if (bd != nullptr && bd_w > 0 && bd_h > 0 && c->split_panel_w > 0 &&
+			    comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_BACKDROP,
+			                                    c->split_panel_w, c->split_panel_h)) {
+				struct comp_d3d12_deposit_plane bp = {};
+				if (comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_BACKDROP,
+				                                 &bp)) {
+					// The flatten leaves the scratch in PSR for a DP that,
+					// on this route, lives on the arm and never samples it —
+					// COMMON is where the copy promotes from.
+					D3D12_RESOURCE_BARRIER to_common = {};
+					to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+					to_common.Transition.pResource = bd;
+					to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+					to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+					to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+					c->cmd_list->ResourceBarrier(1, &to_common);
+
+					int32_t bproj = -1;
+					for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+						enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+						if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+							bproj = (int32_t)i;
+							break;
+						}
+					}
+					struct xrt_rect bd_box = {};
+					uint64_t bd_hash = 0;
+					d3d12_local2d_digest(c, bproj, /*over=*/false, bd_w, bd_h, &bd_box,
+					                     &bd_hash);
+					if (bd_hash != c->reroute.bd_copied_hash) {
+						d3d12_reroute_copy_to_plane(c, bd,
+						                            (ID3D12Resource *)bp.resource12);
+						c->reroute.bd_copied_hash = bd_hash;
+					}
+					comp_vk_split_stage_backdrop(c->reroute.split, bp.shared_handle,
+					                             bp.generation, bp.width, bp.height, bd_hash,
+					                             bd_box.offset.w, bd_box.offset.h,
+					                             (uint32_t)bd_box.extent.w,
+					                             (uint32_t)bd_box.extent.h, bd_w, bd_h);
+					bd_staged = true;
+				}
+			}
+			if (!bd_staged) {
+				// The NULL drop — un-stages the plane so a slot can never
+				// claim a backdrop it has no pixels for.
+				comp_vk_split_stage_backdrop(c->reroute.split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+				c->repaint.backdrop_w = 0;
+				c->repaint.backdrop_h = 0;
+			}
+
+			// The MASK plane, staged before the composite decision and
+			// independently of it (#918 F1/D6 — a Tier-3 mask must be able
+			// to bootstrap). Fork inside stages the arm.
+			d3d12_stage_mask_plane(c, authored_mask);
+
+			// The Local2D/mask deposit half (fork inside stages the arm).
+			const bool deposited = d3d12_composite_zone_mask(
+			    c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0,
+			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width,
+			    tgt_height, &eff_canvas, /*slot=*/-1, /*is_repaint=*/false);
+			if (!deposited) {
+				comp_vk_split_stage_no_composite(c->reroute.split);
+			}
+		}
+
+		// Plane back-pressure: nothing in this frame's execute may rewrite a
+		// plane the arm's producer is still reading. GPU-side, usually
+		// already satisfied.
+		comp_d3d12_deposit_plane_wait(c->reroute.dep, c->command_queue);
+
+		c->cmd_list->Close();
+		ID3D12CommandList *rr_lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, rr_lists);
+		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
+		gpu_wait_idle_app(c);
+
+		struct comp_vk_deposit_handoff rr_handoff = {};
+		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
+			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
+			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
+			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
+			// The PLANE release edge, behind the pre_plane_write wait
+			// submit_atlas just recorded on the same D3D11 immediate
+			// context — one ordered stream, one signal for every plane.
+			comp_d3d12_deposit_note_planes_consumed(c->reroute.dep);
+		}
+
+		// The DP canvas: the effective canvas sub-rect when one is active,
+		// else the full target — the same answer the own weave computes.
+		struct xrt_rect rr_canvas = {};
+		if (eff_canvas.valid) {
+			rr_canvas.offset.w = eff_canvas.x;
+			rr_canvas.offset.h = eff_canvas.y;
+			rr_canvas.extent.w = (int32_t)eff_canvas.w;
+			rr_canvas.extent.h = (int32_t)eff_canvas.h;
+		} else {
+			rr_canvas.extent.w = (int32_t)tgt_width;
+			rr_canvas.extent.h = (int32_t)tgt_height;
+		}
+		c->reroute.canvas = rr_canvas;
+
+		const bool rr_wove = comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/false,
+		                                                     &rr_canvas);
+
+		// #868: arm the repaint replay exactly as the VK tier does — a frame
+		// that wove nothing keeps the panel's last woven frame and stays
+		// disarmed for the tick.
+		c->repaint.tgt_w = tgt_width;
+		c->repaint.tgt_h = tgt_height;
+		c->repaint.view_w = c->eff_layout.tile_w;
+		c->repaint.view_h = c->eff_layout.tile_h;
+		c->repaint.cols = c->eff_layout.cols;
+		c->repaint.rows = c->eff_layout.rows;
+		c->repaint.armed = rr_wove;
+		if (rr_wove) {
+			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
+			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+		}
+
+		comp_vk_split_render_diag(c->reroute.split);
+		return XRT_SUCCESS;
+	}
+#endif
 
 	// Shared texture mode: weave (or copy) atlas into shared texture, skip window present
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
@@ -4604,6 +5377,19 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	// #1264 reroute teardown: the arm first (its consumer holds NT opens of
+	// the deposit slots and quiesces its own device), then the deposit —
+	// AFTER the repaint join above, since the fill ticks drive the arm.
+	if (c->reroute.split != NULL) {
+		comp_vk_split_destroy(&c->reroute.split);
+	}
+	if (c->reroute.dep != NULL) {
+		comp_d3d12_deposit_destroy(&c->reroute.dep);
+	}
+	c->reroute.active = false;
+#endif
+
 	// Wait for GPU idle. Teardown is one of the only two places that must
 	// quiesce BOTH scopes, and it does so as two INDEPENDENT waits, each on
 	// its own queue's fence — never one wait covering both queues. Off the
@@ -4736,6 +5522,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *d3d12_device,
                              void *d3d12_command_queue,
                              void *dp_factory_d3d12,
+                             void *dp_factory_d3d11,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
@@ -4763,6 +5550,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
+	c->dp_factory_d3d11 = dp_factory_d3d11;
 	c->hud = NULL;
 	c->hud_texture = nullptr;
 	c->hud_upload_buffer = nullptr;
@@ -4978,11 +5766,20 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			d3d12_compositor_destroy(&c->base.base);
 			return XRT_ERROR_D3D;
 		}
-		xret = d3d12_make_target(c, transparent_background);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_E("Failed to create D3D12 target");
-			d3d12_compositor_destroy(&c->base.base);
-			return xret;
+		if (c->reroute.active) {
+			// #1264 reroute: the d3d11 fill arm owns the HWND's swapchain
+			// and present. The factory above stays — a future retire
+			// rebuilds the app-side target with it, exactly as a split
+			// retire does.
+			c->target = nullptr;
+			U_LOG_I("Skipping app-side DXGI swapchain (reroute — the d3d11 arm presents)");
+		} else {
+			xret = d3d12_make_target(c, transparent_background);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Failed to create D3D12 target");
+				d3d12_compositor_destroy(&c->base.base);
+				return xret;
+			}
 		}
 	} else {
 		c->target = nullptr;
@@ -5011,7 +5808,10 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// DP frame and is inert until then, so starting it here (before the display
 	// processor exists) is safe.
 	{
-		const char *e = getenv("DXR_WEAVE_REPAINT");
+		// #1252: settings chain (env > per-user > machine) — the Control
+		// Panel's Compatibility mode turns this off. Same parse as before.
+		char rp_buf[64];
+		const char *e = u_setting_get_raw("DXR_WEAVE_REPAINT", rp_buf, sizeof(rp_buf), nullptr);
 		c->repaint.enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 		const char *fe = getenv("DXR_WEAVE_REPAINT_FORCE");
 		c->repaint.force = (fe != nullptr && fe[0] == '1') ? 1 : 0;
@@ -5019,7 +5819,16 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("#868: DXR_WEAVE_REPAINT_FORCE=1 — repainting every refresh regardless of app "
 			        "rate. This is a correctness probe and WILL cost frame rate.");
 		}
-		if (c->repaint.enabled == 1 && c->target != nullptr) {
+		// #1264 reroute: there is deliberately no app-side target — the fill
+		// replays through the d3d11 arm — but the fill LOOP is still this
+		// thread. Gating on the target alone left the reroute with a working
+		// partition and zero fills: a 20 Hz panel, worse than every config
+		// this campaign measured (found on the first Unity verdict run).
+		bool have_fill_surface = c->target != nullptr;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		have_fill_surface = have_fill_surface || c->reroute.active;
+#endif
+		if (c->repaint.enabled == 1 && have_fill_surface) {
 			c->repaint_quit.store(false);
 			c->repaint_thread = std::thread(d3d12_repaint_thread, c);
 		} else if (c->repaint.enabled == 0) {
@@ -5037,7 +5846,13 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	// cannot drift apart. Everything the DP is told after creation (output
 	// format, transparency, shared-texture-present) moved in there with it.
 	c->dp_factory = dp_factory_d3d12;
-	if (dp_factory_d3d12 != NULL) {
+	if (c->reroute.active) {
+		// #1264 reroute: the d3d11 fill arm's Stage A already created the
+		// session's ONE weaver on the HWND (ADR-037 §3a negotiated in
+		// there); creating this tier's own DP too would put two weavers on
+		// one window — the hard rule d3d12_make_dp's doc carries.
+		U_LOG_I("Skipping app-side display processor (reroute — the d3d11 arm's weaver owns the HWND)");
+	} else if (dp_factory_d3d12 != NULL) {
 		if (!d3d12_make_dp(c) && c->split_active) {
 			/*
 			 * ADR-037 §3a — A WEAVER-CREATION FAILURE IS A FALLBACK TRIGGER,
@@ -5070,13 +5885,23 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 
 	// If display processor is available, query display pixel info to compute
 	// optimal view dimensions (scaled to window size, matching D3D11 model).
-	// Do NOT resize the app's window — _ext apps own their window.
-	if (c->display_processor != nullptr) {
+	// Do NOT resize the app's window — _ext apps own their window. Under the
+	// #1264 reroute the session's weaver lives in the d3d11 arm; ask it.
+	{
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_d3d12_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
+		bool px_ok = false;
+		if (c->display_processor != nullptr) {
+			px_ok = xrt_display_processor_d3d12_get_display_pixel_info(
+			    c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top);
+		}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		else if (c->reroute.active && c->reroute.split != NULL) {
+			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                             &disp_left, &disp_top);
+		}
+#endif
+		if (px_ok && disp_px_w > 0 && disp_px_h > 0) {
 			// Use half display width as base view dims
 			uint32_t base_vw = disp_px_w / 2;
 			uint32_t base_vh = disp_px_h;
@@ -5197,6 +6022,12 @@ comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 			return true;
 		}
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_get_predicted_eye_positions(c->reroute.split, out_eye_pos) &&
+		       out_eye_pos->valid;
+	}
+#endif
 
 	return false;
 }
@@ -5208,6 +6039,11 @@ comp_d3d12_compositor_get_display_dimensions(struct xrt_compositor *xc,
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		return comp_vk_split_get_display_dimensions(c->reroute.split, out_width_m, out_height_m);
+	}
+#endif
 	return xrt_display_processor_d3d12_get_display_dimensions(
 	    c->display_processor, out_width_m, out_height_m);
 }
@@ -5240,23 +6076,34 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 		// Shared-texture (texture-app) sessions carry the app's window in
 		// app_hwnd (c->hwnd stays null); their metrics come from that window.
 		HWND metrics_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-		if (c->display_processor == nullptr || metrics_hwnd == nullptr) {
+		bool have_dp = c->display_processor != nullptr;
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		const bool have_reroute_dp = c->reroute.active && c->reroute.split != NULL;
+		have_dp = have_dp || have_reroute_dp;
+#endif
+		if (!have_dp || metrics_hwnd == nullptr) {
 			return false;
 		}
 
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
-		if (!xrt_display_processor_d3d12_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top)) {
-			return false;
-		}
-		if (disp_px_w == 0 || disp_px_h == 0) {
-			return false;
-		}
-
+		bool px_ok = false;
 		float disp_w_m = 0.0f, disp_h_m = 0.0f;
-		if (!xrt_display_processor_d3d12_get_display_dimensions(
-		        c->display_processor, &disp_w_m, &disp_h_m)) {
+		bool dim_ok = false;
+		if (c->display_processor != nullptr) {
+			px_ok = xrt_display_processor_d3d12_get_display_pixel_info(
+			    c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top);
+			dim_ok = xrt_display_processor_d3d12_get_display_dimensions(c->display_processor, &disp_w_m,
+			                                                            &disp_h_m);
+		}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+		else if (have_reroute_dp) {
+			px_ok = comp_vk_split_get_display_pixel_info(c->reroute.split, &disp_px_w, &disp_px_h,
+			                                             &disp_left, &disp_top);
+			dim_ok = comp_vk_split_get_display_dimensions(c->reroute.split, &disp_w_m, &disp_h_m);
+		}
+#endif
+		if (!px_ok || disp_px_w == 0 || disp_px_h == 0 || !dim_ok) {
 			return false;
 		}
 
@@ -5332,6 +6179,14 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 		gpu_wait_idle_app(c);
 	}
 
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (c->reroute.active && c->reroute.split != NULL) {
+		// The d3d11 arm owns the weaver; it quiesces its own device around
+		// the switch, exactly as the VK tier's forward does.
+		return comp_vk_split_request_display_mode(c->reroute.split, enable_3d) ? XRT_SUCCESS
+		                                                                       : XRT_ERROR_D3D12;
+	}
+#endif
 	return xrt_display_processor_d3d12_request_display_mode(c->display_processor, enable_3d);
 }
 
@@ -5347,6 +6202,11 @@ comp_d3d12_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t 
 	if (c->display_processor != nullptr) {
 		xrt_display_processor_d3d12_set_eye_tracking_mode(c->display_processor, mode);
 	}
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	else if (c->reroute.active && c->reroute.split != NULL) {
+		comp_vk_split_set_eye_tracking_mode(c->reroute.split, mode);
+	}
+#endif
 }
 
 extern "C" void
@@ -5571,6 +6431,32 @@ d3d12_frame_authored_mask(struct comp_d3d12_compositor *c)
 static bool
 d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
 {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (d3d12_fill_arm_active(c)) {
+		/*
+		 * #1264 reroute — the mask travels as a DEPOSIT plane (R8, sized at
+		 * the mask), bound on the arm by NT handle. A failure degrades THAT
+		 * FEATURE (mask_plane_live=false; the stage un-stages, and the
+		 * composite falls to the raster kinds), never the session — so this
+		 * always returns true on the reroute.
+		 */
+		c->mask_plane_live = false;
+		c->mask_plane_gen = 0;
+		if (mask == nullptr || c->reroute.dep == NULL || c->reroute.split == NULL) {
+			return true;
+		}
+		struct comp_d3d12_deposit_plane mp = {};
+		if (comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, mask->w,
+		                                    mask->h) &&
+		    comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, &mp) &&
+		    comp_vk_split_bind_mask_plane(c->reroute.split, mp.shared_handle, mp.generation, mp.width,
+		                                  mp.height)) {
+			c->mask_plane_live = true;
+			c->mask_plane_gen = mask->res_gen;
+		}
+		return true;
+	}
+#endif
 	if (!c->split_active || c->xbridge == nullptr) {
 		c->mask_plane_live = false;
 		c->mask_plane_gen = 0;
@@ -5631,6 +6517,62 @@ d3d12_bind_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_ma
 static void
 d3d12_stage_mask_plane(struct comp_d3d12_compositor *c, struct comp_d3d12_zone_mask *mask)
 {
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+	if (d3d12_fill_arm_active(c)) {
+		if (mask == nullptr || !c->mask_plane_live || c->reroute.split == NULL ||
+		    c->reroute.dep == NULL) {
+			// 0 un-stages: the recipe stamps the plane invalid rather than
+			// lending an older frame's pixels — the arm's exact contract.
+			if (c->reroute.split != NULL) {
+				comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+			}
+			return;
+		}
+		// A zones frame's explicit wish snapshot — the same refresh the
+		// own-legs stage does, for the same #1175 reason (the off-split
+		// stager never runs here).
+		if (c->zones_frame) {
+			d3d12_zone_mask_snapshot(mask, c->cmd_list);
+			if (c->zone_frame_wish_last != mask) {
+				c->zone_frame_wish_last = mask;
+			}
+		}
+		// The transport IS the copy: staged (PSR at rest) -> deposit plane
+		// (COMMON at rest), on content change only.
+		const uint64_t key = (mask->res_gen << 48) | (mask->author_seq & 0xFFFFFFFFFFFFull);
+		struct comp_d3d12_deposit_plane mp = {};
+		if (comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_MASK, &mp) &&
+		    mp.width == mask->w && mp.height == mask->h) {
+			if (key != c->reroute.mask_copied_key) {
+				D3D12_RESOURCE_BARRIER pre[2] = {};
+				pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				pre[0].Transition.pResource = mask->staged;
+				pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+				pre[1] = pre[0];
+				pre[1].Transition.pResource = (ID3D12Resource *)mp.resource12;
+				pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+				pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+				c->cmd_list->ResourceBarrier(2, pre);
+				c->cmd_list->CopyResource((ID3D12Resource *)mp.resource12, mask->staged);
+				D3D12_RESOURCE_BARRIER post[2] = {};
+				post[0] = pre[0];
+				post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				post[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				post[1] = pre[1];
+				post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				post[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+				c->cmd_list->ResourceBarrier(2, post);
+				c->reroute.mask_copied_key = key;
+			}
+			comp_vk_split_stage_mask_plane(c->reroute.split, key, mask->w, mask->h);
+		} else {
+			comp_vk_split_stage_mask_plane(c->reroute.split, 0, 0, 0);
+		}
+		return;
+	}
+#endif
 	if (!c->split_active || c->xbridge == nullptr) {
 		return;
 	}
@@ -6915,8 +7857,8 @@ d3d12_flatten_backdrop_2d(struct comp_d3d12_compositor *c, uint32_t dst_w, uint3
 	 * writes only the region at the top-left, and the DP is told the region's
 	 * dims separately, exactly as it is off the split.
 	 */
-	const uint32_t bd_alloc_w = c->split_active ? c->split_panel_w : region_w;
-	const uint32_t bd_alloc_h = c->split_active ? c->split_panel_h : region_h;
+	const uint32_t bd_alloc_w = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_w : region_w;
+	const uint32_t bd_alloc_h = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_h : region_h;
 	if (!d3d12_ensure_backdrop_scratch(c, bd_alloc_w, bd_alloc_h)) {
 		return nullptr;
 	}
@@ -7145,7 +8087,7 @@ d3d12_local2d_digest(struct comp_d3d12_compositor *c,
 static void
 d3d12_clamp_region_to_panel(struct comp_d3d12_compositor *c, uint32_t *w, uint32_t *h)
 {
-	if (!c->split_active || c->split_panel_w == 0 || c->split_panel_h == 0) {
+	if ((!c->split_active && !d3d12_fill_arm_active(c)) || c->split_panel_w == 0 || c->split_panel_h == 0) {
 		return;
 	}
 	if (*w > c->split_panel_w) {
@@ -7195,7 +8137,11 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	 * atlas generation stops a slot being woven under the wrong mode, this stops
 	 * its pixels being composited under the wrong recipe.
 	 */
-	const bool split_deposit = c->split_active && prepare_only;
+	// #1264: the reroute runs the SAME deposit half (capture + flatten +
+	// stage), with the transport forked to the d3d11 arm at the staging
+	// site; the consume half stays own-legs-only (the arm composites on its
+	// own device).
+	const bool split_deposit = (c->split_active || d3d12_fill_arm_active(c)) && prepare_only;
 	const bool split_consume = c->split_active && !prepare_only;
 	struct comp_xbridge_recipe rec = {};
 	if (split_consume) {
@@ -7525,8 +8471,8 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 * top-left, and the composite derives the plane's uv scale from its own
 		 * extent, so a panel-sized plane samples the region 1:1.
 		 */
-		const uint32_t alloc_w = c->split_active ? c->split_panel_w : region_w;
-		const uint32_t alloc_h = c->split_active ? c->split_panel_h : region_h;
+		const uint32_t alloc_w = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_w : region_w;
+		const uint32_t alloc_h = (c->split_active || d3d12_fill_arm_active(c)) ? c->split_panel_h : region_h;
 		if (!d3d12_ensure_local2d_scratch(c, alloc_w, alloc_h)) {
 			ZC_BAIL("g5");
 		}
@@ -7590,6 +8536,20 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			 * compositable that nothing can composite. See d3d12_ensure_outcomp
 			 * for why the create is lazy at all.
 			 */
+#ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
+			if (d3d12_fill_arm_active(c)) {
+				// #1264 — the transport fork: the arm rasters the captured
+				// mask itself and composites on its own device, so the
+				// own-legs outcomp/xbridge below never runs.
+				if (!d3d12_reroute_stage_local2d(c, region_w, region_h, zones_frame,
+				                                 have_explicit && c->mask_plane_live, have_explicit,
+				                                 eff_canvas, zones_frame ? -1 : proj_idx)) {
+					c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+					return false;
+				}
+				return true;
+			}
+#endif
 			if (!d3d12_ensure_outcomp(c)) {
 				c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
 				return false;

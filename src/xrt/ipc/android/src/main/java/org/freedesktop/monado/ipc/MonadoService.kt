@@ -204,8 +204,45 @@ open class MonadoService : Service(), Watchdog.ShutdownListener {
 
     override fun onShutdown() {
         Log.d(TAG, "onShutdown")
+        // #1245: the MAIN-process service stays RESIDENT once started; only
+        // satellites die with their client.
+        //
+        // Why: a client binds us with bindService(). On OEM ROMs with
+        // background-start restrictions (nubia/ZTE AutoLaunchManagerService and
+        // friends) the framework refuses to CREATE a service on behalf of another
+        // package — "ActivityManager: Skip bringUpServiceLocked ... from callerApp
+        // org.chromium.chrome". Binding a service that is ALREADY RUNNING is
+        // allowed; creating one is not. So the moment we stopSelf() on idle, the
+        // next client — the DisplayXR Browser's inline-3D above all — cannot get
+        // us back, gets no runtime socket, and renders flat 2D with no error
+        // anywhere. That is exactly the "reinstall breaks the browser" report.
+        //
+        // Staying resident is also what this runtime does on Windows, where
+        // displayxr-service.exe is the always-on orchestrator started at logon
+        // (docs/architecture/service-architecture.md). Android now matches it.
+        // We are a foreground service with a notification that carries a
+        // shutdown action, so the user keeps an explicit way out.
+        //
+        // Kill switch: `adb shell setprop debug.dxr.service_resident 0` restores
+        // the old stop-when-idle behaviour.
+        if (!isSatellite && residentModeEnabled()) {
+            Log.i(TAG, "onShutdown: main service staying resident (#1245) — clients " +
+                "cannot re-create a stopped service on background-restricted ROMs")
+            return
+        }
         handleShutdown()
     }
+
+    /** #1245 kill switch — `debug.dxr.service_resident=0` opts out. */
+    private fun residentModeEnabled(): Boolean =
+        try {
+            val v = Class.forName("android.os.SystemProperties")
+                .getMethod("get", String::class.java, String::class.java)
+                .invoke(null, "debug.dxr.service_resident", "1") as String
+            v != "0" && !v.equals("false", ignoreCase = true)
+        } catch (_: Throwable) {
+            true
+        }
 
     private fun handleShutdown() {
         stopForeground(true)

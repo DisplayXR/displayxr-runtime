@@ -64,7 +64,7 @@ Name "DisplayXR ${VERSION}"
 	OutFile "$%TEMP%\DisplayXRSetup_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.${BUILD_NUM}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Runtime"
@@ -641,6 +641,89 @@ Function un.DumpLog
 FunctionEnd
 
 ;--------------------------------
+; #1268: nothing may hold DisplayXRClient.dll when we overwrite it.
+;
+; Killing displayxr-service.exe is not enough. EVERY OpenXR client keeps the
+; runtime DLL mapped for the life of its process, and now that the DisplayXR
+; Browser is a first-class client that is the common case, not an exotic one.
+; A mapped image is opened without FILE_SHARE_WRITE, so `File` hits a sharing
+; violation -- and under /S (how the bundle drives this installer) NSIS SKIPS
+; the file, sets the error flag, and still reports success. The install then
+; stamps Software\DisplayXR\Runtime\Version anyway, so the bundle's version
+; gate treats the runtime as current and skips the component on every later
+; run: the skew becomes permanent and no amount of reinstalling clears it.
+;
+; So: close the clients WE own, then refuse to write anything at all -- file
+; or registry -- if a holder survives.
+
+; Close every DisplayXR-owned process that could hold the runtime DLL.
+;
+; Path-scoped on purpose. The DisplayXR Browser's process is named chrome.exe,
+; so a plain `taskkill /im chrome.exe` would take the user's own Google Chrome
+; down with it. We only kill what runs out of a directory we installed:
+; $INSTDIR, plus the browser's own registered root.
+Function CloseRuntimeClients
+	Push $0
+	Push $1
+
+	; The service is ours unconditionally and maps the DLL every time.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	Pop $0
+
+	; The browser records its own root; a missing key just means not installed,
+	; and the empty entry is filtered out below.
+	ReadRegStr $1 HKLM "Software\DisplayXR\Browser" "InstallPath"
+
+	; One sweep over both roots. `$$` is a literal '$' for PowerShell.
+	;
+	; Win32_Process.ExecutablePath, NOT Get-Process().Path, on purpose: an NSIS
+	; installer is a 32-bit process, and a 32-bit process cannot read the module
+	; list of a 64-bit one. Get-Process().Path therefore throws for every 64-bit
+	; process -- which, swallowed by SilentlyContinue, yields an EMPTY match set
+	; and kills nothing at all, silently. Measured on 8k-box: the .Path form
+	; matched 0 of 10 live browser processes under SysWOW64 PowerShell while the
+	; CIM form matched all 10. WMI is bitness-agnostic, so this works whether the
+	; installer stays 32-bit or is ever built 64-bit.
+	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') }) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+	Pop $0
+
+	; Process exit and image unmap are not instantaneous even after
+	; Stop-Process returns.
+	Sleep 2000
+
+	Pop $1
+	Pop $0
+FunctionEnd
+
+; $R0 = "1" when DisplayXRClient.dll can be replaced, "0" when a process still
+; has it mapped.
+;
+; Opening for append needs FILE_SHARE_WRITE, which a mapped image never grants
+; -- so this is a reliable lock test in pure NSIS with no plugin dependency,
+; and it tests the exact operation `File` is about to perform.
+Function ClientDllWritable
+	Push $0
+
+	; A fresh install has no DLL yet, so nothing can be holding one.
+	IfFileExists "$INSTDIR\DisplayXRClient.dll" 0 cdw_free
+
+	ClearErrors
+	FileOpen $0 "$INSTDIR\DisplayXRClient.dll" a
+	IfErrors cdw_held
+	FileClose $0
+
+cdw_free:
+	StrCpy $R0 "1"
+	Goto cdw_done
+cdw_held:
+	StrCpy $R0 "0"
+cdw_done:
+	ClearErrors
+	Pop $0
+FunctionEnd
+
+
+;--------------------------------
 ; Installer Sections
 
 Section "DisplayXR Runtime" SecRuntime
@@ -654,18 +737,48 @@ Section "DisplayXR Runtime" SecRuntime
 
 	SetOutPath "$INSTDIR"
 
-	; Kill any running DisplayXR processes before overwriting (avoids write/sharing error).
+	; Close DisplayXR processes holding the runtime, then PROVE the client DLL
+	; is writable before touching a single file or registry value (#1268).
 	; Workspace controllers (e.g. the DisplayXR shell) are installed as separate
 	; products and have their own installers; we don't reach into their processes
-	; here. The uninstall path runs cascade-uninstall first which handles their
-	; lifecycle.
-	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	Pop $0
-	; Wait for processes to fully exit and release pipe/file handles
-	Sleep 2000
+	; beyond what runs from a directory we installed. The uninstall path runs
+	; cascade-uninstall first which handles their lifecycle.
+	Call CloseRuntimeClients
 
-	; Install runtime files
+	Call ClientDllWritable
+	StrCmp $R0 "1" dll_writable
+
+	; Give a straggler a second chance -- a process can be gone from the task
+	; list a moment before its image is unmapped.
+	Sleep 3000
+	Call ClientDllWritable
+	StrCmp $R0 "1" dll_writable
+
+	; A holder we do NOT own is still running: a Unity editor, a customer app,
+	; an engine plug-in. Killing arbitrary user processes is not acceptable, so
+	; fail loudly instead. Aborting HERE is what makes this recoverable -- no
+	; file is written and, crucially, no Version stamp is left behind, so the
+	; bundle sees a real failure and its next run retries the component rather
+	; than skipping it forever.
+	SetErrorLevel 2
+	DetailPrint "FATAL: DisplayXRClient.dll is in use and cannot be replaced."
+	DetailPrint "Close every OpenXR application (the DisplayXR Browser included) and run this installer again."
+	MessageBox MB_OK|MB_ICONSTOP "DisplayXR cannot update: DisplayXRClient.dll is still in use by another program.$\n$\nClose every running OpenXR application -- including the DisplayXR Browser -- then run this installer again.$\n$\nNothing has been changed." /SD IDOK
+	Abort "DisplayXRClient.dll is in use -- installation aborted, nothing was changed."
+
+dll_writable:
+
+	; Install runtime files. The client DLL is the one file whose silent loss
+	; produces the client/service skew, so verify this specific write landed
+	; before anything downstream (above all the Version stamp) can run.
+	ClearErrors
 	File "${BIN_DIR}\DisplayXRClient.dll"
+	IfErrors 0 client_dll_ok
+	SetErrorLevel 2
+	DetailPrint "FATAL: failed to write DisplayXRClient.dll."
+	MessageBox MB_OK|MB_ICONSTOP "DisplayXR could not replace DisplayXRClient.dll.$\n$\nInstallation has been stopped rather than leave a runtime whose client and service are different builds." /SD IDOK
+	Abort "Failed to write DisplayXRClient.dll -- installation aborted."
+client_dll_ok:
 
 	; Install service (needed for Chrome WebXR and other sandboxed apps)
 	File /nonfatal "${BIN_DIR}\displayxr-service.exe"
@@ -682,6 +795,15 @@ Section "DisplayXR Runtime" SecRuntime
 	; the DisplayXR Browser is the supported authoring path. Sweep the orphan so
 	; an upgrade over an install that shipped it does not leave a dead exe.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
+
+	; Sweep the retired DisplayXRSwitcher (#378). Its Start Menu shortcut was
+	; removed at the time but the exe itself never was, so upgraded boxes kept
+	; a years-old binary that still launched and still looked authoritative —
+	; and it enumerated runtimes from AvailableRuntimes alone, so it could not
+	; show a competing runtime that had grabbed ActiveRuntime without
+	; registering. Someone used it to diagnose exactly that and it reported
+	; nothing wrong. `displayxr-cli runtime` replaces it.
+	Delete "$INSTDIR\DisplayXRSwitcher.exe"
 
 	; Diagnostics CLI + Control Panel GUI (the Control Panel shells out to the
 	; CLI; both replace the retired DisplayXRSwitcher — #378). SDL2.dll (the
@@ -804,6 +926,32 @@ Section "DisplayXR Runtime" SecRuntime
 	; Set as active OpenXR runtime (still in 64-bit view from section-start
 	; SetRegView; explicit no-op kept for clarity).
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
+
+	; Advertise ourselves in AvailableRuntimes so OTHER vendors' runtime
+	; switchers can list and select DisplayXR. Writing only ActiveRuntime
+	; makes us the active runtime but leaves us invisible to every tool that
+	; enumerates this key, so a user who switched away had no supported way
+	; back except re-running this installer.
+	WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+
+	; ...and in the 32-bit view, which 32-bit OpenXR apps read INSTEAD of the
+	; one above. Writing only the 64-bit view leaves a box where 64-bit apps
+	; use one runtime and 32-bit apps use whatever last wrote WOW6432Node —
+	; observed in the field as a machine whose 32-bit value still pointed at a
+	; runtime uninstalled months earlier.
+	SetRegView 32
+	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
+	WriteRegDWORD HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json" 0
+	SetRegView 64
+
+	; A per-user ActiveRuntime silently outranks everything written above, so
+	; a stale HKCU value would make this whole section a no-op from the app's
+	; point of view. Drop it; per-user selection is not something any
+	; DisplayXR component sets.
+	DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
+	SetRegView 32
+	DeleteRegValue HKCU "Software\Khronos\OpenXR\1" "ActiveRuntime"
+	SetRegView 64
 
 	; PATH is intentionally not modified. DisplayXRClient.dll's third-party
 	; transitive deps that previously *required* $INSTDIR on PATH are gone:
@@ -1173,6 +1321,20 @@ Section "Uninstall"
 	ReadRegStr $0 HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
 	StrCmp $0 "$INSTDIR\DisplayXR_win64.json" 0 +2
 		DeleteRegValue HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
+
+	; Same for the 32-bit view the install section now writes, and drop our
+	; AvailableRuntimes advertisement from both. Leaving the advertisement
+	; behind would keep a dead DisplayXR entry in every other vendor's
+	; switcher long after the runtime is gone.
+	DeleteRegValue HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json"
+	DeleteRegKey /ifempty HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes"
+	SetRegView 32
+	ReadRegStr $0 HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
+	StrCmp $0 "$INSTDIR\DisplayXR_win64.json" 0 +2
+		DeleteRegValue HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
+	DeleteRegValue HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes" "$INSTDIR\DisplayXR_win64.json"
+	DeleteRegKey /ifempty HKLM "Software\Khronos\OpenXR\1\AvailableRuntimes"
+	SetRegView 64
 
 	; Remove install directory from system PATH
 	Push $INSTDIR

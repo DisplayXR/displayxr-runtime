@@ -122,7 +122,12 @@ jobs:
       # shim that dlopens libleiaCore-impl.so out of the ON-DEVICE package, so
       # the real core, face tracking and per-device calibration are never
       # redistributed. Same shape as Windows assuming an installed SR runtime.
-      CNSDK_TAG: v0.10.61
+      # >= 0.10.62 is the FLOOR (#1232). 0.10.61 and earlier mis-detect device
+      # orientation in a non-fullscreen window, corrupting the interlacer's
+      # viewport-to-panel mapping so the DP's weave framebuffer faults inside
+      # vkCreateFramebuffer. Measured: the runtime fixes alone still crash on
+      # 0.10.61. The assertion in Inspect APK checks the APK really contains it.
+      CNSDK_TAG: v0.10.62
 
     steps:
 
@@ -351,6 +356,22 @@ jobs:
             # failure #1212 describes.
             need libdxrp050_leia_cnsdk.so "the leia payload did not reach jniLibs"
             need libleiaCore-loader.so "the CNSDK AAR did not contribute its native libs"
+
+            # The APK must actually CONTAIN the CNSDK we pinned. Four consecutive
+            # tags shipped an Android APK bundling 0.10.61 while the fix needed
+            # >= 0.10.62, and every one of them was caught on a device instead of
+            # here -- because presence checks say "a loader is bundled", never
+            # "WHICH loader". A stale AAR, a cache hit, or a pin bumped in one
+            # place and not the other all look identical to `need`.
+            mkdir -p _apkchk && unzip -q -o "$APK" 'lib/arm64-v8a/libleiaCore-loader.so' -d _apkchk
+            got=$(strings -a _apkchk/lib/arm64-v8a/libleiaCore-loader.so \
+                    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -u | head -1)
+            want="${CNSDK_TAG#v}"
+            if [ "$got" != "$want" ]; then
+              echo "::error::bundled CNSDK loader reports '$got' but CNSDK_TAG pins '$want' — the APK does not contain the SDK this build claims to pin."
+              exit 1
+            fi
+            echo "  ok: bundled CNSDK loader $got matches CNSDK_TAG $want"
           fi
 
       - name: Stage the APK with a release name

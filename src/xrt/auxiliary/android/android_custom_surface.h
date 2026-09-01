@@ -63,6 +63,14 @@ struct android_custom_surface;
  *        Non-zero values map to the corresponding display mode
  *        ID that are returned from the getSupportedModes() method for
  *        the given Android display. (the 1-indexed IDs.)
+ * @param span_system_bars When true the window lays out edge-to-edge over the
+ *        FULL physical panel (FLAG_LAYOUT_IN_SCREEN | FLAG_LAYOUT_NO_LIMITS),
+ *        ignoring system-bar insets. The weave satellite (#1277) needs this:
+ *        its overlay is the physical-pixel canvas, and an inset overlay cannot
+ *        cover an edge-to-edge client window (the immersive-fullscreen browser
+ *        extends into the status-bar band, and the weave then lands shifted by
+ *        the inset — the "tap toggles immersive -> broken weave" bug). Existing
+ *        callers pass false and keep the inset layout.
  *
  * @return An opaque handle for monitoring this operation and referencing the
  * surface, or NULL if there was an error.
@@ -74,7 +82,8 @@ android_custom_surface_async_start(struct _JavaVM *vm,
                                    void *context,
                                    int32_t display_id,
                                    const char *surface_title,
-                                   int32_t preferred_display_mode_id);
+                                   int32_t preferred_display_mode_id,
+                                   bool span_system_bars);
 
 /*!
  * Destroy the native handle for the custom surface.

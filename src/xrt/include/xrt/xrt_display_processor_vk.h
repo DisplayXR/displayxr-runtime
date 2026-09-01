@@ -368,6 +368,53 @@ struct xrt_display_processor_vk
 	 */
 	bool (*get_scanout_caps)(struct xrt_display_processor_vk *xdp, struct xrt_dp_scanout_caps *out_caps);
 
+	/*!
+	 * #206: the FORWARD-computed weave→scanout time of THIS weave, from the
+	 * runtime's vsync-locked vblank grid — the exact per-weave horizon for
+	 * the vendor eye predictor, to be fed RAW (no smoothing, no deadband).
+	 * 0 = no trusted grid this frame ⟹ the DP keeps its retrospective
+	 * heuristic. Called after @ref set_frame_timing, before
+	 * @ref xrt_display_processor::process_atlas. Full contract: the D3D11
+	 * variant's doc. Appended after @ref get_scanout_caps per ADR-020
+	 * (append-only within a major; no version bump — gated by the variant's
+	 * `base.struct_size`).
+	 *
+	 * @param xdp                            Pointer to self.
+	 * @param predicted_weave_to_scanout_ns  Forward horizon; 0 = unknown.
+	 */
+	void (*set_predicted_scanout)(struct xrt_display_processor_vk *xdp,
+	                              uint64_t predicted_weave_to_scanout_ns);
+
+	/*!
+	 * Report the panel's pixel size **in the display's CURRENT orientation**.
+	 *
+	 * Why this exists: a weaver that converts a window rect to a bottom-origin
+	 * phase needs to know which panel dimension is "height" right now, and a
+	 * vendor SDK may report only orientation-blind native metrics (CNSDK on
+	 * NP02J reports 1600x2560 whether the device is portrait or landscape).
+	 * Without this, a plug-in can only guess — and guessing from the WINDOW's
+	 * aspect is wrong for any window whose shape disagrees with the panel's
+	 * (a 1200x1600 window on a 2560x1600 landscape panel reads as "portrait",
+	 * picks the long side, and lands the weave phase a half-period out:
+	 * exactly inverted eyes, LeiaSR#205 follow-up).
+	 *
+	 * Called alongside @ref set_window_screen_rect, from the same site and
+	 * with the same @p display_id, so the two always agree.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL is
+	 * fine; the plug-in then falls back to whatever it did before.
+	 * Appended after @ref set_predicted_scanout per ADR-020.
+	 *
+	 * @param xdp         Pointer to self.
+	 * @param panel_w     Panel width in physical pixels, current orientation.
+	 * @param panel_h     Panel height in physical pixels, current orientation.
+	 * @param display_id  Same display id as @ref set_window_screen_rect.
+	 */
+	void (*set_panel_size)(struct xrt_display_processor_vk *xdp,
+	                       uint32_t panel_w,
+	                       uint32_t panel_h,
+	                       int32_t display_id);
+
 };
 
 /*!
@@ -378,6 +425,14 @@ struct xrt_display_processor_vk
  * (runtime#757 / LeiaSR#85).
  */
 #define XRT_DP_VK_HAS_PRESENT_ORIGIN 1
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::set_panel_size slot — same coupled-ABI-addition
+ * pattern as @ref XRT_DP_VK_HAS_WINDOW_SCREEN_RECT, for the current-orientation
+ * panel size a windowed weave phase needs (LeiaSR#205 follow-up).
+ */
+#define XRT_DP_VK_HAS_PANEL_SIZE 1
 
 /*!
  * Defined when this header carries the @ref xrt_display_processor_vk::set_frame_timing
@@ -450,7 +505,16 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, weave_submitted)    
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_window_screen_rect)      == sizeof(struct xrt_display_processor) + 6 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_backend_state)          == sizeof(struct xrt_display_processor) + 7 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_scanout_caps)           == sizeof(struct xrt_display_processor) + 8 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_predicted_scanout)     == sizeof(struct xrt_display_processor) + 9 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_panel_size)            == sizeof(struct xrt_display_processor) + 10 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_display_processor_vk::set_predicted_scanout slot (#206) — same
+ * coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_FRAME_TIMING.
+ */
+#define XRT_DP_VK_HAS_PREDICTED_SCANOUT 1
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 11 * sizeof(void *), XRT_DP_ABI_MSG);
 // clang-format on
 
 /*!
@@ -580,6 +644,27 @@ xrt_display_processor_vk_set_frame_timing(struct xrt_display_processor_vk *xdp,
 }
 
 /*!
+ * @copydoc xrt_display_processor_vk::set_predicted_scanout
+ * No-op if not supported (slot absent or NULL) — the DP then keeps its
+ * retrospective horizon heuristic.
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_set_predicted_scanout(struct xrt_display_processor_vk *xdp,
+                                               uint64_t predicted_weave_to_scanout_ns)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end =
+	    (const char *)&xdp->set_predicted_scanout + sizeof(xdp->set_predicted_scanout);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_predicted_scanout == NULL) {
+		return;
+	}
+	xdp->set_predicted_scanout(xdp, predicted_weave_to_scanout_ns);
+}
+
+/*!
  * @copydoc xrt_display_processor_vk::weave_submitted
  *
  * Returns true if the DP was told, false if the slot is absent (older plug-in
@@ -630,6 +715,32 @@ xrt_display_processor_vk_set_window_screen_rect(struct xrt_display_processor_vk 
 		return false;
 	}
 	xdp->set_window_screen_rect(xdp, x, y, w, h, display_id);
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_panel_size
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the caller then simply doesn't report the
+ * panel size and the plug-in keeps its previous behaviour.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_panel_size(struct xrt_display_processor_vk *xdp,
+                                        uint32_t panel_w,
+                                        uint32_t panel_h,
+                                        int32_t display_id)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_panel_size + sizeof(xdp->set_panel_size);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_panel_size == NULL) {
+		return false;
+	}
+	xdp->set_panel_size(xdp, panel_w, panel_h, display_id);
 	return true;
 }
 

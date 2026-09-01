@@ -89,6 +89,16 @@ weave_split_enabled(void)
 
 #include "android/android_ahardwarebuffer_allocator.h"
 #include "android/android_main_thread.h"
+#include "android/android_custom_surface.h"
+#include "android/android_globals.h"
+
+#include <android/native_window.h>
+#include <sys/system_properties.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include <android/hardware_buffer.h>
 
@@ -578,6 +588,1049 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 	return true;
 }
 
+
+/*
+ *
+ * Arch-C weave satellite (#1277 P0) — service-presented weave.
+ *
+ * `debug.dxr.weave_satellite=1` diverts the woven output onto a SERVICE-owned
+ * full-panel overlay surface instead of returning it to the caller. The
+ * overlay is the #558 machinery (android_custom_surface: an Activity-free
+ * TYPE_APPLICATION_OVERLAY MonadoView, translucent with debug.dxr.transparent)
+ * — so it is never scaled by the window manager: it IS the physical-pixel
+ * canvas, which is the entire point. An OEM freeform "mini window" scales the
+ * app's surface AFTER an in-app weave (measured 0.67x on NP02J,
+ * browser#173/#186), destroying the interlace; here the weave lands after any
+ * such transform, so the scaled window is structurally weavable.
+ *
+ * The caller needs no changes: spec v7 already allows returning no woven
+ * texture (comp_multi_weave_export_output reports none while the satellite is
+ * active), so the browser's over-plane draws nothing and the page's own 2D
+ * shows under the overlay.
+ *
+ * Placement: the woven output is blitted at the caller-reported window
+ * geometry; `debug.dxr.satellite_scale` (float, default 1.0) maps a logical
+ * window size to its physical footprint under an OEM container scale until
+ * the platform exposes the real factor (OEM-asks list).
+ *
+ * Every failure is one-shot latched (sat_failed) and falls back to the
+ * return-the-output path bit-for-bit.
+ */
+
+static bool
+weave_satellite_wanted(struct multi_compositor *mc)
+{
+	if (!mc->weave.sat_checked) {
+		char value[PROP_VALUE_MAX] = {0};
+		mc->weave.sat_enabled =
+		    __system_property_get("debug.dxr.weave_satellite", value) > 0 && value[0] == '1';
+		mc->weave.sat_checked = true;
+		if (mc->weave.sat_enabled) {
+			U_LOG_W("weave satellite(#1277): ENABLED via debug.dxr.weave_satellite");
+		}
+	}
+	return mc->weave.sat_enabled && !mc->weave.sat_failed;
+}
+
+static float
+weave_satellite_scale(void)
+{
+	char value[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.satellite_scale", value) > 0 && value[0] != '\0') {
+		float f = (float)atof(value);
+		if (f > 0.05f && f <= 4.0f) {
+			return f;
+		}
+	}
+	return 1.0f;
+}
+
+//! Queue-idles first: swapchain images may be in flight with the present engine.
+static void
+weave_satellite_release(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (vk != NULL && vk->device != VK_NULL_HANDLE &&
+	    (mc->weave.sat_swapchain != VK_NULL_HANDLE || mc->weave.sat_surface != VK_NULL_HANDLE)) {
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+	}
+	if (mc->weave.sat_acquire_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, mc->weave.sat_acquire_sem, NULL);
+		mc->weave.sat_acquire_sem = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_done_sem != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, mc->weave.sat_done_sem, NULL);
+		mc->weave.sat_done_sem = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, mc->weave.sat_fence, NULL);
+		mc->weave.sat_fence = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_cmd != VK_NULL_HANDLE && mc->weave.cmd_pool != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, mc->weave.cmd_pool, 1, &mc->weave.sat_cmd);
+		mc->weave.sat_cmd = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_swapchain != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, mc->weave.sat_swapchain, NULL);
+		mc->weave.sat_swapchain = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_surface != VK_NULL_HANDLE) {
+		vk->vkDestroySurfaceKHR(vk->instance, mc->weave.sat_surface, NULL);
+		mc->weave.sat_surface = VK_NULL_HANDLE;
+	}
+	if (mc->weave.sat_csurface != NULL) {
+		android_custom_surface_destroy(&mc->weave.sat_csurface);
+	}
+	mc->weave.sat_image_count = 0;
+}
+
+/*!
+ * (Re)build the swapchain on the EXISTING surface, chaining oldSwapchain —
+ * the canonical Vulkan resize path. Keeping the VkSurface + MonadoView alive
+ * avoids Android's asynchronous BufferQueue producer disconnect, which made a
+ * destroy-then-recreate race VK_ERROR_NATIVE_WINDOW_IN_USE for ~2 s (121
+ * retry frames measured on a rotation) and latch the satellite off.
+ */
+static bool
+weave_satellite_build_swapchain(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	VkSurfaceCapabilitiesKHR caps = {0};
+	VkResult ret =
+	    vk->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physical_device, mc->weave.sat_surface, &caps);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): surface caps: %s", vk_result_string(ret));
+		return false;
+	}
+
+	VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	char opq[PROP_VALUE_MAX] = {0};
+	const bool force_opaque = __system_property_get("debug.dxr.satellite_opaque", opq) > 0 && opq[0] == '1';
+	if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)) {
+		alpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+	} else if (!force_opaque && (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)) {
+		alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+	}
+
+	// Prefer PASS_THROUGH (no compositor CSC — the weave output is calibrated
+	// panel values); see the long comment at the first ensure.
+	VkColorSpaceKHR colorspace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+	{
+		VkSurfaceFormatKHR formats[16];
+		uint32_t n_formats = ARRAY_SIZE(formats);
+		VkResult fret = vk->vkGetPhysicalDeviceSurfaceFormatsKHR(vk->physical_device, mc->weave.sat_surface,
+		                                                         &n_formats, formats);
+		if (fret == VK_SUCCESS || fret == VK_INCOMPLETE) {
+			for (uint32_t i = 0; i < n_formats; i++) {
+				if (formats[i].format == WEAVE_VK_FORMAT &&
+				    formats[i].colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+					colorspace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+				}
+			}
+		}
+	}
+
+	uint32_t min_images = caps.minImageCount + 1;
+	if (caps.maxImageCount != 0 && min_images > caps.maxImageCount) {
+		min_images = caps.maxImageCount;
+	}
+
+	VkSwapchainKHR old_sc = mc->weave.sat_swapchain;
+	if (old_sc != VK_NULL_HANDLE) {
+		// Nothing may be in flight against the old images.
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+	}
+
+	VkSwapchainCreateInfoKHR sc_info = {
+	    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+	    .surface = mc->weave.sat_surface,
+	    .minImageCount = min_images,
+	    .imageFormat = WEAVE_VK_FORMAT,
+	    .imageColorSpace = colorspace,
+	    .imageExtent = caps.currentExtent,
+	    .imageArrayLayers = 1,
+	    .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+	    .compositeAlpha = alpha,
+	    .presentMode = VK_PRESENT_MODE_FIFO_KHR,
+	    .clipped = VK_TRUE,
+	    .oldSwapchain = old_sc,
+	};
+	VkSwapchainKHR new_sc = VK_NULL_HANDLE;
+	ret = vk->vkCreateSwapchainKHR(vk->device, &sc_info, NULL, &new_sc);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): vkCreateSwapchainKHR: %s", vk_result_string(ret));
+		return false;
+	}
+	if (old_sc != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, old_sc, NULL);
+	}
+	mc->weave.sat_swapchain = new_sc;
+	mc->weave.sat_w = caps.currentExtent.width;
+	mc->weave.sat_h = caps.currentExtent.height;
+
+	mc->weave.sat_image_count = ARRAY_SIZE(mc->weave.sat_images);
+	ret = vk->vkGetSwapchainImagesKHR(vk->device, mc->weave.sat_swapchain, &mc->weave.sat_image_count,
+	                                  mc->weave.sat_images);
+	if (ret != VK_SUCCESS && ret != VK_INCOMPLETE) {
+		U_LOG_E("weave satellite(#1277): vkGetSwapchainImagesKHR: %s", vk_result_string(ret));
+		vk->vkDestroySwapchainKHR(vk->device, mc->weave.sat_swapchain, NULL);
+		mc->weave.sat_swapchain = VK_NULL_HANDLE;
+		return false;
+	}
+	for (uint32_t i = 0; i < mc->weave.sat_image_count; i++) {
+		mc->weave.sat_image_first[i] = true;
+	}
+
+	// Overlay origin (see the header comment): recompute per build — the
+	// inset can change with orientation.
+	mc->weave.sat_off_x = 0;
+	mc->weave.sat_off_y = 0;
+	{
+		struct xrt_android_display_metrics metrics = {0};
+		struct _JavaVM *mvm = android_globals_get_vm();
+		void *mctx = android_globals_get_context();
+		if (mvm != NULL && mctx != NULL &&
+		    android_custom_surface_get_display_metrics(mvm, mctx, &metrics)) {
+			int32_t pw = metrics.width_pixels, ph = metrics.height_pixels;
+			if ((mc->weave.sat_w > mc->weave.sat_h) != (pw > ph)) {
+				int32_t t = pw;
+				pw = ph;
+				ph = t;
+			}
+			if (ph > (int32_t)mc->weave.sat_h) {
+				mc->weave.sat_off_y = ph - (int32_t)mc->weave.sat_h;
+			}
+			if (pw > (int32_t)mc->weave.sat_w) {
+				mc->weave.sat_off_x = pw - (int32_t)mc->weave.sat_w;
+			}
+			mc->weave.sat_panel_w = (uint32_t)pw;
+			mc->weave.sat_panel_h = (uint32_t)ph;
+		}
+	}
+	U_LOG_W("weave satellite(#1277): swapchain %s %ux%u images=%u origin (%d,%d)",
+	        old_sc != VK_NULL_HANDLE ? "REBUILT" : "live", mc->weave.sat_w, mc->weave.sat_h,
+	        mc->weave.sat_image_count, mc->weave.sat_off_x, mc->weave.sat_off_y);
+	return true;
+}
+
+/*!
+ * P1 auto-derivation of the container scale (#1277). Per WINDOW, not global:
+ *
+ *   1. `debug.dxr.satellite_scale` != 1.0 -> diagnostic override, wins.
+ *   2. The OEM-scaled tell fires -> `debug.dxr.satellite_miniwindow_scale`
+ *      (default 0.67, the leash factor measured on NP02J).
+ *   3. Otherwise 1.0 (fullscreen / unscaled windows).
+ *
+ * The tell (measured, browser#128/#186 + dumpsys on NP02J): an OEM "mini
+ * window" is a fixed phone-profile task (sw540dp -> 1080x1685 logical here)
+ * whose WM bounds are a HYBRID — physical origin + LOGICAL size — while the
+ * leash scales presentation (tr=[0.67,0][0,0.67]). So the caller-reported
+ * rect EXCEEDS the panel while its origin lies inside: that is app-visibly
+ * unique to a container-scaled window on this platform. The factor itself is
+ * app-invisible (leash-only; a11y bounds are logical-clipped, no config /
+ * settings / prop carries it — all probed), hence the per-device default
+ * until the OEM exposes it (platform-requirements ask).
+ *
+ * Caveat, direction-of-failure: an unscaled freeform window dragged off-edge
+ * would also trip the tell and get wrongly scale-woven — but this OEM clamps
+ * mini windows inside the panel and offers no unscaled-freeform UX, and the
+ * satellite is gated off elsewhere. Revisit if either changes.
+ *
+ * Call with mc->weave.mutex held (reads the geometry fields).
+ */
+static float
+weave_satellite_effective_scale(struct multi_compositor *mc)
+{
+	const float override = weave_satellite_scale();
+	if (override != 1.0f) {
+		return override;
+	}
+	if (!mc->weave.have_geometry) {
+		return 1.0f;
+	}
+	uint32_t pw = mc->weave.sat_panel_w, ph = mc->weave.sat_panel_h;
+	bool exceeds;
+	if (pw != 0 && ph != 0) {
+		exceeds = (mc->weave.win_x + (int32_t)mc->weave.win_w > (int32_t)pw) ||
+		          (mc->weave.win_y + (int32_t)mc->weave.win_h > (int32_t)ph);
+	} else {
+		// Satellite swapchain not up yet: rotation unknown, so only trust a
+		// rect that exceeds the panel in BOTH orientations (the measured mini
+		// case does). Ambiguous fits stay 1.0 until the panel extent lands.
+		struct xrt_android_display_metrics metrics = {0};
+		struct _JavaVM *vm = android_globals_get_vm();
+		void *ctx = android_globals_get_context();
+		if (vm == NULL || ctx == NULL ||
+		    !android_custom_surface_get_display_metrics(vm, ctx, &metrics)) {
+			return 1.0f;
+		}
+		const int32_t a = metrics.width_pixels, b = metrics.height_pixels;
+		const int32_t rx = mc->weave.win_x + (int32_t)mc->weave.win_w;
+		const int32_t ry = mc->weave.win_y + (int32_t)mc->weave.win_h;
+		exceeds = (rx > a || ry > b) && (rx > b || ry > a);
+	}
+	if (!exceeds || mc->weave.win_x < 0 || mc->weave.win_y < 0) {
+		return 1.0f;
+	}
+	float s = 0.67f;
+	char v[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.satellite_miniwindow_scale", v) > 0 && v[0] != '\0') {
+		float parsed = strtof(v, NULL);
+		if (parsed > 0.05f && parsed <= 1.0f) {
+			s = parsed;
+		}
+	}
+	return s;
+}
+
+static bool
+weave_satellite_ensure(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.sat_swapchain != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	// 1. The service-owned overlay surface (the #558 machinery, no Activity).
+	if (mc->weave.sat_csurface == NULL) {
+		struct _JavaVM *vm = android_globals_get_vm();
+		void *ctx = android_globals_get_context();
+		if (vm == NULL || ctx == NULL) {
+			U_LOG_E("weave satellite(#1277): no JavaVM/context; disabled");
+			goto fail;
+		}
+		if (!android_custom_surface_can_draw_overlays(vm, ctx)) {
+			U_LOG_E("weave satellite(#1277): SYSTEM_ALERT_WINDOW not granted; disabled");
+			goto fail;
+		}
+		mc->weave.sat_csurface =
+		    android_custom_surface_async_start(vm, ctx, /*display_id=*/0, "DisplayXR Weave Satellite", 0,
+		                                       /*span_system_bars=*/true);
+		if (mc->weave.sat_csurface == NULL) {
+			U_LOG_E("weave satellite(#1277): overlay surface start failed; disabled");
+			goto fail;
+		}
+	}
+	ANativeWindow *window = android_custom_surface_wait_get_surface(mc->weave.sat_csurface, 2000);
+	if (window == NULL) {
+		U_LOG_E("weave satellite(#1277): overlay ANativeWindow timeout; disabled");
+		goto fail;
+	}
+
+	// 2. VkSurface + swapchain on it (comp_window_android's recipe).
+	{
+		VkAndroidSurfaceCreateInfoKHR surface_info = {
+		    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+		    .window = window,
+		};
+		VkResult ret = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_info, NULL, &mc->weave.sat_surface);
+		if (ret == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+			// A just-destroyed swapchain's BufferQueue connection lingers for
+			// a few ms after vkDestroySwapchainKHR. Transient: retry on later
+			// frames rather than latching a permanent fallback; bound it so a
+			// genuinely stuck window still falls back.
+			static int in_use_retries = 0;
+			if (++in_use_retries <= 120) {
+				return false; // not latched — next submit retries
+			}
+			U_LOG_E("weave satellite(#1277): window stuck IN_USE after %d retries; disabled",
+			        in_use_retries);
+			goto fail;
+		}
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("weave satellite(#1277): vkCreateAndroidSurfaceKHR: %s; disabled",
+			        vk_result_string(ret));
+			goto fail;
+		}
+
+		if (!weave_satellite_build_swapchain(vk, mc)) {
+			goto fail;
+		}
+	}
+
+	// 3. Sync + command buffer (out of the engine's own pool).
+	{
+		VkSemaphoreCreateInfo sem_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkCreateSemaphore(vk->device, &sem_info, NULL, &mc->weave.sat_acquire_sem) != VK_SUCCESS ||
+		    vk->vkCreateSemaphore(vk->device, &sem_info, NULL, &mc->weave.sat_done_sem) != VK_SUCCESS ||
+		    vk->vkCreateFence(vk->device, &fence_info, NULL, &mc->weave.sat_fence) != VK_SUCCESS) {
+			U_LOG_E("weave satellite(#1277): sync object creation failed; disabled");
+			goto fail;
+		}
+		VkCommandBufferAllocateInfo alloc = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = mc->weave.cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		if (vk->vkAllocateCommandBuffers(vk->device, &alloc, &mc->weave.sat_cmd) != VK_SUCCESS) {
+			U_LOG_E("weave satellite(#1277): command buffer allocation failed; disabled");
+			goto fail;
+		}
+	}
+
+	U_LOG_W("weave satellite(#1277): overlay swapchain live %ux%u images=%u — service-presented weave ACTIVE",
+	        mc->weave.sat_w, mc->weave.sat_h, mc->weave.sat_image_count);
+	return true;
+
+fail:
+	weave_satellite_release(vk, mc);
+	mc->weave.sat_failed = true;
+	return false;
+}
+
+/*
+ *
+ * Occlusion (#1277 P1) — a11y-fed window subtraction.
+ *
+ * The satellite overlay sits above the entire app window stack, so a 2D window
+ * overlapping the woven client would be painted over by the weave. The only
+ * app-reachable source of other windows' rects + z-order is an
+ * AccessibilityService: WindowWatcherService (runtime APK, user/adb-enabled)
+ * serializes every interactive window as {type, layer, bounds} into
+ * files/dxr_occlusion.bin (atomic rename) on every windows-changed event. The
+ * file transport crosses the slot processes for free. Service absent/disabled
+ * -> zero occluders -> exactly today's behavior.
+ *
+ * Rules (v1):
+ *  - IME windows always occlude (they layer above apps, and the overlay
+ *    layers above THEM).
+ *  - Application windows occlude when their a11y layer is above the client's.
+ *    The client's a11y window is matched by exact origin (+-4 px) — reliable
+ *    for freeform/mini windows, whose reported origin is physical. A client
+ *    that covers >=90% of the panel (fullscreen) instead treats every
+ *    intersecting NON-fullscreen application window as an occluder (a mini
+ *    window floating over a fullscreen client is always presented above it on
+ *    this OEM, but its a11y layer ordering is not trustworthy).
+ *  - A scaled occluder (OEM mini window) reports hybrid bounds — physical
+ *    origin + logical size (same tell as the client derivation) — so its
+ *    extent is corrected by the mini-window factor before subtraction.
+ */
+
+#define DXR_SAT_MAX_PIECES 64
+#define DXR_SAT_MAX_OCCLUDERS 24
+
+#define DXR_A11Y_TYPE_APPLICATION 1
+#define DXR_A11Y_TYPE_INPUT_METHOD 2
+
+struct dxr_occ_window
+{
+	int32_t type;
+	int32_t layer;
+	int32_t l, t, r, b;
+};
+
+static struct
+{
+	pthread_mutex_t mutex;
+	bool path_resolved;
+	char path[256];
+	int64_t last_mtime_ns;
+	int64_t last_size;
+	uint32_t count;
+	struct dxr_occ_window win[DXR_SAT_MAX_OCCLUDERS];
+} g_dxr_occ = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+
+static void
+dxr_occ_resolve_path(void)
+{
+	if (g_dxr_occ.path_resolved) {
+		return;
+	}
+	g_dxr_occ.path_resolved = true;
+	char cmdline[256] = {0};
+	FILE *f = fopen("/proc/self/cmdline", "r");
+	if (f == NULL) {
+		return;
+	}
+	size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+	fclose(f);
+	if (n == 0) {
+		return;
+	}
+	char *colon = strchr(cmdline, ':');
+	if (colon != NULL) {
+		*colon = 0; // slot process "<pkg>:dxrN" -> "<pkg>"
+	}
+	snprintf(g_dxr_occ.path, sizeof(g_dxr_occ.path), "/data/user/0/%s/files/dxr_occlusion.bin", cmdline);
+	struct stat st;
+	if (stat(g_dxr_occ.path, &st) != 0) {
+		// Not written yet (or legacy layout); /data/data is a compat symlink.
+		snprintf(g_dxr_occ.path, sizeof(g_dxr_occ.path), "/data/data/%s/files/dxr_occlusion.bin", cmdline);
+	}
+}
+
+//! Refresh the cached window list if the a11y service rewrote the file.
+static void
+dxr_occ_refresh(void)
+{
+	dxr_occ_resolve_path();
+	if (g_dxr_occ.path[0] == 0) {
+		return;
+	}
+	struct stat st;
+	if (stat(g_dxr_occ.path, &st) != 0) {
+		g_dxr_occ.count = 0;
+		return;
+	}
+	const int64_t mtime_ns = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+	if (mtime_ns == g_dxr_occ.last_mtime_ns && (int64_t)st.st_size == g_dxr_occ.last_size) {
+		return;
+	}
+	g_dxr_occ.last_mtime_ns = mtime_ns;
+	g_dxr_occ.last_size = (int64_t)st.st_size;
+	g_dxr_occ.count = 0;
+
+	FILE *f = fopen(g_dxr_occ.path, "rb");
+	if (f == NULL) {
+		return;
+	}
+	uint32_t hdr[3] = {0};
+	if (fread(hdr, sizeof(hdr), 1, f) == 1 && hdr[0] == 0x434f5844 /*'DXOC'*/ && hdr[1] == 1) {
+		uint32_t count = hdr[2];
+		if (count > DXR_SAT_MAX_OCCLUDERS) {
+			count = DXR_SAT_MAX_OCCLUDERS;
+		}
+		if (fread(g_dxr_occ.win, sizeof(struct dxr_occ_window), count, f) == count) {
+			g_dxr_occ.count = count;
+		}
+	}
+	fclose(f);
+}
+
+//! Subtract rect o from every rect in list (dst space); returns new count.
+static uint32_t
+dxr_occ_subtract(struct xrt_rect *list, uint32_t count, int32_t ol, int32_t ot, int32_t or_, int32_t ob)
+{
+	struct xrt_rect out[DXR_SAT_MAX_PIECES];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const int32_t pl = list[i].offset.w, pt = list[i].offset.h;
+		const int32_t pr = pl + (int32_t)list[i].extent.w, pb = pt + (int32_t)list[i].extent.h;
+		if (or_ <= pl || ol >= pr || ob <= pt || ot >= pb) {
+			if (n < DXR_SAT_MAX_PIECES) {
+				out[n++] = list[i];
+			}
+			continue;
+		}
+		// Up to 4 bands around the occluder.
+		if (ot > pt && n < DXR_SAT_MAX_PIECES) { // top
+			out[n++] = (struct xrt_rect){{pl, pt}, {(uint32_t)(pr - pl), (uint32_t)(ot - pt)}};
+		}
+		if (ob < pb && n < DXR_SAT_MAX_PIECES) { // bottom
+			out[n++] = (struct xrt_rect){{pl, ob}, {(uint32_t)(pr - pl), (uint32_t)(pb - ob)}};
+		}
+		const int32_t mt = ot > pt ? ot : pt, mb = ob < pb ? ob : pb;
+		if (ol > pl && mb > mt && n < DXR_SAT_MAX_PIECES) { // left
+			out[n++] = (struct xrt_rect){{pl, mt}, {(uint32_t)(ol - pl), (uint32_t)(mb - mt)}};
+		}
+		if (or_ < pr && mb > mt && n < DXR_SAT_MAX_PIECES) { // right
+			out[n++] = (struct xrt_rect){{or_, mt}, {(uint32_t)(pr - or_), (uint32_t)(mb - mt)}};
+		}
+	}
+	memcpy(list, out, n * sizeof(*out));
+	return n;
+}
+
+/*!
+ * Clip one dst-space blit rect to the overlay and subtract occluding windows.
+ * Returns the number of pieces written to out (up to DXR_SAT_MAX_PIECES).
+ * Called with the weave mutex held (reads the geometry fields).
+ */
+static uint32_t
+weave_satellite_clip_and_occlude(
+    struct multi_compositor *mc, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, struct xrt_rect *out)
+{
+	if (dx0 < 0) dx0 = 0;
+	if (dy0 < 0) dy0 = 0;
+	if (dx1 > (int32_t)mc->weave.sat_w) dx1 = (int32_t)mc->weave.sat_w;
+	if (dy1 > (int32_t)mc->weave.sat_h) dy1 = (int32_t)mc->weave.sat_h;
+	if (dx1 <= dx0 || dy1 <= dy0) {
+		return 0;
+	}
+	out[0] = (struct xrt_rect){{dx0, dy0}, {(uint32_t)(dx1 - dx0), (uint32_t)(dy1 - dy0)}};
+	uint32_t n = 1;
+
+	pthread_mutex_lock(&g_dxr_occ.mutex);
+	dxr_occ_refresh();
+	if (g_dxr_occ.count == 0 || !mc->weave.have_geometry) {
+		pthread_mutex_unlock(&g_dxr_occ.mutex);
+		return n;
+	}
+
+	const int32_t pw = (int32_t)mc->weave.sat_panel_w, ph = (int32_t)mc->weave.sat_panel_h;
+	// Client identification: exact-origin match, else the fullscreen rule.
+	int32_t client_layer = INT32_MIN;
+	for (uint32_t i = 0; i < g_dxr_occ.count; i++) {
+		const struct dxr_occ_window *w = &g_dxr_occ.win[i];
+		if (w->type != DXR_A11Y_TYPE_APPLICATION) {
+			continue;
+		}
+		if (w->l >= mc->weave.win_x - 4 && w->l <= mc->weave.win_x + 4 && w->t >= mc->weave.win_y - 4 &&
+		    w->t <= mc->weave.win_y + 4 && w->layer > client_layer) {
+			client_layer = w->layer;
+		}
+	}
+	const bool client_fullscreen = pw > 0 && ph > 0 &&
+	                               (int64_t)mc->weave.win_w * mc->weave.win_h * 10 >= (int64_t)pw * ph * 9;
+
+	static bool logged_active = false;
+	for (uint32_t i = 0; i < g_dxr_occ.count && n > 0; i++) {
+		const struct dxr_occ_window *w = &g_dxr_occ.win[i];
+		bool occludes = false;
+		if (w->type == DXR_A11Y_TYPE_INPUT_METHOD) {
+			occludes = true;
+		} else if (w->type == DXR_A11Y_TYPE_APPLICATION) {
+			// Skip the client's own window (origin match).
+			const bool is_client = w->l >= mc->weave.win_x - 4 && w->l <= mc->weave.win_x + 4 &&
+			                       w->t >= mc->weave.win_y - 4 && w->t <= mc->weave.win_y + 4;
+			if (is_client) {
+				continue;
+			}
+			if (client_layer != INT32_MIN) {
+				occludes = w->layer > client_layer;
+			} else if (client_fullscreen && pw > 0 && ph > 0) {
+				const bool w_fullscreen =
+				    (int64_t)(w->r - w->l) * (w->b - w->t) * 10 >= (int64_t)pw * ph * 9;
+				occludes = !w_fullscreen;
+			}
+		}
+		if (!occludes) {
+			continue;
+		}
+		int32_t wl = w->l, wt = w->t, wr = w->r, wb = w->b;
+		// Scaled-occluder correction: hybrid bounds (same tell as the client
+		// scale derivation) -> physical extent = logical * miniwindow factor.
+		if (pw > 0 && ph > 0 && wl >= 0 && wt >= 0 && (wr > pw || wb > ph)) {
+			float ms = 0.67f;
+			char v[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.satellite_miniwindow_scale", v) > 0 &&
+			    v[0] != 0) {
+				float parsed = strtof(v, NULL);
+				if (parsed > 0.05f && parsed <= 1.0f) {
+					ms = parsed;
+				}
+			}
+			wr = wl + (int32_t)((float)(wr - wl) * ms + 0.5f);
+			wb = wt + (int32_t)((float)(wb - wt) * ms + 0.5f);
+		}
+		// Panel -> overlay coords.
+		wl -= mc->weave.sat_off_x;
+		wr -= mc->weave.sat_off_x;
+		wt -= mc->weave.sat_off_y;
+		wb -= mc->weave.sat_off_y;
+		if (!logged_active) {
+			logged_active = true;
+			U_LOG_W("weave satellite(#1277): occlusion ACTIVE — first occluder type=%d layer=%d "
+			        "%d,%d-%d,%d (client layer %d)",
+			        w->type, w->layer, wl, wt, wr, wb, client_layer);
+		}
+		n = dxr_occ_subtract(out, n, wl, wt, wr, wb);
+	}
+	pthread_mutex_unlock(&g_dxr_occ.mutex);
+	return n;
+}
+
+void
+comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
+{
+	if (mc->weave.sat_swapchain == VK_NULL_HANDLE || mc->weave.sat_cmd == VK_NULL_HANDLE) {
+		return;
+	}
+	struct vk_bundle *vk = weave_get_vk(mc);
+	if (vk == NULL) {
+		return;
+	}
+
+	uint32_t idx = 0;
+	VkResult ret = vk->vkAcquireNextImageKHR(vk->device, mc->weave.sat_swapchain, 50ULL * 1000ULL * 1000ULL,
+	                                         mc->weave.sat_acquire_sem, VK_NULL_HANDLE, &idx);
+	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		// Transient (timeout / out-of-date): the overlay stays stale one
+		// more tick; the 20 Hz caller retries while the client stays idle.
+		return;
+	}
+
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+	VkCommandBuffer cmd = mc->weave.sat_cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo begin = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin);
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+	mc->weave.sat_image_first[idx] = false;
+	VkClearColorValue clear = {.float32 = {0.f, 0.f, 0.f, 0.f}};
+	vk->vkCmdClearColorImage(cmd, mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1,
+	                         &range);
+	VkImageMemoryBarrier to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+	                         0, NULL, 1, &to_present);
+	vk->vkEndCommandBuffer(cmd);
+
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &mc->weave.sat_acquire_sem,
+	    .pWaitDstStageMask = &wait_stage,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &mc->weave.sat_done_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	vk->vkResetFences(vk->device, 1, &mc->weave.sat_fence);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.sat_fence);
+	if (ret == VK_SUCCESS) {
+		vk->vkWaitForFences(vk->device, 1, &mc->weave.sat_fence, VK_TRUE, 100ULL * 1000ULL * 1000ULL);
+		VkPresentInfoKHR present = {
+		    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		    .waitSemaphoreCount = 1,
+		    .pWaitSemaphores = &mc->weave.sat_done_sem,
+		    .swapchainCount = 1,
+		    .pSwapchains = &mc->weave.sat_swapchain,
+		    .pImageIndices = &idx,
+		};
+		vk->vkQueuePresentKHR(vk->main_queue->queue, &present);
+	}
+	vk_queue_unlock(vk->main_queue);
+	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
+}
+
+/*!
+ * Blit the completed woven output onto the overlay at the window's physical
+ * rect and present. Called with the weave mutex held, AFTER the weave fence
+ * has been waited (out_image is GPU-complete, COLOR_ATTACHMENT_OPTIMAL).
+ * Best-effort: any failure releases the swapchain; the next submit either
+ * recreates it (transient, e.g. OUT_OF_DATE) or latched-fails via ensure.
+ */
+static void
+weave_satellite_present(struct vk_bundle *vk,
+                        struct multi_compositor *mc,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects)
+{
+	if (!weave_satellite_ensure(vk, mc)) {
+		return;
+	}
+
+	// Rotation: tolerating SUBOPTIMAL (correct — it is Android's steady state
+	// on a rotated panel) also removed the only rotation signal, so a
+	// portrait swapchain survived into landscape and Android SCALED its
+	// content into the re-laid-out overlay view — a squished stale weave over
+	// the caller's mono draw (field report, morning after). The reliable
+	// signal is the weave itself: the output tracks the caller's reported
+	// geometry, so an orientation mismatch between output and swapchain means
+	// the panel rotated — release and recreate at the new extent.
+	if (mc->weave.out_w != 0 && mc->weave.out_h != 0 &&
+	    ((mc->weave.out_w > mc->weave.out_h) != (mc->weave.sat_w > mc->weave.sat_h))) {
+		U_LOG_W("weave satellite(#1277): orientation changed (out %ux%u vs overlay %ux%u) — recreating",
+		        mc->weave.out_w, mc->weave.out_h, mc->weave.sat_w, mc->weave.sat_h);
+		// Swapchain-only rebuild: the overlay view survives rotation with a
+		// surfaceChanged in place (same holder, new extent — measured), so the
+		// VkSurface stays valid. A full release/re-ensure here destroys a live
+		// view and collides with the #558 single-window globals (stale window
+		// republished -> VK_ERROR_NATIVE_WINDOW_IN_USE latch).
+		if (!weave_satellite_build_swapchain(vk, mc)) {
+			weave_satellite_release(vk, mc);
+			return;
+		}
+	}
+
+	uint32_t idx = 0;
+	VkResult ret = vk->vkAcquireNextImageKHR(vk->device, mc->weave.sat_swapchain, 100ULL * 1000ULL * 1000ULL,
+	                                         mc->weave.sat_acquire_sem, VK_NULL_HANDLE, &idx);
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+		U_LOG_W("weave satellite(#1277): swapchain out of date — rebuilding");
+		if (!weave_satellite_build_swapchain(vk, mc)) {
+			weave_satellite_release(vk, mc);
+		}
+		return;
+	}
+	// SUBOPTIMAL is Android's steady state on a rotated panel when the
+	// swapchain's preTransform is IDENTITY (the compositor applies the
+	// rotation). It is NOT a recreate signal — treating it as one is a
+	// teardown/recreate thrash that ends in VK_ERROR_NATIVE_WINDOW_IN_USE.
+	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		U_LOG_E("weave satellite(#1277): acquire: %s", vk_result_string(ret));
+		weave_satellite_release(vk, mc);
+		return;
+	}
+
+	VkCommandBuffer cmd = mc->weave.sat_cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo begin = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin);
+
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+
+	// Swapchain image -> TRANSFER_DST (UNDEFINED on first use; discard old
+	// present contents otherwise — we repaint the whole surface every frame).
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	// Woven output -> TRANSFER_SRC (the weave's render pass left it
+	// COLOR_ATTACHMENT_OPTIMAL; its writes are fence-complete).
+	VkImageMemoryBarrier out_to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.out_image,
+	    .subresourceRange = range,
+	};
+	VkImageMemoryBarrier pre[2] = {to_dst, out_to_src};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+	mc->weave.sat_image_first[idx] = false;
+
+	// Everything outside the woven rect is TRANSPARENT — the desktop shows
+	// through (pre-multiplied alpha: all-zero = fully clear).
+	VkClearColorValue clear = {.float32 = {0.f, 0.f, 0.f, 0.f}};
+	vk->vkCmdClearColorImage(cmd, mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1,
+	                         &range);
+
+	// Placement: caller-reported window geometry x the container-scale prop,
+	// clamped to the panel. No geometry yet -> panel origin at output size.
+	const float scale = weave_satellite_scale();
+	// Phase-meter nudge (diagnostic): debug.dxr.satellite_shift_x / _y shift the
+	// blit destination by whole pixels (may be negative). A left/right-asymmetric
+	// crosstalk that a +-1..3 px x-nudge cures IS a sub-lens-pitch displacement,
+	// and the value that cures it measures the displacement directly.
+	int32_t nudge_x = 0, nudge_y = 0;
+	{
+		char v[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.satellite_shift_x", v) > 0) {
+			nudge_x = atoi(v);
+		}
+		v[0] = 0;
+		if (__system_property_get("debug.dxr.satellite_shift_y", v) > 0) {
+			nudge_y = atoi(v);
+		}
+		static int32_t last_nx = INT32_MIN, last_ny = INT32_MIN;
+		if (nudge_x != last_nx || nudge_y != last_ny) {
+			last_nx = nudge_x;
+			last_ny = nudge_y;
+			U_LOG_W("weave satellite(#1277): blit nudge (%d,%d)", nudge_x, nudge_y);
+		}
+	}
+	int32_t dst_x = 0, dst_y = 0;
+	int32_t dst_w = (int32_t)mc->weave.out_w, dst_h = (int32_t)mc->weave.out_h;
+	if (mc->weave.have_geometry) {
+		// Panel coordinates -> overlay-local (see sat_off_* in the header).
+		dst_x = mc->weave.win_x - mc->weave.sat_off_x + nudge_x;
+		dst_y = mc->weave.win_y - mc->weave.sat_off_y + nudge_y;
+		// Physical-rect mode weaves at win*scale already, so the output IS the
+		// on-panel size: present 1:1. (scale re-applied only if the weave ran
+		// logical — the legacy/pre-physical behaviour.)
+		if (mc->weave.out_w != mc->weave.win_w || mc->weave.out_h != mc->weave.win_h) {
+			dst_w = (int32_t)mc->weave.out_w;
+			dst_h = (int32_t)mc->weave.out_h;
+		} else {
+			dst_w = (int32_t)((float)mc->weave.win_w * scale + 0.5f);
+			dst_h = (int32_t)((float)mc->weave.win_h * scale + 0.5f);
+		}
+	}
+	// dst_x/dst_y may be negative and dst rect may exceed the overlay (an
+	// off-edge window, or a transitional geometry): the mapping stays linear
+	// and each blit below is clipped in DST space with source compensation.
+	// Pre-loop clamping here broke that linearity (the immersive-toggle bug:
+	// dst_y = -inset clamped to 0 shifted the whole weave by the inset).
+
+	// Per-RECT blits, not the whole output: the DP's non-tile region carries a
+	// low-alpha backdrop (the compose-under transparency model), and copying it
+	// panel-wide put a visible dark film over the page (measured round 5). The
+	// submitted rects are exactly the woven regions — copy those, leave every
+	// other overlay pixel at the transparent clear. This is also occlusion-lite:
+	// the overlay only ever owns pixels a weave actually claimed this frame.
+	const float sx = (dst_w > 0 && mc->weave.out_w > 0) ? (float)dst_w / (float)mc->weave.out_w : 1.0f;
+	const float sy = (dst_h > 0 && mc->weave.out_h > 0) ? (float)dst_h / (float)mc->weave.out_h : 1.0f;
+	// Physical-rect mode: the submitted rects are LOGICAL window coords, but the
+	// woven output is physical-sized — scale the source rects by out/logical.
+	// Identity in normal mode (out == logical).
+	const float rrx = (mc->weave.have_geometry && mc->weave.win_w > 0)
+	                      ? (float)mc->weave.out_w / (float)mc->weave.win_w
+	                      : 1.0f;
+	const float rry = (mc->weave.have_geometry && mc->weave.win_h > 0)
+	                      ? (float)mc->weave.out_h / (float)mc->weave.win_h
+	                      : 1.0f;
+	for (uint32_t i = 0; i < rect_count && rects != NULL; i++) {
+		const struct xrt_rect *r = &rects[i];
+		if (r->extent.w <= 0 || r->extent.h <= 0) {
+			continue;
+		}
+		int32_t sx0 = (int32_t)((float)r->offset.w * rrx + 0.5f);
+		int32_t sy0 = (int32_t)((float)r->offset.h * rry + 0.5f);
+		int32_t sx1 = sx0 + (int32_t)((float)r->extent.w * rrx + 0.5f);
+		int32_t sy1 = sy0 + (int32_t)((float)r->extent.h * rry + 0.5f);
+		if (sx0 < 0) sx0 = 0;
+		if (sy0 < 0) sy0 = 0;
+		if (sx1 > (int32_t)mc->weave.out_w) sx1 = (int32_t)mc->weave.out_w;
+		if (sy1 > (int32_t)mc->weave.out_h) sy1 = (int32_t)mc->weave.out_h;
+		if (sx1 <= sx0 || sy1 <= sy0) {
+			continue;
+		}
+		int32_t dx0 = dst_x + (int32_t)((float)sx0 * sx + 0.5f);
+		int32_t dy0 = dst_y + (int32_t)((float)sy0 * sy + 0.5f);
+		int32_t dx1 = dst_x + (int32_t)((float)sx1 * sx + 0.5f);
+		int32_t dy1 = dst_y + (int32_t)((float)sy1 * sy + 0.5f);
+
+		// Clip in DST space (overlay bounds now; occlusion pieces subtract
+		// here too), then derive the source by the INVERSE mapping so a
+		// clipped edge shifts the source with it instead of smearing.
+		struct xrt_rect pieces[DXR_SAT_MAX_PIECES];
+		uint32_t n_pieces = weave_satellite_clip_and_occlude(mc, dx0, dy0, dx1, dy1, pieces);
+		for (uint32_t pi = 0; pi < n_pieces; pi++) {
+			const struct xrt_rect *p = &pieces[pi];
+			const int32_t px0 = p->offset.w, py0 = p->offset.h;
+			const int32_t px1 = px0 + (int32_t)p->extent.w, py1 = py0 + (int32_t)p->extent.h;
+			int32_t qx0 = (int32_t)((float)(px0 - dst_x) / sx + 0.5f);
+			int32_t qy0 = (int32_t)((float)(py0 - dst_y) / sy + 0.5f);
+			int32_t qx1 = (int32_t)((float)(px1 - dst_x) / sx + 0.5f);
+			int32_t qy1 = (int32_t)((float)(py1 - dst_y) / sy + 0.5f);
+			if (qx0 < 0) qx0 = 0;
+			if (qy0 < 0) qy0 = 0;
+			if (qx1 > (int32_t)mc->weave.out_w) qx1 = (int32_t)mc->weave.out_w;
+			if (qy1 > (int32_t)mc->weave.out_h) qy1 = (int32_t)mc->weave.out_h;
+			if (qx1 <= qx0 || qy1 <= qy0) {
+				continue;
+			}
+			VkImageBlit blit = {
+			    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			    .srcOffsets = {{qx0, qy0, 0}, {qx1, qy1, 1}},
+			    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+			    .dstOffsets = {{px0, py0, 0}, {px1, py1, 1}},
+			};
+			// NEAREST: at 1:1 this is exact-copy semantics with zero filter
+			// risk; under a scale the physical-size weave is the real answer,
+			// not a nicer filter.
+			vk->vkCmdBlitImage(cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   mc->weave.sat_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+			                   VK_FILTER_NEAREST);
+		}
+	}
+
+	// Output back to what the next weave's render pass LOADs; swapchain image
+	// to PRESENT.
+	VkImageMemoryBarrier out_back = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.out_image,
+	    .subresourceRange = range,
+	};
+	VkImageMemoryBarrier sc_to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = mc->weave.sat_images[idx],
+	    .subresourceRange = range,
+	};
+	VkImageMemoryBarrier post[2] = {out_back, sc_to_present};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	                         0, 0, NULL, 0, NULL, 2, post);
+	vk->vkEndCommandBuffer(cmd);
+
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	VkSubmitInfo submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &mc->weave.sat_acquire_sem,
+	    .pWaitDstStageMask = &wait_stage,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = 1,
+	    .pSignalSemaphores = &mc->weave.sat_done_sem,
+	};
+	vk_queue_lock(vk->main_queue);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.sat_fence);
+	vk_queue_unlock(vk->main_queue);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): blit submit: %s", vk_result_string(ret));
+		weave_satellite_release(vk, mc);
+		return;
+	}
+	// Same bounded synchronous contract as the weave itself.
+	ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.sat_fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
+	vk->vkResetFences(vk->device, 1, &mc->weave.sat_fence);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave satellite(#1277): blit did not complete: %s", vk_result_string(ret));
+		weave_satellite_release(vk, mc);
+		return;
+	}
+
+	VkPresentInfoKHR present = {
+	    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &mc->weave.sat_done_sem,
+	    .swapchainCount = 1,
+	    .pSwapchains = &mc->weave.sat_swapchain,
+	    .pImageIndices = &idx,
+	};
+	vk_queue_lock(vk->main_queue);
+	ret = vk->vkQueuePresentKHR(vk->main_queue->queue, &present);
+	vk_queue_unlock(vk->main_queue);
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+		weave_satellite_release(vk, mc);
+	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+		U_LOG_E("weave satellite(#1277): present: %s", vk_result_string(ret));
+		weave_satellite_release(vk, mc);
+	}
+}
+
 bool
 comp_multi_weave_submit(struct xrt_compositor *xc,
                         xrt_graphics_buffer_handle_t in_handle,
@@ -682,6 +1735,33 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
+		// Satellite physical-rect weave (#1277 P0, second half): under an OEM
+		// container scale the window's PIXELS ON PANEL are logical*scale, and a
+		// weave computed at logical size then resampled is destroyed. When the
+		// satellite presents (and only then — the in-app path returns the
+		// output to a caller that expects logical dims), weave at the PHYSICAL
+		// size: output + scratch sized *scale, content blits scaled INTO the
+		// atlas, the DP phase slot fed the physical rect, and the overlay blit
+		// becomes 1:1 (the present path's ratios collapse automatically since
+		// out dims == physical). Factor from debug.dxr.satellite_scale until
+		// the platform exposes the real container scale (OEM-asks list).
+		// Batch path only: legacy clients keep logical semantics.
+		float sat_pscale = 1.0f;
+		if (weave_satellite_wanted(mc) && rect_count > 0) {
+			sat_pscale = weave_satellite_effective_scale(mc);
+			if (sat_pscale != 1.0f) {
+				static float logged_pscale = -1.0f;
+				if (logged_pscale != sat_pscale) {
+					logged_pscale = sat_pscale;
+					U_LOG_W("weave satellite(#1277): PHYSICAL-RECT weave, scale %.3f "
+					        "(window %d,%d %ux%u vs panel %ux%u)",
+					        (double)sat_pscale, mc->weave.win_x, mc->weave.win_y,
+					        mc->weave.win_w, mc->weave.win_h, mc->weave.sat_panel_w,
+					        mc->weave.sat_panel_h);
+				}
+			}
+		}
+
 		// Output dims: v6 = one content view; batch = the (window-client-sized)
 		// input; legacy = rect offset+extent.
 		uint32_t want_w = 0, want_h = 0;
@@ -689,8 +1769,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			want_w = cvw;
 			want_h = cvh;
 		} else if (rect_count > 0) {
-			want_w = mc->weave.in_w;
-			want_h = mc->weave.in_h;
+			want_w = (uint32_t)((float)mc->weave.in_w * sat_pscale + 0.5f);
+			want_h = (uint32_t)((float)mc->weave.in_h * sat_pscale + 0.5f);
 		} else {
 			want_w = (uint32_t)rect_x + rect_w;
 			want_h = (uint32_t)rect_y + rect_h;
@@ -929,21 +2009,27 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				continue;
 			}
 
+			// Physical-rect mode: content lands in the (physical-sized) atlas
+			// at scaled coordinates; identity when sat_pscale == 1.
+			const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+			const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+			const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+			const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
 			VkImageBlit blits[2] = {
 			    // Left eye: input rect's left half -> left tile, unsqueezed.
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
+			        .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
 			    },
 			    // Right eye: input rect's right half -> right tile (+out_w).
 			    {
 			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
 			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
 			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
-			                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},
+			        .dstOffsets = {{(int32_t)mc->weave.out_w + dx0, dy0, 0},
+			                       {(int32_t)mc->weave.out_w + dx1, dy1, 1}},
 			    },
 			};
 			vk->vkCmdBlitImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
@@ -986,9 +2072,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// geometry (or a DP without the slot) = display-scoped, which is correct
 		// only for a full-screen window at the panel origin.
 		if (mc->weave.have_geometry) {
+			// Physical-rect mode scales the on-panel client size; origin is
+			// already physical (the geometry feed reports screen coordinates).
+			const uint32_t dp_w = (uint32_t)((float)mc->weave.win_w * sat_pscale + 0.5f);
+			const uint32_t dp_h = (uint32_t)((float)mc->weave.win_h * sat_pscale + 0.5f);
 			bool fed = xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)mc->weave.dp, mc->weave.win_x, mc->weave.win_y,
-			    mc->weave.win_w, mc->weave.win_h, mc->weave.win_display_id);
+			    dp_w, dp_h, mc->weave.win_display_id);
 			if (mc->weave.geometry_dirty) {
 				mc->weave.geometry_dirty = false;
 				U_LOG_W("weave(#1036): window rect %s the DP phase slot", fed ? "fed to" : "NOT accepted by");
@@ -1181,6 +2271,25 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		mc->weave.fence_value++;
+		mc->weave.last_submit_ns = os_monotonic_get_ns(); // #1278 idle tracking
+		if (mc->weave.idle_released) {
+			// #1278: weaving resumed after an idle release. The lens re-binds
+			// via this weave's own apply path; on_resume keeps the DP contract
+			// symmetric (a vendor may re-assert more than the lens).
+			mc->weave.idle_released = false;
+			if (mc->weave.dp != NULL) {
+				xrt_display_processor_on_resume(mc->weave.dp);
+			}
+			U_LOG_W("weave(#1278): weave resumed after idle release — lens re-asserted");
+		}
+
+		// Arch-C satellite (#1277 P0): present the woven output ourselves.
+		// Best-effort AFTER the weave is complete — a satellite failure logs,
+		// latches sat_failed, and the very same frame still exports normally,
+		// so the caller never sees a black gap during a fallback.
+		if (weave_satellite_wanted(mc)) {
+			weave_satellite_present(vk, mc, rect_count, rects);
+		}
 
 		*out_width = mc->weave.out_w;
 		*out_height = mc->weave.out_h;
@@ -1220,7 +2329,12 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 	}
 	os_mutex_lock(&mc->weave.mutex);
 	bool ok = false;
-	if (mc->weave.out_ahb != NULL && mc->weave.out_w != 0) {
+	// Arch-C satellite (#1277): while the service presents the weave itself,
+	// report no output — the caller's over-plane then draws nothing and its
+	// page-owned 2D shows under the overlay (spec v7 permits absent output).
+	const bool satellite_live = mc->weave.sat_enabled && !mc->weave.sat_failed &&
+	                            mc->weave.sat_swapchain != VK_NULL_HANDLE;
+	if (!satellite_live && mc->weave.out_ahb != NULL && mc->weave.out_w != 0) {
 		// Hand out the CACHED handle without taking a reference. The generated
 		// out_handles send path only READS the handle — it never releases it
 		// (proto.py) — and AHardwareBuffer_sendHandleToUnixSocket does not
@@ -1288,6 +2402,7 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk->vkQueueWaitIdle(vk->main_queue->queue);
 			vk_queue_unlock(vk->main_queue);
 		}
+		weave_satellite_release(vk, mc);
 		weave_release_input(vk, mc);
 		weave_release_overlay(vk, mc);
 		weave_release_scratch(vk, mc);

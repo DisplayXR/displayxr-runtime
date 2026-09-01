@@ -21,7 +21,7 @@ a stack:
 
 | | Approach | What it costs |
 |---|---|---|
-| **A** | Let frames queue (`DXR_DEFER_PRESENT`) so that a DP capable of re-sampling the pose at submit time has something to correct | +1 frame of eye-pose staleness, which the DP-side correction is supposed to pay back. Measured null twice. |
+| **A** | Let frames queue (`DXR_DEFER_PRESENT`, since **removed** — see below) so that a DP capable of re-sampling the pose at submit time has something to correct | +1 frame of eye-pose staleness, which the DP-side correction is supposed to pay back. Measured null twice. |
 | **B** | Never let the weave go stale in the first place — **repaint** re-weaves the last atlas at display rate with a **fresh** eye pose | A repaint costs GPU time even when the app has produced nothing new |
 
 **We ship B.** Repaint runs at the display rate, so the woven pose is at most one refresh old
@@ -62,8 +62,40 @@ produces 15 atlases a second but the panel still gets ~60 correctly-phased weave
 
 A repaint replays *rendering state only* — it never touches app-owned state.
 
+**The quiet gate is cadence-aware, in vblank counts (#1257).** A repaint must never
+compete with an imminent app frame, and the loops originally enforced that with a fixed
+constant: repaint only after ≥ 2 panel periods of app silence. That constant made panel
+rate structurally unreachable for a present-capped app — at 20 Hz it forbids repainting
+the first missed vblank of *every* app frame, and at 30 Hz (interval = exactly 2 periods)
+the gate never opens at all (measured repaints/s 0.0). Two rounds of ms-domain
+"EMA ± jitter" prediction also failed measurably: a vsynced capped app's intervals are
+quantized to period multiples, so honest jitter reads 12–23 ms on a metronomic app, and
+repaints presented late in the gap steal the app's own FIFO queue slot — inflating the
+jitter the gate was reading (a feedback loop). Since #1257 the gate (`u_repaint_gate.h`)
+estimates the cadence in vblank counts — "the app presents every N vblanks", via a
+mode-majority / coherent-mean ladder over round(interval/period). An adaptive N = 2 window
+exists behind `DXR_WEAVE_REPAINT_GATE=adaptive` (one repaint fills the one missed vblank,
+governor-guarded) but is **not the default**: its perf win was real (hz30: 0.0 → ~15-17
+repaints/s) yet the trust ladder engages intermittently, the panel cadence breathes
+28-50 updates/s, and the eyeball verdict was judder — **the eye grades cadence stability,
+not average rate**; a steady 33 beats an oscillating 28-50. At **N ≥ 3 five schedule
+variants lost to the legacy gate on hardware** — fires collide with displaced-early
+commits, each ~5 ms replay lock hold vsync-snaps into a 16.7 ms app slip, and the loop's
+ticks starve on the convoy. The route to panel-rate weaving under a slow app is a **slot
+partition** (app every Nth vblank, repaints the rest — the app vsync-quantizes onto its
+own slots, so the fire/commit collision never exists by construction, and the schedule is
+steady, which is what the eye wants; this is why the FORCE probe succeeds where every
+gap-filling schedule failed, measured independently on Arc at −9.5 GPU pts "really crisp"
+and on Unity at −14.5 GPU pts with the display rate untouched). Evidence chain: #1257. An app whose predicted frame goes a full period
+overdue is hitching, not pacing — the gate then falls open at panel-rate spacing (the
+original #868 case). Without a trusted cadence (startup, erratic app, N = 1 — e.g. the
+measured 46.7 fps case the old constant protected) it degrades to the legacy 2-period
+behavior.
+
 | Probe | Purpose |
 |---|---|
+| `DXR_WEAVE_REPAINT_GATE=legacy` | Pin the pre-#1257 fixed 2-period quiet gate, for A/B. |
+| `DXR_WEAVE_REPAINT_TRACE=1` | One WARN row per ~5 s per loop: real tick cadence, replay/pace durations, per-gate bail counts (#1257 instrumentation). |
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 
@@ -71,6 +103,49 @@ A repaint replays *rendering state only* — it never touches app-owned state.
 is entitled to assume a weave cadence tied to app frames, and one that does may degrade — possibly
 silently — when repaint drives extra weaves. That is a per-vendor contract question, not a runtime
 one; if you change repaint's cadence, re-check it against each vendor's documented constraints.
+
+### `DXR_APP_FRAME_DIVISOR` — **default off** (#1257 slot partition)
+
+The productized form of what five gap-filling repaint schedules could not do: a SLOW app
+with a PANEL-RATE weave. `D` (2..8) makes xrWaitFrame — the spec's throttle point — block
+until the app's next slot, releasing the app every Dth vblank; the repaint loop fills the
+other D−1 slots per frame with a **known** N=D schedule (no cadence estimation, so the
+output cadence is steady — the visual requirement) and commits are phase-locked to the
+runtime's own schedule, so the fire/commit collision that sank the gap-filling variants
+never exists by construction. Pacing lives in the throttle **alone**: `predictedDisplayPeriod`
+deliberately stays the panel period (reporting D × period made well-behaved apps pace
+themselves on top of the throttle — double pacing; on vsync-blocking tiers the app slid
+off its slots to cycle + stride, measured 14/s on a 20/s schedule), and animation steps
+by `predictedDisplayTime` deltas, which stride honestly. Releases sit on a fixed grid —
+never re-anchored — so a late app converges back onto its slots. Measured precursors
+**Supported tier: the #918 split's d3d11 fill arm — hybrid AND, since ADR-039 Phase A,
+same-adapter** — the hybrid acceptance record is steady 60.0 presents across long runs,
+exact weave/repaint pair, GPU 25.5→19.0%, and the eyeball verdicts "tracking is great no
+stutter very good experience" / "looks great this run"; the same-adapter record (#1264,
+2026-08-29) adds the 68-window ≥5-min leg flat through the ~105 s events with weaves
+exactly 20/s in every window, and the eyeball "what i see on screen now holds well" on
+the configuration that opened #1257. A VK session on a single-adapter box now takes the
+same-adapter split by default (`DXR_SPLIT_SAME_ADAPTER=0` kills it) and is therefore a
+supported partition tier — the gate keys on the split being active, so the two flip
+together. Purely in-process tiers (a VK session that refused the split, d3d12, gl)
+**refuse the throttle cleanly** (app runs unthrottled) rather than collapse the panel:
+their fill loops tick at 100–175/s with 17–19 ms intervals against the fill arm's
+~400–585/s at 1.4–2.9 ms — same build, same box — and cannot sustain the fill schedule.
+That tick starvation was the strongest single correlate in the whole dataset, and
+ADR-039's answer is to stop fixing it in place: every tier moves onto the one fill
+engine rather than growing its own cadence remedies. The in-process d3d11 tier joined
+with Phase C (its partition gate keys on `split_active`, same structural coupling);
+d3d12 remains bring-up (Phase B) and gl proposed. `DXR_APP_FRAME_DIVISOR_ANY_TIER=1`
+re-enables refused tiers for bring-up. Measured precursors
+(the FORCE probe, which is this mechanism minus the
+deliberate release): render-30/weave-60 on Arc at −9.5 GPU pts "really crisp"; Unity
+iGPU-pinned at −14.5 GPU pts with the display rate untouched — and it paces runtime-side,
+so it works where an app-side cap (`targetFrameRate`) is box-dependent. The repaint
+governor stays armed underneath as the acceptance-pair enforcement (app weave rate must
+hold at panel/D). Not wired into Metal (no repaint loop — throttling there would slow the
+app with nothing filling the panel) or the IPC/service path yet. The future face-tracking
+correlation (drop D when no face is tracked, restore on face) drives exactly this one
+lever.
 
 ### `DXR_VK_QUEUE_MODE` — **default `auto`** (#902)
 
@@ -89,7 +164,12 @@ meant tier 2 was unreachable on every single-queue GPU and those machines silent
 Overrides: `queue` = tier 1 only · `layer` = force tier 2 even where a queue exists, so the layer
 path is testable on multi-queue GPUs · `off` = no layer injection, no repaint.
 
-### `DXR_DEFER_PRESENT` — **default OFF** (#837)
+### `DXR_DEFER_PRESENT` — **REMOVED from the code; kept here as the measurement record** (#837)
+
+> **The variable no longer exists.** `grep -rn DEFER_PRESENT src/` returns nothing — the
+> mechanism was measured as a null twice (below) and deleted. Setting it does nothing.
+> The section stays because the *result* is what stops someone re-deriving it; do not
+> read it as a lever you can turn on.
 
 Return from the weave without waiting on the submit fence, parking the frame's command buffer,
 framebuffer and fence and retiring exactly that predecessor at the top of the next call. Net
@@ -102,15 +182,112 @@ proven live (`#837: first frame PARKED`), 15 fps and identical results either wa
 app frames (`!is_repaint`), so with repaint on it affects roughly 15 of every 60 weaves. Keep it
 off.
 
+### The recurring bug: a fixed constant standing in for a platform-varying quantity
+
+`DXR_DP_FORWARD_HORIZON` below is one instance of a defect shape that has now been
+found independently **four times in this stack**, three of them in a single week
+(2026-08). Recording it here because each discovery cost days, and each was found by
+measurement after being invisible to review:
+
+| instance | the constant | what actually varies |
+|---|---|---|
+| leia-plugin#206 | an EMA of weave cadence | per-weave present-to-photon time |
+| CNSDK `facePredictLatencyMs` | hardcoded 40 ms prediction horizon | real weave→photon time, per frame |
+| leia-plugin#211 | a 100 ms eye-pair holdover window | the tier asymmetry it compensates for |
+| CNSDK filter `R` | a synthetic noise prior | real, correlated detector noise |
+| #868 repaint loop (Android) | a hardcoded 60 Hz panel period | a variable-refresh panel the platform moves 59.86 ⇄ 119.71 Hz mid-session |
+
+**The shape.** A quantity that genuinely varies gets replaced by a constant (or a
+smoothed estimate, which is a constant that lies more slowly). The code is correct
+at the calibration point and wrong everywhere else, proportionally to how far the
+real value has drifted.
+
+**Why it survives review.** The failure is not a crash or a wrong answer — it is a
+*breathing* output: judder, stutter, an intermittent geometry error. That reads as
+noise from the layer below, so it is attributed to tracking jitter, thermals, or the
+panel, and never investigated. leia-plugin#211's worst case was a fallback tier that
+only runs during dropouts, which is the most hostile version of this: an intermittent
+error in a rarely-exercised path, blamed on the sensor.
+
+**What to do instead.** Consume the per-sample value **raw**, and when it is
+unavailable report that honestly (0, `false`) so the consumer can take a documented
+fallback — rather than substituting a plausible number. If a constant is genuinely
+unavoidable, its comment must say what varies, what the constant was calibrated
+against, and what breaks when the platform moves — so the next person measuring a
+breathing output has somewhere to look.
+
+#### CAVEAT: finding the constant is not the same as it being the constraint
+
+The list above identifies a real defect class. It does **not** establish that any
+given instance is what limits the system — and the fifth instance is the cautionary
+data, because most of the work that followed from it measured null.
+
+The repaint loop's hardcoded 60 Hz *was* genuinely wrong: the panel is
+variable-refresh and the platform re-rates it on interaction. Replacing it with a
+measured vblank grid (`comp_vblank_grid.h`, fed from `VK_GOOGLE_display_timing`) was
+correct and paid: 34.0 → 59.9 fps against a steady panel, with a human verdict of
+"fluid, tracking feels faster". That is the pattern working as advertised.
+
+Then everything built on top of it measured null:
+
+| follow-on | result |
+|---|---|
+| grid-based late-weave tier | **null** — the weave budget already exceeds a refresh period, so there is no slack to weave late into |
+| slot partition on Android | **null** — CoV 34.9 / 33.5 / 33.2% at D=1/2/3, inside the D=1 run-to-run spread |
+| repaint phase hold (aim the fill at the midpoint) | **null** — a hold can only delay a fire, and the fire was already late |
+| `setFrameRate` / `preferredDisplayModeId` panel pin | **null** — accepted by the platform and ignored, twice, on two different APIs |
+| "fill" gate mode (budget repaints off the measured interval) | **harmful** — see the mode-4 comment in `u_repaint_gate.h` |
+
+The binding constraint was none of them. It was the **GPU governor**: at the default
+governor this device runs its GPU at 295 MHz of a possible 680, and pinning the clock
+moved the app from 51.53 ms to 28.45 ms per frame, took on-screen interval CoV from
+61% to 16%, and made the repaint loop stop firing entirely — because an app that fast
+never opens the quiet gate. The 41/18 ms alternation everything above was trying to
+schedule around **does not exist at adequate clock.**
+
+Note the shape: CNSDK's 40 ms `facePredictLatencyMs` is a genuine instance of the
+defect *and* was not what limited this device — the measured weave→scanout residual is
+28–47 ms, so 40 ms is a well-chosen centre whose defect is that it cannot move. Both
+things are true at once, and only measurement separates them.
+
+**So: identify the constant, then measure whether it is load-bearing before building
+on it.** The pattern is a hypothesis generator, not a work queue.
+
+#### And beware the metric that hides the answer
+
+"Fill" mode improved every panel statistic it was graded on — 34.4 → 39.7 fps, interval
+CoV 46.8% → 33.2%, SD 13.60 → 8.35 ms — while the app had stopped submitting frames
+entirely and the compositor was re-weaving a frozen atlas. Panel-interval statistics
+cannot distinguish a well-paced live stream from a well-paced dead one. Only a
+per-kind census (how many weaves carried a *new* app frame) can, and any scheduling
+change here must be graded on that rather than on smoothness.
+
+### `DXR_DP_FORWARD_HORIZON` — **default on** (#206 per-weave forward horizon)
+
+The vendor eye predictor extrapolates to whatever horizon the DP feeds it, and it consumes
+that value raw and per-call — so a smoothed retrospective estimate is the wrong feed the
+moment weave cadence varies (the leia-plugin#206 stutter: an EMA of a non-constant
+quantity puts ±~8 ms of horizon error on every weave at 28–50 Hz breathing). The runtime
+therefore computes each weave's **forward** present-to-photon time from the vsync-locked
+vblank grid — DXGI frame statistics give a vblank timestamp and a **measured** refresh
+period (59.94 vs 60.00 is measured, not assumed; the #1257 partition v3 post-mortem shows
+what an open-loop nominal-rate clock does) — and hands it to the DP via the appended
+`set_predicted_scanout` slot, per weave, immediately before `process_atlas`. The DP feeds
+it raw: no smoothing, no deadband. When no trusted grid exists (statistics unavailable on
+a composition swapchain, stalled >500 ms, warm-up), the value is 0 and the DP falls back
+to the retrospective `set_frame_timing` heuristic — the pre-#206 behavior. Wired on the
+split/bridge, d3d11, and d3d12 weave paths; the in-process VK dcomp path has no vblank
+source (no statistics, no `present_wait` on Intel) and honestly reports 0.
+
 ### Prediction horizon — computed by the DP, no runtime env var
 
 The runtime feeds the DP a **measured weave→scanout residual** through its frame-timing loop. A DP
 that predicts eye position can use that instead of assuming a fixed pipeline depth, which means a
 change in real present latency is largely self-correcting without any runtime knob.
 
-**Unverified:** whether that residual still means what the DP thinks it means when
-`DXR_DEFER_PRESENT` moves the present into the following call. Check before that flag is ever
-considered for default-on.
+**Moot since the removal:** the open question used to be whether that residual still means what
+the DP thinks it means when `DXR_DEFER_PRESENT` moves the present into the following call. Nothing
+moves the present any more. Re-open it only if a deferred-present mechanism is ever reintroduced.
 
 ### Adjacent levers that change the picture
 
@@ -119,7 +296,7 @@ considered for default-on.
 | `DXR_VK_BRIDGE_PACING` | governor | `0..3` pins the queue depth and disables governor transitions (#912) |
 | `DXR_PRESENT_OPAQUE` | `false` | Opaque flip chain instead of the composed chain. Different pacing source: `GetFrameStatistics` vs the DComp compositor clock |
 | `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` | unset | Which adapter renders and weaves (#821). See [adapter-selection.md](adapter-selection.md) |
-| `DXR_WEAVE_ON_SCANOUT` | **on (kill switch)** | **DEFAULT ON since #918 Phase 3 (ADR-037 §1).** The output-device split engages automatically wherever the scanout adapter differs from the render adapter **and the path implements it**: in-process D3D11, the D3D11 service (eligible presenter kinds only — `SERVICE_WINDOW` / `APP_HWND`; `CLIENT_TEXTURE` and self-presenting clients are structurally ineligible), in-process D3D12 (**all layer kinds** as of D12-4/D12-5), and **in-process Vulkan** (**all layer kinds** as of #1178 VK-0/VK-1a/VK-1b, shipped v2.12.1/v2.13.0). Vulkan reaches it without any cross-adapter Vulkan work: the compositor renders its atlas directly into a same-adapter D3D11 deposit texture (zero copies — the atlas IS the deposit slot, `COLOR_ATTACHMENT`), ordered by a shared `ID3D11Fence` imported as a VK timeline semaphore, and the existing D3D11-ends `comp_xbridge` carries it from there — so the bridge needed **no** Vulkan support. A VK session refuses the split only when the app's `VkDevice` lacks `VK_KHR_timeline_semaphore` (`reason=no_timeline_semaphore`). **OpenGL** has no split and cannot have one — it exposes no adapter-selection API, so the runtime cannot place a GL context — and takes ADR-037 §3 rung 2, logged as `split=0 reason=api_unsupported`; its D3D interop devices do now follow the GL context's own adapter (#1159). Set `DXR_WEAVE_ON_SCANOUT=0` (or `f…`/`n…`/`off`) to KILL it and force the old single-adapter behaviour; `=1` still works and is now a no-op restatement of the default. What it does: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. Covers **zones, Local2D, authored masks and the 2D-under backdrop** as of Phase 2a on the D3D11 legs (the four mask rasterizers take pure CPU rects and are built on the output device, while the Local2D flatten, the backdrop and a Tier-3 app-drawn mask ride the same egress slot as the atlas as extra planes — dirty-box + change-skip; measured 3 copies per session at rest, zero bridge traffic per repaint tick). The D3D12 leg covered projection only until D12-4/D12-5; it now transports zones, Local2D, the backdrop and app-authored masks too, so `layers_unsupported` is a **retired token** that nothing emits (kept so pre-D12-4 field logs still resolve). The VK leg likewise covers all layer kinds; its only remaining retire triggers are machine failures (`authored_mask` on an R8 plane allocation failure, `dp_refused_scanout`). On the SERVICE it covers **both** paths — direct (the focused client's cropped atlas) and compose (the crop of the combined atlas) — with the panel DP staying on the scanout adapter across a shell attach/detach, the zones wish mask following the DP's device rather than the output half, and unfocused app-HWND flat repaints skipped while it is on. No-op (`reason=same_adapter`) when the scanout adapter already is the app's, and refused outright under `DXR_LEGACY_STANDALONE`. Every fallback names itself on the one `weave placement:` line. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick; `DXR_TEST_SPLIT_FAIL_STAGEA=1` forces Stage A to fail and `DXR_TEST_FAKE_DP_REFUSE=1` forces a DP refusal on the scanout adapter (both in-process legs: D3D12 retires the engaged split, D3D11 fails Stage A before it engages — ADR-037 §3a), for exercising the two halves of the fallback matrix. **#1172:** an ineligible SERVICE client (`CLIENT_TEXTURE` / present-owner) does not merely stay off the scanout adapter — it gets a display processor of its **own** on the render device, bound to its **own** window, because the shared panel DP follows whichever presenter owns the panel and weaving a render-adapter texture through a scanout-adapter weaver faults inside the vendor SDK. Logged as `split=0 reason=presenter_ineligible,weave_on_ingest`. `DXR_TEST_FORCE_WEAVE_INGEST_DP=1` forces that path on with no split at all (so it is exercisable on a single-adapter box, with `test_apps/probes/weave_rpc_probe_d3d11_win`), `=2` forces the DP creation to fail so the refusal guard runs instead of the weave |
+| `DXR_WEAVE_ON_SCANOUT` | **on (kill switch)** | **DEFAULT ON since #918 Phase 3 (ADR-037 §1).** The output-device split engages automatically wherever the scanout adapter differs from the render adapter **and the path implements it**: in-process D3D11, the D3D11 service (eligible presenter kinds only — `SERVICE_WINDOW` / `APP_HWND`; `CLIENT_TEXTURE` and self-presenting clients are structurally ineligible), in-process D3D12 (**all layer kinds** as of D12-4/D12-5), and **in-process Vulkan** (**all layer kinds** as of #1178 VK-0/VK-1a/VK-1b, shipped v2.12.1/v2.13.0). Vulkan reaches it without any cross-adapter Vulkan work: the compositor renders its atlas directly into a same-adapter D3D11 deposit texture (zero copies — the atlas IS the deposit slot, `COLOR_ATTACHMENT`), ordered by a shared `ID3D11Fence` imported as a VK timeline semaphore, and the existing D3D11-ends `comp_xbridge` carries it from there — so the bridge needed **no** Vulkan support. A VK session refuses the split only when the deposit can stand up no GPU-side sync at all: fence mode needs `VK_KHR_timeline_semaphore` on the app's `VkDevice` (`reason=no_timeline_semaphore`), and on a driver with no D3D12_FENCE import the deposit falls back to KEYED-MUTEX mode (ADR-039 Phase A; requires `VK_KHR_win32_keyed_mutex`; plane deposits run timing-only per #1274). **OpenGL** has no split and cannot have one — it exposes no adapter-selection API, so the runtime cannot place a GL context — and takes ADR-037 §3 rung 2, logged as `split=0 reason=api_unsupported`; its D3D interop devices do now follow the GL context's own adapter (#1159). Set `DXR_WEAVE_ON_SCANOUT=0` (or `f…`/`n…`/`off`) to KILL it and force the old single-adapter behaviour; `=1` still works and is now a no-op restatement of the default. What it does: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. Covers **zones, Local2D, authored masks and the 2D-under backdrop** as of Phase 2a on the D3D11 legs (the four mask rasterizers take pure CPU rects and are built on the output device, while the Local2D flatten, the backdrop and a Tier-3 app-drawn mask ride the same egress slot as the atlas as extra planes — dirty-box + change-skip; measured 3 copies per session at rest, zero bridge traffic per repaint tick). The D3D12 leg covered projection only until D12-4/D12-5; it now transports zones, Local2D, the backdrop and app-authored masks too, so `layers_unsupported` is a **retired token** that nothing emits (kept so pre-D12-4 field logs still resolve). The VK leg likewise covers all layer kinds; its only remaining retire triggers are machine failures (`authored_mask` on an R8 plane allocation failure, `dp_refused_scanout`). On the SERVICE it covers **both** paths — direct (the focused client's cropped atlas) and compose (the crop of the combined atlas) — with the panel DP staying on the scanout adapter across a shell attach/detach, the zones wish mask following the DP's device rather than the output half, and unfocused app-HWND flat repaints skipped while it is on. When the scanout adapter already is the app's, ALL THREE accepted tiers now ENGAGE by default (`DXR_SPLIT_SAME_ADAPTER=0` is the shared kill switch back to the old `reason=same_adapter` decline — the fill-engine headroom, not the removed copy, is the property): VK (ADR-039 Phase A), the in-process D3D11 tier (Phase C — all layer kinds, planes eyeball-verified), and the D3D12 tier **via the heavy-d3d12 reroute** — its engage routes through the d3d11 fill arm (its own-legs arm serializes under real app load; `DXR_SPLIT_D3D12_ROUTE=own` keeps it as the A/B control), with Local2D/backdrop/zone planes transported and live window-resize followed. Refused outright under `DXR_LEGACY_STANDALONE`. Every fallback names itself on the one `weave placement:` line. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick; `DXR_TEST_SPLIT_FAIL_STAGEA=1` forces Stage A to fail and `DXR_TEST_FAKE_DP_REFUSE=1` forces a DP refusal on the scanout adapter (both in-process legs: D3D12 retires the engaged split, D3D11 fails Stage A before it engages — ADR-037 §3a), for exercising the two halves of the fallback matrix. **#1172:** an ineligible SERVICE client (`CLIENT_TEXTURE` / present-owner) does not merely stay off the scanout adapter — it gets a display processor of its **own** on the render device, bound to its **own** window, because the shared panel DP follows whichever presenter owns the panel and weaving a render-adapter texture through a scanout-adapter weaver faults inside the vendor SDK. Logged as `split=0 reason=presenter_ineligible,weave_on_ingest`. `DXR_TEST_FORCE_WEAVE_INGEST_DP=1` forces that path on with no split at all (so it is exercisable on a single-adapter box, with `test_apps/probes/weave_rpc_probe_d3d11_win`), `=2` forces the DP creation to fail so the refusal guard runs instead of the weave |
 | `DXR_SPLIT_INGRESS` | `adaptive` | **#918 Phase 2b PR 6, service only.** What the bridge does with the app-device source texture. `adaptive` reads a source that has held still IN PLACE and stages only the frame a source CHANGE lands on (a focus change, a controller attaching, a crop texture reallocating), with a 250 ms settle before it re-binds so a resize drag cannot drive one shared-handle re-open per frame. `staged` pins the PR 3-5 behaviour — one extra full-content app-device copy every frame — and exists as the A/B control, not as tuning. A source the render thread does not exclusively own is never read in place regardless: a client's own atlas is written by that client's IPC thread and always stages |
 | `DXR_FRAME_STAGE_TIMING` | off | Per-stage CPU timing of the windowed commit. `composite=` is the GPU wait |
 
@@ -129,7 +306,7 @@ considered for default-on.
 |---|---|---|---|
 | Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
 | Repaint | **on**, tier 1 dedicated queue | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) | on; follows the adapter the session was created on |
-| `DXR_DEFER_PRESENT` | off | off | off |
+| `DXR_DEFER_PRESENT` | *removed from the code* | *removed* | *removed* |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
 **Hybrid is the one still being settled — but the answer is now measured.** On this class of laptop
@@ -206,6 +383,8 @@ are unavailable there (#1044); the plain-swapchain paths are the instrumented on
 
 ## See also
 
+- [`docs/roadmap/control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md) — the full census of **every** `DXR_*` lever (read site, mechanism, default, tier), and the design for surfacing a small subset in the Control Panel
+- [`weave-cadence-vs-eye-prediction.md`](weave-cadence-vs-eye-prediction.md) — how these levers relate to vendor-side late latching and the eye predictor, what exists on Android (short version: #206, the split and the slot partition do not), and the CNSDK prediction measurement plan
 - [`docs/adr/ADR-007`](../adr/ADR-007-compositor-never-weaves.md) — the compositor never weaves; the DP does
 - [`docs/architecture/compositor-pipeline.md`](../architecture/compositor-pipeline.md)
 - [`docs/reference/adapter-selection.md`](adapter-selection.md) — GPU placement on hybrid machines
