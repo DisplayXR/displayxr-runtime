@@ -50,6 +50,36 @@ static comp_frame_witness g_frame_witness_vk{"vk"};
 #ifdef XRT_OS_ANDROID
 #include <sys/system_properties.h>
 
+
+//! Float-valued sysprop; default on unset or unparseable.
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	char buf[PROP_VALUE_MAX] = {0};
+	if (__system_property_get(name, buf) <= 0) {
+		return default_val;
+	}
+	char *end = NULL;
+	const float v = strtof(buf, &end);
+	return (end == buf || !std::isfinite(v)) ? default_val : v;
+}
+#else
+/*
+ * Non-Android: there are no sysprops, so every lookup is the default. Defined
+ * rather than left absent because the CALL SITES are unconditional — a helper
+ * that exists only under XRT_OS_ANDROID while its callers do not is a build
+ * break on every other platform, which is exactly how this file reached CI
+ * broken (the Android-only local builds could never see it).
+ */
+static float
+get_prop_float_local(const char *name, float default_val)
+{
+	(void)name;
+	return default_val;
+}
+#endif
+
+
 //! Diagnostic gate for the periodic #206 residual row — see the compositor's
 //! dxr_weave_cadence_trace() for the reasoning. The residual MEASUREMENT is
 //! always taken (it feeds comp_vk_native_target_weave_to_scanout_ns); only the
@@ -76,21 +106,6 @@ dxr_weave_cadence_trace_target(void)
 	}
 	return on == 1;
 }
-
-//! Float-valued sysprop; default on unset or unparseable.
-static float
-get_prop_float_local(const char *name, float default_val)
-{
-	char buf[PROP_VALUE_MAX] = {0};
-	if (__system_property_get(name, buf) <= 0) {
-		return default_val;
-	}
-	char *end = NULL;
-	const float v = strtof(buf, &end);
-	return (end == buf || !std::isfinite(v)) ? default_val : v;
-}
-#endif
-
 
 #include <dlfcn.h>
 #include <cmath>
