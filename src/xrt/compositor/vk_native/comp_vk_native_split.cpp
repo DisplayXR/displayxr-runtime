@@ -2125,6 +2125,55 @@ split_check_target_follows_window(struct comp_vk_split *s, uint32_t tgt_w, uint3
 	    (unsigned long long)s->tgt_drift_frames);
 }
 
+// (startup jerk) Name the call that blocks.
+//
+// Measured 2026-09-01 on the Unity avatar: the present stream stalls ~211 ms, eleven
+// times, spaced ~385 ms apart, over the first ~4 s -- while two cube controls on the
+// identical runtime, panel and reroute path stall ZERO times, CPU sits at 1.6 of 22
+// cores, and thirteen env-level hypotheses have been falsified. Counters cannot say
+// WHICH call blocks; this can. Logs only when a section exceeds the threshold, so it
+// costs one QPC pair per section on the hot path and prints nothing in steady state.
+//
+// DXR_SLOW_SECTION_MS=<n> sets the threshold (default 50); =0 disables.
+namespace {
+double
+slow_section_threshold_ms()
+{
+	static double ms = -1.0;
+	if (ms < 0.0) {
+		const char *e = getenv("DXR_SLOW_SECTION_MS");
+		ms = 50.0;
+		if (e != nullptr && e[0] != '\0') {
+			const double v = atof(e);
+			ms = (v >= 0.0) ? v : 50.0;
+		}
+	}
+	return ms;
+}
+
+struct slow_section
+{
+	const char *name;
+	uint64_t t0;
+	bool repaint;
+	explicit slow_section(const char *n, bool is_repaint)
+		: name(n), t0(os_monotonic_get_ns()), repaint(is_repaint)
+	{}
+	~slow_section()
+	{
+		const double thr = slow_section_threshold_ms();
+		if (thr <= 0.0) {
+			return;
+		}
+		const double ms = (double)(os_monotonic_get_ns() - t0) / 1e6;
+		if (ms >= thr) {
+			U_LOG_W("[SLOWSEC] %s took %.1f ms (%s) -- threshold %.0f ms\n",
+				        name, ms, repaint ? "repaint" : "app frame", thr);
+		}
+	}
+};
+} // namespace
+
 extern "C" bool
 comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const struct xrt_rect *canvas)
 {
@@ -2237,8 +2286,16 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	// Late-weave pacing + the weave-latency harness mark, on the scanout
 	// adapter where the present now happens.
 	if (is_repaint) {
+		// The late-weave PACING lives in weave_mark, not in Present: it holds a
+		// bounded WaitForSingleObject(frame_latency_waitable, 100) plus an optional
+		// compositor-clock wait. Two bounded waits that both time out is ~200 ms --
+		// the exact shape of the 211 ms present gaps, with the GPU measured IDLE
+		// (7-12%) throughout. Timed here because the earlier instrumentation wrapped
+		// the weave, the present and the composite tail but NOT the pacing.
+		slow_section _ss_mark("weave_mark pacing (repaint)", true);
 		comp_d3d11_target_weave_mark_repaint(s->target, s->mode_3d);
 	} else {
+		slow_section _ss_mark2("weave_mark pacing (app frame)", false);
 		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
 	}
 
@@ -2289,10 +2346,13 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	if (canvas != nullptr) {
 		cv = *canvas;
 	}
+	{
+	slow_section _ss_weave("DP process_atlas (weave)", is_repaint);
 	xrt_display_processor_d3d11_process_atlas(s->dp, s->out_ctx, atlas_srv, weave_view_w, weave_view_h, weave_cols,
 	                                          weave_rows, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, tgt_w, tgt_h,
 	                                          cv.offset.w, cv.offset.h, (uint32_t)cv.extent.w,
 	                                          (uint32_t)cv.extent.h);
+	}
 
 	/*
 	 * VK-1b-2 — the masked 2D-over-3D composite, then the HUD, both on the OUT
@@ -2302,6 +2362,7 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 	 * comp_d3d11_outcomp states and the plane transports exist to satisfy.
 	 */
 	{
+		slow_section _ss_tail("composite+HUD tail", is_repaint);
 		auto *dst = static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(s->target));
 		(void)split_composite(s, slot, is_repaint, dst);
 		split_draw_hud(s, dst, tgt_w, tgt_h);
@@ -2313,6 +2374,7 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		comp_xbridge_set_weave_slot(s->xbridge, slot);
 	}
 
+	slow_section _ss_present("target Present", is_repaint);
 	return comp_d3d11_target_present(s->target, 1) == XRT_SUCCESS;
 }
 

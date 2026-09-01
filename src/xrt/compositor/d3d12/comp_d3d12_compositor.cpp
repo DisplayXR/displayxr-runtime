@@ -340,6 +340,8 @@ struct comp_d3d12_compositor
 		uint64_t bd_copied_hash;
 		//! ADR-027 P4 wish publish sequence on this route.
 		uint64_t wish_seq;
+		//! Signature of the last wish actually published (dedupe).
+		uint64_t wish_sig_published;
 		//! Change-detection for the authored-mask staged->plane copy
 		//! ((res_gen << 48) | author_seq — either half moving re-copies).
 		uint64_t mask_copied_key;
@@ -644,6 +646,18 @@ struct comp_d3d12_compositor
 		 */
 		bool app_frame_in_progress;
 
+		/*
+		 * (startup jerk) When the layer_begin -> layer_commit window opened.
+		 *
+		 * The comment above asserts this window is short because an app renders
+		 * between xrWaitFrame and xrEndFrame. If a client holds it open instead,
+		 * every repaint bails for the whole duration and the panel shows nothing --
+		 * which is what ~211 ms present gaps during the Unity warm-up look like.
+		 * Measured, not assumed: DXR_SLOW_SECTION_MS logs any window over the
+		 * threshold (default 50 ms, 0 disables).
+		 */
+		uint64_t app_frame_begin_ns;
+
 		//! Everything process_atlas needs, captured at the last real weave.
 		//! Stable by construction: the resources are compositor-owned and the
 		//! geometry only changes when a new frame arrives (which re-arms).
@@ -760,6 +774,9 @@ static void d3d12_release_zone_state(struct comp_d3d12_compositor *c);
 // sideband publish of the wish / sticky mask. Defined with the zone helpers
 // near the bottom; called after each path's fence wait in layer_commit.
 static bool d3d12_zone_dp_supported(struct comp_d3d12_compositor *c);
+// (startup jerk) sub-step timers; defined with the zone helpers near the bottom.
+static void d3d12_zone_step(const char *nm);
+static void d3d12_zone_step_begin(void);
 static bool d3d12_zone_dp_supported_weaving_arm(struct comp_d3d12_compositor *c);
 static void d3d12_sync_zone_mask_to_dp(struct comp_d3d12_compositor *c);
 // #918 D12-5 — the app-authored (Tier-3) mask's bridge transport. Defined with
@@ -1789,6 +1806,57 @@ d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scr
  * @return false when this frame cannot composite on the route — the caller
  *         stamps no-composite, exactly like a failed own-legs deposit.
  */
+// (startup jerk MITIGATION) Skip a zone-wish publish that would say the same thing.
+//
+// MEASURED: comp_vk_split_publish_zone_wish() -> the vendor plug-in's
+// leia_dp_d3d11_publish_local_zone_mask() blocks 180-186 ms EVERY FRAME during the Unity
+// warm-up, on the compositor thread, under c->mutex. That is the whole ~200 ms hold that
+// locks out the repaint fill and freezes the panel; GPU idle 7-12%, CPU 1.6 of 22 cores.
+//
+// The avatar's wish is CONSTANT while it warms up (811x1421, 1x1 collapse), so publishing
+// it once per frame re-asserts an unchanged mask at ~185 ms a go. This hashes what the
+// publish would convey and skips the call when it is unchanged.
+//
+// The real fix belongs in the plug-in (async or rate-limited publish) -- a 184 ms
+// synchronous call is a defect whatever the caller does. This bounds the damage.
+//
+// DXR_ZONE_WISH_DEDUPE=0 restores the publish-every-frame behaviour for A/B.
+static bool
+d3d12_zone_wish_dedupe_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_ZONE_WISH_DEDUPE");
+		on = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return on == 1;
+}
+
+//! Cheap signature of everything the wish publish conveys.
+static uint64_t
+d3d12_zone_wish_sig(struct comp_d3d12_compositor *c, uint32_t region_w, uint32_t region_h)
+{
+	uint64_t h = 1469598103934665603ULL;
+	const auto mix = [&h](uint64_t v) {
+		h ^= v;
+		h *= 1099511628211ULL;
+	};
+	mix((uint64_t)c->out_mask_req.kind);
+	mix((uint64_t)c->out_mask_req.count);
+	mix((uint64_t)c->out_mask_req.w);
+	mix((uint64_t)c->out_mask_req.h);
+	mix((uint64_t)region_w);
+	mix((uint64_t)region_h);
+	for (uint32_t i = 0; i < c->out_mask_req.count && i < XRT_MAX_LAYERS; i++) {
+		const struct xrt_rect *r = &c->out_mask_req.rects[i];
+		mix((uint64_t)(uint32_t)r->offset.w);
+		mix((uint64_t)(uint32_t)r->offset.h);
+		mix((uint64_t)(uint32_t)r->extent.w);
+		mix((uint64_t)(uint32_t)r->extent.h);
+	}
+	return h;
+}
+
 static bool
 d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
                             uint32_t region_w,
@@ -1799,22 +1867,27 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
                             const struct u_canvas_rect *eff_canvas,
                             int32_t digest_proj_idx)
 {
+	d3d12_zone_step_begin();
 	if (c->split_panel_w == 0 || c->split_panel_h == 0) {
 		return false;
 	}
+	d3d12_zone_step("L2D:deposit_plane_ensure");
 	if (!comp_d3d12_deposit_plane_ensure(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, c->split_panel_w,
 	                                     c->split_panel_h)) {
 		return false;
 	}
 	struct comp_d3d12_deposit_plane pl = {};
+	d3d12_zone_step("L2D:deposit_plane_get");
 	if (!comp_d3d12_deposit_plane_get(c->reroute.dep, COMP_D3D12_DEPOSIT_PLANE_LOCAL2D, &pl)) {
 		return false;
 	}
 
 	struct xrt_rect box = {};
 	uint64_t hash = 0;
+	d3d12_zone_step("L2D:local2d_digest");
 	d3d12_local2d_digest(c, digest_proj_idx, /*over=*/true, region_w, region_h, &box, &hash);
 	if (hash != c->reroute.l2d_copied_hash) {
+		d3d12_zone_step("L2D:copy_to_plane");
 		d3d12_reroute_copy_to_plane(c, c->local2d_scratch, (ID3D12Resource *)pl.resource12);
 		c->reroute.l2d_copied_hash = hash;
 	}
@@ -1825,6 +1898,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	// capture block's exact exemption.
 	bool mask_ok = false;
 	if (c->out_mask_req.kind != D3D12_OUT_MASK_NONE && c->out_mask_req.count > 0) {
+		d3d12_zone_step("L2D:split_raster_mask");
 		mask_ok = comp_vk_split_raster_mask(c->reroute.split, c->out_mask_req.kind, c->out_mask_req.rects,
 		                                    c->out_mask_req.feather, c->out_mask_req.count,
 		                                    c->out_mask_req.w, c->out_mask_req.h);
@@ -1846,6 +1920,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	const uint32_t cw = eff_canvas->valid ? eff_canvas->w : region_w;
 	const uint32_t ch = eff_canvas->valid ? eff_canvas->h : region_h;
 
+	d3d12_zone_step("L2D:split_stage_local2d");
 	comp_vk_split_stage_local2d(c->reroute.split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
 	                            box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
 	                            region_w, region_h, cx, cy, cw, ch, mode, opaque, mask_is_plane);
@@ -1856,9 +1931,24 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	 * built; a non-zones frame clears.
 	 */
 	if (zones_frame) {
+		// Dedupe: this call costs ~185 ms in the plug-in; do not pay it to repeat itself.
+		const uint64_t wish_sig = d3d12_zone_wish_sig(c, region_w, region_h);
+		if (d3d12_zone_wish_dedupe_on() && wish_sig == c->reroute.wish_sig_published &&
+		    c->reroute.wish_seq != 0) {
+			static uint64_t skipped = 0;
+			skipped++;
+			if (skipped == 1 || (skipped % 300) == 0) {
+				U_LOG_W("[WISHDEDUPE] skipped %llu unchanged zone-wish publish(es)\n",
+				        (unsigned long long)skipped);
+			}
+		} else {
+		c->reroute.wish_sig_published = wish_sig;
 		c->reroute.wish_seq++;
+		d3d12_zone_step("L2D:publish_zone_wish");
 		comp_vk_split_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
+		}
 	} else {
+		d3d12_zone_step("L2D:clear_zone_wish");
 		comp_vk_split_clear_zone_wish(c->reroute.split);
 	}
 	return true;
@@ -2568,6 +2658,7 @@ d3d12_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_f
 	// #868: layer_accum is now mid-rewrite and the lock is about to be
 	// released — keep the repaint thread out until layer_commit.
 	c->repaint.app_frame_in_progress = true;
+	c->repaint.app_frame_begin_ns = os_monotonic_get_ns();
 	comp_layer_accum_begin(&c->layer_accum, data);
 	return XRT_SUCCESS;
 }
@@ -3914,6 +4005,43 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
  * one weave+present, and only reachable when the app was idle enough to trip the
  * gate in the first place.
  */
+// (startup jerk) Report what happened DURING a long gap between submits.
+//
+// All four in-path sections measure <50 ms (pacing, weave, present, composite tail) and
+// the GPU is idle (7-12%) while the present stream shows ~211 ms gaps -- so the time goes
+// BETWEEN our calls. This says whether the repaint loop was even awake: ticks advancing
+// with bail_armed climbing means it ran and refused; ticks flat means it never woke.
+static void
+d3d12_report_submit_gap(struct comp_d3d12_compositor *c, const char *who)
+{
+	static double thr_ms = -1.0;
+	if (thr_ms < 0.0) {
+		const char *e = getenv("DXR_SLOW_SECTION_MS");
+		thr_ms = (e != NULL && e[0] != '\0') ? atof(e) : 50.0;
+	}
+	if (thr_ms <= 0.0) {
+		return;
+	}
+	static uint64_t last_ns = 0;
+	static uint64_t last_ticks = 0, last_armed = 0, last_gate = 0;
+	const uint64_t now = os_monotonic_get_ns();
+	if (last_ns != 0) {
+		const double gap_ms = (double)(now - last_ns) / 1e6;
+		if (gap_ms >= thr_ms) {
+			U_LOG_W("[GAP] %.1f ms with no submit (next by %s) -- during it the repaint "
+				        "loop: ticks+%llu bail_armed+%llu bail_gate+%llu\n",
+				        gap_ms, who,
+				        (unsigned long long)(c->repaint.ticks - last_ticks),
+				        (unsigned long long)(c->repaint.bail_armed - last_armed),
+				        (unsigned long long)(c->repaint.bail_gate - last_gate));
+		}
+	}
+	last_ns = now;
+	last_ticks = c->repaint.ticks;
+	last_armed = c->repaint.bail_armed;
+	last_gate = c->repaint.bail_gate;
+}
+
 static void
 d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 {
@@ -3930,8 +4058,27 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// refresh it matters for, rather than up to a full period late.
 		// #1257 partition: with a known fill schedule the window segments
 		// are only a few ms wide, so tick fine enough to land in them.
-		os_nanosleep((int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12
-		                                                                   : period_ns / 4));
+		// (startup jerk) The [GAP] reporter showed the loop ticking ONCE per ~200 ms gap
+		// while the box is idle, with no bails -- i.e. the thread is not refusing, it is
+		// not running. Measure the sleep itself: asked-vs-actual separates "os_nanosleep
+		// overslept" (timer resolution) from "the thread was starved" (scheduling, e.g.
+		// the MMCSS join above demoting it).
+		const int64_t ask_ns =
+		    (int64_t)((c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4);
+		const uint64_t sleep_t0 = os_monotonic_get_ns();
+		os_nanosleep(ask_ns);
+		{
+			static double thr_ms = -1.0;
+			if (thr_ms < 0.0) {
+				const char *e = getenv("DXR_SLOW_SECTION_MS");
+				thr_ms = (e != NULL && e[0] != '\0') ? atof(e) : 50.0;
+			}
+			const double slept_ms = (double)(os_monotonic_get_ns() - sleep_t0) / 1e6;
+			if (thr_ms > 0.0 && slept_ms >= thr_ms) {
+				U_LOG_W("[SLEEP] repaint loop asked %.2f ms, slept %.1f ms\n",
+				        (double)ask_ns / 1e6, slept_ms);
+			}
+		}
 
 		if (c->repaint_quit.load(std::memory_order_relaxed)) {
 			break;
@@ -4036,6 +4183,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			}
 
 			const uint64_t fire_t0 = os_monotonic_get_ns();
+			d3d12_report_submit_gap(c, "repaint fill");
 			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
 			                                &c->reroute.canvas);
 			c->repaint.count++;
@@ -4115,17 +4263,120 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 	}
 }
 
+// (startup jerk) PROTOTYPE, default OFF: DXR_FILL_DURING_APP_WAIT=1.
+//
+// layer_commit holds c->mutex for the whole frame and waits INFINITE on the app GPU
+// timeline inside it (gpu_wait_idle_on -> WaitForSingleObject(event, INFINITE)). Measured
+// during the Unity warm-up: the mutex is held ~200 ms, thirteen times, and the repaint
+// fill wakes, bumps its tick, then blocks on that mutex for all of it -- so the panel
+// gets NOTHING for 200 ms while the GPU sits at 7-12%. app_frame_in_progress is already
+// cleared by this point, so the fill is otherwise eligible to run.
+//
+// Releasing the lock across a pure fence wait lets the fill present in the hole. It is
+// GATED because it also lets the fill present CONCURRENTLY with this frame, and the
+// serialisation of the two present paths is exactly what this lock was providing --
+// that has to be proven on hardware, not assumed.
+static bool
+d3d12_fill_during_app_wait(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_FILL_DURING_APP_WAIT");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
-	std::lock_guard<std::mutex> lock(c->mutex);
+	std::unique_lock<std::mutex> lock(c->mutex);
+	// (startup jerk) This lock_guard is FUNCTION-SCOPED: c->mutex is held across the
+	// whole frame -- deposit, submit to the arm, weave, present, gpu_wait_idle_app. The
+	// repaint thread increments its tick, then blocks here, which is exactly the
+	// signature measured: [GAP] ~200 ms closed by an app frame with ticks+1 and no
+	// bails, while every individual section times under 80 ms and the GPU is idle.
+	// So: how long is it actually held?
+	const uint64_t lock_t0 = os_monotonic_get_ns();
+	struct lock_hold_report
+	{
+		uint64_t t0;
+		const char *names[24];
+		uint64_t stamps[24];
+		int n;
+		void mark(const char *nm)
+		{
+			if (n < 24) {
+				names[n] = nm;
+				stamps[n] = os_monotonic_get_ns();
+				n++;
+			}
+		}
+		~lock_hold_report()
+		{
+			static double thr_ms = -1.0;
+			if (thr_ms < 0.0) {
+				const char *e = getenv("DXR_SLOW_SECTION_MS");
+				thr_ms = (e != NULL && e[0] != '\0') ? atof(e) : 50.0;
+			}
+			const uint64_t now = os_monotonic_get_ns();
+			const double held = (double)(now - t0) / 1e6;
+			if (thr_ms <= 0.0 || held < thr_ms) {
+				return;
+			}
+			// Which span inside the critical section owns the hold?
+			const char *worst_from = "lock";
+			const char *worst_to = "return";
+			double worst = 0.0;
+			uint64_t prev = t0;
+			const char *prev_nm = "lock";
+			for (int k = 0; k < n; k++) {
+				const double d = (double)(stamps[k] - prev) / 1e6;
+				if (d > worst) {
+					worst = d;
+					worst_from = prev_nm;
+					worst_to = names[k];
+				}
+				prev = stamps[k];
+				prev_nm = names[k];
+			}
+			{
+				const double d = (double)(now - prev) / 1e6;
+				if (d > worst) {
+					worst = d;
+					worst_from = prev_nm;
+					worst_to = "return";
+				}
+			}
+			U_LOG_W("[LOCK] layer_commit held c->mutex %.1f ms; worst span %.1f ms "
+				        "between [%s] and [%s] (%d marks)\n",
+				        held, worst, worst_from, worst_to, n);
+		}
+	} _lock_hold{lock_t0, {}, {}, 0};
+
 
 	// #868: the submission window closes here. Cleared at the TOP rather than
 	// on the way out so it cannot be leaked by one of this function's several
 	// early returns — the lock is held throughout, so no repaint can interleave
 	// with layer_commit itself regardless.
+	{
+		// How long were repaints locked out by this app frame?
+		static double thr_ms = -1.0;
+		if (thr_ms < 0.0) {
+			const char *e = getenv("DXR_SLOW_SECTION_MS");
+			thr_ms = (e != nullptr && e[0] != '\0') ? atof(e) : 50.0;
+		}
+		if (thr_ms > 0.0 && c->repaint.app_frame_begin_ns != 0) {
+			const double held_ms =
+				    (double)(os_monotonic_get_ns() - c->repaint.app_frame_begin_ns) / 1e6;
+			if (held_ms >= thr_ms) {
+				U_LOG_W("[SLOWSEC] layer_begin->layer_commit held %.1f ms "
+				        "-- repaints were locked out for all of it\n", held_ms);
+			}
+		}
+	}
 	c->repaint.app_frame_in_progress = false;
 
 	// Capture-intent poll — see u_capture_intent.h. Consumed at the
@@ -4276,6 +4527,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// #1264 reroute: the bind forks inside — a reroute bind failure degrades
 	// the mask feature (returns true), never the session, so this retire is
 	// own-legs-only by construction.
+	_lock_hold.mark("before bind mask plane");
 	if ((c->split_active || d3d12_fill_arm_active(c)) && !d3d12_bind_mask_plane(c, authored_mask)) {
 		d3d12_split_retire(c, "the app-authored zone mask could not be transported to the scanout adapter",
 		                   COMP_SPLIT_REASON_AUTHORED_MASK);
@@ -4524,7 +4776,16 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			const uint32_t need_w = c->eff_layout.cols * c->eff_layout.tile_w;
 			const uint32_t need_h = c->eff_layout.rows * c->eff_layout.tile_h;
 			if (need_w > dep_w || need_h > dep_h) {
-				gpu_wait_idle_app(c);
+				if (d3d12_fill_during_app_wait()) {
+					// let the fill present in this hole; re-acquire after the fence
+					lock.unlock();
+					_lock_hold.mark("before gpu_wait_idle_app");
+					gpu_wait_idle_app(c);
+					lock.lock();
+				} else {
+					_lock_hold.mark("before gpu_wait_idle_app");
+					gpu_wait_idle_app(c);
+				}
 				comp_d3d12_deposit_resize(c->reroute.dep, need_w > dep_w ? need_w : dep_w,
 				                          need_h > dep_h ? need_h : dep_h);
 				comp_d3d12_deposit_get_dims(c->reroute.dep, &dep_w, &dep_h);
@@ -4568,10 +4829,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			ws_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			c->cmd_list->ResourceBarrier(1, &ws_barrier);
 
+			_lock_hold.mark("before cmdlist Close");
 			c->cmd_list->Close();
 			ID3D12CommandList *flush_lists[] = {c->cmd_list};
+			_lock_hold.mark("before ExecuteCommandLists");
 			c->command_queue->ExecuteCommandLists(1, flush_lists);
-			gpu_wait_idle_app(c);
+			if (d3d12_fill_during_app_wait()) {
+				// let the fill present in this hole; re-acquire after the fence
+				lock.unlock();
+				_lock_hold.mark("before gpu_wait_idle_app");
+				gpu_wait_idle_app(c);
+				lock.lock();
+			} else {
+				_lock_hold.mark("before gpu_wait_idle_app");
+				gpu_wait_idle_app(c);
+			}
 
 			// Capture handles its own cmd_list reset + barriers (PSR↔COPY_SOURCE).
 			d3d12_compositor_dispatch_capture(c, MCP_CAPTURE_MODE_PROJECTION_ONLY);
@@ -4679,10 +4951,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			d3d12_stage_mask_plane(c, authored_mask);
 
 			// The Local2D/mask deposit half (fork inside stages the arm).
+			_lock_hold.mark("before composite zone_mask");
 			const bool deposited = d3d12_composite_zone_mask(
 			    c, /*reuse_mask=*/false, /*prepare_only=*/true, nullptr, 0,
 			    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, tgt_width,
 			    tgt_height, &eff_canvas, /*slot=*/-1, /*is_repaint=*/false);
+			_lock_hold.mark("AFTER composite zone_mask call");
 			if (!deposited) {
 				comp_vk_split_stage_no_composite(c->reroute.split);
 			}
@@ -4691,16 +4965,31 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Plane back-pressure: nothing in this frame's execute may rewrite a
 		// plane the arm's producer is still reading. GPU-side, usually
 		// already satisfied.
+		_lock_hold.mark("before deposit plane_wait");
 		comp_d3d12_deposit_plane_wait(c->reroute.dep, c->command_queue);
 
+		_lock_hold.mark("before cmdlist Close");
 		c->cmd_list->Close();
 		ID3D12CommandList *rr_lists[] = {c->cmd_list};
+		_lock_hold.mark("before ExecuteCommandLists");
 		c->command_queue->ExecuteCommandLists(1, rr_lists);
+		_lock_hold.mark("before deposit signal");
 		comp_d3d12_deposit_signal(c->reroute.dep, c->command_queue);
-		gpu_wait_idle_app(c);
+		if (d3d12_fill_during_app_wait()) {
+			// let the fill present in this hole; re-acquire after the fence
+			lock.unlock();
+			_lock_hold.mark("before gpu_wait_idle_app");
+			gpu_wait_idle_app(c);
+			lock.lock();
+		} else {
+			_lock_hold.mark("before gpu_wait_idle_app");
+			gpu_wait_idle_app(c);
+		}
 
 		struct comp_vk_deposit_handoff rr_handoff = {};
 		if (comp_d3d12_deposit_get_handoff(c->reroute.dep, &rr_handoff)) {
+			d3d12_report_submit_gap(c, "app frame");
+			_lock_hold.mark("before split submit_atlas");
 			comp_vk_split_submit_atlas(c->reroute.split, &rr_handoff, c->eff_layout.cols,
 			                           c->eff_layout.rows, c->eff_layout.tile_w, c->eff_layout.tile_h);
 			comp_d3d12_deposit_note_consumed(c->reroute.dep, rr_handoff.slot);
@@ -4724,6 +5013,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 		c->reroute.canvas = rr_canvas;
 
+		_lock_hold.mark("before split weave+present");
 		const bool rr_wove = comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/false,
 		                                                     &rr_canvas);
 
@@ -4762,10 +5052,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 
 			// Execute atlas rendering commands first
+			_lock_hold.mark("before cmdlist Close");
 			c->cmd_list->Close();
 			ID3D12CommandList *copy_lists[] = {c->cmd_list};
+			_lock_hold.mark("before ExecuteCommandLists");
 			c->command_queue->ExecuteCommandLists(1, copy_lists);
-			gpu_wait_idle_app(c);
+			if (d3d12_fill_during_app_wait()) {
+				// let the fill present in this hole; re-acquire after the fence
+				lock.unlock();
+				_lock_hold.mark("before gpu_wait_idle_app");
+				gpu_wait_idle_app(c);
+				lock.lock();
+			} else {
+				_lock_hold.mark("before gpu_wait_idle_app");
+				gpu_wait_idle_app(c);
+			}
 
 			// Fresh command list for weaver
 			c->cmd_allocator->Reset();
@@ -4886,10 +5187,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			if (tap_this && tap_tmp != nullptr) {
 				// Flush the recorded weave so the texture holds its output.
+				_lock_hold.mark("before cmdlist Close");
 				c->cmd_list->Close();
 				ID3D12CommandList *tap_lists[] = {c->cmd_list};
+				_lock_hold.mark("before ExecuteCommandLists");
 				c->command_queue->ExecuteCommandLists(1, tap_lists);
-				gpu_wait_idle_app(c);
+				if (d3d12_fill_during_app_wait()) {
+					// let the fill present in this hole; re-acquire after the fence
+					lock.unlock();
+					_lock_hold.mark("before gpu_wait_idle_app");
+					gpu_wait_idle_app(c);
+					lock.lock();
+				} else {
+					_lock_hold.mark("before gpu_wait_idle_app");
+					gpu_wait_idle_app(c);
+				}
 				char tap_path[MAX_PATH];
 				snprintf(tap_path, sizeof(tap_path),
 				         "%s\\dxr_tap_f%03ld_a_postweave.png", tap_tmp, tap_idx);
@@ -4951,7 +5263,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Signal fence and wait for frame completion. App scope: the shared
 		// texture and the list that wrote it are both on the app device, and
 		// this path has no swapchain at all.
-		gpu_wait_idle_app(c);
+		if (d3d12_fill_during_app_wait()) {
+			// let the fill present in this hole; re-acquire after the fence
+			lock.unlock();
+			gpu_wait_idle_app(c);
+			lock.lock();
+		} else {
+			gpu_wait_idle_app(c);
+		}
 
 		// #727 dual tap, second point: composite is GPU-complete here.
 		if (c->tap_postcomposite_pending) {
@@ -8108,6 +8427,46 @@ d3d12_clamp_region_to_panel(struct comp_d3d12_compositor *c, uint32_t *w, uint32
 	}
 }
 
+// (startup jerk) Sub-step timing inside the zone-mask composite.
+//
+// Measured: ~185 ms of a ~199 ms c->mutex hold in layer_commit lives between
+// [before composite zone_mask] and [before deposit plane_wait], i.e. inside
+// d3d12_composite_zone_mask -- with the GPU idle at 7-12%. This names the sub-step.
+// Threshold shared with the rest: DXR_SLOW_SECTION_MS (default 50, 0 disables).
+// Reset at each invocation: a single static prev would otherwise measure the span from
+// the LAST mark of one frame to the FIRST of the next -- i.e. the frame interval, which
+// is exactly the wrong answer (it reported ~390 ms and meant nothing).
+static uint64_t g_zone_step_prev_ns;
+static const char *g_zone_step_prev_nm = "entry";
+static void
+d3d12_zone_step_begin(void)
+{
+	g_zone_step_prev_ns = os_monotonic_get_ns();
+	g_zone_step_prev_nm = "composite entry";
+}
+
+static void
+d3d12_zone_step(const char *nm)
+{
+	static double thr_ms = -1.0;
+	if (thr_ms < 0.0) {
+		const char *e = getenv("DXR_SLOW_SECTION_MS");
+		thr_ms = (e != NULL && e[0] != '\0') ? atof(e) : 50.0;
+	}
+	uint64_t &prev_ns = g_zone_step_prev_ns;
+	const char *&prev_nm = g_zone_step_prev_nm;
+	const uint64_t now = os_monotonic_get_ns();
+	if (thr_ms > 0.0 && prev_ns != 0) {
+		const double d = (double)(now - prev_ns) / 1e6;
+		if (d >= thr_ms) {
+			U_LOG_W("[ZONESTEP] %.1f ms spent after [%s], before [%s]\n",
+				        d, prev_nm, nm);
+		}
+	}
+	prev_ns = now;
+	prev_nm = nm;
+}
+
 static bool
 d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           bool reuse_mask,
@@ -8122,6 +8481,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
                           int32_t slot,
                           bool is_repaint)
 {
+	d3d12_zone_step_begin();
 	// #439 Phase 3: run when EITHER an explicit submitted mask exists OR this
 	// frame carries Local2D layers (the layers supply both the 2D pixels and
 	// an implicit mask). Mirrors the D3D11 leg.
@@ -8155,12 +8515,14 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	const bool split_consume = c->split_active && !prepare_only;
 	struct comp_xbridge_recipe rec = {};
 	if (split_consume) {
+		d3d12_zone_step("xbridge_slot_recipe");
 		if (slot < 0 || !comp_xbridge_slot_recipe(c->xbridge, slot, &rec)) {
 			ZC_BAIL("slot");
 		}
 		if (!rec.composite) {
 			// A projection-only frame filled this slot — nothing to composite,
 			// and that is the correct answer, not a bail.
+			d3d12_zone_step("about to return (line ~54)");
 			return false;
 		}
 	}
@@ -8193,6 +8555,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			region_h = ((uint32_t)r.bottom < dst_h) ? (uint32_t)r.bottom : dst_h;
 		}
 	}
+	d3d12_zone_step("clamp_region_to_panel");
 	d3d12_clamp_region_to_panel(c, &region_w, &region_h);
 	if (split_consume) {
 		/*
@@ -8363,6 +8726,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			 * same resource under the same seq test — and a cached pointer would
 			 * be the one thing that could outlive its seq.
 			 */
+			d3d12_zone_step("xbridge_get_plane_resource");
 			mask_res = static_cast<ID3D12Resource *>(comp_xbridge_get_plane_resource(
 			    c->xbridge, slot, COMP_XBRIDGE_PLANE_MASK, rec.plane_seq[COMP_XBRIDGE_PLANE_MASK]));
 			if (mask_res == nullptr) {
@@ -8370,14 +8734,17 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			}
 		} else if (!is_repaint && c->out_mask_req.kind != D3D12_OUT_MASK_NONE) {
 			ID3D12Device *odev = d3d12_out_device(c);
+			d3d12_zone_step("weave_list");
 			ID3D12GraphicsCommandList *olist = d3d12_weave_list(c);
 			ID3D12Resource *r = nullptr;
 			const uint32_t mw = c->out_mask_req.w;
 			const uint32_t mh = c->out_mask_req.h;
 			if (c->out_mask_req.kind == D3D12_OUT_MASK_IMPLICIT) {
+				d3d12_zone_step("update_implicit_mask");
 				r = d3d12_update_implicit_mask(c, odev, olist, c->out_mask_req.rects,
 				                               c->out_mask_req.count, mw, mh);
 			} else {
+				d3d12_zone_step("update_zone_wish_mask");
 				ID3D12Resource *binary = d3d12_update_zone_wish_mask(
 				    c, odev, olist, c->out_mask_req.rects, c->out_mask_req.count, mw, mh);
 				r = binary;
@@ -8396,6 +8763,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 					                             c->out_mask_req.count, mw, mh);
 				}
 				if (c->out_mask_req.kind == D3D12_OUT_MASK_ZONE_FEATHER) {
+					d3d12_zone_step("update_zone_feather_mask");
 					ID3D12Resource *fres = d3d12_update_zone_feather_mask(
 					    c, odev, olist, c->out_mask_req.rects, c->out_mask_req.feather,
 					    c->out_mask_req.count, mw, mh);
@@ -8433,8 +8801,10 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 */
 		mask_res = c->repaint.mask_res;
 	} else if (zones_frame) {
+		d3d12_zone_step("update_zone_wish_state");
 		mask_res = d3d12_update_zone_wish_state(c, c->device, c->cmd_list, region_w, region_h);
 		if (any_feather) {
+			d3d12_zone_step("update_zone_feather_mask");
 			ID3D12Resource *fres = d3d12_update_zone_feather_mask(c, c->device, c->cmd_list, zrects,
 			                                                      zfeather, zcount, region_w, region_h);
 			if (fres != nullptr) {
@@ -8455,6 +8825,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			}
 			rects[rect_count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
+		d3d12_zone_step("update_implicit_mask");
 		mask_res = d3d12_update_implicit_mask(c, c->device, c->cmd_list, rects, rect_count, region_w, region_h);
 	}
 	if (mask_res == nullptr && !split_deposit) {
@@ -8536,6 +8907,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 			to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			d3d12_zone_step("ResourceBarrier");
 			c->cmd_list->ResourceBarrier(1, &to_common);
 
 			/*
@@ -8554,14 +8926,18 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 				if (!d3d12_reroute_stage_local2d(c, region_w, region_h, zones_frame,
 				                                 have_explicit && c->mask_plane_live, have_explicit,
 				                                 eff_canvas, zones_frame ? -1 : proj_idx)) {
+				d3d12_zone_step("L2D:returned false");
 					c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+					d3d12_zone_step("about to return (line ~458)");
 					return false;
 				}
+				d3d12_zone_step("about to return (line ~460)");
 				return true;
 			}
 #endif
 			if (!d3d12_ensure_outcomp(c)) {
 				c->out_mask_req.kind = D3D12_OUT_MASK_NONE;
+				d3d12_zone_step("about to return (line ~465)");
 				return false;
 			}
 
@@ -8635,6 +9011,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			r.bd_h = c->repaint.backdrop_h;
 			comp_xbridge_stage_recipe(c->xbridge, &r);
 		}
+		d3d12_zone_step("about to return (line ~538)");
 		return true;
 	}
 
@@ -8647,6 +9024,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		if ((rec.plane_valid & (1u << COMP_XBRIDGE_PLANE_LOCAL2D)) == 0) {
 			ZC_BAIL("plane_invalid");
 		}
+		d3d12_zone_step("xbridge_get_plane_resource");
 		twod_res = static_cast<ID3D12Resource *>(comp_xbridge_get_plane_resource(
 		    c->xbridge, slot, COMP_XBRIDGE_PLANE_LOCAL2D, rec.plane_seq[COMP_XBRIDGE_PLANE_LOCAL2D]));
 		if (twod_res == nullptr) {
@@ -8721,6 +9099,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 		 * the egress plane, `mask_res` is the raster recorded a few lines up, and
 		 * the weave snapshot is the unit's own scratch.
 		 */
+		d3d12_zone_step("weave_list");
 		ID3D12GraphicsCommandList *olist = d3d12_weave_list(c);
 		/*
 		 * The deposit half creates the unit and stamps `composite = false` if it
@@ -8755,6 +9134,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 			fix.Transition.StateBefore = dst_pre_state;
 			fix.Transition.StateAfter = dst_post_state;
 			fix.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			d3d12_zone_step("ResourceBarrier");
 			olist->ResourceBarrier(1, &fix);
 		}
 		return oxret == XRT_SUCCESS;
@@ -8781,6 +9161,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	weave_enter[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 	weave_enter[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 	weave_enter[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	d3d12_zone_step("ResourceBarrier");
 	c->cmd_list->ResourceBarrier(2, weave_enter);
 
 	D3D12_TEXTURE_COPY_LOCATION weave_dst_loc = {};
@@ -8806,6 +9187,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	weave_exit[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 	weave_exit[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	weave_exit[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	d3d12_zone_step("ResourceBarrier");
 	c->cmd_list->ResourceBarrier(2, weave_exit);
 
 	xrt_result_t xret = comp_d3d12_renderer_composite_2d_masked(
@@ -8838,6 +9220,7 @@ d3d12_composite_zone_mask(struct comp_d3d12_compositor *c,
 	restore[n].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 	restore[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	n++;
+	d3d12_zone_step("ResourceBarrier");
 	c->cmd_list->ResourceBarrier(n, restore);
 
 	return xret == XRT_SUCCESS;
