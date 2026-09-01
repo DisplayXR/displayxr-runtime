@@ -107,7 +107,13 @@ dxr_weave_cadence_trace_target(void)
 	return on == 1;
 }
 
+#ifdef XRT_OS_ANDROID
+// POSIX, and used ONLY by the Android frame-rate pin below
+// (dlopen("libandroid.so") for ANativeWindow_setFrameRate, which is API 30/31
+// against minSdk 29). Unguarded it breaks the Windows build, which has no
+// dlfcn.h — and this file IS compiled on Windows.
 #include <dlfcn.h>
+#endif
 #include <cmath>
 #include <cstring>
 #include <cstdio>
