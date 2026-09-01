@@ -73,6 +73,21 @@ sides in the *same* space — `os_display_desktop_info` returns
 `width_in_caller_dpi`/`height_in_caller_dpi` for exactly this, and for nothing
 else.
 
+### The same split inside one component
+
+The rule generalises past "runtime DLL vs host app". A single component can
+straddle both spaces on its own: in the DisplayXR Unity plug-in, `native~/`
+windows pin per-monitor-v2 while the managed `Runtime/**.cs` P/Invoke layer
+inherits Unity's awareness and never pins, so the two halves disagree with no
+second component involved. That repo's `CLAUDE.md` carries the plug-in-side
+rules; this page is the cross-component picture.
+
+The generalised form: **whenever two pieces of code in one process read Win32
+geometry and only some of them pin, they are in different spaces.** Prefer doing
+the work in whichever layer can pin, so the numbers never enter a context where
+they would be virtualised — that is a stronger guarantee than converting at each
+call site, because there is no conversion left to forget.
+
 ## Reproducing it
 
 Force any process DPI-unaware without touching the box's display settings:
