@@ -258,7 +258,19 @@ android_custom_surface_wait_get_surface(struct android_custom_surface *custom_su
 		}
 	}
 
-	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf.object().makeLocalReference());
+	/*
+	 * #1310: `makeLocalReference()` is `NewLocalRef` — it hands us a JNI LOCAL
+	 * reference that `ANativeWindow_fromSurface` reads but does NOT consume, so
+	 * it must be deleted explicitly. Both callers of this file run on
+	 * long-lived JVM-ATTACHED native threads that never return to Java, so no
+	 * frame is ever popped for us and every leaked ref accumulates for the life
+	 * of the process. See the sibling site in
+	 * `android_custom_surface_refresh_window()`, which leaks once per
+	 * `xrPollEvent` — i.e. per frame.
+	 */
+	jobject surf_local = surf.object().makeLocalReference();
+	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf_local);
+	jni::env()->DeleteLocalRef(surf_local);
 	if (win == nullptr) {
 		return nullptr;
 	}
@@ -320,7 +332,23 @@ android_custom_surface_refresh_window(struct android_custom_surface *custom_surf
 		return;
 	}
 
-	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf.object().makeLocalReference());
+	/*
+	 * #1310: delete the local ref — see the note at the sibling site above.
+	 * THIS is the one that actually killed apps: `oxr_session_poll()` calls
+	 * this every tick, so it leaked one `android.view.Surface` local reference
+	 * PER FRAME on a thread whose local frame is never popped. At ~60 fps the
+	 * table hits its 16,777,216 ceiling in roughly 77 hours and ART aborts the
+	 * process:
+	 *
+	 *   JNI ERROR (app bug): local reference table overflow (max=16777216)
+	 *     16777215: 0x131c1e58 android.view.Surface   <- the SAME object, 16.7M times
+	 *
+	 * Note the early-return below must not skip the delete, which is why the
+	 * ref is released here rather than after the dedupe check.
+	 */
+	jobject surf_local = surf.object().makeLocalReference();
+	ANativeWindow *win = ANativeWindow_fromSurface(jni::env(), surf_local);
+	jni::env()->DeleteLocalRef(surf_local);
 	if (win == nullptr) {
 		return;
 	}
