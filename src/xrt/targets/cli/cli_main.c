@@ -40,8 +40,10 @@ cli_print_help(int argc, const char **argv)
 	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
 	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
 	P("                      'input list [--json]', 'input haptic-test [seconds]'.\n");
-	P("  runtime <...>     - Show / set DisplayXR as the active OpenXR runtime.\n");
-	P("                      'runtime status', 'runtime activate'.\n");
+	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
+	P("                      'runtime status'   full loader precedence + conflicts,\n");
+	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");
+	P("                      'runtime activate [<manifest>]', 'runtime restore'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
