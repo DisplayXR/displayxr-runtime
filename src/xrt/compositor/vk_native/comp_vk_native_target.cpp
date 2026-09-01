@@ -107,6 +107,16 @@ dxr_weave_cadence_trace_target(void)
 	return on == 1;
 }
 
+/*
+ * Forward declaration: the Windows-only late-weave call sites (the earliest is
+ * ~line 713) precede this helper's definition further down the file. Android
+ * and macOS compile those sites out, so their first use already followed the
+ * definition and the omission was invisible on both — it broke only the Windows
+ * build, which is why local Android/macOS builds could not catch it.
+ */
+static bool
+dxr_late_weave_enabled();
+
 #ifdef XRT_OS_ANDROID
 // POSIX, and used ONLY by the Android frame-rate pin below
 // (dlopen("libandroid.so") for ANativeWindow_setFrameRate, which is API 30/31
