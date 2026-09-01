@@ -4123,9 +4123,40 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			 * 0 = no trusted measurement yet ⟹ the DP keeps its own
 			 * heuristic, so an unmeasured frame never injects a wrong value.
 			 */
-			xrt_display_processor_vk_set_predicted_scanout(
-			    (struct xrt_display_processor_vk *)c->display_processor,
-			    comp_vk_native_target_weave_to_scanout_ns(c->target));
+			{
+				/*
+				 * Bound it HERE, at the source, not at the consumer.
+				 * A consumer clamp can only fall back to its constant —
+				 * it cannot tell anyone the measurement went bad. Bounding
+				 * at publish means an absurd residual is both suppressed
+				 * AND logged, so a broken correlation shows up as a
+				 * diagnosable event instead of a silent reversion to the
+				 * vendor's hardcoded horizon.
+				 *
+				 * [0, 200] ms matches the vendor-side bound. A sane
+				 * residual here is 2.5-3.4 refresh periods (22-48 ms
+				 * measured), so the ceiling is ~4x the worst legitimate
+				 * value: loose enough never to clip a real slow frame,
+				 * tight enough to catch a correlation that has gone wrong.
+				 */
+				const uint64_t horizon_ns = comp_vk_native_target_weave_to_scanout_ns(c->target);
+				const uint64_t horizon_max_ns = 200 * U_TIME_1MS_IN_NS;
+				if (horizon_ns > horizon_max_ns) {
+					// Lifecycle-rare by construction; never per frame.
+					static uint64_t s_last_bad_ns = 0;
+					if (horizon_ns != s_last_bad_ns) {
+						s_last_bad_ns = horizon_ns;
+						U_LOG_W("#206: measured weave->scanout residual %" PRIu64
+						        " ms is outside [0, 200] — NOT published; the DP keeps "
+						        "its own heuristic. A value this large means the "
+						        "presentID/actualPresentTime correlation is wrong.",
+						        horizon_ns / U_TIME_1MS_IN_NS);
+					}
+				} else {
+					xrt_display_processor_vk_set_predicted_scanout(
+					    (struct xrt_display_processor_vk *)c->display_processor, horizon_ns);
+				}
+			}
 
 			// Call display processor with atlas (or zero-copy swapchain) texture.
 			// The canvas sub-rect comes from vk_dp_canvas_rect() — the same
