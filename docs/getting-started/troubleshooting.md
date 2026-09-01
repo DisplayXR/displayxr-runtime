@@ -148,15 +148,45 @@ reports `XRT_ERROR_DEVICE_CREATION_FAILED`.
 
 **Causes & fixes:**
 
-- **The active OpenXR runtime points somewhere else.** Windows resolves the runtime from
-  `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`. Confirm it points at your DisplayXR
-  install (`C:\Program Files\DisplayXR\Runtime\DisplayXR_win64.json`). `displayxr-cli info`
-  prints the current value.
+- **Another OpenXR runtime took the key.** This is the single most common cause, and
+  `displayxr-cli selftest` names it directly — the `active_runtime` check fails with
+  `HIJACKED — apps resolve to '<their manifest>'`. `ActiveRuntime` is one machine-wide
+  value with exactly one winner, so *any* runtime installed after DisplayXR simply
+  overwrites it and every DisplayXR app silently starts loading that one instead. Fix
+  from an elevated prompt:
+
+  ```bat
+  displayxr-cli runtime list        :: everything on the box, and who holds the key
+  displayxr-cli runtime activate    :: take it back
+  displayxr-cli runtime restore     :: hand it back to whoever had it
+  ```
+
+  Use `runtime list` rather than another vendor's switcher: it sweeps the filesystem as
+  well as the registry, so it also finds runtimes that grabbed `ActiveRuntime` without
+  ever registering in `AvailableRuntimes` — which a registry-only switcher cannot show
+  you, including when that runtime is the one currently active.
+
+- **The 64-bit and 32-bit views disagree.** 32-bit apps read
+  `HKLM\Software\WOW6432Node\Khronos\OpenXR\1\ActiveRuntime`, a *different* value. An
+  installer that writes only one view leaves the box running two different runtimes
+  depending on app bitness. `displayxr-cli runtime status` prints both and flags the
+  mismatch; `runtime activate` writes both.
+
+- **A per-user value is shadowing the machine one.** `HKCU\...\Khronos\OpenXR\1\ActiveRuntime`
+  outranks `HKLM`, so a stale per-user value makes a machine-wide installer look like it had
+  no effect. `runtime status` flags it; `runtime activate` clears it.
 
 - **A SteamVR (or other OpenXR runtime) uninstall blanked the key.** Uninstalling another
   OpenXR runtime can clear `ActiveRuntime` instead of restoring the previous one. Re-point
-  it at `DisplayXR_win64.json` — reinstalling DisplayXR, or the installer's repair, restores
-  it.
+  it at `DisplayXR_win64.json` with `displayxr-cli runtime activate`, or re-run the bundle
+  installer — which re-asserts the registration even when it skips every component as
+  already current.
+
+> **Do not use `DisplayXRSwitcher.exe`.** It was retired in #378 and is swept by the
+> installer, but an upgraded box may still have the orphaned binary in
+> `C:\Program Files\DisplayXR\Runtime`. It lists only runtimes registered in
+> `AvailableRuntimes`, so it cannot see — and will not report — a competing runtime that
+> took the key without registering. `displayxr-cli runtime` replaces it.
 
 - **No display processor is registered (from-source / dev installs).** On Windows, vendor
   and sim display plug-ins are discovered **only** from the registry

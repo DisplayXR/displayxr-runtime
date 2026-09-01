@@ -78,6 +78,21 @@ enum cli_selftest_result
 	//! rejected (the classic being an ABI-rotted hand-built plug-in), which
 	//! previously reported PASS over a black screen.
 	CLI_SELFTEST_VENDOR_DP_REJECTED = 8,
+
+	/*!
+	 * Another OpenXR runtime holds `ActiveRuntime`, so apps on this box
+	 * reach IT and never reach DisplayXR — however healthy everything the
+	 * other checks probe happens to be.
+	 *
+	 * ABSENCE NEVER FAILS: an UNSET key is a PASS, which keeps CI and
+	 * from-source dev boxes (no installed runtime, no key) green. Only a
+	 * key that is set and points somewhere that is not this DisplayXR
+	 * install fails. Without this check the self-test reported a clean
+	 * sweep on a box where every app was silently loading a competing
+	 * runtime, which is exactly the report that sent someone hunting
+	 * through the compositor for a fault that was one registry value.
+	 */
+	CLI_SELFTEST_RUNTIME_HIJACKED = 9,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -130,6 +145,10 @@ struct cli_query_result
 	bool active_runtime_queried;
 	bool active_runtime_set;
 	char active_runtime[1024];
+	//! False only when the key is SET and points away from this install.
+	bool active_runtime_ok;
+	//! Human verdict for the `active_runtime` self-test check.
+	char active_runtime_note[512];
 
 	/* Per-stage outcomes (mirror the self-test checks). */
 	bool instance_ok;

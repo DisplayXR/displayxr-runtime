@@ -473,19 +473,63 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 	describe_service_split(r);
 }
 
+/*!
+ * Read `ActiveRuntime` and judge it.
+ *
+ * The verdict is the point: a runtime that starts perfectly is still useless
+ * if apps resolve to somebody else's manifest, and that is invisible from
+ * every other probe in this file. Compare against the installer's own
+ * `InstallPath` rather than sniffing the path for "DisplayXR", so a competing
+ * runtime that merely lives under a similarly-named folder cannot pass.
+ */
 static void
 read_active_runtime(struct cli_query_result *r)
 {
 	r->active_runtime_queried = true;
+	r->active_runtime_ok = true; // Absence never fails; see CLI_SELFTEST_RUNTIME_HIJACKED.
+
 	wchar_t wbuf[1024];
 	DWORD wbuf_bytes = sizeof(wbuf);
 	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Khronos\\OpenXR\\1", L"ActiveRuntime", RRF_RT_REG_SZ,
 	                          NULL, wbuf, &wbuf_bytes);
-	if (rc == ERROR_SUCCESS) {
-		WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, r->active_runtime, (int)sizeof(r->active_runtime), NULL,
-		                    NULL);
-		r->active_runtime_set = r->active_runtime[0] != '\0';
+	if (rc != ERROR_SUCCESS) {
+		snprintf(r->active_runtime_note, sizeof(r->active_runtime_note),
+		         "ActiveRuntime is unset (OK — from-source or CI box; installed runtimes set it)");
+		return;
 	}
+	WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, r->active_runtime, (int)sizeof(r->active_runtime), NULL, NULL);
+	r->active_runtime_set = r->active_runtime[0] != '\0';
+	if (!r->active_runtime_set) {
+		snprintf(r->active_runtime_note, sizeof(r->active_runtime_note), "ActiveRuntime is empty");
+		return;
+	}
+
+	// Resolve where this install's manifest should be, from the record the
+	// installer wrote. No InstallPath means we are not an installed runtime
+	// and have no standing to call the key wrong.
+	wchar_t install[MAX_PATH];
+	DWORD install_bytes = sizeof(install);
+	if (RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\Runtime", L"InstallPath", RRF_RT_REG_SZ, NULL,
+	                 install, &install_bytes) != ERROR_SUCCESS) {
+		snprintf(r->active_runtime_note, sizeof(r->active_runtime_note),
+		         "%s (not evaluated — no installed DisplayXR to compare against)", r->active_runtime);
+		return;
+	}
+	wchar_t expect[MAX_PATH];
+	_snwprintf_s(expect, MAX_PATH, _TRUNCATE, L"%s\\DisplayXR_win64.json", install);
+
+	if (_wcsicmp(expect, wbuf) == 0) {
+		snprintf(r->active_runtime_note, sizeof(r->active_runtime_note), "%s (this install)", r->active_runtime);
+		return;
+	}
+
+	r->active_runtime_ok = false;
+	char expect_u8[1024];
+	WideCharToMultiByte(CP_UTF8, 0, expect, -1, expect_u8, (int)sizeof(expect_u8), NULL, NULL);
+	snprintf(r->active_runtime_note, sizeof(r->active_runtime_note),
+	         "HIJACKED — apps resolve to '%s', not '%s'. Fix: displayxr-cli runtime activate (elevated); "
+	         "inspect with: displayxr-cli runtime list",
+	         r->active_runtime, expect_u8);
 }
 
 //! Fallback for a plug-in that doesn't self-report a version through
@@ -954,6 +998,10 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	snprintf(r->git_tag, sizeof(r->git_tag), "%s", u_git_tag);
 	r->plugin_abi_version = (uint32_t)XRT_PLUGIN_API_VERSION_CURRENT;
 	r->result_code = CLI_SELFTEST_INIT_FAIL;
+	// Default-true so the ActiveRuntime verdict is a PASS everywhere the
+	// concept does not exist (non-Windows); read_active_runtime() below is
+	// the only thing that may clear it.
+	r->active_runtime_ok = true;
 
 #ifdef XRT_OS_WINDOWS
 	read_active_runtime(r);
@@ -1195,6 +1243,13 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	// above it still describes a runtime that came up.
 	if (r->result_code == CLI_SELFTEST_PASS && !r->vendor_dp_ok) {
 		r->result_code = CLI_SELFTEST_VENDOR_DP_REJECTED;
+	}
+
+	// Another runtime holds ActiveRuntime. Applied last, for the same reason
+	// as the check above: everything before it describes a runtime that came
+	// up correctly, and this one says apps will never reach it.
+	if (r->result_code == CLI_SELFTEST_PASS && !r->active_runtime_ok) {
+		r->result_code = CLI_SELFTEST_RUNTIME_HIJACKED;
 	}
 }
 
@@ -1934,6 +1989,16 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->name = "vk_repaint_tier";
 	c->ok = true;
 	snprintf(c->detail, sizeof(c->detail), "%s", r->vk_layer_note[0] != '\0' ? r->vk_layer_note : "not evaluated");
+
+	// The "can apps even reach us?" check. ABSENCE NEVER FAILS: an unset key
+	// (CI, from-source dev boxes) is a PASS. FAILS only when the key is set
+	// and points at a different runtime — the one condition under which every
+	// other check here can be green while no app on the box loads DisplayXR.
+	c = &out[n++];
+	c->name = "active_runtime";
+	c->ok = r->active_runtime_ok;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->active_runtime_note[0] != '\0' ? r->active_runtime_note : "not evaluated");
 
 	c = &out[n++];
 	c->name = "input_providers";
