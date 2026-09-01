@@ -385,6 +385,33 @@ comp_ipc_client_compositor_get_workspace_sync_fence(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_get_read_done_fence(struct xrt_compositor *xc,
+                                               bool *out_have_fence,
+                                               xrt_graphics_sync_handle_t *out_handle)
+{
+	if (xc == NULL || out_have_fence == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_fence = false;
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool have = false;
+	xrt_graphics_sync_handle_t h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	xrt_result_t xret = ipc_call_compositor_get_read_done_fence(icc->ipc_c, &have, &h, 1);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	*out_have_fence = have;
+	*out_handle = h;
+	return XRT_SUCCESS;
+}
+
 void
 comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value)
 {

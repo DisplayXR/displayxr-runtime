@@ -1053,6 +1053,18 @@ struct d3d11_service_compositor
 	uint32_t fence_stale_incomplete_in_window;
 	uint32_t fence_stale_acqfail_in_window;
 
+	//! #1215 -- reverse direction of `workspace_sync_fence`: the SERVICE
+	//! signals (with the client's own shipped value) once every read this
+	//! commit will ever make of the client's swapchain images has been queued
+	//! on sys->context, and the CLIENT waits in `wait_image` before letting
+	//! the app rewrite the single shared image. Created only when
+	//! `workspace_sync_fence` exists (fence-path clients); null = clients on
+	//! the legacy KeyedMutex contract keep their old behavior.
+	wil::com_ptr<ID3D11Fence> read_done_fence;
+	HANDLE read_done_fence_handle;
+	uint64_t read_done_value;      //!< last value queued on the signal (commit thread only)
+	int64_t read_done_drop_log_ns; //!< 1/s throttle for the drop-not-defer log
+
 	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
 	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask,
@@ -17409,6 +17421,21 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 	}
 }
 
+//! #1215 drop-not-defer: name every dropped read, at most 1/s per client, so the
+//! degradation is a diagnosable frame drop rather than the silence that hid the
+//! original race.
+static void
+svc_read_done_note_drop(struct d3d11_service_compositor *c, const char *why, uint32_t eye, uint64_t value)
+{
+	int64_t now_ns = os_monotonic_get_ns();
+	if (now_ns - c->read_done_drop_log_ns > 1000000000LL) {
+		c->read_done_drop_log_ns = now_ns;
+		U_LOG_W("[FENCE] #1215: view %u read for value %llu DROPPED (%s) -- tile keeps the "
+		        "previous frame; the app is released to render the next one",
+		        eye, (unsigned long long)value, why);
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -17470,6 +17497,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
 			xrt_session_event_sink_push(c->xses, &xse);
 			c->exit_request_sent = true;
+		}
+		// #1215: this early return skips the blits, so no read of this commit's
+		// images will EVER happen (every later commit takes this same branch).
+		// Signal read_done anyway -- truthfully -- or the app eats a 1 s
+		// wait_image timeout on every frame of its teardown window (review note
+		// on #1217: degradations are named or removed, never silent).
+		if (c->read_done_fence) {
+			uint64_t rd_v = c->last_signaled_fence_value.load(std::memory_order_acquire);
+			if (rd_v > c->read_done_value) {
+				sys->context->Signal(c->read_done_fence.get(), rd_v);
+				c->read_done_value = rd_v;
+			}
 		}
 		// Return success so the error doesn't propagate as XR_ERROR_INSTANCE_LOST.
 		// The EXIT_REQUEST event drives the session to STOPPING so the app
@@ -18720,6 +18759,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 							view_zc_eligible[eye] = false;
 							c->fence_stale_views_in_window++;
 							c->fence_stale_incomplete_in_window++;
+							// #1215 drop-not-defer: with the read-done fence in
+							// play, a deferred pickup can never happen -- the app
+							// blocks in wait_image and no further commit arrives
+							// to do the picking up (deadlock). Drop this frame
+							// instead (tile reuses the previous composite) and
+							// let the end-of-commit signal release the app.
+							if (c->read_done_fence) {
+								c->last_composed_fence_value[eye] = signaled;
+								svc_read_done_note_drop(c, "gpu-incomplete", eye, signaled);
+							}
 						} else {
 							HRESULT hr_a =
 							    view_scs[eye]->images[view_img_indices[eye]].keyed_mutex->AcquireSync(
@@ -18733,6 +18782,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 								view_zc_eligible[eye] = false;
 								c->fence_stale_views_in_window++;
 								c->fence_stale_acqfail_in_window++;
+								// #1215 drop-not-defer -- see the incomplete
+								// branch above.
+								if (c->read_done_fence) {
+									c->last_composed_fence_value[eye] = signaled;
+									svc_read_done_note_drop(c, "mutex-acqfail", eye, signaled);
+								}
 							}
 						}
 						// Phase 2 leaves zero-copy semantics
@@ -19288,6 +19343,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// composite. Counted so a chronically late client is visible on
 			// the [RENDER] window rather than only as a held recipe (#1140).
 			sys->render_diag_zones_skip.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	// #1215 -- reverse handshake. Every read this commit will ever make of the
+	// client's swapchain images has now been QUEUED on sys->context (projection
+	// blits and zones composite above; both submit from this thread, and the
+	// context executes in queue order, so the signal below completes only after
+	// they have). Signal with the value the client shipped for this commit; the
+	// client's wait_image blocks the app's NEXT write into the single shared
+	// image until it lands. Skipped views were dropped, not deferred (see the
+	// skip sites), so this signal never licenses a rewrite of an image the
+	// service still intends to read.
+	if (c->read_done_fence) {
+		uint64_t rd_v = c->last_signaled_fence_value.load(std::memory_order_acquire);
+		if (rd_v > c->read_done_value) {
+			sys->context->Signal(c->read_done_fence.get(), rd_v);
+			c->read_done_value = rd_v;
 		}
 	}
 
@@ -20541,6 +20613,11 @@ compositor_destroy(struct xrt_compositor *xc)
 			CloseHandle(c->workspace_sync_fence_handle);
 			c->workspace_sync_fence_handle = nullptr;
 		}
+		if (c->read_done_fence_handle != nullptr) {
+			CloseHandle(c->read_done_fence_handle);
+			c->read_done_fence_handle = nullptr;
+		}
+		c->read_done_fence.reset(); // #1215
 		if (c->fence_wait_event != nullptr) {
 			CloseHandle(c->fence_wait_event);
 			c->fence_wait_event = nullptr;
@@ -20576,6 +20653,11 @@ compositor_destroy(struct xrt_compositor *xc)
 			CloseHandle(c->workspace_sync_fence_handle);
 			c->workspace_sync_fence_handle = nullptr;
 		}
+		if (c->read_done_fence_handle != nullptr) {
+			CloseHandle(c->read_done_fence_handle);
+			c->read_done_fence_handle = nullptr;
+		}
+		c->read_done_fence.reset(); // #1215
 		if (c->fence_wait_event != nullptr) {
 			CloseHandle(c->fence_wait_event);
 			c->fence_wait_event = nullptr;
@@ -20611,6 +20693,25 @@ comp_d3d11_service_compositor_export_workspace_sync_fence(struct xrt_compositor 
 		return false;
 	}
 	*out_handle = (xrt_graphics_sync_handle_t)c->workspace_sync_fence_handle;
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_compositor_export_read_done_fence(struct xrt_compositor *xc,
+                                                     xrt_graphics_sync_handle_t *out_handle)
+{
+	if (out_handle == nullptr) {
+		return false;
+	}
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->read_done_fence_handle == nullptr) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)c->read_done_fence_handle;
 	return true;
 }
 
@@ -22580,6 +22681,42 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 				        "KeyedMutex path stays in effect for this client.",
 				        (long)hr_fence);
 				c->workspace_sync_fence.reset();
+			}
+		}
+
+		// #1215 -- the reverse-direction "read executed" fence. Only useful to
+		// clients on the fence path, so gate on the forward fence existing.
+		// NOTE: the VK client is currently the only importer/waiter; a fence-path
+		// D3D11 client gets this fence exported and signaled into the void -- the
+		// handle count and the log line below do NOT imply the handshake is
+		// load-bearing for that client (D3D12/GL/D3D11 wait halves are follow-ups).
+		// Failure is non-fatal: the client sees have_fence=false and leaves
+		// wait_image a pass-through (the pre-#1215 behavior, race included).
+		c->read_done_fence_handle = nullptr;
+		c->read_done_value = 0;
+		c->read_done_drop_log_ns = 0;
+		if (c->workspace_sync_fence) {
+			HRESULT hr_rd = sys->device->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+			                                         IID_PPV_ARGS(c->read_done_fence.put()));
+			if (SUCCEEDED(hr_rd) && c->read_done_fence) {
+				HANDLE rdh = nullptr;
+				HRESULT hr_rdh = c->read_done_fence->CreateSharedHandle(nullptr, GENERIC_ALL,
+				                                                        nullptr, &rdh);
+				if (SUCCEEDED(hr_rdh) && rdh != nullptr) {
+					c->read_done_fence_handle = rdh;
+					U_LOG_W("[FENCE] client=%p read_done_fence created (handle=%p) (#1215)",
+					        (void *)c, rdh);
+				} else {
+					U_LOG_W("#1215: CreateSharedHandle on read_done_fence failed "
+					        "(hr=0x%08lX); wait_image stays a pass-through for this client.",
+					        (long)hr_rdh);
+					c->read_done_fence.reset();
+				}
+			} else {
+				U_LOG_W("#1215: CreateFence for read_done_fence failed (hr=0x%08lX); "
+				        "wait_image stays a pass-through for this client.",
+				        (long)hr_rd);
+				c->read_done_fence.reset();
 			}
 		}
 	}

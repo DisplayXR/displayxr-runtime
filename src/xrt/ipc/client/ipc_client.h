@@ -182,6 +182,20 @@ void
 comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
 
 /*!
+ * #1215 -- fetch the per-client service->client "read executed" fence. The
+ * service signals it (with the client's own workspace_sync value) once every
+ * read it will ever make of that commit's swapchain images has been queued on
+ * its immediate context; a client waits on it in `wait_image` before letting
+ * the app rewrite the single shared swapchain image. Reverse direction of
+ * `workspace_sync_fence`; `out_have_fence` false = service too old / non-D3D11
+ * backend / creation failed, and the client must leave wait_image unchanged.
+ */
+xrt_result_t
+comp_ipc_client_compositor_get_read_done_fence(struct xrt_compositor *xc,
+                                               bool *out_have_fence,
+                                               xrt_graphics_sync_handle_t *out_handle);
+
+/*!
  * #551 — fetch the per-client SHARED transparent-output texture handle (+ its
  * pixel dims) the service weaves into, for the client to present transparently
  * via its own DirectComposition swap chain. `out_have_output` is false unless

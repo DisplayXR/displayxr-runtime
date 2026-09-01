@@ -99,6 +99,16 @@ struct client_vk_compositor
 	 * vkQueueWaitIdle path stays in effect.
 	 */
 	VkSemaphore workspace_sync_semaphore;
+
+	//! #1215 -- service->client "read executed" timeline semaphore (imported
+	//! shared ID3D11Fence, reverse direction of workspace_sync_semaphore).
+	//! wait_image host-waits it for the last committed workspace_sync value so
+	//! the app cannot rewrite the single shared swapchain image while the
+	//! service's GPU-async read of the previous commit is still pending.
+	//! VK_NULL_HANDLE = pass-through wait_image (pre-#1215 behavior).
+	VkSemaphore read_done_semaphore;
+	//! 1/s throttle for the wait_image timeout log (#1215).
+	int64_t read_done_timeout_last_log_ns;
 	uint64_t workspace_sync_fence_value;
 
 	struct vk_bundle vk;

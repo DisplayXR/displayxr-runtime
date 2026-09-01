@@ -51,6 +51,13 @@ comp_ipc_client_compositor_get_workspace_sync_fence(struct xrt_compositor *xc,
                                                     xrt_graphics_sync_handle_t *out_handle);
 extern void
 comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
+// #1215 -- reverse-direction "read executed" fence fetch; same forward-decl
+// pattern as the pair above (the missing decl here is what failed the POSIX
+// CI legs: MSVC tolerated the implicit declaration, clang -Werror did not).
+extern xrt_result_t
+comp_ipc_client_compositor_get_read_done_fence(struct xrt_compositor *xc,
+                                               bool *out_have_fence,
+                                               xrt_graphics_sync_handle_t *out_handle);
 
 // Prefixed with OXR since the only user right now is the OpenXR state tracker.
 DEBUG_GET_ONCE_LOG_OPTION(vulkan_log, "OXR_VULKAN_LOG", U_LOGGING_INFO)
@@ -451,6 +458,73 @@ client_vk_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, ui
 {
 	COMP_TRACE_MARKER();
 
+#ifdef VK_KHR_timeline_semaphore
+	/*
+	 * #1215 -- server-created swapchains have ONE image and the service-side
+	 * wait_image is a documented no-op, so before this block xrWaitSwapchainImage
+	 * waited on NOTHING: the app could clear and redraw the shared image while
+	 * the service's GPU-async blit of the previous commit was still pending,
+	 * and the blit then captured a partially-drawn frame (the gauss white
+	 * flash -- rotation-gated because the mid-draw window scales with frame
+	 * time). Wait here -- which is exactly what xrWaitSwapchainImage is FOR --
+	 * until the service signals that every read of our last commit has
+	 * executed.
+	 *
+	 * BOUNDED, never trusted (#922 rule, and #1213's lesson): cap the wait at
+	 * 1 s regardless of the caller's timeout so a dead service surfaces as
+	 * XRT_TIMEOUT plus a named 1/s log, never a wedge. Steady state the value
+	 * has long since completed and this is a single userspace check.
+	 */
+	struct client_vk_swapchain *sc = client_vk_swapchain(xsc);
+	struct client_vk_compositor *c = sc->c;
+	if (c != NULL && c->read_done_semaphore != VK_NULL_HANDLE &&
+	    c->workspace_sync_fence_value > 0 && c->vk.vkWaitSemaphores != NULL) {
+		VkSemaphoreWaitInfoKHR wait_info = {
+		    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR,
+		    .semaphoreCount = 1,
+		    .pSemaphores = &c->read_done_semaphore,
+		    .pValues = &c->workspace_sync_fence_value,
+		};
+		/*
+		 * Three explicit timeout cases (review on #1217 caught the zero case
+		 * falling through to the cap and BLOCKING 1 s on what the spec defines
+		 * as a poll):
+		 *   timeout_ns == 0  -> POLL: wait 0, return XRT_TIMEOUT quietly if the
+		 *                       read has not executed (a poll timing out is the
+		 *                       caller's expected path, not a fault to log);
+		 *   timeout_ns  < 0  -> treated as infinite, CAPPED at 1 s (a dead
+		 *                       service surfaces as XRT_TIMEOUT plus a named
+		 *                       1/s log, never a wedge -- #922 rule);
+		 *   timeout_ns  > 0  -> min(timeout, cap).
+		 */
+		const uint64_t cap_ns = 1000000000ULL; // 1 s -- far beyond any healthy frame
+		uint64_t wait_ns;
+		bool is_poll = (timeout_ns == 0);
+		if (is_poll) {
+			wait_ns = 0;
+		} else if (timeout_ns < 0) {
+			wait_ns = cap_ns;
+		} else {
+			wait_ns = (uint64_t)timeout_ns < cap_ns ? (uint64_t)timeout_ns : cap_ns;
+		}
+		VkResult vres = c->vk.vkWaitSemaphores(c->vk.device, &wait_info, wait_ns);
+		if (vres == VK_TIMEOUT) {
+			if (!is_poll) {
+				int64_t now_ns = (int64_t)os_monotonic_get_ns();
+				if (now_ns - c->read_done_timeout_last_log_ns > 1000000000LL) {
+					c->read_done_timeout_last_log_ns = now_ns;
+					U_LOG_W("#1215: wait_image timed out waiting for the service's read of "
+					        "commit value %llu (service dead or stalled) -- returning "
+					        "XRT_TIMEOUT rather than letting the app overwrite a frame "
+					        "the service may still read",
+					        (unsigned long long)c->workspace_sync_fence_value);
+				}
+			}
+			return XRT_TIMEOUT;
+		}
+	}
+#endif
+
 	// Pipe down call into native swapchain.
 	return xrt_swapchain_wait_image(to_native_swapchain(xsc), timeout_ns, index);
 }
@@ -547,6 +621,11 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->workspace_sync_semaphore != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, c->workspace_sync_semaphore, NULL);
 		c->workspace_sync_semaphore = VK_NULL_HANDLE;
+	}
+
+	if (c->read_done_semaphore != VK_NULL_HANDLE) { // #1215
+		vk->vkDestroySemaphore(vk->device, c->read_done_semaphore, NULL);
+		c->read_done_semaphore = VK_NULL_HANDLE;
 	}
 
 #if defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12))
@@ -1203,6 +1282,42 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		        (int)c->vk.external.timeline_semaphore_sync_fd,
 		        (int)c->vk.external.timeline_semaphore_opaque_fd);
 #endif
+	}
+#endif
+
+#ifdef VK_KHR_timeline_semaphore
+	// #1215 -- the reverse-direction "read executed" fence. Only meaningful
+	// when the forward fence imported (the service gates creation the same
+	// way), and only on Windows sync handles. Failure of any step leaves
+	// wait_image a pass-through -- the pre-#1215 behavior, race included --
+	// and says so once.
+	c->read_done_semaphore = VK_NULL_HANDLE;
+	c->read_done_timeout_last_log_ns = 0;
+	if (c->workspace_sync_semaphore != VK_NULL_HANDLE) {
+		bool have_rd = false;
+		xrt_graphics_sync_handle_t rd_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t rdret =
+		    comp_ipc_client_compositor_get_read_done_fence(&xcn->base, &have_rd, &rd_handle);
+		if (rdret == XRT_SUCCESS && have_rd && xrt_graphics_sync_handle_is_valid(rd_handle)) {
+			VkSemaphore rd_sem = VK_NULL_HANDLE;
+			VkResult vret = vk_create_timeline_semaphore_from_native(&c->vk, rd_handle, &rd_sem);
+			if (vret == VK_SUCCESS && rd_sem != VK_NULL_HANDLE) {
+				c->read_done_semaphore = rd_sem;
+				U_LOG_W("[FENCE] client=%p read_done_semaphore imported -- "
+				        "xrWaitSwapchainImage now blocks until the service's read "
+				        "of the previous commit has executed (#1215)",
+				        (void *)c);
+			} else {
+				U_LOG_W("#1215 (VK): read_done fence import failed (%s); wait_image "
+				        "stays a pass-through (single-image write/read race remains).",
+				        vk_result_string(vret));
+				u_graphics_sync_unref(&rd_handle);
+			}
+		} else {
+			U_LOG_W("#1215 (VK): service reported no read_done fence "
+			        "(xret=%d have=%d); wait_image stays a pass-through.",
+			        (int)rdret, (int)have_rd);
+		}
 	}
 #endif
 
