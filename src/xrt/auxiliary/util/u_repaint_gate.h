@@ -630,8 +630,38 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	}
 
 	if (!engaged) {
-		// Legacy: only once the app has already missed a FULL refresh.
-		return quiet_ns >= period_ns * 2;
+		/*
+		 * Legacy: fill once the app has missed a refresh.
+		 *
+		 * The 2-period wait is why warm-up judder survives every other fix.
+		 * Measured on the Unity avatar with the ~185 ms plug-in publish already
+		 * eliminated: recurring ~50 ms present gaps, each one the loop awake and
+		 * ARMED but bailing on this gate ([GAP] ticks+9 bail_armed+0 bail_gate+7).
+		 * Two periods is 33.4 ms of deliberate silence, and the ~5.5 ms tick
+		 * granularity pushes the actual gap to ~50 ms -- comfortably over the 33 ms
+		 * at which a dropped 60 Hz update becomes visible.
+		 *
+		 * DXR_WEAVE_REPAINT_QUIET_PERIODS sets the multiplier (default 1.2, swept:
+		 * 2.0/1.5/1.2/1.05 -> 18/7/3/4 hitches >33 ms in the load window, with
+		 * presents 60/s and weaves 56/s at every setting, i.e. NO queue theft). The
+		 * floor matters: filling too early steals the slot the app's next frame
+		 * needs -- the queue-theft this file documents at length -- so this must
+		 * stay above 1.0, and 2.0 restores the historical behaviour exactly.
+		 */
+		static double quiet_mult = -1.0;
+		if (quiet_mult < 0.0) {
+			const char *qe = getenv("DXR_WEAVE_REPAINT_QUIET_PERIODS");
+			quiet_mult = 1.2;
+			if (qe != NULL && qe[0] != '\0') {
+				const double v = atof(qe);
+				if (v >= 1.0 && v <= 4.0) {
+					quiet_mult = v;
+				}
+			}
+			U_LOG_W("#1257 legacy fill gate: quiet threshold %.2f periods "
+				        "(DXR_WEAVE_REPAINT_QUIET_PERIODS; 2.0 = historical)\n", quiet_mult);
+		}
+		return (double)quiet_ns >= (double)period_ns * quiet_mult;
 	}
 
 	/*
