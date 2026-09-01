@@ -33,12 +33,26 @@ else()
 	target_sources(aux_os PRIVATE os_display_edid_stubs.c)
 endif()
 
-# Desktop rect + device name of the monitor the 3D panel is on (#1301). Plain
-# MonitorFromPoint/GetMonitorInfoW, no SetupAPI, so it cannot fail the way the
-# EDID correlation can.
+# Desktop rect + device name of the monitor the 3D panel is on (#1301).
+# Deliberately light: no SetupAPI on Windows, and the X11 entry points are
+# dlopen'd rather than linked, so this respects the no-DSO rule at the top of
+# this file. Android and anything else falls through to the stub.
 target_sources(aux_os PRIVATE os_display_desktop.h)
 if(WIN32)
 	target_sources(aux_os PRIVATE os_display_desktop_win32.c)
+elseif(APPLE)
+	target_sources(aux_os PRIVATE os_display_desktop_macos.c)
+	# System frameworks, always present — CoreGraphics for the display bounds,
+	# CoreFoundation for the display UUID string.
+	target_link_libraries(aux_os PRIVATE "-framework CoreGraphics" "-framework CoreFoundation")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux only — the XRT_OS_LINUX_DESKTOP distinction in CMake form.
+	# Uses CMAKE_SYSTEM_NAME (the repo idiom) rather than the LINUX variable,
+	# which only exists from CMake 3.25 and would silently evaluate FALSE here
+	# (this project requires 3.22), dropping us to the stub with no diagnostic.
+	target_sources(aux_os PRIVATE os_display_desktop_x11.c)
+	# dlopen/dlsym only; libX11/libXrandr themselves are NOT linked.
+	target_link_libraries(aux_os PRIVATE ${CMAKE_DL_LIBS})
 else()
 	target_sources(aux_os PRIVATE os_display_desktop_stubs.c)
 endif()

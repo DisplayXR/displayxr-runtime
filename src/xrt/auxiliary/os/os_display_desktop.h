@@ -16,8 +16,16 @@
  *
  * See runtime issue #1301 and docs/specs/extensions/XR_DXR_display_info.md.
  *
- * Other platforms: stub that reports failure. The per-platform equivalents
- * (macOS `CGDirectDisplayID`, Linux XRandR output) are the follow-on.
+ * Implemented on Windows (`MonitorFromPoint`/`GetMonitorInfoW`), macOS
+ * (CoreGraphics `CGDisplayBounds` + display UUID) and desktop Linux (X11
+ * RandR 1.5 `XRRGetMonitors`, dlopen'd). Android and everything else get the
+ * stub, which reports failure so the caller publishes "unknown".
+ *
+ * COORDINATE SPACE IS PER-PLATFORM, and always the one the OS places windows
+ * in: physical pixels on Windows (per-monitor-v2, pinned during the query),
+ * POINTS on macOS (the backing store is 2x on Retina), device pixels on X11.
+ * All three are top-down with the origin at the primary/main display's
+ * top-left, and all three allow negative offsets.
  */
 
 #pragma once
@@ -61,24 +69,29 @@ struct os_display_desktop_info
 	//! True if this is the primary monitor (the one the desktop origin is on).
 	bool is_primary;
 
-	//! Stable OS device name, NUL-terminated UTF-8. Windows: the GDI name,
-	//! e.g. `\\.\DISPLAY1`. Empty string when the platform has no equivalent.
+	//! Stable OS device name, NUL-terminated UTF-8, for re-resolving this
+	//! monitor after a hotplug or rearrangement. Windows: the GDI name, e.g.
+	//! `\\.\DISPLAY1`. macOS: the display UUID (the CGDirectDisplayID
+	//! itself is NOT stable across reboots). Linux/X11: the RandR output name,
+	//! e.g. `HDMI-1`. Empty when unknown.
 	char device_name[OS_DISPLAY_DEVICE_NAME_SIZE];
 
 	/*!
-	 * @name The same monitor measured in the CALLER's DPI space
+	 * @name The same monitor measured in the space PLUG-IN dimensions live in
 	 *
-	 * Identical to @ref width / @ref height when the calling process is
-	 * per-monitor-DPI-aware, and divided by the monitor's scale factor when it
-	 * is not (a 3840x2160 panel at 250% reports 1536x864 to an unaware
-	 * process).
+	 * These exist for exactly ONE job: comparing against the panel dimensions a
+	 * display-processor plug-in reports. Comparing those against @ref width /
+	 * @ref height would disagree for reasons that have nothing to do with
+	 * whether the monitors match, so the comparison needs both sides in one
+	 * space. Per platform, the mismatch has a different cause:
 	 *
-	 * These exist for exactly ONE job: comparing against another value the
-	 * same process obtained through a DPI-sensitive API — notably the panel
-	 * dimensions a display-processor plug-in reports, since a plug-in is a DLL
-	 * and inherits its host's awareness. Comparing such a value against
-	 * @ref width / @ref height would disagree purely because of DPI and say
-	 * nothing about whether the monitors match.
+	 * - Windows: a plug-in is a DLL and inherits its host's DPI awareness, so
+	 *   under a DPI-unaware host it reports VIRTUALISED dims (a 3840x2160 panel
+	 *   at 250% reports 1536x864) while @ref width stays physical. These are
+	 *   then the monitor as the unaware caller sees it.
+	 * - macOS: @ref width is in points, but a plug-in reports BACKING PIXELS,
+	 *   so on Retina the two differ by the 2x scale. These are the pixel dims.
+	 * - X11: no scaling layer, so these equal @ref width / @ref height.
 	 *
 	 * NEVER publish these or place a window with them. Use @ref width /
 	 * @ref height for anything that leaves the process.

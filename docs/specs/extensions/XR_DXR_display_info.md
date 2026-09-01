@@ -610,7 +610,7 @@ substitute: it is ambiguous the moment two monitors share a resolution, which is
 | `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_DESKTOP_INFO_DXR` (`1004999211`). |
 | `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
 | `desktopRect` | `XrRect2Di` | The panel monitor's full rect in physical virtual-desktop pixels. `offset` is the signed top-left; `extent` is the current desktop mode's size. An all-zero rect means "unknown". |
-| `deviceName` | `char[128]` | Stable OS device name, NUL-terminated UTF-8. Windows: the GDI name, e.g. `\\.\DISPLAY1`. Empty when the platform has no equivalent. |
+| `deviceName` | `char[128]` | Stable OS device name, NUL-terminated UTF-8. Windows: GDI name (`\\.\DISPLAY1`); macOS: display UUID; Linux/X11: RandR output name (`HDMI-1`). Empty when unresolved. |
 | `isPrimary` | `XrBool32` | `XR_TRUE` when the panel's monitor is the desktop's primary monitor. |
 | `isPanelConfirmed` | `XrBool32` | `XR_TRUE` when the runtime genuinely located the 3D panel; `XR_FALSE` when it fell back to the primary monitor. |
 
@@ -635,14 +635,30 @@ chained struct — the same layout-freeze rule `XrDisplayRenderingModeInfoDXR` d
 
 ##### Coordinate contract
 
-`desktopRect` is in **physical virtual-desktop pixels**: the coordinate space a
-per-monitor-DPI-aware-v2 process sees. The origin is the primary monitor's top-left, and
-monitors left of or above it have **negative** offsets.
+`desktopRect` is in **the coordinate space the OS places windows in** — which is what a
+client actually needs, and which differs per platform:
 
-The runtime pins a per-monitor-v2 DPI context while resolving the rect, so the published
-value is physical **regardless of the host process's own DPI awareness**. This matters
-because the runtime is a DLL: for every in-process app class it runs inside the
-application's process and would otherwise inherit that process's awareness.
+| Platform | Units | Source |
+|---|---|---|
+| Windows | physical virtual-screen pixels | `GetMonitorInfoW(rcMonitor)` under a pinned per-monitor-v2 DPI context |
+| macOS | **points**, not backing pixels | `CGDisplayBounds` (global display space) |
+| Linux / X11 | device pixels | RandR 1.5 `XRRGetMonitors`, root-window coords |
+
+All three are **top-down**, origin at the primary/main display's top-left, with
+**negative** offsets for monitors left of or above it.
+
+Two platform notes that bite if missed:
+
+- **Windows.** The runtime pins a per-monitor-v2 DPI context while resolving the rect, so
+  the published value is physical **regardless of the host process's own DPI awareness**.
+  This matters because the runtime is a DLL: for every in-process app class it runs inside
+  the application's process and would otherwise inherit that process's awareness.
+- **macOS.** The space is deliberately CoreGraphics', not Cocoa's. `NSScreen.frame` is
+  bottom-left with y increasing *upward*, so an app placing an `NSWindow` must flip into
+  that space itself; one that forgets mirrors its position vertically on any multi-display
+  arrangement. And because the units are points, `desktopRect.extent` on a Retina panel is
+  half the backing resolution — another reason not to compare it against
+  `displayPixelWidth`/`Height`.
 
 > **A consumer must act in that same space.** A DPI-unaware process that passes these
 > coordinates to `SetWindowPos` (or any managed wrapper over it) is handed *virtualised*
@@ -683,7 +699,10 @@ machines that already worked around it report `isPrimary == XR_TRUE` *and*
   changes (monitor hotplug, rearrangement) are not reported dynamically. `deviceName` is
   provided so an application can re-resolve the monitor itself after such a change.
 - A runtime that cannot resolve the geometry **must** return an all-zero `desktopRect` and
-  an empty `deviceName` rather than a guess.
+  an empty `deviceName` rather than a guess. That is the normal outcome on Android (no
+  virtual desktop), on a headless session, and under a pure Wayland session with no
+  XWayland — a Wayland client is denied any global coordinate space by design, so no
+  runtime can answer there.
 
 ### New Enums
 
