@@ -1932,6 +1932,31 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	 */
 	if (zones_frame) {
 		// Dedupe: this call costs ~185 ms in the plug-in; do not pay it to repeat itself.
+		/*	
+		 * PROBE: DXR_ZONE_WISH_SKIP=1 drops the zone-wish publish ENTIRELY, both the
+		 * publish and the clear. Answers "is the whole stall this one vendor call?".
+		 *
+		 * What is lost: the DP stops receiving the PER-ZONE mask, so it cannot switch
+		 * 3D/2D per region -- the panel falls back to whatever global mode the
+		 * ADR-027 tier-1 path requested. For THIS app that may be invisible: its wish
+		 * is a 1x1 collapse over the whole 811x1421 region, i.e. "all 3D", which is
+		 * what the global request already says. An app with real mixed 2D/3D zones
+		 * would lose the mixing, so this is a PROBE, not a shipping switch.
+		 */
+		{
+			static int skip = -1;
+			if (skip < 0) {
+				const char *e = getenv("DXR_ZONE_WISH_SKIP");
+				skip = (e != NULL && e[0] == '1') ? 1 : 0;
+				if (skip == 1) {
+					U_LOG_W("[WISHSKIP] DXR_ZONE_WISH_SKIP=1 - zone-wish publish "
+					        "DISABLED entirely (probe; per-zone 2D/3D mixing is off)\n");
+				}
+			}
+			if (skip == 1) {
+				return true;
+			}
+		}
 		const uint64_t wish_sig = d3d12_zone_wish_sig(c, region_w, region_h);
 		if (d3d12_zone_wish_dedupe_on() && wish_sig == c->reroute.wish_sig_published &&
 		    c->reroute.wish_seq != 0) {
@@ -5026,6 +5051,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		c->repaint.view_h = c->eff_layout.tile_h;
 		c->repaint.cols = c->eff_layout.cols;
 		c->repaint.rows = c->eff_layout.rows;
+		// #868: arm the repaint replay exactly as the VK tier does.
 		c->repaint.armed = rr_wove;
 		if (rr_wove) {
 			c->repaint.last_app_frame_ns = os_monotonic_get_ns();
