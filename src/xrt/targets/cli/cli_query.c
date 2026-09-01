@@ -26,6 +26,7 @@
 #include "xrt/xrt_config_os.h"
 
 #include "os/os_display_edid.h"
+#include "os/os_display_desktop.h"
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
 #ifdef XRT_OS_WINDOWS
@@ -1117,6 +1118,19 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->display_info = info;
 	r->display_info_ok = true;
 
+	// #1301 — widen the plug-in's panel ORIGIN into the full monitor rect apps
+	// are told to place their window in. Same resolver, same inputs as the
+	// runtime, so `info` reports what an app would actually receive.
+	r->desktop_info_ok =
+	    os_display_desktop_info_at(info.display_screen_left, info.display_screen_top, &r->desktop_info);
+	// Caller-DPI space on both sides — the plug-in's dims are virtualised
+	// whenever this process is DPI-unaware, so the physical rect is the wrong
+	// thing to compare them against.
+	r->desktop_info_is_panel = r->desktop_info_ok && info.display_pixel_width > 0 &&
+	                           info.display_pixel_height > 0 &&
+	                           r->desktop_info.width_in_caller_dpi == info.display_pixel_width &&
+	                           r->desktop_info.height_in_caller_dpi == info.display_pixel_height;
+
 	// #1252 — the allow-listed performance settings, resolved through the same
 	// chain the runtime uses. Platform-independent, and deliberately BEFORE the
 	// GPU probe so it is reported even where that probe does not run.
@@ -1397,6 +1411,14 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	PT("view scale:   (%.3f, %.3f) (baseline hint; see per-mode scale)\n", (double)i->recommended_view_scale_x,
 	   (double)i->recommended_view_scale_y);
 	PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
+	// #1301: the full monitor rect apps place windows into, plus the GDI device
+	// name. "primary-fallback" means the plug-in reported no panel position, so
+	// this is just the primary monitor.
+	PT("desktop rect: %ux%u at (%d, %d) on '%s'%s%s\n", r->desktop_info.width, r->desktop_info.height,
+	   r->desktop_info.left, r->desktop_info.top,
+	   r->desktop_info.device_name[0] != 0 ? r->desktop_info.device_name : "?",
+	   r->desktop_info.is_primary ? " [primary]" : "",
+	   r->desktop_info_is_panel ? "" : " [primary-fallback: not panel-confirmed]");
 	char et_buf[64];
 	PT("eye-tracking: supported=%s (0x%x) default=%s\n",
 	   eye_modes_label(i->supported_eye_tracking_modes, et_buf, sizeof(et_buf)), i->supported_eye_tracking_modes,
@@ -1580,6 +1602,15 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON *sp = cJSON_AddObjectToObject(d, "screen_pos");
 		cJSON_AddNumberToObject(sp, "left", (double)i->display_screen_left);
 		cJSON_AddNumberToObject(sp, "top", (double)i->display_screen_top);
+		cJSON *dr = cJSON_AddObjectToObject(d, "desktop_rect");
+		cJSON_AddBoolToObject(dr, "resolved", r->desktop_info_ok);
+		cJSON_AddNumberToObject(dr, "left", (double)r->desktop_info.left);
+		cJSON_AddNumberToObject(dr, "top", (double)r->desktop_info.top);
+		cJSON_AddNumberToObject(dr, "width", (double)r->desktop_info.width);
+		cJSON_AddNumberToObject(dr, "height", (double)r->desktop_info.height);
+		cJSON_AddStringToObject(dr, "device_name", r->desktop_info.device_name);
+		cJSON_AddBoolToObject(dr, "is_primary", r->desktop_info.is_primary);
+		cJSON_AddBoolToObject(dr, "is_panel_confirmed", r->desktop_info_is_panel);
 		cJSON *et = cJSON_AddObjectToObject(d, "eye_tracking");
 		cJSON_AddNumberToObject(et, "supported_modes", (double)i->supported_eye_tracking_modes);
 		cJSON_AddNumberToObject(et, "default_mode", (double)i->default_eye_tracking_mode);

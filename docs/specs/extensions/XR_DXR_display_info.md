@@ -589,6 +589,102 @@ vendor plug-in reports to the runtime for its own hosted-window placement (#715)
 - The position is a static property for the lifetime of the runtime instance; display
   topology changes (monitor hotplug, rearrangement) are not reported dynamically in v16.
 
+> **Superseded in v18** by [`XrDisplayDesktopInfoDXR`](#xrdisplaydesktopinfodxr-v18), which
+> carries the panel's full rect and a stable device name instead of the origin alone. This
+> struct keeps working unchanged and runtimes continue to fill it; new code should prefer
+> the v18 struct.
+
+#### XrDisplayDesktopInfoDXR (v18)
+
+Chained to `XrSystemProperties` to return the **full desktop rect** of the monitor the 3D
+panel is on, plus a **stable device name** for re-resolving that monitor later. It answers
+the question `XrDisplayDesktopPositionDXR` left open — the origin alone does not tell an
+application how big the panel's desktop area is, and nothing in the protocol identified
+*which* OS monitor the panel is.
+
+Matching `displayPixelWidth`/`displayPixelHeight` against the OS monitor list is **not** a
+substitute: it is ambiguous the moment two monitors share a resolution, which is common.
+
+| Member | Type | Description |
+|---|---|---|
+| `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_DESKTOP_INFO_DXR` (`1004999211`). |
+| `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
+| `desktopRect` | `XrRect2Di` | The panel monitor's full rect in physical virtual-desktop pixels. `offset` is the signed top-left; `extent` is the current desktop mode's size. An all-zero rect means "unknown". |
+| `deviceName` | `char[128]` | Stable OS device name, NUL-terminated UTF-8. Windows: the GDI name, e.g. `\\.\DISPLAY1`. Empty when the platform has no equivalent. |
+| `isPrimary` | `XrBool32` | `XR_TRUE` when the panel's monitor is the desktop's primary monitor. |
+| `isPanelConfirmed` | `XrBool32` | `XR_TRUE` when the runtime genuinely located the 3D panel; `XR_FALSE` when it fell back to the primary monitor. |
+
+```c
+#define XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR 128
+
+typedef struct XrDisplayDesktopInfoDXR {
+    XrStructureType             type;
+    void* XR_MAY_ALIAS          next;
+    XrRect2Di                   desktopRect;
+    char                        deviceName[XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR];
+    XrBool32                    isPrimary;
+    XrBool32                    isPanelConfirmed;
+} XrDisplayDesktopInfoDXR;
+```
+
+**Why it is a separate struct rather than new fields on `XrDisplayDesktopPositionDXR`:**
+the runtime writes chained output structs using its own compiled layout, so appending
+fields to a published struct would write past the allocation of an application compiled
+against v16. Every additive change to this extension's output structs **must** be a new
+chained struct — the same layout-freeze rule `XrDisplayRenderingModeInfoDXR` documents.
+
+##### Coordinate contract
+
+`desktopRect` is in **physical virtual-desktop pixels**: the coordinate space a
+per-monitor-DPI-aware-v2 process sees. The origin is the primary monitor's top-left, and
+monitors left of or above it have **negative** offsets.
+
+The runtime pins a per-monitor-v2 DPI context while resolving the rect, so the published
+value is physical **regardless of the host process's own DPI awareness**. This matters
+because the runtime is a DLL: for every in-process app class it runs inside the
+application's process and would otherwise inherit that process's awareness.
+
+> **A consumer must act in that same space.** A DPI-unaware process that passes these
+> coordinates to `SetWindowPos` (or any managed wrapper over it) is handed *virtualised*
+> coordinates by the OS and will place the window wrong — by the ratio of the two monitors'
+> scale factors. Such a bug looks correct on every single-monitor development box and fails
+> on exactly the mixed-DPI multi-monitor rigs this struct exists to serve. Either declare
+> per-monitor-v2 awareness for the process, or wrap the placement call in
+> `SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)`.
+
+##### `desktopRect` is not `displayPixelWidth`/`displayPixelHeight`
+
+`XrDisplayInfoDXR.displayPixelWidth`/`Height` are the panel's **native** resolution.
+`desktopRect.extent` is the monitor's **current desktop mode**. They differ whenever the
+user runs a non-native mode. Use `desktopRect` for window placement and `displayPixel*` for
+render sizing.
+
+##### What `isPanelConfirmed` is for
+
+The runtime resolves the monitor from the panel origin the display processor reported. A
+display processor that reports no position — `sim_display`, and the platforms whose
+panel-origin plumbing is still open (#715) — resolves to the primary monitor. That is a
+valid, placeable rect, but it is **not** evidence that a 3D panel is there.
+
+`isPanelConfirmed` separates the two, so an application can decide whether moving its
+window is worth doing. `isPrimary` is independent of it: making the 3D panel the Windows
+primary display is the standing field workaround for the absence of this struct, so
+machines that already worked around it report `isPrimary == XR_TRUE` *and*
+`isPanelConfirmed == XR_TRUE`, and a client can skip the move entirely.
+
+**Valid Usage:**
+- `type` **must** be `XR_TYPE_DISPLAY_DESKTOP_INFO_DXR`.
+- The application **must** have enabled the `XR_DXR_display_info` extension at instance
+  creation.
+- The values are available before session creation (`xrGetSystemProperties` needs only the
+  instance and system id), so the query slots between `xrGetSystem` and native window
+  creation — early enough to place a window before the first present.
+- The rect is a static property for the lifetime of the runtime instance; display topology
+  changes (monitor hotplug, rearrangement) are not reported dynamically. `deviceName` is
+  provided so an application can re-resolve the monitor itself after such a change.
+- A runtime that cannot resolve the geometry **must** return an all-zero `desktopRect` and
+  an empty `deviceName` rather than a guess.
+
 ### New Enums
 
 #### XrDisplayModeDXR
@@ -1948,7 +2044,8 @@ the property) silently ignore the call — graceful degradation.
 | 13 | 2026-05-18 | David Fattal | Added per-session `isActive` and `isRequestable` fields to `XrDisplayRenderingModeInfoDXR` (#234). `isActive` lets an app learn the current mode from the first enumerate without waiting for an event; `isRequestable` tells a session whether it may request a mode (false for non-controller sessions under a workspace). |
 | 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeDXR`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedDXR`. No struct/ABI change. |
 | 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). |
-| 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 17`).** |
+| 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. |
+| 18 | 2026-09-01 | David Fattal | Added `XrDisplayDesktopInfoDXR` (`1004999211`, new chained struct — additive, no ABI change to existing structs): the panel monitor's **full desktop rect** plus a **stable device name** (`\\.\DISPLAY1`), superseding the origin-only `XrDisplayDesktopPositionDXR`, so a client can place its window on the 3D panel and re-resolve the monitor after a topology change (#1301, unblocking displayxr-unity#266). Adds `isPrimary` and `isPanelConfirmed`. The rect is resolved under a pinned per-monitor-v2 DPI context so it is physical even when the host process is DPI-unaware. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 18`).** |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

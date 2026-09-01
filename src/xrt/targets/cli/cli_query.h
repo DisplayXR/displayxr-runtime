@@ -19,6 +19,7 @@
 #include "cli_dims_check.h"
 
 #include "xrt/xrt_plugin.h"
+#include "os/os_display_desktop.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
 
@@ -181,6 +182,18 @@ struct cli_query_result
 
 	/* Vendor-neutral display info (valid iff display_info_ok). */
 	struct xrt_plugin_display_info display_info;
+
+	/* #1301 — the panel monitor's FULL desktop rect + stable device name,
+	 * resolved from `display_info.display_screen_left/top` exactly the way
+	 * the runtime resolves it for `XR_DXR_display_info`. Lets `info` show
+	 * what an app would be told about where to put its window, and whether
+	 * that is a real panel or a primary-monitor fallback.
+	 * Valid iff desktop_info_ok. */
+	struct os_display_desktop_info desktop_info;
+	bool desktop_info_ok;
+	/* True when the resolved monitor's mode equals the plug-in's reported
+	 * native panel resolution — i.e. we really did land on the 3D panel. */
+	bool desktop_info_is_panel;
 
 	/* #1201 — the authoritative panel mode, so `display_dims` can PROVE the
 	 * plug-in's `display_pixel_*` instead of printing it. Windows-only:

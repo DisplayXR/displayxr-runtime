@@ -11,7 +11,7 @@ add_library(cli_query STATIC cli_query.c cli_query.h)
 target_link_libraries(
 	cli_query
 	PUBLIC xrt-interfaces
-	PRIVATE aux_util target_lists xrt-external-cjson
+	PRIVATE aux_util aux_os target_lists xrt-external-cjson
 	)
 target_include_directories(cli_query PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

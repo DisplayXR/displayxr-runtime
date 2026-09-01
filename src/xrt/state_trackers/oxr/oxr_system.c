@@ -738,6 +738,31 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 		desktop_pos->top = info ? info->display_screen_top : 0;
 	}
 
+
+	// v18: the FULL panel rect + a stable device name, so a client can both
+	// place a window on the panel and re-resolve the monitor after a hotplug
+	// (#1301 / displayxr-unity#266). Supersedes the origin-only v16 struct
+	// above, which stays filled for apps compiled against v16..v17.
+	XrDisplayDesktopInfoDXR *desktop_info = NULL;
+	if (sys->inst->extensions.DXR_display_info) {
+		desktop_info =
+		    OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_DISPLAY_DESKTOP_INFO_DXR, XrDisplayDesktopInfoDXR);
+	}
+
+	if (desktop_info) {
+		desktop_info->desktopRect.offset.x = info ? info->display_screen_left : 0;
+		desktop_info->desktopRect.offset.y = info ? info->display_screen_top : 0;
+		desktop_info->desktopRect.extent.width = info ? (int32_t)info->display_desktop_width : 0;
+		desktop_info->desktopRect.extent.height = info ? (int32_t)info->display_desktop_height : 0;
+		desktop_info->isPrimary = (info && info->display_is_primary) ? XR_TRUE : XR_FALSE;
+		desktop_info->isPanelConfirmed = (info && info->display_desktop_rect_is_panel) ? XR_TRUE : XR_FALSE;
+
+		// snprintf, not strncpy: the destination must stay NUL-terminated
+		// even if a future platform's identifier outgrows the field.
+		(void)snprintf(desktop_info->deviceName, sizeof(desktop_info->deviceName), "%s",
+		               info ? info->display_device_name : "");
+	}
+
 	XrEyeTrackingModeCapabilitiesDXR *eye_caps = OXR_GET_OUTPUT_FROM_CHAIN(
 	    properties, XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR, XrEyeTrackingModeCapabilitiesDXR);
 	if (eye_caps) {
