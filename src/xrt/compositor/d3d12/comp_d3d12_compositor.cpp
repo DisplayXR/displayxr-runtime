@@ -1615,6 +1615,37 @@ d3d12_fill_arm_active(struct comp_d3d12_compositor *c)
  * draw-granular). `DXR_SPLIT_D3D12_ROUTE=own` keeps the tier's own out-arm,
  * as the A/B control and for the cube-class record.
  */
+/*!
+ * PROTOTYPE (#1261 follow-up): route a HYBRID (cross-adapter) d3d12 session
+ * onto the d3d11 fill arm too, instead of its own-legs D3D12 arm.
+ *
+ * The VK tier already does exactly this in BOTH topologies -- its partition
+ * gate reads "the #918 split's d3d11 fill arm, hybrid OR same-adapter". The
+ * d3d12 reroute was accepted same-adapter-only (#1264), so a hybrid d3d12
+ * session falls through to the own-legs arm, whose partition record did not
+ * pass -- which is why the #1257 divisor lever does not exist for Unity on a
+ * hybrid box today.
+ *
+ * Nothing structural blocks it: the deposit ring is app-adapter-local in both
+ * designs (D3D12 renders into NT-shared D3D11 textures on its OWN adapter),
+ * and the cross-adapter hop belongs to the xbridge downstream -- the same
+ * xbridge the VK tier already crosses on hybrid hardware.
+ *
+ * OPT-IN and default OFF: this is a bring-up flag, exactly as
+ * DXR_SPLIT_SAME_ADAPTER_D3D12 was for Phase C. It does not become a default
+ * without its own measured acceptance record.
+ */
+static bool
+d3d12_reroute_hybrid_optin(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_SPLIT_D3D12_HYBRID_REROUTE");
+		on = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return on == 1;
+}
+
 static bool
 d3d12_reroute_route_d3d11(void)
 {
@@ -1904,7 +1935,10 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 	comp_split_gate_evaluate(&gin, &gate);
 	const char *reason = gate.reason;
 	c->split_off_reason = gate.short_reason;
-	if (gate.same_adapter && gate.split_active) {
+	// PROTOTYPE: the reroute is same-adapter by acceptance; the opt-in extends it
+	// to the hybrid topology the VK tier already serves on this same arm.
+	const bool reroute_topology_ok = gate.same_adapter || d3d12_reroute_hybrid_optin();
+	if (reroute_topology_ok && gate.split_active) {
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
 		if (d3d12_reroute_route_d3d11()) {
 			// #1264 heavy-d3d12: the same-adapter engage runs on the d3d11
@@ -1912,11 +1946,13 @@ d3d12_split_stage_a(struct comp_d3d12_compositor *c,
 			// measured route for real app load. Nothing of the own-legs
 			// Stage A below is created.
 			U_LOG_W(
-			    "#918 output-device split: ADR-039 same-adapter ENGAGE via the d3d11 fill arm on "
-			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute, accepted default; "
+			    "#918 output-device split: ADR-039 %s ENGAGE via the d3d11 fill arm on "
+			    "'%ls' LUID=%08lx:%08lx (#1264 heavy-d3d12 reroute%s; "
 			    "DXR_SPLIT_SAME_ADAPTER=0 reverts, DXR_SPLIT_D3D12_ROUTE=own for the own-legs arm)",
-			    sdesc.Description, (unsigned long)sdesc.AdapterLuid.HighPart,
-			    (unsigned long)sdesc.AdapterLuid.LowPart);
+			    gate.same_adapter ? "same-adapter" : "HYBRID (cross-adapter)", sdesc.Description,
+			    (unsigned long)sdesc.AdapterLuid.HighPart, (unsigned long)sdesc.AdapterLuid.LowPart,
+			    gate.same_adapter ? ", accepted default"
+			                      : ", PROTOTYPE opt-in DXR_SPLIT_D3D12_HYBRID_REROUTE=1");
 			d3d12_reroute_stage_a(c, xdev, display_screen_left, display_screen_top);
 			return;
 		}
