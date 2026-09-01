@@ -433,6 +433,7 @@ See `docs/README.md` for the full index. By task:
 | Tune or reason about motion-to-photon latency (late weave, repaint, VK queue tiers, deferred present, late latching) — and what the defaults are per GPU topology | `docs/reference/motion-to-photon-levers.md` |
 | Look up **any** `DXR_*` env var — what it does, where it's read, its default, and whether it could ever be a user-facing setting | `docs/roadmap/control-panel-performance-settings.md` (census of all 71 + Control Panel design) |
 | GPU adapter selection on hybrid iGPU/dGPU machines (`DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU`, in-process `getenv` caveat) | `docs/reference/adapter-selection.md` |
+| Read or publish any Win32 screen/window geometry from runtime or plug-in code (`GetMonitorInfo`, `MonitorFromPoint`, `GetWindowRect`) — why a DLL inherits the HOST app's DPI space, and the `__COMPAT_LAYER` A/B that exposes it | `docs/reference/dpi-awareness.md` |
 | Install / release DisplayXR on Android (released APKs, the two variants, the launch-once broker trap) | `docs/getting-started/android-build-guide.md` § *Installing from released artifacts* → `scripts/install-android.sh` |
 | Why the Android vendor plug-in is bundled in the runtime APK rather than installed separately | `docs/adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
