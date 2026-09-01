@@ -18,6 +18,7 @@
 
 #include "os/os_time.h"
 #include "os/os_display_edid.h"
+#include "os/os_display_desktop.h"
 
 #include "util/u_debug.h"
 #include "util/u_system.h"
@@ -49,6 +50,7 @@
 #endif
 
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -265,6 +267,60 @@ resolve_render_adapter_luid(const struct xrt_plugin_display_info *pdi)
 	(void)pdi;
 	return 0;
 #endif
+}
+
+/*!
+ * Fill the panel's desktop rect + device name from the origin the display
+ * processor reported (#1301).
+ *
+ * `display_screen_left/top` alone identifies the monitor; this widens it to the
+ * full rect apps need for `SetWindowPos`, plus the GDI device name they need to
+ * re-resolve the monitor after a hotplug or arrangement change.
+ *
+ * `display_desktop_rect_is_panel` is the honesty flag: a plug-in that reports no
+ * position (sim_display, and the not-yet-wired Linux/macOS paths of #715) lands
+ * us on the primary monitor, which is a legitimate rect but is NOT evidence
+ * that we know where a 3D panel is. Comparing the resolved monitor's current
+ * mode against the panel's reported native resolution separates the two, so an
+ * app can decide whether moving its window is worth doing.
+ */
+static void
+fill_display_desktop_info(struct xrt_system_compositor_info *info)
+{
+	struct os_display_desktop_info desktop = {0};
+
+	if (!os_display_desktop_info_at(info->display_screen_left, info->display_screen_top, &desktop)) {
+		// No implementation on this platform, or the query failed. Leave the
+		// zeroed defaults, which XR_DXR_display_info defines as "unknown".
+		U_LOG_I("Panel desktop rect unavailable for origin (%d, %d); apps get 'unknown'.",
+		        (int)info->display_screen_left, (int)info->display_screen_top);
+		return;
+	}
+
+	info->display_desktop_width = desktop.width;
+	info->display_desktop_height = desktop.height;
+	info->display_is_primary = desktop.is_primary;
+
+	// The resolver may have snapped to the NEAREST monitor, so take its rect
+	// origin rather than trusting the point we asked about.
+	info->display_screen_left = desktop.left;
+	info->display_screen_top = desktop.top;
+
+	(void)snprintf(info->display_device_name, sizeof(info->display_device_name), "%s", desktop.device_name);
+
+	// Compare in the CALLER's DPI space, not the physical one: the plug-in is a
+	// DLL and reports panel dims through whatever awareness its host declared,
+	// so under a DPI-unaware host (a game engine's player, say) it reports
+	// VIRTUALISED dims. Checking those against the physical rect would fail on
+	// every box at non-100% scaling and wrongly claim the panel was not found.
+	info->display_desktop_rect_is_panel = info->display_pixel_width > 0 && info->display_pixel_height > 0 &&
+	                                      desktop.width_in_caller_dpi == info->display_pixel_width &&
+	                                      desktop.height_in_caller_dpi == info->display_pixel_height;
+
+	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s%s", desktop.width, desktop.height,
+	        (int)desktop.left, (int)desktop.top, desktop.device_name[0] != '\0' ? desktop.device_name : "?",
+	        desktop.is_primary ? ", primary" : "",
+	        info->display_desktop_rect_is_panel ? "" : " (size != panel native — primary-monitor fallback?)");
 }
 
 static xrt_result_t
@@ -539,6 +595,14 @@ out:
 		// Independent of the active plug-in's get_display_info above; the
 		// scalar dp_factory_* set there stays the Phase-1 compositor input.
 		build_dp_registry(&xsysc->info);
+
+		// Resolve the panel's FULL desktop rect + stable device name from the
+		// origin the plug-in reported, so XR_DXR_display_info can tell apps
+		// where to put their window (#1301 / displayxr-unity#266). Outside the
+		// plug-in branch above on purpose: a (0,0) origin — no plug-in, or
+		// sim_display expressing no preference — resolves to the primary
+		// monitor, which is the right answer for both readings.
+		fill_display_desktop_info(&xsysc->info);
 
 		// All display-info + DP factories are sourced from the plug-in
 		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer

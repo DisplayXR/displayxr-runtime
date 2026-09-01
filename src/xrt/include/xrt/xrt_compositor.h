@@ -2754,6 +2754,51 @@ struct xrt_system_compositor_info
 	//! Display top edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_top;
 
+	/*!
+	 * @name Panel desktop geometry (#1301)
+	 *
+	 * The FULL desktop rect and stable device name of the monitor the 3D
+	 * panel is on, resolved from @ref display_screen_left / @ref
+	 * display_screen_top by @ref os_display_desktop_info_at. Published to
+	 * apps through `XR_DXR_display_info` so a client can place its window on
+	 * the panel instead of the primary monitor.
+	 *
+	 * Distinct from @ref display_pixel_width / @ref display_pixel_height,
+	 * which are the panel's NATIVE resolution as the plug-in reports it:
+	 * these are the monitor's CURRENT desktop mode, which differs whenever
+	 * the user runs a non-native mode. Window placement wants these.
+	 *
+	 * Always PHYSICAL virtual-desktop pixels — the resolver pins a
+	 * per-monitor-v2 DPI context for the query, so these stay physical even
+	 * when the host process is DPI-unaware.
+	 * @{
+	 */
+
+	//! Panel monitor width in physical pixels, current desktop mode. 0 = unknown.
+	uint32_t display_desktop_width;
+
+	//! Panel monitor height in physical pixels, current desktop mode. 0 = unknown.
+	uint32_t display_desktop_height;
+
+	//! True when the panel's monitor is the desktop's primary monitor.
+	bool display_is_primary;
+
+	/*!
+	 * True when the resolved monitor's current mode equals the panel's
+	 * reported native resolution — i.e. the runtime really did land on the
+	 * 3D panel, rather than falling back to the primary because the plug-in
+	 * expressed no position preference (the sim_display case, which reports
+	 * a 0,0 origin). Apps use it to tell "the runtime knows where the panel
+	 * is" from "this is just the primary monitor".
+	 */
+	bool display_desktop_rect_is_panel;
+
+	//! Stable OS device name of the panel's monitor, NUL-terminated UTF-8.
+	//! Windows: the GDI name, e.g. `\\.\DISPLAY1`. Empty when unknown.
+	char display_device_name[128];
+
+	/*! @} */
+
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	//! Set by the IPC server when --workspace flag is used. Server-side only.
 	bool workspace_mode;

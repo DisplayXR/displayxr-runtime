@@ -41,10 +41,19 @@ extern "C" {
 #define XR_DXR_wayland_surface_binding_SPEC_VERSION 1
 #define XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_wayland_surface_binding"
 
-// Value from the DisplayXR provisional 1004999xxx block — decade 1004999210–219
-// (the xlib sibling claimed 200–209). Replace with an official Khronos-assigned
-// value if the extension is standardized.
-#define XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999210)
+// Value from the DisplayXR provisional 1004999xxx block — decade 1004999250–259.
+// Replace with an official Khronos-assigned value if the extension is
+// standardized.
+//
+// This was originally 1004999210, which COLLIDED with
+// XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR: the 210–219 decade already belonged to
+// XR_DXR_display_info's v16+ additions (see this directory's README.md
+// registry), not to the window-binding siblings. Both structs happened to be
+// chained onto different parents, so nothing misbehaved in practice, but two
+// distinct XrStructureType values must never share a number. Corrected to a
+// fresh decade; the extension is at SPEC_VERSION 1 and no shipped app chains
+// this struct, so the renumber breaks nothing.
+#define XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999250)
 
 // Only meaningful on desktop Linux (Android also reports __linux__ but has no
 // Wayland desktop surface path).
