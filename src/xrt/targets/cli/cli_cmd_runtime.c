@@ -50,11 +50,21 @@ static const wchar_t *AVAILABLE_KEY = L"Software\\Khronos\\OpenXR\\1\\AvailableR
 static const wchar_t *DXR_KEY = L"Software\\DisplayXR\\Runtime";
 static const wchar_t *DEFAULT_MANIFEST = L"C:\\Program Files\\DisplayXR\\Runtime\\DisplayXR_win64.json";
 
-//! Budget for the `list` filesystem sweep. A runtime manifest is a few hundred
-//! bytes, so the size gate below prunes essentially every other .json on disk;
-//! these caps only bound pathological trees (huge Steam libraries, etc.).
+/*!
+ * Budget for the `list` filesystem sweep. A runtime manifest is a few hundred
+ * bytes, so the size gate below prunes essentially every other .json on disk;
+ * these caps only bound pathological trees (huge Steam libraries, etc.).
+ *
+ * The budget is PER ROOT, not global. A single shared deadline let the first
+ * root consume all of it: on the box this tool was written for, Program Files
+ * (with a large Steam library under it) exhausted a 10 s global budget and the
+ * sweep never reached the user profile — where the runtime we were hunting
+ * actually lived. A starving-later-roots failure is invisible in the output
+ * except as one truncation warning, which is the worst way for a discovery
+ * tool to fail.
+ */
 #define SCAN_MAX_DEPTH 6
-#define SCAN_MAX_MS 10000
+#define SCAN_ROOT_MS 6000
 #define SCAN_MAX_MANIFEST_BYTES 8192
 
 #define MAX_RUNTIMES 64
@@ -80,6 +90,8 @@ struct rt_entry
 static struct rt_entry g_rt[MAX_RUNTIMES];
 static int g_rt_count = 0;
 static bool g_scan_truncated = false;
+//! Roots whose sweep ran out of budget, so `list` can say WHICH went unsearched.
+static char g_scan_truncated_roots[512];
 
 
 /*
@@ -360,16 +372,31 @@ name_is_noise(const wchar_t *n)
 static bool
 dir_is_noise(const wchar_t *n)
 {
+	// AppData is here because LOCALAPPDATA and APPDATA are swept as roots in
+	// their own right; without this, the USERPROFILE root re-walks the whole
+	// of AppData a second time and burns its budget before reaching Desktop.
 	static const wchar_t *skip[] = {L"node_modules", L".git",     L"WinSxS",   L"assembly", L"Package Cache",
 	                                L"Installer",    L"dotnet",   L"Fonts",    L"INF",      L"servicing",
 	                                L"SysWOW64",     L"System32", L"Temp",     L"cache",    L"cache2",
-	                                L"CrashReports", L"Logs"};
+	                                L"CrashReports", L"Logs",     L"AppData"};
 	for (int i = 0; i < (int)(sizeof(skip) / sizeof(skip[0])); i++) {
 		if (_wcsicmp(n, skip[i]) == 0) {
 			return true;
 		}
 	}
 	return false;
+}
+
+/*!
+ * True for a cloud-backed placeholder (OneDrive and friends). Recursing into
+ * one can block on a network fetch per entry, which is how a sweep with a time
+ * budget spends all of it in a directory that holds nothing we want.
+ */
+static bool
+is_cloud_placeholder(DWORD attrs)
+{
+	return (attrs & (FILE_ATTRIBUTE_OFFLINE | 0x00400000 /* RECALL_ON_DATA_ACCESS */ |
+	                 0x00040000 /* RECALL_ON_OPEN */)) != 0;
 }
 
 /*!
@@ -402,6 +429,9 @@ scan_dir(const wchar_t *dir, int depth, ULONGLONG deadline)
 		}
 		if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
 			continue; // Never follow junctions; they loop.
+		}
+		if (is_cloud_placeholder(fd.dwFileAttributes)) {
+			continue;
 		}
 
 		wchar_t full[MAX_PATH];
@@ -454,17 +484,29 @@ scan_dir(const wchar_t *dir, int depth, ULONGLONG deadline)
 static void
 scan_filesystem(void)
 {
-	static const wchar_t *vars[] = {L"ProgramFiles", L"ProgramFiles(x86)", L"ProgramData",
-	                                L"LOCALAPPDATA", L"APPDATA",           L"USERPROFILE"};
-	ULONGLONG deadline = GetTickCount64() + SCAN_MAX_MS;
+	// USERPROFILE first: a runtime dropped in a dev folder or on the Desktop
+	// is both the likeliest thing the registry does NOT already know about and
+	// the cheapest tree to walk, so it should never be the one that gets cut.
+	static const wchar_t *vars[] = {L"USERPROFILE",       L"ProgramFiles", L"ProgramFiles(x86)",
+	                                L"ProgramData",       L"LOCALAPPDATA", L"APPDATA"};
 	for (int i = 0; i < (int)(sizeof(vars) / sizeof(vars[0])); i++) {
 		wchar_t root[MAX_PATH];
 		DWORD n = GetEnvironmentVariableW(vars[i], root, MAX_PATH);
 		if (n == 0 || n >= MAX_PATH) {
 			continue;
 		}
-		scan_dir(root, 0, deadline);
+		// Each root gets its own budget, so a huge tree cannot starve the rest.
+		g_scan_truncated = false;
+		scan_dir(root, 0, GetTickCount64() + SCAN_ROOT_MS);
+		if (g_scan_truncated) {
+			char u8[MAX_PATH * 2];
+			to_u8(root, u8, (int)sizeof(u8));
+			size_t used = strlen(g_scan_truncated_roots);
+			_snprintf_s(g_scan_truncated_roots + used, sizeof(g_scan_truncated_roots) - used, _TRUNCATE,
+			            "%s%s", used > 0 ? ", " : "", u8);
+		}
 	}
+	g_scan_truncated = g_scan_truncated_roots[0] != '\0';
 }
 
 
@@ -779,7 +821,10 @@ cmd_list(int argc, const char **argv)
 	P("  registry-only switcher cannot see it — including, potentially, the one\n");
 	P("  currently holding the key.\n");
 	if (g_scan_truncated) {
-		P("\n  ! The filesystem sweep hit its %d s budget and may be incomplete.\n", SCAN_MAX_MS / 1000);
+		P("\n  ! The filesystem sweep hit its %d s per-root budget under: %s\n", SCAN_ROOT_MS / 1000,
+		  g_scan_truncated_roots);
+		P("    Runtimes below those paths may be missing. Everything the registry\n");
+		P("    knows about — including whatever currently holds the key — is still listed.\n");
 	}
 	P("\n  Switch with:  displayxr-cli runtime activate [<manifest>]   (elevated)\n");
 	return 0;

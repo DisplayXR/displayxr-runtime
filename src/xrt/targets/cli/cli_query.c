@@ -523,13 +523,12 @@ read_active_runtime(struct cli_query_result *r)
 		return;
 	}
 
+	// Kept short on purpose: this lands in a 256-byte check detail, and the
+	// hijacker's path is the one part that must survive verbatim.
 	r->active_runtime_ok = false;
-	char expect_u8[1024];
-	WideCharToMultiByte(CP_UTF8, 0, expect, -1, expect_u8, (int)sizeof(expect_u8), NULL, NULL);
 	snprintf(r->active_runtime_note, sizeof(r->active_runtime_note),
-	         "HIJACKED — apps resolve to '%s', not '%s'. Fix: displayxr-cli runtime activate (elevated); "
-	         "inspect with: displayxr-cli runtime list",
-	         r->active_runtime, expect_u8);
+	         "HIJACKED — apps resolve to '%s', not this install. Fix (elevated): displayxr-cli runtime activate",
+	         r->active_runtime);
 }
 
 //! Fallback for a plug-in that doesn't self-report a version through
