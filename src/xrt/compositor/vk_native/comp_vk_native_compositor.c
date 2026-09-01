@@ -4095,6 +4095,37 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (struct xrt_display_processor_vk *)c->display_processor,
 			    comp_vk_native_target_get_measured_weave_ns(c->target),
 			    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+			/*
+			 * #206: the MEASURED weave→scanout residual, per frame.
+			 *
+			 * This is the horizon a vendor eye predictor must extrapolate
+			 * to. Until now the VK path measured it and dropped it on the
+			 * floor — only D3D11/D3D12 fed the slot — so on Android the
+			 * vendor SDK fell back to a hardcoded constant.
+			 *
+			 * That constant is not merely imprecise, it inverts our own
+			 * platform work. Measured on an NP02J, the residual is BIMODAL
+			 * on GPU governor state: p50 42.9 ms at the default governor,
+			 * 29.1 ms with the clock pinned. Scored in lenticular phase
+			 * units over 170 labelled turnaround events, a correct horizon
+			 * at 29 ms scores 0.038 median against 0.054 at 43 ms — a ~30%
+			 * win. But pinning the clock while the predictor still assumes
+			 * 40 ms scores 0.065, i.e. ~20% WORSE than not pinning at all,
+			 * because it then overshoots an 11 ms shorter reality.
+			 *
+			 * So this feed is the precondition for the GPU-clock platform
+			 * ask paying off rather than regressing. It must stay per-frame:
+			 * a session-start calibration cannot track a governor that
+			 * changes state mid-session, and the measured run-to-run spread
+			 * on a single configuration (7 ms) already exceeds the 40→29
+			 * difference being chased.
+			 *
+			 * 0 = no trusted measurement yet ⟹ the DP keeps its own
+			 * heuristic, so an unmeasured frame never injects a wrong value.
+			 */
+			xrt_display_processor_vk_set_predicted_scanout(
+			    (struct xrt_display_processor_vk *)c->display_processor,
+			    comp_vk_native_target_weave_to_scanout_ns(c->target));
 
 			// Call display processor with atlas (or zero-copy swapchain) texture.
 			// The canvas sub-rect comes from vk_dp_canvas_rect() — the same
