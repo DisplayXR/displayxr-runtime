@@ -42,9 +42,13 @@ if(WIN32)
 	target_sources(aux_os PRIVATE os_display_desktop_win32.c)
 elseif(APPLE)
 	target_sources(aux_os PRIVATE os_display_desktop_macos.c)
-	# System frameworks, always present — CoreGraphics for the display bounds,
-	# CoreFoundation for the display UUID string.
-	target_link_libraries(aux_os PRIVATE "-framework CoreGraphics" "-framework CoreFoundation")
+	# System frameworks, always present. CoreGraphics for the display bounds,
+	# CoreFoundation for the UUID string, and ColorSync because that is where
+	# CGDisplayCreateUUIDFromDisplayID actually lives (moved out of CoreGraphics
+	# in 10.13 — CoreGraphics re-exports the symbol but not the declaration).
+	target_link_libraries(
+		aux_os PRIVATE "-framework CoreGraphics" "-framework CoreFoundation" "-framework ColorSync"
+		)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# Desktop Linux only — the XRT_OS_LINUX_DESKTOP distinction in CMake form.
 	# Uses CMAKE_SYSTEM_NAME (the repo idiom) rather than the LINUX variable,

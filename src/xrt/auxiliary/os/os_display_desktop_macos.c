@@ -37,6 +37,13 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreFoundation/CoreFoundation.h>
+// CGDisplayCreateUUIDFromDisplayID is declared in ColorSync, NOT CoreGraphics —
+// it was moved there in 10.13 and CoreGraphics re-exports only the symbol, not
+// the declaration. Including CoreGraphics alone builds it as an implicit
+// declaration returning int, which is a hard error under this project's
+// -Werror-implicit-function-declaration (and would silently truncate the
+// pointer if it ever were not).
+#include <ColorSync/ColorSync.h>
 
 /*!
  * Stable identity for a display.
