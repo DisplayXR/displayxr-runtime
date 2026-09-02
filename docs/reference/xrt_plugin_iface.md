@@ -367,6 +367,27 @@ void my_plugin_init(void) {
 }
 ```
 
+### Log levels — the one rule that matters
+
+**Never call `U_LOG_W` (or `U_LOG_E`) on a per-frame path.** A plug-in shares the
+application's log file, so a warning on a hot path becomes a flood at frame rate:
+observed twice in shipping plug-in code, once at ~22 Hz producing 6,429 lines /
+1.17 MB in six minutes, and once as ~2,900 lines in 14 seconds while a window
+handle was being re-matched. Both were real hot-path I/O, and both buried
+everything else in the log at the moment someone needed to read it.
+
+The example above is correct precisely because init runs once.
+
+- `U_LOG_W` / `U_LOG_E` — one-off init, error and lifecycle events **only**.
+- `U_LOG_I` and below — anything recurring, and throttle it as well.
+- For a condition that can persist across many frames (a lost window, a
+  disconnected tracker, an unavailable device), log the **first occurrence** and
+  then a **count on recovery**. That turns a flood into a signal, and it is the
+  shape to reach for whenever a per-frame `U_LOG_W` feels tempting.
+
+This is the same convention the runtime holds itself to — see
+[debug logging](debug-logging.md).
+
 ## Related
 
 - [Vendor plug-in onboarding](../guides/vendor-plugin-onboarding.md) — high-level guide for building + shipping a plug-in
