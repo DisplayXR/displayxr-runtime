@@ -129,6 +129,14 @@ mode with a lease token) instead of owning the policy.
   but it is **serialised by the panel owner, bounded, and may not mutate mode or geometry**
   — the DP is invoked only through the pipeline's serialisation and only on behalf of a
   lease holder.
+- **"Always on" is about shape, not about holding hardware with nobody watching.** The
+  pipeline outlives any individual client — that is the point, it is what removes the
+  per-client teardown races — but with *zero* clients it releases the panel DP and parks
+  the render thread after a grace window (`DXR_IDLE_QUIESCE_MS`, default 5 s). The vendor
+  DP owns the SR context and the SR context owns the eye-tracking camera, so "never let
+  go" meant a camera streaming, LED lit, from the session's first client until the service
+  process exited (#1319). Coming back is free: the next client's register restarts the
+  thread and the pipeline binds a DP to the incoming presenter on its first frame.
 - The standalone per-client-DP path is retired behind `DXR_LEGACY_STANDALONE=1` for one
   release (A/B on motion-to-photon and the Intel-iGPU present path), then deleted.
 - Commit-thread writes to global mode/geometry move behind the S3 queue; no vendor DP

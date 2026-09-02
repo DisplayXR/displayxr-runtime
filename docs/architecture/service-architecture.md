@@ -326,7 +326,19 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
   they decide the lease/veto verdict themselves and report it synchronously.
 - **Retiring a panel DP never destroys it inline** — it goes to `mc->dp_graveyard`
   and the render thread frees it after `DXR_DP_GRAVEYARD_MS` (#1002), so a
-  lock-free reader that latched the pointer cannot fault.
+  lock-free reader that latched the pointer cannot fault. The one exception is
+  the idle quiesce below, where there is no reader left to protect and nothing
+  would ever drain the graveyard again.
+- **With zero clients the pipeline lets the panel go** (`pipeline_idle_quiesce_if_due`,
+  #1319). After `DXR_IDLE_QUIESCE_MS` (default 5 s) with no IPC *and* no capture
+  client, the render thread drops the lens vote, destroys the panel DP — which is
+  what releases the vendor SR context and with it the eye-tracking camera — force-
+  drains the graveyard, and parks itself. Before this the DP was released only by
+  `multi_compositor_destroy`, i.e. at process exit, so the camera stayed lit and
+  the 14 ms present loop kept running under `[HEALTH] clients=0`. There is no
+  resume path to maintain: `multi_compositor_register_client` restarts the thread
+  and the presenter re-bind builds a DP on the first frame. The grace window is
+  what keeps an app restart or a shell relaunch from recreating the vendor weaver.
 - Never join the render thread under `render_mutex`; never hold
   `global_state.lock` across a compositor call.
 
