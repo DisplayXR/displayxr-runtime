@@ -3461,6 +3461,17 @@ struct d3d11_multi_compositor
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
+	//! #1319: monotonic ns at which the pipeline was last seen with no clients
+	//! at all, or 0 while a client is connected. Armed and read by the render
+	//! thread only; register_client clears it. See pipeline_idle_quiesce_if_due.
+	int64_t idle_since_ns;
+
+	//! #1319: the panel DP was released and the render thread parked because
+	//! nothing was connected. Purely a latch — coming back needs no state, the
+	//! next register_client restarts the thread and the pipeline binds a DP on
+	//! its first frame — it just keeps the check from re-running every frame.
+	bool idle_quiesced;
+
 	//! Cursor render inputs for the controller-pushed sprite (sys->cursor_xsc).
 	//! cursor_panel_x/y is the OS cursor position sampled per frame in
 	//! render_pass (runtime-owned). cursor_hit_z_m + cursor_over_window +
@@ -8657,6 +8668,12 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			        mc->clients[i].window_rect_h);
 			multi_compositor_update_input_forward(mc);
 
+			// #1319: someone is back — disarm the idle window and clear the
+			// quiesce latch, so the render thread we are about to (re)start
+			// binds a panel DP on its first frame instead of parking again.
+			mc->idle_since_ns = 0;
+			mc->idle_quiesced = false;
+
 			// Ensure render timer is running. Normally started on capture client
 			// connect, but pure 3D IPC sessions need it too — otherwise workspace UI
 			// (drag, rotation) only repaints at the app's framerate (very slow on iGPU).
@@ -9296,6 +9313,11 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			         mc->client_count, mc->capture_client_count);
 			multi_compositor_update_input_forward(mc);
 
+			// #1319: as on the IPC register path — someone is back, so disarm
+			// the idle window and clear the quiesce latch.
+			mc->idle_since_ns = 0;
+			mc->idle_quiesced = false;
+
 			// Start render timer if this is the first capture client
 			if (mc->capture_client_count == 1) {
 				capture_render_thread_start(sys);
@@ -9351,12 +9373,13 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 	U_LOG_W("Multi-comp: removed capture client from slot %d (total=%u, captures=%u)",
 	         slot_index, mc->client_count, mc->capture_client_count);
 
-	// Stop render timer only when all clients (capture and IPC) are gone.
-	// IPC-only sessions now also rely on this thread for smooth workspace UI.
-	if (mc->capture_client_count == 0 && mc->client_count == 0) {
-		// Don't join from render thread — stop async
-		mc->capture_render_running.store(false);
-	}
+	// #1319: the last client (capture or IPC) just left. This used to stop the
+	// render thread here and nowhere else — which is why an IPC-only session
+	// never wound down at all, and why a capture-only one stopped rendering
+	// while still holding the panel DP (and the camera behind it) forever.
+	// Both now converge on pipeline_idle_quiesce_if_due: leave the thread
+	// running, and it releases the DP and parks itself once the grace window
+	// expires. A client that comes back inside the window costs nothing.
 
 	// Render one final frame to clear stale content
 	multi_compositor_render(sys);
@@ -10105,6 +10128,27 @@ dxr_dp_graveyard_ns()
 	return ns;
 }
 
+//! #1319: how long the pipeline stays up with no clients before it releases the
+//! panel DP and parks the render thread. A GRACE window, not a timeout — an app
+//! restart, a shell relaunch, or a launcher swapping one app for another all
+//! land inside it and cost nothing. Too short and the vendor weaver is recreated
+//! at app-switch rate, which is the churn `pipeline_dp_retire` exists to avoid.
+//! 0 disables the quiesce entirely (pre-#1319 behaviour). DXR_IDLE_QUIESCE_MS.
+static int64_t
+dxr_idle_quiesce_ns()
+{
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *e = getenv("DXR_IDLE_QUIESCE_MS");
+		int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 5000;
+		if (ms < 0) {
+			ms = 0;
+		}
+		ns = ms * 1000000LL;
+	}
+	return ns;
+}
+
 /*!
  * #964: park a retired panel DP instead of destroying it. Caller holds
  * render_mutex and has ALREADY published its replacement (or nullptr).
@@ -10264,6 +10308,97 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		mc->dp_graveyard[i].hwnd = nullptr;
 		mc->dp_graveyard[i].dev = nullptr;
 	}
+}
+
+/*!
+ * #1319: let the panel go when nothing is connected.
+ *
+ * The pipeline is "always on" in the ADR-035 D3 sense — one compositor, one DP
+ * per panel, no per-client teardown races — but that was never meant to include
+ * holding a display processor open with no client behind it. The vendor DP owns
+ * the SR context and the SR context owns the eye-tracking camera, so a service
+ * that never lets go keeps the camera streaming (LED lit) from the session's
+ * first client until the process exits, and burns the 14 ms present loop doing
+ * it. Reported against the browser, but nothing here is browser-specific: the
+ * IPC unregister path decremented `client_count` and stopped, and the only
+ * unconditional DP teardown we had was `multi_compositor_destroy` — reachable
+ * from `system_destroy` alone, i.e. process shutdown.
+ *
+ * So: once the last client has been gone for the grace window, drop the DP and
+ * park the render thread. Coming back needs no resume path of its own —
+ * `multi_compositor_register_client` already restarts the thread, and the
+ * pipeline binds a DP to the incoming presenter on its first frame.
+ *
+ * Two things are deliberate:
+ *
+ * - **Synchronous destroy.** The graveyard exists for LIVE lock-free readers on
+ *   IPC threads; with zero clients there is no such thread, the same argument
+ *   `pipeline_release_panel_dp_for_hwnd` makes for a destroyed window. And the
+ *   sweep that would drain the graveyard is about to stop running, so whatever
+ *   is parked in it has to go NOW or it stays alive — camera and all, which is
+ *   the very bug being fixed. Hence the forced drain below.
+ * - **Lens vote first.** The vendor SDK ORs the 3D hint of every live context,
+ *   so a DP on its way out must stop asking before it goes (same reason
+ *   `pipeline_dp_retire` drops it immediately).
+ *
+ * Render thread, under render_mutex — the one writer of `display_processor`.
+ * Returns true when the caller must return from this frame without touching the
+ * DP again.
+ */
+static bool
+pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	if (sys == nullptr || mc == nullptr || mc->idle_quiesced) {
+		return false;
+	}
+	// `suspended` is the workspace-deactivate quiesce (Ctrl+Space) — same
+	// teardown, different trigger, and it already released the DP.
+	if (mc->suspended || mc->client_count != 0 || mc->capture_client_count != 0) {
+		mc->idle_since_ns = 0;
+		return false;
+	}
+	const int64_t grace_ns = dxr_idle_quiesce_ns();
+	if (grace_ns == 0) {
+		return false; // opted out
+	}
+
+	// Self-arming: the render thread also runs with no clients at all (started
+	// by an activate, or after the last unregister), so arm on the first idle
+	// frame rather than making every disconnect site remember to.
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	if (mc->idle_since_ns == 0) {
+		mc->idle_since_ns = now_ns;
+		return false;
+	}
+	if (now_ns - mc->idle_since_ns < grace_ns) {
+		return false;
+	}
+
+	if (mc->display_processor != nullptr) {
+		// The window's ESC/close hook runs on the WINDOW thread and takes no
+		// lock of ours — detach it before the object under it goes away.
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *dead = mc->display_processor;
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr;
+		mc->panel_dp_encoding = -1; // #1016: a fresh DP starts unknown
+		(void)DP_REQUEST_DISPLAY_MODE(dead, false);
+		xrt_display_processor_d3d11_destroy(&dead);
+	}
+	pipeline_dp_graveyard_sweep(mc, /*force*/ true);
+
+	mc->idle_quiesced = true;
+	mc->idle_since_ns = 0;
+	// Request, never join: we ARE the render thread. The loop re-reads the flag
+	// at the top of the next iteration and exits; `capture_render_thread_start`
+	// reaps the handle when a client brings us back.
+	capture_render_thread_request_stop(sys);
+	U_LOG_W("[pipeline] idle: no clients for %lld ms — panel DP released, render thread parking (#1319)",
+	        (long long)(grace_ns / 1000000LL));
+	return true;
 }
 
 /*!
@@ -13032,6 +13167,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// period has expired. Render thread, under render_mutex — the only place
 	// a panel DP is ever actually destroyed outside teardown.
 	pipeline_dp_graveyard_sweep(mc, /*force*/ false);
+
+	// #1319: nothing has been connected for the grace window — release the panel
+	// DP (and with it the vendor SR context and the tracking camera) and park
+	// this thread. Before the health poll: no point asking a DP we are dropping.
+	if (pipeline_idle_quiesce_if_due(sys, mc)) {
+		return;
+	}
 
 	// Ask the panel DP once a second whether its vendor backend is still
 	// alive, and recreate it if it says it cannot recover. Same locked

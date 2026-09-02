@@ -83,7 +83,8 @@ a `static … = -1` cache in a process that already runs continuously. Making th
 means deleting the static and reading a service-held snapshot — mechanically cheap.
 
 `DXR_COMMIT_PACE` · `DXR_FENCE_WAIT_MS` · `DXR_EVICT_IDLE_MS` · `DXR_EVICT_ENDED_MS` ·
-`DXR_DP_GRAVEYARD_MS` · `DXR_DEVICE_REMOVED_EXIT_MS` · `DXR_HEALTH_MS`.
+`DXR_DP_GRAVEYARD_MS` · `DXR_DEVICE_REMOVED_EXIT_MS` · `DXR_HEALTH_MS` ·
+`DXR_IDLE_QUIESCE_MS`.
 
 Semantic caveat: `DXR_COMMIT_PACE` changes backpressure discipline; flipping it under a
 live client is a behaviour change mid-flight, not just a number change.
@@ -443,6 +444,7 @@ drive-by.
 | `DXR_EVICT_IDLE_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:13554` | `getenv`, `static` cached | 0 | Svc | 2 | Grace before an idle client slot is evicted; stretches to 4× a capped client's own cadence |
 | `DXR_EVICT_ENDED_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:13505` | `getenv`, `static` cached | 2000 | Svc | 2 | Grace before an ended-session slot is evicted (0 disables) |
 | `DXR_DP_GRAVEYARD_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10086` | `getenv`, `static` cached | 2000 | Svc | 2 | How long a torn-down DP is kept alive to outlive an in-flight swap |
+| `DXR_IDLE_QUIESCE_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10136` | `getenv`, `static` cached | 5000 | Svc | 2 | #1319 grace after the last client leaves before the panel DP is released (freeing the vendor SR context and the tracking camera) and the render thread parks; 0 disables |
 | `DXR_DEVICE_REMOVED_EXIT_MS` | `compositor/d3d11_service/comp_d3d11_service.cpp:10279` | `getenv`, `static` cached | 2000 | Svc | 2 | Delay before the service exits on an unrecoverable `DEVICE_REMOVED` |
 | `DXR_HEALTH_MS` | `ipc/server/ipc_server_process.c:82` | `DEBUG_GET_ONCE_NUM` | 10000 | Svc | 2 | #951 `[HEALTH]` telemetry cadence; 0 disables |
 | `DXR_MAX_CLIENTS` | `ipc/server/ipc_server_process.c:87` | `DEBUG_GET_ONCE_NUM`, consumed `:541-551` | 0 = auto | Svc | 1 | #959 admitted-client cap. Read once at service start |
