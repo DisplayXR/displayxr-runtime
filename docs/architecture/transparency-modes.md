@@ -182,3 +182,38 @@ table and the smear of rule 5 is the deciding factor.
 Present-path env: `DXR_PRESENT_OPAQUE` (default off). App-side building
 blocks: displayxr-common ≥ v2.6.0 (`vk_overlay_kit.h`,
 `vk_clickthrough_region.h`, `win_window_drag.h`).
+
+### `DXR_PRESENT_OPAQUE` stays opt-in — the default-on question is ANSWERED, not open
+
+#833 landed the flag default-off and deferred the default flip "after HW soak
+(drag/phase-snap, 2D/3D transitions, VK-bridge flip eligibility)". That soak ran
+on 2026-09-02 and the answer is **no**. Do not re-open it as an oversight.
+
+The mechanism works and reproduces. Four **alternating** runs on `cube_handle_d3d12`
+(transparent session, per-process attribution, in-process) gave dwm **114.9 → 15.6
+ms/s, −86.4%**, rank-separated with the worst pairing 96.2 ms/s apart; app iGPU
+138.7 → 119.0 (−14.2%), also rank-separated; app dGPU unchanged. Alternation matters
+here because the dwm term on the reference box is a documented **per-run** coin flip
+(~0 ↔ ~150 ms/s regardless of arm, #1144) — within-arm spread was ≤4.5 against a
+between-arm gap of 99.3, so it tracked the arm, not the toggle. Cadence is a **pacing**
+result, not throughput: 60.00 with sd 0.000 versus 59.67 with sd 0.298, a mean gain of
+0.33 presents/s that is not worth quoting as speed.
+
+**It still must not ship on, because the benefit and the cost land on the same app
+class** — which is exactly the matrix at the top of this file:
+
+- **unshaped + opaque** → the whole win (Independent Flip, dwm ≈ 0) **and bakes
+  everywhere the window covers**. Maintainer verdict on the live panel: *"not good —
+  am seeing bg capture everywhere, should be only in deocclusions, rest should be
+  punch through."* That is the *Baked × Unshaped* cell behaving exactly as documented.
+- **shaped + opaque** → the correct look (live punch-through in the carved holes,
+  bake only in the blend band) but the region denies flip promotion, so it stays
+  `Composed` and buys **no dwm saving** (10.7 vs 10.2).
+
+So the class that gains the performance is the class that loses the look. On a shaped
+app the flag's value is that the opaque flip chain carries the late-weave **waitable**
+— pacing and latency, not GPU. Quote it that way.
+
+Not settled by that soak, and still open if anyone wants them: the **D3D11 service**
+path (different code from the in-process compositor tested here; the default would
+cover both), and **VK-bridge flip eligibility**.
