@@ -329,6 +329,14 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
   lock-free reader that latched the pointer cannot fault. The one exception is
   the idle quiesce below, where there is no reader left to protect and nothing
   would ever drain the graveyard again.
+- **A destroyed panel DP invalidates every belief about it.** `panel_dp_encoding`
+  and `panel_dp_client_presents` cache what the *live* DP was last told, and both
+  setters no-op when the cache matches — carried across a destroy they become lies
+  that suppress the one call which would configure the replacement. Every site that
+  drops `display_processor` calls `pipeline_dp_forget_beliefs()` (#1319); a
+  `set_window` re-point drops the transparency belief too, since a weaver that
+  rebuilds its pipelines against the new window loses them and the runtime cannot
+  see that from here.
 - **With zero clients the pipeline lets the panel go** (`pipeline_idle_quiesce_if_due`,
   #1319). After `DXR_IDLE_QUIESCE_MS` (default 5 s) with no IPC *and* no capture
   client, the render thread drops the lens vote, destroys the panel DP — which is

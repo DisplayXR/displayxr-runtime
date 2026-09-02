@@ -3292,6 +3292,16 @@ struct d3d11_multi_compositor
 	//! same-window presenter-kind change (present-owner vs opaque app).
 	bool panel_dp_client_presents;
 
+	//! #1319: whether @ref panel_dp_client_presents describes the LIVE DP. False
+	//! means "nothing is known" — no DP yet, or the instance that carried this
+	//! mode has been destroyed. It exists because the field above is a belief
+	//! about a specific DP instance and `pipeline_dp_set_transparency` no-ops
+	//! when the belief already matches: carried across a destroy, that belief is
+	//! a lie that suppresses the one call which would configure the replacement.
+	//! `panel_dp_encoding`'s -1 is the same idea for the same reason; this is the
+	//! bool's missing third state. Cleared by `pipeline_dp_forget_beliefs`.
+	bool panel_dp_client_presents_valid;
+
 	//! #1016: the atlas ENCODING the panel DP currently carries (an
 	//! xrt_atlas_encoding, -1 = never set). The DP latches encoding per
 	//! instance, and with one DP per panel there are THREE writers into it —
@@ -4249,6 +4259,38 @@ static void
 pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force);
 static bool
 pipeline_dp_graveyard_flush_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd);
+
+/*!
+ * #1319: forget everything we believe about the panel DP, because the instance
+ * those beliefs described is gone.
+ *
+ * `panel_dp_encoding` and `panel_dp_client_presents` are caches of what the LIVE
+ * DP was last told, and both setters no-op when the cache already matches — that
+ * is what keeps a per-frame path from re-issuing vendor calls. Carried across a
+ * destroy, they become lies about a DP that never received anything: the setter
+ * sees "already applied" and never configures the replacement.
+ *
+ * That cost a real regression. After the #1319 idle quiesce the next session's
+ * DP came up on the plug-in's opaque default while the cache still read
+ * `client_presents = true`, so every `pipeline_dp_set_transparency(..., true)`
+ * no-opped, the alpha-gate pipelines were never built, and a present-owner
+ * (displayxr-browser) that composes into alpha holes rendered its 2D area black.
+ * The same staleness was latent at every other destroy site — the quiesce only
+ * turned a rare path into a routine one.
+ *
+ * So: call this at EVERY site that drops `display_processor`, next to clearing
+ * the pointer. Cheap, and the alternative is remembering which of two caches
+ * matters on which path.
+ */
+static inline void
+pipeline_dp_forget_beliefs(struct d3d11_multi_compositor *mc)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	mc->panel_dp_encoding = -1;                 // #1016: a fresh DP starts unknown
+	mc->panel_dp_client_presents_valid = false; // #1319: and so does its transparency
+}
 
 static inline struct xrt_display_processor_d3d11 *
 panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
@@ -9424,6 +9466,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	if (mc->display_processor != nullptr) {
 		DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
+		pipeline_dp_forget_beliefs(mc); // #1319
 	}
 	mc->panel_dp_hwnd = nullptr;
 	mc->panel_dp_device = nullptr; // #918
@@ -9899,6 +9942,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				xrt_display_processor_d3d11_destroy(&mc->display_processor);
 				mc->panel_dp_hwnd = nullptr;
 				mc->panel_dp_device = nullptr; // #918
+				pipeline_dp_forget_beliefs(mc); // #1319
 				mc->back_buffer_rtv.reset();
 				mc->swap_chain.reset();
 				comp_d3d11_window_destroy(&mc->window);
@@ -10293,6 +10337,7 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_device = nullptr; // #918
+		pipeline_dp_forget_beliefs(mc); // #1319
 		(void)DP_REQUEST_DISPLAY_MODE(old, false);
 		xrt_display_processor_d3d11_destroy(&old);
 		U_LOG_W("[pipeline] panel DP released with its window hwnd=%p — rebinds on the next frame (#1014)",
@@ -10384,7 +10429,7 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_device = nullptr;
-		mc->panel_dp_encoding = -1; // #1016: a fresh DP starts unknown
+		pipeline_dp_forget_beliefs(mc);
 		(void)DP_REQUEST_DISPLAY_MODE(dead, false);
 		xrt_display_processor_d3d11_destroy(&dead);
 	}
@@ -10499,13 +10544,17 @@ pipeline_dp_set_transparency(struct d3d11_multi_compositor *mc,
                              bool client_presents,
                              const char *who)
 {
-	if (mc == nullptr || dp == nullptr || mc->panel_dp_client_presents == client_presents) {
+	// #1319: `valid` first. Without it a belief carried across a DP destroy
+	// suppresses the very call that would configure the replacement.
+	if (mc == nullptr || dp == nullptr ||
+	    (mc->panel_dp_client_presents_valid && mc->panel_dp_client_presents == client_presents)) {
 		return;
 	}
 	if (!xrt_display_processor_d3d11_set_transparent_background(dp, client_presents, client_presents)) {
 		return; // plug-in refused — leave the tracked state alone so we retry
 	}
 	mc->panel_dp_client_presents = client_presents;
+	mc->panel_dp_client_presents_valid = true;
 	pipeline_dp_note_state_flip(mc, "transparency", who);
 }
 
@@ -10608,7 +10657,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		HWND dead_hwnd = mc->panel_dp_hwnd;
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
-		mc->panel_dp_encoding = -1; // #1016: a fresh DP starts unknown
+		pipeline_dp_forget_beliefs(mc); // #1016 + #1319
 		ID3D11Device *dead_dev = mc->panel_dp_device;
 		mc->panel_dp_device = nullptr;
 		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev);
@@ -10659,7 +10708,7 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		mc->display_processor = nullptr;
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_device = nullptr;
-		mc->panel_dp_encoding = -1;
+		pipeline_dp_forget_beliefs(mc); // #1016 + #1319
 		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev);
 		U_LOG_W(
 		    "[pipeline] panel DP crossing devices: %p (hwnd=%p) retired, rebinding on device %p "
@@ -10674,7 +10723,11 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 		// Already bound where we want it -- but the presenter KIND may have
 		// changed on the same window (present-owner <-> opaque app): keep the
 		// DP's transparency mode in step with the presenter.
-		if (mc->panel_dp_client_presents != client_presents) {
+		// #1319: `!valid` also fires here — a DP this bind did not create (the
+		// `multi_compositor_ensure_output` repair arm builds one on the live
+		// window, unconfigured) reaches us needing the mode applied, not
+		// compared.
+		if (!mc->panel_dp_client_presents_valid || mc->panel_dp_client_presents != client_presents) {
 			pipeline_dp_set_transparency(mc, mc->display_processor, client_presents, "bind");
 			static int64_t s_last_tp_log_ns = 0;
 			const int64_t tp_now_ns = (int64_t)os_monotonic_get_ns();
@@ -10719,6 +10772,15 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	if (mc->display_processor != nullptr && mc->panel_dp_device == want_dev &&
 	    xrt_display_processor_d3d11_set_window(mc->display_processor, (void *)hwnd)) {
 		mc->panel_dp_hwnd = hwnd;
+		// #1319: the comment above says the mode is re-applied on a re-point —
+		// but `pipeline_dp_set_transparency` no-ops when the belief matches, so
+		// for an unchanged mode it was not re-applied at all. Whether that
+		// matters depends on the plug-in: a weaver that rebuilds its alpha-gate
+		// pipelines against the new window loses them, and the runtime cannot
+		// see that from here. Drop the belief so the mode is ASSERTED on the new
+		// window. Bounded by presenter changes, not frames, so it is not the
+		// per-frame chatter the no-op exists to prevent.
+		mc->panel_dp_client_presents_valid = false;
 		pipeline_dp_set_transparency(mc, mc->display_processor, client_presents, "set_window");
 		// The window's ESC/close hook follows the binding, as on the recreate path.
 		if (mc->window != nullptr) {
@@ -10801,7 +10863,11 @@ pipeline_bind_panel_dp(struct d3d11_service_system *sys,
 	mc->display_processor = fresh;
 	mc->panel_dp_hwnd = hwnd;
 	mc->panel_dp_device = want_dev; // #918: the other half of the bind key
+	// This bind DID configure `fresh` (alpha-gate applied just above when
+	// client_presents; otherwise the plug-in's opaque default IS what we want),
+	// so the belief is true of the live instance — #1319's `valid` flag included.
 	mc->panel_dp_client_presents = client_presents;
+	mc->panel_dp_client_presents_valid = true;
 	// #1016: a fresh DP starts on the plug-in's ENCODED default and no writer
 	// has touched it yet — record "unknown" so the first process_atlas site
 	// asserts its own encoding rather than trusting that default.
@@ -13114,6 +13180,7 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_device = nullptr; // #918
+		pipeline_dp_forget_beliefs(mc); // #1319
 	}
 	mc->back_buffer_rtv.reset();
 	mc->combined_atlas_rtv.reset();
@@ -13325,6 +13392,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// Release shared DP (per-client DPs now handle display)
 			if (mc->display_processor != nullptr) {
 				xrt_display_processor_d3d11_destroy(&mc->display_processor);
+				pipeline_dp_forget_beliefs(mc); // #1319
 			}
 
 			U_LOG_W("Multi-comp: workspace dismissed — captures restored, IPC clients hot-switched");
@@ -26973,6 +27041,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		// Tear down window and GPU resources (same order as multi_compositor_destroy)
 		if (mc->display_processor != nullptr) {
 			xrt_display_processor_d3d11_destroy(&mc->display_processor);
+			pipeline_dp_forget_beliefs(mc); // #1319
 		}
 		mc->back_buffer_rtv.reset();
 		mc->combined_atlas_rtv.reset();
@@ -27205,6 +27274,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		if (mc->display_processor != nullptr) {
 			DP_REQUEST_DISPLAY_MODE(mc->display_processor, false);
 			xrt_display_processor_d3d11_destroy(&mc->display_processor);
+			pipeline_dp_forget_beliefs(mc); // #1319
 		}
 
 		hide_hwnd = mc->hwnd;
