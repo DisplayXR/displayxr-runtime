@@ -21814,7 +21814,10 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	 * and can take seconds, which under `render_mutex` would stall every other
 	 * client behind one connecting browser (#925).
 	 *
-	 * No-op for every eligible client and every split-off session.
+	 * No-op for every split-ELIGIBLE client (it weaves via the composed atlas,
+	 * not its own DP). Since #939 it is NOT a no-op for a split-off present-owner
+	 * — dropping the split_active gate is the point of the PR — so this builds
+	 * the ingest DP on every box, not only when the split is active.
 	 */
 	svc_ensure_client_weave_dp(sys, c);
 
