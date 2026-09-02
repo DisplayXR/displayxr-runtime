@@ -4314,12 +4314,14 @@ panel_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
  * `DXR_TEST_FAKE_DEVICE_REMOVED` / `DXR_TEST_FAKE_DP_REFUSE`: opt-in, read once,
  * announced on the first read so a log can never look like a real session.
  *
- *   1 — force an ineligible presenter onto its OWN ingest-device DP even with
- *       the split OFF. The whole fix path runs: create, bind to the client's own
- *       window, weave through it, mask through it, destroy on disconnect.
+ *   1 — NO-OP since #939. It used to force an ineligible presenter onto its OWN
+ *       ingest-device DP with the split OFF; that IS the unconditional behaviour
+ *       now (@ref svc_client_wants_ingest_dp), so there is nothing left to force.
+ *       Still accepted so an old recipe does not fail, and still announced.
  *   2 — force that DP's creation to FAIL, so the REFUSAL guard is what runs.
  *       Proves the guard degrades (named WARN, weave skipped) instead of handing
- *       the vendor a foreign-device SRV.
+ *       the vendor a foreign-device SRV. This arm is live and is why the whole
+ *       knob survives #939.
  *
  * Pairs with `test_apps/probes/weave_rpc_probe_d3d11_win` — the in-tree,
  * browser-free present-owner. See the file header there.
@@ -4336,22 +4338,37 @@ dxr_test_weave_ingest_dp_arm(void)
 	if (e != nullptr && e[0] >= '1' && e[0] <= '2' && e[1] == '\0') {
 		arm = e[0] - '0';
 		U_LOG_W("DXR_TEST_FORCE_WEAVE_INGEST_DP=%d: %s (test)", arm,
-		        arm == 1 ? "forcing an ineligible client's weave onto its own INGEST-device DP"
+		        arm == 1 ? "NO-OP since #939 — an ineligible client's weave ALWAYS runs on its own "
+		                   "INGEST-device DP, so there is nothing left to force"
 		                 : "forcing that DP's creation to FAIL, to exercise the refusal guard");
 	}
 	return arm;
 }
 
 /*!
- * #1172 — does @p c's weave belong on a display processor of its OWN?
+ * #1172/#939 — does @p c's weave belong on a display processor of its OWN?
  *
- * TRUE exactly when the panel DP is not guaranteed to be on the device this
- * client's pixels live on: the split is engaged (so the panel DP follows the
- * presenter across the eligibility boundary) and THIS client is one of the
- * structurally ineligible kinds, whose atlas, shared input and handback are all
- * on `sys->device`. Note this is deliberately NOT "is this client the current
- * presenter" — the whole bug was that the answer changed with focus while the
- * client kept weaving.
+ * TRUE for every structurally split-INELIGIBLE client: a present-owner
+ * (`PRESENTER_SELF`) or an ADR-029 client-texture client, whose atlas, shared
+ * input and handback all live on `sys->device` and whose pixels reach the panel
+ * through a surface it owns rather than through the composed atlas.
+ *
+ * THE INVARIANT (#939): such a client NEVER touches the shared panel DP; it
+ * always weaves on a DP of its own on the ingest device. The panel DP therefore
+ * keeps exactly ONE writer — the pipeline, on behalf of the current holder.
+ * Two writers asserting transparency and encoding on one DP every frame is what
+ * produced the observed `DP state thrash` (up to 28 flips/s, 3D gone entirely);
+ * it is not arbitrable frame-by-frame, so the second writer is removed instead.
+ *
+ * This used to be gated on `sys->split_active`, which made the invariant true
+ * only on hybrid boxes: at `split=0` the client fell back to the shared panel DP
+ * and became that second writer. The split is an ADAPTER question — it says
+ * nothing about how many writers one DP should have — so it was never the right
+ * predicate. It survives as the *reason the bug was invisible*, not as a gate.
+ *
+ * Note this is deliberately still NOT "is this client the current presenter" —
+ * the #1172 bug was that the answer changed with focus while the client kept
+ * weaving. The answer must be a property of the client, not of who has focus.
  *
  * Legacy standalone is excluded because it already gives every client its own
  * DP on `sys->device` (and the split is refused there anyway, D-7).
@@ -4365,7 +4382,7 @@ svc_client_wants_ingest_dp(struct d3d11_service_system *sys, struct d3d11_servic
 	if (svc_kind_eligible_for_split(c->presenter)) {
 		return false;
 	}
-	return sys->split_active || dxr_test_weave_ingest_dp_arm() > 0;
+	return true;
 }
 
 /*!
@@ -6690,10 +6707,29 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 	// Create display processor via factory (set by the target builder at init time).
 	// Phase 6.1 (#140): skip per-client DP creation when workspace mode is active.
-	// The multi-compositor already owns a shared DP for the combined atlas;
-	// creating a SECOND DP instance causes the SR SDK to recalibrate its
-	// weaver, producing a multi-second stretched-left-eye artifact. The
+	// The multi-compositor already owns a shared DP for the combined atlas; the
 	// per-client DP is only needed for standalone (non-workspace) rendering.
+	//
+	// #140 ("left eye stretched to fullscreen during eye-tracking warmup after
+	// activation") had TWO prongs, and only the first is settled:
+	//
+	//   (a) Do not call `request_display_mode(true)` at DP creation — THAT is the
+	//       SR recalibration cycle. Honoured here (see the note further down) and
+	//       honoured by the client weave DP, which is factory-only and casts no
+	//       lens vote (`svc_ensure_client_weave_dp`).
+	//   (b) Do not create a SECOND DP instance while the workspace holds one.
+	//       This was the claim attached to this skip. #1172 has shipped exactly
+	//       that on hybrid boxes since — a client weave DP alongside the panel DP,
+	//       in workspace mode — with no artifact reported, and #939 removes
+	//       `split_active` as the gate so it now happens on every box. Prong (b)
+	//       is therefore believed to have been a misattribution of (a), PENDING
+	//       the hardware check described in #939's PR: a human eyeball at
+	//       `split=0`, workspace active, through the eye-tracking warmup window
+	//       after activate, with a face in front of the camera. Counters cannot
+	//       see a stretched left eye.
+	//
+	// The reference stays: if the artifact returns, prong (b) is real and the
+	// second writer becomes an arbitration problem rather than one to remove.
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 	if (dp_fac != NULL && !sys->workspace_mode) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_fac;
