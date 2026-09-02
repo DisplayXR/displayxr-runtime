@@ -26912,9 +26912,12 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			capture_render_thread_start(sys);
 		}
 
-		// Get every app-owned window out of the way — under a controller the
-		// app's pixels reach the panel through the composed atlas, not its own
-		// HWND. MINIMIZE, not hide (#964 Phase A): a hidden window is gone from
+		// Get every COMPOSED app-owned window out of the way — for a client the
+		// controller composites, the app's pixels reach the panel through the
+		// composed atlas, not its own HWND, so its window is redundant on the
+		// desktop. That is NOT true of every client (see the present-owner skip
+		// below), so this is a per-slot decision, not a blanket sweep.
+		// MINIMIZE, not hide (#964 Phase A): a hidden window is gone from
 		// the taskbar and Alt-Tab, so the user could not get back to an app
 		// without killing the shell. Minimized it stays reachable, and
 		// Alt-Tabbing to it restores it -> foreground -> foreground override.
@@ -26922,6 +26925,19 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 			struct d3d11_multi_client_slot *slot = &pmc->clients[i];
 			if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
+				continue;
+			}
+			// #1323: a weave present-owner (the browser) is NOT a workspace
+			// window — the enroller above skips it for exactly that reason —
+			// and it presents its own pixels into this HWND, so minimising it
+			// is minimising the only thing that draws it. Leave it on the
+			// desktop; focus-follows-foreground decides who holds the panel.
+			// Keep this predicate identical to enrol_standalone_clients_locked's.
+			if (slot->compositor != nullptr && slot->compositor->render.weave_hwnd != nullptr) {
+				U_LOG_W(
+				    "[pipeline] activate: slot %d is a present-owner (weave hwnd=%p) — left on the "
+				    "desktop, not a workspace window (#1323)",
+				    i, (void *)slot->compositor->render.weave_hwnd);
 				continue;
 			}
 			// #1014: a hosted client's window is runtime-owned, so it is on
@@ -26933,6 +26949,13 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			}
 			if (park != nullptr && IsWindow(park)) {
 				ShowWindowAsync(park, SW_MINIMIZE);
+				// #1323: this sweep used to log nothing, which cost an
+				// afternoon of misattribution to pipeline_park_app_hwnd().
+				// Activate-time only — never a per-frame line.
+				U_LOG_W(
+				    "[pipeline] activate: minimised slot %d's window %p (composed client; its pixels "
+				    "reach the panel via the atlas)",
+				    i, (void *)park);
 			}
 		}
 
