@@ -855,6 +855,12 @@ struct d3d11_service_compositor
 	std::atomic<int64_t> client_texture_last_skip_ns{0};
 	std::atomic<int64_t> client_texture_last_ok_ns{0};
 
+	//! #939: one-shot, per CLIENT — this client wanted an ingest DP of its own,
+	//! did not get one, and a workspace is up, so its weave is SKIPPED rather
+	//! than fall back to the shared panel DP. Once, not per frame: the condition
+	//! is sticky (`weave_dp_refused`) and the frames are 60+/s.
+	std::atomic<bool> weave_dp_missing_logged{false};
+
 	//! #964: pacing state for this client's presenter when it is an APP_HWND —
 	//! a foreign, frequently occluded window the render thread must never
 	//! block on. `last_flat_present_ns` rate-limits the unfocused flat-2D
@@ -21829,10 +21835,40 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// stays for the legacy path, where a per-client DP may or may not exist.
 	// ONE load into a local, used for this whole bounded call sequence.
 	//
-	// #1172: except under an active split, where this client owns an
-	// ingest-device DP and `svc_client_weave_dp` returns THAT — see above.
+	// #1172/#939: except that this client owns an ingest-device DP and
+	// `svc_client_weave_dp` returns THAT — see above.
 	struct xrt_display_processor_d3d11 *dp = svc_client_weave_dp(sys, c);
 	const bool dp_is_own = (dp != nullptr && dp == c->render.weave_dp);
+
+	/*
+	 * #939 — UNDER A WORKSPACE THE SHARED PANEL DP IS NOT A VALID FALLBACK.
+	 *
+	 * `svc_client_weave_dp`'s tail returns `panel_dp()` when this client has no
+	 * DP of its own. That is harmless with no controller up (one writer either
+	 * way), but under a workspace the pipeline is ALSO writing that DP's
+	 * transparency and encoding every compose tick, and the two of us then flip
+	 * it against each other every frame — the measured `DP state thrash`. So
+	 * when this client WANTED a DP of its own and did not get one (the factory
+	 * refused, `DXR_TEST_FORCE_WEAVE_INGEST_DP=2`, or the window is not bindable
+	 * yet), skip the weave for this frame instead of re-introducing the second
+	 * writer. Same degrade shape as the #1172 device tripwire below: return
+	 * false, allocate nothing, signal nothing — the client keeps its last
+	 * presented frame and the next submit retries once its DP exists.
+	 */
+	if (sys->workspace_mode && !dp_is_own && svc_client_wants_ingest_dp(sys, c)) {
+		bool expected = false;
+		if (c->weave_dp_missing_logged.compare_exchange_strong(expected, true)) {
+			U_LOG_W(
+			    "#939 weave_submit: '%s' has no display processor of its own (refused=%d hwnd=%p) and a "
+			    "workspace is active — WEAVE SKIPPED. The shared panel DP is not a valid fallback here: "
+			    "the pipeline writes it too, and two writers thrash its transparency/encoding every "
+			    "frame. Its window keeps its last frame; retries once its own DP exists (once/client)",
+			    c->slot_app_name, (int)c->render.weave_dp_refused,
+			    (void *)(c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd));
+		}
+		return false;
+	}
+
 	bool dp_is_shared = !dp_is_own && pipeline_always_on(sys) && dp != nullptr;
 	if (dp == nullptr && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
