@@ -3969,6 +3969,22 @@ oxr_session_create(struct oxr_logger *log,
 				}
 			}
 		}
+	} else {
+		// #833: no window binding at all — a HOSTED session, where the runtime
+		// self-creates the window. `transparent_background_enabled` is reachable
+		// ONLY from this chain, so a hosted session is opaque by construction and
+		// there is no way for the app to ask otherwise.
+		//
+		// Say so, because the failure is otherwise SILENT: an app that sets
+		// DISPLAYXR_TRANSPARENT_BG (or submits ALPHA_BLEND) gets an opaque session
+		// with no diagnostic, and an A/B run that way produces two identical arms
+		// that read as "the transparency flag does nothing" when in fact it was
+		// never armed in either arm. A void result wearing the costume of a null
+		// one. One line at create is cheap; the confusion it prevents is not.
+		U_LOG_W(
+		    "xrCreateSession: no XR_DXR_win32_window_binding — hosted session, runtime-created "
+		    "window. Transparent background is UNAVAILABLE here (compose-under-bg needs an "
+		    "app-supplied HWND); DISPLAYXR_TRANSPARENT_BG / ALPHA_BLEND will have no effect.");
 	}
 #endif
 
