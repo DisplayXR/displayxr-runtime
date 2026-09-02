@@ -43,9 +43,17 @@
  * `[pipeline] this client weaves on its OWN display processor on the RENDER
  * device (split=0 reason=weave_on_ingest ...)` plus
  * `NOT binding the panel DP to it (one weaver per HWND; #1172)` — and the probe
- * must keep weaving. With `=2` the weave must be SKIPPED with the `[weave_dev]`
- * WARN rather than run on the panel DP. Closing the probe must destroy only its
- * own DP: the panel keeps its mode and the split does not change.
+ * must keep weaving. With `=2` the refusal fires and `svc_client_weave_dp` falls
+ * back to the panel DP — whether the weave is then SKIPPED depends on the split:
+ *   split=1  the panel DP is on the SCANOUT device, the `[weave_dev]` tripwire
+ *            refuses the cross-adapter use, and the weave is skipped with the WARN.
+ *   split=0  the panel DP is on the SAME device, the tripwire correctly passes,
+ *            and the weave runs on the panel DP — harmlessly, and with no WARN.
+ * So `=2` only exercises the refusal guard on a hybrid box with the split
+ * engaged; on a single-adapter box it proves only that the fallback is safe.
+ * (Verified 2026-09-02 at split=0: refusal logged, 7 weave summaries followed.)
+ * Closing the probe must destroy only its own DP: the panel keeps its mode and
+ * the split does not change.
  *
  * ── Spec v8 per-region hardware wish (browser#88) ────────────────────────────
  *

@@ -389,6 +389,31 @@ provider.
 
 ---
 
+## Sampling a client window's Win32 state — key on the HWND the runtime names
+
+When diagnosing "the app went dark / stopped weaving" with `IsWindowVisible`,
+`IsIconic`, `GetWindowRect` or `DwmGetWindowAttribute`, sample the **HWND the
+service log prints** (`hwnd=…` on the `presenter=` / `weave_bind_window` /
+`init_client_render_resources` lines), not the process's `MainWindowHandle`.
+Chromium and other multi-window apps have several top-level windows, and
+`MainWindowHandle` returns whichever one Windows considers "main" — on one box
+that was a normal, visible window while the runtime's presenter window
+(`0x72041A`) was minimised. Reading `IsIconic = FALSE` off the wrong window
+sent an investigation looking for a nonexistent move-and-resize (#1323).
+
+Two related traps:
+- A minimised window reports its rect as roughly `(-32000,-32000)`, 160×28
+  physical. From a DPI-unaware PowerShell on a 250 %-scaled box that reads as
+  `(-12800,-12800)`, 156×24. That is the standard minimised rect, not an
+  off-screen park — check `GetWindowPlacement().showCmd == 2` before
+  concluding anything from geometry.
+- The compositor screenshot trigger (`%TEMP%\workspace_screenshot_trigger`) is
+  read in `multi_compositor_render()` before `Present()`. If the pipeline is
+  not presenting — which is exactly the state you are usually diagnosing — it
+  produces **no file at all**. Fall back to a desktop `CopyFromScreen`, and
+  treat "no screenshot appeared" as a datum (the pipeline is idle), not as a
+  capture failure.
+
 ## Still stuck?
 
 Grab a bug-report dump and open an issue on the
