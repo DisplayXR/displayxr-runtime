@@ -98,10 +98,13 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t requested_ring_slices,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
+                                        uint32_t *out_array_slice,
+                                        uint32_t *out_slice_count,
                                         struct xrt_eye_positions *out_eyes);
 
 xrt_result_t
@@ -111,6 +114,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            uint32_t slice_index,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -399,9 +403,35 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		layout.content_view_h = lay->contentViewHeight;
 	}
 
+	/*
+	 * #625 spec v10: the caller opts into the weaved-output RING by chaining
+	 * XrWeaveRingRequestDXR. Presence is the opt-in — absence keeps the pre-v10
+	 * single-buffer shape byte for byte, which is what every shipped consumer
+	 * still expects.
+	 *
+	 * Why an opt-in at all: with one buffer the runtime overwrites the frame the
+	 * caller is reading, every frame (the weave for v+1 is performed inside this
+	 * very call, and the caller then reads a value it was told about earlier). But
+	 * turning the output into a Texture2DArray unilaterally would make every
+	 * existing caller read subresource 0 forever and show a frame `sliceCount`
+	 * submits old, so the shape change has to be negotiated.
+	 */
+	uint32_t requested_ring = 0;
+	for (const XrBaseInStructure *e = (const XrBaseInStructure *)submitInfo->next; e != NULL; e = e->next) {
+		if (e->type == XR_TYPE_WEAVE_RING_REQUEST_DXR) {
+			const XrWeaveRingRequestDXR *rr = (const XrWeaveRingRequestDXR *)e;
+			// 0 means "runtime picks"; anything non-zero is a hint the service
+			// clamps. Either way a chained struct = opted in, so floor it at 1
+			// so the request survives as non-zero on the wire.
+			requested_ring = rr->requestedSliceCount > 0 ? rr->requestedSliceCount : 1u;
+			break;
+		}
+	}
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
+	uint32_t array_slice = 0, slice_count = 1;
 	struct xrt_eye_positions eyes = {0};
 	xrt_result_t xret = comp_ipc_client_compositor_weave_submit(
 	    &sess->xcn->base, (xrt_graphics_buffer_handle_t)submitInfo->inputTexture,
@@ -410,13 +440,46 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 	    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 	    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-	    &have_out, &w, &h, &fence_value, &eyes);
+	    requested_ring, &have_out, &w, &h, &fence_value, &array_slice, &slice_count, &eyes);
 	// XRT_ERROR_WEAVE_REFUSED (the service said "not this frame") lands on the
 	// non-fatal branch; only a dead pipe loses the session. See the file header.
 	OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave failed (xrt_result=%d)", (int)xret);
 
 	// Per-frame scalars are always valid; the shared HANDLEs are handed back
 	// only on the first submit and on re-allocation (resize → dims change).
+	/*
+	 * #625 spec v10: tell the caller which of the N outputs this frame landed in.
+	 *
+	 * Filled even without the ring opt-in (0 of 1, mirroring `weavedTexture`), so a
+	 * caller can read it unconditionally and a runtime that never rings still gives
+	 * a truthful answer.
+	 *
+	 * The count is CLAMPED to the extension array's length. The service's own cap
+	 * is a separate constant on the far side of an IPC boundary that carries no
+	 * OpenXR headers, so clamping here is what makes a drift between the two
+	 * impossible to turn into a truncated handback — the caller is simply told
+	 * about fewer outputs than exist, never handed a short array it believes is
+	 * full.
+	 */
+	XrWeaveOutputSliceDXR *out_slice = NULL;
+	for (XrBaseOutStructure *e = (XrBaseOutStructure *)output->next; e != NULL; e = e->next) {
+		if (e->type == XR_TYPE_WEAVE_OUTPUT_SLICE_DXR) {
+			out_slice = (XrWeaveOutputSliceDXR *)e;
+			break;
+		}
+	}
+	if (out_slice != NULL) {
+		uint32_t n = slice_count > 0 ? slice_count : 1u;
+		if (n > XR_WEAVE_MAX_OUTPUTS_DXR) {
+			n = XR_WEAVE_MAX_OUTPUTS_DXR;
+		}
+		out_slice->outputCount = n;
+		out_slice->outputIndex = array_slice < n ? array_slice : 0u;
+		for (uint32_t i = 0; i < XR_WEAVE_MAX_OUTPUTS_DXR; i++) {
+			out_slice->outputTextures[i] = NULL;
+		}
+	}
+
 	output->weavedTexture = NULL;
 	output->width = w;
 	output->height = h;
@@ -439,15 +502,41 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
 	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
 
-	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
+	// #625 spec v10: a ring-depth change reallocates the output WITHOUT changing
+	// its dimensions, so slice_count is part of "are my handles still valid".
+	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h ||
+	                   slice_count != sess->weave.last_slice_count;
 	if (have_out && w != 0 && h != 0 && need_export) {
 		bool have_tex = false;
 		uint32_t gw = 0, gh = 0;
 		xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-		if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h) ==
+		if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, 0, &have_tex, &gw, &gh, &tex_h) ==
 		        XRT_SUCCESS &&
 		    have_tex && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
 			output->weavedTexture = (void *)tex_h;
+		}
+
+		/*
+		 * v10: the caller must import EVERY output, not just the one this frame
+		 * used — it will be pointed at the others on later frames, and the
+		 * handles are only handed back on this same first-export / re-allocation
+		 * occasion. Output 0 is the one `weavedTexture` already carries, so it is
+		 * reused rather than exported twice (two handles to one texture would
+		 * both have to be closed, and a caller that closes one and imports the
+		 * other has a use-after-close waiting for it).
+		 */
+		if (out_slice != NULL && out_slice->outputCount > 0) {
+			out_slice->outputTextures[0] = output->weavedTexture;
+			for (uint32_t i = 1; i < out_slice->outputCount; i++) {
+				bool have_i = false;
+				uint32_t iw = 0, ih = 0;
+				xrt_graphics_buffer_handle_t ih_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+				if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, i, &have_i, &iw,
+				                                                &ih, &ih_h) == XRT_SUCCESS &&
+				    have_i && ih_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+					out_slice->outputTextures[i] = (void *)ih_h;
+				}
+			}
 		}
 
 		bool have_fence = false;
@@ -464,6 +553,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		sess->weave.exported = true;
 		sess->weave.last_w = w;
 		sess->weave.last_h = h;
+		sess->weave.last_slice_count = slice_count;
 	}
 
 	return XR_SUCCESS;

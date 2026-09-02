@@ -892,6 +892,16 @@ struct ipc_arg_weave_submit
 	//! xrCreateInstance, so a mismatched pair never connects in the first place.
 	uint32_t flat_rect_count; //!< 0..IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX (0 = no flat regions)
 	struct ipc_weave_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX]; //!< first flat_rect_count valid
+
+	//! XR_DXR_weave v10 (#625): requested depth of the weaved-output RING
+	//! (XrWeaveRingRequestDXR). 0 = caller did not opt in, so the runtime keeps
+	//! the single shared output it has always had. Non-zero = the caller
+	//! understands that `weavedTexture` is a Texture2DArray and will read the
+	//! slice reported back per submit. Latched service-side, clamped there too.
+	//!
+	//! Appended at the end, same discipline as v8 above: 828 B before v10 + 4 =
+	//! 832 of the 1024 B message.
+	uint32_t ring_slices;
 };
 
 /*!

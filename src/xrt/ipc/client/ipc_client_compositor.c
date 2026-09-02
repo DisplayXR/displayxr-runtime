@@ -555,10 +555,13 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        uint32_t requested_ring_slices,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
+                                        uint32_t *out_array_slice,
+                                        uint32_t *out_slice_count,
                                         struct xrt_eye_positions *out_eyes)
 {
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
@@ -578,6 +581,12 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_width = 0;
 	*out_height = 0;
 	*out_fence_value = 0;
+	if (out_array_slice != NULL) {
+		*out_array_slice = 0;
+	}
+	if (out_slice_count != NULL) {
+		*out_slice_count = 1;
+	}
 	U_ZERO(out_eyes);
 
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
@@ -586,6 +595,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	}
 
 	struct ipc_arg_weave_submit args = {0};
+	// #625 spec v10: 0 = caller did not opt into the output ring; the service
+	// keeps its single shared output and reports slice 0 of 1.
+	args.ring_slices = requested_ring_slices;
 	args.rect_x = rect_x;
 	args.rect_y = rect_y;
 	args.rect_w = rect_w;
@@ -658,11 +670,12 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	bool have = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
+	uint32_t slice = 0, slices = 1;
 	struct xrt_eye_positions eyes = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handles, it does not consume them.
 	xrt_result_t xret =
-	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes);
+	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &slice, &slices, &eyes);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -670,6 +683,12 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	if (out_array_slice != NULL) {
+		*out_array_slice = slice;
+	}
+	if (out_slice_count != NULL) {
+		*out_slice_count = slices > 0 ? slices : 1;
+	}
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
 }
@@ -709,6 +728,7 @@ comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
+                                            uint32_t slice_index,
                                             bool *out_have_output,
                                             uint32_t *out_width,
                                             uint32_t *out_height,
@@ -731,7 +751,7 @@ comp_ipc_client_compositor_weave_get_output(struct xrt_compositor *xc,
 	bool have = false;
 	uint32_t w = 0, h = 0;
 	xrt_graphics_buffer_handle_t handle = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, &have, &w, &h, &handle, 1);
+	xrt_result_t xret = ipc_call_weave_get_output(icc->ipc_c, slice_index, &have, &w, &h, &handle, 1);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}

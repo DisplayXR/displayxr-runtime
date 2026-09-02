@@ -738,12 +738,17 @@
 			{"name": "width", "type": "uint32_t"},
 			{"name": "height", "type": "uint32_t"},
 			{"name": "fence_value", "type": "uint64_t"},
+			{"name": "array_slice", "type": "uint32_t"},
+			{"name": "slice_count", "type": "uint32_t"},
 			{"name": "eyes", "type": "struct xrt_eye_positions"}
 		],
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},
 
 	"weave_get_output": {
+		"in": [
+			{"name": "slice_index", "type": "uint32_t"}
+		],
 		"out": [
 			{"name": "have_output", "type": "bool"},
 			{"name": "width", "type": "uint32_t"},

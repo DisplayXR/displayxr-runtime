@@ -6251,12 +6251,19 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_width,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
+                        uint32_t *out_array_slice,
+                        uint32_t *out_slice_count,
                         struct xrt_eye_positions *out_eyes,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
+	// #625 spec v10 defaults: no ring. The D3D11 branch below overwrites these
+	// when the caller opted in; the multi/Metal branch keeps them, which is the
+	// correct report for a path that still weaves into one buffer.
+	*out_array_slice = 0;
+	*out_slice_count = 1;
 	*out_have_output = false;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
@@ -6352,6 +6359,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
+	uint32_t slice = 0, slices = 1;
 	struct xrt_eye_positions eyes = {0};
 	bool ok = comp_d3d11_service_weave_submit(                  //
 	    ics->xc, in_handle, in_is_dxgi,                         //
@@ -6363,7 +6371,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	    layout.view_count > 0 ? &layout : NULL,                 //
 	    args->flat_rect_count,                                  //
 	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
-	    &w, &h, &fv, &eyes);
+	    args->ring_slices,                                       //
+	    &w, &h, &fv, &slice, &slices, &eyes);
 	if (!ok) {
 		// TRANSIENT, and the distinction is load-bearing (browser#103): the
 		// commonest `false` here is the 4 ms input AcquireSync timeout — the
@@ -6376,6 +6385,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	*out_array_slice = slice;
+	*out_slice_count = slices;
 	*out_eyes = eyes;
 	return XRT_SUCCESS;
 #elif defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
@@ -6481,6 +6492,7 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 
 xrt_result_t
 ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
+                            uint32_t slice_index,
                             bool *out_have_output,
                             uint32_t *out_width,
                             uint32_t *out_height,
@@ -6506,7 +6518,7 @@ ipc_handle_weave_get_output(volatile struct ipc_client_state *ics,
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 	uint32_t w = 0, ht = 0;
-	if (comp_d3d11_service_weave_export_output(ics->xc, &h, &w, &ht)) {
+	if (comp_d3d11_service_weave_export_output(ics->xc, slice_index, &h, &w, &ht)) {
 		out_handles[0] = h;
 		*out_handle_count = 1;
 		*out_have_output = true;
