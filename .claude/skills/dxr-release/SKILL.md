@@ -73,22 +73,38 @@ Four consequences for this skill:
 - **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
   `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
   manual `workflow_dispatch` build lanes and never fire on a tag.
-- **TRANSITIONAL (2026-09-03): the tag-triggered run currently FAILS at *Resolve the
-  build runs for this commit*, and that is not your release breaking.** That step matches
-  a successful `build-box*.yml` run whose `headSha` equals the tagged commit — but
-  `headSha` is *where the workflow ran*, not *what it built*, and the build lanes take
-  their source as a `patch_ref` **input**. So the tagged commit normally carries no
-  matching build. Verified on `preview-0.1.25`: the tag run failed, zero successful runs
-  sat at the tagged commit on either lane, and the release shipped correctly from a
-  `workflow_dispatch` with explicit run ids. **Recovery, and the documented escape
-  hatch:** re-run the publish yourself and watch that run instead —
+- **THE TAG TRIGGER WORKS, BUT ONLY IF A BUILD RAN AT THE COMMIT YOU TAG. Arrange that
+  before you tag.** The publish resolves which build to ship by matching a successful
+  `build-box*.yml` run against the tagged commit, and the build lanes take their source
+  as a `patch_ref` **input** — so a build dispatched `--ref main` with
+  `patch_ref=<something else>` does **not** match, on purpose. The release procedure is
+  therefore: dispatch BOTH lanes with `--ref` at the commit you are about to tag, let
+  them finish, then tag. Proven on `preview-0.1.26`: both lanes dispatched at
+  `60382687b3ab`, the tag run then resolved `android=headsha windows=headsha` with no
+  fallback and no manual dispatch. Skip that ordering and you get the `preview-0.1.25`
+  outcome — the tag run fails at *Resolve the build runs for this commit* and you publish
+  by hand:
   `gh workflow run publish-browser-releases.yml -R "$REPO" --ref main -f tag="$NEW_TAG"
-  -f android_run_id=<id> -f windows_run_id=<id>`, taking the ids from the build runs you
-  actually mean. **Do not "fix" this by matching the newest build by recency** — that
-  re-introduces the wrong-source release this whole lane was built to prevent. The real
-  fix is in flight: the build stamps its resolved source sha into the artifact and the
-  publish asserts it against the tag, after which the tag trigger is correct again and
-  this note should be deleted rather than worked around.
+  -f android_run_id=<id> -f windows_run_id=<id>`.
+  **Never "fix" a non-matching tag by pointing the resolver at the newest build** — the
+  artifact now carries a provenance stamp the publish asserts against the tag, and an
+  unstamped artifact chosen by recency is refused precisely because nothing ties it to
+  the tag.
+- **THE UPDATE FEED IS NOT UPDATED BY THIS FLOW — a green release is NOT a shipped
+  release.** `feed/feed.json` in the **public** repo is published to
+  `https://updates.displayxr.org`, and that URL is compiled into every browser already
+  installed. Only the older `pipeline.yml` promote path writes it;
+  `publish-browser-releases.yml` does not. So a release cut through this skill is
+  invisible to every existing user until the feed moves. This is not hypothetical: as of
+  2026-09-04 the feed still advertises `0.1.23` (last commit 2026-08-28) while `0.1.24`,
+  `0.1.25` and `0.1.26` have all shipped. **Do not report a browser release as complete
+  on the strength of the GitHub release alone** — check the feed and say plainly if it is
+  stale:
+  ```bash
+  FEED=$(curl -s https://updates.displayxr.org/feed.json | jq -r '.latest.version')
+  echo "update feed advertises $FEED; this release is ${NEW_TAG#preview-}"
+  [ "$FEED" = "${NEW_TAG#preview-}" ] || echo "FEED IS STALE — existing installs will NOT be offered this release."
+  ```
 - **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
   "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
   it is just signed one step earlier than every other component. Its Windows
@@ -818,6 +834,11 @@ rm -rf "$WORK"
 ---
 
 ## PHASE 6: REPORT
+
+**browser — the report must state the update-feed status.** "Published successfully" is
+false-in-effect for the browser if the feed did not move: the GitHub release exists and
+no existing install will ever be offered it. Include the feed line from the "Browser is
+special" check above, and if it is stale say so in the summary rather than in a footnote.
 
 ```
 Release $NEW_TAG published successfully!
