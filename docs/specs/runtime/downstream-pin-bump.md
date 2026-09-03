@@ -133,11 +133,16 @@ stale.
 **Record where to look, never the version numbers.** The manifest holds file
 paths; the numbers are re-read from the consumer's own headers every run, so
 the manifest cannot drift from them the way the NSIS literal did. The one
-exception is `displayxr-browser`, which vendors no header *file* — it is a
+exception is the browser, which vendors no header *file* — it is a
 patch series, so `XR_DXR_weave.h` exists only after the patches apply. Its
 number is written down, and the audit cross-checks it against prose in
 `patches/README.md` (`requires_anchor`), emitting a note when it cannot
-confirm it.
+confirm it. Since the 2026-09 repo split its key is **`displayxr-browser-pvt`**:
+the audit reads the patch series and the NSIS floor, and both live in the private
+source repo (the public `displayxr-browser` keeps only releases and assets). That
+read needs the publish-bot App token `drift-audit.yml` already mints for
+`displayxr-shell-pvt`; on the default `GITHUB_TOKEN` the consumer reads as
+unfetchable and is reported, not silently skipped.
 
 Two consequences worth knowing:
 
