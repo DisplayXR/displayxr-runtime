@@ -244,7 +244,8 @@ spec: `docs/specs/runtime/release-signing.md`.
 | `displayxr-leia-plugin` | Public | Leia SR DP plug-in source + `DisplayXRLeiaSRSetup-*.exe`. |
 | `displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo. |
 | `displayxr-demo-*` | Public | Standalone demos (independent evolution; no source-mirror). |
-| `displayxr-browser` | Public | Chromium fork that weaves glasses-free inline 3D (`XR_DXR_weave`). Windows + Android. Releases are `preview-*` pre-releases from its own `pipeline.yml`, **not** `/dxr-release`; pinned in `versions.json` as `browser`. |
+| `displayxr-browser-pvt` | Private | Chromium fork source that weaves glasses-free inline 3D (`XR_DXR_weave`): patch series, build lanes (`build-box*.yml`, `pipeline.yml`), scripts, internal docs, Android keystore. Windows + Android. Dev issues here. Mirrors the shell split (`displayxr-shell-pvt` → `displayxr-shell-releases`). |
+| `displayxr-browser` | Public | **Keeps its name** (load-bearing: `versions.json[browser]`, `install-android-bundle.sh --links`, and tester install URLs all resolve against it). Holds `preview-*` pre-releases + assets, user-facing issues, public-safe docs. Published by `displayxr-browser-pvt`'s tag-triggered `publish-browser-releases.yml` via `/dxr-release browser preview-X.Y.Z`; pinned in `versions.json` as `browser`. |
 | `displayxr-unity` | Public | Unity engine plug-in (UPM package `com.displayxr.unity`); dev issues here. Coupled to the runtime only by the OpenXR extension wire protocol. |
 | `displayxr-unity-samples` | Public | Unity sample projects (birp-multipass, urp/hdrp-singlepass-ui, desktop-avatar) + a single shared NSIS installer. Signed `v1.0.0` ships 4 per-sample installers. **Releases are NOT in `versions.json` / the meta-bundle / `/dxr-release`.** Consolidates the four **archived** `displayxr-unity-test*` repos (now redirect). |
 
