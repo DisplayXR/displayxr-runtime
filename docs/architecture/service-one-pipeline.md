@@ -169,6 +169,25 @@ is a semaphore and a slot consumed for a chain that then never presents is lost 
 (observed: 14 presents then a dead presenter); a desync watchdog (500 ms probe-miss ⇒ re-prime
 + one unpaced recovery present) self-heals the rest.
 
+**D-9a Holder liveness — the panel goes only to a presenter that can present (2026-09-03,
+#939 leg 4).** Two rules close the gap D-9 left for a second immersive client beside a
+present-owner (the DisplayXR Browser beside plain-Chrome WebXR). (1) *Raise on grant:* when a
+slot takes the panel, its runtime-owned hosted window is raised to the top **without
+activation** (`SetWindowPos HWND_TOP|SWP_NOACTIVATE`). A window that wins via `(new-app)`
+came up behind whatever the user was in — foreground-lock refused it activation — and DWM
+does not drain an occluded cross-process chain: 20 ms presents, park, dead waitable, black.
+Restoring an iconic window already did this; raising a visible-but-covered one completes it.
+An app's real HWND is never touched. (2) *Yield on stall:* an active `APP_HWND` holder that
+earns no present grant for `DXR_HOLDER_STALL_MS` (default 2 s — behind the 500 ms desync
+watchdog and the 1 s park, and far above a merely slow ~10-16 fps hosted presenter) yields
+the panel to a live present-owner (`(holder-stalled)`), which outranks the foreground rule
+because the stalled holder's window is usually the one the user is staring at. The yielded
+slot is barred from (c)/(d) for `DXR_HOLDER_STALL_DWELL_MS` (default 3 s), doubling per
+consecutive yield (cap 30 s) and reset by a real grant — a dead presenter converges to
+"checked rarely", never a slow blink. A present-owner that loses the panel is unchanged: it
+keeps weaving through its own ingest DP (#1172) and its `CLIENT_TEXTURE` path drops to flat 2D
+(#1208) — it never blacks out, which is what makes it the safe place to hand the panel back to.
+
 **D-10 The workspace is scoped and never exclusive (2026-08-17, David).** The shell composes
 ONLY clients launched under it (`DISPLAYXR_WORKSPACE_SESSION=1`, reported by the client in
 `xrt_application_info.workspace_session`; `workspace_enumerate/get_client_info` filter).

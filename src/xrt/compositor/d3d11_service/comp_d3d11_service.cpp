@@ -278,6 +278,54 @@ dxr_app_hwnd_latency(bool split)
 //! user Alt-Tabbing back never sees a frozen window for long.
 #define DXR_WAITABLE_DESYNC_MS 500
 
+/*!
+ * #939 holder liveness: how long the ACTIVE APP_HWND presenter may go without a
+ * single present GRANT (parked in backoff, window not presentable, or the
+ * zero-timeout probe missing) before the panel is handed to a live present-owner
+ * instead of staying black. 0 disables the hand-back.
+ *
+ * Deliberately far above every self-heal it sits behind: the #1014 desync
+ * watchdog (500 ms) and the 1 s park both get their turn first, and a merely
+ * SLOW hosted presenter (plain-Chrome WebXR at ~10-16 fps through this path)
+ * still earns a grant every ~60-100 ms, so it never trips this.
+ */
+static int64_t
+dxr_holder_stall_ns()
+{
+	static int64_t cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_HOLDER_STALL_MS");
+		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 2000;
+		if (v < 0) {
+			v = 0;
+		}
+		cached = (int64_t)v * 1000000LL;
+	}
+	return cached;
+}
+
+/*!
+ * #939 holder liveness: how long a slot that just YIELDED the panel for stalling
+ * is barred from re-taking it through the foreground or new-app rules. Doubles
+ * on every consecutive yield of the same slot (capped at 30 s) and resets the
+ * moment the slot earns a real present grant, so a presenter that is dead for
+ * good converges to "checked rarely" rather than a slow blink.
+ */
+static int64_t
+dxr_holder_stall_dwell_ns()
+{
+	static int64_t cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_HOLDER_STALL_DWELL_MS");
+		int v = (e != nullptr && e[0] != '\0') ? atoi(e) : 3000;
+		if (v < 100) {
+			v = 100;
+		}
+		cached = (int64_t)v * 1000000LL;
+	}
+	return cached;
+}
+
 static bool
 dxr_legacy_standalone_enabled()
 {
@@ -892,6 +940,22 @@ struct d3d11_service_compositor
 	int64_t probe_miss_since_ns;
 	bool force_unpaced_present;
 	bool was_iconic;
+
+	//! #939 holder liveness. `stall_since_ns` is when this APP_HWND presenter,
+	//! while ACTIVE, last stopped earning present grants (parked, window not
+	//! presentable, or probe missing) — 0 while it is presenting. It is NOT
+	//! cleared by the #1014 desync recovery's forced unpaced present (that is
+	//! not a grant, and letting it reset the clock every 500 ms would mask a
+	//! dead chain forever); only a genuine grant clears it. Once it exceeds
+	//! DXR_HOLDER_STALL_MS with a live present-owner on the box, the focus pick
+	//! hands the panel over rather than leave it black. `stall_yield_until_ns`
+	//! then bars this slot from re-taking the panel via foreground / new-app
+	//! until it expires; `stall_yield_dwell_ns` is the dwell that was applied,
+	//! doubled on each consecutive yield and reset on a real grant. All zero
+	//! at rest — the struct is memset(0), and 0 is the safe value for each.
+	int64_t stall_since_ns;
+	int64_t stall_yield_until_ns;
+	int64_t stall_yield_dwell_ns;
 	//! Was this client the ACTIVE presenter last time we asked? A chain that
 	//! has just taken over is the one whose latency budget the previous focus
 	//! holder's pacing wait most likely spent, so it is re-primed up front
@@ -11309,6 +11373,44 @@ dxr_split_cover_note(struct d3d11_service_system *sys,
 }
 
 /*!
+ * #939 holder liveness: the ACTIVE presenter failed to earn a grant this frame.
+ * Starts the stall clock if it is not already running. Unfocused presenters are
+ * skipped by design and never count.
+ */
+static inline void
+pipeline_holder_stall_note(struct d3d11_service_compositor *c, int64_t now_ns, bool is_active)
+{
+	if (is_active && c->stall_since_ns == 0) {
+		c->stall_since_ns = now_ns;
+	}
+}
+
+/*!
+ * #939 holder liveness: a GENUINE present grant (waitable signaled or the pacer
+ * token) — the presenter is alive. Stops the stall clock and forgets any
+ * yield-dwell doubling, so a recovered presenter starts clean.
+ */
+static inline void
+pipeline_holder_stall_clear(struct d3d11_service_compositor *c)
+{
+	c->stall_since_ns = 0;
+	c->stall_yield_dwell_ns = 0;
+}
+
+/*!
+ * #939 holder liveness: is @p slot barred from taking the panel because it
+ * yielded for stalling and its dwell has not expired?
+ */
+static inline bool
+pipeline_slot_in_stall_dwell(struct d3d11_multi_compositor *mc, int32_t slot, int64_t now_ns)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
+		return false;
+	}
+	return now_ns < mc->clients[slot].compositor->stall_yield_until_ns;
+}
+
+/*!
  * #964: may the render thread touch this APP_HWND presenter's back buffer this
  * frame?
  *
@@ -11369,12 +11471,16 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		if (out_backoff != nullptr) {
 			*out_backoff = true;
 		}
+		pipeline_holder_stall_note(c, now_ns, is_active); // #939: parked = no grant
 		return false;
 	}
 	if (!have_window || !IsWindowVisible(h) || iconic) {
 		// Not presentable at all — that is not a desync, so don't let the
 		// stuck-probe clock run while the window is parked.
 		c->probe_miss_since_ns = 0;
+		// #939: but it IS a stall for the holder — a hidden/iconic active
+		// presenter leaves the panel black exactly like a drained chain does.
+		pipeline_holder_stall_note(c, now_ns, is_active);
 		return false;
 	}
 	if (c->render.frame_latency_waitable != nullptr) {
@@ -11410,10 +11516,12 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		if (tmc != nullptr && tmc->app_present_token_sc == c->render.swap_chain.get() &&
 		    tmc->app_present_token.exchange(false, std::memory_order_acq_rel)) {
 			c->probe_miss_since_ns = 0;
+			pipeline_holder_stall_clear(c); // #939: a real grant
 			return true;
 		}
 		if (WaitForSingleObject(c->render.frame_latency_waitable, 0) == WAIT_OBJECT_0) {
 			c->probe_miss_since_ns = 0;
+			pipeline_holder_stall_clear(c); // #939: a real grant
 			return true;
 		}
 
@@ -11425,6 +11533,9 @@ pipeline_app_hwnd_ready(struct d3d11_service_compositor *c, int64_t now_ns, bool
 		if (!is_active) {
 			return false;
 		}
+		// #939: the holder is missing grants; the stall clock runs from the
+		// FIRST miss and is NOT reset by the desync recovery below.
+		pipeline_holder_stall_note(c, now_ns, true);
 		if (c->probe_miss_since_ns == 0) {
 			c->probe_miss_since_ns = now_ns;
 			return false;
@@ -11932,13 +12043,38 @@ pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || mc->clients[slot].compositor == nullptr) {
 		return;
 	}
-	HWND h = mc->clients[slot].compositor->render.hwnd;
-	if (h == nullptr || !IsWindow(h) || !IsIconic(h)) {
+	struct d3d11_service_compositor *c = mc->clients[slot].compositor;
+	HWND h = c->render.hwnd;
+	if (h == nullptr || !IsWindow(h)) {
 		return;
 	}
-	ShowWindowAsync(h, SW_RESTORE);
-	U_LOG_W("[pipeline] restored slot %d's parked presenter window %p — it now holds the panel (#1018)", slot,
-	        (void *)h);
+	if (IsIconic(h)) {
+		ShowWindowAsync(h, SW_RESTORE);
+		U_LOG_W("[pipeline] restored slot %d's parked presenter window %p — it now holds the panel (#1018)",
+		        slot, (void *)h);
+		return;
+	}
+	/*
+	 * #939: not iconic — but a window can be visible and still not COMPOSED.
+	 * A hosted client's runtime-created window comes up behind whatever the
+	 * user was just in (Windows' foreground-lock refuses activation to a
+	 * background-launched process — the very reason the new-app rule exists),
+	 * so plain-Chrome WebXR's window sits under Chrome's own. DWM does not
+	 * drain an occluded cross-process chain: its presents take 20+ ms, get
+	 * parked, the waitable never re-signals, and the slot that just WON the
+	 * panel shows black (observed live, 2026-09-03). Raise it. HWND_TOP with
+	 * SWP_NOACTIVATE moves z-order only — no activation is stolen, keyboard
+	 * focus stays where the user put it — and only on a window WE own; an
+	 * app's real HWND is never touched. Async, like every other cross-thread
+	 * window call here. On an already-top window this is a no-op.
+	 */
+	if (!c->render.owns_window || !IsWindowVisible(h)) {
+		return;
+	}
+	SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+	U_LOG_W("[pipeline] raised slot %d's runtime-owned presenter window %p to the top (no activation) so DWM "
+	        "composes it — it now holds the panel (#939)",
+	        slot, (void *)h);
 }
 
 /*!
@@ -12036,8 +12172,62 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 		}
 	}
 
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+
+	/* (b'') #939 HOLDER LIVENESS. The panel must go to a presenter that can
+	 * actually present. An APP_HWND holder that has earned no present grant for
+	 * DXR_HOLDER_STALL_MS (parked, window not presentable, or a drained
+	 * waitable the #1014 watchdog could not revive) is showing black — and if a
+	 * live weave present-owner is on the box, black is a choice, not a
+	 * necessity. Hand the panel to the present-owner. This outranks the
+	 * foreground rule on purpose: the stalled holder's window is usually THE
+	 * foreground window (the user is staring at it), and (c) would re-elect it
+	 * every tick. The yielded slot is then barred from re-taking the panel
+	 * through (c)/(d) for a dwell that doubles on each consecutive yield, so a
+	 * presenter that is dead for good converges to "checked rarely" instead of
+	 * a slow blink; a real grant resets the doubling. Present-owner test kept
+	 * IDENTICAL to pipeline_slot_is_present_owner (#1334) — same predicate as
+	 * the enrol / activate sweeps. */
+	{
+		const int64_t stall_ns = dxr_holder_stall_ns();
+		struct d3d11_service_compositor *hc =
+		    (cur >= 0 && cur < D3D11_MULTI_MAX_CLIENTS) ? mc->clients[cur].compositor : nullptr;
+		if (stall_ns > 0 && hc != nullptr && cur_live && hc->presenter == PRESENTER_APP_HWND &&
+		    hc->stall_since_ns != 0 && now_ns - hc->stall_since_ns >= stall_ns) {
+			int32_t owner = -1;
+			uint64_t owner_ns = 0;
+			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+				struct d3d11_multi_client_slot *slot = &mc->clients[s];
+				if (s == cur || !pipeline_slot_presenting(slot) || slot->compositor->render.weave_hwnd == nullptr) {
+					continue;
+				}
+				if (owner < 0 || slot->first_frame_ns >= owner_ns) {
+					owner = s;
+					owner_ns = slot->first_frame_ns;
+				}
+			}
+			if (owner >= 0) {
+				int64_t dwell = hc->stall_yield_dwell_ns > 0 ? hc->stall_yield_dwell_ns : dxr_holder_stall_dwell_ns();
+				hc->stall_yield_until_ns = now_ns + dwell;
+				hc->stall_yield_dwell_ns = dwell >= 15000000000LL ? 30000000000LL : dwell * 2;
+				U_LOG_W("[pipeline] focus: holder slot %d (%s) has had no present grant for %lld ms — yielding the "
+				        "panel to live present-owner slot %d rather than show black; barred from re-taking it "
+				        "for %lld ms (#939)",
+				        cur, mc->clients[cur].app_name[0] != '\0' ? mc->clients[cur].app_name : "?",
+				        (long long)((now_ns - hc->stall_since_ns) / 1000000LL), owner,
+				        (long long)(dwell / 1000000LL));
+				hc->stall_since_ns = 0; // restarts fresh if it ever re-takes the panel
+				*out_reason = "holder-stalled";
+				return owner;
+			}
+		}
+	}
+
 	/* (c) A client's own window in the foreground wins outright. */
 	int32_t match = pipeline_slot_for_foreground(mc, fg);
+	if (match >= 0 && pipeline_slot_in_stall_dwell(mc, match, now_ns)) {
+		match = -1; // #939: yielded for stalling, dwell not expired — no verdict
+	}
 	if (match >= 0) {
 		if (!fg_selfmove) {
 			*out_reason = "foreground";
@@ -12100,6 +12290,9 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 			struct d3d11_multi_client_slot *slot = &mc->clients[s];
 			if (s == cur || slot->ever_focused || !pipeline_slot_presenting(slot)) {
 				continue;
+			}
+			if (pipeline_slot_in_stall_dwell(mc, s, now_ns)) {
+				continue; // #939: yielded for stalling, dwell not expired
 			}
 			if (slot->first_frame_ns <= (uint64_t)mc->focus_acquired_ns) {
 				continue; // already rendering before the incumbent took over
