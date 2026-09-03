@@ -338,8 +338,17 @@ struct comp_d3d12_compositor
 		//! on-change surfaces; a steady frame costs a compare).
 		uint64_t l2d_copied_hash;
 		uint64_t bd_copied_hash;
-		//! ADR-027 P4 wish publish sequence on this route.
+		/*!
+		 * ADR-027 P4 wish publish generation on this route.
+		 *
+		 * The DP contract makes `seq` the mask CONTENT generation, so it
+		 * advances only when the content this route publishes changes -- see
+		 * @ref d3d12_reroute_wish_content_sig. @ref wish_content_sig is what
+		 * "changes" is tested against; 0 means "no wish standing", so a
+		 * withdrawal resets it and the republish is a new generation.
+		 */
 		uint64_t wish_seq;
+		uint64_t wish_content_sig;
 		//! Change-detection for the authored-mask staged->plane copy
 		//! ((res_gen << 48) | author_seq — either half moving re-copies).
 		uint64_t mask_copied_key;
@@ -1776,6 +1785,68 @@ d3d12_reroute_copy_to_plane(struct comp_d3d12_compositor *c, ID3D12Resource *scr
 }
 
 /*!
+ * ADR-027 P4 -- the CONTENT generation this route publishes its zone wish under.
+ *
+ * @ref xrt_display_processor::publish_local_zone_mask defines `seq` as the mask
+ * content generation: "monotonic, bumped only when the published content changes
+ * ... same-seq publishes differ only in the screen anchor, so a vendor evaluates
+ * content once per generation." This route used to mint a FRESH generation on
+ * every app frame, so a conformant vendor was obliged to re-evaluate identical
+ * geometry at frame rate -- measured at 180-186 ms inside the SR plug-in's
+ * publish_local_zone_mask during the Unity avatar's warm-up, synchronously, on
+ * the compositor thread, under the mutex the #868 repaint fill needs.
+ *
+ * The runtime still publishes EVERY frame. That is the other half of the same
+ * contract -- "The runtime republishes every frame while a mask is active;
+ * vendors coalesce per max_update_hz" -- and it is what carries the SCREEN
+ * ANCHOR, so a window move with unchanged zone geometry still reaches the vendor.
+ * Only the generation is held still. Nothing is ever skipped, so there is no
+ * "did the publish succeed" bookkeeping to get out of step with: an early return
+ * inside @ref comp_vk_split_publish_zone_wish (authored plane not landed, raster
+ * kind not binary, 0x0 client rect) simply means the vendor has not yet seen this
+ * generation, and the next frame re-offers the same one.
+ *
+ * The signature covers what the publish transmits as CONTENT, and it covers BOTH
+ * sources unconditionally rather than predicting which branch the publish will
+ * take -- asking the callee's question on the caller's side is exactly how the
+ * tier-1 zone gate went wrong:
+ *   - the app-authored plane's content key ((res_gen << 48) | author_seq, the same
+ *     key @ref d3d12_stage_mask_plane transports on), because an app that keeps its
+ *     rects and re-authors its wish texture changes the pixels and no geometry;
+ *   - the auto raster's kind, dims and rects.
+ * A change in the source the publish did NOT take mints one redundant generation,
+ * costing one vendor evaluation. Only the reverse -- a content change that does not
+ * bump -- can leave stale geometry on the panel, so the bias is deliberate.
+ *
+ * Deliberately NOT in the signature:
+ *   - the screen anchor: it rides every publish (see above);
+ *   - the FEATHER ramp: a feather change is a composite-only cosmetic (#803) and
+ *     the publish transmits the BINARY raster whatever the composite sampled, so
+ *     folding it in would mint a generation for identical published geometry.
+ */
+static uint64_t
+d3d12_reroute_wish_content_sig(struct comp_d3d12_compositor *c)
+{
+	uint64_t h = 1469598103934665603ull; // FNV-1a 64 offset basis
+#define WISH_MIX(v) (h = (h ^ (uint64_t)(v)) * 1099511628211ull)
+	WISH_MIX(c->reroute.mask_copied_key);
+	WISH_MIX(c->out_mask_req.kind);
+	WISH_MIX(c->out_mask_req.count);
+	WISH_MIX(c->out_mask_req.w);
+	WISH_MIX(c->out_mask_req.h);
+	for (uint32_t i = 0; i < c->out_mask_req.count; i++) {
+		const struct xrt_rect *r = &c->out_mask_req.rects[i];
+		WISH_MIX((uint32_t)r->offset.w);
+		WISH_MIX((uint32_t)r->offset.h);
+		WISH_MIX((uint32_t)r->extent.w);
+		WISH_MIX((uint32_t)r->extent.h);
+	}
+#undef WISH_MIX
+	// 0 is reserved for "no wish standing" (comp_d3d12_compositor::reroute).
+	return h != 0 ? h : 1;
+}
+
+/*!
  * #1264 — the reroute's LOCAL2D staging: the transport fork of the deposit
  * half. Everything semantic (the mask capture into out_mask_req, the Local2D
  * flatten into the panel-sized scratch, the guards) already ran exactly as the
@@ -1856,9 +1927,26 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 	 * built; a non-zones frame clears.
 	 */
 	if (zones_frame) {
-		c->reroute.wish_seq++;
+		/*
+		 * Publish every frame (that is the anchor channel), but advance the
+		 * content generation only when the content changed -- see
+		 * d3d12_reroute_wish_content_sig.
+		 */
+		const uint64_t sig = d3d12_reroute_wish_content_sig(c);
+		if (sig != c->reroute.wish_content_sig) {
+			c->reroute.wish_content_sig = sig;
+			c->reroute.wish_seq++;
+		}
 		comp_vk_split_publish_zone_wish(c->reroute.split, c->reroute.wish_seq);
 	} else {
+		/*
+		 * The wish is WITHDRAWN, not merely unchanged. Drop the signature so the
+		 * next zones frame publishes under a NEW generation even if its geometry
+		 * is identical -- a vendor that evaluated this content and then had it
+		 * cleared is holding nothing, and re-offering the generation it already
+		 * retired would licence it to coalesce the republish away.
+		 */
+		c->reroute.wish_content_sig = 0;
 		comp_vk_split_clear_zone_wish(c->reroute.split);
 	}
 	return true;
