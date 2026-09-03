@@ -66,6 +66,10 @@ jobs:
               Write-Host "::warning::no verdict written for $m"
             }
           }
+          # The arms EXPECT non-zero exits (three of the four are known-bad
+          # windows), so this step must not adopt the last one's code. Whether
+          # those codes are the RIGHT ones is the next step's whole job.
+          exit 0
 
       - name: Assert the gate discriminates
         shell: pwsh
