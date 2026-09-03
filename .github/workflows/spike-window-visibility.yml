@@ -1,0 +1,126 @@
+# SPIKE (not a required check, branch-scoped): can CI catch a permanently
+# invisible window?
+#
+# The bug class: a cloaked window passes every "did it start" check. Process
+# alive, log emitted, HWND present, IsWindowVisible() TRUE. That shipped twice --
+# plug-in #256 in v2.13.0, then again in v2.16.0 when an early DWM cloak had no
+# un-cloak on the no-runtime path (no runtime => no session => no overlay to
+# un-cloak => cloaked, parked, invisible; hit on both of a tester's machines
+# within an hour). `DWMWA_CLOAKED` appears nowhere in the runtime tree, so the
+# window predicate the codebase already uses cannot see it.
+#
+# This job answers two questions and nothing else:
+#   Q1  Can a GitHub-hosted windows runner host a top-level window and read DWM
+#       cloak state at all? (The load-bearing unknown -- the runner agent runs as
+#       a service.)
+#   Q2  Does the gate DISCRIMINATE? It must pass a plainly visible window and
+#       FAIL the known-bad ones. A gate that cannot fail on a deliberately broken
+#       input proves nothing, which is exactly the lesson of this bug class.
+#
+# The job is green only if every arm's verdict matches what it is SUPPOSED to be,
+# and only if the `not_cloaked` arm was actually ENFORCED rather than skipped --
+# the same belt-and-braces the runtime self-test applies to its input-provider
+# check ("a silently-skipped path would pass the exit code").
+name: spike-window-visibility
+
+on:
+  push:
+    branches: [spike/ci-window-visibility-gate]
+  workflow_dispatch:
+
+jobs:
+  visibility-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report what the runner can host
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Write-Host "OS            : $([System.Environment]::OSVersion.VersionString)"
+          Write-Host "SESSIONNAME   : '$env:SESSIONNAME'"
+          Write-Host "UserInteractive: $([System.Environment]::UserInteractive)"
+          Write-Host "monitors      : $(@([System.Windows.Forms.Screen]::AllScreens).Count)"
+          $dwm = Get-Process -Name dwm -ErrorAction SilentlyContinue
+          Write-Host "dwm.exe       : $(if ($dwm) { "running (pid $($dwm.Id -join ','))" } else { 'NOT RUNNING' })"
+
+      # Each arm runs in its own powershell.exe so a wedged message pump cannot
+      # take the others with it. Verdicts land as JSON and are asserted below.
+      - name: Run the four arms
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path verdicts | Out-Null
+          foreach ($m in @('normal','cloak','minimize','offscreen')) {
+            Write-Host "=============== $m ==============="
+            & powershell -ExecutionPolicy Bypass -NoProfile -File scripts\test\window_visibility_check.ps1 `
+                -Mode $m -SettleMs 1500 -Json "verdicts\$m.json" | Out-Null
+            Write-Host "  exit=$LASTEXITCODE"
+            if (Test-Path "verdicts\$m.json") {
+              $v = Get-Content "verdicts\$m.json" -Raw | ConvertFrom-Json
+              foreach ($a in $v.arms) {
+                $tag = if (-not $a.enforced) { 'SKIP' } elseif ($a.ok) { 'ok  ' } else { 'FAIL' }
+                Write-Host ("  [{0}] {1,-18} {2}" -f $tag, $a.name, $a.detail)
+              }
+            } else {
+              Write-Host "::warning::no verdict written for $m"
+            }
+          }
+
+      - name: Assert the gate discriminates
+        shell: pwsh
+        run: |
+          # What each arm MUST conclude. `cloak` is the positive control.
+          $expect = @{
+            normal    = @{ presentable = $true;  mustFail = @() }
+            cloak     = @{ presentable = $false; mustFail = @('not_cloaked') }
+            minimize  = @{ presentable = $false; mustFail = @('not_minimised') }
+            offscreen = @{ presentable = $false; mustFail = @('rect_on_a_monitor') }
+          }
+
+          $fail = 0
+          foreach ($m in $expect.Keys | Sort-Object) {
+            $p = "verdicts\$m.json"
+            if (-not (Test-Path $p)) { Write-Host "::error::$m produced no verdict."; $fail = 1; continue }
+            $v = Get-Content $p -Raw | ConvertFrom-Json
+            $e = $expect[$m]
+
+            if ($v.presentable -ne $e.presentable) {
+              Write-Host "::error::$m -- presentable=$($v.presentable), expected $($e.presentable)."
+              $fail = 1
+            }
+            foreach ($arm in $e.mustFail) {
+              $row = $v.arms | Where-Object { $_.name -eq $arm }
+              if (-not $row) { Write-Host "::error::$m -- arm '$arm' absent."; $fail = 1; continue }
+              if (-not $row.enforced) {
+                Write-Host "::error::$m -- arm '$arm' was SKIPPED, not enforced. The gate proves nothing here: $($row.detail)"
+                $fail = 1
+              } elseif ($row.ok) {
+                Write-Host "::error::$m -- arm '$arm' PASSED a known-bad window. The gate is blind: $($row.detail)"
+                $fail = 1
+              } else {
+                Write-Host "PASS: $m -- '$arm' correctly caught it."
+              }
+            }
+          }
+
+          # Q1, stated separately so a runner limitation reads as a runner
+          # limitation and not as a passing gate.
+          $cl = (Get-Content "verdicts\cloak.json" -Raw | ConvertFrom-Json)
+          $cloakArm = $cl.arms | Where-Object { $_.name -eq 'not_cloaked' }
+          Write-Host ""
+          Write-Host "--- feasibility ---"
+          Write-Host "monitors on runner : $($cl.environment.monitors)"
+          Write-Host "DWM answers        : $($cl.environment.dwm_answers)"
+          Write-Host "DwmSetWindowAttribute(DWMWA_CLOAK) hr : $($cl.environment.cloak_set_hr)"
+          Write-Host "not_cloaked enforced on this runner   : $($cloakArm.enforced)"
+
+          if ($fail -ne 0) { Write-Host "::error::visibility gate did not discriminate correctly."; exit 1 }
+          Write-Host ""
+          Write-Host "ALL ARMS CORRECT -- a cloaked/minimised/parked window is catchable in CI."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visibility-verdicts
+          path: verdicts/
