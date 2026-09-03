@@ -12251,6 +12251,78 @@ pipeline_park_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 }
 
 /*!
+ * #939: is @p slot a weave PRESENT-OWNER — a client that presents its own pixels
+ * into its own top-level window (the DisplayXR Browser), rather than one whose
+ * pixels the pipeline composes?
+ *
+ * Predicate kept IDENTICAL to `enrol_standalone_clients_locked`'s and to the
+ * activate sweep's (#1323). All three ask the same question — "is this client a
+ * desktop peer?" — and must never drift apart.
+ */
+static inline bool
+pipeline_slot_is_present_owner(struct d3d11_multi_compositor *mc, int32_t slot)
+{
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+	return mc->clients[slot].compositor != nullptr && mc->clients[slot].compositor->render.weave_hwnd != nullptr;
+}
+
+/*!
+ * #939: park the slot that just LOST the panel — UNLESS the slot that won it is
+ * a present-owner.
+ *
+ * Parking the loser exists for two situations, and a present-owner winning is
+ * neither of them:
+ *
+ *  - a WORKSPACE holds the panel, so the loser's pixels reach the display
+ *    through the composed atlas and its own window is redundant on the desktop;
+ *  - an APP_HWND -> APP_HWND handoff, where the outgoing window would otherwise
+ *    sit beside the new presenter showing the flat 2D courtesy repaint.
+ *
+ * A present-owner presents into its OWN top-level window and is a desktop peer
+ * (#1323), so both windows are live desktop windows the user may Alt-Tab
+ * between and z-order already shows whichever one is foreground. Minimizing the
+ * loser buys nothing and costs plenty. Observed on hardware with the DisplayXR
+ * Browser beside a plain-Chrome WebXR session trading the OS foreground: the
+ * WebXR window blinked away and back on every trade, the browser's 3D tile
+ * flashed through it during the minimize/restore, and while iconic
+ * `pipeline_app_hwnd_ready` refused the loser every tick (`pipe_active_skip`),
+ * starving its WebXR loop.
+ *
+ * The unpark of the winner is unconditional and stays with the caller — it is a
+ * no-op for a present-owner (whose window we never parked) and load-bearing for
+ * everyone else.
+ *
+ * Focus-change only — never per frame.
+ */
+static void
+pipeline_park_loser_for_winner(struct d3d11_multi_compositor *mc, int32_t loser, int32_t winner)
+{
+	if (!pipeline_slot_is_present_owner(mc, winner)) {
+		pipeline_park_app_hwnd(mc, loser);
+		return;
+	}
+	/* Say so only when the park would actually have moved a window — the same
+	 * preconditions pipeline_park_app_hwnd checks — so the line marks a real
+	 * behaviour change rather than every focus change that had nothing to park. */
+	if (loser < 0 || loser >= D3D11_MULTI_MAX_CLIENTS || !pipeline_slot_presenting(&mc->clients[loser])) {
+		return;
+	}
+	struct d3d11_service_compositor *lc = mc->clients[loser].compositor;
+	if (lc->presenter != PRESENTER_APP_HWND) {
+		return;
+	}
+	HWND h = lc->render.hwnd;
+	if (h == nullptr || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h)) {
+		return;
+	}
+	U_LOG_W("[pipeline] focus: slot %d (%s) lost the panel to present-owner slot %d — left on the desktop, not "
+	        "parked; z-order shows the foreground window (#939)",
+	        loser, mc->clients[loser].app_name[0] != '\0' ? mc->clients[loser].app_name : "?", winner);
+}
+
+/*!
  * #918 PR 4 — the layout signature's slot field for the COMPOSE path.
  *
  * The compose path has no focused slot: it weaves ONE combined atlas built from
@@ -12637,8 +12709,11 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			service_signal_workspace_wakeup(sys);
 
 			// The outgoing APP_HWND presenter's window gets out of the way
-			// rather than sitting there showing the flat 2D repaint.
-			pipeline_park_app_hwnd(mc, was_focused);
+			// rather than sitting there showing the flat 2D repaint — but NOT
+			// when the winner is a present-owner with a window of its own
+			// (#939): there both are desktop peers and z-order already shows
+			// the foreground one.
+			pipeline_park_loser_for_winner(mc, was_focused, best);
 			// #1018: the INCOMING one may itself be parked — restore it, or
 			// the ready-probe skips it every frame and the panel goes black.
 			// Covers the survivor-fallback path too (holder exits -> next).
