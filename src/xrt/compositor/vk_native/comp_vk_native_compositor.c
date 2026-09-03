@@ -18,6 +18,7 @@
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
 
+#include "util/comp_zone_tier1.h"
 #include "util/comp_layer_accum.h"
 #include "util/comp_bg2d.h"
 #ifdef XRT_OS_WINDOWS
@@ -10078,12 +10079,18 @@ vk_zone_dp_supported(struct comp_vk_native_compositor *c)
 static bool
 vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c)
 {
+	bool weaver_on_arm = false;
+	bool arm_consumes = false;
 #ifdef XRT_OS_WINDOWS
-	if (c->split != NULL) {
-		return comp_vk_split_zone_dp_supported(c->split);
+	weaver_on_arm = (c->split != NULL);
+	if (weaver_on_arm) {
+		arm_consumes = comp_vk_split_zone_dp_supported(c->split);
 	}
 #endif
-	return vk_zone_dp_supported(c);
+	// The dispatch is shared with the d3d12 tier and unit-tested without a GPU:
+	// tests/tests_comp_zone_tier1.cpp.
+	return comp_zone_tier1_dp_consumes_zones(weaver_on_arm, arm_consumes,
+	                                         weaver_on_arm ? false : vk_zone_dp_supported(c));
 }
 
 // Keep the DP's view of this client's zone mask in sync with the

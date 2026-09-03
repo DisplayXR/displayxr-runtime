@@ -10,6 +10,7 @@
 #include "comp_d3d12_compositor.h"
 #include "comp_d3d12_swapchain.h"
 #include "comp_d3d12_target.h"
+#include "util/comp_zone_tier1.h"
 #include "util/comp_display_refresh_win.h"
 #include "comp_d3d12_renderer.h"
 #include "comp_d3d12_outcomp.h"
@@ -6474,12 +6475,18 @@ d3d12_zone_dp_supported(struct comp_d3d12_compositor *c)
 static bool
 d3d12_zone_dp_supported_weaving_arm(struct comp_d3d12_compositor *c)
 {
+	bool weaver_on_arm = false;
+	bool arm_consumes = false;
 #ifdef COMP_D3D12_HAVE_D3D11_FILL_ARM
-	if (c->reroute.active && c->reroute.split != NULL) {
-		return comp_vk_split_zone_dp_supported(c->reroute.split);
+	weaver_on_arm = (c->reroute.active && c->reroute.split != NULL);
+	if (weaver_on_arm) {
+		arm_consumes = comp_vk_split_zone_dp_supported(c->reroute.split);
 	}
 #endif
-	return d3d12_zone_dp_supported(c);
+	// Shared with the VK tier so the two cannot drift, and unit-tested without
+	// a GPU: tests/tests_comp_zone_tier1.cpp.
+	return comp_zone_tier1_dp_consumes_zones(weaver_on_arm, arm_consumes,
+	                                         weaver_on_arm ? false : d3d12_zone_dp_supported(c));
 }
 
 /*!

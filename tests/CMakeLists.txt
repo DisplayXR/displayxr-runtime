@@ -27,6 +27,7 @@ set(tests
     tests_space_overseer_rig
     tests_cli_dims_check
     tests_comp_vblank_grid
+    tests_comp_zone_tier1
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
@@ -91,6 +92,10 @@ target_include_directories(tests_cli_dims_check PRIVATE ${CMAKE_SOURCE_DIR}/src/
 # lets its drift / staleness / mode-switch logic be tested on the host, where
 # those bugs are actually findable.
 target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+# ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
+# library, no graphics API, no device -- so it needs the include path and
+# nothing else.
+target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(

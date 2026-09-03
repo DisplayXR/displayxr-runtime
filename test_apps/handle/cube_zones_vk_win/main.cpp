@@ -129,6 +129,66 @@ static bool g_zonesAttempted = false;
 static long g_zonesFrameCounter = 0;
 static const long kZonesActivationFrame = 10;
 
+// COVERAGE TOGGLES (#1331 / #1337). Both default OFF, both env-driven rather
+// than keyed: CI has to drive them headlessly, and the harness already drives
+// env. Neither changes a single default.
+//
+// Why they exist: nothing on any box was simultaneously a zones app AND
+// exercising these paths, so #1331s VK tier-1 gate and #1337s withdrawal /
+// Tier-3 paths both shipped CODE-READ. This app is already accepted by the VK
+// split (measured: split=1), so it is the right place to close both.
+
+// DXR_ZONES_MODE_2D=1 — ask for hardware 2D once, N frames after zones go live.
+//
+// This is the arm that was missing: the app never requested 2D, so the ADR-027
+// tier-1 gate had never been observed DECLINING to force 3D. Pre-#1331 the first
+// zones frame yanks the panel back ("switched to 3D" right after our request);
+// with the fix the request sticks.
+//
+// ORDERING IS THE WHOLE TEST, and getting it wrong makes the arm toothless.
+// `zones_mode_requested` is a ONCE-ONLY latch, so the tier-1 force fires on the
+// FIRST zones frame and never again. Request 2D after that and the request simply
+// overrides the force -- the arm passes against a broken runtime (measured: it
+// did). The real failure is app-requests-2D THEN the first zones frame yanks it
+// back, so the request must land BEFORE zones activate.
+static bool ZonesMode2DRequested() {
+    static const bool e = []() {
+        const char* v = getenv("DXR_ZONES_MODE_2D");
+        return v != nullptr && *v == '1';
+    }();
+    return e;
+}
+static const long kZonesMode2DFrame = 3;  // BEFORE kZonesActivationFrame (10) -- see above
+static bool g_zonesMode2DSent = false;
+
+// DXR_ZONES_CYCLE_S=N — alternate zones-on / zones-off every N seconds (0 = off).
+//
+// A zones-OFF frame is what drives comp_vk_split_clear_zone_wish, i.e. the
+// WITHDRAWAL. It matters that this CYCLES rather than switching off once: the
+// review finding on the rejected dedupe was that zones-off -> zones-on could
+// dedupe against a stale signature FOREVER, so the re-publish after a withdrawal
+// is the half that needs exercising, not the withdrawal alone.
+static double ZonesCycleSeconds() {
+    static const double e = []() {
+        const char* v = getenv("DXR_ZONES_CYCLE_S");
+        if (v == nullptr || *v == '\0') return 0.0;
+        const double d = atof(v);
+        return d > 0.0 ? d : 0.0;
+    }();
+    return e;
+}
+
+// False on a zones-OFF phase. Wall-clock rather than frame-counted so the phase
+// length does not silently change with frame rate.
+static bool ZonesOnThisFrame() {
+    const double period = ZonesCycleSeconds();
+    if (period <= 0.0) return true;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const long phase = (long)(t / period);
+    return (phase % 2) == 0;
+}
+
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
     static const bool e = []() {
@@ -696,6 +756,10 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
                              const XrFrameState& frameState) {
     // Per-zone locate + submit data. The zone structs are chained at BOTH
     // points (locate and xrEndFrame) — same instances within the frame.
+    // Resolved ONCE per frame: the layer list and the frame-end chain must agree,
+    // and a mid-frame flip would submit zone layers with no zones frame-end info.
+    const bool zonesOn = ZonesOnThisFrame();
+
     XrDisplayZoneDXR zoneStructs[kNumZones];
     XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
@@ -826,7 +890,16 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         if (submitViewCounts[zi] == 0) continue;
         projLayers[zi] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-        projLayers[zi].next = &zoneStructs[zi]; // SAME instance as the locate chain
+        // A zones-OFF frame submits the SAME projection UNCHAINED, so the state
+        // tracker sees a plain projection instead of an XRT_LAYER_ZONE_3D and the
+        // compositor takes its non-zones branch -> clear_zone_wish. One zone only,
+        // because two unchained full projections is not a frame any app would send.
+        if (!zonesOn) {
+            if (zi != 0) continue;
+            projLayers[zi].next = nullptr;
+        } else {
+            projLayers[zi].next = &zoneStructs[zi]; // SAME instance as the locate chain
+        }
         // Content alpha is meaningful (zone B transparent bg): premultiplied bytes.
         projLayers[zi].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         projLayers[zi].space = xr.localSpace;
@@ -858,7 +931,11 @@ static void RenderZonesFrame(XrSessionManager& xr, VkRenderer& renderer,
     XrDisplayZonesFrameEndInfoDXR zonesEnd = {(XrStructureType)XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR};
     zonesEnd.flags = ZonesValidateEnabled() ? XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_DXR : 0;
     zonesEnd.wishMask = XR_NULL_HANDLE;
-    endInfo.next = &zonesEnd;
+    // Withheld on a zones-off frame along with the chaining above: the wish is
+    // WITHDRAWN, not merely unchanged.
+    if (zonesOn) {
+        endInfo.next = &zonesEnd;
+    }
 
     xrEndFrame(xr.session, &endInfo);
 }
@@ -890,6 +967,25 @@ static void RenderThreadFunc(HWND hwnd, XrSessionManager* xr, VkRenderer* render
         if (g_hasDisplayZonesExt && !g_zonesActive && !g_zonesAttempted &&
             g_zonesFrameCounter >= kZonesActivationFrame) {
             TryActivateZones(*xr, *renderer, colorFormat);
+        }
+
+        // The 2D arm. Sent once, after zones are live and the tier-1 gate has
+        // already seen a zones frame -- so "2D stuck" cannot be an artefact of
+        // asking before the gate could fire.
+        // NOT gated on g_zonesActive: the request has to PRECEDE zone activation.
+        if (ZonesMode2DRequested() && !g_zonesMode2DSent &&
+            g_zonesFrameCounter >= kZonesMode2DFrame) {
+            g_zonesMode2DSent = true;
+            PFN_xrRequestDisplayModeDXR fn = nullptr;
+            if (XR_SUCCEEDED(xrGetInstanceProcAddr(xr->instance, "xrRequestDisplayModeDXR",
+                                                   (PFN_xrVoidFunction*)&fn)) &&
+                fn != nullptr) {
+                const XrResult r2d = fn(xr->session, XR_DISPLAY_MODE_2D_DXR);
+                LOG_INFO("[coverage] requested XR_DISPLAY_MODE_2D_DXR at frame %ld -> %d",
+                         g_zonesFrameCounter, (int)r2d);
+            } else {
+                LOG_ERROR("[coverage] xrRequestDisplayModeDXR unavailable");
+            }
         }
 
         if (g_zonesActive && frameState.shouldRender) {
