@@ -171,20 +171,25 @@ is a semaphore and a slot consumed for a chain that then never presents is lost 
 
 **D-9a Holder liveness — the panel goes only to a presenter that can present (2026-09-03,
 #939 leg 4).** Two rules close the gap D-9 left for a second immersive client beside a
-present-owner (the DisplayXR Browser beside plain-Chrome WebXR). (1) *Raise on grant:* when a
-slot takes the panel, its runtime-owned hosted window is raised to the top **without
-activation** (`SetWindowPos HWND_TOP|SWP_NOACTIVATE`). A window that wins via `(new-app)`
-came up behind whatever the user was in — foreground-lock refused it activation — and DWM
-does not drain an occluded cross-process chain: 20 ms presents, park, dead waitable, black.
-Restoring an iconic window already did this; raising a visible-but-covered one completes it.
-An app's real HWND is never touched. (2) *Yield on stall:* an active `APP_HWND` holder that
-earns no present grant for `DXR_HOLDER_STALL_MS` (default 2 s — behind the 500 ms desync
-watchdog and the 1 s park, and far above a merely slow ~10-16 fps hosted presenter) yields
-the panel to a live present-owner (`(holder-stalled)`), which outranks the foreground rule
-because the stalled holder's window is usually the one the user is staring at. The yielded
-slot is barred from (c)/(d) for `DXR_HOLDER_STALL_DWELL_MS` (default 3 s), doubling per
-consecutive yield (cap 30 s) and reset by a real grant — a dead presenter converges to
-"checked rarely", never a slow blink. A present-owner that loses the panel is unchanged: it
+present-owner (the DisplayXR Browser beside plain-Chrome WebXR). (1) *Raise on grant*
+(`DXR_HOLDER_RAISE=1`, **default off**): when a slot takes the panel, its runtime-owned hosted
+window is raised to the top **without activation** (`SetWindowPos HWND_TOP|SWP_NOACTIVATE`).
+Built on the theory that a `(new-app)` winner came up behind the user's window and DWM was not
+draining the occluded chain. The first hardware run (2026-09-03) refuted the premise — the
+chain earns no paced grant even raised — and the raise correlated 1:1 with an OS-foreground
+flap that flickered the browser, so it is a knob for that A/B, not a default. An app's real
+HWND is never touched. (2) *Yield on stall:* an active `APP_HWND` holder that lands **no
+present at all** — paced or unpaced — for `DXR_HOLDER_STALL_MS` (default 2 s, behind the
+500 ms desync watchdog and the 1 s park) yields the panel to a live present-owner
+(`(holder-stalled)`), which outranks the foreground rule because the stalled holder's window
+is usually the one the user is staring at. "No present" is deliberate: a hosted chain whose
+waitable never signals still lands frames through the #1014 unpaced recovery (plain-Chrome
+WebXR: ~9 fps that way — choppy but visible), and that presenter must never be yanked; only an
+occluded, erroring or silent window stays on the clock, and the clock resets whenever the slot
+is not the holder. The yielded slot is barred from (c)/(d) for `DXR_HOLDER_STALL_DWELL_MS`
+(default 3 s), doubling per consecutive yield (cap 30 s) and reset by a landed present — a
+dead presenter converges to "checked rarely", never a slow blink. Every focus change logs the
+foreground HWND, its owning process and title, so a flap has a named author. A present-owner that loses the panel is unchanged: it
 keeps weaving through its own ingest DP (#1172) and its `CLIENT_TEXTURE` path drops to flat 2D
 (#1208) — it never blacks out, which is what makes it the safe place to hand the panel back to.
 

@@ -326,6 +326,26 @@ dxr_holder_stall_dwell_ns()
 	return cached;
 }
 
+/*!
+ * #939: raise a runtime-owned hosted window to the top (no activation) when it
+ * takes the panel. DEFAULT OFF. Built on the theory that the window was
+ * occluded and DWM was not draining it; the first hardware run (2026-09-03)
+ * showed the chain earns no paced grant even when raised, and the raise
+ * correlated 1:1 with an OS-foreground flap that flickered the browser. Kept
+ * as a knob for the A/B that settles whether it CAUSES the flap or merely
+ * rode along with it.
+ */
+static bool
+dxr_holder_raise_enabled()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *e = getenv("DXR_HOLDER_RAISE");
+		cached = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 static bool
 dxr_legacy_standalone_enabled()
 {
@@ -3498,6 +3518,15 @@ struct d3d11_multi_compositor
 	//! Render-thread only, under render_mutex; no other reader.
 	int64_t focus_fg_selfmove_until_ns;
 	bool focus_fg_selfmove_suppressed_logged;
+
+	//! #939: the debounced OS foreground window as sampled by the LAST
+	//! pipeline_pick_focus call — stored every frame (a pointer copy), read
+	//! only by the focus-change WARN so a foreground flap names its author
+	//! (HWND, owning PID, title) instead of just "(foreground)". The first
+	//! hardware run of the holder-liveness rules showed ~10 unexplained
+	//! foreground trades in 45 s and nothing in the log said whose window
+	//! they were. Render-thread only.
+	HWND focus_verdict_fg;
 
 	//! #964 Phase A: when the current holder ACQUIRED the panel (monotonic ns,
 	//! 0 = never). The "new app" rule compares a candidate's `first_frame_ns`
@@ -11380,7 +11409,14 @@ dxr_split_cover_note(struct d3d11_service_system *sys,
 static inline void
 pipeline_holder_stall_note(struct d3d11_service_compositor *c, int64_t now_ns, bool is_active)
 {
-	if (is_active && c->stall_since_ns == 0) {
+	if (!is_active) {
+		// Not the holder: "no grant" means nothing, and a clock left running
+		// here fired the yield 21 ms after a re-take, reporting a 10 s stall
+		// the slot never had while holding (2026-09-03). Reset.
+		c->stall_since_ns = 0;
+		return;
+	}
+	if (c->stall_since_ns == 0) {
 		c->stall_since_ns = now_ns;
 	}
 }
@@ -11606,6 +11642,16 @@ pipeline_present_app_hwnd(struct d3d11_service_compositor *c, bool paced)
 		park = true;
 	} else if (FAILED(phr) && phr != DXGI_ERROR_WAS_STILL_DRAWING) {
 		park = true;
+	}
+	// #939 holder liveness: "stalled" means NO PRESENT LANDED — not "no paced
+	// grant". A hosted chain whose waitable never signals still lands frames
+	// through the #1014 unpaced recovery (plain-Chrome WebXR: 87 presents per
+	// 10 s that way, choppy but alive), and yanking the panel from a presenter
+	// the user can see is the wrong call. Any Present that DXGI accepted on a
+	// non-occluded window is life; only a window that is occluded, erroring
+	// or never presenting at all stays on the clock.
+	if (!park) {
+		pipeline_holder_stall_clear(c);
 	}
 	if (park) {
 		c->present_backoff_until_ns = now_ns + 1000LL * 1000000LL;
@@ -12068,7 +12114,7 @@ pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 	 * app's real HWND is never touched. Async, like every other cross-thread
 	 * window call here. On an already-top window this is a no-op.
 	 */
-	if (!c->render.owns_window || !IsWindowVisible(h)) {
+	if (!dxr_holder_raise_enabled() || !c->render.owns_window || !IsWindowVisible(h)) {
 		return;
 	}
 	SetWindowPos(h, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
@@ -12155,6 +12201,7 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 
 	/* (b) Debounced foreground sample — once per frame, here. */
 	HWND fg = pipeline_sample_foreground(mc);
+	mc->focus_verdict_fg = fg; // #939: for the focus-change WARN's author line
 
 	/* (b') #939: is the foreground still an echo of OUR OWN last move? The
 	 * park/unpark pair below writes the foreground on every focus change and
@@ -12900,6 +12947,34 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		int32_t best = pipeline_pick_focus(sys, mc, &reason);
 		if (best != mc->focused_slot) {
 			U_LOG_W("[pipeline] default focus: slot %d -> %d (%s)", mc->focused_slot, best, reason);
+			{
+				/* #939: name the foreground window behind this verdict —
+				 * once per focus change, never per frame. Which client (if
+				 * any) it belongs to, its owning process, and its title, so
+				 * a foreground flap has an author. `foreground` verdicts are
+				 * the interesting ones; the rest still say what the OS
+				 * foreground was at the time, which is what tells a hold
+				 * from a hand-off. */
+				HWND vfg = mc->focus_verdict_fg;
+				DWORD vpid = 0;
+				char vtitle[64] = {0};
+				int vslot = -1;
+				bool vowned = false;
+				if (vfg != nullptr && IsWindow(vfg)) {
+					GetWindowThreadProcessId(vfg, &vpid);
+					GetWindowTextA(vfg, vtitle, (int)sizeof(vtitle));
+					for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+						struct d3d11_service_compositor *sc = mc->clients[s].compositor;
+						if (sc != nullptr && (sc->render.hwnd == vfg || sc->render.weave_hwnd == vfg)) {
+							vslot = s;
+							vowned = sc->render.owns_window;
+							break;
+						}
+					}
+				}
+				U_LOG_W("[pipeline]   foreground was hwnd=%p pid=%lu slot=%d%s title='%s' (#939)", (void *)vfg,
+				        (unsigned long)vpid, vslot, vowned ? " (runtime-owned)" : "", vtitle);
+			}
 			mc->focused_slot = best;
 			// #964 Phase A: stamp the acquisition so the new-app rule can tell
 			// "started after the incumbent took the panel" from "was already
@@ -12917,6 +12992,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// (#939): there both are desktop peers and z-order already shows
 			// the foreground one.
 			pipeline_park_loser_for_winner(mc, was_focused, best);
+			// #939 holder liveness: the loser is no longer the holder, so its
+			// stall clock is meaningless — reset it here explicitly rather
+			// than rely on the courtesy-repaint probe to do it later.
+			if (was_focused >= 0 && was_focused < D3D11_MULTI_MAX_CLIENTS &&
+			    mc->clients[was_focused].compositor != nullptr) {
+				mc->clients[was_focused].compositor->stall_since_ns = 0;
+			}
 			// #1018: the INCOMING one may itself be parked — restore it, or
 			// the ready-probe skips it every frame and the panel goes black.
 			// Covers the survivor-fallback path too (holder exits -> next).
