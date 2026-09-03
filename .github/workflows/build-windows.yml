@@ -283,6 +283,30 @@ jobs:
           }
           Write-Host "PASS: sim-input provider built and exports xrtInputPluginNegotiate."
 
+      # Unit tests. `tests/` has carried ~20 Catch2 suites that CI BUILT and never
+      # RAN -- `grep -rn ctest .github/workflows/` returned nothing before this
+      # step, so every invariant pinned in there was pinned on developer boxes
+      # only. Hardware-free by construction (the suites own no graphics types), so
+      # this costs seconds and is the only place some fixes CAN be covered: the
+      # app-level zones arm cannot run on a hosted runner at all (no Vulkan ICD is
+      # registered; the sole adapter is "Microsoft Hyper-V Video").
+      - name: Unit tests (ctest)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $bd = if (Test-Path build) { "build" } else { "_build" }
+          if (-not (Test-Path $bd)) {
+            Write-Host "::error::no build dir -- cannot run ctest."
+            exit 1
+          }
+          # -C matches the multi-config generator; --output-on-failure so a red
+          # check names the assertion instead of just a count.
+          ctest --test-dir $bd -C Release --output-on-failure --no-tests=error
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::unit tests failed."
+            exit 1
+          }
+
       # First runtime EXECUTION smoke test in CI. Every other job only builds.
       # `displayxr-cli selftest` creates an instance + system devices headlessly
       # (no compositor, no GPU, no window), discovers the display processor via
