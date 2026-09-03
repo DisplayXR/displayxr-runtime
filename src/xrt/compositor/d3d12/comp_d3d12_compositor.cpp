@@ -4081,7 +4081,7 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 		// fill a gap that was closing on its own. But the same constant made
 		// panel rate unreachable for a present-capped app (hz20: the first
 		// missed vblank of EVERY app frame is unrepaintable; hz30: interval
-		// = exactly 2 periods, the gate never opens — measured repaints/s
+		// = exactly 2 periods, the gate never opens — measured repaint/s
 		// 0.0). u_repaint_gate keeps the intent in vblank counts instead:
 		// when the app provably presents every N vblanks, each app frame
 		// gets a budget of N-1 repaints presented clear of the app's own

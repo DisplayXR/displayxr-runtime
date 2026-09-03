@@ -63,7 +63,7 @@ computed. Reading B: the whole pipeline — render, composite, 4K weave, local p
 is ~460 ms/s on the iGPU, i.e. **~74 ms/s (≈1.2 ms/frame) more than A's receive cost
 alone**, with the dGPU idle. System-wide, B uses ~25 % less total GPU time.
 
-| Forced repaint (`DXR_WEAVE_REPAINT_FORCE=1`, both configs settled at ~30 repaints/s) | app iGPU 3d | app dGPU 3d | app dGPU copy | iGPU total | dGPU total |
+| Forced repaint (`DXR_WEAVE_REPAINT_FORCE=1`, both configs settled at ~30 repaint/s) | app iGPU 3d | app dGPU 3d | app dGPU copy | iGPU total | dGPU total |
 |---|---|---|---|---|---|
 | A force | 423.4 | 10.7 | **326.8** | 436.9 | 352.2 |
 | B force | 427.5 | — | — | 428.2 | ~0 |

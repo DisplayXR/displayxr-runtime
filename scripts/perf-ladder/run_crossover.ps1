@@ -264,8 +264,10 @@ function Invoke-Cell {
     if ($all.Count -gt $witBefore) { $wit = $all[$witBefore..($all.Count - 1)] }
     $wp = 0.0; $ww = 0.0
     if ($wit.Count -gt 0) {
-        $wp = Get-TrueMedian @($wit | ForEach-Object { $_.PresentsPerS })
-        $ww = Get-TrueMedian @($wit | ForEach-Object { $_.WeavesPerS })
+        # #1339 rename: CSV column presents_s carries the WEAVE rate and
+        # weaves_s the PRESENT rate (unchanged values, new source names).
+        $wp = Get-TrueMedian @($wit | ForEach-Object { $_.WeavePerS })
+        $ww = Get-TrueMedian @($wit | ForEach-Object { $_.PresentPerS })
     } else { $flags += 'NO_WITNESS' }
 
     Stop-Named @($cliBase, 'gpu_loadgen', $svcBase)

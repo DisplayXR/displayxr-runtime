@@ -18,7 +18,7 @@
  * frame and most of the idle window with it (measured ceiling ~1 repaint
  * per app frame instead of 2); at 30 Hz the interval is exactly 2 periods
  * and the gate NEVER opens — a repaint dead zone (#1257, hz30 witness:
- * repaints/s = 0.0).
+ * repaint/s = 0.0).
  *
  * This helper keeps the constant's INTENT — never compete with an
  * imminent app frame — but reasons in VBLANK COUNTS over the FIFO
@@ -39,7 +39,7 @@
  *    EARLIEST PLAUSIBLE next commit (a displaced commit arrives a
  *    vblank early). A repaint presented or lock-held past that lands
  *    where the app's next frame needs to be and costs the app a whole
- *    vblank (measured as weaves/s < presents/s + degraded cadence).
+ *    vblank (measured as present/s < weave/s + degraded cadence).
  *    N >= 3 deliberately falls back to the legacy gate — five schedule
  *    variants lost to it on hardware (#1257).
  *  - A closed-loop governor sheds budget by the ring's own slipped-
@@ -367,7 +367,7 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	if (g->mode == 0) {
 		/*
 		 * Default is the LEGACY schedule. The N=2 adaptive window won its
-		 * perf numbers (hz30: 0 -> ~15 repaints/s) but FAILED the human
+		 * perf numbers (hz30: 0 -> ~15 repaint/s) but FAILED the human
 		 * eyeball: the trust ladder engages intermittently, the panel rate
 		 * breathes 28-50 updates/s, and an oscillating cadence reads as
 		 * judder where a steady 33 does not — the eye grades cadence
@@ -430,8 +430,8 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 *    vblanks exactly — a budget, not a rate.
 	 *  - A repaint PRESENTED after (N-1) periods lands in the slot the
 	 *    app's next frame needs, pushing the app out a whole vblank.
-	 *    That queue theft is what round 2 measured as weaves/s <
-	 *    presents/s AND as the inflated "jitter": the feature was
+	 *    That queue theft is what round 2 measured as present/s <
+	 *    weave/s AND as the inflated "jitter": the feature was
 	 *    displacing the very cadence it was predicting. So the window
 	 *    closes a quarter period (≈ one replay, measured 3.5-7.5 ms)
 	 *    before that boundary, and the budget caps the queue depth.
@@ -567,7 +567,7 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 		 * frame must all fit strictly inside the app interval with half
 		 * a period of guard — otherwise the last repaint steals the slot
 		 * the app's next frame needs (the queue theft the #1257 rounds
-		 * measured as weaves/s < presents/s). interval_ema >= period is
+		 * measured as present/s < weave/s). interval_ema >= period is
 		 * established by _fill_ok, and period/2 < period, so the
 		 * subtraction cannot wrap; the explicit test keeps that true for
 		 * any future caller.
@@ -686,7 +686,7 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	 * commit waits ~5 ms, misses its vblank, and vsync snaps the slip to
 	 * 16.7 ms. Measured: the first build whose adaptive schedule really
 	 * ran at hz20 degraded the app from a 50 ms to a true ~60 ms cadence
-	 * (weaves/s 20 -> 16.6) — repaints that displace app frames make the
+	 * (present/s 20 -> 16.6) — repaints that displace app frames make the
 	 * panel fresher but the CONTENT staler, strictly worse than doing
 	 * nothing. The ring already records the damage as slipped intervals
 	 * (>= N+0.5 beats), so the budget sheds one repaint per three slips

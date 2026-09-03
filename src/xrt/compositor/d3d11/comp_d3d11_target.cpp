@@ -845,7 +845,7 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 	g_present_wd_enter_ns.store(0, std::memory_order_release);
 	if (SUCCEEDED(hr)) {
 		// Witness counts frames that actually reached the chain — the 50 ms
-		// drop path above intentionally shows up as a lower presents/s.
+		// drop path above intentionally shows up as a lower weave/s.
 		g_frame_witness_d3d11.count_present();
 	}
 	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);

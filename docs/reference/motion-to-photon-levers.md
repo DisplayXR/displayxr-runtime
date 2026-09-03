@@ -17,19 +17,25 @@ does with it is the DP's business.
 ## Terminology — present, repaint, weave (agreed 2026-09-03)
 
 Three rates, defined from the app outward. Use these words in issues, reports and reviews;
-the `[WITNESS]` log line currently names two of them **the other way round** (see below).
+since #1339 the `[WITNESS]` log line names its columns the same way.
 
-| term | meaning | ideal | `[WITNESS]` column today |
+| term | meaning | ideal | `[WITNESS]` column |
 |---|---|---|---|
-| **present rate** | app frames per second — what the app produces | the app's own cadence (under `DXR_APP_FRAME_DIVISOR=D`: refresh ÷ D, exactly) | `weaves/s` |
-| **repaint rate** | extra re-weaves of the *last* app frame at a fresh eye pose (#868) — no new app content | fills the refresh slots the app does not use | `repaints/s` |
-| **weave rate** | present + repaint — everything that reaches the panel | ≈ display refresh, and **steady** | `presents/s` |
+| **present rate** | app frames per second — what the app produces | the app's own cadence (under `DXR_APP_FRAME_DIVISOR=D`: refresh ÷ D, exactly) | `present/s` |
+| **repaint rate** | extra re-weaves of the *last* app frame at a fresh eye pose (#868) — no new app content | fills the refresh slots the app does not use | `repaint/s` |
+| **weave rate** | present + repaint — everything that reaches the panel | ≈ display refresh, and **steady** | `weave/s` |
 
-`weaves/s + repaints/s == presents/s` holds to 0.00/s in the witness (the two weave counters are
-stamped at the weave mark, the present counter after a `SUCCEEDED` present — two instruments
-that agree, so nothing is lost between them). Only the *names* invert: the witness calls the
-panel flip a "present" after the DXGI call, and the app frame a "weave". That collision cost a
-review; the columns are being renamed to `app/s` / `repaint/s` / `panel/s` (#1339 follow-up).
+`present/s + repaint/s == weave/s` holds to 0.00/s in the witness (the two weave counters are
+stamped at the weave mark, the panel-flip counter after a `SUCCEEDED` present — two instruments
+that agree, so nothing is lost between them).
+
+**Legacy keys, one release only (#1339).** The line used to name two of these the other way
+round: its `weaves/s` was the present rate and its `presents/s` the weave rate, because the
+panel flip was named after the DXGI `Present` call. That collision cost a review. The witness
+now emits the agreed names first and repeats the same three numbers under the old names in a
+trailing `(legacy keys: presents/s=… weaves/s=… repaints/s=…)` group, so external harnesses
+that regex the old keys keep reading exactly what they always did. The legacy group is removed
+next release — move parsers to `present/s` / `repaint/s` / `weave/s` now.
 
 Two rules that follow from the definitions:
 
@@ -93,7 +99,7 @@ compete with an imminent app frame, and the loops originally enforced that with 
 constant: repaint only after ≥ 2 panel periods of app silence. That constant made panel
 rate structurally unreachable for a present-capped app — at 20 Hz it forbids repainting
 the first missed vblank of *every* app frame, and at 30 Hz (interval = exactly 2 periods)
-the gate never opens at all (measured repaints/s 0.0). Two rounds of ms-domain
+the gate never opens at all (measured repaint/s 0.0). Two rounds of ms-domain
 "EMA ± jitter" prediction also failed measurably: a vsynced capped app's intervals are
 quantized to period multiples, so honest jitter reads 12–23 ms on a metronomic app, and
 repaints presented late in the gap steal the app's own FIFO queue slot — inflating the
@@ -102,7 +108,7 @@ estimates the cadence in vblank counts — "the app presents every N vblanks", v
 mode-majority / coherent-mean ladder over round(interval/period). An adaptive N = 2 window
 exists behind `DXR_WEAVE_REPAINT_GATE=adaptive` (one repaint fills the one missed vblank,
 governor-guarded) but is **not the default**: its perf win was real (hz30: 0.0 → ~15-17
-repaints/s) yet the trust ladder engages intermittently, the panel cadence breathes
+repaint/s) yet the trust ladder engages intermittently, the panel cadence breathes
 28-50 updates/s, and the eyeball verdict was judder — **the eye grades cadence stability,
 not average rate**; a steady 33 beats an oscillating 28-50. At **N ≥ 3 five schedule
 variants lost to the legacy gate on hardware** — fires collide with displaced-early

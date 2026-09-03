@@ -277,11 +277,14 @@ function Get-WitnessLines {
     if ([string]::IsNullOrEmpty($logPath) -or -not (Test-Path $logPath)) { return @() }
     $out = @()
     foreach ($ln in (Get-Content $logPath -ErrorAction SilentlyContinue)) {
-        if ($ln -match '\[WITNESS\] site=(\S+) window=([\d.]+)s presents/s=([\d.]+) weaves/s=([\d.]+) repaints/s=([\d.]+) mode=(\S+)') {
+        # #1339: the witness now names the columns present/s (app frames),
+        # repaint/s and weave/s (everything reaching the panel). The legacy
+        # trio is still emitted for one release; parse the NEW keys.
+        if ($ln -match '\[WITNESS\] site=(\S+) window=([\d.]+)s present/s=([\d.]+) repaint/s=([\d.]+) weave/s=([\d.]+) mode=(\S+)') {
             $out += New-Object PSObject -Property @{
                 Site = $Matches[1]; WindowS = [double]$Matches[2]
-                PresentsPerS = [double]$Matches[3]; WeavesPerS = [double]$Matches[4]
-                RepaintsPerS = [double]$Matches[5]; Mode = $Matches[6]
+                PresentPerS = [double]$Matches[3]; RepaintPerS = [double]$Matches[4]
+                WeavePerS = [double]$Matches[5]; Mode = $Matches[6]
             }
         }
     }

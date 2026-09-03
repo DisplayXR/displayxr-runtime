@@ -197,7 +197,7 @@ here because the dwm term on the reference box is a documented **per-run** coin 
 (~0 ↔ ~150 ms/s regardless of arm, #1144) — within-arm spread was ≤4.5 against a
 between-arm gap of 99.3, so it tracked the arm, not the toggle. Cadence is a **pacing**
 result, not throughput: 60.00 with sd 0.000 versus 59.67 with sd 0.298, a mean gain of
-0.33 presents/s that is not worth quoting as speed.
+0.33 weave/s that is not worth quoting as speed.
 
 **It still must not ship on, because the benefit and the cost land on the same app
 class** — which is exactly the matrix at the top of this file:

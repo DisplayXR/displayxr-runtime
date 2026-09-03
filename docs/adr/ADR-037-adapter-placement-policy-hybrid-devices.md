@@ -421,8 +421,8 @@ before it is attempted.
 
    | app | rung 2 (render) | rung 3 (`DXR_VK_FORCE_GPU=scanout`) |
    |---|---|---|
-   | light (`cube_handle_vk_win`) | 60.0 presents/s, dGPU ~70 ms/s | **60.0 presents/s, dGPU 0** |
-   | heavy (gaussian splat) | 59.9 presents/s, 59.9 weaves/s | **51.4 presents/s, 15.1 weaves/s** |
+   | light (`cube_handle_vk_win`) | 60.0 weave/s, dGPU ~70 ms/s | **60.0 weave/s, dGPU 0** |
+   | heavy (gaussian splat) | 59.9 weave/s, 59.9 present/s | **51.4 weave/s, 15.1 present/s** |
 
    For LIGHT Vulkan content rung 3 is free: identical throughput while the
    discrete GPU goes to exactly zero (the iGPU roughly doubles, to ~134 ms/s,

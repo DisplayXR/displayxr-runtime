@@ -76,6 +76,9 @@ foreach ($a in $armNames) {
         dwm         = Get-TrueMedian @($r | ForEach-Object { [double]$_.dwm })
         total       = Get-TrueMedian @($r | ForEach-Object { [double]$_.total_gpu })
         app_cpu     = Get-TrueMedian @($r | ForEach-Object { [double]$_.app_cpu })
+        # #1339: CSV column names predate the rename - presents_s is the
+        # WEAVE rate, weaves_s the PRESENT rate. Values are unchanged; only
+        # the reported column order/labels below follow the new vocabulary.
         presents    = Get-TrueMedian @($r | ForEach-Object { [double]$_.presents_s })
         weaves      = Get-TrueMedian @($r | ForEach-Object { [double]$_.weaves_s })
         repaints    = Get-TrueMedian @($r | ForEach-Object { [double]$_.repaints_s })
@@ -107,7 +110,7 @@ function Add-Comp {
     # $arms: the input-arm median objects - min n across them gates the verdict
     # (a single-rep run has NO spread information; zero spread must read as
     # SINGLE-REP, never as precision). $forceVerdict for arms that measured
-    # nothing (e.g. repaint pair with 0 repaints/s).
+    # nothing (e.g. repaint pair with 0 repaint/s).
     param([string]$name, $value, $spread, [string]$unit, [string]$derivation, [string]$note = '', $arms = @(), [string]$forceVerdict = '')
     if ($value -eq $null) { return }
     $v = [math]::Round([double]$value, 3)
@@ -174,7 +177,7 @@ if ($rpArm -ne $null -and $rpBase -ne $null) {
     $rpForce = ''
     $note = 'active'
     if ($rpArm.repaints -le 5) { $note = 'NO REPAINTS - app never present-quiet; arm measures nothing'; $rpForce = 'INVALID' }
-    Add-Comp 'repaint_tax' ($rpArm.app_dwm - $rpBase.app_dwm) ($rpArm.spread + $rpBase.spread) 'pts' ('repaint on - off at ' + $rpArm.repaints + ' repaints/s') $note @($rpArm, $rpBase) $rpForce
+    Add-Comp 'repaint_tax' ($rpArm.app_dwm - $rpBase.app_dwm) ($rpArm.spread + $rpBase.spread) 'pts' ('repaint on - off at ' + $rpArm.repaints + ' repaint/s') $note @($rpArm, $rpBase) $rpForce
     if ($rpArm.repaints -gt 5) {
         Add-Comp 'ms_per_repaint' (10.0 * ($rpArm.app_dwm - $rpBase.app_dwm) / $rpArm.repaints) (10.0 * ($rpArm.spread + $rpBase.spread) / $rpArm.repaints) 'ms' 'repaint_tax / repaint rate' '' @($rpArm, $rpBase)
     }
@@ -273,14 +276,14 @@ $out += '## Per-arm medians (GPU busy %, Running-Time deltas; spread = max-min a
 $out += ''
 $out += 'app+dwm is the SUBJECT (client + svc + dwm). **tot@scanout / tot@other are adapter totals across ALL processes** and are first-class, not noise: the same physical cross-adapter transfer is charged to the SERVICE when a bridge issues it explicitly, but to dwm/System when it happens implicitly inside Present - so subject-only accounting flatters the implicit arm and biases against the split (#1154).'
 $out += ''
-$out += '| arm | n | app@scanout | app@other | svc | dwm | app+dwm | spread | tot@scanout | tot@other | total | app CPU | presents/s | weaves/s | repaints/s | mode | flags |'
+$out += '| arm | n | app@scanout | app@other | svc | dwm | app+dwm | spread | tot@scanout | tot@other | total | app CPU | present/s | repaint/s | weave/s | mode | flags |'
 $out += '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|'
 foreach ($a in $armNames) {
     $m = $med[$a]
     $out += ('| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} | {11} | {12} | {13} | {14} | {15} | {16} |' -f `
         $a, $m.n, $m.app_scanout, $m.app_other, $m.svc, $m.dwm, $m.app_dwm, $m.spread, `
         $m.tot_scanout, $m.tot_other, $m.total, $m.app_cpu, `
-        $m.presents, $m.weaves, $m.repaints, $m.mode, $m.flags)
+        $m.weaves, $m.repaints, $m.presents, $m.mode, $m.flags)
 }
 $out += ''
 
