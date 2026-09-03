@@ -3417,6 +3417,24 @@ struct d3d11_multi_compositor
 	HWND focus_fg_last;
 	int focus_fg_stable;
 
+	//! #939: deadline (monotonic ns, 0 = none) until which the OS foreground is
+	//! an ECHO OF OUR OWN WRITE and carries no user intent.
+	//!
+	//! `pipeline_pick_focus` both READS the foreground and, through the park /
+	//! unpark pair on a focus change, WRITES it. `ShowWindowAsync` lands a few
+	//! ticks later, the debounced sample then reads the result back, and the
+	//! rule treats it as a gesture — a read-your-own-write loop that oscillated
+	//! the panel at ~10 Hz between a present-owner and a hosted `#1014` client.
+	//! While `now` is before this deadline the foreground rules yield no verdict
+	//! and the current holder keeps the panel; the new-app rule is untouched.
+	//!
+	//! `focus_fg_selfmove_suppressed_logged` rate-limits the WARN to once per
+	//! window (cleared when the window expires).
+	//!
+	//! Render-thread only, under render_mutex; no other reader.
+	int64_t focus_fg_selfmove_until_ns;
+	bool focus_fg_selfmove_suppressed_logged;
+
 	//! #964 Phase A: when the current holder ACQUIRED the panel (monotonic ns,
 	//! 0 = never). The "new app" rule compares a candidate's `first_frame_ns`
 	//! against this: a client that started rendering AFTER the incumbent took
@@ -11715,6 +11733,19 @@ pipeline_flat_present(struct d3d11_service_system *sys, struct d3d11_service_com
 #define PIPELINE_FOCUS_FG_STABLE_FRAMES 2
 
 /*!
+ * #939: how long a foreground change is treated as an echo of the runtime's OWN
+ * window move (the park / unpark pair on a focus change) rather than as a user
+ * gesture.
+ *
+ * `ShowWindowAsync` is asynchronous and the foreground sample is
+ * PIPELINE_FOCUS_FG_STABLE_FRAMES-debounced on top, so the echo arrives several
+ * ticks after we issue the move; 250 ms covers that with margin at any frame
+ * rate while staying far below the reaction time of a user who saw the same
+ * event. A real Alt-Tab is never inside a window the runtime itself opened.
+ */
+static constexpr int64_t PIPELINE_FOCUS_SELFMOVE_QUIET_NS = 250 * 1000 * 1000;
+
+/*!
  * #964 Phase A: sample the OS foreground window, debounced.
  *
  * Normalised to its root window: a client may activate a child/owned window (a
@@ -11831,6 +11862,34 @@ pipeline_slot_for_foreground(struct d3d11_multi_compositor *mc, HWND fg)
 		if (!pipeline_slot_presenting(slot) || slot->compositor->client_pid == 0) {
 			continue;
 		}
+		/* #939: two kinds of slot have nothing for the process fallback to
+		 * disambiguate, so a match on them can only be a mis-fire.
+		 *
+		 * (i) A slot whose own window is ICONIC right now — we parked it
+		 *     ourselves on the last focus change. Matching it on the process
+		 *     of some OTHER window resurrects a window the user is not
+		 *     looking at, and the unpark then raises it back over whatever
+		 *     the user actually foregrounded.
+		 *
+		 * (ii) A slot presenting through a window the RUNTIME created (#1014
+		 *      hosted). The fallback was added for engine apps whose bound
+		 *      overlay differs from their Alt-Tab-able main window; a
+		 *      runtime-created window has exact identity by construction, so
+		 *      the exact-HWND match above is authoritative and a process
+		 *      match can only land on a SIBLING window of the host process
+		 *      (e.g. Chrome's ordinary browser window beside its WebXR
+		 *      session).
+		 *
+		 * Neither weakens the user's control: restoring such a window from
+		 * the taskbar foregrounds it and still wins the exact match above.
+		 */
+		HWND fb_own = pipeline_slot_own_window(slot);
+		if (fb_own != nullptr && IsIconic(fb_own)) {
+			continue;
+		}
+		if (slot->compositor->render.owns_window) {
+			continue;
+		}
 		if ((DWORD)slot->compositor->client_pid != fg_pid) {
 			continue;
 		}
@@ -11873,6 +11932,27 @@ pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 }
 
 /*!
+ * #939: note that a foreground verdict was DROPPED because the runtime itself
+ * moved that window moments ago.
+ *
+ * Fires at most once per self-move window (the flag is cleared when the window
+ * expires), and only when the dropped verdict would actually have changed
+ * hands — a foreground rule that re-elects the current holder is a no-op worth
+ * no line. NOT per frame.
+ */
+static void
+pipeline_focus_note_selfmove_suppressed(struct d3d11_multi_compositor *mc, int32_t would_be, int32_t cur)
+{
+	if (mc->focus_fg_selfmove_suppressed_logged) {
+		return;
+	}
+	mc->focus_fg_selfmove_suppressed_logged = true;
+	U_LOG_W("[pipeline] focus: foreground says slot %d but slot %d keeps the panel — that foreground is an echo of "
+	        "our own park/unpark (< %d ms ago) (#939)",
+	        would_be, cur, (int)(PIPELINE_FOCUS_SELFMOVE_QUIET_NS / (1000 * 1000)));
+}
+
+/*!
  * #964 Phase A (D-3/D-5): pick the slot that owns the panel this frame.
  *
  * "Focus follows the OS foreground window": when the user Alt-Tabs to (or
@@ -11889,6 +11969,14 @@ pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
  * keeps it. Only when the holder stops presenting does the newest-presenting
  * fallback (#962) pick its successor — which is also the rule at cold start,
  * before anything has ever been focused.
+ *
+ * #939: neither does it change hands on a foreground WE just caused. The
+ * park/unpark pair the caller runs on a focus change moves the OS foreground,
+ * and reading that back as a gesture oscillated the panel. For
+ * PIPELINE_FOCUS_SELFMOVE_QUIET_NS after such a move the foreground rules
+ * yield no verdict and the holder keeps the panel — the new-app rule and the
+ * newest/fallback rules are unaffected, as is any user Alt-Tab (which never
+ * lands inside a window the runtime itself opened).
  *
  * Called only from pipeline_default_policy_render. Under a controller the
  * controller owns `focused_slot`; the foreground override there is a per-frame
@@ -11922,11 +12010,32 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 	/* (b) Debounced foreground sample — once per frame, here. */
 	HWND fg = pipeline_sample_foreground(mc);
 
+	/* (b') #939: is the foreground still an echo of OUR OWN last move? The
+	 * park/unpark pair below writes the foreground on every focus change and
+	 * this function reads it back — a read-your-own-write loop. While the quiet
+	 * window is open the foreground rules yield NO VERDICT and we fall through
+	 * to the hold rule; the new-app rule (d) is deliberately not suppressed, so
+	 * a genuinely new presenter still gets its turn. */
+	bool fg_selfmove = false;
+	if (mc->focus_fg_selfmove_until_ns != 0) {
+		if ((int64_t)os_monotonic_get_ns() < mc->focus_fg_selfmove_until_ns) {
+			fg_selfmove = true;
+		} else {
+			mc->focus_fg_selfmove_until_ns = 0;
+			mc->focus_fg_selfmove_suppressed_logged = false;
+		}
+	}
+
 	/* (c) A client's own window in the foreground wins outright. */
 	int32_t match = pipeline_slot_for_foreground(mc, fg);
 	if (match >= 0) {
-		*out_reason = "foreground";
-		return match;
+		if (!fg_selfmove) {
+			*out_reason = "foreground";
+			return match;
+		}
+		if (match != cur) {
+			pipeline_focus_note_selfmove_suppressed(mc, match, cur);
+		}
 	}
 
 	/* (c') The shared service window in the foreground: the focused HOSTED
@@ -11948,8 +12057,13 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
 			}
 		}
 		if (hosted >= 0) {
-			*out_reason = "foreground";
-			return hosted;
+			if (!fg_selfmove) {
+				*out_reason = "foreground";
+				return hosted;
+			}
+			if (hosted != cur) {
+				pipeline_focus_note_selfmove_suppressed(mc, hosted, cur);
+			}
 		}
 	}
 
@@ -12529,6 +12643,13 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// the ready-probe skips it every frame and the panel goes black.
 			// Covers the survivor-fallback path too (holder exits -> next).
 			pipeline_unpark_app_hwnd(mc, best);
+			// #939: both of those calls WRITE the OS foreground (SW_MINIMIZE /
+			// SW_RESTORE, asynchronously). Open the quiet window so
+			// pipeline_pick_focus does not read the result back a few ticks
+			// later and mistake it for a user gesture.
+			mc->focus_fg_selfmove_until_ns =
+			    (int64_t)os_monotonic_get_ns() + PIPELINE_FOCUS_SELFMOVE_QUIET_NS;
+			mc->focus_fg_selfmove_suppressed_logged = false;
 			// #1016: and the incoming one takes the qwerty ticker with it.
 			pipeline_set_qwerty_owner(mc, pipeline_slot_runtime_window(mc, best));
 
