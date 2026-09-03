@@ -73,9 +73,15 @@ Four consequences for this skill:
 - **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
   `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
   manual `workflow_dispatch` build lanes and never fire on a tag.
-- **Signing happens INSIDE the publish workflow** (Windows via the EV signing runner,
-  Android via `apksigner` + the keystore secret), so Phase 3.5 is **skipped** for
-  browser — there is nothing for the hub to re-sign and re-upload.
+- **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
+  "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
+  it is just signed one step earlier than every other component. Its Windows
+  installer goes through the *same* EV signing runner dispatch as everything else,
+  but the publish lane fires it, not this skill — because the lane must also sign
+  the **Android APK**, and that uses `apksigner` with a keystore rather than the
+  hardware dongle the EV chain needs. One component, two signing mechanisms, one
+  place to run them: the lane. By the time Phase 3 goes green the assets are
+  already signed, so a hub-side re-sign would rebuild and overwrite a good asset.
 - **Asset ops target `$REL_REPO`** (`displayxr-browser`), same trap as shell. The
   `versions-bump` dispatch fires from the pvt publish workflow with a
   `displayxr-publish-bot` token scoped to `displayxr-runtime`.
@@ -293,9 +299,12 @@ CI_CONC="${S#completed/}"
 
 ## PHASE 3.5: CODE-SIGN THE COMPONENT INSTALLER (capability-gated)
 
-**Skip this entire phase for `browser`** — its publish workflow signs in-CI (Windows
-installer via the EV signing runner, Android APK via `apksigner`), so the release
-asset is already signed when Phase 3 goes green. Verify instead of re-signing:
+**Skip this entire phase for `browser`** — signing already happened, one step
+earlier. Its publish workflow dispatches the same EV signing runner this phase
+would (Windows installer) *and* signs the Android APK with `apksigner` + a
+keystore, which the dongle-bound EV chain cannot do. Both must run in the lane,
+so both do. The assets are signed by the time Phase 3 goes green; re-dispatching
+here would rebuild and clobber them. Verify instead of re-signing:
 ```bash
 if [ "$COMPONENT" = browser ]; then
   gh release view "$NEW_TAG" -R "$REL_REPO" --json assets --jq '.assets[].name'   # expect DisplayXR-Browser-Preview-Setup-X.Y.Z.exe (+ APKs)
