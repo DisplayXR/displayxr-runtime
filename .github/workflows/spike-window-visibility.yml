@@ -155,3 +155,100 @@ jobs:
         with:
           name: visibility-verdicts
           path: verdicts/
+
+  # ---------------------------------------------------------------------------
+  # THE REAL REGRESSION TEST: a shipped app must be visible on a machine with NO
+  # DisplayXR runtime installed.
+  #
+  # That property is exactly what v2.16.0 broke -- no runtime means no session,
+  # so a cloak whose un-cloak is gated on a session never lifts, and the app runs
+  # forever behind a window nobody can see. A hosted runner has nothing
+  # registered, so it IS the regressing configuration, for free. On a dev box the
+  # arm cannot be reproduced cheaply at all: clearing XR_RUNTIME_JSON does not
+  # help, because ActiveRuntime lives in HKLM and the loader falls back to it.
+  #
+  # Building a Unity player in CI is the expensive part (licence, GB of editor,
+  # tens of minutes). LAUNCHING one is ~40 s. So this job builds nothing: it
+  # takes the released sample installer and unpacks it with 7-Zip -- no install,
+  # no registry writes, no admin.
+  #
+  # The synthetic job above is what proves the gate has teeth (it contains a
+  # deliberately-broken input that the gate must fail). This job is the gate
+  # pointed at real bytes.
+  real-app-launch:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # PINNED on purpose. "latest" would make the gate a moving target: a red
+      # run could mean a new sample or a real regression, and you could not tell
+      # which. Bump this deliberately.
+      - name: Fetch and unpack the released sample player
+        id: player
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SAMPLE_TAG: v2.1.1
+        run: |
+          $ok = $true
+          try {
+            gh release download $env:SAMPLE_TAG --repo DisplayXR/displayxr-unity-samples --dir player --clobber
+          } catch { $ok = $false }
+          $setup = Get-ChildItem player\*.exe -EA SilentlyContinue | Select-Object -First 1
+          if (-not $ok -or -not $setup) {
+            # A gate that silently passes when it could not run is the very bug
+            # class this job exists for. Say so, and fail.
+            Write-Host "::error::could not obtain a player for tag $env:SAMPLE_TAG -- this arm proved NOTHING."
+            exit 1
+          }
+          Write-Host ("installer: {0} ({1:N1} MB)" -f $setup.Name, ($setup.Length / 1MB))
+
+          $7z = (Get-Command 7z -EA SilentlyContinue).Source
+          if (-not $7z) { $7z = "C:\Program Files\7-Zip\7z.exe" }
+          if (-not (Test-Path $7z)) { Write-Host "::error::no 7-Zip on this runner."; exit 1 }
+          & $7z x $setup.FullName -oplayer\x -y | Select-Object -Last 3
+
+          # The player, not UnityCrashHandler64.
+          $app = Get-ChildItem player\x -Recurse -Filter *.exe |
+                 Where-Object { $_.Name -ne 'UnityCrashHandler64.exe' } | Select-Object -First 1
+          if (-not $app) { Write-Host "::error::no player exe inside the installer."; exit 1 }
+          Write-Host "player: $($app.FullName)"
+          "exe=$($app.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: A shipped app must be visible with NO runtime installed
+        shell: pwsh
+        run: |
+          # Deadline generous, budget generous: a hosted runner is slower than a
+          # real box, and the absolute timing is NOT portable (the same player
+          # graded 2.4 s on a dev box). So the HARD gate is "ever presentable";
+          # "presentable but late" (exit 2) is reported as a warning, not a
+          # failure, until this runner has its own baseline.
+          & powershell -ExecutionPolicy Bypass -NoProfile -File scripts\test\app_visible_within.ps1 `
+              -Exe "${{ steps.player.outputs.exe }}" -NoRuntime `
+              -DeadlineSec 90 -BudgetSec 60 -Json verdict-real.json
+          $code = $LASTEXITCODE
+
+          if (-not (Test-Path verdict-real.json)) {
+            Write-Host "::error::no verdict written -- the arm proved nothing."
+            exit 1
+          }
+          $v = Get-Content verdict-real.json -Raw | ConvertFrom-Json
+          Write-Host ""
+          Write-Host "arm                  : $($v.arm)   (no DisplayXR runtime registered on this runner)"
+          Write-Host "ever_presentable     : $($v.ever_presentable)"
+          Write-Host "first_presentable_ms : $($v.first_presentable_ms)"
+
+          if (-not $v.ever_presentable) {
+            Write-Host "::error::the shipped app was NEVER visible with no runtime installed. This is the v2.16.0 regression."
+            exit 1
+          }
+          if ($code -eq 2) {
+            Write-Host "::warning::visible, but later than the budget ($($v.first_presentable_ms) ms > $($v.budget_ms) ms) -- the white-window shape. Runner timings are not portable; treat as a baseline signal."
+          }
+          Write-Host "PASS: visible with no runtime installed, after $($v.first_presentable_ms) ms."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: real-app-verdict
+          path: verdict-real.json
