@@ -1032,6 +1032,19 @@ struct xrt_session_info
 	//! workspace.
 	bool is_workspace_controller;
 
+	//! True when this session is an XR_DXR_weave PRESENT-OWNER (the DisplayXR
+	//! Browser). Populated server-side in ipc_handle_session_create from
+	//! ics->client_state.client_class == XRT_CLIENT_CLASS_PRESENT_OWNER. A
+	//! present-owner self-presents via the weave path (it calls
+	//! xrWeaveBindWindowDXR + xrWeaveSubmitDXR and presents the woven result
+	//! into its OWN window), so the D3D11 service must NOT create a runtime
+	//! swapchain on that window (PRESENTER_APP_HWND / CreateSwapChainForHwnd) —
+	//! it collides with the client's own present. Routes an external-HWND
+	//! present-owner to the shared-texture / client-presents path whether the
+	//! background is transparent OR opaque; the transparent flag then only
+	//! decides desktop show-through, not who owns the swapchain.
+	bool is_present_owner;
+
 	//! Application name from the creating OpenXR client's xrInstance info.
 	//! Populated server-side in ipc_handle_session_create from
 	//! ics->client_state.info.application_name; empty for in-process

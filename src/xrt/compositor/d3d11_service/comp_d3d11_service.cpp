@@ -6020,6 +6020,7 @@ static xrt_result_t
 init_client_render_resources(struct d3d11_service_system *sys,
                              void *external_hwnd,
                              bool transparent_hwnd,
+                             bool is_present_owner,
                              struct xrt_system_devices *xsysd,
                              struct d3d11_client_render_resources *res,
                              struct d3d11_service_compositor *c)
@@ -6201,8 +6202,17 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		// client asking for a transparent background needs no DComp route.
 		enum d3d11_presenter_kind kind = PRESENTER_SERVICE_WINDOW;
 		if (res->hwnd != nullptr) {
-			kind = (transparent_hwnd && external_hwnd != nullptr) ? PRESENTER_CLIENT_TEXTURE
-			                                                      : PRESENTER_APP_HWND;
+			// A weave PRESENT-OWNER (the DisplayXR Browser) presents its own
+			// window itself, so the service must not build a swapchain on that
+			// HWND — route it to the shared-texture / client-presents path
+			// whether its background is opaque or transparent. Historically only
+			// TRANSPARENT external HWNDs took this branch (an opaque external app
+			// went to APP_HWND); an opaque present-owner now joins it via
+			// is_present_owner, while a non-present-owner opaque external app is
+			// unchanged.
+			bool external_self_present =
+			    external_hwnd != nullptr && (transparent_hwnd || is_present_owner);
+			kind = external_self_present ? PRESENTER_CLIENT_TEXTURE : PRESENTER_APP_HWND;
 		}
 
 		if (kind == PRESENTER_CLIENT_TEXTURE) {
@@ -23203,9 +23213,11 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Get external window handle if app provided one via XR_DXR_win32_window_binding
 	void *external_hwnd = nullptr;
 	bool transparent_hwnd = false;
+	bool is_present_owner = false;
 	if (xsi != nullptr) {
 		external_hwnd = xsi->external_window_handle;
 		transparent_hwnd = xsi->transparent_background_enabled;
+		is_present_owner = xsi->is_present_owner;
 	}
 
 	if (!is_headless_relay && !is_workspace_controller) {
@@ -23217,7 +23229,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		}
 
 		xrt_result_t res_ret =
-		    init_client_render_resources(sys, external_hwnd, transparent_hwnd, sys->xsysd, &c->render, c);
+		    init_client_render_resources(sys, external_hwnd, transparent_hwnd, is_present_owner, sys->xsysd, &c->render, c);
 		if (res_ret != XRT_SUCCESS) {
 			U_LOG_E("Failed to initialize client render resources");
 			delete c;
