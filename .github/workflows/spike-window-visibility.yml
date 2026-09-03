@@ -1,4 +1,4 @@
-# SPIKE (not a required check, branch-scoped): can CI catch a permanently
+﻿# SPIKE (not a required check, branch-scoped): can CI catch a permanently
 # invisible window?
 #
 # The bug class: a cloaked window passes every "did it start" check. Process
@@ -124,9 +124,8 @@ jobs:
 
           # The discriminating pair, stated on its own: same cloak, and the only
           # difference is whether an overlay exists to be seen instead.
-          $rp = Get-Content "verdictsuntime_present.json" -Raw | ConvertFrom-Json
-          $nr = Get-Content "verdicts
-o_runtime.json" -Raw | ConvertFrom-Json
+          $rp = Get-Content "verdicts\runtime_present.json" -Raw | ConvertFrom-Json
+          $nr = Get-Content "verdicts\no_runtime.json" -Raw | ConvertFrom-Json
           Write-Host ""
           Write-Host "--- the discriminating pair ---"
           Write-Host ("runtime_present : presentable={0} ({1}/{2} windows) <- main window IS cloaked, and that is correct" -f $rp.presentable, $rp.windows_presentable, $rp.windows_total)
