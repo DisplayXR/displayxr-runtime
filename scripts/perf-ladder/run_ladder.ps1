@@ -254,9 +254,11 @@ function Invoke-ArmSample {
 
     $wp = 0.0; $ww = 0.0; $wr = 0.0; $wm = ''
     if ($wit.Count -gt 0) {
-        $wp = Get-TrueMedian @($wit | ForEach-Object { $_.PresentsPerS })
-        $ww = Get-TrueMedian @($wit | ForEach-Object { $_.WeavesPerS })
-        $wr = Get-TrueMedian @($wit | ForEach-Object { $_.RepaintsPerS })
+        # #1339 rename: CSV column presents_s carries the WEAVE rate and
+        # weaves_s the PRESENT rate (unchanged values, new source names).
+        $wp = Get-TrueMedian @($wit | ForEach-Object { $_.WeavePerS })
+        $ww = Get-TrueMedian @($wit | ForEach-Object { $_.PresentPerS })
+        $wr = Get-TrueMedian @($wit | ForEach-Object { $_.RepaintPerS })
         $wm = ($wit | Select-Object -Last 1).Mode
     }
 

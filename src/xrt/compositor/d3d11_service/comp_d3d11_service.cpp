@@ -127,7 +127,7 @@ extern "C" bool g_bridge_relay_active;
  *
  * #1112 wired the witness into the three in-process native compositors and
  * deferred this one, which has its own present machinery — so on the
- * service/IPC path presents/s and weaves/s were unmeasurable. Same header,
+ * service/IPC path weave/s and present/s were unmeasurable. Same header,
  * therefore byte-identical output; only the counting sites differ.
  *
  * AGGREGATE, NOT PER-PRESENTER. One witness per service process, summed over
@@ -140,7 +140,7 @@ extern "C" bool g_bridge_relay_active;
  *
  *  - the unfocused courtesy flat repaints (`pipeline_flat_present`) — real
  *    flips, but to windows that are not on the panel; counting them would put
- *    presents/s above the panel rate for reasons that have nothing to do with
+ *    weave/s above the panel rate for reasons that have nothing to do with
  *    throughput. They already have `[RENDER] pipe_flat_present`.
  *  - CLIENT_TEXTURE / XR_DXR_weave present-owners — the runtime signals a fence
  *    and the CLIENT presents, so no present happens in this process. Their
@@ -153,7 +153,7 @@ extern "C" bool g_bridge_relay_active;
  * (invariant F4 — never present a cleared-unwoven buffer; and the free-buffer
  * probes on both the service-window and APP_HWND chains). Every count_present()
  * below sits behind a *succeeded* Present, never behind a tick, so a skip
- * lowers presents/s instead of being counted as one. That distinction is the
+ * lowers weave/s instead of being counted as one. That distinction is the
  * whole point on the split arm, where skips are not rare.
  */
 #include "util/comp_frame_witness.h"
@@ -3329,7 +3329,7 @@ struct d3d11_multi_compositor
 	//! #964: pacing hand-off for an APP_HWND active presenter.
 	//!
 	//! When the service window is hidden its swap chain stops signaling, so the
-	//! render loop fell back to the 20 ms tick and landed ~50 presents/s against
+	//! render loop fell back to the 20 ms tick and landed ~50 weave/s against
 	//! a 60+ Hz panel. Instead the loop paces on the ACTIVE presenter's own
 	//! frame-latency waitable. `pace_app_waitable` / `pace_app_sc` are published
 	//! by pipeline_default_policy_render at the end of each frame (under
@@ -9029,7 +9029,7 @@ try {
 		// stops signaling.
 		// #964: when an APP_HWND client is the ACTIVE presenter the service
 		// window is hidden, and a hidden swap chain's waitable stops signaling
-		// — pacing on it degrades to the fallback tick (~50 presents/s against
+		// — pacing on it degrades to the fallback tick (~50 weave/s against
 		// a 60+ Hz panel). Pace on THAT PRESENTER'S OWN waitable instead: it
 		// signals right after its previous flip, exactly like the service
 		// window's does on the hosted path.
@@ -22593,7 +22593,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
 		// #625 present-owner: a real panel-DP weave, driven by the client's own
 		// synchronous submit. It presents the woven texture itself, so this
-		// contributes to weaves/s with no matching present (see header note).
+		// contributes to present/s with no matching panel flip (see header note).
 		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		if (acquired && in_km) {
