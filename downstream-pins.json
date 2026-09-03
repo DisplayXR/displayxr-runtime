@@ -170,9 +170,20 @@
       ]
     },
 
-    "displayxr-browser": {
+    "displayxr-browser-pvt": {
       "role": "Chromium fork; drives the display-processor weave over XR_DXR_weave. Windows + Android.",
       "gate": "hard",
+      "repo_note": [
+        "PRIVATE repo, and the key is the repo the audit READS -- so it must name",
+        "-pvt, not the public displayxr-browser. The 2026-09 split put everything",
+        "that BUILDS (patches/, scripts/, installer/, workflows) in the private repo",
+        "and left everything that SHIPS (releases, assets, user-facing issues) on the",
+        "public one, which keeps its name. Both paths below moved with the source.",
+        "Reading a private repo needs the publish-bot App installation token that",
+        "drift-audit.yml already mints for displayxr-shell-pvt -- no new token. If",
+        "that mint ever degrades to the default GITHUB_TOKEN, this consumer goes",
+        "unreadable and the audit reports it rather than passing silently."
+      ],
       "declared_floor": { "file": "installer/DisplayXRBrowserInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" },
       "requires": { "weave": 8 },
       "requires_anchor": "patches/README.md",
