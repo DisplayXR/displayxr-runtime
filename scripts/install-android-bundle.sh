@@ -148,7 +148,13 @@ for c in "${COMPONENTS[@]}"; do
   TAG=$(pin "$FIELD")
   [ -z "$TAG" ] && { echo "   $NAME: no pin — skipped"; continue; }
   if gh release download "$TAG" -R "$REPO" -p "*.apk" -D "$WORK/apk" --clobber 2>/dev/null; then
-    A=$(ls -t "$WORK"/apk/*.apk | command grep -viE "android-arm64.apk$" | head -1)
+    # Exclude the RUNTIME APK by exact path, not by an "android-arm64.apk$" suffix.
+    # That suffix is not runtime-specific: the browser publishes as
+    # DisplayXR-Browser-Preview-X.Y.Z-android-arm64.apk, so the old filter dropped it and
+    # the browser was SILENTLY never installed -- the download SUCCEEDED, so the
+    # desktop-only fallback below never fired either. Demos were unaffected (their names
+    # carry no such suffix), which is why this went unnoticed.
+    A=$(ls -t "$WORK"/apk/*.apk | command grep -vF "$RUNTIME_APK" | head -1)
     [ -n "$A" ] && { APPS+=("$A"); echo "   $NAME: $(basename "$A")"; }
   else
     # The pinned release may be desktop-only. The browser is the live case:
