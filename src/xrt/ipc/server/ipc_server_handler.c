@@ -2150,6 +2150,7 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	{
 		uint32_t cls = ics->client_state.client_class;
 		xsi_local.is_workspace_controller = (cls == XRT_CLIENT_CLASS_CONTROLLER);
+		xsi_local.is_present_owner = (cls == XRT_CLIENT_CLASS_PRESENT_OWNER);
 		xsi_local.is_bridge_relay = (cls == XRT_CLIENT_CLASS_RELAY);
 		if (cls == XRT_CLIENT_CLASS_RELAY && create_native_compositor) {
 			IPC_WARN(ics->server,
