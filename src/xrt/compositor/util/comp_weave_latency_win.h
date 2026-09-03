@@ -495,7 +495,12 @@ struct late_weave_governor
 		 * workspace governor to depth 1 for EVERY client.
 		 */
 		const bool paced = u_app_partition_divisor() >= 2;
-		if (paced && !paced_logged) {
+		/* Only claim the hold when the partition is the REASON for it. With an
+		 * explicit DXR_LATE_WEAVE_MAX_LATENCY (base != 1) or AUTOBACKOFF=0 the
+		 * governor is off regardless, and attributing that depth to the partition
+		 * makes the WARN a lying witness for the one A/B this code invites
+		 * (pin 3 with the env var vs. the held 1). Reported by leaiss on #1342. */
+		if (paced && base == 1 && auto_backoff == 1 && !paced_logged) {
 			paced_logged = true;
 			U_LOG_W("Late-weave: app is PACED by the frame partition (divisor %u) -- "
 			        "governor held at max latency %d; the app-mark interval is not a "
