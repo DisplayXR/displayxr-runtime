@@ -31,6 +31,7 @@
 #include <dxgi.h>
 
 #include "comp_late_weave_lookahead.h"
+#include "util/u_app_partition.h" // #1339: u_app_partition_divisor()
 
 struct weave_latency_log
 {
@@ -259,6 +260,7 @@ struct late_weave_governor
 	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..MAX)
 	int auto_backoff = -1; // DXR_LATE_WEAVE_AUTOBACKOFF, default 1
 	int effective = 1;
+	bool paced_logged = false; // #1339 one-shot
 
 	// Saturation signal: EMA of weave-mark→weave-mark wall time, judged
 	// against the display period derived from DXGI frame statistics.
@@ -467,7 +469,40 @@ struct late_weave_governor
 			    (interval_ema_ns == 0.0) ? dt_ns : interval_ema_ns * 0.9 + dt_ns * 0.1;
 		}
 
-		if (base != 1 || auto_backoff != 1 || period_ns <= 0.0 || interval_ema_ns <= 0.0) {
+		/*
+		 * #1339: a PACED app is not a saturated one. Under DXR_APP_FRAME_DIVISOR=D
+		 * the runtime itself holds the app to every Dth vblank, so the app-mark
+		 * interval this governor measures reads ~D periods BY DESIGN -- and the
+		 * saturation test below cannot tell that from a pipeline that cannot make
+		 * rate. Measured: at D=3 it escalated to max latency 3 within 4 s on every
+		 * run, putting three refreshes between every weave (repaints included) and
+		 * the glass; a blind eyeball preferred depth 1 twice ("very good" vs "not
+		 * as good"), with the fill unchanged. Under the partition the pipeline that
+		 * reaches the panel is the weave loop, which is at display rate; extra
+		 * queue depth there buys no throughput and costs only motion-to-photon.
+		 * Hold the initialised depth (base, normally 1) for the app's life. The
+		 * divisor is env-set before the first mark, so no unwind path is needed;
+		 * an explicit DXR_LATE_WEAVE_MAX_LATENCY still wins (base != 1 above).
+		 *
+		 * SCOPE: this bites IN-PROCESS only. u_app_partition_divisor() is a
+		 * process-local getenv, and the partition is not wired into the IPC path
+		 * (u_app_partition.h: "deliberately NOT wired into the IPC/service path
+		 * yet"), so in the service's copy of this governor `paced` reads the
+		 * SERVICE's env, never a client's -- a no-op there, not a hold. The
+		 * service-side behaviour arrives when the divisor becomes a per-client
+		 * property sampled at weave-present (step 2 of #1339). Foot-gun: setting
+		 * DXR_APP_FRAME_DIVISOR in the service's own environment would pin the
+		 * workspace governor to depth 1 for EVERY client.
+		 */
+		const bool paced = u_app_partition_divisor() >= 2;
+		if (paced && !paced_logged) {
+			paced_logged = true;
+			U_LOG_W("Late-weave: app is PACED by the frame partition (divisor %u) -- "
+			        "governor held at max latency %d; the app-mark interval is not a "
+			        "saturation signal here (#1339)",
+			        u_app_partition_divisor(), effective);
+		}
+		if (paced || base != 1 || auto_backoff != 1 || period_ns <= 0.0 || interval_ema_ns <= 0.0) {
 			return 0;
 		}
 
