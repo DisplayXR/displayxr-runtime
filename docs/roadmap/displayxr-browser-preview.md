@@ -1,5 +1,13 @@
 # DisplayXR Browser — packaging the inline-3D fork as a developer preview
 
+> **Where the source lives (updated 2026-09-03).** This document is the ORIGINAL plan and its
+> milestone text is kept as written — P0–P4 describe what was done at the time, so rewriting them
+> would falsify the record. One thing has since moved: the patch series, build scripts and CI
+> named below as living in `displayxr-browser` are now in the **private** `displayxr-browser-pvt`.
+> The public `displayxr-browser` keeps its name and holds the **releases**, because
+> `versions.json[browser]`, `install-android-bundle.sh --links` and tester install URLs all
+> resolve against it. Release flow: `/dxr-release browser preview-X.Y.Z` (tags pvt).
+>
 > Status: **plan** (no build yet). Companion to [`webxr-support.md`](webxr-support.md) §2.4–2.6
 > (Step B) and [`webxr-step-b-design.md`](webxr-step-b-design.md). Tracks how we turn the working
 > `displayxr-inline-3d` Chromium patch into a downloadable browser product **without** signing up
