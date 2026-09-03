@@ -20787,6 +20787,86 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 }
 
 /*!
+ * #814/#939 — who is still standing once @p c has gone?
+ *
+ * THE survivor predicate for the teardown path. Both users need the same
+ * answer, so there is one scan: #814 asks it to decide whether the lens may go
+ * flat, #939 asks it to decide whether the fresh panel DP must come up in 3D.
+ *
+ * Two passes, because a renderable client can reach the panel two ways. The
+ * slot scan covers everything the pipeline composites; the `all_clients` pass
+ * covers what never holds a slot — #963 standalone clients on the legacy path,
+ * and weave present-owners, which have no slot on either path and are exactly
+ * the ones this predicate exists to notice.
+ *
+ * @param out_weave_owner_survives set when at least one survivor is a weave
+ *        present-owner (`render.weave_hwnd != nullptr`). Such a client holds
+ *        the panel in 3D merely by existing.
+ * @return the number of survivors.
+ *
+ * Caller must hold `sys->render_mutex` and must already have unregistered @p c
+ * from the multi-compositor, or the dying client counts itself.
+ */
+static uint32_t
+service_scan_teardown_survivors(struct d3d11_service_system *sys,
+                                struct d3d11_service_compositor *c,
+                                bool *out_weave_owner_survives)
+{
+	uint32_t survivors = 0;
+	bool weave_owner_survives = false;
+	struct d3d11_multi_compositor *mc = sys != nullptr ? sys->multi_comp : nullptr;
+	if (mc != nullptr) {
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			struct d3d11_service_compositor *other = mc->clients[i].compositor;
+			if (!mc->clients[i].active || other == nullptr || other == c) {
+				continue;
+			}
+			survivors++;
+			if (other->render.weave_hwnd != nullptr) {
+				weave_owner_survives = true;
+			}
+		}
+	}
+	// #963: STANDALONE survivors — clients that never held a slot (pure
+	// standalone service, or two hosted clients side by side). A standalone
+	// client that is presenting owns its own DP; it must not lose the panel
+	// because a sibling left. Caller holds render_mutex; clients_mutex nests
+	// inside it.
+	//
+	// #964 (D-6): LEGACY-ONLY. On the pipeline path every renderable client
+	// holds a slot, so the slot scan above is complete and this second pass
+	// would double-count. Weave present-owners are the one exception — they
+	// have no slot — so they are still scanned.
+	if (sys != nullptr) {
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		for (struct d3d11_service_compositor *other : sys->all_clients) {
+			if (other == c || other->is_bridge_relay) {
+				continue;
+			}
+			if (pipeline_always_on(sys)) {
+				if (other->render.weave_hwnd == nullptr) {
+					continue; // slotted; already counted above
+				}
+			} else if (other->render.display_processor == nullptr) {
+				continue;
+			}
+			bool in_slot = mc != nullptr && multi_comp_find_slot(mc, other) >= 0;
+			if (in_slot) {
+				continue; // already counted above
+			}
+			survivors++;
+			if (other->render.weave_hwnd != nullptr) {
+				weave_owner_survives = true;
+			}
+		}
+	}
+	if (out_weave_owner_survives != nullptr) {
+		*out_weave_owner_survives = weave_owner_survives;
+	}
+	return survivors;
+}
+
+/*!
  * #814 — fail safe to hardware 2D when the client that was holding the panel in
  * hardware 3D goes away.
  *
@@ -20835,54 +20915,8 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	// self-healing), so a surviving one would just re-assert 3D on its next
 	// submit; flattening here would only produce a visible flicker.
 	bool this_client_is_weave_owner = c->render.weave_hwnd != nullptr;
-	uint32_t survivors = 0;
 	bool survivor_wants_3d = false;
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc != nullptr) {
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			struct d3d11_service_compositor *other = mc->clients[i].compositor;
-			if (!mc->clients[i].active || other == nullptr || other == c) {
-				continue;
-			}
-			survivors++;
-			if (other->render.weave_hwnd != nullptr) {
-				survivor_wants_3d = true;
-			}
-		}
-	}
-	// #963: STANDALONE survivors — clients that never held a slot (pure
-	// standalone service, or two hosted clients side by side). A standalone
-	// client that is presenting owns its own DP; it must not lose the panel
-	// because a sibling left. Caller holds render_mutex; clients_mutex nests
-	// inside it.
-	//
-	// #964 (D-6): LEGACY-ONLY. On the pipeline path every renderable client
-	// holds a slot, so the slot scan above is complete and this second pass
-	// would double-count. Weave present-owners are the one exception — they
-	// have no slot — so they are still scanned.
-	{
-		std::lock_guard<std::mutex> reg(sys->clients_mutex);
-		for (struct d3d11_service_compositor *other : sys->all_clients) {
-			if (other == c || other->is_bridge_relay) {
-				continue;
-			}
-			if (pipeline_always_on(sys)) {
-				if (other->render.weave_hwnd == nullptr) {
-					continue; // slotted; already counted above
-				}
-			} else if (other->render.display_processor == nullptr) {
-				continue;
-			}
-			bool in_slot = mc != nullptr && multi_comp_find_slot(mc, other) >= 0;
-			if (in_slot) {
-				continue; // already counted above
-			}
-			survivors++;
-			if (other->render.weave_hwnd != nullptr) {
-				survivor_wants_3d = true;
-			}
-		}
-	}
+	uint32_t survivors = service_scan_teardown_survivors(sys, c, &survivor_wants_3d);
 	if (survivor_wants_3d) {
 		return;
 	}
@@ -20994,6 +21028,15 @@ compositor_destroy(struct xrt_compositor *xc)
 		// unregister above has made the survivor scan accurate.
 		service_failsafe_hardware_2d_on_teardown(sys, c);
 
+		// #939: THE same scan, asked the other question — does a weave
+		// present-owner survive? The failsafe uses it to decide whether the
+		// lens may go flat; the rebind below uses it to decide whether the
+		// fresh panel DP must come up in 3D regardless of what this client
+		// left behind. Read here, where the unregister above has just made it
+		// accurate and nothing has yet been torn down.
+		bool weave_owner_survives = false;
+		(void)service_scan_teardown_survivors(sys, c, &weave_owner_survives);
+
 		// #939: note whether the shared panel DP is bound to a window that
 		// dies with THIS client, before anything drops it. Either window
 		// qualifies: the runtime-created one a hosted APP_HWND presenter got
@@ -21047,9 +21090,80 @@ compositor_destroy(struct xrt_compositor *xc)
 			    "re-bound to the service window so the surviving presenter is not left on a dead "
 			    "HWND (#939)",
 			    c->slot_app_name, (void *)panel_dp_dying_hwnd);
+
+			/*
+			 * #939: do NOT let the fresh panel DP inherit the leaver's parting
+			 * lens state when a weave PRESENT-OWNER survives.
+			 *
+			 * A lease-holding client that requests hardware 2D on its way out
+			 * (a plain-Chrome WebXR session ending does exactly that) lands
+			 * `sys->hardware_display_3d = 0` before it gets here — and the
+			 * #814 failsafe correctly does nothing, because it only ever
+			 * turns the lens OFF. The rebind below then reads that flag as the
+			 * new DP's `want_3d`, so the survivor's 3D content is woven onto a
+			 * 2D lens: black tiles, and it does not self-heal.
+			 *
+			 * It does not self-heal because the survivor's own
+			 * `weave_force_3d_if_needed` is not a lens writer here: with an
+			 * ingest DP that accepts a zone mask it takes the tier-1 demotion
+			 * (`skip_dp = mask_capable`), so `apply_mode_transition` runs with
+			 * `xdp == nullptr` — it flips this very flag to true and drives no
+			 * DP at all, leaving the physical element to the published wish.
+			 * That wish goes to the present-owner's OWN ingest DP, which casts
+			 * no lens vote by design (#140 prong (a)). The flag it just set
+			 * then satisfies the helper's own `if (sys->hardware_display_3d)
+			 * return;` gate, so every later attempt is suppressed too. Hence
+			 * the observed `[weave_3d] ... forcing 3D (mode 1 -> 1)` with no
+			 * `switched to 3D` behind it.
+			 *
+			 * So the panel level has to do it, and it has to do it BEFORE the
+			 * bind: the plug-in records the wish handed to a DP at creation
+			 * and applies it when its async weaver finishes, so a correction
+			 * issued afterwards races a DP that is already coming up in 2D.
+			 * `xdp` is nullptr because there is no panel DP to drive at this
+			 * instant (released just above); this call is here to move the
+			 * flag, broadcast the hardware state and stamp the flip cooldown
+			 * through the one primitive that owns all three.
+			 */
+			if (weave_owner_survives) {
+				struct xrt_device *fs_head =
+				    sys->xsysd != nullptr ? sys->xsysd->static_roles.head : nullptr;
+				U_LOG_W("[pipeline] teardown: a weave present-owner survives — fresh panel DP "
+				        "created in 3D, not the departing client's parting %s (#939)",
+				        sys->hardware_display_3d ? "3D" : "2D");
+				(void)apply_mode_transition(sys, fs_head, /*xdp*/ nullptr, UINT32_MAX,
+				                            /*want_3d*/ true, "939_teardown");
+			}
+
 			pipeline_bind_panel_dp(sys, tmc, tmc->hwnd, /*client_presents*/ false,
 			                       /*force_recreate*/ false,
 			                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
+
+			/*
+			 * #939: and re-assert 3D on the PANEL DP once it exists.
+			 *
+			 * Two jobs. It is the panel-level counterpart of the force the
+			 * survivor cannot make itself — `DP_REQUEST_DISPLAY_MODE` on the
+			 * shared DP via `apply_mode_transition`'s same-state re-assert arm
+			 * ("keeps a drifted vendor honest"), never on the ingest DP, so
+			 * #140 prong (a) still holds.
+			 *
+			 * And it closes the ordering hole. The leaver's parting mode
+			 * request is a queued `WS_CMD_MODE_TRANSITION`, drained on the
+			 * render thread; the drain and this teardown both run under
+			 * `render_mutex`, so they cannot interleave — but nothing orders
+			 * them, and the drain never checks whether the client that queued
+			 * a transition still exists. If that 2D is still in the ring it
+			 * will land after everything above. Going through
+			 * `service_request_mode_transition` puts this 3D behind it in the
+			 * same FIFO (the coalescer merges only identical triples, and 3D
+			 * is not 2D), so the last word is 3D either way; with no render
+			 * thread to drain, it applies inline instead.
+			 */
+			if (weave_owner_survives) {
+				(void)service_request_mode_transition(sys, nullptr, UINT32_MAX, /*want_3d*/ true,
+				                                      /*skip_dp*/ false, "939_teardown");
+			}
 		}
 
 		// Tear down per-client render resources (window, swap chain, DP,
