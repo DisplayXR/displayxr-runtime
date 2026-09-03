@@ -47,20 +47,20 @@ jobs:
 
       # Each arm runs in its own powershell.exe so a wedged message pump cannot
       # take the others with it. Verdicts land as JSON and are asserted below.
-      - name: Run the four arms
+      - name: Run the six arms
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path verdicts | Out-Null
-          foreach ($m in @('normal','cloak','minimize','offscreen')) {
+          foreach ($m in @('normal','cloak','minimize','offscreen','runtime_present','no_runtime')) {
             Write-Host "=============== $m ==============="
             & powershell -ExecutionPolicy Bypass -NoProfile -File scripts\test\window_visibility_check.ps1 `
                 -Mode $m -SettleMs 1500 -Json "verdicts\$m.json" | Out-Null
             Write-Host "  exit=$LASTEXITCODE"
             if (Test-Path "verdicts\$m.json") {
               $v = Get-Content "verdicts\$m.json" -Raw | ConvertFrom-Json
-              foreach ($a in $v.arms) {
-                $tag = if (-not $a.enforced) { 'SKIP' } elseif ($a.ok) { 'ok  ' } else { 'FAIL' }
-                Write-Host ("  [{0}] {1,-18} {2}" -f $tag, $a.name, $a.detail)
+              Write-Host ("  PROCESS presentable={0} ({1}/{2} windows)" -f $v.presentable, $v.windows_presentable, $v.windows_total)
+              foreach ($w in $v.windows) {
+                Write-Host ("    {0} {1,-22} presentable={2} failed=[{3}]" -f $w.hwnd, $w.title, $w.presentable, ($w.failed -join ','))
               }
             } else {
               Write-Host "::warning::no verdict written for $m"
@@ -74,12 +74,20 @@ jobs:
       - name: Assert the gate discriminates
         shell: pwsh
         run: |
-          # What each arm MUST conclude. `cloak` is the positive control.
+          # What each arm MUST conclude. The load-bearing pair is
+          # runtime_present vs no_runtime: they differ by exactly the thing that
+          # broke, so a gate that cannot tell them apart proves nothing.
+          #
+          # Note runtime_present MUST PASS with its main window cloaked. Cloaking
+          # the engine window is the shipping design; a gate that rejected it would
+          # be rejecting the feature, not catching a bug.
           $expect = @{
-            normal    = @{ presentable = $true;  mustFail = @() }
-            cloak     = @{ presentable = $false; mustFail = @('not_cloaked') }
-            minimize  = @{ presentable = $false; mustFail = @('not_minimised') }
-            offscreen = @{ presentable = $false; mustFail = @('rect_on_a_monitor') }
+            normal          = @{ presentable = $true;  mustFailArm = $null }
+            cloak           = @{ presentable = $false; mustFailArm = 'not_cloaked' }
+            minimize        = @{ presentable = $false; mustFailArm = 'not_minimised' }
+            offscreen       = @{ presentable = $false; mustFailArm = 'rect_on_a_monitor' }
+            runtime_present = @{ presentable = $true;  mustFailArm = $null }
+            no_runtime      = @{ presentable = $false; mustFailArm = 'not_cloaked' }
           }
 
           $fail = 0
@@ -90,34 +98,54 @@ jobs:
             $e = $expect[$m]
 
             if ($v.presentable -ne $e.presentable) {
-              Write-Host "::error::$m -- presentable=$($v.presentable), expected $($e.presentable)."
+              Write-Host "::error::$m -- PROCESS presentable=$($v.presentable), expected $($e.presentable) ($($v.windows_presentable)/$($v.windows_total) windows)."
+              $fail = 1
+            } else {
+              Write-Host "PASS: $m -- process presentable=$($v.presentable) as expected ($($v.windows_presentable)/$($v.windows_total) windows)."
+            }
+
+            # The arm that matters must have actually RUN. A skipped check passes
+            # an exit code while proving nothing -- which is this whole bug class.
+            if (-not $v.not_cloaked_enforced) {
+              Write-Host "::error::$m -- the not_cloaked arm was SKIPPED on this runner. The gate proves nothing here."
               $fail = 1
             }
-            foreach ($arm in $e.mustFail) {
-              $row = $v.arms | Where-Object { $_.name -eq $arm }
-              if (-not $row) { Write-Host "::error::$m -- arm '$arm' absent."; $fail = 1; continue }
-              if (-not $row.enforced) {
-                Write-Host "::error::$m -- arm '$arm' was SKIPPED, not enforced. The gate proves nothing here: $($row.detail)"
-                $fail = 1
-              } elseif ($row.ok) {
-                Write-Host "::error::$m -- arm '$arm' PASSED a known-bad window. The gate is blind: $($row.detail)"
+
+            if ($e.mustFailArm) {
+              $hit = @($v.windows | ForEach-Object { $_.failed } | Where-Object { $_ -eq $e.mustFailArm })
+              if ($hit.Count -eq 0) {
+                Write-Host "::error::$m -- no window failed on '$($e.mustFailArm)'. The gate is blind to the reason."
                 $fail = 1
               } else {
-                Write-Host "PASS: $m -- '$arm' correctly caught it."
+                Write-Host "      caught by '$($e.mustFailArm)'."
               }
             }
+          }
+
+          # The discriminating pair, stated on its own: same cloak, and the only
+          # difference is whether an overlay exists to be seen instead.
+          $rp = Get-Content "verdictsuntime_present.json" -Raw | ConvertFrom-Json
+          $nr = Get-Content "verdicts
+o_runtime.json" -Raw | ConvertFrom-Json
+          Write-Host ""
+          Write-Host "--- the discriminating pair ---"
+          Write-Host ("runtime_present : presentable={0} ({1}/{2} windows) <- main window IS cloaked, and that is correct" -f $rp.presentable, $rp.windows_presentable, $rp.windows_total)
+          Write-Host ("no_runtime      : presentable={0} ({1}/{2} windows) <- THE BUG" -f $nr.presentable, $nr.windows_presentable, $nr.windows_total)
+          if ($rp.presentable -and -not $nr.presentable) {
+            Write-Host "The gate SEPARATES them. It would have caught the v2.16.0 regression without rejecting the feature."
+          } else {
+            Write-Host "::error::the gate does NOT separate the shipping design from the regression."
+            $fail = 1
           }
 
           # Q1, stated separately so a runner limitation reads as a runner
           # limitation and not as a passing gate.
           $cl = (Get-Content "verdicts\cloak.json" -Raw | ConvertFrom-Json)
-          $cloakArm = $cl.arms | Where-Object { $_.name -eq 'not_cloaked' }
           Write-Host ""
           Write-Host "--- feasibility ---"
           Write-Host "monitors on runner : $($cl.environment.monitors)"
-          Write-Host "DWM answers        : $($cl.environment.dwm_answers)"
           Write-Host "DwmSetWindowAttribute(DWMWA_CLOAK) hr : $($cl.environment.cloak_set_hr)"
-          Write-Host "not_cloaked enforced on this runner   : $($cloakArm.enforced)"
+          Write-Host "not_cloaked enforced on this runner   : $($cl.not_cloaked_enforced)"
 
           if ($fail -ne 0) { Write-Host "::error::visibility gate did not discriminate correctly."; exit 1 }
           Write-Host ""
