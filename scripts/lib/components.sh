@@ -88,7 +88,13 @@ COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilit
 # ~monthly onto Chrome stable but NOT patched to Chrome's mid-cycle security
 # cadence, so it must be a thing a user asks for by name.
 #
-# Asset naming: displayxr-browser/scripts/release.sh uploads
+# Repo split (2026-09): source + build lanes live in the PRIVATE
+# displayxr-browser-pvt; releases + assets stay on the PUBLIC displayxr-browser,
+# which keeps its name precisely so this repo pin (and every asset URL already
+# handed to testers) keeps resolving. Do not point this at -pvt.
+#
+# Asset naming: the publish workflow (displayxr-browser-pvt, formerly
+# displayxr-browser/scripts/release.sh) uploads
 # `"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The part after `#` is the gh
 # *display label*, not the filename — the asset lands under its versioned real
 # name (`…-Setup-0.1.16.exe`), which is what this glob matches.

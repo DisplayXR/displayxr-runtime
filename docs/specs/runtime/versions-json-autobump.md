@@ -146,11 +146,18 @@ Release. `components.sh` carries the macOS glob + install marker
 POSIX mirror of the Windows REG_DWORD), so `setup-displayxr.sh --with
 mcp` works on a clean Mac.
 
-### `displayxr-browser`
+### `displayxr-browser` (published from `displayxr-browser-pvt`)
 
-Same snippet, with `field: "browser"`. Fired from
-`displayxr-browser/scripts/release.sh` (the script that actually creates
-the release), not from a tag-push trigger — the browser has none.
+Same snippet, with `field: "browser"`. The browser is a private-source /
+public-release split like the shell: the tag-triggered
+`publish-browser-releases.yml` in the **private** `displayxr-browser-pvt`
+builds, signs, creates the release on the **public** `displayxr-browser`
+(which keeps its name — this pin resolves against it), then fires the
+dispatch with a `displayxr-publish-bot` token scoped to `displayxr-runtime`
+— the same second-token mint `publish-shell-releases.yml` does. (Before the
+2026-09 split the dispatch fired from `displayxr-browser/scripts/release.sh`,
+because the public repo had no tag-push publisher.) Cut with
+`/dxr-release browser preview-X.Y.Z`.
 
 ### `displayxr-demo-*`
 
@@ -212,8 +219,8 @@ five pins by name (`runtime`, `shell`, `leia_plugin`, `mcp_tools`,
 `DisplayXRBundle-*.exe`. Enrolling it is a separate, deliberate edit
 there.
 
-One asset-naming note, because it reads like a trap and isn't:
-`displayxr-browser/scripts/release.sh` uploads
+One asset-naming note, because it reads like a trap and isn't: the browser
+publish workflow (`displayxr-browser-pvt`, formerly `scripts/release.sh`) uploads
 `"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The text after `#` is gh's
 *display label*, not the filename — the asset still lands under its
 versioned real name, so the ordinary

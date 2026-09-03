@@ -1,6 +1,6 @@
 ---
 name: dxr-release
-description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, gauss & modelviewer & mediaplayer & avatar & earthview demos, unity plugin) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. Unity is special-cased: its prebuilt displayxr_unity.dll is signed via the sign-artifact folder hook and re-injected into the .tgz + upm branch (no versions-bump). NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
+description: Tag-and-publish a release for any DisplayXR sibling component (shell, leia-plugin, mcp, browser, gauss & modelviewer & mediaplayer & avatar & earthview demos, unity plugin) FROM the displayxr-runtime hub. Takes an explicit component + version — clones the target repo to a temp dir, tags HEAD, watches the repo's CI, watches the dispatched versions-bump.yml on displayxr-runtime, reports the bump + installer-mirror outcome. Unity is special-cased: its prebuilt displayxr_unity.dll is signed via the sign-artifact folder hook and re-injected into the .tgz + upm branch (no versions-bump). NOT for displayxr-runtime itself (use /release) and NOT for the bundle (use /installer-release).
 ---
 
 # dxr-release — component release driven from the runtime hub
@@ -28,8 +28,8 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 ```
 /dxr-release <component> <version-spec>
 
-  <component>     shell | leia-plugin (leia) | mcp | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
-  <version-spec>  vX.Y.Z  |  patch  |  minor  |  major
+  <component>     shell | leia-plugin (leia) | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
+  <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser: preview-X.Y.Z — see "Browser is special")
 ```
 
 Examples:
@@ -39,6 +39,8 @@ Examples:
 /dxr-release shell minor
 /dxr-release gauss v1.4.4
 /dxr-release unity v1.25.0
+/dxr-release browser preview-0.1.24
+/dxr-release browser patch
 ```
 
 If no component is given, **STOP** and ask which component. Do not guess
@@ -49,6 +51,7 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | Component arg | Repo | versions.json field | CI workflow | Release lands on |
 |---|---|---|---|---|
 | `shell` | `DisplayXR/displayxr-shell-pvt` | `shell` | `publish-shell-releases.yml` | `displayxr-shell-releases` |
+| `browser` | `DisplayXR/displayxr-browser-pvt` | `browser` | `publish-browser-releases.yml` | `displayxr-browser` (public, keeps its name) |
 | `leia-plugin` / `leia` | `DisplayXR/displayxr-leia-plugin` | `leia_plugin` | `build-windows.yml` | same repo |
 | `mcp` | `DisplayXR/displayxr-mcp` | `mcp_tools` | `build.yml` | same repo |
 | `gauss` / `demo-gaussiansplat` | `DisplayXR/displayxr-demo-gaussiansplat` | `gauss_demo` | `build-windows.yml` | same repo |
@@ -57,6 +60,27 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 | `avatar` / `demo-avatar` | `DisplayXR/displayxr-demo-avatar` | `avatar_demo` | `build-windows.yml` | same repo |
 | `earthview` / `demo-earthview` | `DisplayXR/displayxr-demo-earthview` | `earthview_demo` | `build-macos.yml` | same repo |
 | `unity` | `DisplayXR/displayxr-unity` | *(none — not pinned)* | `build-native.yml` | same repo |
+
+**Browser is special** — it is the second private→public split after the shell
+(source, patch series, build lanes and the Android keystore live in the PRIVATE
+`displayxr-browser-pvt`; releases + assets + user-facing issues stay on the PUBLIC
+`displayxr-browser`, which **keeps its name** because `versions.json[browser]`,
+`install-android-bundle.sh --links` and tester install URLs all resolve against it).
+Four consequences for this skill:
+- **Tag shape is `preview-X.Y.Z`, not `vX.Y.Z`.** `versions-bump.yml` has a per-field
+  tag-shape carve-out for `browser`; never "normalise" it to `v`. `patch`/`minor`/`major`
+  compute from the newest `preview-*` tag (Step 1.3).
+- **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
+  `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
+  manual `workflow_dispatch` build lanes and never fire on a tag.
+- **Signing happens INSIDE the publish workflow** (Windows via the EV signing runner,
+  Android via `apksigner` + the keystore secret), so Phase 3.5 is **skipped** for
+  browser — there is nothing for the hub to re-sign and re-upload.
+- **Asset ops target `$REL_REPO`** (`displayxr-browser`), same trap as shell. The
+  `versions-bump` dispatch fires from the pvt publish workflow with a
+  `displayxr-publish-bot` token scoped to `displayxr-runtime`.
+The browser also stays **opt-in** in the orchestrator (`--with browser`) — a release
+through this skill must never promote it to a default install.
 
 **Unity is special** — it ships a prebuilt `displayxr_unity.dll` (not an
 installer) in a UPM `.tgz` release asset **and** on the `upm` git branch, has
@@ -101,6 +125,7 @@ Report the final state in the format defined in PHASE 6.
 ```bash
 case "$COMPONENT" in
   shell)                         REPO=DisplayXR/displayxr-shell-pvt;          FIELD=shell;       WORKFLOW=publish-shell-releases.yml; REL_REPO=DisplayXR/displayxr-shell-releases ;;
+  browser)                       REPO=DisplayXR/displayxr-browser-pvt;        FIELD=browser;     WORKFLOW=publish-browser-releases.yml; REL_REPO=DisplayXR/displayxr-browser ;;
   leia|leia-plugin)              REPO=DisplayXR/displayxr-leia-plugin;        FIELD=leia_plugin; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-leia-plugin ;;
   mcp)                           REPO=DisplayXR/displayxr-mcp;                FIELD=mcp_tools;   WORKFLOW=build.yml;                   REL_REPO=DisplayXR/displayxr-mcp ;;
   gauss|demo-gaussiansplat)      REPO=DisplayXR/displayxr-demo-gaussiansplat; FIELD=gauss_demo; WORKFLOW=build-windows.yml;           REL_REPO=DisplayXR/displayxr-demo-gaussiansplat ;;
@@ -111,10 +136,14 @@ case "$COMPONENT" in
   unity)                         REPO=DisplayXR/displayxr-unity;              FIELD="";               WORKFLOW=build-native.yml;      REL_REPO=DisplayXR/displayxr-unity ;;
   runtime)                       echo "Use /release (in-repo) for the runtime."; exit 1 ;;
   installer)                     echo "Use /installer-release for the bundle.";  exit 1 ;;
-  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
+  *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
 # FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
-echo "repo=$REPO field=$FIELD workflow=$WORKFLOW"
+# Tag shape per component: browser tags are `preview-X.Y.Z` (versions-bump.yml carve-out);
+# everything else is `vX.Y.Z`. Every later regex/derivation goes through TAG_PREFIX.
+case "$COMPONENT" in browser) TAG_PREFIX=preview- ;; *) TAG_PREFIX=v ;; esac
+TAG_RE="^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$"
+echo "repo=$REPO field=$FIELD workflow=$WORKFLOW rel_repo=$REL_REPO tag_prefix=$TAG_PREFIX"
 ```
 
 ### Step 1.2: Clone the target repo to a temp dir
@@ -126,9 +155,11 @@ cd "$WORK/repo"
 ```
 
 ### Step 1.3: Resolve version-spec
-- `vX.Y.Z` literal → validate `^v[0-9]+\.[0-9]+\.[0-9]+$`, use as-is.
+- Literal tag → validate against `$TAG_RE` (`^v[0-9]+\.[0-9]+\.[0-9]+$`, or
+  `^preview-[0-9]+\.[0-9]+\.[0-9]+$` for browser), use as-is. A `vX.Y.Z` given for
+  browser (or `preview-` for anything else) is a hard error, not a rewrite.
 - `patch`/`minor`/`major` → compute from
-  `git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1`.
+  `git tag --sort=-creatordate | grep -E "$TAG_RE" | head -1`, keeping `$TAG_PREFIX`.
 
 ### Step 1.4: Pre-flight on the clone
 ```bash
@@ -149,7 +180,7 @@ if git rev-parse "$NEW_TAG" >/dev/null 2>&1; then
     echo "Tag $NEW_TAG already exists on $REPO"; exit 1
   fi
 fi
-PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+PREV_TAG=$(git tag --sort=-creatordate | grep -E "$TAG_RE" | head -1)
 # Clone defaults to the default branch (main) — no branch check needed.
 ```
 
@@ -261,6 +292,17 @@ CI_CONC="${S#completed/}"
 ---
 
 ## PHASE 3.5: CODE-SIGN THE COMPONENT INSTALLER (capability-gated)
+
+**Skip this entire phase for `browser`** — its publish workflow signs in-CI (Windows
+installer via the EV signing runner, Android APK via `apksigner`), so the release
+asset is already signed when Phase 3 goes green. Verify instead of re-signing:
+```bash
+if [ "$COMPONENT" = browser ]; then
+  gh release view "$NEW_TAG" -R "$REL_REPO" --json assets --jq '.assets[].name'   # expect DisplayXR-Browser-Preview-Setup-X.Y.Z.exe (+ APKs)
+  SIGNED=in-ci; SKIP_SIGN=1
+fi
+```
+and go to Phase 3.6.
 
 Same model as the runtime's `/release` skill: GitHub-hosted CI builds the
 component **unsigned** (contributor PRs/pushes stay unsigned by design; no
@@ -770,6 +812,12 @@ STOP.
 - **publish-bot prereq:** the `displayxr-publish-bot` GitHub App must be
   installed on `displayxr-runtime` + `displayxr-installer` (Contents:write).
   Confirmed for all repos as of 2026-05-29.
+- **Private-source / public-release split (shell, browser):** `REPO` is where the
+  tag goes and whose CI is watched; `REL_REPO` is where the release object and its
+  assets live. Every `gh release` call must use `$REL_REPO`. The browser row was
+  added 2026-09 when `displayxr-browser` split into `displayxr-browser-pvt` (source)
+  + `displayxr-browser` (releases, name kept); before that the browser released
+  through its own `release.sh` and was documented as NOT using this skill.
 - **New sibling repo joining the family?** Add a row to the component→config
   map above, add a `versions.json` field on runtime, add the
   `DispatchVersionsBump` step to the new repo's CI per
