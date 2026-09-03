@@ -1842,7 +1842,11 @@ d3d12_reroute_wish_content_sig(struct comp_d3d12_compositor *c)
 	WISH_MIX(c->out_mask_req.count);
 	WISH_MIX(c->out_mask_req.w);
 	WISH_MIX(c->out_mask_req.h);
-	for (uint32_t i = 0; i < c->out_mask_req.count; i++) {
+	// Bound on the ARRAY as well as the count. Every writer of `count` caps it
+	// today (zcount and rect_count are both capped in their fill loops), so this
+	// is not a live over-read -- it is the bound that keeps it that way if a
+	// later writer sets `count` from somewhere else.
+	for (uint32_t i = 0; i < c->out_mask_req.count && i < XRT_MAX_LAYERS; i++) {
 		const struct xrt_rect *r = &c->out_mask_req.rects[i];
 		WISH_MIX((uint32_t)r->offset.w);
 		WISH_MIX((uint32_t)r->offset.h);
