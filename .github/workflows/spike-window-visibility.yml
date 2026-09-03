@@ -252,3 +252,62 @@ jobs:
         with:
           name: real-app-verdict
           path: verdict-real.json
+
+  # ---------------------------------------------------------------------------
+  # FEASIBILITY ONLY: can a hosted runner run a real VK zones app at all?
+  #
+  # The zones coverage gap David named has to close IN CI, and cube_zones_vk_win
+  # needs three things the existing CI never needs: a Vulkan device, a window, and
+  # the split's D3D11 scanout weaver. Today the only step that EXECUTES the runtime
+  # is `displayxr-cli selftest`, which is explicitly "no compositor, no GPU, no
+  # window".
+  #
+  # Building the runtime + test apps here costs ~15 min, so this job spends 30
+  # seconds first on the question that gates all of it: does this runner expose a
+  # Vulkan device with a graphics queue? If it does not, the app arm cannot run on
+  # hosted CI and the answer is a self-hosted runner (or a predicate-level test
+  # instead of an app-level one).
+  #
+  # Reports; never gates. A hosted-runner limitation is a finding, not a failure.
+  vk-feasibility:
+    runs-on: windows-latest
+    steps:
+      - name: Is there a Vulkan device on a hosted runner?
+        shell: pwsh
+        run: |
+          $loader = "C:\Windows\System32\vulkan-1.dll"
+          Write-Host "vulkan-1.dll present : $(Test-Path $loader)"
+          if (Test-Path $loader) {
+            Write-Host ("vulkan-1.dll version : {0}" -f (Get-Item $loader).VersionInfo.FileVersion)
+          }
+
+          # ICDs are registered here; no ICD means no device however present the loader is.
+          foreach ($k in @('HKLM:\SOFTWARE\Khronos\Vulkan\Drivers',
+                           'HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers')) {
+            if (Test-Path $k) {
+              $vals = (Get-Item $k).GetValueNames()
+              Write-Host ("ICDs in {0}: {1}" -f $k, $(if ($vals.Count) { $vals -join ', ' } else { '(none)' }))
+            } else {
+              Write-Host "ICDs in ${k}: key absent"
+            }
+          }
+
+          Write-Host ""
+          Write-Host "--- adapters the OS reports ---"
+          Get-CimInstance Win32_VideoController |
+            Select-Object Name, DriverVersion, AdapterRAM |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+          Write-Host "--- what this means ---"
+          $icd = $false
+          foreach ($k in @('HKLM:\SOFTWARE\Khronos\Vulkan\Drivers',
+                           'HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers')) {
+            if ((Test-Path $k) -and (Get-Item $k).GetValueNames().Count -gt 0) { $icd = $true }
+          }
+          if ((Test-Path $loader) -and $icd) {
+            Write-Host "Loader AND at least one ICD present -> a VK zones arm on hosted CI is worth building."
+          } else {
+            Write-Host "No usable Vulkan ICD -> cube_zones_vk_win CANNOT run on a hosted runner."
+            Write-Host "Then the options are a self-hosted runner with a GPU, or testing the tier-1"
+            Write-Host "PREDICATE directly rather than through the app."
+          }
