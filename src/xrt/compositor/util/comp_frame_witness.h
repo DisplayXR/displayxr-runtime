@@ -8,8 +8,9 @@
  * DXR_FRAME_WITNESS=1 (or =N seconds, 1..60; default interval 5 s) makes each
  * native compositor emit one throttled log line per interval:
  *
- *   [WITNESS] site=d3d11 window=5.0s present/s=22.2 repaint/s=37.8 weave/s=60.0
- *             mode=3d (legacy keys: presents/s=60.0 weaves/s=22.2 repaints/s=37.8)
+ *   [WITNESS] site=d3d11 window=5.0s presents/s=60.0 weaves/s=22.2 repaints/s=37.8 mode=3d
+ *             present/s=22.2 repaint/s=37.8 weave/s=60.0
+ *   (old line verbatim, agreed keys appended — see the note at the U_LOG_W)
  *
  * Rationale (#1044 / perf-decomposition ladder): the weave-latency harness
  * measures weave→scanout, which requires presentation-timing machinery that is
@@ -125,13 +126,16 @@ struct comp_frame_witness
 		const char *mode = (w + r) == 0 ? "idle" : (w3 == 0 ? "2d" : (w3 == w + r ? "3d" : "mixed"));
 		// #1339: the legacy key names invert the agreed vocabulary — the old
 		// `weaves/s` is the PRESENT rate (app frames) and the old `presents/s`
-		// is the WEAVE rate (every flip reaching the panel). The new keys use
-		// the agreed names; the legacy trio is emitted alongside for one
-		// release so external harnesses that regex the old keys keep reading
-		// the same numbers they always did, then it is removed.
-		U_LOG_W("[WITNESS] site=%s window=%.1fs present/s=%.1f repaint/s=%.1f weave/s=%.1f mode=%s "
-		        "(legacy keys: presents/s=%.1f weaves/s=%.1f repaints/s=%.1f)",
-		        site, secs, (double)w / secs, (double)r / secs, (double)p / secs, mode, (double)p / secs,
-		        (double)w / secs, (double)r / secs);
+		// is the WEAVE rate (every flip reaching the panel). For one release the
+		// OLD LINE IS EMITTED VERBATIM and the agreed keys are APPENDED after
+		// mode=: every existing parser anchors contiguously from "[WITNESS]"
+		// through "mode=", so the new keys can live nowhere inside that span
+		// without silently zeroing it (a mirror's ladder proved this against
+		// an earlier draft that put a "legacy keys:" tail after mode=). Next
+		// release the old trio goes and the new keys move to the front.
+		U_LOG_W("[WITNESS] site=%s window=%.1fs presents/s=%.1f weaves/s=%.1f repaints/s=%.1f mode=%s "
+		        "present/s=%.1f repaint/s=%.1f weave/s=%.1f",
+		        site, secs, (double)p / secs, (double)w / secs, (double)r / secs, mode, (double)w / secs,
+		        (double)r / secs, (double)p / secs);
 	}
 };

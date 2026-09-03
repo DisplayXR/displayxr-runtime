@@ -29,13 +29,10 @@ since #1339 the `[WITNESS]` log line names its columns the same way.
 stamped at the weave mark, the panel-flip counter after a `SUCCEEDED` present — two instruments
 that agree, so nothing is lost between them).
 
-**Legacy keys, one release only (#1339).** The line used to name two of these the other way
+**Transition, one release only (#1339).** The line used to name two of these the other way
 round: its `weaves/s` was the present rate and its `presents/s` the weave rate, because the
-panel flip was named after the DXGI `Present` call. That collision cost a review. The witness
-now emits the agreed names first and repeats the same three numbers under the old names in a
-trailing `(legacy keys: presents/s=… weaves/s=… repaints/s=…)` group, so external harnesses
-that regex the old keys keep reading exactly what they always did. The legacy group is removed
-next release — move parsers to `present/s` / `repaint/s` / `weave/s` now.
+panel flip was named after the DXGI `Present` call. That collision cost a review.
+For **one release** the `[WITNESS]` line is emitted in its **old shape verbatim** — `presents/s=… weaves/s=… repaints/s=… mode=…` — with the agreed keys **appended after `mode=`**: `present/s=… repaint/s=… weave/s=…`. Every existing parser anchors contiguously from `[WITNESS]` through `mode=`, so the new keys can live nowhere *inside* that span without silently zeroing it (a mirror's ladder proved this against an earlier draft that put a `(legacy keys: …)` tail after `mode=`). Old regexes keep matching unchanged; new parsers read the three new keys from the tail. Next release the old trio is removed and the new keys move to the front.
 
 Two rules that follow from the definitions:
 
