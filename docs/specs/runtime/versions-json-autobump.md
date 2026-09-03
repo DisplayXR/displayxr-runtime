@@ -159,6 +159,31 @@ dispatch with a `displayxr-publish-bot` token scoped to `displayxr-runtime`
 because the public repo had no tag-push publisher.) Cut with
 `/dxr-release browser preview-X.Y.Z`.
 
+#### The browser pin LAGS the newest release on purpose — do not "tidy" it
+
+`versions.json[browser]` will often name an **older** tag than the newest release
+on `displayxr-browser`, and that divergence is correct.
+
+The pin means *"the version the orchestrator can install as a released asset"*, not
+*"the latest version"*. On Windows, `setup-displayxr.bat --with browser` resolves the
+release through `scripts/lib/components.sh`'s `COMPONENT_EXE_WINDOWS_browser` glob,
+`DisplayXR-Browser-Preview-Setup-*.exe`. An **Android-only** preview does not satisfy
+that glob, so `publish-browser-releases.yml` deliberately **skips** the bump when no
+Windows installer shipped (it logs a `::warning::` saying so rather than silently
+no-op'ing).
+
+Worked example, live as of 2026-09-03:
+
+| | |
+|---|---|
+| `versions.json[browser]` | `preview-0.1.23` — the newest release **with** a Windows installer |
+| newest public release | `preview-0.1.24` (Android-only, 0 Windows installers) |
+
+Hand-bumping the pin to the newest tag to make those agree re-creates exactly the break
+the guard prevents: `--with browser` then matches nothing and the install fails, pointed
+at a release that genuinely has no installer. **Leave it behind until a preview ships a
+Windows installer**, at which point it bumps normally on its own.
+
 ### `displayxr-demo-*`
 
 Same snippet, with `field: "<demo_name>"`. The schema is flat — each
