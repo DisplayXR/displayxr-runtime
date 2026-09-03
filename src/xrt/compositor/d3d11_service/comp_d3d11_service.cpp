@@ -12685,6 +12685,34 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 				    "the panel DP to it (one weaver per HWND; #1172)",
 				    (void *)present_hwnd);
 			}
+			/*
+			 * #939 safety net. "Leave the panel DP where it is" assumes where
+			 * it lives is a LIVE window. A hosted APP_HWND presenter that held
+			 * the panel and then tore down can leave it on a destroyed HWND,
+			 * and this branch is precisely the one that will never notice.
+			 * compositor_destroy hands the panel back deterministically; this
+			 * catches any path that does not reach it.
+			 *
+			 * IsWindow is a cheap user32 call and this runs at most once per
+			 * frame, only for a present-owner. The rebind makes the predicate
+			 * false, so this is a transition, not a steady state — the log is
+			 * throttled anyway because a bind can legitimately defer.
+			 */
+			if (mc->panel_dp_hwnd != nullptr && mc->panel_dp_hwnd != mc->hwnd && mc->hwnd != nullptr &&
+			    !IsWindow(mc->panel_dp_hwnd)) {
+				static int64_t s_last_dead_log_ns = 0;
+				const int64_t dead_now_ns = (int64_t)os_monotonic_get_ns();
+				if (dead_now_ns - s_last_dead_log_ns > 5LL * 1000000000LL) {
+					s_last_dead_log_ns = dead_now_ns;
+					U_LOG_W(
+					    "[pipeline] panel DP was left on a DESTROYED window %p — re-binding it "
+					    "to the service window; the present-owner keeps its own DP (#939)",
+					    (void *)mc->panel_dp_hwnd);
+				}
+				pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false,
+				                       /*force_recreate*/ false,
+				                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
+			}
 		} else {
 			pipeline_bind_panel_dp(sys, mc, present_hwnd, /*client_presents*/ true,
 			                       /*force_recreate*/ false, svc_panel_dp_device(sys, kind));
@@ -20845,12 +20873,62 @@ compositor_destroy(struct xrt_compositor *xc)
 		// unregister above has made the survivor scan accurate.
 		service_failsafe_hardware_2d_on_teardown(sys, c);
 
+		// #939: note whether the shared panel DP is bound to a window that
+		// dies with THIS client, before anything drops it. Either window
+		// qualifies: the runtime-created one a hosted APP_HWND presenter got
+		// (#1014), or the client's own app window, which goes with its
+		// process. `mc->hwnd` (the service window) never does.
+		struct d3d11_multi_compositor *tmc = sys->multi_comp;
+		HWND panel_dp_dying_hwnd = nullptr;
+		if (tmc->display_processor != nullptr && tmc->panel_dp_hwnd != nullptr &&
+		    tmc->panel_dp_hwnd != tmc->hwnd &&
+		    (tmc->panel_dp_hwnd == c->render.hwnd || tmc->panel_dp_hwnd == c->app_hwnd)) {
+			panel_dp_dying_hwnd = tmc->panel_dp_hwnd;
+		}
+
 		// #1014: this client may own a runtime-created window that fini is
 		// about to destroy — and the panel DP subclasses the HWND it was
 		// created against. Detach it FIRST, still under render_mutex, or
 		// DestroyWindow re-enters the weaver on a live DP.
 		if (c->render.owns_window && c->render.hwnd != nullptr) {
-			pipeline_release_panel_dp_for_hwnd(sys->multi_comp, c->render.hwnd);
+			pipeline_release_panel_dp_for_hwnd(tmc, c->render.hwnd);
+		}
+
+		/*
+		 * #939: the departing client hands the panel BACK.
+		 *
+		 * A hosted IPC client with no window binding becomes an APP_HWND
+		 * presenter on a runtime-created window (#1014), and while it is
+		 * focused the pipeline binds the shared panel DP to THAT window. When
+		 * its session ends the window is destroyed — but a surviving
+		 * present-owner's branch in pipeline_default_policy_render
+		 * deliberately does NOT bind the panel DP to its own window ("one
+		 * weaver per HWND", #1172), so nothing puts the panel back: it is left
+		 * on a corpse and scans out black until every client leaves and
+		 * #1319's idle quiesce releases it. Observed with a plain-Chrome
+		 * immersive WebXR session ending under a live DisplayXR Browser.
+		 *
+		 * So do it here, synchronously, while the client that took the panel
+		 * still exists to give it back — under render_mutex (held) and before
+		 * fini_client_render_resources destroys the window, which is exactly
+		 * the contract pipeline_bind_panel_dp documents.
+		 */
+		if (panel_dp_dying_hwnd != nullptr && tmc->hwnd != nullptr) {
+			// The runtime-owned window's DP is already gone (released just
+			// above). An EXTERNAL app window's is not, and a plain rebind
+			// would merely park it in the graveyard — keyed on a window that
+			// is about to be destroyed, which is the one thing #1014 forbids.
+			if (tmc->display_processor != nullptr && tmc->panel_dp_hwnd == panel_dp_dying_hwnd) {
+				pipeline_release_panel_dp_for_hwnd(tmc, panel_dp_dying_hwnd);
+			}
+			U_LOG_W(
+			    "[pipeline] teardown: panel DP was bound to departing client '%s' window %p — "
+			    "re-bound to the service window so the surviving presenter is not left on a dead "
+			    "HWND (#939)",
+			    c->slot_app_name, (void *)panel_dp_dying_hwnd);
+			pipeline_bind_panel_dp(sys, tmc, tmc->hwnd, /*client_presents*/ false,
+			                       /*force_recreate*/ false,
+			                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
 		}
 
 		// Tear down per-client render resources (window, swap chain, DP,
