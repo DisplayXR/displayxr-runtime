@@ -103,6 +103,14 @@ struct comp_settings
 // #116), so the post-weave Local2D composite must flatten too instead of
 // emitting DWM-dependent alpha.
 DEBUG_GET_ONCE_BOOL_OPTION(present_opaque_comp, "DXR_PRESENT_OPAQUE", false)
+/*!
+ * Negative control for the zone-wish CONTENT generation (see
+ * @ref d3d12_reroute_wish_content_sig): restores the pre-fix behaviour of minting a
+ * fresh generation on every app frame, so the vendor cost of an unchanged wish can be
+ * A/B-ed against a conformant one inside a single build. Off; the conformant path is
+ * the only one that ships.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(zone_wish_seq_perframe, "DXR_ZONE_WISH_SEQ_PERFRAME", false)
 
 struct comp_d3d12_compositor
 {
@@ -1933,7 +1941,7 @@ d3d12_reroute_stage_local2d(struct comp_d3d12_compositor *c,
 		 * d3d12_reroute_wish_content_sig.
 		 */
 		const uint64_t sig = d3d12_reroute_wish_content_sig(c);
-		if (sig != c->reroute.wish_content_sig) {
+		if (sig != c->reroute.wish_content_sig || debug_get_bool_option_zone_wish_seq_perframe()) {
 			c->reroute.wish_content_sig = sig;
 			c->reroute.wish_seq++;
 		}
