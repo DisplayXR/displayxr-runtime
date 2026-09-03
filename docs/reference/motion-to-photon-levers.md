@@ -14,6 +14,32 @@ documented in the vendor's own plug-in repo (see [`docs/vendors/README.md`](../v
 The only thing the runtime guarantees a DP is a well-paced weave with a fresh pose; what the DP
 does with it is the DP's business.
 
+## Terminology — present, repaint, weave (agreed 2026-09-03)
+
+Three rates, defined from the app outward. Use these words in issues, reports and reviews;
+the `[WITNESS]` log line currently names two of them **the other way round** (see below).
+
+| term | meaning | ideal | `[WITNESS]` column today |
+|---|---|---|---|
+| **present rate** | app frames per second — what the app produces | the app's own cadence (under `DXR_APP_FRAME_DIVISOR=D`: refresh ÷ D, exactly) | `weaves/s` |
+| **repaint rate** | extra re-weaves of the *last* app frame at a fresh eye pose (#868) — no new app content | fills the refresh slots the app does not use | `repaints/s` |
+| **weave rate** | present + repaint — everything that reaches the panel | ≈ display refresh, and **steady** | `presents/s` |
+
+`weaves/s + repaints/s == presents/s` holds to 0.00/s in the witness (the two weave counters are
+stamped at the weave mark, the present counter after a `SUCCEEDED` present — two instruments
+that agree, so nothing is lost between them). Only the *names* invert: the witness calls the
+panel flip a "present" after the DXGI call, and the app frame a "weave". That collision cost a
+review; the columns are being renamed to `app/s` / `repaint/s` / `panel/s` (#1339 follow-up).
+
+Two rules that follow from the definitions:
+
+- **Never quote the weave rate alone.** It can read 58/s while the present rate is 0.4/s — a
+  repainted still image at panel rate, indistinguishable from health in that column. Report
+  all three.
+- **A fill that lowers the present rate is a defect, not a trade.** Under the partition the app
+  is paced to an exact schedule; if repaints cost it frames, they are landing in the slot its
+  next frame needs (queue theft — `u_repaint_gate.h`). Measured on the hybrid reroute in #1339.
+
 ## The central trade
 
 There are two ways to stop the viewer seeing a stale eye position, and they are alternatives, not
