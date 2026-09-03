@@ -73,6 +73,22 @@ Four consequences for this skill:
 - **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
   `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
   manual `workflow_dispatch` build lanes and never fire on a tag.
+- **TRANSITIONAL (2026-09-03): the tag-triggered run currently FAILS at *Resolve the
+  build runs for this commit*, and that is not your release breaking.** That step matches
+  a successful `build-box*.yml` run whose `headSha` equals the tagged commit — but
+  `headSha` is *where the workflow ran*, not *what it built*, and the build lanes take
+  their source as a `patch_ref` **input**. So the tagged commit normally carries no
+  matching build. Verified on `preview-0.1.25`: the tag run failed, zero successful runs
+  sat at the tagged commit on either lane, and the release shipped correctly from a
+  `workflow_dispatch` with explicit run ids. **Recovery, and the documented escape
+  hatch:** re-run the publish yourself and watch that run instead —
+  `gh workflow run publish-browser-releases.yml -R "$REPO" --ref main -f tag="$NEW_TAG"
+  -f android_run_id=<id> -f windows_run_id=<id>`, taking the ids from the build runs you
+  actually mean. **Do not "fix" this by matching the newest build by recency** — that
+  re-introduces the wrong-source release this whole lane was built to prevent. The real
+  fix is in flight: the build stamps its resolved source sha into the artifact and the
+  publish asserts it against the tag, after which the tag trigger is correct again and
+  this note should be deleted rather than worked around.
 - **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
   "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
   it is just signed one step earlier than every other component. Its Windows
@@ -713,6 +729,30 @@ gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | head -20
 [ -z "$FIELD" ] && { echo "No versions.json field for $COMPONENT — no bump to watch; skipping to report."; SKIP_BUMP=1; }
 ```
 
+**browser — NO BUMP IS THE CORRECT OUTCOME for an Android-only preview.** Do not report
+it as a failed or missing bump. `publish-browser-releases.yml` gates its dispatch on a
+Windows installer actually shipping (`steps.locate.outputs.exe != ''`), because
+`versions.json[browser]` means *"the version the orchestrator can install as a released
+asset"*, and `setup-displayxr.bat --with browser` resolves it through `components.sh`'s
+`DisplayXR-Browser-Preview-Setup-*.exe` glob. An APK-only release cannot satisfy that
+glob, so the pin deliberately stays behind — real and already live: `preview-0.1.24`
+shipped Android-only and the pin correctly still names `preview-0.1.23`. **Never
+hand-bump the pin to match the newest tag**; it points `--with browser` at a release
+with no installer. Decide from the assets, not from the absence of a bump run:
+```bash
+if [ "$COMPONENT" = browser ]; then
+  HAS_EXE=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
+              --jq '[.assets[].name|select(contains("Setup") and endswith(".exe"))]|length')
+  if [ "$HAS_EXE" = 0 ]; then
+    echo "Android-only preview — no Windows installer, so NO versions.json bump is expected."
+    echo "versions.json[browser] intentionally stays behind $NEW_TAG. Do not bump it by hand."
+    SKIP_BUMP=1
+  fi
+fi
+```
+Spec: `docs/specs/runtime/versions-json-autobump.md` §"The browser pin LAGS the newest
+release on purpose".
+
 ```bash
 BUMP_RUN=""
 for i in $(seq 1 12); do
@@ -753,6 +793,8 @@ elif [ "$FIELD" = "leia_plugin" ]; then
             --state open --label abi-mismatch --search "$NEW_TAG" \
             --json number,url --jq '.[0]')
   echo "ABI gate skipped the bump. Tracking issue: $ISSUE"
+elif [ "$COMPONENT" = browser ] && [ "${SKIP_BUMP:-0}" = 1 ]; then
+  echo "versions.json[browser] = $PINNED, intentionally behind $NEW_TAG (Android-only preview — see Phase 4)."
 else
   echo "Bump did not land — versions.json[$FIELD] = $PINNED, expected $NEW_TAG"
 fi
