@@ -409,7 +409,8 @@ jobs:
             fi
             echo "  ok: loader $got == plug-in's CNSDK $plug (pair verified from the artifacts)"
             # And the APK must SAY which loader it bundles, so the pair is auditable
-            # on a device with one `dumpsys package` instead of an unpack. The
+            # from the INSTALLED apk (pull + aapt2 xmltree; `dumpsys package` does not
+            # print meta-data) without scraping strings out of the .so files. The
             # manifest stamp (com.displayxr.CNSDK_LOADER_VERSION, build.gradle) is
             # only worth trusting if it equals what the loader .so itself reports.
             AAPT2=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
@@ -424,7 +425,7 @@ jobs:
               echo "::error::manifest stamp com.displayxr.CNSDK_LOADER_VERSION='${stamp:-<absent>}' but the bundled loader is '$got' -- the on-device audit would lie."
               exit 1
             fi
-            echo "  ok: manifest stamp CNSDK_LOADER_VERSION=$stamp == bundled loader (dumpsys-auditable on device)"
+            echo "  ok: manifest stamp CNSDK_LOADER_VERSION=$stamp == bundled loader (auditable from the installed APK via aapt2)"
             # The build stamp is identification, not a gate -- but its dotted prefix
             # must still be the loader's version, or the label names the wrong drop.
             bstamp=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" \
