@@ -252,6 +252,16 @@ android {
 
         resValue "string", "monado_lib_version", "${versionName}"
 
+        // Stamp the bundled CNSDK loader version into the manifest so the pair
+        // is auditable ON DEVICE with one `dumpsys package` -- without unpacking
+        // the APK (#1357: loader 0.10.62 beside a 0.10.63 plug-in shipped green
+        // twice because nothing on the device said which loader it carried).
+        // Read from the drop's VERSION.txt: the .aar in that same drop is the
+        // SOLE source of libleiaCore-loader.so, so it describes the loader.
+        // "none" = built CNSDK-free (sim_display path). CI asserts this value
+        // equals the string the loader .so itself reports.
+        manifestPlaceholders = [cnsdkLoaderVersion: cnsdkVersion ?: 'none']
+
         resValue "string", "library_openxrheaders_libraryVersion", parseOpenXRVersion("${rootDir}/src/external/openxr_includes/openxr/openxr.h")
 
         externalNativeBuild {
