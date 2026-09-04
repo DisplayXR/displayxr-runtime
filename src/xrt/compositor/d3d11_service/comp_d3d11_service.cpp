@@ -1134,6 +1134,15 @@ struct d3d11_service_compositor
 	//! window-relative and merged into the flat list at raster time.
 	struct xrt_rect weave_screen_flat_rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX];
 	uint32_t weave_screen_flat_rect_count;
+	//! #939: while os_monotonic < this, the sticky latch above is NOT merged into
+	//! the published wish. Set by pipeline_rearm_focus_wish when this slot regains
+	//! the panel — a latch it carries at that moment was set while another
+	//! client's window covered it (the browser flattens the whole panel when its
+	//! tab is occluded) and the client re-evaluates ~300 ms after it is uncovered,
+	//! but its first submits publish the stale whole-panel flat and the vendor
+	//! evaluates that to a 2D verdict. Cleared by the client's next
+	//! xrWeaveSetScreenFlatRegionsDXR, or by expiry. 0 = none.
+	int64_t weave_screen_flat_suspended_until_ns;
 
 	//! Window dims the cached raster was SCALED FROM. The mask is published at
 	//! the DP's preferred resolution, not the window's, so a resize changes the
@@ -12245,6 +12254,24 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 		return;
 	}
 	struct d3d11_service_compositor *nc = mc->clients[slot].compositor;
+	/* #939: a sticky screen-flat latch this slot carries as it regains the
+	 * panel was set while it was covered (the browser flattens the whole panel
+	 * when its tab is occluded) and is about to be revised — but its first
+	 * submits would publish it as-is and the vendor would evaluate that to a
+	 * 2D verdict, 200+ ms before the client's own 3D re-ask. Suspend it for
+	 * the same grace the 2D wish gets below; the client's next
+	 * xrWeaveSetScreenFlatRegionsDXR ends the suspension early. */
+	{
+		const int64_t flat_grace_ns = dxr_rearm_2d_grace_ns();
+		if (flat_grace_ns > 0 && nc->weave_screen_flat_rect_count > 0) {
+			nc->weave_screen_flat_suspended_until_ns = (int64_t)os_monotonic_get_ns() + flat_grace_ns;
+			U_LOG_W(
+			    "[pipeline] %s -> slot %d: %u sticky screen-flat rect(s) suspended for %lld ms — latched "
+			    "while this slot was covered; its next flat-regions call or the expiry restores them "
+			    "(#939)",
+			    tag, slot, nc->weave_screen_flat_rect_count, (long long)(flat_grace_ns / 1000000LL));
+		}
+	}
 	int32_t wish_mode = nc->wish_content_mode.load(std::memory_order_acquire);
 	int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
 	if (wish_mode < 0 && wish_hw < 0) {
@@ -22060,7 +22087,24 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 	for (uint32_t i = 0; i < flat_rect_count && merged_count < WEAVE_WISH_MAX_FLAT_RECTS; i++) {
 		merged[merged_count++] = flat_rects[i];
 	}
-	for (uint32_t i = 0; i < c->weave_screen_flat_rect_count && merged_count < WEAVE_WISH_MAX_FLAT_RECTS; i++) {
+	// #939: a latch suspended by pipeline_rearm_focus_wish (set while this
+	// client was covered, about to be revised) stays out of the wish until the
+	// client re-sends it or the grace expires.
+	bool sticky_suspended = false;
+	if (c->weave_screen_flat_suspended_until_ns != 0) {
+		if ((int64_t)os_monotonic_get_ns() < c->weave_screen_flat_suspended_until_ns) {
+			sticky_suspended = true;
+		} else {
+			c->weave_screen_flat_suspended_until_ns = 0;
+			U_LOG_W(
+			    "[weave_wish] sticky screen-flat suspension expired without a new flat-regions call — "
+			    "%u latched rect(s) back in the wish (#939)",
+			    c->weave_screen_flat_rect_count);
+		}
+	}
+	for (uint32_t i = 0;
+	     !sticky_suspended && i < c->weave_screen_flat_rect_count && merged_count < WEAVE_WISH_MAX_FLAT_RECTS;
+	     i++) {
 		struct xrt_rect r = c->weave_screen_flat_rects[i];
 		r.offset.w -= (int32_t)origin.x;
 		r.offset.h -= (int32_t)origin.y;
@@ -22133,6 +22177,9 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
 		c->weave_screen_flat_rects[i] = screen_rects[i];
 	}
 	c->weave_screen_flat_rect_count = rect_count;
+	// #939: the client spoke — whatever pipeline_rearm_focus_wish suspended is
+	// superseded by this call, so the new latch takes effect at once.
+	c->weave_screen_flat_suspended_until_ns = 0;
 	U_LOG_W("[weave_wish] sticky screen flat regions latched: %u rect(s)", rect_count);
 
 	// Apply immediately when a wish is already live, so screen furniture goes flat
