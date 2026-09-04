@@ -742,6 +742,18 @@ def check_consumer_floors(report: Report) -> None:
             if tag:
                 derived.append((tag, f"XR_DXR_{ext} spec {want}"))
 
+        # A behavioural floor is one the spec derivation above CANNOT reach: a runtime
+        # change that bumped no SPEC_VERSION but that the shipped consumer still needs.
+        # Real case (runtime#1347): runtime#1336 routes an opaque present-owner to
+        # CLIENT_TEXTURE with no extension change at all, and the opaque browser does
+        # not present correctly without it. Derivation reads spec versions, so it sees
+        # nothing -- and an under-declared floor is exactly the failure this block
+        # exists to catch, so it must not depend on the change happening to touch a
+        # header. Folded into the same max() so the strictest floor wins.
+        bf = spec.get("behavioural_floor")
+        if isinstance(bf, dict) and bf.get("min_runtime"):
+            derived.append((bf["min_runtime"], bf.get("why") or "a behavioural runtime change"))
+
         if not derived:
             continue
 

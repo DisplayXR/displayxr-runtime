@@ -156,6 +156,36 @@ Two consequences worth knowing:
   pin their installer derives its minimum from, so `runtime_tag_pins` already
   covers them and listing them here would double-report.
 
+### Behavioural floors — the one thing spec derivation cannot see
+
+Derivation reads extension `SPEC_VERSION`s, so it is blind by construction to a
+runtime change that bumps no spec but that a shipped consumer still requires.
+That is not a bug in the audit; it is a limit of what specs express. Real case
+(runtime#1347): runtime#1336 routes an opaque present-owner to `CLIENT_TEXTURE`
+in the service, touching no extension header at all — and the opaque browser
+(browser-pvt#2) does not present correctly without it. Its true floor is
+**v2.16.3**, the first release carrying #1336, and nothing in any header says so.
+
+A consumer entry may therefore carry a `behavioural_floor`:
+
+```json
+"behavioural_floor": {
+  "min_runtime": "v2.16.3",
+  "why":  "the opaque present-owner path ...",
+  "ref":  "runtime#1336 (9399479b4), an ancestor of v2.16.3 (verified by merge-base)"
+}
+```
+
+The audit folds it into the same `max()` as the derived floors, so the advertised
+minimum is checked against whichever is stricter. This **deliberately breaks the
+rule above** — it hardcodes a version — and the reason it is safe to is the reason
+the rule exists: a number copied from a header drifts from the header, but a
+behavioural floor has no header to drift from. It is a fact about which release
+first carried a behaviour, verifiable at any time with
+`git merge-base --is-ancestor <commit> <release-tag>`, and unchanging once the
+release is cut. Always cite `ref` so the claim can be re-checked that way, and keep
+the entry to the behaviours a consumer genuinely cannot run without.
+
 ## Invariant
 
 A pin that no job verifies is a pin that rots silently until a release train
