@@ -594,6 +594,22 @@ def runtime_spec(ext: str, ref: str = "HEAD") -> int | None:
     return _dxr_specs(text).get(ext)
 
 
+def commit_is_ancestor_of_tag(commit: str, tag: str) -> bool | None:
+    """Does the runtime release ``tag`` contain ``commit``?
+
+    Executed through the GitHub compare API rather than ``git merge-base`` because
+    this audit deliberately runs with no checkout. ``compare/<tag>...<commit>``
+    reports ``head`` relative to ``base``: an ancestor is "behind", the same
+    commit is "identical". Anything else -- "ahead", "diverged", or a 404 for a
+    ref that does not exist -- is not an ancestor. Returns None when the API
+    call itself failed so the caller can distinguish "no" from "could not ask".
+    """
+    out = _gh(["api", f"repos/{ORG}/displayxr-runtime/compare/{tag}...{commit}", "--jq", ".status"])
+    if out is None:
+        return None
+    return out.strip() in ("identical", "behind")
+
+
 def first_release_with_spec(ext: str, want: int, tags: list[str]) -> str | None:
     """Earliest release tag whose XR_DXR_<ext> spec is >= want.
 
@@ -752,7 +768,40 @@ def check_consumer_floors(report: Report) -> None:
         # header. Folded into the same max() so the strictest floor wins.
         bf = spec.get("behavioural_floor")
         if isinstance(bf, dict) and bf.get("min_runtime"):
-            derived.append((bf["min_runtime"], bf.get("why") or "a behavioural runtime change"))
+            # The number is hand-typed, so it is exactly the kind of claim that is
+            # true when written and drifts afterwards. Do not trust it: require the
+            # commit that introduced the behaviour and EXECUTE the ancestry check
+            # against the named release every run. Any failure to verify is loud
+            # and the floor is withheld -- a silently trusted wrong floor would
+            # either hide an under-declaration or fabricate one.
+            bf_tag, bf_commit = bf["min_runtime"], bf.get("commit")
+            bf_why = bf.get("why") or "a behavioural runtime change"
+            if not bf_commit:
+                report.add(
+                    repo,
+                    "consumer-floor-unverifiable",
+                    f"behavioural_floor names {bf_tag} but no `commit` to verify it "
+                    f"against -- add the runtime commit that introduced the behaviour",
+                )
+            else:
+                anc = commit_is_ancestor_of_tag(bf_commit, bf_tag)
+                if anc is True:
+                    derived.append((bf_tag, bf_why))
+                elif anc is None:
+                    report.add(
+                        repo,
+                        "consumer-floor-unverifiable",
+                        f"could not verify behavioural_floor {bf_tag}: GitHub compare "
+                        f"{bf_tag}...{bf_commit[:12]} failed (missing tag or commit?)",
+                    )
+                else:
+                    report.add(
+                        repo,
+                        "consumer-floor-unverifiable",
+                        f"behavioural_floor claims {bf_commit[:12]} first shipped in "
+                        f"{bf_tag}, but that commit is NOT an ancestor of {bf_tag} -- "
+                        f"the floor is wrong or the commit is; not applied",
+                    )
 
         if not derived:
             continue
