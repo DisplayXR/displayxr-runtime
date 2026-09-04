@@ -122,12 +122,20 @@ jobs:
       # shim that dlopens libleiaCore-impl.so out of the ON-DEVICE package, so
       # the real core, face tracking and per-device calibration are never
       # redistributed. Same shape as Windows assuming an installed SR runtime.
-      # >= 0.10.62 is the FLOOR (#1232). 0.10.61 and earlier mis-detect device
-      # orientation in a non-fullscreen window, corrupting the interlacer's
-      # viewport-to-panel mapping so the DP's weave framebuffer faults inside
-      # vkCreateFramebuffer. Measured: the runtime fixes alone still crash on
-      # 0.10.61. The assertion in Inspect APK checks the APK really contains it.
-      CNSDK_TAG: v0.10.62
+      # NOT A FLOOR -- AN EXACT MATCH. CNSDK's loader shim refuses any plug-in
+      # built against a different apiVersion ("Invalid load request: apiVersion
+      # (X) does not match the loader version (Y)") -> leia_cnsdk_create fails
+      # -> "falling back to no-DP path" -> every in-process app runs in 2D with
+      # no error surfaced anywhere upstream. v2.16.2 and v2.16.3 shipped loader
+      # 0.10.62 beside a plug-in built against 0.10.63 and did exactly that.
+      #
+      # So this MUST equal the CNSDK_TAG the pinned leia-plugin release
+      # (versions.json[leia_plugin]) was built with. The Inspect-APK step now
+      # asserts loader == the version the plug-in .so itself embeds, so a drift
+      # between the two pins fails the BUILD instead of a pad.
+      # (0.10.62 was also a hard floor for #1232's orientation bug; that is
+      # subsumed -- nothing older can match a current plug-in anyway.)
+      CNSDK_TAG: v0.10.63
 
     steps:
 
@@ -372,6 +380,27 @@ jobs:
               exit 1
             fi
             echo "  ok: bundled CNSDK loader $got matches CNSDK_TAG $want"
+            # The pin is only HALF the truth. What actually has to agree is the
+            # loader and the PLUG-IN, and the plug-in was built by another repo
+            # against its own CNSDK_TAG. Both hand-typed pins matched their own
+            # artifacts on v2.16.2/v2.16.3 and still shipped a broken pair. So
+            # read the version the plug-in .so itself embeds -- its CNSDK include
+            # paths, cnsdk-android-<ver>+<build>/include/... -- and require the
+            # loader to equal THAT. Provenance from the artifact, not the pin.
+            unzip -q -o "$APK" 'lib/arm64-v8a/libdxrp050_leia_cnsdk.so' -d _apkchk
+            plug=$(strings -a _apkchk/lib/arm64-v8a/libdxrp050_leia_cnsdk.so \
+                     | grep -oE 'cnsdk-android-[0-9]+\.[0-9]+\.[0-9]+' | sort -u | head -1 | sed 's/cnsdk-android-//')
+            if [ -z "$plug" ]; then
+              echo "::error::could not read the CNSDK version the plug-in was built against (no cnsdk-android-<ver> string in libdxrp050_leia_cnsdk.so) -- cannot prove the pair matches"
+              exit 1
+            fi
+            if [ "$got" != "$plug" ]; then
+              echo "::error::CNSDK PAIR MISMATCH: bundled loader is $got but the bundled plug-in was built against $plug."
+              echo "::error::CNSDK will refuse to load on device and every in-process app will run in 2D."
+              echo "::error::Fix: set CNSDK_TAG here to v$plug (the leia-plugin release's CNSDK_TAG), or pin a plug-in built against v$got."
+              exit 1
+            fi
+            echo "  ok: loader $got == plug-in's CNSDK $plug (pair verified from the artifacts)"
           fi
 
       - name: Stage the APK with a release name
