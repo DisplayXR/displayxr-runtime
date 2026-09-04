@@ -1939,6 +1939,18 @@ struct oxr_system
 	//! Have the client application called the gfx api requirements func?
 	bool gotten_requirements;
 
+	//! #1041 / #939: the content mode a session was in when xrEndSession
+	//! dropped the panel to 2D, so a later xrBeginSession can put it back
+	//! instead of coming up flat. Lives on the SYSTEM, not the session: the
+	//! drop is written into the shared head device, which outlives the
+	//! session, so a NEW session in the same process (plain-Chrome WebXR's XR
+	//! utility process opens one XrSession per immersive session) inherited
+	//! mode 0 and rendered 2D under a 2D lens until the user toggled twice.
+	//! Only meaningful while @ref has_ended_rendering_mode is true; cleared
+	//! once consumed.
+	uint32_t ended_rendering_mode_index;
+	bool has_ended_rendering_mode;
+
 	XrViewConfigurationType view_config_type;
 	uint32_t view_count; //!< Number of views (1=mono, 2=stereo, 4=quad, etc.)
 	XrViewConfigurationView views[XRT_MAX_VIEWS];
@@ -2482,12 +2494,8 @@ struct oxr_session
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
 
-	//! #1041: the content mode this session was in when xrEndSession dropped
-	//! the panel to 2D, so a later xrBeginSession on the SAME session can put
-	//! it back instead of silently coming up flat. Only meaningful while
-	//! @ref has_ended_rendering_mode is true; cleared once consumed.
-	uint32_t ended_rendering_mode_index;
-	bool has_ended_rendering_mode;
+	//! (#1041's end->begin restore memory moved to oxr_system — see
+	//! oxr_system::ended_rendering_mode_index.)
 
 	//! Last recommended per-view render size polled at frame end (#439
 	//! Phase 3 Q4): 0 = no sample yet (baseline set without firing), else
