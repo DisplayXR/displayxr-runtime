@@ -168,8 +168,13 @@
         "versions, so a behavioural change is invisible to it BY CONSTRUCTION -- not a bug",
         "in the audit, a limit of what specs express. Tracking: runtime#1347.",
         "",
-        "{min_runtime, why, ref}. Folded into the same max() as the derived floors, so the",
-        "advertised minimum is checked against whichever is higher.",
+        "{min_runtime, commit, why, ref}. `commit` is the runtime commit that introduced the",
+        "behaviour, and the audit EXECUTES the ancestry check at read time -- GitHub compare",
+        "must report the commit identical-to or behind the min_runtime tag -- rather than",
+        "trusting the number: a missing tag, a missing commit, or a non-ancestor is a loud",
+        "consumer-floor-unverifiable finding and the floor is NOT applied. Verified floors are",
+        "folded into the same max() as the derived ones, so the advertised minimum is checked",
+        "against whichever is higher.",
         "",
         "YES, THIS HARDCODES A VERSION, against the DESIGN RULE above -- deliberately. That",
         "rule exists because a number copied from a header drifts from the header. A",
@@ -204,8 +209,9 @@
       "requires": { "weave": 8 },
       "behavioural_floor": {
         "min_runtime": "v2.16.3",
+        "commit": "9399479b49e7e7817d4ea732d8a59d197a2c5693",
         "why": "the opaque present-owner path: the service routes an opaque browser to CLIENT_TEXTURE; on an older runtime the opaque build does not present correctly",
-        "ref": "runtime#1336 (9399479b4), an ancestor of v2.16.3 (verified by merge-base); browser-pvt#2 turned the browser opaque. Tracking: runtime#1347"
+        "ref": "runtime#1336 = commit above, first released in v2.16.3 (the audit asserts this ancestry on every run); browser-pvt#2 turned the browser opaque. Tracking: runtime#1347"
       },
       "requires_anchor": "patches/README.md",
       "requires_note": [

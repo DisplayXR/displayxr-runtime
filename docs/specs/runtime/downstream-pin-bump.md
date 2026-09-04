@@ -171,8 +171,9 @@ A consumer entry may therefore carry a `behavioural_floor`:
 ```json
 "behavioural_floor": {
   "min_runtime": "v2.16.3",
+  "commit": "9399479b4...",
   "why":  "the opaque present-owner path ...",
-  "ref":  "runtime#1336 (9399479b4), an ancestor of v2.16.3 (verified by merge-base)"
+  "ref":  "runtime#1336 = commit above, first released in v2.16.3"
 }
 ```
 
@@ -181,10 +182,16 @@ minimum is checked against whichever is stricter. This **deliberately breaks the
 rule above** — it hardcodes a version — and the reason it is safe to is the reason
 the rule exists: a number copied from a header drifts from the header, but a
 behavioural floor has no header to drift from. It is a fact about which release
-first carried a behaviour, verifiable at any time with
-`git merge-base --is-ancestor <commit> <release-tag>`, and unchanging once the
-release is cut. Always cite `ref` so the claim can be re-checked that way, and keep
-the entry to the behaviours a consumer genuinely cannot run without.
+first carried a behaviour, and unchanging once the release is cut — **so the audit
+checks it rather than trusting it.** `commit` is required, and on every run the
+audit asks the GitHub compare API whether that commit is identical to or behind
+the `min_runtime` tag (the checkout-free equivalent of `git merge-base
+--is-ancestor`). A missing `commit`, a tag or commit that does not exist, or a
+commit that is not an ancestor of the tag is a `consumer-floor-unverifiable`
+finding and the floor is **not** applied — loud, never silently trusted. That is
+what stops the hand-typed number from becoming the very "true when written" claim
+the rest of this file is designed to avoid. Keep the entry to the behaviours a
+consumer genuinely cannot run without.
 
 ## Invariant
 
