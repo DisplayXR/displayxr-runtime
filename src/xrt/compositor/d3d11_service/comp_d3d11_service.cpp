@@ -10435,7 +10435,7 @@ pipeline_dp_graveyard_sweep(struct d3d11_multi_compositor *mc, bool force)
  * Render thread or an IPC thread holding render_mutex.
  */
 static void
-pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
+pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd, bool drop_lens_vote = true)
 {
 	if (mc == nullptr || hwnd == nullptr) {
 		return;
@@ -10449,7 +10449,17 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd)
 		mc->panel_dp_hwnd = nullptr;
 		mc->panel_dp_device = nullptr; // #918
 		pipeline_dp_forget_beliefs(mc); // #1319
-		(void)DP_REQUEST_DISPLAY_MODE(old, false);
+		if (drop_lens_vote) {
+			(void)DP_REQUEST_DISPLAY_MODE(old, false);
+		} else {
+			// #939: a weave present-owner survives and the replacement DP will
+			// come up in 3D within ~150 ms. Asking this one for 2D on its way
+			// out put the lens through 3D -> 2D -> 3D at every hosted client's
+			// teardown (measured 157 ms); its vote dies with it either way.
+			U_LOG_W(
+			    "[pipeline] panel DP released WITHOUT dropping its lens vote — a weave present-owner "
+			    "survives in 3D and the replacement re-asserts it (#939)");
+		}
 		xrt_display_processor_d3d11_destroy(&old);
 		U_LOG_W("[pipeline] panel DP released with its window hwnd=%p — rebinds on the next frame (#1014)",
 		        (void *)hwnd);
@@ -21366,7 +21376,8 @@ compositor_destroy(struct xrt_compositor *xc)
 		// created against. Detach it FIRST, still under render_mutex, or
 		// DestroyWindow re-enters the weaver on a live DP.
 		if (c->render.owns_window && c->render.hwnd != nullptr) {
-			pipeline_release_panel_dp_for_hwnd(tmc, c->render.hwnd);
+			pipeline_release_panel_dp_for_hwnd(tmc, c->render.hwnd,
+			                                   /*drop_lens_vote*/ !weave_owner_survives);
 		}
 
 		/*
@@ -21394,7 +21405,8 @@ compositor_destroy(struct xrt_compositor *xc)
 			// would merely park it in the graveyard — keyed on a window that
 			// is about to be destroyed, which is the one thing #1014 forbids.
 			if (tmc->display_processor != nullptr && tmc->panel_dp_hwnd == panel_dp_dying_hwnd) {
-				pipeline_release_panel_dp_for_hwnd(tmc, panel_dp_dying_hwnd);
+				pipeline_release_panel_dp_for_hwnd(tmc, panel_dp_dying_hwnd,
+				                                   /*drop_lens_vote*/ !weave_owner_survives);
 			}
 			U_LOG_W(
 			    "[pipeline] teardown: panel DP was bound to departing client '%s' window %p — "
