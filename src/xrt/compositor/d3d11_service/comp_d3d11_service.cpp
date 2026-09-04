@@ -3009,6 +3009,11 @@ struct d3d11_multi_client_slot
 	enum xrt_layer_composition_flags projection_flags_snapshot;
 	bool projection_flags_valid;
 
+	//! Throttle for pipeline_repark_stray_client_windows's WARN: last time this
+	//! slot's own window was found on screen under the workspace and re-parked.
+	//! 0 = never (slots are zeroed at allocation).
+	int64_t stray_window_park_last_log_ns;
+
 	//! Runtime-side cache of the WS layer's source texture, populated by
 	//! GPU `CopyResource` from the app's HUD swapchain whenever
 	//! multi_compositor_render successfully `AcquireSync`s the cross-process
@@ -11942,6 +11947,71 @@ pipeline_unpark_app_hwnd(struct d3d11_multi_compositor *mc, int32_t slot)
 }
 
 /*!
+ * Workspace compose: re-park a composed client's own window that has come back
+ * ON SCREEN.
+ *
+ * Under a controller a composed client's pixels reach the panel through its
+ * atlas, and its own HWND is parked - hidden by the client at session create
+ * (`oxr_session.c`, DISPLAYXR_WORKSPACE_SESSION) or minimised by the activate
+ * sweep. Nothing enforced that afterwards. An app that rewrites its style word
+ * (`SetWindowLong(GWL_STYLE, WS_POPUP | WS_VISIBLE)` - the demos' Ctrl+T
+ * borderless swap, followed by `HWND_TOPMOST`) puts a real window over the
+ * workspace, and once it is visible the CLIENT_TEXTURE flat repaint keeps it
+ * live: the user sees the app's native window on top of the shell.
+ *
+ * Only a window the user is NOT looking at is parked. A window that holds the
+ * OS foreground is the user's Alt-Tab / taskbar click - the #964 Phase A
+ * override, which the caller has already sampled (debounced) this frame - and
+ * is left alone; the demos' swap passes SWP_NOACTIVATE, so it never takes the
+ * foreground on its own. Present-owners (`weave_hwnd`, #1323) and
+ * runtime-owned hosted windows (#1014) are not composed clients and are
+ * skipped. SW_HIDE puts the window back in its launched-under-the-shell state;
+ * async, because the window's thread is the app's (#925).
+ *
+ * Render thread, under render_mutex; the style reads are cheap, non-blocking.
+ * The WARN is per slot and throttled to once a second - an app that re-shows
+ * its window every frame must not flood the log.
+ */
+static void
+pipeline_repark_stray_client_windows(struct d3d11_multi_compositor *mc)
+{
+	HWND fg = GetForegroundWindow();
+	if (fg != nullptr) {
+		HWND root = GetAncestor(fg, GA_ROOT);
+		if (root != nullptr) {
+			fg = root;
+		}
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (!slot->active || slot->client_type != CLIENT_TYPE_IPC || slot->compositor == nullptr) {
+			continue;
+		}
+		const struct d3d11_service_compositor *sc = slot->compositor;
+		if (sc->render.weave_hwnd != nullptr || sc->render.owns_window) {
+			continue;
+		}
+		HWND h = slot->app_hwnd;
+		if (h == nullptr &&
+		    (sc->presenter == PRESENTER_APP_HWND || sc->presenter == PRESENTER_CLIENT_TEXTURE)) {
+			h = sc->render.hwnd;
+		}
+		if (h == nullptr || !IsWindow(h) || !IsWindowVisible(h) || IsIconic(h) || h == fg) {
+			continue;
+		}
+		ShowWindowAsync(h, SW_HIDE);
+		const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		if (now_ns - slot->stray_window_park_last_log_ns > 1000000000LL) {
+			slot->stray_window_park_last_log_ns = now_ns;
+			U_LOG_W(
+			    "[pipeline] slot %d ('%s') showed its own window %p under the workspace - re-parked "
+			    "(hidden); its pixels reach the panel via the atlas",
+			    i, slot->app_name[0] != '\0' ? slot->app_name : "?", (void *)h);
+		}
+	}
+}
+
+/*!
  * #939: note that a foreground verdict was DROPPED because the runtime itself
  * moved that window moments ago.
  *
@@ -13726,6 +13796,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				                                      /*skip_dp*/ false, "override_end");
 			}
 		}
+
+		// No override this frame: a composed client's own window has no business
+		// being on screen. Put back any the app re-showed itself (Ctrl+T).
+		pipeline_repark_stray_client_windows(mc);
 	}
 
 	// ADR-018: the runtime no longer consumes TAB to cycle focus. TAB is
