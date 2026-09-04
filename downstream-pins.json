@@ -162,6 +162,22 @@
       "spec_sources": "Files to scan for `#define XR_DXR_<ext>_SPEC_VERSION <n>`. The ext segment is matched case-insensitively -- Unity writes XR_DXR_DISPLAY_INFO_SPEC_VERSION, the runtime writes XR_DXR_display_info_SPEC_VERSION -- and normalised to the runtime's lowercase header naming.",
       "declared_floor": "Where the consumer writes its minimum-runtime literal, if it has one. The audit compares it against the floor DERIVED from spec_sources.",
       "requires": "Escape hatch: an explicit {ext: version} map for a consumer whose headers are not readable files. Prefer spec_sources.",
+      "behavioural_floor": [
+        "The floor spec derivation CANNOT see: a runtime change with no SPEC_VERSION bump",
+        "that a shipped consumer nonetheless requires. Derivation reads extension spec",
+        "versions, so a behavioural change is invisible to it BY CONSTRUCTION -- not a bug",
+        "in the audit, a limit of what specs express. Tracking: runtime#1347.",
+        "",
+        "{min_runtime, why, ref}. Folded into the same max() as the derived floors, so the",
+        "advertised minimum is checked against whichever is higher.",
+        "",
+        "YES, THIS HARDCODES A VERSION, against the DESIGN RULE above -- deliberately. That",
+        "rule exists because a number copied from a header drifts from the header. A",
+        "behavioural floor has no header to drift from: it is a fact about which runtime",
+        "release first carried a behaviour, and that never changes once the release is cut.",
+        "Keep the entry minimal and always cite `ref` so the claim can be re-checked with",
+        "`git merge-base --is-ancestor <commit> <release-tag>`."
+      ],
       "_monotonicity": [
         "Deriving 'which release first shipped spec N' binary-searches the runtime's",
         "release tags, which assumes a SPEC_VERSION never decreases from one release",
@@ -186,6 +202,11 @@
       ],
       "declared_floor": { "file": "installer/DisplayXRBrowserInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" },
       "requires": { "weave": 8 },
+      "behavioural_floor": {
+        "min_runtime": "v2.16.3",
+        "why": "the opaque present-owner path: the service routes an opaque browser to CLIENT_TEXTURE; on an older runtime the opaque build does not present correctly",
+        "ref": "runtime#1336 (9399479b4), an ancestor of v2.16.3 (verified by merge-base); browser-pvt#2 turned the browser opaque. Tracking: runtime#1347"
+      },
       "requires_anchor": "patches/README.md",
       "requires_note": [
         "Spelled out because this consumer vendors no header FILE -- it is a patch",
