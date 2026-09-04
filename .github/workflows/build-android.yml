@@ -272,6 +272,13 @@ jobs:
           echo "plugin_pin=$PIN" >> "$GITHUB_OUTPUT"
           echo "cnsdk_dir=$CNSDK_DIR" >> "$GITHUB_OUTPUT"
           echo "cnsdk_version=$CNSDK_VER" >> "$GITHUB_OUTPUT"
+          # Full build id (x.y.z+<n>.<sha>) for the identification-only manifest
+          # stamp: the extracted dir name when the zip nests one, else the zip's
+          # own basename. Not gated -- nothing in the binary to compare against.
+          CNSDK_BUILD=$(basename "$CNSDK_DIR" | sed 's/^cnsdk-android-//')
+          case "$CNSDK_BUILD" in *+*) ;; *) CNSDK_BUILD=$(basename "$(ls _cnsdk_zip/*.zip)" .zip | sed 's/^cnsdk-android-//') ;; esac
+          case "$CNSDK_BUILD" in *+*) ;; *) echo "::warning::CNSDK drop carries no +build metadata (dir/zip: $CNSDK_BUILD) -- stamping CNSDK_LOADER_BUILD=unknown"; CNSDK_BUILD=unknown ;; esac
+          echo "cnsdk_build=$CNSDK_BUILD" >> "$GITHUB_OUTPUT"
           echo "leia plug-in $PIN + CNSDK $CNSDK_VER staged"
 
       # Never publish an unsigned APK. The decode writes ANDROID_KEYSTORE_FILE
@@ -310,7 +317,7 @@ jobs:
           chmod +x ./gradlew
           ARGS=""
           if [ "${{ matrix.variant }}" = "leia" ]; then
-            ARGS="-PcnsdkDir=${{ steps.payload.outputs.cnsdk_dir }}"
+            ARGS="-PcnsdkDir=${{ steps.payload.outputs.cnsdk_dir }} -PcnsdkBuild=${{ steps.payload.outputs.cnsdk_build }}"
           fi
           ./gradlew :src:xrt:targets:openxr_android:assembleRelease --no-daemon --stacktrace $ARGS
 
@@ -418,6 +425,16 @@ jobs:
               exit 1
             fi
             echo "  ok: manifest stamp CNSDK_LOADER_VERSION=$stamp == bundled loader (dumpsys-auditable on device)"
+            # The build stamp is identification, not a gate -- but its dotted prefix
+            # must still be the loader's version, or the label names the wrong drop.
+            bstamp=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" \
+                       | grep -A1 'com.displayxr.CNSDK_LOADER_BUILD' \
+                       | grep -oE ':value\([^)]*\)="[^"]*"' | head -1 | sed -E 's/.*="([^"]*)"/\1/')
+            if [ "$bstamp" != unknown ] && [ "${bstamp%%+*}" != "$got" ]; then
+              echo "::error::manifest stamp CNSDK_LOADER_BUILD='$bstamp' does not describe loader $got"
+              exit 1
+            fi
+            echo "  ok: manifest stamp CNSDK_LOADER_BUILD=$bstamp"
           fi
 
       - name: Stage the APK with a release name

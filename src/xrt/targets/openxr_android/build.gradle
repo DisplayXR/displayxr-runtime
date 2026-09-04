@@ -222,6 +222,13 @@ def cnsdkVersionFile = cnsdkDir ? new File("${cnsdkDir}/VERSION.txt") : null
 def cnsdkVersion = (cnsdkVersionFile?.exists()) ? cnsdkVersionFile.text.trim() : null
 def cnsdkAar = (cnsdkDir && cnsdkVersion) ? new File("${cnsdkDir}/android/sdk-${cnsdkVersion}.aar") : null
 def hasCnsdk = cnsdkAar?.exists()
+// Which BUILD of that version (x.y.z+<n>.<sha>): identification only, never gated
+// (the loader .so carries no build metadata to assert against). Two builds of one
+// dotted version stamp identical CNSDK_LOADER_VERSIONs -- this is what tells them
+// apart. CI passes -PcnsdkBuild from the drop directory / release zip name; a
+// local drop extracted to a bare "cnsdk-android-x.y.z" has no build info -> 'unknown'.
+def cnsdkBuild = project.findProperty('cnsdkBuild') ?: (
+    (cnsdkDir && (new File(cnsdkDir).name =~ /\d+\.\d+\.\d+\+\S+/)) ? (new File(cnsdkDir).name - ~/^cnsdk-android-/) : 'unknown')
 println "openxr_android: runtime-hosted CNSDK Java glue ${hasCnsdk ? "ENABLED (${cnsdkAar})" : 'disabled (sim_display path)'}"
 
 android {
@@ -260,7 +267,8 @@ android {
         // SOLE source of libleiaCore-loader.so, so it describes the loader.
         // "none" = built CNSDK-free (sim_display path). CI asserts this value
         // equals the string the loader .so itself reports.
-        manifestPlaceholders = [cnsdkLoaderVersion: cnsdkVersion ?: 'none']
+        manifestPlaceholders = [cnsdkLoaderVersion: cnsdkVersion ?: 'none',
+                                cnsdkLoaderBuild:   cnsdkVersion ? cnsdkBuild : 'none']
 
         resValue "string", "library_openxrheaders_libraryVersion", parseOpenXRVersion("${rootDir}/src/external/openxr_includes/openxr/openxr.h")
 

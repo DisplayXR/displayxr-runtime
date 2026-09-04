@@ -87,6 +87,16 @@
         <meta-data
             android:name="com.displayxr.CNSDK_LOADER_VERSION"
             android:value="${cnsdkLoaderVersion}" />
+        <!--
+            Which BUILD of that loader (x.y.z+<n>.<sha>, from the CNSDK drop /
+            release zip name). Identification only, NOT asserted against the
+            binary, which carries no build metadata. Two builds of one dotted
+            version are indistinguishable by CNSDK_LOADER_VERSION; this is what
+            tells them apart. "unknown" = drop had no build info (local dev).
+        -->
+        <meta-data
+            android:name="com.displayxr.CNSDK_LOADER_BUILD"
+            android:value="${cnsdkLoaderBuild}" />
 
         <!--
             Diagnostics dashboard (#558) replaces the shared android_common
