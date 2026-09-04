@@ -879,15 +879,22 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
 			// #1041: undo oxr_session_end()'s local drop-to-2D when this is
-			// an end→begin cycle on the same session (Android resizes/pauses
-			// an app into one; the app is emphatically NOT gone). Guarded on
-			// the index still being the 0 we ourselves wrote, so a mode set
-			// by anyone else in between — the workspace/panel lease, another
-			// client's request re-synced onto the IPC proxy — wins and is
-			// never stomped by a stale restore.
-			if (sess->has_ended_rendering_mode) {
-				uint32_t restore = sess->ended_rendering_mode_index;
-				sess->has_ended_rendering_mode = false;
+			// an end→begin cycle (Android resizes/pauses an app into one; the
+			// app is emphatically NOT gone). Guarded on the index still being
+			// the 0 we ourselves wrote, so a mode set by anyone else in
+			// between — the workspace/panel lease, another client's request
+			// re-synced onto the IPC proxy — wins and is never stomped by a
+			// stale restore.
+			//
+			// #939: the memory lives on the SYSTEM, not the session. The
+			// drop below is written into the shared head device, which
+			// outlives the session, so a NEW XrSession in the same process
+			// (plain-Chrome WebXR: one session per immersive entry, one XR
+			// utility process for all of them) inherited mode 0 and came up
+			// 2D under a 2D lens until the user toggled twice.
+			if (sess->sys->has_ended_rendering_mode) {
+				uint32_t restore = sess->sys->ended_rendering_mode_index;
+				sess->sys->has_ended_rendering_mode = false;
 				if (head->hmd->active_rendering_mode_index == 0 &&
 				    restore < head->rendering_mode_count) {
 					head->hmd->active_rendering_mode_index = restore;
@@ -979,8 +986,10 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 			// server here (see above), so this is purely this session's
 			// own state — the single mode field stays the only authority.
 			if (head->hmd != NULL && head->hmd->active_rendering_mode_index != 0) {
-				sess->ended_rendering_mode_index = head->hmd->active_rendering_mode_index;
-				sess->has_ended_rendering_mode = true;
+				// #939: on the system, so the next session in this process
+				// restores it too (see oxr_session_begin).
+				sess->sys->ended_rendering_mode_index = head->hmd->active_rendering_mode_index;
+				sess->sys->has_ended_rendering_mode = true;
 			}
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;

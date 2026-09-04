@@ -10469,9 +10469,21 @@ pipeline_release_panel_dp_for_hwnd(struct d3d11_multi_compositor *mc, HWND hwnd,
 			// come up in 3D within ~150 ms. Asking this one for 2D on its way
 			// out put the lens through 3D -> 2D -> 3D at every hosted client's
 			// teardown (measured 157 ms); its vote dies with it either way.
+			//
+			// And the departing client's own parting 2D (xrEndSession asks for
+			// hardware 2D before it ends the session) may already sit in THIS
+			// DP's lens mailbox, held in the vendor's short dwell — destroying
+			// the DP flushes a held 2D rather than dropping it (a departing DP
+			// must normally land its 2D). Post a 3D behind it: the dwell
+			// withdraws the pair and the lens never moves. Measured before:
+			// `switched to 2D` 18 ms after the drain, `applied recorded lens
+			// wish (3D)` 133 ms later on the fresh DP — a visible dip at every
+			// plain-Chrome WebXR exit beside the browser.
+			(void)DP_REQUEST_DISPLAY_MODE(old, true);
 			U_LOG_W(
 			    "[pipeline] panel DP released WITHOUT dropping its lens vote — a weave present-owner "
-			    "survives in 3D and the replacement re-asserts it (#939)");
+			    "survives in 3D and the replacement re-asserts it; a parting 2D held in its dwell is "
+			    "withdrawn (#939)");
 		}
 		xrt_display_processor_d3d11_destroy(&old);
 		U_LOG_W("[pipeline] panel DP released with its window hwnd=%p — rebinds on the next frame (#1014)",
@@ -12270,6 +12282,40 @@ pipeline_pick_focus(struct d3d11_service_system *sys, struct d3d11_multi_composi
  *
  * Render thread, under render_mutex.
  */
+static bool
+service_apply_pending_mode(struct d3d11_service_system *sys,
+                           struct d3d11_service_compositor *c,
+                           bool bridge_live,
+                           bool as_service,
+                           bool holds_render_mutex);
+
+/*!
+ * #939: apply a re-armed wish NOW, on the render thread, as a service-driven
+ * transition. Leaving it as a pending request for the client's next commit
+ * raced the lease: `client_holds_panel_lease` reads `state_focused`, which the
+ * IPC layer mirrors from the slot table on ITS loop, so a commit that arrived
+ * inside that window was DENIED (reason=2) and the replay silently lost —
+ * measured as the lens staying 2D after the browser closed beside a live
+ * WebXR session (the survivor's 3D re-arm denied 11 ms after the focus
+ * change). The render thread just DECIDED the focus; it is the authority
+ * (D-5), so the lease check has nothing to add here.
+ */
+static void
+pipeline_rearm_apply_now(struct d3d11_service_compositor *nc, int32_t slot, const char *why)
+{
+	if (nc == nullptr || nc->sys == nullptr) {
+		return;
+	}
+	if (nc->pending_content_mode.load(std::memory_order_acquire) == 0xFFFFFFFFu &&
+	    nc->pending_hw_3d.load(std::memory_order_acquire) < 0) {
+		return;
+	}
+	if (!service_apply_pending_mode(nc->sys, nc, /*bridge_live*/ false, /*as_service*/ true,
+	                                /*holds_render_mutex*/ true)) {
+		U_LOG_W("[pipeline] slot %d: re-armed wish (%s) did not land on the render thread (#939)", slot, why);
+	}
+}
+
 static void
 pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const char *tag)
 {
@@ -12325,6 +12371,7 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 		    "[pipeline] %s -> slot %d: re-arming wish content=%d hw=0 DEFERRED %lld ms so the client can "
 		    "re-ask first (#939)",
 		    tag, slot, (int)wish_mode, (long long)(grace_ns / 1000000LL));
+		pipeline_rearm_apply_now(nc, slot, tag); // the content-mode half, if any; hw waits
 		return;
 	}
 	nc->rearm_hw2d_due_ns.store(0, std::memory_order_release);
@@ -12332,6 +12379,7 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 		nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
 	}
 	U_LOG_W("[pipeline] %s -> slot %d: re-arming wish content=%d hw=%d", tag, slot, (int)wish_mode, wish_hw);
+	pipeline_rearm_apply_now(nc, slot, tag);
 }
 
 /*!
@@ -12385,6 +12433,7 @@ pipeline_apply_deferred_rearm(struct d3d11_service_system *sys, struct d3d11_mul
 		        wish_hw,
 		        wish_hw == 0 ? "the client did not re-ask; applying its 2D"
 		                     : "the client's 3D re-ask did not land; re-asserting it");
+		pipeline_rearm_apply_now(nc, s, "held-back replay");
 	}
 }
 
@@ -21325,6 +21374,38 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	uint32_t survivors = service_scan_teardown_survivors(sys, c, &survivor_wants_3d);
 	if (survivor_wants_3d) {
 		return;
+	}
+	// #939: `survivor_wants_3d` above only says "a weave present-owner
+	// survives". A HOSTED survivor that is presenting in 3D — plain-Chrome
+	// WebXR holding the panel while the DisplayXR Browser exits — wants the
+	// lens just as much, and its standing wish says so (content mode with
+	// hardware_display_3d, or an explicit hw=1). Flattening under it was a
+	// one-shot 2D dip at every browser exit beside a live WebXR session; the
+	// focus rule re-arms the survivor's wish a tick later, so nothing here is
+	// stranded by leaving the lens alone.
+	{
+		struct d3d11_multi_compositor *tmc = sys->multi_comp;
+		struct xrt_device *head = sys->xsysd != nullptr ? sys->xsysd->static_roles.head : nullptr;
+		for (int i = 0; tmc != nullptr && i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			struct d3d11_service_compositor *other = tmc->clients[i].compositor;
+			if (!tmc->clients[i].active || other == nullptr || other == c ||
+			    !pipeline_slot_presenting(&tmc->clients[i])) {
+				continue;
+			}
+			const int32_t wm = other->wish_content_mode.load(std::memory_order_acquire);
+			const bool wants_3d =
+			    other->wish_hw_3d.load(std::memory_order_acquire) == 1 ||
+			    (wm >= 0 && head != nullptr && (uint32_t)wm < head->rendering_mode_count &&
+			     head->rendering_modes[wm].hardware_display_3d);
+			if (wants_3d) {
+				U_LOG_W(
+				    "#814 failsafe: %s client leaving, but presenting survivor slot %d ('%s') still "
+				    "wants 3D — leaving the lens alone (#939)",
+				    this_client_is_weave_owner ? "weave present-owner" : "last", i,
+				    other->slot_app_name);
+				return;
+			}
+		}
 	}
 	// An ordinary client leaving while others are still connected is not
 	// evidence that the panel should go flat — one of those survivors may be
