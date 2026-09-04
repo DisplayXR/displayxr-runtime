@@ -59,6 +59,27 @@ for f in "$PKG"/*.dll "$PKG"/*.exe "$PKG"/*.json; do
 done
 echo "== copied $copied files"
 
+# 3b. Refresh input-provider / display plug-in DLLs that are ALREADY installed
+# under PF\plugins (the installer does not ship every provider; a hand-placed
+# one that is never refreshed silently drifts behind the runtime — e.g. an
+# Ultraleap provider predating the presence slot held the hand roles with no
+# hardware attached and every hosted/WebXR app lost its controllers). Only
+# files PF already has are touched; a loaded DLL is renamed aside, never
+# overwritten in place.
+refreshed=0
+for f in "$PKG"/plugins/*.dll; do
+  [ -f "$f" ] || continue
+  base="$(basename "$f")"
+  [ -f "$PF/plugins/$base" ] || continue
+  if cmp -s "$f" "$PF/plugins/$base"; then continue; fi
+  if ! cp -f "$f" "$PF/plugins/$base" 2>/dev/null; then
+    mv -f "$PF/plugins/$base" "$PF/plugins/$base.old-$(date +%Y%m%d%H%M%S)"       || { echo "ERROR: could not move aside locked plugins/$base" >&2; exit 1; }
+    cp -f "$f" "$PF/plugins/$base" || { echo "ERROR: could not copy plugins/$base" >&2; exit 1; }
+  fi
+  refreshed=$((refreshed+1))
+done
+echo "== refreshed $refreshed already-installed plug-in DLL(s) under plugins/"
+
 # Keep the installed MCP adapter in place (voice resolves it CWD-relative from
 # the Runtime dir; the file must EXIST there but must be the MCP\bin build).
 if [ -f "/c/Program Files/DisplayXR/MCP/bin/displayxr-mcp.exe" ]; then

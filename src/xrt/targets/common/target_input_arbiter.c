@@ -637,6 +637,18 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		const struct t_input_candidate *cand = &g_arb.candidates[i];
 		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d).", i, candidate_name(cand),
 		        (unsigned)cand->priority, cand->left_index, cand->right_index);
+		// A provider built before the presence slot is ASSUMED present for as
+		// long as it is loaded (query_candidate_presence), so with no hardware
+		// attached it still outranks qwerty and every hosted / WebXR app sees
+		// controllers that never go active. Say so where `displayxr-cli info`
+		// and the service log show the roles, or the stale DLL is invisible.
+		if (cand->iface != NULL && !XRT_INPUT_PLUGIN_IFACE_HAS(cand->iface, get_presence)) {
+			U_LOG_W(
+			    "input arbiter: candidate '%s' predates the presence slot (no get_presence) — "
+			    "ASSUMED PRESENT while loaded, so it holds the hand roles even with no hardware; "
+			    "rebuild or re-register the provider so qwerty can take over when it is absent.",
+			    candidate_name(cand));
+		}
 	}
 	U_LOG_W("input arbiter: installed — %d candidates; roles re-resolve on every xrSyncActions.",
 	        g_arb.candidate_count);
