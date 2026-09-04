@@ -1009,6 +1009,14 @@ struct d3d11_service_compositor
 	std::atomic<int32_t> wish_content_mode{-1};
 	std::atomic<int> wish_hw_3d{-1};
 
+	//! #939: deadline (os_monotonic ns, 0 = none) for a hardware-2D wish that
+	//! pipeline_rearm_focus_wish chose NOT to replay yet. A present-owner such as
+	//! the browser drops to 2D when another client's window covers its tab and
+	//! re-asks for 3D a debounce (~300 ms) after it is uncovered; replaying its
+	//! stale 2D the instant it regains the lease put the lens through
+	//! 3D -> 2D -> 3D on every focus trade. See pipeline_apply_deferred_rearm.
+	std::atomic<int64_t> rearm_hw2d_due_ns{0};
+
 	//! #815: the app's standing HARDWARE override, latched from the last
 	//! xrRequestDisplayModeDXR this client made. -1 = none / 0 = 2D / 1 = 3D.
 	//!
@@ -10247,6 +10255,25 @@ dxr_dp_graveyard_ns()
 	return ns;
 }
 
+//! #939: how long a REPLAYED hardware-2D wish is held back so the client that
+//! just regained the lease can speak for itself first (the browser re-asks
+//! ~300 ms after its tab is uncovered). DXR_REARM_2D_GRACE_MS; 0 = replay
+//! immediately, the pre-#939 behaviour.
+static int64_t
+dxr_rearm_2d_grace_ns()
+{
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *e = getenv("DXR_REARM_2D_GRACE_MS");
+		int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 750;
+		if (ms < 0) {
+			ms = 0;
+		}
+		ns = ms * 1000000LL;
+	}
+	return ns;
+}
+
 //! #1319: how long the pipeline stays up with no clients before it releases the
 //! panel DP and parks the render thread. A GRACE window, not a timeout — an app
 //! restart, a shell relaunch, or a launcher swapping one app for another all
@@ -12226,10 +12253,89 @@ pipeline_rearm_focus_wish(struct d3d11_multi_compositor *mc, int32_t slot, const
 	if (wish_mode >= 0) {
 		nc->pending_content_mode.store((uint32_t)wish_mode, std::memory_order_release);
 	}
+	const int64_t grace_ns = dxr_rearm_2d_grace_ns();
+	if (wish_hw == 0 && grace_ns > 0) {
+		/* #939: a replayed 2D is a guess about a client that is about to
+		 * speak. The browser (a present-owner) asks for hardware 2D when
+		 * another client's window covers its tab and asks for 3D again
+		 * ~300 ms after it is uncovered. The 2D it asked for while covered
+		 * was denied (it did not hold the lease) but latched as its standing
+		 * wish (#964), so replaying it here the instant the lease came back
+		 * put the SR lens through 3D -> 2D -> 3D on every focus trade —
+		 * plug-in log `display mode switched to 2D` 250 ms before `switched
+		 * to 3D`, seen from the chair as the browser's 3D elements blinking
+		 * beside a plain-Chrome WebXR session. Hold the 2D for a grace
+		 * window instead: a request the client makes meanwhile lands on its
+		 * own (it holds the lease now), and at the deadline
+		 * pipeline_apply_deferred_rearm replays whatever the wish is THEN.
+		 * A 3D wish is still replayed at once — 2D -> 3D is the direction
+		 * the user is waiting on, and there is nothing to wait for. */
+		nc->rearm_hw2d_due_ns.store((int64_t)os_monotonic_get_ns() + grace_ns, std::memory_order_release);
+		U_LOG_W(
+		    "[pipeline] %s -> slot %d: re-arming wish content=%d hw=0 DEFERRED %lld ms so the client can "
+		    "re-ask first (#939)",
+		    tag, slot, (int)wish_mode, (long long)(grace_ns / 1000000LL));
+		return;
+	}
+	nc->rearm_hw2d_due_ns.store(0, std::memory_order_release);
 	if (wish_hw >= 0) {
 		nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
 	}
 	U_LOG_W("[pipeline] %s -> slot %d: re-arming wish content=%d hw=%d", tag, slot, (int)wish_mode, wish_hw);
+}
+
+/*!
+ * #939: the second half of pipeline_rearm_focus_wish. Every tick on the render
+ * thread (under render_mutex), once the presenter slot is resolved.
+ *
+ * A held-back 2D replay is dropped when its slot loses the panel again (the
+ * next holder's own re-arm decides), and otherwise fires at its deadline with
+ * the slot's wish AS IT STANDS THEN: still 2D — the client really does want a
+ * flat panel (a 2D page), apply it, grace over; 3D — the client re-asked and
+ * either landed it already (nothing to do) or was denied because
+ * `state_focused` had not caught up with the slot table when it asked, in
+ * which case this is the replay that heals it.
+ */
+static void
+pipeline_apply_deferred_rearm(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int32_t focused)
+{
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_service_compositor *nc = mc->clients[s].compositor;
+		if (nc == nullptr) {
+			continue;
+		}
+		const int64_t due_ns = nc->rearm_hw2d_due_ns.load(std::memory_order_acquire);
+		if (due_ns == 0) {
+			continue;
+		}
+		if (s != focused) {
+			nc->rearm_hw2d_due_ns.store(0, std::memory_order_release);
+			U_LOG_W("[pipeline] slot %d: held-back 2D replay dropped — it no longer holds the panel (#939)",
+			        s);
+			continue;
+		}
+		if (now_ns < due_ns) {
+			continue;
+		}
+		nc->rearm_hw2d_due_ns.store(0, std::memory_order_release);
+		const int wish_hw = nc->wish_hw_3d.load(std::memory_order_acquire);
+		if (wish_hw < 0) {
+			continue;
+		}
+		if (wish_hw != 0 && sys->hardware_display_3d) {
+			U_LOG_W(
+			    "[pipeline] slot %d: held-back 2D replay expired — the client re-asked for 3D and the "
+			    "panel is already there; nothing replayed (#939)",
+			    s);
+			continue;
+		}
+		nc->pending_hw_3d.store(wish_hw, std::memory_order_release);
+		U_LOG_W("[pipeline] slot %d: held-back replay fires — standing wish is now hw=%d (%s) (#939)", s,
+		        wish_hw,
+		        wish_hw == 0 ? "the client did not re-ask; applying its 2D"
+		                     : "the client's 3D re-ask did not land; re-asserting it");
+	}
 }
 
 /*!
@@ -12739,6 +12845,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		}
 		focused = best;
 	}
+
+	/* #939: fire or drop any hardware-2D replay pipeline_rearm_focus_wish held
+	 * back (both the focus and the foreground-override re-arms land here). */
+	pipeline_apply_deferred_rearm(sys, mc, focused);
 
 	/* #1017: publish panel ownership for the commit-side weave. Only the
 	 * focused slot owns it; everyone else must not touch the shared DP. */
