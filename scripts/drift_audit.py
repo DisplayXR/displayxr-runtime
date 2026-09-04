@@ -600,9 +600,10 @@ def commit_is_ancestor_of_tag(commit: str, tag: str) -> bool | None:
     Executed through the GitHub compare API rather than ``git merge-base`` because
     this audit deliberately runs with no checkout. ``compare/<tag>...<commit>``
     reports ``head`` relative to ``base``: an ancestor is "behind", the same
-    commit is "identical". Anything else -- "ahead", "diverged", or a 404 for a
-    ref that does not exist -- is not an ancestor. Returns None when the API
-    call itself failed so the caller can distinguish "no" from "could not ask".
+    commit is "identical". "ahead" or "diverged" means it is NOT an ancestor
+    (False). A 404 -- the tag or the commit does not exist -- or any other API
+    failure returns None, so the caller can distinguish "no" from "could not
+    ask"; the caller treats None as unverifiable, which is the safer reading.
     """
     out = _gh(["api", f"repos/{ORG}/displayxr-runtime/compare/{tag}...{commit}", "--jq", ".status"])
     if out is None:
