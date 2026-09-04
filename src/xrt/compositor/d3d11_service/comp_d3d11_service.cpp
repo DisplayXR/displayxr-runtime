@@ -17406,13 +17406,24 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
  * the shell fired the moment the workspace deactivated). @p as_service bypasses
  * the lease for runtime-initiated transitions (the #814 teardown failsafe).
  *
+ * @param holds_render_mutex the caller already holds `sys->render_mutex`. Only
+ *        the wish retraction below needs it (it drives the DP directly); the
+ *        rest of this function is lock-free by #966.
+ *
  * @return true if a request was found and applied.
  */
+static void
+service_weave_wish_withdraw(struct d3d11_service_system *sys,
+                            struct d3d11_service_compositor *c,
+                            struct xrt_display_processor_d3d11 *dp,
+                            const char *reason);
+
 static bool
 service_apply_pending_mode(struct d3d11_service_system *sys,
                            struct d3d11_service_compositor *c,
                            bool bridge_live,
-                           bool as_service = false)
+                           bool as_service = false,
+                           bool holds_render_mutex = false)
 {
 	uint32_t req_mode = c->pending_content_mode.exchange(0xFFFFFFFFu, std::memory_order_acq_rel);
 	int req_hw = c->pending_hw_3d.exchange(-1, std::memory_order_acq_rel);
@@ -17470,6 +17481,60 @@ service_apply_pending_mode(struct d3d11_service_system *sys,
 		// XR_DXR_display_info contract for xrRequestDisplayModeDXR ("holds
 		// until the next mode request ... or the next call to this function").
 		c->hw_override.store(-1, std::memory_order_release);
+	}
+
+	/*
+	 * #815, SECOND HALF — a request for a FLAT panel retracts this client's own
+	 * per-region wish.
+	 *
+	 * The wish (browser#88) and `xrRequestDisplayModeDXR` are two authorities
+	 * over ONE physical lens; the plug-in says so outright ("both this path and
+	 * request_display_mode drive the same SR lens hint; last caller wins"). The
+	 * whole-panel request lands on the panel DP, the wish stands on this
+	 * client's own weave DP, and nothing retracted it — so a wish published
+	 * BEFORE the 2D request kept voting 3D after it.
+	 *
+	 * That is not a theoretical race: the vendor evaluates a published
+	 * generation ASYNCHRONOUSLY (leia-plugin #215, "readback N ms over M polls",
+	 * measured at 0.7 s, 9.8 s and — with no further publish to poll on — two
+	 * hours), and a present-owner leaving inline-3D content STOPS SUBMITTING, so
+	 * the verdict for the last generation arrives long after the panel was asked
+	 * to go flat, and re-asserts 3D on top of it. Symptom: leave a 3D tab for an
+	 * ordinary one and the panel stays lensed over 2D content.
+	 *
+	 * #815 already taught `weave_force_3d_if_needed` not to fight an explicit
+	 * hardware 2D; this is the same rule for the other channel. Retract BEFORE
+	 * the transition is requested so the whole-panel 2D is the last word: the
+	 * plug-in's clear hands the lens back to the MODE authority, which is
+	 * exactly what runs next.
+	 *
+	 * Gated on the caller holding `render_mutex` because this drives a DP. Every
+	 * call site does: the two frame paths and the teardown failsafe already hold
+	 * it, and the two IPC entry points take it — but ONLY for a client that has
+	 * a wish standing, so the ordinary lock-free #966 request path is untouched.
+	 * A client with no wish published has nothing to retract and never reaches
+	 * here; @ref service_weave_publish_wish's `hw_override` gate then keeps it
+	 * from minting a new one while the flat request stands.
+	 */
+	if (!want_3d && holds_render_mutex && c->zone_published) {
+		struct xrt_display_processor_d3d11 *wdp = svc_client_weave_dp(sys, c);
+		service_weave_wish_withdraw(sys, c, wdp, "app requested hardware 2D");
+		/*
+		 * ...and SAY FLAT on that DP, not just "I withdraw".
+		 *
+		 * A vendor clear legitimately hands the lens back to the MODE authority
+		 * rather than forcing it off — the Leia plug-in restores the hint its
+		 * `view_count >= 2` implies, i.e. 3D. The whole-panel request below then
+		 * lands on the PANEL DP, a different instance with its own async lens
+		 * worker (#215), so the two verdicts are not ordered against each other
+		 * and "last caller wins" could pick the clear's 3D. Asserting 2D here
+		 * makes both DPs say the same thing, so the order stops mattering.
+		 * No-op when this client has no DP of its own (wdp == panel DP): the
+		 * transition below re-asserts the same state anyway.
+		 */
+		if (wdp != nullptr) {
+			(void)DP_REQUEST_DISPLAY_MODE(wdp, false);
+		}
 	}
 
 	// #776 blocker 4 lives inside apply_mode_transition: it drives the head
@@ -20754,10 +20819,26 @@ compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
 	// whichever runs first consumes it and the other sees "nothing pending".
 	// bridge_live is re-evaluated rather than assumed — unlike the weave path,
 	// an arbitrary IPC client may well be behind a live bridge.
-	// #966: the apply is queued for the render thread, so no lock is needed.
+	// #966: the apply is queued for the render thread, so no lock is needed —
+	// EXCEPT for a client with a wish standing (a weave present-owner), where a
+	// request for a flat panel retracts it inline on this client's own weave DP.
+	// See the retraction block in service_apply_pending_mode; the lock is the
+	// same bounded pattern comp_d3d11_service_weave_set_screen_flat_regions uses,
+	// and it is taken only on the rare path that needs it.
+	// The predicate is the REQUEST, not `c->zone_published`: that flag is written
+	// by the render thread under the lock we have not taken yet, so testing it
+	// here would be a race that silently skips the retraction — the one direction
+	// that must not be missed. A hardware-3D request keeps the lock-free path.
 	struct d3d11_service_system *sys = c->sys;
 	if (sys != nullptr) {
-		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
+		const bool bridge_live = bridge_client_is_live(sys, c->render.hwnd);
+		if (!enable_3d) {
+			render_mutex_fair_lock lock(sys);
+			(void)service_apply_pending_mode(sys, c, bridge_live, /* as_service */ false,
+			                                 /* holds_render_mutex */ true);
+		} else {
+			(void)service_apply_pending_mode(sys, c, bridge_live);
+		}
 	}
 	return XRT_SUCCESS;
 }
@@ -20788,10 +20869,18 @@ compositor_request_rendering_mode(struct xrt_compositor *xc,
 	// #961: drain inline like the hardware request above, so the lease verdict
 	// (applied / denied-with-reason) reaches the client immediately rather than
 	// on its next commit — a client that stopped rendering would otherwise never
-	// hear back. #966: the apply is queued for the render thread — no lock.
+	// hear back. #966: the apply is queued for the render thread — no lock,
+	// except for the wish retraction (see the hardware twin above).
 	struct d3d11_service_system *sys = c->sys;
 	if (sys != nullptr) {
-		(void)service_apply_pending_mode(sys, c, bridge_client_is_live(sys, c->render.hwnd));
+		const bool bridge_live = bridge_client_is_live(sys, c->render.hwnd);
+		if (c->zone_published) {
+			render_mutex_fair_lock lock(sys);
+			(void)service_apply_pending_mode(sys, c, bridge_live, /* as_service */ false,
+			                                 /* holds_render_mutex */ true);
+		} else {
+			(void)service_apply_pending_mode(sys, c, bridge_live);
+		}
 	}
 	return XRT_SUCCESS;
 }
@@ -20947,7 +21036,8 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	c->pending_hw_3d.store(0, std::memory_order_release);
 	U_LOG_W("#814 failsafe: %s client leaving with the panel in 3D (%u survivor(s)) — requesting hardware 2D",
 	        this_client_is_weave_owner ? "weave present-owner" : "last", survivors);
-	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false, /* as_service */ true);
+	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false, /* as_service */ true,
+	                                 /* holds_render_mutex */ true);
 }
 
 static void
@@ -21743,6 +21833,20 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
 		service_weave_wish_withdraw(sys, c, dp, "zero-rect submit");
 		return;
 	}
+	// #815, SECOND HALF — this client has explicitly asked for a FLAT panel, and
+	// the wish is a 3D vote on the same physical lens. Publishing one here would
+	// re-open the very authority the hardware request just closed: the vendor
+	// evaluates a generation asynchronously, so a wish minted now can out-live
+	// and out-rank the 2D that follows it. Same rule, same reason, as the
+	// `hw_override == 0` early-out in weave_force_3d_if_needed — and the belt to
+	// the retraction in service_apply_pending_mode, which covers the wish that
+	// was already standing when the request arrived. Cleared by the next
+	// rendering-mode or hardware-3D request, after which the next submit
+	// re-publishes normally.
+	if (c->hw_override.load(std::memory_order_acquire) == 0) {
+		service_weave_wish_withdraw(sys, c, dp, "app requested hardware 2D");
+		return;
+	}
 	if (!service_dp_accepts_zone_mask(dp) || c->zone_mask_dp_rejected) {
 		return; // whole-panel force-3D owns the panel
 	}
@@ -22261,7 +22365,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// Order matters: apply BEFORE the force-3D kick, so the kick sees the
 	// requested mode already active and keeps it (see weave_force_3d_if_needed,
 	// which now prefers the active mode over its first-3D fallback).
-	(void)service_apply_pending_mode(sys, c, /*bridge_live*/ false);
+	(void)service_apply_pending_mode(sys, c, /*bridge_live*/ false, /*as_service*/ false,
+	                                 /*holds_render_mutex*/ true);
 
 	// Output is sized to the bound window's client area so the weave phase is
 	// correct at the window's absolute screen position; the sub-rect is confined
