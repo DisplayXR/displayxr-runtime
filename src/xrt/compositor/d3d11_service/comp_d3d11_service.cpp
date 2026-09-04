@@ -1538,6 +1538,19 @@ struct d3d11_service_system
 	//! Recursive because unregister_client calls render for final clear frame.
 	std::recursive_mutex render_mutex;
 
+	//! #939: serializes multi-call SEQUENCES on the one immediate context that
+	//! run OUTSIDE render_mutex. D3D11's multithread protection makes each call
+	//! thread-safe but the context is one state machine: a client's lock-free
+	//! commit blits (OMSetRenderTargets + Draw on its atlas, #966) interleaving
+	//! with a present-owner's weave on another IPC thread (under render_mutex)
+	//! left the OTHER client's TYPELESS atlas bound when the vendor's alpha
+	//! gate read the render target back — E_INVALIDARG creating its view, the
+	//! gate poisoned, and the browser's tile black until the DP was recreated
+	//! (David's "blinks, then stays black" beside a plain-Chrome WebXR
+	//! session). Innermost lock, never held across a blocking wait; order is
+	//! render_mutex / c->mutex / atlas_submit_mutex → this.
+	std::mutex immediate_ctx_mutex;
+
 	//! Count of threads currently blocked acquiring render_mutex through
 	//! render_mutex_fair_lock (every acquirer EXCEPT the capture render
 	//! thread). std::recursive_mutex has no waiter fairness, and with SR v2
@@ -13142,6 +13155,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
+	// #939: crop + weave + present is one D3D sequence on the shared immediate
+	// context; a sibling client's lock-free commit blits must not interleave.
+	// The atlas guard above is a try_lock, so nothing under this lock blocks.
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 	ID3D11Texture2D *crop_tex = nullptr;
 	ID3D11ShaderResourceView *dp_input_srv = service_crop_atlas_for_dp(
 	    sys, &fc->render, fc->pipe_content_w, fc->pipe_content_h, cols, rows, fc->atlas_flip_y, &crop_tex);
@@ -19734,6 +19751,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// all of this frame's tiles or none of them. Microseconds: these are
 			// submissions, not execution, and nothing inside waits on a lock.
 			std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
+			// #939: and the immediate context itself — these blits set OM state
+			// and draw; a present-owner's weave on another thread must not see
+			// this client's atlas as ITS render target mid-sequence.
+			std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 			// Blit each view into its atlas tile position
 			static bool logged_blit_path = false;
 			if (!logged_blit_path) {
@@ -20116,6 +20137,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
+		// #939: same rule as the tile blits above — a state-setting sequence on
+		// the shared immediate context, outside render_mutex.
+		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 		// Bind per-client stereo render target
 		ID3D11RenderTargetView *rtvs[] = {c->render.atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -22651,6 +22675,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// on a frame that then bails out before publishing one — the geometry above is
 	// exactly what decides that. (It still takes no geometry itself.)
 	weave_force_3d_if_needed(sys, c);
+
+	// #939: everything from here to the fence signal is one D3D sequence on
+	// the shared immediate context (input blits, the vendor weave, its
+	// post-weave alpha gate, the epilogue). Another client's lock-free commit
+	// blits must not interleave — see immediate_ctx_mutex.
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
 
 	if (!weave_ensure_output(c, win_w, win_h)) {
 		return false;
