@@ -12829,6 +12829,61 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
  *        (#964 Phase A workspace scope): present exactly that slot this frame
  *        and do not touch `mc->focused_slot` — that is the controller's.
  */
+/*!
+ * #939: hand an APP_HWND presenter's frame-latency grant BACK when the frame
+ * that won it presents nothing.
+ *
+ * `pipeline_app_hwnd_ready` SPENDS the sticky token (or consumes one slot of
+ * the chain's waitable directly) the moment it says "ready", and only a Present
+ * pays that slot back. Every early return between the probe and the Present —
+ * a zero-sized target, an atlas the owner is mid-write into, and above all the
+ * split's "nothing weavable this frame" (the bridge's egress slot not ready) —
+ * therefore leaked one slot. At max latency 2, two such frames left the
+ * waitable at zero for good; the 500 ms desync watchdog re-primed one slot,
+ * the same frames ate it again, and the hosted chain sat at ~9 presents/s
+ * (plain-Chrome WebXR under the output-device split, "sluggish"; the cube
+ * stand-in never hits that return and never showed it). Same fixture with the
+ * split off: ~50/s.
+ *
+ * The buffer DXGI granted is still ours and still free: re-arm the token keyed
+ * to this chain so the next frame's probe takes its fast path and the Present
+ * spends it. The pacing target is CLEARED for that one loop — the token is a
+ * bool, not a count, so letting the pacer wait on the chain again while a
+ * grant is already held would consume a second slot the token cannot
+ * represent. The next full frame re-publishes the pacing target as usual; its
+ * chain-change drop finds the token already spent. A watchdog-forced frame
+ * owns no slot (the probe never signaled), so its flag is cleared and nothing
+ * is re-armed.
+ *
+ * Render thread, under render_mutex.
+ */
+static void
+pipeline_return_app_grant(struct d3d11_multi_compositor *mc,
+                          struct d3d11_service_compositor *fc,
+                          enum d3d11_presenter_kind kind)
+{
+	if (kind != PRESENTER_APP_HWND || fc == nullptr || fc->render.frame_latency_waitable == nullptr ||
+	    !fc->render.swap_chain) {
+		return;
+	}
+	mc->pace_app_waitable = nullptr;
+	mc->pace_app_sc = nullptr;
+	if (fc->force_unpaced_present) {
+		fc->force_unpaced_present = false; // no slot was won; nothing to give back
+		return;
+	}
+	mc->app_present_token_sc = fc->render.swap_chain.get();
+	mc->app_present_token.store(true, std::memory_order_release);
+	static std::atomic<uint32_t> s_returned{0};
+	const uint32_t n = s_returned.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n == 1 || n == 100 || (n % 10000) == 0) {
+		U_LOG_W(
+		    "[pipeline] app-HWND frame-latency grant returned unspent (frame presented nothing) — "
+		    "%u so far (#939)",
+		    n);
+	}
+}
+
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys,
                                struct d3d11_multi_compositor *mc,
@@ -13141,6 +13196,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	uint32_t target_w = 0, target_h = 0;
 	pipeline_rtv_dims(present_rtv, &target_w, &target_h);
 	if (target_w == 0 || target_h == 0) {
+		pipeline_return_app_grant(mc, fc, kind); // #939: nothing presented — keep the slot
 		return;
 	}
 
@@ -13153,6 +13209,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	atlas_read_guard fc_atlas_guard(sys, fc);
 	if (!fc_atlas_guard.held) {
 		sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
+		pipeline_return_app_grant(mc, fc, kind); // #939: nothing presented — keep the slot
 		return;
 	}
 	// #939: deliberately NOT under immediate_ctx_mutex. The black-tile race was
@@ -13212,9 +13269,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			 * FLIP_DISCARD the panel keeps showing the last frame it was given,
 			 * where presenting the (cleared) back buffer would be a black flash.
 			 * Counted inside the helper, never logged per frame.
+			 *
+			 * #939: but the frame-latency slot the probe just consumed must
+			 * survive — this return is what drained the hosted chain under
+			 * the split (see pipeline_return_app_grant).
 			 */
-			mc->pace_app_waitable = nullptr;
-			mc->pace_app_sc = nullptr;
+			pipeline_return_app_grant(mc, fc, kind);
 			return;
 		}
 	}
