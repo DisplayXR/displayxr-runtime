@@ -13155,10 +13155,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		sys->render_diag_pipe_active_skip.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	// #939: crop + weave + present is one D3D sequence on the shared immediate
-	// context; a sibling client's lock-free commit blits must not interleave.
-	// The atlas guard above is a try_lock, so nothing under this lock blocks.
-	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+	// #939: deliberately NOT under immediate_ctx_mutex. The black-tile race was
+	// a present-owner's weave (alpha gate reading the bound target back) against
+	// a sibling's commit blits; this path has no such read-back, and holding the
+	// lock across the vendor weave (27-40 ms on slow frames) plus Present made
+	// the hosted client's own commits queue behind every tick — measured as its
+	// chain falling to ~9 presents/s with no browser up at all.
 	ID3D11Texture2D *crop_tex = nullptr;
 	ID3D11ShaderResourceView *dp_input_srv = service_crop_atlas_for_dp(
 	    sys, &fc->render, fc->pipe_content_w, fc->pipe_content_h, cols, rows, fc->atlas_flip_y, &crop_tex);
