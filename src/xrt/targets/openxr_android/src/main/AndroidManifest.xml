@@ -75,6 +75,20 @@
         android:theme="@style/AppTheme">
 
         <!--
+            Which CNSDK loader this APK bundles, stamped at build time from the
+            CNSDK drop's VERSION.txt (build.gradle). The loader exact-matches the
+            Leia plug-in's apiVersion and silently falls back to 2D on mismatch
+            (#1357), so make the pair checkable on device:
+              adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process \
+                | grep CNSDK_LOADER_VERSION
+            "none" = built CNSDK-free (sim_display path). Mirrors the services'
+            own com.leia.cnsdk.FULL_VERSION meta-data (CNSDK >= 0.10.65).
+        -->
+        <meta-data
+            android:name="com.displayxr.CNSDK_LOADER_VERSION"
+            android:value="${cnsdkLoaderVersion}" />
+
+        <!--
             Diagnostics dashboard (#558) replaces the shared android_common
             AboutActivity as this APK's launcher: on-device displayxr-cli
             info/selftest snapshot + live service state + the permission
