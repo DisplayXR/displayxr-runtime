@@ -135,7 +135,12 @@ jobs:
       # between the two pins fails the BUILD instead of a pad.
       # (0.10.62 was also a hard floor for #1232's orientation bug; that is
       # subsumed -- nothing older can match a current plug-in anyway.)
-      CNSDK_TAG: v0.10.63
+      # v0.10.66: matches leia-plugin v2.6.14 (built against
+      # cnsdk-android-0.10.66+190.990cee0.zip). 0.10.66 fixes the K68 EVT
+      # device-service donopx regeneration bug that parked CNSDK's no-face
+      # phase gate outside normal viewing distance (flat 2D with tracking
+      # alive, on every runtime version). Loader == plug-in == impl again.
+      CNSDK_TAG: v0.10.66
 
     steps:
 
