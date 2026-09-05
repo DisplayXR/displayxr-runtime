@@ -25,7 +25,6 @@ u_rear_budget_tuning_defaults(struct u_rear_budget_tuning *t)
 	t->close_ms = 100;
 	t->ramp_open_ms = 300;
 	t->ramp_close_ms = 150;
-	t->stale_after_ms = 1000;
 	t->force = U_REAR_BUDGET_FORCE_AUTO;
 }
 
@@ -114,9 +113,6 @@ u_rear_budget_init(struct u_rear_budget *b,
 	if (b->tuning.ramp_close_ms == 0) {
 		b->tuning.ramp_close_ms = 1;
 	}
-	if (b->tuning.stale_after_ms == 0) {
-		b->tuning.stale_after_ms = 1000;
-	}
 
 	// The conservative start: no source yet, so clip at the ZDP. A session
 	// that turns out to be opaque is corrected on its very first update.
@@ -126,7 +122,6 @@ u_rear_budget_init(struct u_rear_budget *b,
 	b->ramp_to_vh = 0.0f;
 	b->ramp_start_ns = now_ns;
 	b->ramp_duration_ns = 0;
-	b->last_generation_change_ns = now_ns;
 
 	if (label != NULL) {
 		size_t n = strlen(label);
@@ -252,12 +247,13 @@ u_rear_budget_update(struct u_rear_budget *b,
 		if (!b->have_generation || in->generation != b->last_generation) {
 			b->have_generation = true;
 			b->last_generation = in->generation;
-			b->last_generation_change_ns = now_ns;
 		}
-		const bool stalled =
-		    (now_ns - b->last_generation_change_ns) > REAR_BUDGET_MS_TO_NS(b->tuning.stale_after_ms);
-
-		if (!in->source_available || !in->have_result || stalled) {
+		// A generation that stops advancing is NOT a dead source. The capture
+		// only delivers a frame when the desktop CHANGES, so an unchanged
+		// generation means the last verdict still describes what is behind
+		// the app - a quiet desktop is the best case, not a stall. Only the
+		// source itself saying no (or a missing analysis) closes the budget.
+		if (!in->source_available || !in->have_result) {
 			next = U_REAR_BUDGET_CLIPPED_NO_SOURCE;
 			target_vh = 0.0f;
 			b->cue_energy = 0.0f;
