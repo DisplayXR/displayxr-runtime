@@ -78,9 +78,13 @@
             Which CNSDK loader this APK bundles, stamped at build time from the
             CNSDK drop's VERSION.txt (build.gradle). The loader exact-matches the
             Leia plug-in's apiVersion and silently falls back to 2D on mismatch
-            (#1357), so make the pair checkable on device:
-              adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process \
-                | grep CNSDK_LOADER_VERSION
+            (#1357), so make the pair checkable from what is INSTALLED, not from
+            a filename. NOTE: `dumpsys package` does NOT print meta-data (verified
+            Android 13); read it from the installed APK instead:
+              adb pull "$(adb shell pm path org.freedesktop.monado.openxr_runtime.out_of_process \
+                          | sed 's/^package://')" rt.apk
+              aapt2 dump xmltree (file: AndroidManifest.xml) rt.apk | grep CNSDK_LOADER
+            (spelled out because an XML comment cannot contain a double hyphen)
             "none" = built CNSDK-free (sim_display path). Mirrors the services'
             own com.leia.cnsdk.FULL_VERSION meta-data (CNSDK >= 0.10.65).
         -->
