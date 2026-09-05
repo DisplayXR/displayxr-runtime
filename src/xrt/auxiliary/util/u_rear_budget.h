@@ -52,7 +52,7 @@ enum u_rear_budget_state
 	U_REAR_BUDGET_OPEN = 2,
 	//! Transparent + standalone, background is busy.
 	U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND = 3,
-	//! No usable background preview (absent, declined, or stale).
+	//! No usable background preview (absent or declined).
 	U_REAR_BUDGET_CLIPPED_NO_SOURCE = 4,
 	//! An environment override is pinning the budget.
 	U_REAR_BUDGET_FORCED = 5,
@@ -91,8 +91,6 @@ struct u_rear_budget_tuning
 	uint32_t ramp_open_ms;
 	//! Time for a full unrestricted → 0 slide. Default 150.
 	uint32_t ramp_close_ms;
-	//! Preview generation may stall this long before the source reads stale.
-	uint32_t stale_after_ms; //!< Default 1000.
 	//! @ref u_rear_budget_force.
 	int force;
 };
@@ -112,7 +110,7 @@ struct u_rear_budget_in
 	bool source_available;
 	//! True when @ref result holds a fresh analysis.
 	bool have_result;
-	//! Preview generation the analysis came from (stall detector).
+	//! Preview generation the analysis came from (re-analysis gate: unchanged means still valid).
 	uint32_t generation;
 	//! Latest analysis; read only when @ref have_result.
 	struct u_bg_neutrality_result result;
@@ -165,7 +163,6 @@ struct u_rear_budget
 
 	//! Stall detector for the preview generation.
 	uint32_t last_generation;
-	uint64_t last_generation_change_ns;
 	bool have_generation;
 
 	//! Label used in the one-line-per-transition log ("d3d11 session", …).

@@ -330,7 +330,7 @@ struct xrt_dp_background_preview {
 	   (0,0) = canvas top-left, (1,1) = canvas bottom-right. Normally 0,0,1,1
 	   (the desktop region under the app canvas); a DP may include a margin. */
 	float canvas_u0, canvas_v0, canvas_u1, canvas_v1;
-	uint32_t flags;            /* bit0 XRT_DP_BG_PREVIEW_STALE: capture > 1 s old */
+	uint32_t flags;            /* bit0 XRT_DP_BG_PREVIEW_STALE: source KNOWS the preview is invalid (unchanged desktop is NOT stale) */
 	uint32_t reserved[7];
 };
 

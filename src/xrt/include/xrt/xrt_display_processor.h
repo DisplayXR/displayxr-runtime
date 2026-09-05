@@ -109,7 +109,9 @@ struct xrt_window_metrics;
  * already-built plug-in - the silent break ADR-020 exists to prevent.
  */
 
-//! @ref xrt_dp_background_preview::flags - capture is more than a second old.
+//! @ref xrt_dp_background_preview::flags - the source KNOWS the preview no longer reflects the
+//! screen (capture session lost, monitor changed). An unchanged desktop is NOT stale: capture
+//! sources deliver only on change, so an old generation is still a valid description.
 #define XRT_DP_BG_PREVIEW_STALE 0x1u
 
 /*!

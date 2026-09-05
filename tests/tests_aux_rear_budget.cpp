@@ -6,7 +6,7 @@
  *         (XR_DXR_depth_budget).
  *
  * Time is a parameter of the machine, never read inside it, so every dynamic
- * here (dwell, close grace, ramp shape, staleness) is exercised exactly rather
+ * here (dwell, close grace, ramp shape) is exercised exactly rather
  * than approximately. The asymmetry is the point: opening is slow and must be
  * earned, closing is fast, and every "I don't know" answer clips.
  */
@@ -249,10 +249,10 @@ TEST_CASE("rear_budget: closing is faster than opening")
 	CHECK(t.ramp_close_ms < t.ramp_open_ms);
 }
 
-TEST_CASE("rear_budget: a preview generation that stops advancing goes stale")
+TEST_CASE("rear_budget: a preview generation that stops advancing keeps the last verdict")
 {
 	u_rear_budget b{};
-	auto t = tuning(); // stale_after_ms = 1000
+	auto t = tuning();
 	u_rear_budget_init(&b, &t, "test", 0);
 
 	u_rear_budget_out out{};
@@ -265,18 +265,25 @@ TEST_CASE("rear_budget: a preview generation that stops advancing goes stale")
 	}
 	REQUIRE(out.state == U_REAR_BUDGET_OPEN);
 
-	// The DP keeps claiming a source, and keeps handing back the SAME frame.
-	// "Still available" is not "still current"; a frozen capture is exactly
-	// the state in which the analysis is confidently wrong.
+	// The DP keeps claiming a source and keeps handing back the SAME
+	// generation. That is what a QUIET desktop looks like: the capture only
+	// delivers on change, so "unchanged" means the last analysis still
+	// describes the screen. It must NOT read as a dead source and re-clip.
 	const uint32_t frozen = gen;
 	auto in = sample(true, frozen);
-	u_rear_budget_update(&b, &in, (ms + 500) * MS, &out);
-	CHECK(out.state == U_REAR_BUDGET_OPEN);
+	for (uint64_t hold = 0; hold <= 30000; hold += 1000) {
+		u_rear_budget_update(&b, &in, (ms + hold) * MS, &out);
+		CHECK(out.state == U_REAR_BUDGET_OPEN);
+		CHECK(out.far_offset_vh == U_REAR_BUDGET_UNRESTRICTED_VH);
+	}
 
-	u_rear_budget_update(&b, &in, (ms + 500 + t.stale_after_ms + 1) * MS, &out);
+	// The source itself withdrawing is what closes it.
+	auto gone = sample(true, frozen);
+	gone.source_available = false;
+	gone.have_result = false;
+	u_rear_budget_update(&b, &gone, (ms + 31000) * MS, &out);
 	CHECK(out.state == U_REAR_BUDGET_CLIPPED_NO_SOURCE);
 	CHECK(out.far_offset_vh == 0.0f);
-	CHECK(out.cue_energy == 0.0f);
 }
 
 TEST_CASE("rear_budget: the force override pins the budget")

@@ -132,7 +132,7 @@ nothing but the chance to log or to reconfigure something expensive.
 | `UNRESTRICTED_WORKSPACE` | 1000 | Transparent, but running under a workspace controller. The controller composites the scene; this is today's behaviour and v1 does not change it. |
 | `OPEN` | ramps 0 → 1000 | Transparent, standalone, and the background has been measured neutral continuously for the open dwell. |
 | `CLIPPED_BUSY_BACKGROUND` | ramps → 0 | The background carries a horizontal-disparity cue. |
-| `CLIPPED_NO_SOURCE` | 0 | No background preview is available: the display processor does not implement the source slot, the source declined this frame, or its preview went stale. Byte-for-byte today's behaviour. |
+| `CLIPPED_NO_SOURCE` | 0 | No background preview is available: the display processor does not implement the source slot, the source declined this frame, or flagged its preview invalid. Byte-for-byte today's behaviour. |
 | `FORCED` | 0 or 1000 | An environment override is armed (§4.4). |
 
 ### 4.2 Dynamics
@@ -154,8 +154,10 @@ Three properties follow, and applications depend on them:
 - **`farOffsetVH` is ramped, not switched**, so the clip plane *slides* rather than pops. **Apply
   it as-is** — app-side smoothing fights the runtime's ramp and produces a slower, less
   predictable plane.
-- **Staleness closes the budget.** A source that claims to be available but whose preview stops
-  advancing for more than 1 s is treated as no source.
+- **An unchanged preview is NOT stale.** Capture sources deliver a frame only when the desktop
+  *changes*, so a generation that stops advancing means the last verdict still describes what is
+  behind the app (a quiet desktop is the best case). Only the source withdrawing (`false` from the
+  slot) or positively flagging its preview invalid (`XRT_DP_BG_PREVIEW_STALE`) closes the budget.
 
 ### 4.3 Applying the budget
 

@@ -121,8 +121,9 @@ Three properties of the dynamics are load-bearing:
 - **Ramped, not switched.** `farOffsetVH` is time-ramped (ease-out, ~300 ms open / ~150 ms
   close), so the app's clip plane *slides*. Apps apply the value as-is; app-side smoothing would
   fight the runtime's.
-- **Staleness is a closure.** A generation that stops advancing while the source still claims to
-  be available is treated as no source.
+- **An unchanged generation is not staleness.** Capture sources deliver only on desktop change, so
+  a frozen generation means the last verdict still holds; only the source withdrawing or flagging
+  its preview invalid closes the budget.
 
 ### 4. App channel — a new extension, not a grown struct
 
