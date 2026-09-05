@@ -14,6 +14,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
+#include "util/u_rear_budget.h"
 
 // Forward declarations
 struct comp_d3d11_compositor;
@@ -224,6 +225,34 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 bool
 comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct xrt_window_metrics *out_metrics);
+
+/*!
+ * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
+ *
+ * Latched exactly like the transparency flag, and for the same reason: the
+ * background preview fetch + analysis is real per-frame work on the render
+ * thread, and it must not run for a session that never opted in. Called once,
+ * right after create.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * XR_DXR_depth_budget: the latest budget the render thread computed.
+ *
+ * Read from the app's locate thread; the value is published under the
+ * compositor's own small lock, so a caller never sees a half-written triple.
+ *
+ * @return false when this session has no policy running (not transparent, not
+ *         opted in, or the compositor is still starting) - the caller then
+ *         applies the conservative default.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
  * Request display mode switch (2D/3D) via display processor.
