@@ -1312,6 +1312,20 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   XrBool32 isTracking,
                                                   XrEyeTrackingModeDXR activeMode);
 
+#ifdef OXR_HAVE_DXR_depth_budget
+/*!
+ * Push an `XrEventDataRearDepthBudgetStateChangedDXR` onto the instance event
+ * queue. Fired from the locate path when the rear-depth-budget STATE changes -
+ * never on ramp progress, which the app reads per-locate from the chained
+ * XrRearDepthBudgetDXR.
+ */
+XrResult
+oxr_event_push_XrEventDataRearDepthBudgetStateChanged(struct oxr_logger *log,
+                                                      struct oxr_session *sess,
+                                                      XrRearDepthBudgetStateDXR previousState,
+                                                      XrRearDepthBudgetStateDXR newState);
+#endif // OXR_HAVE_DXR_depth_budget
+
 #ifdef OXR_HAVE_DXR_local_3d_zone
 /*!
  * Push an `XrEventDataLocal3DZoneViewSizeChangedDXR` onto the instance event
@@ -2429,6 +2443,18 @@ struct oxr_session
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	//! XR_DXR_depth_budget: the session's transparency, remembered from
+	//! xrCreateSession. The rear-depth default is a function of it (a
+	//! transparent session with no answer clips at the ZDP, an opaque one is
+	//! unrestricted), and by locate time the create-info chain is long gone.
+	bool transparent_background;
+	//! Last state reported to the app; the event fires only on a CHANGE.
+	XrRearDepthBudgetStateDXR rear_depth_budget_state;
+	//! False until the first fill - so the first state is not an "event".
+	bool rear_depth_budget_state_known;
+#endif
 
 #ifdef OXR_HAVE_DXR_display_zones
 	//! XR_DXR_display_zones (ADR-027): per-session zone bookkeeping. The

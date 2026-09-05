@@ -674,6 +674,23 @@
 
 
 /*
+ * XR_DXR_depth_budget
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
+ * of the DisplayXR blocks - keep them when regenerating). No entry points:
+ * the whole interface is a next-chain output struct on xrLocateViews plus
+ * one event, so only the support macro is needed.
+ */
+#if defined(XR_DXR_depth_budget)
+#define OXR_HAVE_DXR_depth_budget
+#define OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
+    _(DXR_depth_budget, DXR_DEPTH_BUDGET)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_depth_budget(_)
+#endif
+
+
+/*
  * XR_DXR_display_zones
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
@@ -1216,6 +1233,7 @@
     OXR_EXTENSION_SUPPORT_DXR_atlas_capture(_) \
     OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
+    OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \

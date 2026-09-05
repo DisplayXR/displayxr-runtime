@@ -47,6 +47,7 @@
 #include "util/u_visibility_mask.h"
 #include "util/u_verify.h"
 #include "util/u_canvas.h" // XR_DXR_display_zones zone-scoped locate
+#include "util/u_rear_budget.h" // XR_DXR_depth_budget policy state machine
 
 #include "math/m_api.h"
 #include "math/m_mathinclude.h"
@@ -1454,6 +1455,95 @@ adjust_fov(const struct xrt_fov *original_fov, const struct xrt_quat *original_r
 	};
 }
 
+#ifdef OXR_HAVE_DXR_depth_budget
+/*
+ * XR_DXR_depth_budget - the app-facing half of the rear depth budget.
+ *
+ * The policy itself lives in the compositor (u_rear_budget, fed by the DP's
+ * background preview); everything here is transport: read whatever the
+ * compositor last decided, convert vH to metres with the session's rig, and
+ * fire ONE event per state change.
+ */
+
+//! Pull the compositor's latest budget. False = this backend has no policy
+//! wired yet, and the caller falls back to the conservative default.
+static bool
+oxr_session_get_rear_budget(struct oxr_session *sess, struct u_rear_budget_out *out)
+{
+	if (sess == NULL || sess->xcn == NULL || out == NULL) {
+		return false;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_rear_budget(&sess->xcn->base, out);
+	}
+#endif
+	// TODO(rear-budget): the other in-process backends (d3d12 / vk / gl /
+	// metal) have the DP slot but no preview wiring yet. Returning false here
+	// is not a gap in correctness - it is exactly the CLIPPED_NO_SOURCE
+	// default, which IS today's shipped behaviour for those backends.
+	return false;
+}
+
+//! Write @p out and emit the state-change event if the state moved.
+static void
+oxr_session_publish_rear_budget(struct oxr_session *sess,
+                                XrRearDepthBudgetDXR *out,
+                                float far_offset_vh,
+                                XrRearDepthBudgetStateDXR state,
+                                float cue_energy)
+{
+	out->farOffsetVH = far_offset_vh;
+	out->state = state;
+	out->backgroundCueEnergy = cue_energy;
+
+	// Metres are a convenience, not a second source of truth: without a rig
+	// there is no virtual display height to scale by, and 0 says so honestly
+	// rather than inventing a scale.
+	const float vh = sess->view_rig.virtual_display_height;
+	out->farOffsetMeters = (vh > 0.0f) ? far_offset_vh * vh : 0.0f;
+
+	if (!sess->rear_depth_budget_state_known) {
+		sess->rear_depth_budget_state_known = true;
+		sess->rear_depth_budget_state = state;
+		return;
+	}
+	if (state == sess->rear_depth_budget_state) {
+		return;
+	}
+
+	const XrRearDepthBudgetStateDXR prev = sess->rear_depth_budget_state;
+	sess->rear_depth_budget_state = state;
+
+	struct oxr_logger log;
+	oxr_log_init(&log, "rear_depth_budget");
+	oxr_event_push_XrEventDataRearDepthBudgetStateChanged(&log, sess, prev, state);
+}
+
+//! Fill the chained struct for this locate.
+static void
+oxr_session_fill_rear_depth_budget(struct oxr_session *sess, XrRearDepthBudgetDXR *out)
+{
+	struct u_rear_budget_out b = {0};
+	if (oxr_session_get_rear_budget(sess, &b)) {
+		oxr_session_publish_rear_budget(sess, out, b.far_offset_vh, (XrRearDepthBudgetStateDXR)b.state,
+		                                b.cue_energy);
+		return;
+	}
+
+	// No policy behind this session (yet): the zero-default rule. A
+	// transparent session clips at the ZDP - which is what its app already
+	// does today - and an opaque one was never restricted in the first place.
+	if (sess->transparent_background) {
+		oxr_session_publish_rear_budget(sess, out, 0.0f, XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR,
+		                                0.0f);
+	} else {
+		oxr_session_publish_rear_budget(sess, out, U_REAR_BUDGET_UNRESTRICTED_VH,
+		                                XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_OPAQUE_DXR, 0.0f);
+	}
+}
+#endif // OXR_HAVE_DXR_depth_budget
+
 #ifdef OXR_HAVE_DXR_view_rig
 /*
  * XR_DXR_view_rig (#396 W7) — descriptor validation policy: CLAMP out-of-range
@@ -1755,6 +1845,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 			view_raw->canvasSizeMeters = (XrExtent2Df){0, 0};
 			view_raw->sampleTimeNs = 0;
 			view_raw->isTracking = XR_FALSE;
+		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: the advisory rear budget, chained beside the raw
+	// block on the SAME XrViewState. Filled unconditionally when chained -
+	// there is no "not filled yet" value an app would have to handle, only the
+	// conservative default: a transparent session clips at the ZDP (today's
+	// behaviour) and everything else is unrestricted.
+	XrRearDepthBudgetDXR *rear_budget = NULL;
+	if (sess->sys->inst->extensions.DXR_depth_budget) {
+		rear_budget = OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_REAR_DEPTH_BUDGET_DXR, XrRearDepthBudgetDXR);
+		if (rear_budget != NULL) {
+			oxr_session_fill_rear_depth_budget(sess, rear_budget);
 		}
 	}
 #endif
@@ -2440,6 +2545,18 @@ oxr_session_locate_views(struct oxr_logger *log,
 				view_raw->sampleTimeNs = reply.raw.sample_time_ns;
 				view_raw->isTracking = reply.raw.is_tracking ? XR_TRUE : XR_FALSE;
 			}
+
+#ifdef OXR_HAVE_DXR_depth_budget
+			// XR_DXR_depth_budget: the SERVICE runs the display processor, so
+			// the service computes the budget. Overwrite the conservative
+			// default written above - one authority per session, never a
+			// client-side second opinion.
+			if (rear_budget != NULL) {
+				oxr_session_publish_rear_budget(sess, rear_budget, reply.rear_far_offset_vh,
+				                                (XrRearDepthBudgetStateDXR)reply.rear_state,
+				                                reply.rear_cue);
+			}
+#endif
 
 			// Rig applied server-side: surface the world-space rig eyes
 			// through the existing view-override machinery, exactly like
@@ -4074,6 +4191,15 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: enabling the extension IS the opt-in. The
+	// background preview fetch + neutrality analysis is real per-frame work on
+	// the render thread, so it must never run for a session that did not ask
+	// for it - and an app that did not ask still gets the conservative
+	// zero-default from the locate path, i.e. today's behaviour exactly.
+	xsi.rear_depth_budget_requested = sys->inst->extensions.DXR_depth_budget;
+#endif
+
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
@@ -4141,6 +4267,12 @@ oxr_session_create(struct oxr_logger *log,
 	sess->android_bound_window = android_bound_window;
 #endif
 	sess->is_bridge_relay = xsi.is_bridge_relay;
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: the create-info chain is gone by locate time, and
+	// the rear-depth DEFAULT is a function of transparency, so remember it.
+	sess->transparent_background = xsi.transparent_background_enabled;
+#endif
 
 #ifdef OXR_HAVE_DXR_display_info
 	// Authoritative legacy WARN: fires only when the compromise view scale
