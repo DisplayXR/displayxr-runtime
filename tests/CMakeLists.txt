@@ -28,6 +28,8 @@ set(tests
     tests_cli_dims_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1
+    tests_aux_bg_neutrality
+    tests_aux_rear_budget
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
