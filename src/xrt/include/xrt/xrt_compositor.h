@@ -1010,6 +1010,14 @@ struct xrt_session_info
 	//! on other graphics APIs. Set via XrWin32WindowBindingCreateInfoDXR::transparentBackgroundEnabled.
 	bool transparent_background_enabled;
 
+	//! XR_DXR_depth_budget: the app enabled the rear-depth-budget extension,
+	//! so it consumes an advisory far-plane offset instead of hard-clipping at
+	//! the ZDP. Latched by the compositor exactly like
+	//! @ref transparent_background_enabled; gates the per-frame background
+	//! preview fetch + analysis, which never runs for a session that did not
+	//! ask for it.
+	bool rear_depth_budget_requested;
+
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
 	//! Userdata passed to readback_callback

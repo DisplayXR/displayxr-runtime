@@ -42,6 +42,9 @@
 #endif
 
 #include "xrt/xrt_display_processor_d3d11.h"
+// XR_DXR_depth_budget: struct xrt_dp_background_preview (the per-API slot
+// headers only forward-declare it - the vtable takes it by pointer).
+#include "xrt/xrt_display_processor.h"
 
 #include "util/u_hud.h"
 #include <displayxr_mcp/mcp_capture.h>
@@ -64,6 +67,8 @@
 #include "util/u_repaint_gate.h"
 #include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
+#include "util/u_bg_neutrality.h"
+#include "util/u_rear_budget.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -548,6 +553,32 @@ struct comp_d3d11_compositor
 
 	//! Thread safety.
 	std::mutex mutex;
+
+	/*!
+	 * XR_DXR_depth_budget (rear depth budget).
+	 *
+	 * The render thread pulls a small background preview from the DP (at most
+	 * every 66 ms, and only when it advanced), analyses it, and feeds the
+	 * policy. The app's locate thread reads the published triple. Its OWN lock,
+	 * not @ref mutex: this publishes from inside the render path, and a policy
+	 * read must never be able to contend with frame submission.
+	 */
+	struct
+	{
+		bool requested;           //!< App enabled XR_DXR_depth_budget.
+		bool running;             //!< Policy initialised (transparent + requested).
+		int dump;                 //!< DXR_REAR_BUDGET_DUMP. -1 = unprobed.
+		uint64_t next_poll_ns;    //!< Render-thread throttle (66 ms).
+		uint32_t last_generation; //!< Preview generation last ANALYSED.
+		bool have_generation;
+		bool have_result;
+		struct u_bg_neutrality_result result;
+		struct u_rear_budget policy;
+
+		std::mutex publish_mutex;
+		struct u_rear_budget_out published;
+		bool published_valid;
+	} rear_budget;
 
 	/*!
 	 * #868 — weave-rate decoupling. Mirrors the D3D12 leg; the invariants are
@@ -1739,6 +1770,150 @@ d3d11_capture_texture_to_png(ID3D11Device *device,
 // what the passes actually painted — submission-derived), falling back to the
 // renderer's mode layout before the first commit. Returns false if the
 // renderer hasn't been sized yet.
+/*
+ * ── XR_DXR_depth_budget: rear depth budget (render thread) ──────────────────
+ *
+ * A transparent app composites over the LIVE desktop, so anything it draws
+ * behind the display plane occludes pixels that sit at zero disparity. Apps
+ * avoid that today by clipping at the plane and throwing all rear depth away.
+ * The conflict is only visible over a background with HORIZONTAL luminance
+ * structure, so the runtime watches the desktop the DP already captures and
+ * hands the app a budget instead of a blanket rule.
+ *
+ * Cost control: the DP produces the preview on its own capture throttle
+ * (<= 15 Hz), we ask at most every 66 ms, and we only ANALYSE when the
+ * generation advanced. A frame where nothing moved costs one vtable call.
+ */
+
+//! %LOCALAPPDATA%\\DisplayXR\\rear_budget_preview.png, or empty on failure.
+static void
+d3d11_rear_budget_dump_path(char *out, size_t out_len)
+{
+	out[0] = '\0';
+	const char *lad = getenv("LOCALAPPDATA");
+	if (lad == nullptr || lad[0] == '\0') {
+		lad = getenv("TEMP");
+	}
+	if (lad == nullptr || lad[0] == '\0') {
+		return;
+	}
+	snprintf(out, out_len, "%s\\DisplayXR\\rear_budget_preview.png", lad);
+}
+
+/*
+ * Write the preview the analysis actually saw. The verdict is a single
+ * boolean over a whole desktop; without the picture behind it, a wrong
+ * verdict is unfalsifiable.
+ */
+static void
+d3d11_rear_budget_dump_preview(const struct xrt_dp_background_preview *pv)
+{
+	if (pv->bgra == nullptr || pv->width == 0 || pv->height == 0) {
+		return;
+	}
+	char path[512];
+	d3d11_rear_budget_dump_path(path, sizeof(path));
+	if (path[0] == '\0') {
+		return;
+	}
+
+	// BGRA -> RGBA; the preview is opaque by contract, so alpha is passed
+	// through rather than forced (a forced 255 would hide a DP that handed
+	// over a transparent buffer).
+	const size_t pitch = (size_t)pv->width * 4u;
+	uint8_t *rgba = (uint8_t *)malloc(pitch * pv->height);
+	if (rgba == nullptr) {
+		return;
+	}
+	for (uint32_t y = 0; y < pv->height; y++) {
+		const uint8_t *src = pv->bgra + (size_t)y * pv->stride_bytes;
+		uint8_t *dst = rgba + (size_t)y * pitch;
+		for (uint32_t x = 0; x < pv->width; x++) {
+			dst[x * 4 + 0] = src[x * 4 + 2];
+			dst[x * 4 + 1] = src[x * 4 + 1];
+			dst[x * 4 + 2] = src[x * 4 + 0];
+			dst[x * 4 + 3] = src[x * 4 + 3];
+		}
+	}
+	const int ok = stbi_write_png(path, (int)pv->width, (int)pv->height, 4, rgba, (int)pitch);
+	free(rgba);
+	U_LOG_W("REAR_BUDGET: preview dump %s -> %s", ok ? "wrote" : "FAILED", path);
+}
+
+//! One rear-budget evaluation. Called from the render thread, after the DP
+//! has been handed the atlas. Cheap and self-throttling; a no-op unless the
+//! session is transparent, standalone, and opted in.
+static void
+d3d11_rear_budget_tick(struct comp_d3d11_compositor *c)
+{
+	if (!c->rear_budget.running) {
+		return;
+	}
+
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (now_ns < c->rear_budget.next_poll_ns) {
+		return;
+	}
+	c->rear_budget.next_poll_ns = now_ns + 66 * U_TIME_1MS_IN_NS;
+
+	struct xrt_dp_background_preview pv;
+	xrt_dp_background_preview_init(&pv);
+	const bool have_preview = xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv) &&
+	                          pv.bgra != nullptr && pv.width >= 2 && pv.height >= 1 &&
+	                          pv.stride_bytes >= pv.width * 4u && (pv.flags & XRT_DP_BG_PREVIEW_STALE) == 0;
+
+	if (have_preview) {
+		// Re-analysing an unchanged capture would burn the CPU to reach the
+		// same answer; the policy's own staleness rule covers a generation
+		// that stops advancing entirely.
+		if (!c->rear_budget.have_generation || pv.generation != c->rear_budget.last_generation) {
+			struct u_bg_roi roi = {0, 0, pv.width, pv.height}; // v1 ROI = the canvas
+			struct u_bg_neutrality_result res = {};
+			if (u_bg_neutrality_analyse(pv.bgra, pv.width, pv.height, pv.stride_bytes, &roi, nullptr,
+			                            &res)) {
+				c->rear_budget.result = res;
+				c->rear_budget.have_result = true;
+			}
+			c->rear_budget.have_generation = true;
+			c->rear_budget.last_generation = pv.generation;
+		}
+	}
+
+	struct u_rear_budget_in in = {};
+	in.transparent = c->transparent_background;
+	// In-process native sessions are standalone by construction: a session
+	// under a workspace controller is an IPC client of the service, and this
+	// compositor is not on that path at all.
+	in.under_workspace = false;
+	in.source_available = have_preview;
+	in.have_result = have_preview && c->rear_budget.have_result;
+	in.generation = c->rear_budget.last_generation;
+	in.result = c->rear_budget.result;
+
+	const enum u_rear_budget_state before = c->rear_budget.policy.state;
+	struct u_rear_budget_out out = {};
+	u_rear_budget_update(&c->rear_budget.policy, &in, now_ns, &out);
+
+	{
+		std::lock_guard<std::mutex> lock(c->rear_budget.publish_mutex);
+		c->rear_budget.published = out;
+		c->rear_budget.published_valid = true;
+	}
+
+	if (c->rear_budget.dump < 0) {
+		const char *e = getenv("DXR_REAR_BUDGET_DUMP");
+		c->rear_budget.dump = (e != nullptr && e[0] == '1') ? 1 : 0;
+		if (c->rear_budget.dump == 1) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_DUMP armed = 1 (preview PNG on each "
+			    "state change)");
+		}
+	}
+	if (c->rear_budget.dump == 1 && out.state != before && have_preview) {
+		d3d11_rear_budget_dump_preview(&pv);
+	}
+}
+
 static bool
 d3d11_compositor_content_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, uint32_t *out_h)
 {
@@ -2417,6 +2592,11 @@ d3d11_dp_weave(struct comp_d3d11_compositor *c, bool is_repaint)
 	    eff_canvas.valid ? eff_canvas.y : 0,
 	    eff_canvas.valid ? eff_canvas.w : 0,
 	    eff_canvas.valid ? eff_canvas.h : 0);
+
+	// XR_DXR_depth_budget: evaluate the rear budget from the background the
+	// DP just composited under. AFTER process_atlas, because that is the point
+	// at which the DP's capture for this frame is settled.
+	d3d11_rear_budget_tick(c);
 
 	// #439 Phase 1: an authored zone mask (XR_DXR_local_3d_zone) or a
 	// Local2D layer composites the 2D/3D regions of the DXGI back buffer.
@@ -3958,6 +4138,25 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
+
+	// XR_DXR_depth_budget: the policy exists from the first frame so that a
+	// locate arriving before any preview reads a real CLIPPED_NO_SOURCE rather
+	// than an uninitialised struct. `running` is armed by the oxr setter below,
+	// once the session's extension opt-in is known.
+	c->rear_budget.requested = false;
+	c->rear_budget.running = false;
+	c->rear_budget.dump = -1;
+	c->rear_budget.next_poll_ns = 0;
+	c->rear_budget.last_generation = 0;
+	c->rear_budget.have_generation = false;
+	c->rear_budget.have_result = false;
+	c->rear_budget.published_valid = false;
+	{
+		struct u_rear_budget_tuning tuning;
+		u_rear_budget_tuning_defaults(&tuning);
+		u_rear_budget_tuning_from_env(&tuning);
+		u_rear_budget_init(&c->rear_budget.policy, &tuning, "d3d11", os_monotonic_get_ns());
+	}
 
 	// Handle window: use provided HWND, create our own, or go offscreen (shared texture)
 	if (shared_texture_handle != nullptr) {
@@ -7715,9 +7914,60 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	return false;
 }
 
+extern "C" extern "C" void
+comp_d3d11_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	c->rear_budget.requested = requested;
+
+	// Both halves are required: an opaque session has no conflict to police,
+	// and an app that never enabled the extension must not pay for the poll.
+	const bool running = requested && c->transparent_background;
+	if (running != c->rear_budget.running) {
+		c->rear_budget.running = running;
+		U_LOG_W("REAR_BUDGET: policy %s (requested=%d transparent=%d)", running ? "ARMED" : "off",
+		        requested ? 1 : 0, c->transparent_background ? 1 : 0);
+	}
+}
+
 extern "C" bool
-comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
-                                          struct xrt_window_metrics *out_metrics)
+comp_d3d11_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
+{
+	if (xc == nullptr || out == nullptr) {
+		return false;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	// An opaque session is unrestricted by definition, and says so without
+	// waiting for a render-thread tick that will never run for it.
+	if (!c->rear_budget.requested) {
+		return false;
+	}
+	if (!c->transparent_background) {
+		out->far_offset_vh = U_REAR_BUDGET_UNRESTRICTED_VH;
+		out->state = U_REAR_BUDGET_UNRESTRICTED_OPAQUE;
+		out->cue_energy = 0.0f;
+		return true;
+	}
+
+	std::lock_guard<std::mutex> lock(c->rear_budget.publish_mutex);
+	if (!c->rear_budget.published_valid) {
+		// Transparent and armed, but no evaluation has landed yet. Clip -
+		// which is exactly what the app does today, so the first frames are
+		// unchanged rather than briefly and wrongly open.
+		out->far_offset_vh = 0.0f;
+		out->state = U_REAR_BUDGET_CLIPPED_NO_SOURCE;
+		out->cue_energy = 0.0f;
+		return true;
+	}
+	*out = c->rear_budget.published;
+	return true;
+}
+bool
+comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics)
 {
 	if (xc == nullptr || out_metrics == nullptr) {
 		if (out_metrics != nullptr) {
