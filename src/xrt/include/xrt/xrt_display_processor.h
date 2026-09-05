@@ -93,6 +93,74 @@ struct xrt_window_metrics;
 #define XRT_DP_BACKEND_STATE_STALE 2u
 #endif
 
+/*
+ * ── Background preview (rear depth budget) ─────────────────────────────────
+ *
+ * A small CPU-side snapshot of what is on the panel BEHIND the app's canvas,
+ * produced by the DP that already captures the desktop for compose-under-bg.
+ * The runtime analyses it for horizontal-disparity cue energy and turns the
+ * answer into the app-facing rear depth budget (XR_DXR_depth_budget). The DP
+ * decides nothing perceptual - it only hands over pixels.
+ *
+ * The slot that returns this lives on the per-API variants (d3d11 / d3d12 /
+ * gl / vk / metal), NOT on the base vtable below: @ref
+ * xrt_display_processor_vk embeds that struct by value, so growing it would
+ * move every appended slot of the VK variant and misdispatch calls into an
+ * already-built plug-in - the silent break ADR-020 exists to prevent.
+ */
+
+//! @ref xrt_dp_background_preview::flags - capture is more than a second old.
+#define XRT_DP_BG_PREVIEW_STALE 0x1u
+
+/*!
+ * One background preview, borrowed from the DP for the duration of the call.
+ *
+ * @ref bgra points at DP-owned memory that stays valid only until the next
+ * `process_atlas()` on the same DP (i.e. within one render-thread frame). The
+ * runtime analyses it immediately and never retains the pointer.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_dp_background_preview
+{
+	//! `sizeof(*this)` - set by the RUNTIME before the call (see @ref xrt_dp_background_preview_init).
+	uint32_t struct_size;
+	//! Monotonic; changes only when the underlying capture advanced.
+	uint32_t generation;
+	//! Preview dimensions, both <= 512. 0,0 = the DP has no preview.
+	uint32_t width, height;
+	//! Row pitch of @ref bgra in bytes; >= width * 4.
+	uint32_t stride_bytes;
+	//! BGRA8, top-down. Valid until the next process_atlas() on this DP.
+	const uint8_t *bgra;
+	/*!
+	 * Region of the monitor the preview covers, in CANVAS-normalised
+	 * coordinates: (0,0) = canvas top-left, (1,1) = canvas bottom-right.
+	 * Normally 0,0,1,1 (the desktop region directly under the app canvas);
+	 * a DP that includes a margin says so here.
+	 */
+	float canvas_u0, canvas_v0, canvas_u1, canvas_v1;
+	//! XRT_DP_BG_PREVIEW_* bits.
+	uint32_t flags;
+	uint32_t reserved[7];
+};
+
+/*!
+ * Pre-set @p preview for a `get_background_preview` call: zero it and stamp
+ * the caller's `struct_size`. Every call site uses this so the convention is
+ * stated once (mirrors @ref xrt_dp_scanout_caps_init).
+ *
+ * @ingroup xrt_iface
+ */
+static inline void
+xrt_dp_background_preview_init(struct xrt_dp_background_preview *preview)
+{
+	for (size_t i = 0; i < sizeof(*preview); i++) {
+		((char *)preview)[i] = 0;
+	}
+	preview->struct_size = (uint32_t)sizeof(*preview);
+}
+
 /*!
  * @interface xrt_display_processor
  *

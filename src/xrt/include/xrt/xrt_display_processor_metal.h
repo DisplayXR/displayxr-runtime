@@ -35,6 +35,7 @@ extern "C" {
 // Forward declarations for types used by optional vtable methods.
 struct xrt_eye_positions;
 struct xrt_window_metrics;
+struct xrt_dp_background_preview;
 
 /*!
  * @interface xrt_display_processor_metal
@@ -322,6 +323,34 @@ struct xrt_display_processor_metal
 	 */
 	bool (*get_scanout_caps)(struct xrt_display_processor_metal *xdp, struct xrt_dp_scanout_caps *out_caps);
 
+	/*!
+	 * Hand the runtime a small CPU snapshot of the desktop BEHIND the app's
+	 * canvas, for the rear depth budget (XR_DXR_depth_budget).
+	 *
+	 * A DP that already captures the desktop for compose-under-bg has these
+	 * pixels; this slot exposes a downsampled (<= 512 px) BGRA8 copy of them.
+	 * The DP decides NOTHING perceptual - the runtime analyses the preview for
+	 * horizontal-disparity cue energy and owns the policy. Produce the preview
+	 * on the capture's own throttle (<= 15 Hz), never per weave, and bump
+	 * @ref xrt_dp_background_preview::generation only when it actually advanced.
+	 *
+	 * The caller pre-sets @ref xrt_dp_background_preview::struct_size; the DP
+	 * writes only fields within it. The returned @ref
+	 * xrt_dp_background_preview::bgra pointer is BORROWED - valid only until the
+	 * next `process_atlas()` on this DP - and the runtime never retains it.
+	 *
+	 * Return false for "no source right now": capture disabled, client-present
+	 * mode, cross-monitor drag, capture backend unavailable, NULL window. An
+	 * absent slot (older plug-in `struct_size`) or NULL reads the same way, and
+	 * the runtime's policy then degrades to today's behaviour (clip at the ZDP).
+	 * Appended per ADR-020 (append-only within a major; no version bump).
+	 *
+	 * @param      xdp          Pointer to self.
+	 * @param[out] out_preview  Filled by the DP (struct_size pre-set by caller).
+	 * @return true if @p out_preview was filled with a usable preview.
+	 */
+	bool (*get_background_preview)(struct xrt_display_processor_metal *xdp,
+	                               struct xrt_dp_background_preview *out_preview);
 };
 
 
@@ -379,7 +408,15 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_local_zone_ca
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, publish_local_zone_mask)      == XRT_DP_METAL_BASE_OFF + 14 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, clear_local_zone_mask)        == XRT_DP_METAL_BASE_OFF + 15 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_scanout_caps)             == XRT_DP_METAL_BASE_OFF + 16 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_metal, get_background_preview) == XRT_DP_METAL_BASE_OFF + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_metal)                                == XRT_DP_METAL_BASE_OFF + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the get_background_preview slot, so a
+ * plug-in built against an older runtime can #ifdef-guard its implementation
+ * - the coupled-ABI-addition pattern used by every other appended slot.
+ */
+#define XRT_DP_METAL_HAS_BACKGROUND_PREVIEW 1
 // clang-format on
 
 /*!
@@ -707,6 +744,26 @@ xrt_display_processor_metal_get_weave_scope(struct xrt_display_processor_metal *
 		return XRT_DP_WEAVE_SCOPE_CANVAS;
 	}
 	return xrt_dp_weave_scope_clamp(caps.weave_scope);
+}
+
+/*!
+ * @copydoc xrt_display_processor_metal::get_background_preview
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL,
+ * or the DP declined - in every one of those cases the caller has no
+ * background source this frame, and the rear-depth policy must read that as
+ * CLIPPED_NO_SOURCE, i.e. today's behaviour.
+ *
+ * @public @memberof xrt_display_processor_metal
+ */
+static inline bool
+xrt_display_processor_metal_get_background_preview(struct xrt_display_processor_metal *xdp,
+                                                   struct xrt_dp_background_preview *out_preview)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, get_background_preview) || xdp->get_background_preview == NULL) {
+		return false;
+	}
+	return xdp->get_background_preview(xdp, out_preview);
 }
 
 #ifdef __cplusplus

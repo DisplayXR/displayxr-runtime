@@ -415,6 +415,34 @@ struct xrt_display_processor_vk
 	                       uint32_t panel_h,
 	                       int32_t display_id);
 
+	/*!
+	 * Hand the runtime a small CPU snapshot of the desktop BEHIND the app's
+	 * canvas, for the rear depth budget (XR_DXR_depth_budget).
+	 *
+	 * A DP that already captures the desktop for compose-under-bg has these
+	 * pixels; this slot exposes a downsampled (<= 512 px) BGRA8 copy of them.
+	 * The DP decides NOTHING perceptual - the runtime analyses the preview for
+	 * horizontal-disparity cue energy and owns the policy. Produce the preview
+	 * on the capture's own throttle (<= 15 Hz), never per weave, and bump
+	 * @ref xrt_dp_background_preview::generation only when it actually advanced.
+	 *
+	 * The caller pre-sets @ref xrt_dp_background_preview::struct_size; the DP
+	 * writes only fields within it. The returned @ref
+	 * xrt_dp_background_preview::bgra pointer is BORROWED - valid only until the
+	 * next `process_atlas()` on this DP - and the runtime never retains it.
+	 *
+	 * Return false for "no source right now": capture disabled, client-present
+	 * mode, cross-monitor drag, capture backend unavailable, NULL window. An
+	 * absent slot (older plug-in `struct_size`) or NULL reads the same way, and
+	 * the runtime's policy then degrades to today's behaviour (clip at the ZDP).
+	 * Appended per ADR-020 (append-only within a major; no version bump).
+	 *
+	 * @param      xdp          Pointer to self.
+	 * @param[out] out_preview  Filled by the DP (struct_size pre-set by caller).
+	 * @return true if @p out_preview was filled with a usable preview.
+	 */
+	bool (*get_background_preview)(struct xrt_display_processor_vk *xdp,
+	                               struct xrt_dp_background_preview *out_preview);
 };
 
 /*!
@@ -514,7 +542,15 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_panel_size)     
  * coupled-ABI-addition pattern as @ref XRT_DP_VK_HAS_FRAME_TIMING.
  */
 #define XRT_DP_VK_HAS_PREDICTED_SCANOUT 1
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_preview) == sizeof(struct xrt_display_processor) + 11 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the get_background_preview slot, so a
+ * plug-in built against an older runtime can #ifdef-guard its implementation
+ * - the coupled-ABI-addition pattern used by every other appended slot.
+ */
+#define XRT_DP_VK_HAS_BACKGROUND_PREVIEW 1
 // clang-format on
 
 /*!
@@ -808,6 +844,32 @@ xrt_display_processor_vk_get_weave_scope(struct xrt_display_processor_vk *xdp)
 		return XRT_DP_WEAVE_SCOPE_CANVAS;
 	}
 	return xrt_dp_weave_scope_clamp(caps.weave_scope);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_background_preview
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL,
+ * or the DP declined - in every one of those cases the caller has no
+ * background source this frame, and the rear-depth policy must read that as
+ * CLIPPED_NO_SOURCE, i.e. today's behaviour.
+ * Like the wrappers above, the presence check reads `xdp->base.struct_size`
+ * because the variant embeds the base - see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_background_preview(struct xrt_display_processor_vk *xdp,
+                                                struct xrt_dp_background_preview *out_preview)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_background_preview + sizeof(xdp->get_background_preview);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->get_background_preview == NULL) {
+		return false;
+	}
+	return xdp->get_background_preview(xdp, out_preview);
 }
 
 #ifdef __cplusplus
