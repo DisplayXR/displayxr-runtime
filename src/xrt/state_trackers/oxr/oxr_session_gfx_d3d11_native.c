@@ -155,6 +155,13 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Set system devices for debug GUI qwerty driver support
 	comp_d3d11_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: latch the extension opt-in the same way the
+	// transparency flag is latched. Without it the compositor would either
+	// poll the DP for every session or for none.
+	comp_d3d11_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
+#endif
+
 	// Pass legacy app tile scaling flag and compromise view scale to compositor
 	if (sess->sys->xsysc != NULL) {
 		comp_d3d11_compositor_set_legacy_app_tile_scaling(

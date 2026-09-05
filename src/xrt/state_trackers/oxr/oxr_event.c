@@ -462,6 +462,39 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 
+#ifdef OXR_HAVE_DXR_depth_budget
+XrResult
+oxr_event_push_XrEventDataRearDepthBudgetStateChanged(struct oxr_logger *log,
+                                                      struct oxr_session *sess,
+                                                      XrRearDepthBudgetStateDXR previousState,
+                                                      XrRearDepthBudgetStateDXR newState)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataRearDepthBudgetStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->previousState = previousState;
+	changed->newState = newState;
+	event->result = XR_SUCCESS;
+
+	// The budget VALUE ramps every frame; the STATE moves rarely. Only the
+	// latter gets here, so WARN is the right tier (#441) and this line can
+	// never flood a log.
+	U_LOG_W("OXR EVENT: Rear depth budget state changed %d -> %d", (int)previousState, (int)newState);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_depth_budget
+
 #ifdef OXR_HAVE_DXR_local_3d_zone
 XrResult
 oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
