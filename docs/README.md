@@ -36,6 +36,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_DXR_xlib_window_binding](specs/extensions/XR_DXR_xlib_window_binding.md) — app-provided X11 window (desktop Linux)
 - [XR_DXR_spatial_workspace](specs/extensions/XR_DXR_spatial_workspace.md) — workspace controller surface (shell-style apps)
 - [XR_DXR_display_zones](specs/extensions/XR_DXR_display_zones.md) — N 3D zones + 2D zones + wish mask (design sketch, ADR-027)
+- [XR_DXR_depth_budget](specs/extensions/XR_DXR_depth_budget.md) — rear depth budget: how far behind the display plane a transparent app may render (ADR-040)
 - [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
 
 ---
@@ -141,6 +142,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-037](adr/ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement policy on hybrid-GPU devices
 - [ADR-038](adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
 - [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
+- [ADR-040](adr/ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 <!-- END ADR INDEX -->
 
 ---

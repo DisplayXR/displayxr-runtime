@@ -43,3 +43,4 @@
 - [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md) — Adapter placement policy on hybrid-GPU devices
 - [ADR-038](ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
 - [ADR-039](ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
+- [ADR-040](ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry

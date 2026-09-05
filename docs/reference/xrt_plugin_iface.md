@@ -311,6 +311,57 @@ carries its own placement slot (`xrt_display_processor_d3d11::set_window`,
 #1008). **Appending to the base vtable is no longer ABI-neutral now that a
 variant embeds it.**
 
+## What is behind the window: `get_background_preview` (ADR-040)
+
+The runtime decides how far behind the display plane a transparent app may
+render ([ADR-040](../adr/ADR-040-rear-depth-budget.md)), and to decide it needs
+to see the desktop under the app's canvas. On Windows the display processor
+already captures those pixels for compose-under transparency, so this optional
+appended slot lets it hand back a cheap preview:
+
+```c
+struct xrt_dp_background_preview {
+	uint32_t struct_size;      /* sizeof(*this), set by the RUNTIME before the call */
+	uint32_t generation;       /* monotonic; changes only when the capture advanced */
+	uint32_t width, height;    /* preview dims, both <= 512; 0,0 = no preview */
+	uint32_t stride_bytes;     /* >= width*4 */
+	const uint8_t *bgra;       /* BGRA8, top-down */
+	/* Monitor region the preview covers, in CANVAS-normalised coords:
+	   (0,0) = canvas top-left, (1,1) = canvas bottom-right. Normally 0,0,1,1
+	   (the desktop region under the app canvas); a DP may include a margin. */
+	float canvas_u0, canvas_v0, canvas_u1, canvas_v1;
+	uint32_t flags;            /* bit0 XRT_DP_BG_PREVIEW_STALE: capture > 1 s old */
+	uint32_t reserved[7];
+};
+
+bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
+                               struct xrt_dp_background_preview *out);
+```
+
+- **Slot 24 on D3D11** (after `set_predicted_scanout` = 23), **appended at the
+  end on every per-API variant** (`d3d11`, `d3d12`, `gl`, `vk`, `metal`) — never
+  on the base vtable, for the reason given in the section above. Guarded the same
+  way `set_frame_timing` is: `XRT_DP_HAS_SLOT` (the `struct_size` read-clamp) plus
+  a NULL check, an `XRT_DP_<API>_HAS_*` define, and an `offsetof` `static_assert`.
+- **Optional.** A NULL slot or a `false` return means *no source* — the runtime
+  reports `CLIPPED_NO_SOURCE` and the app clips at the display plane, which is
+  exactly the pre-ADR-040 behaviour. Failing closed is always safe, so return
+  `false` freely: capture disabled, client-present mode, a cross-monitor drag,
+  the capture API unavailable, HWND NULL.
+- **Pixels only, never a verdict.** The plug-in returns an image and a
+  generation; the runtime owns the perceptual policy. A DP that returned
+  "background is busy" would put perception in vendor code — explicitly rejected
+  in ADR-040.
+- **Lifetime.** `bgra` is *borrowed*: it must stay valid until the next
+  `process_atlas()` on the same DP (render thread). The runtime analyses
+  immediately and never retains the pointer.
+- **Cadence.** The runtime polls at most every 66 ms and re-analyses only when
+  `generation` advanced, so a plug-in should produce the preview at its existing
+  capture throttle (<= 15 Hz) and never per weave.
+- **`struct_size` is the runtime's, not yours.** The runtime sets it before the
+  call; write only the fields that fit within it.
+- **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and
