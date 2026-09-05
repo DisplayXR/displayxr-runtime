@@ -568,7 +568,8 @@ struct comp_d3d11_compositor
 		bool requested;           //!< App enabled XR_DXR_depth_budget.
 		bool running;             //!< Policy initialised (transparent + requested).
 		int dump;                 //!< DXR_REAR_BUDGET_DUMP. -1 = unprobed.
-		uint64_t next_poll_ns;    //!< Render-thread throttle (66 ms).
+		uint64_t next_poll_ns;    //!< DP poll throttle (66 ms); the policy itself ticks every frame.
+		bool source_available;    //!< Outcome of the LAST DP poll, reused between polls.
 		uint32_t last_generation; //!< Preview generation last ANALYSED.
 		bool have_generation;
 		bool have_result;
@@ -1851,18 +1852,25 @@ d3d11_rear_budget_tick(struct comp_d3d11_compositor *c)
 	}
 
 	const uint64_t now_ns = os_monotonic_get_ns();
-	if (now_ns < c->rear_budget.next_poll_ns) {
-		return;
-	}
-	c->rear_budget.next_poll_ns = now_ns + 66 * U_TIME_1MS_IN_NS;
 
+	// Two cadences on purpose. The DP poll + analysis is throttled to the
+	// capture rate (66 ms): re-reading an unchanged preview is wasted work.
+	// The policy update + publish runs EVERY frame, because the app applies
+	// the published far offset as-is and the open/close ramps must advance
+	// per frame or the clip plane steps in ~5 visible jumps instead of sliding.
 	struct xrt_dp_background_preview pv;
 	xrt_dp_background_preview_init(&pv);
-	const bool have_preview = xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv) &&
-	                          pv.bgra != nullptr && pv.width >= 2 && pv.height >= 1 &&
-	                          pv.stride_bytes >= pv.width * 4u && (pv.flags & XRT_DP_BG_PREVIEW_STALE) == 0;
-
-	if (have_preview) {
+	bool polled = false;
+	if (now_ns >= c->rear_budget.next_poll_ns) {
+		c->rear_budget.next_poll_ns = now_ns + 66 * U_TIME_1MS_IN_NS;
+		polled = true;
+		c->rear_budget.source_available =
+		    xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv) &&
+		    pv.bgra != nullptr && pv.width >= 2 && pv.height >= 1 && pv.stride_bytes >= pv.width * 4u &&
+		    (pv.flags & XRT_DP_BG_PREVIEW_STALE) == 0;
+	}
+	const bool have_preview = c->rear_budget.source_available;
+	if (polled && have_preview) {
 		// Re-analysing an unchanged capture would burn the CPU to reach the
 		// same answer; the policy's own staleness rule covers a generation
 		// that stops advancing entirely.
@@ -1909,7 +1917,8 @@ d3d11_rear_budget_tick(struct comp_d3d11_compositor *c)
 			    "state change)");
 		}
 	}
-	if (c->rear_budget.dump == 1 && out.state != before && have_preview) {
+	// The preview bytes are only valid on the frame that polled them.
+	if (c->rear_budget.dump == 1 && out.state != before && polled && have_preview) {
 		d3d11_rear_budget_dump_preview(&pv);
 	}
 }
