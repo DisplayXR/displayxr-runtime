@@ -6934,6 +6934,18 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 
 	U_ZERO(out_info);
 
+	/*
+	 * XR_DXR_depth_budget (Phase 1): filled here, before any of the rig
+	 * branches, so EVERY return path carries it - including the legacy
+	 * device-poses fallback at the bottom. A client of this service is
+	 * running under a workspace controller, which owns what is behind it;
+	 * no live desktop shows through, so there is no occlusion-vs-disparity
+	 * conflict to budget against.
+	 */
+	out_info->rear_far_offset_vh = 1000.0f;
+	out_info->rear_state = 1; // U_REAR_BUDGET_UNRESTRICTED_WORKSPACE
+	out_info->rear_cue = 0.0f;
+
 	// The legacy path's fallback eye relation is the client's IPD-based
 	// default; this call always runs against the DP-tracked path, so a
 	// nominal IPD is only consumed if the SR path is unavailable.

@@ -1018,6 +1018,21 @@ struct ipc_info_locate_views_rig
 	struct xrt_vec3 eye_world[XRT_MAX_VIEWS];
 	uint32_t rig_applied; //!< IPC_VIEW_RIG_* actually applied by the server
 	struct ipc_view_raw_info raw;
+
+	/*
+	 * XR_DXR_depth_budget - append-only past this point.
+	 *
+	 * The rear depth budget is computed SERVICE-side, because the service is
+	 * where the display processor (and therefore the background capture)
+	 * lives. Phase 1 ships the transport and the workspace answer: a client
+	 * of a service compositor is running under a workspace controller, which
+	 * owns what is behind it, so the desktop is not showing through and the
+	 * budget is unrestricted - today's behaviour, stated explicitly instead of
+	 * left implicit.
+	 */
+	float rear_far_offset_vh; //!< vH; 0 = clip at the ZDP, 1000 = unrestricted
+	uint32_t rear_state;      //!< enum u_rear_budget_state / XrRearDepthBudgetStateDXR
+	float rear_cue;           //!< 0..1 background cue energy; 0 when no source
 };
 
 struct ipc_pcm_haptic_buffer
