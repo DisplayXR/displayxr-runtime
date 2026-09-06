@@ -402,7 +402,7 @@ deployment is. A client opts into IPC (C) by one of four signals, in this order:
 
 | Signal | Shape | For |
 |---|---|---|
-| `XRT_FORCE_MODE=ipc` / `=native` | env, or the `debug.xrt.XRT_FORCE_MODE` / `debug.dxr.force_ipc` system properties | dev + test; wins over everything, both directions |
+| `XRT_FORCE_MODE=ipc` / `=native` | env, or the `debug.xrt.XRT_FORCE_MODE` / `debug.dxr.force_ipc` system properties | dev + test; wins over everything, both directions. (#1277 P2: `debug.dxr.force_ipc` also takes an allow-list of package names, and `ro.dxr.force_ipc` is the OEM device-policy tier — allow-list only, the device-wide form refused, per "per-application, never device-wide" above.) |
 | `<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>` | the app's own manifest | the per-app, build-time switch — pairs with `com.displayxr.satellite_slot` |
 | `XR_DXR_weave` enabled | capability | present-owners (#1036); weave on Android exists only in the service compositor, so this needs no configuration at all |
 | an adopted service socket | `ipc_client_connection_adopt_fd` / `DXR_IPC_FD` | the browser's GPU process (#1056) |

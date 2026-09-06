@@ -419,6 +419,28 @@ drive-by.
 | `DXR_ANDROID_VSYNC_PACING` | `compositor/main/comp_target_swapchain.c:116` | `DEBUG_GET_ONCE_BOOL` | **on** | App | 1 | Feeds AChoreographer vsync timestamps into the pacer (closed loop) |
 | `DXR_ANDROID_WEAVE_SPLIT` | `compositor/multi/comp_multi_weave_android.c:75` | `DEBUG_GET_ONCE_BOOL` | **on** | App | 1 | Kill switch for the self-submitting-DP split submission path |
 
+#### Android routing properties — deployment, not performance
+
+These are **not** `DXR_*` environment variables and never will be: an Android
+app is launched by the system, so there is no parent process to export an env
+var, and the decision they make (in-process Architecture A vs a service client,
+Architecture C) happens once at `xrt_instance_create`, before a window exists.
+They are listed here because the census is meant to be the place you can look up
+*any* `debug.dxr.*` name, and because a Control Panel on a large-format Android
+device would plausibly surface the device tier.
+
+| Property | Read site | Grammar | Default | Tier | What it does |
+|---|---|---|---|---|---|
+| `debug.xrt.XRT_FORCE_MODE` | `auxiliary/util/u_sandbox.c` (`u_sandbox_should_use_ipc`) | `ipc` / `native` | unset | 4 | The sysprop spelling of `XRT_FORCE_MODE`. Both directions. Device-wide |
+| `debug.dxr.force_ipc` | same | `1`/`true`/`all`/`*` (whole device) **or** an allow-list of process names, `,`/`;`/space separated, `pkg*` prefixes allowed | unset | 4 | Dev routing. Routes a **shipped, unmodified** APK onto the service with no rebuild — the way to exercise #1277 P2(b) on a demo without touching its repo. Matched against `/proc/self/cmdline` (a satellite slot `<pkg>:dxrN` matches its package) |
+| `ro.dxr.force_ipc` | same | allow-list **only** — a bare `1`/`*` is deliberately refused | unset | 2 | Device-class policy: "on this panel, these apps run out of process." Read-only, so OEM-build-set and not adb-settable on a locked device. Refusing the device-wide form is the ADR-036 rule (a device-wide deployment decision is what the Gradle flavor merge deleted) |
+
+`XRT_FORCE_MODE` in the environment wins over all three, in both directions, and
+is checked first. The app's own `<meta-data android:name="com.displayxr.force_ipc">`
+is a separate, earlier signal in `targets/openxr/target.c` that a sysprop cannot
+override back to native. Grammar is `u_sandbox_route_prop_selects()`, unit-tested
+host-side in `tests/tests_aux_route_policy.cpp`.
+
 ### Diagnostics / observers
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
