@@ -53,6 +53,55 @@ using wrap::android::view::WindowManager_LayoutParams;
 using wrap::org::freedesktop::monado::auxiliary::MonadoView;
 using xrt::auxiliary::android::loadClassFromRuntimeApk;
 
+/*
+ * #1367: the in-process hosted view reports its on-screen rect here (see
+ * MonadoView.reportsRectToNative). Same sink as xrSetAndroidWindowGeometryDXR,
+ * so the compositor's per-window Kooima, the DP's phase origin and the 2D
+ * backdrop crop all pick it up unchanged. Registered with RegisterNatives
+ * because the runtime .so is dlopen'ed by the OpenXR loader: ART only resolves
+ * `Java_*` symbols in libraries loaded through the class's own classloader,
+ * which this one never is.
+ */
+static void
+jni_window_rect_changed(JNIEnv * /*env*/,
+                        jclass /*clazz*/,
+                        jlong /*native_pointer*/,
+                        jint x,
+                        jint y,
+                        jint w,
+                        jint h,
+                        jint display_id,
+                        jint disp_w,
+                        jint disp_h)
+{
+	if (w <= 0 || h <= 0) {
+		return;
+	}
+	android_globals_set_window_screen_rect(x, y, (uint32_t)w, (uint32_t)h, display_id,
+	                                       disp_w > 0 ? (uint32_t)disp_w : 0u,
+	                                       disp_h > 0 ? (uint32_t)disp_h : 0u);
+}
+
+static void
+register_window_rect_native(jobject view)
+{
+	static const JNINativeMethod methods[] = {
+	    {"nativeWindowRectChanged", "(JIIIIIII)V", (void *)&jni_window_rect_changed},
+	};
+	JNIEnv *env = jni::env();
+	jclass clazz = env->GetObjectClass(view);
+	const jint rc = env->RegisterNatives(clazz, methods, 1);
+	env->DeleteLocalRef(clazz);
+	if (rc != JNI_OK) {
+		// An older MonadoView without the method (mismatched AAR) — the Java
+		// side catches the UnsatisfiedLinkError and stops polling; nothing
+		// else depends on this.
+		env->ExceptionClear();
+		U_LOG_W("android_custom_surface: could not register nativeWindowRectChanged — "
+		        "hosted window rect will not be published (#1367)");
+	}
+}
+
 struct android_custom_surface
 {
 	explicit android_custom_surface();
@@ -189,6 +238,11 @@ android_custom_surface_async_start(
 			U_LOG_W("android_custom_surface: TRANSLUCENT overlay window (#568 transparency spike)");
 		}
 		ret->monadoView = MonadoView::attachToWindow(displayContext, ret.get(), lp);
+		// Register on the class of the view we actually got, not on `clazz`: the
+		// runtime APK's classes are loaded through more than one classloader in
+		// the app process (#507), JNI natives bind per Class object, and the
+		// wrapper's static class may be an earlier load than this one.
+		register_window_rect_native(ret->monadoView.object().getHandle());
 		lp.object().set("preferredDisplayModeId", preferred_display_mode_id);
 
 		return ret.release();
