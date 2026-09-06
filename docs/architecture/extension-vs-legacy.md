@@ -40,7 +40,7 @@ The runtime detects which type of app it's dealing with at session creation time
 ## The View Path
 
 The split above is about swapchain sizing and mode control; `xrLocateViews` is where the two
-classes actually diverge in what they get back.
+classes actually diverge in what they get back (the contract is [ADR-024, Amendment 1](../adr/ADR-024-raw-vs-render-ready-views.md)).
 
 - **Render-ready (legacy apps, and any app that chains an `XR_DXR_view_rig` rig).** The runtime
   owns the camera: `XrView{pose, fov}` is complete for rendering and — since #1370 — is
