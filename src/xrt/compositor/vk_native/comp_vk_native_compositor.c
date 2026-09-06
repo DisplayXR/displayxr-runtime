@@ -509,6 +509,8 @@ struct comp_vk_native_compositor
 	//! / already logged, so the per-window rect feed and its Kooima line stay
 	//! lifecycle events rather than per-frame noise (#1037).
 	uint64_t android_rect_generation_fed;
+	//! #1367: last rect generation the view-dims log line reported.
+	uint64_t android_rect_generation_viewed;
 	uint64_t android_rect_generation_logged;
 #endif
 
@@ -5281,7 +5283,40 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 					uint32_t new_vh = mode->view_height_pixels;
 					uint32_t new_aw = mode->atlas_width_pixels;
 					uint32_t new_ah = mode->atlas_height_pixels;
-#if defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX_DESKTOP)
+#if defined(XRT_OS_ANDROID)
+					{
+						// #1367: the weave must happen at the VIEWPORT size.
+						// The view dims the DP gets are cols×view_w by
+						// rows×view_h, cropped out of the atlas — so they must
+						// be the WINDOW canvas × the mode's view_scale, exactly
+						// what the app renders (INV-4.3, fed to it as the
+						// view-rig canvasRectPx from the same rect). Left at
+						// the mode's display-sized dims, a freeform window got
+						// a display-sized tile crop — the app's window-sized
+						// tile plus stale atlas — scaled into the surface:
+						// "texture rescaled", wrong parallax. The rect is the
+						// one android_globals sink (app binding publish, or the
+						// hosted view's own report); fullscreen it equals the
+						// panel, so the result is the mode's dims unchanged.
+						// No rect (pre-#1037 app, OOP client) → mode dims.
+						int32_t win_x = 0, win_y = 0, display_id = -1;
+						uint32_t win_w = 0, win_h = 0, panel_w = 0, panel_h = 0;
+						uint64_t generation = 0;
+						if (android_globals_get_window_screen_rect(&win_x, &win_y, &win_w, &win_h,
+						                                           &display_id, &panel_w, &panel_h,
+						                                           &generation) &&
+						    win_w > 0 && win_h > 0) {
+							u_tiling_compute_canvas_view(mode, win_w, win_h, &new_vw, &new_vh);
+							if (generation != c->android_rect_generation_viewed) {
+								c->android_rect_generation_viewed = generation;
+								U_LOG_W("VIEW_DIMS: window %ux%u x mode scale -> view %ux%u "
+								        "(mode %ux%u) (#1367)",
+								        win_w, win_h, new_vw, new_vh,
+								        mode->view_width_pixels, mode->view_height_pixels);
+							}
+						}
+					}
+#elif defined(XRT_OS_WINDOWS) || defined(__APPLE__) || defined(XRT_OS_LINUX_DESKTOP)
 					if (!c->owns_window && c->settings.preferred.width > 0 &&
 					    c->settings.preferred.height > 0) {
 						// Handle app: window may be smaller than the display,
