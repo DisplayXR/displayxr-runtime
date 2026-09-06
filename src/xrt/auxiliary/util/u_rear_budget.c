@@ -25,6 +25,7 @@ u_rear_budget_tuning_defaults(struct u_rear_budget_tuning *t)
 	t->close_ms = 100;
 	t->ramp_open_ms = 300;
 	t->ramp_close_ms = 150;
+	t->open_cue_max = 0.85f;
 	t->force = U_REAR_BUDGET_FORCE_AUTO;
 }
 
@@ -43,6 +44,23 @@ rear_budget_env_u32(const char *name, uint32_t *field)
 	}
 	*field = (uint32_t)v;
 	U_LOG_W("REAR_BUDGET: %s armed = %u ms", name, *field);
+}
+
+//! Read one 0..1 override; logs once when armed. Out of (0,1] leaves @p field.
+static void
+rear_budget_env_f01(const char *name, float *field)
+{
+	const char *e = getenv(name);
+	if (e == NULL || e[0] == '\0') {
+		return;
+	}
+	const double v = strtod(e, NULL);
+	if (!(v > 0.0) || !(v <= 1.0)) {
+		U_LOG_W("REAR_BUDGET: %s='%s' out of range (0,1] - ignored, keeping %.2f", name, e, (double)*field);
+		return;
+	}
+	*field = (float)v;
+	U_LOG_W("REAR_BUDGET: %s armed = %.2f", name, (double)*field);
 }
 
 void
@@ -72,6 +90,7 @@ u_rear_budget_tuning_from_env(struct u_rear_budget_tuning *t)
 	rear_budget_env_u32("DXR_REAR_BUDGET_CLOSE_MS", &t->close_ms);
 	rear_budget_env_u32("DXR_REAR_BUDGET_RAMP_OPEN_MS", &t->ramp_open_ms);
 	rear_budget_env_u32("DXR_REAR_BUDGET_RAMP_CLOSE_MS", &t->ramp_close_ms);
+	rear_budget_env_f01("DXR_REAR_BUDGET_OPEN_CUE_MAX", &t->open_cue_max);
 }
 
 const char *
@@ -112,6 +131,12 @@ u_rear_budget_init(struct u_rear_budget *b,
 	}
 	if (b->tuning.ramp_close_ms == 0) {
 		b->tuning.ramp_close_ms = 1;
+	}
+	// A caller-built tuning struct that never set this (or set it out of
+	// range) must not silently become "open on any neutral sample", which is
+	// the flapping behaviour this field exists to remove.
+	if (!(b->tuning.open_cue_max > 0.0f) || !(b->tuning.open_cue_max <= 1.0f)) {
+		b->tuning.open_cue_max = 0.85f;
 	}
 
 	// The conservative start: no source yet, so clip at the ZDP. A session
@@ -259,6 +284,37 @@ u_rear_budget_update(struct u_rear_budget *b,
 			b->cue_energy = 0.0f;
 			b->neutral_run_active = false;
 			b->busy_run_active = false;
+		} else if (in->result.neutral && in->result.cue_energy > b->tuning.open_cue_max) {
+			/*
+			 * THE DEAD BAND (open_cue_max < cue < 1.0). Neutral by the
+			 * analysis's single threshold, but not quietly enough to be
+			 * worth opening for - and this is where the panel's
+			 * open/clipped flap lived, because one threshold was doing
+			 * both jobs.
+			 *
+			 * Neither run advances: the open dwell is RESET (so it has to
+			 * be earned again from scratch once the cue drops back under
+			 * the bar) and the close grace never starts. Whatever state
+			 * the session is in, it keeps - including the ramp already in
+			 * flight, since the target is left exactly where it was.
+			 */
+			b->cue_energy = in->result.cue_energy;
+			b->neutral_run_active = false;
+			b->busy_run_active = false;
+			if (prev == U_REAR_BUDGET_OPEN || rear_budget_is_clipped(prev)) {
+				next = prev;
+				target_vh = b->ramp_to_vh;
+				ramp_ms = 0;
+			} else {
+				// Arriving in the band from a state that was never a
+				// measurement (an opaque or workspace session that just
+				// became transparent + standalone). The dead band HOLDS a
+				// verdict; it cannot manufacture one, and the conservative
+				// answer is the only honest one.
+				next = U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND;
+				target_vh = 0.0f;
+				ramp_ms = b->tuning.ramp_close_ms;
+			}
 		} else if (in->result.neutral) {
 			b->cue_energy = in->result.cue_energy;
 			b->busy_run_active = false;

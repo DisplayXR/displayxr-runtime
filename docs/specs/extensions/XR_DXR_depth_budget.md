@@ -171,11 +171,22 @@ for tuning:
 | `DXR_REAR_BUDGET_CLOSE_MS` | 100 | Any busy sample closes the state after this. |
 | `DXR_REAR_BUDGET_RAMP_OPEN_MS` | 300 | Ease-out ramp toward 1000. |
 | `DXR_REAR_BUDGET_RAMP_CLOSE_MS` | 150 | Ease-out ramp toward 0. |
+| `DXR_REAR_BUDGET_OPEN_CUE_MAX` | 0.85 | The cue a sample must be **below** to count toward the open dwell (see the dead band below). |
 
 Three properties follow, and applications depend on them:
 
 - **The hysteresis is asymmetric on purpose.** Opening is slow, closing is fast: a visible
   occlusion conflict is worse than a missing rear volume.
+- **There is a dead band on the cue, not just on time.** `neutral` is one threshold — the cue
+  energy is the worse metric as a fraction of its own limit, clamped, so `neutral` *is*
+  `cue < 1.0`. A background parked just under that line satisfies the dwell, opens, crosses it on
+  the next sample and closes after the grace, for ever (the panel logged
+  `OPEN cue=0.93`, then `OPEN cue=0.97`, then a 400–500 ms flap for seconds). So a sample counts
+  toward **opening** only at `cue <= DXR_REAR_BUDGET_OPEN_CUE_MAX`, counts toward **closing** only
+  at `cue >= 1.0` (i.e. `!neutral`), and in between it **holds** whatever state is current — an
+  `OPEN` session stays open, a clipped one stays clipped and its dwell is reset, so re-opening has
+  to be earned from scratch. Time hysteresis cannot fix a flap whose two sides are both legitimate
+  under the same comparison.
 - **`farOffsetVH` is ramped, not switched**, so the clip plane *slides* rather than pops. **Apply
   it as-is** — app-side smoothing fights the runtime's ramp and produces a slower, less
   predictable plane.
@@ -346,6 +357,25 @@ canvas the content was nowhere near?
   rebase the zone-space result through the zone rect with `dxr::RebaseZoneBoundsToWindow`
   (§4.5). Do **not** apply any ROI logic of your own beyond that: the dilation, the zone clamp,
   the staleness rule and the verdict are the runtime's.
+- **Do not report an engine's skinned-mesh bounds as-is.** `SkinnedMeshRenderer.bounds` and its
+  equivalents are the **import-time** box, sized to cover the whole animation set — a T-pose with
+  the arms out — not the pose on screen, unless the engine is told to update them per frame (Unity:
+  `updateWhenOffscreen = true`). Nothing about the value looks wrong, so this over-reports silently
+  and by a lot: the rect the runtime measures is then a box around where the character *could* be.
+- **Report what occupies the rear volume, not the scenery.** Two failure shapes, both from the same
+  instinct to union everything:
+  - A floor, backdrop or skybox **quad with corners behind the eye** cannot be projected, so the
+    union degrades to "unknown" and the runtime falls back to the whole window — strictly worse
+    than reporting only the character.
+  - A large ground plane that *does* project widens the rect until it covers the zone, which is the
+    same as not reporting at all.
+
+  If a piece of geometry would not be clipped by the rear budget, it does not belong in the AABB.
+- **The runtime clamps, but it does not fix.** As of #1365 the region is intersected with the
+  frame's 3D display zones (§4.5), so an over-reported or mis-rebased rect degrades to a coarser
+  measurement instead of a wrong one. That is a floor, not a substitute for reporting the right
+  rect: a rect around a character is still the wrong *shape* for a character, and a **mask-based
+  ROI (v3)** is the planned answer to that, not a larger rectangle.
 
 ## 7. Sample Usage
 

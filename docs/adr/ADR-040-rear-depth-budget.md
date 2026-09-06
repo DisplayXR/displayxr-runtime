@@ -188,6 +188,24 @@ when the runtime lacks the extension.
   that this **narrows the blast radius of a wrong hint without making the hint optional**: bounds
   entirely outside every 3D zone measure the zone union and log once naming the app's rebase, so
   the app bug stays visible instead of being absorbed into a plausible-looking number.
+- **A rectangle is the wrong shape for a character, and the app is the wrong place to fix that.**
+  The two ways v2 goes wrong in practice are both *shape* problems, not policy ones: an engine's
+  skinned-mesh bounds are the import-time box over the whole animation set (a T-pose with the arms
+  out) unless the app opts into per-frame bounds, and unioning scenery into the AABB either widens
+  the rect to the whole zone or, with a backdrop quad whose corners sit behind the eye, collapses it
+  to "unknown" and the whole-window fallback. Both over-report silently: nothing about the value
+  looks malformed. The zone clamp bounds the damage, and §6 names the two traps, but the real answer
+  is a **mask-based ROI (v3)** — the runtime already rasterises per-frame masks for the zone wish, so
+  the shape is available without the app computing anything new. A larger rectangle is not the fix.
+- **One threshold cannot both admit and reject.** `u_bg_neutrality` reports `neutral` as `cue < 1.0`,
+  and the panel found a background parked at 0.93–0.97: the dwell was served, the budget opened, the
+  next sample crossed 1.0, it closed after the grace, for seconds. The dwell and the close grace are
+  hysteresis on the **time** axis and cannot damp that, because both sides of the flap were
+  legitimate under their own rule. `open_cue_max` (default 0.85) adds hysteresis on the
+  **measurement** axis: a sample must be below it to count toward opening, at or above 1.0 to count
+  toward closing, and the band between holds whatever verdict is current. The general lesson is the
+  one worth keeping — a state machine whose entry and exit conditions are the *same* comparison has
+  no stable region, however much time you put around it.
 
 - **A new advisory value reaching apps means a new way for apps to disagree.** The ramp is the
   mitigation: because the runtime hands over an already-smoothed value and asks apps to apply it
