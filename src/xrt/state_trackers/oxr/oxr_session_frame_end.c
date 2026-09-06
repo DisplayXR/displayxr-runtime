@@ -2312,8 +2312,9 @@ oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndI
 	    OXR_GET_INPUT_FROM_CHAIN(frameEndInfo, XR_TYPE_CONTENT_BOUNDS_DXR, XrContentBoundsDXR);
 	if (cb == NULL) {
 		// Not chained this frame. The compositor's own age rule (1 s) is what
-		// turns "stopped chaining" back into the whole canvas - re-sending
-		// "unknown" here would instead punish a single dropped hint.
+		// turns "stopped chaining" back into the whole window (or, on a zones
+		// frame, the zone union) - re-sending "unknown" here would instead
+		// punish a single dropped hint.
 		return;
 	}
 
@@ -2332,7 +2333,7 @@ oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndI
 			sess->warned_content_bounds_invalid = true;
 			U_LOG_W(
 			    "XrContentBoundsDXR: bounds {%f, %f, %f, %f} unusable - the rear-depth "
-			    "analysis falls back to the whole canvas (one-time warning)",
+			    "analysis falls back to the whole window (one-time warning)",
 			    (double)u0, (double)v0, (double)w, (double)h);
 		}
 		oxr_session_set_content_bounds(sess, 0.0f, 0.0f, 0.0f, 0.0f, now_ns);
@@ -2344,7 +2345,7 @@ oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndI
 
 	// marginNormalized is dilation the app wants ON TOP of the runtime's own
 	// default (which the compositor applies in preview pixels, where it can
-	// see the preview). Applied here because it is in the same canvas-
+	// see the preview). Applied here because it is in the same window-
 	// normalised units as the rect.
 	float margin = cb->marginNormalized;
 	if (!isfinite(margin) || margin < 0.0f) {
@@ -2358,15 +2359,18 @@ oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndI
 	u1 += margin;
 	v1 += margin;
 
-	// Canvas-normalised means [0,1] IS the canvas; content outside it is not
-	// composited over anything the analysis can see.
+	// Window-normalised means [0,1] IS the app window's client rect; content
+	// outside it is not composited over anything the analysis can see. The
+	// runtime clamps AGAIN, to the frame's 3D display zones, in
+	// comp_rear_budget - a rect can be inside the window and still name a 2D
+	// band, which is a mistake no validation here can catch (#1365).
 	u0 = OXR_CB_CLAMP01(u0);
 	v0 = OXR_CB_CLAMP01(v0);
 	u1 = OXR_CB_CLAMP01(u1);
 	v1 = OXR_CB_CLAMP01(v1);
 
 	if (!(u1 > u0) || !(v1 > v0)) {
-		// Clamped away to nothing - off-canvas content. Unknown, never empty:
+		// Clamped away to nothing - off-window content. Unknown, never empty:
 		// a region with no pixels in it would otherwise measure as neutral and
 		// open the budget on a busy desktop.
 		oxr_session_set_content_bounds(sess, 0.0f, 0.0f, 0.0f, 0.0f, now_ns);

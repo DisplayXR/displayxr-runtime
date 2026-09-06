@@ -108,17 +108,19 @@ typedef struct XrRearDepthBudgetDXR {
 
 ```c
 /* INPUT: the app chains this on XrFrameEndInfo::next in xrEndFrame. Optional; when absent
-   (or not chained for more than 1 s) the runtime measures the whole canvas, i.e. v1. */
+   (or not chained for more than 1 s) the runtime measures the whole canvas, i.e. v1 — or,
+   on a frame with 3D display zones, the zone union (§4.5). */
 typedef struct XrContentBoundsDXR {
     XrStructureType   type;      /* XR_TYPE_CONTENT_BOUNDS_DXR */
     const void*       next;
-    XrRect2Df         bounds;    /* CANVAS-NORMALISED: offset/extent in [0,1], origin top-left
-                                    (u right, v DOWN — the same convention as the display
-                                    processor's background-preview canvas rect and
-                                    XrViewDisplayRawDXR::canvasRectPx). The union over ALL views
+    XrRect2Df         bounds;    /* WINDOW-NORMALISED: offset/extent in [0,1], origin top-left
+                                    (u right, v DOWN). The frame is the app WINDOW'S CLIENT
+                                    RECT — the frame of the DP's background preview — never a
+                                    display zone's canvasRectPx. A zoned app rebases through
+                                    its zone rect first (§4.5). The union over ALL views
                                     of the projected content AABB. An extent <= 0, or any
-                                    non-finite component, means "unknown" = whole canvas. */
-    float             marginNormalized; /* extra dilation the app wants, in canvas-normalised
+                                    non-finite component, means "unknown" = whole window. */
+    float             marginNormalized; /* extra dilation the app wants, in window-normalised
                                     units, ON TOP of the runtime's own default (§4.5).
                                     0 = the runtime default alone. */
 } XrContentBoundsDXR;
@@ -217,32 +219,66 @@ own menu and status bars, while the model was nowhere near them.)
 **v2** lets the app say where its content actually projects, by chaining `XrContentBoundsDXR`
 (§3.4) on `XrFrameEndInfo` in `xrEndFrame`. The runtime then measures only that region.
 
+#### What the bounds are normalised to
+
+**The app window's client rect** — the frame of the DP's background preview — and **never** a
+display zone's `canvasRectPx`. This is the whole contract, and it is the one an app can get wrong
+without any validation catching it.
+
 The app is the only party that can compute this — it owns the geometry and the matrices — so it
-projects its content AABB, unions over all views, and reports the result in canvas-normalised
-coordinates. `dxr::ProjectAabbToCanvasBounds` in `displayxr-common` does the projection; apps
+projects its content AABB, unions over all views, and reports the result in window-normalised
+coordinates. `dxr::ProjectAabbToWindowBounds` in `displayxr-common` does the projection; apps
 should not roll their own.
 
-How the runtime turns those bounds into a measured region:
+A **zoned** app (`XR_DXR_display_zones`) has one extra step, and it is not optional: it projects in
+the **zone's** view, clamps to `[0,1]` *of the zone*, and then rebases through that zone's window
+rect — `dxr::RebaseZoneBoundsToWindow`. Chaining zone-normalised bounds as window-normalised
+reports a rect that reaches outside the 3D zone, typically into a Local2D 2D band; the background
+preview covers the whole window, so the analysis then measures desktop pixels behind the band that
+3D content never covers, and the verdict still reads authoritative (#1365, seen on the panel with a
+zoned Unity app).
 
-1. **Map.** The bounds are canvas-normalised; the background preview covers `canvas_u0..v1` **of
-   the canvas**, which is normally `0,0,1,1` but may include a margin. The bounds are mapped
-   through that rect into preview pixels. A display processor that leaves the canvas rect zeroed
-   is treated as `0,0,1,1` — the documented normal case.
-2. **Dilate.** Every side is expanded by `max(4% of the preview width, 8 px)`, plus the app's
-   `marginNormalized` (applied in canvas-normalised units before the mapping). The disparity
+The preview frame is the window client rect. A display processor that wants a margin declares it in
+`canvas_u0..canvas_v1` on the preview and the runtime maps through that rect; one that leaves the
+field zeroed is read as `0,0,1,1`, the documented normal case.
+
+#### How the runtime turns those bounds into a measured region
+
+1. **Clamp to the 3D zones.** The region is intersected with the union of **this frame's 3D display
+   zones**, in the same window-normalised space, before anything else. Only 3D zones count: a
+   Local2D zone is a 2D band the DP never weaves. A frame with **no** zones means the whole canvas
+   *is* the 3D zone (every full-window app — modelviewer, gauss — is unchanged).
+2. **Map.** The result is mapped through the preview's `canvas_u0..v1` rect into preview pixels.
+3. **Dilate.** Every side is expanded by `max(4% of the preview width, 8 px)`, plus the app's
+   `marginNormalized` (applied in window-normalised units before the mapping). The disparity
    conflict is read in the **band around the silhouette**, not strictly under it, so measuring the
    exact projected AABB would answer a question nobody asked.
-3. **Clamp** to the preview.
+4. **Clamp** to the preview — and, when the frame has zones, to the zone box again. The dilation is
+   a band, and a band is just as able to reach into a 2D strip as the bounds were.
 
-Every failure path falls back to the **whole preview** — never to "neutral":
+The clamp is a **defence, not the contract**: an app that skips the rebase degrades to a coarser
+measurement instead of a wrong one. It does not make zone-normalised bounds correct.
+
+Every failure path falls back to the **whole preview** — never to "neutral" — except where the
+frame has 3D zones, where it falls back to the **zone union**, because outside a 3D zone there is
+nothing for the content to occlude:
 
 | Situation | Region measured |
 |---|---|
-| No `XrContentBoundsDXR` ever chained | Whole canvas (v1 behaviour) |
-| Not chained for more than 1 s | Whole canvas — the app stopped, and a second-old rect describes geometry that has since moved |
+| No `XrContentBoundsDXR` ever chained, no zones | Whole canvas (v1 behaviour) |
+| No `XrContentBoundsDXR` ever chained, zones present | The 3D zone union |
+| Not chained for more than 1 s | Whole canvas / the zone union — the app stopped, and a second-old rect describes geometry that has since moved |
 | `extent <= 0`, or any non-finite component | Whole canvas ("unknown"); one-time `WARN` |
-| Bounds that clamp away to fewer than 2 px | Whole canvas — an empty region would measure as neutral and open the budget over a desktop nobody looked at |
-| `DXR_REAR_BUDGET_ROI=0` | Whole canvas (A/B kill switch; logs once when armed) |
+| Bounds that clamp away to fewer than 2 px | Whole canvas / the zone union — an empty region would measure as neutral and open the budget over a desktop nobody looked at |
+| Bounds entirely outside every 3D zone | The 3D zone union, plus a one-time `WARN` naming the app's zone→window rebase. Never the whole window: that is the failure this clamp exists to stop |
+| Zone rects older than 1 s | No clamp — the app stopped chaining zones and the layout has since moved |
+| `DXR_REAR_BUDGET_ROI=0` | Whole canvas, clamp included (A/B kill switch; logs once when armed) |
+
+**Where the zones come from.** Each native compositor publishes this frame's `XRT_LAYER_ZONE_3D`
+rects from the same per-frame layer scan that resolves `zones_frame` — the same accumulator the
+wish raster and the masked composite read — normalised by the window's client rect
+(`comp_rear_budget_set_zone_rects`). It is a second *reader* of the frame's zone authority, never a
+second channel, and it runs unconditionally: a frame with no zones publishes zero zones.
 
 The runtime re-measures when the capture generation advances **or when the derived region moves**.
 The second is what keeps the ROI live: on a quiet desktop the generation never advances again, and
@@ -303,11 +339,13 @@ canvas the content was nowhere near?
   per-app capture cost and a different policy in every app.
 - **Report your content bounds (v2, optional but strongly recommended).** Chain
   `XrContentBoundsDXR` on `XrFrameEndInfo` every frame with the projected AABB of the content that
-  would occupy the rear volume, unioned over views and clamped to `[0,1]`. Without it the runtime
-  judges the whole canvas and closes the budget for busy pixels the app is nowhere near. Use
-  `dxr::ProjectAabbToCanvasBounds` — the projection has one correct answer and app-side variants
-  of it will not agree. Do **not** apply any ROI logic of your own beyond that: the dilation, the
-  staleness rule and the verdict are the runtime's.
+  would occupy the rear volume, unioned over views and clamped to `[0,1]`, **normalised to your
+  window's client rect**. Without it the runtime judges the whole canvas and closes the budget for
+  busy pixels the app is nowhere near. Use `dxr::ProjectAabbToWindowBounds` — the projection has
+  one correct answer and app-side variants of it will not agree — and if you use display zones,
+  rebase the zone-space result through the zone rect with `dxr::RebaseZoneBoundsToWindow`
+  (§4.5). Do **not** apply any ROI logic of your own beyond that: the dilation, the zone clamp,
+  the staleness rule and the verdict are the runtime's.
 
 ## 7. Sample Usage
 
@@ -346,10 +384,14 @@ const float clipFar = transparent ? far_z : 0.0f;   /* 0 = "no shader-side clip"
 /* far_z drives the projection AND any shader/compute far cull, so they agree while it ramps. */
 
 /* --- per frame, at xrEndFrame: say where the content is (v2) --- */
-XrRect2Df bounds;                       /* canvas-normalised, origin top-left */
-if (!dxr_project_aabb_to_canvas_bounds(aabbMin, aabbMax, viewProj, viewCount, &bounds)) {
-    bounds = (XrRect2Df){{0, 0}, {0, 0}};   /* extent 0 = "unknown" = whole canvas */
+XrRect2Df bounds;                       /* WINDOW-normalised, origin top-left */
+if (!dxr_project_aabb_to_window_bounds(aabbMin, aabbMax, viewProj, viewCount, &bounds)) {
+    bounds = (XrRect2Df){{0, 0}, {0, 0}};   /* extent 0 = "unknown" = whole window */
 }
+/* Zoned app: the projection above was in the ZONE's view, so rebase it through the
+   zone's window rect before reporting. Skipping this aims the analysis at the wrong
+   part of the window — usually a Local2D 2D band the content never covers. */
+dxr_rebase_zone_bounds_to_window(&bounds, zoneRectPx, windowWidthPx, windowHeightPx);
 
 XrContentBoundsDXR cb = {XR_TYPE_CONTENT_BOUNDS_DXR};
 cb.bounds           = bounds;

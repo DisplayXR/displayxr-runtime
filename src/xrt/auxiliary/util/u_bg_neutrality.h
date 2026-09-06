@@ -48,6 +48,23 @@ struct u_bg_roi
 };
 
 /*!
+ * The normalised sibling of @ref u_bg_roi: a rect in [0,1] with the origin
+ * top-left (u right, v DOWN).
+ *
+ * Exists because a region is derived in a resolution-independent space and only
+ * then mapped into preview pixels — the app's content bounds and the frame's 3D
+ * display-zone rects are both normalised to the app window's client rect, and
+ * they have to be intersected with each other BEFORE either meets the preview's
+ * pixel grid.
+ *
+ * @ingroup aux_util
+ */
+struct u_bg_rect_norm
+{
+	float u0, v0, u1, v1;
+};
+
+/*!
  * Thresholds for @ref u_bg_neutrality_analyse.
  *
  * @ingroup aux_util

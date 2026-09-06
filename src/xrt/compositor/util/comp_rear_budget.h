@@ -37,6 +37,7 @@
 #pragma once
 
 #include "xrt/xrt_display_processor.h" // struct xrt_dp_background_preview
+#include "xrt/xrt_limits.h"           // XRT_MAX_LAYERS
 
 #include "os/os_threading.h"
 
@@ -71,6 +72,48 @@ extern "C" {
  * @ingroup comp_util
  */
 typedef void (*comp_rear_budget_dump_fn)(void *ctx, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride);
+
+/*!
+ * How many 3D display zones one frame may contribute to the ROI clamp.
+ *
+ * Sized to the layer limit rather than to the four zones the extension
+ * advertises, so "more zones than we can hold" is unrepresentable: the union of
+ * the FIRST n zones is a SUBSET of the real one, and silently clamping to a
+ * subset would aim the analysis at less than the app's content covers — the
+ * exact class of quiet wrongness this whole file exists to avoid.
+ *
+ * @ingroup comp_util
+ */
+#define COMP_REAR_BUDGET_MAX_ZONES XRT_MAX_LAYERS
+
+/*!
+ * Where the ROI the last analysis used came from. Reported on each state
+ * transition, because a rear-depth verdict whose region is unattributable
+ * cannot be argued with.
+ *
+ * @ingroup comp_util
+ */
+enum comp_rear_budget_roi_src
+{
+	//! No usable bounds and no zones — v1's whole-preview region.
+	COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW = 0,
+	//! The app's content bounds, unclamped (full-window app: no 3D zones).
+	COMP_REAR_BUDGET_ROI_SRC_BOUNDS,
+	//! The app's content bounds intersected with the frame's 3D zones.
+	COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES,
+	//! The 3D zone union: no usable bounds, or a clamped region that collapsed.
+	COMP_REAR_BUDGET_ROI_SRC_ZONES,
+	//! Bounds that fell entirely outside every 3D zone — the zone union.
+	COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE,
+};
+
+/*!
+ * Human-readable @ref comp_rear_budget_roi_src, for the transition log.
+ *
+ * @ingroup comp_util
+ */
+const char *
+comp_rear_budget_roi_src_str(enum comp_rear_budget_roi_src src);
 
 /*!
  * One session's rear-depth-budget runner. Zero-init is NOT valid — call
@@ -142,7 +185,7 @@ struct comp_rear_budget
 	 * region neither frame asked for.
 	 * @{
 	 */
-	//! Canvas-normalised, origin top-left. Meaningful only when @ref bounds_valid.
+	//! Window-normalised, origin top-left. Meaningful only when @ref bounds_valid.
 	float bounds_u0, bounds_v0, bounds_u1, bounds_v1;
 	//! When the app last chained bounds; older than a second is "stopped chaining".
 	uint64_t bounds_ns;
@@ -155,6 +198,37 @@ struct comp_rear_budget
 	bool have_roi;
 	//! The last ROI was narrower than the preview (i.e. the bounds were used).
 	bool last_roi_narrowed;
+	//! Which rule produced @ref last_roi.
+	enum comp_rear_budget_roi_src last_roi_src;
+	/*! @} */
+
+	/*!
+	 * @name XR_DXR_depth_budget v2 - the 3D display zones the ROI is clamped to
+	 *
+	 * The bounds contract is WINDOW-normalised, and an app can get that wrong in
+	 * a way no validation catches: a zoned app that projects in the ZONE view
+	 * and forgets to rebase through the zone rect reports a rect that reaches
+	 * outside its 3D zone and into a Local2D 2D band (#1365, on a zoned Unity
+	 * app). The background preview covers the whole window, so the analysis then
+	 * measures desktop pixels behind the 2D band — pixels the 3D content can
+	 * never occlude — and the verdict still reads authoritative.
+	 *
+	 * So the runtime defends: the derived region is intersected with the union
+	 * of THIS frame's 3D zones. Only 3D zones count; a Local2D zone is a 2D band
+	 * and is deliberately not in this list. NO zones at all means the whole
+	 * canvas IS the 3D zone (every full-window app), and nothing is clamped.
+	 *
+	 * Written from the compositor's per-frame layer scan and read by the
+	 * analysis, so the rects and their timestamp move under
+	 * @ref publish_mutex as one unit.
+	 * @{
+	 */
+	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
+	uint32_t zone_count;
+	//! When the zones were last published; older than a second is "stopped".
+	uint64_t zones_ns;
+	//! One-shot: the bounds fell entirely outside every 3D zone.
+	bool zones_outside_logged;
 	/*! @} */
 
 	//! Guards @ref published / @ref published_valid and the content bounds.
@@ -210,8 +284,16 @@ void
 comp_rear_budget_arm(struct comp_rear_budget *b, bool transparent);
 
 /*!
- * XR_DXR_depth_budget v2: where this frame's content projects, canvas-
- * normalised with the origin top-left, as the app reported it on xrEndFrame.
+ * XR_DXR_depth_budget v2: where this frame's content projects, normalised to
+ * the app WINDOW'S CLIENT RECT with the origin top-left, as the app reported it
+ * on xrEndFrame.
+ *
+ * Window-normalised, never zone-normalised: a zoned app projects in the zone
+ * view, clamps to [0,1], and then rebases through its 3D zone rect
+ * (`dxr::RebaseZoneBoundsToWindow`). An app that skips the rebase reports a
+ * rect that can reach outside its zone, which is why
+ * @ref comp_rear_budget_set_zone_rects exists — the runtime clamps rather than
+ * trusting.
  *
  * Advisory and lossy on purpose. The runtime dilates the region before
  * measuring (the disparity conflict lives in the band around the silhouette,
@@ -223,7 +305,7 @@ comp_rear_budget_arm(struct comp_rear_budget *b, bool transparent);
  * Called from the APP thread while @ref comp_rear_budget_tick runs on the
  * render thread; the rect moves under the runner's own mutex.
  *
- * @param u0,v0,u1,v1 Canvas-normalised bounds. A non-positive extent (u1 <= u0
+ * @param u0,v0,u1,v1 Window-normalised bounds. A non-positive extent (u1 <= u0
  *                    or v1 <= v0) means "unknown" and selects the whole
  *                    preview - which is exactly v1's behaviour.
  * @param now_ns      Monotonic now, for the staleness rule.
@@ -237,6 +319,35 @@ comp_rear_budget_set_content_bounds(struct comp_rear_budget *b,
                                     float u1,
                                     float v1,
                                     uint64_t now_ns);
+
+/*!
+ * XR_DXR_depth_budget v2: THIS frame's 3D display zones (XR_DXR_display_zones),
+ * normalised to the same app-window client rect the content bounds are in.
+ *
+ * Called once per APP frame from the compositor's per-frame layer scan — the
+ * same scan that resolves `zones_frame` — so the ROI logic stays inside the
+ * runner and no backend grows its own copy of the clamp. Pass @p count 0 on a
+ * frame with no zones: an empty list means "the whole canvas is the 3D zone",
+ * which is the full-window app and is left exactly as v2 had it. Local2D zones
+ * are 2D bands and must NOT be in @p rects.
+ *
+ * Rects are validated and clamped to [0,1]; degenerate ones are dropped. More
+ * than @ref COMP_REAR_BUDGET_MAX_ZONES cannot arrive — the compositors' own
+ * gather loops stop at @ref XRT_MAX_LAYERS — but the excess is dropped WITH the
+ * whole clamp rather than clamping to a subset of the real zone union.
+ *
+ * @param rects  May be NULL when @p count is 0.
+ * @param now_ns Monotonic now; zones older than a second are treated as absent,
+ *               because an app that stopped chaining zones has a layout that
+ *               has since moved.
+ *
+ * @ingroup comp_util
+ */
+void
+comp_rear_budget_set_zone_rects(struct comp_rear_budget *b,
+                                const struct u_bg_rect_norm *rects,
+                                uint32_t count,
+                                uint64_t now_ns);
 
 /*!
  * True when the policy is armed for this session. A cheap gate the render
@@ -319,6 +430,18 @@ comp_rear_budget_debug_set_dump_sink(struct comp_rear_budget *b, comp_rear_budge
  */
 bool
 comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_roi *out_roi, bool *out_narrowed);
+
+/*!
+ * TEST ONLY — which rule produced the ROI the last analysis used.
+ *
+ * The clamp's failure paths are the point of it: "bounds fell entirely outside
+ * every 3D zone" and "bounds clamped INTO the zones" produce different regions
+ * for the same input and must be distinguishable from outside.
+ *
+ * @ingroup comp_util
+ */
+enum comp_rear_budget_roi_src
+comp_rear_budget_debug_last_roi_src(const struct comp_rear_budget *b);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.

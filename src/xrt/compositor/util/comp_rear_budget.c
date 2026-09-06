@@ -164,23 +164,50 @@ comp_rear_budget_clampf(float v, float lo, float hi)
 	return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
+const char *
+comp_rear_budget_roi_src_str(enum comp_rear_budget_roi_src src)
+{
+	switch (src) {
+	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS: return "app content bounds";
+	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES: return "app content bounds clamped to the 3D zones";
+	case COMP_REAR_BUDGET_ROI_SRC_ZONES: return "3D zone union";
+	case COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE: return "3D zone union (bounds fell outside)";
+	case COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW:
+	default: return "whole preview";
+	}
+}
+
 /*!
  * The ROI this frame's analysis should use, in preview pixels.
  *
- * Every failure path lands on the WHOLE preview — the v1 answer — and never on
- * "neutral". A region the runner could not derive is a question it did not
- * ask, not a background it measured and found quiet.
+ * Two authorities, in this order:
+ *
+ * 1. the app's content bounds, window-normalised (what it says it drew), and
+ * 2. this frame's 3D display zones (what the runtime WEAVES).
+ *
+ * The second is not advice, it is a fact of the frame — outside a 3D zone the
+ * app's content cannot occlude anything, so measuring the desktop there answers
+ * a question about pixels nobody will ever see through the lens. #1365: a zoned
+ * app whose bounds were still zone-normalised reported a rect reaching into a
+ * Local2D band, and the verdict was read off desktop behind that band.
+ *
+ * Every failure path lands on the WHOLE preview — the v1 answer — EXCEPT where
+ * the frame has 3D zones, where it lands on the zone union instead. Never on
+ * "neutral": a region the runner could not derive is a question it did not ask,
+ * not a background it measured and found quiet.
  */
 static void
 comp_rear_budget_derive_roi(struct comp_rear_budget *b,
                             const struct xrt_dp_background_preview *pv,
                             uint64_t now_ns,
                             struct u_bg_roi *out_roi,
-                            bool *out_narrowed)
+                            bool *out_narrowed,
+                            enum comp_rear_budget_roi_src *out_src)
 {
 	const struct u_bg_roi whole = {0, 0, pv->width, pv->height};
 	*out_roi = whole;
 	*out_narrowed = false;
+	*out_src = COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
 
 	// Probed once. An armed kill switch says so: an A/B whose two arms are
 	// indistinguishable in the log is not an A/B.
@@ -197,18 +224,132 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 		return;
 	}
 
+	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
+	uint32_t zone_count = 0;
+
 	os_mutex_lock(&b->publish_mutex);
 	const bool valid = b->bounds_valid;
 	const uint64_t age_ns = (now_ns > b->bounds_ns) ? (now_ns - b->bounds_ns) : 0;
 	const float u0 = b->bounds_u0, v0 = b->bounds_v0, u1 = b->bounds_u1, v1 = b->bounds_v1;
+	const uint64_t zones_age_ns = (now_ns > b->zones_ns) ? (now_ns - b->zones_ns) : 0;
+	if (b->zone_count > 0 && zones_age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS) {
+		zone_count = b->zone_count;
+		memcpy(zones, b->zones, sizeof(zones[0]) * (size_t)zone_count);
+	}
 	os_mutex_unlock(&b->publish_mutex);
 
-	if (!valid || age_ns > COMP_REAR_BUDGET_ROI_MAX_AGE_NS) {
+	const bool have_bounds = valid && age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS;
+	if (!have_bounds && zone_count == 0) {
 		return;
 	}
 
 	/*
-	 * Map canvas-normalised bounds into preview pixels. The preview covers
+	 * Resolve the region in WINDOW-NORMALISED space, before anything meets the
+	 * preview's pixel grid — the bounds and the zone rects are both in that
+	 * space, and intersecting them after the mapping would make the answer
+	 * depend on the preview's resolution.
+	 */
+	float ru0 = u0, rv0 = v0, ru1 = u1, rv1 = v1;
+
+	// The 3D zone union's bounding box. A union of rects is not a rect and the
+	// ROI is one, so what is carried forward is the box that contains them —
+	// the tightest rect that cannot exclude woven content.
+	float zu0 = 0.0f, zv0 = 0.0f, zu1 = 1.0f, zv1 = 1.0f;
+	if (zone_count > 0) {
+		zu0 = zones[0].u0;
+		zv0 = zones[0].v0;
+		zu1 = zones[0].u1;
+		zv1 = zones[0].v1;
+		for (uint32_t i = 1; i < zone_count; i++) {
+			if (zones[i].u0 < zu0) {
+				zu0 = zones[i].u0;
+			}
+			if (zones[i].v0 < zv0) {
+				zv0 = zones[i].v0;
+			}
+			if (zones[i].u1 > zu1) {
+				zu1 = zones[i].u1;
+			}
+			if (zones[i].v1 > zv1) {
+				zv1 = zones[i].v1;
+			}
+		}
+
+		if (!have_bounds) {
+			// Zones but no usable bounds. NOT the whole window: outside a 3D
+			// zone there is nothing to occlude, so the honest default region
+			// is what the frame actually weaves.
+			ru0 = zu0;
+			rv0 = zv0;
+			ru1 = zu1;
+			rv1 = zv1;
+			*out_src = COMP_REAR_BUDGET_ROI_SRC_ZONES;
+		} else {
+			// Intersect the bounds with EACH zone and take the box around what
+			// survives — per-zone, not against the union box, so a rect that
+			// only touches the gap between two zones is correctly empty.
+			bool any = false;
+			float iu0 = 0.0f, iv0 = 0.0f, iu1 = 0.0f, iv1 = 0.0f;
+			for (uint32_t i = 0; i < zone_count; i++) {
+				const float a0 = (ru0 > zones[i].u0) ? ru0 : zones[i].u0;
+				const float a1 = (ru1 < zones[i].u1) ? ru1 : zones[i].u1;
+				const float c0 = (rv0 > zones[i].v0) ? rv0 : zones[i].v0;
+				const float c1 = (rv1 < zones[i].v1) ? rv1 : zones[i].v1;
+				if (!(a1 > a0) || !(c1 > c0)) {
+					continue;
+				}
+				if (!any) {
+					iu0 = a0;
+					iv0 = c0;
+					iu1 = a1;
+					iv1 = c1;
+					any = true;
+					continue;
+				}
+				iu0 = (a0 < iu0) ? a0 : iu0;
+				iv0 = (c0 < iv0) ? c0 : iv0;
+				iu1 = (a1 > iu1) ? a1 : iu1;
+				iv1 = (c1 > iv1) ? c1 : iv1;
+			}
+
+			if (any) {
+				ru0 = iu0;
+				rv0 = iv0;
+				ru1 = iu1;
+				rv1 = iv1;
+				*out_src = COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES;
+			} else {
+				/*
+				 * The bounds live entirely outside every 3D zone. That is an
+				 * APP bug — almost always a zone-normalised projection chained
+				 * as window-normalised — and the region it names is unusable.
+				 * The zone union, never the whole window and never "neutral":
+				 * falling back to the window is exactly the failure this clamp
+				 * exists to stop, and neutral would open the budget over a
+				 * desktop nobody measured.
+				 */
+				ru0 = zu0;
+				rv0 = zv0;
+				ru1 = zu1;
+				rv1 = zv1;
+				*out_src = COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE;
+				if (!b->zones_outside_logged) {
+					b->zones_outside_logged = true;
+					U_LOG_W(
+					    "REAR_BUDGET: content bounds fall outside the 3D zones — check "
+					    "the app's zone→window rebase (bounds %.3f,%.3f..%.3f,%.3f vs "
+					    "zone union %.3f,%.3f..%.3f,%.3f); measuring the zones instead",
+					    (double)u0, (double)v0, (double)u1, (double)v1, (double)zu0,
+					    (double)zv0, (double)zu1, (double)zv1);
+				}
+			}
+		}
+	} else {
+		*out_src = COMP_REAR_BUDGET_ROI_SRC_BOUNDS;
+	}
+
+	/*
+	 * Map the resolved region into preview pixels. The preview covers
 	 * `canvas_u0..v1` OF THE CANVAS — normally 0,0,1,1, but a display
 	 * processor may include a margin. One that predates the field leaves it
 	 * zeroed, and that is the documented normal case rather than a degenerate
@@ -224,10 +365,10 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 
 	const float w_px = (float)pv->width;
 	const float h_px = (float)pv->height;
-	float x0 = (u0 - cu0) / (cu1 - cu0) * w_px;
-	float x1 = (u1 - cu0) / (cu1 - cu0) * w_px;
-	float y0 = (v0 - cv0) / (cv1 - cv0) * h_px;
-	float y1 = (v1 - cv0) / (cv1 - cv0) * h_px;
+	float x0 = (ru0 - cu0) / (cu1 - cu0) * w_px;
+	float x1 = (ru1 - cu0) / (cu1 - cu0) * w_px;
+	float y0 = (rv0 - cv0) / (cv1 - cv0) * h_px;
+	float y1 = (rv1 - cv0) / (cv1 - cv0) * h_px;
 
 	// Dilate BEFORE clamping, so a band that runs off the preview edge is
 	// clipped by the preview rather than by the arithmetic.
@@ -245,13 +386,47 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	y0 = comp_rear_budget_clampf(floorf(y0), 0.0f, h_px);
 	y1 = comp_rear_budget_clampf(ceilf(y1), 0.0f, h_px);
 
-	const struct u_bg_roi roi = {(uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
+	// The zone box in preview pixels, and the second half of the clamp: the
+	// dilation is a band around the silhouette, and a band is just as able to
+	// reach into a 2D strip as the bounds were. Applying the clamp only before
+	// dilation would leave an 8-px window on exactly the pixels #1365 is about.
+	float zx0 = 0.0f, zy0 = 0.0f, zx1 = w_px, zy1 = h_px;
+	if (zone_count > 0) {
+		zx0 = comp_rear_budget_clampf(floorf((zu0 - cu0) / (cu1 - cu0) * w_px), 0.0f, w_px);
+		zx1 = comp_rear_budget_clampf(ceilf((zu1 - cu0) / (cu1 - cu0) * w_px), 0.0f, w_px);
+		zy0 = comp_rear_budget_clampf(floorf((zv0 - cv0) / (cv1 - cv0) * h_px), 0.0f, h_px);
+		zy1 = comp_rear_budget_clampf(ceilf((zv1 - cv0) / (cv1 - cv0) * h_px), 0.0f, h_px);
 
-	// Degenerate after clamping — bounds that landed off the preview
-	// entirely. The whole preview, never a pass: a region too small to hold a
-	// measurement must not be able to open the budget.
+		x0 = (x0 > zx0) ? x0 : zx0;
+		y0 = (y0 > zy0) ? y0 : zy0;
+		x1 = (x1 < zx1) ? x1 : zx1;
+		y1 = (y1 < zy1) ? y1 : zy1;
+	}
+
+	struct u_bg_roi roi = {(uint32_t)x0, (uint32_t)y0, (uint32_t)((x1 > x0) ? (x1 - x0) : 0.0f),
+	                       (uint32_t)((y1 > y0) ? (y1 - y0) : 0.0f)};
+
+	/*
+	 * Degenerate after clamping — a region that landed off the preview
+	 * entirely. A region too small to hold a measurement must never be
+	 * measured: an empty ROI reads as neutral and would open the budget over a
+	 * desktop nobody looked at. Where the frame has zones the retry is the zone
+	 * box; only a frame with no zones at all falls back to the whole preview.
+	 */
 	if (roi.w < 2 || roi.h < 1) {
-		return;
+		if (zone_count == 0 || !(zx1 - zx0 >= 2.0f) || !(zy1 - zy0 >= 1.0f)) {
+			*out_src = COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
+			return;
+		}
+		roi.x = (uint32_t)zx0;
+		roi.y = (uint32_t)zy0;
+		roi.w = (uint32_t)(zx1 - zx0);
+		roi.h = (uint32_t)(zy1 - zy0);
+		// Keep the "bounds were outside" diagnosis if that is how we got here;
+		// otherwise the honest label is just "the zones".
+		if (*out_src != COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE) {
+			*out_src = COMP_REAR_BUDGET_ROI_SRC_ZONES;
+		}
 	}
 
 	*out_roi = roi;
@@ -279,6 +454,61 @@ comp_rear_budget_set_content_bounds(struct comp_rear_budget *b, float u0, float 
 	os_mutex_unlock(&b->publish_mutex);
 }
 
+void
+comp_rear_budget_set_zone_rects(struct comp_rear_budget *b,
+                                const struct u_bg_rect_norm *rects,
+                                uint32_t count,
+                                uint64_t now_ns)
+{
+	if (b == NULL || !b->initialised) {
+		return;
+	}
+	if (rects == NULL) {
+		count = 0;
+	}
+
+	/*
+	 * More zones than the runner can hold drops the CLAMP, not the tail: the
+	 * union of the first n is a subset of the real one, and clamping to a
+	 * subset would exclude content the app really drew. It cannot happen (the
+	 * compositors' gather loops stop at XRT_MAX_LAYERS, and so does this
+	 * array), which is precisely why the impossible case must not be the one
+	 * that quietly narrows the answer.
+	 */
+	if (count > COMP_REAR_BUDGET_MAX_ZONES) {
+		count = 0;
+	}
+
+	struct u_bg_rect_norm keep[COMP_REAR_BUDGET_MAX_ZONES];
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < count; i++) {
+		const float u0 = rects[i].u0, v0 = rects[i].v0, u1 = rects[i].u1, v1 = rects[i].v1;
+		if (!isfinite(u0) || !isfinite(v0) || !isfinite(u1) || !isfinite(v1)) {
+			continue;
+		}
+		const float cu0 = comp_rear_budget_clampf(u0, 0.0f, 1.0f);
+		const float cv0 = comp_rear_budget_clampf(v0, 0.0f, 1.0f);
+		const float cu1 = comp_rear_budget_clampf(u1, 0.0f, 1.0f);
+		const float cv1 = comp_rear_budget_clampf(v1, 0.0f, 1.0f);
+		if (!(cu1 > cu0) || !(cv1 > cv0)) {
+			continue; // a zone with no area weaves nothing
+		}
+		keep[kept].u0 = cu0;
+		keep[kept].v0 = cv0;
+		keep[kept].u1 = cu1;
+		keep[kept].v1 = cv1;
+		kept++;
+	}
+
+	os_mutex_lock(&b->publish_mutex);
+	b->zone_count = kept;
+	if (kept > 0) {
+		memcpy(b->zones, keep, sizeof(keep[0]) * (size_t)kept);
+	}
+	b->zones_ns = now_ns;
+	os_mutex_unlock(&b->publish_mutex);
+}
+
 bool
 comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_roi *out_roi, bool *out_narrowed)
 {
@@ -292,6 +522,15 @@ comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_ro
 		*out_narrowed = b->last_roi_narrowed;
 	}
 	return true;
+}
+
+enum comp_rear_budget_roi_src
+comp_rear_budget_debug_last_roi_src(const struct comp_rear_budget *b)
+{
+	if (b == NULL || !b->have_roi) {
+		return COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
+	}
+	return b->last_roi_src;
 }
 
 
@@ -437,7 +676,8 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 	if (polled && have_preview) {
 		struct u_bg_roi roi;
 		bool narrowed = false;
-		comp_rear_budget_derive_roi(b, pv, now_ns, &roi, &narrowed);
+		enum comp_rear_budget_roi_src src = COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
+		comp_rear_budget_derive_roi(b, pv, now_ns, &roi, &narrowed, &src);
 
 		/*
 		 * Two reasons to re-measure, and the second is what makes the ROI
@@ -462,6 +702,7 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		}
 		b->last_roi = roi;
 		b->last_roi_narrowed = narrowed;
+		b->last_roi_src = src;
 		b->have_roi = true;
 
 		if (gen_new) {
@@ -511,8 +752,7 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		// a canvas the content was nowhere near?
 		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u (%s)", b->policy.label[0] != '\0' ? b->policy.label : "session",
 		        b->last_roi.x, b->last_roi.y, b->last_roi.w, b->last_roi.h,
-		        !b->have_roi ? "no preview analysed"
-		                     : (b->last_roi_narrowed ? "app content bounds" : "whole preview"));
+		        !b->have_roi ? "no preview analysed" : comp_rear_budget_roi_src_str(b->last_roi_src));
 	}
 
 	if (b->dump == 1 && out.state != before) {

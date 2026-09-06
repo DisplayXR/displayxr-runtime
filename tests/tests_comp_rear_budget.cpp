@@ -131,11 +131,30 @@ roi_of(Runner &r, bool *out_narrowed = nullptr)
 	return roi;
 }
 
-//! Canvas-normalised content bounds, as xrEndFrame would forward them.
+//! Which rule produced the last ROI.
+comp_rear_budget_roi_src
+src_of(Runner &r)
+{
+	return comp_rear_budget_debug_last_roi_src(&r.b);
+}
+
+//! Window-normalised content bounds, as xrEndFrame would forward them.
 void
 bounds(Runner &r, float u0, float v0, float u1, float v1, uint64_t now_ns)
 {
 	comp_rear_budget_set_content_bounds(&r.b, u0, v0, u1, v1, now_ns);
+}
+
+/*!
+ * The frame's 3D display zones, window-normalised — what each compositor's
+ * per-frame layer scan publishes. An empty list is a frame with no zones, i.e.
+ * "the whole canvas is the 3D zone".
+ */
+void
+zones(Runner &r, const std::vector<u_bg_rect_norm> &rects, uint64_t now_ns)
+{
+	comp_rear_budget_set_zone_rects(&r.b, rects.empty() ? nullptr : rects.data(), (uint32_t)rects.size(),
+	                                now_ns);
 }
 
 u_rear_budget_out
@@ -688,5 +707,204 @@ TEST_CASE("comp_rear_budget: DXR_REAR_BUDGET_ROI=0 disables the narrowing")
 	CHECK(roi.w == 200);
 	CHECK(roi.h == 100);
 	CHECK_FALSE(narrowed);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * v2: clamping the ROI to the frame's 3D zones (#1365)
+ *
+ * The bounds contract is WINDOW-normalised, and a zoned app can get that wrong
+ * in a way no validation catches - a zone-normalised projection chained as
+ * window-normalised, or animation bounds projecting outside the frustum. The
+ * background preview covers the whole window, so the analysis then measures
+ * desktop behind a Local2D 2D band that 3D content never covers, and the
+ * verdict still reads authoritative. These pin the runtime's defence.
+ *
+ * Geometry shared by the cases below: a 200x100 preview over the whole canvas,
+ * one 3D zone occupying the LEFT HALF of the window (u 0..0.5 -> px 0..100),
+ * and the right half a 2D band.
+ * -----------------------------------------------------------------------------
+ */
+
+TEST_CASE("comp_rear_budget: bounds reaching past a 3D zone are clipped to it")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	// Content bounds that spill 0.3 of the window past the zone's right edge.
+	bounds(r, 0.3f, 0.2f, 0.8f, 0.8f, 0);
+	step(r, &neutral.pv, 0);
+
+	// Intersection is u 0.3..0.5 x v 0.2..0.8 -> px 60..100 x 20..80, dilated
+	// by 8 -> 52..108 x 12..88, and the zone box (px 0..100) is what stops the
+	// right edge at 100 - the dilation is clamped too, because a band is just
+	// as able to reach into the 2D strip as the bounds were.
+	bool narrowed = false;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.x == 52);
+	CHECK(roi.y == 12);
+	CHECK(roi.w == 100 - 52);
+	CHECK(roi.h == 88 - 12);
+	CHECK(narrowed);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+}
+
+TEST_CASE("comp_rear_budget: bounds entirely outside every 3D zone measure the zone union")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	// Squarely inside the 2D band - the app's zone->window rebase is missing.
+	bounds(r, 0.6f, 0.2f, 0.9f, 0.8f, 0);
+	step(r, &neutral.pv, 0);
+
+	// Never the whole window (that is the bug), never neutral (that would open
+	// the budget over a desktop nobody measured): the zone union itself.
+	bool narrowed = false;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.x == 0);
+	CHECK(roi.y == 0);
+	CHECK(roi.w == 100);
+	CHECK(roi.h == 100);
+	CHECK(narrowed);
+	// The branch that emits the one-shot "check the app's zone->window rebase"
+	// WARN. Re-deriving it must stay on the same branch - the log is one-shot,
+	// the clamp is not.
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE);
+
+	bounds(r, 0.6f, 0.2f, 0.9f, 0.8f, 100 * MS);
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 100 * MS);
+	run_for(r, &neutral.pv, 100 * MS, 200);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_ZONES_BOUNDS_OUTSIDE);
+	CHECK(roi_of(r).w == 100);
+}
+
+TEST_CASE("comp_rear_budget: a frame with no zones is unchanged v2 behaviour")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// The full-window apps (modelviewer, gauss): the whole canvas IS the 3D
+	// zone, so an empty zone list must clamp nothing at all.
+	zones(r, {}, 0);
+	bounds(r, 0.4f, 0.4f, 0.6f, 0.6f, 0);
+	step(r, &neutral.pv, 0);
+
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 72);
+	CHECK(roi.y == 32);
+	CHECK(roi.w == 56);
+	CHECK(roi.h == 36);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS);
+}
+
+TEST_CASE("comp_rear_budget: zones older than a second stop clamping")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+
+	// The app stopped chaining zones. A layout from a second ago describes a
+	// window that has since moved, so it is worse than no layout at all - and
+	// the bounds, which ARE fresh, are then trusted as they were in v2.
+	bounds(r, 0.6f, 0.2f, 0.9f, 0.8f, 2000 * MS);
+	step(r, &neutral.pv, 2000 * MS);
+
+	// px 120..180 x 20..80, dilated by 8, with no zone box to stop it.
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 112);
+	CHECK(roi.w == 188 - 112);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS);
+}
+
+TEST_CASE("comp_rear_budget: a busy 2D band under bounds spanning both bands stays open")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	// The Local2D band's desktop, text-like. Nothing the 3D content can ever
+	// occlude - it is not woven there.
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	// Bounds that span the 3D zone AND the 2D band, which is exactly what the
+	// zoned Unity app reported on the panel.
+	bounds(r, 0.3f, 0.1f, 0.9f, 0.9f, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x + roi.w <= 100); // the clamp excludes the patch entirely
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+
+	// Unclamped, this closed the budget on pixels behind the 2D band. That is
+	// the regression #1365 exists to remove.
+	const u_rear_budget_out out = read(r);
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+	CHECK(out.far_offset_vh > U_REAR_BUDGET_UNRESTRICTED_VH - 0.5f);
+}
+
+TEST_CASE("comp_rear_budget: zones with no usable bounds measure the zones, not the window")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// An app that chains zones but no content bounds. v2 measured the whole
+	// preview here; outside a 3D zone there is nothing to occlude, so the
+	// honest default region is what the frame actually weaves.
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.w == 100);
+	CHECK(roi.h == 100);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_ZONES);
+	CHECK(read(r).state == U_REAR_BUDGET_OPEN);
+}
+
+TEST_CASE("comp_rear_budget: two 3D zones clamp to the box around both")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// A zones app with a gap between its zones. The ROI is one rect, so what
+	// is carried forward is the box around the surviving intersections - the
+	// tightest rect that cannot exclude woven content.
+	zones(r, {{0.0f, 0.0f, 0.2f, 1.0f}, {0.6f, 0.0f, 0.8f, 1.0f}}, 0);
+	bounds(r, 0.1f, 0.2f, 0.7f, 0.8f, 0);
+	step(r, &neutral.pv, 0);
+
+	// Intersections: u 0.1..0.2 and u 0.6..0.7 -> box u 0.1..0.7 -> px 20..140,
+	// dilated to 12..148, then clamped by the zone box (px 0..160).
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 12);
+	CHECK(roi.w == 148 - 12);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+}
+
+TEST_CASE("comp_rear_budget: DXR_REAR_BUDGET_ROI=0 also disables the zone clamp")
+{
+	ScopedEnv off("DXR_REAR_BUDGET_ROI", "0");
+
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// The kill switch is the A/B's other arm, and an arm that still clamps is
+	// not the whole-preview arm it claims to be.
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	bounds(r, 0.3f, 0.1f, 0.9f, 0.9f, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW);
 	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
 }

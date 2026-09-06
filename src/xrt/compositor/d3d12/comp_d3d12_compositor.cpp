@@ -3665,6 +3665,62 @@ d3d12_rear_budget_tick(struct comp_d3d12_compositor *c)
 	comp_rear_budget_tick(&c->rear_budget, got ? &pv : nullptr, polled, c->transparent_background, now_ns);
 }
 
+/*!
+ * XR_DXR_depth_budget v2 — hand the runner THIS frame's 3D display zones so it
+ * can clamp the app's content-bounds ROI to them (#1365).
+ *
+ * Reads the SAME accumulator the wish raster and the masked composite read, so
+ * this is a second reader of the frame's zone authority and never a second
+ * channel. Only XRT_LAYER_ZONE_3D counts: a Local2D layer is a 2D band the DP
+ * never weaves, and measuring the desktop behind one is exactly the bug.
+ *
+ * Called once per APP frame from layer_commit, unconditionally: a frame with no
+ * zones must publish ZERO zones (the whole canvas is the 3D zone), not leave
+ * the previous frame's list standing.
+ *
+ * Caller holds c->mutex.
+ */
+static void
+d3d12_publish_rear_budget_zones(struct comp_d3d12_compositor *c)
+{
+	if (!comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+
+	// The client-window region the zone rects are expressed in — the same
+	// GetClientRect the composite derives its region from.
+	uint32_t win_w = 0, win_h = 0;
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	if (wnd != nullptr) {
+		RECT r;
+		if (GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+			win_w = (uint32_t)r.right;
+			win_h = (uint32_t)r.bottom;
+		}
+	}
+
+	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
+	uint32_t count = 0;
+	// No resolvable client rect ⟹ no window-normalised space to express the
+	// zones in, so publish none and leave the ROI exactly as v2 had it. A
+	// guessed denominator would clamp to the wrong strip of the window.
+	if (win_w > 0 && win_h > 0) {
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && count < COMP_REAR_BUDGET_MAX_ZONES; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			const struct xrt_rect r = c->layer_accum.layers[i].data.zone_3d.rect;
+			zones[count].u0 = (float)r.offset.w / (float)win_w;
+			zones[count].v0 = (float)r.offset.h / (float)win_h;
+			zones[count].u1 = (float)(r.offset.w + r.extent.w) / (float)win_w;
+			zones[count].v1 = (float)(r.offset.h + r.extent.h) / (float)win_h;
+			count++;
+		}
+	}
+
+	comp_rear_budget_set_zone_rects(&c->rear_budget, zones, count, os_monotonic_get_ns());
+}
+
 static xrt_result_t
 d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3D12Resource **out_back_buffer)
 {
@@ -4416,6 +4472,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->zones_frame = true;
 		}
 	}
+
+	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the
+	// frame's 3D zones, from the same scan. Unconditional — a frame with no
+	// zones publishes none, which is what "the whole canvas is the 3D zone"
+	// means to the runner.
+	d3d12_publish_rear_budget_zones(c);
 
 	// XR_DXR_display_zones hardware leg (P4). Zone-capable DP: the per-frame
 	// wish publish after each path's fence wait drives the per-region switch
