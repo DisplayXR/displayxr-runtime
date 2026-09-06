@@ -441,6 +441,35 @@ is a separate, earlier signal in `targets/openxr/target.c` that a sysprop cannot
 override back to native. Grammar is `u_sandbox_route_prop_selects()`, unit-tested
 host-side in `tests/tests_aux_route_policy.cpp`.
 
+#### Android weave-satellite properties (#1277) — sysprop-only, no `DXR_*` twin
+
+The Architecture-C weave satellite is driven entirely by `debug.dxr.*` with no
+environment-variable counterpart, for the same reason the routing properties
+above have none: an Android app is launched by the system, so nothing exports an
+env var into it. Until now **none of them appeared in this census at all**,
+which made the census wrong about its own promise (`the place you can look up
+*any* debug.dxr.* name`). All are read in
+`compositor/multi/comp_multi_weave_android.c` unless noted; all default to the
+pre-satellite behaviour when unset.
+
+| Property | Read site | Grammar | Default | Tier | What it does |
+|---|---|---|---|---|---|
+| `debug.dxr.weave_satellite` | `comp_multi_weave_android.c:626` | `1` = on; anything else off | off | 4 | Master gate for the whole satellite. The woven output is presented by the SERVICE on a full-panel `TYPE_APPLICATION_OVERLAY` instead of returned to the client, so the weave lands *after* the platform's window transform. **Read once per client and cached** (`sat_checked`/`sat_enabled`, `:621`) — changing it mid-run needs a client restart. Any bring-up failure latches `sat_failed` and falls back bit-for-bit |
+| `debug.dxr.satellite_scale` | `:639` | float, clamped `(0.05, 4.0]` | `1.0` | 4 | P0 diagnostic override of the global placement scale. **Demoted by P1** (`e777fc6b2`) to a diagnostic — the per-window derivation below is the real path. Set globally it mis-scales fullscreen windows |
+| `debug.dxr.satellite_miniwindow_scale` | `:881` **and** `:1211` | float `(0.05, 1.0]` | `0.67` | 4 | The per-device OEM mini-window leash factor the P1 hybrid-bounds tell selects once it has decided a window *is* container-scaled. `0.67` is field-measured on the reference tablet. **Parsed independently at two sites** (client scale, occluder-rect correction), each with its own `0.67f` default — collapse when next touched |
+| `debug.dxr.satellite_opaque` | `:708` | `1` = opaque | off (pre-multiplied alpha) | 4 | Forces `VK_COMPOSITE_ALPHA_OPAQUE_BIT` on the overlay swapchain. Diagnostic: the overlay is normally pre-multiplied so everything outside the woven rect is transparent and the desktop shows through |
+| `debug.dxr.satellite_shift_x` / `_y` | `:1447` / `:1451` | signed integer pixels | `0` | 4 | Phase meter. Nudges the blit destination by whole pixels. A left/right-asymmetric crosstalk that a ±1–3 px x-nudge cures **is** a sub-lens-pitch displacement, and the curing value measures it directly |
+| `debug.dxr.weave_idle_release_ms` | `compositor/multi/comp_multi_system.c:5901` | integer ms; `0` disables | `2000` | 3 | #1278. How long a weaving client may be idle before the runtime releases its lens vote (the OEM backlight service logs `Disable`) **and** clears the satellite overlay, so a stopped client's last woven frame is not left painted over whoever now owns the panel (`91f071770`). Re-read every ~256 ticks |
+| `debug.dxr.transparent` | `auxiliary/android/android_custom_surface.cpp:40`; also `compositor/multi/comp_multi_compositor.c:94`, `compositor/main/comp_target_swapchain.c:61`, `MonadoView.java` | `1` = translucent | off | 4 | Makes a runtime-created Android surface `PixelFormat.TRANSLUCENT`. Predates the satellite (#558 overlay mode) but applies to the satellite overlay too |
+
+**Not a property, and the single most important thing to set before any satellite
+run:** `settings put global maximum_obscuring_opacity_for_touch 1.0`. Android's
+anti-tapjacking clamp composites an overlay window at **α ≤ 0.80** (measured
+`alpha: 204` in the HWC layer list), blending 20 % of the under-content through
+the weave as per-eye crosstalk. Screenshots cannot see it — it is HWC-level
+blending. The shipping fix is a trusted-overlay or per-package exemption, filed
+as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
+
 ### Diagnostics / observers
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |

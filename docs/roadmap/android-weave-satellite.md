@@ -427,6 +427,248 @@ that order, because the manifest line is the one step that is a release in
 someone else's repo.
 
 
+## P2 implementation plan (2026-09-07)
+
+The section above is the *design*. This one is the executable plan: every touch
+point with a `file:line` anchor as of `dcd9c22e8`, an effort estimate per step,
+and the device ladder for whoever has the pad. **Nothing in it has run on
+hardware** — it was written with no device access, from the source and the
+shipped commits.
+
+Line anchors move. They are given so a reader can find the seam, not as a
+promise; re-grep the symbol if a number is off.
+
+**What landed with this plan** (and nothing else — no compositor code, no
+present-path change): `auxiliary/util/u_overlay_lease.{h,c}`, the lease's API
+surface with an always-grant default backend and the arbitration policy as a
+pure function, plus `tests/tests_aux_overlay_lease.cpp` which states #1376's
+acceptance cases as facts about that function. It has **no callers**; with no
+backend installed the mechanism grants every acquire, which is bit-for-bit the
+shipped one-client-per-process behaviour. That is step A2 (and A5) below,
+landed early because it is the only part of P2 that can be *proven* without a
+device — the same argument `tests/tests_aux_route_policy.cpp` was written on.
+
+### The as-built map both items attach to
+
+| Thing | Where |
+|---|---|
+| Satellite gate (`debug.dxr.weave_satellite`) | `comp_multi_weave_android.c:621` `weave_satellite_wanted()`, prop read `:626` |
+| Overlay surface bring-up (`SYSTEM_ALERT_WINDOW` → `android_custom_surface_async_start(..., span_system_bars=true)` → `VK_KHR_android_surface` swapchain) | `comp_multi_weave_android.c:891` `weave_satellite_ensure()`; surface at `:910`; `sat_failed` latch at `:1015` |
+| Satellite present (blit woven output → overlay at the physical rect, present) | `comp_multi_weave_android.c:1337` `weave_satellite_present()` |
+| Satellite clear (transparent-black repaint) | `comp_multi_weave_android.c:1239` `comp_multi_weave_android_satellite_clear()` |
+| P1 container-scale tell | `comp_multi_weave_android.c:846` `weave_satellite_effective_scale()`; prop `debug.dxr.satellite_miniwindow_scale` read at `:881` **and again at `:1211`**, both defaulting to `0.67f` |
+| Occlusion subtraction (a11y feed) | `comp_multi_weave_android.c:1039`–`:1145` |
+| Rotation (swapchain-only rebuild on out-vs-overlay orientation mismatch) | `comp_multi_weave_android.c:1358` |
+| The ONLY caller of the satellite today | `comp_multi_weave_android.c:2291`, inside `comp_multi_weave_submit()` (`:1635`), after the weave fence at `:2266` |
+| Satellite state (per-`multi_compositor`, **not** per-process) | `comp_multi_private.h:724`–`:746` (`sat_checked`/`sat_enabled`/`sat_failed`/`sat_csurface`/`sat_surface`/`sat_swapchain`/`sat_images[8]`/`sat_off_x,y`) |
+| The weave mutex the satellite runs under | `comp_multi_private.h:619`–`:620`; `weave_ensure_mutex()` `comp_multi_weave_android.c:131`. Held across the whole of `comp_multi_weave_submit()` (`:1676`–`:2308`), satellite present included |
+| The satellite swapchain's image usage | `comp_multi_weave_android.c:748` — **`VK_IMAGE_USAGE_TRANSFER_DST_BIT` only**. The overlay image can be blitted into and nothing else |
+| The satellite blit | `comp_multi_weave_android.c:1551` `vkCmdBlitImage`, `VK_FILTER_NEAREST`, no image view anywhere in the path |
+| `export_output` suppression while the satellite presents | `comp_multi_weave_android.c:2334`–`:2335` (`satellite_live` → report no output, so the caller's over-plane draws nothing) |
+| Weave-idle clear (#1278) that drives the satellite from the 20 Hz IPC loop | `comp_multi_system.c:5862` `android_window_transition_locked()`, clear call at `:5934`; external tick `multi_system_compositor_android_visibility_tick()` `:5957` |
+| **The APP-class per-session render** — the function P2(b) has to reach | `comp_multi_system.c:2770` `render_session_to_own_target()` |
+| …its atlas source (the composed image, **pre-DP**) | `comp_multi_system.c:3489`–`:3490` (`session_render.flip_sbs_image` / `flip_sbs_view`, declared `comp_multi_private.h:403`–`:408`, built by `ensure_session_atlas_image()` `comp_multi_system.c:1833`, called `:3232`) |
+| …its DP invocation | `comp_multi_system.c:3488`–`:3502` `xrt_display_processor_process_atlas()`, preceded by `set_target_color_view()` at `:3484`–`:3485` (the #510 M2 fix — a self-submitting DP needs it or the weave is skipped) |
+| …its destination | `ct->images[buffer_index]`, i.e. the **client's own** `ANativeWindow` swapchain, inside the scaled container |
+| …its submit + present | `comp_multi_system.c:3588` (`vkQueueSubmit` under `vk_queue_lock`), `:3640` `comp_target_present()` |
+| …the loop that drives it | `comp_multi_system.c:5970` `multi_main_loop()` → `:6075` → `render_per_session_clients_locked()` `:5349`, per-client call at `:5424` |
+| The window rect the destination must be derived from | `comp_multi_system.c:2722` `update_window_screen_rect()` (called at `:3379`) → `android_globals_get_window_screen_rect()` (`android_globals.h:242`, impl `android_globals.cpp:289`) → `session_render.window_screen_{x,y,w,h,disp_w,disp_h}` + `window_rect_generation` (`comp_multi_private.h:487`–`:495`) |
+| The in-process scaled degrade that already ships (tile-0 collapse + lens release) | `comp_vk_native_compositor.c:3412` `vk_android_update_container_scaled()`, applied at `:3476` and `:5676` — commit `736db35de`, whose own message says *"Only the in-process VK path is touched; the out-of-process satellite has the same exposure and is not covered here."* |
+| Routing policy (already landed, never run on a device) | `u_sandbox.c:55` `u_sandbox_route_prop_selects()`, read sites `:292`/`:306`/`:317`; host tests `tests/tests_aux_route_policy.cpp` |
+
+Two facts from that map shape everything below:
+
+1. **The satellite is per-client state on a panel-global resource.** `sat_*`
+   lives on `multi_compositor`, but the overlay it drives is one physical
+   surface. In the shipped topology that is safe only because ADR-036 gives each
+   client its own *process* — `android_globals.h:214`–`:217` says so in as many
+   words ("Process-local and NOT keyed by client: one satellite compositor
+   process serves exactly one client… If a process ever hosts several clients
+   this must become per-client state"). #1376 is the arbiter that assumption has
+   been standing in for.
+2. **There is no focus authority on Android.** `focused_slot` is a
+   Windows/D3D11 concept (`comp_d3d11_service.h:779`); the IPC layer's
+   `active_client_index` (`ipc_server.h:459`) is degenerate under one client per
+   satellite. #1376's tie-break *cannot be written today* without first choosing
+   a focus signal — see A1.
+3. **There is no per-client `ANativeWindow` on Android either.** An APP-class
+   client's `comp_target` is created handle-free —
+   `multi_compositor_init_session_render()` `comp_multi_compositor.c:1755`
+   passes a NULL handle to `comp_target_service_create()`, which lands in
+   `null_target_service_create_from_window_android()`
+   (`null_compositor.c:772`, wired `:971`) → `comp_window_android_create()`,
+   whose swapchain pulls the window from the **process-global**
+   `android_globals_acquire_window()` (`comp_window_android.c:146`). The window
+   rect is a process global too (`android_globals.cpp:255`–`:264`). Both are
+   correct only because ADR-036 gives each client its own process. Nothing in
+   this plan may assume a second client in the same process; two would overwrite
+   each other's window *and* rect. (Nothing branches on `client_class` anywhere
+   in these paths — the real split is `multi_compositor_has_session_render()`
+   `comp_multi_private.h:1156` versus the weave entry points.)
+
+**And one stale belief to retire before it costs someone an afternoon:** there
+is **no #868 repaint disarm on Android**. `#868` is exclusively the
+Windows/D3D11 late-weave repaint machinery
+(`comp_weave_latency_win.h`, `comp_d3d11_target.cpp`, `queue_lock_layer.c`);
+`grep -rn 868 src/xrt/compositor/multi/` finds nothing. The Android locking
+story is two locks and no repaint arbiter: `mc->weave.mutex` and
+`vk_queue_lock(vk->main_queue)`.
+
+---
+
+### (b) #1377 — satellite present for APP-class sessions
+
+**The shape.** Do not blit the client's woven surface onto the overlay: under a
+0.677 container the client's surface is woven at *logical* size, and rescaling a
+woven image is the exact bug the satellite exists to avoid. Instead do what the
+weave path already does — `weave_satellite_present()` comments it at
+`comp_multi_weave_android.c:1470`: *"Physical-rect mode weaves at win*scale
+already, so the output IS the on-panel size: present 1:1."* So the session's DP
+must **run at the physical rect** into a runtime-owned image, and that image is
+blitted 1:1.
+
+```
+app (unmodified, _hosted, routed by debug.dxr.force_ipc)
+  └─ layers ─IPC─▶ multi_compositor
+                     ├─ per-tile blit ──▶ flip_sbs atlas   (composed, PRE-DP)  ← the source
+                     ├─ process_atlas ──▶ sat_out_image  (PHYSICAL w×h)        ← new destination
+                     │                     └─ weave_satellite_present() 1:1 ──▶ overlay ──▶ panel
+                     └─ tile-0 mono ────▶ ct->images[i]  (the app's own surface, LOGICAL)
+                                            └─ placement + input anchor, and the
+                                               picture that shows through the 0.80
+                                               obscuring-opacity clamp
+```
+
+**Answering the acceptance question directly** — *"the app's own surface shows…
+what?"* — **correct mono 2D**, not black and not a second woven copy. Three
+reasons, in order of force:
+
+1. Android's anti-tapjacking clamp composites the overlay at **α = 0.80** on a
+   stock device (field-measured `alpha: 204`, `oem-android-platform-requirements.md`
+   §R6). 20 % of whatever is underneath blends *through* the weave. Black would
+   darken it; a woven copy would double-weave it into per-eye crosstalk — that
+   crosstalk was the decisive P0 bring-up bug. Mono 2D is the only under-content
+   that degrades gracefully.
+2. It is the picture the moment `sat_failed` latches, so there is no black gap
+   on fallback.
+3. It keeps the window a live placement + input anchor, which is the whole
+   Architecture-A-clean promise.
+
+That is also why **B0 is a prerequisite, not an optional extra**: producing that
+mono 2D on the OOP path is precisely the port of `736db35de`.
+
+| # | Step | Anchors | Effort |
+|---|---|---|---|
+| **B0** | **Port the container-scaled degrade to the OOP per-session path.** `736db35de` shipped it only in `comp_vk_native`; `render_session_to_own_target()` has the same exposure and none of the fix. Same tell (window rect exceeds panel), same three effects: collapse the effective layout to tile 0, request hardware 2D + `on_pause` the session DP's lens preference, force zero-copy off. Lands standalone, testable with `weave_satellite=0`, and is *also* B5. | `comp_multi_system.c:2722` (tell input), `:2770`+ (apply); model `comp_vk_native_compositor.c:3412`, `:3476`, `:5676` | **2 d** |
+| **B1** | **Make `weave_satellite_present()` source-agnostic.** It reads `mc->weave.{out_image,out_w,out_h,win_*,have_geometry}` today. Introduce `struct weave_satellite_frame {VkImage src; VkImageLayout src_layout; uint32_t src_w, src_h; int32_t win_x, win_y; uint32_t win_w, win_h; bool have_geometry;}` and pass it in; the weave-submit call site fills it from `mc->weave.*`. Pure refactor — byte-identical behaviour, reviewable on its own. Keep `sat_*` exactly where it is. **Fix the latent layout bug while here** (see the risk table): the present's `out_to_src` barrier declares `oldLayout = COLOR_ATTACHMENT_OPTIMAL` at `:1414`, but the weave submit's final `out_to_general` barrier at `:2237`–`:2246` leaves the image in `VK_IMAGE_LAYOUT_GENERAL` before the fence wait. Carrying the layout in the struct makes the mismatch impossible to reintroduce. Also re-shape `weave_satellite_effective_scale()`'s "must be called under `weave.mutex`" contract into the doc comment. | `comp_multi_weave_android.c:1337` (signature), `:1414`, `:2237`, `:2291` (existing caller), `:1239` (clear stays as-is) | **1 d** |
+| **B2** | **One physical-rect derivation, two callers.** Re-shape `weave_satellite_effective_scale()` to take `(win_x, win_y, win_w, win_h)` rather than reading `mc->weave.*`, and collapse the **duplicated** `debug.dxr.satellite_miniwindow_scale` parse (`:881` and `:1211`, both defaulting `0.67f` independently) into one. Add `session_satellite_rect(mc, *x,*y,*w,*h)` reading `session_render.window_screen_*`. | `comp_multi_weave_android.c:846`, `:881`, `:1211`; `comp_multi_private.h:487`–`:496` | **1 d** |
+| **B3** | **Per-session satellite output image** at **exactly** the physical size, `COLOR_ATTACHMENT | TRANSFER_SRC`, plus its render pass/framebuffer; rebuilt when the physical rect changes (rect generation is already tracked). Mirror `weave_create_output()`. Two reasons the intermediate is not optional: the overlay swapchain is created with **`VK_IMAGE_USAGE_TRANSFER_DST_BIT` only** (`comp_multi_weave_android.c:748`), so a DP can never render into it directly; and the present is a `vkCmdBlitImage` with **`VK_FILTER_NEAREST`** (`:1551`), so any size mismatch is a nearest-neighbour resample of a woven image — the exact failure the satellite exists to prevent. The Android DP is self-submitting (Leia CNSDK), so it also needs `set_target_color_view(dp, sat_out_view)` — omit it and the weave is silently skipped every frame (the #510 M2 failure mode). | new fields beside `comp_multi_private.h:403`–`:408`; model `comp_multi_weave_android.c:349` `weave_create_output()`; usage `:748`; blit `:1551`; view call `comp_multi_system.c:3484` | **2 d** |
+| **B4** | **Divert `process_atlas` when the lease is held.** At the call site pass `framebuffer = sat_out_fb`, target image `sat_out_image`, `framebufferWidth/Height = phys_w/phys_h`, `canvas = 0,0,phys_w,phys_h`. **The atlas source is unchanged** — `flip_sbs_image`/`flip_sbs_view`, the composed image pre-DP, exactly as the design says. Note that this is the *content* being downscaled (logical view dims → physical destination), which is legitimate; it is only the *woven* result that must never be resampled. | `comp_multi_system.c:3484`–`:3502` | **2 d** |
+| **B5** | **Client surface = tile-0 mono, same frame** (B0's machinery, now driven by "the satellite has this session" rather than by "scaled"). | `comp_multi_system.c` `submit_and_present:` block, `:3520`+ | **1 d** |
+| **B6** | **Call the satellite.** After the session render's submit + fence, under `mc->weave.mutex`, call `weave_satellite_present(vk, mc, &frame, 1, &rect)`. The satellite takes `vk_queue_lock` for its own submit (`comp_multi_weave_android.c:1598`, `:1623`); the session path already does the same at `:3588`. **Ordering rules to write down, both already true and both easy to break:** (i) never take `list_and_timing_lock` inside `weave.mutex` — the #1278 comment states it at `comp_multi_system.c:5919`–`:5922`; (ii) `render_per_session_clients_locked()` runs **holding `list_and_timing_lock`** (`comp_multi_system.c:6067`–`:6076`). Taking `weave.mutex` inside it is fine — that is already the established order, proven by the #1278 pass at `:5927`, which does exactly this. What is **not** fine is calling `weave_ensure_mutex()` there: it re-locks the already-held, non-recursive `list_and_timing_lock` (`comp_multi_weave_android.c:132`). **That is a self-deadlock, not a style note.** Ensure the weave mutex at session-render init instead. | `comp_multi_system.c:3588`–`:3640`, `:6075`; `comp_multi_weave_android.c:131`, `:1598` | **1.5 d** |
+| **B7** | **Gate + fallback.** `session_satellite_wanted(mc)` = `weave_satellite_wanted(mc)` **AND** `window_rect_generation != 0` **AND** `android_overlay_lease_held()` (#1376; the no-op default always grants, so B can be brought up before A lands). Any failure path already latches `sat_failed` and the next frame renders straight to `ct` — that is the fallback, unchanged. | `comp_multi_weave_android.c:621`, `:1015` | **0.5 d** |
+| **B8** | **Idle + lifecycle parity.** `mc->weave.last_submit_ns` is stamped only by the weave submit (`:2274`). Stamp it from the session path too, so the #1278 pass clears the overlay when an APP-class client stops rendering, on resume, and on exit. Rotation needs nothing new: the orientation-mismatch rebuild keys off the source dims, which now follow the window. | `comp_multi_weave_android.c:2274`; `comp_multi_system.c:5926`–`:5936` | **1 d** |
+
+**Total ≈ 12 engineer-days** of implementation, plus device bring-up. On the
+P0 evidence, budget device bring-up at roughly the implementation again: P0's
+own delta was "one blit" and it still cost an overnight session of
+phase-beat, backdrop, `IN_USE`, and α = 0.80 discoveries.
+
+**Deliberately out of scope, recorded so it is a decision and not an oversight:**
+the post-weave 2D chrome — LOCAL_2D layers (`comp_multi_system.c:3497`), the HUD,
+the workspace chrome pill, the taskbar overlays and cursor (`:3520`–`:3535`) —
+stays on the client's own target and is **not** promoted onto the overlay. It is
+flat 2D by construction; putting it on an unscaled full-panel surface while the
+window is scaled would place it wrong. It therefore renders at container scale.
+Acceptable now, revisit under C-single.
+
+#### Risks (b)
+
+| Risk | Why it bites | Mitigation |
+|---|---|---|
+| **Hot-path Vulkan under the weave mutex** | The satellite present acquires a swapchain image with a 100 ms timeout (`:1372`) and submits, all inside `mc->weave.mutex`. On the weave path that mutex is held by a *client's* synchronous IPC call; on the session path it will be held by the **service render thread**, which also drives every other client. A wedged overlay acquire stalls the panel, not one app. | Keep the 100 ms bound, and treat a timeout as "skip this frame, present the client's own target", never as a retry-in-place. Do not add work inside the mutex beyond what B1 moves there. |
+| **Lens arbitration between the APP-class client and the satellite** | Two DPs now exist per client: `session_render.display_processor` (weaving into `sat_out_image`) and `mc->weave.dp` (the weave-submit path's, which the #1278 idle release pokes directly at `comp_multi_system.c:5927`). An APP-class session has no `mc->weave.dp`. The idle clear must not dereference it. | `comp_multi_weave_android_satellite_clear()` is already `dp`-free; the surrounding #1278 block guards on `mc->weave.dp != NULL` for the `on_pause` but calls `satellite_clear()` inside that same guard — **that guard must be relaxed** for APP-class, or the overlay never clears for a demo. This is a real, specific bug the plan would otherwise ship. |
+| **The 0.80 obscuring-opacity clamp** | The overlay is `TYPE_APPLICATION_OVERLAY` + `FLAG_NOT_TOUCHABLE` (`android_custom_surface.cpp:191`, `:201`) — untouchable, which is what makes input passthrough free. Nothing in the runtime keeps it at full opacity: the OS clamps *any* obscuring overlay to `maximum_obscuring_opacity_for_touch`, default **0.8**, measured as `alpha: 204` in the HWC layer list. | Dev: `settings put global maximum_obscuring_opacity_for_touch 1.0` before **every** device run — without it the result is a 20 % ghost that reads as a weave bug. Ship: trusted-overlay or a per-package exemption, already filed as `oem-android-platform-requirements.md` §R6. **Screenshots cannot see this** — it is HWC-level blending; dump the layer list. |
+| **B0 changes the `weave_satellite=0` baseline** | #1377 test 11 expects "today's behaviour exactly (2D-correct, scaled double image)". After B0, `weave_satellite=0` in a mini-window shows *correct 2D* instead. That is better, but it is a change. | Land B0 first, on its own, and re-baseline test 11 to "correct 2D, no double image" explicitly. |
+| **Latent layout-declaration mismatch on the source image** | `weave_satellite_present()`'s `out_to_src` barrier declares `oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL` (`comp_multi_weave_android.c:1414`), but the weave submit's own final barrier leaves `out_image` in `VK_IMAGE_LAYOUT_GENERAL` (`:2237`–`:2246`) before the fence wait. It works today because the driver tolerates it; a validation-layer build or a stricter driver will not, and B4 adds a *second* producer with a *third* layout. | B1 carries the layout in the frame struct. Fix it in the refactor, not later. |
+| **Prop is read once per client and cached** | `weave_satellite_wanted()` latches `sat_checked`/`sat_enabled` on first call (`comp_multi_weave_android.c:621`–`:634`). `setprop debug.dxr.weave_satellite 1` mid-run does nothing for a client that already asked. | Every ladder rung that flips the prop must restart the client (and, for a satellite slot, let the slot process exit — `SATELLITE_EXIT_GRACE_MS` is 3 s, `MonadoService.kt:260`). |
+| **The rect is the app's, and an off-panel drag trips the tell** | The P1 tell is "bounds exceed the panel", which an unscaled window dragged off-edge also satisfies. `736db35de` accepts the same false positive. | Unchanged direction of failure: costs 2D content, never a broken weave. Not reachable on this OEM (mini windows are clamped in-panel). |
+
+---
+
+### (a) #1376 — the overlay ownership lease
+
+**The structural blocker found while planning this:** the slot broker is
+**Java-only and unreachable from native code.** `grep -rn SlotBroker` over
+`*.c/*.cpp/*.h/*.hpp` returns zero hits; `ISlotBroker.aidl` has exactly three
+transactions (`acquireSlot` `:48`, `releaseSlot` `:51`, `getSlotCount` `:54`) and
+**no callback interface**, so the broker cannot revoke anything from a holder
+today. A slot record is `Owner(pkg, pid, tokens)` (`SlotBroker.kt:33`–`:34`) —
+there is nowhere to hang "holds the overlay". The lease is therefore not a
+policy tweak on an existing channel; the channel does not exist.
+
+| # | Step | Anchors | Effort |
+|---|---|---|---|
+| **A1** | **Choose the focus signal** (design, must be first). There is none on Android (see the map above). The cheapest honest source is the one already crossing processes for free: `WindowWatcherService` serialises the a11y window list into `files/dxr_occlusion.bin` and the satellite reads it with no IPC at all. `AccessibilityWindowInfo` carries `isFocused()`/`isActive()` and the owning package. Extend that record by one bool + a package string rather than inventing a second focus authority — ADR-035 D2 is explicit that there is one. **Caveat that must be stated in the design, not discovered on device:** the watcher is **OFF by default** and is killed by `am force-stop` on the runtime package, re-binding only on a settings retoggle. With no watcher there is no focus, so the tie-break degenerates to "incumbent keeps it". | `comp_multi_weave_android.c:1039`–`:1106`; `comp_d3d11_service.h:779` (the Windows precedent); `ipc_server.h:459` | **0.5 d** |
+| **A2** | **The native lease façade** — `auxiliary/android/android_overlay_lease.{h,c}`: `acquire(tag, slot, container_scaled, focused)`, `release(slot)` (synchronous), `held(slot)`, `set_revoke_cb(cb, data)`. **Default backend = always-grant**, so with one client the behaviour is bit-for-bit today's. **LANDED** (`u_overlay_lease.{h,c}`), no callers. | `auxiliary/util/u_overlay_lease.h`; to be consumed at `comp_multi_weave_android.c:621` and by B7 | **done** |
+| **A3** | **The binder backend.** `ISlotBroker.aidl` grows `boolean acquireOverlayLease(int slot, IBinder token, int flags)` / `void releaseOverlayLease(int slot, IBinder token)`; a new one-way `IOverlayLeaseCallback.aidl` gives the broker the revoke path it does not have. `SlotBroker.Owner` grows `holdsOverlay`. Native reaches it through `MonadoImpl` — the only existing Java↔native service seam — mirroring `nativeWindowScreenRect` in the opposite direction. **Hard rule: no binder round-trip on the weave hot path or inside `weave.mutex`.** Acquire/release fire on transitions only; the per-frame read is a process-local atomic the revoke callback updates. | `ISlotBroker.aidl:48`,`:51`,`:54`; `SlotBroker.kt:33`,`:43`,`:102`,`:115`; `MonadoImpl.java:284`–`:368`; `service_target.cpp:325` (the pattern) | **3 d** |
+| **A4** | **Synchronous clear on release.** Release calls `comp_multi_weave_android_satellite_clear()` **and waits for its present to retire** before the binder release returns. This is the `91f071770` bug's structural fix. The incoming holder's `weave_satellite_ensure()` already tolerates a lingering `BufferQueue` connection with a bounded `VK_ERROR_NATIVE_WINDOW_IN_USE` retry (120 frames), so a slow hand-off degrades to a few dropped frames rather than a latch. | `comp_multi_weave_android.c:1239`, `:930`–`:940` | **0.5 d** |
+| **A5** | **The arbitration predicate, as a pure function.** `overlay_lease_winner(const struct lease_candidate *, size_t n, const char *focused_pkg) -> ssize_t`. Rules: a scaled container beats an unscaled one; among scaled, focus wins; on a tie the **incumbent keeps it** (anti-thrash — the loser's degradation is a double image, so trading the lease every few frames is worse than either steady state). Host-tested exactly like `u_sandbox_route_prop_selects` — that precedent exists specifically because Android policy decisions are pure string/number comparisons that must not need a device to be right. **LANDED** as `u_overlay_lease_select()` + `tests/tests_aux_overlay_lease.cpp` (9 cases, 54 assertions), including the one that guards P0: a lone unscaled client still takes the overlay. | `u_overlay_lease.c`; `tests/tests_aux_overlay_lease.cpp` | **done** |
+| **A6** | **Diagnostics.** One WARN per lease transition naming winner, loser and reason; the loser's degradation logged as a stated outcome, never silent (the design says so; make it a line of code). Surface in the #558-adjacent diag dashboard. | `comp_multi_weave_android.c` | **0.5 d** |
+
+**Total ≈ 6.5 engineer-days**, of which **A2 and A5 are done** (≈ 2 d) and **A3 is the only genuinely new plumbing**. Remaining ≈ 4.5 d.
+
+#### Risks (a)
+
+| Risk | Why it bites | Mitigation |
+|---|---|---|
+| **A binder call on the weave path** | The lease lives in another process. A naive `held()` implementation is a synchronous binder transaction inside the per-frame weave, under `weave.mutex`, with the panel behind it. | A3's rule: transitions only, atomic read per frame, revoke pushed not polled. Make this a review gate, not a comment. |
+| **Focus does not exist yet** | A1 is a dependency, not a detail. Building A5's tie-break before A1 means unit-testing a predicate against an input nothing produces. | Land A1's feed extension first; A5's predicate takes `focused_pkg` as an argument precisely so it is testable before the feed ships. |
+| **Watcher-off is the default state** | The a11y watcher is OFF by default and dies on `am force-stop`. Every ladder step below therefore has a "did you retoggle `enabled_accessibility_services`?" precondition. | State it in the ladder (it is). Design the no-focus path — incumbent keeps it — as the *specified* behaviour, not an accident. |
+| **Four slots, then nothing** | ADR-036 D3 pre-declares `:dxr0..3`. The fifth client shares the main-process service, and that path has never been run with the satellite at all. | #1376 test 6 is exactly this. Worst acceptable outcome: the fifth client does not get the overlay and does not corrupt it for the other four. |
+| **Two overlay creators already exist** | `service_target.cpp:234` (the #558 service overlay, `span_system_bars=false`) and `comp_multi_weave_android.c:910` (the satellite, `span_system_bars=true`) both call `android_custom_surface_async_start`, and stash the handle in *different* places — a process-global vs per-`multi_compositor`. Today they never collide only because they never run in the same process. | The lease must arbitrate the *panel*, not the process. Note it explicitly in A2's contract; C-single removes the second creator entirely. |
+
+---
+
+### Ordered device-validation ladder (NP02J)
+
+Preconditions for **every** rung:
+
+```bash
+adb shell settings put global maximum_obscuring_opacity_for_touch 1.0   # else a 20% ghost reads as a weave bug
+adb shell settings get secure enabled_accessibility_services            # WindowWatcher must be on; retoggle after any force-stop
+adb shell wm fixed-to-user-rotation enabled                             # tablet launches must be landscape; gate on measured rotation=1
+```
+
+And two traps that will otherwise be rediscovered on every rung:
+
+- **`debug.dxr.weave_satellite` is latched per client on first use**
+  (`comp_multi_weave_android.c:621`). Flipping it mid-run does nothing — restart
+  the client, and give a satellite slot process its 3 s exit grace
+  (`MonadoService.kt:260`) before relaunching.
+- **`am force-stop` on the runtime package kills the a11y window watcher**, and
+  Android only rebinds it on a settings retoggle. Occlusion (and, after A1,
+  focus) silently reverts to "none" until you retoggle
+  `enabled_accessibility_services`. The failure is a *missing* clip, not an
+  error.
+
+| Rung | What | Gate |
+|---|---|---|
+| **0** | **The routing policy that already landed and has never run.** #1377 Stage 0 tests 1–6 (`debug.dxr.force_ipc <pkg>` targets ONE app; `1` still device-wide; `pkg*` prefixes; empty/bogus route nothing; `XRT_FORCE_MODE=native` wins; a `<pkg>:dxrN` slot matches its package). Costs nothing, blocks everything. | modelviewer logs `Hybrid mode: using IPC/service compositor`; every other app still logs `using in-process native compositor` |
+| **1** | **Single-client satellite regression on current `main`.** Browser + `weave_satellite=1`, P0 tests 1–4. Establishes that the baseline this plan modifies still passes before anything is modified. | golden parity fullscreen; "crisp 3D" in the mini-window; `=0` bit-for-bit |
+| **2** | **B0 alone** (`weave_satellite=0`, modelviewer via `force_ipc`). OOP port of the scaled degrade. | mini-window shows **correct 2D**, no double image; `HW_DBG_CNSDK: lens preference RELEASED`; unscaled control (`am task resize`) resumes weaving |
+| **3** | **B1–B8, single client.** #1377 tests 7–9: modelviewer fullscreen at parity with its in-process golden; **modelviewer in the OEM mini-window crisp 3D** (the acceptance case); touch/drag reach the app through the overlay and the weave tracks the drag. | the app's own surface shows mono 2D under the overlay throughout |
+| **4** | **Lifecycle**, #1377 test 10: rotation both directions, background/resume, app exit. | no stale overlay rect; overlay clears within the #1278 2 s idle window |
+| **5** | **Re-baselined test 11:** `weave_satellite=0` with the app still routed to IPC → rung 2's picture (correct 2D), not a regression. | — |
+| **6** | **#1376 with two clients.** Only now is the lease testable. #1376 tests 1–5: mixed pair (browser fullscreen unscaled + a demo in the mini-window) **both crisp simultaneously**; two scaled → focused one crisp; 20× hand-off with no frozen rect and no `IN_USE` storm; `am force-stop` the leaseholder → overlay clears and the lease moves within 2 s; lens refcount ORs (no `Disable` while either weaves, exactly one on the last exit). | — |
+| **7** | **#1376 test 6** — five clients, slot exhaustion. The fifth must not corrupt the overlay for the other four. | — |
+| **8** | **#1377 test 12** — repeat rungs 3–5 for gaussiansplat, mediaplayer, earthview. | — |
+| **9** | **Only then**, the manifest line (`com.displayxr.force_ipc`) into each demo repo. It is a release in someone else's repo; do it once the picture is signed off, never before. | — |
+
+Rungs 0–2 need no new runtime code beyond B0 and are the highest
+information-per-hour on the ladder: rung 0 validates a merged, unexercised
+policy change, and rung 2 closes a gap `736db35de` explicitly left open.
+
 ## Risks / open questions
 
 - Does the OEM allow a `TYPE_APPLICATION_OVERLAY` surface to cover a freeform
