@@ -42,6 +42,20 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
                         const struct u_bg_neutrality_params *p,
                         struct u_bg_neutrality_result *out)
 {
+	return u_bg_neutrality_analyse_masked(bgra, w, h, stride, roi, NULL, 0, p, out);
+}
+
+bool
+u_bg_neutrality_analyse_masked(const uint8_t *bgra,
+                               uint32_t w,
+                               uint32_t h,
+                               uint32_t stride,
+                               const struct u_bg_roi *roi,
+                               const uint8_t *mask,
+                               uint32_t mask_stride,
+                               const struct u_bg_neutrality_params *p,
+                               struct u_bg_neutrality_result *out)
+{
 	if (out == NULL) {
 		return false;
 	}
@@ -66,6 +80,18 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
 		return false;
 	}
 
+	// The mask lives in the SAME grid as the pixels, so it is indexed by
+	// absolute coordinates and a too-narrow pitch is a caller bug, never a
+	// reason to measure the wrong bytes.
+	if (mask != NULL) {
+		if (mask_stride == 0) {
+			mask_stride = w;
+		}
+		if (mask_stride < w) {
+			return false;
+		}
+	}
+
 	struct u_bg_neutrality_params params;
 	if (p != NULL) {
 		params = *p;
@@ -82,12 +108,14 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
 		params.max_column_density = 0.20f;
 	}
 
-	// One difference sample per adjacent column pair, per row.
+	// One difference sample per adjacent column pair, per row — but under a
+	// mask only where BOTH pixels of the pair are selected, so the count is
+	// accumulated rather than assumed.
 	const uint32_t sample_cols = r.w - 1u;
-	const uint64_t total_samples = (uint64_t)sample_cols * (uint64_t)r.h;
+	uint64_t total_samples = 0;
 
 	uint64_t edge_samples = 0;
-	uint32_t max_col_edges = 0;
+	float max_col_density = 0.0f;
 
 	// Column-major accumulation would thrash the cache; walk rows and keep a
 	// per-column running count in the caller-free way: a single pass with a
@@ -97,8 +125,21 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
 	for (uint32_t cx = 0; cx < sample_cols; cx++) {
 		const uint32_t x = r.x + cx;
 		uint32_t col_edges = 0;
+		uint32_t col_pairs = 0;
 		for (uint32_t dy = 0; dy < r.h; dy++) {
-			const uint8_t *row = bgra + (size_t)(r.y + dy) * (size_t)stride;
+			const uint32_t y = r.y + dy;
+			if (mask != NULL) {
+				const uint8_t *mrow = mask + (size_t)y * (size_t)mask_stride;
+				// A pair straddling the silhouette edge is the app's
+				// own border against the desktop, not a background
+				// cue. Requiring BOTH sides is what keeps every
+				// silhouette from measuring as busy by construction.
+				if (mrow[x] == 0 || mrow[x + 1u] == 0) {
+					continue;
+				}
+			}
+			col_pairs++;
+			const uint8_t *row = bgra + (size_t)y * (size_t)stride;
 			const float y0 = bg_luma(row + (size_t)x * 4u);
 			const float y1 = bg_luma(row + (size_t)(x + 1u) * 4u);
 			float d = y1 - y0;
@@ -110,13 +151,33 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
 			}
 		}
 		edge_samples += col_edges;
-		if (col_edges > max_col_edges) {
-			max_col_edges = col_edges;
+		total_samples += col_pairs;
+
+		// A column too short to describe a vertical border must not be
+		// allowed to set the column metric: one edge over two masked pairs
+		// is a density of 0.5 read off two samples. Unmasked columns span
+		// the whole ROI by construction, so this only ever bites the mask.
+		if (mask != NULL && col_pairs < U_BG_NEUTRALITY_MIN_MASKED_COLUMN_PAIRS) {
+			continue;
+		}
+		if (col_pairs > 0) {
+			const float density = (float)((double)col_edges / (double)col_pairs);
+			if (density > max_col_density) {
+				max_col_density = density;
+			}
 		}
 	}
 
+	// Too little of the region survived the mask to draw a conclusion from.
+	// "Could not measure" is not "measured and found quiet" — the policy above
+	// reads false as no source, which clips, and clipping is today's behaviour.
+	if (mask != NULL && total_samples < U_BG_NEUTRALITY_MIN_MASKED_SAMPLES) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+
 	out->edge_fraction = (total_samples > 0) ? (float)((double)edge_samples / (double)total_samples) : 0.0f;
-	out->max_column_density = (float)((double)max_col_edges / (double)r.h);
+	out->max_column_density = max_col_density;
 
 	const float e_ratio = out->edge_fraction / params.max_edge_fraction;
 	const float c_ratio = out->max_column_density / params.max_column_density;

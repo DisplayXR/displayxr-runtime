@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_depth_budget` |
-| Spec Version | 2 |
-| Type Values | `XR_TYPE_REAR_DEPTH_BUDGET_DXR` (1004999260) · `XR_TYPE_CONTENT_BOUNDS_DXR` (1004999261) · `XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR` (1004999262) |
+| Spec Version | 3 |
+| Type Values | `XR_TYPE_REAR_DEPTH_BUDGET_DXR` (1004999260) · `XR_TYPE_CONTENT_BOUNDS_DXR` (1004999261) · `XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR` (1004999262) · `XR_TYPE_CONTENT_MASK_DXR` (1004999263) |
 | Author | The DisplayXR Project |
 | Platform | All. The budget only ever *opens* where a background source exists; elsewhere it reports the conservative state and the app behaves exactly as it does today. |
 
@@ -66,12 +66,13 @@ supported configuration. See §6.
 
 ```c
 #define XR_DXR_depth_budget 1
-#define XR_DXR_depth_budget_SPEC_VERSION 2
+#define XR_DXR_depth_budget_SPEC_VERSION 3
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 
 #define XR_TYPE_REAR_DEPTH_BUDGET_DXR                          ((XrStructureType)1004999260)
 #define XR_TYPE_CONTENT_BOUNDS_DXR                             ((XrStructureType)1004999261)
 #define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
+#define XR_TYPE_CONTENT_MASK_DXR                               ((XrStructureType)1004999263)
 ```
 
 ### 3.2 XrRearDepthBudgetStateDXR
@@ -146,6 +147,34 @@ The event is a notification, not the value channel — it fires on transitions o
 progress. The authoritative `farOffsetVH` for the frame you are about to render is always the one
 that came back from that frame's `xrLocateViews`. An app can ignore the event entirely and lose
 nothing but the chance to log or to reconfigure something expensive.
+
+### 3.6 XrContentMaskDXR — input, chained on `XrFrameEndInfo` (v3)
+
+```c
+/* INPUT: the app chains this on XrFrameEndInfo::next in xrEndFrame, beside or instead of
+   XrContentBoundsDXR. Optional; when absent, all-zero, or not chained for more than 1 s the
+   runtime falls back to the bounds, then to the 3D zones, then to the whole canvas (§4.6). */
+typedef struct XrContentMaskDXR {
+    XrStructureType   type;         /* XR_TYPE_CONTENT_MASK_DXR */
+    const void*       next;
+    uint32_t          width;        /* 1..512 cells */
+    uint32_t          height;       /* 1..512 cells */
+    uint32_t          strideBytes;  /* >= width */
+    const uint8_t*    cells;        /* row-major, top-left origin, WINDOW-CLIENT-normalised:
+                                       cell (x, y) covers [x/width, (x+1)/width) x
+                                       [y/height, (y+1)/height) of the window client rect — the
+                                       same frame as XrContentBoundsDXR. Nonzero = content
+                                       occupies the cell, unioned over ALL views. The runtime
+                                       copies the cells during xrEndFrame; the pointer need only
+                                       stay valid until xrEndFrame returns. */
+    float             marginNormalized; /* extra dilation the app wants, in window-normalised
+                                       units, ON TOP of the runtime's own default (§4.6).
+                                       0 = the runtime default alone. */
+} XrContentMaskDXR;
+```
+
+Input only — the runtime writes nothing back through it, and like the bounds it is a **hint**: no
+value of any field can fail `xrEndFrame`. See §4.6.
 
 ## 4. Semantics
 
@@ -304,6 +333,118 @@ REAR_BUDGET d3d11: roi=142,2,56,96 (app content bounds)
 A rear-depth verdict without its region is unattributable — measured under the content, or over a
 canvas the content was nowhere near?
 
+
+### 4.6 Content mask (v3)
+
+A rectangle is the wrong shape for a character. Even a perfect, zone-clamped rect around a person
+is roughly two thirds background the model never covers, and any horizontal structure in that
+surplus — a window border, a line of text, an icon — closes a budget the silhouette itself would
+have left open. The two ways v2 goes wrong in practice are both *shape* problems (§6), and the fix
+for a wrong shape is not a bigger rectangle.
+
+**v3** lets the app hand over the shape it already has. A transparent app derives the union-over-
+views rendered silhouette every frame — it is what its click-through window region is built from —
+so `XrContentMaskDXR` (§3.6) costs it a downsample, not a new computation.
+
+Precedence, most specific first, each step falling through when the one above is **absent,
+all-zero or older than 1 s**:
+
+```
+content mask  ->  content bounds  ->  3D display zone union  ->  whole canvas (v1)
+```
+
+Bounds are not superseded by the mask; they are its fallback, and an app should keep chaining both.
+
+#### The grid
+
+Row-major, top-left origin, one byte per cell, nonzero = occupied. The extent is the **app window's
+client rect** — exactly the frame `XrContentBoundsDXR` uses, and again never a zone's
+`canvasRectPx`. A zoned app writes its zone's silhouette into the window grid and leaves the rest
+zero.
+
+The grid is independent of the app's render resolution and of the runtime's preview resolution;
+256x256 is the recommended maximum and 512 the hard limit (a 512x512 grid is the 256 KB the
+runtime copies during `xrEndFrame`).
+
+#### How the runtime turns the mask into a measured region
+
+1. **Resample** onto the runtime's preview grid with an **any-coverage (max) filter**: a preview
+   pixel is masked if *any* overlapping cell is nonzero. Iterated cell-first, so a cell finer than
+   a preview pixel still marks the pixel it lands in. Under-reporting the silhouette is the one
+   error that would open the budget over pixels nobody measured.
+2. **Clamp to the 3D zones** — per zone, not to the box around them, since a mask (unlike a rect)
+   has no reason to give away the gap between two zones.
+3. **Dilate** by `max(4% of the preview width, the app's marginNormalized, 8 px)` — a **box**
+   (Chebyshev) dilation, i.e. a `(2r+1) x (2r+1)` square structuring element, run as two separable
+   1-D max filters over prefix sums so the cost is `O(w*h)` rather than `O(w*h*r)`. The conflict is
+   read in the band *around* the silhouette rather than strictly under it.
+4. **Clamp to the 3D zones again.** The dilation is a band, and a band reaches into a Local2D 2-D
+   strip just as readily as the silhouette could.
+
+The per-pixel mask that comes out of that is what the analysis reads. It is cached and rebuilt only
+when one of its inputs changes — the app's mask, the zone rects, the preview dimensions or the
+preview's canvas rect — because on a quiet desktop nothing else does.
+
+#### The masked metric
+
+`u_bg_neutrality` measures only masked pixels, and the difference is entirely in what counts as a
+sample:
+
+- a horizontal difference sample at `(x, y)` counts only when **both** pixels of the pair are
+  masked. A pair straddling the silhouette edge is the app's own border against the desktop, not a
+  background cue — counting it would make every silhouette measure as busy at its own outline;
+- `edge_fraction` = edges / **masked** samples, not / the rect's area;
+- a column's density is its edges over **its** masked pairs, and a column holding fewer than 4
+  masked pairs is skipped: one edge over two pairs is a density of 0.5, read off two samples;
+- fewer than **64** masked samples in total returns "could not measure", never "neutral". The
+  runtime checks the same floor before choosing the mask, so a silhouette that survives the zone
+  clamp as a sliver falls through to the bounds rather than freezing the previous verdict.
+
+`cue_energy` and `neutral` are formed from those two numbers exactly as in the unmasked case, so
+the thresholds, the dead band and the dwell/grace hysteresis are unchanged.
+
+#### Diagnostics and switches
+
+The transition log line carries the mask's bounding rect as `roi=` plus the pixel count:
+
+```
+REAR_BUDGET d3d11: roi=142,2,56,96 mask=3216 (app content mask)
+```
+
+`roi=` alone cannot describe a mask — a bar and the box around it have the same bounding rect and
+measure completely different pixels — so `DXR_REAR_BUDGET_DUMP=1` additionally tints the dilated
+mask 50% toward green in the dumped PNG. The tint is what lets an eyeball disagree with the number.
+
+| Environment variable | Effect |
+|---|---|
+| `DXR_REAR_BUDGET_MASK=0` | Mask off, bounds still on — the "is the silhouette better than the box?" A/B. Logs once when armed. |
+| `DXR_REAR_BUDGET_ROI=0` | Mask **and** bounds **and** the zone clamp off: the whole canvas, i.e. v1. Logs once when armed. |
+
+Every failure path falls back to the next authority down, and never to "neutral":
+
+| Situation | Region measured |
+|---|---|
+| No `XrContentMaskDXR` chained | The bounds (v2), then the zones, then the canvas |
+| Not chained for more than 1 s | Same — the app stopped, and a second-old silhouette describes a pose that has since moved |
+| All-zero grid | Same. "The app rendered nothing here" is absence, not an empty region |
+| `cells == NULL`, dims outside 1..512, `strideBytes < width` | Same, plus a one-time `WARN`. Refused, never truncated: truncating would measure a region the app never described |
+| Mask cleared entirely by the 3D-zone clamp | Same, plus a one-time `WARN` naming the app's zone→window rebase |
+| Fewer than 64 preview pixels survive | Same — a coarser question with an answer beats a finer one without |
+| `DXR_REAR_BUDGET_MASK=0` / `DXR_REAR_BUDGET_ROI=0` | Bounds / whole canvas, as above |
+
+#### Producing the mask
+
+- Downsample the union-over-views coverage (alpha, or whatever the click-through region is built
+  from) with a **max filter**, to at most 256x256. Max, not average or point sampling: a thin arm
+  must survive the downsample, and the runtime's any-coverage resample cannot recover what the
+  producer already dropped.
+- Write into the **window** grid. A zoned app rasterises its zone's silhouette at the zone's place
+  in the window and leaves the rest zero.
+- Keep chaining `XrContentBoundsDXR` as well. It costs nothing, and it is what answers on any frame
+  whose silhouette is unavailable — and on any runtime older than v3.
+- `dxr::ContentMaskFromSilhouette` and `dxr::ChainContentMask` in `displayxr-common` do both halves;
+  as with the projection, app-side variants will not agree with each other.
+
 ## 5. Runtime Behavior
 
 - **Source.** The background pixels come from an optional appended per-API display-processor slot,
@@ -374,8 +515,14 @@ canvas the content was nowhere near?
 - **The runtime clamps, but it does not fix.** As of #1365 the region is intersected with the
   frame's 3D display zones (§4.5), so an over-reported or mis-rebased rect degrades to a coarser
   measurement instead of a wrong one. That is a floor, not a substitute for reporting the right
-  rect: a rect around a character is still the wrong *shape* for a character, and a **mask-based
-  ROI (v3)** is the planned answer to that, not a larger rectangle.
+  rect.
+- **Report your silhouette, not just its box (v3, the recommended path).** Both bullets above are
+  *shape* problems, and a rectangle cannot be the answer to either. Chain `XrContentMaskDXR`
+  (§3.6) with a max-filter downsample of the union-over-views coverage you already compute for
+  your click-through region, at most 256x256, written into the **window** grid (§4.6). A skinned
+  mesh's animation-set box and a unioned ground plane both stop mattering once the region is the
+  silhouette: what the mask says is what was rendered. Keep chaining the bounds as well - they are
+  the fallback for a frame with no silhouette and for any runtime older than v3.
 
 ## 7. Sample Usage
 
@@ -457,11 +604,12 @@ past the end of a struct declared by an app compiled against an older header. `X
 is likewise untouched by this extension for exactly that reason (ADR-040, *Alternatives
 considered*).
 
-An app compiled against v1 headers runs unchanged on a v2 runtime; the v2 runtime simply never
-sees the structs the app does not chain. v2 added exactly that: `XrContentBoundsDXR`, a new input
-struct on a type value v1 had already claimed. `XrRearDepthBudgetDXR` is byte-identical between
-the two versions, and a v2 app talking to a v1 runtime has its content bounds ignored — which is
-v1's canvas-wide ROI, i.e. today.
+An app compiled against v1 headers runs unchanged on a v2 or v3 runtime; the runtime simply never
+sees the structs the app does not chain. Both bumps added exactly that and nothing else: v2 added
+`XrContentBoundsDXR` on a type value v1 had already claimed, and v3 added `XrContentMaskDXR` on a
+new one. `XrRearDepthBudgetDXR` is byte-identical across all three, and an app talking to an older
+runtime has its newer input ignored — which degrades to that runtime's own region rule (bounds, or
+the canvas-wide v1 ROI), i.e. today.
 
 Applications that vendor these headers should note that a vendored copy does **not** track spec
 bumps automatically — the `consumer_floors` drift audit is what catches the gap.
@@ -477,8 +625,8 @@ bumps automatically — the `consumer_floors` drift audit is what catches the ga
 - Per-session runner (cadence, ROI derivation, publish): `src/xrt/compositor/util/comp_rear_budget.{c,h}`
   (+ unit tests), driven by the D3D11, Vulkan and D3D12 native compositors
 - oxr consumption: `oxr_session.c` (locate-views path, beside `XrViewDisplayRawDXR`),
-  `oxr_session_frame_end.c` (`XrContentBoundsDXR` parse + per-backend dispatch),
-  `oxr_event.c` (state-changed event)
+  `oxr_session_frame_end.c` (`XrContentBoundsDXR` / `XrContentMaskDXR` parse, mask copy into the
+  session's double buffer, per-backend dispatch), `oxr_event.c` (state-changed event)
 - App-side helper: `dxr::ClipPolicy::ResolveClipPlanes` in `displayxr-common`
 
 ## 10. Out of Scope / Future
@@ -499,3 +647,4 @@ Tracked on [#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365):
 |---------|---------|
 | 1 | Initial version — `XrRearDepthBudgetDXR` on `XrViewState`, the state-changed event, canvas-wide ROI; `XR_TYPE_CONTENT_BOUNDS_DXR` reserved for v2 (epic #1363, ADR-040) |
 | 2 | `XrContentBoundsDXR` on `XrFrameEndInfo` — the app reports where its content projects and the analysis measures only there, dilated (§4.5). Additive: `XrRearDepthBudgetDXR` unchanged, no new entry points, no new event ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)) |
+| 3 | `XrContentMaskDXR` on `XrFrameEndInfo` — the app's rendered SILHOUETTE, resampled with an any-coverage filter, zone-clamped, dilated, and measured with a masked metric (§4.6). A rect around a character is mostly background the character never covers. Additive: `XrRearDepthBudgetDXR` and `XrContentBoundsDXR` unchanged, bounds remain the fallback ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)) |

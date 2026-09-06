@@ -28,6 +28,39 @@
 #include "stb_image_write.h"
 
 
+//! Grow @p buf to at least @p need bytes, keeping what is there. False = OOM.
+static bool
+comp_rear_budget_grow_u8(uint8_t **buf, size_t *cap, size_t need)
+{
+	if (*cap >= need) {
+		return true;
+	}
+	uint8_t *grown = (uint8_t *)realloc(*buf, need);
+	if (grown == NULL) {
+		return false;
+	}
+	*buf = grown;
+	*cap = need;
+	return true;
+}
+
+//! @copydoc comp_rear_budget_grow_u8, for the dilation's prefix sums.
+static bool
+comp_rear_budget_grow_u32(uint32_t **buf, size_t *cap, size_t need_elems)
+{
+	if (*cap >= need_elems) {
+		return true;
+	}
+	uint32_t *grown = (uint32_t *)realloc(*buf, need_elems * sizeof(uint32_t));
+	if (grown == NULL) {
+		return false;
+	}
+	*buf = grown;
+	*cap = need_elems;
+	return true;
+}
+
+
 /*
  * ---------------------------------------------------------------------------
  * DXR_REAR_BUDGET_DUMP — the picture behind the verdict
@@ -134,6 +167,53 @@ comp_rear_budget_retain_preview(struct comp_rear_budget *b, const struct xrt_dp_
 	b->dump_have = true;
 }
 
+/*!
+ * The image the dump sink is handed: the retained preview, with the v3
+ * silhouette mask — the pixels the analysis actually judged — tinted 50% toward
+ * green.
+ *
+ * Only the MASK is drawn, and only when one was used. A rect region is already
+ * fully described by the `roi=` line, so tinting it would add nothing; a mask is
+ * not, and cannot be — a bar and the box around it have the same bounding rect
+ * and measure completely different pixels. The tint is what lets an eyeball
+ * disagree with the number.
+ *
+ * The retained copy is never modified: it is reused across dumps, and a tint
+ * baked into it would accumulate.
+ *
+ * @return @ref comp_rear_budget::dump_bgra when there is nothing to draw.
+ */
+static const uint8_t *
+comp_rear_budget_dump_image(struct comp_rear_budget *b)
+{
+	const uint32_t w = b->dump_w, h = b->dump_h;
+	if (!b->dump_have || b->dump_bgra == NULL || !b->roi_mask_in_use || b->roi_mask == NULL ||
+	    b->roi_mask_w != w || b->roi_mask_h != h) {
+		return b->dump_bgra;
+	}
+
+	const size_t bytes = (size_t)w * 4u * (size_t)h;
+	if (!comp_rear_budget_grow_u8(&b->dump_tint, &b->dump_tint_cap, bytes)) {
+		return b->dump_bgra; // the untinted picture beats no picture
+	}
+	memcpy(b->dump_tint, b->dump_bgra, bytes);
+
+	for (uint32_t y = 0; y < h; y++) {
+		uint8_t *row = b->dump_tint + (size_t)y * (size_t)w * 4u;
+		const uint8_t *mrow = b->roi_mask + (size_t)y * (size_t)w;
+		for (uint32_t x = 0; x < w; x++) {
+			if (mrow[x] == 0) {
+				continue;
+			}
+			uint8_t *px = row + (size_t)x * 4u;
+			px[0] = (uint8_t)(px[0] / 2u);           // B
+			px[1] = (uint8_t)((px[1] + 255u) / 2u);  // G — toward green
+			px[2] = (uint8_t)(px[2] / 2u);           // R
+		}
+	}
+	return b->dump_tint;
+}
+
 
 /*
  * ---------------------------------------------------------------------------
@@ -168,6 +248,7 @@ const char *
 comp_rear_budget_roi_src_str(enum comp_rear_budget_roi_src src)
 {
 	switch (src) {
+	case COMP_REAR_BUDGET_ROI_SRC_MASK: return "app content mask";
 	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS: return "app content bounds";
 	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES: return "app content bounds clamped to the 3D zones";
 	case COMP_REAR_BUDGET_ROI_SRC_ZONES: return "3D zone union";
@@ -176,6 +257,491 @@ comp_rear_budget_roi_src_str(enum comp_rear_budget_roi_src src)
 	default: return "whole preview";
 	}
 }
+
+/*
+ * ---------------------------------------------------------------------------
+ * The content occupancy mask (XR_DXR_depth_budget v3)
+ *
+ * The shape, not the box around it. Four steps, in this order, and the order is
+ * the argument:
+ *
+ *   resample -> clamp to the 3D zones -> dilate -> clamp again
+ *
+ * The zone clamp runs on BOTH sides of the dilation for the same reason the
+ * rect path does it twice: the dilation is a band, and a band reaches into a
+ * Local2D 2D strip just as readily as the silhouette itself could. Clamping
+ * only before would leave a dilation-wide window onto pixels the content can
+ * never occlude; clamping only after would let the band grow out of a cell that
+ * should not have been there in the first place.
+ * ---------------------------------------------------------------------------
+ */
+
+/*!
+ * One window-normalised coordinate in preview pixels, with cell edges that land
+ * on pixel edges SNAPPED to them.
+ *
+ * Both grids are half-open, so an unsnapped edge is a one-pixel error either
+ * way: cell 6 of 20 over a 200-px preview is pixel 60.0, but `6.0f/20.0f*200`
+ * is 60.000002, and `ceil` of that claims pixel 60 for a cell that ends exactly
+ * where it begins. The snap makes an aligned grid exact instead of leaving it to
+ * whichever way the last bit rounded — and 1e-4 of a pixel is far below anything
+ * a mask cell could mean.
+ */
+static double
+comp_rear_budget_map_px(double u, double c0, double dc, double n)
+{
+	double p = (u - c0) / dc * n;
+	const double nearest = floor(p + 0.5);
+	if (fabs(p - nearest) < 1e-4) {
+		p = nearest;
+	}
+	return p;
+}
+
+/*!
+ * Mark every preview pixel any nonzero cell overlaps ("any-coverage").
+ *
+ * Deliberately iterated CELL-first rather than pixel-first. A mask can be
+ * coarser or finer than the preview, and the direction that survives both is
+ * the one that asks "which pixels does this cell touch" — a cell smaller than a
+ * pixel still marks the pixel it lands in, where a pixel-first "which cell is
+ * at my centre" would drop it. Under-reporting the silhouette is the one error
+ * that opens the budget over something it never measured.
+ *
+ * @param out Preview-res, tight stride; fully overwritten.
+ */
+static void
+comp_rear_budget_mask_resample(const uint8_t *cells,
+                               uint32_t mw,
+                               uint32_t mh,
+                               uint8_t *out,
+                               uint32_t pw,
+                               uint32_t ph,
+                               float cu0,
+                               float cv0,
+                               float cu1,
+                               float cv1)
+{
+	memset(out, 0, (size_t)pw * (size_t)ph);
+
+	const double du = (double)cu1 - (double)cu0;
+	const double dv = (double)cv1 - (double)cv0;
+
+	for (uint32_t cy = 0; cy < mh; cy++) {
+		const uint8_t *crow = cells + (size_t)cy * (size_t)mw;
+
+		// The cell's window-normalised v extent, mapped through the
+		// preview's own canvas rect and taken half-open, so a cell edge
+		// landing exactly on a pixel boundary does not claim both sides.
+		const double va = (double)cy / (double)mh;
+		const double vb = (double)(cy + 1u) / (double)mh;
+		int y0 = (int)floor(comp_rear_budget_map_px(va, cv0, dv, (double)ph));
+		int y1 = (int)ceil(comp_rear_budget_map_px(vb, cv0, dv, (double)ph)) - 1;
+		if (y1 < y0) {
+			y1 = y0; // a cell finer than a pixel still marks its pixel
+		}
+		if (y1 < 0 || y0 >= (int)ph) {
+			continue;
+		}
+		if (y0 < 0) {
+			y0 = 0;
+		}
+		if (y1 >= (int)ph) {
+			y1 = (int)ph - 1;
+		}
+
+		for (uint32_t cx = 0; cx < mw; cx++) {
+			if (crow[cx] == 0) {
+				continue;
+			}
+			const double ua = (double)cx / (double)mw;
+			const double ub = (double)(cx + 1u) / (double)mw;
+			int x0 = (int)floor(comp_rear_budget_map_px(ua, cu0, du, (double)pw));
+			int x1 = (int)ceil(comp_rear_budget_map_px(ub, cu0, du, (double)pw)) - 1;
+			if (x1 < x0) {
+				x1 = x0;
+			}
+			if (x1 < 0 || x0 >= (int)pw) {
+				continue;
+			}
+			if (x0 < 0) {
+				x0 = 0;
+			}
+			if (x1 >= (int)pw) {
+				x1 = (int)pw - 1;
+			}
+			for (int y = y0; y <= y1; y++) {
+				memset(out + (size_t)y * (size_t)pw + (size_t)x0, 1,
+				       (size_t)(x1 - x0 + 1));
+			}
+		}
+	}
+}
+
+/*!
+ * Clear every masked pixel that lies outside every 3D zone.
+ *
+ * Per-ZONE, not against the box around them: a mask is not a rect, so there is
+ * no reason to give away the gap between two zones the way the rect path has to.
+ *
+ * @param row_scratch At least @p pw bytes.
+ * @return Nonzero pixels left.
+ */
+static uint32_t
+comp_rear_budget_mask_clamp_zones(uint8_t *m,
+                                  uint8_t *row_scratch,
+                                  uint32_t pw,
+                                  uint32_t ph,
+                                  const struct u_bg_rect_norm *zones,
+                                  uint32_t zone_count,
+                                  float cu0,
+                                  float cv0,
+                                  float cu1,
+                                  float cv1)
+{
+	uint32_t kept = 0;
+
+	if (zone_count == 0) {
+		// No zones means the whole canvas IS the 3D zone (every full-window
+		// app); there is nothing to clamp against.
+		for (size_t i = 0, n = (size_t)pw * (size_t)ph; i < n; i++) {
+			kept += (m[i] != 0) ? 1u : 0u;
+		}
+		return kept;
+	}
+
+	int zx0[COMP_REAR_BUDGET_MAX_ZONES], zx1[COMP_REAR_BUDGET_MAX_ZONES];
+	int zy0[COMP_REAR_BUDGET_MAX_ZONES], zy1[COMP_REAR_BUDGET_MAX_ZONES];
+	const double du = (double)cu1 - (double)cu0;
+	const double dv = (double)cv1 - (double)cv0;
+	for (uint32_t i = 0; i < zone_count; i++) {
+		zx0[i] = (int)floor(comp_rear_budget_map_px(zones[i].u0, cu0, du, (double)pw));
+		zx1[i] = (int)ceil(comp_rear_budget_map_px(zones[i].u1, cu0, du, (double)pw));
+		zy0[i] = (int)floor(comp_rear_budget_map_px(zones[i].v0, cv0, dv, (double)ph));
+		zy1[i] = (int)ceil(comp_rear_budget_map_px(zones[i].v1, cv0, dv, (double)ph));
+		if (zx0[i] < 0) {
+			zx0[i] = 0;
+		}
+		if (zy0[i] < 0) {
+			zy0[i] = 0;
+		}
+		if (zx1[i] > (int)pw) {
+			zx1[i] = (int)pw;
+		}
+		if (zy1[i] > (int)ph) {
+			zy1[i] = (int)ph;
+		}
+	}
+
+	for (uint32_t y = 0; y < ph; y++) {
+		memset(row_scratch, 0, pw);
+		for (uint32_t i = 0; i < zone_count; i++) {
+			if ((int)y < zy0[i] || (int)y >= zy1[i] || zx1[i] <= zx0[i]) {
+				continue;
+			}
+			memset(row_scratch + zx0[i], 1, (size_t)(zx1[i] - zx0[i]));
+		}
+		uint8_t *mrow = m + (size_t)y * (size_t)pw;
+		for (uint32_t x = 0; x < pw; x++) {
+			mrow[x] = (uint8_t)(mrow[x] && row_scratch[x]);
+			kept += (mrow[x] != 0) ? 1u : 0u;
+		}
+	}
+	return kept;
+}
+
+/*!
+ * Dilate the mask by a BOX of Chebyshev radius @p r — a (2r+1) x (2r+1) square
+ * structuring element, run as two separable 1D max filters over prefix sums, so
+ * the cost is O(w*h) rather than O(w*h*r).
+ *
+ * A box rather than a diamond: the conflict band is not isotropic in any way
+ * this metric can exploit (the metric itself only looks at horizontal
+ * differences), and a box is the shape whose radius means the same thing on
+ * both axes — the number the log and the spec quote.
+ *
+ * @param scratch At least max(w, h) + 1 entries.
+ */
+static void
+comp_rear_budget_mask_dilate(uint8_t *m, uint32_t *scratch, uint32_t pw, uint32_t ph, uint32_t r)
+{
+	if (r == 0) {
+		return;
+	}
+
+	for (uint32_t y = 0; y < ph; y++) {
+		uint8_t *row = m + (size_t)y * (size_t)pw;
+		scratch[0] = 0;
+		for (uint32_t x = 0; x < pw; x++) {
+			scratch[x + 1] = scratch[x] + (row[x] != 0 ? 1u : 0u);
+		}
+		// The prefix sums are a snapshot, so writing the row back as we go
+		// cannot feed the filter its own output (which would smear the mask
+		// across the whole row instead of dilating it by r).
+		for (uint32_t x = 0; x < pw; x++) {
+			const uint32_t lo = (x > r) ? (x - r) : 0u;
+			const uint32_t hi = (x + r + 1u < pw) ? (x + r + 1u) : pw;
+			row[x] = (scratch[hi] - scratch[lo]) != 0 ? 1u : 0u;
+		}
+	}
+
+	for (uint32_t x = 0; x < pw; x++) {
+		scratch[0] = 0;
+		for (uint32_t y = 0; y < ph; y++) {
+			scratch[y + 1] = scratch[y] + (m[(size_t)y * (size_t)pw + x] != 0 ? 1u : 0u);
+		}
+		for (uint32_t y = 0; y < ph; y++) {
+			const uint32_t lo = (y > r) ? (y - r) : 0u;
+			const uint32_t hi = (y + r + 1u < ph) ? (y + r + 1u) : ph;
+			m[(size_t)y * (size_t)pw + x] = (scratch[hi] - scratch[lo]) != 0 ? 1u : 0u;
+		}
+	}
+}
+
+/*!
+ * (Re)build @ref comp_rear_budget::roi_mask from the app grid already copied
+ * into @ref comp_rear_budget::mask_work.
+ *
+ * Cached on every input the result depends on — the app's mask generation, the
+ * zone rects, the preview dims and the preview's canvas rect — because on a
+ * quiet desktop the analysis runs at the poll rate over an unchanged mask, and
+ * rebuilding it each time would be the only per-poll work in the whole feature.
+ *
+ * @return false when the result is unusable (too few pixels to measure, or
+ *         cleared away entirely by the zone clamp); the caller then falls
+ *         through to the rect path.
+ */
+static bool
+comp_rear_budget_build_mask(struct comp_rear_budget *b,
+                            const struct xrt_dp_background_preview *pv,
+                            float cu0,
+                            float cv0,
+                            float cu1,
+                            float cv1,
+                            const struct u_bg_rect_norm *zones,
+                            uint32_t zone_count,
+                            uint32_t zone_gen,
+                            uint32_t mask_gen)
+{
+	const uint32_t pw = pv->width;
+	const uint32_t ph = pv->height;
+
+	const bool cached = b->roi_mask_key.valid && b->roi_mask_key.mask_gen == mask_gen &&
+	                    b->roi_mask_key.zone_gen == zone_gen && b->roi_mask_key.zone_count == zone_count &&
+	                    b->roi_mask_key.pw == pw && b->roi_mask_key.ph == ph && b->roi_mask_key.cu0 == cu0 &&
+	                    b->roi_mask_key.cv0 == cv0 && b->roi_mask_key.cu1 == cu1 && b->roi_mask_key.cv1 == cv1;
+	if (cached) {
+		return b->roi_mask_px >= COMP_REAR_BUDGET_MASK_MIN_PX;
+	}
+
+	const size_t px_count = (size_t)pw * (size_t)ph;
+	const size_t scratch_elems = (size_t)((pw > ph) ? pw : ph) + 1u;
+	if (!comp_rear_budget_grow_u8(&b->roi_mask, &b->roi_mask_cap, px_count) ||
+	    !comp_rear_budget_grow_u32(&b->dilate_scratch, &b->dilate_scratch_cap, scratch_elems)) {
+		// Out of memory for a diagnostic region. The rect path needs no
+		// allocation at all, so it is the honest fallback.
+		b->roi_mask_px = 0;
+		b->roi_mask_key.valid = false;
+		return false;
+	}
+
+	comp_rear_budget_mask_resample(b->mask_work, b->mask_work_w, b->mask_work_h, b->roi_mask, pw, ph, cu0, cv0,
+	                               cu1, cv1);
+
+	// The row scratch for the zone clamp rides on the dilation's prefix-sum
+	// buffer: it is uint32 and at least max(pw, ph) + 1 long, so it holds pw
+	// bytes with room to spare, and byte access to it is well defined.
+	uint8_t *row_scratch = (uint8_t *)b->dilate_scratch;
+
+	uint32_t kept = comp_rear_budget_mask_clamp_zones(b->roi_mask, row_scratch, pw, ph, zones, zone_count, cu0,
+	                                                  cv0, cu1, cv1);
+	if (kept == 0) {
+		/*
+		 * The silhouette lies entirely outside every 3D zone — the same app
+		 * bug the rect path diagnoses (a zone-normalised grid chained as
+		 * window-normalised), and the same answer: this region is unusable,
+		 * so fall through rather than measure it. Never "neutral".
+		 */
+		b->roi_mask_px = 0;
+		b->roi_mask_key.valid = false;
+		if (!b->mask_outside_logged) {
+			b->mask_outside_logged = true;
+			U_LOG_W(
+			    "REAR_BUDGET: the content mask falls outside the 3D zones — check the "
+			    "app's zone→window rebase; falling back to the content bounds");
+		}
+		return false;
+	}
+
+	// Dilation: the runtime's own band, whatever the app asked for on top, and
+	// never less than a real band on a small preview. marginNormalized is in
+	// window units, so it maps through the preview's canvas rect like anything
+	// else does.
+	float dilate = COMP_REAR_BUDGET_ROI_DILATE_FRAC * (float)pw;
+	const float span = cu1 - cu0;
+	const float margin_px = (span > 0.0f) ? (b->mask_work_margin / span * (float)pw) : 0.0f;
+	if (margin_px > dilate) {
+		dilate = margin_px;
+	}
+	if (dilate < COMP_REAR_BUDGET_ROI_DILATE_MIN_PX) {
+		dilate = COMP_REAR_BUDGET_ROI_DILATE_MIN_PX;
+	}
+	// Clamped BEFORE the cast, not after: a preview covering a sliver of the
+	// window turns even a legal margin into a huge pixel count, and converting
+	// a float past UINT32_MAX is undefined rather than merely large. Past both
+	// axes the mask is full anyway, so the cap costs nothing.
+	const float max_r = (float)(pw + ph);
+	if (!(dilate >= 0.0f)) {
+		dilate = COMP_REAR_BUDGET_ROI_DILATE_MIN_PX;
+	}
+	if (dilate > max_r) {
+		dilate = max_r;
+	}
+	const uint32_t r = (uint32_t)(dilate + 0.5f);
+	comp_rear_budget_mask_dilate(b->roi_mask, b->dilate_scratch, pw, ph, r);
+
+	kept = comp_rear_budget_mask_clamp_zones(b->roi_mask, row_scratch, pw, ph, zones, zone_count, cu0, cv0, cu1,
+	                                         cv1);
+
+	// The bounding rect of what survived. It is what `roi=` reports and what
+	// bounds the analysis scan; the MASK is what decides which pixels inside
+	// it count.
+	uint32_t bx0 = pw, by0 = ph, bx1 = 0, by1 = 0;
+	for (uint32_t y = 0; y < ph; y++) {
+		const uint8_t *row = b->roi_mask + (size_t)y * (size_t)pw;
+		for (uint32_t x = 0; x < pw; x++) {
+			if (row[x] == 0) {
+				continue;
+			}
+			if (x < bx0) {
+				bx0 = x;
+			}
+			if (x + 1u > bx1) {
+				bx1 = x + 1u;
+			}
+			if (y < by0) {
+				by0 = y;
+			}
+			if (y + 1u > by1) {
+				by1 = y + 1u;
+			}
+		}
+	}
+
+	b->roi_mask_w = pw;
+	b->roi_mask_h = ph;
+	b->roi_mask_px = kept;
+	b->roi_mask_build_id++;
+	b->roi_mask_key.mask_gen = mask_gen;
+	b->roi_mask_key.zone_gen = zone_gen;
+	b->roi_mask_key.zone_count = zone_count;
+	b->roi_mask_key.pw = pw;
+	b->roi_mask_key.ph = ph;
+	b->roi_mask_key.cu0 = cu0;
+	b->roi_mask_key.cv0 = cv0;
+	b->roi_mask_key.cu1 = cu1;
+	b->roi_mask_key.cv1 = cv1;
+	b->roi_mask_key.valid = true;
+
+	if (kept < COMP_REAR_BUDGET_MASK_MIN_PX || bx1 <= bx0 || by1 <= by0 || (bx1 - bx0) < 2u) {
+		// Too little to measure. The analysis would refuse it, and a refusal
+		// mid-tick freezes the previous verdict instead of producing one.
+		b->roi_mask_px = 0;
+		return false;
+	}
+
+	b->roi_mask_rect.x = bx0;
+	b->roi_mask_rect.y = by0;
+	b->roi_mask_rect.w = bx1 - bx0;
+	b->roi_mask_rect.h = by1 - by0;
+	return true;
+}
+
+void
+comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
+                                  const uint8_t *cells,
+                                  uint32_t w,
+                                  uint32_t h,
+                                  uint32_t stride,
+                                  float margin_normalized,
+                                  uint64_t now_ns)
+{
+	if (b == NULL || !b->initialised) {
+		return;
+	}
+
+	// oxr validates first; this is the second gate, because the grid steers a
+	// memory read and "advisory" must never come to mean "unchecked".
+	const bool usable = cells != NULL && w >= 1u && h >= 1u && w <= COMP_REAR_BUDGET_MASK_MAX_DIM &&
+	                    h <= COMP_REAR_BUDGET_MASK_MAX_DIM && stride >= w;
+	if (!isfinite(margin_normalized) || margin_normalized < 0.0f) {
+		margin_normalized = 0.0f;
+	}
+	if (margin_normalized > 0.5f) {
+		margin_normalized = 0.5f;
+	}
+
+	if (!usable) {
+		// "Absent", never "empty": an empty region measures as neutral and
+		// would open the budget over a desktop nobody looked at. The bounds
+		// are the fallback, and they are still fresh.
+		os_mutex_lock(&b->publish_mutex);
+		b->mask_valid = false;
+		b->mask_ns = now_ns;
+		b->mask_gen++;
+		os_mutex_unlock(&b->publish_mutex);
+		return;
+	}
+
+	os_mutex_lock(&b->publish_mutex);
+	bool ok = comp_rear_budget_grow_u8(&b->mask_cells, &b->mask_cap, (size_t)w * (size_t)h);
+	uint32_t nonzero = 0;
+	if (ok) {
+		for (uint32_t y = 0; y < h; y++) {
+			const uint8_t *src = cells + (size_t)y * (size_t)stride;
+			uint8_t *dst = b->mask_cells + (size_t)y * (size_t)w;
+			memcpy(dst, src, w);
+			for (uint32_t x = 0; x < w; x++) {
+				nonzero += (dst[x] != 0) ? 1u : 0u;
+			}
+		}
+	}
+	// An all-zero grid is "the app rendered nothing here", which is absence,
+	// not a region — the spec says so and the fallback chain depends on it.
+	b->mask_valid = ok && nonzero > 0;
+	b->mask_w = ok ? w : 0;
+	b->mask_h = ok ? h : 0;
+	b->mask_margin = margin_normalized;
+	b->mask_ns = now_ns;
+	b->mask_gen++;
+	os_mutex_unlock(&b->publish_mutex);
+}
+
+bool
+comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
+                                 const uint8_t **out_mask,
+                                 uint32_t *out_w,
+                                 uint32_t *out_h,
+                                 uint32_t *out_px)
+{
+	if (b == NULL || !b->roi_mask_in_use || b->roi_mask == NULL || b->roi_mask_px == 0) {
+		return false;
+	}
+	if (out_mask != NULL) {
+		*out_mask = b->roi_mask;
+	}
+	if (out_w != NULL) {
+		*out_w = b->roi_mask_w;
+	}
+	if (out_h != NULL) {
+		*out_h = b->roi_mask_h;
+	}
+	if (out_px != NULL) {
+		*out_px = b->roi_mask_px;
+	}
+	return true;
+}
+
 
 /*!
  * The ROI this frame's analysis should use, in preview pixels.
@@ -208,6 +774,7 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	*out_roi = whole;
 	*out_narrowed = false;
 	*out_src = COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
+	b->roi_mask_in_use = false;
 
 	// Probed once. An armed kill switch says so: an A/B whose two arms are
 	// indistinguishable in the log is not an A/B.
@@ -223,9 +790,25 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	if (b->roi_enabled == 0) {
 		return;
 	}
+	// The narrower switch: mask off, bounds still on. Two switches because the
+	// v2->v3 question ("is the silhouette better than the box?") and the
+	// v1->v2 question ("is a region better than the canvas?") are different
+	// A/Bs and collapsing them would answer neither.
+	if (b->mask_enabled < 0) {
+		const char *e = getenv("DXR_REAR_BUDGET_MASK");
+		b->mask_enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		if (b->mask_enabled == 0) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_MASK armed = 0 (content MASK off, "
+			    "falling back to the content bounds)");
+		}
+	}
 
 	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
 	uint32_t zone_count = 0;
+	uint32_t zone_gen = 0;
+	bool have_mask = false;
+	uint32_t mask_gen = 0;
 
 	os_mutex_lock(&b->publish_mutex);
 	const bool valid = b->bounds_valid;
@@ -234,11 +817,64 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	const uint64_t zones_age_ns = (now_ns > b->zones_ns) ? (now_ns - b->zones_ns) : 0;
 	if (b->zone_count > 0 && zones_age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS) {
 		zone_count = b->zone_count;
+		zone_gen = b->zone_gen;
 		memcpy(zones, b->zones, sizeof(zones[0]) * (size_t)zone_count);
+	}
+	// The app's grid is copied OUT here rather than resampled in place: the
+	// render thread must not read app-owned memory, and the locate thread must
+	// not wait behind a 512x512 scan to read a float.
+	const uint64_t mask_age_ns = (now_ns > b->mask_ns) ? (now_ns - b->mask_ns) : 0;
+	if (b->mask_enabled == 1 && b->mask_valid && b->mask_w > 0 && b->mask_h > 0 &&
+	    mask_age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS) {
+		const size_t need = (size_t)b->mask_w * (size_t)b->mask_h;
+		if (comp_rear_budget_grow_u8(&b->mask_work, &b->mask_work_cap, need)) {
+			memcpy(b->mask_work, b->mask_cells, need);
+			b->mask_work_w = b->mask_w;
+			b->mask_work_h = b->mask_h;
+			b->mask_work_margin = b->mask_margin;
+			mask_gen = b->mask_gen;
+			have_mask = true;
+		}
 	}
 	os_mutex_unlock(&b->publish_mutex);
 
 	const bool have_bounds = valid && age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS;
+	if (!have_mask && !have_bounds && zone_count == 0) {
+		return;
+	}
+
+	/*
+	 * The preview covers `canvas_u0..v1` OF THE CANVAS — normally 0,0,1,1, but
+	 * a display processor may include a margin. One that predates the field
+	 * leaves it zeroed, and that is the documented normal case rather than a
+	 * degenerate one, so it reads as the identity instead of disabling the ROI.
+	 *
+	 * Resolved before either region path, because both map through it and the
+	 * mask cache is keyed on it.
+	 */
+	float cu0 = pv->canvas_u0, cv0 = pv->canvas_v0, cu1 = pv->canvas_u1, cv1 = pv->canvas_v1;
+	if (!(cu1 > cu0) || !(cv1 > cv0)) {
+		cu0 = 0.0f;
+		cv0 = 0.0f;
+		cu1 = 1.0f;
+		cv1 = 1.0f;
+	}
+
+	/*
+	 * Precedence: MASK first. The silhouette is the most specific statement
+	 * the app can make about where its content is, and every way it can fail
+	 * (absent, all-zero, stale, cleared by the zone clamp, too small to
+	 * measure) falls THROUGH to the rect below rather than to "neutral".
+	 */
+	if (have_mask && comp_rear_budget_build_mask(b, pv, cu0, cv0, cu1, cv1, zones, zone_count, zone_gen,
+	                                             mask_gen)) {
+		*out_roi = b->roi_mask_rect;
+		*out_narrowed = b->roi_mask_px < (uint32_t)pv->width * pv->height;
+		*out_src = COMP_REAR_BUDGET_ROI_SRC_MASK;
+		b->roi_mask_in_use = true;
+		return;
+	}
+
 	if (!have_bounds && zone_count == 0) {
 		return;
 	}
@@ -348,21 +984,8 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 		*out_src = COMP_REAR_BUDGET_ROI_SRC_BOUNDS;
 	}
 
-	/*
-	 * Map the resolved region into preview pixels. The preview covers
-	 * `canvas_u0..v1` OF THE CANVAS — normally 0,0,1,1, but a display
-	 * processor may include a margin. One that predates the field leaves it
-	 * zeroed, and that is the documented normal case rather than a degenerate
-	 * one, so it reads as the identity instead of disabling the ROI.
-	 */
-	float cu0 = pv->canvas_u0, cv0 = pv->canvas_v0, cu1 = pv->canvas_u1, cv1 = pv->canvas_v1;
-	if (!(cu1 > cu0) || !(cv1 > cv0)) {
-		cu0 = 0.0f;
-		cv0 = 0.0f;
-		cu1 = 1.0f;
-		cv1 = 1.0f;
-	}
-
+	// Map the resolved region into preview pixels, through the canvas rect
+	// resolved above.
 	const float w_px = (float)pv->width;
 	const float h_px = (float)pv->height;
 	float x0 = (ru0 - cu0) / (cu1 - cu0) * w_px;
@@ -501,9 +1124,17 @@ comp_rear_budget_set_zone_rects(struct comp_rear_budget *b,
 	}
 
 	os_mutex_lock(&b->publish_mutex);
-	b->zone_count = kept;
-	if (kept > 0) {
-		memcpy(b->zones, keep, sizeof(keep[0]) * (size_t)kept);
+	// Zones are republished EVERY frame, so the generation must count changes
+	// rather than publishes: bumping it unconditionally would invalidate the v3
+	// mask cache once per frame and turn it into a rebuild with extra steps.
+	const bool changed = kept != b->zone_count ||
+	                     (kept > 0 && memcmp(b->zones, keep, sizeof(keep[0]) * (size_t)kept) != 0);
+	if (changed) {
+		b->zone_count = kept;
+		if (kept > 0) {
+			memcpy(b->zones, keep, sizeof(keep[0]) * (size_t)kept);
+		}
+		b->zone_gen++;
 	}
 	b->zones_ns = now_ns;
 	os_mutex_unlock(&b->publish_mutex);
@@ -549,6 +1180,7 @@ comp_rear_budget_init(struct comp_rear_budget *b, const char *label)
 	memset(b, 0, sizeof(*b));
 	b->dump = -1;
 	b->roi_enabled = -1;
+	b->mask_enabled = -1;
 
 	if (os_mutex_init(&b->publish_mutex) != 0) {
 		// Without the lock the publish/read pair is a data race, so the
@@ -579,6 +1211,25 @@ comp_rear_budget_fini(struct comp_rear_budget *b)
 	b->dump_bgra = NULL;
 	b->dump_cap = 0;
 	b->dump_have = false;
+	free(b->dump_tint);
+	b->dump_tint = NULL;
+	b->dump_tint_cap = 0;
+	free(b->mask_cells);
+	b->mask_cells = NULL;
+	b->mask_cap = 0;
+	b->mask_valid = false;
+	free(b->mask_work);
+	b->mask_work = NULL;
+	b->mask_work_cap = 0;
+	free(b->roi_mask);
+	b->roi_mask = NULL;
+	b->roi_mask_cap = 0;
+	b->roi_mask_px = 0;
+	b->roi_mask_in_use = false;
+	b->roi_mask_key.valid = false;
+	free(b->dilate_scratch);
+	b->dilate_scratch = NULL;
+	b->dilate_scratch_cap = 0;
 	os_mutex_destroy(&b->publish_mutex);
 }
 
@@ -696,14 +1347,20 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		const bool gen_new = !b->have_generation || pv->generation != b->last_generation;
 		const bool roi_new = !b->have_roi || roi.x != b->last_roi.x || roi.y != b->last_roi.y ||
 		                     roi.w != b->last_roi.w || roi.h != b->last_roi.h;
+		// A silhouette can change shape inside an unchanged bounding rect —
+		// an arm coming down moves no edge of the box — so the mask needs its
+		// own "this is not what we measured last time" term.
+		const bool mask_new = b->roi_mask_in_use && b->roi_mask_build_id != b->last_analysed_mask_build_id;
 
-		if (gen_new || roi_new) {
+		if (gen_new || roi_new || mask_new) {
 			struct u_bg_neutrality_result res = {0};
-			if (u_bg_neutrality_analyse(pv->bgra, pv->width, pv->height, pv->stride_bytes, &roi, NULL,
-			                            &res)) {
+			const uint8_t *mask = b->roi_mask_in_use ? b->roi_mask : NULL;
+			if (u_bg_neutrality_analyse_masked(pv->bgra, pv->width, pv->height, pv->stride_bytes, &roi,
+			                                   mask, b->roi_mask_w, NULL, &res)) {
 				b->result = res;
 				b->have_result = true;
 			}
+			b->last_analysed_mask_build_id = b->roi_mask_build_id;
 		}
 		b->last_roi = roi;
 		b->last_roi_narrowed = narrowed;
@@ -755,8 +1412,9 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		// region because the policy is deliberately ROI-blind. Without this a
 		// busy verdict is unattributable: measured under the content, or over
 		// a canvas the content was nowhere near?
-		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u (%s)", b->policy.label[0] != '\0' ? b->policy.label : "session",
-		        b->last_roi.x, b->last_roi.y, b->last_roi.w, b->last_roi.h,
+		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u mask=%u (%s)",
+		        b->policy.label[0] != '\0' ? b->policy.label : "session", b->last_roi.x, b->last_roi.y,
+		        b->last_roi.w, b->last_roi.h, b->roi_mask_in_use ? b->roi_mask_px : 0u,
 		        !b->have_roi ? "no preview analysed" : comp_rear_budget_roi_src_str(b->last_roi_src));
 	}
 
@@ -764,7 +1422,7 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		if (b->dump_have) {
 			const comp_rear_budget_dump_fn sink =
 			    (b->dump_sink != NULL) ? b->dump_sink : comp_rear_budget_dump_png;
-			sink(b->dump_sink_ctx, b->dump_bgra, b->dump_w, b->dump_h, b->dump_w * 4u);
+			sink(b->dump_sink_ctx, comp_rear_budget_dump_image(b), b->dump_w, b->dump_h, b->dump_w * 4u);
 		} else if (!b->dump_missing_logged) {
 			// Name the negative path once. "Armed and silent" was exactly the
 			// symptom of the bug above, so it must never read that way again.

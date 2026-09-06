@@ -6315,6 +6315,22 @@ comp_d3d12_compositor_set_content_bounds(struct xrt_compositor *xc,
 	comp_rear_budget_set_content_bounds(&d3d12_comp(xc)->rear_budget, u0, v0, u1, v1, now_ns);
 }
 
+extern "C" void
+comp_d3d12_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	comp_rear_budget_set_content_mask(&d3d12_comp(xc)->rear_budget, cells, w, h, stride, margin_normalized,
+	                                  now_ns);
+}
+
 extern "C" bool
 comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
 {

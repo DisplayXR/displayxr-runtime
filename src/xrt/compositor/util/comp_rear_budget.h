@@ -87,6 +87,30 @@ typedef void (*comp_rear_budget_dump_fn)(void *ctx, const uint8_t *bgra, uint32_
 #define COMP_REAR_BUDGET_MAX_ZONES XRT_MAX_LAYERS
 
 /*!
+ * Widest and tallest content mask the runner will accept, matching
+ * `XrContentMaskDXR`'s own 1..512 limit. 512 x 512 = 256 KB, the largest copy
+ * one xrEndFrame can hand over.
+ *
+ * @ingroup comp_util
+ */
+#define COMP_REAR_BUDGET_MASK_MAX_DIM 512u
+
+/*!
+ * Fewest preview pixels the dilated, zone-clamped mask must cover before it is
+ * used as the region.
+ *
+ * A mask that survives as a sliver cannot be measured — @ref
+ * u_bg_neutrality_analyse_masked refuses fewer than
+ * @ref U_BG_NEUTRALITY_MIN_MASKED_SAMPLES samples — and a refusal here would
+ * freeze the previous verdict instead of producing a new one. So the runner
+ * checks first and falls through to the rect path, which is a coarser question
+ * with an answer rather than a finer one without.
+ *
+ * @ingroup comp_util
+ */
+#define COMP_REAR_BUDGET_MASK_MIN_PX 64u
+
+/*!
  * Where the ROI the last analysis used came from. Reported on each state
  * transition, because a rear-depth verdict whose region is unattributable
  * cannot be argued with.
@@ -97,6 +121,12 @@ enum comp_rear_budget_roi_src
 {
 	//! No usable bounds and no zones — v1's whole-preview region.
 	COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW = 0,
+	/*!
+	 * The app's content occupancy MASK (v3), resampled onto the preview grid,
+	 * clamped to the frame's 3D zones and dilated. `roi` is then only the
+	 * bounding rect of that mask — what was measured is the mask itself.
+	 */
+	COMP_REAR_BUDGET_ROI_SRC_MASK,
 	//! The app's content bounds, unclamped (full-window app: no 3D zones).
 	COMP_REAR_BUDGET_ROI_SRC_BOUNDS,
 	//! The app's content bounds intersected with the frame's 3D zones.
@@ -203,6 +233,77 @@ struct comp_rear_budget
 	/*! @} */
 
 	/*!
+	 * @name XR_DXR_depth_budget v3 - the content occupancy MASK
+	 *
+	 * A rect around a character is roughly two thirds background the model
+	 * never covers, and any horizontal structure in that surplus closes the
+	 * budget. The app already computes its silhouette every frame (it is the
+	 * click-through window region), so v3 measures under THAT.
+	 *
+	 * Two buffers, and they are deliberately different things:
+	 *
+	 * - @ref mask_cells is the app's grid as it arrived, copied under
+	 *   @ref publish_mutex because it crosses from the app thread to the
+	 *   render thread. The render thread must never read app memory.
+	 * - @ref roi_mask is the runner's own, in PREVIEW pixels: the app grid
+	 *   resampled, zone-clamped, dilated. It is what the analysis reads, and
+	 *   it is rebuilt only when one of its inputs changed
+	 *   (@ref roi_mask_key), because on a quiet desktop nothing else does.
+	 * @{
+	 */
+	uint8_t *mask_cells;  //!< App grid, tightly packed (stride = @ref mask_w). NULL = none.
+	size_t mask_cap;      //!< Bytes allocated at @ref mask_cells.
+	uint32_t mask_w, mask_h;
+	float mask_margin;    //!< marginNormalized, window-normalised units.
+	uint64_t mask_ns;     //!< When the app last chained a mask.
+	bool mask_valid;      //!< The last chained mask was usable and not all-zero.
+	uint32_t mask_gen;    //!< Bumped on every accepted mask; the cache key's first term.
+
+	/*!
+	 * The app grid copied OUT from under the lock before it is resampled.
+	 * The copy is one bounded memcpy (<= 256 KB, at the poll rate); resampling
+	 * under the lock instead would hold it for the length of a 512x512 scan
+	 * while the app's locate thread waits to read a float.
+	 */
+	uint8_t *mask_work;
+	size_t mask_work_cap;
+	uint32_t mask_work_w, mask_work_h;
+	float mask_work_margin;
+
+	uint8_t *roi_mask;    //!< Preview-res, 1 byte/px, tight stride (@ref roi_mask_w).
+	size_t roi_mask_cap;
+	uint32_t roi_mask_w, roi_mask_h;
+	uint32_t roi_mask_px; //!< Nonzero pixels in @ref roi_mask; 0 = not usable.
+	//! Bounding rect of the dilated mask, in preview pixels — what `roi=` logs.
+	struct u_bg_roi roi_mask_rect;
+	//! The mask was the region the LAST analysis measured through.
+	bool roi_mask_in_use;
+	//! Inputs the current @ref roi_mask was built from; a change rebuilds it.
+	struct
+	{
+		uint32_t mask_gen;
+		uint32_t zone_gen;
+		uint32_t zone_count;
+		uint32_t pw, ph;
+		float cu0, cv0, cu1, cv1;
+		bool valid;
+	} roi_mask_key;
+	//! Bumped on every rebuild, so the tick can re-measure an unchanged capture.
+	uint32_t roi_mask_build_id;
+	uint32_t last_analysed_mask_build_id;
+	//! DXR_REAR_BUDGET_MASK. -1 = unprobed, 0 = mask off, bounds still on.
+	int mask_enabled;
+	//! One-shot: the mask fell entirely outside every 3D zone.
+	bool mask_outside_logged;
+	//! Scratch for the separable dilation; grown with the preview.
+	uint32_t *dilate_scratch;
+	size_t dilate_scratch_cap;
+	//! Tinted copy handed to the dump sink; only allocated while dumping.
+	uint8_t *dump_tint;
+	size_t dump_tint_cap;
+	/*! @} */
+
+	/*!
 	 * @name XR_DXR_depth_budget v2 - the 3D display zones the ROI is clamped to
 	 *
 	 * The bounds contract is WINDOW-normalised, and an app can get that wrong in
@@ -227,6 +328,13 @@ struct comp_rear_budget
 	uint32_t zone_count;
 	//! When the zones were last published; older than a second is "stopped".
 	uint64_t zones_ns;
+	/*!
+	 * Bumped only when the RECTS change, never merely because a frame
+	 * republished them. Zones are published every frame, so a generation that
+	 * counted publishes would rebuild the v3 mask every frame and make the
+	 * cache a memcpy with extra steps.
+	 */
+	uint32_t zone_gen;
 	//! One-shot: the bounds fell entirely outside every 3D zone.
 	bool zones_outside_logged;
 	/*! @} */
@@ -319,6 +427,46 @@ comp_rear_budget_set_content_bounds(struct comp_rear_budget *b,
                                     float u1,
                                     float v1,
                                     uint64_t now_ns);
+
+/*!
+ * XR_DXR_depth_budget v3: this frame's content OCCUPANCY MASK — the union over
+ * all views of the app's rendered silhouette, as it chained it on xrEndFrame
+ * (`XrContentMaskDXR`).
+ *
+ * Takes precedence over @ref comp_rear_budget_set_content_bounds: a rect around
+ * a character is mostly background the character never covers, and horizontal
+ * structure in that surplus closes a budget the silhouette itself would have
+ * left open. Bounds stay valid and are the fallback — the precedence is
+ * mask → bounds → 3D zones → whole preview, each step falling through when the
+ * one above is absent, all-zero or older than a second.
+ *
+ * The cells are copied HERE, under the runner's own mutex, even though the
+ * caller has usually copied them already: the render thread must never read a
+ * pointer the app owns, and "usually" is not a threading argument.
+ *
+ * Called from the APP thread while @ref comp_rear_budget_tick runs on the
+ * render thread.
+ *
+ * @param cells   Row-major, top-left origin, one byte per cell, nonzero =
+ *                content occupies the cell; normalised to the app WINDOW'S
+ *                client rect exactly as the bounds are. NULL (or a mask with no
+ *                nonzero cell) means "absent" and drops back to the bounds.
+ * @param w,h     Grid dims, 1..@ref COMP_REAR_BUDGET_MASK_MAX_DIM.
+ * @param stride  Row pitch of @p cells in bytes; >= @p w.
+ * @param margin_normalized Extra dilation the app wants, window-normalised, ON
+ *                TOP of the runtime's own default.
+ * @param now_ns  Monotonic now, for the staleness rule.
+ *
+ * @ingroup comp_util
+ */
+void
+comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
+                                  const uint8_t *cells,
+                                  uint32_t w,
+                                  uint32_t h,
+                                  uint32_t stride,
+                                  float margin_normalized,
+                                  uint64_t now_ns);
 
 /*!
  * XR_DXR_depth_budget v2: THIS frame's 3D display zones (XR_DXR_display_zones),
@@ -442,6 +590,30 @@ comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_ro
  */
 enum comp_rear_budget_roi_src
 comp_rear_budget_debug_last_roi_src(const struct comp_rear_budget *b);
+
+/*!
+ * TEST ONLY — the dilated, zone-clamped mask the last analysis measured
+ * through, in preview pixels.
+ *
+ * The ROI rect alone cannot describe a mask: a bar and the box around it have
+ * the same bounding rect and measure completely different pixels, which is the
+ * whole reason v3 exists.
+ *
+ * @param out_mask  Receives a pointer to the runner's own buffer, valid until
+ *                  the next tick; may be NULL.
+ * @param out_w,out_h  Preview dims the mask is in; may be NULL.
+ * @param out_px    Nonzero pixel count; may be NULL.
+ *
+ * @return false when the last analysis used a rect rather than a mask.
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
+                                 const uint8_t **out_mask,
+                                 uint32_t *out_w,
+                                 uint32_t *out_h,
+                                 uint32_t *out_px);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.

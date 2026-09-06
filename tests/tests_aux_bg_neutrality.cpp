@@ -257,3 +257,252 @@ TEST_CASE("bg_neutrality: custom thresholds are respected")
 	REQUIRE(u_bg_neutrality_analyse(img.data(), img.w, img.h, img.stride, nullptr, &p, &loose));
 	CHECK(loose.neutral);
 }
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * v3: the masked metric (XR_DXR_depth_budget, #1365)
+ *
+ * A rectangle around a character is roughly two thirds background the character
+ * never covers. These pin the three things the mask changes: what counts as a
+ * sample, what a column's density is measured over, and what happens when the
+ * mask leaves too little to measure.
+ * -----------------------------------------------------------------------------
+ */
+
+namespace {
+
+//! A preview-res mask: nonzero = analyse here.
+struct Mask
+{
+	uint32_t w = 0, h = 0;
+	std::vector<uint8_t> px;
+
+	Mask(uint32_t w_, uint32_t h_) : w(w_), h(h_) { px.assign((size_t)w_ * h_, 0); }
+
+	void
+	rect(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+	{
+		for (uint32_t y = y0; y < y1; y++) {
+			for (uint32_t x = x0; x < x1; x++) {
+				px[(size_t)y * w + x] = 1;
+			}
+		}
+	}
+
+	const uint8_t *
+	data() const
+	{
+		return px.data();
+	}
+};
+
+u_bg_neutrality_result
+analyse_masked(const Img &img, const Mask &m, const u_bg_roi *roi = nullptr)
+{
+	u_bg_neutrality_result out{};
+	REQUIRE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, roi, m.data(), m.w, nullptr,
+	                                       &out));
+	return out;
+}
+
+} // namespace
+
+TEST_CASE("bg_neutrality: a mask that excludes the busy patch is neutral")
+{
+	// The v3 case in one picture: a character-shaped region over flat desktop,
+	// with text beside it INSIDE the same bounding rect. v2 measured the rect
+	// and closed; v3 measures the silhouette and does not.
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+	for (uint32_t y = 20; y < 80; y++) {
+		for (uint32_t x = 120; x < 190; x++) {
+			const uint8_t v = ((x + y) % 2) ? 255 : 0;
+			img.set(x, y, v, v, v);
+		}
+	}
+
+	// The rect around both is busy...
+	u_bg_roi rect = {10, 10, 185, 85};
+	CHECK_FALSE(analyse(img, &rect).neutral);
+
+	// ...and the bar alone, inside that same rect, is not.
+	Mask bar(200, 100);
+	bar.rect(20, 15, 60, 90);
+	auto r = analyse_masked(img, bar, &rect);
+	CHECK(r.neutral);
+	CHECK(r.edge_fraction == 0.0f);
+	CHECK(r.max_column_density == 0.0f);
+}
+
+TEST_CASE("bg_neutrality: a mask that includes the busy patch is busy")
+{
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+	for (uint32_t y = 20; y < 80; y++) {
+		for (uint32_t x = 120; x < 190; x++) {
+			const uint8_t v = ((x + y) % 2) ? 255 : 0;
+			img.set(x, y, v, v, v);
+		}
+	}
+
+	// Same buffer, same ROI - only the mask moved. If the mask were being
+	// ignored, this and the case above would return the same verdict.
+	Mask over(200, 100);
+	over.rect(125, 25, 185, 75);
+	u_bg_roi rect = {10, 10, 185, 85};
+
+	auto r = analyse_masked(img, over, &rect);
+	CHECK_FALSE(r.neutral);
+	CHECK(r.edge_fraction > 0.003f);
+	CHECK(r.cue_energy == 1.0f);
+}
+
+TEST_CASE("bg_neutrality: edge_fraction is over MASKED samples, not the ROI area")
+{
+	// A busy patch that fills the mask entirely reads high, not the ~4% it
+	// would if the denominator were still the rect. Dividing by the rect would
+	// make a small silhouette over solid text look quiet.
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+	for (uint32_t y = 0; y < 100; y++) {
+		for (uint32_t x = 100; x < 140; x++) {
+			const uint8_t v = (x % 2) ? 255 : 0;
+			img.set(x, y, v, v, v);
+		}
+	}
+
+	Mask on_patch(200, 100);
+	on_patch.rect(101, 0, 139, 100);
+
+	auto r = analyse_masked(img, on_patch);
+	CHECK(r.edge_fraction > 0.9f);
+	CHECK_FALSE(r.neutral);
+}
+
+TEST_CASE("bg_neutrality: a pair straddling the mask edge is not a sample")
+{
+	// The app's own silhouette border against the desktop is not a background
+	// cue. If half-masked pairs counted, EVERY mask would measure as busy at
+	// its own outline - the metric would be reporting the app to itself.
+	Img img(64, 64);
+	img.fill(0, 0, 0);
+	for (uint32_t y = 0; y < img.h; y++) {
+		for (uint32_t x = 32; x < img.w; x++) {
+			img.set(x, y, 255, 255, 255); // a hard vertical edge at x=31|32
+		}
+	}
+
+	Mask left(64, 64);
+	left.rect(0, 0, 32, 64); // ends exactly on the edge
+
+	auto r = analyse_masked(img, left);
+	CHECK(r.neutral);
+	CHECK(r.edge_fraction == 0.0f);
+}
+
+TEST_CASE("bg_neutrality: a short masked column cannot set the column density")
+{
+	// One edge over two masked pairs is a density of 0.5 - two and a half
+	// times the 0.20 limit, read off two samples. The column term exists to
+	// catch a border spanning the region, and a two-row column cannot
+	// describe one.
+	Img img(200, 100);
+	img.fill(20, 20, 20);
+	for (uint32_t y = 0; y < img.h; y++) {
+		img.set(50, y, 240, 240, 240);
+	}
+
+	Mask sliver(200, 100);
+	// Masked across the line but only 2 rows tall: under the 4-pair floor.
+	sliver.rect(49, 10, 52, 12);
+	// Plus enough flat area elsewhere to clear the 64-sample floor.
+	sliver.rect(100, 0, 140, 60);
+
+	auto r = analyse_masked(img, sliver);
+	CHECK(r.max_column_density == 0.0f);
+	CHECK(r.neutral);
+
+	// The same line, masked tall enough to mean something, DOES close it.
+	Mask tall(200, 100);
+	tall.rect(45, 0, 55, 100);
+	auto busy = analyse_masked(img, tall);
+	CHECK(busy.max_column_density == 1.0f);
+	CHECK_FALSE(busy.neutral);
+}
+
+TEST_CASE("bg_neutrality: too few masked samples returns false, never 'neutral'")
+{
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+
+	// 8x8 masked = 7 pairs x 8 rows = 56 samples, under the floor of 64. A
+	// fraction over 56 samples is noise; reporting it as neutral would open
+	// the budget on the strength of nothing.
+	Mask tiny(200, 100);
+	tiny.rect(10, 10, 18, 18);
+
+	u_bg_neutrality_result out{};
+	CHECK_FALSE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, nullptr, tiny.data(), tiny.w,
+	                                           nullptr, &out));
+	CHECK_FALSE(out.neutral);
+
+	// One more masked column clears the floor (8 pairs x 8 rows = 64).
+	Mask just_enough(200, 100);
+	just_enough.rect(10, 10, 19, 18);
+	REQUIRE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, nullptr, just_enough.data(),
+	                                       just_enough.w, nullptr, &out));
+	CHECK(out.neutral);
+}
+
+TEST_CASE("bg_neutrality: an all-zero mask measures nothing and returns false")
+{
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+	Mask none(200, 100);
+
+	u_bg_neutrality_result out{};
+	CHECK_FALSE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, nullptr, none.data(), none.w,
+	                                           nullptr, &out));
+	CHECK_FALSE(out.neutral);
+}
+
+TEST_CASE("bg_neutrality: a NULL mask is exactly the unmasked call")
+{
+	// The v1/v2 callers go through the same code path now, so this is what
+	// pins that the mask parameter did not quietly change their answer.
+	Img img(200, 100);
+	img.fill(30, 30, 30);
+	for (uint32_t y = 0; y < img.h; y++) {
+		img.set(50, y, 240, 240, 240);
+	}
+
+	u_bg_neutrality_result plain{}, null_mask{};
+	REQUIRE(u_bg_neutrality_analyse(img.data(), img.w, img.h, img.stride, nullptr, nullptr, &plain));
+	REQUIRE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, nullptr, nullptr, 0, nullptr,
+	                                       &null_mask));
+	CHECK(plain.edge_fraction == null_mask.edge_fraction);
+	CHECK(plain.max_column_density == null_mask.max_column_density);
+	CHECK(plain.cue_energy == null_mask.cue_energy);
+	CHECK(plain.neutral == null_mask.neutral);
+
+	// And an unmasked ROI too small to hold 64 samples is still measured: the
+	// floor is a property of the MASK, not a new rule for everyone.
+	u_bg_roi small = {0, 0, 4, 4};
+	u_bg_neutrality_result tiny{};
+	CHECK(u_bg_neutrality_analyse(img.data(), img.w, img.h, img.stride, &small, nullptr, &tiny));
+	CHECK(tiny.neutral);
+}
+
+TEST_CASE("bg_neutrality: a mask stride below the width is rejected")
+{
+	Img img(64, 32);
+	img.fill(30, 30, 30);
+	Mask m(64, 32);
+	m.rect(0, 0, 64, 32);
+
+	u_bg_neutrality_result out{};
+	CHECK_FALSE(u_bg_neutrality_analyse_masked(img.data(), img.w, img.h, img.stride, nullptr, m.data(), 63,
+	                                           nullptr, &out));
+	CHECK_FALSE(out.neutral);
+}
