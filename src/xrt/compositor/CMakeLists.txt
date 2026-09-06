@@ -178,6 +178,8 @@ if(XRT_HAVE_VULKAN)
 		util/comp_high_level_scratch.h
 		util/comp_layer_accum.h
 		util/comp_layer_accum.c
+		util/comp_rear_budget.h
+		util/comp_rear_budget.c
 		util/comp_render.h
 		util/comp_render_cs.c
 		util/comp_render_gfx.c
@@ -197,7 +199,10 @@ if(XRT_HAVE_VULKAN)
 	target_link_libraries(
 		comp_util
 		PUBLIC xrt-interfaces
-		PRIVATE aux_util aux_os aux_vk comp_render
+		# xrt-external-stb: comp_rear_budget encodes the DXR_REAR_BUDGET_DUMP
+		# preview PNG (STB_IMAGE_WRITE_STATIC, so it cannot clash with the
+		# per-compositor copies).
+		PRIVATE aux_util aux_os aux_vk comp_render xrt-external-stb
 		)
 	target_include_directories(comp_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
