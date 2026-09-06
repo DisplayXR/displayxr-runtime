@@ -908,3 +908,482 @@ TEST_CASE("comp_rear_budget: DXR_REAR_BUDGET_ROI=0 also disables the zone clamp"
 	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW);
 	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
 }
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * v3: the silhouette occupancy mask ROI (#1365)
+ *
+ * A rect around a character is roughly two thirds background the character
+ * never covers, and any horizontal structure in that surplus closes a budget
+ * the silhouette itself would have left open. The app already computes the
+ * union-over-views silhouette every frame - it is its click-through window
+ * region - so v3 measures under THAT.
+ *
+ * Shared geometry below: a 200x100 preview over the whole canvas, so the
+ * runtime dilation is max(4% of 200, 8 px) = 8 px on every side, and a 20x10
+ * mask grid whose cells are 10x10 preview pixels each.
+ * -----------------------------------------------------------------------------
+ */
+
+namespace {
+
+//! An XrContentMaskDXR-shaped grid, window-normalised like the bounds are.
+struct MaskGrid
+{
+	uint32_t w, h;
+	std::vector<uint8_t> cells;
+
+	MaskGrid(uint32_t w_, uint32_t h_) : w(w_), h(h_) { cells.assign((size_t)w_ * h_, 0); }
+
+	//! Half-open cell range, matching how the runtime reads the grid.
+	void
+	set(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+	{
+		for (uint32_t y = y0; y < y1; y++) {
+			for (uint32_t x = x0; x < x1; x++) {
+				cells[(size_t)y * w + x] = 1;
+			}
+		}
+	}
+};
+
+//! The app's content mask, as xrEndFrame would forward it.
+void
+mask(Runner &r, const MaskGrid &m, uint64_t now_ns, float margin = 0.0f)
+{
+	comp_rear_budget_set_content_mask(&r.b, m.cells.data(), m.w, m.h, m.w, margin, now_ns);
+}
+
+//! Nonzero preview pixels of the dilated mask the last analysis measured through.
+uint32_t
+mask_px(Runner &r)
+{
+	uint32_t px = 0;
+	if (!comp_rear_budget_debug_last_mask(&r.b, nullptr, nullptr, nullptr, &px)) {
+		return 0;
+	}
+	return px;
+}
+
+//! Whether preview pixel (x, y) is inside the dilated mask.
+bool
+mask_at(Runner &r, uint32_t x, uint32_t y)
+{
+	const uint8_t *m = nullptr;
+	uint32_t w = 0, h = 0;
+	if (!comp_rear_budget_debug_last_mask(&r.b, &m, &w, &h, nullptr)) {
+		return false;
+	}
+	if (x >= w || y >= h) {
+		return false;
+	}
+	return m[(size_t)y * w + x] != 0;
+}
+
+//! A dump sink that keeps the whole image, so the tint can be inspected.
+struct TintSink
+{
+	int calls = 0;
+	uint32_t w = 0, h = 0;
+	std::vector<uint8_t> image;
+
+	static void
+	fn(void *ctx, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride)
+	{
+		auto *self = static_cast<TintSink *>(ctx);
+		self->calls++;
+		self->w = w;
+		self->h = h;
+		self->image.assign(bgra, bgra + (size_t)stride * h);
+	}
+
+	const uint8_t *
+	at(uint32_t x, uint32_t y) const
+	{
+		return image.data() + ((size_t)y * w + x) * 4u;
+	}
+};
+
+} // namespace
+
+TEST_CASE("comp_rear_budget: one nonzero cell marks every preview pixel it overlaps")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// Cell (5, 5) of a 20x10 grid covers u 0.25..0.30 and v 0.5..0.6 - preview
+	// px 50..59 x 50..59 - and the dilation adds 8 on every side.
+	MaskGrid m(20, 10);
+	m.set(5, 5, 6, 6);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 42);
+	CHECK(roi.y == 42);
+	CHECK(roi.w == 26); // 42..67
+	CHECK(roi.h == 26);
+	CHECK(mask_px(r) == 26u * 26u);
+
+	// Any-coverage means the WHOLE cell is marked, not just the pixel under
+	// its centre: under-reporting the silhouette is the one error that opens
+	// the budget over something it never measured.
+	CHECK(mask_at(r, 50, 50));
+	CHECK(mask_at(r, 59, 59));
+	CHECK(mask_at(r, 42, 42)); // the dilation band
+	CHECK_FALSE(mask_at(r, 41, 50));
+	CHECK_FALSE(mask_at(r, 68, 50));
+}
+
+TEST_CASE("comp_rear_budget: a mask cell finer than a preview pixel still marks one")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// A 512x512 grid over a 200x100 preview: one cell is 0.39 x 0.20 px. A
+	// pixel-first "which cell is under my centre" resample would drop it
+	// entirely, and a silhouette that vanishes reads as no region at all.
+	MaskGrid m(512, 512);
+	m.set(256, 256, 257, 257);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi roi = roi_of(r);
+	// One pixel at (100, 50), dilated by 8 on every side.
+	CHECK(roi.x == 92);
+	CHECK(roi.y == 42);
+	CHECK(roi.w == 17);
+	CHECK(roi.h == 17);
+}
+
+TEST_CASE("comp_rear_budget: the app's margin widens the dilation")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	MaskGrid m(20, 10);
+	m.set(5, 5, 6, 6);
+	// 0.1 of the window = 20 preview px, which is wider than the runtime's
+	// own 8 - marginNormalized is ON TOP of the default, not instead of it,
+	// so the wider of the two wins.
+	mask(r, m, 0, /*margin=*/0.1f);
+	step(r, &neutral.pv, 0);
+
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 30);          // 50 - 20
+	CHECK(roi.x + roi.w == 80);  // 59 + 20, half-open
+}
+
+TEST_CASE("comp_rear_budget: the mask is clamped to the frame's 3D zones")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// One 3D zone on the left half (px 0..100); the right half is a 2D band.
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	// A silhouette spanning both: cells x 8..15 -> px 80..159, y 2..7 -> px 20..79.
+	MaskGrid m(20, 10);
+	m.set(8, 2, 16, 8);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi roi = roi_of(r);
+	// Clamped to px 80..99, dilated to 72..107, and clamped AGAIN - the band
+	// reaches into the 2D strip just as readily as the silhouette could.
+	CHECK(roi.x == 72);
+	CHECK(roi.x + roi.w == 100);
+	CHECK_FALSE(mask_at(r, 100, 50));
+	CHECK(mask_at(r, 99, 50));
+}
+
+TEST_CASE("comp_rear_budget: a mask entirely outside every 3D zone falls back to the bounds")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	// Squarely inside the 2D band: cells x 12..15 -> px 120..159.
+	MaskGrid m(20, 10);
+	m.set(12, 2, 16, 8);
+	mask(r, m, 0);
+	bounds(r, 0.3f, 0.2f, 0.45f, 0.8f, 0);
+	step(r, &neutral.pv, 0);
+
+	// The mask names no measurable region, so the next authority down answers.
+	// Never "neutral": an unmeasurable region must not open the budget.
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+	CHECK(mask_px(r) == 0);
+}
+
+TEST_CASE("comp_rear_budget: a mask too small to measure falls back rather than refusing")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// A 3D zone of 4 x 5 preview px. Whatever the mask says, at most 20 px
+	// survive the clamp - under the analysis's 64-sample floor. The analysis
+	// would REFUSE that, and a refusal mid-tick freezes the previous verdict
+	// instead of producing one, so the runner checks first.
+	zones(r, {{0.0f, 0.0f, 0.02f, 0.05f}}, 0);
+	MaskGrid m(20, 10);
+	m.set(0, 0, 1, 1);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_ZONES);
+	CHECK(mask_px(r) == 0);
+}
+
+TEST_CASE("comp_rear_budget: an all-zero mask is absent, not empty")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// "The app rendered nothing here" is absence. Measuring it would measure
+	// nothing, and nothing measures as neutral - which would open the budget
+	// over a desktop nobody looked at.
+	MaskGrid empty(20, 10);
+	mask(r, empty, 0);
+	bounds(r, 0.4f, 0.4f, 0.6f, 0.6f, 0);
+	step(r, &neutral.pv, 0);
+
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS);
+	CHECK(roi_of(r).w == 56); // the v2 answer, unchanged
+}
+
+TEST_CASE("comp_rear_budget: precedence is mask, then bounds, then zones, then the preview")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, 0);
+	bounds(r, 0.1f, 0.2f, 0.4f, 0.8f, 0);
+	MaskGrid m(20, 10);
+	m.set(2, 2, 6, 8);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+
+	// The app stops chaining the mask but keeps chaining bounds and zones. A
+	// silhouette from a second ago describes a pose that has since moved.
+	for (uint64_t t = 10 * MS; t <= 1500 * MS; t += 10 * MS) {
+		bounds(r, 0.1f, 0.2f, 0.4f, 0.8f, t);
+		zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, t);
+		step(r, &neutral.pv, t);
+	}
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+
+	// Then it stops chaining bounds too, and only the frame's own zones are
+	// left - a fact of the frame rather than a claim by the app.
+	for (uint64_t t = 1510 * MS; t <= 3000 * MS; t += 10 * MS) {
+		zones(r, {{0.0f, 0.0f, 0.5f, 1.0f}}, t);
+		step(r, &neutral.pv, t);
+	}
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_ZONES);
+
+	// And with the zones gone as well there is nothing left but v1.
+	for (uint64_t t = 3010 * MS; t <= 4600 * MS; t += 10 * MS) {
+		step(r, &neutral.pv, t);
+	}
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW);
+	CHECK(roi_of(r).w == 200);
+}
+
+TEST_CASE("comp_rear_budget: a busy patch beside the silhouette keeps the budget open")
+{
+	// The v3 case end to end. A wide bounds rect around a character with text
+	// beside it - an engine's animation-set AABB, or scenery unioned in -
+	// measures the text and closes. The silhouette does not touch it.
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// Bounds spanning the whole window, patch included.
+	bounds(r, 0.05f, 0.1f, 0.95f, 0.9f, 0);
+	// The character: a vertical bar at px 20..39, nowhere near the patch.
+	MaskGrid m(20, 10);
+	m.set(2, 1, 4, 9);
+	mask(r, m, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 12);
+	CHECK(roi.x + roi.w == 48);
+	CHECK(mask_px(r) > 0);
+
+	const u_rear_budget_out out = read(r);
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+	CHECK(out.far_offset_vh > U_REAR_BUDGET_UNRESTRICTED_VH - 0.5f);
+}
+
+TEST_CASE("comp_rear_budget: the same frame with the mask disabled closes")
+{
+	// The other arm of the A/B, and the reason DXR_REAR_BUDGET_MASK is
+	// separate from DXR_REAR_BUDGET_ROI: this asks "is the silhouette better
+	// than the box", not "is a region better than the canvas".
+	ScopedEnv off("DXR_REAR_BUDGET_MASK", "0");
+
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	bounds(r, 0.05f, 0.1f, 0.95f, 0.9f, 0);
+	MaskGrid m(20, 10);
+	m.set(2, 1, 4, 9);
+	mask(r, m, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS);
+	CHECK(mask_px(r) == 0);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}
+
+TEST_CASE("comp_rear_budget: DXR_REAR_BUDGET_ROI=0 disables the mask as well")
+{
+	ScopedEnv off("DXR_REAR_BUDGET_ROI", "0");
+
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	MaskGrid m(20, 10);
+	m.set(2, 1, 4, 9);
+	mask(r, m, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK_FALSE(narrowed);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}
+
+TEST_CASE("comp_rear_budget: a silhouette that changes inside an unchanged rect is re-measured")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(100, 0, 140, 100);
+
+	// Two cells at opposite ends fix the bounding rect; the desktop never
+	// changes, so the generation never advances either. Neither the rect nor
+	// the capture can tell the runner to look again - only the mask can.
+	MaskGrid clear_of_it(20, 10);
+	clear_of_it.set(2, 1, 4, 9);
+	clear_of_it.set(19, 1, 20, 9);
+	mask(r, clear_of_it, 0);
+	uint64_t t = run_for(r, &pv.pv, 0, 800);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi before = roi_of(r);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	// An arm comes down over the text. Same bounding rect, different pixels.
+	MaskGrid over_it(20, 10);
+	over_it.set(2, 1, 4, 9);
+	over_it.set(19, 1, 20, 9);
+	over_it.set(11, 3, 13, 7);
+	for (uint64_t u = t + 10 * MS; u <= t + 500 * MS; u += 10 * MS) {
+		mask(r, over_it, u);
+		step(r, &pv.pv, u);
+	}
+
+	const u_bg_roi after = roi_of(r);
+	CHECK(after.x == before.x);
+	CHECK(after.w == before.w); // the rect really did not move
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}
+
+TEST_CASE("comp_rear_budget: an oversized or malformed mask is refused, not truncated")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+	bounds(r, 0.4f, 0.4f, 0.6f, 0.6f, 0);
+
+	std::vector<uint8_t> cells((size_t)600 * 4, 1);
+
+	SECTION("wider than the 512-cell limit")
+	{
+		comp_rear_budget_set_content_mask(&r.b, cells.data(), 600, 4, 600, 0.0f, 0);
+	}
+	SECTION("stride below the width")
+	{
+		comp_rear_budget_set_content_mask(&r.b, cells.data(), 64, 4, 32, 0.0f, 0);
+	}
+	SECTION("null cells")
+	{
+		comp_rear_budget_set_content_mask(&r.b, nullptr, 64, 4, 64, 0.0f, 0);
+	}
+	SECTION("zero dims")
+	{
+		comp_rear_budget_set_content_mask(&r.b, cells.data(), 0, 0, 0, 0.0f, 0);
+	}
+
+	step(r, &neutral.pv, 0);
+
+	// Truncating to the first 512 columns would measure a region the app never
+	// described. The bounds are still fresh, so they answer.
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS);
+	CHECK(mask_px(r) == 0);
+}
+
+TEST_CASE("comp_rear_budget: the dump tints the mask the analysis judged")
+{
+	Runner r;
+	TintSink sink;
+	comp_rear_budget_debug_set_dump_sink(&r.b, TintSink::fn, &sink);
+
+	FakePreview neutral(200, 100, /*generation=*/1, /*busy=*/false); // fills 128
+	MaskGrid m(20, 10);
+	m.set(5, 5, 6, 6); // px 50..59, dilated to 42..67
+	mask(r, m, 0);
+	run_for(r, &neutral.pv, 0, 800);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+	REQUIRE(sink.calls > 0);
+	REQUIRE(sink.w == 200);
+
+	// Inside the dilated mask: 50% toward green. Without this the PNG answers
+	// "what did the desktop look like" but not "what did the runtime measure",
+	// and for a mask those are completely different pictures - a bar and the
+	// box around it share a bounding rect and share nothing else.
+	const uint8_t *judged = sink.at(50, 50);
+	CHECK(judged[0] == 64);                    // B halved
+	CHECK(judged[1] == (128 + 255) / 2);       // G toward 255
+	CHECK(judged[2] == 64);                    // R halved
+
+	// Outside it, the preview is untouched - the tint is the region, not a
+	// filter over the whole picture.
+	const uint8_t *untouched = sink.at(10, 10);
+	CHECK(untouched[0] == 128);
+	CHECK(untouched[1] == 128);
+	CHECK(untouched[2] == 128);
+}
+
+TEST_CASE("comp_rear_budget: the mask maps through a preview that carries a margin")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+	// A display processor capturing 25% beyond the window on every side: the
+	// preview spans window -0.25..1.25. Reading the grid as if the preview
+	// were the window would aim the silhouette a third of a screen to the left.
+	neutral.pv.canvas_u0 = -0.25f;
+	neutral.pv.canvas_v0 = -0.25f;
+	neutral.pv.canvas_u1 = 1.25f;
+	neutral.pv.canvas_v1 = 1.25f;
+
+	// Cell (5,5) of 20x10 = window u 0.25..0.30 -> (0.25+0.25)/1.5*200 = 66.67
+	// .. (0.30+0.25)/1.5*200 = 73.33, so px 66..73; dilated by 8 -> 58..81.
+	MaskGrid m(20, 10);
+	m.set(5, 5, 6, 6);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 58);
+	CHECK(roi.x + roi.w == 82);
+}

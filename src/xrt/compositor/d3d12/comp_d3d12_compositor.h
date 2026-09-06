@@ -151,6 +151,25 @@ comp_d3d12_compositor_set_content_bounds(struct xrt_compositor *xc,
                                          uint64_t now_ns);
 
 /*!
+ * XR_DXR_depth_budget v3: this frame's content occupancy MASK, as the app
+ * reported it via XrContentMaskDXR on xrEndFrame.
+ *
+ * Takes precedence over the bounds rect; a mask that is absent, all-zero or
+ * stale falls back to it. The cells are copied inside the runner, under its own
+ * lock - the render thread never reads app memory.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns);
+
+/*!
  * Request display mode switch (2D/3D) via display processor.
  *
  * @param xc The compositor.

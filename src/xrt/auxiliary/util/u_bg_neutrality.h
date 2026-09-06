@@ -76,10 +76,11 @@ struct u_bg_neutrality_params
 	//! Neutral iff edge_samples / total_samples < this. Default 0.003.
 	float max_edge_fraction;
 	/*!
-	 * Neutral iff the busiest COLUMN's edge density (edge rows / roi rows)
-	 * is below this. Default 0.20 — an area metric alone cannot see a single
-	 * vertical window border spanning the whole ROI, which is exactly the
-	 * cue that matters most.
+	 * Neutral iff the busiest COLUMN's edge density (edge rows / rows
+	 * SAMPLED in that column — the ROI's rows, or the masked ones under a
+	 * mask) is below this. Default 0.20 — an area metric alone cannot see a
+	 * single vertical window border spanning the whole ROI, which is exactly
+	 * the cue that matters most.
 	 */
 	float max_column_density;
 };
@@ -113,6 +114,37 @@ void
 u_bg_neutrality_params_default(struct u_bg_neutrality_params *p);
 
 /*!
+ * Fewest masked difference samples @ref u_bg_neutrality_analyse_masked will
+ * draw a conclusion from.
+ *
+ * A silhouette mask can narrow the measured set to a handful of pixels — a
+ * sliver of a character's arm against the preview grid — and a fraction over
+ * a handful of samples is noise, not a verdict. Below this the answer is
+ * "could not measure", which the policy above treats as no source at all;
+ * reporting it as neutral would open the budget on the strength of nothing.
+ *
+ * Applies ONLY when a mask is supplied: unmasked callers keep exactly the v1/v2
+ * rule (>= 2 columns, >= 1 row).
+ *
+ * @ingroup aux_util
+ */
+#define U_BG_NEUTRALITY_MIN_MASKED_SAMPLES 64u
+
+/*!
+ * Fewest masked pairs a COLUMN must hold before its edge density is allowed to
+ * set @ref u_bg_neutrality_result::max_column_density.
+ *
+ * The column metric exists to catch one vertical window border running the
+ * height of the region — a shape that needs a column to be tall to mean
+ * anything. Under a mask most columns are short (the top of a head, the gap
+ * between two legs), and one edge over two masked pairs is a density of 0.5:
+ * three times the default limit, read off two samples.
+ *
+ * @ingroup aux_util
+ */
+#define U_BG_NEUTRALITY_MIN_MASKED_COLUMN_PAIRS 4u
+
+/*!
  * Analyse @p roi of a BGRA8, top-down buffer.
  *
  * Luma is Y = 0.299R + 0.587G + 0.114B in [0,1]; the difference sampled is
@@ -142,6 +174,53 @@ u_bg_neutrality_analyse(const uint8_t *bgra,
                         const struct u_bg_roi *roi,
                         const struct u_bg_neutrality_params *p,
                         struct u_bg_neutrality_result *out);
+
+/*!
+ * @ref u_bg_neutrality_analyse, restricted to the pixels @p mask selects
+ * (XR_DXR_depth_budget v3).
+ *
+ * A rectangle around a character is roughly two thirds background the model
+ * never covers, and any horizontal structure in that surplus closes the budget.
+ * The app already knows its own silhouette, so v3 measures only under it.
+ *
+ * The mask is in the SAME pixel grid as @p bgra (one byte per pixel, nonzero =
+ * measure here), so a caller can keep one preview-sized mask and vary the ROI
+ * independently. Restricting the mask to a ROI is still worth doing — it is
+ * what bounds the scan — but the mask, not the rect, decides what counts.
+ *
+ * Masked metric, differing from the unmasked one only in what a "sample" is:
+ *
+ * - a horizontal difference sample at (x, y) counts only when BOTH pixels of
+ *   the pair, (x, y) and (x+1, y), are masked. A pair straddling the silhouette
+ *   edge is the app's OWN border against the desktop, not a background cue, and
+ *   counting it would make every silhouette look busy;
+ * - `edge_fraction` = edges / masked samples (not / ROI area);
+ * - a column's density is its edges over ITS masked pairs, and a column holding
+ *   fewer than @ref U_BG_NEUTRALITY_MIN_MASKED_COLUMN_PAIRS masked pairs is
+ *   skipped entirely — one edge over two pairs is a density of 0.5 and would
+ *   pin `max_column_density` on nothing;
+ * - fewer than @ref U_BG_NEUTRALITY_MIN_MASKED_SAMPLES masked samples in total
+ *   returns false. Never neutral.
+ *
+ * `cue_energy` and `neutral` are formed from those two numbers exactly as in
+ * the unmasked case.
+ *
+ * @param mask        One byte per pixel of the @p w x @p h buffer, nonzero =
+ *                    analyse. NULL is identical to @ref u_bg_neutrality_analyse.
+ * @param mask_stride Row pitch of @p mask in bytes; 0 means @p w. Must be >= w.
+ *
+ * @ingroup aux_util
+ */
+bool
+u_bg_neutrality_analyse_masked(const uint8_t *bgra,
+                               uint32_t w,
+                               uint32_t h,
+                               uint32_t stride,
+                               const struct u_bg_roi *roi,
+                               const uint8_t *mask,
+                               uint32_t mask_stride,
+                               const struct u_bg_neutrality_params *p,
+                               struct u_bg_neutrality_result *out);
 
 #ifdef __cplusplus
 }

@@ -105,6 +105,7 @@ layer_error_throttled(struct oxr_logger *log, XrResult res, const char *fmt, ...
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 
@@ -2260,6 +2261,13 @@ submit_passthrough_layer(struct oxr_session *sess,
 //! Clamp to the canvas-normalised range.
 #define OXR_CB_CLAMP01(v) ((v) < 0.0f ? 0.0f : ((v) > 1.0f ? 1.0f : (v)))
 
+/*!
+ * Widest and tallest XrContentMaskDXR grid accepted, matching the extension's
+ * own documented 1..512 limit. 512 x 512 = 256 KB, the largest copy one
+ * xrEndFrame will make.
+ */
+#define OXR_CONTENT_MASK_MAX_DIM 512u
+
 /*
  * XR_DXR_depth_budget v2 (#1365) - the app's content bounds, chained on
  * XrFrameEndInfo.
@@ -2379,6 +2387,135 @@ oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndI
 
 	oxr_session_set_content_bounds(sess, u0, v0, u1, v1, now_ns);
 }
+
+/*
+ * XR_DXR_depth_budget v3 (#1365) - the app's content occupancy MASK.
+ *
+ * A rect around a character is roughly two thirds background the character
+ * never covers, and any horizontal structure in that surplus closes a budget
+ * the silhouette itself would have left open. Transparent apps already compute
+ * the union-over-views silhouette every frame - it is their click-through
+ * window region - so v3 measures under THAT instead of under its bounding box.
+ *
+ * Same contract as the bounds: a hint, never a frame input. Nothing below can
+ * fail a frame, and every way of getting it wrong falls back to the bounds and
+ * then to the canvas.
+ */
+
+//! Dispatch to whichever native compositor owns this session's policy.
+static void
+oxr_session_set_content_mask(struct oxr_session *sess,
+                             const uint8_t *cells,
+                             uint32_t w,
+                             uint32_t h,
+                             uint32_t stride,
+                             float margin,
+                             uint64_t now_ns)
+{
+	if (sess->xcn == NULL) {
+		return;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_content_mask(&sess->xcn->base, cells, w, h, stride, margin, now_ns);
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		comp_vk_native_compositor_set_content_mask(&sess->xcn->base, cells, w, h, stride, margin, now_ns);
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_content_mask(&sess->xcn->base, cells, w, h, stride, margin, now_ns);
+		return;
+	}
+#endif
+	// GL, Metal and the IPC path run no policy, so there is nothing to aim.
+}
+
+//! Parse, validate, COPY and forward the optional XrContentMaskDXR on this frame.
+static void
+oxr_session_frame_end_content_mask(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo)
+{
+	const XrContentMaskDXR *cm = OXR_GET_INPUT_FROM_CHAIN(frameEndInfo, XR_TYPE_CONTENT_MASK_DXR, XrContentMaskDXR);
+	if (cm == NULL) {
+		// Not chained this frame. The compositor's own age rule (1 s) is
+		// what turns "stopped chaining" back into the bounds - re-sending
+		// "absent" here would punish a single dropped hint.
+		return;
+	}
+
+	const uint64_t now_ns = (uint64_t)os_monotonic_get_ns();
+
+	const uint32_t w = cm->width;
+	const uint32_t h = cm->height;
+	const uint32_t stride = cm->strideBytes;
+
+	if (cm->cells == NULL || w < 1u || h < 1u || w > OXR_CONTENT_MASK_MAX_DIM || h > OXR_CONTENT_MASK_MAX_DIM ||
+	    stride < w) {
+		if (!sess->warned_content_mask_invalid) {
+			sess->warned_content_mask_invalid = true;
+			U_LOG_W(
+			    "XrContentMaskDXR: %ux%u stride %u cells %p unusable (dims must be 1..%u and "
+			    "strideBytes >= width) - the rear-depth analysis falls back to the content "
+			    "bounds (one-time warning)",
+			    w, h, stride, (const void *)cm->cells, OXR_CONTENT_MASK_MAX_DIM);
+		}
+		// "Absent", not "empty": an empty region measures as neutral and
+		// would open the budget over a desktop nobody looked at.
+		oxr_session_set_content_mask(sess, NULL, 0, 0, 0, 0.0f, now_ns);
+		return;
+	}
+
+	float margin = cm->marginNormalized;
+	if (!isfinite(margin) || margin < 0.0f) {
+		margin = 0.0f;
+	}
+
+	/*
+	 * Copy NOW, on this thread, while the app's pointer is still guaranteed
+	 * valid - the spec only promises it until xrEndFrame returns, and the
+	 * compositor's render thread is nowhere near that guarantee. Tightly
+	 * packed on the way in, so the stride stops travelling.
+	 */
+	const size_t need = (size_t)w * (size_t)h;
+	const uint32_t slot = sess->content_mask.next & 1u;
+	if (sess->content_mask.cap[slot] < need) {
+		uint8_t *grown = realloc(sess->content_mask.cells[slot], need);
+		if (grown == NULL) {
+			// Out of memory for a hint. Fall back, never fail the frame.
+			oxr_session_set_content_mask(sess, NULL, 0, 0, 0, 0.0f, now_ns);
+			return;
+		}
+		sess->content_mask.cells[slot] = grown;
+		sess->content_mask.cap[slot] = need;
+	}
+	sess->content_mask.next = slot ^ 1u;
+
+	uint8_t *dst = sess->content_mask.cells[slot];
+	uint32_t nonzero = 0;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *src = cm->cells + (size_t)y * (size_t)stride;
+		uint8_t *row = dst + (size_t)y * (size_t)w;
+		memcpy(row, src, w);
+		for (uint32_t x = 0; x < w; x++) {
+			nonzero += (row[x] != 0) ? 1u : 0u;
+		}
+	}
+
+	if (nonzero == 0) {
+		// A grid with no occupied cell is "the app rendered nothing here",
+		// which is absence. Measuring it would measure nothing, and nothing
+		// measures as neutral.
+		oxr_session_set_content_mask(sess, NULL, 0, 0, 0, 0.0f, now_ns);
+		return;
+	}
+
+	oxr_session_set_content_mask(sess, dst, w, h, w, margin, now_ns);
+}
 #endif // OXR_HAVE_DXR_depth_budget
 
 XrResult
@@ -2433,6 +2570,11 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// frame had no layers.
 	if (sess->sys->inst->extensions.DXR_depth_budget) {
 		oxr_session_frame_end_content_bounds(sess, frameEndInfo);
+		// v3: the mask, read beside the bounds and taking precedence over
+		// them in the compositor. Both are read because an app is expected
+		// to keep chaining bounds as the fallback for a frame whose
+		// silhouette is unavailable.
+		oxr_session_frame_end_content_mask(sess, frameEndInfo);
 	}
 #endif
 

@@ -2459,6 +2459,30 @@ struct oxr_session
 	//! but it must be said once - a silently ignored hint reads to the app
 	//! exactly like one the runtime honoured.
 	bool warned_content_bounds_invalid;
+	//! One-shot: the same, for an unusable XrContentMaskDXR (v3).
+	bool warned_content_mask_invalid;
+	/*!
+	 * XR_DXR_depth_budget v3: the app's content occupancy mask, copied out
+	 * of app memory during xrEndFrame.
+	 *
+	 * DOUBLE-BUFFERED, and that is the point: the cells the app hands over
+	 * are only guaranteed valid until xrEndFrame returns, so they are copied
+	 * here and the COPY is what is forwarded to the compositor. Alternating
+	 * between two buffers means the copy this frame cannot overwrite the one
+	 * the previous frame's forward may still be reading - the compositor
+	 * takes its own copy under its lock, but the ordering between the two
+	 * threads is not this file's to assume.
+	 *
+	 * <= 256 KB each (512x512, the extension's own limit), allocated on
+	 * first use and freed with the session; an app that never chains a mask
+	 * pays nothing.
+	 */
+	struct
+	{
+		uint8_t *cells[2];
+		size_t cap[2];
+		uint32_t next; //!< Buffer the next copy goes into.
+	} content_mask;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones

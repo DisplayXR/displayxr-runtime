@@ -197,6 +197,28 @@ when the runtime lacks the extension.
   looks malformed. The zone clamp bounds the damage, and §6 names the two traps, but the real answer
   is a **mask-based ROI (v3)** — the runtime already rasterises per-frame masks for the zone wish, so
   the shape is available without the app computing anything new. A larger rectangle is not the fix.
+- **The shape was already being computed; nobody had asked for it (v3).** `XrContentMaskDXR`
+  (`SPEC_VERSION` 3) is the answer to the bullet above, and what makes it cheap is that a
+  transparent app derives the union-over-views rendered silhouette *every frame already* — it is
+  what its click-through window region is built from. The extension asks for a max-filter
+  downsample of that (<= 256x256) rather than for a new computation, so the app's side of the
+  contract stays "report geometry you already know" and no perceptual judgement moves into it.
+  The runtime resamples the grid with an any-coverage filter, clamps it to the frame's 3D zones,
+  dilates it by the conflict band and measures only masked pixels; bounds are not superseded but
+  demoted to the fallback, so an app that cannot produce a silhouette on some frame loses nothing.
+  The consequence worth naming is that the region and the *metric* had to change together: with a
+  mask, `edge_fraction` over the rect's area would understate a small silhouette over solid text,
+  a pair straddling the mask edge would report the app's own outline back to it as a background
+  cue, and a two-row column would set the column density off two samples. Each of those is a way
+  to make a more precise region produce a *less* trustworthy number.
+- **A finer region needs a lower bound on how fine.** The masked metric refuses fewer than 64
+  samples, and the runner refuses a mask that survives the zone clamp as a sliver — falling
+  through to the bounds instead. This is the same rule the whole feature is built on, applied one
+  level down: a coarser question with an answer beats a finer one without, because "could not
+  measure" and "measured and found quiet" must never collapse into the same verdict. It is also
+  why the dump PNG now tints the dilated mask: `roi=` cannot describe a mask (a bar and the box
+  around it share a bounding rect and share nothing else), so without the tint a v3 verdict would
+  be unfalsifiable in exactly the way v1's canvas-wide one was.
 - **One threshold cannot both admit and reject.** `u_bg_neutrality` reports `neutral` as `cue < 1.0`,
   and the panel found a background parked at 0.93–0.97: the dwell was served, the budget opened, the
   next sample crossed 1.0, it closed after the grace, for seconds. The dwell and the close grace are

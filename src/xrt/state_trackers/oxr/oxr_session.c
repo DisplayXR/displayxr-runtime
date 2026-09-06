@@ -3439,6 +3439,17 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_android_surface_session_fini(sess);
 #endif
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget v3: the content-mask double buffer. AFTER the
+	// compositor teardown above, which is what could still have been reading
+	// the copy the last xrEndFrame forwarded.
+	for (uint32_t i = 0; i < 2; i++) {
+		free(sess->content_mask.cells[i]);
+		sess->content_mask.cells[i] = NULL;
+		sess->content_mask.cap[i] = 0;
+	}
+#endif
+
 	free(sess);
 
 	return ret;
