@@ -3727,14 +3727,22 @@ vk_rear_budget_tick(struct comp_vk_native_compositor *c)
 	xrt_dp_background_preview_init(&pv);
 	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
 
-	// No #ifdef: `split` is always NULL where there is no split, and the
-	// forwarder compiles to its honest-NO stub off Windows.
+	/*
+	 * The guard is not decoration: `split` is a WINDOWS-ONLY member of this
+	 * struct (the whole #918 block is), so an unguarded read is a compile error
+	 * on Linux, macOS and Android — which is exactly how CI caught it.
+	 */
 	bool got = false;
-	if (polled && c->split != NULL) {
-		got = comp_vk_split_get_background_preview(c->split, &pv);
-	} else if (polled && c->display_processor != NULL) {
-		got = xrt_display_processor_vk_get_background_preview(
-		    (struct xrt_display_processor_vk *)c->display_processor, &pv);
+	if (polled) {
+#ifdef XRT_OS_WINDOWS
+		if (c->split != NULL) {
+			got = comp_vk_split_get_background_preview(c->split, &pv);
+		}
+#endif
+		if (!got && c->display_processor != NULL) {
+			got = xrt_display_processor_vk_get_background_preview(
+			    (struct xrt_display_processor_vk *)c->display_processor, &pv);
+		}
 	}
 
 	comp_rear_budget_tick(&c->rear_budget, got ? &pv : NULL, polled, c->transparent_background, now_ns);
