@@ -148,6 +148,17 @@ git tag [FULL_TAG]
 git push origin [FULL_TAG]
 ```
 
+The tag is **lightweight** (`git tag`, not `git tag -a`). That used to be
+load-bearing by accident: the Android APK derived its version from a bare
+`git describe`, which walks only *annotated* tags, so a lightweight release tag
+was skipped and the APK named itself after the last annotated one (v2.14.5) —
+while an annotated tag would instead have overflowed the old `versionCode`
+format and shipped an empty one. Both halves are fixed in
+`src/xrt/targets/openxr_android/build.gradle` (#1379: `--tags` + positional
+arithmetic + a loud failure), so **tag type is no longer load-bearing** —
+lightweight stays the convention, but annotating one would no longer break the
+APK. Do not "fix" an Android version problem by changing the tag type.
+
 Store the tagged commit SHA for later monitoring:
 `RELEASE_SHA=$(git rev-parse [FULL_TAG]^{commit})` (this is the marker
 commit). Also keep it as `MARKER_SHA` for Phase 7 rollback.

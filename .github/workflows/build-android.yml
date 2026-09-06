@@ -155,12 +155,15 @@ jobs:
           lfs: true
           # Tags are required, not optional. openxr_android/build.gradle derives
           # BOTH versionCode and versionName by shelling out to
-          # `git describe --match 'v*'`; on a shallow clone that has no tags the
-          # describe degrades to --always and yields a bare SHA, so the release
-          # APK ships versionName='<sha>' and an EMPTY versionCode -- which means
-          # Android cannot compare versions for in-place upgrade and a user
-          # cannot tell what they installed. v2.14.0 shipped exactly that.
+          # `git describe --tags --match 'v[0-9]*'`; on a shallow clone that has
+          # no tags the describe now FAILS THE BUILD (#1379) rather than
+          # degrading to a bare SHA + an EMPTY versionCode -- which is what
+          # v2.14.0 shipped (#1226) and what made in-place upgrade impossible.
           fetch-depth: 0
+          # fetch-depth alone is not enough: actions/checkout fetches with
+          # --no-tags unless this is set. Same guard DetectChanges already
+          # carries; the tag walk here is what names the APK (#1379).
+          fetch-tags: true
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -336,11 +339,89 @@ jobs:
           set -euo pipefail
           APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
           echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          # List once. `unzip -l "$APK" | grep -q ...` under `set -o pipefail`
+          # is a SIGPIPE race: grep -q exits at the first match, unzip dies with
+          # 141, and the pipeline "fails" even though the file IS present.
+          # Reproducible on macOS (16K pipe buffer) while staying green on the
+          # Linux runner -- i.e. a latent CI flake, not a local-only quirk.
+          APK_LIST=$(unzip -l "$APK")
           echo "Native libs:"
-          unzip -l "$APK" | grep '\.so$' || echo "(none)"
+          printf '%s\n' "$APK_LIST" | grep '\.so$' || echo "(none)"
+
+          # aapt2 is needed by both the version gate below and the CNSDK
+          # manifest-stamp gate further down; resolve it once.
+          AAPT2=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
+          if [ -z "$AAPT2" ]; then
+            echo "::error::no aapt2 under \$ANDROID_HOME/build-tools -- cannot read the APK manifest"
+            exit 1
+          fi
+
+          # ---- versionCode / versionName gate (#1379, #1226) ---------------
+          # Prove the stamps FROM THE ARTIFACT, the same way the CNSDK pair
+          # gate below does -- never from the inputs that were supposed to
+          # produce them.
+          #
+          # Three distinct failures this catches, all of which have shipped:
+          #   * EMPTY versionCode. #1226 (v2.14.0): a tagless clone, plus a
+          #     `catch (ignored) { return null }`. Android cannot compare
+          #     versions, so no installed unit can upgrade in place.
+          #   * WRONG base tag. #1379: `git describe` without `--tags` sees
+          #     only ANNOTATED tags, and our release tags are lightweight, so
+          #     every APK from v2.14.5 through v2.16.14 called itself
+          #     "v2.14.5-<n>-g<sha>".
+          #   * NON-MONOTONIC versionCode. Retail units carry 214500291
+          #     (v2.14.5-291 under the old format) and Android refuses a
+          #     downgrade, so anything <= that bricks in-place upgrade once,
+          #     irreversibly, on every pad in the field.
+          #
+          # scripts/android_version_code.py is an independent implementation of
+          # the arithmetic in build.gradle. Comparing the two is the whole
+          # point: a silent edit to either side fails here instead of shipping.
+          python3 scripts/android_version_code.py --selftest
+
+          badging=$("$AAPT2" dump badging "$APK")
+          vcode=$(printf '%s\n' "$badging" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p" | head -1)
+          vname=$(printf '%s\n' "$badging" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)
+          echo "APK stamps: versionCode='${vcode}' versionName='${vname}'"
+
+          if [ -z "$vcode" ]; then
+            echo "::error::APK has an EMPTY versionCode. Android cannot compare versions, so no installed unit can upgrade in place. This is #1226 -- do not ship it."
+            exit 1
+          fi
+          case "$vcode" in
+            ''|*[!0-9]*) echo "::error::versionCode '$vcode' is not a plain integer"; exit 1 ;;
+          esac
+          if [ "$vcode" -le 214500291 ]; then
+            echo "::error::versionCode $vcode is <= 214500291, the highest code already shipped (v2.14.5-291). Android refuses downgrades, so every retail unit would reject this APK as an in-place upgrade (#1379)."
+            exit 1
+          fi
+
+          describe=$(git describe --tags --long --match 'v[0-9]*')
+          want_code=$(python3 scripts/android_version_code.py --describe "$describe" --print code)
+          want_name=$(python3 scripts/android_version_code.py --describe "$describe" --print name)
+          echo "expected from '$describe': versionCode=$want_code versionName=$want_name"
+
+          if [ "$vcode" != "$want_code" ]; then
+            echo "::error::versionCode $vcode does not match the tag arithmetic for '$describe' (expected $want_code). build.gradle and scripts/android_version_code.py have diverged."
+            exit 1
+          fi
+          # A dirty CI tree is its own problem; do not let it mask the check.
+          if [ "${vname%-dirty}" != "$want_name" ]; then
+            echo "::error::versionName '$vname' does not match '$want_name' derived from '$describe'. If it names an older release than the tag you are building, git describe lost --tags again (#1379)."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            case "$vname" in
+              "$GITHUB_REF_NAME"|"$GITHUB_REF_NAME"-*) : ;;
+              *)
+                echo "::error::tag build of $GITHUB_REF_NAME produced versionName '$vname' -- the APK would name itself after a different release (#1379)."
+                exit 1 ;;
+            esac
+          fi
+          echo "  ok: versionCode=$vcode versionName=$vname (monotonic vs 214500291, matches $describe)"
 
           need() {
-            if ! unzip -l "$APK" | grep -q "lib/arm64-v8a/$1"; then
+            if ! printf '%s\n' "$APK_LIST" | grep -q "lib/arm64-v8a/$1"; then
               echo "::error::APK is missing lib/arm64-v8a/$1 — $2"
               exit 1
             fi
@@ -366,9 +447,9 @@ jobs:
             # legitimate AAR-supplied libleiaSDK-jni.so, so a substring grep
             # would make the leia variant unbuildable and was only ever green
             # because jniLibs/ is gitignored and empty on a runner.
-            if unzip -l "$APK" | grep -qE 'lib/arm64-v8a/(libleiaSDK\.so|libleia|libdxrp050)'; then
+            if printf '%s\n' "$APK_LIST" | grep -qE 'lib/arm64-v8a/(libleiaSDK\.so|libleia|libdxrp050)'; then
               echo "::error::vendor material leaked into the NEUTRAL runtime APK (ADR-019). The neutral variant must carry sim-display only."
-              unzip -l "$APK" | grep -E 'libleia|libdxrp'
+              printf '%s\n' "$APK_LIST" | grep -E 'libleia|libdxrp'
               exit 1
             fi
             echo "  ok: no vendor material (ADR-019)"
@@ -422,11 +503,6 @@ jobs:
             # print meta-data) without scraping strings out of the .so files. The
             # manifest stamp (com.displayxr.CNSDK_LOADER_VERSION, build.gradle) is
             # only worth trusting if it equals what the loader .so itself reports.
-            AAPT2=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)
-            if [ -z "$AAPT2" ]; then
-              echo "::error::no aapt2 under \$ANDROID_HOME/build-tools -- cannot read the manifest stamp"
-              exit 1
-            fi
             stamp=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" \
                       | grep -A1 'com.displayxr.CNSDK_LOADER_VERSION' \
                       | grep -oE ':value\([^)]*\)="[^"]*"' | head -1 | sed -E 's/.*="([^"]*)"/\1/')
