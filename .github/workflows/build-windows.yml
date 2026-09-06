@@ -368,8 +368,8 @@ jobs:
               if ($vsCode -ne 0) {
                 Write-Host "::error::tests_oxr_view_space failed (exit $vsCode) - xrLocateViews does not honour the base space (#1370)."
                 $code = $vsCode
-              } elseif ($vsOut -match "SKIP") {
-                Write-Host "::error::tests_oxr_view_space SKIPped with sim-display registered - the headless runtime did not come up (#1370)."
+              } elseif ($vsOut -cmatch "SKIPPED:") {
+                Write-Host "::error::tests_oxr_view_space SKIPped with sim-display registered - the headless runtime did not come up (#1370). (Catch2 prints SKIPPED: for an explicit skip; matched case-sensitively so the runtime's own 'skipping ...' INFO lines cannot trip it.)"
                 $code = 1
               } else {
                 Write-Host "PASS: tests_oxr_view_space (#1370 base-space gate)."
