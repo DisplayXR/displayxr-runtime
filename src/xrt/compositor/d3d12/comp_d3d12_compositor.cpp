@@ -6239,6 +6239,20 @@ comp_d3d12_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool 
 	comp_rear_budget_arm(&c->rear_budget, c->transparent_background);
 }
 
+extern "C" void
+comp_d3d12_compositor_set_content_bounds(struct xrt_compositor *xc,
+                                         float u0,
+                                         float v0,
+                                         float u1,
+                                         float v1,
+                                         uint64_t now_ns)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	comp_rear_budget_set_content_bounds(&d3d12_comp(xc)->rear_budget, u0, v0, u1, v1, now_ns);
+}
+
 extern "C" bool
 comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
 {

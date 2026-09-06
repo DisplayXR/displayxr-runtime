@@ -132,6 +132,25 @@ bool
 comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
+ * XR_DXR_depth_budget v2: where this frame's content projects, canvas-
+ * normalised (origin top-left), as the app reported it via XrContentBoundsDXR
+ * on xrEndFrame.
+ *
+ * Called from the app thread; the rect reaches the render thread under the
+ * runner's own lock. A non-positive extent means "unknown" and the analysis
+ * falls back to the whole preview, which is exactly v1's behaviour.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_content_bounds(struct xrt_compositor *xc,
+                                         float u0,
+                                         float v0,
+                                         float u1,
+                                         float v1,
+                                         uint64_t now_ns);
+
+/*!
  * Request display mode switch (2D/3D) via display processor.
  *
  * @param xc The compositor.

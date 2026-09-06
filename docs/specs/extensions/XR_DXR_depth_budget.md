@@ -3,8 +3,8 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_depth_budget` |
-| Spec Version | 1 |
-| Type Values | `XR_TYPE_REAR_DEPTH_BUDGET_DXR` (1004999260) · `XR_TYPE_CONTENT_BOUNDS_DXR` (1004999261, reserved for v2) · `XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR` (1004999262) |
+| Spec Version | 2 |
+| Type Values | `XR_TYPE_REAR_DEPTH_BUDGET_DXR` (1004999260) · `XR_TYPE_CONTENT_BOUNDS_DXR` (1004999261) · `XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR` (1004999262) |
 | Author | The DisplayXR Project |
 | Platform | All. The budget only ever *opens* where a background source exists; elsewhere it reports the conservative state and the app behaves exactly as it does today. |
 
@@ -66,11 +66,11 @@ supported configuration. See §6.
 
 ```c
 #define XR_DXR_depth_budget 1
-#define XR_DXR_depth_budget_SPEC_VERSION 1
+#define XR_DXR_depth_budget_SPEC_VERSION 2
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 
 #define XR_TYPE_REAR_DEPTH_BUDGET_DXR                          ((XrStructureType)1004999260)
-#define XR_TYPE_CONTENT_BOUNDS_DXR                             ((XrStructureType)1004999261) /* reserved, v2 */
+#define XR_TYPE_CONTENT_BOUNDS_DXR                             ((XrStructureType)1004999261)
 #define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
 ```
 
@@ -104,7 +104,30 @@ typedef struct XrRearDepthBudgetDXR {
 } XrRearDepthBudgetDXR;
 ```
 
-### 3.4 XrEventDataRearDepthBudgetStateChangedDXR
+### 3.4 XrContentBoundsDXR — input, chained on `XrFrameEndInfo` (v2)
+
+```c
+/* INPUT: the app chains this on XrFrameEndInfo::next in xrEndFrame. Optional; when absent
+   (or not chained for more than 1 s) the runtime measures the whole canvas, i.e. v1. */
+typedef struct XrContentBoundsDXR {
+    XrStructureType   type;      /* XR_TYPE_CONTENT_BOUNDS_DXR */
+    const void*       next;
+    XrRect2Df         bounds;    /* CANVAS-NORMALISED: offset/extent in [0,1], origin top-left
+                                    (u right, v DOWN — the same convention as the display
+                                    processor's background-preview canvas rect and
+                                    XrViewDisplayRawDXR::canvasRectPx). The union over ALL views
+                                    of the projected content AABB. An extent <= 0, or any
+                                    non-finite component, means "unknown" = whole canvas. */
+    float             marginNormalized; /* extra dilation the app wants, in canvas-normalised
+                                    units, ON TOP of the runtime's own default (§4.5).
+                                    0 = the runtime default alone. */
+} XrContentBoundsDXR;
+```
+
+Input only — the runtime writes nothing back through it. It is a **hint**: no value of any field
+can fail `xrEndFrame`. See §4.5.
+
+### 3.5 XrEventDataRearDepthBudgetStateChangedDXR
 
 ```c
 /* EVENT: emitted on every state change (not on ramp progress). */
@@ -185,14 +208,54 @@ measured one.
 
 ### 4.5 Region of interest
 
-**v1 analyses the whole canvas.** The region measured is the desktop under the app's canvas, and
-a busy patch anywhere within it closes the budget for the session — conservative in the wrong
-direction when the model occupies one corner.
+The conflict this extension polices is **local**: it exists only where rear content is drawn over
+a horizontal cue. v1 nevertheless measured the whole canvas, so a busy patch anywhere under the
+app closed the budget for the session — conservative in the wrong direction when the content sat
+in one corner. (The panel run that motivated v2 read `cue = 0.93` off an *empty* Notepad window's
+own menu and status bars, while the model was nowhere near them.)
 
-`XR_TYPE_CONTENT_BOUNDS_DXR` (1004999261) is **reserved** for v2, where an app will be able to
-report where its rear-most content actually projects and have the analysis look only there. The
-type value is claimed in v1 so that adopting it later is purely additive; there is no
-`XrContentBoundsDXR` struct in v1 and chaining that type has no effect.
+**v2** lets the app say where its content actually projects, by chaining `XrContentBoundsDXR`
+(§3.4) on `XrFrameEndInfo` in `xrEndFrame`. The runtime then measures only that region.
+
+The app is the only party that can compute this — it owns the geometry and the matrices — so it
+projects its content AABB, unions over all views, and reports the result in canvas-normalised
+coordinates. `dxr::ProjectAabbToCanvasBounds` in `displayxr-common` does the projection; apps
+should not roll their own.
+
+How the runtime turns those bounds into a measured region:
+
+1. **Map.** The bounds are canvas-normalised; the background preview covers `canvas_u0..v1` **of
+   the canvas**, which is normally `0,0,1,1` but may include a margin. The bounds are mapped
+   through that rect into preview pixels. A display processor that leaves the canvas rect zeroed
+   is treated as `0,0,1,1` — the documented normal case.
+2. **Dilate.** Every side is expanded by `max(4% of the preview width, 8 px)`, plus the app's
+   `marginNormalized` (applied in canvas-normalised units before the mapping). The disparity
+   conflict is read in the **band around the silhouette**, not strictly under it, so measuring the
+   exact projected AABB would answer a question nobody asked.
+3. **Clamp** to the preview.
+
+Every failure path falls back to the **whole preview** — never to "neutral":
+
+| Situation | Region measured |
+|---|---|
+| No `XrContentBoundsDXR` ever chained | Whole canvas (v1 behaviour) |
+| Not chained for more than 1 s | Whole canvas — the app stopped, and a second-old rect describes geometry that has since moved |
+| `extent <= 0`, or any non-finite component | Whole canvas ("unknown"); one-time `WARN` |
+| Bounds that clamp away to fewer than 2 px | Whole canvas — an empty region would measure as neutral and open the budget over a desktop nobody looked at |
+| `DXR_REAR_BUDGET_ROI=0` | Whole canvas (A/B kill switch; logs once when armed) |
+
+The runtime re-measures when the capture generation advances **or when the derived region moves**.
+The second is what keeps the ROI live: on a quiet desktop the generation never advances again, and
+gating on it alone would pin the verdict to wherever the content used to be.
+
+The region is reported on every state transition, in the runtime log:
+
+```
+REAR_BUDGET d3d11: roi=142,2,56,96 (app content bounds)
+```
+
+A rear-depth verdict without its region is unattributable — measured under the content, or over a
+canvas the content was nowhere near?
 
 ## 5. Runtime Behavior
 
@@ -207,6 +270,9 @@ type value is claimed in v1 so that adopting it later is purely additive; there 
 - **Analysis.** `u_bg_neutrality` — luma `Y = 0.299R + 0.587G + 0.114B`, **horizontal**
   differences only. Vertical differences are ignored by design: a vertical gradient is
   horizontally uniform, which is exactly what makes it depth-neutral.
+- **Region.** The analysis ROI is the app's dilated content bounds when it chains them, and the
+  whole preview otherwise (§4.5). The bounds arrive on the app thread in `xrEndFrame` and are read
+  on the render thread by the analysis, so they move under the runner's own lock.
 - **Policy.** `u_rear_budget`, one instance per native-compositor session or per service client.
 - **IPC.** For service clients the budget is computed service-side (the service runs the display
   processor) and travels with the located views. Client-present / workspace-hosted sessions report
@@ -235,6 +301,13 @@ type value is claimed in v1 so that adopting it later is purely additive; there 
   cull will disagree while the budget ramps.
 - **Do not capture the desktop yourself.** That path was considered and rejected in ADR-040:
   per-app capture cost and a different policy in every app.
+- **Report your content bounds (v2, optional but strongly recommended).** Chain
+  `XrContentBoundsDXR` on `XrFrameEndInfo` every frame with the projected AABB of the content that
+  would occupy the rear volume, unioned over views and clamped to `[0,1]`. Without it the runtime
+  judges the whole canvas and closes the budget for busy pixels the app is nowhere near. Use
+  `dxr::ProjectAabbToCanvasBounds` — the projection has one correct answer and app-side variants
+  of it will not agree. Do **not** apply any ROI logic of your own beyond that: the dilation, the
+  staleness rule and the verdict are the runtime's.
 
 ## 7. Sample Usage
 
@@ -272,6 +345,25 @@ const float clipFar = transparent ? far_z : 0.0f;   /* 0 = "no shader-side clip"
 
 /* far_z drives the projection AND any shader/compute far cull, so they agree while it ramps. */
 
+/* --- per frame, at xrEndFrame: say where the content is (v2) --- */
+XrRect2Df bounds;                       /* canvas-normalised, origin top-left */
+if (!dxr_project_aabb_to_canvas_bounds(aabbMin, aabbMax, viewProj, viewCount, &bounds)) {
+    bounds = (XrRect2Df){{0, 0}, {0, 0}};   /* extent 0 = "unknown" = whole canvas */
+}
+
+XrContentBoundsDXR cb = {XR_TYPE_CONTENT_BOUNDS_DXR};
+cb.bounds           = bounds;
+cb.marginNormalized = 0.0f;             /* 0 = the runtime's own dilation alone */
+
+XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
+cb.next             = fei.next;         /* preserve whatever else is chained */
+fei.next            = &cb;
+fei.displayTime     = frameState.predictedDisplayTime;
+fei.environmentBlendMode = blendMode;
+fei.layerCount      = layerCount;
+fei.layers          = layers;
+xrEndFrame(session, &fei);
+
 /* --- optional: react to transitions --- */
 XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
 while (xrPollEvent(instance, &ev) == XR_SUCCESS) {
@@ -294,7 +386,10 @@ is likewise untouched by this extension for exactly that reason (ADR-040, *Alter
 considered*).
 
 An app compiled against v1 headers runs unchanged on a v2 runtime; the v2 runtime simply never
-sees the structs the app does not chain.
+sees the structs the app does not chain. v2 added exactly that: `XrContentBoundsDXR`, a new input
+struct on a type value v1 had already claimed. `XrRearDepthBudgetDXR` is byte-identical between
+the two versions, and a v2 app talking to a v1 runtime has its content bounds ignored — which is
+v1's canvas-wide ROI, i.e. today.
 
 Applications that vendor these headers should note that a vendored copy does **not** track spec
 bumps automatically — the `consumer_floors` drift audit is what catches the gap.
@@ -307,7 +402,10 @@ bumps automatically — the `consumer_floors` drift audit is what catches the ga
 - Policy: `src/xrt/auxiliary/util/u_rear_budget.{c,h}` (+ unit tests)
 - Display-processor slot: `get_background_preview` / `struct xrt_dp_background_preview` in
   `xrt_display_processor.h` — see [`xrt_plugin_iface.md`](../../reference/xrt_plugin_iface.md)
+- Per-session runner (cadence, ROI derivation, publish): `src/xrt/compositor/util/comp_rear_budget.{c,h}`
+  (+ unit tests), driven by the D3D11, Vulkan and D3D12 native compositors
 - oxr consumption: `oxr_session.c` (locate-views path, beside `XrViewDisplayRawDXR`),
+  `oxr_session_frame_end.c` (`XrContentBoundsDXR` parse + per-backend dispatch),
   `oxr_event.c` (state-changed event)
 - App-side helper: `dxr::ClipPolicy::ResolveClipPlanes` in `displayxr-common`
 
@@ -318,8 +416,6 @@ Tracked on [#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365):
 - **Vendor-neutral background source** — a runtime-owned Windows capture probe (so `sim_display`
   and other vendors are not gated on implementing the slot) and a `bg2d` socket source on
   Linux / Android.
-- **Content-bounds ROI** — `XrContentBoundsDXR`, the reserved type value of §4.5, bumping
-  `SPEC_VERSION` to 2.
 - **Graded budget** — mapping partial `backgroundCueEnergy` to a partial offset rather than the
   v1 binary open/clip. Needs a perceptual calibration pass before any curve is chosen.
 - **Workspace sessions** — `UNRESTRICTED_WORKSPACE` is a placeholder for today's behaviour, not a
@@ -330,3 +426,4 @@ Tracked on [#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365):
 | Version | Changes |
 |---------|---------|
 | 1 | Initial version — `XrRearDepthBudgetDXR` on `XrViewState`, the state-changed event, canvas-wide ROI; `XR_TYPE_CONTENT_BOUNDS_DXR` reserved for v2 (epic #1363, ADR-040) |
+| 2 | `XrContentBoundsDXR` on `XrFrameEndInfo` — the app reports where its content projects and the analysis measures only there, dilated (§4.5). Additive: `XrRearDepthBudgetDXR` unchanged, no new entry points, no new event ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)) |

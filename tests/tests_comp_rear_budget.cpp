@@ -29,7 +29,9 @@
 
 #include "catch_amalgamated.hpp"
 
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -41,6 +43,21 @@ struct FakePreview
 {
 	std::vector<uint8_t> bytes;
 	xrt_dp_background_preview pv{};
+
+	//! Paint a text-like (1-px vertical stripe) patch into an otherwise flat preview.
+	void
+	paint_busy_patch(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+	{
+		for (uint32_t y = y0; y < y1; y++) {
+			for (uint32_t x = x0; x < x1; x++) {
+				const uint8_t v = (x & 1u) ? 255 : 0;
+				uint8_t *p = &bytes[((size_t)y * pv.width + x) * 4u];
+				p[0] = v;
+				p[1] = v;
+				p[2] = v;
+			}
+		}
+	}
 
 	FakePreview(uint32_t w, uint32_t h, uint32_t generation, bool busy)
 	{
@@ -101,6 +118,26 @@ step(Runner &r, const xrt_dp_background_preview *pv, uint64_t now_ns)
 	return polled;
 }
 
+//! The ROI the runner last analysed through; fails the test if none has been.
+u_bg_roi
+roi_of(Runner &r, bool *out_narrowed = nullptr)
+{
+	u_bg_roi roi{};
+	bool narrowed = false;
+	REQUIRE(comp_rear_budget_debug_last_roi(&r.b, &roi, &narrowed));
+	if (out_narrowed != nullptr) {
+		*out_narrowed = narrowed;
+	}
+	return roi;
+}
+
+//! Canvas-normalised content bounds, as xrEndFrame would forward them.
+void
+bounds(Runner &r, float u0, float v0, float u1, float v1, uint64_t now_ns)
+{
+	comp_rear_budget_set_content_bounds(&r.b, u0, v0, u1, v1, now_ns);
+}
+
 u_rear_budget_out
 read(Runner &r)
 {
@@ -118,6 +155,48 @@ run_for(Runner &r, const xrt_dp_background_preview *pv, uint64_t start_ns, uint6
 	}
 	return start_ns + ms * MS;
 }
+
+/*!
+ * Set an environment variable for the length of a scope and put it back.
+ *
+ * The kill switch is probed once per runner, from the environment, so the only
+ * honest way to test it is through the environment - and the only safe way to
+ * do that in a single-process test binary is to restore it afterwards.
+ */
+struct ScopedEnv
+{
+	const char *name;
+	std::string previous;
+	bool had_previous;
+
+	ScopedEnv(const char *n, const char *value) : name(n), had_previous(false)
+	{
+		const char *old = getenv(n);
+		if (old != nullptr) {
+			previous = old;
+			had_previous = true;
+		}
+		set(value);
+	}
+	~ScopedEnv() { set(had_previous ? previous.c_str() : nullptr); }
+
+	void
+	set(const char *value)
+	{
+#ifdef _WIN32
+		_putenv_s(name, value != nullptr ? value : "");
+#else
+		if (value != nullptr) {
+			setenv(name, value, 1);
+		} else {
+			unsetenv(name);
+		}
+#endif
+	}
+
+	ScopedEnv(const ScopedEnv &) = delete;
+	ScopedEnv &operator=(const ScopedEnv &) = delete;
+};
 
 //! Stands in for the PNG writer so the dump path is observable and writes nothing.
 struct DumpSink
@@ -377,4 +456,237 @@ TEST_CASE("comp_rear_budget: nothing is retained while the dump is off")
 	// The copy is opt-in: an un-armed session must not pay ~0.5 MB and a memcpy
 	// per capture for a picture nobody asked for.
 	CHECK_FALSE(comp_rear_budget_debug_last_preview(&r.b, nullptr, nullptr));
+}
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * v2: the content-bounds ROI (#1365)
+ * -----------------------------------------------------------------------------
+ */
+
+TEST_CASE("comp_rear_budget: with no content bounds the ROI is the whole preview")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+	step(r, &neutral.pv, 0);
+
+	// v1's behaviour, and the floor every failure path in v2 falls back to.
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.x == 0);
+	CHECK(roi.y == 0);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed);
+}
+
+TEST_CASE("comp_rear_budget: content bounds map to preview pixels and dilate")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// Canvas 0.4..0.6 x 0.4..0.6 over a 200x100 preview covering the whole
+	// canvas = px 80..120 x 40..60. Dilation is max(4% of 200, 8) = 8 px per
+	// side, so 72..128 x 32..68.
+	bounds(r, 0.4f, 0.4f, 0.6f, 0.6f, 0);
+	step(r, &neutral.pv, 0);
+
+	bool narrowed = false;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.x == 72);
+	CHECK(roi.y == 32);
+	CHECK(roi.w == 56);
+	CHECK(roi.h == 36);
+	CHECK(narrowed);
+}
+
+TEST_CASE("comp_rear_budget: the ROI maps through a preview that carries a margin")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+	// A display processor that captured 25% beyond the canvas on every side:
+	// the preview spans canvas -0.25..1.25, so canvas 0.5 sits at px 100 of
+	// 200 only because the mapping accounts for it. Reading the bounds as if
+	// the preview were the canvas would aim 33 px to the left.
+	neutral.pv.canvas_u0 = -0.25f;
+	neutral.pv.canvas_v0 = -0.25f;
+	neutral.pv.canvas_u1 = 1.25f;
+	neutral.pv.canvas_v1 = 1.25f;
+
+	// u 0.25..0.75 -> (0.25+0.25)/1.5*200 = 66.67 .. (0.75+0.25)/1.5*200 = 133.3
+	// dilate 8 -> 58.67..141.3 -> floor/ceil -> 58..142.
+	bounds(r, 0.25f, 0.25f, 0.75f, 0.75f, 0);
+	step(r, &neutral.pv, 0);
+
+	const u_bg_roi roi = roi_of(r);
+	CHECK(roi.x == 58);
+	CHECK(roi.w == 142 - 58);
+}
+
+TEST_CASE("comp_rear_budget: the ROI clamps to the preview")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// Content filling the canvas: dilation pushes the rect past every edge and
+	// the preview, not the arithmetic, is what stops it.
+	bounds(r, 0.0f, 0.0f, 1.0f, 1.0f, 0);
+	step(r, &neutral.pv, 0);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.x == 0);
+	CHECK(roi.y == 0);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed); // it IS the whole preview, however it got there
+}
+
+TEST_CASE("comp_rear_budget: bounds that clamp away entirely fall back to the whole preview")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+	// The preview only covers the left fifth of the canvas; content on the
+	// right of the canvas is nowhere in it. A degenerate ROI must never be
+	// measured - an empty region reads as neutral, and would open the budget
+	// over a desktop nobody looked at.
+	neutral.pv.canvas_u0 = 0.0f;
+	neutral.pv.canvas_v0 = 0.0f;
+	neutral.pv.canvas_u1 = 0.2f;
+	neutral.pv.canvas_v1 = 1.0f;
+
+	bounds(r, 0.9f, 0.1f, 0.95f, 0.9f, 0);
+	step(r, &neutral.pv, 0);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed);
+}
+
+TEST_CASE("comp_rear_budget: an unknown extent is the whole preview")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	// What oxr forwards for a malformed or absent rect.
+	bounds(r, 0.0f, 0.0f, 0.0f, 0.0f, 0);
+	step(r, &neutral.pv, 0);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK_FALSE(narrowed);
+}
+
+TEST_CASE("comp_rear_budget: bounds older than a second stop narrowing")
+{
+	Runner r;
+	FakePreview neutral(200, 100, 1, /*busy=*/false);
+
+	bounds(r, 0.4f, 0.4f, 0.6f, 0.6f, 0);
+	step(r, &neutral.pv, 0);
+	REQUIRE(roi_of(r).w == 56);
+
+	// The app stopped chaining. A rect from a second ago describes geometry
+	// that has since moved, so it is worse than no rect at all.
+	run_for(r, &neutral.pv, 10 * MS, 1500);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed);
+}
+
+TEST_CASE("comp_rear_budget: busy pixels outside the ROI keep the budget open")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	// A text-like patch in the right-hand quarter - the empty-window menu bar
+	// that read cue 0.93 on the v1 panel run.
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// The content sits on the LEFT: canvas 0.05..0.35 -> px 10..70, dilated by
+	// 8 -> 2..78. The patch starts at 150, well clear of it.
+	bounds(r, 0.05f, 0.1f, 0.35f, 0.9f, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	bool narrowed = false;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(narrowed);
+	CHECK(roi.x + roi.w <= 150);
+
+	const u_rear_budget_out out = read(r);
+	// v1 measured this whole preview and closed. That is the regression this
+	// feature exists to remove.
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+	CHECK(out.far_offset_vh > U_REAR_BUDGET_UNRESTRICTED_VH - 0.5f);
+}
+
+TEST_CASE("comp_rear_budget: busy pixels inside the ROI still close it")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// Same preview, same patch - the content is now over it.
+	bounds(r, 0.75f, 0.1f, 0.95f, 0.9f, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	bool narrowed = false;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(narrowed);
+	CHECK(roi.x < 150);
+	CHECK(roi.x + roi.w > 150);
+
+	const u_rear_budget_out out = read(r);
+	CHECK(out.state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	CHECK(out.far_offset_vh < 0.001f);
+	CHECK(out.cue_energy > 0.0f);
+}
+
+TEST_CASE("comp_rear_budget: moving the content re-measures the same capture")
+{
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	bounds(r, 0.05f, 0.1f, 0.35f, 0.9f, 0);
+	uint64_t t = run_for(r, &pv.pv, 0, 800);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	// The desktop never changes again, so the generation never advances - on a
+	// quiet desktop it never will. Gating re-analysis on the generation alone
+	// would leave the verdict pinned to where the content USED to be.
+	for (uint64_t u = t + 10 * MS; u <= t + 500 * MS; u += 10 * MS) {
+		bounds(r, 0.75f, 0.1f, 0.95f, 0.9f, u);
+		step(r, &pv.pv, u);
+	}
+
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}
+
+TEST_CASE("comp_rear_budget: DXR_REAR_BUDGET_ROI=0 disables the narrowing")
+{
+	ScopedEnv off("DXR_REAR_BUDGET_ROI", "0");
+
+	Runner r;
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(150, 0, 200, 100);
+
+	// The same setup that stays OPEN with the ROI on. With the switch armed
+	// the analysis sees the whole preview again, so the A/B has two visibly
+	// different arms rather than one arm and a no-op.
+	bounds(r, 0.05f, 0.1f, 0.35f, 0.9f, 0);
+	run_for(r, &pv.pv, 0, 800);
+
+	bool narrowed = true;
+	const u_bg_roi roi = roi_of(r, &narrowed);
+	CHECK(roi.w == 200);
+	CHECK(roi.h == 100);
+	CHECK_FALSE(narrowed);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
 }

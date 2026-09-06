@@ -2256,6 +2256,127 @@ submit_passthrough_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
+#ifdef OXR_HAVE_DXR_depth_budget
+//! Clamp to the canvas-normalised range.
+#define OXR_CB_CLAMP01(v) ((v) < 0.0f ? 0.0f : ((v) > 1.0f ? 1.0f : (v)))
+
+/*
+ * XR_DXR_depth_budget v2 (#1365) - the app's content bounds, chained on
+ * XrFrameEndInfo.
+ *
+ * v1 measured the whole canvas, so a busy patch anywhere under the app closed
+ * the budget even when the content sat in another corner. The app is the only
+ * party that knows where its geometry lands, so it says so here and the
+ * compositor narrows the background analysis to that region.
+ *
+ * This is a HINT, never a frame input: nothing below can fail a frame. A
+ * missing, stale or malformed rect resolves to "unknown", which is the whole
+ * canvas, which is v1 - the failure mode of every layer of this feature is
+ * "today".
+ */
+
+//! Dispatch to whichever native compositor owns this session's policy.
+static void
+oxr_session_set_content_bounds(struct oxr_session *sess, float u0, float v0, float u1, float v1, uint64_t now_ns)
+{
+	if (sess->xcn == NULL) {
+		return;
+	}
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		comp_d3d11_compositor_set_content_bounds(&sess->xcn->base, u0, v0, u1, v1, now_ns);
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		comp_vk_native_compositor_set_content_bounds(&sess->xcn->base, u0, v0, u1, v1, now_ns);
+		return;
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		comp_d3d12_compositor_set_content_bounds(&sess->xcn->base, u0, v0, u1, v1, now_ns);
+		return;
+	}
+#endif
+	// GL, Metal and the IPC path run no policy (oxr_session.c's
+	// get_rear_budget returns false for them), so there is nothing to aim.
+}
+
+//! Parse, validate and forward the optional XrContentBoundsDXR on this frame.
+static void
+oxr_session_frame_end_content_bounds(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo)
+{
+	const XrContentBoundsDXR *cb =
+	    OXR_GET_INPUT_FROM_CHAIN(frameEndInfo, XR_TYPE_CONTENT_BOUNDS_DXR, XrContentBoundsDXR);
+	if (cb == NULL) {
+		// Not chained this frame. The compositor's own age rule (1 s) is what
+		// turns "stopped chaining" back into the whole canvas - re-sending
+		// "unknown" here would instead punish a single dropped hint.
+		return;
+	}
+
+	const uint64_t now_ns = (uint64_t)os_monotonic_get_ns();
+
+	float u0 = cb->bounds.offset.x;
+	float v0 = cb->bounds.offset.y;
+	const float w = cb->bounds.extent.width;
+	const float h = cb->bounds.extent.height;
+
+	// An extent that is non-positive or non-finite is the spec's "unknown",
+	// and so is a non-finite offset. Forwarded as an empty rect, which the
+	// compositor reads as the whole preview.
+	if (!isfinite(u0) || !isfinite(v0) || !isfinite(w) || !isfinite(h) || w <= 0.0f || h <= 0.0f) {
+		if (!sess->warned_content_bounds_invalid) {
+			sess->warned_content_bounds_invalid = true;
+			U_LOG_W(
+			    "XrContentBoundsDXR: bounds {%f, %f, %f, %f} unusable - the rear-depth "
+			    "analysis falls back to the whole canvas (one-time warning)",
+			    (double)u0, (double)v0, (double)w, (double)h);
+		}
+		oxr_session_set_content_bounds(sess, 0.0f, 0.0f, 0.0f, 0.0f, now_ns);
+		return;
+	}
+
+	float u1 = u0 + w;
+	float v1 = v0 + h;
+
+	// marginNormalized is dilation the app wants ON TOP of the runtime's own
+	// default (which the compositor applies in preview pixels, where it can
+	// see the preview). Applied here because it is in the same canvas-
+	// normalised units as the rect.
+	float margin = cb->marginNormalized;
+	if (!isfinite(margin) || margin < 0.0f) {
+		margin = 0.0f;
+	}
+	if (margin > 0.5f) {
+		margin = 0.5f;
+	}
+	u0 -= margin;
+	v0 -= margin;
+	u1 += margin;
+	v1 += margin;
+
+	// Canvas-normalised means [0,1] IS the canvas; content outside it is not
+	// composited over anything the analysis can see.
+	u0 = OXR_CB_CLAMP01(u0);
+	v0 = OXR_CB_CLAMP01(v0);
+	u1 = OXR_CB_CLAMP01(u1);
+	v1 = OXR_CB_CLAMP01(v1);
+
+	if (!(u1 > u0) || !(v1 > v0)) {
+		// Clamped away to nothing - off-canvas content. Unknown, never empty:
+		// a region with no pixels in it would otherwise measure as neutral and
+		// open the budget on a busy desktop.
+		oxr_session_set_content_bounds(sess, 0.0f, 0.0f, 0.0f, 0.0f, now_ns);
+		return;
+	}
+
+	oxr_session_set_content_bounds(sess, u0, v0, u1, v1, now_ns);
+}
+#endif // OXR_HAVE_DXR_depth_budget
+
 XrResult
 oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo)
 {
@@ -2299,6 +2420,17 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		return oxr_session_success_result(sess);
 	}
 
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget v2 (#1365): the app's content bounds narrow the
+	// background-analysis ROI. Read before any of the frame's own validation,
+	// because it is advisory and must reach the compositor even on a frame the
+	// app goes on to discard - the content did not move just because this
+	// frame had no layers.
+	if (sess->sys->inst->extensions.DXR_depth_budget) {
+		oxr_session_frame_end_content_bounds(sess, frameEndInfo);
+	}
+#endif
 
 	/*
 	 * Blend mode.

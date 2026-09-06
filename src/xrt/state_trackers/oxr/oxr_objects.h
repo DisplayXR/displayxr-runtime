@@ -2454,6 +2454,11 @@ struct oxr_session
 	XrRearDepthBudgetStateDXR rear_depth_budget_state;
 	//! False until the first fill - so the first state is not an "event".
 	bool rear_depth_budget_state_known;
+	//! One-shot: the app chained an unusable XrContentBoundsDXR (v2). A
+	//! malformed hint degrades to "unknown" rather than failing the frame,
+	//! but it must be said once - a silently ignored hint reads to the app
+	//! exactly like one the runtime honoured.
+	bool warned_content_bounds_invalid;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones

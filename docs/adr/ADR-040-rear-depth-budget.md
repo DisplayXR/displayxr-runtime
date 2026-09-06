@@ -167,6 +167,16 @@ when the runtime lacks the extension.
   carve-out would have meant the budget never opening on the shipping Vulkan path at all. The
   policy instance stays on the compositor, so retiring the split mid-session changes which slot is
   asked and nothing else.
+- **The app owns WHERE, the runtime still owns WHETHER (v2).** The canvas-wide ROI turned out to be
+  the feature's biggest false negative in practice — the first panel run read a busy verdict off an
+  *empty* window's own menu bar while the model sat elsewhere. `XrContentBoundsDXR`
+  (`SPEC_VERSION` 2) lets the app report where its content projects, and the analysis measures only
+  that region, dilated by the band the conflict actually lives in. This does **not** move policy
+  into the app: the bounds are a hint about geometry — the one thing the app is the authority on —
+  and every way of getting them wrong (absent, stale, malformed, off-canvas) falls back to the
+  canvas-wide v1 region, never to "neutral". An unmeasurable region must not be able to open the
+  budget.
+
 - **A new advisory value reaching apps means a new way for apps to disagree.** The ramp is the
   mitigation: because the runtime hands over an already-smoothed value and asks apps to apply it
   raw, two apps on one display move their clip planes together.
