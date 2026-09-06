@@ -512,6 +512,12 @@ struct comp_vk_native_compositor
 	//! #1367: last rect generation the view-dims log line reported.
 	uint64_t android_rect_generation_viewed;
 	uint64_t android_rect_generation_logged;
+	/*!
+	 * #1367/#1277: the window's CONTAINER is scaling our surface (an OEM
+	 * freeform "mini window"). While set the compositor degrades to mono —
+	 * see @ref vk_android_update_container_scaled.
+	 */
+	bool android_container_scaled;
 #endif
 
 	/*!
@@ -3351,6 +3357,92 @@ vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c);
 static void
 vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * #1367/#1277 — detect-and-degrade: is our window's CONTAINER scaling the
+ * surface we weave into?
+ *
+ * The OEM recents-card "freeform" toggle does not resize the task, it puts it
+ * in a SCALED mini-window: measured on an NP02J (ZTE Android 13),
+ * SurfaceFlinger carries the task layer with
+ * `geomLayerTransform (ROT_0) (SCALE TRANSLATE)` and a 732x1137 displayFrame
+ * for the app's 1080x1685 buffer (~0.677). A woven buffer bilinear-resampled by
+ * ANY factor is a uniform double image: every subpixel lands on the wrong lens,
+ * and no geometry we publish can undo a filter applied after we are done. So an
+ * in-app weave can never be correct inside that container — the only right
+ * answer is to stop weaving and show correct 2D (epic #1277; the browser
+ * shipped exactly this as "option 1", displayxr-browser#184 / patch 0123).
+ *
+ * ## The signal
+ *
+ * Mirrors the browser's heuristic EXACTLY, including its lack of slack: the OEM
+ * places a logical-size window in physical panel coordinates, so the window's
+ * bounds exceed the display's. The browser reads
+ * `WindowManager.getCurrentWindowMetrics()` vs `getMaximumWindowMetrics()`; we
+ * read the same fact off the rect the window already publishes into
+ * @ref android_globals_set_window_screen_rect (the app's
+ * `xrSetAndroidWindowGeometryDXR`, or the hosted MonadoView's own report,
+ * #1367) against the panel extent published with it — which is the panel in the
+ * CURRENT rotation, the frame the rect lives in (#1034). Measured scaled:
+ * rect 1757,236 1080x1685 on a 2560x1600 panel — 1757+1080 = 2837 > 2560 and
+ * 236+1685 = 1921 > 1600.
+ *
+ * Computing it here rather than adding a flag to XrAndroidWindowGeometryDXR is
+ * deliberate: one authority, and extension struct growth would need every
+ * consumer resynced. A window merely dragged off-panel trips this too; that
+ * false positive costs 2D content, never a broken weave, which is the direction
+ * to fail in.
+ *
+ * ## The degrade
+ *
+ * Nothing here drives the panel. The transition asks the DP for hardware 2D
+ * through the same call an app's `xrRequestDisplayModeDXR` reaches
+ * (@ref comp_vk_native_compositor_request_display_mode) and, because a scaled
+ * window genuinely stops weaving, releases this session's lens preference with
+ * the DP's existing `on_pause` / `on_resume` pair — the contract is "stop
+ * weaving and RELEASE your lens preference" (#1039), and the Leia Android DP
+ * only ever re-asserts the lens from inside a weave, so with the weave gone
+ * nothing else would ever let go. Both are no-ops on a DP that implements
+ * neither slot.
+ *
+ * The content half is @ref vk_compute_effective_layout, which collapses the
+ * frame to tile 0.
+ */
+static void
+vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
+{
+	int32_t x = 0, y = 0, display_id = -1;
+	uint32_t w = 0, h = 0, disp_w = 0, disp_h = 0;
+	uint64_t generation = 0;
+	if (!android_globals_get_window_screen_rect(&x, &y, &w, &h, &display_id, &disp_w, &disp_h, &generation) ||
+	    w == 0 || h == 0 || disp_w == 0 || disp_h == 0) {
+		// Nothing published a rect, or no panel extent to compare against.
+		// Never degrade on ignorance: keep whatever state we were in.
+		return;
+	}
+
+	const bool scaled =
+	    x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
+	if (scaled == c->android_container_scaled) {
+		return;
+	}
+	c->android_container_scaled = scaled;
+
+	// ONE line per transition — this is a lifecycle event (the user toggling a
+	// freeform container), never a per-frame one.
+	U_LOG_W("CONTAINER_SCALED: window %d,%d %ux%u %s panel %ux%u -> %s (#1367/#1277)", x, y, w, h,
+	        scaled ? "exceeds" : "fits inside", disp_w, disp_h,
+	        scaled ? "presenting 2D (no weave)" : "weaving again");
+
+	comp_vk_native_compositor_request_display_mode(&c->base.base, !scaled);
+	if (scaled) {
+		xrt_display_processor_on_pause(c->display_processor);
+	} else {
+		xrt_display_processor_on_resume(c->display_processor);
+	}
+}
+#endif // XRT_OS_ANDROID
+
 // Per-frame effective CONTENT layout (#542) — same policy as the D3D11/D3D12/
 // GL legs: the content recipe is the ACTIVE MODE's, submissions are clamped
 // to it (always-stereo apps submit identical views in a mono mode; zone
@@ -3368,6 +3460,28 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 	if (mode_cols == 0) mode_cols = 1;
 	if (mode_rows == 0) mode_rows = 1;
 	uint32_t mode_tiles = mode_cols * mode_rows;
+
+#ifdef XRT_OS_ANDROID
+	/*
+	 * #1367/#1277 content half of detect-and-degrade: a scaled container
+	 * collapses the frame to TILE 0 — a 1x1 grid one view wide, not the
+	 * mono-submission shape below. The difference matters: the `views == 1`
+	 * branch means "the app painted one view across the whole content
+	 * region", so it stretches tile 0 over `cols * tile_w`. Here the app is
+	 * still painting a full stereo pair at view_w x view_h, and we are
+	 * dropping the right one, so the tile keeps its own width. The DP then
+	 * receives tc=tr=1 and takes its existing mono passthrough — no weave,
+	 * correct 2D, same code path as any mono mode.
+	 */
+	if (c->android_container_scaled && view_w > 0 && view_h > 0) {
+		c->eff_layout.views = 1;
+		c->eff_layout.cols = 1;
+		c->eff_layout.rows = 1;
+		c->eff_layout.tile_w = view_w;
+		c->eff_layout.tile_h = view_h;
+		return;
+	}
+#endif
 
 	uint32_t views = mode_tiles;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -5384,6 +5498,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
+#ifdef XRT_OS_ANDROID
+	// #1367/#1277: must precede the layout — it decides whether this frame
+	// weaves at all. Cheap (one atomic read of the published rect) and only
+	// acts on a transition.
+	vk_android_update_container_scaled(c);
+#endif
+
 	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
 	// SUBMISSION, decoupled from the hardware weave-state. Feeds the
 	// renderer draw, the window-space pass, both DP handoffs, and the
@@ -5472,6 +5593,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 	 * into the test. Same shape as the D3D12 leg's.
 	 */
 	if (c->split != NULL) {
+		zero_copy = false;
+	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	/*
+	 * #1367/#1277 — zero-copy hands the DP the app's own stereo swapchain
+	 * with the mode's tile counts, which is precisely the weave we have just
+	 * decided must not happen. Same shape as the #918 guard above: a
+	 * placement fact applied to `u_tiling_can_zero_copy()`'s RESULT, not a
+	 * second eligibility gate folded into it (ADR-030). Dead weight today
+	 * (Android never satisfies the rule) and cheap insurance if it ever does.
+	 */
+	if (c->android_container_scaled) {
 		zero_copy = false;
 	}
 #endif
