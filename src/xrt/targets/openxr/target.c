@@ -104,10 +104,13 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 
 	// Check if we should use IPC mode
 	if (u_sandbox_should_use_ipc()) {
-		U_LOG_I("Hybrid mode: using IPC/service compositor (sandboxed environment)");
+		// One line per instance create (lifecycle, never per frame): WARN so the
+		// routing decision survives a release build's INFO drop — the #1378
+		// device check is "read this line", never inspection.
+		U_LOG_W("Hybrid mode: using IPC/service compositor (sandboxed environment)");
 		return ipc_instance_create(ii, out_xinst);
 	} else {
-		U_LOG_I("Hybrid mode: using in-process native compositor");
+		U_LOG_W("Hybrid mode: using in-process native compositor");
 		return native_instance_create(ii, out_xinst);
 	}
 }
