@@ -140,7 +140,11 @@ jobs:
       # device-service donopx regeneration bug that parked CNSDK's no-face
       # phase gate outside normal viewing distance (flat 2D with tracking
       # alive, on every runtime version). Loader == plug-in == impl again.
-      CNSDK_TAG: v0.10.66
+      # v0.10.67: matches leia-plugin v2.6.15. Adds the libfilter input-noise
+      # thread stop flag (LeiaInc/CNSDK#730) so leia_core_release returns —
+      # on 0.10.53..0.10.66 an activity relaunch of an in-process app hung
+      # forever in xrDestroySession (recents freeform toggle, 2026-09-06).
+      CNSDK_TAG: v0.10.67
 
     steps:
 
