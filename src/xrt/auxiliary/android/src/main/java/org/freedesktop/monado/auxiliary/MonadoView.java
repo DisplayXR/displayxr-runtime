@@ -211,12 +211,14 @@ public class MonadoView extends SurfaceView
         if (windowRectPollRunning) {
             return;
         }
-        if (surfaceStateListener == null) {
-            // Nobody to report to — e.g. the SERVICE-owned overlay (#558), which has no
-            // host Activity and no IPC client to forward to. Don't burn a Choreographer
-            // callback per frame for nothing. The listener is assigned in
-            // attachToActivity() before the view reaches the window manager, so a real
-            // client is always registered by the time onAttachedToWindow fires.
+        if (surfaceStateListener == null && !reportsRectToNative()) {
+            // Nobody to report to — e.g. the SERVICE-owned overlay (#558) or the weave
+            // satellite's surface, which have no host Activity and no IPC client to
+            // forward to. Don't burn a Choreographer callback per frame for nothing.
+            // The listener is assigned in attachToActivity() before the view reaches
+            // the window manager, so a real client is always registered by the time
+            // onAttachedToWindow fires; the in-process hosted view (#1367) reports
+            // straight to native instead — see reportsRectToNative().
             return;
         }
         windowRectPollRunning = true;
@@ -306,8 +308,42 @@ public class MonadoView extends SurfaceView
         SurfaceStateListener listener = surfaceStateListener;
         if (listener != null) {
             listener.onWindowRectChanged(x, y, w, h, displayId, dispW, dispH);
+        } else if (reportsRectToNative()) {
+            try {
+                nativeWindowRectChanged(
+                        nativeCounterpart.getNativePointer(), x, y, w, h, displayId, dispW, dispH);
+            } catch (UnsatisfiedLinkError e) {
+                // The native side that owns this view did not register the entry point
+                // (an older runtime .so, or a process that never called
+                // android_custom_surface_async_start). Nothing to report to; stop
+                // polling rather than throw once per frame.
+                Log.w(TAG, "nativeWindowRectChanged not registered; window rect stays unpublished", e);
+                stopWindowRectPoll();
+            }
         }
     }
+
+    /**
+     * #1367: the in-process {@code _hosted} fallback. The runtime spawns this view on the app's
+     * Activity (native-owned, {@code hostActivity != null}) and has no Java listener, so until
+     * now its window rect was never published: a freeform-resized hosted window weaved with a
+     * display-sized canvas squeezed into the surface and a display-anchored phase. Report the rect
+     * straight to native, which feeds the same {@code android_globals} sink an app's own
+     * {@code xrSetAndroidWindowGeometryDXR} uses. The service-owned overlay and the weave
+     * satellite have no host Activity and are excluded: in the service process that sink carries
+     * the CLIENT's rect and must not be clobbered by the overlay's own.
+     */
+    private boolean reportsRectToNative() {
+        return hostActivity != null && nativeCounterpart != null && nativeCounterpart.getNativePointer() != 0;
+    }
+
+    /**
+     * Registered by native code ({@code android_custom_surface.cpp}, {@code RegisterNatives}) —
+     * the runtime .so is dlopen'ed by the OpenXR loader, so a {@code Java_…} symbol lookup would
+     * never find it. Arguments as {@link SurfaceStateListener#onWindowRectChanged}.
+     */
+    private static native void nativeWindowRectChanged(
+            long nativePointer, int x, int y, int w, int h, int displayId, int dispW, int dispH);
 
     /**
      * #558 P3: make this service-owned overlay declare an explicit touchable Region via the hidden

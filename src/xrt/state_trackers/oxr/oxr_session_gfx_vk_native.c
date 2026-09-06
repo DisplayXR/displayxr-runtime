@@ -312,12 +312,17 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	 * spawn a SurfaceView on the activity via android_custom_surface and block
 	 * briefly for its ANativeWindow.
 	 *
-	 * FULLSCREEN ONLY. This view is added straight to the WindowManager, so it
-	 * has no ViewParent — and SurfaceView.onAttachedToWindow dereferences one on
-	 * the freeform/translucent path, so the app dies with
-	 * `NullPointerException … ViewParent.requestTransparentRegion` the moment
-	 * the task lands in a multi-window container. An app that wants multi-window
-	 * owns its own SurfaceView and chains the binding (#1037, ADR-036 D2).
+	 * Multi-window: a RESIZE of the task (an activity that declares the
+	 * multi-window configChanges, so the freeform toggle is a surfaceChanged)
+	 * works — the view reports its on-screen rect to native (#1367,
+	 * MonadoView.nativeWindowRectChanged) so the per-window Kooima, the DP
+	 * phase origin and the backdrop crop all follow the window. What still
+	 * kills the app is a RELAUNCH: this view is added straight to the
+	 * WindowManager with no ViewParent, and SurfaceView's pending draw-finished
+	 * callback dereferences one after the old window detaches
+	 * (`NullPointerException … ViewParent.requestTransparentRegion`, #1358).
+	 * An app that wants that path robust owns its own SurfaceView and chains
+	 * the binding (#1037, ADR-036 D2).
 	 */
 	if (window_handle == NULL) {
 		struct _JavaVM *vm = (struct _JavaVM *)android_globals_get_vm();
