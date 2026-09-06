@@ -78,7 +78,7 @@ This proposal introduces four independent but complementary extensions:
 | `XR_DXR_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_DXR_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
 | `XR_DXR_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
-| `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
+| `XR_DXR_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeDXR` for 2D/3D mode control, `xrRequestEyeTrackingModeDXR` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeDXR` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns eye positions relative to the display plane (`XrViewDisplayRawDXR::displayPlanePose` locates that plane in the requested space). |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR across desktop, mobile, and macOS platforms.
@@ -1052,10 +1052,12 @@ When `XR_DXR_display_info` is enabled, `xrLocateViews()` returns views in **RAW 
 - `XrView.fov` — advisory only. The application should compute its own FOV from the eye
   position and display geometry.
 
-The runtime returns screen-relative eye positions **regardless of the reference space
-parameter** passed to `xrLocateViews`. Applications should pass LOCAL space. The runtime
-applies **no convergence adjustment or camera policy** to RAW views. The application is
-fully responsible for its camera model.
+The runtime returns eye positions **relative to the display plane**. The plane itself is
+reported by `XrViewDisplayRawDXR::displayPlanePose` (`XR_DXR_view_rig` raw channel) in the
+space passed to `xrLocateViews`, so anything else located in that space (grips, hand joints)
+can be rebased onto a RAW view. Applications should pass LOCAL space. The runtime applies
+**no convergence adjustment or camera policy** to RAW views. The application is fully
+responsible for its camera model.
 
 **Kooima projection from RAW views:**
 
@@ -1113,8 +1115,9 @@ XrVector3f nominalPos = displayInfo.nominalViewerPositionInDisplaySpace;
 ### Example Code: Locating Views in RAW Mode
 
 ```cpp
-// In RAW mode (XR_DXR_display_info enabled), xrLocateViews returns
-// screen-centered eye positions regardless of the space parameter.
+// In RAW mode (XR_DXR_display_info enabled, no rig chained), xrLocateViews
+// returns eye positions relative to the display plane; displayPlanePose
+// (XR_DXR_view_rig raw channel) locates that plane in the space passed here.
 // Use LOCAL space for both view location and layer submission.
 XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
 locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1625,7 +1628,8 @@ future revision if windowed 3D display use cases emerge.
 **OPEN 3: Interaction with XR_EXT_local_floor and other space extensions.**
 
 For tracked 3D displays, LOCAL space serves as the primary coordinate frame. In RAW mode,
-eye positions are returned in screen-centered coordinates regardless of the space parameter.
+eye positions are returned relative to the display plane, and `displayPlanePose` locates that
+plane in the space parameter.
 Future work should clarify how this interacts with spatial anchor extensions and
 mixed-reality scenarios where tracked displays coexist with HMDs.
 
@@ -2065,6 +2069,7 @@ the property) silently ignore the call — graceful degradation.
 | 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). |
 | 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. |
 | 18 | 2026-09-01 | David Fattal | Added `XrDisplayDesktopInfoDXR` (`1004999211`, new chained struct — additive, no ABI change to existing structs): the panel monitor's **full desktop rect** plus a **stable device name** (`\\.\DISPLAY1`), superseding the origin-only `XrDisplayDesktopPositionDXR`, so a client can place its window on the 3D panel and re-resolve the monitor after a topology change (#1301, unblocking displayxr-unity#266). Adds `isPrimary` and `isPanelConfirmed`. The rect is resolved under a pinned per-monitor-v2 DPI context so it is physical even when the host process is DPI-unaware. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 18`).** |
+| 19 | 2026-09-06 | David Fattal | RAW-mode wording (#1370): eye positions are **relative to the display plane**, not "regardless of the reference space" — `XrViewDisplayRawDXR::displayPlanePose` reports that plane in the locate space. Render-ready views (legacy and rig-chained) now honour `XrViewLocateInfo::space` on both legs; no wire or struct change. |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do

@@ -37,6 +37,35 @@ The runtime detects which type of app it's dealing with at session creation time
 3. **Event delivery** — `XrEventDataRenderingModeChangedDXR` only sent to extension apps
 4. **Tile layout** — extension apps get the mode's native tile layout; legacy apps get a fixed compromise layout
 
+## The View Path
+
+The split above is about swapchain sizing and mode control; `xrLocateViews` is where the two
+classes actually diverge in what they get back.
+
+- **Render-ready (legacy apps, and any app that chains an `XR_DXR_view_rig` rig).** The runtime
+  owns the camera: `XrView{pose, fov}` is complete for rendering and — since #1370 — is
+  expressed in `XrViewLocateInfo::space`, exactly as the OpenXR spec says. Internally the view math
+  runs in the head device's tracking-origin space (the display plane, the qwerty rig, the
+  render-ready eyes all live there); the state tracker converts on **both legs**: a chained rig
+  pose comes *in* from the locate space, and the eyes plus `displayPlanePose` go *out* to it,
+  through the tracking-origin-to-base relation (`oxr_space_locate_device` for the head). Both legs
+  or nothing — every shipping rig app locates in LOCAL and treats the result as rig-local, so
+  converting only the output would shift them by the LOCAL offset. The same holds over IPC: the
+  client converts, the server never sees the base space. Legacy clients keep the standard
+  `T_base_head` chain (never the eye override — the #739 lesson), which carries the server's head
+  motion in whatever base space the app asked for.
+- **RAW (extension apps with `XR_DXR_display_info` and no rig chained).** The app owns the
+  camera: `XrView.pose` is the display processor's eyes **relative to the display plane**, identity
+  orientation, in every base space — ADR-024 / INV-6.1. `XrViewDisplayRawDXR::displayPlanePose`
+  says where that plane is in the locate space, which is how a RAW app composes anything else it
+  located there (grips, hand joints) into its own view.
+- **Reference spaces are not redefined per class.** `LOCAL` is Monado's root + (0, 1.6, 0) for
+  everyone (what legacy VR titles expect: STAGE at the floor, the head standing at 1.6 m); the
+  qwerty rig is seeded at the same height. A hosted legacy title therefore sees its eyes about
+  0.1 m above the LOCAL origin (+WASD), and 1.7 m above STAGE. The in-tree hosted test cubes draw
+  their content at STAGE y = 1.6 for that reason — the former hosted world-absolute concession
+  chain in `oxr_session_locate_views` existed only for them and was deleted in #1370.
+
 ## Further Reading
 
 - [Multiview Tiling](../specs/runtime/multiview-tiling.md) — atlas layout algorithm
