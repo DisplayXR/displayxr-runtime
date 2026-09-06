@@ -105,10 +105,15 @@ target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src
 # which is Vulkan-gated and would drag the whole render library into a test that
 # needs no GPU, no window and no plug-in: a synthetic BGRA preview stands in for
 # the display processor.
+# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the vendor plug-in's signing recipe builds
+# this runtime as a SUB-PROJECT (the plug-in repo is the top-level source dir), and a
+# target_sources() path that resolves against the wrong root is a hard configure
+# error (leia-plugin v2.6.16 shipped unsigned because of it). Include dirs elsewhere
+# in this file tolerate the wrong root; a source file does not.
 target_sources(
-	tests_comp_rear_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/util/comp_rear_budget.c
+	tests_comp_rear_budget PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_rear_budget.c
 	)
-target_include_directories(tests_comp_rear_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+target_include_directories(tests_comp_rear_budget PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-external-stb)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
