@@ -316,13 +316,17 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	 * multi-window configChanges, so the freeform toggle is a surfaceChanged)
 	 * works — the view reports its on-screen rect to native (#1367,
 	 * MonadoView.nativeWindowRectChanged) so the per-window Kooima, the DP
-	 * phase origin and the backdrop crop all follow the window. What still
-	 * kills the app is a RELAUNCH: this view is added straight to the
-	 * WindowManager with no ViewParent, and SurfaceView's pending draw-finished
-	 * callback dereferences one after the old window detaches
+	 * phase origin and the backdrop crop all follow the window. A RELAUNCH
+	 * (a config change the app does not declare, a locale change, the
+	 * lockscreen bring-up) used to kill the app: the SurfaceView went to the
+	 * WindowManager directly, so its only ViewParent was the ViewRootImpl,
+	 * which nulls it while tearing the window down — and a still-pending
+	 * attach or draw-finished callback then dereferenced it
 	 * (`NullPointerException … ViewParent.requestTransparentRegion`, #1358).
-	 * An app that wants that path robust owns its own SurfaceView and chains
-	 * the binding (#1037, ADR-036 D2).
+	 * MonadoView now interposes a FrameLayout between the SurfaceView and the
+	 * WindowManager, so that parent outlives the window. An app that wants
+	 * full control of this path still owns its own SurfaceView and chains the
+	 * binding (#1037, ADR-036 D2).
 	 */
 	if (window_handle == NULL) {
 		struct _JavaVM *vm = (struct _JavaVM *)android_globals_get_vm();
