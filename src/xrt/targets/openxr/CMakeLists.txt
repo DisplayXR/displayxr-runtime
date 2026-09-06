@@ -53,6 +53,34 @@ if(ANDROID)
 	# name -- its loader reads an explicit path from a JSON manifest and applies
 	# no such filter.
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES PREFIX "lib")
+
+	# NEVER let the loader unmap us (#1358).
+	#
+	# The Khronos loader dlopen()s this .so and dlclose()s it at
+	# xrDestroyInstance. On Android an in-process app calls xrDestroyInstance
+	# from native_app_glue's android_main and then RETURNS -- so the thread
+	# exits, bionic runs its __cxa_thread_atexit destructors, and any
+	# thread_local owned by this library is now a jump into an unmapped hole:
+	#
+	#   signal 11 (SIGSEGV) ... fault addr falls between mapped regions
+	#     #00 pc <unknown>
+	#     #01 __cxa_thread_finalize+76   /apex/.../libc.so
+	#     #02 pthread_exit+28
+	#
+	# That is not hypothetical -- it kills every hosted demo on an Activity
+	# RELAUNCH the moment CNSDK >= 0.10.67 lets xrDestroySession return (before
+	# that it hung, so android_main never exited and the bug stayed hidden).
+	# Keeping the runtime mapped for the life of the process is the right
+	# answer anyway: an OpenXR runtime is re-created, not disposed of, and the
+	# next xrCreateInstance would just dlopen it straight back.
+	#
+	# Desktop is deliberately untouched: there the app owns its own main
+	# thread, which does not exit under the loader's feet.
+	set_property(
+		TARGET ${RUNTIME_TARGET}
+		APPEND_STRING
+		PROPERTY LINK_FLAGS " -Wl,-z,nodelete "
+		)
 endif()
 if(WIN32)
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES OUTPUT_NAME "DisplayXRClient")
