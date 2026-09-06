@@ -51,6 +51,13 @@ endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
+if(XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
+	# #1370 -- drives the BUILT runtime library through the public OpenXR API
+	# on a headless session (see the file header). Needs a registered display
+	# processor at run time and SKIPs without one, so the unregistered ctest
+	# pass stays green; CI re-runs it after registering sim-display.
+	list(APPEND tests tests_oxr_view_space)
+endif()
 if(XRT_HAVE_OPENGL
    AND XRT_HAVE_OPENGL_GLX
    AND XRT_HAVE_SDL2
@@ -84,6 +91,19 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
+
+if(TARGET tests_oxr_view_space)
+	target_include_directories(
+		tests_oxr_view_space PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes
+		)
+	target_compile_definitions(
+		tests_oxr_view_space PRIVATE "DXR_RUNTIME_LIB_PATH=\"$<TARGET_FILE:${RUNTIME_TARGET}>\""
+		)
+	add_dependencies(tests_oxr_view_space ${RUNTIME_TARGET})
+	if(NOT WIN32)
+		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
+	endif()
+endif()
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is
