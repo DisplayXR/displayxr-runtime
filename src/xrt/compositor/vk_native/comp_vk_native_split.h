@@ -121,6 +121,8 @@
 struct xrt_device;
 struct comp_vk_split;
 struct comp_vk_deposit_handoff;
+//! XR_DXR_depth_budget - taken by pointer only; see xrt/xrt_display_processor.h.
+struct xrt_dp_background_preview;
 
 #ifdef __cplusplus
 extern "C" {
@@ -649,6 +651,27 @@ comp_vk_split_request_display_mode(struct comp_vk_split *split, bool enable_3d);
 
 void
 comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode);
+
+/*!
+ * XR_DXR_depth_budget - one background preview from the split's weaver.
+ *
+ * The rear-depth policy needs the desktop UNDER the app window, and under the
+ * split the display processor that has those pixels is the D3D11 one on the
+ * scanout adapter: it is the weaver for this session, and the vendor plug-in
+ * produces the preview as a downsample of the capture it already runs for
+ * compose-under transparency. The Vulkan display processor - if a session even
+ * still has one - is not weaving and is not capturing.
+ *
+ * Pixels only: the split forwards the vtable call and forms no opinion. The
+ * policy stays in the compositor's @ref comp_rear_budget, so a session that
+ * retires the split mid-flight keeps its state and simply starts polling the
+ * Vulkan slot instead.
+ *
+ * @return false when there is no source right now, which the policy treats as
+ *         the conservative case.
+ */
+bool
+comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_background_preview *out_preview);
 /*! @} */
 
 #ifdef __cplusplus

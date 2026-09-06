@@ -214,9 +214,15 @@ type value is claimed in v1 so that adopting it later is purely additive; there 
 - **Backends.** D3D11, Vulkan and D3D12 are wired: each drives the shared per-session runner
   (`comp_rear_budget`) once per **app** frame, immediately after handing its display processor the
   atlas — never from a repaint, which replays rendering only. GL and Metal report
-  `CLIPPED_NO_SOURCE` until their slot call is wired, which is today's behaviour. So does a Vulkan
-  session running under the hybrid output-device split, where the Vulkan display processor does not
-  weave at all.
+  `CLIPPED_NO_SOURCE` until their slot call is wired, which is today's behaviour.
+- **Which display processor is polled.** Whichever one is *weaving* the session, because that is
+  the one running the desktop capture the preview is a downsample of. Under the hybrid
+  output-device split (ADR-039, on by default at every tier, so on an iGPU/dGPU box every Vulkan
+  session takes it) the weaver is the **D3D11** display processor on the scanout adapter, and the
+  runtime polls that one; the compositor's Vulkan display processor is neither weaving nor
+  capturing there. The policy lives on the compositor rather than on either display processor, so
+  a session that retires the split mid-flight keeps its dwell, its ramp and its published value
+  and simply changes which slot it asks.
 
 ## 6. Application Responsibilities
 
