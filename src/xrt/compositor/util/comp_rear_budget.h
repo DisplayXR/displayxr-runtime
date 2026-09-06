@@ -62,6 +62,17 @@ extern "C" {
 #define COMP_REAR_BUDGET_POLL_INTERVAL_NS (66ULL * 1000ULL * 1000ULL)
 
 /*!
+ * Where a `DXR_REAR_BUDGET_DUMP` preview goes. The default writes a PNG;
+ * @ref comp_rear_budget_debug_set_dump_sink replaces it for tests, which is
+ * what lets the dump path be exercised without touching the filesystem.
+ *
+ * @param bgra   Tightly packed BGRA8, top-down; @p stride is always w * 4.
+ *
+ * @ingroup comp_util
+ */
+typedef void (*comp_rear_budget_dump_fn)(void *ctx, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride);
+
+/*!
  * One session's rear-depth-budget runner. Zero-init is NOT valid — call
  * @ref comp_rear_budget_init (it owns a mutex).
  *
@@ -89,6 +100,33 @@ struct comp_rear_budget
 	struct u_bg_neutrality_result result;
 
 	struct u_rear_budget policy;
+
+	/*!
+	 * @name DXR_REAR_BUDGET_DUMP - the retained preview
+	 *
+	 * The dump has to show the preview the analysis SAW, and it fires on a
+	 * state CHANGE. Those two are almost never the same frame: the DP is
+	 * polled every 66 ms while a transition lands whenever the dwell (400 ms)
+	 * or the close grace (100 ms) elapses, on a ~8 ms frame boundary. Dumping
+	 * the live `pv` therefore required a coincidence that essentially never
+	 * happens, and the feature was silently dead — armed runs produced no PNG
+	 * and not even a "FAILED" line.
+	 *
+	 * So while the dump is armed the runner keeps its OWN tightly-packed copy
+	 * of the last analysed preview and writes THAT on a transition, whether or
+	 * not this frame polled. Bounded and opt-in: previews are <= 512 px on the
+	 * long side (<= 1 MB), and nothing is allocated unless the dump is armed.
+	 * @{
+	 */
+	uint8_t *dump_bgra;       //!< Retained copy, tight stride (w * 4). NULL = none.
+	size_t dump_cap;          //!< Bytes allocated at @ref dump_bgra.
+	uint32_t dump_w, dump_h;
+	uint32_t dump_gen;        //!< Generation the retained copy came from.
+	bool dump_have;           //!< A copy is present and describes @ref dump_gen.
+	bool dump_missing_logged; //!< One-shot: armed, transitioned, nothing retained.
+	comp_rear_budget_dump_fn dump_sink; //!< NULL = the built-in PNG writer.
+	void *dump_sink_ctx;
+	/*! @} */
 
 	//! Guards @ref published / @ref published_valid only.
 	struct os_mutex publish_mutex;
@@ -195,6 +233,32 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
  */
 bool
 comp_rear_budget_get(struct comp_rear_budget *b, struct u_rear_budget_out *out);
+
+/*!
+ * TEST ONLY — redirect the dump and arm retention without reading the
+ * environment.
+ *
+ * Arming through @p fn rather than through `DXR_REAR_BUDGET_DUMP` is what lets
+ * a unit test assert the dump actually FIRES — the bug this exists to pin was
+ * that it never did — without writing a PNG into the developer's
+ * `%LOCALAPPDATA%`. Passing NULL restores the built-in PNG writer and leaves
+ * the armed state alone.
+ *
+ * @ingroup comp_util
+ */
+void
+comp_rear_budget_debug_set_dump_sink(struct comp_rear_budget *b, comp_rear_budget_dump_fn fn, void *ctx);
+
+/*!
+ * TEST ONLY — dimensions of the preview currently retained for the dump.
+ *
+ * @return false when nothing is retained (the dump is not armed, or no valid
+ *         preview has been analysed yet).
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_rear_budget_debug_last_preview(const struct comp_rear_budget *b, uint32_t *out_w, uint32_t *out_h);
 
 #ifdef __cplusplus
 }

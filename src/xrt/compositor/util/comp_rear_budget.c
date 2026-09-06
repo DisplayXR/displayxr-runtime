@@ -62,11 +62,17 @@ comp_rear_budget_dump_path(char *out, size_t out_len)
  * Write the preview the analysis actually saw. The verdict is a single boolean
  * over a whole desktop; without the picture behind it, a wrong verdict is
  * unfalsifiable.
+ *
+ * The default sink. It takes raw pixels rather than an
+ * @ref xrt_dp_background_preview, because by the time a state change fires the
+ * DP-owned buffer is long gone — what gets written is the runner's own
+ * retained copy (see @ref comp_rear_budget::dump_bgra).
  */
 static void
-comp_rear_budget_dump_preview(const struct xrt_dp_background_preview *pv)
+comp_rear_budget_dump_png(void *ctx, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride)
 {
-	if (pv == NULL || pv->bgra == NULL || pv->width == 0 || pv->height == 0) {
+	(void)ctx;
+	if (bgra == NULL || w == 0 || h == 0) {
 		return;
 	}
 	char path[512];
@@ -78,24 +84,53 @@ comp_rear_budget_dump_preview(const struct xrt_dp_background_preview *pv)
 	// BGRA -> RGBA; the preview is opaque by contract, so alpha is passed
 	// through rather than forced (a forced 255 would hide a DP that handed
 	// over a transparent buffer).
-	const size_t pitch = (size_t)pv->width * 4u;
-	uint8_t *rgba = (uint8_t *)malloc(pitch * pv->height);
+	const size_t pitch = (size_t)w * 4u;
+	uint8_t *rgba = (uint8_t *)malloc(pitch * h);
 	if (rgba == NULL) {
 		return;
 	}
-	for (uint32_t y = 0; y < pv->height; y++) {
-		const uint8_t *src = pv->bgra + (size_t)y * pv->stride_bytes;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *src = bgra + (size_t)y * stride;
 		uint8_t *dst = rgba + (size_t)y * pitch;
-		for (uint32_t x = 0; x < pv->width; x++) {
+		for (uint32_t x = 0; x < w; x++) {
 			dst[x * 4 + 0] = src[x * 4 + 2];
 			dst[x * 4 + 1] = src[x * 4 + 1];
 			dst[x * 4 + 2] = src[x * 4 + 0];
 			dst[x * 4 + 3] = src[x * 4 + 3];
 		}
 	}
-	const int ok = stbi_write_png(path, (int)pv->width, (int)pv->height, 4, rgba, (int)pitch);
+	const int ok = stbi_write_png(path, (int)w, (int)h, 4, rgba, (int)pitch);
 	free(rgba);
 	U_LOG_W("REAR_BUDGET: preview dump %s -> %s", ok ? "wrote" : "FAILED", path);
+}
+
+//! Take the runner's own tightly-packed copy of @p pv. Only while armed.
+static void
+comp_rear_budget_retain_preview(struct comp_rear_budget *b, const struct xrt_dp_background_preview *pv)
+{
+	const size_t need = (size_t)pv->width * 4u * pv->height;
+	if (need == 0) {
+		return;
+	}
+	if (b->dump_cap < need) {
+		uint8_t *grown = (uint8_t *)realloc(b->dump_bgra, need);
+		if (grown == NULL) {
+			// Keep whatever is already retained: a stale picture of the
+			// desktop is worth more than none, and the log line names the
+			// state it was written for.
+			return;
+		}
+		b->dump_bgra = grown;
+		b->dump_cap = need;
+	}
+	for (uint32_t y = 0; y < pv->height; y++) {
+		memcpy(b->dump_bgra + (size_t)y * pv->width * 4u, pv->bgra + (size_t)y * pv->stride_bytes,
+		       (size_t)pv->width * 4u);
+	}
+	b->dump_w = pv->width;
+	b->dump_h = pv->height;
+	b->dump_gen = pv->generation;
+	b->dump_have = true;
 }
 
 
@@ -139,6 +174,10 @@ comp_rear_budget_fini(struct comp_rear_budget *b)
 	}
 	b->initialised = false;
 	b->running = false;
+	free(b->dump_bgra);
+	b->dump_bgra = NULL;
+	b->dump_cap = 0;
+	b->dump_have = false;
 	os_mutex_destroy(&b->publish_mutex);
 }
 
@@ -207,6 +246,19 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 	}
 	b->transparent = transparent;
 
+	// Resolved BEFORE the analyse block, not after it: retention is what the
+	// dump writes, so probing afterwards would silently skip the first
+	// generation — which on a quiet desktop can be the only one there is.
+	if (b->dump < 0) {
+		const char *e = getenv("DXR_REAR_BUDGET_DUMP");
+		b->dump = (e != NULL && e[0] == '1') ? 1 : 0;
+		if (b->dump == 1) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_DUMP armed = 1 (preview PNG on each "
+			    "state change)");
+		}
+	}
+
 	/*
 	 * The source verdict is recomputed only on a polling frame and then
 	 * REUSED: between polls the last answer still describes the source, and
@@ -234,6 +286,9 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 			}
 			b->have_generation = true;
 			b->last_generation = pv->generation;
+			if (b->dump == 1) {
+				comp_rear_budget_retain_preview(b, pv);
+			}
 		}
 	}
 
@@ -257,19 +312,59 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 	b->published_valid = true;
 	os_mutex_unlock(&b->publish_mutex);
 
-	if (b->dump < 0) {
-		const char *e = getenv("DXR_REAR_BUDGET_DUMP");
-		b->dump = (e != NULL && e[0] == '1') ? 1 : 0;
-		if (b->dump == 1) {
+	/*
+	 * A transition fires when a dwell or a close grace ELAPSES, which is a
+	 * different frame from the one that polled: 66 ms between polls, ~8 ms
+	 * between frames, 100/400 ms of hysteresis. So what is written here is the
+	 * RETAINED copy, never the live `pv` — gating this on `polled` made the
+	 * dump unreachable in practice, and an armed run produced no PNG and not
+	 * even a FAILED line.
+	 */
+	if (b->dump == 1 && out.state != before) {
+		if (b->dump_have) {
+			const comp_rear_budget_dump_fn sink =
+			    (b->dump_sink != NULL) ? b->dump_sink : comp_rear_budget_dump_png;
+			sink(b->dump_sink_ctx, b->dump_bgra, b->dump_w, b->dump_h, b->dump_w * 4u);
+		} else if (!b->dump_missing_logged) {
+			// Name the negative path once. "Armed and silent" was exactly the
+			// symptom of the bug above, so it must never read that way again.
+			b->dump_missing_logged = true;
 			U_LOG_W(
-			    "REAR_BUDGET: DXR_REAR_BUDGET_DUMP armed = 1 (preview PNG on each "
-			    "state change)");
+			    "REAR_BUDGET: dump armed but no preview has been analysed yet — "
+			    "state %s with no source to picture",
+			    u_rear_budget_state_str(out.state));
 		}
 	}
-	// The preview bytes are only valid on the frame that polled them.
-	if (b->dump == 1 && out.state != before && polled && have_preview) {
-		comp_rear_budget_dump_preview(pv);
+}
+
+void
+comp_rear_budget_debug_set_dump_sink(struct comp_rear_budget *b, comp_rear_budget_dump_fn fn, void *ctx)
+{
+	if (b == NULL) {
+		return;
 	}
+	b->dump_sink = fn;
+	b->dump_sink_ctx = ctx;
+	if (fn != NULL) {
+		// Arm without consulting the environment, so a test never depends on
+		// the developer's shell and never writes a PNG.
+		b->dump = 1;
+	}
+}
+
+bool
+comp_rear_budget_debug_last_preview(const struct comp_rear_budget *b, uint32_t *out_w, uint32_t *out_h)
+{
+	if (b == NULL || !b->dump_have) {
+		return false;
+	}
+	if (out_w != NULL) {
+		*out_w = b->dump_w;
+	}
+	if (out_h != NULL) {
+		*out_h = b->dump_h;
+	}
+	return true;
 }
 
 bool

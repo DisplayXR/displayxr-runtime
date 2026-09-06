@@ -16,7 +16,10 @@
  *   deliver only on change, so a quiet desktop is the best case, and
  *   re-analysing it is pure waste),
  * - the policy is ticked EVERY frame while the DP is polled at most every
- *   66 ms — so the ramp must keep moving on frames that asked the DP nothing.
+ *   66 ms — so the ramp must keep moving on frames that asked the DP nothing,
+ * - and the DXR_REAR_BUDGET_DUMP picture must survive to the frame that needs
+ *   it: a transition fires when a dwell elapses, which is essentially never a
+ *   polling frame, so the runner has to keep its own copy of what it analysed.
  *
  * A synthetic BGRA preview stands in for the display processor, so this runs
  * with no GPU, no window and no plug-in.
@@ -115,6 +118,25 @@ run_for(Runner &r, const xrt_dp_background_preview *pv, uint64_t start_ns, uint6
 	}
 	return start_ns + ms * MS;
 }
+
+//! Stands in for the PNG writer so the dump path is observable and writes nothing.
+struct DumpSink
+{
+	int calls = 0;
+	uint32_t w = 0, h = 0, stride = 0;
+	uint8_t first_pixel_b = 0;
+
+	static void
+	fn(void *ctx, const uint8_t *bgra, uint32_t w, uint32_t h, uint32_t stride)
+	{
+		auto *self = static_cast<DumpSink *>(ctx);
+		self->calls++;
+		self->w = w;
+		self->h = h;
+		self->stride = stride;
+		self->first_pixel_b = (bgra != nullptr) ? bgra[0] : 0;
+	}
+};
 
 } // namespace
 
@@ -276,4 +298,83 @@ TEST_CASE("comp_rear_budget: an unarmed runner does no work")
 	CHECK_FALSE(comp_rear_budget_should_poll(&b, 10ULL * 1000 * MS));
 
 	comp_rear_budget_fini(&b);
+}
+
+TEST_CASE("comp_rear_budget: the dump fires on a transition, from a frame that polled nothing")
+{
+	Runner r;
+	DumpSink sink;
+	comp_rear_budget_debug_set_dump_sink(&r.b, DumpSink::fn, &sink);
+
+	FakePreview neutral(64, 32, /*generation=*/1, /*busy=*/false);
+
+	// The preview is retained the moment it is ANALYSED...
+	step(r, &neutral.pv, 0);
+	uint32_t w = 0, h = 0;
+	REQUIRE(comp_rear_budget_debug_last_preview(&r.b, &w, &h));
+	CHECK(w == 64);
+	CHECK(h == 32);
+
+	// ...and the transition it explains lands ~400 ms later, on a frame chosen
+	// by the dwell, not by the poll throttle. Gating the dump on `polled` made
+	// it unreachable: 66 ms between polls, 10 ms between these frames.
+	CHECK(sink.calls == 0);
+	run_for(r, &neutral.pv, 10 * MS, 800);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	CHECK(sink.calls == 1);
+	CHECK(sink.w == 64);
+	CHECK(sink.h == 32);
+	// Tightly packed by the runner, whatever stride the DP handed over.
+	CHECK(sink.stride == 64 * 4);
+	CHECK(sink.first_pixel_b == 128); // the neutral fill
+}
+
+TEST_CASE("comp_rear_budget: the retained preview survives non-polling frames and refreshes on a new generation")
+{
+	Runner r;
+	DumpSink sink;
+	comp_rear_budget_debug_set_dump_sink(&r.b, DumpSink::fn, &sink);
+
+	// A preview whose backing buffer goes away, exactly like the DP-owned one:
+	// it is only valid until the next process_atlas.
+	{
+		FakePreview transient(64, 32, 1, /*busy=*/false);
+		step(r, &transient.pv, 0);
+	}
+
+	// Hundreds of frames with nothing to poll from. The copy is the runner's,
+	// so it is still there — and still the right size.
+	uint32_t w = 0, h = 0;
+	for (uint64_t t = 10 * MS; t <= 1500 * MS; t += 10 * MS) {
+		step(r, nullptr, t);
+	}
+	REQUIRE(comp_rear_budget_debug_last_preview(&r.b, &w, &h));
+	CHECK(w == 64);
+	CHECK(h == 32);
+
+	// A new generation with different dimensions replaces it (and grows the
+	// runner's buffer rather than writing past the old one).
+	FakePreview bigger(128, 96, /*generation=*/2, /*busy=*/true);
+	run_for(r, &bigger.pv, 1510 * MS, 500);
+	REQUIRE(comp_rear_budget_debug_last_preview(&r.b, &w, &h));
+	CHECK(w == 128);
+	CHECK(h == 96);
+
+	// And the transition that new picture explains was dumped with it.
+	REQUIRE(sink.calls > 0);
+	CHECK(sink.w == 128);
+	CHECK(sink.h == 96);
+}
+
+TEST_CASE("comp_rear_budget: nothing is retained while the dump is off")
+{
+	Runner r;
+	FakePreview neutral(64, 32, 1, /*busy=*/false);
+	run_for(r, &neutral.pv, 0, 800);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	// The copy is opt-in: an un-armed session must not pay ~0.5 MB and a memcpy
+	// per capture for a picture nobody asked for.
+	CHECK_FALSE(comp_rear_budget_debug_last_preview(&r.b, nullptr, nullptr));
 }
