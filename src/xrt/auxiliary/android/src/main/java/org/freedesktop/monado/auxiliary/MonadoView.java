@@ -25,8 +25,11 @@ import android.view.Choreographer;
 import android.view.Display;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
+import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 import androidx.annotation.GuardedBy;
 import androidx.annotation.Keep;
 import androidx.annotation.NonNull;
@@ -106,6 +109,50 @@ public class MonadoView extends SurfaceView
     private final Region touchableRegion = new Region(); // empty == pass everything through
 
     private boolean passthroughInstalled = false;
+
+    /** Guards the window-attach state below (touched from native threads and the UI thread). */
+    private final Object attachSync = new Object();
+
+    /**
+     * #1358: the MonadoView is never handed to the WindowManager directly — it is the single child
+     * of this plain {@link FrameLayout}, and the FrameLayout is what {@code wm.addView} gets.
+     *
+     * <p>A View added straight to the WindowManager has the ViewRootImpl as its {@code mParent},
+     * and the ViewRootImpl NULLS that parent as part of tearing the window down
+     * ({@code dispatchDetachedFromWindow} → {@code assignParent(null)}). A {@link SurfaceView}
+     * dereferences {@code mParent} unconditionally in two places —
+     * {@code SurfaceView.onAttachedToWindow} (line 294 on Android 13) and
+     * {@code SurfaceView.performDrawFinished} (line 396) — both doing
+     * {@code mParent.requestTransparentRegion(this)}. When a still-pending attach callback or a
+     * still-pending draw-finished callback lands after the window went away, that is a
+     * {@code NullPointerException} on the UI thread, i.e. the app process dies. That is exactly
+     * what happens when a hosted app's Activity is relaunched (a config change it does not
+     * declare, a locale change, the lockscreen bring-up of #1358) — the old view's callback fires
+     * while the new Activity is already coming up.
+     *
+     * <p>With a FrameLayout in between, the SurfaceView's {@code mParent} is the FrameLayout for
+     * its whole life — we never call {@code removeView} on it — and
+     * {@code ViewGroup.requestTransparentRegion} is itself null-safe on its own parent. This is
+     * the ordinary shape every Android app uses (a SurfaceView inside a ViewGroup), which is why
+     * no ordinary app ever hits this. Everything else is unchanged: the FrameLayout has no
+     * background (draws nothing, so translucency and {@code setZOrderMediaOverlay} behave the
+     * same), it dispatches touch straight down to its only child (#499 forwarding), and
+     * {@code getLocationOnScreen} on the child still returns absolute screen coordinates (#1367).
+     */
+    @GuardedBy("attachSync")
+    @Nullable
+    private ViewGroup windowContainer = null;
+
+    /** True once {@code wm.addView} actually ran for {@link #windowContainer}. */
+    @GuardedBy("attachSync")
+    private boolean addedToWindow = false;
+
+    /**
+     * Set when the native side gives up before the posted {@code wm.addView} ever ran, so the add
+     * is dropped instead of racing a remove posted behind it (#1358 bug 2).
+     */
+    @GuardedBy("attachSync")
+    private boolean attachCancelled = false;
 
     public MonadoView(Context context) {
         super(context);
@@ -525,15 +572,37 @@ public class MonadoView extends SurfaceView
 
     private static void attachToWindow(
             @NonNull final Context context,
-            @NonNull MonadoView view,
+            @NonNull final MonadoView view,
             @NonNull WindowManager.LayoutParams lp) {
+        // #1358: hand the WindowManager a FrameLayout that owns the MonadoView, never the
+        // SurfaceView itself — see the windowContainer field comment for why.
+        final FrameLayout container = new FrameLayout(context);
+        container.addView(
+                view,
+                new FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT,
+                        FrameLayout.LayoutParams.MATCH_PARENT));
+        synchronized (view.attachSync) {
+            view.windowContainer = container;
+        }
+
         Handler handler = new Handler(Looper.getMainLooper());
         handler.post(
                 () -> {
-                    Log.d(TAG, "Start adding view to window");
-                    WindowManager wm =
-                            (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-                    wm.addView(view, lp);
+                    synchronized (view.attachSync) {
+                        if (view.attachCancelled) {
+                            // Native gave up (timeout / session teardown) before this posted
+                            // add ever ran. Adding now would only be followed by a remove
+                            // racing the very traversal that attaches it (#1358 bug 2).
+                            Log.d(TAG, "Discarding pending add: native already gave up");
+                            return;
+                        }
+                        Log.d(TAG, "Start adding view to window");
+                        WindowManager wm =
+                                (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+                        wm.addView(container, lp);
+                        view.addedToWindow = true;
+                    }
 
                     SystemUiController systemUiController = new SystemUiController(view);
                     systemUiController.hide();
@@ -547,6 +616,24 @@ public class MonadoView extends SurfaceView
      */
     @Keep
     public static void removeFromWindow(@NonNull MonadoView view) {
+        // #1358: what the WindowManager holds is the FrameLayout container, so that is what has
+        // to come back out. The MonadoView is deliberately LEFT inside the container — keeping
+        // its ViewParent alive is the whole point of the wrapper.
+        final View target;
+        synchronized (view.attachSync) {
+            if (!view.addedToWindow) {
+                // The posted wm.addView has not run yet (or never will). Cancel it instead of
+                // posting a removeView behind it: that ordering is what made the pending
+                // attach/draw-finished callbacks fire against a torn-down window (#1358).
+                view.attachCancelled = true;
+                Log.d(TAG, "removeFromWindow: cancelled a still-pending add");
+                return;
+            }
+            view.attachCancelled = true;
+            view.addedToWindow = false;
+            target = view.windowContainer != null ? view.windowContainer : view;
+        }
+
         // #558: when we're already on the UI thread (e.g. the service's onDestroy →
         // MonadoImpl.shutdown → nativeDestroyServiceOverlay), use removeViewImmediate:
         // it detaches the view synchronously. Plain removeView() only *schedules*
@@ -557,7 +644,7 @@ public class MonadoView extends SurfaceView
             Log.d(TAG, "Removing view from window (immediate)");
             WindowManager wm =
                     (WindowManager) view.getContext().getSystemService(Context.WINDOW_SERVICE);
-            wm.removeViewImmediate(view);
+            wm.removeViewImmediate(target);
         } else {
             new Handler(Looper.getMainLooper())
                     .post(
@@ -567,7 +654,7 @@ public class MonadoView extends SurfaceView
                                         (WindowManager)
                                                 view.getContext()
                                                         .getSystemService(Context.WINDOW_SERVICE);
-                                wm.removeView(view);
+                                wm.removeView(target);
                             });
         }
     }
