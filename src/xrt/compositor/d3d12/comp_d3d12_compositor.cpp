@@ -47,6 +47,12 @@ struct comp_vk_split; // the reroute fields exist either way; the code does not
 
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_display_processor_d3d12.h"
+// XR_DXR_depth_budget: struct xrt_dp_background_preview (the per-API slot
+// headers only forward-declare it - the vtable takes it by pointer).
+#include "xrt/xrt_display_processor.h"
+// The API-agnostic runner (validate -> analyse -> policy -> publish -> dump)
+// shared with the other native compositors.
+#include "util/comp_rear_budget.h"
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
@@ -410,6 +416,18 @@ struct comp_d3d12_compositor
 
 	//! D3D12 display processor.
 	struct xrt_display_processor_d3d12 *display_processor;
+
+	/*!
+	 * XR_DXR_depth_budget (rear depth budget).
+	 *
+	 * The render thread pulls a small background preview from the DP (at most
+	 * every 66 ms, and only when it advanced), analyses it, and feeds the
+	 * policy; the app's locate thread reads the published triple through the
+	 * runner's own lock. Ticked ONCE per app frame, from the pass that just
+	 * handed the DP an atlas - never from a repaint, which replays RENDERING
+	 * only and must not advance a per-frame state machine.
+	 */
+	struct comp_rear_budget rear_budget;
 
 	//! SRV descriptor heap for display processor.
 	ID3D12DescriptorHeap *dp_srv_heap;
@@ -3613,6 +3631,40 @@ d3d12_bind_dp_atlas_srv(struct comp_d3d12_compositor *c, ID3D12Resource *dp_reso
  * @param[out] out_back_buffer The image this weave went into. Captured before
  *        the present, which advances the swapchain's current index.
  */
+/*
+ * ── XR_DXR_depth_budget: rear depth budget (render thread) ──────────────────
+ *
+ * A transparent app composites over the LIVE desktop, so anything it draws
+ * behind the display plane occludes pixels that sit at zero disparity. The
+ * conflict is only visible over a background with HORIZONTAL luminance
+ * structure, so the runtime watches the desktop the DP already captures and
+ * hands the app a budget instead of a blanket rule (ADR-040).
+ *
+ * Everything that is NOT the typed vtable call lives in comp_rear_budget, so
+ * this backend runs the SAME policy as D3D11 and VK rather than a third that
+ * looks alike. Ticked from exactly ONE place per app frame: the windowed site
+ * inside d3d12_dp_weave_and_present (skipped on `is_repaint` - a replay is not
+ * an app frame) or the shared-texture site, which are mutually exclusive arms
+ * of the same commit.
+ */
+static void
+d3d12_rear_budget_tick(struct comp_d3d12_compositor *c)
+{
+	if (c->display_processor == nullptr || !comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+
+	const uint64_t now_ns = os_monotonic_get_ns();
+
+	struct xrt_dp_background_preview pv;
+	xrt_dp_background_preview_init(&pv);
+	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
+	const bool got =
+	    polled && xrt_display_processor_d3d12_get_background_preview(c->display_processor, &pv);
+
+	comp_rear_budget_tick(&c->rear_budget, got ? &pv : nullptr, polled, c->transparent_background, now_ns);
+}
+
 static xrt_result_t
 d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3D12Resource **out_back_buffer)
 {
@@ -3898,6 +3950,14 @@ d3d12_dp_weave_and_present(struct comp_d3d12_compositor *c, bool is_repaint, ID3
 	    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM), tgt_width, tgt_height,
 	    eff_canvas.valid ? eff_canvas.x : 0, eff_canvas.valid ? eff_canvas.y : 0,
 	    eff_canvas.valid ? eff_canvas.w : 0, eff_canvas.valid ? eff_canvas.h : 0);
+
+	// XR_DXR_depth_budget: evaluate the rear budget from the background the DP
+	// just composited under. AFTER process_atlas, because that is the point at
+	// which the DP's capture for this frame is settled, and NOT on a repaint -
+	// a replay is not an app frame.
+	if (!is_repaint) {
+		d3d12_rear_budget_tick(c);
+	}
 
 	// #439 / ADR-027: an authored zone mask or Local2D layers composite the
 	// 2D/3D regions of the back buffer. Back buffer is still in RENDER_TARGET
@@ -4979,6 +5039,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    eff_canvas.valid ? eff_canvas.w : 0,
 			    eff_canvas.valid ? eff_canvas.h : 0);
 
+			// XR_DXR_depth_budget — the other arm of this commit (see
+			// d3d12_rear_budget_tick). Mutually exclusive with the windowed
+			// site, and this path has no repaint, so it ticks unconditionally.
+			d3d12_rear_budget_tick(c);
+
 			// Transition: atlas COMMON→PSR, shared texture RT→COMMON
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
@@ -5608,6 +5673,9 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		comp_d3d11_window_destroy(&c->own_window);
 	}
 
+	// XR_DXR_depth_budget: the runner owns a mutex.
+	comp_rear_budget_fini(&c->rear_budget);
+
 	delete c;
 }
 
@@ -5652,6 +5720,11 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 	c->transparent_background = transparent_background;
+	// XR_DXR_depth_budget: the policy exists from the first frame so that a
+	// locate arriving before any preview reads a real CLIPPED_NO_SOURCE rather
+	// than an uninitialised struct. ARMED by the oxr setter, once the session's
+	// extension opt-in is known.
+	comp_rear_budget_init(&c->rear_budget, "d3d12");
 	c->dp_factory_d3d11 = dp_factory_d3d11;
 	c->hud = NULL;
 	c->hud_texture = nullptr;
@@ -5688,6 +5761,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		    win_w, win_h, display_screen_left, display_screen_top, &c->own_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window");
+			comp_rear_budget_fini(&c->rear_budget);
 			delete c;
 			return xret;
 		}
@@ -6148,6 +6222,30 @@ comp_d3d12_compositor_get_display_dimensions(struct xrt_compositor *xc,
 #endif
 	return xrt_display_processor_d3d12_get_display_dimensions(
 	    c->display_processor, out_width_m, out_height_m);
+}
+
+/*
+ * XR_DXR_depth_budget - thin wrappers over the shared runner, so oxr keeps
+ * calling one symbol per backend and knows nothing about comp_rear_budget.
+ */
+extern "C" void
+comp_d3d12_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	comp_rear_budget_set_requested(&c->rear_budget, requested);
+	comp_rear_budget_arm(&c->rear_budget, c->transparent_background);
+}
+
+extern "C" bool
+comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
+{
+	if (xc == nullptr || out == nullptr) {
+		return false;
+	}
+	return comp_rear_budget_get(&d3d12_comp(xc)->rear_budget, out);
 }
 
 extern "C" bool

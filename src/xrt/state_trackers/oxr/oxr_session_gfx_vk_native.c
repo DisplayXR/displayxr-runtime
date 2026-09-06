@@ -397,6 +397,13 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	// Set system devices for qwerty driver support
 	comp_vk_native_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: latch the extension opt-in the same way the
+	// transparency flag is latched. Without it the compositor would either
+	// poll the DP for every session or for none.
+	comp_vk_native_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
+#endif
+
 	// Set system compositor info (display dimensions, nominal viewer, legacy flags)
 	if (sess->sys->xsysc != NULL) {
 		comp_vk_native_compositor_set_sys_info(&xcn->base, &sess->sys->xsysc->info);

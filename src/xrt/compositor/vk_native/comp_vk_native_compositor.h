@@ -14,6 +14,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
+#include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
 
 // Forward declarations
 struct comp_vk_native_compositor;
@@ -124,6 +125,33 @@ comp_vk_native_compositor_get_display_dimensions(struct xrt_compositor *xc,
 bool
 comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
                                               struct xrt_window_metrics *out_metrics);
+
+/*!
+ * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
+ *
+ * Latched exactly like the transparency flag, and for the same reason: the
+ * background preview fetch + analysis is real per-frame work on the weave
+ * thread, and it must not run for a session that never opted in. Called once,
+ * right after create.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * XR_DXR_depth_budget: the latest budget the weave thread computed.
+ *
+ * Read from the app's locate thread; the value is published under the runner's
+ * own small lock, so a caller never sees a half-written triple.
+ *
+ * @return false when this session never opted in - the caller then applies the
+ *         conservative default.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
  * Request display mode switch (2D/3D) via display processor.

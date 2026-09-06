@@ -211,8 +211,12 @@ type value is claimed in v1 so that adopting it later is purely additive; there 
 - **IPC.** For service clients the budget is computed service-side (the service runs the display
   processor) and travels with the located views. Client-present / workspace-hosted sessions report
   `UNRESTRICTED_WORKSPACE` in v1.
-- **Backends.** D3D11 is wired in v1. D3D12 / Vulkan / GL report `CLIPPED_NO_SOURCE` until their
-  slot call is wired, which is today's behaviour.
+- **Backends.** D3D11, Vulkan and D3D12 are wired: each drives the shared per-session runner
+  (`comp_rear_budget`) once per **app** frame, immediately after handing its display processor the
+  atlas — never from a repaint, which replays rendering only. GL and Metal report
+  `CLIPPED_NO_SOURCE` until their slot call is wired, which is today's behaviour. So does a Vulkan
+  session running under the hybrid output-device split, where the Vulkan display processor does not
+  weave at all.
 
 ## 6. Application Responsibilities
 

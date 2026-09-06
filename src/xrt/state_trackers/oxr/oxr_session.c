@@ -1478,10 +1478,20 @@ oxr_session_get_rear_budget(struct oxr_session *sess, struct u_rear_budget_out *
 		return comp_d3d11_compositor_get_rear_budget(&sess->xcn->base, out);
 	}
 #endif
-	// TODO(rear-budget): the other in-process backends (d3d12 / vk / gl /
-	// metal) have the DP slot but no preview wiring yet. Returning false here
-	// is not a gap in correctness - it is exactly the CLIPPED_NO_SOURCE
-	// default, which IS today's shipped behaviour for those backends.
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_get_rear_budget(&sess->xcn->base, out);
+	}
+#endif
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor) {
+		return comp_d3d12_compositor_get_rear_budget(&sess->xcn->base, out);
+	}
+#endif
+	// TODO(rear-budget): GL and Metal have the DP slot but no preview wiring
+	// yet. Returning false here is not a gap in correctness - it is exactly the
+	// CLIPPED_NO_SOURCE default, which IS today's shipped behaviour for those
+	// backends.
 	return false;
 }
 
