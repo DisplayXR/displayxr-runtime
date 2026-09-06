@@ -176,6 +176,18 @@ when the runtime lacks the extension.
   and every way of getting them wrong (absent, stale, malformed, off-canvas) falls back to the
   canvas-wide v1 region, never to "neutral". An unmeasurable region must not be able to open the
   budget.
+- **A hint the app can get wrong is a hint the runtime must bound (v2).** `XrContentBoundsDXR` is
+  normalised to the app **window's client rect**, and a zoned app that projects in the zone view
+  and forgets to rebase through its zone rect reports a rect reaching outside its 3D zone — into a
+  Local2D 2D band, whose desktop pixels the content can never occlude. Nothing about that rect is
+  malformed, so none of the fallbacks above fire and the wrong verdict reads authoritative
+  ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365), seen on the panel with a
+  zoned Unity app). So the runtime intersects the region with the union of the frame's **3D display
+  zones** — a fact of the frame, not a claim by the app — and a frame with no zones means the whole
+  canvas *is* the zone, leaving every full-window app untouched. The consequence worth naming is
+  that this **narrows the blast radius of a wrong hint without making the hint optional**: bounds
+  entirely outside every 3D zone measure the zone union and log once naming the app's rebase, so
+  the app bug stays visible instead of being absorbed into a plausible-looking number.
 
 - **A new advisory value reaching apps means a new way for apps to disagree.** The ramp is the
   mitigation: because the runtime hands over an already-smoothed value and asks apps to apply it

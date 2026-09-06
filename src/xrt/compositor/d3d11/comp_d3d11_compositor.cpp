@@ -815,6 +815,10 @@ d3d11_sync_zone_mask_to_dp(struct comp_d3d11_compositor *c);
 // frame's zone rects. Defined with the other zone helpers near the bottom.
 static void
 d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c);
+// The client-window region zone rects are expressed in. Defined with the other
+// zone helpers near the bottom.
+static void
+d3d11_client_region_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, uint32_t *out_h);
 
 // #439 Phase 2: an active zone mask supersedes the canvas output rect —
 // the weave region, view dims, Kooima metrics, and composite region all
@@ -1801,6 +1805,53 @@ d3d11_rear_budget_tick(struct comp_d3d11_compositor *c)
 	    polled && xrt_display_processor_d3d11_get_background_preview(c->display_processor, &pv);
 
 	comp_rear_budget_tick(&c->rear_budget, got ? &pv : nullptr, polled, c->transparent_background, now_ns);
+}
+
+/*!
+ * XR_DXR_depth_budget v2 — hand the runner THIS frame's 3D display zones so it
+ * can clamp the app's content-bounds ROI to them (#1365).
+ *
+ * Reads the SAME accumulator the wish raster and the composite read — the zone
+ * rects are already the frame's authority, so this is a second reader, never a
+ * second channel. Only XRT_LAYER_ZONE_3D counts: a Local2D layer is a 2D band
+ * the DP never weaves, and measuring the desktop behind one is exactly the bug.
+ *
+ * Called once per APP frame from layer_commit, unconditionally: a frame with no
+ * zones must publish ZERO zones (the whole canvas is the 3D zone), not leave
+ * the previous frame's list standing.
+ *
+ * Caller holds c->mutex.
+ */
+static void
+d3d11_publish_rear_budget_zones(struct comp_d3d11_compositor *c)
+{
+	if (!comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+
+	uint32_t win_w = 0, win_h = 0;
+	d3d11_client_region_dims(c, &win_w, &win_h);
+
+	struct u_bg_rect_norm zones[COMP_REAR_BUDGET_MAX_ZONES];
+	uint32_t count = 0;
+	// No resolvable client rect ⟹ no window-normalised space to express the
+	// zones in, so publish none and leave the ROI exactly as v2 had it. A
+	// guessed denominator would clamp to the wrong strip of the window.
+	if (win_w > 0 && win_h > 0) {
+		for (uint32_t i = 0; i < c->layer_accum.layer_count && count < COMP_REAR_BUDGET_MAX_ZONES; i++) {
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				continue;
+			}
+			const struct xrt_rect r = c->layer_accum.layers[i].data.zone_3d.rect;
+			zones[count].u0 = (float)r.offset.w / (float)win_w;
+			zones[count].v0 = (float)r.offset.h / (float)win_h;
+			zones[count].u1 = (float)(r.offset.w + r.extent.w) / (float)win_w;
+			zones[count].v1 = (float)(r.offset.h + r.extent.h) / (float)win_h;
+			count++;
+		}
+	}
+
+	comp_rear_budget_set_zone_rects(&c->rear_budget, zones, count, os_monotonic_get_ns());
 }
 
 static bool
@@ -3154,6 +3205,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// effective canvas, the wish raster/publish, and the visual composite
 	// all read this under the same c->mutex hold.
 	c->zones_frame = zones_frame;
+
+	// XR_DXR_depth_budget v2 (#1365): the rear-budget ROI is clamped to the
+	// frame's 3D zones, from the same scan. Unconditional — a frame with no
+	// zones publishes none, which is what "the whole canvas is the 3D zone"
+	// means to the runner.
+	d3d11_publish_rear_budget_zones(c);
 
 	// #439 Phase 2: the one canvas authority for this frame. While a zone
 	// mask is active this is the client-window rect (the mask supersedes
@@ -6240,23 +6297,36 @@ d3d11_update_zone_feather_mask(struct comp_d3d11_compositor *c,
 // wish: stage the authoring texture (referenced-at-frame-end = consume
 // current state — no xrSubmitLocal3DZoneDXR required) and dedup the publish
 // generation on the mask's author_seq.
+// The client-window region zone rects and Local2D rects are expressed in. Zero
+// on both outputs when it cannot be resolved — the callers treat that as "no
+// region", never as a 1x1 one.
+static void
+d3d11_client_region_dims(struct comp_d3d11_compositor *c, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+	RECT r;
+	if (wnd != nullptr && GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
+		*out_w = (uint32_t)r.right;
+		*out_h = (uint32_t)r.bottom;
+	} else if (c->shared_texture != nullptr) {
+		// Shared-texture sessions have no window of ours to measure; the
+		// texture IS the canvas the app composites into.
+		D3D11_TEXTURE2D_DESC td;
+		c->shared_texture->GetDesc(&td);
+		*out_w = td.Width;
+		*out_h = td.Height;
+	}
+}
+
 static void
 d3d11_update_zone_wish_state(struct comp_d3d11_compositor *c)
 {
 	// Window region for the raster (same clamp as the composite).
 	uint32_t w = 0;
 	uint32_t h = 0;
-	HWND wnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
-	RECT r;
-	if (wnd != nullptr && GetClientRect(wnd, &r) && r.right > 0 && r.bottom > 0) {
-		w = (uint32_t)r.right;
-		h = (uint32_t)r.bottom;
-	} else if (c->shared_texture != nullptr) {
-		D3D11_TEXTURE2D_DESC td;
-		c->shared_texture->GetDesc(&td);
-		w = td.Width;
-		h = td.Height;
-	}
+	d3d11_client_region_dims(c, &w, &h);
 
 	struct xrt_rect rects[XRT_MAX_LAYERS];
 	uint32_t rect_count = 0;
