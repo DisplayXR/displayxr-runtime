@@ -352,6 +352,36 @@ static void CleanupHands()
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
+// Rigid-pose helpers (XrPosef, DirectXMath): a o b applies b first, then a.
+static XrPosef PoseMul(const XrPosef &a, const XrPosef &b)
+{
+    XMVECTOR qa = XMVectorSet(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w);
+    XMVECTOR qb = XMVectorSet(b.orientation.x, b.orientation.y, b.orientation.z, b.orientation.w);
+    // XMQuaternionMultiply(q1, q2) is the rotation q1 followed by q2.
+    XMVECTOR q = XMQuaternionMultiply(qb, qa);
+    XMVECTOR p = XMVectorAdd(XMVector3Rotate(XMVectorSet(b.position.x, b.position.y, b.position.z, 0.0f), qa),
+                             XMVectorSet(a.position.x, a.position.y, a.position.z, 0.0f));
+    XMFLOAT4 qo;
+    XMFLOAT3 po;
+    XMStoreFloat4(&qo, q);
+    XMStoreFloat3(&po, p);
+    return {{qo.x, qo.y, qo.z, qo.w}, {po.x, po.y, po.z}};
+}
+
+static XrPosef PoseInverse(const XrPosef &a)
+{
+    XMVECTOR qa = XMVectorSet(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w);
+    XMVECTOR qi = XMQuaternionInverse(qa);
+    XMVECTOR p = XMVectorNegate(
+        XMVector3Rotate(XMVectorSet(a.position.x, a.position.y, a.position.z, 0.0f), qi));
+    XMFLOAT4 qo;
+    XMFLOAT3 po;
+    XMStoreFloat4(&qo, qi);
+    XMStoreFloat3(&po, p);
+    return {{qo.x, qo.y, qo.z, qo.w}, {po.x, po.y, po.z}};
+}
+
+
 // Application name for logging
 static const char* APP_NAME = "cube_handle_d3d11_win";
 
@@ -1079,8 +1109,10 @@ static void RenderOneFrame(RenderState& rs) {
                     const bool rigCamera = useAppProjection && g_inputState.cameraMode;
                     XrCameraRigDXR cameraRig = {XR_TYPE_CAMERA_RIG_DXR};
                     XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    // The app's player pose - the rig pose when a rig is chained,
+                    // and the frame the RAW path composes its eyes on otherwise.
                     XrPosef rigPose = {{0, 0, 0, 1}, {0, 0, 0}};
-                    if (useAppProjection) {
+                    {
                         XMVECTOR rigOri = XMQuaternionRotationRollPitchYaw(
                             g_inputState.pitch, g_inputState.yaw, 0);
                         XMFLOAT4 rq;
@@ -1088,6 +1120,8 @@ static void RenderOneFrame(RenderState& rs) {
                         rigPose.orientation = {rq.x, rq.y, rq.z, rq.w};
                         rigPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY,
                                             g_inputState.cameraPosZ};
+                    }
+                    if (useAppProjection) {
                         if (rigCamera) {
                             cameraRig.pose = rigPose;
                             cameraRig.ipdFactor = g_inputState.viewParams.ipdFactor;
@@ -1112,6 +1146,29 @@ static void RenderOneFrame(RenderState& rs) {
                     }
 
                     xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                    // #1370: the grip / joint markers are located in LOCAL. On the
+                    // rig path the runtime returns render-ready views IN LOCAL, so a
+                    // LOCAL pose draws as-is. On the RAW path (no rig chained)
+                    // XrView.pose is display-plane-relative (INV-6.1) and this app
+                    // composes it on its own player pose (LocateViews in
+                    // displayxr-common): the app's world is the player frame with
+                    // the display plane at its origin. A LOCAL pose is rebased into
+                    // that frame:
+                    //   world = player o inv(displayPlanePose) o pose_in_LOCAL
+                    // where displayPlanePose is the raw channel's plane in LOCAL.
+                    // Without the raw channel the plane is unknown; identity is the
+                    // best available guess.
+                    auto markerWorldPose = [&](const XrPosef &poseInLocal) -> XrPosef {
+                        if (useAppProjection) {
+                            return poseInLocal;
+                        }
+                        XrPosef plane = {{0, 0, 0, 1}, {0, 0, 0}};
+                        if (g_hasViewRigExt && rawProbe.eyeCountOutput > 0) {
+                            plane = rawProbe.displayPlanePose;
+                        }
+                        return PoseMul(rigPose, PoseMul(PoseInverse(plane), poseInLocal));
+                    };
 
                     // Capture the runtime's resolved CANVAS size (the window
                     // client area in meters) — this is the physical_height_m the
@@ -1446,7 +1503,7 @@ static void RenderOneFrame(RenderState& rs) {
                                     if (!g_actions.poseValid[hnd]) {
                                         continue;
                                     }
-                                    const XrPosef &p = g_actions.pose[hnd];
+                                    const XrPosef p = markerWorldPose(g_actions.pose[hnd]);
                                     float s = g_actions.selectPressed[hnd] ? 0.035f : 0.02f;
                                     XMVECTOR q = XMVectorSet(p.orientation.x, p.orientation.y,
                                                              p.orientation.z, p.orientation.w);
@@ -1481,12 +1538,13 @@ static void RenderOneFrame(RenderState& rs) {
                                             continue;
                                         }
                                         float s = jl.radius > 0.001f ? jl.radius : 0.008f;
-                                        XMVECTOR q = XMVectorSet(jl.pose.orientation.x, jl.pose.orientation.y,
-                                                                 jl.pose.orientation.z, jl.pose.orientation.w);
+                                        const XrPosef jp = markerWorldPose(jl.pose);
+                                        XMVECTOR q = XMVectorSet(jp.orientation.x, jp.orientation.y,
+                                                                 jp.orientation.z, jp.orientation.w);
                                         XMMATRIX world = XMMatrixScaling(s, s, s) *
                                                          XMMatrixRotationQuaternion(q) *
-                                                         XMMatrixTranslation(jl.pose.position.x, jl.pose.position.y,
-                                                                             jl.pose.position.z);
+                                                         XMMatrixTranslation(jp.position.x, jp.position.y,
+                                                                             jp.position.z);
                                         XMMATRIX wvp = world * viewMatrix * zoomM * projMatrix;
                                         XMFLOAT4X4 wvpOut;
                                         XMStoreFloat4x4(&wvpOut, wvp);

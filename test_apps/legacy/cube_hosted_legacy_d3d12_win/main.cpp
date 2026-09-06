@@ -114,7 +114,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Create reference spaces
-    if (!CreateSpaces(xr)) {
+    // Hosted legacy-style cube: the cube is drawn at y = 1.6 - a legacy VR title
+    // standing 1.6 m above the floor - so the app's world is STAGE (the floor),
+    // not LOCAL (the head). Runtime #1370: xrLocateViews honours the requested
+    // base space on both legs, and the hosted world-absolute concession that used
+    // to lift LOCAL views to the standing height for these cubes is gone.
+    if (!CreateSpaces(xr, XR_REFERENCE_SPACE_TYPE_STAGE)) {
         LOG_ERROR("Reference space creation failed");
         CleanupOpenXR(xr);
         CleanupD3D12(renderer);

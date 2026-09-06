@@ -816,8 +816,13 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 
 static bool CreateSpaces(AppXrSession &app)
 {
+    // Hosted legacy-style cube: the cube is drawn at y = 1.6 - a legacy VR title
+    // standing 1.6 m above the floor - so the app's world is STAGE (the floor),
+    // not LOCAL (the head). Runtime #1370: xrLocateViews honours the requested
+    // base space on both legs, and the hosted world-absolute concession that used
+    // to lift LOCAL views to the standing height for these cubes is gone.
     XrReferenceSpaceCreateInfo spaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
-    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
     spaceInfo.poseInReferenceSpace = {{0,0,0,1}, {0,0,0}};
     XR_CHECK(xrCreateReferenceSpace(app.session, &spaceInfo, &app.localSpace));
 
