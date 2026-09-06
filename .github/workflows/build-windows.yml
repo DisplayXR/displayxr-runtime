@@ -301,7 +301,10 @@ jobs:
           }
           # -C matches the multi-config generator; --output-on-failure so a red
           # check names the assertion instead of just a count.
-          ctest --test-dir $bd -C Release --output-on-failure --no-tests=error
+          # tests_oxr_view_space (#1370) needs a registered display processor;
+          # it SKIPs here and is re-run for real in the self-test step below,
+          # after sim-display is registered.
+          ctest --test-dir $bd -C Release --output-on-failure --no-tests=error -E tests_oxr_view_space
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::unit tests failed."
             exit 1
@@ -351,6 +354,27 @@ jobs:
           try {
             & $cli selftest
             $code = $LASTEXITCODE
+
+            # #1370: with a display processor registered, the OpenXR-level
+            # view-space acceptance test can run for real (it SKIPped in the
+            # ctest pass above). xrLocateViews must honour the requested base
+            # space on the legacy and the rig path; a SKIP here is a FAILURE
+            # (the environment is exactly what it needs).
+            if ($code -eq 0) {
+              $bd = if (Test-Path build) { "build" } else { "_build" }
+              $vsOut = (& ctest --test-dir $bd -C Release -V --no-tests=error -R tests_oxr_view_space 2>&1 | Out-String)
+              $vsCode = $LASTEXITCODE
+              Write-Host $vsOut
+              if ($vsCode -ne 0) {
+                Write-Host "::error::tests_oxr_view_space failed (exit $vsCode) - xrLocateViews does not honour the base space (#1370)."
+                $code = $vsCode
+              } elseif ($vsOut -match "SKIP") {
+                Write-Host "::error::tests_oxr_view_space SKIPped with sim-display registered - the headless runtime did not come up (#1370)."
+                $code = 1
+              } else {
+                Write-Host "PASS: tests_oxr_view_space (#1370 base-space gate)."
+              }
+            }
 
             # Belt-and-braces (#823): the input check must have actually
             # EVALUATED (a silently-skipped input path would pass the exit
