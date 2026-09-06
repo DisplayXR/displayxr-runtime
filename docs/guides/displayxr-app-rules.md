@@ -90,9 +90,12 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   graphics binding (`XrGraphicsBinding*`) into `XrSessionCreateInfo.next` at `xrCreateSession`.
 - **F-4 — Reference space.** Create one `LOCAL` reference space
   (`xrCreateReferenceSpace`, `XR_REFERENCE_SPACE_TYPE_LOCAL`) and use it for **both** `xrLocateViews`
-  and layer submission. In RAW mode (`XR_DXR_display_info` enabled) the runtime returns
-  screen-centered positions regardless of the space, but LOCAL is the correct, portable choice
-  (see [INV-6.1](#6-kooima-projection)).
+  and layer submission. Render-ready views (legacy, or an `XR_DXR_view_rig` rig chained) come back
+  **in that space**, like on any OpenXR runtime, and a chained rig pose is read in it. In RAW mode
+  (`XR_DXR_display_info` enabled, no rig chained) the eyes are **relative to the display plane**;
+  `XrViewDisplayRawDXR::displayPlanePose` gives that plane in the locate space, which is how you
+  rebase anything else you located there (grips, hand joints) — see
+  [INV-6.1](#6-kooima-projection).
 - **F-5 — Enable the extensions you use.** Check availability with
   `xrEnumerateInstanceExtensionProperties`, then list each in
   `XrInstanceCreateInfo.enabledExtensionNames` at `xrCreateInstance`, and resolve its functions via
@@ -458,11 +461,13 @@ its own content by definition, so there is no full-window backer. Reference apps
 
 ## 6. Kooima projection
 
-- **INV-6.1 — With `XR_DXR_display_info` enabled, `xrLocateViews` is RAW mode and YOU own the
-  camera.** It returns screen-centered eye positions (meters), identity orientation, advisory
-  FOV — regardless of the reference space (pass LOCAL). The runtime applies no
-  convergence/comfort; you build your own asymmetric off-axis frustum. Ref:
-  `XR_DXR_display_info.md:976-989`.
+- **INV-6.1 — With `XR_DXR_display_info` enabled and no rig chained, `xrLocateViews` is RAW mode
+  and YOU own the camera.** It returns eye positions (meters) **relative to the display plane**,
+  identity orientation, advisory FOV (pass LOCAL). The runtime applies no convergence/comfort; you
+  build your own asymmetric off-axis frustum. The plane itself is
+  `XrViewDisplayRawDXR::displayPlanePose`, reported in the locate space: compose it in when you draw
+  something you located in that space through a RAW view (`cube_handle_d3d11_win` rebases its
+  grip / joint markers this way). Ref: `XR_DXR_display_info.md:976-989`.
 
 - **INV-6.2 — Without the extension (legacy/RENDER_READY), the runtime returns converged poses +
   FOV; you still build the matrix from `XrFovf`** (the runtime never returns a matrix).
