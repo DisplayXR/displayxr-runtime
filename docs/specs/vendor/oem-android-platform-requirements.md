@@ -394,7 +394,7 @@ adb logcat | grep 'setBacklightMode:false'            # fires exactly once
 
 ### R6 — Freeform / multi-window must map 1:1 to panel pixels
 
-**Owner:** **PLATFORM** · **Status:** **OPEN — and, as of 2026-09-05, measured
+**Owner:** **PLATFORM** · **Status:** **OPEN — and, as of 2026-09-06, measured
 rather than inferred** · **Traces to:** report §6b pixel-exactness rules, #1087,
 [#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367), ADR-036 D6
 
@@ -417,7 +417,7 @@ destroys it. The platform must therefore guarantee, for a DisplayXR window:
    phase origin) must be the position at which SurfaceFlinger actually composites
    the layer.
 
-**Measured, 2026-09-05: the mini-window / recents-card freeform path scales the
+**Measured, 2026-09-06: the mini-window / recents-card freeform path scales the
 whole task.** This is no longer an inference from authoring rules — it was read
 straight out of SurfaceFlinger and the window manager on the reference device
 (landscape-oriented 2560×1600 panel, Android 13), with an in-process `_hosted`
