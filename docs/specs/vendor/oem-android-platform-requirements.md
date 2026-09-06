@@ -12,6 +12,7 @@ code-paths:
   - src/xrt/compositor/multi/comp_multi_system.c
   - src/xrt/compositor/multi/comp_multi_weave_android.c
   - src/xrt/compositor/vk_native/comp_vk_native_compositor.c
+  - scripts/android-oem-probe.sh
   - scripts/android-sidebyside.sh
   - scripts/android_bg_capture.sh
 ---
@@ -26,6 +27,18 @@ It is written to be actionable without talking to us: every ask states the exact
 mechanism, the user-visible consequence of not having it, the degraded fallback
 DisplayXR actually ships in its absence, and an acceptance test you can run on a
 bench unit.
+
+**The platform asks that can be measured over adb are scripted.**
+[`scripts/android-oem-probe.sh`](../../../scripts/android-oem-probe.sh) runs them
+in about a minute against an attached device and prints PASS / FAIL / INFO per
+ask with the raw evidence — R6, S9, R8 and S4 today, with S2 and S6 reporting the
+read-only half and pointing at the manual test. It is read-only with respect to
+device configuration: it never installs, uninstalls, roots, or writes a setting
+or system property, and it force-stops every app it launched. Run everything
+(`./scripts/android-oem-probe.sh`) or one ask at a time
+(`--only r6`); it exits non-zero on any FAIL, so it drops straight into a
+firmware acceptance gate. Each ask's "Acceptance test" block below gives the
+exact invocation and the expected PASS output.
 
 Two things are deliberately kept apart, because they land on different desks:
 
@@ -79,7 +92,7 @@ Tiering:
 | **N3** | Capture protocol: panel extent in header, configurable width/rate, zero-copy path | NICE | VENDOR | Runtime consumer side landed; vendor producer PR open |
 | **N4** | Do not force `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` | NICE | **PLATFORM** | OPEN |
 | **N5** | GPU headroom: context slots, `VK_KHR_global_priority`, timeline semaphores | NICE | **PLATFORM** | OPEN |
-| **N6** | Clean teardown in the vendor core (no thread join that never returns) | NICE | VENDOR | OPEN |
+| **N6** | Clean teardown in the vendor core (no thread join that never returns) | NICE | VENDOR | **Join hang FIXED** upstream 2026-09-06, hardware-proven and in a released SDK; the teardown `vkDestroyImage` SIGSEGV is still open |
 
 ---
 
@@ -557,6 +570,37 @@ scaling on the freeform path — that is the exact failure this requirement exis
 to catch. Step 4 is the same failure reached through the affordance a user
 actually touches, and it is the one the reference device fails today.
 
+**Acceptance test, automated:** `scripts/android-oem-probe.sh --only r6`
+(`--app <pkg>` for your own resizable 3D app). It performs step 4 end to end —
+launch, recents, the card's freeform affordance — and prints the measurement.
+PASS looks like:
+
+```
+  SF task #<id> leash transform          (ROT_0) (TRANSLATE)
+    leash scale (sx, sy)                 1.000000, 1.000000
+    leash displayFrame                   [x0 y0 x1 y1]
+    leash forceClientComposition         false
+  app layer                              SurfaceView ... (BLAST)#<n>
+    displayFrame                         [x0 y0 x1 y1]  = WxH on screen
+    buffer / geomLayerBounds             WxH
+    measured scale (x, y)                1.0000, 1.0000
+    forceClientComposition               false
+  WM task bounds                         Rect(...) against a <panel> panel
+
+  PASS -- the app's buffer maps 1:1 to panel pixels in the mini window.
+```
+
+Any measured scale other than 1.0000 in either axis is a FAIL and the script
+exits non-zero. Both the task leash and the app's own layer are reported,
+because the scale and the client-composition fallback land on **different**
+layers — the reference device shows `(SCALE TRANSLATE)` with ~0.67 and
+`forceClientComposition=true` on the **leash**, while the app's own layer stays
+`false`. Note also that SurfaceFlinger reports every frame in
+**natural-orientation** display coordinates, so on a landscape-oriented,
+portrait-natural panel the frames look transposed against the WM bounds; the
+probe detects that and says `(axes swapped)` rather than reporting two
+disagreeing scale factors.
+
 ---
 
 ### R7 — Camera arbitration through the tracking service
@@ -640,6 +684,25 @@ screen on, and confirm the session and the vendor services are still alive
 (`adb shell dumpsys activity processes | grep -E '<pkg>|<vendor-svc>'`, check
 `adj` and frozen state). Update the app in place; confirm the overlay app-op
 survives (`adb shell cmd appops get <pkg> SYSTEM_ALERT_WINDOW`).
+
+**Acceptance test, automated (the snapshot half):**
+`scripts/android-oem-probe.sh --only r8` reads the runtime service's process
+state in one shot — resident, non-isolated, declared foreground-service type,
+`oom adj`, and the freezer triple. PASS looks like:
+
+```
+  process                            pid <n>, uid <n>, resident
+  oom adj                            oom adj: max=1001 curRaw=200 setRaw=200 cur=200 set=200
+  foreground services                mHasForegroundServices=true
+  freezer                            isFreezeExempt=false isPendingFreeze=false isFrozen=false
+  manifest foregroundServiceType     0x12 = mediaPlayback|connectedDevice
+
+  PASS -- resident, non-isolated, holding a foreground service, not frozen.
+```
+
+`isFrozen=true` is a FAIL. The 15-minute soak and the app-op-survives-update
+check above are still manual — the probe reports the instant, not the policy over
+time.
 
 ---
 
@@ -1096,6 +1159,15 @@ minSdk 29).
 # (i.e. the hint session, not the pipelining, is now holding the clocks up).
 ```
 
+**Acceptance test, automated:** `scripts/android-oem-probe.sh --only s4`. The
+runtime already performs exactly the call above and logs the outcome, so the
+probe reads the answer out rather than re-implementing it: PASS on
+`ADPF: perf-hint session created`, FAIL on `ADPF: createSession failed` or
+`no PerformanceHintManager`. It also reports whether the `IPower` AIDL service is
+registered at all, and SurfaceFlinger's own `use_adpf_cpu_hint`. If no `ADPF:`
+line is in the log buffer the verdict is INFO, not a guess — run an
+out-of-process (service-compositor) session and re-read.
+
 ---
 
 ### S5 — Ship the background-capture producer in firmware, auto-started
@@ -1355,6 +1427,21 @@ affordance. PASS requires EITHER:
       window delivers a notification before the next frame is rendered.
 ```
 
+**Acceptance test, automated:** `scripts/android-oem-probe.sh --only r6,s9`
+(S9 reads R6's measurement, so run the two together). The check is always
+**INFO** — it reports what each app-visible source says, and the ask is closed by
+(a) `r6` passing, or (b) one of those sources carrying the number. On a device
+that satisfies neither it prints:
+
+```
+  dumpsys window: scale fields         0 occurrence(s)   <- the server-side scale is not reported at all
+  WM bounds reported to the app        Rect(...)   (origin physical, size logical -- a hybrid)
+  actual composited rect               [x0 y0 x1 y1]
+  effective scale, measured            0.6704, 0.6700
+  settings global (freeform)           enable_freeform_support=1 force_resizable_activities=1
+  system properties                    <none carrying the scale>
+```
+
 ---
 
 ## 4. NICE-TO-HAVE
@@ -1395,11 +1482,38 @@ N concurrent compositors (order 4–31 depending on the GPU family); expose
 `SYNC_FD` semaphores are **binary and temporary-import only** — a timeline path
 would remove a per-frame import from every cross-process weave. *(Platform.)*
 
-**N6 — Clean vendor-core teardown.** Core release currently joins an internal
-thread that never exits (a `nanosleep` loop), so an in-process host must
-`_exit()` rather than shut down cleanly; and there is an intermittent SIGSEGV in
-`vkDestroyImage` during interlacer release. Architecture C hides both behind
-process death; Architecture A cannot. *(Vendor; issues open.)*
+**N6 — Clean vendor-core teardown.** *(Vendor. The first half is **fixed
+upstream and released**; the second is still open.)*
+
+**The join hang is solved.** Core release used to join an internal thread that
+never exits — the input-noise measurement thread of the eye-pair predictor looped
+`while(true)` with no stop condition while the predictor's destructor joined it
+unconditionally — so the SDK's core-release entry point
+(`leia_core_release()` in the reference SDK) blocked in `pthread_join` forever
+and an in-process host had to `_exit()` rather than shut down cleanly. It was present
+in every SDK drop from the one that introduced the noise-adaptive filter, and
+enabled by default on Android, so **every** Android consumer had an unjoinable
+predictor. The user-visible shape was an app that never draws again after an
+activity relaunch — the recents freeform toggle was the reliable way to reach it:
+`NativeActivity.onDestroy` blocks the Java main thread waiting for `android_main`,
+which is inside `xrDestroySession` → core release, ending in
+`APP TRANSITION TIMEOUT` and an ANR.
+
+The upstream fix applies the pattern the same destructor already used for its
+*output* noise thread — an atomic stop flag set before the thread starts, checked
+by the loop, cleared before the join. It **merged 2026-09-06 and ships in the SDK
+release cut the same day** (§7), and it is hardware-proven: on the reference
+device the release now returns in **~1.07 s** (bounded by one measurement period,
+because the loop checks the flag after its sleep) and the relaunch that used to
+wedge completes normally. The runtime side ships the matching defence for
+unfixed cores still in the field: the display plug-in bounds the core-release
+call with a **3 s watchdog** that detaches, skips the library release and leaks
+the core rather than let a vendor shutdown hang block `xrDestroySession` — the
+plug-in release that carries it is named in §7.
+
+**What remains open** is the other half: an intermittent SIGSEGV in
+`vkDestroyImage` during interlacer release. Architecture C hides it behind
+process death; Architecture A cannot.
 
 ---
 
@@ -1415,7 +1529,7 @@ what is genuinely still open:
 | L2 | Backlight is a binary bind-refcount | **R5** | Vendor | Contract verified; "bound but 2D" residual open |
 | L3 | Legacy backlight tiers force global 2D | **R5** | Vendor | Deprecation PR open |
 | L4 | One core per process | — | — | **Not asked** — only the rejected Architecture B needed it |
-| L5 | Core release joins a thread that never exits | **N6** | Vendor | OPEN |
+| L5 | Core release joins a thread that never exits | **N6** | Vendor | **FIXED** — merged upstream 2026-09-06 and released; measured ~1.07 s to release on the reference device |
 | L6 | No multi-display | **S7** | Vendor | OPEN |
 | L7 | Services discoverable only by package name | **R1** | Vendor + firmware | Fix written, proven on device; **PR open** |
 | L8 / L9 | Desktop-SDK phase origin / per-process calibration | — | — | Desktop SDK only; out of scope for an Android OEM |
@@ -1465,9 +1579,10 @@ pre-installed display services are built from a version **at or after** the
 change, and to keep them updatable.
 
 Statuses below were re-verified against the upstream tracker on **2026-09-06**.
-Only **R4** is merged; everything else marked "PR" is an **open** pull request,
-so an OEM planning a firmware spin should treat those as *available to
-cherry-pick*, not *available in a release*.
+Two changes are **merged and released** — **R4** and the join-hang half of
+**N6**; everything else marked "PR" is an **open** pull request, so an OEM
+planning a firmware spin should treat those as *available to cherry-pick*, not
+*available in a release*.
 
 | Ask | Upstream change (LeiaInc/CNSDK) | Upstream state | Notes |
 |---|---|---|---|
@@ -1483,7 +1598,7 @@ cherry-pick*, not *available in a release*.
 | S9 | Issue #732 | open | Near-term: expose the composited on-screen rect + container scale per window. Confirms no interlacer API change is needed |
 | N1 | PR #713, issue #709 | open | |
 | N2 | PR #701, issue #710 | open | |
-| N6 | Issues #694, #696 | open | |
+| N6 | **PR #730** (issue #694) — the core-release join hang; issue #696 — the teardown SIGSEGV | **#730 MERGED 2026-09-06**, released in **CNSDK 0.10.67** (same day); #696 open | The join-hang half needs no cherry-pick — take 0.10.67 or later. Proven on device: release returns in ~1.07 s and the freeform relaunch no longer wedges. Runtime-side watchdog: `displayxr-leia-plugin` [#226](https://github.com/DisplayXR/displayxr-leia-plugin/pull/226), shipped in v2.6.15 |
 | — | PRs #700, #712 | open | Build fixes needed to compile the services standalone on NDK 26 |
 
 Two build notes for whoever integrates them, because both cost a day the first
@@ -1520,6 +1635,9 @@ vendor asks before committing to a firmware spin.
   — the multi-display half of the vendor contract (S7's runtime side)
 - [`docs/guides/vendor-plugin-onboarding.md`](../../guides/vendor-plugin-onboarding.md)
   — zero-to-shipping for a new display vendor
+- [`scripts/android-oem-probe.sh`](../../../scripts/android-oem-probe.sh) — the
+  scripted acceptance probe for the platform asks above (`--list` for the
+  sub-checks, `--only <id>` to run one)
 - [`docs/roadmap/android-weave-satellite.md`](../../roadmap/android-weave-satellite.md)
   — the weave satellite (S8's intermediate form) as designed and measured,
   including the container-scale derivation S9 exists to replace

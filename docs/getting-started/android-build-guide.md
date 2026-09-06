@@ -493,6 +493,15 @@ Each extra live satellite costs ~30–60 MB and one GPU context.
 
 ## Troubleshooting
 
+**Before chasing a runtime bug, check the platform underneath it.**
+`scripts/android-oem-probe.sh` (`--list` for the sub-checks, `--only r6` for one)
+is a read-only, one-minute adb probe of the platform asks in
+[`docs/specs/vendor/oem-android-platform-requirements.md`](../specs/vendor/oem-android-platform-requirements.md)
+— 1:1 panel pixels in a mini window, container-scale visibility, the runtime
+service's process/freezer policy, ADPF hint sessions — and it prints the device,
+Android version, panel geometry and CNSDK loader stamps as a header, which is
+also the fastest way to capture an environment for a bug report.
+
 ### Build fails: "No CNSDK AAR found"
 
 The Gradle build expects the CNSDK release tree at `cnsdk/` in the repo root. Re-read Step 1.
