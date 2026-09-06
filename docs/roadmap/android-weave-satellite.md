@@ -48,13 +48,19 @@ P2 item (b) below. `91f071770`'s two-client experiment (browser present-owner +
 modelviewer via `force_ipc`, two slots live) is the one time both have run
 concurrently, and it is what found the frozen-overlay bug that commit fixes.
 
-**Not the runtime's:** the "while scaled, show 2D" mitigation is entirely
-browser-side (patch `0123`, option 1b), it is **opt-in and default OFF**
+**Two "while scaled, show 2D" mitigations now exist, and they differ.** The
+browser's is patch `0123` option 1b, **opt-in and default OFF**
 (`--inline-3d-refuse-scaled`) because of the browser#186 freeform→fullscreen
-staging wedge, and there is no runtime PR that degrades an in-process
-compositor to 2D under a scaled container. PR #1372 is a different fix — the
-in-process hosted view publishing its window rect (#1367) — and its device run
-is still awaiting an eye check.
+staging wedge. The runtime's landed in PR #1372 (`736db35de`, 2026-09-06,
+merged): the in-process VK compositor derives "container scaled" from the
+published window rect against the panel (the same bounds-exceed-the-panel tell
+as P1), and while scaled collapses to tile 0, skips the weave and releases the
+lens preference — correct 2D, never a double image — and resumes weaving when
+the rect fits again. Device-verified on the reference tablet (scaled
+mini-window → clean 2D, David's eye check; `am task resize` to on-panel bounds
+→ 3D resumes; fullscreen untouched). It is always on; it needs no property.
+The same PR is what makes a `_hosted` view publish its rect at all (#1367) and
+scales the DP view dims to the window canvas.
 
 ## The P0-shaping finding (2026-08-28)
 
@@ -349,9 +355,9 @@ rebuild the compositor, the swapchains, the `VkDevice` binding and the vendor
 core *under a live `XrSession`*, and the in-process path's whole value is that
 the app's own images are used with no copy — those images live in the app's
 process and cannot be re-homed into a satellite. There is no OpenXR mechanism
-for it and no runtime affordance. (The premise that a "detect-and-degrade"
-signal is being implemented in parallel is not accurate: the scaled-container
-2D fallback is browser-side only, opt-in, and default off pending browser#186.)
+for it and no runtime affordance. (The in-process detect-and-degrade that
+landed in PR #1372 is the *fallback* while scaled — 2D, correct — not a
+hand-off: it does not move the session anywhere.)
 
 **Why (iii) is a setter and not a route.** "Every app on this device goes out
 of process" is precisely the device-wide deployment decision that ADR-036's
