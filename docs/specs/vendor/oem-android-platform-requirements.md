@@ -1,8 +1,8 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-08-20
-issues: [1038, 1031, 1073, 1087, 1090]
+updated: 2026-09-06
+issues: [1038, 1031, 1073, 1087, 1090, 1277]
 adr: ADR-036
 code-paths:
   - src/xrt/auxiliary/android/android_custom_surface.cpp
@@ -10,6 +10,7 @@ code-paths:
   - src/xrt/compositor/util/comp_bg2d.c
   - src/xrt/compositor/util/comp_bg2d_capture.c
   - src/xrt/compositor/multi/comp_multi_system.c
+  - src/xrt/compositor/multi/comp_multi_weave_android.c
   - src/xrt/compositor/vk_native/comp_vk_native_compositor.c
   - scripts/android-sidebyside.sh
   - scripts/android_bg_capture.sh
@@ -29,10 +30,16 @@ bench unit.
 Two things are deliberately kept apart, because they land on different desks:
 
 - **Vendor-SDK asks** — changes inside the display vendor's SDK and its
-  pre-installed device services. Most of these are already **written, merged or
-  in review upstream**; the OEM's job is to *pick up a firmware image that
-  contains them*, not to implement them. Marked **[VENDOR — SOLVED]** or
+  pre-installed device services. Most of these are already **written and in
+  review upstream**; the OEM's job is to *pick up a firmware image that contains
+  them*, not to implement them. Marked **[VENDOR — SOLVED]** or
   **[VENDOR — OPEN]**, with the upstream change listed in §7.
+
+  **Read "SOLVED upstream" precisely.** It means *the fix exists upstream and has
+  been proven on a bench unit* — not that it is in a release you can pull. As of
+  this revision only **R4** is actually **merged**; R1, R2, R3 and R5 are open
+  pull requests. §7 states merged-vs-open per ask, and that column is the one an
+  OEM should plan against.
 - **Platform asks** — changes that only the OEM/ODM can make, because they live
   in the AOSP fork, in the signing story, in SurfaceFlinger, in the window
   manager, or in the PowerHAL. Marked **[PLATFORM]**. These are the ones that
@@ -50,24 +57,26 @@ Tiering:
 
 | # | Ask | Tier | Owner | Status |
 |---|---|---|---|---|
-| **R1** | Vendor display services discoverable by a **neutral intent action** | REQUIRED | VENDOR (+ firmware pickup) | **SOLVED** upstream |
-| **R2** | **Thread-safe multi-client registration**, per-client eviction in the head-tracking service | REQUIRED | VENDOR (+ firmware pickup) | **SOLVED** upstream |
-| **R3** | **Per-client tracking engine config** (no global last-writer-wins) | REQUIRED | VENDOR (+ firmware pickup) | **SOLVED** upstream |
-| **R4** | Device orientation from **`getRealMetrics()`**, not the window-adjusted metrics | REQUIRED | VENDOR (+ firmware pickup) | **SOLVED** upstream |
+| **R1** | Vendor display services discoverable by a **neutral intent action** | REQUIRED | VENDOR (+ firmware pickup) | Fix written, proven on device; **PR open** |
+| **R2** | **Thread-safe multi-client registration**, per-client eviction in the head-tracking service | REQUIRED | VENDOR (+ firmware pickup) | Fix written, measured on device; **PR open** |
+| **R3** | **Per-client tracking engine config** (no global last-writer-wins) | REQUIRED | VENDOR (+ firmware pickup) | Fix written; **PR open** |
+| **R4** | Device orientation from **`getRealMetrics()`**, not the window-adjusted metrics | REQUIRED | VENDOR (+ firmware pickup) | **MERGED** upstream 2026-08-27 |
 | **R5** | The **multi-client lens/backlight tier is the sole writer**; legacy tiers deprecated | REQUIRED | VENDOR (+ firmware pickup) | Contract verified; deprecation PR open |
-| **R6** | **1:1 panel pixels** — no compat scaling, WM bounds == composited layer | REQUIRED | **PLATFORM** | OPEN |
+| **R6** | **1:1 panel pixels** — no compat scaling, WM bounds == composited layer | REQUIRED | **PLATFORM** | **OPEN — now MEASURED** on the OEM mini-window path |
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence | REQUIRED | **PLATFORM** | Works today — don't regress |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
 | **S2** | **Per-PIXEL** click-through at full opacity (per-region touchability); *plus*, for apps that must keep a foreground Activity, an untrusted-touch exemption + scoping the per-Activity input sink | NICE TO HAVE | **PLATFORM** | **NARROWED** — per-FRAME click-through at full opacity is SOLVED on stock via a tight touchable overlay (#1110); only per-pixel precision and the foreground-Activity case remain |
-| **S3** | **Wait-semaphore hook** into the vendor interlacer (keep compose→weave on-GPU) | STRONGLY REC. | VENDOR | In progress (ours) |
+| **S3** | ~~Wait-semaphore hook into the vendor interlacer~~ | — | VENDOR | **NOT AN ASK — withdrawn.** The hook already existed; we were passing NULL. Documentation-only PR open |
 | **S4** | **ADPF / PowerHAL hint sessions** (`APerformanceHint_createSession`) | STRONGLY REC. | **PLATFORM** | OPEN — unsupported on the reference device |
 | **S5** | Ship the **background-capture service** in firmware, auto-started | STRONGLY REC. | VENDOR + firmware | PRs open |
 | **S6** | Window **move is atomic with the buffer**; a drag affordance exists | STRONGLY REC. | **PLATFORM** | OPEN |
 | **S7** | **Per-display** tracking/lens config (multi-panel) | STRONGLY REC. | VENDOR | OPEN |
+| **S8** | A **platform-composed weave** (end state), or — now — a **full-opacity, device-composited privileged overlay** for the runtime's weave satellite | STRONGLY REC. | **PLATFORM** | OPEN — the intermediate form is measured and shipping behind a flag |
+| **S9** | Expose the **container scale + composited on-screen rect** per window (or a manifest opt-out from mini-window scaling) | STRONGLY REC. | **PLATFORM** | OPEN — the information, not the capability, is what is missing |
 | **N1** | Observability: log the applied engine config **and** the client that set it | NICE | VENDOR | PR open |
 | **N2** | Document the **classloader-parent contract**; add an explicit `classLoader` field | NICE | VENDOR | Docs PR open |
-| **N3** | Capture protocol: panel extent in header, configurable width/rate, zero-copy path | NICE | VENDOR | Partly landed |
+| **N3** | Capture protocol: panel extent in header, configurable width/rate, zero-copy path | NICE | VENDOR | Runtime consumer side landed; vendor producer PR open |
 | **N4** | Do not force `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` | NICE | **PLATFORM** | OPEN |
 | **N5** | GPU headroom: context slots, `VK_KHR_global_priority`, timeline semaphores | NICE | **PLATFORM** | OPEN |
 | **N6** | Clean teardown in the vendor core (no thread join that never returns) | NICE | VENDOR | OPEN |
@@ -96,10 +105,14 @@ Two deployment shapes exist, and the platform must support **both**
   process and as a fallback.
 
 The reference bring-up device for everything measured below is a **1600×2560
-portrait-natural panel on Android 13** (referred to as "the reference device").
-Where a behaviour is that device's rather than AOSP's, it is called out — those
-are the entries an OEM should read as *"avoid or document"*, not as
-*"reproduce"*.
+portrait-natural panel on Android 13** (referred to as "the reference device"),
+run both fullscreen and in the OEM's small-window ("mini window" / recents-card
+freeform) mode, in both panel orientations. Where a behaviour is that device's
+rather than AOSP's, it is called out — those are the entries an OEM should read
+as *"avoid or document"*, not as *"reproduce"*. The two window shapes matter
+independently: several asks here are satisfied fullscreen and fail in a small
+window, which is the failure mode a demo never shows and a user meets in the
+first minute (R6, S8, S9).
 
 ---
 
@@ -107,8 +120,9 @@ are the entries an OEM should read as *"avoid or document"*, not as
 
 ### R1 — Vendor display services must be discoverable by a neutral intent action
 
-**Owner:** vendor SDK + OEM firmware pickup · **Status:** **SOLVED upstream**,
-proven on device · **Traces to:** L7 / ADR-036 D5
+**Owner:** vendor SDK + OEM firmware pickup · **Status:** fix written upstream
+and **proven on a retail unit**; the pull request is still **open** (§7) ·
+**Traces to:** L7 / ADR-036 D5
 
 **Mechanism.** Every pre-installed vendor display service (head tracking, display
 configuration, backlight/lens control) must declare a **vendor-neutral intent
@@ -214,7 +228,8 @@ adb logcat | grep -E 'Successfully initialized in-service library|ClientHello|On
 
 ### R2 — Head-tracking service: thread-safe client registration, per-client eviction
 
-**Owner:** vendor SDK + OEM firmware pickup · **Status:** **SOLVED upstream** ·
+**Owner:** vendor SDK + OEM firmware pickup · **Status:** fix written upstream
+and **measured on device**; the pull request is still **open** (§7) ·
 **Traces to:** L-a / L-b
 
 **Mechanism.** The head-tracking service must, for N concurrent client processes:
@@ -269,8 +284,8 @@ kill-one leaves the survivor receiving (455 further frames over ~23 s).
 
 ### R3 — Tracking engine configuration must be per-client, not global
 
-**Owner:** vendor SDK + OEM firmware pickup · **Status:** **SOLVED upstream** ·
-**Traces to:** L1
+**Owner:** vendor SDK + OEM firmware pickup · **Status:** fix written upstream;
+the pull request is still **open** (§7) · **Traces to:** L1
 
 **Mechanism.** Face-detector backend, device orientation, tracked-eye selection,
 IPD, face count, frame rate and log level must be **scoped or aggregated per
@@ -298,8 +313,9 @@ configures nothing must not change the aggregate.
 
 ### R4 — Device orientation must come from `getRealMetrics()`
 
-**Owner:** vendor SDK + OEM firmware pickup · **Status:** **SOLVED upstream**
-(validated A/B/A on device) · **Traces to:** the orientation defect found during
+**Owner:** vendor SDK + OEM firmware pickup · **Status:** **MERGED upstream**
+2026-08-27, validated A/B/A on device — the only ask on this list that is in an
+SDK release · **Traces to:** the orientation defect found during
 in-process freeform bring-up
 
 **Mechanism.** The vendor SDK's orientation helper must derive the **device**
@@ -378,8 +394,9 @@ adb logcat | grep 'setBacklightMode:false'            # fires exactly once
 
 ### R6 — Freeform / multi-window must map 1:1 to panel pixels
 
-**Owner:** **PLATFORM** · **Status:** OPEN · **Traces to:** report §6b
-pixel-exactness rules, #1087, ADR-036 D6
+**Owner:** **PLATFORM** · **Status:** **OPEN — and, as of 2026-09-05, measured
+rather than inferred** · **Traces to:** report §6b pixel-exactness rules, #1087,
+[#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367), ADR-036 D6
 
 **Mechanism.** A woven frame is an **interlaced** image: view assignment is
 per-subpixel. Any resampling between the app's swapchain image and the panel
@@ -400,7 +417,41 @@ destroys it. The platform must therefore guarantee, for a DisplayXR window:
    phase origin) must be the position at which SurfaceFlinger actually composites
    the layer.
 
-**Behaviours an OEM should avoid or explicitly document** — both observed on the
+**Measured, 2026-09-05: the mini-window / recents-card freeform path scales the
+whole task.** This is no longer an inference from authoring rules — it was read
+straight out of SurfaceFlinger and the window manager on the reference device
+(landscape-oriented 2560×1600 panel, Android 13), with an in-process `_hosted`
+3D app put into freeform by the **recents-card affordance**, which is the
+device's normal user-facing route into a small window:
+
+| Probe | Reading |
+|---|---|
+| SF task layer transform | `geomLayerTransform (ROT_0) (SCALE TRANSLATE)` — a **scale**, not a resize |
+| SF `displayFrame` | `[231 1753 1368 2485]` in natural-portrait display coordinates (1137×732 there) |
+| App buffer | **1080×1685** logical, so the on-screen footprint is 732×1137 in the app's own orientation — **scale ≈ 0.677** |
+| SF composition | `forceClientComposition=true` — the resample is a **GPU bilinear** filter |
+| WM `mBounds` | `Rect(1757, 236 - 2837, 1921)` — 1080×1685 (**logical size**) at a **physical origin**, and the rect **extends past the 2560×1600 panel in both axes** |
+| Exposed setting | `settings list global` shows `enable_freeform_support=1` and `force_resizable_activities=1`, and **nothing at all for the scale** |
+
+Three things follow, and they are what make this a REQUIRED ask rather than a
+quality complaint:
+
+1. **The weave cannot survive it.** The app presents a correctly interlaced
+   buffer and the compositor bilinearly resamples it afterwards. Bilinear
+   filtering of an interlaced pattern **is not invertible** — neighbouring views
+   are averaged into each other — so there is no pre-compensation an application
+   can apply at any precision. The 3D is destroyed, not softened.
+2. **The scale is invisible to the app.** The window bounds are a *hybrid*
+   (physical origin, logical size), the `Configuration` carries no compat-scale
+   field, accessibility bounds are logical-clipped, and no setting or system
+   property carries the factor — all probed. See **S9**, which asks for exactly
+   this information.
+3. **It is an OEM addition, not AOSP behaviour.** Stock AOSP desktop windowing
+   (the Android 15 QPR / 16 desktop-mode lineage) composes a resizable app's
+   freeform window **1:1**; a whole-task presentation scale is a
+   device-specific window-container policy layered on top of it.
+
+**Behaviours an OEM should avoid or explicitly document** — all observed on the
 reference device:
 
 - **`am task resize` desyncs WM from SF.** After a task resize, WM bounds
@@ -435,6 +486,43 @@ so the resize provably precedes surface creation and the desync window is never
 entered. For moves we poll `View.getLocationOnScreen()` from a `Choreographer`
 callback and re-weave on change, which costs ≥ 1 frame of wrong phase.
 
+For the container-scaled mini window specifically we ship **two different
+responses, neither of them a fix**:
+
+- *Weave at the physical size.* The runtime's weave satellite infers the scale
+  from the hybrid-bounds tell (the reported rect exceeds the panel while its
+  origin lies inside it), then sizes its output and the display processor's phase
+  rect in **physical** pixels so the compositor's own resample lands on an image
+  that was woven for the pixels it will actually occupy
+  ([#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277) P0/P1,
+  `comp_multi_weave_android.c`). This works, and it is **fragile by
+  construction**: the factor is a per-device constant, correct only while the
+  OEM's mini-window scale stays fixed and static. One firmware tweak to the scale
+  silently breaks 3D in every mini window, with no error anywhere.
+- *Present 2D.* The in-process hosted path detects the same tell and drops the
+  window to 2D rather than show a broken weave
+  ([#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367)); the
+  browser takes the same route on its Android surface. Honest, and it means the
+  device's own small-window affordance turns 3D off.
+
+**Acceptable implementations** — any one of these closes R6 for the scaled-window
+case:
+
+- **(a) Don't scale a resizable 3D app**, or offer an unscaled freeform mode
+  beside the scaled mini window. Cheapest, and it matches stock AOSP.
+- **(b) Expose the scale and the composited on-screen rect** to the app owning
+  the task, so the runtime can size its buffer to the on-screen pixel count and
+  the container's scale collapses to 1.0. This is **S9**, and it is the smallest
+  change: what is missing is the *information*, not any capability — the vendor
+  SDK's interlacer is already told an integer on-panel viewport and screen
+  position, and at 1:1 the on-screen rect **is** integral panel pixels, so no
+  interlacer API changes. Note the limit: 1:1 sizing only covers a **static**
+  scale. A scale that *animates* — mid-resize, mid-transition — changes every
+  frame and cannot be chased, so that case still falls to (c) or to the 2D
+  fallback.
+- **(c) Compose the weave in the platform**, so no app-visible geometry has to be
+  correct at all. This is **S8**, the end state.
+
 **Acceptance test.**
 
 ```bash
@@ -448,11 +536,26 @@ adb shell dumpsys SurfaceFlinger | grep -A8 <pkg>          # compare the layer's
 # 3. Pixel exactness, objectively: render a 1-px vertical black/white checker,
 #    screencap, and confirm the readback is still a 1-px checker (no resampling).
 adb exec-out screencap -p > shot.png
+
+# 4. THE MINI-WINDOW TEST. Launch a resizable 3D app, then put it into a small
+#    window using the device's own affordance (the recents card / mini-window
+#    control), not `am task resize` — the user-facing path is the one that
+#    matters. Then:
+adb shell dumpsys SurfaceFlinger | grep -A12 <pkg> | grep -E 'geomLayerTransform|displayFrame|forceClientComposition'
+#    PASS: no SCALE in the layer transform, and displayFrame dimensions equal the
+#          app's buffer dimensions.
+#    FAIL: 'SCALE' present, or displayFrame != buffer size -> the weave is being
+#          resampled and the 3D is gone.
+adb shell dumpsys window windows | grep -A5 <pkg> | grep -i bounds
+#    PASS: bounds are physical, and bounds + origin lie INSIDE the panel.
+#    FAIL: a rect that extends past the panel is the hybrid-bounds tell of a
+#          container scale.
 ```
 
 A device that passes (3) in fullscreen but fails it in freeform has compat
 scaling on the freeform path — that is the exact failure this requirement exists
-to catch.
+to catch. Step 4 is the same failure reached through the affordance a user
+actually touches, and it is the one the reference device fails today.
 
 ---
 
@@ -544,7 +647,10 @@ survives (`adb shell cmd appops get <pkg> SYSTEM_ALERT_WINDOW`).
 
 ### S1 — A display capture that can exclude the caller's own layer
 
-**Owner:** **PLATFORM** · **Status:** **OPEN — this is the headline OEM ask** ·
+**Owner:** **PLATFORM** · **Status:** **OPEN — this is the headline OEM ask.**
+The runtime-side work it gates is done ([#1073](https://github.com/DisplayXR/displayxr-runtime/issues/1073),
+closed 2026-08-21) and, since S3 was withdrawn, cost no longer gates compose-under
+either — content correctness is the only thing still waiting on the platform ·
 **Traces to:** L10 (superseded) → **L12**, #1073
 
 **Why this exists at all.** A 3D weave assigns views **per subpixel**, while RGBA
@@ -654,7 +760,7 @@ backdrop is directly readable by `screencap`.
 ### S2 — Per-pixel click-through (and the foreground-Activity case)
 
 **Owner:** **PLATFORM** · **Status:** **NARROWED — no longer needed for
-click-through as such.** Measured end-to-end on the reference NP02J (Android 13 /
+click-through as such.** Measured end-to-end on the reference device (Android 13 /
 SDK 33) on 2026-08-20, twice. The first pass, against the Architecture-A avatar's
 **Activity** window, found it blocked three ways and turned up a second,
 independent blocker the original ask did not cover (*The second blocker* below).
@@ -674,16 +780,31 @@ works outside the overlay's frame, but every transparent pixel *inside* it still
 swallows the tap, and the frame was a full-band 1200×1600 rectangle. Since an
 overlay's touchable region **is** its frame (mechanism 3 is blocked for overlay
 windows too — the blocklist is per-API, not per-window-type), the only lever left
-was to shrink the frame onto the silhouette. That shipped as
-[displayxr-demo-avatar#67](https://github.com/DisplayXR/displayxr-demo-avatar/pull/67):
-the frame now tracks the union bounding box of the character and its speech
-bubble, 1200×1600 → 832×1600 on the reference NP02J, **31 % less screen eaten**,
-with the horizontal dead margin around the character down from ~600 px to
-~230 px. (Only the **width** is driven; under Architecture A the frame is also
-the render canvas, and the height is a feedback axis — see that PR.)
+was to shrink the frame onto the silhouette.
 
-So mechanism 3 now buys a **bounded, quantified** improvement rather than an
-unblocking: the residual is exactly the transparent corners of one rectangle. The
+**Correction (2026-09-06): that shrink was tried, and reverted.**
+[displayxr-demo-avatar#67](https://github.com/DisplayXR/displayxr-demo-avatar/pull/67)
+drove the frame width from the character's bounding box (1200×1600 → 832×1600,
+~31 % less screen eaten) on the argument that only the *height* axis feeds back
+into the render. That argument held for the character and **not** for its 2D
+speech bubble, which is sized as a fraction of the canvas *pixel width* — so
+narrowing the frame shrank the bubble, which shrank the union box, which narrowed
+the frame again. Human verdict on the staged build was a flickering avatar, a
+minuscule bubble and black fringes, and it was reverted the same day
+([#68](https://github.com/DisplayXR/displayxr-demo-avatar/pull/68)); the overlay
+box is now a fixed, tunable aspect
+([#71](https://github.com/DisplayXR/displayxr-demo-avatar/pull/71)).
+
+**The lesson strengthens the ask rather than weakening it.** Under Architecture A
+the overlay frame is simultaneously the input region *and* the render canvas, so
+shrinking it to shape input changes what is rendered — the two are the same
+number, and any app whose layout depends on canvas width has a feedback loop
+waiting for it. A **separate** per-region touchable declaration (mechanism 3) has
+no such coupling: it shapes input without touching the canvas. So the shipped
+dead area is the **full overlay rectangle**, not a tightened bounding box.
+
+Mechanism 3 therefore still buys a **bounded** improvement rather than an
+unblocking — the residual is the transparent area of one rectangle. The
 only stock alternative is an in-app `AccessibilityService` re-dispatching
 misdirected taps ([#1114](https://github.com/DisplayXR/displayxr-runtime/issues/1114)),
 which costs a user-visible accessibility grant, ~50–100 ms of added tap latency
@@ -820,7 +941,7 @@ each clearing exactly one wall, and none of them a grant:
 | **Touchable** (no `FLAG_NOT_TOUCHABLE`) | Inside its own frame the overlay is the **touched** window, not an obscuring one, so the opacity policy is never consulted for it and alpha stays 1.00. It is also what stops the platform clamping us to 0.80. |
 | **No Activity of ours in the foreground task** | `ActivityRecordInputSink`. `moveTaskToBack(true)` suffices — the sink goes `NOT_VISIBLE|NOT_TOUCHABLE`. |
 
-Probe result, NP02J, launcher in the foreground, overlay 600×600 centred, no
+Probe result on the reference device, launcher in the foreground, overlay 600×600 centred, no
 Activity of ours anywhere:
 
 ```
@@ -897,37 +1018,51 @@ adb shell dumpsys input | grep -A1 'ActivityRecordInputSink.*<pkg>'
 
 ---
 
-### S3 — A wait-semaphore hook into the vendor interlacer
+### S3 — ~~A wait-semaphore hook into the vendor interlacer~~ — **WITHDRAWN**
 
-**Owner:** vendor SDK · **Status:** in progress (implemented by us upstream) ·
-**Traces to:** L11
+**Owner:** vendor SDK · **Status:** **NOT AN ASK.** Retained here because earlier
+revisions of this document, and the L-series it came from, asserted the opposite —
+an OEM who read those should stop carrying this item. · **Traces to:** L11
 
-**Mechanism.** The interlacer's Vulkan post-process entry point must accept a
-**wait semaphore** (or a timeline semaphore + value) so the compose→weave
-dependency stays on the GPU. Today the compose-under pass must **CPU-wait a
-`VkFence`** before the self-submitting display processor samples the composed
-atlas. (The reference SDK's interlacer header already carries two semaphore
-fields; if one of them can already express this, the ask collapses to a
-documentation fix — which is the first thing to check.)
+**What the ask said, and why it was wrong.** L11 claimed the interlacer's Vulkan
+post-process entry point exposed no way to express the compose→weave dependency
+on the GPU, so the compose-under pass had to **CPU-wait a `VkFence`** before the
+self-submitting display processor sampled the composed atlas. The premise was
+false: that entry point has taken a wait semaphore since 2023, and it is honoured —
+it is attached to the submit whose command buffer samples the source views. **We
+were passing NULL.** The documentation described the parameter in terms that read
+as swapchain interop, which is how the misreading happened; correcting the
+documentation is the only vendor-side change, and it is an open docs-only PR (§7).
 
-**Consequence if absent.** Measured **2.6–2.9 ms per frame** of CPU stall on the
-reference device, against a bar of ≤ 1 ms. That is the single reason
-compose-under transparency cannot be enabled by default — it ships behind a debug
-flag instead of being the shipping path.
+**What it cost, and what fixing it recovered.** Measured on the reference device,
+CPU time on the render thread in the compose pass, 300-frame averages, same
+binary and same session for the A/B:
 
-**DisplayXR fallback.** The CPU fence wait, with compose-under **default-off**
-behind `debug.dxr.bg2d`.
+| Path | With the CPU fence wait | With the semaphore |
+|---|---|---|
+| In-process | 1.47–1.50 ms | **0.130–0.150 ms** |
+| IPC + service overlay | 2.6–2.9 ms | **0.181–0.198 ms** |
 
-**Acceptance test.** With the hook, enabling compose-under costs ≤ 1 ms/frame and
-a 60 fps app stays at 60 fps with the backdrop on. Compare the per-stage frame
-timers with the backdrop on and off.
+A 10–14× reduction against a ≤ 1 ms bar, with a 60 s soak clean on both paths
+(zero `VK_ERROR_*`, zero validation lines). **Compose-under transparency is no
+longer gated on cost** — what still gates it is **S1**, the capture that can
+exclude the caller's own layer, which is a content-correctness problem and a
+platform ask.
+
+**The generalisable lesson for an OEM.** The expensive part of this was not a
+missing capability — there wasn't one — it was carrying a wrong reading of a
+documented parameter long enough for it to reach a requirements list. Where a
+vendor SDK's synchronisation contract is load-bearing, stating it explicitly in
+the header is worth more than any new API.
 
 ---
 
 ### S4 — ADPF / PowerHAL hint-session support
 
 **Owner:** **PLATFORM** · **Status:** OPEN — **unsupported on the reference
-device** · **Traces to:** #663
+device.** Our side of it is finished and the workaround shipped
+([#663](https://github.com/DisplayXR/displayxr-runtime/issues/663), closed
+2026-06-30); the platform gap is unchanged · **Traces to:** #663
 
 **Mechanism.** Implement the PowerHAL `IPower` **hint session** interface so
 `APerformanceHint_createSession()` succeeds and reported actual/target durations
@@ -1051,6 +1186,177 @@ other.
 
 ---
 
+### S8 — A weave the platform composes (end state), or a full-opacity privileged overlay (now)
+
+**Owner:** **PLATFORM** · **Status:** OPEN. The intermediate form is measured and
+ships behind a flag; the end state is a platform design ask ·
+**Traces to:** [#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277),
+R6, S1, S2, S6
+
+**The end state.** The display pipeline should treat **"3D atlas + geometry"** as
+a **layer type**, and weave it **at scanout** — downstream of all compositing,
+the way HDR and protected layers are already handled. The compositor keeps doing
+what it does: scale the window, animate the transition, place the caption,
+rotate the display. The weave happens after all of that, against the panel's own
+pixel grid, so it is correct by construction for **any** window, at **any** scale,
+during **any** animation.
+
+**Why this is necessary and not an optimisation.** Every other ask on this list
+is a way of keeping a *pre-composed* weave from being disturbed downstream: R6
+asks the compositor not to scale it, S9 asks it to say by how much it will, S6
+asks it to move it atomically. Each of those closes one path. None of them can
+close the general case, for one structural reason: **bilinear filtering of an
+interlaced pattern is not invertible.** Neighbouring views are averaged into each
+other, so no pre-compensation exists at any precision — an app cannot render a
+buffer that survives an arbitrary resample. And the cases the other asks cannot
+reach are real and ordinary:
+
+- **An animated scale.** A window mid-resize or mid-transition changes its scale
+  every frame. Even a perfect S9 — the app is told the exact scale — cannot be
+  consumed in time to render for it; the app is always a frame behind a moving
+  target. Today those frames are simply wrong, or 2D.
+- **Any compositor effect** — a shrink into recents, a cross-fade, a magnifier,
+  a picture-in-picture. All of them resample.
+- **Windows that are not the app's own.** Nothing an application does can make a
+  weave correct in a surface it does not own.
+
+Under a platform-composed weave none of these are special cases; they stop being
+a list.
+
+**The intermediate form, which is what we ask for now: a platform-privileged
+full-panel overlay, composed at full opacity.** The runtime already ships a
+**weave satellite** ([#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277))
+that presents the woven result for one or more app windows through a
+service-owned full-panel `TYPE_APPLICATION_OVERLAY`. That gets most of the end
+state's benefit — the weave is computed after the window transform is known,
+against panel coordinates — without any change to the display pipeline. It needs
+three things from the platform:
+
+1. **Full opacity.** The overlay must carry `FLAG_NOT_TOUCHABLE`, because input
+   has to reach the apps beneath it; stock Android's anti-tapjacking policy then
+   clamps it to **0.8 window alpha**, blending 20 % of whatever is underneath
+   into the woven output. On a lenticular panel that reads as per-eye crosstalk
+   and destroys the weave. There is no app-side workaround: the clamp is applied
+   in composition, after the runtime has done everything right.
+   *Field-measured on the reference device: the hardware composer reports the
+   overlay at `alpha: 204` against the required 255; lifting the clamp restored a
+   weave indistinguishable from the in-app golden reference on the same panel.*
+2. **Device (HWC) composition.** The overlay is device-composited on the
+   reference device today. Forcing it through GPU client composition adds latency
+   and re-introduces exactly the resample risk R6 exists to prevent.
+3. **Predictable z-order** against system chrome and window captions, so the
+   satellite covers the windows it is weaving for and nothing else.
+
+**Acceptable implementations.**
+
+*For the intermediate form (any one):*
+
+- Grant the runtime's overlay **trusted-overlay status** (`setTrustedOverlay`).
+- **Per-package exemption** from the obscuring-opacity clamp for the runtime's
+  package.
+- `maximum_obscuring_opacity_for_touch = 1.0` **scoped to the runtime's
+  windows**. The device-global form
+  (`settings put global maximum_obscuring_opacity_for_touch 1.0`) works but
+  weakens tapjacking protection for every app on the device — a per-package grant
+  is the right shape, and the runtime is a natural trust anchor, being the
+  component the 3D experience ships through.
+
+*For the end state:* a display-pipeline layer type carrying the multi-view atlas
+plus its geometry, woven at scanout by the vendor display processor. This is a
+platform + vendor co-design, not something an OEM can adopt unilaterally; the
+vendor-side counterpart is filed with the display SDK (§7).
+
+**Consequence if absent.** Without the intermediate form, the satellite path is
+unusable on a stock policy — a permanent 20 % ghost over every pixel, which is
+worse than no satellite at all. Without the end state, R6, S6 and S9 remain a
+permanent maintenance surface: every new window effect the platform ships is a
+new way for the weave to be resampled, discovered in the field.
+
+**Acceptance test.**
+
+```bash
+# Intermediate form, with the weave satellite presenting:
+adb shell dumpsys SurfaceFlinger | grep -A10 'displayxr.*overlay' | grep -iE 'alpha|composition'
+#   expect: alpha 255 (not 204), composition DEVICE (not CLIENT)
+# Then, by eye on the panel: the satellite's weave must be indistinguishable
+# from the same content woven in-app and presented fullscreen.
+
+# End state: run the same 3D window through a resize animation and a transition
+# to recents. The weave must stay correct for every frame of the animation --
+# which is precisely what no pre-composed weave can do.
+```
+
+---
+
+### S9 — Expose the container scale and the composited on-screen rect
+
+**Owner:** **PLATFORM** · **Status:** OPEN · **Traces to:** R6,
+[#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277) P1,
+[#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367)
+
+**Mechanism.** When the platform presents a task at other than 1:1 — the OEM
+"mini window" / recents-card freeform mode that scales a whole task through a
+SurfaceFlinger leash — the app owning that task must be able to learn its
+**effective presentation scale, or equivalently its true physical on-screen
+rect**, and be notified when either changes.
+
+**This ask is for information, not capability, and that is what makes it cheap.**
+The vendor SDK's interlacer is already told an **integer on-panel viewport and
+screen position** — that parameter exists precisely so the weave can be placed at
+the correct absolute panel position. At 1:1 the composited on-screen rect **is**
+integral panel pixels, which is exactly the shape that API already expects. So a
+client that learns it is being composited to 732×1137 renders at 732×1137, the
+container's scale becomes 1.0, there is no resample, and today's interlacer weaves
+it correctly with **no API change on either side**. The work is plumbing a number
+that SurfaceFlinger already holds out to the app that needs it.
+
+**Its limit, stated up front.** 1:1 sizing covers a **static** container scale.
+An **animated** scale — mid-resize, mid-transition — changes per frame and cannot
+be chased by a client rendering a frame ahead. That case needs **S8** (a
+platform-composed weave) or the 2D fallback; S9 does not claim it.
+
+**Consequence if absent.** A weave maps individual subpixels to lenticular
+lenses, so it must know the window's physical pixel footprint *exactly* — being
+wrong by a few pixels per thousand lands subpixels on the wrong lens. The scale
+is invisible by every route probed on the reference device (see R6's table:
+hybrid bounds, no `Configuration` field, logical-clipped accessibility bounds, no
+setting or property). The runtime therefore **infers** it from the hybrid-bounds
+tell and applies a per-device constant — correct only while the OEM's mini-window
+scale stays fixed. One firmware change to that scale silently breaks 3D in every
+mini window, with nothing in any log to say why. That fragility is what this ask
+removes.
+
+**DisplayXR fallback.** The inference described above
+(`comp_multi_weave_android.c`, `weave_satellite_effective_scale()`): the tell is
+that the caller-reported rect **exceeds the panel** while its origin lies inside
+it — app-visibly unique to a container-scaled window on this platform — after
+which a per-device constant is applied. Its direction of failure is documented in
+the code: an *unscaled* freeform window dragged off-edge would trip the same tell
+and be wrongly scale-woven. That is a fallback, not a design.
+
+**Acceptable implementations** (any one):
+
+- Expose the **effective presentation scale** of a task to the app owning it —
+  via a queryable API or the window `Configuration` — with change notifications.
+- Report the task's **true physical bounds** in `WindowMetrics`.
+- Guarantee **1:1 presentation (no leash scale)** for packages that request it —
+  e.g. a manifest property by which an app that declares `resizeableActivity`
+  opts out of mini-window scaling.
+
+**Acceptance test.**
+
+```
+Launch a resizable 3D app via the device's recents freeform / mini-window
+affordance. PASS requires EITHER:
+  (a) the app's buffer maps 1:1 to panel pixels -- no SCALE in the layer
+      transform, displayFrame dimensions == buffer dimensions; OR
+  (b) the app can READ the scale (or its true on-screen rect) from a documented
+      API, the value matches SurfaceFlinger's displayFrame, and a change to the
+      window delivers a notification before the next frame is rendered.
+```
+
+---
+
 ## 4. NICE-TO-HAVE
 
 **N1 — Observability in the tracking service.** Log the **applied** engine config
@@ -1069,7 +1375,8 @@ core-load struct, so an Activity can keep serving Activity-typed calls
 (orientation limits, permission dialogs) without a second `Context`. *(Vendor;
 docs PR open, ABI-changing field deferred.)*
 
-**N3 — Capture protocol polish.** Panel extent in the frame header (landed);
+**N3 — Capture protocol polish.** Panel extent in the frame header — the runtime
+consumer side has landed, the vendor producer PR is still open (§7);
 configurable capture width and rate — the shipped default of 512 px against a
 1600 px panel is a 3.1× downscale and reads as a soft patch inside the
 de-occlusion band; and the zero-copy `AHardwareBuffer` delivery path for when the
@@ -1104,21 +1411,21 @@ what is genuinely still open:
 
 | L | Subject | Here | Owner | Status |
 |---|---|---|---|---|
-| L1 | Global last-writer-wins tracking config | **R3** | Vendor | **SOLVED** upstream |
+| L1 | Global last-writer-wins tracking config | **R3** | Vendor | Fix written; **PR open** |
 | L2 | Backlight is a binary bind-refcount | **R5** | Vendor | Contract verified; "bound but 2D" residual open |
 | L3 | Legacy backlight tiers force global 2D | **R5** | Vendor | Deprecation PR open |
 | L4 | One core per process | — | — | **Not asked** — only the rejected Architecture B needed it |
 | L5 | Core release joins a thread that never exits | **N6** | Vendor | OPEN |
 | L6 | No multi-display | **S7** | Vendor | OPEN |
-| L7 | Services discoverable only by package name | **R1** | Vendor + firmware | **SOLVED** upstream, proven on device |
+| L7 | Services discoverable only by package name | **R1** | Vendor + firmware | Fix written, proven on device; **PR open** |
 | L8 / L9 | Desktop-SDK phase origin / per-process calibration | — | — | Desktop SDK only; out of scope for an Android OEM |
-| L-a | Client-id race in registration | **R2** | Vendor | **SOLVED** upstream |
-| L-b | `onUnbind` evicts every client | **R2** | Vendor | **SOLVED** upstream |
+| L-a | Client-id race in registration | **R2** | Vendor | Fix written; **PR open** |
+| L-b | `onUnbind` evicts every client | **R2** | Vendor | Fix written; **PR open** |
 | L10 | "`captureDisplay` + `setExcludeLayers`, or priv-app" | **superseded by L12** | — | Both halves were **wrong**; see S1 |
-| L11 | No wait-semaphore into the interlacer | **S3** | Vendor | In progress (ours) |
+| L11 | "No wait-semaphore into the interlacer" | **S3** | Vendor | **CLOSED — the premise was wrong.** The hook existed; we passed NULL. No SDK ask; docs-only PR open |
 | L12 | No exclude-uid filter in SurfaceFlinger | **S1** | **PLATFORM** | **OPEN — headline** |
 | L13 | Per-region touchability is reflection-blocklisted (per-API, overlay windows too) → no **per-pixel** click-through. Full-opacity **per-frame** click-through needs no vendor change: a tight, TOUCHABLE `TYPE_APPLICATION_OVERLAY` with no foreground Activity delivers it on stock (#1110, shipped in avatar#66). `ActivityRecordInputSink` only bites apps that keep a foreground Activity | **S2** | **PLATFORM** | **NARROWED** — needed only for pixel-precise regions / Activity-window apps |
-| — | Orientation from window-adjusted metrics | **R4** | Vendor | **SOLVED** upstream |
+| — | Orientation from window-adjusted metrics | **R4** | Vendor | **MERGED** upstream 2026-08-27 |
 
 ---
 
@@ -1129,16 +1436,24 @@ Stated explicitly, so an OEM does not spend effort on them:
 - **Per-channel alpha, or any other post-weave transparency scheme.** The
   subpixel-vs-pixel mismatch is structural; a post-weave gate can only relocate
   the error. Compose-under (S1) is the only correct fix.
-- **A shared-surface / single-compositor overlay for all apps.** DisplayXR's
-  Android model is one compositor instance **per window**
-  ([ADR-036](../../adr/ADR-036-android-per-window-compositor-instances.md) D1); a
-  shared-surface overlay is an optional workspace *mode*, never the default, so no
-  platform support is needed for it.
+- **A shared-surface / single-compositor overlay as the *default* app model.**
+  DisplayXR's Android model is one compositor instance **per window**
+  ([ADR-036](../../adr/ADR-036-android-per-window-compositor-instances.md) D1).
+  **Revised 2026-09-06:** an earlier revision said no platform support was needed
+  here at all, on the grounds that the shared-surface overlay was only an optional
+  workspace *mode*. That is no longer accurate — the weave satellite is a
+  service-owned full-panel overlay, it is how a container-scaled or animated
+  window can be woven correctly at all, and it **does** need the opacity and
+  composition guarantees in **S8**. What remains not-an-ask is making it the
+  default app model; per-window compositors stay the default.
 - **Root, or a permanently unlocked bootloader.** Everything above is expressible
   in a signed retail firmware image. The developer-mode daemons we ship exist only
   because the platform concessions are missing.
 - **A DisplayXR-specific HAL.** The runtime talks to the vendor display SDK; it
-  never talks to a HAL directly.
+  never talks to a HAL directly. **S8's end state is not an exception**: the
+  weaving layer type it asks for is composed by the *vendor's* display processor
+  inside the platform's own pipeline, exactly as HDR and protected layers are —
+  DisplayXR gains no HAL surface of its own from it.
 
 ---
 
@@ -1149,20 +1464,27 @@ reference vendor SDK. An OEM's obligation is to ship a firmware image whose
 pre-installed display services are built from a version **at or after** the
 change, and to keep them updatable.
 
-| Ask | Upstream change (LeiaInc/CNSDK) | Notes |
-|---|---|---|
-| R1 | PR #699 (+ AAR `<queries>` switched to intent form) | Proven on device; also removes the vendor package names from every consuming app's manifest |
-| R2 | PR #697 | Atomic registration + `linkToDeath` eviction + client-id logging |
-| R3 | PR #698 (+ #713 for N1 observability) | Aggregate held; recomputed on disconnect |
-| R4 | PR #716 (issue #715) | Deployed and A/B/A validated in 0.10.62 |
-| R5 | PR #714 (issues #702, #703) | Deprecate legacy tiers; document bind-as-preference |
-| S3 | L11 — being implemented by us | Check first whether the existing semaphore fields already express it |
-| S5 / S1 producer | PRs #717, #718, #719 | Capture service, multi-uid composite, protocol v2 (panel extent) |
-| S7 | Issue #704 | Per-display config |
-| N1 | PR #713, issue #709 | |
-| N2 | PR #701, issue #710 | |
-| N6 | Issues #694, #696 | |
-| — | PRs #700, #712 | Build fixes needed to compile the services standalone on NDK 26 |
+Statuses below were re-verified against the upstream tracker on **2026-09-06**.
+Only **R4** is merged; everything else marked "PR" is an **open** pull request,
+so an OEM planning a firmware spin should treat those as *available to
+cherry-pick*, not *available in a release*.
+
+| Ask | Upstream change (LeiaInc/CNSDK) | Upstream state | Notes |
+|---|---|---|---|
+| R1 | PR #699 (+ AAR `<queries>` switched to intent form) | **open** | Proven on device; also removes the vendor package names from every consuming app's manifest |
+| R2 | PR #697 | **open** | Atomic registration + `linkToDeath` eviction + client-id logging |
+| R3 | PR #698 (+ #713 for N1 observability) | **open** | Aggregate held; recomputed on disconnect |
+| R4 | PR #716 (issue #715) | **MERGED 2026-08-27** | A/B/A validated on device; present from the SDK release that carries it |
+| R5 | PR #714 (issues #702, #703) | **open** | Deprecate legacy tiers; document bind-as-preference |
+| S3 | PR #720 | **open**, docs only | **No code change.** Specifies the Vulkan post-process semaphore contract that already existed — the correction that withdrew this ask |
+| S5 / S1 producer | PRs #717, #718, #719 | **open** | Capture service, multi-uid composite, protocol v2 (panel extent) |
+| S7 | Issue #704 | open | Per-display config |
+| S8 | Issue #731 | open | Long-term: weave after the window transform / at scanout — the vendor-side half of the end state |
+| S9 | Issue #732 | open | Near-term: expose the composited on-screen rect + container scale per window. Confirms no interlacer API change is needed |
+| N1 | PR #713, issue #709 | open | |
+| N2 | PR #701, issue #710 | open | |
+| N6 | Issues #694, #696 | open | |
+| — | PRs #700, #712 | open | Build fixes needed to compile the services standalone on NDK 26 |
 
 Two build notes for whoever integrates them, because both cost a day the first
 time: the Gradle external-native-build can leave `.cxx/**/CMakeFiles/` empty on a
@@ -1198,50 +1520,16 @@ vendor asks before committing to a firmware spin.
   — the multi-display half of the vendor contract (S7's runtime side)
 - [`docs/guides/vendor-plugin-onboarding.md`](../../guides/vendor-plugin-onboarding.md)
   — zero-to-shipping for a new display vendor
+- [`docs/roadmap/android-weave-satellite.md`](../../roadmap/android-weave-satellite.md)
+  — the weave satellite (S8's intermediate form) as designed and measured,
+  including the container-scale derivation S9 exists to replace
 - Issues: [#1038](https://github.com/DisplayXR/displayxr-runtime/issues/1038)
   (the L-series), [#1031](https://github.com/DisplayXR/displayxr-runtime/issues/1031)
   (concurrent multi-app epic), [#1073](https://github.com/DisplayXR/displayxr-runtime/issues/1073)
-  (compose-under transparency), [#1087](https://github.com/DisplayXR/displayxr-runtime/issues/1087)
+  (compose-under transparency, closed), [#1087](https://github.com/DisplayXR/displayxr-runtime/issues/1087)
   (WM↔SF desync), [#1090](https://github.com/DisplayXR/displayxr-runtime/issues/1090),
-  [#663](https://github.com/DisplayXR/displayxr-runtime/issues/663) (ADPF finding)
-
-## Trusted weave overlay (weave satellite, runtime#1277)
-
-The runtime's weave-satellite present surface is a `TYPE_APPLICATION_OVERLAY`
-window with `FLAG_NOT_TOUCHABLE` (input must pass through to the apps beneath).
-Stock Android's anti-tapjacking policy clamps such an overlay to **0.8 window
-alpha**, which blends 20% of the content beneath into the woven output — on a
-lenticular panel that reads as per-eye crosstalk and destroys the weave
-(field-measured on NP02J: HWC `alpha: 204` vs the required 255; lifting the
-clamp restored a weave indistinguishable from the in-app golden reference).
-
-**The platform must compose the runtime's satellite overlay at full opacity.**
-Acceptable implementations: grant the runtime's overlay trusted-overlay status
-(`setTrustedOverlay`), whitelist its package from the obscuring-opacity clamp,
-or ship `maximum_obscuring_opacity_for_touch=1.0` for the runtime's windows.
-The device-global `settings put global maximum_obscuring_opacity_for_touch 1.0`
-works but weakens tapjacking protection system-wide — a per-package exemption
-is the right shape. The satellite also benefits from the overlay being
-DEVICE-composited (it is on NP02J) — forcing it through GPU client composition
-adds latency and a resample risk.
-
-## Container-scale visibility (mini/freeform windows, runtime#1277 P1)
-
-The OEM "mini window" presents a fixed phone-profile task (sw540dp →
-1080×1685 logical on NP02J) through a SurfaceFlinger leash scale
-(`tr=[0.67,0][0,0.67]` measured). That factor is **invisible to apps**: the
-task/window bounds are a hybrid (physical origin + logical size), the
-Configuration carries no compat scale, accessibility bounds are logical-clipped,
-and no setting or property exposes it (all probed on NP02J firmware). A weave
-must know the physical pixel footprint exactly — a container-scaled weave that
-guesses wrong by even a few px per thousand lands subpixels on the wrong lens.
-
-The runtime currently *infers* scaling from the hybrid-bounds tell (the
-reported rect exceeds the panel) and applies a per-device constant — correct
-only because the mini window's scale is fixed on current firmware.
-
-**The platform must expose the effective presentation scale (or equivalently
-the physical on-screen bounds) of a task to the app owning it, and changes to
-it, via a queryable API or the window Configuration.** Alternatives that also
-satisfy this: report the task's true physical bounds in `WindowMetrics`, or
-guarantee 1:1 presentation (no leash scale) for packages that request it.
+  [#663](https://github.com/DisplayXR/displayxr-runtime/issues/663) (ADPF finding, closed),
+  [#1110](https://github.com/DisplayXR/displayxr-runtime/issues/1110) (click-through
+  trade study, closed), [#1277](https://github.com/DisplayXR/displayxr-runtime/issues/1277)
+  (weave satellite epic), [#1367](https://github.com/DisplayXR/displayxr-runtime/issues/1367)
+  (hosted window rect under a scaled container)
