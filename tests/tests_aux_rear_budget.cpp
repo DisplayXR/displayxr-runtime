@@ -46,6 +46,19 @@ sample(bool neutral, uint32_t generation)
 	return in;
 }
 
+/*!
+ * The same session with an explicit cue energy. `u_bg_neutrality` clamps the
+ * energy to [0,1] and reports `neutral` iff it is strictly below 1, so a cue
+ * of exactly 1.0 IS the busy sample - the two cannot be set independently.
+ */
+u_rear_budget_in
+sample_cue(float cue, uint32_t generation)
+{
+	u_rear_budget_in in = sample(cue < 1.0f, generation);
+	in.result.cue_energy = cue;
+	return in;
+}
+
 bool
 is_clipped(u_rear_budget_state s)
 {
@@ -338,4 +351,153 @@ TEST_CASE("rear_budget: state names exist for every state")
 		INFO("state = " << (int)s);
 		CHECK(std::strcmp(u_rear_budget_state_str(s), "?") != 0);
 	}
+}
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * The cue dead band (#1365)
+ *
+ * `neutral` is one threshold (cue < 1.0). A background parked just under it
+ * satisfies the open dwell, opens, crosses the line on the next sample, closes
+ * after the close grace, and repeats - the panel logged
+ * `CLIPPED_NO_SOURCE -> OPEN cue=0.93`, then `CLIPPED_BUSY_BACKGROUND -> OPEN
+ * cue=0.97`, then a 400-500 ms flap for seconds. One threshold cannot both
+ * admit and reject; open_cue_max splits it in two and leaves a band between
+ * them where the current verdict simply holds.
+ * -----------------------------------------------------------------------------
+ */
+
+TEST_CASE("rear_budget: a cue inside the dead band never opens")
+{
+	u_rear_budget b{};
+	auto t = tuning();
+	u_rear_budget_init(&b, &t, "test", 0);
+
+	// 0.95: neutral by the analysis, far above the 0.85 bar. Held for ten
+	// times the dwell, it must still be shut - the dwell is reset by every
+	// sample in the band, so it can never be served.
+	u_rear_budget_out out{};
+	for (uint64_t now = 0; now <= 4000 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.95f, 1);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(is_clipped(out.state));
+	CHECK(out.far_offset_vh == 0.0f);
+	CHECK(out.cue_energy == Catch::Approx(0.95f));
+}
+
+TEST_CASE("rear_budget: an OPEN session holds through the dead band")
+{
+	u_rear_budget b{};
+	auto t = tuning();
+	u_rear_budget_init(&b, &t, "test", 0);
+
+	// Earn OPEN on a genuinely quiet background, then let the cue drift up
+	// into the band. This is the other half of the flap: the state must not
+	// come back down for a sample that was never busy.
+	u_rear_budget_out out{};
+	for (uint64_t now = 0; now <= 800 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.5f, 1);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	REQUIRE(out.state == U_REAR_BUDGET_OPEN);
+	REQUIRE(out.far_offset_vh == U_REAR_BUDGET_UNRESTRICTED_VH);
+
+	for (uint64_t now = 810 * MS; now <= 3000 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.95f, 2);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+	CHECK(out.far_offset_vh == U_REAR_BUDGET_UNRESTRICTED_VH);
+}
+
+TEST_CASE("rear_budget: the dead band does not block closing")
+{
+	u_rear_budget b{};
+	auto t = tuning();
+	u_rear_budget_init(&b, &t, "test", 0);
+
+	u_rear_budget_out out{};
+	for (uint64_t now = 0; now <= 800 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.5f, 1);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	REQUIRE(out.state == U_REAR_BUDGET_OPEN);
+
+	// A genuinely busy sample (cue 1.0 == !neutral) still closes on the close
+	// grace. The band buys stability, never a slower response to a real cue.
+	for (uint64_t now = 810 * MS; now <= 1100 * MS; now += 10 * MS) {
+		auto in = sample_cue(1.0f, 2);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(out.state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	CHECK(out.far_offset_vh == 0.0f);
+}
+
+TEST_CASE("rear_budget: after closing, a dead-band cue does not restart the dwell")
+{
+	u_rear_budget b{};
+	auto t = tuning();
+	u_rear_budget_init(&b, &t, "test", 0);
+
+	u_rear_budget_out out{};
+	for (uint64_t now = 0; now <= 300 * MS; now += 10 * MS) {
+		auto in = sample_cue(1.0f, 1);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	REQUIRE(out.state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+
+	// The cue relaxes to 0.95 - still in the band - and stays there. Without
+	// the band this is the reopen half of the flap; with it the session stays
+	// clipped no matter how long it holds.
+	for (uint64_t now = 310 * MS; now <= 3000 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.95f, 2);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(out.state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	CHECK(out.far_offset_vh == 0.0f);
+
+	// And it opens the moment the cue actually drops under the bar and the
+	// dwell is served from scratch - the band delays nothing that qualifies.
+	for (uint64_t now = 3010 * MS; now <= 3800 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.5f, 3);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+}
+
+TEST_CASE("rear_budget: open_cue_max is tunable and guarded")
+{
+	// Raise the bar past the band and the 0.95 background opens again - the
+	// A/B has two visibly different arms rather than one arm and a no-op.
+	u_rear_budget b{};
+	auto t = tuning();
+	t.open_cue_max = 0.99f;
+	u_rear_budget_init(&b, &t, "test", 0);
+
+	u_rear_budget_out out{};
+	for (uint64_t now = 0; now <= 800 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.95f, 1);
+		u_rear_budget_update(&b, &in, now, &out);
+	}
+	CHECK(out.state == U_REAR_BUDGET_OPEN);
+
+	// A tuning struct that never set the field (or set it out of range) must
+	// not silently mean "open on any neutral sample" - that is the flapping
+	// behaviour, and a zero-initialised struct is the easiest way to get it.
+	u_rear_budget c{};
+	u_rear_budget_tuning zeroed{};
+	zeroed.open_dwell_ms = 400;
+	zeroed.close_ms = 100;
+	zeroed.ramp_open_ms = 300;
+	zeroed.ramp_close_ms = 150;
+	zeroed.open_cue_max = 0.0f; // never set
+	u_rear_budget_init(&c, &zeroed, "test", 0);
+
+	for (uint64_t now = 0; now <= 2000 * MS; now += 10 * MS) {
+		auto in = sample_cue(0.95f, 1);
+		u_rear_budget_update(&c, &in, now, &out);
+	}
+	CHECK(is_clipped(out.state));
 }

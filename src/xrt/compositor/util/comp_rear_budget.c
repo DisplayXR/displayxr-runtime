@@ -604,8 +604,13 @@ comp_rear_budget_arm(struct comp_rear_budget *b, bool transparent)
 	const bool running = b->initialised && b->requested && transparent;
 	if (running != b->running) {
 		b->running = running;
-		U_LOG_W("REAR_BUDGET: policy %s (requested=%d transparent=%d)", running ? "ARMED" : "off",
-		        b->requested ? 1 : 0, transparent ? 1 : 0);
+		// open<= is the cue dead band's lower edge (u_rear_budget's
+		// open_cue_max). Without it in the armed line a run that sat in the
+		// band all session looks identical to one that never measured
+		// anything - which is exactly how the panel's open/clipped flap read
+		// before the band existed.
+		U_LOG_W("REAR_BUDGET: policy %s (requested=%d transparent=%d open<=%.2f)", running ? "ARMED" : "off",
+		        b->requested ? 1 : 0, transparent ? 1 : 0, (double)b->policy.tuning.open_cue_max);
 	}
 }
 

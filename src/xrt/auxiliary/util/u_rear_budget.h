@@ -91,6 +91,26 @@ struct u_rear_budget_tuning
 	uint32_t ramp_open_ms;
 	//! Time for a full unrestricted → 0 slide. Default 150.
 	uint32_t ramp_close_ms;
+	/*!
+	 * The cue a sample must be BELOW to count toward the open dwell.
+	 * Default 0.85, in (0,1]; `DXR_REAR_BUDGET_OPEN_CUE_MAX`.
+	 *
+	 * `u_bg_neutrality`'s `neutral` is a single threshold — the cue energy is
+	 * the worse metric as a fraction of its own limit, clamped, so `neutral`
+	 * is exactly `cue < 1.0`. A background parked just under that line
+	 * satisfies the dwell, opens, then crosses it on the next sample and
+	 * closes after the close grace, for ever: the panel showed
+	 * `CLIPPED_NO_SOURCE -> OPEN cue=0.93`, later
+	 * `CLIPPED_BUSY_BACKGROUND -> OPEN cue=0.97`, then a 400–500 ms
+	 * open/clipped flap for seconds.
+	 *
+	 * One threshold cannot both admit and reject, so this splits it into two
+	 * and leaves a DEAD BAND between them (`open_cue_max < cue < 1.0`) where
+	 * neither the open dwell advances nor the close grace starts: whatever
+	 * state the session is in, it keeps. Hysteresis on the MEASUREMENT, beside
+	 * the hysteresis the dwell/grace already give the TIME axis.
+	 */
+	float open_cue_max;
 	//! @ref u_rear_budget_force.
 	int force;
 };
@@ -186,7 +206,8 @@ u_rear_budget_tuning_defaults(struct u_rear_budget_tuning *t);
  *
  * Reads: `DXR_REAR_BUDGET` (`clip` | `open` | `auto`),
  * `DXR_REAR_BUDGET_OPEN_DWELL_MS`, `DXR_REAR_BUDGET_CLOSE_MS`,
- * `DXR_REAR_BUDGET_RAMP_OPEN_MS`, `DXR_REAR_BUDGET_RAMP_CLOSE_MS`.
+ * `DXR_REAR_BUDGET_RAMP_OPEN_MS`, `DXR_REAR_BUDGET_RAMP_CLOSE_MS`,
+ * `DXR_REAR_BUDGET_OPEN_CUE_MAX`.
  *
  * @ingroup aux_util
  */
