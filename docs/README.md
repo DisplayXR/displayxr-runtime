@@ -51,7 +51,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[Project Structure](architecture/project-structure.md)** — source tree organization
 - **[Compositor Pipeline](architecture/compositor-pipeline.md)** — end-to-end rendering pipeline (single-app)
 - **[Transparency Modes](architecture/transparency-modes.md)** — canonical vocabulary: live/baked composition × shaped/unshaped windows, costs, rules, per-app table
-- **[Rear depth budget (explainer)](architecture/rear-depth-budget.md) 
+- **[Rear depth budget (explainer)](architecture/rear-depth-budget.md)** — plain-language: how a transparent app decides whether it may draw behind the screen (the plug-in supplies a desktop thumbnail, the runtime measures horizontal cues under the app's content bounds and publishes a budget, the app moves its far plane; ADR-040)
 - **[Service-Mode Multi-Compositor](architecture/multi-compositor.md)** — server-side N-client compositor (workspace + IPC apps + bridge)
 - **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
 - **[Service Architecture](architecture/service-architecture.md)** — the service as built: processes, threads, locks, the two compositor modes, client classes, failure domains, limits
