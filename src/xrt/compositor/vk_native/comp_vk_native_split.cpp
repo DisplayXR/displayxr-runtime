@@ -14,6 +14,9 @@
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_processor_d3d11.h"
+// XR_DXR_depth_budget: struct xrt_dp_background_preview (the per-API slot
+// headers only forward-declare it - the vtable takes it by pointer).
+#include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_limits.h"
 
 #include "util/u_logging.h"
@@ -2437,6 +2440,17 @@ comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *s, uint32_t mode)
 	xrt_display_processor_d3d11_set_eye_tracking_mode(s->dp, mode);
 }
 
+extern "C" bool
+comp_vk_split_get_background_preview(struct comp_vk_split *s, struct xrt_dp_background_preview *out_preview)
+{
+	if (s == nullptr || s->dp == nullptr || out_preview == nullptr) {
+		return false;
+	}
+	// Pixels only. The inline wrapper already answers false for a plug-in whose
+	// vtable predates the slot, so an older weaver is "no source", not a crash.
+	return xrt_display_processor_d3d11_get_background_preview(s->dp, out_preview);
+}
+
 #else /* !(XRT_OS_WINDOWS && XRT_HAVE_D3D11) */
 
 extern "C" xrt_result_t
@@ -2722,6 +2736,14 @@ comp_vk_split_set_eye_tracking_mode(struct comp_vk_split *split, uint32_t mode)
 {
 	(void)split;
 	(void)mode;
+}
+
+extern "C" bool
+comp_vk_split_get_background_preview(struct comp_vk_split *split, struct xrt_dp_background_preview *out_preview)
+{
+	(void)split;
+	(void)out_preview;
+	return false;
 }
 
 #endif /* XRT_OS_WINDOWS && XRT_HAVE_D3D11 */

@@ -160,6 +160,13 @@ when the runtime lacks the extension.
   above. The compositor reach has since widened: the API-agnostic half of the runner was factored
   into `comp_rear_budget` and D3D11, Vulkan and D3D12 all drive it, so they run one policy rather
   than three that resemble each other. GL and Metal still report `CLIPPED_NO_SOURCE`.
+- **The source follows the weaver, not the graphics API.** Under the hybrid output-device split
+  ([ADR-039](ADR-039-one-fill-engine-for-every-tier.md)) a Vulkan session weaves through the **D3D11**
+  display processor on the scanout adapter, and that is the plug-in holding the desktop capture —
+  so that is the one polled. Because the split is default-ON at every tier, treating it as a
+  carve-out would have meant the budget never opening on the shipping Vulkan path at all. The
+  policy instance stays on the compositor, so retiring the split mid-session changes which slot is
+  asked and nothing else.
 - **A new advisory value reaching apps means a new way for apps to disagree.** The ramp is the
   mitigation: because the runtime hands over an already-smoothed value and asks apps to apply it
   raw, two apps on one display move their clip planes together.

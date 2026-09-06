@@ -3668,26 +3668,51 @@ dxr_postwait_queue_only(void)
  *
  * Everything that is NOT the typed vtable call lives in comp_rear_budget, so
  * this backend and the D3D11 one run the SAME policy rather than two that look
- * alike. What is here is the VK slot.
+ * alike. What is here is the choice of SLOT.
  *
- * Called from exactly ONE place per app frame — immediately after the DP has
- * been handed this frame's atlas, which is the point at which its capture is
- * settled. Two rules keep that "once per APP frame":
+ * ## Which display processor holds the pixels
  *
- * - the windowed call site is inside vk_dp_weave_and_present and is skipped on
- *   `is_repaint`; a repaint replays RENDERING only and must never advance a
- *   per-frame state machine,
- * - the shared-texture call site is the other arm of the same commit, so the
- *   two are mutually exclusive.
+ * Whichever one is WEAVING this session, because that is the one running the
+ * desktop capture the preview is a downsample of:
  *
- * Under the #918 output-device split there is no VK weave at all (the D3D11
- * scanout-adapter half does it), so neither site runs and the budget simply
- * never leaves CLIPPED_NO_SOURCE — which is byte-for-byte today's behaviour.
+ * - normally the Vulkan DP on the app's own adapter, and
+ * - under the #918 output-device split, the D3D11 DP on the SCANOUT adapter
+ *   (`c->split`), where `c->display_processor` is not weaving and not
+ *   capturing.
+ *
+ * The split is not a corner: ADR-039 defaults it ON at every tier, so on a
+ * hybrid iGPU/dGPU box EVERY Vulkan session takes it. Treating it as a
+ * carve-out would have meant the feature never firing on the shipping Vulkan
+ * path at all.
+ *
+ * The policy itself does not care which slot answered — it lives on the
+ * compositor, not on either display processor — so a session that RETIRES the
+ * split mid-flight (the only direction that transition runs; Stage A is
+ * create-time only) keeps its dwell, its ramp and its published value and
+ * simply starts asking the Vulkan slot from the next frame on. For the same
+ * reason the arm/latch in comp_vk_native_compositor_set_rear_budget_requested
+ * is independent of which arm is live: it tests `requested && transparent`,
+ * neither of which is a placement fact.
+ *
+ * ## Once per APP frame
+ *
+ * Three call sites, exactly one of which runs per commit, and each excludes the
+ * replay tick the same way:
+ *
+ * - the windowed Vulkan site, inside vk_dp_weave_and_present, skipped on
+ *   `is_repaint`,
+ * - the split site, after the `is_repaint=false` comp_vk_split_weave_and_present
+ *   in layer_commit (the repaint thread's call passes `is_repaint=true` and does
+ *   not tick),
+ * - the shared-texture site, which has no repaint at all.
+ *
+ * A repaint replays RENDERING only: it must never advance a per-frame state
+ * machine, or the ramp would run off the weave rate rather than the app rate.
  */
 static void
 vk_rear_budget_tick(struct comp_vk_native_compositor *c)
 {
-	if (c->display_processor == NULL || !comp_rear_budget_is_running(&c->rear_budget)) {
+	if (!comp_rear_budget_is_running(&c->rear_budget)) {
 		return;
 	}
 
@@ -3701,8 +3726,16 @@ vk_rear_budget_tick(struct comp_vk_native_compositor *c)
 	struct xrt_dp_background_preview pv;
 	xrt_dp_background_preview_init(&pv);
 	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
-	const bool got = polled && xrt_display_processor_vk_get_background_preview(
-	                               (struct xrt_display_processor_vk *)c->display_processor, &pv);
+
+	// No #ifdef: `split` is always NULL where there is no split, and the
+	// forwarder compiles to its honest-NO stub off Windows.
+	bool got = false;
+	if (polled && c->split != NULL) {
+		got = comp_vk_split_get_background_preview(c->split, &pv);
+	} else if (polled && c->display_processor != NULL) {
+		got = xrt_display_processor_vk_get_background_preview(
+		    (struct xrt_display_processor_vk *)c->display_processor, &pv);
+	}
 
 	comp_rear_budget_tick(&c->rear_budget, got ? &pv : NULL, polled, c->transparent_background, now_ns);
 }
@@ -5712,6 +5745,19 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
 		const bool wove = comp_vk_split_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+
+		/*
+		 * XR_DXR_depth_budget — the split arm's tick. The preview comes from
+		 * the split's D3D11 weaver (see vk_rear_budget_tick), which has just
+		 * been handed this frame's atlas, so its capture is settled.
+		 *
+		 * Deliberately NOT gated on `wove`: a frame that found no usable slot
+		 * (#918 F4) is still an APP frame, and the ramp is time-based. Skipping
+		 * it would stall the clip plane exactly while the bridge is under
+		 * pressure. The DP poll is throttled independently and is answered from
+		 * the vendor's own capture, not from anything this weave produced.
+		 */
+		vk_rear_budget_tick(c);
 
 		/*
 		 * #918 F4 — a frame with nothing woven presents NOTHING. With
