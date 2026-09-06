@@ -442,7 +442,7 @@ See `docs/README.md` for the full index. By task:
 | Write a device driver | `docs/guides/writing-driver.md` |
 | Leia implementation internals (weaver, chroma-key fallback, phase-snapping, 2D/3D mode switching, and the **desktop-behind-the-window** capture that feeds transparency on Windows) | `displayxr-leia-plugin` repo, [`docs/`](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md) (migrated from `docs/vendors/leia/`) |
 | Background / capture code **the runtime itself owns** (not plug-in-internal): `comp_bg2d` + `comp_bg2d_capture` (static or socket-fed Local2D backdrops for compose-under, selected by `DXR_BG2D` / `debug.dxr.bg2d`, feeding base DP slot 16 `set_background_2d`) and the WGC **window**-capture module in the D3D11 service (`src/xrt/compositor/d3d11_service/d3d11_capture.{h,cpp}`, captures an HWND as an SRV for the multi-compositor blit). Only the *desktop-behind-the-window* texture on Windows lives in the vendor DP | `src/xrt/compositor/util/comp_bg2d.h`, `src/xrt/compositor/d3d11_service/d3d11_capture.h`, `docs/roadmap/android-transparency-compose-under.md` |
-| Let a transparent app render behind the display plane / rear depth budget | `docs/adr/ADR-040-rear-depth-budget.md` → `docs/specs/extensions/XR_DXR_depth_budget.md` |
+| Let a transparent app render behind the display plane / rear depth budget (plain-language explainer first) | `docs/architecture/rear-depth-budget.md` → `docs/adr/ADR-040-rear-depth-budget.md` → `docs/specs/extensions/XR_DXR_depth_budget.md` |
 | Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Swapchain model / canvas | `docs/specs/runtime/swapchain-model.md` |
