@@ -118,56 +118,164 @@ if (!(new File(project.file(project.eigenCMakeDir), "Eigen3Config.cmake")).exist
 }
 
 // ***
-// Git version handling
+// Git version handling (#1379)
 // ***
+//
+// Both stamps come from `git describe`, and BOTH have shipped wrong before:
+//
+//  - #1226 (v2.14.0): a shallow, tagless clone made describe degrade to
+//    `--always`, so versionName was a bare SHA and versionCode was NULL.
+//    A null versionCode means Android cannot compare versions and an
+//    in-place upgrade is impossible. The checkout guards in
+//    build-android.yml fixed the fetch; the swallow-everything
+//    `catch (ignored) { return null }` that turned it into a silent, shipped
+//    failure is fixed HERE.
+//
+//  - #1379: describe was invoked WITHOUT `--tags`, which considers only
+//    ANNOTATED tags. Our release tags are lightweight (`git tag`, see
+//    .claude/skills/release/SKILL.md Phase 2.1), so every APK since v2.14.5
+//    named itself after the last annotated tag -- v2.14.5 -- while actually
+//    being built from a v2.16.x commit.
+//
+// The two are coupled: adding `--tags` alone would feed the real (two-digit
+// minor/patch) numbers into the old "%02d%01d%01d%05d" string format, whose
+// %01d fields are MINIMUM widths -- v2.16.12-291 rendered as "02161200291",
+// i.e. 2,161,200,291 > Integer.MAX_VALUE (2,147,483,647). parseInt would
+// throw, the bare catch would return null, and #1226 would ship again.
+// That is also why release tags must stay lightweight OR annotated purely as
+// a matter of taste now: the arithmetic below, not the tag type, is what
+// keeps the code in range.
 
-// Supplied with major, minor, patch, commit count
-def versionCodeFormatPattern = "%02d%01d%01d%05d"
+// ---------------------------------------------------------------------------
+// versionCode scheme (#1379). Positional, NOT string concatenation:
+//
+//     code = major * 100_000_000        // <= 20   (2 digits, weight 1e8)
+//          + minor *   1_000_000        // <= 99   (2 digits, weight 1e6)
+//          + patch *      10_000        // <= 99   (2 digits, weight 1e4)
+//          + commits                    // <= 9999 (4 digits, weight 1e0)
+//
+// Every field is strictly narrower than its weight, so the encoding is a
+// true positional number: ordering by code == ordering by
+// (major, minor, patch, commits) lexicographically. Monotonic forever.
+//
+// Worked values:
+//   v2.14.5-291   (what retail units carry today) = 214_500_291   [legacy format]
+//   v2.16.12-291                                  = 216_120_291   > 214_500_291  OK
+//   v2.16.14-4                                    = 216_140_004
+//   v3.0.0-0                                      = 300_000_000   > any v2.x.y
+//   v2.99.99-9999 (worst case in the v2 series)   = 299_999_999   < 300_000_000
+//   v20.99.99-9999 (absolute maximum)             = 2_099_999_999 <= 2_147_483_647
+//                                                                 and <= Google
+//                                                                 Play's 2.1e9 cap
+//
+// Continuity with the OLD format is the reason for the 1e8/1e6/1e4 weights
+// rather than something tidier: installed units report 214_500_291 and Android
+// refuses a downgrade, so any new scheme MUST exceed that for v2.16.x. The old
+// format's value for v2.M.P is 2_M*10^7-ish; the new one for the same release
+// is larger for every M >= 15, and v2.16.x is where we are. Verified above.
+//
+// LIMIT: major > 20 overflows int. That is ~decades away, and the build fails
+// loudly (below) rather than shipping a null. Revisit by moving to a
+// major*10^7 packing (dropping a commits digit) if it ever matters.
+// ---------------------------------------------------------------------------
+def ANDROID_VERSION_CODE_MAX      = 2147483647     // Integer.MAX_VALUE
+def ANDROID_VERSION_CODE_PLAY_CAP = 2100000000     // Google Play's ceiling
+// The largest versionCode ever shipped under the OLD format (v2.14.5-291).
+// Anything we emit must beat it or in-place upgrade breaks exactly once, on
+// every retail unit in the field. CI turns this into a hard gate.
+def ANDROID_VERSION_CODE_SHIPPED_FLOOR = 214500291
 
-// parsed using this regex
-def gitDescribePattern = ~/v(?<tag>(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+))-(?<commits>\d+)-g(?<hash>[0-9a-f]+)/
+// `git describe --long` output. --long guarantees the -<n>-g<sha> suffix even
+// when HEAD *is* the tag, so this shape is not optional.
+def gitDescribeLongPattern = ~/v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)-(?<commits>\d+)-g(?<hash>[0-9a-f]+)/
 
-// Get the version code from git describe output
-def getVersionCode = { ->
+// Run git, failing the build loudly on a non-zero exit or empty output.
+// There is deliberately no catch-and-return-null here: see #1226.
+def gitOrDie = { List<String> args, String what ->
+    def stdout = new ByteArrayOutputStream()
+    def stderr = new ByteArrayOutputStream()
+    def result
     try {
-        def stdout = new ByteArrayOutputStream()
-        exec {
-            commandLine 'git', 'describe', '--always', '--long', '--match', 'v*'
+        result = exec {
+            commandLine args
             standardOutput = stdout
+            errorOutput = stderr
+            ignoreExitValue = true
             workingDir rootDir
         }
-        def longOutput = stdout.toString().trim()
-        def matcher = longOutput =~ gitDescribePattern
-        if (!matcher.matches()) {
-            println "Could not find an annotated git tag matching the regex!"
-            return null
-        }
-        def codeAsString = String.format(versionCodeFormatPattern,
-            Integer.parseInt(matcher.group('major')),
-            Integer.parseInt(matcher.group('minor')),
-            Integer.parseInt(matcher.group('patch')),
-            Integer.parseInt(matcher.group('commits')))
-        return Integer.parseInt(codeAsString)
+    } catch (Exception e) {
+        throw new GradleException(
+            "openxr_android: cannot determine ${what} -- failed to run `${args.join(' ')}`: ${e.message}. " +
+            "The APK version stamps are derived from git and MUST NOT be guessed (#1226).")
     }
-    catch (ignored) {
-        return null;
+    def out = stdout.toString().trim()
+    if (result.exitValue != 0 || out.isEmpty()) {
+        throw new GradleException(
+            "openxr_android: cannot determine ${what} -- `${args.join(' ')}` exited ${result.exitValue}: " +
+            "${stderr.toString().trim()}\n" +
+            "This usually means the clone has no v* tags (a shallow or --no-tags fetch). " +
+            "Run `git fetch --tags` (CI: actions/checkout with fetch-depth: 0 + fetch-tags: true). " +
+            "Refusing to build an APK with a missing/guessed versionCode -- that is #1226.")
     }
+    return out
 }
 
-// Get the version string from git describe output
+// versionCode, from `git describe --tags --long`.
+def getVersionCode = { ->
+    def longOutput = gitOrDie(
+        ['git', 'describe', '--tags', '--long', '--match', 'v[0-9]*'],
+        'the Android versionCode')
+
+    def matcher = longOutput =~ gitDescribeLongPattern
+    if (!matcher.matches()) {
+        throw new GradleException(
+            "openxr_android: `git describe --tags --long --match 'v[0-9]*'` returned '${longOutput}', " +
+            "which is not a vMAJOR.MINOR.PATCH-<commits>-g<sha>. Cannot derive a versionCode (#1379).")
+    }
+
+    int major   = Integer.parseInt(matcher.group('major'))
+    int minor   = Integer.parseInt(matcher.group('minor'))
+    int patch   = Integer.parseInt(matcher.group('patch'))
+    int commits = Integer.parseInt(matcher.group('commits'))
+
+    // Field-width guards. Each field must stay strictly narrower than its
+    // weight or the positional encoding collapses and monotonicity is lost --
+    // a silently WRONG code is worse than no build.
+    if (minor > 99 || patch > 99 || commits > 9999 || major > 20) {
+        throw new GradleException(
+            "openxr_android: version ${major}.${minor}.${patch}+${commits} does not fit the versionCode " +
+            "encoding (major<=20, minor<=99, patch<=99, commits<=9999) -- see the scheme comment in " +
+            "src/xrt/targets/openxr_android/build.gradle (#1379). Refusing to emit a non-monotonic code.")
+    }
+
+    long code = (long) major * 100000000L + (long) minor * 1000000L + (long) patch * 10000L + (long) commits
+    if (code > ANDROID_VERSION_CODE_MAX) {
+        throw new GradleException(
+            "openxr_android: computed versionCode ${code} exceeds Integer.MAX_VALUE (${ANDROID_VERSION_CODE_MAX}) " +
+            "for ${longOutput}. This is exactly the overflow that made getVersionCode() return null in #1226/#1379.")
+    }
+    if (code > ANDROID_VERSION_CODE_PLAY_CAP) {
+        logger.warn("openxr_android: versionCode ${code} exceeds Google Play's ${ANDROID_VERSION_CODE_PLAY_CAP} ceiling.")
+    }
+    if (code <= ANDROID_VERSION_CODE_SHIPPED_FLOOR) {
+        // Not fatal here (an archaeology build of a pre-v2.15 branch is a
+        // legitimate thing to do), but it must never reach a release: CI's
+        // "Inspect APK" step turns this into an error.
+        logger.warn("openxr_android: versionCode ${code} is NOT above the highest code already shipped " +
+                    "(${ANDROID_VERSION_CODE_SHIPPED_FLOOR}, v2.14.5-291). Installed units would refuse this as a " +
+                    "downgrade. Do not release this build (#1379).")
+    }
+    return (int) code
+}
+
+// versionName, from `git describe --tags --dirty`.
+// Deliberately NOT --long: on the tag itself this yields a clean 'vX.Y.Z',
+// and 'vX.Y.Z-<n>-g<sha>' only once you are past it. --dirty appends
+// '-dirty' for an uncommitted tree, which is worth seeing on a dev pad.
 def getVersionString = { ->
-    try {
-        def stdout = new ByteArrayOutputStream()
-        exec {
-            commandLine 'git', 'describe', '--always', '--dirty', '--match', 'v*'
-            standardOutput = stdout
-            workingDir rootDir
-        }
-        return stdout.toString().trim()
-    }
-    catch (ignored) {
-        return null;
-    }
+    return gitOrDie(
+        ['git', 'describe', '--tags', '--dirty', '--match', 'v[0-9]*'],
+        'the Android versionName')
 }
 
 

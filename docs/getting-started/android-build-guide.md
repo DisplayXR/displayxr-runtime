@@ -260,6 +260,85 @@ sdk.dir=C:/Users/<you>/AppData/Local/Android/Sdk          # Windows
 # src/xrt/targets/openxr_android/build/outputs/apk/debug/openxr_android-debug.apk
 ```
 
+### APK version stamps — `versionName` / `versionCode` (#1379)
+
+Both stamps are derived from `git describe` in
+`src/xrt/targets/openxr_android/build.gradle`. **The clone must have the `v*`
+tags** — a shallow or `--no-tags` fetch now *fails the build* with an explicit
+message instead of silently stamping a bare SHA and a null `versionCode`
+(which is what v2.14.0 shipped, #1226).
+
+```bash
+git fetch --tags        # if `git describe --tags --match 'v[0-9]*'` finds nothing
+```
+
+**`versionName`** = `git describe --tags --dirty --match 'v[0-9]*'` — `vX.Y.Z`
+on the release commit itself, `vX.Y.Z-N-g<sha>` after it, `-dirty` appended for
+an uncommitted tree. `--tags` is load-bearing: DisplayXR release tags are
+**lightweight** (`git tag`, not `git tag -a` — see `.claude/skills/release/SKILL.md`
+Phase 2.1) and bare `git describe` walks only *annotated* tags. Without it every
+APK from v2.14.5 to v2.16.14 named itself `v2.14.5-<n>-g<sha>` while being built
+from a v2.16.x commit.
+
+**`versionCode`** is positional arithmetic over
+`git describe --tags --long`, *not* string concatenation:
+
+```
+code = major × 100,000,000     (≤ 20)
+     + minor ×   1,000,000     (≤ 99)
+     + patch ×      10,000     (≤ 99)
+     + commits                 (≤ 9999)
+```
+
+Every field is strictly narrower than its weight, so ordering by `code` **is**
+lexicographic ordering by `(major, minor, patch, commits)` — monotonic forever.
+
+| release | `versionCode` | note |
+|---|---|---|
+| `v2.14.5-291` | `214,500,291` | **old** format; what retail units carry today |
+| `v2.16.12-291` | `216,120,291` | > the floor ⇒ upgrades in place |
+| `v2.16.14-4` | `216,140,004` | |
+| `v2.99.99-9999` | `299,999,999` | worst case in the v2 series |
+| `v3.0.0-0` | `300,000,000` | beats every possible v2 value |
+| `v20.99.99-9999` | `2,099,999,999` | absolute max — under `Integer.MAX_VALUE` (2,147,483,647) *and* Google Play's 2,100,000,000 cap |
+
+Two hard constraints the scheme satisfies:
+
+1. **Monotonic vs the field.** Android refuses downgrades, and installed units
+   report `214500291`. Anything ≤ that would make in-place upgrade impossible,
+   once, irreversibly, on every pad already out there.
+2. **No overflow.** `versionCode` is a signed 32-bit int. The *old*
+   `"%02d%01d%01d%05d"` format used **minimum** field widths, so a two-digit
+   minor or patch widened the string: `v2.16.12-291` rendered as the 11-digit
+   `"02161200291"` = 2,161,200,291 > `Integer.MAX_VALUE`. `Integer.parseInt`
+   threw, a bare `catch (ignored) { return null }` swallowed it, and the APK
+   would have shipped with an **empty** `versionCode`. This is why adding
+   `--tags` alone was not the fix, and why making release tags annotated is not
+   one either — it feeds the same real numbers into the same overflow.
+
+Field widths that don't fit (major > 20, minor/patch > 99, commits > 9999) fail
+the build loudly. `getVersionCode()` never returns null.
+
+**Verifying an APK:**
+
+```bash
+$ANDROID_HOME/build-tools/34.0.0/aapt2 dump badging path/to.apk | head -1
+# package: name='org.freedesktop.monado.openxr_runtime.out_of_process'
+#          versionCode='216140004' versionName='v2.16.14-4-gdcd9c22e8' ...
+
+# on device
+adb shell dumpsys package org.freedesktop.monado.openxr_runtime.out_of_process \
+  | grep -E 'versionCode|versionName'
+```
+
+`scripts/android_version_code.py` is a host-side twin of the gradle arithmetic
+(`--selftest` runs its unit tests; `--describe <str>` / `--git <repo>` compute a
+code or name). CI's *Inspect APK* step runs the selftest, reads the stamps back
+out of the **built APK** with `aapt2 dump badging`, and fails if the
+`versionCode` is empty, non-numeric, ≤ `214500291`, or disagrees with the
+arithmetic — the same prove-it-from-the-artifact pattern as the CNSDK
+loader ↔ plug-in pair gate.
+
 ### Build variants
 
 There is **one** runtime APK (#1031). The `inProcess` / `outOfProcess` product
