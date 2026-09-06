@@ -30,6 +30,7 @@ set(tests
     tests_comp_zone_tier1
     tests_aux_bg_neutrality
     tests_aux_rear_budget
+    tests_comp_rear_budget
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
@@ -98,6 +99,17 @@ target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/sr
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
 target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+
+# XR_DXR_depth_budget (#1364) -- the per-session runner every native compositor
+# drives. Compiled straight into the unit rather than linked from comp_util,
+# which is Vulkan-gated and would drag the whole render library into a test that
+# needs no GPU, no window and no plug-in: a synthetic BGRA preview stands in for
+# the display processor.
+target_sources(
+	tests_comp_rear_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor/util/comp_rear_budget.c
+	)
+target_include_directories(tests_comp_rear_budget PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-external-stb)
 
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
