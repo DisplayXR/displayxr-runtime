@@ -940,7 +940,11 @@ struct ipc_info_get_view_poses_2
 struct ipc_view_rig_info
 {
 	uint32_t rig_type;              //!< IPC_VIEW_RIG_*
-	struct xrt_pose pose;           //!< Display-plane / camera pose in the locate space
+	//! Display-plane / camera pose in the head device's TRACKING-ORIGIN space
+	//! (the server's math frame). The app chains it in the LOCATE space; the
+	//! client converts before sending and converts eye_world / raw.display_pose
+	//! back on receipt - the server never sees the base space (#1370).
+	struct xrt_pose pose;
 	float virtual_display_height;   //!< Display rig only
 	float perspective_factor;       //!< Display rig only
 	float inv_convergence_distance; //!< Camera rig only
