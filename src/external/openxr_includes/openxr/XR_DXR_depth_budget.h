@@ -63,7 +63,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_depth_budget 1
-#define XR_DXR_depth_budget_SPEC_VERSION 2
+#define XR_DXR_depth_budget_SPEC_VERSION 3
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 
 // Reserved 1004999xxx range, next free block after view_rig (…140-142).
@@ -72,6 +72,8 @@ extern "C" {
 //! App-reported content bounds, narrowing the analysis ROI (v2).
 #define XR_TYPE_CONTENT_BOUNDS_DXR ((XrStructureType)1004999261)
 #define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
+//! App-reported content occupancy mask (v3) - the silhouette, not a box.
+#define XR_TYPE_CONTENT_MASK_DXR ((XrStructureType)1004999263)
 
 /*!
  * @brief Why the runtime is handing out the budget it is handing out.
@@ -191,6 +193,36 @@ typedef struct XrEventDataRearDepthBudgetStateChangedDXR {
     XrRearDepthBudgetStateDXR previousState;
     XrRearDepthBudgetStateDXR newState;
 } XrEventDataRearDepthBudgetStateChangedDXR;
+
+/*!
+ * v3 INPUT (SPEC_VERSION 3): the app's content OCCUPANCY MASK for this frame - the
+ * union over ALL views of its rendered silhouette (the same artefact a transparent
+ * app derives from alpha for its click-through window region). Chain on
+ * XrFrameEndInfo::next, beside or instead of XrContentBoundsDXR.
+ *
+ * Grid: row-major, top-left origin, WINDOW-CLIENT-normalised extent - cell (x, y)
+ * covers [x/width, (x+1)/width) x [y/height, (y+1)/height) of the window client
+ * rect (the same frame as XrContentBoundsDXR; a zoned app writes its zone's
+ * silhouette into the window grid and leaves the rest 0). nonzero = content
+ * occupies the cell. The runtime copies the cells during xrEndFrame; the pointer
+ * need only stay valid until xrEndFrame returns.
+ *
+ * Precedence in the runtime, most specific first, each falling back to the next
+ * when absent, all-zero or stale (> 1 s): mask -> XrContentBoundsDXR -> the 3D
+ * display zones -> the whole canvas. The runtime resamples the mask onto its
+ * own analysis grid with an any-coverage filter, clamps it to the 3D zones and
+ * dilates it by the disparity band before measuring; only masked pixels count.
+ */
+typedef struct XrContentMaskDXR {
+    XrStructureType          type;   //!< Must be XR_TYPE_CONTENT_MASK_DXR
+    const void* XR_MAY_ALIAS next;
+    uint32_t                 width;        //!< 1..512 cells
+    uint32_t                 height;       //!< 1..512 cells
+    uint32_t                 strideBytes;  //!< >= width
+    const uint8_t*           cells;        //!< width x height bytes, nonzero = occupied
+    //! Extra dilation the app wants, in window-normalised units. 0 = the runtime default alone.
+    float                    marginNormalized;
+} XrContentMaskDXR;
 
 #ifdef __cplusplus
 }
