@@ -281,10 +281,35 @@ D3, Architecture C), by any one of:
 
 | Opt-in | How | Notes |
 |---|---|---|
-| Env / sysprop | `XRT_FORCE_MODE=ipc`, or `adb shell setprop debug.dxr.force_ipc 1` | Overrides everything, both directions — `XRT_FORCE_MODE=native` forces back in-process. The sysprop is device-wide, so unset it when you are done. |
+| Env / sysprop | `XRT_FORCE_MODE=ipc`, or `adb shell setprop debug.dxr.force_ipc 1` | Overrides everything, both directions — `XRT_FORCE_MODE=native` forces back in-process. `1` is device-wide, so unset it when you are done; name packages instead to target one app (below). |
 | Manifest | `<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>` | The per-app switch. Pair with `com.displayxr.satellite_slot` to pin a slot. |
 | Capability | enable `XR_DXR_weave` | Present-owners (the browser, `weave_client_vk_android`). Weave lives only in the service compositor, so this is automatic — no configuration. |
 | Adopted socket | `ipc_client_connection_adopt_fd()` or `DXR_IPC_FD=<n>` | Embedders with no `Context` (Chromium's GPU process, #1056). |
+
+**Targeting one app without rebuilding it** (#1277 P2). `debug.dxr.force_ipc`
+also takes an allow-list of process names, so a *shipped, unmodified* APK can be
+routed onto the service:
+
+```bash
+adb shell setprop debug.dxr.force_ipc com.displayxr.modelviewer            # one app
+adb shell setprop debug.dxr.force_ipc 'com.displayxr.modelviewer,com.displayxr.mediaplayer'
+adb shell setprop debug.dxr.force_ipc 'com.displayxr.*'                    # prefix
+adb shell setprop debug.dxr.force_ipc ''                                   # back to normal
+adb logcat -d | grep 'Hybrid mode:\|force_ipc'                             # confirm which arm ran
+```
+
+Names are matched against `/proc/self/cmdline` — the package for a normal
+process, `<pkg>:dxrN` for a satellite slot, which also matches its package.
+Separators are `,`, `;`, space or tab; a trailing `*` is a prefix. Property
+values are capped at 92 characters, so a long list needs prefixes. If the
+process name cannot be read the list matches **nothing** — it never widens to
+the whole device.
+
+`ro.dxr.force_ipc` takes the same allow-list and is the OEM/device-policy tier
+(read-only property, set by the device build, not settable by adb on a locked
+device). It deliberately **refuses** the device-wide `1`/`*` forms: a device-wide
+deployment decision is exactly what ADR-036's Gradle-flavor merge removed. The
+`debug.` property wins over it, and `XRT_FORCE_MODE` wins over both.
 
 ### Migrating an existing app to the merged runtime
 
@@ -432,7 +457,8 @@ Both cubes run **in-process** by default. To put one of them on a satellite inst
 (the mixed case), force just that package:
 ```bash
 adb shell am start -n com.displayxr.cube_handle_vk_android.b/....MainActivity  # in-process
-adb shell setprop debug.dxr.force_ipc 1   # next launch goes IPC; unset when done
+adb shell setprop debug.dxr.force_ipc com.displayxr.cube_handle_vk_android.b  # that one goes IPC
+
 ```
 (The two builds write the same APK path, so copy A aside before building B. On a host with a
 system cJSON — `brew install cjson` — add `-PdxrForceVendoredCjson`; see #496.)

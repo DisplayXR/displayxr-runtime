@@ -30,6 +30,7 @@ set(tests
     tests_comp_zone_tier1
     tests_aux_bg_neutrality
     tests_aux_rear_budget
+    tests_aux_route_policy
     tests_comp_rear_budget
 	)
 if(XRT_HAVE_D3D11)

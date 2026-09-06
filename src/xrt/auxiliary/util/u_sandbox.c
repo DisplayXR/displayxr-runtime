@@ -33,6 +33,134 @@
 #include <sys/system_properties.h>
 #endif
 
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_ANDROID)
+#include <stdio.h>
+#endif
+
+/*
+ *
+ * Routing-policy helpers (platform independent, so they can be unit tested)
+ *
+ */
+
+//! Is @p c a separator in a routing-property value?
+static bool
+route_is_sep(char c)
+{
+	// NOT ':' — a satellite slot process is "<pkg>:dxrN" and that colon is
+	// part of a name, not a separator.
+	return c == ',' || c == ' ' || c == '\t' || c == ';';
+}
+
+bool
+u_sandbox_route_prop_selects(const char *value, const char *process_name, bool allow_device_wide)
+{
+	if (value == NULL || value[0] == '\0') {
+		return false;
+	}
+
+	// Whole-device booleans first — this is what the property has always
+	// meant and what every existing script sets. Refused outright on the
+	// shipping (read-only-property) tier: ADR-036's flavor merge exists
+	// because a device-wide deployment decision pushed apps that wanted
+	// in-process out of process, and a `ro.` property is exactly the shape
+	// that could bring that back. Devices get an allow-list, not a switch.
+	if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "t") == 0 ||
+	    strcmp(value, "y") == 0 || strcmp(value, "yes") == 0 || strcmp(value, "on") == 0 ||
+	    strcmp(value, "all") == 0 || strcmp(value, "*") == 0) {
+		return allow_device_wide;
+	}
+	if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 || strcmp(value, "f") == 0 ||
+	    strcmp(value, "n") == 0 || strcmp(value, "no") == 0 || strcmp(value, "off") == 0) {
+		return false;
+	}
+
+	// Anything else is an allow-list of process/package names. Without a
+	// process name to compare against we cannot honour it — and must NOT
+	// fall back to "true", or a targeted list would silently become a
+	// device-wide force.
+	if (process_name == NULL || process_name[0] == '\0') {
+		return false;
+	}
+
+	// A satellite/slot process is "<pkg>:dxrN"; the package is what an
+	// operator types, so match on the base as well as the full name.
+	size_t base_len = 0;
+	while (process_name[base_len] != '\0' && process_name[base_len] != ':') {
+		base_len++;
+	}
+	const size_t full_len = strlen(process_name);
+
+	const char *p = value;
+	while (*p != '\0') {
+		while (*p != '\0' && route_is_sep(*p)) {
+			p++;
+		}
+		const char *tok = p;
+		while (*p != '\0' && !route_is_sep(*p)) {
+			p++;
+		}
+		size_t len = (size_t)(p - tok);
+		if (len == 0) {
+			continue;
+		}
+		if (tok[len - 1] == '*') {
+			// Prefix form: "com.displayxr.*".
+			len--;
+			if (len == 0) {
+				// A bare "*" token is a device-wide switch wearing
+				// a list's clothes; same rule as above.
+				if (allow_device_wide) {
+					return true;
+				}
+				continue;
+			}
+			if (full_len >= len && strncmp(process_name, tok, len) == 0) {
+				return true;
+			}
+			continue;
+		}
+		if (len == full_len && strncmp(process_name, tok, len) == 0) {
+			return true;
+		}
+		if (len == base_len && strncmp(process_name, tok, len) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+u_sandbox_process_name(char *out_name, size_t out_size)
+{
+	if (out_name == NULL || out_size == 0) {
+		return false;
+	}
+	out_name[0] = '\0';
+
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_ANDROID)
+	// On Android the main process' cmdline IS the package name, and a
+	// satellite slot's is "<pkg>:dxrN" — the same string an operator sees in
+	// `adb shell ps`. No JNI, no Context, so this is reachable from
+	// aux_util at any point in instance creation.
+	FILE *f = fopen("/proc/self/cmdline", "r");
+	if (f == NULL) {
+		return false;
+	}
+	size_t n = fread(out_name, 1, out_size - 1, f);
+	fclose(f);
+	if (n == 0) {
+		out_name[0] = '\0';
+		return false;
+	}
+	out_name[n] = '\0'; // cmdline is NUL separated; the first field is what we want
+	return out_name[0] != '\0';
+#else
+	(void)out_size;
+	return false;
+#endif
+}
+
 /*
  *
  * Windows implementation
@@ -165,10 +293,33 @@ u_sandbox_should_use_ipc(void)
 	    sysprop_buf[0] != '\0') {
 		force_mode = sysprop_buf;
 	}
-	if (force_mode == NULL && __system_property_get("debug.dxr.force_ipc", sysprop_buf) > 0 &&
-	    (sysprop_buf[0] == '1' || sysprop_buf[0] == 't')) {
-		U_LOG_I("debug.dxr.force_ipc=%s: forcing IPC/service mode", sysprop_buf);
-		return true;
+	if (force_mode == NULL) {
+		// #1277 P2: `debug.dxr.force_ipc` grew a per-package grammar. `1`
+		// still means "every app on this device" (what it has always
+		// meant); a value containing a package name is an ALLOW-LIST, so
+		// one demo can be routed to the service without dragging every
+		// other app on the panel with it. See
+		// u_sandbox_route_prop_selects() for the grammar.
+		char pkg[128] = {0};
+		char dev_buf[PROP_VALUE_MAX] = {0};
+		const bool have_pkg = u_sandbox_process_name(pkg, sizeof(pkg));
+		if (__system_property_get("debug.dxr.force_ipc", sysprop_buf) > 0 &&
+		    u_sandbox_route_prop_selects(sysprop_buf, have_pkg ? pkg : NULL, /* allow_device_wide */ true)) {
+			U_LOG_I("debug.dxr.force_ipc=%s selects '%s': forcing IPC/service mode", sysprop_buf,
+			        have_pkg ? pkg : "(unknown process)");
+			return true;
+		}
+		// Device-class policy tier (#1277 P2 candidate (iii)). A read-only
+		// property can only be set by the OEM's build, survives reboot and
+		// cannot be flipped by adb on a locked device — which is exactly
+		// what "on THIS large-format panel, these apps run out of process"
+		// needs to be. Same grammar; the debug property above wins.
+		if (__system_property_get("ro.dxr.force_ipc", dev_buf) > 0 &&
+		    u_sandbox_route_prop_selects(dev_buf, have_pkg ? pkg : NULL, /* allow_device_wide */ false)) {
+			U_LOG_I("ro.dxr.force_ipc=%s selects '%s': forcing IPC/service mode (device policy)", dev_buf,
+			        have_pkg ? pkg : "(unknown process)");
+			return true;
+		}
 	}
 #endif
 
