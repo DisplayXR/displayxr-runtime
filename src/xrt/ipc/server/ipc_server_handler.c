@@ -959,6 +959,11 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
 	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
 	if (rig_display || rig_camera) {
+		// The wire pose is in the head device's TRACKING-ORIGIN space - the
+		// frame this math (and the qwerty pose above) runs in. The client
+		// re-expressed the app's locate-space rig pose before sending it and
+		// re-expresses eye_world / display_pose on the way back (#1370: the
+		// client owns XrViewLocateInfo::space; the server never sees it).
 		display_pos = rig->pose.position;
 		display_ori = rig->pose.orientation;
 		static bool rig_logged = false;
@@ -1173,7 +1178,6 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
                                struct xrt_pose *out_poses)
 {
 	struct ipc_server *s = ics->server;
-	(void)at_timestamp_ns;
 
 	if (view_count < 1 || view_count > XRT_MAX_VIEWS) {
 		return false;
@@ -1223,6 +1227,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			screen_height_m = tmp;
 		}
 	}
+	// A controller-PLACED window (macOS #59) is the analogue of a Windows
+	// workspace tile: it gets the identity head below, never the rig head.
+	bool placed_window = false;
+	(void)placed_window;
 
 #ifdef XRT_OS_ANDROID
 	// PER-WINDOW Kooima (ADR-036 D6, epic #1031, #1034).
@@ -1315,6 +1323,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		float ww_m = 0.0f, wh_m = 0.0f;
 		if (comp_multi_workspace_load_window_pose(ics->xc, &wpose, &ww_m, &wh_m) && ww_m > 0.0f &&
 		    wh_m > 0.0f) {
+			placed_window = true;
 			screen_width_m = ww_m;
 			screen_height_m = wh_m;
 			win_eye_offset_x = wpose.position.x;
@@ -1561,8 +1570,34 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
 	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
 	const bool rig_any = rig_display || rig_camera;
-	struct xrt_vec3 display_pos = rig_any ? rig->pose.position : (struct xrt_vec3){0, 0, 0};
-	struct xrt_quat display_ori = rig_any ? rig->pose.orientation : (struct xrt_quat)XRT_QUAT_IDENTITY;
+	// The wire rig pose is in the head device's tracking-origin space (the
+	// client converted it from the app's locate space, #1370).
+	//
+	// #1370, legacy (no-rig) clients: the display plane is the HEAD DEVICE
+	// pose, exactly like the D3D11 server's use_qwerty_head path for a
+	// runtime-owned window. It rides back in out_head_relation, so the
+	// client's standard T_base_head chain carries the head motion in
+	// whatever base space the app asked for (the #739 lesson: carry motion
+	// through the chain), while the per-view poses stay head-local below -
+	// #48's plane-relative transport is unchanged. A controller-placed window
+	// keeps the identity head (a workspace tile). On Android the head pose is
+	// the nominal eye the per-client LOCAL is seeded from, so a LOCAL locate
+	// is byte-identical to the pre-#1370 result.
+	struct xrt_vec3 display_pos = {0, 0, 0};
+	struct xrt_quat display_ori = XRT_QUAT_IDENTITY;
+	if (rig_any) {
+		display_pos = rig->pose.position;
+		display_ori = rig->pose.orientation;
+	} else if (!placed_window && head != NULL) {
+		struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
+		xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, &head_rel);
+		const enum xrt_space_relation_flags head_valid = (enum xrt_space_relation_flags)(
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
+		if ((head_rel.relation_flags & head_valid) == head_valid) {
+			display_pos = head_rel.pose.position;
+			display_ori = head_rel.pose.orientation;
+		}
+	}
 
 	dxr_screen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};

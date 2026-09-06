@@ -1735,6 +1735,60 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 }
 #endif // OXR_HAVE_DXR_view_rig
 
+/*
+ * #1370 - the two legs of the base-space conversion in xrLocateViews.
+ *
+ * The view math in oxr_session_locate_views runs in the head device's
+ * TRACKING-ORIGIN space (the root on every DisplayXR head: the qwerty rig
+ * pose, the display plane, the render-ready eyes all live there). The app
+ * speaks XrViewLocateInfo::space. T_base_origin is that origin space located
+ * in the base space - exactly what oxr_space_locate_device returns for the
+ * head (the overseer links a device to its origin space, not to its pose;
+ * the tracked head pose rides separately in T_xdev_head). NOT T_base_head:
+ * that already carries the head motion the eyes carry too and would apply
+ * it twice.
+ *
+ *   IN : a chained rig pose, documented "in the locate space", is re-expressed
+ *        origin-side before the math consumes it.
+ *   OUT: the eyes and displayPlanePose are re-expressed base-side on the way
+ *        out.
+ *
+ * Both legs or nothing: every shipping rig app locates in LOCAL and treats
+ * the result as rig-local, so converting one leg alone shifts them by the
+ * LOCAL offset; converting both is a numerical no-op for them and makes the
+ * result spec-correct for everyone else. A base relation with no valid pose
+ * bits degrades to the identity (never garbage).
+ */
+static void
+locate_views_pose_base_to_origin(const struct xrt_space_relation *T_base_origin,
+                                 const struct xrt_pose *pose_base,
+                                 struct xrt_pose *out_pose_origin)
+{
+	const enum xrt_space_relation_flags valid =
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	if ((T_base_origin->relation_flags & valid) != valid) {
+		*out_pose_origin = *pose_base;
+		return;
+	}
+	struct xrt_pose T_origin_base;
+	math_pose_invert(&T_base_origin->pose, &T_origin_base);
+	math_pose_transform(&T_origin_base, pose_base, out_pose_origin);
+}
+
+static void
+locate_views_pose_origin_to_base(const struct xrt_space_relation *T_base_origin,
+                                 const struct xrt_pose *pose_origin,
+                                 struct xrt_pose *out_pose_base)
+{
+	const enum xrt_space_relation_flags valid =
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	if ((T_base_origin->relation_flags & valid) != valid) {
+		*out_pose_base = *pose_origin;
+		return;
+	}
+	math_pose_transform(&T_base_origin->pose, pose_origin, out_pose_base);
+}
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
@@ -1804,12 +1858,24 @@ oxr_session_locate_views(struct oxr_logger *log,
 	static int log_counter = 0;
 	bool should_log = (++log_counter % 120) == 1; // Log every ~2 seconds at 60fps
 
-	// World head pose - declared here so it's accessible in the view loop later
-	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
+	// The display-plane / camera pose the view math composes the eyes on, in
+	// the head device's TRACKING-ORIGIN space. Declared here so it is
+	// reachable in the view loop below. The default is the origin itself - the
+	// physical display plane - which is what an external-window session keeps
+	// (its head device never moves the plane); runtime-window sessions
+	// overwrite it with the head device pose, a chained rig with its pose.
+	// (#1370: no standing-height placeholder any more - the ONE standing-
+	// height constant is the qwerty rig seed, and LOCAL absorbs it.)
+	struct xrt_vec3 world_head_pos = {0.0f, 0.0f, 0.0f};
 	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
 
-	// View override: when set, view poses use these world-space eye positions
+	// View override: when set, view poses come from view_eye_world[] -
+	// tracking-origin-space eyes, converted to the base space on the way out
+	// (#1370)... except when raw_eye_override is ALSO set: then they are the
+	// display-plane-relative RAW eyes of an external-window / bridge-relay
+	// session, passed through verbatim by contract (ADR-024, INV-6.1).
 	bool have_eye_override = false;
+	bool raw_eye_override = false;
 	struct xrt_vec3 view_eye_world[XRT_MAX_VIEWS] = {{0}};
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	struct qwerty_view_state view_state = {0};
@@ -1994,10 +2060,59 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
+	/*
+	 * #1370: the requested base space, resolved ONCE and used on both legs.
+	 *
+	 * T_base_xdev is the head device's tracking-origin space located in
+	 * XrViewLocateInfo::space (see locate_views_pose_base_to_origin above).
+	 * It is also the T_base_xdev the standard T_base_head chain below has
+	 * always composed - resolved here, before the rig pose is consumed,
+	 * because the IN leg needs it first. One IPC round trip either way.
+	 */
+	struct xrt_space_relation T_base_xdev = XRT_SPACE_RELATION_ZERO;
+	XrResult ret = oxr_space_locate_device( //
+	    log,                                //
+	    xdev,                               //
+	    baseSpc,                            //
+	    viewLocateInfo->displayTime,        //
+	    &T_base_xdev);                      //
+	if (ret != XR_SUCCESS || T_base_xdev.relation_flags == 0) {
+		// In IPC mode, the device tracking proxy may return zero flags on
+		// early frames before the server's tracking is ready. For handle apps
+		// with external windows (has_ext_win) and bridge-relay sessions, use
+		// identity pose so the app can still render - it does its own Kooima
+		// projection via its HWND / forwards raw display-local eyes to a
+		// browser app.
+		if (T_base_xdev.relation_flags == 0 && (sess->has_external_window || sess->is_bridge_relay)) {
+			T_base_xdev.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+			T_base_xdev.relation_flags = (enum xrt_space_relation_flags)(
+			    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+			    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+			U_LOG_W("xrLocateViews: device relation_flags=0, using identity for ext_win/bridge app");
+		} else {
+			if (print) {
+				oxr_slog(&slog, "\n\tReturning invalid poses");
+				oxr_log_slog(log, &slog);
+			} else {
+				oxr_slog_cancel(&slog);
+			}
+			// Never hand back XR_SUCCESS with views[] unwritten (a latent
+			// route to app-side zero quats). Report "no valid pose" per the
+			// spec: identity poses, viewStateFlags = 0.
+			if (ret == XR_SUCCESS) {
+				viewState->viewStateFlags = 0;
+				for (uint32_t i = 0; i < viewCapacityInput && i < view_count; i++) {
+					views[i].pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+				}
+			}
+			return ret;
+		}
+	}
+
 	// Get device pose for 3D world-space computation (qwerty = virtual display)
 	// Bridge-relay sessions (headless, XR_DXR_display_info) forward raw
 	// DP-tracked eye positions to a browser app; treat them like handle
-	// apps (display-local views) and skip the qwerty world_head_pos offset.
+	// apps (display-local views) and keep the display plane at the origin.
 	if (!sess->has_external_window && !sess->is_bridge_relay) {
 		struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
@@ -2012,13 +2127,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 
 	// XR_DXR_view_rig: the chained rig pose IS the display-plane / camera
-	// pose — it replaces the qwerty device pose (runtime-window sessions)
-	// and the {0,1.6,0}/identity defaults (external-window sessions, where
-	// the defaults were harmless only because their eye_world output was
-	// discarded under the forcing this extension lifts).
+	// pose - it replaces the qwerty device pose (runtime-window sessions)
+	// and the identity default (external-window sessions). The app hands it
+	// over in the LOCATE space (XR_DXR_view_rig.h); the math below runs in
+	// the tracking-origin space - this is the IN leg of #1370.
 	if (rig_active) {
-		world_head_pos = sess->view_rig.pose.position;
-		world_head_ori = sess->view_rig.pose.orientation;
+		struct xrt_pose rig_origin = sess->view_rig.pose;
+		locate_views_pose_base_to_origin(&T_base_xdev, &sess->view_rig.pose, &rig_origin);
+		world_head_pos = rig_origin.position;
+		world_head_ori = rig_origin.orientation;
 	}
 
 	bool have_eyes = got_eye_positions && eye_pos.valid;
@@ -2270,9 +2387,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 					    {0, 0}, {(int32_t)wm.display_pixel_width, (int32_t)wm.display_pixel_height}};
 				}
 				view_raw->canvasSizeMeters = (XrExtent2Df){screen_width_m, screen_height_m};
-				view_raw->displayPlanePose = (XrPosef){
-				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
-				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
+				// OUT leg (#1370): the plane in the LOCATE space, not the
+				// tracking-origin space the math runs in.
+				{
+					struct xrt_pose plane_origin = {world_head_ori, world_head_pos};
+					struct xrt_pose plane_base;
+					locate_views_pose_origin_to_base(&T_base_xdev, &plane_origin, &plane_base);
+					OXR_XRT_POSE_TO_XRPOSEF(plane_base, view_raw->displayPlanePose);
+				}
 			}
 #endif
 
@@ -2403,17 +2525,19 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 			}
 
-			// Ext apps (standalone) and bridge-relay sessions: use raw nominal
-			// eye positions directly. FOVs come from the device (sim_display
-			// Kooima), so we only need to override the view positions to
-			// bypass the LOCAL space offset.
-			// Skip in IPC/workspace mode: the server provides tracked eyes in view poses.
+			// Ext apps (standalone) and bridge-relay sessions with NO rig
+			// chained: RAW contract (ADR-024, INV-6.1) - the DP's eyes,
+			// display-plane-relative, identity orientation, passed through
+			// verbatim whatever the locate space (displayPlanePose says where
+			// that plane is in the locate space). FOVs come from the device.
+			// Skip in IPC/workspace mode: the server provides them in view poses.
 			if ((sess->has_external_window || sess->is_bridge_relay) && !have_eye_override && have_eyes) {
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
 					view_eye_world[ei] = (struct xrt_vec3){
 					    adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
 				}
 				have_eye_override = true;
+				raw_eye_override = true;
 			}
 
 		}
@@ -2493,7 +2617,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 		if (rig_route_native && rig_active) {
 			// Values are already clamped by view_rig_update_from_chain.
-			rig_info.pose = sess->view_rig.pose;
+			// #1370 IN leg, applied above: world_head_* is the chained rig
+			// pose re-expressed in the tracking-origin space - the frame the
+			// server's math runs in (ipc_view_rig_info::pose is a
+			// tracking-origin pose on the wire; the client owns the base).
+			rig_info.pose = (struct xrt_pose){world_head_ori, world_head_pos};
 			rig_info.virtual_display_height = sess->view_rig.virtual_display_height;
 			rig_info.perspective_factor = sess->view_rig.perspective_factor;
 			rig_info.inv_convergence_distance = sess->view_rig.inv_convergence_distance;
@@ -2543,11 +2671,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 					    reply.raw.eyes[i].x, reply.raw.eyes[i].y, reply.raw.eyes[i].z};
 				}
 				view_raw->eyeCountOutput = rc;
-				view_raw->displayPlanePose = (XrPosef){
-				    {reply.raw.display_pose.orientation.x, reply.raw.display_pose.orientation.y,
-				     reply.raw.display_pose.orientation.z, reply.raw.display_pose.orientation.w},
-				    {reply.raw.display_pose.position.x, reply.raw.display_pose.position.y,
-				     reply.raw.display_pose.position.z}};
+				// OUT leg (#1370): the server reports the plane in the
+				// tracking-origin space; the app gets it in the LOCATE space.
+				{
+					struct xrt_pose plane_base;
+					locate_views_pose_origin_to_base(&T_base_xdev, &reply.raw.display_pose,
+					                                 &plane_base);
+					OXR_XRT_POSE_TO_XRPOSEF(plane_base, view_raw->displayPlanePose);
+				}
 				view_raw->canvasRectPx = (XrRect2Di){{reply.raw.rect_x_px, reply.raw.rect_y_px},
 				                                     {reply.raw.rect_w_px, reply.raw.rect_h_px}};
 				view_raw->canvasSizeMeters =
@@ -2675,50 +2806,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	// The xdev pose in the base space.
-	struct xrt_space_relation T_base_xdev = XRT_SPACE_RELATION_ZERO;
-	XrResult ret = oxr_space_locate_device( //
-	    log,                                //
-	    xdev,                               //
-	    baseSpc,                            //
-	    viewLocateInfo->displayTime,        //
-	    &T_base_xdev);                      //
-	if (ret != XR_SUCCESS || T_base_xdev.relation_flags == 0) {
-		// In IPC mode, the device tracking proxy may return zero flags on
-		// early frames before the server's tracking is ready. For handle apps
-		// with external windows (has_ext_win) and bridge-relay sessions, use
-		// identity pose so the app can still render — it does its own Kooima
-		// projection via its HWND / forwards raw display-local eyes to a
-		// browser app.
-		if (T_base_xdev.relation_flags == 0 && (sess->has_external_window || sess->is_bridge_relay)) {
-			T_base_xdev.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
-			T_base_xdev.relation_flags =
-			    (enum xrt_space_relation_flags)(
-			        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-			        XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-			        XRT_SPACE_RELATION_POSITION_VALID_BIT |
-			        XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
-			U_LOG_W("xrLocateViews: device relation_flags=0, using identity for ext_win/bridge app");
-		} else {
-			if (print) {
-				oxr_slog(&slog, "\n\tReturning invalid poses");
-				oxr_log_slog(log, &slog);
-			} else {
-				oxr_slog_cancel(&slog);
-			}
-			// Never hand back XR_SUCCESS with views[] unwritten (a latent
-			// route to app-side zero quats). Report "no valid pose" per the
-			// spec: identity poses, viewStateFlags = 0.
-			if (ret == XR_SUCCESS) {
-				viewState->viewStateFlags = 0;
-				for (uint32_t i = 0; i < viewCapacityInput && i < view_count; i++) {
-					views[i].pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
-				}
-			}
-			return ret;
-		}
-	}
-
 	struct xrt_space_relation T_base_head;
 	struct xrt_relation_chain xrc = {0};
 	m_relation_chain_push_relation(&xrc, &T_xdev_head);
@@ -2751,115 +2838,28 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// Do the magical space relation dance here.
 		struct xrt_space_relation result = {0};
 
-		// Service-mode (OOP) sessions: the server already computed
-		// display-relative view poses (via display-centric Kooima with DP eye
-		// tracking — ipc_try_get_sr_view_poses on Windows, ipc_try_get_oop_view_poses
-		// on Android/macOS). Skip the T_base_head transform, which would re-add a
-		// spurious Y offset from the head device's world-space tracked pose (the
-		// qwerty standing height of 1.6 m). Handle/texture apps matched this via
-		// has_external_window already; hosted apps (no external window) own no HWND
-		// yet still get display-relative server poses, so key on service mode too.
-		// (#48: macOS hosted OOP — Android has no qwerty so T_base_head was already
-		// identity there; this is a no-op for it.)
+		// External-window (handle/texture) and bridge-relay sessions with no
+		// rig: the server already returned display-plane-relative eyes - the
+		// RAW contract (ADR-024, INV-6.1) - so they pass through untouched.
+		// (#48's macOS OOP transport - the SERVER returning plane-relative
+		// per-view poses - is a server-side property and is unaffected here.)
 		//
-		// #739: the service-mode leg of the skip is scoped to NON-Windows. On
-		// Windows the wire head_relation (T_xdev_head) IS the server's qwerty
-		// rig pose (ipc_try_get_sr_view_poses), and hosted legacy sessions
-		// (Chrome WebXR) need it composed for the fly-camera: the per-view
-		// poses are head-local by construction, so skipping T_base_head
-		// cancels the qwerty motion out of XrView.pose entirely — inputs then
-		// visibly move only the qwerty controllers (children of the qwerty
-		// HMD). The LOCAL reference-space origin absorbs the 1.6 m standing
-		// height (it is the initial head pose), so composing adds only the
-		// motion delta — the pre-#48 behavior. Workspace sessions return an
-		// identity head relation (use_qwerty=0), so this is a no-op there.
-		bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
-#ifndef XRT_OS_WINDOWS
-		server_display_relative = server_display_relative ||
-		                          (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode);
-#endif
-		// A HOSTED app over IPC must see the same world-absolute view pose an
-		// in-process hosted app sees. In-process, the Kooima block above sets
-		// have_eye_override and writes world-space eyes straight into
-		// XrView.pose (camera at y≈1.7 for the 1.6 m rig + 0.1 nominal eye).
-		// Over IPC that override only engages for apps that chain
-		// XR_DXR_view_rig: the plain locate handler passes rig_reply == NULL,
-		// so rig_applied stays NONE and the server's HEAD-RELATIVE poses
-		// (y≈0.1) fall through to the chain below — where T_base_head is
-		// (0,0,0), because T_base_xdev is (0,-1.6,0): the LOCAL reference
-		// space origin is the initial head pose and cancels the standing
-		// height. Net effect measured on the dev box: the app got a camera at
-		// y=0.100 while drawing its cube at the world y=1.6 its hosted
-		// convention mandates, so the cube floated ~1.5 m overhead and you had
-		// to pitch up to find it. Same app, same scene, in-process: y=1.700.
-		//
-		// Compose against T_xdev_head instead — on Windows that IS the
-		// server's rig pose (see #739 below), so this re-adds the 1.6 m the
-		// LOCAL origin removed and lands on the in-process value exactly,
-		// while still carrying qwerty motion (the rig pose moves with WASD).
-		//
-		// Deliberately narrow: external-window and bridge-relay sessions are
-		// already handled by server_display_relative above; workspace sessions
-		// get an identity head relation (use_qwerty=0) and must not be
-		// touched; and apps that DO chain a rig take the override path and
-		// never reach here. That leaves exactly the broken class — a plain
-		// hosted app on the service.
-		//
-		// ...but NOT for Chrome WebXR. The world-absolute pose above is a
-		// concession to our in-tree hosted apps, which hardcode their content
-		// at the world standing height (the hosted cube is drawn at y=1.6) and
-		// so need a camera at y≈1.7 to see it. A standards-compliant app has
-		// no such convention: XrView.pose is specified relative to
-		// XrViewLocateInfo::space, and Chrome uses that space for EVERYTHING
-		// it owns — it renders with XRView.transform but positions its
-		// controllers, hit tests and content from base-space getPose()
-		// results. Re-adding the rig height there puts the camera 1.6 m above
-		// every pose Chrome has, so the qwerty controllers (base-space
-		// y = -0.30) sit ~2 m below the eye and their rays never enter the
-		// frustum — WebXR controllers simply vanish.
-		//
-		// Measured on the dev box before this exclusion: XrViewerPose
-		// head=(0,0,0) but XrView eye=(0,1.700,0) in the same LOCAL space, and
-		// a marker drawn dead ahead at eye level projected to NDC y=-2.46.
-		// After: eye=(0,0.100,0) — the 0.1 m nominal eye height above the
-		// head — and the controllers land just below centre where their rays
-		// cross the view.
-		//
-		// `is_appcontainer` (XR_EXT_win32_appcontainer_compatible, which
-		// Chrome enables because it is sandboxed and handle apps do not) is
-		// the same discriminator ipc_server_handler.c already uses to tell
-		// Chrome apart from a handle app for the qwerty head transform.
-		//
-		// #1014 amendment: the exclusion is NOT `workspace_mode`. It used to
-		// be, because "workspace session" implied "server returned an identity
-		// head relation" (use_qwerty_head was false for every client whenever a
-		// controller was up). Per-client window ownership (59d701ed4) ended
-		// that: an UNPLACED slot — a hosted app reached through the foreground
-		// override rather than launched by the controller — is not a workspace
-		// tile, so the server hands it the qwerty rig head exactly as it does
-		// with no controller running. Keying on `workspace_mode` then cancelled
-		// the 1.6 m back out and dropped the camera to the floor with the cube
-		// overhead, purely because a shell happened to be running. Key on the
-		// thing the flag was standing in for: did the server send a real head
-		// pose? An identity T_xdev_head means it did not (workspace tiles,
-		// controller chrome) and the standard chain still owns those.
-		const bool server_sent_head_pose =
-		    (T_xdev_head.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0 &&
-		    !m_pose_is_identity(&T_xdev_head.pose);
-		const bool hosted_ipc_world_absolute =
-		    !server_display_relative && !have_eyes && !have_eye_override && !sess->is_appcontainer &&
-		    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode && server_sent_head_pose &&
-		    !sess->has_external_window && !sess->is_bridge_relay;
-
+		// Everything else takes the standard chain: T_base_head = T_base_xdev
+		// (tracking origin in the base space) o T_xdev_head (the server's /
+		// device's head pose). That carries the head motion for every legacy
+		// client, hosted-over-IPC included, in whatever base space the app
+		// asked for - the #739 lesson (never route a legacy client through
+		// the eye override; carry motion through the chain). #1370 deleted the
+		// hosted world-absolute concession that used to sit between these two
+		// branches (hosted_ipc_world_absolute / server_sent_head_pose / the
+		// T_xdev_head-only chain / the non-Windows service-mode skip): it
+		// re-added the standing height for one class of in-tree test cube, and
+		// those cubes now simply locate in STAGE.
+		const bool server_display_relative = sess->has_external_window || sess->is_bridge_relay;
 		if (server_display_relative && !have_eyes && !have_eye_override) {
-			// Use server poses directly (display-relative)
+			// Use server poses directly (display-plane-relative)
 			result.pose = view_pose;
 			result.relation_flags = T_base_head.relation_flags;
-		} else if (hosted_ipc_world_absolute) {
-			struct xrt_relation_chain xrc = {0};
-			m_relation_chain_push_pose_if_not_identity(&xrc, &view_pose);
-			m_relation_chain_push_relation(&xrc, &T_xdev_head);
-			m_relation_chain_resolve(&xrc, &result);
 		} else {
 			// Standard path: apply space relation chain
 			struct xrt_relation_chain xrc = {0};
@@ -2873,12 +2873,37 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// view_eye_world[] is set by either camera-centric or display-centric path
 		// to ensure FOV and view position are consistent.
 		// Apply for mono too (active_view_count==1, i.e. 2D mode): centroid of all eye positions.
+		//
+		// #1370 OUT leg: the eyes below are computed in the head device's
+		// tracking-origin space (view_eye_world / world_head_*), and
+		// XrView.pose is specified relative to XrViewLocateInfo::space - so
+		// each pose is re-expressed through T_base_xdev (origin -> base) on
+		// the way out. The one deliberate exception is the RAW branch
+		// (raw_eye_override, and the tracked-eye SESSION TARGET branch):
+		// display-plane-relative eyes by contract (ADR-024, INV-6.1).
 		if (have_eyes || have_eye_override) {
 			uint32_t eye_idx = i;
+			bool origin_pose_valid = false;
+			struct xrt_pose origin_pose = {world_head_ori, {0.0f, 0.0f, 0.0f}};
 
-			if (have_eye_override) {
-				// VIEW OVERRIDE: use pre-computed eye positions
-				// For ext apps: display-local coords; for non-ext: world-space
+			if (have_eye_override && raw_eye_override) {
+				// RAW contract: display-plane-relative eyes, identity
+				// orientation, verbatim - whatever the locate space.
+				struct xrt_vec3 raw_eye = view_eye_world[eye_idx];
+				if (active_view_count == 1) {
+					float cx = 0, cy = 0, cz = 0;
+					uint32_t nc = eye_pos.count > 0 ? eye_pos.count : 2;
+					for (uint32_t ei = 0; ei < nc; ei++) {
+						cx += view_eye_world[ei].x;
+						cy += view_eye_world[ei].y;
+						cz += view_eye_world[ei].z;
+					}
+					raw_eye = (struct xrt_vec3){cx / (float)nc, cy / (float)nc, cz / (float)nc};
+				}
+				views[i].pose.position = (XrVector3f){raw_eye.x, raw_eye.y, raw_eye.z};
+				views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+			} else if (have_eye_override) {
+				// VIEW OVERRIDE: use pre-computed eye positions (tracking-origin space)
 				if (active_view_count == 1) {
 					// Mono: centroid of all eyes
 					float cx = 0, cy = 0, cz = 0;
@@ -2888,16 +2913,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 						cy += view_eye_world[ei].y;
 						cz += view_eye_world[ei].z;
 					}
-					views[i].pose.position.x = cx / (float)nc;
-					views[i].pose.position.y = cy / (float)nc;
-					views[i].pose.position.z = cz / (float)nc;
+					origin_pose.position =
+					    (struct xrt_vec3){cx / (float)nc, cy / (float)nc, cz / (float)nc};
 				} else {
-					views[i].pose.position.x = view_eye_world[eye_idx].x;
-					views[i].pose.position.y = view_eye_world[eye_idx].y;
-					views[i].pose.position.z = view_eye_world[eye_idx].z;
+					origin_pose.position = view_eye_world[eye_idx];
 				}
-				views[i].pose.orientation = (XrQuaternionf){
-				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
+				origin_pose_valid = true;
 			} else if (have_eyes) {
 				// Get tracked eye position for this view (in display-local coords)
 				struct xrt_vec3 tracked_eye;
@@ -2921,23 +2942,28 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 
 				if (!sess->has_external_window && !sess->is_bridge_relay) {
-					// DISPLAY MODE (Monado window): Transform tracked eye to world
+					// DISPLAY MODE (runtime window): compose the tracked eye
+					// on the display-plane pose (tracking-origin space).
 					struct xrt_vec3 rotated_eye;
 					math_quat_rotate_vec3(&world_head_ori, &tracked_eye, &rotated_eye);
-
-					views[i].pose.position.x = world_head_pos.x + rotated_eye.x;
-					views[i].pose.position.y = world_head_pos.y + rotated_eye.y;
-					views[i].pose.position.z = world_head_pos.z + rotated_eye.z;
-					views[i].pose.orientation = (XrQuaternionf){
-					    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
+					origin_pose.position = (struct xrt_vec3){world_head_pos.x + rotated_eye.x,
+					                                         world_head_pos.y + rotated_eye.y,
+					                                         world_head_pos.z + rotated_eye.z};
+					origin_pose_valid = true;
 				} else {
-					// SESSION TARGET (handle app or bridge relay):
-					// return RAW display-local DP-tracked eye positions.
-					views[i].pose.position.x = tracked_eye.x;
-					views[i].pose.position.y = tracked_eye.y;
-					views[i].pose.position.z = tracked_eye.z;
+					// SESSION TARGET (handle app or bridge relay): RAW
+					// contract - display-plane-relative DP-tracked eye
+					// positions, identity orientation.
+					views[i].pose.position =
+					    (XrVector3f){tracked_eye.x, tracked_eye.y, tracked_eye.z};
 					views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
 				}
+			}
+
+			if (origin_pose_valid) {
+				struct xrt_pose base_pose;
+				locate_views_pose_origin_to_base(&T_base_xdev, &origin_pose, &base_pose);
+				OXR_XRT_POSE_TO_XRPOSEF(base_pose, views[i].pose);
 			}
 
 			if (should_log) {
