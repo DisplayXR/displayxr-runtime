@@ -128,7 +128,36 @@ struct comp_rear_budget
 	void *dump_sink_ctx;
 	/*! @} */
 
-	//! Guards @ref published / @ref published_valid only.
+	/*!
+	 * @name XR_DXR_depth_budget v2 - the content-bounds ROI
+	 *
+	 * The app reports where its content projects (XrContentBoundsDXR on
+	 * xrEndFrame) and the analysis measures only there. v1 judged the whole
+	 * canvas, which read a busy verdict off an empty Notepad's own menu bar
+	 * while the model sat in another corner entirely.
+	 *
+	 * Written from the APP thread (xrEndFrame) and read from the RENDER
+	 * thread (the tick), so the four floats plus their timestamp move under
+	 * @ref publish_mutex as one unit - a torn rect would aim the ROI at a
+	 * region neither frame asked for.
+	 * @{
+	 */
+	//! Canvas-normalised, origin top-left. Meaningful only when @ref bounds_valid.
+	float bounds_u0, bounds_v0, bounds_u1, bounds_v1;
+	//! When the app last chained bounds; older than a second is "stopped chaining".
+	uint64_t bounds_ns;
+	//! The last chained bounds were usable (finite, positive extent).
+	bool bounds_valid;
+	//! DXR_REAR_BUDGET_ROI. -1 = unprobed, 0 = kill switch armed.
+	int roi_enabled;
+	//! ROI the last analysis actually used, in preview pixels.
+	struct u_bg_roi last_roi;
+	bool have_roi;
+	//! The last ROI was narrower than the preview (i.e. the bounds were used).
+	bool last_roi_narrowed;
+	/*! @} */
+
+	//! Guards @ref published / @ref published_valid and the content bounds.
 	struct os_mutex publish_mutex;
 	struct u_rear_budget_out published;
 	bool published_valid;
@@ -179,6 +208,35 @@ comp_rear_budget_set_requested(struct comp_rear_budget *b, bool requested);
  */
 void
 comp_rear_budget_arm(struct comp_rear_budget *b, bool transparent);
+
+/*!
+ * XR_DXR_depth_budget v2: where this frame's content projects, canvas-
+ * normalised with the origin top-left, as the app reported it on xrEndFrame.
+ *
+ * Advisory and lossy on purpose. The runtime dilates the region before
+ * measuring (the disparity conflict lives in the band around the silhouette,
+ * not strictly under it), falls back to the whole preview when the app stops
+ * chaining for more than a second, and never treats a region it cannot use as
+ * neutral - "I could not measure" and "I measured nothing" must not collapse
+ * into the same answer.
+ *
+ * Called from the APP thread while @ref comp_rear_budget_tick runs on the
+ * render thread; the rect moves under the runner's own mutex.
+ *
+ * @param u0,v0,u1,v1 Canvas-normalised bounds. A non-positive extent (u1 <= u0
+ *                    or v1 <= v0) means "unknown" and selects the whole
+ *                    preview - which is exactly v1's behaviour.
+ * @param now_ns      Monotonic now, for the staleness rule.
+ *
+ * @ingroup comp_util
+ */
+void
+comp_rear_budget_set_content_bounds(struct comp_rear_budget *b,
+                                    float u0,
+                                    float v0,
+                                    float u1,
+                                    float v1,
+                                    uint64_t now_ns);
 
 /*!
  * True when the policy is armed for this session. A cheap gate the render
@@ -248,6 +306,19 @@ comp_rear_budget_get(struct comp_rear_budget *b, struct u_rear_budget_out *out);
  */
 void
 comp_rear_budget_debug_set_dump_sink(struct comp_rear_budget *b, comp_rear_budget_dump_fn fn, void *ctx);
+
+/*!
+ * TEST ONLY — the ROI the last analysis used, in preview pixels.
+ *
+ * @param out_narrowed Set when the ROI came from the app's content bounds
+ *                     rather than being the whole preview; may be NULL.
+ *
+ * @return false before any analysis has run.
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_roi *out_roi, bool *out_narrowed);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.

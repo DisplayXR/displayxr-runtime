@@ -360,6 +360,11 @@ bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
   capture throttle (<= 15 Hz) and never per weave.
 - **`struct_size` is the runtime's, not yours.** The runtime sets it before the
   call; write only the fields that fit within it.
+- **The canvas rect became load-bearing in `XR_DXR_depth_budget` v2.** The slot
+  itself is unchanged, but the runtime now maps the app's reported content
+  bounds through `canvas_u0..v1` to narrow the analysis region. A plug-in that
+  includes a margin around the canvas MUST say so there; one that leaves the
+  four floats zeroed is read as the documented normal case, `0,0,1,1`.
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
 
 ## Frame-timing inputs are an offer, never a requirement

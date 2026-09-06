@@ -15,6 +15,7 @@
 
 #include "util/u_logging.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -136,6 +137,166 @@ comp_rear_budget_retain_preview(struct comp_rear_budget *b, const struct xrt_dp_
 
 /*
  * ---------------------------------------------------------------------------
+ * The content-bounds ROI (XR_DXR_depth_budget v2)
+ * ---------------------------------------------------------------------------
+ */
+
+/*!
+ * Dilation applied to every side of the mapped bounds, as a fraction of the
+ * preview width. The disparity conflict is read in the BAND around the
+ * silhouette rather than strictly under it, so measuring the exact projected
+ * AABB would answer a question nobody asked.
+ */
+#define COMP_REAR_BUDGET_ROI_DILATE_FRAC 0.04f
+
+//! Never dilate by less than this, so a small preview still gets a real band.
+#define COMP_REAR_BUDGET_ROI_DILATE_MIN_PX 8.0f
+
+/*!
+ * Bounds older than this are treated as absent: the app stopped chaining, and
+ * a rect from a second ago describes geometry that has since moved.
+ */
+#define COMP_REAR_BUDGET_ROI_MAX_AGE_NS (1000ULL * 1000ULL * 1000ULL)
+
+static float
+comp_rear_budget_clampf(float v, float lo, float hi)
+{
+	return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
+/*!
+ * The ROI this frame's analysis should use, in preview pixels.
+ *
+ * Every failure path lands on the WHOLE preview — the v1 answer — and never on
+ * "neutral". A region the runner could not derive is a question it did not
+ * ask, not a background it measured and found quiet.
+ */
+static void
+comp_rear_budget_derive_roi(struct comp_rear_budget *b,
+                            const struct xrt_dp_background_preview *pv,
+                            uint64_t now_ns,
+                            struct u_bg_roi *out_roi,
+                            bool *out_narrowed)
+{
+	const struct u_bg_roi whole = {0, 0, pv->width, pv->height};
+	*out_roi = whole;
+	*out_narrowed = false;
+
+	// Probed once. An armed kill switch says so: an A/B whose two arms are
+	// indistinguishable in the log is not an A/B.
+	if (b->roi_enabled < 0) {
+		const char *e = getenv("DXR_REAR_BUDGET_ROI");
+		b->roi_enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		if (b->roi_enabled == 0) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_ROI armed = 0 (content-bounds ROI off, "
+			    "analysing the whole preview)");
+		}
+	}
+	if (b->roi_enabled == 0) {
+		return;
+	}
+
+	os_mutex_lock(&b->publish_mutex);
+	const bool valid = b->bounds_valid;
+	const uint64_t age_ns = (now_ns > b->bounds_ns) ? (now_ns - b->bounds_ns) : 0;
+	const float u0 = b->bounds_u0, v0 = b->bounds_v0, u1 = b->bounds_u1, v1 = b->bounds_v1;
+	os_mutex_unlock(&b->publish_mutex);
+
+	if (!valid || age_ns > COMP_REAR_BUDGET_ROI_MAX_AGE_NS) {
+		return;
+	}
+
+	/*
+	 * Map canvas-normalised bounds into preview pixels. The preview covers
+	 * `canvas_u0..v1` OF THE CANVAS — normally 0,0,1,1, but a display
+	 * processor may include a margin. One that predates the field leaves it
+	 * zeroed, and that is the documented normal case rather than a degenerate
+	 * one, so it reads as the identity instead of disabling the ROI.
+	 */
+	float cu0 = pv->canvas_u0, cv0 = pv->canvas_v0, cu1 = pv->canvas_u1, cv1 = pv->canvas_v1;
+	if (!(cu1 > cu0) || !(cv1 > cv0)) {
+		cu0 = 0.0f;
+		cv0 = 0.0f;
+		cu1 = 1.0f;
+		cv1 = 1.0f;
+	}
+
+	const float w_px = (float)pv->width;
+	const float h_px = (float)pv->height;
+	float x0 = (u0 - cu0) / (cu1 - cu0) * w_px;
+	float x1 = (u1 - cu0) / (cu1 - cu0) * w_px;
+	float y0 = (v0 - cv0) / (cv1 - cv0) * h_px;
+	float y1 = (v1 - cv0) / (cv1 - cv0) * h_px;
+
+	// Dilate BEFORE clamping, so a band that runs off the preview edge is
+	// clipped by the preview rather than by the arithmetic.
+	float dilate = COMP_REAR_BUDGET_ROI_DILATE_FRAC * w_px;
+	if (dilate < COMP_REAR_BUDGET_ROI_DILATE_MIN_PX) {
+		dilate = COMP_REAR_BUDGET_ROI_DILATE_MIN_PX;
+	}
+	x0 -= dilate;
+	x1 += dilate;
+	y0 -= dilate;
+	y1 += dilate;
+
+	x0 = comp_rear_budget_clampf(floorf(x0), 0.0f, w_px);
+	x1 = comp_rear_budget_clampf(ceilf(x1), 0.0f, w_px);
+	y0 = comp_rear_budget_clampf(floorf(y0), 0.0f, h_px);
+	y1 = comp_rear_budget_clampf(ceilf(y1), 0.0f, h_px);
+
+	const struct u_bg_roi roi = {(uint32_t)x0, (uint32_t)y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
+
+	// Degenerate after clamping — bounds that landed off the preview
+	// entirely. The whole preview, never a pass: a region too small to hold a
+	// measurement must not be able to open the budget.
+	if (roi.w < 2 || roi.h < 1) {
+		return;
+	}
+
+	*out_roi = roi;
+	*out_narrowed = roi.w < pv->width || roi.h < pv->height;
+}
+
+void
+comp_rear_budget_set_content_bounds(struct comp_rear_budget *b, float u0, float v0, float u1, float v1, uint64_t now_ns)
+{
+	if (b == NULL || !b->initialised) {
+		return;
+	}
+
+	// oxr validates and clamps; this is the second gate, because the rect
+	// steers a memory read and "advisory" must never come to mean "unchecked".
+	const bool finite = isfinite(u0) && isfinite(v0) && isfinite(u1) && isfinite(v1);
+
+	os_mutex_lock(&b->publish_mutex);
+	b->bounds_u0 = u0;
+	b->bounds_v0 = v0;
+	b->bounds_u1 = u1;
+	b->bounds_v1 = v1;
+	b->bounds_ns = now_ns;
+	b->bounds_valid = finite && u1 > u0 && v1 > v0;
+	os_mutex_unlock(&b->publish_mutex);
+}
+
+bool
+comp_rear_budget_debug_last_roi(const struct comp_rear_budget *b, struct u_bg_roi *out_roi, bool *out_narrowed)
+{
+	if (b == NULL || !b->have_roi) {
+		return false;
+	}
+	if (out_roi != NULL) {
+		*out_roi = b->last_roi;
+	}
+	if (out_narrowed != NULL) {
+		*out_narrowed = b->last_roi_narrowed;
+	}
+	return true;
+}
+
+
+/*
+ * ---------------------------------------------------------------------------
  * Lifecycle
  * ---------------------------------------------------------------------------
  */
@@ -148,6 +309,7 @@ comp_rear_budget_init(struct comp_rear_budget *b, const char *label)
 	}
 	memset(b, 0, sizeof(*b));
 	b->dump = -1;
+	b->roi_enabled = -1;
 
 	if (os_mutex_init(&b->publish_mutex) != 0) {
 		// Without the lock the publish/read pair is a data race, so the
@@ -273,19 +435,41 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 	const bool have_preview = b->source_available;
 
 	if (polled && have_preview) {
-		// Re-analysing an unchanged capture would burn the CPU to reach the
-		// same answer; the policy's own staleness rule covers a generation
-		// that stops advancing entirely.
-		if (!b->have_generation || pv->generation != b->last_generation) {
-			struct u_bg_roi roi = {0, 0, pv->width, pv->height}; // v1 ROI = the canvas
+		struct u_bg_roi roi;
+		bool narrowed = false;
+		comp_rear_budget_derive_roi(b, pv, now_ns, &roi, &narrowed);
+
+		/*
+		 * Two reasons to re-measure, and the second is what makes the ROI
+		 * live: a capture that CHANGED, or the same capture seen through a
+		 * different region. Gating on the generation alone would freeze the
+		 * verdict of wherever the content used to be — on a quiet desktop the
+		 * generation never advances again, which is the best case for the
+		 * budget and the worst case for a stale ROI. Re-analysing an
+		 * unchanged capture through an unchanged region stays skipped.
+		 */
+		const bool gen_new = !b->have_generation || pv->generation != b->last_generation;
+		const bool roi_new = !b->have_roi || roi.x != b->last_roi.x || roi.y != b->last_roi.y ||
+		                     roi.w != b->last_roi.w || roi.h != b->last_roi.h;
+
+		if (gen_new || roi_new) {
 			struct u_bg_neutrality_result res = {0};
 			if (u_bg_neutrality_analyse(pv->bgra, pv->width, pv->height, pv->stride_bytes, &roi, NULL,
 			                            &res)) {
 				b->result = res;
 				b->have_result = true;
 			}
+		}
+		b->last_roi = roi;
+		b->last_roi_narrowed = narrowed;
+		b->have_roi = true;
+
+		if (gen_new) {
 			b->have_generation = true;
 			b->last_generation = pv->generation;
+			// Retention follows the PICTURE, not the region: the dump shows
+			// what the analysis saw, and a moved ROI over an unchanged desktop
+			// is the same picture.
 			if (b->dump == 1) {
 				comp_rear_budget_retain_preview(b, pv);
 			}
@@ -320,6 +504,17 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 	 * dump unreachable in practice, and an armed run produced no PNG and not
 	 * even a FAILED line.
 	 */
+	if (out.state != before) {
+		// Beside u_rear_budget's own transition line, which cannot name the
+		// region because the policy is deliberately ROI-blind. Without this a
+		// busy verdict is unattributable: measured under the content, or over
+		// a canvas the content was nowhere near?
+		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u (%s)", b->policy.label[0] != '\0' ? b->policy.label : "session",
+		        b->last_roi.x, b->last_roi.y, b->last_roi.w, b->last_roi.h,
+		        !b->have_roi ? "no preview analysed"
+		                     : (b->last_roi_narrowed ? "app content bounds" : "whole preview"));
+	}
+
 	if (b->dump == 1 && out.state != before) {
 		if (b->dump_have) {
 			const comp_rear_budget_dump_fn sink =
