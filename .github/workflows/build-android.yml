@@ -339,14 +339,18 @@ jobs:
           set -euo pipefail
           APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
           echo "APK: $APK ($(du -h "$APK" | cut -f1))"
-          # List once. `unzip -l "$APK" | grep -q ...` under `set -o pipefail`
-          # is a SIGPIPE race: grep -q exits at the first match, unzip dies with
+          # List once, and match with a HERE-STRING, never a pipe.
+          # `unzip -l "$APK" | grep -q ...` under `set -o pipefail` is a SIGPIPE
+          # race: grep -q exits at the FIRST match, the writer upstream dies with
           # 141, and the pipeline "fails" even though the file IS present.
-          # Reproducible on macOS (16K pipe buffer) while staying green on the
-          # Linux runner -- i.e. a latent CI flake, not a local-only quirk.
+          # Whether it fires depends on where the match falls in the listing
+          # relative to the pipe buffer -- a coin flip per APK per platform. It
+          # reproduced on macOS with `unzip` upstream and on the Linux runner
+          # with `printf` upstream. `<<<` feeds grep from a temp file, so there
+          # is no writer left to signal and no race to lose.
           APK_LIST=$(unzip -l "$APK")
           echo "Native libs:"
-          printf '%s\n' "$APK_LIST" | grep '\.so$' || echo "(none)"
+          grep '\.so$' <<<"$APK_LIST" || echo "(none)"
 
           # aapt2 is needed by both the version gate below and the CNSDK
           # manifest-stamp gate further down; resolve it once.
@@ -421,7 +425,7 @@ jobs:
           echo "  ok: versionCode=$vcode versionName=$vname (monotonic vs 214500291, matches $describe)"
 
           need() {
-            if ! printf '%s\n' "$APK_LIST" | grep -q "lib/arm64-v8a/$1"; then
+            if ! grep -q "lib/arm64-v8a/$1" <<<"$APK_LIST"; then
               echo "::error::APK is missing lib/arm64-v8a/$1 — $2"
               exit 1
             fi
@@ -447,9 +451,9 @@ jobs:
             # legitimate AAR-supplied libleiaSDK-jni.so, so a substring grep
             # would make the leia variant unbuildable and was only ever green
             # because jniLibs/ is gitignored and empty on a runner.
-            if printf '%s\n' "$APK_LIST" | grep -qE 'lib/arm64-v8a/(libleiaSDK\.so|libleia|libdxrp050)'; then
+            if grep -qE 'lib/arm64-v8a/(libleiaSDK\.so|libleia|libdxrp050)' <<<"$APK_LIST"; then
               echo "::error::vendor material leaked into the NEUTRAL runtime APK (ADR-019). The neutral variant must carry sim-display only."
-              printf '%s\n' "$APK_LIST" | grep -E 'libleia|libdxrp'
+              grep -E 'libleia|libdxrp' <<<"$APK_LIST"
               exit 1
             fi
             echo "  ok: no vendor material (ADR-019)"
