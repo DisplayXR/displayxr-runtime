@@ -154,10 +154,12 @@ when the runtime lacks the extension.
 - **New cost is bounded and gated.** The preview is produced at the vendor's existing capture
   throttle (<= 15 Hz), analysed at most every 66 ms, over <= 512 px, on the CPU, and only for
   opted-in transparent standalone sessions.
-- **Reach is narrow in v1, on purpose.** Only the Windows vendor-DP source exists, only D3D11 is
-  wired, and the ROI is the whole canvas rather than the region under the model. Each is a
-  tracked follow-up ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)); none
-  changes the layering above.
+- **Reach is narrow in v1, on purpose.** Only the Windows vendor-DP source exists, and the ROI is
+  the whole canvas rather than the region under the model. Each is a tracked follow-up
+  ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)); none changes the layering
+  above. The compositor reach has since widened: the API-agnostic half of the runner was factored
+  into `comp_rear_budget` and D3D11, Vulkan and D3D12 all drive it, so they run one policy rather
+  than three that resemble each other. GL and Metal still report `CLIPPED_NO_SOURCE`.
 - **A new advisory value reaching apps means a new way for apps to disagree.** The ramp is the
   mitigation: because the runtime hands over an already-smoothed value and asks apps to apply it
   raw, two apps on one display move their clip planes together.

@@ -21,6 +21,9 @@
 #include "util/comp_zone_tier1.h"
 #include "util/comp_layer_accum.h"
 #include "util/comp_bg2d.h"
+// XR_DXR_depth_budget: the API-agnostic runner (validate -> analyse -> policy
+// -> publish -> dump). Only the typed get_background_preview call stays here.
+#include "util/comp_rear_budget.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -447,6 +450,20 @@ struct comp_vk_native_compositor
 	//! present uses a transparent compositeAlpha. Cached for the macOS Local2D
 	//! flat-2D-over-desktop rule (#568) in vk_composite_local_2d.
 	bool transparent_background;
+
+	/*!
+	 * XR_DXR_depth_budget (rear depth budget).
+	 *
+	 * The weave thread pulls a small background preview from the VK DP (at
+	 * most every 66 ms, and only when it advanced), analyses it, and feeds the
+	 * policy; the app's locate thread reads the published triple through the
+	 * runner's own lock, never @ref mutex.
+	 *
+	 * Ticked ONCE per app frame, from the pass that just handed the DP an
+	 * atlas — never from a repaint, which replays RENDERING only and must not
+	 * advance a per-frame state machine.
+	 */
+	struct comp_rear_budget rear_budget;
 
 	//! Compose-under backdrop for the base-DP slot-16 seam (#1073). The
 	//! out-of-process path produces this in comp_multi_system.c; in-process
@@ -3639,6 +3656,57 @@ dxr_postwait_queue_only(void)
 	return on == 1;
 }
 
+/*
+ * ── XR_DXR_depth_budget: rear depth budget (weave thread) ────────────────────
+ *
+ * A transparent app composites over the LIVE desktop, so anything it draws
+ * behind the display plane occludes pixels that sit at zero disparity. Apps
+ * avoid that today by clipping at the plane and throwing all rear depth away.
+ * The conflict is only visible over a background with HORIZONTAL luminance
+ * structure, so the runtime watches the desktop the DP already captures and
+ * hands the app a budget instead of a blanket rule (ADR-040).
+ *
+ * Everything that is NOT the typed vtable call lives in comp_rear_budget, so
+ * this backend and the D3D11 one run the SAME policy rather than two that look
+ * alike. What is here is the VK slot.
+ *
+ * Called from exactly ONE place per app frame — immediately after the DP has
+ * been handed this frame's atlas, which is the point at which its capture is
+ * settled. Two rules keep that "once per APP frame":
+ *
+ * - the windowed call site is inside vk_dp_weave_and_present and is skipped on
+ *   `is_repaint`; a repaint replays RENDERING only and must never advance a
+ *   per-frame state machine,
+ * - the shared-texture call site is the other arm of the same commit, so the
+ *   two are mutually exclusive.
+ *
+ * Under the #918 output-device split there is no VK weave at all (the D3D11
+ * scanout-adapter half does it), so neither site runs and the budget simply
+ * never leaves CLIPPED_NO_SOURCE — which is byte-for-byte today's behaviour.
+ */
+static void
+vk_rear_budget_tick(struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL || !comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+
+	const uint64_t now_ns = os_monotonic_get_ns();
+
+	// Two cadences on purpose. The DP poll + analysis is throttled to the
+	// capture rate: re-reading an unchanged preview is wasted work. The policy
+	// update + publish runs EVERY app frame, because the app applies the
+	// published far offset as-is and the ramps must advance per frame or the
+	// clip plane steps in a handful of visible jumps instead of sliding.
+	struct xrt_dp_background_preview pv;
+	xrt_dp_background_preview_init(&pv);
+	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
+	const bool got = polled && xrt_display_processor_vk_get_background_preview(
+	                               (struct xrt_display_processor_vk *)c->display_processor, &pv);
+
+	comp_rear_budget_tick(&c->rear_budget, got ? &pv : NULL, polled, c->transparent_background, now_ns);
+}
+
 static xrt_result_t
 vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         bool is_repaint,
@@ -4173,6 +4241,14 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
 			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
 			    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
+
+			// XR_DXR_depth_budget: evaluate the rear budget from the background
+			// the DP just composited under. AFTER process_atlas, because that is
+			// the point at which the DP's capture for this frame is settled, and
+			// NOT on a repaint — a replay is not an app frame.
+			if (!is_repaint) {
+				vk_rear_budget_tick(c);
+			}
 
 			if (ftime) {
 				fp[3] = os_monotonic_get_ns();
@@ -5510,6 +5586,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc, xrt_graphics_sync_h
 			    dp_target_w, dp_target_h, (VkFormat_XDP)view_format, dp_canvas.offset.w, dp_canvas.offset.h,
 			    (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
 
+			// XR_DXR_depth_budget — the other arm of this commit (see
+			// vk_rear_budget_tick). Mutually exclusive with the windowed site
+			// above, and this path has no repaint, so it ticks unconditionally.
+			vk_rear_budget_tick(c);
+
 			if (dp_self_submits) {
 				// DP owns its own submit — nothing left for us to do this
 				// frame except mark woven and clean up.
@@ -6004,6 +6085,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// #868: last, after the repaint thread has been joined above.
 	os_cond_destroy(&c->weave_cond);
 	os_mutex_destroy(&c->mutex);
+
+	// XR_DXR_depth_budget: the runner owns a mutex.
+	comp_rear_budget_fini(&c->rear_budget);
 
 	free(c);
 }
@@ -6515,6 +6599,12 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	os_mutex_init(&c->mutex);
 	os_cond_init(&c->weave_cond);
 	os_thread_helper_init(&c->repaint_thread);
+
+	// XR_DXR_depth_budget: the policy exists from the first frame so that a
+	// locate arriving before any preview reads a real CLIPPED_NO_SOURCE rather
+	// than an uninitialised struct. Same reason as the mutex above: it must be
+	// valid on every path that can reach vk_compositor_destroy.
+	comp_rear_budget_init(&c->rear_budget, "vk");
 
 	// Initialize vk_bundle from the app's existing VkDevice
 	VkResult vk_ret = vk_init_from_given(&c->vk, vkGetInstanceProcAddr, (VkInstance)vk_instance,
@@ -7490,6 +7580,30 @@ comp_vk_native_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	*out_width_m = 0.3f;
 	*out_height_m = 0.2f;
 	return false;
+}
+
+/*
+ * XR_DXR_depth_budget - thin wrappers over the shared runner, so oxr keeps
+ * calling one symbol per backend and knows nothing about comp_rear_budget.
+ */
+void
+comp_vk_native_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	comp_rear_budget_set_requested(&c->rear_budget, requested);
+	comp_rear_budget_arm(&c->rear_budget, c->transparent_background);
+}
+
+bool
+comp_vk_native_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
+{
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	return comp_rear_budget_get(&vk_comp(xc)->rear_budget, out);
 }
 
 bool

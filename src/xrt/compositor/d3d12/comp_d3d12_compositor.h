@@ -14,6 +14,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_metrics.h"
+#include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
 
 // Forward declarations
 struct comp_d3d12_compositor;
@@ -106,6 +107,29 @@ comp_d3d12_compositor_get_display_dimensions(struct xrt_compositor *xc,
 bool
 comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct xrt_window_metrics *out_metrics);
+
+/*!
+ * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
+ *
+ * Latched exactly like the transparency flag, and for the same reason: the
+ * background preview fetch + analysis is real per-frame work on the render
+ * thread, and it must not run for a session that never opted in.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * XR_DXR_depth_budget: the latest budget the render thread computed.
+ *
+ * @return false when this session never opted in - the caller then applies the
+ *         conservative default.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
  * Request display mode switch (2D/3D) via display processor.
