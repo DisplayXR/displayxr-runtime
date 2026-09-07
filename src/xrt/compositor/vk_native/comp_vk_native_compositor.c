@@ -605,6 +605,20 @@ struct comp_vk_native_compositor
 	uint64_t present_serial;
 
 	/*!
+	 * #1394: dropped-frame accounting for the log throttle. Per compositor and
+	 * not function-local statics, because vk_dp_weave_and_present runs on BOTH
+	 * the app thread and the repaint thread and there is one instance per
+	 * window — statics would interleave two threads' counts and merge every
+	 * window's into one. Written under c->mutex, like every other field here.
+	 */
+	struct
+	{
+		uint64_t total;       //!< Drops seen by this compositor this session.
+		uint64_t last_log_ns; //!< Monotonic time of the last line we emitted.
+		bool logged_once;     //!< The very first drop always logs.
+	} weave_drop;
+
+	/*!
 	 * #868: everything the repaint thread needs to replay the last app frame's
 	 * weave WITHOUT touching app-owned state. Published by layer_commit.
 	 */
@@ -4337,6 +4351,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 	VkCommandBuffer cmd;
 	VkFramebuffer target_fb = VK_NULL_HANDLE;
+	/*
+	 * #1394: set when the DP reports that this frame never became pixels. It
+	 * suppresses the overlays, the present COUNT and the timing flush — but
+	 * NOT the present itself. See the drop branch after process_atlas for why
+	 * the present has to happen anyway.
+	 */
+	bool frame_dropped = false;
 	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
 	if (res == VK_SUCCESS) {
 		VkCommandBufferBeginInfo begin_info = {
@@ -4665,50 +4686,70 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			 *
 			 * A self-submitting DP weaves on its own queue, so a vendor submit
 			 * that FAILS looks exactly like one that succeeded from here: we
-			 * would present a target the weaver never wrote, count it, and fold
+			 * would present a target the weaver never wrote, COUNT it, and fold
 			 * its timing into the next frame. The measured case is an Adreno GSL
 			 * timestamp collision failing the CNSDK weaver's internal
 			 * vkQueueSubmit (LeiaInc/CNSDK#733/#734).
 			 *
-			 * Treat it exactly like the fence-park's drop-if-superseded: bail
-			 * BEFORE the composite submit, the present, and the frame-timing
-			 * flush. That gives the four properties the vendor fix needs from
-			 * us — no present, no present_serial bump, nothing from this frame
-			 * in vk_frame_timing (fp[] is never flushed) or in the next
-			 * predicted-scanout horizon (which is measured from presents), and
-			 * a fresh acquire + generation re-check on the next weave, so the
-			 * DP can never be handed a framebuffer cached across the drop.
+			 * What a drop suppresses: the content overlays below, the
+			 * present_serial bump, and the frame-timing flush. Nothing from this
+			 * frame reaches vk_frame_timing, and the #206 predicted-scanout
+			 * horizon is measured from PRESENTS THAT COUNTED, so it is fed
+			 * nothing either. The DP owns recovering its own state; the next
+			 * weave re-enters through comp_vk_native_target_acquire and the #602
+			 * generation compare, so it can never be handed a framebuffer cached
+			 * across the drop.
 			 *
-			 * The DP owns recovering its own state; we own the target. Absent
-			 * slot / older plug-in ⟹ false ⟹ byte-identical to before.
+			 * What a drop does NOT suppress is the present, and that is
+			 * deliberate. Vulkan offers exactly two ways to give back an image
+			 * from vkAcquireNextImageKHR: present it, or destroy the swapchain.
+			 * comp_vk_native_target tracks a single `current_index` and returns
+			 * it only in comp_vk_native_target_present, so skipping the present
+			 * STRANDS that image for the life of the swapchain. The acquire
+			 * budget is finite whatever the driver hands back (image_count -
+			 * minImageCount + 1; as few as 2 at the count we ask for), every
+			 * drop permanently consumes one, and #1394 collisions come in runs
+			 * — so it is a question of WHEN, not whether, the weave thread
+			 * blocks inside vkAcquireNextImageKHR(UINT64_MAX) while holding
+			 * c->mutex. That is #1394 relocated, not fixed, so a dropped frame
+			 * is recycled to the presentation engine instead:
+			 * uncounted, untimed, and with no new content composited into it, so
+			 * under FIFO the panel shows the older woven frame that image
+			 * already held. (This is NOT the shape of the #1264 S1 fence-park
+			 * skip, which only fires once another present has landed or the
+			 * swapchain generation has changed — both of which release the
+			 * image. That skip is self-limiting; a drop has no such pairing.)
+			 *
+			 * Absent slot / older plug-in ⟹ false ⟹ byte-identical to before.
 			 */
 			if (xrt_display_processor_vk_get_last_frame_dropped(
 			        (struct xrt_display_processor_vk *)c->display_processor)) {
+				frame_dropped = true;
 				/*
 				 * Rate-limited, never per-frame: the whole point of the
 				 * vendor fix is that a drop is survivable, and a survivable
 				 * failure logged at 60 Hz is its own ship-blocker. One WARN
-				 * on the first ever drop, then at most one line per 5 s
-				 * carrying the running count.
+				 * on the first drop, then at most one line per 5 s carrying
+				 * the running count.
+				 *
+				 * Per-compositor, not function-local statics: this function
+				 * runs on both the app and the repaint thread and there is
+				 * one instance per window, so statics would interleave two
+				 * threads' counts and merge every window's.
 				 */
-				static uint64_t s_drops = 0;
-				static uint64_t s_last_log_ns = 0;
 				const uint64_t now_ns = os_monotonic_get_ns();
-				s_drops++;
-				if (s_drops == 1 || now_ns - s_last_log_ns > 5 * U_TIME_1S_IN_NS) {
-					s_last_log_ns = now_ns;
+				c->weave_drop.total++;
+				if (!c->weave_drop.logged_once ||
+				    now_ns - c->weave_drop.last_log_ns > 5ULL * U_TIME_1S_IN_NS) {
+					c->weave_drop.logged_once = true;
+					c->weave_drop.last_log_ns = now_ns;
 					U_LOG_W("#1394: the display processor DROPPED this frame — not "
-					        "presenting it (%" PRIu64 " dropped so far). The vendor "
-					        "log line immediately above says whether its submit "
+					        "counted, not timed, recycled to the presentation "
+					        "engine (%" PRIu64 " dropped so far). The vendor log "
+					        "line immediately above says whether its submit "
 					        "failed or its fence wait timed out.",
-					        s_drops);
+					        c->weave_drop.total);
 				}
-				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
-				if (target_fb != VK_NULL_HANDLE) {
-					vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
-				}
-				*out_skip_frame = true;
-				return XRT_SUCCESS;
 			}
 
 			// XR_DXR_depth_budget: evaluate the rear budget from the background
@@ -4788,7 +4829,10 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				const char *ne = getenv("DXR_WEAVE_REPAINT_NO2D");
 				no2d = (ne != NULL && ne[0] == '1') ? 1 : 0;
 			}
-			if (!(is_repaint && no2d == 1))
+			// #1394: a dropped frame gets no new content composited into it —
+			// the overlays would paint over whatever stale image is about to be
+			// recycled, turning "the older woven frame" into a mix of two.
+			if (!(is_repaint && no2d == 1) && !frame_dropped)
 			vk_composite_local_2d(c, cmd, (VkImage)(uintptr_t)target_image,
 			    (VkImageView)(uintptr_t)target_view, tgt_width, tgt_height,
 			    /*
@@ -4812,10 +4856,12 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    /*reuse_twod=*/is_repaint);
 
 			// Diagnostic HUD overlay (TAB key toggle)
-			vk_compositor_render_hud(c, cmd,
-			    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
-			    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-			                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+			if (!frame_dropped) {
+				vk_compositor_render_hud(c, cmd,
+				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
+				    dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+			}
 
 			// A self-submitting DP (Leia CNSDK) ran its own internal
 			// render pass, whose finalLayout leaves the target in
@@ -4969,7 +5015,11 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 
 	// Present
 	xret = comp_vk_native_target_present(c->target, queue);
-	if (xret == XRT_SUCCESS) {
+	if (xret == XRT_SUCCESS && !frame_dropped) {
+		// #1394: a dropped frame IS presented (it is the only way to give the
+		// acquired image back) but never COUNTED. present_serial is the
+		// fence-park's drop-if-superseded key — bumping it here would let a
+		// parked fill mistake a recycled frame for a fresher one.
 		c->present_serial++; // #1264 S1: the fence-park's drop-if-superseded key
 	}
 
@@ -4983,7 +5033,10 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 */
 	comp_vk_deposit_probe_once(comp_vk_native_renderer_get_deposit(c->renderer), queue);
 
-	if (ftime && fp[1] != 0) {
+	// #1394: nothing from a dropped frame enters the timing history — a frame
+	// whose weave never reached the GPU would report an absurdly fast WEAVE
+	// stage and poison every stage's mean.
+	if (ftime && fp[1] != 0 && !frame_dropped) {
 		fp[6] = os_monotonic_get_ns();
 		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PRE, fp[0], fp[1]);
 		vk_frame_timing_add(&s_ftiming, VK_FSTAGE_PREFLUSH, fp[1], fp[2]);

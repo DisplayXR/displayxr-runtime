@@ -246,6 +246,56 @@ dxr_surface_lost_latch_enabled(void)
 }
 #endif
 
+/*!
+ * #1394: optional BOUND on vkAcquireNextImageKHR, in nanoseconds.
+ *
+ * Both acquires below pass UINT64_MAX, which is an unbounded wait taken on the
+ * weave thread while it holds c->mutex — the exact shape the workspace-stability
+ * rules exist to forbid. It is reachable whenever the acquire budget is
+ * exhausted, which is what a stranded swapchain image does (see the #1394 drop
+ * branch in vk_dp_weave_and_present; that path no longer strands one, and this
+ * is the belt for the braces).
+ *
+ * DEFAULT IS UNCHANGED — 0 means UINT64_MAX, i.e. today's behaviour on every
+ * platform. This is off by default on purpose: FIFO acquire legitimately blocks
+ * until a vsync frees an image, and much longer than that when the window is
+ * backgrounded or the device is dozing, so any finite value risks turning a
+ * normal stall into an error storm. Shipping it armed would be an unvalidated
+ * behaviour change on a hot path for Windows, macOS and Linux as well as
+ * Android. Same reasoning as #1397's off-by-default guard: the mechanism exists
+ * and is one setprop away for a hardware session that needs it.
+ *
+ *   adb shell setprop debug.dxr.vk_acquire_timeout_ms 1000
+ *   DXR_VK_ACQUIRE_TIMEOUT_MS=1000
+ */
+static uint64_t
+dxr_acquire_timeout_ns(void)
+{
+	static int64_t cached = -1;
+	if (cached < 0) {
+		long ms = 0;
+		const char *e = getenv("DXR_VK_ACQUIRE_TIMEOUT_MS");
+		if (e != NULL && e[0] != '\0') {
+			ms = strtol(e, NULL, 10);
+		}
+#ifdef XRT_OS_ANDROID
+		if (ms <= 0) {
+			char prop[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.vk_acquire_timeout_ms", prop) > 0) {
+				ms = strtol(prop, NULL, 10);
+			}
+		}
+#endif
+		cached = ms > 0 ? ms : 0;
+		if (cached > 0) {
+			U_LOG_W("#1394: vkAcquireNextImageKHR bounded at %ld ms (default is an "
+			        "unbounded wait; a timeout fails the frame)",
+			        (long)cached);
+		}
+	}
+	return cached > 0 ? (uint64_t)cached * 1000000ULL : UINT64_MAX;
+}
+
 // Desktop Linux (X11/XCB). Android also defines XRT_OS_LINUX but uses
 // VK_KHR_android_surface, so the XCB path is gated on "Linux AND NOT Android".
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
@@ -3064,7 +3114,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-	                                          UINT64_MAX, target->image_available,
+	                                          dxr_acquire_timeout_ns(), target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
@@ -3128,7 +3178,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 		// Retry acquire with new swapchain
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-		                                 UINT64_MAX, target->image_available,
+		                                 dxr_acquire_timeout_ns(), target->image_available,
 		                                 VK_NULL_HANDLE, &target->current_index);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
