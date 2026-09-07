@@ -200,7 +200,15 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	 * a relaunch) would otherwise inherit the previous window's answer and
 	 * apply it to a window it was never measured for. No event: the session
 	 * that would receive it is going away.
+	 *
+	 * Locked like every other writer (#1401 review). Session destroy runs this
+	 * BEFORE os_mutex_destroy, and an app is free to still be inside
+	 * xrWaitFrame on another thread when it calls xrDestroySession.
 	 */
+	const bool hint_locked = sess->android_hint_mutex_ready;
+	if (hint_locked) {
+		os_mutex_lock(&sess->android_hint_mutex);
+	}
 	sess->android_hint_active = false;
 	sess->android_hint_unknown_logged = false;
 	sess->android_hint_ignored_logged = false;
@@ -221,6 +229,9 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	sess->android_hint_coalesce_logged = false;
 	sess->android_hint_last_emit_ns = 0;
 	android_mini_window_reset();
+	if (hint_locked) {
+		os_mutex_unlock(&sess->android_hint_mutex);
+	}
 }
 
 /*
@@ -315,10 +326,23 @@ oxr_android_window_hint_commit(struct oxr_logger *log,
 void
 oxr_android_window_hint_flush(struct oxr_logger *log, struct oxr_session *sess)
 {
-	if (sess == NULL || !sess->android_hint_pending) {
+	if (sess == NULL || !sess->android_hint_mutex_ready) {
 		return;
 	}
-	if (os_monotonic_get_ns() - sess->android_hint_last_emit_ns < OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS) {
+	/*
+	 * Unlocked pre-check ONLY to keep the per-frame cost at one load: a stale
+	 * false just defers the flush by a frame, and a stale true is re-checked
+	 * under the lock below. Every actual read and write of the block happens
+	 * locked (#1401 review).
+	 */
+	if (!sess->android_hint_pending) {
+		return;
+	}
+
+	os_mutex_lock(&sess->android_hint_mutex);
+	if (!sess->android_hint_pending ||
+	    os_monotonic_get_ns() - sess->android_hint_last_emit_ns < OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS) {
+		os_mutex_unlock(&sess->android_hint_mutex);
 		return;
 	}
 	oxr_android_window_hint_commit(log, sess, sess->android_hint_pending_layout_w,
@@ -327,6 +351,7 @@ oxr_android_window_hint_flush(struct oxr_logger *log, struct oxr_session *sess)
 	                               sess->android_hint_pending_y, (uint32_t)sess->android_hint_pending_disp_w,
 	                               (uint32_t)sess->android_hint_pending_disp_h, sess->android_hint_pending_scale,
 	                               /* repeat */ true);
+	os_mutex_unlock(&sess->android_hint_mutex);
 }
 
 //! End the episode and tell the app to restore. No-op when no hint is active.
@@ -383,10 +408,18 @@ oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess, 
 void
 oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess)
 {
-	if (sess == NULL || !sess->android_hint_active) {
+	if (sess == NULL || !sess->sys->inst->extensions.DXR_android_surface_binding) {
 		return;
 	}
-	if (!sess->sys->inst->extensions.DXR_android_surface_binding) {
+	if (!sess->android_hint_mutex_ready) {
+		return;
+	}
+	// Locked: the five numbers below are one ANSWER, and re-delivering a
+	// half-updated one is the same mismatched-pair defect as a torn write
+	// (#1401 review).
+	os_mutex_lock(&sess->android_hint_mutex);
+	if (!sess->android_hint_active) {
+		os_mutex_unlock(&sess->android_hint_mutex);
 		return;
 	}
 	// A re-delivery is a lifecycle event (xrBeginSession, a surface republish),
@@ -395,19 +428,21 @@ oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess)
 	    log, sess, XR_TRUE, sess->android_hint_scale, sess->android_hint_layout_w, sess->android_hint_layout_h,
 	    sess->android_hint_buffer_w, sess->android_hint_buffer_h, sess->android_hint_x, sess->android_hint_y,
 	    /* repeat */ false);
+	os_mutex_unlock(&sess->android_hint_mutex);
 }
 
-void
-oxr_android_window_hint_update(struct oxr_logger *log,
-                               struct oxr_session *sess,
-                               int32_t x,
-                               int32_t y,
-                               uint32_t w,
-                               uint32_t h,
-                               uint32_t disp_w,
-                               uint32_t disp_h)
+//! The whole decision, run with @ref oxr_session::android_hint_mutex held.
+static void
+oxr_android_window_hint_update_locked(struct oxr_logger *log,
+                                      struct oxr_session *sess,
+                                      int32_t x,
+                                      int32_t y,
+                                      uint32_t w,
+                                      uint32_t h,
+                                      uint32_t disp_w,
+                                      uint32_t disp_h)
 {
-	if (sess == NULL || w == 0 || h == 0) {
+	if (w == 0 || h == 0) {
 		return;
 	}
 	if (disp_w == 0 || disp_h == 0) {
@@ -591,6 +626,39 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 	oxr_android_window_hint_commit(log, sess, hint.layout_w, hint.layout_h, hint.buffer_w, hint.buffer_h, x, y,
 	                               disp_w, disp_h, hint.scale,
 	                               /* repeat */ sess->android_hint_active);
+}
+
+void
+oxr_android_window_hint_update(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               int32_t x,
+                               int32_t y,
+                               uint32_t w,
+                               uint32_t h,
+                               uint32_t disp_w,
+                               uint32_t disp_h)
+{
+	if (sess == NULL || !sess->android_hint_mutex_ready) {
+		return;
+	}
+	/*
+	 * One lock around the WHOLE decision, not around each field (#1401 review).
+	 * The block is a single answer — scale, layout pair, buffer pair, the panel
+	 * it was derived against, and the memo of the episode that just ended — and
+	 * every one of the early returns inside leaves a specific combination of
+	 * them standing. Locking per field would let the flush on the render thread
+	 * observe a half-applied transition, which is precisely the mismatched
+	 * layout/buffer pair this exists to prevent.
+	 *
+	 * The JNI probe inside runs under this lock. That is deliberate: it resolves
+	 * once per episode and must not race a concurrent reset, and the Java side
+	 * takes its own monitor anyway. Nothing reachable from in here takes this
+	 * mutex, so the order (hint -> Java monitor -> instance event lock) is
+	 * one-way.
+	 */
+	os_mutex_lock(&sess->android_hint_mutex);
+	oxr_android_window_hint_update_locked(log, sess, x, y, w, h, disp_w, disp_h);
+	os_mutex_unlock(&sess->android_hint_mutex);
 }
 
 XrResult

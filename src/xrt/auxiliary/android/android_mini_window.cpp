@@ -203,9 +203,12 @@ android_mini_window_compute_hint(int32_t x,
 	}
 	Bridge &b = bridge();
 
-	jobject activity = (jobject)android_globals_get_activity();
+	// PINNED, not borrowed: this runs on the app's geometry thread while the UI
+	// thread may be retiring the Activity through a #1392 relaunch (#1401 review).
+	jobject activity = (jobject)android_globals_acquire_activity(env);
 	jobject result = env->CallStaticObjectMethod(b.clazz, b.compute, activity, (jint)x, (jint)y, (jint)w, (jint)h,
 	                                             (jint)disp_w, (jint)disp_h);
+	android_globals_release_activity(env, activity);
 	if (env->ExceptionCheck()) {
 		env->ExceptionClear();
 		return false;
@@ -243,8 +246,9 @@ android_mini_window_still_scalable(void)
 	if (env == nullptr || !resolve(env) || b.scalable == nullptr) {
 		return true; // never end a hint on ignorance
 	}
-	jobject activity = (jobject)android_globals_get_activity();
+	jobject activity = (jobject)android_globals_acquire_activity(env);
 	jboolean ret = env->CallStaticBooleanMethod(b.clazz, b.scalable, activity);
+	android_globals_release_activity(env, activity);
 	if (env->ExceptionCheck()) {
 		env->ExceptionClear();
 		return true;

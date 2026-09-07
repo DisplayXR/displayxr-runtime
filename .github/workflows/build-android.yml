@@ -379,15 +379,21 @@ jobs:
       # the OEM container scale for itself. That makes a Java class an ABI: a
       # rename, a signature change, or turning minification on compiles clean,
       # ships, and breaks a shipped browser at run time with no signal on either
-      # side. Asserted here, against the RELEASE APK's DEX — a debug APK never
-      # minifies, so checking that one would prove nothing about what ships.
+      # side. Asserted here against the RELEASE APK's DEX.
+      #
+      # SCOPE, precisely: openxr_android/build.gradle sets `minifyEnabled false`
+      # on release, so TODAY this is a source-RENAME / signature / access-flag
+      # detector, not proof that the contract survives minification — there is
+      # no minification to survive. It becomes the latter the moment anyone
+      # flips that switch, which is exactly when the -keep rule starts carrying
+      # weight and when a silent break would otherwise ship.
       - name: Assert the MiniWindowLayout cross-APK contract (${{ matrix.variant }})
         if: steps.build.outcome == 'success'
         run: |
           set -euo pipefail
           APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
           chmod +x scripts/check_mini_window_contract.sh
-          ./scripts/check_mini_window_contract.sh "$APK"
+          ./scripts/check_mini_window_contract.sh --require-dexdump "$APK"
 
       - name: Inspect APK contents (${{ matrix.variant }})
         if: steps.build.outcome == 'success'
