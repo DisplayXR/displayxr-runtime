@@ -9,6 +9,7 @@
 
 #include "android_lifecycle_callbacks.h"
 
+#include "android_globals.h"
 #include "android_load_class.hpp"
 #include "org.freedesktop.monado.auxiliary.hpp"
 
@@ -41,9 +42,28 @@ android_lifecycle_callbacks_invoke(struct android_lifecycle_callbacks *alc, enum
  * JNI functions
  */
 
+/*!
+ * Keep `android_globals`' Activity live (#1401).
+ *
+ * The existing callbacks all gate on `IsSameObject(activity, context)` — the
+ * Activity captured at instance creation — which is precisely what a #1392
+ * freeform RELAUNCH invalidates: the process survives, the Activity instance does
+ * not, and the new one is a different object, so every one of those gates goes
+ * quietly false forever. This tracker deliberately does NOT gate: "the most
+ * recently created/started/resumed Activity in this process" is the standard
+ * definition of the current one, and it is the one a container-scale probe has
+ * to reflect on.
+ */
+static void
+track_current_activity(jobject activity)
+{
+	android_globals_set_current_activity((void *)activity);
+}
+
 static void
 on_activity_created(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobject activity)
 {
+	track_current_activity(activity);
 	auto *alc = reinterpret_cast<android_lifecycle_callbacks *>(native_callback_ptr);
 	if (env->IsSameObject(activity, (jobject)xrt_instance_android_get_context(alc->instance_android))) {
 		android_lifecycle_callbacks_invoke(alc, XRT_ANDROID_LIVECYCLE_EVENT_ON_CREATE);
@@ -53,6 +73,7 @@ on_activity_created(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobjec
 static void
 on_activity_started(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobject activity)
 {
+	track_current_activity(activity);
 	auto *alc = reinterpret_cast<android_lifecycle_callbacks *>(native_callback_ptr);
 	if (env->IsSameObject(activity, (jobject)xrt_instance_android_get_context(alc->instance_android))) {
 		android_lifecycle_callbacks_invoke(alc, XRT_ANDROID_LIVECYCLE_EVENT_ON_START);
@@ -62,6 +83,7 @@ on_activity_started(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobjec
 static void
 on_activity_resumed(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobject activity)
 {
+	track_current_activity(activity);
 	auto *alc = reinterpret_cast<android_lifecycle_callbacks *>(native_callback_ptr);
 	if (env->IsSameObject(activity, (jobject)xrt_instance_android_get_context(alc->instance_android))) {
 		android_lifecycle_callbacks_invoke(alc, XRT_ANDROID_LIVECYCLE_EVENT_ON_RESUME);
@@ -93,6 +115,16 @@ on_activity_save_instance_state(JNIEnv *env, jobject thiz, jlong native_callback
 static void
 on_activity_destroyed(JNIEnv *env, jobject thiz, jlong native_callback_ptr, jobject activity)
 {
+	/*
+	 * Only drop the tracked Activity when the one being destroyed IS it —
+	 * another Activity of the same process finishing must not take the live one
+	 * down. Readers then fall back to the Activity captured at instance
+	 * creation, i.e. exactly the pre-#1401 behaviour, until the relaunched one
+	 * is created a moment later.
+	 */
+	if (env->IsSameObject(activity, (jobject)android_globals_get_activity())) {
+		android_globals_set_current_activity(nullptr);
+	}
 	auto *alc = reinterpret_cast<android_lifecycle_callbacks *>(native_callback_ptr);
 	if (env->IsSameObject(activity, (jobject)xrt_instance_android_get_context(alc->instance_android))) {
 		android_lifecycle_callbacks_invoke(alc, XRT_ANDROID_LIVECYCLE_EVENT_ON_DESTROY);

@@ -50,6 +50,7 @@
 
 #include "android/android_globals.h"
 #include "android/android_mini_window.h"
+#include "android/android_mini_window_tell.h"
 
 /*!
  * Resolve a binding struct to an ANativeWindow the caller may keep.
@@ -216,6 +217,9 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	sess->android_hint_prev_armed_ns = 0;
 	sess->android_hint_prev_refused_logged = false;
 	sess->android_hint_scale = 0.0f;
+	sess->android_hint_pending = false;
+	sess->android_hint_coalesce_logged = false;
+	sess->android_hint_last_emit_ns = 0;
 	android_mini_window_reset();
 }
 
@@ -252,6 +256,78 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
  * an unbounded time. A clock cannot.
  */
 #define OXR_ANDROID_PREV_LAYOUT_GRACE_NS (1000 * 1000 * 1000ULL)
+
+/*!
+ * Floor on the interval between two hint events INSIDE one episode (#1401).
+ *
+ * Only recomputes are throttled — the first answer of an episode is always
+ * emitted at once, because that is the container transition and it is what
+ * unblocks the weave. 100 ms is chosen to be longer than a drag's frame period
+ * (so an intermediate size is dropped rather than resizing the app's buffer)
+ * and far shorter than a human's reaction to the size they settled on.
+ *
+ * NEVER a drop: a throttled answer is stored and delivered by
+ * @ref oxr_android_window_hint_flush from the frame loop. A container this is
+ * reachable on has not been seen — the NP02J's mini-window is a fixed nominal
+ * placement — so this is a bound on a class of behaviour, not a tuned constant.
+ */
+#define OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS (100 * 1000 * 1000ULL)
+
+/*!
+ * Latch an answer into the session and push it (#1401).
+ *
+ * @p repeat is "this is a recompute inside an episode, not the transition into
+ * one" — it only picks the log tier; the event is identical either way.
+ */
+static void
+oxr_android_window_hint_commit(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               int32_t layout_w,
+                               int32_t layout_h,
+                               int32_t buffer_w,
+                               int32_t buffer_h,
+                               int32_t x,
+                               int32_t y,
+                               uint32_t disp_w,
+                               uint32_t disp_h,
+                               float scale,
+                               bool repeat)
+{
+	sess->android_hint_active = true;
+	sess->android_hint_ignored_logged = false;
+	sess->android_hint_layout_w = layout_w;
+	sess->android_hint_layout_h = layout_h;
+	sess->android_hint_buffer_w = buffer_w;
+	sess->android_hint_buffer_h = buffer_h;
+	sess->android_hint_x = x;
+	sess->android_hint_y = y;
+	sess->android_hint_disp_w = (int32_t)disp_w;
+	sess->android_hint_disp_h = (int32_t)disp_h;
+	sess->android_hint_scale = scale;
+
+	sess->android_hint_pending = false;
+	sess->android_hint_last_emit_ns = os_monotonic_get_ns();
+
+	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_TRUE, scale, layout_w, layout_h, buffer_w,
+	                                                  buffer_h, x, y, repeat);
+}
+
+void
+oxr_android_window_hint_flush(struct oxr_logger *log, struct oxr_session *sess)
+{
+	if (sess == NULL || !sess->android_hint_pending) {
+		return;
+	}
+	if (os_monotonic_get_ns() - sess->android_hint_last_emit_ns < OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS) {
+		return;
+	}
+	oxr_android_window_hint_commit(log, sess, sess->android_hint_pending_layout_w,
+	                               sess->android_hint_pending_layout_h, sess->android_hint_pending_buffer_w,
+	                               sess->android_hint_pending_buffer_h, sess->android_hint_pending_x,
+	                               sess->android_hint_pending_y, (uint32_t)sess->android_hint_pending_disp_w,
+	                               (uint32_t)sess->android_hint_pending_disp_h, sess->android_hint_pending_scale,
+	                               /* repeat */ true);
+}
 
 //! End the episode and tell the app to restore. No-op when no hint is active.
 static void
@@ -294,8 +370,14 @@ oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess, 
 	sess->android_hint_disp_w = 0;
 	sess->android_hint_disp_h = 0;
 	sess->android_hint_scale = 0.0f;
+	// A coalesced answer belongs to the episode that is ending; delivering it
+	// after the OFF would tell the app to shrink a window that just restored.
+	sess->android_hint_pending = false;
+	sess->android_hint_coalesce_logged = false;
 	android_mini_window_reset();
-	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_FALSE, 0.0f, 0, 0, 0, 0, 0, 0);
+	sess->android_hint_last_emit_ns = os_monotonic_get_ns();
+	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_FALSE, 0.0f, 0, 0, 0, 0, 0, 0,
+	                                                  /* repeat */ false);
 }
 
 void
@@ -307,9 +389,12 @@ oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess)
 	if (!sess->sys->inst->extensions.DXR_android_surface_binding) {
 		return;
 	}
+	// A re-delivery is a lifecycle event (xrBeginSession, a surface republish),
+	// not a recompute — it keeps the WARN tier.
 	oxr_event_push_XrEventDataAndroidWindowLayoutHint(
 	    log, sess, XR_TRUE, sess->android_hint_scale, sess->android_hint_layout_w, sess->android_hint_layout_h,
-	    sess->android_hint_buffer_w, sess->android_hint_buffer_h, sess->android_hint_x, sess->android_hint_y);
+	    sess->android_hint_buffer_w, sess->android_hint_buffer_h, sess->android_hint_x, sess->android_hint_y,
+	    /* repeat */ false);
 }
 
 void
@@ -375,8 +460,9 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 		}
 	}
 
-	const bool tell =
-	    x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
+	// ONE definition, shared with vk_android_update_container_scaled and pinned
+	// against MiniWindowLayout.isTell by tests_aux_mini_window_tell (#1401).
+	const bool tell = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
 
 	if (!tell) {
 		oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
@@ -465,20 +551,46 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 		return;
 	}
 
-	sess->android_hint_active = true;
-	sess->android_hint_ignored_logged = false;
-	sess->android_hint_layout_w = hint.layout_w;
-	sess->android_hint_layout_h = hint.layout_h;
-	sess->android_hint_buffer_w = hint.buffer_w;
-	sess->android_hint_buffer_h = hint.buffer_h;
-	sess->android_hint_x = x;
-	sess->android_hint_y = y;
-	sess->android_hint_disp_w = (int32_t)disp_w;
-	sess->android_hint_disp_h = (int32_t)disp_h;
-	sess->android_hint_scale = hint.scale;
+	/*
+	 * #1401: throttle RECOMPUTES, never the transition.
+	 *
+	 * The first answer of an episode is the container transition — it is what
+	 * takes the window off the 2D fallback, and delaying it would be visible.
+	 * A later, DIFFERENT answer is a resize of a container that can be resized;
+	 * on such a device every intermediate size of a drag would otherwise cost
+	 * the app a buffer reallocation and put a WARN in the log. Hold it instead,
+	 * and let the frame loop deliver whatever the gesture settled on
+	 * (@ref oxr_android_window_hint_flush) — a coalesced answer is delayed,
+	 * never dropped.
+	 */
+	if (sess->android_hint_active) {
+		const uint64_t now = os_monotonic_get_ns();
+		if (now - sess->android_hint_last_emit_ns < OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS) {
+			sess->android_hint_pending = true;
+			sess->android_hint_pending_layout_w = hint.layout_w;
+			sess->android_hint_pending_layout_h = hint.layout_h;
+			sess->android_hint_pending_buffer_w = hint.buffer_w;
+			sess->android_hint_pending_buffer_h = hint.buffer_h;
+			sess->android_hint_pending_x = x;
+			sess->android_hint_pending_y = y;
+			sess->android_hint_pending_disp_w = (int32_t)disp_w;
+			sess->android_hint_pending_disp_h = (int32_t)disp_h;
+			sess->android_hint_pending_scale = hint.scale;
+			if (!sess->android_hint_coalesce_logged) {
+				sess->android_hint_coalesce_logged = true;
+				U_LOG_W(
+				    "XR_DXR_android_surface_binding: the container is answering a new size "
+				    "faster than %u ms — coalescing layout hints for this episode, further "
+				    "recomputes log at INFO (#1401)",
+				    (unsigned)(OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS / (1000 * 1000)));
+			}
+			return;
+		}
+	}
 
-	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_TRUE, hint.scale, hint.layout_w, hint.layout_h,
-	                                                  hint.buffer_w, hint.buffer_h, x, y);
+	oxr_android_window_hint_commit(log, sess, hint.layout_w, hint.layout_h, hint.buffer_w, hint.buffer_h, x, y,
+	                               disp_w, disp_h, hint.scale,
+	                               /* repeat */ sess->android_hint_active);
 }
 
 XrResult

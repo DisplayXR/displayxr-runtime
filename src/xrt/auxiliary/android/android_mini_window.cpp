@@ -13,6 +13,7 @@
 
 #include "xrt/xrt_config_android.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include "wrap/android.app.h"
 
@@ -34,13 +35,30 @@ enum
 	HINT_LEN = 6,
 };
 
+/*!
+ * How long to wait before re-attempting a class lookup that failed (#1401).
+ *
+ * Same shape and the same reasoning as `MiniWindowLayout.VENDOR_RETRY_MS`: don't
+ * re-reflect on every published rect while it keeps failing, but never let ONE
+ * failure be final.
+ */
+constexpr uint64_t RESOLVE_RETRY_NS = 500 * 1000 * 1000ULL;
+
 struct Bridge
 {
-	bool tried = false;     //!< resolved (or failed) once per process
+	//! Resolved. THE SUCCESS is cached, not the attempt (#1401).
 	jclass clazz = nullptr; //!< global ref
 	jmethodID compute = nullptr;
 	jmethodID reset = nullptr;
 	jmethodID scalable = nullptr;
+
+	//! Monotonic ns of the last FAILED attempt; 0 = never tried.
+	uint64_t last_fail_ns = 0;
+	//! One WARN per distinct failure episode, not one per retry.
+	bool fail_logged = false;
+	//! Hard stop: the aux AAR is too old to have the method. Retrying that
+	//! cannot change the answer within the life of the process.
+	bool unsupported = false;
 };
 
 Bridge &
@@ -50,69 +68,107 @@ bridge()
 	return b;
 }
 
+//! Note a failed attempt so the next one backs off, and WARN at most once per episode.
+bool
+resolve_failed(const char *why)
+{
+	Bridge &b = bridge();
+	b.last_fail_ns = os_monotonic_get_ns();
+	if (b.last_fail_ns == 0) {
+		b.last_fail_ns = 1; // 0 means "never tried"
+	}
+	if (!b.fail_logged) {
+		b.fail_logged = true;
+		U_LOG_W(
+		    "android_mini_window: %s — mini-window layout hints unavailable for now, retrying "
+		    "every %u ms (#1396/#1401)",
+		    why, (unsigned)(RESOLVE_RETRY_NS / (1000 * 1000)));
+	}
+	return false;
+}
+
 /*!
  * The runtime .so is dlopen'ed by the OpenXR loader, so ART's `FindClass` on a
  * native thread resolves against the SYSTEM classloader and would never see
  * `MiniWindowLayout`. Same dance as android_custom_surface: go through the
  * runtime APK's own DexClassLoader.
+ *
+ * CACHES THE SUCCESS, NOT THE ATTEMPT (#1401). Every input this depends on can
+ * be transiently absent — the Context is stored during instance creation, the
+ * runtime APK's DexClassLoader is built lazily, JNI can throw — and caching the
+ * attempt turned any one of those into a permanent, silent loss of the feature
+ * for the life of the process, with a single WARN at the moment it happened. The
+ * one thing that IS cached as final is an aux AAR without the method: that is a
+ * mismatched install, and no amount of retrying changes it.
  */
 bool
 resolve(JNIEnv *env)
 {
 	Bridge &b = bridge();
-	if (b.tried) {
-		return b.clazz != nullptr;
+	if (b.clazz != nullptr) {
+		return true; // resolved; nothing below can un-resolve it
 	}
-	b.tried = true;
+	if (b.unsupported) {
+		return false;
+	}
+	if (b.last_fail_ns != 0 && os_monotonic_get_ns() - b.last_fail_ns < RESOLVE_RETRY_NS) {
+		return false; // backing off
+	}
 
 	void *context = android_globals_get_context();
 	if (context == nullptr) {
-		U_LOG_W("android_mini_window: no Android Context — mini-window layout hints disabled (#1396)");
-		return false;
+		return resolve_failed("no Android Context yet");
 	}
 
+	jclass global = nullptr;
 	try {
 		jni::init((JavaVM *)android_globals_get_vm());
 		auto loaded =
 		    loadClassFromRuntimeApk((jobject)context, "org.freedesktop.monado.auxiliary.MiniWindowLayout");
 		if (loaded.isNull()) {
-			U_LOG_W(
-			    "android_mini_window: could not load MiniWindowLayout from '%s' — "
-			    "mini-window layout hints disabled (#1396)",
-			    XRT_ANDROID_PACKAGE);
-			return false;
+			return resolve_failed("could not load MiniWindowLayout from " XRT_ANDROID_PACKAGE);
 		}
 		jclass local = (jclass)loaded.object().getHandle();
-		b.clazz = (jclass)env->NewGlobalRef(local);
+		global = (jclass)env->NewGlobalRef(local);
 	} catch (std::exception const &e) {
-		U_LOG_W("android_mini_window: MiniWindowLayout lookup threw (%s) — hints disabled (#1396)", e.what());
-		return false;
+		U_LOG_W("android_mini_window: MiniWindowLayout lookup threw (%s) (#1396)", e.what());
+		return resolve_failed("MiniWindowLayout lookup threw");
 	}
-	if (b.clazz == nullptr) {
-		return false;
+	if (global == nullptr) {
+		return resolve_failed("NewGlobalRef on MiniWindowLayout failed");
 	}
 
-	b.compute = env->GetStaticMethodID(b.clazz, "computeHintForActivity", "(Ljava/lang/Object;IIIIII)[I");
-	if (b.compute == nullptr) {
+	jmethodID compute = env->GetStaticMethodID(global, "computeHintForActivity", "(Ljava/lang/Object;IIIIII)[I");
+	if (compute == nullptr) {
 		env->ExceptionClear();
 	}
-	b.reset = env->GetStaticMethodID(b.clazz, "resetForActivity", "()V");
-	if (b.reset == nullptr) {
+	jmethodID reset = env->GetStaticMethodID(global, "resetForActivity", "()V");
+	if (reset == nullptr) {
 		env->ExceptionClear();
 	}
-	b.scalable = env->GetStaticMethodID(b.clazz, "isInScalableContainer", "(Ljava/lang/Object;)Z");
-	if (b.scalable == nullptr) {
+	jmethodID scalable = env->GetStaticMethodID(global, "isInScalableContainer", "(Ljava/lang/Object;)Z");
+	if (scalable == nullptr) {
 		env->ExceptionClear();
 	}
-	if (b.compute == nullptr) {
+	if (compute == nullptr) {
 		// An older aux AAR without the method (mismatched runtime install).
+		// Final, unlike everything else above.
 		U_LOG_W(
 		    "android_mini_window: MiniWindowLayout.computeHintForActivity missing — "
 		    "mini-window layout hints disabled (#1396)");
-		env->DeleteGlobalRef(b.clazz);
-		b.clazz = nullptr;
+		env->DeleteGlobalRef(global);
+		b.unsupported = true;
 		return false;
 	}
+
+	// Publish only once everything is in hand, so a partially-resolved bridge
+	// is never observable.
+	b.compute = compute;
+	b.reset = reset;
+	b.scalable = scalable;
+	b.clazz = global;
+	b.last_fail_ns = 0;
+	b.fail_logged = false;
 	return true;
 }
 
@@ -200,6 +256,15 @@ extern "C" void
 android_mini_window_reset(void)
 {
 	Bridge &b = bridge();
+	/*
+	 * A container transition is the one moment worth spending a lookup on
+	 * regardless of the backoff — it is exactly when the feature is about to be
+	 * needed again, and by then whatever was transiently missing (the Context,
+	 * the DexClassLoader) has had a whole episode to appear. Re-arm the WARN
+	 * with it so a failure that comes back is not silent (#1401).
+	 */
+	b.last_fail_ns = 0;
+	b.fail_logged = false;
 	if (b.clazz == nullptr || b.reset == nullptr) {
 		return;
 	}

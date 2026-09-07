@@ -32,6 +32,7 @@ set(tests
     tests_aux_rear_budget
     tests_aux_route_policy
     tests_aux_overlay_lease
+    tests_aux_mini_window_tell
     tests_comp_rear_budget
 	)
 if(XRT_HAVE_D3D11)
@@ -121,6 +122,21 @@ target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/sr
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
 target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
+
+# #1401 -- the OEM container-scaled tell. The C copy is a header of pure integer
+# arithmetic (deliberately NOT gated on XRT_OS_ANDROID, so it is testable here);
+# the fourth copy lives in the aux AAR and cannot be linked, so the test READS
+# the Java source and evaluates its expression. PROJECT_SOURCE_DIR, not
+# CMAKE_SOURCE_DIR: the vendor plug-in's signing recipe builds this runtime as a
+# sub-project, and a path resolved against the wrong root is a hard error there.
+target_include_directories(
+	tests_aux_mini_window_tell PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_compile_definitions(
+	tests_aux_mini_window_tell
+	PRIVATE
+		"DXR_MINI_WINDOW_LAYOUT_JAVA=\"${PROJECT_SOURCE_DIR}/src/xrt/auxiliary/android/src/main/java/org/freedesktop/monado/auxiliary/MiniWindowLayout.java\""
+	)
 
 # XR_DXR_depth_budget (#1364) -- the per-session runner every native compositor
 # drives. Compiled straight into the unit rather than linked from comp_util,

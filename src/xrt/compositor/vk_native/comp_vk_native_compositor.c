@@ -107,6 +107,8 @@
 // android_globals (XR_DXR_android_surface_binding); we consume it for both the
 // DP weave phase and the per-window Kooima canvas.
 #include "android/android_globals.h"
+// #1401: the container-scaled tell itself, shared with the state tracker.
+#include "android/android_mini_window_tell.h"
 #endif
 
 // Direct-scanout present path (ST-5539). Only compiled when the bundle carries
@@ -3621,8 +3623,9 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 		return;
 	}
 
-	const bool scaled =
-	    x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
+	// ONE definition, shared with oxr_android_surface.c and pinned against the
+	// Java copy by tests_aux_mini_window_tell (#1401).
+	const bool scaled = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
 	if (scaled == c->android_container_scaled) {
 		return;
 	}

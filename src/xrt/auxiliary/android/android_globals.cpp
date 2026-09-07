@@ -48,6 +48,25 @@ static struct
 	void *custom_surface = nullptr;
 } android_surface;
 
+/*!
+ * The app's CURRENT Activity (#1401), fed by the lifecycle callbacks.
+ *
+ * Separate from the (unlocked) legacy globals above and separately locked,
+ * because it is WRITTEN from the Java UI thread on every activity transition and
+ * READ from whichever native thread wants an Activity — the geometry channel,
+ * the plug-in loader, session creation.
+ *
+ * A GLOBAL ref, unlike @ref android_globals.activity: this one outlives the JNI
+ * call that supplied it by construction, so it has to own a reference. Exactly
+ * one Activity is pinned at a time, and only while it is the live one — the
+ * destroy callback clears it.
+ */
+static struct
+{
+	std::mutex mutex;
+	jobject activity = nullptr;
+} android_current_activity;
+
 void
 android_globals_store_vm_and_activity(struct _JavaVM *vm, void *activity)
 {
@@ -227,9 +246,48 @@ android_globals_get_vm()
 	return android_globals.vm;
 }
 
+void
+android_globals_set_current_activity(void *activity)
+{
+	JavaVM *vm = (JavaVM *)android_globals.vm;
+	if (vm == nullptr) {
+		return;
+	}
+	JNIEnv *env = nullptr;
+	if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK || env == nullptr) {
+		// Only ever called from a Java lifecycle callback, i.e. already on an
+		// attached thread. Attaching one here would leave it attached.
+		return;
+	}
+
+	jobject fresh = nullptr;
+	if (activity != nullptr) {
+		fresh = env->NewGlobalRef((jobject)activity);
+		if (fresh == nullptr) {
+			return; // OOM; keep whatever we had rather than losing it
+		}
+	}
+
+	jobject stale = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(android_current_activity.mutex);
+		stale = android_current_activity.activity;
+		android_current_activity.activity = fresh;
+	}
+	if (stale != nullptr) {
+		env->DeleteGlobalRef(stale);
+	}
+}
+
 void *
 android_globals_get_activity()
 {
+	{
+		std::lock_guard<std::mutex> lock(android_current_activity.mutex);
+		if (android_current_activity.activity != nullptr) {
+			return android_current_activity.activity;
+		}
+	}
 	return android_globals.activity.getHandle();
 }
 

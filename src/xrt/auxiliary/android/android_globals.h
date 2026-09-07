@@ -51,7 +51,37 @@ struct _JavaVM *
 android_globals_get_vm(void);
 
 /*!
- * Retrieve the android.app.Activity jobject previously stored, if any.
+ * Publish the app's CURRENT android.app.Activity (#1401).
+ *
+ * The activity stored at instance creation is captured once, from
+ * `XrInstanceCreateInfoAndroidKHR::applicationActivity`. Since #1392 an app
+ * SURVIVES the freeform relaunch, so the process now outlives the Activity
+ * instance that was captured — and everything downstream
+ * (`MiniWindowLayout.computeHintForActivity` / `isInScalableContainer`, the
+ * plug-in loader's activity hand-off) would then be reflecting on a DESTROYED
+ * Activity. Best case a probe returns null and the feature silently stops; worst
+ * case `getTaskId()` / `isInMultiWindowMode()` answer for the dead instance and
+ * the container decision is simply wrong.
+ *
+ * So the lifecycle callbacks push the live one here and every reader of
+ * @ref android_globals_get_activity is covered at once, rather than each caller
+ * growing its own freshness rule.
+ *
+ * The globals take a GLOBAL REF on @p activity and drop the one they held. Pass
+ * NULL from `onActivityDestroyed` for the Activity that is current: the reader
+ * then falls back to the captured one, which is exactly the pre-#1401 behaviour
+ * — never worse — and the destroyed instance is not pinned.
+ *
+ * Safe to call from any thread.
+ */
+void
+android_globals_set_current_activity(void *activity);
+
+/*!
+ * Retrieve the android.app.Activity jobject to use, if any.
+ *
+ * The most recent one published by @ref android_globals_set_current_activity
+ * when there is one, else the one captured at instance creation.
  *
  * For usage, cast the return value to jobject - a typedef whose definition
  * differs between C (a void *) and C++ (a pointer to an empty class)
