@@ -1346,26 +1346,39 @@ a slogan:
 - **Per panel, static** (all of it already exists in the served panel
   calibration today): panel resolution and pixel pitch, the panel's natural
   orientation, the lens geometry (lens pitch in pixels, slant, view count, the
-  distance-over-pitch term and the centre phase), the correction maps and
-  polynomials when present, the RGB sub-pixel shifts, and gamma.
+  distance-over-pitch term, the centre phase and the lens material's
+  refractive index), the correction maps and polynomials when present, the RGB
+  sub-pixel shifts (applied at the integer panel pixel), the per-panel
+  crosstalk-compensation kernel and its coefficients (part of the woven
+  *output* — a weave without it ships visibly more crosstalk), the
+  view-boundary softening parameter, and gamma.
 - **Per window, per composite:** the app's **unwoven** multi-view atlas (this
   replaces the woven buffer as the app's output, so the atlas format — tile
   layout, view count, view order — becomes a defined contract instead of an
   implicit agreement between an app and its own interlacer); the composited
   **on-screen rect in panel pixels** (the quantity S9 asks for, now on the
   correct side of the boundary, because the compositor knows it and the app
-  never can); and the current display rotation relative to the natural
-  orientation.
-- **Per frame, at scanout:** the viewer's eye position in panel-relative
-  millimetres, **predicted to the scanout instant**. This moves prediction from
+  never can); the current display rotation relative to the natural
+  orientation; the app's per-content stereo controls (reconvergence amount and
+  zoom — the atlas alone is not the whole app contribution); a per-window
+  **"render this window 2D now"** flag (this is how the weave renders flat when
+  there is no face; without it the no-face behaviour is lost — essential);
+  and the window's blend alpha.
+- **Per frame, at scanout:** **both** eye positions (or centre plus
+  inter-pupillary distance) in panel-relative millimetres, **predicted to the
+  scanout instant**, with the non-predicted pair also available (it drives the
+  no-face range check and the look-around path). This moves prediction from
   "the app must guess when its frame will show" to "the compositor knows when it
   is showing", which removes a whole class of fixed-latency error — but it means
   the face-tracking service must be reachable by the display service at
   scanout, or the app must forward a timestamped predicted eye position.
 
 The interlacer's mapping is then buffer pixel → unit coordinates → the on-screen
-rect → floor to an integer panel pixel → phase from that pixel, the lens
-geometry and the viewer distance. Because the panel pixel is computed from the
+rect → floor to an integer panel pixel → the RGB sub-pixel shifts at that pixel
+→ phase from that pixel, the lens geometry and the viewer distance. (Camera
+intrinsics are read only in the vendor's calibration mode and are not part of
+this contract.) This list was diffed against the vendor interlacer's actual
+shader inputs on 2026-09-07; nothing in it is decorative. Because the panel pixel is computed from the
 *final* composited position, every window transform — scale, move, animation —
 is correct by construction, which is exactly what no in-app weave can offer.
 
@@ -1397,6 +1410,23 @@ adb shell dumpsys SurfaceFlinger | grep -A10 'displayxr.*overlay' | grep -iE 'al
 ```
 
 ---
+
+### R6/S9 addendum — the cheapest fix may be one OEM configuration line
+
+Found 2026-09-07 on the reference device (read-only): the OEM's mini-window
+subsystem is governed by a world-readable configuration file in the system
+image that already carries a **per-package exclusion list** — some two dozen
+games are listed, exactly the class of app that renders wrong when resampled
+— alongside allow-lists, and other builds of the same OEM software expose the
+*scale* itself as a distinct vendor feature flag. So the platform owner already
+has, and already uses, a mechanism for "do not put this app in the scaled
+window". **Ask, ahead of S9:** add the 3D runtime's clients (the DisplayXR
+packages and the browser) to that exclusion, or expose the exclusion as a
+manifest property so a 3D app can declare it. What the exclusion does to a
+listed app — fullscreen-only, or simply ineligible for the scaled recents
+window — must be confirmed with the OEM; either satisfies R6. Zero code on
+either side; it only needs to be agreed. (Named file and list: internal
+engagement notes.)
 
 ### S9 — Expose the container scale and the composited on-screen rect
 
