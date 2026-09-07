@@ -687,6 +687,21 @@ struct multi_compositor
 		VkFramebuffer out_fb;
 		void *out_ahb; //!< AHardwareBuffer * the runtime allocated + bound.
 		uint32_t out_w, out_h;
+		/*!
+		 * #1387 defect 3: the layout `out_image` is ACTUALLY left in when a
+		 * weave command buffer retires — the single authority every later
+		 * consumer's `oldLayout` must come from.
+		 *
+		 * The weave records COLOR_ATTACHMENT_OPTIMAL for the render pass and
+		 * then GENERAL for the caller's cross-process read, so it retires in
+		 * GENERAL; the satellite present that runs after the fence used to
+		 * hard-code COLOR_ATTACHMENT_OPTIMAL as its `oldLayout`, which is
+		 * undefined per the Vulkan spec (a mismatched oldLayout that is not
+		 * UNDEFINED means the contents become undefined) and worked only by
+		 * accident of the driver. Zero-init = VK_IMAGE_LAYOUT_UNDEFINED, which
+		 * is the correct state for a freshly imported image.
+		 */
+		VkImageLayout out_layout;
 		//! @}
 
 		//! @name v4 DP-composited 2D overlay atlas (browser#18)
