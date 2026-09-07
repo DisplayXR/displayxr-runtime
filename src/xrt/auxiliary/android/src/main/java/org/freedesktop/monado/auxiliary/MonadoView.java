@@ -15,7 +15,6 @@ import android.content.Context;
 import android.os.Bundle;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
-import android.graphics.Rect;
 import android.graphics.Region;
 import android.hardware.display.DisplayManager;
 import android.os.Build;

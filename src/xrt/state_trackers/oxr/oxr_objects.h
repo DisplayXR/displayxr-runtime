@@ -2493,6 +2493,9 @@ struct oxr_session
 	int32_t android_hint_layout_w, android_hint_layout_h;
 	int32_t android_hint_buffer_w, android_hint_buffer_h;
 	int32_t android_hint_x, android_hint_y;
+	//! Panel extent the hint was computed in. A rotation mid-episode changes
+	//! the frame the whole answer lives in, so it ends the episode (#1396).
+	int32_t android_hint_disp_w, android_hint_disp_h;
 	float android_hint_scale;
 #endif
 

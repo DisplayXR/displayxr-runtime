@@ -23,9 +23,9 @@ import androidx.annotation.Nullable;
  * <p>The OEM's "window reply" mini-window does not give the task a smaller window — it gives it a
  * FULL-SIZE logical window and scales the whole task with a SurfaceFlinger leash (measured on
  * NP02J: {@code SCALE TRANSLATE 0.67 @ (1757,236)}), so a 1080x1685 logical window lands on the
- * panel as 723x1129 physical pixels. The vendor interlacer is strict 1:1 buffer→panel: any
- * resample between the woven buffer and the panel destroys the interlace, which is why
- * {@code vk_android_update_container_scaled} degrades such a window to flat 2D.
+ * panel as 723x1129 physical pixels. The vendor interlacer is strict 1:1 buffer→panel: any resample
+ * between the woven buffer and the panel destroys the interlace, which is why {@code
+ * vk_android_update_container_scaled} degrades such a window to flat 2D.
  *
  * <p>The fix is to make SF's COMPOSED transform identity rather than to fight it: hand the surface
  * a buffer of {@code round(logical * scale)} pixels, and SF's buffer→layer scale times the leash
@@ -41,16 +41,16 @@ import androidx.annotation.Nullable;
  *       it applies the layout itself, and it sees the app's touches, so the touch-ratio fallback is
  *       available to it.
  *   <li>the {@code XR_DXR_android_surface_binding} path (#1396) — the app owns its own Surface, so
- *       the runtime can only MEASURE and must hand the answer back as
- *       {@code XrEventDataAndroidWindowLayoutHintDXR}. See {@link #computeHintForActivity}. The
- *       runtime sees none of that app's touch events, so only the vendor API is available there.
+ *       the runtime can only MEASURE and must hand the answer back as {@code
+ *       XrEventDataAndroidWindowLayoutHintDXR}. See {@link #computeHintForActivity}. The runtime
+ *       sees none of that app's touch events, so only the vendor API is available there.
  * </ul>
  *
  * <p>TRAP: size the buffer to {@code round(scale * logical)} — which is what the vendor API's Rect
- * and the layer's {@code coveredRegion} both report — and NOT to SurfaceFlinger's
- * {@code displayFrame} (732x1137 here). displayFrame includes the task layer's shadow
- * ({@code shadowRadius} 6 x 0.67 ~ 4 px a side); sizing to it re-introduces an 8 px resample, i.e.
- * exactly the thing this exists to remove.
+ * and the layer's {@code coveredRegion} both report — and NOT to SurfaceFlinger's {@code
+ * displayFrame} (732x1137 here). displayFrame includes the task layer's shadow ({@code
+ * shadowRadius} 6 x 0.67 ~ 4 px a side); sizing to it re-introduces an 8 px resample, i.e. exactly
+ * the thing this exists to remove.
  */
 @Keep
 public final class MiniWindowLayout {
@@ -67,6 +67,25 @@ public final class MiniWindowLayout {
 
     /** How close p/q must sit to a touch-measured scale to be accepted as that scale. */
     private static final float RATIONALISE_TOL = 1.0e-4f;
+
+    /**
+     * How far the vendor Rect's two axis ratios may disagree before the scale is refused.
+     *
+     * <p>HOSTED keeps the v2.16.16 value. It is loose because the Rect is quantised to whole
+     * pixels, so a genuinely small mini-window has a real quantisation floor of about {@code 0.5/w
+     * + 0.5/h}; tightening it there would silently push such a window onto the 2D fallback, on a
+     * path that is shipped and eyeball-approved. See runtime#1400.
+     */
+    private static final float HOSTED_AXIS_AGREE_TOL = 0.02f;
+
+    /**
+     * BINDING is tighter, and only because the surface-binding path can be handed an inconsistent
+     * rect that the hosted path cannot (see {@link #isBindingTell}). Measured: a real mini-window
+     * gives 0.6704 / 0.6700, 4e-4 apart; the rotation-transient rect gave 0.4525 / 0.4410, 1.15e-2
+     * apart — inside the hosted band. Second line of defence behind the transposed reject: a wrong
+     * scale here silently weaves the app at the wrong size, while refusing it only costs 2D.
+     */
+    private static final float BINDING_AXIS_AGREE_TOL = 0.005f;
 
     /**
      * How far {@code layout * scale} may sit from a whole pixel.
@@ -93,6 +112,18 @@ public final class MiniWindowLayout {
     /** Per-process instance for the surface-binding path (one Activity per app process). */
     @Nullable private static MiniWindowLayout sForActivity = null;
 
+    /** Which of the two bands above this instance uses. */
+    private final float axisAgreeTol;
+
+    /** Hosted ({@link MonadoView}) — v2.16.16 behaviour, unchanged. */
+    public MiniWindowLayout() {
+        this(HOSTED_AXIS_AGREE_TOL);
+    }
+
+    private MiniWindowLayout(float axisAgreeTol) {
+        this.axisAgreeTol = axisAgreeTol;
+    }
+
     // ---- per-episode state (an "episode" = one entry into a scaled container).
     private int ratP = 0;
     private int ratQ = 0;
@@ -117,26 +148,48 @@ public final class MiniWindowLayout {
      * "This window is being scaled by its container."
      *
      * <p>The window is laid out at its LOGICAL size but placed at its PHYSICAL origin, so a window
-     * that is really 0.67x the panel still reports a full-size extent and spills off the edge. The
-     * spill test is deliberately identical to the compositor's {@code CONTAINER_SCALED} tell.
+     * that is really 0.67x the panel still reports a full-size extent and spills off the edge. One
+     * definition, deliberately identical to the compositor's {@code CONTAINER_SCALED} tell.
      *
-     * <p>ROTATION-TRANSIENT REJECT (measured, NP02J 2026-09-07): an extent that is EXACTLY the
-     * panel transposed is not a scaled container, it is a sample taken mid-rotation — the view's
-     * width/height had not been re-laid-out yet while {@code getLocationOnScreen} and
-     * {@code getRealSize} already had. Seen as {@code window 1757,236 1600x2560, panel 2560x1600}
-     * on the home→recents→freeform path: it spills, so it trips the raw tell, and the vendor
-     * Rect divided by those wrong dimensions yields a plausible-looking 0.4469 that latched a
-     * 715x1144 buffer and wove the app at the wrong size. A real scaled container reports the
-     * container's own logical size (1080x1685 here), never the panel's transpose.
+     * <p>This is the HOSTED predicate and is byte-for-byte what shipped in v2.16.16 — see {@link
+     * #isBindingTell} for why the surface-binding path needs a stricter one, and why that
+     * strictness is deliberately NOT applied here.
      */
     public static boolean isTell(int x, int y, int w, int h, int dispW, int dispH) {
-        if (dispW <= 0 || dispH <= 0 || w <= 0 || h <= 0) {
-            return false;
-        }
+        return dispW > 0
+                && dispH > 0
+                && w > 0
+                && h > 0
+                && (x < 0 || y < 0 || x + w > dispW || y + h > dispH);
+    }
+
+    /**
+     * {@link #isTell} plus a ROTATION-TRANSIENT REJECT, for the surface-binding path only (#1396).
+     *
+     * <p>Measured on the NP02J 2026-09-07: an extent that is EXACTLY the panel transposed is not a
+     * scaled container, it is a sample taken mid-rotation — the app's {@code getLocationOnScreen}
+     * and {@code getRealSize} had updated while its view's width/height had not. Seen as {@code
+     * window 1757,236 1600x2560, panel 2560x1600} on the home→recents→freeform path: it spills, so
+     * it trips the raw tell, and the vendor Rect over those wrong dimensions yields a
+     * plausible-looking 0.4469 that latched a 715x1144 buffer and wove the app at the wrong size. A
+     * real scaled container reports the container's own logical size (1080x1685 here), never the
+     * panel's transpose.
+     *
+     * <p>WHY NOT ON THE HOSTED PATH. {@code MonadoView} owns its view, so it never sees this
+     * inconsistency in the first place — its width/height and its Display come from the same laid
+     * out view. Adding the reject there would only introduce a NEW way for the predicate to flip to
+     * false mid-episode (at rotation), and the OFF branch runs {@code restoreLayoutToWindow() +
+     * setSizeFromLayout()}: a surface resize under a possibly in-flight weave, which is exactly the
+     * class of change that wedged the app in {@code vkWaitForFences} and is why {@link #isEnabled}
+     * is cached per process. The hosted path is shipped and eyeball-approved at v2.16.16; it keeps
+     * that behaviour untouched. Hardening it needs its own device pass WITH rotation —
+     * runtime#1400.
+     */
+    public static boolean isBindingTell(int x, int y, int w, int h, int dispW, int dispH) {
         if (w == dispH && h == dispW) {
             return false; // mid-rotation sample, not a container scale
         }
-        return x < 0 || y < 0 || x + w > dispW || y + h > dispH;
+        return isTell(x, y, w, h, dispW, dispH);
     }
 
     /**
@@ -146,11 +199,12 @@ public final class MiniWindowLayout {
      * <p>READ ONCE PER PROCESS and cached, the same contract as {@code debug.dxr.weave_satellite}:
      * changing it mid-run needs an app restart. That is not laziness — flipping it live was
      * measured to WEDGE the app. It re-sizes the surface underneath a weave that is already in
-     * flight, and the vendor's {@code leia_cnsdk_weave} then sits forever in {@code vkWaitForFences}
-     * inside {@code libleiaCore-impl.so} while the app thread blocks on the compositor mutex in
-     * {@code vk_compositor_layer_commit} (ANR trace, NP02J, 2026-09-07). The buffer size may only
-     * change where nothing is mid-weave — which on this OEM is the container transition itself,
-     * since entering and leaving the mini-window destroys and recreates the surface.
+     * flight, and the vendor's {@code leia_cnsdk_weave} then sits forever in {@code
+     * vkWaitForFences} inside {@code libleiaCore-impl.so} while the app thread blocks on the
+     * compositor mutex in {@code vk_compositor_layer_commit} (ANR trace, NP02J, 2026-09-07). The
+     * buffer size may only change where nothing is mid-weave — which on this OEM is the container
+     * transition itself, since entering and leaving the mini-window destroys and recreates the
+     * surface.
      */
     public static boolean isEnabled() {
         if (sPropCached >= 0) {
@@ -203,8 +257,7 @@ public final class MiniWindowLayout {
         return ratQ;
     }
 
-    @Nullable
-    public String scaleSource() {
+    @Nullable public String scaleSource() {
         return scaleSource;
     }
 
@@ -237,7 +290,9 @@ public final class MiniWindowLayout {
             }
             if (!crossChecked) {
                 crossChecked = true;
-                Log.i(TAG, "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
+                Log.i(
+                        TAG,
+                        "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
             }
         }
 
@@ -255,9 +310,9 @@ public final class MiniWindowLayout {
     /**
      * The exact-integer sizing.
      *
-     * <p>{@code round(logical * s)} is NOT enough. 1080 * 0.67 = 723.6 rounds to 724, so SF composes
-     * buffer->layer x leash = (1080/724) x 0.67 = 0.9994 — a 0.06 % scale, ~0.4 px of drift across a
-     * 724 px window, which reads as a slight double image in BOTH eyes.
+     * <p>{@code round(logical * s)} is NOT enough. 1080 * 0.67 = 723.6 rounds to 724, so SF
+     * composes buffer->layer x leash = (1080/724) x 0.67 = 0.9994 — a 0.06 % scale, ~0.4 px of
+     * drift across a 724 px window, which reads as a slight double image in BOTH eyes.
      *
      * <p>The requirement is NOT "a multiple of q" — that was too blunt, it cost a 54 px (5 %) black
      * border on the right and another 57 px at the bottom, which David rejected. All that is
@@ -267,9 +322,9 @@ public final class MiniWindowLayout {
      * (1128.95, e = 0.05 px -> buffer 1129). The border collapses from 54 px to ONE logical pixel.
      *
      * <p>What does NOT work, measured on device, so do not re-try it: OVERSCANNING (a layout LARGER
-     * than the window, so the crop eats the remainder). A SurfaceView bigger than its window has its
-     * surface sized to the VISIBLE frame, so a 737x1139 buffer got mapped into 723.6x1128.95 screen
-     * px — composed 0.982, a 2 % resample, and the double image came straight back.
+     * than the window, so the crop eats the remainder). A SurfaceView bigger than its window has
+     * its surface sized to the VISIBLE frame, so a 737x1139 buffer got mapped into 723.6x1128.95
+     * screen px — composed 0.982, a 2 % resample, and the double image came straight back.
      *
      * @param out receives {layoutW, layoutH, bufferW, bufferH} at {@link #HINT_LAYOUT_W}..
      * @return true when a usable layout was produced
@@ -359,13 +414,13 @@ public final class MiniWindowLayout {
     /**
      * Rationalise the measured scale to {@code p/q}.
      *
-     * <p>q = 100 IS TRIED FIRST, and that is a deliberate prior, not a shortcut: an OEM window scale
-     * is a round percentage (this one is 0.67, and SurfaceFlinger prints the leash as
-     * {@code 0.6700}). Smallest-q-wins on its own picks the WRONG fraction here — the vendor Rect
-     * only pins the scale to about 3e-4 because it is quantised to whole pixels, and inside that
-     * band {@code 63/94 = 0.670213} both reproduces the Rect exactly AND has a smaller q than
-     * {@code 67/100}, while composing to 0.99968 instead of 1. So try the percentage first, and only
-     * fall back to an ascending search for a device that is not on a percentage grid.
+     * <p>q = 100 IS TRIED FIRST, and that is a deliberate prior, not a shortcut: an OEM window
+     * scale is a round percentage (this one is 0.67, and SurfaceFlinger prints the leash as {@code
+     * 0.6700}). Smallest-q-wins on its own picks the WRONG fraction here — the vendor Rect only
+     * pins the scale to about 3e-4 because it is quantised to whole pixels, and inside that band
+     * {@code 63/94 = 0.670213} both reproduces the Rect exactly AND has a smaller q than {@code
+     * 67/100}, while composing to 0.99968 instead of 1. So try the percentage first, and only fall
+     * back to an ascending search for a device that is not on a percentage grid.
      *
      * @return true when a usable p/q was found
      */
@@ -419,9 +474,9 @@ public final class MiniWindowLayout {
     }
 
     /**
-     * S9 probe result (b): {@code ActivityManager.getDefaultWindowParamByTaskForNormalWr(taskId)} is
-     * a hidden TEST-API that is NOT on this build's blocklist and returns the POST-SCALE on-screen
-     * Rect for an ordinary app uid, no permission needed.
+     * S9 probe result (b): {@code ActivityManager.getDefaultWindowParamByTaskForNormalWr(taskId)}
+     * is a hidden TEST-API that is NOT on this build's blocklist and returns the POST-SCALE
+     * on-screen Rect for an ordinary app uid, no permission needed.
      *
      * <p>MUST BE GATED ON THE TELL by the caller, and that gate is load-bearing: the method returns
      * the NOMINAL window-reply placement whether or not the app is actually in a mini-window — in
@@ -430,7 +485,8 @@ public final class MiniWindowLayout {
      *
      * @return the scale, or 0 when unavailable or implausible
      */
-    private float queryVendorWrScale(@Nullable Activity activity, int w, int h, int dispW, int dispH) {
+    private float queryVendorWrScale(
+            @Nullable Activity activity, int w, int h, int dispW, int dispH) {
         if (vendorScale > 0f) {
             return vendorScale; // resolved once per scaled-container episode
         }
@@ -453,7 +509,8 @@ public final class MiniWindowLayout {
                 r =
                         (Rect)
                                 am.getClass()
-                                        .getMethod("getDefaultWindowParamByTaskForNormalWr", int.class)
+                                        .getMethod(
+                                                "getDefaultWindowParamByTaskForNormalWr", int.class)
                                         .invoke(am, activity.getTaskId());
             } catch (Throwable ignored) {
                 r = null;
@@ -463,7 +520,9 @@ public final class MiniWindowLayout {
                     r =
                             (Rect)
                                     am.getClass()
-                                            .getMethod("getDefaultWindowParamForNormalWr", boolean.class)
+                                            .getMethod(
+                                                    "getDefaultWindowParamForNormalWr",
+                                                    boolean.class)
                                             .invoke(am, Boolean.FALSE);
                 } catch (Throwable ignored) {
                     return 0f;
@@ -478,13 +537,9 @@ public final class MiniWindowLayout {
             }
             float sx = r.width() / (float) w;
             float sy = r.height() / (float) h;
-            // The two axes must agree TIGHTLY: one leash scales both. Measured on the
-            // NP02J, a real mini-window gives 0.6704 / 0.6700 (4e-4 apart) while a
-            // rotation-transient rect — the sample the reject in isTell now catches —
-            // gave 0.4525 / 0.4410, 1.15e-2 apart and inside the old 2e-2 band. Keep
-            // this as the second line of defence: a bad scale here silently weaves the
-            // app at the wrong size, whereas rejecting it only costs the 2D fallback.
-            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > 0.005f) {
+            // One leash scales both axes, so the two ratios must agree. How tightly is
+            // per-instance: see HOSTED_AXIS_AGREE_TOL / BINDING_AXIS_AGREE_TOL.
+            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > axisAgreeTol) {
                 return 0f;
             }
             // Keep the RAW rect: the rationalisation round-trips against these integers
@@ -501,8 +556,8 @@ public final class MiniWindowLayout {
 
     /**
      * S9 probe result (c): the platform inverts the leash on the way in, so on a REAL dispatched
-     * drag {@code |Δraw| / |Δlocal|} is the container scale (measured 0.670000, max residual 1e-4 px
-     * over 100 samples), and it needs neither a vendor API nor a permission. Differences, so the
+     * drag {@code |Δraw| / |Δlocal|} is the container scale (measured 0.670000, max residual 1e-4
+     * px over 100 samples), and it needs neither a vendor API nor a permission. Differences, so the
      * view position and the insets cancel. Synthetic events ({@code MotionEvent.obtain}) read 1.0
      * and are rejected by the plausibility band below, as is a fullscreen window.
      *
@@ -532,7 +587,8 @@ public final class MiniWindowLayout {
         if (localSpan < TOUCH_MIN_SPAN_PX) {
             return; // too short to divide by
         }
-        float rawSpan = Math.abs(ev.getRawX() - touchDownRawX) + Math.abs(ev.getRawY() - touchDownRawY);
+        float rawSpan =
+                Math.abs(ev.getRawX() - touchDownRawX) + Math.abs(ev.getRawY() - touchDownRawY);
         float s = rawSpan / localSpan;
         if (s < 0.2f || s > 0.999f) {
             return; // fullscreen (1.0), a synthetic event, or nonsense
@@ -544,23 +600,22 @@ public final class MiniWindowLayout {
     }
 
     /**
-     * The surface-binding entry point (#1396), called from native
-     * ({@code android_mini_window.cpp}) on every {@code xrSetAndroidWindowGeometryDXR} whose rect
-     * trips the tell. The app owns the view, so this ONLY measures — the answer travels back to the
-     * app as {@code XrEventDataAndroidWindowLayoutHintDXR} and the app applies it.
+     * The surface-binding entry point (#1396), called from native ({@code android_mini_window.cpp})
+     * on every {@code xrSetAndroidWindowGeometryDXR} whose rect trips the tell. The app owns the
+     * view, so this ONLY measures — the answer travels back to the app as {@code
+     * XrEventDataAndroidWindowLayoutHintDXR} and the app applies it.
      *
      * <p>{@code activityObj} is the {@code XrInstanceCreateInfoAndroidKHR::applicationActivity} the
-     * runtime already holds. Everything the probe needs is on it (an ActivityManager and a task id);
-     * nothing here touches the app's view hierarchy.
+     * runtime already holds. Everything the probe needs is on it (an ActivityManager and a task
+     * id); nothing here touches the app's view hierarchy.
      *
      * @return {@link #HINT_LEN} ints — layoutW, layoutH, bufferW, bufferH, p, q — or null when the
      *     window fits the panel, the feature is off, or the scale is not knowable on this device.
      */
     @Keep
-    @Nullable
-    public static int[] computeHintForActivity(
+    @Nullable public static int[] computeHintForActivity(
             @Nullable Object activityObj, int x, int y, int w, int h, int dispW, int dispH) {
-        if (!isTell(x, y, w, h, dispW, dispH) || !isEnabled()) {
+        if (!isBindingTell(x, y, w, h, dispW, dispH) || !isEnabled()) {
             return null;
         }
         if (!(activityObj instanceof Activity)) {
@@ -572,7 +627,7 @@ public final class MiniWindowLayout {
         Activity activity = (Activity) activityObj;
         MiniWindowLayout self = sForActivity;
         if (self == null) {
-            self = new MiniWindowLayout();
+            self = new MiniWindowLayout(BINDING_AXIS_AGREE_TOL);
             sForActivity = self;
         }
         float s = self.resolveScale(activity, w, h, dispW, dispH);
@@ -599,11 +654,15 @@ public final class MiniWindowLayout {
      * fullscreen task.
      *
      * <p>{@code Activity.isInMultiWindowMode()} is the exact, PUBLIC answer: true for the OEM
-     * mini-window (windowing mode freeform) and for split-screen, false for fullscreen. Split-screen
-     * never trips the tell in the first place (the window fits), so "multi-window" is a safe
-     * superset of "possibly scaled".
+     * mini-window (windowing mode freeform) and for split-screen, false for fullscreen.
+     * Split-screen never trips the tell in the first place (the window fits), so "multi-window" is
+     * a safe superset of "possibly scaled".
      *
-     * <p>Reads one boolean field; safe to call off the UI thread, which the geometry channel is.
+     * <p>Thread-safe to call off the UI thread, which the geometry channel is. NOT free on every
+     * API level: {@code Activity.isInMultiWindowMode()} only became a cached field in API 28 — on
+     * 24-27 it is a binder round trip to ActivityTaskManager. It is called once per published
+     * geometry change (not per frame), which is a handful of calls per container transition, so
+     * that is affordable; do not move it into a per-frame path.
      *
      * @return true when the Activity is in a multi-window container, or when it cannot be asked
      *     (never end a hint on ignorance — the tell will).

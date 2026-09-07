@@ -193,6 +193,11 @@ class MainActivity : NativeActivity() {
             miniLayoutW = 0
             miniLayoutH = 0
             val lp = win.attributes
+            // Put back everything the ON path changed, gravity included: leaving
+            // TOP|START on a restored MATCH_PARENT window is a lasting side effect
+            // of a transient hint. NO_GRAVITY is what an activity window has
+            // before anyone touches it.
+            lp.gravity = Gravity.NO_GRAVITY
             lp.width = WindowManager.LayoutParams.MATCH_PARENT
             lp.height = WindowManager.LayoutParams.MATCH_PARENT
             win.attributes = lp

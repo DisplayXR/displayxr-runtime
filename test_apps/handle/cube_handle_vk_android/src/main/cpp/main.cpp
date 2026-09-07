@@ -241,6 +241,10 @@ std::atomic<int32_t> g_hint_buf_h{0};
 ANativeWindow *g_hint_applied_win = nullptr;
 int32_t g_hint_applied_w = 0;
 int32_t g_hint_applied_h = 0;
+//! Consecutive setBuffersGeometry failures. A failure cannot be memoised, so
+//! without a bound the retry (and its log line) would run every frame.
+int32_t g_hint_apply_fails = 0;
+constexpr int32_t kHintApplyMaxFails = 30;
 
 //! Forget the override (the hint cleared, or the surface went away).
 void
@@ -249,6 +253,7 @@ forget_hint_buffer_geometry()
 	g_hint_applied_win = nullptr;
 	g_hint_applied_w = 0;
 	g_hint_applied_h = 0;
+	g_hint_apply_fails = 0;
 }
 
 // Re-assert the fixed buffer size on our own window. Idempotent and cheap, and
@@ -275,9 +280,28 @@ apply_hint_buffer_geometry()
 		g_hint_applied_win = win;
 		g_hint_applied_w = bw;
 		g_hint_applied_h = bh;
+		g_hint_apply_fails = 0;
+		// One line per transition; the memo above is what keeps that true.
+		LOGI("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p -> 0", bw, bh, (void *)win);
+		return;
 	}
-	// One line per transition; the guard above is what keeps that true.
-	LOGI("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p -> %d", bw, bh, (void *)win, (int)rc);
+	/*
+	 * A failure memoises nothing, so it would otherwise be retried — and logged —
+	 * on every frame. Say it once, bound the retries, and if it never takes, drop
+	 * the hint: the runtime's 2D fallback is the honest place to end up, and it
+	 * is what an app that never implemented spec v2 gets anyway.
+	 */
+	if (g_hint_apply_fails == 0) {
+		LOGW("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p failed (%d) — retrying", bw, bh,
+		     (void *)win, (int)rc);
+	}
+	if (++g_hint_apply_fails >= kHintApplyMaxFails) {
+		LOGW("miniWindow1to1: giving up after %d failed setBuffersGeometry attempts — dropping the hint, "
+		     "the runtime keeps its 2D fallback",
+		     (int)kHintApplyMaxFails);
+		g_hint_active.store(false, std::memory_order_release);
+		forget_hint_buffer_geometry();
+	}
 }
 #endif
 
@@ -892,17 +916,30 @@ push_window_geometry()
 	 * #1396: while a layout hint is in effect our window is LOGICAL-sized but
 	 * its buffer is PHYSICAL-sized, and it is the physical rect the runtime
 	 * must weave in — that is the frame the DP's interlace phase, the per-window
-	 * Kooima and the compositor's view dims all live in. Only substitute once
-	 * the buffer override has actually taken (ANativeWindow reports it), so we
-	 * never claim a size the buffer does not have. The ORIGIN is the app's, live:
-	 * getLocationOnScreen already returns on-screen coordinates in a scaled
-	 * container.
+	 * Kooima and the compositor's view dims all live in. Substitute it only once
+	 * BOTH halves of the hint are in place (see below), so we never claim a
+	 * geometry the composition does not actually have. The ORIGIN is the app's,
+	 * live: getLocationOnScreen already returns on-screen coordinates in a
+	 * scaled container.
 	 */
 	int32_t pub_w = r.w;
 	int32_t pub_h = r.h;
 	if (g_hint_active.load(std::memory_order_acquire)) {
 		ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
-		if (win != nullptr && win == g_hint_applied_win && g_hint_applied_w > 0 && g_hint_applied_h > 0) {
+		const int32_t lw = g_hint_layout_w.load(std::memory_order_relaxed);
+		const int32_t lh = g_hint_layout_h.load(std::memory_order_relaxed);
+		/*
+		 * BOTH halves must be in place, not just the buffer. The layout is applied
+		 * asynchronously by the UI thread, so there is a window in which the buffer
+		 * is already 723x1129 while the window is still 1080 logical — composed
+		 * (1080/723) x 0.67 = 1.00083, which is the ~0.4 px drift that reads as a
+		 * double image in both eyes. Publishing the physical rect there would tell
+		 * the runtime to weave through exactly that. So wait until our own sampled
+		 * logical size IS the hinted layout; until then keep publishing the logical
+		 * rect, which keeps the runtime on its honest 2D fallback.
+		 */
+		if (win != nullptr && win == g_hint_applied_win && g_hint_applied_w > 0 && g_hint_applied_h > 0 &&
+		    lw > 0 && lh > 0 && r.w == lw && r.h == lh) {
 			pub_w = g_hint_applied_w;
 			pub_h = g_hint_applied_h;
 		}
@@ -2426,6 +2463,7 @@ poll_xr_events()
 					g_hint_layout_h.store(e->layoutSize.height, std::memory_order_relaxed);
 					g_hint_buf_w.store(e->bufferSize.width, std::memory_order_relaxed);
 					g_hint_buf_h.store(e->bufferSize.height, std::memory_order_relaxed);
+					g_hint_apply_fails = 0;
 					g_hint_active.store(true, std::memory_order_release);
 					LOGI("miniWindow1to1 HINT: scale=%.4f layout %dx%d buffer %dx%d "
 					     "physical %d,%d %dx%d",
@@ -2849,6 +2887,17 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// nothing presents into a dead window and the DP pauses (releasing its
 		// 3D-lens vote, ADR-036 D7) instead of holding the panel.
 		publish_app_surface(nullptr);
+		/*
+		 * #1396: the surface is gone, so the buffer-size override went with it.
+		 * The memo MUST be dropped here and not left for the next
+		 * APP_CMD_INIT_WINDOW to notice: the allocator can hand back the SAME
+		 * ANativeWindow address, and then the pointer compare in
+		 * apply_hint_buffer_geometry() would read "already applied" for a window
+		 * that has no override at all — we would go on publishing the physical
+		 * extent for a logical-sized buffer, and the runtime would latch on a
+		 * lie, silently and with nothing in the log.
+		 */
+		forget_hint_buffer_geometry();
 #endif
 		// Clear any in-progress touch: a card/recents gesture sends a DOWN to the
 		// app, then the system steals it for the swipe, so the matching UP never

@@ -208,9 +208,11 @@ typedef struct XrEventDataAndroidWindowLayoutHintDXR {
     //! ordinary match-parent layout and drop the fixed buffer size. Every
     //! other field is 0 when this is XR_FALSE.
     XrBool32                    active;
-    //! The measured container scale (physical / logical), e.g. 0.67. Informational —
-    //! the app must use the integer sizes below, which are the RATIONALISED answer;
-    //! recomputing from this float re-introduces the drift the search removed.
+    //! The RATIONALISED container scale (physical / logical) the sizing actually
+    //! used — `p/q`, e.g. 0.6700 = 67/100 — NOT the raw probe result (0.67020005),
+    //! which carries the vendor rect's whole-pixel quantisation. Informational:
+    //! the app must use the integer sizes below; recomputing from this float
+    //! re-introduces the drift the integer search removed.
     float                       scale;
     //! Logical size the app must lay its content view / window out at. Never
     //! LARGER than the window: overscanning does not work, because a SurfaceView
@@ -220,12 +222,16 @@ typedef struct XrEventDataAndroidWindowLayoutHintDXR {
     XrExtent2Di                 layoutSize;
     //! Fixed buffer size in physical panel pixels — `SurfaceHolder.setFixedSize()`
     //! or `ANativeWindow_setBuffersGeometry()`. This is `round(layoutSize * scale)`.
+    //! TRAP: `ANativeWindow_getWidth/Height` do NOT report this override, they keep
+    //! answering the window size. Memoise the request; see the spec, §2.5.
     XrExtent2Di                 bufferSize;
     //! The on-screen rect to publish through @ref xrSetAndroidWindowGeometryDXR
-    //! ONCE the buffer has actually come back at @p bufferSize. Its offset is the
-    //! window's on-screen origin as the runtime last saw it (the app should keep
-    //! publishing its own live `View.getLocationOnScreen()` as the window moves)
-    //! and its extent is @p bufferSize.
+    //! ONCE BOTH halves are in place — the buffer request has succeeded AND the
+    //! app's own window is laid out at @p layoutSize. Publishing it while only the
+    //! buffer has changed asks the runtime to weave through the very resample this
+    //! removes. Its offset is the window's on-screen origin as the runtime last saw
+    //! it (the app should keep publishing its own live `View.getLocationOnScreen()`
+    //! as the window moves) and its extent is @p bufferSize.
     XrRect2Di                   physicalRect;
 } XrEventDataAndroidWindowLayoutHintDXR;
 

@@ -165,7 +165,7 @@ typedef struct XrEventDataAndroidWindowLayoutHintDXR {
     const void* XR_MAY_ALIAS    next;
     XrSession                   session;
     XrBool32                    active;        // XR_FALSE = restore, every other field 0
-    float                       scale;         // measured container scale, informational
+    float                       scale;         // RATIONALISED container scale, informational
     XrExtent2Di                 layoutSize;    // logical size to lay the window out at
     XrExtent2Di                 bufferSize;    // fixed buffer size, physical panel px
     XrRect2Di                   physicalRect;  // republish this through xrSetAndroidWindowGeometryDXR
@@ -241,8 +241,25 @@ Hence: the runtime keeps the policy, emits this event, and the app applies it.
    sizing to it re-introduces an 8 px resample — exactly the thing being removed.
 
 One implementation of all of the above ships in the runtime
-(`org.freedesktop.monado.auxiliary.MiniWindowLayout`) and is shared verbatim with
-the runtime's own hosted `MonadoView`, so the two paths cannot drift.
+(`org.freedesktop.monado.auxiliary.MiniWindowLayout`) and is shared with the
+runtime's own hosted `MonadoView`, so the measured rules cannot drift.
+
+**Two of its guards are deliberately scoped to this path only**, because the
+hosted path cannot hit what they defend against and is shipped and
+eyeball-approved as it stands:
+
+- the **rotation-transient reject** (`isBindingTell`: an extent that is exactly
+  the panel transposed is a mid-rotation sample, not a container scale), and
+- the **tighter two-axis agreement band** on the vendor Rect (5e-3 vs the hosted
+  2e-2).
+
+An app publishes its rect and its panel extent from *different* sources that can
+disagree for a frame during a rotation; `MonadoView` reads both off one laid-out
+view and never sees that. Applying the reject there would add a new way for the
+predicate to flip mid-episode, and its OFF branch resizes the surface — the class
+of change that has been measured to wedge a weave in `vkWaitForFences`.
+Hardening the hosted path is tracked separately and needs its own device pass
+*with* rotation.
 
 #### Application obligations
 
@@ -257,13 +274,35 @@ On `active == XR_TRUE`:
    or `SurfaceHolder.setFixedSize(w, h)`. **Re-assert it after every surface
    recreate**; a window resize destroys and rebuilds the Surface and the override
    goes with it.
+
+   **MEMOISE THE REQUEST — do not ask the window whether it took.**
+   `ANativeWindow_getWidth/Height` do **not** report a `setBuffersGeometry`
+   override: measured on the reference device, after a successful
+   `setBuffersGeometry(723, 1129)` they still answer the *window* size
+   (`1079x1685`), even though the runtime's `VkSurfaceKHR` does come back at
+   `723x1129`. An app that derives "has it taken?" from them never converges — it
+   re-issues the call every frame, every call re-creates the runtime's swapchain
+   target, and **the weave never gets a frame out** (0 weave frames under a storm
+   of `HW_XFORM: surface extent … recreating target`). Remember
+   `{ANativeWindow*, width, height}` and re-issue only when one of them changes.
+   The pointer is the reliable half: a surface recreate hands out a *new*
+   `ANativeWindow`, so the compare is exactly the "the override was dropped"
+   test. Clear the memo when the surface is destroyed (`APP_CMD_TERM_WINDOW` /
+   `surfaceDestroyed`) — the allocator may hand the same address back, and a
+   stale memo then reads "already applied" for a window that has no override.
+   A `setBuffersGeometry` failure memoises nothing, so bound the retries, log
+   once, and drop the hint if it never takes.
 3. Publish `physicalRect` through `xrSetAndroidWindowGeometryDXR` — the app's own
    live `View.getLocationOnScreen()` origin (which is already on-screen
    coordinates in a scaled container) with `bufferSize` as the extent. Do it only
-   **once the override has taken** (`ANativeWindow_getWidth/Height` report
-   `bufferSize`), so the runtime never weaves at a size the buffer does not have.
-   Until then keep publishing the logical rect — that keeps the honest 2D
-   fallback, which is the direction to fail in.
+   once **both** halves are in place: the buffer request has succeeded *and* the
+   app's own sampled logical size is `layoutSize`. The layout is applied
+   asynchronously, so there is a window in which the buffer is already
+   `723x1129` while the window is still `1080` logical — composed
+   `(1080/723) × 0.67 = 1.00083`, the ~0.4 px drift that reads as a double image
+   in both eyes. Publishing the physical rect there tells the runtime to weave
+   through exactly that. Until both hold, keep publishing the logical rect: that
+   keeps the honest 2D fallback, which is the direction to fail in.
 4. Paint the one-pixel right/bottom remainder black if anything shows through.
 
 On `active == XR_FALSE`: restore the ordinary match-parent layout, drop the
@@ -273,6 +312,12 @@ to publishing the logical rect.
 **Ignoring the event is legal.** An app that does nothing keeps the runtime's 2D
 fallback in the scaled container, exactly as before spec v2. There is no
 `XR_ERROR_*` for not applying a hint.
+
+`scale` on the wire is the **rationalised** `p/q` the sizing actually used
+(`0.6700` = 67/100), not the raw probe result (`0.67020005`) — the raw value
+carries the vendor Rect's whole-pixel quantisation. It is informational either
+way: recomputing the sizes from it re-introduces the drift the integer search
+removed. Use `layoutSize` / `bufferSize`.
 
 #### Runtime behaviour
 

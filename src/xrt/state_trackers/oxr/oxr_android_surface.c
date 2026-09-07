@@ -189,6 +189,26 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	 */
 	android_globals_set_window(NULL);
 	sess->android_bound_window = NULL;
+
+	/*
+	 * #1396: drop the layout-hint episode with the session. The Java helper
+	 * caches the probed vendor scale and its p/q for the lifetime of an
+	 * episode, so a SECOND session in the same process (an end→begin bounce,
+	 * a relaunch) would otherwise inherit the previous window's answer and
+	 * apply it to a window it was never measured for. No event: the session
+	 * that would receive it is going away.
+	 */
+	sess->android_hint_active = false;
+	sess->android_hint_unknown_logged = false;
+	sess->android_hint_ignored_logged = false;
+	sess->android_hint_layout_w = 0;
+	sess->android_hint_layout_h = 0;
+	sess->android_hint_buffer_w = 0;
+	sess->android_hint_buffer_h = 0;
+	sess->android_hint_disp_w = 0;
+	sess->android_hint_disp_h = 0;
+	sess->android_hint_scale = 0.0f;
+	android_mini_window_reset();
 }
 
 /*
@@ -225,6 +245,8 @@ oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess)
 	sess->android_hint_layout_h = 0;
 	sess->android_hint_buffer_w = 0;
 	sess->android_hint_buffer_h = 0;
+	sess->android_hint_disp_w = 0;
+	sess->android_hint_disp_h = 0;
 	sess->android_hint_scale = 0.0f;
 	android_mini_window_reset();
 	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_FALSE, 0.0f, 0, 0, 0, 0, 0, 0);
@@ -263,31 +285,48 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 		return;
 	}
 
-	/*
-	 * Once the app has applied a hint it publishes the PHYSICAL rect, which
-	 * fits the panel and so no longer trips the tell. Recognise that by the
-	 * EXTENT (the origin keeps changing as the window is dragged) and latch,
-	 * or every drag frame would look like "the window left its container".
-	 */
-	if (sess->android_hint_active && (int32_t)w == sess->android_hint_buffer_w &&
-	    (int32_t)h == sess->android_hint_buffer_h) {
+	if (sess->android_hint_active) {
 		/*
-		 * ...but the latch has a blind spot the rect cannot fill: a physical
-		 * rect fits the panel BY CONSTRUCTION, so "the window left its
-		 * container" and "the hint is working" look identical here. MEASURED
-		 * on the NP02J: moving the task back to fullscreen left the app's
-		 * window at the hinted layout, so it kept publishing a fitting
-		 * 723x1129 rect and the hint stayed latched — a small window weaving
-		 * in a fullscreen task. `Activity.isInMultiWindowMode()` is the exact
-		 * public answer and the only thing that can end the episode.
+		 * Two things can end an episode that the published RECT cannot show,
+		 * so they are checked on every publish while a hint is live — not only
+		 * on the latched branch below. An app that leaves the container while
+		 * publishing a rect that still spills (a resize, a rotation, a
+		 * different display) would otherwise keep the hint latched forever.
+		 *
+		 * 1. The container itself. A physical rect fits the panel BY
+		 *    CONSTRUCTION, so "the window left its container" and "the hint is
+		 *    working" are indistinguishable from the rect. MEASURED on the
+		 *    NP02J: moving the task back to fullscreen left the app's window at
+		 *    the hinted layout, so it kept publishing a fitting 723x1129 rect
+		 *    and the hint stayed latched — a small window weaving in a
+		 *    fullscreen task. `Activity.isInMultiWindowMode()` is the exact
+		 *    public answer.
+		 * 2. The panel frame. Every number in the hint — the scale, the
+		 *    layout, the buffer — was derived against one panel extent. A
+		 *    rotation replaces it, so the episode is over; the app restores and
+		 *    the next publish re-derives from scratch. Without this the latch
+		 *    below keeps weaving at the pre-rotation size.
 		 */
 		if (!android_mini_window_still_scalable()) {
 			oxr_android_window_hint_clear(log, sess);
 			return;
 		}
-		sess->android_hint_x = x;
-		sess->android_hint_y = y;
-		return;
+		if ((int32_t)disp_w != sess->android_hint_disp_w || (int32_t)disp_h != sess->android_hint_disp_h) {
+			oxr_android_window_hint_clear(log, sess);
+			return;
+		}
+
+		/*
+		 * Once the app has applied a hint it publishes the PHYSICAL rect, which
+		 * fits the panel and so no longer trips the tell. Recognise that by the
+		 * EXTENT (the origin keeps changing as the window is dragged) and latch,
+		 * or every drag frame would look like "the window left its container".
+		 */
+		if ((int32_t)w == sess->android_hint_buffer_w && (int32_t)h == sess->android_hint_buffer_h) {
+			sess->android_hint_x = x;
+			sess->android_hint_y = y;
+			return;
+		}
 	}
 
 	const bool tell =
@@ -345,6 +384,8 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 	sess->android_hint_buffer_h = hint.buffer_h;
 	sess->android_hint_x = x;
 	sess->android_hint_y = y;
+	sess->android_hint_disp_w = (int32_t)disp_w;
+	sess->android_hint_disp_h = (int32_t)disp_h;
 	sess->android_hint_scale = hint.scale;
 
 	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_TRUE, hint.scale, hint.layout_w, hint.layout_h,
