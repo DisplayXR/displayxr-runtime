@@ -33,6 +33,8 @@
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
+#include "os/os_time.h"
+
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_handle.h"
@@ -209,6 +211,10 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	sess->android_hint_disp_h = 0;
 	sess->android_hint_prev_layout_w = 0;
 	sess->android_hint_prev_layout_h = 0;
+	sess->android_hint_prev_disp_w = 0;
+	sess->android_hint_prev_disp_h = 0;
+	sess->android_hint_prev_armed_ns = 0;
+	sess->android_hint_prev_refused_logged = false;
 	sess->android_hint_scale = 0.0f;
 	android_mini_window_reset();
 }
@@ -233,9 +239,23 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
  * `MiniWindowLayout` for every measured rule, so they cannot drift.
  */
 
+/*!
+ * How long the "do not derive from the previous episode's layout" memo lives.
+ *
+ * It only has to outlive the app's asynchronous restore — measured on the NP02J
+ * at 50-160 ms between the `OFF` and the next real rect — so a second is a wide
+ * margin, and it is far shorter than any human re-entry (recents + a tap).
+ *
+ * Wall clock rather than a publish count on purpose: the app publishes only when
+ * its rect CHANGES, and the platform freezes a backgrounded app outright
+ * (`CpuFreezerManagerServiceV2` on this OEM), so a counter can sit unadvanced for
+ * an unbounded time. A clock cannot.
+ */
+#define OXR_ANDROID_PREV_LAYOUT_GRACE_NS (1000 * 1000 * 1000ULL)
+
 //! End the episode and tell the app to restore. No-op when no hint is active.
 static void
-oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess)
+oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess, uint32_t disp_w, uint32_t disp_h)
 {
 	if (!sess->android_hint_active) {
 		return;
@@ -252,6 +272,17 @@ oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess)
 	 */
 	sess->android_hint_prev_layout_w = sess->android_hint_layout_w;
 	sess->android_hint_prev_layout_h = sess->android_hint_layout_h;
+	/*
+	 * Armed against the panel of the publish that ENDS the episode, not the one
+	 * the hint was computed in. On a rotation those differ, and arming with the
+	 * old one expires the memo on the very next publish — which is the 723x1130
+	 * bug it exists to prevent, measured again on the NP02J when this was first
+	 * written the other way round.
+	 */
+	sess->android_hint_prev_disp_w = (int32_t)disp_w;
+	sess->android_hint_prev_disp_h = (int32_t)disp_h;
+	sess->android_hint_prev_armed_ns = os_monotonic_get_ns();
+	sess->android_hint_prev_refused_logged = false;
 
 	sess->android_hint_active = false;
 	sess->android_hint_unknown_logged = false;
@@ -323,11 +354,11 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 		 *    below keeps weaving at the pre-rotation size.
 		 */
 		if (!android_mini_window_still_scalable()) {
-			oxr_android_window_hint_clear(log, sess);
+			oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
 			return;
 		}
 		if ((int32_t)disp_w != sess->android_hint_disp_w || (int32_t)disp_h != sess->android_hint_disp_h) {
-			oxr_android_window_hint_clear(log, sess);
+			oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
 			return;
 		}
 
@@ -348,21 +379,52 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 	    x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
 
 	if (!tell) {
-		oxr_android_window_hint_clear(log, sess);
+		oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
 		return;
 	}
 
 	/*
-	 * The app has not finished restoring from the previous episode yet — this is
-	 * still that episode's layout size, not the container's own. Wait for a real
-	 * one (see oxr_android_window_hint_clear).
+	 * The app may not have finished restoring from the previous episode — a rect
+	 * that is still THAT episode's layout size is not the container's own, and
+	 * deriving from it is deriving a hint from a hint.
+	 *
+	 * The memo is bounded (see OXR_ANDROID_PREV_LAYOUT_GRACE_NS). Unbounded it
+	 * would be a permanent, silent lock-out on any device whose container scale
+	 * rationalises to a small q — 0.75, 0.80, 0.50, 0.60 all leave
+	 * snapDimension() returning the window unchanged, so the previous layout IS
+	 * the container's natural logical size and every re-entry would match it
+	 * forever. (The NP02J escapes only because 1080 x 0.67 is not integral.)
+	 *
+	 * It cannot instead be cleared on any non-spilling publish: a 1079x1685
+	 * window FITS a rotated 1600x2560 panel, so such a publish arrives
+	 * mid-rotation before the app has restored — which is exactly the case that
+	 * measured 723x1130 instead of 723x1129.
 	 */
-	if (sess->android_hint_prev_layout_w > 0 && (int32_t)w == sess->android_hint_prev_layout_w &&
-	    (int32_t)h == sess->android_hint_prev_layout_h) {
-		return;
+	if (sess->android_hint_prev_layout_w > 0) {
+		const uint64_t now = os_monotonic_get_ns();
+		const bool expired = (int32_t)disp_w != sess->android_hint_prev_disp_w ||
+		                     (int32_t)disp_h != sess->android_hint_prev_disp_h ||
+		                     now - sess->android_hint_prev_armed_ns > OXR_ANDROID_PREV_LAYOUT_GRACE_NS;
+
+		if (!expired && (int32_t)w == sess->android_hint_prev_layout_w &&
+		    (int32_t)h == sess->android_hint_prev_layout_h) {
+			// The only state decision in this file that produces no event.
+			// Say it once so it is never silent.
+			if (!sess->android_hint_prev_refused_logged) {
+				sess->android_hint_prev_refused_logged = true;
+				U_LOG_W(
+				    "XR_DXR_android_surface_binding: ignoring a %ux%u rect — still the previous "
+				    "episode's layout, waiting for the container's own (#1396)",
+				    w, h);
+			}
+			return;
+		}
+		sess->android_hint_prev_layout_w = 0;
+		sess->android_hint_prev_layout_h = 0;
+		sess->android_hint_prev_disp_w = 0;
+		sess->android_hint_prev_disp_h = 0;
+		sess->android_hint_prev_refused_logged = false;
 	}
-	sess->android_hint_prev_layout_w = 0;
-	sess->android_hint_prev_layout_h = 0;
 
 	struct android_mini_window_hint hint = {0};
 	if (!android_mini_window_compute_hint(x, y, w, h, disp_w, disp_h, &hint)) {

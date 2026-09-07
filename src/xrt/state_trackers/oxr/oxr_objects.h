@@ -2496,10 +2496,23 @@ struct oxr_session
 	//! Panel extent the hint was computed in. A rotation mid-episode changes
 	//! the frame the whole answer lives in, so it ends the episode (#1396).
 	int32_t android_hint_disp_w, android_hint_disp_h;
-	//! The layout size of the episode that just ENDED. A hint must never be
-	//! derived from a rect that is still the previous hint's layout — that is a
-	//! hint computed from a hint (#1396).
+	/*
+	 * The layout size of the episode that just ENDED. A hint must never be
+	 * derived from a rect that is still the previous hint's layout — that is a
+	 * hint computed from a hint (#1396).
+	 *
+	 * BOUNDED, and that bound is load-bearing: the refusal only has to outlive
+	 * the app's asynchronous restore (measured at 50-160 ms), whereas on a
+	 * device whose container scale rationalises to a small q the previous
+	 * layout EQUALS the container's natural logical size, and an unbounded memo
+	 * would refuse every re-entry for the life of the process.
+	 */
 	int32_t android_hint_prev_layout_w, android_hint_prev_layout_h;
+	//! Panel extent the memo was armed against; a different one expires it.
+	int32_t android_hint_prev_disp_w, android_hint_prev_disp_h;
+	//! Monotonic ns at arming; @ref OXR_ANDROID_PREV_LAYOUT_GRACE_NS expires it.
+	uint64_t android_hint_prev_armed_ns;
+	bool android_hint_prev_refused_logged;
 	float android_hint_scale;
 #endif
 
