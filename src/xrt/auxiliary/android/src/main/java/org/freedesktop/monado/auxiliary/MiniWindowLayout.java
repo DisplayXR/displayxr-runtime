@@ -144,23 +144,15 @@ public final class MiniWindowLayout {
     private static final float RATIONALISE_TOL = 1.0e-4f;
 
     /**
-     * How far the vendor Rect's two axis ratios may disagree before the scale is refused.
+     * Floor on how far the vendor Rect's two axis ratios may disagree before the scale is refused.
      *
-     * <p>HOSTED keeps the v2.16.16 value. It is loose because the Rect is quantised to whole
-     * pixels, so a genuinely small mini-window has a real quantisation floor of about {@code 0.5/w
-     * + 0.5/h}; tightening it there would silently push such a window onto the 2D fallback, on a
-     * path that is shipped and eyeball-approved. See runtime#1399.
+     * <p>ONE band for both paths since runtime#1399, and ADAPTIVE rather than a constant — see
+     * {@link #axisAgreeTol}. Measured on the NP02J: a real mini-window gives 0.6704 / 0.6700, 4e-4
+     * apart; the rotation-transient rect gave 0.4525 / 0.4410, 1.15e-2 apart. 5e-3 separates them
+     * with an order of magnitude of margin on the side that matters, because a wrong scale
+     * silently weaves at the wrong size while refusing one only costs 2D.
      */
-    private static final float HOSTED_AXIS_AGREE_TOL = 0.02f;
-
-    /**
-     * BINDING is tighter, and only because the surface-binding path can be handed an inconsistent
-     * rect that the hosted path cannot (see {@link #isBindingTell}). Measured: a real mini-window
-     * gives 0.6704 / 0.6700, 4e-4 apart; the rotation-transient rect gave 0.4525 / 0.4410, 1.15e-2
-     * apart — inside the hosted band. Second line of defence behind the transposed reject: a wrong
-     * scale here silently weaves the app at the wrong size, while refusing it only costs 2D.
-     */
-    private static final float BINDING_AXIS_AGREE_TOL = 0.005f;
+    private static final float AXIS_AGREE_TOL_FLOOR = 0.005f;
 
     /**
      * How far {@code layout * scale} may sit from a whole pixel.
@@ -224,16 +216,29 @@ public final class MiniWindowLayout {
      */
     @Nullable private static volatile MiniWindowLayout sForActivity = null;
 
-    /** Which of the two bands above this instance uses. */
-    private final float axisAgreeTol;
+    public MiniWindowLayout() {}
 
-    /** Hosted ({@link MonadoView}) — v2.16.16 behaviour, unchanged. */
-    public MiniWindowLayout() {
-        this(HOSTED_AXIS_AGREE_TOL);
-    }
-
-    private MiniWindowLayout(float axisAgreeTol) {
-        this.axisAgreeTol = axisAgreeTol;
+    /**
+     * How far the two axis ratios may disagree, for a window of {@code w x h} (runtime#1399).
+     *
+     * <p>ADAPTIVE, because a constant cannot be right at both ends. The vendor Rect is quantised to
+     * WHOLE PIXELS, so the ratios {@code r.width()/w} and {@code r.height()/h} carry a rounding
+     * error of up to half a pixel each — a real floor of about {@code 0.5/w + 0.5/h}. On a
+     * 1080x1685 window that is 7.6e-4, an order of magnitude under the floor; on a 200x150 window
+     * it is 5.8e-3, ABOVE it, and a fixed 5e-3 would have refused a perfectly good small
+     * mini-window and pushed it onto the 2D fallback silently. So take the larger of the two: the
+     * floor where quantisation is negligible, the quantisation limit where it is not.
+     *
+     * <p>This replaces the two constants #1398 shipped (hosted 2e-2, binding 5e-3). The hosted
+     * value was the loose one only because it predated the measurement; on the NP02J the ratios
+     * agree to 4e-4, so the shipped hosted answer is unchanged by the tightening — which is what
+     * the device leg of runtime#1399 verified before this landed.
+     */
+    private static float axisAgreeTol(int w, int h) {
+        if (w <= 0 || h <= 0) {
+            return AXIS_AGREE_TOL_FLOOR;
+        }
+        return Math.max(AXIS_AGREE_TOL_FLOOR, 0.5f / w + 0.5f / h);
     }
 
     // ---- per-episode state (an "episode" = one entry into a scaled container).
@@ -263,9 +268,8 @@ public final class MiniWindowLayout {
      * that is really 0.67x the panel still reports a full-size extent and spills off the edge. One
      * definition, deliberately identical to the compositor's {@code CONTAINER_SCALED} tell.
      *
-     * <p>This is the HOSTED predicate and is byte-for-byte what shipped in v2.16.16 — see {@link
-     * #isBindingTell} for why the surface-binding path needs a stricter one, and why that
-     * strictness is deliberately NOT applied here.
+     * <p>The raw geometric fact, and nothing else. Both callers wrap it with the mid-rotation
+     * reject below — see {@link #isTransposedPanel}.
      */
     @Keep
     public static boolean isTell(int x, int y, int w, int h, int dispW, int dispH) {
@@ -277,30 +281,33 @@ public final class MiniWindowLayout {
     }
 
     /**
-     * {@link #isTell} plus a ROTATION-TRANSIENT REJECT, for the surface-binding path only (#1396).
+     * Is this window extent EXACTLY the panel transposed, i.e. a mid-rotation sample?
      *
-     * <p>Measured on the NP02J 2026-09-07: an extent that is EXACTLY the panel transposed is not a
-     * scaled container, it is a sample taken mid-rotation — the app's {@code getLocationOnScreen}
-     * and {@code getRealSize} had updated while its view's width/height had not. Seen as {@code
-     * window 1757,236 1600x2560, panel 2560x1600} on the home→recents→freeform path: it spills, so
-     * it trips the raw tell, and the vendor Rect over those wrong dimensions yields a
-     * plausible-looking 0.4469 that latched a 715x1144 buffer and wove the app at the wrong size. A
-     * real scaled container reports the container's own logical size (1080x1685 here), never the
-     * panel's transpose.
+     * <p>Measured on the NP02J 2026-09-07: such an extent is not a scaled container, it is a sample
+     * taken while the rotation was in flight — {@code getLocationOnScreen} and {@code getRealSize}
+     * had updated while the view's width/height had not. Seen as {@code window 1757,236 1600x2560,
+     * panel 2560x1600} on the home→recents→freeform path: it spills, so it trips the raw tell, and
+     * the vendor Rect over those wrong dimensions yields a plausible-looking 0.4469 that latched a
+     * 715x1144 buffer and wove the app at the wrong size. A real scaled container reports the
+     * container's own logical size (1080x1685 here), never the panel's transpose.
      *
-     * <p>WHY NOT ON THE HOSTED PATH. {@code MonadoView} owns its view, so it never sees this
-     * inconsistency in the first place — its width/height and its Display come from the same laid
-     * out view. Adding the reject there would only introduce a NEW way for the predicate to flip to
-     * false mid-episode (at rotation), and the OFF branch runs {@code restoreLayoutToWindow() +
-     * setSizeFromLayout()}: a surface resize under a possibly in-flight weave, which is exactly the
-     * class of change that wedged the app in {@code vkWaitForFences} and is why {@link #isEnabled}
-     * is cached per process. The hosted path is shipped and eyeball-approved at v2.16.16; it keeps
-     * that behaviour untouched. Hardening it needs its own device pass WITH rotation —
-     * runtime#1399.
+     * <p>#1398 applied this to the surface-binding path only, on the ARGUMENT that {@code
+     * MonadoView} reads its extent and its Display off one laid-out view and so could not observe
+     * the inconsistency. runtime#1399 instrumented that argument on device instead of trusting it
+     * — see {@code MonadoView.sampleWindowRect}, which now SKIPS such a sample outright rather than
+     * ending the episode with it. Skipping is the shape that made it safe to apply there: the OFF
+     * branch would have been a surface resize under a possibly in-flight weave, which is the class
+     * of change that wedged the app in {@code vkWaitForFences} (#1394).
      */
     @Keep
+    public static boolean isTransposedPanel(int w, int h, int dispW, int dispH) {
+        return dispW > 0 && dispH > 0 && w == dispH && h == dispW;
+    }
+
+    /** {@link #isTell} plus the {@link #isTransposedPanel} reject (#1396). */
+    @Keep
     public static boolean isBindingTell(int x, int y, int w, int h, int dispW, int dispH) {
-        if (w == dispH && h == dispW) {
+        if (isTransposedPanel(w, h, dispW, dispH)) {
             return false; // mid-rotation sample, not a container scale
         }
         return isTell(x, y, w, h, dispW, dispH);
@@ -652,9 +659,10 @@ public final class MiniWindowLayout {
             }
             float sx = r.width() / (float) w;
             float sy = r.height() / (float) h;
-            // One leash scales both axes, so the two ratios must agree. How tightly is
-            // per-instance: see HOSTED_AXIS_AGREE_TOL / BINDING_AXIS_AGREE_TOL.
-            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > axisAgreeTol) {
+            // One leash scales both axes, so the two ratios must agree — to within
+            // whatever the Rect's whole-pixel quantisation allows at THIS size. See
+            // axisAgreeTol (runtime#1399).
+            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > axisAgreeTol(w, h)) {
                 return 0f;
             }
             // Keep the RAW rect: the rationalisation round-trips against these integers
@@ -742,7 +750,7 @@ public final class MiniWindowLayout {
         Activity activity = (Activity) activityObj;
         MiniWindowLayout self = sForActivity;
         if (self == null) {
-            self = new MiniWindowLayout(BINDING_AXIS_AGREE_TOL);
+            self = new MiniWindowLayout();
             sForActivity = self;
         }
         float s = self.resolveScale(activity, w, h, dispW, dispH);
