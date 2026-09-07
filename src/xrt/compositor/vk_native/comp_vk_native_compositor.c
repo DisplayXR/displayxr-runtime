@@ -3373,6 +3373,25 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
  * answer is to stop weaving and show correct 2D (epic #1277; the browser
  * shipped exactly this as "option 1", displayxr-browser#184 / patch 0123).
  *
+ * ## Superseded for the hosted path, by making the resample go away (#1367 S9)
+ *
+ * The degrade below is now the FALLBACK, not the first answer. The resample is
+ * not a property of the container — it is `buffer -> layer` scaling that exists
+ * only because the buffer is the LOGICAL size while the layer is `scale x`
+ * that. `MonadoView.updateMiniWindowOneToOne` measures the container scale
+ * (the OEM's `getDefaultWindowParamByTaskForNormalWr` test-API, or the
+ * raw-vs-local ratio of a real touch — S9 probes on #1367), hands the surface a
+ * `round(logical * scale)` buffer with `SurfaceHolder.setFixedSize`, and
+ * publishes the PHYSICAL rect. SF then composes `(1080/724) x 0.67 = 1.0` and
+ * the vendor's strict 1:1 buffer->panel weave holds inside the mini-window.
+ *
+ * Nothing here had to change for that: the tell reads the PUBLISHED rect, so a
+ * physical rect (1757,236 724x1129 on a 2560x1600 panel) simply fits the panel
+ * and this clears itself back to weaving. The degrade still covers every case
+ * the 1:1 path cannot serve — the scale not measurable, the two sources
+ * disagreeing, `debug.dxr.miniwindow_1to1 0`, a surface-binding app that has
+ * not opted in, and a window genuinely dragged off-panel.
+ *
  * ## The signal
  *
  * Mirrors the browser's heuristic EXACTLY, including its lack of slack: the OEM
