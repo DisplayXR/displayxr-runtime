@@ -711,17 +711,19 @@ struct comp_vk_native_compositor
 		int32_t zc_format;
 		uint32_t zc_width, zc_height, tgt_width, tgt_height;
 		bool ftime;
-		/*!
-		 * #1394: frame-timing marks the SERVER writes.
-		 *
-		 * This used to be a pointer to the requesting frame's stack array,
-		 * which is only valid while that frame is still waiting. Once the
-		 * wait can be abandoned (see `wedged`) the requester returns and its
-		 * stack is gone, so a late serve would write through a dangling
-		 * pointer. Compositor-owned storage instead; the requester copies out
-		 * only when it was actually served.
+		//! #1394: the requester's own fp[0] (frame-path start). The serve loop
+		//! seeds its marks from this; without it VK_FSTAGE_PRE measured from
+		//! zero, i.e. from the epoch.
+		uint64_t fp0;
+		/*
+		 * There is deliberately no pointer to the requester's fp[] here. It
+		 * used to be one, and it was only valid while that frame was still
+		 * waiting: once the wait can be abandoned (see `wedged`) the requester
+		 * returns and its stack is gone, so a late serve would write through a
+		 * dangling pointer. The serve loop keeps its own array instead, seeded
+		 * from fp0 above, and consumes every mark itself — nothing is copied
+		 * back, because `fp` is write-only from the requester's side.
 		 */
-		uint64_t fp_store[8];
 		xrt_result_t result;
 		bool skip_frame;
 		uint64_t served;        //!< Diagnostics.
@@ -738,6 +740,26 @@ struct comp_vk_native_compositor
 		 * alive and responsive instead of freezing behind a dead DP.
 		 */
 		bool wedged;
+		/*!
+		 * #1394: liveness evidence, so `wedged` is not a one-way door.
+		 *
+		 * The 2 s deadline fires on ANY weave that takes longer than that —
+		 * a thermal hitch, a target-recreate storm, a debugger, or the fill
+		 * fence-park (which does NOT hold c->mutex). Blackening the session
+		 * for those would be strictly worse than #1196, which failed one
+		 * frame and carried on. So a wedge is only declared when c->mutex is
+		 * OBSERVABLY unavailable (os_mutex_trylock fails), and it is lifted
+		 * again when the loop is observably alive: `heartbeat` is bumped once
+		 * per iteration of vk_repaint_thread, so a value that has moved past
+		 * `wedged_heartbeat` means the thread came back.
+		 *
+		 * Plain reads/writes, no stdatomic (CLAUDE.md forbids C11 atomics in
+		 * portable code). This IS a benign data race by construction: a torn
+		 * or stale read costs one extra short-circuited frame or one extra
+		 * trylock, never correctness, and the trylock is the authority.
+		 */
+		uint64_t heartbeat;
+		uint64_t wedged_heartbeat;
 		/*!
 		 * #1394: the hand-off handshake's OWN lock — deliberately NOT c->mutex.
 		 *
@@ -1736,13 +1758,33 @@ vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t wid
 	}
 }
 
+static bool
+dxr_weave_app_submit_guard(void);
+static bool
+vk_weave_blocked(struct comp_vk_native_compositor *c);
+
 static xrt_result_t
 vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
+	/*
+	 * #1394: never take c->mutex once the weave is wedged.
+	 *
+	 * The window-follow blocks below all lock it on a size change, and a
+	 * wedged weave holds it forever — so the first resize after a wedge would
+	 * freeze xrBeginFrame exactly the way xrEndFrame used to freeze. Skipping
+	 * the follow costs a stale output size on a display that is not updating
+	 * anyway.
+	 */
+	const bool weave_blocked = vk_weave_blocked(c);
+	// Android has no window-follow block below (the surface is republished
+	// through XR_DXR_android_surface_binding, not polled here), so begin_frame
+	// takes no lock there and the guard has nothing to gate.
+	(void)weave_blocked;
+
 #ifdef XRT_OS_WINDOWS
-	if (c->hwnd != NULL) {
+	if (c->hwnd != NULL && !weave_blocked) {
 		RECT rect;
 		if (GetClientRect((HWND)c->hwnd, &rect)) {
 			uint32_t new_width = (uint32_t)(rect.right - rect.left);
@@ -1806,7 +1848,7 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 #endif
 
 #ifdef XRT_OS_MACOS
-	if (c->macos_window != NULL) {
+	if (c->macos_window != NULL && !weave_blocked) {
 		uint32_t new_width = 0, new_height = 0;
 		comp_vk_native_window_macos_get_dimensions(c->macos_window, &new_width, &new_height);
 
@@ -1850,7 +1892,7 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
-	{
+	if (!weave_blocked) {
 		uint32_t new_width = 0, new_height = 0;
 		if (c->xcb_window != NULL) {
 			comp_vk_native_window_xcb_get_dimensions(c->xcb_window, &new_width, &new_height);
@@ -1930,7 +1972,9 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	 * in. See dxr_weave_app_submit_guard for the measured trade.
 	 */
 	c->repaint.app_submit_window = true;
-	c->repaint.app_frame_begin_ns = os_monotonic_get_ns();
+	// Only the guard reads the timestamp (for its staleness escape), so do not
+	// pay a clock read per frame when it is off — which is the default.
+	c->repaint.app_frame_begin_ns = dxr_weave_app_submit_guard() ? os_monotonic_get_ns() : 0;
 
 	c->layer_accum.layer_count = 0;
 	return XRT_SUCCESS;
@@ -5051,6 +5095,57 @@ dxr_weave_app_submit_guard(void)
 	return on == 1;
 }
 
+/*!
+ * #1394: has the weave thread come back since we declared it wedged?
+ *
+ * Two independent pieces of evidence, both required: the repaint loop has
+ * ticked at least once since the wedge (so the thread is not parked), and
+ * c->mutex is free (so nothing is still holding it). Either alone is not
+ * enough — the loop can tick while another thread legitimately holds the
+ * lock, and the lock can be momentarily free while the weave is still parked
+ * inside the vendor call, because the fill fence-park releases it.
+ *
+ * On success the caller may take c->mutex normally; this leaves it unheld.
+ */
+static bool
+vk_weave_unwedged(struct comp_vk_native_compositor *c)
+{
+	if (!c->weave_hand.wedged) {
+		return true;
+	}
+	if (c->weave_hand.heartbeat == c->weave_hand.wedged_heartbeat) {
+		return false;
+	}
+	if (os_mutex_trylock(&c->mutex) != 0) {
+		return false;
+	}
+	os_mutex_unlock(&c->mutex);
+	c->weave_hand.wedged = false;
+	U_LOG_W(
+	    "#1394: the weave thread came back (repaint loop ticking, c->mutex free) — "
+	    "un-wedging; the window resumes updating.");
+	return true;
+}
+
+/*!
+ * #1394: must an app-thread entry point refuse to take c->mutex right now?
+ *
+ * True only while the weave is wedged AND has not recovered. Every app-thread
+ * site that would otherwise block on c->mutex consults this: layer_commit,
+ * begin_frame's window-follow, and set_sys_info's atlas realloc. Skipping the
+ * work is always safe — the output is frozen anyway — and it is what keeps
+ * xrBeginFrame/xrEndFrame returning instead of blocking behind a lock that is
+ * never released.
+ */
+static bool
+vk_weave_blocked(struct comp_vk_native_compositor *c)
+{
+	if (!c->weave_hand.wedged) {
+		return false;
+	}
+	return !vk_weave_unwedged(c);
+}
+
 static bool
 vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
 {
@@ -5186,6 +5281,11 @@ vk_repaint_thread(void *ptr)
 		const uint64_t tick_ns =
 		    (c->repaint.partition.next_release_ns != 0) ? period_ns / 12 : period_ns / 4;
 
+		// #1394: liveness beacon for vk_weave_unwedged. One plain increment per
+		// iteration; it stops the instant this thread parks inside the vendor
+		// weave, which is exactly the condition it exists to report.
+		c->weave_hand.heartbeat++;
+
 		/*
 		 * #1394: take the REQUEST under the hand-off's own lock, run the
 		 * weave under c->mutex, then publish the result under the hand-off
@@ -5199,12 +5299,17 @@ vk_repaint_thread(void *ptr)
 		 * weave actually needs (compositor state, the DP, the queue) while
 		 * leaving the requester a lock it can always get back.
 		 *
-		 * Lock order is one-way — weave_hand.mutex is a leaf and is never
-		 * held while taking c->mutex — so the two can never deadlock.
+		 * Lock order is one-way: **c->mutex may be held across
+		 * weave_hand.mutex, never the reverse.** weave_hand.mutex is the leaf.
+		 * The only nesting anywhere is in vk_compositor_layer_commit, where
+		 * the frame path holds c->mutex and then takes weave_hand.mutex to
+		 * post the request; this loop takes them strictly one at a time. So
+		 * the two can never deadlock.
 		 */
 		bool serve = false;
 		uint64_t serve_seq = 0;
 		bool h_zero_copy = false, h_ftime = false;
+		uint64_t h_fp0 = 0;
 		uint64_t h_zc_image = 0, h_zc_view = 0;
 		int32_t h_zc_format = 0;
 		uint32_t h_zc_w = 0, h_zc_h = 0, h_tgt_w = 0, h_tgt_h = 0;
@@ -5225,6 +5330,7 @@ vk_repaint_thread(void *ptr)
 			h_tgt_w = c->weave_hand.tgt_width;
 			h_tgt_h = c->weave_hand.tgt_height;
 			h_ftime = c->weave_hand.ftime;
+			h_fp0 = c->weave_hand.fp0;
 		}
 		os_mutex_unlock(&c->weave_hand.mutex);
 
@@ -5232,6 +5338,10 @@ vk_repaint_thread(void *ptr)
 			xrt_result_t h_result = XRT_ERROR_VULKAN;
 			bool h_skip = true;
 			uint64_t h_fp[8] = {0};
+			// The frame path's own start mark, taken by the requester before it
+			// handed off. VK_FSTAGE_PRE is measured from it, so a zero here is
+			// an epoch-length first interval in DXR_FRAME_STAGE_TIMING.
+			h_fp[0] = h_fp0;
 
 			os_mutex_lock(&c->mutex);
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
@@ -5251,7 +5361,6 @@ vk_repaint_thread(void *ptr)
 			if (c->weave_hand.pending && c->weave_hand.seq == serve_seq) {
 				c->weave_hand.result = h_result;
 				c->weave_hand.skip_frame = h_skip;
-				memcpy(c->weave_hand.fp_store, h_fp, sizeof(h_fp));
 				c->weave_hand.served++;
 				c->weave_hand.pending = false;
 				os_cond_broadcast(&c->weave_hand.cond);
@@ -6340,10 +6449,16 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				 * target recreate, this thread parked here behind it. Two
 				 * seconds is deliberately generous: it must never fire on a
 				 * merely slow frame, only convert a permanent wedge into one
-				 * failed frame. The abandon below is race-free — both sides
-				 * run under c->mutex and the serve site re-tests `pending`
-				 * under the lock before writing anything, so a request
-				 * withdrawn here is simply never served.
+				 * failed frame.
+				 *
+				 * #1394 correction: the two sides no longer share c->mutex —
+				 * that is exactly what made the deadline unreachable. The
+				 * handshake runs on weave_hand.mutex (a leaf), the weave runs
+				 * under c->mutex, and the requester releases c->mutex before
+				 * waiting. The abandon stays race-free because both sides
+				 * re-test `pending` AND the request serial under
+				 * weave_hand.mutex before writing anything, so a request
+				 * withdrawn here can only be dropped, never served late.
 				 */
 				uint64_t my_seq;
 				os_mutex_lock(&c->weave_hand.mutex);
@@ -6356,6 +6471,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				c->weave_hand.tgt_width = tgt_width;
 				c->weave_hand.tgt_height = tgt_height;
 				c->weave_hand.ftime = ftime;
+				c->weave_hand.fp0 = fp[0];
 				c->weave_hand.result = XRT_SUCCESS;
 				c->weave_hand.skip_frame = false;
 				my_seq = ++c->weave_hand.seq;
@@ -6386,61 +6502,116 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						continue;
 					}
 					/*
-					 * Wedged. Withdraw the request — bumping the serial so a
+					 * Expired. Withdraw the request — bumping the serial so a
 					 * serve that eventually completes is dropped instead of
-					 * writing into a frame that no longer exists — and give
-					 * up on the weave for the rest of the session.
+					 * writing into a frame that no longer exists.
 					 *
 					 * This deadline is only reachable at all because the wait
 					 * is on weave_hand.mutex. On c->mutex it timed out and
 					 * then blocked forever re-acquiring the lock the parked
 					 * weave holds: measured zero abandons across six captured
 					 * wedges on an NP02J while xrEndFrame never returned.
+					 *
+					 * Deliberately does NOT declare a wedge. Two seconds is
+					 * generous but not proof: a thermal hitch, a debugger, a
+					 * recreate storm or the fill fence-park (which releases
+					 * c->mutex across its own wait) all reach here with the
+					 * weave perfectly alive. Declaring one here would black
+					 * the session out for a frame that was merely late —
+					 * strictly worse than #1196, which failed the frame and
+					 * carried on. The evidence test is below, outside this
+					 * lock.
 					 */
 					c->weave_hand.pending = false;
 					c->weave_hand.seq++;
 					c->weave_hand.result = XRT_SUCCESS;
 					c->weave_hand.skip_frame = true;
-					c->weave_hand.wedged = true;
 					abandoned = true;
 					break;
 				}
 				xret = c->weave_hand.result;
 				skip_frame = c->weave_hand.skip_frame;
-				if (!abandoned && ftime && fp != NULL) {
-					memcpy(fp, c->weave_hand.fp_store, 7 * sizeof(uint64_t));
-				}
+				// No copy-back: `fp` is write-only from here on. Every mark is
+				// consumed inside vk_dp_weave_and_present, which the serve loop
+				// runs against its own array seeded from weave_hand.fp0.
+				const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 				os_mutex_unlock(&c->weave_hand.mutex);
 
 				if (abandoned) {
 					/*
-					 * Do NOT re-take c->mutex: the weave thread holds it and
-					 * is not coming back. Everything below this point in the
-					 * frame path needs it, so the frame ends here — and every
-					 * later layer_commit short-circuits on `wedged` before it
-					 * would block on the same lock, which is what keeps the
-					 * app alive and responsive instead of frozen inside
-					 * xrEndFrame.
+					 * THE EVIDENCE TEST. Is c->mutex actually unavailable, or
+					 * was this weave merely slow?
 					 *
-					 * Relaxed writes: the compositor lock is unavailable by
-					 * construction here, and the only reader that matters is
-					 * the repaint loop's gate, for which a stale read costs
-					 * one more attempt that parks on the same lock.
+					 * A trylock answers it without blocking and without
+					 * inverting the lock order — weave_hand.mutex is already
+					 * released above, so this is a bare acquisition, not a
+					 * nesting.
 					 */
-					c->repaint.armed = false;
-					c->repaint.enabled = 0;
-					U_LOG_E(
-					    "#1394: weave thread unresponsive for 2 s — abandoning the "
-					    "weave for this session. The app keeps running; the window "
-					    "will not update. Known signature: the vendor weaver's own "
-					    "vkQueueSubmit lost the Adreno GSL timestamp race "
-					    "(\"next client ts N must be greater than current ts N\") "
-					    "and asserted, leaving a fence that is waited on with no "
-					    "timeout (LeiaInc/CNSDK#733).");
-					*out_lock_released = true;
-					return XRT_SUCCESS;
+					if (os_mutex_trylock(&c->mutex) == 0) {
+						/*
+						 * Free. The weave thread is not holding it, so it is
+						 * late, not gone — the fill fence-park releases the
+						 * lock across its own wait and lands here, as does a
+						 * thermal hitch or a recreate storm. Fail THIS frame
+						 * only, exactly as #1196 did, and leave the session
+						 * intact. We now hold c->mutex, so the frame path
+						 * continues normally from here and the wrapper
+						 * unlocks it.
+						 */
+						static uint64_t s_slow_logged_ns = 0;
+						const uint64_t now_ns = os_monotonic_get_ns();
+						if (s_slow_logged_ns == 0 ||
+						    now_ns - s_slow_logged_ns > 10ULL * 1000 * 1000 * 1000) {
+							s_slow_logged_ns = now_ns;
+							U_LOG_W(
+							    "#1394: weave took over 2 s — dropped this frame. "
+							    "c->mutex is free, so the weave thread is late, "
+							    "not wedged; the session continues. Throttled to "
+							    "one line per 10 s.");
+						}
+						c->repaint.armed = false;
+						skip_frame = true;
+						xret = XRT_SUCCESS;
+					} else {
+						/*
+						 * Held, and the only thing that holds it this long is
+						 * a weave parked inside the vendor call. Declare the
+						 * wedge and do NOT re-take c->mutex: everything below
+						 * needs it, so the frame ends here, and every later
+						 * app-thread entry point short-circuits on `wedged`
+						 * before it would block on the same lock. That is what
+						 * keeps the app alive and responsive instead of frozen
+						 * inside xrEndFrame.
+						 *
+						 * Not permanent: `wedged_heartbeat` is the loop's tick
+						 * count at this instant, and vk_weave_unwedged lifts
+						 * the flag if the thread ever comes back.
+						 *
+						 * Unlocked writes here are a deliberate, benign data
+						 * race — c->mutex is unavailable by construction and
+						 * CLAUDE.md rules out C11 atomics in portable code.
+						 * The only reader that matters is the repaint gate,
+						 * for which a stale read costs one more attempt that
+						 * parks on the same lock.
+						 */
+						c->repaint.armed = false;
+						c->weave_hand.wedged_heartbeat = hb_at_expiry;
+						c->weave_hand.wedged = true;
+						U_LOG_E(
+						    "#1394: weave thread unresponsive for 2 s and c->mutex is "
+						    "held — abandoning the weave. The app keeps running; the "
+						    "window will not update until the thread returns. Known "
+						    "signature: the vendor weaver's own vkQueueSubmit lost "
+						    "the Adreno GSL timestamp race (\"next client ts N must "
+						    "be greater than current ts N\") and asserted, leaving a "
+						    "fence that is waited on with no timeout "
+						    "(LeiaInc/CNSDK#733).");
+						*out_lock_released = true;
+						return XRT_SUCCESS;
+					}
+				} else {
+					os_mutex_lock(&c->mutex);
 				}
-				os_mutex_lock(&c->mutex);
 			} else {
 				xret = vk_dp_weave_and_present(c, /*is_repaint=*/false, zero_copy, zc_image_u64,
 				                               zc_view_u64, zc_format, zc_width, zc_height, tgt_width,
@@ -6519,7 +6690,28 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	 * into "the window stops updating and the app keeps running". Read without
 	 * the lock, and only ever written by this same thread.
 	 */
-	if (c->weave_hand.wedged) {
+	if (vk_weave_blocked(c)) {
+		/*
+		 * Throttled so a log taken long after the wedge still says why the
+		 * window is frozen — the one-shot U_LOG_E above may be far off the
+		 * top of the buffer by then.
+		 *
+		 * U_LOG_W, not U_LOG_I, and that is measured rather than a style
+		 * choice: the INFO version of this line did not appear in a device
+		 * capture of a real wedge at all (the compositor's INFO is dropped
+		 * from the frame path — docs/reference/debug-logging.md), so it
+		 * failed the one job it has. One line per 5 s is lifecycle rate, not
+		 * the per-frame WARN the logging rule forbids.
+		 */
+		static uint64_t s_blocked_logged_ns = 0;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (s_blocked_logged_ns == 0 || now_ns - s_blocked_logged_ns > 5ULL * 1000 * 1000 * 1000) {
+			s_blocked_logged_ns = now_ns;
+			U_LOG_W(
+			    "#1394: frame dropped — the weave thread is still parked and holds "
+			    "c->mutex. The app is running normally; the window is frozen. "
+			    "Throttled to one line per 5 s.");
+		}
 		c->repaint.app_frame_in_progress = false;
 		c->repaint.app_submit_window = false;
 		return XRT_SUCCESS;
@@ -6552,6 +6744,40 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	struct vk_bundle *vk = &c->vk;
 
 	U_LOG_I("Destroying VK native compositor");
+
+	/*
+	 * #1394: a wedged weave thread cannot be joined, and nothing below is
+	 * safe while it lives.
+	 *
+	 * os_thread_helper_destroy joins, unbounded, and the thread it would join
+	 * is parked in the vendor weaver's vkWaitForFences and never returns — so
+	 * this is where the freeze reappears if it is not handled: it moves out of
+	 * xrEndFrame and into xrDestroySession, where on Android it looks like the
+	 * platform killing the process rather than the app exiting.
+	 *
+	 * Joining is not the only problem. That thread still holds c->mutex and
+	 * still has live references to `c`, the display processor and the target,
+	 * so destroying the mutex (UB — destroying a held mutex), the DP, the
+	 * target or `c` itself would arm a use-after-free for the moment it wakes.
+	 *
+	 * So: signal it to stop (it will never see the flag) and LEAK it, along
+	 * with everything it can still reach. One session's worth of compositor
+	 * state, once, on a device that is already displaying a frozen window — a
+	 * bounded, diagnosable leak against an unbounded hang. The MCP capture
+	 * hook is process-global and points at `c`, so that one must still come
+	 * out or a later capture would dereference the leaked object.
+	 */
+	if (vk_weave_blocked(c)) {
+		U_LOG_W(
+		    "#1394: the weave thread is still parked in the vendor weaver — NOT "
+		    "joining it, and LEAKING the compositor, its display processor, its "
+		    "target and c->mutex. Joining would hang xrDestroySession forever and "
+		    "freeing them would arm a use-after-free. See LeiaInc/CNSDK#733.");
+		os_thread_helper_signal_stop(&c->repaint_thread);
+		mcp_capture_uninstall();
+		mcp_capture_fini(&c->mcp_capture);
+		return;
+	}
 
 	// #868: stop the repaint loop FIRST. It touches the queue, the target and
 	// the display processor, all of which are torn down below. Joining before
@@ -8827,6 +9053,13 @@ comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
 		// #868: reallocates the atlas the repaint replay holds a view of.
 		// Same lock + disarm as begin_frame's resize path. Normally called
 		// once at session setup, but nothing guarantees that.
+		//
+		// #1394: and if the weave is wedged, c->mutex is never released —
+		// so skip the realloc rather than block the app thread here. The
+		// atlas it would resize feeds an output that is not updating.
+		if (vk_weave_blocked(c)) {
+			return;
+		}
 		os_mutex_lock(&c->mutex);
 		vk_repaint_disarm_locked(c);
 		comp_vk_native_renderer_resize(c->renderer, vw, vh, tc * vw, tr * vh);

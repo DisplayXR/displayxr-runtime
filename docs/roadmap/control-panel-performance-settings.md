@@ -244,7 +244,7 @@ process resolves the same chain. Three surfaces, in order of value:
    resolved from real display topology, and the split engages *automatically* when they
    differ. A checkbox per lever invites combinations nobody has ever measured — which is
    the argument for presets.
-3. **Doc drift already exists.** 32 of the 71 `DXR_*` names appear nowhere in `docs/`, and
+3. **Doc drift already exists.** 32 of the 72 `DXR_*` names appear nowhere in `docs/`, and
    `motion-to-photon-levers.md` documents `DXR_DEFER_PRESENT` in four places although it
    exists nowhere in `src/`. Exposing a name in a GUI is a commitment to it; document
    first.
@@ -346,6 +346,7 @@ library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, contr
 | `DXR_WEAVE_REPAINT_REFLATTEN` | `compositor/gl/comp_gl_compositor.cpp:3388` | `getenv`, cached | off | App | 4 | Force a repaint to re-run deposit/flatten. Source comment: "must never be a default" |
 | `DXR_WEAVE_REPAINT_DRAIN` | `compositor/vk_native/comp_vk_native_compositor.c:4219` | `getenv`, cached | off | App | 4 | Force `vkDeviceWaitIdle` around a repaint (cross-queue race probe) |
 | `DXR_WEAVE_SINGLE_THREAD` | `compositor/vk_native/comp_vk_native_compositor.c:6169` | `getenv` (+ `debug.dxr.weave_single_thread`) | on (Android), off elsewhere | App | 1 | #1196 pins the DP weave to one thread where the DP is proven thread-affine |
+| `DXR_WEAVE_APP_SUBMIT_GUARD` | `compositor/vk_native/comp_vk_native_compositor.c` (`dxr_weave_app_submit_guard`) | `getenv` (+ `debug.dxr.weave_app_submit_guard`), cached | **off** | App | 2 | #1394. Stops a fill weave running between the app's `xrBeginFrame` and `xrEndFrame`, i.e. across the app's own `vkQueueSubmit` calls. On Adreno every VkQueue in the process shares one GSL submission context and no `VK_LAYER_DXR_queue_lock` can load on Android, so a fill can lose the queue-timestamp race against the app and take the vendor weaver's own submit down with it. Measured on an NP02J: mini-window wedges 6/21 off vs 2/23 on, fullscreen weave rate 40-47 Hz off vs 17.6 Hz on. Off by default because that is more than half the weave rate for a partial fix, and it is a quality call. Tier 2 rather than 1: a user would only ever reach for it on a device showing the wedge |
 | `DXR_LATE_WEAVE` | `compositor/d3d11/comp_d3d11_target.cpp:51`; `d3d11_service/…:187`; `d3d12/comp_d3d12_target.cpp:68`; `gl/…:2423`; `vk_native/comp_vk_native_target.cpp:229` | `getenv`, cached per site | **on** | App + Svc | 1 | Weave as late as possible before scanout. The largest single latency win |
 | `DXR_LATE_WEAVE_MAX_LATENCY` | `compositor/util/comp_weave_latency_win.h:221`; `vk_native/comp_vk_native_target.cpp:245` | `getenv` into a file-scope governor | 1 | App + Svc | 3 | Frame-latency depth, clamped `1..LATE_WEAVE_MAX_DEPTH`. Only `base` is latched; `effective` already moves at runtime |
 | `DXR_LATE_WEAVE_AUTOBACKOFF` | `compositor/util/comp_weave_latency_win.h:224` | `getenv` into the same governor | on | App + Svc | 3 | Backs the depth off on saturation; 30 s dwell, doubling, capped at 5 min |
