@@ -724,6 +724,13 @@ struct multi_compositor
 		bool sat_checked; //!< Prop read once per client.
 		bool sat_enabled;
 		bool sat_failed; //!< One-shot: bring-up failed, use the return path.
+		//! #1387 defect 2: THIS client has painted the panel-global overlay and
+		//! has not cleared it since. It is what the weave-idle stale-frame guard
+		//! must key on — not `dp != NULL`, which is present-owner-only state and
+		//! is NULL for an APP-class (demo) client that the satellite presents for
+		//! (#1377). Set by a successful satellite present, cleared by the clear
+		//! and by any swapchain release.
+		bool sat_presented;
 		struct android_custom_surface *sat_csurface;
 		VkSurfaceKHR sat_surface;
 		VkSwapchainKHR sat_swapchain;
@@ -1117,6 +1124,17 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
  */
 void
 comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
+
+/*!
+ * Has THIS client painted the satellite overlay and not cleared it since?
+ *
+ * #1387 defect 2: the stale-frame guard above must fire for every client the
+ * satellite has presented for, and an APP-class (demo) session routed onto the
+ * satellite by #1377 has no `mc->weave.dp` — that field is present-owner
+ * (`XR_DXR_weave`) state. Call with mc->weave.mutex held.
+ */
+bool
+comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
 #endif
 
 bool

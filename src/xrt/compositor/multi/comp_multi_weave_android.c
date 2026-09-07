@@ -708,6 +708,7 @@ weave_satellite_release(struct vk_bundle *vk, struct multi_compositor *mc)
 		android_custom_surface_destroy(&mc->weave.sat_csurface);
 	}
 	mc->weave.sat_image_count = 0;
+	mc->weave.sat_presented = false;
 }
 
 /*!
@@ -1348,7 +1349,14 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
 		vk->vkQueuePresentKHR(vk->main_queue->queue, &present);
 	}
 	vk_queue_unlock(vk->main_queue);
+	mc->weave.sat_presented = false;
 	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
+}
+
+bool
+comp_multi_weave_android_satellite_presented(struct multi_compositor *mc)
+{
+	return mc != NULL && mc->weave.sat_presented;
 }
 
 /*!
@@ -1653,6 +1661,10 @@ weave_satellite_present(struct vk_bundle *vk,
 	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
 		U_LOG_E("weave satellite(#1277): present: %s", vk_result_string(ret));
 		weave_satellite_release(vk, mc);
+	} else {
+		// #1387 defect 2: this client's pixels are now on the panel-global
+		// overlay, and stay there until someone clears them.
+		mc->weave.sat_presented = true;
 	}
 }
 
