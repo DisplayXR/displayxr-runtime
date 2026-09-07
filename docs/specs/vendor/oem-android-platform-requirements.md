@@ -86,7 +86,7 @@ Tiering:
 | **S6** | Window **move is atomic with the buffer**; a drag affordance exists | STRONGLY REC. | **PLATFORM** | OPEN |
 | **S7** | **Per-display** tracking/lens config (multi-panel) | STRONGLY REC. | VENDOR | OPEN |
 | **S8** | A **platform-composed weave** (end state), or — now — a **full-opacity, device-composited privileged overlay** for the runtime's weave satellite | STRONGLY REC. | **PLATFORM** | OPEN — the intermediate form is measured and shipping behind a flag |
-| **S9** | Expose the **container scale + composited on-screen rect** per window (or a manifest opt-out from mini-window scaling) | STRONGLY REC. | **PLATFORM** | OPEN — the information, not the capability, is what is missing |
+| **S9** | Expose the **container scale + composited on-screen rect** per window (or a manifest opt-out from mini-window scaling) | STRONGLY REC. | **PLATFORM** | **SATISFIED on the reference firmware, de facto** (2026-09-07): a hidden **test-API** on the activity manager returns the post-scale on-screen rect to an ordinary app, and the touch transform recovers the scale exactly; ask = keep it, make it public / stable |
 | **N1** | Observability: log the applied engine config **and** the client that set it | NICE | VENDOR | PR open |
 | **N2** | Document the **classloader-parent contract**; add an explicit `classLoader` field | NICE | VENDOR | Docs PR open |
 | **N3** | Capture protocol: panel extent in header, configurable width/rate, zero-copy path | NICE | VENDOR | Runtime consumer side landed; vendor producer PR open |
@@ -1425,13 +1425,36 @@ games are listed, exactly the class of app that renders wrong when resampled
 — alongside allow-lists, and other builds of the same OEM software expose the
 *scale* itself as a distinct vendor feature flag. So the platform owner already
 has, and already uses, a mechanism for "do not put this app in the scaled
-window". **Ask, ahead of S9:** add the 3D runtime's clients (the DisplayXR
-packages and the browser) to that exclusion, or expose the exclusion as a
-manifest property so a 3D app can declare it. What the exclusion does to a
-listed app — fullscreen-only, or simply ineligible for the scaled recents
-window — must be confirmed with the OEM; either satisfies R6. Zero code on
-either side; it only needs to be agreed. (Named file and list: internal
-engagement notes.)
+window". Measured 2026-09-07 on the reference device: the lists are
+**eligibility and chrome only, no geometry**, unlisted apps are eligible by
+default, and the file is platform-writable with a remote-update flag. So the
+ask here is defensive — **do not add the 3D runtime's clients to the exclusion**
+(they now handle the scale, below) — and, for OEMs that want a knob, expose the
+exclusion as a manifest property a 3D app can declare. (Named file and lists:
+internal engagement notes.)
+
+**What actually closes S9 on this firmware (measured the same day, both from an
+ordinary app uid, no permission, no platform signature):**
+
+1. A hidden **test-API** on the activity manager returns the **post-scale
+   on-screen rect** of the caller's task (`Rect(1757, 236 - 2481, 1365)` for a
+   1080×1685 logical task on the 2560×1600 panel) — flagged test-API, not
+   blocklisted under stock hidden-API enforcement. It returns the *nominal*
+   placement in every state, so the runtime only trusts it when its own
+   scaled-container tell fires.
+2. **The input transform.** Touches reach the app in logical coordinates while
+   `getRawX/Y` stay in screen pixels, so on a real dispatched event the ratio
+   of raw to local deltas is the leash scale itself (measured 0.670000 with the
+   intercept recovering the origin (1757, 236) to 0.0001 px; exactly 1.0
+   fullscreen). Synthetic events carry an identity transform and read 1.0 —
+   a trap for anyone testing this; accessibility magnification multiplies in.
+
+With either, the runtime sizes its buffer to the on-screen pixel count at the
+same origin, the compositor's composed transform becomes identity, and the
+existing integer viewport weave is 1:1 again — no OEM or vendor change. The ask
+that remains is stability: keep the test-API (or a public equivalent) across
+firmware updates, and document it; the input-transform method is the portable
+fallback on any Android build.
 
 ### S9 — Expose the container scale and the composited on-screen rect
 
