@@ -427,6 +427,30 @@ that order, because the manifest line is the one step that is a release in
 someone else's repo.
 
 
+## The vendor interlacer assumes strict 1:1 (2026-09-07, from the CNSDK side)
+
+Read from the interlace shader by the CNSDK maintainers while designing
+LeiaInc/CNSDK#732: the weave assumes a strict 1:1 buffer→panel mapping — the
+same `mViewportWidth` is both the buffer divisor and the panel extent, the
+screen position is an integer, and the per-pixel index is `floor()`ed. So even
+if the platform handed the runtime the container scale today, the vendor
+interlacer could not consume it; "consume a scale" is a prerequisite on the
+vendor side of #732, not a plumbing detail. Consequences for this roadmap:
+
+- The satellite's physical-rect weave at the derived constant (P1,
+  `e777fc6b2`) is the structurally correct shape for a scaled container now,
+  not a stopgap: it feeds the interlacer integer panel pixels at 1:1.
+- The runtime-side tell (`bounds exceed the panel`, PR #1372) answers
+  *whether* a window is scaled; the scalar (*how much*) must come from a
+  platform-trusted reader (#732) — the app's `getLocationOnScreen()` origin is
+  already the true post-scale on-screen origin, only the size is pre-scale
+  (SurfaceFlinger: `geomLayerTransform` = translate (1757,236) + 0.67·bounds =
+  `coveredRegion [1757,236,2481,1365]`), so #732 needs one scalar per task,
+  not a rect.
+- Static-once-settled is measured; the open/close transition is not — an
+  animated scale still needs the platform-composed weave (S8) or the 2D
+  fallback.
+
 ## P2 implementation plan (2026-09-07)
 
 The section above is the *design*. This one is the executable plan: every touch
