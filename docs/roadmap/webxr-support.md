@@ -56,6 +56,17 @@ model is inline (§2.1). Retiring the bridge is therefore a deliberate scope dec
 **immersive WebXR is no longer a first-class authoring target.** It still runs, bare and
 unaugmented, on the legacy compromise branch — which is retained precisely for that.
 
+**What the retirement did not answer (2026-09-08).** The bridge only reached pages that
+opted in; the *unmodified* headset-authored corpus was left on the bare compromise branch. A
+zero-page-change conversion — the DisplayXR Browser serving `immersive-vr` itself through the
+inline-3d weave path, in-tab, with the runtime-hosted takeover blocked — is a different
+proposition from the bridge and is being studied in the browser repo:
+[`docs/design/immersive-vr-emulation.md`](https://github.com/DisplayXR/displayxr-browser-pvt/blob/main/docs/design/immersive-vr-emulation.md).
+Nothing in this chapter is reopened by it: the legacy compromise branch stays as is, and the
+runtime already hands a legacy client render-ready off-axis views
+([extension-vs-legacy](../architecture/extension-vs-legacy.md) § The View Path), which is what
+makes the browser-side conversion cheap.
+
 Supporting reasons, recorded for the archaeology: the bridge was Windows-only while the
 browser now covers Windows and Android; it had been in maintenance-only mode, costing
 cross-cutting refactors (#960 client classes, #734 extension rename) without gaining
