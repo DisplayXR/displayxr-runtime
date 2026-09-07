@@ -74,7 +74,7 @@ public final class MiniWindowLayout {
      * <p>HOSTED keeps the v2.16.16 value. It is loose because the Rect is quantised to whole
      * pixels, so a genuinely small mini-window has a real quantisation floor of about {@code 0.5/w
      * + 0.5/h}; tightening it there would silently push such a window onto the 2D fallback, on a
-     * path that is shipped and eyeball-approved. See runtime#1400.
+     * path that is shipped and eyeball-approved. See runtime#1399.
      */
     private static final float HOSTED_AXIS_AGREE_TOL = 0.02f;
 
@@ -183,7 +183,7 @@ public final class MiniWindowLayout {
      * class of change that wedged the app in {@code vkWaitForFences} and is why {@link #isEnabled}
      * is cached per process. The hosted path is shipped and eyeball-approved at v2.16.16; it keeps
      * that behaviour untouched. Hardening it needs its own device pass WITH rotation —
-     * runtime#1400.
+     * runtime#1399.
      */
     public static boolean isBindingTell(int x, int y, int w, int h, int dispW, int dispH) {
         if (w == dispH && h == dispW) {

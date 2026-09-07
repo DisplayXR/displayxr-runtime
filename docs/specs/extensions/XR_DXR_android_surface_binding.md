@@ -258,8 +258,8 @@ disagree for a frame during a rotation; `MonadoView` reads both off one laid-out
 view and never sees that. Applying the reject there would add a new way for the
 predicate to flip mid-episode, and its OFF branch resizes the surface — the class
 of change that has been measured to wedge a weave in `vkWaitForFences`.
-Hardening the hosted path is tracked separately and needs its own device pass
-*with* rotation.
+Hardening the hosted path is tracked as runtime#1399 and needs its own device
+pass *with* rotation.
 
 #### Application obligations
 
