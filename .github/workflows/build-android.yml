@@ -333,6 +333,45 @@ jobs:
           fi
           ./gradlew :src:xrt:targets:openxr_android:assembleRelease --no-daemon --stacktrace $ARGS
 
+      # #1402 -- the XR_DXR_android_surface_binding REFERENCE app.
+      #
+      # cube_handle_vk_android is what the extension spec points adopters at and
+      # what the spec-v2 layout-hint handling (#1396/#1398) was written into
+      # first. It was in settings.gradle and compiled locally, but NOTHING in CI
+      # built it -- so the one app whose job is to be copied could rot silently
+      # while every runtime job stayed green. A reference that is only assumed
+      # to build is worse than not shipping one.
+      #
+      # NEUTRAL LEG ONLY: the app carries no vendor material (its build.gradle
+      # logs "in-APK CNSDK glue DISABLED (runtime hosts it, #1061)"), so the leia
+      # leg would compile the identical sources a second time for nothing.
+      #
+      # assembleDebug, not Release: this is a compile check plus an artifact to
+      # flash, and debug needs no keystore, so a fork PR gets the same coverage.
+      #
+      # The other two Android test apps in settings.gradle
+      # (cube_zones_vk_android, weave_client_vk_android) have the same exposure
+      # and are deliberately NOT added here -- #1402 is scoped to the
+      # surface-binding reference app, and each needs its own device pass before
+      # it is worth claiming CI keeps it working.
+      - name: Build the surface-binding reference app (cube_handle_vk_android)
+        id: build_cube
+        if: needs.DetectChanges.outputs.docs_only != 'true' && matrix.variant == 'neutral' && steps.build.outcome == 'success'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./gradlew :test_apps:cube_handle_vk_android:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the reference app APK
+        if: steps.build_cube.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: cube_handle_vk_android
+          path: test_apps/handle/cube_handle_vk_android/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Inspect APK contents (${{ matrix.variant }})
         if: steps.build.outcome == 'success'
         run: |
