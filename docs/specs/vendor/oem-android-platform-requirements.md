@@ -1338,6 +1338,44 @@ plus its geometry, woven at scanout by the vendor display processor. This is a
 platform + vendor co-design, not something an OEM can adopt unilaterally; the
 vendor-side counterpart is filed with the display SDK (§7).
 
+*What the end state's display service must be given* — the contract, derived
+from what the vendor interlacer actually reads (reviewed with the display-SDK
+maintainers, 2026-09-07), so that "weave at scanout" is a specification and not
+a slogan:
+
+- **Per panel, static** (all of it already exists in the served panel
+  calibration today): panel resolution and pixel pitch, the panel's natural
+  orientation, the lens geometry (lens pitch in pixels, slant, view count, the
+  distance-over-pitch term and the centre phase), the correction maps and
+  polynomials when present, the RGB sub-pixel shifts, and gamma.
+- **Per window, per composite:** the app's **unwoven** multi-view atlas (this
+  replaces the woven buffer as the app's output, so the atlas format — tile
+  layout, view count, view order — becomes a defined contract instead of an
+  implicit agreement between an app and its own interlacer); the composited
+  **on-screen rect in panel pixels** (the quantity S9 asks for, now on the
+  correct side of the boundary, because the compositor knows it and the app
+  never can); and the current display rotation relative to the natural
+  orientation.
+- **Per frame, at scanout:** the viewer's eye position in panel-relative
+  millimetres, **predicted to the scanout instant**. This moves prediction from
+  "the app must guess when its frame will show" to "the compositor knows when it
+  is showing", which removes a whole class of fixed-latency error — but it means
+  the face-tracking service must be reachable by the display service at
+  scanout, or the app must forward a timestamped predicted eye position.
+
+The interlacer's mapping is then buffer pixel → unit coordinates → the on-screen
+rect → floor to an integer panel pixel → phase from that pixel, the lens
+geometry and the viewer distance. Because the panel pixel is computed from the
+*final* composited position, every window transform — scale, move, animation —
+is correct by construction, which is exactly what no in-app weave can offer.
+
+Two things this does **not** change, stated so nobody re-derives them: a woven
+buffer that the compositor scales afterwards is unrecoverable by any interlacer
+change (bilinear resampling of an interlaced pattern is not invertible), which
+is why the intermediate form sizes the buffer to the on-screen rect instead;
+and the existing integer viewport API is sufficient for that intermediate form
+— the missing input is the scale (S9), not a new API.
+
 **Consequence if absent.** Without the intermediate form, the satellite path is
 unusable on a stock policy — a permanent 20 % ghost over every pixel, which is
 worse than no satellite at all. Without the end state, R6, S6 and S9 remain a

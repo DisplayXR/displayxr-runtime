@@ -427,26 +427,36 @@ that order, because the manifest line is the one step that is a release in
 someone else's repo.
 
 
-## The vendor interlacer assumes strict 1:1 (2026-09-07, from the CNSDK side)
+## The interlacer contract under a container scale (2026-09-07, with the vendor SDK maintainers)
 
-Read from the interlace shader by the CNSDK maintainers while designing
-LeiaInc/CNSDK#732: the weave assumes a strict 1:1 buffer→panel mapping — the
-same `mViewportWidth` is both the buffer divisor and the panel extent, the
-screen position is an integer, and the per-pixel index is `floor()`ed. So even
-if the platform handed the runtime the container scale today, the vendor
-interlacer could not consume it; "consume a scale" is a prerequisite on the
-vendor side of #732, not a plumbing detail. Consequences for this roadmap:
+Settled from the interlace shader while LeiaInc/CNSDK#732 was being designed
+(an earlier reading — "the interlacer must first learn to consume a scale" —
+was retracted; the corrected statement is this):
 
+- **The existing integer viewport API is sufficient.** The only viable path
+  for a scaled container is the client sizing its buffer to the *on-screen*
+  rect so the compositor's scale becomes 1.0. In that path buffer width equals
+  the panel extent by construction, so an interlacer that uses one viewport
+  width as both buffer divisor and panel extent is exactly right.
+  `set_viewport(1757, 236, 732, 1137)` with a 732×1137 framebuffer *is* strict
+  1:1. The only missing input is the number (the scale); the app already has
+  the origin.
+- A "panel scale" parameter would only matter if the buffer stayed at the
+  logical size and the compositor scaled it — and that case is unfixable by
+  **any** interlacer change, because bilinear resampling of an interlaced
+  pattern is not invertible (S8 / #731 is the answer there, not an API).
+- One real limit stands: the screen position is an integer, so a fractional
+  composited origin cannot be expressed. On the reference tablet the leash
+  translate is integral (1757, 236), so this is theoretical today.
 - The satellite's physical-rect weave at the derived constant (P1,
-  `e777fc6b2`) is the structurally correct shape for a scaled container now,
-  not a stopgap: it feeds the interlacer integer panel pixels at 1:1.
-- The runtime-side tell (`bounds exceed the panel`, PR #1372) answers
-  *whether* a window is scaled; the scalar (*how much*) must come from a
-  platform-trusted reader (#732) — the app's `getLocationOnScreen()` origin is
-  already the true post-scale on-screen origin, only the size is pre-scale
-  (SurfaceFlinger: `geomLayerTransform` = translate (1757,236) + 0.67·bounds =
-  `coveredRegion [1757,236,2481,1365]`), so #732 needs one scalar per task,
-  not a rect.
+  `e777fc6b2`) **is** the size-to-on-screen path, with the constant standing in
+  for the missing scalar — the structurally correct shape now, not a stopgap.
+- The runtime-side tell (`bounds exceed the panel`, PR #1372) answers *whether*
+  a window is scaled; the scalar (*how much*) must come from a platform-trusted
+  reader (#732). The app's `getLocationOnScreen()` origin is already the true
+  post-scale on-screen origin, only the size is pre-scale (SurfaceFlinger:
+  `geomLayerTransform` = translate (1757,236) + 0.67·bounds = `coveredRegion
+  [1757,236,2481,1365]`), so #732 needs one scalar per task, not a rect.
 - Static-once-settled is measured; the open/close transition is not — an
   animated scale still needs the platform-composed weave (S8) or the 2D
   fallback.
