@@ -361,6 +361,81 @@ readFile(const char *path)
 	return ss.str();
 }
 
+/*!
+ * Blank out every comment, keeping the source's length and line structure.
+ *
+ * MANDATORY before any of the parsing below, and the reason is this file's own
+ * history: the class javadoc documents the cross-APK contract by NAME, so it
+ * contains the literal text `{@code boolean isTell(int, int, ...)}`. A plain
+ * `find("boolean isTell(")` matched THAT, ran the brace matcher over prose, and
+ * the whole test died with "no return statement" — after passing locally, on a
+ * binary built before the javadoc existed.
+ *
+ * Replacing with spaces rather than erasing keeps every later offset meaningful,
+ * so a failure still points at the right place in the real file.
+ */
+std::string
+stripComments(const std::string &src)
+{
+	std::string out = src;
+	enum
+	{
+		CODE,
+		LINE_COMMENT,
+		BLOCK_COMMENT,
+		STRING_LIT,
+		CHAR_LIT
+	} st = CODE;
+
+	for (size_t i = 0; i < out.size(); i++) {
+		const char c = out[i];
+		const char n = (i + 1 < out.size()) ? out[i + 1] : '\0';
+		switch (st) {
+		case CODE:
+			if (c == '/' && n == '/') {
+				st = LINE_COMMENT;
+				out[i] = out[i + 1] = ' ';
+				i++;
+			} else if (c == '/' && n == '*') {
+				st = BLOCK_COMMENT;
+				out[i] = out[i + 1] = ' ';
+				i++;
+			} else if (c == '"') {
+				st = STRING_LIT;
+			} else if (c == '\'') {
+				st = CHAR_LIT;
+			}
+			break;
+		case LINE_COMMENT:
+			if (c == '\n') {
+				st = CODE;
+			} else {
+				out[i] = ' ';
+			}
+			break;
+		case BLOCK_COMMENT:
+			if (c == '*' && n == '/') {
+				out[i] = out[i + 1] = ' ';
+				i++;
+				st = CODE;
+			} else if (c != '\n') {
+				out[i] = ' ';
+			}
+			break;
+		case STRING_LIT:
+		case CHAR_LIT:
+			// Skip an escape pair so \" / \' do not end the literal.
+			if (c == '\\') {
+				i++;
+			} else if ((st == STRING_LIT && c == '"') || (st == CHAR_LIT && c == '\'')) {
+				st = CODE;
+			}
+			break;
+		}
+	}
+	return out;
+}
+
 //! Pull the body of `public static boolean <name>(...) { ... }` out of the source.
 std::string
 extractMethodBody(const std::string &src, const std::string &name)
@@ -418,7 +493,7 @@ TEST_CASE("mini-window tell: MiniWindowLayout.isTell agrees with the C helper")
 {
 	// DXR_MINI_WINDOW_LAYOUT_JAVA is the source path, handed over by CMake —
 	// the same shape tests_oxr_view_space uses for the runtime library.
-	const std::string src = readFile(DXR_MINI_WINDOW_LAYOUT_JAVA);
+	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
 	const std::string expr = lastReturnExpression(extractMethodBody(src, "isTell"));
 	INFO("Java isTell expression: " << expr);
 
@@ -445,7 +520,7 @@ TEST_CASE("mini-window tell: the binding predicate still rejects a transposed pa
 	 * raw tell, and latched a bogus 0.4469 scale on the NP02J. Deliberately NOT
 	 * on the hosted path: runtime#1399.
 	 */
-	const std::string src = readFile(DXR_MINI_WINDOW_LAYOUT_JAVA);
+	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
 
 	std::string flatFile;
 	for (char c : src) {
