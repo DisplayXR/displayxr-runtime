@@ -15,6 +15,7 @@ import android.content.Context;
 import android.os.Bundle;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
+import android.graphics.Rect;
 import android.graphics.Region;
 import android.hardware.display.DisplayManager;
 import android.os.Build;
@@ -224,6 +225,10 @@ public class MonadoView extends SurfaceView
         // The activity's dispatchTouchEvent goes to its own view hierarchy
         // (not back to this separate overlay window), so there's no loop.
         if (hostActivity != null) {
+            // #1367 S9 fallback (c): the OEM freeform leash is inverted on the way IN,
+            // so raw-vs-local on a REAL drag measures the scale. Free — we already see
+            // every event here.
+            measureTouchScale(event);
             hostActivity.dispatchTouchEvent(event);
             return true; // claim the gesture so we keep receiving MOVE/UP
         }
@@ -261,6 +266,27 @@ public class MonadoView extends SurfaceView
     private int lastRectDispH = -1;
     private boolean windowRectPollRunning = false;
     @Nullable private Choreographer.FrameCallback windowRectCallback = null;
+
+    // ---- mini-window 1:1 weave (#1367 S9 / #1277). All touched on the UI thread only.
+    private static final float TOUCH_MIN_SPAN_PX = 40.0f;
+    private static final long VENDOR_RETRY_MS = 500;
+    private final int[] oneToOneSize = new int[2];
+    private boolean miniOneToOneApplied = false;
+    private int miniBufW = 0;
+    private int miniBufH = 0;
+    private float miniVendorScale = 0f;
+    private long miniVendorLastTryMs = 0;
+    private boolean miniCrossChecked = false;
+    private boolean miniScaleMismatchLogged = false;
+    @Nullable private String miniScaleSource = null;
+    private int miniPropCached = -1;
+    private float touchDownRawX = 0f;
+    private float touchDownRawY = 0f;
+    private float touchDownX = 0f;
+    private float touchDownY = 0f;
+    private boolean touchDownValid = false;
+    private float touchScale = 0f;
+    private float touchScaleSpan = 0f;
 
     /**
      * Sample this view's on-screen rect once per frame and report changes (ADR-036 D6, #1033).
@@ -348,6 +374,19 @@ public class MonadoView extends SurfaceView
             dispW = real.x;
             dispH = real.y;
         }
+        // #1277/#1367 S9: in an OEM-scaled container the numbers above are the
+        // window's LOGICAL size; the on-screen extent is scale x that. Re-size the
+        // surface's buffer to the physical extent and publish THAT, so every
+        // downstream consumer (view dims, Kooima, DP origin) works in panel pixels
+        // and SurfaceFlinger's composed transform collapses to identity. Returns
+        // false — publish the logical rect, keep the 2D fallback — whenever the
+        // window fits the panel, the scale is not known yet, or the surface has not
+        // yet come back at the new size.
+        if (updateMiniWindowOneToOne(x, y, w, h, dispW, dispH, oneToOneSize)) {
+            w = oneToOneSize[0];
+            h = oneToOneSize[1];
+        }
+
         if (x == lastRectX
                 && y == lastRectY
                 && w == lastRectW
@@ -410,6 +449,294 @@ public class MonadoView extends SurfaceView
      */
     private boolean reportsRectToNative() {
         return hostActivity != null && nativeCounterpart != null && nativeCounterpart.getNativePointer() != 0;
+    }
+
+    // ------------------------------------------------- mini-window 1:1 weave (#1367 S9 / #1277)
+
+    /**
+     * The OEM's "window reply" mini-window scales the whole task with a SurfaceFlinger leash
+     * (measured on NP02J: {@code SCALE TRANSLATE 0.67 @ (1757,236)}), so a 1080x1685 logical
+     * window lands on the panel as 724x1129 physical pixels. The vendor interlacer is strict
+     * 1:1 buffer→panel: any resample between the woven buffer and the panel destroys the
+     * interlace, which is why {@code vk_android_update_container_scaled} degrades such a window
+     * to flat 2D.
+     *
+     * <p>The fix is to make SF's COMPOSED transform identity rather than to fight it: hand the
+     * surface a buffer of {@code round(logical * scale)} pixels, and SF's buffer→layer scale
+     * ({@code 1080/724}) times the leash ({@code 0.67}) multiplies out to 1.0. The rect we then
+     * publish is the physical one, so the compositor's view dims, the per-window Kooima and the
+     * DP's screen origin are all in panel pixels — the same frame the weave happens in.
+     *
+     * <p>TRAP: size the buffer to {@code round(scale * logical)} — which is what the vendor API's
+     * Rect and the layer's {@code coveredRegion} both report — and NOT to SurfaceFlinger's
+     * {@code displayFrame} (732x1137 here). displayFrame includes the task layer's shadow
+     * ({@code shadowRadius} 6 x 0.67 ~ 4 px a side); sizing to it re-introduces an 8 px resample,
+     * i.e. exactly the thing this exists to remove.
+     *
+     * @param outSize receives the physical width/height when this returns true
+     * @return true when the 1:1 buffer is in effect AND the surface has already come back at that
+     *     size, i.e. the physical rect is the one to publish
+     */
+    private boolean updateMiniWindowOneToOne(
+            int x, int y, int w, int h, int dispW, int dispH, int[] outSize) {
+        // Same predicate as the compositor's CONTAINER_SCALED tell, deliberately: one
+        // definition of "this window is being scaled by the container".
+        boolean tell =
+                dispW > 0 && dispH > 0 && (x < 0 || y < 0 || x + w > dispW || y + h > dispH);
+
+        if (!tell || !isMiniWindow1to1Enabled()) {
+            if (miniOneToOneApplied) {
+                getHolder().setSizeFromLayout();
+                miniOneToOneApplied = false;
+                miniBufW = 0;
+                miniBufH = 0;
+                miniVendorScale = 0f;
+                Log.i(
+                        TAG,
+                        "miniWindow1to1: OFF ("
+                                + (tell ? "disabled by debug.dxr.miniwindow_1to1" : "window fits the panel")
+                                + ") — surface back to layout size");
+            }
+            return false;
+        }
+
+        float s = resolveMiniScale(w, h, dispW, dispH);
+        if (s <= 0f) {
+            // Not known yet (no vendor API and no real touch measured), or the two
+            // sources disagreed. Publishing the logical rect keeps the honest 2D
+            // fallback, which is the direction to fail in.
+            return false;
+        }
+
+        int bw = Math.round(w * s);
+        int bh = Math.round(h * s);
+        if (bw <= 0 || bh <= 0) {
+            return false;
+        }
+        if (!miniOneToOneApplied || bw != miniBufW || bh != miniBufH) {
+            miniBufW = bw;
+            miniBufH = bh;
+            miniOneToOneApplied = true;
+            getHolder().setFixedSize(bw, bh);
+            // ONE line per transition — a lifecycle event, never a per-frame one.
+            Log.i(
+                    TAG,
+                    "miniWindow1to1: ON scale="
+                            + s
+                            + " source="
+                            + miniScaleSource
+                            + " logical "
+                            + w
+                            + "x"
+                            + h
+                            + " -> buffer "
+                            + bw
+                            + "x"
+                            + bh
+                            + " (SF buffer->layer x leash should compose to identity)");
+        }
+
+        // Ordering: setFixedSize is a request. Until the surface actually comes back at
+        // that size (surfaceChanged, which re-samples), publishing the physical rect
+        // would have the compositor weave at a size the buffer does not have — one
+        // visibly wrong frame. Publish the logical rect until then.
+        synchronized (currentSurfaceHolderSync) {
+            if (this.width != bw || this.height != bh) {
+                return false;
+            }
+        }
+        outSize[0] = bw;
+        outSize[1] = bh;
+        return true;
+    }
+
+    /**
+     * The container scale, preferring the vendor API and falling back to the touch ratio. When
+     * both are available they are cross-checked once: on this firmware they agree exactly
+     * (0.670000), so a disagreement means accessibility magnification is multiplied in, or the
+     * firmware changed — neither is a number to guess at, so log once and stay on the 2D
+     * fallback.
+     */
+    private float resolveMiniScale(int w, int h, int dispW, int dispH) {
+        float api = queryVendorWrScale(w, h, dispW, dispH);
+        float touch = touchScale;
+
+        if (api > 0f && touch > 0f) {
+            if (Math.abs(api - touch) > 0.01f) {
+                if (!miniScaleMismatchLogged) {
+                    miniScaleMismatchLogged = true;
+                    Log.w(
+                            TAG,
+                            "miniWindow1to1: vendor-api scale "
+                                    + api
+                                    + " disagrees with the measured touch ratio "
+                                    + touch
+                                    + " — accessibility magnification, or a firmware change. "
+                                    + "Staying on the 2D fallback rather than picking one.");
+                }
+                return 0f;
+            }
+            if (!miniCrossChecked) {
+                miniCrossChecked = true;
+                Log.i(TAG, "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
+            }
+        }
+
+        if (api > 0f) {
+            miniScaleSource = "vendor-api";
+            return api;
+        }
+        if (touch > 0f) {
+            miniScaleSource = "touch";
+            return touch;
+        }
+        return 0f;
+    }
+
+    /**
+     * S9 probe result (b): {@code ActivityManager.getDefaultWindowParamByTaskForNormalWr(taskId)}
+     * is a hidden TEST-API that is NOT on this build's blocklist and returns the POST-SCALE
+     * on-screen Rect for an ordinary app uid, no permission needed.
+     *
+     * <p>GATED ON THE TELL by the sole caller, and that gate is load-bearing: the method returns
+     * the NOMINAL window-reply placement whether or not the app is actually in a mini-window — in
+     * fullscreen it still answers {@code Rect(1757,236-2481,1365)}. An ungated read would shrink a
+     * fullscreen buffer to 724x1129.
+     *
+     * @return the scale, or 0 when unavailable or implausible
+     */
+    private float queryVendorWrScale(int w, int h, int dispW, int dispH) {
+        if (miniVendorScale > 0f) {
+            return miniVendorScale; // resolved once per scaled-container episode
+        }
+        long now = SystemClock.uptimeMillis();
+        if (now - miniVendorLastTryMs < VENDOR_RETRY_MS) {
+            return 0f; // don't re-reflect every frame while it keeps failing
+        }
+        miniVendorLastTryMs = now;
+
+        Activity activity = hostActivity;
+        if (activity == null) {
+            return 0f;
+        }
+        try {
+            Object am = activity.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) {
+                return 0f;
+            }
+            Rect r = null;
+            try {
+                r =
+                        (Rect)
+                                am.getClass()
+                                        .getMethod("getDefaultWindowParamByTaskForNormalWr", int.class)
+                                        .invoke(am, activity.getTaskId());
+            } catch (Throwable ignored) {
+                r = null;
+            }
+            if (r == null || r.width() <= 0 || r.height() <= 0) {
+                try {
+                    r =
+                            (Rect)
+                                    am.getClass()
+                                            .getMethod("getDefaultWindowParamForNormalWr", boolean.class)
+                                            .invoke(am, Boolean.FALSE);
+                } catch (Throwable ignored) {
+                    return 0f;
+                }
+            }
+            if (r == null || r.width() <= 0 || r.height() <= 0) {
+                return 0f;
+            }
+            // A result that does not fit the panel is not an on-screen rect.
+            if (r.width() > dispW || r.height() > dispH) {
+                return 0f;
+            }
+            float sx = r.width() / (float) w;
+            float sy = r.height() / (float) h;
+            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > 0.02f) {
+                return 0f;
+            }
+            miniVendorScale = (sx + sy) * 0.5f;
+            return miniVendorScale;
+        } catch (Throwable t) {
+            return 0f;
+        }
+    }
+
+    /**
+     * S9 probe result (c): the platform inverts the leash on the way in, so on a REAL dispatched
+     * drag {@code |Δraw| / |Δlocal|} is the container scale (measured 0.670000, max residual 1e-4
+     * px over 100 samples), and it needs neither a vendor API nor a permission. Differences, so
+     * the view position and the insets cancel. Synthetic events ({@code MotionEvent.obtain}) read
+     * 1.0 and are rejected by the plausibility band below, as is a fullscreen window.
+     */
+    private void measureTouchScale(android.view.MotionEvent ev) {
+        final int action = ev.getActionMasked();
+        if (action == android.view.MotionEvent.ACTION_DOWN) {
+            touchDownRawX = ev.getRawX();
+            touchDownRawY = ev.getRawY();
+            touchDownX = ev.getX();
+            touchDownY = ev.getY();
+            touchDownValid = true;
+            return;
+        }
+        if (!touchDownValid
+                || (action != android.view.MotionEvent.ACTION_MOVE
+                        && action != android.view.MotionEvent.ACTION_UP)) {
+            return;
+        }
+        if (action == android.view.MotionEvent.ACTION_UP) {
+            touchDownValid = false;
+        }
+        float localSpan = Math.abs(ev.getX() - touchDownX) + Math.abs(ev.getY() - touchDownY);
+        if (localSpan < TOUCH_MIN_SPAN_PX) {
+            return; // too short to divide by
+        }
+        float rawSpan = Math.abs(ev.getRawX() - touchDownRawX) + Math.abs(ev.getRawY() - touchDownRawY);
+        float s = rawSpan / localSpan;
+        if (s < 0.2f || s > 0.999f) {
+            return; // fullscreen (1.0), a synthetic event, or nonsense
+        }
+        if (localSpan > touchScaleSpan) {
+            touchScaleSpan = localSpan;
+            touchScale = s;
+        }
+    }
+
+    /**
+     * {@code debug.dxr.miniwindow_1to1} — default ON. Set to 0 to A/B against the old behaviour
+     * (the honest 2D fallback in {@code vk_android_update_container_scaled}).
+     *
+     * <p>READ ONCE PER PROCESS and cached, the same contract as {@code debug.dxr.weave_satellite}:
+     * changing it mid-run needs an app restart. That is not laziness — flipping it live was
+     * measured to WEDGE the app. It re-sizes the surface underneath a weave that is already in
+     * flight, and the vendor's `leia_cnsdk_weave` then sits forever in `vkWaitForFences` inside
+     * `libleiaCore-impl.so` while the app thread blocks on the compositor mutex in
+     * `vk_compositor_layer_commit` (ANR trace, NP02J, 2026-09-07). The buffer size may only change
+     * where nothing is mid-weave — which on this OEM is the container transition itself, since
+     * entering and leaving the mini-window destroys and recreates the surface.
+     */
+    private boolean isMiniWindow1to1Enabled() {
+        if (miniPropCached >= 0) {
+            return miniPropCached == 1;
+        }
+        int on = 1;
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String v = (String) sp.getMethod("get", String.class).invoke(null, "debug.dxr.miniwindow_1to1");
+            if (v != null && !v.isEmpty()) {
+                on =
+                        (v.startsWith("0") || v.startsWith("f") || v.startsWith("F") || v.startsWith("n")
+                                        || v.startsWith("N"))
+                                ? 0
+                                : 1;
+            }
+        } catch (Exception e) {
+            on = 1;
+        }
+        miniPropCached = on;
+        return on == 1;
     }
 
     /**
@@ -940,6 +1267,13 @@ public class MonadoView extends SurfaceView
         // out-of-process client instead observes via the listener (#528).
         if (surfaceStateListener != null) {
             surfaceStateListener.onSurfaceAvailable(surfaceHolder);
+        }
+        // #1367 S9: the mini-window 1:1 path publishes the PHYSICAL rect only once the
+        // surface has actually come back at the requested buffer size. This is that
+        // moment — re-sample now rather than waiting for the next Choreographer tick, so
+        // the rect and the buffer change over together.
+        if (windowRectPollRunning) {
+            sampleWindowRect();
         }
     }
 

@@ -461,6 +461,58 @@ was retracted; the corrected statement is this):
   animated scale still needs the platform-composed weave (S8) or the 2D
   fallback.
 
+### The S9 client recipe, implemented in-app (2026-09-07, #1367)
+
+The bullet above — *"the only viable path for a scaled container is the client
+sizing its buffer to the on-screen rect so the compositor's scale becomes
+1.0"* — is now implemented for the **hosted, in-process** Android path, so the
+mini-window no longer needs the satellite to be crisp. Three parts, all in
+`MonadoView` plus the rect sink the compositor already consumes:
+
+1. **Get the scalar without #732.** The S9 probes on #1367 found it is already
+   readable from an ordinary app uid on this firmware, two independent ways:
+   the OEM test-API `ActivityManager.getDefaultWindowParamByTaskForNormalWr(taskId)`
+   (returns the post-scale on-screen `Rect`; **not** blocklisted), and the
+   raw-vs-local ratio of a *real* dispatched touch (`0.670000`, max residual
+   1e-4 px). The API is preferred, the touch ratio is the fallback, and when
+   both are present they are cross-checked once — a disagreement means
+   accessibility magnification or a firmware change, and the code then keeps
+   the 2D fallback rather than picking one.
+   *Gating matters:* the test-API returns the **nominal** window-reply
+   placement in fullscreen too, so it is read only when the container-scaled
+   tell already fired.
+2. **Size the buffer to `round(scale · logical)`** via
+   `SurfaceHolder.setFixedSize` — 724×1129 for a 1080×1685 window at 0.67, the
+   value the API's `Rect` and the layer's `coveredRegion` both report. **Not**
+   SurfaceFlinger's `displayFrame` (732×1137): that includes the task layer's
+   shadow (`shadowRadius` 6 × 0.67 ≈ 4 px a side) and sizing to it would put an
+   8 px resample straight back.
+3. **Publish the PHYSICAL rect** (origin unchanged — `getLocationOnScreen` is
+   already post-scale; size = the buffer). Everything downstream then works in
+   panel pixels: the compositor's view dims (`window × view_scale`), the
+   per-window Kooima, the app's `canvasRectPx`, and the DP's screen origin. The
+   rect is published only once the surface has actually come back at the new
+   size, so no frame weaves at a size the buffer does not have.
+
+SF then composes `buffer→layer (1080/724) × leash (0.67) ≈ 1.0` and the strict
+1:1 contract above holds. `vk_android_update_container_scaled` needed no change:
+its tell reads the published rect, so a physical rect fits the panel and it
+clears itself back to weaving. The degrade remains the fallback for every case
+this cannot serve — scale unmeasurable, sources disagreeing,
+`debug.dxr.miniwindow_1to1 0`, a surface-binding app that has not opted in, and
+a window genuinely dragged off-panel.
+
+**Surface-binding (`XR_DXR_android_surface_binding`) apps are not covered.**
+They own their own surface and their own rect publish, so opting in means doing
+the same two things themselves: `setFixedSize(round(w·s), round(h·s))` on their
+`SurfaceHolder`, and passing the physical rect to
+`xrSetAndroidWindowGeometryDXR`. A runtime helper that hands them the measured
+scalar is the obvious follow-up.
+
+**Still open (this does not close it):** the *animated* open/close transition,
+where the scale is in motion — that still needs the platform-composed weave
+(S8) or the 2D fallback.
+
 ## P2 implementation plan (2026-09-07)
 
 The section above is the *design*. This one is the executable plan: every touch
