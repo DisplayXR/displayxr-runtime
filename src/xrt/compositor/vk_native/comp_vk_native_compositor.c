@@ -373,6 +373,15 @@ struct comp_vk_native_compositor
 	uint64_t plane_cmd_value[VK_SPLIT_PLANE_CMD_RING];
 	uint32_t plane_cmd_next;
 	/*!
+	 * #1406 — the window-space (HUD) pass's own ring, recycled the same way.
+	 * Separate storage rather than a shared ring: both passes run on the same
+	 * frame, so sharing entries would let one starve the other into a skip.
+	 */
+	VkCommandPool ws_cmd_pool;
+	VkCommandBuffer ws_cmd[VK_SPLIT_PLANE_CMD_RING];
+	uint64_t ws_cmd_value[VK_SPLIT_PLANE_CMD_RING];
+	uint32_t ws_cmd_next;
+	/*!
 	 * Last frame's composite region. A change means the panel-sized plane holds
 	 * stale pixels outside the new region, so the whole surface is re-cleared and
 	 * every egress slot is told it owes a full refresh (#918 review F4).
@@ -3495,6 +3504,9 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 //! surfaces and publish them to the bridge. Defined beside the flatten it drives.
 static void
 vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint32_t tgt_h);
+
+static void
+vk_split_composite_window_space(struct comp_vk_native_compositor *c);
 //! VK-1b-3 - this frame's authoritative app-authored mask, and the ensure that
 //! must run BEFORE any command is recorded. Defined with the zone helpers.
 struct comp_vk_native_zone_mask;
@@ -6350,6 +6362,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		c->repaint.rows = c->eff_layout.rows;
 
 		/*
+		 * #1406 — the app's window-space overlay, BEFORE the planes and before
+		 * the handoff: the windowed weave site that used to do this is exactly
+		 * what the split replaces.
+		 */
+		vk_split_composite_window_space(c);
+
+		/*
 		 * VK-1b — the PLANE pass, before the handoff is taken.
 		 *
 		 * Order matters twice. It flattens into deposit-backed surfaces and
@@ -6955,6 +6974,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkDestroyFramebuffer(vk->device, c->plane_l2d_fb, NULL);
 		c->plane_l2d_fb = VK_NULL_HANDLE;
 		c->plane_l2d_fb_view = VK_NULL_HANDLE;
+	}
+	if (c->ws_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->ws_cmd_pool, NULL);
+		c->ws_cmd_pool = VK_NULL_HANDLE;
 	}
 	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
@@ -9834,12 +9857,22 @@ vk_local2d_digest(struct comp_vk_native_compositor *c,
 	*out_hash = (hash == 0) ? 1u : hash;
 }
 
-//! Allocate the plane pass's own pool + command-buffer ring. Idempotent.
+/*!
+ * Allocate a split-side pass's own pool + command-buffer ring. Idempotent.
+ *
+ * Parameterised over the storage so the plane pass and the window-space pass
+ * each get their own ring (#1406) without a second copy of the recycling rule.
+ */
 static bool
-vk_plane_cmd_ring_ensure(struct comp_vk_native_compositor *c)
+vk_split_cmd_ring_ensure(struct comp_vk_native_compositor *c,
+                         VkCommandPool *pool,
+                         VkCommandBuffer *bufs,
+                         uint64_t *values,
+                         uint32_t *next,
+                         const char *what)
 {
 	struct vk_bundle *vk = &c->vk;
-	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
+	if (*pool != VK_NULL_HANDLE) {
 		return true;
 	}
 	VkCommandPoolCreateInfo pool_ci = {
@@ -9847,28 +9880,28 @@ vk_plane_cmd_ring_ensure(struct comp_vk_native_compositor *c)
 	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 	    .queueFamilyIndex = vk->main_queue->family_index,
 	};
-	if (vk->vkCreateCommandPool(vk->device, &pool_ci, NULL, &c->plane_cmd_pool) != VK_SUCCESS) {
-		c->plane_cmd_pool = VK_NULL_HANDLE;
-		U_LOG_W(
-		    "#918 VK-1b: the plane command pool could not be created — the 2D planes do not "
-		    "transport this session; the weave is unaffected");
+	if (vk->vkCreateCommandPool(vk->device, &pool_ci, NULL, pool) != VK_SUCCESS) {
+		*pool = VK_NULL_HANDLE;
+		U_LOG_W("#918 VK-1b: the %s command pool could not be created — that pass does not "
+		        "transport this session; the weave is unaffected",
+		        what);
 		return false;
 	}
 	VkCommandBufferAllocateInfo cba = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = c->plane_cmd_pool,
+	    .commandPool = *pool,
 	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 	    .commandBufferCount = VK_SPLIT_PLANE_CMD_RING,
 	};
-	if (vk->vkAllocateCommandBuffers(vk->device, &cba, c->plane_cmd) != VK_SUCCESS) {
-		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
-		c->plane_cmd_pool = VK_NULL_HANDLE;
+	if (vk->vkAllocateCommandBuffers(vk->device, &cba, bufs) != VK_SUCCESS) {
+		vk->vkDestroyCommandPool(vk->device, *pool, NULL);
+		*pool = VK_NULL_HANDLE;
 		return false;
 	}
 	for (uint32_t i = 0; i < VK_SPLIT_PLANE_CMD_RING; i++) {
-		c->plane_cmd_value[i] = 0;
+		values[i] = 0;
 	}
-	c->plane_cmd_next = 0;
+	*next = 0;
 	return true;
 }
 
@@ -9881,15 +9914,18 @@ vk_plane_cmd_ring_ensure(struct comp_vk_native_compositor *c)
  * until it is not is the #925 wedge class.
  */
 static int32_t
-vk_plane_cmd_ring_take(struct comp_vk_native_compositor *c, struct comp_vk_deposit *dep)
+vk_split_cmd_ring_take(struct comp_vk_native_compositor *c,
+                       struct comp_vk_deposit *dep,
+                       uint64_t *values,
+                       uint32_t *next)
 {
 	struct vk_bundle *vk = &c->vk;
 	const VkSemaphore timeline = comp_vk_deposit_get_timeline(dep);
 
 	for (uint32_t n = 0; n < VK_SPLIT_PLANE_CMD_RING; n++) {
-		const uint32_t i = (c->plane_cmd_next + n) % VK_SPLIT_PLANE_CMD_RING;
-		if (c->plane_cmd_value[i] == 0) {
-			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+		const uint32_t i = (*next + n) % VK_SPLIT_PLANE_CMD_RING;
+		if (values[i] == 0) {
+			*next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i; // never used
 		}
 		if (timeline == VK_NULL_HANDLE || vk->vkGetSemaphoreCounterValue == NULL) {
@@ -9899,19 +9935,132 @@ vk_plane_cmd_ring_take(struct comp_vk_native_compositor *c, struct comp_vk_depos
 			// per-frame CPU wait (#837), so an entry submitted last frame
 			// has retired by the time this frame asks for it. If #837's
 			// wait is removed, this branch needs a real retirement test.
-			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+			*next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i;
 		}
 		uint64_t now = 0;
 		if (vk->vkGetSemaphoreCounterValue(vk->device, timeline, &now) != VK_SUCCESS) {
 			return -1;
 		}
-		if (now >= c->plane_cmd_value[i]) {
-			c->plane_cmd_next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
+		if (now >= values[i]) {
+			*next = (i + 1) % VK_SPLIT_PLANE_CMD_RING;
 			return (int32_t)i;
 		}
 	}
 	return -1;
+}
+
+/*!
+ * #1406 — composite this frame's window-space (HUD) layers into the atlas on the
+ * SPLIT path.
+ *
+ * The windowed path does this inside @ref vk_dp_weave_and_present, which the
+ * split replaces wholesale: with the weave moved to the scanout adapter that
+ * function never runs, so on a weave-on-scanout box every app-authored 2D
+ * overlay — a transport bar, a button strip — was submitted, validated,
+ * accepted, and then silently never drawn. The app still hit-tests it (the
+ * layer only ever lost its PIXELS), which is what makes the symptom read as a
+ * rendering bug rather than a dropped layer.
+ *
+ * Ordering, like the plane pass: its own command buffer, its own value claimed
+ * on the deposit timeline AFTER the atlas submit, and it must run BEFORE the
+ * handoff is taken — @ref comp_vk_deposit_get_handoff reports the latest claimed
+ * value, so the single `Wait` @ref comp_vk_split_submit_atlas takes on the other
+ * adapter then covers this pass too.
+ *
+ * A repaint never reaches here (it replays inside the split), which is the same
+ * exclusion #868 spells out for the windowed site: this pass samples the APP's
+ * own layer swapchain images, and a repaint has no claim on those.
+ */
+static void
+vk_split_composite_window_space(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (c->split == NULL || c->renderer == NULL) {
+		return;
+	}
+	bool has_ws = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			has_ws = true;
+			break;
+		}
+	}
+	if (!has_ws) {
+		// No overlay this frame: claim nothing, submit nothing.
+		return;
+	}
+	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+	if (dep == NULL) {
+		return;
+	}
+	if (!vk_split_cmd_ring_ensure(c, &c->ws_cmd_pool, c->ws_cmd, c->ws_cmd_value, &c->ws_cmd_next,
+	                             "window-space")) {
+		return;
+	}
+	const int32_t ring = vk_split_cmd_ring_take(c, dep, c->ws_cmd_value, &c->ws_cmd_next);
+	if (ring < 0) {
+		/*
+		 * Every entry still in flight. Skip the overlay for this frame rather
+		 * than stall — one stale frame of a fading HUD, never the #925 wedge.
+		 */
+		return;
+	}
+	const VkCommandBuffer cmd = c->ws_cmd[ring];
+	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+		return;
+	}
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+	uint32_t atlas_w = 0, atlas_h = 0;
+	comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+	vk_compositor_render_window_space_into_atlas(
+	    c, cmd, (VkImage)(uintptr_t)comp_vk_native_renderer_get_atlas_image(c->renderer),
+	    (VkImageView)(uintptr_t)comp_vk_native_renderer_get_atlas_view(c->renderer), atlas_w, atlas_h,
+	    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.cols, c->eff_layout.rows);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	/*
+	 * Same bidirectional-fence discipline as the plane pass: signal so the
+	 * bridge's read is ordered behind this blend, and (fence-less deposits) fall
+	 * back to one bounded CPU wait rather than racing the D3D11 staging copy.
+	 */
+	VkSemaphore sem = VK_NULL_HANDLE;
+	uint64_t signal_value = 0;
+	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
+	VkTimelineSemaphoreSubmitInfo timeline_info = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+	};
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (sem != VK_NULL_HANDLE) {
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues = &signal_value;
+		submit_info.pNext = &timeline_info;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores = &sem;
+	}
+
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+		// The claimed value would never be signalled — give it back.
+		if (sem != VK_NULL_HANDLE) {
+			comp_vk_deposit_abandon_signal(dep);
+		}
+		return;
+	}
+	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	c->ws_cmd_value[ring] = signal_value;
 }
 
 /*!
@@ -10121,11 +10270,12 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * planes as well as the atlas, so the single `ID3D11DeviceContext4::Wait`
 	 * comp_vk_split_submit_atlas already takes orders BOTH.
 	 */
-	if (!vk_plane_cmd_ring_ensure(c)) {
+	if (!vk_split_cmd_ring_ensure(c, &c->plane_cmd_pool, c->plane_cmd, c->plane_cmd_value,
+	                             &c->plane_cmd_next, "plane")) {
 		vk_split_unstage_planes(c);
 		return;
 	}
-	const int32_t ring = vk_plane_cmd_ring_take(c, dep);
+	const int32_t ring = vk_split_cmd_ring_take(c, dep, c->plane_cmd_value, &c->plane_cmd_next);
 	if (ring < 0) {
 		/*
 		 * Every entry is still in flight. Skip the plane update for this frame
