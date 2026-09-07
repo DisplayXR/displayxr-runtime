@@ -196,6 +196,113 @@ struct WindowRectSample
 };
 std::atomic<uint64_t> g_win_rect_seq{0};   // bumped by the UI thread on any change
 WindowRectSample g_win_rect;                // guarded by the seq above (single writer)
+
+/*
+ * #1396 mini-window layout hint (XR_DXR_android_surface_binding spec v2).
+ *
+ * An OEM "window reply" container hands the task a FULL-SIZE logical window and
+ * scales the whole thing with a SurfaceFlinger leash, so a woven buffer gets
+ * resampled and the interlace dies — the runtime notices and honestly degrades
+ * to 2D. Escaping it needs the composed transform to be identity, i.e. a buffer
+ * of round(logical * scale) AND a layout whose product lands on a whole pixel.
+ * The runtime measures the scale and does the exact-integer search (it shares
+ * that code with its own hosted SurfaceView); we own the window, so we apply it:
+ * shrink the window to layoutSize, fix the buffer to bufferSize, and publish the
+ * PHYSICAL rect from then on.
+ *
+ * Written by the android_main thread (poll_xr_events), read by the UI thread
+ * (nativeGetWindowLayoutRequest) — hence the atomics. The UI thread POLLS rather
+ * than being called back: it already runs a Choreographer callback per frame,
+ * and JNI callbacks into an app class have been unreliable across classloaders
+ * (#507).
+ */
+std::atomic<bool> g_hint_active{false};
+std::atomic<int32_t> g_hint_layout_w{0};
+std::atomic<int32_t> g_hint_layout_h{0};
+std::atomic<int32_t> g_hint_buf_w{0};
+std::atomic<int32_t> g_hint_buf_h{0};
+
+/*
+ * What we have actually asked THIS window for. Only the android_main thread
+ * touches these — poll_xr_events and push_window_geometry both run on it.
+ *
+ * TRAP, measured on the NP02J: ANativeWindow_getWidth/Height do NOT report the
+ * override. After a successful setBuffersGeometry(723,1129) they still answer
+ * the WINDOW size (1079x1685), even though the runtime's VkSurfaceKHR does come
+ * back at 723x1129. Deriving "has it taken?" from them therefore never
+ * converges: the app re-issues setBuffersGeometry every frame, every call
+ * re-creates the compositor's swapchain target, and the weave never gets a
+ * frame out (0 weave frames under a storm of "HW_XFORM: surface extent ...
+ * recreating target"). So remember the REQUEST instead and re-issue it only
+ * when the size or the window changes — a surface recreate hands us a NEW
+ * ANativeWindow, so the pointer compare is exactly the "the override was
+ * dropped" test.
+ */
+ANativeWindow *g_hint_applied_win = nullptr;
+int32_t g_hint_applied_w = 0;
+int32_t g_hint_applied_h = 0;
+//! Consecutive setBuffersGeometry failures. A failure cannot be memoised, so
+//! without a bound the retry (and its log line) would run every frame.
+int32_t g_hint_apply_fails = 0;
+constexpr int32_t kHintApplyMaxFails = 30;
+
+//! Forget the override (the hint cleared, or the surface went away).
+void
+forget_hint_buffer_geometry()
+{
+	g_hint_applied_win = nullptr;
+	g_hint_applied_w = 0;
+	g_hint_applied_h = 0;
+	g_hint_apply_fails = 0;
+}
+
+// Re-assert the fixed buffer size on our own window. Idempotent and cheap, and
+// it must be re-applied after any surface recreate (a window resize destroys and
+// rebuilds the Surface, which drops the override).
+void
+apply_hint_buffer_geometry()
+{
+	if (!g_hint_active.load(std::memory_order_acquire)) {
+		return;
+	}
+	ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+	const int32_t bw = g_hint_buf_w.load(std::memory_order_relaxed);
+	const int32_t bh = g_hint_buf_h.load(std::memory_order_relaxed);
+	if (win == nullptr || bw <= 0 || bh <= 0) {
+		return;
+	}
+	if (win == g_hint_applied_win && bw == g_hint_applied_w && bh == g_hint_applied_h) {
+		return;
+	}
+	// format 0 = keep whatever the window already has.
+	const int32_t rc = ANativeWindow_setBuffersGeometry(win, bw, bh, 0);
+	if (rc == 0) {
+		g_hint_applied_win = win;
+		g_hint_applied_w = bw;
+		g_hint_applied_h = bh;
+		g_hint_apply_fails = 0;
+		// One line per transition; the memo above is what keeps that true.
+		LOGI("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p -> 0", bw, bh, (void *)win);
+		return;
+	}
+	/*
+	 * A failure memoises nothing, so it would otherwise be retried — and logged —
+	 * on every frame. Say it once, bound the retries, and if it never takes, drop
+	 * the hint: the runtime's 2D fallback is the honest place to end up, and it
+	 * is what an app that never implemented spec v2 gets anyway.
+	 */
+	if (g_hint_apply_fails == 0) {
+		LOGW("miniWindow1to1: ANativeWindow_setBuffersGeometry(%d,%d) on %p failed (%d) — retrying", bw, bh,
+		     (void *)win, (int)rc);
+	}
+	if (++g_hint_apply_fails >= kHintApplyMaxFails) {
+		LOGW("miniWindow1to1: giving up after %d failed setBuffersGeometry attempts — dropping the hint, "
+		     "the runtime keeps its 2D fallback",
+		     (int)kHintApplyMaxFails);
+		g_hint_active.store(false, std::memory_order_release);
+		forget_hint_buffer_geometry();
+	}
+}
 #endif
 
 // Display-centric rig defaults (match cube_handle_vk_win). virtualDisplayHeight
@@ -789,25 +896,73 @@ push_window_geometry()
 	if (g_pfnSetAndroidWindowGeometry == nullptr || g_session == XR_NULL_HANDLE) {
 		return;
 	}
+	// #1396: cheap and idempotent, and it must run even when the rect did not
+	// change — a window resize destroys and rebuilds the Surface, which drops the
+	// buffer-size override.
+	apply_hint_buffer_geometry();
+
 	static uint64_t last_seq = 0;
+	static int32_t last_pub_w = -1;
+	static int32_t last_pub_h = -1;
 	uint64_t seq = g_win_rect_seq.load(std::memory_order_acquire);
-	if (seq == last_seq || seq == 0) {
+	if (seq == 0) {
 		return;
 	}
-	last_seq = seq;
 	WindowRectSample r = g_win_rect;
 	if (r.w <= 0 || r.h <= 0) {
 		return;
 	}
+	/*
+	 * #1396: while a layout hint is in effect our window is LOGICAL-sized but
+	 * its buffer is PHYSICAL-sized, and it is the physical rect the runtime
+	 * must weave in — that is the frame the DP's interlace phase, the per-window
+	 * Kooima and the compositor's view dims all live in. Substitute it only once
+	 * BOTH halves of the hint are in place (see below), so we never claim a
+	 * geometry the composition does not actually have. The ORIGIN is the app's,
+	 * live: getLocationOnScreen already returns on-screen coordinates in a
+	 * scaled container.
+	 */
+	int32_t pub_w = r.w;
+	int32_t pub_h = r.h;
+	if (g_hint_active.load(std::memory_order_acquire)) {
+		ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+		const int32_t lw = g_hint_layout_w.load(std::memory_order_relaxed);
+		const int32_t lh = g_hint_layout_h.load(std::memory_order_relaxed);
+		/*
+		 * BOTH halves must be in place, not just the buffer. The layout is applied
+		 * asynchronously by the UI thread, so there is a window in which the buffer
+		 * is already 723x1129 while the window is still 1080 logical — composed
+		 * (1080/723) x 0.67 = 1.00083, which is the ~0.4 px drift that reads as a
+		 * double image in both eyes. Publishing the physical rect there would tell
+		 * the runtime to weave through exactly that. So wait until our own sampled
+		 * logical size IS the hinted layout; until then keep publishing the logical
+		 * rect, which keeps the runtime on its honest 2D fallback.
+		 */
+		if (win != nullptr && win == g_hint_applied_win && g_hint_applied_w > 0 && g_hint_applied_h > 0 &&
+		    lw > 0 && lh > 0 && r.w == lw && r.h == lh) {
+			pub_w = g_hint_applied_w;
+			pub_h = g_hint_applied_h;
+		}
+	}
+
+	// Re-publish when the rect moved OR when the extent we publish flipped between
+	// logical and physical (the buffer override taking effect raises no new sample).
+	if (seq == last_seq && pub_w == last_pub_w && pub_h == last_pub_h) {
+		return;
+	}
+	last_seq = seq;
+	last_pub_w = pub_w;
+	last_pub_h = pub_h;
+
 	XrAndroidWindowGeometryDXR g = {};
 	g.type = XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR;
-	g.windowRect = XrRect2Di{{r.x, r.y}, {r.w, r.h}};
+	g.windowRect = XrRect2Di{{r.x, r.y}, {pub_w, pub_h}};
 	g.panelExtent = XrExtent2Di{r.panel_w, r.panel_h};
 	g.displayId = r.display_id;
 	XrResult res = g_pfnSetAndroidWindowGeometry(g_session, &g);
 	// Lifecycle only (the rect actually changed), never every frame.
-	LOGI("window screen rect: %d,%d %dx%d panel %dx%d display %d -> %d", r.x, r.y, r.w, r.h, r.panel_w,
-	     r.panel_h, r.display_id, (int)res);
+	LOGI("window screen rect: %d,%d %dx%d (logical %dx%d) panel %dx%d display %d -> %d", r.x, r.y, pub_w,
+	     pub_h, r.w, r.h, r.panel_w, r.panel_h, r.display_id, (int)res);
 }
 #endif
 
@@ -2293,6 +2448,46 @@ poll_xr_events()
 				     g_modes[e->currentModeIndex].tile_columns,
 				     g_modes[e->currentModeIndex].tile_rows);
 			}
+#if defined(CUBE_HAVE_ANDROID_SURFACE_BINDING) && defined(XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR)
+		} else if (ev.type == XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR) {
+			// #1396: the runtime measured the OEM container scale and did the
+			// exact-integer search; we own the window, so we apply the answer.
+			// Layout is applied by the UI thread, which polls
+			// nativeGetWindowLayoutRequest once per Choreographer frame; the
+			// buffer override is ours to set here (and re-set after any surface
+			// recreate, see apply_hint_buffer_geometry).
+			const auto *e = reinterpret_cast<const XrEventDataAndroidWindowLayoutHintDXR *>(&ev);
+			if (e->session == g_session) {
+				if (e->active) {
+					g_hint_layout_w.store(e->layoutSize.width, std::memory_order_relaxed);
+					g_hint_layout_h.store(e->layoutSize.height, std::memory_order_relaxed);
+					g_hint_buf_w.store(e->bufferSize.width, std::memory_order_relaxed);
+					g_hint_buf_h.store(e->bufferSize.height, std::memory_order_relaxed);
+					g_hint_apply_fails = 0;
+					g_hint_active.store(true, std::memory_order_release);
+					LOGI("miniWindow1to1 HINT: scale=%.4f layout %dx%d buffer %dx%d "
+					     "physical %d,%d %dx%d",
+					     (double)e->scale, e->layoutSize.width, e->layoutSize.height,
+					     e->bufferSize.width, e->bufferSize.height,
+					     e->physicalRect.offset.x, e->physicalRect.offset.y,
+					     e->physicalRect.extent.width, e->physicalRect.extent.height);
+					apply_hint_buffer_geometry();
+				} else {
+					g_hint_active.store(false, std::memory_order_release);
+					g_hint_layout_w.store(0, std::memory_order_relaxed);
+					g_hint_layout_h.store(0, std::memory_order_relaxed);
+					g_hint_buf_w.store(0, std::memory_order_relaxed);
+					g_hint_buf_h.store(0, std::memory_order_relaxed);
+					ANativeWindow *win = g_app_window.load(std::memory_order_acquire);
+					if (win != nullptr) {
+						// 0,0 hands the buffer size back to the window.
+						ANativeWindow_setBuffersGeometry(win, 0, 0, 0);
+					}
+					forget_hint_buffer_geometry();
+					LOGI("miniWindow1to1 HINT: OFF — restoring layout");
+				}
+			}
+#endif
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			LOGW("instance loss pending — exiting");
 			g_exit_requested = true;
@@ -2646,6 +2841,9 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// it goes out as xrSetAndroidSurfaceDXR so the runtime rebuilds its
 		// VkSurfaceKHR and the DP resumes.
 		publish_app_surface(app->window);
+		// #1396: a brand-new Surface has no buffer-size override, so an active
+		// layout hint must be re-asserted on it before the first frame.
+		apply_hint_buffer_geometry();
 #endif
 		// xrCreateInstance is deferred until the window exists because
 		// some runtimes inspect the Activity surface state during create.
@@ -2689,6 +2887,17 @@ handle_cmd(struct android_app *app, int32_t cmd)
 		// nothing presents into a dead window and the DP pauses (releasing its
 		// 3D-lens vote, ADR-036 D7) instead of holding the panel.
 		publish_app_surface(nullptr);
+		/*
+		 * #1396: the surface is gone, so the buffer-size override went with it.
+		 * The memo MUST be dropped here and not left for the next
+		 * APP_CMD_INIT_WINDOW to notice: the allocator can hand back the SAME
+		 * ANativeWindow address, and then the pointer compare in
+		 * apply_hint_buffer_geometry() would read "already applied" for a window
+		 * that has no override at all — we would go on publishing the physical
+		 * extent for a logical-sized buffer, and the runtime would latch on a
+		 * lie, silently and with nothing in the log.
+		 */
+		forget_hint_buffer_geometry();
 #endif
 		// Clear any in-progress touch: a card/recents gesture sends a DOWN to the
 		// app, then the system steals it for the swipe, so the matching UP never
@@ -2823,6 +3032,41 @@ Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeSetBackgroundEna
     JNIEnv * /*env*/, jobject /*thiz*/, jboolean enabled)
 {
 	g_bg_enabled.store(enabled == JNI_TRUE, std::memory_order_relaxed);
+}
+
+/*
+ * #1396: the UI thread asks, once per Choreographer frame, whether the runtime
+ * wants our window laid out at a different LOGICAL size (the exact-integer
+ * layout that makes the OEM container's composed transform identity). Polled
+ * rather than pushed for the same reason the window rect is: the UI thread is
+ * already running a per-frame callback, and a JNI callback into an app class is
+ * classloader-fragile (#507).
+ *
+ * @param out int[2] receiving layout width/height when this returns true.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_displayxr_cube_1handle_1vk_1android_MainActivity_nativeGetWindowLayoutRequest(
+    JNIEnv *env, jobject /*thiz*/, jintArray out)
+{
+#ifdef CUBE_HAVE_ANDROID_SURFACE_BINDING
+	if (out == nullptr || env->GetArrayLength(out) < 2) {
+		return JNI_FALSE;
+	}
+	if (!g_hint_active.load(std::memory_order_acquire)) {
+		return JNI_FALSE;
+	}
+	jint vals[2] = {g_hint_layout_w.load(std::memory_order_relaxed),
+	                g_hint_layout_h.load(std::memory_order_relaxed)};
+	if (vals[0] <= 0 || vals[1] <= 0) {
+		return JNI_FALSE;
+	}
+	env->SetIntArrayRegion(out, 0, 2, vals);
+	return JNI_TRUE;
+#else
+	(void)env;
+	(void)out;
+	return JNI_FALSE;
+#endif
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL

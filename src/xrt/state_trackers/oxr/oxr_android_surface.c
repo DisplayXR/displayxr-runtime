@@ -33,6 +33,8 @@
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
+#include "os/os_time.h"
+
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_handle.h"
@@ -47,6 +49,7 @@
 #include <jni.h>
 
 #include "android/android_globals.h"
+#include "android/android_mini_window.h"
 
 /*!
  * Resolve a binding struct to an ANativeWindow the caller may keep.
@@ -188,6 +191,294 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	 */
 	android_globals_set_window(NULL);
 	sess->android_bound_window = NULL;
+
+	/*
+	 * #1396: drop the layout-hint episode with the session. The Java helper
+	 * caches the probed vendor scale and its p/q for the lifetime of an
+	 * episode, so a SECOND session in the same process (an end→begin bounce,
+	 * a relaunch) would otherwise inherit the previous window's answer and
+	 * apply it to a window it was never measured for. No event: the session
+	 * that would receive it is going away.
+	 */
+	sess->android_hint_active = false;
+	sess->android_hint_unknown_logged = false;
+	sess->android_hint_ignored_logged = false;
+	sess->android_hint_layout_w = 0;
+	sess->android_hint_layout_h = 0;
+	sess->android_hint_buffer_w = 0;
+	sess->android_hint_buffer_h = 0;
+	sess->android_hint_disp_w = 0;
+	sess->android_hint_disp_h = 0;
+	sess->android_hint_prev_layout_w = 0;
+	sess->android_hint_prev_layout_h = 0;
+	sess->android_hint_prev_disp_w = 0;
+	sess->android_hint_prev_disp_h = 0;
+	sess->android_hint_prev_armed_ns = 0;
+	sess->android_hint_prev_refused_logged = false;
+	sess->android_hint_scale = 0.0f;
+	android_mini_window_reset();
+}
+
+/*
+ *
+ * Mini-window layout hint (#1396, spec v2).
+ *
+ * An OEM "window reply" container does not give the task a smaller window — it
+ * gives it a FULL-SIZE logical window and scales the whole task with a
+ * SurfaceFlinger leash. The vendor interlacer is strict 1:1 buffer→panel, so
+ * that resample destroys the weave and the compositor honestly degrades to 2D
+ * (`vk_android_update_container_scaled`).
+ *
+ * Escaping it needs a LAYOUT change (1080 → 1079 logical, so `logical * scale`
+ * lands on a whole pixel) plus a fixed BUFFER. `ANativeWindow_setBuffersGeometry`
+ * on the bound window reaches the second but not the first, and the app owns its
+ * view — so the runtime measures and the app applies. Exactly the ADR-036 D6
+ * split the geometry channel already uses, in the other direction.
+ *
+ * The hosted `MonadoView` does both halves itself; both paths call the SAME
+ * `MiniWindowLayout` for every measured rule, so they cannot drift.
+ */
+
+/*!
+ * How long the "do not derive from the previous episode's layout" memo lives.
+ *
+ * It only has to outlive the app's asynchronous restore — measured on the NP02J
+ * at 50-160 ms between the `OFF` and the next real rect — so a second is a wide
+ * margin, and it is far shorter than any human re-entry (recents + a tap).
+ *
+ * Wall clock rather than a publish count on purpose: the app publishes only when
+ * its rect CHANGES, and the platform freezes a backgrounded app outright
+ * (`CpuFreezerManagerServiceV2` on this OEM), so a counter can sit unadvanced for
+ * an unbounded time. A clock cannot.
+ */
+#define OXR_ANDROID_PREV_LAYOUT_GRACE_NS (1000 * 1000 * 1000ULL)
+
+//! End the episode and tell the app to restore. No-op when no hint is active.
+static void
+oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess, uint32_t disp_w, uint32_t disp_h)
+{
+	if (!sess->android_hint_active) {
+		return;
+	}
+	/*
+	 * Remember the layout we are ending on. The app restores asynchronously, so
+	 * its very next publish may still carry it — and deriving a new hint from
+	 * THAT is deriving a hint from a hint. MEASURED on the NP02J: rotating out
+	 * of and back into the mini-window recomputed against the app's still-1079
+	 * layout instead of the container's natural 1080, and settled on a 723x1130
+	 * buffer where a clean entry gives 723x1129 — about 1.05 px of drift, above
+	 * the 0.4 px that is visibly a double image. The container never hands out a
+	 * size we invented, so refusing exactly this extent is safe.
+	 */
+	sess->android_hint_prev_layout_w = sess->android_hint_layout_w;
+	sess->android_hint_prev_layout_h = sess->android_hint_layout_h;
+	/*
+	 * Armed against the panel of the publish that ENDS the episode, not the one
+	 * the hint was computed in. On a rotation those differ, and arming with the
+	 * old one expires the memo on the very next publish — which is the 723x1130
+	 * bug it exists to prevent, measured again on the NP02J when this was first
+	 * written the other way round.
+	 */
+	sess->android_hint_prev_disp_w = (int32_t)disp_w;
+	sess->android_hint_prev_disp_h = (int32_t)disp_h;
+	sess->android_hint_prev_armed_ns = os_monotonic_get_ns();
+	sess->android_hint_prev_refused_logged = false;
+
+	sess->android_hint_active = false;
+	sess->android_hint_unknown_logged = false;
+	sess->android_hint_ignored_logged = false;
+	sess->android_hint_layout_w = 0;
+	sess->android_hint_layout_h = 0;
+	sess->android_hint_buffer_w = 0;
+	sess->android_hint_buffer_h = 0;
+	sess->android_hint_disp_w = 0;
+	sess->android_hint_disp_h = 0;
+	sess->android_hint_scale = 0.0f;
+	android_mini_window_reset();
+	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_FALSE, 0.0f, 0, 0, 0, 0, 0, 0);
+}
+
+void
+oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess)
+{
+	if (sess == NULL || !sess->android_hint_active) {
+		return;
+	}
+	if (!sess->sys->inst->extensions.DXR_android_surface_binding) {
+		return;
+	}
+	oxr_event_push_XrEventDataAndroidWindowLayoutHint(
+	    log, sess, XR_TRUE, sess->android_hint_scale, sess->android_hint_layout_w, sess->android_hint_layout_h,
+	    sess->android_hint_buffer_w, sess->android_hint_buffer_h, sess->android_hint_x, sess->android_hint_y);
+}
+
+void
+oxr_android_window_hint_update(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               int32_t x,
+                               int32_t y,
+                               uint32_t w,
+                               uint32_t h,
+                               uint32_t disp_w,
+                               uint32_t disp_h)
+{
+	if (sess == NULL || w == 0 || h == 0) {
+		return;
+	}
+	if (disp_w == 0 || disp_h == 0) {
+		// No panel extent to compare against. Never decide on ignorance —
+		// keep whatever state we are in (same rule as the compositor's tell).
+		return;
+	}
+
+	if (sess->android_hint_active) {
+		/*
+		 * Two things can end an episode that the published RECT cannot show,
+		 * so they are checked on every publish while a hint is live — not only
+		 * on the latched branch below. An app that leaves the container while
+		 * publishing a rect that still spills (a resize, a rotation, a
+		 * different display) would otherwise keep the hint latched forever.
+		 *
+		 * 1. The container itself. A physical rect fits the panel BY
+		 *    CONSTRUCTION, so "the window left its container" and "the hint is
+		 *    working" are indistinguishable from the rect. MEASURED on the
+		 *    NP02J: moving the task back to fullscreen left the app's window at
+		 *    the hinted layout, so it kept publishing a fitting 723x1129 rect
+		 *    and the hint stayed latched — a small window weaving in a
+		 *    fullscreen task. `Activity.isInMultiWindowMode()` is the exact
+		 *    public answer.
+		 * 2. The panel frame. Every number in the hint — the scale, the
+		 *    layout, the buffer — was derived against one panel extent. A
+		 *    rotation replaces it, so the episode is over; the app restores and
+		 *    the next publish re-derives from scratch. Without this the latch
+		 *    below keeps weaving at the pre-rotation size.
+		 */
+		if (!android_mini_window_still_scalable()) {
+			oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
+			return;
+		}
+		if ((int32_t)disp_w != sess->android_hint_disp_w || (int32_t)disp_h != sess->android_hint_disp_h) {
+			oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
+			return;
+		}
+
+		/*
+		 * Once the app has applied a hint it publishes the PHYSICAL rect, which
+		 * fits the panel and so no longer trips the tell. Recognise that by the
+		 * EXTENT (the origin keeps changing as the window is dragged) and latch,
+		 * or every drag frame would look like "the window left its container".
+		 */
+		if ((int32_t)w == sess->android_hint_buffer_w && (int32_t)h == sess->android_hint_buffer_h) {
+			sess->android_hint_x = x;
+			sess->android_hint_y = y;
+			return;
+		}
+	}
+
+	const bool tell =
+	    x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
+
+	if (!tell) {
+		oxr_android_window_hint_clear(log, sess, disp_w, disp_h);
+		return;
+	}
+
+	/*
+	 * The app may not have finished restoring from the previous episode — a rect
+	 * that is still THAT episode's layout size is not the container's own, and
+	 * deriving from it is deriving a hint from a hint.
+	 *
+	 * The memo is bounded (see OXR_ANDROID_PREV_LAYOUT_GRACE_NS). Unbounded it
+	 * would be a permanent, silent lock-out on any device whose container scale
+	 * rationalises to a small q — 0.75, 0.80, 0.50, 0.60 all leave
+	 * snapDimension() returning the window unchanged, so the previous layout IS
+	 * the container's natural logical size and every re-entry would match it
+	 * forever. (The NP02J escapes only because 1080 x 0.67 is not integral.)
+	 *
+	 * It cannot instead be cleared on any non-spilling publish: a 1079x1685
+	 * window FITS a rotated 1600x2560 panel, so such a publish arrives
+	 * mid-rotation before the app has restored — which is exactly the case that
+	 * measured 723x1130 instead of 723x1129.
+	 */
+	if (sess->android_hint_prev_layout_w > 0) {
+		const uint64_t now = os_monotonic_get_ns();
+		const bool expired = (int32_t)disp_w != sess->android_hint_prev_disp_w ||
+		                     (int32_t)disp_h != sess->android_hint_prev_disp_h ||
+		                     now - sess->android_hint_prev_armed_ns > OXR_ANDROID_PREV_LAYOUT_GRACE_NS;
+
+		if (!expired && (int32_t)w == sess->android_hint_prev_layout_w &&
+		    (int32_t)h == sess->android_hint_prev_layout_h) {
+			// The only state decision in this file that produces no event.
+			// Say it once so it is never silent.
+			if (!sess->android_hint_prev_refused_logged) {
+				sess->android_hint_prev_refused_logged = true;
+				U_LOG_W(
+				    "XR_DXR_android_surface_binding: ignoring a %ux%u rect — still the previous "
+				    "episode's layout, waiting for the container's own (#1396)",
+				    w, h);
+			}
+			return;
+		}
+		sess->android_hint_prev_layout_w = 0;
+		sess->android_hint_prev_layout_h = 0;
+		sess->android_hint_prev_disp_w = 0;
+		sess->android_hint_prev_disp_h = 0;
+		sess->android_hint_prev_refused_logged = false;
+	}
+
+	struct android_mini_window_hint hint = {0};
+	if (!android_mini_window_compute_hint(x, y, w, h, disp_w, disp_h, &hint)) {
+		/*
+		 * No usable answer for this rect. Either the container scale is not
+		 * knowable — the app owns the view, so the touch-ratio fallback the
+		 * hosted path uses is not available here and there is no readable
+		 * vendor API — or the helper rejected the rect as a mid-rotation
+		 * sample. Both fail to the 2D fallback, which is the honest direction.
+		 */
+		if (!sess->android_hint_unknown_logged) {
+			sess->android_hint_unknown_logged = true;
+			U_LOG_W(
+			    "XR_DXR_android_surface_binding: window %d,%d %ux%u spills the panel %ux%u but no "
+			    "1:1 layout is derivable for it (scale unknown, or a mid-rotation sample) — "
+			    "staying on the 2D fallback (#1396)",
+			    x, y, w, h, disp_w, disp_h);
+		}
+		return;
+	}
+
+	if (sess->android_hint_active && hint.layout_w == sess->android_hint_layout_w &&
+	    hint.layout_h == sess->android_hint_layout_h && hint.buffer_w == sess->android_hint_buffer_w &&
+	    hint.buffer_h == sess->android_hint_buffer_h) {
+		// Same answer, and the app is still publishing a LOGICAL rect — it has
+		// not applied the hint (or does not implement spec v2). Say so once and
+		// do not re-push: the event is already in its queue.
+		sess->android_hint_x = x;
+		sess->android_hint_y = y;
+		if (!sess->android_hint_ignored_logged) {
+			sess->android_hint_ignored_logged = true;
+			U_LOG_W(
+			    "XR_DXR_android_surface_binding: layout hint delivered but the app is still "
+			    "publishing a logical %ux%u rect — expecting the physical %dx%d one; the 2D "
+			    "fallback stays until it does (#1396)",
+			    w, h, hint.buffer_w, hint.buffer_h);
+		}
+		return;
+	}
+
+	sess->android_hint_active = true;
+	sess->android_hint_ignored_logged = false;
+	sess->android_hint_layout_w = hint.layout_w;
+	sess->android_hint_layout_h = hint.layout_h;
+	sess->android_hint_buffer_w = hint.buffer_w;
+	sess->android_hint_buffer_h = hint.buffer_h;
+	sess->android_hint_x = x;
+	sess->android_hint_y = y;
+	sess->android_hint_disp_w = (int32_t)disp_w;
+	sess->android_hint_disp_h = (int32_t)disp_h;
+	sess->android_hint_scale = hint.scale;
+
+	oxr_event_push_XrEventDataAndroidWindowLayoutHint(log, sess, XR_TRUE, hint.scale, hint.layout_w, hint.layout_h,
+	                                                  hint.buffer_w, hint.buffer_h, x, y);
 }
 
 XrResult
@@ -204,7 +495,16 @@ oxr_xrSetAndroidSurfaceDXR(XrSession session, const XrAndroidSurfaceBindingCreat
 		                 "XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR");
 	}
 
-	return oxr_android_surface_publish(&log, sess, binding, NULL);
+	XrResult ret = oxr_android_surface_publish(&log, sess, binding, NULL);
+
+	// A republish is a background→resume (or a container transition): the app's
+	// event queue may have been drained across it, and it has just rebuilt its
+	// Surface at the layout size. Re-deliver an active hint so it re-applies.
+	if (ret == XR_SUCCESS && binding != NULL) {
+		oxr_android_window_hint_reemit(&log, sess);
+	}
+
+	return ret;
 }
 
 XrResult
@@ -229,6 +529,15 @@ oxr_xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeomet
 	    (uint32_t)geometry->windowRect.extent.width, (uint32_t)geometry->windowRect.extent.height,
 	    geometry->displayId, (uint32_t)(geometry->panelExtent.width > 0 ? geometry->panelExtent.width : 0),
 	    (uint32_t)(geometry->panelExtent.height > 0 ? geometry->panelExtent.height : 0));
+
+	// #1396: the same rect decides whether this window needs a 1:1 layout to
+	// weave at all. Cheap — the tell is four compares, and the vendor probe
+	// behind it resolves once per scaled-container episode.
+	oxr_android_window_hint_update(&log, sess, geometry->windowRect.offset.x, geometry->windowRect.offset.y,
+	                               (uint32_t)geometry->windowRect.extent.width,
+	                               (uint32_t)geometry->windowRect.extent.height,
+	                               (uint32_t)(geometry->panelExtent.width > 0 ? geometry->panelExtent.width : 0),
+	                               (uint32_t)(geometry->panelExtent.height > 0 ? geometry->panelExtent.height : 0));
 
 	return XR_SUCCESS;
 }

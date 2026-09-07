@@ -27,12 +27,16 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Choreographer
+import android.view.Gravity
 import android.view.MotionEvent
+import android.view.WindowManager
 
 class MainActivity : NativeActivity() {
 
     companion object {
+        private const val TAG = "cube_handle_vk_android"
         private const val REQUEST_CAMERA = 1
 
         // Load the native lib into the JVM so the external JNI function below
@@ -59,6 +63,14 @@ class MainActivity : NativeActivity() {
     private external fun nativeSetWindowRect(
         x: Int, y: Int, w: Int, h: Int, panelW: Int, panelH: Int, displayId: Int,
     )
+
+    // Implemented in main.cpp. #1396: the runtime measured the OEM container
+    // scale and wants this window laid out at an exact-integer LOGICAL size so
+    // its scaled composition lands 1:1 on the panel. Returns true and fills
+    // out[0]=width, out[1]=height while a hint is active. Polled, not pushed —
+    // we are already running a per-frame callback here, and JNI callbacks into
+    // an app class are classloader-fragile (#507).
+    private external fun nativeGetWindowLayoutRequest(out: IntArray): Boolean
 
     // True once xrCreateInstance failed with RUNTIME_UNAVAILABLE.
     private external fun nativeRuntimeUnavailable(): Boolean
@@ -133,6 +145,21 @@ class MainActivity : NativeActivity() {
     private var lastRect = intArrayOf(Int.MIN_VALUE, Int.MIN_VALUE, -1, -1, -1, -1, -1)
     private var rectPollRunning = false
 
+    // ---- #1396 mini-window 1:1 layout.
+    //
+    // We are a NativeActivity: our Surface IS the activity window's surface
+    // (NativeActivity.onCreate does getWindow().takeSurface(this)), so there is
+    // no content view to shrink — the LAYOUT half of the hint is the WINDOW
+    // size, WindowManager.LayoutParams.width/height. The BUFFER half is
+    // ANativeWindow_setBuffersGeometry on the native side.
+    //
+    // Anchored TOP|START so the on-screen origin stays getLocationOnScreen with
+    // no offset math anywhere downstream, and the (typically one logical pixel)
+    // remainder falls on the right/bottom edge.
+    private val layoutRequest = IntArray(2)
+    private var miniLayoutW = 0
+    private var miniLayoutH = 0
+
     private val rectCallback = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!rectPollRunning) return
@@ -141,7 +168,45 @@ class MainActivity : NativeActivity() {
         }
     }
 
+    /** Apply (or undo) the runtime's requested window layout. UI thread only. */
+    private fun updateMiniWindowLayout() {
+        val win = window ?: return
+        val active =
+            try {
+                nativeGetWindowLayoutRequest(layoutRequest)
+            } catch (_: Throwable) {
+                false // native lib not bound yet; the next frame retries
+            }
+        if (active) {
+            val w = layoutRequest[0]
+            val h = layoutRequest[1]
+            if (w <= 0 || h <= 0 || (w == miniLayoutW && h == miniLayoutH)) return
+            miniLayoutW = w
+            miniLayoutH = h
+            val lp = win.attributes
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.width = w
+            lp.height = h
+            win.attributes = lp
+            Log.i(TAG, "miniWindow1to1: window layout -> ${w}x$h (#1396)")
+        } else if (miniLayoutW != 0 || miniLayoutH != 0) {
+            miniLayoutW = 0
+            miniLayoutH = 0
+            val lp = win.attributes
+            // Put back everything the ON path changed, gravity included: leaving
+            // TOP|START on a restored MATCH_PARENT window is a lasting side effect
+            // of a transient hint. NO_GRAVITY is what an activity window has
+            // before anyone touches it.
+            lp.gravity = Gravity.NO_GRAVITY
+            lp.width = WindowManager.LayoutParams.MATCH_PARENT
+            lp.height = WindowManager.LayoutParams.MATCH_PARENT
+            win.attributes = lp
+            Log.i(TAG, "miniWindow1to1: window layout restored to MATCH_PARENT (#1396)")
+        }
+    }
+
     private fun sampleWindowRect() {
+        updateMiniWindowLayout()
         val view = window?.decorView ?: return
         val w = view.width
         val h = view.height
