@@ -443,6 +443,44 @@ struct xrt_display_processor_vk
 	 */
 	bool (*get_background_preview)(struct xrt_display_processor_vk *xdp,
 	                               struct xrt_dp_background_preview *out_preview);
+
+	/*!
+	 * Did the `process_atlas()` that just returned actually reach the panel?
+	 *
+	 * `process_atlas()` returns void, and a self-submitting DP does its weave
+	 * on its own queue — so a vendor submit that FAILS is, to the compositor,
+	 * indistinguishable from one that succeeded. It then presents a target the
+	 * weaver never wrote, counts the frame, and folds its timing into the next
+	 * frame's accounting. runtime#1394 / LeiaInc/CNSDK#733 is exactly that: an
+	 * Adreno GSL timestamp collision fails the weaver's internal
+	 * `vkQueueSubmit`, and every downstream book keeps saying the frame shipped.
+	 *
+	 * This slot lets the DP say "that one did not". Semantics, deliberately
+	 * narrow:
+	 *
+	 * - It reports the MOST RECENT `process_atlas()` on this DP and nothing
+	 *   else. The runtime calls it immediately after `process_atlas()` returns,
+	 *   on the same thread, before any other DP call.
+	 * - true  = the frame was DROPPED: no pixels were produced for this atlas.
+	 *           The runtime must not present it, must not count it as
+	 *           presented, and must feed nothing from it into the next frame's
+	 *           timing/horizon accounting.
+	 * - false = the frame is as good as it ever was (this is also what an
+	 *           absent slot, a NULL pointer, or a DP with no such signal reads
+	 *           as, so today's behaviour is the default everywhere).
+	 *
+	 * The DP owns recovery of its OWN state (semaphores, caches). The runtime
+	 * owns the target: after a drop it re-enters `process_atlas()` through a
+	 * fresh acquire and re-checks the swapchain generation, so a DP must not
+	 * hold a framebuffer or image view cached from the dropped frame.
+	 *
+	 * Must not block and must not log per frame — it is called on every weave.
+	 * Appended per ADR-020 (append-only within a major; no version bump).
+	 *
+	 * @param xdp Pointer to self.
+	 * @return true if the frame just handed to `process_atlas()` was dropped.
+	 */
+	bool (*get_last_frame_dropped)(struct xrt_display_processor_vk *xdp);
 };
 
 /*!
@@ -543,7 +581,6 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_panel_size)     
  */
 #define XRT_DP_VK_HAS_PREDICTED_SCANOUT 1
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_preview) == sizeof(struct xrt_display_processor) + 11 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -551,6 +588,16 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * - the coupled-ABI-addition pattern used by every other appended slot.
  */
 #define XRT_DP_VK_HAS_BACKGROUND_PREVIEW 1
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::get_last_frame_dropped slot (runtime#1394), so a
+ * plug-in built against an older runtime can #ifdef-guard its implementation
+ * - the coupled-ABI-addition pattern used by every other appended slot.
+ */
+#define XRT_DP_VK_HAS_FRAME_DROPPED 1
 // clang-format on
 
 /*!
@@ -870,6 +917,30 @@ xrt_display_processor_vk_get_background_preview(struct xrt_display_processor_vk 
 		return false;
 	}
 	return xdp->get_background_preview(xdp, out_preview);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_last_frame_dropped
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL, or
+ * the DP says the frame was fine. All three mean "present it as usual", which is
+ * what every caller did before this slot existed - so an old plug-in is
+ * bit-identical to today. Like the wrappers above, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base - see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_last_frame_dropped(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_last_frame_dropped + sizeof(xdp->get_last_frame_dropped);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->get_last_frame_dropped == NULL) {
+		return false;
+	}
+	return xdp->get_last_frame_dropped(xdp);
 }
 
 #ifdef __cplusplus

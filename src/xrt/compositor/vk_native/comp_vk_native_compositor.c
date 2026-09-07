@@ -4660,6 +4660,57 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
 			    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
 
+			/*
+			 * #1394 — the DP is allowed to say "that frame did not happen".
+			 *
+			 * A self-submitting DP weaves on its own queue, so a vendor submit
+			 * that FAILS looks exactly like one that succeeded from here: we
+			 * would present a target the weaver never wrote, count it, and fold
+			 * its timing into the next frame. The measured case is an Adreno GSL
+			 * timestamp collision failing the CNSDK weaver's internal
+			 * vkQueueSubmit (LeiaInc/CNSDK#733/#734).
+			 *
+			 * Treat it exactly like the fence-park's drop-if-superseded: bail
+			 * BEFORE the composite submit, the present, and the frame-timing
+			 * flush. That gives the four properties the vendor fix needs from
+			 * us — no present, no present_serial bump, nothing from this frame
+			 * in vk_frame_timing (fp[] is never flushed) or in the next
+			 * predicted-scanout horizon (which is measured from presents), and
+			 * a fresh acquire + generation re-check on the next weave, so the
+			 * DP can never be handed a framebuffer cached across the drop.
+			 *
+			 * The DP owns recovering its own state; we own the target. Absent
+			 * slot / older plug-in ⟹ false ⟹ byte-identical to before.
+			 */
+			if (xrt_display_processor_vk_get_last_frame_dropped(
+			        (struct xrt_display_processor_vk *)c->display_processor)) {
+				/*
+				 * Rate-limited, never per-frame: the whole point of the
+				 * vendor fix is that a drop is survivable, and a survivable
+				 * failure logged at 60 Hz is its own ship-blocker. One WARN
+				 * on the first ever drop, then at most one line per 5 s
+				 * carrying the running count.
+				 */
+				static uint64_t s_drops = 0;
+				static uint64_t s_last_log_ns = 0;
+				const uint64_t now_ns = os_monotonic_get_ns();
+				s_drops++;
+				if (s_drops == 1 || now_ns - s_last_log_ns > 5 * U_TIME_1S_IN_NS) {
+					s_last_log_ns = now_ns;
+					U_LOG_W("#1394: the display processor DROPPED this frame — not "
+					        "presenting it (%" PRIu64 " dropped so far). The vendor "
+					        "log line immediately above says whether its submit "
+					        "failed or its fence wait timed out.",
+					        s_drops);
+				}
+				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+				if (target_fb != VK_NULL_HANDLE) {
+					vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
+				}
+				*out_skip_frame = true;
+				return XRT_SUCCESS;
+			}
+
 			// XR_DXR_depth_budget: evaluate the rear budget from the background
 			// the DP just composited under. AFTER process_atlas, because that is
 			// the point at which the DP's capture for this frame is settled, and
