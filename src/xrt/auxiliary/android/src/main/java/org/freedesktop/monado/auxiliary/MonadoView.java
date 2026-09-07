@@ -26,6 +26,7 @@ import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Choreographer;
 import android.view.Display;
+import android.view.Gravity;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -270,10 +271,19 @@ public class MonadoView extends SurfaceView
     // ---- mini-window 1:1 weave (#1367 S9 / #1277). All touched on the UI thread only.
     private static final float TOUCH_MIN_SPAN_PX = 40.0f;
     private static final long VENDOR_RETRY_MS = 500;
+    private static final int Q_MAX = 250;
+    private static final float RATIONALISE_TOL = 1.0e-4f;
+    private static final double SNAP_TOL_PX = 0.1;
     private final int[] oneToOneSize = new int[2];
     private boolean miniOneToOneApplied = false;
     private int miniBufW = 0;
     private int miniBufH = 0;
+    private int miniRatP = 0;
+    private int miniRatQ = 0;
+    private boolean miniRatTried = false;
+    private boolean miniInexactLogged = false;
+    private int miniVendorRectW = 0;
+    private int miniVendorRectH = 0;
     private float miniVendorScale = 0f;
     private long miniVendorLastTryMs = 0;
     private boolean miniCrossChecked = false;
@@ -354,6 +364,22 @@ public class MonadoView extends SurfaceView
         getLocationOnScreen(locationOnScreen);
         int x = locationOnScreen[0];
         int y = locationOnScreen[1];
+        // #1367 S9: the WINDOW's logical extent, which is the PARENT's — the #1358
+        // FrameLayout is always the full window, while this view may have been laid out
+        // to a different size by the integer-exact 1:1 path below. Every decision here
+        // (the container-scaled tell, the scale derivation) is about the window, not
+        // about the size we chose to weave at. Falls back to this view's own size when
+        // there is no parent View, since then nothing has resized it.
+        {
+            android.view.ViewParent vp = getParent();
+            if (vp instanceof View) {
+                View pv = (View) vp;
+                if (pv.getWidth() > 0 && pv.getHeight() > 0) {
+                    w = pv.getWidth();
+                    h = pv.getHeight();
+                }
+            }
+        }
         int displayId = 0;
         int dispW = 0;
         int dispH = 0;
@@ -486,11 +512,14 @@ public class MonadoView extends SurfaceView
 
         if (!tell || !isMiniWindow1to1Enabled()) {
             if (miniOneToOneApplied) {
+                restoreLayoutToWindow();
                 getHolder().setSizeFromLayout();
                 miniOneToOneApplied = false;
                 miniBufW = 0;
                 miniBufH = 0;
                 miniVendorScale = 0f;
+                miniVendorRectW = 0;
+                miniVendorRectH = 0;
                 Log.i(
                         TAG,
                         "miniWindow1to1: OFF ("
@@ -508,38 +537,113 @@ public class MonadoView extends SurfaceView
             return false;
         }
 
-        int bw = Math.round(w * s);
-        int bh = Math.round(h * s);
-        if (bw <= 0 || bh <= 0) {
+        // ---- integer-exact sizing.
+        //
+        // round(logical * s) is NOT enough. 1080 * 0.67 = 723.6 rounds to 724, so SF
+        // composes buffer->layer x leash = (1080/724) x 0.67 = 0.9994 — a 0.06 % scale,
+        // ~0.4 px of drift across a 724 px window. David's eye read that as "weaves
+        // good, but a slight double image in BOTH eyes", and both eyes equally is the
+        // signature of a residual RESAMPLE (bilinear bleeding adjacent views into each
+        // eye), not of a phase error. The SF readback said the same: 0.9994 / 1.0000.
+        //
+        // The requirement is NOT "a multiple of q" — that was too blunt, it cost a 54 px
+        // (5 %) black border on the right and another 57 px at the bottom, which David
+        // rejected. All that is actually required is that layout * s land close ENOUGH to
+        // an integer, so search for the LARGEST layout within q of the window whose
+        // residual is under a tenth of a pixel (@ref SNAP_TOL_PX).
+        //
+        // With s = 0.67 that is 1079 wide (1079 * 0.67 = 722.93, e = 0.07 px -> buffer
+        // 723, composed 0.99990) and the FULL 1685 high (1128.95, e = 0.05 px -> buffer
+        // 1129, composed 0.99996). The border collapses from 54 px to ONE logical pixel.
+        // Calibration for the 0.1 px tolerance: the error David SAW was 0.4 px
+        // (1080 -> 723.6), and the 0.05 px height case has been on the panel throughout
+        // without a complaint.
+        //
+        // What does NOT work, measured on device, so do not re-try it: OVERSCANNING (a
+        // layout LARGER than the window, so the crop eats the remainder). A SurfaceView
+        // bigger than its window has its surface sized to the VISIBLE frame, so a
+        // 737x1139 buffer got mapped into 723.6x1128.95 screen px — composed 0.982, a 2 %
+        // resample, and the double image came straight back.
+        if (!rationaliseScale(s, w, h)) {
+            // No usable p/q: fall back to the old rounded size, which still beats the
+            // 2D degrade, and say so once.
+            if (!miniInexactLogged) {
+                miniInexactLogged = true;
+                Log.w(
+                        TAG,
+                        "miniWindow1to1: scale "
+                                + s
+                                + " does not rationalise to a usable p/q (q<="
+                                + Q_MAX
+                                + ") — exact 1:1 is NOT reachable, using round(logical*s);"
+                                + " expect a sub-pixel resample");
+            }
+            miniRatP = 0;
+            miniRatQ = 0;
+        }
+
+        int layoutW;
+        int layoutH;
+        int bw;
+        int bh;
+        if (miniRatQ > 0) {
+            layoutW = snapDimension(w, miniRatP, miniRatQ);
+            layoutH = snapDimension(h, miniRatP, miniRatQ);
+            bw = (int) Math.round((double) layoutW * miniRatP / miniRatQ);
+            bh = (int) Math.round((double) layoutH * miniRatP / miniRatQ);
+        } else {
+            layoutW = w;
+            layoutH = h;
+            bw = Math.round(w * s);
+            bh = Math.round(h * s);
+        }
+        if (layoutW <= 0 || layoutH <= 0 || bw <= 0 || bh <= 0) {
             return false;
         }
+
         if (!miniOneToOneApplied || bw != miniBufW || bh != miniBufH) {
             miniBufW = bw;
             miniBufH = bh;
             miniOneToOneApplied = true;
+            // Layout first, buffer second: the composed scale is layout/buffer x leash,
+            // and only the pair is meaningful.
+            applyOneToOneLayout(layoutW, layoutH);
             getHolder().setFixedSize(bw, bh);
             // ONE line per transition — a lifecycle event, never a per-frame one.
             Log.i(
                     TAG,
                     "miniWindow1to1: ON scale="
                             + s
+                            + (miniRatQ > 0 ? " (" + miniRatP + "/" + miniRatQ + ")" : " (inexact)")
                             + " source="
                             + miniScaleSource
-                            + " logical "
+                            + " window "
                             + w
                             + "x"
                             + h
+                            + " -> layout "
+                            + layoutW
+                            + "x"
+                            + layoutH
                             + " -> buffer "
                             + bw
                             + "x"
                             + bh
-                            + " (SF buffer->layer x leash should compose to identity)");
+                            + " (residual "
+                            + String.format("%.3f", residualPx(layoutW, bw))
+                            + "/"
+                            + String.format("%.3f", residualPx(layoutH, bh))
+                            + " px, strip "
+                            + Math.round((w - layoutW) * s)
+                            + "x"
+                            + Math.round((h - layoutH) * s)
+                            + " px right/bottom)");
         }
 
         // Ordering: setFixedSize is a request. Until the surface actually comes back at
         // that size (surfaceChanged, which re-samples), publishing the physical rect
         // would have the compositor weave at a size the buffer does not have — one
-        // visibly wrong frame. Publish the logical rect until then.
+        // visibly wrong frame. Publish the window's logical rect until then.
         synchronized (currentSurfaceHolderSync) {
             if (this.width != bw || this.height != bh) {
                 return false;
@@ -548,6 +652,146 @@ public class MonadoView extends SurfaceView
         outSize[0] = bw;
         outSize[1] = bh;
         return true;
+    }
+
+    /**
+     * The largest layout size within q of {@code dim} whose on-screen extent
+     * ({@code layout * p/q}) is within {@link #SNAP_TOL_PX} of a whole pixel — i.e. the
+     * smallest border that still buys a resample-free composition.
+     *
+     * <p>An exact multiple of q always satisfies this with residual 0 and is always inside
+     * the search window ({@code dim - dim%q}, and {@code dim%q < q}), so the loop cannot
+     * come back empty; the return after it only covers a degenerate {@code dim < q}.
+     */
+    private int snapDimension(int dim, int p, int q) {
+        int lo = Math.max(1, dim - q);
+        for (int l = dim; l >= lo; l--) {
+            double v = (double) l * p / q;
+            if (Math.abs(v - Math.rint(v)) <= SNAP_TOL_PX) {
+                return l;
+            }
+        }
+        int mult = (dim / q) * q;
+        return mult > 0 ? mult : dim;
+    }
+
+    /**
+     * Sub-pixel drift the composition still carries, over the whole window, in panel px.
+     * Computed from the RATIONALISED p/q, not from the raw measured float — p/q is what the
+     * sizing used and what the leash actually is; the float carries the vendor Rect's
+     * whole-pixel quantisation and would overstate the drift by 2-4x.
+     */
+    private double residualPx(int layout, int buffer) {
+        if (miniRatQ <= 0) {
+            return 0.0;
+        }
+        return Math.abs((double) layout * miniRatP / miniRatQ - buffer);
+    }
+
+    /**
+     * Rationalise the measured scale to {@code p/q}, into {@link #miniRatP}/{@link #miniRatQ}.
+     *
+     * <p>q = 100 IS TRIED FIRST, and that is a deliberate prior, not a shortcut: an OEM window
+     * scale is a round percentage (this one is 0.67, and SurfaceFlinger prints the leash as
+     * {@code 0.6700}). Smallest-q-wins on its own picks the WRONG fraction here — the vendor
+     * Rect only pins the scale to about 3e-4 because it is quantised to whole pixels, and
+     * inside that band {@code 63/94 = 0.670213} both reproduces the Rect exactly AND has a
+     * smaller q than {@code 67/100}, while composing to 0.99968 instead of 1. So try the
+     * percentage first, and only fall back to an ascending search for a device that is not on
+     * a percentage grid.
+     *
+     * <p>A candidate is accepted only if it round-trips the vendor Rect in both axes when we
+     * have one, or is within {@link #RATIONALISE_TOL} of a touch-measured scale when we do not.
+     *
+     * @return true when a usable p/q was found
+     */
+    private boolean rationaliseScale(float s, int w, int h) {
+        if (miniRatQ > 0) {
+            return true; // resolved once per scaled-container episode
+        }
+        if (miniRatTried) {
+            return false; // already searched and failed; don't re-search every frame
+        }
+        miniRatTried = true;
+        int p100 = Math.round(s * 100f);
+        if (p100 > 0 && acceptRational(p100, 100, s, w, h)) {
+            miniRatP = p100;
+            miniRatQ = 100;
+            return true;
+        }
+        for (int q = 1; q <= Q_MAX; q++) {
+            int p = Math.round(s * q);
+            if (p <= 0) {
+                continue;
+            }
+            if (acceptRational(p, q, s, w, h)) {
+                miniRatP = p;
+                miniRatQ = q;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * A p/q is usable when it explains the evidence we actually have, and when snapping the
+     * layout to a multiple of q does not move it far from the window.
+     */
+    private boolean acceptRational(int p, int q, float s, int w, int h) {
+        if (q <= 0 || w <= 0 || h <= 0) {
+            return false;
+        }
+        // q only bounds how far snapDimension may search; the border it actually costs is
+        // whatever that search finds (one logical px here). Keep the window under a tenth
+        // of the axis so the worst case stays bounded too.
+        if ((q - 1) * 10 > w) {
+            return false;
+        }
+        if (miniVendorRectW > 0 && miniVendorRectH > 0) {
+            return Math.round((double) w * p / q) == miniVendorRectW
+                    && Math.round((double) h * p / q) == miniVendorRectH;
+        }
+        return Math.abs(s - (float) p / q) <= RATIONALISE_TOL;
+    }
+
+    /**
+     * Lay this view out at the exact-width size, anchored TOP|LEFT inside the #1358
+     * FrameLayout, so the on-screen origin stays {@code getLocationOnScreen} with no offset
+     * math anywhere downstream and the whole width remainder falls on the RIGHT edge. That
+     * strip is real (nothing clips it — see the note above about why overscan does not work
+     * on a SurfaceView), so the FrameLayout is painted black behind it.
+     */
+    private void applyOneToOneLayout(int layoutW, int layoutH) {
+        ViewGroup.LayoutParams lp = getLayoutParams();
+        if (lp == null || lp.width != layoutW || lp.height != layoutH) {
+            if (getParent() instanceof FrameLayout) {
+                setLayoutParams(
+                        new FrameLayout.LayoutParams(layoutW, layoutH, Gravity.TOP | Gravity.LEFT));
+                ((FrameLayout) getParent()).setBackgroundColor(android.graphics.Color.BLACK);
+            } else if (lp != null) {
+                lp.width = layoutW;
+                lp.height = layoutH;
+                setLayoutParams(lp);
+            }
+        }
+    }
+
+    /** Undo {@link #applyOneToOneLayout}: back to filling the window, background cleared. */
+    private void restoreLayoutToWindow() {
+        ViewGroup.LayoutParams lp = getLayoutParams();
+        if (lp != null
+                && (lp.width != ViewGroup.LayoutParams.MATCH_PARENT
+                        || lp.height != ViewGroup.LayoutParams.MATCH_PARENT)) {
+            lp.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            setLayoutParams(lp);
+        }
+        if (getParent() instanceof FrameLayout) {
+            ((FrameLayout) getParent()).setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        }
+        miniRatP = 0;
+        miniRatQ = 0;
+        miniRatTried = false;
     }
 
     /**
@@ -657,6 +901,11 @@ public class MonadoView extends SurfaceView
             if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > 0.02f) {
                 return 0f;
             }
+            // Keep the RAW rect: the rationalisation round-trips against these integers
+            // rather than against the lossy float, which is the only evidence that
+            // actually pins the scale.
+            miniVendorRectW = r.width();
+            miniVendorRectH = r.height();
             miniVendorScale = (sx + sy) * 0.5f;
             return miniVendorScale;
         } catch (Throwable t) {
