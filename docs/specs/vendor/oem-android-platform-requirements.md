@@ -1351,7 +1351,7 @@ a slogan:
   sub-pixel shifts (applied at the integer panel pixel), the per-panel
   crosstalk-compensation kernel and its coefficients (part of the woven
   *output* — a weave without it ships visibly more crosstalk), the
-  view-boundary softening parameter, and gamma.
+  view-boundary softening parameters, and gamma.
 - **Per window, per composite:** the app's **unwoven** multi-view atlas (this
   replaces the woven buffer as the app's output, so the atlas format — tile
   layout, view count, view order — becomes a defined contract instead of an
@@ -1364,10 +1364,12 @@ a slogan:
   **"render this window 2D now"** flag (this is how the weave renders flat when
   there is no face; without it the no-face behaviour is lost — essential);
   and the window's blend alpha.
-- **Per frame, at scanout:** **both** eye positions (or centre plus
-  inter-pupillary distance) in panel-relative millimetres, **predicted to the
-  scanout instant**, with the non-predicted pair also available (it drives the
-  no-face range check and the look-around path). This moves prediction from
+- **Per frame, at scanout:** **both** eye positions in panel-relative
+  millimetres, **predicted to the scanout instant**, with the non-predicted pair
+  also available (it drives the no-face range check and the look-around path).
+  Centre plus inter-pupillary distance is *not* sufficient: it loses head roll
+  (the eyes not being level), and today the vendor derives the centre from the
+  two eyes, not the other way round. This moves prediction from
   "the app must guess when its frame will show" to "the compositor knows when it
   is showing", which removes a whole class of fixed-latency error — but it means
   the face-tracking service must be reachable by the display service at
@@ -1377,8 +1379,11 @@ The interlacer's mapping is then buffer pixel → unit coordinates → the on-sc
 rect → floor to an integer panel pixel → the RGB sub-pixel shifts at that pixel
 → phase from that pixel, the lens geometry and the viewer distance. (Camera
 intrinsics are read only in the vendor's calibration mode and are not part of
-this contract.) This list was diffed against the vendor interlacer's actual
-shader inputs on 2026-09-07; nothing in it is decorative. Because the panel pixel is computed from the
+this contract; a per-window centre-phase diagnostic view mode is likewise
+read but deliberately left out as a debug input.) This list was diffed against
+the vendor interlacer's actual shader inputs and re-confirmed complete for
+vendor SDK 0.10.67 on 2026-09-07; every remaining shader input is a pure
+derivation of something listed; nothing in it is decorative. Because the panel pixel is computed from the
 *final* composited position, every window transform — scale, move, animation —
 is correct by construction, which is exactly what no in-app weave can offer.
 
