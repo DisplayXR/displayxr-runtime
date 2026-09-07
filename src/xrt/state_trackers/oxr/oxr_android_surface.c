@@ -207,6 +207,8 @@ oxr_android_surface_session_fini(struct oxr_session *sess)
 	sess->android_hint_buffer_h = 0;
 	sess->android_hint_disp_w = 0;
 	sess->android_hint_disp_h = 0;
+	sess->android_hint_prev_layout_w = 0;
+	sess->android_hint_prev_layout_h = 0;
 	sess->android_hint_scale = 0.0f;
 	android_mini_window_reset();
 }
@@ -238,6 +240,19 @@ oxr_android_window_hint_clear(struct oxr_logger *log, struct oxr_session *sess)
 	if (!sess->android_hint_active) {
 		return;
 	}
+	/*
+	 * Remember the layout we are ending on. The app restores asynchronously, so
+	 * its very next publish may still carry it — and deriving a new hint from
+	 * THAT is deriving a hint from a hint. MEASURED on the NP02J: rotating out
+	 * of and back into the mini-window recomputed against the app's still-1079
+	 * layout instead of the container's natural 1080, and settled on a 723x1130
+	 * buffer where a clean entry gives 723x1129 — about 1.05 px of drift, above
+	 * the 0.4 px that is visibly a double image. The container never hands out a
+	 * size we invented, so refusing exactly this extent is safe.
+	 */
+	sess->android_hint_prev_layout_w = sess->android_hint_layout_w;
+	sess->android_hint_prev_layout_h = sess->android_hint_layout_h;
+
 	sess->android_hint_active = false;
 	sess->android_hint_unknown_logged = false;
 	sess->android_hint_ignored_logged = false;
@@ -336,6 +351,18 @@ oxr_android_window_hint_update(struct oxr_logger *log,
 		oxr_android_window_hint_clear(log, sess);
 		return;
 	}
+
+	/*
+	 * The app has not finished restoring from the previous episode yet — this is
+	 * still that episode's layout size, not the container's own. Wait for a real
+	 * one (see oxr_android_window_hint_clear).
+	 */
+	if (sess->android_hint_prev_layout_w > 0 && (int32_t)w == sess->android_hint_prev_layout_w &&
+	    (int32_t)h == sess->android_hint_prev_layout_h) {
+		return;
+	}
+	sess->android_hint_prev_layout_w = 0;
+	sess->android_hint_prev_layout_h = 0;
 
 	struct android_mini_window_hint hint = {0};
 	if (!android_mini_window_compute_hint(x, y, w, h, disp_w, disp_h, &hint)) {

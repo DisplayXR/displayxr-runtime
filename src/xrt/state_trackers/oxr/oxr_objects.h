@@ -2496,6 +2496,10 @@ struct oxr_session
 	//! Panel extent the hint was computed in. A rotation mid-episode changes
 	//! the frame the whole answer lives in, so it ends the episode (#1396).
 	int32_t android_hint_disp_w, android_hint_disp_h;
+	//! The layout size of the episode that just ENDED. A hint must never be
+	//! derived from a rect that is still the previous hint's layout — that is a
+	//! hint computed from a hint (#1396).
+	int32_t android_hint_prev_layout_w, android_hint_prev_layout_h;
 	float android_hint_scale;
 #endif
 
