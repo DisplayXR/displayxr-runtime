@@ -125,16 +125,41 @@ weave_get_vk(struct multi_compositor *mc)
 	return comp_target_service_get_vk(mc->msc->target_service);
 }
 
-//! Lazily create the per-client engine lock (multi_compositor is zero-alloced).
+/*!
+ * Serializes the lazy creation of every client's weave engine lock.
+ *
+ * #1387 defect 1: this used to be `msc->list_and_timing_lock`, which made
+ * @ref weave_ensure_mutex illegal to call from anything that already holds it
+ * — and `render_per_session_clients_locked()` (`comp_multi_system.c`, the
+ * per-session render path #1377 has to drive the satellite from) runs holding
+ * exactly that lock, so the ensure would have self-deadlocked the render
+ * thread. `os_mutex` is not recursive and the lock is one of the multi
+ * module's outermost, so the fix is to stop borrowing it for a job that needs
+ * no ordering with anything: a file-static LEAF mutex whose only critical
+ * section is the two stores below. It is never held while any other lock is
+ * taken, so @ref weave_ensure_mutex is now safe to call under ANY caller's
+ * lock, including `list_and_timing_lock` and `mc->weave.mutex` itself.
+ *
+ * (Publication still needs a lock: the ensure runs on IPC handler threads
+ * while `android_window_transition_locked()` reads `mutex_initialized` from
+ * the IPC 20 Hz main loop.)
+ */
+static pthread_mutex_t g_weave_mutex_init_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*!
+ * Lazily create the per-client engine lock (multi_compositor is zero-alloced).
+ *
+ * Callable with any other lock held — see @ref g_weave_mutex_init_lock.
+ */
 static void
 weave_ensure_mutex(struct multi_compositor *mc)
 {
-	os_mutex_lock(&mc->msc->list_and_timing_lock);
+	pthread_mutex_lock(&g_weave_mutex_init_lock);
 	if (!mc->weave.mutex_initialized) {
 		os_mutex_init(&mc->weave.mutex);
 		mc->weave.mutex_initialized = true;
 	}
-	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+	pthread_mutex_unlock(&g_weave_mutex_init_lock);
 }
 
 //! The swapchain-create-info shape the AHB helpers speak, for one 2D RGBA8 image.
