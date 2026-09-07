@@ -51,6 +51,77 @@ import androidx.annotation.Nullable;
  * displayFrame} (732x1137 here). displayFrame includes the task layer's shadow ({@code
  * shadowRadius} 6 x 0.67 ~ 4 px a side); sizing to it re-introduces an 8 px resample, i.e. exactly
  * the thing this exists to remove.
+ *
+ * <h2>CROSS-APK CONTRACT (#1403 Option B) — read before changing anything public here</h2>
+ *
+ * <p>The static entry points below are a <b>SUPPORTED CROSS-APK SURFACE</b>, not internals. A
+ * present-owner whose XrSession runs in a process with no {@code Activity} cannot be told the
+ * answer over OpenXR — the DisplayXR Browser's session lives in Chromium's GPU process, which is
+ * an isolated Service, and both obligations the answer imposes (lay the window out, fix the
+ * buffer) belong to the BROWSER process. So that process measures for itself, by reflecting into
+ * this class through {@code createPackageContext(runtimePkg, CONTEXT_INCLUDE_CODE |
+ * CONTEXT_IGNORE_SECURITY)} — the same route it already uses for the runtime's fd connector. The
+ * measured policy still lives in exactly one place, which is the whole point.
+ *
+ * <p>The surface is, and is versioned by {@link #contractVersion}:
+ *
+ * <ul>
+ *   <li>{@code int contractVersion()}
+ *   <li>{@code int[] computeHintForActivity(Object activity, int x, int y, int w, int h, int dispW,
+ *       int dispH)} — the whole measurement in one call. Returns {@code null}, or {@link #HINT_LEN}
+ *       ints indexed by the {@code HINT_*} constants.
+ *   <li>{@code boolean isInScalableContainer(Object activity)} — the episode END signal, which the
+ *       published rect cannot show.
+ *   <li>{@code void resetForActivity()} — forget the episode.
+ *   <li>{@code boolean isTell(int, int, int, int, int, int)} / {@code boolean isBindingTell(int,
+ *       int, int, int, int, int)} — the container-scaled tell, so a caller does not re-implement
+ *       it. Mirrored in C by {@code android_mini_window_is_tell()}; the two are pinned against
+ *       each other by {@code tests_aux_mini_window_tell} (#1401).
+ * </ul>
+ *
+ * <p><b>Types.</b> Nothing runtime-internal crosses the boundary: {@code Object} in (the caller's
+ * own {@code Activity}, so it needs none of our classes), {@code int[]} / {@code boolean} / {@code
+ * int} out. A reflecting caller never has to load a DisplayXR type it cannot see.
+ *
+ * <p><b>Versioning is APPEND-ONLY.</b> A method's name, parameter list, return type and the
+ * meaning of every {@code int[]} slot are frozen once shipped. A different signature is a NEW
+ * method and a {@link #contractVersion} bump; it is never a changed one — a caller reflecting by
+ * name and descriptor fails at run time, in a shipped browser, silently. Same rule for the {@code
+ * HINT_*} indices: append at the end, never renumber. Enforced two ways: a {@code -keep} rule in
+ * {@code proguard-rules.pro} (so this survives a release APK even if minification is ever turned
+ * on), and {@code scripts/check_mini_window_contract.sh}, which CI runs against the built release
+ * APK's DEX.
+ *
+ * <p><b>Threading.</b> Every static here is safe to call off the UI thread and that is the normal
+ * case — the surface-binding path calls from the app's geometry thread. {@link #isEnabled} reads a
+ * volatile; {@link #computeHintForActivity} and {@link #resetForActivity} are {@code synchronized}
+ * on this class. A cross-APK caller is in a different process, so it gets its own copy of every
+ * static and contends with nobody. What is NOT safe from an arbitrary thread is what a caller does
+ * with the answer: {@code setLayout} / {@code setFixedSize} are View calls and belong on the UI
+ * thread.
+ *
+ * <p><b>What the CALLER owns.</b> This class measures ONE rect. Every rule about an EPISODE lives
+ * in the runtime's state machine ({@code oxr_android_surface.c}) and a cross-APK caller must
+ * re-implement it — there is no state here to inherit:
+ *
+ * <ol>
+ *   <li>A rotation ends the episode: store the panel extent with the hint and restore when it
+ *       changes, because every number was derived against that extent.
+ *   <li>Never derive a hint from the previous episode's LAYOUT. The window restores
+ *       asynchronously, so the first rect after an episode can still be the hinted 1079x1685
+ *       rather than the container's natural 1080x1685; deriving from it measured 723x1130 (~1.05
+ *       px drift, above the 0.4 px double-image threshold).
+ *   <li>That memo must be BOUNDED — by the panel extent it was armed against and by ~1 s of
+ *       monotonic time. Unbounded it is a permanent silent lock-out on any device whose scale
+ *       rationalises to a small q, where the previous layout IS the container's natural size.
+ *   <li>Arm the memo with the panel extent of the publish that ENDS the episode, not the one the
+ *       hint was computed in.
+ *   <li>Publish the PHYSICAL rect only once BOTH halves are in place. Between them the composed
+ *       transform is 1.00083 — the ~0.4 px drift that reads as a double image in both eyes.
+ *   <li>Memoise the buffer-size request; do not ask the window whether it took. After a successful
+ *       {@code setFixedSize(723,1129)} the window still answers 1079x1685, and a caller that
+ *       re-derives "has it taken?" re-issues every frame and never gets a frame out.
+ * </ol>
  */
 @Keep
 public final class MiniWindowLayout {
@@ -106,6 +177,26 @@ public final class MiniWindowLayout {
     public static final int HINT_RAT_P = 4;
     public static final int HINT_RAT_Q = 5;
     public static final int HINT_LEN = 6;
+
+    /**
+     * Version of the cross-APK contract described in this class's javadoc (#1403).
+     *
+     * <p>APPEND-ONLY. Bump when a method is ADDED or a new {@code HINT_*} slot is appended; the
+     * existing names, signatures and slot meanings never change, so a caller that got version N
+     * can keep calling everything version N documented, forever. A caller that needs something
+     * newer checks this first — reflection on a missing method is the only alternative and it
+     * cannot distinguish "older runtime" from "obfuscated runtime".
+     *
+     * <p>1 — the initial surface: computeHintForActivity, isInScalableContainer, resetForActivity,
+     * isTell, isBindingTell, HINT_LAYOUT_W..HINT_RAT_Q.
+     */
+    private static final int CONTRACT_VERSION = 1;
+
+    /** @return {@link #CONTRACT_VERSION}. Cheap, pure, callable from any thread. */
+    @Keep
+    public static int contractVersion() {
+        return CONTRACT_VERSION;
+    }
 
     /**
      * Cached {@code debug.dxr.miniwindow_1to1}, -1 = not read yet.
@@ -172,6 +263,7 @@ public final class MiniWindowLayout {
      * #isBindingTell} for why the surface-binding path needs a stricter one, and why that
      * strictness is deliberately NOT applied here.
      */
+    @Keep
     public static boolean isTell(int x, int y, int w, int h, int dispW, int dispH) {
         return dispW > 0
                 && dispH > 0
@@ -202,6 +294,7 @@ public final class MiniWindowLayout {
      * that behaviour untouched. Hardening it needs its own device pass WITH rotation —
      * runtime#1399.
      */
+    @Keep
     public static boolean isBindingTell(int x, int y, int w, int h, int dispW, int dispH) {
         if (w == dispH && h == dispW) {
             return false; // mid-rotation sample, not a container scale
@@ -223,6 +316,7 @@ public final class MiniWindowLayout {
      * transition itself, since entering and leaving the mini-window destroys and recreates the
      * surface.
      */
+    @Keep
     public static boolean isEnabled() {
         if (sPropCached >= 0) {
             return sPropCached == 1;

@@ -363,6 +363,78 @@ the whole mechanism, on both paths, for an A/B against the 2D fallback. It is
 cached deliberately: flipping it live re-sizes a surface underneath an in-flight
 weave, and the vendor `leia_cnsdk_weave` then parks forever in `vkWaitForFences`.
 
+### 2.6 Sibling note — what a present-owner with no Activity does instead (#1403)
+
+**This is not part of the extension.** Nothing here is on the OpenXR wire and
+neither `SPEC_VERSION` moves. It is recorded next to §2.5 because it answers the
+same question for the one class of consumer §2.5 structurally cannot serve.
+
+The hint in §2.5 needs an `Activity`: the vendor probe reads that Activity's own
+`taskId`, and `Activity.isInMultiWindowMode()` is the episode-end signal. Some
+present-owners do not have one in the process that holds the `XrSession` — the
+DisplayXR Browser's session lives in Chromium's **GPU process**, an isolated
+`Service`, and passes the *Application Context* as
+`XrInstanceCreateInfoAndroidKHR::applicationActivity`. A `jobject` cannot cross a
+process boundary, so this is structural rather than a plumbing gap. Worse, both
+obligations the answer imposes — lay the window out, fix the buffer — belong to
+that consumer's **browser** process, which owns the Activity and the
+`SurfaceView`. Delivering an event to the session would deliver it to the wrong
+process.
+
+Such a consumer therefore **measures in the process that has the Activity**,
+calling the runtime's own measurement code cross-APK rather than re-deriving any
+of it:
+
+```java
+Context rt = ctx.createPackageContext(
+        runtimePkg, Context.CONTEXT_INCLUDE_CODE | Context.CONTEXT_IGNORE_SECURITY);
+Class<?> mwl = rt.getClassLoader()
+        .loadClass("org.freedesktop.monado.auxiliary.MiniWindowLayout");
+```
+
+Supported entry points on that class, all `public static`:
+
+| Method | Meaning |
+|---|---|
+| `int contractVersion()` | Version of this surface. Currently **1**. |
+| `int[] computeHintForActivity(Object activity, int x, int y, int w, int h, int dispW, int dispH)` | The whole measurement. `null`, or 6 ints: `layoutW, layoutH, bufferW, bufferH, p, q`. Applies the tell and the scalable-container gate itself. |
+| `boolean isInScalableContainer(Object activity)` | The episode-END signal. Once a hint is applied the published rect fits the panel by construction, so "the hint is working" and "the window went fullscreen" are indistinguishable from geometry alone. |
+| `void resetForActivity()` | Forget the episode; the next entry re-probes. |
+| `boolean isTell(int x, int y, int w, int h, int dispW, int dispH)` | The container-scaled tell, so a caller does not re-implement it. |
+| `boolean isBindingTell(...)` | `isTell` plus the mid-rotation (panel-transposed) reject. |
+| `boolean isEnabled()` | `debug.dxr.miniwindow_1to1`. |
+
+Units are exactly as in §2.5: the rect is a **physical** origin with a
+**logical** extent (that hybrid is what the OEM reports and what the tell is
+written against), the panel extent is **physical, in the current rotation**,
+`layout*` is **logical** and `buffer*` is **physical panel pixels**. `scale`
+(`p/q`) is informational — never recompute sizes from it, that re-introduces the
+sub-pixel drift the integer search exists to remove.
+
+**Threading.** Every entry point is safe off the UI thread; a cross-APK caller
+is in another process and so contends with nobody. `isInMultiWindowMode()` is a
+cached field only from API 28 — on 24–27 it is a binder round trip, so call it
+once per published geometry change, never per frame. What must stay on the UI
+thread is what the caller does with the answer (`setLayout`, `setFixedSize`).
+
+**The caller owns the episode.** This class measures one rect. Every rule in §3
+about rotation ending an episode, about never deriving a hint from the previous
+episode's layout, about bounding that memo by panel extent *and* ~1 s of
+monotonic time, about arming it with the panel of the publish that *ends* the
+episode, about publishing the physical rect only once *both* halves are in
+place, and about memoising the buffer request rather than asking the window —
+all of that lives in `oxr_android_surface.c` and must be re-implemented by a
+cross-APK caller. There is no state on the Java side to inherit.
+
+**Versioning is append-only.** Names, parameter lists, return types and the
+meaning of every `int[]` slot are frozen once shipped; a different signature is a
+*new* method plus a `contractVersion()` bump, never a changed one. A reflecting
+caller fails by name at run time, in a shipped browser, with no build-time signal
+on either side — so the rule is enforced mechanically: a `-keep` rule in
+`src/xrt/targets/openxr_android/proguard-rules.pro`, and
+`scripts/check_mini_window_contract.sh`, which CI runs against the built
+**release** APK's DEX and fails if any signature is missing or renamed.
+
 ## 3. Runtime Behavior
 
 1. **Session create.** `oxr_session.c` reads the chained binding, resolves

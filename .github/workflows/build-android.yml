@@ -372,6 +372,23 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # #1403 Option B — MiniWindowLayout is a CROSS-APK contract, not internals.
+      # The DisplayXR Browser's XrSession lives in Chromium's GPU process (an
+      # isolated Service with no Activity), so its BROWSER process reflects into
+      # this APK's org.freedesktop.monado.auxiliary.MiniWindowLayout to measure
+      # the OEM container scale for itself. That makes a Java class an ABI: a
+      # rename, a signature change, or turning minification on compiles clean,
+      # ships, and breaks a shipped browser at run time with no signal on either
+      # side. Asserted here, against the RELEASE APK's DEX — a debug APK never
+      # minifies, so checking that one would prove nothing about what ships.
+      - name: Assert the MiniWindowLayout cross-APK contract (${{ matrix.variant }})
+        if: steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          chmod +x scripts/check_mini_window_contract.sh
+          ./scripts/check_mini_window_contract.sh "$APK"
+
       - name: Inspect APK contents (${{ matrix.variant }})
         if: steps.build.outcome == 'success'
         run: |
