@@ -431,6 +431,7 @@ weave_release_output(struct vk_bundle *vk, struct multi_compositor *mc)
 	}
 	mc->weave.out_w = 0;
 	mc->weave.out_h = 0;
+	mc->weave.out_layout = VK_IMAGE_LAYOUT_UNDEFINED; // #1387: a fresh import starts undefined
 }
 
 //! Marshalling shim: the vendor DP's async init must start on a Looper thread.
@@ -1362,7 +1363,7 @@ comp_multi_weave_android_satellite_presented(struct multi_compositor *mc)
 /*!
  * Blit the completed woven output onto the overlay at the window's physical
  * rect and present. Called with the weave mutex held, AFTER the weave fence
- * has been waited (out_image is GPU-complete, COLOR_ATTACHMENT_OPTIMAL).
+ * has been waited (out_image is GPU-complete, in mc->weave.out_layout).
  * Best-effort: any failure releases the swapchain; the next submit either
  * recreates it (transient, e.g. OUT_OF_DATE) or latched-fails via ensure.
  */
@@ -1443,13 +1444,19 @@ weave_satellite_present(struct vk_bundle *vk,
 	    .image = mc->weave.sat_images[idx],
 	    .subresourceRange = range,
 	};
-	// Woven output -> TRANSFER_SRC (the weave's render pass left it
-	// COLOR_ATTACHMENT_OPTIMAL; its writes are fence-complete).
+	// Woven output -> TRANSFER_SRC. #1387 defect 3: the oldLayout is the one
+	// the weave's command buffer ACTUALLY retired in, tracked in out_layout —
+	// not the COLOR_ATTACHMENT_OPTIMAL this used to assert. The weave ends with
+	// an explicit transition to GENERAL for the caller's cross-process read
+	// (`out_to_general`), so this ran with a mismatched, non-UNDEFINED
+	// oldLayout every frame: undefined behaviour per the spec, working only by
+	// accident of the driver. Access/stage masks are layout-agnostic (MEMORY_*
+	// + ALL_COMMANDS) so no future resting layout can reintroduce the mismatch.
 	VkImageMemoryBarrier out_to_src = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
 	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .oldLayout = mc->weave.out_layout,
 	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1457,8 +1464,8 @@ weave_satellite_present(struct vk_bundle *vk,
 	    .subresourceRange = range,
 	};
 	VkImageMemoryBarrier pre[2] = {to_dst, out_to_src};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, pre);
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 2, pre);
 	mc->weave.sat_image_first[idx] = false;
 
 	// Everything outside the woven rect is TRANSPARENT — the desktop shows
@@ -1587,14 +1594,16 @@ weave_satellite_present(struct vk_bundle *vk,
 		}
 	}
 
-	// Output back to what the next weave's render pass LOADs; swapchain image
-	// to PRESENT.
+	// Output back to the layout the weave path owns as its resting state
+	// (#1387 defect 3: borrow-and-return, so out_layout stays true and the
+	// caller's GENERAL cross-process read is unaffected when the satellite is
+	// on but export is not suppressed); swapchain image to PRESENT.
 	VkImageMemoryBarrier out_back = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
 	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .newLayout = mc->weave.out_layout,
 	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	    .image = mc->weave.out_image,
@@ -1612,9 +1621,8 @@ weave_satellite_present(struct vk_bundle *vk,
 	    .subresourceRange = range,
 	};
 	VkImageMemoryBarrier post[2] = {out_back, sc_to_present};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-	                         0, 0, NULL, 0, NULL, 2, post);
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+	                         NULL, 2, post);
 	vk->vkEndCommandBuffer(cmd);
 
 	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -2280,6 +2288,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		};
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &out_to_general);
+		// #1387 defect 3: THIS is the layout the command buffer retires in, and
+		// therefore the one the satellite present (which runs after the fence)
+		// must declare. Recording it here keeps one authority instead of two
+		// call sites each asserting a layout from memory.
+		mc->weave.out_layout = VK_IMAGE_LAYOUT_GENERAL;
 
 		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 			break;
