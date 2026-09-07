@@ -5912,9 +5912,20 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 			continue;
 		}
 		const bool active = mc->state.session_active;
+		// #1387 defect 2: a client can be on the satellite WITHOUT a weave
+		// engine — an APP-class (demo) session the satellite presents for
+		// (#1377) never runs comp_multi_weave_submit, so engine_initialized
+		// stays false for it. "Has something of ours been left painted on the
+		// panel-global overlay" is the condition the stale-frame guard is
+		// about, so it belongs in the idle test too. Read unlocked, like
+		// last_submit_ns above and for the same reason (a plain bool, re-tested
+		// under the weave mutex before anything acts on it). No behaviour
+		// change today: nothing but the weave submit path presents on the
+		// satellite, so sat_presented implies engine_initialized.
+		const bool sat_painted = mc->weave.sat_presented;
 		bool weave_idle = false;
-		if (idle_thresh_ns > 0 && mc->weave.engine_initialized && mc->weave.last_submit_ns != 0 &&
-		    (now_ns - mc->weave.last_submit_ns) > idle_thresh_ns) {
+		if (idle_thresh_ns > 0 && (mc->weave.engine_initialized || sat_painted) &&
+		    mc->weave.last_submit_ns != 0 && (now_ns - mc->weave.last_submit_ns) > idle_thresh_ns) {
 			weave_idle = true;
 		}
 		// #1278: the weave DP's lens vote is re-bound per WEAVE (not per the
@@ -5925,15 +5936,35 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 		// takes list_and_timing_lock inside it, so the order is safe.
 		if (weave_idle && !mc->weave.idle_released && mc->weave.mutex_initialized) {
 			os_mutex_lock(&mc->weave.mutex);
-			if (!mc->weave.idle_released && mc->weave.dp != NULL) {
+			// #1387 defect 2: TWO independent things happen on this edge and
+			// they had been fused under one `dp != NULL` guard.
+			//
+			//  - the LENS vote release is the weave DP's, so it is correctly
+			//    keyed on mc->weave.dp (a present-owner-only field);
+			//  - the OVERLAY clear is about the panel-global surface and must
+			//    fire for ANY client that painted it. An APP-class session on
+			//    the satellite (#1377) has no weave.dp — its lens vote rides
+			//    the session-render visibility path below instead — so under
+			//    the old guard its last frame would have stayed frozen on the
+			//    overlay forever, over whoever now owns the screen. That is the
+			//    exact 91f071770 bug the clear was added for, re-entering
+			//    through the door the guard left open.
+			const bool has_weave_dp = mc->weave.dp != NULL;
+			const bool sat_live = comp_multi_weave_android_satellite_presented(mc);
+			if (!mc->weave.idle_released && (has_weave_dp || sat_live)) {
 				mc->weave.idle_released = true;
-				xrt_display_processor_on_pause(mc->weave.dp);
-				// #1277 P2: also wipe the satellite overlay — an idle
-				// client's last woven frame otherwise stays frozen on
-				// screen, painted over whatever now owns the panel.
+				if (has_weave_dp) {
+					xrt_display_processor_on_pause(mc->weave.dp);
+				}
+				// #1277 P2: wipe the satellite overlay — an idle client's
+				// last woven frame otherwise stays frozen on screen,
+				// painted over whatever now owns the panel.
 				comp_multi_weave_android_satellite_clear(mc);
-				U_LOG_W("weave(#1278): idle %.1fs — lens vote RELEASED (next weave re-asserts)",
-				        (double)(now_ns - mc->weave.last_submit_ns) / 1e9);
+				U_LOG_W("weave(#1278): idle %.1fs — %s%s",
+				        (double)(now_ns - mc->weave.last_submit_ns) / 1e9,
+				        has_weave_dp ? "lens vote RELEASED (next weave re-asserts)"
+				                     : "no weave DP (APP-class client)",
+				        sat_live ? ", satellite overlay CLEARED" : "");
 			}
 			os_mutex_unlock(&mc->weave.mutex);
 		}
