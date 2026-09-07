@@ -1445,8 +1445,24 @@ void
 oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess);
 
 /*!
+ * Deliver a hint that was coalesced during a burst of recomputes (#1401).
+ *
+ * Called from the frame loop, so the answer a drag-resize gesture settled on
+ * still reaches the app once the gesture goes quiet — coalescing must never be
+ * able to DROP the last answer, only delay it. A no-op (two loads and a
+ * compare) whenever nothing is pending, which is always on a device whose
+ * scaled container is a fixed placement.
+ */
+void
+oxr_android_window_hint_flush(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
  * Push an `XrEventDataAndroidWindowLayoutHintDXR` onto the instance event
  * queue. @p active false zeroes every other field (restore the layout).
+ *
+ * @p repeat marks a recompute INSIDE an episode rather than a container
+ * transition: same event, but logged at INFO so a resizable container cannot
+ * turn the WARN tier into a gesture trace (#1401).
  */
 XrResult
 oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
@@ -1458,7 +1474,8 @@ oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
                                                   int32_t buffer_w,
                                                   int32_t buffer_h,
                                                   int32_t phys_x,
-                                                  int32_t phys_y);
+                                                  int32_t phys_y,
+                                                  bool repeat);
 
 /*! @} */
 #endif // OXR_HAVE_DXR_android_surface_binding
@@ -2514,6 +2531,29 @@ struct oxr_session
 	uint64_t android_hint_prev_armed_ns;
 	bool android_hint_prev_refused_logged;
 	float android_hint_scale;
+	/*
+	 * #1401 — coalescing of RECOMPUTES INSIDE one episode.
+	 *
+	 * Each distinct answer costs the app a buffer resize, so a container the
+	 * user can DRAG-RESIZE would produce one event (and one WARN) per
+	 * intermediate size mid-gesture. Not reachable on the NP02J — its
+	 * mini-window is a fixed nominal placement — but it was seen in miniature
+	 * during a rotation before the prev-layout guard landed (three ON events in
+	 * 66 ms as the numbers chased each other). So: the FIRST answer of an
+	 * episode is always emitted immediately (it is the container transition,
+	 * and it is what unblocks the weave), and a later one inside
+	 * @ref OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS of the last emit is held here
+	 * instead. Held, never dropped — @ref oxr_android_window_hint_flush
+	 * delivers it from the frame loop once the gesture goes quiet.
+	 */
+	uint64_t android_hint_last_emit_ns;
+	bool android_hint_pending;
+	bool android_hint_coalesce_logged;
+	int32_t android_hint_pending_layout_w, android_hint_pending_layout_h;
+	int32_t android_hint_pending_buffer_w, android_hint_pending_buffer_h;
+	int32_t android_hint_pending_x, android_hint_pending_y;
+	int32_t android_hint_pending_disp_w, android_hint_pending_disp_h;
+	float android_hint_pending_scale;
 #endif
 
 	//! True if this is a headless bridge-relay session (XR_DXR_display_info +

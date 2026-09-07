@@ -107,10 +107,27 @@ public final class MiniWindowLayout {
     public static final int HINT_RAT_Q = 5;
     public static final int HINT_LEN = 6;
 
-    private static int sPropCached = -1;
+    /**
+     * Cached {@code debug.dxr.miniwindow_1to1}, -1 = not read yet.
+     *
+     * <p>VOLATILE (#1401): read from at least two threads — {@link MonadoView} on the UI thread and
+     * the surface-binding path on the app's geometry thread. The computation is pure and
+     * idempotent, so two threads racing to fill it is harmless and no lock is taken (locking here
+     * would put the hosted path behind a monitor it does not need); volatile is what makes the
+     * publication safe rather than a data race with an unspecified outcome.
+     */
+    private static volatile int sPropCached = -1;
 
-    /** Per-process instance for the surface-binding path (one Activity per app process). */
-    @Nullable private static MiniWindowLayout sForActivity = null;
+    /**
+     * Per-process instance for the surface-binding path (one Activity per app process).
+     *
+     * <p>Volatile plus the {@code synchronized} on its two accessors (#1401): unlike the sysprop,
+     * this instance carries the whole per-episode measurement state, so racing to create it could
+     * produce TWO instances and silently split the vendor probe and the rationalised p/q between
+     * them. {@link MonadoView} does not touch this field — it holds its own instance — so the lock
+     * is never on the hosted path.
+     */
+    @Nullable private static volatile MiniWindowLayout sForActivity = null;
 
     /** Which of the two bands above this instance uses. */
     private final float axisAgreeTol;
@@ -613,7 +630,7 @@ public final class MiniWindowLayout {
      *     window fits the panel, the feature is off, or the scale is not knowable on this device.
      */
     @Keep
-    @Nullable public static int[] computeHintForActivity(
+    @Nullable public static synchronized int[] computeHintForActivity(
             @Nullable Object activityObj, int x, int y, int w, int h, int dispW, int dispH) {
         if (!isBindingTell(x, y, w, h, dispW, dispH) || !isEnabled()) {
             return null;
@@ -679,9 +696,15 @@ public final class MiniWindowLayout {
         }
     }
 
-    /** Forget the surface-binding episode state — the window left its scaled container. */
+    /**
+     * Forget the surface-binding episode state — the window left its scaled container.
+     *
+     * <p>{@code synchronized} on the same monitor as {@link #computeHintForActivity} (#1401): the
+     * two are called from different native threads (the geometry channel and session teardown), and
+     * a reset that interleaves with a compute would half-clear the episode.
+     */
     @Keep
-    public static void resetForActivity() {
+    public static synchronized void resetForActivity() {
         MiniWindowLayout self = sForActivity;
         if (self != null) {
             self.reset();

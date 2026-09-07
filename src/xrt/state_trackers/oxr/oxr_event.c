@@ -479,7 +479,8 @@ oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
                                                   int32_t buffer_w,
                                                   int32_t buffer_h,
                                                   int32_t phys_x,
-                                                  int32_t phys_y)
+                                                  int32_t phys_y,
+                                                  bool repeat)
 {
 	struct oxr_instance *inst = sess->sys->inst;
 	XrEventDataAndroidWindowLayoutHintDXR *hint;
@@ -505,7 +506,18 @@ oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
 	// Container transitions only — the user toggling a freeform window. Never
 	// per frame, so WARN is the visible tier (#441) and this line is the proof
 	// the hint reached the client.
-	if (active) {
+	//
+	// EXCEPT a repeat inside one episode (#1401): a container the user can
+	// drag-resize answers differently at every intermediate size, and those are
+	// a gesture trace, not lifecycle. They drop to INFO so the WARN tier keeps
+	// meaning "the container changed". The event itself is identical — the app
+	// still has to resize its buffer for each one.
+	if (active && repeat) {
+		U_LOG_I(
+		    "OXR EVENT: Android window layout hint ON (recompute) scale=%.4f layout %dx%d "
+		    "buffer %dx%d physical %d,%d %dx%d (#1396/#1401)",
+		    (double)scale, layout_w, layout_h, buffer_w, buffer_h, phys_x, phys_y, buffer_w, buffer_h);
+	} else if (active) {
 		U_LOG_W(
 		    "OXR EVENT: Android window layout hint ON scale=%.4f layout %dx%d buffer %dx%d "
 		    "physical %d,%d %dx%d (#1396)",

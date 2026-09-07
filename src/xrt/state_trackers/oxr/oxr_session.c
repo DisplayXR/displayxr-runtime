@@ -3244,6 +3244,15 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 		oxr_log(log, "Called at %8.3fms", ts_ms(sess));
 	}
 
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	// #1401: deliver a layout hint that was coalesced during a burst of
+	// container resizes, once the burst goes quiet. Two loads and a compare
+	// when nothing is pending, which is every frame on a device whose scaled
+	// container is a fixed placement — and NOTHING is logged from here unless
+	// an event is actually pushed.
+	oxr_android_window_hint_flush(log, sess);
+#endif
+
 	/*
 	 * A subsequent xrWaitFrame call must: block until the previous frame
 	 * has been begun. It's extremely forbidden to call xrWaitFrame from
