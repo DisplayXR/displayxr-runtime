@@ -614,8 +614,10 @@ struct comp_vk_native_compositor
 	struct
 	{
 		uint64_t total;       //!< Drops seen by this compositor this session.
+		uint64_t runs;        //!< Drop RUNS (a run = consecutive dropped weaves).
+		uint64_t run_len;     //!< Length of the run in progress.
 		uint64_t last_log_ns; //!< Monotonic time of the last line we emitted.
-		bool logged_once;     //!< The very first drop always logs.
+		bool in_run;          //!< The previous weave was dropped.
 	} weave_drop;
 
 	/*!
@@ -4139,6 +4141,14 @@ vk_publish_rear_budget_zones(struct comp_vk_native_compositor *c)
 	comp_rear_budget_set_zone_rects(&c->rear_budget, zones, count, os_monotonic_get_ns());
 }
 
+/*!
+ * #1394: how many dropped-frame RUNS log verbatim before the 5 s throttle takes
+ * over. Sized so a realistic episode (measured: 17 drops across 8 forced trials,
+ * every one of run length 1) is reported in full, while drop/good alternation at
+ * frame rate cannot produce a per-frame WARN for more than half a second.
+ */
+#define DXR_DROP_VERBOSE_RUNS 32
+
 static xrt_result_t
 vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         bool is_repaint,
@@ -4726,31 +4736,64 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			        (struct xrt_display_processor_vk *)c->display_processor)) {
 				frame_dropped = true;
 				/*
-				 * Rate-limited, never per-frame: the whole point of the
-				 * vendor fix is that a drop is survivable, and a survivable
-				 * failure logged at 60 Hz is its own ship-blocker. One WARN
-				 * on the first drop, then at most one line per 5 s carrying
-				 * the running count.
+				 * Logging is keyed on the drop RUN, not on the drop and not
+				 * on a clock.
 				 *
-				 * Per-compositor, not function-local statics: this function
-				 * runs on both the app and the repaint thread and there is
-				 * one instance per window, so statics would interleave two
-				 * threads' counts and merge every window's.
+				 * A pure time throttle hides the evidence it exists to
+				 * carry: measured on the pad, a second failure 689 ms after
+				 * the first produced no line at all — the counter simply
+				 * stepped 1 -> 3, and the pairing between a vendor failure
+				 * and the frame it cost became unreadable. So the START of
+				 * every run logs, and the "recovered" line below always
+				 * reports the run's length. An isolated drop — which is what
+				 * the vendor fix produces, run-length 1 on every measured
+				 * occurrence — therefore yields exactly one line per
+				 * occurrence, which IS the per-occurrence evidence.
+				 *
+				 * The pathological case that a time throttle does defend
+				 * against is drop/good alternation at frame rate, where
+				 * every drop starts a run. So the first
+				 * DXR_DROP_VERBOSE_RUNS runs log unconditionally and the
+				 * rest fall back to one line per 5 s. NOTE the run counter,
+				 * not the drop counter, is what the line count tracks.
 				 */
 				const uint64_t now_ns = os_monotonic_get_ns();
 				c->weave_drop.total++;
-				if (!c->weave_drop.logged_once ||
-				    now_ns - c->weave_drop.last_log_ns > 5ULL * U_TIME_1S_IN_NS) {
-					c->weave_drop.logged_once = true;
-					c->weave_drop.last_log_ns = now_ns;
-					U_LOG_W("#1394: the display processor DROPPED this frame — not "
-					        "counted, not timed, recycled to the presentation "
-					        "engine (%" PRIu64 " dropped so far). The vendor log "
-					        "line immediately above says whether its submit "
-					        "failed or its fence wait timed out.",
-					        c->weave_drop.total);
+				if (!c->weave_drop.in_run) {
+					c->weave_drop.in_run = true;
+					c->weave_drop.runs++;
+					c->weave_drop.run_len = 0;
+					const bool verbose = c->weave_drop.runs <= DXR_DROP_VERBOSE_RUNS;
+					if (verbose ||
+					    now_ns - c->weave_drop.last_log_ns > 5ULL * U_TIME_1S_IN_NS) {
+						c->weave_drop.last_log_ns = now_ns;
+						U_LOG_W("#1394: the display processor DROPPED a frame — "
+						        "not counted, not timed, recycled to the "
+						        "presentation engine (run %" PRIu64 ", %" PRIu64
+						        " dropped in total). See the LeiaSDK [Weave] "
+						        "line above for the cause.%s",
+						        c->weave_drop.runs, c->weave_drop.total,
+						        c->weave_drop.runs == DXR_DROP_VERBOSE_RUNS
+						            ? " Further lines are rate-limited to one "
+						              "per 5 s."
+						            : "");
+					}
 				}
+				c->weave_drop.run_len++;
+			} else if (c->weave_drop.in_run) {
+				/*
+				 * The run ended. ALWAYS a WARN: aux INFO is dropped from the
+				 * frame path, so an INFO here would exist in the source and be
+				 * absent from the one log a bug report carries. This is the
+				 * line that makes a single drop observable per occurrence, so
+				 * it is not throttled below the run rate.
+				 */
+				c->weave_drop.in_run = false;
+				U_LOG_W("#1394: weave recovered after %" PRIu64
+				        " dropped frame(s) (run %" PRIu64 ")",
+				        c->weave_drop.run_len, c->weave_drop.runs);
 			}
+
 
 			// XR_DXR_depth_budget: evaluate the rear budget from the background
 			// the DP just composited under. AFTER process_atlas, because that is
