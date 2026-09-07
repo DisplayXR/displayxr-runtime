@@ -10,7 +10,9 @@
 package org.freedesktop.monado.auxiliary;
 
 import android.app.Activity;
+import android.app.Application;
 import android.content.Context;
+import android.os.Bundle;
 import android.graphics.PixelFormat;
 import android.graphics.Point;
 import android.graphics.Region;
@@ -154,6 +156,31 @@ public class MonadoView extends SurfaceView
     @GuardedBy("attachSync")
     private boolean attachCancelled = false;
 
+    /**
+     * #1389: the hook that takes the hosted window down when the host Activity is destroyed.
+     *
+     * <p>Nothing used to remove it. The runtime keeps its {@code android_custom_surface} alive
+     * across xrEndSession/xrBeginSession on purpose (#507) and never retired it, so on an Activity
+     * RELAUNCH the framework found the window still attached to the dying Activity's token, logged
+     * {@code WindowLeaked}, and swept it with a POSTED {@code ViewRootImpl.die()} — i.e. the
+     * ANativeWindow was still alive, and still published to native as valid, while the relaunched
+     * Activity was already creating its session. {@code vkCreateAndroidSurfaceKHR} on that dead
+     * window fails {@code VK_ERROR_NATIVE_WINDOW_IN_USE_KHR} (the Android loader maps every
+     * {@code native_window_api_connect} failure onto that code), and the session never comes up.
+     *
+     * <p>This is deliberately a JAVA hook rather than the runtime's own native lifecycle callbacks
+     * ({@code android_lifecycle_callbacks.cpp}): for a {@code native_app_glue} app the runtime
+     * instance is already destroyed by then. {@code NativeActivity.onDestroy} runs
+     * {@code unloadNativeCode()} — which BLOCKS the UI thread until {@code android_main} has
+     * returned, i.e. past {@code xrDestroyInstance} and the listener's own unregistration — and
+     * only then calls {@code super.onDestroy()}, which is what dispatches
+     * {@code onActivityDestroyed}. That same ordering is why this can be synchronous: the native
+     * side is provably gone, nothing is presenting to the surface any more, and we are on the UI
+     * thread with the framework's leak sweep still ahead of us, so {@code removeViewImmediate}
+     * detaches the window before {@code WindowManagerGlobal.closeAll} ever sees it.
+     */
+    @Nullable private Application.ActivityLifecycleCallbacks hostDestroyHook = null;
+
     public MonadoView(Context context) {
         super(context);
 
@@ -163,6 +190,7 @@ public class MonadoView extends SurfaceView
             systemUiController = new SystemUiController(activity.getWindow().getDecorView());
             systemUiController.hide();
             pinDisplayModeIfRequested(activity);
+            registerHostDestroyHook(activity);
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
@@ -616,46 +644,131 @@ public class MonadoView extends SurfaceView
      */
     @Keep
     public static void removeFromWindow(@NonNull MonadoView view) {
+        view.unregisterHostDestroyHook();
+        view.detachFromWindow();
+    }
+
+    /**
+     * Take the container back out of the WindowManager. Idempotent, and safe to call from either
+     * the native side ({@link #removeFromWindow}) or the host Activity's destroy (#1389) — whoever
+     * gets there first does the work and the other becomes a no-op.
+     */
+    private void detachFromWindow() {
         // #1358: what the WindowManager holds is the FrameLayout container, so that is what has
         // to come back out. The MonadoView is deliberately LEFT inside the container — keeping
         // its ViewParent alive is the whole point of the wrapper.
         final View target;
-        synchronized (view.attachSync) {
-            if (!view.addedToWindow) {
+        synchronized (attachSync) {
+            if (!addedToWindow) {
                 // The posted wm.addView has not run yet (or never will). Cancel it instead of
                 // posting a removeView behind it: that ordering is what made the pending
                 // attach/draw-finished callbacks fire against a torn-down window (#1358).
-                view.attachCancelled = true;
-                Log.d(TAG, "removeFromWindow: cancelled a still-pending add");
+                attachCancelled = true;
+                Log.d(TAG, "detachFromWindow: cancelled a still-pending add");
                 return;
             }
-            view.attachCancelled = true;
-            view.addedToWindow = false;
-            target = view.windowContainer != null ? view.windowContainer : view;
+            attachCancelled = true;
+            addedToWindow = false;
+            target = windowContainer != null ? windowContainer : this;
         }
 
+        final Context ctx = getContext();
         // #558: when we're already on the UI thread (e.g. the service's onDestroy →
-        // MonadoImpl.shutdown → nativeDestroyServiceOverlay), use removeViewImmediate:
-        // it detaches the view synchronously. Plain removeView() only *schedules*
-        // the removal for the next looper traversal — which never runs when the
-        // service's MainLooper is shutting down, so the overlay's last frame stays
-        // frozen on the launcher. Off the UI thread, post a normal removeView.
+        // MonadoImpl.shutdown → nativeDestroyServiceOverlay, or the host Activity's
+        // onActivityDestroyed of #1389), use removeViewImmediate: it detaches the view
+        // synchronously. Plain removeView() only *schedules* the removal for the next
+        // looper traversal — which never runs when the service's MainLooper is shutting
+        // down, so the overlay's last frame stays frozen on the launcher; and on an
+        // Activity relaunch it lands AFTER the framework's own leak sweep, which is
+        // exactly the race #1389 is about. Off the UI thread, post a normal removeView.
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.d(TAG, "Removing view from window (immediate)");
-            WindowManager wm =
-                    (WindowManager) view.getContext().getSystemService(Context.WINDOW_SERVICE);
-            wm.removeViewImmediate(target);
+            removeQuietly(ctx, target, true);
         } else {
             new Handler(Looper.getMainLooper())
                     .post(
                             () -> {
                                 Log.d(TAG, "Start removing view from window");
-                                WindowManager wm =
-                                        (WindowManager)
-                                                view.getContext()
-                                                        .getSystemService(Context.WINDOW_SERVICE);
-                                wm.removeView(target);
+                                removeQuietly(ctx, target, false);
                             });
+        }
+    }
+
+    /**
+     * WindowManager.removeView* throws IllegalArgumentException when the view is not (or no longer)
+     * attached. That is a legitimate race now that two paths can remove the container — and it
+     * would otherwise be an uncaught exception on the UI thread, i.e. process death.
+     */
+    private static void removeQuietly(
+            @NonNull Context ctx, @NonNull View target, boolean immediate) {
+        try {
+            WindowManager wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
+            if (immediate) {
+                wm.removeViewImmediate(target);
+            } else {
+                wm.removeView(target);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Removing the hosted window failed (already gone?)", t);
+        }
+    }
+
+    /** See {@link #hostDestroyHook}. */
+    private void registerHostDestroyHook(@NonNull final Activity activity) {
+        final Application app = activity.getApplication();
+        if (app == null) {
+            Log.w(TAG, "No Application on the host Activity — hosted window teardown hook skipped");
+            return;
+        }
+        hostDestroyHook =
+                new Application.ActivityLifecycleCallbacks() {
+                    @Override
+                    public void onActivityCreated(
+                            @NonNull Activity a, @Nullable Bundle savedInstanceState) {}
+
+                    @Override
+                    public void onActivityStarted(@NonNull Activity a) {}
+
+                    @Override
+                    public void onActivityResumed(@NonNull Activity a) {}
+
+                    @Override
+                    public void onActivityPaused(@NonNull Activity a) {}
+
+                    @Override
+                    public void onActivityStopped(@NonNull Activity a) {}
+
+                    @Override
+                    public void onActivitySaveInstanceState(
+                            @NonNull Activity a, @NonNull Bundle outState) {}
+
+                    @Override
+                    public void onActivityDestroyed(@NonNull Activity a) {
+                        if (a != activity) {
+                            return;
+                        }
+                        Log.i(TAG, "Host activity destroyed — removing the hosted window (#1389)");
+                        unregisterHostDestroyHook();
+                        detachFromWindow();
+                    }
+                };
+        app.registerActivityLifecycleCallbacks(hostDestroyHook);
+    }
+
+    private void unregisterHostDestroyHook() {
+        final Application.ActivityLifecycleCallbacks hook = hostDestroyHook;
+        final Activity activity = hostActivity;
+        hostDestroyHook = null;
+        if (hook == null || activity == null) {
+            return;
+        }
+        try {
+            Application app = activity.getApplication();
+            if (app != null) {
+                app.unregisterActivityLifecycleCallbacks(hook);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not unregister the hosted-window teardown hook", t);
         }
     }
 

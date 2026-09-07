@@ -338,6 +338,42 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 			                 "from JNI_OnLoad / Activity onCreate)",
 			                 (void *)vm, activity);
 		}
+		/*
+		 * #1389: retire the PREVIOUS hosted surface before making a new one.
+		 *
+		 * The custom surface is deliberately kept alive across
+		 * xrEndSession/xrBeginSession (#507) and was never retired at all — so
+		 * after an Activity relaunch the process still holds the dead
+		 * Activity's `android_custom_surface`, AND `android_globals` still
+		 * publishes that Activity's ANativeWindow as VALID (the #507 poll that
+		 * would have cleared it stopped when the old app thread exited). The
+		 * reuse branch in `android_custom_surface_wait_get_surface()` then
+		 * honours that publication and hands the NEW session the DEAD window;
+		 * `vkCreateAndroidSurfaceKHR` on it fails
+		 * `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` (-1000000001) and the session
+		 * never comes up (2 of 11 relaunches, #1389).
+		 *
+		 * Dropping it here both frees the old view and — via
+		 * `android_globals_clear_window()` — invalidates the stale publication,
+		 * so the reuse branch cannot fire against it. The window pointer itself
+		 * is kept referenced by the globals (the #1040/#1146 contract), so
+		 * nothing dangles. Java-side the container is normally already gone by
+		 * now (MonadoView tears it down on the host Activity's onDestroy), and
+		 * `removeFromWindow` is idempotent, so this is safe either way.
+		 */
+		{
+			struct android_custom_surface *prev =
+			    (struct android_custom_surface *)android_globals_get_custom_surface();
+			if (prev != NULL) {
+				U_LOG_IFL_W(U_LOGGING_WARN,
+				            "Android: retiring the previous hosted surface before creating a "
+				            "new one (#1389)");
+				android_globals_set_custom_surface(NULL);
+				android_globals_clear_window();
+				android_custom_surface_destroy(&prev);
+			}
+		}
+
 		struct android_custom_surface *cs = android_custom_surface_async_start(
 		    vm, activity, /*display_id*/ 0, "DisplayXR", /*preferred_display_mode_id*/ 0, false);
 		if (cs == NULL) {

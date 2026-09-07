@@ -1567,7 +1567,38 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	    .window = (ANativeWindow *)hwnd,
 	};
 
+	/*
+	 * #1389 belt-and-braces: retry a bounded number of times on
+	 * VK_ERROR_NATIVE_WINDOW_IN_USE_KHR.
+	 *
+	 * The Android loader maps EVERY `native_window_api_connect()` failure onto
+	 * that one code, so it does NOT only mean "another VkSurface holds this
+	 * window" — it is also what an ANativeWindow whose BufferQueue is being
+	 * torn down on the UI thread reports. Both shapes are transient: the losing
+	 * side is a teardown already in flight on another thread. A hosted app's
+	 * Activity RELAUNCH is where this bites (#1389) — the previous window's
+	 * removal is a posted main-thread message, and `xrCreateSession` on the
+	 * relaunched Activity's native thread can beat it.
+	 *
+	 * The real fix is upstream of here (the hosted window is now taken down
+	 * synchronously at Activity destroy, and a stale publication can no longer
+	 * be adopted by the next session) — this only keeps a lost race from
+	 * failing the whole session. Bounded and short: ~5 x 20 ms, then the
+	 * original error. Not a loop that can hang session creation.
+	 */
 	VkResult res = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR) {
+		const int retries = 5;
+		for (int i = 0; i < retries && res == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR; i++) {
+			U_LOG_W("Android surface window in use (%d) — retry %d/%d in 20 ms (#1389)", res, i + 1,
+			        retries);
+			os_nanosleep(20 * 1000 * 1000);
+			res = vk->vkCreateAndroidSurfaceKHR(vk->instance, &surface_ci, NULL, &target->surface);
+		}
+		if (res == VK_SUCCESS) {
+			U_LOG_W("Android surface created after retry (#1389)");
+		}
+	}
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to create Android surface: %d", res);
 		free(target);
