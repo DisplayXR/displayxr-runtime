@@ -2543,9 +2543,38 @@ struct oxr_session
 	 * episode is always emitted immediately (it is the container transition,
 	 * and it is what unblocks the weave), and a later one inside
 	 * @ref OXR_ANDROID_HINT_MIN_EMIT_INTERVAL_NS of the last emit is held here
-	 * instead. Held, never dropped — @ref oxr_android_window_hint_flush
+	 * instead. Held rather than dropped — @ref oxr_android_window_hint_flush
 	 * delivers it from the frame loop once the gesture goes quiet.
+	 *
+	 * "Never dropped" holds only WHILE THE APP KEEPS CALLING xrWaitFrame, which
+	 * is the delivery vehicle. An app whose last geometry publish lands inside
+	 * the quiet window and then stops rendering keeps weaving at the PREVIOUS
+	 * answer until it pumps a frame or publishes again. That is the honest
+	 * bound, and it is acceptable because the previous answer is a valid one for
+	 * a window that has stopped changing: the failure mode is staleness, never a
+	 * mismatched layout/buffer pair.
 	 */
+	/*
+	 * Guards EVERY `android_hint_*` field above and below (#1401 review).
+	 *
+	 * Two app threads reach this block and OpenXR does not require them to be
+	 * the same one: `xrSetAndroidWindowGeometryDXR` runs on whatever thread the
+	 * app samples its geometry on (a Choreographer callback, in every consumer
+	 * we ship), while the coalesced-hint flush runs from `xrWaitFrame` on the
+	 * render thread. The fields are not independent — `layout_*` and `buffer_*`
+	 * are a PAIR derived together — so a torn interleave hands the app a
+	 * layoutSize from one answer and a bufferSize from another, whose composed
+	 * transform is not identity. That is the ~0.4 px drift that reads as a
+	 * double image in both eyes, arriving silently and only under a race.
+	 *
+	 * Lock order is hint_mutex -> instance event lock (both writers push events
+	 * while holding this); nothing takes this from inside an event push, so
+	 * there is no inversion.
+	 */
+	struct os_mutex android_hint_mutex;
+	//! os_mutex_init succeeded, so destroy must run. Session create can fail
+	//! between the handle allocation and the init.
+	bool android_hint_mutex_ready;
 	uint64_t android_hint_last_emit_ns;
 	bool android_hint_pending;
 	bool android_hint_coalesce_logged;

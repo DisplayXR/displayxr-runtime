@@ -17,9 +17,17 @@
  * is pinned HERE instead: the test parses `isTell`'s expression straight out of
  * the Java source and evaluates it against the same case table as the C.
  *
- * That is deliberately a semantic comparison, not a string one. A reformat (the
- * project runs google-java-format over that file) must not fail this test, and a
- * quietly ADDED SLACK — `x < -8`, `w > dispW * 1.02` — must.
+ * For `isTell` that is a SEMANTIC comparison, not a string one: the expression is
+ * parsed and evaluated, so a reformat (the project runs google-java-format over
+ * that file) must not fail this test while a quietly ADDED SLACK — `x < -8`,
+ * `w > dispW * 1.02` — must.
+ *
+ * `isBindingTell` and its mid-rotation reject are pinned only by SHAPE — a
+ * substring match on the guard and on the delegation to `isTell`. They have no C
+ * counterpart to compare against and the reject is a statement rather than an
+ * expression, so the evaluator cannot reach them. That is a weaker pin and is
+ * called out here so nobody reads the file as proving more than it does;
+ * extending the evaluator to cover them is tracked as a follow-up.
  *
  * No Android, no JNI, no device: the rule is integer arithmetic, and the whole
  * point of extracting it is that it is now findable on the host.
@@ -89,6 +97,15 @@ const Case cases[] = {
     // Degenerate inputs. Every caller's rule is "never decide on ignorance", so
     // a missing panel extent or a zero window answers false and the caller
     // checks for it separately.
+    // ZERO EXTENT AT A SPILLING ORIGIN. Without these, dropping `w > 0 && h > 0`
+    // from the Java SURVIVES: the only zero-extent row sat at 1757,236, where no
+    // spill term fires anyway, so the guard was never load-bearing (#1401 review).
+    {"zero extent, spilling x origin", 2600,    0,    0,    0, 2560, 1600, false},
+    {"zero extent, spilling y origin",    0, 1700,    0,    0, 2560, 1600, false},
+    // PANEL HEIGHT MISSING ON ITS OWN. Without this, dropping the `disp_h == 0`
+    // term from the C header SURVIVES: every other row sets both panel axes or
+    // neither.
+    {"panel height missing only",         0,    0, 1080, 1685, 2560,    0, false},
     {"no panel extent yet",            1757,  236, 1080, 1685,    0,    0, false},
     {"no window extent yet",           1757,  236,    0,    0, 2560, 1600, false},
     {"zero panel width only",             0,    0, 1080, 1685,    0, 1600, false},
@@ -402,8 +419,10 @@ stripComments(const std::string &src)
 				i++;
 			} else if (c == '"') {
 				st = STRING_LIT;
+				out[i] = ' ';
 			} else if (c == '\'') {
 				st = CHAR_LIT;
+				out[i] = ' ';
 			}
 			break;
 		case LINE_COMMENT:
@@ -424,11 +443,32 @@ stripComments(const std::string &src)
 			break;
 		case STRING_LIT:
 		case CHAR_LIT:
-			// Skip an escape pair so \" / \' do not end the literal.
+			/*
+			 * BLANK the contents, do not merely track them (#1401 review).
+			 * Tracking alone only stops a `//` inside a literal from opening a
+			 * comment; the text stays visible to the parser. Proven live: one
+			 *
+			 *   Log.i("X", "boolean isTell(int a) { return x < 0 || y < 0; }")
+			 *
+			 * re-points the extractor at the string, and the test dies as a
+			 * mystery CI failure rather than as a useful one. This class is now
+			 * the DOCUMENTED cross-APK contract, so a log line naming a
+			 * signature is a plausible next edit. The parser never needs literal
+			 * contents, and blanking them also protects the brace matcher and
+			 * the find(';') in lastReturnExpression.
+			 */
 			if (c == '\\') {
+				// An escape pair, so \" and \' do not end the literal.
+				out[i] = ' ';
+				if (i + 1 < out.size() && out[i + 1] != '\n') {
+					out[i + 1] = ' ';
+				}
 				i++;
 			} else if ((st == STRING_LIT && c == '"') || (st == CHAR_LIT && c == '\'')) {
+				out[i] = ' ';
 				st = CODE;
+			} else if (c != '\n') {
+				out[i] = ' ';
 			}
 			break;
 		}
@@ -440,7 +480,11 @@ stripComments(const std::string &src)
 std::string
 extractMethodBody(const std::string &src, const std::string &name)
 {
-	const std::string sig = "boolean " + name + "(";
+	// Anchored on the full DECLARATION, not on "boolean <name>(" (#1401 review).
+	// The looser form also matches a use of the name inside an argument list,
+	// and — before the comment/literal blanking above — matched prose. The
+	// contract says these are public static, so require exactly that.
+	const std::string sig = "public static boolean " + name + "(";
 	size_t at = src.find(sig);
 	if (at == std::string::npos) {
 		throw std::runtime_error("no method '" + name + "' in MiniWindowLayout.java");

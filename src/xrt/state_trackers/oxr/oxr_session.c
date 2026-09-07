@@ -3455,6 +3455,10 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// window. AFTER the compositor teardown above, which is what still had a
 	// VkSurfaceKHR built from it. The app keeps owning the Surface itself.
 	oxr_android_surface_session_fini(sess);
+	if (sess->android_hint_mutex_ready) {
+		sess->android_hint_mutex_ready = false;
+		os_mutex_destroy(&sess->android_hint_mutex);
+	}
 #endif
 
 #ifdef OXR_HAVE_DXR_depth_budget
@@ -4330,6 +4334,19 @@ oxr_session_create(struct oxr_logger *log,
 	// Adopt the ANativeWindow reference the binding parse took, so session
 	// destroy (and every later xrSetAndroidSurfaceDXR) releases exactly one.
 	sess->android_bound_window = android_bound_window;
+	/*
+	 * #1401 review: the mini-window hint block is written from two app threads
+	 * (the geometry channel and xrWaitFrame's coalesced flush), so it needs its
+	 * own lock. Created here rather than in the impl because nothing can reach
+	 * the block until this function hands the handle back.
+	 */
+	if (os_mutex_init(&sess->android_hint_mutex) == 0) {
+		sess->android_hint_mutex_ready = true;
+	} else {
+		oxr_warn(log,
+		         "XR_DXR_android_surface_binding: could not create the layout-hint mutex; "
+		         "mini-window layout hints are disabled for this session (#1401)");
+	}
 #endif
 	sess->is_bridge_relay = xsi.is_bridge_relay;
 

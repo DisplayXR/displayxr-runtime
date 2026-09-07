@@ -292,6 +292,45 @@ android_globals_get_activity()
 }
 
 void *
+android_globals_acquire_activity(void *env_v)
+{
+	JNIEnv *env = (JNIEnv *)env_v;
+	if (env == nullptr) {
+		return nullptr;
+	}
+	/*
+	 * NewLocalRef UNDER THE LOCK. The tracked slot is a global ref that
+	 * on_activity_destroyed deletes on the UI thread, so taking the pointer out
+	 * first and referencing it after would be a use-after-free window the width
+	 * of a scheduler slice — invisible, and only during a relaunch, which is
+	 * exactly when the mini-window path is running (#1401 review).
+	 */
+	{
+		std::lock_guard<std::mutex> lock(android_current_activity.mutex);
+		if (android_current_activity.activity != nullptr) {
+			return env->NewLocalRef(android_current_activity.activity);
+		}
+	}
+	/*
+	 * The captured one is never deleted, so it needs no lock — but hand it back
+	 * as a local ref too, so callers have ONE ownership rule rather than a
+	 * conditional one.
+	 */
+	jobject captured = (jobject)android_globals.activity.getHandle();
+	return captured != nullptr ? env->NewLocalRef(captured) : nullptr;
+}
+
+void
+android_globals_release_activity(void *env_v, void *activity)
+{
+	JNIEnv *env = (JNIEnv *)env_v;
+	if (env == nullptr || activity == nullptr) {
+		return;
+	}
+	env->DeleteLocalRef((jobject)activity);
+}
+
+void *
 android_globals_get_context()
 {
 	return android_globals.context.isNull() ? android_globals.activity.getHandle()

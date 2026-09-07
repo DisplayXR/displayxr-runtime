@@ -430,10 +430,17 @@ cross-APK caller. There is no state on the Java side to inherit.
 meaning of every `int[]` slot are frozen once shipped; a different signature is a
 *new* method plus a `contractVersion()` bump, never a changed one. A reflecting
 caller fails by name at run time, in a shipped browser, with no build-time signal
-on either side — so the rule is enforced mechanically: a `-keep` rule in
-`src/xrt/targets/openxr_android/proguard-rules.pro`, and
-`scripts/check_mini_window_contract.sh`, which CI runs against the built
-**release** APK's DEX and fails if any signature is missing or renamed.
+on either side — so the rule is enforced mechanically:
+`scripts/check_mini_window_contract.sh` runs in CI (with `--require-dexdump`)
+against the built **release** APK's DEX and fails if any entry point is missing,
+renamed, re-signed, or no longer `public static`.
+
+Note the current scope honestly: the runtime APK builds with `minifyEnabled
+false`, so that check is a **source-change detector** — it does not yet prove the
+contract survives R8, because R8 does not run. The `-keep` rule in
+`src/xrt/targets/openxr_android/proguard-rules.pro` is what would make it
+survive, and it is inert until someone enables minification. Both are in place so
+that day cannot silently break a shipped consumer.
 
 ## 3. Runtime Behavior
 

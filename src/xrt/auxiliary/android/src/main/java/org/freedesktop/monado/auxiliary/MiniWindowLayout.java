@@ -87,10 +87,14 @@ import androidx.annotation.Nullable;
  * meaning of every {@code int[]} slot are frozen once shipped. A different signature is a NEW
  * method and a {@link #contractVersion} bump; it is never a changed one — a caller reflecting by
  * name and descriptor fails at run time, in a shipped browser, silently. Same rule for the {@code
- * HINT_*} indices: append at the end, never renumber. Enforced two ways: a {@code -keep} rule in
- * {@code proguard-rules.pro} (so this survives a release APK even if minification is ever turned
- * on), and {@code scripts/check_mini_window_contract.sh}, which CI runs against the built release
- * APK's DEX.
+ * HINT_*} indices: append at the end, never renumber.
+ *
+ * <p>Enforced two ways, with different reach. {@code scripts/check_mini_window_contract.sh} runs in
+ * CI against the built RELEASE APK and fails on a renamed, re-signed, non-public or non-static
+ * entry point — but the release build sets {@code minifyEnabled false}, so today it is a
+ * source-change detector rather than proof of R8 survival. The {@code -keep} rule in {@code
+ * proguard-rules.pro} is what makes it the latter the day minification is turned on; until then it
+ * is inert, and deliberately so.
  *
  * <p><b>Threading.</b> Every static here is safe to call off the UI thread and that is the normal
  * case — the surface-binding path calls from the app's geometry thread. {@link #isEnabled} reads a

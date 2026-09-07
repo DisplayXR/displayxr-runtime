@@ -72,7 +72,13 @@ android_globals_get_vm(void);
  * then falls back to the captured one, which is exactly the pre-#1401 behaviour
  * — never worse — and the destroyed instance is not pinned.
  *
- * Safe to call from any thread.
+ * THREADING: the internal state is mutex-guarded, so concurrent callers are
+ * safe — but this needs an ALREADY-ATTACHED thread, because it takes and drops
+ * JNI global references. It deliberately does NOT attach one (that would leave
+ * the thread attached behind the caller's back), and returns without doing
+ * anything if the calling thread has no `JNIEnv`. That is not a limitation in
+ * practice: its only callers are the Java `ActivityLifecycleCallbacks`, which
+ * are always on an attached thread by construction.
  */
 void
 android_globals_set_current_activity(void *activity);
@@ -83,11 +89,39 @@ android_globals_set_current_activity(void *activity);
  * The most recent one published by @ref android_globals_set_current_activity
  * when there is one, else the one captured at instance creation.
  *
+ * BORROWED, and therefore ONLY safe on a thread that cannot race
+ * @ref android_globals_set_current_activity — in practice instance/session
+ * creation, which runs long before any relaunch can retire an Activity. Anything
+ * that can run CONCURRENTLY with the UI thread must use
+ * @ref android_globals_acquire_activity instead: the tracked reference is a
+ * global ref that the destroy callback deletes, so a borrowed pointer can be
+ * freed between this returning and the caller's JNI call (#1401 review).
+ *
  * For usage, cast the return value to jobject - a typedef whose definition
  * differs between C (a void *) and C++ (a pointer to an empty class)
  */
 void *
 android_globals_get_activity(void);
+
+/*!
+ * Like @ref android_globals_get_activity, but PINNED for the caller (#1401).
+ *
+ * Returns a new LOCAL reference taken while the globals' lock is held, so it
+ * cannot be freed underneath the caller no matter what the UI thread does next.
+ * Must be released with @ref android_globals_release_activity, and — being a
+ * local ref — must not outlive the JNI call that obtained it.
+ *
+ * @param env The calling thread's attached `JNIEnv *`, as a `void *`.
+ * @return A local reference, or NULL when no Activity is known.
+ */
+void *
+android_globals_acquire_activity(void *env);
+
+/*!
+ * Release a reference from @ref android_globals_acquire_activity. NULL-safe.
+ */
+void
+android_globals_release_activity(void *env, void *activity);
 
 /*!
  * Retrieve the android.content.Context jobject previously stored, if any.
