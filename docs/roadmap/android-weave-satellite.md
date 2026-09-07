@@ -481,12 +481,41 @@ mini-window no longer needs the satellite to be crisp. Three parts, all in
    *Gating matters:* the test-API returns the **nominal** window-reply
    placement in fullscreen too, so it is read only when the container-scaled
    tell already fired.
-2. **Size the buffer to `round(scale · logical)`** via
-   `SurfaceHolder.setFixedSize` — 724×1129 for a 1080×1685 window at 0.67, the
-   value the API's `Rect` and the layer's `coveredRegion` both report. **Not**
-   SurfaceFlinger's `displayFrame` (732×1137): that includes the task layer's
-   shadow (`shadowRadius` 6 × 0.67 ≈ 4 px a side) and sizing to it would put an
-   8 px resample straight back.
+2. **Size the buffer so the composition carries no visible resample.**
+   `round(scale · logical)` is not enough: 1080 × 0.67 = 723.6 rounds to 724, so
+   SF composes (1080/724) × 0.67 = **0.9994** — 0.06 %, ~0.4 px of drift across
+   the window, which David's eye read as *"weaves good, but a slight double image
+   in **both** eyes"*. Both eyes equally is the signature of a residual
+   **resample**, not of a phase error, and the SF readback agreed (0.9994 / 1.0000).
+
+   The requirement is only that `layout · s` land close **enough** to an integer.
+   So rationalise the scale to `p/q` (**q = 100 first** — an OEM window scale is a
+   round percentage; smallest-q-wins picks the wrong fraction, because the
+   whole-pixel `Rect` only pins the scale to ~3e-4 and `63/94` fits that band with
+   a smaller q while composing to 0.99968), then take the **largest** layout within
+   q of the window whose residual is under **0.1 px**. Calibration: 0.4 px was
+   visible, 0.05 px has been on the panel throughout unremarked.
+
+   On the reference tablet that is **1079 × 1685 logical → 723 × 1129 buffer**
+   (residual 0.07 / 0.05 px), leaving a **one-logical-pixel** strip on the right
+   and none at the bottom. Anchor the view `TOP|LEFT` so the origin needs no offset
+   math and the whole remainder falls on the far edge; paint the FrameLayout black
+   behind it.
+
+   Two rules that were tried on device and rejected, so they are not worth
+   re-deriving:
+   - **Snapping to a multiple of q** (1000 × 1600 → 670 × 1072) composes to exactly
+     1.0000 — SF stops classifying the transform as `SCALE` at all — but costs a
+     54 × 57 px black border, ~5 % of the window. David rejected the border.
+   - **Overscanning** (a layout *larger* than the window, so the crop eats the
+     remainder) does not work at all: a SurfaceView bigger than its window has its
+     surface sized to the **visible frame**, so a 737 × 1139 buffer was mapped into
+     723.6 × 1128.95 screen px — composed **0.982**, a 2 % resample, and the double
+     image came straight back.
+
+   Either way, **not** SurfaceFlinger's `displayFrame` (732×1137): that includes the
+   task layer's shadow (`shadowRadius` 6 × 0.67 ≈ 4 px a side) and sizing to it
+   would put an 8 px resample straight back.
 3. **Publish the PHYSICAL rect** (origin unchanged — `getLocationOnScreen` is
    already post-scale; size = the buffer). Everything downstream then works in
    panel pixels: the compositor's view dims (`window × view_scale`), the
@@ -494,8 +523,10 @@ mini-window no longer needs the satellite to be crisp. Three parts, all in
    rect is published only once the surface has actually come back at the new
    size, so no frame weaves at a size the buffer does not have.
 
-SF then composes `buffer→layer (1080/724) × leash (0.67) ≈ 1.0` and the strict
-1:1 contract above holds. `vk_android_update_container_scaled` needed no change:
+SF then composes `buffer→layer (1079/723) × leash (0.67) = 0.99990` in x and
+`(1685/1129) × 0.67 = 0.99996` in y — 0.07 px and 0.05 px of drift over the whole
+window — and the strict 1:1 contract above holds to the eye ("it's perfect now",
+David, on the reference tablet). `vk_android_update_container_scaled` needed no change:
 its tell reads the published rect, so a physical rect fits the panel and it
 clears itself back to weaving. The degrade remains the fallback for every case
 this cannot serve — scale unmeasurable, sources disagreeing,
