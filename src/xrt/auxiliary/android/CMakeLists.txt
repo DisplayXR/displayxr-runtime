@@ -27,6 +27,8 @@ add_library(
 	android_looper.h
 	android_main_thread.c
 	android_main_thread.h
+	android_mini_window.cpp
+	android_mini_window.h
 	android_perf_hint.c
 	android_perf_hint.h
 	org.freedesktop.monado.auxiliary.cpp

@@ -1416,6 +1416,50 @@ oxr_android_surface_publish(struct oxr_logger *log,
 void
 oxr_android_surface_session_fini(struct oxr_session *sess);
 
+/*!
+ * Evaluate the OEM container-scaled tell against a freshly published window
+ * rect and, when the answer changes, emit
+ * `XrEventDataAndroidWindowLayoutHintDXR` (#1396).
+ *
+ * The runtime owns the POLICY (the vendor scale probe and the exact-integer
+ * search, shared verbatim with the hosted `MonadoView` path through
+ * `MiniWindowLayout`); the app owns its WINDOW and applies the answer. An app
+ * that ignores the event keeps the honest 2D fallback.
+ */
+void
+oxr_android_window_hint_update(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               int32_t x,
+                               int32_t y,
+                               uint32_t w,
+                               uint32_t h,
+                               uint32_t disp_w,
+                               uint32_t disp_h);
+
+/*!
+ * Re-emit the active layout hint, if any — `xrBeginSession` and every surface
+ * republish, so an app that starts or resumes already inside a scaled
+ * container never misses it.
+ */
+void
+oxr_android_window_hint_reemit(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
+ * Push an `XrEventDataAndroidWindowLayoutHintDXR` onto the instance event
+ * queue. @p active false zeroes every other field (restore the layout).
+ */
+XrResult
+oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrBool32 active,
+                                                  float scale,
+                                                  int32_t layout_w,
+                                                  int32_t layout_h,
+                                                  int32_t buffer_w,
+                                                  int32_t buffer_h,
+                                                  int32_t phys_x,
+                                                  int32_t phys_y);
+
 /*! @} */
 #endif // OXR_HAVE_DXR_android_surface_binding
 
@@ -2430,6 +2474,26 @@ struct oxr_session
 	//! binding (the runtime-spawned `_hosted` SurfaceView owns its own
 	//! window instead).
 	void *android_bound_window;
+
+	/*
+	 * #1396 mini-window layout hint (XR_DXR_android_surface_binding spec v2).
+	 * The state the runtime keeps so it emits ONE event per distinct answer
+	 * and can re-emit it to a late joiner. Plain ints so this block needs no
+	 * extension header.
+	 *
+	 * `android_hint_active` latches: once the app has applied the hint it
+	 * publishes the PHYSICAL rect, which fits the panel and therefore no
+	 * longer trips the container-scaled tell. A published extent equal to
+	 * `android_hint_buffer_*` is what tells "the hint is applied" apart from
+	 * "the window left its container".
+	 */
+	bool android_hint_active;
+	bool android_hint_unknown_logged;
+	bool android_hint_ignored_logged;
+	int32_t android_hint_layout_w, android_hint_layout_h;
+	int32_t android_hint_buffer_w, android_hint_buffer_h;
+	int32_t android_hint_x, android_hint_y;
+	float android_hint_scale;
 #endif
 
 	//! True if this is a headless bridge-relay session (XR_DXR_display_info +

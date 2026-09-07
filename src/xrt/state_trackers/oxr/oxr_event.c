@@ -170,6 +170,12 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		return call->session == session;
 	}
 #endif
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	case XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR: {
+		XrEventDataAndroidWindowLayoutHintDXR *hint = (XrEventDataAndroidWindowLayoutHintDXR *)type;
+		return hint->session == session;
+	}
+#endif
 	default: return false;
 	}
 }
@@ -461,6 +467,62 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 
 	return XR_SUCCESS;
 }
+
+#ifdef OXR_HAVE_DXR_android_surface_binding
+XrResult
+oxr_event_push_XrEventDataAndroidWindowLayoutHint(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrBool32 active,
+                                                  float scale,
+                                                  int32_t layout_w,
+                                                  int32_t layout_h,
+                                                  int32_t buffer_w,
+                                                  int32_t buffer_h,
+                                                  int32_t phys_x,
+                                                  int32_t phys_y)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataAndroidWindowLayoutHintDXR *hint;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &hint);
+
+	hint->type = XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR;
+	hint->next = NULL;
+	hint->session = oxr_session_to_openxr(sess);
+	hint->active = active;
+	hint->scale = active ? scale : 0.0f;
+	hint->layoutSize.width = active ? layout_w : 0;
+	hint->layoutSize.height = active ? layout_h : 0;
+	hint->bufferSize.width = active ? buffer_w : 0;
+	hint->bufferSize.height = active ? buffer_h : 0;
+	hint->physicalRect.offset.x = active ? phys_x : 0;
+	hint->physicalRect.offset.y = active ? phys_y : 0;
+	hint->physicalRect.extent.width = active ? buffer_w : 0;
+	hint->physicalRect.extent.height = active ? buffer_h : 0;
+	event->result = XR_SUCCESS;
+
+	// Container transitions only — the user toggling a freeform window. Never
+	// per frame, so WARN is the visible tier (#441) and this line is the proof
+	// the hint reached the client.
+	if (active) {
+		U_LOG_W(
+		    "OXR EVENT: Android window layout hint ON scale=%.4f layout %dx%d buffer %dx%d "
+		    "physical %d,%d %dx%d (#1396)",
+		    (double)scale, layout_w, layout_h, buffer_w, buffer_h, phys_x, phys_y, buffer_w, buffer_h);
+	} else {
+		U_LOG_W(
+		    "OXR EVENT: Android window layout hint OFF — window fits the panel, restore layout "
+		    "(#1396)");
+	}
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_android_surface_binding
 
 #ifdef OXR_HAVE_DXR_depth_budget
 XrResult

@@ -51,6 +51,12 @@
  *     `Choreographer` callback). ADR-036 D6; ADR-033 is unchanged — this
  *     reports GEOMETRY, the weaver still owns all phase including snapping.
  *
+ * Spec v2 adds one EVENT in the other direction — @ref
+ * XrEventDataAndroidWindowLayoutHintDXR. An OEM "mini-window" container scales
+ * the whole task with a SurfaceFlinger leash, which resamples (and so destroys)
+ * the weave; escaping it needs a layout change only the app can make, from a
+ * measurement only the runtime does. See that struct.
+ *
  * TRAP: an OEM that applies the `OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS` compat
  * change makes `View.getLocationOnScreen()` return WINDOW-relative
  * coordinates, so every window would report (0,0) with no error anywhere. The
@@ -70,17 +76,19 @@ extern "C" {
 #endif
 
 #define XR_DXR_android_surface_binding 1
-#define XR_DXR_android_surface_binding_SPEC_VERSION 1
+#define XR_DXR_android_surface_binding_SPEC_VERSION 2
 #define XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_android_surface_binding"
 
 // XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR keeps the value published in
 // the (previously unimplemented) sketch in docs/specs/extensions/
 // XR_DXR_display_info.md §4 — it sits in one of the two unused gaps of the
 // XR_DXR_display_info decade rather than in this extension's own decade. The
-// geometry struct added by this revision takes the next free decade,
-// 1004999220–229. Both are recorded in this directory's README.md registry.
+// geometry struct takes the next free decade, 1004999220–229 (220 = geometry,
+// 221 = the spec-v2 layout-hint event). Both are recorded in this directory's
+// README.md registry.
 #define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999005)
 #define XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR ((XrStructureType)1004999220)
+#define XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR ((XrStructureType)1004999221)
 
 #if defined(__ANDROID__)
 
@@ -147,6 +155,79 @@ typedef struct XrAndroidWindowGeometryDXR {
     XrExtent2Di                 panelExtent;  //!< Panel extent in the same rotation, physical px
     int32_t                     displayId;    //!< `Display.getDisplayId()`; 0 = default display
 } XrAndroidWindowGeometryDXR;
+
+/*!
+ * @brief The runtime's answer to "this window is being scaled by its container"
+ *        (spec v2, runtime#1396).
+ *
+ * Some OEM multi-window shells ("mini-window", "window reply", freeform-with-
+ * scale) do not give the task a smaller window — they give it a FULL-SIZE
+ * logical window and shrink the whole task with a SurfaceFlinger leash
+ * (measured on one A13 tablet: `SCALE TRANSLATE 0.67 @ (1757,236)`, so a
+ * 1080x1685 logical window lands as 723x1129 physical pixels). The vendor
+ * interlacer is strict 1:1 buffer→panel, so ANY resample between the woven
+ * buffer and the panel destroys the interlace; a runtime that notices this and
+ * does nothing must fall back to flat 2D.
+ *
+ * The fix is to make the COMPOSED transform identity rather than to fight the
+ * leash: give the surface a buffer of `round(logical * scale)` pixels, and
+ * SurfaceFlinger's buffer→layer scale times the leash multiplies out to 1.0.
+ * That needs BOTH halves and only the application owns one of them:
+ *
+ *   - the BUFFER size — reachable from either side, and
+ *   - the LAYOUT size of the view — reachable only by the app. It matters
+ *     because `logical * scale` must land on a whole pixel: 1080 x 0.67 =
+ *     723.6 composes to 0.9994, ~0.4 px of drift across the window, which
+ *     reads as a slight double image in BOTH eyes (the signature of a residual
+ *     resample; a phase error blurs one eye only). 1079 x 0.67 = 722.93 → 723,
+ *     a 0.07 px residual, is invisible. `ANativeWindow_setBuffersGeometry` on
+ *     the bound window cannot reach that: it sets the buffer, not the layout.
+ *
+ * So the runtime keeps the POLICY (it owns the scale probe and the exact-
+ * integer search — see the spec) and the app keeps its WINDOW. The runtime
+ * emits this event; the app resizes its content view to @p layoutSize, fixes
+ * its buffer to @p bufferSize, and republishes @p physicalRect through
+ * @ref xrSetAndroidWindowGeometryDXR. When @p active is XR_FALSE the window
+ * fits the panel again and the app restores its ordinary layout.
+ *
+ * An app that ignores the event is not broken — it keeps the runtime's honest
+ * 2D fallback in the scaled container, exactly as before spec v2.
+ *
+ * Re-emitted at `xrBeginSession` and on the next `xrSetAndroidSurfaceDXR`
+ * publish while a hint is active, so an app that starts (or resumes) already
+ * inside a scaled container never misses it.
+ *
+ * @extends XrEventDataBaseHeader
+ */
+typedef struct XrEventDataAndroidWindowLayoutHintDXR {
+    XrStructureType             type;          //!< Must be XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;       //!< Session whose bound surface this describes
+    //! XR_TRUE  = apply the layout below.
+    //! XR_FALSE = the container no longer scales this window; restore the
+    //! ordinary match-parent layout and drop the fixed buffer size. Every
+    //! other field is 0 when this is XR_FALSE.
+    XrBool32                    active;
+    //! The measured container scale (physical / logical), e.g. 0.67. Informational —
+    //! the app must use the integer sizes below, which are the RATIONALISED answer;
+    //! recomputing from this float re-introduces the drift the search removed.
+    float                       scale;
+    //! Logical size the app must lay its content view / window out at. Never
+    //! LARGER than the window: overscanning does not work, because a SurfaceView
+    //! bigger than its window has its surface sized to the VISIBLE frame and the
+    //! resample comes straight back. The remainder (typically ONE logical pixel)
+    //! shows as a strip on the right/bottom edge; paint it black.
+    XrExtent2Di                 layoutSize;
+    //! Fixed buffer size in physical panel pixels — `SurfaceHolder.setFixedSize()`
+    //! or `ANativeWindow_setBuffersGeometry()`. This is `round(layoutSize * scale)`.
+    XrExtent2Di                 bufferSize;
+    //! The on-screen rect to publish through @ref xrSetAndroidWindowGeometryDXR
+    //! ONCE the buffer has actually come back at @p bufferSize. Its offset is the
+    //! window's on-screen origin as the runtime last saw it (the app should keep
+    //! publishing its own live `View.getLocationOnScreen()` as the window moves)
+    //! and its extent is @p bufferSize.
+    XrRect2Di                   physicalRect;
+} XrEventDataAndroidWindowLayoutHintDXR;
 
 /*!
  * @brief Republish (or drop) the application-owned Surface mid-session.

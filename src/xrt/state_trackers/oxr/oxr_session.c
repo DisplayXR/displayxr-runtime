@@ -925,6 +925,15 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	// #1396: an app that STARTS inside an OEM-scaled container has already
+	// published its rect (session create seeds one, and its Choreographer runs
+	// before the first frame), so the hint may have been computed before it had
+	// any chance to poll. Re-deliver it here — the first xrPollEvent after
+	// xrBeginSession is the earliest point every app is listening.
+	oxr_android_window_hint_reemit(log, sess);
+#endif
+
 	return oxr_session_success_result(sess);
 }
 
