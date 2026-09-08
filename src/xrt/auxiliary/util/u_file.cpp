@@ -19,7 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if __cplusplus >= 201703L
+// MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is passed, so it
+// needs _MSVC_LANG to report the real standard. Without this the experimental
+// branch is always taken on MSVC, and MSVC 14.51 (VS 2026) removed that header.
+#if (__cplusplus >= 201703L) || (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L)
 #include <filesystem>
 namespace fs = std::filesystem;
 #else
