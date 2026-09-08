@@ -616,7 +616,8 @@ struct comp_vk_native_compositor
 		uint64_t total;       //!< Drops seen by this compositor this session.
 		uint64_t runs;        //!< Drop RUNS (a run = consecutive dropped weaves).
 		uint64_t run_len;     //!< Length of the run in progress.
-		uint64_t last_log_ns; //!< Monotonic time of the last line we emitted.
+		uint64_t last_log_ns; //!< Monotonic time of the last "dropped" line.
+		uint64_t last_rec_ns; //!< Monotonic time of the last "recovered" line.
 		bool in_run;          //!< The previous weave was dropped.
 	} weave_drop;
 
@@ -4782,16 +4783,27 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				c->weave_drop.run_len++;
 			} else if (c->weave_drop.in_run) {
 				/*
-				 * The run ended. ALWAYS a WARN: aux INFO is dropped from the
-				 * frame path, so an INFO here would exist in the source and be
-				 * absent from the one log a bug report carries. This is the
-				 * line that makes a single drop observable per occurrence, so
-				 * it is not throttled below the run rate.
+				 * The run ended. WARN and not INFO: aux INFO is dropped from
+				 * the frame path, so an INFO here would exist in the source and
+				 * be absent from the one log a bug report carries. This is the
+				 * line that makes a single drop observable per occurrence.
+				 *
+				 * Carries the SAME verbose-then-throttle budget as the run-start
+				 * line above, and on the same run counter, so the two stay
+				 * PAIRED: for the first DXR_DROP_VERBOSE_RUNS runs you get both,
+				 * after that both are rate-limited. Without this, drop/good
+				 * alternation at frame rate would make this line per-frame,
+				 * which is the one thing the logging rules forbid outright.
 				 */
 				c->weave_drop.in_run = false;
-				U_LOG_W("#1394: weave recovered after %" PRIu64
-				        " dropped frame(s) (run %" PRIu64 ")",
-				        c->weave_drop.run_len, c->weave_drop.runs);
+				const uint64_t rec_ns = os_monotonic_get_ns();
+				if (c->weave_drop.runs <= DXR_DROP_VERBOSE_RUNS ||
+				    rec_ns - c->weave_drop.last_rec_ns > 5ULL * U_TIME_1S_IN_NS) {
+					c->weave_drop.last_rec_ns = rec_ns;
+					U_LOG_W("#1394: weave recovered after %" PRIu64
+					        " dropped frame(s) (run %" PRIu64 ")",
+					        c->weave_drop.run_len, c->weave_drop.runs);
+				}
 			}
 
 
