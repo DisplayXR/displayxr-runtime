@@ -8,6 +8,7 @@
  */
 
 #include "comp_d3d11_service.h"
+#include "comp_eye_dp_policy.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
@@ -24684,41 +24685,34 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
 static struct xrt_display_processor_d3d11 *
 resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compositor *xc)
 {
-	// #1002: dead device — hand out no DP at all; callers then fall back to
-	// their default eye pair instead of faulting inside the vendor weaver.
-	if (service_device_removed(sys)) {
-		return nullptr;
-	}
+	// The decision itself lives in comp_eye_dp_policy.h — pure, and pinned by
+	// tests/tests_comp_eye_dp_policy.cpp (#1414). Here we only read the state
+	// it needs and dereference the slot it names.
+	struct d3d11_service_compositor *c = (xc != nullptr) ? d3d11_service_compositor_from_xrt(xc) : nullptr;
 
-	// Workspace mode / #964 pipeline: per-client compositors have no DP of
-	// their own — the multi-compositor owns the one panel DP (D-4).
-	if ((sys->workspace_mode || pipeline_always_on(sys)) && sys->multi_comp != nullptr) {
-		return sys->multi_comp->display_processor;
-	}
+	struct comp_eye_dp_state st = {};
+	st.device_removed = service_device_removed(sys);
+	st.panel_dp_owns_clients = sys->workspace_mode || pipeline_always_on(sys);
+	st.have_multi_comp = sys->multi_comp != nullptr;
+	st.have_panel_dp = st.have_multi_comp && sys->multi_comp->display_processor != nullptr;
+	st.have_client_dp = c != nullptr && c->render.display_processor != nullptr;
 
-	// The caller's own DP. Correct regardless of whether this client renders.
-	if (xc != nullptr) {
-		struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
-		if (c != nullptr && c->render.display_processor != nullptr) {
-			return c->render.display_processor;
-		}
-	}
-
-	// Shared DP for a client that has none of its own (weave_submit's fallback).
-	if (sys->multi_comp != nullptr && sys->multi_comp->display_processor != nullptr) {
-		return sys->multi_comp->display_processor;
-	}
-
-	// Last resort: whichever compositor rendered most recently. Preserves the
-	// pre-#625 behaviour exactly for callers that pass no xc.
-	{
+	switch (comp_eye_dp_select(&st)) {
+	case COMP_EYE_DP_CLIENT: return c->render.display_processor;
+	case COMP_EYE_DP_PANEL: return sys->multi_comp->display_processor;
+	case COMP_EYE_DP_ACTIVE: {
+		// Whichever compositor rendered most recently. Preserves the pre-#625
+		// behaviour exactly for callers that pass no xc — and is exactly the
+		// slot a submit-less client must never reach (it is NULL there).
 		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
 		if (sys->active_compositor != nullptr) {
 			return sys->active_compositor->render.display_processor;
 		}
+		return nullptr;
 	}
-
-	return nullptr;
+	case COMP_EYE_DP_NONE:
+	default: return nullptr;
+	}
 }
 
 bool

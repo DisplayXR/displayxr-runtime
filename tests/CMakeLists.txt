@@ -37,7 +37,7 @@ set(tests
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
-	     tests_comp_xbridge_plane_policy tests_comp_split_gate
+	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
 		)
 endif()
 if(XRT_HAVE_D3D12)
@@ -185,6 +185,17 @@ if(XRT_HAVE_D3D11)
 	if(TARGET comp_xbridge)
 		target_link_libraries(tests_comp_split_gate PRIVATE comp_xbridge)
 	endif()
+	# #1414 — which DP answers a client's eye query (and therefore whether an
+	# IPC rig locate reports rig_applied != 0). Pure decisions, extracted out of
+	# the service unit for exactly this reason: no device, no window, no panel,
+	# so the submit-less-client regression is assertable in ctest. The ipc
+	# include is for IPC_VIEW_RIG_NONE alone.
+	target_include_directories(
+		tests_comp_eye_dp_policy
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+			${PROJECT_SOURCE_DIR}/src/xrt/ipc
+		)
+	target_link_libraries(tests_comp_eye_dp_policy PRIVATE xrt-interfaces)
 	# Phase 2 — comp_d3d11_client.cpp now references the
 	# comp_ipc_client_compositor_{get,set}_workspace_sync_fence{,_value}
 	# bridge symbols defined in ipc_client_compositor.c. Add ipc_client to
