@@ -184,6 +184,13 @@ to self-hosted runners (unmetered on private repos) on a small always-on orchest
 **So: before privatising any repo, or moving CI into a private one, audit what its jobs
 actually *do* on the runner.** A job that waits on external hardware is the expensive shape.
 
+**Which EC2 box to stop vs leave running** — three boxes, two opposite rules, both failing
+silently (an idle builder burns ~$100/day; stopping the always-on orchestrator queues every
+build lane forever with no error). The table lives with the boxes, in `displayxr-browser-pvt`'s
+[`CLAUDE.md`](https://github.com/DisplayXR/displayxr-browser-pvt/blob/main/CLAUDE.md) §*Which
+EC2 box to stop*. Rule of thumb: check the instance's `AlwaysOn` tag before stopping anything
+to save money.
+
 Reading the numbers — `gh api /orgs/{org}/settings/billing/actions` is **410 Gone**; use
 `/organizations/DisplayXR/settings/billing/usage?year=&month=`. **Query an explicit month:**
 the no-arg default returns a rolled-up view whose per-repo attribution disagrees with the
