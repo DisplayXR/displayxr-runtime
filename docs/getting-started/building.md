@@ -392,7 +392,9 @@ Prefer VS Code over the Visual Studio IDE? It debugs the **Ninja** build (no
    **`install`** target → a Debug runtime + sim-display land in `_package\`.
 3. **Activate it (elevated, once):** `scripts\register_dev_plugin.bat` registers
    the `_package` sim-display, and point the active runtime at the Debug build:
-   `reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\DisplayXR_win64.json" /f` (or just `scripts\dev-setup.bat --no-vs`,
+   `reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\bin\DisplayXR_win64.json" /f` (note `bin\` — the top-level
+   `_package\DisplayXR_win64.json` is the installer's copy, and its `library_path`
+   only resolves once installed) (or just `scripts\dev-setup.bat --no-vs`,
    which builds + registers + activates in one shot — Release, fine for stepping
    the runtime). Verify: `_package\bin\displayxr-cli.exe selftest`.
 4. **Debug:** add a launch config (`.vscode/launch.json`, `type: cppvsdbg`) that
