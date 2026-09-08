@@ -73,6 +73,13 @@ Four consequences for this skill:
 - **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
   `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
   manual `workflow_dispatch` build lanes and never fire on a tag.
+- **NO MARKER COMMIT FOR THE BROWSER — tag the BUILT commit directly.** Phase 2's empty
+  "Release X" marker is a commit no build ran on; `publish-browser-releases.yml` resolves the
+  build runs by `headSha == the tagged commit`, so tagging a marker sends both lanes to the
+  `newest` fallback and the provenance gate then hard-fails (`source_sha` ≠ tag). Every browser
+  tag to date (0.1.26 … 0.1.31) points straight at its content commit; `preview-0.1.31`
+  (2026-09-08) was cut this way deliberately. If `main` has moved past the built commit (docs
+  landed), the tag still goes on the built commit — it is fine for it to sit behind `main`.
 - **THE TAG TRIGGER WORKS, BUT ONLY IF A BUILD RAN AT THE COMMIT YOU TAG. Arrange that
   before you tag.** The publish resolves which build to ship by matching a successful
   `build-box*.yml` run against the tagged commit, and the build lanes take their source
