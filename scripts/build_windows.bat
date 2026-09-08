@@ -44,6 +44,11 @@ if exist "%VSWHERE%" (
 set "VCVARS="
 if defined VS_INSTALL if exist "%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%VS_INSTALL%\VC\Auxiliary\Build\vcvars64.bat"
 
+:: Explicit pin: vswhere -latest returns the NEWEST Visual Studio on the box,
+:: which may be newer than the toolchain this tree is validated against. Set
+:: DXR_VCVARS to a vcvars64.bat to force a specific one.
+if defined DXR_VCVARS if exist "%DXR_VCVARS%" set "VCVARS=%DXR_VCVARS%"
+
 :: Fallback: probe the known editions if vswhere is unavailable (older installs).
 if not defined VCVARS (
     for %%E in (Community Professional Enterprise BuildTools) do (
