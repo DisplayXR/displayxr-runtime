@@ -144,7 +144,17 @@ jobs:
       # thread stop flag (LeiaInc/CNSDK#730) so leia_core_release returns —
       # on 0.10.53..0.10.66 an activity relaunch of an in-process app hung
       # forever in xrDestroySession (recents freeform toggle, 2026-09-06).
-      CNSDK_TAG: v0.10.67
+      # v0.10.68: matches leia-plugin v2.6.18. Carries LeiaInc/CNSDK#734 (the
+      # fix for CNSDK#733) — a failed weaver vkQueueSubmit now DISARMS its
+      # fence and returns false out of Apply2DEffect, with a 500 ms bounded
+      # fence wait as the net, instead of asserting and leaving the NEXT weave
+      # parked forever in vkWaitForFences. That park is #1394 (the mini-window
+      # weave stall). #1411 landed the runtime half — a DP may now report the
+      # frame as DROPPED and we discard it — and this pin is what puts a core
+      # that can actually report it under that path. It also publishes
+      # leia_interlacer_get_last_weave_result in interlacer.h, which is the
+      # entry point leia-plugin #230 reads by name.
+      CNSDK_TAG: v0.10.68
 
     steps:
 
