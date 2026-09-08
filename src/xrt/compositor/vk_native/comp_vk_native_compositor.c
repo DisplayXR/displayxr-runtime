@@ -4145,8 +4145,12 @@ vk_publish_rear_budget_zones(struct comp_vk_native_compositor *c)
 /*!
  * #1394: how many dropped-frame RUNS log verbatim before the 5 s throttle takes
  * over. Sized so a realistic episode (measured: 17 drops across 8 forced trials,
- * every one of run length 1) is reported in full, while drop/good alternation at
- * frame rate cannot produce a per-frame WARN for more than half a second.
+ * every one of run length 1) is reported in full.
+ *
+ * Worst case is drop/good alternation, where a run starts every SECOND frame:
+ * at 60 Hz that is 30 runs/s, so the verbose budget is 64 WARN lines (a
+ * run-start and a recovered line per run) spread over ~1.07 s, after which both
+ * lines fall to one per 5 s. Bounded and short-lived, never per-frame.
  */
 #define DXR_DROP_VERBOSE_RUNS 32
 
@@ -4918,6 +4922,71 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				                    : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 			}
 
+			/*
+			 * #1394: make the recycled frame DEFINED.
+			 *
+			 * The pre-weave barrier above declares oldLayout=UNDEFINED, and on
+			 * the self-submitting path it has already been submitted and waited
+			 * on BEFORE process_atlas ran — so by the time the DP tells us the
+			 * frame was dropped, the image's previous contents are formally
+			 * discarded and a tiler will not fetch the old tiles back. CNSDK
+			 * then wrote nothing and the overlays above are suppressed, so
+			 * presenting as-is shows UNDEFINED pixels: a garbage flash, varying
+			 * by driver, once per drop.
+			 *
+			 * (An earlier revision of this comment claimed FIFO would show the
+			 * older woven frame. That was wrong, and it was the justification
+			 * for the whole design — hence this clear.)
+			 *
+			 * Repeating the previous frame instead is not available: it would
+			 * need the UNDEFINED transition deferred until after the drop is
+			 * known, and it cannot be — the DP has to weave into a
+			 * COLOR_ATTACHMENT_OPTIMAL image, which is what that barrier is
+			 * for. Declaring oldLayout=PRESENT_SRC_KHR to preserve the contents
+			 * is also out: it is wrong on the self-submit path and trips
+			 * VUID-VkImageMemoryBarrier-oldLayout-01197, measured 20x per run.
+			 *
+			 * So the cost of a dropped frame is ONE BLACK FRAME, deterministic
+			 * on every driver, instead of one undefined one. Off the happy path
+			 * entirely.
+			 */
+			if (frame_dropped) {
+				const VkImageLayout drop_layout = dp_self_submits
+				                                      ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				                                      : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+				const VkImageSubresourceRange drop_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+				const VkClearColorValue black = {.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+				VkImageMemoryBarrier to_xfer = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = drop_layout,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				    .image = (VkImage)(uintptr_t)target_image,
+				    .subresourceRange = drop_range,
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &to_xfer);
+				vk->vkCmdClearColorImage(cmd, (VkImage)(uintptr_t)target_image,
+				                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1,
+				                         &drop_range);
+				// Back to whatever this path's present transition expects, so
+				// the barrier below (and the non-self-submit render pass's
+				// finalLayout contract) still see the layout they were written
+				// for.
+				VkImageMemoryBarrier from_xfer = to_xfer;
+				from_xfer.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				from_xfer.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+				from_xfer.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				from_xfer.newLayout = drop_layout;
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL,
+				                         0, NULL, 1, &from_xfer);
+			}
+
 			// A self-submitting DP (Leia CNSDK) ran its own internal
 			// render pass, whose finalLayout leaves the target in
 			// COLOR_ATTACHMENT_OPTIMAL — not PRESENT_SRC_KHR. The
@@ -4988,7 +5057,12 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		// testable the moment that synchronous wait is deferred (#837 calls
 		// that out as its own goal). Wiring it later would mean discovering
 		// this ordering constraint twice.
-		if (res == VK_SUCCESS && c->display_processor != NULL) {
+		// #1394: NOT on a dropped frame. This edge tells the DP a weave is in
+		// flight on this queue, which is what vendor late latching counts to
+		// decide it has a queued frame worth patching. On a drop there is no
+		// such frame — the only thing this submit carries is the clear-to-black
+		// above — so signalling it would hand the vendor a phantom.
+		if (res == VK_SUCCESS && !frame_dropped && c->display_processor != NULL) {
 			xrt_display_processor_vk_weave_submitted(
 			    (struct xrt_display_processor_vk *)c->display_processor, queue);
 		}
@@ -5069,7 +5143,12 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	}
 
 	// Present
-	xret = comp_vk_native_target_present(c->target, queue);
+	// #1394: `counted` false ⟹ present it, but measure nothing from it. The
+	// present itself is what hands the acquired image back; every measurement
+	// hung off it (the frame witness, the presentID chains, the residual ring
+	// the #206 horizon is derived from, and the #902 vblank grid) would
+	// otherwise be anchored on a frame that never became pixels.
+	xret = comp_vk_native_target_present(c->target, queue, /*counted=*/!frame_dropped);
 	if (xret == XRT_SUCCESS && !frame_dropped) {
 		// #1394: a dropped frame IS presented (it is the only way to give the
 		// acquired image back) but never COUNTED. present_serial is the
