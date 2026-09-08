@@ -191,6 +191,21 @@ build lane forever with no error). The table lives with the boxes, in `displayxr
 EC2 box to stop*. Rule of thumb: check the instance's `AlwaysOn` tag before stopping anything
 to save money.
 
+**Recognising a hard stop when it happens.** It does *not* surface as anything that says
+"billing". The job comes back `conclusion: failure` with **`runner: ""`** (never assigned)
+and **zero steps** — searching for `startup_failure` or `status: queued` correctly finds
+nothing and still gives you the wrong answer. Match on the empty runner:
+
+```bash
+gh api /repos/<owner>/<repo>/actions/runs/<id>/jobs \
+  --jq '.jobs[] | select(.conclusion=="failure" and (.runner_name // "")=="") | .name'
+```
+
+Confirmed against `displayxr-browser-pvt` run `34167402094`, whose `plan` job died this way
+when the September allowance ran out. **Do not confuse it with the other silent stall:** a
+job stuck in `queued` *with* `runs-on` pointing at a self-hosted label means the runner pool
+is down, not that billing stopped — opposite cause, opposite fix (see the orchestrator doc).
+
 Reading the numbers — `gh api /orgs/{org}/settings/billing/actions` is **410 Gone**; use
 `/organizations/DisplayXR/settings/billing/usage?year=&month=`. **Query an explicit month:**
 the no-arg default returns a rolled-up view whose per-repo attribution disagrees with the
