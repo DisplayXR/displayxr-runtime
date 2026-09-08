@@ -155,6 +155,40 @@ Public-repo CI is free, so `build-windows.yml` + `build-macos.yml` fire on every
 
 For tagged releases use `/release` — don't tag manually.
 
+#### Org Actions billing — "public-repo CI is free" is load-bearing, and it stops being true the moment a repo goes private
+
+The first line of this section is the whole reason CI here is unconstrained. **Only private
+repos are metered.** The org is on **GitHub Team: 3,000 Actions minutes + 2 GB Actions
+storage per month**, weighted **Linux ×1, Windows ×2, macOS ×10**, and it carries four
+spending budgets pinned to **$0 with `prevent_further_usage: true`** (`actions`, `packages`,
+`git_lfs`, `codespaces`) — so exhausting an allowance is a **hard stop across the org**, not
+an overage. This repo's ~$700/month of gross usage is 100% discounted and always will be.
+
+The three private repos share that one 3,000-unit pool:
+
+| repo | typical draw | why |
+|---|---|---|
+| `displayxr-shell-pvt` | **~1,270 units/mo** | ~89 macOS min × 10 = 890 units. **Mac CI is the expensive one** — 89 Mac minutes cost more allowance than 800 Linux minutes. |
+| `displayxr-browser-pvt` | ~310 units/mo (was ~11,400) | see below |
+| `displayxr-ml-workers` | 0 | no workflows |
+
+**The trap, and it will recur.** When `displayxr-browser` went private as
+`displayxr-browser-pvt`, its `build-box` / `build-box-android` / `pipeline.build` jobs kept
+`runs-on: ubuntu-latest` — but those jobs **compile nothing**; they start an EC2 box, SSM the
+work onto it, and `sleep`-poll for up to two hours. Free when public, metered when private:
+**3,052 units in eight days, 101% of the org's month, from one repo.** Fixed by moving them
+to self-hosted runners (unmetered on private repos) on a small always-on orchestrator box —
+`displayxr-browser-pvt`'s `scripts/aws/setup-orchestrator.sh` and
+[`docs/orchestrator-runner.md`](https://github.com/DisplayXR/displayxr-browser-pvt/blob/main/docs/orchestrator-runner.md).
+
+**So: before privatising any repo, or moving CI into a private one, audit what its jobs
+actually *do* on the runner.** A job that waits on external hardware is the expensive shape.
+
+Reading the numbers — `gh api /orgs/{org}/settings/billing/actions` is **410 Gone**; use
+`/organizations/DisplayXR/settings/billing/usage?year=&month=`. **Query an explicit month:**
+the no-arg default returns a rolled-up view whose per-repo attribution disagrees with the
+explicit query. Budgets: `/organizations/DisplayXR/settings/billing/budgets`.
+
 ### Branch protection / merging PRs
 `main` is governed by a `main-protection` ruleset (same policy across all DisplayXR repos): required CI checks (`Runtime`, `Build`, `shell-path-guard`) **+ 1 required review**, with the **repo-admin role** and the **publish-bot** App as bypass actors. Implications when merging:
 - **Non-admin PRs need 1 approving review.** GitHub **auto-merge does not exercise the admin bypass** — enabling `--auto` on an admin PR just stalls on `REVIEW_REQUIRED` even with green CI (verified). So auto-merge only completes once a review lands.
