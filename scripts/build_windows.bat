@@ -374,7 +374,7 @@ echo   launch _package\run_cube_handle_d3d11_win.bat (sets XR_RUNTIME_JSON +
 echo   has openxr_loader.dll beside the exe); attach VS, or add a debug profile
 echo   pointing at that exe with the same env.
 echo   (Folding a test app in as a one-click F5 target: WIP, see issue/PR notes
-echo   — set -DXRT_VS_LAUNCH_APP=cube_handle_d3d11_win once that lands.)
+echo   — set -DXRT_VS_LAUNCH_APP=handle/cube_handle_d3d11_win once that lands.)
 goto :done
 
 :done
