@@ -396,12 +396,13 @@ Supported entry points on that class, all `public static`:
 
 | Method | Meaning |
 |---|---|
-| `int contractVersion()` | Version of this surface. Currently **1**. |
+| `int contractVersion()` | Version of this surface. Currently **2**. |
 | `int[] computeHintForActivity(Object activity, int x, int y, int w, int h, int dispW, int dispH)` | The whole measurement. `null`, or 6 ints: `layoutW, layoutH, bufferW, bufferH, p, q`. Applies the tell and the scalable-container gate itself. |
 | `boolean isInScalableContainer(Object activity)` | The episode-END signal. Once a hint is applied the published rect fits the panel by construction, so "the hint is working" and "the window went fullscreen" are indistinguishable from geometry alone. |
 | `void resetForActivity()` | Forget the episode; the next entry re-probes. |
 | `boolean isTell(int x, int y, int w, int h, int dispW, int dispH)` | The container-scaled tell, so a caller does not re-implement it. |
 | `boolean isBindingTell(...)` | `isTell` plus the mid-rotation (panel-transposed) reject. |
+| `boolean isTransposedPanel(int w, int h, int dispW, int dispH)` | **Since version 2.** True when the extent is exactly the panel transposed — a mid-rotation sample, not a scaled container. A caller sampling its own geometry sees the same transient, so this is the measured rule for discarding it. |
 | `boolean isEnabled()` | `debug.dxr.miniwindow_1to1`. |
 
 Units are exactly as in §2.5: the rect is a **physical** origin with a

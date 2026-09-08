@@ -77,6 +77,10 @@ import androidx.annotation.Nullable;
  *       int, int, int, int, int)} — the container-scaled tell, so a caller does not re-implement
  *       it. Mirrored in C by {@code android_mini_window_is_tell()}; the two are pinned against
  *       each other by {@code tests_aux_mini_window_tell} (#1401).
+ *   <li>{@code boolean isTransposedPanel(int w, int h, int dispW, int dispH)} — SINCE VERSION 2.
+ *       True when the extent is exactly the panel transposed, i.e. a mid-rotation sample rather
+ *       than a scaled container. A cross-APK caller samples its own geometry and so sees the same
+ *       transient; this is the measured rule for discarding it (runtime#1399).
  * </ul>
  *
  * <p><b>Types.</b> Nothing runtime-internal crosses the boundary: {@code Object} in (the caller's
@@ -185,8 +189,12 @@ public final class MiniWindowLayout {
      *
      * <p>1 — the initial surface: computeHintForActivity, isInScalableContainer, resetForActivity,
      * isTell, isBindingTell, HINT_LAYOUT_W..HINT_RAT_Q.
+     *
+     * <p>2 — adds {@link #isTransposedPanel} (runtime#1399). Purely additive, which is what the
+     * append-only rule requires: everything version 1 documented still exists, unchanged, so a
+     * caller written against 1 keeps working against 2 without asking.
      */
-    private static final int CONTRACT_VERSION = 1;
+    private static final int CONTRACT_VERSION = 2;
 
     /** @return {@link #CONTRACT_VERSION}. Cheap, pure, callable from any thread. */
     @Keep
