@@ -123,14 +123,24 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 /*!
  * Present the rendered image.
  *
- * @param target The target.
+ * @param target  The target.
+ * @param queue   Queue to present on.
+ * @param counted Whether this frame should be MEASURED as well as presented.
+ *                Pass false only for a #1394 recycle: a frame the display
+ *                processor dropped is still presented, because that is the only
+ *                way to hand its acquired swapchain image back, but it never
+ *                became pixels — so it must not enter the frame witness, be
+ *                tagged with a present id, occupy a residual_ring slot (which
+ *                is what @ref comp_vk_native_target_weave_to_scanout_ns derives
+ *                the #206 horizon from), or anchor the #902 vblank grid.
+ *                Every ordinary present passes true.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
  * @ingroup comp_vk_native
  */
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue);
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted);
 
 /*!
  * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the

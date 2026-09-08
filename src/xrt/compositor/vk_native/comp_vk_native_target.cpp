@@ -246,6 +246,56 @@ dxr_surface_lost_latch_enabled(void)
 }
 #endif
 
+/*!
+ * #1394: optional BOUND on vkAcquireNextImageKHR, in nanoseconds.
+ *
+ * Both acquires below pass UINT64_MAX, which is an unbounded wait taken on the
+ * weave thread while it holds c->mutex — the exact shape the workspace-stability
+ * rules exist to forbid. It is reachable whenever the acquire budget is
+ * exhausted, which is what a stranded swapchain image does (see the #1394 drop
+ * branch in vk_dp_weave_and_present; that path no longer strands one, and this
+ * is the belt for the braces).
+ *
+ * DEFAULT IS UNCHANGED — 0 means UINT64_MAX, i.e. today's behaviour on every
+ * platform. This is off by default on purpose: FIFO acquire legitimately blocks
+ * until a vsync frees an image, and much longer than that when the window is
+ * backgrounded or the device is dozing, so any finite value risks turning a
+ * normal stall into an error storm. Shipping it armed would be an unvalidated
+ * behaviour change on a hot path for Windows, macOS and Linux as well as
+ * Android. Same reasoning as #1397's off-by-default guard: the mechanism exists
+ * and is one setprop away for a hardware session that needs it.
+ *
+ *   adb shell setprop debug.dxr.vk_acquire_timeout_ms 1000
+ *   DXR_VK_ACQUIRE_TIMEOUT_MS=1000
+ */
+static uint64_t
+dxr_acquire_timeout_ns(void)
+{
+	static int64_t cached = -1;
+	if (cached < 0) {
+		long ms = 0;
+		const char *e = getenv("DXR_VK_ACQUIRE_TIMEOUT_MS");
+		if (e != NULL && e[0] != '\0') {
+			ms = strtol(e, NULL, 10);
+		}
+#ifdef XRT_OS_ANDROID
+		if (ms <= 0) {
+			char prop[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.vk_acquire_timeout_ms", prop) > 0) {
+				ms = strtol(prop, NULL, 10);
+			}
+		}
+#endif
+		cached = ms > 0 ? ms : 0;
+		if (cached > 0) {
+			U_LOG_W("#1394: vkAcquireNextImageKHR bounded at %ld ms (default is an "
+			        "unbounded wait; a timeout fails the frame)",
+			        (long)cached);
+		}
+	}
+	return cached > 0 ? (uint64_t)cached * 1000000ULL : UINT64_MAX;
+}
+
 // Desktop Linux (X11/XCB). Android also defines XRT_OS_LINUX but uses
 // VK_KHR_android_surface, so the XCB path is gated on "Linux AND NOT Android".
 #if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
@@ -3064,7 +3114,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-	                                          UINT64_MAX, target->image_available,
+	                                          dxr_acquire_timeout_ns(), target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
@@ -3128,7 +3178,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 
 		// Retry acquire with new swapchain
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-		                                 UINT64_MAX, target->image_available,
+		                                 dxr_acquire_timeout_ns(), target->image_available,
 		                                 VK_NULL_HANDLE, &target->current_index);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
@@ -3164,6 +3214,30 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			return XRT_ERROR_VULKAN;
 		}
 #endif
+		/*
+		 * #1394: VK_TIMEOUT is only reachable when dxr_acquire_timeout_ns() has
+		 * been armed, and it is NOT an error in the way the codes below it are
+		 * — it means the presentation engine had no image ready inside the
+		 * bound, which under FIFO is a normal (if slow) state. Falling into the
+		 * generic branch would emit an unthrottled U_LOG_E every frame for as
+		 * long as the condition lasted, i.e. exactly the error storm the knob's
+		 * own documentation warns about. Report it at most once per 5 s, with a
+		 * running count, and still fail the frame.
+		 */
+		if (res == VK_TIMEOUT || res == VK_NOT_READY) {
+			static uint64_t s_timeouts = 0;
+			static uint64_t s_last_log_ns = 0;
+			const uint64_t now_ns = os_monotonic_get_ns();
+			s_timeouts++;
+			if (s_timeouts == 1 || now_ns - s_last_log_ns > 5ULL * 1000 * 1000 * 1000) {
+				s_last_log_ns = now_ns;
+				U_LOG_W("#1394: vkAcquireNextImageKHR timed out (%llu so far) — the frame "
+				        "is failed. Only reachable with the acquire bound armed; set it "
+				        "to 0 to restore the unbounded wait.",
+				        (unsigned long long)s_timeouts);
+			}
+			return XRT_ERROR_VULKAN;
+		}
 		U_LOG_E("Failed to acquire swapchain image: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
@@ -3188,14 +3262,20 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 }
 
 xrt_result_t
-comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue)
+comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted)
 {
 	struct vk_bundle *vk = target->vk;
 
 	// Witness counts at the dispatch point so the DComp-bridge path (which
 	// never reaches the WSI present below) is counted too — the whole point
 	// of the witness is holding on paths the latency harness cannot see.
-	g_frame_witness_vk.count_present();
+	//
+	// #1394: not for an uncounted present. That one exists only to hand a
+	// dropped frame's swapchain image back, and a frame that never became
+	// pixels must not appear in the witness's population.
+	if (counted) {
+		g_frame_witness_vk.count_present();
+	}
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
@@ -3221,7 +3301,10 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	struct wl_harness *wl = wl_get(target);
 	uint64_t wl_id = 0;
 	VkPresentIdKHR present_id = {};
-	if ((wl != nullptr || dxr_late_weave_enabled()) && target_present_wait_fn(target) != nullptr) {
+	// #1394: an uncounted present is never tagged — a present id issued for a
+	// dropped frame would be waited on and timed as if it had reached glass.
+	if (counted && (wl != nullptr || dxr_late_weave_enabled()) &&
+	    target_present_wait_fn(target) != nullptr) {
 		wl_id = ++target->present_id_counter;
 		present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
 		present_id.swapchainCount = 1;
@@ -3249,7 +3332,11 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	 */
 	VkPresentTimeGOOGLE present_time = {};
 	VkPresentTimesInfoGOOGLE present_times = {};
-	if (vk->has_GOOGLE_display_timing && present_info.pNext == NULL) {
+	// #1394: uncounted ⟹ no presentID and no residual_ring slot. This ring is
+	// exactly what comp_vk_native_target_weave_to_scanout_ns() derives the #206
+	// horizon from, so anchoring a dropped frame here would feed the vendor
+	// predictor a scanout that never happened.
+	if (counted && vk->has_GOOGLE_display_timing && present_info.pNext == NULL) {
 		present_time.presentID = ++target->display_timing_present_id;
 		present_time.desiredPresentTime = 0;
 		present_times.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
@@ -3268,7 +3355,12 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a
 	// failure here never affects the present's own result.
-	if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
+	//
+	// #1394: "what actually reached the panel" is the whole point, so an
+	// uncounted present anchors nothing — neither the grid nor the weave-cost
+	// budget the late-weave sleep aims with. target->weave_start_ns is left
+	// alone; the next weave overwrites it before the next counted present.
+	if (counted && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
 		target_feed_vblank_grid(target);
 
 		/*
