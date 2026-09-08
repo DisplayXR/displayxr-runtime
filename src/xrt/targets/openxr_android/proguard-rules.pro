@@ -20,6 +20,10 @@
 # right now. It is here so that turning minification on later cannot quietly
 # break the contract — the failure it prevents is invisible from inside this
 # repo. Asserted on the built release APK by scripts/check_mini_window_contract.sh.
+# The wildcard is deliberate: every PUBLIC STATIC member of this class is part of
+# the contract by construction, so a method added later (isTransposedPanel at
+# contract version 2, runtime#1399) is covered the moment it is written. A list of
+# individual signatures here would be a second place to forget.
 -keep class org.freedesktop.monado.auxiliary.MiniWindowLayout {
     public static <methods>;
     public static <fields>;

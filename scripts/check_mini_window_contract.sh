@@ -59,6 +59,7 @@ isInScalableContainer	(Ljava/lang/Object;)Z
 resetForActivity	()V
 isTell	(IIIIII)Z
 isBindingTell	(IIIIII)Z
+isTransposedPanel	(IIII)Z
 isEnabled	()Z
 EOF
 

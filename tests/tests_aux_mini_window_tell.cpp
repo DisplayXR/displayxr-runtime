@@ -554,27 +554,87 @@ TEST_CASE("mini-window tell: MiniWindowLayout.isTell agrees with the C helper")
 	}
 }
 
-TEST_CASE("mini-window tell: the binding predicate still rejects a transposed panel")
+TEST_CASE("mini-window tell: MiniWindowLayout.isTransposedPanel agrees with the measured rule")
 {
 	/*
-	 * `isBindingTell` is isTell PLUS the rotation-transient reject, and that
-	 * reject is a guard clause rather than part of the expression — so it is
-	 * pinned by shape, not by the evaluator. It exists because a mid-rotation
-	 * sample (`window 1757,236 1600x2560, panel 2560x1600`) spills, trips the
-	 * raw tell, and latched a bogus 0.4469 scale on the NP02J. Deliberately NOT
-	 * on the hosted path: runtime#1399.
+	 * SEMANTIC, like isTell (runtime#1399). This predicate has no C counterpart
+	 * to compare against — it is a Java-only rule — so the pin is the Java
+	 * expression evaluated against a table of numbers that were measured or
+	 * reasoned about, rather than a substring of its source.
+	 *
+	 * What it encodes: an extent that is EXACTLY the panel transposed is a
+	 * sample taken mid-rotation, not a container scale. Measured on the NP02J as
+	 * `window 1757,236 1600x2560, panel 2560x1600`, which spills (so it trips
+	 * the raw tell) and whose vendor Rect yields a plausible-looking 0.4469 that
+	 * latched a 715x1144 buffer and wove the app at the wrong size.
+	 */
+	struct TCase
+	{
+		const char *name;
+		int64_t w, h, dispW, dispH;
+		bool expect;
+	};
+	// clang-format off
+	const TCase tcases[] = {
+	    // The measured transient, both rotations of it.
+	    {"panel transposed (landscape panel)",   1600, 2560, 2560, 1600, true},
+	    {"panel transposed (portrait panel)",    2560, 1600, 1600, 2560, true},
+	    // A real scaled container reports the CONTAINER's logical size, never
+	    // the panel's transpose. This is the case that must survive.
+	    {"real np02j mini-window",               1080, 1685, 2560, 1600, false},
+	    {"real mini-window, portrait",           1685, 1080, 1600, 2560, false},
+	    // Fullscreen is the panel, not its transpose.
+	    {"fullscreen",                           2560, 1600, 2560, 1600, false},
+	    // One axis matching is not a transpose; requiring BOTH is the point.
+	    {"only width matches dispH",             1600, 1000, 2560, 1600, false},
+	    {"only height matches dispW",            1000, 2560, 2560, 1600, false},
+	    // A SQUARE panel makes transpose and identity the same thing. Answering
+	    // true there would discard a legitimate fullscreen sample, so this row
+	    // pins which way that ambiguity resolves.
+	    {"square panel, extent equals panel",    1600, 1600, 1600, 1600, true},
+	    // Never decide on ignorance: no panel extent yet.
+	    {"no panel extent",                      1600, 2560,    0,    0, false},
+	    {"panel width missing only",             1600, 2560,    0, 1600, false},
+	    {"panel height missing only",            1600, 2560, 2560,    0, false},
+	    // The rows above do NOT actually exercise the `dispW > 0 && dispH > 0`
+	    // guard: none of them makes BOTH equalities hold, so the guard is not
+	    // load-bearing for them and dropping it survives. These two do — a zero
+	    // extent against a zero panel axis satisfies `w == dispH` and
+	    // `h == dispW` by coincidence, and only the guard keeps the answer
+	    // false. (Same shape of gap as the two mutants the #1408 review found.)
+	    {"zero w against zero dispH",               0, 2560, 2560,    0, false},
+	    {"zero h against zero dispW",            1600,    0,    0, 1600, false},
+	};
+	// clang-format on
+
+	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
+	const std::string expr = lastReturnExpression(extractMethodBody(src, "isTransposedPanel"));
+	INFO("Java isTransposedPanel expression: " << expr);
+	const std::vector<std::string> toks = tokenize(expr);
+	REQUIRE_FALSE(toks.empty());
+
+	for (const TCase &c : tcases) {
+		INFO("case: " << c.name);
+		Env env{0, 0, c.w, c.h, c.dispW, c.dispH};
+		Parser parser(toks, env);
+		CHECK((parser.parse() != 0) == c.expect);
+	}
+}
+
+TEST_CASE("mini-window tell: isBindingTell composes the transposed reject with the tell")
+{
+	/*
+	 * The COMPOSITION, evaluated rather than grepped (runtime#1399).
+	 *
+	 * `isBindingTell` is a two-statement method, so the expression evaluator
+	 * cannot consume it whole. Instead: evaluate BOTH leaf predicates out of the
+	 * Java, compose them here as the method claims to
+	 * (`!isTransposedPanel(...) && isTell(...)`), and check that against a table.
+	 * The one thing still pinned by SHAPE is that the method really is that
+	 * composition — asserted below — and that assertion is narrow enough to be
+	 * honest about: it cannot see a reordering that preserves the text.
 	 */
 	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
-
-	std::string flatFile;
-	for (char c : src) {
-		if (std::isspace(static_cast<unsigned char>(c)) == 0) {
-			flatFile.push_back(c);
-		}
-	}
-	// The comparison itself, wherever it lives — inline in isBindingTell, or
-	// behind a named helper that the hosted path also uses (runtime#1399).
-	CHECK(flatFile.find("w==dispH&&h==dispW") != std::string::npos);
 
 	std::string flatBody;
 	for (char c : extractMethodBody(src, "isBindingTell")) {
@@ -583,8 +643,46 @@ TEST_CASE("mini-window tell: the binding predicate still rejects a transposed pa
 		}
 	}
 	INFO("isBindingTell body (whitespace stripped): " << flatBody);
-	// It must REJECT (rather than, say, log), and it must still delegate the
-	// rest of the decision to the one copy above.
+	// It must REJECT (not, say, log), it must reject on the shared predicate,
+	// and it must delegate the rest to the one copy of the tell.
+	CHECK(flatBody.find("isTransposedPanel(w,h,dispW,dispH)") != std::string::npos);
 	CHECK(flatBody.find("returnfalse;") != std::string::npos);
 	CHECK(flatBody.find("isTell(x,y,w,h,dispW,dispH)") != std::string::npos);
+
+	const std::vector<std::string> tellToks = tokenize(lastReturnExpression(extractMethodBody(src, "isTell")));
+	const std::vector<std::string> transToks =
+	    tokenize(lastReturnExpression(extractMethodBody(src, "isTransposedPanel")));
+
+	struct BCase
+	{
+		const char *name;
+		int32_t x, y;
+		int64_t w, h, dispW, dispH;
+		bool expect;
+	};
+	// clang-format off
+	const BCase bcases[] = {
+	    // THE case this exists for: the mid-rotation sample spills the panel, so
+	    // the raw tell says true, and the binding predicate must still say false.
+	    {"mid-rotation transient",     1757,  236, 1600, 2560, 2560, 1600, false},
+	    // A real mini-window is not transposed, so the reject must not eat it.
+	    {"real np02j mini-window",     1757,  236, 1080, 1685, 2560, 1600, true},
+	    {"real mini-window, portrait",  797,  716, 1685, 1080, 1600, 2560, true},
+	    // Fullscreen: neither transposed nor spilling.
+	    {"fullscreen",                    0,    0, 2560, 1600, 2560, 1600, false},
+	    // Applied hint: physical rect, fits, so false by the tell alone.
+	    {"applied hint, physical rect", 1757,  236,  723, 1129, 2560, 1600, false},
+	    // Dragged off-panel and NOT transposed: still a tell.
+	    {"dragged off the left edge",   -40,  100,  800,  600, 2560, 1600, true},
+	};
+	// clang-format on
+
+	for (const BCase &c : bcases) {
+		INFO("case: " << c.name);
+		Env env{c.x, c.y, c.w, c.h, c.dispW, c.dispH};
+		Parser tellP(tellToks, env);
+		Parser transP(transToks, env);
+		const bool composed = (transP.parse() == 0) && (tellP.parse() != 0);
+		CHECK(composed == c.expect);
+	}
 }

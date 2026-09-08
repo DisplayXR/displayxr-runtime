@@ -279,6 +279,8 @@ public class MonadoView extends SurfaceView
     private boolean miniOneToOneApplied = false;
     private int miniBufW = 0;
     private int miniBufH = 0;
+    /** One WARN per run of transposed samples, never one per frame (runtime#1399). */
+    private boolean transposedSampleLogged = false;
 
     /**
      * Sample this view's on-screen rect once per frame and report changes (ADR-036 D6, #1033).
@@ -382,6 +384,45 @@ public class MonadoView extends SurfaceView
             dispW = real.x;
             dispH = real.y;
         }
+        /*
+         * runtime#1399: a sample whose window extent is EXACTLY the panel transposed
+         * is a mid-rotation artefact, not a container scale — the location and the
+         * Display have updated while the extent has not. #1398 rejected it on the
+         * surface-binding path (where it measurably latched a bogus 0.4469 scale) and
+         * deliberately left the hosted path alone, on the ARGUMENT that a single
+         * laid-out view cannot show the inconsistency.
+         *
+         * SKIPPED, not rejected. The "reject" shape on this path would fall into the
+         * OFF branch of updateMiniWindowOneToOne, which runs restoreLayoutToWindow()
+         * + setSizeFromLayout() — a surface resize, possibly under an in-flight
+         * weave, i.e. the exact class of change that parks the vendor weave in
+         * vkWaitForFences (#1394) and the reason debug.dxr.miniwindow_1to1 is cached
+         * per process. Doing NOTHING for one Choreographer frame cannot wedge
+         * anything: no publish, no recompute, no episode ended, and the next frame
+         * carries a consistent pair.
+         *
+         * Logged once per occurrence-run so the device pass can say whether this
+         * fires at all on the hosted path, rather than the code implying it does.
+         */
+        if (MiniWindowLayout.isTransposedPanel(w, h, dispW, dispH)) {
+            if (!transposedSampleLogged) {
+                transposedSampleLogged = true;
+                Log.w(
+                        TAG,
+                        "windowRect: ignoring a transposed sample — window "
+                                + w
+                                + "x"
+                                + h
+                                + " is exactly the panel "
+                                + dispW
+                                + "x"
+                                + dispH
+                                + " transposed, i.e. mid-rotation (#1399)");
+            }
+            return;
+        }
+        transposedSampleLogged = false;
+
         // #1277/#1367 S9: in an OEM-scaled container the numbers above are the
         // window's LOGICAL size; the on-screen extent is scale x that. Re-size the
         // surface's buffer to the physical extent and publish THAT, so every
