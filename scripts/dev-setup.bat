@@ -166,7 +166,10 @@ echo   running %LEIA_EXE% /S ...
 exit /b %ERRORLEVEL%
 
 :set_active_runtime
-set "MANIFEST=%REPO%\_package\DisplayXR_win64.json"
+REM _package\bin (not the top level): the top-level manifest is written for the
+REM installer's flat layout, so in the staging tree its library_path points at a
+REM DLL that isn't there. See src/xrt/targets/openxr/CMakeLists.txt (#852).
+set "MANIFEST=%REPO%\_package\bin\DisplayXR_win64.json"
 if not exist "%MANIFEST%" ( echo   WARN: %MANIFEST% missing; skipping active-runtime change. & exit /b 0 )
 REM Back up the current ActiveRuntime once, so --clean can restore it.
 for /f "tokens=2,*" %%A in ('reg query "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime 2^>nul ^| find "ActiveRuntime"') do set "PREV=%%B"

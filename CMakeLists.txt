@@ -609,11 +609,16 @@ if(XRT_VS_LAUNCH_APP)
 			)
 		if(TARGET ${XRT_VS_LAUNCH_APP})
 			# F5 uses the freshly-installed dev runtime manifest. Build the
-			# INSTALL target first so this path exists.
+			# INSTALL target first so this path exists. The manifest next to
+			# the DLL, not the top-level one -- see
+			# src/xrt/targets/openxr/CMakeLists.txt (#852).
+			set(_dev_runtime_manifest
+			    "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/DisplayXR_win64.json"
+				)
 			set_target_properties(
 				${XRT_VS_LAUNCH_APP}
 				PROPERTIES VS_DEBUGGER_ENVIRONMENT
-					   "XR_RUNTIME_JSON=${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json"
+					   "XR_RUNTIME_JSON=${_dev_runtime_manifest}"
 				)
 			# Make it the solution's default startup project.
 			set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT ${XRT_VS_LAUNCH_APP})
