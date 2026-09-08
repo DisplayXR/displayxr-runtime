@@ -47,9 +47,14 @@ qwerty_set_bridge_relay_active(bool active)
 	g_qwerty_bridge_relay_active = active;
 }
 
-#define QWERTY_HMD_INITIAL_MOVEMENT_SPEED 0.002f // in meters per frame
-#define QWERTY_HMD_INITIAL_LOOK_SPEED 0.02f      // in radians per frame
-#define QWERTY_CONTROLLER_INITIAL_MOVEMENT_SPEED 0.005f
+// Human-scale locomotion for metre-scale scenes (the legacy/hosted default): a
+// walk of 1.4 m/s, and Shift (SPRINT_STEPS of MOVEMENT_SPEED_STEP = x3.05) a run
+// of ~4.3 m/s. Speeds are "per 60 Hz frame" and time-scaled at integration.
+// The old 0.002 (0.12 m/s) was tuned for tabletop-sized content and read as
+// crawling in any room-scale WebXR/VR title; +/- still rescale it live.
+#define QWERTY_HMD_INITIAL_MOVEMENT_SPEED 0.0233f // in meters per frame (1.4 m/s)
+#define QWERTY_HMD_INITIAL_LOOK_SPEED 0.02f       // in radians per frame
+#define QWERTY_CONTROLLER_INITIAL_MOVEMENT_SPEED 0.01f // 0.6 m/s hand travel
 #define QWERTY_CONTROLLER_INITIAL_LOOK_SPEED 0.05f
 #define MOVEMENT_SPEED_STEP 1.25f // Multiplier for how fast will mov speed increase/decrease
 #define SPRINT_STEPS 5            // Amount of MOVEMENT_SPEED_STEPs to increase when sprinting
