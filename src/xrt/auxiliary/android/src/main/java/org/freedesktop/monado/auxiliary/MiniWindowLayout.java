@@ -270,6 +270,27 @@ public final class MiniWindowLayout {
     private boolean touchDownValid = false;
 
     /**
+     * Window geometry latched at ACTION_DOWN, and whether it has moved since (#1424).
+     *
+     * <p>The touch ratio is {@code |Δraw| / |Δlocal|} across one drag, which is the container scale
+     * ONLY while the container holds still. The OEM's drop-zone entry gesture is itself a drag that
+     * MOVES the window, so the local frame shifts under the finger and the quotient means nothing:
+     * measured on the pad, that gesture produced <b>0.3700027</b> against a true 0.67, which then
+     * lost to the vendor API in the cross-check and dropped a correctly-hinted window back to flat
+     * 2D three seconds after it had started weaving (#1424 eyeball #2).
+     *
+     * <p>So a drag that straddles a geometry change is discarded by construction. The 40 px minimum
+     * span stays: it rejects a tap, this rejects a MOVING window, and they are different faults.
+     */
+    private int touchDownRectX = 0;
+    private int touchDownRectY = 0;
+    private int touchDownRectW = 0;
+    private int touchDownRectH = 0;
+    private boolean touchDownRectValid = false;
+    private boolean touchStraddledGeometry = false;
+    private boolean touchStraddleLogged = false;
+
+    /**
      * "This window is being scaled by its container."
      *
      * <p>The window is laid out at its LOGICAL size but placed at its PHYSICAL origin, so a window
@@ -386,6 +407,9 @@ public final class MiniWindowLayout {
         touchScale = 0f;
         touchScaleSpan = 0f;
         touchDownValid = false;
+        touchDownRectValid = false;
+        touchStraddledGeometry = false;
+        touchStraddleLogged = false;
         crossChecked = false;
         scaleSource = null;
     }
@@ -419,27 +443,46 @@ public final class MiniWindowLayout {
         float api = queryVendorWrScale(activity, w, h, dispW, dispH);
         float touch = touchScale;
 
-        if (api > 0f && touch > 0f) {
-            if (Math.abs(api - touch) > 0.01f) {
-                if (!scaleMismatchLogged) {
-                    scaleMismatchLogged = true;
-                    Log.w(
-                            TAG,
-                            "miniWindow1to1: vendor-api scale "
-                                    + api
-                                    + " disagrees with the measured touch ratio "
-                                    + touch
-                                    + " — accessibility magnification, or a firmware change. "
-                                    + "Staying on the 2D fallback rather than picking one.");
-                }
-                return 0f;
-            }
-            if (!crossChecked) {
-                crossChecked = true;
-                Log.i(
-                        TAG,
-                        "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
-            }
+        /*
+         * #1424: the vendor API WINS when it answers plausibly. A disagreement is
+         * logged, once, with both values -- and then ignored.
+         *
+         * It used to discard BOTH sources and drop to the 2D fallback, on the
+         * reasoning that a disagreement means accessibility magnification or a
+         * firmware change and neither is a number to guess at. Measured on the pad,
+         * that reasoning had the sign backwards: the touch ratio is the fragile
+         * input, not the API. The OEM's drop-zone entry gesture is a drag that MOVES
+         * the window, so it yielded 0.3700027 against the API's correct 0.67020005,
+         * and a window that had been weaving 1:1 for three seconds was thrown back to
+         * flat 2D by the bogus one (#1424 eyeball #2, 16:49:23 -> 16:49:26).
+         *
+         * The straddle guard in noteWindowGeometry should stop that sample being
+         * taken at all; this is the second line of defence, and it is the one that
+         * decides which source is authoritative when they still differ. The vendor
+         * Rect is a direct read of the placement the window manager applied; the
+         * touch ratio is inferred from two coordinate spaces across a gesture. When
+         * both are available, trust the direct read.
+         *
+         * The disagreement is still worth a line: on a device where the API is wrong,
+         * this log is the evidence, and it now costs a log line instead of the
+         * feature.
+         */
+        if (api > 0f && touch > 0f && Math.abs(api - touch) > 0.01f && !scaleMismatchLogged) {
+            scaleMismatchLogged = true;
+            Log.w(
+                    TAG,
+                    "miniWindow1to1: vendor-api scale "
+                            + api
+                            + " disagrees with the measured touch ratio "
+                            + touch
+                            + " — using the vendor API (a direct read of the placement) and"
+                            + " ignoring the touch ratio, which a drag across the container"
+                            + " transition can poison. If the WEAVE is wrong at this scale, the"
+                            + " API is the thing to doubt (#1424)");
+        }
+        if (api > 0f && touch > 0f && Math.abs(api - touch) <= 0.01f && !crossChecked) {
+            crossChecked = true;
+            Log.i(TAG, "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
         }
 
         if (api > 0f) {
@@ -712,6 +755,37 @@ public final class MiniWindowLayout {
      * surface-binding path (#1396) never sees the app's MotionEvents, so it is vendor-API only —
      * unless the app itself measures the ratio and forwards it, which the spec leaves open.
      */
+    /**
+     * Tell the ratio measurement that the window's geometry changed (#1424).
+     *
+     * <p>Called from the geometry sampler on every rect it sees, INCLUDING the ones it skips as
+     * torn or transposed — a skipped sample is still evidence that the window is in motion, which
+     * is exactly what invalidates an in-flight drag. Cheap: four int compares.
+     */
+    public void noteWindowGeometry(int x, int y, int w, int h) {
+        if (touchDownRectValid && (x != touchDownRectX || y != touchDownRectY || w != touchDownRectW
+                || h != touchDownRectH)) {
+            touchStraddledGeometry = true;
+            if (!touchStraddleLogged) {
+                touchStraddleLogged = true;
+                Log.i(
+                        TAG,
+                        "miniWindow1to1: discarding the in-flight touch ratio — the window moved"
+                                + " under the drag ("
+                                + touchDownRectX + "," + touchDownRectY + " "
+                                + touchDownRectW + "x" + touchDownRectH
+                                + " -> " + x + "," + y + " " + w + "x" + h
+                                + "); that drag is the container transition, not a measurement"
+                                + " inside a settled window (#1424)");
+            }
+        }
+        touchDownRectX = x;
+        touchDownRectY = y;
+        touchDownRectW = w;
+        touchDownRectH = h;
+        touchDownRectValid = true;
+    }
+
     public void measureTouchScale(android.view.MotionEvent ev) {
         final int action = ev.getActionMasked();
         if (action == android.view.MotionEvent.ACTION_DOWN) {
@@ -720,6 +794,7 @@ public final class MiniWindowLayout {
             touchDownX = ev.getX();
             touchDownY = ev.getY();
             touchDownValid = true;
+            touchStraddledGeometry = false;
             return;
         }
         if (!touchDownValid
@@ -729,6 +804,11 @@ public final class MiniWindowLayout {
         }
         if (action == android.view.MotionEvent.ACTION_UP) {
             touchDownValid = false;
+        }
+        if (touchStraddledGeometry) {
+            // The window moved during this drag: the local frame shifted under the
+            // finger, so the quotient is not a scale. See noteWindowGeometry.
+            return;
         }
         float localSpan = Math.abs(ev.getX() - touchDownX) + Math.abs(ev.getY() - touchDownY);
         if (localSpan < TOUCH_MIN_SPAN_PX) {

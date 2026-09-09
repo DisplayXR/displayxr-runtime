@@ -538,8 +538,10 @@ struct comp_vk_native_target
 	 *
 	 * TWO tallies, because they mean opposite things. HARD failures (negative
 	 * VkResult: OUT_OF_DATE, SURFACE_LOST, ...) arm the WARN. VK_SUBOPTIMAL_KHR
-	 * does NOT: it is a success code, and MEASURED on device it fires on every
-	 * frame of a healthy mini-window (~46/s against a live ~42/s weave), so
+	 * does NOT: it is a success code, and MEASURED on device it fires on
+	 * EVERY present in EVERY mode -- ~48/s in plain FULLSCREEN as much as ~46/s in
+	 * a mini-window, against a live ~45-49/s weave, with only 2 acquire failures
+	 * in 122k presents -- so
 	 * treating it as a fault made this diagnostic pure noise in the one place it
 	 * was built for. It is reported as CONTEXT on the hard-failure line instead.
 	 *
@@ -2855,11 +2857,11 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 	/*
 	 * VK_SUBOPTIMAL_KHR is a SUCCESS code -- the frame DID reach the
 	 * presentation engine; the swapchain is merely no longer an ideal match for
-	 * the surface. MEASURED (#1424 device leg): in an OEM mini-window present
-	 * returns it on essentially EVERY frame, ~46/s, while the weave publishes
-	 * ~42/s and the picture is perfectly live -- on the plain recents-icon
-	 * window as much as the off-panel one. So it is the mini-window's normal
-	 * steady state and must never be a reason to warn.
+	 * the surface. MEASURED (#1424 device leg): on this device present returns it
+	 * on essentially EVERY frame in EVERY mode -- ~48/s in plain fullscreen, ~46/s
+	 * in a mini-window, against a live ~45-49/s weave, with 2 acquire failures in
+	 * 122k presents. It is the device's permanent normal, not a mini-window
+	 * quirk, and must never be a reason to warn.
 	 *
 	 * Counted for context and returning WITHOUT touching the throttle, which is
 	 * the load-bearing part: were it to arm the throttle, a healthy mini-window
@@ -2888,8 +2890,8 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 	target->swap_diag_last_log_ns = now;
 	U_LOG_W("SWAP_DIAG: %llu HARD failure(s) in the last window (acquire %llu, present %llu total) — "
 	        "last %s returned VkResult %d. [%llu VK_SUBOPTIMAL_KHR in the same window, %llu total: "
-	        "SUBOPTIMAL on every frame is NORMAL in a scaled/mini window, it is context here, not a "
-	        "fault.] A burst of hard failures around a resize or rotation is expected -- it precedes "
+	        "SUBOPTIMAL on every present is NORMAL on this device in EVERY mode, fullscreen included; "
+	        "it is context here, not a fault.] A burst of hard failures around a resize or rotation is expected -- it precedes "
 	        "the recreate. A SUSTAINED stream of them while the image is not updating is the freeze "
 	        "signal (#1424)",
 	        (unsigned long long)target->swap_diag_err_since_log,

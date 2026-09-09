@@ -390,6 +390,15 @@ public class MonadoView extends SurfaceView
             dispH = real.y;
         }
         /*
+         * #1424: tell the ratio measurement what the geometry is BEFORE any skip
+         * returns. A torn or transposed sample is still proof that the window is in
+         * motion, and a drag in flight across that motion cannot be a scale
+         * measurement -- so the skip paths must feed this too, or the very gesture
+         * that creates the mini-window poisons the ratio it is about to need.
+         */
+        miniLayout.noteWindowGeometry(x, y, w, h);
+
+        /*
          * runtime#1399: a sample whose window extent is EXACTLY the panel transposed
          * is a mid-rotation artefact, not a container scale — the location and the
          * Display have updated while the extent has not. #1398 rejected it on the

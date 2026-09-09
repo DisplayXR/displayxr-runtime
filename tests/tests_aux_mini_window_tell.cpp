@@ -764,3 +764,78 @@ TEST_CASE("mini-window tell: container-scaled degrade separates scale from place
 		}
 	}
 }
+
+/*
+ * runtime#1424 eyeball #2: the SCALE-SOURCE contract.
+ *
+ * These two rules cost a correctly-hinted, already-weaving window three seconds
+ * of life on the pad, so they are pinned:
+ *
+ *   1. A drag that STRADDLES a window-geometry change is not a scale
+ *      measurement. The OEM's drop-zone entry gesture is exactly such a drag --
+ *      it MOVES the window under the finger -- and it produced a touch ratio of
+ *      0.3700027 against a true 0.67020005.
+ *   2. When both sources answer, the VENDOR API wins. It is a direct read of the
+ *      placement the window manager applied; the touch ratio is inferred across
+ *      two coordinate spaces during a gesture. The old code discarded BOTH on
+ *      disagreement and fell back to flat 2D, which is how the bogus 0.37 threw
+ *      away the good 0.67.
+ *
+ * STRUCTURAL, and labelled as such: this is a Java source contract that the C
+ * side cannot execute, so — exactly like the isTell parse above — the test reads
+ * the source (comments blanked first, for the reason documented on
+ * stripComments) and asserts the shape. It is a regression detector for these
+ * two rules, not proof that the arithmetic is right; the arithmetic was proved
+ * on the device and is recorded in #1424.
+ */
+TEST_CASE("mini-window scale source: a poisoned drag cannot beat the vendor API")
+{
+	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
+
+	SECTION("the straddle guard exists and is consulted by the ratio measurement")
+	{
+		// The notifier the geometry sampler must call.
+		REQUIRE(src.find("void noteWindowGeometry(") != std::string::npos);
+		// It must be able to SET the flag...
+		REQUIRE(src.find("touchStraddledGeometry = true") != std::string::npos);
+		// ...and measureTouchScale must actually consult it. MUTANT: delete the
+		// early-out in measureTouchScale and this fails.
+		const size_t m = src.find("public void measureTouchScale(");
+		REQUIRE(m != std::string::npos);
+		const size_t end = src.find("\n    }", m);
+		REQUIRE(end != std::string::npos);
+		const std::string body = src.substr(m, end - m);
+		REQUIRE(body.find("if (touchStraddledGeometry)") != std::string::npos);
+		// and the 40 px minimum span must survive alongside it -- they reject
+		// different faults (a tap vs a moving window).
+		REQUIRE(body.find("TOUCH_MIN_SPAN_PX") != std::string::npos);
+	}
+
+	SECTION("resolveScale prefers the vendor API over the touch ratio")
+	{
+		const size_t r = src.find("public float resolveScale(");
+		REQUIRE(r != std::string::npos);
+		const size_t end = src.find("\n    }", r);
+		REQUIRE(end != std::string::npos);
+		const std::string body = src.substr(r, end - r);
+
+		const size_t ret_api = body.find("return api;");
+		const size_t ret_touch = body.find("return touch;");
+		REQUIRE(ret_api != std::string::npos);
+		REQUIRE(ret_touch != std::string::npos);
+		// MUTANT: swap the two blocks and this fails.
+		REQUIRE(ret_api < ret_touch);
+
+		// MUTANT: restore the destructive cross-check (`return 0f;` inside the
+		// disagreement branch) and this fails. A disagreement may LOG, never
+		// discard: the only `return 0f` left is the both-sources-absent tail,
+		// so exactly one may appear and it must come after both.
+		size_t zeros = 0;
+		for (size_t at = body.find("return 0f;"); at != std::string::npos;
+		     at = body.find("return 0f;", at + 1)) {
+			zeros++;
+			REQUIRE(at > ret_touch);
+		}
+		REQUIRE(zeros == 1);
+	}
+}
