@@ -515,6 +515,31 @@ struct comp_vk_native_target
 	 * miss roughly half the time. The slow decay lets it come back down when
 	 * the scene gets cheaper without tracking every dip.
 	 */
+	/*!
+	 * @name Swapchain-result diagnostics (#1424)
+	 *
+	 * "The app renders fine but nothing reaches glass" is currently invisible
+	 * in a released build: present success is not logged, because a per-frame
+	 * U_LOG_W is banned outright. So a frozen mini-window with a healthy app
+	 * frame counter left no trace at all in a 900 MB capture and the mechanism
+	 * had to be guessed at.
+	 *
+	 * These count NON-success results from acquire and present and emit at most
+	 * ONE line per @ref TARGET_SWAP_DIAG_PERIOD_NS while any are still
+	 * happening. Completely silent when every call succeeds, which is the
+	 * normal case, so this costs one comparison per frame and no log volume.
+	 * Per-target (hence per-compositor) rather than static: two compositors in
+	 * one process must not share a throttle or a count.
+	 * @{
+	 */
+	uint64_t swap_diag_last_log_ns;
+	uint64_t swap_diag_acquire_bad;
+	uint64_t swap_diag_present_bad;
+	uint64_t swap_diag_since_log;
+	int32_t swap_diag_last_res;
+	const char *swap_diag_last_site;
+	/*! @} */
+
 	uint64_t weave_cost_ns;
 	//! Set at acquire, consumed after present, to measure the above.
 	uint64_t weave_start_ns;
@@ -2516,6 +2541,48 @@ wl_get(struct comp_vk_native_target *target)
 	return wl;
 }
 
+
+//! One line per this many ns while acquire/present keep returning non-success (#1424).
+#define TARGET_SWAP_DIAG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
+
+/*!
+ * Record a swapchain acquire/present result and, at most once every
+ * @ref TARGET_SWAP_DIAG_PERIOD_NS, say so (#1424).
+ *
+ * VK_SUCCESS and VK_SUBOPTIMAL_KHR are both "a frame reached the presentation
+ * engine", but SUBOPTIMAL is counted anyway: a swapchain that reports it every
+ * frame and is never recreated is exactly the state in which an app renders
+ * happily and the picture never changes.
+ */
+static void
+target_note_swap_result(struct comp_vk_native_target *target, VkResult res, const char *site)
+{
+	if (target == NULL || res == VK_SUCCESS) {
+		return;
+	}
+	if (site != NULL && site[0] == 'a') {
+		target->swap_diag_acquire_bad++;
+	} else {
+		target->swap_diag_present_bad++;
+	}
+	target->swap_diag_since_log++;
+	target->swap_diag_last_res = (int32_t)res;
+	target->swap_diag_last_site = site;
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (target->swap_diag_last_log_ns != 0 && now - target->swap_diag_last_log_ns < TARGET_SWAP_DIAG_PERIOD_NS) {
+		return;
+	}
+	target->swap_diag_last_log_ns = now;
+	U_LOG_W("SWAP_DIAG: %llu non-success in the last window (acquire %llu, present %llu total) — "
+	        "last %s returned VkResult %d (#1424)",
+	        (unsigned long long)target->swap_diag_since_log, (unsigned long long)target->swap_diag_acquire_bad,
+	        (unsigned long long)target->swap_diag_present_bad, site != NULL ? site : "?",
+	        (int)target->swap_diag_last_res);
+	target->swap_diag_since_log = 0;
+}
+
+
 static void
 wl_teardown(struct comp_vk_native_target *target)
 {
@@ -3116,6 +3183,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 	                                          dxr_acquire_timeout_ns(), target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
+	target_note_swap_result(target, res, "acquire");
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
 		U_LOG_I("Swapchain out of date, recreating");
@@ -3180,6 +3248,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 		                                 dxr_acquire_timeout_ns(), target->image_available,
 		                                 VK_NULL_HANDLE, &target->current_index);
+		target_note_swap_result(target, res, "acquire-retry");
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
 #ifdef XRT_OS_ANDROID
@@ -3351,6 +3420,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
+	target_note_swap_result(target, res, "present");
 
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a

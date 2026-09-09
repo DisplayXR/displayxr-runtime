@@ -3687,9 +3687,29 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 	// partly-off-panel window is visible in a capture rather than silent.
 	if (spills && !scaled && !c->android_offpanel_logged) {
 		c->android_offpanel_logged = true;
-		U_LOG_W("OFF_PANEL_PLACEMENT: window %d,%d %ux%u spills panel %ux%u but its extent fits — "
-		        "physical rect, keeping the weave (#1424)",
-		        x, y, w, h, disp_w, disp_h);
+		/*
+		 * The ON-PANEL visible extent next to the FIXED buffer extent (#1424).
+		 *
+		 * These two disagreeing is the standing hypothesis for the frozen
+		 * mini-window: MonadoView pins the buffer with setFixedSize() to the
+		 * full physical size, but a SurfaceView whose window is clipped has its
+		 * surface sized to the VISIBLE frame, and a buffer that permanently
+		 * disagrees with its surface is how an app renders every frame while
+		 * nothing new ever reaches glass. Printing the number costs nothing and
+		 * turns "presumably clipped" into evidence; pair it with SWAP_DIAG,
+		 * which says whether present/acquire are actually unhappy.
+		 */
+		const int64_t vis_x0 = x > 0 ? x : 0;
+		const int64_t vis_y0 = y > 0 ? y : 0;
+		const int64_t vis_x1 = (int64_t)x + (int64_t)w < (int64_t)disp_w ? (int64_t)x + (int64_t)w : (int64_t)disp_w;
+		const int64_t vis_y1 = (int64_t)y + (int64_t)h < (int64_t)disp_h ? (int64_t)y + (int64_t)h : (int64_t)disp_h;
+		const int64_t vis_w = vis_x1 > vis_x0 ? vis_x1 - vis_x0 : 0;
+		const int64_t vis_h = vis_y1 > vis_y0 ? vis_y1 - vis_y0 : 0;
+		U_LOG_W("OFF_PANEL_PLACEMENT: physical %ux%u at %d,%d on a %ux%u panel: %lldx%lld visible "
+		        "(%lld px of %u clipped right/left, %lld of %u clipped bottom/top) — extent fits, "
+		        "keeping the weave (#1424)",
+		        w, h, x, y, disp_w, disp_h, (long long)vis_w, (long long)vis_h,
+		        (long long)((int64_t)w - vis_w), w, (long long)((int64_t)h - vis_h), h);
 	} else if (!spills) {
 		c->android_offpanel_logged = false;
 	}
