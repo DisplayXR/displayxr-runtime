@@ -39,6 +39,7 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_xret.h"
+#include "oxr_weave_latch.h"
 
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
@@ -444,26 +445,64 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		bool have_tex = false;
 		uint32_t gw = 0, gh = 0;
 		xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-		if (comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h) ==
-		        XRT_SUCCESS &&
-		    have_tex && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		xret = comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h);
+		// #1427: a designed "nothing to hand out" is XRT_SUCCESS with
+		// have_tex == false (Windows before the output exists; Android while the
+		// #1277 weave satellite presents it itself — ipc_handle_weave_get_output
+		// never turns that into an error), and stays a retry on the next frame.
+		// A real transport failure is NOT that: XRT_ERROR_IPC_FAILURE must reach
+		// the caller as XR_ERROR_INSTANCE_LOST like every other bridge here,
+		// instead of being swallowed by an `== XRT_SUCCESS` test as "no handle".
+		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave output export failed (xrt_result=%d)",
+		                   (int)xret);
+		bool got_tex = have_tex && tex_h != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		if (got_tex) {
 			output->weavedTexture = (void *)tex_h;
 		}
 
 		bool have_fence = false;
 		xrt_graphics_sync_handle_t fence_h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
-		if (comp_ipc_client_compositor_weave_get_fence(&sess->xcn->base, &have_fence, &fence_h) ==
-		        XRT_SUCCESS &&
-		    have_fence && fence_h != XRT_GRAPHICS_SYNC_HANDLE_INVALID) {
+		xret = comp_ipc_client_compositor_weave_get_fence(&sess->xcn->base, &have_fence, &fence_h);
+		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave fence export failed (xrt_result=%d)",
+		                   (int)xret);
+		bool got_fence = have_fence && fence_h != XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		if (got_fence) {
 			// (intptr_t hop: the handle is an fd int on POSIX — macOS never
 			// exports a fence (#759, completion is synchronous), so this
 			// branch fires on Windows HANDLEs only.)
 			output->fence = (void *)(intptr_t)fence_h;
 		}
 
-		sess->weave.exported = true;
-		sess->weave.last_w = w;
-		sess->weave.last_h = h;
+		// #1427: arm the one-shot latch ONLY when every export this platform is
+		// expected to produce actually produced a handle — the texture
+		// everywhere, plus the fence on Windows (the caller cannot safely sample
+		// the woven texture without it). Latching on a miss is what turned a
+		// transient into a NULL weavedTexture for the life of the session.
+		// The rule itself lives in oxr_weave_latch.h so it can be pinned on the
+		// host without a service.
+		if (oxr_weave_should_latch_export(oxr_weave_platform_exports_fence(), got_tex, got_fence)) {
+			sess->weave.exported = true;
+			sess->weave.last_w = w;
+			sess->weave.last_h = h;
+			// One-off (never per-frame): pairs with the miss WARN below, so a
+			// field log shows the whole latch class in two lines.
+			if (sess->weave.warned_export_miss && !sess->weave.warned_export_recovered) {
+				sess->weave.warned_export_recovered = true;
+				U_LOG_W(
+				    "xrWeaveSubmitDXR: weave handle export RECOVERED at %ux%u — the caller now "
+				    "has the woven texture%s (#1427).",
+				    w, h, got_fence ? " + fence" : "");
+			}
+		} else if (!sess->weave.warned_export_miss) {
+			// One-off (never per-frame): the per-frame retry is otherwise
+			// silent, so this is the only trace that a session ever ran without
+			// a woven handle.
+			sess->weave.warned_export_miss = true;
+			U_LOG_W(
+			    "xrWeaveSubmitDXR: weave handle export produced nothing at %ux%u (texture=%s, "
+			    "fence=%s) — NOT latching, will retry every frame (#1427).",
+			    w, h, got_tex ? "yes" : "no", got_fence ? "yes" : "no");
+		}
 	}
 
 	return XR_SUCCESS;

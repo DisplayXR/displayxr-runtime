@@ -2669,11 +2669,20 @@ struct oxr_session
 	//! on the first xrWeaveSubmitDXR and again whenever the output is
 	//! re-allocated (window resize → dims change). @c exported latches the
 	//! one-shot; @c last_w/last_h detect the resize re-export.
+	//!
+	//! #1427: the latch is armed only when the export actually produced the
+	//! handles this platform is expected to produce (@ref oxr_weave_latch.h) —
+	//! it used to be armed unconditionally, which turned a transient export
+	//! miss into a NULL @c weavedTexture for the life of the session. The two
+	//! @c warned_ flags keep the field log's latch class visible at one WARN
+	//! each per session (never per frame).
 	struct
 	{
 		bool exported;
 		uint32_t last_w;
 		uint32_t last_h;
+		bool warned_export_miss;
+		bool warned_export_recovered;
 	} weave;
 #endif
 

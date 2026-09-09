@@ -34,6 +34,7 @@ set(tests
     tests_aux_overlay_lease
     tests_aux_mini_window_tell
     tests_comp_rear_budget
+    tests_oxr_weave_latch
 	)
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
@@ -107,6 +108,14 @@ if(TARGET tests_oxr_view_space)
 		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
 	endif()
 endif()
+
+# #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
+# no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point
+# itself is not host-drivable), so it needs the st_oxr include path and nothing
+# else.
+target_include_directories(
+	tests_oxr_weave_latch PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is
