@@ -536,18 +536,26 @@ struct comp_vk_native_target
 	 * frame counter left no trace at all in a 900 MB capture and the mechanism
 	 * had to be guessed at.
 	 *
-	 * These count NON-success results from acquire and present and emit at most
-	 * ONE line per @ref TARGET_SWAP_DIAG_PERIOD_NS while any are still
-	 * happening. Completely silent when every call succeeds, which is the
-	 * normal case, so this costs one comparison per frame and no log volume.
+	 * TWO tallies, because they mean opposite things. HARD failures (negative
+	 * VkResult: OUT_OF_DATE, SURFACE_LOST, ...) arm the WARN. VK_SUBOPTIMAL_KHR
+	 * does NOT: it is a success code, and MEASURED on device it fires on every
+	 * frame of a healthy mini-window (~46/s against a live ~42/s weave), so
+	 * treating it as a fault made this diagnostic pure noise in the one place it
+	 * was built for. It is reported as CONTEXT on the hard-failure line instead.
+	 *
+	 * At most ONE line per @ref TARGET_SWAP_DIAG_PERIOD_NS, and silent when the
+	 * only thing happening is SUBOPTIMAL or plain success -- one comparison per
+	 * frame and no log volume.
 	 * Per-target (hence per-compositor) rather than static: two compositors in
 	 * one process must not share a throttle or a count.
 	 * @{
 	 */
 	uint64_t swap_diag_last_log_ns;
-	uint64_t swap_diag_acquire_bad;
-	uint64_t swap_diag_present_bad;
-	uint64_t swap_diag_since_log;
+	uint64_t swap_diag_acquire_err;
+	uint64_t swap_diag_present_err;
+	uint64_t swap_diag_suboptimal;
+	uint64_t swap_diag_suboptimal_since_log;
+	uint64_t swap_diag_err_since_log;
 	int32_t swap_diag_last_res;
 	enum target_swap_site swap_diag_last_site;
 	/*! @} */
@@ -2843,12 +2851,33 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 	if (target == NULL || res == VK_SUCCESS) {
 		return;
 	}
-	if (site == TARGET_SWAP_PRESENT) {
-		target->swap_diag_present_bad++;
-	} else {
-		target->swap_diag_acquire_bad++;
+
+	/*
+	 * VK_SUBOPTIMAL_KHR is a SUCCESS code -- the frame DID reach the
+	 * presentation engine; the swapchain is merely no longer an ideal match for
+	 * the surface. MEASURED (#1424 device leg): in an OEM mini-window present
+	 * returns it on essentially EVERY frame, ~46/s, while the weave publishes
+	 * ~42/s and the picture is perfectly live -- on the plain recents-icon
+	 * window as much as the off-panel one. So it is the mini-window's normal
+	 * steady state and must never be a reason to warn.
+	 *
+	 * Counted for context and returning WITHOUT touching the throttle, which is
+	 * the load-bearing part: were it to arm the throttle, a healthy mini-window
+	 * would hold the once-per-period slot open forever and a REAL failure
+	 * arriving later would be silently throttled away behind it.
+	 */
+	if (res == VK_SUBOPTIMAL_KHR) {
+		target->swap_diag_suboptimal++;
+		target->swap_diag_suboptimal_since_log++;
+		return;
 	}
-	target->swap_diag_since_log++;
+
+	if (site == TARGET_SWAP_PRESENT) {
+		target->swap_diag_present_err++;
+	} else {
+		target->swap_diag_acquire_err++;
+	}
+	target->swap_diag_err_since_log++;
 	target->swap_diag_last_res = (int32_t)res;
 	target->swap_diag_last_site = site;
 
@@ -2857,21 +2886,20 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 		return;
 	}
 	target->swap_diag_last_log_ns = now;
-	/*
-	 * #1424 (c): this counts the OUT_OF_DATE/SUBOPTIMAL that PRECEDES the
-	 * recreate branch below, so an ordinary lifecycle resize (rotation, the
-	 * status bar, entering the mini-window) produces a line or two and that is
-	 * NORMAL. The signal is not "SWAP_DIAG appeared", it is "SWAP_DIAG KEEPS
-	 * appearing while the picture is not moving" — the message says so, so a
-	 * capture cannot be misread by someone who did not write this.
-	 */
-	U_LOG_W("SWAP_DIAG: %llu non-success in the last window (acquire %llu, present %llu total) — "
-	        "last %s returned VkResult %d; a burst around a resize/rotation is NORMAL (it precedes "
-	        "the recreate), a SUSTAINED stream while the image is static is not (#1424)",
-	        (unsigned long long)target->swap_diag_since_log, (unsigned long long)target->swap_diag_acquire_bad,
-	        (unsigned long long)target->swap_diag_present_bad, target_swap_site_name(site),
-	        (int)target->swap_diag_last_res);
-	target->swap_diag_since_log = 0;
+	U_LOG_W("SWAP_DIAG: %llu HARD failure(s) in the last window (acquire %llu, present %llu total) — "
+	        "last %s returned VkResult %d. [%llu VK_SUBOPTIMAL_KHR in the same window, %llu total: "
+	        "SUBOPTIMAL on every frame is NORMAL in a scaled/mini window, it is context here, not a "
+	        "fault.] A burst of hard failures around a resize or rotation is expected -- it precedes "
+	        "the recreate. A SUSTAINED stream of them while the image is not updating is the freeze "
+	        "signal (#1424)",
+	        (unsigned long long)target->swap_diag_err_since_log,
+	        (unsigned long long)target->swap_diag_acquire_err,
+	        (unsigned long long)target->swap_diag_present_err, target_swap_site_name(site),
+	        (int)target->swap_diag_last_res,
+	        (unsigned long long)target->swap_diag_suboptimal_since_log,
+	        (unsigned long long)target->swap_diag_suboptimal);
+	target->swap_diag_err_since_log = 0;
+	target->swap_diag_suboptimal_since_log = 0;
 }
 
 xrt_result_t
