@@ -884,6 +884,12 @@ struct comp_vk_native_compositor
 	 */
 	VkFramebuffer atlas_ws_fb;
 	VkFramebuffer atlas_ws_fb_ring[COMP_VK_DEPOSIT_RING];
+	//! Extent each ring framebuffer was built for. The atlas is re-sized on a
+	//! rendering-mode change (2560x1600 mono → 3840x1600 stereo on NP02J) and the
+	//! driver recycles view handles, so a view-keyed hit can return a framebuffer
+	//! for a dead image: the HUD is then stamped into nothing. Key on extent too.
+	uint32_t atlas_ws_fb_ring_w[COMP_VK_DEPOSIT_RING];
+	uint32_t atlas_ws_fb_ring_h[COMP_VK_DEPOSIT_RING];
 	VkImageView atlas_ws_fb_ring_view[COMP_VK_DEPOSIT_RING];
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
@@ -2262,7 +2268,16 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 	c->atlas_ws_fb = VK_NULL_HANDLE;
 	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
 		if (c->atlas_ws_fb_ring[i] != VK_NULL_HANDLE && c->atlas_ws_fb_ring_view[i] == atlas_view) {
-			c->atlas_ws_fb = c->atlas_ws_fb_ring[i];
+			if (c->atlas_ws_fb_ring_w[i] == atlas_w && c->atlas_ws_fb_ring_h[i] == atlas_h) {
+				c->atlas_ws_fb = c->atlas_ws_fb_ring[i];
+				break;
+			}
+			// Same view handle, different atlas: a recycled handle over a new image.
+			vk->vkDestroyFramebuffer(vk->device, c->atlas_ws_fb_ring[i], NULL);
+			c->atlas_ws_fb_ring[i] = VK_NULL_HANDLE;
+			c->atlas_ws_fb_ring_view[i] = VK_NULL_HANDLE;
+			U_LOG_W("[VK native] window-space atlas fb evicted: view reused at %ux%u (was %ux%u)",
+			        atlas_w, atlas_h, c->atlas_ws_fb_ring_w[i], c->atlas_ws_fb_ring_h[i]);
 			break;
 		}
 	}
@@ -2303,6 +2318,8 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 			return;
 		}
 		c->atlas_ws_fb_ring_view[slot] = atlas_view;
+		c->atlas_ws_fb_ring_w[slot] = atlas_w;
+		c->atlas_ws_fb_ring_h[slot] = atlas_h;
 		c->atlas_ws_fb = c->atlas_ws_fb_ring[slot];
 	}
 
@@ -4321,6 +4338,17 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		uint32_t tgen = comp_vk_native_target_get_generation(c->target);
 		if (tgen != c->dp_notified_target_generation) {
 			c->dp_notified_target_generation = tgen;
+			// The window-space (HUD) atlas framebuffers are keyed by image view;
+			// a recreate can recycle those handles. Both recreate paths drained the
+			// device, so destroying here is safe.
+			for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+				if (c->atlas_ws_fb_ring[i] != VK_NULL_HANDLE) {
+					c->vk.vkDestroyFramebuffer(c->vk.device, c->atlas_ws_fb_ring[i], NULL);
+					c->atlas_ws_fb_ring[i] = VK_NULL_HANDLE;
+				}
+				c->atlas_ws_fb_ring_view[i] = VK_NULL_HANDLE;
+			}
+			c->atlas_ws_fb = VK_NULL_HANDLE;
 			if (c->display_processor != NULL) {
 				xrt_display_processor_vk_notify_target_recreated(
 				    (struct xrt_display_processor_vk *)c->display_processor, tgen);
