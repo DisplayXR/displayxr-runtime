@@ -364,7 +364,18 @@ public final class MiniWindowLayout {
         return on == 1;
     }
 
-    /** Forget everything measured for the previous episode. */
+    /**
+     * Forget everything measured for the previous episode.
+     *
+     * <p>#1424: this now also drops the TOUCH ratio. It used to survive, and a
+     * surviving scale is not inert — it re-arms the 1:1 path against whatever
+     * window trips the tell next. Measured on the NP02J: after a drag had pinned
+     * 0.6700, the 60 px status-bar offset made a FULLSCREEN window spill
+     * ((0,60) 2560x1600 on a 2560x1600 panel), the cached ratio was applied to it,
+     * and the fullscreen surface was briefly re-laid-out to a 1695x1072 buffer.
+     * A scale describes one container, so it dies with that container; the vendor
+     * API (and, in a real mini-window, the next drag) re-measures in milliseconds.
+     */
     public void reset() {
         ratP = 0;
         ratQ = 0;
@@ -372,6 +383,11 @@ public final class MiniWindowLayout {
         vendorScale = 0f;
         vendorRectW = 0;
         vendorRectH = 0;
+        touchScale = 0f;
+        touchScaleSpan = 0f;
+        touchDownValid = false;
+        crossChecked = false;
+        scaleSource = null;
     }
 
     /** The rationalised scale that {@link #computeSizes} used, or 0 when it had none. */

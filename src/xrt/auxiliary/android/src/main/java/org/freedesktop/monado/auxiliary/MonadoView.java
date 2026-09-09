@@ -264,6 +264,11 @@ public class MonadoView extends SurfaceView
     private int lastRectDisplayId = -1;
     private int lastRectDispW = -1;
     private int lastRectDispH = -1;
+    /** Consecutive torn geometry samples skipped; bounds the skip so it cannot latch (#1424). */
+    private static final int MAX_TORN_SAMPLE_SKIPS = 2;
+
+    private int tornSampleSkips = 0;
+
     private boolean windowRectPollRunning = false;
     @Nullable private Choreographer.FrameCallback windowRectCallback = null;
 
@@ -423,6 +428,57 @@ public class MonadoView extends SurfaceView
         }
         transposedSampleLogged = false;
 
+        /*
+         * runtime#1424: a TORN sample -- getLocationOnScreen() has moved but the
+         * view extent has not, so the origin belongs to the new container and the
+         * extent to the old one. Measured on the NP02J entering the mini-window
+         * from the OEM's drop zone:
+         *
+         *     windowRect: 2137,84 2560x1540   <- new origin, PREVIOUS extent
+         *     windowRect: 2137,84 1080x1685   <- consistent, one frame later
+         *
+         * Same family as the mid-rotation transposed sample above, different
+         * shape, so isTransposedPanel does not catch it (2560x1540 is not the
+         * panel transposed). Published, it feeds a rect that is nobody's geometry
+         * to the container-scaled tell and to the per-window Kooima for a frame.
+         *
+         * SKIPPED for the same reason the transposed one is: doing nothing for a
+         * Choreographer frame cannot wedge anything, whereas the OFF branch is a
+         * surface resize under a possibly in-flight weave (#1394).
+         *
+         * BOUNDED. The predicate is "the origin moved, the extent did not, and
+         * the result now spills" -- if the container genuinely moves a window
+         * without resizing it (a drag), that is a real sample and skipping it
+         * forever would freeze the rect. Two consecutive skips is one frame of
+         * settling either side of the OEM's transition; after that the sample is
+         * accepted whatever it looks like.
+         */
+        if (lastRectW == w
+                && lastRectH == h
+                && (lastRectX != x || lastRectY != y)
+                && MiniWindowLayout.isTell(x, y, w, h, dispW, dispH)
+                && !MiniWindowLayout.isTell(lastRectX, lastRectY, w, h, dispW, dispH)
+                && tornSampleSkips < MAX_TORN_SAMPLE_SKIPS) {
+            tornSampleSkips++;
+            Log.w(
+                    TAG,
+                    "windowRect: ignoring a torn sample — origin moved to "
+                            + x
+                            + ","
+                            + y
+                            + " while the extent is still "
+                            + w
+                            + "x"
+                            + h
+                            + " (skip "
+                            + tornSampleSkips
+                            + "/"
+                            + MAX_TORN_SAMPLE_SKIPS
+                            + ", #1424)");
+            return;
+        }
+        tornSampleSkips = 0;
+
         // #1277/#1367 S9: in an OEM-scaled container the numbers above are the
         // window's LOGICAL size; the on-screen extent is scale x that. Re-size the
         // surface's buffer to the physical extent and publish THAT, so every
@@ -528,6 +584,10 @@ public class MonadoView extends SurfaceView
                 miniOneToOneApplied = false;
                 miniBufW = 0;
                 miniBufH = 0;
+                // #1424: the episode is over, so the scale measured inside it is
+                // too. Left cached it re-arms this path against the next window
+                // that happens to spill — including a fullscreen one.
+                miniLayout.reset();
                 Log.i(
                         TAG,
                         "miniWindow1to1: OFF ("

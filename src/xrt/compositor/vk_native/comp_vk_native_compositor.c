@@ -539,6 +539,8 @@ struct comp_vk_native_compositor
 	 * see @ref vk_android_update_container_scaled.
 	 */
 	bool android_container_scaled;
+	//! One-shot latch for the OFF_PANEL_PLACEMENT note (#1424).
+	bool android_offpanel_logged;
 #endif
 
 	/*!
@@ -3669,7 +3671,29 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 
 	// ONE definition, shared with oxr_android_surface.c and pinned against the
 	// Java copy by tests_aux_mini_window_tell (#1401).
-	const bool scaled = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
+	//
+	// #1424: the raw tell is the geometric spill and is NOT on its own a reason
+	// to stop weaving. Degrade only when the EXTENT cannot fit the panel, i.e. a
+	// genuinely scaled container. A spill whose extent fits is an off-panel
+	// PLACEMENT — the rect is already physical, the 1:1 layout is already
+	// applied, the phase origin is still correct and SurfaceFlinger clips the
+	// part that hangs over the edge. The OEM's drop-zone gesture lands exactly
+	// there ((2137,84) 723x1129 on a 2560x1600 panel) and degrading left the app
+	// stuck in flat 2D until the user moved the window.
+	const bool scaled = android_mini_window_is_container_scaled(x, y, w, h, disp_w, disp_h);
+	const bool spills = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
+
+	// Lifecycle-only note for the case the degrade no longer covers, so a
+	// partly-off-panel window is visible in a capture rather than silent.
+	if (spills && !scaled && !c->android_offpanel_logged) {
+		c->android_offpanel_logged = true;
+		U_LOG_W("OFF_PANEL_PLACEMENT: window %d,%d %ux%u spills panel %ux%u but its extent fits — "
+		        "physical rect, keeping the weave (#1424)",
+		        x, y, w, h, disp_w, disp_h);
+	} else if (!spills) {
+		c->android_offpanel_logged = false;
+	}
+
 	if (scaled == c->android_container_scaled) {
 		return;
 	}

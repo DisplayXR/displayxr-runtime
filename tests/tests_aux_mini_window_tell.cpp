@@ -686,3 +686,68 @@ TEST_CASE("mini-window tell: isBindingTell composes the transposed reject with t
 		CHECK(composed == c.expect);
 	}
 }
+
+/*
+ * runtime#1424: the DEGRADE decision is not the raw tell.
+ *
+ * The raw tell stays exactly as it is (it is what the 1:1 path arms on, and it is
+ * pinned against the Java copy above). What must NOT be the raw tell is the
+ * decision to stop weaving: a spill whose EXTENT fits the panel is an off-panel
+ * placement, not a container scale.
+ *
+ * Every row here is a rect that was actually observed on the NP02J, with the
+ * verdict the device evidence says it should get.
+ */
+TEST_CASE("mini-window tell: container-scaled degrade separates scale from placement")
+{
+	struct DCase
+	{
+		const char *name;
+		int32_t x, y;
+		uint32_t w, h, dispW, dispH;
+		bool spills;        //!< raw tell
+		bool extent_fits;   //!< extent alone
+		bool degrade;       //!< the decision
+	};
+
+	// clang-format off
+	const DCase dcases[] = {
+	    // The regression this fixes: physical, 1:1 applied, only the POSITION
+	    // pushes it off the right edge. 2137+723 = 2860 > 2560; 84+1129 = 1213.
+	    {"drop-zone origin, physical",  2137,   84,  723, 1129, 2560, 1600,  true,  true, false},
+	    // The genuinely scaled container it must keep catching: logical extent,
+	    // physical origin. 1685 > 1600, so no placement can make it fit.
+	    {"drop-zone origin, logical",   2137,   84, 1080, 1685, 2560, 1600,  true, false,  true},
+	    {"recents origin, logical",     1757,  236, 1080, 1685, 2560, 1600,  true, false,  true},
+	    // PATH 1 steady state: physical and fully on-panel. Unchanged.
+	    {"recents origin, physical",    1757,  236,  723, 1129, 2560, 1600, false,  true, false},
+	    // Fullscreen with the status bar: spills by 60 px, extent fits exactly.
+	    // Used to cost a 2D blip on every status-bar toggle.
+	    {"fullscreen + status bar",         0,   60, 2560, 1600, 2560, 1600,  true,  true, false},
+	    {"fullscreen",                      0,    0, 2560, 1600, 2560, 1600, false,  true, false},
+	    // Mid-rotation transposed extent cannot fit -> still degrades (unchanged;
+	    // the transposed sample is handled upstream, not here).
+	    {"mid-rotation transposed",         0,    0, 1600, 2560, 2560, 1600,  true, false,  true},
+	    // A small window dragged off the left edge is a placement, not a scale.
+	    {"dragged off the left edge",     -40,  100,  800,  600, 2560, 1600,  true,  true, false},
+	    // Portrait mini-window, physical, on-panel.
+	    {"portrait mini-window",          797,  716,  723, 1129, 1600, 2560, false,  true, false},
+	    // Degenerate: no panel extent -> never decide anything.
+	    {"no panel extent",              1757,  236,  723, 1129,    0,    0, false, false, false},
+	    {"zero window extent",           1757,  236,    0,    0, 2560, 1600, false, false, false},
+	};
+	// clang-format on
+
+	for (const DCase &c : dcases) {
+		INFO("case: " << c.name);
+		CHECK(android_mini_window_is_tell(c.x, c.y, c.w, c.h, c.dispW, c.dispH) == c.spills);
+		CHECK(android_mini_window_extent_fits(c.w, c.h, c.dispW, c.dispH) == c.extent_fits);
+		CHECK(android_mini_window_is_container_scaled(c.x, c.y, c.w, c.h, c.dispW, c.dispH) == c.degrade);
+		// The invariant the fix rests on: degrading is strictly narrower than
+		// spilling, and the two differ exactly where the extent fits.
+		if (c.degrade) {
+			CHECK(c.spills);
+			CHECK_FALSE(c.extent_fits);
+		}
+	}
+}

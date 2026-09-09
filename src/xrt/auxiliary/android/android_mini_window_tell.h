@@ -65,6 +65,69 @@ android_mini_window_is_tell(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32
 	return x < 0 || y < 0 || (int64_t)x + (int64_t)w > (int64_t)disp_w || (int64_t)y + (int64_t)h > (int64_t)disp_h;
 }
 
+/*!
+ * Does the window's EXTENT fit inside the panel, ignoring where it sits?
+ *
+ * The discriminator between the two very different situations that @ref
+ * android_mini_window_is_tell lumps together (#1424).
+ *
+ * A container-scaled window reports its LOGICAL extent, which is 1/scale larger
+ * than the space it actually occupies — on the NP02J 1080x1685 against a
+ * 2560x1600 panel, so the height alone cannot fit however the window is placed.
+ * A window that has already had the 1:1 layout applied reports its PHYSICAL
+ * extent (723x1129), which fits the panel comfortably; if such a rect spills, it
+ * is because of WHERE it is, not HOW BIG it is.
+ *
+ * @ingroup aux_android
+ */
+static inline bool
+android_mini_window_extent_fits(uint32_t w, uint32_t h, uint32_t disp_w, uint32_t disp_h)
+{
+	if (disp_w == 0 || disp_h == 0 || w == 0 || h == 0) {
+		return false;
+	}
+	return w <= disp_w && h <= disp_h;
+}
+
+/*!
+ * "This window is being scaled by its container" — the DEGRADE decision (#1424).
+ *
+ * @ref android_mini_window_is_tell is the raw geometric spill and stays exactly
+ * as it is: it is the signal the 1:1 path arms on, and it is pinned against the
+ * Java copy. But it is NOT on its own a reason to stop weaving, because it
+ * cannot separate:
+ *
+ *   - a genuinely scaled container — logical extent at a physical origin, which
+ *     the vendor interlacer cannot weave 1:1 at all, so 2D is the honest answer;
+ *   - an already-physical, already-1:1 rect that merely hangs off the panel
+ *     edge — measured on the NP02J when the OEM's drop-zone gesture places the
+ *     freeform window at (2137,84): 2137+723 = 2860 > 2560, while the extent
+ *     723x1129 fits the panel with room to spare. Weaving is still correct for
+ *     the on-panel portion, the phase origin is unchanged, and SurfaceFlinger
+ *     clips the remainder. Degrading there left the app stuck in flat 2D until
+ *     the user happened to move the window (#1424 run B: 30 s, no recovery).
+ *
+ * A spill whose extent fits is a PLACEMENT, not a scale. Same rule catches the
+ * fullscreen status-bar transient — (0,60) 2560x1600 on a 2560x1600 panel spills
+ * by 60 px with an extent that fits exactly — which used to produce a 2D blip on
+ * every status-bar toggle.
+ *
+ * @ingroup aux_android
+ */
+static inline bool
+android_mini_window_is_container_scaled(int32_t x,
+                                        int32_t y,
+                                        uint32_t w,
+                                        uint32_t h,
+                                        uint32_t disp_w,
+                                        uint32_t disp_h)
+{
+	if (!android_mini_window_is_tell(x, y, w, h, disp_w, disp_h)) {
+		return false;
+	}
+	return !android_mini_window_extent_fits(w, h, disp_w, disp_h);
+}
+
 #ifdef __cplusplus
 }
 #endif
