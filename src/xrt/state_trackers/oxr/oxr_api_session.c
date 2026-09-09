@@ -1552,6 +1552,10 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	}
 	struct xrt_rendering_mode *mode = &head->rendering_modes[effectiveModeIndex];
 	bool hardware_state_changed = (mode->hardware_display_3d != sess->hardware_display_3d);
+	U_LOG_W("HW3D_DBG request mode=%u eff=%u mode_hw3d=%d sess_hw3d=%d changed=%d vk_native=%d xmcc=%d bridge=%d",
+	        modeIndex, effectiveModeIndex, (int)mode->hardware_display_3d, (int)sess->hardware_display_3d,
+	        (int)hardware_state_changed, (int)sess->is_vk_native_compositor,
+	        (int)(sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL), (int)sess->is_bridge_relay);
 
 	// 3. Toggle hardware 3D mode if needed (to the EFFECTIVE mode's 3D state).
 	if (hardware_state_changed) {

@@ -2008,6 +2008,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	// both the freshly-created and the cached (#528) DP. On Android the platform
 	// (SurfaceFlinger) always presents, so client_presents = true.
 	mc->session_render.dp_transparent = android_transparent_requested(mc);
+	// A hardware 2D request recorded before the display processor existed
+	// (media-player idle splash, #64: xrRequestDisplayRenderingModeDXR is legal
+	// from session begin, session_render is initialised by the render worker
+	// later). Apply it now; the default is 3D, so only a 2D wish needs acting on.
+	if (mc->session_render.display_processor != NULL && !mc->hardware_display_3d) {
+		const bool ok =
+		    xrt_display_processor_request_display_mode(mc->session_render.display_processor, false);
+		U_LOG_W("HW3D_DBG applied deferred 2D request after session_render DP create -> %d", (int)ok);
+	}
 	if (mc->session_render.display_processor != NULL && mc->session_render.dp_transparent) {
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)mc->session_render.display_processor,
@@ -2419,6 +2428,7 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	// device-mode sync can't see this — OUTPUT_MODE doesn't cross IPC — so this flag
 	// IS the source of truth there.)
 	mc->hardware_display_3d = enable_3d;
+	U_LOG_W("HW3D_DBG multi request enable_3d=%d dp=%p", (int)enable_3d, (void *)mc->session_render.display_processor);
 
 	// Prefer display processor path (vendor-specific, e.g. SR SwitchableLensHint)
 	if (mc->session_render.display_processor != NULL) {

@@ -1074,6 +1074,15 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 bool
 multi_compositor_init_session_render(struct multi_compositor *mc);
 
+/*!
+ * Route a hardware 2D/3D request to whichever client's session_render owns a
+ * display processor (Android in-process: the app's own vk_native compositor has
+ * no DP; the weaving one hangs off its multi_compositor client). Returns true if
+ * at least one DP accepted the request.
+ */
+bool
+multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d);
+
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID)
 /*!
  * @name XR_DXR_weave on the comp_multi service path (macOS #759, Android #1036)
