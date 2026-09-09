@@ -539,8 +539,17 @@ struct comp_vk_native_compositor
 	 * see @ref vk_android_update_container_scaled.
 	 */
 	bool android_container_scaled;
-	//! One-shot latch for the OFF_PANEL_PLACEMENT note (#1424).
-	bool android_offpanel_logged;
+	/*!
+	 * Throttle for the OFF_PANEL_PLACEMENT note (#1424).
+	 *
+	 * A monotonic deadline, NOT a one-shot latch cleared when the window stops
+	 * spilling: @ref vk_android_update_container_scaled runs every frame, so a
+	 * window jittering across the panel edge alternates spill/no-spill and a
+	 * latch cleared on the no-spill side re-arms every other frame. Never
+	 * reset, so the rate is bounded at one line per period however the geometry
+	 * behaves.
+	 */
+	uint64_t android_offpanel_last_log_ns;
 #endif
 
 	/*!
@@ -3656,6 +3665,9 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
  * The content half is @ref vk_compute_effective_layout, which collapses the
  * frame to tile 0.
  */
+//! Rate cap on the OFF_PANEL_PLACEMENT note (#1424) — see the field's comment.
+#define VK_OFFPANEL_LOG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
+
 static void
 vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 {
@@ -3685,8 +3697,11 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 
 	// Lifecycle-only note for the case the degrade no longer covers, so a
 	// partly-off-panel window is visible in a capture rather than silent.
-	if (spills && !scaled && !c->android_offpanel_logged) {
-		c->android_offpanel_logged = true;
+	const uint64_t offpanel_now_ns = os_monotonic_get_ns();
+	if (spills && !scaled &&
+	    (c->android_offpanel_last_log_ns == 0 ||
+	     offpanel_now_ns - c->android_offpanel_last_log_ns >= VK_OFFPANEL_LOG_PERIOD_NS)) {
+		c->android_offpanel_last_log_ns = offpanel_now_ns;
 		/*
 		 * The ON-PANEL visible extent next to the FIXED buffer extent (#1424).
 		 *
@@ -3710,8 +3725,6 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 		        "keeping the weave (#1424)",
 		        w, h, x, y, disp_w, disp_h, (long long)vis_w, (long long)vis_h,
 		        (long long)((int64_t)w - vis_w), w, (long long)((int64_t)h - vis_h), h);
-	} else if (!spills) {
-		c->android_offpanel_logged = false;
 	}
 
 	if (scaled == c->android_container_scaled) {

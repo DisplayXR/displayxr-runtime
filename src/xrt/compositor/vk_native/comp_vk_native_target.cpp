@@ -396,6 +396,14 @@ wl_teardown(struct comp_vk_native_target *target);
 /*!
  * Vulkan target structure.
  */
+//! Which swapchain call SWAP_DIAG is recording (#1424).
+enum target_swap_site
+{
+	TARGET_SWAP_ACQUIRE = 0,
+	TARGET_SWAP_ACQUIRE_RETRY,
+	TARGET_SWAP_PRESENT,
+};
+
 struct comp_vk_native_target
 {
 	//! Vulkan bundle (borrowed).
@@ -515,6 +523,10 @@ struct comp_vk_native_target
 	 * miss roughly half the time. The slow decay lets it come back down when
 	 * the scene gets cheaper without tracking every dip.
 	 */
+	uint64_t weave_cost_ns;
+	//! Set at acquire, consumed after present, to measure the above.
+	uint64_t weave_start_ns;
+
 	/*!
 	 * @name Swapchain-result diagnostics (#1424)
 	 *
@@ -537,12 +549,8 @@ struct comp_vk_native_target
 	uint64_t swap_diag_present_bad;
 	uint64_t swap_diag_since_log;
 	int32_t swap_diag_last_res;
-	const char *swap_diag_last_site;
+	enum target_swap_site swap_diag_last_site;
 	/*! @} */
-
-	uint64_t weave_cost_ns;
-	//! Set at acquire, consumed after present, to measure the above.
-	uint64_t weave_start_ns;
 	//! One-shot log guard for the late-weave tier engaging.
 	bool late_weave_grid_logged;
 
@@ -2808,6 +2816,18 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 //! One line per this many ns while acquire/present keep returning non-success (#1424).
 #define TARGET_SWAP_DIAG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
 
+//! Which swapchain call produced the result SWAP_DIAG is recording (#1424).
+static const char *
+target_swap_site_name(enum target_swap_site site)
+{
+	switch (site) {
+	case TARGET_SWAP_ACQUIRE: return "acquire";
+	case TARGET_SWAP_ACQUIRE_RETRY: return "acquire-retry";
+	case TARGET_SWAP_PRESENT: return "present";
+	default: return "?";
+	}
+}
+
 /*!
  * Record a swapchain acquire/present result and, at most once every
  * @ref TARGET_SWAP_DIAG_PERIOD_NS, say so (#1424).
@@ -2818,15 +2838,15 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
  * happily and the picture never changes.
  */
 static void
-target_note_swap_result(struct comp_vk_native_target *target, VkResult res, const char *site)
+target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum target_swap_site site)
 {
 	if (target == NULL || res == VK_SUCCESS) {
 		return;
 	}
-	if (site != NULL && site[0] == 'a') {
-		target->swap_diag_acquire_bad++;
-	} else {
+	if (site == TARGET_SWAP_PRESENT) {
 		target->swap_diag_present_bad++;
+	} else {
+		target->swap_diag_acquire_bad++;
 	}
 	target->swap_diag_since_log++;
 	target->swap_diag_last_res = (int32_t)res;
@@ -2837,10 +2857,19 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, cons
 		return;
 	}
 	target->swap_diag_last_log_ns = now;
+	/*
+	 * #1424 (c): this counts the OUT_OF_DATE/SUBOPTIMAL that PRECEDES the
+	 * recreate branch below, so an ordinary lifecycle resize (rotation, the
+	 * status bar, entering the mini-window) produces a line or two and that is
+	 * NORMAL. The signal is not "SWAP_DIAG appeared", it is "SWAP_DIAG KEEPS
+	 * appearing while the picture is not moving" — the message says so, so a
+	 * capture cannot be misread by someone who did not write this.
+	 */
 	U_LOG_W("SWAP_DIAG: %llu non-success in the last window (acquire %llu, present %llu total) — "
-	        "last %s returned VkResult %d (#1424)",
+	        "last %s returned VkResult %d; a burst around a resize/rotation is NORMAL (it precedes "
+	        "the recreate), a SUSTAINED stream while the image is static is not (#1424)",
 	        (unsigned long long)target->swap_diag_since_log, (unsigned long long)target->swap_diag_acquire_bad,
-	        (unsigned long long)target->swap_diag_present_bad, site != NULL ? site : "?",
+	        (unsigned long long)target->swap_diag_present_bad, target_swap_site_name(site),
 	        (int)target->swap_diag_last_res);
 	target->swap_diag_since_log = 0;
 }
@@ -3184,7 +3213,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 	                                          dxr_acquire_timeout_ns(), target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
-	target_note_swap_result(target, res, "acquire");
+	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
 		U_LOG_I("Swapchain out of date, recreating");
@@ -3249,7 +3278,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 		                                 dxr_acquire_timeout_ns(), target->image_available,
 		                                 VK_NULL_HANDLE, &target->current_index);
-		target_note_swap_result(target, res, "acquire-retry");
+		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
 #ifdef XRT_OS_ANDROID
@@ -3421,7 +3450,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
-	target_note_swap_result(target, res, "present");
+	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
 
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a

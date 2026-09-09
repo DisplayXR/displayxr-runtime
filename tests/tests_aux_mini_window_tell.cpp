@@ -728,8 +728,21 @@ TEST_CASE("mini-window tell: container-scaled degrade separates scale from place
 	    // Mid-rotation transposed extent cannot fit -> still degrades (unchanged;
 	    // the transposed sample is handled upstream, not here).
 	    {"mid-rotation transposed",         0,    0, 1600, 2560, 2560, 1600,  true, false,  true},
-	    // A small window dragged off the left edge is a placement, not a scale.
+	    // AMBIGUOUS BY CONSTRUCTION, and labelled so rather than as a win: an
+	    // 800x600 window at (-40,100) is called a placement, but a CONTAINER-
+	    // SCALED window of that logical size would be too -- 800x600 fits
+	    // 2560x1600 either way. The rect cannot tell them apart; only the
+	    // measured scale can. See the blind-spot section in
+	    // android_mini_window_tell.h. The verdict below is the one this rule
+	    // gives, not a claim that it is right for every window of this shape.
 	    {"dragged off the left edge",     -40,  100,  800,  600, 2560, 1600,  true,  true, false},
+	    // THE BLIND SPOT, pinned so it is a known quantity and not a surprise:
+	    // a genuinely scaled container whose LOGICAL extent still fits. At
+	    // scale 0.67 a 1000x1000 physical window has a 1493x1493 logical
+	    // extent, which fits 2560x1600 -- so this rule says "placement, keep
+	    // weaving" where the truth is "scaled, degrade". The NP02J case escapes
+	    // only on height (1685 vs 1600, 85 px).
+	    {"BLIND SPOT: scaled, logical fits", 1700, 300, 1493, 1493, 2560, 1600, true, true, false},
 	    // Portrait mini-window, physical, on-panel.
 	    {"portrait mini-window",          797,  716,  723, 1129, 1600, 2560, false,  true, false},
 	    // Degenerate: no panel extent -> never decide anything.
