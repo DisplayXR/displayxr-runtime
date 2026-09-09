@@ -9389,15 +9389,6 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	c->hw3d_request_value = enable_3d;
 	U_LOG_W("HW3D_DBG vk_native: no display processor yet — deferring enable_3d=%d", (int)enable_3d);
 	return true;
-#if 0
-#ifdef XRT_OS_WINDOWS
-	// (kept for reference; the split branch above already handles this)
-	if (c->split != NULL) {
-		return comp_vk_split_request_display_mode(c->split, enable_3d);
-	}
-#endif
-#endif /* 0 */
-	return false;
 }
 
 void
