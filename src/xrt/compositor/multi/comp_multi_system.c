@@ -6393,3 +6393,38 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 
 	return XRT_SUCCESS;
 }
+
+bool
+multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d)
+{
+	if (xsysc == NULL) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	bool any = false;
+	os_mutex_lock(&msc->list_and_timing_lock);
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL) {
+			continue;
+		}
+		struct xrt_display_processor *dp = mc->session_render.display_processor;
+		U_LOG_W("HW3D_DBG multi_system client[%zu] session_render init=%d dp=%p", k,
+		        (int)mc->session_render.initialized, (void *)dp);
+		if (!mc->session_render.initialized || dp == NULL) {
+			// Not initialised yet but WILL render (it has a window/surface):
+			// record the wish; init_session_render applies it once the DP exists.
+			if (multi_compositor_has_session_render(mc)) {
+				mc->hardware_display_3d = enable_3d;
+				any = true;
+			}
+			continue;
+		}
+		mc->hardware_display_3d = enable_3d;
+		if (xrt_display_processor_request_display_mode(dp, enable_3d)) {
+			any = true;
+		}
+	}
+	os_mutex_unlock(&msc->list_and_timing_lock);
+	return any;
+}

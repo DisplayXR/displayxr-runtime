@@ -456,6 +456,16 @@ struct comp_vk_native_compositor
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
+	//! A 2D/3D request that arrived BEFORE the display processor existed (it is
+	//! created lazily with the first target, while xrRequestDisplayRenderingModeDXR
+	//! is legal from session begin). Applied right after creation. Without this the
+	//! media player's idle-splash 2D borrow (#64) was silently lost on Android.
+	bool hw3d_request_pending;
+	bool hw3d_request_value;
+	//! Whether a DP factory was handed to this compositor at all (Android
+	//! in-process: none — the weaving DP is the multi-compositor's).
+	bool dp_factory_available;
+
 	//! Transparent-background present requested at create (XR_EXT_*_window_binding
 	//! transparentBackgroundEnabled). The atlas/DP clear to alpha=0 and the
 	//! present uses a transparent compositeAlpha. Cached for the macOS Local2D
@@ -7398,6 +7408,7 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 {
 	// Create display processor via factory FIRST — the SR weaver creates
 	// its own VkSwapchain on the HWND, so we must not also create one.
+	c->dp_factory_available = dp_factory_vk != NULL;
 	if (dp_factory_vk != NULL) {
 		xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)dp_factory_vk;
 
@@ -7533,6 +7544,12 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 	// saving partly bought black de-occlusions. WGC cost is attacked via
 	// capture throttling instead. client_presents=true remains correct for
 	// true client-side presents (#551 IPC) and bandless content.
+	if (c->display_processor != NULL && c->hw3d_request_pending) {
+		c->hw3d_request_pending = false;
+		const bool ok = xrt_display_processor_request_display_mode(c->display_processor, c->hw3d_request_value);
+		U_LOG_W("HW3D_DBG vk_native: applied deferred enable_3d=%d after DP create -> %d",
+		        (int)c->hw3d_request_value, (int)ok);
+	}
 	if (c->display_processor != NULL) {
 		xrt_display_processor_vk_set_transparent_background(
 		    (struct xrt_display_processor_vk *)c->display_processor, transparent_background, false);
@@ -9317,6 +9334,10 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	if (xc == NULL) return false;
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
+	U_LOG_W("HW3D_DBG vk_native request enable_3d=%d dp=%p has_slot=%d slot=%p", (int)enable_3d,
+	        (void *)c->display_processor,
+	        c->display_processor ? (int)XRT_DP_HAS_SLOT(c->display_processor, request_display_mode) : -1,
+	        c->display_processor ? (void *)c->display_processor->request_display_mode : NULL);
 	if (c->display_processor != NULL) {
 		return xrt_display_processor_request_display_mode(c->display_processor, enable_3d);
 	}
@@ -9326,6 +9347,28 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 		return comp_vk_split_request_display_mode(c->split, enable_3d);
 	}
 #endif
+	// No display processor yet. If THIS compositor will create one (it has a
+	// factory; creation is lazy, with the first target) keep the wish and apply
+	// it then, reporting success so the session's belief tracks the wish that
+	// WILL be honoured. If it never will (Android in-process: the weaving DP
+	// belongs to the multi-compositor behind us) say so, so the session falls
+	// through to the compositor that owns the panel.
+	if (!c->dp_factory_available) {
+		U_LOG_W("HW3D_DBG vk_native: no display processor and no factory — not ours");
+		return false;
+	}
+	c->hw3d_request_pending = true;
+	c->hw3d_request_value = enable_3d;
+	U_LOG_W("HW3D_DBG vk_native: no display processor yet — deferring enable_3d=%d", (int)enable_3d);
+	return true;
+#if 0
+#ifdef XRT_OS_WINDOWS
+	// (kept for reference; the split branch above already handles this)
+	if (c->split != NULL) {
+		return comp_vk_split_request_display_mode(c->split, enable_3d);
+	}
+#endif
+#endif /* 0 */
 	return false;
 }
 

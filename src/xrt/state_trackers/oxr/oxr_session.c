@@ -471,6 +471,15 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 		success = comp_vk_native_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
 			sess->hardware_display_3d = enable_3d;
+			return XR_SUCCESS;
+		}
+		// Android in-process (#1031): the session's vk_native compositor is the
+		// app-side leg and owns no display processor; the weaving DP hangs off a
+		// multi_compositor client of the system compositor. Ask the system to
+		// route it there (never cast sess->xcn to a multi_compositor — it is not one).
+		if (sess->sys->xsysc != NULL && sess->sys->xsysc->xmcc != NULL &&
+		    multi_system_request_display_mode_any(sess->sys->xsysc, enable_3d)) {
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -4423,6 +4432,19 @@ oxr_session_create(struct oxr_logger *log,
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
 			sess->last_rendering_mode_index = head->hmd->active_rendering_mode_index;
+			// Seed the hardware 2D/3D belief from the ACTIVE mode too. It was
+			// zero-initialised ("2D") regardless of the panel, so on a display
+			// that boots in its 3D mode the first xrRequestDisplayRenderingModeDXR
+			// for a flat mode compared false against false, decided nothing had
+			// changed, and never asked the display processor to drop to 2D —
+			// the media player's idle-splash 2D borrow (#64) stayed woven on
+			// Android. Only a later request BACK to 3D reached the plug-in, as
+			// a no-op. hardware_display_3d is otherwise updated by successful
+			// requests and by RENDERING_MODE_CHANGE session events.
+			const uint32_t cur = head->hmd->active_rendering_mode_index;
+			if (cur < head->rendering_mode_count) {
+				sess->hardware_display_3d = head->rendering_modes[cur].hardware_display_3d;
+			}
 		}
 	}
 #endif
