@@ -56,6 +56,42 @@ struct weave_latency_log
 		CSV_ON = 2,
 	};
 	int enabled = CSV_UNPROBED;
+
+	/*!
+	 * #206 horizon jitter probe — DXR_DP_FORWARD_HORIZON_TRACE=1.
+	 *
+	 * predict_weave_to_scanout_ns() returns the distance to the FIRST VBLANK
+	 * AFTER `now + headroom`, so it is a STEP function of the headroom: as
+	 * last frame's submit->present cost drifts across a vblank boundary the
+	 * answer jumps a whole refresh period, with no hysteresis, smoothing or
+	 * deadband (the engage WARN says as much). The DP hands that number to the
+	 * vendor eye predictor, so a period-sized jump asks it to extrapolate the
+	 * eyes ~16.7 ms further on one weave than the last — an interlace-phase
+	 * step, visible as shiver on LATERAL head motion and on nothing else.
+	 *
+	 * A trivial app never shows it (small, steady headroom sits well inside
+	 * one slot); an app with large or variable headroom straddles the boundary.
+	 * That asymmetry is measurable, and nothing in the tree measured it, so the
+	 * mechanism could only be argued. This counts the jumps.
+	 *
+	 * Zero-safe like the CSV state above, and for the same reason (#1128):
+	 * these live in memset(0) C structs, so 0 MUST mean "unprobed".
+	 */
+	enum hz_state
+	{
+		HZ_UNPROBED = 0,
+		HZ_OFF = 1,
+		HZ_ON = 2,
+	};
+	int hz_trace = HZ_UNPROBED;
+	uint64_t hz_win_start_ns = 0; // 0 = window not started
+	uint64_t hz_last_ns = 0;
+	uint64_t hz_min_ns = 0;
+	uint64_t hz_max_ns = 0;
+	uint64_t hz_sum_ns = 0;
+	uint32_t hz_n = 0;
+	uint32_t hz_jumps = 0; // consecutive-weave deltas >= half a refresh period
+
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
 	uint64_t qpc_freq = 0;
@@ -201,7 +237,69 @@ struct weave_latency_log
 		// First vblank strictly after `ready`.
 		const uint64_t target =
 		    last_sync_qpc + ((ready - last_sync_qpc) / refresh_period_qpc + 1) * refresh_period_qpc;
-		return (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
+		const uint64_t horizon_ns = (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
+		const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * 1000000000.0 / (double)f2);
+		note_horizon(horizon_ns, period_ns);
+		return horizon_ns;
+	}
+
+	/*!
+	 * One throttled row per ~5 s, only under DXR_DP_FORWARD_HORIZON_TRACE=1.
+	 * Never per-frame: this is on the weave path (see the logging convention
+	 * in docs/reference/debug-logging.md).
+	 */
+	void
+	note_horizon(uint64_t horizon_ns, uint64_t period_ns)
+	{
+		if (hz_trace == HZ_UNPROBED) {
+			const char *e = getenv("DXR_DP_FORWARD_HORIZON_TRACE");
+			hz_trace = (e != nullptr && e[0] != '0') ? HZ_ON : HZ_OFF;
+		}
+		if (hz_trace != HZ_ON || period_ns == 0) {
+			return;
+		}
+
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (hz_win_start_ns == 0) {
+			hz_win_start_ns = now_ns;
+		}
+
+		// A jump of half a period or more cannot be drift — the grid quantises
+		// to whole periods, so this counts boundary flips and nothing else.
+		if (hz_n > 0) {
+			const uint64_t d = (horizon_ns > hz_last_ns) ? (horizon_ns - hz_last_ns)
+			                                             : (hz_last_ns - horizon_ns);
+			if (d >= period_ns / 2) {
+				hz_jumps++;
+			}
+		}
+		hz_last_ns = horizon_ns;
+		if (hz_n == 0 || horizon_ns < hz_min_ns) {
+			hz_min_ns = horizon_ns;
+		}
+		if (horizon_ns > hz_max_ns) {
+			hz_max_ns = horizon_ns;
+		}
+		hz_sum_ns += horizon_ns;
+		hz_n++;
+
+		if (now_ns - hz_win_start_ns < 5000000000ULL) {
+			return;
+		}
+		const double secs = (double)(now_ns - hz_win_start_ns) / 1e9;
+		U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
+		        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)",
+		        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
+		        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
+		        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps,
+		        (double)hz_jumps / secs);
+
+		hz_win_start_ns = now_ns;
+		hz_min_ns = 0;
+		hz_max_ns = 0;
+		hz_sum_ns = 0;
+		hz_n = 0;
+		hz_jumps = 0;
 	}
 
 	/*!
