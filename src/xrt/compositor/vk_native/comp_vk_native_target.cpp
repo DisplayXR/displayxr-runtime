@@ -2542,46 +2542,6 @@ wl_get(struct comp_vk_native_target *target)
 }
 
 
-//! One line per this many ns while acquire/present keep returning non-success (#1424).
-#define TARGET_SWAP_DIAG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
-
-/*!
- * Record a swapchain acquire/present result and, at most once every
- * @ref TARGET_SWAP_DIAG_PERIOD_NS, say so (#1424).
- *
- * VK_SUCCESS and VK_SUBOPTIMAL_KHR are both "a frame reached the presentation
- * engine", but SUBOPTIMAL is counted anyway: a swapchain that reports it every
- * frame and is never recreated is exactly the state in which an app renders
- * happily and the picture never changes.
- */
-static void
-target_note_swap_result(struct comp_vk_native_target *target, VkResult res, const char *site)
-{
-	if (target == NULL || res == VK_SUCCESS) {
-		return;
-	}
-	if (site != NULL && site[0] == 'a') {
-		target->swap_diag_acquire_bad++;
-	} else {
-		target->swap_diag_present_bad++;
-	}
-	target->swap_diag_since_log++;
-	target->swap_diag_last_res = (int32_t)res;
-	target->swap_diag_last_site = site;
-
-	const uint64_t now = os_monotonic_get_ns();
-	if (target->swap_diag_last_log_ns != 0 && now - target->swap_diag_last_log_ns < TARGET_SWAP_DIAG_PERIOD_NS) {
-		return;
-	}
-	target->swap_diag_last_log_ns = now;
-	U_LOG_W("SWAP_DIAG: %llu non-success in the last window (acquire %llu, present %llu total) — "
-	        "last %s returned VkResult %d (#1424)",
-	        (unsigned long long)target->swap_diag_since_log, (unsigned long long)target->swap_diag_acquire_bad,
-	        (unsigned long long)target->swap_diag_present_bad, site != NULL ? site : "?",
-	        (int)target->swap_diag_last_res);
-	target->swap_diag_since_log = 0;
-}
-
 
 static void
 wl_teardown(struct comp_vk_native_target *target)
@@ -2842,6 +2802,47 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 	(void)target;
 	return 0;
 #endif
+}
+
+
+//! One line per this many ns while acquire/present keep returning non-success (#1424).
+#define TARGET_SWAP_DIAG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
+
+/*!
+ * Record a swapchain acquire/present result and, at most once every
+ * @ref TARGET_SWAP_DIAG_PERIOD_NS, say so (#1424).
+ *
+ * VK_SUCCESS and VK_SUBOPTIMAL_KHR are both "a frame reached the presentation
+ * engine", but SUBOPTIMAL is counted anyway: a swapchain that reports it every
+ * frame and is never recreated is exactly the state in which an app renders
+ * happily and the picture never changes.
+ */
+static void
+target_note_swap_result(struct comp_vk_native_target *target, VkResult res, const char *site)
+{
+	if (target == NULL || res == VK_SUCCESS) {
+		return;
+	}
+	if (site != NULL && site[0] == 'a') {
+		target->swap_diag_acquire_bad++;
+	} else {
+		target->swap_diag_present_bad++;
+	}
+	target->swap_diag_since_log++;
+	target->swap_diag_last_res = (int32_t)res;
+	target->swap_diag_last_site = site;
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (target->swap_diag_last_log_ns != 0 && now - target->swap_diag_last_log_ns < TARGET_SWAP_DIAG_PERIOD_NS) {
+		return;
+	}
+	target->swap_diag_last_log_ns = now;
+	U_LOG_W("SWAP_DIAG: %llu non-success in the last window (acquire %llu, present %llu total) — "
+	        "last %s returned VkResult %d (#1424)",
+	        (unsigned long long)target->swap_diag_since_log, (unsigned long long)target->swap_diag_acquire_bad,
+	        (unsigned long long)target->swap_diag_present_bad, site != NULL ? site : "?",
+	        (int)target->swap_diag_last_res);
+	target->swap_diag_since_log = 0;
 }
 
 xrt_result_t
