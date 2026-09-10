@@ -139,6 +139,13 @@ void
 comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t period_ns);
 
 /*!
+ * The display refresh period this target is pacing against, or 0 if it has not
+ * been established yet (the DP contract's "unknown").
+ */
+uint64_t
+comp_d3d11_target_get_display_period_ns(struct comp_d3d11_target *target);
+
+/*!
  * Measured weave→scanout residual of the last completed frame in ns (0 =
  * unknown), from DXGI frame statistics. Feeds the DP's set_frame_timing
  * control loop.
