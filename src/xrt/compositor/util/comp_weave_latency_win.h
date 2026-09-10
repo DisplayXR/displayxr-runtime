@@ -98,6 +98,9 @@ struct weave_latency_log
 	//! hit. A |error| >= half a period is a WRONG SLOT CALL — the flip the
 	//! predictor made (or failed to make) did not match reality. Flips that
 	//! match reality are correct and must not be smoothed away.
+	//! Resolved from after_present, one to a few presents after the
+	//! prediction, so a window's `resolved` lags its `n` by the resolve
+	//! depth — read the two as neighbours, not as a ratio.
 	uint32_t hz_resolved = 0;
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
@@ -984,21 +987,6 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						                        ring[idx].qpc) *
 						               1000000000.0 / (double)freq());
 					}
-					// #1432: predicted vs realised horizon. Only on an EXACT
-					// present match — when the statistics have skipped ahead
-					// SyncQPCTime belongs to a later present and would read
-					// as a whole-period miss that never happened.
-					if (ring[idx].horizon_ns != 0 && ring[idx].present_count == stats.PresentCount &&
-					    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].horizon_base_qpc &&
-					    refresh_period_qpc != 0) {
-						const double k = 1000000000.0 / (double)freq();
-						const int64_t realised_ns =
-						    (int64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
-						                       ring[idx].horizon_base_qpc) *
-						              k);
-						note_horizon_outcome(realised_ns - (int64_t)ring[idx].horizon_ns,
-						                     (uint64_t)((double)refresh_period_qpc * k));
-					}
 					// #867: xrWaitFrame's promise vs this frame's real
 					// photon time. os_monotonic_get_ns() is QPC scaled
 					// to ns on Windows, so the two share an origin and
@@ -1015,6 +1003,37 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						                    (int64_t)ring[idx].predicted_ns));
 					}
 					break;
+				}
+			}
+			/*
+			 * #1432: predicted vs realised horizon — its OWN pass, not the
+			 * loop above. That loop breaks on the newest entry whose weave
+			 * precedes SyncQPCTime, which on the #1051 stale-sync configs is
+			 * an OLDER present than stats.PresentCount; the exact entry we
+			 * need would never be reached. And it re-selects the same entry
+			 * on every repeated statistics sample, which is fine for the
+			 * idempotent consumers above but would double-count here — so
+			 * the entry is CONSUMED (horizon_ns = 0) once resolved.
+			 *
+			 * Exact PresentCount only: a skipped-ahead SyncQPCTime belongs
+			 * to a later present and would read as a whole-period miss that
+			 * never happened. Trace-gated so the default path pays nothing.
+			 */
+			if (hz_trace == HZ_ON && refresh_period_qpc != 0) {
+				for (int i = 0; i < ring_count; i++) {
+					int idx = (ring_head - 1 - i + 16) % 8;
+					if (ring[idx].horizon_ns != 0 && ring[idx].present_count == stats.PresentCount &&
+					    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].horizon_base_qpc) {
+						const double k = 1000000000.0 / (double)freq();
+						const int64_t realised_ns =
+						    (int64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
+						                       ring[idx].horizon_base_qpc) *
+						              k);
+						note_horizon_outcome(realised_ns - (int64_t)ring[idx].horizon_ns,
+						                     (uint64_t)((double)refresh_period_qpc * k));
+						ring[idx].horizon_ns = 0; // consumed
+						break;
+					}
 				}
 			}
 			// #1051: on slow-app configs GetFrameStatistics can report an
