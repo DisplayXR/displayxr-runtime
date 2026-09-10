@@ -79,6 +79,7 @@ Tiering:
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence | REQUIRED | **PLATFORM** | Works today — don't regress |
 | **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
+| **R10** | The **mini-window survives an activity launch from inside it** (system file picker, share sheet, permission dialog) | REQUIRED | **PLATFORM** | **OPEN — MEASURED** on the reference device 2026-09-10; no app-side arrangement avoids it |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
 | **S2** | **Per-PIXEL** click-through at full opacity (per-region touchability); *plus*, for apps that must keep a foreground Activity, an untrusted-touch exemption + scoping the per-Activity input sink | NICE TO HAVE | **PLATFORM** | **NARROWED** — per-FRAME click-through at full opacity is SOLVED on stock via a tight touchable overlay (#1110); only per-pixel precision and the foreground-Activity case remain |
 | **S3** | ~~Wait-semaphore hook into the vendor interlacer~~ | — | VENDOR | **NOT AN ASK — withdrawn.** The hook already existed; we were passing NULL. Documentation-only PR open |
@@ -765,6 +766,60 @@ adb shell getevent -lt /dev/input/eventN | grep -c 'TRACKING_ID   ffffffff'
 the whole gesture — one per lift. Any count in the hundreds is this defect. The
 result must hold at the **default** report rate the device ships with, not only
 after a manual write to the report-rate node.
+
+---
+
+### R10 — The mini-window must survive an activity launch from inside it
+
+**Owner:** **PLATFORM** — the OEM's mini-window ("window reply", `WR` in its logs)
+implementation · **Status:** **OPEN — measured on the reference device 2026-09-10**
+· **Traces to:** `displayxr-demo-mediaplayer#69` (a 3D media player that cannot open
+a file while in the mini-window)
+
+**Mechanism.** The reference device's mini-window is a single-window mode with a
+per-task eligibility check. When the app inside it starts **any** activity that is
+not itself eligible — the system document picker (`ACTION_OPEN_DOCUMENT`, served by
+`com.android.documentsui`), a share sheet, a runtime-permission dialog — the
+platform logs `startActivityInner-not support WindowReply from sourceRecord` followed
+by `setWindowingMode(freeform to full)` and returns **the app's own task** to
+fullscreen. The picker itself is not the problem; it is the *launch from inside the
+mode* that ends the mode.
+
+Measured with three launch arrangements, all with the same result:
+
+1. the picker started for-result from the app's activity (joins the app's task);
+2. the picker hosted by a trampoline activity in a **separate task**
+   (`taskAffinity=""`, `FLAG_ACTIVITY_NEW_TASK`, `excludeFromRecents`) — the new
+   task **inherits** the mini-window state from its source and the toggle then
+   applies to the whole session, so the app's task leaves the mini-window before the
+   picker is even visible;
+3. the trampoline started from the **application context** (no source activity
+   record) — identical.
+
+There is therefore no arrangement available to an ordinary app that keeps its
+window in the mini-window across a picker round-trip.
+
+**Consequence if absent.** Any app whose content comes through the system picker
+(the only storage access path a non-privileged app has to user files) cannot be
+*used* from the mini-window: the user has to pick the file first, then re-enter
+the mini-window from recents, and every subsequent file change repeats the dance.
+On a device whose whole point is running 3D content in a small window beside
+other work, that turns the mini-window into a view-only mode.
+
+**DisplayXR fallback.** None. The player documents the sequence that works (open
+first, then mini-window) and keeps the single-activity task the eligibility check
+wants; nothing in the runtime is involved.
+
+**Acceptance test.** Put a resizable app into the mini-window through the recents
+affordance, then from inside it start `ACTION_OPEN_DOCUMENT` and cancel the picker:
+
+```
+adb shell dumpsys activity activities | grep -E 'Task\{[0-9a-f]+ #[0-9]+ .*<pkg>' | grep -oE 'mode=[a-z]+'
+adb logcat -d | grep -c 'setWindowingMode(freeform to full)'
+```
+
+Expect `mode=freeform` and a count of `0` after the picker is dismissed. On the
+reference device today the mode is `fullscreen` and the count is `1`.
 
 ---
 
