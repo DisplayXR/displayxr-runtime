@@ -606,11 +606,11 @@ public class MonadoView extends SurfaceView
             return false;
         }
 
-        float s = miniLayout.resolveScale(hostActivity, w, h, dispW, dispH);
+        float s = miniLayout.resolveScale(hostActivity, x, y, w, h, dispW, dispH);
         if (s <= 0f) {
-            // Not known yet (no vendor API and no real touch measured), or the two
-            // sources disagreed. Publishing the logical rect keeps the honest 2D
-            // fallback, which is the direction to fail in.
+            // Not known yet (no vendor API and no real touch measured). Publishing
+            // the logical rect keeps the honest 2D fallback, which is the direction
+            // to fail in.
             return false;
         }
         if (!miniLayout.computeSizes(s, w, h, miniSizes)) {
