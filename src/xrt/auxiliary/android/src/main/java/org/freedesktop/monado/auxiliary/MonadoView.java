@@ -264,6 +264,24 @@ public class MonadoView extends SurfaceView
     private int lastRectDisplayId = -1;
     private int lastRectDispW = -1;
     private int lastRectDispH = -1;
+    /** Consecutive torn geometry samples skipped; bounds the skip so it cannot latch (#1424). */
+    private static final int MAX_TORN_SAMPLE_SKIPS = 2;
+
+    private int tornSampleSkips = 0;
+    /**
+     * The LOGICAL window extent of the last accepted sample (#1424 eyeball #4). {@code lastRectW/H}
+     * hold what was PUBLISHED, which inside a 1:1 episode is the physical buffer size — so they
+     * cannot say whether the window's own extent moved, and the exit-side torn sample (fullscreen
+     * origin, still the mini-window's logical extent) slipped past the guard on them.
+     */
+    private int lastLogicalW = -1;
+
+    private int lastLogicalH = -1;
+    /** Samples in a row where the view or surface did not follow the window after OFF. */
+    private int layoutMismatchSamples = 0;
+
+    private boolean layoutHealLogged = false;
+
     private boolean windowRectPollRunning = false;
     @Nullable private Choreographer.FrameCallback windowRectCallback = null;
 
@@ -385,6 +403,15 @@ public class MonadoView extends SurfaceView
             dispH = real.y;
         }
         /*
+         * #1424: tell the ratio measurement what the geometry is BEFORE any skip
+         * returns. A torn or transposed sample is still proof that the window is in
+         * motion, and a drag in flight across that motion cannot be a scale
+         * measurement -- so the skip paths must feed this too, or the very gesture
+         * that creates the mini-window poisons the ratio it is about to need.
+         */
+        miniLayout.noteWindowGeometry(x, y, w, h);
+
+        /*
          * runtime#1399: a sample whose window extent is EXACTLY the panel transposed
          * is a mid-rotation artefact, not a container scale — the location and the
          * Display have updated while the extent has not. #1398 rejected it on the
@@ -422,6 +449,87 @@ public class MonadoView extends SurfaceView
             return;
         }
         transposedSampleLogged = false;
+
+        /*
+         * runtime#1424: a TORN sample -- getLocationOnScreen() has moved but the
+         * view extent has not, so the origin belongs to the new container and the
+         * extent to the old one. Measured on the NP02J entering the mini-window
+         * from the OEM's drop zone:
+         *
+         *     windowRect: 2137,84 2560x1540   <- new origin, PREVIOUS extent
+         *     windowRect: 2137,84 1080x1685   <- consistent, one frame later
+         *
+         * Same family as the mid-rotation transposed sample above, different
+         * shape, so isTransposedPanel does not catch it (2560x1540 is not the
+         * panel transposed). Published, it feeds a rect that is nobody's geometry
+         * to the container-scaled tell and to the per-window Kooima for a frame.
+         *
+         * SKIPPED for the same reason the transposed one is: doing nothing for a
+         * Choreographer frame cannot wedge anything, whereas the OFF branch is a
+         * surface resize under a possibly in-flight weave (#1394).
+         *
+         * BOUNDED. The predicate is "the origin moved, the extent did not, and
+         * the result now spills" -- if the container genuinely moves a window
+         * without resizing it (a drag), that is a real sample and skipping it
+         * forever would freeze the rect. Two consecutive skips is one frame of
+         * settling either side of the OEM's transition; after that the sample is
+         * accepted whatever it looks like.
+         */
+        boolean tornEntry =
+                lastRectW == w
+                        && lastRectH == h
+                        && (lastRectX != x || lastRectY != y)
+                        && MiniWindowLayout.isTell(x, y, w, h, dispW, dispH)
+                        && !MiniWindowLayout.isTell(lastRectX, lastRectY, w, h, dispW, dispH);
+        /*
+         * #1424 eyeball #4 -- the EXIT side of the same tear. Leaving the mini-window
+         * for fullscreen, one sample carried the fullscreen origin with the
+         * mini-window's LOGICAL extent still attached:
+         *
+         *     windowRect: 2137,84 397x623     <- hang window, 1:1 in effect (published physical)
+         *     sample:     0,60 1080x1685      <- new origin, PREVIOUS logical extent: spills
+         *     windowRect: 0,0 2560x1600       <- consistent, 4 ms later
+         *
+         * That one sample tripped the tell, the 1:1 path went ON (layout 1079x1685,
+         * buffer 723x1129), and the OFF four milliseconds later left the view laid
+         * out at 1079x1685 inside a 2560x1600 window -- David saw the fullscreen
+         * content weaving correctly but squashed to the left at the mini-window's
+         * aspect. The entry predicate cannot see it because lastRectW/H hold the
+         * PUBLISHED physical size, not the window's own extent, so compare against
+         * the logical extent and require the origin to have JUMPED: a container
+         * transition teleports the window (2137 px here); a drag moves it tens of
+         * pixels a frame, and the Hang->Normal tap by 380 px (< a quarter panel),
+         * both of which must stay real samples.
+         */
+        boolean tornExit =
+                lastLogicalW == w
+                        && lastLogicalH == h
+                        && (Math.abs(x - lastRectX) > dispW / 4 || Math.abs(y - lastRectY) > dispH / 4)
+                        && MiniWindowLayout.isTell(x, y, w, h, dispW, dispH);
+        if ((tornEntry || tornExit) && tornSampleSkips < MAX_TORN_SAMPLE_SKIPS) {
+            tornSampleSkips++;
+            Log.w(
+                    TAG,
+                    "windowRect: ignoring a torn sample — origin moved to "
+                            + x
+                            + ","
+                            + y
+                            + " while the "
+                            + (tornExit && !tornEntry ? "logical " : "")
+                            + "extent is still "
+                            + w
+                            + "x"
+                            + h
+                            + " (skip "
+                            + tornSampleSkips
+                            + "/"
+                            + MAX_TORN_SAMPLE_SKIPS
+                            + ", #1424)");
+            return;
+        }
+        tornSampleSkips = 0;
+        lastLogicalW = w;
+        lastLogicalH = h;
 
         // #1277/#1367 S9: in an OEM-scaled container the numbers above are the
         // window's LOGICAL size; the on-screen extent is scale x that. Re-size the
@@ -528,20 +636,27 @@ public class MonadoView extends SurfaceView
                 miniOneToOneApplied = false;
                 miniBufW = 0;
                 miniBufH = 0;
+                // #1424: the episode is over, so the scale measured inside it is
+                // too. Left cached it re-arms this path against the next window
+                // that happens to spill — including a fullscreen one.
+                miniLayout.reset();
                 Log.i(
                         TAG,
                         "miniWindow1to1: OFF ("
                                 + (tell ? "disabled by debug.dxr.miniwindow_1to1" : "window fits the panel")
                                 + ") — surface back to layout size");
+                layoutMismatchSamples = 0;
+            } else {
+                healLayoutAfterOff(w, h);
             }
             return false;
         }
 
-        float s = miniLayout.resolveScale(hostActivity, w, h, dispW, dispH);
+        float s = miniLayout.resolveScale(hostActivity, x, y, w, h, dispW, dispH);
         if (s <= 0f) {
-            // Not known yet (no vendor API and no real touch measured), or the two
-            // sources disagreed. Publishing the logical rect keeps the honest 2D
-            // fallback, which is the direction to fail in.
+            // Not known yet (no vendor API and no real touch measured). Publishing
+            // the logical rect keeps the honest 2D fallback, which is the direction
+            // to fail in.
             return false;
         }
         if (!miniLayout.computeSizes(s, w, h, miniSizes)) {
@@ -643,6 +758,77 @@ public class MonadoView extends SurfaceView
             ((FrameLayout) getParent()).setBackgroundColor(android.graphics.Color.TRANSPARENT);
         }
         miniLayout.reset();
+    }
+
+    /**
+     * After OFF, make sure the view and its surface actually FOLLOWED the window (#1424 eyeball #4).
+     *
+     * <p>Measured on the NP02J leaving the mini-window: an ON and an OFF landed 4 ms apart inside
+     * one traversal (the ON from a torn sample, the OFF from the consistent one that followed), and
+     * the surface came back at the ON's 1079x1685 layout — {@code surfaceChanged 723x1129}, OFF,
+     * {@code surfaceChanged 1079x1685}, and then nothing: no relayout to 2560x1600 ever arrived,
+     * and fullscreen content weaved at the mini-window's aspect in the left 1079 px. The torn-exit
+     * guard in {@code sampleWindowRect} now stops that ON at source; this is the second line of
+     * defence for any other interleaving, and it is self-evidencing: it re-asserts MATCH_PARENT +
+     * {@code setSizeFromLayout} and logs ONCE per occurrence-run which of the two had not
+     * followed, so the device log says whether the guard alone was enough.
+     *
+     * <p>Debounced to three consecutive mismatching samples so an in-flight layout (a rotation, a
+     * resize) is never fought — those settle within a frame or two.
+     *
+     * @param winW the window's logical width (the parent's), as the sampler measured it
+     * @param winH the window's logical height
+     */
+    private void healLayoutAfterOff(int winW, int winH) {
+        if (!(getParent() instanceof View) || winW <= 0 || winH <= 0) {
+            layoutMismatchSamples = 0;
+            return;
+        }
+        final int vw = getWidth();
+        final int vh = getHeight();
+        final int sw;
+        final int sh;
+        synchronized (currentSurfaceHolderSync) {
+            sw = this.width;
+            sh = this.height;
+        }
+        final boolean viewOff = vw > 0 && vh > 0 && (vw != winW || vh != winH);
+        final boolean surfaceOff = !viewOff && sw > 0 && sh > 0 && (sw != vw || sh != vh);
+        if (!viewOff && !surfaceOff) {
+            layoutMismatchSamples = 0;
+            layoutHealLogged = false;
+            return;
+        }
+        if (++layoutMismatchSamples < 3) {
+            return;
+        }
+        layoutMismatchSamples = 0;
+        if (!layoutHealLogged) {
+            layoutHealLogged = true;
+            Log.w(
+                    TAG,
+                    "miniWindow1to1: after OFF the "
+                            + (viewOff ? "VIEW " + vw + "x" + vh : "SURFACE " + sw + "x" + sh)
+                            + " did not follow the window "
+                            + winW
+                            + "x"
+                            + winH
+                            + " — re-asserting MATCH_PARENT + setSizeFromLayout (#1424)");
+        }
+        if (viewOff) {
+            if (getParent() instanceof FrameLayout) {
+                setLayoutParams(
+                        new FrameLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT));
+                ((FrameLayout) getParent()).setBackgroundColor(android.graphics.Color.TRANSPARENT);
+            } else {
+                restoreLayoutToWindow();
+            }
+            ((View) getParent()).requestLayout();
+        }
+        getHolder().setSizeFromLayout();
+        requestLayout();
     }
 
     /**

@@ -539,6 +539,17 @@ struct comp_vk_native_compositor
 	 * see @ref vk_android_update_container_scaled.
 	 */
 	bool android_container_scaled;
+	/*!
+	 * Throttle for the OFF_PANEL_PLACEMENT note (#1424).
+	 *
+	 * A monotonic deadline, NOT a one-shot latch cleared when the window stops
+	 * spilling: @ref vk_android_update_container_scaled runs every frame, so a
+	 * window jittering across the panel edge alternates spill/no-spill and a
+	 * latch cleared on the no-spill side re-arms every other frame. Never
+	 * reset, so the rate is bounded at one line per period however the geometry
+	 * behaves.
+	 */
+	uint64_t android_offpanel_last_log_ns;
 #endif
 
 	/*!
@@ -3654,6 +3665,9 @@ vk_sync_zone_mask_to_dp(struct comp_vk_native_compositor *c);
  * The content half is @ref vk_compute_effective_layout, which collapses the
  * frame to tile 0.
  */
+//! Rate cap on the OFF_PANEL_PLACEMENT note (#1424) — see the field's comment.
+#define VK_OFFPANEL_LOG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
+
 static void
 vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 {
@@ -3669,7 +3683,50 @@ vk_android_update_container_scaled(struct comp_vk_native_compositor *c)
 
 	// ONE definition, shared with oxr_android_surface.c and pinned against the
 	// Java copy by tests_aux_mini_window_tell (#1401).
-	const bool scaled = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
+	//
+	// #1424: the raw tell is the geometric spill and is NOT on its own a reason
+	// to stop weaving. Degrade only when the EXTENT cannot fit the panel, i.e. a
+	// genuinely scaled container. A spill whose extent fits is an off-panel
+	// PLACEMENT — the rect is already physical, the 1:1 layout is already
+	// applied, the phase origin is still correct and SurfaceFlinger clips the
+	// part that hangs over the edge. The OEM's drop-zone gesture lands exactly
+	// there ((2137,84) 723x1129 on a 2560x1600 panel) and degrading left the app
+	// stuck in flat 2D until the user moved the window.
+	const bool scaled = android_mini_window_is_container_scaled(x, y, w, h, disp_w, disp_h);
+	const bool spills = android_mini_window_is_tell(x, y, w, h, disp_w, disp_h);
+
+	// Lifecycle-only note for the case the degrade no longer covers, so a
+	// partly-off-panel window is visible in a capture rather than silent.
+	const uint64_t offpanel_now_ns = os_monotonic_get_ns();
+	if (spills && !scaled &&
+	    (c->android_offpanel_last_log_ns == 0 ||
+	     offpanel_now_ns - c->android_offpanel_last_log_ns >= VK_OFFPANEL_LOG_PERIOD_NS)) {
+		c->android_offpanel_last_log_ns = offpanel_now_ns;
+		/*
+		 * The ON-PANEL visible extent next to the FIXED buffer extent (#1424).
+		 *
+		 * These two disagreeing is the standing hypothesis for the frozen
+		 * mini-window: MonadoView pins the buffer with setFixedSize() to the
+		 * full physical size, but a SurfaceView whose window is clipped has its
+		 * surface sized to the VISIBLE frame, and a buffer that permanently
+		 * disagrees with its surface is how an app renders every frame while
+		 * nothing new ever reaches glass. Printing the number costs nothing and
+		 * turns "presumably clipped" into evidence; pair it with SWAP_DIAG,
+		 * which says whether present/acquire are actually unhappy.
+		 */
+		const int64_t vis_x0 = x > 0 ? x : 0;
+		const int64_t vis_y0 = y > 0 ? y : 0;
+		const int64_t vis_x1 = (int64_t)x + (int64_t)w < (int64_t)disp_w ? (int64_t)x + (int64_t)w : (int64_t)disp_w;
+		const int64_t vis_y1 = (int64_t)y + (int64_t)h < (int64_t)disp_h ? (int64_t)y + (int64_t)h : (int64_t)disp_h;
+		const int64_t vis_w = vis_x1 > vis_x0 ? vis_x1 - vis_x0 : 0;
+		const int64_t vis_h = vis_y1 > vis_y0 ? vis_y1 - vis_y0 : 0;
+		U_LOG_W("OFF_PANEL_PLACEMENT: physical %ux%u at %d,%d on a %ux%u panel: %lldx%lld visible "
+		        "(%lld px of %u clipped right/left, %lld of %u clipped bottom/top) — extent fits, "
+		        "keeping the weave (#1424)",
+		        w, h, x, y, disp_w, disp_h, (long long)vis_w, (long long)vis_h,
+		        (long long)((int64_t)w - vis_w), w, (long long)((int64_t)h - vis_h), h);
+	}
+
 	if (scaled == c->android_container_scaled) {
 		return;
 	}

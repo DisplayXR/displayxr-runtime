@@ -396,6 +396,14 @@ wl_teardown(struct comp_vk_native_target *target);
 /*!
  * Vulkan target structure.
  */
+//! Which swapchain call SWAP_DIAG is recording (#1424).
+enum target_swap_site
+{
+	TARGET_SWAP_ACQUIRE = 0,
+	TARGET_SWAP_ACQUIRE_RETRY,
+	TARGET_SWAP_PRESENT,
+};
+
 struct comp_vk_native_target
 {
 	//! Vulkan bundle (borrowed).
@@ -518,6 +526,41 @@ struct comp_vk_native_target
 	uint64_t weave_cost_ns;
 	//! Set at acquire, consumed after present, to measure the above.
 	uint64_t weave_start_ns;
+
+	/*!
+	 * @name Swapchain-result diagnostics (#1424)
+	 *
+	 * "The app renders fine but nothing reaches glass" is currently invisible
+	 * in a released build: present success is not logged, because a per-frame
+	 * U_LOG_W is banned outright. So a frozen mini-window with a healthy app
+	 * frame counter left no trace at all in a 900 MB capture and the mechanism
+	 * had to be guessed at.
+	 *
+	 * TWO tallies, because they mean opposite things. HARD failures (negative
+	 * VkResult: OUT_OF_DATE, SURFACE_LOST, ...) arm the WARN. VK_SUBOPTIMAL_KHR
+	 * does NOT: it is a success code, and MEASURED on device it fires on
+	 * EVERY present in EVERY mode -- ~48/s in plain FULLSCREEN as much as ~46/s in
+	 * a mini-window, against a live ~45-49/s weave, with only 2 acquire failures
+	 * in 122k presents -- so
+	 * treating it as a fault made this diagnostic pure noise in the one place it
+	 * was built for. It is reported as CONTEXT on the hard-failure line instead.
+	 *
+	 * At most ONE line per @ref TARGET_SWAP_DIAG_PERIOD_NS, and silent when the
+	 * only thing happening is SUBOPTIMAL or plain success -- one comparison per
+	 * frame and no log volume.
+	 * Per-target (hence per-compositor) rather than static: two compositors in
+	 * one process must not share a throttle or a count.
+	 * @{
+	 */
+	uint64_t swap_diag_last_log_ns;
+	uint64_t swap_diag_acquire_err;
+	uint64_t swap_diag_present_err;
+	uint64_t swap_diag_suboptimal;
+	uint64_t swap_diag_suboptimal_since_log;
+	uint64_t swap_diag_err_since_log;
+	int32_t swap_diag_last_res;
+	enum target_swap_site swap_diag_last_site;
+	/*! @} */
 	//! One-shot log guard for the late-weave tier engaging.
 	bool late_weave_grid_logged;
 
@@ -2516,6 +2559,8 @@ wl_get(struct comp_vk_native_target *target)
 	return wl;
 }
 
+
+
 static void
 wl_teardown(struct comp_vk_native_target *target)
 {
@@ -2775,6 +2820,88 @@ comp_vk_native_target_get_measured_weave_ns(struct comp_vk_native_target *target
 	(void)target;
 	return 0;
 #endif
+}
+
+
+//! One line per this many ns while acquire/present keep returning non-success (#1424).
+#define TARGET_SWAP_DIAG_PERIOD_NS (5ULL * 1000 * 1000 * 1000)
+
+//! Which swapchain call produced the result SWAP_DIAG is recording (#1424).
+static const char *
+target_swap_site_name(enum target_swap_site site)
+{
+	switch (site) {
+	case TARGET_SWAP_ACQUIRE: return "acquire";
+	case TARGET_SWAP_ACQUIRE_RETRY: return "acquire-retry";
+	case TARGET_SWAP_PRESENT: return "present";
+	default: return "?";
+	}
+}
+
+/*!
+ * Record a swapchain acquire/present result and, at most once every
+ * @ref TARGET_SWAP_DIAG_PERIOD_NS, say so (#1424).
+ *
+ * VK_SUCCESS and VK_SUBOPTIMAL_KHR are both "a frame reached the presentation
+ * engine", but SUBOPTIMAL is counted anyway: a swapchain that reports it every
+ * frame and is never recreated is exactly the state in which an app renders
+ * happily and the picture never changes.
+ */
+static void
+target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum target_swap_site site)
+{
+	if (target == NULL || res == VK_SUCCESS) {
+		return;
+	}
+
+	/*
+	 * VK_SUBOPTIMAL_KHR is a SUCCESS code -- the frame DID reach the
+	 * presentation engine; the swapchain is merely no longer an ideal match for
+	 * the surface. MEASURED (#1424 device leg): on this device present returns it
+	 * on essentially EVERY frame in EVERY mode -- ~48/s in plain fullscreen, ~46/s
+	 * in a mini-window, against a live ~45-49/s weave, with 2 acquire failures in
+	 * 122k presents. It is the device's permanent normal, not a mini-window
+	 * quirk, and must never be a reason to warn.
+	 *
+	 * Counted for context and returning WITHOUT touching the throttle, which is
+	 * the load-bearing part: were it to arm the throttle, a healthy mini-window
+	 * would hold the once-per-period slot open forever and a REAL failure
+	 * arriving later would be silently throttled away behind it.
+	 */
+	if (res == VK_SUBOPTIMAL_KHR) {
+		target->swap_diag_suboptimal++;
+		target->swap_diag_suboptimal_since_log++;
+		return;
+	}
+
+	if (site == TARGET_SWAP_PRESENT) {
+		target->swap_diag_present_err++;
+	} else {
+		target->swap_diag_acquire_err++;
+	}
+	target->swap_diag_err_since_log++;
+	target->swap_diag_last_res = (int32_t)res;
+	target->swap_diag_last_site = site;
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (target->swap_diag_last_log_ns != 0 && now - target->swap_diag_last_log_ns < TARGET_SWAP_DIAG_PERIOD_NS) {
+		return;
+	}
+	target->swap_diag_last_log_ns = now;
+	U_LOG_W("SWAP_DIAG: %llu HARD failure(s) in the last window (acquire %llu, present %llu total) — "
+	        "last %s returned VkResult %d. [%llu VK_SUBOPTIMAL_KHR in the same window, %llu total: "
+	        "SUBOPTIMAL on every present is NORMAL on this device in EVERY mode, fullscreen included; "
+	        "it is context here, not a fault.] A burst of hard failures around a resize or rotation is expected -- it precedes "
+	        "the recreate. A SUSTAINED stream of them while the image is not updating is the freeze "
+	        "signal (#1424)",
+	        (unsigned long long)target->swap_diag_err_since_log,
+	        (unsigned long long)target->swap_diag_acquire_err,
+	        (unsigned long long)target->swap_diag_present_err, target_swap_site_name(site),
+	        (int)target->swap_diag_last_res,
+	        (unsigned long long)target->swap_diag_suboptimal_since_log,
+	        (unsigned long long)target->swap_diag_suboptimal);
+	target->swap_diag_err_since_log = 0;
+	target->swap_diag_suboptimal_since_log = 0;
 }
 
 xrt_result_t
@@ -3116,6 +3243,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 	                                          dxr_acquire_timeout_ns(), target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
+	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
 		U_LOG_I("Swapchain out of date, recreating");
@@ -3180,6 +3308,7 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 		                                 dxr_acquire_timeout_ns(), target->image_available,
 		                                 VK_NULL_HANDLE, &target->current_index);
+		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
 		if (res != VK_SUCCESS) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
 #ifdef XRT_OS_ANDROID
@@ -3351,6 +3480,7 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
+	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
 
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a

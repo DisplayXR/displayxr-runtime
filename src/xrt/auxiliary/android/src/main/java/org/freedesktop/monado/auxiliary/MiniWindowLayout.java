@@ -261,6 +261,31 @@ public final class MiniWindowLayout {
     private boolean crossChecked = false;
     private boolean scaleMismatchLogged = false;
     @Nullable private String scaleSource = null;
+
+    /**
+     * The OEM has TWO scaled-window families, and one Rect getter each (#1424 eyeball #3).
+     *
+     * <p>{@code NormalWr} is the mini-window the recents "freeform" icon opens (this pad: 0.67,
+     * 723x1129 at 1757,236). {@code HangWr} is the smaller hanging window the drop-zone gesture
+     * parks a task in (0.37, 400x623 at 2137,84); a tap on it toggles it to Normal. The window is
+     * 1080x1685 LOGICAL in both, so nothing about the window itself says which family it is in —
+     * only the origin, the leash, and the window manager's own state getters do. Reading the
+     * NormalWr getter unconditionally, as this used to, sized a 723x1129 buffer for a 400x623 slot:
+     * the leash then composed it at 0.55, and David saw head-tracked, weaving, double-imaged
+     * content. Both candidates are kept so a later measurement can re-pick, and the placement the
+     * pick was made at is remembered so a window that MOVES (the Hang<->Normal toggle keeps the
+     * logical size) is re-read rather than served the stale family.
+     */
+    @Nullable private Rect vendorNormalRect = null;
+    @Nullable private Rect vendorHangRect = null;
+    @Nullable private Rect vendorPickedRect = null;
+    @Nullable private String vendorFamily = null;
+    private int vendorResolvedAtX = Integer.MIN_VALUE;
+    private int vendorResolvedAtY = Integer.MIN_VALUE;
+    private int vendorResolvedAtW = 0;
+    private int vendorResolvedAtH = 0;
+    /** The scale {@link #computeSizes} is currently built on; a different answer re-rationalises. */
+    private float chosenScale = 0f;
     private float touchScale = 0f;
     private float touchScaleSpan = 0f;
     private float touchDownRawX = 0f;
@@ -268,6 +293,27 @@ public final class MiniWindowLayout {
     private float touchDownX = 0f;
     private float touchDownY = 0f;
     private boolean touchDownValid = false;
+
+    /**
+     * Window geometry latched at ACTION_DOWN, and whether it has moved since (#1424).
+     *
+     * <p>The touch ratio is {@code |Δraw| / |Δlocal|} across one drag, which is the container scale
+     * ONLY while the container holds still. The OEM's drop-zone entry gesture is itself a drag that
+     * MOVES the window, so the local frame shifts under the finger and the quotient means nothing.
+     * (Eyeball #2 read its <b>0.3700027</b> as a poisoned sample against a "true" 0.67 — eyeball #3
+     * showed it was in fact the HANG family's real leash, see {@link #vendorHangRect}; the guard is
+     * still right, because a drag that straddles the transition measures neither family.)
+     *
+     * <p>So a drag that straddles a geometry change is discarded by construction. The 40 px minimum
+     * span stays: it rejects a tap, this rejects a MOVING window, and they are different faults.
+     */
+    private int touchDownRectX = 0;
+    private int touchDownRectY = 0;
+    private int touchDownRectW = 0;
+    private int touchDownRectH = 0;
+    private boolean touchDownRectValid = false;
+    private boolean touchStraddledGeometry = false;
+    private boolean touchStraddleLogged = false;
 
     /**
      * "This window is being scaled by its container."
@@ -364,7 +410,18 @@ public final class MiniWindowLayout {
         return on == 1;
     }
 
-    /** Forget everything measured for the previous episode. */
+    /**
+     * Forget everything measured for the previous episode.
+     *
+     * <p>#1424: this now also drops the TOUCH ratio. It used to survive, and a
+     * surviving scale is not inert — it re-arms the 1:1 path against whatever
+     * window trips the tell next. Measured on the NP02J: after a drag had pinned
+     * 0.6700, the 60 px status-bar offset made a FULLSCREEN window spill
+     * ((0,60) 2560x1600 on a 2560x1600 panel), the cached ratio was applied to it,
+     * and the fullscreen surface was briefly re-laid-out to a 1695x1072 buffer.
+     * A scale describes one container, so it dies with that container; the vendor
+     * API (and, in a real mini-window, the next drag) re-measures in milliseconds.
+     */
     public void reset() {
         ratP = 0;
         ratQ = 0;
@@ -372,6 +429,44 @@ public final class MiniWindowLayout {
         vendorScale = 0f;
         vendorRectW = 0;
         vendorRectH = 0;
+        vendorNormalRect = null;
+        vendorHangRect = null;
+        vendorPickedRect = null;
+        vendorFamily = null;
+        vendorResolvedAtX = Integer.MIN_VALUE;
+        vendorResolvedAtY = Integer.MIN_VALUE;
+        vendorResolvedAtW = 0;
+        vendorResolvedAtH = 0;
+        vendorLastTryMs = 0;
+        chosenScale = 0f;
+        touchScale = 0f;
+        touchScaleSpan = 0f;
+        touchDownValid = false;
+        touchDownRectValid = false;
+        touchStraddledGeometry = false;
+        touchStraddleLogged = false;
+        crossChecked = false;
+        scaleMismatchLogged = false;
+        scaleSource = null;
+    }
+
+    /**
+     * The placement changed under the episode (#1424 eyeball #3): forget what was measured IN it.
+     *
+     * <p>A scale describes one placement. The OEM's Hang<->Normal toggle keeps the logical window
+     * size and changes the origin and the leash, so the vendor pick, the touch ratio taken in the
+     * old placement, and the sizing built on either are all stale together. The next sample
+     * re-reads the API immediately (no retry throttle) and the next settled drag re-measures.
+     */
+    private void invalidatePlacement() {
+        vendorScale = 0f;
+        vendorFamily = null;
+        vendorPickedRect = null;
+        vendorLastTryMs = 0;
+        touchScale = 0f;
+        touchScaleSpan = 0f;
+        crossChecked = false;
+        scaleMismatchLogged = false;
     }
 
     /** The rationalised scale that {@link #computeSizes} used, or 0 when it had none. */
@@ -392,49 +487,132 @@ public final class MiniWindowLayout {
     }
 
     /**
-     * The container scale, preferring the vendor API and falling back to the touch ratio. When both
-     * are available they are cross-checked once: on this firmware they agree exactly (0.670000), so
-     * a disagreement means accessibility magnification is multiplied in, or the firmware changed —
-     * neither is a number to guess at, so log once and return 0 (stay on the 2D fallback).
+     * The container scale.
      *
+     * <p>Two sources. The vendor placement API says which family the window manager parked the
+     * task in and that family's post-scale Rect ({@link #queryVendorWrScale}); the touch ratio is a
+     * direct measurement of the composition, taken inside a settled window ({@link
+     * #measureTouchScale}). They are cross-checked whenever both exist.
+     *
+     * <p>Who wins a disagreement has flipped twice, each time on device evidence, so the rule is
+     * spelled out here: <b>the measurement wins</b>.
+     *
+     * <ul>
+     *   <li>Originally a disagreement discarded BOTH (2D fallback). Eyeball #2 showed that throwing
+     *       a correctly weaving window back to flat 2D, so the API was made to win — on the
+     *       reasoning that the touch ratio had been poisoned by the drop-zone drag. That poisoning
+     *       is now prevented at source by the straddle guard in {@link #noteWindowGeometry}: a
+     *       touch ratio that survives was taken in a window that held still.
+     *   <li>Eyeball #3 then showed the API being WRONG. The drop-zone gesture parks the task in
+     *       the OEM's HANG family (400x623 on this pad, leash 0.37) while the NormalWr getter kept
+     *       answering the Normal family's 0.67; trusting it composed a 723x1129 buffer under a 0.55
+     *       leash — head-tracked, weaving, and a double image. The touch ratio had said 0.3700007.
+     * </ul>
+     *
+     * <p>{@link #queryVendorWrScale} now picks the family, so on this firmware the two agree
+     * again. When they still differ, the candidate Rect that explains the measurement is adopted
+     * (its integers pin the rationalisation, see {@link #acceptRational}); if neither does, the
+     * bare measurement is used unpinned. The disagreement is logged once per placement.
+     *
+     * @param x window origin on the panel (post-scale), as published by the geometry sampler
+     * @param y window origin on the panel (post-scale)
+     * @param w window LOGICAL width
+     * @param h window LOGICAL height
      * @return the scale, or 0 when it is not known
      */
-    public float resolveScale(@Nullable Activity activity, int w, int h, int dispW, int dispH) {
-        float api = queryVendorWrScale(activity, w, h, dispW, dispH);
+    public float resolveScale(
+            @Nullable Activity activity, int x, int y, int w, int h, int dispW, int dispH) {
+        float api = queryVendorWrScale(activity, x, y, w, h, dispW, dispH);
         float touch = touchScale;
 
-        if (api > 0f && touch > 0f) {
-            if (Math.abs(api - touch) > 0.01f) {
-                if (!scaleMismatchLogged) {
-                    scaleMismatchLogged = true;
-                    Log.w(
-                            TAG,
-                            "miniWindow1to1: vendor-api scale "
-                                    + api
-                                    + " disagrees with the measured touch ratio "
-                                    + touch
-                                    + " — accessibility magnification, or a firmware change. "
-                                    + "Staying on the 2D fallback rather than picking one.");
-                }
-                return 0f;
+        if (api > 0f && touch > 0f && Math.abs(api - touch) > 0.01f) {
+            Rect explains = null;
+            String fam = null;
+            if (rectExplains(vendorNormalRect, touch, w, h)) {
+                explains = vendorNormalRect;
+                fam = "normal";
+            } else if (rectExplains(vendorHangRect, touch, w, h)) {
+                explains = vendorHangRect;
+                fam = "hang";
             }
-            if (!crossChecked) {
-                crossChecked = true;
-                Log.i(
+            if (!scaleMismatchLogged) {
+                scaleMismatchLogged = true;
+                Log.w(
                         TAG,
-                        "miniWindow1to1: cross-check OK, vendor-api " + api + " == touch " + touch);
+                        "miniWindow1to1: vendor-api scale "
+                                + api
+                                + " ("
+                                + vendorFamily
+                                + " family) disagrees with the measured touch ratio "
+                                + touch
+                                + " — the MEASUREMENT wins"
+                                + (explains != null
+                                        ? ", and the " + fam + " Rect " + explains.width() + "x"
+                                                + explains.height()
+                                                + " explains it, so that family is adopted"
+                                        : "; no candidate Rect explains it, using the ratio"
+                                                + " unpinned")
+                                + " (#1424 eyeball #3)");
             }
+            if (explains != null) {
+                float s = (explains.width() / (float) w + explains.height() / (float) h) * 0.5f;
+                return choose(s, explains.width(), explains.height(), "touch->vendor-api:" + fam);
+            }
+            return choose(touch, 0, 0, "touch");
+        }
+        if (api > 0f && touch > 0f && !crossChecked) {
+            crossChecked = true;
+            Log.i(
+                    TAG,
+                    "miniWindow1to1: cross-check OK, vendor-api "
+                            + api
+                            + " ("
+                            + vendorFamily
+                            + ") == touch "
+                            + touch);
         }
 
-        if (api > 0f) {
-            scaleSource = "vendor-api";
-            return api;
+        if (api > 0f && vendorPickedRect != null) {
+            return choose(
+                    api,
+                    vendorPickedRect.width(),
+                    vendorPickedRect.height(),
+                    "vendor-api:" + vendorFamily);
         }
         if (touch > 0f) {
-            scaleSource = "touch";
-            return touch;
+            return choose(touch, 0, 0, "touch");
         }
         return 0f;
+    }
+
+    /**
+     * Commit the scale the sizing is built on. A different answer than last time — a family
+     * re-pick, a measurement overriding the API, a new placement — drops the cached p/q so {@link
+     * #computeSizes} re-rationalises against the new evidence instead of serving the old buffer.
+     *
+     * @param pinW the Rect width that pins the rationalisation, 0 for none
+     * @param pinH the Rect height that pins the rationalisation, 0 for none
+     */
+    private float choose(float s, int pinW, int pinH, String source) {
+        if (s != chosenScale || pinW != vendorRectW || pinH != vendorRectH) {
+            chosenScale = s;
+            vendorRectW = pinW;
+            vendorRectH = pinH;
+            ratP = 0;
+            ratQ = 0;
+            ratTried = false;
+        }
+        scaleSource = source;
+        return s;
+    }
+
+    /** Does this candidate Rect reproduce scale {@code s} on both axes of a {@code w x h} window? */
+    private static boolean rectExplains(@Nullable Rect r, float s, int w, int h) {
+        if (r == null || w <= 0 || h <= 0 || s <= 0f) {
+            return false;
+        }
+        return Math.abs(r.width() / (float) w - s) <= 0.01f
+                && Math.abs(r.height() / (float) h - s) <= 0.01f;
     }
 
     /**
@@ -604,21 +782,48 @@ public final class MiniWindowLayout {
     }
 
     /**
-     * S9 probe result (b): {@code ActivityManager.getDefaultWindowParamByTaskForNormalWr(taskId)}
-     * is a hidden TEST-API that is NOT on this build's blocklist and returns the POST-SCALE
-     * on-screen Rect for an ordinary app uid, no permission needed.
+     * S9 probe result (b): {@code ActivityManager}'s hidden WindowReply TEST-API surface is NOT on
+     * this build's blocklist and answers an ordinary app uid, no permission needed. It carries one
+     * POST-SCALE placement Rect getter per family — {@code getDefaultWindowParamByTaskForNormalWr
+     * (taskId)} and {@code getDefaultWindowParamByTaskForHangWr(taskId, 0)} — plus the state getters
+     * {@code isTopRootTaskNormalFreeformWR()} / {@code isTopRootTaskHangFreeformWR()} /
+     * {@code topRootTaskIdFreeformWR()}.
      *
-     * <p>MUST BE GATED ON THE TELL by the caller, and that gate is load-bearing: the method returns
-     * the NOMINAL window-reply placement whether or not the app is actually in a mini-window — in
-     * fullscreen it still answers {@code Rect(1757,236-2481,1365)}. An ungated read would shrink a
-     * fullscreen buffer to 724x1129.
+     * <p>MUST BE GATED ON THE TELL by the caller, and that gate is load-bearing: the Rect getters
+     * return the NOMINAL placement whether or not the app is actually in a mini-window — in
+     * fullscreen NormalWr still answers {@code Rect(1757,236-2481,1365)}. An ungated read would
+     * shrink a fullscreen buffer to 724x1129.
+     *
+     * <p>WHICH FAMILY (#1424 eyeball #3) is decided by the first discriminator that answers, in this
+     * order, and the choice is logged with its reason:
+     *
+     * <ol>
+     *   <li><b>state</b> — the window manager's own getters, guarded so they describe THIS task;
+     *   <li><b>origin</b> — the candidate whose Rect origin is where the window actually is (the
+     *       geometry sampler publishes the post-scale origin: 2137,84 IS the hang slot);
+     *   <li><b>touch</b> — the candidate a settled touch ratio agrees with;
+     *   <li><b>panel-fit</b> — the candidate whose Rect fits the panel from this origin (a 723 px
+     *       Normal buffer at x=2137 on a 2560 px panel does not; the 400 px Hang one does — the
+     *       "OFF_PANEL_PLACEMENT" the compositor reported was this wrong family, not a real
+     *       off-panel window);
+     *   <li><b>default</b> — Normal, the historical behaviour.
+     * </ol>
+     *
+     * <p>The answer is cached per PLACEMENT, not per episode: a window whose origin or logical size
+     * changed is re-read, because the Hang→Normal tap keeps the size and changes the leash.
      *
      * @return the scale, or 0 when unavailable or implausible
      */
     private float queryVendorWrScale(
-            @Nullable Activity activity, int w, int h, int dispW, int dispH) {
+            @Nullable Activity activity, int x, int y, int w, int h, int dispW, int dispH) {
         if (vendorScale > 0f) {
-            return vendorScale; // resolved once per scaled-container episode
+            if (x == vendorResolvedAtX
+                    && y == vendorResolvedAtY
+                    && w == vendorResolvedAtW
+                    && h == vendorResolvedAtH) {
+                return vendorScale; // resolved once per placement
+            }
+            invalidatePlacement();
         }
         long now = SystemClock.uptimeMillis();
         if (now - vendorLastTryMs < VENDOR_RETRY_MS) {
@@ -634,54 +839,205 @@ public final class MiniWindowLayout {
             if (am == null) {
                 return 0f;
             }
-            Rect r = null;
-            try {
-                r =
-                        (Rect)
-                                am.getClass()
-                                        .getMethod(
-                                                "getDefaultWindowParamByTaskForNormalWr", int.class)
-                                        .invoke(am, activity.getTaskId());
-            } catch (Throwable ignored) {
-                r = null;
+            int taskId = activity.getTaskId();
+
+            Rect normal =
+                    callRect(
+                            am,
+                            "getDefaultWindowParamByTaskForNormalWr",
+                            new Class<?>[] {int.class},
+                            new Object[] {taskId});
+            if (!usableRect(normal)) {
+                normal =
+                        callRect(
+                                am,
+                                "getDefaultWindowParamForNormalWr",
+                                new Class<?>[] {boolean.class},
+                                new Object[] {Boolean.FALSE});
             }
-            if (r == null || r.width() <= 0 || r.height() <= 0) {
-                try {
-                    r =
-                            (Rect)
-                                    am.getClass()
-                                            .getMethod(
-                                                    "getDefaultWindowParamForNormalWr",
-                                                    boolean.class)
-                                            .invoke(am, Boolean.FALSE);
-                } catch (Throwable ignored) {
-                    return 0f;
+            Rect hang =
+                    callRect(
+                            am,
+                            "getDefaultWindowParamByTaskForHangWr",
+                            new Class<?>[] {int.class, int.class},
+                            new Object[] {taskId, 0});
+            if (!usableRect(hang)) {
+                hang =
+                        callRect(
+                                am,
+                                "getDefaultWindowParamForHangWr",
+                                new Class<?>[] {boolean.class, int.class},
+                                new Object[] {Boolean.FALSE, 0});
+            }
+            normal = plausibleRect(normal, w, h, dispW, dispH);
+            hang = plausibleRect(hang, w, h, dispW, dispH);
+            vendorNormalRect = normal;
+            vendorHangRect = hang;
+            if (normal == null && hang == null) {
+                return 0f;
+            }
+
+            Rect pick = null;
+            String fam = null;
+            String why = null;
+
+            // 1. The window manager's own state, when it is talking about THIS task.
+            Integer topId = callInt(am, "topRootTaskIdFreeformWR");
+            if (topId == null || topId == taskId) {
+                if (hang != null && Boolean.TRUE.equals(callBool(am, "isTopRootTaskHangFreeformWR"))) {
+                    pick = hang;
+                    fam = "hang";
+                    why = "state";
+                } else if (normal != null
+                        && Boolean.TRUE.equals(callBool(am, "isTopRootTaskNormalFreeformWR"))) {
+                    pick = normal;
+                    fam = "normal";
+                    why = "state";
                 }
             }
-            if (r == null || r.width() <= 0 || r.height() <= 0) {
-                return 0f;
+            // 2. The placement whose origin is where this window actually is.
+            if (pick == null) {
+                boolean mN = originMatches(normal, x, y);
+                boolean mH = originMatches(hang, x, y);
+                if (mN != mH) {
+                    pick = mN ? normal : hang;
+                    fam = mN ? "normal" : "hang";
+                    why = "origin";
+                }
             }
-            // A result that does not fit the panel is not an on-screen rect.
-            if (dispW > 0 && dispH > 0 && (r.width() > dispW || r.height() > dispH)) {
-                return 0f;
+            // 3. The placement a settled touch measurement agrees with.
+            if (pick == null && touchScale > 0f) {
+                boolean eN = rectExplains(normal, touchScale, w, h);
+                boolean eH = rectExplains(hang, touchScale, w, h);
+                if (eN != eH) {
+                    pick = eN ? normal : hang;
+                    fam = eN ? "normal" : "hang";
+                    why = "touch";
+                }
             }
-            float sx = r.width() / (float) w;
-            float sy = r.height() / (float) h;
-            // One leash scales both axes, so the two ratios must agree — to within
-            // whatever the Rect's whole-pixel quantisation allows at THIS size. See
-            // axisAgreeTol (runtime#1399).
-            if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > axisAgreeTol(w, h)) {
-                return 0f;
+            // 4. The placement that fits the panel from this origin.
+            if (pick == null) {
+                boolean fN = fitsFrom(normal, x, y, dispW, dispH);
+                boolean fH = fitsFrom(hang, x, y, dispW, dispH);
+                if (fN != fH) {
+                    pick = fN ? normal : hang;
+                    fam = fN ? "normal" : "hang";
+                    why = "panel-fit";
+                }
             }
-            // Keep the RAW rect: the rationalisation round-trips against these integers
-            // rather than against the lossy float, which is the only evidence that
-            // actually pins the scale.
-            vendorRectW = r.width();
-            vendorRectH = r.height();
+            // 5. Historical default.
+            if (pick == null) {
+                pick = normal != null ? normal : hang;
+                fam = normal != null ? "normal" : "hang";
+                why = "default";
+            }
+
+            float sx = pick.width() / (float) w;
+            float sy = pick.height() / (float) h;
             vendorScale = (sx + sy) * 0.5f;
+            vendorFamily = fam;
+            vendorPickedRect = pick;
+            vendorResolvedAtX = x;
+            vendorResolvedAtY = y;
+            vendorResolvedAtW = w;
+            vendorResolvedAtH = h;
+            // ONE line per placement — a lifecycle event.
+            Log.i(
+                    TAG,
+                    "miniWindow1to1: vendor-api family="
+                            + fam
+                            + " by "
+                            + why
+                            + " scale="
+                            + vendorScale
+                            + " normal="
+                            + rectString(normal)
+                            + " hang="
+                            + rectString(hang)
+                            + " window "
+                            + x
+                            + ","
+                            + y
+                            + " "
+                            + w
+                            + "x"
+                            + h
+                            + " panel "
+                            + dispW
+                            + "x"
+                            + dispH
+                            + " (#1424)");
             return vendorScale;
         } catch (Throwable t) {
             return 0f;
+        }
+    }
+
+    private static boolean usableRect(@Nullable Rect r) {
+        return r != null && r.width() > 0 && r.height() > 0;
+    }
+
+    /**
+     * A candidate Rect is plausible when it is a post-scale on-screen rect for a {@code w x h}
+     * logical window: it fits the panel, and both axes agree on one leash to within the Rect's
+     * whole-pixel quantisation at this size (axisAgreeTol, runtime#1399).
+     *
+     * @return the Rect, or null when it is not a scale for this window
+     */
+    @Nullable private static Rect plausibleRect(@Nullable Rect r, int w, int h, int dispW, int dispH) {
+        if (!usableRect(r) || w <= 0 || h <= 0) {
+            return null;
+        }
+        if (dispW > 0 && dispH > 0 && (r.width() > dispW || r.height() > dispH)) {
+            return null;
+        }
+        float sx = r.width() / (float) w;
+        float sy = r.height() / (float) h;
+        if (sx < 0.2f || sx > 1.0f || Math.abs(sx - sy) > axisAgreeTol(w, h)) {
+            return null;
+        }
+        return r;
+    }
+
+    private static boolean originMatches(@Nullable Rect r, int x, int y) {
+        return r != null && Math.abs(r.left - x) <= 2 && Math.abs(r.top - y) <= 2;
+    }
+
+    private static boolean fitsFrom(@Nullable Rect r, int x, int y, int dispW, int dispH) {
+        if (r == null || dispW <= 0 || dispH <= 0) {
+            return false;
+        }
+        return x + r.width() <= dispW && y + r.height() <= dispH;
+    }
+
+    private static String rectString(@Nullable Rect r) {
+        return r == null ? "none" : r.width() + "x" + r.height() + "@" + r.left + "," + r.top;
+    }
+
+    @Nullable private static Rect callRect(Object am, String name, Class<?>[] sig, Object[] args) {
+        try {
+            Object r = am.getClass().getMethod(name, sig).invoke(am, args);
+            return r instanceof Rect ? (Rect) r : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Nullable private static Boolean callBool(Object am, String name) {
+        try {
+            Object r = am.getClass().getMethod(name).invoke(am);
+            return r instanceof Boolean ? (Boolean) r : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Nullable private static Integer callInt(Object am, String name) {
+        try {
+            Object r = am.getClass().getMethod(name).invoke(am);
+            return r instanceof Integer ? (Integer) r : null;
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -696,6 +1052,42 @@ public final class MiniWindowLayout {
      * surface-binding path (#1396) never sees the app's MotionEvents, so it is vendor-API only —
      * unless the app itself measures the ratio and forwards it, which the spec leaves open.
      */
+    /**
+     * Tell the ratio measurement that the window's geometry changed (#1424).
+     *
+     * <p>Called from the geometry sampler on every rect it sees, INCLUDING the ones it skips as
+     * torn or transposed — a skipped sample is still evidence that the window is in motion, which
+     * is exactly what invalidates an in-flight drag. Cheap: four int compares.
+     */
+    public void noteWindowGeometry(int x, int y, int w, int h) {
+        if (touchDownRectValid && (x != touchDownRectX || y != touchDownRectY || w != touchDownRectW
+                || h != touchDownRectH)) {
+            // #1424 eyeball #3: a ratio measured in the PREVIOUS placement describes the
+            // previous leash (the Hang->Normal tap keeps the size and changes the leash from
+            // 0.37 to 0.67). Drop it with the placement; the next settled drag re-measures.
+            touchScale = 0f;
+            touchScaleSpan = 0f;
+            touchStraddledGeometry = true;
+            if (!touchStraddleLogged) {
+                touchStraddleLogged = true;
+                Log.i(
+                        TAG,
+                        "miniWindow1to1: discarding the in-flight touch ratio — the window moved"
+                                + " under the drag ("
+                                + touchDownRectX + "," + touchDownRectY + " "
+                                + touchDownRectW + "x" + touchDownRectH
+                                + " -> " + x + "," + y + " " + w + "x" + h
+                                + "); that drag is the container transition, not a measurement"
+                                + " inside a settled window (#1424)");
+            }
+        }
+        touchDownRectX = x;
+        touchDownRectY = y;
+        touchDownRectW = w;
+        touchDownRectH = h;
+        touchDownRectValid = true;
+    }
+
     public void measureTouchScale(android.view.MotionEvent ev) {
         final int action = ev.getActionMasked();
         if (action == android.view.MotionEvent.ACTION_DOWN) {
@@ -704,6 +1096,7 @@ public final class MiniWindowLayout {
             touchDownX = ev.getX();
             touchDownY = ev.getY();
             touchDownValid = true;
+            touchStraddledGeometry = false;
             return;
         }
         if (!touchDownValid
@@ -713,6 +1106,11 @@ public final class MiniWindowLayout {
         }
         if (action == android.view.MotionEvent.ACTION_UP) {
             touchDownValid = false;
+        }
+        if (touchStraddledGeometry) {
+            // The window moved during this drag: the local frame shifted under the
+            // finger, so the quotient is not a scale. See noteWindowGeometry.
+            return;
         }
         float localSpan = Math.abs(ev.getX() - touchDownX) + Math.abs(ev.getY() - touchDownY);
         if (localSpan < TOUCH_MIN_SPAN_PX) {
@@ -761,7 +1159,7 @@ public final class MiniWindowLayout {
             self = new MiniWindowLayout();
             sForActivity = self;
         }
-        float s = self.resolveScale(activity, w, h, dispW, dispH);
+        float s = self.resolveScale(activity, x, y, w, h, dispW, dispH);
         if (s <= 0f) {
             return null;
         }
