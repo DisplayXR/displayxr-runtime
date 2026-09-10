@@ -2245,9 +2245,25 @@ comp_vk_split_weave_and_present(struct comp_vk_split *s, bool is_repaint, const 
 		comp_d3d11_target_weave_mark(s->target, /*predicted_display_time_ns=*/0, s->mode_3d);
 	}
 
-	// Hand the vendor eye predictor last frame's MEASURED weave->scanout
-	// residual, so it runs with an exact horizon (0 = unknown, DP heuristic).
-	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target), 0);
+	/*
+	 * Hand the vendor eye predictor last frame's MEASURED weave->scanout
+	 * residual, so it runs with an exact horizon (0 = unknown, DP heuristic)
+	 * -- AND the display period, which this arm passed as a literal 0.
+	 *
+	 * `frame_period_ns` is documented "Display refresh period; 0 = unknown",
+	 * and the app's own d3d12 arm has always passed the real value
+	 * (U_TIME_1S_IN_NS / display_refresh_rate). Only the reroute's fill arm
+	 * said "unknown", leaving the DP to infer the period itself. The governor
+	 * on this target already knows it, so there is no reason to withhold it.
+	 *
+	 * NOT a fix for the #1339 lateral shiver -- that was the hypothesis this
+	 * change was written to test, and it was WRONG: with the real period
+	 * passed (verified non-zero, log shows "display period 16.7 ms") the
+	 * shiver is unchanged. Kept because the inconsistency is real on its own
+	 * terms: two arms told the same DP different things about the same panel.
+	 */
+	xrt_display_processor_d3d11_set_frame_timing(s->dp, comp_d3d11_target_get_measured_weave_ns(s->target),
+	                                             comp_d3d11_target_get_display_period_ns(s->target));
 
 	// #206: and the FORWARD-computed horizon for THIS weave, from the
 	// vsync-locked vblank grid — exact per weave, no estimator lag under

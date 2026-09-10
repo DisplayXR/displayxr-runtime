@@ -786,6 +786,18 @@ comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t 
 }
 
 extern "C" uint64_t
+comp_d3d11_target_get_display_period_ns(struct comp_d3d11_target *target)
+{
+	(void)target;
+	// The governor seeds this from the compositor's queried refresh rate and
+	// refines it from DXGI frame statistics, so it is the one place on this
+	// target that knows the real period. <= 0 means "not measured yet", which
+	// the DP contract spells "0 = unknown".
+	const double p = g_lw_gov_d3d11.period_ns;
+	return (p > 0.0) ? (uint64_t)p : 0;
+}
+
+extern "C" uint64_t
 comp_d3d11_target_get_measured_weave_ns(struct comp_d3d11_target *target)
 {
 	(void)target;
