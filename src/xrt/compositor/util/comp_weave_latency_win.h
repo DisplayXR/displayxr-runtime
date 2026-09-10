@@ -94,6 +94,16 @@ struct weave_latency_log
 	uint64_t hz_sum_ns = 0;
 	uint32_t hz_n = 0;
 	uint32_t hz_jumps = 0; // consecutive-weave deltas >= half a refresh period
+	//! #1432 closed loop: predicted horizon vs the vblank the frame really
+	//! hit. A |error| >= half a period is a WRONG SLOT CALL — the flip the
+	//! predictor made (or failed to make) did not match reality. Flips that
+	//! match reality are correct and must not be smoothed away.
+	//! Resolved from after_present, one to a few presents after the
+	//! prediction, so a window's `resolved` lags its `n` by the resolve
+	//! depth — read the two as neighbours, not as a ratio.
+	uint32_t hz_resolved = 0;
+	uint32_t hz_wrong_slot = 0;
+	uint64_t hz_abs_err_sum_ns = 0;
 
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
@@ -112,9 +122,16 @@ struct weave_latency_log
 		//! the scanout below). 0 = the caller did not supply one.
 		uint64_t predicted_ns;
 		bool repaint; //!< #868: this weave had no app frame behind it
+		//! #1432: the forward horizon handed to the DP for this weave and the
+		//! QPC it was measured from, so the realised scanout can be checked
+		//! against it. 0 = no horizon was computed for this weave.
+		uint64_t horizon_ns;
+		uint64_t horizon_base_qpc;
 	};
 	uint64_t pending_predicted_ns = 0; // armed by mark_weave, consumed by after_present
 	bool pending_repaint = false;      // #868: this weave re-wove an unchanged atlas
+	uint64_t pending_horizon_ns = 0;   // #1432: armed by predict_weave_to_scanout_ns
+	uint64_t pending_horizon_base_qpc = 0;
 	//! #1051: last SyncQPCTime emitted as an S row, so stale-mixed stats can
 	//! be suppressed from the CSV (see the S-row write in after_present).
 	uint64_t last_s_sync_qpc = 0;
@@ -138,7 +155,19 @@ struct weave_latency_log
 	uint64_t last_sync_qpc = 0;      // newest vblank timestamp seen; monotone
 	uint64_t last_sync_refresh = 0;  // SyncRefreshCount at that vblank
 	uint64_t refresh_period_qpc = 0; // TRUE measured vblank period; 0 = unknown
-	uint64_t headroom_qpc = 0;       // last frame's mark→present-return cost
+	/*!
+	 * Last frame's mark→present-return cost, kept per weave POPULATION
+	 * (#1432). An app weave sits behind the frame-latency waitable at the
+	 * governor's depth; a repaint never waits on it and is paced to one
+	 * panel period — the same two populations #868 already keeps apart for
+	 * `measured_r_ns`, for the same reason. Feeding both into one value
+	 * made the forward horizon's headroom alternate between them, and when
+	 * the two sit either side of a vblank boundary the horizon flipped by a
+	 * whole refresh period on alternate weaves (the #1431 trace: 0 flips/s
+	 * on a trivial app that never repaints, up to 8.6/s on a heavy one).
+	 */
+	uint64_t headroom_qpc = 0;         // app weaves
+	uint64_t headroom_repaint_qpc = 0; // repaint weaves (#868 population)
 
 	uint64_t
 	freq()
@@ -196,14 +225,19 @@ struct weave_latency_log
 	 *
 	 * The prediction is the first vblank after now + headroom, where the
 	 * headroom is the measured cost of getting a weave from its record
-	 * mark through submit and present into the queue (last frame's value,
-	 * clamped to [1 ms, one refresh]). A stale-but-on-grid SyncQPCTime is
+	 * mark through submit and present into the queue (the last value from
+	 * THIS weave's population — app or repaint, #1432 — clamped to
+	 * [1 ms, one refresh]). A stale-but-on-grid SyncQPCTime is
 	 * harmless: it only shifts the base by whole periods, and the period
 	 * itself is measured, not nominal, so the grid does not drift.
 	 */
 	uint64_t
 	predict_weave_to_scanout_ns()
 	{
+		// #1432: no horizon on record until one is computed below, so a
+		// weave that returns 0 (kill switch, no grid) resolves to nothing.
+		pending_horizon_ns = 0;
+		pending_horizon_base_qpc = 0;
 		// Kill switch: DXR_DP_FORWARD_HORIZON=0 returns "unknown" everywhere,
 		// so the plug-in falls back to its retrospective heuristic — the
 		// pre-#206 behavior, byte for byte.
@@ -228,7 +262,12 @@ struct weave_latency_log
 		if (nowq - last_sync_qpc > f2 / 2) {
 			return 0; // statistics stalled >500 ms — grid not trusted
 		}
-		uint64_t head = headroom_qpc;
+		// #1432: headroom from THIS weave's population; fall back to the
+		// other one only while ours has never been measured.
+		uint64_t head = pending_repaint ? headroom_repaint_qpc : headroom_qpc;
+		if (head == 0) {
+			head = pending_repaint ? headroom_qpc : headroom_repaint_qpc;
+		}
 		const uint64_t head_min = f2 / 1000; // 1 ms
 		if (head < head_min) {
 			head = head_min;
@@ -243,7 +282,30 @@ struct weave_latency_log
 		const uint64_t horizon_ns = (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
 		const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * 1000000000.0 / (double)f2);
 		note_horizon(horizon_ns, period_ns);
+		// #1432: remember what we told the DP, so after_present can check it
+		// against the vblank this weave really lands on.
+		pending_horizon_ns = horizon_ns;
+		pending_horizon_base_qpc = nowq;
 		return horizon_ns;
+	}
+
+	/*!
+	 * #1432: one resolved weave — the realised weave→scanout of a frame
+	 * against the forward horizon it was handed. Aggregated into the
+	 * DXR_DP_FORWARD_HORIZON_TRACE row; no-op when the trace is off.
+	 */
+	void
+	note_horizon_outcome(int64_t err_ns, uint64_t period_ns)
+	{
+		if (hz_trace != HZ_ON || period_ns == 0) {
+			return;
+		}
+		const uint64_t a = (uint64_t)(err_ns < 0 ? -err_ns : err_ns);
+		hz_resolved++;
+		hz_abs_err_sum_ns += a;
+		if (a >= period_ns / 2) {
+			hz_wrong_slot++;
+		}
 	}
 
 	/*!
@@ -290,12 +352,15 @@ struct weave_latency_log
 			return;
 		}
 		const double secs = (double)(now_ns - hz_win_start_ns) / 1e9;
-		U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
-		        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)",
-		        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
-		        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
-		        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps,
-		        (double)hz_jumps / secs);
+		U_LOG_W(
+		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
+		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
+		    "| resolved %u  wrong-slot %u (%.1f%%)  mean |err| %.2f ms",
+		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
+		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
+		    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_wrong_slot,
+		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
+		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0);
 
 		hz_win_start_ns = now_ns;
 		hz_min_ns = 0;
@@ -303,6 +368,9 @@ struct weave_latency_log
 		hz_sum_ns = 0;
 		hz_n = 0;
 		hz_jumps = 0;
+		hz_resolved = 0;
+		hz_wrong_slot = 0;
+		hz_abs_err_sum_ns = 0;
 	}
 
 	/*!
@@ -832,10 +900,17 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 			// the headroom the forward predictor adds before snapping to the
 			// next vblank.
 			if ((uint64_t)now.QuadPart > qpc_weave) {
-				headroom_qpc = (uint64_t)now.QuadPart - qpc_weave;
+				// #1432: into THIS weave's population only — see the
+				// field comment; repaints and app weaves must not share.
+				if (pending_repaint) {
+					headroom_repaint_qpc = (uint64_t)now.QuadPart - qpc_weave;
+				} else {
+					headroom_qpc = (uint64_t)now.QuadPart - qpc_weave;
+				}
 			}
 			// Track for the timing loop.
-			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns, pending_repaint};
+			ring[ring_head] = {present_count, qpc_weave, pending_predicted_ns, pending_repaint,
+			                   pending_horizon_ns, pending_horizon_base_qpc};
 			ring_head = (ring_head + 1) % 8;
 			if (ring_count < 8) {
 				ring_count++;
@@ -850,6 +925,8 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 			}
 			qpc_weave = 0;
 			pending_repaint = false;
+			pending_horizon_ns = 0;
+			pending_horizon_base_qpc = 0;
 		}
 
 		DXGI_FRAME_STATISTICS stats = {};
@@ -926,6 +1003,37 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						                    (int64_t)ring[idx].predicted_ns));
 					}
 					break;
+				}
+			}
+			/*
+			 * #1432: predicted vs realised horizon — its OWN pass, not the
+			 * loop above. That loop breaks on the newest entry whose weave
+			 * precedes SyncQPCTime, which on the #1051 stale-sync configs is
+			 * an OLDER present than stats.PresentCount; the exact entry we
+			 * need would never be reached. And it re-selects the same entry
+			 * on every repeated statistics sample, which is fine for the
+			 * idempotent consumers above but would double-count here — so
+			 * the entry is CONSUMED (horizon_ns = 0) once resolved.
+			 *
+			 * Exact PresentCount only: a skipped-ahead SyncQPCTime belongs
+			 * to a later present and would read as a whole-period miss that
+			 * never happened. Trace-gated so the default path pays nothing.
+			 */
+			if (hz_trace == HZ_ON && refresh_period_qpc != 0) {
+				for (int i = 0; i < ring_count; i++) {
+					int idx = (ring_head - 1 - i + 16) % 8;
+					if (ring[idx].horizon_ns != 0 && ring[idx].present_count == stats.PresentCount &&
+					    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].horizon_base_qpc) {
+						const double k = 1000000000.0 / (double)freq();
+						const int64_t realised_ns =
+						    (int64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
+						                       ring[idx].horizon_base_qpc) *
+						              k);
+						note_horizon_outcome(realised_ns - (int64_t)ring[idx].horizon_ns,
+						                     (uint64_t)((double)refresh_period_qpc * k));
+						ring[idx].horizon_ns = 0; // consumed
+						break;
+					}
 				}
 			}
 			// #1051: on slow-app configs GetFrameStatistics can report an
