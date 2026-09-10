@@ -78,6 +78,7 @@ Tiering:
 | **R6** | **1:1 panel pixels** — no compat scaling, WM bounds == composited layer | REQUIRED | **PLATFORM** | **OPEN — now MEASURED** on the OEM mini-window path |
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
 | **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence | REQUIRED | **PLATFORM** | Works today — don't regress |
+| **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
 | **S2** | **Per-PIXEL** click-through at full opacity (per-region touchability); *plus*, for apps that must keep a foreground Activity, an untrusted-touch exemption + scoping the per-Activity input sink | NICE TO HAVE | **PLATFORM** | **NARROWED** — per-FRAME click-through at full opacity is SOLVED on stock via a tight touchable overlay (#1110); only per-pixel precision and the foreground-Activity case remain |
 | **S3** | ~~Wait-semaphore hook into the vendor interlacer~~ | — | VENDOR | **NOT AN ASK — withdrawn.** The hook already existed; we were passing NULL. Documentation-only PR open |
@@ -703,6 +704,67 @@ state in one shot — resident, non-isolated, declared foreground-service type,
 `isFrozen=true` is a FAIL. The 15-minute soak and the app-op-survives-update
 check above are still manual — the probe reports the instant, not the policy over
 time.
+
+---
+
+### R9 — The touch controller must report every held contact in every frame
+
+**Owner:** **PLATFORM** — touch-controller firmware, or the OEM's default touch
+configuration · **Status:** **OPEN — measured on the reference device 2026-09-09**
+· **Traces to:** press-and-hold game controls unusable in *every* browser on the
+reference device (a DisplayXR browser issue that turned out not to be one)
+
+**Mechanism.** While two fingers are held on the glass, the touch controller
+must report **both** contacts in **every** report frame. On the reference device,
+at the OEM's default **240 Hz** touch report rate, the controller reports the
+*first-down* finger only in every other frame the moment a second finger lands:
+the raw frames alternate touch-count `1, 2, 1, 2 …` with a contiguous frame
+counter, so nothing is lost in transit — the firmware simply omits the contact.
+The kernel driver faithfully emits a slot release plus a new tracking id every
+~4 ms, Android turns that into `ACTION_UP` / `ACTION_DOWN`, and every browser
+turns it into `touchend` / `touchstart` (508 spurious releases in a 5.4 s hold).
+A **single** motionless finger is clean (7 s, one release). At the **120 Hz**
+report rate (`/proc/touchscreen/tp_report_rate = 0` on the reference device) the
+same two-finger hold produces **zero** spurious releases.
+
+The OEM's own touch layer already *detects* the pattern — it logs a repeated
+"single ghost detect, touch id 0" on the held finger — and does not act on it. The
+cheapest fix is therefore a **default report rate of 120 Hz** (one configuration
+value) until the controller firmware is corrected; the OEM's refresh-rate service
+currently re-asserts 240 Hz on every app resume, so a one-time write does not
+survive.
+
+**Consequence if absent.** Any press-and-hold control that coexists with a
+second finger — hold a button, steer with the other hand — releases ~120 times a
+second. A held button cuts out, a long-press never completes because every drop
+restarts its timer, and a second finger often "never arrives" because the first
+sequence has already ended. This is not a 3D or DisplayXR failure; it breaks every
+two-finger game control on the device, in the stock browser and in native apps
+alike, and it is silent: the events are well-formed `UP`s, indistinguishable from
+a real lift.
+
+**DisplayXR fallback.** **None in any DisplayXR component**, deliberately — the
+events are correct at every layer we own (verified by injecting a two-finger hold
+at the kernel evdev layer, which passed cleanly through InputReader,
+InputDispatcher and both browsers), and a browser-side coalescing filter would be
+device-quirk code that still leaves stock-browser users broken. What we ship is
+guidance: web apps with press-and-hold controls treat a lift as provisional for
+~250 ms and adopt a re-landing finger as the same press (the pitfall register in
+the web SDK's porting guide). That tolerance is a workaround for this defect, not
+a contract.
+
+**Acceptance test.** On a bench unit with the shipping touch configuration, hold
+one finger on the glass, land a second finger next to it, hold both for 5 s, and
+count digitizer releases from the raw event stream:
+
+```
+adb shell getevent -lt /dev/input/eventN | grep -c 'TRACKING_ID   ffffffff'
+```
+
+(`eventN` = the touchscreen node from `getevent -lp`.) Expect **exactly 2** over
+the whole gesture — one per lift. Any count in the hundreds is this defect. The
+result must hold at the **default** report rate the device ships with, not only
+after a manual write to the report-rate node.
 
 ---
 
