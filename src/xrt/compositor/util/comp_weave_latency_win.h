@@ -66,8 +66,11 @@ struct weave_latency_log
 	 * answer jumps a whole refresh period, with no hysteresis, smoothing or
 	 * deadband (the engage WARN says as much). The DP hands that number to the
 	 * vendor eye predictor, so a period-sized jump asks it to extrapolate the
-	 * eyes ~16.7 ms further on one weave than the last — an interlace-phase
-	 * step, visible as shiver on LATERAL head motion and on nothing else.
+	 * eyes ~16.7 ms further on one weave than the last. The HYPOTHESIS was
+	 * that this shows up as an interlace-phase step on lateral head motion;
+	 * it was tested against the #1339 lateral shiver (DXR_DP_FORWARD_HORIZON=0
+	 * verified engaged) and is NOT its cause. The flip itself is real and
+	 * app-dependent, so it is reported as a defect in its own right.
 	 *
 	 * A trivial app never shows it (small, steady headroom sits well inside
 	 * one slot); an app with large or variable headroom straddles the boundary.
