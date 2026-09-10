@@ -308,6 +308,20 @@ to the retrospective `set_frame_timing` heuristic — the pre-#206 behavior. Wir
 split/bridge, d3d11, and d3d12 weave paths; the in-process VK dcomp path has no vblank
 source (no statistics, no `present_wait` on Intel) and honestly reports 0.
 
+The horizon is "first vblank after now + headroom", where the headroom is last frame's
+mark→present-return cost — so it is a **step function** of that cost and legitimately jumps a
+whole period when the weave will land one vblank later. What must **not** happen is the
+headroom alternating between two unrelated populations: an app weave sits behind the
+frame-latency waitable at the governor's depth while a repaint never waits on it and paces
+to one panel period (the #868 split). Until #1432 one `headroom_qpc` fed both, and a heavy app
+that interleaves repaints flipped the horizon on alternate weaves (0 flips/s on a trivial app,
+up to 8.6/s on the Unity avatar, per `DXR_DP_FORWARD_HORIZON_TRACE`); the headroom is now kept
+per population and selected by the weave kind. The trace also closes the loop — each weave's
+predicted horizon is checked against the vblank DXGI says it really hit (exact `PresentCount`
+match only), so a remaining flip can be told apart from a *wrong slot call* (|error| ≥ half a
+period). Hysteresis was deliberately **not** added: a flip that matches reality is correct,
+and smoothing it would be the constant-standing-in-for-a-varying-quantity shape above.
+
 ### Prediction horizon — computed by the DP, no runtime env var
 
 The runtime feeds the DP a **measured weave→scanout residual** through its frame-timing loop. A DP
