@@ -705,9 +705,9 @@ TEST_CASE("mini-window tell: container-scaled degrade separates scale from place
 		const char *name;
 		int32_t x, y;
 		uint32_t w, h, dispW, dispH;
-		bool spills;        //!< raw tell
-		bool extent_fits;   //!< extent alone
-		bool degrade;       //!< the decision
+		bool spills;      //!< raw tell
+		bool extent_fits; //!< extent alone
+		bool degrade;     //!< the decision
 	};
 
 	// clang-format off
@@ -766,75 +766,148 @@ TEST_CASE("mini-window tell: container-scaled degrade separates scale from place
 }
 
 /*
- * runtime#1424 eyeball #2: the SCALE-SOURCE contract.
- *
- * These two rules cost a correctly-hinted, already-weaving window three seconds
- * of life on the pad, so they are pinned:
+ * runtime#1424 eyeballs #2-#5: the SCALE-SOURCE contract, as it stands after
+ * four device rounds. Each rule below was paid for on the pad:
  *
  *   1. A drag that STRADDLES a window-geometry change is not a scale
- *      measurement. The OEM's drop-zone entry gesture is exactly such a drag --
- *      it MOVES the window under the finger -- and it produced a touch ratio of
- *      0.3700027 against a true 0.67020005.
- *   2. When both sources answer, the VENDOR API wins. It is a direct read of the
- *      placement the window manager applied; the touch ratio is inferred across
- *      two coordinate spaces during a gesture. The old code discarded BOTH on
- *      disagreement and fell back to flat 2D, which is how the bogus 0.37 threw
- *      away the good 0.67.
+ *      measurement (eyeball #2). The OEM's drop-zone gesture MOVES the window
+ *      under the finger, so the quotient across it means nothing. And a ratio
+ *      measured in the PREVIOUS placement describes the previous leash, so a
+ *      geometry change drops it too (the Hang->Normal tap keeps the logical
+ *      size and changes the leash from 0.37 to 0.67).
+ *   2. The OEM has TWO scaled-window families and the vendor API describes
+ *      both (eyeball #3). Reading the Normal getter unconditionally sized a
+ *      723x1129 buffer for the Hang window's 400x623 slot: weaving, head-
+ *      tracked, double image. queryVendorWrScale must query both families and
+ *      choose by, in order: the window manager's own state, the origin match,
+ *      a settled touch ratio, panel fit, and only then the historical default.
+ *   3. When the API and a SETTLED touch ratio still disagree, the MEASUREMENT
+ *      wins (eyeball #3 again: the API was the wrong one). A disagreement may
+ *      re-pick the family whose Rect explains the measurement; it may never
+ *      discard both and fall back to 2D, which is what eyeball #2 cost.
  *
  * STRUCTURAL, and labelled as such: this is a Java source contract that the C
- * side cannot execute, so — exactly like the isTell parse above — the test reads
- * the source (comments blanked first, for the reason documented on
+ * side cannot execute, so -- exactly like the isTell parse above -- the test
+ * reads the source (comments blanked first, for the reason documented on
  * stripComments) and asserts the shape. It is a regression detector for these
- * two rules, not proof that the arithmetic is right; the arithmetic was proved
- * on the device and is recorded in #1424.
+ * rules, not proof that the arithmetic is right; the arithmetic was proved on
+ * the device and is recorded in #1424 / #1425.
  */
-TEST_CASE("mini-window scale source: a poisoned drag cannot beat the vendor API")
+static std::string
+javaMethodBody(const std::string &src, const char *signature)
+{
+	const size_t m = src.find(signature);
+	REQUIRE(m != std::string::npos);
+	// Methods in this file close at column-4 brace; the first such brace after the
+	// signature ends the method.
+	const size_t end = src.find("\n    }", m);
+	REQUIRE(end != std::string::npos);
+	return src.substr(m, end - m);
+}
+
+TEST_CASE("mini-window scale source: straddle guard, two families, measurement wins")
 {
 	const std::string src = stripComments(readFile(DXR_MINI_WINDOW_LAYOUT_JAVA));
 
-	SECTION("the straddle guard exists and is consulted by the ratio measurement")
+	SECTION("rule 1: the straddle guard exists, is consulted, and drops the stale ratio")
 	{
-		// The notifier the geometry sampler must call.
-		REQUIRE(src.find("void noteWindowGeometry(") != std::string::npos);
-		// It must be able to SET the flag...
-		REQUIRE(src.find("touchStraddledGeometry = true") != std::string::npos);
-		// ...and measureTouchScale must actually consult it. MUTANT: delete the
-		// early-out in measureTouchScale and this fails.
-		const size_t m = src.find("public void measureTouchScale(");
-		REQUIRE(m != std::string::npos);
-		const size_t end = src.find("\n    }", m);
-		REQUIRE(end != std::string::npos);
-		const std::string body = src.substr(m, end - m);
+		// The notifier the geometry sampler must call, and what it must do.
+		const std::string note = javaMethodBody(src, "public void noteWindowGeometry(");
+		REQUIRE(note.find("touchStraddledGeometry = true") != std::string::npos);
+		// MUTANT: stop clearing the ratio on a geometry change and this fails --
+		// the Hang->Normal tap would then carry 0.37 into a 0.67 placement.
+		REQUIRE(note.find("touchScale = 0f") != std::string::npos);
+
+		// measureTouchScale must actually consult the flag. MUTANT: delete the
+		// early-out and this fails.
+		const std::string body = javaMethodBody(src, "public void measureTouchScale(");
 		REQUIRE(body.find("if (touchStraddledGeometry)") != std::string::npos);
 		// and the 40 px minimum span must survive alongside it -- they reject
 		// different faults (a tap vs a moving window).
 		REQUIRE(body.find("TOUCH_MIN_SPAN_PX") != std::string::npos);
 	}
 
-	SECTION("resolveScale prefers the vendor API over the touch ratio")
+	SECTION("rule 2: both families are queried and the discriminators run in the pinned order")
 	{
-		const size_t r = src.find("public float resolveScale(");
-		REQUIRE(r != std::string::npos);
-		const size_t end = src.find("\n    }", r);
-		REQUIRE(end != std::string::npos);
-		const std::string body = src.substr(r, end - r);
+		// stripComments blanks STRING LITERALS too (a reflected method name inside a
+		// string must not be able to satisfy an isTell parse), so every pin below is
+		// on code shape, never on a quoted name.
+		const std::string q = javaMethodBody(src, "private float queryVendorWrScale(");
+		// Both families are fetched and BOTH are kept for the later re-pick.
+		// MUTANT: drop the Hang candidate and the drop-zone window is sized for
+		// the Normal slot again (eyeball #3).
+		REQUIRE(q.find("vendorNormalRect = normal;") != std::string::npos);
+		REQUIRE(q.find("vendorHangRect = hang;") != std::string::npos);
+		// Four Rect reads (two getters x two fallbacks), two state getters, one id.
+		size_t rects = 0;
+		for (size_t at = q.find("callRect("); at != std::string::npos; at = q.find("callRect(", at + 1)) {
+			rects++;
+		}
+		REQUIRE(rects == 4);
+		size_t bools = 0;
+		for (size_t at = q.find("callBool("); at != std::string::npos; at = q.find("callBool(", at + 1)) {
+			bools++;
+		}
+		REQUIRE(bools == 2);
+		REQUIRE(q.find("callInt(") != std::string::npos);
 
-		const size_t ret_api = body.find("return api;");
-		const size_t ret_touch = body.find("return touch;");
-		REQUIRE(ret_api != std::string::npos);
+		// Discriminator order, by the code that implements each step. MUTANT: move
+		// the default ahead of the state read and this fails.
+		const size_t d_state = q.find("Boolean.TRUE.equals(callBool(");
+		const size_t d_origin = q.find("originMatches(normal, x, y)");
+		const size_t d_touch = q.find("rectExplains(normal, touchScale, w, h)");
+		const size_t d_fit = q.find("fitsFrom(normal, x, y, dispW, dispH)");
+		const size_t d_default = q.find("pick = normal != null ? normal : hang;");
+		REQUIRE(d_state != std::string::npos);
+		REQUIRE(d_origin != std::string::npos);
+		REQUIRE(d_touch != std::string::npos);
+		REQUIRE(d_fit != std::string::npos);
+		REQUIRE(d_default != std::string::npos);
+		REQUIRE(d_state < d_origin);
+		REQUIRE(d_origin < d_touch);
+		REQUIRE(d_touch < d_fit);
+		REQUIRE(d_fit < d_default);
+		// The state read is guarded to THIS task. MUTANT: drop the guard and a
+		// different app's WR task decides our family.
+		REQUIRE(q.find("topId == taskId") != std::string::npos);
+
+		// Cached per PLACEMENT, not per episode: a moved window is re-read.
+		// MUTANT: return the cached scale unconditionally and this fails.
+		REQUIRE(q.find("x == vendorResolvedAtX") != std::string::npos);
+		REQUIRE(q.find("invalidatePlacement()") != std::string::npos);
+	}
+
+	SECTION("rule 3: resolveScale lets the measurement win, and never discards both")
+	{
+		const std::string body = javaMethodBody(src, "public float resolveScale(");
+
+		// The disagreement branch exists and returns the TOUCH-derived answer...
+		const size_t disagree = body.find("Math.abs(api - touch) > 0.01f");
+		REQUIRE(disagree != std::string::npos);
+		const size_t ret_touch = body.find("return choose(touch, 0, 0,", disagree);
 		REQUIRE(ret_touch != std::string::npos);
-		// MUTANT: swap the two blocks and this fails.
-		REQUIRE(ret_api < ret_touch);
+		// ...after trying to re-pick the family whose Rect explains it. MUTANT:
+		// drop the re-pick and the integer pinning is lost on every override.
+		const size_t repick = body.find("rectExplains(vendorHangRect, touch", disagree);
+		REQUIRE(repick != std::string::npos);
+		REQUIRE(repick < ret_touch);
+
+		// The plain vendor-API return comes AFTER the disagreement branch.
+		// MUTANT: swap them (API wins) and this fails -- that was eyeball #3.
+		const size_t ret_api = body.find("vendorPickedRect.height(),");
+		REQUIRE(ret_api != std::string::npos);
+		REQUIRE(ret_touch < ret_api);
 
 		// MUTANT: restore the destructive cross-check (`return 0f;` inside the
-		// disagreement branch) and this fails. A disagreement may LOG, never
-		// discard: the only `return 0f` left is the both-sources-absent tail,
-		// so exactly one may appear and it must come after both.
+		// disagreement branch) and this fails. A disagreement may LOG and
+		// re-pick, never discard: the only `return 0f` left is the
+		// both-sources-absent tail, so exactly one may appear and it must come
+		// after the API return.
 		size_t zeros = 0;
 		for (size_t at = body.find("return 0f;"); at != std::string::npos;
 		     at = body.find("return 0f;", at + 1)) {
 			zeros++;
-			REQUIRE(at > ret_touch);
+			REQUIRE(at > ret_api);
 		}
 		REQUIRE(zeros == 1);
 	}
