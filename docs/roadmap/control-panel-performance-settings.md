@@ -104,7 +104,7 @@ the service, next-launch in-app*.
 
 All `DXR_TEST_*` · every `_DIAG` / `_DUMP` / `_PROBE` / `_JIGGLE` / `_REFLATTEN` /
 `_DRAIN` / `_NO2D` bisect probe · `DXR_WEAVE_REPAINT_FORCE` (documented as *"it **will**
-cost frame rate"*) · `DXR_SIM_INPUT` · `DXR_LEGACY_STANDALONE` · `DXR_IPC_FD` /
+cost frame rate"*) · `DXR_SIM_INPUT` (+ `DXR_SIM_INPUT_NAV*`) · `DXR_LEGACY_STANDALONE` · `DXR_IPC_FD` /
 `DXR_IPC_HANDLE` · `DXR_ALLOW_UNVERIFIED_CONTROLLER`.
 
 > **Security carve-out — `DXR_ALLOW_DEV_PLUGIN_PATHS`.** It is read via
@@ -525,6 +525,9 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_ALLOW_DEV_PLUGIN_PATHS` | `targets/common/target_plugin_path_guard.c:91` (`GetEnvironmentVariableW`) | unset | Both | **Disables the #943 plug-in-path guard.** Env-only, permanently — see the carve-out above |
 | `DXR_ALLOW_UNVERIFIED_CONTROLLER` | `ipc/server/ipc_server_handler.c:167` | off | Svc | Accepts an unverified `CONTROLLER` claim. "Never set on a production box" |
 | `DXR_SIM_INPUT` | `drivers/sim_input/sim_input_plugin.c:59` | off | Both | Simulated-input opt-in |
+| `DXR_SIM_INPUT_NAV` | `drivers/sim_input/sim_input_plugin.c:139` | off | Both | With `DXR_SIM_INPUT=1`: adds the scripted "Sim navigation" device (rig role, ADR-034 Amendment 4) and puts the sim controllers on `RIG_LOCAL` origins. Test/CI only |
+| `DXR_SIM_INPUT_NAV_HOLD_MS` | `drivers/sim_input/sim_input_plugin.c:153` | 0 (never) | Both | Every *n* ms the scripted navigation pose reports invalid for 500 ms — exercises the composer's hold / re-align path |
+| `DXR_SIM_INPUT_NAV_RECENTER_MS` | `drivers/sim_input/sim_input_plugin.c:154` | 0 (never) | Both | Every *n* ms the scripted device publishes a durable RECENTER timestamp together with a phase jump — exercises recenter alignment; CI runs 400 |
 | `DXR_LEGACY_STANDALONE` | `compositor/d3d11_service/comp_d3d11_service.cpp:286` | off | Svc | Reverts the service to the pre-hybrid standalone path (ADR-035 D3, slated for deletion) |
 | `DXR_IPC_FD` | `auxiliary/util/u_sandbox.c:181`; `ipc/client/ipc_client_connection.c:211, 234` | unset | Both / App | #1056 adopts an embedder-supplied service socket. Not a setting |
 | `DXR_IPC_HANDLE` | `ipc/client/ipc_client_connection.c:437, 456` | unset | App | Windows analogue of the above |
