@@ -553,7 +553,62 @@ TEST_CASE("rig_composer: a recenter published while N is invalid stays pending u
 
 /*
  *
- * 6. Handover back to qwerty.
+ * 6. A pending recenter does not survive its provider.
+ *
+ */
+
+TEST_CASE("rig_composer: a pending recenter dies with its provider and does not fire for the next one")
+{
+	const struct xrt_pose home = pose_at(0.f, 1.6f, 0.f);
+	composer_fixture f(home);
+
+	set_rig_role(&f.sysd, 0);
+	f.poll(1000);
+
+	// Drive away from home so "did it recenter?" is not hiding behind the
+	// seed pose.
+	f.nav.n = pose_at(3.f, 0.f, -4.f);
+	const struct xrt_pose held = f.poll(1000);
+	check_pose_eq(held, pose_at(3.f, 1.6f, -4.f));
+
+	// A recenter is raised, but N is invalid — so it is still PENDING when
+	// the provider disappears.
+	f.nav.valid = false;
+	fake_nav_publish_recenter(&f.nav, 2000, pose_at(-9.f, 0.f, 9.f));
+	check_pose_eq(f.poll(2001), held);
+
+	// The provider unplugs: back to the qwerty floor.
+	set_rig_role(&f.sysd, -1);
+	check_pose_eq(f.poll(2002), held);
+	CHECK(g_qwerty_set_calls == 1);
+
+	// A new provider takes the role, still republishing the SAME (stale)
+	// recenter timestamp. The rig must continue at `held` — the pending
+	// request died with the previous tenure, and the timestamp is not newer
+	// than the one already consumed.
+	f.nav.valid = true;
+	f.nav.n = pose_at(5.f, 0.f, 5.f);
+	set_rig_role(&f.sysd, 0);
+	check_pose_eq(f.poll(2003), held);
+
+	// Alignment really is at `held`, not at home: a provider-local step of
+	// one metre along -Z moves the rig one metre along -Z from `held`.
+	f.nav.n = pose_at(5.f, 0.f, 4.f);
+	check_pose_eq(f.poll(2004), pose_at(3.f, 1.6f, -5.f));
+
+	// Republishing the stale timestamp outright changes nothing either.
+	fake_nav_publish_recenter(&f.nav, 2000, pose_at(5.f, 0.f, 4.f));
+	check_pose_eq(f.poll(2005), pose_at(3.f, 1.6f, -5.f));
+
+	// Only a NEWER timestamp recenters — and then it lands exactly on home.
+	fake_nav_publish_recenter(&f.nav, 3000, pose_at(-2.f, 0.f, 7.f));
+	check_pose_eq(f.poll(3001), home);
+}
+
+
+/*
+ *
+ * 7. Handover back to qwerty.
  *
  */
 
@@ -597,7 +652,7 @@ TEST_CASE("rig_composer: handback reseeds qwerty at the current rig")
 
 /*
  *
- * 7. Hand-role churn must not disturb the rig.
+ * 8. Hand-role churn must not disturb the rig.
  *
  */
 
@@ -635,7 +690,7 @@ TEST_CASE("rig_composer: hand-role churn does not re-align the rig")
 
 /*
  *
- * 8. Concurrency smoke.
+ * 9. Concurrency smoke.
  *
  */
 

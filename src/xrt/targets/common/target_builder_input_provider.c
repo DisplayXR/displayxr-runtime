@@ -194,7 +194,13 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 			// parallax (ADR-034 Amendment 2). Qwerty is
 			// deliberately absent here — its controllers already
 			// follow the qwerty HMD.
-			if (ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
+			// A NAVIGATION device is the one exception: its poses
+			// are in the provider's own private frame F and are
+			// read directly by the rig composer, which is what
+			// DEFINES the rig. Rig-composing it through the space
+			// graph would feed the rig back into itself.
+			if (xdev->device_type != XRT_DEVICE_TYPE_NAVIGATION &&
+			    ubrh->rig_relative_count < ARRAY_SIZE(ubrh->rig_relative)) {
 				ubrh->rig_relative[ubrh->rig_relative_count++] = xdev;
 			}
 

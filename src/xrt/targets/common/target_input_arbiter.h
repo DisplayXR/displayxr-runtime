@@ -30,7 +30,7 @@
  * other hand to the next-ranked candidate rather than dragging both
  * down to qwerty.
  *
- * ADR-034 Amendment 4 (pending) adds the **rig (navigation) role** to the
+ * ADR-034 Amendment 4 adds the **rig (navigation) role** to the
  * same walk: a provider may supply one @ref XRT_DEVICE_TYPE_NAVIGATION
  * device, and `xrt_system_roles::rig` points at the highest-priority
  * present one. Its floor is not a candidate but an absence — `rig == -1`
@@ -128,7 +128,7 @@ t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left
  * highest-priority present candidate that supplies a navigation device
  * wins. There is no qwerty candidate here — the runtime's own fly camera
  * IS the floor, and it is expressed as `xrt_system_roles::rig == -1`
- * (ADR-034 Amendment 4, pending).
+ * (ADR-034 Amendment 4).
  */
 void
 t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_t count);
