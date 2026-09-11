@@ -105,6 +105,8 @@ struct weave_latency_log
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
 	int64_t hz_err_sum_ns = 0;    // signed, to see a systematic bias
+	int hz_depth = 0;             // governor depth at the last present (0 = no governor)
+	uint32_t hz_depth_changes = 0;
 	uint64_t hz_sync_lag_sum = 0; // sum of (SyncRefreshCount - PresentRefreshCount)
 	//! Histogram of round(err / period), k in [-2, +4] (clamped): the MODE is
 	//! the pipeline's constant offset (a composed chain adds a whole DWM
@@ -523,14 +525,15 @@ struct weave_latency_log
 		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
 		    "| resolved %u  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
-		    "bias %+.2f ms  sync-flip lag %.2f refr",
+		    "bias %+.2f ms  sync-flip lag %.2f refr  | depth %d (%u changes)",
 		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
 		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, po_applied, hz_wrong_slot,
 		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
 		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
 		    hz_resolved ? (double)hz_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
-		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0);
+		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0, hz_depth, hz_depth_changes);
+		hz_depth_changes = 0;
 
 		hz_win_start_ns = now_ns;
 		hz_min_ns = 0;
@@ -652,6 +655,60 @@ struct late_weave_governor
 	uint64_t last_probe_qpc = 0;
 	uint64_t probe_dwell_ns = 30ull * 1000000000ull; // ×2 per failed probe, cap 5 min
 
+	/*!
+	 * #1432 follow-up — depth flapping made observable, and capped.
+	 *
+	 * The targets log the FIRST backoff and the FIRST return only, so a
+	 * "cleared, probing return -> max latency 3" line (seen on the avatar)
+	 * means depth had silently climbed to 4 first. Every change is now
+	 * logged here, throttled to one WARN per 2 s with a suppressed count,
+	 * and counted for the horizon trace row.
+	 *
+	 * The flap itself: slip-rate escalation adds a level per 120-mark window
+	 * with >= 8% vsync-doubled frames, up to MAX, with no reference to what
+	 * the frame cost needs; the return probe steps down after 300 calm frames
+	 * once the probe dwell has passed; on a GPU-bound app at ~47 fps the two
+	 * fight — up one per 2 s, down one per 5 s, dwell doubling to 5 min —
+	 * and every step moves the pipeline offset the eye predictor is
+	 * extrapolating over by a whole period. Measured on the 3DLuma avatar on
+	 * the iGPU: `applied` swinging +1/+2/+3 within one 60 s leg.
+	 *
+	 * Policy (DXR_LATE_WEAVE_SLIP_CAP=0 restores the old behaviour for A/B):
+	 *  - slip escalation is capped at needed_depth() + 1 — the one extra
+	 *    banked token the field comment above credits it with; beyond that
+	 *    the align yields, as it already does at MAX;
+	 *  - the return probe needs THREE consecutive clean slip windows (6 s at
+	 *    60 marks/s), not one — slip is bursty on a ~50 fps app, and a probe
+	 *    fired on a single clean window re-escalated within 2-20 s in every
+	 *    measured leg;
+	 *  - a slip escalation within 30 s of a return probe is a FAILED probe
+	 *    and doubles the probe dwell (30 -> 60 -> 120 -> 300 s), exactly as
+	 *    the starvation path already does — the slip path never did, which
+	 *    is why the dwell never converged on slip-driven flaps.
+	 */
+	int slip_cap_enabled = -1;      // DXR_LATE_WEAVE_SLIP_CAP, default 1
+	bool last_window_slipping = false;
+	int clean_windows = 0;          // consecutive slip windows below the threshold
+	uint32_t depth_changes = 0;
+	uint32_t depth_changes_suppressed = 0;
+	uint64_t depth_log_qpc = 0;
+
+	void
+	log_change(uint64_t now, uint64_t freq_hz, int from, const char *reason)
+	{
+		depth_changes++;
+		if (depth_log_qpc != 0 && (double)(now - depth_log_qpc) < 2.0 * (double)freq_hz) {
+			depth_changes_suppressed++;
+			return;
+		}
+		U_LOG_W("Late-weave governor: depth %d -> %d (%s; interval %.1f ms, period %.1f ms, need %d, "
+		        "probe dwell %llu s; change #%u, %u suppressed since last line)",
+		        from, effective, reason, interval_ema_ns / 1e6, period_ns / 1e6, needed_depth(),
+		        (unsigned long long)(probe_dwell_ns / 1000000000ull), depth_changes, depth_changes_suppressed);
+		depth_changes_suppressed = 0;
+		depth_log_qpc = now;
+	}
+
 	int
 	base_latency()
 	{
@@ -661,6 +718,8 @@ struct late_weave_governor
 			base = v < 1 ? 1 : (v > LATE_WEAVE_MAX_DEPTH ? LATE_WEAVE_MAX_DEPTH : v);
 			const char *a = getenv("DXR_LATE_WEAVE_AUTOBACKOFF");
 			auto_backoff = (a != nullptr && a[0] == '0') ? 0 : 1;
+			const char *sc = getenv("DXR_LATE_WEAVE_SLIP_CAP");
+			slip_cap_enabled = (sc != nullptr && sc[0] == '0') ? 0 : 1;
 			effective = base;
 		}
 		return base;
@@ -867,12 +926,34 @@ struct late_weave_governor
 				const bool slipping = slip_count >= 10; // ~8%
 				slip_marks = 0;
 				slip_count = 0;
+				last_window_slipping = slipping;
+				clean_windows = slipping ? 0 : clean_windows + 1;
 				if (slipping) {
-					if (effective < LATE_WEAVE_MAX_DEPTH) {
+					// Cap: one banked token above what the frame cost needs.
+					int cap = LATE_WEAVE_MAX_DEPTH;
+					if (slip_cap_enabled == 1) {
+						const int need = needed_depth();
+						cap = (need > 0 ? need : 1) + 1;
+						if (cap > LATE_WEAVE_MAX_DEPTH) {
+							cap = LATE_WEAVE_MAX_DEPTH;
+						}
+					}
+					if (effective < cap) {
+						// Re-escalating shortly after a return probe = the
+						// probe failed -> double the next dwell (the
+						// starvation path below has always done this).
+						if (slip_cap_enabled == 1 && last_probe_qpc != 0 &&
+						    (double)(now - last_probe_qpc) < 30.0 * (double)freq_hz) {
+							probe_dwell_ns = probe_dwell_ns >= 150ull * 1000000000ull
+							                     ? 300ull * 1000000000ull
+							                     : probe_dwell_ns * 2;
+						}
+						const int from = effective;
 						effective++;
 						over_frames = 0;
 						calm_frames = 0;
 						backoff_qpc = now;
+						log_change(now, freq_hz, from, "slip-rate escalation");
 						return +1;
 					}
 					// Depth is exhausted — the align's hard deadline
@@ -921,9 +1002,11 @@ struct late_weave_governor
 				// panel a heavy frame can want 3-4 levels at once, and
 				// crawling up one per 30 frames would stall for seconds.
 				const int want = needed_depth();
+				const int from = effective;
 				effective = (want > effective) ? want : effective + 1;
 				over_frames = 0;
 				backoff_qpc = now;
+				log_change(now, freq_hz, from, "starvation backoff");
 				return +1;
 			}
 		} else if (roomy) {
@@ -931,12 +1014,17 @@ struct late_weave_governor
 			calm_frames++;
 			const double since_backoff_ns =
 			    (double)(now - backoff_qpc) * 1e9 / (double)freq_hz;
-			if (calm_frames >= 300 && since_backoff_ns > (double)probe_dwell_ns) {
+			// Do not probe down into a pipeline the last slip window
+			// showed still slipping — that probe fails by construction.
+			const bool slip_quiet = (slip_cap_enabled != 1) || clean_windows >= 3;
+			if (calm_frames >= 300 && since_backoff_ns > (double)probe_dwell_ns && slip_quiet) {
 				// Step down one level at a time: the probe is what
 				// re-tests the pipeline, so it must be gentle.
+				const int from = effective;
 				effective--;
 				calm_frames = 0;
 				last_probe_qpc = now;
+				log_change(now, freq_hz, from, "return probe");
 				return -1;
 			}
 		} else {
@@ -1108,6 +1196,10 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 		if (SUCCEEDED(sc->GetFrameStatistics(&stats))) {
 			if (gov != nullptr) {
 				gov->on_stats(stats, freq());
+				if (hz_depth != 0 && gov->effective != hz_depth) {
+					hz_depth_changes++;
+				}
+				hz_depth = gov->effective;
 			}
 			// #206: capture the vsync-locked vblank grid, always-on. The
 			// period comes from the statistics themselves — SyncQPCTime
