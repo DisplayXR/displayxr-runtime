@@ -50,6 +50,29 @@
 extern "C" {
 #endif
 
+/*!
+ * What the partition actually DID in this process (#1442). The divisor
+ * above is intent (an env var); this is outcome — set by the throttle when
+ * it anchors the grid (ENGAGED) or refuses the tier (REFUSED). Process-wide
+ * (defined in u_app_partition.c, not a header-local static, so every
+ * translation unit sees one value). Anything that changes behaviour because
+ * "the app is paced" — the late-weave governor's depth hold — must read
+ * THIS, not the divisor: the hold's premise is the grid, and on a refused
+ * tier there is no grid.
+ */
+enum u_app_partition_state
+{
+	U_APP_PARTITION_UNKNOWN = 0, //!< throttle not yet reached (or divisor off)
+	U_APP_PARTITION_ENGAGED = 1, //!< grid anchored; the app IS paced
+	U_APP_PARTITION_REFUSED = 2, //!< tier refused; the app runs unthrottled
+};
+
+void
+u_app_partition_set_state(enum u_app_partition_state state);
+
+enum u_app_partition_state
+u_app_partition_state(void);
+
 //! Cached probe of DXR_APP_FRAME_DIVISOR. 0/1 = partition off; else 2..8.
 static inline uint32_t
 u_app_partition_divisor(void)
@@ -146,6 +169,7 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 	 */
 	if (!tier_supported) {
 		if (!u_app_partition_any_tier()) {
+			u_app_partition_set_state(U_APP_PARTITION_REFUSED);
 			if (!p->logged) {
 				p->logged = 1;
 				U_LOG_W("#1257 partition: DXR_APP_FRAME_DIVISOR=%u REFUSED on this "
@@ -165,6 +189,7 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 	if (p->next_release_ns == 0) {
 		// First frame passes immediately; the grid anchors here.
 		p->next_release_ns = now_ns + stride_ns;
+		u_app_partition_set_state(U_APP_PARTITION_ENGAGED);
 		if (!p->logged) {
 			p->logged = 1;
 			U_LOG_W("#1257 partition: xrWaitFrame throttles the app to every %uth vblank "

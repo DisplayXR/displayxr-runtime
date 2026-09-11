@@ -681,13 +681,14 @@ struct late_weave_governor
 	 *    60 marks/s), not one — slip is bursty on a ~50 fps app, and a probe
 	 *    fired on a single clean window re-escalated within 2-20 s in every
 	 *    measured leg;
-	 *  - a slip escalation within 30 s of a return probe is a FAILED probe
-	 *    and doubles the probe dwell (30 -> 60 -> 120 -> 300 s). The
-	 *    starvation path has the same rule at 5 s; the slip path uses 30 s
-	 *    deliberately — measured re-escalations landed 2-20 s after the
-	 *    probe, and one dwell (>= 30 s) is the natural attribution window.
-	 *    The dwell never decays, so a genuinely new load arriving inside
-	 *    that window is also counted as a failure; accepted for now.
+	 *  - a slip escalation within TWO dwells of a return probe is a FAILED
+	 *    probe and doubles the probe dwell (30 -> 60 -> 120 -> 300 s). The
+	 *    starvation path has the same rule at 5 s; the slip path's window
+	 *    scales with the dwell because the measured cycle re-escalated
+	 *    ~55 s after each probe (one dwell + 300 calm frames) — a fixed
+	 *    30 s never caught it and the cycle ran forever (#1443). The dwell
+	 *    never decays, so a genuinely new load arriving inside the window
+	 *    is also counted as a failure; accepted.
 	 *
 	 * Two things the cap must NOT do (review of #1441): surrender the
 	 * composed-chain tick-align — that yield is keyed on LATE_WEAVE_MAX_DEPTH,
@@ -908,7 +909,10 @@ struct late_weave_governor
 		 * DXR_APP_FRAME_DIVISOR in the service's own environment would pin the
 		 * workspace governor to depth 1 for EVERY client.
 		 */
-		const bool paced = u_app_partition_divisor() >= 2;
+		/* #1442: the OUTCOME, not the env var — on a tier where the partition
+		 * refused there is no grid and the app is not paced; holding the depth
+		 * there disabled the governor with a WARN saying the opposite. */
+		const bool paced = u_app_partition_state() == U_APP_PARTITION_ENGAGED;
 		/* Only claim the hold when the partition is the REASON for it. With an
 		 * explicit DXR_LATE_WEAVE_MAX_LATENCY (base != 1) or AUTOBACKOFF=0 the
 		 * governor is off regardless, and attributing that depth to the partition
@@ -949,11 +953,16 @@ struct late_weave_governor
 						}
 					}
 					if (effective < cap) {
-						// Re-escalating shortly after a return probe = the
-						// probe failed -> double the next dwell (the
-						// starvation path below has always done this).
+						// Re-escalating after a return probe = the probe
+						// failed -> double the next dwell (the starvation
+						// path below has always done this, at 5 s). Window =
+						// two dwells: measured, the 2<->3 cycle re-escalated
+						// ~55 s after each probe (dwell 30 s + 300 calm
+						// frames), which a 30 s window never caught, so the
+						// dwell never grew and the cycle ran forever (#1443).
 						if (slip_cap_enabled == 1 && last_probe_qpc != 0 &&
-						    (double)(now - last_probe_qpc) < 30.0 * (double)freq_hz) {
+						    (double)(now - last_probe_qpc) <
+						        2.0 * ((double)probe_dwell_ns / 1e9) * (double)freq_hz) {
 							probe_dwell_ns = probe_dwell_ns >= 150ull * 1000000000ull
 							                     ? 300ull * 1000000000ull
 							                     : probe_dwell_ns * 2;
