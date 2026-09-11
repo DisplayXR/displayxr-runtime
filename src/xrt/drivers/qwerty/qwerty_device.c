@@ -1349,8 +1349,7 @@ qwerty_reset_view_state(struct qwerty_system *qs)
 		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
 
-	U_LOG_W("Qwerty: view state reset to %s",
-	        qs->camera_profile_active ? "camera profile" : "camera defaults");
+	U_LOG_W("Qwerty: view state reset to %s", qs->camera_profile_active ? "camera profile" : "camera defaults");
 	os_mutex_unlock(&qs->view_lock);
 }
 
@@ -1367,9 +1366,7 @@ find_qwerty_system(struct xrt_device **xdevs, size_t count)
 }
 
 bool
-qwerty_set_camera_profile(struct xrt_device **xdevs,
-                          size_t count,
-                          const struct u_camera_profile *profile)
+qwerty_set_camera_profile(struct xrt_device **xdevs, size_t count, const struct u_camera_profile *profile)
 {
 	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
 	if (qs == NULL || profile == NULL)
