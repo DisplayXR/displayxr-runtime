@@ -13,7 +13,7 @@ REM
 REM Usage:
 REM   scripts\setup-displayxr.bat                      :: runtime + shell + leia
 REM   scripts\setup-displayxr.bat --with mcp           :: also DisplayXR MCP Tools
-REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (developer preview)
+REM   scripts\setup-displayxr.bat --with browser       :: also DisplayXR Browser (opt-in)
 REM   scripts\setup-displayxr.bat --with-demos         :: also install each demo's prebuilt release
 REM   scripts\setup-displayxr.bat --with-demo-sources  :: also clone each demo's source into demos\
 REM   scripts\setup-displayxr.bat --dry-run            :: print plan, install nothing
@@ -48,12 +48,19 @@ set "COMPONENT_REPO_mcp_tools=DisplayXR/displayxr-mcp"
 set "COMPONENT_EXE_mcp_tools=DisplayXRMCPSetup-*.exe"
 set "COMPONENT_MARKER_mcp_tools=HKLM\Software\DisplayXR\Capabilities\MCP"
 
-REM Browser: opt-in only (--with browser). The preview is rebased ~monthly onto
-REM Chrome stable but NOT patched to Chrome's mid-cycle security cadence, so it is
-REM never part of the default install. Its pin in versions.json is preview-X.Y.Z,
-REM not vX.Y.Z -- see versions-bump.yml's per-field tag validation.
+REM Browser: a Chromium-based browser that weaves glasses-free inline 3D.
+REM Opt-in only (--with browser) -- it is a separate ~200 MB browser, so it is
+REM never part of the default install (out of scope to change: browser-pvt#120 D4).
+REM Its pin in versions.json is vX.Y.Z from v1.0.0 (older preview-X.Y.Z pins stay
+REM valid) -- see versions-bump.yml's per-field tag validation.
+REM The asset glob matches BOTH channel names on purpose -- old
+REM DisplayXR-Browser-Preview-Setup-0.1.35.exe and new
+REM DisplayXR-Browser-Setup-1.0.0.exe -- so the merge order across repos does not
+REM matter. If a transition release attaches both, :install_component prefers the
+REM NON-Preview one explicitly (mirrors component_prefer_exe in lib\components.sh).
 set "COMPONENT_REPO_browser=DisplayXR/displayxr-browser"
-set "COMPONENT_EXE_browser=DisplayXR-Browser-Preview-Setup-*.exe"
+set "COMPONENT_EXE_browser=DisplayXR-Browser-*Setup-*.exe"
+set "COMPONENT_EXE_DEPRECATED_browser=-Preview-Setup-"
 set "COMPONENT_MARKER_browser=HKLM\Software\DisplayXR\Browser"
 
 set "COMPONENT_REPO_gauss_demo=DisplayXR/displayxr-demo-gaussiansplat"
@@ -225,9 +232,10 @@ echo.
 echo Usage: scripts\setup-displayxr.bat [flags]
 echo.
 echo   --with mcp        Also install DisplayXR MCP Tools.
-echo   --with browser    Also install the DisplayXR Browser developer preview.
-echo                     ^(opt-in: rebased ~monthly onto Chrome stable, but not
-echo                     patched to Chrome's mid-cycle security cadence^).
+echo   --with browser    Also install the DisplayXR Browser -- a Chromium-based
+echo                     browser that weaves glasses-free inline 3D.
+echo                     ^(Opt-in: it is a separate browser, so you ask for it
+echo                     by name; it is never part of the default install.^)
 echo   --with-demos      Also install each demo's prebuilt release installer
 echo                     ^(no build needed; demos with no Windows asset skip^).
 echo   --with-demo-sources
@@ -330,9 +338,37 @@ if "%DRY_RUN%"=="0" (
 )
 
 REM Find the .exe (NSIS installer's filename includes the build number).
+REM
+REM More than one .exe can land when a component's glob deliberately matches a
+REM retiring asset name AND its replacement, and a transition release attaches
+REM both (browser-pvt#120: DisplayXR-Browser-Preview-Setup-*.exe ->
+REM DisplayXR-Browser-Setup-*.exe). COMPONENT_EXE_DEPRECATED_<name>, when set,
+REM is a substring that marks the retiring name: any .exe NOT containing it wins.
+REM This is the explicit tie-break -- do NOT fall back to `for` iteration order.
+REM Mirrors component_prefer_exe() in lib\components.sh.
 set "_IC_EXE="
+set "_IC_EXE_DEP="
+REM Resolved BEFORE the block below, because %%-expansion inside a parenthesised
+REM block happens when the block is parsed. "@@none@@" is a sentinel that can
+REM never appear in a filename, so components with no retiring name take the
+REM plain path.
+call set "_IC_DEPPAT=%%COMPONENT_EXE_DEPRECATED_%_IC_NAME%%%"
+if not defined _IC_DEPPAT set "_IC_DEPPAT=@@none@@"
 if "%DRY_RUN%"=="0" (
-    for %%f in ("%_IC_SUBDIR%\*.exe") do set "_IC_EXE=%%f"
+    for %%f in ("%_IC_SUBDIR%\*.exe") do (
+        set "_IC_CAND=%%~nxf"
+        REM Substring test: removing the pattern changes the name only if it
+        REM was present.
+        set "_IC_STRIPPED=!_IC_CAND:%_IC_DEPPAT%=!"
+        if "!_IC_STRIPPED!"=="!_IC_CAND!" (
+            if not defined _IC_EXE set "_IC_EXE=%%f"
+        ) else (
+            if not defined _IC_EXE_DEP set "_IC_EXE_DEP=%%f"
+        )
+    )
+    REM Every candidate carried the retiring name: still a valid install (an
+    REM older pin), so use it rather than failing.
+    if not defined _IC_EXE if defined _IC_EXE_DEP set "_IC_EXE=!_IC_EXE_DEP!"
     if not defined _IC_EXE (
         echo ERROR: %_IC_NAME%: download succeeded but no .exe landed in %_IC_SUBDIR% 1>&2
         set "EXITCODE=1"

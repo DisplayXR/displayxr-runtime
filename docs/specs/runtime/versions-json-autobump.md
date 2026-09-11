@@ -13,7 +13,7 @@ tag per DisplayXR component:
   "shell":       "v1.3.1",
   "leia_plugin": "v1.0.7",
   "mcp_tools":   "v0.3.2",
-  "browser":     "preview-0.1.16",
+  "browser":     "v1.0.0",
   "gauss_demo":  "v1.4.3"
 }
 ```
@@ -208,7 +208,7 @@ dispatch with a `displayxr-publish-bot` token scoped to `displayxr-runtime`
 — the same second-token mint `publish-shell-releases.yml` does. (Before the
 2026-09 split the dispatch fired from `displayxr-browser/scripts/release.sh`,
 because the public repo had no tag-push publisher.) Cut with
-`/dxr-release browser preview-X.Y.Z`.
+`/dxr-release browser vX.Y.Z`.
 
 #### The browser pin LAGS the newest release on purpose — do not "tidy" it
 
@@ -218,7 +218,7 @@ on `displayxr-browser`, and that divergence is correct.
 The pin means *"the version the orchestrator can install as a released asset"*, not
 *"the latest version"*. On Windows, `setup-displayxr.bat --with browser` resolves the
 release through `scripts/lib/components.sh`'s `COMPONENT_EXE_WINDOWS_browser` glob,
-`DisplayXR-Browser-Preview-Setup-*.exe`. An **Android-only** preview does not satisfy
+`DisplayXR-Browser-*Setup-*.exe`. An **Android-only** release does not satisfy
 that glob, so `publish-browser-releases.yml` deliberately **skips** the bump when no
 Windows installer shipped (it logs a `::warning::` saying so rather than silently
 no-op'ing).
@@ -232,7 +232,7 @@ Worked example, live as of 2026-09-03:
 
 Hand-bumping the pin to the newest tag to make those agree re-creates exactly the break
 the guard prevents: `--with browser` then matches nothing and the install fails, pointed
-at a release that genuinely has no installer. **Leave it behind until a preview ships a
+at a release that genuinely has no installer. **Leave it behind until a release ships a
 Windows installer**, at which point it bumps normally on its own.
 
 ### `displayxr-demo-*`
@@ -269,24 +269,39 @@ context. Full design: `displayxr-website/docs/org-sync.md`.
 ## The browser field
 
 The browser joined the matrix once it stopped being an experiment
-(2026-08). It is a normal component in every respect except two, both
-of which are deliberate.
+(2026-08). It now has exactly **one** deliberate carve-out.
 
-**1. Its tags are `preview-X.Y.Z`, not `vX.Y.Z`.** `versions-bump.yml`
-therefore validates the tag shape **per field** rather than globally.
-The prefix is not cosmetic: it marks a build that is rebased ~monthly
-onto Chrome stable but is **not** patched to Chrome's mid-cycle
-security cadence, it is what the in-browser update check and
-`displayxr-web/js/version-check.js` read, and it predates this field.
-Renaming the channel so the matrix could keep one regex would have
-destroyed a user-facing safety signal to save a `case` statement. The
-validator accepts three- or four-part versions (`preview-0.1.16`, and
-the Chromium-versioned `preview-150.0.7871.129` shape the early builds
-used).
+**It is opt-in, never default.** `--with browser` on both
+orchestrators, mirroring `--with mcp`. It is a separate ~200 MB
+browser, so it must be something a user asks for by name. (Moving it
+into the default install / desktop bundle is explicitly out of scope —
+browser-pvt#120 D4.)
 
-**2. It is opt-in, never default.** `--with browser` on both
-orchestrators, mirroring `--with mcp`. For the same security-cadence
-reason, a preview browser must be something a user asks for by name.
+**Tags are `vX.Y.Z`, like every other component**, from **v1.0.0**
+(browser-pvt#120, approved by David 2026-09-11). The browser used to be
+the second carve-out here — its releases were `preview-X.Y.Z` — and
+`versions-bump.yml` still validates the tag shape **per field** to
+handle the transition: the `browser)` case accepts
+`^(preview-[0-9]+(\.[0-9]+){2,3}|v[0-9]+\.[0-9]+\.[0-9]+)$`, so
+`preview-*` pins already in history stay valid, any in-flight preview
+release still bumps, and the merge order across repos does not matter.
+Drop the `preview-` alternative once no preview release can dispatch.
+
+Note what the old rationale in that file got *wrong*, because it is the
+kind of claim that propagates: the `preview-` prefix was **not** read by
+anything. The pin is handed to `gh release download` verbatim, and the
+only consumer of the update feed — the start page's
+`displayxr-web/js/version-check.js` — compares `latest.chromium` and
+ignores `channel` entirely. The prefix was a label, not a mechanism;
+the real reason this field is validated separately is simply that it is
+the **one** component whose tags ever carried a non-`v` prefix. The
+`preview-*` branch of the regex still accepts three- **or** four-part
+versions, because the early builds were Chromium-versioned
+(`preview-150.0.7871.129`) before the channel settled on `preview-0.1.x`.
+
+There is also a **version discontinuity at the cut-over**: `0.1.35 →
+1.0.0` is not a `sort -V` step, so the first tag on the new channel must
+be given literally (`v1.0.0`), never derived from the newest tag.
 
 Note also that the **meta-bundle is unaffected by the field's
 existence**: `displayxr-installer`'s `build-bundle.sh` / `.bat` read
@@ -295,13 +310,26 @@ five pins by name (`runtime`, `shell`, `leia_plugin`, `mcp_tools`,
 `DisplayXRBundle-*.exe`. Enrolling it is a separate, deliberate edit
 there.
 
-One asset-naming note, because it reads like a trap and isn't: the browser
-publish workflow (`displayxr-browser-pvt`, formerly `scripts/release.sh`) uploads
-`"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The text after `#` is gh's
-*display label*, not the filename — the asset still lands under its
-versioned real name, so the ordinary
-`DisplayXR-Browser-Preview-Setup-*.exe` glob in `components.sh` is
-correct.
+Two asset-naming notes, because both read like traps and neither is:
+
+1. The browser publish workflow (`displayxr-browser-pvt`, formerly
+   `scripts/release.sh`) uploads `"$EXE#DisplayXR-Browser-Setup.exe"`. The text
+   after `#` is gh's *display label*, not the filename — the asset still lands
+   under its versioned real name, which is what the glob in `components.sh`
+   matches.
+2. That glob is `DisplayXR-Browser-*Setup-*.exe`, and it matches **both**
+   channel names on purpose — `DisplayXR-Browser-Preview-Setup-0.1.35.exe` and
+   `DisplayXR-Browser-Setup-1.0.0.exe`. The producer (browser-pvt) and this
+   consumer live in different repos, so the merge order must not matter; and
+   the cut-over release may attach the same bytes under **both** names so older
+   pins keep resolving. When two assets match, the winner is chosen
+   **explicitly**, never by glob order: `component_prefer_exe()` in
+   `components.sh` (and the mirrored `COMPONENT_EXE_DEPRECATED_*` tie-break in
+   `setup-displayxr.bat`) prefers the non-`Preview` name, falling back to the
+   retiring one when it is the only candidate. The Android APK is
+   `DisplayXR-Browser-X.Y.Z-android-arm64.apk` (was
+   `DisplayXR-Browser-Preview-X.Y.Z-…`); `install-android-bundle.sh` selects by
+   extension, so it needs no edit for either name.
 
 ## The `cnsdk_services` field
 

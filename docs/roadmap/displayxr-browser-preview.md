@@ -1,12 +1,25 @@
 # DisplayXR Browser — packaging the inline-3D fork as a developer preview
 
+> **Status 2026-09-11 — the Developer-Preview channel is retired.** The browser moves to a full
+> release channel: `vX.Y.Z` tags from **v1.0.0**, `DisplayXR-Browser-Setup-X.Y.Z.exe`,
+> `DisplayXR-Browser-X.Y.Z-android-arm64.apk`, and a `stable` update feed — approved by David and
+> tracked in
+> [`displayxr-browser-pvt#120`](https://github.com/DisplayXR/displayxr-browser-pvt/issues/120).
+> This document's title and body still say "developer preview" and are **kept as written**: it is
+> the original packaging plan, and P0–P4 record what was actually done at the time. The filename
+> is deliberately unchanged too (seven inbound links resolve against it). For the current channel,
+> asset names and release flow, read browser-pvt#120 and
+> [`../specs/runtime/versions-json-autobump.md`](../specs/runtime/versions-json-autobump.md)
+> §*The browser field* — not the prose below.
+>
 > **Where the source lives (updated 2026-09-03).** This document is the ORIGINAL plan and its
 > milestone text is kept as written — P0–P4 describe what was done at the time, so rewriting them
 > would falsify the record. One thing has since moved: the patch series, build scripts and CI
 > named below as living in `displayxr-browser` are now in the **private** `displayxr-browser-pvt`.
 > The public `displayxr-browser` keeps its name and holds the **releases**, because
 > `versions.json[browser]`, `install-android-bundle.sh --links` and tester install URLs all
-> resolve against it. Release flow: `/dxr-release browser preview-X.Y.Z` (tags pvt).
+> resolve against it. Release flow: `/dxr-release browser vX.Y.Z` (tags pvt; was
+> `preview-X.Y.Z` before the channel change noted above).
 >
 > Status: **plan** (no build yet). Companion to [`webxr-support.md`](webxr-support.md) §2.4–2.6
 > (Step B) and [`webxr-step-b-design.md`](webxr-step-b-design.md). Tracks how we turn the working

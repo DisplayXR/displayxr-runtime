@@ -83,28 +83,36 @@ COMPONENT_INSTALL_MARKER_MACOS_mcp_tools="/Library/Application Support/DisplayXR
 COMPONENT_INSTALL_MARKER_WINDOWS_mcp_tools="HKLM\\Software\\DisplayXR\\Capabilities\\MCP"
 
 # --- browser ---
-# DisplayXR Browser (developer preview) — Windows-only, and deliberately an
-# opt-in (`--with browser`), never part of the default install: it is rebased
-# ~monthly onto Chrome stable but NOT patched to Chrome's mid-cycle security
-# cadence, so it must be a thing a user asks for by name.
+# DisplayXR Browser — a Chromium-based browser that weaves glasses-free inline
+# 3D. Windows-only here, and deliberately an opt-in (`--with browser`), never
+# part of the default install: it is a separate ~200 MB browser, so it must be
+# a thing a user asks for by name. (Moving it into the default install is
+# explicitly out of scope — browser-pvt#120 D4.)
 #
 # Repo split (2026-09): source + build lanes live in the PRIVATE
 # displayxr-browser-pvt; releases + assets stay on the PUBLIC displayxr-browser,
 # which keeps its name precisely so this repo pin (and every asset URL already
 # handed to testers) keeps resolving. Do not point this at -pvt.
 #
-# Asset naming: the publish workflow (displayxr-browser-pvt, formerly
-# displayxr-browser/scripts/release.sh) uploads
-# `"$EXE#DisplayXR-Browser-Preview-Setup.exe"`. The part after `#` is the gh
-# *display label*, not the filename — the asset lands under its versioned real
-# name (`…-Setup-0.1.16.exe`), which is what this glob matches.
+# Asset naming — the glob matches BOTH channels on purpose:
+#   old (retiring)  DisplayXR-Browser-Preview-Setup-0.1.35.exe
+#   new (from 1.0)  DisplayXR-Browser-Setup-1.0.0.exe
+# browser-pvt#120 retires the Developer-Preview channel at v1.0.0, and the
+# producer and this consumer live in different repos, so the merge order must
+# not matter. The cut-over release may also upload the SAME bytes under BOTH
+# names so older pins keep resolving — in which case two assets match this one
+# glob. `gh release download --pattern` happily downloads both, so the tie-break
+# is explicit: see component_prefer_exe() below. Never rely on glob order.
 #
-# The pin is `preview-X.Y.Z`, not `vX.Y.Z` — see versions-bump.yml's per-field
-# tag validation. Nothing here parses the tag, it is passed to `gh release
-# download` verbatim.
+# Tags are `vX.Y.Z` from v1.0.0 (`preview-X.Y.Z` for the older pins that are
+# still valid) — see versions-bump.yml's per-field tag validation. Nothing here
+# parses the tag, it is passed to `gh release download` verbatim.
 COMPONENT_REPO_browser="DisplayXR/displayxr-browser"
 COMPONENT_PKG_MACOS_browser=""
-COMPONENT_EXE_WINDOWS_browser="DisplayXR-Browser-Preview-Setup-*.exe"
+COMPONENT_EXE_WINDOWS_browser="DisplayXR-Browser-*Setup-*.exe"
+# Candidates matching this lose to any candidate that does not (see
+# component_prefer_exe). Empty/unset for every other component.
+COMPONENT_EXE_WINDOWS_DEPRECATED_browser="DisplayXR-Browser-Preview-Setup-*.exe"
 COMPONENT_DEB_LINUX_browser=""
 COMPONENT_INSTALL_MARKER_MACOS_browser=""
 COMPONENT_INSTALL_MARKER_WINDOWS_browser="HKLM\\Software\\DisplayXR\\Browser"
@@ -193,4 +201,37 @@ COMPONENT_INSTALL_MARKER_LINUX_earthview_demo="/usr/bin/displayxr-earthview"
 component_field() {
     local var="COMPONENT_${2}_${1}"
     printf '%s' "${!var-}"
+}
+
+# Helper: choose the ONE Windows installer to run when more than one asset
+# matched COMPONENT_EXE_WINDOWS_<component>.
+#   $1     = component name
+#   $2..$n = candidate names or paths (in any order)
+# Prints the preferred candidate, or nothing if none were given.
+#
+# Why this exists: an asset glob may deliberately match a retiring name AND its
+# replacement (browser-pvt#120 — `DisplayXR-Browser-Preview-Setup-*.exe` and
+# `DisplayXR-Browser-Setup-*.exe`), and a transition release may attach both.
+# The rule is "prefer the name that is NOT deprecated", stated once here rather
+# than left to whatever order the glob or the filesystem happened to produce.
+component_prefer_exe() {
+    local comp="$1"; shift
+    local dep_var="COMPONENT_EXE_WINDOWS_DEPRECATED_${comp}"
+    local dep="${!dep_var-}"
+    local first="" cand base
+    for cand in "$@"; do
+        [ -n "$cand" ] || continue
+        [ -n "$first" ] || first="$cand"
+        base="${cand##*/}"; base="${base##*\\}"
+        # No deprecated pattern declared, or this candidate doesn't match it →
+        # it is the preferred one. First such candidate wins.
+        # shellcheck disable=SC2254  # $dep is a glob on purpose
+        if [ -z "$dep" ] || [[ "$base" != $dep ]]; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+    # Every candidate matched the deprecated pattern — it is still a valid
+    # install (an older pin), so fall back to the first.
+    printf '%s' "$first"
 }
