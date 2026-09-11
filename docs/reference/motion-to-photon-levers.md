@@ -79,7 +79,7 @@ workspace  29 -> 17 ms
 |---|---|---|
 | `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH` |
 | `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min |
-| `DXR_LATE_WEAVE_SLIP_CAP` | on (`0` restores the pre-2026-09 policy) | Caps slip-rate escalation at `needed_depth() + 1`, requires three clean slip windows before a return probe, and doubles the probe dwell when a slip escalation follows a probe within 30 s |
+| `DXR_LATE_WEAVE_SLIP_CAP` | on (`0` restores the pre-2026-09 policy) | Caps slip-rate escalation at `needed_depth() + 1`, requires three clean slip windows before a return probe, and doubles the probe dwell when a slip escalation follows a probe within two dwells (30 → 60 → 120 → 300 s; measured: the 2↔3 cycle converges instead of running forever) |
 
 Late weave depends on present-timing feedback from the swapchain. Where the platform does not
 provide it, it is **dormant** rather than wrong — see the topology table.
