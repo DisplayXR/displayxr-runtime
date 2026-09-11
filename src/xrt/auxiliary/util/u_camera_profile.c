@@ -296,16 +296,29 @@ environment(const char *name, char *out, size_t capacity)
 {
 	out[0] = '\0';
 #ifdef XRT_OS_WINDOWS
-	wchar_t wide_name[64], wide_value[32768];
+	wchar_t wide_name[64];
 	if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, wide_name, 64))
 		return false;
 	SetLastError(ERROR_SUCCESS);
-	DWORD count = GetEnvironmentVariableW(wide_name, wide_value, 32768);
+	DWORD count = GetEnvironmentVariableW(wide_name, NULL, 0);
 	if (count == 0)
 		return GetLastError() == ERROR_ENVVAR_NOT_FOUND || GetLastError() == ERROR_SUCCESS;
-	if (count >= 32768)
+	if (count > 32768 || count > capacity)
 		return false;
-	return WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_value, -1, out, (int)capacity, NULL, NULL) > 0;
+	wchar_t *wide_value = malloc((size_t)count * sizeof(*wide_value));
+	if (wide_value == NULL)
+		return false;
+	SetLastError(ERROR_SUCCESS);
+	DWORD copied = GetEnvironmentVariableW(wide_name, wide_value, count);
+	if (copied == 0) {
+		DWORD error = GetLastError();
+		free(wide_value);
+		return error == ERROR_ENVVAR_NOT_FOUND || error == ERROR_SUCCESS;
+	}
+	bool ok = copied < count && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide_value, -1, out,
+	                                                (int)capacity, NULL, NULL) > 0;
+	free(wide_value);
+	return ok;
 #else
 	const char *value = getenv(name);
 	if (value == NULL)
@@ -320,13 +333,23 @@ environment(const char *name, char *out, size_t capacity)
 enum u_camera_profile_result
 u_camera_profile_load_for_process(float aspect, struct u_camera_profile *out, char *error, size_t size)
 {
-	char override[PROFILE_MAX_BYTES + 1];
-	if (!environment("DXR_LEGACY_CAMERA_RIG", override, sizeof(override))) {
-		invalid(error, size, "DXR_LEGACY_CAMERA_RIG is oversized or invalid");
+	char *override = malloc(PROFILE_MAX_BYTES + 1);
+	if (override == NULL) {
+		invalid(error, size, "camera profile allocation failed");
 		return U_CAMERA_PROFILE_INVALID;
 	}
-	if (override[0] != '\0')
-		return u_camera_profile_load(NULL, NULL, override, aspect, out, error, size);
+	if (!environment("DXR_LEGACY_CAMERA_RIG", override, PROFILE_MAX_BYTES + 1)) {
+		free(override);
+		invalid(error, size, "DXR_LEGACY_CAMERA_RIG could not be read within the supported size/encoding");
+		return U_CAMERA_PROFILE_INVALID;
+	}
+	if (override[0] != '\0') {
+		enum u_camera_profile_result result =
+		    u_camera_profile_load(NULL, NULL, override, aspect, out, error, size);
+		free(override);
+		return result;
+	}
+	free(override);
 	char executable[PROFILE_PATH_SIZE], dir[PROFILE_PATH_SIZE];
 #ifdef XRT_OS_WINDOWS
 	wchar_t wide[PROFILE_PATH_SIZE];

@@ -31,7 +31,14 @@ qwerty_create_devices(enum u_logging_level log_level,
 	struct qwerty_controller *qleft = qwerty_controller_create(true, qhmd);
 	struct qwerty_controller *qright = qwerty_controller_create(false, qhmd);
 
-	qwerty_system_create(qhmd, qleft, qright, log_level);
+	if (qwerty_system_create(qhmd, qleft, qright, log_level) == NULL) {
+		struct xrt_device *devices[] = {&qright->base.base, &qleft->base.base, &qhmd->base.base};
+		for (size_t i = 0; i < 3; i++) {
+			xrt_device_destroy(&devices[i]);
+		}
+		*out_hmd = *out_left = *out_right = NULL;
+		return XRT_ERROR_ALLOCATION;
+	}
 
 	*out_hmd = &qhmd->base.base;
 	*out_left = &qleft->base.base;

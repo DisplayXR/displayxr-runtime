@@ -4,12 +4,13 @@
 
 #include "xrt/xrt_compositor.h"
 
-//! Graphics-specific population may discover a binding that the common create
-//! info did not carry (Vulkan Xlib/Wayland). Finalization must preserve that
-//! classification, including for legacy camera-profile eligibility.
+//! Extra classification for CAMERA PROFILE ELIGIBILITY ONLY. Desktop Linux
+//! Vulkan decodes app-owned Xlib/Wayland handles after common create-info parsing.
+//! Other backends may report runtime-created handles (Android hosted windows),
+//! so their flag must not change this policy or the shared session classification.
 static inline bool
-oxr_session_has_external_binding(bool backend_external, const struct xrt_session_info *info)
+oxr_camera_profile_has_external_binding(bool desktop_linux, bool backend_external, const struct xrt_session_info *info)
 {
-	return backend_external || info->external_window_handle != NULL || info->readback_callback != NULL ||
-	       info->shared_texture_handle != NULL;
+	return (desktop_linux && backend_external) || info->external_window_handle != NULL ||
+	       info->readback_callback != NULL || info->shared_texture_handle != NULL;
 }

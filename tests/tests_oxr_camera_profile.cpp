@@ -17,6 +17,7 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -253,7 +254,7 @@ main(int argc, char **argv)
 		return 2;
 	}
 	try {
-		SetEnvironmentVariableW(L"XRT_FORCE_MODE", L"native");
+		require(_putenv_s("XRT_FORCE_MODE", "native") == 0, "Could not select native runtime mode");
 		SetEnvironmentVariableW(L"DXR_LEGACY_CAMERA_RIG",
 		                        L"{\"ipdFactor\":0,\"parallaxFactor\":0,\"verticalFov\":1.0}");
 		Runtime runtime;

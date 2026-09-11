@@ -4119,7 +4119,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 static void
-seed_legacy_camera_profile(struct oxr_session *sess)
+seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_binding)
 {
 	// The first eligible native camera session seeds its instance. Headless-only
 	// instances never seed; headless siblings of an eligible native session share
@@ -4127,7 +4127,7 @@ seed_legacy_camera_profile(struct oxr_session *sess)
 	bool native = sess->is_d3d11_native_compositor || sess->is_d3d12_native_compositor ||
 	              sess->is_gl_native_compositor || sess->is_vk_native_compositor ||
 	              sess->is_metal_native_compositor;
-	if (!native || sess->xcn == NULL || sess->has_external_window || sess->is_bridge_relay ||
+	if (!native || sess->xcn == NULL || profile_external_binding || sess->is_bridge_relay ||
 	    (sess->sys->xsysc != NULL && sess->sys->xsysc->info.workspace_mode))
 		return;
 #ifdef OXR_HAVE_DXR_display_info
@@ -4412,8 +4412,22 @@ oxr_session_create(struct oxr_logger *log,
 		return ret;
 	}
 
-	// Preserve platform bindings discovered by the selected graphics backend.
-	sess->has_external_window = oxr_session_has_external_binding(sess->has_external_window, &xsi);
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	// Capture desktop Linux's late-decoded binding for the profile gate only.
+	// In particular, Android's backend flag can describe a runtime-created
+	// hosted window and must not change the shared rendering/input classification.
+#if defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+	const bool desktop_linux = true;
+#else
+	const bool desktop_linux = false;
+#endif
+	const bool profile_external_binding =
+	    oxr_camera_profile_has_external_binding(desktop_linux, sess->has_external_window, &xsi);
+#endif
+
+	// Track whether this session has an external window handle, offscreen readback, or shared texture
+	sess->has_external_window =
+	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
 
 #if defined(OXR_HAVE_DXR_android_surface_binding)
 	// Adopt the ANativeWindow reference the binding parse took, so session
@@ -4526,7 +4540,7 @@ oxr_session_create(struct oxr_logger *log,
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	seed_legacy_camera_profile(sess);
+	seed_legacy_camera_profile(sess, profile_external_binding);
 #endif
 
 	// Everything is in order, start the state changes.
