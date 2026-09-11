@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Presence-gated hand-role arbitration (implementation).
+ * @brief  Presence-gated hand- and rig-role arbitration (implementation).
  * @ingroup target_common
  */
 
@@ -67,6 +67,17 @@ struct t_input_candidate
 
 	//! Indices for @ref ht_devices, resolved at install. -1 = absent.
 	int32_t ht_indices[4];
+
+	/*!
+	 * The single @ref XRT_DEVICE_TYPE_NAVIGATION device this candidate
+	 * supplies, or NULL. Qwerty never has one: the runtime's own fly
+	 * camera is the rig floor and is expressed as `roles.rig == -1`, not
+	 * as a candidate.
+	 */
+	struct xrt_device *nav;
+
+	//! Index for @ref nav, resolved at install. -1 = absent.
+	int32_t nav_index;
 
 	//! Cached presence verdict for this candidate.
 	bool present;
@@ -156,6 +167,17 @@ name_of(struct xrt_device *xdev)
 	return xdev != NULL ? xdev->name : XRT_DEVICE_INVALID;
 }
 
+//! Does this candidate supply anything the HAND roles can use?
+static bool
+candidate_supplies_hands(const struct t_input_candidate *cand)
+{
+	bool has_any = cand->left != NULL || cand->right != NULL;
+	for (int i = 0; !has_any && i < 4; i++) {
+		has_any = cand->ht_devices[i] != NULL;
+	}
+	return has_any;
+}
+
 /*!
  * Ask one candidate whether its hardware is there. Uncached — see
  * @ref candidate_is_present_locked for the throttled entry point.
@@ -163,12 +185,8 @@ name_of(struct xrt_device *xdev)
 static bool
 query_candidate_presence(const struct t_input_candidate *cand)
 {
-	bool has_any = cand->left != NULL || cand->right != NULL;
-	for (int i = 0; !has_any && i < 4; i++) {
-		has_any = cand->ht_devices[i] != NULL;
-	}
-	if (!has_any) {
-		return false; // Supplied no hand devices at all.
+	if (!candidate_supplies_hands(cand) && cand->nav == NULL) {
+		return false; // Supplied no arbitrable device at all.
 	}
 	if (cand->iface == NULL) {
 		return true; // Qwerty: the keyboard is always there.
@@ -241,6 +259,27 @@ pick_for_hand_locked(bool want_left)
 	return NULL;
 }
 
+/*!
+ * Same walk for the rig (navigation) role: the highest-priority present
+ * candidate that supplies a navigation device. -1 when none does — which
+ * is not "no rig" but "the runtime's own fly camera holds it", the state
+ * every box without a navigating provider is in (ADR-034 Amendment 4).
+ */
+static int32_t
+pick_rig_locked(void)
+{
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->nav_index < 0) {
+			continue;
+		}
+		if (candidate_is_present_locked(cand)) {
+			return cand->nav_index;
+		}
+	}
+	return -1;
+}
+
 //! Same walk for one hand-tracking slot; -1 when no present carrier.
 static int32_t
 pick_ht_slot_locked(int slot)
@@ -265,6 +304,9 @@ provider_holds_roles_locked(void)
 		struct t_input_candidate *cand = &g_arb.candidates[i];
 		if (cand->iface == NULL) {
 			continue; // The qwerty floor is not a provider.
+		}
+		if (!candidate_supplies_hands(cand)) {
+			continue; // Navigation-only: present, but not for the HANDS.
 		}
 		if (candidate_is_present_locked(cand)) {
 			return true;
@@ -350,10 +392,13 @@ refresh_roles_locked(void)
 	int32_t ht_cl = pick_ht_slot_locked(ARB_HT_CONFORMING_LEFT);
 	int32_t ht_cr = pick_ht_slot_locked(ARB_HT_CONFORMING_RIGHT);
 
+	int32_t rig = pick_rig_locked();
+
 	if (g_arb.roles.generation_id != 0 && g_arb.roles.left == left && g_arb.roles.right == right &&
 	    g_arb.roles.hand_tracking.unobstructed.left == ht_ul &&
 	    g_arb.roles.hand_tracking.unobstructed.right == ht_ur &&
-	    g_arb.roles.hand_tracking.conforming.left == ht_cl && g_arb.roles.hand_tracking.conforming.right == ht_cr) {
+	    g_arb.roles.hand_tracking.conforming.left == ht_cl && g_arb.roles.hand_tracking.conforming.right == ht_cr &&
+	    g_arb.roles.rig == rig) {
 		return; // Nothing moved.
 	}
 
@@ -373,10 +418,15 @@ refresh_roles_locked(void)
 	g_arb.roles.hand_tracking.unobstructed.right = ht_ur;
 	g_arb.roles.hand_tracking.conforming.left = ht_cl;
 	g_arb.roles.hand_tracking.conforming.right = ht_cr;
+	g_arb.roles.rig = rig;
 
-	U_LOG_W("input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), generation %u.",
+	struct xrt_device *rig_xdev =
+	    (rig >= 0 && (size_t)rig < g_arb.xsysd->xdev_count) ? g_arb.xsysd->xdevs[rig] : NULL;
+
+	U_LOG_W("input arbiter: hand roles -> left='%s' (%s) right='%s' (%s), rig -> '%s', generation %u.",
 	        left_xdev != NULL ? left_xdev->str : "<none>", candidate_name(left_cand),
-	        right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand), (unsigned)generation);
+	        right_xdev != NULL ? right_xdev->str : "<none>", candidate_name(right_cand),
+	        rig_xdev != NULL ? rig_xdev->str : "<runtime fly camera>", (unsigned)generation);
 }
 
 static xrt_result_t
@@ -513,6 +563,7 @@ note_candidate(const struct xrt_input_plugin_iface *iface,
 	cand->right = right;
 	cand->left_index = -1;
 	cand->right_index = -1;
+	cand->nav_index = -1;
 	for (int i = 0; i < 4; i++) {
 		cand->ht_indices[i] = -1;
 	}
@@ -558,6 +609,33 @@ t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left
 }
 
 void
+t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_t count)
+{
+	// Attaches to the candidate note_provider_pair just created, exactly
+	// like the hand-tracking devices do.
+	if (devs == NULL || g_arb.last_noted < 0 || g_arb.last_noted >= g_arb.candidate_count) {
+		return;
+	}
+	struct t_input_candidate *cand = &g_arb.candidates[g_arb.last_noted];
+
+	for (uint32_t i = 0; i < count; i++) {
+		struct xrt_device *xdev = devs[i];
+		if (xdev == NULL || xdev->device_type != XRT_DEVICE_TYPE_NAVIGATION) {
+			continue;
+		}
+		if (cand->nav != NULL) {
+			// One rig per provider by contract — a second one is a
+			// provider bug, and silently picking a different device
+			// each build would be worse than picking the first.
+			U_LOG_W("input arbiter: '%s' supplied more than one navigation device — keeping '%s'.",
+			        candidate_name(cand), cand->nav->str);
+			break;
+		}
+		cand->nav = xdev;
+	}
+}
+
+void
 t_input_arbiter_note_qwerty_pair(struct xrt_device *left, struct xrt_device *right)
 {
 	if (left == NULL && right == NULL) {
@@ -589,10 +667,17 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		return;
 	}
 
-	if (g_arb.candidate_count < 2) {
+	bool have_nav = false;
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		have_nav |= g_arb.candidates[i].nav != NULL;
+	}
+
+	if (g_arb.candidate_count < 2 && !have_nav) {
 		// Zero or one candidate: nothing to arbitrate between; the
 		// static roles the builder already assigned are the right
-		// (and only) answer.
+		// (and only) answer. A navigation device is the exception —
+		// the builder has no static seed for `roles.rig`, so a lone
+		// navigating provider still needs the arbiter to be reachable.
 		U_LOG_I("input arbiter: not installed — %s.", g_arb.candidate_count == 0
 		                                                  ? "no hand-role candidates at all"
 		                                                  : "single candidate owns the hand roles");
@@ -611,6 +696,7 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 		for (int k = 0; k < 4; k++) {
 			cand->ht_indices[k] = index_of(xsysd, cand->ht_devices[k]);
 		}
+		cand->nav_index = index_of(xsysd, cand->nav);
 		// #958: seed the cache synchronously (single-threaded here) so the
 		// refresh below and the first client xrSyncActions / cli selftest get a
 		// valid verdict before the poll thread's first tick. The builder's own
@@ -635,8 +721,9 @@ t_input_arbiter_install(struct xrt_system_devices *xsysd)
 
 	for (int i = 0; i < g_arb.candidate_count; i++) {
 		const struct t_input_candidate *cand = &g_arb.candidates[i];
-		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d).", i, candidate_name(cand),
-		        (unsigned)cand->priority, cand->left_index, cand->right_index);
+		U_LOG_W("input arbiter: candidate [%d] '%s' priority=%u pair (%d,%d) nav (%d).", i,
+		        candidate_name(cand), (unsigned)cand->priority, cand->left_index, cand->right_index,
+		        cand->nav_index);
 		// A provider built before the presence slot is ASSUMED present for as
 		// long as it is loaded (query_candidate_presence), so with no hardware
 		// attached it still outranks qwerty and every hosted / WebXR app sees
