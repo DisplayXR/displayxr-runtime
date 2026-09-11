@@ -25,6 +25,21 @@
  * caveat — the runtime DLL has its own static-CRT environment block, so
  * set it before launching the host process, not from a run script.)
  *
+ * A second, independent opt-in adds the scripted NAVIGATION device that
+ * drives the rig role (ADR-034 Amendment 4 / #1380):
+ *
+ *   - `DXR_SIM_INPUT_NAV=1`            — create it (default OFF, so every
+ *                                        pre-existing run is unchanged). It
+ *                                        also switches the controllers to
+ *                                        display-plane-relative poses, which
+ *                                        is what the contract requires of a
+ *                                        provider that navigates.
+ *   - `DXR_SIM_INPUT_NAV_HOLD_MS=n`    — every n ms the navigation pose reports
+ *                                        invalid for 500 ms (composer hold /
+ *                                        re-align path). Default 0 = never.
+ *   - `DXR_SIM_INPUT_NAV_RECENTER_MS=n`— fire a scripted recenter every n ms.
+ *                                        Default 0 = never.
+ *
  * @author David Fattal
  * @ingroup drv_sim_input
  */
@@ -39,6 +54,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,17 +66,39 @@
  */
 
 /*!
- * Is the `DXR_SIM_INPUT` opt-in set? Anything but unset / empty / "0" /
+ * Is @p name set to something truthy? Anything but unset / empty / "0" /
  * "false" / "no" / "off" counts as on.
  */
 static bool
-sim_input_opted_in(void)
+sim_input_env_on(const char *name)
 {
-	const char *v = getenv("DXR_SIM_INPUT");
+	const char *v = getenv(name);
 	if (v == NULL || v[0] == '\0') {
 		return false;
 	}
 	return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0 && strcmp(v, "off") != 0;
+}
+
+//! Is the `DXR_SIM_INPUT` opt-in set?
+static bool
+sim_input_opted_in(void)
+{
+	return sim_input_env_on("DXR_SIM_INPUT");
+}
+
+/*!
+ * A non-negative millisecond knob, 0 when unset / empty / unparseable /
+ * negative — every one of which means "feature off" for the callers here.
+ */
+static int64_t
+sim_input_env_ms(const char *name)
+{
+	const char *v = getenv(name);
+	if (v == NULL || v[0] == '\0') {
+		return 0;
+	}
+	long long ms = strtoll(v, NULL, 10);
+	return ms > 0 ? (int64_t)ms : 0;
 }
 
 static xrt_result_t
@@ -91,25 +129,50 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	(void)inst;
 
 	*out_count = 0;
-	if (max_count < 2) {
+
+	/* #1380: the scripted NAVIGATION device is a SECOND opt-in on top of
+	 * DXR_SIM_INPUT. Default OFF, so every existing selftest / CI run that
+	 * only asks for simulated hands keeps exactly the behaviour it had —
+	 * the rig stays on the qwerty floor and the controllers keep their
+	 * stage-anchored circle. With it on, this provider drives the rig
+	 * role end-to-end with no hardware. */
+	const bool nav = sim_input_env_on("DXR_SIM_INPUT_NAV");
+	const uint32_t needed = nav ? 3 : 2;
+	if (max_count < needed) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER);
-	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER);
-	if (left == NULL || right == NULL) {
+	/* A provider that navigates publishes its controllers
+	 * display-plane-relative (ADR-034 Amendment 4) — so the knob moves the
+	 * controllers' frame too, which is the whole point: the reference
+	 * provider must model the contract, not half of it. */
+	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, nav);
+	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, nav);
+	struct xrt_device *navdev = NULL;
+	if (nav) {
+		navdev = sim_input_create_navigation(sim_input_env_ms("DXR_SIM_INPUT_NAV_HOLD_MS"),
+		                                     sim_input_env_ms("DXR_SIM_INPUT_NAV_RECENTER_MS"));
+	}
+
+	if (left == NULL || right == NULL || (nav && navdev == NULL)) {
 		if (left != NULL) {
 			left->destroy(left);
 		}
 		if (right != NULL) {
 			right->destroy(right);
 		}
+		if (navdev != NULL) {
+			navdev->destroy(navdev);
+		}
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
 	out_devices[0] = left;
 	out_devices[1] = right;
-	*out_count = 2;
+	if (navdev != NULL) {
+		out_devices[2] = navdev;
+	}
+	*out_count = needed;
 	return XRT_SUCCESS;
 }
 

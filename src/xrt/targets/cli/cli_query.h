@@ -94,6 +94,20 @@ enum cli_selftest_result
 	 * through the compositor for a fault that was one registry value.
 	 */
 	CLI_SELFTEST_RUNTIME_HIJACKED = 9,
+
+	/*!
+	 * A provider supplied a `XRT_DEVICE_TYPE_NAVIGATION` device (ADR-034
+	 * Amendment 4 / #1380) and the rig role did not actually work: the role
+	 * did not land on it, or the head's pose — which IS the composed rig —
+	 * never moved, or went non-finite, or a scripted recenter never brought
+	 * it back.
+	 *
+	 * ABSENCE NEVER FAILS, same rule as the input-provider check above: a
+	 * system with no navigation device is not "no rig", it is the runtime's
+	 * own fly camera holding it, which is the state of every box without a
+	 * navigating provider.
+	 */
+	CLI_SELFTEST_BAD_RIG = 10,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -263,6 +277,35 @@ struct cli_query_result
 	char input_left_str[256];
 	char input_right_str[256];
 	char input_note[160];
+
+	/* Rig (navigation) role checks (ADR-034 Amendment 4 / #1380). ABSENCE
+	 * NEVER FAILS: with no `XRT_DEVICE_TYPE_NAVIGATION` device in the
+	 * system the fields stay "not evaluated" and the verdict is untouched —
+	 * the qwerty fly camera holding the rig is the normal configuration.
+	 *
+	 * When one IS present the check drives the role END TO END, which is
+	 * the point: the role landing on the device proves the arbiter walk,
+	 * and the HEAD's pose moving proves the composer actually took the
+	 * provider's navigation frame as the rig source. A green role with a
+	 * frozen head is exactly the regression a role-only assertion misses.
+	 *
+	 * `rig_recenter_expected` is derived from the DEVICE, not from an env
+	 * knob: the scripted provider's RECENTER timestamp is watched across
+	 * the sample window, and only if it advances at least twice is a return
+	 * to `rig_initial` something the run is entitled to demand. A real
+	 * provider recenters on user intent, which a headless self-test cannot
+	 * provoke, so it stays unexpected and passes. */
+	bool rig_nav_present;       //!< a NAVIGATION device is in xsysd->xdevs
+	bool rig_evaluated;         //!< checks ran (a navigation device exists)
+	bool rig_role_ok;           //!< xrt_system_roles::rig points at that device
+	bool rig_moves_ok;          //!< the head pose changed over the window and stayed finite
+	bool rig_recenter_expected; //!< >= 2 scripted recenters fired during the window
+	bool rig_recenter_ok;       //!< …and the head returned to one identical pose each time
+	uint32_t rig_recenter_seen; //!< recenter timestamp advances observed
+	uint32_t rig_repeat_max;    //!< largest exact-repeat count among the sampled head poses
+	float rig_travel_m;         //!< furthest the head got from its first sample
+	char rig_nav_str[256];
+	char rig_note[224];
 
 	/* Hand-tracking role checks (#825 Tier 2), same absence-never-fails
 	 * rule: `expected` = a provider role device advertises
