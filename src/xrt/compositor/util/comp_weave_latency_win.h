@@ -141,17 +141,18 @@ struct weave_latency_log
 		PO_ON = 2,
 	};
 	int po_enabled = PO_UNPROBED;
-	int po_applied = 0;   // whole periods currently added to the forward horizon
+	int po_applied = 0;   // whole periods currently added to the forward horizon, [0, cap]
 	int8_t po_win[32] = {0};
 	uint32_t po_win_n = 0;
 	uint32_t po_win_head = 0;
 	uint32_t po_changes = 0;
 	uint64_t po_last_log_ns = 0;
+	bool po_clamp_logged = false;
 
 	void
-	po_observe(int k)
+	po_observe(int k, uint64_t period_ns)
 	{
-		if (po_enabled != PO_ON) {
+		if (po_enabled != PO_ON || period_ns == 0) {
 			return;
 		}
 		if (k < -2) {
@@ -181,14 +182,41 @@ struct weave_latency_log
 			return; // locked, or not yet a clear majority
 		}
 		int next = po_applied + m;
-		if (next < -1) {
-			next = -1;
+		/*
+		 * Floor 0: the grid snap is the FIRST vblank after now + headroom,
+		 * so a realised flip before it can only mean headroom over-
+		 * prediction — not a pipeline offset — and applying -1 would hand
+		 * the DP a bimodal value (offset on long snaps, un-offset on short
+		 * ones: the boundary flip this work exists to remove).
+		 *
+		 * Ceiling: the handed horizon is at most (k + 2) periods; keep it
+		 * under ~55 ms so a vendor clamp (the Leia path pins at 60 ms,
+		 * silently) never flattens it into a constant the loop cannot see
+		 * — it scores what the runtime handed, not what the DP used.
+		 * 55 ms / 16.7 ms → +3 at 60 Hz; +4 is the hard cap (governor depth).
+		 */
+		int cap = (int)(55000000ULL / period_ns);
+		if (cap > 4) {
+			cap = 4;
 		}
-		if (next > 4) {
-			next = 4;
+		if (next < 0) {
+			next = 0;
+		}
+		if (next > cap) {
+			next = cap;
 		}
 		if (next == po_applied) {
-			po_win_n = 0; // clamped — drop the window rather than re-fire every frame
+			// Clamped. Drop the window rather than re-fire every frame, and
+			// say so ONCE — a pipeline beyond the cap converges to a knowingly
+			// short horizon with no other witness when the trace is off.
+			if (!po_clamp_logged) {
+				po_clamp_logged = true;
+				U_LOG_W("#1435 forward horizon: pipeline offset clamped at %+d periods (residual mode %+d "
+				        "persists; cap %+d for a %.2f ms period) — the horizon handed to the DP is knowingly "
+				        "short by that residual",
+				        po_applied, m, cap, (double)period_ns / 1e6);
+			}
+			po_win_n = 0;
 			return;
 		}
 		const uint64_t now_ns = os_monotonic_get_ns();
@@ -1180,7 +1208,7 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						note_horizon_outcome(err_ns, period_ns, lag);
 						// #1435: residual in whole periods, into the loop.
 						const double kf = (double)err_ns / (double)period_ns;
-						po_observe((int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5));
+						po_observe((int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5), period_ns);
 						ring[idx].horizon_ns = 0; // consumed
 						break;
 					}
