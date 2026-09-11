@@ -134,7 +134,7 @@ input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input
  * `xrtInputPluginNegotiate` for the life of the process, so the storage
  * must outlive the negotiate call. It used to be a stack local in each
  * platform's `input_try_load_one` — a provider that kept the pointer
- * (PortalVR does) was reading dead stack the moment negotiate returned.
+ * (the first external navigation provider does) was reading dead stack the moment negotiate returned.
  *
  * Every provider in the process sees the SAME iface; nothing in it is
  * per-provider, which is why sharing one is correct rather than merely
