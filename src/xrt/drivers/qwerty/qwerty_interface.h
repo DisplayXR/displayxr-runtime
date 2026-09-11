@@ -22,6 +22,7 @@ extern "C" {
 
 struct xrt_pose;
 struct u_camera_profile;
+struct xrt_device;
 
 /*!
  * Snapshot of the qwerty controller's SINGLE active view rig (unified shape,
@@ -153,6 +154,26 @@ qwerty_create_devices(enum u_logging_level log_level,
  */
 bool
 qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pose *out_pose);
+
+/*!
+ * Set the qwerty HMD's integrated pose.
+ *
+ * The rig composer (#1380, ADR-034 Amendment 4) calls this when the rig
+ * (navigation) role hands back from an input provider to the qwerty floor, so
+ * WASD/mouse-look continue from where the provider left the rig instead of
+ * from wherever qwerty's own integrator sat while it was not being read.
+ *
+ * Takes the qwerty system lock, like the other qwerty setters, because
+ * get_tracked_pose integrates on whatever thread polls it.
+ *
+ * @param qwerty_hmd The qwerty HMD device. NULL or a non-qwerty device is a
+ *                   no-op.
+ * @param pose       The pose to continue from.
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_set_hmd_pose(struct xrt_device *qwerty_hmd, const struct xrt_pose *pose);
 
 /*!
  * Check if a runtime-side display mode toggle is pending.

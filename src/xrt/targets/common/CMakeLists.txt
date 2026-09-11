@@ -15,6 +15,7 @@ add_library(
 			    target_plugin_loader.c target_plugin_loader.h
 			    target_plugin_preload_sanitize.c target_plugin_preload_sanitize.h
 			    target_plugin_path_guard.c target_plugin_path_guard.h
+			    target_rig_composer.c target_rig_composer.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
 # #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
