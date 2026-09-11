@@ -1,0 +1,85 @@
+name: Mirror versions.json
+
+# Mirrors versions.json to DisplayXR/displayxr-installer on ANY push to main
+# that changes it — not only inside a component bump.
+#
+# Why this exists. versions-bump.yml (sibling releases) and build-windows.yml's
+# BumpVersionsJsonOnTag (runtime self-bump) each mirror the file after they
+# commit it, but ONLY on their own release path — and only when the bump was a
+# real change (both gate on `.bump-noop`). A field edited by hand and merged as
+# an ordinary PR therefore mirrored nothing. Meanwhile displayxr-installer's
+# publish-bundle.yml `assert-versions-in-sync` job diffs its whole copy against
+# displayxr-runtime/main and hard-fails on any difference. Net effect: one
+# hand-edited pin on main silently blocked EVERY desktop bundle release until
+# the next component release happened to carry the file across, and re-running
+# the bump by hand did not heal it (a no-op bump writes `.bump-noop`, which
+# skips the commit AND the mirror).
+#
+# The mirror itself is scripts/mirror_versions_json.sh — the same script the
+# two bump paths now call, so there is exactly one copy of the logic.
+#
+# Interaction with the bump paths (the thing to get right):
+#
+#   1. Bump commits carry `[skip ci]`, and GitHub does not create push-event
+#      workflow runs for such a commit. So this workflow does not fire on the
+#      bump path at all, and the bump's own mirror step remains the only one.
+#   2. Belt and braces: this workflow shares the `versions-bump` concurrency
+#      group with versions-bump.yml, so the two can never run at the same time.
+#   3. Braces and belt: the script is idempotent — whichever runs second finds
+#      the installer already matching and exits 0 without committing.
+#
+# Together: mirrored exactly once, or a no-op. Never a double commit.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - versions.json
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deliberately the SAME group versions-bump.yml uses — see note 2 above.
+  # Never cancel in progress: a half-done mirror is worse than a queued one.
+  group: versions-bump
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    # Forks push nowhere (and hold none of the App secrets).
+    if: github.repository == 'DisplayXR/displayxr-runtime'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          # Mirror-only: this job never writes back to displayxr-runtime, so
+          # it asks for the one repo it pushes to. Same App, same secrets as
+          # the bump jobs — no new credential path.
+          repositories: displayxr-installer
+
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          # `main`, not github.sha: the mirror should always publish the
+          # current tip. If two pushes land close together the runs converge
+          # on the same content instead of a later run restoring older bytes.
+          ref: main
+          persist-credentials: false
+
+      - name: Mirror versions.json to displayxr-installer
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          SHA=$(git rev-parse --short=9 HEAD)
+          scripts/mirror_versions_json.sh \
+            "chore(versions): mirror versions.json from displayxr-runtime" \
+            "Auto-synced from displayxr-runtime/main@${SHA} by versions-mirror.yml
+          (push to main touching versions.json — e.g. a pin edited by hand in a PR).
+          See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
+          [skip ci]"

@@ -90,6 +90,55 @@ any field by hand from the Actions tab — useful if a sibling repo's
 auto-dispatch step is missing, or to manually re-sync after a
 known-good runtime+leia coordinated release.
 
+## Mirroring to `displayxr-installer` (every path, not just bumps)
+
+`displayxr-installer` holds a byte-for-byte copy of this file, and its
+`publish-bundle.yml` refuses to build a bundle when the two differ —
+`assert-versions-in-sync` does a whole-file `diff -u` of its copy
+against `displayxr-runtime/main` and hard-fails on any difference.
+**So every change to `versions.json` on `main` has to be mirrored,
+whatever made it** — not just the ones a component release made.
+
+Three triggers mirror, through **one** implementation
+(`scripts/mirror_versions_json.sh`):
+
+| What changed the file | Workflow | Trigger |
+|---|---|---|
+| A sibling component release | `versions-bump.yml` | `repository_dispatch` / `workflow_dispatch`, after the bump commits |
+| The runtime's own tag | `build-windows.yml` (`BumpVersionsJsonOnTag`) | `v*` tag push, after the bump commits |
+| **Anything else** — a field added or edited by hand and merged as an ordinary PR | `versions-mirror.yml` | `push` to `main`, `paths: [versions.json]` |
+
+The third trigger closes a hole that was live until 2026-09. Both bump
+jobs mirror only on their own release path, and only when the bump was a
+real change (they gate on the `.bump-noop` sentinel). A hand-edited pin
+therefore mirrored **nothing**, and the drift guard above then blocked
+*every* desktop bundle release until the next unrelated component
+release happened to carry the file across. Re-dispatching the bump by
+hand did not heal it either: a no-op bump writes `.bump-noop`, which
+skips the commit **and** the mirror.
+
+### Why the extra trigger can't double-commit or race the bump
+
+Three independent reasons, in order of which one actually fires:
+
+1. **Bump commits carry `[skip ci]`.** GitHub creates no push-event
+   workflow run for such a commit, so `versions-mirror.yml` does not
+   fire on the bump path at all — the bump's own mirror step stays the
+   only one. (Verified against this repo's history: the bot's
+   `chore(versions): bump …` commits on `main` have zero workflow runs
+   while adjacent ordinary merges have five.)
+2. **Shared concurrency group.** `versions-mirror.yml` declares
+   `concurrency: group: versions-bump` — the same group
+   `versions-bump.yml` uses — with `cancel-in-progress: false`, so the
+   two can never execute at the same time.
+3. **The mirror is idempotent.** `mirror_versions_json.sh` clones,
+   copies, and returns success *without committing* when the installer's
+   copy already matches. Whichever caller runs second is a no-op.
+
+`versions-mirror.yml` also checks out `main` rather than the pushed SHA,
+so if two pushes land close together both runs converge on the current
+tip instead of a late run restoring older bytes.
+
 ## Sibling-side snippets
 
 Each sibling repo adds **one step** to its existing release workflow
@@ -353,6 +402,7 @@ known-good matrix that's been continuously curated by this flow.
 | Two siblings race the same `versions.json` write | `concurrency: versions-bump` serializes them | None needed |
 | ABI mismatch on leia bump | Bump skipped, issue opened on leia repo | Rebuild leia against current runtime, tag a new release |
 | ABI mismatch on runtime self-bump | Bump skipped, issue opened on leia repo | Rebuild leia + tag, *then* re-run `workflow_dispatch` on `versions-bump.yml` with `field=runtime, tag=<this runtime tag>` |
+| A `versions.json` field is edited by hand and merged as an ordinary PR | `versions-mirror.yml` mirrors it to `displayxr-installer` within ~1 min of the merge | None needed. Before that workflow existed this silently blocked every bundle release (`assert-versions-in-sync`) until the next component bump |
 | Sibling repo forgets the dispatch step | `versions.json` doesn't update | Manual `workflow_dispatch` on `versions-bump.yml` with the field + tag, then fix the sibling repo's release workflow |
 | `displayxr-publish-bot` token expires | All bumps fail with auth error | Rotate the GitHub App's private key per `.secrets/NOTE.md` |
 | Bundle build fails downloading a component asset (`gh release download … exit 1`) | `components.sh` declares a platform glob the pinned release doesn't carry (see "Asset-table timing" above) | Cut a component release whose CI produces the asset (`/dxr-release <component> <ver>`); the auto-bump re-pins, the bundle finds it. Or, as a stopgap, blank the glob in `components.sh` to restore warn-and-skip. |

@@ -240,27 +240,21 @@ jobs:
       # Installer's main is unprotected (no ruleset), so the bot's push lands
       # directly. publish-bundle.yml asserts the two files stay in sync as a
       # belt-and-braces drift guard.
+      #
+      # The logic lives in scripts/mirror_versions_json.sh so that this path,
+      # build-windows.yml's runtime self-bump, and versions-mirror.yml (any
+      # push to main touching the file) all mirror through ONE implementation.
+      # It is idempotent: already-matching means no commit, exit 0.
       - name: Mirror versions.json to displayxr-installer
         if: hashFiles('.bump-noop') == '' && (steps.inputs.outputs.field != 'leia_plugin' || steps.abi.outputs.rc == '0')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-installer.git" /tmp/installer
-          cp versions.json /tmp/installer/versions.json
-          cd /tmp/installer
-          if git diff --quiet versions.json; then
-            echo "displayxr-installer/versions.json already matches; no mirror commit needed"
-            exit 0
-          fi
-          git config user.name  "displayxr-publish-bot[bot]"
-          git config user.email "displayxr-publish-bot@users.noreply.github.com"
-          git add versions.json
-          git commit -m "chore(versions): mirror ${{ steps.inputs.outputs.field }} → ${{ steps.inputs.outputs.tag }} from displayxr-runtime
-
-          Auto-synced from displayxr-runtime/versions.json by versions-bump.yml.
+          scripts/mirror_versions_json.sh \
+            "chore(versions): mirror ${{ steps.inputs.outputs.field }} → ${{ steps.inputs.outputs.tag }} from displayxr-runtime" \
+            "Auto-synced from displayxr-runtime/versions.json by versions-bump.yml.
           See displayxr-runtime/docs/specs/runtime/versions-json-autobump.md.
           [skip ci]"
-          git push origin HEAD:main || (git pull --rebase origin main && git push origin HEAD:main)
 
       # Nudge the project website to re-pull org data (versions, demos, repos)
       # so displayxr.org reflects the new release within ~1 min instead of
