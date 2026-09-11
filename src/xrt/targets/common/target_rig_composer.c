@@ -18,10 +18,11 @@
  * transition and at any non-recenter re-alignment the first composed pose is
  * exactly `rig_last`, because `T_world_F o N = (rig_last o inv(N)) o N`. The
  * single deliberate jump is a recenter, which lands on `rig_initial` — the rig
- * pose at system build, the same value @ref u_space_overseer captures as its
+ * pose at system build, which @ref u_space_overseer also captures as its
  * `rig_initial` when it arms the rig source on this very head device
- * (`u_builders.c`, rig-source arming). Hands follow a recenter, which is
- * correct: a recenter is voluntary (ADR-034 Amendment 2).
+ * (`u_builders.c`, rig-source arming), up to the head's tracking-origin offset
+ * (see the seeding comment in @ref t_rig_composer_create). Hands follow a
+ * recenter, which is correct: a recenter is voluntary (ADR-034 Amendment 2).
  */
 
 #include "xrt/xrt_config_drivers.h"
@@ -205,9 +206,16 @@ rig_composer_get_tracked_pose(struct xrt_device *xdev,
 		rc->holder = want;
 		rc->aligned = false;
 
+		// A pending recenter belongs to the tenure it was raised in. If
+		// that provider disappears before the recenter could land, the
+		// request dies with it — it must never fire into the NEXT
+		// holder's frame. recenter_last_ts is deliberately kept, so a
+		// stale timestamp republished by a later provider is still
+		// ignored; only a strictly newer one recenters.
+		rc->recenter_pending = 0;
+
 		if (want >= 0) {
 			// Alignment happens below, on the first valid N.
-			rc->recenter_pending = 0;
 			rc->nav_was_valid = false;
 			if (rc->xsysd->xdevs[want]->str[0] != '\0') {
 				new_name = rc->xsysd->xdevs[want]->str;
@@ -382,10 +390,15 @@ t_rig_composer_create(struct xrt_device *qwerty_hmd, struct xrt_system_devices *
 	rc->T_world_F = (struct xrt_pose)XRT_POSE_IDENTITY;
 
 	// Seed the rig at the qwerty pose. This is "home": what a recenter
-	// returns to, and the same value u_space_overseer captures as its own
-	// rig_initial when it arms the rig source on the head device — the
-	// head's pose IS this composer's rig(t), so the two are equal by
-	// construction rather than by agreement. The overseer logs its copy
+	// returns to. @ref u_space_overseer captures its own rig_initial when it
+	// arms the rig source on this head device, but in a DIFFERENT frame: the
+	// composer's rig_initial is in the head DEVICE frame, while the overseer
+	// resolves its copy through the head's tracking-origin offset (the root
+	// frame). On the sim_display / Leia targets that offset is identity
+	// (origin type OTHER), so the two log lines print the same numbers; with
+	// a non-identity origin offset they differ by exactly that constant
+	// offset, which cancels in every composition — so recenter and
+	// `world = rig(t) o L` stay exact either way. The overseer logs its copy
 	// ("Rig source ... armed at"); this WARN is the other half of the pair.
 	struct xrt_pose seed = XRT_POSE_IDENTITY;
 	if (qwerty_hmd != NULL) {
