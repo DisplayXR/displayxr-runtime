@@ -394,7 +394,7 @@ t_rig_composer_create(struct xrt_device *qwerty_hmd, struct xrt_system_devices *
 	// arms the rig source on this head device, but in a DIFFERENT frame: the
 	// composer's rig_initial is in the head DEVICE frame, while the overseer
 	// resolves its copy through the head's tracking-origin offset (the root
-	// frame). On the sim_display / Leia targets that offset is identity
+	// frame). On the sim_display and vendor display targets that offset is identity
 	// (origin type OTHER), so the two log lines print the same numbers; with
 	// a non-identity origin offset they differ by exactly that constant
 	// offset, which cancels in every composition — so recenter and

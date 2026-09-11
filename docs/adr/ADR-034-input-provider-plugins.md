@@ -393,7 +393,7 @@ camera (WASD / mouse-look) drives — was not a role at all. It was a wire: the
 display plug-in's `set_pose_source` hook, bound once at system build to the
 fly camera and never re-read. So a tracking vendor whose *product* is
 navigation (a controller drag, an IR-fused camera pose) had nowhere to plug
-in, and the first external consumer to want one — PortalVR — carried a
+in, and the first external consumer to want one — an external navigation-provider consumer — carried a
 private runtime fork instead.
 
 That prototype is worth recording, because all three of its moves are traps
