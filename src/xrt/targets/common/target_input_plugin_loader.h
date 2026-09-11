@@ -148,6 +148,38 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
 bool
 target_input_plugin_get_force_qwerty(void);
 
+/*!
+ * Publish the active display processor's nominal panel + viewer geometry to
+ * input providers (#1380).
+ *
+ * The system builder calls this ONCE, right after the display plug-in has
+ * answered `get_display_info` and BEFORE any provider's `create_devices`
+ * runs — which is exactly the readiness the host-iface contract promises:
+ * `get_display_geometry` returns
+ * @ref XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY before this call and the
+ * cached record after it. @p geometry is copied; the caller keeps ownership.
+ * NULL is ignored. The cache's own `struct_size` is always set to the
+ * runtime's `sizeof`, whatever the caller left in it.
+ *
+ * Thread-safe: the publish is mutex-guarded against provider-thread reads,
+ * even though in practice it is a one-shot write on the single-threaded
+ * system-create path.
+ */
+void
+target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geometry *geometry);
+
+/*!
+ * THE process-lifetime host iface handed to every provider at
+ * `xrtInputPluginNegotiate` (#1380).
+ *
+ * Providers are allowed to retain the pointer for the life of the process,
+ * so this storage is static and never a stack local. Exposed for
+ * diagnostics and tests, which drive `get_display_geometry` through the
+ * very same function pointer a provider gets. Never NULL.
+ */
+const struct xrt_input_plugin_host_iface *
+target_input_plugin_get_host_iface(void);
+
 #ifdef __cplusplus
 }
 #endif

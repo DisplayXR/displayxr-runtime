@@ -306,4 +306,24 @@ typedef enum xrt_result
 	 * suppresses the check entirely and is unaffected.
 	 */
 	XRT_ERROR_IPC_VERSION_SKEW = -43,
+
+	/*!
+	 * #1380: an input-provider plug-in asked the host for the active display
+	 * processor's nominal panel/viewer geometry
+	 * (@ref xrt_input_plugin_host_iface::get_display_geometry) BEFORE the
+	 * runtime had it to give.
+	 *
+	 * Not a failure and not "unsupported": the callback itself is valid for
+	 * the life of the process from `xrtInputPluginNegotiate` on, but the
+	 * geometry is only cached once the display plug-in has answered — which
+	 * happens after negotiation and before any provider's `create_devices`
+	 * call. A provider that asks during negotiate gets this; the same call
+	 * from `create_devices` on succeeds. The out struct is left UNTOUCHED,
+	 * so a caller may simply retry later.
+	 *
+	 * Kept distinct from @ref XRT_ERROR_FEATURE_NOT_SUPPORTED (which would
+	 * mean "this runtime never has geometry") precisely so a provider can
+	 * tell "too early" from "never".
+	 */
+	XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY = -44,
 } xrt_result_t;

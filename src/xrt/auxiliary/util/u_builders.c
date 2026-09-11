@@ -7,12 +7,18 @@
  * @ingroup aux_util
  */
 
+#include "xrt/xrt_device.h"
 #include "xrt/xrt_prober.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_tracking.h"
 
+#include "math/m_api.h"
+
+#include "os/os_time.h"
+
 #include "util/u_debug.h"
 #include "util/u_builders.h"
+#include "util/u_logging.h"
 #include "util/u_system_helpers.h"
 #include "util/u_space_overseer.h"
 
@@ -34,6 +40,93 @@ apply_offset(struct xrt_vec3 *position, struct xrt_vec3 *offset)
 	position->x += offset->x;
 	position->y += offset->y;
 	position->z += offset->z;
+}
+
+/*!
+ * Anchor every `XRT_TRACKING_TYPE_RIG_LOCAL` tracking origin at the INITIAL
+ * rig (#1380 / ADR-034 Amendment 4).
+ *
+ * A provider that navigates publishes its controllers and joints
+ * display-plane-relative — origin at the display centre, +X right, +Y up, +Z
+ * toward the viewer. Those poses only become world poses once something says
+ * where the display plane was when the system was built. That is exactly
+ * `u_space_overseer`'s `rig_initial`, so setting it as the origin's
+ * `initial_offset` makes the existing rig delta collapse to the identity the
+ * contract asks for:
+ *
+ *     world = rig(t) o inv(rig_initial) o rig_initial o L = rig(t) o L
+ *
+ * `rig_initial` is read here the same way @ref u_space_overseer_set_rig_source
+ * reads it a moment later: the head device's pose right now, resolved through
+ * its tracking origin's offset (the one level `u_space_overseer_legacy_setup`
+ * builds), and the identity when the head has no valid pose. It has to happen
+ * HERE — after @ref u_builder_setup_tracking_origins has settled the head's
+ * own offset, and before `legacy_setup` snapshots each origin's
+ * `initial_offset` into a space — because the overseer never re-reads it.
+ *
+ * Origins of any other type (OTHER, NONE, …) are left exactly as they were:
+ * a stage-anchored provider keeps its own mount offset.
+ */
+static void
+anchor_rig_local_origins(struct xrt_device *head, struct xrt_device **xdevs, uint32_t xdev_count)
+{
+	if (head == NULL || head->tracking_origin == NULL || xdevs == NULL) {
+		return;
+	}
+
+	// Cheap pre-pass: most systems have no RIG_LOCAL origin at all, and
+	// polling the head for a pose is not free.
+	bool any = false;
+	for (uint32_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] != NULL && xdevs[i]->tracking_origin != NULL &&
+		    xdevs[i]->tracking_origin->type == XRT_TRACKING_TYPE_RIG_LOCAL) {
+			any = true;
+			break;
+		}
+	}
+	if (!any) {
+		return;
+	}
+
+	struct xrt_pose rig_initial = XRT_POSE_IDENTITY;
+
+	struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
+	xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &head_rel);
+
+	const enum xrt_space_relation_flags needed =
+	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+	if ((head_rel.relation_flags & needed) == needed) {
+		// The head's space hangs off its tracking origin's offset
+		// space, so the world pose is offset o pose.
+		math_pose_transform(&head->tracking_origin->initial_offset, &head_rel.pose, &rig_initial);
+	}
+
+	for (uint32_t i = 0; i < xdev_count; i++) {
+		struct xrt_device *xdev = xdevs[i];
+		if (xdev == NULL || xdev->tracking_origin == NULL ||
+		    xdev->tracking_origin->type != XRT_TRACKING_TYPE_RIG_LOCAL) {
+			continue;
+		}
+
+		// Several devices routinely share one origin (a provider's
+		// left and right controllers do); anchor it once.
+		bool already = false;
+		for (uint32_t k = 0; k < i; k++) {
+			if (xdevs[k] != NULL && xdevs[k]->tracking_origin == xdev->tracking_origin) {
+				already = true;
+				break;
+			}
+		}
+		if (already) {
+			continue;
+		}
+
+		xdev->tracking_origin->initial_offset = rig_initial;
+
+		U_LOG_W("Rig-local origin '%s' anchored at the initial rig (%.3f, %.3f, %.3f).",
+		        xdev->tracking_origin->name, rig_initial.position.x, rig_initial.position.y,
+		        rig_initial.position.z);
+	}
 }
 
 
@@ -183,6 +276,12 @@ u_builder_create_space_overseer_legacy(struct xrt_session_event_sink *broadcast,
 	    right,                           //
 	    gamepad,                         //
 	    &global_tracking_origin_offset); //
+
+	// #1380: display-plane-relative origins are anchored at the initial
+	// rig, which is only knowable once the head's own origin is settled
+	// and must be known before the overseer turns each origin offset
+	// into a space.
+	anchor_rig_local_origins(head, xdevs, xdev_count);
 
 
 	/*
