@@ -181,7 +181,20 @@ struct weave_latency_log
 		if (m == 0 || hist[mode_i] < 24) {
 			return; // locked, or not yet a clear majority
 		}
-		int next = po_applied + m;
+		/*
+		 * One period per change. The mode's SIGN is evidence; its
+		 * magnitude is not a safe step. Measured on the avatar eyeball A/B
+		 * (2026-09-10): a governor backoff mid-run deepened the queue for a
+		 * few dozen frames, the residual read +2 in 24/32, and the loop
+		 * jumped +1 -> +3 in one change — 56-75 ms handed, the DP's 60 ms
+		 * clamp engaged, 39% wrong-slot for the window, on a pipeline that
+		 * settled back to +1 moments later. Stepping by one and re-measuring
+		 * (the window resets on every change, ~0.5 s) bounds the overshoot
+		 * to a single period and costs nothing on a genuine +2 (two steps,
+		 * ~1 s).
+		 */
+		const int step = (m > 0) ? 1 : -1;
+		int next = po_applied + step;
 		/*
 		 * Floor 0: the grid snap is the FIRST vblank after now + headroom,
 		 * so a realised flip before it can only mean headroom over-
