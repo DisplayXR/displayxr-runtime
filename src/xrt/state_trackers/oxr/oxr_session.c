@@ -4144,7 +4144,8 @@ seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_bindi
 	bool already_checked = inst->camera_profile_checked;
 	inst->camera_profile_checked = true;
 	os_mutex_unlock(&inst->sessions_mutex);
-	if (already_checked) return;
+	if (already_checked)
+		return;
 	float width = 0.0f, height = 0.0f;
 	struct xrt_window_metrics metrics = {0};
 	if (oxr_session_get_window_metrics(sess, &metrics) && metrics.valid && metrics.window_width_m > 0.0f &&
@@ -4180,8 +4181,7 @@ seed_legacy_camera_profile(struct oxr_session *sess, bool profile_external_bindi
 	profile.inv_convergence_distance = rig.inv_convergence_distance;
 	// Chained per-locate rigs still win in view_rig_update_from_chain; this only
 	// seeds the existing qwerty fallback and its Space reset target.
-	bool applied =
-	    qwerty_set_camera_profile(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &profile);
+	bool applied = qwerty_set_camera_profile(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &profile);
 	if (applied) {
 		U_LOG_W(
 		    "Legacy camera profile: ipd=%.6g parallax=%.6g convergenceDiopters=%.6g verticalFov=%.6g "
