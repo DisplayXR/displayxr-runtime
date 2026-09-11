@@ -1,6 +1,6 @@
 # ADR-034: Input Providers Are a Second Plug-in Type, Not a Display-Processor Extension
 
-**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*; presence-ranked hierarchy — all claiming providers stay resident, roles follow presence — amended 2026-08-16, see *Amendment 3*, whose addendum makes the hand-tracking source follow presence too). The process that **hosts** input providers is not decided here: today they load in-process, and moving them out is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
+**Status:** Accepted (Phase 1 implemented — #823; role arbitration amended 2026-08-15, see *Amendment 1*; rig-relative pose composition amended 2026-08-15, see *Amendment 2*; presence-ranked hierarchy — all claiming providers stay resident, roles follow presence — amended 2026-08-16, see *Amendment 3*, whose addendum makes the hand-tracking source follow presence too; navigation became a third arbitrated role, composed by the runtime — amended 2026-09-11, see *Amendment 4*). The process that **hosts** input providers is not decided here: today they load in-process, and moving them out is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md) D4.
 **Date:** 2026-08-02
 
 ## Context
@@ -377,3 +377,213 @@ whenever the generation moves (`oxr_hand_tracker_resolve_sources`), so the
 joint source hot-follows provider presence exactly like the controllers.
 Hardware-validated: Leap unplug switched live joints to sim-input's
 synthetic hands mid-session and back on replug.
+
+## Amendment 4 — Navigation is a role, composed by the runtime (2026-09-11)
+
+**Status:** Accepted. Adds a third arbitrated role alongside the hands, and
+answers the question *Amendment 2* raised but deliberately did not settle:
+who is allowed to move the rig.
+
+### What was missing
+
+Amendments 1–3 turned the **hands** into a role: ranked, presence-gated,
+re-read on every `xrSyncActions`, and moved between claimants without
+anyone's cooperation. The **rig** — the virtual camera the runtime's own fly
+camera (WASD / mouse-look) drives — was not a role at all. It was a wire: the
+display plug-in's `set_pose_source` hook, bound once at system build to the
+fly camera and never re-read. So a tracking vendor whose *product* is
+navigation (a controller drag, an IR-fused camera pose) had nowhere to plug
+in, and the first external consumer to want one — PortalVR — carried a
+private runtime fork instead.
+
+That prototype is worth recording, because all three of its moves are traps
+the next vendor would walk into independently:
+
+- **Three new vtable slots** (`begin_navigation` / `get_navigation` /
+  `end_navigation`) — a session-ownership protocol sitting next to the
+  arbiter, with its own begin/end lifecycle, no presence gate and no
+  `generation_id`. Two ownership protocols in one process disagree
+  eventually, and the one without arbitration is the one that loses
+  silently: nothing ranks a second claimant, and nothing hands the rig back
+  when hardware is unplugged mid-drag.
+- **Rebinding `set_pose_source`** from a runtime-side adapter — a one-shot
+  display-plug-in hook repurposed as a live ownership channel. It makes
+  every display vendor's contract grow an input obligation it should never
+  carry (the argument against option 1 at the top of this ADR, recurring),
+  and it still has no answer for "two providers, one rig".
+- **The provider pre-cancelling the rig delta.** To keep its hands landing
+  in the right place while it drove the camera, the provider composed the
+  *inverse* of its own navigation into the controller poses it published.
+  This is the *Amendment 2* "applied twice" trap seen from the other end:
+  the runtime composes `rig_now ∘ inv(rig_initial)` onto every provider
+  device, so a provider that pre-compensates is subtracting a transform the
+  runtime is about to add. It looks correct for exactly as long as both
+  sides agree about a number neither of them owns, and it fails invisibly —
+  as drift, not as an error.
+
+The shape of the fix was already in the tree. Navigation should be the same
+kind of thing the hands are.
+
+### Decision
+
+1. **The rig is a role, arbitrated exactly like the hands.** A provider that
+   can navigate creates ONE additional device of type
+   `XRT_DEVICE_TYPE_NAVIGATION`, carrying `XRT_INPUT_GENERIC_NAVIGATION_POSE`
+   and optionally `XRT_INPUT_GENERIC_NAVIGATION_RECENTER`. Its controllers
+   stay controllers. `xrt_system_roles::rig` is then the index of the
+   navigation device belonging to the highest-priority (lowest ProbeOrder)
+   candidate that has one and reports `PRESENT` — the same walk, the same
+   ~250 ms presence cache, the same `generation_id`, the same IPC
+   forwarding, in `target_input_arbiter.c`.
+
+   **The floor is an absence, not a candidate.** The fly camera supplies no
+   navigation device, so `rig == -1` does not mean "no rig": it means *the
+   runtime's own fly camera holds it*. That is the state every box without a
+   navigating provider is in, and the state an unplug falls back to, with no
+   separate teardown path to get wrong.
+
+2. **A runtime-owned composer — not the provider — is the head's pose
+   source.** The builder creates one `xrt_device` whose
+   `XRT_INPUT_GENERIC_HEAD_POSE` is the rig pose `rig(t)`, and binds *it*
+   through the existing `set_pose_source` hook in place of the fly camera.
+   The display-plug-in contract is untouched — this is the same one hook it
+   always had — and the composer is not in `xrt_system_devices::xdevs` and
+   holds no role of its own.
+
+   While the role sits on the floor the composer is a pass-through and the
+   head's pose is byte-for-byte what it was before this amendment. While a
+   provider holds it:
+
+   - **Alignment.** At an epoch `h` the runtime computes one rigid transform
+     `T_world_F = rig(h) ∘ inv(N(h))` — world ← the provider's own
+     navigation frame — and thereafter `rig(t) = T_world_F ∘ N(t)`.
+     Equivalently `rig(t) = rig(h) ∘ inv(N(h)) ∘ N(t)`: a delta taken in the
+     provider's frame and applied in the rig's local coordinates. A
+     non-identity `N(h)` (the provider's frame origin is private and
+     arbitrary) is absorbed into the alignment, and a provider-local step —
+     `N → N ∘ T(0,0,-1)` — moves the rig along its **own** forward, which is
+     what a drag has to mean.
+   - **Epochs.** Exactly three: the rig **holder** changes; `N` transitions
+     invalid → valid; a newer recenter timestamp arrives. Deliberately *not*
+     every `generation_id` bump — hand-role churn (an optical tracker
+     unplugged, a controller hotplugged) shares that counter, and re-aligning
+     on it would swallow whatever navigation step happened in the same poll.
+   - **Continuity is an invariant, not a convention.** At a handover, at an
+     invalid → valid transition and at any non-recenter re-alignment the
+     first composed pose is *exactly* the last one returned, because
+     `T_world_F ∘ N = (rig_last ∘ inv(N)) ∘ N`. While `N` is invalid the rig
+     holds its last pose rather than snapping. There is one deliberate jump
+     in the whole design, and it is the recenter.
+   - **Recenter is durable, not a pulse.** `NAVIGATION_RECENTER` is a
+     level-with-timestamp boolean: value `true`, timestamp = the moment of
+     the most recent reset, never cleared. The composer keeps the last
+     consumed timestamp and acts on `timestamp > last_consumed`. This is
+     forced by the action system, not chosen for elegance: `xrSyncActions`
+     sweeps `update_inputs` over **every** device (and so do the two IPC
+     server paths), so a one-update pulse can be consumed by action sync
+     before the composer ever polls, and the recenter would simply never
+     happen — intermittently, and only on some paths. With a durable level,
+     how many `update_inputs` calls land in between is irrelevant, and two
+     resets between polls collapse to one (a recenter is idempotent).
+   - **The recenter target is `rig_initial`** — the rig pose at system
+     build, "home" — after which the runtime re-aligns there. Hands follow,
+     which is correct and is exactly what *Amendment 2* says: a recenter is
+     voluntary motion.
+   - **Exclusivity.** The role holder is the only navigation source.
+     WASD / mouse-look act **only** while the fly camera holds the role;
+     while a provider holds it the fly camera is not read at all, and it is
+     re-seeded at the current rig on handback so it continues from there
+     instead of from wherever its own integrator sat while unread.
+
+3. **A rig-local frame that removes the runtime's constants from the
+   provider.** A provider that navigates publishes its controllers and joints
+   with `tracking_origin->type = XRT_TRACKING_TYPE_RIG_LOCAL`: poses relative
+   to the **display plane** — origin at the display centre, +X right, +Y up,
+   +Z toward the viewer, metres. The builder anchors such an origin at
+   `rig_initial`, so the *Amendment 2* delta collapses to
+
+   ```
+   world = rig(t) ∘ inv(rig_initial) ∘ rig_initial ∘ L = rig(t) ∘ L
+   ```
+
+   and the provider needs to know neither the standing height nor its own
+   mount offset in stage space. A solver that already produces product poses
+   `C_W` in its own navigated world publishes `L = inv(P(t)) ∘ C_W` next to
+   `N(t) = P(t)`, and the single alignment maps the whole product world at
+   once — no provider-side reference frame, no runtime rig knowledge.
+   `XRT_TRACKING_TYPE_OTHER` / `_NONE` origins keep today's stage-anchored
+   behaviour with their mount offsets intact, so no existing provider
+   changes.
+
+4. **The host iface becomes real storage, plus nominal display geometry.**
+   Both loader paths used to hand `xrtInputPluginNegotiate` a **stack-local**
+   host iface, so a provider that retained the pointer — a reasonable thing
+   to do, and what the first navigating provider did — read dead stack the
+   moment negotiate returned. There is now one persistent host iface per
+   process, shared by every provider in it, and its first real callback is
+   `get_display_geometry`: the panel size and the **nominal** viewer
+   position, cached from the display plug-in's display info before any
+   provider creates devices. Nominal is the whole point — it is geometry for
+   a solver (how big the working volume is, where the plane sits), never a
+   head pose and never the tracked eyes. Pointer **lifetime** and data
+   **readiness** are different questions, so a call made too early gets its
+   own result code and leaves the caller's struct untouched, rather than
+   being confused with "this runtime has no geometry to give".
+
+### Consequences
+
+- **What a vendor does to navigate:** create one `NAVIGATION` device;
+  answer `NAVIGATION_POSE` with the absolute pose of the rig in your own
+  frame, un-parallaxed; clear that pose's validity bits to mean "hold the
+  rig"; publish a durable recenter timestamp if you have a reset gesture;
+  mark your controllers `RIG_LOCAL`. That is the entire surface. There is no
+  session to open, no start epoch handed to you, and no initial rig to
+  reason about.
+- **What a vendor must never do:** compose navigation into the poses it
+  publishes (it will be applied twice — the same rule *Amendment 2* states,
+  and the rig role is precisely what makes breaking it tempting); report a
+  delta, a viewer pose, or an eye-tracked pose as `NAVIGATION_POSE`; or use
+  validity as a presence signal and presence as a validity signal.
+  **Presence is transport, validity is authority**: a plugged-in provider
+  with nothing to say keeps the role and clears validity, while a provider
+  that reports `ABSENT` because it momentarily lost optical lock hands the
+  rig to the fly camera and takes it back a frame later, which is visible.
+- **No gesture policy enters the runtime.** Thresholds, momentum, rest
+  detection, arm-stretch mapping, which button starts a drag — all of it
+  stays in the provider. The runtime owns alignment, continuity, recenter
+  and composition, and nothing else. Symmetrically, nothing vendor-specific
+  entered the runtime for this: the first consumer and the second plug in
+  through the same four things above.
+- **Eye-tracked parallax still never reaches `rig(t)`.** The composer answers
+  the head *device* pose; eye tracking lands later, at view-pose level. That
+  is what keeps *Amendment 2*'s divergence from HMD semantics free rather
+  than filtered.
+- **Under a workspace controller, recentering is a leased action.** v1 is
+  native / standalone: the composer and the role live once per system, in
+  the service when there is one. Arbitrating *which client* may recenter the
+  shared rig is [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
+  D2's "space origin / recenter" lease, and is the follow-up — a background
+  app must not be able to move everyone's camera.
+- **Alignment state is piecewise-constant, with no history.** A head query
+  for a timestamp *before* a recenter, issued after that recenter has
+  aligned, composes with the current alignment. Correcting it would mean
+  keeping an alignment timeline for the sake of queries nobody makes in
+  anger; this is documented instead.
+
+Alternatives rejected along the way, beyond the prototype above:
+
+- **The runtime implements grab-drag itself**, from a grip button plus a
+  controller pose. It needs nothing new on the ABI, and it is wrong for the
+  same reason the vtable slots were: it makes the runtime the author of a
+  gesture policy — where the drag anchors, what happens at arm's length,
+  when a hand at rest stops driving — that only the vendor's solver has the
+  signals to get right, and it hard-codes one interaction for every future
+  input device.
+- **A navigation *delta* input** instead of an absolute pose. It removes the
+  alignment step, and with it every property that makes handover safe:
+  deltas cannot be resampled at a requested timestamp, cannot be dropped
+  without accumulating error, and leave the runtime nothing to hold when
+  tracking goes invalid.
+- **Letting the provider own the head pose directly.** The shortest path,
+  and the one that ends this ADR: parallax, the fly-camera fallback and the
+  *Amendment 2* composition all live behind that pose.
