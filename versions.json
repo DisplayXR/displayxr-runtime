@@ -9,5 +9,6 @@
   "modelviewer_demo": "v0.28.3",
   "mediaplayer_demo": "v1.9.6",
   "avatar_demo": "v0.11.7",
-  "earthview_demo": "v0.7.6"
+  "earthview_demo": "v0.7.6",
+  "cnsdk_services": "v0.10.68"
 }
