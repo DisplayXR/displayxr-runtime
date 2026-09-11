@@ -149,6 +149,29 @@ struct weave_latency_log
 	uint64_t po_last_log_ns = 0;
 	bool po_clamp_logged = false;
 
+	/*!
+	 * #1432 per-frame slot-call candidates — OPT-IN experiments, judged by
+	 * the trace's wrong-slot column under CPU starvation. Both zero-safe
+	 * (0 = off = today's snap).
+	 *
+	 * DEADBAND (DXR_DP_FORWARD_HORIZON_DEADBAND=<0..0.5>, fraction of a
+	 * period): when the snapped vblank differs from "last target + one
+	 * period" (steady cadence) and `ready` sits within the band of the
+	 * boundary that decides between them, hold the steady slot. A Schmitt
+	 * trigger on the boundary; per weave population.
+	 *
+	 * MARGIN (DXR_DP_FORWARD_HORIZON_MARGIN=1): an adaptive headroom margin
+	 * nudged by the SIGN of each resolved weave's residual (after the #1435
+	 * whole-period offset): landed later than predicted -> +P/16, earlier ->
+	 * -P/16, clamped to +-P/2. An integral term on the boundary position.
+	 */
+	int sc_probed = 0;            // 0 unprobed, 1 probed
+	double sc_deadband = 0.0;     // fraction of a period; 0 = off
+	int sc_margin_on = 0;
+	uint64_t sc_prev_target_qpc[2] = {0, 0}; // [app, repaint]
+	int64_t sc_margin_qpc = 0;
+	uint32_t sc_deadband_holds = 0; // trace: snaps overridden this window
+
 	void
 	po_observe(int k, uint64_t period_ns)
 	{
@@ -412,6 +435,23 @@ struct weave_latency_log
 		if (head == 0) {
 			head = pending_repaint ? headroom_qpc : headroom_repaint_qpc;
 		}
+		if (!sc_probed) {
+			sc_probed = 1;
+			const char *db = getenv("DXR_DP_FORWARD_HORIZON_DEADBAND");
+			if (db != nullptr && db[0] != '\0') {
+				sc_deadband = atof(db);
+				if (sc_deadband < 0.0 || sc_deadband > 0.5) {
+					sc_deadband = 0.0;
+				}
+			}
+			const char *mg = getenv("DXR_DP_FORWARD_HORIZON_MARGIN");
+			sc_margin_on = (mg != nullptr && mg[0] == '1') ? 1 : 0;
+		}
+		// #1432 MARGIN candidate: adaptive headroom margin (0 when off).
+		if (sc_margin_on) {
+			const int64_t h = (int64_t)head + sc_margin_qpc;
+			head = h > 0 ? (uint64_t)h : 0;
+		}
 		const uint64_t head_min = f2 / 1000; // 1 ms
 		if (head < head_min) {
 			head = head_min;
@@ -421,8 +461,27 @@ struct weave_latency_log
 		}
 		const uint64_t ready = nowq + head;
 		// First vblank strictly after `ready`.
-		const uint64_t target =
+		uint64_t target =
 		    last_sync_qpc + ((ready - last_sync_qpc) / refresh_period_qpc + 1) * refresh_period_qpc;
+		// #1432 DEADBAND candidate: hold the steady-cadence slot near a boundary.
+		{
+			const int pop = pending_repaint ? 1 : 0;
+			const uint64_t prev = sc_prev_target_qpc[pop];
+			if (sc_deadband > 0.0 && prev != 0) {
+				const uint64_t steady = prev + refresh_period_qpc;
+				if (target != steady && steady > nowq && steady <= prev + 3 * refresh_period_qpc) {
+					// Distance from `ready` to the boundary that separates the
+					// snapped slot from the steady one.
+					const uint64_t dist = (target > steady) ? (ready - (target - refresh_period_qpc))
+					                                        : (target > ready ? target - ready : 0);
+					if ((double)dist < sc_deadband * (double)refresh_period_qpc) {
+						target = steady;
+						sc_deadband_holds++;
+					}
+				}
+			}
+			sc_prev_target_qpc[pop] = target;
+		}
 		uint64_t horizon_ns = (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
 		const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * 1000000000.0 / (double)f2);
 		// #1435: the learned whole-period pipeline offset (0 until locked).
@@ -523,14 +582,16 @@ struct weave_latency_log
 		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
 		    "| resolved %u  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
-		    "bias %+.2f ms  sync-flip lag %.2f refr",
+		    "bias %+.2f ms  sync-flip lag %.2f refr  | db %.2f holds %u  margin %+.2f ms",
 		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
 		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, po_applied, hz_wrong_slot,
 		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
 		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
 		    hz_resolved ? (double)hz_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
-		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0);
+		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0, sc_deadband, sc_deadband_holds,
+		    (double)sc_margin_qpc * 1000.0 / (double)freq());
+		sc_deadband_holds = 0;
 
 		hz_win_start_ns = now_ns;
 		hz_min_ns = 0;
@@ -1221,7 +1282,20 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						note_horizon_outcome(err_ns, period_ns, lag);
 						// #1435: residual in whole periods, into the loop.
 						const double kf = (double)err_ns / (double)period_ns;
-						po_observe((int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5), period_ns);
+						const int kres = (int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5);
+						po_observe(kres, period_ns);
+						// #1432 MARGIN candidate: integral term on the boundary.
+						if (sc_margin_on && kres != 0) {
+							const int64_t stepq = (int64_t)(refresh_period_qpc / 16);
+							const int64_t lim = (int64_t)(refresh_period_qpc / 2);
+							sc_margin_qpc += (kres > 0) ? stepq : -stepq;
+							if (sc_margin_qpc > lim) {
+								sc_margin_qpc = lim;
+							}
+							if (sc_margin_qpc < -lim) {
+								sc_margin_qpc = -lim;
+							}
+						}
 						ring[idx].horizon_ns = 0; // consumed
 						break;
 					}
