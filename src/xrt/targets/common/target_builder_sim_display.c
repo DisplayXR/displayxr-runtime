@@ -23,6 +23,7 @@
 #include "target_input_arbiter.h"
 #include "target_input_plugin_loader.h"
 #include "target_plugin_loader.h"
+#include "target_rig_composer.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_device.h"
@@ -68,6 +69,23 @@ sim_display_estimate_system(struct xrt_builder *xb,
 
 	return XRT_SUCCESS;
 }
+
+/*!
+ * The sim_display builder, plus the one thing it owns beyond its own memory:
+ * the rig composer (#1380). The composer is NOT in `xsysd->xdevs` -- it is the
+ * head device's pose source, not a role holder -- so nothing else would free
+ * it. Hanging it off the builder is safe because the builder outlives the
+ * system: `oxr_instance_destroy` tears down `xsysd` (and with it the head that
+ * polls the composer) before `xrt_instance_destroy` reaches the prober's
+ * builders.
+ */
+struct sim_display_builder
+{
+	struct u_builder base;
+
+	//! The rig composer bound as the head's pose source, or NULL.
+	struct xrt_device *rig_composer;
+};
 
 static xrt_result_t
 sim_display_open_system_impl(struct xrt_builder *xb,
@@ -176,13 +194,30 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 			qd->sys->nominal_viewer_z = nominal_z_m;
 		}
 
-		// Bind the qwerty HMD as the head's external pose source.
-		// Iface-routed; the plug-in owns the vendor-private cast.
+		// Bind the head's external pose source. Iface-routed; the
+		// plug-in owns the vendor-private cast.
+		//
+		// #1380: the source is the RIG COMPOSER, not the qwerty HMD
+		// directly. While the rig (navigation) role sits on the qwerty
+		// floor the composer is a pass-through and the head's pose is
+		// byte-for-byte what it always was; when an input provider's
+		// NAVIGATION device takes the role the composer owns alignment,
+		// continuity, recenter and composition. The display plug-in and
+		// sim_display are untouched -- this is the same one hook.
 		if (plugin != NULL &&
 		    plugin->struct_size >=
 		        offsetof(struct xrt_plugin_iface, set_pose_source) + sizeof(plugin->set_pose_source) &&
 		    plugin->set_pose_source != NULL) {
-			plugin->set_pose_source(target_plugin_get_active_instance(), head, qwerty_hmd);
+			struct sim_display_builder *sdb = (struct sim_display_builder *)xb;
+			struct xrt_device *source = qwerty_hmd;
+
+			t_rig_composer_destroy(&sdb->rig_composer);
+			sdb->rig_composer = t_rig_composer_create(qwerty_hmd, xsysd, head);
+			if (sdb->rig_composer != NULL) {
+				source = sdb->rig_composer;
+			}
+
+			plugin->set_pose_source(target_plugin_get_active_instance(), head, source);
 		}
 	}
 #endif
@@ -193,6 +228,13 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 static void
 sim_display_destroy(struct xrt_builder *xb)
 {
+	struct sim_display_builder *sdb = (struct sim_display_builder *)xb;
+
+	// The head device is already gone (see struct sim_display_builder), so
+	// nothing polls the composer any more and there is no pose-source
+	// binding left to clear.
+	t_rig_composer_destroy(&sdb->rig_composer);
+
 	free(xb);
 }
 
@@ -206,7 +248,8 @@ sim_display_destroy(struct xrt_builder *xb)
 struct xrt_builder *
 t_builder_sim_display_create(void)
 {
-	struct u_builder *ub = U_TYPED_CALLOC(struct u_builder);
+	struct sim_display_builder *sdb = U_TYPED_CALLOC(struct sim_display_builder);
+	struct u_builder *ub = &sdb->base;
 
 	// xrt_builder fields.
 	ub->base.estimate_system = sim_display_estimate_system;

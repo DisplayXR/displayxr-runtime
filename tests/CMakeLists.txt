@@ -27,6 +27,7 @@ set(tests
     tests_u_multi_display
     tests_dp_weave_scope
     tests_space_overseer_rig
+    tests_rig_composer
     tests_cli_dims_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1
@@ -128,6 +129,23 @@ target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
 endif()
+
+# #1380 rig composer -- the head device's pose source. Compiled straight into
+# the unit (like tests_comp_rear_budget) rather than linked from target_lists,
+# which would drag the whole prober/plug-in/builder stack into a test that needs
+# no plug-in, no display and no provider. The one driver symbol it calls,
+# qwerty_set_hmd_pose, is stubbed in the test file: that stub IS the fake qwerty.
+# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- the vendor plug-in's signing recipe
+# builds this runtime as a sub-project and a target_sources() path resolved
+# against the wrong root is a hard configure error.
+target_sources(
+	tests_rig_composer PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_rig_composer.c
+	)
+target_include_directories(
+	tests_rig_composer PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+			   ${PROJECT_SOURCE_DIR}/src/xrt/drivers
+	)
+target_link_libraries(tests_rig_composer PRIVATE xrt-interfaces aux_math aux_os)
 
 if(TARGET tests_oxr_view_space)
 	target_include_directories(

@@ -1074,6 +1074,30 @@ qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pos
 	return false;
 }
 
+void
+qwerty_set_hmd_pose(struct xrt_device *qwerty_hmd, const struct xrt_pose *pose)
+{
+	if (qwerty_hmd == NULL || pose == NULL || qwerty_hmd->tracking_origin == NULL) {
+		return;
+	}
+	if (strcmp(qwerty_hmd->tracking_origin->name, QWERTY_HMD_TRACKER_STR) != 0) {
+		return;
+	}
+
+	struct qwerty_device *qd = qwerty_device(qwerty_hmd);
+
+	os_mutex_lock(&qd->lock); // #958
+	qd->pose = *pose;
+	// #1016: do not BANK the time qwerty spent unread. While an input
+	// provider held the rig role nothing polled this device, so
+	// last_integrate_ns is stale by that whole span -- and the first poll
+	// after the handback would integrate a clamped 100 ms (six frames) of
+	// held-key movement in one tick, which is the opposite of "continue
+	// from this pose".
+	qd->last_integrate_ns = os_monotonic_get_ns();
+	os_mutex_unlock(&qd->lock); // #958
+}
+
 // Clamp helper
 static inline float
 clampf(float v, float lo, float hi)
