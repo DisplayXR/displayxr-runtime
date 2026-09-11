@@ -29,7 +29,7 @@ Spec: [`docs/specs/runtime/versions-json-autobump.md`](../../docs/specs/runtime/
 /dxr-release <component> <version-spec>
 
   <component>     shell | leia-plugin (leia) | mcp | browser | gauss (demo-gaussiansplat) | modelviewer (demo-modelviewer) | mediaplayer (demo-mediaplayer) | avatar (demo-avatar) | earthview (demo-earthview) | unity
-  <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser: preview-X.Y.Z — see "Browser is special")
+  <version-spec>  vX.Y.Z  |  patch  |  minor  |  major        (browser too, from v1.0.0 — see "Browser is special")
 ```
 
 Examples:
@@ -39,7 +39,7 @@ Examples:
 /dxr-release shell minor
 /dxr-release gauss v1.4.4
 /dxr-release unity v1.25.0
-/dxr-release browser preview-0.1.24
+/dxr-release browser v1.0.0
 /dxr-release browser patch
 ```
 
@@ -67,9 +67,14 @@ from cwd — that's the old cwd-detecting behavior this skill replaced.
 `displayxr-browser`, which **keeps its name** because `versions.json[browser]`,
 `install-android-bundle.sh --links` and tester install URLs all resolve against it).
 Four consequences for this skill:
-- **Tag shape is `preview-X.Y.Z`, not `vX.Y.Z`.** `versions-bump.yml` has a per-field
-  tag-shape carve-out for `browser`; never "normalise" it to `v`. `patch`/`minor`/`major`
-  compute from the newest `preview-*` tag (Step 1.3).
+- **Tag shape is `vX.Y.Z`, like every other component** — from **v1.0.0** onwards
+  (browser-pvt#120, approved by David 2026-09-11; the Developer-Preview channel and its
+  `preview-X.Y.Z` tags are retired). `versions-bump.yml` still *accepts* `preview-*` for
+  the `browser` field during the transition, but this skill only ever emits `v`.
+  `patch`/`minor`/`major` compute from the newest `v*` tag (Step 1.3) — and note there is
+  a **version discontinuity at the cut-over**: `0.1.35 → 1.0.0` is not a `sort -V` step,
+  so the first release on this channel must be given the literal tag `v1.0.0`, never
+  derived.
 - **CI workflow = `publish-browser-releases.yml`** (tag-triggered, mirrors
   `publish-shell-releases.yml`). NOT `pipeline.yml` / `build-box.yml` — those are
   manual `workflow_dispatch` build lanes and never fire on a tag.
@@ -109,8 +114,11 @@ Four consequences for this skill:
   stale:
   ```bash
   FEED=$(curl -s https://updates.displayxr.org/feed.json | jq -r '.latest.version')
-  echo "update feed advertises $FEED; this release is ${NEW_TAG#preview-}"
-  [ "$FEED" = "${NEW_TAG#preview-}" ] || echo "FEED IS STALE — existing installs will NOT be offered this release."
+  # Strip whatever prefix the tag carries ($TAG_PREFIX is `v`; historical browser
+  # tags were `preview-`) — the feed's `version` is bare X.Y.Z either way.
+  REL_VER="${NEW_TAG#preview-}"; REL_VER="${REL_VER#v}"
+  echo "update feed advertises $FEED; this release is $REL_VER"
+  [ "$FEED" = "$REL_VER" ] || echo "FEED IS STALE — existing installs will NOT be offered this release."
   ```
 - **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
   "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
@@ -184,9 +192,10 @@ case "$COMPONENT" in
   *)                             echo "Unknown component '$COMPONENT'. One of: shell, leia-plugin, mcp, browser, gauss, modelviewer, mediaplayer, avatar, earthview, unity."; exit 1 ;;
 esac
 # FIELD="" (unity) → no versions.json entry; skip the Phase 4 versions-bump watch.
-# Tag shape per component: browser tags are `preview-X.Y.Z` (versions-bump.yml carve-out);
-# everything else is `vX.Y.Z`. Every later regex/derivation goes through TAG_PREFIX.
-case "$COMPONENT" in browser) TAG_PREFIX=preview- ;; *) TAG_PREFIX=v ;; esac
+# Tag shape is `vX.Y.Z` for EVERY component, browser included (browser-pvt#120 retired
+# the `preview-X.Y.Z` channel at v1.0.0). Every later regex/derivation goes through
+# TAG_PREFIX, so the variable stays even though there is no longer a carve-out.
+TAG_PREFIX=v
 TAG_RE="^${TAG_PREFIX}[0-9]+\.[0-9]+\.[0-9]+$"
 echo "repo=$REPO field=$FIELD workflow=$WORKFLOW rel_repo=$REL_REPO tag_prefix=$TAG_PREFIX"
 ```
@@ -200,9 +209,9 @@ cd "$WORK/repo"
 ```
 
 ### Step 1.3: Resolve version-spec
-- Literal tag → validate against `$TAG_RE` (`^v[0-9]+\.[0-9]+\.[0-9]+$`, or
-  `^preview-[0-9]+\.[0-9]+\.[0-9]+$` for browser), use as-is. A `vX.Y.Z` given for
-  browser (or `preview-` for anything else) is a hard error, not a rewrite.
+- Literal tag → validate against `$TAG_RE` (`^v[0-9]+\.[0-9]+\.[0-9]+$`, for every
+  component including browser), use as-is. A `preview-X.Y.Z` spec is a hard error, not a
+  rewrite: that channel is retired — say so and ask for the `vX.Y.Z` the caller meant.
 - `patch`/`minor`/`major` → compute from
   `git tag --sort=-creatordate | grep -E "$TAG_RE" | head -1`, keeping `$TAG_PREFIX`.
 
@@ -346,7 +355,7 @@ so both do. The assets are signed by the time Phase 3 goes green; re-dispatching
 here would rebuild and clobber them. Verify instead of re-signing:
 ```bash
 if [ "$COMPONENT" = browser ]; then
-  gh release view "$NEW_TAG" -R "$REL_REPO" --json assets --jq '.assets[].name'   # expect DisplayXR-Browser-Preview-Setup-X.Y.Z.exe (+ APKs)
+  gh release view "$NEW_TAG" -R "$REL_REPO" --json assets --jq '.assets[].name'   # expect DisplayXR-Browser-Setup-X.Y.Z.exe + DisplayXR-Browser-X.Y.Z-android-arm64.apk
   SIGNED=in-ci; SKIP_SIGN=1
 fi
 ```
@@ -752,14 +761,14 @@ gh release view "$NEW_TAG" -R "$REL_REPO" --json body -q '.body' | head -20
 [ -z "$FIELD" ] && { echo "No versions.json field for $COMPONENT — no bump to watch; skipping to report."; SKIP_BUMP=1; }
 ```
 
-**browser — NO BUMP IS THE CORRECT OUTCOME for an Android-only preview.** Do not report
+**browser — NO BUMP IS THE CORRECT OUTCOME for an Android-only release.** Do not report
 it as a failed or missing bump. `publish-browser-releases.yml` gates its dispatch on a
 Windows installer actually shipping (`steps.locate.outputs.exe != ''`), because
 `versions.json[browser]` means *"the version the orchestrator can install as a released
 asset"*, and `setup-displayxr.bat --with browser` resolves it through `components.sh`'s
-`DisplayXR-Browser-Preview-Setup-*.exe` glob. An APK-only release cannot satisfy that
+`DisplayXR-Browser-*Setup-*.exe` glob. An APK-only release cannot satisfy that
 glob, so the pin deliberately stays behind — real and already live: `preview-0.1.24`
-shipped Android-only and the pin correctly still names `preview-0.1.23`. **Never
+shipped Android-only and the pin correctly still named `preview-0.1.23`. **Never
 hand-bump the pin to match the newest tag**; it points `--with browser` at a release
 with no installer. Decide from the assets, not from the absence of a bump run:
 ```bash
@@ -767,7 +776,7 @@ if [ "$COMPONENT" = browser ]; then
   HAS_EXE=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
               --jq '[.assets[].name|select(contains("Setup") and endswith(".exe"))]|length')
   if [ "$HAS_EXE" = 0 ]; then
-    echo "Android-only preview — no Windows installer, so NO versions.json bump is expected."
+    echo "Android-only release — no Windows installer, so NO versions.json bump is expected."
     echo "versions.json[browser] intentionally stays behind $NEW_TAG. Do not bump it by hand."
     SKIP_BUMP=1
   fi
@@ -817,7 +826,7 @@ elif [ "$FIELD" = "leia_plugin" ]; then
             --json number,url --jq '.[0]')
   echo "ABI gate skipped the bump. Tracking issue: $ISSUE"
 elif [ "$COMPONENT" = browser ] && [ "${SKIP_BUMP:-0}" = 1 ]; then
-  echo "versions.json[browser] = $PINNED, intentionally behind $NEW_TAG (Android-only preview — see Phase 4)."
+  echo "versions.json[browser] = $PINNED, intentionally behind $NEW_TAG (Android-only release — see Phase 4)."
 else
   echo "Bump did not land — versions.json[$FIELD] = $PINNED, expected $NEW_TAG"
 fi
