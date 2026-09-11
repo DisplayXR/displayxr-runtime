@@ -6,7 +6,8 @@ name: Bump versions.json
 #
 #   {
 #     "field":       "shell" | "leia_plugin" | "mcp_tools" | "browser" | "demos.<name>",
-#     "tag":         "v1.2.3"   (or "preview-0.1.16" for the browser field)
+#     "tag":         "v1.2.3"   (the browser field also still accepts the
+#                                retiring "preview-0.1.16" shape)
 #     "source_repo": "DisplayXR/displayxr-<repo>"
 #   }
 #
@@ -73,18 +74,24 @@ jobs:
             echo "::error::field and tag are required (got field='$FIELD' tag='$TAG')"
             exit 1
           fi
-          # Tag shape is per-field. Everything in the matrix ships vX.Y.Z except
-          # the browser, whose releases are `preview-X.Y.Z`: the prefix is
-          # load-bearing (it marks a build that is rebased ~monthly onto Chrome
-          # stable but NOT patched to Chrome's mid-cycle security cadence), it is
-          # what the in-browser update feed reads, and it predates this field.
-          # Renaming the channel to look uniform here would erase that signal, so
-          # the validator learns the shape instead.
+          # Tag shape is per-field. Every component ships `vX.Y.Z`; the browser
+          # is validated separately only because it is the ONE component whose
+          # tags ever carried a non-`v` prefix (`preview-X.Y.Z`) — and that
+          # channel is retiring (browser-pvt#120, David 2026-09-11: vX.Y.Z from
+          # v1.0.0). Nothing downstream parses the prefix: the pin is passed to
+          # `gh release download` verbatim, and the only consumer of the update
+          # feed (the start page's version-check) compares the Chromium build
+          # and ignores the channel entirely. So the browser case accepts BOTH
+          # shapes for the duration of the transition — `preview-*` so the
+          # existing history and any in-flight preview release keep bumping,
+          # `vX.Y.Z` so the v1.0.0 cut-over needs no second edit here. Drop the
+          # `preview-` alternative once no preview release can still dispatch.
           case "$FIELD" in
-            # 3 or 4 parts: the channel is on preview-0.1.x today, but the early
-            # builds were Chromium-versioned (preview-150.0.7871.129) and a rebase
-            # could reasonably go back to that.
-            browser) TAG_RE='^preview-[0-9]+(\.[0-9]+){2,3}$' ; TAG_SHAPE='preview-X.Y.Z' ;;
+            # preview-* takes 3 or 4 parts: the channel ended on preview-0.1.x,
+            # but the early builds were Chromium-versioned
+            # (preview-150.0.7871.129). vX.Y.Z is exactly 3, as everywhere else.
+            browser) TAG_RE='^(preview-[0-9]+(\.[0-9]+){2,3}|v[0-9]+\.[0-9]+\.[0-9]+)$'
+                     TAG_SHAPE='vX.Y.Z (preview-X.Y.Z accepted during the channel transition)' ;;
             *)       TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+$'        ; TAG_SHAPE='vX.Y.Z' ;;
           esac
           if [[ ! "$TAG" =~ $TAG_RE ]]; then
