@@ -40,6 +40,7 @@ set(tests
     tests_comp_rear_budget
     tests_oxr_weave_latch
     tests_input_arbiter_rig
+    tests_sim_input_nav
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile)
@@ -159,6 +160,23 @@ if(TARGET tests_oxr_view_space)
 		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
 	endif()
 endif()
+
+# #1380 — the sim_input scripted NAVIGATION device: the hardware-free reference
+# rig driver. Compiled straight into the unit (like tests_rig_composer above)
+# rather than loaded as the plug-in DLL, because what is under test is the
+# SCRIPT — pure functions of the requested timestamp — and not discovery: a
+# loader-driven test could not pin determinism without a registry write.
+# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the vendor plug-in's signing recipe
+# builds this runtime as a SUB-PROJECT and a target_sources() path resolved
+# against the wrong root is a hard configure error.
+target_sources(
+	tests_sim_input_nav PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input/sim_input_nav.c
+	)
+target_include_directories(
+	tests_sim_input_nav PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input
+			    ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_sim_input_nav PRIVATE xrt-interfaces aux_os)
 
 # #1380 — the rig (navigation) role in the input arbiter. The arbiter is pure
 # decision logic over a candidate table, so the unit compiles it straight in

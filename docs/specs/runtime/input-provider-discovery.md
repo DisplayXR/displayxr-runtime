@@ -497,6 +497,24 @@ for the device and the `DXR_SIM_INPUT*` environment gates that drive it.
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
 | `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 
+**`sim_input` and the rig role (#1380).** A *second*, independent opt-in,
+`DXR_SIM_INPUT_NAV=1`, adds one scripted `XRT_DEVICE_TYPE_NAVIGATION` device
+("Sim navigation") so the rig role of §4b runs hardware-free. Default **off**,
+so every pre-existing `DXR_SIM_INPUT=1` run is byte-for-byte unchanged: no
+navigation device, the rig stays on the qwerty floor. With it on, `N(t)` is a
+slow figure-eight plus yaw in the provider's own frame F — a pure function of
+the requested timestamp, so prediction is exact and CI is reproducible — and
+the controllers switch to `XRT_TRACKING_TYPE_RIG_LOCAL`, because a provider
+that navigates publishes display-plane-relative poses (§4b). Two optional
+fault knobs, both off by default: `DXR_SIM_INPUT_NAV_HOLD_MS=<n>` makes the
+pose report invalid for 500 ms every *n* ms (the composer's hold / re-align
+path) and `DXR_SIM_INPUT_NAV_RECENTER_MS=<n>` fires a scripted reset every *n*
+ms, advancing the durable `NAVIGATION_RECENTER` timestamp **and** jumping the
+scripted pose in the same publication. All three are env vars, not registry
+values, for the reason `DXR_SIM_INPUT` is (§4.6): per-run developer switches,
+not machine configuration — and the process-level caveat applies, set them
+before launching the host process.
+
 ### 5.1 net_input wire protocol (v1)
 
 Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`

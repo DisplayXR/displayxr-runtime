@@ -27,6 +27,7 @@
 
 #include "os/os_display_edid.h"
 #include "os/os_display_desktop.h"
+#include "os/os_time.h" // #1380 rig-role sampling window
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
 #ifdef XRT_OS_WINDOWS
@@ -40,6 +41,7 @@
 
 #include <cjson/cJSON.h>
 
+#include <math.h> // #1380 isfinite() over the sampled rig poses
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -674,6 +676,195 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 	}
 }
 
+/*
+ *
+ * Rig (navigation) role -- ADR-034 Amendment 4 / #1380.
+ *
+ */
+
+//! Head samples taken while watching the rig move. 80 x 20 ms = 1.6 s.
+#define CLI_RIG_SAMPLES 80
+#define CLI_RIG_SAMPLE_INTERVAL_NS (20 * 1000 * 1000)
+//! How long to wait for provider presence to settle into `roles.rig`.
+#define CLI_RIG_ROLE_ATTEMPTS 20
+
+//! Find an input by name; the RECENTER input is optional by contract.
+static struct xrt_input *
+rig_find_input(struct xrt_device *xdev, enum xrt_input_name name)
+{
+	if (xdev == NULL || xdev->inputs == NULL) {
+		return NULL;
+	}
+	for (size_t i = 0; i < xdev->input_count; i++) {
+		if (xdev->inputs[i].name == name) {
+			return &xdev->inputs[i];
+		}
+	}
+	return NULL;
+}
+
+static bool
+rig_pose_finite(const struct xrt_pose *p)
+{
+	return isfinite(p->position.x) && isfinite(p->position.y) && isfinite(p->position.z) &&
+	       isfinite(p->orientation.x) && isfinite(p->orientation.y) && isfinite(p->orientation.z) &&
+	       isfinite(p->orientation.w);
+}
+
+static float
+rig_distance(const struct xrt_vec3 *a, const struct xrt_vec3 *b)
+{
+	const float dx = a->x - b->x;
+	const float dy = a->y - b->y;
+	const float dz = a->z - b->z;
+	return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+/*!
+ * ADR-034 Amendment 4 / #1380 -- the rig (navigation) role, end to end.
+ *
+ * ABSENCE NEVER FAILS: a system with no `XRT_DEVICE_TYPE_NAVIGATION` device
+ * leaves every field at "not evaluated" and the verdict untouched, because
+ * `roles.rig == -1` is not "no rig" -- it is the runtime's own fly camera
+ * holding it, which is what every box without a navigating provider reports.
+ *
+ * When a navigation device IS there, three things are asserted, and the second
+ * is the one that matters: a role that resolves while the head stands still is
+ * precisely the regression an index-only check cannot see.
+ *
+ *   1. `xrt_system_roles::rig` resolves to that device (the arbiter walk).
+ *   2. The HEAD's pose -- which IS the composed rig -- changes over a 1.6 s
+ *      window and every sample is finite (the composer really took the
+ *      provider's navigation frame as the rig source).
+ *   3. If the device fired at least two recenters during that window (watched
+ *      on its own durable RECENTER timestamp -- never inferred from an env
+ *      knob, so a real provider that recenters only on user intent stays
+ *      unexpected and passes), the head returned to ONE identical pose each
+ *      time: `rig_initial`, the single deliberate jump in the contract.
+ */
+static void
+probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct xrt_device *head)
+{
+	if (h->xsysd == NULL || head == NULL) {
+		snprintf(r->rig_note, sizeof(r->rig_note), "not evaluated: no system devices");
+		return;
+	}
+
+	int32_t nav_index = -1;
+	for (uint32_t i = 0; i < h->xsysd->xdev_count; i++) {
+		struct xrt_device *xdev = h->xsysd->xdevs[i];
+		if (xdev != NULL && xdev->device_type == XRT_DEVICE_TYPE_NAVIGATION) {
+			nav_index = (int32_t)i;
+			break;
+		}
+	}
+	if (nav_index < 0) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "not evaluated: no navigation device (OK - the runtime's fly camera holds the rig)");
+		return;
+	}
+
+	struct xrt_device *nav = h->xsysd->xdevs[nav_index];
+	r->rig_nav_present = true;
+	r->rig_evaluated = true;
+	snprintf(r->rig_nav_str, sizeof(r->rig_nav_str), "%s", nav->str);
+
+	// Presence is cached and refreshed by the arbiter's poll thread, so the
+	// role can take a beat to settle after system build.
+	for (int attempt = 0; attempt < CLI_RIG_ROLE_ATTEMPTS; attempt++) {
+		struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
+		if (xrt_system_devices_get_roles(h->xsysd, &roles) == XRT_SUCCESS && roles.rig == nav_index) {
+			r->rig_role_ok = true;
+			break;
+		}
+		os_nanosleep(CLI_RIG_SAMPLE_INTERVAL_NS);
+	}
+	if (!r->rig_role_ok) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "FAIL: '%s' is a navigation device but never took the rig role", r->rig_nav_str);
+		return;
+	}
+
+	struct xrt_input *recenter = rig_find_input(nav, XRT_INPUT_GENERIC_NAVIGATION_RECENTER);
+	int64_t recenter_ts = 0;
+	bool first_recenter_seen = false;
+
+	struct xrt_vec3 samples[CLI_RIG_SAMPLES];
+	uint32_t count = 0;
+	bool finite = true;
+
+	for (int i = 0; i < CLI_RIG_SAMPLES; i++) {
+		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+		if (xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, (int64_t)os_monotonic_get_ns(),
+		                                &rel) == XRT_SUCCESS) {
+			finite = finite && rig_pose_finite(&rel.pose);
+			samples[count++] = rel.pose.position;
+		}
+
+		// The head poll above is what drives the composer's own
+		// update_inputs on the navigation device, so this reads the
+		// timestamp the composer just consumed.
+		if (recenter != NULL && recenter->active && recenter->value.boolean &&
+		    recenter->timestamp > recenter_ts) {
+			if (first_recenter_seen) {
+				r->rig_recenter_seen++;
+			}
+			first_recenter_seen = true;
+			recenter_ts = recenter->timestamp;
+		}
+
+		os_nanosleep(CLI_RIG_SAMPLE_INTERVAL_NS);
+	}
+
+	// Travel: the head must actually go somewhere.
+	float travel = 0.0f;
+	for (uint32_t i = 1; i < count; i++) {
+		const float d = rig_distance(&samples[0], &samples[i]);
+		if (d > travel) {
+			travel = d;
+		}
+	}
+	r->rig_travel_m = travel;
+	r->rig_moves_ok = finite && count >= 2 && travel > 1e-4f;
+
+	// A recenter lands the rig on `rig_initial` EXACTLY (the one deliberate
+	// jump), so two or more recenters put the same value in the sample set
+	// twice. Identity, not a tolerance: the composer returns the stored
+	// pose verbatim, and a "nearly equal" rule would also be satisfied by a
+	// rig that merely happened to pass back through.
+	uint32_t repeat_max = 1;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t n = 1;
+		for (uint32_t k = i + 1; k < count; k++) {
+			if (samples[k].x == samples[i].x && samples[k].y == samples[i].y &&
+			    samples[k].z == samples[i].z) {
+				n++;
+			}
+		}
+		if (n > repeat_max) {
+			repeat_max = n;
+		}
+	}
+	r->rig_repeat_max = repeat_max;
+	r->rig_recenter_expected = r->rig_recenter_seen >= 2;
+	r->rig_recenter_ok = !r->rig_recenter_expected || repeat_max >= 2;
+
+	if (!r->rig_moves_ok) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "FAIL: rig role on '%s' but the head %s (travel %.4f m over %u samples)", r->rig_nav_str,
+		         finite ? "never moved" : "went non-finite", (double)travel, count);
+	} else if (!r->rig_recenter_ok) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "FAIL: %u recenter(s) fired on '%s' but the head never returned to one pose",
+		         r->rig_recenter_seen, r->rig_nav_str);
+	} else {
+		snprintf(r->rig_note, sizeof(r->rig_note), "rig held by '%s': head travelled %.3f m, %u recenter(s)%s",
+		         r->rig_nav_str, (double)travel, r->rig_recenter_seen,
+		         r->rig_recenter_expected ? " returned to rig_initial" : " (no recenter to assert)");
+	}
+}
+
+
 /*!
  * ADR-034 / #823 — input-provider checks. ABSENCE NEVER FAILS: with no
  * provider registered, the ForceQwerty override set, or the provider's
@@ -1045,6 +1236,11 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->head_ok = true;
 	snprintf(r->head_str, sizeof(r->head_str), "%s", head->str);
 
+	// ADR-034 Amendment 4 / #1380 -- the rig (navigation) role. Needs the
+	// head, because the head's pose IS the composed rig; skipped entirely
+	// (and silently) when no provider supplied a navigation device.
+	probe_rig_role(r, h, head);
+
 	// Rendering-mode snapshot incl. per-mode tracking flags (#441).
 	r->rendering_mode_count = head->rendering_mode_count;
 	if (r->rendering_mode_count > XRT_MAX_RENDERING_MODES) {
@@ -1247,6 +1443,14 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	      (!r->input_ht_expected_left || r->input_ht_left_ok) &&
 	      (!r->input_ht_expected_right || r->input_ht_right_ok))) {
 		r->result_code = CLI_SELFTEST_BAD_INPUT;
+	}
+
+	// ADR-034 Amendment 4 / #1380 -- the rig role. Same absence-never-fails
+	// rule: no navigation device leaves rig_evaluated false and passes,
+	// because the qwerty fly camera holding the rig is the normal state.
+	if (r->result_code == CLI_SELFTEST_PASS && r->rig_evaluated &&
+	    !(r->rig_role_ok && r->rig_moves_ok && r->rig_recenter_ok)) {
+		r->result_code = CLI_SELFTEST_BAD_RIG;
 	}
 
 	// #1212 — a better-ranked plug-in was present and rejected, so the
@@ -1514,6 +1718,19 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 	}
 
+	P(" :: Rig (navigation) role (ADR-034 Amendment 4)\n");
+	if (r->rig_evaluated) {
+		PT("device:       %s\n", r->rig_nav_str);
+		PT("role:         %s\n", r->rig_role_ok ? "held (xrt_system_roles::rig)" : "NOT HELD");
+		PT("head travel:  %.4f m%s\n", (double)r->rig_travel_m, r->rig_moves_ok ? "" : "  (STALLED)");
+		PT("recenters:    %u%s\n", r->rig_recenter_seen,
+		   !r->rig_recenter_expected ? "  (none to assert)"
+		   : r->rig_recenter_ok      ? "  (returned to rig_initial)"
+		                             : "  (NO RETURN)");
+	} else {
+		PT("%s\n", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
+	}
+
 	P(" :: Local zone caps (#224/ADR-027, headless D3D11 WARP probe)\n");
 	if (r->zone_caps_probed) {
 		const struct xrt_dp_local_zone_caps *z = &r->zone_caps;
@@ -1733,6 +1950,23 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(ip, "ht_left_ok", r->input_ht_left_ok);
 			cJSON_AddBoolToObject(ip, "ht_expected_right", r->input_ht_expected_right);
 			cJSON_AddBoolToObject(ip, "ht_right_ok", r->input_ht_right_ok);
+		}
+	}
+
+	// ADR-034 Amendment 4 / #1380 rig (navigation) role.
+	{
+		cJSON *rg = cJSON_AddObjectToObject(root, "rig_role");
+		cJSON_AddBoolToObject(rg, "evaluated", r->rig_evaluated);
+		cJSON_AddStringToObject(rg, "note", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
+		if (r->rig_evaluated) {
+			cJSON_AddStringToObject(rg, "device", r->rig_nav_str);
+			cJSON_AddBoolToObject(rg, "role_ok", r->rig_role_ok);
+			cJSON_AddBoolToObject(rg, "moves_ok", r->rig_moves_ok);
+			cJSON_AddNumberToObject(rg, "head_travel_m", (double)r->rig_travel_m);
+			cJSON_AddNumberToObject(rg, "recenters", (double)r->rig_recenter_seen);
+			cJSON_AddBoolToObject(rg, "recenter_expected", r->rig_recenter_expected);
+			cJSON_AddBoolToObject(rg, "recenter_ok", r->rig_recenter_ok);
+			cJSON_AddNumberToObject(rg, "repeat_max", (double)r->rig_repeat_max);
 		}
 	}
 
@@ -2037,6 +2271,15 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	                                (!r->input_ht_expected_right || r->input_ht_right_ok));
 	snprintf(c->detail, sizeof(c->detail), "%s", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 
+	// ADR-034 Amendment 4 / #1380 -- the rig (navigation) role. ABSENCE
+	// NEVER FAILS: with no navigation device in the system the row is "not
+	// evaluated" and ok, because the runtime's own fly camera holding the
+	// rig is the normal configuration, not a fault.
+	c = &out[n++];
+	c->name = "rig_role";
+	c->ok = !r->rig_evaluated || (r->rig_role_ok && r->rig_moves_ok && r->rig_recenter_ok);
+	snprintf(c->detail, sizeof(c->detail), "%s", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
+
 	return n;
 }
 
@@ -2045,7 +2288,7 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 {
 	P(" :: DisplayXR CLI self-test (headless, no compositor)\n");
 
-	struct check checks[16];
+	struct check checks[20];
 	int n = build_checks(r, checks);
 	for (int i = 0; i < n; i++) {
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
@@ -2063,7 +2306,7 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
 
-	struct check checks[16];
+	struct check checks[20];
 	int n = build_checks(r, checks);
 	cJSON *arr = cJSON_AddArrayToObject(root, "checks");
 	for (int i = 0; i < n; i++) {

@@ -324,7 +324,7 @@ static enum xrt_output_name sim_input_outputs_array[] = {
  */
 
 struct xrt_device *
-sim_input_create_controller(enum xrt_device_type type)
+sim_input_create_controller(enum xrt_device_type type, bool rig_local)
 {
 	bool is_left = false;
 	switch (type) {
@@ -358,8 +358,15 @@ sim_input_create_controller(enum xrt_device_type type)
 	// u_builder_setup_tracking_origins injects per-hand "arm model"
 	// offsets (±0.2, 1.3, −0.5) into NONE-typed origins, silently
 	// shifting every reported pose. Same rule as qwerty.
-	sd->base.tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
-	snprintf(sd->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", "Sim Input Tracker");
+	//
+	// #1380: a provider that ALSO navigates publishes its controllers
+	// DISPLAY-PLANE-relative instead (RIG_LOCAL), and the builder anchors
+	// that origin at the initial rig — so `world = rig(t) o L` and the
+	// hands follow the scripted navigation exactly as a real provider's
+	// would. With the nav knob off nothing here changes.
+	sd->base.tracking_origin->type = rig_local ? XRT_TRACKING_TYPE_RIG_LOCAL : XRT_TRACKING_TYPE_OTHER;
+	snprintf(sd->base.tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s",
+	         rig_local ? "Sim Input Rig-Local Volume" : "Sim Input Tracker");
 
 	snprintf(sd->base.str, sizeof(sd->base.str), "Simulated %s Motion Controller", is_left ? "Left" : "Right");
 	snprintf(sd->base.serial, sizeof(sd->base.serial), "SIM-INPUT-%s", is_left ? "L" : "R");
@@ -380,10 +387,19 @@ sim_input_create_controller(enum xrt_device_type type)
 	// (T_stage_local), and test apps put their cube at the local origin
 	// — so stage-space y ≈ 1.65 maps to just above the cube. Chest-height
 	// VR placement (y 1.3) would render below the visible frustum.
+	//
+	// RIG_LOCAL (#1380) is a DIFFERENT frame — origin at the display
+	// centre, +Z toward the viewer — so the same "just in front of the
+	// panel, at hand height" placement is a different triple: a third of a
+	// metre out of the screen, a hand's width either side, slightly below
+	// centre.
 	sd->center = (struct xrt_pose){
 	    .orientation = {0.0f, 0.0f, 0.0f, 1.0f},
 	    .position = {is_left ? -0.10f : 0.10f, 1.65f, -0.05f},
 	};
+	if (rig_local) {
+		sd->center.position = (struct xrt_vec3){is_left ? -0.20f : 0.20f, -0.15f, 0.35f};
+	}
 	// Half a revolution apart, so the hands interleave visibly (and the
 	// button scripts alternate).
 	sd->phase_rad = is_left ? M_PI : 0.0;
