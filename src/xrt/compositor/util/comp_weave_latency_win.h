@@ -895,9 +895,14 @@ struct late_weave_governor
 		 * as good"), with the fill unchanged. Under the partition the pipeline that
 		 * reaches the panel is the weave loop, which is at display rate; extra
 		 * queue depth there buys no throughput and costs only motion-to-photon.
-		 * Hold the initialised depth (base, normally 1) for the app's life. The
-		 * divisor is env-set before the first mark, so no unwind path is needed;
-		 * an explicit DXR_LATE_WEAVE_MAX_LATENCY still wins (base != 1 above).
+		 * Hold the initialised depth (base, normally 1) for the app's life.
+		 * #1442: `paced` is the partition's OUTCOME (engaged vs refused), not
+		 * the env var. There is still no unwind path: every tier that has a
+		 * governor gates the partition create-once (split_active / reroute /
+		 * split set at compositor create), so the outcome cannot flip mid-life
+		 * on those tiers; if a dynamically-gated tier ever grows a governor,
+		 * an ENGAGED->REFUSED flip would leave `effective` wherever it stood.
+		 * An explicit DXR_LATE_WEAVE_MAX_LATENCY still wins (base != 1 above).
 		 *
 		 * SCOPE: this bites IN-PROCESS only. u_app_partition_divisor() is a
 		 * process-local getenv, and the partition is not wired into the IPC path

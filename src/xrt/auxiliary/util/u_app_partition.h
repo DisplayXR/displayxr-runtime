@@ -183,13 +183,17 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 			return;
 		}
 	}
+	// Past the tier gate: the app IS paced from here on. Asserted on every
+	// pass, not once at anchor — a tier whose gate is dynamic (the vk_native
+	// vblank grid can go stale and recover) would otherwise latch REFUSED
+	// after one refused call while the grid was in fact pacing the app again.
+	u_app_partition_set_state(U_APP_PARTITION_ENGAGED);
 	const uint64_t stride_ns = (uint64_t)d * period_ns;
 	uint64_t now_ns = os_monotonic_get_ns();
 
 	if (p->next_release_ns == 0) {
 		// First frame passes immediately; the grid anchors here.
 		p->next_release_ns = now_ns + stride_ns;
-		u_app_partition_set_state(U_APP_PARTITION_ENGAGED);
 		if (!p->logged) {
 			p->logged = 1;
 			U_LOG_W("#1257 partition: xrWaitFrame throttles the app to every %uth vblank "
