@@ -407,6 +407,34 @@ The shell drives the runtime through the OpenXR workspace extensions, so cube-in
 
 Document your implementation internals in your plug-in repo's `docs/`, then add a row to the table in the runtime repo's `docs/vendors/README.md` via PR — vendor name, link to your repo + docs, supported APIs. The runtime maintainers will review + merge as a docs-only change. (Example: [displayxr-leia-plugin/docs/](https://github.com/DisplayXR/displayxr-leia-plugin/blob/main/docs/README.md).)
 
+## 8. Input providers — the other plug-in type
+
+Everything above is the **display** side. If what you ship is a *tracking* system — controllers, hands, a camera-fused pose — you implement a different contract: [`xrt_input_plugin_iface`](../reference/xrt_input_plugin_iface.md), entry point `xrtInputPluginNegotiate`, discovery root `HKLM\Software\DisplayXR\InputProviders` (POSIX: `NNN-<name>-input-provider.json` manifests). Same ProbeOrder convention, same ABI discipline, same installer shape — a different vtable, versioned and shipped independently, because a tracking vendor is not a display vendor ([ADR-034](../adr/ADR-034-input-provider-plugins.md)). Full contract: the [input-provider discovery spec](../specs/runtime/input-provider-discovery.md).
+
+### Adding navigation
+
+A provider may also drive the **rig** — the virtual camera the user flies around with, which the runtime's own WASD / mouse-look fly camera drives otherwise. This is a role you win by presence, exactly like the hands; it is not a hook you bind and not a session you open. Design: [ADR-034 *Amendment 4*](../adr/ADR-034-input-provider-plugins.md#amendment-4--navigation-is-a-role-composed-by-the-runtime-2026-09-11). Normative rules: discovery spec [§4b](../specs/runtime/input-provider-discovery.md).
+
+The whole checklist:
+
+1. **One extra device.** In `create_devices`, return one more `xrt_device` with `device_type = XRT_DEVICE_TYPE_NAVIGATION`, alongside your controllers. Never more than one — the runtime keeps the first and warns about the rest. A navigation-only provider (no controllers) is legal.
+2. **One required input: `XRT_INPUT_GENERIC_NAVIGATION_POSE`.** `get_tracked_pose` on it returns **N(t): the absolute pose of the rig in your own navigation frame F** — right-handed, +Y up, −Z forward, metres, gravity-aligned. F's origin is private to you and is never interpreted; the runtime aligns to it once, at an epoch, and holds the result. Not a delta, not a viewer/eye pose, never parallaxed. Serve the requested timestamp from your latched publication.
+3. **Validity is your authority switch.** Set `POSITION_VALID | ORIENTATION_VALID` while you have navigation authority; clear them to mean *hold the rig* (optical loss, a rest state, nothing held). The `*_TRACKED` bits are ignored here. Do **not** express the same condition through `get_presence` — presence is transport ("am I attached?"), and flipping it hands the rig to the fly camera and back, which the user sees as a jump.
+4. **Optional reset: `XRT_INPUT_GENERIC_NAVIGATION_RECENTER`.** A *durable level with a timestamp*: `value.boolean = true`, `timestamp` = the time of your most recent reset, **never cleared**. Publish the new timestamp and the post-reset N in the same atomic publication. A pulse does not work — `xrSyncActions` sweeps `update_inputs` over every device and would eat it.
+5. **Publish your controllers rig-local.** Set their `tracking_origin->type = XRT_TRACKING_TYPE_RIG_LOCAL` — poses relative to the display plane (origin at the display centre, +X right, +Y up, +Z toward the viewer, metres). The runtime anchors that origin at the initial rig, so you need no standing height, no mount offset and no knowledge of where the rig is. If your solver already emits product poses `C_W` in its own navigated world, publish `L = inv(P(t)) ∘ C_W` with `N(t) = P(t)` and the runtime's single alignment maps your whole world.
+6. **Never pre-compensate.** Do not compose your navigation (or its inverse) into the controller poses you publish. The runtime applies its own rig delta to every provider device, so a pre-compensated pose subtracts a transform the runtime is about to add. It fails as slow drift, not as an error. This is the single most expensive mistake on this contract.
+7. **Geometry, if your solver needs it.** `host->get_display_geometry(&geo)` gives panel width/height and the **nominal** viewer position. The host pointer you get at `xrtInputPluginNegotiate` is process-lifetime storage and may be retained; the *data* is only ready from your `create_devices` call onward, and an earlier call returns `XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY` and leaves your struct untouched. These are nominal numbers for sizing a working volume — never a head pose, never the tracked eyes.
+8. **Keep all gesture policy on your side.** Thresholds, momentum, rest detection, arm-stretch mapping, which button starts a drag: yours. The runtime owns only alignment, continuity across handovers, recenter and composition — and will not grow an opinion about any of the former.
+
+**Testing it, before and without your hardware:**
+
+- Build the runtime from source and register the in-tree `sim_input` provider (`scripts\register_dev_plugin.bat input sim`, elevated). It carries a scripted navigation device behind `DXR_SIM_INPUT` — see the discovery spec §5 — so you can watch the role walk, a handover and a recenter happen with nothing plugged in, and compare your provider's behaviour against a known-good one at a different ProbeOrder.
+- Register your provider at a **lower** ProbeOrder than `sim_input` (vendors use 50; in-tree fallbacks are 200) and confirm you win the rig while present and that it falls back — first to `sim_input`, then to the fly camera — as each goes absent.
+- `displayxr-cli selftest` runs the real loader and arbitration path with no GPU, window or app: use it to check your DLL loads, ABI-passes, probes, and that the roles land where you expect. Provider *absence* never fails the check — only a provider that could not be dispatched does.
+- `displayxr-cli input list [--json]` enumerates registered providers and the ForceQwerty state without loading any DLL; `displayxr-cli input haptic-test` re-resolves roles every iteration and prints each `generation_id` change, so it doubles as a live view of arbitration flipping.
+- Run the same checks a second time with `XRT_FORCE_MODE=ipc` and a running `displayxr-service.exe`. Roles, the rig and the composer all live service-side there, and the durable-recenter rule exists precisely because that path polls differently.
+- `HKLM\Software\DisplayXR\Input\ForceQwerty = 1` skips input providers entirely — the fastest way to prove a symptom is yours.
+
 ## Related
 
 - [Plug-in iface reference](../reference/xrt_plugin_iface.md) — per-method contract for `xrt_plugin_iface`
@@ -415,4 +443,5 @@ Document your implementation internals in your plug-in repo's `docs/`, then add 
 - [`XR_DXR_display_info` spec](../specs/extensions/XR_DXR_display_info.md) — display info + eye-tracking mode contract
 - [Eye tracking modes spec](../specs/vendor/eye-tracking-modes.md) — MANAGED vs MANUAL contract
 - [ADR-027](../adr/ADR-027-display-zones.md) + [`XR_DXR_display_zones`](../specs/extensions/XR_DXR_display_zones.md) — the zones contract a region-scoped hardware weaver implements
+- [Input-provider iface reference](../reference/xrt_input_plugin_iface.md) + [discovery spec](../specs/runtime/input-provider-discovery.md) — the other plug-in type: controllers, hand tracking, and the rig (navigation) role (§8)
 - [Legacy in-tree integration model](../archive/vendor-integration-historical.md) — historical reference for the pre-#263 in-tree integration shape

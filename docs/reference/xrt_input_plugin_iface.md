@@ -1,6 +1,7 @@
 # `xrt_input_plugin_iface` — Input-Provider Plug-in Interface
 
-**Status: implemented** (Phase 1, #823) — the header is
+**Status: implemented** (Phase 1, #823; rig/navigation role, persistent host
+iface and display geometry, #1380 / ADR-034 *Amendment 4*) — the header is
 `src/xrt/include/xrt/xrt_input_plugin.h`; the runtime-side consumer is
 `src/xrt/targets/common/target_input_plugin_loader.c`. Design rationale:
 `docs/adr/ADR-034-input-provider-plugins.md`. Discovery and lifecycle:
@@ -107,10 +108,99 @@ it, and the nominal viewer position, never the tracked eyes. Use them for
 solver geometry (how big the working volume is, where the plane sits),
 never as a head pose.
 
+## The navigation device — driving the rig (#1380)
+
+A provider that navigates — a controller drag, a fused camera pose, anything
+that moves the user's viewpoint — creates **one extra device** next to its
+controllers:
+
+```c
+xdev->device_type = XRT_DEVICE_TYPE_NAVIGATION;
+xdev->inputs[0].name = XRT_INPUT_GENERIC_NAVIGATION_POSE;      /* required */
+xdev->inputs[1].name = XRT_INPUT_GENERIC_NAVIGATION_RECENTER;  /* optional */
+```
+
+The runtime then arbitrates the **rig role** exactly as it arbitrates the
+hands: `xrt_system_roles::rig` points at the navigation device of the
+highest-priority present candidate that has one, or is **-1**, which means the
+runtime's own fly camera (WASD / mouse-look) holds the rig. Design: ADR-034
+*Amendment 4*. Normative contract: discovery spec §4b.
+
+**One navigation device per provider.** The arbiter takes the first one in the
+array `create_devices` returned and warns about the rest.
+
+### `XRT_INPUT_GENERIC_NAVIGATION_POSE`
+
+`get_tracked_pose(NAVIGATION_POSE, at_timestamp_ns)` returns **N(t): the
+absolute pose of the rig in your own navigation frame F.**
+
+- F is right-handed, +Y up, −Z forward, metres, gravity-aligned. **Its origin
+  is yours** — the runtime never interprets it, and identity simply means "the
+  rig sits at F's origin". You do not need to agree with the runtime about
+  where anything is; the runtime aligns once, at an epoch, and holds the
+  result.
+- Absolute, **not a delta**. Not a viewer or eye pose. Un-parallaxed: eye
+  tracking lands later at view-pose level and must never enter N.
+- Timestamp-correct, like every other pose: serve the requested time out of
+  your latched publication, do not return "latest sample".
+- **`relation_flags` are your authority switch.** Set
+  `POSITION_VALID | ORIENTATION_VALID` while you have navigation authority;
+  clear them to say *hold the rig* (optical loss, a rest state, no controller
+  held). The `*_TRACKED` bits are ignored for this input.
+
+Validity is **not** presence. `get_presence` stays hardware/transport only:
+a plugged-in provider with nothing to say keeps the role and clears validity.
+Flipping presence instead bounces the rig to the fly camera and back, which
+the user sees.
+
+Serve navigation, grip/aim and joints for one requested timestamp from **one
+latched publication** — the runtime guarantees nothing across separate
+`get_tracked_pose` calls, and a head poll plus an action sync in the same frame
+must see a coherent set.
+
+### `XRT_INPUT_GENERIC_NAVIGATION_RECENTER`
+
+A **durable level with a publication timestamp**, not a pulse:
+
+```c
+in->active = true;
+in->value.boolean = true;                 /* never cleared */
+in->timestamp = time_of_the_last_reset;   /* monotonic ns */
+```
+
+The composer consumes a reset when `timestamp > last_consumed`, and then
+returns the rig to `rig_initial` ("home", the rig at system build) and
+re-aligns there. Publish the new timestamp **and** the post-reset N in the same
+atomic publication.
+
+This shape is required, not stylistic: `xrSyncActions` sweeps `update_inputs`
+over every device, and so do the IPC server's device passes, so a one-update
+pulse can be consumed by action sync before the composer ever polls — the reset
+would be silently lost, intermittently, and preferentially over IPC. Two resets
+between polls collapse to one; a recenter is idempotent.
+
+Nothing else is signalled through this input.
+
+### What the runtime does with it
+
+One runtime-owned device, the **rig composer** (`target_rig_composer.c`),
+becomes the head's pose source. At an epoch `h` it computes
+`T_world_F = rig(h) ∘ inv(N(h))` and thereafter answers the head pose with
+`rig(t) = T_world_F ∘ N(t)`. Epochs are exactly three: the role holder
+changes, N goes invalid → valid, or a newer recenter timestamp arrives. While N
+is invalid the rig holds. The first composed pose after any non-recenter epoch
+equals the last pose returned, exactly — continuity is an identity, not a
+smoothing filter.
+
+Two consequences you can rely on: a **non-identity N at alignment is absorbed**
+(so your frame's yaw/offset never leaks into the world), and a **provider-local
+step moves the rig along its own forward** — `N → N ∘ T(0,0,-1)` walks the rig
+one metre the way your frame points.
+
 ## Display-plane-relative devices: `XRT_TRACKING_TYPE_RIG_LOCAL`
 
-A provider that also drives the rig (ADR-034 Amendment 4) publishes its
-controllers and hand joints **relative to the display plane** — origin at
+A provider that also drives the rig (ADR-034 Amendment 4) **must** publish
+its controllers and hand joints **relative to the display plane** — origin at
 the display centre, +X right, +Y up, +Z toward the viewer, metres — by
 setting its devices' `tracking_origin->type` to
 `XRT_TRACKING_TYPE_RIG_LOCAL`.
@@ -139,8 +229,9 @@ Anchoring is logged once per origin at init
 
 Devices returned by `create_devices` are ordinary `xrt_device`s. Each
 self-describes via `device_type`
-(`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY}_HAND_CONTROLLER`; other types ride
-along without claiming a hand role) and the interaction profile it binds
+(`XRT_DEVICE_TYPE_{LEFT,RIGHT,ANY}_HAND_CONTROLLER` claim a hand role;
+`XRT_DEVICE_TYPE_NAVIGATION` claims the rig role; other types ride
+along without claiming anything) and the interaction profile it binds
 (`name` + optional `binding_profiles`, from `bindings.json`). The
 provider must implement:
 
@@ -207,13 +298,44 @@ while its hardware is present, qwerty owns them otherwise, and the roles
 move between them mid-session on plug/unplug (the `generation_id` bump
 makes the OpenXR state tracker rebind at the next `xrSyncActions`).
 
+The **rig role** rides the same walk (#1380): `xrt_system_roles.rig` is the
+index of the navigation device of the highest-priority present candidate
+that has one, and **-1** means the runtime's own fly camera holds the rig.
+A provider may win the rig while losing the hands, or the other way round —
+the walks are independent, and a provider that supplies *only* a navigation
+device is still a candidate. Hand-role churn bumps the same
+`generation_id` without disturbing the rig.
+
 `HKLM\Software\DisplayXR\Input\ForceQwerty` (POSIX: a `force_qwerty` file
 next to the manifests) skips providers entirely. Details: discovery spec
-§4.
+§4 (hands) and §4b (rig).
 
 ## What providers must NOT do
 
 - Supply a head device (the display processor / builder owns the head).
+  Driving the *rig* is a role you can win (see above); the head pose itself
+  is composed by the runtime and bound through the display plug-in's
+  `set_pose_source` hook, which is not yours.
+- **Compose navigation, a camera transform, or any rig pre-compensation
+  into the poses you publish.** The runtime applies its own rig delta to
+  every provider device, so a pre-compensated pose is subtracting a
+  transform the runtime is about to add — it looks right only while both
+  sides agree about a number neither owns, and it fails as drift, not as an
+  error. This is ADR-034 *Amendment 2*, and driving the rig
+  (*Amendment 4*) is exactly what makes breaking it tempting.
+- Report a delta, a viewer/eye pose, or a parallaxed pose as
+  `XRT_INPUT_GENERIC_NAVIGATION_POSE`.
+- Use pose validity as a presence signal, or `get_presence` as a validity
+  signal. Presence is transport ("am I attached?"); validity is authority
+  ("do I have something to say?"). Clearing validity holds the rig;
+  reporting `ABSENT` gives it away and takes it back.
+- Signal anything except a deliberate reset through
+  `XRT_INPUT_GENERIC_NAVIGATION_RECENTER`, or clear it after publishing —
+  it is a durable level, and clearing it makes the reset a pulse that
+  `xrSyncActions` can eat.
+- Publish more than one `XRT_DEVICE_TYPE_NAVIGATION` device.
+- Dereference any `reserved[]` slot of the host iface, or any host-iface
+  field at or past its `struct_size`.
 - Claim workspace-controller registration (unrelated subsystem).
 - Depend on runtime-internal symbols beyond the public `xrt_*` headers and
   the aux helpers exported to plug-ins — same boundary discipline as

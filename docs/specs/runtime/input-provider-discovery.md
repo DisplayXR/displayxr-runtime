@@ -8,8 +8,12 @@ runtime), and runtime engineers maintaining the discovery path.
 `xrt/xrt_input_plugin.h`, `target_input_plugin_loader.c`, the builder
 arbitration, `sim_input`, and the CLI/self-test diagnostics). §5 —
 `net_input` and its wire protocol — has since **shipped**
-(`src/xrt/drivers/net_input/`, `DisplayXR-NetInput`). Still planned: the
-`PreferredPlugin` override (§3, noted inline). The authoritative
+(`src/xrt/drivers/net_input/`, `DisplayXR-NetInput`). §4b — the rig
+(navigation) role, the rig composer, rig-local anchoring and the
+persistent host iface — is **implemented** (#1380, ADR-034 *Amendment 4*).
+Still planned: the `PreferredPlugin` override (§3, noted inline), and the
+per-client recenter lease under a workspace controller (§4b, ADR-035 D2).
+The authoritative
 rationale is `docs/adr/ADR-034-input-provider-plugins.md`. This spec
 intentionally mirrors the display-processor contract
 (`docs/specs/runtime/plugin-discovery.md`); where a rule is not restated
@@ -35,8 +39,11 @@ An input provider is a dynamically-loaded module that creates one or more
 
 - **Left / right motion controllers** (first-class in v1): 6DOF pose,
   buttons/axes per a claimed interaction profile, haptic output.
-- Future (same ABI, no vtable change): generic trackers, hand-tracking
-  sources filling the hand-tracking device roles.
+- **One navigation device** (`XRT_DEVICE_TYPE_NAVIGATION`, #1380) if the
+  provider drives the virtual rig — the camera the qwerty fly camera drives
+  otherwise. See §4b.
+- Hand-tracking sources filling the hand-tracking device roles; future
+  generic trackers (same ABI, no vtable change).
 
 Providers own their tracking stack entirely — camera access, IMU fusion,
 radio/USB transport, threads. The runtime sees only `xrt_device` calls:
@@ -128,7 +135,9 @@ builder falls back to qwerty.
 In `target_builder_sim_display.c`:
 
 Arbitration is **presence-gated, dynamic and ranked** (ADR-034
-*Amendments 1 + 3*). The devices are static — every claiming provider's
+*Amendments 1 + 3*). Three role families run through the same walk: the
+two hand roles below, the dynamic hand-tracking slots (§4.5), and the rig
+(navigation) role (§4b). The devices are static — every claiming provider's
 pair plus qwerty's is created once and all live in `xsysd->xdevs` — but
 which pair holds each hand role is re-resolved for the life of the
 process: per hand, the highest-priority candidate that supplies that hand
@@ -172,9 +181,14 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    anything else = on). Forces the fallback, registry/config-gated by
    convention (not an env var). Providers are then not loaded at all,
    so behavior is bit-identical to a box with none registered.
-4. The head-pose path is untouched: the DP's `set_pose_source` hook keeps
-   receiving the same pose source as today; input providers never supply
-   the head.
+4. **Input providers never supply the head**, and the DP's
+   `set_pose_source` hook is still the single binding point. What that
+   hook receives is now the runtime's own **rig composer** rather than the
+   qwerty HMD directly (#1380): while the rig role sits on the qwerty
+   floor the composer is a pass-through and the head pose is unchanged;
+   when a provider's `NAVIGATION` device holds the role the composer owns
+   alignment, continuity, recenter and composition. See §4b. The display
+   plug-in contract and `sim_display` are untouched by this.
 5. **Hand-tracking roles (#825 Tier 2):** the same pass fills
    `static_roles.hand_tracking.{unobstructed,conforming}.{left,right}` from
    provider devices that set `supported.hand_tracking` and carry the
@@ -202,37 +216,6 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    machine configuration. Set it process-level — the runtime DLL has its
    own static-CRT environment block.)
 
-## 4b. Rig (navigation) role
-
-A provider may also drive the **rig** — the virtual camera the qwerty fly
-camera drives today — by creating ONE extra device of type
-`XRT_DEVICE_TYPE_NAVIGATION` alongside its controllers. The role is arbitrated
-by the same presence-ranked walk as the hands (`target_input_arbiter.c`), under
-the same `generation_id` and over the same IPC `get_roles` forwarding:
-
-> `xrt_system_roles::rig` is the `xsysd->xdevs` index of the navigation device
-> of the **highest-priority (lowest ProbeOrder) candidate that has one and
-> reports `PRESENT`**. Otherwise **-1**.
-
-Two things differ from the hand walk:
-
-- **At most one navigation device per provider.** A provider that creates more
-  than one is buggy; the arbiter warns and keeps the first.
-- **The floor is an absence, not a candidate.** Qwerty supplies no navigation
-  device, so `rig == -1` is not "no rig" — it means *the runtime's own fly
-  camera holds it* (WASD / mouse-look). That is what every box without a
-  navigating provider reports, and what an unplug falls back to.
-
-Presence semantics are the hands' exactly: a NULL `get_presence` (or a
-`struct_size` predating the slot) means "assume present", `UNKNOWN` means not
-present. Pose validity is *not* presence — a provider that is plugged in but has
-nothing to say clears the pose's validity flags and keeps the role.
-
-What the runtime then *does* with the role — alignment against the provider's
-own navigation frame, the re-alignment epochs, recenter, and the rig composer
-that feeds the head pose — is not decided here: see **ADR-034 Amendment 4
-(pending)** and issue #1380.
-
 ## 4a. Pose anchoring — provider volumes are rig-relative
 
 A provider reports poses **in its own tracking volume** and says nothing about
@@ -245,7 +228,7 @@ optional**:
 
 | Motion | Do provider poses follow? |
 |---|---|
-| Voluntary rig motion — WASD, mouse-look (translation **and** rotation) | **Yes** |
+| Voluntary rig motion — WASD, mouse-look, a navigating provider (§4b) (translation **and** rotation) | **Yes** |
 | Eye-tracked head parallax — viewer leaning/tilting about the panel | **No** |
 
 Mechanically, `t_builder_add_input_provider_devices()` lists every device it
@@ -261,13 +244,250 @@ Provider-facing consequences:
 
 - **Do not compose a camera or navigation transform in the provider.** It will
   be applied twice. Report the sensor's honest reading plus your mount offset.
+  This holds *especially* for a provider that also drives the rig (§4b): the
+  rig role is what makes pre-compensating look attractive, and the runtime is
+  about to add exactly the transform you would be subtracting.
 - Your mount offset stays in **stage** space (e.g. a desk-mounted Leap at
-  y≈1.45). Do not express it relative to the head.
+  y≈1.45). Do not express it relative to the head. A provider that navigates
+  can skip the mount offset entirely by publishing `XRT_TRACKING_TYPE_RIG_LOCAL`
+  origins instead — see §4b.
 - Devices that already follow the camera themselves are excluded — qwerty's
   controllers parent to the qwerty HMD (`follow_hmd`) and are never marked.
 - Applies uniformly to grip/aim action spaces, `xrLocateSpace`, and the
   hand-joint base (`xrt_space_overseer::locate_device`), in-process and over
   IPC. Covered by `tests/tests_space_overseer_rig.cpp`.
+
+## 4b. Rig (navigation) role
+
+**Normative.** Implemented in `target_input_arbiter.c` (the role),
+`target_rig_composer.c` (the composition), `u_builders.c` (rig-local
+anchoring) and `target_input_plugin_loader.c` (the host iface). Rationale:
+ADR-034 *Amendment 4*; issue #1380.
+
+A provider may also drive the **rig** — the virtual camera the qwerty fly
+camera drives today — by creating ONE extra device of type
+`XRT_DEVICE_TYPE_NAVIGATION` alongside its controllers.
+
+### 4b.1 The walk, and the floor
+
+The role is arbitrated by the same presence-ranked walk as the hands, under the
+same `generation_id` and over the same IPC `get_roles` forwarding:
+
+> `xrt_system_roles::rig` is the `xsysd->xdevs` index of the navigation device
+> of the **highest-priority (lowest ProbeOrder) candidate that has one and
+> reports `PRESENT`**. Otherwise **-1**.
+
+Two things differ from the hand walk:
+
+- **At most one navigation device per provider.** The arbiter scans the
+  devices a provider returned from `create_devices` in order and takes the
+  first `XRT_DEVICE_TYPE_NAVIGATION` one. A second is a provider bug: the
+  arbiter logs `input arbiter: '<id>' supplied more than one navigation
+  device — keeping '<name>'` and ignores the rest. (Picking a different one
+  per build would be worse than picking the first.)
+- **The floor is an absence, not a candidate.** Qwerty supplies no navigation
+  device, so `rig == -1` is not "no rig" — it means *the runtime's own fly
+  camera holds it* (WASD / mouse-look). That is what every box without a
+  navigating provider reports, and what an unplug falls back to.
+
+A provider may supply a navigation device and **no** controllers; it is still a
+candidate and can still win the rig. Conversely a provider with controllers and
+no navigation device is skipped by this walk entirely and can never hold the
+rig, whatever its ProbeOrder (`tests/tests_input_arbiter_rig.cpp`).
+
+The arbiter normally declines to install itself when there is nothing to
+arbitrate (fewer than two candidates). A navigation device is the exception:
+the builder has no static seed for `roles.rig`, so a **lone** navigating
+provider still forces the arbiter in. Without that, `roles.rig` would stay at
+its `XRT_SYSTEM_ROLES_INIT` default of -1 and the provider would never be
+reached.
+
+### 4b.2 Presence is not validity
+
+Presence semantics are the hands' exactly: a NULL `get_presence` (or a
+`struct_size` predating the slot) means "assume present", `UNKNOWN` means not
+present, and verdicts are cached ~250 ms.
+
+Pose validity is a **different axis**, and conflating the two is the mistake
+this section exists to prevent:
+
+| | Answers | Owned by | Effect |
+|---|---|---|---|
+| **Presence** (`get_presence`) | "is my hardware/transport attached?" | the provider's transport thread | decides **who holds the role** |
+| **Validity** (`relation_flags` on `NAVIGATION_POSE`) | "do I have navigation authority right now?" | the provider's solver | decides **whether the rig advances** |
+
+A provider that is plugged in but has nothing to say (optical loss, a rest
+state, no controller being held) clears the pose's `POSITION_VALID` /
+`ORIENTATION_VALID` bits and **keeps** the role; the rig holds its last pose
+and resumes from there. Flipping presence for the same condition hands the rig
+to the fly camera and takes it back a frame later, which is visible as a jump
+and is a provider bug.
+
+### 4b.3 What the provider publishes
+
+`get_tracked_pose(XRT_INPUT_GENERIC_NAVIGATION_POSE, t)` returns **N(t): the
+absolute pose of the rig in the provider's own navigation frame F.**
+
+- F is right-handed, +Y up, −Z forward, metres, gravity-aligned. Its **origin
+  is private to the provider** and is never interpreted by the runtime —
+  identity means "rig at F's origin", nothing more.
+- N is **not** a delta, **not** a viewer or eye pose, and **un-parallaxed**.
+  Eye tracking is applied later, at view-pose level, and must never enter N.
+- `relation_flags`: set `POSITION_VALID | ORIENTATION_VALID` when the provider
+  has navigation authority; clear them to say "hold the rig". The `*_TRACKED`
+  bits are **ignored** for this input.
+- The runtime guarantees nothing across separate `get_tracked_pose` calls. A
+  provider serves navigation, grip/aim and joints for a requested timestamp
+  from **one latched publication**, so that a head poll and an action sync in
+  the same frame see a coherent set.
+
+`XRT_INPUT_GENERIC_NAVIGATION_RECENTER` (boolean, optional) is a **durable
+level with a publication timestamp**, not a pulse:
+
+- `value.boolean = true`, `timestamp` = the monotonic time of the most recent
+  reset. **Never cleared.** The composer consumes a recenter when
+  `timestamp > last_consumed`.
+- Publish the new timestamp **and** the post-reset N in the *same* publication
+  (one atomic swap of the latched frame). No generation gating and no
+  invalid-until-delivered hold are needed.
+- Nothing else is signalled through this input. Two resets between polls
+  collapse to one — a recenter is idempotent, and alignment uses the N
+  delivered with the latest one.
+
+The level-with-timestamp shape is **required, not stylistic**: `xrSyncActions`
+sweeps `update_inputs` over every device (`oxr_input.c`), and so do the IPC
+server's own device passes. A one-update pulse can therefore be consumed by
+action sync before the composer ever polls the device, and the recenter would
+be lost — intermittently, and preferentially on the IPC path. A durable level
+is immune to how many `update_inputs` calls land in between.
+
+### 4b.4 A navigating provider's other devices are rig-local
+
+A provider that drives the rig **must** publish its controllers and hand joints
+with `tracking_origin->type = XRT_TRACKING_TYPE_RIG_LOCAL`: poses relative to
+the **display plane** — origin at the display centre, +X right, +Y up, +Z
+toward the viewer, metres.
+
+The builder (`u_builders.c::anchor_rig_local_origins`) sets such an origin's
+`initial_offset` to `rig_initial`, the rig pose at system build, so the
+*Amendment 2* rig delta collapses:
+
+```
+world = rig(t) ∘ inv(rig_initial) ∘ rig_initial ∘ L = rig(t) ∘ L
+```
+
+Consequences for the provider: **no standing height, no mount offset, no rig
+knowledge.** Several devices may share one origin (a left/right pair normally
+does) — it is anchored once, and logged once at init as `Rig-local origin
+'<name>' anchored at the initial rig (x, y, z)`.
+
+`XRT_TRACKING_TYPE_OTHER` / `_NONE` origins are untouched and keep today's
+stage-anchored behaviour, mount offsets included, so no existing provider
+changes. Anchoring happens after the head's own tracking origin is settled and
+before the space overseer freezes each origin offset into a space; a head with
+no valid pose anchors at identity.
+
+**The recipe for a solver that already outputs world poses.** If your tracking
+stack produces product poses `C_W` in its own world `W` that *already* contains
+your navigation `P(t)` — which is the normal shape for a camera-drag solver —
+do not try to undo it. Publish
+
+```
+N(t) = P(t)                 as NAVIGATION_POSE
+L    = inv(P(t)) ∘ C_W      as the controller/joint pose, RIG_LOCAL
+```
+
+Then `world = rig(t) ∘ L = T_world_F ∘ P(t) ∘ inv(P(t)) ∘ C_W = T_world_F ∘ C_W`:
+the runtime's single alignment maps your entire product world, with no
+provider-side reference frame `P0` and no runtime rig knowledge on your side.
+
+### 4b.5 What the runtime does with the role — the composer
+
+The runtime binds a runtime-owned `xrt_device`, the **rig composer**
+(`target_rig_composer.c`), as the head's pose source through the display
+plug-in's existing `set_pose_source` hook. Its `XRT_INPUT_GENERIC_HEAD_POSE`
+**is** `rig(t)`. The composer is not in `xsysd->xdevs`, holds no role, and is
+created and destroyed by the sim-display builder.
+
+Per poll of the head pose, in this order:
+
+1. **Roles.** Read `xrt_system_devices_get_roles`. A change of the **holder
+   index** — not every `generation_id` bump — is a handover. `rig_last` is
+   left untouched: the rig continues from where it *is*, never from the new
+   holder's frame. Taking the role drops the alignment (it is recomputed
+   below, on the first valid N) and clears any pending recenter; handing back
+   to the floor re-seeds the fly camera at `rig_last` so WASD continues from
+   there. One WARN per handover, never per frame.
+2. **Floor.** With `rig == -1` the composer returns the fly camera's relation
+   verbatim and records it as `rig_last`. **WASD / mouse-look act only here** —
+   while a provider holds the role the fly camera is not read at all.
+3. **Provider.** `update_inputs` on the navigation device, then the durable
+   RECENTER read, then `get_tracked_pose(NAVIGATION_POSE, at_timestamp_ns)`.
+   `valid` = both VALID bits; TRACKED bits ignored.
+4. **Epochs.** Recenter wins when two are due in one poll:
+   - *pending recenter with timestamp r*: on the first sample that is valid
+     **and** whose requested time is `>= r`, set
+     `T_world_F = rig_initial ∘ inv(N)`, return `rig_initial` exactly, clear
+     the pending flag. Otherwise hold `rig_last` and stay pending.
+   - *not aligned* (fresh handover, or validity was lost): on the first valid
+     N, `T_world_F = rig_last ∘ inv(N)`, then compose. Otherwise hold.
+   - *aligned but N invalid*: drop the alignment (so the next valid sample
+     re-aligns at the held rig) and hold.
+   - *aligned and valid*: compose.
+5. **Compose.** `rig(t) = T_world_F ∘ N(t)`, with `T_world_F` on the **left**,
+   so a provider-local step `N → N ∘ T(0,0,-1)` moves the rig along its own
+   forward. Emitted with `POSITION|ORIENTATION_VALID|TRACKED` and zero
+   velocity.
+
+**Continuity invariant.** At a handover, at an invalid → valid transition and
+at any non-recenter re-alignment the first composed pose equals `rig_last`
+exactly, because `(rig_last ∘ inv(N)) ∘ N = rig_last`. The single deliberate
+jump is a recenter, which lands on `rig_initial`.
+
+**No history.** Alignment state is piecewise-constant: a head query for a
+timestamp *before* a recenter, issued after that recenter aligned, composes
+with the current alignment. This is documented, not history-corrected.
+
+Covered by `tests/tests_rig_composer.cpp` (alignment with non-identity N,
+invalid-hold, the four recenter cases, handback re-seeding, hand-role churn,
+concurrent polls) and `tests/tests_input_arbiter_rig.cpp` (the walk).
+
+### 4b.6 Host iface and display geometry
+
+`xrtInputPluginNegotiate` receives a `struct xrt_input_plugin_host_iface *`
+that is **process-lifetime runtime storage** — one static, shared by every
+provider in the process. A provider may retain it, and the callbacks inside it,
+for as long as it lives. (It was a stack local before #1380; a provider that
+kept the pointer read dead stack.)
+
+`host->get_display_geometry(&geo)` fills `struct
+xrt_input_host_display_geometry` — panel width/height in metres and the
+**nominal** viewer position (display-centre origin, +Z toward the viewer). It
+is geometry for a solver, never a head pose and never the tracked eyes.
+
+Pointer lifetime and data readiness are separate, and so are their failures:
+
+| Situation | Result | Out struct |
+|---|---|---|
+| Slot is NULL | — | older runtime; no geometry exists to ask for |
+| `inout == NULL`, or `struct_size` too small to hold even `struct_size` | `XRT_ERROR_INPUT_UNSUPPORTED` | untouched |
+| Called before the cache is published (e.g. from negotiate) | `XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY` | **untouched** — retry later |
+| Cache published | `XRT_SUCCESS` | filled, prefix semantics |
+
+The cache is populated by the system builder from the display plug-in's
+`get_display_info`, **after** the head device exists and **before** any
+provider's `create_devices` runs. So the data is ready from `create_devices` on
+and static for the life of the system. Set `struct_size = sizeof(...)` before
+the call; the runtime copies `min(your struct_size, its own)` bytes and leaves
+your `struct_size` as you set it. Publication is logged once
+(`input plugin loader: display geometry published to providers: …`), so a bug
+report shows whether providers ever got geometry at all.
+
+### 4b.7 Testing without hardware
+
+`sim_input` carries a scripted navigation device so the role walk, the
+handover and the recenter path are exercised in CI with no hardware — see §5
+for the device and the `DXR_SIM_INPUT*` environment gates that drive it.
 
 ## 5. In-tree reference providers
 
