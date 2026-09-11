@@ -104,6 +104,14 @@ struct weave_latency_log
 	uint32_t hz_resolved = 0;
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
+	int64_t hz_err_sum_ns = 0;    // signed, to see a systematic bias
+	uint64_t hz_sync_lag_sum = 0; // sum of (SyncRefreshCount - PresentRefreshCount)
+	//! Histogram of round(err / period), k in [-2, +4] (clamped): the MODE is
+	//! the pipeline's constant offset (a composed chain adds a whole DWM
+	//! frame the forward horizon does not model); a WRONG SLOT is a sample
+	//! that lands in any other bucket. Measured against zero, a constant
+	//! +1 period read as 100% wrong — which is not what "wrong" means.
+	uint32_t hz_k_hist[7] = {0, 0, 0, 0, 0, 0, 0};
 
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
@@ -295,7 +303,7 @@ struct weave_latency_log
 	 * DXR_DP_FORWARD_HORIZON_TRACE row; no-op when the trace is off.
 	 */
 	void
-	note_horizon_outcome(int64_t err_ns, uint64_t period_ns)
+	note_horizon_outcome(int64_t err_ns, uint64_t period_ns, uint32_t sync_lag_refreshes)
 	{
 		if (hz_trace != HZ_ON || period_ns == 0) {
 			return;
@@ -303,9 +311,18 @@ struct weave_latency_log
 		const uint64_t a = (uint64_t)(err_ns < 0 ? -err_ns : err_ns);
 		hz_resolved++;
 		hz_abs_err_sum_ns += a;
-		if (a >= period_ns / 2) {
-			hz_wrong_slot++;
+		hz_err_sum_ns += err_ns;
+		hz_sync_lag_sum += sync_lag_refreshes;
+		// Nearest whole period, clamped into the histogram.
+		const double kf = (double)err_ns / (double)period_ns;
+		int k = (int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5);
+		if (k < -2) {
+			k = -2;
 		}
+		if (k > 4) {
+			k = 4;
+		}
+		hz_k_hist[k + 2]++;
 	}
 
 	/*!
@@ -352,15 +369,27 @@ struct weave_latency_log
 			return;
 		}
 		const double secs = (double)(now_ns - hz_win_start_ns) / 1e9;
+		// Mode of the offset histogram = the pipeline's constant; everything
+		// else is a wrong slot call.
+		int mode_i = 0;
+		for (int i = 1; i < 7; i++) {
+			if (hz_k_hist[i] > hz_k_hist[mode_i]) {
+				mode_i = i;
+			}
+		}
+		hz_wrong_slot = hz_resolved - hz_k_hist[mode_i];
 		U_LOG_W(
 		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-		    "| resolved %u  wrong-slot %u (%.1f%%)  mean |err| %.2f ms",
+		    "| resolved %u  pipeline %+d periods  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
+		    "bias %+.2f ms  sync-flip lag %.2f refr",
 		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
-		    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_wrong_slot,
+		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, hz_wrong_slot,
 		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
-		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0);
+		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
+		    hz_resolved ? (double)hz_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
+		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0);
 
 		hz_win_start_ns = now_ns;
 		hz_min_ns = 0;
@@ -371,6 +400,11 @@ struct weave_latency_log
 		hz_resolved = 0;
 		hz_wrong_slot = 0;
 		hz_abs_err_sum_ns = 0;
+		hz_err_sum_ns = 0;
+		hz_sync_lag_sum = 0;
+		for (int i = 0; i < 7; i++) {
+			hz_k_hist[i] = 0;
+		}
 	}
 
 	/*!
@@ -1018,19 +1052,29 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 			 * Exact PresentCount only: a skipped-ahead SyncQPCTime belongs
 			 * to a later present and would read as a whole-period miss that
 			 * never happened. Trace-gated so the default path pays nothing.
+			 *
+			 * SyncQPCTime is the time of the LATEST vsync at sampling
+			 * (SyncRefreshCount), NOT the vblank this present flipped on
+			 * (PresentRefreshCount). Sampled after Present returns, the
+			 * two are typically one refresh apart, so the raw difference
+			 * over-reads the realised horizon by whole periods — the first
+			 * live run showed 100% "wrong slot" at exactly +1 period.
+			 * Walk SyncQPCTime back by the refresh-count gap to the flip.
 			 */
-			if (hz_trace == HZ_ON && refresh_period_qpc != 0) {
+			if (hz_trace == HZ_ON && refresh_period_qpc != 0 &&
+			    stats.SyncRefreshCount >= stats.PresentRefreshCount) {
+				const uint32_t lag = stats.SyncRefreshCount - stats.PresentRefreshCount;
+				const uint64_t flip_qpc =
+				    (uint64_t)stats.SyncQPCTime.QuadPart - (uint64_t)lag * refresh_period_qpc;
 				for (int i = 0; i < ring_count; i++) {
 					int idx = (ring_head - 1 - i + 16) % 8;
 					if (ring[idx].horizon_ns != 0 && ring[idx].present_count == stats.PresentCount &&
-					    (uint64_t)stats.SyncQPCTime.QuadPart > ring[idx].horizon_base_qpc) {
+					    flip_qpc > ring[idx].horizon_base_qpc) {
 						const double k = 1000000000.0 / (double)freq();
 						const int64_t realised_ns =
-						    (int64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
-						                       ring[idx].horizon_base_qpc) *
-						              k);
+						    (int64_t)((double)(flip_qpc - ring[idx].horizon_base_qpc) * k);
 						note_horizon_outcome(realised_ns - (int64_t)ring[idx].horizon_ns,
-						                     (uint64_t)((double)refresh_period_qpc * k));
+						                     (uint64_t)((double)refresh_period_qpc * k), lag);
 						ring[idx].horizon_ns = 0; // consumed
 						break;
 					}
