@@ -48,6 +48,7 @@ add_library(
 	oxr_pretty_print.c
 	oxr_pretty_print.h
 	oxr_session.c
+	oxr_session_window_binding.h
 	oxr_session_frame_end.c
 	oxr_space.c
 	oxr_swapchain.c

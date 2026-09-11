@@ -697,6 +697,7 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	assert(qright && "Cannot create a qwerty system when Right controller is NULL");
 
 	struct qwerty_system *qs = U_TYPED_CALLOC(struct qwerty_system);
+	os_mutex_init(&qs->view_lock);
 	qs->hmd = qhmd;
 	qs->lctrl = qleft;
 	qs->rctrl = qright;
@@ -786,6 +787,7 @@ qwerty_system_destroy(struct qwerty_system *qs)
 		return;
 	}
 	u_var_remove_root(qs);
+	os_mutex_destroy(&qs->view_lock);
 	free(qs);
 }
 
@@ -1140,12 +1142,22 @@ qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, i
 	}
 }
 
+bool
+qwerty_is_camera_mode(struct qwerty_system *qs)
+{
+	os_mutex_lock(&qs->view_lock);
+	bool camera_mode = qs->camera_mode;
+	os_mutex_unlock(&qs->view_lock);
+	return camera_mode;
+}
+
 void
 qwerty_toggle_camera_mode(struct qwerty_system *qs)
 {
 	if (qs->hmd == NULL) {
 		return;
 	}
+	os_mutex_lock(&qs->view_lock);
 
 	struct xrt_pose *pose = &qs->hmd->base.pose;
 
@@ -1224,11 +1236,13 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 
 	U_LOG_W("Qwerty: view mode -> %s (disturbance-free, no transition)",
 	        qs->camera_mode ? "Camera" : "Display");
+	os_mutex_unlock(&qs->view_lock);
 }
 
 void
 qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 {
+	os_mutex_lock(&qs->view_lock);
 	if (qs->camera_mode) {
 		// The display rig clamps IPD/parallax to [0,1], but the camera rig's comfort
 		// is defined on its DISPLAY-centric equivalent, not on the camera factor
@@ -1251,12 +1265,15 @@ qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 		qs->disp_parallax_factor = v;
 		U_LOG_I("Qwerty: Display IPD/Parallax = %.3f", v);
 	}
+	os_mutex_unlock(&qs->view_lock);
 }
 
 void
 qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 {
+	os_mutex_lock(&qs->view_lock);
 	if (!qs->camera_mode) {
+		os_mutex_unlock(&qs->view_lock);
 		return; // No-op in display mode
 	}
 	// Comfort clamp via the SHARED gate (one comfort definition across runtime +
@@ -1274,40 +1291,90 @@ qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 	}
 	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, conv_max);
 	U_LOG_I("Qwerty: Convergence = %.2f diopters (max %.2f = comfort limit)", qs->cam_convergence, conv_max);
+	os_mutex_unlock(&qs->view_lock);
 }
 
 void
 qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier)
 {
+	os_mutex_lock(&qs->view_lock);
 	if (qs->camera_mode) {
+		os_mutex_unlock(&qs->view_lock);
 		return; // No-op in camera mode
 	}
 	qs->disp_vHeight = clampf(qs->disp_vHeight * multiplier, 0.1f, 10.0f);
 	U_LOG_I("Qwerty: vHeight = %.2f m", qs->disp_vHeight);
+	os_mutex_unlock(&qs->view_lock);
 }
 
-void
-qwerty_reset_view_state(struct qwerty_system *qs)
+static void
+set_camera_tuning(struct qwerty_system *qs, const struct u_camera_profile *profile)
+{
+	qs->cam_spread_factor = profile->ipd_factor;
+	qs->cam_parallax_factor = profile->parallax_factor;
+	qs->cam_convergence = profile->inv_convergence_distance;
+	qs->cam_half_tan_vfov = profile->half_tan_vfov;
+	qs->cam_m2v = profile->m2v;
+}
+
+//! Caller holds view_lock. Does not change the voluntary rig pose.
+static void
+reset_view_tuning(struct qwerty_system *qs)
 {
 	qs->camera_mode = true;
-
-	qs->cam_spread_factor = 1.0f;
-	qs->cam_parallax_factor = 1.0f;
-	qs->cam_convergence = 0.5f;
-	qs->cam_half_tan_vfov = 0.3249f;
-	qs->cam_m2v = 1.0f;
+	const struct u_camera_profile defaults = U_CAMERA_PROFILE_DEFAULT;
+	set_camera_tuning(qs, qs->camera_profile_active ? &qs->camera_profile : &defaults);
 
 	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f;
 	qs->disp_perspective = 1.0f;
+}
 
+void
+qwerty_reset_view_state(struct qwerty_system *qs)
+{
+	os_mutex_lock(&qs->view_lock);
+	reset_view_tuning(qs);
 	if (qs->hmd != NULL) {
 		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
 		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
 
-	U_LOG_W("Qwerty: view state reset to camera defaults");
+	U_LOG_W("Qwerty: view state reset to %s",
+	        qs->camera_profile_active ? "camera profile" : "camera defaults");
+	os_mutex_unlock(&qs->view_lock);
+}
+
+static struct qwerty_system *
+find_qwerty_system(struct xrt_device **xdevs, size_t count)
+{
+	if (xdevs == NULL)
+		return NULL;
+	for (size_t i = 0; i < count; i++) {
+		if (xdevs[i] != NULL && xdevs[i]->destroy == qwerty_destroy)
+			return qwerty_device(xdevs[i])->sys;
+	}
+	return NULL;
+}
+
+bool
+qwerty_set_camera_profile(struct xrt_device **xdevs,
+                          size_t count,
+                          const struct u_camera_profile *profile)
+{
+	struct qwerty_system *qs = find_qwerty_system(xdevs, count);
+	if (qs == NULL || profile == NULL)
+		return false;
+	os_mutex_lock(&qs->view_lock);
+	bool available = qs->camera_mode && !qs->camera_profile_active;
+	if (available) {
+		qs->camera_profile_active = true;
+		qs->camera_profile = *profile;
+		set_camera_tuning(qs, profile);
+	}
+	os_mutex_unlock(&qs->view_lock);
+	return available;
 }
 
 bool
@@ -1338,6 +1405,7 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	// Emit the single ACTIVE rig (unified shape). Shared ipd/parallax come from
 	// the active mode's spread/parallax; the type-specific fields are carried so
 	// the consumer can pick the relevant subset by camera_mode.
+	os_mutex_lock(&qs->view_lock);
 	out->camera_mode = qs->camera_mode;
 	out->ipd_factor = qs->camera_mode ? qs->cam_spread_factor : qs->disp_spread_factor;
 	out->parallax_factor = qs->camera_mode ? qs->cam_parallax_factor : qs->disp_parallax_factor;
@@ -1349,6 +1417,7 @@ qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 
 	out->nominal_viewer_z = qs->nominal_viewer_z;
 	out->screen_height_m = qs->screen_height_m;
+	os_mutex_unlock(&qs->view_lock);
 	return true;
 }
 

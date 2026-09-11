@@ -2271,6 +2271,8 @@ struct oxr_instance
 	//! race a concurrent unlink+free (heap corruption). Held across the
 	//! per-session poll, which is non-blocking on this path.
 	struct os_mutex sessions_mutex;
+	//! One lazy camera-profile lookup per instance; guarded by sessions_mutex.
+	bool camera_profile_checked;
 
 	struct
 	{

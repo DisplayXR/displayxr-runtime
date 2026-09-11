@@ -21,6 +21,7 @@ extern "C" {
 
 
 struct xrt_pose;
+struct u_camera_profile;
 
 /*!
  * Snapshot of the qwerty controller's SINGLE active view rig (unified shape,
@@ -212,6 +213,12 @@ bool
 qwerty_get_view_state(struct xrt_device **xdevs,
                         size_t xdev_count,
                         struct qwerty_view_state *out);
+
+//! Seed an eligible instance's shared camera tuning without changing navigation.
+//! The seed lasts for the qwerty system's lifetime; Space resets to it. Returns
+//! false if no qwerty system exists, display mode is active, or it is already seeded.
+bool
+qwerty_set_camera_profile(struct xrt_device **xdevs, size_t xdev_count, const struct u_camera_profile *profile);
 
 
 /*!

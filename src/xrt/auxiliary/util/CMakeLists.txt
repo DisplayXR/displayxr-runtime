@@ -17,6 +17,8 @@ configure_file(
 
 add_library(
 	aux_util STATIC
+	u_camera_profile.c
+	u_camera_profile.h
 	u_autoexpgain.c
 	u_autoexpgain.h
 	u_bg_neutrality.c
