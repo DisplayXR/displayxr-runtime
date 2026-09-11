@@ -43,6 +43,13 @@ set(tests
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile)
 endif()
+
+# #1380 -- the input-provider host iface's display-geometry cache. Needs the
+# loader itself (target_lists), so it is only registered where that target
+# exists; everything it drives is the exact function pointer providers get.
+if(TARGET target_lists)
+	list(APPEND tests tests_input_host_geometry)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate
@@ -117,6 +124,10 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_space_overseer_rig PRIVATE aux_math)
+
+if(TARGET tests_input_host_geometry)
+	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
+endif()
 
 if(TARGET tests_oxr_view_space)
 	target_include_directories(

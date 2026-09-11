@@ -47,8 +47,93 @@ Exported symbol: `xrtInputPluginNegotiate` (see the discovery spec §2 for
 the signature). The loader rejects any provider whose reported ABI major
 differs from `XRT_INPUT_PLUGIN_API_VERSION_CURRENT` before touching the
 vtable (ADR-020 rule 3). A `xrt_input_plugin_host_iface` (struct_size +
-`host_api_version` + reserved slots) is passed to negotiate for future
-host-supplied callbacks.
+`host_api_version` + `get_display_geometry` + reserved slots) is passed to
+negotiate — see below.
+
+## The host iface (#1380)
+
+```c
+struct xrt_input_host_display_geometry {
+    uint32_t struct_size;       /* caller sets to sizeof before the call */
+    float display_width_m;
+    float display_height_m;
+    float nominal_viewer_x_m;   /* display-centre origin, +Z toward viewer */
+    float nominal_viewer_y_m;
+    float nominal_viewer_z_m;   /* never the tracked eyes */
+};
+
+struct xrt_input_plugin_host_iface {
+    uint32_t struct_size;
+    uint32_t host_api_version;
+    xrt_result_t (*get_display_geometry)(struct xrt_input_host_display_geometry *inout);
+    void *reserved[13];
+};
+```
+
+**Lifetime of the pointer, readiness of the data — two different things,
+and the reason there is a distinct result code.**
+
+- The `struct xrt_input_plugin_host_iface *` handed to
+  `xrtInputPluginNegotiate` is **process-lifetime runtime storage** (one
+  static, filled once —
+  `target_input_plugin_loader.c::input_host_iface()`). A provider may
+  retain it, and the `get_display_geometry` pointer inside it, for as long
+  as it lives. It was a stack local before #1380; a provider that kept it
+  read dead stack.
+- The **geometry** is a runtime-owned cache populated from the display
+  plug-in's `get_display_info`, in the system builder, *after* the DP head
+  exists and *before* any provider's `create_devices` runs
+  (`target_builder_sim_display.c`). So: **ready from `create_devices` on,
+  static for the life of the system, NOT ready during negotiate.**
+
+Contract of the call:
+
+| Situation | Returns | The out struct |
+|---|---|---|
+| Slot is `NULL` | — | older runtime; there is no geometry to ask for |
+| `inout == NULL`, or `struct_size` too small to even hold `struct_size` | `XRT_ERROR_INPUT_UNSUPPORTED` | untouched |
+| Called before the cache is published (e.g. from negotiate) | `XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY` | **untouched** — retry later |
+| Cache published | `XRT_SUCCESS` | filled, prefix semantics |
+
+*Prefix semantics* is the display-info convention: set `struct_size =
+sizeof(...)` **before** the call; the runtime copies
+`min(struct_size, sizeof(runtime's struct))` bytes and leaves your
+`struct_size` as you set it. A provider built against an older, shorter
+header therefore gets the leading fields it knows and nothing is written
+past its own allocation.
+
+The numbers are **nominal** — the panel as the display processor reports
+it, and the nominal viewer position, never the tracked eyes. Use them for
+solver geometry (how big the working volume is, where the plane sits),
+never as a head pose.
+
+## Display-plane-relative devices: `XRT_TRACKING_TYPE_RIG_LOCAL`
+
+A provider that also drives the rig (ADR-034 Amendment 4) publishes its
+controllers and hand joints **relative to the display plane** — origin at
+the display centre, +X right, +Y up, +Z toward the viewer, metres — by
+setting its devices' `tracking_origin->type` to
+`XRT_TRACKING_TYPE_RIG_LOCAL`.
+
+- **What the provider publishes:** `L`, the honest volume pose. No
+  standing height, no mount offset, no rig pre-compensation (Amendment 2
+  forbids the last one outright). A solver whose product poses `C_W` are
+  already in its own navigated world `W` publishes `L = inv(P(t)) ∘ C_W`
+  alongside `N(t) = P(t)`.
+- **What the runtime anchors:** at system build the builder sets that
+  origin's `initial_offset` to `rig_initial` — the rig pose at build,
+  the same one `u_space_overseer::rig_source` arms from
+  (`u_builders.c::anchor_rig_local_origins`, which runs after the
+  tracking origins are settled and before the overseer freezes each
+  offset into a space). Combined with the existing rig delta this
+  collapses to `world = rig(t) ∘ inv(rig_initial) ∘ rig_initial ∘ L =
+  rig(t) ∘ L`. Several devices sharing one origin are anchored once.
+- **What is left alone:** `XRT_TRACKING_TYPE_OTHER` / `_NONE` origins keep
+  today's stage-anchored behaviour, mount offsets included. Existing
+  providers need no change.
+
+Anchoring is logged once per origin at init
+(`Rig-local origin '…' anchored at the initial rig (…)`), never per frame.
 
 ## Device obligations
 

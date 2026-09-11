@@ -33,6 +33,8 @@
 
 #include "util/u_logging.h"
 
+#include "os/os_threading.h"
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -114,6 +116,153 @@ input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input
 	slot->iface = iface;
 	slot->inst = inst;
 	slot->probe_order = order;
+}
+
+
+
+/*
+ *
+ * Host iface + display-geometry cache (#1380).
+ *
+ */
+
+/*!
+ * THE host iface, one per process, filled once and never moved.
+ *
+ * A provider is explicitly allowed to retain the `struct
+ * xrt_input_plugin_host_iface *` it is handed at
+ * `xrtInputPluginNegotiate` for the life of the process, so the storage
+ * must outlive the negotiate call. It used to be a stack local in each
+ * platform's `input_try_load_one` — a provider that kept the pointer
+ * (PortalVR does) was reading dead stack the moment negotiate returned.
+ *
+ * Every provider in the process sees the SAME iface; nothing in it is
+ * per-provider, which is why sharing one is correct rather than merely
+ * convenient.
+ */
+static struct xrt_input_plugin_host_iface g_input_host;
+static bool g_input_host_filled = false;
+
+/*!
+ * The runtime-owned geometry cache behind
+ * @ref xrt_input_plugin_host_iface::get_display_geometry.
+ *
+ * Written exactly once, by the system builder, from the display plug-in's
+ * display info — after the DP head exists and BEFORE any provider's
+ * `create_devices` runs. Read afterwards, potentially from a provider's
+ * own thread, hence the mutex: the write is a one-shot publish, not a
+ * live feed.
+ */
+static struct xrt_input_host_display_geometry g_input_geometry;
+static bool g_input_geometry_ready = false;
+static struct os_mutex g_input_geometry_mutex;
+static bool g_input_geometry_mutex_ready = false;
+
+/*!
+ * Bring the geometry mutex up. Called from the two entry points that both
+ * run long before any provider thread exists — the loader's negotiate path
+ * and the builder's publish — so the guard itself never races.
+ */
+static void
+input_geometry_lock_init_once(void)
+{
+	if (!g_input_geometry_mutex_ready) {
+		g_input_geometry_mutex_ready = os_mutex_init(&g_input_geometry_mutex) == 0;
+	}
+}
+
+static xrt_result_t
+input_host_get_display_geometry(struct xrt_input_host_display_geometry *inout)
+{
+	// A caller that cannot even hold the leading `struct_size` has
+	// nothing we could fill in, prefix rules or not. `xrt_result` has no
+	// generic invalid-argument code; INPUT_UNSUPPORTED is the closest
+	// existing one in this domain and is deliberately NOT the code a
+	// too-early call gets, which is the distinction that matters here.
+	if (inout == NULL || inout->struct_size < sizeof(uint32_t)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+
+	if (g_input_geometry_mutex_ready) {
+		os_mutex_lock(&g_input_geometry_mutex);
+	}
+	const bool ready = g_input_geometry_ready;
+	struct xrt_input_host_display_geometry snapshot = g_input_geometry;
+	if (g_input_geometry_mutex_ready) {
+		os_mutex_unlock(&g_input_geometry_mutex);
+	}
+
+	if (!ready) {
+		// Contract: leave the caller's struct untouched so a retry
+		// later is the whole of the recovery.
+		return XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY;
+	}
+
+	// Prefix semantics, the display-info convention: a provider built
+	// against an older (shorter) header gets the fields it knows and
+	// keeps its own `struct_size`.
+	size_t copy = inout->struct_size;
+	if (copy > sizeof(snapshot)) {
+		copy = sizeof(snapshot);
+	}
+	const uint32_t caller_size = inout->struct_size;
+	memcpy(inout, &snapshot, copy);
+	inout->struct_size = caller_size;
+
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Fill @ref g_input_host once and hand it out. Called from each
+ * platform's `input_try_load_one` immediately before `negotiate`.
+ */
+static struct xrt_input_plugin_host_iface *
+input_host_iface(void)
+{
+	if (!g_input_host_filled) {
+		input_geometry_lock_init_once();
+		memset(&g_input_host, 0, sizeof(g_input_host));
+		g_input_host.struct_size = (uint32_t)sizeof(struct xrt_input_plugin_host_iface);
+		g_input_host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
+		g_input_host.get_display_geometry = input_host_get_display_geometry;
+		g_input_host_filled = true;
+	}
+	return &g_input_host;
+}
+
+void
+target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geometry *geometry)
+{
+	if (geometry == NULL) {
+		return;
+	}
+
+	input_geometry_lock_init_once();
+
+	if (g_input_geometry_mutex_ready) {
+		os_mutex_lock(&g_input_geometry_mutex);
+	}
+	g_input_geometry = *geometry;
+	g_input_geometry.struct_size = (uint32_t)sizeof(struct xrt_input_host_display_geometry);
+	g_input_geometry_ready = true;
+	if (g_input_geometry_mutex_ready) {
+		os_mutex_unlock(&g_input_geometry_mutex);
+	}
+
+	// One-off init fact, once per process: a bug report needs to show
+	// whether providers ever got geometry at all.
+	U_LOG_W(
+	    "input plugin loader: display geometry published to providers: %.4f x %.4f m, nominal viewer "
+	    "(%.4f, %.4f, %.4f) m.",
+	    (double)g_input_geometry.display_width_m, (double)g_input_geometry.display_height_m,
+	    (double)g_input_geometry.nominal_viewer_x_m, (double)g_input_geometry.nominal_viewer_y_m,
+	    (double)g_input_geometry.nominal_viewer_z_m);
+}
+
+const struct xrt_input_plugin_host_iface *
+target_input_plugin_get_host_iface(void)
+{
+	return input_host_iface();
 }
 
 
@@ -310,13 +459,13 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 		return NULL;
 	}
 
-	struct xrt_input_plugin_host_iface host = {0};
-	host.struct_size = (uint32_t)sizeof(struct xrt_input_plugin_host_iface);
-	host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
+	// Process-lifetime host storage: providers may retain this pointer
+	// (#1380). Never a stack local.
+	struct xrt_input_plugin_host_iface *host = input_host_iface();
 
 	struct xrt_input_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
-	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, host, &iface, &plugin_version);
 	if (xret != XRT_SUCCESS || iface == NULL) {
 		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
 		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
@@ -703,13 +852,13 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 		return NULL;
 	}
 
-	struct xrt_input_plugin_host_iface host = {0};
-	host.struct_size = (uint32_t)sizeof(struct xrt_input_plugin_host_iface);
-	host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
+	// Process-lifetime host storage: providers may retain this pointer
+	// (#1380). Never a stack local.
+	struct xrt_input_plugin_host_iface *host = input_host_iface();
 
 	struct xrt_input_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
-	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, host, &iface, &plugin_version);
 	if (xret != XRT_SUCCESS || iface == NULL) {
 		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
 		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,

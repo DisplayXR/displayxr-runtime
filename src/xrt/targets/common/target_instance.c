@@ -488,8 +488,9 @@ out:
 		// "already filled in" guards and skip themselves.
 		bool plugin_filled_display_info = false;
 		const struct xrt_plugin_iface *plugin = target_plugin_get_active();
-		if (plugin != NULL && plugin->struct_size >
-		                          offsetof(struct xrt_plugin_iface, get_display_info) &&
+		if (plugin != NULL &&
+		    plugin->struct_size >=
+		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) &&
 		    plugin->get_display_info != NULL) {
 			struct xrt_plugin_display_info pdi = {0};
 			pdi.struct_size = (uint32_t)sizeof(pdi);

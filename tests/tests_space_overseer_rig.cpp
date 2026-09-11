@@ -20,6 +20,7 @@
 
 #include "math/m_api.h"
 
+#include "util/u_builders.h"
 #include "util/u_space_overseer.h"
 
 #include "catch_amalgamated.hpp"
@@ -310,5 +311,152 @@ TEST_CASE("u_space_overseer rig composition")
 		math_pose_transform(&fwd, &inv.pose, &round_trip);
 		check_vec3(round_trip.position, 0.f, 0.f, 0.f);
 		CHECK(std::fabs(round_trip.orientation.w) == Catch::Approx(1.0).margin(0.0001));
+	}
+}
+
+
+/*
+ * #1380 — display-plane-relative (RIG_LOCAL) provider origins.
+ *
+ * A provider that navigates publishes its controllers relative to the display
+ * plane and knows nothing about standing height or mount. The BUILDER anchors
+ * that origin at the initial rig, so the pose an app reads is
+ * `world = rig(t) o L` with no provider-side reference frame. Everything below
+ * goes through `u_builder_create_space_overseer_legacy` — the anchoring lives
+ * inside it, between the tracking-origin setup and the moment the overseer
+ * freezes each origin offset into a space.
+ */
+namespace {
+
+//! The builder's own sequence: create the overseer, then arm rig composition.
+struct builder_fixture
+{
+	fake_device head{};
+	fake_device dev{};
+	struct xrt_space_overseer *xso = nullptr;
+
+	builder_fixture(enum xrt_tracking_type dev_origin_type, const struct xrt_pose &dev_pose)
+	{
+		fake_device_init(&head, "Fake Head", pose_at(0.f, 1.6f, 0.f));
+		fake_device_init(&dev, "Fake Provider Hand", dev_pose);
+
+		// TYPE_OTHER on the head keeps u_builder_setup_tracking_origins
+		// from bolting its own 1.6 m on top of the pose.
+		head.origin.type = XRT_TRACKING_TYPE_OTHER;
+		dev.origin.type = dev_origin_type;
+
+		struct xrt_device *xdevs[] = {&head.base, &dev.base};
+
+		u_builder_create_space_overseer_legacy(nullptr, &head.base, nullptr, nullptr, nullptr, xdevs, 2, false,
+		                                       false, &xso);
+		REQUIRE(xso != nullptr);
+
+		auto *uso = (struct u_space_overseer *)xso;
+		u_space_overseer_set_rig_source(uso, &head.base, XRT_INPUT_GENERIC_HEAD_POSE);
+		u_space_overseer_set_device_rig_relative(uso, &dev.base);
+	}
+
+	~builder_fixture()
+	{
+		xrt_space_reference(&dev_space, NULL);
+		xrt_space_overseer_destroy(&xso);
+	}
+
+	//! The provider device's grip pose in stage space.
+	struct xrt_pose
+	locate_dev()
+	{
+		if (dev_space == nullptr) {
+			xrt_space_overseer_create_pose_space(xso, &dev.base, XRT_INPUT_SIMPLE_GRIP_POSE, &dev_space);
+			REQUIRE(dev_space != nullptr);
+		}
+
+		struct xrt_pose ident = XRT_POSE_IDENTITY;
+		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+		xrt_space_overseer_locate_space(xso, xso->semantic.stage, &ident, 1, dev_space, &ident, &rel);
+		REQUIRE((rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+		return rel.pose;
+	}
+
+	struct xrt_space *dev_space = nullptr;
+};
+
+} // namespace
+
+
+TEST_CASE("u_builders anchors RIG_LOCAL origins at the initial rig")
+{
+	// Display-plane-relative: 10 cm right of the display centre, 5 cm up,
+	// 30 cm toward the viewer. No standing height anywhere in it.
+	const struct xrt_pose L = pose_at(0.10f, 0.05f, 0.30f);
+
+	SECTION("a RIG_LOCAL device starts at rig_initial o L")
+	{
+		builder_fixture f{XRT_TRACKING_TYPE_RIG_LOCAL, L};
+
+		// rig_initial is the head at (0, 1.6, 0), so the provider's
+		// display-plane pose lands at panel height without the
+		// provider knowing the number.
+		check_vec3(f.locate_dev().position, 0.10f, 1.65f, 0.30f);
+	}
+
+	SECTION("and then follows the rig: world = rig(t) o L")
+	{
+		builder_fixture f{XRT_TRACKING_TYPE_RIG_LOCAL, L};
+		(void)f.locate_dev();
+
+		f.head.pose = pose_at(0.5f, 1.6f, -3.f); // WASD.
+		check_vec3(f.locate_dev().position, 0.60f, 1.65f, -2.70f);
+
+		// Yaw 90 deg about +Y at the new rig position: (x, z) of L
+		// maps (0.10, 0.30) -> (0.30, -0.10) around the rig.
+		f.head.pose = pose_yaw(pose_at(0.f, 1.6f, -2.f), kHalfPi);
+		check_vec3(f.locate_dev().position, 0.30f, 1.65f, -2.10f);
+
+		// Home again: the device comes home with it.
+		f.head.pose = pose_at(0.f, 1.6f, 0.f);
+		check_vec3(f.locate_dev().position, 0.10f, 1.65f, 0.30f);
+	}
+
+	SECTION("a TYPE_OTHER device is untouched — today's stage-anchored behaviour")
+	{
+		builder_fixture f{XRT_TRACKING_TYPE_OTHER, L};
+
+		// No anchoring: the origin offset stays identity, so the pose
+		// is read straight out of the volume.
+		check_vec3(f.locate_dev().position, 0.10f, 0.05f, 0.30f);
+
+		// It still rides the rig delta, exactly as before #1380.
+		f.head.pose = pose_at(0.5f, 1.6f, -3.f);
+		check_vec3(f.locate_dev().position, 0.60f, 0.05f, -2.70f);
+	}
+
+	SECTION("devices sharing one RIG_LOCAL origin are anchored once, not twice")
+	{
+		fake_device head{};
+		fake_device left{};
+		fake_device right{};
+
+		fake_device_init(&head, "Fake Head", pose_at(0.f, 1.6f, 0.f));
+		fake_device_init(&left, "Fake Left", pose_at(-0.1f, 0.f, 0.2f));
+		fake_device_init(&right, "Fake Right", pose_at(0.1f, 0.f, 0.2f));
+
+		head.origin.type = XRT_TRACKING_TYPE_OTHER;
+
+		// One shared origin, as a provider's controller pair has.
+		left.origin.type = XRT_TRACKING_TYPE_RIG_LOCAL;
+		right.base.tracking_origin = &left.origin;
+
+		struct xrt_device *xdevs[] = {&head.base, &left.base, &right.base};
+		struct xrt_space_overseer *xso = nullptr;
+		u_builder_create_space_overseer_legacy(nullptr, &head.base, nullptr, nullptr, nullptr, xdevs, 3, false,
+		                                       false, &xso);
+		REQUIRE(xso != nullptr);
+
+		// Anchored to rig_initial exactly once — a second pass would
+		// have composed (0, 1.6, 0) onto itself.
+		check_vec3(left.origin.initial_offset.position, 0.f, 1.6f, 0.f);
+
+		xrt_space_overseer_destroy(&xso);
 	}
 }

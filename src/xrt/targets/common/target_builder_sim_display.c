@@ -7,6 +7,7 @@
  * @ingroup drv_sim_display
  */
 
+#include "xrt/xrt_compiler.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_drivers.h"
 
@@ -20,6 +21,7 @@
 #include "target_builder_input_provider.h"
 #include "target_builder_qwerty_input.h"
 #include "target_input_arbiter.h"
+#include "target_input_plugin_loader.h"
 #include "target_plugin_loader.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -102,6 +104,36 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	// Assign to role(s).
 	ubrh->head = head;
 
+	// Read the display plug-in's nominal panel + viewer geometry ONCE,
+	// here, and publish it to the input-provider host iface before any
+	// provider gets to create devices (#1380): a gesture solver may ask
+	// for it from create_devices on, and the qwerty block below wants the
+	// same two numbers. Failure is non-fatal — the cache simply stays
+	// unpopulated and `get_display_geometry` keeps answering
+	// XRT_ERROR_INPUT_HOST_GEOMETRY_NOT_READY.
+	XRT_MAYBE_UNUSED float screen_height_m = 0.0f;
+	XRT_MAYBE_UNUSED float nominal_z_m = 0.0f;
+	if (plugin != NULL &&
+	    plugin->struct_size >=
+	        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) &&
+	    plugin->get_display_info != NULL) {
+		struct xrt_plugin_display_info pdi = {0};
+		pdi.struct_size = (uint32_t)sizeof(pdi);
+		if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
+			screen_height_m = pdi.display_height_m;
+			nominal_z_m = pdi.nominal_viewer_z_m;
+
+			struct xrt_input_host_display_geometry geo = {0};
+			geo.struct_size = (uint32_t)sizeof(geo);
+			geo.display_width_m = pdi.display_width_m;
+			geo.display_height_m = pdi.display_height_m;
+			geo.nominal_viewer_x_m = pdi.nominal_viewer_x_m;
+			geo.nominal_viewer_y_m = pdi.nominal_viewer_y_m;
+			geo.nominal_viewer_z_m = pdi.nominal_viewer_z_m;
+			target_input_plugin_set_display_geometry(&geo);
+		}
+	}
+
 	// Input-provider plug-ins run BEFORE qwerty (ADR-034 arbitration):
 	// a provider's left/right motion controllers take the hand roles IF
 	// their hardware is actually present; qwerty below then fills the
@@ -135,20 +167,8 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
 		// Dims for the qwerty system: screen height + nominal viewer Z
-		// drive the WASD camera scaling. Sourced from the plug-in iface.
-		float screen_height_m = 0.0f;
-		float nominal_z_m = 0.0f;
-		if (plugin != NULL &&
-		    plugin->struct_size >=
-		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) &&
-		    plugin->get_display_info != NULL) {
-			struct xrt_plugin_display_info pdi = {0};
-			pdi.struct_size = (uint32_t)sizeof(pdi);
-			if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
-				screen_height_m = pdi.display_height_m;
-				nominal_z_m = pdi.nominal_viewer_z_m;
-			}
-		}
+		// drive the WASD camera scaling. Read once, above, alongside
+		// the geometry published to input providers.
 		if (screen_height_m > 0.0f) {
 			qd->sys->screen_height_m = screen_height_m;
 		}
