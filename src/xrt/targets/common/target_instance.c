@@ -388,7 +388,8 @@ t_instance_create_system(struct xrt_instance *xinst,
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
 		if (rr_plugin != NULL &&
-		    rr_plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
+		    rr_plugin->struct_size >=
+		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(rr_plugin->get_display_info) &&
 		    rr_plugin->get_display_info != NULL) {
 			struct xrt_plugin_display_info rr_pdi = {0};
 			rr_pdi.struct_size = (uint32_t)sizeof(rr_pdi);
