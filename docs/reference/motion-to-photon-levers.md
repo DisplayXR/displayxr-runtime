@@ -334,7 +334,15 @@ This is the levers-table shape from above with the sign reversed — a *missing*
 than a stale one — and the fix is the one the table recommends: measure the platform quantity
 and consume it, do not assume it. What the loop does **not** do is smooth the per-frame slot
 call: under load the headroom genuinely straddles a vblank boundary frame to frame, and a flip
-that matches reality must reach the predictor. (Keeping headroom per weave population — app
+that matches reality must reach the predictor. **That was then tested, not assumed** (#1432,
+branch `feat/1432-slot-call-candidates` @ `86d48dce6`, never merged): a Schmitt-style deadband that
+holds the steady-cadence slot when the snap lands within 0.2–0.35 period of a boundary, and an
+adaptive headroom margin nudged ±P/16 by the sign of each resolved residual. Under 8 CPU hogs the
+un-touched snap read **16.8% / 17.1%** pooled wrong-slot across two reps; the deadband **25.4%**,
+the margin **34.0%** (and 3× the flips, its margin pinned at the clamp). The deadband cuts flips
+by holding slots reality has moved; the margin hunts. The residual per-frame error under
+starvation is genuine cost volatility, and the next lever is upstream of the horizon — the
+governor's depth flapping (each leg sampled a different `applied` mix) or the app's frame cost. (Keeping headroom per weave population — app
 vs repaint, the #868 split — was also landed in #1433; measured, it was hygiene rather than the
 lever: the bistability reproduces only under CPU load, on app weaves alone.)
 
