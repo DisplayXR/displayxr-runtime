@@ -113,6 +113,97 @@ struct weave_latency_log
 	//! +1 period read as 100% wrong — which is not what "wrong" means.
 	uint32_t hz_k_hist[7] = {0, 0, 0, 0, 0, 0, 0};
 
+	/*!
+	 * #1435 closed loop — the pipeline's whole-period offset, LEARNED.
+	 *
+	 * The grid snap below predicts the first vblank a weave can reach. On an
+	 * opaque flip chain at queue depth 1 that IS the flip (measured: +0
+	 * periods, 0.00 ms error, 300/302 frames). But the frame DXGI reports as
+	 * flipped sits whole periods later on a DComp (transparent) chain (+1 at
+	 * depth 1 AND at depth 2 — the composition frame) and on an opaque chain
+	 * once the governor backs off to depth 2 (+1 — the queued frame); the two
+	 * terms were measured NOT to simply add. Rather than model chain type x
+	 * governor depth x DWM state, learn the integer from the realised
+	 * outcomes the ring already resolves: residual k = round((realised -
+	 * handed) / period) over the last 32 resolved weaves; when a non-zero k
+	 * is the mode of >= 24 of them, fold it into `po_applied`. The per-weave
+	 * grid snap stays raw — this corrects a CONSTANT that changes on rare
+	 * state transitions, which is what a mode with hysteresis is for (the
+	 * levers doc's anti-pattern is smoothing a per-frame quantity).
+	 *
+	 * Zero-safe: applied 0 = today's behaviour until the first lock (~0.5 s
+	 * at 60 weaves/s). DXR_DP_FORWARD_HORIZON_LOOP=0 pins applied at 0.
+	 */
+	enum po_state
+	{
+		PO_UNPROBED = 0,
+		PO_OFF = 1,
+		PO_ON = 2,
+	};
+	int po_enabled = PO_UNPROBED;
+	int po_applied = 0;   // whole periods currently added to the forward horizon
+	int8_t po_win[32] = {0};
+	uint32_t po_win_n = 0;
+	uint32_t po_win_head = 0;
+	uint32_t po_changes = 0;
+	uint64_t po_last_log_ns = 0;
+
+	void
+	po_observe(int k)
+	{
+		if (po_enabled != PO_ON) {
+			return;
+		}
+		if (k < -2) {
+			k = -2;
+		}
+		if (k > 4) {
+			k = 4;
+		}
+		po_win[po_win_head] = (int8_t)k;
+		po_win_head = (po_win_head + 1) % 32;
+		if (po_win_n < 32) {
+			po_win_n++;
+			return; // decide only on a full window
+		}
+		uint32_t hist[7] = {0, 0, 0, 0, 0, 0, 0};
+		for (uint32_t i = 0; i < 32; i++) {
+			hist[po_win[i] + 2]++;
+		}
+		int mode_i = 0;
+		for (int i = 1; i < 7; i++) {
+			if (hist[i] > hist[mode_i]) {
+				mode_i = i;
+			}
+		}
+		const int m = mode_i - 2;
+		if (m == 0 || hist[mode_i] < 24) {
+			return; // locked, or not yet a clear majority
+		}
+		int next = po_applied + m;
+		if (next < -1) {
+			next = -1;
+		}
+		if (next > 4) {
+			next = 4;
+		}
+		if (next == po_applied) {
+			po_win_n = 0; // clamped — drop the window rather than re-fire every frame
+			return;
+		}
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - po_last_log_ns > 5000000000ULL) {
+			// Lifecycle-level: a pipeline state change, once per lock, throttled.
+			U_LOG_W("#1435 forward horizon: pipeline offset %+d -> %+d periods (residual mode %+d in %u/32 "
+			        "resolved weaves; change #%u — gaps in the numbering are throttled changes)",
+			        po_applied, next, m, hist[mode_i], po_changes + 1);
+			po_last_log_ns = now_ns;
+		}
+		po_applied = next;
+		po_changes++;
+		po_win_n = 0; // re-measure against the new value
+	}
+
 	uint64_t seq = 0;
 	uint64_t qpc_weave = 0; // armed by mark_weave, consumed by after_present
 	uint64_t qpc_freq = 0;
@@ -257,6 +348,10 @@ struct weave_latency_log
 		if (fh_enabled == 0) {
 			return 0;
 		}
+		if (po_enabled == PO_UNPROBED) {
+			const char *e = getenv("DXR_DP_FORWARD_HORIZON_LOOP");
+			po_enabled = (e != nullptr && e[0] == '0') ? PO_OFF : PO_ON;
+		}
 		if (last_sync_qpc == 0 || refresh_period_qpc == 0) {
 			return 0;
 		}
@@ -287,8 +382,13 @@ struct weave_latency_log
 		// First vblank strictly after `ready`.
 		const uint64_t target =
 		    last_sync_qpc + ((ready - last_sync_qpc) / refresh_period_qpc + 1) * refresh_period_qpc;
-		const uint64_t horizon_ns = (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
+		uint64_t horizon_ns = (uint64_t)((double)(target - nowq) * 1000000000.0 / (double)f2);
 		const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * 1000000000.0 / (double)f2);
+		// #1435: the learned whole-period pipeline offset (0 until locked).
+		if (po_enabled == PO_ON && po_applied != 0) {
+			const int64_t adj = (int64_t)horizon_ns + (int64_t)po_applied * (int64_t)period_ns;
+			horizon_ns = adj > 0 ? (uint64_t)adj : horizon_ns;
+		}
 		note_horizon(horizon_ns, period_ns);
 		// #1432: remember what we told the DP, so after_present can check it
 		// against the vblank this weave really lands on.
@@ -381,11 +481,11 @@ struct weave_latency_log
 		U_LOG_W(
 		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-		    "| resolved %u  pipeline %+d periods  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
+		    "| resolved %u  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
 		    "bias %+.2f ms  sync-flip lag %.2f refr",
 		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
-		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, hz_wrong_slot,
+		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, po_applied, hz_wrong_slot,
 		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
 		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
 		    hz_resolved ? (double)hz_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
@@ -1051,7 +1151,9 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 			 *
 			 * Exact PresentCount only: a skipped-ahead SyncQPCTime belongs
 			 * to a later present and would read as a whole-period miss that
-			 * never happened. Trace-gated so the default path pays nothing.
+			 * never happened. Runs when the trace OR the #1435 loop is on
+			 * (the loop is default-on, so in practice always): one scan of
+			 * <= 8 ring entries per present.
 			 *
 			 * SyncQPCTime is the time of the LATEST vsync at sampling
 			 * (SyncRefreshCount), NOT the vblank this present flipped on
@@ -1061,7 +1163,7 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 			 * live run showed 100% "wrong slot" at exactly +1 period.
 			 * Walk SyncQPCTime back by the refresh-count gap to the flip.
 			 */
-			if (hz_trace == HZ_ON && refresh_period_qpc != 0 &&
+			if ((hz_trace == HZ_ON || po_enabled == PO_ON) && refresh_period_qpc != 0 &&
 			    stats.SyncRefreshCount >= stats.PresentRefreshCount) {
 				const uint32_t lag = stats.SyncRefreshCount - stats.PresentRefreshCount;
 				const uint64_t flip_qpc =
@@ -1073,8 +1175,12 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						const double k = 1000000000.0 / (double)freq();
 						const int64_t realised_ns =
 						    (int64_t)((double)(flip_qpc - ring[idx].horizon_base_qpc) * k);
-						note_horizon_outcome(realised_ns - (int64_t)ring[idx].horizon_ns,
-						                     (uint64_t)((double)refresh_period_qpc * k), lag);
+						const int64_t err_ns = realised_ns - (int64_t)ring[idx].horizon_ns;
+						const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * k);
+						note_horizon_outcome(err_ns, period_ns, lag);
+						// #1435: residual in whole periods, into the loop.
+						const double kf = (double)err_ns / (double)period_ns;
+						po_observe((int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5));
 						ring[idx].horizon_ns = 0; // consumed
 						break;
 					}

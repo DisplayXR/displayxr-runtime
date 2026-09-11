@@ -313,7 +313,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **80 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **81 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -479,6 +479,7 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_FRAME_STAGE_TIMING` | `compositor/vk_native/comp_vk_native_compositor.c:148` | `DEBUG_GET_ONCE_BOOL` | off | App | 3 | Per-stage CPU timing of the windowed commit; `composite=` is the GPU wait |
 | `DXR_FRAME_WITNESS` | `compositor/util/comp_frame_witness.h:62` | `getenv`, atomic cached | 0 (secs) | App | 3 | Windowed count of app weaves vs. repaints vs. presents vs. 3D weaves |
 | `DXR_WEAVE_LATENCY_CSV` | `compositor/util/comp_weave_latency_win.h:82`; `vk_native/comp_vk_native_target.cpp:1860, 1878` | `getenv` | unset | App | 3 | Filename prefix for latency CSV output |
+| `DXR_DP_FORWARD_HORIZON_LOOP` | `compositor/util/comp_weave_latency_win.h` (`po_observe` from `after_present`; applied in `predict_weave_to_scanout_ns`) | `getenv`, cached | **on** (kill switch) | App | 1 | #1435: learns the pipeline's whole-period offset (composition frame on DComp chains, queued frame at governor depth ≥ 2) from realised flips — mode of the last 32 resolved weaves, ≥ 24 agreeing — and adds it to the forward horizon. `0` pins the offset at 0, the pre-#1435 feed |
 | `DXR_DP_FORWARD_HORIZON_TRACE` | `compositor/util/comp_weave_latency_win.h` (`note_horizon`, called from `predict_weave_to_scanout_ns` on the split + d3d11 + d3d12 weave paths) | `getenv`, cached | off | App | 3 | #206 horizon-jitter probe: one throttled WARN per ~5 s with min/mean/max of the forward horizon, its spread in refresh periods, the count of vblank-boundary flips (consecutive-weave deltas ≥ half a period), and (#1432) the closed loop — resolved weaves, wrong-slot calls (|predicted − realised| ≥ half a period) and mean |error|. Pure observer — changes nothing but logging |
 | `DXR_WEAVE_PROBE` | `compositor/d3d11/comp_d3d11_compositor.cpp:2383` | `getenv`, cached | off | App | 4 | One-shot dump of the back buffer as the DP left it, pre-composite |
 | `DXR_WEAVE_TAP` | `compositor/d3d12/comp_d3d12_compositor.cpp:4122` | `getenv`, cached | 0 | App | 4 | #727 dual-tap PNG dump around the composite. GPU flush + readback; costly |

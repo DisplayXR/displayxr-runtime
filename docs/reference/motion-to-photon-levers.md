@@ -309,18 +309,34 @@ split/bridge, d3d11, and d3d12 weave paths; the in-process VK dcomp path has no 
 source (no statistics, no `present_wait` on Intel) and honestly reports 0.
 
 The horizon is "first vblank after now + headroom", where the headroom is last frame's
-mark→present-return cost — so it is a **step function** of that cost and legitimately jumps a
-whole period when the weave will land one vblank later. What must **not** happen is the
-headroom alternating between two unrelated populations: an app weave sits behind the
-frame-latency waitable at the governor's depth while a repaint never waits on it and paces
-to one panel period (the #868 split). Until #1432 one `headroom_qpc` fed both, and a heavy app
-that interleaves repaints flipped the horizon on alternate weaves (0 flips/s on a trivial app,
-up to 8.6/s on the Unity avatar, per `DXR_DP_FORWARD_HORIZON_TRACE`); the headroom is now kept
-per population and selected by the weave kind. The trace also closes the loop — each weave's
-predicted horizon is checked against the vblank DXGI says it really hit (exact `PresentCount`
-match only), so a remaining flip can be told apart from a *wrong slot call* (|error| ≥ half a
-period). Hysteresis was deliberately **not** added: a flip that matches reality is correct,
-and smoothing it would be the constant-standing-in-for-a-varying-quantity shape above.
+mark→present-return cost — a **step function** of that cost that legitimately jumps a whole
+period when the weave will land one vblank later. Three things were measured against the
+vblank DXGI reports for the same present (`DXR_DP_FORWARD_HORIZON_TRACE=1`, exact
+`PresentCount` join; #1432, #1434, #1435):
+
+- **The grid snap itself is exact where nothing sits between the present and the flip.** An
+  opaque flip chain at queue depth 1 reads `+0 periods`, 0.00 ms error, 300 of 302 frames.
+- **Whole periods sit between them on other pipelines, and the terms do not simply add.** A
+  DComp (transparent-HWND) chain reads `+1` — the composition frame — at governor depth 1 *and*
+  at depth 2. An opaque chain reads `+1` once the late-weave governor backs off to depth 2 (the
+  queued frame), `+2` at depth 3. Until #1435 the DP was handed the un-offset value, i.e. a
+  horizon one whole refresh short on every transparent-overlay app, every frame.
+- **The offset is a constant that changes on rare state transitions**, so it is *learned*, not
+  modelled: `po_observe` takes the residual `round((realised − handed) / period)` of the last 32
+  resolved weaves and, when a non-zero value is the mode of ≥ 24 of them, folds it into the
+  horizon (`DXR_DP_FORWARD_HORIZON_LOOP=0` pins it at 0). Locks in ~0.5 s at 60 weaves/s;
+  follows the governor's depth changes; the per-weave grid snap stays raw. Measured on the
+  Unity avatar: locked `+1` in the first window, then 0.00 ms error and 0% wrong-slot in 9 of
+  11 quiet windows; under CPU starvation it tracked the governor to `+2` and back, wrong-slot
+  1–9% locked versus 6–58% before.
+
+This is the levers-table shape from above with the sign reversed — a *missing* constant rather
+than a stale one — and the fix is the one the table recommends: measure the platform quantity
+and consume it, do not assume it. What the loop does **not** do is smooth the per-frame slot
+call: under load the headroom genuinely straddles a vblank boundary frame to frame, and a flip
+that matches reality must reach the predictor. (Keeping headroom per weave population — app
+vs repaint, the #868 split — was also landed in #1433; measured, it was hygiene rather than the
+lever: the bistability reproduces only under CPU load, on app weaves alone.)
 
 ### Prediction horizon — computed by the DP, no runtime env var
 
