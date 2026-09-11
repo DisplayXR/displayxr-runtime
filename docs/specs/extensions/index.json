@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Hand-written editorial notes about the XR_DXR_* extensions — the ONLY place",
+    "they are maintained. The extension SET is derived from the headers in",
+    "src/external/openxr_includes/openxr/ by scripts/gen_extensions_index.py,",
+    "which hard-fails when a header has no entry here (or an entry names no",
+    "header). That is what stops the published surfaces from drifting: the",
+    "displayxr-extensions README, its machine-readable extensions.json, and the",
+    "displayxr.org/extensions page are all generated or merged from this file.",
+    "Adding a header without a note here fails the `lint` workflow.",
+    "",
+    "'summary' is one sentence, README-length. Longer prose for the website",
+    "lives in displayxr-website/app/extensions/page.tsx and is merged by name;",
+    "where none exists the website falls back to this summary, so an extension",
+    "can never be missing from the public list."
+  ],
+  "groups": [
+    {
+      "id": "display",
+      "title": "Display capability",
+      "blurb": "What the runtime tells apps about the 3D display they are rendering on."
+    },
+    {
+      "id": "rendering",
+      "title": "Rendering, projection & compositing",
+      "blurb": "How an app drives the runtime's view math, declares which regions of its window are 3D, and hands pre-weave content to the vendor display processor — instead of re-implementing projection or weaving itself."
+    },
+    {
+      "id": "windowing",
+      "title": "App window binding",
+      "blurb": "How an app hands its native window to the runtime so the compositor can output into it."
+    },
+    {
+      "id": "workspace",
+      "title": "Workspace controller surface",
+      "blurb": "The contract that lets a workspace controller — the DisplayXR Shell, or any third-party / OEM / vertical / AI-agent equivalent — drive the spatial-desktop layer on top of the runtime. Activation is gated by orchestrator-PID match; the runtime trusts whatever binary it was configured to spawn."
+    },
+    {
+      "id": "agent",
+      "title": "Agent control",
+      "blurb": "How applications plug into the AI-agent surface, exposing their own actions through the same MCP framework the runtime and workspace controllers use."
+    },
+    {
+      "id": "capture",
+      "title": "Capture",
+      "blurb": "Getting the composed multi-view frame back out of the runtime — for screenshots, recording, and dataset generation."
+    }
+  ],
+  "extensions": {
+    "XR_DXR_display_info": {
+      "group": "display",
+      "title": "Display Info",
+      "summary": "Display dimensions, eye-tracking modes, and the data needed for asymmetric (Kooima) projection"
+    },
+    "XR_DXR_view_rig": {
+      "group": "rendering",
+      "title": "View Rig",
+      "summary": "App declares a display or camera rig descriptor and consumes render-ready XrView{pose, fov}; the runtime owns the projection math"
+    },
+    "XR_DXR_display_zones": {
+      "group": "rendering",
+      "title": "Display Zones",
+      "summary": "A layout of independent 3D zones and flat 2D zones across one display, each 3D zone with its own view rig, plus the wish mask a switchable-lens panel honours"
+    },
+    "XR_DXR_local_3d_zone": {
+      "group": "rendering",
+      "title": "Local 3D Zones",
+      "summary": "Per-pixel 3D-ness mask over an app's own window, with the flat 2D side as a first-class post-weave composition layer"
+    },
+    "XR_DXR_depth_budget": {
+      "group": "rendering",
+      "title": "Rear Depth Budget",
+      "summary": "Advisory limit on how far behind the display plane a transparent app may render, chained on XrViewState at xrLocateViews"
+    },
+    "XR_DXR_weave": {
+      "group": "rendering",
+      "title": "Window Weave Service",
+      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence"
+    },
+    "XR_DXR_win32_window_binding": {
+      "group": "windowing",
+      "title": "Win32 Window Binding",
+      "summary": "App-provided HWND, shared texture, canvas sub-rect"
+    },
+    "XR_DXR_cocoa_window_binding": {
+      "group": "windowing",
+      "title": "Cocoa Window Binding",
+      "summary": "App-provided NSView, IOSurface sharing"
+    },
+    "XR_DXR_xlib_window_binding": {
+      "group": "windowing",
+      "title": "Xlib Window Binding",
+      "summary": "App-provided X11 Display* and Window (desktop Linux)"
+    },
+    "XR_DXR_wayland_surface_binding": {
+      "group": "windowing",
+      "title": "Wayland Surface Binding",
+      "summary": "App-provided wl_display and wl_surface (desktop Linux)"
+    },
+    "XR_DXR_android_surface_binding": {
+      "group": "windowing",
+      "title": "Android Surface Binding",
+      "summary": "App-provided Android Surface / ANativeWindow, republished across background and resume, with the per-frame window rect"
+    },
+    "XR_DXR_macos_gl_binding": {
+      "group": "windowing",
+      "title": "macOS OpenGL Binding",
+      "summary": "macOS OpenGL graphics binding"
+    },
+    "XR_DXR_spatial_workspace": {
+      "group": "workspace",
+      "title": "Spatial Workspace",
+      "summary": "Multi-app composition: window pose, hit-test, capture, overlay, modal input grab"
+    },
+    "XR_DXR_workspace_file_dialog": {
+      "group": "workspace",
+      "title": "Workspace File Dialog",
+      "summary": "Async spatial-native file picker spawned by the active workspace controller, with fallback to the platform dialog"
+    },
+    "XR_DXR_mcp_tools": {
+      "group": "agent",
+      "title": "App MCP Tools",
+      "summary": "An app registers its own MCP tools with the runtime's agent surface; calls arrive on the OpenXR event queue"
+    },
+    "XR_DXR_atlas_capture": {
+      "group": "capture",
+      "title": "Atlas Capture",
+      "summary": "Vendor-neutral PNG snapshot of the multi-view atlas at a caller-selected compositor stage, for any app class"
+    }
+  }
+}

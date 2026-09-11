@@ -84,6 +84,16 @@ jobs:
         # pruned roadmap docs still linked, a stale ADR filename).
         run: python3 scripts/check_doc_paths.py
 
+      - name: Every published extension has a note
+        # The displayxr-extensions README + extensions.json + the
+        # displayxr.org/extensions page are all generated from
+        # docs/specs/extensions/index.json joined to the XR_DXR_*.h headers.
+        # A header with no entry there (or an entry with no header) fails here,
+        # so those public surfaces cannot drift behind the header set again —
+        # which is exactly how the mirror's README came to document 5 of 16
+        # extensions (displayxr-extensions#2).
+        run: python3 scripts/gen_extensions_index.py --check --github
+
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
