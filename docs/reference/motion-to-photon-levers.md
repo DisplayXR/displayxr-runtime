@@ -79,9 +79,32 @@ workspace  29 -> 17 ms
 |---|---|---|
 | `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH` |
 | `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min |
+| `DXR_LATE_WEAVE_SLIP_CAP` | on (`0` restores the pre-2026-09 policy) | Caps slip-rate escalation at `needed_depth() + 1`, requires three clean slip windows before a return probe, and doubles the probe dwell when a slip escalation follows a probe within 30 s |
 
 Late weave depends on present-timing feedback from the swapchain. Where the platform does not
 provide it, it is **dormant** rather than wrong — see the topology table.
+
+**The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
+Every queue level the governor adds moves the flip one whole period later, and #1437's learned
+pipeline offset follows it with ~0.5 s of lag — so every depth change is ~0.5 s of a
+whole-period-wrong horizon plus a 16.7 ms step in what the predictor extrapolates over. On a
+sub-60 app the governor *flaps*: slip-rate escalation adds a level per 2 s window with ≥ 8%
+vsync-doubled frames, the return probe removes one after 300 calm frames, and a ~50 fps app
+sits on exactly that boundary. The 3DLuma Unity avatar on this box (48 fps on either GPU,
+agent off, untracked, 90–150 s legs, `DXR_DP_FORWARD_HORIZON_TRACE`):
+
+| governor | depth changes / 90 s | depth range | wrong-slot (pooled) | app fps |
+|---|---|---|---|---|
+| old policy | 8–10 | 1–4 | 23% | ~56 |
+| `SLIP_CAP` policy (this default) | ~4 | 1–3 | 20% | ~55 |
+| `DXR_LATE_WEAVE_AUTOBACKOFF=0` (depth held at 1) | **0** | 1 | **2.3%**, 0.2 ms mean error | ~44–48 |
+
+The governor buys ~8–12 fps on an app that cannot make rate and pays for it with a 10× worse
+slot call — the trade its own comment names as wrong for a 3D display. `SLIP_CAP` damps the
+flap (the slip path stops at `needed_depth()+1`; the starvation path is uncapped and can still
+reach 4; converging dwell) but cannot remove it while slip escalation exists; whether
+slip escalation should be **off by default** (keeping only the starvation backoff for genuinely
+serialized pipelines) is the open product decision, recorded on the issue.
 
 ### `DXR_WEAVE_REPAINT` — **default ON** (#868)
 
