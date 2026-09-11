@@ -25,6 +25,9 @@ keeps its existing precedence over the keyboard fallback. External/raw view
 paths and service/workspace rig policy keep their existing semantics. Independent
 per-window input/head devices are outside this feature's scope.
 
+V1 does not seed IPC or service sessions. Their existing synthesis and workspace
+override policy remain unchanged.
+
 ## Location and selection
 
 Windows reads `%ProgramData%\DisplayXR\app-profiles\<executable-basename>.json`.
@@ -106,10 +109,11 @@ and Unicode paths. `tests_qwerty_camera_profile` exercises actual qwerty devices
 profile seeding, live adjustments, Space reset, independent-system defaults and
 display-mode exclusion.
 
-`tests_oxr_session_window_binding` covers the final classification of common
-window/readback/shared-texture bindings and the already-populated external
-classification used by Vulkan's Xlib/Wayland paths. It requires no graphics
-surface and runs on the host; it is not a Linux GPU integration test.
+`tests_oxr_session_window_binding` covers profile-only exclusion for common
+window/readback/shared-texture bindings, late-decoded Xlib/Wayland bindings,
+and Android runtime-created hosted windows. The profile check does not rewrite
+the shared rendering/input classification. The test requires no graphics surface
+and runs on the host; it is not a Linux or Android GPU integration test.
 
 On Windows, explicitly build and run `tests_oxr_camera_profile --native` for the
 GPU/native-session probe. It loads the candidate runtime DLL directly and opens

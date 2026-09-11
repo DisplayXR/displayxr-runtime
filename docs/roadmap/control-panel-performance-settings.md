@@ -320,13 +320,13 @@ Process column: **App** = the runtime DLL, loaded into the OpenXR app's process 
 **Svc** = `displayxr-service.exe` · **Both** = a shared `auxiliary/` or `targets/common/`
 library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, controls nothing).
 
-### Weave / present pipeline
-
-Camera policy is separate from the performance switches below:
+### Legacy camera profiles
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
 |---|---|---|---|---|---|---|
 | `DXR_LEGACY_CAMERA_RIG` | `auxiliary/util/u_camera_profile.c` | Process environment at the first eligible session per instance (Windows: `GetEnvironmentVariableW`) | Per-executable JSON profile, otherwise qwerty defaults | App | 1 | Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset. [Profile contract](../specs/runtime/legacy-camera-profile.md). Excludes display-aware and headless-only/external-only/workspace-only instances; headless siblings of an eligible native session share its tuning |
+
+### Weave / present pipeline
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
 |---|---|---|---|---|---|---|

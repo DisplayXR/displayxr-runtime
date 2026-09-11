@@ -500,7 +500,9 @@ qwerty_destroy(struct xrt_device *xd)
 	// Note: do not destroy a single device of a qwerty system or its var tracking
 	// ui will make a null reference
 	struct qwerty_device *qd = qwerty_device(xd);
-	qwerty_system_remove(qd->sys, qd);
+	if (qd->sys != NULL) {
+		qwerty_system_remove(qd->sys, qd);
+	}
 	os_mutex_destroy(&qd->lock); // #958
 	u_device_free(xd);
 }
@@ -697,7 +699,13 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	assert(qright && "Cannot create a qwerty system when Right controller is NULL");
 
 	struct qwerty_system *qs = U_TYPED_CALLOC(struct qwerty_system);
-	os_mutex_init(&qs->view_lock);
+	if (qs == NULL) {
+		return NULL;
+	}
+	if (os_mutex_init(&qs->view_lock) != 0) {
+		free(qs);
+		return NULL;
+	}
 	qs->hmd = qhmd;
 	qs->lctrl = qleft;
 	qs->rctrl = qright;
