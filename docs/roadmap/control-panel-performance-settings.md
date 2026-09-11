@@ -313,7 +313,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **88 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **89 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -321,6 +321,12 @@ Process column: **App** = the runtime DLL, loaded into the OpenXR app's process 
 library linked into both · **CLI** = `displayxr-cli.exe` (reporting only, controls nothing).
 
 ### Weave / present pipeline
+
+Camera policy is separate from the performance switches below:
+
+| Var | Read site | Mechanism | Default | Proc | Tier | What it does |
+|---|---|---|---|---|---|---|
+| `DXR_LEGACY_CAMERA_RIG` | `auxiliary/util/u_camera_profile.c` | Process environment at the first eligible session per instance (Windows: `GetEnvironmentVariableW`) | Per-executable JSON profile, otherwise qwerty defaults | App | 1 | Inline camera-rig JSON or a UTF-8 file path; seeds instance-wide native legacy camera tuning and Space reset. [Profile contract](../specs/runtime/legacy-camera-profile.md). Excludes display-aware and headless-only/external-only/workspace-only instances; headless siblings of an eligible native session share its tuning |
 
 | Var | Read site | Mechanism | Default | Proc | Tier | What it does |
 |---|---|---|---|---|---|---|

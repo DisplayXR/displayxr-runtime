@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: BSL-1.0
 
 set(tests
+    tests_camera_profile
+    tests_oxr_session_window_binding
     tests_cxx_wrappers
     tests_deque
     tests_generic_callbacks
@@ -36,6 +38,9 @@ set(tests
     tests_comp_rear_budget
     tests_oxr_weave_latch
 	)
+if(XRT_BUILD_DRIVER_QWERTY)
+	list(APPEND tests tests_qwerty_camera_profile)
+endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate
@@ -82,6 +87,21 @@ foreach(testname ${tests})
 endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
+
+target_include_directories(tests_oxr_session_window_binding PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+
+if(TARGET tests_qwerty_camera_profile)
+	target_link_libraries(tests_qwerty_camera_profile PRIVATE drv_qwerty drv_qwerty_includes)
+endif()
+
+if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
+	# Explicit acceptance probe: opens native windows, so never an automatic CTest.
+	add_executable(tests_oxr_camera_profile EXCLUDE_FROM_ALL tests_oxr_camera_profile.cpp)
+	target_include_directories(tests_oxr_camera_profile PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes)
+	target_compile_definitions(tests_oxr_camera_profile PRIVATE "DXR_RUNTIME_LIB_PATH=\"$<TARGET_FILE:${RUNTIME_TARGET}>\"")
+	target_link_libraries(tests_oxr_camera_profile PRIVATE d3d11 dxgi)
+	add_dependencies(tests_oxr_camera_profile ${RUNTIME_TARGET})
+endif()
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 target_link_libraries(tests_history_buf PRIVATE aux_math)

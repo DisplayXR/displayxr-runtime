@@ -9,6 +9,7 @@
 #pragma once
 
 #include "util/u_logging.h"
+#include "util/u_camera_profile.h"
 #include "xrt/xrt_device.h"
 
 #include "os/os_threading.h"
@@ -51,10 +52,13 @@ struct qwerty_system
 
 	// View controls (P toggles mode with derivation, spacebar resets)
 	bool camera_mode; //!< true=camera-centric (default), false=display-centric
+	struct os_mutex view_lock; //!< Serializes view tuning, profile seeding and Space reset.
+	bool camera_profile_active;
+	struct u_camera_profile camera_profile;
 
 	// Camera-centric state (user adjusts when camera_mode=true)
-	float cam_spread_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
-	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
+	float cam_spread_factor;   //!< Absolute eye scale; profile may seed it independently of parallax.
+	float cam_parallax_factor; //!< Absolute parallax scale; the combined keyboard control couples both.
 	float cam_convergence;     //!< [0,2] diopters, default 0.5
 	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
 	float cam_m2v;             //!< meters→world scale, default 1.0 (qwerty perspective is always 1)
@@ -473,6 +477,10 @@ qwerty_set_rendering_mode(struct qwerty_system *qs, int mode);
  */
 void
 qwerty_toggle_camera_mode(struct qwerty_system *qs);
+
+//! Read the view-mode selector under the same lock as profile and keyboard changes.
+bool
+qwerty_is_camera_mode(struct qwerty_system *qs);
 
 /*!
  * Adjust IPD+parallax factor by multiplier (both set to same value, clamped [0.01,1]).

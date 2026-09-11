@@ -520,7 +520,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 				if (flags & NSEventModifierFlagShift) {
 					float mult = (delta_y > 0) ? 1.1f : (1.0f / 1.1f);
 					qwerty_adjust_view_factor(qsys, mult);
-				} else if (qsys->camera_mode) {
+				} else if (qwerty_is_camera_mode(qsys)) {
 					qwerty_adjust_convergence(qsys, (delta_y > 0) ? 1.0f : -1.0f);
 				} else {
 					float mult = (delta_y > 0) ? 1.05f : (1.0f / 1.05f);
