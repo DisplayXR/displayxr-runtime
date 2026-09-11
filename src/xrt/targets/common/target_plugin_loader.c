@@ -2569,7 +2569,7 @@ query_source_claims(const struct plugin_display_source *src,
 	if (iface == NULL) {
 		return 0;
 	}
-	if (iface->struct_size > offsetof(struct xrt_plugin_iface, probe_displays) &&
+	if (iface->struct_size >= offsetof(struct xrt_plugin_iface, probe_displays) + sizeof(iface->probe_displays) &&
 	    iface->probe_displays != NULL) {
 		return iface->probe_displays(src->inst, descs, n, out, max);
 	}

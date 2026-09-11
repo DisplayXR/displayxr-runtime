@@ -223,6 +223,13 @@ struct xrt_system_roles
 			int32_t right;
 		} conforming;
 	} hand_tracking;
+
+	/*!
+	 * Index in @ref xrt_system_devices::xdevs of the device holding the rig
+	 * (navigation) role, or negative when the runtime's own fly camera
+	 * (qwerty) holds it. ADR-034 Amendment 4.
+	 */
+	int32_t rig;
 };
 
 /*!
@@ -233,12 +240,7 @@ struct xrt_system_roles
  * @relates xrt_system_roles
  */
 #define XRT_SYSTEM_ROLES_INIT                                                                                          \
-	{                                                                                                              \
-		0, -1, -1, -1, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID,                             \
-		{                                                                                                      \
-			{-1, -1}, {-1, -1}                                                                             \
-		}                                                                                                      \
-	}
+	{0, -1, -1, -1, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID, XRT_DEVICE_INVALID, {{-1, -1}, {-1, -1}}, -1}
 
 
 /*!

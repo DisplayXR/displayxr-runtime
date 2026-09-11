@@ -138,7 +138,9 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		// drive the WASD camera scaling. Sourced from the plug-in iface.
 		float screen_height_m = 0.0f;
 		float nominal_z_m = 0.0f;
-		if (plugin != NULL && plugin->struct_size > offsetof(struct xrt_plugin_iface, get_display_info) &&
+		if (plugin != NULL &&
+		    plugin->struct_size >=
+		        offsetof(struct xrt_plugin_iface, get_display_info) + sizeof(plugin->get_display_info) &&
 		    plugin->get_display_info != NULL) {
 			struct xrt_plugin_display_info pdi = {0};
 			pdi.struct_size = (uint32_t)sizeof(pdi);
@@ -156,7 +158,9 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 
 		// Bind the qwerty HMD as the head's external pose source.
 		// Iface-routed; the plug-in owns the vendor-private cast.
-		if (plugin != NULL && plugin->struct_size > offsetof(struct xrt_plugin_iface, set_pose_source) &&
+		if (plugin != NULL &&
+		    plugin->struct_size >=
+		        offsetof(struct xrt_plugin_iface, set_pose_source) + sizeof(plugin->set_pose_source) &&
 		    plugin->set_pose_source != NULL) {
 			plugin->set_pose_source(target_plugin_get_active_instance(), head, qwerty_hmd);
 		}

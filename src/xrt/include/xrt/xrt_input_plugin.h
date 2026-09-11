@@ -108,13 +108,31 @@ struct xrt_device;
 /*!
  * Guard for a vtable slot that was APPENDED after a provider may have
  * been compiled (ADR-020): true only when the provider's reported
- * `struct_size` actually covers @p FIELD *and* the provider filled it in.
- * Every runtime-side dispatch through an appended slot must go through
- * this — reading past `struct_size` is undefined by contract.
+ * `struct_size` covers ALL of @p FIELD's bytes *and* the provider filled
+ * it in. Every runtime-side dispatch through an appended slot must go
+ * through this — reading past `struct_size` is undefined by contract.
+ *
+ * Whole-field coverage, exactly like @ref XRT_DP_HAS_SLOT: a `struct_size`
+ * that lands anywhere inside the slot (`> offsetof` alone) still leaves
+ * part of the pointer outside the provider's allocation.
  */
 #define XRT_INPUT_PLUGIN_IFACE_HAS(IFACE, FIELD)                                                                       \
-	((IFACE) != NULL && (IFACE)->struct_size > offsetof(struct xrt_input_plugin_iface, FIELD) &&                   \
+	((IFACE) != NULL &&                                                                                            \
+	 (IFACE)->struct_size >= offsetof(struct xrt_input_plugin_iface, FIELD) + sizeof((IFACE)->FIELD) &&            \
 	 (IFACE)->FIELD != NULL)
+
+
+/*!
+ * Static-assert helper for this header's ABI invariants, mirroring
+ * `XRT_DP_ABI_ASSERT` in `xrt_plugin.h`'s display-processor contract.
+ */
+#ifndef XRT_INPUT_PLUGIN_ABI_ASSERT
+#if defined(__cplusplus)
+#define XRT_INPUT_PLUGIN_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define XRT_INPUT_PLUGIN_ABI_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+#endif
 
 
 /*
@@ -183,6 +201,22 @@ enum xrt_input_provider_presence
  */
 
 /*!
+ * Nominal panel + viewer geometry of the active display processor, filled in
+ * by @ref xrt_input_plugin_host_iface::get_display_geometry.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_input_host_display_geometry
+{
+	uint32_t struct_size; /* caller sets to sizeof before the call */
+	float display_width_m;
+	float display_height_m;
+	float nominal_viewer_x_m; /* nominal viewer, display-centre origin, +Z toward viewer */
+	float nominal_viewer_y_m;
+	float nominal_viewer_z_m; /* never the tracked eyes */
+};
+
+/*!
  * Host-supplied callbacks the provider may call. Intentionally minimal in
  * v1 — logging, debug-var tracking, and metrics reach providers through
  * the runtime's aux export surface, same boundary discipline as
@@ -193,8 +227,11 @@ enum xrt_input_provider_presence
  *   - Providers MUST NOT dereference any field whose offset is at or
  *     past `host->struct_size`.
  *   - The runtime MAY introduce new callbacks by repurposing reserved
- *     slots in later API versions; doing so bumps
- *     @ref XRT_INPUT_PLUGIN_API_VERSION_CURRENT and grows `struct_size`.
+ *     slots. Because a reserved slot is one providers are forbidden to
+ *     dereference, and the repurposing keeps the struct's size and every
+ *     other offset identical, the API major does NOT move: a provider
+ *     detects the callback with the usual `struct_size` coverage check
+ *     plus a NULL test (an older runtime leaves the slot NULL).
  *
  * Lifetime: valid for the duration of the `xrtInputPluginNegotiate` call
  * and for the lifetime of the negotiated provider (until
@@ -216,12 +253,33 @@ struct xrt_input_plugin_host_iface
 	 */
 	uint32_t host_api_version;
 
+	/*! Nominal panel + viewer geometry of the active display processor. Optional (NULL on
+	 *  an older runtime). The CALLBACK is valid for the life of the process from
+	 *  xrtInputPluginNegotiate on (persistent host storage); the GEOMETRY is ready from the
+	 *  provider's create_devices call on (cached from the display plug-in before any provider
+	 *  creates devices) and is static for the life of the system. Earlier calls return a
+	 *  distinct error and leave the struct untouched. */
+	xrt_result_t (*get_display_geometry)(struct xrt_input_host_display_geometry *inout);
+
 	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Providers MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[14];
+	void *reserved[13];
 };
+
+// The get_display_geometry slot was carved out of the former reserved[0]: the
+// host iface's size and every other offset are unchanged, so providers built
+// against the previous header keep working and the API major stays 1.
+// clang-format off
+XRT_INPUT_PLUGIN_ABI_ASSERT(offsetof(struct xrt_input_plugin_host_iface, reserved) ==
+                                offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+                                    sizeof(void *),
+                            "xrt_input_plugin_host_iface: get_display_geometry must occupy the former reserved[0]");
+XRT_INPUT_PLUGIN_ABI_ASSERT(sizeof(struct xrt_input_plugin_host_iface) ==
+                                2 * sizeof(uint32_t) + 14 * sizeof(void *),
+                            "xrt_input_plugin_host_iface size changed - see ADR-020, this needs an API major bump");
+// clang-format on
 
 /*!
  * The provider's vtable. Filled in by the provider inside its

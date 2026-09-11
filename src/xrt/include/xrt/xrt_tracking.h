@@ -60,6 +60,16 @@ enum xrt_tracking_type
 
 	// The device(s) are tracked by other methods.
 	XRT_TRACKING_TYPE_OTHER,
+
+	/*!
+	 * The device's poses are DISPLAY-PLANE-RELATIVE (rig-local): origin at the
+	 * display centre, +X right, +Y up, +Z toward the viewer, metres. The runtime
+	 * anchors this origin at the initial rig (u_space_overseer::rig_initial), so
+	 * world = rig(t) o pose with no standing-height or mount knowledge in the
+	 * provider. New providers use this; TYPE_OTHER keeps today's stage-anchored
+	 * behaviour (ultraleap's ul_mount_offset_default {0, 1.45, -0.10} stays).
+	 */
+	XRT_TRACKING_TYPE_RIG_LOCAL,
 };
 
 /*!
