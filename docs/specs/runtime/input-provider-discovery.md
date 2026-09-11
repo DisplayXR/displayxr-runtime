@@ -202,6 +202,37 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    machine configuration. Set it process-level — the runtime DLL has its
    own static-CRT environment block.)
 
+## 4b. Rig (navigation) role
+
+A provider may also drive the **rig** — the virtual camera the qwerty fly
+camera drives today — by creating ONE extra device of type
+`XRT_DEVICE_TYPE_NAVIGATION` alongside its controllers. The role is arbitrated
+by the same presence-ranked walk as the hands (`target_input_arbiter.c`), under
+the same `generation_id` and over the same IPC `get_roles` forwarding:
+
+> `xrt_system_roles::rig` is the `xsysd->xdevs` index of the navigation device
+> of the **highest-priority (lowest ProbeOrder) candidate that has one and
+> reports `PRESENT`**. Otherwise **-1**.
+
+Two things differ from the hand walk:
+
+- **At most one navigation device per provider.** A provider that creates more
+  than one is buggy; the arbiter warns and keeps the first.
+- **The floor is an absence, not a candidate.** Qwerty supplies no navigation
+  device, so `rig == -1` is not "no rig" — it means *the runtime's own fly
+  camera holds it* (WASD / mouse-look). That is what every box without a
+  navigating provider reports, and what an unplug falls back to.
+
+Presence semantics are the hands' exactly: a NULL `get_presence` (or a
+`struct_size` predating the slot) means "assume present", `UNKNOWN` means not
+present. Pose validity is *not* presence — a provider that is plugged in but has
+nothing to say clears the pose's validity flags and keeps the role.
+
+What the runtime then *does* with the role — alignment against the provider's
+own navigation frame, the re-alignment epochs, recenter, and the rig composer
+that feeds the head pose — is not decided here: see **ADR-034 Amendment 4
+(pending)** and issue #1380.
+
 ## 4a. Pose anchoring — provider volumes are rig-relative
 
 A provider reports poses **in its own tracking volume** and says nothing about

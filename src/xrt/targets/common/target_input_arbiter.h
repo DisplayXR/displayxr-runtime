@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Presence-gated hand-role arbitration across N input providers
- *         and the qwerty fallback.
+ * @brief  Presence-gated hand- and rig-role arbitration across N input
+ *         providers and the qwerty fallback.
  *
  * ADR-034 shipped a one-shot rule: whatever the active input-provider
  * plug-in created at system build claimed the left/right hand roles for
@@ -29,6 +29,13 @@
  * per-hand, so a provider that supplies only one controller leaves the
  * other hand to the next-ranked candidate rather than dragging both
  * down to qwerty.
+ *
+ * ADR-034 Amendment 4 (pending) adds the **rig (navigation) role** to the
+ * same walk: a provider may supply one @ref XRT_DEVICE_TYPE_NAVIGATION
+ * device, and `xrt_system_roles::rig` points at the highest-priority
+ * present one. Its floor is not a candidate but an absence — `rig == -1`
+ * means the runtime's own fly camera (qwerty WASD/mouse-look) drives the
+ * rig, which is what every box without a navigating provider reports.
  *
  * That reuses the role-change path Monado already has end to end: the
  * OpenXR state tracker re-reads the roles in `xrSyncActions`, rebinds
@@ -104,6 +111,27 @@ t_input_arbiter_note_provider_hand_tracking(struct xrt_device *unobstructed_left
                                             struct xrt_device *unobstructed_right,
                                             struct xrt_device *conforming_left,
                                             struct xrt_device *conforming_right);
+
+/*!
+ * Record the navigation (rig) device the SAME provider supplied — must
+ * follow the matching @ref t_input_arbiter_note_provider_pair call
+ * (attaches to the most recently noted provider candidate).
+ *
+ * @p devs / @p count is the provider's whole device array as returned by
+ * @ref xrt_input_plugin_iface::create_devices; the arbiter picks the one
+ * device of type @ref XRT_DEVICE_TYPE_NAVIGATION out of it. A provider
+ * may supply at most one — more than one is a provider bug, so the
+ * arbiter warns and takes the first. A provider without one has no rig
+ * candidate and is simply skipped by the rig walk.
+ *
+ * The rig role then follows the same presence walk as the hands: the
+ * highest-priority present candidate that supplies a navigation device
+ * wins. There is no qwerty candidate here — the runtime's own fly camera
+ * IS the floor, and it is expressed as `xrt_system_roles::rig == -1`
+ * (ADR-034 Amendment 4, pending).
+ */
+void
+t_input_arbiter_note_provider_navigation(struct xrt_device *const *devs, uint32_t count);
 
 /*!
  * Record the qwerty fallback's left/right emulated controllers. Either

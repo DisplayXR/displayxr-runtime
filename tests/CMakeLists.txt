@@ -38,6 +38,7 @@ set(tests
     tests_aux_zone_canvas
     tests_comp_rear_budget
     tests_oxr_weave_latch
+    tests_input_arbiter_rig
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile)
@@ -129,6 +130,22 @@ if(TARGET tests_oxr_view_space)
 		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
 	endif()
 endif()
+
+# #1380 — the rig (navigation) role in the input arbiter. The arbiter is pure
+# decision logic over a candidate table, so the unit compiles it straight in
+# (like tests_comp_rear_budget does) rather than linking the target_lists
+# library, which would drag the whole plug-in loader and its registry probing
+# into a test that needs no plug-in, no device and no display.
+# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the vendor plug-in's signing recipe
+# builds this runtime as a SUB-PROJECT, and a target_sources() path resolved
+# against the wrong root is a hard configure error.
+target_sources(
+	tests_input_arbiter_rig PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_rig PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_rig PRIVATE xrt-interfaces aux_os)
 
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point

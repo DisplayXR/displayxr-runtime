@@ -276,6 +276,7 @@ t_builder_add_input_provider_devices(struct xrt_system_devices *xsysd,
 		// re-resolve for the life of the process.
 		t_input_arbiter_note_provider_pair(iface, inst, priority, prov_left, prov_right);
 		t_input_arbiter_note_provider_hand_tracking(ht_ul, ht_ur, ht_cl, ht_cr);
+		t_input_arbiter_note_provider_navigation(devs, count);
 
 		if (first_left == NULL) {
 			first_left = prov_left;
