@@ -17,6 +17,12 @@ name: lint
 #   in-tree) are allowed here. Catches stale pre-migration branches
 #   re-adding `docs/vendors/leia/` on merge.
 #
+# - CNSDK pin guard: versions.json[cnsdk_services] and build-android.yml's
+#   CNSDK_TAG name the SAME LeiaInc/CNSDK release (different assets from
+#   it). Drift there is invisible until hardware: the loader shim refuses a
+#   plug-in built against another apiVersion and every in-process app
+#   silently runs in 2D. See scripts/check_cnsdk_pins.py.
+#
 # Add other lightweight lint jobs here as needed (yaml validity,
 # CLAUDE.md presence, etc.).
 
@@ -102,3 +108,29 @@ jobs:
             exit 1
           fi
           echo "docs/vendors/ is index-only. ✓"
+
+  cnsdk-pin-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: CNSDK pins name one release
+        # Pure file read of two paths in THIS repo -- no network, no token, no
+        # build, ~20 s. That is why it lives in lint.yml (which runs on every
+        # PR and every branch push) rather than behind build-android.yml's
+        # DetectChanges/docs_only short-circuit: it costs about what the
+        # short-circuit itself costs, so gating it would buy nothing, and
+        # lint.yml carries no docs_only logic to break.
+        #
+        # Scope is 1 <-> 2 by design. The third pin -- the CNSDK the pinned
+        # leia_plugin was built against -- is already asserted from the
+        # BINARIES by build-android.yml's "Inspect APK contents" step (bundled
+        # loader .so version == the cnsdk-android-<ver> string the plug-in .so
+        # embeds). Scraping another repo's workflow YAML over the network would
+        # be a weaker duplicate of that. Rationale in full: the docstring of
+        # scripts/check_cnsdk_pins.py.
+        run: python3 scripts/check_cnsdk_pins.py

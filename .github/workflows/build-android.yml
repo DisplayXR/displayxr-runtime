@@ -154,6 +154,11 @@ jobs:
       # that can actually report it under that path. It also publishes
       # leia_interlacer_get_last_weave_result in interlacer.h, which is the
       # entry point leia-plugin #230 reads by name.
+      # Bumping this? versions.json[cnsdk_services] pins the SAME release
+      # (its Android service APKs, for the tablet bundle) and must move with
+      # it. lint.yml's cnsdk-pin-guard job fails the PR if they drift; the
+      # Inspect-APK step below covers the third pin (the plug-in's own CNSDK)
+      # from the artifacts.
       CNSDK_TAG: v0.10.68
 
     steps:
