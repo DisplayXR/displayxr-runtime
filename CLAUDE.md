@@ -80,6 +80,8 @@ Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). 
 - `XR_DXR_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallDXR`
 - `XR_DXR_depth_budget` — advisory **rear depth budget**: how far behind the display plane a transparent app may render (`farOffsetVH`, 0 = clip at the ZDP, 1000 = unrestricted), chained on `XrViewState` at `xrLocateViews`. The runtime owns the policy (it measures the background's horizontal-disparity cue), the DP owns pixels, the app owns geometry — ADR-040
 
+The list above is highlights, not the catalog — **`docs/specs/extensions/index.json` is the catalog**: one hand-written note (group, title, one-line summary) per published extension, joined to the `XR_DXR_*.h` headers by `scripts/gen_extensions_index.py`. It generates the `displayxr-extensions` mirror's `README.md` + machine-readable `extensions.json`, and `displayxr-website` merges its longer editorial prose onto that by name — so adding a header is all it takes for an extension to appear on every public surface. `lint.yml` runs `--check` on every PR, so a header with no note (or a note with no header) fails the build. That guard exists because the mirror's README was a frozen heredoc that documented 5 of 16 extensions for months (displayxr-extensions#2).
+
 Specs: `docs/specs/extensions/`. Eye-tracking MANAGED vs MANUAL contract: `docs/specs/vendor/eye-tracking-modes.md`.
 
 ## Build
@@ -235,7 +237,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 | Shell | `displayxr-shell-pvt` → `displayxr-shell-releases` | `/dxr-release` or `git tag` → `publish-shell-releases.yml` builds + cross-publishes + dispatches `versions-bump`. Auth via `displayxr-publish-bot` GitHub App (`.secrets/displayxr-publish-bot.pem` backup; see `.secrets/NOTE.md`). |
 | Leia SR plug-in | `displayxr-leia-plugin` | `/dxr-release` → builds DLL + installer + dispatches `versions-bump` with ABI gate (ADR-020). |
 | MCP framework | `displayxr-mcp` | `/dxr-release` → matrix build + dual-platform installers (`DisplayXRMCPSetup-*.exe` NSIS + `DisplayXRMCP-*.pkg` productbuild) + dispatches `versions-bump`. |
-| Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main. No tag. |
+| Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main. No tag. Its `README.md` + `extensions.json` are **generated** from the headers joined to `docs/specs/extensions/index.json` (see below). |
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
 | Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. On release, uploads `DisplayXRBundle-*.exe` to OneDrive (the sole OneDrive upload point; runtime CI no longer does). |
 
