@@ -359,13 +359,14 @@ feedback loops — the always-on `measured_r_ns` residual behind `set_frame_timi
 On the Unity avatar over the `#1264` same-adapter reroute onto the d3d11 fill arm,
 `GetLastPresentCount` runs **10–14 presents ahead of `stats.PresentCount`** for the whole
 session, so the ring never joins (0.00% of ~14,000 sampled weaves, two independent replays);
-on this box's chains it joins 85–99%. Three consequences, all fixed in the same change:
+on this box's chains it joins 67–100% (avatar 72–73% median, cube 100%). Three consequences, all fixed in the same change:
 the always-on residual was never refreshed there yet was handed to the DP as fresh every
 frame (the getter now reports 0 = unknown once the value is 250 ms old); the learned offset
 learned from the few frames whose queue momentarily fell inside the ring — a sub-population
 the instrument selected — and latched +3 (a 66 ms horizon, clamped to 60 by the DP) in 3 of
-5 legs (an epoch now decides only when it resolved ≥ 50% of the horizons it armed, otherwise
-the loop stays where it is and says so once); and a window that resolved nothing printed as
+5 legs (an epoch now decides only when it resolved ≥ 50% of the horizons it armed — a rate guard,
+one decision per covered epoch — otherwise the loop stays where it is and says so once, also
+when nothing resolves at all); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
 `join N/M (P%)` and `present gap min..max (mean)` so an unreachable arm is visible in the
 log itself. Whether that arm's 13-present-deep counter lag is a real 13-frame pipeline or a

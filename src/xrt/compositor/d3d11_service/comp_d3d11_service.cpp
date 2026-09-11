@@ -3408,6 +3408,10 @@ struct d3d11_multi_compositor
 	 * through the panel DP and presents the texture itself — can be given.
 	 */
 	uint64_t panel_r_ns;
+	//! QPC when panel_r_ns was last written (0 = never). The ADR-029
+	//! client-texture path replays panel_r_ns with no chain of its own, so it
+	//! needs an age bound of its own; 250 ms, like the accessor that fills it.
+	uint64_t panel_r_qpc;
 
 	//! #918 PR 6 — adaptive-ingress source identity of @ref crop_texture.
 	void *crop_share_handle;
@@ -13475,7 +13479,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		 */
 		if (weave_lat != nullptr) {
 			weave_lat->mark_weave(weave_lat_site);
-			mc->panel_r_ns = weave_lat->measured_r_ns;
+			// Fresh-or-0: a residual the join has not refreshed for 250 ms is
+			// "unknown" to the DP, not a live measurement (Arc-box leg).
+			mc->panel_r_ns = weave_lat->measured_weave_ns_fresh();
+			LARGE_INTEGER pq;
+			QueryPerformanceCounter(&pq);
+			mc->panel_r_qpc = (uint64_t)pq.QuadPart;
 		}
 		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
 		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
@@ -16436,7 +16445,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		pipeline_dp_set_encoding(
 		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
 		mc->weave_lat.mark_weave("workspace");
-		mc->panel_r_ns = mc->weave_lat.measured_r_ns;
+		mc->panel_r_ns = mc->weave_lat.measured_weave_ns_fresh(); // fresh-or-0, see above
+		{
+			LARGE_INTEGER pq;
+			QueryPerformanceCounter(&pq);
+			mc->panel_r_qpc = (uint64_t)pq.QuadPart;
+		}
 		// Timing feedback: measured weave→scanout of the last completed frame
 		// (0 = unknown ⟹ DP heuristic) + panel period, for the vendor eye
 		// predictor's exact horizon.
@@ -18267,8 +18281,18 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		// and no PresentCount to correlate against. The panel's last measured
 		// residual (from whichever chain last wove AND presented) is the honest
 		// input, and is what the shared file-scope log used to supply by accident.
-		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
-		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		{
+			// Replayed value: bound its age too (the chain that wrote it may
+			// have stopped weaving). 0 = unknown -> DP heuristic.
+			uint64_t replay_r = mc->panel_r_ns;
+			LARGE_INTEGER pq;
+			QueryPerformanceCounter(&pq);
+			if (mc->panel_r_qpc == 0 || (uint64_t)pq.QuadPart - mc->panel_r_qpc > mc->weave_lat.freq() / 4) {
+				replay_r = 0;
+			}
+			xrt_display_processor_d3d11_set_frame_timing(dp, replay_r,
+			                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		}
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv, c->pipe_content_w,
 		                                          c->pipe_content_h, cols, rows, DXGI_FORMAT_R8G8B8A8_UNORM,
 		                                          target_w, target_h, 0, 0, 0, 0);
@@ -21007,7 +21031,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		g_weave_latency_standalone.mark_weave("standalone");
 		// Timing feedback (see workspace path above).
 		xrt_display_processor_d3d11_set_frame_timing(
-		    c->render.display_processor, g_weave_latency_standalone.measured_r_ns,
+		    c->render.display_processor, g_weave_latency_standalone.measured_weave_ns_fresh(),
 		    (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
 		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,

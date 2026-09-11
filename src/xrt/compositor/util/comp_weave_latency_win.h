@@ -112,7 +112,6 @@ struct weave_latency_log
 	//! GetLastPresentCount and stats.PresentCount at each sample. A window that
 	//! resolves nothing used to print as a flawless one (residual = the empty
 	//! histogram's mode, wrong-slot 0, |err| 0.00); it now prints NO JOIN.
-	uint32_t hz_armed = 0;
 	uint32_t hz_gap_min = 0;
 	uint32_t hz_gap_max = 0;
 	uint64_t hz_gap_sum = 0;
@@ -171,11 +170,39 @@ struct weave_latency_log
 	 * epoch, and only let an epoch decide when it resolved at least half of
 	 * them. Below that the loop stays where it is (0 until it ever sees a
 	 * covered epoch = the pre-#1437 feed), and says so once.
+	 *
+	 * This is a RATE guard, not a population guard: a covered epoch buys one
+	 * decision (one period, #1440) for the window that overlaps it, so an arm
+	 * that bursts a covered epoch every ~10 s can still step over a long
+	 * session. An epoch also closes on 1024 armed horizons (~17 s at 60/s)
+	 * so an arm that resolves nothing still reaches the "starved" verdict and
+	 * its one WARN — otherwise the only witness is the trace row.
 	 */
 	uint32_t po_weaves_seen = 0; // horizons armed since the epoch started
 	uint32_t po_epoch_obs = 0;   // observations in the current epoch (0..31)
 	bool po_coverage_ok = false; // the last completed epoch covered >= 50%
 	bool po_starved_logged = false;
+
+	//! Close the coverage epoch when it has 32 observations, or (from
+	//! predict, `from_arm`) when 1024 horizons were armed without reaching 32.
+	void
+	po_epoch_close(bool from_arm)
+	{
+		if (po_epoch_obs < 32 && !(from_arm && po_weaves_seen >= 1024)) {
+			return;
+		}
+		po_coverage_ok = (po_epoch_obs >= 32 && po_weaves_seen <= 64); // 32 resolved of <= 64 armed
+		if (!po_coverage_ok && !po_starved_logged) {
+			po_starved_logged = true;
+			U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%) — the offset "
+			        "loop will not learn from this arm (stays at %+d; present-count statistics do "
+			        "not reach the ring here)",
+			        po_epoch_obs, po_weaves_seen,
+			        100.0 * (double)po_epoch_obs / (double)(po_weaves_seen ? po_weaves_seen : 1), po_applied);
+		}
+		po_epoch_obs = 0;
+		po_weaves_seen = 0;
+	}
 
 	void
 	po_observe(int k, uint64_t period_ns)
@@ -193,19 +220,8 @@ struct weave_latency_log
 		po_win_head = (po_win_head + 1) % 32;
 		// Epoch bookkeeping: every 32 observations, ask how many horizons had
 		// to be armed to get them. Half or more = the join sees the pipeline.
-		if (++po_epoch_obs >= 32) {
-			po_coverage_ok = (po_weaves_seen <= 64); // 32 resolved of <= 64 armed
-			if (!po_coverage_ok && !po_starved_logged) {
-				po_starved_logged = true;
-				U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%) — the offset "
-				        "loop will not learn from this arm (stays at %+d; present-count statistics do "
-				        "not reach the ring here)",
-				        32u, po_weaves_seen, 3200.0 / (double)(po_weaves_seen ? po_weaves_seen : 1),
-				        po_applied);
-			}
-			po_epoch_obs = 0;
-			po_weaves_seen = 0;
-		}
+		po_epoch_obs++;
+		po_epoch_close(false);
 		if (po_win_n < 32) {
 			po_win_n++;
 			return; // decide only on a full window
@@ -374,10 +390,17 @@ struct weave_latency_log
 	}
 
 	/*!
-	 * measured_r_ns for the DP's set_frame_timing loop, or 0 (= unknown) when
-	 * the join has not refreshed it for 250 ms — the plug-in treats any
-	 * non-zero value it is handed as fresh, so a stale one has to be withheld
-	 * here. 250 ms matches the plug-in's own freshness window.
+	 * DP-HANDOFF accessor: measured_r_ns for the DP's set_frame_timing loop,
+	 * or 0 (= unknown) when the join has not refreshed it for 250 ms — the
+	 * plug-in treats any non-zero value it is handed as fresh, so a stale one
+	 * has to be withheld here. 250 ms matches the plug-in's own window.
+	 *
+	 * Deliberately NOT used by the two runtime-internal readers of
+	 * measured_r_ns (the repaint late-weave pacer's `period - R` and
+	 * `predicted_lookahead_ns`): those already treat 0 as "keep the
+	 * fallback", and gating the repaint pacer on freshness would turn the
+	 * app-idle stretches — where repaints are the only weaves — into
+	 * "weave now". Do not "complete" this change there.
 	 */
 	uint64_t
 	measured_weave_ns_fresh()
@@ -507,7 +530,9 @@ struct weave_latency_log
 		pending_horizon_ns = horizon_ns;
 		pending_horizon_base_qpc = nowq;
 		po_weaves_seen++;
-		hz_armed++;
+		if (po_enabled == PO_ON) {
+			po_epoch_close(true);
+		}
 		return horizon_ns;
 	}
 
@@ -592,36 +617,42 @@ struct weave_latency_log
 			}
 		}
 		hz_wrong_slot = hz_resolved - hz_k_hist[mode_i];
-		const double gap_mean = hz_gap_n ? (double)hz_gap_sum / (double)hz_gap_n : 0.0;
+		// Present gap: "n/a" when GetFrameStatistics never succeeded in the
+		// window — 0..0 would read as "the ring should have joined", the
+		// empty-default trap this row exists to remove.
+		char gap[48];
+		if (hz_gap_n == 0) {
+			snprintf(gap, sizeof(gap), "n/a (no statistics)");
+		} else {
+			snprintf(gap, sizeof(gap), "%u..%u (mean %.1f)", hz_gap_min, hz_gap_max,
+			         (double)hz_gap_sum / (double)hz_gap_n);
+		}
 		if (hz_resolved == 0) {
 			// Nothing joined: the derived fields have no value, and printing
 			// their empty defaults read as a perfect window (Arc-box leg).
 			U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-			        "| NO JOIN (armed %u, resolved 0)  applied %+d  present gap %u..%u (mean %.1f)  "
+			        "| NO JOIN (armed %u, resolved 0)  applied %+d  present gap %s  "
 			        "| depth %d (%u changes)",
 			        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
 			        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
-			        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps, (double)hz_jumps / secs,
-			        hz_armed, po_applied, hz_gap_min, hz_gap_max, gap_mean, hz_depth, hz_depth_changes);
+			        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps, (double)hz_jumps / secs, hz_n,
+			        po_applied, gap, hz_depth, hz_depth_changes);
 		} else {
 			U_LOG_W(
 			    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
 			    "| join %u/%u (%.0f%%)  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  "
-			    "mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  present gap %u..%u (mean %.1f)  "
+			    "mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  present gap %s  "
 			    "| depth %d (%u changes)",
 			    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 			    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
-			    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_armed,
-			    hz_armed ? 100.0 * (double)hz_resolved / (double)hz_armed : 0.0, mode_i - 2, po_applied,
-			    hz_wrong_slot, 100.0 * (double)hz_wrong_slot / (double)hz_resolved,
-			    (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6,
-			    (double)hz_err_sum_ns / (double)hz_resolved / 1e6, (double)hz_sync_lag_sum / (double)hz_resolved,
-			    hz_gap_min, hz_gap_max, gap_mean, hz_depth, hz_depth_changes);
+			    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_n, 100.0 * (double)hz_resolved / (double)hz_n,
+			    mode_i - 2, po_applied, hz_wrong_slot, 100.0 * (double)hz_wrong_slot / (double)hz_resolved,
+			    (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6, (double)hz_err_sum_ns / (double)hz_resolved / 1e6,
+			    (double)hz_sync_lag_sum / (double)hz_resolved, gap, hz_depth, hz_depth_changes);
 		}
 		hz_depth_changes = 0;
-		hz_armed = 0;
 		hz_gap_min = 0;
 		hz_gap_max = 0;
 		hz_gap_sum = 0;
