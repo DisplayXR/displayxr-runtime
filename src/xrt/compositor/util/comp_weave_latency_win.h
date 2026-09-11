@@ -682,12 +682,21 @@ struct late_weave_governor
 	 *    fired on a single clean window re-escalated within 2-20 s in every
 	 *    measured leg;
 	 *  - a slip escalation within 30 s of a return probe is a FAILED probe
-	 *    and doubles the probe dwell (30 -> 60 -> 120 -> 300 s), exactly as
-	 *    the starvation path already does — the slip path never did, which
-	 *    is why the dwell never converged on slip-driven flaps.
+	 *    and doubles the probe dwell (30 -> 60 -> 120 -> 300 s). The
+	 *    starvation path has the same rule at 5 s; the slip path uses 30 s
+	 *    deliberately — measured re-escalations landed 2-20 s after the
+	 *    probe, and one dwell (>= 30 s) is the natural attribution window.
+	 *    The dwell never decays, so a genuinely new load arriving inside
+	 *    that window is also counted as a failure; accepted for now.
+	 *
+	 * Two things the cap must NOT do (review of #1441): surrender the
+	 * composed-chain tick-align — that yield is keyed on LATE_WEAVE_MAX_DEPTH,
+	 * not on the cap, so a need-capped depth keeps its constant phase; and
+	 * pin the depth — a probe is still allowed when the depth exceeds what
+	 * the frame cost needs, even if the slip rate never goes quiet, so the
+	 * dwell doubling (not a ratchet) is what converges a chronic slipper.
 	 */
 	int slip_cap_enabled = -1;      // DXR_LATE_WEAVE_SLIP_CAP, default 1
-	bool last_window_slipping = false;
 	int clean_windows = 0;          // consecutive slip windows below the threshold
 	uint32_t depth_changes = 0;
 	uint32_t depth_changes_suppressed = 0;
@@ -812,6 +821,7 @@ struct late_weave_governor
 		calm_frames = 0;
 		slip_marks = 0;
 		slip_count = 0;
+		clean_windows = 0;
 	}
 
 	//! May the composed-chain tick-align run this frame? (See
@@ -852,6 +862,7 @@ struct late_weave_governor
 				calm_frames = 0;
 				slip_marks = 0;
 				slip_count = 0;
+				clean_windows = 0;
 				dt_ns = 0.0;
 			}
 		}
@@ -926,7 +937,6 @@ struct late_weave_governor
 				const bool slipping = slip_count >= 10; // ~8%
 				slip_marks = 0;
 				slip_count = 0;
-				last_window_slipping = slipping;
 				clean_windows = slipping ? 0 : clean_windows + 1;
 				if (slipping) {
 					// Cap: one banked token above what the frame cost needs.
@@ -955,6 +965,12 @@ struct late_weave_governor
 						backoff_qpc = now;
 						log_change(now, freq_hz, from, "slip-rate escalation");
 						return +1;
+					}
+					if (effective < LATE_WEAVE_MAX_DEPTH) {
+						// Need-capped, not exhausted: keep the tick-align's
+						// constant phase (review of #1441 — at the cap this
+						// would otherwise ratchet the align off for 5 min).
+						return 0;
 					}
 					// Depth is exhausted — the align's hard deadline
 					// is the residual cost; yield it (see field
@@ -1016,7 +1032,11 @@ struct late_weave_governor
 			    (double)(now - backoff_qpc) * 1e9 / (double)freq_hz;
 			// Do not probe down into a pipeline the last slip window
 			// showed still slipping — that probe fails by construction.
-			const bool slip_quiet = (slip_cap_enabled != 1) || clean_windows >= 3;
+			// ...unless the depth already exceeds what the frame cost needs:
+			// then the probe is the only way down and the dwell doubling,
+			// not a ratchet, is what converges a chronic slipper.
+			const bool slip_quiet =
+			    (slip_cap_enabled != 1) || clean_windows >= 3 || effective > needed_depth();
 			if (calm_frames >= 300 && since_backoff_ns > (double)probe_dwell_ns && slip_quiet) {
 				// Step down one level at a time: the probe is what
 				// re-tests the pipeline, so it must be gentle.

@@ -101,7 +101,8 @@ agent off, untracked, 90–150 s legs, `DXR_DP_FORWARD_HORIZON_TRACE`):
 
 The governor buys ~8–12 fps on an app that cannot make rate and pays for it with a 10× worse
 slot call — the trade its own comment names as wrong for a 3D display. `SLIP_CAP` damps the
-flap (max depth 3, converging dwell) but cannot remove it while slip escalation exists; whether
+flap (the slip path stops at `needed_depth()+1`; the starvation path is uncapped and can still
+reach 4; converging dwell) but cannot remove it while slip escalation exists; whether
 slip escalation should be **off by default** (keeping only the starvation backoff for genuinely
 serialized pipelines) is the open product decision, recorded on the issue.
 
