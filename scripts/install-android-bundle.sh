@@ -150,10 +150,12 @@ for c in "${COMPONENTS[@]}"; do
   if gh release download "$TAG" -R "$REPO" -p "*.apk" -D "$WORK/apk" --clobber 2>/dev/null; then
     # Exclude the RUNTIME APK by exact path, not by an "android-arm64.apk$" suffix.
     # That suffix is not runtime-specific: the browser publishes as
-    # DisplayXR-Browser-Preview-X.Y.Z-android-arm64.apk, so the old filter dropped it and
-    # the browser was SILENTLY never installed -- the download SUCCEEDED, so the
-    # desktop-only fallback below never fired either. Demos were unaffected (their names
-    # carry no such suffix), which is why this went unnoticed.
+    # DisplayXR-Browser-X.Y.Z-android-arm64.apk (and, before browser-pvt#120 retired the
+    # preview channel, DisplayXR-Browser-Preview-X.Y.Z-android-arm64.apk), so the old
+    # filter dropped it and the browser was SILENTLY never installed -- the download
+    # SUCCEEDED, so the desktop-only fallback below never fired either. Demos were
+    # unaffected (their names carry no such suffix), which is why this went unnoticed.
+    # This exclusion is name-agnostic, so BOTH browser APK names work unchanged.
     A=$(ls -t "$WORK"/apk/*.apk | command grep -vF "$RUNTIME_APK" | head -1)
     [ -n "$A" ] && { APPS+=("$A"); echo "   $NAME: $(basename "$A")"; }
   else
@@ -162,6 +164,9 @@ for c in "${COMPONENTS[@]}"; do
     # (0.1.18+) would silently install nothing. Fall back to the newest
     # release that actually HAS one, and say so — an older-but-present
     # browser beats "--with-browser installed no browser".
+    # The fallback selects by *asset extension*, never by name or tag shape, so
+    # it spans the browser's channel change (browser-pvt#120: preview-X.Y.Z ->
+    # vX.Y.Z from v1.0.0) with no edit here.
     FB_TAG=""; FB_ASSET=""
     for t in $(gh release list -R "$REPO" --limit 15 --json tagName -q '.[].tagName' 2>/dev/null); do
       a=$(gh release view "$t" -R "$REPO" --json assets \

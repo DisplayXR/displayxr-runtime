@@ -165,7 +165,7 @@ table is regenerated daily from the live org, so this one is a convenience copy.
 | [displayxr-unity-samples](https://github.com/DisplayXR/displayxr-unity-samples) | Unity sample projects + shared installer (consolidates the archived `displayxr-unity-test*` repos) |
 | [displayxr-unreal](https://github.com/DisplayXR/displayxr-unreal) | Unreal Engine plugin |
 | **Web** | |
-| [displayxr-browser](https://github.com/DisplayXR/displayxr-browser) | Developer-preview Chromium that weaves glasses-free inline 3D (Windows · Android) |
+| [displayxr-browser](https://github.com/DisplayXR/displayxr-browser) | Chromium-based browser that weaves glasses-free inline 3D (Windows · Android) |
 | [displayxr-web](https://github.com/DisplayXR/displayxr-web) | Inline-3D web samples + the `@displayxr/inline3d` JS SDK |
 | **Demos** | |
 | [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |

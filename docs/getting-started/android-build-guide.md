@@ -91,7 +91,7 @@ emit stale links that look perfectly correct at the far end.
 from a *matched pair*: the client↔service check in
 `ipc_client_connection.c::ipc_client_check_git_tag` is an exact string compare,
 not a minimum-version floor. A hand-assembled list that pairs, say, runtime
-v2.14.10 with browser preview-0.1.22 fails every `xrCreateInstance` from the
+v2.14.10 with browser v1.0.0 fails every `xrCreateInstance` from the
 browser — and because Android demo apps run **in-process** and never cross that
 IPC boundary, the demos keep weaving while only the browser goes black. It reads
 as "the browser is broken", not "these two builds disagree". Two testers hit

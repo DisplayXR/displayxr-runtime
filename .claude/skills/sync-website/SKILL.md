@@ -249,8 +249,11 @@ Judgment notes that keep the feed credible:
   input vendor onboarding, a new tracking source. A vendor's own version bump is
   not news. The homepage's *own prose* stays vendor-neutral (website CLAUDE.md);
   a factual news item naming a vendor does not violate that.
-- **Prereleases and preview builds can be news** (the browser preview is), but
-  say so in the blurb — "preview", "ahead of GA" — rather than implying GA.
+- **Prereleases and preview builds can be news**, but say so in the blurb —
+  "preview", "ahead of GA" — rather than implying GA. Note the browser is **no
+  longer** an example of this: browser-pvt#120 retired its Developer-Preview
+  channel at v1.0.0, so a browser release is a normal release and must not be
+  blurbed as a preview.
 - **Don't date it "today".** `date` is when it became true for a user: the
   release's `date` field, or the upstream merge date for a standards item.
 - **When the pool is thin, resist promoting filler to `banner`.** The ticker
@@ -387,7 +390,7 @@ Gaps found:
   • ecosystem    — displayxr-foo → added card (category: tools)
   • extensions   — XR_EXT_bar → added card (group: display)
   • news         — runtime@v2.3.0 → 2 banner items (input providers, CTS in CI)
-                   browser@preview-0.1.7 → 1 banner item
+                   browser@v1.0.0 → 1 banner item
 Skipped (judgment):
   • ADR-019 — internal vendor-isolation rule, not user-facing
   • displayxr-unity-test-2d-ui — test fork, not featured

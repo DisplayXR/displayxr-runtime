@@ -12,7 +12,7 @@
 # Usage:
 #   ./scripts/setup-displayxr.sh                     # runtime (+ bundled sim-display)
 #   ./scripts/setup-displayxr.sh --with mcp          # also DisplayXR MCP Tools
-#   ./scripts/setup-displayxr.sh --with browser      # also DisplayXR Browser (Windows-only today)
+#   ./scripts/setup-displayxr.sh --with browser      # also DisplayXR Browser (opt-in; Windows-only today)
 #   ./scripts/setup-displayxr.sh --with-demos        # also install each demo's prebuilt release
 #   ./scripts/setup-displayxr.sh --with-demo-sources # also clone each demo's source into demos/
 #   ./scripts/setup-displayxr.sh --dry-run           # print plan, install nothing
@@ -57,11 +57,11 @@ Usage: $0 [flags]
 
   --with mcp        Also install DisplayXR MCP Tools (when a macOS
                     asset is available; warn+skip otherwise).
-  --with browser    Also install the DisplayXR Browser developer preview.
-                    Windows-only today, so this warn+skips here. Opt-in on
-                    purpose: the preview is rebased ~monthly onto Chrome
-                    stable but is NOT patched to Chrome's mid-cycle security
-                    cadence, so it is never installed by default.
+  --with browser    Also install the DisplayXR Browser — a Chromium-based
+                    browser that weaves glasses-free inline 3D. Windows-only
+                    today, so this warn+skips here. Opt-in on purpose: it is a
+                    separate browser, so you ask for it by name; it is never
+                    installed by default.
   --with-demos      Also install each demo's prebuilt release asset
                     (no build needed — same install path as the runtime).
                     Demos without a release asset for this OS are skipped.

@@ -26,7 +26,7 @@ curl -fsSLO https://raw.githubusercontent.com/DisplayXR/displayxr-runtime/main/s
 chmod +x install-android-bundle.sh
 ./install-android-bundle.sh                 # runtime (Leia) + all five demos
 ./install-android-bundle.sh --list          # show what would install, install nothing
-./install-android-bundle.sh --with-browser  # + DisplayXR Browser preview
+./install-android-bundle.sh --with-browser  # + DisplayXR Browser
 ```
 
 It works from a clone or standalone (it fetches `versions.json` and
