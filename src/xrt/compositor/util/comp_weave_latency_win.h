@@ -107,6 +107,16 @@ struct weave_latency_log
 	int64_t hz_err_sum_ns = 0;    // signed, to see a systematic bias
 	int hz_depth = 0;             // governor depth at the last present (0 = no governor)
 	uint32_t hz_depth_changes = 0;
+	//! Join coverage + present gap (Arc-box leg, 2026-09-11): how many horizons
+	//! were ARMED in the window vs how many RESOLVED, and the distance between
+	//! GetLastPresentCount and stats.PresentCount at each sample. A window that
+	//! resolves nothing used to print as a flawless one (residual = the empty
+	//! histogram's mode, wrong-slot 0, |err| 0.00); it now prints NO JOIN.
+	uint32_t hz_armed = 0;
+	uint32_t hz_gap_min = 0;
+	uint32_t hz_gap_max = 0;
+	uint64_t hz_gap_sum = 0;
+	uint32_t hz_gap_n = 0;
 	uint64_t hz_sync_lag_sum = 0; // sum of (SyncRefreshCount - PresentRefreshCount)
 	//! Histogram of round(err / period), k in [-2, +4] (clamped): the MODE is
 	//! the pipeline's constant offset (a composed chain adds a whole DWM
@@ -150,6 +160,22 @@ struct weave_latency_log
 	uint32_t po_changes = 0;
 	uint64_t po_last_log_ns = 0;
 	bool po_clamp_logged = false;
+	/*!
+	 * Join-coverage gate (Arc-box leg, 2026-09-11). The window is 32
+	 * OBSERVATIONS, and an observation exists only when the join resolves.
+	 * On an arm the join cannot reach (present counter 13 behind the ring),
+	 * the only frames that ever resolve are the ones whose queue momentarily
+	 * fell inside the ring — a sub-population the instrument selected, not a
+	 * sample of the pipeline. Learning from it latched +3 (a 66 ms horizon)
+	 * in 3 of 5 legs there. So: count the horizons ARMED per 32-observation
+	 * epoch, and only let an epoch decide when it resolved at least half of
+	 * them. Below that the loop stays where it is (0 until it ever sees a
+	 * covered epoch = the pre-#1437 feed), and says so once.
+	 */
+	uint32_t po_weaves_seen = 0; // horizons armed since the epoch started
+	uint32_t po_epoch_obs = 0;   // observations in the current epoch (0..31)
+	bool po_coverage_ok = false; // the last completed epoch covered >= 50%
+	bool po_starved_logged = false;
 
 	void
 	po_observe(int k, uint64_t period_ns)
@@ -165,9 +191,27 @@ struct weave_latency_log
 		}
 		po_win[po_win_head] = (int8_t)k;
 		po_win_head = (po_win_head + 1) % 32;
+		// Epoch bookkeeping: every 32 observations, ask how many horizons had
+		// to be armed to get them. Half or more = the join sees the pipeline.
+		if (++po_epoch_obs >= 32) {
+			po_coverage_ok = (po_weaves_seen <= 64); // 32 resolved of <= 64 armed
+			if (!po_coverage_ok && !po_starved_logged) {
+				po_starved_logged = true;
+				U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%) — the offset "
+				        "loop will not learn from this arm (stays at %+d; present-count statistics do "
+				        "not reach the ring here)",
+				        32u, po_weaves_seen, 3200.0 / (double)(po_weaves_seen ? po_weaves_seen : 1),
+				        po_applied);
+			}
+			po_epoch_obs = 0;
+			po_weaves_seen = 0;
+		}
 		if (po_win_n < 32) {
 			po_win_n++;
 			return; // decide only on a full window
+		}
+		if (!po_coverage_ok) {
+			return; // a window the join only half-saw decides nothing
 		}
 		uint32_t hist[7] = {0, 0, 0, 0, 0, 0, 0};
 		for (uint32_t i = 0; i < 32; i++) {
@@ -281,6 +325,13 @@ struct weave_latency_log
 	int ring_head = 0;
 	int ring_count = 0;
 	uint64_t measured_r_ns = 0; // last completed frame's weave→scanout; 0 = unknown
+	//! QPC of the last measured_r_ns update. The Arc-box leg (Suki, 2026-09-11)
+	//! found an arm where GetLastPresentCount runs 10-14 presents ahead of
+	//! stats.PresentCount, so the 8-entry ring never joins and measured_r_ns
+	//! is never refreshed — yet the DP was still handed the last value every
+	//! frame and treated it as fresh for the whole session. The getter now
+	//! reports 0 (unknown) once the value is older than 250 ms.
+	uint64_t measured_r_qpc = 0;
 
 	/*
 	 * #206 forward horizon — the vblank GRID, captured always-on from DXGI
@@ -320,6 +371,24 @@ struct weave_latency_log
 			qpc_freq = (uint64_t)f2.QuadPart;
 		}
 		return qpc_freq;
+	}
+
+	/*!
+	 * measured_r_ns for the DP's set_frame_timing loop, or 0 (= unknown) when
+	 * the join has not refreshed it for 250 ms — the plug-in treats any
+	 * non-zero value it is handed as fresh, so a stale one has to be withheld
+	 * here. 250 ms matches the plug-in's own freshness window.
+	 */
+	uint64_t
+	measured_weave_ns_fresh()
+	{
+		if (measured_r_ns == 0 || measured_r_qpc == 0) {
+			return 0;
+		}
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		const uint64_t age = (uint64_t)now.QuadPart - measured_r_qpc;
+		return (age > freq() / 4) ? 0 : measured_r_ns;
 	}
 
 	bool
@@ -437,6 +506,8 @@ struct weave_latency_log
 		// against the vblank this weave really lands on.
 		pending_horizon_ns = horizon_ns;
 		pending_horizon_base_qpc = nowq;
+		po_weaves_seen++;
+		hz_armed++;
 		return horizon_ns;
 	}
 
@@ -521,19 +592,40 @@ struct weave_latency_log
 			}
 		}
 		hz_wrong_slot = hz_resolved - hz_k_hist[mode_i];
-		U_LOG_W(
-		    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
-		    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-		    "| resolved %u  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  mean |err| %.2f ms  "
-		    "bias %+.2f ms  sync-flip lag %.2f refr  | depth %d (%u changes)",
-		    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
-		    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
-		    hz_jumps, (double)hz_jumps / secs, hz_resolved, mode_i - 2, po_applied, hz_wrong_slot,
-		    hz_resolved ? 100.0 * (double)hz_wrong_slot / (double)hz_resolved : 0.0,
-		    hz_resolved ? (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
-		    hz_resolved ? (double)hz_err_sum_ns / (double)hz_resolved / 1e6 : 0.0,
-		    hz_resolved ? (double)hz_sync_lag_sum / (double)hz_resolved : 0.0, hz_depth, hz_depth_changes);
+		const double gap_mean = hz_gap_n ? (double)hz_gap_sum / (double)hz_gap_n : 0.0;
+		if (hz_resolved == 0) {
+			// Nothing joined: the derived fields have no value, and printing
+			// their empty defaults read as a perfect window (Arc-box leg).
+			U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
+			        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
+			        "| NO JOIN (armed %u, resolved 0)  applied %+d  present gap %u..%u (mean %.1f)  "
+			        "| depth %d (%u changes)",
+			        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
+			        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
+			        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps, (double)hz_jumps / secs,
+			        hz_armed, po_applied, hz_gap_min, hz_gap_max, gap_mean, hz_depth, hz_depth_changes);
+		} else {
+			U_LOG_W(
+			    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
+			    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
+			    "| join %u/%u (%.0f%%)  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  "
+			    "mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  present gap %u..%u (mean %.1f)  "
+			    "| depth %d (%u changes)",
+			    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
+			    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
+			    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_armed,
+			    hz_armed ? 100.0 * (double)hz_resolved / (double)hz_armed : 0.0, mode_i - 2, po_applied,
+			    hz_wrong_slot, 100.0 * (double)hz_wrong_slot / (double)hz_resolved,
+			    (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6,
+			    (double)hz_err_sum_ns / (double)hz_resolved / 1e6, (double)hz_sync_lag_sum / (double)hz_resolved,
+			    hz_gap_min, hz_gap_max, gap_mean, hz_depth, hz_depth_changes);
+		}
 		hz_depth_changes = 0;
+		hz_armed = 0;
+		hz_gap_min = 0;
+		hz_gap_max = 0;
+		hz_gap_sum = 0;
+		hz_gap_n = 0;
 
 		hz_win_start_ns = now_ns;
 		hz_min_ns = 0;
@@ -1235,6 +1327,19 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 				}
 				hz_depth = gov->effective;
 			}
+			// Present gap: how far the flipped counter trails the submitted one.
+			// >= 8 for a whole window means the ring can never join (Arc arm: 10-14).
+			if (present_count >= stats.PresentCount) {
+				const uint32_t gap = present_count - stats.PresentCount;
+				if (hz_gap_n == 0 || gap < hz_gap_min) {
+					hz_gap_min = gap;
+				}
+				if (gap > hz_gap_max) {
+					hz_gap_max = gap;
+				}
+				hz_gap_sum += gap;
+				hz_gap_n++;
+			}
 			// #206: capture the vsync-locked vblank grid, always-on. The
 			// period comes from the statistics themselves — SyncQPCTime
 			// delta over SyncRefreshCount delta — so 59.94 vs 60.00 is
@@ -1287,6 +1392,7 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						    (uint64_t)((double)((uint64_t)stats.SyncQPCTime.QuadPart -
 						                        ring[idx].qpc) *
 						               1000000000.0 / (double)freq());
+						measured_r_qpc = (uint64_t)now.QuadPart;
 					}
 					// #867: xrWaitFrame's promise vs this frame's real
 					// photon time. os_monotonic_get_ns() is QPC scaled

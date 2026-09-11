@@ -801,7 +801,7 @@ extern "C" uint64_t
 comp_d3d11_target_get_measured_weave_ns(struct comp_d3d11_target *target)
 {
 	(void)target;
-	return g_weave_latency_d3d11.measured_r_ns;
+	return g_weave_latency_d3d11.measured_weave_ns_fresh();
 }
 
 extern "C" uint64_t
