@@ -353,6 +353,27 @@ vblank DXGI reports for the same present (`DXR_DP_FORWARD_HORIZON_TRACE=1`, exac
   11 quiet windows; under CPU starvation it tracked the governor to `+2` and back, wrong-slot
   1–9% locked versus 6–58% before.
 
+**The join is the instrument, and it does not reach every arm (Arc-box leg, 2026-09-11).** Both
+feedback loops — the always-on `measured_r_ns` residual behind `set_frame_timing`, and the
+#1437 learned offset — join a weave to its flip by exact `PresentCount` into an 8-entry ring.
+On the Unity avatar over the `#1264` same-adapter reroute onto the d3d11 fill arm,
+`GetLastPresentCount` runs **10–14 presents ahead of `stats.PresentCount`** for the whole
+session, so the ring never joins (0.00% of ~14,000 sampled weaves, two independent replays);
+on this box's chains it joins 67–100% (avatar 72–73% median, cube 100%). Three consequences, all fixed in the same change:
+the always-on residual was never refreshed there yet was handed to the DP as fresh every
+frame (the getter now reports 0 = unknown once the value is 250 ms old); the learned offset
+learned from the few frames whose queue momentarily fell inside the ring — a sub-population
+the instrument selected — and latched +3 (a 66 ms horizon, clamped to 60 by the DP) in 3 of
+5 legs (an epoch now decides only when it resolved ≥ 50% of the horizons it armed — a rate guard,
+one decision per covered epoch — otherwise the loop stays where it is and says so once, also
+when nothing resolves at all); and a window that resolved nothing printed as
+a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
+`join N/M (P%)` and `present gap min..max (mean)` so an unreachable arm is visible in the
+log itself. Whether that arm's 13-present-deep counter lag is a real 13-frame pipeline or a
+statistics artefact of the composition swapchain is the open question on the Arc box; a
+deeper ring is *not* the answer (measured: ring 32 resolves and reports 9–13 periods of error,
+worse than blind).
+
 This is the levers-table shape from above with the sign reversed — a *missing* constant rather
 than a stale one — and the fix is the one the table recommends: measure the platform quantity
 and consume it, do not assume it. What the loop does **not** do is smooth the per-frame slot
