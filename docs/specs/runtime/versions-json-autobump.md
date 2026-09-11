@@ -18,12 +18,14 @@ tag per DisplayXR component:
 }
 ```
 
-Membership is decided by **"can the orchestrator install it as a
-released asset?"**, not by "is it part of the product?". That is why
-the Unity and Unreal plug-ins are deliberately absent (a UPM `.tgz`
-and a plugin folder are not installable this way) while the browser,
-which ships a Windows NSIS installer and writes its own `HKLM` marker,
-is present. See "The browser field" below for its two carve-outs.
+Membership is decided by **"can the desktop orchestrator install it as
+a released asset, or does a platform bundle pin it?"**, not by "is it
+part of the product?". That is why the Unity and Unreal plug-ins are
+deliberately absent (a UPM `.tgz` and a plugin folder are not
+installable this way) while the browser, which ships a Windows NSIS
+installer and writes its own `HKLM` marker, is present. See "The
+browser field" below for its two carve-outs, and "The `cnsdk_services`
+field" for the one field that joins on the second clause alone.
 
 Historically this file was manually curated and drifted constantly —
 the runtime field was stuck at `v1.5.0` for three releases (v1.5.1,
@@ -300,6 +302,74 @@ publish workflow (`displayxr-browser-pvt`, formerly `scripts/release.sh`) upload
 versioned real name, so the ordinary
 `DisplayXR-Browser-Preview-Setup-*.exe` glob in `components.sh` is
 correct.
+
+## The `cnsdk_services` field
+
+This is the one field that is **not** installable by
+`scripts/setup-displayxr.{sh,bat}`, and the reason the membership rule
+above grew its second clause. Left implicit it would have quietly
+contradicted the stated rule, so it is written down instead.
+
+It pins the pair of CNSDK **Android service APKs** —
+`device-service-release-*.apk` and `headTracking-service-release-*.apk`
+— which are release assets on the **private** repo `LeiaInc/CNSDK`.
+They are consumed by the CI-assembled Android tablet bundle in
+`displayxr-installer`, which needs nine APKs: runtime, browser, the
+five demos (all already pinned above), and this pair. CI downloads them
+with the existing `LEIALOFT_GITHUB_TOKEN` secret — the same token and
+the same private repo that `displayxr-leia-plugin`'s `build-android.yml`
+already uses to fetch `cnsdk-android-*.zip`.
+
+Three things about it are deliberate:
+
+**1. It is Android-only and private-source, so the desktop orchestrator
+never touches it.** `setup-displayxr.sh` resolves a pin *by name* for
+each component it was asked to install (`pin_key="$(component_field
+"$name" PIN_KEY)"` → `pinned_tag "$pin_key"`) and errors only when a
+**named** component has no pin; it does not iterate the file's fields.
+`setup-displayxr.bat` is stricter still — it reads five pins by name
+via explicit `call :read_pin` lines. Neither can trip over a field it
+does not ask for. Same for the meta-bundle: `build-bundle.{sh,bat}`
+`jq`s its pins by name.
+
+**2. It pins the TAG, not the build string.** The tag is `v0.10.68`;
+the CNSDK build string is `0.10.68+192.4e2202b` and is what appears in
+the asset filenames. Pinning the tag means the default
+`^v[0-9]+\.[0-9]+\.[0-9]+$` validator in `versions-bump.yml` accepts it
+as-is, so **no per-field `case` carve-out is needed** (the browser
+remains the only field with one). The consuming workflow derives the
+full build string from the downloaded artifact — its filename and its
+`com.leia.cnsdk.FULL_VERSION` manifest meta-data — rather than from
+hand-typed config. That is the same "prove it from the artifact"
+discipline the Android APK inspection step already applies to the
+CNSDK loader/plug-in pair, and it is why a `+build` suffix never needs
+to live in this file.
+
+**3. It must stay equal to `CNSDK_TAG` in
+`.github/workflows/build-android.yml`.** That workflow already pins the
+same `LeiaInc/CNSDK` release (`CNSDK_TAG: v0.10.68`) for a *different*
+asset out of it — `cnsdk-android-*.zip`, which supplies the Java glue
+and the transitive `.so` files for the runtime's own leia APK variant —
+and that pin must itself match the CNSDK the pinned `leia_plugin`
+release was built against (an exact match, not a floor; the loader shim
+refuses a mismatched plug-in). So the invariant is a three-way one:
+
+```
+versions.json[cnsdk_services]  ==  build-android.yml CNSDK_TAG  ==  the CNSDK
+                                                                    versions.json[leia_plugin]
+                                                                    was built against
+```
+
+Nothing dispatches a `cnsdk_services` bump today — CNSDK is a vendor
+repo with no DisplayXR release workflow — so the field moves by hand or
+via `workflow_dispatch` on `versions-bump.yml`, and whoever moves it
+must move `CNSDK_TAG` in the same change. The `Apply bump` step's field
+existence check (`versions.json has no field '<field>'`) means the field
+had to exist here before such a dispatch could ever succeed.
+
+As with every other key: adding this field does **not** enroll anything
+in `DisplayXRBundle-*.exe`. See the note at the end of "The browser
+field".
 
 ## ABI gate (the one carve-out)
 
