@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026, The DisplayXR Project and its contributors
+     SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Android 11+ package visibility: without this the client cannot see the
+         runtime package at all, so the wake silently no-ops on a filtered app. -->
+    <queries>
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+    </queries>
+
+    <application>
+        <!-- androidx.startup runs the initializer before the app's own
+             Application.onCreate, which is earlier than any Activity.onCreate —
+             so the runtime is awake before the OpenXR loader looks for it, with
+             zero code in the consuming app. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge"
+            xmlns:tools="http://schemas.android.com/tools">
+            <meta-data
+                android:name="org.displayxr.client.RuntimeWakeInitializer"
+                android:value="androidx.startup" />
+        </provider>
+    </application>
+</manifest>

@@ -1,0 +1,30 @@
+// Copyright 2026, The DisplayXR Project and its contributors
+// SPDX-License-Identifier: Apache-2.0
+// Minimal probe: no native code, no OpenXR. Its ONLY job is to depend on
+// :displayxr_client and start, so the runtime-wake path can be tested on device
+// without a full demo build. See runtime#1453.
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+android {
+    namespace 'org.displayxr.wakeprobe'
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+    defaultConfig {
+        applicationId 'org.displayxr.wakeprobe'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+        versionCode 1
+        versionName '1.0'
+    }
+    buildTypes { release { minifyEnabled false } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}
+dependencies {
+    implementation project(':src:xrt:targets:displayxr_client')
+}
