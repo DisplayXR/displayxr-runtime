@@ -812,15 +812,18 @@ a death to platform policy.
    app once" — and that is a workaround the platform should not require
    (runtime#1453, runtime#1454). It is being productised as a no-display
    `WakeActivity` in the runtime plus a client library (#1453), measured on the
-   NP02J. **Decision 2026-09-12: the wake also starts `RuntimeService`**, so the
-   runtime keeps a resident foreground service after its last client leaves —
-   the always-on model the runtime has on Windows. Two measured reasons: the
-   OEM that blocks a foreign package from *creating* the service still allows
-   binding a *running* one (the browser binds the service directly and failed
-   on the Lume Phone with the wake alone, 0 `ServiceRecord`s, and succeeded once
-   the service was up); and a live `RuntimeService` holds the process at
-   `adj 800`, outside the NP02J freezer's `adj >= 900` window. **This is
-   DisplayXR's mitigation, not the platform's fix — R8.6 stands as written.**
+   NP02J. **Decision 2026-09-12: the wake also starts `MonadoService`** (the
+   IPC service clients actually bind; `RuntimeService` is a loader-metadata
+   stub nothing binds) — the same one `startService` call `DashboardActivity`
+   has made since #1245, so the service and its lifetime are exactly what a
+   user already gets by opening the runtime app, now without opening it. Two
+   measured reasons: the OEM that blocks a foreign package from *creating* the
+   service still allows binding a *running* one (the browser binds the service
+   directly and failed on the Lume Phone with the wake alone, 0
+   `ServiceRecord`s, and succeeded once the service was up); and a live
+   `MonadoService` holds the process at `adj 800`, outside the NP02J freezer's
+   `adj >= 900` window. **This is DisplayXR's mitigation, not the platform's
+   fix — R8.6 stands as written.** (runtime#1463)
 
 **Consequence if absent (R8.6).** Every OpenXR app fails at `xrCreateInstance`
 with `XR_ERROR_RUNTIME_UNAVAILABLE` until the user opens the runtime app by hand;
