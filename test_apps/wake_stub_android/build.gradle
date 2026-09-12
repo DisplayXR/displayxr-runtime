@@ -1,0 +1,32 @@
+// Copyright 2026, The DisplayXR Project and its contributors
+// SPDX-License-Identifier: Apache-2.0
+// Stand-in for the runtime's WakeActivity, in its own package.
+//
+// The property under test -- does starting a cross-package Theme.NoDisplay
+// activity take focus from the caller, and what does it cost -- does not depend
+// on WHICH package hosts it. This lets that be measured without replacing the
+// installed runtime, which on a device whose CNSDK services are 0.10.68 would
+// mean building a runtime APK against a different CNSDK and breaking 3D. See
+// runtime#1453.
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+android {
+    namespace 'org.displayxr.wakestub'
+    compileSdk project.sharedCompileSdk
+    buildToolsVersion = buildToolsVersion
+    defaultConfig {
+        applicationId 'org.displayxr.wakestub'
+        minSdkVersion project.sharedMinSdk
+        targetSdkVersion project.sharedTargetSdk
+        versionCode 1
+        versionName '1.0'
+    }
+    buildTypes { release { minifyEnabled false } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+}

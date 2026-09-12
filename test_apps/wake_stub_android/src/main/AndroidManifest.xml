@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright 2026, The DisplayXR Project and its contributors
+     SPDX-License-Identifier: Apache-2.0 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="DXR Wake Stub">
+        <!-- Identical attributes to the runtime's WakeActivity, so what is
+             measured here is what ships there. -->
+        <activity
+            android:name="org.freedesktop.monado.openxr_runtime.WakeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleInstance" />
+    </application>
+</manifest>
