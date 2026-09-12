@@ -1379,19 +1379,30 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		// source can report a FIXED orientation while the panel rotates — a
 		// vendor DP (Leia) does this, and the live present-target extent can lag
 		// a rotation (#528) — but the app submits the zone in the CURRENT
-		// orientation. The zone is always a sub-rect of its canvas (zone ⊆
-		// canvas), so if the zone overflows wm's orientation, transpose the
-		// baseline to match. Without this the offset math mixes a landscape zone
-		// with a portrait display centre → wrong-signed vertical offset → the
-		// avatar is framed off-screen.
-		uint32_t canvas_w = wm.window_pixel_width;
-		uint32_t canvas_h = wm.window_pixel_height;
-		if ((uint32_t)(rig->zone_x_px + rig->zone_w_px) > canvas_w ||
-		    (uint32_t)(rig->zone_y_px + rig->zone_h_px) > canvas_h) {
-			uint32_t t = canvas_w;
-			canvas_w = canvas_h;
-			canvas_h = t;
-		}
+		// orientation. u_canvas_zone_canvas_dims transposes the baseline when
+		// that is the orientation the zone fits (or fits better). Without this
+		// the offset math mixes a landscape zone with a portrait display centre
+		// → wrong-signed vertical offset → the avatar is framed off-screen.
+		//
+		// It never REJECTS the zone (#1458). The old fits-or-bust gate fell back
+		// to the full-canvas frame for any zone hanging past the bottom or right
+		// edge — a tile half scrolled in, or a browser whose layout viewport has
+		// drifted from its visual one — so a square tile got the whole panel's
+		// frustum and rendered ~2.2x too wide. A rect off the canvas edge is an
+		// ordinary windowed-weave case: the Kooima only needs the zone's metres
+		// and centre offset, which u_canvas_apply_to_metrics derives for any
+		// rect. The in-process oxr_session.c zone block never had a gate.
+		struct u_canvas_rect zone_canvas = {
+		    .valid = true,
+		    .x = rig->zone_x_px,
+		    .y = rig->zone_y_px,
+		    .w = (uint32_t)rig->zone_w_px,
+		    .h = (uint32_t)rig->zone_h_px,
+		};
+		uint32_t canvas_w = 0;
+		uint32_t canvas_h = 0;
+		const bool zone_transposed = u_canvas_zone_canvas_dims(wm.window_pixel_width, wm.window_pixel_height,
+		                                                       &zone_canvas, &canvas_w, &canvas_h);
 		// Square-pixel pitch from the NATIVE panel dims (orientation-invariant),
 		// so the meters baseline matches the (possibly transposed) canvas pixels
 		// regardless of how the metrics source or the #499 swap oriented them.
@@ -1399,10 +1410,18 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
 			pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
 		}
-		// Only rebase when the data is self-consistent (pitch known, zone fits
-		// the resolved canvas); otherwise fall back to the full-canvas frame.
-		if (pitch > 0.0f && (uint32_t)(rig->zone_x_px + rig->zone_w_px) <= canvas_w &&
-		    (uint32_t)(rig->zone_y_px + rig->zone_h_px) <= canvas_h) {
+		if (pitch <= 0.0f) {
+			// The only remaining reason to keep the full-canvas frame, and it is
+			// named: no metres-per-pixel means no zone metres either.
+			static bool zone_no_pitch_logged = false;
+			if (!zone_no_pitch_logged) {
+				zone_no_pitch_logged = true;
+				IPC_WARN(s,
+				         "ZONES IPC: zone-scoped locate skipped — no pixel pitch "
+				         "(display_pixel_width=%u display_width_m=%.4f); using the full-canvas frame",
+				         s->xsysc->info.display_pixel_width, (double)s->xsysc->info.display_width_m);
+			}
+		} else {
 			wm.display_pixel_width = canvas_w;
 			wm.display_pixel_height = canvas_h;
 			wm.display_width_m = (float)canvas_w * pitch;
@@ -1411,13 +1430,6 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			wm.display_screen_top = 0;
 			wm.window_screen_left = 0;
 			wm.window_screen_top = 0;
-			struct u_canvas_rect zone_canvas = {
-			    .valid = true,
-			    .x = rig->zone_x_px,
-			    .y = rig->zone_y_px,
-			    .w = (uint32_t)rig->zone_w_px,
-			    .h = (uint32_t)rig->zone_h_px,
-			};
 			u_canvas_apply_to_metrics(&wm, &zone_canvas);
 			screen_width_m = wm.window_width_m;   // zone meters → scr below
 			screen_height_m = wm.window_height_m;
@@ -1430,10 +1442,10 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 				zone_locate_logged = true;
 				IPC_WARN(s,
 				         "ZONES IPC: first zone-scoped locate, rect=(%d,%d %dx%d) px, "
-				         "canvas=%ux%u screen=%.3fx%.3fm offset=(%.4f,%.4f)m",
+				         "canvas=%ux%u (transposed=%d) screen=%.3fx%.3fm offset=(%.4f,%.4f)m",
 				         rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px, canvas_w,
-				         canvas_h, (double)screen_width_m, (double)screen_height_m,
-				         (double)zone_eye_offset_x, (double)zone_eye_offset_y);
+				         canvas_h, zone_transposed ? 1 : 0, (double)screen_width_m,
+				         (double)screen_height_m, (double)zone_eye_offset_x, (double)zone_eye_offset_y);
 			}
 		}
 	}

@@ -43,6 +43,62 @@ struct u_canvas_rect
 };
 
 /*!
+ * Pixels a rect's far edge hangs past an extent (0 when it fits).
+ */
+static inline int64_t
+u_canvas_overhang(int64_t far_edge, uint32_t extent)
+{
+	return far_edge > (int64_t)extent ? far_edge - (int64_t)extent : 0;
+}
+
+/*!
+ * Resolve the pixel dims of the canvas a zone rect is expressed in.
+ *
+ * A zone arrives in the window-client space of the CURRENT orientation, while
+ * the metrics source may report a FIXED one — a vendor DP (Leia) does, and the
+ * live present-target extent can lag a rotation (#528). The zone is a sub-rect
+ * of its canvas in the true orientation, so the reported dims are transposed
+ * when — and only when — that reduces how far the zone hangs off the canvas.
+ *
+ * This never rejects a zone. A rect that hangs off the bottom or right edge in
+ * BOTH orientations is a partially visible window — a tile mid-scroll, or a
+ * page whose layout viewport has drifted from its visual one — and the
+ * projection it needs is still the zone's own. Reframing to the full canvas
+ * instead was #1458: a square tile drawn with the whole panel's frustum, ~2.2x
+ * too wide on a portrait phone. u_canvas_apply_to_metrics() does not need the
+ * rect inside the canvas; windowed weaving never did.
+ *
+ * @param reported_w  Canvas width the metrics source reports, px.
+ * @param reported_h  Canvas height the metrics source reports, px.
+ * @param zone        The zone rect, window-client px of the current orientation.
+ * @param[out] out_w  Canvas width to use, px (reported or transposed).
+ * @param[out] out_h  Canvas height to use, px.
+ * @return true when the dims were transposed relative to the reported ones.
+ */
+static inline bool
+u_canvas_zone_canvas_dims(
+    uint32_t reported_w, uint32_t reported_h, const struct u_canvas_rect *zone, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = reported_w;
+	*out_h = reported_h;
+	if (!zone->valid || zone->w == 0 || zone->h == 0 || reported_w == 0 || reported_h == 0) {
+		return false;
+	}
+	const int64_t right = (int64_t)zone->x + (int64_t)zone->w;
+	const int64_t bottom = (int64_t)zone->y + (int64_t)zone->h;
+	const int64_t over_reported = u_canvas_overhang(right, reported_w) + u_canvas_overhang(bottom, reported_h);
+	const int64_t over_transposed = u_canvas_overhang(right, reported_h) + u_canvas_overhang(bottom, reported_w);
+	// Strictly less: a tie (square canvas, or a zone that overhangs both the
+	// same) keeps what the source reported, so the choice is stable frame to frame.
+	if (over_transposed < over_reported) {
+		*out_w = reported_h;
+		*out_h = reported_w;
+		return true;
+	}
+	return false;
+}
+
+/*!
  * Reframe window metrics to a sub-rect canvas.
  *
  * Overrides the "window" fields in xrt_window_metrics with the canvas sub-rect

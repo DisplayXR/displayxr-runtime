@@ -35,6 +35,7 @@ set(tests
     tests_aux_route_policy
     tests_aux_overlay_lease
     tests_aux_mini_window_tell
+    tests_aux_zone_canvas
     tests_comp_rear_budget
     tests_oxr_weave_latch
 	)
