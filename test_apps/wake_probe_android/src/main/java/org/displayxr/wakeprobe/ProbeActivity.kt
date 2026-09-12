@@ -41,6 +41,35 @@ class ProbeActivity : Activity() {
         // Measure the no-display wake against an arbitrary package hosting the
         // same activity, so the property can be read without a runtime that has
         // one yet:  am start ... --es target org.displayxr.wakestub
+        // CONTROL for R8.6: does a SERVICE BIND thaw a frozen runtime? The
+        // shipping library no longer binds, so this lives here rather than in it.
+        //   am start ... --ez bind true
+        if (intent?.getBooleanExtra("bind", false) == true) {
+            val probe = Intent("org.khronos.openxr.OpenXRRuntimeService")
+                .apply { `package` = RUNTIME_PACKAGES[0] }
+            val ri = packageManager.queryIntentServices(probe, 0).firstOrNull()
+            if (ri == null) {
+                Log.w(TAG, "PROBE bind control: no runtime service resolved")
+            } else {
+                val i = Intent("org.khronos.openxr.OpenXRRuntimeService").apply {
+                    component = ComponentName(ri.serviceInfo.packageName, ri.serviceInfo.name)
+                    addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                }
+                val latch = java.util.concurrent.CountDownLatch(1)
+                val conn = object : android.content.ServiceConnection {
+                    override fun onServiceConnected(n: ComponentName?, b: android.os.IBinder?) =
+                        latch.countDown()
+                    override fun onServiceDisconnected(n: ComponentName?) {}
+                }
+                val t3 = SystemClock.uptimeMillis()
+                val accepted = bindService(i, conn, BIND_AUTO_CREATE)
+                val connected = latch.await(3000, java.util.concurrent.TimeUnit.MILLISECONDS)
+                Log.i(TAG, "PROBE bind control: bindService=$accepted connected=$connected " +
+                    "in ${SystemClock.uptimeMillis() - t3}ms")
+                try { unbindService(conn) } catch (_: Throwable) {}
+            }
+        }
+
         intent?.getStringExtra("target")?.let { target ->
             val i = Intent(Intent.ACTION_MAIN).apply {
                 component = ComponentName(target, WAKE_ACTIVITY)
