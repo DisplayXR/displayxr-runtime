@@ -764,8 +764,20 @@ a death to platform policy.
      Once frozen, a client's bind is **refused rather than thawing the target**:
      `ActivityManager: skip unfrozen when bringup … Skip bringUpServiceLocked`,
      `bindService … could not be found to bind!`, `Bind failed immediately`. Only
-     an **activity** start thaws it. (The client's subsequent `.in_process`
-     `NameNotFoundException` is fallback noise, not the cause.)
+     an **activity** start thaws it — and that is **structural, not tuning**: the
+     OEM invokes the unfreeze from inside the activity-start path
+     (`CpuFreezerManagerServiceV2.updateAppinfoFlags` ← `ActivityTaskManagerService
+     .handleFreezer` ← `ActivityTaskSupervisor.realStartActivityLocked`, then
+     `ActivityManager: sync unfroze <pid>` — same pid, thawed not restarted;
+     measured 2026-09-12) and there is **no equivalent hook on the bind path**.
+     So `BIND_IMPORTANT` / `BIND_ABOVE_CLIENT` cannot help: there is no code they
+     could reach. (The client's subsequent `.in_process` `NameNotFoundException`
+     is fallback noise, not the cause.) Freeze preconditions, also measured:
+     **on battery only** (on AC the freezer attempts every cycle and fails
+     `CommonChecker.check fail`), **`adj >= 900` only** (with `RuntimeService`
+     alive the process sits at `adj 800` and is never a candidate), and it takes
+     **4½–7½ minutes** after the last client leaves, not the ~1 minute first
+     estimated.
    - **Related-start blocking** (measured Lume Phone `PQ82A11_3D`, MyOS 13.0.16,
      runtime v2.16.24, 2026-09-12). `AutoLaunchManagerService` refuses one package
      starting or binding another package's service at all — `compType=Service …
@@ -809,8 +821,13 @@ stock provider (Google Cardboard, whose QR scanner then crashes on a device with
 no rear camera — browser-pvt#132). To the user this reads as "3D stopped working"
 some minutes after they last used it.
 
-**Acceptance test for R8.6.** With the runtime installed and *not* recently used:
-1. Wait 2 minutes with no DisplayXR app in the foreground; then
+**Acceptance test for R8.6.** With the runtime installed and *not* recently used.
+The preconditions are load-bearing — a run that skips them reports PASS on a
+device that does freeze:
+1. **On battery** (`adb shell dumpsys battery unplug` keeps adb; `dumpsys battery
+   reset` afterwards), **screen off**, no DisplayXR app in the foreground and no
+   client bound (the process must be at `adj >= 900`, not the `adj 800` a live
+   `RuntimeService` holds it at). **Wait 10 minutes**, then
    `adb shell 'RP=$(pidof org.freedesktop.monado.openxr_runtime.out_of_process); cat /sys/fs/cgroup/uid_$(stat -c %u /proc/$RP)/pid_$RP/cgroup.freeze'`
    — **PASS = `0` or absent** (never frozen), or `1` *provided step 2 passes*.
 2. Launch any DisplayXR app cold (no manual runtime launch). It must reach
