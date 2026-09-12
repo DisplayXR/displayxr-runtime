@@ -453,6 +453,10 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 
 	comp_d3d11_target *target = *target_ptr;
 
+	// #1456: the join-coverage verdict belongs to this chain; the file-scope
+	// log outlives it and serves the next session in this process.
+	g_weave_latency_d3d11.po_gate_reset();
+
 	// Stop the present watchdog (#1000). Join with a bound: if the watchdog is
 	// somehow wedged we must not hang teardown for it.
 	if (g_present_wd_thread != nullptr) {

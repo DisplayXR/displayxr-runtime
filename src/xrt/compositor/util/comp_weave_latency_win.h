@@ -202,7 +202,8 @@ struct weave_latency_log
 	 *    window; the second bad verdict then refuses and unlearns it. Bounded
 	 *    to one step, ~35 s, and the trace row shows `refused`/bad/good;
 	 *  - refuse / recover each log once per edge; the gate state is reset
-	 *    with the chain (`close()`), never carried into the next client.
+	 *    with the chain (`po_gate_reset()` from close() and from the
+	 *    in-process target destroy), never carried into the next chain.
 	 * A healthy chain (join 66-100%) reaches its first verdict after ~32-48
 	 * armed weaves and is never refused, so its lock timing is unchanged.
 	 */
@@ -257,7 +258,7 @@ struct weave_latency_log
 				// happened to see, not from the pipeline. Honest value = 0.
 				// Not counted as a numbered change; the WARN above is it.
 				po_applied = 0;
-				po_clamp_logged = false; // a later re-climb to the cap may log again
+				po_clamp_logged = false; // unlearned off the cap: a re-climb may log again
 			}
 			po_win_n = 0; // burst observations must not linger into a later allowed window
 		}
@@ -367,6 +368,26 @@ struct weave_latency_log
 		po_applied = next;
 		po_changes++;
 		po_win_n = 0; // re-measure against the new value
+		if (next < cap) {
+			po_clamp_logged = false; // left the cap: a later re-climb to it may log again
+		}
+	}
+
+	//! #1456: the coverage verdict is a property of the CHAIN, not the
+	//! process. Called from close() (service, per-client log) and from the
+	//! d3d11/d3d12 target destroy (the file-scope in-process logs survive a
+	//! session teardown and are reused by the next chain in the process), so
+	//! a refusal never follows a torn-down chain into the next one.
+	void
+	po_gate_reset()
+	{
+		po_refused = false;
+		po_bad_verdicts = 0;
+		po_good_verdicts = 0;
+		po_cov_armed = 0;
+		po_cov_resolved = 0;
+		po_coverage_ok = false;
+		po_edge_ns = 0;
 	}
 
 	uint64_t seq = 0;
@@ -754,16 +775,7 @@ struct weave_latency_log
 			f = nullptr;
 		}
 		enabled = CSV_UNPROBED;
-		// #1456: the coverage verdict is a property of the chain, not the
-		// process — a refusal must not follow a torn-down chain into the
-		// next client that reuses this log.
-		po_refused = false;
-		po_bad_verdicts = 0;
-		po_good_verdicts = 0;
-		po_cov_armed = 0;
-		po_cov_resolved = 0;
-		po_coverage_ok = false;
-		po_edge_ns = 0;
+		po_gate_reset();
 	}
 };
 
