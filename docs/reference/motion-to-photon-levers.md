@@ -364,9 +364,16 @@ the always-on residual was never refreshed there yet was handed to the DP as fre
 frame (the getter now reports 0 = unknown once the value is 250 ms old); the learned offset
 learned from the few frames whose queue momentarily fell inside the ring — a sub-population
 the instrument selected — and latched +3 (a 66 ms horizon, clamped to 60 by the DP) in 3 of
-5 legs (an epoch now decides only when it resolved ≥ 50% of the horizons it armed — a rate guard,
-one decision per covered epoch — otherwise the loop stays where it is and says so once, also
-when nothing resolves at all); and a window that resolved nothing printed as
+5 legs (coverage is judged **cumulatively since the last verdict** — 32 observations or 1024 armed
+horizons, whichever first — so a burst after a starved stretch is scored against the stretch;
+two consecutive verdicts under 50% **refuse** (sticky): the loop unlearns to +0, drops its
+window and needs three consecutive covered verdicts to decide again — and an edge in either
+direction needs 30 s since the opposite edge, so a chain flapping across the 50% line steps
+the DP's value at most once per 30 s (a second, higher threshold for recovery was tried and
+left a steady 50-66% chain refused for the life of the struct). The trace row carries
+`refused N (bad N, good N)` as the standing witness, and the gate resets with the chain. The first, per-epoch version of this gate
+re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
++0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
 `join N/M (P%)` and `present gap min..max (mean)` so an unreachable arm is visible in the
 log itself. Whether that arm's 13-present-deep counter lag is a real 13-frame pipeline or a

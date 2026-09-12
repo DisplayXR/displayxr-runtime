@@ -602,6 +602,10 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 
 	comp_d3d12_target *target = *target_ptr;
 
+	// #1456: the join-coverage verdict belongs to this chain; the file-scope
+	// log outlives it and serves the next session in this process.
+	g_weave_latency_d3d12.po_gate_reset();
+
 	release_back_buffers(target);
 
 	if (target->rtv_heap != nullptr) {
