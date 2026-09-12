@@ -3,6 +3,8 @@
 package org.displayxr.wakeprobe
 
 import android.app.Activity
+import android.content.ComponentName
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.os.SystemClock
@@ -35,6 +37,28 @@ class ProbeActivity : Activity() {
             val ok = DisplayXrRuntime.wake(this, force = true)
             Log.i(TAG, "PROBE forced wake -> $ok in ${SystemClock.uptimeMillis() - t1}ms")
         }
+
+        // Measure the no-display wake against an arbitrary package hosting the
+        // same activity, so the property can be read without a runtime that has
+        // one yet:  am start ... --es target org.displayxr.wakestub
+        intent?.getStringExtra("target")?.let { target ->
+            val i = Intent(Intent.ACTION_MAIN).apply {
+                component = ComponentName(target, WAKE_ACTIVITY)
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION or
+                        Intent.FLAG_INCLUDE_STOPPED_PACKAGES
+                )
+            }
+            val t2 = SystemClock.uptimeMillis()
+            try {
+                startActivity(i)
+                Log.i(TAG, "PROBE no-display wake of $target returned in " +
+                    "${SystemClock.uptimeMillis() - t2}ms")
+            } catch (t: Throwable) {
+                Log.w(TAG, "PROBE no-display wake of $target failed: $t")
+            }
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -59,6 +83,7 @@ class ProbeActivity : Activity() {
     private companion object {
         const val TAG = "DisplayXrClient"
         const val FLAG_STOPPED = 1 shl 21
+        const val WAKE_ACTIVITY = "org.freedesktop.monado.openxr_runtime.WakeActivity"
         val RUNTIME_PACKAGES = arrayOf(
             "org.freedesktop.monado.openxr_runtime.out_of_process",
             "org.freedesktop.monado.openxr_runtime.in_process",

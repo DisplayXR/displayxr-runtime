@@ -36,6 +36,9 @@ include ':src:xrt:targets:displayxr_client'
 include ':test_apps:wake_probe_android'
 project(':test_apps:wake_probe_android').projectDir = new File(rootDir, 'test_apps/wake_probe_android')
 
+include ':test_apps:wake_stub_android'
+project(':test_apps:wake_stub_android').projectDir = new File(rootDir, 'test_apps/wake_stub_android')
+
 include ':test_apps:cube_handle_vk_android'
 project(':test_apps:cube_handle_vk_android').projectDir = new File(rootDir, 'test_apps/handle/cube_handle_vk_android')
 
