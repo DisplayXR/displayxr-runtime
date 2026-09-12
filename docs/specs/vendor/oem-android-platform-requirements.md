@@ -812,7 +812,15 @@ a death to platform policy.
    app once" — and that is a workaround the platform should not require
    (runtime#1453, runtime#1454). It is being productised as a no-display
    `WakeActivity` in the runtime plus a client library (#1453), measured on the
-   NP02J; the no-display cost is unmeasured until a CI runtime build carries it.
+   NP02J. **Decision 2026-09-12: the wake also starts `RuntimeService`**, so the
+   runtime keeps a resident foreground service after its last client leaves —
+   the always-on model the runtime has on Windows. Two measured reasons: the
+   OEM that blocks a foreign package from *creating* the service still allows
+   binding a *running* one (the browser binds the service directly and failed
+   on the Lume Phone with the wake alone, 0 `ServiceRecord`s, and succeeded once
+   the service was up); and a live `RuntimeService` holds the process at
+   `adj 800`, outside the NP02J freezer's `adj >= 900` window. **This is
+   DisplayXR's mitigation, not the platform's fix — R8.6 stands as written.**
 
 **Consequence if absent (R8.6).** Every OpenXR app fails at `xrCreateInstance`
 with `XR_ERROR_RUNTIME_UNAVAILABLE` until the user opens the runtime app by hand;
