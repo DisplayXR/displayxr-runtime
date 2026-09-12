@@ -779,12 +779,28 @@ a death to platform policy.
      one session. A one-shot `adb` whitelist is not durable; only the OEM's own
      Settings entry is, and that is not scriptable.
 
+   Two measurements bound what the platform *does* still permit, and both point
+   at the same component. **The activity path is allowed where the service path
+   is not** — on the NP02J the same `AutoLaunchManagerService` that blocks a
+   cross-package service returns `Activity RelatedStart BlockResult = false`
+   (2026-09-12). And **`FLAG_STOPPED` is not the blocker**: on the NP02J a
+   `content query` against the runtime's broker resolves while the package is
+   `stopped=true`, starts the process, and clears the flag as a side effect; a
+   demo launched into that state reaches `xrCreateInstance → XR_SUCCESS` with no
+   wake at all. So on the Lume Phone `stopped=true` is *correlated, not causal*,
+   and its actual blocker is an open question — the leading hypothesis is a
+   fourth verdict from the same service, `compType=Provider`, which is checkable
+   in one `logcat` grep the next time that device is attached. If it holds, it is
+   an OEM policy, not a platform behaviour to live with.
+
    The runtime cannot fix any of these from its side: a foreground service was not
    sufficient against the freezer, no API choice escapes related-start blocking,
    and pruning undoes whatever an installer sets. The only thaw path an app has is
    an **activity start** — what a user does by hand when they "open the runtime
    app once" — and that is a workaround the platform should not require
-   (runtime#1453, runtime#1454).
+   (runtime#1453, runtime#1454). It is being productised as a no-display
+   `WakeActivity` in the runtime plus a client library (#1453), measured on the
+   NP02J; the no-display cost is unmeasured until a CI runtime build carries it.
 
 **Consequence if absent (R8.6).** Every OpenXR app fails at `xrCreateInstance`
 with `XR_ERROR_RUNTIME_UNAVAILABLE` until the user opens the runtime app by hand;
