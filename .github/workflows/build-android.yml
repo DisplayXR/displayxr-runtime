@@ -636,6 +636,57 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # ---- the client wake library --------------------------------------
+      # Built in the NEUTRAL leg only. The library is pure Kotlin and carries no
+      # vendor payload, so it is identical in both variants -- building it twice
+      # would race two jobs to attach the same asset name.
+      #
+      # It has to ship as an AAR rather than as source. Its manifest is load-bearing:
+      # it declares the <queries> entries without which Android 11+ package
+      # visibility hides the runtime from the client, plus the androidx.startup
+      # provider registration that makes the wake automatic. A consumer copying the
+      # two Kotlin files would have to replicate both by hand -- and hand-copied
+      # wake code drifting across five demo repos is the exact bug this replaces
+      # (#1453). An AAR merges them into the consumer's manifest.
+      - name: Build the client wake library (AAR)
+        id: clientlib
+        if: steps.build.outcome == 'success' && matrix.variant == 'neutral'
+        run: |
+          set -euo pipefail
+          ./gradlew :src:xrt:targets:displayxr_client:assembleRelease --no-daemon --stacktrace
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="dev-${GITHUB_SHA::8}"
+          AAR=$(find src/xrt/targets/displayxr_client/build/outputs/aar -name '*.aar' | head -1)
+          [ -n "$AAR" ] || { echo "::error::no AAR produced"; exit 1; }
+          mkdir -p outlib
+          cp "$AAR" "outlib/DisplayXR-Client-${VER}.aar"
+          # Fail loudly if the manifest lost either load-bearing entry: without the
+          # <queries> the wake silently no-ops on a filtered consumer, and without the
+          # initializer it never runs at all. Both are invisible at runtime.
+          unzip -p "outlib/DisplayXR-Client-${VER}.aar" AndroidManifest.xml > /tmp/m.xml
+          grep -q '<queries>' /tmp/m.xml || { echo "::error::AAR manifest lost <queries>"; exit 1; }
+          grep -q 'RuntimeWakeInitializer' /tmp/m.xml || { echo "::error::AAR manifest lost the startup initializer"; exit 1; }
+          echo "name=DisplayXR-Client-${VER}.aar" >> "$GITHUB_OUTPUT"
+          ls -la outlib
+
+      - name: Upload client wake library
+        if: steps.clientlib.outcome == 'success' && matrix.variant == 'neutral'
+        uses: actions/upload-artifact@v6
+        with:
+          name: DisplayXR-Client-AAR
+          path: outlib/*.aar
+          if-no-files-found: error
+          retention-days: 14
+
+      # Not gated on APK signing: an AAR is consumed by a build, never installed,
+      # so it carries no signature. (An unsigned APK still fails the job below.)
+      - name: Attach client wake library to GitHub release on tag
+        if: steps.clientlib.outcome == 'success' && matrix.variant == 'neutral' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: outlib/*.aar
+          fail_on_unmatched_files: true
+
       # NOTE: no generate_release_notes — build-windows.yml owns that flag.
       # The action create-or-updates, so whichever platform workflow finishes
       # first on the tag creates the release and the rest append assets.
