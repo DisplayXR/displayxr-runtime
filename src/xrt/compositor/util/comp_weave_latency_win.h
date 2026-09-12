@@ -100,7 +100,10 @@ struct weave_latency_log
 	//! match reality are correct and must not be smoothed away.
 	//! Resolved from after_present, one to a few presents after the
 	//! prediction, so a window's `resolved` lags its `n` by the resolve
-	//! depth — read the two as neighbours, not as a ratio.
+	//! depth — read the two as neighbours, not as a ratio. (The coverage
+	//! gate below does divide its own pair, but over an epoch of >= 32
+	//! resolves the lag only depresses a 100%-join chain's first verdict to
+	//! ~32/47; it cannot by itself push one under the 50% line.)
 	uint32_t hz_resolved = 0;
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
@@ -177,24 +180,40 @@ struct weave_latency_log
 	 *    comes at 32 observations OR 1024 armed horizons, whichever first, so
 	 *    a burst after a starved stretch is scored against the whole stretch,
 	 *    and an arm that resolves nothing still reaches a verdict (~17 s);
-	 *  - a verdict under 50% counts as BAD; two consecutive bad verdicts
-	 *    REFUSE (sticky): the loop unlearns to +0 (the pre-#1437 feed is the
-	 *    honest value for an arm the join cannot see) and drops its window;
-	 *  - recovery needs three consecutive verdicts at >= 66% (>= 96
-	 *    observations) — strictly harder than refusal, because the count of
-	 *    horizons armed to collect 32 resolves is negative-binomial and a
-	 *    chain near 50% would otherwise coin-flip refuse/recover every ~10 s,
-	 *    each flip a whole-period step in the value handed to the DP;
-	 *  - engage / recover each log once per transition.
+	 *  - a verdict under 50% counts as BAD and by itself blocks the next
+	 *    window; two consecutive bad verdicts REFUSE (sticky): the loop
+	 *    unlearns to +0 in one step (the pre-#1437 feed is the honest value
+	 *    for an arm the join cannot see, and handing 2-3 known-wrong values
+	 *    on the way down would be worse) and drops its window;
+	 *  - recovery needs three consecutive covered verdicts (>= 96
+	 *    observations at >= 50%);
+	 *  - the hysteresis is in TIME, not in threshold: an edge (refuse or
+	 *    recover) also needs PO_EDGE_DWELL_NS since the opposite edge, so
+	 *    the value handed to the DP steps on a gate edge at most once per
+	 *    dwell. Verdicts are cheap (a bad one closes in ~1 s at 60/s), so
+	 *    a count-only rule let a chain alternating strong/bad verdicts cycle
+	 *    every ~5 s; a second threshold for recovery instead left a steady
+	 *    50-66% chain refused for the life of the struct — on the service
+	 *    multi-compositor that is the logon session;
+	 *  - a covered verdict authorises the NEXT epoch's window (`po_coverage_ok`
+	 *    is the last verdict, latched forward). If the arm starves right
+	 *    after a covered verdict, a trickle of 32 resolves inside 1024 armed
+	 *    can still take ONE step before that epoch closes bad and drops the
+	 *    window; the second bad verdict then refuses and unlearns it. Bounded
+	 *    to one step, ~35 s, and the trace row shows `refused`/bad/good;
+	 *  - refuse / recover each log once per edge; the gate state is reset
+	 *    with the chain (`close()`), never carried into the next client.
 	 * A healthy chain (join 66-100%) reaches its first verdict after ~32-48
 	 * armed weaves and is never refused, so its lock timing is unchanged.
 	 */
+	static constexpr uint64_t PO_EDGE_DWELL_NS = 30ull * 1000ull * 1000ull * 1000ull;
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
-	bool po_coverage_ok = false;   // may the current window decide?
+	bool po_coverage_ok = false;   // did the last closed epoch cover (>= 50%)? latched forward
 	bool po_refused = false;       // sticky: two consecutive verdicts came in under 50%
 	uint32_t po_bad_verdicts = 0;  // consecutive verdicts under 50% (refusal needs 2)
-	uint32_t po_good_verdicts = 0; // consecutive verdicts at >= 66% (recovery needs 3)
+	uint32_t po_good_verdicts = 0; // consecutive verdicts at >= 50% (recovery needs 3)
+	uint64_t po_edge_ns = 0;       // last refuse/recover edge (0 = none yet); dwell anchor
 
 	//! Coverage verdict at 32 observations, or (from predict, `from_arm`) at
 	//! 1024 armed horizons without reaching 32.
@@ -204,40 +223,43 @@ struct weave_latency_log
 		if (po_cov_resolved < 32 && !(from_arm && po_cov_armed >= 1024)) {
 			return;
 		}
-		// Two lines, not one: refuse below 50%, recover only at >= 66%.
 		const bool covered = po_cov_resolved >= 32 && po_cov_resolved * 2 >= po_cov_armed;
-		const bool strong = po_cov_resolved >= 32 && po_cov_resolved * 3 >= po_cov_armed * 2;
+		// An edge needs its verdict count AND the dwell since the opposite
+		// edge. The counters keep running while the dwell holds, so the edge
+		// fires on the first verdict after it expires if the evidence stands.
+		const uint64_t now_ns = os_monotonic_get_ns();
+		const bool dwelt = po_edge_ns == 0 || now_ns - po_edge_ns >= PO_EDGE_DWELL_NS;
 		if (covered) {
 			po_bad_verdicts = 0;
-			po_good_verdicts = strong ? po_good_verdicts + 1 : 0;
-			if (po_refused && po_good_verdicts >= 3) {
+			po_good_verdicts++;
+			if (po_refused && po_good_verdicts >= 3 && dwelt) {
 				po_refused = false;
-				U_LOG_W("#1435 forward horizon: join recovered (3 consecutive verdicts >= 66%%; last %u of %u "
+				po_edge_ns = now_ns;
+				U_LOG_W("#1435 forward horizon: join recovered (3 consecutive covered verdicts; last %u of %u "
 				        "armed) — the offset loop may learn again (offset is +0 until it does)",
 				        po_cov_resolved, po_cov_armed);
 			}
 		} else {
 			po_good_verdicts = 0;
 			po_bad_verdicts++;
-			if (!po_refused && po_bad_verdicts >= 2) {
+			if (!po_refused && po_bad_verdicts >= 2 && dwelt) {
 				po_refused = true;
+				po_edge_ns = now_ns;
 				U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%), second verdict in a "
 				        "row under 50%% — the offset loop will not learn from this arm%s (present-count "
-				        "statistics do not reach the ring here; needs 3 consecutive verdicts >= 66%% to resume)",
+				        "statistics do not reach the ring here; needs 3 consecutive covered verdicts to resume)",
 				        po_cov_resolved, po_cov_armed,
 				        100.0 * (double)po_cov_resolved / (double)(po_cov_armed ? po_cov_armed : 1),
 				        po_applied != 0 ? ", unlearning to +0" : " (stays at +0)");
 			}
 			if (po_refused) {
-				if (po_applied != 0) {
-					// Unlearn: whatever was learned came from frames the join
-					// happened to see, not from the pipeline. Honest value = 0.
-					// Not counted as a numbered change; the WARN above is it.
-					po_applied = 0;
-					po_clamp_logged = false; // a later re-climb to the cap may log again
-				}
-				po_win_n = 0; // burst observations must not linger into a later allowed window
+				// Unlearn: whatever was learned came from frames the join
+				// happened to see, not from the pipeline. Honest value = 0.
+				// Not counted as a numbered change; the WARN above is it.
+				po_applied = 0;
+				po_clamp_logged = false; // a later re-climb to the cap may log again
 			}
+			po_win_n = 0; // burst observations must not linger into a later allowed window
 		}
 		po_coverage_ok = covered && !po_refused;
 		po_cov_resolved = 0;
@@ -569,8 +591,8 @@ struct weave_latency_log
 		// against the vblank this weave really lands on.
 		pending_horizon_ns = horizon_ns;
 		pending_horizon_base_qpc = nowq;
-		po_cov_armed++;
 		if (po_enabled == PO_ON) {
+			po_cov_armed++;
 			po_epoch_close(true);
 		}
 		return horizon_ns;
@@ -672,23 +694,25 @@ struct weave_latency_log
 			// their empty defaults read as a perfect window (Arc-box leg).
 			U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-			        "| NO JOIN (armed %u, resolved 0)  applied %+d  present gap %s  "
-			        "| depth %d (%u changes)",
+			        "| NO JOIN (armed %u, resolved 0)  applied %+d  refused %d (bad %u, good %u)  "
+			        "present gap %s  | depth %d (%u changes)",
 			        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
 			        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
 			        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps, (double)hz_jumps / secs, hz_n,
-			        po_applied, gap, hz_depth, hz_depth_changes);
+			        po_applied, (int)po_refused, po_bad_verdicts, po_good_verdicts, gap, hz_depth,
+			        hz_depth_changes);
 		} else {
 			U_LOG_W(
 			    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-			    "| join %u/%u (%.0f%%)  residual %+d periods  applied %+d  wrong-slot %u (%.1f%%)  "
-			    "mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  present gap %s  "
-			    "| depth %d (%u changes)",
+			    "| join %u/%u (%.0f%%)  residual %+d periods  applied %+d  refused %d (bad %u, good %u)  "
+			    "wrong-slot %u (%.1f%%)  mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  "
+			    "present gap %s  | depth %d (%u changes)",
 			    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 			    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
 			    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_n, 100.0 * (double)hz_resolved / (double)hz_n,
-			    mode_i - 2, po_applied, hz_wrong_slot, 100.0 * (double)hz_wrong_slot / (double)hz_resolved,
+			    mode_i - 2, po_applied, (int)po_refused, po_bad_verdicts, po_good_verdicts, hz_wrong_slot,
+			    100.0 * (double)hz_wrong_slot / (double)hz_resolved,
 			    (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6, (double)hz_err_sum_ns / (double)hz_resolved / 1e6,
 			    (double)hz_sync_lag_sum / (double)hz_resolved, gap, hz_depth, hz_depth_changes);
 		}
@@ -730,6 +754,16 @@ struct weave_latency_log
 			f = nullptr;
 		}
 		enabled = CSV_UNPROBED;
+		// #1456: the coverage verdict is a property of the chain, not the
+		// process — a refusal must not follow a torn-down chain into the
+		// next client that reuses this log.
+		po_refused = false;
+		po_bad_verdicts = 0;
+		po_good_verdicts = 0;
+		po_cov_armed = 0;
+		po_cov_resolved = 0;
+		po_coverage_ok = false;
+		po_edge_ns = 0;
 	}
 };
 

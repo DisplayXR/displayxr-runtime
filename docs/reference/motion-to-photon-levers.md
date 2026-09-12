@@ -367,9 +367,11 @@ the instrument selected — and latched +3 (a 66 ms horizon, clamped to 60 by th
 5 legs (coverage is judged **cumulatively since the last verdict** — 32 observations or 1024 armed
 horizons, whichever first — so a burst after a starved stretch is scored against the stretch;
 two consecutive verdicts under 50% **refuse** (sticky): the loop unlearns to +0, drops its
-window and needs three consecutive verdicts at ≥ 66% to decide again — two lines, not one,
-because the horizons armed per 32 resolves is negative-binomial and a chain near 50% would
-otherwise coin-flip refuse/recover every ~10 s, each flip a whole-period step at the DP. The first, per-epoch version of this gate
+window and needs three consecutive covered verdicts to decide again — and an edge in either
+direction needs 30 s since the opposite edge, so a chain flapping across the 50% line steps
+the DP's value at most once per 30 s (a second, higher threshold for recovery was tried and
+left a steady 50-66% chain refused for the life of the struct). The trace row carries
+`refused N (bad N, good N)` as the standing witness, and the gate resets with the chain. The first, per-epoch version of this gate
 re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
 +0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
