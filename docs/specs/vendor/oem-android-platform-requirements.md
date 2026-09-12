@@ -77,7 +77,7 @@ Tiering:
 | **R5** | The **multi-client lens/backlight tier is the sole writer**; legacy tiers deprecated | REQUIRED | VENDOR (+ firmware pickup) | Contract verified; deprecation PR open |
 | **R6** | **1:1 panel pixels** — no compat scaling, WM bounds == composited layer | REQUIRED | **PLATFORM** | **OPEN — now MEASURED** on the OEM mini-window path |
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
-| **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence, **memory-pressure kill ranking** | REQUIRED | **PLATFORM** | **PARTLY OPEN — MEASURED**: R8.5 (kill ranking) fails on one Android build; R8.1–R8.4 work today, don't regress |
+| **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence, **memory-pressure kill ranking**, **wake + bind must be permitted (R8.6)** | REQUIRED | **PLATFORM** | **PARTLY OPEN — MEASURED**: R8.5 (kill ranking) fails on one Android build; R8.1–R8.4 work today, don't regress |
 | **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
 | **R10** | The **mini-window survives an activity launch from inside it** (system file picker, share sheet, permission dialog) | REQUIRED | **PLATFORM** | **OPEN — MEASURED** on the reference device 2026-09-10; no app-side arrangement avoids it |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
@@ -644,10 +644,11 @@ adb logcat | grep -iE 'face|tracking'
 
 **Owner:** **PLATFORM** · **Status:** **partly open.** R8.1–R8.4 work on the
 reference device — treat those as non-regression requirements. **R8.5 (kill
-ranking) is OPEN and measured failing on a second Android build, 2026-09-11.** ·
+ranking) is OPEN and measured failing on a second Android build, 2026-09-11.
+R8.6 (wake + bind) is OPEN and measured failing on two builds, 2026-09-12.** ·
 **Traces to:** report §6b
 
-**Mechanism.** Five platform policies DisplayXR depends on:
+**Mechanism.** Six platform policies DisplayXR depends on:
 
 1. **Non-isolated, pre-declared process slots.** `isolatedProcess` cannot reach
    SurfaceFlinger or gralloc (sepolicy `isolated_app_all.te`), and
@@ -703,7 +704,8 @@ ranking) is OPEN and measured failing on a second Android build, 2026-09-11.** �
 (1); a service that cannot legally run (2); sessions killed mid-frame or a frozen
 vendor service taking down its clients (3); transparency and overlay features
 that silently stop working after an app update (4); tracking that dies under
-ordinary memory pressure and takes 3D with it (5) — and note the *user-visible*
+ordinary memory pressure and takes 3D with it (5); a runtime no app can reach
+until a human opens it (6) — and note the *user-visible*
 form of (5) is not "tracking stopped" but visual corruption, because a display
 stack that loses its pose keeps weaving against the last one it had.
 
@@ -746,6 +748,62 @@ self-directed `Process.killProcess` from inside the vendor service produces
 `reason=2 SIGNALED status=9` with no `am_kill` record, forensically identical to
 an external kill; rule it out from the vendor service's own log before attributing
 a death to platform policy.
+
+6. **Wake and bind must be permitted.** An OpenXR runtime exists to be *bound by
+   other packages* — every OpenXR app reaches it through `bindService` on its
+   exported `org.freedesktop.monado.ipc.CONNECT` service, and locates it through
+   its `OpenXRRuntimeBroker` content provider. Three OEM policies, each measured
+   on a shipping build, defeat that outright. Devices are attached to each claim
+   because the three do **not** all reproduce on each other:
+
+   - **Force-idle freezer that a bind does not thaw** (measured NP02J, Android 13,
+     runtime v2.16.23/24, 2026-09-11). `CpuFreezerManagerServiceV2` marks the idle
+     runtime — which holds a **foreground service with a notification** — for
+     freezing about a minute after its last client disconnects (`force into idle`,
+     `ActivityManager: froze <pid> org.freedesktop.monado…`, `cgroup.freeze=1`).
+     Once frozen, a client's bind is **refused rather than thawing the target**:
+     `ActivityManager: skip unfrozen when bringup … Skip bringUpServiceLocked`,
+     `bindService … could not be found to bind!`, `Bind failed immediately`. Only
+     an **activity** start thaws it. (The client's subsequent `.in_process`
+     `NameNotFoundException` is fallback noise, not the cause.)
+   - **Related-start blocking** (measured Lume Phone `PQ82A11_3D`, MyOS 13.0.16,
+     runtime v2.16.24, 2026-09-12). `AutoLaunchManagerService` refuses one package
+     starting or binding another package's service at all — `compType=Service …
+     Service RelatedStart BlockResult = true` — for `startService` and
+     `bindService` alike, with an explicitly resolved component, from both an
+     `androidx.startup` initializer and `Activity.onCreate`. On the same build the
+     freezer *attempted* the runtime and failed (`tryDoFreeze fail`), so the two
+     builds fail in opposite ways.
+   - **Exemptions that do not persist** (same phone, same session): `deviceidle`
+     battery exemptions for our packages were pruned **four separate times** in
+     one session. A one-shot `adb` whitelist is not durable; only the OEM's own
+     Settings entry is, and that is not scriptable.
+
+   The runtime cannot fix any of these from its side: a foreground service was not
+   sufficient against the freezer, no API choice escapes related-start blocking,
+   and pruning undoes whatever an installer sets. The only thaw path an app has is
+   an **activity start** — what a user does by hand when they "open the runtime
+   app once" — and that is a workaround the platform should not require
+   (runtime#1453, runtime#1454).
+
+**Consequence if absent (R8.6).** Every OpenXR app fails at `xrCreateInstance`
+with `XR_ERROR_RUNTIME_UNAVAILABLE` until the user opens the runtime app by hand;
+the browser's inline-3D stays dormant and its `immersive-vr` falls through to the
+stock provider (Google Cardboard, whose QR scanner then crashes on a device with
+no rear camera — browser-pvt#132). To the user this reads as "3D stopped working"
+some minutes after they last used it.
+
+**Acceptance test for R8.6.** With the runtime installed and *not* recently used:
+1. Wait 2 minutes with no DisplayXR app in the foreground; then
+   `adb shell 'RP=$(pidof org.freedesktop.monado.openxr_runtime.out_of_process); cat /sys/fs/cgroup/uid_$(stat -c %u /proc/$RP)/pid_$RP/cgroup.freeze'`
+   — **PASS = `0` or absent** (never frozen), or `1` *provided step 2 passes*.
+2. Launch any DisplayXR app cold (no manual runtime launch). It must reach
+   `xrCreateInstance` successfully — `logcat` must show **no** `Bind failed
+   immediately`, no `RelatedStart BlockResult = true`, no `skip unfrozen when
+   bringup` against the runtime package.
+3. `adb shell dumpsys deviceidle whitelist | grep -E 'monado|displayxr'` at the
+   start and again after 30 minutes of mixed use: the entries must be **identical**.
+   A pruned entry is a FAIL even if steps 1–2 passed at the start.
 
 **Acceptance test, automated (the snapshot half):**
 `scripts/android-oem-probe.sh --only r8` reads the runtime service's process
