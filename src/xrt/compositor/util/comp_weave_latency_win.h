@@ -160,49 +160,41 @@ struct weave_latency_log
 	uint64_t po_last_log_ns = 0;
 	bool po_clamp_logged = false;
 	/*!
-	 * Join-coverage gate (Arc-box leg, 2026-09-11). The window is 32
+	 * Join-coverage gate (Arc-box legs, 2026-09-11). The loop's window is 32
 	 * OBSERVATIONS, and an observation exists only when the join resolves.
-	 * On an arm the join cannot reach (present counter 13 behind the ring),
-	 * the only frames that ever resolve are the ones whose queue momentarily
-	 * fell inside the ring — a sub-population the instrument selected, not a
-	 * sample of the pipeline. Learning from it latched +3 (a 66 ms horizon)
-	 * in 3 of 5 legs there. So: count the horizons ARMED per 32-observation
-	 * epoch, and only let an epoch decide when it resolved at least half of
-	 * them. Below that the loop stays where it is (0 until it ever sees a
-	 * covered epoch = the pre-#1437 feed), and says so once.
+	 * On an arm the join cannot reach (present counter 10-15 behind the
+	 * 8-entry ring), the only frames that ever resolve are the ones whose
+	 * queue momentarily dipped inside the ring — a sub-population the
+	 * instrument selected, not a sample of the pipeline. Learning from it
+	 * latched +3 (a 66 ms horizon) in 3 of 5 legs there.
 	 *
-	 * This is a RATE guard, not a population guard: a covered epoch buys one
-	 * decision (one period, #1440) for the window that overlaps it, so an arm
-	 * that bursts a covered epoch every ~10 s can still step over a long
-	 * session. An epoch also closes on 1024 armed horizons (~17 s at 60/s)
-	 * so an arm that resolves nothing still reaches the "starved" verdict and
-	 * its one WARN — otherwise the only witness is the trace row.
-	 */
-	/*
-	 * Round 3 (Arc-box leg on v2.16.26, Suki, 2026-09-11): the first gate
-	 * judged each 32-observation epoch on its own and reset both counters
-	 * after every verdict, so a BURST — 32 resolves inside 64 armed weaves,
-	 * which is exactly what a present queue dipping from 15 to 1 produces —
-	 * re-qualified the loop while the arm's true coverage was 0-9%. Measured:
-	 * `applied` left +0 in 5 of 8 default legs, once +0 -> +3 in 1.7 s, 68 s
-	 * after the gate's own WARN had said "0 of 1024 armed". The number that
-	 * would have refused was already in that WARN. So:
-	 *  - coverage is judged CUMULATIVELY since the last verdict, and a verdict
-	 *    comes at 32 observations OR 1024 armed horizons, whichever first — a
-	 *    burst after a starved stretch is scored against the whole stretch;
-	 *  - a verdict under 50% is STICKY: the loop unlearns to +0 (the pre-#1437
-	 *    feed is the honest value for an arm the join cannot see), drops its
-	 *    window, and needs three consecutive covered verdicts (>= 96
-	 *    observations at >= 50%) before it may decide again;
+	 * A first version judged each 32-observation epoch on its own and reset
+	 * after every verdict, so a BURST — 32 resolves inside 64 armed weaves —
+	 * re-qualified the loop while the arm's true coverage was 0-9% (measured:
+	 * `applied` left +0 in 5 of 8 legs, once +0 -> +3 in 1.7 s, 68 s after the
+	 * gate's own WARN had said "0 of 1024 armed"). So now:
+	 *  - coverage is judged CUMULATIVELY since the last verdict; a verdict
+	 *    comes at 32 observations OR 1024 armed horizons, whichever first, so
+	 *    a burst after a starved stretch is scored against the whole stretch,
+	 *    and an arm that resolves nothing still reaches a verdict (~17 s);
+	 *  - a verdict under 50% counts as BAD; two consecutive bad verdicts
+	 *    REFUSE (sticky): the loop unlearns to +0 (the pre-#1437 feed is the
+	 *    honest value for an arm the join cannot see) and drops its window;
+	 *  - recovery needs three consecutive verdicts at >= 66% (>= 96
+	 *    observations) — strictly harder than refusal, because the count of
+	 *    horizons armed to collect 32 resolves is negative-binomial and a
+	 *    chain near 50% would otherwise coin-flip refuse/recover every ~10 s,
+	 *    each flip a whole-period step in the value handed to the DP;
 	 *  - engage / recover each log once per transition.
-	 * A healthy chain (join 70-100%) reaches its first verdict after ~32-46
+	 * A healthy chain (join 66-100%) reaches its first verdict after ~32-48
 	 * armed weaves and is never refused, so its lock timing is unchanged.
 	 */
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
 	bool po_coverage_ok = false;   // may the current window decide?
-	bool po_refused = false;       // sticky: a verdict came in under threshold
-	uint32_t po_good_verdicts = 0; // consecutive covered verdicts (recovery needs 3)
+	bool po_refused = false;       // sticky: two consecutive verdicts came in under 50%
+	uint32_t po_bad_verdicts = 0;  // consecutive verdicts under 50% (refusal needs 2)
+	uint32_t po_good_verdicts = 0; // consecutive verdicts at >= 66% (recovery needs 3)
 
 	//! Coverage verdict at 32 observations, or (from predict, `from_arm`) at
 	//! 1024 armed horizons without reaching 32.
@@ -212,33 +204,40 @@ struct weave_latency_log
 		if (po_cov_resolved < 32 && !(from_arm && po_cov_armed >= 1024)) {
 			return;
 		}
+		// Two lines, not one: refuse below 50%, recover only at >= 66%.
 		const bool covered = po_cov_resolved >= 32 && po_cov_resolved * 2 >= po_cov_armed;
+		const bool strong = po_cov_resolved >= 32 && po_cov_resolved * 3 >= po_cov_armed * 2;
 		if (covered) {
-			po_good_verdicts++;
+			po_bad_verdicts = 0;
+			po_good_verdicts = strong ? po_good_verdicts + 1 : 0;
 			if (po_refused && po_good_verdicts >= 3) {
 				po_refused = false;
-				U_LOG_W("#1435 forward horizon: join recovered (3 consecutive verdicts >= 50%%; last %u of %u "
-				        "armed) — the offset loop may learn again from +%d",
-				        po_cov_resolved, po_cov_armed, po_applied);
+				U_LOG_W("#1435 forward horizon: join recovered (3 consecutive verdicts >= 66%%; last %u of %u "
+				        "armed) — the offset loop may learn again (offset is +0 until it does)",
+				        po_cov_resolved, po_cov_armed);
 			}
 		} else {
 			po_good_verdicts = 0;
-			if (!po_refused) {
+			po_bad_verdicts++;
+			if (!po_refused && po_bad_verdicts >= 2) {
 				po_refused = true;
-				U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%) — the offset "
-				        "loop will not learn from this arm%s (present-count statistics do not reach "
-				        "the ring here; needs 3 consecutive covered verdicts to resume)",
+				U_LOG_W("#1435 forward horizon: join covers %u of %u armed weaves (%.0f%%), second verdict in a "
+				        "row under 50%% — the offset loop will not learn from this arm%s (present-count "
+				        "statistics do not reach the ring here; needs 3 consecutive verdicts >= 66%% to resume)",
 				        po_cov_resolved, po_cov_armed,
 				        100.0 * (double)po_cov_resolved / (double)(po_cov_armed ? po_cov_armed : 1),
 				        po_applied != 0 ? ", unlearning to +0" : " (stays at +0)");
 			}
-			if (po_applied != 0) {
-				// Unlearn: whatever was learned came from frames the join
-				// happened to see, not from the pipeline. Honest value = 0.
-				po_applied = 0;
-				po_changes++;
+			if (po_refused) {
+				if (po_applied != 0) {
+					// Unlearn: whatever was learned came from frames the join
+					// happened to see, not from the pipeline. Honest value = 0.
+					// Not counted as a numbered change; the WARN above is it.
+					po_applied = 0;
+					po_clamp_logged = false; // a later re-climb to the cap may log again
+				}
+				po_win_n = 0; // burst observations must not linger into a later allowed window
 			}
-			po_win_n = 0; // burst observations must not linger into a later allowed window
 		}
 		po_coverage_ok = covered && !po_refused;
 		po_cov_resolved = 0;
@@ -259,8 +258,8 @@ struct weave_latency_log
 		}
 		po_win[po_win_head] = (int8_t)k;
 		po_win_head = (po_win_head + 1) % 32;
-		// Epoch bookkeeping: every 32 observations, ask how many horizons had
-		// to be armed to get them. Half or more = the join sees the pipeline.
+		// Coverage verdict: at 32 observations (or 1024 armed, from predict),
+		// how many horizons had to be armed to get them. See po_epoch_close.
 		po_cov_resolved++;
 		po_epoch_close(false);
 		if (po_win_n < 32) {
