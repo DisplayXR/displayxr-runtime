@@ -82,10 +82,28 @@ object DisplayXrRuntime {
      *        stopped. Use this to retry after xrCreateInstance has already failed:
      *        a *frozen* runtime (runtime#1454) is not flagged stopped and is not
      *        detectable from here, so the un-forced path cannot see it.
-     * @return true if the runtime should now be reachable. False means no runtime
-     *         is installed, or it did not come out of the stopped state in time.
-     *         Callers may proceed regardless — the loader then fails exactly as it
-     *         did before, so this never makes anything worse.
+     * @return true if the runtime is no longer in the stopped state. **That is not the
+     *         same as "the runtime is bindable"**, and the difference is ~650 ms.
+     *
+     *         This matters only if you bypass the Khronos loader and bind the runtime's
+     *         IPC service yourself. Loader clients need no extra budget: the loader's
+     *         broker query brings the service up and retries on its own, which is why
+     *         every demo works with nothing more than this call.
+     *
+     *         A direct-bind client must budget about **one second of retry after this
+     *         returns**. Measured on a Lume Phone (`PQ82A11_3D`), three runs: the
+     *         stopped flag clears ~515 ms after the activity start and the wake activity
+     *         is created ~118 ms in, but the OEM's thaw plus the service publish land
+     *         **700 / 800 / 790 ms** after `startActivity` returns. A client that budgeted
+     *         3x150 ms had every bind refused and launched without its fd. Credit to the
+     *         browser connector work (browser-pvt#140) for measuring the bind side, which
+     *         this function cannot observe: polling anything that would prove bindability
+     *         means a synchronous binder call into a possibly-frozen process, which per
+     *         the runtime's OEM requirement R8.3 kills it.
+     *
+     *         False means no runtime is installed, or it did not leave the stopped state
+     *         in time. Callers may proceed regardless — the loader then fails exactly as
+     *         it did before, so this never makes anything worse.
      */
     @JvmOverloads
     @JvmStatic
