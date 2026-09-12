@@ -44,7 +44,12 @@ class WakeActivity : Activity() {
         super.onCreate(savedInstanceState)
         // Theme.NoDisplay REQUIRES finishing before onResume, or the framework
         // throws. Nothing may be added between super.onCreate and finish().
-        Log.i(TAG, "woken by ${callingActivity?.packageName ?: referrer?.host ?: "unknown"}")
+        // No caller attribution here: a FLAG_ACTIVITY_NEW_TASK start with no
+        // result leaves both callingActivity and referrer null, so asking for one
+        // only ever printed "unknown". The framework already logs the caller --
+        // "AutoLaunchManagerService: Activity RelatedStart ... callingPkg=..." on
+        // the builds where it matters.
+        Log.i(TAG, "wake activity started; clearing stopped/frozen state")
         finish()
     }
 
