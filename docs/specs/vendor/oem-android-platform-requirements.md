@@ -77,7 +77,7 @@ Tiering:
 | **R5** | The **multi-client lens/backlight tier is the sole writer**; legacy tiers deprecated | REQUIRED | VENDOR (+ firmware pickup) | Contract verified; deprecation PR open |
 | **R6** | **1:1 panel pixels** — no compat scaling, WM bounds == composited layer | REQUIRED | **PLATFORM** | **OPEN — now MEASURED** on the OEM mini-window path |
 | **R7** | **Camera arbitration through the tracking service**; no power-gating of the tracking camera | REQUIRED | PLATFORM + VENDOR | Works today — don't regress |
-| **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence | REQUIRED | **PLATFORM** | Works today — don't regress |
+| **R8** | Process / service policy: non-isolated slots, FGS type, freezer, app-op persistence, **memory-pressure kill ranking** | REQUIRED | **PLATFORM** | **PARTLY OPEN — MEASURED**: R8.5 (kill ranking) fails on one Android build; R8.1–R8.4 work today, don't regress |
 | **R9** | The **touch controller reports every held contact in every frame** at its default report rate (no alternate-frame drop of the first finger under a two-finger hold) | REQUIRED | **PLATFORM** (touch firmware / default config) | **OPEN — MEASURED** on the reference device 2026-09-09; 120 Hz report rate is clean, 240 Hz default is not |
 | **R10** | The **mini-window survives an activity launch from inside it** (system file picker, share sheet, permission dialog) | REQUIRED | **PLATFORM** | **OPEN — MEASURED** on the reference device 2026-09-10; no app-side arrangement avoids it |
 | **S1** | **SurfaceFlinger exclude-uid capture filter** (or a platform-signed capture host) | STRONGLY REC. | **PLATFORM** | **OPEN — headline ask** |
@@ -642,10 +642,12 @@ adb logcat | grep -iE 'face|tracking'
 
 ### R8 — Process, service and app-op policy
 
-**Owner:** **PLATFORM** · **Status:** works on the reference device — treat as a
-non-regression requirement · **Traces to:** report §6b
+**Owner:** **PLATFORM** · **Status:** **partly open.** R8.1–R8.4 work on the
+reference device — treat those as non-regression requirements. **R8.5 (kill
+ranking) is OPEN and measured failing on a second Android build, 2026-09-11.** ·
+**Traces to:** report §6b
 
-**Mechanism.** Four platform policies DisplayXR depends on:
+**Mechanism.** Five platform policies DisplayXR depends on:
 
 1. **Non-isolated, pre-declared process slots.** `isolatedProcess` cannot reach
    SurfaceFlinger or gralloc (sepolicy `isolated_app_all.te`), and
@@ -670,22 +672,80 @@ non-regression requirement · **Traces to:** report §6b
    happens — we lost one to exactly that. Note also that Android 15 narrows the
    `SYSTEM_ALERT_WINDOW` background-start exemption to a **visible** overlay,
    which affects any service-owned overlay path.
+5. **Memory-pressure kill ranking.** A head-tracking service is a **display-pipeline
+   component**, not an ordinary app, and must be classified as one for
+   low-memory-killer purposes. This is a *different mechanism from the freezer in
+   (3)* and is not covered by it: the freezer acts at `curAdj >= 900`, whereas the
+   failure here is LMK/OOM **selection of a process sitting at `adj 0`** because it
+   is large. Measured on a second Android build, 2026-09-11: a vendor tracking
+   service holding a camera foreground service, bound `BIND_IMPORTANT`, resident
+   ~260 MB at `adj 0` and `oom_score` 676, was SIGKILLed **seven times in one day**
+   (`reason=2 SIGNALED status=9`, no `am_kill` record). Pinning `oom_score_adj` to
+   -800 took the score to 143 and kills from four-in-fifteen-minutes to **zero**
+   over the same workload. Removing 31 MB of resident memory from the same process
+   left `oom_score` **unchanged at 676** — so this cannot be engineered around from
+   the app side, and a vendor cannot fix it by shrinking.
+
+   Note the inconsistency this produces: on that build the **display HAL runs at
+   `adj -1000`** while the tracking service that feeds it runs at `adj 0`. Two
+   halves of one display pipeline, opposite treatment. Being a preinstalled
+   `SYSTEM` app is **not** sufficient — the service already is one, and is still
+   selected.
+
+   Two further properties the policy must have, both measured failing on that
+   build: any exemption must be **persistent** (observed pruned three separate
+   times in one session, from a server-pushed policy the device owner could not
+   configure locally), and **binds must be permitted, not merely the process kept
+   alive** (a client's `blockingConnect` was refused while the service process
+   existed).
 
 **Consequence if absent.** Satellites that cannot reach the compositor at all
 (1); a service that cannot legally run (2); sessions killed mid-frame or a frozen
 vendor service taking down its clients (3); transparency and overlay features
-that silently stop working after an app update (4).
+that silently stop working after an app update (4); tracking that dies under
+ordinary memory pressure and takes 3D with it (5) — and note the *user-visible*
+form of (5) is not "tracking stopped" but visual corruption, because a display
+stack that loses its pose keeps weaving against the last one it had.
 
 **DisplayXR fallback.** We already bind with the importance flags, declare static
 slots, drop `IBinder`s on unbind so we never make a sync call into a frozen peer,
 and re-grant the overlay app-op from our install script with a loud warning. None
-of that survives a platform policy that overrides it.
+of that survives a platform policy that overrides it. **For (5) there is no
+fallback at all** — the app side already runs the service in the foreground with
+its own notification and binds `BIND_IMPORTANT`, and is killed through both; and
+the null result above shows shrinking the process does not change its ranking.
 
 **Acceptance test.** Run a 3D session, background it for 15 minutes with the
 screen on, and confirm the session and the vendor services are still alive
 (`adb shell dumpsys activity processes | grep -E '<pkg>|<vendor-svc>'`, check
 `adj` and frozen state). Update the app in place; confirm the overlay app-op
 survives (`adb shell cmd appops get <pkg> SYSTEM_ALERT_WINDOW`).
+
+**Acceptance test for R8.5 — a soak under pressure, not a snapshot.** The
+snapshot probe below cannot see this failure: it is time-dependent (kills cluster,
+with multi-hour quiet gaps in the same day), load-dependent (needs real memory
+pressure), stateful (exemptions lapse), and in at least one case server-pushed
+(policy can change after any PASS). **A PASS from the one-shot probe is therefore
+not evidence R8.5 holds.** Run instead:
+
+1. Start a 3D session with a client bound and tracking, kept in the **foreground**.
+2. Drive `MemAvailable` down — open heavy apps/tabs until it is a small fraction of
+   `MemTotal`. Record `MemAvailable` at the start and throughout; a run at high
+   headroom proves nothing.
+3. Soak **30 minutes**. Sample every 30 s: the tracking service pid,
+   `/proc/<pid>/oom_score_adj` and `oom_score`, and whether a client bind succeeds.
+4. PASS = the service process is never replaced, no bind is refused, and any
+   exemption applied at the start is still in place at the end.
+5. Afterwards, check the exit records for deaths the sampler could have missed:
+   `adb shell dumpsys activity exit-info <pkg>` — any `reason=2 (SIGNALED)
+   status=9` during the window is a FAIL.
+
+Two traps worth stating because both cost us time. A clean run at high
+`MemAvailable` is **not** a pass — it means the killer never ran. And a
+self-directed `Process.killProcess` from inside the vendor service produces
+`reason=2 SIGNALED status=9` with no `am_kill` record, forensically identical to
+an external kill; rule it out from the vendor service's own log before attributing
+a death to platform policy.
 
 **Acceptance test, automated (the snapshot half):**
 `scripts/android-oem-probe.sh --only r8` reads the runtime service's process

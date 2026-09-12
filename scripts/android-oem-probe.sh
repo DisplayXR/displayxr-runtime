@@ -60,7 +60,9 @@ sub-checks (--only takes a comma-separated list; default: all)
   s9    STRONGLY REC. S9 -- is the container scale visible to the app?  Reuses
         r6's measurement; reports every app-visible source probed.  Always INFO.
   r8    REQUIRED R8 -- process/service policy for the runtime service: resident,
-        foreground-service type, oom adj, freezer state.
+        foreground-service type, oom adj, freezer state, plus kill-ranking inputs
+        and recent SIGNALED exits.  R8.5 (kill ranking) needs the soak in the spec;
+        a PASS here covers R8.1-R8.4 only.
   s4    STRONGLY REC. S4 -- ADPF / PowerHAL hint sessions.
   s2    STRONGLY REC. S2 -- per-pixel click-through.  Partly manual; reports the
         read-only half (untrusted-touch opacity, ActivityRecordInputSink).
@@ -471,6 +473,26 @@ check_r8() {
     else
         kv "manifest foregroundServiceType" "NOT CHECKED (no aapt2)"
     fi
+    # R8.5 -- memory-pressure kill ranking.  A DIFFERENT mechanism from the freezer
+    # above: the freezer acts at curAdj >= 900, whereas this is LMK/OOM selecting a
+    # process that sits at adj 0 because it is large.  Report the inputs and the
+    # recent kill history; the verdict needs a soak, not a snapshot.
+    local adj score rss memavail memtotal
+    adj=$(sh_ cat "/proc/$pid/oom_score_adj" 2>/dev/null | tr -d '\r')
+    score=$(sh_ cat "/proc/$pid/oom_score" 2>/dev/null | tr -d '\r')
+    rss=$(sh_ awk "/VmRSS/{print \$2}" "/proc/$pid/status" 2>/dev/null | tr -d '\r')
+    memavail=$(sh_ awk '/MemAvailable/{print $2}' /proc/meminfo | tr -d '\r')
+    memtotal=$(sh_ awk '/MemTotal/{print $2}' /proc/meminfo | tr -d '\r')
+    kv "kill ranking"              "oom_score_adj=${adj:-?} oom_score=${score:-?} VmRSS=${rss:-?} kB"
+    kv "memory headroom"           "MemAvailable=${memavail:-?} of MemTotal=${memtotal:-?} kB"
+
+    # Deaths the snapshot cannot see.  A self-directed Process.killProcess looks
+    # IDENTICAL to an external kill here (reason=2 SIGNALED status=9, no am_kill),
+    # so this counts candidates and does not attribute them.
+    local sigkills; sigkills=$(sh_ dumpsys activity exit-info "$RUNTIME_PKG" 2>/dev/null \
+        | grep -c 'reason=2 (SIGNALED).*status=9' || true)
+    kv "SIGNALED status=9 in exit-info" "${sigkills:-0}  (candidates; see note below)"
+
     local frozen=no
     case "$blk" in *isFrozen=true*) frozen=yes ;; esac
     ev ""
@@ -478,11 +500,24 @@ check_r8() {
         ev "FAIL -- the runtime service is FROZEN.  A synchronous binder call into a frozen"
         ev "       process kills it; a frozen display/runtime service takes its clients down."
         record R8 FAIL "runtime service is frozen"
+    elif [ "${sigkills:-0}" -gt 0 ]; then
+        ev "FAIL -- ${sigkills} SIGNALED/status=9 exit(s) on record for $RUNTIME_PKG."
+        ev "       R8.1-R8.4 look fine in this snapshot, but the service has been killed."
+        ev "       Rule out a self-directed Process.killProcess from the service's own log"
+        ev "       before attributing these to platform policy -- they are forensically"
+        ev "       identical.  If they are external, this is R8.5 (kill ranking)."
+        record R8 FAIL "R8.5: ${sigkills} SIGNALED status=9 exits on record (adj=${adj:-?} score=${score:-?})"
     else
-        ev "PASS -- resident, non-isolated, holding a foreground service, not frozen."
-        ev "     Note this is a snapshot.  The full R8 test is the 15-minute backgrounded"
-        ev "     soak plus the app-op-survives-update check in the spec (§2 R8)."
-        record R8 PASS "resident, FGS held, isFrozen=false, $(printf '%s\n' "$blk" | grep -m1 -oE 'cur=[0-9]+ set=[0-9]+')"
+        ev "PASS (R8.1-R8.4 only) -- resident, non-isolated, holding a foreground service,"
+        ev "     not frozen, and no SIGNALED exits on record."
+        ev ""
+        ev "     R8.5 IS NOT TESTED BY THIS PROBE.  Kill ranking is time- and load-dependent;"
+        ev "     a clean snapshot at MemAvailable=${memavail:-?} kB mostly means the killer"
+        ev "     never ran.  The verdict needs the 30-minute soak under induced memory"
+        ev "     pressure in the spec (§2 R8, 'Acceptance test for R8.5')."
+        ev "     Note also that shrinking the process does not help: 31 MB removed from a"
+        ev "     ~260 MB tracking service left oom_score unchanged at 676 on one build."
+        record R8 PASS "R8.1-R8.4 only; R8.5 untested (adj=${adj:-?} score=${score:-?}, MemAvailable=${memavail:-?} kB)"
     fi
 }
 
