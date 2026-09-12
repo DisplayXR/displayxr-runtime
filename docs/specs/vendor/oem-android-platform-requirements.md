@@ -820,10 +820,26 @@ a death to platform policy.
    measured reasons: the OEM that blocks a foreign package from *creating* the
    service still allows binding a *running* one (the browser binds the service
    directly and failed on the Lume Phone with the wake alone, 0
-   `ServiceRecord`s, and succeeded once the service was up); and a live
-   `MonadoService` holds the process at `adj 800`, outside the NP02J freezer's
-   `adj >= 900` window. **This is DisplayXR's mitigation, not the platform's
-   fix — R8.6 stands as written.** (runtime#1463)
+   `ServiceRecord`s, and succeeded once the service was up). **A resident
+   service does NOT exempt the runtime from the freezer** — measured
+   `D123171101B0`, 30-minute idle soak with `MonadoService` resident, screen
+   off, on battery: frozen from **minute 1** for 30 of 31 samples, `adj` 50 →
+   200, same pid, `ServiceRecord` present, our uid in the freezer's own
+   `frozen-list` beside gms and the keyboard (runtime#1454). So the freeze
+   threshold is **per device, not one number**: `adj >= 900` on the NP02J,
+   **`adj ≈ 200` (already at 50)** on `PQ82A11_3D`. A frozen-but-running
+   runtime is therefore the *normal idle state* on that build, and the only
+   thaw remains an activity start. Idle cost of the resident service there, for
+   the record: ~25.6 MB PSS (one pre-freeze sample), 0.18 s CPU over the process
+   lifetime — negligible precisely because the platform freezes it. **This is
+   DisplayXR's mitigation, not the platform's fix — R8.6 stands as written.**
+   (runtime#1463, #1454)
+
+   Instrumentation caveats for anyone re-measuring: `adb shell dumpsys battery
+   unplug` **pins the reported battery level**, so a level column read that way
+   is meaningless — use `/proc/<pid>/stat` CPU ticks or `batterystats` for the
+   uid; and `dumpsys meminfo` needs a binder call into the process, so **PSS is
+   unreadable while frozen**.
 
 **Consequence if absent (R8.6).** Every OpenXR app fails at `xrCreateInstance`
 with `XR_ERROR_RUNTIME_UNAVAILABLE` until the user opens the runtime app by hand;
@@ -837,8 +853,9 @@ The preconditions are load-bearing — a run that skips them reports PASS on a
 device that does freeze:
 1. **On battery** (`adb shell dumpsys battery unplug` keeps adb; `dumpsys battery
    reset` afterwards), **screen off**, no DisplayXR app in the foreground and no
-   client bound (the process must be at `adj >= 900`, not the `adj 800` a live
-   `RuntimeService` holds it at). **Wait 10 minutes**, then
+   client bound. Do not assume a threshold — it is `adj >= 900` on one build and
+   `adj ≈ 200` on another, and a resident service does not exempt. **Wait 10
+   minutes**, then
    `adb shell 'RP=$(pidof org.freedesktop.monado.openxr_runtime.out_of_process); cat /sys/fs/cgroup/uid_$(stat -c %u /proc/$RP)/pid_$RP/cgroup.freeze'`
    — **PASS = `0` or absent** (never frozen), or `1` *provided step 2 passes*.
 2. Launch any DisplayXR app cold (no manual runtime launch). It must reach
