@@ -3,6 +3,7 @@
 package org.freedesktop.monado.openxr_runtime
 
 import android.app.Activity
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 
@@ -32,11 +33,25 @@ import android.util.Log
  * docs/specs/vendor/oem-android-platform-requirements.md — the platform should not
  * require any of this, and this class is the workaround until it doesn't.
  *
- * WHAT IT DELIBERATELY DOES NOT DO. It does not start [
- * org.freedesktop.monado.android_common.RuntimeService]. A started service outlives
- * its clients' unbind, so starting one here would silently change the runtime
- * service's lifetime for every app on the device. Clearing the stopped flag is the
- * whole job; the loader binds the service itself, as it always did.
+ * IT ALSO ARMS THE IPC SERVICE, and must. Clearing the stopped flag is enough for a
+ * client that reaches the runtime through the Khronos loader: the loader's broker
+ * query brings the service up on its own. It is NOT enough for a client that talks
+ * to the IPC service directly -- the DisplayXR Browser's inline-3D connector, and
+ * anything running force-ipc. On the OEM builds in question a client's bindService
+ * cannot CREATE our service (AMS "Skip bringUpServiceLocked"), so such a client gets
+ * no runtime socket until something else creates it. That is #1245, and
+ * [DashboardActivity] already fixes it with a single startService from a foreground
+ * activity. This activity exists to replace the "open the runtime app once" ritual,
+ * so it has to do everything that ritual did -- otherwise it fixes the loader clients
+ * and silently leaves the IPC clients broken.
+ *
+ * Measured on a Lume Phone: with the wake activity alone the browser's connector
+ * still failed (`blockingConnect ... refused: -1`, zero ServiceRecords); after
+ * DashboardActivity it connected and reported inline-3D weave ready. The only
+ * difference between the two was this call.
+ *
+ * Note this is NOT a new "resident service" behaviour: it is the same service, with
+ * the same lifetime, that a user already starts every time they open the runtime app.
  */
 class WakeActivity : Activity() {
 
@@ -50,6 +65,27 @@ class WakeActivity : Activity() {
         // "AutoLaunchManagerService: Activity RelatedStart ... callingPkg=..." on
         // the builds where it matters.
         Log.i(TAG, "wake activity started; clearing stopped/frozen state")
+
+        // Same call DashboardActivity makes, for the same reason (#1245). It must run
+        // while this activity makes us a foreground app: that is what lets the service
+        // be created at all on a ROM that refuses a background client's bindService.
+        // MonadoService self-foregrounds with a sticky notification on first start, so
+        // one start here is all it takes; later client binds attach to the live service
+        // instead of being refused.
+        //
+        // Never let this throw past us. A wake that half-worked (stopped flag cleared,
+        // service not armed) is still better than an exception propagating out of a
+        // no-display activity, which surfaces to the user as the CLIENT app crashing.
+        try {
+            startService(
+                Intent(this, org.freedesktop.monado.ipc.MonadoService::class.java)
+                    .setAction(org.freedesktop.monado.ipc.BuildConfig.SERVICE_ACTION)
+            )
+        } catch (t: Throwable) {
+            // Logged, never swallowed silently -- a silent catch is what hid the
+            // broken demo wake for months.
+            Log.w(TAG, "could not arm the IPC service: $t")
+        }
         finish()
     }
 
