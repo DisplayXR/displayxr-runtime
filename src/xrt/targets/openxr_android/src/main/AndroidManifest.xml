@@ -121,6 +121,28 @@
         </activity>
 
         <!--
+            Wake target (runtime#1453 / #1454). A client library starts this to
+            clear the runtime package's "stopped" flag — and, on a build whose
+            freezer has frozen us, to thaw the process — because neither can be
+            done by starting or binding our service on the OEM builds we ship
+            against (R8.6). It draws nothing: Theme.NoDisplay plus finish() in
+            onCreate, so the caller keeps focus.
+
+            exported=true is the point of it — it exists to be started by another
+            app. It carries no data in or out, so there is nothing to abuse.
+            taskAffinity="" + excludeFromRecents + noHistory keep it out of the
+            caller's back stack and out of recents.
+        -->
+        <activity
+            android:name=".WakeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleInstance" />
+
+        <!--
             The diag query runs in its own short-lived process: the native
             side skips runtime teardown (vendor plug-in destroy can hang,
             displayxr-leia-plugin#39) and the service self-kills after each
