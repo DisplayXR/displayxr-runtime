@@ -296,6 +296,31 @@ pick_ht_slot_locked(int slot)
 	return -1;
 }
 
+/*!
+ * Caller holds the mutex (or is the single-threaded builder path). Is the
+ * candidate that supplies the navigation device at @p nav_index present?
+ *
+ * The rig counterpart of @ref provider_holds_roles_locked: `roles.rig == -1`
+ * alone cannot say whether a navigating provider is unplugged (correct) or
+ * present and failing to take the role (a fault), and this is what tells the
+ * two apart (#1465).
+ */
+static bool
+nav_candidate_present_locked(int32_t nav_index)
+{
+	if (nav_index < 0) {
+		return false; // Not an index: -1 IS the fly-camera floor.
+	}
+	for (int i = 0; i < g_arb.candidate_count; i++) {
+		struct t_input_candidate *cand = &g_arb.candidates[i];
+		if (cand->nav_index != nav_index) {
+			continue;
+		}
+		return candidate_is_present_locked(cand);
+	}
+	return false; // No candidate owns it at all.
+}
+
 //! Caller holds the mutex (or is the single-threaded builder path).
 static bool
 provider_holds_roles_locked(void)
@@ -658,6 +683,21 @@ t_input_arbiter_provider_holds_roles(void)
 	bool holds = provider_holds_roles_locked();
 	os_mutex_unlock(&g_arb_mutex);
 	return holds;
+}
+
+bool
+t_input_arbiter_nav_candidate_present(int32_t nav_index)
+{
+	if (!g_arb_mutex_ready) {
+		// Mutex init failed (t_input_arbiter_reset warned): degrade to
+		// the mutex-free walk — the builder path is single-threaded.
+		return nav_candidate_present_locked(nav_index);
+	}
+
+	os_mutex_lock(&g_arb_mutex);
+	bool present = nav_candidate_present_locked(nav_index);
+	os_mutex_unlock(&g_arb_mutex);
+	return present;
 }
 
 void

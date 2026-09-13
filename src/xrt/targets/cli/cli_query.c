@@ -773,13 +773,50 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 	// role can take a beat to settle after system build.
 	for (int attempt = 0; attempt < CLI_RIG_ROLE_ATTEMPTS; attempt++) {
 		struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
-		if (xrt_system_devices_get_roles(h->xsysd, &roles) == XRT_SUCCESS && roles.rig == nav_index) {
+		if (xrt_system_devices_get_roles(h->xsysd, &roles) == XRT_SUCCESS && roles.rig >= 0 &&
+		    (uint32_t)roles.rig < h->xsysd->xdev_count &&
+		    h->xsysd->xdevs[roles.rig]->device_type == XRT_DEVICE_TYPE_NAVIGATION) {
+			// #1465 — assert against the HOLDER, not against whichever
+			// navigation device happens to sit first in xdevs. With two
+			// providers registered and only one of them plugged in, those
+			// are different devices, and it is the one that won the
+			// presence walk whose pose composition is under test here.
+			nav_index = roles.rig;
+			nav = h->xsysd->xdevs[nav_index];
+			snprintf(r->rig_nav_str, sizeof(r->rig_nav_str), "%s", nav->str);
 			r->rig_role_ok = true;
 			break;
 		}
 		os_nanosleep(CLI_RIG_SAMPLE_INTERVAL_NS);
 	}
 	if (!r->rig_role_ok) {
+		// #1465 — ABSENCE NEVER FAILS, here too. The rig walk only
+		// gives the role to a PRESENT candidate, so a navigation device
+		// whose provider's hardware is unplugged leaving `roles.rig == -1`
+		// is the runtime behaving correctly (the fly camera holds the
+		// rig), exactly as an absent provider leaving the hands to qwerty
+		// is. Ask the arbiter which of the two this is, and only fail for
+		// a candidate that IS present.
+		int32_t present_index = -1;
+		for (uint32_t i = 0; i < h->xsysd->xdev_count; i++) {
+			struct xrt_device *xdev = h->xsysd->xdevs[i];
+			if (xdev == NULL || xdev->device_type != XRT_DEVICE_TYPE_NAVIGATION) {
+				continue;
+			}
+			if (t_input_arbiter_nav_candidate_present((int32_t)i)) {
+				present_index = (int32_t)i;
+				break;
+			}
+		}
+		if (present_index < 0) {
+			snprintf(r->rig_note, sizeof(r->rig_note),
+			         "not evaluated: navigation device '%s' found but its provider's hardware is "
+			         "absent (OK — the runtime's fly camera holds the rig)",
+			         r->rig_nav_str);
+			r->rig_evaluated = false;
+			return;
+		}
+		snprintf(r->rig_nav_str, sizeof(r->rig_nav_str), "%s", h->xsysd->xdevs[present_index]->str);
 		snprintf(r->rig_note, sizeof(r->rig_note),
 		         "FAIL: '%s' is a navigation device but never took the rig role", r->rig_nav_str);
 		return;
