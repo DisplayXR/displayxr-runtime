@@ -293,6 +293,57 @@ TEST_CASE("input arbiter: hand-role churn bumps the generation without moving th
 	t_input_arbiter_reset();
 }
 
+/*!
+ * #1465 — the state `displayxr-cli selftest` used to call a hard failure: a
+ * provider that DOES supply a navigation device, registered and loaded, whose
+ * hardware is simply not plugged in. The rig correctly parks at -1 (the
+ * runtime's fly camera), and the diagnostic needs to be able to tell that from
+ * a present provider that never took the role — which is what
+ * t_input_arbiter_nav_candidate_present answers.
+ */
+TEST_CASE("input arbiter: an ABSENT navigation candidate parks the rig and reports absent")
+{
+	t_input_arbiter_reset();
+	g_sys.reset();
+	init_provider(g_prov_a, "prov-a-navigates");
+
+	struct xrt_device a_left = make_device(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, "a-left");
+	struct xrt_device a_nav = make_device(XRT_DEVICE_TYPE_NAVIGATION, "a-nav");
+	struct xrt_device qwerty_left = make_device(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, "qwerty-left");
+
+	g_sys.add(&a_left);
+	int32_t a_nav_index = g_sys.add(&a_nav);
+	g_sys.add(&qwerty_left);
+
+	struct xrt_device *a_devs[] = {&a_left, &a_nav};
+
+	// Unplugged before the system is even built — the install seeds the
+	// presence cache synchronously, so the first read already sees ABSENT.
+	g_prov_a.present.store(false);
+
+	t_input_arbiter_note_provider_pair(&g_prov_a.iface, instance_of(g_prov_a), 50, &a_left, nullptr);
+	t_input_arbiter_note_provider_navigation(a_devs, 2);
+	t_input_arbiter_note_qwerty_pair(&qwerty_left, nullptr);
+
+	t_input_arbiter_install(&g_sys.base);
+
+	// The rig is NOT the navigation device: the fly camera holds it, and the
+	// helper says why — the candidate that owns the index is absent.
+	CHECK(wait_for_rig(-1).rig == -1);
+	CHECK_FALSE(t_input_arbiter_nav_candidate_present(a_nav_index));
+
+	// Plug it in: same index, opposite verdict, and the role resolves.
+	g_prov_a.present.store(true);
+	CHECK(wait_for_rig(a_nav_index).rig == a_nav_index);
+	CHECK(t_input_arbiter_nav_candidate_present(a_nav_index));
+
+	// An index no candidate owns is never 'present'.
+	CHECK_FALSE(t_input_arbiter_nav_candidate_present(-1));
+	CHECK_FALSE(t_input_arbiter_nav_candidate_present(99));
+
+	t_input_arbiter_reset();
+}
+
 TEST_CASE("input arbiter: with no providers the rig parks at -1")
 {
 	t_input_arbiter_reset();

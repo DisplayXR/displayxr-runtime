@@ -155,6 +155,25 @@ bool
 t_input_arbiter_provider_holds_roles(void);
 
 /*!
+ * Is the candidate that owns the navigation device at system-device index
+ * @p nav_index present at this instant?
+ *
+ * The rig counterpart of @ref t_input_arbiter_provider_holds_roles, and it
+ * exists for the same reason: a navigation device sitting in `xsysd->xdevs`
+ * while `xrt_system_roles::rig` reads -1 is the CORRECT state when the
+ * provider's hardware is unplugged (the runtime's own fly camera holds the
+ * rig), and only a diagnostic that can tell that apart from a present
+ * provider that never took the role can say which of the two it is looking
+ * at (#1465).
+ *
+ * False when no candidate owns @p nav_index, when @p nav_index is negative,
+ * or when the owning candidate's cached presence verdict says absent. Cheap
+ * and side-effect free — a pure read of the poll thread's cache.
+ */
+bool
+t_input_arbiter_nav_candidate_present(int32_t nav_index);
+
+/*!
  * Install the dynamic `get_roles` on @p xsysd. Call once, after BOTH the
  * provider pass and the qwerty pass have added their devices, from the
  * builder's `open_system_impl` (the device list is final by then and the
