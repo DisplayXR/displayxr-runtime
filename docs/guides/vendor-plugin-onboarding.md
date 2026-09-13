@@ -161,6 +161,8 @@ The full discovery contract — registry layout, JSON schema, env-var overrides,
 
 Pick a value in 1–99 if your `probe()` consults a vendor SDK to detect connected hardware and returns `XRT_ERROR_PROBER_NOT_SUPPORTED` cleanly when absent. Pick something close to 200 if your plug-in is meant to handle "any machine, no specific hardware" cases (rare for vendor plug-ins).
 
+Within a range, pick a value **distinct from every plug-in or provider you expect to coexist with** — lower wins, and equal values are broken deterministically by id (`strcmp`), which is an alphabetical accident, not a decision. The input-provider loader logs a WARN naming both ids when it has to do that (#1466). On the input side the in-tree Ultraleap provider ships at **50** and `sim_input` at **200**.
+
 ## 5. Installer contract
 
 The vendor plug-in installer is independent of the runtime installer — it has its own version cadence, its own release flow, its own NSIS script (Windows) or `.pkg` builder (macOS).
@@ -429,7 +431,7 @@ The whole checklist:
 **Testing it, before and without your hardware:**
 
 - Build the runtime from source and register the in-tree `sim_input` provider (`scripts\register_dev_plugin.bat input sim`, elevated). It carries a scripted navigation device behind `DXR_SIM_INPUT` — see the discovery spec §5 — so you can watch the role walk, a handover and a recenter happen with nothing plugged in, and compare your provider's behaviour against a known-good one at a different ProbeOrder.
-- Register your provider at a **lower** ProbeOrder than `sim_input` (vendors use 50; in-tree fallbacks are 200) and confirm you win the rig while present and that it falls back — first to `sim_input`, then to the fly camera — as each goes absent.
+- Register your provider at a **lower** ProbeOrder than `sim_input` (200), and at a value distinct from every provider you expect to coexist with — the in-tree Ultraleap provider ships at 50, and an equal value is broken by id and logged, not by your intent. Then confirm you win the rig while present and that it falls back — first to `sim_input`, then to the fly camera — as each goes absent.
 - `displayxr-cli selftest` runs the real loader and arbitration path with no GPU, window or app: use it to check your DLL loads, ABI-passes, probes, and that the roles land where you expect. Provider *absence* never fails the check — only a provider that could not be dispatched does.
 - `displayxr-cli input list [--json]` enumerates registered providers and the ForceQwerty state without loading any DLL; `displayxr-cli input haptic-test` re-resolves roles every iteration and prints each `generation_id` change, so it doubles as a live view of arbitration flipping.
 - Run the same checks a second time with `XRT_FORCE_MODE=ipc` and a running `displayxr-service.exe`. Roles, the rig and the composer all live service-side there, and the durable-recenter rule exists precisely because that path polls differently.
