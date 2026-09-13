@@ -97,9 +97,16 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 **Root:** `HKLM\Software\DisplayXR\InputProviders` (64-bit view).
 Per-provider subkey, same value schema as DisplayProcessors: `Binary`
 (absolute DLL path, required), `DisplayName` / `Vendor` / `Version`
-(optional strings), `ProbeOrder` (DWORD; vendors 50, in-tree fallback
-providers 200, missing = 100), optional `Enabled` (DWORD, 0 disables —
-implemented for input providers; the DP root has no such value).
+(optional strings), `ProbeOrder` (DWORD; missing = 100), optional
+`Enabled` (DWORD, 0 disables — implemented for input providers; the DP
+root has no such value).
+
+**Choosing a `ProbeOrder`:** lower wins. Pick a value distinct from every
+provider yours expects to coexist with — the in-tree Ultraleap provider
+ships at **50** and `sim_input` at **200**. Equal values are broken
+deterministically by provider id (`strcmp`) and the loader logs one WARN
+naming both ids, because which of the two then outranks the other is an
+alphabetical accident rather than anyone's decision (#1466).
 A `PreferredPlugin` override mirroring DP spec §2.1 is *planned, not yet
 implemented* — v1 selection is pure ProbeOrder.
 

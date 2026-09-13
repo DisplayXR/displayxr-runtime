@@ -407,18 +407,48 @@ input_enumerate_registry(struct input_plugin_entry *entries, int max)
 	return count;
 }
 
+/*!
+ * ProbeOrder ascending, ties broken by id (#1466).
+ *
+ * qsort is not stable, so equal ProbeOrder values used to leave the relative
+ * priority of two providers up to the sort implementation — and that order is
+ * what the arbiter ranks its candidates by, i.e. which provider wins a hand
+ * when both are present. strcmp on the registry id makes it the same on every
+ * run and every box; `input_warn_probe_order_ties` then tells the vendor a
+ * tiebreak happened at all.
+ */
 static int
 input_compare_by_probe_order(const void *a, const void *b)
 {
-	uint32_t oa = ((const struct input_plugin_entry *)a)->probe_order;
-	uint32_t ob = ((const struct input_plugin_entry *)b)->probe_order;
-	if (oa < ob) {
+	const struct input_plugin_entry *ea = (const struct input_plugin_entry *)a;
+	const struct input_plugin_entry *eb = (const struct input_plugin_entry *)b;
+	if (ea->probe_order < eb->probe_order) {
 		return -1;
 	}
-	if (oa > ob) {
+	if (ea->probe_order > eb->probe_order) {
 		return 1;
 	}
-	return 0;
+	return strcmp(ea->id, eb->id);
+}
+
+/*!
+ * One WARN per adjacent pair sharing a ProbeOrder, after the sort (#1466).
+ * Which provider outranks the other is then an alphabetical accident rather
+ * than a decision, and the vendor whose provider lost is the only person who
+ * can fix it — so say so, once, with both ids.
+ */
+static void
+input_warn_probe_order_ties(const struct input_plugin_entry *entries, int n)
+{
+	for (int i = 1; i < n; i++) {
+		if (entries[i - 1].probe_order != entries[i].probe_order) {
+			continue;
+		}
+		U_LOG_W(
+		    "input plugin loader: '%s' and '%s' share ProbeOrder %u — tie broken by id; "
+		    "give coexisting providers distinct values.",
+		    entries[i - 1].id, entries[i].id, entries[i].probe_order);
+	}
 }
 
 /*!
@@ -520,6 +550,7 @@ input_discover_all(void)
 	}
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), input_compare_by_probe_order);
+	input_warn_probe_order_ties(entries, n);
 
 	U_LOG_I("input plugin loader: %d registered provider(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {

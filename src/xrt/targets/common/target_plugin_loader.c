@@ -361,18 +361,25 @@ enumerate_registry(struct plugin_entry *entries, int max)
 	return count;
 }
 
+/*!
+ * ProbeOrder ascending, ties broken by id (#1466) — same shape, same reason as
+ * the input loader's comparator: qsort is not stable, so two plug-ins
+ * registered at one ProbeOrder would otherwise be ranked by the sort
+ * implementation. Which one is probed first decides which DP the runtime ends
+ * up on, so it must not vary between runs.
+ */
 static int
 compare_by_probe_order(const void *a, const void *b)
 {
-	uint32_t oa = ((const struct plugin_entry *)a)->probe_order;
-	uint32_t ob = ((const struct plugin_entry *)b)->probe_order;
-	if (oa < ob) {
+	const struct plugin_entry *ea = (const struct plugin_entry *)a;
+	const struct plugin_entry *eb = (const struct plugin_entry *)b;
+	if (ea->probe_order < eb->probe_order) {
 		return -1;
 	}
-	if (oa > ob) {
+	if (ea->probe_order > eb->probe_order) {
 		return 1;
 	}
-	return 0;
+	return strcmp(ea->id, eb->id);
 }
 
 /*!
