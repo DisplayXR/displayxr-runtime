@@ -686,9 +686,14 @@ comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
 		// would open the budget over a desktop nobody looked at. The bounds
 		// are the fallback, and they are still fresh.
 		os_mutex_lock(&b->publish_mutex);
+		// Valid -> absent IS a change; absent -> absent is not. `mask_ns`
+		// still moves: staleness is a different question from change.
+		const bool changed = b->mask_valid;
 		b->mask_valid = false;
 		b->mask_ns = now_ns;
-		b->mask_gen++;
+		if (changed) {
+			b->mask_gen++;
+		}
 		os_mutex_unlock(&b->publish_mutex);
 		return;
 	}
@@ -696,10 +701,27 @@ comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
 	os_mutex_lock(&b->publish_mutex);
 	bool ok = comp_rear_budget_grow_u8(&b->mask_cells, &b->mask_cap, (size_t)w * (size_t)h);
 	uint32_t nonzero = 0;
+	/*
+	 * The generation counts CHANGES, never publishes — the same rule
+	 * @ref comp_rear_budget_set_zone_rects spells out, and for the same reason
+	 * one level down (#1470). An app chains its silhouette every frame, so a
+	 * generation that counted publishes would invalidate `roi_mask_key` on
+	 * every poll: full resample + zone clamp + dilation + bbox scan at 15 Hz
+	 * over an unchanged grid, and — worse than the cost — a permanently true
+	 * `mask_new`, so "the mask changed" carried no information at all.
+	 *
+	 * The comparison rides on the copy: each row is diffed against what is
+	 * already stored and then overwritten, so an unchanged grid costs one
+	 * extra memcmp per row rather than a second buffer.
+	 */
+	bool same = ok && b->mask_valid && b->mask_w == w && b->mask_h == h && b->mask_margin == margin_normalized;
 	if (ok) {
 		for (uint32_t y = 0; y < h; y++) {
 			const uint8_t *src = cells + (size_t)y * (size_t)stride;
 			uint8_t *dst = b->mask_cells + (size_t)y * (size_t)w;
+			if (same && memcmp(dst, src, w) != 0) {
+				same = false;
+			}
 			memcpy(dst, src, w);
 			for (uint32_t x = 0; x < w; x++) {
 				nonzero += (dst[x] != 0) ? 1u : 0u;
@@ -713,8 +735,18 @@ comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
 	b->mask_h = ok ? h : 0;
 	b->mask_margin = margin_normalized;
 	b->mask_ns = now_ns;
-	b->mask_gen++;
+	// `same` already implies the new grid is valid: it matched a grid that was
+	// valid, cell for cell, so its nonzero count is the same one.
+	if (!same) {
+		b->mask_gen++;
+	}
 	os_mutex_unlock(&b->publish_mutex);
+}
+
+uint32_t
+comp_rear_budget_debug_mask_build_id(const struct comp_rear_budget *b)
+{
+	return (b == NULL) ? 0u : b->roi_mask_build_id;
 }
 
 bool

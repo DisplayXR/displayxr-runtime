@@ -616,6 +616,21 @@ comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
                                  uint32_t *out_px);
 
 /*!
+ * TEST ONLY — how many times the runner has REBUILT its preview-resolution
+ * mask.
+ *
+ * The cache exists because an app chains its silhouette every frame while the
+ * inputs the rebuild depends on change far more rarely; a build id that
+ * advanced on every publish would mean the cache never hit and that "the mask
+ * changed" carried no information (#1470). Only a counter can tell those apart
+ * from outside — the mask itself is identical either way.
+ *
+ * @ingroup comp_util
+ */
+uint32_t
+comp_rear_budget_debug_mask_build_id(const struct comp_rear_budget *b);
+
+/*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.
  *
  * @return false when nothing is retained (the dump is not armed, or no valid
