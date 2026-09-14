@@ -1389,6 +1389,195 @@ TEST_CASE("comp_rear_budget: the mask maps through a preview that carries a marg
 }
 
 
+/*
+ * -----------------------------------------------------------------------------
+ * The mask RATCHET (#1470)
+ *
+ * v3 defines the mask as the app's RENDERED silhouette, which is produced AFTER
+ * the shader-side far clip - so the region the runtime measures is a function of
+ * the budget the runtime published, and on a perfectly static desktop that loop
+ * closes: clipped -> a small front-cap mask over a blank margin -> neutral ->
+ * open -> the rear half appears -> the mask grows across a text column -> busy
+ * -> close -> the rear half is discarded -> round again, every 0.6-1.1 s.
+ *
+ * Nothing in either pure layer can see this. `u_bg_neutrality` is right about
+ * both regions and `u_rear_budget` is right about both verdicts; the defect is
+ * that the REGION moved, and only the runner knows that. So the model below is
+ * the app, not a canned sequence: the mask it publishes is computed from the
+ * budget the runner published last, which is precisely the feedback path.
+ * -----------------------------------------------------------------------------
+ */
+
+namespace {
+
+/*!
+ * A transparent app parked on the border between a blank margin and a text
+ * column - the tester's geometry.
+ *
+ * The preview is neutral except for a text-like strip from x = 120; the app's
+ * front half sits clear of it (preview px 20..60, dilated 12..68) and its rear
+ * half reaches across it (20..130, dilated 12..138) - so the two clip states
+ * genuinely deserve opposite verdicts, which is why no amount of hysteresis on
+ * the time or measurement axis can settle this.
+ */
+struct FeedbackApp
+{
+	MaskGrid front{20, 10};
+	MaskGrid full{20, 10};
+	uint32_t cell_x0 = 2;
+
+	FeedbackApp()
+	{
+		rebuild();
+	}
+
+	//! Move the model sideways, as a drag would. Cells are 10 preview px wide.
+	void
+	move_to(uint32_t cell_x0_)
+	{
+		cell_x0 = cell_x0_;
+		rebuild();
+	}
+
+	void
+	rebuild()
+	{
+		front = MaskGrid(20, 10);
+		full = MaskGrid(20, 10);
+		front.set(cell_x0, 3, cell_x0 + 4u, 7);
+		full.set(cell_x0, 3, cell_x0 + 11u, 7);
+	}
+
+	//! What the app renders THIS frame, given the budget it was handed.
+	const MaskGrid &
+	silhouette(float far_offset_vh) const
+	{
+		return (far_offset_vh > 0.0f) ? full : front;
+	}
+};
+
+//! How many times the budget opened, and how many times it closed again.
+struct Flaps
+{
+	int opens = 0;
+	int closes = 0;
+};
+
+/*!
+ * Drive @p ms of 10 ms frames with the app's mask fed back from the budget the
+ * runner published on the previous frame, counting transitions.
+ *
+ * @param park_full When set, the app ignores the budget and always reports
+ *                  @ref FeedbackApp::front - a model that is nowhere near the
+ *                  text, used to check the ratchet lets a genuine re-open through.
+ */
+Flaps
+run_feedback(Runner &r,
+             const xrt_dp_background_preview *pv,
+             FeedbackApp &app,
+             uint64_t start_ns,
+             uint64_t ms,
+             bool park_front = false)
+{
+	Flaps f{};
+	u_rear_budget_state prev = read(r).state;
+	for (uint64_t t = start_ns; t <= start_ns + ms * MS; t += 10 * MS) {
+		const float budget = park_front ? 0.0f : read(r).far_offset_vh;
+		mask(r, app.silhouette(budget), t);
+		step(r, pv, t);
+
+		const u_rear_budget_state now = read(r).state;
+		if (now != prev) {
+			if (now == U_REAR_BUDGET_OPEN) {
+				f.opens++;
+			} else if (prev == U_REAR_BUDGET_OPEN) {
+				f.closes++;
+			}
+			prev = now;
+		}
+	}
+	return f;
+}
+
+//! The preview the feedback tests share: neutral, with a text column from x=120.
+FakePreview
+feedback_preview()
+{
+	FakePreview pv(200, 100, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(120, 0, 200, 100);
+	return pv;
+}
+
+} // namespace
+
+TEST_CASE("comp_rear_budget: a silhouette fed back from the budget flaps exactly once")
+{
+	FakePreview pv = feedback_preview();
+	FeedbackApp app;
+
+	// Five seconds is four to eight periods of the observed 0.6-1.1 s cycle,
+	// so "it settled" and "it happened not to have come round yet" cannot be
+	// confused.
+	Runner r;
+	const Flaps guarded = run_feedback(r, &pv.pv, app, 0, 5000);
+
+	// One open (the front cap really is over a blank margin, and nothing knows
+	// better until the rear half has been seen once), one close, and then the
+	// held region keeps it shut.
+	CHECK(guarded.opens == 1);
+	CHECK(guarded.closes == 1);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+
+	// The verdict stays attributable: the region that produced it is wider
+	// than the silhouette the app is currently drawing, and says so.
+	uint32_t held = 0;
+	CHECK(comp_rear_budget_debug_ratchet(&r.b, &held));
+	CHECK(held > 0);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET);
+
+	/*
+	 * And the arm that proves the test pins the loop rather than describing
+	 * whatever the code happens to do: with the ratchet killed, the SAME app
+	 * against the SAME desktop cycles.
+	 */
+	ScopedEnv off("DXR_REAR_BUDGET_MASK_RATCHET", "0");
+	Runner unguarded;
+	FeedbackApp app2;
+	const Flaps flapping = run_feedback(unguarded, &pv.pv, app2, 0, 5000);
+	CHECK(flapping.opens >= 2);
+	CHECK(flapping.closes >= 2);
+}
+
+TEST_CASE("comp_rear_budget: moving the model past the dilation radius releases the ratchet")
+{
+	FakePreview pv = feedback_preview();
+	FeedbackApp app;
+
+	Runner r;
+	uint64_t t = 0;
+	const Flaps first = run_feedback(r, &pv.pv, app, t, 2000);
+	REQUIRE(first.opens == 1);
+	REQUIRE(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	REQUIRE(comp_rear_budget_debug_ratchet(&r.b, nullptr));
+	t += 2000 * MS;
+
+	/*
+	 * The user drags the model three cells to the left - 30 preview pixels,
+	 * well past the 8 px dilation radius. The region the ratchet holds
+	 * describes where the model WAS, so holding the budget shut with it would
+	 * be the same class of wrongness the ratchet exists to stop: a verdict
+	 * about pixels the content is nowhere near.
+	 *
+	 * Parked front-only at the new spot (a model that no longer reaches the
+	 * text however far back it renders), so a re-open is the correct answer
+	 * and not merely the next half of a cycle.
+	 */
+	app.move_to(0);
+	const Flaps after = run_feedback(r, &pv.pv, app, t + 10 * MS, 2000, /*park_front=*/true);
+	CHECK(after.opens == 1);
+	CHECK(read(r).state == U_REAR_BUDGET_OPEN);
+}
+
 TEST_CASE("comp_rear_budget: re-publishing an identical mask does not rebuild it")
 {
 	Runner r;
