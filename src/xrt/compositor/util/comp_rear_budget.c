@@ -187,8 +187,8 @@ static const uint8_t *
 comp_rear_budget_dump_image(struct comp_rear_budget *b)
 {
 	const uint32_t w = b->dump_w, h = b->dump_h;
-	if (!b->dump_have || b->dump_bgra == NULL || !b->roi_mask_in_use || b->roi_mask == NULL ||
-	    b->roi_mask_w != w || b->roi_mask_h != h) {
+	if (!b->dump_have || b->dump_bgra == NULL || !b->roi_mask_in_use || b->region == NULL || b->roi_mask_w != w ||
+	    b->roi_mask_h != h) {
 		return b->dump_bgra;
 	}
 
@@ -198,17 +198,33 @@ comp_rear_budget_dump_image(struct comp_rear_budget *b)
 	}
 	memcpy(b->dump_tint, b->dump_bgra, bytes);
 
+	/*
+	 * Two colours, because the region has two provenances and a verdict read
+	 * off a region the app is not currently drawing must stay falsifiable
+	 * (#1470): GREEN is this frame's own silhouette, BLUE is the surplus the
+	 * ratchet is holding from while the budget was last open. A cycling
+	 * open/clip and a correctly held-closed budget look identical in the state
+	 * log and completely different in this picture.
+	 */
+	const uint8_t *cur = b->roi_mask;
 	for (uint32_t y = 0; y < h; y++) {
 		uint8_t *row = b->dump_tint + (size_t)y * (size_t)w * 4u;
-		const uint8_t *mrow = b->roi_mask + (size_t)y * (size_t)w;
+		const uint8_t *mrow = b->region + (size_t)y * (size_t)w;
+		const uint8_t *crow = (cur != NULL) ? (cur + (size_t)y * (size_t)w) : NULL;
 		for (uint32_t x = 0; x < w; x++) {
 			if (mrow[x] == 0) {
 				continue;
 			}
 			uint8_t *px = row + (size_t)x * 4u;
-			px[0] = (uint8_t)(px[0] / 2u);           // B
-			px[1] = (uint8_t)((px[1] + 255u) / 2u);  // G — toward green
-			px[2] = (uint8_t)(px[2] / 2u);           // R
+			if (crow != NULL && crow[x] == 0) {
+				px[0] = (uint8_t)((px[0] + 255u) / 2u); // B — toward blue
+				px[1] = (uint8_t)(px[1] / 2u);          // G
+				px[2] = (uint8_t)(px[2] / 2u);          // R
+				continue;
+			}
+			px[0] = (uint8_t)(px[0] / 2u);          // B
+			px[1] = (uint8_t)((px[1] + 255u) / 2u); // G — toward green
+			px[2] = (uint8_t)(px[2] / 2u);          // R
 		}
 	}
 	return b->dump_tint;
@@ -249,6 +265,7 @@ comp_rear_budget_roi_src_str(enum comp_rear_budget_roi_src src)
 {
 	switch (src) {
 	case COMP_REAR_BUDGET_ROI_SRC_MASK: return "app content mask";
+	case COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET: return "app content mask, widened by the ratchet";
 	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS: return "app content bounds";
 	case COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES: return "app content bounds clamped to the 3D zones";
 	case COMP_REAR_BUDGET_ROI_SRC_ZONES: return "3D zone union";
@@ -531,7 +548,7 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 	                    b->roi_mask_key.pw == pw && b->roi_mask_key.ph == ph && b->roi_mask_key.cu0 == cu0 &&
 	                    b->roi_mask_key.cv0 == cv0 && b->roi_mask_key.cu1 == cu1 && b->roi_mask_key.cv1 == cv1;
 	if (cached) {
-		return b->roi_mask_px >= COMP_REAR_BUDGET_MASK_MIN_PX;
+		return b->roi_mask_usable;
 	}
 
 	const size_t px_count = (size_t)pw * (size_t)ph;
@@ -541,6 +558,7 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 		// Out of memory for a diagnostic region. The rect path needs no
 		// allocation at all, so it is the honest fallback.
 		b->roi_mask_px = 0;
+		b->roi_mask_usable = false;
 		b->roi_mask_key.valid = false;
 		return false;
 	}
@@ -563,6 +581,7 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 		 * so fall through rather than measure it. Never "neutral".
 		 */
 		b->roi_mask_px = 0;
+		b->roi_mask_usable = false;
 		b->roi_mask_key.valid = false;
 		if (!b->mask_outside_logged) {
 			b->mask_outside_logged = true;
@@ -571,6 +590,31 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 			    "app's zone→window rebase; falling back to the content bounds");
 		}
 		return false;
+	}
+
+	/*
+	 * The silhouette's centroid, taken here — after the zone clamp, BEFORE the
+	 * dilation. It is what the ratchet's "the model moved" reset compares
+	 * against (#1470), and the dilation band is a fixed-width skirt that would
+	 * drag the centroid toward whichever side the shape is thin on, making the
+	 * comparison depend on the very radius it is compared against.
+	 */
+	{
+		double sx = 0.0, sy = 0.0;
+		uint32_t n = 0;
+		for (uint32_t y = 0; y < ph; y++) {
+			const uint8_t *row = b->roi_mask + (size_t)y * (size_t)pw;
+			for (uint32_t x = 0; x < pw; x++) {
+				if (row[x] == 0) {
+					continue;
+				}
+				sx += (double)x;
+				sy += (double)y;
+				n++;
+			}
+		}
+		b->roi_mask_cx = (n > 0) ? (float)(sx / (double)n) : 0.0f;
+		b->roi_mask_cy = (n > 0) ? (float)(sy / (double)n) : 0.0f;
 	}
 
 	// Dilation: the runtime's own band, whatever the app asked for on top, and
@@ -598,6 +642,7 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 		dilate = max_r;
 	}
 	const uint32_t r = (uint32_t)(dilate + 0.5f);
+	b->roi_mask_dilate_r = r;
 	comp_rear_budget_mask_dilate(b->roi_mask, b->dilate_scratch, pw, ph, r);
 
 	kept = comp_rear_budget_mask_clamp_zones(b->roi_mask, row_scratch, pw, ph, zones, zone_count, cu0, cv0, cu1,
@@ -643,10 +688,9 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 	b->roi_mask_key.cv1 = cv1;
 	b->roi_mask_key.valid = true;
 
-	if (kept < COMP_REAR_BUDGET_MASK_MIN_PX || bx1 <= bx0 || by1 <= by0 || (bx1 - bx0) < 2u) {
-		// Too little to measure. The analysis would refuse it, and a refusal
-		// mid-tick freezes the previous verdict instead of producing one.
+	if (bx1 <= bx0 || by1 <= by0) {
 		b->roi_mask_px = 0;
+		b->roi_mask_usable = false;
 		return false;
 	}
 
@@ -654,6 +698,274 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 	b->roi_mask_rect.y = by0;
 	b->roi_mask_rect.w = bx1 - bx0;
 	b->roi_mask_rect.h = by1 - by0;
+
+	/*
+	 * Too little to measure ON ITS OWN. The analysis would refuse it, and a
+	 * refusal mid-tick freezes the previous verdict instead of producing one.
+	 *
+	 * The mask and its rect are kept anyway (they are still what the ratchet
+	 * accumulates and what the "did the model move?" test reads): the sliver
+	 * check belongs to the REGION handed to the analysis, which the ratchet may
+	 * have widened past this floor — and a thin clipped silhouette dipping
+	 * under it is itself one of #1470's oscillators, flipping the region kind
+	 * from mask to bounds and back.
+	 */
+	b->roi_mask_usable = kept >= COMP_REAR_BUDGET_MASK_MIN_PX && (bx1 - bx0) >= 2u;
+	return b->roi_mask_usable;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The mask RATCHET (#1470)
+ *
+ * v3 defines the app's mask as its RENDERED silhouette, and the render happens
+ * after the shader-side far clip — so the region the runtime measures is a
+ * function of the budget the runtime published, and the loop closes on a static
+ * desktop. See the block comment on the ratchet fields in the header for the
+ * full cycle and the invariant.
+ * ---------------------------------------------------------------------------
+ */
+
+//! Drop what the ratchet holds. The only way out, and it is always this cheap.
+static void
+comp_rear_budget_ratchet_reset(struct comp_rear_budget *b)
+{
+	if (!b->ratchet_valid) {
+		return;
+	}
+	b->ratchet_valid = false;
+	b->ratchet_px = 0;
+	b->ratchet_have_ref = false;
+	// The composition key is (mask build, ratchet gen), so dropping the
+	// ratchet has to move the generation or the region would be re-used as if
+	// nothing had changed.
+	b->ratchet_gen++;
+}
+
+/*!
+ * Accumulate into the ratchet, then compose the region the analysis reads:
+ * `roi_mask UNION ratchet_mask`, or the mask alone when the ratchet holds
+ * nothing.
+ *
+ * Call only when @ref comp_rear_budget::roi_mask holds a mask
+ * (`roi_mask_px > 0`) — including one too thin to measure on its own, because
+ * the union may well clear the floor the sliver does not, and a clipped
+ * silhouette dipping under that floor is itself one of #1470's oscillators.
+ *
+ * @return whether the composed region is big enough to measure through; false
+ *         falls the caller through to the rect path exactly as before.
+ */
+static bool
+comp_rear_budget_build_region(struct comp_rear_budget *b,
+                              const struct xrt_dp_background_preview *pv,
+                              float cu0,
+                              float cv0,
+                              float cu1,
+                              float cv1,
+                              uint32_t zone_gen,
+                              uint32_t zone_count)
+{
+	const uint32_t pw = pv->width;
+	const uint32_t ph = pv->height;
+	const size_t px_count = (size_t)pw * (size_t)ph;
+
+	// Probed once, and an armed kill switch says so: a guard that is silent
+	// when disabled cannot be told from one that never engaged.
+	if (b->ratchet_enabled < 0) {
+		const char *e = getenv("DXR_REAR_BUDGET_MASK_RATCHET");
+		b->ratchet_enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+		if (b->ratchet_enabled == 0) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_MASK_RATCHET armed = 0 (mask ratchet off — the "
+			    "measured region follows the clip state again, #1470)");
+		}
+	}
+	if (b->ratchet_enabled == 0) {
+		comp_rear_budget_ratchet_reset(b);
+	}
+
+	// The session disarmed (left transparent + standalone) since the last
+	// tick. Published from another thread, consumed here.
+	os_mutex_lock(&b->publish_mutex);
+	const bool dropped = b->ratchet_drop_requested;
+	b->ratchet_drop_requested = false;
+	os_mutex_unlock(&b->publish_mutex);
+	if (dropped) {
+		comp_rear_budget_ratchet_reset(b);
+	}
+
+	/*
+	 * The region moved for a reason that has nothing to do with the budget:
+	 * the frame's 3D zones, the preview's resolution, or the slice of the
+	 * window the preview covers. A ratchet accumulated in one of those frames
+	 * describes different pixels in the next one.
+	 */
+	if (b->ratchet_valid && (b->ratchet_pw != pw || b->ratchet_ph != ph || b->ratchet_zone_gen != zone_gen ||
+	                         b->ratchet_zone_count != zone_count || b->ratchet_cu0 != cu0 ||
+	                         b->ratchet_cv0 != cv0 || b->ratchet_cu1 != cu1 || b->ratchet_cv1 != cv1)) {
+		comp_rear_budget_ratchet_reset(b);
+	}
+
+	/*
+	 * The budget the runner published LAST tick: this runs before
+	 * u_rear_budget_update, so it is exactly the value the app's silhouette was
+	 * rendered under. Non-zero covers OPEN and both ramps — a closing ramp is
+	 * still showing rear geometry, so its silhouette still belongs in the
+	 * region.
+	 */
+	const bool budget_open = b->policy.current_vh > 0.0f || b->policy.ramp_to_vh > 0.0f;
+
+	/*
+	 * "The model was dragged or rotated" — and evaluated ONLY while the budget
+	 * is zero, i.e. while the ratchet is holding rather than accumulating.
+	 *
+	 * Growing across the clip plane moves the centroid too (the rear half
+	 * appears on one side of it), so testing this while the budget is open
+	 * would reset the ratchet on exactly the transition it exists to survive.
+	 * While it holds, the silhouette is the clipped one the reference was taken
+	 * from, so any movement past the dilation radius really is the app's.
+	 */
+	if (b->ratchet_valid && b->ratchet_have_ref && !budget_open) {
+		const float dx = b->roi_mask_cx - b->ratchet_cx;
+		const float dy = b->roi_mask_cy - b->ratchet_cy;
+		const float r = (float)b->roi_mask_dilate_r;
+		if (dx * dx + dy * dy > r * r) {
+			comp_rear_budget_ratchet_reset(b);
+		}
+	}
+
+	// The home position, refreshed only while clipped AND holding nothing —
+	// see the field's own comment for why neither of those may be relaxed.
+	if (!budget_open && !b->ratchet_valid) {
+		b->ratchet_cx = b->roi_mask_cx;
+		b->ratchet_cy = b->roi_mask_cy;
+		b->ratchet_have_ref = true;
+	}
+
+	if (budget_open && b->ratchet_enabled == 1) {
+		if (!comp_rear_budget_grow_u8(&b->ratchet_mask, &b->ratchet_mask_cap, px_count)) {
+			// No memory for the guard. Running without it is the old
+			// behaviour, which is a flap, not a wrong verdict.
+			comp_rear_budget_ratchet_reset(b);
+		} else {
+			if (!b->ratchet_valid) {
+				memset(b->ratchet_mask, 0, px_count);
+				b->ratchet_px = 0;
+				b->ratchet_rect = b->roi_mask_rect;
+				if (!b->ratchet_have_ref) {
+					// Started without ever having seen a clipped
+					// frame (a forced-open session, say). This
+					// frame's centroid is the only reference there
+					// is, and a wrong one only costs an extra flap.
+					b->ratchet_cx = b->roi_mask_cx;
+					b->ratchet_cy = b->roi_mask_cy;
+					b->ratchet_have_ref = true;
+				}
+				b->ratchet_pw = pw;
+				b->ratchet_ph = ph;
+				b->ratchet_zone_gen = zone_gen;
+				b->ratchet_zone_count = zone_count;
+				b->ratchet_cu0 = cu0;
+				b->ratchet_cv0 = cv0;
+				b->ratchet_cu1 = cu1;
+				b->ratchet_cv1 = cv1;
+				b->ratchet_valid = true;
+				b->ratchet_gen++;
+			}
+
+			uint32_t added = 0;
+			for (size_t i = 0; i < px_count; i++) {
+				if (b->roi_mask[i] != 0 && b->ratchet_mask[i] == 0) {
+					b->ratchet_mask[i] = 1;
+					added++;
+				}
+			}
+			if (added > 0) {
+				b->ratchet_px += added;
+				if (b->roi_mask_rect.x < b->ratchet_rect.x) {
+					b->ratchet_rect.w += b->ratchet_rect.x - b->roi_mask_rect.x;
+					b->ratchet_rect.x = b->roi_mask_rect.x;
+				}
+				if (b->roi_mask_rect.y < b->ratchet_rect.y) {
+					b->ratchet_rect.h += b->ratchet_rect.y - b->roi_mask_rect.y;
+					b->ratchet_rect.y = b->roi_mask_rect.y;
+				}
+				const uint32_t mx1 = b->roi_mask_rect.x + b->roi_mask_rect.w;
+				const uint32_t my1 = b->roi_mask_rect.y + b->roi_mask_rect.h;
+				if (mx1 > b->ratchet_rect.x + b->ratchet_rect.w) {
+					b->ratchet_rect.w = mx1 - b->ratchet_rect.x;
+				}
+				if (my1 > b->ratchet_rect.y + b->ratchet_rect.h) {
+					b->ratchet_rect.h = my1 - b->ratchet_rect.y;
+				}
+				b->ratchet_gen++;
+			}
+		}
+	}
+
+	const bool use_ratchet = b->ratchet_valid && b->ratchet_px > 0 && b->ratchet_mask != NULL;
+
+	// The re-analysis gate downstream keys on this: it must advance when the
+	// composed region CHANGED and not merely when it was recomposed.
+	const uint32_t key_ratchet_gen = use_ratchet ? b->ratchet_gen : 0u;
+	if (!b->region_key_valid || b->region_key_mask_build_id != b->roi_mask_build_id ||
+	    b->region_key_ratchet_gen != key_ratchet_gen) {
+		b->region_key_valid = true;
+		b->region_key_mask_build_id = b->roi_mask_build_id;
+		b->region_key_ratchet_gen = key_ratchet_gen;
+		b->region_build_id++;
+	}
+
+	if (!use_ratchet || !comp_rear_budget_grow_u8(&b->union_mask, &b->union_mask_cap, px_count)) {
+		b->region = b->roi_mask;
+		b->region_px = b->roi_mask_px;
+		b->region_rect = b->roi_mask_rect;
+		b->region_from_ratchet = false;
+		return b->roi_mask_usable;
+	}
+
+	uint32_t px = 0, surplus = 0;
+	for (size_t i = 0; i < px_count; i++) {
+		const uint8_t v = (uint8_t)((b->roi_mask[i] != 0 || b->ratchet_mask[i] != 0) ? 1 : 0);
+		b->union_mask[i] = v;
+		px += v;
+		surplus += (b->roi_mask[i] == 0 && b->ratchet_mask[i] != 0) ? 1u : 0u;
+	}
+
+	struct u_bg_roi rect = b->roi_mask_rect;
+	if (b->ratchet_rect.x < rect.x) {
+		rect.w += rect.x - b->ratchet_rect.x;
+		rect.x = b->ratchet_rect.x;
+	}
+	if (b->ratchet_rect.y < rect.y) {
+		rect.h += rect.y - b->ratchet_rect.y;
+		rect.y = b->ratchet_rect.y;
+	}
+	const uint32_t rx1 = b->ratchet_rect.x + b->ratchet_rect.w;
+	const uint32_t ry1 = b->ratchet_rect.y + b->ratchet_rect.h;
+	if (rx1 > rect.x + rect.w) {
+		rect.w = rx1 - rect.x;
+	}
+	if (ry1 > rect.y + rect.h) {
+		rect.h = ry1 - rect.y;
+	}
+
+	b->region = b->union_mask;
+	b->region_px = px;
+	b->region_rect = rect;
+	b->region_from_ratchet = surplus > 0;
+	return px >= COMP_REAR_BUDGET_MASK_MIN_PX && rect.w >= 2u && rect.h >= 1u;
+}
+
+bool
+comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_px)
+{
+	if (b == NULL || !b->ratchet_valid || b->ratchet_px == 0) {
+		return false;
+	}
+	if (out_px != NULL) {
+		*out_px = b->ratchet_px;
+	}
 	return true;
 }
 
@@ -756,11 +1068,14 @@ comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
                                  uint32_t *out_h,
                                  uint32_t *out_px)
 {
-	if (b == NULL || !b->roi_mask_in_use || b->roi_mask == NULL || b->roi_mask_px == 0) {
+	// The REGION, which is what the analysis measured — the ratchet's surplus
+	// included. A caller asking "what did you judge" must not be handed the
+	// frame's own silhouette when those differ.
+	if (b == NULL || !b->roi_mask_in_use || b->region == NULL || b->region_px == 0) {
 		return false;
 	}
 	if (out_mask != NULL) {
-		*out_mask = b->roi_mask;
+		*out_mask = b->region;
 	}
 	if (out_w != NULL) {
 		*out_w = b->roi_mask_w;
@@ -769,7 +1084,7 @@ comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
 		*out_h = b->roi_mask_h;
 	}
 	if (out_px != NULL) {
-		*out_px = b->roi_mask_px;
+		*out_px = b->region_px;
 	}
 	return true;
 }
@@ -807,6 +1122,9 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	*out_narrowed = false;
 	*out_src = COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW;
 	b->roi_mask_in_use = false;
+	b->region = NULL;
+	b->region_px = 0;
+	b->region_from_ratchet = false;
 
 	// Probed once. An armed kill switch says so: an A/B whose two arms are
 	// indistinguishable in the log is not an A/B.
@@ -820,6 +1138,10 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 		}
 	}
 	if (b->roi_enabled == 0) {
+		// The whole-preview region is state-independent by construction, so
+		// there is nothing to ratchet and nothing to carry over if the switch
+		// is flipped back.
+		comp_rear_budget_ratchet_reset(b);
 		return;
 	}
 	// The narrower switch: mask off, bounds still on. Two switches because the
@@ -870,6 +1192,13 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	}
 	os_mutex_unlock(&b->publish_mutex);
 
+	if (!have_mask) {
+		// Absent, all-zero, stale past a second, or the mask switch is off.
+		// Each is a state-independent statement that the silhouette the ratchet
+		// accumulated is no longer the region.
+		comp_rear_budget_ratchet_reset(b);
+	}
+
 	const bool have_bounds = valid && age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS;
 	if (!have_mask && !have_bounds && zone_count == 0) {
 		return;
@@ -898,13 +1227,29 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 	 * (absent, all-zero, stale, cleared by the zone clamp, too small to
 	 * measure) falls THROUGH to the rect below rather than to "neutral".
 	 */
-	if (have_mask && comp_rear_budget_build_mask(b, pv, cu0, cv0, cu1, cv1, zones, zone_count, zone_gen,
-	                                             mask_gen)) {
-		*out_roi = b->roi_mask_rect;
-		*out_narrowed = b->roi_mask_px < (uint32_t)pv->width * pv->height;
-		*out_src = COMP_REAR_BUDGET_ROI_SRC_MASK;
-		b->roi_mask_in_use = true;
-		return;
+	if (have_mask) {
+		// The mask's own usability is deliberately not the gate: the ratchet
+		// may widen a sliver past the floor, and the region it composes is
+		// what the analysis measures (#1470).
+		(void)comp_rear_budget_build_mask(b, pv, cu0, cv0, cu1, cv1, zones, zone_count, zone_gen, mask_gen);
+
+		if (b->roi_mask_px > 0 &&
+		    comp_rear_budget_build_region(b, pv, cu0, cv0, cu1, cv1, zone_gen, zone_count)) {
+			*out_roi = b->region_rect;
+			*out_narrowed = b->region_px < (uint32_t)pv->width * pv->height;
+			*out_src = b->region_from_ratchet ? COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET
+			                                  : COMP_REAR_BUDGET_ROI_SRC_MASK;
+			b->roi_mask_in_use = true;
+			return;
+		}
+
+		// The mask was cleared by the zone clamp, or even the union is too
+		// small to measure. Either way the region is about to become a RECT,
+		// which the ratchet has nothing to say about.
+		comp_rear_budget_ratchet_reset(b);
+		b->region = NULL;
+		b->region_px = 0;
+		b->region_from_ratchet = false;
 	}
 
 	if (!have_bounds && zone_count == 0) {
@@ -1213,6 +1558,7 @@ comp_rear_budget_init(struct comp_rear_budget *b, const char *label)
 	b->dump = -1;
 	b->roi_enabled = -1;
 	b->mask_enabled = -1;
+	b->ratchet_enabled = -1;
 
 	if (os_mutex_init(&b->publish_mutex) != 0) {
 		// Without the lock the publish/read pair is a data race, so the
@@ -1259,6 +1605,17 @@ comp_rear_budget_fini(struct comp_rear_budget *b)
 	b->roi_mask_px = 0;
 	b->roi_mask_in_use = false;
 	b->roi_mask_key.valid = false;
+	free(b->ratchet_mask);
+	b->ratchet_mask = NULL;
+	b->ratchet_mask_cap = 0;
+	b->ratchet_valid = false;
+	b->ratchet_px = 0;
+	free(b->union_mask);
+	b->union_mask = NULL;
+	b->union_mask_cap = 0;
+	b->region = NULL;
+	b->region_px = 0;
+	b->region_key_valid = false;
 	free(b->dilate_scratch);
 	b->dilate_scratch = NULL;
 	b->dilate_scratch_cap = 0;
@@ -1287,6 +1644,19 @@ comp_rear_budget_arm(struct comp_rear_budget *b, bool transparent)
 	const bool running = b->initialised && b->requested && transparent;
 	if (running != b->running) {
 		b->running = running;
+		if (!running && b->initialised) {
+			/*
+			 * Leaving transparent + standalone is a state-independent
+			 * change of region: the session that comes back may be a
+			 * different window on a different part of the desktop, and a
+			 * ratchet from the old one would hold it closed for reasons
+			 * nobody could see. Flagged rather than cleared, because the
+			 * ratchet is the render thread's and this is not it.
+			 */
+			os_mutex_lock(&b->publish_mutex);
+			b->ratchet_drop_requested = true;
+			os_mutex_unlock(&b->publish_mutex);
+		}
 		// open<= is the cue dead band's lower edge (u_rear_budget's
 		// open_cue_max). Without it in the armed line a run that sat in the
 		// band all session looks identical to one that never measured
@@ -1382,17 +1752,20 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		// A silhouette can change shape inside an unchanged bounding rect —
 		// an arm coming down moves no edge of the box — so the mask needs its
 		// own "this is not what we measured last time" term.
-		const bool mask_new = b->roi_mask_in_use && b->roi_mask_build_id != b->last_analysed_mask_build_id;
+		// The REGION, not the frame's mask: the ratchet can change what is
+		// measured without the app's silhouette changing at all, and a gate
+		// that missed that would hold the verdict the ratchet exists to revise.
+		const bool mask_new = b->roi_mask_in_use && b->region_build_id != b->last_analysed_mask_build_id;
 
 		if (gen_new || roi_new || mask_new) {
 			struct u_bg_neutrality_result res = {0};
-			const uint8_t *mask = b->roi_mask_in_use ? b->roi_mask : NULL;
+			const uint8_t *mask = b->roi_mask_in_use ? b->region : NULL;
 			if (u_bg_neutrality_analyse_masked(pv->bgra, pv->width, pv->height, pv->stride_bytes, &roi,
 			                                   mask, b->roi_mask_w, NULL, &res)) {
 				b->result = res;
 				b->have_result = true;
 			}
-			b->last_analysed_mask_build_id = b->roi_mask_build_id;
+			b->last_analysed_mask_build_id = b->region_build_id;
 		}
 		b->last_roi = roi;
 		b->last_roi_narrowed = narrowed;
@@ -1444,9 +1817,10 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		// region because the policy is deliberately ROI-blind. Without this a
 		// busy verdict is unattributable: measured under the content, or over
 		// a canvas the content was nowhere near?
-		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u mask=%u (%s)",
+		U_LOG_W("REAR_BUDGET %s: roi=%u,%u,%u,%u mask=%u ratchet=%u (%s)",
 		        b->policy.label[0] != '\0' ? b->policy.label : "session", b->last_roi.x, b->last_roi.y,
-		        b->last_roi.w, b->last_roi.h, b->roi_mask_in_use ? b->roi_mask_px : 0u,
+		        b->last_roi.w, b->last_roi.h, b->roi_mask_in_use ? b->region_px : 0u,
+		        (b->roi_mask_in_use && b->ratchet_valid) ? b->ratchet_px : 0u,
 		        !b->have_roi ? "no preview analysed" : comp_rear_budget_roi_src_str(b->last_roi_src));
 	}
 

@@ -127,6 +127,15 @@ enum comp_rear_budget_roi_src
 	 * bounding rect of that mask — what was measured is the mask itself.
 	 */
 	COMP_REAR_BUDGET_ROI_SRC_MASK,
+	/*!
+	 * The mask, WIDENED by the ratchet (#1470): the union of this frame's
+	 * silhouette and the silhouette that was observed while the budget was
+	 * last open. Reported instead of @ref COMP_REAR_BUDGET_ROI_SRC_MASK
+	 * whenever the union covers more than the frame's own mask, so a verdict
+	 * measured over a region the app is not currently drawing stays
+	 * attributable.
+	 */
+	COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET,
 	//! The app's content bounds, unclamped (full-window app: no 3D zones).
 	COMP_REAR_BUDGET_ROI_SRC_BOUNDS,
 	//! The app's content bounds intersected with the frame's 3D zones.
@@ -291,6 +300,18 @@ struct comp_rear_budget
 	//! Bumped on every rebuild, so the tick can re-measure an unchanged capture.
 	uint32_t roi_mask_build_id;
 	uint32_t last_analysed_mask_build_id;
+	//! The mask alone holds enough pixels to measure through (cached with it).
+	bool roi_mask_usable;
+	/*!
+	 * Centroid of the resampled, zone-clamped mask BEFORE dilation, in preview
+	 * pixels. Pre-dilation on purpose: the band is a fixed-width skirt, so
+	 * including it biases the centroid toward whichever side the silhouette
+	 * happens to be thin on and makes "did the model move?" depend on the
+	 * dilation radius it is compared against.
+	 */
+	float roi_mask_cx, roi_mask_cy;
+	//! Dilation radius @ref roi_mask was built with, in preview pixels.
+	uint32_t roi_mask_dilate_r;
 	//! DXR_REAR_BUDGET_MASK. -1 = unprobed, 0 = mask off, bounds still on.
 	int mask_enabled;
 	//! One-shot: the mask fell entirely outside every 3D zone.
@@ -301,6 +322,96 @@ struct comp_rear_budget
 	//! Tinted copy handed to the dump sink; only allocated while dumping.
 	uint8_t *dump_tint;
 	size_t dump_tint_cap;
+	/*! @} */
+
+	/*!
+	 * @name XR_DXR_depth_budget - the mask RATCHET (#1470)
+	 *
+	 * v3's contract defines the mask as the app's RENDERED silhouette, and the
+	 * render happens after the shader-side far clip. So the region the runtime
+	 * measures is a function of the budget it published, and that loop closes
+	 * on a perfectly static desktop: clipped -> only the front half renders ->
+	 * a small mask sitting in a blank margin -> neutral -> open -> the rear
+	 * half appears -> the mask grows across a text column -> busy -> close ->
+	 * the rear half is discarded -> repeat, every 0.6-1.1 s. Neither the
+	 * dwell/grace (time axis) nor the cue dead band (measurement axis) can damp
+	 * it, because both verdicts are correct about their own region.
+	 *
+	 * Spec v4 fixes the CONTRACT (the mask is the unclipped silhouette). This
+	 * is the runtime's own guard, and it ships to every app already in the
+	 * field. The invariant:
+	 *
+	 *   the re-open verdict is never measured over a region SMALLER than the
+	 *   region that produced the last close verdict, unless the region changed
+	 *   for a state-INDEPENDENT reason.
+	 *
+	 * Mechanically: while the budget is non-zero, every dilated mask is OR'd
+	 * into @ref ratchet_mask; while it is zero the ratchet HOLDS, and the
+	 * analysis measures @ref roi_mask UNION @ref ratchet_mask. The rear half's
+	 * text therefore stays in the measured region after the clip discards it,
+	 * the re-open never happens, and the worst case is one flap instead of an
+	 * indefinite cycle.
+	 *
+	 * Reset (see @ref comp_rear_budget_ratchet_reset) is exactly the set of
+	 * reasons the region changed for something OTHER than the budget: the zone
+	 * rects, the preview dims or canvas rect, the mask going absent / all-zero
+	 * / stale, either kill switch, the session leaving transparent+standalone,
+	 * and the mask's centroid moving further than the dilation radius — the
+	 * model was dragged or rotated, so the old region describes a place the
+	 * content no longer is.
+	 *
+	 * Entirely on the runner's side, like @ref roi_mask: the render thread
+	 * never reads app memory, and the only cross-thread write is
+	 * @ref ratchet_drop_requested, set under @ref publish_mutex.
+	 * @{
+	 */
+	uint8_t *ratchet_mask; //!< Preview-res, tight stride. Accumulated while open.
+	size_t ratchet_mask_cap;
+	uint32_t ratchet_px;          //!< Nonzero pixels in @ref ratchet_mask.
+	struct u_bg_roi ratchet_rect; //!< Its bounding rect, in preview pixels.
+	bool ratchet_valid;           //!< The ratchet holds a region to union in.
+	/*!
+	 * The silhouette's HOME centroid: where the mask sits while the budget is
+	 * fully clipped. Recorded on every tick that is clipped with nothing
+	 * held — never while accumulating, and never refreshed while holding, or a
+	 * slow drag would walk the reference along with it and never trip.
+	 *
+	 * Deliberately not "the centroid on the tick the ratchet started": the app
+	 * sees the open budget one frame before the runner ticks again, so by then
+	 * the silhouette has ALREADY grown and its centroid is the open one — which
+	 * is the position the held mask can never return to, so comparing against
+	 * it would reset the ratchet on every close and restore the loop exactly.
+	 */
+	float ratchet_cx, ratchet_cy;
+	bool ratchet_have_ref;
+	uint32_t ratchet_pw, ratchet_ph; //!< Preview dims it was accumulated in.
+	uint32_t ratchet_zone_gen, ratchet_zone_count;
+	float ratchet_cu0, ratchet_cv0, ratchet_cu1, ratchet_cv1;
+	//! Set under @ref publish_mutex when the session disarms; consumed by the tick.
+	bool ratchet_drop_requested;
+	//! Bumped whenever @ref ratchet_mask's CONTENT changed.
+	uint32_t ratchet_gen;
+	//! DXR_REAR_BUDGET_MASK_RATCHET. -1 = unprobed, 0 = kill switch armed.
+	int ratchet_enabled;
+
+	//! @ref roi_mask UNION @ref ratchet_mask; only built when they differ.
+	uint8_t *union_mask;
+	size_t union_mask_cap;
+
+	/*!
+	 * The mask the analysis reads: @ref roi_mask, or @ref union_mask when the
+	 * ratchet widened it. Points into this struct, never into app memory.
+	 */
+	const uint8_t *region;
+	uint32_t region_px;
+	struct u_bg_roi region_rect;
+	//! Bumped whenever @ref region's contents changed — the re-analysis gate.
+	uint32_t region_build_id;
+	//! Composition @ref region_build_id describes.
+	uint32_t region_key_mask_build_id, region_key_ratchet_gen;
+	bool region_key_valid;
+	//! The ratchet covered pixels this frame's own mask does not.
+	bool region_from_ratchet;
 	/*! @} */
 
 	/*!
@@ -629,6 +740,16 @@ comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
  */
 uint32_t
 comp_rear_budget_debug_mask_build_id(const struct comp_rear_budget *b);
+
+/*!
+ * TEST ONLY — nonzero preview pixels the RATCHET currently holds.
+ *
+ * @return false when the ratchet is not armed or holds nothing.
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_px);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.
