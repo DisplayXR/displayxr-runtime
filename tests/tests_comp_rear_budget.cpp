@@ -1387,3 +1387,46 @@ TEST_CASE("comp_rear_budget: the mask maps through a preview that carries a marg
 	CHECK(roi.x == 58);
 	CHECK(roi.x + roi.w == 82);
 }
+
+
+TEST_CASE("comp_rear_budget: re-publishing an identical mask does not rebuild it")
+{
+	Runner r;
+	FakePreview neutral(200, 100, /*generation=*/1, /*busy=*/false);
+
+	MaskGrid m(20, 10);
+	m.set(5, 3, 9, 7);
+	mask(r, m, 0);
+	step(r, &neutral.pv, 0);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+
+	const uint32_t built = comp_rear_budget_debug_mask_build_id(&r.b);
+	REQUIRE(built > 0);
+
+	/*
+	 * An app chains its silhouette EVERY frame. A generation that counted
+	 * publishes rather than changes would invalidate the cache on every poll -
+	 * a full resample, zone clamp, dilation and bbox scan over an unchanged
+	 * grid - and, worse, would leave `mask_new` permanently true, so "the mask
+	 * changed" carried no information at all (#1470). That is the trap
+	 * `zone_gen` already documents one level up.
+	 */
+	for (uint64_t t = 100 * MS; t <= 1000 * MS; t += 10 * MS) {
+		mask(r, m, t);
+		step(r, &neutral.pv, t);
+	}
+	CHECK(comp_rear_budget_debug_mask_build_id(&r.b) == built);
+
+	// A real change still rebuilds - the cache must not be a cache of nothing.
+	MaskGrid moved(20, 10);
+	moved.set(6, 3, 10, 7);
+	mask(r, moved, 1010 * MS);
+	step(r, &neutral.pv, 1010 * MS);
+	CHECK(comp_rear_budget_debug_mask_build_id(&r.b) > built);
+
+	// So does a change of margin alone: it is an input to the dilation.
+	const uint32_t after_move = comp_rear_budget_debug_mask_build_id(&r.b);
+	mask(r, moved, 1100 * MS, /*margin=*/0.05f);
+	step(r, &neutral.pv, 1100 * MS);
+	CHECK(comp_rear_budget_debug_mask_build_id(&r.b) > after_move);
+}
