@@ -219,6 +219,48 @@ when the runtime lacks the extension.
   why the dump PNG now tints the dilated mask: `roi=` cannot describe a mask (a bar and the box
   around it share a bounding rect and share nothing else), so without the tint a v3 verdict would
   be unfalsifiable in exactly the way v1's canvas-wide one was.
+- **A hint derived from the runtime's own answer is a control loop, not a hint (v4).** v3 asked for
+  the app's *rendered* silhouette, and rendering happens after the shader-side far cull — so the
+  region the runtime measured was a function of the budget the runtime had just published. On a
+  perfectly static desktop that closes: clipped, only the front half renders, the small silhouette
+  sits in a blank page margin, neutral, the dwell is served, the budget opens, the rear half
+  appears, the silhouette grows across a text column, busy, close, the rear half is discarded,
+  round again every 0.6-1.1 s
+  ([#1470](https://github.com/DisplayXR/displayxr-runtime/issues/1470), the storefront demo's
+  undocked model viewer). Neither damper could touch it: the dwell/grace are hysteresis on the time
+  axis and the dead band on the measurement axis, and *both verdicts were correct about their own
+  region* — what moved was the region. Note that the v2 **bounds** never had this problem, because
+  the rule §6 states for them ("if a piece of geometry would not be clipped by the rear budget, it
+  does not belong in the AABB") is clip-independent by construction; v3 introduced the coupling by
+  reusing the one artefact an app derives *after* the clip. `SPEC_VERSION` 4 restates the mask rule
+  as that same rule — the silhouette as it would render at an unrestricted budget — and names the
+  divergence explicitly: the click-through window region keeps the clipped alpha, because it
+  answers a different question ("which pixels were painted"). The general lesson sits beside the
+  `open_cue_max` one below: a state machine whose entry and exit conditions are the same comparison
+  has no stable region, and a state machine whose *input* is computed from its own output has none
+  either, however correct each half is.
+- **A contract fix does not reach the apps already shipped, so the runtime ratchets (v4).** Every
+  v3 app in the field reports the clipped silhouette, and a spec bump changes none of them. So the
+  runtime makes the measured region monotonic in budget state: while the budget is non-zero it
+  unions every silhouette it sees, while the budget is zero it holds that accumulation, and it
+  measures `this frame's mask ∪ the held one`. The invariant — *the re-open verdict is never
+  measured over a region smaller than the region that produced the last close verdict, unless the
+  region changed for a state-independent reason* — bounds the worst case at one flap. It is
+  deliberately a one-way guard: a held region is by construction wider than what the app is
+  drawing, so it can only ever keep the budget closed longer than the truth, which is the same
+  direction every other fallback in this design errs in. What earns its keep is the release rule,
+  because a guard that never released would be a budget that never reopened: the zone rects, the
+  preview dims or canvas rect, the mask going absent/all-zero/stale, either kill switch, the
+  session disarming, and the silhouette's centroid moving further than the dilation radius from
+  where it sits while clipped. That last one is the whole difficulty in miniature — growing across
+  the clip plane moves the centroid too, so it is compared only while the ratchet is *holding*, and
+  against the centroid observed on clipped frames rather than the one from the frame the ratchet
+  started on (the app sees an open budget a frame before the runner ticks again, so that reference
+  would already be the grown shape's, and comparing against it would reset on every close and
+  restore the loop exactly). Attributability is the other half: the ratchet reports its own
+  `roi_src`, the transition line carries `ratchet=`, and the dump PNG tints the held surplus blue
+  against the frame's own silhouette in green — a correctly held-closed budget and a cycling one
+  read identically in the state log.
 - **One threshold cannot both admit and reject.** `u_bg_neutrality` reports `neutral` as `cue < 1.0`,
   and the panel found a background parked at 0.93–0.97: the dwell was served, the budget opened, the
   next sample crossed 1.0, it closed after the grace, for seconds. The dwell and the close grace are

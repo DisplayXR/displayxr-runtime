@@ -63,7 +63,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_depth_budget 1
-#define XR_DXR_depth_budget_SPEC_VERSION 3
+#define XR_DXR_depth_budget_SPEC_VERSION 4
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 
 // Reserved 1004999xxx range, next free block after view_rig (…140-142).
@@ -195,10 +195,34 @@ typedef struct XrEventDataRearDepthBudgetStateChangedDXR {
 } XrEventDataRearDepthBudgetStateChangedDXR;
 
 /*!
- * v3 INPUT (SPEC_VERSION 3): the app's content OCCUPANCY MASK for this frame - the
- * union over ALL views of its rendered silhouette (the same artefact a transparent
- * app derives from alpha for its click-through window region). Chain on
- * XrFrameEndInfo::next, beside or instead of XrContentBoundsDXR.
+ * v3 INPUT (SPEC_VERSION 3; semantics clarified in 4): the app's content OCCUPANCY
+ * MASK for this frame - the union over ALL views of the silhouette of the content
+ * SUBJECT TO the rear budget, rasterised IGNORING the far clip, i.e. as it would
+ * render at an unrestricted budget. Chain on XrFrameEndInfo::next, beside or
+ * instead of XrContentBoundsDXR.
+ *
+ * This mirrors the bounds rule exactly: if a piece of geometry would not be
+ * clipped by the rear budget, it does not belong in the mask - and, symmetrically,
+ * geometry the CURRENT budget happens to be clipping away still does.
+ *
+ * SPEC_VERSION 4 (#1470) says so explicitly because the v3 wording ("its rendered
+ * silhouette") made the mask a function of the budget the runtime published, and
+ * that is a feedback loop: clipped -> a small silhouette over a quiet patch of
+ * desktop -> the budget opens -> the rear half appears -> the silhouette grows
+ * over a busy one -> the budget closes -> the rear half is discarded -> round
+ * again, roughly once a second, on a static desktop. So the mask and the app's
+ * CLICK-THROUGH window region diverge: the window region keeps the clipped alpha,
+ * because that one is about which pixels were actually painted. Build the mask
+ * from the same coverage pass with the far cull disabled (or from the pre-clip
+ * geometry), not from the post-clip alpha readback the window region uses.
+ *
+ * Runtimes reporting SPEC_VERSION 3 read the mask identically - the struct is
+ * byte-identical and no behaviour is conditional on the version - so an app may
+ * ship the unclipped mask unconditionally, and should: it is what the region rule
+ * always meant. Runtimes additionally RATCHET the measured region (they hold the
+ * silhouette observed while the budget was last open) so that an app still
+ * reporting the clipped one degrades to a single flap rather than an endless
+ * cycle; that guard is a floor, not the contract.
  *
  * Grid: row-major, top-left origin, WINDOW-CLIENT-normalised extent - cell (x, y)
  * covers [x/width, (x+1)/width) x [y/height, (y+1)/height) of the window client
