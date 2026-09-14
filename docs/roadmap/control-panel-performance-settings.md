@@ -107,6 +107,15 @@ All `DXR_TEST_*` · every `_DIAG` / `_DUMP` / `_PROBE` / `_JIGGLE` / `_REFLATTEN
 cost frame rate"*) · `DXR_SIM_INPUT` (+ `DXR_SIM_INPUT_NAV*`) · `DXR_LEGACY_STANDALONE` · `DXR_IPC_FD` /
 `DXR_IPC_HANDLE` · `DXR_ALLOW_UNVERIFIED_CONTROLLER`.
 
+Plus the **rear-depth-budget A/B kill switches** — `DXR_REAR_BUDGET` (`clip`/`open`/`auto`),
+`DXR_REAR_BUDGET_OPEN_DWELL_MS` / `_CLOSE_MS` / `_RAMP_OPEN_MS` / `_RAMP_CLOSE_MS` /
+`_OPEN_CUE_MAX`, `DXR_REAR_BUDGET_ROI=0`, `DXR_REAR_BUDGET_MASK=0`,
+`DXR_REAR_BUDGET_MASK_RATCHET=0` and `DXR_REAR_BUDGET_DUMP=1`. They are read once per
+session in `comp_rear_budget.c` / `u_rear_budget.c` and every one of them turns off or
+detunes a **correctness** guard rather than trading frames for quality — `_MASK_RATCHET=0`
+in particular restores the #1470 open/clip oscillation by design, which is the only reason
+it exists. Perceptual policy is the runtime's (ADR-040); none of these is a user setting.
+
 > **Security carve-out — `DXR_ALLOW_DEV_PLUGIN_PATHS`.** It is read via
 > `GetEnvironmentVariableW` in `target_plugin_path_guard.c:91`, deliberately outside the
 > `u_debug` machinery, and it **disables the #943 plug-in-path guard** — i.e. it decides
