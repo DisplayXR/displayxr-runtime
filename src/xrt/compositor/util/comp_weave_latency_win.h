@@ -101,9 +101,8 @@ struct weave_latency_log
 	//! Resolved from after_present, one to a few presents after the
 	//! prediction, so a window's `resolved` lags its `n` by the resolve
 	//! depth — read the two as neighbours, not as a ratio. (The coverage
-	//! gate below does divide its own pair, but over an epoch of >= 32
-	//! resolves the lag only depresses a 100%-join chain's first verdict to
-	//! ~32/47; it cannot by itself push one under the 50% line.)
+	//! gate below does divide its own pair, but over an epoch of 1024 armed
+	//! the <= 8-deep resolve lag is noise: a 100%-join chain reads ~1016/1024.)
 	uint32_t hz_resolved = 0;
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
@@ -120,6 +119,18 @@ struct weave_latency_log
 	uint64_t hz_gap_sum = 0;
 	uint32_t hz_gap_n = 0;
 	uint64_t hz_sync_lag_sum = 0; // sum of (SyncRefreshCount - PresentRefreshCount)
+	//! #1339 (Arc box, 2026-09-14): repaints are the dose of the lateral
+	//! shiver and the d3d11 fill arm its locus. Both weave kinds are handed a
+	//! horizon from the same grid; if their REALISED latencies differ (an app
+	//! frame queued behind others, a repaint issued into a quiet queue and
+	//! flipping next vblank) the eye predictor's error alternates at the
+	//! repaint rate. These split the window's armed/resolved/error by kind so
+	//! that difference is a number in the row, not a hypothesis.
+	uint32_t hz_rp_n = 0;             // horizons armed for repaints
+	uint32_t hz_rp_resolved = 0;      // of which resolved
+	uint32_t hz_rp_refused = 0;       // #1339 repaint ticks refused at the frame-latency cap
+	uint64_t hz_rp_abs_err_sum_ns = 0;
+	int64_t hz_rp_err_sum_ns = 0;
 	//! Histogram of round(err / period), k in [-2, +4] (clamped): the MODE is
 	//! the pipeline's constant offset (a composed chain adds a whole DWM
 	//! frame the forward horizon does not model); a WRONG SLOT is a sample
@@ -176,10 +187,17 @@ struct weave_latency_log
 	 * re-qualified the loop while the arm's true coverage was 0-9% (measured:
 	 * `applied` left +0 in 5 of 8 legs, once +0 -> +3 in 1.7 s, 68 s after the
 	 * gate's own WARN had said "0 of 1024 armed"). So now:
-	 *  - coverage is judged CUMULATIVELY since the last verdict; a verdict
-	 *    comes at 32 observations OR 1024 armed horizons, whichever first, so
-	 *    a burst after a starved stretch is scored against the whole stretch,
-	 *    and an arm that resolves nothing still reaches a verdict (~17 s);
+	 *  - a verdict closes every PO_EPOCH_ARMED armed horizons (~17 s at 60/s)
+	 *    and NEVER on an observation count. Round 4 (Arc box, v2.16.27, 25
+	 *    legs): with a verdict also closing at 32 observations, a bad verdict
+	 *    needed ~17 s of evidence but a covered one closed in ~0.6 s on that
+	 *    arm (32 of ~39 armed), so one 5 s burst minted five covered verdicts
+	 *    in a row and the loop latched +3 in 5 of 10 legs. Replayed against
+	 *    all 25 legs: at 1024 armed per verdict no avatar epoch on that arm
+	 *    reaches 50% (best 36%) while every cube epoch covers at 99.7-100%;
+	 *    at 512 two of 169 leaked. Same denominator, same evidence, both
+	 *    sides. Cost: a healthy chain's first verdict, and so its first
+	 *    decision, moves from ~0.5 s to ~17 s after the loop arms;
 	 *  - a verdict under 50% counts as BAD and by itself blocks the next
 	 *    window; two consecutive bad verdicts REFUSE (sticky): the loop
 	 *    unlearns to +0 in one step (the pre-#1437 feed is the honest value
@@ -195,36 +213,42 @@ struct weave_latency_log
 	 *    every ~5 s; a second threshold for recovery instead left a steady
 	 *    50-66% chain refused for the life of the struct — on the service
 	 *    multi-compositor that is the logon session;
-	 *  - a covered verdict authorises the NEXT epoch's window (`po_coverage_ok`
-	 *    is the last verdict, latched forward). If the arm starves right
-	 *    after a covered verdict, a trickle of 32 resolves inside 1024 armed
-	 *    can still take ONE step before that epoch closes bad and drops the
-	 *    window; the second bad verdict then refuses and unlearns it. Bounded
-	 *    to one step, ~35 s, and the trace row shows `refused`/bad/good;
+	 *  - a covered verdict authorises the NEXT epoch (`po_coverage_ok` is the
+	 *    last verdict, latched forward), and an epoch may take ONE step
+	 *    (`po_changes_this_epoch`): an arm that degrades right after a covered
+	 *    verdict can deliver hundreds of resolves inside the next 1024 armed,
+	 *    which is a dozen full windows — without the bound it would climb to
+	 *    the cap inside that epoch and hold it ~17 s. With it: one step, then
+	 *    the bad verdict drops the window and the second one unlearns it;
 	 *  - refuse / recover each log once per edge; the gate state is reset
 	 *    with the chain (`po_gate_reset()` from close() and from the
 	 *    in-process target destroy), never carried into the next chain.
-	 * A healthy chain (join 66-100%) reaches its first verdict after ~32-48
-	 * armed weaves and is never refused, so its lock timing is unchanged.
+	 * A healthy chain (join 66-100%) covers every epoch and is never refused;
+	 * its first decision waits for its first epoch (~17 s at 60/s), and each
+	 * later step for the next one. `po_applied` is deliberately NOT reset with
+	 * the gate on teardown, so a chain recreated in-process keeps the last
+	 * chain's offset for that first epoch.
 	 */
 	static constexpr uint64_t PO_EDGE_DWELL_NS = 30ull * 1000ull * 1000ull * 1000ull;
+	static constexpr uint32_t PO_EPOCH_ARMED = 1024; // armed horizons per coverage verdict
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
+	uint32_t po_changes_this_epoch = 0; // decisions taken since the last verdict (max 1)
 	bool po_coverage_ok = false;   // did the last closed epoch cover (>= 50%)? latched forward
 	bool po_refused = false;       // sticky: two consecutive verdicts came in under 50%
 	uint32_t po_bad_verdicts = 0;  // consecutive verdicts under 50% (refusal needs 2)
 	uint32_t po_good_verdicts = 0; // consecutive verdicts at >= 50% (recovery needs 3)
 	uint64_t po_edge_ns = 0;       // last refuse/recover edge (0 = none yet); dwell anchor
 
-	//! Coverage verdict at 32 observations, or (from predict, `from_arm`) at
-	//! 1024 armed horizons without reaching 32.
+	//! Coverage verdict every PO_EPOCH_ARMED armed horizons, from predict —
+	//! never from an observation count (see the design block above).
 	void
-	po_epoch_close(bool from_arm)
+	po_epoch_close()
 	{
-		if (po_cov_resolved < 32 && !(from_arm && po_cov_armed >= 1024)) {
+		if (po_cov_armed < PO_EPOCH_ARMED) {
 			return;
 		}
-		const bool covered = po_cov_resolved >= 32 && po_cov_resolved * 2 >= po_cov_armed;
+		const bool covered = po_cov_resolved * 2 >= po_cov_armed;
 		// An edge needs its verdict count AND the dwell since the opposite
 		// edge. The counters keep running while the dwell holds, so the edge
 		// fires on the first verdict after it expires if the evidence stands.
@@ -265,6 +289,7 @@ struct weave_latency_log
 		po_coverage_ok = covered && !po_refused;
 		po_cov_resolved = 0;
 		po_cov_armed = 0;
+		po_changes_this_epoch = 0;
 	}
 
 	void
@@ -281,16 +306,15 @@ struct weave_latency_log
 		}
 		po_win[po_win_head] = (int8_t)k;
 		po_win_head = (po_win_head + 1) % 32;
-		// Coverage verdict: at 32 observations (or 1024 armed, from predict),
-		// how many horizons had to be armed to get them. See po_epoch_close.
+		// Coverage bookkeeping only: the verdict closes on the ARMED count,
+		// in predict_weave_to_scanout_ns. See po_epoch_close.
 		po_cov_resolved++;
-		po_epoch_close(false);
 		if (po_win_n < 32) {
 			po_win_n++;
 			return; // decide only on a full window
 		}
-		if (!po_coverage_ok) {
-			return; // the join has not covered this arm's pipeline; no decision
+		if (!po_coverage_ok || po_changes_this_epoch != 0) {
+			return; // no cover for this arm's pipeline, or this epoch's one step is taken
 		}
 		uint32_t hist[7] = {0, 0, 0, 0, 0, 0, 0};
 		for (uint32_t i = 0; i < 32; i++) {
@@ -367,6 +391,7 @@ struct weave_latency_log
 		}
 		po_applied = next;
 		po_changes++;
+		po_changes_this_epoch++;
 		po_win_n = 0; // re-measure against the new value
 		if (next < cap) {
 			po_clamp_logged = false; // left the cap: a later re-climb to it may log again
@@ -386,6 +411,7 @@ struct weave_latency_log
 		po_good_verdicts = 0;
 		po_cov_armed = 0;
 		po_cov_resolved = 0;
+		po_changes_this_epoch = 0;
 		po_coverage_ok = false;
 		po_edge_ns = 0;
 	}
@@ -614,7 +640,7 @@ struct weave_latency_log
 		pending_horizon_base_qpc = nowq;
 		if (po_enabled == PO_ON) {
 			po_cov_armed++;
-			po_epoch_close(true);
+			po_epoch_close();
 		}
 		return horizon_ns;
 	}
@@ -625,7 +651,7 @@ struct weave_latency_log
 	 * DXR_DP_FORWARD_HORIZON_TRACE row; no-op when the trace is off.
 	 */
 	void
-	note_horizon_outcome(int64_t err_ns, uint64_t period_ns, uint32_t sync_lag_refreshes)
+	note_horizon_outcome(int64_t err_ns, uint64_t period_ns, uint32_t sync_lag_refreshes, bool repaint)
 	{
 		if (hz_trace != HZ_ON || period_ns == 0) {
 			return;
@@ -634,6 +660,11 @@ struct weave_latency_log
 		hz_resolved++;
 		hz_abs_err_sum_ns += a;
 		hz_err_sum_ns += err_ns;
+		if (repaint) {
+			hz_rp_resolved++;
+			hz_rp_abs_err_sum_ns += a;
+			hz_rp_err_sum_ns += err_ns;
+		}
 		hz_sync_lag_sum += sync_lag_refreshes;
 		// Nearest whole period, clamped into the histogram.
 		const double kf = (double)err_ns / (double)period_ns;
@@ -645,6 +676,15 @@ struct weave_latency_log
 			k = 4;
 		}
 		hz_k_hist[k + 2]++;
+	}
+
+	//! #1339: a repaint tick the queue cap refused (comp_d3d11_target_repaint_admit).
+	void
+	note_repaint_refused()
+	{
+		if (hz_trace == HZ_ON) {
+			hz_rp_refused++;
+		}
 	}
 
 	/*!
@@ -666,6 +706,9 @@ struct weave_latency_log
 		const uint64_t now_ns = os_monotonic_get_ns();
 		if (hz_win_start_ns == 0) {
 			hz_win_start_ns = now_ns;
+		}
+		if (pending_repaint) {
+			hz_rp_n++; // armed for a repaint (mark_weave ran before predict)
 		}
 
 		// A jump of half a period or more cannot be drift — the grid quantises
@@ -715,27 +758,40 @@ struct weave_latency_log
 			// their empty defaults read as a perfect window (Arc-box leg).
 			U_LOG_W("#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			        "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
-			        "| NO JOIN (armed %u, resolved 0)  applied %+d  refused %d (bad %u, good %u)  "
-			        "present gap %s  | depth %d (%u changes)",
+			        "| NO JOIN (armed %u = app %u + repaint %u, refused %u, resolved 0)  applied %+d  "
+			        "refused %d (bad %u, good %u)  present gap %s  | depth %d (%u changes)",
 			        hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6,
 			        (double)hz_max_ns / 1e6, (double)(hz_max_ns - hz_min_ns) / 1e6,
 			        (double)(hz_max_ns - hz_min_ns) / (double)period_ns, hz_jumps, (double)hz_jumps / secs, hz_n,
-			        po_applied, (int)po_refused, po_bad_verdicts, po_good_verdicts, gap, hz_depth,
-			        hz_depth_changes);
+			        hz_n - hz_rp_n, hz_rp_n, hz_rp_refused, po_applied, (int)po_refused, po_bad_verdicts,
+			        po_good_verdicts, gap,
+			        hz_depth, hz_depth_changes);
 		} else {
+			// #1339: the same numbers split by weave kind (app = total - repaint).
+			const uint32_t app_res = hz_resolved - hz_rp_resolved;
+			const uint32_t app_n = hz_n - hz_rp_n;
+			const double app_abs =
+			    app_res ? (double)(hz_abs_err_sum_ns - hz_rp_abs_err_sum_ns) / (double)app_res / 1e6 : 0.0;
+			const double app_bias =
+			    app_res ? (double)(hz_err_sum_ns - hz_rp_err_sum_ns) / (double)app_res / 1e6 : 0.0;
+			const double rp_abs = hz_rp_resolved ? (double)hz_rp_abs_err_sum_ns / (double)hz_rp_resolved / 1e6 : 0.0;
+			const double rp_bias = hz_rp_resolved ? (double)hz_rp_err_sum_ns / (double)hz_rp_resolved / 1e6 : 0.0;
 			U_LOG_W(
 			    "#206 horizon trace: n=%u  min %.2f  mean %.2f  max %.2f ms  "
 			    "spread %.2f ms (%.2f periods)  boundary flips %u (%.1f/s)  "
 			    "| join %u/%u (%.0f%%)  residual %+d periods  applied %+d  refused %d (bad %u, good %u)  "
 			    "wrong-slot %u (%.1f%%)  mean |err| %.2f ms  bias %+.2f ms  sync-flip lag %.2f refr  "
-			    "present gap %s  | depth %d (%u changes)",
+			    "| by kind: app %u/%u |err| %.2f bias %+.2f ms  repaint %u/%u |err| %.2f bias %+.2f ms  "
+			    "(refused %u)  "
+			    "| present gap %s  | depth %d (%u changes)",
 			    hz_n, (double)hz_min_ns / 1e6, (double)hz_sum_ns / (double)hz_n / 1e6, (double)hz_max_ns / 1e6,
 			    (double)(hz_max_ns - hz_min_ns) / 1e6, (double)(hz_max_ns - hz_min_ns) / (double)period_ns,
 			    hz_jumps, (double)hz_jumps / secs, hz_resolved, hz_n, 100.0 * (double)hz_resolved / (double)hz_n,
 			    mode_i - 2, po_applied, (int)po_refused, po_bad_verdicts, po_good_verdicts, hz_wrong_slot,
 			    100.0 * (double)hz_wrong_slot / (double)hz_resolved,
 			    (double)hz_abs_err_sum_ns / (double)hz_resolved / 1e6, (double)hz_err_sum_ns / (double)hz_resolved / 1e6,
-			    (double)hz_sync_lag_sum / (double)hz_resolved, gap, hz_depth, hz_depth_changes);
+			    (double)hz_sync_lag_sum / (double)hz_resolved, app_res, app_n, app_abs, app_bias, hz_rp_resolved,
+			    hz_rp_n, rp_abs, rp_bias, hz_rp_refused, gap, hz_depth, hz_depth_changes);
 		}
 		hz_depth_changes = 0;
 		hz_gap_min = 0;
@@ -754,6 +810,11 @@ struct weave_latency_log
 		hz_abs_err_sum_ns = 0;
 		hz_err_sum_ns = 0;
 		hz_sync_lag_sum = 0;
+		hz_rp_n = 0;
+		hz_rp_resolved = 0;
+		hz_rp_refused = 0;
+		hz_rp_abs_err_sum_ns = 0;
+		hz_rp_err_sum_ns = 0;
 		for (int i = 0; i < 7; i++) {
 			hz_k_hist[i] = 0;
 		}
@@ -815,6 +876,23 @@ struct late_weave_governor
 {
 	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..MAX)
 	int auto_backoff = -1; // DXR_LATE_WEAVE_AUTOBACKOFF, default 1
+	//! #1339: last repaint present (QPC), stamped by the target's repaint mark.
+	//! While repaints are flowing the governor holds the initialised depth and
+	//! walks any escalation back: the extra queue levels a saturated app earns
+	//! are exactly what repaints then fill, and on an arm the join cannot see
+	//! that is latency the eye predictor never learns. Measured (fill arm,
+	//! forced repaints): the queue cap held at depth 1-2 (~200 refusals per
+	//! 5 s, gap ~3.5) until the app's interval under repaint load read as
+	//! saturation, the governor went to 3, and the queue ran 3 deep again.
+	uint64_t last_repaint_qpc = 0;
+	int repaint_hold = -1; // DXR_LATE_WEAVE_REPAINT_HOLD, default 1
+	bool repaint_hold_logged = false;
+
+	void
+	note_repaint(uint64_t now_qpc)
+	{
+		last_repaint_qpc = now_qpc;
+	}
 	int effective = 1;
 	bool paced_logged = false; // #1339 one-shot
 
@@ -1140,6 +1218,38 @@ struct late_weave_governor
 			        u_app_partition_divisor(), effective);
 		}
 		if (paced || base != 1 || auto_backoff != 1 || period_ns <= 0.0 || interval_ema_ns <= 0.0) {
+			return 0;
+		}
+		// #1339: repaints flowing (one in the last second) -> hold at base
+		// and walk any escalation back one level per mark. The repaint loop
+		// only runs when the app misses vblanks, so this cannot starve a
+		// pipeline that is making rate; a saturated app that ALSO repaints
+		// gets latency-first, which is the blind-eyeball verdict on #1339
+		// (depth 1 "very good" vs escalated "not as good", fill unchanged).
+		if (repaint_hold < 0) {
+			const char *e = getenv("DXR_LATE_WEAVE_REPAINT_HOLD");
+			repaint_hold = (e != nullptr && e[0] == '0') ? 0 : 1;
+		}
+		const bool repainting = repaint_hold == 1 && last_repaint_qpc != 0 && now > last_repaint_qpc &&
+		                        (double)(now - last_repaint_qpc) < 1.0 * (double)freq_hz;
+		if (repainting) {
+			if (!repaint_hold_logged) {
+				repaint_hold_logged = true;
+				U_LOG_W("Late-weave: repaints are flowing -- governor holds max latency %d; the queue "
+				        "levels a saturated app earns are what repaints fill, and that depth is latency "
+				        "the eye predictor cannot see on a blind arm (#1339; "
+				        "DXR_LATE_WEAVE_REPAINT_HOLD=0 disables)",
+				        base);
+			}
+			if (effective > base) {
+				const int from = effective;
+				effective--;
+				over_frames = 0;
+				calm_frames = 0;
+				backoff_qpc = now;
+				log_change(now, freq_hz, from, "repaints flowing (#1339)");
+				return -1;
+			}
 			return 0;
 		}
 
@@ -1567,7 +1677,7 @@ weave_latency_log::after_present(const char *site, IDXGISwapChain *sc, struct la
 						    (int64_t)((double)(flip_qpc - ring[idx].horizon_base_qpc) * k);
 						const int64_t err_ns = realised_ns - (int64_t)ring[idx].horizon_ns;
 						const uint64_t period_ns = (uint64_t)((double)refresh_period_qpc * k);
-						note_horizon_outcome(err_ns, period_ns, lag);
+						note_horizon_outcome(err_ns, period_ns, lag, ring[idx].repaint);
 						// #1435: residual in whole periods, into the loop.
 						const double kf = (double)err_ns / (double)period_ns;
 						po_observe((int)(kf >= 0.0 ? kf + 0.5 : kf - 0.5), period_ns);

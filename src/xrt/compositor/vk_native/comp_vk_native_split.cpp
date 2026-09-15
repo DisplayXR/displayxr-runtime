@@ -2341,6 +2341,12 @@ comp_vk_split_has_weave_slot(struct comp_vk_split *s)
 	return s != nullptr && s->xbridge != nullptr && comp_xbridge_get_weave_slot(s->xbridge) >= 0;
 }
 
+extern "C" bool
+comp_vk_split_repaint_admit(struct comp_vk_split *s)
+{
+	return s == nullptr || s->target == nullptr || comp_d3d11_target_repaint_admit(s->target);
+}
+
 extern "C" void
 comp_vk_split_render_diag(struct comp_vk_split *s)
 {

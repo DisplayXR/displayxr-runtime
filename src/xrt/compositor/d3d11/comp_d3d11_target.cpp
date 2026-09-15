@@ -68,6 +68,18 @@ static int g_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disable
 // next waits would return instantly for that many frames (pacing loss after
 // every idle stretch). weave_mark drains the excess when this is nonzero.
 static std::atomic<uint32_t> g_repaint_presents_since_app{0};
+// #1339 repaint queue cap (see comp_d3d11_target_repaint_admit): a token taken
+// by admit and not yet spent by a present. Plain statics, written on the
+// repaint thread and read in comp_d3d11_target_present on BOTH threads: that
+// is safe only because every present on every tier that uses this target runs
+// under the compositor mutex (d3d11 c->mutex, the d3d12 reroute's lock_guard,
+// the VK tier's c->mutex). An unlocked present path would need atomics here.
+static bool g_repaint_holds_token = false;
+// A repaint has been marked and its present is next on the repaint thread;
+// that present (and only a present on that thread) settles the token.
+static bool g_repaint_present_pending = false;
+static DWORD g_repaint_thread_id = 0;
+static int g_repaint_queue_cap = -1; // DXR_WEAVE_REPAINT_QUEUE_CAP, default 1
 
 // Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
 // auto-backoff (mirrors comp_d3d12_target.cpp).
@@ -456,6 +468,12 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	// #1456: the join-coverage verdict belongs to this chain; the file-scope
 	// log outlives it and serves the next session in this process.
 	g_weave_latency_d3d11.po_gate_reset();
+	// #1339: so does the repaint token state — the waitable it was taken
+	// from dies with the chain (the repaint thread is already joined).
+	g_repaint_holds_token = false;
+	g_repaint_present_pending = false;
+	g_repaint_thread_id = 0;
+	g_repaint_presents_since_app.store(0, std::memory_order_relaxed);
 
 	// Stop the present watchdog (#1000). Join with a bound: if the watchdog is
 	// somehow wedged we must not hang teardown for it.
@@ -625,6 +643,36 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
 	os_nanosleep((int64_t)slack_ns);
 }
 
+extern "C" bool
+comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target)
+{
+	(void)target;
+	if (g_repaint_queue_cap < 0) {
+		const char *e = getenv("DXR_WEAVE_REPAINT_QUEUE_CAP");
+		g_repaint_queue_cap = (e != nullptr && e[0] == '0') ? 0 : 1;
+	}
+	if (g_repaint_queue_cap == 0 || g_frame_latency_waitable == nullptr) {
+		return true;
+	}
+	if (g_repaint_holds_token) {
+		return true; // taken on an earlier tick that then bailed; still ours
+	}
+	if (WaitForSingleObjectEx(g_frame_latency_waitable, 0, FALSE) != WAIT_OBJECT_0) {
+		g_weave_latency_d3d11.note_repaint_refused();
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#1339: repaint refused — the present queue is at the frame-latency cap, and a "
+			        "repaint queued behind a pending present is latency, not a fill (logged once; the "
+			        "horizon trace row counts them; DXR_WEAVE_REPAINT_QUEUE_CAP=0 restores the old "
+			        "behaviour)");
+		}
+		return false;
+	}
+	g_repaint_holds_token = true;
+	return true;
+}
+
 /*!
  * #868: stamp T_weave for a repaint and nothing else — no governor EMA (repaints
  * land a panel period apart by construction and would collapse the saturation
@@ -637,9 +685,18 @@ comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode
 	(void)target;
 	g_frame_witness_d3d11.count_weave(true, mode_3d);
 	g_weave_latency_d3d11.mark_weave("d3d11", 0, true);
-	// Each repaint's Present releases a waitable token nobody waits for; the
-	// app's weave_mark drains the excess on its next frame (#868 interplay).
-	g_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);
+	// #1339: the token accounting settles at the PRESENT, not here — a repaint
+	// that bails between mark and present (#918 F7 slot-not-ready, the race
+	// re-tests) or whose present is dropped must keep its token for the next
+	// tick; spending it here would consume a token the chain never releases,
+	// and one such bail would pin the app's waitable wait at its 100 ms
+	// timeout for the life of the chain.
+	g_repaint_present_pending = true;
+	g_repaint_thread_id = GetCurrentThreadId();
+	// #1339: tell the governor repaints are flowing (see late_weave_governor).
+	LARGE_INTEGER q;
+	QueryPerformanceCounter(&q);
+	g_lw_gov_d3d11.note_repaint((uint64_t)q.QuadPart);
 }
 
 extern "C" void
@@ -863,6 +920,25 @@ comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interv
 		// Witness counts frames that actually reached the chain — the 50 ms
 		// drop path above intentionally shows up as a lower weave/s.
 		g_frame_witness_d3d11.count_present();
+	}
+	// #1339: a repaint's present settles its token. Thread-keyed, because an
+	// app present can land between a bailed repaint's mark and its next tick
+	// and must not settle on the repaint's behalf. A dropped present (FAILED,
+	// or the 50 ms deadline) released nothing: the held token stays held and
+	// admit reuses it; an un-capped repaint that dropped is not counted for
+	// the app-side drain either.
+	if (g_repaint_present_pending && GetCurrentThreadId() == g_repaint_thread_id) {
+		g_repaint_present_pending = false;
+		if (SUCCEEDED(hr)) {
+			if (g_repaint_holds_token) {
+				g_repaint_holds_token = false;
+			} else {
+				// Old accounting (cap off, or no waitable): this present
+				// releases a token nobody waited for; the app's weave_mark
+				// drains it (#868 interplay).
+				g_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 	}
 	g_weave_latency_d3d11.after_present("d3d11", target->swapchain, &g_lw_gov_d3d11);
 	if (SUCCEEDED(hr) && g_frame_latency_waitable != nullptr) {

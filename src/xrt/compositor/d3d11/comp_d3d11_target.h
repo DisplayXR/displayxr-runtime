@@ -109,6 +109,31 @@ void
 comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
 
 /*!
+ * #1339: may a repaint present NOW without deepening the present queue?
+ *
+ * Takes one frame-latency token non-blockingly (timeout 0). A repaint is a
+ * fill for a vblank the app missed; one that queues BEHIND a pending present
+ * is not a fill, it is latency — and on an arm where the join cannot see the
+ * pipeline (#1435 refused) that latency is invisible to the eye predictor.
+ * Measured on the reference box (fill arm, forced repaints): the flip queue
+ * ran 4-5 deep and every weave landed 3 periods after the horizon it was
+ * handed, at max frame latency 1 — the cap only binds presenters that wait
+ * on it, and repaints never did. Returns false = skip this tick (the token
+ * stays with the app). A token taken here is kept until the repaint presents
+ * (settled in @ref comp_d3d11_target_present on the repaint thread), and a
+ * repaint that bails after admission, or whose present is dropped, keeps it
+ * for the next tick — or, if the loop disarms for good, abandons it: the app
+ * reclaims it at its next wait (one 100 ms timeout, then the chain re-syncs). Applies to DXR_WEAVE_REPAINT_FORCE=1 too: the probe now
+ * fills every FREE slot rather than every refresh (DXR_WEAVE_REPAINT_QUEUE_CAP=0
+ * restores the old fill-the-queue behaviour). Call it UNDER the compositor
+ * lock: the app frame path waits on the same waitable while holding that lock,
+ * and a token taken outside it can be the one the app is about to block on.
+ * Runs on the repaint thread only.
+ */
+bool
+comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target);
+
+/*!
  * #868: repaint counterpart of @ref comp_d3d11_target_weave_mark — stamps
  * T_weave only, staying out of the saturation governor and the #867 ledger.
  */

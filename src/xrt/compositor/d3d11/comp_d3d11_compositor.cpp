@@ -2954,6 +2954,16 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			continue;
 		}
+		// #1339: no fill into a queue that already holds a pending present.
+		// UNDER the lock: layer_commit waits on the same waitable while it
+		// holds c->mutex, so a token taken before the lock could be the one
+		// the app is about to block on. Under an ENGAGED partition the
+		// schedule owns the slots; leave it.
+		if (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target)) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
 
 		// Acquire exactly as the app frame does. This is NOT bookkeeping: the
 		// swapchain is FLIP_DISCARD, so the back buffer's contents are

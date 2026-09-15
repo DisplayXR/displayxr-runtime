@@ -364,14 +364,35 @@ the always-on residual was never refreshed there yet was handed to the DP as fre
 frame (the getter now reports 0 = unknown once the value is 250 ms old); the learned offset
 learned from the few frames whose queue momentarily fell inside the ring — a sub-population
 the instrument selected — and latched +3 (a 66 ms horizon, clamped to 60 by the DP) in 3 of
-5 legs (coverage is judged **cumulatively since the last verdict** — 32 observations or 1024 armed
-horizons, whichever first — so a burst after a starved stretch is scored against the stretch;
+5 legs (coverage is judged over a fixed epoch of **1024 armed horizons**, never on an observation
+count — the Arc-box round on v2.16.27 (25 legs) showed that a verdict closing at 32 observations
+takes ~0.6 s on a bursty arm against ~17 s for a bad one, so one 5 s burst minted five covered
+verdicts and latched +3 in 5 of 10 legs; at 1024 armed per verdict no epoch on that arm reaches
+50% while every cube epoch covers, at the cost of a healthy chain's first decision moving from
+~0.5 s to ~17 s;
 two consecutive verdicts under 50% **refuse** (sticky): the loop unlearns to +0, drops its
 window and needs three consecutive covered verdicts to decide again — and an edge in either
 direction needs 30 s since the opposite edge, so a chain flapping across the 50% line steps
 the DP's value at most once per 30 s (a second, higher threshold for recovery was tried and
 left a steady 50-66% chain refused for the life of the struct). The trace row carries
-`refused N (bad N, good N)` as the standing witness, and the gate resets with the chain. The first, per-epoch version of this gate
+`refused N (bad N, good N)` as the standing witness, and the gate resets with the chain. The
+row also splits join, `|err|` and bias **by weave kind** (`by kind: app … repaint …`): the #1339
+shiver's dose is repaints and its locus the d3d11 fill arm. The column answered it on the
+reference box: app frames and repaints land the SAME 3 periods late on the fill arm under
+forced repaints — the flip queue runs 4-5 deep at max frame latency 1, because the cap only
+binds presenters that wait on the waitable and repaints never did (the d3d12 reroute has no
+app-side pacer at all; the arm's `Present` throttles by filling). On a chain where the join
+sees the pipeline the offset loop learns the +3 and the horizon stays right; on an arm where
+it cannot (Suki's, refused) the eye predictor runs ~50 ms short exactly while repaints flow,
+which is the dose-response and the on/off cycling she measured. Fix: a repaint takes a
+frame-latency token non-blockingly before it weaves and skips the tick when none is free
+(`comp_d3d11_target_repaint_admit`, `DXR_WEAVE_REPAINT_QUEUE_CAP=0` for A/B); the trace row
+counts refusals as `(refused N)`. The cap is the governor's depth, and the governor raised it
+to 3 within ~10 s under forced repaints (the app's interval under repaint load reads as
+saturation), after which repaints filled 3 deep again — so while repaints are flowing the
+governor now holds the initialised depth and walks any escalation back
+(`DXR_LATE_WEAVE_REPAINT_HOLD=0` for A/B). Measured on the reference box with both: pre-lock
+error 50.9 → 16.7 ms, present gap mean 4.9 → 2.5–3.0, app 30 → 51–53 fps under FORCE. The first, per-epoch version of this gate
 re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
 +0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries

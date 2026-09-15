@@ -4269,6 +4269,15 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 				u_repaint_trace_bail_race(&c->repaint.trace);
 				continue;
 			}
+			// #1339: the reroute has no app-side pacer; the d3d11 arm's flip
+			// chain was the only throttle, and it throttles by FILLING (4-5
+			// deep, every weave 3 periods late on the reference box). Ask the
+			// arm for a frame-latency token first; no token = no fill.
+			if (c->repaint.partition.next_release_ns == 0 && !comp_vk_split_repaint_admit(c->reroute.split)) {
+				c->repaint.bail_gate++;
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				continue;
+			}
 
 			const uint64_t fire_t0 = os_monotonic_get_ns();
 			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
