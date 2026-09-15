@@ -97,7 +97,7 @@ jobs:
             $spec = "exclude:[interactive]"
             $timeout = "900"
           } else {
-            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,[actions]~[interactive]"
+            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,multithreading,[actions]~[interactive]"
             $timeout = "420"
           }
           "graphics=$graphics" >> $env:GITHUB_OUTPUT

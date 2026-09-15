@@ -68,7 +68,13 @@ oxr_handle_init(struct oxr_logger *log,
 	hb->state = OXR_HANDLE_STATE_UNINITIALIZED;
 
 	if (parent != NULL) {
+		// The slot scan and the claim are one step under the parent's
+		// lock; two threads creating children of the same parent used to
+		// claim the same slot (CTS "multithreading").
+		os_mutex_lock(&parent->children_mutex);
+
 		if (parent->state != OXR_HANDLE_STATE_LIVE) {
+			os_mutex_unlock(&parent->children_mutex);
 			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 			                 "Handle %p given parent %p in invalid state: %s", (void *)parent, (void *)hb,
 			                 oxr_handle_state_to_string(parent->state));
@@ -86,6 +92,9 @@ oxr_handle_init(struct oxr_logger *log,
 				break;
 			}
 		}
+
+		os_mutex_unlock(&parent->children_mutex);
+
 		if (!placed) {
 			return oxr_error(log, XR_ERROR_LIMIT_REACHED,
 			                 "Parent handle has no more room for "
@@ -97,6 +106,22 @@ oxr_handle_init(struct oxr_logger *log,
 	hb->parent = parent;
 	hb->state = OXR_HANDLE_STATE_LIVE;
 	hb->destroy = destroy;
+
+	if (os_mutex_init(&hb->children_mutex) != 0) {
+		if (parent != NULL) {
+			os_mutex_lock(&parent->children_mutex);
+			for (int i = 0; i < XRT_MAX_HANDLE_CHILDREN; ++i) {
+				if (parent->children[i] == hb) {
+					parent->children[i] = NULL;
+					break;
+				}
+			}
+			os_mutex_unlock(&parent->children_mutex);
+		}
+		hb->state = OXR_HANDLE_STATE_UNINITIALIZED;
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Handle %p: failed to init children mutex", (void *)hb);
+	}
+
 	return XR_SUCCESS;
 }
 
@@ -143,6 +168,7 @@ oxr_handle_do_destroy(struct oxr_logger *log, struct oxr_handle_base *hb, int le
 		bool found = false;
 		struct oxr_handle_base *parent = hb->parent;
 
+		os_mutex_lock(&parent->children_mutex);
 		for (int i = 0; i < XRT_MAX_HANDLE_CHILDREN; ++i) {
 			if (parent->children[i] == hb) {
 				HANDLE_LIFECYCLE_LOG(log,
@@ -155,6 +181,8 @@ oxr_handle_do_destroy(struct oxr_logger *log, struct oxr_handle_base *hb, int le
 				break;
 			}
 		}
+		os_mutex_unlock(&parent->children_mutex);
+
 		if (!found) {
 			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Parent handle does not refer to this handle");
 		}
@@ -174,6 +202,10 @@ oxr_handle_do_destroy(struct oxr_logger *log, struct oxr_handle_base *hb, int le
 			}
 		}
 	}
+
+	/* Every child is gone, nobody can claim a slot under us any more. The
+	 * destroyer below frees the object, so the mutex goes first. */
+	os_mutex_destroy(&hb->children_mutex);
 
 	/* Might destroy instance, which log needs, so use secured variant */
 	HANDLE_LIFECYCLE_LOG_SCOPED_BEGIN(log)

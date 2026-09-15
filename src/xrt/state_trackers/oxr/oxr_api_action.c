@@ -522,17 +522,23 @@ oxr_xrCreateActionSet(XrInstance instance, const XrActionSetCreateInfo *createIn
 
 
 	/*
-	 * Dup checks.
+	 * Dup checks + insert, atomically: xrCreateActionSet may be called from
+	 * several threads at once (CTS "multithreading"), and the u_hashset
+	 * stores are not thread-safe on their own.
 	 */
+
+	os_mutex_lock(&inst->action_sets.mutex);
 
 	h_ret = u_hashset_find_c_str(inst->action_sets.name_store, createInfo->actionSetName, &d);
 	if (h_ret >= 0) {
+		os_mutex_unlock(&inst->action_sets.mutex);
 		return oxr_error(&log, XR_ERROR_NAME_DUPLICATED, "(createInfo->actionSetName == '%s') is duplicated",
 		                 createInfo->actionSetName);
 	}
 
 	h_ret = u_hashset_find_c_str(inst->action_sets.loc_store, createInfo->localizedActionSetName, &d);
 	if (h_ret >= 0) {
+		os_mutex_unlock(&inst->action_sets.mutex);
 		return oxr_error(&log, XR_ERROR_LOCALIZED_NAME_DUPLICATED,
 		                 "(createInfo->localizedActionSetName == '%s') "
 		                 "is duplicated",
@@ -545,6 +551,9 @@ oxr_xrCreateActionSet(XrInstance instance, const XrActionSetCreateInfo *createIn
 	 */
 
 	ret = oxr_action_set_create(&log, inst, createInfo, &act_set);
+
+	os_mutex_unlock(&inst->action_sets.mutex);
+
 	if (ret != XR_SUCCESS) {
 		return ret;
 	}
@@ -606,17 +615,22 @@ oxr_xrCreateAction(XrActionSet actionSet, const XrActionCreateInfo *createInfo, 
 
 
 	/*
-	 * Dup checks.
+	 * Dup checks + insert, atomically (same lock as the action set names,
+	 * see oxr_instance.action_sets.mutex).
 	 */
+
+	os_mutex_lock(&inst->action_sets.mutex);
 
 	h_ret = u_hashset_find_c_str(act_set->data->actions.name_store, createInfo->actionName, &d);
 	if (h_ret >= 0) {
+		os_mutex_unlock(&inst->action_sets.mutex);
 		return oxr_error(&log, XR_ERROR_NAME_DUPLICATED, "(createInfo->actionName == '%s') is duplicated",
 		                 createInfo->actionName);
 	}
 
 	h_ret = u_hashset_find_c_str(act_set->data->actions.loc_store, createInfo->localizedActionName, &d);
 	if (h_ret >= 0) {
+		os_mutex_unlock(&inst->action_sets.mutex);
 		return oxr_error(&log, XR_ERROR_LOCALIZED_NAME_DUPLICATED,
 		                 "(createInfo->localizedActionName == '%s') "
 		                 "is duplicated",
@@ -629,6 +643,9 @@ oxr_xrCreateAction(XrActionSet actionSet, const XrActionCreateInfo *createInfo, 
 	 */
 
 	ret = oxr_action_create(&log, act_set, createInfo, &act);
+
+	os_mutex_unlock(&inst->action_sets.mutex);
+
 	if (ret != XR_SUCCESS) {
 		return ret;
 	}
