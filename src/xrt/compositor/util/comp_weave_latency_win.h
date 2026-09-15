@@ -214,26 +214,46 @@ struct weave_latency_log
 	 *    50-66% chain refused for the life of the struct — on the service
 	 *    multi-compositor that is the logon session;
 	 *  - a covered verdict authorises the NEXT epoch (`po_coverage_ok` is the
-	 *    last verdict, latched forward), and an epoch may take ONE step
-	 *    (`po_changes_this_epoch`): an arm that degrades right after a covered
-	 *    verdict can deliver hundreds of resolves inside the next 1024 armed,
-	 *    which is a dozen full windows — without the bound it would climb to
-	 *    the cap inside that epoch and hold it ~17 s. With it: one step, then
-	 *    the bad verdict drops the window and the second one unlearns it;
+	 *    last verdict, latched forward), and a step needs PO_EPOCH_ARMED armed
+	 *    horizons SINCE THE LAST STEP (`po_last_change_armed`): an arm that
+	 *    degrades right after a covered verdict can deliver hundreds of
+	 *    resolves inside 1024 armed, a dozen full windows, and without a bound
+	 *    would climb to the cap in one epoch and hold it ~17 s.
+	 *    The bound is measured from the STEP, not from the epoch boundary.
+	 *    A per-epoch flag was tried first and leaked exactly at the boundary
+	 *    (Arc box, 2026-09-15): an epoch whose budget went unused lets a step
+	 *    land just before its close, and the next epoch grants a fresh budget
+	 *    milliseconds later — measured `+1 -> +2` then `+2 -> +1` **416 armed
+	 *    apart** (6.95 s), change numbers #2/#3 consecutive so nothing was
+	 *    throttled. It showed up as a direction asymmetry because it is one:
+	 *    a climb fires LATE in its epoch (the residual needs time to re-read
+	 *    the same sign), and the correction it provokes is ready immediately
+	 *    (strong `-1 in 32/32` within one window refill, ~0.5 s), so the
+	 *    step-back was always the one waiting at the boundary. Every up-step
+	 *    in that leg took a full epoch or more; every step-back closed early;
 	 *  - refuse / recover each log once per edge; the gate state is reset
 	 *    with the chain (`po_gate_reset()` from close() and from the
 	 *    in-process target destroy), never carried into the next chain.
 	 * A healthy chain (join 66-100%) covers every epoch and is never refused;
 	 * its first decision waits for its first epoch (~17 s at 60/s), and each
-	 * later step for the next one. `po_applied` is deliberately NOT reset with
-	 * the gate on teardown, so a chain recreated in-process keeps the last
-	 * chain's offset for that first epoch.
+	 * later step for PO_EPOCH_ARMED more armed horizons AFTER THE PREVIOUS
+	 * STEP — not for the next epoch boundary, which is the bug above.
+	 * `po_applied` is deliberately NOT reset with the gate on teardown, so a
+	 * chain recreated in-process keeps the last chain's offset for that first
+	 * epoch.
 	 */
 	static constexpr uint64_t PO_EDGE_DWELL_NS = 30ull * 1000ull * 1000ull * 1000ull;
-	static constexpr uint32_t PO_EPOCH_ARMED = 1024; // armed horizons per coverage verdict
+	//! Armed horizons per coverage verdict — AND the minimum armed gap between
+	//! two applied steps. Two roles, deliberately one number: retuning it for
+	//! one silently moves the other.
+	static constexpr uint32_t PO_EPOCH_ARMED = 1024;
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
-	uint32_t po_changes_this_epoch = 0; // decisions taken since the last verdict (max 1)
+	//! Monotone armed-horizon clock and the reading at the last applied step.
+	//! The step rate limit is (po_armed_total - po_last_change_armed), so it
+	//! cannot be reset by an epoch boundary falling between two steps.
+	uint64_t po_armed_total = 0;
+	uint64_t po_last_change_armed = 0;
 	bool po_coverage_ok = false;   // did the last closed epoch cover (>= 50%)? latched forward
 	bool po_refused = false;       // sticky: two consecutive verdicts came in under 50%
 	uint32_t po_bad_verdicts = 0;  // consecutive verdicts under 50% (refusal needs 2)
@@ -289,7 +309,6 @@ struct weave_latency_log
 		po_coverage_ok = covered && !po_refused;
 		po_cov_resolved = 0;
 		po_cov_armed = 0;
-		po_changes_this_epoch = 0;
 	}
 
 	void
@@ -313,8 +332,15 @@ struct weave_latency_log
 			po_win_n++;
 			return; // decide only on a full window
 		}
-		if (!po_coverage_ok || po_changes_this_epoch != 0) {
-			return; // no cover for this arm's pipeline, or this epoch's one step is taken
+		if (po_last_change_armed > po_armed_total) {
+			// Unreachable today (both are written together, and every reset
+			// zeroes the pair), but the subtraction below is unsigned: one
+			// torn reset would read ~2^64 and disable the rate limit for the
+			// life of the struct. One line to make that impossible.
+			po_last_change_armed = po_armed_total;
+		}
+		if (!po_coverage_ok || po_armed_total - po_last_change_armed < PO_EPOCH_ARMED) {
+			return; // no cover for this arm, or the last step is too recent
 		}
 		uint32_t hist[7] = {0, 0, 0, 0, 0, 0, 0};
 		for (uint32_t i = 0; i < 32; i++) {
@@ -391,7 +417,7 @@ struct weave_latency_log
 		}
 		po_applied = next;
 		po_changes++;
-		po_changes_this_epoch++;
+		po_last_change_armed = po_armed_total;
 		po_win_n = 0; // re-measure against the new value
 		if (next < cap) {
 			po_clamp_logged = false; // left the cap: a later re-climb to it may log again
@@ -411,7 +437,8 @@ struct weave_latency_log
 		po_good_verdicts = 0;
 		po_cov_armed = 0;
 		po_cov_resolved = 0;
-		po_changes_this_epoch = 0;
+		po_armed_total = 0;
+		po_last_change_armed = 0;
 		po_coverage_ok = false;
 		po_edge_ns = 0;
 	}
@@ -640,6 +667,7 @@ struct weave_latency_log
 		pending_horizon_base_qpc = nowq;
 		if (po_enabled == PO_ON) {
 			po_cov_armed++;
+			po_armed_total++;
 			po_epoch_close();
 		}
 		return horizon_ns;
