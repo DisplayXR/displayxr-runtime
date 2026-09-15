@@ -484,6 +484,28 @@ struct comp_rear_budget
 	uint64_t region_static_since_ns;
 	bool region_static_ref;
 	bool region_static_logged;
+
+	/*!
+	 * The region KIND changing is a fact about ingestion, and until #1474 it
+	 * was only ever printed on a state transition — which is the one moment it
+	 * is least likely to coincide with. A viewer that chains its bounds on
+	 * frame 0 and its silhouette a few frames later opens on the rect path,
+	 * switches to the mask path silently, and then, correctly, never
+	 * transitions again on a static desktop: the last line in the log says
+	 * `(app content bounds)` for ever and reads exactly like a runner that
+	 * never ingested the mask at all. Two panel sessions were diagnosed that
+	 * way. So the kind is announced when it CHANGES, rate-limited to 1 Hz
+	 * because mask<->bounds flapping is itself a defect worth seeing but not
+	 * worth 15 lines a second.
+	 * @{
+	 */
+	uint64_t roi_src_log_ns;
+	bool roi_src_log_ref;
+	//! One bit per @ref comp_rear_budget_roi_src already announced.
+	uint32_t roi_src_seen_mask;
+	//! Every kind change, counted whether or not the rate limit printed it.
+	uint32_t roi_src_changes;
+	/*! @} */
 	/*! @} */
 	/*! @} */
 
@@ -834,6 +856,14 @@ comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_p
  */
 bool
 comp_rear_budget_debug_region_static(const struct comp_rear_budget *b);
+
+/*!
+ * TEST ONLY — how many times the region KIND has changed this session.
+ *
+ * @ingroup comp_util
+ */
+uint32_t
+comp_rear_budget_debug_roi_src_changes(const struct comp_rear_budget *b);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.

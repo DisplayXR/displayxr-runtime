@@ -1880,3 +1880,84 @@ TEST_CASE("comp_rear_budget: an app republishing one silhouette for ever is name
 	}
 	CHECK_FALSE(comp_rear_budget_debug_region_static(&r2.b));
 }
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * INGESTION on a frozen capture (#1474 panel follow-up, second report)
+ *
+ * The two sequences a panel session actually produces, both with the capture
+ * generation frozen for ever — so `gen_new` is false and every re-measurement
+ * has to come from the REGION having changed:
+ *
+ * - a second, different mask must be analysed through (not the first one's
+ *   verdict, frozen);
+ * - a viewer whose first analysed frame PRECEDES its first mask (bounds and
+ *   zones on frame 0, the silhouette a few frames later) must switch from the
+ *   rect path to the mask path when the mask turns up — the reported source
+ *   must not be "whatever was analysed first".
+ * -----------------------------------------------------------------------------
+ */
+
+TEST_CASE("comp_rear_budget: a second, different mask is analysed on a frozen capture")
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(240, 0, 400, 200);
+
+	Runner r;
+	MaskGrid a(20, 10);
+	a.set(1, 1, 9, 9); // clear of the text
+	uint64_t t = run_with_mask(r, &pv.pv, a, 0, 300);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	REQUIRE(mask_px(r) > 0);
+	REQUIRE(read(r).cue_energy < 1.0f);
+	const u_bg_roi first = roi_of(r);
+
+	MaskGrid second_pose(20, 10);
+	second_pose.set(11, 1, 19, 9); // same size, on the text
+	t = run_with_mask(r, &pv.pv, second_pose, t + 10 * MS, 300);
+
+	const u_bg_roi second = roi_of(r);
+	CHECK(second.x != first.x);                        // the region followed the mask
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK); // and it is still the mask path
+	CHECK(mask_px(r) > 0);
+	CHECK(read(r).cue_energy >= 1.0f); // and it was re-measured through it
+}
+
+TEST_CASE("comp_rear_budget: a mask arriving after the bounds takes the region over")
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(240, 0, 400, 200);
+
+	Runner r;
+	const std::vector<u_bg_rect_norm> zone = {{0.0f, 0.0f, 1.0f, 1.0f}};
+
+	// Frame 0: bounds and zones, no silhouette yet.
+	bounds(r, 0.05f, 0.05f, 0.5f, 0.95f, 0);
+	zones(r, zone, 0);
+	step(r, &pv.pv, 0);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+	REQUIRE(mask_px(r) == 0);
+
+	// The silhouette turns up a few frames later. Nothing about the capture
+	// changed, so only the region can carry this.
+	MaskGrid m(20, 10);
+	m.set(1, 1, 9, 9);
+	for (uint64_t t = 100 * MS; t <= 600 * MS; t += 10 * MS) {
+		bounds(r, 0.05f, 0.05f, 0.5f, 0.95f, t);
+		zones(r, zone, t);
+		mask(r, m, t);
+		step(r, &pv.pv, t);
+	}
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	CHECK(mask_px(r) > 0);
+
+	/*
+	 * And the takeover is VISIBLE. This is the half that cost two panel
+	 * sessions: the switch happened, correctly, on a frame that was not a state
+	 * transition, so the only line in the log still said `(app content bounds
+	 * clamped to the 3D zones)` — indistinguishable from a runner that never
+	 * ingested the mask. Two kinds seen (bounds, then mask) = one change.
+	 */
+	CHECK(comp_rear_budget_debug_roi_src_changes(&r.b) == 2);
+}

@@ -992,6 +992,12 @@ comp_rear_budget_build_region(struct comp_rear_budget *b,
 	return true;
 }
 
+uint32_t
+comp_rear_budget_debug_roi_src_changes(const struct comp_rear_budget *b)
+{
+	return (b == NULL) ? 0u : b->roi_src_changes;
+}
+
 bool
 comp_rear_budget_debug_region_static(const struct comp_rear_budget *b)
 {
@@ -1851,6 +1857,37 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 			}
 			b->last_analysed_mask_build_id = b->region_build_id;
 		}
+		/*
+		 * The region KIND changed — the silhouette arrived, or was lost back
+		 * to the bounds. Announced HERE rather than on a state transition,
+		 * because the two essentially never coincide and a session that opens
+		 * on the rect path and then quietly switches to the mask path leaves a
+		 * log whose last word is `(app content bounds)` (#1474). Rate-limited:
+		 * a mask/bounds flap is a defect worth seeing, at 1 Hz not 15.
+		 */
+		if (!b->have_roi || src != b->last_roi_src) {
+			b->roi_src_changes++;
+			/*
+			 * A kind never seen this session ALWAYS prints, whatever the
+			 * rate limit says — that is the line the panel needs, it can
+			 * appear at most once per enumerator, and the first sighting
+			 * is exactly the one a 1 Hz limit swallows (a viewer's
+			 * silhouette turns up a few frames after its bounds, well
+			 * inside the first second).
+			 */
+			const uint32_t bit = 1u << (uint32_t)src;
+			const bool first_of_its_kind = (b->roi_src_seen_mask & bit) == 0;
+			b->roi_src_seen_mask |= bit;
+			if (first_of_its_kind || !b->roi_src_log_ref || now_ns - b->roi_src_log_ns >= 1000000000ULL) {
+				b->roi_src_log_ref = true;
+				b->roi_src_log_ns = now_ns;
+				U_LOG_W("REAR_BUDGET: region is now %s — roi=%u,%u,%u,%u mask=%u ratchet=%u",
+				        comp_rear_budget_roi_src_str(src), roi.x, roi.y, roi.w, roi.h,
+				        b->roi_mask_in_use ? b->roi_mask_px : 0u,
+				        (b->roi_mask_in_use && b->close_valid) ? b->close_px : 0u);
+			}
+		}
+
 		b->last_roi = roi;
 		b->last_roi_narrowed = narrowed;
 		b->last_roi_src = src;
