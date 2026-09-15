@@ -401,7 +401,17 @@ present gap 14–15 → ~3, and the offset loop learns on that arm for the first
 present gap of the earlier rounds was a real flip-queue depth, not a statistics artefact: the arm
 was blind *because* repaints filled the queue past the 8-entry ring. The governor hold is a null on
 that box (its governor never escalated) and load-bearing on the reference box; both stay. Still
-unmeasured: the GPU cost of the cap on the default arm (it removes ~570 weaves per 5 s under FORCE). The first, per-epoch version of this gate
+unmeasured then, since measured: the cap is **free in the shipping condition** (median +0.03 app iGPU,
+mixed signs) and costs +15 under forced repaints only because the uncapped arm was starving the app
+(20 fps vs 59) — so `DXR_WEAVE_REPAINT_QUEUE_CAP=0` is not a performance lever, it is an app-starvation
+mechanism that lowers the counter. The cheap-and-smooth lever remains `DXR_APP_FRAME_DIVISOR`.
+
+The learned offset's step rate limit is measured **from the last step**, not from the epoch boundary. A
+per-epoch flag was tried first and leaked at the boundary: an epoch whose budget went unused lets a step
+land just before its close and the next epoch grants a fresh one milliseconds later (measured on the Arc
+box, two steps 416 armed apart against a 1024 bound). It reads as a direction asymmetry — a climb fires
+late in its epoch, and the correction it provokes is ready within one window refill, so the step-back is
+the one waiting at the boundary. The first, per-epoch version of this gate
 re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
 +0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
