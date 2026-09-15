@@ -423,25 +423,47 @@ So **v4 fixes the contract**: the mask is the unclipped silhouette, which is cli
 exactly as `XrContentBoundsDXR` has always been (§6). An app that reports it cannot drive this loop
 at all.
 
-**The runtime additionally ratchets**, because apps already in the field report the clipped
-silhouette. While the budget is non-zero the runtime accumulates (unions) every silhouette it sees;
-while the budget is zero it **holds** that accumulation, and the region it measures is
-`this frame's mask ∪ the held one`. The invariant is:
+**The runtime additionally guards**, because apps already in the field report the clipped
+silhouette. The invariant it keeps is:
 
 > the re-open verdict is never measured over a region **smaller** than the region that produced the
 > last close verdict, unless the region changed for a **state-independent** reason.
 
-so the text the rear half reached over stays in the measured region after the clip discards it, the
-re-open never happens, and the worst case is a single flap. The accumulation is released when the
-region changed for a reason that is not the budget: the frame's 3D zone rects, the preview
-resolution or canvas rect, the mask going absent / all-zero / stale past 1 s, either kill switch,
-the session leaving transparent + standalone, or the silhouette's centroid moving further than the
-dilation radius — the model was dragged or rotated, so the held region describes a place the
-content no longer is.
+so the text the rear half reached over is still judged after the clip discards it, the re-open
+never happens, and the worst case is a single flap.
 
-It is a **floor, not a substitute for the contract**: a held region is by construction wider than
-what the app is drawing, so it can only ever keep the budget *closed* longer than the truth. Report
-the unclipped mask and the ratchet never engages.
+What keeps that invariant is **two separate verdicts per tick, never one merged region**
+([#1474](https://github.com/DisplayXR/displayxr-runtime/issues/1474)):
+
+1. the **close** verdict is measured over *this frame's mask alone* — what the app is drawing now;
+2. the **open** verdict additionally requires the **held close mask** — the dilated mask that was in
+   use when the session last entered `CLIPPED_BUSY_BACKGROUND`, captured at that transition — to
+   measure neutral as well, in its own analysis pass over the same preview.
+
+While a mask is held the policy is fed the **worse** of the two (max `cue_energy`; neutral only if
+both are); while the budget is open nothing is held and the frame's own region is the whole answer.
+The hold is released when the region changed for a reason that is not the budget: the frame's 3D
+zone rects, the preview resolution or canvas rect, the mask going absent / all-zero / stale past
+1 s, either kill switch, the session leaving transparent + standalone, or the silhouette's centroid
+moving further than the dilation radius — the model was dragged or rotated, so the held region
+describes a place the content no longer is. It is also dropped the moment the budget opens; the next
+close captures a fresh one.
+
+> **Why not a union.** The first implementation *accumulated*: every silhouette seen while the
+> budget was non-zero was OR'd together and the region measured was `this frame's mask ∪ the held
+> one`. That reads as a conservative widening and is the opposite, because both numbers in the
+> §*The masked metric* below are **fractions over the masked samples** — adding neutral area to a
+> busy region lowers its edge fraction, and adding neutral rows to a busy column lowers that
+> column's density. On the panel an avatar's large intro pose (20697 preview px) was accumulated
+> while open, the ~10700 px idle pose that followed sat on a text column, and the union — twice the
+> area, the surplus neutral desktop — diluted the text below the limit and held the budget **open**
+> over it for 46 s. Conservative-*open* is the one direction this design must never err in. Two
+> regions, two analyses, worse-of-two: a fraction cannot be diluted by a region it was never
+> measured over. Both passes together cost ~0.1 ms.
+
+It is a **floor, not a substitute for the contract**: a held region is by construction at least as
+wide as what the app is drawing, so it can only ever keep the budget *closed* longer than the truth.
+Report the unclipped mask and the guard never engages.
 
 #### The masked metric
 
@@ -467,18 +489,20 @@ The transition log line carries the mask's bounding rect as `roi=` plus the pixe
 
 ```
 REAR_BUDGET d3d11: roi=142,2,56,96 mask=3216 ratchet=0 (app content mask)
-REAR_BUDGET d3d11: roi=118,2,80,96 mask=5104 ratchet=5104 (app content mask, widened by the ratchet)
+REAR_BUDGET d3d11: roi=118,2,80,96 mask=3216 ratchet=5104 (app content mask, widened by the ratchet)
 ```
 
-`mask=` is the region that was measured and `ratchet=` how much the §4.6.1 accumulation holds; the
-`roi_src` in brackets says "widened by the ratchet" only when the union covers more than this
-frame's own silhouette, so a verdict read off a region the app is not currently drawing is never
-unattributable.
+`mask=` is the app's **own** silhouette this frame and `ratchet=` the §4.6.1 close mask held beside
+it — two regions measured apart, so one number each, and `roi=` the rect that contains both. The
+`roi_src` in brackets says "widened by the ratchet" only when the held mask covers pixels this
+frame's silhouette does not, so a verdict the app's current silhouette alone would not produce is
+never unattributable. (`ratchet=` and the switch keep the name the accumulation had; only the
+operator changed.)
 
 `roi=` alone cannot describe a mask — a bar and the box around it have the same bounding rect and
 measure completely different pixels — so `DXR_REAR_BUDGET_DUMP=1` additionally tints the measured
 region 50% toward a colour in the dumped PNG: **green** where it is this frame's own silhouette,
-**blue** where it is ratchet surplus. The tint is what lets an eyeball disagree with the number, and
+**blue** where it is the held close mask's surplus. The tint is what lets an eyeball disagree with the number, and
 the two colours are what make a correctly held-closed budget distinguishable from a cycling one —
 they read identically in the state log.
 
@@ -486,7 +510,7 @@ they read identically in the state log.
 |---|---|
 | `DXR_REAR_BUDGET_MASK=0` | Mask off, bounds still on — the "is the silhouette better than the box?" A/B. Logs once when armed. |
 | `DXR_REAR_BUDGET_ROI=0` | Mask **and** bounds **and** the zone clamp off: the whole canvas, i.e. v1. Logs once when armed. |
-| `DXR_REAR_BUDGET_MASK_RATCHET=0` | The §4.6.1 ratchet off — the measured region follows the clip state again. The "did the guard change this verdict?" A/B. Logs once when armed. |
+| `DXR_REAR_BUDGET_MASK_RATCHET=0` | The §4.6.1 guard off — nothing is held, so the verdict follows the clip state again. The "did the guard change this verdict?" A/B. Logs once when armed. |
 
 Every failure path falls back to the next authority down, and never to "neutral":
 
@@ -497,7 +521,7 @@ Every failure path falls back to the next authority down, and never to "neutral"
 | All-zero grid | Same. "The app rendered nothing here" is absence, not an empty region |
 | `cells == NULL`, dims outside 1..512, `strideBytes < width` | Same, plus a one-time `WARN`. Refused, never truncated: truncating would measure a region the app never described |
 | Mask cleared entirely by the 3D-zone clamp | Same, plus a one-time `WARN` naming the app's zone→window rebase |
-| Fewer than 64 preview pixels survive **in the region** (mask ∪ ratchet) | Same — a coarser question with an answer beats a finer one without. Measured on the region, not the frame's mask: a thin clipped silhouette dipping under the floor flips the region *kind* from mask to bounds, which is a second oscillator on the same axis (#1470) |
+| Fewer than 64 preview pixels survive in the frame's mask **and** nothing is held | Same — a coarser question with an answer beats a finer one without. The held close mask keeps the mask path alive on its own: a thin clipped silhouette dipping under the floor flips the region *kind* from mask to bounds, which is a second oscillator on the same axis (#1470) |
 | `DXR_REAR_BUDGET_MASK=0` / `DXR_REAR_BUDGET_ROI=0` | Bounds / whole canvas, as above |
 
 #### Producing the mask
@@ -602,9 +626,10 @@ Every failure path falls back to the next authority down, and never to "neutral"
   0.6-1.1 s open/clip cycle on a completely static desktop. **The two artefacts diverge:** the
   window region keeps the clipped alpha (it answers "which pixels were painted"), while the mask
   needs the unclipped shape (it answers "where would rear content go"). Produce it from the same
-  coverage pass with the far cull disabled, or from the pre-clip geometry. Runtimes ratchet the
-  measured region so a clipped mask degrades to one flap rather than a cycle (§4.6.1), but that is
-  a floor and it keeps the budget closed longer than the truth.
+  coverage pass with the far cull disabled, or from the pre-clip geometry. Runtimes hold the
+  silhouette that produced the last close and judge it beside the current one, so a clipped mask
+  degrades to one flap rather than a cycle (§4.6.1) — but that is a floor, and it keeps the budget
+  closed longer than the truth.
 
 ## 7. Sample Usage
 
@@ -736,4 +761,4 @@ Tracked on [#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365):
 | 1 | Initial version — `XrRearDepthBudgetDXR` on `XrViewState`, the state-changed event, canvas-wide ROI; `XR_TYPE_CONTENT_BOUNDS_DXR` reserved for v2 (epic #1363, ADR-040) |
 | 2 | `XrContentBoundsDXR` on `XrFrameEndInfo` — the app reports where its content projects and the analysis measures only there, dilated (§4.5). Additive: `XrRearDepthBudgetDXR` unchanged, no new entry points, no new event ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)) |
 | 3 | `XrContentMaskDXR` on `XrFrameEndInfo` — the app's rendered SILHOUETTE, resampled with an any-coverage filter, zone-clamped, dilated, and measured with a masked metric (§4.6). A rect around a character is mostly background the character never covers. Additive: `XrRearDepthBudgetDXR` and `XrContentBoundsDXR` unchanged, bounds remain the fallback ([#1365](https://github.com/DisplayXR/displayxr-runtime/issues/1365)) |
-| 4 | **Mask semantics: the UNCLIPPED silhouette** — rasterised ignoring the far clip, as the content would render at an unrestricted budget, mirroring the v2 bounds rule. v3's "rendered silhouette" made the region a function of the published budget and so a feedback loop (a 0.6-1.1 s open/clip cycle on a static desktop); the click-through window region keeps the clipped alpha, so the two artefacts diverge (§4.6.1, §6). No struct, field or type-value change. The runtime additionally **ratchets** the measured region and counts mask generations by change, bounding an app that still reports the clipped silhouette to a single flap ([#1470](https://github.com/DisplayXR/displayxr-runtime/issues/1470)) |
+| 4 | **Mask semantics: the UNCLIPPED silhouette** — rasterised ignoring the far clip, as the content would render at an unrestricted budget, mirroring the v2 bounds rule. v3's "rendered silhouette" made the region a function of the published budget and so a feedback loop (a 0.6-1.1 s open/clip cycle on a static desktop); the click-through window region keeps the clipped alpha, so the two artefacts diverge (§4.6.1, §6). No struct, field or type-value change. The runtime additionally **holds the silhouette that produced the last close** as a second region and takes the worse of the two verdicts, and counts mask generations by change, bounding an app that still reports the clipped silhouette to a single flap ([#1470](https://github.com/DisplayXR/displayxr-runtime/issues/1470), [#1474](https://github.com/DisplayXR/displayxr-runtime/issues/1474)) |

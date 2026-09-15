@@ -261,6 +261,32 @@ when the runtime lacks the extension.
   `roi_src`, the transition line carries `ratchet=`, and the dump PNG tints the held surplus blue
   against the frame's own silhouette in green — a correctly held-closed budget and a cycling one
   read identically in the state log.
+- **…but the UNION was the wrong operator, because the metric is a FRACTION
+  ([#1474](https://github.com/DisplayXR/displayxr-runtime/issues/1474)).** The first
+  implementation kept the invariant above by *accumulating*: one region, `this frame's mask ∪ the
+  held one`, measured once. That reads as a conservative widening and is the exact opposite, because
+  `u_bg_neutrality` returns fractions over the masked samples — `edge_fraction` is edges / masked
+  samples and a column's density is its edges / that column's masked pairs — so **adding neutral
+  area to a busy region can only ever make it look quieter**. The panel found it: an avatar's intro
+  pose (20697 preview px) was accumulated while open, the ~10700 px idle pose that followed sat on a
+  text column, and the union — twice the area, the surplus neutral desktop, and *taller* than the
+  idle pose so the crossing columns picked up neutral pairs too — diluted both numbers under their
+  limits and held the budget **open** over the text for 46 s. With the guard off the same session
+  cycled. A guard that fails conservative-*open* is worse than no guard at all here, because the
+  whole ordering of this design (100 ms close grace against a 400 ms open dwell) says a visible
+  conflict beats a missing rear. The replacement keeps the invariant and drops the merge: **two
+  verdicts per tick, combined as numbers rather than as regions.** The close verdict is measured
+  over the current mask alone, so nothing the runtime remembers can dilute what the app is drawing
+  now; the open verdict additionally requires the **held close mask** — the dilated silhouette
+  captured at the transition into `CLIPPED_BUSY_BACKGROUND`, not a running union — to measure
+  neutral in its own pass, and the policy is fed the worse of the two (max `cue_energy`, neutral
+  only if both are). The loop of the previous bullet is still shut (clipped: the front cap is
+  neutral, the held full silhouette over text is busy, so it stays clipped) and a smaller pose can
+  no longer hide behind a larger one. Every release rule, the kill switch, the `roi_src`, the
+  `ratchet=` field and the blue tint survive unchanged — what changed is one operator. The general
+  lesson is worth more than the fix: **a monotonic guard over a normalised metric has to widen the
+  VERDICT, not the SAMPLE SET.** `max` over two measurements is monotone; a union of two regions,
+  measured once, is not.
 - **One threshold cannot both admit and reject.** `u_bg_neutrality` reports `neutral` as `cue < 1.0`,
   and the panel found a background parked at 0.93–0.97: the dwell was served, the budget opened, the
   next sample crossed 1.0, it closed after the grace, for seconds. The dwell and the close grace are
