@@ -111,6 +111,17 @@ typedef void (*comp_rear_budget_dump_fn)(void *ctx, const uint8_t *bgra, uint32_
 #define COMP_REAR_BUDGET_MASK_MIN_PX 64u
 
 /*!
+ * How long the capture generation AND the measured region must both sit still
+ * before the runner says so, once, in the log.
+ *
+ * Ten seconds: long enough that no dwell, grace or ramp can reach it, short
+ * enough to be in the first screenful of a panel session.
+ *
+ * @ingroup comp_util
+ */
+#define COMP_REAR_BUDGET_STATIC_REGION_NS (10ULL * 1000ULL * 1000ULL * 1000ULL)
+
+/*!
  * Where the ROI the last analysis used came from. Reported on each state
  * transition, because a rear-depth verdict whose region is unattributable
  * cannot be argued with.
@@ -446,6 +457,34 @@ struct comp_rear_budget
 	bool region_key_valid;
 	//! The held close mask covers pixels this frame's own mask does not.
 	bool region_from_close;
+
+	/*!
+	 * @name A frozen region is a frozen verdict — the one-shot that says so
+	 *
+	 * The runner re-analyses only when the CAPTURE changed or the REGION did,
+	 * and both of those are correct: a capture source delivers on change, so a
+	 * quiet desktop is the best case, and an unchanged region over an unchanged
+	 * picture has the answer it already has.
+	 *
+	 * The consequence is not obvious from a log, though, and it cost a panel
+	 * session: if an app republishes the SAME silhouette every frame while its
+	 * model moves — a coverage pass computed once, say — then nothing the
+	 * runner can see has changed, the verdict is frozen by construction, and
+	 * the state line that would have shown it never prints, because a frozen
+	 * verdict produces no transitions. "The runtime stopped ingesting masks"
+	 * and "the app stopped varying them" read identically: silence.
+	 *
+	 * So the runner names it once per session, after
+	 * @ref COMP_REAR_BUDGET_STATIC_REGION_NS of both being still. One line, no
+	 * hot path, and it is deliberately NOT an error — a still model on a still
+	 * desktop is the intended best case and reads exactly the same.
+	 * @{
+	 */
+	uint32_t region_static_id;
+	uint64_t region_static_since_ns;
+	bool region_static_ref;
+	bool region_static_logged;
+	/*! @} */
 	/*! @} */
 
 	/*!
@@ -787,6 +826,14 @@ comp_rear_budget_debug_mask_build_id(const struct comp_rear_budget *b);
  */
 bool
 comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_px);
+
+/*!
+ * TEST ONLY — whether the "nothing has changed for seconds" one-shot has fired.
+ *
+ * @ingroup comp_util
+ */
+bool
+comp_rear_budget_debug_region_static(const struct comp_rear_budget *b);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.

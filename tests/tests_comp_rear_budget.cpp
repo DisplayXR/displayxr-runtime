@@ -1802,3 +1802,81 @@ TEST_CASE("comp_rear_budget: moving the model off the text releases the held clo
 	CHECK_FALSE(comp_rear_budget_debug_ratchet(&r.b, nullptr));
 	CHECK(read(r).state == U_REAR_BUDGET_OPEN);
 }
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * A SWEEP over a frozen capture (#1474 panel follow-up)
+ *
+ * The panel's sequence, which is not the one above: the preview generation never
+ * advances (a static desktop is the capture source's best case), the session
+ * opens on a large pose over blank desktop, and then the SAME-SIZED silhouette
+ * is dragged onto dense text. Nothing about the picture changed and nothing
+ * about the region's SIZE changed — only where it is — so the only thing that
+ * can produce a close is re-running the analysis because the MASK moved.
+ *
+ * That is the ingestion path in its purest form, and the one a "did it re-read
+ * the mask?" bug hides in: `gen_new` is false for ever, so `mask_new` (keyed on
+ * the region generation) is carrying the whole thing.
+ * -----------------------------------------------------------------------------
+ */
+
+TEST_CASE("comp_rear_budget: a mask swept onto text closes with the capture generation frozen")
+{
+	// Flat left half, dense text down the right half.
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(240, 0, 400, 200);
+
+	MaskGrid clear_of_it(20, 10);
+	clear_of_it.set(1, 1, 9, 9); // preview 20..180 x 20..180, dilated 4..196
+	MaskGrid over_text(20, 10);
+	over_text.set(11, 1, 19, 9); // preview 220..380, dilated 204..396 — same size
+
+	Runner r;
+	uint64_t t = run_with_mask(r, &pv.pv, clear_of_it, 0, 1200);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+	REQUIRE(read(r).cue_energy < 1.0f);
+
+	// The sweep. One generation, one mask size, one new position.
+	t = run_with_mask(r, &pv.pv, over_text, t + 10 * MS, 600);
+
+	// Analysed at all: a frozen verdict would still read the blank half.
+	CHECK(read(r).cue_energy >= 1.0f);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	CHECK(read(r).far_offset_vh < 0.001f);
+}
+
+
+TEST_CASE("comp_rear_budget: an app republishing one silhouette for ever is named, once")
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(240, 0, 400, 200);
+
+	MaskGrid frozen(20, 10);
+	frozen.set(1, 1, 9, 9);
+
+	Runner r;
+	uint64_t t = run_with_mask(r, &pv.pv, frozen, 0, 2000);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	// Two seconds of stillness is just a quiet desktop, which is the best case
+	// and must not accuse anybody.
+	CHECK_FALSE(comp_rear_budget_debug_region_static(&r.b));
+
+	t = run_with_mask(r, &pv.pv, frozen, t + 10 * MS, 12000);
+	CHECK(comp_rear_budget_debug_region_static(&r.b));
+
+	/*
+	 * And a mask that moves resets it: the panel question is "did the region
+	 * follow the model?", so an app whose silhouette moved must never be named
+	 * — a diagnostic that fires on the healthy case is worse than none.
+	 */
+	MaskGrid moved(20, 10);
+	moved.set(11, 1, 19, 9);
+	Runner r2;
+	uint64_t t2 = run_with_mask(r2, &pv.pv, frozen, 0, 6000);
+	for (int i = 0; i < 4; i++) {
+		t2 = run_with_mask(r2, &pv.pv, (i % 2) ? frozen : moved, t2 + 10 * MS, 3000);
+	}
+	CHECK_FALSE(comp_rear_budget_debug_region_static(&r2.b));
+}
