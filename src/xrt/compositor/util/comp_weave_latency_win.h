@@ -236,12 +236,17 @@ struct weave_latency_log
 	 *    in-process target destroy), never carried into the next chain.
 	 * A healthy chain (join 66-100%) covers every epoch and is never refused;
 	 * its first decision waits for its first epoch (~17 s at 60/s), and each
-	 * later step for the next one. `po_applied` is deliberately NOT reset with
-	 * the gate on teardown, so a chain recreated in-process keeps the last
-	 * chain's offset for that first epoch.
+	 * later step for PO_EPOCH_ARMED more armed horizons AFTER THE PREVIOUS
+	 * STEP — not for the next epoch boundary, which is the bug above.
+	 * `po_applied` is deliberately NOT reset with the gate on teardown, so a
+	 * chain recreated in-process keeps the last chain's offset for that first
+	 * epoch.
 	 */
 	static constexpr uint64_t PO_EDGE_DWELL_NS = 30ull * 1000ull * 1000ull * 1000ull;
-	static constexpr uint32_t PO_EPOCH_ARMED = 1024; // armed horizons per coverage verdict
+	//! Armed horizons per coverage verdict — AND the minimum armed gap between
+	//! two applied steps. Two roles, deliberately one number: retuning it for
+	//! one silently moves the other.
+	static constexpr uint32_t PO_EPOCH_ARMED = 1024;
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
 	//! Monotone armed-horizon clock and the reading at the last applied step.
@@ -326,6 +331,13 @@ struct weave_latency_log
 		if (po_win_n < 32) {
 			po_win_n++;
 			return; // decide only on a full window
+		}
+		if (po_last_change_armed > po_armed_total) {
+			// Unreachable today (both are written together, and every reset
+			// zeroes the pair), but the subtraction below is unsigned: one
+			// torn reset would read ~2^64 and disable the rate limit for the
+			// life of the struct. One line to make that impossible.
+			po_last_change_armed = po_armed_total;
 		}
 		if (!po_coverage_ok || po_armed_total - po_last_change_armed < PO_EPOCH_ARMED) {
 			return; // no cover for this arm, or the last step is too recent

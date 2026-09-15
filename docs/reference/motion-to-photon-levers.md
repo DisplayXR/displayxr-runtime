@@ -411,8 +411,10 @@ per-epoch flag was tried first and leaked at the boundary: an epoch whose budget
 land just before its close and the next epoch grants a fresh one milliseconds later (measured on the Arc
 box, two steps 416 armed apart against a 1024 bound). It reads as a direction asymmetry — a climb fires
 late in its epoch, and the correction it provokes is ready within one window refill, so the step-back is
-the one waiting at the boundary. The first, per-epoch version of this gate
-re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
+the one waiting at the boundary.
+
+The first, per-epoch version of the **coverage** gate (a different mechanism from the step limiter
+above, and an earlier bug) re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
 +0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
 `join N/M (P%)` and `present gap min..max (mean)` so an unreachable arm is visible in the
