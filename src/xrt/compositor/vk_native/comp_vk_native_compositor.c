@@ -5856,6 +5856,13 @@ vk_repaint_thread(void *ptr)
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
+			// #1339: no fill into the arm's flip queue while it holds a
+			// pending present (see comp_d3d11_target_repaint_admit).
+			if (c->repaint.partition.next_release_ns == 0 && !comp_vk_split_repaint_admit(c->split)) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
 			c->repaint.count++;

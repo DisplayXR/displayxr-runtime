@@ -613,6 +613,14 @@ bool
 comp_vk_split_has_weave_slot(struct comp_vk_split *split);
 
 /*!
+ * #1339: @ref comp_d3d11_target_repaint_admit on the arm's own target — the
+ * fill arm presents through its d3d11 flip chain, so THAT queue is the one a
+ * repaint must not deepen. false = skip this repaint tick.
+ */
+bool
+comp_vk_split_repaint_admit(struct comp_vk_split *split);
+
+/*!
  * The once-every-10-s `[RENDER] split=… xb_kb=… ingress=… ing_leak=…` line, in
  * the same shape the D3D12 leg emits so one grep covers every in-process leg.
  * Cheap to call every frame; rate-limits itself.

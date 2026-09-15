@@ -68,6 +68,10 @@ static int g_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disable
 // next waits would return instantly for that many frames (pacing loss after
 // every idle stretch). weave_mark drains the excess when this is nonzero.
 static std::atomic<uint32_t> g_repaint_presents_since_app{0};
+// #1339 repaint queue cap (see comp_d3d11_target_repaint_admit): a token taken
+// by admit and not yet spent by a present. Repaint thread only.
+static bool g_repaint_holds_token = false;
+static int g_repaint_queue_cap = -1; // DXR_WEAVE_REPAINT_QUEUE_CAP, default 1
 
 // Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
 // auto-backoff (mirrors comp_d3d12_target.cpp).
@@ -631,12 +635,48 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
  * signal) and no predicted display time (xrWaitFrame promised no photon time for
  * this present, so there is nothing to score it against).
  */
+extern "C" bool
+comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target)
+{
+	(void)target;
+	if (g_repaint_queue_cap < 0) {
+		const char *e = getenv("DXR_WEAVE_REPAINT_QUEUE_CAP");
+		g_repaint_queue_cap = (e != nullptr && e[0] == '0') ? 0 : 1;
+	}
+	if (g_repaint_queue_cap == 0 || g_frame_latency_waitable == nullptr) {
+		return true;
+	}
+	if (g_repaint_holds_token) {
+		return true; // taken on an earlier tick that then bailed; still ours
+	}
+	if (WaitForSingleObjectEx(g_frame_latency_waitable, 0, FALSE) != WAIT_OBJECT_0) {
+		g_weave_latency_d3d11.note_repaint_refused();
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_W("#1339: repaint refused — the present queue is at the frame-latency cap, and a "
+			        "repaint queued behind a pending present is latency, not a fill (logged once; the "
+			        "horizon trace row counts them; DXR_WEAVE_REPAINT_QUEUE_CAP=0 restores the old "
+			        "behaviour)");
+		}
+		return false;
+	}
+	g_repaint_holds_token = true;
+	return true;
+}
+
 extern "C" void
 comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode_3d)
 {
 	(void)target;
 	g_frame_witness_d3d11.count_weave(true, mode_3d);
 	g_weave_latency_d3d11.mark_weave("d3d11", 0, true);
+	if (g_repaint_holds_token) {
+		// #1339: this present spends the token admit took; the cap's
+		// accounting is whole and there is nothing for the app to drain.
+		g_repaint_holds_token = false;
+		return;
+	}
 	// Each repaint's Present releases a waitable token nobody waits for; the
 	// app's weave_mark drains the excess on its next frame (#868 interplay).
 	g_repaint_presents_since_app.fetch_add(1, std::memory_order_relaxed);

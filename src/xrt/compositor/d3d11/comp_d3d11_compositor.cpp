@@ -2933,6 +2933,13 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
+		// #1339: no fill into a queue that already holds a pending present.
+		// Under an ENGAGED partition the schedule owns the slots; leave it.
+		if (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target)) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
+			continue;
+		}
 
 		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
