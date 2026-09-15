@@ -2065,3 +2065,39 @@ TEST_CASE("comp_rear_budget: an app that stops chaining its mask is named as the
 	REQUIRE(comp_rear_budget_debug_no_mask_reason(&r.b) != nullptr);
 	CHECK(std::string(comp_rear_budget_debug_no_mask_reason(&r.b)).find("STOPPED chaining") != std::string::npos);
 }
+
+
+TEST_CASE("comp_rear_budget: the trace changes no verdict")
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(240, 0, 400, 200);
+
+	MaskGrid clear_of_it(20, 10);
+	clear_of_it.set(1, 1, 9, 9);
+	MaskGrid over_text(20, 10);
+	over_text.set(11, 1, 19, 9);
+
+	// Same drive, traced and untraced: a diagnostic that moves a verdict is
+	// not a diagnostic. The env is set BEFORE the runner exists because the
+	// switch is probed in init — it is read from two threads later.
+	u_rear_budget_state quiet_state{}, traced_state{};
+	float quiet_cue = 0.0f, traced_cue = 0.0f;
+	{
+		Runner r;
+		uint64_t t = run_with_mask(r, &pv.pv, clear_of_it, 0, 1200);
+		t = run_with_mask(r, &pv.pv, over_text, t + 10 * MS, 600);
+		quiet_state = read(r).state;
+		quiet_cue = read(r).cue_energy;
+	}
+	{
+		ScopedEnv on("DXR_REAR_BUDGET_TRACE", "1");
+		Runner r;
+		uint64_t t = run_with_mask(r, &pv.pv, clear_of_it, 0, 1200);
+		t = run_with_mask(r, &pv.pv, over_text, t + 10 * MS, 600);
+		traced_state = read(r).state;
+		traced_cue = read(r).cue_energy;
+	}
+	CHECK(traced_state == quiet_state);
+	CHECK(traced_cue == quiet_cue);
+	CHECK(quiet_state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+}

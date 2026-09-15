@@ -184,6 +184,39 @@ struct comp_rear_budget
 	//! DXR_REAR_BUDGET_DUMP. -1 = unprobed.
 	int dump;
 
+	/*!
+	 * @name DXR_REAR_BUDGET_TRACE - what the analysis actually measured
+	 *
+	 * The state log answers "what did it decide"; the transition log answers
+	 * "over which region". Neither answers "over which PIXELS, and what came
+	 * back" — and a verdict that is neutral over text is a question about the
+	 * numbers, not about the gate. Three sessions were spent bisecting runtime
+	 * builds for want of one line per analysis (#1474).
+	 *
+	 * Armed once from the environment in @ref comp_rear_budget_init — from the
+	 * environment on ONE thread, at session create, because the mask trace
+	 * below is written on the app thread and the analysis trace on the render
+	 * thread, and a lazily-probed int shared by both is a data race.
+	 *
+	 * Everything here is opt-in, rate-limited to 1 Hz per line kind, and reads
+	 * state the runner already has. Nothing in it changes a verdict.
+	 * @{
+	 */
+	int trace; //!< DXR_REAR_BUDGET_TRACE. -1 = unprobed, 1 = armed.
+	uint64_t trace_log_ns;
+	bool trace_log_ref;
+	uint64_t trace_cache_log_ns;
+	bool trace_cache_log_ref;
+	//! Whether the last @ref roi_mask build was a cache hit — trace only.
+	bool trace_mask_cached;
+	uint64_t trace_maskgen_log_ns;
+	bool trace_maskgen_log_ref;
+	uint64_t trace_dump_ns;
+	bool trace_dump_ref;
+	//! 3D zone count the last derived region was clamped to — trace only.
+	uint32_t last_zone_count;
+	/*! @} */
+
 	//! Next frame the DP may be polled on.
 	uint64_t next_poll_ns;
 	//! Outcome of the LAST DP poll, reused between polls.

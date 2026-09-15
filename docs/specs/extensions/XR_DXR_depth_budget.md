@@ -510,6 +510,7 @@ they read identically in the state log.
 |---|---|
 | `DXR_REAR_BUDGET_MASK=0` | Mask off, bounds still on — the "is the silhouette better than the box?" A/B. Logs once when armed. |
 | `DXR_REAR_BUDGET_ROI=0` | Mask **and** bounds **and** the zone clamp off: the whole canvas, i.e. v1. Logs once when armed. |
+| `DXR_REAR_BUDGET_TRACE=1` | One `WARN` per analysis and per mask generation, 1 Hz each: the ROI, the region kind, the masked pixel count, `edge_fraction` / `max_column_density` / `cue_energy` / `neutral`, the preview dims, the DP's canvas rect and the 3D zone count — i.e. **which pixels were measured and what came back**, which no other line says. With `DXR_REAR_BUDGET_DUMP=1` it also writes a dump every 2 s instead of only on a state change, so a session that never transitions still produces pictures. Changes no verdict. |
 | `DXR_REAR_BUDGET_MASK_RATCHET=0` | The §4.6.1 guard off — nothing is held, so the verdict follows the clip state again. The "did the guard change this verdict?" A/B. Logs once when armed. |
 
 Every failure path falls back to the next authority down, and never to "neutral":
