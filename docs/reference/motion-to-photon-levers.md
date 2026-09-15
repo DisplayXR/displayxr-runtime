@@ -392,7 +392,16 @@ to 3 within ~10 s under forced repaints (the app's interval under repaint load r
 saturation), after which repaints filled 3 deep again — so while repaints are flowing the
 governor now holds the initialised depth and walks any escalation back
 (`DXR_LATE_WEAVE_REPAINT_HOLD=0` for A/B). Measured on the reference box with both: pre-lock
-error 50.9 → 16.7 ms, present gap mean 4.9 → 2.5–3.0, app 30 → 51–53 fps under FORCE. The first, per-epoch version of this gate
+error 50.9 → 16.7 ms, present gap mean 4.9 → 2.5–3.0, app 30 → 51–53 fps under FORCE.
+
+**Confirmed on the Arc box (v2.16.34, 2026-09-15):** blind forced-repaint pair, sealed order, 6 of 6
+("no shiver" with the cap, "shivers" without, both orders), and a sealed shipping-defaults pair
+v2.16.27 "shivers" vs v2.16.34 "no shiver". The cap also **un-blinds the join** there — 0% → 95–97%,
+present gap 14–15 → ~3, and the offset loop learns on that arm for the first time — so the 10..14
+present gap of the earlier rounds was a real flip-queue depth, not a statistics artefact: the arm
+was blind *because* repaints filled the queue past the 8-entry ring. The governor hold is a null on
+that box (its governor never escalated) and load-bearing on the reference box; both stay. Still
+unmeasured: the GPU cost of the cap on the default arm (it removes ~570 weaves per 5 s under FORCE). The first, per-epoch version of this gate
 re-qualified on bursts — measured on the Arc box: `applied` left +0 in 5 of 8 legs, once
 +0 → +3 in 1.7 s — which is why it is cumulative and sticky now); and a window that resolved nothing printed as
 a flawless one (it now prints `NO JOIN (armed N, resolved 0)`). The row carries
