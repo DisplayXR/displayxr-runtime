@@ -548,6 +548,9 @@ comp_rear_budget_build_mask(struct comp_rear_budget *b,
 	                    b->roi_mask_key.zone_gen == zone_gen && b->roi_mask_key.zone_count == zone_count &&
 	                    b->roi_mask_key.pw == pw && b->roi_mask_key.ph == ph && b->roi_mask_key.cu0 == cu0 &&
 	                    b->roi_mask_key.cv0 == cv0 && b->roi_mask_key.cu1 == cu1 && b->roi_mask_key.cv1 == cv1;
+	// Recorded rather than logged: the throttle needs `now_ns`, which the
+	// caller has and this does not, so derive_roi emits it.
+	b->trace_mask_cached = cached;
 	if (cached) {
 		return b->roi_mask_usable;
 	}
@@ -1105,7 +1108,21 @@ comp_rear_budget_set_content_mask(struct comp_rear_budget *b,
 	if (!same) {
 		b->mask_gen++;
 	}
+	const uint32_t traced_gen = b->mask_gen;
+	const bool trace_due =
+	    b->trace == 1 && (!b->trace_maskgen_log_ref || now_ns - b->trace_maskgen_log_ns >= 1000000000ULL);
+	if (trace_due) {
+		b->trace_maskgen_log_ref = true;
+		b->trace_maskgen_log_ns = now_ns;
+	}
 	os_mutex_unlock(&b->publish_mutex);
+
+	// Logged OUTSIDE the lock: this is the app's thread, and the locate thread
+	// must never wait behind a formatted write.
+	if (trace_due) {
+		U_LOG_W("REAR_BUDGET trace: mask_gen -> %u nonzero=%u same=%d w=%u h=%u", traced_gen, nonzero,
+		        same ? 1 : 0, w, h);
+	}
 }
 
 uint32_t
@@ -1288,6 +1305,8 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 		}
 	}
 
+	b->last_zone_count = zone_count;
+
 	const bool have_bounds = valid && age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS;
 	if (!have_mask && !have_bounds && zone_count == 0) {
 		return;
@@ -1321,6 +1340,17 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 		// mask still carries a verdict when this frame's silhouette has shrunk
 		// to a sliver that cannot be measured at all (#1470, #1474).
 		(void)comp_rear_budget_build_mask(b, pv, cu0, cv0, cu1, cv1, zones, zone_count, zone_gen, mask_gen);
+
+		if (b->trace == 1 && (!b->trace_cache_log_ref || now_ns - b->trace_cache_log_ns >= 1000000000ULL)) {
+			b->trace_cache_log_ref = true;
+			b->trace_cache_log_ns = now_ns;
+			U_LOG_W(
+			    "REAR_BUDGET trace: mask cache %s — mask_gen=%u build=%u px=%u usable=%d "
+			    "rect=%u,%u,%u,%u dilate_r=%u zones=%u",
+			    b->trace_mask_cached ? "HIT" : "miss", mask_gen, b->roi_mask_build_id, b->roi_mask_px,
+			    b->roi_mask_usable ? 1 : 0, b->roi_mask_rect.x, b->roi_mask_rect.y, b->roi_mask_rect.w,
+			    b->roi_mask_rect.h, b->roi_mask_dilate_r, zone_count);
+		}
 
 		if (b->roi_mask_px > 0 &&
 		    comp_rear_budget_build_region(b, pv, cu0, cv0, cu1, cv1, zone_gen, zone_count)) {
@@ -1656,6 +1686,20 @@ comp_rear_budget_init(struct comp_rear_budget *b, const char *label)
 	b->roi_enabled = -1;
 	b->mask_enabled = -1;
 	b->guard_enabled = -1;
+	/*
+	 * Probed HERE, not lazily: the mask trace is written from the app thread
+	 * and the analysis trace from the render thread, so a lazily-probed int
+	 * shared by both would be a data race. Session create is single-threaded.
+	 */
+	{
+		const char *e = getenv("DXR_REAR_BUDGET_TRACE");
+		b->trace = (e != NULL && e[0] == '1') ? 1 : 0;
+		if (b->trace == 1) {
+			U_LOG_W(
+			    "REAR_BUDGET: DXR_REAR_BUDGET_TRACE armed = 1 (one line per analysis and per "
+			    "mask generation, 1 Hz each; with DXR_REAR_BUDGET_DUMP=1 a PNG every 2 s)");
+		}
+	}
 
 	if (os_mutex_init(&b->publish_mutex) != 0) {
 		// Without the lock the publish/read pair is a data race, so the
@@ -1938,6 +1982,28 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 			}
 		}
 
+		/*
+		 * One line per analysis, 1 Hz, and it is the whole point of the trace:
+		 * WHICH pixels were measured and WHAT came back. A verdict that reads
+		 * neutral over text is a question about these numbers — a zone-rect to
+		 * preview mapping that lands the region on blank desktop looks exactly
+		 * like a quiet background from every other vantage point.
+		 */
+		if (b->trace == 1 && (!b->trace_log_ref || now_ns - b->trace_log_ns >= 1000000000ULL)) {
+			b->trace_log_ref = true;
+			b->trace_log_ns = now_ns;
+			U_LOG_W(
+			    "REAR_BUDGET trace: gen=%u mask_gen=%u mask_build=%u roi=%u,%u,%u,%u src=%s "
+			    "masked_px=%u edge_frac=%.4f col=%.3f cue=%.2f neutral=%d preview=%ux%u "
+			    "canvas=%.2f,%.2f-%.2f,%.2f zones=%u",
+			    pv->generation, b->roi_mask_key.mask_gen, b->roi_mask_build_id, roi.x, roi.y, roi.w, roi.h,
+			    comp_rear_budget_roi_src_str(src), b->roi_mask_in_use ? b->roi_mask_px : 0u,
+			    (double)b->result.edge_fraction, (double)b->result.max_column_density,
+			    (double)b->result.cue_energy, b->result.neutral ? 1 : 0, pv->width, pv->height,
+			    (double)pv->canvas_u0, (double)pv->canvas_v0, (double)pv->canvas_u1, (double)pv->canvas_v1,
+			    b->last_zone_count);
+		}
+
 		b->last_roi = roi;
 		b->last_roi_narrowed = narrowed;
 		b->last_roi_src = src;
@@ -2061,7 +2127,23 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		        !b->have_roi ? "no preview analysed" : comp_rear_budget_roi_src_str(b->last_roi_src));
 	}
 
-	if (b->dump == 1 && out.state != before) {
+	/*
+	 * The dump normally fires on a state CHANGE, which is exactly what a wedged
+	 * session does not produce — so while the trace is armed it also fires on a
+	 * 2 s cadence. Same retained copy, same mask tint; only the trigger differs.
+	 */
+	bool dump_due = out.state != before;
+	if (b->dump == 1 && b->trace == 1) {
+		if (!b->trace_dump_ref) {
+			b->trace_dump_ref = true;
+			b->trace_dump_ns = now_ns;
+		} else if (now_ns - b->trace_dump_ns >= 2000000000ULL) {
+			b->trace_dump_ns = now_ns;
+			dump_due = true;
+		}
+	}
+
+	if (b->dump == 1 && dump_due) {
 		if (b->dump_have) {
 			const comp_rear_budget_dump_fn sink =
 			    (b->dump_sink != NULL) ? b->dump_sink : comp_rear_budget_dump_png;
