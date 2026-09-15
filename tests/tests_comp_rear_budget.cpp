@@ -1961,3 +1961,107 @@ TEST_CASE("comp_rear_budget: a mask arriving after the bounds takes the region o
 	 */
 	CHECK(comp_rear_budget_debug_roi_src_changes(&r.b) == 2);
 }
+
+
+/*
+ * The modelviewer's ACTUAL order (#1474 panel, third report). Not just "bounds
+ * before mask": the session goes all the way round the state machine on the
+ * rect path first — busy desktop, a CLIPPED transition (so the close-mask
+ * capture is attempted with no mask present at all), then the desktop goes
+ * quiet and it OPENs — and only THEN does the silhouette turn up.
+ */
+namespace {
+
+void
+modelviewer_order(Runner &r, FakePreview &busy, FakePreview &quiet)
+{
+	const std::vector<u_bg_rect_norm> zone = {{0.0f, 0.0f, 1.0f, 1.0f}};
+	uint64_t t = 0;
+
+	// 1. Bounds + zones, no mask, over a busy desktop → CLIPPED_BUSY_BACKGROUND.
+	//    The close-mask capture runs here with nothing to capture.
+	for (; t <= 800 * MS; t += 10 * MS) {
+		bounds(r, 0.05f, 0.05f, 0.7f, 0.95f, t);
+		zones(r, zone, t);
+		step(r, &busy.pv, t);
+	}
+	REQUIRE(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_BOUNDS_IN_ZONES);
+
+	// 2. The desktop goes quiet → OPEN (which runs the hold-drop path).
+	for (; t <= 2500 * MS; t += 10 * MS) {
+		bounds(r, 0.05f, 0.05f, 0.7f, 0.95f, t);
+		zones(r, zone, t);
+		step(r, &quiet.pv, t);
+	}
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	// 3. NOW the silhouette arrives, capture generation frozen from here.
+	MaskGrid m(20, 10);
+	m.set(1, 1, 9, 9);
+	for (; t <= 3500 * MS; t += 10 * MS) {
+		bounds(r, 0.05f, 0.05f, 0.7f, 0.95f, t);
+		zones(r, zone, t);
+		mask(r, m, t);
+		step(r, &quiet.pv, t);
+	}
+}
+
+} // namespace
+
+TEST_CASE("comp_rear_budget: a mask arriving after a full clip/open cycle on the bounds is ingested")
+{
+	FakePreview busy(400, 200, /*generation=*/3, /*busy=*/true);
+	FakePreview quiet(400, 200, /*generation=*/75, /*busy=*/false);
+
+	Runner r;
+	modelviewer_order(r, busy, quiet);
+	CHECK(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	CHECK(mask_px(r) > 0);
+
+	// And with the guard off, to say whether anything here is guard-specific.
+	ScopedEnv off("DXR_REAR_BUDGET_MASK_RATCHET", "0");
+	Runner r2;
+	FakePreview busy2(400, 200, 3, true);
+	FakePreview quiet2(400, 200, 75, false);
+	modelviewer_order(r2, busy2, quiet2);
+	CHECK(src_of(r2) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	CHECK(mask_px(r2) > 0);
+}
+
+
+/*
+ * "The region is the bounds" has nine causes and used to name none of them
+ * (#1474). Two panel sessions were spent diffing runtime builds to tell
+ * "the runtime rejected the mask" from "the app stopped sending one" — the
+ * second of which is what a session that OPENS looks like when the app only
+ * chains its silhouette while it is clipping.
+ */
+TEST_CASE("comp_rear_budget: an app that stops chaining its mask is named as the reason")
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	Runner r;
+
+	// Nothing chained at all yet.
+	step(r, &pv.pv, 0);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_WHOLE_PREVIEW);
+	CHECK(comp_rear_budget_debug_no_mask_reason(&r.b) != nullptr);
+	CHECK(std::string(comp_rear_budget_debug_no_mask_reason(&r.b)).find("never chained") != std::string::npos);
+
+	// The silhouette arrives and is adopted — the latch clears, so a LATER
+	// loss is news again rather than hidden behind the first reason.
+	MaskGrid m(20, 10);
+	m.set(1, 1, 9, 9);
+	uint64_t t = run_with_mask(r, &pv.pv, m, 100 * MS, 300);
+	REQUIRE(src_of(r) == COMP_REAR_BUDGET_ROI_SRC_MASK);
+	REQUIRE(comp_rear_budget_debug_no_mask_reason(&r.b) == nullptr);
+
+	// Now the app stops chaining it — exactly what an app that only publishes
+	// a silhouette while the budget is clipped does the moment it opens.
+	for (t += 10 * MS; t <= 3000 * MS; t += 10 * MS) {
+		step(r, &pv.pv, t);
+	}
+	CHECK(src_of(r) != COMP_REAR_BUDGET_ROI_SRC_MASK);
+	REQUIRE(comp_rear_budget_debug_no_mask_reason(&r.b) != nullptr);
+	CHECK(std::string(comp_rear_budget_debug_no_mask_reason(&r.b)).find("STOPPED chaining") != std::string::npos);
+}

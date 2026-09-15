@@ -992,6 +992,12 @@ comp_rear_budget_build_region(struct comp_rear_budget *b,
 	return true;
 }
 
+const char *
+comp_rear_budget_debug_no_mask_reason(const struct comp_rear_budget *b)
+{
+	return (b == NULL) ? NULL : b->no_mask_logged;
+}
+
 uint32_t
 comp_rear_budget_debug_roi_src_changes(const struct comp_rear_budget *b)
 {
@@ -1138,6 +1144,23 @@ comp_rear_budget_debug_last_mask(const struct comp_rear_budget *b,
 
 
 /*!
+ * Name a reason the mask path was not taken — once per distinct reason.
+ *
+ * One-shot per reason rather than per session: an app that never chains a mask
+ * and an app that stops chaining one halfway through are different bugs, and a
+ * single latched line would hide the second behind the first.
+ */
+static void
+comp_rear_budget_log_no_mask(struct comp_rear_budget *b, const char *why)
+{
+	if (b->no_mask_logged == why) {
+		return;
+	}
+	b->no_mask_logged = why; // string LITERALS, compared by identity on purpose
+	U_LOG_W("REAR_BUDGET: measuring the content BOUNDS, not the silhouette — %s", why);
+}
+
+/*!
  * The ROI this frame's analysis should use, in preview pixels.
  *
  * Two authorities, in this order:
@@ -1237,13 +1260,32 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 			have_mask = true;
 		}
 	}
+	const bool mask_ever = b->mask_ns != 0;
+	const bool mask_was_valid = b->mask_valid;
 	os_mutex_unlock(&b->publish_mutex);
 
 	if (!have_mask) {
 		// Absent, all-zero, stale past a second, or the mask switch is off.
-		// Each is a state-independent statement that the silhouette the ratchet
-		// accumulated is no longer the region.
+		// Each is a state-independent statement that the silhouette held from
+		// the last close is no longer the region.
 		comp_rear_budget_close_reset(b);
+
+		/*
+		 * And SAY so, once per reason (#1474). "The region is the bounds"
+		 * is the visible symptom of nine different causes, three of them
+		 * app-side and one of them a kill switch, and until this line existed
+		 * the only way to tell them apart was to diff two runtime builds — two
+		 * panel sessions were spent doing exactly that. The reason is a
+		 * property of the app's publishing, so it is stated in those terms.
+		 */
+		if (b->mask_enabled == 1) {
+			const char *why = !mask_ever        ? "the app has never chained one"
+			                  : !mask_was_valid ? "the last one was refused or all-zero"
+			                  : (mask_age_ns > COMP_REAR_BUDGET_ROI_MAX_AGE_NS)
+			                      ? "the app STOPPED chaining it — the last one is over 1 s old"
+			                      : "its working copy could not be allocated";
+			comp_rear_budget_log_no_mask(b, why);
+		}
 	}
 
 	const bool have_bounds = valid && age_ns <= COMP_REAR_BUDGET_ROI_MAX_AGE_NS;
@@ -1287,8 +1329,16 @@ comp_rear_budget_derive_roi(struct comp_rear_budget *b,
 			*out_src = b->region_from_close ? COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET
 			                                : COMP_REAR_BUDGET_ROI_SRC_MASK;
 			b->roi_mask_in_use = true;
+			// The silhouette is back; a future loss is news again.
+			b->no_mask_logged = NULL;
 			return;
 		}
+
+		// Named for the same reason as the absent case above: "the region is
+		// the bounds" has too many causes to leave unattributed.
+		comp_rear_budget_log_no_mask(b, (b->roi_mask_px == 0)
+		                                    ? "the chained silhouette survives the 3D-zone clamp as nothing"
+		                                    : "the chained silhouette is too small to measure through");
 
 		// The mask was cleared by the zone clamp, and nothing is held. Either
 		// way the region is about to become a RECT, which a silhouette held
