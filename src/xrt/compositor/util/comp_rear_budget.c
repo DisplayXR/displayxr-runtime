@@ -993,6 +993,12 @@ comp_rear_budget_build_region(struct comp_rear_budget *b,
 }
 
 bool
+comp_rear_budget_debug_region_static(const struct comp_rear_budget *b)
+{
+	return b != NULL && b->region_static_logged;
+}
+
+bool
 comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_px)
 {
 	if (b == NULL || !b->close_valid || b->close_px == 0) {
@@ -1849,6 +1855,28 @@ comp_rear_budget_tick(struct comp_rear_budget *b,
 		b->last_roi_narrowed = narrowed;
 		b->last_roi_src = src;
 		b->have_roi = true;
+
+		/*
+		 * Neither input has moved for ten seconds. Said once, because the
+		 * alternative is silence that reads exactly like a runner that stopped
+		 * ingesting masks — which is how a panel session came to blame the
+		 * runtime for an app republishing one intro-pose silhouette (#1474).
+		 * Not an error: a still model on a still desktop looks the same.
+		 */
+		if (gen_new || !b->region_static_ref || b->region_static_id != b->region_build_id) {
+			b->region_static_ref = true;
+			b->region_static_id = b->region_build_id;
+			b->region_static_since_ns = now_ns;
+		} else if (!b->region_static_logged && b->roi_mask_in_use &&
+		           now_ns - b->region_static_since_ns >= COMP_REAR_BUDGET_STATIC_REGION_NS) {
+			b->region_static_logged = true;
+			U_LOG_W(
+			    "REAR_BUDGET: no new capture (gen %u) and no new region (mask gen %u, %u px) "
+			    "for %u s — the verdict is frozen by construction and cannot transition. If the "
+			    "model IS moving, the app is republishing an unchanged content mask.",
+			    b->last_generation, b->roi_mask_key.mask_gen, b->roi_mask_px,
+			    (unsigned)(COMP_REAR_BUDGET_STATIC_REGION_NS / 1000000000ULL));
+		}
 
 		if (gen_new) {
 			b->have_generation = true;
