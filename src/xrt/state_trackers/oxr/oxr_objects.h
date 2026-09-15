@@ -1972,6 +1972,16 @@ struct oxr_handle_base
 	struct oxr_handle_base *children[XRT_MAX_HANDLE_CHILDREN];
 
 	/*!
+	 * Guards @ref children: a slot is claimed (oxr_handle_init) and released
+	 * (oxr_handle_destroy) under it. Two threads creating handles under one
+	 * parent used to race for the same free slot, so one child was never
+	 * recorded and its later destroy failed with XR_ERROR_RUNTIME_FAILURE
+	 * ("Parent handle does not refer to this handle") - the CTS
+	 * multithreading test creates action sets from several threads.
+	 */
+	struct os_mutex children_mutex;
+
+	/*!
 	 * Current handle state.
 	 */
 	enum oxr_handle_state state;
@@ -2240,6 +2250,16 @@ struct oxr_instance
 	{
 		struct u_hashset *name_store;
 		struct u_hashset *loc_store;
+
+		/*!
+		 * Recursive. Guards the two stores above AND every action set's own
+		 * actions.{name,loc}_store: the duplicate-name check and the insert
+		 * must be one atomic step, and the erase in the destroy callbacks
+		 * must not interleave with a lookup. Recursive because a failed
+		 * create tears its half-built handle down (destroy callback -> erase)
+		 * while the creating thread still holds the lock.
+		 */
+		struct os_mutex mutex;
 	} action_sets;
 
 	//! Path store, for looking up paths.

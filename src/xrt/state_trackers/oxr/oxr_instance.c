@@ -143,6 +143,9 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 
 	u_hashset_destroy(&inst->action_sets.name_store);
 	u_hashset_destroy(&inst->action_sets.loc_store);
+	// Every action set (and action) child was destroyed before this callback
+	// ran, so nothing holds or wants the name lock any more.
+	os_mutex_recursive_destroy(&inst->action_sets.mutex);
 
 	// Free the mask here, no system destroy yet.
 	for (uint32_t i = 0; i < ARRAY_SIZE(inst->system.visibility_mask); i++) {
@@ -420,6 +423,12 @@ oxr_instance_create(struct oxr_logger *log,
 	m_ret = os_mutex_init(&inst->system.sync_actions_mutex);
 	if (m_ret < 0) {
 		ret = oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to init sync action mutex");
+		return ret;
+	}
+
+	m_ret = os_mutex_recursive_init(&inst->action_sets.mutex);
+	if (m_ret < 0) {
+		ret = oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to init action set name mutex");
 		return ret;
 	}
 

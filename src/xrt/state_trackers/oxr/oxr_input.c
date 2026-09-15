@@ -265,6 +265,8 @@ oxr_action_set_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_refcounted_unref(&act_set->data->base);
 	act_set->data = NULL;
 
+	// Recursive lock: a create that failed half-way tears down under it.
+	os_mutex_lock(&act_set->inst->action_sets.mutex);
 	if (act_set->name_item != NULL) {
 		u_hashset_erase_item(act_set->inst->action_sets.name_store, act_set->name_item);
 		free(act_set->name_item);
@@ -275,6 +277,7 @@ oxr_action_set_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 		free(act_set->loc_item);
 		act_set->loc_item = NULL;
 	}
+	os_mutex_unlock(&act_set->inst->action_sets.mutex);
 
 	free(act_set);
 
@@ -352,6 +355,9 @@ oxr_action_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 	oxr_refcounted_unref(&act->data->base);
 	act->data = NULL;
 
+	// The action set outlives its actions (handle tree destroys children
+	// first), so its instance and the shared name lock are still live.
+	os_mutex_lock(&act->act_set->inst->action_sets.mutex);
 	if (act->name_item != NULL) {
 		u_hashset_erase_item(act->act_set->data->actions.name_store, act->name_item);
 		free(act->name_item);
@@ -362,6 +368,7 @@ oxr_action_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 		free(act->loc_item);
 		act->loc_item = NULL;
 	}
+	os_mutex_unlock(&act->act_set->inst->action_sets.mutex);
 
 	free(act);
 
