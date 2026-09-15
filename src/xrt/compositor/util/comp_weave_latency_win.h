@@ -876,6 +876,23 @@ struct late_weave_governor
 {
 	int base = -1;         // DXR_LATE_WEAVE_MAX_LATENCY, probed once (1..MAX)
 	int auto_backoff = -1; // DXR_LATE_WEAVE_AUTOBACKOFF, default 1
+	//! #1339: last repaint present (QPC), stamped by the target's repaint mark.
+	//! While repaints are flowing the governor holds the initialised depth and
+	//! walks any escalation back: the extra queue levels a saturated app earns
+	//! are exactly what repaints then fill, and on an arm the join cannot see
+	//! that is latency the eye predictor never learns. Measured (fill arm,
+	//! forced repaints): the queue cap held at depth 1-2 (~200 refusals per
+	//! 5 s, gap ~3.5) until the app's interval under repaint load read as
+	//! saturation, the governor went to 3, and the queue ran 3 deep again.
+	uint64_t last_repaint_qpc = 0;
+	int repaint_hold = -1; // DXR_LATE_WEAVE_REPAINT_HOLD, default 1
+	bool repaint_hold_logged = false;
+
+	void
+	note_repaint(uint64_t now_qpc)
+	{
+		last_repaint_qpc = now_qpc;
+	}
 	int effective = 1;
 	bool paced_logged = false; // #1339 one-shot
 
@@ -1201,6 +1218,38 @@ struct late_weave_governor
 			        u_app_partition_divisor(), effective);
 		}
 		if (paced || base != 1 || auto_backoff != 1 || period_ns <= 0.0 || interval_ema_ns <= 0.0) {
+			return 0;
+		}
+		// #1339: repaints flowing (one in the last second) -> hold at base
+		// and walk any escalation back one level per mark. The repaint loop
+		// only runs when the app misses vblanks, so this cannot starve a
+		// pipeline that is making rate; a saturated app that ALSO repaints
+		// gets latency-first, which is the blind-eyeball verdict on #1339
+		// (depth 1 "very good" vs escalated "not as good", fill unchanged).
+		if (repaint_hold < 0) {
+			const char *e = getenv("DXR_LATE_WEAVE_REPAINT_HOLD");
+			repaint_hold = (e != nullptr && e[0] == '0') ? 0 : 1;
+		}
+		const bool repainting = repaint_hold == 1 && last_repaint_qpc != 0 && now > last_repaint_qpc &&
+		                        (double)(now - last_repaint_qpc) < 1.0 * (double)freq_hz;
+		if (repainting) {
+			if (!repaint_hold_logged) {
+				repaint_hold_logged = true;
+				U_LOG_W("Late-weave: repaints are flowing -- governor holds max latency %d; the queue "
+				        "levels a saturated app earns are what repaints fill, and that depth is latency "
+				        "the eye predictor cannot see on a blind arm (#1339; "
+				        "DXR_LATE_WEAVE_REPAINT_HOLD=0 disables)",
+				        base);
+			}
+			if (effective > base) {
+				const int from = effective;
+				effective--;
+				over_frames = 0;
+				calm_frames = 0;
+				backoff_qpc = now;
+				log_change(now, freq_hz, from, "repaints flowing (#1339)");
+				return -1;
+			}
 			return 0;
 		}
 

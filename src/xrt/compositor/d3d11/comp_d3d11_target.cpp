@@ -688,6 +688,10 @@ comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode
 	// timeout for the life of the chain.
 	g_repaint_present_pending = true;
 	g_repaint_thread_id = GetCurrentThreadId();
+	// #1339: tell the governor repaints are flowing (see late_weave_governor).
+	LARGE_INTEGER q;
+	QueryPerformanceCounter(&q);
+	g_lw_gov_d3d11.note_repaint((uint64_t)q.QuadPart);
 }
 
 extern "C" void
