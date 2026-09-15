@@ -69,7 +69,11 @@ static int g_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disable
 // every idle stretch). weave_mark drains the excess when this is nonzero.
 static std::atomic<uint32_t> g_repaint_presents_since_app{0};
 // #1339 repaint queue cap (see comp_d3d11_target_repaint_admit): a token taken
-// by admit and not yet spent by a present. Repaint thread only.
+// by admit and not yet spent by a present. Plain statics, written on the
+// repaint thread and read in comp_d3d11_target_present on BOTH threads: that
+// is safe only because every present on every tier that uses this target runs
+// under the compositor mutex (d3d11 c->mutex, the d3d12 reroute's lock_guard,
+// the VK tier's c->mutex). An unlocked present path would need atomics here.
 static bool g_repaint_holds_token = false;
 // A repaint has been marked and its present is next on the repaint thread;
 // that present (and only a present on that thread) settles the token.
@@ -468,6 +472,7 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	// from dies with the chain (the repaint thread is already joined).
 	g_repaint_holds_token = false;
 	g_repaint_present_pending = false;
+	g_repaint_thread_id = 0;
 	g_repaint_presents_since_app.store(0, std::memory_order_relaxed);
 
 	// Stop the present watchdog (#1000). Join with a bound: if the watchdog is

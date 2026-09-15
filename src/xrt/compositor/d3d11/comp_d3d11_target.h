@@ -122,7 +122,8 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
  * stays with the app). A token taken here is kept until the repaint presents
  * (settled in @ref comp_d3d11_target_present on the repaint thread), and a
  * repaint that bails after admission, or whose present is dropped, keeps it
- * for the next tick. Applies to DXR_WEAVE_REPAINT_FORCE=1 too: the probe now
+ * for the next tick — or, if the loop disarms for good, abandons it: the app
+ * reclaims it at its next wait (one 100 ms timeout, then the chain re-syncs). Applies to DXR_WEAVE_REPAINT_FORCE=1 too: the probe now
  * fills every FREE slot rather than every refresh (DXR_WEAVE_REPAINT_QUEUE_CAP=0
  * restores the old fill-the-queue behaviour). Call it UNDER the compositor
  * lock: the app frame path waits on the same waitable while holding that lock,
