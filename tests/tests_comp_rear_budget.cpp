@@ -44,6 +44,20 @@ struct FakePreview
 	std::vector<uint8_t> bytes;
 	xrt_dp_background_preview pv{};
 
+	//! Repaint a patch flat — the desktop behind the model changed, e.g. a window closed.
+	void
+	paint_flat(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+	{
+		for (uint32_t y = y0; y < y1; y++) {
+			for (uint32_t x = x0; x < x1; x++) {
+				uint8_t *p = &bytes[((size_t)y * pv.width + x) * 4u];
+				p[0] = 128;
+				p[1] = 128;
+				p[2] = 128;
+			}
+		}
+	}
+
 	//! Paint a text-like (1-px vertical stripe) patch into an otherwise flat preview.
 	void
 	paint_busy_patch(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
@@ -1618,4 +1632,173 @@ TEST_CASE("comp_rear_budget: re-publishing an identical mask does not rebuild it
 	mask(r, moved, 1100 * MS, /*margin=*/0.05f);
 	step(r, &neutral.pv, 1100 * MS);
 	CHECK(comp_rear_budget_debug_mask_build_id(&r.b) > after_move);
+}
+
+
+/*
+ * -----------------------------------------------------------------------------
+ * The union DILUTES (#1474)
+ *
+ * #1471 guarded #1470's feedback loop by measuring `this frame's mask UNION the
+ * silhouettes seen while the budget was open`. Both neutrality numbers are
+ * FRACTIONS over the masked samples, so that union is not a conservative
+ * widening at all: adding neutral area to a busy region lowers its edge
+ * fraction, and adding neutral ROWS to a busy column lowers that column's
+ * density. On the panel (avatar v0.11.9, runtime v2.16.33) a large intro pose
+ * was accumulated while open, the ~half-size idle pose that followed sat ON a
+ * text column, and the union held the budget OPEN over it for 46 s — the one
+ * direction ADR-040 must never err in.
+ *
+ * The scene below is that panel run at preview scale, chosen so the arithmetic
+ * is the argument rather than the tuning: a 400x200 preview (so the runtime
+ * dilation is 4% of 400 = 16 px), flat except for a small text block, a LARGE
+ * pose whose region is wide enough that the block dilutes to a neutral verdict,
+ * and a SMALL pose around the same block that is unambiguously busy on its own.
+ * The union of the two IS the large one, so a merged region is neutral and a
+ * separated pair is not — which is exactly the defect.
+ * -----------------------------------------------------------------------------
+ */
+
+namespace {
+
+constexpr uint32_t TEXT_X0 = 196, TEXT_Y0 = 95, TEXT_X1 = 204, TEXT_Y1 = 105;
+
+//! Flat 400x200 desktop with one small text block near the middle.
+FakePreview
+dilution_preview()
+{
+	FakePreview pv(400, 200, /*generation=*/1, /*busy=*/false);
+	pv.paint_busy_patch(TEXT_X0, TEXT_Y0, TEXT_X1, TEXT_Y1);
+	return pv;
+}
+
+//! The intro pose: 200x200 preview px of silhouette, dilated to 84..316 x all rows.
+MaskGrid
+dilution_large()
+{
+	MaskGrid m(20, 10);
+	m.set(5, 0, 15, 10);
+	return m;
+}
+
+//! The idle pose: 40x40 px around the text block, dilated to 164..236 x 64..136.
+MaskGrid
+dilution_small()
+{
+	MaskGrid m(20, 10);
+	m.set(9, 4, 11, 6);
+	return m;
+}
+
+//! Drive @p ms of 10 ms frames with one fixed silhouette — a pose that is held.
+uint64_t
+run_with_mask(Runner &r, const xrt_dp_background_preview *pv, const MaskGrid &m, uint64_t start_ns, uint64_t ms)
+{
+	for (uint64_t t = start_ns; t <= start_ns + ms * MS; t += 10 * MS) {
+		mask(r, m, t);
+		step(r, pv, t);
+	}
+	return start_ns + ms * MS;
+}
+
+/*!
+ * Open on the large pose, then hand over to the small one and let the close
+ * land. Returns the time the caller should carry on from.
+ *
+ * REQUIREs rather than CHECKs: every test below is about what happens AFTER
+ * this, so a failure here is a broken premise, not a second finding.
+ */
+uint64_t
+dilution_settle(Runner &r, const xrt_dp_background_preview *pv, uint64_t *out_closed_ns = nullptr)
+{
+	const MaskGrid large = dilution_large();
+	const MaskGrid small = dilution_small();
+
+	// The intro pose reads neutral — the block is real, but 90-odd edge
+	// samples in 46200 is under the 0.003 limit, and 10 edge rows in 200 masked
+	// pairs is under the 0.20 column limit. This is the pose that opens.
+	uint64_t t = run_with_mask(r, pv, large, 0, 1200);
+	REQUIRE(read(r).state == U_REAR_BUDGET_OPEN);
+
+	/*
+	 * The idle pose. The SAME text block, now 1.8% of a 5112-sample region
+	 * instead of 0.2% of a 46200-sample one: busy by a factor of six, and busy
+	 * on the metric the union hides (the column density stays at 10/72, under
+	 * its own limit, which is why multi-column text is not caught by that half
+	 * either).
+	 */
+	t = run_with_mask(r, pv, small, t + 10 * MS, 400);
+	REQUIRE(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+	if (out_closed_ns != nullptr) {
+		*out_closed_ns = t;
+	}
+	return t;
+}
+
+} // namespace
+
+TEST_CASE("comp_rear_budget: a large transient pose cannot dilute the next pose's busy verdict")
+{
+	FakePreview pv = dilution_preview();
+	Runner r;
+
+	// Closes within the grace despite the large pose that came before it.
+	uint64_t t = dilution_settle(r, &pv.pv);
+	CHECK(read(r).far_offset_vh < 0.001f);
+
+	/*
+	 * And stays shut. Nothing here is a hysteresis question: the app is
+	 * drawing the same silhouette over the same text for three more seconds,
+	 * so every tick of it deserves the same verdict, and #1471's union gave the
+	 * opposite one for 46 s on the panel.
+	 */
+	t = run_with_mask(r, &pv.pv, dilution_small(), t + 10 * MS, 3000);
+	CHECK(read(r).state == U_REAR_BUDGET_CLIPPED_BUSY_BACKGROUND);
+
+	// The region that produced the close is held, and it is the silhouette the
+	// app was drawing at the close — not an accumulation of everything before.
+	uint32_t held = 0;
+	REQUIRE(comp_rear_budget_debug_ratchet(&r.b, &held));
+	CHECK(held == mask_px(r));
+}
+
+TEST_CASE("comp_rear_budget: the held close mask releases when the desktop under it goes quiet")
+{
+	FakePreview pv = dilution_preview();
+	Runner r;
+	uint64_t t = dilution_settle(r, &pv.pv);
+
+	/*
+	 * The window behind the model closes. The app's silhouette has not moved,
+	 * so nothing in the mask path changes — the release has to come from
+	 * re-measuring the HELD region against the new capture, which is the whole
+	 * reason the hold is a mask and not a latched verdict.
+	 */
+	pv.paint_flat(TEXT_X0, TEXT_Y0, TEXT_X1, TEXT_Y1);
+	pv.pv.generation++;
+
+	t = run_with_mask(r, &pv.pv, dilution_small(), t + 10 * MS, 1500);
+	CHECK(read(r).state == U_REAR_BUDGET_OPEN);
+	CHECK(read(r).far_offset_vh > U_REAR_BUDGET_UNRESTRICTED_VH - 0.5f);
+}
+
+TEST_CASE("comp_rear_budget: moving the model off the text releases the held close mask")
+{
+	FakePreview pv = dilution_preview();
+	Runner r;
+	uint64_t t = dilution_settle(r, &pv.pv);
+
+	/*
+	 * The user drags the model 100 preview px to the left — far past the 16 px
+	 * dilation radius — onto blank desktop. The text is still there, so the
+	 * held region is still busy, and holding the budget shut with it would be
+	 * a verdict about pixels the content is nowhere near: the same class of
+	 * wrongness the guard exists to prevent, pointing the other way.
+	 */
+	MaskGrid moved(20, 10);
+	moved.set(4, 4, 6, 6);
+
+	t = run_with_mask(r, &pv.pv, moved, t + 10 * MS, 1500);
+	CHECK_FALSE(comp_rear_budget_debug_ratchet(&r.b, nullptr));
+	CHECK(read(r).state == U_REAR_BUDGET_OPEN);
 }
