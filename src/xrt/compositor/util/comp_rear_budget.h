@@ -128,12 +128,14 @@ enum comp_rear_budget_roi_src
 	 */
 	COMP_REAR_BUDGET_ROI_SRC_MASK,
 	/*!
-	 * The mask, WIDENED by the ratchet (#1470): the union of this frame's
-	 * silhouette and the silhouette that was observed while the budget was
-	 * last open. Reported instead of @ref COMP_REAR_BUDGET_ROI_SRC_MASK
-	 * whenever the union covers more than the frame's own mask, so a verdict
-	 * measured over a region the app is not currently drawing stays
-	 * attributable.
+	 * The mask, with the verdict WIDENED by the held close mask (#1470): the
+	 * silhouette that was in use when the session last closed is measured as
+	 * a second region and the worse of the two answers is used. Reported
+	 * instead of @ref COMP_REAR_BUDGET_ROI_SRC_MASK whenever that held region
+	 * covers pixels the frame's own mask does not, so a verdict the app's
+	 * current silhouette alone would not produce stays attributable. (The
+	 * enumerator keeps its `RATCHET` name: it is the same guard, and
+	 * #1474 replaced only its operator — see the header's field block.)
 	 */
 	COMP_REAR_BUDGET_ROI_SRC_MASK_RATCHET,
 	//! The app's content bounds, unclamped (full-window app: no 3D zones).
@@ -325,7 +327,7 @@ struct comp_rear_budget
 	/*! @} */
 
 	/*!
-	 * @name XR_DXR_depth_budget - the mask RATCHET (#1470)
+	 * @name XR_DXR_depth_budget - the HELD CLOSE MASK (#1470, revised in #1474)
 	 *
 	 * v3's contract defines the mask as the app's RENDERED silhouette, and the
 	 * render happens after the shader-side far clip. So the region the runtime
@@ -345,62 +347,94 @@ struct comp_rear_budget
 	 *   region that produced the last close verdict, unless the region changed
 	 *   for a state-INDEPENDENT reason.
 	 *
-	 * Mechanically: while the budget is non-zero, every dilated mask is OR'd
-	 * into @ref ratchet_mask; while it is zero the ratchet HOLDS, and the
-	 * analysis measures @ref roi_mask UNION @ref ratchet_mask. The rear half's
-	 * text therefore stays in the measured region after the clip discards it,
-	 * the re-open never happens, and the worst case is one flap instead of an
-	 * indefinite cycle.
+	 * #1471 kept that invariant by UNIONING: every dilated mask seen while the
+	 * budget was non-zero was OR'd into an accumulation, and the analysis
+	 * measured `roi_mask UNION accumulation`. That is the wrong operator for
+	 * this metric and #1474 is what it costs. Both neutrality numbers are
+	 * FRACTIONS over the masked samples (`edge_fraction` = edges / masked
+	 * samples; a column's density = its edges / ITS masked pairs), so adding
+	 * neutral area to a region can only ever make a busy region look quieter.
+	 * On the panel an avatar intro pose (20697 px) was accumulated while open,
+	 * the idle pose that followed was ~10700 px and sat ON a text column, and
+	 * the union — twice the area, the surplus neutral desktop — diluted the
+	 * text's edges below the limit and held the budget OPEN over it for 46 s.
+	 * Conservative-OPEN is the one direction this design must never err in
+	 * (ADR-040: a visible conflict is worse than a missing rear).
 	 *
-	 * Reset (see @ref comp_rear_budget_ratchet_reset) is exactly the set of
+	 * So the region is never merged. TWO verdicts, measured separately over the
+	 * same preview and combined only as numbers:
+	 *
+	 * - the CLOSE verdict reads @ref roi_mask ALONE — what the app is drawing
+	 *   now, undilutable by anything the runner remembers;
+	 * - the OPEN verdict additionally requires @ref close_mask — the dilated
+	 *   mask that was in use when the session last transitioned to
+	 *   CLIPPED_BUSY_BACKGROUND, CAPTURED at that transition rather than
+	 *   accumulated — to read neutral as well.
+	 *
+	 * While the hold stands the policy is fed the WORSE of the two (max
+	 * `cue_energy`, neutral only if both are); while the budget is open there
+	 * is no hold and the policy is fed the current mask's result. #1470's loop
+	 * is still shut — clipped, the front cap reads neutral but the held
+	 * full-silhouette-over-text reads busy — and a small busy pose can no
+	 * longer be hidden by a large neutral one that came before it.
+	 *
+	 * Reset (see @ref comp_rear_budget_close_reset) is exactly the set of
 	 * reasons the region changed for something OTHER than the budget: the zone
 	 * rects, the preview dims or canvas rect, the mask going absent / all-zero
 	 * / stale, either kill switch, the session leaving transparent+standalone,
 	 * and the mask's centroid moving further than the dilation radius — the
 	 * model was dragged or rotated, so the old region describes a place the
-	 * content no longer is.
+	 * content no longer is. The hold is also dropped the moment the budget
+	 * opens: it has done its job, and the next close captures a fresh one.
 	 *
 	 * Entirely on the runner's side, like @ref roi_mask: the render thread
 	 * never reads app memory, and the only cross-thread write is
-	 * @ref ratchet_drop_requested, set under @ref publish_mutex.
+	 * @ref close_drop_requested, set under @ref publish_mutex.
 	 * @{
 	 */
-	uint8_t *ratchet_mask; //!< Preview-res, tight stride. Accumulated while open.
-	size_t ratchet_mask_cap;
-	uint32_t ratchet_px;          //!< Nonzero pixels in @ref ratchet_mask.
-	struct u_bg_roi ratchet_rect; //!< Its bounding rect, in preview pixels.
-	bool ratchet_valid;           //!< The ratchet holds a region to union in.
+	//! Preview-res, tight stride. The silhouette that produced the last close.
+	uint8_t *close_mask;
+	size_t close_mask_cap;
+	uint32_t close_px;          //!< Nonzero pixels in @ref close_mask.
+	struct u_bg_roi close_rect; //!< Its bounding rect, in preview pixels.
+	bool close_valid;           //!< A close mask is held and measurable.
+	//! Its own neutrality verdict, from its own analysis pass.
+	struct u_bg_neutrality_result close_result;
+	bool have_close_result;
 	/*!
 	 * The silhouette's HOME centroid: where the mask sits while the budget is
 	 * fully clipped. Recorded on every tick that is clipped with nothing
-	 * held — never while accumulating, and never refreshed while holding, or a
-	 * slow drag would walk the reference along with it and never trip.
+	 * held — never while the budget is open, and never refreshed while holding,
+	 * or a slow drag would walk the reference along with it and never trip.
 	 *
-	 * Deliberately not "the centroid on the tick the ratchet started": the app
+	 * Deliberately not "the centroid on the tick the budget closed": the app
 	 * sees the open budget one frame before the runner ticks again, so by then
 	 * the silhouette has ALREADY grown and its centroid is the open one — which
 	 * is the position the held mask can never return to, so comparing against
-	 * it would reset the ratchet on every close and restore the loop exactly.
+	 * it would drop the hold on every close and restore the loop exactly.
 	 */
-	float ratchet_cx, ratchet_cy;
-	bool ratchet_have_ref;
-	uint32_t ratchet_pw, ratchet_ph; //!< Preview dims it was accumulated in.
-	uint32_t ratchet_zone_gen, ratchet_zone_count;
-	float ratchet_cu0, ratchet_cv0, ratchet_cu1, ratchet_cv1;
+	float home_cx, home_cy;
+	bool have_home;
+	uint32_t close_pw, close_ph; //!< Preview dims it was captured in.
+	uint32_t close_zone_gen, close_zone_count;
+	float close_cu0, close_cv0, close_cu1, close_cv1;
 	//! Set under @ref publish_mutex when the session disarms; consumed by the tick.
-	bool ratchet_drop_requested;
-	//! Bumped whenever @ref ratchet_mask's CONTENT changed.
-	uint32_t ratchet_gen;
+	bool close_drop_requested;
+	//! Bumped whenever @ref close_mask's CONTENT changed.
+	uint32_t close_gen;
 	//! DXR_REAR_BUDGET_MASK_RATCHET. -1 = unprobed, 0 = kill switch armed.
-	int ratchet_enabled;
+	int guard_enabled;
 
-	//! @ref roi_mask UNION @ref ratchet_mask; only built when they differ.
+	//! @ref roi_mask UNION @ref close_mask; only built when they differ.
 	uint8_t *union_mask;
 	size_t union_mask_cap;
 
 	/*!
-	 * The mask the analysis reads: @ref roi_mask, or @ref union_mask when the
-	 * ratchet widened it. Points into this struct, never into app memory.
+	 * Everything measured this tick: @ref roi_mask, or the union of it and
+	 * @ref close_mask while one is held. NOT what is handed to either analysis
+	 * — each reads its own mask — but what the dump tints, what `roi=` reports
+	 * and what @ref comp_rear_budget_debug_last_mask answers "what did you
+	 * judge?" with. Points into this struct, never into app memory.
 	 */
 	const uint8_t *region;
 	uint32_t region_px;
@@ -408,10 +442,10 @@ struct comp_rear_budget
 	//! Bumped whenever @ref region's contents changed — the re-analysis gate.
 	uint32_t region_build_id;
 	//! Composition @ref region_build_id describes.
-	uint32_t region_key_mask_build_id, region_key_ratchet_gen;
+	uint32_t region_key_mask_build_id, region_key_close_gen;
 	bool region_key_valid;
-	//! The ratchet covered pixels this frame's own mask does not.
-	bool region_from_ratchet;
+	//! The held close mask covers pixels this frame's own mask does not.
+	bool region_from_close;
 	/*! @} */
 
 	/*!
@@ -742,11 +776,14 @@ uint32_t
 comp_rear_budget_debug_mask_build_id(const struct comp_rear_budget *b);
 
 /*!
- * TEST ONLY — nonzero preview pixels the RATCHET currently holds.
+ * TEST ONLY — nonzero preview pixels of the HELD CLOSE MASK (#1470/#1474).
  *
- * @return false when the ratchet is not armed or holds nothing.
+ * Keeps its historical name because the kill switch, the transition line's
+ * `ratchet=` field and the `roi_src` do: what the guard holds changed from an
+ * accumulated union to the silhouette captured at the last close, not what it
+ * is for.
  *
- * @ingroup comp_util
+ * @return false when the guard is not armed or holds nothing.
  */
 bool
 comp_rear_budget_debug_ratchet(const struct comp_rear_budget *b, uint32_t *out_px);
