@@ -329,6 +329,14 @@ struct comp_rear_budget
 	int mask_enabled;
 	//! One-shot: the mask fell entirely outside every 3D zone.
 	bool mask_outside_logged;
+	/*!
+	 * The reason the mask path was last declined, as a string LITERAL, or NULL
+	 * while the silhouette is in use. Compared by pointer identity, so each
+	 * distinct reason is reported once and a reason that stops applying and
+	 * comes back is reported again. "The region is the bounds" has nine causes
+	 * and used to name none of them (#1474).
+	 */
+	const char *no_mask_logged;
 	//! Scratch for the separable dilation; grown with the preview.
 	uint32_t *dilate_scratch;
 	size_t dilate_scratch_cap;
@@ -864,6 +872,14 @@ comp_rear_budget_debug_region_static(const struct comp_rear_budget *b);
  */
 uint32_t
 comp_rear_budget_debug_roi_src_changes(const struct comp_rear_budget *b);
+
+/*!
+ * TEST ONLY — why the mask path was last declined, or NULL while it is in use.
+ *
+ * @ingroup comp_util
+ */
+const char *
+comp_rear_budget_debug_no_mask_reason(const struct comp_rear_budget *b);
 
 /*!
  * TEST ONLY — dimensions of the preview currently retained for the dump.
