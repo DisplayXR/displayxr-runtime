@@ -101,9 +101,8 @@ struct weave_latency_log
 	//! Resolved from after_present, one to a few presents after the
 	//! prediction, so a window's `resolved` lags its `n` by the resolve
 	//! depth — read the two as neighbours, not as a ratio. (The coverage
-	//! gate below does divide its own pair, but over an epoch of >= 32
-	//! resolves the lag only depresses a 100%-join chain's first verdict to
-	//! ~32/47; it cannot by itself push one under the 50% line.)
+	//! gate below does divide its own pair, but over an epoch of 1024 armed
+	//! the <= 8-deep resolve lag is noise: a 100%-join chain reads ~1016/1024.)
 	uint32_t hz_resolved = 0;
 	uint32_t hz_wrong_slot = 0;
 	uint64_t hz_abs_err_sum_ns = 0;
@@ -214,22 +213,27 @@ struct weave_latency_log
 	 *    every ~5 s; a second threshold for recovery instead left a steady
 	 *    50-66% chain refused for the life of the struct — on the service
 	 *    multi-compositor that is the logon session;
-	 *  - a covered verdict authorises the NEXT epoch's window (`po_coverage_ok`
-	 *    is the last verdict, latched forward). If the arm starves right
-	 *    after a covered verdict, a trickle of 32 resolves inside 1024 armed
-	 *    can still take ONE step before that epoch closes bad and drops the
-	 *    window; the second bad verdict then refuses and unlearns it. Bounded
-	 *    to one step, ~35 s, and the trace row shows `refused`/bad/good;
+	 *  - a covered verdict authorises the NEXT epoch (`po_coverage_ok` is the
+	 *    last verdict, latched forward), and an epoch may take ONE step
+	 *    (`po_changes_this_epoch`): an arm that degrades right after a covered
+	 *    verdict can deliver hundreds of resolves inside the next 1024 armed,
+	 *    which is a dozen full windows — without the bound it would climb to
+	 *    the cap inside that epoch and hold it ~17 s. With it: one step, then
+	 *    the bad verdict drops the window and the second one unlearns it;
 	 *  - refuse / recover each log once per edge; the gate state is reset
 	 *    with the chain (`po_gate_reset()` from close() and from the
 	 *    in-process target destroy), never carried into the next chain.
-	 * A healthy chain (join 66-100%) reaches its first verdict after ~32-48
-	 * armed weaves and is never refused, so its lock timing is unchanged.
+	 * A healthy chain (join 66-100%) covers every epoch and is never refused;
+	 * its first decision waits for its first epoch (~17 s at 60/s), and each
+	 * later step for the next one. `po_applied` is deliberately NOT reset with
+	 * the gate on teardown, so a chain recreated in-process keeps the last
+	 * chain's offset for that first epoch.
 	 */
 	static constexpr uint64_t PO_EDGE_DWELL_NS = 30ull * 1000ull * 1000ull * 1000ull;
 	static constexpr uint32_t PO_EPOCH_ARMED = 1024; // armed horizons per coverage verdict
 	uint32_t po_cov_armed = 0;     // horizons armed since the last coverage verdict
 	uint32_t po_cov_resolved = 0;  // observations since the last coverage verdict
+	uint32_t po_changes_this_epoch = 0; // decisions taken since the last verdict (max 1)
 	bool po_coverage_ok = false;   // did the last closed epoch cover (>= 50%)? latched forward
 	bool po_refused = false;       // sticky: two consecutive verdicts came in under 50%
 	uint32_t po_bad_verdicts = 0;  // consecutive verdicts under 50% (refusal needs 2)
@@ -285,6 +289,7 @@ struct weave_latency_log
 		po_coverage_ok = covered && !po_refused;
 		po_cov_resolved = 0;
 		po_cov_armed = 0;
+		po_changes_this_epoch = 0;
 	}
 
 	void
@@ -308,8 +313,8 @@ struct weave_latency_log
 			po_win_n++;
 			return; // decide only on a full window
 		}
-		if (!po_coverage_ok) {
-			return; // the join has not covered this arm's pipeline; no decision
+		if (!po_coverage_ok || po_changes_this_epoch != 0) {
+			return; // no cover for this arm's pipeline, or this epoch's one step is taken
 		}
 		uint32_t hist[7] = {0, 0, 0, 0, 0, 0, 0};
 		for (uint32_t i = 0; i < 32; i++) {
@@ -386,6 +391,7 @@ struct weave_latency_log
 		}
 		po_applied = next;
 		po_changes++;
+		po_changes_this_epoch++;
 		po_win_n = 0; // re-measure against the new value
 		if (next < cap) {
 			po_clamp_logged = false; // left the cap: a later re-climb to it may log again
@@ -405,6 +411,7 @@ struct weave_latency_log
 		po_good_verdicts = 0;
 		po_cov_armed = 0;
 		po_cov_resolved = 0;
+		po_changes_this_epoch = 0;
 		po_coverage_ok = false;
 		po_edge_ns = 0;
 	}

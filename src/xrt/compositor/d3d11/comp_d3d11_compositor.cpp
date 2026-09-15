@@ -2933,13 +2933,6 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		}
 		const uint64_t pace_t1 = os_monotonic_get_ns();
 		u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
-		// #1339: no fill into a queue that already holds a pending present.
-		// Under an ENGAGED partition the schedule owns the slots; leave it.
-		if (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target)) {
-			c->repaint.bail_gate++;
-			u_repaint_trace_bail_gate(&c->repaint.trace);
-			continue;
-		}
 
 		const uint64_t fire_t0 = pace_t1;
 		std::lock_guard<std::mutex> lock(c->mutex);
@@ -2959,6 +2952,16 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			c->repaint.bail_race++;
 			u_repaint_trace_bail_race(&c->repaint.trace);
+			continue;
+		}
+		// #1339: no fill into a queue that already holds a pending present.
+		// UNDER the lock: layer_commit waits on the same waitable while it
+		// holds c->mutex, so a token taken before the lock could be the one
+		// the app is about to block on. Under an ENGAGED partition the
+		// schedule owns the slots; leave it.
+		if (c->repaint.partition.next_release_ns == 0 && !comp_d3d11_target_repaint_admit(c->target)) {
+			c->repaint.bail_gate++;
+			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
 

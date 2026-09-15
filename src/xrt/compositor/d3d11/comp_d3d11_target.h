@@ -120,9 +120,14 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target);
  * handed, at max frame latency 1 — the cap only binds presenters that wait
  * on it, and repaints never did. Returns false = skip this tick (the token
  * stays with the app). A token taken here is kept until the repaint presents
- * (see @ref comp_d3d11_target_weave_mark_repaint), and a repaint that bails
- * after admission keeps it for the next tick. DXR_WEAVE_REPAINT_QUEUE_CAP=0
- * restores the old behaviour. Runs on the repaint thread only.
+ * (settled in @ref comp_d3d11_target_present on the repaint thread), and a
+ * repaint that bails after admission, or whose present is dropped, keeps it
+ * for the next tick. Applies to DXR_WEAVE_REPAINT_FORCE=1 too: the probe now
+ * fills every FREE slot rather than every refresh (DXR_WEAVE_REPAINT_QUEUE_CAP=0
+ * restores the old fill-the-queue behaviour). Call it UNDER the compositor
+ * lock: the app frame path waits on the same waitable while holding that lock,
+ * and a token taken outside it can be the one the app is about to block on.
+ * Runs on the repaint thread only.
  */
 bool
 comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target);
