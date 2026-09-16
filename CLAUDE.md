@@ -460,7 +460,7 @@ Release builds lack PDBs — use `ub` to find the calling pattern (`mov rax,[rbx
 - **Never** add per-frame `U_LOG_W` — massive log bloat.
 
 ### Other skills
-- `/ask-gemini` — read-only code analysis report via Gemini (`~/.claude/skills/ask-gemini/SKILL.md`).
+- `/ask-gpt` — read-only code analysis report, and image generation (GPT-Image-2.5), via OpenAI (`~/.claude/skills/ask-gpt/SKILL.md`). Replaced `/ask-gemini`, removed 2026-09-15.
 - `/new-displayxr-app <name> [class=] [api=] [platform=]` — scaffold a new app correct-by-construction (clones the nearest `cube_*` reference, drops manifest + per-app CLAUDE.md, wires CMake, lints). Backed by `docs/guides/displayxr-app-rules.md`.
 
 ### Writing / checking a DisplayXR app
