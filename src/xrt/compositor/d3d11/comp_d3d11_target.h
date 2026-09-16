@@ -153,6 +153,44 @@ void
 comp_d3d11_target_app_wait_reset(void);
 
 /*!
+ * #1482 instrumentation: the longest STAGE 2 of @ref comp_d3d11_target_weave_mark
+ * since the last read — the composed chain's compositor-clock align or the
+ * opaque chain's scanout wait, whichever ran.
+ *
+ * Stage 1 (the frame-latency wait) is the peak above; this is the other half of
+ * the same span under the compositor lock, and the scanout wait is bounded at
+ * three panel periods — a whole partition stride at D=3 — so it can forfeit a
+ * slot on its own. Same destructive read; diagnostics only.
+ */
+uint64_t
+comp_d3d11_target_app_stage2_take_max_ns(void);
+
+/*!
+ * @name #1482 stage-1 tallies for the trace row's `drain=` / `to=` / `inst=`.
+ *
+ * Destructive reads, like the peaks above: each returns the count since the
+ * last call and zeroes it.
+ *
+ *  - drained: frame-latency tokens the #868 surplus drain removed. Always 0
+ *    while @ref comp_d3d11_target_set_app_paced is true, because the drain does
+ *    not run there.
+ *  - wait_timeouts: stage-1 waits that ran to the full 100 ms bound — the #1482
+ *    signature, where the drain deleted the very token the app then waited for.
+ *  - wait_instant: stage-1 waits that returned inside 2 ms on an already-banked
+ *    token — the #868 signature the drain exists to suppress.
+ * @{
+ */
+uint32_t
+comp_d3d11_target_app_take_drained(void);
+
+uint32_t
+comp_d3d11_target_app_take_wait_timeouts(void);
+
+uint32_t
+comp_d3d11_target_app_take_wait_instant(void);
+/*! @} */
+
+/*!
  * #868: repaint counterpart of @ref comp_d3d11_target_weave_mark — stamps
  * T_weave only, staying out of the saturation governor and the #867 ledger.
  */
@@ -181,6 +219,21 @@ comp_d3d11_target_get_predicted_lookahead_ns(struct comp_d3d11_target *target);
  */
 void
 comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t period_ns);
+
+/*!
+ * #1482: tell the target whether a #1257 partition grid is pacing the app's
+ * frame releases. Pushed by the compositor at its `u_app_partition_throttle`
+ * call and keyed on that compositor's OWN grid (`next_release_ns != 0`), which
+ * is how every other partition decision on this path is keyed.
+ *
+ * While true, @ref comp_d3d11_target_weave_mark skips the #868 surplus-token
+ * drain: the grid is the pacer, so an instant stage-1 return is exactly what
+ * the app's slot wants — and the drain, which cannot tell the app's own credit
+ * from a repaint's surplus, would otherwise delete the token the app is about
+ * to block on while it holds the compositor lock.
+ */
+void
+comp_d3d11_target_set_app_paced(struct comp_d3d11_target *target, bool paced);
 
 /*!
  * The display refresh period this target is pacing against, or 0 if it has not

@@ -1064,6 +1064,16 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// as the VK tier ships. In-process (split-off) sessions still refuse
 	// cleanly.
 	u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, c->split_active);
+	// #1482: republish the grid state to the target, which is where the
+	// app's frame-latency wait lives. When the grid is pacing, the target
+	// must not drain the surplus tokens (#868) — the drain cannot tell the
+	// app's own credit from a repaint's surplus, and the app would then
+	// block on a signal it just deleted, under c->mutex, for the full wait
+	// bound. Keyed on this compositor's OWN grid, as every other partition
+	// decision here is.
+	if (c->target != nullptr) {
+		comp_d3d11_target_set_app_paced(c->target, c->repaint.partition.next_release_ns != 0);
+	}
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -2928,7 +2938,11 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			                    u_app_partition_releases(&c->repaint.partition),
 			                    u_app_partition_slots_forfeited(&c->repaint.partition),
 			                    c->repaint.app_lock_max_ns.exchange(0, std::memory_order_relaxed),
-			                    comp_d3d11_target_app_wait_take_max_ns());
+			                    comp_d3d11_target_app_wait_take_max_ns(),
+			                    comp_d3d11_target_app_stage2_take_max_ns(),
+			                    comp_d3d11_target_app_take_drained(),
+			                    comp_d3d11_target_app_take_wait_timeouts(),
+			                    comp_d3d11_target_app_take_wait_instant());
 			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
 			                       &c->repaint.partition);
 		}

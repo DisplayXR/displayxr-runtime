@@ -831,7 +831,7 @@ struct u_repaint_trace
 	 * @name #1339 app-side numbers, pushed in by the backend.
 	 *
 	 * The loop can see everything about ITSELF and nothing about why the
-	 * APP misses a partition slot. These four are measured on the app
+	 * APP misses a partition slot. These are all measured on the app
 	 * thread (the d3d11 backend only) and pushed here so one row carries
 	 * both halves. @ref app_have gates the segment: a backend that never
 	 * pushes prints no `app{...}`.
@@ -844,6 +844,14 @@ struct u_repaint_trace
 	//! cannot consume a window either. The fold below keeps the max across
 	//! however many pushes land inside one 5 s window.
 	uint64_t app_lock_max_ns, app_wait_max_ns;
+	//! #1482: stage 2 of the same locked span the wait peak measures —
+	//! the scanout wait alone is bounded at three panel periods.
+	uint64_t app_stage2_max_ns;
+	//! #1482 per-window tallies, SUMMED across the pushes inside one
+	//! window (the peaks above fold with max): tokens the #868 drain
+	//! removed (0 while the grid paces the app), stage-1 waits that ran
+	//! to the full bound, and stage-1 waits that returned instantly.
+	uint32_t app_drained, app_wait_timeouts, app_wait_instant;
 	int app_have;
 	/*! @} */
 };
@@ -937,16 +945,20 @@ u_repaint_trace_fire(struct u_repaint_trace *t, uint64_t start_ns, uint64_t end_
 /*!
  * #1339: push the app-side partition health into the next row. Call once per
  * LOOP ITERATION, before @ref u_repaint_trace_report — it is a plain store,
- * never a log. The two maxima are PER-WINDOW peaks: the report zeroes its
- * copies, and the backend zeroes the sources it read them from whenever it
- * observes that a row went out.
+ * never a log. The maxima are PER-WINDOW peaks and the #1482 tallies
+ * PER-WINDOW sums: the report zeroes its copies, and the backend zeroes the
+ * sources it read them from whenever it observes that a row went out.
  */
 static inline void
 u_repaint_trace_app(struct u_repaint_trace *t,
                     uint32_t releases,
                     uint32_t forfeited,
                     uint64_t lock_max_ns,
-                    uint64_t wait_max_ns)
+                    uint64_t wait_max_ns,
+                    uint64_t stage2_max_ns,
+                    uint32_t drained,
+                    uint32_t wait_timeouts,
+                    uint32_t wait_instant)
 {
 	if (t->enabled != 1) {
 		return;
@@ -959,6 +971,14 @@ u_repaint_trace_app(struct u_repaint_trace *t,
 	if (wait_max_ns > t->app_wait_max_ns) {
 		t->app_wait_max_ns = wait_max_ns;
 	}
+	if (stage2_max_ns > t->app_stage2_max_ns) {
+		t->app_stage2_max_ns = stage2_max_ns;
+	}
+	// #1482: counts, not peaks — the sources are destructive reads too, so
+	// summing here is what makes the row's number a per-window total.
+	t->app_drained += drained;
+	t->app_wait_timeouts += wait_timeouts;
+	t->app_wait_instant += wait_instant;
 	t->app_have = 1;
 }
 
@@ -1023,12 +1043,19 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	// the existing fields keep their order and names). Printed only for a
 	// backend that pushed numbers AND only under an engaged partition,
 	// where "the app missed its slot" is a defined event at all.
-	char app_seg[128];
+	char app_seg[256];
 	app_seg[0] = '\0';
 	if (part_on && t->app_have) {
-		snprintf(app_seg, sizeof(app_seg), " app{rel=%u forfeit=%u lock_max=%.2fms wait_max=%.2fms}",
+		// #1482 appended the last four, again without reordering what was
+		// already there: s2_max is the stage-2 peak the wait peak never saw,
+		// and drain/to/inst are the #868-drain and stage-1 wait tallies that
+		// say WHICH of the two the app is living in.
+		snprintf(app_seg, sizeof(app_seg),
+		         " app{rel=%u forfeit=%u lock_max=%.2fms wait_max=%.2fms s2_max=%.2fms drain=%u "
+		         "to=%u inst=%u}",
 		         t->app_releases, t->app_forfeited, (double)t->app_lock_max_ns / 1e6,
-		         (double)t->app_wait_max_ns / 1e6);
+		         (double)t->app_wait_max_ns / 1e6, (double)t->app_stage2_max_ns / 1e6,
+		         t->app_drained, t->app_wait_timeouts, t->app_wait_instant);
 	}
 	U_LOG_W("#1257 trace site=%s: ticks/s=%.1f fires/s=%.1f tick_iv=%.2fms fire=%.2fms "
 	        "pace=%.2fms bail{armed=%u gate=%u race=%u} gate{mode=%s N=%u votes=%u/%u "
@@ -1055,12 +1082,17 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	t->bail_armed = 0;
 	t->bail_gate = 0;
 	t->bail_race = 0;
-	// #1339: the two maxima are PER-WINDOW peaks, so clear them here. The
-	// counters (rel/forfeit) are cumulative since the grid anchored and are
-	// deliberately NOT reset. The backend clears the sources it read the
-	// maxima from when it sees last_report_ns move.
+	// #1339: the maxima are PER-WINDOW peaks, and the #1482 tallies below
+	// them PER-WINDOW sums, so clear them here. The counters (rel/forfeit)
+	// are cumulative since the grid anchored and are deliberately NOT reset.
+	// The backend clears the sources it read the maxima from when it sees
+	// last_report_ns move.
 	t->app_lock_max_ns = 0;
 	t->app_wait_max_ns = 0;
+	t->app_stage2_max_ns = 0;
+	t->app_drained = 0;
+	t->app_wait_timeouts = 0;
+	t->app_wait_instant = 0;
 	t->last_report_ns = now_ns;
 }
 

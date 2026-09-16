@@ -1696,6 +1696,17 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		                comp_vk_native_target_vblank_period_ns(c->target) != 0);
 #endif
 		u_app_partition_throttle(&c->repaint.partition, (uint64_t)period_ns, part_tier_ok);
+#ifdef XRT_OS_WINDOWS
+		// #1482: the app's frame-latency wait lives on the split's d3d11
+		// target, so that target is what has to stop draining surplus
+		// tokens (#868) while the grid is pacing — otherwise the drain
+		// takes the app's own credit and the app blocks for the full wait
+		// bound on a signal it just deleted. Same key as everywhere else:
+		// this compositor's own grid, not the process-wide state.
+		if (c->split != NULL) {
+			comp_vk_split_set_app_paced(c->split, c->repaint.partition.next_release_ns != 0);
+		}
+#endif
 	}
 
 	c->frame_id++;

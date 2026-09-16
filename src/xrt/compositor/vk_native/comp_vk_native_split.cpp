@@ -2348,6 +2348,15 @@ comp_vk_split_repaint_admit(struct comp_vk_split *s)
 }
 
 extern "C" void
+comp_vk_split_set_app_paced(struct comp_vk_split *s, bool paced)
+{
+	if (s == nullptr || s->target == nullptr) {
+		return;
+	}
+	comp_d3d11_target_set_app_paced(s->target, paced);
+}
+
+extern "C" void
 comp_vk_split_render_diag(struct comp_vk_split *s)
 {
 	if (s == nullptr || s->xbridge == nullptr) {

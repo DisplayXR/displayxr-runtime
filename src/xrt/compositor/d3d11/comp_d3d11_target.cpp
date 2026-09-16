@@ -77,6 +77,26 @@ static HANDLE g_frame_latency_waitable = nullptr;
  * atomic because they are EXCHANGED, not merely read.
  */
 static std::atomic<uint64_t> g_app_wait_max_ns{0};
+
+/*!
+ * #1482 instrumentation, in the same destructive-read shape as the peak above.
+ *
+ *  - g_app_stage2_max_ns: peak duration of STAGE 2 in weave_mark (the composed
+ *    chain's compositor-clock align, or the opaque chain's scanout wait). The
+ *    peak above measures stage 1 only, and the scanout wait is bounded at three
+ *    panel periods — a whole stride at D=3 — under the same lock.
+ *  - g_app_drained: frame-latency tokens the #868 surplus drain removed. Zero
+ *    while the grid paces the app, because the drain is skipped there.
+ *  - g_app_wait_timeouts: stage-1 waits that ran to the full 100 ms bound.
+ *  - g_app_wait_instant: stage-1 waits that returned on an already-banked token.
+ *
+ * Relaxed for the same reason: they order nothing, and the one lock that could
+ * order them is the lock whose cost they exist to measure.
+ */
+static std::atomic<uint64_t> g_app_stage2_max_ns{0};
+static std::atomic<uint32_t> g_app_drained{0};
+static std::atomic<uint32_t> g_app_wait_timeouts{0};
+static std::atomic<uint32_t> g_app_wait_instant{0};
 static UINT g_last_present_count = 0;
 
 // Live-path pacing state (#833): the transparent/composed chain paces with the
@@ -89,6 +109,11 @@ static int g_scanout_stats_strikes = 0; //!< consecutive TIMED_OUT; <0 = disable
 // next waits would return instantly for that many frames (pacing loss after
 // every idle stretch). weave_mark drains the excess when this is nonzero.
 static std::atomic<uint32_t> g_repaint_presents_since_app{0};
+// #1482: is the app's frame release paced by a #1257 partition grid? Pushed in
+// by the compositor at its throttle (@ref comp_d3d11_target_set_app_paced) —
+// the grid lives on the compositor, and this target only ever sees the app
+// thread arrive. One target per process on this path, like every static here.
+static bool g_app_paced = false;
 // #1339 repaint queue cap (see comp_d3d11_target_repaint_admit): a token taken
 // by admit and not yet spent by a present. Plain statics, written on the
 // repaint thread and read in comp_d3d11_target_present on BOTH threads: that
@@ -495,6 +520,10 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 	g_repaint_present_pending = false;
 	g_repaint_thread_id = 0;
 	g_repaint_presents_since_app.store(0, std::memory_order_relaxed);
+	// #1482: and the grid flag — the next session republishes it at its first
+	// throttle, and until then "not paced" is the reading that keeps #868's
+	// drain armed.
+	g_app_paced = false;
 
 	// Stop the present watchdog (#1000). Join with a bound: if the watchdog is
 	// somehow wedged we must not hang teardown for it.
@@ -726,6 +755,30 @@ comp_d3d11_target_app_wait_take_max_ns(void)
 	return g_app_wait_max_ns.exchange(0, std::memory_order_relaxed);
 }
 
+extern "C" uint64_t
+comp_d3d11_target_app_stage2_take_max_ns(void)
+{
+	return g_app_stage2_max_ns.exchange(0, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t
+comp_d3d11_target_app_take_drained(void)
+{
+	return g_app_drained.exchange(0, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t
+comp_d3d11_target_app_take_wait_timeouts(void)
+{
+	return g_app_wait_timeouts.exchange(0, std::memory_order_relaxed);
+}
+
+extern "C" uint32_t
+comp_d3d11_target_app_take_wait_instant(void)
+{
+	return g_app_wait_instant.exchange(0, std::memory_order_relaxed);
+}
+
 extern "C" void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
 {
@@ -738,17 +791,34 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 	// instead. Bounded everywhere so occluded windows never wedge.
 	bool wait_timed_out = false;
 	if (g_frame_latency_waitable != nullptr) {
-		// #868 interplay: repaint presents released tokens no one consumed.
-		// Left alone, the wait below returns instantly for that many frames
-		// — pacing loss after every idle stretch. Drain the surplus first;
-		// the blocking wait then re-syncs to the real present cadence.
+		// #868 interplay: a repaint present that held no token released one
+		// nobody consumed. Left alone, the wait below returns instantly for
+		// that many frames — pacing loss after every idle stretch. Drain the
+		// surplus first; the blocking wait then re-syncs to the real present
+		// cadence.
+		//
+		// #1482: NOT while the grid paces the app. The throttle in wait_frame
+		// already released this frame on its slot, so there is no pacing left
+		// for the drain to protect, and an instant stage-1 return is exactly
+		// what the slot wants. What the drain does there is self-inflicted:
+		// tokens are fungible, so emptying the semaphore also takes the APP's
+		// own credit — and the app then blocks below on a signal it just
+		// deleted, holding c->mutex. The repaint thread, the only other
+		// presenter, bails on app_frame_in_progress before that lock and again
+		// under it, so with no present still in flight to retire nothing can
+		// refill the semaphore and the wait runs to its full bound.
+		//
+		// The counter is exchanged to zero either way: it is a surplus tally,
+		// not a backlog, and letting it pile up across a paced stretch would
+		// hand the first unpaced drain a bound it never earned.
 		const uint32_t rp = g_repaint_presents_since_app.exchange(0, std::memory_order_relaxed);
-		if (rp > 0) {
+		if (rp > 0 && !g_app_paced) {
 			uint32_t drained = 0;
 			while (drained < rp + LATE_WEAVE_MAX_DEPTH &&
 			       WaitForSingleObjectEx(g_frame_latency_waitable, 0, FALSE) == WAIT_OBJECT_0) {
 				drained++;
 			}
+			g_app_drained.fetch_add(drained, std::memory_order_relaxed);
 			static bool logged_drain = false;
 			if (!logged_drain && drained > 2) {
 				logged_drain = true;
@@ -761,6 +831,14 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 		wait_timed_out = WaitForSingleObject(g_frame_latency_waitable, 100) == WAIT_TIMEOUT;
 		const uint64_t wait_t1 = os_monotonic_get_ns();
 		const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
+		// #1482: the two ends of the stage-1 distribution, for the trace row. A
+		// full-bound timeout is this bug's signature; an instant return is
+		// #868's. Diagnostics only, never a control input.
+		if (wait_timed_out) {
+			g_app_wait_timeouts.fetch_add(1, std::memory_order_relaxed);
+		} else if (!wait_blocked) {
+			g_app_wait_instant.fetch_add(1, std::memory_order_relaxed);
+		}
 		// #1339: same two stamps, also kept as a peak for the trace row.
 		// Only this thread raises the peak (the reader only exchanges it to
 		// zero), so a load-compare-store needs no CAS.
@@ -781,6 +859,11 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 		const bool running_late = s_last_pace_done_ns != 0 &&
 		                          (double)(wait_t1 - s_last_pace_done_ns) > cu_period_ns * 1.15;
 
+		// #1482 instrumentation: stage 2 was the remaining unmeasured hole. The
+		// opaque chain's scanout wait is bounded at three panel periods (50 ms
+		// at 60 Hz — a whole stride at D=3) and runs under the same lock as the
+		// stage-1 wait above, so it needs a peak of its own.
+		const uint64_t stage2_t0 = os_monotonic_get_ns();
 		if (g_target_is_composed) {
 			// Composed chain: the weave should start at a constant, small
 			// offset after a compositor tick. A BLOCKING waitable release
@@ -823,6 +906,10 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 			}
 		}
 		s_last_pace_done_ns = os_monotonic_get_ns();
+		const uint64_t stage2_ns = s_last_pace_done_ns - stage2_t0;
+		if (stage2_ns > g_app_stage2_max_ns.load(std::memory_order_relaxed)) {
+			g_app_stage2_max_ns.store(stage2_ns, std::memory_order_relaxed);
+		}
 	}
 	g_weave_latency_d3d11.mark_weave("d3d11", predicted_display_time_ns);
 	if (wait_timed_out) {
@@ -878,6 +965,13 @@ comp_d3d11_target_set_display_period(struct comp_d3d11_target *target, uint64_t 
 	if (period_ns > 0 && g_lw_gov_d3d11.period_ns == 0.0) {
 		g_lw_gov_d3d11.period_ns = (double)period_ns;
 	}
+}
+
+extern "C" void
+comp_d3d11_target_set_app_paced(struct comp_d3d11_target *target, bool paced)
+{
+	(void)target;
+	g_app_paced = paced;
 }
 
 extern "C" uint64_t
