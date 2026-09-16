@@ -611,7 +611,6 @@ struct comp_d3d11_compositor
 		 * @{
 		 */
 		std::atomic<uint64_t> app_lock_max_ns{0};
-		uint64_t app_lock_last_ns{0};
 		/*! @} */
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -2918,20 +2917,20 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			u_repaint_trace_tick(&c->repaint.trace, tn);
 			// #1339: push the app-side half of the row. Once per loop
 			// iteration, a plain store; only this backend measures it.
+			// #1339: TAKE the peaks (exchange to 0) rather than read-then-
+			// clear-later. The old shape lost any peak raised between the
+			// read and the clear — a window straddling U_LOG_W, i.e. exactly
+			// when the machine is busy — and the bootstrap report, which
+			// moves last_report_ns without printing, consumed a window.
+			// u_repaint_trace_app folds with max, so several takes inside one
+			// 5 s window still report that window's true peak.
 			u_repaint_trace_app(&c->repaint.trace,
 			                    u_app_partition_releases(&c->repaint.partition),
 			                    u_app_partition_slots_forfeited(&c->repaint.partition),
-			                    c->repaint.app_lock_max_ns.load(std::memory_order_relaxed),
-			                    comp_d3d11_target_app_wait_max_ns());
-			const uint64_t prev_report_ns = c->repaint.trace.last_report_ns;
+			                    c->repaint.app_lock_max_ns.exchange(0, std::memory_order_relaxed),
+			                    comp_d3d11_target_app_wait_take_max_ns());
 			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
 			                       &c->repaint.partition);
-			if (c->repaint.trace.last_report_ns != prev_report_ns) {
-				// A row just went out: lock_max/wait_max are PER-WINDOW
-				// peaks, so clear the sources the trace read them from.
-				c->repaint.app_lock_max_ns.store(0, std::memory_order_relaxed);
-				comp_d3d11_target_app_wait_reset();
-			}
 		}
 
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress) {
@@ -3036,13 +3035,14 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 		 * the replay costs ZERO bridge traffic: it re-weaves the egress slot the
 		 * last app frame published, already resident on this adapter.
 		 */
-		// #1339: spacing is stamped from the START of the fire, so take it
-		// here — after every bail and after the admit, immediately before the
-		// first weave either arm performs. fire_t0 above stays where it is:
-		// it measures fire DURATION for the trace and the #1264 shed. One
-		// stamp for both arms (they are mutually exclusive and the next
-		// statement in each is the acquire+weave).
-		const uint64_t rp_start_ns = os_monotonic_get_ns();
+		// #1339: spacing is stamped from the START of the fire. Stamped
+		// PER ARM, not once above: the split arm has a weave-slot bail of
+		// its own below, and the non-split arm takes the D3D11 multithread
+		// lock first — that Enter() contends with the APP's render thread
+		// and can block for milliseconds, which a stamp taken above would
+		// charge to neither fire. fire_t0 stays where it is: it measures
+		// fire DURATION for the trace and the #1264 shed.
+		uint64_t rp_start_ns = 0;
 
 		if (c->split_active) {
 			// #918 F4: nothing published to re-weave (warmup, or the egress ring
@@ -3053,6 +3053,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 				c->repaint.bail_armed++;
 				continue;
 			}
+			rp_start_ns = os_monotonic_get_ns(); // after this arm's own bail
 			comp_d3d11_target_acquire(c->target, &rp_index);
 			if (d3d11_dp_weave(c, true)) {
 				d3d11_render_hud_overlay(c, c->out_dev, c->out_ctx, true, &c->repaint.eye_pos);
@@ -3066,6 +3067,9 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			if (c->mt_lock != nullptr) {
 				c->mt_lock->Enter();
 			}
+			// After Enter(): that lock contends with the APP's render thread,
+			// so the block belongs to neither fire's spacing.
+			rp_start_ns = os_monotonic_get_ns();
 
 			{
 				// The replay lands BETWEEN the app's own draw calls on this
@@ -3123,9 +3127,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	{
 		// Under the lock, app thread only; relaxed atomic (see the field docs).
 		const uint64_t app_lock_ns = os_monotonic_get_ns() - app_lock_t0;
-		c->repaint.app_lock_last_ns = app_lock_ns;
-		// Only this thread raises the peak (the repaint thread only zeroes
-		// it), so a load-compare-store needs no CAS.
+		// Only this thread raises the peak (the reader only exchanges it to
+		// zero), so a load-compare-store needs no CAS.
 		if (app_lock_ns > c->repaint.app_lock_max_ns.load(std::memory_order_relaxed)) {
 			c->repaint.app_lock_max_ns.store(app_lock_ns, std::memory_order_relaxed);
 		}

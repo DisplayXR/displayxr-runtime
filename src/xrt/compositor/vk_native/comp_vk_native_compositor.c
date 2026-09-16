@@ -6029,9 +6029,10 @@ vk_repaint_thread(void *ptr)
 		uint64_t fp[8] = {0};
 		bool skip_frame = false;
 		const uint64_t fire_t0 = os_monotonic_get_ns();
-		// #1339: spacing is stamped from the START of the fire (fire_t0/t1
-		// keep measuring DURATION for the trace).
-		const uint64_t rp_start_ns = os_monotonic_get_ns();
+		// #1339: spacing is stamped from the START of the fire. Nothing runs
+		// between this and fire_t0, so one read serves both: fire_t0 pairs with
+		// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
+		const uint64_t rp_start_ns = fire_t0;
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);

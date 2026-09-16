@@ -130,17 +130,25 @@ struct u_app_partition
 	 * @name #1339 health counters (instrumentation only; never read back
 	 *       into the schedule).
 	 *
-	 * A FORFEIT means the APP's own cycle exceeded D x period — a full
-	 * stride. The advance below preserves grid phase for ANY lateness
-	 * under one stride (a late arrival is released immediately and the
-	 * next release is still the next grid slot), so nothing is lost
-	 * there. A non-zero @ref slots_forfeited is therefore always the app
-	 * or something blocking the app, NEVER the advance arithmetic. Read
-	 * them when the measured app rate sits below panel_rate / D.
+	 * A FORFEIT is ACCUMULATED lateness crossing a stride, NOT a single
+	 * overrun. The grid never re-anchors: a release that arrived L late
+	 * still advances the next slot by exactly one stride, so L is never
+	 * given back. An app whose own cycle is stride + eps therefore drifts
+	 * by eps per frame and forfeits one slot every ~stride/eps frames,
+	 * with NO single cycle ever exceeding a stride. At D=3 on 60 Hz a
+	 * 52.5 ms cycle against a 50 ms stride forfeits ~1 slot/s — which is
+	 * the shape #1339 reported. So do not read a rising count as "the app
+	 * stalled for a whole stride"; read it as "the app is not keeping up
+	 * with the grid", and read @ref releases beside it (releases +
+	 * forfeits ~= elapsed slots). Read both when the measured app rate
+	 * sits below panel_rate / D.
+	 *
+	 * @ref releases counts xrWaitFrame passes, not presents: a frame the
+	 * runtime released and the app then discarded still counts.
 	 * @{
 	 */
 	uint32_t releases;        //!< app releases since the grid anchored
-	uint32_t slots_forfeited; //!< grid slots skipped because the app's own cycle overran the stride
+	uint32_t slots_forfeited; //!< grid slots skipped (accumulated drift crossing a stride)
 	/*! @} */
 };
 

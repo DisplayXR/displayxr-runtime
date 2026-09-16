@@ -4280,9 +4280,10 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			}
 
 			const uint64_t fire_t0 = os_monotonic_get_ns();
-			// #1339: spacing is stamped from the START of the fire (fire_t0/t1
-			// keep measuring DURATION for the trace and the #1264 shed).
-			const uint64_t rp_start_ns = os_monotonic_get_ns();
+			// #1339: spacing is stamped from the START of the fire. Nothing runs
+			// between this and fire_t0, so one read serves both: fire_t0 pairs with
+			// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
+			const uint64_t rp_start_ns = fire_t0;
 			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
 			                                &c->reroute.canvas);
 			c->repaint.count++;

@@ -4049,7 +4049,10 @@ gl_repaint_thread(void *ptr)
 		// platform arm below stamps this immediately before its present. Not
 		// const, and declared out here, because the two arms are separate
 		// preprocessor branches that converge on one note_repaint call.
-		uint64_t rp_start_ns = 0;
+		// Stamped again inside each platform arm; initialised (not 0) so a
+		// future arm that forgets cannot disable the spacing floor entirely
+		// (note_repaint(0) reads back as "no previous repaint").
+		uint64_t rp_start_ns = os_monotonic_get_ns();
 
 #ifdef XRT_OS_WINDOWS
 		if (c->hdc == NULL || c->hglrc == NULL) {

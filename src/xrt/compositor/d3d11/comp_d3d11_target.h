@@ -143,7 +143,7 @@ comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target);
  * DXR_WEAVE_REPAINT_TRACE row; diagnostics only, never a control input.
  */
 uint64_t
-comp_d3d11_target_app_wait_max_ns(void);
+comp_d3d11_target_app_wait_take_max_ns(void);
 
 /*!
  * #1339: clear the peak above (and its last-sample companion) so the trace
