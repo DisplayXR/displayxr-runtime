@@ -598,15 +598,20 @@ struct comp_d3d11_compositor
 		 * The undiagnosed half of #1339 is the app losing ~1 present/s
 		 * against its partition grid. The hypothesis to test is that
 		 * layer_commit is held past a whole stride by @ref mutex, which
-		 * the repaint thread holds across its ENTIRE replay. Measured on
-		 * the app thread; written under the lock (the max is updated the
-		 * instant after the lock is taken) so no atomics are needed. The
-		 * repaint thread clears the max once per trace window — a benign
-		 * unlocked 64-bit write, the same class as the unlocked reads this
-		 * loop already does on last_app_frame_ns.
+		 * the repaint thread holds across its ENTIRE replay. Raised on the
+		 * app thread the instant after the lock is taken; zeroed and read
+		 * once per trace window by the REPAINT thread.
+		 *
+		 * ATOMIC, relaxed — not because the value needs ordering (it orders
+		 * nothing), but because the only lock that could order it is @ref
+		 * mutex, whose contention is the thing being measured: taking it in
+		 * the repaint loop's clear would perturb the measurement. Relaxed
+		 * atomics cost nothing on x64 and make the race well-defined
+		 * instead of merely harmless in practice.
 		 * @{
 		 */
-		uint64_t app_lock_max_ns, app_lock_last_ns;
+		std::atomic<uint64_t> app_lock_max_ns{0};
+		uint64_t app_lock_last_ns{0};
 		/*! @} */
 
 		//! #887 bail counters, mirroring the D3D12 leg: why a tick did not
@@ -2916,7 +2921,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			u_repaint_trace_app(&c->repaint.trace,
 			                    u_app_partition_releases(&c->repaint.partition),
 			                    u_app_partition_slots_forfeited(&c->repaint.partition),
-			                    c->repaint.app_lock_max_ns,
+			                    c->repaint.app_lock_max_ns.load(std::memory_order_relaxed),
 			                    comp_d3d11_target_app_wait_max_ns());
 			const uint64_t prev_report_ns = c->repaint.trace.last_report_ns;
 			u_repaint_trace_report(&c->repaint.trace, tn, "d3d11", &c->repaint.gate, period_ns,
@@ -2924,7 +2929,7 @@ d3d11_repaint_thread(struct comp_d3d11_compositor *c)
 			if (c->repaint.trace.last_report_ns != prev_report_ns) {
 				// A row just went out: lock_max/wait_max are PER-WINDOW
 				// peaks, so clear the sources the trace read them from.
-				c->repaint.app_lock_max_ns = 0;
+				c->repaint.app_lock_max_ns.store(0, std::memory_order_relaxed);
 				comp_d3d11_target_app_wait_reset();
 			}
 		}
@@ -3116,11 +3121,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	const uint64_t app_lock_t0 = os_monotonic_get_ns();
 	std::lock_guard<std::mutex> lock(c->mutex);
 	{
-		// Under the lock, app thread only — no atomics (see the field docs).
+		// Under the lock, app thread only; relaxed atomic (see the field docs).
 		const uint64_t app_lock_ns = os_monotonic_get_ns() - app_lock_t0;
 		c->repaint.app_lock_last_ns = app_lock_ns;
-		if (app_lock_ns > c->repaint.app_lock_max_ns) {
-			c->repaint.app_lock_max_ns = app_lock_ns;
+		// Only this thread raises the peak (the repaint thread only zeroes
+		// it), so a load-compare-store needs no CAS.
+		if (app_lock_ns > c->repaint.app_lock_max_ns.load(std::memory_order_relaxed)) {
+			c->repaint.app_lock_max_ns.store(app_lock_ns, std::memory_order_relaxed);
 		}
 	}
 

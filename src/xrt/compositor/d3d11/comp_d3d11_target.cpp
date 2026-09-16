@@ -62,14 +62,18 @@ static HANDLE g_frame_latency_waitable = nullptr;
  * waitable inside comp_d3d11_target_weave_mark. That wait runs on the app
  * thread WITH the compositor lock held, so it is one of the two candidate
  * causes for an app commit overrunning a whole partition stride (the other
- * being the acquisition of that lock itself). Plain uint64_t and not atomics
- * deliberately: every write below happens on the app thread under the
- * compositor lock, and the only other toucher is the repaint thread's
- * once-per-trace-window reset — a benign unlocked 64-bit write of the same
- * class the repaint loop already does elsewhere.
+ * being the acquisition of that lock itself).
+ *
+ * ATOMIC, relaxed. Written on the app thread, zeroed once per trace window by
+ * the REPAINT thread, and read by that same thread for the row — three threads'
+ * worth of access with no lock between them. A plain uint64_t here would be a
+ * data race in the language even where it is benign on x64, and the one lock
+ * that could order it is the lock whose contention this counter exists to
+ * measure, so taking it would perturb the measurement. Relaxed is right: each
+ * value stands alone and orders nothing else.
  */
-static uint64_t g_app_wait_max_ns = 0;
-static uint64_t g_app_wait_last_ns = 0;
+static std::atomic<uint64_t> g_app_wait_max_ns{0};
+static std::atomic<uint64_t> g_app_wait_last_ns{0};
 static UINT g_last_present_count = 0;
 
 // Live-path pacing state (#833): the transparent/composed chain paces with the
@@ -716,14 +720,14 @@ comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode
 extern "C" uint64_t
 comp_d3d11_target_app_wait_max_ns(void)
 {
-	return g_app_wait_max_ns;
+	return g_app_wait_max_ns.load(std::memory_order_relaxed);
 }
 
 extern "C" void
 comp_d3d11_target_app_wait_reset(void)
 {
-	g_app_wait_max_ns = 0;
-	g_app_wait_last_ns = 0;
+	g_app_wait_max_ns.store(0, std::memory_order_relaxed);
+	g_app_wait_last_ns.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void
@@ -762,9 +766,12 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 		const uint64_t wait_t1 = os_monotonic_get_ns();
 		const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
 		// #1339: same two stamps, also kept as a peak for the trace row.
-		g_app_wait_last_ns = wait_t1 - wait_t0;
-		if (g_app_wait_last_ns > g_app_wait_max_ns) {
-			g_app_wait_max_ns = g_app_wait_last_ns;
+		// Only this thread raises the peak (the repaint thread only zeroes
+		// it), so a load-compare-store needs no CAS.
+		const uint64_t app_wait_ns = wait_t1 - wait_t0;
+		g_app_wait_last_ns.store(app_wait_ns, std::memory_order_relaxed);
+		if (app_wait_ns > g_app_wait_max_ns.load(std::memory_order_relaxed)) {
+			g_app_wait_max_ns.store(app_wait_ns, std::memory_order_relaxed);
 		}
 		// Catch-up guard: if the LAST frame overran its period the pipeline
 		// is already a vsync behind — tick-aligning now waits for yet
