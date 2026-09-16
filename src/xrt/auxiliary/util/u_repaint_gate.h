@@ -92,6 +92,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -110,7 +111,19 @@ extern "C" {
 struct u_repaint_gate
 {
 	uint64_t last_app_frame_ns; //!< Stamp of the last REAL app frame.
-	uint64_t last_repaint_ns;   //!< Stamp of the last repaint (adaptive spacing only).
+	//! Stamp of the START of the last repaint fire (adaptive spacing only).
+	//! START, not end: spacing must measure the gap BETWEEN repaints, and a
+	//! stamp taken after the weave charges the fire's own duration to the
+	//! next repaint's aperture. See u_repaint_gate_note_repaint().
+	uint64_t last_repaint_ns;
+	//! END of the last repaint fire. Used ONLY by the two stall branches,
+	//! which have no budget above them — there the spacing constant IS the
+	//! rate limiter, so it must keep meaning what it meant when it was
+	//! tuned: present-to-present >= 0.9*period + the fire. Start-stamping
+	//! them would drop the floor to 0.9*period, below one panel period, and
+	//! raise the repaint thread's lock duty cycle during a stall. Every
+	//! budget-capped spacing test uses last_repaint_ns (the START) instead.
+	uint64_t last_repaint_end_ns;
 	uint64_t interval_ema_ns;   //!< EMA of the app inter-frame interval (fill mode + TRACE).
 	uint64_t jitter_ema_ns;     //!< EMA of |interval - interval_ema| (fill-mode trust key + TRACE).
 	uint64_t recent_iv_ns[16];  //!< Ring of raw intervals; the gate buckets these per tick.
@@ -173,12 +186,29 @@ u_repaint_gate_on_app_frame(struct u_repaint_gate *g, uint64_t now_ns)
 }
 
 /*!
- * Record that a repaint fired at @p now_ns (adaptive spacing + budget key).
+ * Record that a repaint fired, @p fire_start_ns being the instant the fire
+ * STARTED (adaptive spacing + budget key).
+ *
+ * START and not end, because the fire's own duration must not be charged to
+ * the NEXT repaint's aperture (#1339 under-fill). At D=3 on 60 Hz the two
+ * fills must both land in quiet in [period/4, 2*period - period/2) and the
+ * spacing floor is 3/4 period: an ~8 ms fire that began ~4 ms in ends ~12 ms
+ * in, so an end-stamped second repaint gets a ~0.3 ms aperture against a
+ * period/12 (~1.39 ms) loop tick — deterministically missed, which is
+ * exactly the measured ~35-39 repaints/s against an ideal 40. Stamping the
+ * start restores an ~8.3 ms aperture, several ticks wide.
+ *
+ * @ref u_repaint_trace_fire and @ref u_fill_shed_note_fire deliberately keep
+ * taking BOTH stamps and measuring true fire DURATION — the trace's `fire=`
+ * column and the #1264 shed threshold are cost measurements, not spacing.
  */
 static inline void
-u_repaint_gate_note_repaint(struct u_repaint_gate *g, uint64_t now_ns)
+u_repaint_gate_note_repaint(struct u_repaint_gate *g, uint64_t fire_start_ns)
 {
-	g->last_repaint_ns = now_ns;
+	// The END is stamped here, at the call after the fire; the two uncapped
+	// stall branches read it (see last_repaint_end_ns).
+	g->last_repaint_end_ns = os_monotonic_get_ns();
+	g->last_repaint_ns = fire_start_ns;
 	if (g->fires_since_app < 255) {
 		g->fires_since_app++;
 	}
@@ -419,6 +449,10 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	const uint64_t since_rp_ns =
 	    (g->last_repaint_ns != 0 && now_ns > g->last_repaint_ns) ? now_ns - g->last_repaint_ns
 	                                                             : UINT64_MAX;
+	// #1339: the stall branches stay END-relative — see last_repaint_end_ns.
+	const uint64_t since_rp_end_ns = (g->last_repaint_end_ns != 0 && now_ns > g->last_repaint_end_ns)
+	                                     ? now_ns - g->last_repaint_end_ns
+	                                     : UINT64_MAX;
 
 	/*
 	 * Vblank-count model (see u_repaint_gate_cadence_n): the app presents
@@ -554,7 +588,7 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 		// STALL: the app is hitching, not pacing — the original #868 case.
 		// Same treatment as the engaged stall branch: panel-rate fill.
 		if (quiet_ns >= g->interval_ema_ns + period_ns) {
-			return since_rp_ns >= (period_ns * 9) / 10;
+			return since_rp_end_ns >= (period_ns * 9) / 10; // uncapped: end-relative (#1339)
 		}
 
 		uint32_t fill_slips = 0, fill_shed = 0;
@@ -677,7 +711,7 @@ u_repaint_gate_open(struct u_repaint_gate *g,
 	const uint64_t stall_ns = part_on ? (uint64_t)n * period_ns + period_ns / 4
 	                                  : (uint64_t)(n + 1) * period_ns;
 	if (quiet_ns >= stall_ns) {
-		return since_rp_ns >= (period_ns * 9) / 10;
+		return since_rp_end_ns >= (period_ns * 9) / 10; // uncapped: end-relative (#1339)
 	}
 
 	/*
@@ -792,6 +826,26 @@ struct u_repaint_trace
 	uint64_t pace_ema_ns;    //!< EMA of the repaint_pace call's duration.
 	uint64_t last_report_ns;
 	uint32_t ticks, fires, bail_armed, bail_gate, bail_race;
+
+	/*!
+	 * @name #1339 app-side numbers, pushed in by the backend.
+	 *
+	 * The loop can see everything about ITSELF and nothing about why the
+	 * APP misses a partition slot. These four are measured on the app
+	 * thread (the d3d11 backend only) and pushed here so one row carries
+	 * both halves. @ref app_have gates the segment: a backend that never
+	 * pushes prints no `app{...}`.
+	 * @{
+	 */
+	uint32_t app_releases, app_forfeited;
+	//! Peaks are pushed by a DESTRUCTIVE read at the source (exchange(0)), so
+	//! nothing can raise a peak between the read and a later clear and have it
+	//! wiped unreported — and a report that does not print (the bootstrap)
+	//! cannot consume a window either. The fold below keeps the max across
+	//! however many pushes land inside one 5 s window.
+	uint64_t app_lock_max_ns, app_wait_max_ns;
+	int app_have;
+	/*! @} */
 };
 
 static inline bool
@@ -880,6 +934,34 @@ u_repaint_trace_fire(struct u_repaint_trace *t, uint64_t start_ns, uint64_t end_
 	}
 }
 
+/*!
+ * #1339: push the app-side partition health into the next row. Call once per
+ * LOOP ITERATION, before @ref u_repaint_trace_report — it is a plain store,
+ * never a log. The two maxima are PER-WINDOW peaks: the report zeroes its
+ * copies, and the backend zeroes the sources it read them from whenever it
+ * observes that a row went out.
+ */
+static inline void
+u_repaint_trace_app(struct u_repaint_trace *t,
+                    uint32_t releases,
+                    uint32_t forfeited,
+                    uint64_t lock_max_ns,
+                    uint64_t wait_max_ns)
+{
+	if (t->enabled != 1) {
+		return;
+	}
+	t->app_releases = releases;
+	t->app_forfeited = forfeited;
+	if (lock_max_ns > t->app_lock_max_ns) {
+		t->app_lock_max_ns = lock_max_ns;
+	}
+	if (wait_max_ns > t->app_wait_max_ns) {
+		t->app_wait_max_ns = wait_max_ns;
+	}
+	t->app_have = 1;
+}
+
 //! Call once per loop iteration; emits one row per ~5 s.
 static inline void
 u_repaint_trace_report(struct u_repaint_trace *t,
@@ -937,9 +1019,20 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 		const uint32_t shed = slips / 3;
 		budget = (n - 1) > shed ? (n - 1) - shed : 0;
 	}
+	// #1339: the app-side half of the row, appended (never interleaved —
+	// the existing fields keep their order and names). Printed only for a
+	// backend that pushed numbers AND only under an engaged partition,
+	// where "the app missed its slot" is a defined event at all.
+	char app_seg[128];
+	app_seg[0] = '\0';
+	if (part_on && t->app_have) {
+		snprintf(app_seg, sizeof(app_seg), " app{rel=%u forfeit=%u lock_max=%.2fms wait_max=%.2fms}",
+		         t->app_releases, t->app_forfeited, (double)t->app_lock_max_ns / 1e6,
+		         (double)t->app_wait_max_ns / 1e6);
+	}
 	U_LOG_W("#1257 trace site=%s: ticks/s=%.1f fires/s=%.1f tick_iv=%.2fms fire=%.2fms "
 	        "pace=%.2fms bail{armed=%u gate=%u race=%u} gate{mode=%s N=%u votes=%u/%u "
-	        "slips=%u budget=%u ema=%.1fms jit=%.1fms samples=%u}",
+	        "slips=%u budget=%u ema=%.1fms jit=%.1fms samples=%u}%s",
 	        site, (double)t->ticks / secs, (double)t->fires / secs,
 	        (double)t->tick_iv_ema_ns / 1e6, (double)t->fire_ema_ns / 1e6,
 	        (double)t->pace_ema_ns / 1e6, t->bail_armed, t->bail_gate, t->bail_race,
@@ -956,12 +1049,18 @@ u_repaint_trace_report(struct u_repaint_trace *t,
 	                              : (g->mode == 1 ? (n == 2 ? "adaptive" : "adaptive-fallback")
 	                                              : "default"))),
 	        n, votes, have, slips, budget, (double)g->interval_ema_ns / 1e6,
-	        (double)g->jitter_ema_ns / 1e6, g->samples);
+	        (double)g->jitter_ema_ns / 1e6, g->samples, app_seg);
 	t->ticks = 0;
 	t->fires = 0;
 	t->bail_armed = 0;
 	t->bail_gate = 0;
 	t->bail_race = 0;
+	// #1339: the two maxima are PER-WINDOW peaks, so clear them here. The
+	// counters (rel/forfeit) are cumulative since the grid anchored and are
+	// deliberately NOT reset. The backend clears the sources it read the
+	// maxima from when it sees last_report_ns move.
+	t->app_lock_max_ns = 0;
+	t->app_wait_max_ns = 0;
 	t->last_report_ns = now_ns;
 }
 

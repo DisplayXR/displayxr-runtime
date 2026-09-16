@@ -134,6 +134,25 @@ bool
 comp_d3d11_target_repaint_admit(struct comp_d3d11_target *target);
 
 /*!
+ * #1339 instrumentation: the longest the APP has blocked on the frame-latency
+ * waitable inside @ref comp_d3d11_target_weave_mark since the last reset.
+ *
+ * That wait happens on the app thread WITH the compositor lock held, so it is
+ * one of the two candidate reasons an app commit can overrun a whole
+ * partition stride and forfeit a grid slot. Read by the repaint loop for the
+ * DXR_WEAVE_REPAINT_TRACE row; diagnostics only, never a control input.
+ */
+uint64_t
+comp_d3d11_target_app_wait_take_max_ns(void);
+
+/*!
+ * #1339: clear the peak above (and its last-sample companion) so the trace
+ * row reports a PER-WINDOW maximum. Called once per trace window.
+ */
+void
+comp_d3d11_target_app_wait_reset(void);
+
+/*!
  * #868: repaint counterpart of @ref comp_d3d11_target_weave_mark — stamps
  * T_weave only, staying out of the saturation governor and the #867 ledger.
  */

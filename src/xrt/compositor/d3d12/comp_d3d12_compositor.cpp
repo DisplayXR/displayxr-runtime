@@ -4280,11 +4280,15 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			}
 
 			const uint64_t fire_t0 = os_monotonic_get_ns();
+			// #1339: spacing is stamped from the START of the fire. Nothing runs
+			// between this and fire_t0, so one read serves both: fire_t0 pairs with
+			// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
+			const uint64_t rp_start_ns = fire_t0;
 			comp_vk_split_weave_and_present(c->reroute.split, /*is_repaint=*/true,
 			                                &c->reroute.canvas);
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
-			u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 			u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 			u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 			static bool rr_logged = false;
@@ -4333,11 +4337,15 @@ d3d12_repaint_thread(struct comp_d3d12_compositor *c)
 			c->cmd_list->Reset(c->cmd_allocator, nullptr);
 		}
 
+		// #1339: spacing is stamped from the START of the fire — here, after
+		// the allocator reset and immediately before the weave. fire_t0/t1
+		// keep measuring DURATION for the trace and the #1264 shed.
+		const uint64_t rp_start_ns = os_monotonic_get_ns();
 		d3d12_dp_weave_and_present(c, true, nullptr);
 
 		c->repaint.count++;
 		const uint64_t fire_t1 = os_monotonic_get_ns();
-		u_repaint_gate_note_repaint(&c->repaint.gate, fire_t1);
+		u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
 		u_fill_shed_note_fire(&c->repaint.shed, fire_t0, fire_t1, period_ns);
 		static bool logged = false;

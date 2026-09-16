@@ -56,6 +56,27 @@ dxr_late_weave_enabled(void)
 
 // Late-weave pacing state (single target per process on this path).
 static HANDLE g_frame_latency_waitable = nullptr;
+
+/*!
+ * #1339 instrumentation: how long the APP blocked on the frame-latency
+ * waitable inside comp_d3d11_target_weave_mark. That wait runs on the app
+ * thread WITH the compositor lock held, so it is one of the two candidate
+ * causes for an app commit overrunning a whole partition stride (the other
+ * being the acquisition of that lock itself).
+ *
+ * ATOMIC, relaxed. Raised on the app thread and TAKEN by the repaint thread
+ * with an exchange, so the read and the reset are one step: nothing can raise
+ * a peak between a read and a later clear and have it wiped unreported. The
+ * one lock that could order this instead is the lock whose contention it
+ * exists to measure, so taking it would perturb the measurement. Relaxed is
+ * right — the value orders nothing else.
+ *
+ * Consistency note: the partition's own releases / slots_forfeited stay plain
+ * uint32 read across the same two threads, as next_release_ns already was. A
+ * torn read of a cumulative diagnostic is not worth an atomic; these two are
+ * atomic because they are EXCHANGED, not merely read.
+ */
+static std::atomic<uint64_t> g_app_wait_max_ns{0};
 static UINT g_last_present_count = 0;
 
 // Live-path pacing state (#833): the transparent/composed chain paces with the
@@ -699,6 +720,12 @@ comp_d3d11_target_weave_mark_repaint(struct comp_d3d11_target *target, bool mode
 	g_lw_gov_d3d11.note_repaint((uint64_t)q.QuadPart);
 }
 
+extern "C" uint64_t
+comp_d3d11_target_app_wait_take_max_ns(void)
+{
+	return g_app_wait_max_ns.exchange(0, std::memory_order_relaxed);
+}
+
 extern "C" void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
 {
@@ -734,6 +761,13 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 		wait_timed_out = WaitForSingleObject(g_frame_latency_waitable, 100) == WAIT_TIMEOUT;
 		const uint64_t wait_t1 = os_monotonic_get_ns();
 		const bool wait_blocked = (wait_t1 - wait_t0) > 2000000; // >2 ms
+		// #1339: same two stamps, also kept as a peak for the trace row.
+		// Only this thread raises the peak (the reader only exchanges it to
+		// zero), so a load-compare-store needs no CAS.
+		const uint64_t app_wait_ns = wait_t1 - wait_t0;
+		if (app_wait_ns > g_app_wait_max_ns.load(std::memory_order_relaxed)) {
+			g_app_wait_max_ns.store(app_wait_ns, std::memory_order_relaxed);
+		}
 		// Catch-up guard: if the LAST frame overran its period the pipeline
 		// is already a vsync behind — tick-aligning now waits for yet
 		// another tick and turns one late pickup into a dropped frame

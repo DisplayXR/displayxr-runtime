@@ -4045,6 +4045,15 @@ gl_repaint_thread(void *ptr)
 			continue;
 		}
 
+		// #1339: spacing is stamped from the START of the fire, so each
+		// platform arm below stamps this immediately before its present. Not
+		// const, and declared out here, because the two arms are separate
+		// preprocessor branches that converge on one note_repaint call.
+		// Stamped again inside each platform arm; initialised (not 0) so a
+		// future arm that forgets cannot disable the spacing floor entirely
+		// (note_repaint(0) reads back as "no previous repaint").
+		uint64_t rp_start_ns = os_monotonic_get_ns();
+
 #ifdef XRT_OS_WINDOWS
 		if (c->hdc == NULL || c->hglrc == NULL) {
 			os_mutex_unlock(&c->mutex);
@@ -4082,17 +4091,19 @@ gl_repaint_thread(void *ptr)
 			}
 		}
 
+		rp_start_ns = os_monotonic_get_ns();
 		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
 
 		// Release unconditionally — see the note above about wedging the app.
 		wglMakeCurrent(NULL, NULL);
 #elif defined(__APPLE__)
 		comp_gl_window_macos_make_current(c->macos_window);
+		rp_start_ns = os_monotonic_get_ns();
 		gl_window_present(c, c->repaint.atlas_tex, c->repaint.last_dt, /*is_repaint=*/true);
 #endif
 
 		c->repaint.count++;
-		u_repaint_gate_note_repaint(&c->repaint.gate, os_monotonic_get_ns());
+		u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;

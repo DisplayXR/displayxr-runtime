@@ -125,7 +125,46 @@ struct u_app_partition
 {
 	uint64_t next_release_ns; //!< Monotonic time of the app's next slot.
 	int logged;               //!< One-shot activation log.
+
+	/*!
+	 * @name #1339 health counters (instrumentation only; never read back
+	 *       into the schedule).
+	 *
+	 * A FORFEIT is ACCUMULATED lateness crossing a stride, NOT a single
+	 * overrun. The grid never re-anchors: a release that arrived L late
+	 * still advances the next slot by exactly one stride, so L is never
+	 * given back. An app whose own cycle is stride + eps therefore drifts
+	 * by eps per frame and forfeits one slot every ~stride/eps frames,
+	 * with NO single cycle ever exceeding a stride. At D=3 on 60 Hz a
+	 * 52.5 ms cycle against a 50 ms stride forfeits ~1 slot/s — which is
+	 * the shape #1339 reported. So do not read a rising count as "the app
+	 * stalled for a whole stride"; read it as "the app is not keeping up
+	 * with the grid", and read @ref releases beside it (releases +
+	 * forfeits ~= elapsed slots). Read both when the measured app rate
+	 * sits below panel_rate / D.
+	 *
+	 * @ref releases counts xrWaitFrame passes, not presents: a frame the
+	 * runtime released and the app then discarded still counts.
+	 * @{
+	 */
+	uint32_t releases;        //!< app releases since the grid anchored
+	uint32_t slots_forfeited; //!< grid slots skipped (accumulated drift crossing a stride)
+	/*! @} */
 };
+
+//! App releases since the grid anchored. NULL-safe (0).
+static inline uint32_t
+u_app_partition_releases(const struct u_app_partition *p)
+{
+	return p != NULL ? p->releases : 0;
+}
+
+//! Grid slots the app skipped by overrunning a whole stride. NULL-safe (0).
+static inline uint32_t
+u_app_partition_slots_forfeited(const struct u_app_partition *p)
+{
+	return p != NULL ? p->slots_forfeited : 0;
+}
 
 /*!
  * Block the calling xrWaitFrame until the app's next partition slot.
@@ -212,10 +251,21 @@ u_app_partition_throttle(struct u_app_partition *p, uint64_t period_ns, bool tie
 		now_ns = os_monotonic_get_ns();
 	}
 
+	// #1339: every pass that reaches the advance is one app release.
+	// Counted HERE and not on the anchor-and-return path above — that
+	// pass establishes the grid rather than being scheduled by it.
+	p->releases++;
+
 	// Advance to the next GRID slot strictly after now — phase preserved,
 	// missed slots skipped in one step, no burst, no re-anchor.
 	if (now_ns >= p->next_release_ns) {
 		const uint64_t behind = now_ns - p->next_release_ns;
+		// #1339: whole strides that went by unclaimed ARE the skipped grid
+		// slots — the one number that separates "the app overran" from "the
+		// schedule slid". Lateness under one stride forfeits nothing.
+		if (behind >= stride_ns) {
+			p->slots_forfeited += (uint32_t)(behind / stride_ns);
+		}
 		p->next_release_ns += (behind / stride_ns + 1) * stride_ns;
 	} else {
 		p->next_release_ns += stride_ns;
