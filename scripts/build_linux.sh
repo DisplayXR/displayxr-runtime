@@ -68,8 +68,11 @@ for arg in "$@"; do
   esac
 done
 
-OPENXR_DIR="$BUILD_DIR/_openxr"
-OPENXR_VERSION="1.1.51"
+OPENXR_VERSION="1.1.63"
+# Versioned cache (#1487): the existence gate below is inherently
+# version-correct, so bumping OPENXR_VERSION always re-builds the loader
+# instead of silently reusing the previously cached one.
+OPENXR_DIR="$BUILD_DIR/_openxr-$OPENXR_VERSION"
 
 # Step 1: Configure + build the runtime, the CLI, and the sim_display plug-in.
 #

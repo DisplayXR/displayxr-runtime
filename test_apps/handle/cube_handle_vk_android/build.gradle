@@ -179,7 +179,7 @@ dependencies {
     // openxr/*.h headers via prefab. The loader discovers our runtime
     // APK at runtime via the OpenXRRuntimeService intent declared in
     // src/xrt/targets/openxr_android/src/main/AndroidManifest.xml.
-    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.41'
+    implementation 'org.khronos.openxr:openxr_loader_for_android:1.1.63'
 
     // CNSDK Java glue — only when testing against the Leia plug-in (cnsdk.dir
     // set). Provides the com.leia.* classes the in-process CNSDK DP resolves

@@ -17,11 +17,14 @@ setlocal enabledelayedexpansion
 :: ============================================================
 
 set REPO=%~dp0..\
-set OPENXR_VERSION=1.1.51
+set OPENXR_VERSION=1.1.63
 :: Honor a pre-set VULKAN_SDK (the LunarG installer / a build runner exports it,
 :: possibly a different version) before falling back to the dev-box default.
 if not defined VULKAN_SDK set "VULKAN_SDK=C:\VulkanSDK\1.4.341.1"
-set OPENXR_SDK=%REPO%openxr_sdk
+:: Versioned so bumping OPENXR_VERSION cannot silently reuse an older cached
+:: loader: the existence gate below tests a path that already carries the
+:: version, so a bump always misses and re-downloads.
+set OPENXR_SDK=%REPO%openxr_sdk_%OPENXR_VERSION%
 set NINJA_DIR=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe
 
 :: Parse argument (default: all)
@@ -127,8 +130,10 @@ if not exist "%OPENXR_SDK%\x64\lib\openxr_loader.lib" (
 
 :: --- OpenXR loader short-path copy (avoids spaces-in-path linker issues) ---
 :: The standalone test apps link against the OpenXR loader via a short path
-:: with no spaces. Versioned so
-:: bumping OPENXR_VERSION doesn't silently reuse an older cached loader.
+:: with no spaces. Both this copy AND its source (%OPENXR_SDK%) are versioned,
+:: so bumping OPENXR_VERSION can't silently reuse an older cached loader —
+:: before #1487 only this copy carried the version, which meant a bumped box
+:: ended up with a directory NAMED ..._<new> holding the OLD loader.
 set OPENXR_SDK_SHORT=C:\dev\openxr_sdk_%OPENXR_VERSION%
 if not exist "%OPENXR_SDK_SHORT%\x64\lib\openxr_loader.lib" (
     xcopy /E /I /Y "%OPENXR_SDK%" "%OPENXR_SDK_SHORT%" >nul
@@ -239,8 +244,10 @@ echo.
 echo === Building test apps ===
 set TESTAPP_FAILED=
 
-:: Copy OpenXR SDK to a short path to avoid spaces-in-path linker issues
-set OPENXR_SDK_SHORT=C:\dev\openxr_sdk
+:: Copy OpenXR SDK to a short path to avoid spaces-in-path linker issues.
+:: Versioned (#1487) — an unversioned short path here kept the test apps
+:: linking the previous loader forever after an OPENXR_VERSION bump.
+set OPENXR_SDK_SHORT=C:\dev\openxr_sdk_%OPENXR_VERSION%
 if not exist "%OPENXR_SDK_SHORT%\x64\lib\openxr_loader.lib" (
     xcopy /E /I /Y "%OPENXR_SDK%" "%OPENXR_SDK_SHORT%" >nul
 )
