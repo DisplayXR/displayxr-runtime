@@ -387,12 +387,34 @@ it cannot (Suki's, refused) the eye predictor runs ~50 ms short exactly while re
 which is the dose-response and the on/off cycling she measured. Fix: a repaint takes a
 frame-latency token non-blockingly before it weaves and skips the tick when none is free
 (`comp_d3d11_target_repaint_admit`, `DXR_WEAVE_REPAINT_QUEUE_CAP=0` for A/B); the trace row
-counts refusals as `(refused N)`. The cap is the governor's depth, and the governor raised it
+counts refusals as `(refused N)`. **The admit is skipped under an engaged frame partition** at all
+three call sites (`partition.next_release_ns == 0` guards it) — a decision that shipped with the cap
+on the argument that the grid owns its slots, never measured, and which leaves `DXR_APP_FRAME_DIVISOR=3`
+uncapped. The cap is the governor's depth, and the governor raised it
 to 3 within ~10 s under forced repaints (the app's interval under repaint load reads as
 saturation), after which repaints filled 3 deep again — so while repaints are flowing the
 governor now holds the initialised depth and walks any escalation back
 (`DXR_LATE_WEAVE_REPAINT_HOLD=0` for A/B). Measured on the reference box with both: pre-lock
 error 50.9 → 16.7 ms, present gap mean 4.9 → 2.5–3.0, app 30 → 51–53 fps under FORCE.
+
+**#1482 — the app's own surplus drain under the partition.** With `DXR_APP_FRAME_DIVISOR=3` the app
+lost slots (`forfeit` climbing, `wait_max` 100 ms under load, 14–16 ms quiet) while `lock_max` read
+0.00 ms everywhere — so not lock contention, and not a full flip queue either (a full queue produces
+instant waits or the `frame dropped after 50 ms` WARN, which is absent from every partition leg). The
+mechanism is the #868 surplus drain at the top of `comp_d3d11_target_weave_mark`: it empties the
+frame-latency semaphore of *every* token, and tokens are fungible, so it also takes the app's own
+credit; the app then blocks on that semaphore under `c->mutex`, and the repaint thread — the only
+other presenter — bails on `app_frame_in_progress`. If a present is still in flight the wait ends
+at its retirement (~one period, the quiet floor); if none is, nothing can ever signal and the wait
+runs to its 100 ms bound. Fix: the drain is skipped while the compositor's own grid is engaged
+(`comp_d3d11_target_set_app_paced`, pushed beside `u_app_partition_throttle` on the d3d11 and VK
+split tiers) — the grid is the pacer there, so an instant stage-1 return is the wanted state — and
+the blocking wait itself is untouched, since it is what binds the app to the cap when a token is
+genuinely unavailable. The `app{…}` row gained `s2_max=` (peak stage-2 scanout wait, bounded at
+three periods = a whole stride at D=3, previously unmeasured), `drain=` (tokens the drain removed;
+must read 0 while paced), `to=` (full-bound timeouts; the #1482 signature) and `inst=` (waits under
+2 ms; the #868 signature). A stride clamp on the timeout was tried first and withdrawn: it bounded
+the damage but capped `wait_max`, the very instrument the defect was diagnosed with.
 
 **Confirmed on the Arc box (v2.16.34, 2026-09-15):** blind forced-repaint pair, sealed order, 6 of 6
 ("no shiver" with the cap, "shivers" without, both orders), and a sealed shipping-defaults pair

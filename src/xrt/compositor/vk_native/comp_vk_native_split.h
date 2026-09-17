@@ -621,6 +621,16 @@ bool
 comp_vk_split_repaint_admit(struct comp_vk_split *split);
 
 /*!
+ * #1482: @ref comp_d3d11_target_set_app_paced on the arm's own target — the
+ * fill arm's app frames block on THAT chain's frame-latency waitable, so it is
+ * that target which must stop draining surplus tokens while the #1257 grid is
+ * the pacer. Pushed from the VK compositor's `u_app_partition_throttle` call,
+ * keyed on the same compositor's own grid.
+ */
+void
+comp_vk_split_set_app_paced(struct comp_vk_split *split, bool paced);
+
+/*!
  * The once-every-10-s `[RENDER] split=… xb_kb=… ingress=… ing_leak=…` line, in
  * the same shape the D3D12 leg emits so one grep covers every in-process leg.
  * Cheap to call every frame; rate-limits itself.
