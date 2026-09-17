@@ -407,6 +407,22 @@ if [ "$COMPONENT" = unity ]; then
   SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
   VER="${NEW_TAG#v}"
 
+  # Fail-closed Authenticode check on one file: prints the Status and succeeds
+  # only on "Valid". Prefer PowerShell 7 (`pwsh`): Windows PowerShell 5.1
+  # launched from git-bash on a box that also has pwsh inherits pwsh's
+  # PSModulePath, cannot load Microsoft.PowerShell.Security, and a
+  # "count the non-Valid ones" test then prints 0 with exit 0 -- a false
+  # "signed" (bit displayxr-unreal's /release on v0.9.3). Count the positive
+  # answer, never the absence of failures, and never swallow stderr.
+  verify_authenticode_file() {
+    local f="$1" ps out
+    if command -v pwsh >/dev/null 2>&1; then ps=pwsh
+    elif command -v powershell >/dev/null 2>&1; then ps=powershell
+    else echo "no-powershell"; return 1; fi
+    out=$("$ps" -NoProfile -Command "\$ErrorActionPreference='Stop'; (Get-AuthenticodeSignature '$(cygpath -w "$f")').Status" 2>&1 | tr -d '\r' | tail -1)
+    echo "$out"; [ "$out" = "Valid" ]
+  }
+
   # ── Reconcile main's in-tree version ──────────────────────────────────────
   # Runs for BOTH paths. On the fresh-tag path Phase 2 already bumped main, so
   # this is a no-op. On the SIGN_ONLY path (release cut by a DIRECT `v*` tag on
@@ -480,6 +496,12 @@ if [ "$COMPONENT" = unity ]; then
 
       if [ -z "$SIGNED_DLL" ]; then
         echo "⚠ sign-artifact did not return a signed DLL — ships unsigned."
+      elif ! DLL_STATUS=$(verify_authenticode_file "$SIGNED_DLL"); then
+        # The runner returned a file but this box cannot prove it carries a Valid
+        # signature. Do not re-inject something we cannot vouch for over the CI
+        # asset; leave the release as CI shipped it and say so.
+        echo "⚠ returned displayxr_unity.dll is not Authenticode-Valid here ($DLL_STATUS) — NOT re-injected; ships as CI built it."
+        UNITY_SIGNED=unverified
       else
         # Channel 1 — repack the .tgz with the signed DLL, re-upload over the asset.
         cp "$SIGNED_DLL" "$DLL"
@@ -494,7 +516,7 @@ if [ "$COMPONENT" = unity ]; then
         git push -f origin upm
         git tag -f "upm/${NEW_TAG}" && git push -f origin "upm/${NEW_TAG}"
         UNITY_SIGNED=yes
-        echo "✅ unity: signed displayxr_unity.dll re-injected into the .tgz asset + upm branch (Valid/Leia)."
+        echo "✅ unity: signed displayxr_unity.dll (Authenticode $DLL_STATUS) re-injected into the .tgz asset + upm branch."
       fi
     fi
     rm -rf "$D"
@@ -505,7 +527,8 @@ if [ "$COMPONENT" = unity ]; then
   gh api repos/DisplayXR/displayxr-website/dispatches -f event_type=org-changed >/dev/null 2>&1 \
     && echo "✓ fired org-changed at displayxr-website (regenerates the unity version on /platform-support)" \
     || echo "(could not dispatch org-changed to displayxr-website — the daily cron will catch up)"
-  # Verify (optional, if on Windows): Get-AuthenticodeSignature on the re-uploaded DLL.
+  # The DLL was Authenticode-verified above before re-injection; UNITY_SIGNED is
+  # yes only on a positive Valid answer, unverified when the check itself failed.
   # Unity has no versions.json field → SKIP Steps 3.5.1–3.5.3 and Phase 4; go to Phase 6.
 fi
 ```
