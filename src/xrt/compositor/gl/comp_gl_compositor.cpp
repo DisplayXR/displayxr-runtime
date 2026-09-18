@@ -4982,10 +4982,41 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	mcp_capture_uninstall();
 	mcp_capture_fini(&c->mcp_capture);
 
+	/*
+	 * #1522: SAVE the caller's GL context before claiming ours.
+	 *
+	 * Every other entry point that makes the compositor context current
+	 * saves and restores the caller's — create_swapchain, layer_commit
+	 * ("critical … app has its own context and needs it back"), and
+	 * comp_gl_compositor_create. This one did not: it claimed the
+	 * compositor context and ended with an unconditional
+	 * wglMakeCurrent(NULL, NULL), so xrDestroySession returned to the app
+	 * with NOTHING current on its thread. Every GL call the app then made
+	 * before its own next make-current went through a GLAD ICD entry point
+	 * with a null current context — an access violation inside the ICD, at
+	 * whatever call site happened to come first. Under the CTS's
+	 * session churn that reads as a nondeterministic teardown SIGSEGV with
+	 * no DisplayXR frame on the stack.
+	 *
+	 * Restored at the end of the platform block below, AFTER our own
+	 * context is deleted (deleting a context that is current on this thread
+	 * is undefined).
+	 */
 #ifdef XRT_OS_WINDOWS
+	HDC prev_hdc = wglGetCurrentDC();
+	HGLRC prev_hglrc = wglGetCurrentContext();
+
 	// Make compositor context current for GL resource cleanup
 	if (c->hglrc) {
 		wglMakeCurrent(c->hdc, c->hglrc);
+	}
+#elif defined(__APPLE__)
+	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
+
+	// Same rule on the macOS leg: the glDelete* calls below belong on the
+	// compositor's context, not on whatever the app left current.
+	if (c->macos_window != NULL) {
+		comp_gl_window_macos_make_current(c->macos_window);
 	}
 #endif
 
@@ -5054,9 +5085,27 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	gl_destroy_dcomp_present(c);
 
 	if (c->hglrc) {
+		/*
+		 * The app never runs on the compositor context, so this cannot
+		 * fire — but restoring a context we just deleted would be worse
+		 * than leaving none current, so drop the restore if it does.
+		 */
+		if (prev_hglrc == c->hglrc) {
+			prev_hglrc = NULL;
+		}
 		wglMakeCurrent(NULL, NULL);
 		wglDeleteContext(c->hglrc);
+		c->hglrc = NULL;
 	}
+
+	/*
+	 * #1522: hand the app back exactly what it had. A caller that genuinely
+	 * had nothing current keeps nothing current.
+	 */
+	if (prev_hglrc != NULL) {
+		wglMakeCurrent(prev_hdc, prev_hglrc);
+	}
+
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_destroy(&c->own_window);
 	} else if (c->owns_window && c->hwnd) {
@@ -5069,6 +5118,14 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->iosurface_gl_texture) {
 		glDeleteTextures(1, &c->iosurface_gl_texture);
 	}
+
+	/*
+	 * #1522: restore BEFORE the window (and with it the compositor's
+	 * NSOpenGLContext) goes away, so the app's context is current again and
+	 * nothing is left pointing at a destroyed one.
+	 */
+	CGLSetCurrentContext(prev_cgl_ctx);
+
 	if (c->macos_window != NULL) {
 		comp_gl_window_macos_destroy(&c->macos_window);
 	}
