@@ -33,6 +33,25 @@
  *   3. displayPlanePose is locate-space: with a rig chained it equals the
  *      chained rig pose in that base; without one it equals
  *      xrLocateSpace(VIEW, base) (the plane is the head device pose).
+ *
+ * #1486 (same harness, same SKIP rule) additionally pins the primary
+ * view-configuration list:
+ *   4. with XR_DXR_display_info enabled, xrEnumerateViewConfigurations reports
+ *      PRIMARY_STEREO first and PRIMARY_MULTIVIEW_DXR second; STEREO reports
+ *      exactly 2 views while MULTIVIEW reports the device max across rendering
+ *      modes (read from xrEnumerateDisplayRenderingModesDXR, never hard-coded);
+ *   5. a session begun on MULTIVIEW locates that many views and REFUSES a
+ *      PRIMARY_STEREO locate; a session begun on PRIMARY_STEREO locates exactly
+ *      2 even on a 4-view device;
+ *   6. without the extension only one configuration is advertised and the
+ *      MULTIVIEW enum is not a valid value at all.
+ *
+ * NOT covered here: the DXR_VIEW_CONFIG_LEGACY=1 kill switch. It is read
+ * through DEBUG_GET_ONCE_BOOL_OPTION, which caches the FIRST read for the life
+ * of the process, and ctest runs every TEST_CASE in this file in one process -
+ * so a legacy arm would either be poisoned by the arms above or poison them,
+ * depending on ordering. Exercising it needs its own process (its own ctest
+ * registration with an ENVIRONMENT property), which is a separate change.
  */
 
 #include "catch_amalgamated.hpp"
@@ -58,6 +77,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
 
 #ifndef DXR_RUNTIME_LIB_PATH
 #error "DXR_RUNTIME_LIB_PATH must name the built runtime library"
@@ -165,6 +185,11 @@ struct Runtime
 	XrSpace stage = XR_NULL_HANDLE;
 	XrSpace view = XR_NULL_HANDLE;
 	bool have_view_rig = false;
+	bool have_display_info = false;
+
+	//! #1486: the view configuration this session was begun with. Every locate
+	//! below names it, because a session locates in exactly one configuration.
+	XrViewConfigurationType view_config = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
 	PFN_xrLocateViews pfnLocateViews = nullptr;
 	PFN_xrLocateSpace pfnLocateSpace = nullptr;
@@ -217,7 +242,7 @@ struct Runtime
 	views(XrSpace base, XrTime t, const void *rig, XrViewDisplayRawDXR *raw)
 	{
 		XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
-		li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		li.viewConfigurationType = view_config;
 		li.displayTime = t;
 		li.space = base;
 		li.next = rig;
@@ -236,6 +261,88 @@ struct Runtime
 		const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
 		REQUIRE((vs.viewStateFlags & need) == need);
 		return out;
+	}
+
+	/*
+	 *
+	 * #1486 helpers.
+	 *
+	 */
+
+	//! The two-call COUNT leg of xrLocateViews under an arbitrary view
+	//! configuration. Returns the result instead of REQUIRE-ing success, so the
+	//! negative arms can pin the exact error.
+	XrResult
+	locate_count(XrViewConfigurationType type, XrTime t, uint32_t *out_count)
+	{
+		// Value-initialised rather than the file's `{XR_TYPE_...}` idiom purely
+		// so this addition adds no -Wmissing-field-initializers noise.
+		XrViewLocateInfo li{};
+		li.type = XR_TYPE_VIEW_LOCATE_INFO;
+		li.viewConfigurationType = type;
+		li.displayTime = t;
+		li.space = local;
+
+		XrViewState vs{};
+		vs.type = XR_TYPE_VIEW_STATE;
+		uint32_t count = 0;
+		XrResult r = pfnLocateViews(session, &li, &vs, 0, &count, nullptr);
+		if (out_count != nullptr) {
+			*out_count = count;
+		}
+		return r;
+	}
+
+	std::vector<XrViewConfigurationType>
+	view_configs()
+	{
+		auto pfn = fn<PFN_xrEnumerateViewConfigurations>("xrEnumerateViewConfigurations");
+		uint32_t n = 0;
+		REQUIRE(XR_SUCCEEDED(pfn(instance, system, 0, &n, nullptr)));
+		std::vector<XrViewConfigurationType> out(n, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO);
+		REQUIRE(XR_SUCCEEDED(pfn(instance, system, n, &n, out.data())));
+		out.resize(n);
+		return out;
+	}
+
+	//! Views that @p type reports, or 0 when the system does not advertise it.
+	uint32_t
+	config_view_count(XrViewConfigurationType type)
+	{
+		auto pfn = fn<PFN_xrEnumerateViewConfigurationViews>("xrEnumerateViewConfigurationViews");
+		uint32_t n = 0;
+		if (XR_FAILED(pfn(instance, system, type, 0, &n, nullptr))) {
+			return 0;
+		}
+		return n;
+	}
+
+	//! The device's MAX view count across rendering modes, READ from the
+	//! runtime (XR_DXR_display_info) rather than assumed. 0 when unavailable.
+	uint32_t
+	device_max_view_count()
+	{
+		if (!have_display_info) {
+			return 0;
+		}
+		auto pfn = fn<PFN_xrEnumerateDisplayRenderingModesDXR>("xrEnumerateDisplayRenderingModesDXR");
+		uint32_t n = 0;
+		if (XR_FAILED(pfn(session, 0, &n, nullptr)) || n == 0) {
+			return 0;
+		}
+		XrDisplayRenderingModeInfoDXR proto{};
+		proto.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
+		std::vector<XrDisplayRenderingModeInfoDXR> modes(n, proto);
+		if (XR_FAILED(pfn(session, n, &n, modes.data()))) {
+			return 0;
+		}
+		uint32_t max = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			if (modes[i].viewCount > max) {
+				max = modes[i].viewCount;
+			}
+		}
+		return max;
 	}
 
 	XrVector3f
@@ -306,10 +413,20 @@ load_gipa(Runtime &rt)
 	return true;
 }
 
+//! #1486: what the caller wants the instance/session to look like. The defaults
+//! reproduce the original #1370 bring-up exactly.
+struct BringUp
+{
+	//! Enable XR_DXR_display_info on the instance (gates PRIMARY_MULTIVIEW_DXR).
+	bool display_info = false;
+	//! The primaryViewConfigurationType handed to xrBeginSession.
+	XrViewConfigurationType begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+};
+
 //! Returns false (after SKIP-ing the test) when the runtime cannot come up
 //! headlessly - no display processor registered on this box.
 bool
-bring_up(Runtime &rt)
+bring_up(Runtime &rt, const BringUp &opt = BringUp{})
 {
 	if (!load_gipa(rt)) {
 		SKIP("runtime library not loadable: " DXR_RUNTIME_LIB_PATH);
@@ -331,6 +448,7 @@ bring_up(Runtime &rt)
 	};
 	REQUIRE(has(XR_MND_HEADLESS_EXTENSION_NAME));
 	rt.have_view_rig = has(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+	rt.have_display_info = opt.display_info && has(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 
 	std::vector<const char *> exts = {XR_MND_HEADLESS_EXTENSION_NAME};
 #if defined(_WIN32)
@@ -342,6 +460,9 @@ bring_up(Runtime &rt)
 #endif
 	if (rt.have_view_rig) {
 		exts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+	}
+	if (rt.have_display_info) {
+		exts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
 	}
 
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -375,7 +496,8 @@ bring_up(Runtime &rt)
 	REQUIRE(XR_SUCCEEDED(createSession(rt.instance, &sci, &rt.session)));
 
 	XrSessionBeginInfo sbi = {XR_TYPE_SESSION_BEGIN_INFO};
-	sbi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	sbi.primaryViewConfigurationType = opt.begin;
+	rt.view_config = opt.begin;
 	auto beginSession = rt.fn<PFN_xrBeginSession>("xrBeginSession");
 	REQUIRE(XR_SUCCEEDED(beginSession(rt.session, &sbi)));
 
@@ -521,6 +643,134 @@ TEST_CASE("xrLocateViews honours the base space (#1370)", "[oxr][view_space]")
 			CHECK(vdist(vV[i].pose.position, expect.position) < kPosTolM);
 			CHECK(qangle_deg(vV[i].pose.orientation, expect.orientation) < kAngTolDeg);
 		}
+	}
+
+	tear_down(rt);
+}
+
+TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr][view_space][view_config]")
+{
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	REQUIRE(device_max >= 2); // A 1-view device advertises PRIMARY_MONO instead.
+	INFO("device max view count across rendering modes = " << device_max);
+
+	SECTION("the list is PRIMARY_STEREO first, PRIMARY_MULTIVIEW_DXR second")
+	{
+		const std::vector<XrViewConfigurationType> cfgs = rt.view_configs();
+		REQUIRE(cfgs.size() == 2);
+		CHECK(cfgs[0] == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+		CHECK(cfgs[1] == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR);
+	}
+
+	SECTION("each type reports its OWN view count")
+	{
+		// PRIMARY_STEREO means exactly 2, whatever the device can drive.
+		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == 2);
+		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == device_max);
+		// A valid core type the system does NOT advertise is still refused.
+		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) == 0);
+	}
+
+	SECTION("a MULTIVIEW session locates the device max and refuses PRIMARY_STEREO")
+	{
+		const XrTime t = rt.now();
+
+		uint32_t n = 0;
+		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, &n) == XR_SUCCESS);
+		CHECK(n == device_max);
+
+		// Same session, the OTHER advertised configuration: valid enum, wrong
+		// session - UNSUPPORTED, not VALIDATION_FAILURE.
+		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, t, nullptr) ==
+		      XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+
+		// And the full locate really writes that many views.
+		std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
+		CHECK(v.size() == device_max);
+	}
+
+	tear_down(rt);
+}
+
+TEST_CASE("PRIMARY_STEREO reports exactly 2 views on a wider device (#1486)", "[oxr][view_space][view_config]")
+{
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	INFO("device max view count across rendering modes = " << device_max);
+	if (device_max <= 2) {
+		WARN("device max is " << device_max
+		                      << " - this arm only PROVES the tightening on a "
+		                         "device with a >2-view rendering mode (sim_display's Quad)");
+	}
+
+	const XrTime t = rt.now();
+	uint32_t n = 0;
+	REQUIRE(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, t, &n) == XR_SUCCESS);
+	CHECK(n == 2);
+
+	std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
+	CHECK(v.size() == 2);
+
+	// The opt-in type is advertised but this session did not begin with it.
+	CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, nullptr) ==
+	      XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+
+	tear_down(rt);
+}
+
+TEST_CASE("without XR_DXR_display_info the MULTIVIEW type does not exist (#1486)", "[oxr][view_space][view_config]")
+{
+	Runtime rt;
+	if (!bring_up(rt)) { // no XR_DXR_display_info, begun on PRIMARY_STEREO
+		return;
+	}
+
+	SECTION("exactly one view configuration is advertised")
+	{
+		const std::vector<XrViewConfigurationType> cfgs = rt.view_configs();
+		REQUIRE(cfgs.size() == 1);
+		CHECK(cfgs[0] == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == 0);
+	}
+
+	SECTION("the enum is not a valid VALUE, so it fails validation")
+	{
+		/*
+		 * XR_ERROR_VALIDATION_FAILURE, not
+		 * XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED: an extension enum
+		 * whose extension is not enabled is not a legal value at all (the
+		 * whitelist in oxr_verify_view_config_type).
+		 *
+		 * This is asserted through xrLocateViews rather than xrBeginSession
+		 * because a HEADLESS session must IGNORE primaryViewConfigurationType
+		 * per XR_MND_headless - xrBeginSession does not validate it there, and
+		 * a graphics-bound session needs a GPU and a window, which this suite
+		 * deliberately does not have. The graphics-bound xrBeginSession leg is
+		 * on the hardware eyeball list.
+		 */
+		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, rt.now(), nullptr) ==
+		      XR_ERROR_VALIDATION_FAILURE);
 	}
 
 	tear_down(rt);
