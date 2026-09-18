@@ -359,6 +359,43 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
  * Vendor-neutral: works with both SR SDK (via per-session weaver) and
  * sim_display (via generic Win32 APIs in multi compositor).
  */
+/*!
+ * #1488 PR B: remember a successful sample so the frame-end view-size poll can
+ * be served without a second IPC round trip. Called on every path below that
+ * returns true, so the cache tracks whichever source actually answered.
+ */
+static bool
+session_cache_window_metrics(struct oxr_session *sess, const struct xrt_window_metrics *wm, bool ok)
+{
+	if (ok && wm->valid) {
+		sess->last_window_metrics = *wm;
+		sess->last_window_metrics_valid = true;
+		sess->last_window_metrics_ns = os_monotonic_get_ns();
+	}
+	return ok;
+}
+
+bool
+oxr_session_get_window_metrics_cached(struct oxr_session *sess, struct xrt_window_metrics *out_metrics)
+{
+	if (sess == NULL || out_metrics == NULL) {
+		return false;
+	}
+
+	if (sess->last_window_metrics_valid) {
+		uint64_t now_ns = os_monotonic_get_ns();
+		// Unsigned, and the stamp is always in the past, so no
+		// signed-overflow trap; a clock that somehow went backwards
+		// wraps to a huge age and simply forces a refresh.
+		if (now_ns - sess->last_window_metrics_ns < OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS) {
+			*out_metrics = sess->last_window_metrics;
+			return true;
+		}
+	}
+
+	return oxr_session_get_window_metrics(sess, out_metrics);
+}
+
 bool
 oxr_session_get_window_metrics(struct oxr_session *sess,
                                 struct xrt_window_metrics *out_metrics)
@@ -369,31 +406,36 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return session_cache_window_metrics(
+		    sess, out_metrics, comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics));
 	}
 #endif
 
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
 	if (sess->is_d3d12_native_compositor) {
-		return comp_d3d12_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return session_cache_window_metrics(
+		    sess, out_metrics, comp_d3d12_compositor_get_window_metrics(&sess->xcn->base, out_metrics));
 	}
 #endif
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
-		return comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return session_cache_window_metrics(
+		    sess, out_metrics, comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics));
 	}
 #endif
 
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor) {
-		return comp_gl_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return session_cache_window_metrics(
+		    sess, out_metrics, comp_gl_compositor_get_window_metrics(&sess->xcn->base, out_metrics));
 	}
 #endif
 
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
 	if (sess->is_vk_native_compositor) {
-		return comp_vk_native_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return session_cache_window_metrics(
+		    sess, out_metrics, comp_vk_native_compositor_get_window_metrics(&sess->xcn->base, out_metrics));
 	}
 #endif
 
@@ -401,7 +443,8 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	// IPC clients have an ipc_client_compositor, not a multi_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		return multi_compositor_get_window_metrics(mc, out_metrics);
+		return session_cache_window_metrics(sess, out_metrics,
+		                                    multi_compositor_get_window_metrics(mc, out_metrics));
 	}
 
 	// IPC-client path. When the service compositor is in workspace mode the
@@ -411,7 +454,7 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	// the browser, which does its own math — Stage 3 territory).
 	if (!sess->is_bridge_relay) {
 		if (comp_ipc_client_compositor_get_window_metrics(&sess->xcn->base, out_metrics)) {
-			return true;
+			return session_cache_window_metrics(sess, out_metrics, true);
 		}
 	}
 

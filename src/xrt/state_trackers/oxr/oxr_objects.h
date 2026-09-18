@@ -17,6 +17,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_openxr_includes.h"
 #include "xrt/xrt_config_os.h"
@@ -959,7 +960,14 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess);
 XrResult
 oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess);
 
-struct xrt_window_metrics;
+/*!
+ * Staleness ceiling for @ref oxr_session::last_window_metrics. Generous on
+ * purpose: this is a geometry hint whose consumer already edge-detects, and a
+ * 60 Hz app refreshes it every ~16 ms, so the only samples this rejects are
+ * from a frame that located no views at all.
+ */
+#define OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS (50 * 1000 * 1000ULL)
+
 /*!
  * Fill @p out_metrics with this session's live display/window geometry
  * (per-client; window_pixel_* is the shell-driven tile pixel rect, updated on
@@ -968,6 +976,17 @@ struct xrt_window_metrics;
  */
 bool
 oxr_session_get_window_metrics(struct oxr_session *sess, struct xrt_window_metrics *out_metrics);
+
+/*!
+ * Same answer as @ref oxr_session_get_window_metrics, served from
+ * @ref oxr_session::last_window_metrics when that sample is younger than
+ * @ref OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS, else by calling through (which
+ * also refreshes the cache).
+ *
+ * Use this on the per-frame path. Over IPC the uncached call is a round trip.
+ */
+bool
+oxr_session_get_window_metrics_cached(struct oxr_session *sess, struct xrt_window_metrics *out_metrics);
 
 #ifdef OXR_HAVE_DXR_display_info
 /*!
@@ -2912,6 +2931,24 @@ struct oxr_session
 	//! edge detection pushes XrEventDataLocal3DZoneViewSizeChangedDXR.
 	uint32_t last_local2d_view_w;
 	uint32_t last_local2d_view_h;
+
+	/*!
+	 * #1488 PR B: last window metrics this session pulled, so the frame-end
+	 * view-size poll does not add a second IPC round trip per frame.
+	 *
+	 * oxr_session_get_window_metrics() is ALREADY called once per
+	 * xrLocateViews (oxr_session_locate_views) for every IPC session, and
+	 * over IPC that is a real round trip. It refreshes this cache on every
+	 * successful call; oxr_session_get_window_metrics_cached() serves the
+	 * frame-end poll from it and only calls through when the sample is
+	 * older than @ref OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS (a session that
+	 * located no views this frame). Steady state therefore costs zero extra
+	 * IPC, and the poll sees exactly the rect the frame was located
+	 * against, which is the correct geometry to publish for that frame.
+	 */
+	struct xrt_window_metrics last_window_metrics;
+	bool last_window_metrics_valid;
+	uint64_t last_window_metrics_ns; //!< os_monotonic_get_ns() at the last refresh. 0 = never.
 
 	//! True if XR_EXT_win32_appcontainer_compatible was enabled (Chrome WebXR).
 	//! Used to delay session state transitions for AppContainer sandbox compatibility.
