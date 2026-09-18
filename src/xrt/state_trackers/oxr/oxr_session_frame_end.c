@@ -2988,6 +2988,52 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			    comp_gl_compositor_get_recommended_view_size(&sess->xcn->base, &view_w, &view_h);
 		}
 #endif
+		// #1488 PR B - the IPC/shell leg.
+		//
+		// Under the shell every client is an `_ipc` app, so all five
+		// is_*_native_compositor flags above are false, `have_dims` stayed
+		// false, and NO view-size event has ever fired for a shell-hosted
+		// app - even though the shell resizes those tiles constantly. This
+		// closes that gap for both doorbells at once.
+		//
+		// THE GATE IS STRUCTURAL, NOT `!have_dims`. "The native getter
+		// declined" is a different question from "this session talks to a
+		// service compositor", and conflating them would newly fire for
+		// in-process sessions whose getter returns false for their own
+		// reasons - notably an XR_DXR_weave present-owner, which brings up
+		// no renderer at all. The conditions below are the same contract
+		// comp_ipc_client_compositor_get_window_metrics() documents
+		// (ipc_client_compositor.c): service mode, no native compositor,
+		// and not a bridge relay (which forwards raw eye positions to a
+		// browser that does its own math and must not be told to resize).
+		//
+		// oxr_session_get_window_metrics() itself picks the right source
+		// - the in-process multi_compositor when there is one, the IPC
+		// round trip otherwise - so this leg does not repeat that
+		// dispatch. It reads the CACHED sample: xrLocateViews already
+		// pulled one this frame, and over IPC each pull is a round trip.
+		//
+		// Linux: ipc_handle_compositor_get_window_metrics() has no
+		// per-client window source on a Linux service build (its final
+		// `#else` just drops the request), so the metrics come back
+		// valid=false and this whole leg is a documented no-op there.
+		if (!have_dims && !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
+		    !sess->is_metal_native_compositor && !sess->is_vk_native_compositor &&
+		    !sess->is_gl_native_compositor && !sess->is_bridge_relay && sess->sys->xsysc != NULL &&
+		    sess->sys->xsysc->info.is_service_mode) {
+			struct xrt_device *vs_head = GET_XDEV_BY_ROLE(sess->sys, head);
+			struct xrt_window_metrics vs_wm = {0};
+			if (vs_head != NULL && vs_head->hmd != NULL &&
+			    oxr_session_get_window_metrics_cached(sess, &vs_wm)) {
+				uint32_t vs_idx = vs_head->hmd->active_rendering_mode_index;
+				if (vs_idx < vs_head->rendering_mode_count) {
+					have_dims = oxr_views_change_size_from_window(
+					    &vs_head->rendering_modes[vs_idx], &vs_wm,
+					    sess->sys->xsysc->info.legacy_app_tile_scaling, &view_w, &view_h);
+				}
+			}
+		}
+
 		if (have_dims && view_w > 0 && view_h > 0) {
 #ifdef OXR_HAVE_DXR_local_3d_zone
 			// The bespoke doorbell, unchanged (soft-deprecated by
