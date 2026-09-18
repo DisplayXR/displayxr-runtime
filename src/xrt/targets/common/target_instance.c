@@ -107,6 +107,12 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (info == NULL || plugin == NULL) {
 		return;
 	}
+	// #1521: record WHICH plug-in the scalars below come from, so
+	// comp_dp_factory_for_window can name both sides when the per-monitor
+	// registry resolves to a different one.
+	if (plugin->id != NULL) {
+		snprintf(info->active_plugin_id, sizeof(info->active_plugin_id), "%s", plugin->id);
+	}
 	// #1243/#1244: this is the path Android takes, and it was NOT covered by the
 	// original guard — a config-skewed plug-in reached the compositor here and
 	// faulted inside the Adreno driver instead of being refused. Same check as
@@ -135,12 +141,14 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 /*!
  * Enumerate connected monitors (vendor-neutral EDID), ask the registered
  * plug-ins which they claim, and build the per-monitor DP factory registry
- * (issue #69 / ADR-015). The scalar `dp_factory_*` fields are left as the
- * authoritative compositor input in Phase 1 — the registry's primary-monitor
- * winner is the same plug-in as the active one, so they stay consistent; the
- * registry is built in parallel for the CLI and the future Phase 3 compositor
- * migration. No-op (empty registry) off-Windows, where the EDID enumerator
- * returns no monitors.
+ * (issue #69 / ADR-015). The scalar `dp_factory_*` fields are the authoritative
+ * input for the scalar-routed compositors (in-process D3D11/D3D12/VK/Metal),
+ * while the registry feeds the registry-routed ones (in-process GL, the D3D11
+ * service compositor) via `comp_dp_factory_for_window`. They agree because the
+ * loader now ENFORCES it (#1521): the active plug-in wins any monitor it claims,
+ * so the primary-monitor winner is the active plug-in whenever it claims that
+ * monitor — it is no longer merely assumed from EDID confidence. No-op (empty
+ * registry) off-Windows, where the EDID enumerator returns no monitors.
  */
 static void
 build_dp_registry(struct xrt_system_compositor_info *info)

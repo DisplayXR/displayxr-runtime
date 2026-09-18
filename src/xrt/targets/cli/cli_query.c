@@ -1678,11 +1678,12 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	if (!r->dp_sel_probed) {
 		PT("not evaluated\n");
 	} else {
-		PT("in-process (handle/texture apps): '%s'\n", or_q(r->dp_sel_inproc_id));
-		PT("service / shell:                  '%s' (%s)\n", or_q(r->dp_sel_service_id), r->dp_sel_service_conf);
+		PT("in-process D3D11/D3D12/VK/Metal: '%s'\n", or_q(r->dp_sel_inproc_id));
+		PT("service / shell / in-process GL: '%s' (%s)\n", or_q(r->dp_sel_service_id), r->dp_sel_service_conf);
 		PT("monitors=%u  claimed=%u\n", r->dp_sel_monitor_count, r->dp_sel_claim_count);
 		if (r->dp_sel_mismatch) {
-			PT("** MISMATCH: the shell will weave with '%s' while standalone apps use '%s'.\n",
+			PT("** MISMATCH: the shell and GL apps will weave with '%s' while D3D11/D3D12/VK "
+			   "standalone apps use '%s'.\n",
 			   r->dp_sel_service_id, r->dp_sel_inproc_id);
 			PT("   If '%s' is a non-tracking DP (e.g. sim_display), shell head-tracking is broken\n",
 			   r->dp_sel_service_id);

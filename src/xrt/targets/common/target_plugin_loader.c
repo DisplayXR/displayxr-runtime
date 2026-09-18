@@ -2813,19 +2813,78 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 			}
 		}
 
-		// No preferred claim for this monitor → highest confidence wins.
+		// #1521: the ACTIVE plug-in wins any monitor it claims. ProbeOrder
+		// forcing (`scripts\run_cts.ps1 -Plugin <id>`, `register_dev_plugin.bat`)
+		// steers only discover_active_plugin, and the scalar `dp_factory_*` follow
+		// that active plug-in — so without this the registry could name a DIFFERENT
+		// vendor and the registry-routed APIs (in-process GL, the D3D11 service
+		// compositor; both via comp_dp_factory_for_window) would weave with a
+		// different DP than the scalar-routed ones (in-process D3D11/D3D12/VK/Metal).
+		// That is exactly the sim-forced-active-but-Leia-wins-on-EDID-confidence
+		// case. On a normal box this is a no-op: the active plug-in IS the lowest-
+		// ProbeOrder vendor, which is also the confidence winner on the monitors it
+		// claims. A vendor does not claim monitors that are not its own, so those
+		// still fall through to confidence below — sim's FALLBACK backstop and the
+		// Phase 3b multi-vendor intent are preserved. PreferredPlugin (#791) is
+		// resolved first and still outranks this.
 		if (best_claim == NULL) {
+			// What confidence alone would pick: highest confidence wins; ties →
+			// lower ProbeOrder. Sources are already in ascending ProbeOrder, so a
+			// strict `>` keeps the first (lowest-order) source at any confidence.
+			const struct plugin_display_source *conf_src = NULL;
+			const struct xrt_display_claim *conf_claim = NULL;
 			for (int s = 0; s < g_display_source_count; s++) {
 				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
 					const struct xrt_display_claim *cl = &src_claims[s][c];
 					if (cl->monitor_id != desc->monitor_id) {
 						continue;
 					}
-					if (best_claim == NULL || cl->confidence > best_claim->confidence) {
-						best_claim = cl;
-						best_src = &g_display_sources[s];
+					if (conf_claim == NULL || cl->confidence > conf_claim->confidence) {
+						conf_claim = cl;
+						conf_src = &g_display_sources[s];
 					}
 				}
+			}
+
+			// The active plug-in's own claim for this monitor, if it has one.
+			const struct plugin_display_source *act_src = NULL;
+			const struct xrt_display_claim *act_claim = NULL;
+			if (g_active_iface != NULL) {
+				for (int s = 0; s < g_display_source_count && act_claim == NULL; s++) {
+					if (g_display_sources[s].iface != g_active_iface) {
+						continue;
+					}
+					for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+						if (src_claims[s][c].monitor_id == desc->monitor_id) {
+							act_src = &g_display_sources[s];
+							act_claim = &src_claims[s][c];
+							break;
+						}
+					}
+				}
+			}
+
+			if (act_claim != NULL) {
+				best_src = act_src;
+				best_claim = act_claim;
+				// One-off per monitor, and only when the override actually
+				// changes the outcome.
+				if (conf_claim != NULL && conf_claim != act_claim) {
+					const struct xrt_plugin_iface *aif = act_src->iface;
+					const struct xrt_plugin_iface *cif = conf_src->iface;
+					const char *aid = (aif != NULL && aif->id != NULL) ? aif->id : "?";
+					const char *cid = (cif != NULL && cif->id != NULL) ? cif->id : "?";
+					U_LOG_W(
+					    "plugin loader: monitor 0x%016llx → ACTIVE plug-in '%s' "
+					    "(confidence=%u, ProbeOrder=%u) forced over '%s' (confidence=%u) — "
+					    "the weaving DP follows the active plug-in so registry-routed APIs "
+					    "(GL, service D3D11) match the scalar-routed ones (#1521)",
+					    (unsigned long long)desc->monitor_id, aid, (unsigned)act_claim->confidence,
+					    act_src->probe_order, cid, (unsigned)conf_claim->confidence);
+				}
+			} else {
+				best_src = conf_src;
+				best_claim = conf_claim;
 			}
 		}
 		if (best_claim == NULL) {

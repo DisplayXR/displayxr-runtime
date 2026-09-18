@@ -2880,6 +2880,11 @@ struct xrt_system_compositor_info
 	 * the primary entry, so existing compositors are unaffected.
 	 */
 	struct xrt_dp_factory_registry dp_registry;
+
+	//! Discovery id of the ACTIVE plug-in (iface->id) — the one the scalar
+	//! dp_factory_* came from; "" if none. Lets comp_dp_factory_for_window name
+	//! both plug-ins when the registry and scalar diverge (#1521).
+	char active_plugin_id[64];
 };
 
 struct xrt_system_compositor;

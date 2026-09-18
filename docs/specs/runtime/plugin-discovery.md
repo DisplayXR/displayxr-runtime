@@ -79,6 +79,22 @@ DisplayXR shell, …):
    DisplayProcessor plug-in DLL (e.g. the in-tree
    `DisplayXR-SimDisplay.dll`) for the runtime to be usable.
 
+### 1.1 The per-monitor DP registry follows the active plug-in
+
+Two things pick the display processor: the scalar `dp_factory_*` fields
+(always the **active** plug-in from step 4) and the per-monitor
+`xrt_dp_factory_registry` built from every registered plug-in's
+`probe_displays()` claims. In-process D3D11/D3D12/VK/Metal read the scalar;
+in-process GL and the D3D11 service compositor read the registry. So the
+**active plug-in wins any monitor it claims** in the registry too
+(`target_plugin_resolve_displays`, #1521) — which means `ProbeOrder`
+forcing (`scripts\run_cts.ps1 -Plugin <id>`, `register_dev_plugin.bat`) and
+`displayxr-cli dp use <id>` both force the *weaving* DP, not just the head
+device. Claim **confidence** decides only among the monitors the active
+plug-in does **not** claim, so the sim-display `FALLBACK` backstop and
+future multi-vendor routing are unaffected. `PreferredPlugin` (§2.1) is
+resolved first and outranks both.
+
 ---
 
 ## 2. Windows: registry-driven discovery
