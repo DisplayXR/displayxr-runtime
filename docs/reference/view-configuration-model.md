@@ -227,10 +227,30 @@ is the first moment `view_config_view_count` is authoritative (it is seeded from
 the system's first advertised type at `xrCreateSession`). **Nothing is resized**:
 the swapchain is worst-case-sized across all modes
 ([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)), so only
-`recommended_view_scale_{x,y}` move, and the
+`recommended_view_scale_{x,y}` move.
+
+**What an `XR_EXT_view_configuration_views_change` app sees.** The
 [#1488](https://github.com/DisplayXR/displayxr-runtime/issues/1488) live-view
-shadow picks the change up from the compositor's real dims on the next
-`xrEndFrame` rather than being written here.
+shadow is deliberately *not* written by the floor, so
+`xrEnumerateViewConfigurationViews` keeps answering with **pre-floor** dims until
+the app's **first `xrEndFrame`**, which is when the doorbell fires. Two reasons,
+and the first is not the obvious one:
+
+- the shadow is fed from the **renderer's** view dims
+  (`comp_*_compositor_get_recommended_view_size`), which the renderer recomputes
+  from `active_rendering_mode_index` — the mode's `view_width_pixels` through
+  `u_tiling_compute_canvas_view()` — **not** from `recommended_view_scale_{x,y}`.
+  Writing the scales does not feed the shadow, and writing the shadow would not
+  be writing the same number the renderer will produce;
+- at `xrBeginSession` a hosted or IPC-class session has no pixel dims at all (no
+  window yet, no first frame), so any value written here would be a guess that
+  could ring the doorbell for a size the compositor never adopts.
+
+Leaving it alone is correct rather than merely convenient:
+`oxr_views_change_seed()` baselines the edge detector on the *frozen*
+`xrCreateInstance` snapshot precisely so the first sample that differs from it
+counts as a change — and the first `xrEndFrame` after a floor is exactly such a
+sample. The clamp, the 1 Hz throttle and the doorbell all follow from there.
 
 ### What is deliberately NOT floored
 
@@ -251,10 +271,20 @@ shadow picks the change up from the compositor's real dims on the next
   mode (ADR-035 D2). A client must not yank it from a workspace controller or
   another client.
 
-In the last two cases the under-submit clamp stands, and the runtime says so
-instead of clamping silently: `xrBeginSession` logs `session in an UNFILLABLE
-rendering mode (#1499)`, and a later display-global mode change into an
-unfillable mode logs once more as it lands.
+**Those last two exempt BOTH halves, not just the floor.** A pinned session is
+not floored, so it is sitting in its pinned mode — denying its request would
+mean refusing it permission to re-request the mode it is already in, and the
+device is the authority there anyway (it swallows the request and logs). A
+service-mode client is likewise not answered locally: its request must *reach*
+the lease holder, which may be moving the panel for someone else entirely.
+Getting that asymmetry wrong was the first cut of this change; the two sites now
+share one helper (`oxr_session_may_move_display_mode()`) so they cannot drift
+apart again.
+
+In both cases the under-submit clamp stands, and the runtime says so instead of
+clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering mode
+(#1499)`, and a later display-global mode change into an unfillable mode logs
+once more as it lands.
 
 The runtime's own 1/2/3 mode keys are **not** gated, in-process or in the
 service. In-process the keys only reach modes 0/1/2 (`qwerty_win32.c:514-519`),
@@ -263,8 +293,9 @@ lease-holder action rather than a client request, so a single client that cannot
 fill the result is told, not given a veto over the other clients' display.
 
 Kill switch: `DXR_MODE_FLOOR=0` restores the pre-#1499 behaviour for extension
-sessions (both halves together — see the
-[census](../roadmap/control-panel-performance-settings.md#test--dev--never-exposed)).
+sessions — both halves together, and the #1499 log lines with them, since a
+warning the runtime never used to print is part of what "pre-#1499" means (see
+the [census](../roadmap/control-panel-performance-settings.md#test--dev--never-exposed)).
 #1510's legacy floor is unaffected by it.
 
 ## Why a vendor type rather than clamping to 2

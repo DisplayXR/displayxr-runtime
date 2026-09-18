@@ -7,6 +7,8 @@
  * @ingroup oxr_main
  */
 
+#include "xrt/xrt_session.h" // #1499 denial reason enum
+
 #include "os/os_threading.h"
 
 #include "util/u_misc.h"
@@ -724,8 +726,32 @@ oxr_event_push_XrEventDataDisplayModeRequestDenied(struct oxr_logger *log,
 	denied->reason = (XrDisplayModeDenialReasonDXR)reason;
 	event->result = XR_SUCCESS;
 
-	U_LOG_W("OXR EVENT: Display mode request DENIED (mode=%u hw=%d reason=%u) — panel lease held elsewhere (#961)",
-	        requestedModeIndex, requestedHardware3D, reason);
+	/*
+	 * The reason is the whole content of this event, so the log line must
+	 * carry it. It used to say "panel lease held elsewhere (#961)"
+	 * unconditionally, which became actively misleading once #1499 added a
+	 * denial that has nothing to do with the lease: someone reading
+	 * "panel lease held elsewhere" while debugging a single-app in-process
+	 * session would be hunting a workspace that does not exist.
+	 */
+	const char *why;
+	switch ((enum xrt_display_mode_denial_reason)reason) {
+	case XRT_DISPLAY_MODE_DENIAL_REASON_WORKSPACE_OWNS_MODE:
+	case XRT_DISPLAY_MODE_DENIAL_REASON_NOT_FOCUSED:
+	case XRT_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE: why = "panel lease held elsewhere (#961)"; break;
+	case XRT_DISPLAY_MODE_DENIAL_REASON_NO_DISPLAY_PROCESSOR:
+		why = "no display processor to apply it to (#961)";
+		break;
+	case XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED:
+		why = "the display processor refused the state (#961)";
+		break;
+	case XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL:
+		why = "the session's view configuration cannot fill the mode (#1499)";
+		break;
+	default: why = "unknown reason"; break;
+	}
+	U_LOG_W("OXR EVENT: Display mode request DENIED (mode=%u hw=%d reason=%u) — %s", requestedModeIndex,
+	        requestedHardware3D, reason, why);
 
 	lock(inst);
 	push(inst, event);
