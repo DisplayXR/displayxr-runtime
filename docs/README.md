@@ -145,6 +145,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-038](adr/ADR-038-android-vendor-plugin-ships-in-the-runtime-apk.md) — On Android the Vendor Plug-in Ships Inside the Runtime APK
 - [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](adr/ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
+- [ADR-041](adr/ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
 <!-- END ADR INDEX -->
 
 ---
