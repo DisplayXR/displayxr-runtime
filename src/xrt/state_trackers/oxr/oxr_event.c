@@ -619,8 +619,7 @@ oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(struct oxr_logger *lo
                                                            struct oxr_instance *inst,
                                                            XrSystemId systemId,
                                                            XrViewConfigurationType viewConfigurationType,
-                                                           uint32_t logRecommendedWidth,
-                                                           uint32_t logRecommendedHeight)
+                                                           const struct oxr_views_change_stats *stats)
 {
 	XrEventDataViewConfigurationViewsChangedEXT *changed;
 	struct oxr_event *event = NULL;
@@ -653,8 +652,22 @@ oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(struct oxr_logger *lo
 		    "systemId %" PRIu64
 		    ", viewConfigurationType %d, recommendedImageRect now %ux%u "
 		    "(first doorbell; subsequent ones are not logged)",
-		    (uint64_t)systemId, (int)viewConfigurationType, logRecommendedWidth, logRecommendedHeight);
+		    (uint64_t)systemId, (int)viewConfigurationType, stats->last_w, stats->last_h);
 	}
+
+	// THE SOAK LINE. Exactly one per doorbell, and the literal prefix
+	// "views-change:" is what PR B and the hardware soak grep on - do not
+	// reword it. A throttled recurring diagnostic, not log bloat: the 1 Hz
+	// rate limit is structural (the spec mandates it and
+	// oxr_views_change_update enforces it), so this can never exceed one line
+	// per second per view configuration. INFO tier per the logging
+	// convention; the global default is warn, so a soak needs XRT_LOG=info.
+	//
+	// suppressed = edges folded into a doorbell rather than getting their own,
+	// i.e. how hard the throttle is working. edges - emitted - suppressed is 0
+	// by construction at this point.
+	U_LOG_I("views-change: edges=%u emitted=%u suppressed=%u last=%ux%u", stats->edges, stats->emitted,
+	        stats->suppressed, stats->last_w, stats->last_h);
 
 	lock(inst);
 	push(inst, event);
