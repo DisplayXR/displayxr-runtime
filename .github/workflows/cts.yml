@@ -509,7 +509,13 @@ jobs:
 
           rows, failed = [], []
           for arm in arms:
-              hits = glob.glob(f"all-results/cts-results-{arm}/cts_ci_{arm}.xml")
+              # Depth-agnostic on purpose: actions/download-artifact only creates
+              # a per-artifact subdirectory when MORE THAN ONE artifact matches
+              # the pattern, so a single-arm lane (the PR's d3d11) lands the XML
+              # directly in all-results/ while a fan-out nests it under
+              # all-results/cts-results-<arm>/. The filename carries the arm, so
+              # matching on it is unambiguous either way.
+              hits = glob.glob(f"all-results/**/cts_ci_{arm}.xml", recursive=True)
               exp = arm in experimental
               if not hits:
                   rows.append((arm, "—", "—", "—", "MISSING (no result XML)", exp))
