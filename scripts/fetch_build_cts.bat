@@ -138,9 +138,17 @@ if %ERRORLEVEL% NEQ 0 ( echo CTS build FAILED & exit /b 1 )
 set DPI_MANIFEST=%REPO%src\xrt\targets\common\dpi_aware.manifest
 if not exist "%DPI_MANIFEST%" ( echo ERROR: DPI manifest not found at %DPI_MANIFEST% & exit /b 1 )
 
+:: `for /r` with a bare (non-wildcard) filename does NOT enumerate existing
+:: files -- it visits every directory under the root and yields
+:: <dir>\conformance_cli.exe whether or not it exists (e.g. it will also
+:: yield build-cts\build\Testing\Temporary\conformance_cli.exe, a phantom
+:: CTest scratch path that is never created). Guard with `if exist` inside
+:: the loop, or CTS_EXE ends up pointing at the last (non-existent)
+:: candidate visited and every step below fails.
 set CTS_EXE=
-for /r "%CTS_BUILD%" %%F in (conformance_cli.exe) do set "CTS_EXE=%%F"
+for /r "%CTS_BUILD%" %%F in (conformance_cli.exe) do if exist "%%F" set "CTS_EXE=%%F"
 if not defined CTS_EXE ( echo ERROR: conformance_cli.exe not found under %CTS_BUILD% after build. & exit /b 1 )
+if not exist "%CTS_EXE%" ( echo ERROR: resolved conformance_cli.exe path does not exist: %CTS_EXE% & exit /b 1 )
 
 where mt.exe >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -179,7 +187,7 @@ echo CTS DPI manifest: EMBEDDED and verified
 echo.
 echo === CTS build complete ===
 echo   conformance_cli: %CTS_EXE%
-for /r "%CTS_BUILD%" %%F in (conformance_test.dll) do echo   conformance_test: %%F
+for /r "%CTS_BUILD%" %%F in (conformance_test.dll) do if exist "%%F" echo   conformance_test: %%F
 echo.
 echo === DONE ===
 endlocal
