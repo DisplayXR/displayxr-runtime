@@ -170,8 +170,16 @@ minimal backing or exclude via the run manifest — and **log every exclusion**
   - Nightly cron on `main` → **full** non-interactive suite.
   - Release tag `v*` → **full** suite as a hard gate (next to the ABI gate).
   - `workflow_dispatch` → on-demand full/any-API.
-- Update #33 with the supported-category matrix; note form-factor categories
-  out of scope by design (CTS interactive tests assume an HMD + controllers).
+- Update #33 with the supported-category matrix.
+- **The interactive categories are in scope, and have a written procedure:**
+  [CTS interactive procedure](../reference/cts-interactive-procedure.md).
+  (This bullet used to say they were out of scope by design, "CTS interactive
+  tests assume an HMD + controllers". Half of that is true and the conclusion
+  was not: there is no HMD, but every controller input the CTS needs is backed
+  by the **qwerty** driver, which `target_builder_sim_display.c` adds
+  unconditionally and which carries binding-profile remaps for five interaction
+  profiles. A conformance submission *requires* one interactive-composition run
+  per graphics API, so skipping them was never an option — #1523 § 4.)
 
 ## Reference
 
