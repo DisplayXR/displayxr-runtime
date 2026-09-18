@@ -13624,6 +13624,12 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 					if (pres && SUCCEEDED(pres->QueryInterface(IID_PPV_ARGS(ptex.put())))) {
 						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot",
 						                  /*from_out*/ true);
+					} else {
+						// Was the one silent exit in the feature: trigger consumed,
+						// no PNG, no log. Say so, once, on the explicit trigger.
+						U_LOG_W(
+						    "workspace_screenshot: post-weave dump SKIPPED — presenter "
+						    "RTV resource is not an ID3D11Texture2D");
 					}
 				}
 				// (2) %TEMP%\workspace_screenshot_atlas*.png — the pre-weave
@@ -16536,8 +16542,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Phase 8: screenshot file-trigger now routes through the same capture path
 	// as the workspace-driven Ctrl+Shift+3 IPC call. Create
-	// %TEMP%\workspace_screenshot_trigger to drop %TEMP%\workspace_screenshot_atlas.png
-	// on the next frame.
+	// %TEMP%\workspace_screenshot_trigger to drop TWO files on the next frame:
+	//   (1) %TEMP%\workspace_screenshot.png — the presenter's back buffer, POST-weave
+	//       and pre-Present: the pixels the panel is about to scan out (interlaced
+	//       when the panel is 3D). Read back from the device that OWNS it — under
+	//       the weave-on-scanout split that is the OUTPUT adapter, not the app one.
+	//   (2) %TEMP%\workspace_screenshot_atlas_<views>_<cols>x<rows>.png — the
+	//       pre-weave composed atlas the DP consumed, for comparison.
+	// The direct single-client path (pipeline_default_policy_render) has written
+	// both since browser#73; this compose/workspace path wrote only (2), so under
+	// the shell nothing captured what actually reached the scanout adapter and
+	// every "is the panel showing X" question needed a human at the display.
 	{
 		static char ss_trigger[MAX_PATH] = {};
 		static char ss_prefix[MAX_PATH] = {};
@@ -16558,6 +16573,37 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			ss_last_poll_ns = ss_now_ns;
 			if (GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
 				DeleteFileA(ss_trigger);
+				// (1) The post-weave back buffer — but ONLY when the weave ran this
+				// tick. Under the split this path can reach here with
+				// `split_no_weave` set (the bridge had no landed slot), in which
+				// case the back buffer holds the PREVIOUS generation or the
+				// FLIP_DISCARD clear: dumping it would produce a plausible-looking
+				// wrong picture (#1107's black-frame shape). The direct path is
+				// gated for free by its early return; this one has to say so.
+				// Every branch logs, so "trigger consumed, no PNG" is never
+				// silent (the direct path's GetResource/QueryInterface guard was).
+				if (split_no_weave) {
+					U_LOG_W(
+					    "workspace_screenshot: post-weave dump SKIPPED — no weave this tick "
+					    "(split had nothing weavable); only the pre-weave atlas follows");
+				} else if (mc->back_buffer_rtv == nullptr) {
+					U_LOG_W(
+					    "workspace_screenshot: post-weave dump SKIPPED — no back-buffer RTV "
+					    "(compose path not presenting)");
+				} else {
+					wil::com_ptr<ID3D11Resource> pres;
+					mc->back_buffer_rtv->GetResource(pres.put());
+					wil::com_ptr<ID3D11Texture2D> ptex;
+					if (pres && SUCCEEDED(pres->QueryInterface(IID_PPV_ARGS(ptex.put())))) {
+						dxr_diag_dump_tex(sys, ptex.get(), "workspace_screenshot",
+						                  /*from_out*/ true);
+					} else {
+						U_LOG_W(
+						    "workspace_screenshot: post-weave dump SKIPPED — back-buffer "
+						    "RTV resource is not an ID3D11Texture2D");
+					}
+				}
+				// (2) The pre-weave composed atlas, as before.
 				struct ipc_capture_result dummy = {};
 				comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
 				                                 IPC_CAPTURE_FLAG_ATLAS, &dummy);
