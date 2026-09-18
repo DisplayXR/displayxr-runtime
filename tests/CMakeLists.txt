@@ -42,6 +42,7 @@ set(tests
     tests_oxr_weave_latch
     tests_oxr_view_config_rule
     tests_oxr_legacy_mode_rule
+    tests_oxr_mode_fillable_rule
     tests_input_arbiter_rig
     tests_sim_input_nav
 	)
@@ -279,6 +280,16 @@ target_include_directories(
 	tests_oxr_legacy_mode_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_legacy_mode_rule PRIVATE xrt-interfaces)
+
+# #1499 — the GENERAL mode floor the legacy one above is now a wrapper over:
+# "a session never runs in a mode it cannot fill", parameterised on the view
+# count of the view configuration it began. Same header, same reason it is only
+# the RULE that is host-drivable (the wiring needs an instance, a system, a head
+# device and a plug-in), so the same include + xrt-interfaces and nothing else.
+target_include_directories(
+	tests_oxr_mode_fillable_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is

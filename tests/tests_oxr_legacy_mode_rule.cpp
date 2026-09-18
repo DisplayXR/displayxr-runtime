@@ -234,3 +234,60 @@ TEST_CASE("the compromise scale follows the mode the session will run in (#1510)
 		CHECK(x == Catch::Approx(7.0f));
 	}
 }
+
+/*
+ * #1499 turned the three decisions above into functions of "how many views can
+ * this session submit", and re-expressed the legacy ones as wrappers binding
+ * that to OXR_LEGACY_MAX_SUBMITTED_VIEWS. This arm is the proof that the
+ * generalisation took NOTHING away: index by index, on both shipping mode
+ * tables, the legacy answer is exactly the general answer at max_views = 2.
+ *
+ * It lives here rather than in tests_oxr_mode_fillable_rule.cpp on purpose —
+ * this is the suite that owns #1510's behaviour, so this is where a future
+ * change to the general rule has to come and explain itself.
+ */
+TEST_CASE("the legacy rule is the general rule at max_views = 2 (#1499 regression)", "[oxr][legacy_mode_rule]")
+{
+	struct table
+	{
+		const char *name;
+		const xrt_rendering_mode *modes;
+		uint32_t count;
+	};
+	const table tables[] = {
+	    {"sim-display", kSim, kSimCount},
+	    {"stereo-only", kStereoOnly, kStereoOnlyCount},
+	};
+
+	for (const table &t : tables) {
+		for (uint32_t i = 0; i < t.count; i++) {
+			INFO(t.name << " mode " << i);
+			CHECK(oxr_legacy_mode_is_fillable(&t.modes[i]) ==
+			      oxr_mode_fillable_by(&t.modes[i], OXR_LEGACY_MAX_SUBMITTED_VIEWS));
+			CHECK(oxr_legacy_pick_mode_index(t.modes, t.count, i) ==
+			      oxr_pick_fillable_mode_index(t.modes, t.count, i, OXR_LEGACY_MAX_SUBMITTED_VIEWS));
+		}
+	}
+
+	// The degenerate inputs too, since those are where a wrapper is easiest to
+	// get subtly wrong.
+	CHECK(oxr_legacy_mode_is_fillable(nullptr) == oxr_mode_fillable_by(nullptr, OXR_LEGACY_MAX_SUBMITTED_VIEWS));
+	CHECK(oxr_legacy_pick_mode_index(nullptr, 0, 3) ==
+	      oxr_pick_fillable_mode_index(nullptr, 0, 3, OXR_LEGACY_MAX_SUBMITTED_VIEWS));
+	CHECK(oxr_legacy_pick_mode_index(kSim, kSimCount, 99) ==
+	      oxr_pick_fillable_mode_index(kSim, kSimCount, 99, OXR_LEGACY_MAX_SUBMITTED_VIEWS));
+
+	// And the demotion gate, whose legacy name is now a pure alias.
+	for (int pinned = 0; pinned < 2; pinned++) {
+		for (int service = 0; service < 2; service++) {
+			INFO("pinned=" << pinned << " service=" << service);
+			CHECK(oxr_legacy_may_demote(pinned != 0, service != 0) ==
+			      oxr_may_demote(pinned != 0, service != 0));
+		}
+	}
+
+	// OXR_LEGACY_MAX_SUBMITTED_VIEWS is what makes the two identical; if it
+	// ever moved, the equalities above would still hold while #1510's
+	// documented behaviour silently changed. Pin the constant itself.
+	CHECK(OXR_LEGACY_MAX_SUBMITTED_VIEWS == 2u);
+}
