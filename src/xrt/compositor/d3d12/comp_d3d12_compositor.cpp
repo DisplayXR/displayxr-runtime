@@ -4663,11 +4663,18 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (layer->data.type == XRT_LAYER_PROJECTION ||
 			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
 				uint32_t vc = mode->view_count;
-				// #542: a hardware/content divergence frame (submitted
-				// views != mode views) must take the atlas path — the
-				// per-view loops below would read stale proj.v[] slots,
-				// and zero-copy can't re-tile a mismatched submission.
-				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->data.view_count == vc &&
+				// #542 / ADR-041: the submission must COVER the mode.
+				// A layer with FEWER views than the mode has tiles takes
+				// the atlas path — the per-view loops below read
+				// proj.v[0..vc) and would pick up slots the app never
+				// wrote, and zero-copy can't re-tile a short submission.
+				// `>=`, not `==`: under ADR-041 the app's view count is
+				// fixed by its view configuration and its inactive tail is
+				// an alias the runtime never reads, so a WIDER submission
+				// is normal. u_tiling_can_zero_copy() remains the sole
+				// eligibility gate (ADR-030) and inspects only the first
+				// vc rects.
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->data.view_count >= vc &&
 				                layer->sc_array[0] != NULL);
 				for (uint32_t v = 1; v < vc && same_sc; v++) {
 					if (layer->sc_array[v] != layer->sc_array[0])

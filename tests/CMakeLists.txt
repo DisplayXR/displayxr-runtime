@@ -38,6 +38,7 @@ set(tests
     tests_aux_overlay_lease
     tests_aux_mini_window_tell
     tests_aux_zone_canvas
+    tests_aux_tiling_zero_copy
     tests_comp_rear_budget
     tests_oxr_weave_latch
     tests_oxr_view_config_rule
@@ -157,6 +158,10 @@ if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLE
 	target_link_libraries(tests_oxr_camera_profile PRIVATE d3d11 dxgi)
 	add_dependencies(tests_oxr_camera_profile ${RUNTIME_TARGET})
 endif()
+
+# ADR-030/ADR-041 -- u_tiling_can_zero_copy(), the sole zero-copy gate. Header
+# arithmetic only; it reads xrt_rendering_mode, hence xrt-interfaces.
+target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 target_link_libraries(tests_history_buf PRIVATE aux_math)
