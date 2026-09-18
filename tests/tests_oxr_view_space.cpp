@@ -571,6 +571,8 @@ TEST_CASE("xrLocateViews honours the base space (#1370)", "[oxr][view_space]")
 	{
 		bool have_ref = false;
 		XrVector3f ref_offset = {0, 0, 0};
+		bool have_plane_ref = false;
+		XrVector3f ref_plane_offset = {0, 0, 0};
 		for (const Base &b : bases) {
 			INFO("base = " << b.name);
 			XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
@@ -599,10 +601,24 @@ TEST_CASE("xrLocateViews honours the base space (#1370)", "[oxr][view_space]")
 
 			// The display plane reported by the raw channel is the head
 			// device pose (legacy: the plane IS the head) - in this base.
+			// #1502 moved VIEW off the plane onto the eye centroid, so the
+			// plane is no longer AT the VIEW origin; what #1370 pins is that
+			// it is reported in the LOCATE space, i.e. that its offset from
+			// VIEW, read in the VIEW frame, does not depend on the base.
 			if (rt.have_view_rig) {
 				INFO("displayPlanePose: " << pstr(raw.displayPlanePose));
-				CHECK(vdist(raw.displayPlanePose.position, T_base_view.position) < kPosTolM);
 				CHECK(qangle_deg(raw.displayPlanePose.orientation, T_base_view.orientation) < kAngTolDeg);
+				XrVector3f pd = {raw.displayPlanePose.position.x - T_base_view.position.x,
+				                 raw.displayPlanePose.position.y - T_base_view.position.y,
+				                 raw.displayPlanePose.position.z - T_base_view.position.z};
+				XrVector3f poff = qrot(qconj(T_base_view.orientation), pd);
+				INFO("plane offset in VIEW frame = (" << poff.x << "," << poff.y << "," << poff.z << ")");
+				if (!have_plane_ref) {
+					ref_plane_offset = poff;
+					have_plane_ref = true;
+				} else {
+					CHECK(vdist(poff, ref_plane_offset) < kPosTolM);
+				}
 			}
 		}
 	}
@@ -667,6 +683,166 @@ TEST_CASE("xrLocateViews honours the base space (#1370)", "[oxr][view_space]")
 			CHECK(qangle_deg(vV[i].pose.orientation, expect.orientation) < kAngTolDeg);
 		}
 	}
+
+	tear_down(rt);
+}
+
+/*
+ * #1502: VIEW is the centroid of the located view origins.
+ *
+ * The OpenXR spec defines XR_REFERENCE_SPACE_TYPE_VIEW as the view origin, or
+ * the centroid of the view origins when there is more than one - which is what
+ * CTS 1.1.63's xrLocateSpace_xrLocateViews asserts at test_xrLocateSpace.cpp:330.
+ * DisplayXR's head device is the display PLANE, and the eyes sit off it by the
+ * nominal viewer position minus the window-centre offset (ADR-012), so before
+ * #1502 the two disagreed by exactly that vector - measured on the win box as
+ * (0, 0.1025, 0) once the CTS harness's DPI artefact (#1506) was removed.
+ *
+ * SCOPE, stated plainly because it decides what a green run here proves.
+ * Headless in-process the published offset is structurally ZERO: there is no
+ * window (so no window-centre term) and no DP instance reporting eyes (QTRACE
+ * shows `eyes=0`), so xrLocateViews takes the UNTRACKED nominal pair, whose y
+ * is deliberately 0 - "nominal_y must NOT leak into the eye", oxr_session.c -
+ * and whose z cancels against nominal_z. The deviation #1502 fixes therefore
+ * only EXISTS in a DP-backed, windowed session.
+ *
+ * So these arms pin the PLUMBING, not the magnitude: that the offset is applied
+ * on both legs (target and base), that VIEW-in-X and X-in-VIEW stay inverses,
+ * that VIEW-in-VIEW is the identity, that VIEW keeps the head orientation, and
+ * that a chained rig does not drag VIEW along. They would catch a one-leg
+ * application, a wrong composition order, or a rig leaking into VIEW. The
+ * MAGNITUDE leg - centroid == VIEW with a non-zero offset - is the CTS run on
+ * hardware (`xrLocateSpace_xrLocateViews`, which must stop reporting
+ * `(0, 0.1025, 0) == Approx((0, 0, 0))`).
+ */
+TEST_CASE("VIEW is the centroid of the located views (#1502)", "[oxr][view_space][view_centroid]")
+{
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+
+	const XrTime t = rt.now();
+	const Base bases[] = {{"LOCAL", rt.local}, {"STAGE", rt.stage}, {"VIEW", rt.view}};
+
+	SECTION("VIEW equals the eye centroid in every base")
+	{
+		for (const Base &b : bases) {
+			INFO("base = " << b.name);
+			// No rig chained: the default/legacy locate, which is the only
+			// one that publishes the offset (a rig is the app's OWN camera).
+			std::vector<XrView> v = rt.views(b.space, t, nullptr, nullptr);
+			const XrPosef T_base_view = rt.locate(rt.view, b.space, t);
+			const XrVector3f c = rt.centroid(v);
+			INFO("VIEW in base: " << pstr(T_base_view));
+			INFO("centroid = (" << c.x << "," << c.y << "," << c.z << ")");
+			CHECK(vdist(c, T_base_view.position) < kPosTolM);
+			// VIEW keeps the head orientation - the offset is a translation.
+			for (size_t i = 0; i < v.size(); i++) {
+				INFO("view " << i << ": " << pstr(v[i].pose));
+				CHECK(qangle_deg(v[i].pose.orientation, T_base_view.orientation) < kAngTolDeg);
+			}
+		}
+	}
+
+	SECTION("locating VIEW in itself is the identity, and the relation inverts")
+	{
+		(void)rt.views(rt.local, t, nullptr, nullptr);
+
+		const XrPosef T_view_view = rt.locate(rt.view, rt.view, t);
+		INFO("VIEW in VIEW: " << pstr(T_view_view));
+		CHECK(vdist(T_view_view.position, XrVector3f{0, 0, 0}) < kPosTolM);
+
+		const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
+		const XrPosef T_view_local = rt.locate(rt.local, rt.view, t);
+		const XrPosef round = pmul(T_local_view, T_view_local);
+		INFO("VIEW in LOCAL: " << pstr(T_local_view) << "\n  LOCAL in VIEW: " << pstr(T_view_local)
+		                       << "\n  round trip: " << pstr(round));
+		CHECK(vdist(round.position, XrVector3f{0, 0, 0}) < kPosTolM);
+		CHECK(qangle_deg(round.orientation, XrQuaternionf{0, 0, 0, 1}) < kAngTolDeg);
+	}
+
+	SECTION("a chained rig places the app's camera, not VIEW")
+	{
+		if (!rt.have_view_rig) {
+			SKIP("XR_DXR_view_rig not advertised");
+		}
+
+		// Baseline: the default locate publishes the viewer's centroid.
+		(void)rt.views(rt.local, t, nullptr, nullptr);
+		const XrPosef before = rt.locate(rt.view, rt.local, t);
+
+		// A rig half a metre away. Its views are nowhere near the viewer, and
+		// VIEW must NOT follow them - otherwise VIEW would flip-flop between
+		// an app's rig frames and its plain ones.
+		XrCameraRigDXR rig = {XR_TYPE_CAMERA_RIG_DXR};
+		rig.pose = {qyaw(0.35f), {0.5f, 0.25f, -0.75f}};
+		rig.ipdFactor = 1.0f;
+		rig.parallaxFactor = 1.0f;
+		rig.convergenceDiopters = 0.5f;
+		rig.verticalFov = 0.8f;
+		rig.metersToVirtual = 1.0f;
+		(void)rt.views(rt.local, t, &rig, nullptr);
+
+		const XrPosef after = rt.locate(rt.view, rt.local, t);
+		INFO("VIEW before rig: " << pstr(before) << "\n  after rig: " << pstr(after));
+		CHECK(vdist(before.position, after.position) < kPosTolM);
+		CHECK(qangle_deg(before.orientation, after.orientation) < kAngTolDeg);
+	}
+
+	tear_down(rt);
+}
+
+/*
+ * #1502 + #1486: the centroid is over the REPORTED array, not the eye set.
+ *
+ * Under PRIMARY_MULTIVIEW_DXR the session reports the device max (4 on
+ * sim_display) while the active rendering mode may be narrower; xrLocateViews
+ * fills the surplus slots by duplicating view 0. An app - and the CTS, which
+ * loops over every enumerated view configuration - averages what it was handed,
+ * so VIEW must be the mean of THAT array, duplicates included.
+ *
+ * This arm only has teeth where the device max exceeds the active mode's view
+ * count; on a box whose sim-display tops out at 2 (Quad not enabled) it is the
+ * stereo arm again. Reading the max from the runtime rather than assuming 4 is
+ * what keeps it honest either way.
+ */
+TEST_CASE("VIEW tracks the reported view array under MULTIVIEW (#1502)", "[oxr][view_space][view_centroid]")
+{
+	if (legacy_switch_set()) {
+		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+		// binary as "the headless runtime did not come up" (#1370).
+		WARN("DXR_VIEW_CONFIG_LEGACY is armed - PRIMARY_MULTIVIEW_DXR is not advertised");
+		SUCCEED("legacy process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised");
+		tear_down(rt);
+		return;
+	}
+
+	const XrTime t = rt.now();
+	std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
+	const uint32_t device_max = rt.device_max_view_count();
+	INFO("reported views = " << v.size() << ", device max = " << device_max);
+	if (device_max != 0) {
+		CHECK(v.size() == device_max);
+	}
+
+	const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
+	const XrVector3f c = rt.centroid(v);
+	INFO("VIEW in LOCAL: " << pstr(T_local_view));
+	INFO("centroid = (" << c.x << "," << c.y << "," << c.z << ")");
+	CHECK(vdist(c, T_local_view.position) < kPosTolM);
 
 	tear_down(rt);
 }
