@@ -30,11 +30,29 @@ The system carries a **list** of view configurations, not a single type
 `PRIMARY_MONO` and `PRIMARY_STEREO` stay mutually exclusive, exactly as before.
 `PRIMARY_MULTIVIEW_DXR` is **gated on the extension being enabled on the
 instance** — an app that never asked for `XR_DXR_display_info` never sees a
-vendor enum, and naming the type without enabling the extension fails
-`xrBeginSession` / `xrEnumerateViewConfigurationViews` validation
-(`XR_ERROR_VALIDATION_FAILURE`, the usual spec pattern for extension enums).
-A valid-but-not-advertised type still returns
-`XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`.
+vendor enum.
+
+**Naming it anyway fails, but with two different codes depending on the entry
+point**, because only some entry points run the validation whitelist
+(`oxr_verify_view_config_type`, `oxr_verify.c:443`):
+
+| Entry point | Runs the whitelist? | Result without the extension |
+|---|---|---|
+| `xrLocateViews` (`oxr_api_session.c:295`) | yes | `XR_ERROR_VALIDATION_FAILURE` |
+| `xrGetVisibilityMaskKHR` (`:371`) | yes | `XR_ERROR_VALIDATION_FAILURE` |
+| `xrEnumerateEnvironmentBlendModes` (`oxr_api_system.c:142`) | yes | `XR_ERROR_VALIDATION_FAILURE` |
+| `xrBeginSession`, graphics-bound (`oxr_api_session.c:133`) | yes | `XR_ERROR_VALIDATION_FAILURE` |
+| `xrBeginSession`, **headless** (`XR_MND_headless`, no compositor) | **no** | ignored — `primaryViewConfigurationType` is not checked at all |
+| `xrEnumerateViewConfigurationViews` (`oxr_api_system.c:187`) | **no** | `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED` |
+| `xrGetViewConfigurationProperties` (`:170`) | **no** | `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED` |
+
+`XR_ERROR_VALIDATION_FAILURE` is the usual spec pattern for an extension enum
+whose extension is not enabled. The bottom two go straight to
+`oxr_system_lookup_view_config()`, so for them "the extension is off" and "the
+system does not advertise it" are the same answer. A valid-but-not-advertised
+type returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED` everywhere. Apps
+should branch on the `xrEnumerateViewConfigurations` result, not on an error
+code.
 
 `PRIMARY_MULTIVIEW_DXR` is advertised on **every** 3D-capable device when the
 extension is on — including a stereo-only device such as Leia, where it reports
@@ -121,6 +139,25 @@ count ([#542](https://github.com/DisplayXR/displayxr-runtime/issues/542),
 Consequence: `PRIMARY_STEREO` reporting 2 costs no capability. A 2-view app in a
 quad mode renders exactly what it rendered before.
 
+**What the two views ARE in a >2-view mode, though, is tiles 0 and 1 — not a
+symmetric stereo pair.** A `PRIMARY_STEREO` session on a device sitting in a
+4-view mode receives `views[0..1]` = the first two viewer poses of the N-view
+fan, which for a 2×2 quad are two adjacent slots off to one side of the viewer,
+not a left/right pair straddling it. The runtime does not synthesise a
+centred pair for the narrower type. This is dev-only today — `sim_display`'s
+Quad is opt-in and no shipping device exceeds 2 views — and
+[#1499](https://github.com/DisplayXR/displayxr-runtime/issues/1499) tracks
+suppressing the mode switch for a session that cannot express it. Two direct
+consequences worth knowing before someone debugs them cold:
+
+- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`) would fail
+  `xrLocateSpace_xrLocateViews` — not on its `views.size() == 2` assertion,
+  which now passes, but on its **centroid check**: VIEW space is the centre of
+  the fan, while the centroid of tiles 0 and 1 is not. Default CI is **not**
+  quad, so the lane is green; see [CTS status](#cts-status).
+- A shipped 2-view app the workspace pushes into a wider mode gets asymmetric
+  eyes for the duration. Same root cause, same fix in #1499.
+
 ## Why a vendor type rather than clamping to 2
 
 - **One worst-case swapchain** ([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)):
@@ -190,7 +227,7 @@ CTS failure, so a box running it is out of contract on purpose.
 | **Shell file picker** | latent bug | **fixed** | Clamps `xrEnumerateViewConfigurationViews` capacity to 2 (`file_picker_openxr.cpp:202-211`) → failed init under sim-display. |
 | **Android demos** (earthview, gauss, modelviewer) | latent bug | **fixed** | All three gate on exactly 2 views and abort otherwise. |
 | **Unity** | unaffected | unaffected | Stereo topology fixed at 2; truncates to 2. Stays on `PRIMARY_STEREO`. |
-| **Unreal** | unaffected | unaffected | Its render loop is **N-wide** — it takes the tile count from `xrEnumerateDisplayRenderingModesDXR`, never from the view configuration — but its *content* is 2-view (views ≥ 2 duplicate the right eye). It is **not** "fixed at 2 views"; it is simply not driven by the view config, so the type it begins does not change its loop. |
+| **Unreal** | unaffected | unaffected **on every device that ships** | Its render loop is **N-wide** — it takes the tile count from `xrEnumerateDisplayRenderingModesDXR`, never from the view configuration — but its *content* is 2-view (views ≥ 2 duplicate the right eye). It is **not** "fixed at 2 views"; it is simply not driven by the view config. That is why it is unaffected *in practice*, not a guarantee: on a hypothetical device with a >2-view mode it would take that count from the modes list and submit `viewCount > 2` while begun on `PRIMARY_STEREO`, which `xrEndFrame` now refuses (`XR_ERROR_VALIDATION_FAILURE`). No such device ships — the only one that exists is `sim_display`'s opt-in Quad. The fix if one ever does is the same as for any N-view app: begin `PRIMARY_MULTIVIEW_DXR` (`INV-3.1`). |
 | **DisplayXR extension apps** | correct | opt in | `INV-3.1` ([app rules](../guides/displayxr-app-rules.md)) now reads: an N-view app begins with `PRIMARY_MULTIVIEW_DXR` when enumerated; a stereo-fixed app stays on `PRIMARY_STEREO` and gets 2. |
 | **Legacy apps** hardcoding 2 | out of contract | correct | They were only ever broken by the max-across-modes count; `PRIMARY_STEREO` = 2 makes them right. |
 

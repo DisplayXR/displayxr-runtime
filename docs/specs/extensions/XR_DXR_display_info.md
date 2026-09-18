@@ -769,9 +769,22 @@ views; this type is how an application reaches the rest.
   `xrEnumerateViewConfigurations`, and if this type is present pass it as
   `XrSessionBeginInfo::primaryViewConfigurationType` (and as
   `XrViewLocateInfo::viewConfigurationType`). If it is absent, begin `PRIMARY_STEREO`.
-  Naming it without having enabled the extension is a validation failure
-  (`XR_ERROR_VALIDATION_FAILURE`); naming it on a system that does not advertise it
-  returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`.
+- **What naming it without the extension returns — two different codes, by entry point.**
+  Only the entry points that run the *validation whitelist* can report "not a valid enum
+  value at all":
+  - `xrLocateViews`, `xrGetVisibilityMaskKHR`, `xrEnumerateEnvironmentBlendModes` and a
+    graphics-bound `xrBeginSession` → **`XR_ERROR_VALIDATION_FAILURE`** (the spec pattern
+    for an extension enum whose extension is not enabled). A *headless* `xrBeginSession`
+    (`XR_MND_headless`, no compositor) ignores `primaryViewConfigurationType` entirely and
+    runs no check.
+  - `xrEnumerateViewConfigurationViews` and `xrGetViewConfigurationProperties` do **not**
+    run the whitelist — they go straight to the system's advertised list, so they return
+    **`XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`** whether the type is absent because
+    the extension is off or because the system does not advertise it.
+
+  Naming it *with* the extension enabled on a system that does not advertise it returns
+  `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED` everywhere. Applications should branch on
+  the `xrEnumerateViewConfigurations` result rather than on either error code.
 - **Stereo-fixed applications are unaffected.** An application that never enables this
   extension, or enables it and stays on `PRIMARY_STEREO`, is never handed more than two
   views and needs no change. Engine plug-ins whose topology is fixed at two (Unity) fall in
@@ -1415,8 +1428,23 @@ with `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR`, so it interacts with
 `xrEnumerateViewConfigurations`, `xrGetViewConfigurationProperties`,
 `xrEnumerateViewConfigurationViews`, `xrEnumerateEnvironmentBlendModes`, `xrBeginSession`,
 `xrLocateViews` and `xrEndFrame`. When the extension is not enabled, the runtime advertises
-only the core types and every one of those entry points behaves exactly as before — the new
-type is additive and opt-in. Because the value is a vendor enum, a conformance or validation
+only the core types and `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` cannot be named
+anywhere — the *enumerator* is additive and opt-in.
+
+**What is not additive is `PRIMARY_STEREO`'s own behaviour, and that is the point of v19.**
+On a device with more than two views (a `sim_display` Quad mode, 4 views), a non-extension
+app used to get the device MAX from `xrEnumerateViewConfigurationViews` and `xrLocateViews`
+under `PRIMARY_STEREO`, and could submit that many views to `xrEndFrame`. It now gets
+**exactly 2** from both, and an `xrEndFrame` projection layer with `viewCount > 2` is refused
+with `XR_ERROR_VALIDATION_FAILURE`. That is the spec deviation #1486 removes: `PRIMARY_STEREO`
+means two views. An app that wants the device max must enable this extension and begin its
+session with `PRIMARY_MULTIVIEW_DXR`. The escape hatch for a deployment that cannot be
+updated yet is the `DXR_VIEW_CONFIG_LEGACY=1` kill switch, which restores the old mapping
+*and* the old permissive `xrEndFrame` rule wholesale; see
+[`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md).
+No shipped two-view device (Leia) is affected either way — there the two rules coincide.
+
+Because the value is a vendor enum, a conformance or validation
 layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not
 recognise it; see
 [`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md#cts-status).
