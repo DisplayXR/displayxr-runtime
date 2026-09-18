@@ -11,7 +11,7 @@
 #
 # Then run:
 #   XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json \
-#   DYLD_LIBRARY_PATH=/tmp/openxr-install/lib \
+#   DYLD_LIBRARY_PATH=/tmp/openxr-install-<OPENXR_VERSION>/lib \
 #   SIM_DISPLAY_OUTPUT=anaglyph \
 #   ./test_apps/build/bin/cube_handle_vk_macos
 
@@ -19,8 +19,11 @@ set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
-OPENXR_DIR="/tmp/openxr-install"
-OPENXR_VERSION="1.1.51"
+OPENXR_VERSION="1.1.63"
+# Versioned cache (#1487): the existence gate below is inherently
+# version-correct, so bumping OPENXR_VERSION always re-builds the loader
+# instead of silently reusing the previously cached one.
+OPENXR_DIR="/tmp/openxr-install-$OPENXR_VERSION"
 
 # Parse arguments
 SERVICE_MODE=OFF
@@ -83,7 +86,7 @@ cmake --build "$BUILD_DIR"
 # it makes a partial install self-heal instead of poisoning every build. (#575)
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ] || \
    [ ! -f "$OPENXR_DIR/lib/cmake/openxr/OpenXRConfig.cmake" ]; then
-  echo "=== Building OpenXR loader ==="
+  echo "=== Building OpenXR loader $OPENXR_VERSION ==="
   rm -rf /tmp/openxr-sdk "$OPENXR_DIR"   # wipe any partial/corrupt prior install
   git clone --depth 1 --branch "release-$OPENXR_VERSION" \
     https://github.com/KhronosGroup/OpenXR-SDK-Source.git /tmp/openxr-sdk

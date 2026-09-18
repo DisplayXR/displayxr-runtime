@@ -162,7 +162,7 @@ jobs:
           # third-party workspace apps), gated on OpenXR_ROOT. Without this
           # download that install rule is skipped and the installer ships
           # without the loader.
-          $openxrVersion = "1.1.51"
+          $openxrVersion = "1.1.63"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
@@ -559,7 +559,7 @@ jobs:
 
       - name: Install OpenXR loader
         run: |
-          $openxrVersion = "1.1.51"
+          $openxrVersion = "1.1.63"
           $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force

@@ -10,8 +10,8 @@ setlocal enabledelayedexpansion
 :: a developer/CI harness, not a runtime artifact.
 ::
 :: Usage: scripts\fetch_build_cts.bat
-::   Pin via CTS_TAG below. Loader ships at 1.1.51 (#724); the CTS pin
-::   runs ahead at 1.1.54 because CTS 1.1.51-1.1.53 has a test-side
+::   Pin via CTS_TAG below. Loader ships at 1.1.63 (#724, bumped #1487);
+::   the CTS pin is at 1.1.54 because CTS 1.1.51-1.1.53 has a test-side
 ::   stack-buffer overflow: test_XR_KHR_extended_struct_name_lengths
 ::   passes a 64-byte XR_MAX_RESULT_STRING_SIZE buffer to
 ::   xrStructureTypeToString2KHR (a 256-byte API), so any runtime

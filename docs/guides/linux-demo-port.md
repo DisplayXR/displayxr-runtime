@@ -133,7 +133,8 @@ Confirmed on **demo #1, mediaplayer** (mediaplayer#30, 4 CI iterations):
   dev pkgs are missing, the decode path is `#if 0`-ed away with no error. The CI job
   must **assert `pkg-config` found them** (fail loudly), not just build.
 - **Loader/header pin drift is org-wide:** the loader is pinned `1.1.43` while
-  vendored headers are newer (`1.1.51`) in several repos incl. the runtime. Keep
+  vendored headers are newer (the runtime is at `1.1.63` since #1487; the demos
+  are still at `1.1.51`) in several repos. Keep
   `1.1.43` for the loader unless you're deliberately bumping all three pins.
 
 Confirmed across the **4-demo batch** (avatar #22, modelviewer #41, gaussiansplat

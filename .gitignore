@@ -128,6 +128,7 @@ LeiaSR-SDK-*/
 vcpkg/
 local_build*.log
 openxr_sdk/
+openxr_sdk_*/
 
 # Shell smoke test outputs (screenshots + logs)
 scripts/test/out/
