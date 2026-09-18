@@ -60,6 +60,10 @@ if(XRT_HAVE_D3D11)
 endif()
 if(XRT_HAVE_D3D12)
 	list(APPEND tests tests_comp_client_d3d12)
+	# #1503 -- the D3D12 swapchain image format policy (typed request ->
+	# TYPELESS resource). Pure header functions plus one optional
+	# device-backed creation check that self-skips without a D3D12 device.
+	list(APPEND tests tests_comp_d3d12_swapchain_format)
 endif()
 if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
 	# #918 D12-1 — the masked-composite HLSL that comp_d3d11_outcomp and
@@ -362,6 +366,7 @@ if(XRT_HAVE_D3D12)
 	# comp_ipc_client_compositor_get_transparent_output{,_fence} bridge symbols
 	# defined in ipc_client_compositor.c. Add ipc_client (same as d3d11 above).
 	target_link_libraries(tests_comp_client_d3d12 PRIVATE comp_client comp_mock ipc_client)
+	target_link_libraries(tests_comp_d3d12_swapchain_format PRIVATE aux_d3d d3d12)
 endif()
 
 if(XRT_HAVE_VULKAN)
