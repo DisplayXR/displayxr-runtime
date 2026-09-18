@@ -2,8 +2,25 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  #1510: which rendering mode a LEGACY session runs in, and the
- *         compromise view scale that follows from it.
+ * @brief  #1510 / #1499: which rendering mode a session runs in, given how many
+ *         views it can submit, and the compromise view scale a LEGACY session is
+ *         sized with once that mode is known.
+ *
+ * The rule has two layers, and only the first one is about legacy apps:
+ *
+ *   - the GENERAL rule (#1499) — @ref oxr_mode_fillable_by,
+ *     @ref oxr_pick_fillable_mode_index, @ref oxr_may_demote — is parameterised
+ *     on `max_views`, "the most views this session can submit". That is the
+ *     session's view configuration: 2 for `PRIMARY_STEREO`, the device max for
+ *     `PRIMARY_MULTIVIEW_DXR` (#1486), and a fixed 2 for a legacy app;
+ *   - the LEGACY wrappers (#1510) — `oxr_legacy_*` — are the same functions with
+ *     `max_views` bound to @ref OXR_LEGACY_MAX_SUBMITTED_VIEWS, plus
+ *     @ref oxr_legacy_compromise_scale, which exists only for legacy apps
+ *     (an extension app is sized worst-case across all modes, ADR-010).
+ *
+ * Everything below was written for the legacy case first; the generalisation is
+ * #1499 and changes no legacy answer (tests/tests_oxr_legacy_mode_rule.cpp pins
+ * that as a regression arm, index by index).
  *
  * A legacy app is one that did not enable `XR_DXR_display_info`. It cannot
  * enumerate rendering modes, cannot request one, and is never told the active
@@ -60,8 +77,24 @@
  * the issue's objection was that the capability loss was SILENT, not that it
  * happened.
  *
+ * ### #1499: the same rule for an EXTENSION session
+ *
+ * An extension app can see the modes and request one, but it still submits only
+ * as many views as the view configuration it BEGAN reports — 2 under
+ * `PRIMARY_STEREO`, even on a device whose active mode wants 4. The capability
+ * loss is therefore identical (the unpainted tiles stay at the clear colour),
+ * and so is the fix: the same pick, with `max_views` = the session's view count
+ * instead of a hard 2, applied at `xrBeginSession` (the view configuration is
+ * only authoritative once the app has named it) and mirrored on
+ * `xrRequestDisplayRenderingModeDXR`, which denies a request the session could
+ * not fill. A `PRIMARY_MULTIVIEW_DXR` session passes `max_views` = the device
+ * max, so @ref oxr_pick_fillable_mode_index returns the active index for every
+ * mode and the whole mechanism is inert — that invariant is pinned in
+ * tests/tests_oxr_mode_fillable_rule.cpp.
+ *
  * Pure integer/float decisions with no runtime dependency, so they are pinned
- * on the host (tests/tests_oxr_legacy_mode_rule.cpp). Same shape as
+ * on the host (tests/tests_oxr_legacy_mode_rule.cpp,
+ * tests/tests_oxr_mode_fillable_rule.cpp). Same shape as
  * @ref oxr_view_config_rule.h and @ref oxr_weave_latch.h.
  *
  * @ingroup oxr_main
@@ -105,7 +138,7 @@ oxr_legacy_tile_scaling_applies(uint32_t rendering_mode_count)
 }
 
 /*!
- * May the runtime move the display out of a mode the legacy app cannot fill?
+ * May the runtime move the display out of a mode this session cannot fill?
  *
  * @param mode_pinned   The device answered XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED.
  *                      A dev pin (SIM_DISPLAY_FORCE_MODE) exists precisely to
@@ -113,66 +146,111 @@ oxr_legacy_tile_scaling_applies(uint32_t rendering_mode_count)
  *                      one, which is what keeps the N-view under-submit path
  *                      testable at all.
  * @param service_mode  The panel lease, not this app, owns the display-global
- *                      mode; a legacy client must not yank it from under a
- *                      workspace controller or another client.
+ *                      mode; a client must not yank it from under a workspace
+ *                      controller or another client.
  */
 static inline bool
-oxr_legacy_may_demote(bool mode_pinned, bool service_mode)
+oxr_may_demote(bool mode_pinned, bool service_mode)
 {
 	return !mode_pinned && !service_mode;
 }
 
 /*!
- * Can a legacy session's two-view submission fill this mode's canvas?
+ * Can a session that submits at most @p max_views views fill this mode's canvas?
  *
  * Exactly the question "does the mode's tile grid hold more tiles than the app
  * can paint?". Expressed on `view_count` rather than `tile_columns *
  * tile_rows`: those are the same number for every well-formed mode, and
  * `view_count` is the field the clamp in `compute_effective_layout()` compares
  * the submission against.
+ *
+ * @p max_views == 0 is not a session — nothing can be filled, so this is false.
+ * Callers pass the view configuration's view count, which is never 0 for a
+ * session that has begun; @ref oxr_pick_fillable_mode_index treats 0 as a
+ * degenerate input and changes nothing.
  */
 static inline bool
-oxr_legacy_mode_is_fillable(const struct xrt_rendering_mode *mode)
+oxr_mode_fillable_by(const struct xrt_rendering_mode *mode, uint32_t max_views)
 {
-	return mode != NULL && mode->view_count <= OXR_LEGACY_MAX_SUBMITTED_VIEWS;
+	return mode != NULL && max_views > 0 && mode->view_count <= max_views;
 }
 
 /*!
- * The mode a legacy session should run in.
+ * The mode a session that submits at most @p max_views views should run in.
  *
  * Returns @p active_index untouched whenever the active mode is fillable —
  * which is every shipping configuration today, because the Leia plug-in's modes
- * are all 1- or 2-view. Otherwise:
+ * are all 1- or 2-view, and every configuration at all for a session whose
+ * @p max_views is the device max (`PRIMARY_MULTIVIEW_DXR`). Otherwise:
  *
- *   1. the first 3D mode with exactly two views (keep stereo), else
+ *   1. the first 3D mode with exactly @p max_views views (keep the session's
+ *      own width — for a stereo session that is "keep stereo"), else
  *   2. the first 3D mode that is fillable at all, else
  *   3. mode 0 — 2D, and the app renders mono over the whole canvas.
+ *
+ * Degenerate inputs (no table, empty table, out-of-range active index, or
+ * @p max_views == 0) are returned as @p active_index rather than guessed at:
+ * this rule may only ever narrow a real choice, never invent one.
  *
  * @param modes        The device's rendering-mode table; may be NULL.
  * @param mode_count   Entries in @p modes.
  * @param active_index The device's current active mode index.
+ * @param max_views    The most views the session can submit.
  */
 static inline uint32_t
-oxr_legacy_pick_mode_index(const struct xrt_rendering_mode *modes, uint32_t mode_count, uint32_t active_index)
+oxr_pick_fillable_mode_index(const struct xrt_rendering_mode *modes,
+                             uint32_t mode_count,
+                             uint32_t active_index,
+                             uint32_t max_views)
 {
-	if (modes == NULL || mode_count == 0 || active_index >= mode_count) {
+	if (modes == NULL || mode_count == 0 || active_index >= mode_count || max_views == 0) {
 		return active_index;
 	}
-	if (oxr_legacy_mode_is_fillable(&modes[active_index])) {
+	if (oxr_mode_fillable_by(&modes[active_index], max_views)) {
 		return active_index;
 	}
 
 	for (uint32_t i = 0; i < mode_count; i++) {
-		if (modes[i].hardware_display_3d && modes[i].view_count == OXR_LEGACY_MAX_SUBMITTED_VIEWS) {
+		if (modes[i].hardware_display_3d && modes[i].view_count == max_views) {
 			return i;
 		}
 	}
 	for (uint32_t i = 0; i < mode_count; i++) {
-		if (modes[i].hardware_display_3d && oxr_legacy_mode_is_fillable(&modes[i])) {
+		if (modes[i].hardware_display_3d && oxr_mode_fillable_by(&modes[i], max_views)) {
 			return i;
 		}
 	}
 	return 0;
+}
+
+/*!
+ * @ref oxr_may_demote for a legacy session. Kept as its own name because the
+ * legacy call site reads better with it and #1510's tests name it.
+ */
+static inline bool
+oxr_legacy_may_demote(bool mode_pinned, bool service_mode)
+{
+	return oxr_may_demote(mode_pinned, service_mode);
+}
+
+/*!
+ * Can a legacy session's two-view submission fill this mode's canvas?
+ * @ref oxr_mode_fillable_by with @ref OXR_LEGACY_MAX_SUBMITTED_VIEWS.
+ */
+static inline bool
+oxr_legacy_mode_is_fillable(const struct xrt_rendering_mode *mode)
+{
+	return oxr_mode_fillable_by(mode, OXR_LEGACY_MAX_SUBMITTED_VIEWS);
+}
+
+/*!
+ * The mode a legacy session should run in.
+ * @ref oxr_pick_fillable_mode_index with @ref OXR_LEGACY_MAX_SUBMITTED_VIEWS.
+ */
+static inline uint32_t
+oxr_legacy_pick_mode_index(const struct xrt_rendering_mode *modes, uint32_t mode_count, uint32_t active_index)
+{
+	return oxr_pick_fillable_mode_index(modes, mode_count, active_index, OXR_LEGACY_MAX_SUBMITTED_VIEWS);
 }
 
 /*!
