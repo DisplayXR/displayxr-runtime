@@ -32,11 +32,30 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 18
+#define XR_DXR_display_info_SPEC_VERSION 19
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
 #define XR_TYPE_DISPLAY_INFO_DXR ((XrStructureType)1004999003)
+
+/*!
+ * @brief N-view primary view configuration (spec v19, #1486 / #80).
+ *
+ * Advertised by xrEnumerateViewConfigurations ONLY when this extension is
+ * enabled on the instance, alongside a conformant
+ * XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO (which always reports exactly 2
+ * views). Under this type xrEnumerateViewConfigurationViews and xrLocateViews
+ * report the device's MAXIMUM view count across all rendering modes (e.g. 4
+ * on a display with a quad mode; 2 on a stereo-only display), fixed for the
+ * instance lifetime; xrEndFrame accepts a projection layer whose viewCount
+ * matches any rendering mode's view count. An app that renders N-view modes
+ * begins its session with this type; a stereo-fixed app stays on
+ * PRIMARY_STEREO and is never handed more than 2 views.
+ *
+ * Value: 1004999212 (display_info's 210-219 decade — see README.md registry).
+ * Cast-defined because C cannot extend the core enum; not visible to -Wswitch.
+ */
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
 
 /*!
  * @brief Display information returned by xrGetSystemProperties.
