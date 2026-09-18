@@ -161,6 +161,111 @@ private:
 	struct comp_swapchain_ring m_ring{};
 };
 
+/*!
+ * The OTHER state-tracker sequence: the plain `oxr_swapchain.c` path that
+ * OpenGL (`oxr_swapchain_gl.c`) and Metal (`oxr_swapchain_metal.c`) take. No
+ * WAIT_IN_ACQUIRE — the backend sees three separate calls, so the ring must
+ * survive `acquire` … `acquire` … `wait` … `release` as well as the Vulkan
+ * shape. Modelled on @ref oxr_swapchain_common_acquire, @ref
+ * oxr_swapchain_verify_wait_state + @ref oxr_swapchain_common_wait and @ref
+ * implicit_release_image + @ref oxr_swapchain_common_release.
+ */
+class OxrGlSwapchain
+{
+public:
+	explicit OxrGlSwapchain(uint32_t image_count, bool is_static = false)
+	    : m_image_count(image_count), m_is_static(is_static), m_ready(image_count, true)
+	{
+		comp_swapchain_ring_init(&m_ring, image_count);
+	}
+
+	//! xrAcquireSwapchainImage: the backend acquire ONLY, no wait.
+	Res
+	acquire(uint32_t *out_index)
+	{
+		if (m_acquired_num >= m_image_count) {
+			return Res::CallOrderInvalid;
+		}
+		if (m_is_static && (m_released_yes || !m_ready[0])) {
+			return Res::CallOrderInvalid;
+		}
+
+		uint32_t index = UINT32_MAX;
+		if (comp_swapchain_ring_acquire(&m_ring, &index) != XRT_SUCCESS) {
+			return Res::RuntimeFailure;
+		}
+
+		if (index >= m_image_count || !m_ready[index]) {
+			return Res::RuntimeFailure;
+		}
+		m_ready[index] = false;
+
+		m_acquired_num++;
+		m_fifo.push_back(index);
+
+		*out_index = index;
+		return Res::Success;
+	}
+
+	//! xrWaitSwapchainImage: peek the FIFO, call the backend wait, pop.
+	Res
+	wait()
+	{
+		if (m_inflight >= 0) {
+			// oxr_swapchain_verify_wait_state: one image in flight at a time.
+			return Res::CallOrderInvalid;
+		}
+		if (m_fifo.empty()) {
+			return Res::CallOrderInvalid;
+		}
+
+		uint32_t index = m_fifo.front();
+		if (comp_swapchain_ring_wait(&m_ring, index) != XRT_SUCCESS) {
+			return Res::RuntimeFailure;
+		}
+		m_fifo.erase(m_fifo.begin());
+		m_inflight = static_cast<int32_t>(index);
+		return Res::Success;
+	}
+
+	//! xrReleaseSwapchainImage.
+	Res
+	release()
+	{
+		if (m_inflight < 0) {
+			// implicit_release_image: "No swapchain images waited on".
+			return Res::CallOrderInvalid;
+		}
+		uint32_t index = static_cast<uint32_t>(m_inflight);
+		m_inflight = -1;
+
+		if (comp_swapchain_ring_release(&m_ring, index) != XRT_SUCCESS) {
+			return Res::RuntimeFailure;
+		}
+
+		m_acquired_num--;
+		m_ready[index] = true;
+		m_released_yes = true;
+		return Res::Success;
+	}
+
+	uint32_t
+	outstanding() const
+	{
+		return comp_swapchain_ring_outstanding(&m_ring);
+	}
+
+private:
+	uint32_t m_image_count;
+	bool m_is_static = false;
+	bool m_released_yes = false;
+	uint32_t m_acquired_num = 0;
+	int32_t m_inflight = -1;
+	std::vector<bool> m_ready;
+	std::vector<uint32_t> m_fifo;
+	struct comp_swapchain_ring m_ring{};
+};
+
 } // namespace
 
 
@@ -400,3 +505,218 @@ TEST_CASE("swapchain_ring(vk): exhaustion is NO_IMAGE_AVAILABLE, never session-l
 }
 
 
+/*
+ *
+ * The OpenGL / Metal state-tracker sequence (#1513).
+ *
+ */
+
+TEST_CASE("swapchain_ring(gl): acquires every image before any release")
+{
+	// The same CTS step ("Acquiring all swapchain images") on -Graphics opengl,
+	// but reaching the backend as acquire-only calls. This is what
+	// gl_swapchain_acquire_image got wrong in exactly the Vulkan way: nothing
+	// released yet, so (last_released_index + 1) % image_count repeated index 1.
+	const uint32_t image_count = GENERATE(1u, 2u, 3u, 4u, 8u);
+	CAPTURE(image_count);
+
+	OxrGlSwapchain sc(image_count);
+
+	std::vector<uint32_t> indices;
+	for (uint32_t i = 0; i < image_count; ++i) {
+		CAPTURE(i);
+		uint32_t index = UINT32_MAX;
+		REQUIRE(sc.acquire(&index) == Res::Success);
+		REQUIRE(index < image_count);
+		for (uint32_t prev : indices) {
+			REQUIRE(index != prev);
+		}
+		indices.push_back(index);
+	}
+	REQUIRE(sc.outstanding() == image_count);
+
+	uint32_t extra = UINT32_MAX;
+	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
+
+	// Wait and release in turn -- FIFO order, so the same order they came out.
+	for (uint32_t i = 0; i < image_count; ++i) {
+		CAPTURE(i);
+		REQUIRE(sc.wait() == Res::Success);
+		REQUIRE(sc.wait() == Res::CallOrderInvalid);
+		REQUIRE(sc.release() == Res::Success);
+	}
+	REQUIRE(sc.outstanding() == 0);
+}
+
+TEST_CASE("swapchain_ring(gl): repeated full acquire/wait/release passes")
+{
+	// CTS SwapchainsAcquire on -Graphics opengl: ten passes of acquire-all then
+	// wait/release-all. On main this failed at i == 1 of the first pass.
+	const uint32_t image_count = GENERATE(1u, 2u, 3u, 8u);
+	CAPTURE(image_count);
+
+	OxrGlSwapchain sc(image_count);
+
+	for (int pass = 0; pass < 10; ++pass) {
+		CAPTURE(pass);
+
+		std::vector<uint32_t> indices;
+		for (uint32_t i = 0; i < image_count; ++i) {
+			CAPTURE(i);
+			uint32_t index = UINT32_MAX;
+			REQUIRE(sc.acquire(&index) == Res::Success);
+			for (uint32_t prev : indices) {
+				REQUIRE(index != prev);
+			}
+			indices.push_back(index);
+		}
+
+		for (uint32_t i = 0; i < image_count; ++i) {
+			CAPTURE(i);
+			REQUIRE(sc.wait() == Res::Success);
+			REQUIRE(sc.release() == Res::Success);
+		}
+		REQUIRE(sc.outstanding() == 0);
+	}
+}
+
+TEST_CASE("swapchain_ring(gl): one-at-a-time steady state round-robins")
+{
+	// The ordinary GL app loop, which worked before and must keep working:
+	// one image per frame, and consecutive frames must not reuse the same one.
+	OxrGlSwapchain sc(3);
+
+	uint32_t previous = UINT32_MAX;
+	for (int frame = 0; frame < 12; ++frame) {
+		CAPTURE(frame);
+		uint32_t index = UINT32_MAX;
+		REQUIRE(sc.acquire(&index) == Res::Success);
+		REQUIRE(index != previous);
+		REQUIRE(sc.wait() == Res::Success);
+		REQUIRE(sc.release() == Res::Success);
+		previous = index;
+	}
+}
+
+TEST_CASE("swapchain_ring(gl): acquire, acquire, wait, release interleave")
+{
+	// The shape only the non-WAIT_IN_ACQUIRE path can produce: two images
+	// ACQUIRED at once with neither waited. The ring has to hold two images in
+	// the ACQUIRED state and then accept the wait for the FIFO-front one.
+	OxrGlSwapchain sc(3);
+
+	uint32_t a = UINT32_MAX, b = UINT32_MAX, c = UINT32_MAX;
+	REQUIRE(sc.acquire(&a) == Res::Success);
+	REQUIRE(sc.acquire(&b) == Res::Success);
+	REQUIRE(a != b);
+	REQUIRE(sc.outstanding() == 2);
+
+	REQUIRE(sc.wait() == Res::Success); // a
+	REQUIRE(sc.release() == Res::Success);
+
+	REQUIRE(sc.acquire(&c) == Res::Success);
+	REQUIRE(c != b);
+
+	REQUIRE(sc.wait() == Res::Success); // b
+	REQUIRE(sc.release() == Res::Success);
+	REQUIRE(sc.wait() == Res::Success); // c
+	REQUIRE(sc.release() == Res::Success);
+	REQUIRE(sc.outstanding() == 0);
+}
+
+TEST_CASE("swapchain_ring(gl): release without a wait never reaches the ring")
+{
+	// Why the ring may stay strict (WAITED-only release) for the OpenGL and
+	// Metal backends too, even though their old release_image accepted
+	// anything: oxr_swapchain.c's implicit_release_image refuses with
+	// CALL_ORDER_INVALID while inflight.index is unset, so a release without a
+	// preceding wait never gets as far as the backend.
+	OxrGlSwapchain sc(3);
+
+	REQUIRE(sc.release() == Res::CallOrderInvalid);
+
+	uint32_t a = UINT32_MAX;
+	REQUIRE(sc.acquire(&a) == Res::Success);
+	REQUIRE(sc.release() == Res::CallOrderInvalid); // acquired, not waited
+	REQUIRE(sc.outstanding() == 1);
+
+	REQUIRE(sc.wait() == Res::Success);
+	REQUIRE(sc.release() == Res::Success);
+	REQUIRE(sc.outstanding() == 0);
+
+	// And directly at the ring: an ACQUIRED image is not releasable.
+	struct comp_swapchain_ring ring{};
+	comp_swapchain_ring_init(&ring, 3);
+	uint32_t index = UINT32_MAX;
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &index) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_release(&ring, index) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_outstanding(&ring) == 1);
+}
+
+TEST_CASE("swapchain_ring(gl): the static swapchain's one image, acquired once")
+{
+	// CTS Swapchains "Non-default create flags" on -Graphics opengl. The GL and
+	// Metal compositors hardcoded image_count = 3 at BOTH the create site and
+	// get_swapchain_create_properties, so a XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT
+	// swapchain advertised three images the state tracker would hand out one
+	// of -- CALL_ORDER_INVALID on the second acquire, once per format.
+	const uint32_t image_count = comp_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE, 3);
+	REQUIRE(image_count == 1);
+
+	OxrGlSwapchain sc(image_count, /* is_static */ true);
+
+	uint32_t index = UINT32_MAX;
+	REQUIRE(sc.acquire(&index) == Res::Success);
+	REQUIRE(index == 0);
+
+	uint32_t extra = UINT32_MAX;
+	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
+
+	REQUIRE(sc.wait() == Res::Success);
+	REQUIRE(sc.wait() == Res::CallOrderInvalid);
+	REQUIRE(sc.release() == Res::Success);
+	REQUIRE(sc.outstanding() == 0);
+
+	// A static swapchain is spent after one acquire.
+	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
+}
+
+TEST_CASE("comp_swapchain_image_count: the default count is the caller's, and is clamped")
+{
+	// #1513 lifted the helper out of vk_native and gave it the backend's own
+	// default, because nothing guarantees every compositor triple buffers
+	// forever. The static rule outranks the default, and the result can never
+	// exceed the fixed-size image arrays nor be zero.
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 2) == 2);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 8) == 8);
+	REQUIRE(comp_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE, 8) == 1);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 99) == COMP_SWAPCHAIN_MAX_IMAGES);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 0) == 1);
+
+	// The bound is the one the xrt_swapchain_* images[] arrays are sized to.
+	REQUIRE(COMP_SWAPCHAIN_MAX_IMAGES == XRT_MAX_SWAPCHAIN_IMAGES);
+}
+
+TEST_CASE("swapchain_ring(gl): the pre-fix GL rule really did hand out a duplicate")
+{
+	// Negative control for the OpenGL/Metal half, so these cases cannot quietly
+	// pass against a reverted fix. This is comp_gl_compositor.cpp:1733 and
+	// comp_metal_compositor.m:1130 verbatim -- next = (last_released_index + 1)
+	// % image_count, seeded to 0 (GL) so the first acquire yields 1 and the
+	// second yields 1 again.
+	const uint32_t image_count = 3;
+	uint32_t last_released_index = 0; // what gl_compositor_create_swapchain set
+
+	uint32_t first = (last_released_index + 1) % image_count;
+	uint32_t second = (last_released_index + 1) % image_count; // no release between
+	REQUIRE(first == 1);
+	REQUIRE(second == first); // <-- the bug
+
+	struct comp_swapchain_ring ring{};
+	comp_swapchain_ring_init(&ring, image_count);
+	uint32_t a = UINT32_MAX, b = UINT32_MAX;
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &a) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &b) == XRT_SUCCESS);
+	REQUIRE(a == 0);
+	REQUIRE(b != a);
+}

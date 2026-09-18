@@ -17,6 +17,9 @@
 #endif
 
 #include "util/comp_layer_accum.h"
+// #1513 — the shared acquire/wait/release bookkeeping and the static-image
+// count rule. Header-only (no Vulkan), so it costs no comp_util link.
+#include "util/comp_swapchain_ring.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
@@ -134,7 +137,9 @@ typedef BOOL(WINAPI *PFN_wglDXUnlockObjectsNV)(HANDLE hDevice, GLint count, HAND
  *
  */
 
-#define GL_SWAPCHAIN_MAX_IMAGES 8
+//! Sized off the shared ring so the texture array and the bookkeeping cannot
+//! disagree about how many images a swapchain can hold (#1513).
+#define GL_SWAPCHAIN_MAX_IMAGES COMP_SWAPCHAIN_MAX_IMAGES
 #ifndef GL_MAX_LAYERS
 #define GL_MAX_LAYERS 16
 #endif
@@ -163,9 +168,8 @@ struct comp_gl_swapchain
 	//! GL_TEXTURE_2D_ARRAY for layered (arraySize>1) swapchains.
 	GLenum target;
 
-	int32_t acquired_index;
-	int32_t waited_index;
-	uint32_t last_released_index;
+	//! Per-image acquire/wait/release state. See util/comp_swapchain_ring.h.
+	struct comp_swapchain_ring ring;
 };
 
 static inline struct comp_gl_swapchain *
@@ -1730,9 +1734,19 @@ static xrt_result_t
 gl_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct comp_gl_swapchain *sc = gl_swapchain(xsc);
-	uint32_t next = (sc->last_released_index + 1) % sc->image_count;
-	sc->acquired_index = (int32_t)next;
-	*out_index = next;
+
+	// OpenXR permits up to image_count concurrently acquired images, so the
+	// ring must be able to hand out every image before any is released. The
+	// old (last_released_index + 1) % image_count handed the same index out
+	// twice and the state tracker rejected it as a non-ready image (#1513).
+	uint32_t index = 0;
+	xrt_result_t xret = comp_swapchain_ring_acquire(&sc->ring, &index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("No free GL swapchain image: all %u are already acquired", sc->image_count);
+		return xret;
+	}
+
+	*out_index = index;
 	return XRT_SUCCESS;
 }
 
@@ -1740,7 +1754,18 @@ static xrt_result_t
 gl_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t index)
 {
 	struct comp_gl_swapchain *sc = gl_swapchain(xsc);
-	sc->waited_index = (int32_t)index;
+	(void)timeout_ns;
+
+	// The app owns these textures; there is no runtime-side GPU work to wait
+	// on (the compositor samples them at layer_commit, after release). The
+	// state tracker enforces the FIFO acquire->wait->release order, so this
+	// only has to move the named image on and reject one that is not acquired.
+	xrt_result_t xret = comp_swapchain_ring_wait(&sc->ring, index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Wait on non-acquired GL swapchain image index %u (image_count=%u)", index, sc->image_count);
+		return xret;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -1748,9 +1773,13 @@ static xrt_result_t
 gl_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_gl_swapchain *sc = gl_swapchain(xsc);
-	sc->last_released_index = index;
-	sc->acquired_index = -1;
-	sc->waited_index = -1;
+
+	xrt_result_t xret = comp_swapchain_ring_release(&sc->ring, index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Release of non-waited GL swapchain image index %u (image_count=%u)", index, sc->image_count);
+		return xret;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -1793,7 +1822,9 @@ gl_compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
                                                const struct xrt_swapchain_create_info *info,
                                                struct xrt_swapchain_create_properties *xsccp)
 {
-	xsccp->image_count = 3;
+	// Must agree with what gl_compositor_create_swapchain actually allocates:
+	// one image for a static swapchain, triple buffering otherwise (#1513).
+	xsccp->image_count = comp_swapchain_image_count(info->create, 3);
 	xsccp->extra_bits = (enum xrt_swapchain_usage_bits)0;
 	return XRT_SUCCESS;
 }
@@ -1835,17 +1866,15 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 	comp_gl_window_macos_make_current(c->macos_window);
 #endif
 
-	uint32_t image_count = 3;
-	if (image_count > GL_SWAPCHAIN_MAX_IMAGES) {
-		image_count = GL_SWAPCHAIN_MAX_IMAGES;
-	}
+	// One image for a static swapchain, triple buffering otherwise (#1513).
+	// Same helper gl_compositor_get_swapchain_create_properties uses, so the
+	// advertised count and the allocated one cannot drift.
+	uint32_t image_count = comp_swapchain_image_count(info->create, 3);
 
 	struct comp_gl_swapchain *sc = U_TYPED_CALLOC(struct comp_gl_swapchain);
 	sc->image_count = image_count;
 	sc->info = *info;
-	sc->acquired_index = -1;
-	sc->waited_index = -1;
-	sc->last_released_index = 0;
+	comp_swapchain_ring_init(&sc->ring, image_count);
 
 	// Create GL textures. Layered (arraySize>1) swapchains allocate a
 	// GL_TEXTURE_2D_ARRAY with `array_size` slices — under single-pass-instanced
