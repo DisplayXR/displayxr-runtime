@@ -56,11 +56,12 @@
 #include <dcomp.h>       // transparent present: DComp visual over the desktop
 #pragma comment(lib, "dcomp.lib")
 
-#include "logging.h"
-#include "input_handler.h"
-#include "xr_session.h"
+#include "atlas_capture.h"   // capture-flash window-message helpers (parity)
+#include "dxr_view_config.h" // ADR-041: DxrAliasInactiveViews
 #include "gl_renderer.h"
-#include "atlas_capture.h" // capture-flash window-message helpers (parity)
+#include "input_handler.h"
+#include "logging.h"
+#include "xr_session.h"
 
 extern "C" int stbi_write_png(const char* filename, int w, int h, int comp,
                               const void* data, int stride_in_bytes);
@@ -1084,6 +1085,8 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
     XrDisplayRigDXR rigStructs[kNumZones];
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
+    // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
+    uint32_t locatedViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
@@ -1151,7 +1154,13 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
         }
         const uint32_t n = (std::min)((std::min)(viewCountOutput, z.tileCount), activeViewCount);
         submitViewCounts[zi] = n;
-        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        // ADR-041: each zone layer carries the LOCATED count; only the active
+        // views are rendered, the tail aliases view 0 and the runtime drops it.
+        const uint32_t locatedCount =
+            (viewCountOutput > 0) ? viewCountOutput : 2u;
+        locatedViewCounts[zi] = locatedCount;
+        projViews[zi].assign(locatedCount,
+                             {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render-ready views -> matrices. ZDP-anchored clip. GL keeps the
         // [-1,1] clip-z — NO convert_projection_gl_to_zero_to_one() (that is
@@ -1206,6 +1215,10 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
 
         renderer.cubeRotation = savedRotation;
 
+        // ADR-041: this zone rendered only `n` views — point the inactive tail
+        // at this zone's view-0 tile so the layer can carry `locatedCount`.
+        DxrAliasInactiveViews(projViews[zi].data(), zoneViews, locatedCount, n);
+
         // Content-alpha edge feather (ADR-027 rule 4). Skipped in wish mode 1
         // (explicit Tier-2): that wish is M=1 to the hard rect edge, so a
         // content fade inside it would weave to opaque black, not the desktop.
@@ -1234,7 +1247,8 @@ static void RenderZonesFrame(XrSessionManager& xr, GLRenderer& renderer,
         // declare source-alpha blending (premultiplied bytes).
         projLayers[zi].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         projLayers[zi].space = xr.localSpace;
-        projLayers[zi].viewCount = submitViewCounts[zi];
+        projLayers[zi].viewCount =
+            locatedViewCounts[zi]; // ADR-041: located, not active
         projLayers[zi].views = projViews[zi].data();
         layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&projLayers[zi];
     }
@@ -1349,6 +1363,10 @@ static void RenderFallbackFrame(XrSessionManager& xr, GLRenderer& renderer,
     }
     int eyeCount = monoMode ? 1 : (int)modeViewCount;
     std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+    // ADR-041: the layer carries the LOCATED count, not the active one. Seeded
+    // from eyeCount, then reconciled with xrLocateViews' count after the
+    // locate.
+    uint32_t locatedCount = (uint32_t)eyeCount;
     bool viewsPopulated = false;
 
     if (frameState.shouldRender) {
@@ -1387,6 +1405,17 @@ static void RenderFallbackFrame(XrSessionManager& xr, GLRenderer& renderer,
                 locateInfo.next = &displayRig;
             }
             xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+            // ADR-041: the layer must carry EVERY located view. Render eyeCount
+            // tiles (clamped so it can never exceed the located count), submit
+            // locatedCount views, alias the inactive tail after the fill loop.
+            locatedCount = (viewCount > 0) ? viewCount : (uint32_t)eyeCount;
+            if (eyeCount > (int)locatedCount)
+                eyeCount = (int)locatedCount;
+            if (projectionViews.size() != locatedCount) {
+                projectionViews.resize(
+                    locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+            }
 
             uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
             uint32_t maxTileH = tileRows > 0 ? xr.swapchain.height / tileRows : xr.swapchain.height;
@@ -1465,6 +1494,9 @@ static void RenderFallbackFrame(XrSessionManager& xr, GLRenderer& renderer,
                         rigViews[monoMode ? 0 : eye].fov :
                         (monoMode ? rawViews[0].fov : rawViews[safeIdx].fov);
                 }
+                DxrAliasInactiveViews(projectionViews.data(), rawViews,
+                                      locatedCount,
+                                      (uint32_t)eyeCount); // ADR-041
                 viewsPopulated = true;
                 ReleaseSwapchainImage(xr);
             }
@@ -1484,7 +1516,7 @@ static void RenderFallbackFrame(XrSessionManager& xr, GLRenderer& renderer,
     XrCompositionLayerFlags projLayerFlags = TransparentBackgroundEnabled()
         ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0;
     EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(),
-             (uint32_t)eyeCount, projLayerFlags);
+             locatedCount, projLayerFlags);
 
     // Texture-mode present: even on the fallback path the runtime composited
     // into our shared texture, so present it into our own window swapchain.
