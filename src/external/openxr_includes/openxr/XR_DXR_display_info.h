@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_display_info 1
-#define XR_DXR_display_info_SPEC_VERSION 20
+#define XR_DXR_display_info_SPEC_VERSION 21
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -607,6 +607,60 @@ typedef struct XrEventDataDisplayModeRequestDeniedDXR {
     int32_t                       requestedHardware3D;
     XrDisplayModeDenialReasonDXR  reason;
 } XrEventDataDisplayModeRequestDeniedDXR;
+
+// ---- v21: Per-frame view activity — the fixed-count submission contract (ADR-041, Model E) ----
+
+#define XR_TYPE_VIEW_ACTIVITY_STATE_DXR ((XrStructureType)1004999213)
+
+/*!
+ * @brief How many of this frame's located views carry live content.
+ *
+ * Chained to XrViewState in xrLocateViews. The VIEW COUNT IS FIXED for the
+ * lifetime of the session — it is whatever the begun view configuration
+ * reports (exactly 2 under XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, the
+ * device maximum under XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) and
+ * never changes when the display's rendering mode does. What changes per frame
+ * is how many of those views are ACTIVE:
+ *
+ *   - views [0, activeViewCount) carry the active rendering mode's viewer
+ *     poses and FOVs. These are the views the runtime composes.
+ *   - views [activeViewCount, viewCountOutput) are INACTIVE. The runtime
+ *     locates them at view 0's pose so they are always valid to render with,
+ *     and IGNORES whatever the app submits for them.
+ *
+ * THE SUBMISSION CONTRACT (all view configuration types): xrEndFrame's
+ * XrCompositionLayerProjection::viewCount must equal the count xrLocateViews
+ * returned — that is what core OpenXR requires ("All views associated with
+ * projection layers must be supplied"). An app that renders only the active
+ * views satisfies it by ALIASING the inactive tail: give each inactive view
+ * any valid subImage of a swapchain it rendered this frame (view 0's is the
+ * obvious choice) while keeping that view's own located pose/fov. The runtime
+ * never reads those pixels.
+ *
+ * Not chaining this struct is legal: an app that always renders every located
+ * view needs nothing from it (the inactive tail then simply duplicates view 0
+ * and is discarded).
+ *
+ * Filled only on the call that RETURNS views, i.e. `viewCapacityInput > 0`. The
+ * two-call count query (`viewCapacityInput == 0`) returns before any view is
+ * located and therefore writes nothing here — the same rule the rest of
+ * XrViewState already follows. Initialise the field and read it back after the
+ * second call.
+ *
+ * DEPRECATED, still accepted: an app that enabled this extension and began
+ * PRIMARY_STEREO may submit a 1-view projection layer while the active mode is
+ * itself 1-view. That is the pre-v21 2D submission path; it logs a one-shot
+ * warning and is removed once the SDK + the shipped demos alias instead. The
+ * DXR_UNDER_SUBMIT runtime switch selects the behaviour (see
+ * docs/specs/extensions/XR_DXR_display_info.md).
+ *
+ * @extends XrViewState
+ */
+typedef struct XrViewActivityStateDXR {
+    XrStructureType           type;            //!< Must be XR_TYPE_VIEW_ACTIVITY_STATE_DXR
+    void* XR_MAY_ALIAS        next;
+    uint32_t                  activeViewCount; //!< Views [0, activeViewCount) are live; the rest are inactive aliases
+} XrViewActivityStateDXR;
 
 #ifdef __cplusplus
 }

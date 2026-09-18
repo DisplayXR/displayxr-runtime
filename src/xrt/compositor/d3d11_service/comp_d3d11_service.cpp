@@ -19550,8 +19550,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			continue;
 		}
 
-		// Determine view count: mono apps have 1 view, 3D mode uses all views
+		// Determine view count: mono apps have 1 view, 3D mode uses all views.
+		//
+		// ADR-041: `layer->data.view_count` is now R — the count the app's VIEW
+		// CONFIGURATION reports, fixed for its session — not A, the active
+		// content mode's tile count. The inactive tail [A, R) aliases view 0 and
+		// must be dropped here, exactly as the in-process path does in
+		// comp_d3d11_renderer_compute_effective_layout(). Without the clamp two
+		// things break: eff_view_count below can never be 1 from a 1-tile mode,
+		// so the #575 mono collapse (the 1x1 DP grid) stops firing; and the blit
+		// loop walks all R views through u_tiling_view_origin(eye, cols, ...),
+		// which for R=2 over a 1x1 grid indexes a tile that does not exist.
+		uint32_t mode_tiles = sys->tile_columns * sys->tile_rows;
+		if (mode_tiles == 0)
+			mode_tiles = 1;
 		uint32_t proj_view_count = layer->data.view_count;
+		if (proj_view_count > mode_tiles)
+			proj_view_count = mode_tiles;
 		if (!sys->hardware_display_3d)
 			proj_view_count = 1;
 		if (proj_view_count > XRT_MAX_VIEWS)

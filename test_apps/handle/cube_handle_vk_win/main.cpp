@@ -12,11 +12,12 @@
 #define _UNICODE
 #include <windows.h>
 
-#include "logging.h"
+#include "dxr_view_config.h"
 #include "input_handler.h"
-#include "xr_session.h"
-#include "vk_renderer.h"
+#include "logging.h"
 #include "projection_depth.h"
+#include "vk_renderer.h"
+#include "xr_session.h"
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -703,8 +704,21 @@ static void RenderThreadFunc(
                     ? xr->renderingModeTileRows[xr->currentModeIndex] : 1;
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
+                // ADR-041: the layer carries the LOCATED count, not the active
+                // mode's. xrLocateViews always reports the view configuration's
+                // count, so it is known before the frame; only eyeCount of them
+                // are rendered and the tail is aliased below.
+                uint32_t locatedCount = !xr->configViews.empty()
+                                            ? (uint32_t)xr->configViews.size()
+                                            : (uint32_t)eyeCount;
+                if (locatedCount > 8)
+                    locatedCount = 8; // rawViews[] capacity
+                if (eyeCount > (int)locatedCount)
+                    eyeCount = (int)locatedCount;
+
                 // Dynamic arrays for N-view rendering
-                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                std::vector<XrCompositionLayerProjectionView> projectionViews(
+                    locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                 bool rendered = false;
                 bool hudSubmitted = false;
 
@@ -964,6 +978,14 @@ static void RenderThreadFunc(
                                     (monoMode ? rawViews[0].fov : rawViews[eye < (int)viewCount ? eye : 0].fov);
                             }
 
+                            // ADR-041: point the inactive tail
+                            // [eyeCount, locatedCount) at view 0's subimage,
+                            // keeping each view's own located pose/fov, so the
+                            // layer is complete without rendering it.
+                            DxrAliasInactiveViews(projectionViews.data(),
+                                                  rawViews, locatedCount,
+                                                  (uint32_t)eyeCount);
+
                             // 'I' key: snapshot the multi-view atlas. Skipped
                             // for mono (1×1) layouts.
                             if (inputSnapshot.captureAtlasRequested) {
@@ -1131,8 +1153,9 @@ static void RenderThreadFunc(
                     }
                 }
 
-                // viewCount: 1 for mono (2D mode), 2 for stereo (3D mode)
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
+                // ADR-041: submit the located count; eyeCount is what was
+                // rendered (1 for mono / 2D mode, N for the active 3D mode).
+                uint32_t submitViewCount = locatedCount;
                 // When transparent_bg is on, ask the runtime to honor the cube's
                 // per-pixel alpha when blending the projection layer. Pre-#213
                 // apps default to 0 (no source-alpha blend = treat as opaque).

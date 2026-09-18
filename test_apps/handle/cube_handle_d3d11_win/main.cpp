@@ -20,6 +20,7 @@
 
 // #918 review F1 — ID3D11DeviceContext1::ClearView, for the Tier-3 mask stroke.
 #include "atlas_capture.h"
+#include "dxr_view_config.h"
 #include "hud_renderer.h"
 #include "projection_depth.h"
 #include "text_overlay.h"
@@ -1073,14 +1074,27 @@ static void RenderOneFrame(RenderState& rs) {
                 if (ArrayLayoutEnabled() && eyeCount > (int)xr.swapchain.arraySize) {
                     eyeCount = (int)xr.swapchain.arraySize;
                 }
-                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-            bool hudSubmitted = false;
+                // ADR-041: the layer carries the LOCATED count, not the active
+                // mode's. xrLocateViews always reports the view configuration's
+                // count, so it is known before the frame; only eyeCount of them
+                // are rendered and the tail is aliased below.
+                uint32_t locatedCount = !xr.configViews.empty()
+                                            ? (uint32_t)xr.configViews.size()
+                                            : (uint32_t)eyeCount;
+                if (locatedCount > 8)
+                    locatedCount = 8; // rawViews[] capacity
+                if (eyeCount > (int)locatedCount)
+                    eyeCount = (int)locatedCount;
+                std::vector<XrCompositionLayerProjectionView> projectionViews(
+                    locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                bool hudSubmitted = false;
 
-            if (frameState.shouldRender) {
-                if (LocateViews(xr, frameState.predictedDisplayTime,
-                    g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                    g_inputState.yaw, g_inputState.pitch,
-                    g_inputState.viewParams)) {
+                if (frameState.shouldRender) {
+                    if (LocateViews(
+                            xr, frameState.predictedDisplayTime,
+                            g_inputState.cameraPosX, g_inputState.cameraPosY,
+                            g_inputState.cameraPosZ, g_inputState.yaw,
+                            g_inputState.pitch, g_inputState.viewParams)) {
 
                     // Get raw view poses (pre-player-transform) for projection views.
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -1581,6 +1595,13 @@ static void RenderOneFrame(RenderState& rs) {
                             if (sliceRtv) sliceRtv->Release();
                         }
 
+                        // ADR-041: point the inactive tail [eyeCount,
+                        // locatedCount) at view 0's subimage, keeping each
+                        // view's own located pose/fov, so the layer is complete
+                        // without rendering it.
+                        DxrAliasInactiveViews(projectionViews.data(), rawViews,
+                                              locatedCount, (uint32_t)eyeCount);
+
                         if (rtv) rtv->Release();
 
                         // 'I' key: snapshot the multi-view atlas to a PNG via the
@@ -1747,7 +1768,7 @@ static void RenderOneFrame(RenderState& rs) {
             } else if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                 XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
                 projLayer.space = xr.localSpace;
-                projLayer.viewCount = (uint32_t)eyeCount;
+                projLayer.viewCount = locatedCount;
                 projLayer.views = projectionViews.data();
 
                 XrCompositionLayerLocal2DDXR panel1Layer = {
@@ -1810,10 +1831,12 @@ static void RenderOneFrame(RenderState& rs) {
                 float fracW = HUD_WIDTH_FRACTION;
                 float fracH = fracW * windowAR / hudAR;
                 if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
-                EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime, projectionViews.data(),
-                    0.0f, 0.0f, fracW, fracH, 0.0f, eyeCount);
+                EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime,
+                                           projectionViews.data(), 0.0f, 0.0f,
+                                           fracW, fracH, 0.0f, locatedCount);
             } else {
-                EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), eyeCount);
+                EndFrame(xr, frameState.predictedDisplayTime,
+                         projectionViews.data(), locatedCount);
             }
             g_l2dFrameCounter++;
         }

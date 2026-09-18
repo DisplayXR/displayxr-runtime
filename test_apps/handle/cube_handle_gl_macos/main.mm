@@ -1837,8 +1837,14 @@ int main(int argc, char **argv)
             ? app.renderingModeTileRows[app.currentModeIndex] : 1;
         int eyeCount = display3D ? (int)modeViewCount : 1;
 
+        // ADR-041: the projection layer must carry EVERY view xrLocateViews
+        // returned, not just the ones the active mode renders. Render eyeCount
+        // tiles, submit locatedCount views, alias the inactive tail below.
+        uint32_t locatedCount = (viewCount > 0) ? viewCount : (uint32_t)eyeCount;
+        if (eyeCount > (int)locatedCount) eyeCount = (int)locatedCount;
+
         // Dynamic arrays for N-view rendering
-        std::vector<XrCompositionLayerProjectionView> projViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        std::vector<XrCompositionLayerProjectionView> projViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render
         if (frameState.shouldRender && viewCount >= 1) {
@@ -1925,6 +1931,11 @@ int main(int argc, char **argv)
                 projViews[eye].fov = submitFov;
             }
 
+            // ADR-041: fill the inactive tail [eyeCount, locatedCount). Each
+            // keeps its OWN located pose/fov; only the subimage is aliased onto
+            // view 0's, and the runtime discards those pixels.
+            DxrAliasInactiveViews(projViews.data(), views.data(), locatedCount, (uint32_t)eyeCount);
+
             RenderScene(renderer, app.swapchain.images[imageIndex],
                         app.swapchain.width, app.swapchain.height,
                         eyeParams.data(), eyeCount);
@@ -2008,12 +2019,12 @@ int main(int argc, char **argv)
             SubmitWindowSpaceHudFrame(
                 app.session, app.localSpace, frameState.predictedDisplayTime,
                 XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
-                projViews.data(), (uint32_t)eyeCount,
+                projViews.data(), locatedCount,
                 hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
         } else {
             XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             projLayer.space = app.localSpace;
-            projLayer.viewCount = (uint32_t)eyeCount;
+            projLayer.viewCount = locatedCount;
             projLayer.views = projViews.data();
 
             const XrCompositionLayerBaseHeader *layers[] = {

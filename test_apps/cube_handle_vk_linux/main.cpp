@@ -38,6 +38,11 @@
 // Vulkan (invisible windowed, where the ZDP near sits close to the content).
 #include "projection_depth.h"
 
+// ADR-041: DxrAliasInactiveViews — a projection layer must carry every view
+// xrLocateViews returned, so the views this fixed-SBS app does not render
+// alias view 0's subimage.
+#include "dxr_view_config.h"
+
 #include <cmath>
 #include <csignal>
 #include <cstdio>
@@ -2602,17 +2607,29 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            // 2-view SBS. Per-eye RENDER TILE = window × view_scale
-                            // (docs/specs/runtime/multiview-tiling.md §"Swapchain
-                            // images are worst-case sized" + ADR-010/030): the
-                            // swapchain is the worst-case `display × scale` envelope,
-                            // but a WINDOWED app renders `view = window × scale` and
-                            // the compositor crops. Using the frozen recommended tile
-                            // (= display × scale) made the window-relative Kooima fov
-                            // render into a panel-sized tile → oversized + off-center
-                            // when windowed. Query the LIVE window each frame; clamp
-                            // to the swapchain envelope.
+                            // 2-view SBS. Per-eye RENDER TILE = window ×
+                            // view_scale
+                            // (docs/specs/runtime/multiview-tiling.md
+                            // §"Swapchain images are worst-case sized" +
+                            // ADR-010/030): the swapchain is the worst-case
+                            // `display × scale` envelope, but a WINDOWED app
+                            // renders `view = window × scale` and the
+                            // compositor crops. Using the frozen recommended
+                            // tile
+                            // (= display × scale) made the window-relative
+                            // Kooima fov render into a panel-sized tile →
+                            // oversized + off-center when windowed. Query the
+                            // LIVE window each frame; clamp to the swapchain
+                            // envelope.
+                            //
+                            // ADR-041: the layer carries the LOCATED count;
+                            // only the active views are rendered, the tail
+                            // aliases view 0 and the runtime drops it.
+                            const uint32_t locatedCount =
+                                (viewCount > 0) ? viewCount : 2;
                             uint32_t eyeCount = 2;
+                            if (eyeCount > locatedCount)
+                              eyeCount = locatedCount;
                             uint32_t winW = 0, winH = 0;
                             {
                                 XWindowAttributes wa = {};
@@ -2638,7 +2655,7 @@ int main() {
                             if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
 
                             EyeRenderParams eyeParams[2];
-                            projectionViews.resize(eyeCount, {});
+                            projectionViews.resize(locatedCount, {});
                             for (uint32_t i = 0; i < eyeCount; i++) {
                                 eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
                                 eyeParams[i].viewportY = 0;
@@ -2673,6 +2690,12 @@ int main() {
                                 projectionViews[i].pose = views[i].pose;
                                 projectionViews[i].fov = views[i].fov;
                             }
+
+                            // ADR-041: fill the inactive tail — own located
+                            // pose/fov, view 0's subimage.
+                            DxrAliasInactiveViews(projectionViews.data(),
+                                                  views.data(), locatedCount,
+                                                  eyeCount);
 
                             RenderScene(vkRenderer, imageIndex, eyeParams, (int)eyeCount);
                             ReleaseSwapchainImage(xr);

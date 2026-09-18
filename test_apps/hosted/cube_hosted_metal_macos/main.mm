@@ -1135,6 +1135,10 @@ int main(int argc, char **argv)
         // Use current mode's view count (not xrLocateViews count, which is max across all modes)
         uint32_t modeViewCount = (app.currentModeIndex < app.renderingModeCount)
             ? app.renderingModeViewCounts[app.currentModeIndex] : viewCount;
+        // ADR-041: the layer carries the LOCATED count; only modeViewCount of
+        // those views are rendered, and the tail is aliased onto view 0 below.
+        uint32_t locatedCount = (viewCount > 0) ? viewCount : modeViewCount;
+        if (modeViewCount > locatedCount) modeViewCount = locatedCount;
         // Render N views into tile positions using runtime-provided tile layout.
         // Falls back to derived layout if mode enumeration unavailable.
         uint32_t tileColumns = (app.currentModeIndex < app.renderingModeCount)
@@ -1165,7 +1169,7 @@ int main(int argc, char **argv)
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
 
         // End frame
-        std::vector<XrCompositionLayerProjectionView> projViews(modeViewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        std::vector<XrCompositionLayerProjectionView> projViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
         for (uint32_t i = 0; i < modeViewCount; i++) {
             uint32_t tileX = i % tileColumns;
             uint32_t tileY = i / tileColumns;
@@ -1182,9 +1186,14 @@ int main(int argc, char **argv)
             projViews[i].subImage.imageArrayIndex = 0;
         }
 
+        // ADR-041: the inactive tail [modeViewCount, locatedCount) keeps its own
+        // located pose/fov and points at view 0's subimage — content the app did
+        // render, which the runtime discards.
+        DxrAliasInactiveViews(projViews.data(), views.data(), locatedCount, modeViewCount);
+
         XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayer.space = app.localSpace;
-        projLayer.viewCount = modeViewCount;
+        projLayer.viewCount = locatedCount;
         projLayer.views = projViews.data();
 
         const XrCompositionLayerBaseHeader *layers[] = {

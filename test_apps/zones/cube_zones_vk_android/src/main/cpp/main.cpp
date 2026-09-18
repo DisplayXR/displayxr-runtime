@@ -2882,6 +2882,11 @@ render_frame()
 	// app renders/submits the ACTIVE mode's view count; xrLocateViews still
 	// needs capacity for the MAX (g_max_view_count) and returns all of them.
 	const uint32_t submit_views = active_view_count();
+	// ADR-041: the layer carries the LOCATED view count, not just the
+	// active mode's — only `submit_views` are rendered, the tail aliases
+	// view 0 and the runtime drops it. Set from located_view_count on a
+	// rendered frame.
+	uint32_t layer_view_count = submit_views;
 	uint32_t render_w = 0, render_h = 0, cols = 1, rows = 1;
 	active_tile_dims(&render_w, &render_h, &cols, &rows);
 	if (frame_state.shouldRender) {
@@ -3052,6 +3057,13 @@ render_frame()
 					                                                  (int32_t)render_h};
 					projection_views[i].subImage.imageArrayIndex = 0;
 				}
+				// ADR-041: fill the inactive tail — each view
+				// keeps its own located pose/fov, the subimage
+				// aliases view 0's tile.
+				DxrAliasInactiveViews(projection_views, views,
+						      located_view_count,
+						      submit_views);
+				layer_view_count = located_view_count;
 				rendered = true;
 			} else {
 				log_xr_result("atlas acquire/wait/release", res);
@@ -3081,7 +3093,7 @@ render_frame()
 	XrCompositionLayerProjection projection_layer = {};
 	projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 	projection_layer.space = g_app_space;
-	projection_layer.viewCount = submit_views;
+	projection_layer.viewCount = layer_view_count;
 	projection_layer.views = projection_views;
 	// Bind this layer's views to the zone (ADR-027 Decision 3, second chain
 	// point). The SAME struct instance the locate used — a locate/submit rect

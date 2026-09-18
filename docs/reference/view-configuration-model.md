@@ -78,7 +78,7 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** for a core-only app; an `XR_DXR_display_info` app may also submit 1 while the active mode is 1-view | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while the active mode is 1-view: **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`" |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
 > **A core-only app gets exact-2, full stop.** If the instance did not enable
@@ -108,12 +108,54 @@ must handle it needs an explicit `case`.
 > pass. The extension gate closes it.
 >
 > **`PRIMARY_MULTIVIEW_DXR` is the recommended path for any mode-driven count**,
-> including the 1-view case: begin with it and submit the active mode's count
-> without a special case. The relaxation above is back-compatibility for apps
+> including the 1-view case. The relaxation above is back-compatibility for apps
 > already shipping on `PRIMARY_STEREO`.
 >
 > This is the only place the `xrEndFrame` rule consults the active mode; the
 > *reported* counts above still never move on a mode switch.
+
+## Submit the located count, alias the tail (ADR-041)
+
+The counts above are fixed for the session. What changes per frame is how many of
+them the active rendering mode *uses*. ADR-041 separates the two properly:
+
+- `xrLocateViews` publishes `activeViewCount` through **`XrViewActivityStateDXR`**
+  (`XR_DXR_display_info` v21), chained on `XrViewState`.
+- Views `[0, activeViewCount)` carry the active mode's poses/FOVs. Views
+  `[activeViewCount, viewCountOutput)` are **inactive**: located at view 0's pose,
+  and their submitted content is ignored.
+- `xrEndFrame` accepts **exactly the located count**, for every type. An app that
+  renders only the active views points each inactive view at content it already
+  rendered this frame (view 0's subimage) while keeping that view's own located
+  pose/FOV. `DxrAliasInactiveViews()` in `test_apps/common/dxr_view_config.h` is
+  the reference tail fill.
+
+That makes both core sentences hold verbatim — "`viewCount` must be equal to the
+number of view poses returned by `xrLocateViews`" and "all views associated with
+projection layers must be supplied" — with no DisplayXR carve-out. The pre-ADR-041
+`PRIMARY_MULTIVIEW_DXR` rule ("any rendering mode's `viewCount`") contradicted
+both, which is why it is gone.
+
+**A 3D zone layer is a projection layer**: `XR_DXR_display_zones` submits each 3D
+zone as an `XR_TYPE_COMPOSITION_LAYER_PROJECTION` with a zone chained on it, so it
+goes through the same gate and carries the located count too, aliased per zone.
+
+### `DXR_UNDER_SUBMIT`
+
+| value | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
+|---|---|---|
+| `0` strict | the located count (2) | the located count |
+| `1` **default** | the located count, **or** 1 while the active mode is 1-view → accepted + one-shot `U_LOG_W` naming the fix | the located count |
+| `2` kill switch | pre-ADR-041 rule | pre-ADR-041 rule (under-submit accepted) |
+
+Out-of-range values clamp to an end, never to the default. The default flips to
+`0` in the first runtime release after `displayxr-common` and the five
+`displayxr-demo-*` demos ship the alias submission — the trigger is that
+shipment, not a date.
+
+CI stays on the default: a CTS session never enables `XR_DXR_display_info`, and
+the deprecated arm requires it, so conformance is on the strict path at every knob
+value and pinning the switch in `cts.yml` would buy nothing.
 
 Three properties hold under all three types:
 
@@ -143,11 +185,20 @@ Three properties hold under all three types:
   type returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`, and the
   visibility-mask path and its event follow the begun type too.
 
-## The under-submit contract
+## The compositor-side clamp
 
-An app under `PRIMARY_MULTIVIEW_DXR` (or a 2-view app that the workspace put into
-a 4-view mode) may submit **fewer** views than the active mode has tiles. The
-compositor resolves the discrepancy on the content side, per-frame:
+> **This is NOT an API permission any more.** Until ADR-041 this section
+> described a *contract*: an app was allowed to submit fewer views than the
+> active mode has tiles, and `xrEndFrame` accepted it. At the default knob it no
+> longer does — the layer must carry the located count and alias its inactive
+> tail ([above](#submit-the-located-count-alias-the-tail-adr-041)). What survives
+> is the **compositor-side clamp** below, which is now defence in depth rather
+> than the mechanism an app relies on: it is what makes the aliased tail free,
+> and what keeps a one-frame skew across a mode change harmless. Only
+> `DXR_UNDER_SUBMIT=2` restores the old API permission.
+
+The compositor resolves any discrepancy between what a layer carries and what
+the active mode has tiles for, on the content side, per-frame:
 
 ```c
 // comp_d3d11_renderer.cpp — comp_d3d11_renderer_compute_effective_layout()
@@ -156,9 +207,13 @@ if (views > mode_tiles) views = mode_tiles;   // never the other way round
 ```
 
 - `views == 1` → one tile spanning the full content region; the DP flat-blits a
-  1×1 grid. This is how an always-stereo app behaves correctly in a 2D mode.
+  1×1 grid. This is how an always-stereo app behaves correctly in a 2D mode —
+  under ADR-041 it gets there by the clamp dropping the aliased tail, not by the
+  app submitting one view.
 - `1 < views < mode_tiles` → the **mode's** grid, with the app painting the first
-  `views` tiles (a 2-view app in a 2×2 quad mode paints tiles 0 and 1).
+  `views` tiles (a 2-view app in a 2×2 quad mode paints tiles 0 and 1). Reachable
+  when the located count itself is narrower than the mode, which is exactly what
+  the mode floor ([below](#the-mode-floor-1499)) exists to prevent.
 
 Same rule, same shape, on every backend:
 `comp_d3d12_renderer_compute_effective_layout`,
@@ -181,7 +236,7 @@ On `sim_display`'s 2×2 Quad they are the symmetric half-IPD pair —
 `view_eye_offsets[0..1] = {±ipd/2, eye_y, eye_z}`, with the upper row carried by
 `[2..3]` at `eye_y + ipd` (`sim_display_device.c:811-815`). So the app's *eyes*
 are correct; what it loses is the **unpainted upper row**, left at the clear
-colour by the compositor's under-submit clamp. A device that laid its fan out
+colour by the compositor-side clamp. A device that laid its fan out
 differently could hand the narrower type an asymmetric pair — the runtime does
 not synthesise a centred one — but that is not what the one N-view device we
 have does, and an earlier revision of this page asserted the opposite.
@@ -266,7 +321,7 @@ sample. The clamp, the 1 Hz throttle and the doorbell all follow from there.
   the view count being known.)
 - **A device that PINS its mode** (`SIM_DISPLAY_FORCE_MODE`). The pin exists to
   hold a mode against every later request — which is exactly what keeps the
-  N-view under-submit path testable at all.
+  N-view narrow-submission path testable at all.
 - **Service mode.** The panel lease, not this session, owns the display-global
   mode (ADR-035 D2). A client must not yank it from a workspace controller or
   another client.
@@ -281,8 +336,8 @@ Getting that asymmetry wrong was the first cut of this change; the two sites now
 share one helper (`oxr_session_may_move_display_mode()`) so they cannot drift
 apart again.
 
-In both cases the under-submit clamp stands, and the runtime says so instead of
-clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering mode
+In both cases the compositor-side clamp stands, and the runtime says so instead
+of clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering mode
 (#1499)`, and a later display-global mode change into an unfillable mode logs
 once more as it lands.
 

@@ -3026,8 +3026,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 			if (mode != NULL && mode->view_count <= XRT_MAX_VIEWS) {
 				uint32_t vc = mode->view_count;
-				// All views must reference the same swapchain
-				bool same_sc = (vc > 0 && layer->sc_array[0] != NULL);
+				// All views must reference the same swapchain.
+				//
+				// ADR-041: the submission must COVER the mode. Every loop
+				// below reads proj.v[0..vc), so a layer carrying FEWER views
+				// than the mode has tiles (PRIMARY_STEREO in a quad mode)
+				// would read slots the app never wrote. `>=`, not `==`: the
+				// aliased inactive tail is legal and simply unread, and
+				// u_tiling_can_zero_copy() stays the sole eligibility gate.
+				bool same_sc = (vc > 0 && layer->data.view_count >= vc && layer->sc_array[0] != NULL);
 				for (uint32_t v = 1; v < vc && same_sc; v++) {
 					if (layer->sc_array[v] != layer->sc_array[0])
 						same_sc = false;
