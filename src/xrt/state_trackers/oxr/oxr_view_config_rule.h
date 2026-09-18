@@ -48,6 +48,34 @@
  * so refusing the layer the app was told to build would make the rollback
  * incomplete.
  *
+ * ADR-041 (Model E) puts a THIRD decision in front of both of those. The view
+ * count a session sees is FIXED for its lifetime (what the begun view
+ * configuration reports, R); what varies per frame is how many of those views
+ * are ACTIVE (A, the active rendering mode's count clamped to R, published to
+ * the app as XrViewActivityStateDXR::activeViewCount). The app therefore
+ * submits exactly R views always, aliasing the inactive tail [A, R) onto any
+ * subimage it rendered this frame — which is what core OpenXR already demands
+ * ("XrCompositionLayerProjection::viewCount must be equal to the number of view
+ * poses returned by xrLocateViews", and "All views associated with projection
+ * layers must be supplied, or XR_ERROR_VALIDATION_FAILURE must be returned by
+ * xrEndFrame"). Under-submitting to PRIMARY_MULTIVIEW_DXR contradicted both
+ * sentences, so it goes.
+ *
+ * @ref oxr_projection_view_count_verdict is that rule, parameterised on the
+ * DXR_UNDER_SUBMIT switch so the removal is staged rather than abrupt:
+ *
+ *   | DXR_UNDER_SUBMIT | PRIMARY_STEREO          | PRIMARY_MULTIVIEW_DXR |
+ *   |------------------|-------------------------|-----------------------|
+ *   | 0 strict         | == R (2)                | == R (device max)     |
+ *   | 1 DEFAULT        | == R, or 1 (DEPRECATED, | == R                  |
+ *   |                  | ext + active mode 1-view)|                      |
+ *   | 2 kill switch    | pre-ADR-041 tight rule  | pre-ADR-041 permissive|
+ *
+ * The 1-view arm survives at the default ONLY because RELEASED demos submit one
+ * view in 2D mode; it answers OXR_VIEW_COUNT_OK_DEPRECATED so the caller can
+ * log it once per session. It is unreachable from a CTS run either way — a
+ * conformance session never enables XR_DXR_display_info, which the arm requires.
+ *
  * Both are pure integer decisions with no runtime dependency, so they are pinned
  * on the host (tests/tests_oxr_view_config_rule.cpp) — the real entry point
  * needs a session, a compositor and a submitted frame, none of which a headless
@@ -117,6 +145,110 @@ oxr_view_count_ok_for_multiview(uint32_t submitted, const uint32_t *mode_view_co
 		}
 	}
 	return false;
+}
+
+/*!
+ * ADR-041 staging switch: how much less than the located view count xrEndFrame
+ * still accepts. Latched from DXR_UNDER_SUBMIT.
+ */
+enum oxr_under_submit_mode
+{
+	//! Every type submits exactly the located count. No relaxation at all.
+	OXR_UNDER_SUBMIT_STRICT = 0,
+	//! DEFAULT: as STRICT, plus the deprecated PRIMARY_STEREO 1-view arm.
+	OXR_UNDER_SUBMIT_COMPAT = 1,
+	//! Kill switch: the pre-ADR-041 rules, including MULTIVIEW under-submit.
+	OXR_UNDER_SUBMIT_LEGACY = 2,
+};
+
+/*!
+ * The answer, with "accepted but on the way out" kept distinct from "accepted"
+ * so the caller can warn exactly once instead of silently blessing it.
+ */
+enum oxr_view_count_verdict
+{
+	OXR_VIEW_COUNT_OK = 0,
+	OXR_VIEW_COUNT_OK_DEPRECATED = 1,
+	OXR_VIEW_COUNT_REJECT = 2,
+};
+
+/*!
+ * Map the raw DXR_UNDER_SUBMIT value onto the switch. Out-of-range clamps
+ * rather than falls back to the default, so DXR_UNDER_SUBMIT=99 is the kill
+ * switch and DXR_UNDER_SUBMIT=-1 is strict — a typo can never silently land on
+ * "whatever the default was".
+ *
+ * Pure, so the env plumbing (DEBUG_GET_ONCE_NUM_OPTION, which caches per
+ * process) is not what the host tests have to drive.
+ */
+static inline enum oxr_under_submit_mode
+oxr_under_submit_from_setting(long value)
+{
+	if (value <= 0) {
+		return OXR_UNDER_SUBMIT_STRICT;
+	}
+	if (value >= 2) {
+		return OXR_UNDER_SUBMIT_LEGACY;
+	}
+	return OXR_UNDER_SUBMIT_COMPAT;
+}
+
+/*!
+ * ADR-041: the projection-layer viewCount rule for the two view configuration
+ * types whose count is not a constant. PRIMARY_MONO / QUAD_VARJO / the MSFT
+ * secondary observer keep their fixed core counts and never reach here, and
+ * neither does the DXR_VIEW_CONFIG_LEGACY (#1486) rollback, which is a separate
+ * switch that restores the permissive rule wholesale.
+ *
+ * @param submitted               The layer's viewCount.
+ * @param reported                R — what xrLocateViews returned this session:
+ *                                2 under PRIMARY_STEREO, the device max under
+ *                                PRIMARY_MULTIVIEW_DXR.
+ * @param is_multiview            Was the session begun with
+ *                                PRIMARY_MULTIVIEW_DXR?
+ * @param active_mode_view_count  A — views in the currently active rendering
+ *                                mode. Callers that cannot determine it pass 2,
+ *                                which never loosens anything.
+ * @param display_info_enabled    Did the INSTANCE enable XR_DXR_display_info?
+ *                                False for every core-only app, including every
+ *                                CTS session.
+ * @param mode_view_counts        One entry per rendering mode; may be NULL.
+ *                                Only read under OXR_UNDER_SUBMIT_LEGACY.
+ * @param mode_count              Entries in @p mode_view_counts.
+ * @param under_submit            The staging switch.
+ */
+static inline enum oxr_view_count_verdict
+oxr_projection_view_count_verdict(uint32_t submitted,
+                                  uint32_t reported,
+                                  bool is_multiview,
+                                  uint32_t active_mode_view_count,
+                                  bool display_info_enabled,
+                                  const uint32_t *mode_view_counts,
+                                  uint32_t mode_count,
+                                  enum oxr_under_submit_mode under_submit)
+{
+	if (under_submit == OXR_UNDER_SUBMIT_LEGACY) {
+		// Exactly what shipped before ADR-041.
+		const bool ok = is_multiview ? oxr_view_count_ok_for_multiview(submitted, mode_view_counts, mode_count)
+		                             : oxr_view_count_ok_for_stereo(submitted, active_mode_view_count,
+		                                                            display_info_enabled);
+		return ok ? OXR_VIEW_COUNT_OK : OXR_VIEW_COUNT_REJECT;
+	}
+
+	// The core rule, and it is the same sentence for both types: submit what
+	// xrLocateViews handed you.
+	if (reported > 0 && submitted == reported) {
+		return OXR_VIEW_COUNT_OK;
+	}
+
+	// The one compat arm. MULTIVIEW never gets it: nothing released
+	// under-submits there, so there is no compat window to hold open.
+	if (under_submit == OXR_UNDER_SUBMIT_COMPAT && !is_multiview && submitted == 1 && active_mode_view_count == 1 &&
+	    display_info_enabled) {
+		return OXR_VIEW_COUNT_OK_DEPRECATED;
+	}
+
+	return OXR_VIEW_COUNT_REJECT;
 }
 
 #ifdef __cplusplus

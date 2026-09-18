@@ -209,3 +209,113 @@ TEST_CASE("where the two rules differ, stated honestly (#1486)", "[oxr][view_con
 		CHECK(oxr_view_count_ok_for_multiview(4, kSimDisplayModes, kSimDisplayModeCount));
 	}
 }
+
+/*
+ * ADR-041 (Model E). The two rules above are now the LEGACY arm of one rule:
+ * the view count is fixed for the session's lifetime and the app submits it
+ * whole, aliasing the tail the runtime does not read.
+ */
+
+TEST_CASE("DXR_UNDER_SUBMIT maps by clamping, never by falling back (ADR-041)", "[oxr][view_config_rule]")
+{
+	CHECK(oxr_under_submit_from_setting(0) == OXR_UNDER_SUBMIT_STRICT);
+	CHECK(oxr_under_submit_from_setting(1) == OXR_UNDER_SUBMIT_COMPAT);
+	CHECK(oxr_under_submit_from_setting(2) == OXR_UNDER_SUBMIT_LEGACY);
+
+	// A typo must not land on the default silently — it clamps to an end.
+	CHECK(oxr_under_submit_from_setting(-1) == OXR_UNDER_SUBMIT_STRICT);
+	CHECK(oxr_under_submit_from_setting(99) == OXR_UNDER_SUBMIT_LEGACY);
+}
+
+TEST_CASE("ADR-041: every type submits the located count, at every knob value", "[oxr][view_config_rule]")
+{
+	// R under PRIMARY_STEREO is ALWAYS 2; under PRIMARY_MULTIVIEW_DXR it is the
+	// device max (4 for sim_display, 2 for a stereo-only panel).
+	const enum oxr_under_submit_mode knobs[] = {OXR_UNDER_SUBMIT_STRICT, OXR_UNDER_SUBMIT_COMPAT,
+	                                            OXR_UNDER_SUBMIT_LEGACY};
+
+	SECTION("submitting exactly R is always OK — the whole point of the model")
+	{
+		for (auto k : knobs) {
+			INFO("knob = " << (int)k);
+			// STEREO, R = 2, in a 1-view mode (the aliased tail) and in a
+			// 2-view one.
+			CHECK(oxr_projection_view_count_verdict(2, 2, false, 1, true, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_OK);
+			CHECK(oxr_projection_view_count_verdict(2, 2, false, 2, true, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_OK);
+			// ...and for a CORE-ONLY app, which never has the extension.
+			CHECK(oxr_projection_view_count_verdict(2, 2, false, 1, false, nullptr, 0, k) ==
+			      OXR_VIEW_COUNT_OK);
+
+			// MULTIVIEW_DXR, R = 4, whatever the active mode is.
+			CHECK(oxr_projection_view_count_verdict(4, 4, true, 1, true, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_OK);
+			CHECK(oxr_projection_view_count_verdict(4, 4, true, 2, true, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_OK);
+		}
+	}
+
+	SECTION("MULTIVIEW under-submit dies at the default and lives only under the kill switch")
+	{
+		// The contradiction ADR-041 removes: a 4-view session submitting 2
+		// because the panel happens to be in a stereo mode. Core OpenXR says
+		// all located views must be supplied.
+		CHECK(oxr_projection_view_count_verdict(2, 4, true, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(2, 4, true, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(2, 4, true, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_LEGACY) == OXR_VIEW_COUNT_OK);
+
+		// One view is the same story.
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(1, 4, true, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_LEGACY) == OXR_VIEW_COUNT_OK);
+	}
+
+	SECTION("the ONE compat arm: PRIMARY_STEREO + extension + 1-view mode, and it is marked")
+	{
+		// Released demos submit one view in 2D mode; the arm is what keeps
+		// them running, and OK_DEPRECATED is what gets that fact into the log
+		// exactly once instead of blessing it silently.
+		CHECK(oxr_projection_view_count_verdict(1, 2, false, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_OK_DEPRECATED);
+
+		// Strict drops it, BY DEFINITION — that is what "0" means.
+		CHECK(oxr_projection_view_count_verdict(1, 2, false, 1, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+
+		// Both halves of the #1486 gate survive into the compat arm.
+		// No extension (every CTS session) -> reject whatever the mode.
+		CHECK(oxr_projection_view_count_verdict(1, 2, false, 1, false, nullptr, 0, OXR_UNDER_SUBMIT_COMPAT) ==
+		      OXR_VIEW_COUNT_REJECT);
+		// Extension, but the active mode is not 1-view -> reject.
+		CHECK(oxr_projection_view_count_verdict(1, 2, false, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+	}
+
+	SECTION("THE CTS PATH: viewCount-- under PRIMARY_STEREO is refused at every knob value")
+	{
+		// test_XrCompositionLayerProjection.cpp:225-230 locates the views, does
+		// `Layer.viewCount--` and CHECKs for XR_ERROR_VALIDATION_FAILURE. A CTS
+		// session never enables XR_DXR_display_info, so the compat arm — which
+		// requires it — is unreachable there and the knob cannot open a hole.
+		for (auto k : knobs) {
+			INFO("knob = " << (int)k);
+			CHECK(oxr_projection_view_count_verdict(1, 2, false, 1, false, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_REJECT);
+			CHECK(oxr_projection_view_count_verdict(1, 2, false, 2, false, kSimDisplayModes,
+			                                        kSimDisplayModeCount, k) == OXR_VIEW_COUNT_REJECT);
+		}
+	}
+
+	SECTION("over-submitting past R is refused too — R is FIXED, not a floor")
+	{
+		CHECK(oxr_projection_view_count_verdict(4, 2, false, 4, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_COMPAT) == OXR_VIEW_COUNT_REJECT);
+		CHECK(oxr_projection_view_count_verdict(3, 2, false, 2, true, kSimDisplayModes, kSimDisplayModeCount,
+		                                        OXR_UNDER_SUBMIT_STRICT) == OXR_VIEW_COUNT_REJECT);
+	}
+}

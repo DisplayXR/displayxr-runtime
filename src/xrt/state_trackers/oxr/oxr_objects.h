@@ -2671,6 +2671,14 @@ struct oxr_session
 	XrViewConfigurationType view_config_type;
 	uint32_t view_config_view_count;
 
+	/*!
+	 * ADR-041: has this session already been told its projection submission
+	 * uses the deprecated PRIMARY_STEREO 1-view arm? The warning names the
+	 * fix, so it is worth exactly once per session and would be ruinous per
+	 * frame (this is the xrEndFrame hot path).
+	 */
+	bool warned_under_submit_deprecated;
+
 	//! What graphics type was this session created with.
 	enum oxr_session_graphics_ext gfx_ext;
 
