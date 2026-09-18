@@ -752,7 +752,7 @@ views; this type is how an application reaches the rest.
 | Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
 | `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
 | `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
-| `xrEndFrame` projection `viewCount` | **exactly 2** for a core-only app; an instance that enabled this extension may also submit 1 while the active rendering mode is 1-view (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` | **exactly 2** for a core-only app; an instance that enabled this extension may also submit 1 while a 1-view rendering mode is in play — the mode active now, or the one active when this frame's `xrBeginFrame` was called (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
 
 - **Fixed per instance.** The count this type reports is the device maximum across modes
   (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
@@ -774,7 +774,7 @@ views; this type is how an application reaches the rest.
   and checks for that error.
 
   An instance that **did** enable this extension may additionally submit `viewCount == 1`
-  **while the active rendering mode is itself 1-view** — the 2D/mono submission path
+  **while a 1-view rendering mode is in play** — the 2D/mono submission path
   described under *Mono Submission in 2D Mode* below. Both halves are required. The
   extension gate is not bureaucracy: a core-only app cannot enumerate a rendering mode,
   request one, or be told the active one changed, so a relaxation scoped to the active
@@ -782,6 +782,18 @@ views; this type is how an application reaches the rest.
   (Gating on the mode alone was tried and failed the conformance suite outright: a CTS
   session is treated as a legacy session, and the reference display sits in a 1-view mode
   for essentially the whole run, so the exception was open throughout.)
+
+  **"In play" spans the frame, not just the instant of `xrEndFrame`.** A rendering-mode
+  switch is asynchronous with respect to the application's frame loop: a 2D→3D switch can
+  land after the app called `xrBeginFrame` and rendered the single view the 1-view mode
+  called for, but before it submits. The runtime therefore judges `viewCount == 1` against
+  the active mode **or** the mode that was active at this frame's `xrBeginFrame`, whichever
+  permits it. The allowance is one frame wide — the next `xrBeginFrame` re-latches, so an
+  application that keeps submitting a single view once the 3D mode is established still
+  gets `XR_ERROR_VALIDATION_FAILURE`. This is behaviour only: no new struct, enum or
+  `SPEC_VERSION`. (The runtime owns the switch, so the runtime absorbs the edge; the
+  alternative — every application re-rendering the in-flight frame with two views —
+  exports a runtime race to every consumer.)
 
   **The recommended path for any mode-driven count is `PRIMARY_MULTIVIEW_DXR`**,
   including the 1-view case: begin with it and submit the active mode's count with no
@@ -934,7 +946,9 @@ significant quality improvement for 2D content.
   mode's views; the application uses the returned eye positions to compute a center-eye camera
   position (or any position it chooses). (See the multiview model — the render/submit loop is
   bounded by the active mode's `viewCount`, not a hardcoded 2.)
-- `xrEndFrame` accepts `viewCount == 1` projection layers when the active mode is a 2D/mono mode.
+- `xrEndFrame` accepts `viewCount == 1` projection layers when the active mode is a 2D/mono mode,
+  and for the one frame that was *begun* in such a mode when the switch out of it lands
+  mid-frame (see *"In play" spans the frame* under the `xrEndFrame` rule above).
   This whole section presumes the instance enabled `XR_DXR_display_info` — it is the
   extension that makes the mode observable, and under `PRIMARY_STEREO` the allowance is
   scoped to instances that enabled it (see the `xrEndFrame` rule above).

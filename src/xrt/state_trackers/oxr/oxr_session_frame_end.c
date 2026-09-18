@@ -696,6 +696,13 @@ verify_projection_view_count(struct oxr_session *sess,
 		active_mode_view_count = head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
 	}
 
+	// #1528: ...and the mode this frame was BEGUN under, latched by
+	// oxr_session_frame_begin(). The app rendered the frame it was told about at
+	// xrBeginFrame; the runtime owns the mode switch, so it owes the one
+	// in-flight frame that a 2D->3D crossing catches mid-render. 0 = never
+	// latched, which contributes nothing and leaves the rule as it was.
+	const uint32_t begun_mode_view_count = sess->frame_begin_mode_view_count;
+
 	// ...and whether the app can OBSERVE that mode at all. A core-only app
 	// cannot enumerate, request or be told about a rendering mode, so the
 	// 1-view relaxation must not apply to it — which is also what keeps the
@@ -753,23 +760,29 @@ verify_projection_view_count(struct oxr_session *sess,
 		 * is now refused instead of silently accepted because some rendering
 		 * mode happened to have that count.
 		 *
-		 * ONE view is legal only for an XR_DXR_display_info app whose active
-		 * mode is 1-view (2D/mono) - the app that legitimately submits one,
-		 * and the only one that can even tell. For a core-only app, which is
-		 * every CTS session, it is exactly 2 whatever mode the panel is in:
+		 * ONE view is legal only for an XR_DXR_display_info app for which a
+		 * 1-view (2D/mono) mode is in play - the app that legitimately submits
+		 * one, and the only one that can even tell. For a core-only app, which
+		 * is every CTS session, it is exactly 2 whatever mode the panel is in:
 		 * the XrCompositionLayerProjection test decrements the located count
 		 * and CHECKs for XR_ERROR_VALIDATION_FAILURE.
+		 *
+		 * #1528: "in play" is the mode active NOW or the one latched at this
+		 * frame's xrBeginFrame, so the single frame a 2D->3D switch catches
+		 * in flight is granted rather than dropped.
 		 */
-		if (!oxr_view_count_ok_for_stereo(proj->viewCount, active_mode_view_count, display_info_enabled)) {
+		if (!oxr_view_count_ok_for_stereo(proj->viewCount, active_mode_view_count, begun_mode_view_count,
+		                                  display_info_enabled)) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 			                 "(frameEndInfo->layers[%u]->viewCount == %u) "
 			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO accepts exactly 2 views "
-			                 "(an app that enabled XR_DXR_display_info may submit 1 while the "
-			                 "active mode is 1-view; this instance %s and the active mode has "
-			                 "%u); N-view needs XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
+			                 "(an app that enabled XR_DXR_display_info may submit 1 while a "
+			                 "1-view mode is in play; this instance %s, the active mode has %u "
+			                 "and the mode latched at xrBeginFrame had %u); N-view needs "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
 			                 layer_index, proj->viewCount,
 			                 display_info_enabled ? "enabled it" : "did NOT enable it",
-			                 active_mode_view_count);
+			                 active_mode_view_count, begun_mode_view_count);
 		}
 		break;
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
