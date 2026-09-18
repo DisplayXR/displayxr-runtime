@@ -3233,12 +3233,22 @@ _update_projection_layer_depth(struct xrt_compositor *xc,
 		return false;
 	}
 
+	// #1486: bound the layer's own view count before it indexes anything, like
+	// the projection and zone-3D variants do. The client writes 2*view_count
+	// swapchain ids here (colour then depth), so an out-of-range count would
+	// walk off both the xcs[]/d_xcs[] arrays and layer->swapchain_ids[].
+	uint32_t view_count = data->view_count;
+	if (view_count > XRT_MAX_VIEWS) {
+		U_LOG_E("Invalid view count %u for projection layer #%u!", view_count, i);
+		return false;
+	}
+
 	struct xrt_swapchain *xcs[XRT_MAX_VIEWS];
 	struct xrt_swapchain *d_xcs[XRT_MAX_VIEWS];
 
-	for (uint32_t j = 0; j < data->view_count; j++) {
+	for (uint32_t j = 0; j < view_count; j++) {
 		int xsci = layer->swapchain_ids[j];
-		int d_xsci = layer->swapchain_ids[j + data->view_count];
+		int d_xsci = layer->swapchain_ids[j + view_count];
 
 		xcs[j] = ics->xscs[xsci];
 		d_xcs[j] = ics->xscs[d_xsci];
