@@ -111,6 +111,32 @@ legacy_switch_set()
 	return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
 }
 
+/*!
+ * #1499: is the plug-in's default rendering mode a >2-view one for THIS process?
+ *
+ * The mode floor is only observable on a device whose active mode a stereo
+ * session cannot fill, and the only such device is sim-display in its Quad
+ * mode. That is chosen by `SIM_DISPLAY_OUTPUT=quad` at plug-in load, so it has
+ * to be a process-level fact - hence the separate ctest registrations in
+ * tests/CMakeLists.txt (`tests_oxr_view_space_mode_floor` /
+ * `_mode_pinned`). Under the plain registration these arms have nothing to
+ * observe and say so.
+ */
+bool
+sim_quad_requested()
+{
+	const char *v = std::getenv("SIM_DISPLAY_OUTPUT");
+	return v != nullptr && std::strcmp(v, "quad") == 0;
+}
+
+//! #1499: is SIM_DISPLAY_FORCE_MODE armed (the device PINS its mode)?
+bool
+sim_mode_pinned()
+{
+	const char *v = std::getenv("SIM_DISPLAY_FORCE_MODE");
+	return v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0;
+}
+
 /*
  *
  * Minimal pose math (float, matches the runtime's own conventions).
@@ -340,32 +366,94 @@ struct Runtime
 		return n;
 	}
 
-	//! The device's MAX view count across rendering modes, READ from the
-	//! runtime (XR_DXR_display_info) rather than assumed. 0 when unavailable.
-	uint32_t
-	device_max_view_count()
+	//! The device's rendering-mode table as this session sees it. Empty when
+	//! XR_DXR_display_info is not enabled on the instance.
+	std::vector<XrDisplayRenderingModeInfoDXR>
+	rendering_modes()
 	{
 		if (!have_display_info) {
-			return 0;
+			return {};
 		}
 		auto pfn = fn<PFN_xrEnumerateDisplayRenderingModesDXR>("xrEnumerateDisplayRenderingModesDXR");
 		uint32_t n = 0;
 		if (XR_FAILED(pfn(session, 0, &n, nullptr)) || n == 0) {
-			return 0;
+			return {};
 		}
 		XrDisplayRenderingModeInfoDXR proto{};
 		proto.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		std::vector<XrDisplayRenderingModeInfoDXR> modes(n, proto);
 		if (XR_FAILED(pfn(session, n, &n, modes.data()))) {
-			return 0;
+			return {};
 		}
+		modes.resize(n);
+		return modes;
+	}
+
+	//! The device's MAX view count across rendering modes, READ from the
+	//! runtime (XR_DXR_display_info) rather than assumed. 0 when unavailable.
+	uint32_t
+	device_max_view_count()
+	{
 		uint32_t max = 0;
-		for (uint32_t i = 0; i < n; i++) {
-			if (modes[i].viewCount > max) {
-				max = modes[i].viewCount;
+		for (const XrDisplayRenderingModeInfoDXR &m : rendering_modes()) {
+			if (m.viewCount > max) {
+				max = m.viewCount;
 			}
 		}
 		return max;
+	}
+
+	/*!
+	 * #1499: the ACTIVE mode, read back through the public API
+	 * (`isActive`) rather than from any runtime-internal state. Returns
+	 * false when nothing claims to be active.
+	 */
+	bool
+	active_mode(XrDisplayRenderingModeInfoDXR *out)
+	{
+		for (const XrDisplayRenderingModeInfoDXR &m : rendering_modes()) {
+			if (m.isActive == XR_TRUE) {
+				if (out != nullptr) {
+					*out = m;
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! #1499: index of the first mode with more than @p max_views views, or -1.
+	int32_t
+	first_unfillable_mode(uint32_t max_views)
+	{
+		for (const XrDisplayRenderingModeInfoDXR &m : rendering_modes()) {
+			if (m.viewCount > max_views) {
+				return (int32_t)m.modeIndex;
+			}
+		}
+		return -1;
+	}
+
+	/*!
+	 * #1499: drain the event queue, keeping every event of interest. The
+	 * runtime pushes onto an INSTANCE queue, so this is the only way to
+	 * observe the mode change the floor performs during xrBeginSession.
+	 */
+	std::vector<XrEventDataBuffer>
+	drain_events()
+	{
+		auto pfn = fn<PFN_xrPollEvent>("xrPollEvent");
+		std::vector<XrEventDataBuffer> out;
+		for (int i = 0; i < 64; i++) {
+			XrEventDataBuffer ev{};
+			ev.type = XR_TYPE_EVENT_DATA_BUFFER;
+			XrResult r = pfn(instance, &ev);
+			if (r != XR_SUCCESS) {
+				break;
+			}
+			out.push_back(ev);
+		}
+		return out;
 	}
 
 	XrVector3f
@@ -1065,6 +1153,166 @@ TEST_CASE("DXR_VIEW_CONFIG_LEGACY restores the pre-#1486 mapping", "[oxr][view_s
 	// rather than as a validation failure.
 	CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, nullptr) ==
 	      XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
+
+	tear_down(rt);
+}
+
+/*
+ * #1499 — the mode floor, end to end through the public API.
+ *
+ * SEPARATE PROCESSES by construction, like the #1486 kill-switch arm above:
+ * which mode sim-display comes up in is decided by `SIM_DISPLAY_OUTPUT` when
+ * the plug-in is loaded, and `SIM_DISPLAY_FORCE_MODE` is read through
+ * DEBUG_GET_ONCE_NUM_OPTION, so one binary cannot host both the floored and the
+ * pinned case. tests/CMakeLists.txt registers this file twice more:
+ * `tests_oxr_view_space_mode_floor` (SIM_DISPLAY_OUTPUT=quad, tag
+ * `[mode_floor]`) and `tests_oxr_view_space_mode_pinned`
+ * (SIM_DISPLAY_FORCE_MODE=4, tag `[mode_pinned]`).
+ *
+ * Under the plain registration these cases have no >2-view active mode to
+ * observe, so they SUCCEED with a WARN — deliberately not a Catch2 SKIP, for
+ * the same reason as the #1486 arms (build-windows.yml reads any "SKIPPED:"
+ * from this binary as "the headless runtime did not come up").
+ */
+TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "[oxr][view_space][mode_floor]")
+{
+	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+		WARN(
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
+		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		SUCCEED("not the mode-floor process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	REQUIRE(device_max > 2); // SIM_DISPLAY_OUTPUT=quad must have taken.
+	INFO("device max view count across rendering modes = " << device_max);
+
+	SECTION("after xrBeginSession the active mode is one this session can fill")
+	{
+		XrDisplayRenderingModeInfoDXR active{};
+		REQUIRE(rt.active_mode(&active));
+		INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount "
+		                    << active.viewCount);
+		// THE assertion: a 2-view session is not left sitting in Quad.
+		CHECK(active.viewCount <= 2);
+		// ...and it kept 3D rather than falling back to the 2D mode, because
+		// sim-display has 2-view 3D modes to fall back to.
+		CHECK(active.hardwareDisplay3D == XR_TRUE);
+	}
+
+	SECTION("the app is TOLD, so a cached isActive cannot go stale")
+	{
+		// Apps enumerate the modes before xrBeginSession, so the floor has to
+		// announce itself; the event is queued during xrBeginSession and this
+		// is the first poll.
+		bool saw_mode_change = false;
+		uint32_t changed_to = 0;
+		for (const XrEventDataBuffer &ev : rt.drain_events()) {
+			if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+				const auto *rm = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
+				saw_mode_change = true;
+				changed_to = rm->currentModeIndex;
+				INFO("rendering mode changed " << rm->previousModeIndex << " -> "
+				                               << rm->currentModeIndex);
+			}
+		}
+		REQUIRE(saw_mode_change);
+
+		XrDisplayRenderingModeInfoDXR active{};
+		REQUIRE(rt.active_mode(&active));
+		// The event and the enumerator agree - the whole point of pushing it.
+		CHECK(changed_to == active.modeIndex);
+	}
+
+	tear_down(rt);
+}
+
+TEST_CASE("a PRIMARY_MULTIVIEW_DXR session keeps the >2-view mode (#1499)", "[oxr][view_space][mode_floor]")
+{
+	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+		WARN(
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
+		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		SUCCEED("not the mode-floor process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	REQUIRE(device_max > 2);
+
+	// The invariant: an app that opted into the device's full width is not
+	// narrowed. If this ever fails, #1499 took capability away from exactly
+	// the apps #1486 added it for.
+	XrDisplayRenderingModeInfoDXR active{};
+	REQUIRE(rt.active_mode(&active));
+	INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount " << active.viewCount);
+	CHECK(active.viewCount == device_max);
+
+	// ...and no floor event was pushed.
+	for (const XrEventDataBuffer &ev : rt.drain_events()) {
+		CHECK(ev.type != XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR);
+	}
+
+	tear_down(rt);
+}
+
+TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_space][mode_pinned]")
+{
+	if (legacy_switch_set() || !sim_mode_pinned()) {
+		WARN(
+		    "this arm needs SIM_DISPLAY_FORCE_MODE=4 - see tests_oxr_view_space_mode_pinned "
+		    "in tests/CMakeLists.txt");
+		SUCCEED("not the pinned process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	/*
+	 * The dev pin exists to hold a mode against every later request, which is
+	 * what keeps the N-view under-submit path testable at all. So the floor is
+	 * NOT applied, the session stays in Quad, the under-submit clamp stands -
+	 * and xrBeginSession logged the UNFILLABLE warning naming #1499. (The log
+	 * line itself is not asserted here; the observable fact is that the mode
+	 * did not move.)
+	 */
+	XrDisplayRenderingModeInfoDXR active{};
+	REQUIRE(rt.active_mode(&active));
+	INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount " << active.viewCount);
+	CHECK(active.modeIndex == 4u); // SIM_DISPLAY_FORCE_MODE=4, Quad
+	CHECK(active.viewCount > 2);
 
 	tear_down(rt);
 }

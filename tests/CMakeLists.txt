@@ -220,6 +220,28 @@ if(TARGET tests_oxr_view_space)
 	set_tests_properties(
 		tests_oxr_view_space_legacy PROPERTIES ENVIRONMENT "DXR_VIEW_CONFIG_LEGACY=1"
 		)
+
+	# #1499 -- the mode floor, in two MORE processes of the same binary, for the
+	# same reason as the legacy run above: which mode sim-display comes up in is
+	# decided by SIM_DISPLAY_OUTPUT when the plug-in is loaded, and
+	# SIM_DISPLAY_FORCE_MODE is read through DEBUG_GET_ONCE_NUM_OPTION, so one
+	# process cannot host both the floored and the pinned case. Both arms
+	# SUCCEED with a WARN (never a Catch2 SKIP -- build-windows.yml reads any
+	# "SKIPPED:" from this binary as "the headless runtime did not come up")
+	# when their variable is absent, so the plain registration above pins
+	# nothing here and stays green on a box with no >2-view mode.
+	add_test(NAME tests_oxr_view_space_mode_floor
+		 COMMAND tests_oxr_view_space "[mode_floor]" --success --allow-running-no-tests
+		)
+	set_tests_properties(
+		tests_oxr_view_space_mode_floor PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad"
+		)
+	add_test(NAME tests_oxr_view_space_mode_pinned
+		 COMMAND tests_oxr_view_space "[mode_pinned]" --success --allow-running-no-tests
+		)
+	set_tests_properties(
+		tests_oxr_view_space_mode_pinned PROPERTIES ENVIRONMENT "SIM_DISPLAY_FORCE_MODE=4"
+		)
 endif()
 
 # #1380 — the sim_input scripted NAVIGATION device: the hardware-free reference

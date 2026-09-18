@@ -82,6 +82,7 @@
 #include "oxr_pretty_print.h"
 #include "oxr_conversions.h"
 #include "oxr_xret.h"
+#include "oxr_legacy_mode_rule.h" // #1510/#1499 mode floor
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -988,6 +989,17 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			uint32_t default_mode = head->hmd->active_rendering_mode_index;
 
 			/*
+			 * #1499: which of the two mode floors applies. A LEGACY app
+			 * (no XR_DXR_display_info) was sized by oxr_system_fill_in()
+			 * for the mode #1510 already picked, so it must keep exactly
+			 * that mode; an EXTENSION app is floored here, from the view
+			 * configuration it just begun. The two are mutually exclusive
+			 * on purpose - re-flooring a legacy session would move it away
+			 * from the mode its compromise view scale was computed from.
+			 */
+			const bool legacy_session = !sess->sys->inst->extensions.DXR_display_info;
+
+			/*
 			 * #1510 legacy mode floor. A legacy session submits a fixed
 			 * two views; a mode with more tiles than that leaves the rest
 			 * at the clear colour. oxr_system_fill_in() already sized the
@@ -998,7 +1010,7 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			 * "not allowed to move": pinned device, service mode) was made
 			 * at xrGetSystem; this never re-decides it.
 			 */
-			if (sess->sys->legacy_rendering_mode_forced &&
+			if (legacy_session && sess->sys->legacy_rendering_mode_forced &&
 			    sess->sys->legacy_rendering_mode_index < head->rendering_mode_count &&
 			    default_mode < head->rendering_mode_count &&
 			    sess->sys->legacy_rendering_mode_index != default_mode) {
@@ -1017,6 +1029,130 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 				// internally still reports the floored index to the
 				// compositor (which derives its tile grid from it).
 				head->hmd->active_rendering_mode_index = floored;
+			}
+
+			/*
+			 * #1499: the same floor for an EXTENSION session, which #1510
+			 * deliberately left alone. An app that enabled
+			 * XR_DXR_display_info can see the modes and request one, but it
+			 * still submits only as many views as the primary view
+			 * configuration it BEGAN reports - 2 under PRIMARY_STEREO, even
+			 * on a device sitting in a 4-view mode - so the capability loss
+			 * is identical: the compositor's under-submit clamp paints the
+			 * first tiles and the per-frame clear leaves the rest flat.
+			 *
+			 * BEGIN-time, not xrGetSystem-time like #1510's: this is the
+			 * first moment sess->view_config_view_count is authoritative
+			 * (it is seeded to the system's first advertised type at
+			 * xrCreateSession and overwritten by the block at the top of
+			 * this function). Nothing is resized - an extension app's
+			 * swapchain is worst-case-sized across all modes (ADR-010), so
+			 * only the recommended view SCALES move.
+			 *
+			 * A PRIMARY_MULTIVIEW_DXR session passes the device max here, so
+			 * oxr_pick_fillable_mode_index() returns the active index for
+			 * every mode and this whole block is inert - #1486's capability
+			 * is untouched by construction.
+			 */
+			if (!legacy_session) {
+				const uint32_t max_submit =
+				    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+
+				int32_t mode_pinned = 0;
+				if (xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED,
+				                            &mode_pinned) != XRT_SUCCESS) {
+					mode_pinned = 0; // device doesn't implement the query ⟹ not pinned
+				}
+				const bool service_mode =
+				    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+
+				if (oxr_may_demote(mode_pinned != 0, service_mode) &&
+				    default_mode < head->rendering_mode_count) {
+					const uint32_t floored = oxr_pick_fillable_mode_index(
+					    head->rendering_modes, head->rendering_mode_count, default_mode,
+					    max_submit);
+					if (floored != default_mode && floored < head->rendering_mode_count) {
+						const uint32_t prev = default_mode;
+						U_LOG_W(
+						    "oxr: MODE FLOOR (#1499) - rendering mode %u ('%s', %u "
+						    "views) cannot be filled by a %u-view session (view "
+						    "config 0x%08x); switching to mode %u ('%s', %u views)",
+						    prev, head->rendering_modes[prev].mode_name,
+						    head->rendering_modes[prev].view_count, max_submit,
+						    (uint32_t)sess->view_config_type, floored,
+						    head->rendering_modes[floored].mode_name,
+						    head->rendering_modes[floored].view_count);
+						default_mode = floored;
+						// Mirrors #1510's write-through above: the
+						// set_property below normally owns this, but a
+						// driver that only tracks the mode internally must
+						// still report the floored index to the compositor,
+						// which derives its tile grid from it.
+						head->hmd->active_rendering_mode_index = floored;
+
+						/*
+						 * The floored mode's per-view scales are what the
+						 * compositor must now size views from. Same two
+						 * writes as the request path
+						 * (oxr_api_session.c, step 4) and the
+						 * RENDERING_MODE_CHANGE poll arm below.
+						 *
+						 * Deliberately NOT written into the #1488
+						 * live-views shadow (oxr_views_change_*): that
+						 * shadow's contract is "emit a doorbell iff
+						 * xrEnumerateViewConfigurationViews would now
+						 * answer differently", and it is fed from the
+						 * compositor's REAL per-view dims at xrEndFrame,
+						 * which are derived from exactly these scales. So
+						 * the first frame after this floor produces the
+						 * edge, the clamp and the throttle for free;
+						 * writing the shadow here would duplicate the edge
+						 * and could ring the doorbell for a size the
+						 * compositor never adopted.
+						 */
+						struct xrt_system_compositor *xsysc = sess->sys->xsysc;
+						if (xsysc != NULL) {
+							xsysc->info.recommended_view_scale_x =
+							    head->rendering_modes[floored].view_scale_x;
+							xsysc->info.recommended_view_scale_y =
+							    head->rendering_modes[floored].view_scale_y;
+						}
+
+						/*
+						 * Tell the app. It enumerated the modes before
+						 * xrBeginSession (the windowspace probe does
+						 * exactly that), so a cached isActive would
+						 * otherwise be stale from the first frame - and an
+						 * extension app is entitled to know which mode it
+						 * is painting.
+						 */
+						sess->hardware_display_3d =
+						    head->rendering_modes[floored].hardware_display_3d;
+						oxr_event_push_XrEventDataRenderingModeChanged(log, sess, prev,
+						                                               floored);
+					}
+				}
+
+				/*
+				 * The two carve-outs: a device that PINS its mode
+				 * (SIM_DISPLAY_FORCE_MODE) and service mode, where the panel
+				 * lease owns the display-global mode. In both the floor is
+				 * not applied and the under-submit clamp stands - but it is
+				 * never SILENT, which was the whole complaint in #1499.
+				 * WARNed here and not at xrCreateSession (unlike #1510's
+				 * legacy twin) because the session's view configuration does
+				 * not exist yet at create time.
+				 */
+				if (default_mode < head->rendering_mode_count &&
+				    !oxr_mode_fillable_by(&head->rendering_modes[default_mode], max_submit)) {
+					U_LOG_W(
+					    "oxr: session in an UNFILLABLE rendering mode (#1499): mode %u "
+					    "('%s') has %u views, this session can submit %u - the remaining "
+					    "tiles stay at the clear colour (device pins its mode, or the "
+					    "panel lease owns it in service mode)",
+					    default_mode, head->rendering_modes[default_mode].mode_name,
+					    head->rendering_modes[default_mode].view_count, max_submit);
+				}
 			}
 
 			sess->last_rendering_mode_index = default_mode;
