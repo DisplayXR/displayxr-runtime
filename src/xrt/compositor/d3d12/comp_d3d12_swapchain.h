@@ -11,6 +11,8 @@
 
 #include "xrt/xrt_compositor.h"
 
+#include <dxgiformat.h>
+
 // Forward declarations (C++ structs)
 struct comp_d3d12_compositor;
 struct comp_d3d12_swapchain;
@@ -61,6 +63,24 @@ comp_d3d12_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, 
  */
 void *
 comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * The DXGI format a view over @p resource must use.
+ *
+ * Swapchain images are created TYPELESS (#1503), which is not a legal view
+ * format, so every SRV the compositor builds over an application image has to
+ * resolve back to a concrete member of the family. This returns the typed
+ * format the app requested (stamped on the resource at create time), mapped
+ * through the sRGB -> UNORM pass-through rule the display processor needs; for
+ * a resource with no stamp — a runtime scratch, an engine-supplied shared
+ * texture — it falls back to the resource's own descriptor.
+ *
+ * @param resource An `ID3D12Resource *`. NULL yields R8G8B8A8_UNORM.
+ *
+ * @ingroup comp_d3d12
+ */
+DXGI_FORMAT
+comp_d3d12_swapchain_sample_format(void *resource);
 
 #ifdef __cplusplus
 }

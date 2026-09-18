@@ -15,6 +15,8 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
+#include "d3d/d3d_dxgi_formats.h"
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
@@ -201,6 +203,23 @@ d3d12_swapchain_destroy(struct xrt_swapchain *xsc)
 	delete sc;
 }
 
+/*!
+ * Private-data key under which every swapchain image carries the TYPED DXGI
+ * format the application asked for.
+ *
+ * The resource itself is created TYPELESS (#1503), and a typeless format is
+ * not a legal view format — so the compositor, which mostly sees a bare
+ * `ID3D12Resource *` handed down through the layer accumulator, needs a way
+ * back to a concrete member of the family. `GetDesc().Format` alone is not
+ * enough: R16G16B16A16_TYPELESS could be FLOAT or UNORM, and only the app's
+ * request settles it. Stamping the request on the resource keeps the answer
+ * exact without threading a format through every call site.
+ *
+ * {2E9F6C41-0B17-4C8A-9E52-5F2D3A7C1B84}
+ */
+static const GUID kDxrRequestedViewFormatGuid = {
+    0x2e9f6c41, 0x0b17, 0x4c8a, {0x9e, 0x52, 0x5f, 0x2d, 0x3a, 0x7c, 0x1b, 0x84}};
+
 /*
  *
  * Exported functions
@@ -249,46 +268,32 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 		resource_flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 	}
 
-	// For depth formats that need DSV, use typeless format for resource creation
-	DXGI_FORMAT resource_format = dxgi_format;
 	bool is_depth = (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) != 0;
 
-	if (is_depth) {
-		switch (dxgi_format) {
-		case DXGI_FORMAT_D24_UNORM_S8_UINT:
-			resource_format = DXGI_FORMAT_R24G8_TYPELESS;
-			break;
-		case DXGI_FORMAT_D32_FLOAT:
-			resource_format = DXGI_FORMAT_R32_TYPELESS;
-			break;
-		case DXGI_FORMAT_D16_UNORM:
-			resource_format = DXGI_FORMAT_R16_TYPELESS;
-			break;
-		default:
-			break;
-		}
-	} else {
-		// For 8-bit color formats, create the resource TYPELESS so the runtime
-		// can build a UNORM sampling SRV that does NOT auto-decode sRGB->linear
-		// when compositing (the DP wants display-referred bytes; pass them
-		// through unchanged). The app still creates its own typed RTV from the
-		// format it requested. Bounded to the 8-bit BGRA/RGBA family where the
-		// TYPELESS->UNORM mapping is unambiguous; other formats stay concrete.
-		// (Unlike D3D11, D3D12 cannot SRV-cast a concrete sRGB resource, so the
-		// TYPELESS promotion is required here.) Mirrors the GL skip-decode fix.
-		switch (dxgi_format) {
-		case DXGI_FORMAT_R8G8B8A8_UNORM:
-		case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-			resource_format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
-			break;
-		case DXGI_FORMAT_B8G8R8A8_UNORM:
-		case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
-			resource_format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
-			break;
-		default:
-			break;
-		}
-	}
+	/*
+	 * #1503 — create the image with the TYPELESS sibling of the format the app
+	 * asked for, whenever one exists. Two independent reasons, one rule:
+	 *
+	 *  - Conformance. The OpenXR D3D12 binding requires the runtime to allocate
+	 *    the typeless member of the family so the app can build whatever typed
+	 *    view it likes over it; the CTS `Swapchains` test asserts the created
+	 *    `ID3D12Resource`'s `desc.Format` IS that sibling (e.g. a requested
+	 *    R16G16B16A16_FLOAT (10) must come back as R16G16B16A16_TYPELESS (9)).
+	 *    Piecemeal promotion — depth plus the 8-bit colour family only — left
+	 *    the 16-bit-per-channel pair typed and failed the check.
+	 *
+	 *  - sRGB pass-through. D3D12 cannot SRV-cast a *concrete* sRGB resource,
+	 *    so a typeless resource is what lets the runtime's internal sampling
+	 *    SRV read an _SRGB swapchain as plain UNORM and hand the display
+	 *    processor display-referred bytes (no implicit sRGB->linear decode).
+	 *    Only the RESOURCE goes typeless: the app still creates its own typed
+	 *    (and, if it asked for one, sRGB) RTV, so nothing about the app's own
+	 *    render path changes.
+	 *
+	 * Identity for formats with no typeless sibling, so an unmapped format is
+	 * still created exactly as requested.
+	 */
+	DXGI_FORMAT resource_format = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
 
 	// Create committed resources
 	D3D12_HEAP_PROPERTIES heap_props = {};
@@ -358,6 +363,11 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 			sc->images[i]->SetName(nm);
 		}
 
+		// #1503: the resource is TYPELESS, so record the typed format the app
+		// asked for. comp_d3d12_swapchain_sample_format() reads it back when
+		// the compositor needs a view over this image.
+		sc->images[i]->SetPrivateData(kDxrRequestedViewFormatGuid, (UINT)sizeof(dxgi_format), &dxgi_format);
+
 		// Store resource pointer as native image handle
 		sc->base.images[i].handle = reinterpret_cast<xrt_graphics_buffer_handle_t>(sc->images[i]);
 		sc->base.images[i].size = 0;
@@ -398,4 +408,29 @@ comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index)
 		return nullptr;
 	}
 	return sc->images[index];
+}
+
+extern "C" DXGI_FORMAT
+comp_d3d12_swapchain_sample_format(void *resource)
+{
+	auto *res = static_cast<ID3D12Resource *>(resource);
+	if (res == nullptr) {
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+
+	// Prefer the typed format the app requested (stamped at create). Foreign
+	// resources — a runtime scratch, an engine-supplied shared texture — carry
+	// no stamp, so fall back to their own descriptor.
+	DXGI_FORMAT typed = DXGI_FORMAT_UNKNOWN;
+	UINT size = (UINT)sizeof(typed);
+	if (FAILED(res->GetPrivateData(kDxrRequestedViewFormatGuid, &size, &typed)) || size != (UINT)sizeof(typed) ||
+	    typed == DXGI_FORMAT_UNKNOWN) {
+		typed = res->GetDesc().Format;
+	}
+
+	// Sample an sRGB colour image through its UNORM sibling so the GPU does
+	// NOT auto-decode sRGB->linear: the display processor wants
+	// display-referred bytes, so the app's bytes pass through unchanged. This
+	// also resolves any still-typeless format to a viewable one.
+	return d3d_dxgi_format_to_unorm_sample(typed);
 }

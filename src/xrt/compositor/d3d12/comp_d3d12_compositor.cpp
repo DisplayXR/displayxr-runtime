@@ -3581,12 +3581,13 @@ d3d12_bind_dp_atlas_srv(struct comp_d3d12_compositor *c, ID3D12Resource *dp_reso
 		return 0;
 	}
 
-	D3D12_RESOURCE_DESC dp_desc = dp_resource->GetDesc();
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	// Typeless atlases (and anything unviewable) fall back to the path's
-	// R8G8B8A8_UNORM contract — the same format process_atlas advertises.
-	srv_desc.Format = (dp_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) ? DXGI_FORMAT_R8G8B8A8_UNORM
-	                                                                    : dp_desc.Format;
+	// A view cannot be typeless. The runtime-owned atlas is concrete
+	// (R8G8B8A8_UNORM, the format process_atlas advertises) and resolves to
+	// itself; under zero-copy this IS the app's swapchain image, which #1503
+	// creates TYPELESS — so go through the shared resolver, which prefers the
+	// typed format the app requested over the (typeless) descriptor.
+	srv_desc.Format = comp_d3d12_swapchain_sample_format(dp_resource);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;

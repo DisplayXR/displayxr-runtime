@@ -82,6 +82,47 @@ d3d_dxgi_format_to_typeless_dxgi(DXGI_FORMAT format)
 }
 
 /*!
+ * Resolve a TYPELESS DXGI format back to a concrete, *viewable* sibling.
+ *
+ * A TYPELESS resource cannot be viewed (SRV/RTV/UAV) with its own format, so
+ * every site that builds a view from a resource's `GetDesc().Format` needs a
+ * typed stand-in when that resource was created TYPELESS. Identity for formats
+ * that are already typed.
+ *
+ * This is a *fallback*, not the authority: a typeless family can have several
+ * typed members (R16G16B16A16_TYPELESS is FLOAT **or** UNORM), and only the
+ * format the app asked for says which. Callers that can recover the requested
+ * format — the D3D12 native swapchain stamps it on the resource, see
+ * comp_d3d12_swapchain_sample_format() — must use that and reach this only for
+ * foreign resources (e.g. an engine-supplied typeless shared texture). The
+ * choices below are the common member of each family.
+ *
+ * The depth families resolve to their SRV-legal siblings
+ * (R24_UNORM_X8_TYPELESS / R32_FLOAT_X8X24_TYPELESS are *partially* typeless
+ * names but are valid view formats).
+ */
+static inline DXGI_FORMAT
+d3d_dxgi_typeless_to_typed_dxgi(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+	case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+	case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+	case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_UNORM;
+	case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;
+	case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+	default: return format;
+	}
+}
+
+/*!
  * Map an sRGB DXGI format to its plain UNORM sibling (identity for non-sRGB).
  *
  * Used to build the runtime's *internal* sampling view of an app color
@@ -124,7 +165,11 @@ d3d_dxgi_format_to_unorm_sample(DXGI_FORMAT format)
 	case DXGI_FORMAT_B8G8R8A8_UNORM:
 		return DXGI_FORMAT_B8G8R8A8_UNORM;
 	default:
-		return format;
+		// Anything else keeps its own format — except that a view cannot BE
+		// typeless, so a resource created TYPELESS outside the 8-bit family
+		// above (#1503 promotes every D3D12 swapchain image with a typeless
+		// sibling) still has to resolve to a concrete member.
+		return d3d_dxgi_typeless_to_typed_dxgi(format);
 	}
 }
 

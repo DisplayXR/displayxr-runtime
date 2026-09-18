@@ -36,3 +36,35 @@ Depth textures already used TYPELESS prior to this change and are unaffected.
 - **All D3D11 apps must create typed views** — applications that previously relied on `nullptr` view descriptors (inferring format from the texture) must now pass explicit `D3D11_RENDER_TARGET_VIEW_DESC` / `D3D11_SHADER_RESOURCE_VIEW_DESC` with the concrete format. Our test apps were updated accordingly.
 - **Internal compositor textures are mostly unaffected** — the renderer's atlas, HUD, and display processor input textures remain concrete format. *Exception:* the **shell-mode per-client atlas** (`d3d11_client_render_resources::atlas_texture` when `sys->shell_mode == true`) was later switched to `R8G8B8A8_TYPELESS` for the same cross-format-view reason as app swapchains: it needs both a UNORM SRV and a UNORM_SRGB SRV onto the same bytes, which D3D11 only allows on TYPELESS storage. Non-shell mode keeps the atlas at concrete UNORM. See [Compositor Pipeline §Color-space handling](../architecture/compositor-pipeline.md#color-space-handling-d3d11-service-compositor) and `webxr-bridge-color-shift-plan.md` for the motivation (DP-side reinterpretation of SRGB-source vs UNORM-source per-client atlases).
 - **Matches Khronos reference behavior** — aligns with `hello_xr` and other conformant OpenXR runtimes.
+
+## Amendment (2026-09-18, #1503): D3D12 allocates TYPELESS too
+
+The Context above says *"D3D12 does not have this issue because its format
+casting model allows creating typed views from concrete-format resources."*
+That is true of D3D12's casting rules and false as a statement about
+conformance — and it is not even fully true of the casting rules:
+
+- The OpenXR **D3D12** binding carries the same requirement as the D3D11 one,
+  and the CTS enforces it: `Swapchains` reads back the created
+  `ID3D12Resource`'s `desc.Format` and asserts it is the TYPELESS sibling of
+  the requested format. Creating it typed failed 238-262 assertions on
+  `-Graphics d3d12`, every one of them this check.
+- A *concrete `_SRGB`* resource cannot be SRV-cast in D3D12 at all, which is
+  why the 8-bit colour family was already being promoted there (so the
+  runtime's own sampling SRV can read it as UNORM and hand the display
+  processor display-referred bytes). That promotion was piecemeal — depth
+  plus the 8-bit family — and left the 16-bit-per-channel pair typed.
+
+So the D3D12 native swapchain now applies the **same one rule** as D3D11:
+`d3d_dxgi_format_to_typeless_dxgi()` over the requested format, identity where
+no typeless sibling exists. The table above holds for both backends, and
+`xrEnumerateSwapchainFormats` still returns concrete formats on both.
+
+The consequence D3D12 has and D3D11 does not: the runtime's own SRVs over an
+application image can no longer be built from `GetDesc().Format`, because a
+typeless family can have several typed members (`R16G16B16A16_TYPELESS` is
+FLOAT **or** UNORM) and the resource cannot say which. The D3D12 swapchain
+therefore stamps the requested typed format on each image as private data, and
+`comp_d3d12_swapchain_sample_format()` is the single accessor every view site
+uses; `d3d_dxgi_typeless_to_typed_dxgi()` is only the fallback for foreign
+resources that carry no stamp.
