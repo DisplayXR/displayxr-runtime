@@ -32,6 +32,9 @@
  *   1 EXT not enabled  -> "case 1"     6 DXR_VIEWS_CHANGE_LIVE=0 -> "case 6"
  *   2 recommended moves -> "case 2"    3 count invariant         -> "case 3"
  *   4 throttle/coalesce -> "case 4"    5 no change, no doorbell  -> "case 5"
+ *
+ * PR B (Design 6) adds the "PR B:" cases at the end of the unit half: the
+ * IPC/shell leg's pure dims derivation, oxr_views_change_size_from_window().
  */
 
 #include "catch_amalgamated.hpp"
@@ -41,6 +44,7 @@
 #include <vector>
 
 extern "C" {
+#include "xrt/xrt_device.h" // struct xrt_rendering_mode, for the PR B cases
 #include "oxr_views_change.h"
 }
 
@@ -410,6 +414,124 @@ TEST_CASE("case 9: recommended* is clamped to max*, and the ceiling ends the edg
 	// Coming back under the ceiling is a change again.
 	REQUIRE(t.feed(1280, 720, 180 * kSec) == true);
 	REQUIRE(t.read(true, true, scratch)[0].recommendedImageRectWidth == 1280);
+}
+
+
+/*
+ *
+ * PR B: the IPC/shell leg's dims derivation (#1488 Design 6).
+ *
+ * oxr_views_change_size_from_window() is the IPC stand-in for
+ * comp_*_compositor_get_recommended_view_size(). It is pure - a rendering mode
+ * plus a window rect in, a per-view size out - so it is tested here rather than
+ * through a session, a service and a shell.
+ *
+ */
+
+namespace {
+
+//! A minimal rendering mode: only the fields the derivation reads.
+static struct xrt_rendering_mode
+mode_with_scale(float sx, float sy)
+{
+	struct xrt_rendering_mode m = {};
+	m.view_count = 2;
+	m.tile_columns = 2;
+	m.tile_rows = 1;
+	m.view_scale_x = sx;
+	m.view_scale_y = sy;
+	return m;
+}
+
+static struct xrt_window_metrics
+window(uint32_t w, uint32_t h, bool valid = true)
+{
+	struct xrt_window_metrics wm = {};
+	wm.window_pixel_width = w;
+	wm.window_pixel_height = h;
+	wm.display_pixel_width = w;
+	wm.display_pixel_height = h;
+	wm.valid = valid;
+	return wm;
+}
+
+} // namespace
+
+TEST_CASE("PR B: window x view_scale is what the native getter would answer (#1488)", "[oxr][views_change]")
+{
+	uint32_t w = 0, h = 0;
+
+	// The shipped SBS shape: two tiles side by side, so each view is half
+	// the canvas wide and full height. Same arithmetic the native
+	// compositors' layer_commit performs via u_tiling_compute_canvas_view().
+	struct xrt_rendering_mode sbs = mode_with_scale(0.5f, 1.0f);
+	struct xrt_window_metrics wm = window(1000, 800);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, &wm, false, &w, &h) == true);
+	REQUIRE(w == 500);
+	REQUIRE(h == 800); // 800 * 1.0
+
+	// A quad mode halves both axes.
+	struct xrt_rendering_mode quad = mode_with_scale(0.5f, 0.5f);
+	REQUIRE(oxr_views_change_size_from_window(&quad, &wm, false, &w, &h) == true);
+	REQUIRE(w == 500);
+	REQUIRE(h == 400);
+
+	// The tile rect changes on every shell drag; the derivation follows it.
+	struct xrt_window_metrics resized = window(640, 480);
+	REQUIRE(oxr_views_change_size_from_window(&quad, &resized, false, &w, &h) == true);
+	REQUIRE(w == 320);
+	REQUIRE(h == 240);
+}
+
+TEST_CASE("PR B: a zero view_scale passes the canvas through (#1488)", "[oxr][views_change]")
+{
+	// u_tiling_compute_canvas_view()'s own guard: a mode that declares no
+	// scale (a 2D/mono mode, or a driver that left the field at 0) means
+	// "the view IS the canvas", not "the view is zero pixels".
+	uint32_t w = 0, h = 0;
+	struct xrt_rendering_mode mono = mode_with_scale(0.0f, 0.0f);
+	struct xrt_window_metrics wm = window(1280, 720);
+	REQUIRE(oxr_views_change_size_from_window(&mono, &wm, false, &w, &h) == true);
+	REQUIRE(w == 1280);
+	REQUIRE(h == 720);
+}
+
+TEST_CASE("PR B: a legacy app never derives dims at all (#1488 R4)", "[oxr][views_change]")
+{
+	// The native compositors skip their per-frame view-dim recompute for a
+	// legacy app (layer_commit's `if (!c->legacy_app_tile_scaling && ...)`),
+	// so their getter keeps answering the frozen compromise size and no edge
+	// is ever detected. The IPC leg has no compositor-side guard, so it must
+	// refuse here or R4 stops holding on this path alone.
+	uint32_t w = 123, h = 456;
+	struct xrt_rendering_mode sbs = mode_with_scale(0.5f, 1.0f);
+	struct xrt_window_metrics wm = window(1000, 800);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, &wm, true, &w, &h) == false);
+	REQUIRE(w == 123); // outputs untouched
+	REQUIRE(h == 456);
+}
+
+TEST_CASE("PR B: no usable window means no answer, which is the Linux case (#1488)", "[oxr][views_change]")
+{
+	uint32_t w = 7, h = 7;
+	struct xrt_rendering_mode sbs = mode_with_scale(0.5f, 1.0f);
+
+	// valid=false is exactly what a Linux service build reports: its
+	// ipc_handle_compositor_get_window_metrics() has no per-client window
+	// source and drops the request, so the IPC leg no-ops there.
+	struct xrt_window_metrics invalid = window(1000, 800, false);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, &invalid, false, &w, &h) == false);
+
+	// A slot that has not bound yet reports 0x0 (xrGetWorkspaceTileSizeDXR
+	// has the same pre-bind hole) - also not an answer.
+	struct xrt_window_metrics unbound = window(0, 0);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, &unbound, false, &w, &h) == false);
+
+	REQUIRE(oxr_views_change_size_from_window(nullptr, &invalid, false, &w, &h) == false);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, nullptr, false, &w, &h) == false);
+
+	REQUIRE(w == 7); // never written on any refusal
+	REQUIRE(h == 7);
 }
 
 

@@ -126,6 +126,7 @@ if(TARGET tests_oxr_view_config_views_change)
 	target_include_directories(
 		tests_oxr_view_config_views_change
 		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+			${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 			${PROJECT_SOURCE_DIR}/src/external/openxr_includes
 		)
 	target_link_libraries(tests_oxr_view_config_views_change PRIVATE aux_os xrt-interfaces)
