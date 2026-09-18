@@ -1230,6 +1230,14 @@ oxr_system_get_by_id(struct oxr_logger *log,
 XrResult
 oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSystemProperties *properties);
 
+/*!
+ * #1486: is @p type one of the primary view configurations this system
+ * advertises? Writes the view count that type reports to @p out_view_count
+ * (may be NULL) and returns true; returns false and writes nothing otherwise.
+ */
+bool
+oxr_system_lookup_view_config(const struct oxr_system *sys, XrViewConfigurationType type, uint32_t *out_view_count);
+
 XrResult
 oxr_system_enumerate_view_confs(struct oxr_logger *log,
                                 struct oxr_system *sys,
@@ -2073,7 +2081,22 @@ struct oxr_system
 	uint32_t ended_rendering_mode_index;
 	bool has_ended_rendering_mode;
 
-	XrViewConfigurationType view_config_type;
+	/*!
+	 * #1486: the primary view configurations this system advertises, in the
+	 * order xrEnumerateViewConfigurations reports them - PRIMARY_STEREO
+	 * first when present, so a stereo-fixed app that takes entry 0 keeps
+	 * exactly today's behaviour.
+	 *
+	 * @ref view_config_view_counts is the count each TYPE reports
+	 * (PRIMARY_MONO 1, PRIMARY_STEREO always 2, PRIMARY_MULTIVIEW_DXR the
+	 * device max across rendering modes). It is NOT @ref view_count: that
+	 * one stays the DEVICE max and keeps sizing every internal array, the
+	 * IPC mirror and @ref views.
+	 */
+	uint32_t view_config_count;                   //!< 1 or 2.
+	XrViewConfigurationType view_config_types[2]; //!< Advertised types.
+	uint32_t view_config_view_counts[2];          //!< Views reported per type.
+
 	uint32_t view_count; //!< Number of views (1=mono, 2=stereo, 4=quad, etc.)
 	XrViewConfigurationView views[XRT_MAX_VIEWS];
 
@@ -2517,6 +2540,19 @@ struct oxr_session
 	//! Common structure for things referred to by OpenXR handles.
 	struct oxr_handle_base handle;
 	struct oxr_system *sys;
+
+	/*!
+	 * #1486: the primary view configuration THIS session was begun with, and
+	 * the view count that type reports to the app.
+	 *
+	 * The system can advertise more than one type (PRIMARY_STEREO plus
+	 * PRIMARY_MULTIVIEW_DXR), so "the session's view config" is a per-session
+	 * fact, not a per-system one. Seeded at xrCreateSession from the system's
+	 * FIRST advertised type so the fields are sane before xrBeginSession, and
+	 * overwritten there once the app has chosen.
+	 */
+	XrViewConfigurationType view_config_type;
+	uint32_t view_config_view_count;
 
 	//! What graphics type was this session created with.
 	enum oxr_session_graphics_ext gfx_ext;

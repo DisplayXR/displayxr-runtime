@@ -451,6 +451,19 @@ oxr_verify_view_config_type(struct oxr_logger *log,
 		return XR_SUCCESS;
 	}
 
+#ifdef OXR_HAVE_DXR_display_info
+	/*
+	 * #1486: an extension enum is only a VALID value once the extension that
+	 * defines it is enabled - the spec pattern is XR_ERROR_VALIDATION_FAILURE
+	 * otherwise (which is what falling through below produces), never
+	 * XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED. Whether the SYSTEM
+	 * advertises it is a separate, later test (oxr_system_lookup_view_config).
+	 */
+	if (view_conf == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR && inst->extensions.DXR_display_info) {
+		return XR_SUCCESS;
+	}
+#endif
+
 	if (OXR_API_VERSION_AT_LEAST(inst, 1, 1)) {
 		if (view_conf == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO_WITH_FOVEATED_INSET) {
 			return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;

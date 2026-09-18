@@ -141,7 +141,9 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 	OXR_VERIFY_SYSTEM_AND_GET(&log, inst, systemId, sys);
 	OXR_VERIFY_VIEW_CONFIG_TYPE(&log, inst, viewConfigurationType);
 
-	if (viewConfigurationType != sys->view_config_type) {
+	// #1486: any ADVERTISED primary view configuration is accepted; they all
+	// report the same blend modes.
+	if (!oxr_system_lookup_view_config(sys, viewConfigurationType, NULL)) {
 		U_LOG_D("[DisplayXR] xrEnumerateEnvironmentBlendModes: UNSUPPORTED view config");
 		return oxr_error(&log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 		                 "(viewConfigurationType == 0x%08x) "

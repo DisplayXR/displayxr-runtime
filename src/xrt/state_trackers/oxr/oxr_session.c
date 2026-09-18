@@ -789,24 +789,50 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		return oxr_error(log, XR_ERROR_SESSION_NOT_READY, "Session is not ready to begin");
 	}
 
-	struct xrt_compositor *xc = sess->compositor;
-	if (xc != NULL) {
-		XrViewConfigurationType view_type = beginInfo->primaryViewConfigurationType;
-
-		// in a headless session there is no compositor and primaryViewConfigurationType must be ignored
-		if (sess->compositor != NULL && view_type != sess->sys->view_config_type) {
-			/*! @todo we only support a single view config type per
-			 * system right now */
+	/*
+	 * #1486: membership test + record, for EVERY session class.
+	 *
+	 * A headless session has no compositor and the spec says it must IGNORE
+	 * primaryViewConfigurationType, so an unadvertised value is not an error
+	 * there - but when the app did name an advertised one, honouring it costs
+	 * nothing and is what makes xrLocateViews answer in the configuration the
+	 * app asked for (the bridge-relay / headless classes locate views too).
+	 * A graphics-bound session still rejects anything unadvertised, exactly as
+	 * before.
+	 */
+	{
+		const XrViewConfigurationType begin_view_type = beginInfo->primaryViewConfigurationType;
+		uint32_t begun_view_count = 0;
+		if (oxr_system_lookup_view_config(sess->sys, begin_view_type, &begun_view_count)) {
+			sess->view_config_type = begin_view_type;
+			sess->view_config_view_count = begun_view_count;
+		} else if (sess->compositor != NULL) {
 			return oxr_error(log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 			                 "(beginInfo->primaryViewConfigurationType == "
 			                 "0x%08x) view configuration type not supported",
-			                 view_type);
+			                 begin_view_type);
 		}
+	}
 
+	struct xrt_compositor *xc = sess->compositor;
+	if (xc != NULL) {
 		const struct oxr_extension_status *extensions = &sess->sys->inst->extensions;
 
+		/*
+		 * #1486: an EXPLICIT mapping, not a cast. XrViewConfigurationType and
+		 * enum xrt_view_type are unrelated enumerations that happened to agree
+		 * on 1 (MONO) and 2 (STEREO); PRIMARY_MULTIVIEW_DXR's value is
+		 * 1004999212 and casting THAT would hand the compositor a garbage view
+		 * type. Everything that is not mono is stereo-or-wider at the xrt
+		 * layer - the per-mode view count is what carries "wider", not this.
+		 */
+		const enum xrt_view_type xrt_view_type =
+		    (beginInfo->primaryViewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO)
+		        ? XRT_VIEW_TYPE_MONO
+		        : XRT_VIEW_TYPE_STEREO;
+
 		const struct xrt_begin_session_info begin_session_info = {
-		    .view_type = (enum xrt_view_type)beginInfo->primaryViewConfigurationType,
+		    .view_type = xrt_view_type,
 #ifdef OXR_HAVE_EXT_hand_tracking
 		    .ext_hand_tracking_enabled = extensions->EXT_hand_tracking,
 #endif
@@ -1322,7 +1348,7 @@ skip_macos_pump:
 			break;
 		case XRT_SESSION_EVENT_VISIBILITY_MASK_CHANGE:
 #ifdef OXR_HAVE_KHR_visibility_mask
-			oxr_event_push_XrEventDataVisibilityMaskChangedKHR(log, sess, sess->sys->view_config_type,
+			oxr_event_push_XrEventDataVisibilityMaskChangedKHR(log, sess, sess->view_config_type,
 			                                                   xse.mask_change.view_index);
 			break;
 #endif // OXR_HAVE_KHR_visibility_mask
@@ -1822,26 +1848,54 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool print = sess->sys->inst->debug_views;
 	struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
 	struct oxr_space *baseSpc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, viewLocateInfo->space);
+	/*
+	 * #1486: TWO counts, and the distinction is the whole point.
+	 *
+	 * `view_count` is the DEVICE max across rendering modes. It sizes every
+	 * XRT_MAX_VIEWS array below and is what the device-facing calls
+	 * (xrt_device_get_view_poses, the IPC rig reply) are asked for, because
+	 * those compute in device space.
+	 *
+	 * `reported_view_count` is what the APP's view configuration says it gets:
+	 * 1 under PRIMARY_MONO, exactly 2 under PRIMARY_STEREO, the device max
+	 * under PRIMARY_MULTIVIEW_DXR. It is the two-call count, the
+	 * SIZE_INSUFFICIENT bound, and the bound of every loop that writes into
+	 * views[] - the app's array is only that long.
+	 */
 	uint32_t view_count = xdev->hmd->view_count;
+	uint32_t reported_view_count = sess->view_config_view_count;
+	if (reported_view_count == 0 || reported_view_count > view_count) {
+		// Defensive: a session begun before the field was seeded, or a view
+		// config claiming more views than the device has.
+		reported_view_count = view_count;
+	}
 
 	// Active rendering mode's view count — controls mono vs 3D eye assignment.
-	// view_count is the max across all modes (always returned to the app),
-	// but active_view_count reflects the current mode (e.g., 1 for 2D, 2 for stereo).
+	// view_count is the max across all modes, but active_view_count reflects
+	// the current mode (e.g., 1 for 2D, 2 for stereo).
 	uint32_t active_mode_idx = xdev->hmd->active_rendering_mode_index;
 	uint32_t active_view_count = (active_mode_idx < xdev->rendering_mode_count)
 	    ? xdev->rendering_modes[active_mode_idx].view_count
 	    : view_count;
 
+	// #1486: the eye-padding and fov save/restore loops below are bounded by
+	// active_view_count, and some of them land in the app's views[]. A mode
+	// wider than the app's view configuration (a 4-view Quad mode under
+	// PRIMARY_STEREO) must never push them past what the app allocated.
+	if (active_view_count > reported_view_count) {
+		active_view_count = reported_view_count;
+	}
+
 	// Start two call handling.
 	if (viewCountOutput != NULL) {
-		*viewCountOutput = view_count;
+		*viewCountOutput = reported_view_count;
 	}
 	if (viewCapacityInput == 0) {
 		return oxr_session_success_result(sess);
 	}
-	if (viewCapacityInput < view_count) {
+	if (viewCapacityInput < reported_view_count) {
 		return oxr_error(log, XR_ERROR_SIZE_INSUFFICIENT, "(viewCapacityInput == %u) need %u",
-		                 viewCapacityInput, view_count);
+		                 viewCapacityInput, reported_view_count);
 	}
 	// End two call handling.
 
@@ -2121,7 +2175,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// spec: identity poses, viewStateFlags = 0.
 			if (ret == XR_SUCCESS) {
 				viewState->viewStateFlags = 0;
-				for (uint32_t i = 0; i < viewCapacityInput && i < view_count; i++) {
+				for (uint32_t i = 0; i < viewCapacityInput && i < reported_view_count; i++) {
 					views[i].pose = (XrPosef){{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
 				}
 			}
@@ -2652,10 +2706,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 
 		// #521: forward the ACTIVE rendering mode's view count (1 = mono/2D,
-		// 2 = stereo/3D). The located view_count is always the stereo view-config
-		// count and OUTPUT_MODE doesn't cross IPC, so this is how the server learns
-		// the app is in 2D and collapses to a centered eye. The client head proxy's
-		// active_rendering_mode_index is kept current by xrRequestDisplayRenderingModeDXR.
+		// 2 = stereo/3D). The wire below asks for the DEVICE view count — the
+		// server computes in device space and OUTPUT_MODE doesn't cross IPC —
+		// so this is how the server learns the app is in 2D and collapses to a
+		// centered eye. (#1486: it is NOT the app's view-configuration count;
+		// that one only bounds what is copied back into views[].) The client
+		// head proxy's active_rendering_mode_index is kept current by
+		// xrRequestDisplayRenderingModeDXR.
 		rig_info.render_view_count = 0;
 		if (xdev != NULL && xdev->hmd != NULL && xdev->rendering_mode_count > 0 &&
 		    xdev->hmd->active_rendering_mode_index < xdev->rendering_mode_count) {
@@ -2834,7 +2891,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 
 	if (print) {
-		for (uint32_t i = 0; i < view_count; i++) {
+		for (uint32_t i = 0; i < reported_view_count; i++) {
 			char tmp[32];
 			snprintf(tmp, 32, "xdev.view[%i]", i);
 			oxr_pp_fov_indented_as_object(&slog, &fovs[i], tmp);
@@ -2844,7 +2901,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 		oxr_pp_relation_indented(&slog, &T_base_xdev, "T_base_xdev");
 	}
 
-	for (uint32_t i = 0; i < view_count; i++) {
+	// #1486: bounded by what the app's view configuration reports, not by the
+	// device max — views[] is only reported_view_count long.
+	for (uint32_t i = 0; i < reported_view_count; i++) {
 		/*
 		 * Pose
 		 */
@@ -3007,17 +3066,18 @@ oxr_session_locate_views(struct oxr_logger *log,
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
 
 		if (oxr_qtrace_enabled()) {
-			U_LOG_W("[QTRACE] LV[%u/%u] sess=%p base=%s(%p) t=%lld head=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) "
-			        "view=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) fov=(%.3f,%.3f,%.3f,%.3f) eyeovr=%d eyes=%d "
-			        "qcam=%d qdisp=%d extwin=%d",
-			        i, view_count, (void *)sess, oxr_qtrace_space_str(baseSpc), (void *)baseSpc,
-			        (long long)viewLocateInfo->displayTime, world_head_pos.x, world_head_pos.y, world_head_pos.z,
-			        world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w,
-			        views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z,
-			        views[i].pose.orientation.x, views[i].pose.orientation.y, views[i].pose.orientation.z,
-			        views[i].pose.orientation.w, views[i].fov.angleLeft, views[i].fov.angleRight,
-			        views[i].fov.angleUp, views[i].fov.angleDown, have_eye_override, have_eyes,
-			        qwerty_camera, qwerty_display, sess->has_external_window);
+			U_LOG_W(
+			    "[QTRACE] LV[%u/%u] sess=%p base=%s(%p) t=%lld head=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) "
+			    "view=(%.4f,%.4f,%.4f|%.4f,%.4f,%.4f,%.4f) fov=(%.3f,%.3f,%.3f,%.3f) eyeovr=%d eyes=%d "
+			    "qcam=%d qdisp=%d extwin=%d",
+			    i, reported_view_count, (void *)sess, oxr_qtrace_space_str(baseSpc), (void *)baseSpc,
+			    (long long)viewLocateInfo->displayTime, world_head_pos.x, world_head_pos.y,
+			    world_head_pos.z, world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w,
+			    views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z,
+			    views[i].pose.orientation.x, views[i].pose.orientation.y, views[i].pose.orientation.z,
+			    views[i].pose.orientation.w, views[i].fov.angleLeft, views[i].fov.angleRight,
+			    views[i].fov.angleUp, views[i].fov.angleDown, have_eye_override, have_eyes, qwerty_camera,
+			    qwerty_display, sess->has_external_window);
 		}
 
 		if (should_log && i == 0) {
@@ -3062,12 +3122,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	// Inactive views (active_view_count < view_count): duplicate view 0.
-	// `view_count` is max-across-modes so the array shape is stable across
-	// the session, but only `active_view_count` views are "live" in the
-	// current rendering mode. Apps that care read `active_view_count`
-	// from XR_DXR_display_info. See #246.
-	for (uint32_t i = active_view_count; i < view_count; i++) {
+	// Inactive views (active_view_count < reported_view_count): duplicate view 0.
+	// The reported count is fixed by the session's view configuration so the
+	// array shape is stable across the session, but only `active_view_count`
+	// views are "live" in the current rendering mode. Apps that care read
+	// `active_view_count` from XR_DXR_display_info. See #246 (#1486: bounded by
+	// the app's reported count, not the device max).
+	for (uint32_t i = active_view_count; i < reported_view_count; i++) {
 		views[i].pose = views[0].pose;
 		views[i].fov = views[0].fov;
 	}
@@ -3502,6 +3563,12 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 
 	// What system is this session based on.
 	sess->sys = sys;
+
+	// #1486: a sane default before xrBeginSession - the system's FIRST
+	// advertised view configuration (PRIMARY_STEREO when there is one).
+	// xrBeginSession overwrites both with the app's actual choice.
+	sess->view_config_type = sys->view_config_types[0];
+	sess->view_config_view_count = sys->view_config_view_counts[0];
 
 	// Init the begin/wait frame handler.
 	oxr_frame_sync_init(&sess->frame_sync);

@@ -241,6 +241,11 @@ struct oxr_subaction_paths;
 		}                                                                                                      \
 	} while (false)
 
+// #1486: deliberately UNTOUCHED, off-by-one and all (`> 2` admits index 2 on a
+// 2-view config). Its only caller is xrGetVisibilityMaskKHR, which this runtime
+// always answers with an EMPTY mask out of an XRT_MAX_VIEWS-sized array - so the
+// stray index reads nothing out of bounds and neither widening it for
+// PRIMARY_MULTIVIEW_DXR nor tightening it would change observable behaviour.
 #define OXR_VERIFY_VIEW_INDEX(log, index)                                                                              \
 	do {                                                                                                           \
 		if (index > 2) {                                                                                       \

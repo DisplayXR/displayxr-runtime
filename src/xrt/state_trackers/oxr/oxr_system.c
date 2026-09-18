@@ -49,6 +49,16 @@ oxr_system_views_change_live_enabled(void)
 	return debug_get_bool_option_views_change_live();
 }
 
+/*!
+ * #1486 kill switch: restore the pre-PRIMARY_MULTIVIEW_DXR mapping, where a
+ * device with more than one view advertised a single PRIMARY_STEREO that
+ * reported the device MAX view count (4 on a quad display). Non-conformant by
+ * construction - PRIMARY_STEREO means exactly 2 views - but it is what every
+ * shipped DisplayXR app was built against, so it stays reachable for one
+ * release. This is the ONLY translation unit that reads it.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(view_config_legacy, "DXR_VIEW_CONFIG_LEGACY", false)
+
 
 
 static bool
@@ -130,13 +140,50 @@ oxr_system_fill_in(
 	sys->inst = inst;
 	sys->systemId = systemId;
 	sys->view_count = view_count;
-	if (view_count == 1) {
-		sys->view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO;
+
+	/*
+	 * #1486: build the advertised primary view-configuration list.
+	 *
+	 * MONO and STEREO stay mutually exclusive, as before. What changes is
+	 * that PRIMARY_STEREO now reports exactly 2 views (what the type MEANS),
+	 * and a device with more than 2 gets a SECOND entry -
+	 * PRIMARY_MULTIVIEW_DXR - carrying the device max. The second entry is
+	 * gated on XR_DXR_display_info being enabled on this instance because
+	 * that is where the type is specified; inst->extensions is populated
+	 * before this function is called (oxr_instance.c).
+	 *
+	 * The extra entry is advertised on EVERY 3D-capable device with the
+	 * extension enabled, not only on devices whose max exceeds 2 - so an app
+	 * can select it uniformly and get 2 views where 2 is all there is.
+	 */
+	if (debug_get_bool_option_view_config_legacy()) {
+		sys->view_config_count = 1;
+		sys->view_config_types[0] = (view_count == 1) ? XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO
+		                                              : XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		sys->view_config_view_counts[0] = view_count;
+		U_LOG_W(
+		    "DXR_VIEW_CONFIG_LEGACY=1: advertising the pre-#1486 mapping - one view "
+		    "configuration (0x%08x) reporting %u views. PRIMARY_MULTIVIEW_DXR is NOT "
+		    "advertised and PRIMARY_STEREO is non-conformant when %u > 2.",
+		    sys->view_config_types[0], view_count, view_count);
+	} else if (view_count == 1) {
+		sys->view_config_count = 1;
+		sys->view_config_types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO;
+		sys->view_config_view_counts[0] = 1;
 	} else {
-		// view_count >= 2: treat as stereo (including quad, lightfield, etc.)
-		sys->view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		sys->view_config_count = 1;
+		sys->view_config_types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		sys->view_config_view_counts[0] = 2;
+#ifdef OXR_HAVE_DXR_display_info
+		if (inst->extensions.DXR_display_info) {
+			sys->view_config_types[1] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+			sys->view_config_view_counts[1] = view_count;
+			sys->view_config_count = 2;
+		}
+#endif
 	}
-	U_LOG_D("sys->view_config_type = %d", sys->view_config_type);
+	U_LOG_D("sys->view_config_types[0] = %d (%u views), count = %u", sys->view_config_types[0],
+	        sys->view_config_view_counts[0], sys->view_config_count);
 	sys->dynamic_roles_cache = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
 
 #ifdef XR_USE_GRAPHICS_API_VULKAN
@@ -802,6 +849,21 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	return XR_SUCCESS;
 }
 
+bool
+oxr_system_lookup_view_config(const struct oxr_system *sys, XrViewConfigurationType type, uint32_t *out_view_count)
+{
+	for (uint32_t i = 0; i < sys->view_config_count; i++) {
+		if (sys->view_config_types[i] != type) {
+			continue;
+		}
+		if (out_view_count != NULL) {
+			*out_view_count = sys->view_config_view_counts[i];
+		}
+		return true;
+	}
+	return false;
+}
+
 XrResult
 oxr_system_enumerate_view_confs(struct oxr_logger *log,
                                 struct oxr_system *sys,
@@ -810,7 +872,7 @@ oxr_system_enumerate_view_confs(struct oxr_logger *log,
                                 XrViewConfigurationType *viewConfigurationTypes)
 {
 	OXR_TWO_CALL_HELPER(log, viewConfigurationTypeCapacityInput, viewConfigurationTypeCountOutput,
-	                    viewConfigurationTypes, 1, &sys->view_config_type, XR_SUCCESS);
+	                    viewConfigurationTypes, sys->view_config_count, sys->view_config_types, XR_SUCCESS);
 }
 
 XrResult
@@ -832,11 +894,12 @@ oxr_system_get_view_conf_properties(struct oxr_logger *log,
                                     XrViewConfigurationType viewConfigurationType,
                                     XrViewConfigurationProperties *configurationProperties)
 {
-	if (viewConfigurationType != sys->view_config_type) {
+	if (!oxr_system_lookup_view_config(sys, viewConfigurationType, NULL)) {
 		return oxr_error(log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED, "Invalid view configuration type");
 	}
 
-	configurationProperties->viewConfigurationType = sys->view_config_type;
+	// Echo the REQUESTED type back - the system may advertise several (#1486).
+	configurationProperties->viewConfigurationType = viewConfigurationType;
 	configurationProperties->fovMutable = sys->xsysc->info.supports_fov_mutable;
 
 	return XR_SUCCESS;
@@ -863,22 +926,27 @@ oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
                                      uint32_t *viewCountOutput,
                                      XrViewConfigurationView *views)
 {
-	if (viewConfigurationType != sys->view_config_type) {
+	// #1486: the count is the TYPE's, not the device's - PRIMARY_MONO 1,
+	// PRIMARY_STEREO 2, PRIMARY_MULTIVIEW_DXR the device max. Every entry of
+	// sys->views is identical, so the per-view fill is unchanged.
+	uint32_t type_view_count = 0;
+	if (!oxr_system_lookup_view_config(sys, viewConfigurationType, &type_view_count)) {
 		return oxr_error(log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED, "Invalid view configuration type");
 	}
-	const uint32_t count = sys->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO ? 1 : sys->view_count;
-
 	// #1488: XR_EXT_view_configuration_views_change is the SOLE sanctioned
 	// carve-out from the core spec's unconditional "always return identical
 	// buffer contents from this enumeration ... for the lifetime of the
 	// instance". An app that has not enabled it therefore keeps the frozen
 	// snapshot bit-for-bit - which is every shipping consumer today - and
 	// this whole branch is inert. The view COUNT never moves either way.
+	// #1486: the count is the REQUESTED view configuration's (2 for
+	// PRIMARY_STEREO, the device max for PRIMARY_MULTIVIEW_DXR); every entry
+	// of the shadow carries the same dims, so one shadow serves both types.
 	XrViewConfigurationView scratch[XRT_MAX_VIEWS];
 	const XrViewConfigurationView *src = oxr_views_change_select(
-	    &sys->views_change, sys->views, count, sys->inst->extensions.EXT_view_configuration_views_change,
+	    &sys->views_change, sys->views, type_view_count, sys->inst->extensions.EXT_view_configuration_views_change,
 	    debug_get_bool_option_views_change_live(), scratch);
 
-	OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, count,
+	OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, type_view_count,
 	                            view_configuration_view_fill_in, src, XR_SUCCESS);
 }

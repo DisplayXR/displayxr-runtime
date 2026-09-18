@@ -659,6 +659,98 @@ verify_depth_layer(struct xrt_compositor *xc,
 }
 #endif // OXR_HAVE_KHR_composition_layer_depth
 
+/*!
+ * #1486: the projection layer's viewCount, against the view configuration THIS
+ * session was begun with.
+ *
+ * Split out of @ref verify_projection_layer because PRIMARY_MULTIVIEW_DXR is a
+ * cast @c #define rather than an enumerator, so it cannot be a @c case label
+ * without tripping clang's "case value not in enumerated type" — it needs an
+ * @c if, and an @c if glued onto the front of the switch would re-indent the
+ * whole body.
+ */
+static XrResult
+verify_projection_view_count(struct oxr_session *sess,
+                             struct oxr_logger *log,
+                             uint32_t layer_index,
+                             const XrCompositionLayerProjection *proj,
+                             struct xrt_device *head)
+{
+#ifdef OXR_HAVE_DXR_display_info
+	if (sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) {
+		// The permissive body PRIMARY_STEREO used to have: any rendering
+		// mode's view count, plus 1 and 2. The app may be one frame behind a
+		// mode transition (the race between the mode change and xrEndFrame),
+		// so this cannot be restricted to the currently active mode.
+		bool valid = (proj->viewCount == 1) || (proj->viewCount == 2);
+		if (!valid && head != NULL && head->rendering_mode_count > 0) {
+			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+				if (proj->viewCount == head->rendering_modes[mi].view_count) {
+					valid = true;
+					break;
+				}
+			}
+		}
+		if (!valid) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
+			                 "rendering mode for XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
+			                 layer_index, proj->viewCount);
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
+	switch (sess->view_config_type) {
+	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO:
+		if (proj->viewCount != 1) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 for "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO",
+			                 layer_index, proj->viewCount);
+		}
+		break;
+	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO:
+		/*
+		 * #1486: PRIMARY_STEREO means exactly 2 views, so a wider submission
+		 * is now refused instead of silently accepted because some rendering
+		 * mode happened to have that count. viewCount == 1 stays legal: apps
+		 * in a 2D rendering mode already submit a single view today.
+		 */
+		if (proj->viewCount != 1 && proj->viewCount != 2) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or 2 for "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; begin the session with "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (XR_DXR_display_info) "
+			                 "to submit more",
+			                 layer_index, proj->viewCount);
+		}
+		break;
+	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
+		if (proj->viewCount != 4) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 4 for "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO",
+			                 layer_index, proj->viewCount);
+		}
+		break;
+	case XR_VIEW_CONFIGURATION_TYPE_SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT:
+		if (proj->viewCount != 1) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 for "
+			                 "XR_VIEW_CONFIGURATION_TYPE_SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT",
+			                 layer_index, proj->viewCount);
+		}
+		break;
+	default:
+		assert(false && "view type validation unimplemented");
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "view type %d not supported", sess->view_config_type);
+		break;
+	}
+
+	return XR_SUCCESS;
+}
+
 static XrResult
 verify_projection_layer(struct oxr_session *sess,
                         struct xrt_compositor *xc,
@@ -678,62 +770,9 @@ verify_projection_layer(struct oxr_session *sess,
 		return ret;
 	}
 
-	switch (sess->sys->view_config_type) {
-	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO:
-		if (proj->viewCount != 1) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 for "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO",
-			                 layer_index, proj->viewCount);
-		}
-		break;
-	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO: {
-		// Accept viewCount that matches ANY rendering mode's view_count.
-		// The app may be one frame behind during mode transitions (race
-		// between mode change and xrEndFrame), so we can't restrict to
-		// only the currently active mode.  viewCount == 1 is always
-		// accepted (mono fallback).
-		bool valid = (proj->viewCount == 1);
-		if (!valid && head != NULL && head->rendering_mode_count > 0) {
-			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-				if (proj->viewCount == head->rendering_modes[mi].view_count) {
-					valid = true;
-					break;
-				}
-			}
-		}
-		if (!valid && proj->viewCount == 2) {
-			valid = true; // default 3D always accepted
-		}
-		if (!valid) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
-			                 "rendering mode for XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
-			                 layer_index, proj->viewCount);
-		}
-		break;
-	}
-	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
-		if (proj->viewCount != 4) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 4 for "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO",
-			                 layer_index, proj->viewCount);
-		}
-		break;
-	case XR_VIEW_CONFIGURATION_TYPE_SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT:
-		if (proj->viewCount != 1) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 for "
-			                 "XR_VIEW_CONFIGURATION_TYPE_SECONDARY_MONO_FIRST_PERSON_OBSERVER_MSFT",
-			                 layer_index, proj->viewCount);
-		}
-		break;
-	default:
-		assert(false && "view type validation unimplemented");
-		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "view type %d not supported",
-		                 sess->sys->view_config_type);
-		break;
+	ret = verify_projection_view_count(sess, log, layer_index, proj, head);
+	if (ret != XR_SUCCESS) {
+		return ret;
 	}
 
 #ifdef OXR_HAVE_KHR_composition_layer_depth
@@ -2934,7 +2973,8 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			                            &vc_stats) &&
 			    debug_get_bool_option_views_change_event()) {
 				oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(
-				    log, sess->sys->inst, sess->sys->systemId, sess->sys->view_config_type, &vc_stats);
+				    // #1486: the type the SESSION began (the system advertises two).
+				    log, sess->sys->inst, sess->sys->systemId, sess->view_config_type, &vc_stats);
 			}
 #endif
 		}
