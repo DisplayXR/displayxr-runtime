@@ -2,7 +2,7 @@
 status: Active
 owner: David Fattal
 updated: 2026-09-18
-issues: [79, 1510]
+issues: [79, 1510, 1499]
 code-paths:
   [
     src/xrt/state_trackers/oxr/oxr_system.c,
@@ -97,6 +97,24 @@ Two things outrank the floor; in both, Case B and the under-submit clamp stand a
   `SIM_DISPLAY_FORCE_MODE`) -- the pin exists to hold a mode against every later
   request, which is what keeps the N-view under-submit path testable;
 - **service mode** -- the panel lease, not this app, owns the display-global mode.
+
+#### The same floor for extension apps (#1499)
+
+`oxr_legacy_mode_rule.h` now states this rule as a function of how many views the
+session can submit, and the `oxr_legacy_*` entry points above are thin wrappers
+binding that to `OXR_LEGACY_MAX_SUBMITTED_VIEWS` (2). Nothing in section 3a
+changes -- `tests/tests_oxr_legacy_mode_rule.cpp` carries a regression arm that
+asserts the wrapper answer equals the general answer at `max_views = 2`, index by
+index, on both shipping mode tables.
+
+What #1499 adds is the other caller: an EXTENSION session is floored at
+`xrBeginSession` from the view count of the primary view configuration it began
+(2 under `PRIMARY_STEREO`, the device max under `PRIMARY_MULTIVIEW_DXR`, so a
+multiview session is never floored), and `xrRequestDisplayRenderingModeDXR`
+denies an unfillable request. The two floors are mutually exclusive on an
+explicit legacy test: re-flooring a legacy session would move it off the mode its
+compromise view scale was computed from. Details:
+[View-Configuration Model](../../reference/view-configuration-model.md#the-mode-floor-1499).
 
 ### 4. Compositor tile processing
 
