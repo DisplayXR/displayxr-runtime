@@ -111,6 +111,14 @@ minimal backing or exclude via the run manifest — and **log every exclusion**
   half is fixed) — see
   [View-Configuration Model](../reference/view-configuration-model.md). Any test
   excluded from `cts.yml` / `run_cts.ps1` must carry a comment naming its issue.
+- **`conformance_cli.exe` DPI manifest (#1506):** the Khronos CTS binary is
+  built with no DPI manifest, so on a scaled display it ran DPI-unaware and
+  every geometric measurement (window size/position, Kooima projection, view
+  poses) came back wrong by the scale factor — this inflated #1502 with a
+  spurious axis. `fetch_build_cts.bat` now embeds + asserts the manifest
+  post-build; see
+  [DPI awareness: the DLL rule](../reference/dpi-awareness.md) § *The CTS
+  runner is third-party*.
 - Full plan: this repo's planning notes (the `unified-bubbling-perlis` plan).
 - Extension spec: `XR_EXT_conformance_automation` (openxr.h, spec v3).
 - Eye-tracking / sim_display fake-tracking knobs: CLAUDE.md "Simulating eye

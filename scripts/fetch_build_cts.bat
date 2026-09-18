@@ -121,12 +121,73 @@ cmake --build "%CTS_BUILD%" --config RelWithDebInfo --target conformance_cli con
 if %ERRORLEVEL% NEQ 0 ( echo CTS build FAILED & exit /b 1 )
 
 :: ------------------------------------------------------------
-:: 5. Report the conformance_cli location
+:: 5. Embed + verify the per-monitor DPI manifest (#1506)
+::
+:: conformance_cli is built from upstream Khronos sources, which carry no
+:: DPI manifest, so it runs DPI-UNAWARE on a scaled display: Windows hands it
+:: virtualised window geometry and every geometric CTS measurement (window
+:: size/position, Kooima projection, view poses) comes back silently wrong by
+:: the scale factor (measured 2.47x at 250% scaling — issue #1502, #1506).
+:: We do not own the CTS CMake tree and its pin moves, so this is a
+:: post-build step rather than a CMake patch: embed the SAME manifest every
+:: DisplayXR executable ships (src/xrt/targets/common/dpi_aware.manifest,
+:: #1201) via mt.exe, then assert it actually landed — a future CTS pin bump
+:: (new target, different output layout, ...) must not silently drop this
+:: again. See docs/reference/dpi-awareness.md.
+:: ------------------------------------------------------------
+set DPI_MANIFEST=%REPO%src\xrt\targets\common\dpi_aware.manifest
+if not exist "%DPI_MANIFEST%" ( echo ERROR: DPI manifest not found at %DPI_MANIFEST% & exit /b 1 )
+
+:: `for /r` with a bare (non-wildcard) filename does NOT enumerate existing
+:: files -- it visits every directory under the root and yields
+:: <dir>\conformance_cli.exe whether or not it exists (e.g. it will also
+:: yield build-cts\build\Testing\Temporary\conformance_cli.exe, a phantom
+:: CTest scratch path that is never created). Guard with `if exist` inside
+:: the loop, or CTS_EXE ends up pointing at the last (non-existent)
+:: candidate visited and every step below fails.
+set CTS_EXE=
+for /r "%CTS_BUILD%" %%F in (conformance_cli.exe) do if exist "%%F" set "CTS_EXE=%%F"
+if not defined CTS_EXE ( echo ERROR: conformance_cli.exe not found under %CTS_BUILD% after build. & exit /b 1 )
+if not exist "%CTS_EXE%" ( echo ERROR: resolved conformance_cli.exe path does not exist: %CTS_EXE% & exit /b 1 )
+
+where mt.exe >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo ERROR: mt.exe not found on PATH.
+    echo        mt.exe ships with the Windows SDK and is normally placed on
+    echo        PATH by vcvars64.bat ^(step 1 above^). A CTS build that cannot
+    echo        embed the DPI manifest would silently run DPI-UNAWARE on a
+    echo        scaled display and corrupt every geometric measurement it
+    echo        makes -- refusing to continue rather than ship a quietly-wrong
+    echo        conformance_cli.exe. See #1506.
+    exit /b 1
+)
+
+echo === Embedding DPI-awareness manifest into conformance_cli.exe ^(#1506^) ===
+mt.exe -nologo -manifest "%DPI_MANIFEST%" -outputresource:"%CTS_EXE%;#1"
+if %ERRORLEVEL% NEQ 0 ( echo ERROR: mt.exe failed to embed the DPI manifest into %CTS_EXE% & exit /b 1 )
+
+:: Assert it actually took: extract resource #1 back out and check for the
+:: PerMonitorV2 marker. This is the regression guard -- a silent embed
+:: failure or a future CTS output-layout change must fail the script loudly.
+set "CTS_MANIFEST_CHECK=%TEMP%\dxr_cts_manifest_check_%RANDOM%.manifest"
+mt.exe -nologo -inputresource:"%CTS_EXE%;#1" -out:"%CTS_MANIFEST_CHECK%" >nul
+if %ERRORLEVEL% NEQ 0 ( echo ERROR: mt.exe failed to extract the embedded manifest back out of %CTS_EXE% for verification. & exit /b 1 )
+findstr /c:"PerMonitorV2" "%CTS_MANIFEST_CHECK%" >nul
+if %ERRORLEVEL% NEQ 0 (
+    echo ERROR: embedded manifest in %CTS_EXE% does not contain PerMonitorV2 -- the CTS DPI manifest embed did NOT take effect.
+    del "%CTS_MANIFEST_CHECK%" >nul 2>&1
+    exit /b 1
+)
+del "%CTS_MANIFEST_CHECK%" >nul 2>&1
+echo CTS DPI manifest: EMBEDDED and verified
+
+:: ------------------------------------------------------------
+:: 6. Report the conformance_cli location
 :: ------------------------------------------------------------
 echo.
 echo === CTS build complete ===
-for /r "%CTS_BUILD%" %%F in (conformance_cli.exe) do echo   conformance_cli: %%F
-for /r "%CTS_BUILD%" %%F in (conformance_test.dll) do echo   conformance_test: %%F
+echo   conformance_cli: %CTS_EXE%
+for /r "%CTS_BUILD%" %%F in (conformance_test.dll) do if exist "%%F" echo   conformance_test: %%F
 echo.
 echo === DONE ===
 endlocal
