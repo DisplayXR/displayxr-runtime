@@ -94,26 +94,18 @@ jobs:
           # system became a first-class regression surface with the
           # input-provider channel (#823).
           #
-          # KNOWN-RED EXCLUSION (#1502) — xrLocateSpace_xrLocateViews.
-          # CTS 1.1.57 added that test. It first asserts views.size() == 2 for
-          # PRIMARY_STEREO — FIXED by #1486 (PRIMARY_STEREO reports exactly 2)
-          # — and then asserts that the VIEW reference space equals the
-          # centroid of the xrLocateViews origins (test_xrLocateSpace.cpp:330).
-          # DisplayXR's VIEW space is the viewer origin while the located eyes
-          # carry an offset, so that second assertion fails deterministically
-          # (measured (0.102, 0.044, 0) vs (0,0,0) on sim-display/D3D11). It is
-          # excluded BY NAME so the nightly's red stays a *known* red instead of
-          # noise — this is not a conformance claim on that test. Delete the
-          # exclusion when #1502 lands.
-          # Full rationale: docs/reference/view-configuration-model.md § CTS.
-          # Catch2 spec syntax: patterns inside ONE filter are ANDed (every
-          # m_required matches, no m_forbidden matches); a COMMA starts a second
-          # filter and filters are OR'd -- so the exclusion must be appended
-          # WITHOUT a comma or it would exclude nothing.
-          # The smoke slice below does not name or tag that test, so it never
-          # runs there and needs no exclusion.
+          # The full lane runs the whole non-interactive suite with nothing
+          # excluded by name. xrLocateSpace_xrLocateViews was excluded here from
+          # #1491 until #1502 landed (#1516): #1486 fixed its views.size() == 2
+          # assertion and #1502 its VIEW == centroid assertion, verified 9/0 on
+          # hardware, so it is back in the lane. History and rationale:
+          # docs/reference/view-configuration-model.md § CTS.
+          # If a by-name exclusion is ever needed again — Catch2 spec syntax:
+          # patterns inside ONE filter are ANDed (every m_required matches, no
+          # m_forbidden matches); a COMMA starts a second filter and filters
+          # are OR'd, so append "~name" WITHOUT a comma or it excludes nothing.
           if ($scope -eq "full") {
-            $spec = "exclude:[interactive]~xrLocateSpace_xrLocateViews"
+            $spec = "exclude:[interactive]"
             $timeout = "900"
           } else {
             $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,multithreading,[actions]~[interactive]"

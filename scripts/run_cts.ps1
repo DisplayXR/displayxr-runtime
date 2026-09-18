@@ -16,23 +16,19 @@
 .PARAMETER Plugin     sim-display (default) | leia-sr | none (leave plugins as-is)
 .PARAMETER Graphics   d3d11 (default) | d3d12 | vulkan | opengl
 .PARAMETER ApiVersion 1.1 (default) | 1.0
-.PARAMETER TestSpec   Catch2 spec; default
-                      "exclude:[interactive]~xrLocateSpace_xrLocateViews"
-
-                      KNOWN-RED EXCLUSION (#1502): xrLocateSpace_xrLocateViews
-                      (added CTS 1.1.57). Its views.size() == 2 assertion for
-                      PRIMARY_STEREO is FIXED by #1486; the test then asserts
-                      VIEW space == centroid of the located view origins
-                      (test_xrLocateSpace.cpp:330), and DisplayXR's VIEW space
-                      is the viewer origin while the located eyes carry an
-                      offset, so it fails deterministically. Excluded BY NAME
-                      — not silently — until #1502 lands; we do not claim
-                      conformance on it. Rationale:
+.PARAMETER TestSpec   Catch2 spec; default "exclude:[interactive]"
+                      (the full non-interactive suite, nothing excluded by name).
+                      xrLocateSpace_xrLocateViews ran excluded by name from
+                      #1491 until #1502 landed (#1516): its two assertions were
+                      fixed by #1486 (views.size() == 2) and #1502 (VIEW ==
+                      centroid), verified 9/0 on the win box, so it now runs in
+                      the default lane. History + rationale:
                       docs/reference/view-configuration-model.md § CTS.
-                      Catch2 note: patterns inside ONE filter are ANDed
-                      (all m_required match, no m_forbidden matches); a comma
-                      would start a SECOND filter and the two are OR'd, which
-                      would not exclude anything. Hence no comma here.
+                      Catch2 note if a by-name exclusion is ever needed again:
+                      patterns inside ONE filter are ANDed (all m_required
+                      match, no m_forbidden matches); a comma starts a SECOND
+                      filter and the two are OR'd, which would exclude nothing.
+                      Append with "~name", no comma.
 .PARAMETER TimeoutSec Kill + restore after this many seconds (default 1800)
 .PARAMETER Tag        Label for output files (default automated_<graphics>_<api>)
 #>
@@ -40,9 +36,7 @@ param(
   [string]$Plugin     = "sim-display",
   [string]$Graphics   = "d3d11",
   [string]$ApiVersion = "1.1",
-  # See .PARAMETER TestSpec above for why xrLocateSpace_xrLocateViews is
-  # excluded by name (#1502 — docs/reference/view-configuration-model.md).
-  [string]$TestSpec   = "exclude:[interactive]~xrLocateSpace_xrLocateViews",
+  [string]$TestSpec   = "exclude:[interactive]",
   [int]   $TimeoutSec = 1800,
   [string]$Tag        = "",
   # Enable the CTS's required XR_APILAYER_KHRONOS_runtime_conformance layer for a
