@@ -33,6 +33,18 @@ oxr_views_change_seed(struct oxr_views_change *vc, const XrViewConfigurationView
 		vc->views_live[i] = frozen[i];
 	}
 	vc->valid = false;
+
+	// Seed the edge detector from the snapshot, NOT from the first frame.
+	// The reference value the app holds is the frozen array, so a first
+	// frame whose compositor dims already differ from it (a window created
+	// after the instance, a DPI change) IS a change the app must hear
+	// about - Design 7's rule is "emit iff enumerate would now answer
+	// differently", and it already would. Baselining on the first sample
+	// would leave the app stale until the NEXT change.
+	if (view_count > 0) {
+		vc->last_w = frozen[0].recommendedImageRectWidth;
+		vc->last_h = frozen[0].recommendedImageRectHeight;
+	}
 }
 
 bool
@@ -42,17 +54,24 @@ oxr_views_change_update(struct oxr_views_change *vc,
                         uint32_t w,
                         uint32_t h,
                         uint64_t now_ns,
-                        bool ext_enabled)
+                        bool ext_enabled,
+                        struct oxr_views_change_stats *out_stats)
 {
 	// A client that has not enabled XR_EXT_view_configuration_views_change
-	// (or that has a kill switch off) pays nothing here: no lock, no copy,
-	// no event. The bespoke XrEventDataLocal3DZoneViewSizeChangedDXR path
-	// at the call site is entirely separate and stays byte-identical.
+	// (or that has DXR_VIEWS_CHANGE_LIVE off) pays nothing here: no lock,
+	// no copy, no event. DXR_VIEWS_CHANGE_EVENT deliberately does NOT reach
+	// this gate - folding it in here would skip the shadow write and freeze
+	// the live enumerate values, which is not what that switch means. The
+	// bespoke XrEventDataLocal3DZoneViewSizeChangedDXR path at the call site
+	// is entirely separate and stays byte-identical.
 	if (!ext_enabled) {
 		return false;
 	}
 	if (w == 0 || h == 0) {
 		return false;
+	}
+	if (view_count == 0) {
+		return false; // base[0] is the clamp + edge reference below
 	}
 	if (view_count > XRT_MAX_VIEWS) {
 		view_count = XRT_MAX_VIEWS;
@@ -62,9 +81,24 @@ oxr_views_change_update(struct oxr_views_change *vc,
 
 	os_mutex_lock(&vc->lock);
 
-	// Edge detection. The first sample only baselines - it does not fire -
-	// mirroring the #441 pattern the DXR doorbell above already uses.
-	if (vc->last_w != 0 && (vc->last_w != w || vc->last_h != h)) {
+	// CLAMP FIRST, then edge-detect on the clamped value. The compositor
+	// getters return window/canvas x view_scale with no ceiling, while the
+	// frozen snapshot is display-derived and already clamped the same way, so
+	// an oversized window (DPI virtualisation, a multi-monitor span) would
+	// otherwise publish recommended > max, which the spec forbids. Detecting
+	// on the clamped value also means a window growing further past the
+	// ceiling produces no extra edges and no extra doorbells.
+	//
+	// view 0 is the edge-detection representative, matching the seed.
+	const uint32_t cw = w < base[0].maxImageRectWidth ? w : base[0].maxImageRectWidth;
+	const uint32_t ch = h < base[0].maxImageRectHeight ? h : base[0].maxImageRectHeight;
+
+	// Edge detection against the seeded snapshot (see oxr_views_change_seed),
+	// so the very first frame can already be a change. The last_w != 0 test
+	// survives only as a never-seeded fallback - it is not the baseline-on-
+	// first-sample behaviour the DXR doorbell at the call site still uses,
+	// and that one is left byte-identical on purpose.
+	if (vc->last_w != 0 && (vc->last_w != cw || vc->last_h != ch)) {
 		for (uint32_t i = 0; i < view_count; i++) {
 			// Copy the whole struct verbatim, THEN move only the
 			// two recommended fields. maxImageRect{Width,Height}
@@ -73,11 +107,16 @@ oxr_views_change_update(struct oxr_views_change *vc,
 			// the extension's "must: only change the content of the
 			// recommended values" are enforced structurally rather
 			// than by convention.
+			// max* is per view, so clamp per view rather than
+			// reusing view 0's ceiling.
 			vc->views_live[i] = base[i];
-			vc->views_live[i].recommendedImageRectWidth = w;
-			vc->views_live[i].recommendedImageRectHeight = h;
+			vc->views_live[i].recommendedImageRectWidth =
+			    w < base[i].maxImageRectWidth ? w : base[i].maxImageRectWidth;
+			vc->views_live[i].recommendedImageRectHeight =
+			    h < base[i].maxImageRectHeight ? h : base[i].maxImageRectHeight;
 		}
 		vc->valid = true;
+		vc->edges++;
 
 		// THE Design-7 GUARANTEE (#1488). This is the only assignment of
 		// pending_push to true anywhere, and it sits in the same critical
@@ -89,8 +128,8 @@ oxr_views_change_update(struct oxr_views_change *vc,
 		// cannot be made to reallocate for a value that did not move.
 		vc->pending_push = true;
 	}
-	vc->last_w = w;
-	vc->last_h = h;
+	vc->last_w = cw;
+	vc->last_h = ch;
 
 	// Spec: "The runtime must: not use this event for frequent (at a rate
 	// faster than 1Hz per view configuration) adjustments of the
@@ -111,7 +150,18 @@ oxr_views_change_update(struct oxr_views_change *vc,
 	if (vc->pending_push && (now_ns - vc->last_push_ns) >= OXR_VIEWS_CHANGE_MIN_PERIOD_NS) {
 		vc->pending_push = false;
 		vc->last_push_ns = now_ns;
+		vc->emitted++;
+		// Edges that got folded into this one doorbell.
+		vc->suppressed = vc->edges - vc->emitted;
 		push = true;
+	}
+
+	if (out_stats != NULL) {
+		out_stats->edges = vc->edges;
+		out_stats->emitted = vc->emitted;
+		out_stats->suppressed = vc->suppressed;
+		out_stats->last_w = vc->last_w;
+		out_stats->last_h = vc->last_h;
 	}
 
 	os_mutex_unlock(&vc->lock);

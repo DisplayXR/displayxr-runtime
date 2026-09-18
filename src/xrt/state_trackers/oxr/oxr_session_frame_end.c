@@ -2855,8 +2855,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	want_dxr_view_size_event = sess->sys->inst->extensions.DXR_local_3d_zone;
 #endif
 #ifdef OXR_HAVE_EXT_view_configuration_views_change
-	want_ext_views_change = sess->sys->inst->extensions.EXT_view_configuration_views_change &&
-	                        debug_get_bool_option_views_change_event() && oxr_system_views_change_live_enabled();
+	// LIVE belongs here (it gates whether the shadow may move at all); EVENT
+	// deliberately does NOT - it gates only the push below. Folding EVENT in
+	// here would skip the shadow write and silently freeze the live enumerate
+	// values, which is not what that switch means.
+	want_ext_views_change =
+	    sess->sys->inst->extensions.EXT_view_configuration_views_change && oxr_system_views_change_live_enabled();
 #endif
 	if ((want_dxr_view_size_event || want_ext_views_change) && sess->xcn != NULL) {
 		uint32_t view_w = 0;
@@ -2917,11 +2921,20 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			// would now answer differently - a consumer of the LOVR
 			// shape (which calls createSwapchains() unconditionally on
 			// the event) can never be made to reallocate for nothing.
+			//
+			// The EVENT kill switch is applied HERE, on the push
+			// alone, never inside update(). When it is off the
+			// doorbell is authorised and consumed without being
+			// emitted - spec-legal ("may: ignore") and deliberately
+			// backlog-free, so flipping the switch back on cannot
+			// produce a burst.
+			struct oxr_views_change_stats vc_stats = {0};
 			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views, sess->sys->view_count,
-			                            view_w, view_h, os_monotonic_get_ns(), want_ext_views_change)) {
+			                            view_w, view_h, os_monotonic_get_ns(), want_ext_views_change,
+			                            &vc_stats) &&
+			    debug_get_bool_option_views_change_event()) {
 				oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(
-				    log, sess->sys->inst, sess->sys->systemId, sess->sys->view_config_type, view_w,
-				    view_h);
+				    log, sess->sys->inst, sess->sys->systemId, sess->sys->view_config_type, &vc_stats);
 			}
 #endif
 		}
