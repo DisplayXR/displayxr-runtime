@@ -71,6 +71,14 @@ endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
 endif()
+if(XRT_FEATURE_OPENXR)
+	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
+	# oxr_views_change.c straight into the unit and injects now_ns, so the
+	# 1 Hz throttle is deterministic (no sleeping, no wall clock, no
+	# compositor). Its integration half additionally dlopens the built
+	# runtime when there is one, and SKIPs without a registered DP.
+	list(APPEND tests tests_oxr_view_config_views_change)
+endif()
 if(XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
 	# #1370 -- drives the BUILT runtime library through the public OpenXR API
 	# on a headless session (see the file header). Needs a registered display
@@ -100,6 +108,33 @@ endforeach()
 # For tests that require more than just aux_util, link those other libs down here.
 
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+
+if(TARGET tests_oxr_view_config_views_change)
+	# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- the vendor plug-in's signing
+	# recipe builds this runtime as a sub-project (see tests_rig_composer).
+	target_sources(
+		tests_oxr_view_config_views_change
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_views_change.c
+		)
+	target_include_directories(
+		tests_oxr_view_config_views_change
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+			${PROJECT_SOURCE_DIR}/src/external/openxr_includes
+		)
+	target_link_libraries(tests_oxr_view_config_views_change PRIVATE aux_os xrt-interfaces)
+	if(RUNTIME_TARGET)
+		# Enables the integration half; without a runtime target the unit
+		# half still builds and runs.
+		target_compile_definitions(
+			tests_oxr_view_config_views_change
+			PRIVATE "DXR_RUNTIME_LIB_PATH=\"$<TARGET_FILE:${RUNTIME_TARGET}>\""
+			)
+		add_dependencies(tests_oxr_view_config_views_change ${RUNTIME_TARGET})
+		if(NOT WIN32)
+			target_link_libraries(tests_oxr_view_config_views_change PRIVATE ${CMAKE_DL_LIBS})
+		endif()
+	endif()
+endif()
 
 if(TARGET tests_qwerty_camera_profile)
 	target_link_libraries(tests_qwerty_camera_profile PRIVATE drv_qwerty drv_qwerty_includes)
