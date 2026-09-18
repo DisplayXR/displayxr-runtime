@@ -189,11 +189,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrGetDisplayZoneRecommendedViewSizeDXR(
     XrSession session, const XrRect2Di* zoneRect, XrExtent2Di* recommendedViewSize);
 
 /*!
- * Advisory: per-zone recommended view sizes may have changed (display-mode /
- * tile-count switch, window DPI change). Re-query each zone; stale sizes stay
- * correct, just soft. The N-zone analog of
- * XrEventDataLocal3DZoneViewSizeChangedDXR (which is single-size and cannot
- * describe N zones; it keeps firing for legacy sessions).
+ * DEPRECATED AND NEVER EMITTED (runtime#1488) — see the note below. Advisory:
+ * per-zone recommended view sizes may have changed (display-mode / tile-count
+ * switch, window DPI change). The type is kept for source compatibility; no
+ * runtime queues it.
  */
 typedef struct XrEventDataDisplayZoneMetricsChangedDXR {
     XrStructureType          type;   // XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR
@@ -202,9 +201,27 @@ typedef struct XrEventDataDisplayZoneMetricsChangedDXR {
 } XrEventDataDisplayZoneMetricsChangedDXR;
 ```
 
+> **`XrEventDataDisplayZoneMetricsChangedDXR` is retired (runtime#1488).** It was
+> specified here as the N-zone doorbell but was never wired at either end — the
+> runtime has no push site for it, and the one real zone-metrics consumer already
+> routes around it by polling. The **type stays in the header**, marked
+> deprecated, because deleting it would be a source break for anything that
+> `case`s on it (including `displayxr-unreal`'s `abi-guard`); it will simply never
+> be queued.
+>
+> **Poll instead.** Call `xrGetDisplayZoneRecommendedViewSizeDXR` per zone — per
+> frame is cheap, and it is what shipping code already does. For a **single-size**
+> (non-zoned) session, enable the Khronos
+> [`XR_EXT_view_configuration_views_change`](XR_EXT_view_configuration_views_change.md)
+> and re-read `xrEnumerateViewConfigurationViews` on its event; that event is
+> instance-level and carries one size, so it cannot describe N zones — which is
+> precisely why the zoned answer is a poll.
+
 Zone swapchains are fixed-size: when a rect animates, the runtime scaled-blits
 the view tile to the rect (sharpness trades off). Apps wanting 1:1 recreate on
-resize, prompted by the event + re-query.
+resize, prompted by the per-zone re-query above — and note that an app sized at
+`maxImageRect*` per ADR-010 never *needs* to reallocate: move
+`subImage.imageRect` instead.
 
 ## 4. Frame rules ("zones mode")
 
@@ -263,7 +280,7 @@ window→panel mapping is the plugin's job (vendor isolation, ADR-019).
 | Local2D frame: explicit mask + 2D layers, supersede → full window | One full-window zone + the same Local2D layers + the same mask object as `wishMask` | Yes — supersede fires only in legacy frames |
 | Implicit mask = union of Local2D rects (M = 0 inside) | Zone rects state the 3D region directly; auto wish = union of zone rects | Yes (legacy frames); rule off in zones frames |
 | `xrSubmitLocal3DZoneDXR` sticky mask | Per-frame `wishMask` in the frame-end chain | Yes — sticky path live in legacy frames; inert in zones frames |
-| `XrEventDataLocal3DZoneViewSizeChangedDXR` | `XrEventDataDisplayZoneMetricsChangedDXR` + per-zone re-query | Yes — old event keeps firing for legacy sessions |
+| `XrEventDataLocal3DZoneViewSizeChangedDXR` | `xrGetDisplayZoneRecommendedViewSizeDXR` polling, per zone (the once-planned `XrEventDataDisplayZoneMetricsChangedDXR` is deprecated and never emitted — runtime#1488) | Yes — the old event keeps firing for legacy sessions, though it is itself soft-deprecated in `local_3d_zone` spec 5 in favour of `XR_EXT_view_configuration_views_change` |
 | App-side Kooima (avatar v0.1.0) | Zone-scoped locate + `XrDisplayRigDXR` | N/A — the point of the design |
 
 Nothing is deprecated: `local_3d_zone` v3 and `view_rig` v2 remain the

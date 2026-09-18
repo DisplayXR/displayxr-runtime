@@ -57,6 +57,7 @@ RULES = {
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
+    "INV-4.9": "An app that enables XR_EXT_view_configuration_views_change must not call xrCreateSwapchain from its event handler — move subImage.imageRect instead (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
     "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
     "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
     "INV-7.2": "xrCaptureAtlasDXR pathPrefix takes NO extension; the runtime appends _atlas.png.",
@@ -489,6 +490,124 @@ def check_manual_tracking_event(root: Path, findings: list):
         ))
 
 
+# INV-4.9: the two sides of the correlation.
+#   - the app opts INTO the Khronos extension (macro or the literal name), and
+#   - it reallocates a swapchain in the region that HANDLES the event.
+VIEWS_CHANGE_ENABLE_RE = re.compile(
+    r"XR_EXT_VIEW_CONFIGURATION_VIEWS_CHANGE_EXTENSION_NAME"
+    r'|"XR_EXT_view_configuration_views_change"'
+)
+VIEWS_CHANGE_EVENT_RE = re.compile(
+    r"\bXR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT\b"
+)
+# INV-4.9 handler window: how many lines AFTER the event-type mention still count
+# as "inside the handler" when no enclosing block can be delimited.
+VIEWS_CHANGE_WINDOW = 40
+
+
+def _inv49_handler_region(lines: list, idx: int) -> tuple:
+    """Return the (start, end) line indices of the handler region for the event
+    mention on line ``idx`` (0-based, end exclusive).
+
+    THE HEURISTIC, stated plainly, because this is a text matcher and not a
+    parser: an OpenXR event handler is written one of two ways, and both are
+    approximated by scanning FORWARD from the line that names the event type.
+
+      1. ``case XR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT:`` —
+         the region ends at the next ``case ``/``default:`` label at any depth,
+         or at the ``break;``/``return`` that closes it, or when the brace depth
+         relative to the label goes negative (the switch itself closing).
+      2. ``if (ev.type == XR_TYPE_...)`` — the region ends when the brace depth
+         relative to the mention returns to 0 after having gone positive.
+
+    Both are then clamped to VIEWS_CHANGE_WINDOW lines, so a mention that opens
+    no block at all (a bare log line, an enum in a table) yields a small window
+    rather than the rest of the file. Clamping is what keeps this conservative:
+    the rule is advisory (WARN) and a false positive is worse than a miss.
+    """
+    end_cap = min(len(lines), idx + 1 + VIEWS_CHANGE_WINDOW)
+    depth = 0
+    opened = False
+    for i in range(idx, end_cap):
+        line = lines[i]
+        if i > idx:
+            # A sibling switch label ends the previous case's region.
+            if depth <= 0 and re.match(r"\s*(case\b|default\s*:)", line):
+                return (idx, i)
+            if depth <= 0 and re.match(r"\s*(break\s*;|return\b)", line):
+                return (idx, i + 1)
+        depth += line.count("{") - line.count("}")
+        if depth > 0:
+            opened = True
+        elif opened and depth <= 0:
+            return (idx, i + 1)
+        if depth < 0:
+            return (idx, i + 1)
+    return (idx, end_cap)
+
+
+def check_views_change_realloc(root: Path, findings: list):
+    """INV-4.9 (advisory) — XR_EXT_view_configuration_views_change <-> no realloc.
+
+    An app that enables the Khronos view-size doorbell must respond by MOVING
+    ``subImage.imageRect``, not by tearing down and recreating swapchains. Every
+    DisplayXR app sizes its swapchain at ``maxImageRect*`` (ADR-010), which the
+    extension forbids the runtime from ever changing — so, in the spec's own
+    words, *an app that sized at maxImageRect* never needs to reallocate*.
+    Reallocating on the event is the LÖVR shape (``createSwapchains()`` fired
+    unconditionally from the handler) and reintroduces exactly the stutter the
+    worst-case swapchain exists to prevent (runtime#1488 Design 7 / R1).
+
+    Conservative trigger, both halves required:
+      1. some source enables the extension (macro or the literal string), AND
+      2. ``xrCreateSwapchain`` appears inside the handler REGION of a mention of
+         ``XR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT`` — region as
+         defined by ``_inv49_handler_region`` above (enclosing ``case``/``if``
+         block, clamped to ±VIEWS_CHANGE_WINDOW lines).
+
+    An app that enables the extension and never mentions the event type does not
+    fire: ignoring the event is an explicit ``may:`` in the spec, and a
+    max-sized app is correct doing nothing at all.
+    """
+    files = []
+    enables = False
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        try:
+            text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if VIEWS_CHANGE_ENABLE_RE.search(text):
+            enables = True
+        files.append((p, text))
+
+    if not enables:
+        return
+
+    for path, text in files:
+        lines = text.splitlines()
+        for m in VIEWS_CHANGE_EVENT_RE.finditer(text):
+            idx = text.count("\n", 0, m.start())
+            start, end = _inv49_handler_region(lines, idx)
+            for i in range(start, end):
+                if "xrCreateSwapchain" not in lines[i]:
+                    continue
+                findings.append(Finding(
+                    WARN, "INV-4.9", rel(path, root), i + 1,
+                    "xrCreateSwapchain inside the XR_EXT_view_configuration_views_change "
+                    "handler — the event never requires a reallocation.",
+                    "Re-enumerate and MOVE subImage.imageRect instead. maxImageRect* is "
+                    "immutable under this extension (and under ADR-010), so a swapchain "
+                    "sized at max never needs recreating; tearing it down on every resize "
+                    "is the stutter the worst-case sizing exists to prevent.",
+                ))
+                break  # one finding per handler region is enough
+
+
+
 
 # ---------------------------------------------------------------------------
 # Android pixel-exactness (docs/guides/displayxr-app-rules.md §11).
@@ -848,6 +967,7 @@ def main(argv=None) -> int:
     scan_manifests(root, findings)
     check_mcp_pairing(root, findings)
     check_manual_tracking_event(root, findings)
+    check_views_change_realloc(root, findings)
     check_android(root, findings)
     findings = dedupe(findings)
     print_findings(findings, root)

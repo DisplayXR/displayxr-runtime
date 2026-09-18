@@ -60,12 +60,12 @@
     "XR_DXR_display_zones": {
       "group": "rendering",
       "title": "Display Zones",
-      "summary": "A layout of independent 3D zones and flat 2D zones across one display, each 3D zone with its own view rig, plus the wish mask a switchable-lens panel honours"
+      "summary": "A layout of independent 3D zones and flat 2D zones across one display, each 3D zone with its own view rig, plus the wish mask a switchable-lens panel honours; poll xrGetDisplayZoneRecommendedViewSizeDXR for per-zone sizes — XrEventDataDisplayZoneMetricsChangedDXR is deprecated and never emitted"
     },
     "XR_DXR_local_3d_zone": {
       "group": "rendering",
       "title": "Local 3D Zones",
-      "summary": "Per-pixel 3D-ness mask over an app's own window, with the flat 2D side as a first-class post-weave composition layer"
+      "summary": "Per-pixel 3D-ness mask over an app's own window, with the flat 2D side as a first-class post-weave composition layer; its view-size event is soft-deprecated since spec 5 in favour of the Khronos XR_EXT_view_configuration_views_change, but still emitted unchanged"
     },
     "XR_DXR_depth_budget": {
       "group": "rendering",
