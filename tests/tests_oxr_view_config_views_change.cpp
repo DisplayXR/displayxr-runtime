@@ -100,11 +100,13 @@ struct VC
 		oxr_views_change_fini(&vc);
 	}
 
+	struct oxr_views_change_stats stats = {};
+
 	//! Feed dims at @p now_ns; returns "the caller should ring the doorbell".
 	bool
 	feed(uint32_t w, uint32_t h, uint64_t now_ns, bool ext_enabled = true)
 	{
-		return oxr_views_change_update(&vc, frozen.v, kViewCount, w, h, now_ns, ext_enabled);
+		return oxr_views_change_update(&vc, frozen.v, kViewCount, w, h, now_ns, ext_enabled, &stats);
 	}
 
 	//! What xrEnumerateViewConfigurationViews would answer.
@@ -241,6 +243,11 @@ TEST_CASE("case 4: 1 Hz throttle coalesces, and the last value wins (#1488)", "[
 	// first frame end after the window closes: pending_push survived.
 	REQUIRE(t.feed(w, 600, now + 10 * 1000 * 1000ULL) == false); // still inside 1 s
 	REQUIRE(t.feed(w, 600, now + kSec) == true);                 // window closed -> deferred fire
+	// 30 edges, 2 doorbells: 28 were folded into the deferred one. This is the
+	// `suppressed=` field the soak line reports.
+	REQUIRE(t.stats.edges == 30);
+	REQUIRE(t.stats.emitted == 2);
+	REQUIRE(t.stats.suppressed == 28);
 	// And it does not fire twice for the same suppressed change.
 	REQUIRE(t.feed(w, 600, now + 3 * kSec) == false);
 }
@@ -288,6 +295,121 @@ TEST_CASE("case 6: DXR_VIEWS_CHANGE_LIVE=0 restores case 1 with the EXT enabled 
 	t2.feed(800, 600, 1 * kSec, /*ext_enabled*/ false);
 	REQUIRE(t2.feed(1280, 720, 3 * kSec, /*ext_enabled*/ false) == false);
 	REQUIRE(t2.read(true, true, scratch) == t2.frozen.v); // nothing was written either
+}
+
+
+TEST_CASE("case 7: the EVENT kill switch is the CALLER's, and never freezes live values (#1488)", "[oxr][views_change]")
+{
+	VC t;
+	XrViewConfigurationView scratch[XRT_MAX_VIEWS];
+
+	// DXR_VIEWS_CHANGE_EVENT must NOT be folded into ext_enabled. update()
+	// reports the doorbell unconditionally; the fire site decides whether to
+	// emit it. So with EVENT off (simulated by the caller simply ignoring the
+	// return value) the shadow still moves and the next enumerate still
+	// answers with the new size.
+	REQUIRE(t.feed(1280, 720, 3 * kSec) == true); // caller decides what to do with this
+
+	const XrViewConfigurationView *got = t.read(/*ext*/ true, /*live*/ true, scratch);
+	REQUIRE(got == scratch);
+	REQUIRE(got[0].recommendedImageRectWidth == 1280);
+	REQUIRE(got[0].recommendedImageRectHeight == 720);
+
+	// The doorbell was authorised and CONSUMED even though the caller did not
+	// emit it: no backlog accumulates, so flipping EVENT back on cannot make
+	// suppressed changes fire in a burst.
+	REQUIRE(t.feed(1280, 720, 30 * kSec) == false);
+
+	// The churn counters the soak line prints. emitted is 1-based and advances
+	// once per authorised doorbell - that is what a run counts events/min from.
+	REQUIRE(t.stats.edges == 1);
+	REQUIRE(t.stats.emitted == 1);
+	REQUIRE(t.stats.suppressed == 0);
+	REQUIRE(t.feed(1600, 900, 60 * kSec) == true);
+	REQUIRE(t.stats.edges == 2);
+	REQUIRE(t.stats.emitted == 2);
+	REQUIRE(t.stats.suppressed == 0);
+	REQUIRE(t.stats.last_w == 1600);
+	REQUIRE(t.stats.last_h == 900);
+
+	// LIVE off IS legitimately folded into ext_enabled, and that one does
+	// freeze both halves: no write, no doorbell.
+	VC t2;
+	REQUIRE(t2.feed(1280, 720, 3 * kSec, /*ext_enabled*/ false) == false);
+	REQUIRE(t2.read(true, true, scratch) == t2.frozen.v);
+}
+
+TEST_CASE("case 8: the FIRST frame can already be a change (#1488)", "[oxr][views_change]")
+{
+	// The edge detector is seeded from the frozen snapshot, not from the
+	// first sample. The reference value the app holds IS the snapshot, so a
+	// first frame that already differs from it is a change the app must hear
+	// about - otherwise enumerate stays stale until the NEXT change, which
+	// may never come.
+	SECTION("first frame equal to the snapshot rings nothing")
+	{
+		VC t;
+		XrViewConfigurationView scratch[XRT_MAX_VIEWS];
+		// The VC fixture seeds at the Frozen defaults, 800x600.
+		REQUIRE(t.feed(800, 600, 5 * kSec) == false);
+		REQUIRE(t.read(true, true, scratch) == t.frozen.v);
+	}
+
+	SECTION("first frame differing from the snapshot rings, and live moves")
+	{
+		VC t;
+		XrViewConfigurationView scratch[XRT_MAX_VIEWS];
+		REQUIRE(t.feed(900, 600, 5 * kSec) == true);
+
+		const XrViewConfigurationView *got = t.read(true, true, scratch);
+		REQUIRE(got == scratch);
+		REQUIRE(got[0].recommendedImageRectWidth == 900);
+		REQUIRE(got[0].recommendedImageRectHeight == 600);
+		require_immutable_fields_match(got[0], t.frozen.v[0]);
+	}
+}
+
+
+TEST_CASE("case 9: recommended* is clamped to max*, and the ceiling ends the edges (#1488)", "[oxr][views_change]")
+{
+	VC t;
+	XrViewConfigurationView scratch[XRT_MAX_VIEWS];
+
+	// The frozen fixture caps at 4096; narrow it so the clamp is reachable.
+	for (uint32_t i = 0; i < XRT_MAX_VIEWS; i++) {
+		t.frozen.v[i].maxImageRectWidth = 1920;
+		t.frozen.v[i].maxImageRectHeight = 1080;
+	}
+
+	// The compositor getters return window/canvas x view_scale with NO
+	// ceiling, so an oversized window (DPI virtualisation, a multi-monitor
+	// span) can hand us dims above max. Publishing those would put
+	// recommended > max, which the spec forbids.
+	REQUIRE(t.feed(2500, 1400, 5 * kSec) == true);
+
+	const XrViewConfigurationView *got = t.read(true, true, scratch);
+	REQUIRE(got == scratch);
+	for (uint32_t i = 0; i < kViewCount; i++) {
+		REQUIRE(got[i].recommendedImageRectWidth == 1920);
+		REQUIRE(got[i].recommendedImageRectHeight == 1080);
+		REQUIRE(got[i].recommendedImageRectWidth <= got[i].maxImageRectWidth);
+		REQUIRE(got[i].recommendedImageRectHeight <= got[i].maxImageRectHeight);
+		// The ceiling itself is untouched, as always.
+		REQUIRE(got[i].maxImageRectWidth == 1920);
+		REQUIRE(got[i].maxImageRectHeight == 1080);
+	}
+
+	// Growing FURTHER past the ceiling is not a change: edge detection runs on
+	// the clamped value, so a drag that keeps enlarging an already-oversized
+	// window rings nothing and adds no edges.
+	REQUIRE(t.feed(2600, 1400, 60 * kSec) == false);
+	REQUIRE(t.feed(4000, 3000, 120 * kSec) == false);
+	REQUIRE(t.stats.edges == 1);
+	REQUIRE(t.stats.emitted == 1);
+
+	// Coming back under the ceiling is a change again.
+	REQUIRE(t.feed(1280, 720, 180 * kSec) == true);
+	REQUIRE(t.read(true, true, scratch)[0].recommendedImageRectWidth == 1280);
 }
 
 
