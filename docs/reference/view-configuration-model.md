@@ -78,7 +78,7 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** for a core-only app; an `XR_DXR_display_info` app may also submit 1 while the active mode is 1-view | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** — the located count. An `XR_DXR_display_info` app may still submit 1 while the active mode is 1-view: **deprecated** (ADR-041), accepted, logged once per session | **exactly the located count** (the device max). ADR-041 removed the old "any rendering mode's `viewCount`" |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
 > **A core-only app gets exact-2, full stop.** If the instance did not enable
@@ -108,12 +108,54 @@ must handle it needs an explicit `case`.
 > pass. The extension gate closes it.
 >
 > **`PRIMARY_MULTIVIEW_DXR` is the recommended path for any mode-driven count**,
-> including the 1-view case: begin with it and submit the active mode's count
-> without a special case. The relaxation above is back-compatibility for apps
+> including the 1-view case. The relaxation above is back-compatibility for apps
 > already shipping on `PRIMARY_STEREO`.
 >
 > This is the only place the `xrEndFrame` rule consults the active mode; the
 > *reported* counts above still never move on a mode switch.
+
+## Submit the located count, alias the tail (ADR-041)
+
+The counts above are fixed for the session. What changes per frame is how many of
+them the active rendering mode *uses*. ADR-041 separates the two properly:
+
+- `xrLocateViews` publishes `activeViewCount` through **`XrViewActivityStateDXR`**
+  (`XR_DXR_display_info` v21), chained on `XrViewState`.
+- Views `[0, activeViewCount)` carry the active mode's poses/FOVs. Views
+  `[activeViewCount, viewCountOutput)` are **inactive**: located at view 0's pose,
+  and their submitted content is ignored.
+- `xrEndFrame` accepts **exactly the located count**, for every type. An app that
+  renders only the active views points each inactive view at content it already
+  rendered this frame (view 0's subimage) while keeping that view's own located
+  pose/FOV. `DxrAliasInactiveViews()` in `test_apps/common/dxr_view_config.h` is
+  the reference tail fill.
+
+That makes both core sentences hold verbatim — "`viewCount` must be equal to the
+number of view poses returned by `xrLocateViews`" and "all views associated with
+projection layers must be supplied" — with no DisplayXR carve-out. The pre-ADR-041
+`PRIMARY_MULTIVIEW_DXR` rule ("any rendering mode's `viewCount`") contradicted
+both, which is why it is gone.
+
+**A 3D zone layer is a projection layer**: `XR_DXR_display_zones` submits each 3D
+zone as an `XR_TYPE_COMPOSITION_LAYER_PROJECTION` with a zone chained on it, so it
+goes through the same gate and carries the located count too, aliased per zone.
+
+### `DXR_UNDER_SUBMIT`
+
+| value | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
+|---|---|---|
+| `0` strict | the located count (2) | the located count |
+| `1` **default** | the located count, **or** 1 while the active mode is 1-view → accepted + one-shot `U_LOG_W` naming the fix | the located count |
+| `2` kill switch | pre-ADR-041 rule | pre-ADR-041 rule (under-submit accepted) |
+
+Out-of-range values clamp to an end, never to the default. The default flips to
+`0` in the first runtime release after `displayxr-common` and the five
+`displayxr-demo-*` demos ship the alias submission — the trigger is that
+shipment, not a date.
+
+CI stays on the default: a CTS session never enables `XR_DXR_display_info`, and
+the deprecated arm requires it, so conformance is on the strict path at every knob
+value and pinning the switch in `cts.yml` would buy nothing.
 
 Three properties hold under all three types:
 
