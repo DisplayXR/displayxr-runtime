@@ -24,6 +24,7 @@
 #include "os/os_time.h"
 
 #ifdef XRT_OS_WINDOWS
+#include <windows.h> // before glad: LoadLibrary/GetProcAddress for the per-module GLAD load
 #include "ogl/ogl_api.h"
 #elif defined(__APPLE__)
 #include <OpenGL/gl3.h>
@@ -639,11 +640,68 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
  *
  */
 
+#ifdef XRT_OS_WINDOWS
+//! GLAD loader: wglGetProcAddress first, GetProcAddress(opengl32.dll) fallback —
+//! same order as the runtime's comp_gl_compositor loader.
+static GLADapiproc
+sim_gl_get_proc_addr(void *userptr, const char *name)
+{
+	GLADapiproc ret = (GLADapiproc)wglGetProcAddress(name);
+	if (ret == NULL) {
+		ret = (GLADapiproc)GetProcAddress((HMODULE)userptr, name);
+	}
+	return ret;
+}
+
+/*!
+ * Load GLAD into THIS module, once (#1521 follow-up).
+ *
+ * aux_ogl is a static lib, so this plug-in DLL carries its own private copy of
+ * the glad_gl* function-pointer table; the runtime's gladLoadGLUserPtr in
+ * comp_gl_compositor fills only the runtime's copy. Without this, the first GL
+ * call in sim_display_processor_gl_create (glCreateShader via compile_shader)
+ * goes through a NULL pointer — the same trap the Leia plug-in fixed in v1.2.1.
+ * It went unnoticed because on a vendor box the GL compositor never selected
+ * the sim GL DP until #1521. Called from the factory, where the compositor has
+ * already made its GL context current.
+ */
+static bool
+sim_gl_ensure_glad_loaded(void)
+{
+	static int loaded_version = 0; // 0 = not attempted / failed
+	if (loaded_version != 0) {
+		return true;
+	}
+	HMODULE opengl_dll = LoadLibraryW(L"opengl32.dll");
+	if (opengl_dll == NULL) {
+		U_LOG_E("sim_display GL: LoadLibrary(opengl32.dll) failed (%lu)", GetLastError());
+		return false;
+	}
+	int gl_result = gladLoadGLUserPtr(sim_gl_get_proc_addr, opengl_dll);
+	if (gl_result == 0) {
+		U_LOG_E("sim_display GL: gladLoadGLUserPtr failed — is a GL context current?");
+		FreeLibrary(opengl_dll);
+		return false;
+	}
+	// Keep opengl32.dll referenced for the life of the module (GLAD pointers point into it).
+	loaded_version = gl_result;
+	U_LOG_W("sim_display GL: GLAD loaded for plug-in module (GL %d.%d)", GLAD_VERSION_MAJOR(gl_result),
+	        GLAD_VERSION_MINOR(gl_result));
+	return true;
+}
+#endif // XRT_OS_WINDOWS
+
 xrt_result_t
 sim_display_dp_factory_gl(void *window_handle,
                            struct xrt_display_processor_gl **out_xdp)
 {
 	(void)window_handle;
+
+#ifdef XRT_OS_WINDOWS
+	if (!sim_gl_ensure_glad_loaded()) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+#endif
 
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 
