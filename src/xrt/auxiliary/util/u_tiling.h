@@ -212,8 +212,20 @@ u_tiling_can_zero_copy(uint32_t view_count,
                        uint32_t swapchain_h,
                        const struct xrt_rendering_mode *mode)
 {
-	// View count must match mode
-	if (view_count != mode->view_count)
+	// ADR-041: the submission must COVER the mode, not equal it. The app's view
+	// count is fixed by its view configuration (R) while the mode's tile count
+	// (A) changes underneath it, so a conformant app submits R views and aliases
+	// the inactive tail [A, R) onto view 0's subimage. Those tail views carry no
+	// content the runtime reads, so they cannot disqualify the passthrough —
+	// only the first mode->view_count rects are checked below. A submission that
+	// does NOT cover the mode (R < A, e.g. PRIMARY_STEREO in a quad mode) still
+	// fails: there is no atlas to hand over.
+	//
+	// This is still the SOLE zero-copy gate (ADR-030). Relaxing it is not an
+	// optimisation: under ADR-041 Windows Leia's worst-case-filling 2D mode is a
+	// 1-view mode that a PRIMARY_STEREO app now submits 2 views into, so an
+	// equality test here would silently retire the one shipping zero-copy case.
+	if (view_count < mode->view_count)
 		return false;
 
 	// Swapchain must match atlas dimensions exactly
@@ -221,8 +233,9 @@ u_tiling_can_zero_copy(uint32_t view_count,
 	    swapchain_h != mode->atlas_height_pixels)
 		return false;
 
-	// Each view's rect must match its expected tile position
-	for (uint32_t i = 0; i < view_count; i++) {
+	// Each ACTIVE view's rect must match its expected tile position. The
+	// inactive tail is deliberately not inspected — see above.
+	for (uint32_t i = 0; i < mode->view_count; i++) {
 		if (!u_tiling_view_matches_tile(i, rect_xs[i], rect_ys[i],
 		                                rect_ws[i], rect_hs[i], mode))
 			return false;
