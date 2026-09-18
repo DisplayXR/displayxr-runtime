@@ -819,9 +819,16 @@ TEST_CASE("without XR_DXR_display_info the MULTIVIEW type does not exist (#1486)
 TEST_CASE("DXR_VIEW_CONFIG_LEGACY restores the pre-#1486 mapping", "[oxr][view_space][view_config_legacy]")
 {
 	if (!legacy_switch_set()) {
-		SKIP(
-		    "DXR_VIEW_CONFIG_LEGACY is not set - run the tests_oxr_view_space_legacy ctest, "
-		    "which arms it in a process of its own (the runtime caches the read)");
+		// Deliberately NOT a Catch2 SKIP: build-windows.yml treats any
+		// "SKIPPED:" from this binary (with sim-display registered) as "the
+		// headless runtime did not come up" (#1370). Under the plain
+		// registration this case simply has nothing to do.
+		WARN(
+		    "DXR_VIEW_CONFIG_LEGACY is not set - this case only runs under the "
+		    "tests_oxr_view_space_legacy ctest, which arms it in a process of its own "
+		    "(the runtime caches the read)");
+		SUCCEED("not the legacy process; nothing to pin here");
+		return;
 	}
 
 	Runtime rt;
