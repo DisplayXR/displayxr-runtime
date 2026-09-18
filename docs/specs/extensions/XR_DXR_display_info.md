@@ -1274,6 +1274,15 @@ renderHeight = (uint32_t)(windowHeight * recommendedViewScaleY)
   window size.
 - If the display processor exposes no rendering-mode table, or the active mode declares
   no scale, the runtime falls back to the plug-in's display-level baseline (or `1.0`).
+- **Both eyes use the same scale factors.** The scale encodes a static display property
+  (ratio of optimal render resolution to native pixels), which is identical for left and
+  right eyes.
+- **Anisotropic scaling is intentional and supported**: `scaleX` may differ from `scaleY`
+  because the optimal horizontal and vertical resolutions may have different ratios to
+  native pixels (e.g., light field displays often need higher horizontal resolution for
+  multi-view interlacing).
+- Scale factors represent **quality scaling only**. Aspect ratio is controlled by the
+  window viewport and projection.
 
 > **Implementation note (runtime ≥ v2.17.1).** This is what the field always reported
 > *after* a mode change: the runtime used to keep a scalar copy of the active mode's scale
@@ -1284,15 +1293,6 @@ renderHeight = (uint32_t)(windowHeight * recommendedViewScaleY)
 > baseline is the minimum across modes) nothing observable moves; on one where they differ,
 > a first query now agrees with `xrEnumerateDisplayRenderingModesDXR` instead of
 > disagreeing with it until the app changed mode.
-- **Both eyes use the same scale factors.** The scale encodes a static display property
-  (ratio of optimal render resolution to native pixels), which is identical for left and
-  right eyes.
-- **Anisotropic scaling is intentional and supported**: `scaleX` may differ from `scaleY`
-  because the optimal horizontal and vertical resolutions may have different ratios to
-  native pixels (e.g., light field displays often need higher horizontal resolution for
-  multi-view interlacing).
-- Scale factors represent **quality scaling only**. Aspect ratio is controlled by the
-  window viewport and projection.
 
 **Example:**
 - Display native resolution: 3840 x 2160.
