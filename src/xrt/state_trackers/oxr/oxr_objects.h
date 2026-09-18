@@ -961,14 +961,6 @@ XrResult
 oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess);
 
 /*!
- * Staleness ceiling for @ref oxr_session::last_window_metrics. Generous on
- * purpose: this is a geometry hint whose consumer already edge-detects, and a
- * 60 Hz app refreshes it every ~16 ms, so the only samples this rejects are
- * from a frame that located no views at all.
- */
-#define OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS (50 * 1000 * 1000ULL)
-
-/*!
  * Fill @p out_metrics with this session's live display/window geometry
  * (per-client; window_pixel_* is the shell-driven tile pixel rect, updated on
  * resize). Backs xrGetWorkspaceTileSizeDXR (#225). Returns false and leaves
@@ -980,7 +972,7 @@ oxr_session_get_window_metrics(struct oxr_session *sess, struct xrt_window_metri
 /*!
  * Same answer as @ref oxr_session_get_window_metrics, served from
  * @ref oxr_session::last_window_metrics when that sample is younger than
- * @ref OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS, else by calling through (which
+ * @ref OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, else by calling through (which
  * also refreshes the cache).
  *
  * Use this on the per-frame path. Over IPC the uncached call is a round trip.
@@ -2941,7 +2933,7 @@ struct oxr_session
 	 * over IPC that is a real round trip. It refreshes this cache on every
 	 * successful call; oxr_session_get_window_metrics_cached() serves the
 	 * frame-end poll from it and only calls through when the sample is
-	 * older than @ref OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS (a session that
+	 * older than @ref OXR_VIEWS_CHANGE_WM_MAX_AGE_NS (a session that
 	 * located no views this frame). Steady state therefore costs zero extra
 	 * IPC, and the poll sees exactly the rect the frame was located
 	 * against, which is the correct geometry to publish for that frame.

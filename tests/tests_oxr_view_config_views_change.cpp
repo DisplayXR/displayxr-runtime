@@ -64,6 +64,7 @@ namespace {
 
 constexpr uint32_t kViewCount = 2;
 constexpr uint64_t kSec = OXR_VIEWS_CHANGE_MIN_PERIOD_NS;
+constexpr uint64_t kMs = 1000 * 1000ULL;
 
 //! A frozen xrCreateInstance-time snapshot, the way oxr_system_fill_in() leaves it.
 struct Frozen
@@ -532,6 +533,64 @@ TEST_CASE("PR B: no usable window means no answer, which is the Linux case (#148
 
 	REQUIRE(w == 7); // never written on any refusal
 	REQUIRE(h == 7);
+}
+
+TEST_CASE("PR B: a cache hit COPIES the sample out (#1488)", "[oxr][views_change]")
+{
+	// THE REGRESSION THIS PINS. oxr_session_get_window_metrics_cached() exists
+	// so the frame-end poll costs no IPC round trip, and the fire site hands it
+	// a ZEROED struct. If a hit ever returned true without writing that struct,
+	// the caller would see valid=false, oxr_views_change_size_from_window()
+	// would refuse, and the IPC leg would produce no dims on any frame where
+	// the cache was fresh -- i.e. on essentially every frame, since
+	// xrLocateViews refreshes it. The doorbell would then fire only on the rare
+	// stale-fallback frame. Silent, total, and invisible to a macOS build.
+	struct xrt_window_metrics cached = window(1600, 900);
+	cached.display_pixel_width = 3840;
+	cached.display_pixel_height = 2160;
+
+	struct xrt_window_metrics out = {}; // exactly what the fire site passes
+	REQUIRE(oxr_views_change_cached_window_metrics(&cached, true, 1000, 1000 + 10 * kMs,
+	                                               OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, &out) == true);
+	REQUIRE(out.valid == true); // the field the downstream helper gates on
+	REQUIRE(out.window_pixel_width == 1600);
+	REQUIRE(out.window_pixel_height == 900);
+	REQUIRE(out.display_pixel_width == 3840);
+
+	// And end to end: a hit must be able to drive the derivation, which is the
+	// only reason the cache exists.
+	uint32_t w = 0, h = 0;
+	struct xrt_rendering_mode sbs = mode_with_scale(0.5f, 1.0f);
+	REQUIRE(oxr_views_change_size_from_window(&sbs, &out, false, &w, &h) == true);
+	REQUIRE(w == 800);
+	REQUIRE(h == 900);
+}
+
+TEST_CASE("PR B: a stale or empty cache falls through untouched (#1488)", "[oxr][views_change]")
+{
+	struct xrt_window_metrics cached = window(1600, 900);
+	struct xrt_window_metrics out = {};
+
+	// Nothing remembered yet.
+	REQUIRE(oxr_views_change_cached_window_metrics(&cached, false, 1000, 1000, OXR_VIEWS_CHANGE_WM_MAX_AGE_NS,
+	                                               &out) == false);
+
+	// Exactly at the ceiling is stale; one nanosecond under it is fresh.
+	REQUIRE(oxr_views_change_cached_window_metrics(&cached, true, 1000, 1000 + OXR_VIEWS_CHANGE_WM_MAX_AGE_NS,
+	                                               OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, &out) == false);
+	REQUIRE(oxr_views_change_cached_window_metrics(&cached, true, 1000, 1000 + OXR_VIEWS_CHANGE_WM_MAX_AGE_NS - 1,
+	                                               OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, &out) == true);
+
+	// Every refusal leaves the caller's struct alone, so it can fall through to
+	// the real query without having been half-written.
+	struct xrt_window_metrics untouched = {};
+	REQUIRE(oxr_views_change_cached_window_metrics(&cached, true, 1000, 1000 + 10 * OXR_VIEWS_CHANGE_WM_MAX_AGE_NS,
+	                                               OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, &untouched) == false);
+	REQUIRE(untouched.valid == false);
+	REQUIRE(untouched.window_pixel_width == 0);
+
+	REQUIRE(oxr_views_change_cached_window_metrics(nullptr, true, 1000, 1000, OXR_VIEWS_CHANGE_WM_MAX_AGE_NS,
+	                                               &untouched) == false);
 }
 
 

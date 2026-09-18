@@ -185,6 +185,48 @@ oxr_views_change_update(struct oxr_views_change *vc,
  *         never a baked-in sys->view_count.
  */
 /*!
+ * Default staleness ceiling for the session's cached window metrics; see
+ * @ref oxr_views_change_cached_window_metrics. Generous on purpose: this is a
+ * geometry hint whose consumer already edge-detects, and a 60 Hz app refreshes
+ * it every ~16 ms, so the only samples it rejects come from a frame that
+ * located no views at all.
+ */
+#define OXR_VIEWS_CHANGE_WM_MAX_AGE_NS (50 * 1000 * 1000ULL)
+
+/*!
+ * The cache policy behind oxr_session_get_window_metrics_cached(): decide
+ * whether a remembered window-metrics sample may serve this frame, and COPY it
+ * out when it may.
+ *
+ * Extracted here, with @p now_ns injected, for the same reason the throttle
+ * was: this TU compiles straight into the unit test, so the policy - and in
+ * particular the fact that a hit WRITES @p out_metrics - is pinned by a test
+ * rather than by review. A hit that returned true without writing would be
+ * silent and total: the fire site passes a zeroed struct, so every hit would
+ * present valid=false to @ref oxr_views_change_size_from_window, the IPC leg
+ * would produce no dims in the steady state, and the doorbell would fire only
+ * on the rare stale-fallback frame.
+ *
+ * @param cached      The remembered sample.
+ * @param cached_valid Whether anything has been remembered yet.
+ * @param cached_ns   Monotonic ns at which @p cached was taken.
+ * @param now_ns      Monotonic ns now; injected so staleness is testable.
+ * @param max_age_ns  Ceiling, normally @ref OXR_VIEWS_CHANGE_WM_MAX_AGE_NS.
+ *                    An age >= this is stale.
+ * @param[out] out_metrics Written ONLY on a hit, and left untouched otherwise
+ *                    so the caller can fall through to the real query.
+ *
+ * @return true iff @p out_metrics now holds the cached sample.
+ */
+bool
+oxr_views_change_cached_window_metrics(const struct xrt_window_metrics *cached,
+                                       bool cached_valid,
+                                       uint64_t cached_ns,
+                                       uint64_t now_ns,
+                                       uint64_t max_age_ns,
+                                       struct xrt_window_metrics *out_metrics);
+
+/*!
  * Derive the per-view render size an IPC/shell-hosted session should publish,
  * from the window rect the service reported plus the active rendering mode.
  *
