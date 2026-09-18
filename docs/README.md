@@ -190,7 +190,7 @@ Cross-cutting references that don't belong to a single audience.
 - [Qwerty Device](reference/qwerty-device.md) — keyboard/mouse simulated controller
 - [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
 - [Debug Logging](reference/debug-logging.md) — log level conventions
-- [View-Configuration Model](reference/view-configuration-model.md) — why `xrEnumerateViewConfigurationViews` can return 4 views for `PRIMARY_STEREO`: the max-across-modes count, the spec deviation it creates, the CTS test that catches it, and the planned fix (#1486)
+- [View-Configuration Model](reference/view-configuration-model.md) — `PRIMARY_STEREO` vs `PRIMARY_MULTIVIEW_DXR`: which view configuration an app begins, what each reports at `xrEnumerateViewConfigurationViews` / `xrLocateViews` / `xrEndFrame`, the under-submit contract, CTS status and the `DXR_VIEW_CONFIG_LEGACY` kill switch (#1486 / #80)
 - [Motion-to-Photon Levers](reference/motion-to-photon-levers.md) — every latency knob (late weave, repaint, queue tiers, deferred present, late latching) with its default, and the defaults per GPU topology (dGPU / iGPU / hybrid)
 - [Weave Cadence vs. Eye Prediction](reference/weave-cadence-vs-eye-prediction.md) — how late weave / repaint / slot partition / adapter split relate to vendor-side late latching and the eye predictor, which of them exist on Android, and the CNSDK prediction measurement plan
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
