@@ -516,6 +516,18 @@
 
 
 /*
+ * XR_EXT_view_configuration_views_change
+ */
+#if defined(XR_EXT_view_configuration_views_change)
+#define OXR_HAVE_EXT_view_configuration_views_change
+#define OXR_EXTENSION_SUPPORT_EXT_view_configuration_views_change(_) \
+    _(EXT_view_configuration_views_change, EXT_VIEW_CONFIGURATION_VIEWS_CHANGE)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_view_configuration_views_change(_)
+#endif
+
+
+/*
  * XR_EXT_win32_appcontainer_compatible
  */
 #if defined(XR_EXT_win32_appcontainer_compatible) && defined(XR_USE_PLATFORM_WIN32)
@@ -1221,6 +1233,7 @@
     OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) \
     OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_) \
     OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
+    OXR_EXTENSION_SUPPORT_EXT_view_configuration_views_change(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_DXR_win32_window_binding(_) \
     OXR_EXTENSION_SUPPORT_DXR_cocoa_window_binding(_) \

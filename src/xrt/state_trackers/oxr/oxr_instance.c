@@ -155,6 +155,7 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 
 	xrt_space_overseer_destroy(&inst->system.xso);
 	os_mutex_destroy(&inst->system.sync_actions_mutex);
+	oxr_views_change_fini(&inst->system.views_change); // #1488
 	xrt_system_devices_destroy(&inst->system.xsysd);
 	xrt_system_destroy(&inst->system.xsys);
 
@@ -423,6 +424,16 @@ oxr_instance_create(struct oxr_logger *log,
 	m_ret = os_mutex_init(&inst->system.sync_actions_mutex);
 	if (m_ret < 0) {
 		ret = oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to init sync action mutex");
+		return ret;
+	}
+
+	// #1488: dedicated lock for the live-view-size shadow. Deliberately NOT
+	// event.mutex (the event push already holds it) and NOT
+	// sync_actions_mutex (trylock-probed by the GET_XDEV_BY_ROLE macros).
+	// Must be initialised before oxr_system_fill_in() below seeds it.
+	m_ret = oxr_views_change_init(&inst->system.views_change);
+	if (m_ret < 0) {
+		ret = oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to init views change mutex");
 		return ret;
 	}
 

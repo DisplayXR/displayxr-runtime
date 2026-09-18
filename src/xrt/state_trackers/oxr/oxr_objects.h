@@ -33,6 +33,7 @@
 #include "oxr_subaction.h"
 #include "oxr_defines.h"
 #include "oxr_frame_sync.h"
+#include "oxr_views_change.h"
 
 #if defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12)
 #include <dxgi.h>
@@ -1227,6 +1228,19 @@ oxr_system_get_view_conf_properties(struct oxr_logger *log,
                                     XrViewConfigurationType viewConfigurationType,
                                     XrViewConfigurationProperties *configurationProperties);
 
+/*!
+ * #1488: is the DXR_VIEWS_CHANGE_LIVE kill switch on?
+ *
+ * The option itself is read by DEBUG_GET_ONCE_BOOL_OPTION in oxr_system.c and
+ * nowhere else (those caches are per translation unit). oxr_session_frame_end.c
+ * consults it through here, because a runtime whose enumerate answer cannot
+ * move must not ring the doorbell either.
+ *
+ * @public @memberof oxr_system
+ */
+bool
+oxr_system_views_change_live_enabled(void);
+
 XrResult
 oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
                                      struct oxr_system *sys,
@@ -2039,6 +2053,12 @@ struct oxr_system
 	XrViewConfigurationType view_config_type;
 	uint32_t view_count; //!< Number of views (1=mono, 2=stereo, 4=quad, etc.)
 	XrViewConfigurationView views[XRT_MAX_VIEWS];
+
+	//! #1488: XR_EXT_view_configuration_views_change. Shadow copy of @ref
+	//! views whose recommendedImageRect{Width,Height} are allowed to move,
+	//! plus its own dedicated lock and the spec's 1 Hz doorbell throttle.
+	//! @ref views itself is NEVER mutated after oxr_system_fill_in().
+	struct oxr_views_change views_change;
 	uint32_t blend_mode_count;
 	XrEnvironmentBlendMode blend_modes[3];
 
