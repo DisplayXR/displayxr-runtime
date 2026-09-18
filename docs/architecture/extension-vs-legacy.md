@@ -10,7 +10,7 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
 | **Rendering modes** | Enumerates all modes, handles `XrEventDataRenderingModeChangedDXR` | Unaware of modes, always renders stereo |
 | **Swapchain sizing** | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | `recommendedImageRectWidth * 2` (compromise scale) |
 | **Mode switching** | All modes: V toggle + 1/2/3 direct selection | Only V toggle between mode 0 (2D) and the default 3D mode |
-| **Modes it may run in** | Only modes its view configuration can fill (2 under `PRIMARY_STEREO`, the device max under `PRIMARY_MULTIVIEW_DXR`) — #1499 | Only modes it can fill (`view_count ≤ 2`) — the mode floor, below |
+| **Modes it may run in** | Only modes its view configuration can fill (2 under `PRIMARY_STEREO`, the device max under `PRIMARY_MULTIVIEW_DXR`) — #1499, *unless* the device pins its mode or the panel lease owns it in service mode | Only modes it can fill (`view_count ≤ 2`) — the mode floor, below |
 
 ## Which Apps Are Which?
 
@@ -58,7 +58,9 @@ Three differences from the legacy half, all forced by *when* the answer is knowa
 
 `xrRequestDisplayRenderingModeDXR` denies a mode the session could not fill, with `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` — locally, before the request reaches the panel-lease holder. A session that was created but never *begun* is exempt: a workspace controller drives the panel on behalf of its clients rather than painting into it, so a painter's constraint must not be imposed on an orchestrator.
 
-The same two overrides apply (a pinned device, service mode), and a `PRIMARY_MULTIVIEW_DXR` session is never floored or denied — that is the invariant the whole change is built around. Kill switch: `DXR_MODE_FLOOR=0` restores the pre-#1499 behaviour for extension sessions only. Full model: [View-Configuration Model](../reference/view-configuration-model.md#the-mode-floor-1499).
+The same two overrides apply — a pinned device and service mode — and they apply to **both** halves: a pinned session is not floored *and* is not denied (it would otherwise be refused permission to re-request the mode it is already sitting in, and the device is the authority there anyway), and a service-mode client is neither floored *nor* answered locally, because its request has to reach the panel-lease holder. A `PRIMARY_MULTIVIEW_DXR` session is never floored or denied either — that is the invariant the whole change is built around.
+
+Kill switch: `DXR_MODE_FLOOR=0` restores the pre-#1499 behaviour for extension sessions only — no floor, no denial, and none of the #1499 log lines, since a warning the runtime never used to print is part of what "pre-#1499" means. Full model: [View-Configuration Model](../reference/view-configuration-model.md#the-mode-floor-1499).
 
 See [ADR-006](../adr/ADR-006-legacy-app-compromise-view-scale.md) for the design rationale and [Legacy App Support](../specs/runtime/legacy-app-support.md) for the full algorithm (Case A/B).
 
