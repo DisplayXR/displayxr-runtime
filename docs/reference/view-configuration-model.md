@@ -181,11 +181,25 @@ OpenXR-CTS 1.1.57 added the automated (untagged, **not** `[interactive]`) test
 that VIEW space equals the centroid of the `xrLocateViews` origins, and for
 `PRIMARY_STEREO` it asserts `REQUIRE(views.size() == 2)`
 (`test_xrLocateSpace.cpp:323`). That assertion is why the old model failed the
-test by construction on sim-display.
+test by construction on sim-display. **With this model it passes** — verified on
+the win box (sim-display, D3D11, CTS 1.1.63.0): the count assertion goes green.
 
-**The `~xrLocateSpace_xrLocateViews` exclusion is removed** from
-`.github/workflows/cts.yml` and `scripts/run_cts.ps1` — the test passing is now
-the acceptance signal for this model, not a known red.
+The test then advances to its **centroid** assertion
+(`test_xrLocateSpace.cpp:330`): VIEW space located in LOCAL must equal the mean
+of the `xrLocateViews` origins. That one fails, deterministically
+(`(0.102304, 0.043731, 0)` vs `(0, 0, 0)`, bit-identical across cold runs),
+because DisplayXR's VIEW reference space is the viewer origin while the located
+eyes carry an offset (the `#1370` test in `tests/tests_oxr_view_space.cpp`
+describes exactly that "eye-centroid offset from the VIEW origin"). This is a
+**second, pre-existing deviation** that the count fix merely exposed — the
+sim-display pair is symmetric about x=0 by construction
+(`sim_display_device.c:807-815`), so the 2-view clamp cannot have shifted it.
+Tracked as [#1502](https://github.com/DisplayXR/displayxr-runtime/issues/1502).
+
+**So the `~xrLocateSpace_xrLocateViews` by-name exclusion stays** in
+`.github/workflows/cts.yml` and `scripts/run_cts.ps1`, re-pointed at #1502: a
+known, named red rather than an unnamed one. The view-count half is fixed; the
+centroid half is tracked. Delete the exclusion when #1502 lands.
 
 What the CTS actually sees: it never enables `XR_DXR_display_info`, so
 `PRIMARY_MULTIVIEW_DXR` is never enumerated to it. The CTS sees exactly
