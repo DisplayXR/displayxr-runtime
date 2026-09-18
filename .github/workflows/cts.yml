@@ -94,24 +94,22 @@ jobs:
           # system became a first-class regression surface with the
           # input-provider channel (#823).
           #
-          # KNOWN-RED EXCLUSION (#1486) — xrLocateSpace_xrLocateViews.
-          # CTS 1.1.57 added that test; it asserts REQUIRE(views.size() == 2)
-          # for PRIMARY_STEREO. DisplayXR advertises PRIMARY_STEREO with the
-          # MAX-across-modes view count, which is 4 on sim-display (it has a
-          # Quad mode), so the test fails by construction on every run. It is
-          # excluded BY NAME so the nightly's red stays a *known* red instead of
-          # noise — this is not a conformance claim on that test. Delete the
-          # exclusion when #1486's real fix lands.
-          # Full rationale + planned fix:
-          #   docs/reference/view-configuration-model.md
-          # Catch2 spec syntax: patterns inside ONE filter are ANDed (every
-          # m_required matches, no m_forbidden matches); a COMMA starts a second
-          # filter and filters are OR'd -- so the exclusion must be appended
-          # WITHOUT a comma or it would exclude nothing.
-          # The smoke slice below does not name or tag that test, so it never
-          # runs there and needs no exclusion.
+          # NO KNOWN-RED EXCLUSIONS. The #1486 exclusion of
+          # xrLocateSpace_xrLocateViews (CTS 1.1.57; it asserts
+          # REQUIRE(views.size() == 2) for PRIMARY_STEREO, which the old
+          # max-across-modes mapping could not satisfy on sim-display) was
+          # REMOVED once PRIMARY_STEREO began reporting exactly 2 and the N-view
+          # path moved to XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR. That
+          # test passing is the acceptance signal for the view-configuration
+          # model: docs/reference/view-configuration-model.md
+          # Any future exclusion must be BY NAME with a comment naming its
+          # issue. Catch2 spec syntax if one is ever needed again: patterns
+          # inside ONE filter are ANDed (every m_required matches, no
+          # m_forbidden matches); a COMMA starts a second filter and filters are
+          # OR'd -- so an appended exclusion must carry no comma or it would
+          # exclude nothing.
           if ($scope -eq "full") {
-            $spec = "exclude:[interactive]~xrLocateSpace_xrLocateViews"
+            $spec = "exclude:[interactive]"
             $timeout = "900"
           } else {
             $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,multithreading,[actions]~[interactive]"
