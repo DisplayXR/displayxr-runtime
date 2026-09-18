@@ -19,8 +19,9 @@
 #include <windows.h>
 #include <wrl/client.h>
 
-#include "logging.h"
 #include "d3d11_renderer.h"
+#include "dxr_view_config.h"
+#include "logging.h"
 #include "xr_session.h"
 
 #include <chrono>
@@ -205,9 +206,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         0.0f, 0.0f)) {     // playerYaw/Pitch (handled by qwerty)
 
                         // Use current mode's view count (not xr.viewCount which is max across all modes)
-                        uint32_t modeViewCount = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeViewCounts[xr.currentModeIndex] : xr.viewCount;
-                        submitViewCount = modeViewCount;
+                        uint32_t modeViewCount =
+                            (xr.currentModeIndex < xr.renderingModeCount)
+                                ? xr.renderingModeViewCounts
+                                      [xr.currentModeIndex]
+                                : xr.viewCount;
 
                         // Get raw view poses (pre-player-transform) for projection views.
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -220,6 +223,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr.session, &locateInfo, &viewState, 8, &rawViewCount, rawViews);
+
+                        // ADR-041: the layer carries the LOCATED count, not the
+                        // active mode's — only modeViewCount of them are
+                        // rendered, and the tail is aliased onto view 0 below.
+                        uint32_t locatedCount =
+                            (rawViewCount > 0) ? rawViewCount : modeViewCount;
+                        if (locatedCount > 8)
+                          locatedCount = 8; // projectionViews[] capacity
+                        if (modeViewCount > locatedCount)
+                          modeViewCount = locatedCount;
+                        submitViewCount = locatedCount;
 
                         // Get tile layout from rendering mode, with fallback
                         uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
@@ -286,6 +300,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
+
+                            // ADR-041: fill the inactive tail
+                            // [modeViewCount, locatedCount) — own located
+                            // pose/fov, view 0's subimage.
+                            DxrAliasInactiveViews(projectionViews, rawViews,
+                                                  locatedCount, modeViewCount);
 
                             if (rtv) rtv->Release();
                             ReleaseSwapchainImage(xr);

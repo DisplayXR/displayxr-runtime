@@ -118,6 +118,52 @@ DxrViewConfigTypeName(XrViewConfigurationType t)
 	return "other";
 }
 
+/*!
+ * ADR-041: fill the INACTIVE tail of a projection layer so the layer carries
+ * the full located view count.
+ *
+ * The view count a session gets is fixed for its lifetime; what changes per
+ * frame is how many of those views the active rendering mode actually uses
+ * (chain XrViewActivityStateDXR on XrViewState to read it, or derive it from
+ * the mode as these apps do). Core OpenXR still requires EVERY located view to
+ * be supplied at xrEndFrame, so an app that renders only the active ones closes
+ * the gap by pointing each inactive view at content it already rendered. The
+ * runtime ignores those pixels.
+ *
+ * Each inactive view keeps its OWN located pose/fov — they are valid (the
+ * runtime parks them at view 0's pose) and a pose the runtime rejects would
+ * fail the layer for real. Only the subimage is aliased, onto view 0's.
+ *
+ * Safe to call with active >= located (does nothing).
+ *
+ * @param projViews  The layer's view array, sized @p located. [0, active) must
+ *                   already be filled by the caller.
+ * @param views      The XrView array xrLocateViews wrote, sized @p located.
+ * @param located    What xrLocateViews returned (viewCountOutput).
+ * @param active     Views the app actually rendered this frame.
+ */
+static inline void
+DxrAliasInactiveViews(XrCompositionLayerProjectionView *projViews,
+                      const XrView *views, uint32_t located, uint32_t active) {
+        if (projViews == NULL || active >= located) {
+                return;
+        }
+        for (uint32_t i = active; i < located; i++) {
+                projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                projViews[i].next = NULL;
+                if (views != NULL) {
+                        projViews[i].pose = views[i].pose;
+                        projViews[i].fov = views[i].fov;
+                } else {
+                        projViews[i].pose = projViews[0].pose;
+                        projViews[i].fov = projViews[0].fov;
+                }
+                // The whole trick: content the app DID render this frame, which
+                // the runtime then discards because the view is inactive.
+                projViews[i].subImage = projViews[0].subImage;
+        }
+}
+
 #ifdef __cplusplus
 }
 #endif
