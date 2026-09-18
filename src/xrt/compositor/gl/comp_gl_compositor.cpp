@@ -5106,6 +5106,22 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 		wglMakeCurrent(prev_hdc, prev_hglrc);
 	}
 
+	/*
+	 * #1522: hand the common (cache) DC back. GetDC() borrowed it from a
+	 * bounded process-wide cache — neither the shared window module's class
+	 * nor an app's is CS_OWNDC — and nothing released it, so every GL session
+	 * leaked one for the life of the process. Must run while c->hwnd is still
+	 * valid, i.e. before the window destroy below, and after the context that
+	 * used it is gone. Harmless (returns 1) if the app's class happens to
+	 * carry CS_OWNDC.
+	 */
+	if (c->hdc != NULL) {
+		if (c->hwnd != NULL) {
+			ReleaseDC(c->hwnd, c->hdc);
+		}
+		c->hdc = NULL;
+	}
+
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_destroy(&c->own_window);
 	} else if (c->owns_window && c->hwnd) {
@@ -5172,19 +5188,6 @@ gl_get_proc_addr(void *userptr, const char *name)
 	return ret;
 }
 
-static const wchar_t GL_WINDOW_CLASS[] = L"DisplayXRGLCompositor";
-
-static LRESULT CALLBACK
-gl_window_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-	switch (msg) {
-	case WM_CLOSE:
-		return 0; // Prevent close
-	default:
-		return DefWindowProcW(hwnd, msg, wParam, lParam);
-	}
-}
-
 static bool
 gl_create_window_and_context(struct comp_gl_compositor *c,
                               void *window_handle,
@@ -5194,15 +5197,15 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
                               int32_t screen_left,
                               int32_t screen_top)
 {
-	// Register window class
-	WNDCLASSEXW wc = {0};
-	wc.cbSize = sizeof(wc);
-	wc.style = CS_OWNDC;
-	wc.lpfnWndProc = gl_window_proc;
-	wc.hInstance = GetModuleHandleW(NULL);
-	wc.lpszClassName = GL_WINDOW_CLASS;
-	RegisterClassExW(&wc);
-
+	/*
+	 * #1522: no window class is registered here any more. This function used
+	 * to register a private CS_OWNDC class "DisplayXRGLCompositor" with its
+	 * own window proc, but nothing ever created a window from it — the
+	 * self-owned window comes from comp_d3d11_window_create() below, and an
+	 * app-supplied HWND is the app's own class. The registration was dead
+	 * from the day the GL leg moved to the shared window module, and it
+	 * leaked one process-global class atom per GL session.
+	 */
 	if (window_handle != NULL) {
 		c->hwnd = (HWND)window_handle;
 		c->owns_window = false;
@@ -5226,6 +5229,12 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 		return false;
 	}
 
+	/*
+	 * #1522: a COMMON (cache) device context — neither the shared window
+	 * module's class nor an app's is CS_OWNDC, so this handle is on loan from
+	 * a bounded process-wide cache and MUST be handed back with ReleaseDC.
+	 * gl_compositor_destroy() does that, while c->hwnd is still alive.
+	 */
 	c->hdc = GetDC(c->hwnd);
 
 	// Set pixel format
