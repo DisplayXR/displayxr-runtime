@@ -6,6 +6,75 @@ Picks up where the macOS session left off. The platform-agnostic half of
 Windows**: build the Khronos conformance suite, run it against the runtime, and
 iterate. First target: **Windows + D3D11**.
 
+> The Phase 1–4 narrative below is the original bring-up plan and is kept for
+> provenance. For **what the lane runs today**, read the next section first.
+
+## Current state — certified version + the arm matrix (#1523)
+
+**Certified against: OpenXR-CTS `1.1.63.0`, Khronos loader `1.1.63`.** Both pins
+are single-sourced — the CTS tag in `scripts/fetch_build_cts.bat` (`CTS_TAG`,
+which carries the rationale for *why* 1.1.63.0 and not an older release) and the
+loader version in `.github/workflows/cts.yml`'s *Install OpenXR loader* step.
+They must move together (#1487). The device under test is the vendor-neutral
+**`sim-display`** plug-in, registered into
+`HKLM\Software\DisplayXR\DisplayProcessors` by the lane itself — the runs are
+hardware-free by construction.
+
+A submission owes **one automated run per graphics plugin per platform**. The
+plugins we advertise, and therefore owe:
+
+| Platform | Graphics plugins | Automated runs |
+|---|---|---:|
+| **Windows** | `d3d11`, `d3d12`, `opengl`, `vulkan`, `vulkan2` | 5 |
+| **Linux** (Vulkan-only, X11/XCB) | `vulkan`, `vulkan2` | 2 |
+| **Android** (Vulkan-only) | `vulkan`, `vulkan2` | 2 |
+
+`vulkan` and `vulkan2` are **separate CTS plugins** (`XR_KHR_vulkan_enable` vs
+`XR_KHR_vulkan_enable2`); we advertise both, so neither substitutes for the
+other. macOS / `metal` is deliberately **out of this matrix** — the platform is
+deferred.
+
+### Which arms actually execute, and on what
+
+`cts.yml` builds the runtime and the CTS **once** and fans the arms out over
+that single build (`plan` → `build` → `run` matrix → `summary`). What each arm
+runs on today:
+
+| Arm | Backing | Gated? | Blocker |
+|---|---|---|---|
+| `d3d11` | GitHub-hosted `windows-2022`, **WARP** (D3D software rasterizer, always present in the image) | **yes** | — |
+| `d3d12` | GitHub-hosted `windows-2022`, **WARP** | **yes** | — |
+| `opengl` | needs a **software ICD** (Mesa llvmpipe) — the hosted image has no usable GL 4.x context | no — `continue-on-error`, reported only | #1525, then #1522 (GL teardown race) |
+| `vulkan` | needs a **software ICD** (lavapipe / SwiftShader) — the hosted image ships no Vulkan ICD | no — `continue-on-error`, reported only | #1525 |
+| `vulkan2` | same as `vulkan` | no — `continue-on-error`, reported only | #1525 |
+| Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
+| Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
+
+The three experimental Windows arms are driven by **one flag**: the
+`EXPERIMENTAL="opengl vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets
+each arm's `continue-on-error` and tells the `summary` job which arms to exclude
+from the gate. #1525 empties that string and nothing else changes.
+
+Beyond software rasterizers, **#1526** tracks a self-hosted Windows runner on a
+hybrid iGPU+dGPU box — a real-GPU lane is what turns the three software-ICD arms
+from "it ran" into a defensible submission, and it is also the only way to cover
+adapter selection (`DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU`).
+
+### Result artefacts
+
+Each arm writes `%TEMP%\cts_ci_<graphics>.xml` (ctsxml) plus
+`cts_ci_<graphics>_console.log`, staged and uploaded as
+**`cts-results-<graphics>`**. The set is assembled to be droppable into a
+Khronos submission package unmodified — one XML per graphics plugin, named after
+it. The `summary` job downloads every arm, prints one table (arm / tests /
+failures / errors / status) into the run summary, and **fails the lane if any
+non-experimental arm was red or produced no XML**. A single arm no longer gates
+alone.
+
+Triggers: PR → `smoke` / `d3d11` only (fast); nightly cron + `v*` tag → `full`
+over all five Windows arms; `workflow_dispatch` → any single plugin or `all`,
+at either scope.
+
 ## What's already done (this branch)
 
 `XR_EXT_conformance_automation` — the mechanism the CTS uses to inject synthetic
@@ -106,11 +175,17 @@ minimal backing or exclude via the run manifest — and **log every exclusion**
 
 ## Reference
 
-- **Known-red exclusions in the default spec:** `xrLocateSpace_xrLocateViews` is
-  excluded by name (#1502, VIEW ≠ centroid of view origins; the #1486 view-count
-  half is fixed) — see
-  [View-Configuration Model](../reference/view-configuration-model.md). Any test
-  excluded from `cts.yml` / `run_cts.ps1` must carry a comment naming its issue.
+- **Known-red exclusions in the default spec: there are none.** The default spec
+  is `exclude:[interactive]` — the whole non-interactive suite, nothing excluded
+  by name. `xrLocateSpace_xrLocateViews` was excluded from #1491 until both of
+  its assertions were fixed (`views.size() == 2` by #1486, `VIEW` == centroid of
+  the located view origins by #1502); the exclusion was dropped in `c1e4fe00d`
+  and the test runs in the default lane — see
+  [View-Configuration Model](../reference/view-configuration-model.md). If a
+  by-name exclusion is ever needed again it must carry a comment naming its
+  issue, in **both** `cts.yml` and `run_cts.ps1`, and Catch2's comma rule
+  applies (a comma starts a second, OR'd filter and would exclude nothing —
+  append `~name` with no comma).
 - **`conformance_cli.exe` DPI manifest (#1506):** the Khronos CTS binary is
   built with no DPI manifest, so on a scaled display it ran DPI-unaware and
   every geometric measurement (window size/position, Kooima projection, view

@@ -4,10 +4,15 @@ name: OpenXR CTS
 # runtime + the sim-display plug-in (hardware-free), using the Khronos
 # conformance_cli pinned to the loader version.
 #
-#  - pull_request (only when runtime / compositor / CTS-harness paths change) -> SMOKE subset
-#  - nightly cron on main                                                     -> FULL non-interactive suite
-#  - v* tag                                                                   -> FULL suite (release gate)
-#  - workflow_dispatch                                                        -> on-demand (choose graphics + scope)
+#  - pull_request (only when runtime / compositor / CTS-harness paths change) -> SMOKE subset, d3d11 only
+#  - nightly cron on main                                                     -> FULL non-interactive suite, ALL Windows arms
+#  - v* tag                                                                   -> FULL suite, ALL Windows arms (release gate)
+#  - workflow_dispatch                                                        -> on-demand (choose graphics incl. `all` + scope)
+#
+# Shape (#1523): ONE build job produces the runtime + the CTS binaries, then a
+# `run` matrix fans out over the graphics plugins reusing that single build —
+# five arms must not mean five builds. A `summary` job aggregates every arm's
+# result XML into one table and is the lane's real gate.
 #
 # The runtime is registered for the (elevated) Khronos loader via HKLM
 # ActiveRuntime — XR_RUNTIME_JSON is ignored when elevated. scripts/run_cts.ps1
@@ -41,10 +46,10 @@ on:
   workflow_dispatch:
     inputs:
       graphics:
-        description: 'Graphics plugin'
+        description: 'Graphics plugin (all = fan out over every Windows plugin)'
         type: choice
         default: d3d11
-        options: [d3d11, d3d12]
+        options: [d3d11, d3d12, opengl, vulkan, vulkan2, all]
       scope:
         description: 'Test scope'
         type: choice
@@ -59,7 +64,114 @@ permissions:
   contents: read
 
 jobs:
-  CTS:
+  # ---------------------------------------------------------------------------
+  # Decide scope + spec + which graphics arms to fan out over. Free Linux job so
+  # the Windows minutes go to the work that needs Windows.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.p.outputs.scope }}
+      spec: ${{ steps.p.outputs.spec }}
+      timeout: ${{ steps.p.outputs.timeout }}
+      arms: ${{ steps.p.outputs.arms }}
+      matrix: ${{ steps.p.outputs.matrix }}
+      experimental: ${{ steps.p.outputs.experimental }}
+    steps:
+      - name: Resolve run parameters
+        id: p
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Every graphics plugin the CTS can drive on Windows. `vulkan` and
+          # `vulkan2` are SEPARATE plugins (XR_KHR_vulkan_enable vs _enable2) and
+          # we advertise both, so both are owed a submission run (#1523).
+          ALL_ARMS="d3d11 d3d12 opengl vulkan vulkan2"
+
+          # ===== THE EXPERIMENTAL FLAG — #1525 FLIPS EXACTLY THIS LINE =====
+          # opengl / vulkan / vulkan2 cannot even START on a GitHub-hosted
+          # windows-2022 runner: the image ships no usable GL 4.x context and no
+          # Vulkan ICD, so conformance_cli aborts before the first test. Until
+          # #1525 lands the software rasterizers (llvmpipe / lavapipe), those
+          # three arms run with continue-on-error and are EXCLUDED FROM THE GATE
+          # (but still reported in the summary table). When #1525 lands, set this
+          # to the empty string — nothing else in this file needs to change.
+          EXPERIMENTAL="opengl vulkan vulkan2"
+          # =================================================================
+
+          scope="smoke"
+          arms="d3d11"   # PR lane: one fast arm.
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              scope="${{ inputs.scope }}"
+              g="${{ inputs.graphics }}"
+              if [ "$g" = "all" ]; then arms="$ALL_ARMS"; else arms="$g"; fi
+              ;;
+            schedule|push)
+              # schedule = nightly on main; push = a v* tag (see `on:` above).
+              scope="full"
+              arms="$ALL_ARMS"
+              ;;
+          esac
+
+          # Smoke = a fast, representative slice; full = the whole non-interactive
+          # subset. Interactive (HMD/controller) categories are out of scope here
+          # and are tracked as a separate manual procedure (#1523 part 4).
+          # The smoke slice includes the non-interactive [actions] tests
+          # (create/destroy sets+actions, suggest bindings, attach,
+          # StateQueryFunctionsAndHaptics, action-space creation) — the action
+          # system became a first-class regression surface with the
+          # input-provider channel (#823).
+          #
+          # The full lane runs the whole non-interactive suite with nothing
+          # excluded by name. If a by-name exclusion is ever needed again —
+          # Catch2 spec syntax: patterns inside ONE filter are ANDed (every
+          # m_required matches, no m_forbidden matches); a COMMA starts a second
+          # filter and filters are OR'd, so append "~name" WITHOUT a comma or it
+          # excludes nothing.
+          if [ "$scope" = "full" ]; then
+            spec="exclude:[interactive]"
+            timeout="900"
+          else
+            spec="Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,multithreading,[actions]~[interactive]"
+            timeout="420"
+          fi
+
+          # Build the matrix as include[] so each arm carries its own
+          # `experimental` flag for continue-on-error.
+          inc=""
+          for a in $arms; do
+            exp="false"
+            for e in $EXPERIMENTAL; do
+              if [ "$a" = "$e" ]; then exp="true"; fi
+            done
+            inc="${inc}{\"graphics\":\"${a}\",\"experimental\":${exp}},"
+          done
+          matrix="{\"include\":[${inc%,}]}"
+
+          {
+            echo "scope=$scope"
+            echo "spec=$spec"
+            echo "timeout=$timeout"
+            echo "arms=$arms"
+            echo "experimental=$EXPERIMENTAL"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "scope=$scope timeout=$timeout"
+          echo "arms=$arms  (experimental: $EXPERIMENTAL)"
+          echo "spec=$spec"
+          echo "matrix=$matrix"
+
+  # ---------------------------------------------------------------------------
+  # ONE build for every arm: runtime + sim-display plug-in + the Khronos CTS.
+  # The runtime tree ships to the run arms as an artifact; the CTS tree rides the
+  # existing actions/cache (the run arms restore the very cache this job warms).
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build runtime + CTS
     runs-on: windows-2022
     env:
       GH_TOKEN: ${{ github.token }}
@@ -69,54 +181,6 @@ jobs:
         with:
           submodules: recursive
           lfs: true
-
-      # Decide graphics + test spec from the trigger.
-      #   PR                 -> smoke / d3d11
-      #   schedule / tag     -> full  / d3d11
-      #   workflow_dispatch  -> inputs
-      - name: Resolve run parameters
-        id: params
-        shell: pwsh
-        run: |
-          $graphics = "d3d11"
-          $scope = "smoke"
-          if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
-            $graphics = "${{ inputs.graphics }}"
-            $scope = "${{ inputs.scope }}"
-          } elseif ($env:GITHUB_EVENT_NAME -eq "schedule" -or $env:GITHUB_REF -like "refs/tags/*") {
-            $scope = "full"
-          }
-          # Smoke = a fast, representative slice; full = the whole non-interactive
-          # subset. Interactive (HMD/controller) categories are out of scope.
-          # The smoke slice includes the non-interactive [actions] tests
-          # (create/destroy sets+actions, suggest bindings, attach,
-          # StateQueryFunctionsAndHaptics, action-space creation) — the action
-          # system became a first-class regression surface with the
-          # input-provider channel (#823).
-          #
-          # The full lane runs the whole non-interactive suite with nothing
-          # excluded by name. xrLocateSpace_xrLocateViews was excluded here from
-          # #1491 until #1502 landed (#1516): #1486 fixed its views.size() == 2
-          # assertion and #1502 its VIEW == centroid assertion, verified 9/0 on
-          # hardware, so it is back in the lane. History and rationale:
-          # docs/reference/view-configuration-model.md § CTS.
-          # If a by-name exclusion is ever needed again — Catch2 spec syntax:
-          # patterns inside ONE filter are ANDed (every m_required matches, no
-          # m_forbidden matches); a COMMA starts a second filter and filters
-          # are OR'd, so append "~name" WITHOUT a comma or it excludes nothing.
-          if ($scope -eq "full") {
-            $spec = "exclude:[interactive]"
-            $timeout = "900"
-          } else {
-            $spec = "Swapchains,SessionState,ValidateEnvironment,validApiLayer,XR_KHR_visibility_mask,XR_KHR_composition_layer_cylinder,multithreading,[actions]~[interactive]"
-            $timeout = "420"
-          }
-          "graphics=$graphics" >> $env:GITHUB_OUTPUT
-          "scope=$scope"       >> $env:GITHUB_OUTPUT
-          "spec=$spec"         >> $env:GITHUB_OUTPUT
-          "timeout=$timeout"   >> $env:GITHUB_OUTPUT
-          Write-Host "graphics=$graphics scope=$scope timeout=$timeout"
-          Write-Host "spec=$spec"
 
       - name: Restore from cache and setup vcpkg
         uses: lukka/run-vcpkg@v11
@@ -203,7 +267,8 @@ jobs:
           cmake --build build --config Release --target install
 
       # Build the Khronos conformance_cli + conformance_test (+ the two CTS API
-      # layers) pinned to the loader version. Cached on the harness script hash.
+      # layers) pinned to the loader version. Cached on the harness script hash —
+      # the `run` arms restore THIS cache rather than rebuilding (see below).
       - name: Cache CTS build
         id: cts-cache
         uses: actions/cache@v5
@@ -215,6 +280,79 @@ jobs:
         if: steps.cts-cache.outputs.cache-hit != 'true'
         shell: cmd
         run: scripts\fetch_build_cts.bat
+
+      # Hand the run arms everything they need to EXECUTE without a toolchain:
+      # the build tree (the dev manifest at build\Release\openxr_displayxr-dev.json
+      # points at an ABSOLUTE path inside it — stable because every hosted Windows
+      # runner uses the same D:\a\<repo>\<repo> workspace), the installed
+      # _package (sim-display plug-in), and the Khronos loader drop. Object files
+      # / import libs / PDBs are stripped — nothing links downstream.
+      - name: Package the build tree for the run arms
+        shell: pwsh
+        run: |
+          tar -cf cts-build-tree.tar `
+            --exclude='*.obj' --exclude='*.o' --exclude='*.lib' --exclude='*.pdb' `
+            --exclude='*.ilk' --exclude='*.exp' --exclude='CMakeFiles' `
+            build _package openxr_sdk
+          if ($LASTEXITCODE -ne 0) { throw "tar failed ($LASTEXITCODE)" }
+          $mb = [math]::Round((Get-Item cts-build-tree.tar).Length / 1MB, 1)
+          Write-Host "cts-build-tree.tar = $mb MB"
+
+      - name: Upload build tree
+        uses: actions/upload-artifact@v6
+        with:
+          name: cts-build-tree
+          path: cts-build-tree.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # One arm per graphics plugin, all reusing the single build above.
+  # ---------------------------------------------------------------------------
+  run:
+    name: CTS ${{ matrix.graphics }}
+    needs: [plan, build]
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    # Experimental arms (see the flag in `plan`) report but never fail the lane.
+    continue-on-error: ${{ matrix.experimental }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Per-arm tag -> %TEMP%\cts_ci_<graphics>.xml + cts_ci_<graphics>_console.log.
+      # Every arm used to write cts_ci.xml, so a matrix would have been five files
+      # with one name and no submission package (#1523).
+      CTS_TAG: ci_${{ matrix.graphics }}
+    steps:
+      # Sources only — nothing is compiled here. No submodules, no LFS: the
+      # binaries arrive as an artifact and the CTS tree from the cache.
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Download build tree
+        uses: actions/download-artifact@v6
+        with:
+          name: cts-build-tree
+
+      - name: Unpack build tree
+        shell: pwsh
+        run: |
+          tar -xf cts-build-tree.tar
+          if ($LASTEXITCODE -ne 0) { throw "tar extract failed ($LASTEXITCODE)" }
+          $manifest = "build\Release\openxr_displayxr-dev.json"
+          if (-not (Test-Path $manifest)) { throw "dev runtime manifest missing after unpack: $manifest" }
+          Get-Content $manifest | Write-Host
+
+      # Same key as the build job's actions/cache — that job either hit it or
+      # populated it, so by the time this runs it always exists. Fail loudly
+      # rather than silently rebuilding the CTS five times over.
+      - name: Restore CTS build
+        uses: actions/cache/restore@v5
+        with:
+          path: build-cts
+          key: cts-${{ runner.os }}-${{ hashFiles('scripts/fetch_build_cts.bat') }}-1.1.63
+          fail-on-cache-miss: true
 
       # Register the freshly-built sim-display plug-in for DP discovery, exactly
       # as build-windows.yml's self-test gate does.
@@ -232,27 +370,27 @@ jobs:
           reg add $key /v DisplayName /t REG_SZ /d "Simulated 3D Display" /f | Out-Null
           Write-Host "Registered sim-display plug-in: $plugin"
 
-      - name: Run CTS (${{ steps.params.outputs.scope }} / ${{ steps.params.outputs.graphics }})
+      - name: Run CTS (${{ needs.plan.outputs.scope }} / ${{ matrix.graphics }})
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE\scripts\run_cts.ps1" `
-            -TestSpec "${{ steps.params.outputs.spec }}" `
-            -Graphics "${{ steps.params.outputs.graphics }}" `
+            -TestSpec "${{ needs.plan.outputs.spec }}" `
+            -Graphics "${{ matrix.graphics }}" `
             -ConformanceLayer `
-            -TimeoutSec ${{ steps.params.outputs.timeout }} `
-            -Tag "ci"
+            -TimeoutSec ${{ needs.plan.outputs.timeout }} `
+            -Tag "$env:CTS_TAG"
 
       - name: Evaluate results
         shell: pwsh
         run: |
-          $xml = "$env:TEMP\cts_ci.xml"
+          $xml = "$env:TEMP\cts_$($env:CTS_TAG).xml"
           if (-not (Test-Path $xml)) { throw "CTS produced no result XML — the run likely crashed before writing results." }
           # Check completeness BEFORE parsing: a crashed run leaves a truncated
           # XML, and the [xml] cast on it dies with an opaque MetadataError
           # (masked the real story for weeks — #830). Surface the last test the
           # console log reached instead.
           if (-not (Select-String -Path $xml -Pattern '</testsuites>' -Quiet)) {
-            $log = "$env:TEMP\cts_ci_console.log"
+            $log = "$env:TEMP\cts_$($env:CTS_TAG)_console.log"
             $lastTest = "(no console log)"
             if (Test-Path $log) {
               $m = Select-String -Path $log -Pattern '^-{10,}$' -Context 0,1 | Select-Object -Last 1
@@ -293,12 +431,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $log = "$env:TEMP\cts_ci_console.log"
+          $log = "$env:TEMP\cts_$($env:CTS_TAG)_console.log"
           if (-not (Test-Path $log)) { Write-Host "No CTS console log to scrape metrics from."; exit 0 }
           $lines = Get-Content $log |
             Select-String -Pattern 'Average (xrWaitFrame|time spent|predicted|xrBeginFrame)|Overhead score'
           if (-not $lines) { Write-Host "No Timed_Pipelined_Frame_Submission metrics in console log."; exit 0 }
-          "## CTS frame-timing (Timed_Pipelined_Frame_Submission)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          "## CTS frame-timing — ${{ matrix.graphics }} (Timed_Pipelined_Frame_Submission)" | Out-File -Append $env:GITHUB_STEP_SUMMARY
           '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
           $lines | ForEach-Object { $_.Line.Trim() | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY | Write-Host }
           '```' | Out-File -Append $env:GITHUB_STEP_SUMMARY
@@ -321,16 +459,105 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force cts-results | Out-Null
-          foreach ($f in @("cts_ci.xml", "cts_ci_console.log")) {
+          foreach ($f in @("cts_$($env:CTS_TAG).xml", "cts_$($env:CTS_TAG)_console.log")) {
             $src = Join-Path $env:TEMP $f
             if (Test-Path $src) { Copy-Item $src cts-results\ }
           }
           Get-ChildItem cts-results | ForEach-Object { Write-Host "staged: $($_.Name) ($($_.Length) bytes)" }
 
+      # One artifact per arm, named so the set can be dropped into a Khronos
+      # submission package unmodified: cts-results-<graphics>/cts_ci_<graphics>.xml.
       - name: Upload CTS results
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: cts-${{ steps.params.outputs.scope }}-${{ steps.params.outputs.graphics }}
+          name: cts-results-${{ matrix.graphics }}
           path: cts-results/
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
+  # arm was red or produced nothing at all.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: CTS summary
+    needs: [plan, run]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every arm's results
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          pattern: cts-results-*
+          path: all-results
+
+      - name: Build the matrix table and gate
+        shell: bash
+        env:
+          ARMS: ${{ needs.plan.outputs.arms }}
+          EXPERIMENTAL: ${{ needs.plan.outputs.experimental }}
+          SCOPE: ${{ needs.plan.outputs.scope }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, glob
+          import xml.etree.ElementTree as ET
+
+          arms = os.environ.get("ARMS", "").split()
+          experimental = set(os.environ.get("EXPERIMENTAL", "").split())
+          scope = os.environ.get("SCOPE", "?")
+
+          rows, failed = [], []
+          for arm in arms:
+              hits = glob.glob(f"all-results/cts-results-{arm}/cts_ci_{arm}.xml")
+              exp = arm in experimental
+              if not hits:
+                  rows.append((arm, "—", "—", "—", "MISSING (no result XML)", exp))
+                  if not exp:
+                      failed.append(f"{arm}: produced no result XML")
+                  continue
+              try:
+                  root = ET.parse(hits[0]).getroot()
+              except ET.ParseError as e:
+                  rows.append((arm, "—", "—", "—", f"TRUNCATED ({e})", exp))
+                  if not exp:
+                      failed.append(f"{arm}: result XML is truncated/unparseable")
+                  continue
+              suite = root.find("testsuite") if root.tag == "testsuites" else root
+              if suite is None:
+                  suite = root
+              tests = int(suite.get("tests", 0))
+              failures = int(suite.get("failures", 0))
+              errors = int(suite.get("errors", 0))
+              bad = failures + errors
+              status = "PASS" if bad == 0 else f"FAIL ({bad} red)"
+              rows.append((arm, tests, failures, errors, status, exp))
+              if bad and not exp:
+                  failed.append(f"{arm}: {failures} failures + {errors} errors")
+
+          lines = [f"## OpenXR CTS matrix — scope `{scope}`", "",
+                   "| arm | tests | failures | errors | status |",
+                   "|---|---:|---:|---:|---|"]
+          for arm, tests, failures, errors, status, exp in rows:
+              label = f"`{arm}`" + (" _(experimental, #1525)_" if exp else "")
+              lines.append(f"| {label} | {tests} | {failures} | {errors} | {status} |")
+          lines += ["",
+                    "Experimental arms (`opengl` / `vulkan` / `vulkan2`) have no usable ICD on the",
+                    "hosted runner and are reported but not gated until #1525 lands the software",
+                    "rasterizers."]
+          out = "\n".join(lines) + "\n"
+          print(out)
+          path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if path:
+              with open(path, "a") as f:
+                  f.write(out)
+
+          if not arms:
+              print("::error::plan produced no arms — nothing ran")
+              sys.exit(1)
+          if failed:
+              for f in failed:
+                  print(f"::error::CTS arm red — {f}")
+              sys.exit(1)
+          print("All gated CTS arms green.")
+          PY

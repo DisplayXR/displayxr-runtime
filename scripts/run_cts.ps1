@@ -14,7 +14,15 @@
   emitting a ctsxml report (for the pass/fail matrix) plus a console log.
 
 .PARAMETER Plugin     sim-display (default) | leia-sr | none (leave plugins as-is)
-.PARAMETER Graphics   d3d11 (default) | d3d12 | vulkan | opengl
+.PARAMETER Graphics   d3d11 (default) | d3d12 | opengl | vulkan | vulkan2
+                      These are the five CTS graphics plugins Windows supports,
+                      and a conformance submission owes one automated run per
+                      plugin (#1523). `vulkan` and `vulkan2` are SEPARATE
+                      plugins exercising XR_KHR_vulkan_enable and
+                      XR_KHR_vulkan_enable2; we advertise both. $Graphics is
+                      deliberately un-ValidateSet'd and passed verbatim as -G,
+                      so any plugin a newer CTS adds works without editing this
+                      script.
 .PARAMETER ApiVersion 1.1 (default) | 1.0
 .PARAMETER TestSpec   Catch2 spec; default "exclude:[interactive]"
                       (the full non-interactive suite, nothing excluded by name).
