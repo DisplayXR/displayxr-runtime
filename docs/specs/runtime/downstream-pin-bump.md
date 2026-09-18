@@ -144,6 +144,42 @@ read needs the publish-bot App token `drift-audit.yml` already mints for
 `displayxr-shell-pvt`; on the default `GITHUB_TOKEN` the consumer reads as
 unfetchable and is reported, not silently skipped.
 
+### A consumer that vendors nothing points at its pin
+
+The rule above assumes the consumer has a header *file* to scan. The shell has
+none: `external/openxr_extensions/` is `.gitkeep` only, because its build clones
+`DisplayXR/displayxr-extensions`. Writing its requirements out by hand (the
+browser's `requires` escape hatch) would have broken the rule for the largest
+`XR_DXR_spatial_workspace` consumer we have.
+
+So a `spec_sources` item may be **either** a string — a path in the consumer's
+own repo at its default branch, the original and still the common case — **or**
+an object naming another repo at a pinned ref:
+
+```json
+"spec_sources": [
+  { "repo": "displayxr-extensions", "ref": "v2.16.37",
+    "path": "include/openxr/XR_DXR_spatial_workspace.h" }
+],
+"pin_sync": { "file": ".github/workflows/build-shell.yml",
+              "regex": "DXR_EXTENSIONS_REF:\\s*(\\S+)" }
+```
+
+The rule survives intact, because a **tag is a pin, not a floor**: the version
+numbers are still re-read from headers on every run, just from the mirror the
+consumer builds against rather than from its own tree.
+
+That pin is also a new drift vector, and `pin_sync` is its detector. The ref in
+the manifest is only the truth if the consumer's build really clones *that* ref;
+if the two drift apart, the audit would derive a confident floor from headers the
+consumer never compiled with — worse than not auditing it. So `pin_sync` names
+where the consumer writes the ref, and the audit compares the two every run: a
+mismatch is a `consumer-floor-pin-desync` **finding**, and a file or regex that
+will not resolve is a **note** naming the unchecked ref, never a silent pass.
+**Use the object form only with a `pin_sync`.** The shell's ref and the
+`DXR_EXTENSIONS_REF` in `build-shell.yml` + `scripts/build-shell.bat` are an
+atomic group: bump them together (shell-pvt#113).
+
 Two consequences worth knowing:
 
 - **The binary search assumes `SPEC_VERSION`s never decrease** across
