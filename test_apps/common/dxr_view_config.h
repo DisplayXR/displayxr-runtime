@@ -36,18 +36,33 @@
 
 #pragma once
 
-#include <stddef.h>
 #include <stdint.h>
 
 #include <openxr/openxr.h>
 
 /*
- * Normally supplied by this repo's src/external/openxr_includes copy of
- * XR_DXR_display_info.h (SPEC_VERSION >= 19). Defined defensively so a tree
- * that vendors an older header set still compiles — the value is fixed by the
- * DXR author-ID block and the enumerate probe below is what actually decides.
+ * The type value is normally supplied by this repo's
+ * src/external/openxr_includes copy of XR_DXR_display_info.h (SPEC_VERSION >=
+ * 19), so PREFER that header whenever it is on the include path. Probing for
+ * the header rather than for the macro matters: once the enumerator is
+ * registered with Khronos it becomes a real XrViewConfigurationType enumerator,
+ * and a plain `#ifndef` fallback would then still fire and silently shadow it
+ * with a macro of our own.
  */
-#ifndef XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR
+#if defined(__has_include)
+#if __has_include(<openxr/XR_DXR_display_info.h>)
+#define DXR_VIEW_CONFIG_HAVE_DISPLAY_INFO_HEADER 1
+#endif
+#endif
+
+#if defined(DXR_VIEW_CONFIG_HAVE_DISPLAY_INFO_HEADER)
+#include <openxr/XR_DXR_display_info.h>
+#else
+/*
+ * A tree that vendors an older header set (or a compiler with no __has_include)
+ * still compiles — the value is fixed by the DXR author-ID block, and the
+ * enumerate probe below is what actually decides whether the runtime has it.
+ */
 #define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
 #endif
 
