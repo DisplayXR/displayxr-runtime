@@ -267,13 +267,7 @@ ADR-024 Amendment 2 argues why that beats letting a rig drag VIEW.
 `xrLocateSpace_xrLocateViews` is 9 assertions / **0 failed** (was 9/1 at `:330`);
 the full D3D11 arm went 61/4 → 62 pass / 3 fail, no new reds.
 
-**The `~xrLocateSpace_xrLocateViews` by-name exclusion is still present** in
-`.github/workflows/cts.yml` and `scripts/run_cts.ps1`: the #1502 change does not
-touch it, so the green run above was taken with the test run explicitly rather
-than through the default lane. Deleting it belongs to the change that records
-that run in CI. Keep `__COMPAT_LAYER=HighDpiAware` (or #1506's manifest) on the
-harness regardless — the fix is measured and so survives the DPI artefact, but
-every other window-geometry number the CTS sees does not.
+**The `~xrLocateSpace_xrLocateViews` by-name exclusion has been removed** from `.github/workflows/cts.yml` and `scripts/run_cts.ps1` (follow-up to #1516): both of the test's assertions are fixed and verified (#1486: `views.size() == 2`; #1502: VIEW == centroid, 9 assertions / 0 failed on the win box), so it runs in the default lane again. Keep `__COMPAT_LAYER=HighDpiAware` or the #1506 manifest on the harness regardless — the #1502 fix is measured and so survives the DPI artefact, but every other window-geometry number the CTS sees does not.
 
 What the CTS actually sees: it never enables `XR_DXR_display_info`, so
 `PRIMARY_MULTIVIEW_DXR` is never enumerated to it. The CTS sees exactly
