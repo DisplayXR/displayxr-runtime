@@ -53,6 +53,33 @@
 DEBUG_GET_ONCE_BOOL_OPTION(views_change_event, "DXR_VIEWS_CHANGE_EVENT", true)
 
 /*
+ * ADR-041 staging switch for the fixed-view-count submission contract.
+ *
+ *   0 = strict     every view configuration submits exactly the located count.
+ *                  By definition this also drops the deprecated PRIMARY_STEREO
+ *                  1-view arm below.
+ *   1 = DEFAULT    strict, plus that one deprecated arm, because RELEASED demos
+ *                  submit a single view in 2D mode and need a compat window.
+ *   2 = kill       the pre-ADR-041 rules, MULTIVIEW under-submit included.
+ *
+ * CI stays on the default: a CTS session never enables XR_DXR_display_info, and
+ * the deprecated arm requires it, so conformance is on the strict path either
+ * way and nothing is gained by pinning the switch in cts.yml.
+ *
+ * NUM rather than BOOL because it is a three-state staging knob, and read in
+ * this TU only (DEBUG_GET_ONCE_* caches per translation unit).
+ */
+DEBUG_GET_ONCE_NUM_OPTION(under_submit, "DXR_UNDER_SUBMIT", 1)
+
+static enum oxr_under_submit_mode
+oxr_under_submit_setting(void)
+{
+	// The mapping itself is pure and lives with the rule, so the host tests
+	// pin all three arms without three processes.
+	return oxr_under_submit_from_setting(debug_get_num_option_under_submit());
+}
+
+/*
  * Monkey-test F1: layer-verification failures are APP input errors on the
  * per-frame hot path. A non-conformant app (both cube test apps submitted
  * zeroed projection views while shouldRender was false) that is no longer
@@ -734,17 +761,59 @@ verify_projection_view_count(struct oxr_session *sess,
 		return XR_SUCCESS;
 	}
 
+	/*
+	 * ADR-041: PRIMARY_STEREO and PRIMARY_MULTIVIEW_DXR share ONE rule — submit
+	 * the count xrLocateViews returned, and alias the inactive tail. Both are
+	 * handled here rather than in the switch below, because
+	 * PRIMARY_MULTIVIEW_DXR is a cast #define and cannot be a case label.
+	 */
 #ifdef OXR_HAVE_DXR_display_info
-	if (sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) {
-		if (!oxr_view_count_ok_for_multiview(proj->viewCount, mode_view_counts, mode_count)) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
-			                 "rendering mode for XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
-			                 layer_index, proj->viewCount);
+	const bool is_multiview = sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+#else
+	const bool is_multiview = false;
+#endif
+	if (is_multiview || sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+		// R, what xrLocateViews reports this session. Falls back to the
+		// type's constant when the field was never seeded — the same
+		// defensive shape oxr_session_locate_views uses.
+		uint32_t reported = sess->view_config_view_count;
+		if (reported == 0) {
+			reported = is_multiview && head != NULL && head->hmd != NULL ? head->hmd->view_count : 2;
 		}
+
+		const enum oxr_view_count_verdict verdict = oxr_projection_view_count_verdict(
+		    proj->viewCount, reported, is_multiview, active_mode_view_count, begun_mode_view_count,
+		    display_info_enabled, mode_view_counts, mode_count, oxr_under_submit_setting());
+
+		if (verdict == OXR_VIEW_COUNT_REJECT) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) %s reports %u view(s) per "
+			                 "frame and xrEndFrame needs all of them: submit xrLocateViews' count and "
+			                 "alias inactive views (XR_DXR_display_info v21). The active rendering "
+			                 "mode has %u view(s); this instance %s XR_DXR_display_info.",
+			                 layer_index, proj->viewCount,
+			                 is_multiview ? "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR"
+			                              : "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
+			                 reported, active_mode_view_count,
+			                 display_info_enabled ? "enabled" : "did NOT enable");
+		}
+
+		if (verdict == OXR_VIEW_COUNT_OK_DEPRECATED && !sess->warned_under_submit_deprecated) {
+			// Once per session. NEVER per frame — this is the hot path.
+			sess->warned_under_submit_deprecated = true;
+			U_LOG_W(
+			    "DEPRECATED projection submission: this session began %s, which reports %u "
+			    "view(s) per frame, but submitted a projection layer with viewCount == %u. "
+			    "Accepted for now (DXR_UNDER_SUBMIT=1). Fix: submit xrLocateViews' count and "
+			    "alias inactive views (XR_DXR_display_info v21) — chain "
+			    "XrViewActivityStateDXR on XrViewState to learn how many are active.",
+			    is_multiview ? "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR"
+			                 : "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
+			    reported, proj->viewCount);
+		}
+
 		return XR_SUCCESS;
 	}
-#endif
 
 	switch (sess->view_config_type) {
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO:
@@ -756,35 +825,8 @@ verify_projection_view_count(struct oxr_session *sess,
 		}
 		break;
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO:
-		/*
-		 * #1486: PRIMARY_STEREO means exactly 2 views, so a wider submission
-		 * is now refused instead of silently accepted because some rendering
-		 * mode happened to have that count.
-		 *
-		 * ONE view is legal only for an XR_DXR_display_info app for which a
-		 * 1-view (2D/mono) mode is in play - the app that legitimately submits
-		 * one, and the only one that can even tell. For a core-only app, which
-		 * is every CTS session, it is exactly 2 whatever mode the panel is in:
-		 * the XrCompositionLayerProjection test decrements the located count
-		 * and CHECKs for XR_ERROR_VALIDATION_FAILURE.
-		 *
-		 * #1528: "in play" is the mode active NOW or the one latched at this
-		 * frame's xrBeginFrame, so the single frame a 2D->3D switch catches
-		 * in flight is granted rather than dropped.
-		 */
-		if (!oxr_view_count_ok_for_stereo(proj->viewCount, active_mode_view_count, begun_mode_view_count,
-		                                  display_info_enabled)) {
-			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO accepts exactly 2 views "
-			                 "(an app that enabled XR_DXR_display_info may submit 1 while a "
-			                 "1-view mode is in play; this instance %s, the active mode has %u "
-			                 "and the mode latched at xrBeginFrame had %u); N-view needs "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
-			                 layer_index, proj->viewCount,
-			                 display_info_enabled ? "enabled it" : "did NOT enable it",
-			                 active_mode_view_count, begun_mode_view_count);
-		}
+		// Handled above, together with PRIMARY_MULTIVIEW_DXR — one ADR-041
+		// rule covers both. Unreachable; kept so -Wswitch stays useful.
 		break;
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
 		if (proj->viewCount != 4) {

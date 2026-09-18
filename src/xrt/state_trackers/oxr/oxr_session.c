@@ -3523,6 +3523,28 @@ oxr_session_locate_views(struct oxr_logger *log,
 		views[i].fov = views[0].fov;
 	}
 
+#ifdef OXR_HAVE_DXR_display_info
+	/*
+	 * ADR-041: publish that split. The inactive tail above is exactly why the
+	 * app can submit the full reported count without rendering it — every view
+	 * in [active_view_count, reported_view_count) is a valid, locatable view
+	 * whose content the runtime discards, so aliasing view 0's subimage onto it
+	 * costs nothing and satisfies core OpenXR's "all views must be supplied".
+	 *
+	 * This is the SINGLE locate path: an IPC/service-mode session reaches it
+	 * through the same oxr_session_locate_views (only the device-facing pose
+	 * fetch further up differs), so the field is filled identically in-process
+	 * and out-of-process.
+	 */
+	{
+		XrViewActivityStateDXR *act =
+		    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_ACTIVITY_STATE_DXR, XrViewActivityStateDXR);
+		if (act != NULL) {
+			act->activeViewCount = active_view_count;
+		}
+	}
+#endif
+
 	/*
 	 * #1502: publish the VIEW-space eye-centroid offset.
 	 *
