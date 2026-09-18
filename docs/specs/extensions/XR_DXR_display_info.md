@@ -752,7 +752,7 @@ views; this type is how an application reaches the rest.
 | Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
 | `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
 | `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
-| `xrEndFrame` projection `viewCount` | 1 or 2 (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` | **2**; 1 only when the active rendering mode is 1-view (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
 
 - **Fixed per instance.** The count this type reports is the device maximum across modes
   (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
@@ -765,6 +765,14 @@ views; this type is how an application reaches the rest.
   and 4 in a quad mode without re-creating the session), and 1 for a mono mode. Submitting
   fewer views than the active mode has tiles is legal: the compositor paints the first
   `viewCount` tiles.
+
+  **Under `PRIMARY_STEREO` the rule is tighter, and deliberately so:** exactly 2, with 1
+  accepted **only when the active rendering mode is itself 1-view** (the 2D/mono
+  submission path described under *Mono Submission in 2D Mode* below). A short
+  submission in a 2-view mode is `XR_ERROR_VALIDATION_FAILURE` — the OpenXR CTS
+  `XrCompositionLayerProjection` test decrements the located view count and requires that
+  error, and it runs in a 2-view mode. An app that wants the "any active mode's count"
+  latitude of the paragraph above begins `PRIMARY_MULTIVIEW_DXR`.
 - **How to opt in.** Enable `XR_DXR_display_info` at `xrCreateInstance`, call
   `xrEnumerateViewConfigurations`, and if this type is present pass it as
   `XrSessionBeginInfo::primaryViewConfigurationType` (and as
@@ -1442,7 +1450,13 @@ session with `PRIMARY_MULTIVIEW_DXR`. The escape hatch for a deployment that can
 updated yet is the `DXR_VIEW_CONFIG_LEGACY=1` kill switch, which restores the old mapping
 *and* the old permissive `xrEndFrame` rule wholesale; see
 [`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md).
-No shipped two-view device (Leia) is affected either way — there the two rules coincide.
+
+On a shipped two-view device (Leia) the **reported counts** are unchanged — the device max
+IS 2 — so nothing there sees a different number. One `xrEndFrame` case does change even
+there: a `viewCount == 1` layer submitted while the active mode is a **2-view** mode is now
+`XR_ERROR_VALIDATION_FAILURE` instead of being accepted. That is required by the CTS (see
+the `xrEndFrame` rule above) and it is not the 2D path: in a 1-view mode `viewCount == 1`
+remains correct and accepted.
 
 Because the value is a vendor enum, a conformance or validation
 layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not

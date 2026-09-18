@@ -686,6 +686,16 @@ verify_projection_view_count(struct oxr_session *sess,
 		}
 	}
 
+	// The ACTIVE mode's view count, which is what decides whether a ONE-view
+	// submission is legitimate under PRIMARY_STEREO. 2 when it cannot be
+	// determined: that makes the rule "exactly two", which is the conformant
+	// answer and never loosens anything.
+	uint32_t active_mode_view_count = 2;
+	if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
+	    head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+		active_mode_view_count = head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
+	}
+
 	// #1486 kill switch: the permissive rule, whatever the type says. This is
 	// what makes DXR_VIEW_CONFIG_LEGACY=1 a COMPLETE rollback of #1486 — the
 	// legacy PRIMARY_STEREO reports the device max, so it must also accept it.
@@ -730,16 +740,21 @@ verify_projection_view_count(struct oxr_session *sess,
 		/*
 		 * #1486: PRIMARY_STEREO means exactly 2 views, so a wider submission
 		 * is now refused instead of silently accepted because some rendering
-		 * mode happened to have that count. viewCount == 1 stays legal: apps
-		 * in a 2D rendering mode already submit a single view today.
+		 * mode happened to have that count.
+		 *
+		 * ONE view is legal only in a 1-view (2D/mono) rendering mode - the
+		 * app that legitimately submits one. In a 2-view mode a short
+		 * submission is an error, and the CTS requires that: the
+		 * XrCompositionLayerProjection test decrements the located count and
+		 * CHECKs for XR_ERROR_VALIDATION_FAILURE.
 		 */
-		if (!oxr_view_count_ok_for_stereo(proj->viewCount)) {
+		if (!oxr_view_count_ok_for_stereo(proj->viewCount, active_mode_view_count)) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or 2 for "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; begin the session with "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (XR_DXR_display_info) "
-			                 "to submit more",
-			                 layer_index, proj->viewCount);
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO accepts 2 views "
+			                 "(1 only in a 1-view mode; the active mode has %u); N-view needs "
+			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
+			                 layer_index, proj->viewCount, active_mode_view_count);
 		}
 		break;
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
