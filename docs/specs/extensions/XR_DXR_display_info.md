@@ -752,7 +752,7 @@ views; this type is how an application reaches the rest.
 | Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
 | `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
 | `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
-| `xrEndFrame` projection `viewCount` | **2**; 1 only when the active rendering mode is 1-view (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` | **exactly 2** for a core-only app; an instance that enabled this extension may also submit 1 while the active rendering mode is 1-view (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
 
 - **Fixed per instance.** The count this type reports is the device maximum across modes
   (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
@@ -766,13 +766,27 @@ views; this type is how an application reaches the rest.
   fewer views than the active mode has tiles is legal: the compositor paints the first
   `viewCount` tiles.
 
-  **Under `PRIMARY_STEREO` the rule is tighter, and deliberately so:** exactly 2, with 1
-  accepted **only when the active rendering mode is itself 1-view** (the 2D/mono
-  submission path described under *Mono Submission in 2D Mode* below). A short
-  submission in a 2-view mode is `XR_ERROR_VALIDATION_FAILURE` — the OpenXR CTS
-  `XrCompositionLayerProjection` test decrements the located view count and requires that
-  error, and it runs in a 2-view mode. An app that wants the "any active mode's count"
-  latitude of the paragraph above begins `PRIMARY_MULTIVIEW_DXR`.
+  **Under `PRIMARY_STEREO` the rule is tighter, and deliberately so.** For an instance
+  that did **not** enable this extension — a core-only app, which is every OpenXR CTS
+  session — `PRIMARY_STEREO` accepts **exactly 2** and nothing else, whatever rendering
+  mode the panel is in. A short submission is `XR_ERROR_VALIDATION_FAILURE`, which the
+  CTS `XrCompositionLayerProjection` test requires: it decrements the located view count
+  and checks for that error.
+
+  An instance that **did** enable this extension may additionally submit `viewCount == 1`
+  **while the active rendering mode is itself 1-view** — the 2D/mono submission path
+  described under *Mono Submission in 2D Mode* below. Both halves are required. The
+  extension gate is not bureaucracy: a core-only app cannot enumerate a rendering mode,
+  request one, or be told the active one changed, so a relaxation scoped to the active
+  mode would make `PRIMARY_STEREO`'s meaning depend on state that app cannot observe.
+  (Gating on the mode alone was tried and failed the conformance suite outright: a CTS
+  session is treated as a legacy session, and the reference display sits in a 1-view mode
+  for essentially the whole run, so the exception was open throughout.)
+
+  **The recommended path for any mode-driven count is `PRIMARY_MULTIVIEW_DXR`**,
+  including the 1-view case: begin with it and submit the active mode's count with no
+  special case. The `PRIMARY_STEREO` allowance above is back-compatibility for apps
+  already shipping on that type, not a design to build on.
 - **How to opt in.** Enable `XR_DXR_display_info` at `xrCreateInstance`, call
   `xrEnumerateViewConfigurations`, and if this type is present pass it as
   `XrSessionBeginInfo::primaryViewConfigurationType` (and as
@@ -921,6 +935,9 @@ significant quality improvement for 2D content.
   position (or any position it chooses). (See the multiview model — the render/submit loop is
   bounded by the active mode's `viewCount`, not a hardcoded 2.)
 - `xrEndFrame` accepts `viewCount == 1` projection layers when the active mode is a 2D/mono mode.
+  This whole section presumes the instance enabled `XR_DXR_display_info` — it is the
+  extension that makes the mode observable, and under `PRIMARY_STEREO` the allowance is
+  scoped to instances that enabled it (see the `xrEndFrame` rule above).
   In a 3D mode, `viewCount` must equal the active rendering mode's `viewCount` (2 for SBS stereo,
   4 for quad, etc.).
 - The compositor renders the single view to fill the full display output and skips light
@@ -1452,11 +1469,13 @@ updated yet is the `DXR_VIEW_CONFIG_LEGACY=1` kill switch, which restores the ol
 [`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md).
 
 On a shipped two-view device (Leia) the **reported counts** are unchanged — the device max
-IS 2 — so nothing there sees a different number. One `xrEndFrame` case does change even
-there: a `viewCount == 1` layer submitted while the active mode is a **2-view** mode is now
-`XR_ERROR_VALIDATION_FAILURE` instead of being accepted. That is required by the CTS (see
-the `xrEndFrame` rule above) and it is not the 2D path: in a 1-view mode `viewCount == 1`
-remains correct and accepted.
+IS 2 — so nothing there sees a different number. `xrEndFrame` does change for one case: a
+`viewCount == 1` layer under `PRIMARY_STEREO` is now `XR_ERROR_VALIDATION_FAILURE` unless
+the instance enabled this extension **and** the active rendering mode is 1-view. That is
+required by the CTS (see the `xrEndFrame` rule above), and it deliberately does not touch
+the 2D path: an app that enabled the extension keeps submitting 1 in a 1-view mode exactly
+as before. A **core-only** app submitting 1 was always out of contract for a two-view type
+and is now told so.
 
 Because the value is a vendor enum, a conformance or validation
 layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not

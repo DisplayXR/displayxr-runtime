@@ -78,22 +78,42 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | **2** (1 only in a 1-view mode) | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** for a core-only app; an `XR_DXR_display_info` app may also submit 1 while the active mode is 1-view | 1, 2, or any rendering mode's `viewCount` |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
-> **The one-view exception is scoped to 1-view modes, and that is a CTS
-> requirement, not a preference.** `PRIMARY_STEREO` accepts `viewCount == 1` only
-> when the **active rendering mode** is itself 1-view — the 2D/mono submission
-> path the extension has always allowed (`cube_*` apps compute
+> **A core-only app gets exact-2, full stop.** If the instance did not enable
+> `XR_DXR_display_info`, `PRIMARY_STEREO` accepts `viewCount == 2` and nothing
+> else, whatever rendering mode the panel happens to be in. That is the
+> conformance contract: the CTS `XrCompositionLayerProjection` test decrements
+> the located count (`test_XrCompositionLayerProjection.cpp:225-230`:
+> `Layer.viewCount--`, then
+> `CHECK(XR_ERROR_VALIDATION_FAILURE == endFrame(...))`).
+>
+> **The one-view allowance is an extension-scoped relaxation**, and it needs
+> *both* halves: the instance enabled `XR_DXR_display_info` **and** the active
+> rendering mode is itself 1-view. It exists for the 2D/mono submission path the
+> extension has always allowed (`cube_*` apps compute
 > `eyeCount = display3D ? modeViewCount : 1`; `displayxr-common` forwards the
-> caller's count). In a 2-view mode a short submission is
-> `XR_ERROR_VALIDATION_FAILURE`, because the CTS
-> `XrCompositionLayerProjection` test decrements the located count
-> (`test_XrCompositionLayerProjection.cpp:225-230`: `Layer.viewCount--`, then
-> `CHECK(XR_ERROR_VALIDATION_FAILURE == endFrame(...))`) and the CTS runs in a
-> 2-view mode. An unconditional "1 or 2" turned that required rejection into a
-> success. This is the only place the `xrEndFrame` rule consults the active mode;
-> the *reported* counts above still never move on a mode switch.
+> caller's count), and for no one else — a core-only app has no notion of a
+> rendering mode at all: it cannot enumerate one, request one, or be told the
+> active one changed, so scoping a relaxation to a fact it cannot observe would
+> make `PRIMARY_STEREO`'s meaning depend on hidden runtime state.
+>
+> **Gating on the mode alone was not enough, and the win box proved it.** The
+> first attempt allowed 1 in any 1-view mode regardless of extensions;
+> `XrCompositionLayerProjection` still failed the full suite, because a CTS
+> session never enables `XR_DXR_display_info` — so the runtime treats it as a
+> legacy session and sim-display sits in a 1-view (Passthrough/2D) mode for
+> essentially the whole run. The exception was open for the entire conformance
+> pass. The extension gate closes it.
+>
+> **`PRIMARY_MULTIVIEW_DXR` is the recommended path for any mode-driven count**,
+> including the 1-view case: begin with it and submit the active mode's count
+> without a special case. The relaxation above is back-compatibility for apps
+> already shipping on `PRIMARY_STEREO`.
+>
+> This is the only place the `xrEndFrame` rule consults the active mode; the
+> *reported* counts above still never move on a mode switch.
 
 Three properties hold under all three types:
 
