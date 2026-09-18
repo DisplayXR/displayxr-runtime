@@ -105,6 +105,9 @@ enum xrt_display_mode_denial_reason
 	XRT_DISPLAY_MODE_DENIAL_REASON_DISPLAY_PROCESSOR_REJECTED = 4,
 	//! A relay (WebXR bridge) owns the mode of the session it relays.
 	XRT_DISPLAY_MODE_DENIAL_REASON_RELAY_OWNS_MODE = 5,
+	//! #1499: the session's view configuration reports fewer views than the
+	//! requested mode needs, so it could not fill the mode's tile grid.
+	XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL = 6,
 };
 
 /*!
