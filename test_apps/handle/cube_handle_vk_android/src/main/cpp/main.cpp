@@ -38,6 +38,11 @@
 #include <openxr/XR_DXR_android_surface_binding.h>
 #endif
 
+// #1486: the shared PRIMARY_MULTIVIEW_DXR view-configuration opt-in
+// (test_apps/common/dxr_view_config.h). Unconditional — it only needs
+// <openxr/openxr.h>.
+#include "dxr_view_config.h"
+
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -166,6 +171,12 @@ RenderingModeInfo g_modes[kMaxViews] = {};
 uint32_t g_mode_count = 0;            // 0 → no XR_DXR_display_info; default stereo
 std::atomic<uint32_t> g_current_mode{0};
 uint32_t g_max_view_count = 2;        // xrEnumerateViewConfigurationViews → locate capacity
+// #1486: this app derives its per-frame view count from the ACTIVE DXR
+// rendering mode, so it begins its session on the view configuration that
+// reports the device MAX. PRIMARY_STEREO now reports exactly 2 and xrEndFrame
+// rejects viewCount > 2 under it. Selected once in create_session(); falls back
+// to PRIMARY_STEREO on a runtime that doesn't enumerate the DXR type.
+XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 uint32_t g_display_px_w = 0;          // native panel pixels (XR_DXR_display_info)
 uint32_t g_display_px_h = 0;
 bool g_has_display_info = false;
@@ -623,6 +634,11 @@ query_system_and_graphics_reqs()
 		LOGW("xrGetSystemProperties failed (%d)", (int)res);
 	}
 
+	// #1486: pick the view configuration BEFORE the first
+	// xrEnumerateViewConfigurationViews / xrBeginSession / xrLocateViews.
+	g_view_config_type = DxrSelectViewConfigType(g_instance, g_system_id);
+	LOGI("View configuration type: %s", DxrViewConfigTypeName(g_view_config_type));
+
 	// Resolve the extension entry point — it lives in libopenxr_loader.so
 	// but the loader exposes it only after the corresponding extension
 	// is enabled on the instance (which we did in create_instance).
@@ -1051,13 +1067,14 @@ active_tile_dims(uint32_t *render_w, uint32_t *render_h, uint32_t *cols, uint32_
 bool
 query_display_info_and_modes()
 {
-	// Max view count = the device's advertised PRIMARY_STEREO view count (the
-	// max across all rendering modes). xrLocateViews REQUIRES capacity >= this
-	// value or it returns XR_ERROR_SIZE_INSUFFICIENT — the exact gate the old
-	// hard-coded `2` tripped on sim_display (which reports 4).
+	// Max view count = the view count the ACTIVE view configuration advertises
+	// (#1486): the device max across all rendering modes under
+	// PRIMARY_MULTIVIEW_DXR, exactly 2 under PRIMARY_STEREO. xrLocateViews
+	// REQUIRES capacity >= this value or it returns XR_ERROR_SIZE_INSUFFICIENT
+	// — the exact gate the old hard-coded `2` tripped on sim_display (4).
 	uint32_t vc = 0;
 	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &vc, nullptr);
+	    g_instance, g_system_id, g_view_config_type, 0, &vc, nullptr);
 	if (res == XR_SUCCESS && vc > 0) {
 		g_max_view_count = vc > kMaxViews ? kMaxViews : vc;
 	}
@@ -1146,7 +1163,7 @@ create_swapchains()
 		}
 		uint32_t cap = g_max_view_count > kMaxViews ? kMaxViews : g_max_view_count;
 		XrResult vres = xrEnumerateViewConfigurationViews(
-		    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, cap, &got, buf);
+		    g_instance, g_system_id, g_view_config_type, cap, &got, buf);
 		if (vres == XR_SUCCESS && got > 0) {
 			view_config = buf[0];
 		}
@@ -2393,7 +2410,7 @@ handle_session_state(XrSessionState new_state)
 	case XR_SESSION_STATE_READY: {
 		XrSessionBeginInfo begin = {};
 		begin.type = XR_TYPE_SESSION_BEGIN_INFO;
-		begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		begin.primaryViewConfigurationType = g_view_config_type;
 		XrResult res = xrBeginSession(g_session, &begin);
 		log_xr_result("xrBeginSession", res);
 		if (res == XR_SUCCESS) {
@@ -2619,7 +2636,7 @@ render_frame()
 		}
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.viewConfigurationType = g_view_config_type;
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
@@ -2729,8 +2746,25 @@ render_frame()
 			} else {
 				log_xr_result("atlas acquire/wait/release", res);
 			}
-		} else {
+		} else if (res != XR_SUCCESS) {
 			log_xr_result("xrLocateViews", res);
+		} else {
+			// #1486: located < submit is a CONTRACT VIOLATION now, not a
+			// frame to drop quietly — it means the session was begun on a
+			// view configuration that reports fewer views than the active
+			// rendering mode needs (e.g. PRIMARY_STEREO's 2 while Quad
+			// wants 4). Dropping the layer here is exactly the "app goes
+			// black in Quad mode" symptom, so say so once.
+			static bool s_mismatch_logged = false;
+			if (!s_mismatch_logged) {
+				s_mismatch_logged = true;
+				LOGE("xrLocateViews located %u views but mode '%s' submits %u — "
+				     "frame DROPPED (view config '%s'). The session must begin on "
+				     "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR to get the "
+				     "device max.",
+				     located_view_count, active_mode().name, submit_views,
+				     DxrViewConfigTypeName(g_view_config_type));
+			}
 		}
 	}
 

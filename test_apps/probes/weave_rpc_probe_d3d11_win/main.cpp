@@ -1076,6 +1076,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		// unpack blits entirely.
 		XrWeaveSubmitLayoutDXR lay = {XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR};
 		if (g_useV6) {
+			// DXR_STEREO_FIXED_APP: this is an XrWeaveSubmitLayoutDXR layout, not a
+			// projection layer; the probe never calls xrEndFrame (INV-3.1, #1486).
 			lay.viewCount = g_v6Cols * g_v6Rows;
 			lay.tileColumns = g_v6Cols;
 			lay.tileRows = g_v6Rows;

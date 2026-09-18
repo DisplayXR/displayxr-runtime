@@ -447,6 +447,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
+        // DXR_STEREO_FIXED_APP: input probe, always submits 2 views (INV-3.1, #1486).
         int eyeCount = 2;
         std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
         bool rendered = false;

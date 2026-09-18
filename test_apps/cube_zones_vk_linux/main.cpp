@@ -49,6 +49,7 @@
 // XrDisplayRigDXR) scoping its framing; a Local2D layer adds the 2D strip.
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
+#include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
 // displayxr-common: remap GL-convention clip-depth ([-1,1]) to Vulkan's [0,1].
 // mat4_from_xr_fov (== the Windows ProjectionFromXrFov) emits GL depth; without
@@ -2367,6 +2368,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
     }
 
+    // #1486: this app sizes its per-zone tile count from the REPORTED view
+    // count (SetupZones below), so it must run on the view configuration that
+    // reports the device MAX. PRIMARY_STEREO now reports exactly 2 and
+    // xrEndFrame rejects viewCount > 2 under it. Falls back to PRIMARY_STEREO
+    // on a runtime that doesn't enumerate the DXR type.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(xr.viewConfigType));
+
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
     xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
@@ -3030,8 +3039,9 @@ static void TryActivateZones(AppXrSession& xr, VkRenderer& renderer,
     g_zoneBRect        = {{W * 700 / 1280, H / 4}, {W * 520 / 1280, H / 2}};
     g_zoneBOverlapRect = {{W * 400 / 1280, H * 300 / 720}, {W * 520 / 1280, H / 2}};
 
-    // Legacy 2-view SBS app: the view count is fixed by the primary-stereo view
-    // configuration (2). Clamp defensively.
+    // Per-zone tile count = the view count the ACTIVE view configuration
+    // reports (#1486): the device max under PRIMARY_MULTIVIEW_DXR, exactly 2
+    // under PRIMARY_STEREO. Clamp defensively.
     uint32_t viewCount = (uint32_t)xr.configViews.size();
     if (viewCount < 1) viewCount = 2;
     if (viewCount > 8) viewCount = 8;
