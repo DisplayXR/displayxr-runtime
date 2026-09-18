@@ -310,10 +310,20 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | P | Toggle camera/display stereo mode | HMD focused |
 | Spacebar | Reset stereo to camera defaults | HMD focused |
 | V | 2D/3D display toggle (HMD) / Thumbstick click (controller) | Focused device |
-| T / F / G / H | Thumbstick up/left/down/right | Focused controller |
-| I / J / K / L | Trackpad up/left/down/right | Focused controller |
-| M | Trackpad click | Focused controller |
-| ESC | Close window | Global |
+| T / F / G / H | Thumbstick **and trackpad** up/left/down/right (one key drives both) | Focused controller |
+| TAB | Toggle the runtime HUD overlay | Global |
+| 1 / 2 / 3 | Select rendering mode | HMD focused |
+| ESC | No-op (workspace lifecycle is Ctrl+Space / tray, not ESC) | Global |
+
+> **Trackpad click has no key.** `qwerty_press_trackpad_click()` exists in the
+> driver API but neither the Win32 nor the SDL backend binds a key to it, so
+> `.../input/trackpad/click` is unreachable from the keyboard. This matters for
+> an OpenXR CTS `[actions][interactive]` submission on
+> `/interaction_profiles/htc/vive_controller`, whose trackpad click cannot be
+> exercised — see
+> [CTS interactive procedure](cts-interactive-procedure.md). Earlier revisions of
+> this table listed `I / J / K / L` for the trackpad and `M` for trackpad click;
+> no such bindings exist in `qwerty_win32.c` or `qwerty_sdl.c`.
 
 ### 6.3 Mouse Controls
 
