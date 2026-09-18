@@ -555,6 +555,12 @@ out:
 				// Recommended view scale: prefer iface-supplied (Leia SR
 				// gives this from its weaver); otherwise derive worst-case
 				// from rendering modes (the sim_display path).
+				//
+				// THIS IS THE ONLY WRITE. The field is the display-level
+				// baseline and is immutable from here on: mode changes no
+				// longer overwrite it, because the active mode's scale is
+				// derived from head->rendering_modes[] on demand through
+				// xrt_device_get_active_mode_view_scale().
 				if (pdi.recommended_view_scale_x > 0.0f && pdi.recommended_view_scale_y > 0.0f) {
 					xsysc->info.recommended_view_scale_x = pdi.recommended_view_scale_x;
 					xsysc->info.recommended_view_scale_y = pdi.recommended_view_scale_y;

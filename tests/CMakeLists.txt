@@ -43,6 +43,7 @@ set(tests
     tests_oxr_view_config_rule
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
+    tests_xrt_active_mode_scale
     tests_input_arbiter_rig
     tests_sim_input_nav
 	)
@@ -325,6 +326,12 @@ target_include_directories(
 	tests_oxr_mode_fillable_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 target_link_libraries(tests_oxr_mode_fillable_rule PRIVATE xrt-interfaces)
+
+# One source of truth for the ACTIVE mode's per-view scale. The accessor is a
+# static inline over xrt_device / xrt_rendering_mode, so headers are all it
+# needs -- but it is the thing three hand-maintained overwrite sites used to do
+# by hand, which is exactly why it is worth pinning.
+target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is

@@ -39,6 +39,7 @@
 #include "os/os_time.h"
 
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_device.h"
 #include "xrt/xrt_limits.h"
 
 #include <cjson/cJSON.h>
@@ -224,10 +225,23 @@ tool_get_display_info(const cJSON *params, void *userdata)
 	cJSON_AddNumberToObject(nom, "z_m", info->nominal_viewer_z_m);
 	cJSON_AddItemToObject(r, "nominal_viewer", nom);
 
+	// The ACTIVE mode's per-view scale (same quantity XrDisplayInfoDXR reports),
+	// derived from the mode table rather than from the immutable display-level
+	// baseline in xsysc->info. The baseline is the fallback and is also dumped,
+	// so a reader can tell the two apart.
+	float scale_x = info->recommended_view_scale_x;
+	float scale_y = info->recommended_view_scale_y;
+	xrt_device_get_active_mode_view_scale(GET_XDEV_BY_ROLE(sess->sys, head), &scale_x, &scale_y);
+
 	cJSON *scale = cJSON_CreateObject();
-	cJSON_AddNumberToObject(scale, "x", info->recommended_view_scale_x);
-	cJSON_AddNumberToObject(scale, "y", info->recommended_view_scale_y);
+	cJSON_AddNumberToObject(scale, "x", scale_x);
+	cJSON_AddNumberToObject(scale, "y", scale_y);
 	cJSON_AddItemToObject(r, "recommended_view_scale", scale);
+
+	cJSON *baseline = cJSON_CreateObject();
+	cJSON_AddNumberToObject(baseline, "x", info->recommended_view_scale_x);
+	cJSON_AddNumberToObject(baseline, "y", info->recommended_view_scale_y);
+	cJSON_AddItemToObject(r, "display_view_scale_baseline", baseline);
 
 	cJSON_AddNumberToObject(r, "view_count", view_count);
 	cJSON_AddBoolToObject(r, "hardware_display_3d", sess->hardware_display_3d);
