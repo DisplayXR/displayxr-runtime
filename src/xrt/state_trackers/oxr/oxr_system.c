@@ -28,6 +28,27 @@
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
 
+/*
+ * #1488 kill switch 1 of 2. DXR_VIEWS_CHANGE_LIVE=0 makes
+ * xrEnumerateViewConfigurationViews always answer from the frozen
+ * xrCreateInstance-time snapshot, i.e. exactly the pre-#1488 behaviour,
+ * regardless of whether the app enabled the extension.
+ *
+ * DEBUG_GET_ONCE_* caches PER TRANSLATION UNIT, so this option is read in this
+ * file and nowhere else; oxr_session_frame_end.c reaches it through
+ * oxr_system_views_change_live_enabled() below. It has to: a live=0 runtime
+ * that still rang the doorbell would be handing consumers of the LOVR shape a
+ * change notification for a value that cannot move - the exact reallocation
+ * hazard this work exists to prevent.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(views_change_live, "DXR_VIEWS_CHANGE_LIVE", true)
+
+bool
+oxr_system_views_change_live_enabled(void)
+{
+	return debug_get_bool_option_views_change_live();
+}
+
 
 
 static bool
@@ -281,6 +302,11 @@ oxr_system_fill_in(
 	}
 
 #undef imin
+
+	// #1488: seed the live-view shadow from the snapshot we just computed.
+	// Leaves views_change.valid false, so xrEnumerateViewConfigurationViews
+	// keeps answering from sys->views until a real change lands.
+	oxr_views_change_seed(&sys->views_change, sys->views, sys->view_count);
 
 
 	/*
@@ -817,7 +843,7 @@ oxr_system_get_view_conf_properties(struct oxr_logger *log,
 }
 
 static void
-view_configuration_view_fill_in(XrViewConfigurationView *target_view, XrViewConfigurationView *source_view)
+view_configuration_view_fill_in(XrViewConfigurationView *target_view, const XrViewConfigurationView *source_view)
 {
 	// clang-format off
 	target_view->recommendedImageRectWidth       = source_view->recommendedImageRectWidth;
@@ -840,11 +866,19 @@ oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
 	if (viewConfigurationType != sys->view_config_type) {
 		return oxr_error(log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED, "Invalid view configuration type");
 	}
-	if (sys->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) {
-		OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, 1,
-		                            view_configuration_view_fill_in, sys->views, XR_SUCCESS);
-	} else {
-		OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, sys->view_count,
-		                            view_configuration_view_fill_in, sys->views, XR_SUCCESS);
-	}
+	const uint32_t count = sys->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO ? 1 : sys->view_count;
+
+	// #1488: XR_EXT_view_configuration_views_change is the SOLE sanctioned
+	// carve-out from the core spec's unconditional "always return identical
+	// buffer contents from this enumeration ... for the lifetime of the
+	// instance". An app that has not enabled it therefore keeps the frozen
+	// snapshot bit-for-bit - which is every shipping consumer today - and
+	// this whole branch is inert. The view COUNT never moves either way.
+	XrViewConfigurationView scratch[XRT_MAX_VIEWS];
+	const XrViewConfigurationView *src = oxr_views_change_select(
+	    &sys->views_change, sys->views, count, sys->inst->extensions.EXT_view_configuration_views_change,
+	    debug_get_bool_option_views_change_live(), scratch);
+
+	OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, count,
+	                            view_configuration_view_fill_in, src, XR_SUCCESS);
 }

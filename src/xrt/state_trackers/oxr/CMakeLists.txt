@@ -55,6 +55,8 @@ add_library(
 	oxr_system.c
 	oxr_two_call.h
 	oxr_verify.c
+	oxr_views_change.c
+	oxr_views_change.h
 	oxr_weave.c
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
