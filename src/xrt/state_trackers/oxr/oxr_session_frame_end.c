@@ -40,6 +40,17 @@
 #include <stdio.h>
 
 /*
+ * #1488 kill switch 2 of 2. DXR_VIEWS_CHANGE_EVENT=0 never emits
+ * XrEventDataViewConfigurationViewsChangedEXT; the extension stays advertised
+ * and enableable, and an app that enables it simply never gets a doorbell,
+ * which the spec explicitly permits ("may: ignore"). The live enumerate values
+ * are unaffected - that is the other switch, DXR_VIEWS_CHANGE_LIVE, read in
+ * oxr_system.c (DEBUG_GET_ONCE_* caches per translation unit, so each option is
+ * read in exactly one TU).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(views_change_event, "DXR_VIEWS_CHANGE_EVENT", true)
+
+/*
  * Monkey-test F1: layer-verification failures are APP input errors on the
  * per-frame hot path. A non-conformant app (both cube test apps submitted
  * zeroed projection views while shouldRender was false) that is no longer
@@ -2822,7 +2833,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
 
-#ifdef OXR_HAVE_DXR_local_3d_zone
+#if defined(OXR_HAVE_DXR_local_3d_zone) || defined(OXR_HAVE_EXT_view_configuration_views_change)
 	// #439 Phase 3 Q4 — view-size renegotiation poll. The just-committed
 	// frame resolved the compositor's recommended per-view render size
 	// (mask activation/deactivation supersedes the canvas; window resize
@@ -2831,7 +2842,23 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// (#441 edge-detection pattern; the event is advisory). Per-compositor
 	// getter dispatch — the D3D11/VK/GL consumer legs add their branches
 	// beside the Metal one.
-	if (sess->sys->inst->extensions.DXR_local_3d_zone && sess->xcn != NULL) {
+	//
+	// #1488: the gate is now "either doorbell is wanted". It used to be
+	// DXR_local_3d_zone alone, which would have left an app that enabled
+	// ONLY XR_EXT_view_configuration_views_change with no poll at all and
+	// therefore no event and no live enumerate values. Each push keeps its
+	// own sub-gate below, so an app that enables neither - or only the old
+	// one - behaves exactly as before, byte for byte.
+	bool want_dxr_view_size_event = false;
+	bool want_ext_views_change = false;
+#ifdef OXR_HAVE_DXR_local_3d_zone
+	want_dxr_view_size_event = sess->sys->inst->extensions.DXR_local_3d_zone;
+#endif
+#ifdef OXR_HAVE_EXT_view_configuration_views_change
+	want_ext_views_change = sess->sys->inst->extensions.EXT_view_configuration_views_change &&
+	                        debug_get_bool_option_views_change_event() && oxr_system_views_change_live_enabled();
+#endif
+	if ((want_dxr_view_size_event || want_ext_views_change) && sess->xcn != NULL) {
 		uint32_t view_w = 0;
 		uint32_t view_h = 0;
 		bool have_dims = false;
@@ -2866,15 +2893,40 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 #endif
 		if (have_dims && view_w > 0 && view_h > 0) {
-			if (sess->last_local2d_view_w != 0 &&
+#ifdef OXR_HAVE_DXR_local_3d_zone
+			// The bespoke doorbell, unchanged (soft-deprecated by
+			// #1488 but emitted forever - see the issue's Design 8).
+			// Keeps its own session-scoped edge state so this path is
+			// byte-identical to pre-#1488.
+			if (want_dxr_view_size_event && sess->last_local2d_view_w != 0 &&
 			    (sess->last_local2d_view_w != view_w || sess->last_local2d_view_h != view_h)) {
 				oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(log, sess, view_w, view_h);
 			}
 			sess->last_local2d_view_w = view_w;
 			sess->last_local2d_view_h = view_h;
+#endif
+
+#ifdef OXR_HAVE_EXT_view_configuration_views_change
+			// #1488. ORDER IS LOAD-BEARING: this call writes the live
+			// shadow BEFORE it can return true, so by the time the app
+			// wakes on the event and re-enumerates, the new value is
+			// already what it gets. And because the "push" answer is a
+			// pure function of a flag set only in the same critical
+			// section as that write, the doorbell is structurally
+			// unreachable unless xrEnumerateViewConfigurationViews
+			// would now answer differently - a consumer of the LOVR
+			// shape (which calls createSwapchains() unconditionally on
+			// the event) can never be made to reallocate for nothing.
+			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views, sess->sys->view_count,
+			                            view_w, view_h, os_monotonic_get_ns(), want_ext_views_change)) {
+				oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(
+				    log, sess->sys->inst, sess->sys->systemId, sess->sys->view_config_type, view_w,
+				    view_h);
+			}
+#endif
 		}
 	}
-#endif // OXR_HAVE_DXR_local_3d_zone
+#endif // OXR_HAVE_DXR_local_3d_zone || OXR_HAVE_EXT_view_configuration_views_change
 
 	sess->frame_id.begun = -1;
 	sess->frame_started = false;
