@@ -408,11 +408,27 @@ Two related traps:
   off-screen park — check `GetWindowPlacement().showCmd == 2` before
   concluding anything from geometry.
 - The compositor screenshot trigger (`%TEMP%\workspace_screenshot_trigger`) is
-  read in `multi_compositor_render()` before `Present()`. If the pipeline is
-  not presenting — which is exactly the state you are usually diagnosing — it
-  produces **no file at all**. Fall back to a desktop `CopyFromScreen`, and
-  treat "no screenshot appeared" as a datum (the pipeline is idle), not as a
-  capture failure.
+  read just before `Present()` on both service render paths — the direct
+  single-client path (`pipeline_default_policy_render()`) and the
+  compose/shell path (`multi_compositor_render()`) — and writes **two** files:
+  `%TEMP%\workspace_screenshot.png`, the presenter's back buffer **post-weave**
+  (read from the output adapter, so it is what the panel scans out — sized to
+  the presenter, i.e. the app window for a windowed client), and
+  `%TEMP%\workspace_screenshot_atlas_<views>_<cols>x<rows>.png` (e.g.
+  `_atlas_2_2x1.png`), the composed atlas **pre-weave**. Glob
+  `workspace_screenshot*.png`, not a fixed name. Before concluding anything
+  from a missing file, grep the service log: `#73 diag: wrote …` /
+  `capture_frame: … written=0x…` mean the PNGs exist under a name you did not
+  look for; `workspace_screenshot: post-weave dump SKIPPED — …` means the
+  compose path had nothing woven that tick and deliberately did not dump a
+  stale buffer. If none of those lines is there and the pipeline is not
+  presenting — which is exactly the state you are usually diagnosing — the
+  trigger produces **no file at all**. Fall back to a desktop
+  `CopyFromScreen`, and treat "no screenshot appeared" as a datum (the
+  pipeline is idle), not as a capture failure. The trigger works with the
+  weave-on-scanout split engaged; a post-weave PNG showing a plain 2D view
+  with the view-cone halo means no viewer was tracked at that instant, not a
+  capture fault.
 
 ## Still stuck?
 

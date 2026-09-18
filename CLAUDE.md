@@ -409,13 +409,19 @@ Optional per-app pose (`--pose x,y,z,width_m,height_m` before each app path):
 ## Autonomous capture & debugging
 
 ### Windows compositor screenshot (preferred)
-The D3D11 service compositor file-triggers a full-resolution atlas capture (reads the D3D11 texture directly — no DPI/PrintWindow issues). Code: `comp_d3d11_service.cpp`, in `multi_compositor_render()` before `Present()`.
+The D3D11 service compositor file-triggers a capture of what it is about to present (reads the D3D11 textures directly — no DPI/PrintWindow issues). One trigger, **two files**, on both the direct single-client path (`pipeline_default_policy_render()`) and the compose/shell path (`multi_compositor_render()`), each just before its `Present()`:
+
+| file | what it is | device |
+|---|---|---|
+| `%TEMP%\workspace_screenshot.png` | the presenter's back buffer, **post-weave**, pre-Present — the pixels the panel scans out (lenticular pattern when a viewer is tracked in 3D; the DP's 2D fallback + view-cone halo when nobody is) | the **output** adapter (`svc_out_device`) — under the weave-on-scanout split that is the iGPU, not the render GPU |
+| `%TEMP%\workspace_screenshot_atlas_<views>_<cols>x<rows>.png` (e.g. `_atlas_2_2x1.png`) | the composed atlas the DP consumed, **pre-weave** | the render adapter |
+
 ```bash
-rm -f "/c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot.png"
+rm -f /c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot*.png
 touch "/c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot_trigger"
-sleep 3   # then Read C:\Users\SPARKS~1\AppData\Local\Temp\workspace_screenshot.png
+sleep 3; ls /c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot*.png   # then Read them
 ```
-%TEMP% screenshot artifacts are pre-authorized for read/write. Screenshots taken during eye-tracking warmup may miss UI — when correctness depends on visuals, ask the user to eyeball the live display.
+The post-weave file is presenter-sized: full panel under the shell, but the app's **window** size for a windowed single client (a 1280×720 PNG from a 1312×808 window is correct, not a failure). Every outcome logs a WARN in the service log — `[dxr_diag_dump_tex] #73 diag: wrote …workspace_screenshot.png (WxH …)` and `[comp_d3d11_service_capture_frame] capture_frame: prefix=… written=0x… used=WxH (atlas=WxH)` on success, `workspace_screenshot: post-weave dump SKIPPED — …` when the compose path had no weave that tick. Those lines are the discriminator when "no screenshot appeared": present → you are looking for the wrong filename; absent → the pipeline never reached the capture site (the trigger is consumed before `Present()`, so a non-presenting pipeline writes nothing and logs nothing — treat that as a datum). Verified working with the weave-on-scanout split engaged on the hybrid box (2026-09-18). %TEMP% screenshot artifacts are pre-authorized for read/write. Screenshots taken during eye-tracking warmup may miss UI — when correctness depends on visuals, ask the user to eyeball the live display.
 
 **Toggle the shell launcher (Ctrl+L) programmatically** via PostMessage to the message-only window:
 ```powershell
