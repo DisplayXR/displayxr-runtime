@@ -468,7 +468,7 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_DXR_display_info`
-- Spec version: 17
+- Spec version: 19
 - Extension name define: `XR_DXR_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
@@ -486,6 +486,9 @@ With this information the application can:
 - Enumerate rendering modes (`xrEnumerateDisplayRenderingModesDXR`) — including each mode's view
   count, tile layout, view scale, hardware-3D state, and (per session) which mode is active and
   which are requestable — and request a mode via `xrRequestDisplayRenderingModeDXR`.
+- Opt into the N-view view configuration `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR`
+  (v19), so an app that renders multi-view modes is handed more than two views while
+  `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` stays a conformant two.
 - Choose between managed and manual eye tracking.
 
 This extension is **platform-independent**. It works on any platform that supports OpenXR,
@@ -497,6 +500,9 @@ regardless of the graphics API or windowing system in use.
 #define XR_TYPE_DISPLAY_INFO_DXR              ((XrStructureType)1004999003)
 #define XR_DISPLAY_MODE_2D_DXR                0
 #define XR_DISPLAY_MODE_3D_DXR                1
+
+// v19 — extends the core XrViewConfigurationType enum. See "New Enums".
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
 ```
 
 > **Note**: These values use the vendor extension range. They would be replaced with
@@ -723,6 +729,68 @@ typedef enum XrDisplayModeDXR {
 |---|---|
 | `XR_DISPLAY_MODE_2D_DXR` | Standard 2D display mode. Switchable optics or backlight are disabled; the display behaves as a conventional flat panel. |
 | `XR_DISPLAY_MODE_3D_DXR` | Tracked 3D display mode. Switchable optics or backlight are enabled; the display produces glasses-free 3D imagery via light field interlacing. |
+
+#### XrViewConfigurationType — `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` (v19)
+
+```c
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
+```
+
+This extension **extends the core `XrViewConfigurationType` enum** with one primary view
+configuration for N-view rendering. It is a cast `#define` because C cannot extend an
+enum from outside — so it is invisible to `-Wswitch`, and a `switch` over
+`XrViewConfigurationType` that must handle it needs an explicit `case`.
+
+A 3D display's rendering modes span 1, 2 or 4 views, while OpenXR ties the view count to
+the view configuration. `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` means exactly two
+views; this type is how an application reaches the rest.
+
+**Semantics:**
+
+| | `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` | `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` |
+|---|---|---|
+| Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
+| `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
+| `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
+| `xrEndFrame` projection `viewCount` | 1 or 2 (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
+
+- **Fixed per instance.** The count this type reports is the device maximum across modes
+  (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
+  change when the active rendering mode changes — the mode governs how many views the
+  application renders and submits, never how many the runtime reports. This keeps the core
+  rule that the view count is a property of the view configuration, and satisfies
+  `XR_EXT_view_configuration_views_change`'s immutability clause.
+- **`xrEndFrame` rule.** Under this type the runtime accepts a projection layer whose
+  `viewCount` matches the active rendering mode (so an app may submit 2 in a stereo mode
+  and 4 in a quad mode without re-creating the session), and 1 for a mono mode. Submitting
+  fewer views than the active mode has tiles is legal: the compositor paints the first
+  `viewCount` tiles.
+- **How to opt in.** Enable `XR_DXR_display_info` at `xrCreateInstance`, call
+  `xrEnumerateViewConfigurations`, and if this type is present pass it as
+  `XrSessionBeginInfo::primaryViewConfigurationType` (and as
+  `XrViewLocateInfo::viewConfigurationType`). If it is absent, begin `PRIMARY_STEREO`.
+  Naming it without having enabled the extension is a validation failure
+  (`XR_ERROR_VALIDATION_FAILURE`); naming it on a system that does not advertise it
+  returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`.
+- **Stereo-fixed applications are unaffected.** An application that never enables this
+  extension, or enables it and stays on `PRIMARY_STEREO`, is never handed more than two
+  views and needs no change. Engine plug-ins whose topology is fixed at two (Unity) fall in
+  this group.
+
+**Valid Usage:**
+- The application **must** have enabled `XR_DXR_display_info` at instance creation before
+  naming this type in any call.
+- `xrLocateViews` **must** be called with a `viewCapacityInput` of at least the count
+  reported by `xrEnumerateViewConfigurationViews` for the type the session began; sizing
+  the array to `XRT_MAX_VIEWS` (8) is the recommended shape.
+- A session begins exactly one primary view configuration; calling `xrLocateViews` with a
+  different type returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`.
+
+Rationale, the compositor-side under-submit contract, consumer impact and the
+`DXR_VIEW_CONFIG_LEGACY` kill switch:
+[`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md).
+Khronos-submission ask:
+[`docs/roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md`](../../roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md).
 
 ### New Functions
 
@@ -1341,6 +1409,17 @@ if (frameState.shouldRender) {
 All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `XrSession`,
 `XrSpace`, `XrSwapchain`, `xrLocateViews`, `xrEndFrame`, `xrGetSystemProperties`,
 `xrCreateReferenceSpace`.
+
+`XR_DXR_display_info` additionally **extends the core `XrViewConfigurationType` enum** (v19)
+with `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR`, so it interacts with
+`xrEnumerateViewConfigurations`, `xrGetViewConfigurationProperties`,
+`xrEnumerateViewConfigurationViews`, `xrEnumerateEnvironmentBlendModes`, `xrBeginSession`,
+`xrLocateViews` and `xrEndFrame`. When the extension is not enabled, the runtime advertises
+only the core types and every one of those entry points behaves exactly as before — the new
+type is additive and opt-in. Because the value is a vendor enum, a conformance or validation
+layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not
+recognise it; see
+[`docs/reference/view-configuration-model.md`](../../reference/view-configuration-model.md#cts-status).
 
 ### Platform Dependencies
 
@@ -2068,12 +2147,16 @@ the property) silently ignore the call — graceful degradation.
 | 15 | 2026-06-11 | David Fattal | **Repurposed `xrRequestDisplayModeDXR`** (#542): no longer a deprecated mode-switching wrapper — it now sets the HARDWARE display state alone for the current mode (the mode's layout/content and the DP's atlas processing are untouched; the DP weaves or flat-blits per the atlas it is handed). Override holds until the next mode request. Reported via `XrEventDataHardwareDisplayStateChangedDXR`. No struct/ABI change. |
 | 16 | 2026-07-07 | David Fattal | Added `XrDisplayDesktopPositionDXR` (`1004999210`, new chained struct — additive, no ABI change to existing structs): the 3D panel's top-left in virtual-desktop pixels, chained to `XrSystemProperties`, so handle/texture-class apps can create their window on the panel on multi-monitor systems (#715). |
 | 17 | 2026-08-16 | David Fattal | **Panel lease** (ADR-035 D2, #961): added `XrEventDataDisplayModeRequestDeniedDXR` (`1004999014`, additive) + `XrDisplayModeDenialReasonDXR` + `XR_DISPLAY_MODE_INDEX_NONE_DXR`. Requests from non-lease-holders are denied with a reason event, never queued; `XrEventDataHardwareDisplayStateChangedDXR` fires only after the display processor confirmed; a mode-change event whose transition does not land is reverted by a second event (#761); service-mode sessions apply nothing locally. |
-| 18 | 2026-09-01 | David Fattal | Added `XrDisplayDesktopInfoDXR` (`1004999211`, new chained struct — additive, no ABI change to existing structs): the panel monitor's **full desktop rect** plus a **stable device name** (`\\.\DISPLAY1`), superseding the origin-only `XrDisplayDesktopPositionDXR`, so a client can place its window on the 3D panel and re-resolve the monitor after a topology change (#1301, unblocking displayxr-unity#266). Adds `isPrimary` and `isPanelConfirmed`. The rect is resolved under a pinned per-monitor-v2 DPI context so it is physical even when the host process is DPI-unaware. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 18`).** |
-| 19 | 2026-09-06 | David Fattal | RAW-mode wording (#1370): eye positions are **relative to the display plane**, not "regardless of the reference space" — `XrViewDisplayRawDXR::displayPlanePose` reports that plane in the locate space. Render-ready views (legacy and rig-chained) now honour `XrViewLocateInfo::space` on both legs; no wire or struct change. |
+| 18 | 2026-09-01 | David Fattal | Added `XrDisplayDesktopInfoDXR` (`1004999211`, new chained struct — additive, no ABI change to existing structs): the panel monitor's **full desktop rect** plus a **stable device name** (`\\.\DISPLAY1`), superseding the origin-only `XrDisplayDesktopPositionDXR`, so a client can place its window on the 3D panel and re-resolve the monitor after a topology change (#1301, unblocking displayxr-unity#266). Adds `isPrimary` and `isPanelConfirmed`. The rect is resolved under a pinned per-monitor-v2 DPI context so it is physical even when the host process is DPI-unaware. |
+| 19 | 2026-09-17 | David Fattal | **N-view view configuration** (#1486 option B / #80): added `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` (`1004999212`) — the extension now extends the core `XrViewConfigurationType` enum. `xrEnumerateViewConfigurations` returns a list: a conformant 2-view `PRIMARY_STEREO` plus, when this extension is enabled, the DXR type reporting the device's max view count across modes. `xrEndFrame` rejects `viewCount > 2` under `PRIMARY_STEREO` and names the DXR type as the opt-in. Additive: no struct, wire or ABI change. Also carries the earlier RAW-mode wording clarification (#1370): eye positions are **relative to the display plane**, not "regardless of the reference space" — `XrViewDisplayRawDXR::displayPlanePose` reports that plane in the locate space, and render-ready views (legacy and rig-chained) honour `XrViewLocateInfo::space` on both legs. **Current header version (`XR_DXR_display_info_SPEC_VERSION == 19`).** |
 
 > The `XR_DXR_display_info_SPEC_VERSION` define in the header is the authoritative current
 > revision. Earlier revision numbers in this table reflect the proposal's editing history and do
 > not all map one-to-one onto the header's inline `// ---- vN ----` section comments.
+>
+> One reconciliation is worth recording: the #1370 RAW-mode clarification was documented as
+> revision 19 while the header define still read 18 (it was editorial — no header change). The
+> define reached 19 with the `PRIMARY_MULTIVIEW_DXR` addition, so revision 19 above covers both.
 
 ---
 

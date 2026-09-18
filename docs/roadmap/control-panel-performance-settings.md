@@ -45,7 +45,7 @@ Three facts that constrain any redesign:
 
 - **`get_option_raw` has an out-of-process channel on Android**: it reads the
   system property `debug.xrt.<NAME>` rather than the environment (`u_debug.c:66-78`).
-  **But it is NOT "already solved" — see the name-length trap below; 33 of the 80
+  **But it is NOT "already solved" — see the name-length trap below; 34 of the 81
   option knobs are silently unreachable through it.**
 - **The parsers are deliberately not unified.** `comp_split_gate.c:20-44` carries an
   explicit note — the leading-character test is *"deliberately NOT
@@ -322,7 +322,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **89 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **90 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -543,6 +543,7 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_SIM_INPUT_NAV_HOLD_MS` | `drivers/sim_input/sim_input_plugin.c:153` | 0 (never) | Both | Every *n* ms the scripted navigation pose reports invalid for 500 ms — exercises the composer's hold / re-align path |
 | `DXR_SIM_INPUT_NAV_RECENTER_MS` | `drivers/sim_input/sim_input_plugin.c:154` | 0 (never) | Both | Every *n* ms the scripted device publishes a durable RECENTER timestamp together with a phase jump — exercises recenter alignment; CI runs 400 |
 | `DXR_LEGACY_STANDALONE` | `compositor/d3d11_service/comp_d3d11_service.cpp:286` | off | Svc | Reverts the service to the pre-hybrid standalone path (ADR-035 D3, slated for deletion) |
+| `DXR_VIEW_CONFIG_LEGACY` | `state_trackers/oxr/oxr_system.c` (`oxr_system_fill_in`, `DEBUG_GET_ONCE_BOOL_OPTION`) | off | App | #1486 kill switch: restores the pre-#1486 single view configuration — `PRIMARY_STEREO` for any `view_count >= 2`, reporting the max across modes (4 on sim-display), and no `PRIMARY_MULTIVIEW_DXR`. Reintroduces the spec deviation and the CTS red on purpose, for one round of field bisection. Logs one `U_LOG_W` when active. 22 characters, so `debug.xrt.DXR_VIEW_CONFIG_LEGACY` is **stranded on Android** by the `PROP_NAME_MAX` trap above — env-only in practice. See [View-Configuration Model](../reference/view-configuration-model.md) |
 | `DXR_IPC_FD` | `auxiliary/util/u_sandbox.c:181`; `ipc/client/ipc_client_connection.c:211, 234` | unset | Both / App | #1056 adopts an embedder-supplied service socket. Not a setting |
 | `DXR_IPC_HANDLE` | `ipc/client/ipc_client_connection.c:437, 456` | unset | App | Windows analogue of the above |
 
@@ -565,7 +566,7 @@ grep -rhoE '"DXR_[A-Z0-9_]+"' src/xrt \
   | sort -u
 ```
 
-As of this writing that yields **79** names, all present above. Read sites and mechanisms
+As of this writing that yields **80** names, all present above. Read sites and mechanisms
 were machine-derived by intersecting that list with lines containing `getenv`,
 `GetEnvironmentVariable` or `DEBUG_GET_ONCE`, then spot-verified line by line. If the
 count changes, the table is stale.

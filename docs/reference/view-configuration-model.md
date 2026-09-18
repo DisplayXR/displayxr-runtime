@@ -1,22 +1,213 @@
-# View-configuration model — what `PRIMARY_STEREO` means in DisplayXR
+# View-configuration model — `PRIMARY_STEREO` vs `PRIMARY_MULTIVIEW_DXR`
 
 DisplayXR drives displays whose rendering modes span **1 to 4 views** (2D, stereo,
 quad), while OpenXR makes the view count a property of the *view configuration*.
-This page records how the runtime reconciles the two **today**, the spec deviation
-that follows, and the planned fix — current behaviour, not a design we defend.
+This page records how the runtime reconciles the two **as implemented**: which
+types it advertises, how many views each reports, what `xrLocateViews` and
+`xrEndFrame` do under each, and which knob restores the old behaviour.
 
-> **Known deviation.** DisplayXR advertises exactly one view configuration —
-> `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` for any device with more than one
-> view — and reports the **maximum view count across all of that device's
-> rendering modes**. On a device with a quad mode that is **4**, not 2, in every
-> mode. The OpenXR spec ties `PRIMARY_STEREO` to two views. Tracked as
-> [#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486).
+> **The short version.** A stereo app does nothing and gets exactly 2 views from
+> a conformant `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`. An app that wants the
+> device's N-view modes enables `XR_DXR_display_info`, finds
+> `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` in
+> `xrEnumerateViewConfigurations`, and begins its session with that type.
+> Landed for [#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486)
+> (option B) / [#80](https://github.com/DisplayXR/displayxr-runtime/issues/80).
 
 ## What the runtime advertises
 
-There is exactly one `view_config_type` per system — the runtime models **one**
-view configuration, never a list. The mapping is
-`src/xrt/state_trackers/oxr/oxr_system.c:111-117`:
+The system carries a **list** of view configurations, not a single type
+(`struct oxr_system`, `oxr_objects.h`: `view_config_count`,
+`view_config_types[]`, `view_config_view_counts[]`), populated in
+`oxr_system_fill_in()` (`src/xrt/state_trackers/oxr/oxr_system.c`):
+
+| Device | `XR_DXR_display_info` enabled? | `xrEnumerateViewConfigurations` returns |
+|---|---|---|
+| `view_count == 1` (mono-only) | either | `PRIMARY_MONO` |
+| `view_count >= 2` | **no** | `PRIMARY_STEREO` |
+| `view_count >= 2` | **yes** | `PRIMARY_STEREO`, then `PRIMARY_MULTIVIEW_DXR` |
+
+`PRIMARY_MONO` and `PRIMARY_STEREO` stay mutually exclusive, exactly as before.
+`PRIMARY_MULTIVIEW_DXR` is **gated on the extension being enabled on the
+instance** — an app that never asked for `XR_DXR_display_info` never sees a
+vendor enum, and naming the type without enabling the extension fails
+`xrBeginSession` / `xrEnumerateViewConfigurationViews` validation
+(`XR_ERROR_VALIDATION_FAILURE`, the usual spec pattern for extension enums).
+A valid-but-not-advertised type still returns
+`XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`.
+
+`PRIMARY_MULTIVIEW_DXR` is advertised on **every** 3D-capable device when the
+extension is on — including a stereo-only device such as Leia, where it reports
+2. That is deliberate: an N-view-capable app can select it unconditionally
+without branching on the hardware.
+
+### The enum value
+
+```c
+// src/external/openxr_includes/openxr/XR_DXR_display_info.h (spec v19)
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
+```
+
+It lives in `XR_DXR_display_info`'s 210–219 decade of the registered `DXR`
+block. It is a cast `#define` because C cannot extend the core enum — so it is
+invisible to `-Wswitch`, and every `switch` over `XrViewConfigurationType` that
+must handle it needs an explicit `case`.
+
+## Per-type behaviour
+
+| | `PRIMARY_MONO` | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
+|---|---|---|---|
+| `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
+| `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
+| `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
+| `xrEndFrame` projection `viewCount` accepted | 1 | 1 or 2 | 1, 2, or any rendering mode's `viewCount` |
+| Fixed for the instance lifetime? | yes | yes | yes |
+
+Three properties hold under all three types:
+
+- **The reported count never moves on a mode switch.** Two counts are in play and
+  only one of them moves:
+
+  | | source | changes on a mode switch? | what it governs |
+  |---|---|---|---|
+  | reported view count | the begun view-configuration type | **no** | what `xrEnumerateViewConfigurationViews` / `xrLocateViews` return |
+  | `active_view_count` | the active rendering mode | yes | mono-vs-3D eye assignment inside `xrLocateViews` |
+
+  Because the reported count is immutable, the core spec rule ("the count is
+  fixed by the `XrViewConfigurationType`") and
+  `XR_EXT_view_configuration_views_change`'s view-count-immutability clause are
+  satisfied by construction.
+
+- **The device max still governs allocation.** `sys->view_count` keeps its old
+  meaning — the device's max across modes — and is what the runtime's internal
+  arrays, the IPC mirror and `xrt_device_get_view_poses` are sized to.
+  `xrLocateViews` computes in device space over that max and then writes only
+  the first `reported_view_count` entries out to the app, clamping
+  `active_view_count` to the reported count so the eye-padding loops can never
+  run past the app's array.
+
+- **The begun type is per session.** `xrBeginSession` records
+  `primaryViewConfigurationType` on the session; `xrLocateViews` with any other
+  type returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`, and the
+  visibility-mask path and its event follow the begun type too.
+
+## The under-submit contract
+
+An app under `PRIMARY_MULTIVIEW_DXR` (or a 2-view app that the workspace put into
+a 4-view mode) may submit **fewer** views than the active mode has tiles. The
+compositor resolves the discrepancy on the content side, per-frame:
+
+```c
+// comp_d3d11_renderer.cpp — comp_d3d11_renderer_compute_effective_layout()
+views = <the projection/zone-3D layer's view_count>;
+if (views > mode_tiles) views = mode_tiles;   // never the other way round
+```
+
+- `views == 1` → one tile spanning the full content region; the DP flat-blits a
+  1×1 grid. This is how an always-stereo app behaves correctly in a 2D mode.
+- `1 < views < mode_tiles` → the **mode's** grid, with the app painting the first
+  `views` tiles (a 2-view app in a 2×2 quad mode paints tiles 0 and 1).
+
+Same rule, same shape, on every backend:
+`comp_d3d12_renderer_compute_effective_layout`,
+`gl_compute_effective_layout` (`comp_gl_compositor.cpp`),
+`vk_compute_effective_layout` (`comp_vk_native_compositor.c`), and the Metal
+compositor's inline equivalent. Submissions are clamped to the active mode's
+recipe, never the reverse — the divergence an app *wants* is expressed with the
+hardware-state override (`xrRequestDisplayModeDXR`), not with a mismatched view
+count ([#542](https://github.com/DisplayXR/displayxr-runtime/issues/542),
+[ADR-028](../adr/ADR-028-display-mode-recipe-vs-hardware-state.md)).
+
+Consequence: `PRIMARY_STEREO` reporting 2 costs no capability. A 2-view app in a
+quad mode renders exactly what it rendered before.
+
+## Why a vendor type rather than clamping to 2
+
+- **One worst-case swapchain** ([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)):
+  the app swapchain is sized once for the worst case across modes and never
+  resized, so a stable max-sized view surface is the matching shape for an app
+  that intends to fill it.
+- **`PRIMARY_STEREO` must mean two.** The core spec ties it to two views, and the
+  CTS asserts it (below). A 4-view `PRIMARY_STEREO` is not a capability, it is a
+  deviation that any external validation layer would reject.
+- **N-view stays reachable.** Clamping everything to 2 would make a quad /
+  lightfield mode unreachable through `xrLocateViews` — future-proofing the
+  N-view path is the whole point of
+  [#80](https://github.com/DisplayXR/displayxr-runtime/issues/80).
+
+## CTS status
+
+OpenXR-CTS 1.1.57 added the automated (untagged, **not** `[interactive]`) test
+`xrLocateSpace_xrLocateViews`
+(`src/conformance/conformance_test/test_xrLocateSpace.cpp:260`, present at tag
+`openxr-cts-1.1.63.0`). For every advertised view-configuration type it asserts
+that VIEW space equals the centroid of the `xrLocateViews` origins, and for
+`PRIMARY_STEREO` it asserts `REQUIRE(views.size() == 2)`
+(`test_xrLocateSpace.cpp:323`). That assertion is why the old model failed the
+test by construction on sim-display.
+
+**The `~xrLocateSpace_xrLocateViews` exclusion is removed** from
+`.github/workflows/cts.yml` and `scripts/run_cts.ps1` — the test passing is now
+the acceptance signal for this model, not a known red.
+
+What the CTS actually sees: it never enables `XR_DXR_display_info`, so
+`PRIMARY_MULTIVIEW_DXR` is never enumerated to it. The CTS sees exactly
+`PRIMARY_STEREO` with 2 views. The test's own loop iterates every enumerated
+type and only **warns** on one it does not recognise, so even a future CTS run
+with the extension on would not fail here.
+
+> **Caveat, recorded as an accident and not a plan.** The CTS *conformance layer*
+> exact-matches `XrViewConfigurationType` against the Khronos `xr.xml` list
+> (`conformance_layer/RuntimeFailure.h:73`, `Instance.cpp:54`) and would flag any
+> `DXR` value. It is moot today for two independent reasons: the CTS never
+> enables `XR_DXR_display_info`, so the value is never enumerated to it; and our
+> `xrSubmitDebugUtilsMessageEXT` is a stub (`oxr_api_debug.c:84-85`) while the
+> loader does not fan the message out (`loader_core.cpp:617-627`), so the layer's
+> flag could not reach the CTS today in any case. Neither of those is a design
+> decision to lean on — a real Khronos submission of the type
+> ([#80](https://github.com/DisplayXR/displayxr-runtime/issues/80)) is what
+> resolves it properly.
+
+## The kill switch — `DXR_VIEW_CONFIG_LEGACY`
+
+`DXR_VIEW_CONFIG_LEGACY=1` restores **exactly** the pre-#1486 mapping: a single
+view configuration, `PRIMARY_STEREO` for any `view_count >= 2`, reporting the max
+across modes (so 4 on sim-display), and no `PRIMARY_MULTIVIEW_DXR` at all. It is
+read once, in `oxr_system_fill_in()` — the only translation unit that reads it —
+via `DEBUG_GET_ONCE_BOOL_OPTION`, so it is next-launch (Tier 1) and logs one
+`U_LOG_W` line when active. It is registered in
+[`control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md)
+Appendix A, *Test / dev — never exposed*.
+
+It exists for one round of field bisection. It reintroduces the deviation and the
+CTS failure, so a box running it is out of contract on purpose.
+
+## What consumers see
+
+| Consumer | Before | After | Note |
+|---|---|---|---|
+| **Windows browser** | latent bug | **fixed** | It calls core `xrLocateViews` with capacity **2** under `PRIMARY_STEREO` (browser-pvt `patches/0036:435`, still 2 in `0077:787`) → `XR_ERROR_SIZE_INSUFFICIENT` under sim-display. Masked on hardware only because Leia reports 2. `PRIMARY_STEREO` reporting 2 fixes it outright. It is **not** wire-only. |
+| **Shell file picker** | latent bug | **fixed** | Clamps `xrEnumerateViewConfigurationViews` capacity to 2 (`file_picker_openxr.cpp:202-211`) → failed init under sim-display. |
+| **Android demos** (earthview, gauss, modelviewer) | latent bug | **fixed** | All three gate on exactly 2 views and abort otherwise. |
+| **Unity** | unaffected | unaffected | Stereo topology fixed at 2; truncates to 2. Stays on `PRIMARY_STEREO`. |
+| **Unreal** | unaffected | unaffected | Its render loop is **N-wide** — it takes the tile count from `xrEnumerateDisplayRenderingModesDXR`, never from the view configuration — but its *content* is 2-view (views ≥ 2 duplicate the right eye). It is **not** "fixed at 2 views"; it is simply not driven by the view config, so the type it begins does not change its loop. |
+| **DisplayXR extension apps** | correct | opt in | `INV-3.1` ([app rules](../guides/displayxr-app-rules.md)) now reads: an N-view app begins with `PRIMARY_MULTIVIEW_DXR` when enumerated; a stereo-fixed app stays on `PRIMARY_STEREO` and gets 2. |
+| **Legacy apps** hardcoding 2 | out of contract | correct | They were only ever broken by the max-across-modes count; `PRIMARY_STEREO` = 2 makes them right. |
+
+**Nothing in-tree actually renders more than 2 views of content.** The only
+device that ever sets `view_count > 2` is `sim_display`, whose Quad mode is
+opt-in (`SIM_DISPLAY_OUTPUT=quad` / `SIM_DISPLAY_FORCE_MODE=4`) and self-described
+as a *"view-inspection tool, not a sane default"*
+(`sim_display_device.c:52-56`). The Leia plug-in hardcodes
+`hmd->base.hmd->view_count = 2` on every platform (`src/drv_leia/leia_device.c:257`)
+and declares two modes, 2D (1 view) and LeiaSR (2 views). So
+`PRIMARY_MULTIVIEW_DXR` is future-proofing plus sim-display CI conformance — it
+is not preserving a shipping N-view product today.
+
+## History — what the deviation was
+
+Before this change the runtime modelled **one** view configuration per system
+(`oxr_system.c`, a single `sys->view_config_type`):
 
 ```c
 sys->view_count = view_count;
@@ -28,94 +219,19 @@ if (view_count == 1) {
 }
 ```
 
-`sys->view_count` is handed verbatim to `xrEnumerateViewConfigurationViews`
-(`oxr_system.c:847`, the non-mono branch of `OXR_TWO_CALL_FILL_IN_HELPER`), and
-`xrLocateViews` returns the same number (`oxr_session.c:1825` reads
-`xdev->hmd->view_count`, `:1837` writes it to `*viewCountOutput`).
+`sys->view_count` — the **max across the device's rendering modes**, computed in
+`sim_display_device.c` — was handed verbatim to
+`xrEnumerateViewConfigurationViews` and `xrLocateViews`. `sim_display` declares 5
+modes (2D 1 view, Anaglyph 2, Cropped SBS 2, Squeezed SBS 2, Quad 4), so **every**
+sim-display instance reported **4 views for `PRIMARY_STEREO`**, in every mode.
+That was the deviation: not latent, not mode-dependent, and in direct conflict
+with the spec's two-view definition of `PRIMARY_STEREO`.
 
-## Where the number comes from
-
-A device reports the **max across its rendering modes**. The in-tree
-`sim_display` driver is the reference (`src/xrt/drivers/sim_display/sim_display_device.c:754-762`):
-
-```c
-// view_count = max across all rendering modes
-uint32_t max_views = 1;
-for (uint32_t m = 0; m < hmd->base.rendering_mode_count; m++)
-        if (hmd->base.rendering_modes[m].view_count > max_views)
-                max_views = hmd->base.rendering_modes[m].view_count;
-hmd->base.hmd->view_count = max_views;
-```
-
-`sim_display` declares 5 modes (`:690` — 2D, Anaglyph, Cropped SBS, Squeezed SBS,
-Quad) and mode 4 is Quad with `view_count = 4` (`:735`). So **every** sim-display
-instance reports 4, regardless of which mode is active. This is not latent and not
-mode-dependent.
-
-## The count is fixed for the instance lifetime
-
-Two counts are in play, and only one of them moves:
-
-| | source | changes on a mode switch? | what it governs |
-|---|---|---|---|
-| `view_count` | max across modes | **no** | what `xrEnumerateViewConfigurationViews` / `xrLocateViews` return |
-| `active_view_count` | the active mode | yes | mono-vs-3D eye assignment inside `xrLocateViews` |
-
-`oxr_session.c:1820-1833` states this deliberately. Because the returned count
-never moves, the core spec rule ("the count is fixed by the
-`XrViewConfigurationType`") and `XR_EXT_view_configuration_views_change`'s
-view-count-immutability clause are **already satisfied**. The open question is
-narrow: *which type do we name, and with how many views.*
-
-## Why it is built this way
-
-- **N-view displays are the point.** Quad / lightfield modes are a shipping
-  capability of the display class; clamping the surface to 2 would make them
-  unreachable through `xrLocateViews`.
-- **One worst-case swapchain** ([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)):
-  the app swapchain is sized once for the worst case across modes and never
-  resized, so a stable max-sized view surface is the matching shape.
-- **Apps are already told to size for the max.** `INV-3.1`
-  ([app rules](../guides/displayxr-app-rules.md)) requires apps to locate into an
-  `XRT_MAX_VIEWS` (8)-wide buffer and render/submit the **active mode's** count,
-  never a hardcoded 2 — so an extension app is not surprised by a 4.
-
-## What catches it
-
-OpenXR-CTS 1.1.57 added the automated (untagged, **not** `[interactive]`) test
-`xrLocateSpace_xrLocateViews`
-(`src/conformance/conformance_test/test_xrLocateSpace.cpp:260`, verified present
-at tag `openxr-cts-1.1.63.0`). For every advertised view-configuration type it
-asserts that VIEW space equals the centroid of the `xrLocateViews` origins, and
-for `PRIMARY_STEREO` it asserts `REQUIRE(views.size() == 2)`
-(`test_xrLocateSpace.cpp:323`). Against the default sim-display configuration
-that is a certain failure.
-
-Until the deviation is fixed, the test is **excluded by name** from the CTS specs
-in `.github/workflows/cts.yml` and `scripts/run_cts.ps1`, with a comment naming
-#1486. The exclusion is not a claim of conformance — we do not claim conformance
-on this test.
-
-## What consumers see
-
-- **Engine plug-ins (Unity, Unreal)** are fixed at **2 views** — no view synthesis
-  exists anywhere in the stack — so a 4-view quad mode is already unfillable by
-  them and nothing changes for them under any of the candidate fixes.
-- **DisplayXR extension apps** follow INV-3.1 and are correct as written; legacy
-  apps that hardcode 2 were already out of contract.
-
-## Planned fix
-
-The target is **a DXR-owned `XrViewConfigurationType`** advertised alongside a
-conformant 2-view `PRIMARY_STEREO`: apps that want N-view opt into the DXR type
-explicitly, and `PRIMARY_STEREO` becomes spec-clean. That is option B in
-[#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486) and it needs
-an enum value from the registered DXR block; it will most likely live in
-`XR_DXR_display_info`'s block.
-
-When that lands it ships behind one next-launch kill switch, whose name is
-**reserved here so nothing else takes it**: `DXR_VIEW_CONFIG_LEGACY=1` restores
-exactly today's mapping (any `view_count >= 2` → `PRIMARY_STEREO`, count = max
-across modes). It is a Tier-1 test/dev lever and will be registered in
-[`control-panel-performance-settings.md`](../roadmap/control-panel-performance-settings.md)
-Appendix A when it is implemented. **Nothing reads it today.**
+It was recorded (rather than fixed) in
+[#1491](https://github.com/DisplayXR/displayxr-runtime/pull/1491), which also
+added the named CTS exclusion this change removes. Three claims in that first
+write-up were wrong and are corrected above: quad was called *"a shipping
+capability of the display class"* (it is a sim-display dev-only inspection mode),
+the browser was called *wire-only* (the Windows browser calls core
+`xrLocateViews`), and Unreal was called *"fixed at 2 views"* (its loop is N-wide;
+only its content is 2-view).
