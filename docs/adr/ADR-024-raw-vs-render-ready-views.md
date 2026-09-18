@@ -1,7 +1,7 @@
 ---
-status: Accepted (amended 2026-09-06, see Amendment 1)
+status: Accepted (amended 2026-09-06 and 2026-09-18, see Amendments 1-2)
 date: 2026-06-08
-issues: [396, 1370]
+issues: [396, 1370, 1502]
 ---
 # ADR-024: Raw vs Render-Ready Views (XR_DXR_view_rig)
 
@@ -147,10 +147,96 @@ patched one class with a per-class constant.
   LOCAL/STAGE/VIEW, the rig round trip across the three spaces, and
   `displayPlanePose` in the locate space. The LOCAL offset is read from the
   runtime, never hard-coded.
-- Deferred: VIEW as the eye centroid (today VIEW is the plane; the views sit in
+- ~~Deferred: VIEW as the eye centroid (today VIEW is the plane; the views sit in
   front of it in every class). That will be a VIEW-space offset, not a head
   change — the head device pose must stay parallax-free for the ADR-034
-  Amendment 2 rig source.
+  Amendment 2 rig source.~~ **Done — Amendment 2 below.**
+
+## Amendment 2 — VIEW is the eye centroid (2026-09-18)
+
+**Status:** Accepted. Closes #1502. Takes the deferral above off the list,
+in the shape it named.
+
+### What was wrong
+
+OpenXR defines `XR_REFERENCE_SPACE_TYPE_VIEW` as the view origin, or the
+**centroid of the view origins** when there is more than one. DisplayXR's VIEW
+was the head device pose — the display plane — while the eyes `xrLocateViews`
+reports carry the nominal viewer position minus the window-centre offset
+(ADR-012). CTS 1.1.63 `xrLocateSpace_xrLocateViews` asserts the spec wording
+(`test_xrLocateSpace.cpp:330`) and failed on the difference. Measured on the win
+box, with the harness's DPI artefact (#1506) removed, that difference is exactly
+
+```
+centroid − VIEW = nominal_eye − window_center_offset
+```
+
+— `(0, 0.1025, 0)` on sim-display, residual ~3e-5 across two independent window
+geometries. A model, not a fit.
+
+### Decision
+
+VIEW is the head pose composed with a **per-session VIEW-space offset**, and the
+offset is **measured, never re-derived**.
+
+1. **Measured off what was reported.** `oxr_session_locate_views` already has
+   the poses it wrote into `views[]` and VIEW's own pose in the same base
+   (`T_base_head`); the offset is whatever makes them agree, read back into the
+   VIEW frame. Runtime VIEW and an app's centroid are therefore the same number
+   by construction — the same argument ADR-024 makes for render-ready views. The
+   alternative, re-deriving `nominal_eye − window_center_offset` inside
+   `oxr_space.c`, is a second copy of the Kooima input resolution and would
+   drift; it is rejected for the same reason the `m_*_view` ports were deleted.
+   The offset is base-independent (the Amendment 1 invariant), so publishing it
+   from a locate in any base — VIEW included, whose fixed point is the same
+   vector — is sound.
+2. **Both legs, in the state tracker.** `oxr_space_ref_offset` composes the
+   offset in front of the app's `poseInReferenceSpace` wherever an overseer
+   `offset` / `base_offset` is built — `xrLocateSpace`, `xrLocateSpaces`,
+   `oxr_space_locate_device` (which is what `xrLocateViews` uses for
+   `T_base_xdev`), and the VIEW-space layer path in `oxr_session_frame_end.c`.
+   Target and base or neither: one leg alone stops `VIEW`-in-`X` and `X`-in-`VIEW`
+   being inverses.
+3. **Not the overseer, and not the head.** The offset lives on
+   `oxr_session`, above `xrt_space_overseer`. That is deliberate: `recenter`
+   (`u_space_overseer.c`, LOCAL re-derived from VIEW) and per-app LOCAL seeding
+   read `xso->semantic.view` directly, so they keep seeing the head pose and the
+   **user-visible origin does not move**. The head device pose is likewise
+   untouched, keeping it parallax-free for the ADR-034 Amendment 2 rig source.
+   A per-system offset was also rejected: the window-centre term is per-session
+   by construction, and a static `nominal_eye` leaves a window-dependent
+   residual (2.5 mm in the measured CTS run) — enough to fail the assertion it
+   is meant to fix.
+4. **Two documented non-participants.** A locate that **chains a rig** does not
+   publish: the rig is the app's own camera, and letting VIEW follow it would
+   make VIEW flip-flop between an app's rig and non-rig frames. The **RAW
+   classes** (external-window / bridge-relay, INV-6.1) do not publish either:
+   their view poses are display-plane-relative in every base by contract, so no
+   centroid of them can be compared with VIEW. Both keep the pre-#1502
+   behaviour — VIEW is the head pose — as does any session before its first
+   qualifying `xrLocateViews`.
+
+### Consequences
+
+- VIEW moves by the eye centroid: +0.10 m in y on sim-display, plus whatever the
+  app's window contributes off-centre. On a vendor display it is the DP's
+  `nominal_viewer_y_m` (the SR SDK's default viewing position on Leia, typically
+  ~0) plus the same window term. Anything anchored to VIEW moves with it —
+  in practice one consumer, `displayxr-common`'s HUD quad, which is *better*
+  centred on the eyes than on the plane. LOCAL, STAGE, recenter and every
+  app that anchors to LOCAL are unaffected.
+- A VIEW-space composition layer is unaffected in pixels: the layer and the
+  views moved together.
+- `tests/tests_oxr_view_space.cpp` gains `[view_centroid]` arms: VIEW == centroid
+  in LOCAL / STAGE / VIEW, `VIEW`-in-`VIEW` identity and round-trip inversion, a
+  chained rig leaving VIEW alone, and the MULTIVIEW arm that pins the centroid to
+  the **reported** array (duplicated inactive views included) rather than the eye
+  set. The Amendment 1 arm that read "displayPlanePose == VIEW" now pins the
+  weaker, still-correct thing — that the plane's offset from VIEW is
+  base-invariant — because the plane is no longer at the VIEW origin.
+- The CTS by-name exclusion is removed only after a real run confirms it, and
+  that run needs #1506 (or `__COMPAT_LAYER=HighDpiAware`) or the window term
+  comes back as a DPI artefact.
 
 ## References
 

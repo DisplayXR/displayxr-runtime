@@ -1835,6 +1835,35 @@ locate_views_pose_origin_to_base(const struct xrt_space_relation *T_base_origin,
 	math_pose_transform(&T_base_origin->pose, pose_origin, out_pose_base);
 }
 
+/*
+ * #1502 - the VIEW reference space carries the eye-centroid offset.
+ *
+ * xrLocateViews is the only thing that knows where the eyes ended up: the
+ * offset is a function of the DP's eyes, the nominal viewer, the window-centre
+ * offset (ADR-012) and the active rendering mode, none of which xrLocateSpace
+ * sees. So the offset is MEASURED off the poses this function just wrote and
+ * published here, rather than re-derived in oxr_space.c - re-deriving is how
+ * the two answers would drift apart, and the whole point is that they cannot.
+ *
+ * Orientation stays identity: the reported views carry the head orientation,
+ * which VIEW already has.
+ */
+void
+oxr_session_get_view_space_offset(struct oxr_session *sess, struct xrt_pose *out_offset)
+{
+	os_mutex_lock(&sess->view_space_offset_lock);
+	*out_offset = sess->view_space_offset;
+	os_mutex_unlock(&sess->view_space_offset_lock);
+}
+
+void
+oxr_session_set_view_space_offset(struct oxr_session *sess, const struct xrt_pose *offset)
+{
+	os_mutex_lock(&sess->view_space_offset_lock);
+	sess->view_space_offset = *offset;
+	os_mutex_unlock(&sess->view_space_offset_lock);
+}
+
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
                          struct oxr_session *sess,
@@ -2901,6 +2930,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 		oxr_pp_relation_indented(&slog, &T_base_xdev, "T_base_xdev");
 	}
 
+	// #1502: how many of the views below ended up expressed in the BASE space
+	// (as opposed to the display-plane-relative RAW contract). Only when every
+	// active view did can their centroid be compared with VIEW, which is the
+	// one thing the published VIEW-space offset must be.
+	uint32_t base_space_view_count = 0;
+
 	// #1486: bounded by what the app's view configuration reports, not by the
 	// device max — views[] is only reported_view_count long.
 	for (uint32_t i = 0; i < reported_view_count; i++) {
@@ -2909,6 +2944,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 		 */
 
 		struct xrt_pose view_pose = poses[i];
+
+		//! #1502: cleared by every branch that writes a plane-relative pose.
+		bool view_in_base_space = true;
 
 		if (sess->sys->inst->quirks.parallel_views) {
 			view_pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
@@ -2939,6 +2977,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// Use server poses directly (display-plane-relative)
 			result.pose = view_pose;
 			result.relation_flags = T_base_head.relation_flags;
+			view_in_base_space = false; // #1502
 		} else {
 			// Standard path: apply space relation chain
 			struct xrt_relation_chain xrc = {0};
@@ -2981,6 +3020,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 				views[i].pose.position = (XrVector3f){raw_eye.x, raw_eye.y, raw_eye.z};
 				views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+				view_in_base_space = false; // #1502
 			} else if (have_eye_override) {
 				// VIEW OVERRIDE: use pre-computed eye positions (tracking-origin space)
 				if (active_view_count == 1) {
@@ -3036,6 +3076,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					views[i].pose.position =
 					    (XrVector3f){tracked_eye.x, tracked_eye.y, tracked_eye.z};
 					views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+					view_in_base_space = false; // #1502
 				}
 			}
 
@@ -3120,6 +3161,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		} else {
 			viewState->viewStateFlags &= xrt_to_view_state_flags(result.relation_flags);
 		}
+
+		if (view_in_base_space) {
+			base_space_view_count++; // #1502
+		}
 	}
 
 	// Inactive views (active_view_count < reported_view_count): duplicate view 0.
@@ -3131,6 +3176,62 @@ oxr_session_locate_views(struct oxr_logger *log,
 	for (uint32_t i = active_view_count; i < reported_view_count; i++) {
 		views[i].pose = views[0].pose;
 		views[i].fov = views[0].fov;
+	}
+
+	/*
+	 * #1502: publish the VIEW-space eye-centroid offset.
+	 *
+	 * The spec's VIEW is "the centroid of the view origins". DisplayXR's head
+	 * device is the display PLANE and must stay parallax-free (ADR-034
+	 * Amendment 2), so the difference goes into a VIEW-space offset exactly as
+	 * ADR-024 Amendment 1 foresaw, and xrLocateSpace applies it on both legs.
+	 *
+	 * MEASURED, not re-derived: the centroid is taken from the poses just
+	 * written into views[] (including the inactive-view duplication above,
+	 * which is what an app - and the CTS - averages), and VIEW's own pose in
+	 * the same base is T_base_head. So the offset is whatever makes
+	 * `xrLocateSpace(VIEW, base) == centroid` true, for free, in every base.
+	 * It is base-independent by the #1370 invariant, which is why publishing it
+	 * from a locate in ANY base is sound - including a locate in VIEW itself,
+	 * whose fixed point is the same vector.
+	 *
+	 * Skipped, leaving the previous value (identity for a session that never
+	 * qualified), when:
+	 *   - a rig is chained: the app has placed its OWN camera for that locate,
+	 *     and VIEW must not flip-flop between rig and non-rig frames;
+	 *   - any active view is display-plane-relative (the RAW classes, INV-6.1):
+	 *     those poses are not in the base space at all, so no centroid of them
+	 *     can be compared with VIEW;
+	 *   - T_base_head has no valid pose: there is nothing to measure against.
+	 */
+	{
+		const enum xrt_space_relation_flags need =
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+		const bool measurable = !rig_active && active_view_count > 0 && reported_view_count > 0 &&
+		                        base_space_view_count >= active_view_count &&
+		                        (T_base_head.relation_flags & need) == need;
+		if (measurable) {
+			struct xrt_vec3 centroid = {0.0f, 0.0f, 0.0f};
+			for (uint32_t i = 0; i < reported_view_count; i++) {
+				centroid.x += views[i].pose.position.x;
+				centroid.y += views[i].pose.position.y;
+				centroid.z += views[i].pose.position.z;
+			}
+			const float inv = 1.0f / (float)reported_view_count;
+			centroid.x *= inv;
+			centroid.y *= inv;
+			centroid.z *= inv;
+
+			struct xrt_vec3 delta = {centroid.x - T_base_head.pose.position.x,
+			                         centroid.y - T_base_head.pose.position.y,
+			                         centroid.z - T_base_head.pose.position.z};
+			struct xrt_quat inv_head;
+			math_quat_invert(&T_base_head.pose.orientation, &inv_head);
+
+			struct xrt_pose view_offset = XRT_POSE_IDENTITY;
+			math_quat_rotate_vec3(&inv_head, &delta, &view_offset.position);
+			oxr_session_set_view_space_offset(sess, &view_offset);
+		}
 	}
 
 #ifdef OXR_HAVE_DXR_display_info
@@ -3521,6 +3622,7 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	os_precise_sleeper_deinit(&sess->sleeper);
 	oxr_frame_sync_fini(&sess->frame_sync);
 	os_mutex_destroy(&sess->active_wait_frames_lock);
+	os_mutex_destroy(&sess->view_space_offset_lock); // #1502
 
 #ifdef OXR_HAVE_DXR_android_surface_binding
 	// Drop the reference XR_DXR_android_surface_binding took on the app's
@@ -3578,6 +3680,12 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 
 	sess->active_wait_frames = 0;
 	os_mutex_init(&sess->active_wait_frames_lock);
+
+	// #1502: VIEW is the head pose until the first locate publishes the eye
+	// centroid. The handle allocation zeroes the session, and a zero quaternion
+	// is not a pose - seed the identity explicitly.
+	sess->view_space_offset = (struct xrt_pose)XRT_POSE_IDENTITY;
+	os_mutex_init(&sess->view_space_offset_lock);
 
 	// Debug and user options.
 	sess->ipd_meters = debug_get_num_option_ipd() / 1000.0f;

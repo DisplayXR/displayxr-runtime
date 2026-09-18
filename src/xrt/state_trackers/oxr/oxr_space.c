@@ -151,6 +151,34 @@ get_xrt_space(struct oxr_logger *log, struct oxr_space *spc, struct xrt_space **
 }
 
 
+/*!
+ * #1502: the overseer offset for @p spc — its app-supplied
+ * `poseInReferenceSpace`, with the session's VIEW-space eye-centroid offset
+ * composed IN FRONT of it for VIEW.
+ *
+ * The overseer applies this as a child offset of the space, so the located
+ * result is `space o offset`: composing V first makes VIEW resolve to
+ * `head o V o poseInReferenceSpace` — the eye centroid the OpenXR spec asks
+ * for, with the app's own offset still on top of it.
+ *
+ * It must be used on the TARGET and the BASE leg of every locate, or
+ * `xrLocateSpace(VIEW, LOCAL)` and `xrLocateSpace(LOCAL, VIEW)` stop being
+ * inverses of each other.
+ */
+void
+oxr_space_ref_offset(struct oxr_space *spc, struct xrt_pose *out_offset)
+{
+	if (spc->space_type != OXR_SPACE_TYPE_REFERENCE_VIEW) {
+		*out_offset = spc->pose;
+		return;
+	}
+
+	struct xrt_pose view_offset = XRT_POSE_IDENTITY;
+	oxr_session_get_view_space_offset(spc->sess, &view_offset);
+	math_pose_transform(&view_offset, &spc->pose, out_offset);
+}
+
+
 /*
  *
  * Space creation and destroy functions.
@@ -371,13 +399,16 @@ oxr_spaces_locate(struct oxr_logger *log,
 		struct xrt_space *xt = NULL;
 		ret = get_xrt_space(log, spcs[i], &xt);
 		xspcs[i] = xt;
-		offsets[i] = spcs[i]->pose;
+		oxr_space_ref_offset(spcs[i], &offsets[i]); // #1502
 	}
 
 	// Make sure not to overwrite error return
 	if (ret == XR_SUCCESS) {
 		ret = get_xrt_space(log, baseSpc, &xbase);
 	}
+
+	struct xrt_pose base_offset = XRT_POSE_IDENTITY;
+	oxr_space_ref_offset(baseSpc, &base_offset); // #1502
 
 	// Only fill this out if the above succeeded. Zero initialized means relation flags == 0.
 	struct xrt_space_relation *results = U_TYPED_ARRAY_CALLOC(struct xrt_space_relation, spc_count);
@@ -390,7 +421,7 @@ oxr_spaces_locate(struct oxr_logger *log,
 		enum xrt_result xret = xrt_space_overseer_locate_spaces( //
 		    sys->xso,                                            //
 		    xbase,                                               //
-		    &baseSpc->pose,                                      //
+		    &base_offset,                                        //
 		    at_timestamp_ns,                                     //
 		    xspcs,                                               //
 		    spc_count,                                           //
@@ -535,14 +566,20 @@ oxr_space_locate(
 		// Convert at_time to monotonic and give to device.
 		uint64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(sys->inst->timekeeping, time);
 
+		// #1502: both legs, or VIEW-in-X and X-in-VIEW stop being inverses.
+		struct xrt_pose target_offset = XRT_POSE_IDENTITY;
+		struct xrt_pose base_offset = XRT_POSE_IDENTITY;
+		oxr_space_ref_offset(spc, &target_offset);
+		oxr_space_ref_offset(baseSpc, &base_offset);
+
 		// Ask the space overseer to locate the spaces.
 		xrt_space_overseer_locate_space( //
 		    sys->xso,                    //
 		    xbase,                       //
-		    &baseSpc->pose,              //
+		    &base_offset,                //
 		    at_timestamp_ns,             //
 		    xtarget,                     //
-		    &spc->pose,                  //
+		    &target_offset,              //
 		    &result);                    //
 	}
 
@@ -673,11 +710,15 @@ oxr_space_locate_device(struct oxr_logger *log,
 	// Convert at_time to monotonic and give to device.
 	uint64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(sys->inst->timekeeping, time);
 
+	// #1502: a device located in VIEW is located in the eye centroid.
+	struct xrt_pose base_offset = XRT_POSE_IDENTITY;
+	oxr_space_ref_offset(baseSpc, &base_offset);
+
 	// Ask the space overseer to locate the spaces.
 	xrt_space_overseer_locate_device( //
 	    sys->xso,                     //
 	    xbase,                        //
-	    &baseSpc->pose,               //
+	    &base_offset,                 //
 	    at_timestamp_ns,              //
 	    xdev,                         //
 	    out_relation);                //

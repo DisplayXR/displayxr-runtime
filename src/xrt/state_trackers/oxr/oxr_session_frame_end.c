@@ -1706,10 +1706,17 @@ handle_space(struct oxr_logger *log,
 	 * poses in view space are already in the space the compositor expects
 	 */
 	if (spc->space_type == OXR_SPACE_TYPE_REFERENCE_VIEW) {
+		// #1502: the compositor's "view space" is the HEAD device pose, but
+		// VIEW is now head o view_space_offset (the eye centroid). Compose the
+		// offset in, exactly as oxr_space_ref_offset does on a locate, so a
+		// VIEW-space layer stays where the app put it relative to its views.
+		struct xrt_pose T_head_space = XRT_POSE_IDENTITY;
+		oxr_space_ref_offset(spc, &T_head_space); // view_space_offset o spc->pose
+
 		struct xrt_space_relation rel;
 		struct xrt_relation_chain xrc = {0};
-		m_relation_chain_push_pose(&xrc, &T_space_layer);             // T_offset_layer
-		m_relation_chain_push_pose_if_not_identity(&xrc, &spc->pose); // T_space_offset
+		m_relation_chain_push_pose(&xrc, &T_space_layer);                // T_offset_layer
+		m_relation_chain_push_pose_if_not_identity(&xrc, &T_head_space); // T_head_offset
 		m_relation_chain_resolve(&xrc, &rel);
 		*out_pose = rel.pose;
 		return true;

@@ -184,11 +184,13 @@ Quad is opt-in and no shipping device exceeds 2 views — and
 suppressing the mode switch for a session that cannot express it. Two direct
 consequences worth knowing before someone debugs them cold:
 
-- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`) would fail
+- A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`) used to fail
   `xrLocateSpace_xrLocateViews` — not on its `views.size() == 2` assertion,
-  which now passes, but on its **centroid check**: VIEW space is the centre of
-  the fan, while the centroid of tiles 0 and 1 is not. Default CI is **not**
-  quad, so the lane is green; see [CTS status](#cts-status).
+  which now passes, but on its **centroid check**: VIEW space was the centre of
+  the fan, while the centroid of tiles 0 and 1 is not. #1502 closes that gap
+  too, because the VIEW-space offset is measured off the **reported** array
+  (tiles 0 and 1 under `PRIMARY_STEREO`), not off the fan. Default CI is still
+  **not** quad; see [CTS status](#cts-status).
 - A shipped 2-view app the workspace pushes into a wider mode gets asymmetric
   eyes for the duration. Same root cause, same fix in #1499.
 
@@ -220,20 +222,42 @@ the win box (sim-display, D3D11, CTS 1.1.63.0): the count assertion goes green.
 
 The test then advances to its **centroid** assertion
 (`test_xrLocateSpace.cpp:330`): VIEW space located in LOCAL must equal the mean
-of the `xrLocateViews` origins. That one fails, deterministically
+of the `xrLocateViews` origins. That one used to fail, deterministically
 (`(0.102304, 0.043731, 0)` vs `(0, 0, 0)`, bit-identical across cold runs),
-because DisplayXR's VIEW reference space is the viewer origin while the located
-eyes carry an offset (the `#1370` test in `tests/tests_oxr_view_space.cpp`
-describes exactly that "eye-centroid offset from the VIEW origin"). This is a
+because DisplayXR's VIEW reference space was the **display plane** while the
+located eyes carry the nominal-viewer / window-centre offset (ADR-012). It is a
 **second, pre-existing deviation** that the count fix merely exposed — the
 sim-display pair is symmetric about x=0 by construction
 (`sim_display_device.c:807-815`), so the 2-view clamp cannot have shifted it.
 Tracked as [#1502](https://github.com/DisplayXR/displayxr-runtime/issues/1502).
 
-**So the `~xrLocateSpace_xrLocateViews` by-name exclusion stays** in
-`.github/workflows/cts.yml` and `scripts/run_cts.ps1`, re-pointed at #1502: a
-known, named red rather than an unnamed one. The view-count half is fixed; the
-centroid half is tracked. Delete the exclusion when #1502 lands.
+Two halves came out of that number, and only one of them was the runtime:
+
+- **Harness**, [#1506](https://github.com/DisplayXR/displayxr-runtime/issues/1506):
+  `conformance_cli.exe` embeds no DPI manifest, so on a 250 %-scaled box the
+  runtime reads a 2.47×-virtualised window. Re-run under
+  `__COMPAT_LAYER=HighDpiAware` and the whole x-component vanishes.
+- **Runtime**, this issue: under correct DPI the residual is exactly
+  `(0, 0.1025, 0)` — the nominal viewer height (`eye_y = 0.10` on sim-display)
+  plus the window's own 2.5 mm off-centre. The closed form is
+  `centroid − VIEW = nominal_eye − window_center_offset`, residual ~3e-5 over
+  two independent window geometries.
+
+**Fixed by #1502**: VIEW now carries a per-session **VIEW-space offset** — the
+eye centroid measured off the poses `xrLocateViews` just reported — applied on
+both legs of every locate (`oxr_space_ref_offset`). The head device pose is
+untouched, so it stays parallax-free for the ADR-034 Amendment 2 rig source, and
+`recenter` / per-app LOCAL seeding (which read `xso->semantic.view` below the
+state tracker) are unaffected. See
+[ADR-024 Amendment 2](../adr/ADR-024-raw-vs-render-ready-views.md#amendment-2--view-is-the-eye-centroid-2026-09-18)
+and the `[view_centroid]` arms in `tests/tests_oxr_view_space.cpp`.
+
+**The `~xrLocateSpace_xrLocateViews` by-name exclusion stays** in
+`.github/workflows/cts.yml` and `scripts/run_cts.ps1` until a real CTS run on
+hardware confirms the fix — a doc claim is not a conformance result. Delete it
+in the same change that records the green run, and keep
+`__COMPAT_LAYER=HighDpiAware` (or #1506's manifest) on the harness, or the
+window term reappears as a DPI artefact rather than a runtime one.
 
 What the CTS actually sees: it never enables `XR_DXR_display_info`, so
 `PRIMARY_MULTIVIEW_DXR` is never enumerated to it. The CTS sees exactly

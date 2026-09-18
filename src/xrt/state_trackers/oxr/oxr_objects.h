@@ -1157,6 +1157,34 @@ oxr_space_locate_device(struct oxr_logger *log,
                         XrTime time,
                         struct xrt_space_relation *out_relation);
 
+/*!
+ * #1502: the offset the space overseer must be handed for @p spc.
+ *
+ * This is the app's `poseInReferenceSpace` for every space but VIEW; for VIEW
+ * it is @ref oxr_session::view_space_offset composed with it, so the located
+ * VIEW space is the eye centroid the spec asks for rather than the display
+ * plane. Call it wherever `spc->pose` used to be passed as the overseer's
+ * `offset` / `base_offset` — on BOTH legs, or the two views of VIEW disagree.
+ *
+ * @param      spc        The space whose overseer offset is wanted.
+ * @param[out] out_offset The offset to hand the overseer.
+ */
+void
+oxr_space_ref_offset(struct oxr_space *spc, struct xrt_pose *out_offset);
+
+/*!
+ * #1502: read the session's VIEW-space eye-centroid offset (thread safe).
+ */
+void
+oxr_session_get_view_space_offset(struct oxr_session *sess, struct xrt_pose *out_offset);
+
+/*!
+ * #1502: publish the session's VIEW-space eye-centroid offset (thread safe).
+ * Only @ref oxr_session_locate_views calls this.
+ */
+void
+oxr_session_set_view_space_offset(struct oxr_session *sess, const struct xrt_pose *offset);
+
 
 /*
  *
@@ -2709,6 +2737,32 @@ struct oxr_session
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
+
+	/*!
+	 * #1502: the VIEW reference space's eye-centroid offset, expressed in the
+	 * VIEW (head device) frame.
+	 *
+	 * The OpenXR spec defines VIEW as "the view origin, or the centroid of the
+	 * view origins if stereo". DisplayXR's head device pose is the DISPLAY
+	 * PLANE (and must stay parallax-free - it is the ADR-034 Amendment 2 rig
+	 * source), while the eyes xrLocateViews reports sit off it by the nominal
+	 * viewer position minus the window-centre offset (ADR-012). So VIEW is the
+	 * head pose composed with THIS offset, exactly as ADR-024 Amendment 1
+	 * foresaw ("a VIEW-space offset, not a head change").
+	 *
+	 * Published by @ref oxr_session_locate_views from the poses it just
+	 * reported - never re-derived, so runtime VIEW and the app's centroid are
+	 * the same number by construction. Consumed by @ref oxr_space_ref_offset on
+	 * BOTH legs of every locate (target and base), so a VIEW-based locate and
+	 * xrLocateSpace(VIEW, ...) can never disagree.
+	 *
+	 * Identity until the first qualifying locate (a session that never calls
+	 * xrLocateViews keeps the pre-#1502 behaviour), and identity forever for
+	 * the RAW classes whose views are display-plane-relative by contract.
+	 * Orientation is always identity: the views carry the head orientation.
+	 */
+	struct os_mutex view_space_offset_lock;
+	struct xrt_pose view_space_offset;
 
 #ifdef OXR_HAVE_DXR_depth_budget
 	//! XR_DXR_depth_budget: the session's transparency, remembered from
