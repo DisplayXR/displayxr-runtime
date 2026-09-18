@@ -69,6 +69,22 @@ TEST_CASE("the permissive rule takes any rendering mode's count (#1486)", "[oxr]
 	CHECK_FALSE(oxr_view_count_ok_for_multiview(4, kSimDisplayModes, 0));
 }
 
+TEST_CASE("neither rule can stand in for PRIMARY_MONO (#1486)", "[oxr][view_config_rule]")
+{
+	// PRIMARY_MONO's rule is "exactly 1" and it is NOT one of these two — it
+	// stays inline in verify_projection_view_count's switch. What is pinnable
+	// here is WHY that matters: both rules wave 2 through unconditionally, so
+	// routing a mono session to either one would turn a
+	// XR_ERROR_VALIDATION_FAILURE into a silent accept.
+	//
+	// That is exactly the hole the kill switch had before it grew its
+	// `view_config_type != PRIMARY_MONO` guard: DXR_VIEW_CONFIG_LEGACY=1 only
+	// ever restored the PRIMARY_STEREO mapping, never mono's.
+	CHECK(oxr_view_count_ok_for_stereo(2));
+	CHECK(oxr_view_count_ok_for_multiview(2, kSimDisplayModes, kSimDisplayModeCount));
+	CHECK(oxr_view_count_ok_for_multiview(2, nullptr, 0));
+}
+
 TEST_CASE("the two rules differ ONLY above 2 views (#1486)", "[oxr][view_config_rule]")
 {
 	// The whole blast radius of the tightening, stated as a property: on a

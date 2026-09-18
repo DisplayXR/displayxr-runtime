@@ -689,7 +689,13 @@ verify_projection_view_count(struct oxr_session *sess,
 	// #1486 kill switch: the permissive rule, whatever the type says. This is
 	// what makes DXR_VIEW_CONFIG_LEGACY=1 a COMPLETE rollback of #1486 — the
 	// legacy PRIMARY_STEREO reports the device max, so it must also accept it.
-	if (sess->sys->view_config_legacy) {
+	//
+	// PRIMARY_MONO is excluded: the legacy mapping only ever changed what
+	// PRIMARY_STEREO reports, so a 1-view device must keep returning
+	// XR_ERROR_VALIDATION_FAILURE for a 2-view layer exactly as it does on main.
+	// Without this guard the kill switch would LOOSEN mono instead of restoring
+	// it (the permissive rule accepts 2 unconditionally).
+	if (sess->sys->view_config_legacy && sess->view_config_type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) {
 		if (!oxr_view_count_ok_for_multiview(proj->viewCount, mode_view_counts, mode_count)) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
