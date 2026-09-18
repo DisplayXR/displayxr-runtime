@@ -54,6 +54,12 @@ target_include_directories(cube_handle_vk_android PRIVATE
 target_include_directories(cube_handle_vk_android BEFORE PRIVATE
     "${CMAKE_SOURCE_DIR}/../../../../../../src/external/openxr_includes")
 
+# test_apps/common — dxr_view_config.h (#1486: the shared
+# PRIMARY_MULTIVIEW_DXR view-configuration opt-in every N-view cube uses).
+# Path: src/main/cpp → test_apps is five levels up.
+target_include_directories(cube_handle_vk_android PRIVATE
+    "${CMAKE_SOURCE_DIR}/../../../../../common")
+
 # -u ANativeActivity_onCreate forces the linker to keep the symbol the
 # Android runtime resolves dynamically on Activity launch — without it,
 # the shared lib loads but exposes nothing.

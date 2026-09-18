@@ -105,6 +105,8 @@ static const uint32_t kNumZones = 2;
 // The ARRAY / SPI stereo layout: 2 views as array slices. A mode with more
 // than 2 views under-submits (n is clamped to this) — this app targets the
 // stereo (view_count <= 2) modes that #672 concerns.
+// DXR_STEREO_FIXED_APP: submission is hard-capped at 2 array slices, so this app
+// deliberately stays on PRIMARY_STEREO (INV-3.1, #1486).
 static const uint32_t kZoneArraySlices = 2;
 
 // Per-zone rig framing (shared virtual display height in app units; cube 0.06 m).

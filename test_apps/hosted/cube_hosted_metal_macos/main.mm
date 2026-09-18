@@ -18,6 +18,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
+#include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
 #include <cmath>
 #include <csignal>
@@ -776,7 +777,13 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
 
     // Enumerate view configs
-    app.viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    // #1486: this app derives its per-frame view count from the ACTIVE DXR
+    // rendering mode, so it must run on the view configuration that reports the
+    // device MAX (4 on sim_display Quad). PRIMARY_STEREO now reports exactly 2
+    // and xrEndFrame rejects viewCount > 2 under it. Falls back to
+    // PRIMARY_STEREO on a runtime that doesn't enumerate the DXR type.
+    app.viewConfigType = DxrSelectViewConfigType(app.instance, app.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(app.viewConfigType));
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(app.instance, app.systemId, app.viewConfigType,
                                                 0, &viewCount, nullptr));

@@ -7,6 +7,7 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include "dxr_view_config.h"
 #include <cstring>
 
 bool g_hasViewRigExt = false;
@@ -236,6 +237,14 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
+
+    // #1486: this app derives its per-frame view count from the ACTIVE DXR
+    // rendering mode, so it must run on the view configuration that reports the
+    // device MAX (4 on sim_display Quad). PRIMARY_STEREO now reports exactly 2
+    // and xrEndFrame rejects viewCount > 2 under it. Falls back to
+    // PRIMARY_STEREO on a runtime that doesn't enumerate the DXR type.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration type: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
