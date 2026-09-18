@@ -509,6 +509,7 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_CAPTURE_KEEP_ALPHA` | `compositor/d3d12/comp_d3d12_compositor.cpp:2830, 2957` | `getenv`, uncached | opaque | App | 4 | #672 preserve real atlas alpha in a debug PNG capture |
 | `DXR_QTRACE` | `drivers/qwerty/qwerty_device.c:36`; `drivers/qwerty/qwerty_win32.c:33`; `state_trackers/oxr/oxr_space.c:36` | `DEBUG_GET_ONCE_BOOL` ×3 | off | Both / App | 4 | Qwerty device + space tracing |
 | `DXR_KEY_DEBUG` | `ipc/server/ipc_server_macos_appkit.m:215` | `getenv`, cached | off | Svc | 4 | macOS AppKit key-forwarding diagnostic |
+| `DXR_VK_ATLAS_ENCODING` | `compositor/vk_native/comp_vk_native_compositor.c` (`dxr_vk_atlas_encoding_override`) | `getenv`, `static` cached | unset (⟹ the compositor's own answer, `ENCODED`) | App | 4 | #1484 / ADR-021. `off` stops the VK weave sites calling base slot 14 `set_atlas_encoding` at all, restoring the pre-#1484 behaviour (the DP then assumes ENCODED); `encoded` / `linear` force the declared value for a one-binary A/B against a DP that has a conversion knob (Leia Linux drives `srWeaverSetShaderSRGBConversion` off it). **Diagnostic-only and must never become a user setting** — vk_native never linearizes, so the only thing this knob can do is make a true declaration false, i.e. ask the weaver to encode already-encoded bytes (the washed-out result) |
 
 ### Lifecycle
 
