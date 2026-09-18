@@ -190,6 +190,7 @@ if(XRT_HAVE_VULKAN)
 		util/comp_semaphore.c
 		util/comp_swapchain.h
 		util/comp_swapchain.c
+		util/comp_swapchain_ring.h
 		util/comp_sync.h
 		util/comp_sync.c
 		util/comp_target_service.h

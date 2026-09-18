@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  The Vulkan native swapchain's acquire/wait/release lifecycle (#1504).
+ * @brief  The native swapchains' acquire/wait/release lifecycle (#1504, #1513).
  *
  * CTS `Swapchains` ("Acquiring all swapchain images") and `SwapchainsAcquire`
  * both acquire EVERY image before releasing any, then run repeated full
@@ -10,19 +10,29 @@
  * returned `XR_ERROR_RUNTIME_FAILURE`: the compositor picked the next index as
  * `(last_released_index + 1) % image_count`, and with nothing released yet that
  * handed index 0 out twice, which the state tracker rejected as a "non-ready
- * image".
+ * image". #1513 found the identical arithmetic in the OpenGL and Metal
+ * compositors, so the bookkeeping now lives in util/ and all three share it.
  *
  * These cases drive the REAL bookkeeping
- * (@ref comp_vk_native_swapchain_ring.h, compiled into the compositor) through
- * the state tracker's Vulkan sequence, which is the part that made the defect
- * visible: `oxr_swapchain_vk.c` sets `WAIT_IN_ACQUIRE`, so
- * `xrAcquireSwapchainImage` acquires AND waits before returning, leaving the
- * compositor no single "currently acquired" slot to reason from. No VkDevice is
- * needed — the ring is pure index bookkeeping, and creating a headless device
- * in ctest would make the check depend on an ICD being installed.
+ * (@ref comp_swapchain_ring.h, compiled into every native compositor) through
+ * BOTH state-tracker sequences, because they differ in the way that made the
+ * defect visible:
+ *
+ * - Vulkan: `oxr_swapchain_vk.c` sets `WAIT_IN_ACQUIRE`, so
+ *   `xrAcquireSwapchainImage` acquires AND waits before returning, leaving the
+ *   compositor no single "currently acquired" slot to reason from.
+ * - OpenGL / Metal: `oxr_swapchain_gl.c` and `oxr_swapchain_metal.c` take the
+ *   plain `oxr_swapchain.c` path, so the backend sees acquire, then wait, then
+ *   release as three separate calls — and never a release without a preceding
+ *   wait, because `oxr_swapchain_common_release` refuses when `inflight.index`
+ *   is unset. Both orders must work against one ring.
+ *
+ * No graphics device is needed — the ring is pure index bookkeeping, and
+ * creating a headless device in ctest would make the check depend on an
+ * installed ICD.
  */
 
-#include "vk_native/comp_vk_native_swapchain_ring.h"
+#include "util/comp_swapchain_ring.h"
 
 #include "catch_amalgamated.hpp"
 
@@ -51,7 +61,7 @@ public:
 	explicit OxrVkSwapchain(uint32_t image_count, bool is_static = false)
 	    : m_image_count(image_count), m_is_static(is_static), m_ready(image_count, true)
 	{
-		comp_vk_native_swapchain_ring_init(&m_ring, image_count);
+		comp_swapchain_ring_init(&m_ring, image_count);
 	}
 
 	//! xrAcquireSwapchainImage on the Vulkan path (acquires, then waits).
@@ -69,7 +79,7 @@ public:
 		}
 
 		uint32_t index = UINT32_MAX;
-		if (comp_vk_native_swapchain_ring_acquire(&m_ring, &index) != XRT_SUCCESS) {
+		if (comp_swapchain_ring_acquire(&m_ring, &index) != XRT_SUCCESS) {
 			return Res::RuntimeFailure;
 		}
 
@@ -84,7 +94,7 @@ public:
 		m_fifo.push_back(index);
 
 		// WAIT_IN_ACQUIRE: oxr_swapchain_vk.c waits here, not in xrWait.
-		if (comp_vk_native_swapchain_ring_wait(&m_ring, index) != XRT_SUCCESS) {
+		if (comp_swapchain_ring_wait(&m_ring, index) != XRT_SUCCESS) {
 			return Res::RuntimeFailure;
 		}
 
@@ -118,7 +128,7 @@ public:
 		uint32_t index = static_cast<uint32_t>(m_inflight);
 		m_inflight = -1;
 
-		if (comp_vk_native_swapchain_ring_release(&m_ring, index) != XRT_SUCCESS) {
+		if (comp_swapchain_ring_release(&m_ring, index) != XRT_SUCCESS) {
 			return Res::RuntimeFailure;
 		}
 
@@ -137,7 +147,7 @@ public:
 	uint32_t
 	outstanding() const
 	{
-		return comp_vk_native_swapchain_ring_outstanding(&m_ring);
+		return comp_swapchain_ring_outstanding(&m_ring);
 	}
 
 private:
@@ -148,13 +158,13 @@ private:
 	int32_t m_inflight = -1;
 	std::vector<bool> m_ready;
 	std::vector<uint32_t> m_fifo;
-	struct comp_vk_native_swapchain_ring m_ring{};
+	struct comp_swapchain_ring m_ring{};
 };
 
 } // namespace
 
 
-TEST_CASE("vk_native_swapchain_ring: acquires every image before any release")
+TEST_CASE("swapchain_ring(vk): acquires every image before any release")
 {
 	// CTS test_Swapchains.cpp:196 "Acquiring all swapchain images", and the
 	// first half of each SwapchainsAcquire pass. 3 is what the compositor
@@ -193,7 +203,7 @@ TEST_CASE("vk_native_swapchain_ring: acquires every image before any release")
 	REQUIRE(sc.outstanding() == 0);
 }
 
-TEST_CASE("vk_native_swapchain_ring: repeated full acquire/wait/release passes")
+TEST_CASE("swapchain_ring(vk): repeated full acquire/wait/release passes")
 {
 	// CTS SwapchainsAcquire, test_Swapchains.cpp:751 — ten passes, each
 	// acquiring all N and then waiting/releasing all N. On main this failed at
@@ -226,7 +236,7 @@ TEST_CASE("vk_native_swapchain_ring: repeated full acquire/wait/release passes")
 	}
 }
 
-TEST_CASE("vk_native_swapchain_ring: one-at-a-time steady state round-robins")
+TEST_CASE("swapchain_ring(vk): one-at-a-time steady state round-robins")
 {
 	// The normal app loop, which worked before and must keep working: each
 	// frame acquires exactly one image, and consecutive frames must not reuse
@@ -245,7 +255,7 @@ TEST_CASE("vk_native_swapchain_ring: one-at-a-time steady state round-robins")
 	}
 }
 
-TEST_CASE("vk_native_swapchain_ring: partial overlap, the real double-buffered app")
+TEST_CASE("swapchain_ring(vk): partial overlap, the real double-buffered app")
 {
 	// Acquire two, release one, acquire another — the shape a pipelined app
 	// actually produces, and the one a last-released-index scheme gets wrong
@@ -271,34 +281,34 @@ TEST_CASE("vk_native_swapchain_ring: partial overlap, the real double-buffered a
 	REQUIRE(sc.outstanding() == 0);
 }
 
-TEST_CASE("vk_native_swapchain_ring: rejects out-of-cycle wait and release")
+TEST_CASE("swapchain_ring(vk): rejects out-of-cycle wait and release")
 {
 	// The ring's own guards, below the state tracker: a wait on an image that
 	// was never acquired, and a release of one that was never waited on, must
 	// be refused rather than corrupt the free pool. XRT_ERROR_NO_IMAGE_AVAILABLE
 	// and not XRT_ERROR_IPC_FAILURE, which would mark the session lost.
-	struct comp_vk_native_swapchain_ring ring{};
-	comp_vk_native_swapchain_ring_init(&ring, 3);
+	struct comp_swapchain_ring ring{};
+	comp_swapchain_ring_init(&ring, 3);
 
-	REQUIRE(comp_vk_native_swapchain_ring_wait(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
-	REQUIRE(comp_vk_native_swapchain_ring_release(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_wait(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_release(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
 
 	uint32_t index = UINT32_MAX;
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &index) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &index) == XRT_SUCCESS);
 	REQUIRE(index == 0);
 
 	// Out of range, and a release before the wait.
-	REQUIRE(comp_vk_native_swapchain_ring_wait(&ring, 99) == XRT_ERROR_NO_IMAGE_AVAILABLE);
-	REQUIRE(comp_vk_native_swapchain_ring_release(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_wait(&ring, 99) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_release(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
 
-	REQUIRE(comp_vk_native_swapchain_ring_wait(&ring, 0) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_wait(&ring, 0) == XRT_SUCCESS);
 	// Waiting twice on the same image is no longer legal either.
-	REQUIRE(comp_vk_native_swapchain_ring_wait(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
-	REQUIRE(comp_vk_native_swapchain_ring_release(&ring, 0) == XRT_SUCCESS);
-	REQUIRE(comp_vk_native_swapchain_ring_outstanding(&ring) == 0);
+	REQUIRE(comp_swapchain_ring_wait(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_release(&ring, 0) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_outstanding(&ring) == 0);
 }
 
-TEST_CASE("vk_native_swapchain_image_count: static swapchains get exactly one image")
+TEST_CASE("comp_swapchain_image_count: static swapchains get exactly one image")
 {
 	// The second half of #1504. The compositor hardcoded 3, so
 	// xrEnumerateSwapchainImages promised three images for a
@@ -306,26 +316,26 @@ TEST_CASE("vk_native_swapchain_image_count: static swapchains get exactly one im
 	// single-acquire rule would only ever hand out one of -- CTS
 	// test_Swapchains.cpp:196, "Non-default create flags", one failure per
 	// format. D3D11 and D3D12 already did this; Vulkan did not.
-	REQUIRE(comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE) == 1);
+	REQUIRE(comp_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE, 3) == 1);
 
 	// Every other flag combination stays triple buffered.
-	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)0) == 3);
-	REQUIRE(comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT) == 3);
-	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)(
-	            XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT | XRT_SWAPCHAIN_CREATE_STATIC_IMAGE)) == 1);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 3) == 3);
+	REQUIRE(comp_swapchain_image_count(XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT, 3) == 3);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)(XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT |
+	                                                                     XRT_SWAPCHAIN_CREATE_STATIC_IMAGE),
+	                                   3) == 1);
 
 	// Never past the fixed-size image/memory/view arrays.
-	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)0) <=
-	        COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES);
+	REQUIRE(comp_swapchain_image_count((enum xrt_swapchain_create_flags)0, 3) <= COMP_SWAPCHAIN_MAX_IMAGES);
 }
 
-TEST_CASE("vk_native_swapchain_ring: the static swapchain's one image, acquired once")
+TEST_CASE("swapchain_ring(vk): the static swapchain's one image, acquired once")
 {
 	// CTS test_Swapchains.cpp:196 then :229-232 for a static swapchain: the
 	// acquire-all loop runs exactly once, the extra acquire is refused, the one
 	// image waits and releases, and the post-release acquire is refused again
 	// because a static swapchain may be acquired once for its whole lifetime.
-	const uint32_t image_count = comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE);
+	const uint32_t image_count = comp_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE, 3);
 	REQUIRE(image_count == 1);
 
 	OxrVkSwapchain sc(image_count, /* is_static */ true);
@@ -349,7 +359,7 @@ TEST_CASE("vk_native_swapchain_ring: the static swapchain's one image, acquired 
 	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
 }
 
-TEST_CASE("vk_native_swapchain_ring: the pre-fix rule really did hand out a duplicate")
+TEST_CASE("swapchain_ring(vk): the pre-fix rule really did hand out a duplicate")
 {
 	// Negative control, so the cases above cannot quietly pass against a
 	// reverted fix. This is the exact arithmetic the compositor used before
@@ -367,24 +377,26 @@ TEST_CASE("vk_native_swapchain_ring: the pre-fix rule really did hand out a dupl
 	REQUIRE(second == first); // <-- the bug
 
 	// The fixed ring, same sequence, hands out two different images.
-	struct comp_vk_native_swapchain_ring ring{};
-	comp_vk_native_swapchain_ring_init(&ring, image_count);
+	struct comp_swapchain_ring ring{};
+	comp_swapchain_ring_init(&ring, image_count);
 	uint32_t a = UINT32_MAX, b = UINT32_MAX;
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &a) == XRT_SUCCESS);
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &b) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &a) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &b) == XRT_SUCCESS);
 	REQUIRE(a == 0);
 	REQUIRE(b != a);
 }
 
-TEST_CASE("vk_native_swapchain_ring: exhaustion is NO_IMAGE_AVAILABLE, never session-lost")
+TEST_CASE("swapchain_ring(vk): exhaustion is NO_IMAGE_AVAILABLE, never session-lost")
 {
-	struct comp_vk_native_swapchain_ring ring{};
-	comp_vk_native_swapchain_ring_init(&ring, 2);
+	struct comp_swapchain_ring ring{};
+	comp_swapchain_ring_init(&ring, 2);
 
 	uint32_t a = UINT32_MAX, b = UINT32_MAX, c = UINT32_MAX;
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &a) == XRT_SUCCESS);
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &b) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &a) == XRT_SUCCESS);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &b) == XRT_SUCCESS);
 	REQUIRE(a != b);
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &c) == XRT_ERROR_NO_IMAGE_AVAILABLE);
-	REQUIRE(comp_vk_native_swapchain_ring_acquire(&ring, &c) != XRT_ERROR_IPC_FAILURE);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &c) == XRT_ERROR_NO_IMAGE_AVAILABLE);
+	REQUIRE(comp_swapchain_ring_acquire(&ring, &c) != XRT_ERROR_IPC_FAILURE);
 }
+
+
