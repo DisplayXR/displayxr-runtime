@@ -1311,6 +1311,19 @@ oxr_system_get_view_conf_properties(struct oxr_logger *log,
 bool
 oxr_system_views_change_live_enabled(void);
 
+/*!
+ * #1499: is the DXR_MODE_FLOOR kill switch on?
+ *
+ * The option itself is read by DEBUG_GET_ONCE_BOOL_OPTION in oxr_session.c and
+ * nowhere else (those caches are per translation unit). oxr_api_session.c
+ * consults it through here, so the begin-time floor and the request denial are
+ * governed by one latched answer and can never disagree within a process.
+ *
+ * @public @memberof oxr_session
+ */
+bool
+oxr_session_mode_floor_enabled(void);
+
 XrResult
 oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
                                      struct oxr_system *sys,
