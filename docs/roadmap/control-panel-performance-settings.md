@@ -322,7 +322,7 @@ never claim a mode the runtime is not in, and "Custom" falls out for free.
 ## Appendix A — census
 
 Every `DXR_*` name read at runtime under `src/xrt`, with its read site, mechanism, default
-and tier. **90 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
+and tier. **91 distinct names**; the two `DXR_BG2D_*` knobs reach the environment through
 `bg2d_int_knob()` rather than a literal `getenv` at the listed line.
 
 Process column: **App** = the runtime DLL, loaded into the OpenXR app's process ·
@@ -544,6 +544,7 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_SIM_INPUT_NAV_RECENTER_MS` | `drivers/sim_input/sim_input_plugin.c:154` | 0 (never) | Both | Every *n* ms the scripted device publishes a durable RECENTER timestamp together with a phase jump — exercises recenter alignment; CI runs 400 |
 | `DXR_LEGACY_STANDALONE` | `compositor/d3d11_service/comp_d3d11_service.cpp:286` | off | Svc | Reverts the service to the pre-hybrid standalone path (ADR-035 D3, slated for deletion) |
 | `DXR_VIEW_CONFIG_LEGACY` | `state_trackers/oxr/oxr_system.c` (`oxr_system_fill_in`, `DEBUG_GET_ONCE_BOOL_OPTION`) | off | App | #1486 kill switch: restores the pre-#1486 single view configuration — `PRIMARY_STEREO` for any `view_count >= 2`, reporting the max across modes (4 on sim-display), and no `PRIMARY_MULTIVIEW_DXR`. Reintroduces the spec deviation and the CTS red on purpose, for one round of field bisection. Logs one `U_LOG_W` when active. 22 characters, so `debug.xrt.DXR_VIEW_CONFIG_LEGACY` is **stranded on Android** by the `PROP_NAME_MAX` trap above — env-only in practice. See [View-Configuration Model](../reference/view-configuration-model.md) |
+| `DXR_MODE_FLOOR` | `state_trackers/oxr/oxr_session.c` (`DEBUG_GET_ONCE_BOOL_OPTION`, one TU; `oxr_api_session.c` reads it through `oxr_session_mode_floor_enabled()`) | on | App | #1499 kill switch. `0` restores the pre-#1499 behaviour for EXTENSION sessions: `xrBeginSession` leaves the display in whatever rendering mode it found, and `xrRequestDisplayRenderingModeDXR` honours a request whose `viewCount` exceeds the session's view configuration — so the compositor's under-submit clamp paints the first tiles and the rest stay at the clear colour, which is exactly the state the issue objected to. **One switch for BOTH halves on purpose**: a floor without the denial lets an app walk straight back into the mode the floor removed it from, and a denial without the floor refuses a mode the session is already in — half of this feature is not a state anyone should be able to bisect into. #1510's LEGACY floor is deliberately NOT affected (a legacy app was sized for its floored mode at `xrGetSystem`, so leaving it in a wider one would make the compromise view scale and the mode disagree). See [View-Configuration Model](../reference/view-configuration-model.md) |
 | `DXR_IPC_FD` | `auxiliary/util/u_sandbox.c:181`; `ipc/client/ipc_client_connection.c:211, 234` | unset | Both / App | #1056 adopts an embedder-supplied service socket. Not a setting |
 | `DXR_IPC_HANDLE` | `ipc/client/ipc_client_connection.c:437, 456` | unset | App | Windows analogue of the above |
 

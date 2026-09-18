@@ -1543,7 +1543,7 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	 * Returns XR_SUCCESS with an event, not an error: both request entry
 	 * points answer at call time and report the outcome by event (v17/#961).
 	 */
-	if (oxr_frame_sync_is_session_running(&sess->frame_sync) &&
+	if (oxr_session_mode_floor_enabled() && oxr_frame_sync_is_session_running(&sess->frame_sync) &&
 	    !oxr_mode_fillable_by(&head->rendering_modes[modeIndex], sess->view_config_view_count)) {
 		U_LOG_W(
 		    "oxr: DENYING rendering mode %u ('%s', %u views) - this session's view "

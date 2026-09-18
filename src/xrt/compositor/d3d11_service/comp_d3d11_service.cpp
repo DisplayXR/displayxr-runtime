@@ -19010,6 +19010,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		//
+		// #1499: this gate is DEAD in the server. legacy_app_tile_scaling has no
+		// IPC carrier - it is computed in oxr_system_fill_in() inside the CLIENT
+		// process and never crosses to the service - so sys->base.info's copy is
+		// always false here and the keys always work. That is deliberate, not an
+		// oversight to "fix": in service mode the PANEL LEASE owns the
+		// display-global mode (ADR-035 D2), so the runtime's own operator input is
+		// a lease-holder action, not a client request. A client that cannot fill
+		// the mode the lease moved to is TOLD (the #1499 observation WARN in
+		// oxr_session.c's XRT_SESSION_EVENT_RENDERING_MODE_CHANGE arm) and never
+		// silently clamped; it is not given a veto over the other clients' display.
 		if (!sys->base.info.legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {

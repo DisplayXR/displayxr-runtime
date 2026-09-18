@@ -137,6 +137,26 @@ sim_mode_pinned()
 	return v != nullptr && v[0] != '\0' && std::strcmp(v, "-1") != 0;
 }
 
+/*!
+ * #1499: is the DXR_MODE_FLOOR kill switch OFF for this process?
+ *
+ * Every arm below asserts the feature is ON, so each states its own
+ * precondition rather than trusting the ctest arguments - running the bare
+ * binary with the switch disabled must not look like a regression. The
+ * runtime reads it through DEBUG_GET_ONCE_BOOL_OPTION, whose truth test is
+ * "set and not 0/off/false/no"; mirrored loosely, as for the #1486 switch.
+ */
+bool
+mode_floor_disabled()
+{
+	const char *v = std::getenv("DXR_MODE_FLOOR");
+	if (v == nullptr || v[0] == '\0') {
+		return false;
+	}
+	return std::strcmp(v, "0") == 0 || std::strcmp(v, "off") == 0 || std::strcmp(v, "false") == 0 ||
+	       std::strcmp(v, "no") == 0;
+}
+
 /*
  *
  * Minimal pose math (float, matches the runtime's own conventions).
@@ -1176,10 +1196,10 @@ TEST_CASE("DXR_VIEW_CONFIG_LEGACY restores the pre-#1486 mapping", "[oxr][view_s
  */
 TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "[oxr][view_space][mode_floor]")
 {
-	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
-		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
+		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1241,10 +1261,10 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 
 TEST_CASE("a PRIMARY_MULTIVIEW_DXR session keeps the >2-view mode (#1499)", "[oxr][view_space][mode_floor]")
 {
-	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
-		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
+		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}
@@ -1281,7 +1301,7 @@ TEST_CASE("a PRIMARY_MULTIVIEW_DXR session keeps the >2-view mode (#1499)", "[ox
 
 TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_space][mode_pinned]")
 {
-	if (legacy_switch_set() || !sim_mode_pinned()) {
+	if (legacy_switch_set() || mode_floor_disabled() || !sim_mode_pinned()) {
 		WARN(
 		    "this arm needs SIM_DISPLAY_FORCE_MODE=4 - see tests_oxr_view_space_mode_pinned "
 		    "in tests/CMakeLists.txt");
@@ -1319,10 +1339,10 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 
 TEST_CASE("a PRIMARY_STEREO session's request for a >2-view mode is denied (#1499)", "[oxr][view_space][mode_floor]")
 {
-	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
-		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
-		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad, an UNpinned device and DXR_MODE_FLOOR on "
+		    "- see tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
 		SUCCEED("not the mode-floor process; nothing to pin here");
 		return;
 	}

@@ -199,6 +199,34 @@ DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS
 DEBUG_GET_ONCE_BOOL_OPTION(frame_timing_spew, "OXR_FRAME_TIMING_SPEW", false)
 DEBUG_GET_ONCE_BOOL_OPTION(hand_tracking_prioritize_conforming, "OXR_HAND_TRACKING_PRIORITIZE_CONFORMING", false)
 
+/*
+ * #1499 kill switch. DXR_MODE_FLOOR=0 restores the pre-#1499 behaviour for
+ * EXTENSION sessions: xrBeginSession leaves the display in whatever mode it
+ * found, and xrRequestDisplayRenderingModeDXR honours a request the session
+ * cannot fill. The under-submit clamp then does what it always did (paint the
+ * first tiles, leave the rest at the clear colour) — which is the state the
+ * issue objected to, kept reachable for one release in case a shipped app
+ * turns out to depend on landing in a mode it under-fills.
+ *
+ * ONE switch for BOTH halves on purpose: a floor without the denial would let
+ * an app walk straight back into the mode the floor removed it from, and a
+ * denial without the floor would refuse a mode the session is already sitting
+ * in. Half of this feature is not a state anyone should be able to bisect into.
+ *
+ * DEBUG_GET_ONCE_* caches PER TRANSLATION UNIT, so it is read in this file and
+ * nowhere else; oxr_api_session.c reaches it through
+ * oxr_session_mode_floor_enabled() below. #1510's LEGACY floor is NOT affected
+ * — a legacy app was sized for its floored mode at xrGetSystem, so leaving it
+ * in a wider one would make the compromise view scale and the mode disagree.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(mode_floor, "DXR_MODE_FLOOR", true)
+
+bool
+oxr_session_mode_floor_enabled(void)
+{
+	return debug_get_bool_option_mode_floor();
+}
+
 
 /*
  *
@@ -1054,7 +1082,7 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			 * every mode and this whole block is inert - #1486's capability
 			 * is untouched by construction.
 			 */
-			if (!legacy_session) {
+			if (!legacy_session && oxr_session_mode_floor_enabled()) {
 				const uint32_t max_submit =
 				    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
 
@@ -1592,6 +1620,36 @@ skip_macos_pump:
 				if (xsysc != NULL) {
 					xsysc->info.recommended_view_scale_x = mode->view_scale_x;
 					xsysc->info.recommended_view_scale_y = mode->view_scale_y;
+				}
+
+				/*
+				 * #1499 S4: the honest half for the two cases the
+				 * floor cannot cover. The mode moved UNDER this
+				 * session - a service-mode panel-lease holder took
+				 * the display somewhere, or a pinned device came up
+				 * there - and the session cannot fill where it
+				 * landed. Nothing is clamped here: the lease holder
+				 * decides the mode (ADR-035 D2) and the under-submit
+				 * clamp is the documented outcome. What #1499 adds is
+				 * that it is no longer SILENT.
+				 *
+				 * Edge-triggered on `cur != last_rendering_mode_index`
+				 * rather than latched in a new session field: this arm
+				 * can be re-entered with the same index (the IPC
+				 * re-sync writes it idempotently), and a per-entry
+				 * one-shot is both what "once per mode" means here and
+				 * what avoids growing struct oxr_session.
+				 */
+				if (cur != sess->last_rendering_mode_index && sess->view_config_view_count > 0 &&
+				    oxr_frame_sync_is_session_running(&sess->frame_sync) &&
+				    mode->view_count > sess->view_config_view_count) {
+					U_LOG_W(
+					    "oxr: the display moved into an UNFILLABLE rendering mode "
+					    "(#1499): mode %u ('%s') has %u views, this session can submit "
+					    "%u - the remaining tiles stay at the clear colour. The mode is "
+					    "display-global and this session does not own it (panel lease / "
+					    "pinned device); begin on PRIMARY_MULTIVIEW_DXR to fill it",
+					    cur, mode->mode_name, mode->view_count, sess->view_config_view_count);
 				}
 			}
 			sess->last_rendering_mode_index = cur;
