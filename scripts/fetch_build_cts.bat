@@ -10,24 +10,49 @@ setlocal enabledelayedexpansion
 :: a developer/CI harness, not a runtime artifact.
 ::
 :: Usage: scripts\fetch_build_cts.bat
-::   Pin via CTS_TAG below. Loader ships at 1.1.63 (#724, bumped #1487);
-::   the CTS pin is at 1.1.54 because CTS 1.1.51-1.1.53 has a test-side
-::   stack-buffer overflow: test_XR_KHR_extended_struct_name_lengths
-::   passes a 64-byte XR_MAX_RESULT_STRING_SIZE buffer to
+::   Pin via CTS_TAG below. CURRENT PIN: openxr-cts-1.1.63.0 (#1487).
+::   Why 1.1.63.0:
+::    - >= 1.1.60.0 is the FLOOR. CTS 1.1.58.0 added the
+::      XR_EXT_view_configuration_views_change test and 1.1.60.0
+::      corrected it to allow XrEventDataViewConfigurationViewsChangedEXT
+::      at a 1 Hz rate; below 1.1.60.0 a correct implementation fails.
+::      Adopting that extension is #1488.
+::    - There is NO openxr-cts-1.1.62.0 (nor .55/.56/.59). The releases
+::      in the window are 1.1.54.0 -> .57.0 -> .58.0 -> .60.0 -> .61.0
+::      -> .63.0, so 1.1.63.0 is simply the newest, and it matches the
+::      loader/header train this repo is moving to.
+::    - 1.1.63.0's only new test is XR_KHR_extended_result_name_lengths,
+::      which is extension-gated and SKIPs (we do not advertise it). It
+::      also RELAXES test_xrResultToString, which now truncates expected
+::      names to XR_MAX_RESULT_STRING_SIZE-1 for runtimes without that
+::      extension. The rest of the 1.1.61 -> 1.1.63 delta is refactor
+::      (GlobalData::invalid* -> InvalidValues::InvalidHandleValue<T>,
+::      IPlatformPlugin::GetInstanceCreateInfoStruct, PLATFORM_EXPORT);
+::      the Win32 platform plugin still returns nullptr, so instance
+::      creation is byte-identical for us.
+::   KNOWN-RED, EXCLUDED BY NAME: xrLocateSpace_xrLocateViews (added CTS
+::   1.1.57.0) asserts views.size() == 2 for PRIMARY_STEREO; we advertise
+::   the max-across-modes view count. run_cts.ps1 / cts.yml exclude it by
+::   name (#1486, docs/reference/view-configuration-model.md) — never
+::   silently. Do not "fix" that by pinning CTS backwards.
+::   HISTORY (still true, do not delete): CTS 1.1.51-1.1.53 had a
+::   test-side stack-buffer overflow — test_XR_KHR_extended_struct_name_-
+::   lengths passed a 64-byte XR_MAX_RESULT_STRING_SIZE buffer to
 ::   xrStructureTypeToString2KHR (a 256-byte API), so any runtime
-::   returning a >63-char struct name (we do) fail-fasts the CTS
+::   returning a >63-char struct name (we do) fail-fasted the CTS
 ::   process with 0xC0000409 mid-suite — truncated result XML, dead
-::   nightly (#830). Fixed upstream in openxr-cts-1.1.54.0.
-::   NOTE: openxr-cts-1.1.44+ renamed the CLI arg --apiVersion ->
-::   --minApiVersion (Khronos MR 3576); run_cts.ps1 was updated to
-::   match (#726). The earlier "1.1.51 crashes the runtime mid-run"
-::   was a misdiagnosis — conformance_cli rejected the stale arg and
-::   exited before running any test (no result XML).
+::   nightly (#830). Fixed upstream in openxr-cts-1.1.54.0, which is
+::   why the pin sat there. Separately, openxr-cts-1.1.44+ renamed the
+::   CLI arg --apiVersion -> --minApiVersion (Khronos MR 3576);
+::   run_cts.ps1 was updated to match (#726). The earlier "1.1.51
+::   crashes the runtime mid-run" was a misdiagnosis — conformance_cli
+::   rejected the stale arg and exited before running any test (no
+::   result XML).
 :: Output: build-cts\build\...\conformance_cli.exe (path echoed at end).
 :: ============================================================
 
 set REPO=%~dp0..\
-set CTS_TAG=openxr-cts-1.1.54.0
+set CTS_TAG=openxr-cts-1.1.63.0
 set CTS_ROOT=%REPO%build-cts
 set CTS_SRC=%CTS_ROOT%\OpenXR-CTS
 set CTS_BUILD=%CTS_ROOT%\build
