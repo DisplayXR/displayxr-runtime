@@ -218,15 +218,39 @@ offset is **measured, never re-derived**.
 
 ### Consequences
 
-- VIEW moves by the eye centroid: +0.10 m in y on sim-display, plus whatever the
-  app's window contributes off-centre. On a vendor display it is the DP's
-  `nominal_viewer_y_m` (the SR SDK's default viewing position on Leia, typically
-  ~0) plus the same window term. Anything anchored to VIEW moves with it —
-  in practice one consumer, `displayxr-common`'s HUD quad, which is *better*
-  centred on the eyes than on the plane. LOCAL, STAGE, recenter and every
-  app that anchors to LOCAL are unaffected.
+- **Who actually sees VIEW move, and it is a smaller set than it first looks.**
+  The offset is published only by a locate that is neither RAW nor rig-chained,
+  so VIEW moves **only for sessions that chain no DisplayXR view extension** —
+  the CTS, legacy OpenXR titles, third-party OpenXR apps, and hosted apps that
+  chain nothing. For them it moves by the eye centroid: +0.10 m in y on
+  sim-display plus the window's off-centre term, or, on a vendor display, the
+  DP's `nominal_viewer_y_m` (the SR SDK's default viewing position on Leia,
+  typically ~0) plus the same window term.
+
+  **Every DisplayXR-aware app sees no change at all.** Every in-tree extension
+  app, every `displayxr-common` consumer and the engine plug-ins chain
+  `XR_DXR_view_rig` (or are external-window RAW), and both of those are
+  non-participants — so `rig_active` is set, no offset is published, and VIEW
+  stays the display plane. Measured A/B on the panel (HUD bounding box from the
+  HUD-off/on diff, same exe and window, `main` vs this change): external-window
+  `cube_handle_d3d11_win` `(12,10,369,475)` both sides, runtime-window
+  `cube_hosted_d3d11_win` `(10,1370,970,2150)` both sides — **0 px, HUD text
+  identical**. An earlier draft of this amendment claimed the
+  `displayxr-common` HUD quad would recentre on the eyes; that was wrong, and
+  the measurement is why.
+- **So two apps on one box can have different VIEW semantics**, and that is
+  deliberate, not an oversight: a rig-chained or RAW app's VIEW is the display
+  plane, a plain OpenXR app's VIEW is the eye centroid. VIEW is a per-session
+  space, the divergence is bounded by the eye centroid (~10 cm), and the
+  alternative — letting a chained rig drag VIEW — would make VIEW flip-flop
+  *within a single app* between its rig and non-rig frames, which is worse. A
+  reviewer who dislikes the split should argue with this paragraph, not
+  discover it.
+- LOCAL, STAGE, `xrRequestRecenter` and everything anchored to them are
+  unaffected for every class.
 - A VIEW-space composition layer is unaffected in pixels: the layer and the
-  views moved together.
+  views move together (`handle_space()` composes the same offset). For a
+  rig-chained app nothing moves at all, because nothing was published.
 - `tests/tests_oxr_view_space.cpp` gains `[view_centroid]` arms: VIEW == centroid
   in LOCAL / STAGE / VIEW, `VIEW`-in-`VIEW` identity and round-trip inversion, a
   chained rig leaving VIEW alone, and the MULTIVIEW arm that pins the centroid to
@@ -234,9 +258,10 @@ offset is **measured, never re-derived**.
   set. The Amendment 1 arm that read "displayPlanePose == VIEW" now pins the
   weaker, still-correct thing — that the plane's offset from VIEW is
   base-invariant — because the plane is no longer at the VIEW origin.
-- The CTS by-name exclusion is removed only after a real run confirms it, and
-  that run needs #1506 (or `__COMPAT_LAYER=HighDpiAware`) or the window term
-  comes back as a DPI artefact.
+- **Confirmed on hardware** (win box, sim-display, D3D11, CTS 1.1.63.0):
+  `xrLocateSpace_xrLocateViews` goes 9 assertions / **0 failed** (was 9/1 at
+  `:330`), and the full D3D11 arm 62 pass / 3 fail (was 61/4) — no new reds. The
+  by-name exclusion is removed in the change that records that run, not here.
 
 ## References
 

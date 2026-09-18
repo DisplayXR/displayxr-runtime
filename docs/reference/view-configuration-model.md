@@ -252,12 +252,28 @@ state tracker) are unaffected. See
 [ADR-024 Amendment 2](../adr/ADR-024-raw-vs-render-ready-views.md#amendment-2--view-is-the-eye-centroid-2026-09-18)
 and the `[view_centroid]` arms in `tests/tests_oxr_view_space.cpp`.
 
-**The `~xrLocateSpace_xrLocateViews` by-name exclusion stays** in
-`.github/workflows/cts.yml` and `scripts/run_cts.ps1` until a real CTS run on
-hardware confirms the fix — a doc claim is not a conformance result. Delete it
-in the same change that records the green run, and keep
-`__COMPAT_LAYER=HighDpiAware` (or #1506's manifest) on the harness, or the
-window term reappears as a DPI artefact rather than a runtime one.
+**Who that changes, and it is only the CTS-shaped apps.** The offset is
+published only by a locate that chains no rig and is not RAW, so VIEW moves only
+for sessions using **no DisplayXR view extension** — the CTS, legacy titles,
+third-party OpenXR apps. Every in-tree extension app, every `displayxr-common`
+consumer and the engine plug-ins chain `XR_DXR_view_rig` or are external-window
+RAW, and see **no change**: measured A/B on the panel, the `cube_handle_d3d11_win`
+and `cube_hosted_d3d11_win` HUD quads shift **0 px** and their text is identical.
+The deliberate consequence is that two apps on one box can hold different VIEW
+semantics — plane for a rig-chained or RAW app, eye centroid for a plain one;
+ADR-024 Amendment 2 argues why that beats letting a rig drag VIEW.
+
+**Confirmed on hardware** (win box, sim-display, D3D11, CTS 1.1.63.0):
+`xrLocateSpace_xrLocateViews` is 9 assertions / **0 failed** (was 9/1 at `:330`);
+the full D3D11 arm went 61/4 → 62 pass / 3 fail, no new reds.
+
+**The `~xrLocateSpace_xrLocateViews` by-name exclusion is still present** in
+`.github/workflows/cts.yml` and `scripts/run_cts.ps1`: the #1502 change does not
+touch it, so the green run above was taken with the test run explicitly rather
+than through the default lane. Deleting it belongs to the change that records
+that run in CI. Keep `__COMPAT_LAYER=HighDpiAware` (or #1506's manifest) on the
+harness regardless — the fix is measured and so survives the DPI artefact, but
+every other window-geometry number the CTS sees does not.
 
 What the CTS actually sees: it never enables `XR_DXR_display_info`, so
 `PRIMARY_MULTIVIEW_DXR` is never enumerated to it. The CTS sees exactly
