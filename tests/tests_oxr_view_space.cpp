@@ -46,18 +46,26 @@
  *   6. without the extension only one configuration is advertised and the
  *      MULTIVIEW enum is not a valid value at all.
  *
- * NOT covered here: the DXR_VIEW_CONFIG_LEGACY=1 kill switch. It is read
- * through DEBUG_GET_ONCE_BOOL_OPTION, which caches the FIRST read for the life
- * of the process, and ctest runs every TEST_CASE in this file in one process -
- * so a legacy arm would either be poisoned by the arms above or poison them,
- * depending on ordering. Exercising it needs its own process (its own ctest
- * registration with an ENVIRONMENT property), which is a separate change.
+ *   7. under DXR_VIEW_CONFIG_LEGACY=1 the pre-#1486 mapping comes back: ONE
+ *      configuration, PRIMARY_STEREO, reporting the device MAX.
+ *
+ * Arm 7 runs in its OWN PROCESS and that is not cosmetic: the kill switch is
+ * read through DEBUG_GET_ONCE_BOOL_OPTION, which caches the first read for the
+ * life of the process, so one binary cannot host both mappings. CMake therefore
+ * registers this file TWICE - the plain registration, and
+ * `tests_oxr_view_space_legacy`, which sets DXR_VIEW_CONFIG_LEGACY=1 and passes
+ * the `[view_config_legacy]` tag filter. The two guards below (@ref
+ * legacy_switch_set) make each arm SKIP in the wrong environment, so the pairing
+ * is enforced by the SOURCE too and not only by the ctest arguments - running
+ * the bare binary with the variable exported cannot silently fail the #1486
+ * arms.
  */
 
 #include "catch_amalgamated.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -87,6 +95,21 @@ namespace {
 
 constexpr float kPosTolM = 0.001f;    // 1 mm
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
+
+/*!
+ * #1486: is the kill switch armed for THIS process?
+ *
+ * The runtime reads DXR_VIEW_CONFIG_LEGACY through DEBUG_GET_ONCE_BOOL_OPTION
+ * (u_debug.h), whose truth test is "set and not 0/off/false/no". Mirrored here
+ * loosely - a bare "is it set and not literally 0" is enough to decide which
+ * arms may run, and the arms themselves then assert the mapping.
+ */
+bool
+legacy_switch_set()
+{
+	const char *v = std::getenv("DXR_VIEW_CONFIG_LEGACY");
+	return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+}
 
 /*
  *
@@ -650,6 +673,10 @@ TEST_CASE("xrLocateViews honours the base space (#1370)", "[oxr][view_space]")
 
 TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr][view_space][view_config]")
 {
+	if (legacy_switch_set()) {
+		SKIP("DXR_VIEW_CONFIG_LEGACY is armed - this arm pins the NEW mapping");
+	}
+
 	Runtime rt;
 	BringUp opt;
 	opt.display_info = true;
@@ -705,6 +732,10 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 TEST_CASE("PRIMARY_STEREO reports exactly 2 views on a wider device (#1486)", "[oxr][view_space][view_config]")
 {
+	if (legacy_switch_set()) {
+		SKIP("DXR_VIEW_CONFIG_LEGACY is armed - this arm pins the NEW mapping");
+	}
+
 	Runtime rt;
 	BringUp opt;
 	opt.display_info = true;
@@ -741,6 +772,10 @@ TEST_CASE("PRIMARY_STEREO reports exactly 2 views on a wider device (#1486)", "[
 
 TEST_CASE("without XR_DXR_display_info the MULTIVIEW type does not exist (#1486)", "[oxr][view_space][view_config]")
 {
+	if (legacy_switch_set()) {
+		SKIP("DXR_VIEW_CONFIG_LEGACY is armed - this arm pins the NEW mapping");
+	}
+
 	Runtime rt;
 	if (!bring_up(rt)) { // no XR_DXR_display_info, begun on PRIMARY_STEREO
 		return;
@@ -772,6 +807,69 @@ TEST_CASE("without XR_DXR_display_info the MULTIVIEW type does not exist (#1486)
 		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, rt.now(), nullptr) ==
 		      XR_ERROR_VALIDATION_FAILURE);
 	}
+
+	tear_down(rt);
+}
+
+/*
+ * #1486 kill switch. SEPARATE PROCESS by construction — see the file header —
+ * registered by tests/CMakeLists.txt as `tests_oxr_view_space_legacy` with
+ * DXR_VIEW_CONFIG_LEGACY=1 in its environment and this tag as the filter.
+ */
+TEST_CASE("DXR_VIEW_CONFIG_LEGACY restores the pre-#1486 mapping", "[oxr][view_space][view_config_legacy]")
+{
+	if (!legacy_switch_set()) {
+		SKIP(
+		    "DXR_VIEW_CONFIG_LEGACY is not set - run the tests_oxr_view_space_legacy ctest, "
+		    "which arms it in a process of its own (the runtime caches the read)");
+	}
+
+	Runtime rt;
+	BringUp opt;
+	// The extension IS enabled: the whole point is that the kill switch
+	// suppresses PRIMARY_MULTIVIEW_DXR even then.
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	REQUIRE(device_max >= 2);
+	INFO("device max view count across rendering modes = " << device_max);
+	if (device_max <= 2) {
+		WARN("device max is " << device_max
+		                      << " - the legacy mapping is only DISTINGUISHABLE from the "
+		                         "new one on a device with a >2-view rendering mode "
+		                         "(sim_display's Quad)");
+	}
+
+	// One entry, PRIMARY_STEREO, DESPITE the extension being enabled.
+	const std::vector<XrViewConfigurationType> cfgs = rt.view_configs();
+	REQUIRE(cfgs.size() == 1);
+	CHECK(cfgs[0] == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO);
+
+	// ...and it reports the DEVICE MAX, which is exactly the non-conformance
+	// the switch exists to preserve for already-shipped apps.
+	CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == device_max);
+	CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == 0);
+
+	const XrTime t = rt.now();
+	uint32_t n = 0;
+	REQUIRE(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, t, &n) == XR_SUCCESS);
+	CHECK(n == device_max);
+
+	std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
+	CHECK(v.size() == device_max);
+
+	// The opt-in type is a valid ENUM (the extension is enabled) but this
+	// system does not advertise it, so the locate is refused as UNSUPPORTED
+	// rather than as a validation failure.
+	CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, nullptr) ==
+	      XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED);
 
 	tear_down(rt);
 }
