@@ -260,13 +260,15 @@ This crop step is performed lazily — the intermediate texture is only created 
 
 #### Zero-copy eligibility — the single rule
 
-Skipping the crop and handing the app's swapchain image straight to the DP is valid in **exactly one case**: the app's submitted layout equals the active mode's atlas **and** fills the swapchain. This is decided **solely** by the shared predicate `u_tiling_can_zero_copy()` (`auxiliary/util/u_tiling.h`), which requires **all** of:
+Skipping the crop and handing the app's swapchain image straight to the DP is valid in **exactly one case**: the app's submitted layout **covers** the active mode's atlas **and** fills the swapchain. This is decided **solely** by the shared predicate `u_tiling_can_zero_copy()` (`auxiliary/util/u_tiling.h`), which requires **all** of:
 
-- `submitted view_count == mode->view_count` (the #542 divergence guard — a hardware/content mismatch frame must crop; zero-copy cannot re-tile a mismatched submission),
+- `submitted view_count >= mode->view_count` (the #542 divergence guard — a submission SHORTER than the mode must crop; zero-copy cannot re-tile it, and the per-view loops would read slots the app never wrote),
 - `swapchain_w == mode->atlas_width_pixels && swapchain_h == mode->atlas_height_pixels`, and
-- every view's sub-rect matches its expected tile origin and size.
+- every **active** view's sub-rect matches its expected tile origin and size — the first `mode->view_count` of them.
 
-**No compositor may add its own zero-copy proxy** — not a view-count threshold, not coupling to the hardware 2D/3D flag, not a mode-index check. If the predicate is false, **crop**. (Historically the D3D11 service path gated zero-copy on `proj_view_count > 1` coupled to `hardware_display_3d`; that ad-hoc proxy is the root of the #575 forced-IPC 2D left-shift and is removed in favour of this rule.)
+**Why coverage, not equality (ADR-041).** The app's view count is fixed by the view configuration it began; the mode's tile count moves underneath it. A conformant app therefore submits its full located count and aliases the inactive tail `[active, located)` onto view 0's subimage. Those tail views carry no content the runtime reads, so they cannot disqualify the passthrough — and an equality test would have silently retired the *one shipping zero-copy case*: Windows Leia's worst-case-filling mode is the 1-view 2D one, which a `PRIMARY_STEREO` app now submits **two** views into. Requiring equality there would have moved full-screen 2D off zero-copy with no visible symptom other than the copy cost.
+
+**No compositor may add its own zero-copy proxy** — not a view-count threshold, not coupling to the hardware 2D/3D flag, not a mode-index check. If the predicate is false, **crop**. A backend may bound-check that the layer carries at least `mode->view_count` views before reading them — that is a read bound, not an eligibility opinion. (Historically the D3D11 service path gated zero-copy on `proj_view_count > 1` coupled to `hardware_display_3d`; that ad-hoc proxy is the root of the #575 forced-IPC 2D left-shift and is removed in favour of this rule.)
 
 ##### Why it's a rare coincidence, and which mode triggers it
 

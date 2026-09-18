@@ -285,16 +285,53 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     EndFrame(..., projectionViews.data(), eyeCount);        // submit eyeCount, not 2
     ```
     (`test_apps/handle/cube_handle_d3d11_win/main.cpp:404-415,719,761,791-793`)
-  - Submitting **fewer** views than the active mode has tiles is always legal — the
-    compositor paints the first `eyeCount` tiles (and collapses `eyeCount == 1` to a full
-    mono tile). Submitting **more** than the begun view configuration allows is not.
+  - **Rendering** fewer views than the begun configuration reports is normal — that is what
+    a 2D or stereo mode means. **Submitting** fewer is not: see INV-3.4.
 
 - **INV-3.2 — Use dynamic/`XRT_MAX_VIEWS`-sized arrays for projection views.** Allocate
-  `std::vector<XrCompositionLayerProjectionView>(eyeCount, ...)` each frame. Ref:
+  `std::vector<XrCompositionLayerProjectionView>(locatedCount, ...)` each frame — sized to
+  the **located** count, not the rendered one (INV-3.4). Ref:
   `main.cpp:412`; VK equivalent `test_apps/handle/cube_handle_vk_win/main.cpp:537,566`.
-  A stereo-fixed app on `PRIMARY_STEREO` may use a fixed 2-element array — `eyeCount` there
-  is only ever 1 or 2 — but the dynamic form costs nothing and survives a later opt-in to
+  A stereo-fixed app on `PRIMARY_STEREO` may use a fixed 2-element array — the located count
+  there is always 2 — but the dynamic form costs nothing and survives a later opt-in to
   `PRIMARY_MULTIVIEW_DXR`.
+
+- **INV-3.4 — Submit the LOCATED view count; alias the inactive tail.** (ADR-041)
+  `xrEndFrame` requires `XrCompositionLayerProjection::viewCount` to equal what
+  `xrLocateViews` returned, for **every** view configuration type. That is core OpenXR, not
+  a DisplayXR rule: *"`viewCount` must be equal to the number of view poses returned by
+  `xrLocateViews`"* and *"all views associated with projection layers must be supplied"*.
+
+  You still **render** only the active mode's views. You close the gap by pointing each
+  inactive view at content you already rendered this frame:
+
+  ```c
+  XrViewActivityStateDXR activity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+  XrViewState viewState = {XR_TYPE_VIEW_STATE, &activity};
+  uint32_t located = 0;
+  xrLocateViews(session, &locateInfo, &viewState, 8, &located, views);
+
+  for (uint32_t i = 0; i < eyeCount; i++) { /* render + fill projViews[i] */ }
+
+  // [eyeCount, located): keep each view's OWN located pose/fov, alias view 0's subImage.
+  DxrAliasInactiveViews(projViews.data(), views.data(), located, eyeCount);
+  projLayer.viewCount = located;
+  ```
+
+  `DxrAliasInactiveViews()` lives in `test_apps/common/dxr_view_config.h` and every in-tree
+  app uses it. `activity.activeViewCount` is the runtime's own answer for how many views are
+  live this frame — prefer it to deriving the number from the rendering mode.
+
+  Two consequences that catch people:
+  - **A 3D zone layer is a projection layer.** `XR_DXR_display_zones` submits each 3D zone as
+    an `XR_TYPE_COMPOSITION_LAYER_PROJECTION`, so every zone layer carries the located count
+    too, aliased **within that zone** (zone tile 0's subimage, not the display's).
+  - **An `XrWeaveSubmitLayoutDXR::viewCount` is NOT this.** A weave-RPC probe that never calls
+    `xrEndFrame` is out of scope; mark it `DXR_STEREO_FIXED_APP` and move on.
+
+  The old under-submit allowance is staged out through `DXR_UNDER_SUBMIT` (default `1`, which
+  still accepts a 1-view `PRIMARY_STEREO` layer in a 1-view mode and logs it once per
+  session). Do not build on it.
 
 ---
 
@@ -888,7 +925,8 @@ macOS app (no manifest → no Android findings).
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
 - [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedDXR` handled — own transition + 2D mode request on loss (INV-2.8)
-- [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
+- [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; **render** `eyeCount` from the active mode, not 2 (INV-3.1)
+- [ ] Projection layer **submits the LOCATED count**, with the inactive tail aliased via `DxrAliasInactiveViews()` — including every 3D zone layer (INV-3.4)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)

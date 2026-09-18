@@ -752,7 +752,7 @@ views; this type is how an application reaches the rest.
 | Advertised by `xrEnumerateViewConfigurations` | always (on a non-mono system) | **only when `XR_DXR_display_info` is enabled** on the instance |
 | `xrEnumerateViewConfigurationViews` count | exactly **2** | the device's **maximum view count across all rendering modes** |
 | `xrLocateViews` `viewCountOutput` | 2 | the same maximum |
-| `xrEndFrame` projection `viewCount` | **exactly 2** for a core-only app; an instance that enabled this extension may also submit 1 while a 1-view rendering mode is in play — the mode active now, or the one active when this frame's `xrBeginFrame` was called (`>2` is rejected, naming this type as the opt-in) | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` | **exactly 2** — the located count (ADR-041). An instance that enabled this extension may still submit 1 while a **1-view mode is in play** — the mode active now, or the one active when this frame's `xrBeginFrame` was called (#1528) — **deprecated**, see below | **exactly the located count** (the device maximum). ADR-041 removed the old "any rendering mode's `viewCount`" allowance |
 
 - **Fixed per instance.** The count this type reports is the device maximum across modes
   (e.g. 4 on a display with a quad mode; **2** on a stereo-only display). It does **not**
@@ -760,45 +760,83 @@ views; this type is how an application reaches the rest.
   application renders and submits, never how many the runtime reports. This keeps the core
   rule that the view count is a property of the view configuration, and satisfies
   `XR_EXT_view_configuration_views_change`'s immutability clause.
-- **`xrEndFrame` rule.** Under this type the runtime accepts a projection layer whose
-  `viewCount` matches the active rendering mode (so an app may submit 2 in a stereo mode
-  and 4 in a quad mode without re-creating the session), and 1 for a mono mode. Submitting
-  fewer views than the active mode has tiles is legal: the compositor paints the first
-  `viewCount` tiles.
+- **`xrEndFrame` rule — submit the located count, alias the inactive tail (v21, ADR-041).**
+  Under **both** types the runtime accepts exactly the `viewCount` `xrLocateViews`
+  returned. That is the core rule verbatim:
 
-  **Under `PRIMARY_STEREO` the rule is tighter, and deliberately so.** For an instance
-  that did **not** enable this extension — a core-only app, which is every OpenXR CTS
-  session — `PRIMARY_STEREO` accepts **exactly 2** and nothing else, whatever rendering
-  mode the panel is in. A short submission is `XR_ERROR_VALIDATION_FAILURE`, which the
-  CTS `XrCompositionLayerProjection` test requires: it decrements the located view count
-  and checks for that error.
+  > `XrCompositionLayerProjection::viewCount` **must** be equal to the number of view poses
+  > returned by `xrLocateViews`.
 
-  An instance that **did** enable this extension may additionally submit `viewCount == 1`
-  **while a 1-view rendering mode is in play** — the 2D/mono submission path
-  described under *Mono Submission in 2D Mode* below. Both halves are required. The
-  extension gate is not bureaucracy: a core-only app cannot enumerate a rendering mode,
-  request one, or be told the active one changed, so a relaxation scoped to the active
-  mode would make `PRIMARY_STEREO`'s meaning depend on state that app cannot observe.
-  (Gating on the mode alone was tried and failed the conformance suite outright: a CTS
-  session is treated as a legacy session, and the reference display sits in a 1-view mode
-  for essentially the whole run, so the exception was open throughout.)
+  > All views associated with projection layers **must** be supplied, or
+  > `XR_ERROR_VALIDATION_FAILURE` **must** be returned by `xrEndFrame`.
 
-  **"In play" spans the frame, not just the instant of `xrEndFrame`.** A rendering-mode
-  switch is asynchronous with respect to the application's frame loop: a 2D→3D switch can
-  land after the app called `xrBeginFrame` and rendered the single view the 1-view mode
-  called for, but before it submits. The runtime therefore judges `viewCount == 1` against
-  the active mode **or** the mode that was active at this frame's `xrBeginFrame`, whichever
-  permits it. The allowance is one frame wide — the next `xrBeginFrame` re-latches, so an
-  application that keeps submitting a single view once the 3D mode is established still
-  gets `XR_ERROR_VALIDATION_FAILURE`. This is behaviour only: no new struct, enum or
-  `SPEC_VERSION`. (The runtime owns the switch, so the runtime absorbs the edge; the
-  alternative — every application re-rendering the in-flight frame with two views —
-  exports a runtime race to every consumer.)
+  An app still *renders* only the active rendering mode's views. It satisfies the rule by
+  pointing each **inactive** view at content it already rendered this frame — view 0's
+  subimage is the obvious choice — while keeping that view's own located pose and FOV. The
+  runtime never reads those pixels: it locates views `[activeViewCount, viewCountOutput)`
+  at view 0's pose, and every compositor backend clamps the layer to the active mode's tile
+  count before compositing. `XrViewActivityStateDXR` (below) is how the app learns
+  `activeViewCount`; `DxrAliasInactiveViews()` in `test_apps/common/dxr_view_config.h` is a
+  header-only reference implementation of the tail fill.
 
-  **The recommended path for any mode-driven count is `PRIMARY_MULTIVIEW_DXR`**,
-  including the 1-view case: begin with it and submit the active mode's count with no
-  special case. The `PRIMARY_STEREO` allowance above is back-compatibility for apps
-  already shipping on that type, not a design to build on.
+  **This applies to zone layers too.** `XR_DXR_display_zones` submits each 3D zone as an
+  `XR_TYPE_COMPOSITION_LAYER_PROJECTION` with a zone chained on it, so each zone layer
+  carries the located count, aliased within that zone.
+
+  **What this replaced.** Until v21, `PRIMARY_MULTIVIEW_DXR` accepted a layer whose
+  `viewCount` matched *any* rendering mode's, so a session that located 4 views could
+  submit 2 in a stereo mode. That contradicted both core sentences above and is now
+  `XR_ERROR_VALIDATION_FAILURE`. Nothing released depended on it.
+
+  **The one deprecated arm.** An instance that enabled this extension and began
+  `PRIMARY_STEREO` may still submit `viewCount == 1` **while the active rendering mode is
+  itself 1-view** — the 2D/mono submission path described under *Mono Submission in 2D
+  Mode* below. It is accepted, logs **once per session**, and names the fix. It exists only
+  because released demos submit one view in 2D mode. Both halves of its gate are required:
+  a core-only app — which is every OpenXR CTS session — cannot enumerate a rendering mode,
+  request one, or be told the active one changed, so a relaxation scoped to the active mode
+  would make `PRIMARY_STEREO`'s meaning depend on state that app cannot observe. (Gating on
+  the mode alone was tried and failed the conformance suite outright: a CTS session is
+  treated as a legacy session, and the reference display sits in a 1-view mode for
+  essentially the whole run, so the exception was open throughout.)
+
+  For a core-only app, `PRIMARY_STEREO` is **exactly 2** and nothing else, whatever mode the
+  panel is in — which is what the CTS `XrCompositionLayerProjection` test requires: it
+  decrements the located view count and checks for `XR_ERROR_VALIDATION_FAILURE`.
+
+  **"In play" spans the frame, not just the instant of `xrEndFrame` (#1528).** A
+  rendering-mode switch is asynchronous with respect to the application's frame loop: a
+  2D→3D switch can land after the app called `xrBeginFrame` and rendered the single view
+  the 1-view mode called for, but before it submits. The runtime therefore judges
+  `viewCount == 1` against the active mode **or** the mode that was active at this frame's
+  `xrBeginFrame`, whichever permits it. The allowance is one frame wide — the next
+  `xrBeginFrame` re-latches, so an application that keeps submitting a single view once the
+  3D mode is established still gets `XR_ERROR_VALIDATION_FAILURE`. The runtime owns the
+  switch, so the runtime absorbs the edge; the alternative — every application re-rendering
+  the in-flight frame with two views — exports a runtime race to every consumer.
+
+  **`DXR_UNDER_SUBMIT` — the staging switch.**
+
+  | value | `PRIMARY_STEREO` | `PRIMARY_MULTIVIEW_DXR` |
+  |---|---|---|
+  | `0` strict | the located count (2) | the located count (device max) |
+  | `1` **default** | the located count, **or** 1 while a 1-view mode is in play (active **or** begun, #1528) → accepted, logged once | the located count |
+  | `2` kill switch | pre-v21 behaviour | pre-v21 behaviour (under-submit accepted) |
+
+  Out-of-range values clamp to an end rather than falling back to the default, so a typo
+  can never silently land on "whatever the default was". `DXR_VIEW_CONFIG_LEGACY` is a
+  separate, older switch (it restores the pre-#1486 *reporting*) and is unaffected.
+
+  **Deprecation timeline — the trigger is a shipment, not a date.** The default flips from
+  `1` to `0` in the **first runtime release after `displayxr-common` and the five
+  `displayxr-demo-*` demos ship the alias submission**. Until every one of those has
+  shipped it, the default stays at `1`. When it flips, the 1-view arm is gone and
+  `DXR_UNDER_SUBMIT=2` is the only way back — itself temporary.
+
+  **The recommended path for any mode-driven count is `PRIMARY_MULTIVIEW_DXR`**: begin with
+  it, locate, render the active views, alias the rest, submit the located count. The
+  `PRIMARY_STEREO` allowance above is back-compatibility for apps already shipping on that
+  type, not a design to build on.
 - **How to opt in.** Enable `XR_DXR_display_info` at `xrCreateInstance`, call
   `xrEnumerateViewConfigurations`, and if this type is present pass it as
   `XrSessionBeginInfo::primaryViewConfigurationType` (and as
@@ -935,11 +973,21 @@ override the automatic behavior. Use cases include:
 
 #### Mono Submission in 2D Mode
 
-When the display is in 2D mode, the application **may** submit a single-view projection
-layer (`viewCount == 1`) to `xrEndFrame`, even though the session view configuration is
-`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`. This enables the application to render a
-single full-resolution view instead of two reduced-resolution stereo views, yielding a
-significant quality improvement for 2D content.
+> **DEPRECATED as a submission shape (v21, ADR-041).** Rendering ONE full-resolution view in
+> 2D mode is still the right thing to do and is unchanged. What is deprecated is *submitting*
+> a 1-view layer: the layer must now carry the located count, with the inactive views aliased
+> onto the mono view's subimage. The runtime still accepts the 1-view layer from an instance
+> that enabled this extension while the active mode is 1-view, logs it once per session, and
+> will stop accepting it when `DXR_UNDER_SUBMIT`'s default flips to `0` — see the
+> deprecation timeline in the `xrEndFrame` rule above. Read the rest of this section as
+> "render one view", not "submit one view".
+
+When the display is in 2D mode, the application renders a **single** full-resolution view
+instead of two reduced-resolution stereo views, a significant quality improvement for 2D
+content. Historically it also submitted a single-view projection layer (`viewCount == 1`) to
+`xrEndFrame` even though the session view configuration is
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`; under v21 it submits the located count with the
+tail aliased onto that one view instead.
 
 **Runtime behavior:**
 - `xrLocateViews` is called with an `XRT_MAX_VIEWS` (8)-sized buffer and returns the active
@@ -961,9 +1009,13 @@ significant quality improvement for 2D content.
 - Detect 2D mode (via a prior call to `xrRequestDisplayModeDXR` or an application toggle).
 - Create or reuse a swapchain at full window/display resolution for the mono view.
 - Render a single view using a center-eye camera position and full-resolution viewport.
-- Submit `viewCount == 1` with the single projection view to `xrEndFrame`.
-- When switching back to a 3D mode, resume submitting the active mode's `viewCount` (2 for SBS
-  stereo, 4 for quad) with per-view content at the recommended scaled resolution.
+- Submit the **located** `viewCount` to `xrEndFrame`, with view 0 carrying the mono view and
+  every inactive view aliased onto view 0's subimage (v21; `DxrAliasInactiveViews()`). The
+  legacy `viewCount == 1` submission is still accepted for now — see the deprecation note at
+  the top of this section.
+- When switching back to a 3D mode, resume rendering the active mode's `viewCount` (2 for SBS
+  stereo, 4 for quad) with per-view content at the recommended scaled resolution. The
+  submitted count does not change: it is always the located count.
 
 **Backward compatibility:**
 - Applications that always submit the stereo view count continue to work in 2D and stereo 3D
@@ -1023,6 +1075,63 @@ Two things outrank **both** of the above, and there the under-submit clamp stand
 
 Service-mode (out-of-process) sessions no longer apply a request locally: the local active mode index, view scales and hardware state follow the runtime's events. In-process sessions (which are their own mode owner) are unchanged.
 
+### Per-frame view activity — `XrViewActivityStateDXR` (v21)
+
+The view count a session gets is **fixed for its lifetime**: exactly 2 under
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`, the device maximum under
+`XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR`. It does not move when the rendering mode
+does. What moves is how many of those views the active mode actually uses, and v21 publishes
+that number instead of making the app infer it from the mode.
+
+```c
+#define XR_TYPE_VIEW_ACTIVITY_STATE_DXR ((XrStructureType)1004999213)
+
+typedef struct XrViewActivityStateDXR {
+    XrStructureType     type;            // XR_TYPE_VIEW_ACTIVITY_STATE_DXR
+    void*               next;
+    uint32_t            activeViewCount; // views [0, activeViewCount) are live
+} XrViewActivityStateDXR;
+```
+
+Chain it on `XrViewState` at `xrLocateViews` (the same pattern as
+`XrViewEyeTrackingStateDXR`). Afterwards:
+
+- views `[0, activeViewCount)` carry the active rendering mode's viewer poses and FOVs — these
+  are the views the runtime composes;
+- views `[activeViewCount, viewCountOutput)` are **inactive**: the runtime locates them at view
+  0's pose, so they are always valid to render or submit with, and it **ignores** whatever the
+  app submits for them.
+
+Chaining it is optional. An app that renders every located view every frame needs nothing from
+it; the inactive tail then simply duplicates view 0 and is discarded.
+
+```c
+XrViewActivityStateDXR activity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+XrViewState viewState = {XR_TYPE_VIEW_STATE, &activity};
+
+XrView views[8];  // XRT_MAX_VIEWS
+for (uint32_t i = 0; i < 8; i++) views[i] = (XrView){XR_TYPE_VIEW};
+
+uint32_t located = 0;
+xrLocateViews(session, &locateInfo, &viewState, 8, &located, views);
+
+// Render only what is active...
+for (uint32_t i = 0; i < activity.activeViewCount; i++) { /* render tile i */ }
+
+// ...but SUBMIT everything that was located. The inactive tail points at
+// content this frame already produced; the runtime never reads it.
+for (uint32_t i = activity.activeViewCount; i < located; i++) {
+    projViews[i].type     = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+    projViews[i].pose     = views[i].pose;   // its OWN located pose
+    projViews[i].fov      = views[i].fov;
+    projViews[i].subImage = projViews[0].subImage;   // alias view 0
+}
+projLayer.viewCount = located;
+```
+
+`test_apps/common/dxr_view_config.h` carries `DxrAliasInactiveViews()`, a header-only
+implementation of that tail loop, and every in-tree test app uses it.
+
 ### Example Code: Querying Display Mode Support and Requesting 2D
 
 > ⚠️ **These inline examples predate the multiview model and the v13 header — read with care.**
@@ -1077,16 +1186,20 @@ if (!displayMode3D) {
     // Render 1 view at full window resolution (no stereo scale factors)
     // ... render to monoSwapchain at windowWidth x windowHeight ...
 
-    // Submit single projection view
-    XrCompositionLayerProjectionView monoView = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-    monoView.subImage.swapchain = monoSwapchain;
-    monoView.subImage.imageRect = {{0, 0}, {(int32_t)windowWidth, (int32_t)windowHeight}};
-    monoView.pose.position = centerEye;
-    monoView.fov = /* center-eye FOV */;
+    // One view RENDERED, `located` views SUBMITTED (v21, ADR-041). The tail
+    // points at the mono view's subimage and the runtime discards it.
+    XrCompositionLayerProjectionView projViews[8] = {};
+    projViews[0].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+    projViews[0].subImage.swapchain = monoSwapchain;
+    projViews[0].subImage.imageRect = {{0, 0}, {(int32_t)windowWidth, (int32_t)windowHeight}};
+    projViews[0].pose.position = centerEye;
+    projViews[0].fov = /* center-eye FOV */;
+
+    DxrAliasInactiveViews(projViews, views, located, 1);
 
     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projLayer.viewCount = 1;  // Mono submission — accepted in 2D mode
-    projLayer.views = &monoView;
+    projLayer.viewCount = located;
+    projLayer.views = projViews;
     // ... xrEndFrame with projLayer ...
 }
 ```
@@ -1432,10 +1545,15 @@ if (frameState.shouldRender) {
         projViews[eye].subImage.imageArrayIndex = 0;
     }
 
+    // v21 (ADR-041): fill the INACTIVE tail [renderViewCount, viewCount) so the
+    // layer carries the located count. Each tail view keeps its own located
+    // pose/fov and aliases view 0's subimage; the runtime never reads it.
+    DxrAliasInactiveViews(projViews, views, viewCount, renderViewCount);
+
     // --- Submit projection layer + HUD layer ---
     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projLayer.space = localSpace;
-    projLayer.viewCount = renderViewCount;
+    projLayer.viewCount = viewCount;   // the LOCATED count, not renderViewCount
     projLayer.views = projViews;
 
     XrCompositionLayerWindowSpaceDXR hudLayer = {};
@@ -1500,6 +1618,12 @@ required by the CTS (see the `xrEndFrame` rule above), and it deliberately does 
 the 2D path: an app that enabled the extension keeps submitting 1 in a 1-view mode exactly
 as before. A **core-only** app submitting 1 was always out of contract for a two-view type
 and is now told so.
+
+**v21 (ADR-041) narrows this further, in the other direction.** `PRIMARY_MULTIVIEW_DXR` no
+longer accepts "any rendering mode's `viewCount`" — it accepts the located count and nothing
+else, because the old rule contradicted two core *musts* about projection-layer view counts.
+The 1-view `PRIMARY_STEREO` allowance above survives as a **deprecated, logged** compat arm on
+the same shipped-two-view path, and `DXR_UNDER_SUBMIT` stages its removal.
 
 Because the value is a vendor enum, a conformance or validation
 layer that exact-matches `XrViewConfigurationType` against the Khronos registry will not
