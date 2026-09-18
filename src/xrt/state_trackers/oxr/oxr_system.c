@@ -24,6 +24,7 @@
 #include "oxr_chain.h"
 #include "oxr_api_verify.h"
 #include "oxr_conversions.h"
+#include "oxr_legacy_mode_rule.h"
 
 
 DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "OXR_VIEWPORT_SCALE_PERCENTAGE", 100)
@@ -140,6 +141,13 @@ oxr_system_fill_in(
 	sys->inst = inst;
 	sys->systemId = systemId;
 	sys->view_count = view_count;
+
+	// #1510: the legacy mode floor is re-decided from scratch on every
+	// fill_in, so clear it here rather than relying on the handle allocation
+	// (this function can run more than once for a system).
+	sys->legacy_rendering_mode_index = 0;
+	sys->legacy_rendering_mode_forced = false;
+	sys->legacy_mode_unfillable = false;
 
 	/*
 	 * #1486: build the advertised primary view-configuration list.
@@ -264,25 +272,54 @@ oxr_system_fill_in(
 #endif
 
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sys, head);
-		if (head != NULL && head->rendering_mode_count > 1) {
-			uint32_t default_3d_idx = head->hmd->active_rendering_mode_index;
-			struct xrt_rendering_mode *mode3d = &head->rendering_modes[default_3d_idx];
-			if (mode3d->view_count == 2 &&
-			    mode3d->view_scale_x <= 0.5f && mode3d->view_scale_y <= 0.5f) {
-				// Case A: typical SBS — compromise to 0.5x1.0
-				view_scale_x = 0.5f;
-				view_scale_y = 1.0f;
-				info->legacy_app_tile_scaling = true;
-				info->legacy_view_scale_x = 0.5f;
-				info->legacy_view_scale_y = 1.0f;
-			} else {
-				// Case B: use 3D mode's actual scale, stretch for 2D
-				view_scale_x = mode3d->view_scale_x;
-				view_scale_y = mode3d->view_scale_y;
-				info->legacy_app_tile_scaling = true;
-				info->legacy_view_scale_x = mode3d->view_scale_x;
-				info->legacy_view_scale_y = mode3d->view_scale_y;
+		if (head != NULL && head->hmd != NULL && oxr_legacy_tile_scaling_applies(head->rendering_mode_count)) {
+			uint32_t active_idx = head->hmd->active_rendering_mode_index;
+			if (active_idx >= head->rendering_mode_count) {
+				active_idx = 0;
 			}
+
+			/*
+			 * #1510: a legacy session submits a fixed two views, so a
+			 * mode with more tiles than that leaves the remainder at the
+			 * clear colour — a capability loss caused by a mode the app
+			 * cannot see (the shape #1486 rejected). Move the display to
+			 * a mode the app CAN fill, before it is sized, so the mode,
+			 * the compromise scale, the compositor grid and the display
+			 * processor all agree. See oxr_legacy_mode_rule.h for why
+			 * this is a mode floor and not a wider Case A.
+			 *
+			 * Two things outrank the floor:
+			 *   - a device that PINS its mode (sim-display's
+			 *     SIM_DISPLAY_FORCE_MODE). The pin exists to hold a mode
+			 *     against every later request, which is exactly what
+			 *     keeps the N-view under-submit path testable.
+			 *   - service mode, where the panel lease — not this app —
+			 *     owns the display-global mode.
+			 * In both cases Case B still applies and xrCreateSession says
+			 * so out loud (the objection was the SILENCE, not the clamp).
+			 */
+			int32_t mode_pinned = 0;
+			if (xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &mode_pinned) !=
+			    XRT_SUCCESS) {
+				mode_pinned = 0; // device doesn't implement the query ⟹ not pinned
+			}
+			const bool may_demote = oxr_legacy_may_demote(mode_pinned != 0, info->is_service_mode);
+			uint32_t legacy_idx = active_idx;
+			if (may_demote) {
+				legacy_idx = oxr_legacy_pick_mode_index(head->rendering_modes,
+				                                        head->rendering_mode_count, active_idx);
+			}
+			sys->legacy_rendering_mode_index = legacy_idx;
+			sys->legacy_rendering_mode_forced = (legacy_idx != active_idx);
+			sys->legacy_mode_unfillable = !oxr_legacy_mode_is_fillable(&head->rendering_modes[legacy_idx]);
+
+			struct xrt_rendering_mode *mode3d = &head->rendering_modes[legacy_idx];
+			// Case A: typical SBS — compromise to 0.5x1.0.
+			// Case B: use the mode's actual scale, stretch for 2D.
+			oxr_legacy_compromise_scale(mode3d, &view_scale_x, &view_scale_y);
+			info->legacy_app_tile_scaling = true;
+			info->legacy_view_scale_x = view_scale_x;
+			info->legacy_view_scale_y = view_scale_y;
 			if (probe_only) {
 				U_LOG_I("Probe instance (no extensions enabled): provisional "
 				        "compromise view scale %.2fx%.2f computed - NOT used for "
@@ -294,6 +331,15 @@ oxr_system_fill_in(
 				        "a LEGACY-session WARN fires at xrCreateSession if used",
 				        view_scale_x, view_scale_y, mode3d->mode_name,
 				        mode3d->view_scale_x, mode3d->view_scale_y);
+				if (sys->legacy_rendering_mode_forced) {
+					U_LOG_I(
+					    "#1510 legacy mode floor: mode %u ('%s', %u views) "
+					    "cannot be filled by a 2-view legacy submission - "
+					    "mode %u ('%s') provisioned instead",
+					    active_idx, head->rendering_modes[active_idx].mode_name,
+					    head->rendering_modes[active_idx].view_count, legacy_idx,
+					    mode3d->mode_name);
+				}
 			}
 		}
 	}

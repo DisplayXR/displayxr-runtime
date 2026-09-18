@@ -40,6 +40,7 @@ set(tests
     tests_comp_rear_budget
     tests_oxr_weave_latch
     tests_oxr_view_config_rule
+    tests_oxr_legacy_mode_rule
     tests_input_arbiter_rig
     tests_sim_input_nav
 	)
@@ -269,6 +270,15 @@ target_include_directories(
 target_include_directories(
 	tests_oxr_view_config_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
+
+# #1510 — the legacy mode floor and the compromise view scale it implies. Same
+# reason as the two above: the real decision needs an instance, a system, a head
+# device and a plug-in, so only the rule is host-drivable. It reads
+# xrt_rendering_mode, hence xrt-interfaces (headers only).
+target_include_directories(
+	tests_oxr_legacy_mode_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_legacy_mode_rule PRIVATE xrt-interfaces)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
 # of printing it. A header of pure integer decisions (the probe that feeds it is

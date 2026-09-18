@@ -2082,6 +2082,32 @@ struct oxr_system
 	bool has_ended_rendering_mode;
 
 	/*!
+	 * #1510: the rendering mode a LEGACY session (no XR_DXR_display_info)
+	 * runs in — the "mode floor". A legacy app submits a fixed two views, so
+	 * a mode with more tiles than that leaves the remainder at the clear
+	 * colour; the floor moves the display to a mode the app can fill BEFORE
+	 * it is sized, so the mode, the compromise view scale, the compositor
+	 * grid and the display processor all agree.
+	 *
+	 * Decided once in oxr_system_fill_in() (together with the compromise
+	 * scale it implies, so the two can never disagree) and applied by
+	 * xrBeginSession. Only meaningful while
+	 * `xsysc->info.legacy_app_tile_scaling` is true. The rule itself lives in
+	 * @ref oxr_legacy_mode_rule.h.
+	 */
+	uint32_t legacy_rendering_mode_index;
+
+	//! #1510: true when @ref legacy_rendering_mode_index differs from the mode
+	//! the device was in, i.e. the floor has a switch to perform.
+	bool legacy_rendering_mode_forced;
+
+	//! #1510: true when the mode the legacy session ends up in STILL has more
+	//! views than it can submit — the floor could not be applied because the
+	//! device pins its mode (SIM_DISPLAY_FORCE_MODE) or the panel lease owns it
+	//! in service mode. xrCreateSession warns; the under-submit clamp stands.
+	bool legacy_mode_unfillable;
+
+	/*!
 	 * #1486: the primary view configurations this system advertises, in the
 	 * order xrEnumerateViewConfigurations reports them - PRIMARY_STEREO
 	 * first when present, so a stereo-fixed app that takes entry 0 keeps

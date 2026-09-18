@@ -1,9 +1,14 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-03-15
-issues: [79]
-code-paths: [src/xrt/state_trackers/oxr/oxr_system.c]
+updated: 2026-09-18
+issues: [79, 1510]
+code-paths:
+  [
+    src/xrt/state_trackers/oxr/oxr_system.c,
+    src/xrt/state_trackers/oxr/oxr_legacy_mode_rule.h,
+    src/xrt/state_trackers/oxr/oxr_session.c,
+  ]
 ---
 
 # Legacy App Support: Adaptive View Sizing and Compositor Tile Processing
@@ -50,14 +55,48 @@ Legacy apps only support switching between:
 
 ### 3. Adaptive view scale for legacy apps
 
-Instead of using `min(all modes)` for `recommended_view_scale`, use a compromise based on the default 3D mode's properties:
+Instead of using `min(all modes)` for `recommended_view_scale`, use a compromise based on the mode the session will actually run in (see the mode floor below):
 
-| Default 3D mode | Communicated scaleXY | Rationale |
+| Session's mode | Communicated scaleXY | Rationale |
 |---|---|---|
-| 2 views, scaleX <= 0.5, scaleY <= 0.5 | **0.5 x 1.0** | Compromise: full height preserves 2D quality, half width is correct for SBS |
-| All other cases (>2 views, or scaleX/Y > 0.5) | **3D mode's actual scaleXY** | Already optimal or close to optimal |
+| 2 views, scaleX <= 0.5, scaleY <= 0.5 | **0.5 x 1.0** (Case A) | Compromise: full height preserves 2D quality, half width is correct for SBS |
+| Anything else | **the mode's actual scaleXY** (Case B) | Already what that mode's grid wants |
 
 For the common case (a hardware DP and sim_display SBS, both 0.5x0.5), this means the legacy app renders at 0.5x1.0 -- each view is half-width but full-height.
+
+### 3a. The mode floor (#1510)
+
+A legacy session submits a **fixed two views**, so a mode with more tiles than that
+(sim_display's Quad: 4 views, 2x2) cannot be filled: the compositor's under-submit
+clamp paints the first two tiles and the per-frame clear leaves the rest flat. Before
+#1510 such a mode reached Case B, sized the app for 0.5x0.5 tiles, and silently cost it
+half the canvas -- the capability-loss shape #1486 rejected.
+
+`oxr_system_fill_in()` therefore picks the mode the legacy session will run in, using
+`oxr_legacy_mode_rule.h`:
+
+1. the active mode, when `view_count <= 2` (every shipping configuration -- the Leia
+   plug-in's modes are all 1- or 2-view, so this is a no-op there);
+2. else the first 3D mode with exactly 2 views;
+3. else the first fillable 3D mode;
+4. else mode 0 (2D) -- mono over the whole canvas.
+
+The compromise scale above is computed from **that** mode, and `xrBeginSession` switches
+the device to it, so the mode, the scale, the compositor tile grid and the DP agree.
+
+The floor is deliberately **not** "widen Case A to `view_count >= 2`". A 0.5x1.0 scale
+only makes sense on a 2x1 grid; the compositor and the DP stay on the mode's own grid
+(`compute_effective_layout()`: *the content recipe is the ACTIVE MODE's -- submissions
+are clamped to it, never the other way round*), so a 2x1 atlas handed to a four-view
+weave de-tiles at the wrong stride. Two clean unpainted quadrants beat a corrupted image.
+
+Two things outrank the floor; in both, Case B and the under-submit clamp stand and
+`xrCreateSession` logs `LEGACY session in an UNFILLABLE rendering mode (#1510)`:
+
+- the device **pins** its mode (`XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED`;
+  `SIM_DISPLAY_FORCE_MODE`) -- the pin exists to hold a mode against every later
+  request, which is what keeps the N-view under-submit path testable;
+- **service mode** -- the panel lease, not this app, owns the display-global mode.
 
 ### 4. Compositor tile processing
 
