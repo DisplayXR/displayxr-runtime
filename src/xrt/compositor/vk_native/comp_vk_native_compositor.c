@@ -456,6 +456,17 @@ struct comp_vk_native_compositor
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
+	/*!
+	 * #1484 — the atlas encoding last DECLARED to `display_processor` via base
+	 * slot 14, as an `int` so `-1` can mean "unknown / never declared". The
+	 * weave sites assert it before every `process_atlas` and the asserter
+	 * no-ops on no change: the declaration is a per-frame contract but the
+	 * value is stable, and these are per-frame paths (same shape as the D3D11
+	 * service's `weave_dp_encoding`). Reset to `-1` wherever the DP pointer
+	 * moves — a fresh DP's state is unknown.
+	 */
+	int dp_atlas_encoding_latched;
+
 	//! A 2D/3D request that arrived BEFORE the display processor existed (it is
 	//! created lazily with the first target, while xrRequestDisplayRenderingModeDXR
 	//! is legal from session begin). Applied right after creation. Without this the
@@ -3861,6 +3872,123 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 	return (struct xrt_rect){0};
 }
 
+/*!
+ * #1484 — `DXR_VK_ATLAS_ENCODING`: diagnostic override for the ADR-021 atlas-
+ * encoding declaration below. Values:
+ *
+ *   `off`     — never call the slot at all, restoring the pre-#1484 behaviour
+ *               exactly (the DP then assumes ENCODED per the slot's own doc).
+ *   `encoded` — declare ENCODED (the default; same as unset).
+ *   `linear`  — declare LINEAR. A/B only: vk_native does not produce a linear
+ *               atlas today, so this is how you make a DP's encode path visible
+ *               (the sim_display VK DP logs what it was handed; the Leia Linux
+ *               DP flips `srWeaverSetShaderSRGBConversion`) without a rebuild.
+ *
+ * Diagnostic-only — it can only make the declaration WRONG, so it must never
+ * become a user-facing setting. Registered in
+ * docs/roadmap/control-panel-performance-settings.md as tier 4.
+ *
+ * Read once into a static, like `dxr_repaint_phase_enabled()` above. Note the
+ * in-process `getenv` caveat (docs/reference/adapter-selection.md): in-process
+ * this reads the APP's environment block, not the service's.
+ *
+ * Returns -2 when unset (no override — the compositor's own answer stands),
+ * -1 for `off`, otherwise the `enum xrt_atlas_encoding` to force.
+ */
+#define DXR_VK_ATLAS_ENCODING_NO_OVERRIDE (-2)
+#define DXR_VK_ATLAS_ENCODING_DISABLED (-1)
+
+static int
+dxr_vk_atlas_encoding_override(void)
+{
+	static int mode = -3; // -3 = not yet read
+	if (mode == -3) {
+		mode = DXR_VK_ATLAS_ENCODING_NO_OVERRIDE;
+		const char *e = getenv("DXR_VK_ATLAS_ENCODING");
+		if (e != NULL && e[0] != '\0') {
+			if (e[0] == 'o' || e[0] == 'O' || e[0] == '0') {
+				mode = DXR_VK_ATLAS_ENCODING_DISABLED;
+			} else if (e[0] == 'l' || e[0] == 'L') {
+				mode = (int)XRT_ATLAS_ENCODING_LINEAR;
+			} else {
+				mode = (int)XRT_ATLAS_ENCODING_ENCODED;
+			}
+			U_LOG_W("#1484 DXR_VK_ATLAS_ENCODING=%s — atlas-encoding declaration is %s", e,
+			        mode == DXR_VK_ATLAS_ENCODING_DISABLED   ? "DISABLED (slot never called)"
+			        : mode == (int)XRT_ATLAS_ENCODING_LINEAR ? "forced LINEAR"
+			                                                 : "forced ENCODED");
+		}
+	}
+	return mode;
+}
+
+/*!
+ * #1484 — the atlas encoding THIS compositor must declare (ADR-021).
+ *
+ * Always ENCODED, and deliberately NOT derived from the swapchain or atlas
+ * format — the same refusal `service_single_client_atlas_encoding()` documents
+ * on the D3D11 service. A format is not a colour space: `*_SRGB` means the
+ * bytes are gamma-encoded, but `*_UNORM` is AMBIGUOUS, holding encoded bytes
+ * for most apps and genuinely linear bytes for a few, and guessing either way
+ * is how you get a washed-out double-encode.
+ *
+ * What makes ENCODED a FACT here rather than a guess is the compositor, not the
+ * app: the vk_native blit passes the app's stored bytes through unchanged
+ * (`comp_vk_native_swapchain.c`) into a `VK_FORMAT_B8G8R8A8_UNORM` atlas
+ * (`comp_vk_native_renderer.c`), and nothing on this path linearizes. So
+ * whatever the app wrote is what the DP receives, and Model-A passthrough is
+ * the honest declaration.
+ *
+ * It exists as a function so that a future linear-composing path changes THIS
+ * function and nothing else — the call sites already declare per frame, which
+ * is the whole point of doing it per frame rather than once at DP create.
+ */
+static inline enum xrt_atlas_encoding
+vk_native_atlas_encoding(const struct comp_vk_native_compositor *c)
+{
+	(void)c;
+	return XRT_ATLAS_ENCODING_ENCODED;
+}
+
+/*!
+ * #1484 — assert @p dp's atlas encoding, the way the D3D11 service's
+ * `svc_client_weave_dp_assert_state()` does. Same contract: every weave site
+ * states what it needs immediately before `process_atlas`, and this no-ops on
+ * no change (the plug-in logs every switch and these are per-frame paths).
+ *
+ * Without this the VK DP is never told anything and — per the slot's own doc —
+ * assumes ENCODED, which the Leia Linux plug-in then overrides with its own
+ * `target_format`-derived guess. Declaring it removes the guess.
+ */
+static void
+vk_dp_assert_atlas_encoding(struct comp_vk_native_compositor *c,
+                            struct xrt_display_processor *dp,
+                            enum xrt_atlas_encoding enc)
+{
+	if (c == NULL || dp == NULL) {
+		return;
+	}
+	const int over = dxr_vk_atlas_encoding_override();
+	if (over == DXR_VK_ATLAS_ENCODING_DISABLED) {
+		return; // kill switch: pre-#1484 behaviour, slot never called
+	}
+	if (over != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
+		enc = (enum xrt_atlas_encoding)over;
+	}
+	if (c->dp_atlas_encoding_latched == (int)enc) {
+		return;
+	}
+	xrt_display_processor_set_atlas_encoding(dp, enc);
+	// One WARN per CHANGE, never per frame (a first declaration counts as a
+	// change, so this fires exactly once on a stable path).
+	U_LOG_W("#1484 VK atlas encoding declared to the DP: %s (was %s)",
+	        enc == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED",
+	        c->dp_atlas_encoding_latched < 0                                 ? "undeclared"
+	        : c->dp_atlas_encoding_latched == (int)XRT_ATLAS_ENCODING_LINEAR ? "LINEAR"
+	                                                                         : "ENCODED");
+	c->dp_atlas_encoding_latched = (int)enc;
+}
+
 
 /*
  * Compose-under backdrop for the base-DP slot-16 seam (#1073), in-process leg.
@@ -4797,6 +4925,11 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// authority vk_bg2d_backdrop() cuts the compose-under backdrop to,
 			// so the two can never disagree (#1101).
 			const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
+
+			// #1484 / ADR-021 — declare the atlas's colour state. Must
+			// precede process_atlas; no-op on no change.
+			vk_dp_assert_atlas_encoding(c, c->display_processor, vk_native_atlas_encoding(c));
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
 			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
@@ -6643,6 +6776,13 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 
 			// Same single canvas authority as the window path (#1101).
 			const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
+
+			// #1484 / ADR-021 — same declaration as the window path. The
+			// shared-texture branch weaves into the app's texture rather
+			// than a swapchain, but the atlas the DP reads came through the
+			// same never-linearizing blit, so the answer is the same.
+			vk_dp_assert_atlas_encoding(c, c->display_processor, vk_native_atlas_encoding(c));
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
 			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
@@ -7623,6 +7763,8 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
 		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
 		c->vk.main_queue->queue = saved_main_queue;
+		// #1484: a fresh DP's colour state is unknown; the weave sites assert it.
+		c->dp_atlas_encoding_latched = -1;
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = NULL;
@@ -7917,6 +8059,9 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 	c->xdev = xdev;
+	// #1484: calloc gives 0, which is a VALID encoding (ENCODED). -1 = never
+	// declared, so the first weave always declares.
+	c->dp_atlas_encoding_latched = -1;
 	c->queue_family_index = queue_family_index;
 	c->repaint_queue = VK_NULL_HANDLE;
 	c->repaint_queue_family = runtime_queue_family;
@@ -8691,6 +8836,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		        "against a different runtime ABI major (ADR-020), or a driver "
 		        "heap-reuse collision.");
 		c->display_processor = NULL;
+		c->dp_atlas_encoding_latched = -1; // #1484
 	}
 
 	// Determine view dimensions

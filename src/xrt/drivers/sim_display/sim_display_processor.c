@@ -82,6 +82,13 @@ struct sim_display_processor
 	uint32_t zone_last_mask_w, zone_last_mask_h;
 	uint64_t zone_last_seq;
 	bool zone_active; //!< A client mask is currently published (not cleared).
+
+	//! #1484 / ADR-021 — the atlas encoding the runtime last declared for the
+	//! next process_atlas (set via base slot 14 `set_atlas_encoding`).
+	//! calloc-zeroed ⟹ XRT_ATLAS_ENCODING_ENCODED (Model A), which is also
+	//! what an undeclaring runtime means, so the default is honest.
+	enum xrt_atlas_encoding atlas_encoding;
+	bool atlas_encoding_declared; //!< Distinguishes "declared ENCODED" from "never declared".
 };
 
 static inline struct sim_display_processor *
@@ -612,6 +619,51 @@ sim_dp_is_alpha_native(struct xrt_display_processor *xdp)
 	return true;
 }
 
+/*
+ * #1484 / ADR-021 — the in-repo, hardware-free proof that the VK compositor's
+ * per-frame atlas-encoding declaration reaches a DP at all.
+ *
+ * Unlike the D3D11 twin this VK DP has NO conversion knob: its pipelines sample
+ * the atlas and write the result through, so it cannot honour a LINEAR atlas by
+ * encoding on output. It therefore records the declaration and logs it rather
+ * than acting on it — which is exactly what makes it a usable test double for
+ * the runtime half, while a real weaver (Leia Linux) consumes the same slot to
+ * drive `srWeaverSetShaderSRGBConversion`.
+ *
+ * Logged on CHANGE only — process_atlas is a per-frame path and the runtime
+ * asserts this before every one of them.
+ */
+static void
+sim_dp_set_atlas_encoding(struct xrt_display_processor *xdp, enum xrt_atlas_encoding atlas_encoding)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	if (sdp->atlas_encoding_declared && sdp->atlas_encoding == atlas_encoding) {
+		return;
+	}
+	U_LOG_W("SIM DP (VK) #1484: runtime declared atlas encoding %s (was %s)",
+	        atlas_encoding == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED",
+	        !sdp->atlas_encoding_declared                      ? "undeclared"
+	        : sdp->atlas_encoding == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR"
+	                                                           : "ENCODED");
+	sdp->atlas_encoding = atlas_encoding;
+	sdp->atlas_encoding_declared = true;
+}
+
+/*
+ * ADR-021 §3 — the handoff encoding this DP actually accepts. ENCODED only: see
+ * set_atlas_encoding above, this DP has no output-encode stage. Filling the
+ * slot is documentation rather than behaviour (NULL already means ENCODED, and
+ * no VK-side caller queries it today — only the D3D11 service does), but an
+ * explicit ENCODED is what stops the next reader assuming the VK twin matches
+ * the D3D11 one, which declares EITHER because it really does encode.
+ */
+static enum xrt_dp_color_capability
+sim_dp_get_handoff_color_capability(struct xrt_display_processor *xdp)
+{
+	(void)xdp;
+	return XRT_DP_COLOR_ENCODED;
+}
+
 // #491 part 3 — store the runtime's flattened 2D-under backdrop for the next
 // process_atlas. sim_display is a test double (no captured desktop), so it
 // records the handoff rather than compositing pixels; the one-shot WARN proves
@@ -751,6 +803,8 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->base.get_display_pixel_info = sim_dp_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_is_alpha_native;
 	sdp->base.set_background_2d = sim_dp_set_background_2d; // #491 part 3
+	sdp->base.get_handoff_color_capability = sim_dp_get_handoff_color_capability; // #1484 / ADR-021
+	sdp->base.set_atlas_encoding = sim_dp_set_atlas_encoding;                     // #1484 / ADR-021
 	sdp->base.get_local_zone_caps = sim_dp_get_local_zone_caps;          // #224 / ADR-027
 	sdp->base.publish_local_zone_mask = sim_dp_publish_local_zone_mask;  // #224 / ADR-027
 	sdp->base.clear_local_zone_mask = sim_dp_clear_local_zone_mask;      // #224 / ADR-027
