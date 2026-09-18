@@ -3012,6 +3012,24 @@ struct oxr_session
 	bool exiting;
 
 	/*!
+	 * #1528: the active rendering mode's view count as latched at this
+	 * frame's xrBeginFrame. 0 = unknown (nothing begun yet, or the mode was
+	 * not readable then).
+	 *
+	 * The app renders the frame it was told about when it BEGAN it. A
+	 * 2D->3D mode switch lands mid-frame — the runtime flips the panel while
+	 * the app is already rendering the single view the 1-view mode called
+	 * for — so judging the submitted viewCount only against the mode live at
+	 * xrEndFrame rejected exactly one in-flight frame per crossing. The
+	 * runtime owns the switch, so it owns the one-frame grace:
+	 * @ref oxr_view_count_ok_for_stereo takes this alongside the live count.
+	 *
+	 * Written only from oxr_session_frame_begin, so it is one frame wide by
+	 * construction — the next xrBeginFrame overwrites it with the new mode.
+	 */
+	uint32_t frame_begin_mode_view_count;
+
+	/*!
 	 * #999: the runtime-owned window was closed by the user (ESC / X / Alt+F4)
 	 * on an in-process native-compositor session, so the runtime owes the app
 	 * a graceful exit. Armed from xrWaitFrame (the only entry point the

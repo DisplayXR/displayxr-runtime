@@ -11,7 +11,8 @@
  *   - PRIMARY_STEREO is TIGHT: for a CORE-ONLY app it is exactly 2, always.
  *
  *     One view is legal only for an app that enabled XR_DXR_display_info AND
- *     only while the active rendering mode is itself 1-view. Both halves are
+ *     only while a 1-view rendering mode is in play — either the mode active
+ *     NOW, or the one the frame was BEGUN under (#1528, below). Both halves are
  *     load-bearing:
  *
  *       * The MODE half is who submits one — the cube_* apps compute
@@ -22,6 +23,19 @@
  *         cannot request one, and is never told the active one changed. Scoping
  *         a relaxation to a fact such an app cannot observe would make
  *         PRIMARY_STEREO's meaning depend on hidden runtime state.
+ *
+ *     #1528, the MODE-EDGE GRACE: the mode half reads the mode latched at
+ *     xrBeginFrame as well as the live one, because a 2D->3D switch lands
+ *     mid-frame. The app begins a frame while the mode is 1-view, renders the
+ *     one view it was told about, and by the time it calls xrEndFrame the
+ *     runtime has flipped the panel to 2-view — so judging only the live mode
+ *     rejected exactly one frame per crossing (measured 4/4 on the win box with
+ *     Unity, and identically with the previous plugin build). The RUNTIME owns
+ *     the switch; making every provider re-render the in-flight frame would push
+ *     a runtime race onto every consumer, so the runtime owns the grace. It is
+ *     one frame wide by construction: the latch is overwritten at the next
+ *     xrBeginFrame, so a steadily-3D app that keeps submitting 1 is still
+ *     refused from its second frame on.
  *
  *     `XrCompositionLayerProjection`
  *     (conformance_test/test_XrCompositionLayerProjection.cpp:225-230) locates
@@ -69,26 +83,42 @@ extern "C" {
 
 /*!
  * The TIGHT rule: XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO accepts exactly two
- * views — and a single view only for an XR_DXR_display_info app whose active
- * rendering mode is itself 1-view, which is the 2D/mono submission path.
+ * views — and a single view only for an XR_DXR_display_info app for which a
+ * 1-view rendering mode is in play, which is the 2D/mono submission path.
+ *
+ * "In play" is EITHER the mode active now OR the mode latched when the app
+ * called xrBeginFrame for this frame (#1528): the app renders the frame it was
+ * told about at begin, and a mode switch that lands in between is the runtime's
+ * doing, not the app's.
  *
  * @param submitted               The layer's viewCount.
  * @param active_mode_view_count  Views in the currently active rendering mode.
  *                                Callers that cannot determine it pass 2, the
  *                                stereo default, which makes the rule "exactly
  *                                two".
+ * @param begun_mode_view_count   Views in the mode that was active at this
+ *                                frame's xrBeginFrame. 0 = not latched (no
+ *                                xrBeginFrame seen, or the mode was unreadable
+ *                                then), which contributes nothing — the rule is
+ *                                then exactly what it was before #1528.
  * @param display_info_enabled    Did the INSTANCE enable XR_DXR_display_info?
  *                                False for every core-only app, including every
  *                                CTS session — for those the answer is exactly
  *                                2 whatever mode the panel is in.
  */
 static inline bool
-oxr_view_count_ok_for_stereo(uint32_t submitted, uint32_t active_mode_view_count, bool display_info_enabled)
+oxr_view_count_ok_for_stereo(uint32_t submitted,
+                             uint32_t active_mode_view_count,
+                             uint32_t begun_mode_view_count,
+                             bool display_info_enabled)
 {
 	if (submitted == 2) {
 		return true;
 	}
-	return submitted == 1 && active_mode_view_count == 1 && display_info_enabled;
+	if (submitted != 1 || !display_info_enabled) {
+		return false;
+	}
+	return active_mode_view_count == 1 || begun_mode_view_count == 1;
 }
 
 /*!

@@ -3856,6 +3856,33 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID, "xrBeginFrame without xrWaitFrame");
 	}
 
+	/*
+	 * #1528: latch the active rendering mode's view count for THIS frame.
+	 *
+	 * The app renders the frame it was told about here, at begin. The runtime
+	 * owns the mode switch, and a 2D->3D switch lands mid-frame — so without
+	 * this latch the one in-flight frame that was begun in a 1-view mode and
+	 * submitted after the flip is rejected by xrEndFrame
+	 * (XR_ERROR_VALIDATION_FAILURE, viewCount == 1 against a now-2-view mode).
+	 * verify_projection_view_count() consults this alongside the live mode, so
+	 * that one frame is granted and the frame after it is not.
+	 *
+	 * Read exactly the way verify_projection_view_count() reads the active
+	 * mode — same head/hmd/count/index guards — except that the "cannot
+	 * determine it" answer here is 0 (contributes nothing) rather than 2: this
+	 * is an additional allowance, never a tightening, so an unreadable mode
+	 * must leave the rule exactly where it was.
+	 */
+	sess->frame_begin_mode_view_count = 0;
+	{
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0 &&
+		    head->hmd->active_rendering_mode_index < head->rendering_mode_count) {
+			sess->frame_begin_mode_view_count =
+			    head->rendering_modes[head->hmd->active_rendering_mode_index].view_count;
+		}
+	}
+
 	if (sess->frame_started) {
 		// max 2 xrWaitFrame can be in flight so a second xrBeginFrame
 		// is only valid if we have a second xrWaitFrame in flight

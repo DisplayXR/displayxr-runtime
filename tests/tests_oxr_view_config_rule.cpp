@@ -10,10 +10,17 @@
  * what is pinned here. Same "make the decision host-testable" shape as
  * tests_oxr_weave_latch.cpp and tests_cli_dims_check.cpp.
  *
+ * #1528 added a third input to the tight rule — the view count of the mode
+ * latched at xrBeginFrame — so that the one in-flight frame a 2D->3D switch
+ * catches mid-render is granted rather than dropped. The decision stays a pure
+ * function, so it stays pinned here.
+ *
  * NOT pinned here (and there is no host-side way to pin it): the WIRING — that
  * verify_projection_view_count picks the permissive rule for
  * PRIMARY_MULTIVIEW_DXR and under DXR_VIEW_CONFIG_LEGACY=1, and the tight one
- * for PRIMARY_STEREO otherwise. That is on the Windows hardware leg.
+ * for PRIMARY_STEREO otherwise, and that oxr_session_frame_begin latches the
+ * active mode's view count into sess->frame_begin_mode_view_count. That is on
+ * the Windows hardware leg.
  */
 
 #include "catch_amalgamated.hpp"
@@ -36,20 +43,105 @@ constexpr uint32_t kStereoOnlyModeCount = 2;
 TEST_CASE("PRIMARY_STEREO is exactly 2, with ONE extension-scoped exception (#1486)", "[oxr][view_config_rule]")
 {
 	// The whole rule as a table, so the single hole is visible rather than
-	// inferred: {submitted} x {active mode view count} x {extension enabled}.
-	// Accepted iff submitted == 2, OR (submitted == 1 && active == 1 && ext).
+	// inferred: {submitted} x {active mode view count} x {mode latched at
+	// xrBeginFrame} x {extension enabled}.
+	//
+	// Accepted iff submitted == 2, OR (submitted == 1 && ext && (active == 1 ||
+	// begun == 1)) — #1528 widened the middle term from "active == 1" to "a
+	// 1-view mode is in play", and nothing else moved.
+	//
+	// Every row where `begun == active` is the STEADY STATE (no mode switch in
+	// flight) and is exactly the pre-#1528 rule, so the whole of the old matrix
+	// is still asserted here; begun == 0 is "never latched", which must also
+	// reproduce the old answer.
 	SECTION("the full matrix")
 	{
 		const uint32_t submitted[] = {1, 2, 3, 4};
 		const uint32_t active[] = {1, 2, 4};
+		const uint32_t begun[] = {0, 1, 2, 4};
 
 		for (uint32_t s : submitted) {
 			for (uint32_t a : active) {
+				for (uint32_t b : begun) {
+					for (bool ext : {false, true}) {
+						const bool expect = (s == 2) || (s == 1 && ext && (a == 1 || b == 1));
+						INFO("submitted = "
+						     << s << ", active mode = " << a << ", begun mode = " << b
+						     << ", XR_DXR_display_info = " << (ext ? "on" : "off"));
+						CHECK(oxr_view_count_ok_for_stereo(s, a, b, ext) == expect);
+					}
+				}
+			}
+		}
+	}
+
+	SECTION("the mode edge: the one in-flight frame a 2D->3D switch catches (#1528)")
+	{
+		// Measured on the win box: every 2D->2-view flip rejected exactly one
+		// frame (4/4 crossings, Unity, and identically with the previous plugin
+		// build as a control). The app began that frame while the mode was
+		// 1-view and submitted it after the runtime had flipped the panel.
+
+		// Begun 1-view, active now 2-view: the in-flight frame. GRANTED.
+		CHECK(oxr_view_count_ok_for_stereo(1, 2, 1, true));
+		CHECK(oxr_view_count_ok_for_stereo(1, 4, 1, true));
+
+		// The very next frame was begun in the 2-view mode, so the grace is
+		// spent: an app that keeps submitting 1 in 3D is still refused. This is
+		// what makes the allowance exactly one frame wide.
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 2, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 4, 4, true));
+
+		// The 3D->2D direction, which never failed and must not start: the mode
+		// is already 1-view at end-frame even though the frame was begun in a
+		// 2-view one.
+		CHECK(oxr_view_count_ok_for_stereo(1, 1, 2, true));
+		CHECK(oxr_view_count_ok_for_stereo(1, 1, 4, true));
+
+		// The extension gate is untouched by all of it — a core-only app
+		// (every CTS session) gets exact-2 at the mode edge too.
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 1, false));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 1, 2, false));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 1, 1, false));
+
+		// Two is accepted across the edge in every combination, as always.
+		for (uint32_t a : {1u, 2u, 4u}) {
+			for (uint32_t b : {0u, 1u, 2u, 4u}) {
 				for (bool ext : {false, true}) {
-					const bool expect = (s == 2) || (s == 1 && a == 1 && ext);
-					INFO("submitted = " << s << ", active mode = " << a
-					                    << ", XR_DXR_display_info = " << (ext ? "on" : "off"));
-					CHECK(oxr_view_count_ok_for_stereo(s, a, ext) == expect);
+					INFO("active = " << a << ", begun = " << b << ", ext = " << ext);
+					CHECK(oxr_view_count_ok_for_stereo(2, a, b, ext));
+				}
+			}
+		}
+
+		// ...and N-view is refused across the edge in every combination: the
+		// grace is about the ONE-view submission only, never a back door into
+		// the counts that need PRIMARY_MULTIVIEW_DXR.
+		for (uint32_t s : {0u, 3u, 4u, 8u}) {
+			for (uint32_t a : {1u, 2u, 4u}) {
+				for (uint32_t b : {0u, 1u, 2u, 4u}) {
+					for (bool ext : {false, true}) {
+						INFO("submitted = " << s << ", active = " << a << ", begun = " << b
+						                    << ", ext = " << ext);
+						CHECK_FALSE(oxr_view_count_ok_for_stereo(s, a, b, ext));
+					}
+				}
+			}
+		}
+	}
+
+	SECTION("an unlatched begin-frame count changes nothing (#1528)")
+	{
+		// 0 = oxr_session_frame_begin could not read the mode (no head device,
+		// no rendering modes, index out of range) or no frame has been begun.
+		// It must contribute NOTHING: this is an additional allowance, never a
+		// tightening, so the answer has to be the pre-#1528 one.
+		for (uint32_t s : {0u, 1u, 2u, 3u, 4u}) {
+			for (uint32_t a : {1u, 2u, 4u}) {
+				for (bool ext : {false, true}) {
+					INFO("submitted = " << s << ", active = " << a << ", ext = " << ext);
+					const bool old_rule = (s == 2) || (s == 1 && a == 1 && ext);
+					CHECK(oxr_view_count_ok_for_stereo(s, a, 0, ext) == old_rule);
 				}
 			}
 		}
@@ -65,14 +157,14 @@ TEST_CASE("PRIMARY_STEREO is exactly 2, with ONE extension-scoped exception (#14
 		//
 		// test_XrCompositionLayerProjection.cpp:225-230 locates the views, does
 		// `Layer.viewCount--` and CHECKs for XR_ERROR_VALIDATION_FAILURE.
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 1, false));
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, false));
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 4, false));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 1, 1, false));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 2, false));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 4, 4, false));
 
 		// ...while the conformant count is always accepted.
-		CHECK(oxr_view_count_ok_for_stereo(2, 1, false));
-		CHECK(oxr_view_count_ok_for_stereo(2, 2, false));
-		CHECK(oxr_view_count_ok_for_stereo(2, 4, false));
+		CHECK(oxr_view_count_ok_for_stereo(2, 1, 1, false));
+		CHECK(oxr_view_count_ok_for_stereo(2, 2, 2, false));
+		CHECK(oxr_view_count_ok_for_stereo(2, 4, 4, false));
 	}
 
 	SECTION("an extension app may submit 1 while the active mode is 1-view")
@@ -80,17 +172,17 @@ TEST_CASE("PRIMARY_STEREO is exactly 2, with ONE extension-scoped exception (#14
 		// Who actually submits one: the cube_* apps compute
 		// `eyeCount = display3D ? modeViewCount : 1`, and displayxr-common
 		// forwards the caller's count. They all enable XR_DXR_display_info.
-		CHECK(oxr_view_count_ok_for_stereo(1, 1, true));
+		CHECK(oxr_view_count_ok_for_stereo(1, 1, 1, true));
 
 		// But only while the mode really is 1-view — the extension is not a
 		// blanket pass.
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, true));
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 4, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 2, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 4, 4, true));
 
 		// An app that keeps submitting the stereo pair in 2D is still fine —
 		// the compositor has always accepted that, and the extension's
 		// backward-compatibility clause promises it.
-		CHECK(oxr_view_count_ok_for_stereo(2, 1, true));
+		CHECK(oxr_view_count_ok_for_stereo(2, 1, 1, true));
 	}
 
 	SECTION("N-view is refused under this type even with the extension on")
@@ -101,11 +193,11 @@ TEST_CASE("PRIMARY_STEREO is exactly 2, with ONE extension-scoped exception (#14
 		// 1-view case above.
 		for (bool ext : {false, true}) {
 			INFO("XR_DXR_display_info = " << (ext ? "on" : "off"));
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 4, ext));
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 2, ext));
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(3, 2, ext));
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(8, 2, ext));
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(0, 2, ext));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 4, 4, ext));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 2, 2, ext));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(3, 2, 2, ext));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(8, 2, 2, ext));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(0, 2, 2, ext));
 		}
 	}
 
@@ -114,8 +206,8 @@ TEST_CASE("PRIMARY_STEREO is exactly 2, with ONE extension-scoped exception (#14
 		// verify_projection_view_count passes 2 when it cannot read the active
 		// mode, which makes the rule "exactly two" — never a loosening, even for
 		// an extension app.
-		CHECK(oxr_view_count_ok_for_stereo(2, 2, true));
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, true));
+		CHECK(oxr_view_count_ok_for_stereo(2, 2, 2, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 2, true));
 	}
 }
 
@@ -157,8 +249,8 @@ TEST_CASE("neither rule can stand in for PRIMARY_MONO (#1486)", "[oxr][view_conf
 	// Note the stereo rule waves 2 through even when the ACTIVE mode is 1-view
 	// and the extension is on, so neither "the active mode is mono" nor
 	// "XR_DXR_display_info is enabled" is a back door into mono's rule.
-	CHECK(oxr_view_count_ok_for_stereo(2, 2, false));
-	CHECK(oxr_view_count_ok_for_stereo(2, 1, true));
+	CHECK(oxr_view_count_ok_for_stereo(2, 2, 2, false));
+	CHECK(oxr_view_count_ok_for_stereo(2, 1, 1, true));
 	CHECK(oxr_view_count_ok_for_multiview(2, kSimDisplayModes, kSimDisplayModeCount));
 	CHECK(oxr_view_count_ok_for_multiview(2, nullptr, 0));
 }
@@ -175,7 +267,7 @@ TEST_CASE("where the two rules differ, stated honestly (#1486)", "[oxr][view_con
 		// rule agree, so no shipped Leia app in 2D is affected by either.
 		for (uint32_t n = 0; n <= 3; n++) {
 			INFO("viewCount = " << n);
-			CHECK(oxr_view_count_ok_for_stereo(n, 1, true) ==
+			CHECK(oxr_view_count_ok_for_stereo(n, 1, 1, true) ==
 			      oxr_view_count_ok_for_multiview(n, kStereoOnlyModes, kStereoOnlyModeCount));
 		}
 	}
@@ -188,24 +280,24 @@ TEST_CASE("where the two rules differ, stated honestly (#1486)", "[oxr][view_con
 		// which is where the conformance run actually sits.
 		for (uint32_t a : {1u, 2u, 4u}) {
 			INFO("active mode = " << a);
-			CHECK_FALSE(oxr_view_count_ok_for_stereo(1, a, false));
+			CHECK_FALSE(oxr_view_count_ok_for_stereo(1, a, a, false));
 		}
 		CHECK(oxr_view_count_ok_for_multiview(1, kStereoOnlyModes, kStereoOnlyModeCount));
 	}
 
 	SECTION("an extension app differs at ONE view only in a >=2-view mode")
 	{
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(1, 2, 2, true));
 		CHECK(oxr_view_count_ok_for_multiview(1, kStereoOnlyModes, kStereoOnlyModeCount));
 
 		// Two is the agreed answer either way.
-		CHECK(oxr_view_count_ok_for_stereo(2, 2, true));
+		CHECK(oxr_view_count_ok_for_stereo(2, 2, 2, true));
 		CHECK(oxr_view_count_ok_for_multiview(2, kStereoOnlyModes, kStereoOnlyModeCount));
 	}
 
 	SECTION("and on a device with a wider mode they differ at that count too")
 	{
-		CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 4, true));
+		CHECK_FALSE(oxr_view_count_ok_for_stereo(4, 4, 4, true));
 		CHECK(oxr_view_count_ok_for_multiview(4, kSimDisplayModes, kSimDisplayModeCount));
 	}
 }

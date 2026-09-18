@@ -78,7 +78,7 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** for a core-only app; an `XR_DXR_display_info` app may also submit 1 while the active mode is 1-view | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **exactly 2** for a core-only app; an `XR_DXR_display_info` app may also submit 1 while a 1-view mode is in play — the mode active now **or** the one latched at this frame's `xrBeginFrame` | 1, 2, or any rendering mode's `viewCount` |
 | Fixed for the instance lifetime? | yes | yes | yes |
 
 > **A core-only app gets exact-2, full stop.** If the instance did not enable
@@ -107,10 +107,31 @@ must handle it needs an explicit `case`.
 > essentially the whole run. The exception was open for the entire conformance
 > pass. The extension gate closes it.
 >
+> **Mode-edge grace: "the active mode" means *when the frame was begun*, too**
+> (#1528). A 2D→3D switch lands in the middle of a frame — the app begins the
+> frame while the mode is 1-view, renders the one view it was told about, and by
+> the time it calls `xrEndFrame` the runtime has already flipped the panel to
+> 2-view. Judging only the live mode therefore rejected **exactly one frame per
+> crossing** (measured on the win box: 4/4 crossings under Unity, and identically
+> with the previous plugin build as a control). So the runtime latches the active
+> mode's view count at `xrBeginFrame`
+> (`oxr_session::frame_begin_mode_view_count`) and accepts `viewCount == 1` if
+> *either* that latched count or the live one is 1.
+>
+> The grace is **one frame wide by construction** — the latch is overwritten at
+> the next `xrBeginFrame`, so an app that keeps submitting 1 while the panel is
+> in a 2-view mode is still refused from its second frame on. And it is
+> deliberately runtime-side: the alternative is that every provider re-renders
+> the in-flight frame with 2 views, which pushes a race the *runtime* owns onto
+> every consumer. The extension gate is untouched — a core-only app gets exact-2
+> at the mode edge as everywhere else.
+>
 > **`PRIMARY_MULTIVIEW_DXR` is the recommended path for any mode-driven count**,
 > including the 1-view case: begin with it and submit the active mode's count
 > without a special case. The relaxation above is back-compatibility for apps
-> already shipping on `PRIMARY_STEREO`.
+> already shipping on `PRIMARY_STEREO`. (The permissive rule never consulted the
+> active mode at all, precisely because of this race — #1528 gives the tight rule
+> the narrow, one-frame version of the same concession.)
 >
 > This is the only place the `xrEndFrame` rule consults the active mode; the
 > *reported* counts above still never move on a mode switch.
