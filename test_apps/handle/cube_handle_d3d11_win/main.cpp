@@ -1038,6 +1038,11 @@ static void RenderOneFrame(RenderState& rs) {
     // Poll OpenXR events
     PollEvents(xr);
 
+    // #1488 reference consumer: re-enumerate on a 1 Hz tick and log when the
+    // recommended view size moves. See ReportViewsChange() for why this is a
+    // poll rather than an event case.
+    ReportViewsChange(xr);
+
     // Only render if session is running
     if (xr.sessionRunning) {
         XrFrameState frameState;
