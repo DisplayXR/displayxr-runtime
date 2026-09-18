@@ -48,7 +48,8 @@ enum class Res
 class OxrVkSwapchain
 {
 public:
-	explicit OxrVkSwapchain(uint32_t image_count) : m_image_count(image_count), m_ready(image_count, true)
+	explicit OxrVkSwapchain(uint32_t image_count, bool is_static = false)
+	    : m_image_count(image_count), m_is_static(is_static), m_ready(image_count, true)
 	{
 		comp_vk_native_swapchain_ring_init(&m_ring, image_count);
 	}
@@ -59,6 +60,11 @@ public:
 	{
 		// oxr_swapchain_common_acquire: bound the outstanding count first.
 		if (m_acquired_num >= m_image_count) {
+			return Res::CallOrderInvalid;
+		}
+
+		// oxr_swapchain.c:192 -- a static swapchain may be acquired once, ever.
+		if (m_is_static && (m_released_yes || !m_ready[0])) {
 			return Res::CallOrderInvalid;
 		}
 
@@ -118,6 +124,7 @@ public:
 
 		m_acquired_num--;
 		m_ready[index] = true;
+		m_released_yes = true;
 		return Res::Success;
 	}
 
@@ -135,6 +142,8 @@ public:
 
 private:
 	uint32_t m_image_count;
+	bool m_is_static = false;
+	bool m_released_yes = false;
 	uint32_t m_acquired_num = 0;
 	int32_t m_inflight = -1;
 	std::vector<bool> m_ready;
@@ -287,6 +296,57 @@ TEST_CASE("vk_native_swapchain_ring: rejects out-of-cycle wait and release")
 	REQUIRE(comp_vk_native_swapchain_ring_wait(&ring, 0) == XRT_ERROR_NO_IMAGE_AVAILABLE);
 	REQUIRE(comp_vk_native_swapchain_ring_release(&ring, 0) == XRT_SUCCESS);
 	REQUIRE(comp_vk_native_swapchain_ring_outstanding(&ring) == 0);
+}
+
+TEST_CASE("vk_native_swapchain_image_count: static swapchains get exactly one image")
+{
+	// The second half of #1504. The compositor hardcoded 3, so
+	// xrEnumerateSwapchainImages promised three images for a
+	// XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT swapchain that the state tracker's
+	// single-acquire rule would only ever hand out one of -- CTS
+	// test_Swapchains.cpp:196, "Non-default create flags", one failure per
+	// format. D3D11 and D3D12 already did this; Vulkan did not.
+	REQUIRE(comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE) == 1);
+
+	// Every other flag combination stays triple buffered.
+	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)0) == 3);
+	REQUIRE(comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT) == 3);
+	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)(
+	            XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT | XRT_SWAPCHAIN_CREATE_STATIC_IMAGE)) == 1);
+
+	// Never past the fixed-size image/memory/view arrays.
+	REQUIRE(comp_vk_native_swapchain_image_count((enum xrt_swapchain_create_flags)0) <=
+	        COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES);
+}
+
+TEST_CASE("vk_native_swapchain_ring: the static swapchain's one image, acquired once")
+{
+	// CTS test_Swapchains.cpp:196 then :229-232 for a static swapchain: the
+	// acquire-all loop runs exactly once, the extra acquire is refused, the one
+	// image waits and releases, and the post-release acquire is refused again
+	// because a static swapchain may be acquired once for its whole lifetime.
+	const uint32_t image_count = comp_vk_native_swapchain_image_count(XRT_SWAPCHAIN_CREATE_STATIC_IMAGE);
+	REQUIRE(image_count == 1);
+
+	OxrVkSwapchain sc(image_count, /* is_static */ true);
+
+	uint32_t index = UINT32_MAX;
+	REQUIRE(sc.acquire(&index) == Res::Success);
+	REQUIRE(index == 0);
+
+	// "An extra acquire once we acquired all should be XR_ERROR_CALL_ORDER_INVALID"
+	uint32_t extra = UINT32_MAX;
+	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
+
+	REQUIRE(sc.wait() == Res::Success);
+	REQUIRE(sc.wait() == Res::CallOrderInvalid);
+	REQUIRE(sc.release() == Res::Success);
+	REQUIRE(sc.outstanding() == 0);
+
+	// ":229 In the case of XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT we must only
+	// allow a single acquire" -- the image is free again, but the swapchain is
+	// spent.
+	REQUIRE(sc.acquire(&extra) == Res::CallOrderInvalid);
 }
 
 TEST_CASE("vk_native_swapchain_ring: the pre-fix rule really did hand out a duplicate")

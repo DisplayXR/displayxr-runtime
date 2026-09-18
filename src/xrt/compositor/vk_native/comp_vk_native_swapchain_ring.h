@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "xrt/xrt_compositor.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -33,6 +34,31 @@ extern "C" {
  * Maximum number of images in a swapchain.
  */
 #define COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES 8
+
+/*!
+ * How many images a swapchain with these creation flags gets.
+ *
+ * Static swapchains (XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) hold exactly one
+ * image and may be acquired only once (OpenXR spec); dynamic swapchains use
+ * triple buffering. Reporting more than one for a static swapchain makes
+ * xrEnumerateSwapchainImages promise images the state tracker's single-acquire
+ * rule then refuses to hand out, which is how the CTS "Non-default create
+ * flags" case failed with XR_ERROR_CALL_ORDER_INVALID (#1504).
+ *
+ * Shared so `comp_vk_native_swapchain_create` and the compositor's
+ * `get_swapchain_create_properties` cannot drift apart.
+ *
+ * @ingroup comp_vk_native
+ */
+static inline uint32_t
+comp_vk_native_swapchain_image_count(enum xrt_swapchain_create_flags create)
+{
+	uint32_t image_count = (create & XRT_SWAPCHAIN_CREATE_STATIC_IMAGE) ? 1u : 3u;
+	if (image_count > COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES) {
+		image_count = COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES;
+	}
+	return image_count;
+}
 
 /*!
  * Where one swapchain image is in the acquire/wait/release cycle.

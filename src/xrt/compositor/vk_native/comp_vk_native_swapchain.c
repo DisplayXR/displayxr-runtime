@@ -204,10 +204,10 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 {
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
 
-	uint32_t image_count = 3; // Triple buffering
-	if (image_count > MAX_SWAPCHAIN_IMAGES) {
-		image_count = MAX_SWAPCHAIN_IMAGES;
-	}
+	// One image for a static swapchain, triple buffering otherwise (#1504).
+	// Same helper the compositor's get_swapchain_create_properties uses, so the
+	// advertised count and the allocated one cannot drift.
+	uint32_t image_count = comp_vk_native_swapchain_image_count(info->create);
 
 	struct comp_vk_native_swapchain *sc = U_TYPED_CALLOC(struct comp_vk_native_swapchain);
 	if (sc == NULL) {
