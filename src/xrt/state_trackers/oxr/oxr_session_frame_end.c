@@ -33,6 +33,7 @@
 #include "oxr_api_verify.h"
 #include "oxr_chain.h"
 #include "oxr_xret.h"
+#include "oxr_view_config_rule.h"
 
 #include <openxr/XR_DXR_win32_window_binding.h>
 
@@ -676,22 +677,31 @@ verify_projection_view_count(struct oxr_session *sess,
                              const XrCompositionLayerProjection *proj,
                              struct xrt_device *head)
 {
+	// The rendering modes' view counts, in the shape the pure rule takes.
+	uint32_t mode_view_counts[XRT_MAX_RENDERING_MODES];
+	uint32_t mode_count = 0;
+	if (head != NULL) {
+		for (uint32_t mi = 0; mi < head->rendering_mode_count && mi < ARRAY_SIZE(mode_view_counts); mi++) {
+			mode_view_counts[mode_count++] = head->rendering_modes[mi].view_count;
+		}
+	}
+
+	// #1486 kill switch: the permissive rule, whatever the type says. This is
+	// what makes DXR_VIEW_CONFIG_LEGACY=1 a COMPLETE rollback of #1486 — the
+	// legacy PRIMARY_STEREO reports the device max, so it must also accept it.
+	if (sess->sys->view_config_legacy) {
+		if (!oxr_view_count_ok_for_multiview(proj->viewCount, mode_view_counts, mode_count)) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
+			                 "rendering mode (DXR_VIEW_CONFIG_LEGACY=1)",
+			                 layer_index, proj->viewCount);
+		}
+		return XR_SUCCESS;
+	}
+
 #ifdef OXR_HAVE_DXR_display_info
 	if (sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) {
-		// The permissive body PRIMARY_STEREO used to have: any rendering
-		// mode's view count, plus 1 and 2. The app may be one frame behind a
-		// mode transition (the race between the mode change and xrEndFrame),
-		// so this cannot be restricted to the currently active mode.
-		bool valid = (proj->viewCount == 1) || (proj->viewCount == 2);
-		if (!valid && head != NULL && head->rendering_mode_count > 0) {
-			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-				if (proj->viewCount == head->rendering_modes[mi].view_count) {
-					valid = true;
-					break;
-				}
-			}
-		}
-		if (!valid) {
+		if (!oxr_view_count_ok_for_multiview(proj->viewCount, mode_view_counts, mode_count)) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
 			                 "rendering mode for XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR",
@@ -717,7 +727,7 @@ verify_projection_view_count(struct oxr_session *sess,
 		 * mode happened to have that count. viewCount == 1 stays legal: apps
 		 * in a 2D rendering mode already submit a single view today.
 		 */
-		if (proj->viewCount != 1 && proj->viewCount != 2) {
+		if (!oxr_view_count_ok_for_stereo(proj->viewCount)) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or 2 for "
 			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO; begin the session with "

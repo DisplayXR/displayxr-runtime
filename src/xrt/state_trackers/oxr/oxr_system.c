@@ -156,7 +156,8 @@ oxr_system_fill_in(
 	 * extension enabled, not only on devices whose max exceeds 2 - so an app
 	 * can select it uniformly and get 2 views where 2 is all there is.
 	 */
-	if (debug_get_bool_option_view_config_legacy()) {
+	sys->view_config_legacy = debug_get_bool_option_view_config_legacy();
+	if (sys->view_config_legacy) {
 		sys->view_config_count = 1;
 		sys->view_config_types[0] = (view_count == 1) ? XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO
 		                                              : XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
