@@ -319,15 +319,17 @@ struct cli_query_result
 	bool input_ht_right_ok;
 
 	/* DP-factory selection divergence probe. Two render paths choose the
-	 * display processor differently: the in-process handle/texture path reads
-	 * the scalar dp_factory (== the active plug-in, `plugin_id` above), while
-	 * the D3D11 service / shell path reads the per-monitor DP registry's
-	 * PRIMARY entry (`comp_dp_factory_for_window` with COMP_DP_PRIMARY_MONITOR
-	 * → entries[0]). On a single display they MUST agree; a mismatch means
-	 * standalone apps and the shell weave with different DPs — e.g. Leia
-	 * in-process but sim_display in the shell, which silently drops shell
-	 * head-tracking. Reproduced headlessly here: the CLI runs in-process, so
-	 * it computes BOTH selections with no service running.
+	 * display processor differently: the in-process D3D11/D3D12/VK/Metal path
+	 * reads the scalar dp_factory (== the active plug-in, `plugin_id` above),
+	 * while the D3D11 service / shell path AND in-process GL read the
+	 * per-monitor DP registry's PRIMARY entry (`comp_dp_factory_for_window`
+	 * with COMP_DP_PRIMARY_MONITOR → entries[0]). On a single display they MUST
+	 * agree — the loader enforces it for any monitor the active plug-in claims
+	 * (#1521) — and a mismatch means standalone apps, GL apps and the shell
+	 * weave with different DPs — e.g. Leia in-process but sim_display in the
+	 * shell, which silently drops shell head-tracking. Reproduced headlessly
+	 * here: the CLI runs in-process, so it computes BOTH selections with no
+	 * service running.
 	 * probed   — the probe ran (registry resolution executed).
 	 * mismatch — in-process plug-in id != service (registry primary) plug-in id. */
 	bool dp_sel_probed;

@@ -127,15 +127,34 @@ comp_dp_factory_for_window(const struct xrt_system_compositor_info *info,
 
 	void *chosen = comp_dp_entry_for_api(chosen_entry, api);
 
-	// Drift detector: on a single display the registry primary equals the
-	// scalar, so this must stay silent. Warn once if they ever diverge.
-	if (chosen != scalar) {
+	// Drift detector. On a single display the registry primary equals the
+	// scalar — the loader forces the ACTIVE plug-in to win any monitor it
+	// claims (#1521) — so this must stay silent. The `warned` latch is per
+	// translation unit (this is a header-only static inline), so at most one
+	// line per compositor TU.
+	if (chosen != NULL && scalar != NULL && chosen != scalar) {
 		static bool warned = false;
 		if (!warned) {
 			warned = true;
-			U_LOG_W("comp_dp_factory: registry factory %p != scalar %p (api=%d, "
-			        "monitor=0x%016llx) — falling back to scalar; investigate registry resolution",
-			        chosen, scalar, (int)api, (unsigned long long)monitor_id);
+			U_LOG_W(
+			    "comp_dp_factory: monitor 0x%016llx api=%d resolved to registry plug-in '%s' "
+			    "(confidence=%u) but the ACTIVE plug-in is '%s' — the registry factory WINS, so "
+			    "this API weaves with '%s' while scalar-routed APIs use '%s'. Pin one with "
+			    "displayxr-cli dp use <id> if unintended (#1521)",
+			    (unsigned long long)monitor_id, (int)api, chosen_entry->plugin_id, chosen_entry->confidence,
+			    info->active_plugin_id, chosen_entry->plugin_id, info->active_plugin_id);
+		}
+	} else if (chosen == NULL && scalar != NULL) {
+		// A real fallback: this monitor's winning plug-in has no factory for
+		// this graphics API, so the active plug-in's scalar carries the weave.
+		static bool warned_fallback = false;
+		if (!warned_fallback) {
+			warned_fallback = true;
+			U_LOG_W(
+			    "comp_dp_factory: monitor 0x%016llx — the registry (plug-in '%s') has no api=%d "
+			    "factory for this monitor — falling back to the active plug-in's scalar factory "
+			    "('%s')",
+			    (unsigned long long)monitor_id, chosen_entry->plugin_id, (int)api, info->active_plugin_id);
 		}
 	}
 
