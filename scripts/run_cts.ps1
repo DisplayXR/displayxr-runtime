@@ -37,8 +37,73 @@
                       match, no m_forbidden matches); a comma starts a SECOND
                       filter and the two are OR'd, which would exclude nothing.
                       Append with "~name", no comma.
-.PARAMETER TimeoutSec Kill + restore after this many seconds (default 1800)
+.PARAMETER TimeoutSec Kill + restore after this many seconds (default 1800).
+                      **0 (or any value <= 0) disables the timeout entirely** —
+                      required for the interactive categories, which are paced by
+                      a human and would otherwise be killed mid-run. -Interactive
+                      defaults this to 0.
 .PARAMETER Tag        Label for output files (default automated_<graphics>_<api>)
+.PARAMETER Interactive
+                      composition | scenario | actions. Selects one of the three
+                      HUMAN-EVALUATED CTS categories. These are hand-run only —
+                      cts.yml never sets this, because every one of them needs an
+                      operator at a Windows box with a display. Setting it:
+                        * defaults -TestSpec to "[<category>][interactive]"
+                        * defaults -TimeoutSec to 0 (no timeout)
+                        * names the outputs the way a conformance submission
+                          package wants them, i.e.
+                            interactive_composition_<graphics>.xml
+                            interactive_scenario_<graphics>.xml
+                            interactive_actions_<graphics>_<profile-slug>.xml
+                          with both logs alongside, on the same stem
+                          (…_console.log, …_stdout.log).
+                      An explicit -TestSpec / -TimeoutSec / -Tag still wins.
+                      NOTE for an operator: conformance_cli's own stdout is
+                      redirected to …_stdout.log and only replayed to the
+                      terminal once the process EXITS, so an interactive run
+                      shows no live console progress. That is fine — the prompts
+                      you act on are rendered composition layers, not stdout —
+                      but do not read the silent terminal as a hang, and tail
+                      the RUNTIME log (%LOCALAPPDATA%\DisplayXR\) rather than
+                      this one when a test needs a log to answer it (e.g. the
+                      haptic-confirmation prompt).
+                      Operator procedure (what to look at, what counts as a pass,
+                      how to package the XML):
+                      docs/reference/cts-interactive-procedure.md
+.PARAMETER InteractionProfile
+                      Interaction profile for conformance_cli's -I argument. The
+                      CTS usage guide wants ONE [actions][interactive] result
+                      file per supported interaction profile, and -I is how you
+                      pick which one a run exercises. Required with
+                      "-Interactive actions" unless you name the output yourself
+                      with -Tag (otherwise the per-profile result files would all
+                      collide on one filename); optional everywhere else.
+                      Which profiles this runtime can bind at all is set by the
+                      qwerty driver's binding_profiles — see the procedure doc.
+
+                      TRAP, and why this parameter normalises its value: the CTS
+                      wants the profile SHORT NAME — "khr/simple_controller" —
+                      *without* the "/interaction_profiles/" prefix
+                      (OpenXR-CTS src/conformance/usage/configuration.adoc). It
+                      compares -I case-insensitively against a shortname built
+                      by stripping exactly that prefix, and it never normalises
+                      the other way, so a full path matches NOTHING, enables NO
+                      profile, and SILENTLY skips every profile-gated [actions]
+                      test instead of erroring. (conformance_cli's own -I help
+                      string is misleading on this point.) Accept either spelling
+                      here and strip the prefix before handing it over.
+.PARAMETER ExtraCliArgs
+                      Extra arguments appended verbatim to the conformance_cli
+                      command line. Needed for "-Interactive actions": qwerty's
+                      controllers cannot be unplugged, so the tests' "Turn off
+                      /user/hand/left" prompts can never be satisfied and the run
+                      needs --nonDisconnectableDevices. That flag MUST be called
+                      out and justified in a conformance submission — which is
+                      exactly why it is an explicit argument and not something
+                      -Interactive turns on behind your back. Do NOT pass
+                      --autoSkipTimeout: it auto-advances interactive tests and
+                      emits a WARN, and an unexplained warning invalidates a
+                      submission.
 #>
 param(
   [string]$Plugin     = "sim-display",
@@ -47,6 +112,10 @@ param(
   [string]$TestSpec   = "exclude:[interactive]",
   [int]   $TimeoutSec = 1800,
   [string]$Tag        = "",
+  [ValidateSet("", "composition", "scenario", "actions")]
+  [string]$Interactive        = "",
+  [string]$InteractionProfile = "",
+  [string[]]$ExtraCliArgs     = @(),
   # Enable the CTS's required XR_APILAYER_KHRONOS_runtime_conformance layer for a
   # submission-valid run. Registered in HKLM (the elevated loader ignores
   # XR_API_LAYER_PATH) and requested via -L; snapshot/restored like the rest.
@@ -59,16 +128,45 @@ $base = "$wt\build-cts\build\src\conformance\conformance_cli"
 $exe  = "$base\RelWithDebInfo\conformance_cli.exe"
 $devManifest = "$wt\build\Release\openxr_displayxr-dev.json"
 
+# Normalise the interaction profile to the CTS's SHORT form. A full path silently
+# enables nothing (see the .PARAMETER note), so accept either and strip.
+if ($InteractionProfile) {
+  $InteractionProfile = $InteractionProfile -replace '^/?interaction_profiles?/', ''
+}
+
+# ---- interactive categories (hand-run; cts.yml never sets -Interactive) ----
+# Defaults only: anything the caller passed explicitly is left alone.
+if ($Interactive) {
+  if (-not $PSBoundParameters.ContainsKey('TestSpec'))   { $TestSpec   = "[$Interactive][interactive]" }
+  if (-not $PSBoundParameters.ContainsKey('TimeoutSec')) { $TimeoutSec = 0 }
+  if (-not $Tag) {
+    $Tag = "interactive_${Interactive}_${Graphics}"
+    if ($Interactive -eq "actions") {
+      # One result file per interaction profile (CTS usage guide). Without the
+      # profile in the name every profile's run would overwrite the last one.
+      if (-not $InteractionProfile) {
+        throw "-Interactive actions requires -InteractionProfile (the submission wants one result file per interaction profile)"
+      }
+      $Tag += "_" + (($InteractionProfile -replace '[^A-Za-z0-9]+', '_').Trim('_'))
+    }
+  }
+}
+
 if (-not $Tag) { $Tag = "${Graphics}_${ApiVersion}" }
 $tmp     = $env:TEMP
-$xml     = "$tmp\cts_${Tag}.xml"
-$console = "$tmp\cts_${Tag}_console.log"
+# Interactive runs are named for the submission package (interactive_<cat>_<gfx>…);
+# automated runs keep the historical cts_<tag> stem. All three outputs share the
+# stem so a run's XML, reporter log and stdout log always sort together.
+$stem    = "cts_$Tag"
+if ($Interactive) { $stem = $Tag }
+$xml     = "$tmp\$stem.xml"
+$console = "$tmp\${stem}_console.log"
 # conformance_cli prints its frame-timing block (Average xrWaitFrame wait time,
 # Overhead score, ...) on its own STDOUT, not through the Catch2 console
 # reporter — so those numbers were never in $console and anything scraping
 # $console for them found nothing. Capture stdout separately; $console keeps
 # the reporter output untouched.
-$stdoutLog = "$tmp\cts_${Tag}_stdout.log"
+$stdoutLog = "$tmp\${stem}_stdout.log"
 
 foreach ($p in @($exe,$devManifest)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
 
@@ -169,7 +267,13 @@ try {
     "--reporter", "ctsxml::out=$xml",
     "--reporter", "console::out=$console"
   )
-  if ($ConformanceLayer) { $cliArgs += @("-L", "XR_APILAYER_KHRONOS_runtime_conformance") }
+  if ($ConformanceLayer)    { $cliArgs += @("-L", "XR_APILAYER_KHRONOS_runtime_conformance") }
+  # Always pass -I explicitly, never rely on the CTS's "khr/simple_controller"
+  # default: the default is injected into globalData AFTER Options is snapshotted,
+  # so the ctsxml <cts:enabledInteractionProfiles> element comes out EMPTY and the
+  # result file does not record which profile was tested.
+  if ($InteractionProfile)  { $cliArgs += @("-I", $InteractionProfile) }
+  if ($ExtraCliArgs.Count)  { $cliArgs += $ExtraCliArgs }
   Write-Output "RUN: conformance_cli $($cliArgs -join ' ')"
   Write-Output "CWD: $base"
 
@@ -179,7 +283,19 @@ try {
   # session-creating test errors with XR_ERROR_RUNTIME_FAILURE (#830).
   $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory (Split-Path $exe) -PassThru -NoNewWindow -RedirectStandardOutput $stdoutLog
   $null = $proc.Handle   # cache the handle NOW or .ExitCode reads back empty after exit (PS quirk)
-  if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+  if ($TimeoutSec -le 0) {
+    # No timeout. The interactive categories are paced by a human pressing Select
+    # per test; the 1800 s default would kill the run partway and leave a
+    # truncated XML that still LOOKS like a result file.
+    #
+    # Ctrl+C here is not a clean exit: PowerShell may tear the pipeline down
+    # without running the finally block below, leaving ActiveRuntime pointed at
+    # the dev build. If you abort, verify with `displayxr-cli runtime status`
+    # and re-point with `displayxr-cli runtime activate <manifest>`.
+    Write-Output "NO TIMEOUT (interactive) - waiting for conformance_cli to exit."
+    $proc.WaitForExit()
+    Write-Output "EXITCODE: $($proc.ExitCode)"
+  } elseif (-not $proc.WaitForExit($TimeoutSec * 1000)) {
     Write-Output "TIMEOUT after ${TimeoutSec}s - killing."
     try { $proc.Kill() } catch {}
     $proc.WaitForExit(10000) | Out-Null
