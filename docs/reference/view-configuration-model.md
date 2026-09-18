@@ -78,8 +78,22 @@ must handle it needs an explicit `case`.
 | `xrEnumerateViewConfigurationViews` count | 1 | **2** | device **max across modes** (4 on sim-display, 2 on Leia) |
 | `xrLocateViews` `*viewCountOutput` | 1 | **2** | same max |
 | `xrLocateViews` capacity required | 1 | 2 | max (size to `XRT_MAX_VIEWS` = 8) |
-| `xrEndFrame` projection `viewCount` accepted | 1 | 1 or 2 | 1, 2, or any rendering mode's `viewCount` |
+| `xrEndFrame` projection `viewCount` accepted | 1 | **2** (1 only in a 1-view mode) | 1, 2, or any rendering mode's `viewCount` |
 | Fixed for the instance lifetime? | yes | yes | yes |
+
+> **The one-view exception is scoped to 1-view modes, and that is a CTS
+> requirement, not a preference.** `PRIMARY_STEREO` accepts `viewCount == 1` only
+> when the **active rendering mode** is itself 1-view — the 2D/mono submission
+> path the extension has always allowed (`cube_*` apps compute
+> `eyeCount = display3D ? modeViewCount : 1`; `displayxr-common` forwards the
+> caller's count). In a 2-view mode a short submission is
+> `XR_ERROR_VALIDATION_FAILURE`, because the CTS
+> `XrCompositionLayerProjection` test decrements the located count
+> (`test_XrCompositionLayerProjection.cpp:225-230`: `Layer.viewCount--`, then
+> `CHECK(XR_ERROR_VALIDATION_FAILURE == endFrame(...))`) and the CTS runs in a
+> 2-view mode. An unconditional "1 or 2" turned that required rejection into a
+> success. This is the only place the `xrEndFrame` rule consults the active mode;
+> the *reported* counts above still never move on a mode switch.
 
 Three properties hold under all three types:
 
