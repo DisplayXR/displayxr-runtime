@@ -31,6 +31,7 @@ set(tests
     tests_cli_dims_check
     tests_comp_vblank_grid
     tests_comp_zone_tier1
+    tests_comp_swapchain_ring
     tests_aux_bg_neutrality
     tests_aux_rear_budget
     tests_aux_route_policy
@@ -72,9 +73,7 @@ if(WIN32 AND (XRT_HAVE_D3D11 OR XRT_HAVE_D3D12))
 	list(APPEND tests tests_comp_masked_composite_shaders)
 endif()
 if(XRT_HAVE_VULKAN)
-	# #1504 -- the Vulkan native swapchain's acquire/wait/release ring. Pure
-	# index bookkeeping (header-only), so no VkDevice and no installed ICD.
-	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent tests_comp_vk_native_swapchain_ring)
+	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
 endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
@@ -295,15 +294,14 @@ target_include_directories(tests_comp_vblank_grid PRIVATE ${CMAKE_SOURCE_DIR}/sr
 # nothing else.
 target_include_directories(tests_comp_zone_tier1 PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/compositor)
 
-# #1504 -- the Vulkan native swapchain's acquire/wait/release ring. Same shape
-# as the two above: a header of pure index bookkeeping, so the CTS acquire
-# sequence is reproducible with no VkDevice and no window.
-if(TARGET tests_comp_vk_native_swapchain_ring)
-	target_include_directories(
-		tests_comp_vk_native_swapchain_ring PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
-		)
-	target_link_libraries(tests_comp_vk_native_swapchain_ring PRIVATE xrt-interfaces)
-endif()
+# #1504 / #1513 -- the acquire/wait/release ring the vk_native, OpenGL and Metal
+# swapchains all share. Same shape as the two above: a header of pure index
+# bookkeeping, so the CTS acquire sequence is reproducible with no graphics
+# device and no window. Unconditional now that three backends depend on it.
+target_include_directories(
+	tests_comp_swapchain_ring PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	)
+target_link_libraries(tests_comp_swapchain_ring PRIVATE xrt-interfaces)
 
 # #1401 -- the OEM container-scaled tell. The C copy is a header of pure integer
 # arithmetic (deliberately NOT gated on XRT_OS_ANDROID, so it is testable here);

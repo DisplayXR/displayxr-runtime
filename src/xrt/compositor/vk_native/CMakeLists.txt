@@ -30,7 +30,6 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_split.h
 		comp_vk_native_swapchain.c
 		comp_vk_native_swapchain.h
-		comp_vk_native_swapchain_ring.h
 		comp_vk_native_target.cpp
 		comp_vk_native_target.h
 		)

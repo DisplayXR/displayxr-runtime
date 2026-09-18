@@ -8,8 +8,9 @@
  */
 
 #include "comp_vk_native_swapchain.h"
-#include "comp_vk_native_swapchain_ring.h"
 #include "comp_vk_native_compositor.h"
+
+#include "util/comp_swapchain_ring.h"
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -23,7 +24,7 @@
 /*!
  * Maximum number of images in a swapchain.
  */
-#define MAX_SWAPCHAIN_IMAGES COMP_VK_NATIVE_MAX_SWAPCHAIN_IMAGES
+#define MAX_SWAPCHAIN_IMAGES COMP_SWAPCHAIN_MAX_IMAGES
 
 /*!
  * Vulkan swapchain structure.
@@ -55,8 +56,8 @@ struct comp_vk_native_swapchain
 	//! Creation info.
 	struct xrt_swapchain_create_info info;
 
-	//! Per-image acquire/wait/release state. See comp_vk_native_swapchain_ring.h.
-	struct comp_vk_native_swapchain_ring ring;
+	//! Per-image acquire/wait/release state. See util/comp_swapchain_ring.h.
+	struct comp_swapchain_ring ring;
 };
 
 static inline struct comp_vk_native_swapchain *
@@ -117,7 +118,7 @@ vk_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 	// Vulkan state-tracker path waits inside xrAcquireSwapchainImage, so the
 	// ring must be able to hand out every image before any is released (#1504).
 	uint32_t index = 0;
-	xrt_result_t xret = comp_vk_native_swapchain_ring_acquire(&sc->ring, &index);
+	xrt_result_t xret = comp_swapchain_ring_acquire(&sc->ring, &index);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("No free swapchain image: all %u are already acquired", sc->image_count);
 		return xret;
@@ -138,7 +139,7 @@ vk_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t 
 	// (the compositor reads them at layer_commit, after release). The state
 	// tracker enforces the FIFO acquire->wait->release order, so this only has
 	// to move the named image on and reject an index that is not acquired.
-	xrt_result_t xret = comp_vk_native_swapchain_ring_wait(&sc->ring, index);
+	xrt_result_t xret = comp_swapchain_ring_wait(&sc->ring, index);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Wait on non-acquired swapchain image index %u (image_count=%u)", index, sc->image_count);
 		return xret;
@@ -161,7 +162,7 @@ vk_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 
-	xrt_result_t xret = comp_vk_native_swapchain_ring_release(&sc->ring, index);
+	xrt_result_t xret = comp_swapchain_ring_release(&sc->ring, index);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Release of non-waited swapchain image index %u (image_count=%u)", index, sc->image_count);
 		return xret;
@@ -207,7 +208,7 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	// One image for a static swapchain, triple buffering otherwise (#1504).
 	// Same helper the compositor's get_swapchain_create_properties uses, so the
 	// advertised count and the allocated one cannot drift.
-	uint32_t image_count = comp_vk_native_swapchain_image_count(info->create);
+	uint32_t image_count = comp_swapchain_image_count(info->create, 3);
 
 	struct comp_vk_native_swapchain *sc = U_TYPED_CALLOC(struct comp_vk_native_swapchain);
 	if (sc == NULL) {
@@ -217,7 +218,7 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	sc->vk = vk;
 	sc->info = *info;
 	sc->image_count = image_count;
-	comp_vk_native_swapchain_ring_init(&sc->ring, image_count);
+	comp_swapchain_ring_init(&sc->ring, image_count);
 
 	VkFormat vk_format = xrt_format_to_vk(info->format);
 	bool depth = is_depth_format(vk_format);
