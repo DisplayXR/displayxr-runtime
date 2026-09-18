@@ -2097,6 +2097,18 @@ struct oxr_system
 	XrViewConfigurationType view_config_types[2]; //!< Advertised types.
 	uint32_t view_config_view_counts[2];          //!< Views reported per type.
 
+	/*!
+	 * #1486: DXR_VIEW_CONFIG_LEGACY=1, latched at @ref oxr_system_fill_in.
+	 *
+	 * The switch is read once per process (DEBUG_GET_ONCE_BOOL_OPTION), so it
+	 * is recorded here rather than re-read: the view-configuration list is not
+	 * the only thing it rolls back. xrEndFrame's projection-layer viewCount
+	 * rule has to roll back with it, or the runtime would advertise a
+	 * PRIMARY_STEREO reporting 4 views and then refuse the 4-view layer the
+	 * app dutifully built.
+	 */
+	bool view_config_legacy;
+
 	uint32_t view_count; //!< Number of views (1=mono, 2=stereo, 4=quad, etc.)
 	XrViewConfigurationView views[XRT_MAX_VIEWS];
 
