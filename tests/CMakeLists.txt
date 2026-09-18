@@ -39,6 +39,7 @@ set(tests
     tests_aux_zone_canvas
     tests_comp_rear_budget
     tests_oxr_weave_latch
+    tests_oxr_view_config_rule
     tests_input_arbiter_rig
     tests_sim_input_nav
 	)
@@ -194,6 +195,20 @@ if(TARGET tests_oxr_view_space)
 	if(NOT WIN32)
 		target_link_libraries(tests_oxr_view_space PRIVATE ${CMAKE_DL_LIBS})
 	endif()
+
+	# #1486 -- the DXR_VIEW_CONFIG_LEGACY kill switch, in a SECOND ctest running
+	# the SAME binary. It has to be its own process: the runtime reads the
+	# variable through DEBUG_GET_ONCE_BOOL_OPTION, which caches the first read
+	# for the life of the process, so one process cannot host both the new and
+	# the legacy view-configuration mapping. The tag filter keeps this run to the
+	# legacy case, and the case itself SKIPs unless the variable is set (so the
+	# plain registration above, which runs every case, never executes it).
+	add_test(NAME tests_oxr_view_space_legacy
+		 COMMAND tests_oxr_view_space "[view_config_legacy]" --success --allow-running-no-tests
+		)
+	set_tests_properties(
+		tests_oxr_view_space_legacy PROPERTIES ENVIRONMENT "DXR_VIEW_CONFIG_LEGACY=1"
+		)
 endif()
 
 # #1380 — the sim_input scripted NAVIGATION device: the hardware-free reference
@@ -235,6 +250,15 @@ target_link_libraries(tests_input_arbiter_rig PRIVATE xrt-interfaces aux_os)
 # else.
 target_include_directories(
 	tests_oxr_weave_latch PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# #1486 — the two xrEndFrame projection-layer viewCount rules (tight
+# PRIMARY_STEREO vs the permissive body PRIMARY_MULTIVIEW_DXR and the
+# DXR_VIEW_CONFIG_LEGACY rollback share). Pure integer decisions in a header, for
+# the same reason as the weave latch above: the entry point needs a submitted
+# frame, so only the rule is host-drivable.
+target_include_directories(
+	tests_oxr_view_config_rule PRIVATE ${CMAKE_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # #1201 — the self-test rule that makes `display_dims` prove its number instead
