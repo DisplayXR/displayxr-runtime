@@ -1638,12 +1638,12 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	// clamp the atlas to the mode grid. No-op in-process / bridge-relay.
 	oxr_session_push_rendering_mode_ipc(sess, effectiveModeIndex);
 
-	// 4. Update recommended view scales
-	struct xrt_system_compositor *xsysc = sess->sys->xsysc;
-	if (xsysc != NULL) {
-		xsysc->info.recommended_view_scale_x = mode->view_scale_x;
-		xsysc->info.recommended_view_scale_y = mode->view_scale_y;
-	}
+	// 4. Nothing to cache. The per-view scale of the mode now active is derived
+	//    on demand from the mode table via xrt_device_get_active_mode_view_scale()
+	//    (head->rendering_modes[active_rendering_mode_index]), which step 2 above
+	//    has already pointed at the effective mode. The scalar
+	//    xsysc->info.recommended_view_scale_* stays the immutable display-level
+	//    baseline it was initialised to.
 
 	// 5. Push rendering mode changed event only on an ACTUAL change. A pinned
 	//    device that refused leaves effective == previous → no event, correctly
