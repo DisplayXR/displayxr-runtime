@@ -945,6 +945,39 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 				}
 			}
 			uint32_t default_mode = head->hmd->active_rendering_mode_index;
+
+			/*
+			 * #1510 legacy mode floor. A legacy session submits a fixed
+			 * two views; a mode with more tiles than that leaves the rest
+			 * at the clear colour. oxr_system_fill_in() already sized the
+			 * app for the floored mode, so this is where the display
+			 * actually moves there — do it BEFORE the set_property below,
+			 * so the hardware state, the device index and the compromise
+			 * scale come up as one coherent set. The decision (including
+			 * "not allowed to move": pinned device, service mode) was made
+			 * at xrGetSystem; this never re-decides it.
+			 */
+			if (sess->sys->legacy_rendering_mode_forced &&
+			    sess->sys->legacy_rendering_mode_index < head->rendering_mode_count &&
+			    default_mode < head->rendering_mode_count &&
+			    sess->sys->legacy_rendering_mode_index != default_mode) {
+				const uint32_t floored = sess->sys->legacy_rendering_mode_index;
+				U_LOG_W(
+				    "oxr: LEGACY mode floor (#1510) - rendering mode %u ('%s', %u views) "
+				    "cannot be filled by a 2-view legacy submission; switching to "
+				    "mode %u ('%s', %u views)",
+				    default_mode, head->rendering_modes[default_mode].mode_name,
+				    head->rendering_modes[default_mode].view_count, floored,
+				    head->rendering_modes[floored].mode_name,
+				    head->rendering_modes[floored].view_count);
+				default_mode = floored;
+				// The device's set_property below normally owns this write;
+				// do it here too so a driver that only tracks the mode
+				// internally still reports the floored index to the
+				// compositor (which derives its tile grid from it).
+				head->hmd->active_rendering_mode_index = floored;
+			}
+
 			sess->last_rendering_mode_index = default_mode;
 			if (default_mode < head->rendering_mode_count) {
 				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
@@ -4535,6 +4568,31 @@ oxr_session_create(struct oxr_logger *log,
 		        "compromise view scale %.2fx%.2f (%ux%u per view) is in effect",
 		        sys->xsysc->info.legacy_view_scale_x, sys->xsysc->info.legacy_view_scale_y,
 		        sys->xsysc->info.legacy_view_width_pixels, sys->xsysc->info.legacy_view_height_pixels);
+
+		/*
+		 * #1510: the one case the mode floor cannot fix. The app will submit
+		 * two views into a wider grid and the compositor's under-submit clamp
+		 * will paint the first two tiles, leaving the rest at the clear colour.
+		 * That is the documented behaviour when a dev pin or the panel lease
+		 * outranks the runtime — but it must never be SILENT, which was the
+		 * whole complaint in the issue.
+		 */
+		if (sys->legacy_mode_unfillable) {
+			struct xrt_device *lhead = GET_XDEV_BY_ROLE(sys, head);
+			uint32_t idx = sys->legacy_rendering_mode_index;
+			const char *name = "?";
+			uint32_t views = 0;
+			if (lhead != NULL && idx < lhead->rendering_mode_count) {
+				name = lhead->rendering_modes[idx].mode_name;
+				views = lhead->rendering_modes[idx].view_count;
+			}
+			U_LOG_W(
+			    "LEGACY session in an UNFILLABLE rendering mode (#1510): mode %u ('%s') has "
+			    "%u views, this session can submit 2 - the remaining tiles stay at the clear "
+			    "colour. The mode floor could not move the display (device pins its mode, or "
+			    "the panel lease owns it in service mode)",
+			    idx, name, views);
+		}
 	}
 #endif
 

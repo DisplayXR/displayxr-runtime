@@ -9,7 +9,8 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
 | **Detection** | Enables `XR_DXR_display_info` | Does not enable `XR_DXR_display_info` |
 | **Rendering modes** | Enumerates all modes, handles `XrEventDataRenderingModeChangedDXR` | Unaware of modes, always renders stereo |
 | **Swapchain sizing** | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | `recommendedImageRectWidth * 2` (compromise scale) |
-| **Mode switching** | All modes: V toggle + 1/2/3 direct selection | Only V toggle between mode 0 (2D) and mode 1 (default 3D) |
+| **Mode switching** | All modes: V toggle + 1/2/3 direct selection | Only V toggle between mode 0 (2D) and the default 3D mode |
+| **Modes it may run in** | Any mode the device offers | Only modes it can fill (`view_count ≤ 2`) — the mode floor, below |
 
 ## Which Apps Are Which?
 
@@ -25,6 +26,23 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
 Legacy apps don't know about rendering modes, so the runtime provides a **compromise scale** that works acceptably across modes. For SBS displays this is `0.5 × 1.0` (half-width, full-height).
 
 The compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
+
+### A legacy app in a mode with more than two views — the mode floor (#1510)
+
+A legacy session submits a **fixed two views** (post-#1486 `PRIMARY_STEREO` reports exactly 2). A rendering mode whose `view_count` exceeds that has more tiles than the app can paint: the compositor's under-submit clamp paints the first two and the per-frame clear leaves the rest flat. Measured on sim-display's Quad mode (4 views, 2×2), a legacy app lost the bottom half of the canvas — to a mode it has no way to see, which is the capability loss #1486 rejected.
+
+The runtime therefore applies a **mode floor**: *a legacy session does not run in a mode it cannot fill.* At `xrGetSystem` the runtime picks the mode the session will run in — the active one when it is fillable (`view_count ≤ 2`, which is every shipping configuration, since the Leia plug-in's modes are all 1- or 2-view), otherwise the first two-view 3D mode, else any fillable 3D mode, else mode 0 (2D). The compromise scale is computed from **that** mode, and `xrBeginSession` switches the display to it — so the mode, the scale, the compositor's tile grid and the display processor come up as one coherent set. The rule is `src/xrt/state_trackers/oxr/oxr_legacy_mode_rule.h`.
+
+The floor is **not** a wider Case A. Giving the app `0.5 × 1.0` and laying its two views out 2×1 inside a 2×2 mode would break the contract every backend's `compute_effective_layout()` states — *the content recipe is the active mode's; submissions are clamped to it, never the other way round* — and the display processor receives that same grid, so a 2×1 atlas handed to a four-view weave de-tiles at the wrong stride. Two clean unpainted quadrants are strictly better than a corrupted image.
+
+Two things outrank the floor, and in both the app keeps Case B and the under-submit clamp:
+
+| Override | Why | What the log says |
+|---|---|---|
+| The device **pins** its mode (`XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED`; sim-display's `SIM_DISPLAY_FORCE_MODE`) | The pin exists to hold a mode against every later request — that is what keeps the N-view under-submit path testable | `LEGACY session in an UNFILLABLE rendering mode (#1510)` at `xrCreateSession` |
+| **Service mode** | The panel lease, not this app, owns the display-global mode; a legacy client must not yank it from a workspace controller or another client | same |
+
+When the floor *does* move the display, `xrBeginSession` logs `oxr: LEGACY mode floor (#1510) - rendering mode N (...) cannot be filled ... switching to mode M`.
 
 See [ADR-006](../adr/ADR-006-legacy-app-compromise-view-scale.md) for the design rationale and [Legacy App Support](../specs/runtime/legacy-app-support.md) for the full algorithm (Case A/B).
 
