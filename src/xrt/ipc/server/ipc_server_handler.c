@@ -3184,7 +3184,20 @@ _update_projection_layer(struct xrt_compositor *xc,
 		return false;
 	}
 
-	uint32_t view_count = xdev->hmd->view_count;
+	// Cast away volatile.
+	struct xrt_layer_data *data = (struct xrt_layer_data *)&layer->data;
+
+	// #1486: the LAYER's own view count (the app's submitted views), like the
+	// projection-depth and zone-3D variants do. The device's view count is the
+	// max across rendering modes, so looking up that many swapchain ids reads
+	// ids the client never wrote whenever the app submits fewer views than the
+	// device can drive - and a session on PRIMARY_STEREO submits exactly 2 on a
+	// 4-view device.
+	uint32_t view_count = data->view_count;
+	if (view_count > XRT_MAX_VIEWS) {
+		U_LOG_E("Invalid view count %u for projection layer!", view_count);
+		return false;
+	}
 
 	struct xrt_swapchain *xcs[XRT_MAX_VIEWS];
 	for (uint32_t k = 0; k < view_count; k++) {
@@ -3195,10 +3208,6 @@ _update_projection_layer(struct xrt_compositor *xc,
 			return false;
 		}
 	}
-
-
-	// Cast away volatile.
-	struct xrt_layer_data *data = (struct xrt_layer_data *)&layer->data;
 
 	xrt_comp_layer_projection(xc, xdev, xcs, data);
 
