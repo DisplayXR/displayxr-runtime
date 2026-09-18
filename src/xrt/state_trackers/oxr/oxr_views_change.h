@@ -20,6 +20,7 @@
 #pragma once
 
 #include "xrt/xrt_limits.h"
+#include "xrt/xrt_display_metrics.h"
 
 #include "os/os_threading.h"
 
@@ -31,6 +32,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct xrt_rendering_mode;
 
 /*!
  * The spec's rate limit: "The runtime must: not use this event for frequent
@@ -181,6 +184,65 @@ oxr_views_change_update(struct oxr_views_change *vc,
  *         @p count entries - the count of the REQUESTED view configuration type,
  *         never a baked-in sys->view_count.
  */
+/*!
+ * Derive the per-view render size an IPC/shell-hosted session should publish,
+ * from the window rect the service reported plus the active rendering mode.
+ *
+ * #1488 PR B. This is the IPC leg's stand-in for
+ * comp_*_compositor_get_recommended_view_size(), and it is deliberately the
+ * SAME arithmetic those getters end up performing: every native compositor
+ * returns its renderer's view dims, which layer_commit recomputes each frame as
+ * u_tiling_compute_canvas_view(mode, canvas-or-window px) - see
+ * comp_d3d11_compositor.cpp's layer_commit and
+ * comp_d3d11_compositor_get_recommended_view_size(). A `_handle` app and an
+ * `_ipc` app at the same window size therefore publish the same number.
+ *
+ * It lives in THIS translation unit, not in oxr_session.c, for exactly the
+ * reason the file header gives: this TU is compiled straight into
+ * tests/tests_oxr_view_config_views_change.cpp, so the derivation is unit
+ * testable with no session, no compositor and no IPC.
+ *
+ * NOT applied here, on purpose:
+ *
+ * - OXR_VIEWPORT_SCALE_PERCENTAGE (oxr_system.c's `scale`, DEFAULT 100). The
+ *   frozen snapshot multiplies by it; the native getters never do. Matching the
+ *   native getters is what keeps the two paths comparable, and at the default
+ *   the distinction does not exist. A box that sets it to something else
+ *   already sees the same native-vs-frozen skew today, on every backend - that
+ *   is a pre-existing property of the compositor getters, not something the IPC
+ *   leg should invent a second answer for.
+ * - The maxImageRect* ceiling. oxr_views_change_update() clamps per view and
+ *   edge-detects on the CLAMPED value, so doing it twice would be redundant and
+ *   could disagree.
+ *
+ * @param mode The session's ACTIVE rendering mode. Over IPC the client proxy
+ *        mirrors the whole table (ipc_client_hmd.c), and the active index is
+ *        refreshed both by update_inputs and by the
+ *        XRT_SESSION_EVENT_RENDERING_MODE_CHANGE handler in oxr_session.c - so
+ *        even a submit-only session that runs no xrWaitFrame has it current.
+ * @param wm Window metrics from oxr_session_get_window_metrics(). Under the
+ *        shell these are the service-side virtual TILE rect, not the client's
+ *        own HWND, which is exactly the canvas the shell composites.
+ * @param legacy_app_tile_scaling xrt_system_compositor_info::legacy_app_tile_scaling.
+ *        A legacy app is pinned to the compromise scale and the native
+ *        compositors skip the per-frame view-dim recompute entirely for it; the
+ *        IPC leg has no such compositor-side guard, so it must refuse here or
+ *        #1488's R4 ("a legacy app can never observe a changed enumerate
+ *        result") would stop holding on this path alone.
+ *
+ * @return false - leaving @p out_w / @p out_h untouched - when there is no
+ *         usable answer. In particular the Linux service build's
+ *         ipc_handle_compositor_get_window_metrics() has no per-client window
+ *         source at all and always reports valid=false, so this returns false
+ *         there and the whole IPC leg is a no-op on Linux.
+ */
+bool
+oxr_views_change_size_from_window(const struct xrt_rendering_mode *mode,
+                                  const struct xrt_window_metrics *wm,
+                                  bool legacy_app_tile_scaling,
+                                  uint32_t *out_w,
+                                  uint32_t *out_h);
+
 const XrViewConfigurationView *
 oxr_views_change_select(struct oxr_views_change *vc,
                         const XrViewConfigurationView *frozen,
