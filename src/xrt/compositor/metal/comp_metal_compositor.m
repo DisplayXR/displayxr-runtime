@@ -22,6 +22,9 @@
 #include "comp_metal_compositor.h"
 
 #include "util/comp_layer_accum.h"
+// #1513 - the shared acquire/wait/release bookkeeping and the static-image
+// count rule, identical to the vk_native and OpenGL compositors.
+#include "util/comp_swapchain_ring.h"
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_build.h"
@@ -68,7 +71,9 @@
  *
  */
 
-#define METAL_SWAPCHAIN_MAX_IMAGES 8
+//! Sized off the shared ring so the texture array and the bookkeeping cannot
+//! disagree about how many images a swapchain can hold (#1513).
+#define METAL_SWAPCHAIN_MAX_IMAGES COMP_SWAPCHAIN_MAX_IMAGES
 
 struct comp_metal_swapchain
 {
@@ -82,9 +87,8 @@ struct comp_metal_swapchain
 	uint32_t image_count;
 	struct xrt_swapchain_create_info info;
 
-	int32_t acquired_index;
-	int32_t waited_index;
-	uint32_t last_released_index;
+	//! Per-image acquire/wait/release state. See util/comp_swapchain_ring.h.
+	struct comp_swapchain_ring ring;
 };
 
 /*
@@ -1127,8 +1131,16 @@ metal_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
 
-	uint32_t index = (msc->last_released_index + 1) % msc->image_count;
-	msc->acquired_index = (int32_t)index;
+	// OpenXR permits up to image_count concurrently acquired images, so the
+	// ring must be able to hand out every image before any is released. The
+	// old (last_released_index + 1) % image_count handed the same index out
+	// twice and the state tracker rejected it as a non-ready image (#1513).
+	uint32_t index = 0;
+	xrt_result_t xret = comp_swapchain_ring_acquire(&msc->ring, &index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("No free Metal swapchain image: all %u are already acquired", msc->image_count);
+		return xret;
+	}
 
 	*out_index = index;
 	return XRT_SUCCESS;
@@ -1138,7 +1150,19 @@ static xrt_result_t
 metal_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t index)
 {
 	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
-	msc->waited_index = (int32_t)index;
+	(void)timeout_ns;
+
+	// The app owns these textures; there is no runtime-side GPU work to wait
+	// on (the compositor samples them at layer_commit, after release). The
+	// state tracker enforces the FIFO acquire->wait->release order, so this
+	// only has to move the named image on and reject one that is not acquired.
+	xrt_result_t xret = comp_swapchain_ring_wait(&msc->ring, index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Wait on non-acquired Metal swapchain image index %u (image_count=%u)", index,
+		        msc->image_count);
+		return xret;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -1146,9 +1170,14 @@ static xrt_result_t
 metal_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
-	msc->last_released_index = index;
-	msc->acquired_index = -1;
-	msc->waited_index = -1;
+
+	xrt_result_t xret = comp_swapchain_ring_release(&msc->ring, index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Release of non-waited Metal swapchain image index %u (image_count=%u)", index,
+		        msc->image_count);
+		return xret;
+	}
+
 	return XRT_SUCCESS;
 }
 
@@ -1188,7 +1217,10 @@ metal_compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
                                                   const struct xrt_swapchain_create_info *info,
                                                   struct xrt_swapchain_create_properties *xsccp)
 {
-	xsccp->image_count = 3; // Triple buffering
+	// Must agree with what metal_compositor_create_swapchain actually
+	// allocates: one image for a static swapchain, triple buffering
+	// otherwise (#1513).
+	xsccp->image_count = comp_swapchain_image_count(info->create, 3);
 	xsccp->extra_bits = (enum xrt_swapchain_usage_bits)0;
 	return XRT_SUCCESS;
 }
@@ -1206,9 +1238,11 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 	}
 
 	msc->info = *info;
-	msc->image_count = 3;
-	msc->acquired_index = -1;
-	msc->waited_index = -1;
+	// One image for a static swapchain, triple buffering otherwise (#1513).
+	// Same helper metal_compositor_get_swapchain_create_properties uses, so
+	// the advertised count and the allocated one cannot drift.
+	msc->image_count = comp_swapchain_image_count(info->create, 3);
+	comp_swapchain_ring_init(&msc->ring, msc->image_count);
 
 	MTLPixelFormat format = xrt_format_to_metal(info->format);
 	uint32_t bpp = metal_format_bytes_per_pixel(format);
