@@ -15,6 +15,7 @@
 #include "comp_vk_native_deposit.h"
 #include "comp_vk_native_split.h"
 #include "comp_vk_native_swapchain.h"
+#include "comp_vk_native_swapchain_ring.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
 
@@ -1516,7 +1517,9 @@ vk_compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
                                                const struct xrt_swapchain_create_info *info,
                                                struct xrt_swapchain_create_properties *xsccp)
 {
-	xsccp->image_count = 3;
+	// Must agree with what comp_vk_native_swapchain_create actually allocates:
+	// one image for a static swapchain, triple buffering otherwise (#1504).
+	xsccp->image_count = comp_vk_native_swapchain_image_count(info->create);
 	xsccp->extra_bits = (enum xrt_swapchain_usage_bits)0;
 	return XRT_SUCCESS;
 }
