@@ -8,6 +8,8 @@
 
 #include "oxr_views_change.h"
 
+#include "util/u_tiling.h"
+
 #include <string.h>
 
 int
@@ -204,4 +206,40 @@ oxr_views_change_select(struct oxr_views_change *vc,
 	os_mutex_unlock(&vc->lock);
 
 	return out;
+}
+
+bool
+oxr_views_change_size_from_window(const struct xrt_rendering_mode *mode,
+                                  const struct xrt_window_metrics *wm,
+                                  bool legacy_app_tile_scaling,
+                                  uint32_t *out_w,
+                                  uint32_t *out_h)
+{
+	if (mode == NULL || wm == NULL || out_w == NULL || out_h == NULL) {
+		return false;
+	}
+
+	// R4 on the IPC path. The native compositors get this for free -
+	// layer_commit's `if (!c->legacy_app_tile_scaling && ...)` means their
+	// renderer view dims never move for a legacy app, so the getter keeps
+	// answering the compromise size and no edge is ever detected. Nothing
+	// equivalent exists on this side of the IPC boundary.
+	if (legacy_app_tile_scaling) {
+		return false;
+	}
+
+	if (!wm->valid || wm->window_pixel_width == 0 || wm->window_pixel_height == 0) {
+		return false;
+	}
+
+	uint32_t w = 0;
+	uint32_t h = 0;
+	u_tiling_compute_canvas_view(mode, wm->window_pixel_width, wm->window_pixel_height, &w, &h);
+	if (w == 0 || h == 0) {
+		return false;
+	}
+
+	*out_w = w;
+	*out_h = h;
+	return true;
 }
