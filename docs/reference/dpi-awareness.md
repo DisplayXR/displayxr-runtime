@@ -107,3 +107,38 @@ must not.
 `displayxr-cli selftest`'s `dpi_awareness` check asserts the **process** is
 per-monitor aware (#1201); it cannot tell you whether a given call site pinned
 its context, so the A/B above is the real test.
+
+## The CTS runner is third-party and was DPI-unaware by default (#1506)
+
+`conformance_cli.exe` (the Khronos OpenXR-CTS binary `scripts\fetch_build_cts.bat`
+builds out-of-tree) is compiled from upstream sources that carry no manifest, so
+until #1506 it ran DPI-unaware like any un-manifested process. On the 250%-scaled
+test box that meant every geometric CTS measurement — window size/position, the
+Kooima projection derived from it, view poses — was silently wrong by the scale
+factor. Measured: the runtime read a **0.1380 x 0.0759 m** window instead of the
+true **0.3411 x 0.1861 m** (ratio **2.47**, i.e. 250%). That inflated #1502 with
+an entire spurious axis before the harness defect was isolated.
+
+**Symptom to recognise:** a CTS-reported window/view dimension, offset, or
+centroid that is off from the expected value by (very close to) the box's
+display-scaling factor — not a small rounding error, a clean multiplicative
+ratio. Compare against `EnumDisplaySettingsW`'s physical mode (what
+`displayxr-cli info` / `selftest`'s `display_dims` check use) to confirm.
+
+**Fix:** `fetch_build_cts.bat` now embeds the same
+`src/xrt/targets/common/dpi_aware.manifest` every DisplayXR executable ships
+into `conformance_cli.exe` as a post-build `mt.exe` step, and asserts
+(`-inputresource` round-trip + a `PerMonitorV2` check) that the embed actually
+took — a future CTS pin move that changes the output layout fails the build
+loudly instead of silently regressing this again.
+
+**Interim workaround**, or belt-and-braces on an older built exe: force the
+process DPI-aware from outside rather than relying on its manifest —
+
+```bat
+set __COMPAT_LAYER=HighDpiAware
+scripts\run_cts.ps1 -Plugin sim-display -Graphics d3d11 -TestSpec "xrLocateSpace_xrLocateViews"
+```
+
+See `docs/roadmap/cts-windows-handoff.md` for the harness's other known
+caveats/exclusions.
