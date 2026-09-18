@@ -14,6 +14,7 @@
 
 #include "math/m_space.h"
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_session.h" // #1499 denial reason enum
 
 #include "os/os_threading.h"
 
@@ -30,6 +31,7 @@
 #include "oxr_handle.h"
 #include "oxr_chain.h"
 #include "oxr_mcp_tools.h"
+#include "oxr_legacy_mode_rule.h" // #1499 mode floor / fillability rule
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
@@ -1520,6 +1522,38 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "modeIndex %u >= rendering_mode_count %u",
 		                 modeIndex, head->rendering_mode_count);
+	}
+
+	/*
+	 * #1499: a session may not move the display into a mode it could not
+	 * fill. The same rule xrBeginSession applies as a floor, applied here as
+	 * a denial - otherwise an app could walk straight back into the mode the
+	 * floor just took it out of, and the runtime would have no honest answer
+	 * for the tiles that stay at the clear colour.
+	 *
+	 * Gated on the session having BEGUN a view configuration, because that is
+	 * what makes "how many views can it submit?" a real question. A session
+	 * that was created but never begun is not a painter: the shell's
+	 * workspace-controller session (shell_openxr.cpp) calls this entry point
+	 * to drive the PANEL on behalf of its clients and never begins a frame
+	 * loop of its own, so gating it would break the workspace. It is also why
+	 * this sits AFTER the range check and BEFORE the service-mode forward: a
+	 * request this session cannot fill never leaves the process.
+	 *
+	 * Returns XR_SUCCESS with an event, not an error: both request entry
+	 * points answer at call time and report the outcome by event (v17/#961).
+	 */
+	if (oxr_frame_sync_is_session_running(&sess->frame_sync) &&
+	    !oxr_mode_fillable_by(&head->rendering_modes[modeIndex], sess->view_config_view_count)) {
+		U_LOG_W(
+		    "oxr: DENYING rendering mode %u ('%s', %u views) - this session's view "
+		    "configuration (0x%08x) reports %u views, so it cannot fill that mode (#1499)",
+		    modeIndex, head->rendering_modes[modeIndex].mode_name, head->rendering_modes[modeIndex].view_count,
+		    (uint32_t)sess->view_config_type, sess->view_config_view_count);
+		oxr_event_push_XrEventDataDisplayModeRequestDenied(
+		    &log, sess, modeIndex, /*requestedHardware3D=*/-1,
+		    XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL);
+		return XR_SUCCESS;
 	}
 
 	// #961: service-mode APP path — forward to the panel-lease holder and let

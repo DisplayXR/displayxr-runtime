@@ -1316,3 +1316,82 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 
 	tear_down(rt);
 }
+
+TEST_CASE("a PRIMARY_STEREO session's request for a >2-view mode is denied (#1499)", "[oxr][view_space][mode_floor]")
+{
+	if (legacy_switch_set() || !sim_quad_requested() || sim_mode_pinned()) {
+		WARN(
+		    "this arm needs SIM_DISPLAY_OUTPUT=quad and an UNpinned device - see "
+		    "tests_oxr_view_space_mode_floor in tests/CMakeLists.txt");
+		SUCCEED("not the mode-floor process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const int32_t unfillable = rt.first_unfillable_mode(2);
+	REQUIRE(unfillable >= 0); // Quad
+	INFO("requesting mode " << unfillable);
+
+	// The floor already moved us out of Quad at xrBeginSession; drain that
+	// event so what follows can only be the answer to OUR request.
+	rt.drain_events();
+
+	auto request = rt.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
+
+	// XR_SUCCESS at call time - both request entry points answer by EVENT
+	// (v17 / #961), so a denial is not an error code.
+	CHECK(request(rt.session, (uint32_t)unfillable) == XR_SUCCESS);
+
+	bool saw_denial = false;
+	for (const XrEventDataBuffer &ev : rt.drain_events()) {
+		// Nothing may claim the mode actually moved.
+		CHECK(ev.type != XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR);
+		if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR) {
+			const auto *d = reinterpret_cast<const XrEventDataDisplayModeRequestDeniedDXR *>(&ev);
+			saw_denial = true;
+			CHECK(d->requestedModeIndex == (uint32_t)unfillable);
+			CHECK(d->requestedHardware3D == -1);
+			CHECK(d->reason == XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR);
+		}
+	}
+	CHECK(saw_denial);
+
+	// ...and the display really did not move.
+	XrDisplayRenderingModeInfoDXR active{};
+	REQUIRE(rt.active_mode(&active));
+	INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount " << active.viewCount);
+	CHECK(active.viewCount <= 2);
+
+	// The same request from a MULTIVIEW session is NOT denied - the rule is
+	// about the session's width, not about the mode.
+	tear_down(rt);
+
+	Runtime wide;
+	BringUp wopt;
+	wopt.display_info = true;
+	wopt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+	if (!bring_up(wide, wopt)) {
+		return;
+	}
+	wide.drain_events();
+	auto wrequest = wide.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
+	CHECK(wrequest(wide.session, (uint32_t)unfillable) == XR_SUCCESS);
+	for (const XrEventDataBuffer &ev : wide.drain_events()) {
+		CHECK(ev.type != XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR);
+	}
+	XrDisplayRenderingModeInfoDXR wactive{};
+	REQUIRE(wide.active_mode(&wactive));
+	CHECK(wactive.modeIndex == (uint32_t)unfillable);
+
+	tear_down(wide);
+}
