@@ -641,6 +641,12 @@ typedef struct XrEventDataDisplayModeRequestDeniedDXR {
  * view needs nothing from it (the inactive tail then simply duplicates view 0
  * and is discarded).
  *
+ * Filled only on the call that RETURNS views, i.e. `viewCapacityInput > 0`. The
+ * two-call count query (`viewCapacityInput == 0`) returns before any view is
+ * located and therefore writes nothing here — the same rule the rest of
+ * XrViewState already follows. Initialise the field and read it back after the
+ * second call.
+ *
  * DEPRECATED, still accepted: an app that enabled this extension and began
  * PRIMARY_STEREO may submit a 1-view projection layer while the active mode is
  * itself 1-view. That is the pre-v21 2D submission path; it logs a one-shot

@@ -3536,7 +3536,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 * fetch further up differs), so the field is filled identically in-process
 	 * and out-of-process.
 	 */
-	{
+	if (sess->sys->inst->extensions.DXR_display_info) {
+		// Runtime gate, not just the compile-time one: an instance that did
+		// not ENABLE XR_DXR_display_info must not be written through a struct
+		// from an extension it never turned on, even if it chained the type by
+		// accident. Same gate the xrEndFrame verdict path uses.
 		XrViewActivityStateDXR *act =
 		    OXR_GET_OUTPUT_FROM_CHAIN(viewState, XR_TYPE_VIEW_ACTIVITY_STATE_DXR, XrViewActivityStateDXR);
 		if (act != NULL) {
