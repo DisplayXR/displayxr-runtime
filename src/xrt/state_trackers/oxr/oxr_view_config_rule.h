@@ -8,20 +8,35 @@
  * the primary view configuration the session was begun with. #1486 split that
  * into two rules where there used to be one:
  *
- *   - PRIMARY_STEREO is TIGHT. The type means exactly two views, so a wider
- *     submission is refused instead of being waved through because some
- *     rendering mode happened to have that count. One view is legal ONLY in a
- *     1-view (2D/mono) rendering mode — which is exactly who submits one today:
- *     the cube_* apps compute `eyeCount = display3D ? modeViewCount : 1`, and
- *     displayxr-common forwards the caller's count. In a 2-view mode the answer
- *     is 2, full stop.
+ *   - PRIMARY_STEREO is TIGHT: for a CORE-ONLY app it is exactly 2, always.
  *
- *     That last clause is what the CTS asserts. `XrCompositionLayerProjection`
+ *     One view is legal only for an app that enabled XR_DXR_display_info AND
+ *     only while the active rendering mode is itself 1-view. Both halves are
+ *     load-bearing:
+ *
+ *       * The MODE half is who submits one — the cube_* apps compute
+ *         `eyeCount = display3D ? modeViewCount : 1`, and displayxr-common
+ *         forwards the caller's count.
+ *       * The EXTENSION half is what keeps the CTS honest. A core-only app has
+ *         no notion of a "rendering mode" at all: it cannot enumerate one,
+ *         cannot request one, and is never told the active one changed. Scoping
+ *         a relaxation to a fact such an app cannot observe would make
+ *         PRIMARY_STEREO's meaning depend on hidden runtime state.
+ *
+ *     `XrCompositionLayerProjection`
  *     (conformance_test/test_XrCompositionLayerProjection.cpp:225-230) locates
  *     the views, does `Layer.viewCount--` and CHECKs for
  *     XR_ERROR_VALIDATION_FAILURE. Under PRIMARY_STEREO that decrement is
- *     2 -> 1, and the CTS runs in a 2-view mode, so accepting 1 unconditionally
- *     turned a required rejection into a success.
+ *     2 -> 1. Gating on the mode alone was NOT enough and the win box proved it
+ *     on the full suite: a CTS session never enables XR_DXR_display_info, so the
+ *     runtime treats it as a legacy session and sim-display sits in a 1-view
+ *     (Passthrough/2D) mode for essentially the whole run — the mode-only
+ *     exception was open for the entire conformance pass. With the extension
+ *     gate the CTS is always on the exact-2 path.
+ *
+ *     An extension app that wants mode-driven counts should begin
+ *     PRIMARY_MULTIVIEW_DXR; the 1-view allowance here is a narrow
+ *     back-compatibility relaxation, not the recommended path.
  *   - PRIMARY_MULTIVIEW_DXR is PERMISSIVE — 1, 2, or any rendering mode's view
  *     count, with no reference to the ACTIVE mode. It cannot be narrowed to the
  *     active mode, because the app may be one frame behind a mode transition
@@ -45,6 +60,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h> // NULL — this header must stand alone, not lean on its includers.
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -53,22 +69,26 @@ extern "C" {
 
 /*!
  * The TIGHT rule: XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO accepts exactly two
- * views — and a single view only when the ACTIVE rendering mode is itself
- * 1-view, which is the 2D/mono submission path.
+ * views — and a single view only for an XR_DXR_display_info app whose active
+ * rendering mode is itself 1-view, which is the 2D/mono submission path.
  *
  * @param submitted               The layer's viewCount.
  * @param active_mode_view_count  Views in the currently active rendering mode.
  *                                Callers that cannot determine it pass 2, the
  *                                stereo default, which makes the rule "exactly
  *                                two".
+ * @param display_info_enabled    Did the INSTANCE enable XR_DXR_display_info?
+ *                                False for every core-only app, including every
+ *                                CTS session — for those the answer is exactly
+ *                                2 whatever mode the panel is in.
  */
 static inline bool
-oxr_view_count_ok_for_stereo(uint32_t submitted, uint32_t active_mode_view_count)
+oxr_view_count_ok_for_stereo(uint32_t submitted, uint32_t active_mode_view_count, bool display_info_enabled)
 {
 	if (submitted == 2) {
 		return true;
 	}
-	return submitted == 1 && active_mode_view_count == 1;
+	return submitted == 1 && active_mode_view_count == 1 && display_info_enabled;
 }
 
 /*!
