@@ -16,6 +16,7 @@
 #include "oxr_logger.h"
 #include "oxr_conversions.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -611,6 +612,57 @@ oxr_event_push_XrEventDataLocal3DZoneViewSizeChanged(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 #endif // OXR_HAVE_DXR_local_3d_zone
+
+#ifdef OXR_HAVE_EXT_view_configuration_views_change
+XrResult
+oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(struct oxr_logger *log,
+                                                           struct oxr_instance *inst,
+                                                           XrSystemId systemId,
+                                                           XrViewConfigurationType viewConfigurationType,
+                                                           uint32_t logRecommendedWidth,
+                                                           uint32_t logRecommendedHeight)
+{
+	XrEventDataViewConfigurationViewsChangedEXT *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	// Instance-level event: the struct has NO XrSession member, so
+	// is_session_link_to_event() deliberately gets no case for it. Its
+	// `default: false` is correct - the event is systemId-scoped and must
+	// survive oxr_event_remove_session_events(). A conformant consumer
+	// filters on BOTH fields below (LOVR does), so both are populated.
+	changed->type = XR_TYPE_EVENT_DATA_VIEW_CONFIGURATION_VIEWS_CHANGED_EXT;
+	changed->next = NULL;
+	changed->systemId = systemId;
+	changed->viewConfigurationType = viewConfigurationType;
+	event->result = XR_SUCCESS;
+
+	// The throttle already caps this at 1 Hz, but a drag-resize still means
+	// one line per second for as long as the drag lasts - and CLAUDE.md
+	// forbids a recurring WARN. Log the first doorbell with everything a
+	// bug report needs, then stay silent; the event itself keeps firing.
+	// The dims come in as parameters rather than being read back out of
+	// oxr_system::views_change - that array is only safe to touch under its
+	// own lock, and the caller already has the value it just wrote.
+	static bool warned_ext_views_change = false;
+	if (!warned_ext_views_change) {
+		warned_ext_views_change = true;
+		U_LOG_W(
+		    "OXR EVENT: View configuration views changed (XR_EXT_view_configuration_views_change): "
+		    "systemId %" PRIu64
+		    ", viewConfigurationType %d, recommendedImageRect now %ux%u "
+		    "(first doorbell; subsequent ones are not logged)",
+		    (uint64_t)systemId, (int)viewConfigurationType, logRecommendedWidth, logRecommendedHeight);
+	}
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_view_configuration_views_change
 
 XrResult
 oxr_event_push_XrEventDataHardwareDisplayStateChanged(struct oxr_logger *log,

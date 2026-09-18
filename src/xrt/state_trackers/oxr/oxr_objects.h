@@ -434,6 +434,29 @@ oxr_local_3d_zone_to_openxr(struct oxr_local_3d_zone_ext *zone)
 }
 #endif // OXR_HAVE_DXR_local_3d_zone
 
+#ifdef OXR_HAVE_EXT_view_configuration_views_change
+/*!
+ * Push an `XrEventDataViewConfigurationViewsChangedEXT` onto the instance event
+ * queue (#1488). The standard successor to the bespoke doorbell above.
+ *
+ * Instance/system-scoped: the struct carries no XrSession, so this takes the
+ * instance plus the two fields a conformant consumer filters on. The dims are
+ * for the one-shot WARN only - they are NOT part of the event, which is a pure
+ * "re-enumerate" doorbell.
+ *
+ * MUST only be called when xrEnumerateViewConfigurationViews would now answer
+ * differently; see @ref oxr_views_change_update, whose return value is the only
+ * sanctioned trigger.
+ */
+XrResult
+oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(struct oxr_logger *log,
+                                                           struct oxr_instance *inst,
+                                                           XrSystemId systemId,
+                                                           XrViewConfigurationType viewConfigurationType,
+                                                           uint32_t logRecommendedWidth,
+                                                           uint32_t logRecommendedHeight);
+#endif // OXR_HAVE_EXT_view_configuration_views_change
+
 /*!
  * To go back to a OpenXR object.
  *
