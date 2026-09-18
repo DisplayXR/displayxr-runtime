@@ -144,24 +144,33 @@ DxrViewConfigTypeName(XrViewConfigurationType t)
  */
 static inline void
 DxrAliasInactiveViews(XrCompositionLayerProjectionView *projViews,
-                      const XrView *views, uint32_t located, uint32_t active) {
-        if (projViews == NULL || active >= located) {
-                return;
-        }
-        for (uint32_t i = active; i < located; i++) {
-                projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                projViews[i].next = NULL;
-                if (views != NULL) {
-                        projViews[i].pose = views[i].pose;
-                        projViews[i].fov = views[i].fov;
-                } else {
-                        projViews[i].pose = projViews[0].pose;
-                        projViews[i].fov = projViews[0].fov;
-                }
-                // The whole trick: content the app DID render this frame, which
-                // the runtime then discards because the view is inactive.
-                projViews[i].subImage = projViews[0].subImage;
-        }
+		      const XrView *views, uint32_t located, uint32_t active) {
+	/*
+	 * `active == 0` means the app rendered NOTHING this frame, so
+	 * projViews[0] holds no subimage to alias — it is still
+	 * zero-initialised, i.e. XR_NULL_HANDLE. Stamping that over every view
+	 * would turn a frame with no content into a layer full of null
+	 * swapchains. Reachable: a zones app whose per-zone tile count clamps to
+	 * 0 (cube_zones_texture_d3d11_win). Do nothing — the caller's own "skip
+	 * this layer" gate handles that frame.
+	 */
+	if (projViews == NULL || active == 0 || active >= located) {
+		return;
+	}
+	for (uint32_t i = active; i < located; i++) {
+		projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		projViews[i].next = NULL;
+		if (views != NULL) {
+			projViews[i].pose = views[i].pose;
+			projViews[i].fov = views[i].fov;
+		} else {
+			projViews[i].pose = projViews[0].pose;
+			projViews[i].fov = projViews[0].fov;
+		}
+		// The whole trick: content the app DID render this frame, which
+		// the runtime then discards because the view is inactive.
+		projViews[i].subImage = projViews[0].subImage;
+	}
 }
 
 #ifdef __cplusplus

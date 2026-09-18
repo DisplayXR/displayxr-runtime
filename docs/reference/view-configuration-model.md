@@ -207,11 +207,20 @@ Three properties hold under all three types:
   type returns `XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED`, and the
   visibility-mask path and its event follow the begun type too.
 
-## The under-submit contract
+## The compositor-side clamp
 
-An app under `PRIMARY_MULTIVIEW_DXR` (or a 2-view app that the workspace put into
-a 4-view mode) may submit **fewer** views than the active mode has tiles. The
-compositor resolves the discrepancy on the content side, per-frame:
+> **This is NOT an API permission any more.** Until ADR-041 this section
+> described a *contract*: an app was allowed to submit fewer views than the
+> active mode has tiles, and `xrEndFrame` accepted it. At the default knob it no
+> longer does — the layer must carry the located count and alias its inactive
+> tail ([above](#submit-the-located-count-alias-the-tail-adr-041)). What survives
+> is the **compositor-side clamp** below, which is now defence in depth rather
+> than the mechanism an app relies on: it is what makes the aliased tail free,
+> and what keeps a one-frame skew across a mode change harmless. Only
+> `DXR_UNDER_SUBMIT=2` restores the old API permission.
+
+The compositor resolves any discrepancy between what a layer carries and what
+the active mode has tiles for, on the content side, per-frame:
 
 ```c
 // comp_d3d11_renderer.cpp — comp_d3d11_renderer_compute_effective_layout()
@@ -220,9 +229,13 @@ if (views > mode_tiles) views = mode_tiles;   // never the other way round
 ```
 
 - `views == 1` → one tile spanning the full content region; the DP flat-blits a
-  1×1 grid. This is how an always-stereo app behaves correctly in a 2D mode.
+  1×1 grid. This is how an always-stereo app behaves correctly in a 2D mode —
+  under ADR-041 it gets there by the clamp dropping the aliased tail, not by the
+  app submitting one view.
 - `1 < views < mode_tiles` → the **mode's** grid, with the app painting the first
-  `views` tiles (a 2-view app in a 2×2 quad mode paints tiles 0 and 1).
+  `views` tiles (a 2-view app in a 2×2 quad mode paints tiles 0 and 1). Reachable
+  when the located count itself is narrower than the mode, which is exactly what
+  the mode floor ([below](#the-mode-floor-1499)) exists to prevent.
 
 Same rule, same shape, on every backend:
 `comp_d3d12_renderer_compute_effective_layout`,
@@ -245,7 +258,7 @@ On `sim_display`'s 2×2 Quad they are the symmetric half-IPD pair —
 `view_eye_offsets[0..1] = {±ipd/2, eye_y, eye_z}`, with the upper row carried by
 `[2..3]` at `eye_y + ipd` (`sim_display_device.c:811-815`). So the app's *eyes*
 are correct; what it loses is the **unpainted upper row**, left at the clear
-colour by the compositor's under-submit clamp. A device that laid its fan out
+colour by the compositor-side clamp. A device that laid its fan out
 differently could hand the narrower type an asymmetric pair — the runtime does
 not synthesise a centred one — but that is not what the one N-view device we
 have does, and an earlier revision of this page asserted the opposite.
@@ -330,7 +343,7 @@ sample. The clamp, the 1 Hz throttle and the doorbell all follow from there.
   the view count being known.)
 - **A device that PINS its mode** (`SIM_DISPLAY_FORCE_MODE`). The pin exists to
   hold a mode against every later request — which is exactly what keeps the
-  N-view under-submit path testable at all.
+  N-view narrow-submission path testable at all.
 - **Service mode.** The panel lease, not this session, owns the display-global
   mode (ADR-035 D2). A client must not yank it from a workspace controller or
   another client.
@@ -345,8 +358,8 @@ Getting that asymmetry wrong was the first cut of this change; the two sites now
 share one helper (`oxr_session_may_move_display_mode()`) so they cannot drift
 apart again.
 
-In both cases the under-submit clamp stands, and the runtime says so instead of
-clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering mode
+In both cases the compositor-side clamp stands, and the runtime says so instead
+of clamping silently: `xrBeginSession` logs `session in an UNFILLABLE rendering mode
 (#1499)`, and a later display-global mode change into an unfillable mode logs
 once more as it lands.
 
