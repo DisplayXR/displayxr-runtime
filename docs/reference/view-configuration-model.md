@@ -173,16 +173,23 @@ count ([#542](https://github.com/DisplayXR/displayxr-runtime/issues/542),
 Consequence: `PRIMARY_STEREO` reporting 2 costs no capability. A 2-view app in a
 quad mode renders exactly what it rendered before.
 
-**What the two views ARE in a >2-view mode, though, is tiles 0 and 1 — not a
-symmetric stereo pair.** A `PRIMARY_STEREO` session on a device sitting in a
-4-view mode receives `views[0..1]` = the first two viewer poses of the N-view
-fan, which for a 2×2 quad are two adjacent slots off to one side of the viewer,
-not a left/right pair straddling it. The runtime does not synthesise a
-centred pair for the narrower type. This is dev-only today — `sim_display`'s
-Quad is opt-in and no shipping device exceeds 2 views — and
-[#1499](https://github.com/DisplayXR/displayxr-runtime/issues/1499) tracks
-suppressing the mode switch for a session that cannot express it. Two direct
-consequences worth knowing before someone debugs them cold:
+**What is lost in a >2-view mode is the tiles the session cannot paint — not,
+on sim-display, the symmetry of the pair.** A `PRIMARY_STEREO` session on a
+device sitting in a 4-view mode receives `views[0..1]` = the first two viewer
+poses of the N-view fan, and *what those two poses are is the device's business*.
+On `sim_display`'s 2×2 Quad they are the symmetric half-IPD pair —
+`view_eye_offsets[0..1] = {±ipd/2, eye_y, eye_z}`, with the upper row carried by
+`[2..3]` at `eye_y + ipd` (`sim_display_device.c:811-815`). So the app's *eyes*
+are correct; what it loses is the **unpainted upper row**, left at the clear
+colour by the compositor's under-submit clamp. A device that laid its fan out
+differently could hand the narrower type an asymmetric pair — the runtime does
+not synthesise a centred one — but that is not what the one N-view device we
+have does, and an earlier revision of this page asserted the opposite.
+
+Both losses are what [#1499](https://github.com/DisplayXR/displayxr-runtime/issues/1499)
+removes: the session is moved out of a mode it cannot fill before its first
+frame ([below](#the-mode-floor-1499)). One direct consequence worth knowing
+before someone debugs it cold:
 
 - A CTS lane **forced** into quad (`SIM_DISPLAY_OUTPUT=quad`) used to fail
   `xrLocateSpace_xrLocateViews` — not on its `views.size() == 2` assertion,
@@ -190,9 +197,75 @@ consequences worth knowing before someone debugs them cold:
   the fan, while the centroid of tiles 0 and 1 is not. #1502 closes that gap
   too, because the VIEW-space offset is measured off the **reported** array
   (tiles 0 and 1 under `PRIMARY_STEREO`), not off the fan. Default CI is still
-  **not** quad; see [CTS status](#cts-status).
-- A shipped 2-view app the workspace pushes into a wider mode gets asymmetric
-  eyes for the duration. Same root cause, same fix in #1499.
+  **not** quad; see [CTS status](#cts-status). Note that #1499's floor does
+  **not** rescue that lane on its own: the CTS is a LEGACY session (it enables
+  no `XR_DXR_display_info`), so it is #1510's floor that applies to it, and
+  #1499 is a no-op there by construction.
+
+## The mode floor (#1499)
+
+`PRIMARY_STEREO` reporting 2 costs no capability *as long as the display is in a
+mode two views can fill*. If it is not, the session paints the first tiles and
+the per-frame clear leaves the rest flat — a capability loss caused by a mode
+the app may not even have chosen. So:
+
+> **A session never runs in, or requests, a rendering mode it cannot fill.**
+
+"Cannot fill" is `mode.view_count > <the view count of the primary view
+configuration the session began>`. The rule lives in
+`src/xrt/state_trackers/oxr/oxr_legacy_mode_rule.h` (named for #1510, which got
+there first with a hard-coded 2) and is applied at two points:
+
+| Point | What happens |
+|---|---|
+| `xrBeginSession` | If the active mode is unfillable, the display moves to one that is not — preferring a 3D mode of exactly the session's width, then any fillable 3D mode, then mode 0 (2D) — and `XrEventDataRenderingModeChangedDXR` is pushed. Apps enumerate modes *before* `xrBeginSession`, so without the event a cached `isActive` would be stale from the first frame. |
+| `xrRequestDisplayRenderingModeDXR` | An unfillable request is denied with `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` (`XR_DXR_display_info` v20). `XR_SUCCESS` at call time, as for every other denial; the event is the answer, and the display does not move. |
+
+**Begin-time, not `xrGetSystem`-time** — unlike #1510's legacy twin. The view
+configuration is a *per-session* fact the app names in `xrBeginSession`, so that
+is the first moment `view_config_view_count` is authoritative (it is seeded from
+the system's first advertised type at `xrCreateSession`). **Nothing is resized**:
+the swapchain is worst-case-sized across all modes
+([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)), so only
+`recommended_view_scale_{x,y}` move, and the
+[#1488](https://github.com/DisplayXR/displayxr-runtime/issues/1488) live-view
+shadow picks the change up from the compositor's real dims on the next
+`xrEndFrame` rather than being written here.
+
+### What is deliberately NOT floored
+
+- **`PRIMARY_MULTIVIEW_DXR` sessions.** `max_views` is the device max, so the
+  pick returns the active index for every mode: no floor, no denial, no warning.
+  An app that wants the device's full width says so, and gets it. This is the
+  invariant the whole change is built around — #1499 must not take back what
+  #1486 added.
+- **A session that was created but never begun.** A workspace controller drives
+  the panel *on behalf of* its clients and never begins a frame loop of its own;
+  it is an orchestrator, not a painter, so a painter's constraint does not apply
+  to it. (This is why the denial is gated on the session running, not merely on
+  the view count being known.)
+- **A device that PINS its mode** (`SIM_DISPLAY_FORCE_MODE`). The pin exists to
+  hold a mode against every later request — which is exactly what keeps the
+  N-view under-submit path testable at all.
+- **Service mode.** The panel lease, not this session, owns the display-global
+  mode (ADR-035 D2). A client must not yank it from a workspace controller or
+  another client.
+
+In the last two cases the under-submit clamp stands, and the runtime says so
+instead of clamping silently: `xrBeginSession` logs `session in an UNFILLABLE
+rendering mode (#1499)`, and a later display-global mode change into an
+unfillable mode logs once more as it lands.
+
+The runtime's own 1/2/3 mode keys are **not** gated, in-process or in the
+service. In-process the keys only reach modes 0/1/2 (`qwerty_win32.c:514-519`),
+none of which is >2-view on any device we have; in the service they are a
+lease-holder action rather than a client request, so a single client that cannot
+fill the result is told, not given a veto over the other clients' display.
+
+Kill switch: `DXR_MODE_FLOOR=0` restores the pre-#1499 behaviour for extension
+sessions (both halves together — see the
+[census](../roadmap/control-panel-performance-settings.md#test--dev--never-exposed)).
+#1510's legacy floor is unaffected by it.
 
 ## Why a vendor type rather than clamping to 2
 

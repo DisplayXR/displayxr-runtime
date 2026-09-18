@@ -10,7 +10,7 @@ Orthogonal to the [four app classes](../getting-started/app-classes.md), apps ar
 | **Rendering modes** | Enumerates all modes, handles `XrEventDataRenderingModeChangedDXR` | Unaware of modes, always renders stereo |
 | **Swapchain sizing** | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | `recommendedImageRectWidth * 2` (compromise scale) |
 | **Mode switching** | All modes: V toggle + 1/2/3 direct selection | Only V toggle between mode 0 (2D) and the default 3D mode |
-| **Modes it may run in** | Any mode the device offers | Only modes it can fill (`view_count ≤ 2`) — the mode floor, below |
+| **Modes it may run in** | Only modes its view configuration can fill (2 under `PRIMARY_STEREO`, the device max under `PRIMARY_MULTIVIEW_DXR`) — #1499 | Only modes it can fill (`view_count ≤ 2`) — the mode floor, below |
 
 ## Which Apps Are Which?
 
@@ -43,6 +43,22 @@ Two things outrank the floor, and in both the app keeps Case B and the under-sub
 | **Service mode** | The panel lease, not this app, owns the display-global mode; a legacy client must not yank it from a workspace controller or another client | same |
 
 When the floor *does* move the display, `xrBeginSession` logs `oxr: LEGACY mode floor (#1510) - rendering mode N (...) cannot be filled ... switching to mode M`.
+
+### The same floor for an EXTENSION app (#1499)
+
+The rule turned out not to be about legacy apps at all. An extension app can see the modes and request one, but it still submits exactly as many views as the primary view configuration it **began** reports — 2 under `PRIMARY_STEREO`, even on a device sitting in a 4-view mode ([#1486](https://github.com/DisplayXR/displayxr-runtime/issues/1486)). The tiles it cannot paint are lost the same way, so [#1499](https://github.com/DisplayXR/displayxr-runtime/issues/1499) applies the same pick with `max_views` = the session's view count, in `oxr_legacy_mode_rule.h` (the `oxr_legacy_*` names are now thin wrappers binding it to 2).
+
+Three differences from the legacy half, all forced by *when* the answer is knowable:
+
+| | Legacy (#1510) | Extension (#1499) |
+|---|---|---|
+| Decided at | `xrGetSystem` — the app must be *sized* for the floored mode | `xrBeginSession` — the first moment `view_config_view_count` is authoritative |
+| Sizing | Compromise view scale recomputed from the floored mode | **None.** The swapchain is worst-case-sized across all modes ([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)); only the recommended view *scales* move |
+| Told? | No — a legacy app cannot receive mode events | `XrEventDataRenderingModeChangedDXR`, because apps enumerate modes *before* `xrBeginSession` and a cached `isActive` would go stale |
+
+`xrRequestDisplayRenderingModeDXR` denies a mode the session could not fill, with `XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR` — locally, before the request reaches the panel-lease holder. A session that was created but never *begun* is exempt: a workspace controller drives the panel on behalf of its clients rather than painting into it, so a painter's constraint must not be imposed on an orchestrator.
+
+The same two overrides apply (a pinned device, service mode), and a `PRIMARY_MULTIVIEW_DXR` session is never floored or denied — that is the invariant the whole change is built around. Kill switch: `DXR_MODE_FLOOR=0` restores the pre-#1499 behaviour for extension sessions only. Full model: [View-Configuration Model](../reference/view-configuration-model.md#the-mode-floor-1499).
 
 See [ADR-006](../adr/ADR-006-legacy-app-compromise-view-scale.md) for the design rationale and [Legacy App Support](../specs/runtime/legacy-app-support.md) for the full algorithm (Case A/B).
 
