@@ -3017,6 +3017,12 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		// per-client window source on a Linux service build (its final
 		// `#else` just drops the request), so the metrics come back
 		// valid=false and this whole leg is a documented no-op there.
+		//
+		// `!have_dims` leads the condition as a cheap skip, NOT as the
+		// gate: the STRUCTURAL terms after it are what authorise this
+		// leg, and each one must hold on its own. Deleting the other
+		// terms and keeping `!have_dims` is exactly the shape #1488
+		// forbids.
 		if (!have_dims && !sess->is_d3d11_native_compositor && !sess->is_d3d12_native_compositor &&
 		    !sess->is_metal_native_compositor && !sess->is_vk_native_compositor &&
 		    !sess->is_gl_native_compositor && !sess->is_bridge_relay && sess->sys->xsysc != NULL &&

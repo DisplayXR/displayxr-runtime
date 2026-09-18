@@ -243,3 +243,29 @@ oxr_views_change_size_from_window(const struct xrt_rendering_mode *mode,
 	*out_h = h;
 	return true;
 }
+
+bool
+oxr_views_change_cached_window_metrics(const struct xrt_window_metrics *cached,
+                                       bool cached_valid,
+                                       uint64_t cached_ns,
+                                       uint64_t now_ns,
+                                       uint64_t max_age_ns,
+                                       struct xrt_window_metrics *out_metrics)
+{
+	if (cached == NULL || out_metrics == NULL || !cached_valid) {
+		return false;
+	}
+
+	// Unsigned, and the stamp is always in the past, so no signed-overflow
+	// trap; a clock that somehow went backwards wraps to a huge age and
+	// simply forces a refresh.
+	if (now_ns - cached_ns >= max_age_ns) {
+		return false;
+	}
+
+	// LOAD-BEARING, and pinned by "PR B: a cache hit COPIES the sample out".
+	// Returning true without this leaves the caller's zeroed struct at
+	// valid=false, which silently disables the whole IPC leg.
+	*out_metrics = *cached;
+	return true;
+}

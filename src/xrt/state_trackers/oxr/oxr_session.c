@@ -382,15 +382,13 @@ oxr_session_get_window_metrics_cached(struct oxr_session *sess, struct xrt_windo
 		return false;
 	}
 
-	if (sess->last_window_metrics_valid) {
-		uint64_t now_ns = os_monotonic_get_ns();
-		// Unsigned, and the stamp is always in the past, so no
-		// signed-overflow trap; a clock that somehow went backwards
-		// wraps to a huge age and simply forces a refresh.
-		if (now_ns - sess->last_window_metrics_ns < OXR_SESSION_WINDOW_METRICS_MAX_AGE_NS) {
-			*out_metrics = sess->last_window_metrics;
-			return true;
-		}
+	// The hit path - including the fact that a hit COPIES the sample into
+	// out_metrics - lives in oxr_views_change.c so it is unit tested rather
+	// than reviewed. See oxr_views_change_cached_window_metrics().
+	if (oxr_views_change_cached_window_metrics(&sess->last_window_metrics, sess->last_window_metrics_valid,
+	                                           sess->last_window_metrics_ns, os_monotonic_get_ns(),
+	                                           OXR_VIEWS_CHANGE_WM_MAX_AGE_NS, out_metrics)) {
+		return true;
 	}
 
 	return oxr_session_get_window_metrics(sess, out_metrics);
