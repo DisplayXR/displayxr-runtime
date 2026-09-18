@@ -106,6 +106,10 @@ minimal backing or exclude via the run manifest — and **log every exclusion**
 
 ## Reference
 
+- **Known-red exclusions in the default spec:** `xrLocateSpace_xrLocateViews` is
+  excluded by name (#1486) — see
+  [View-Configuration Model](../reference/view-configuration-model.md). Any test
+  excluded from `cts.yml` / `run_cts.ps1` must carry a comment naming its issue.
 - Full plan: this repo's planning notes (the `unified-bubbling-perlis` plan).
 - Extension spec: `XR_EXT_conformance_automation` (openxr.h, spec v3).
 - Eye-tracking / sim_display fake-tracking knobs: CLAUDE.md "Simulating eye
