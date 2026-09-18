@@ -53,7 +53,7 @@ JVM_EXTS = {".java", ".kt"}
 RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
-    "INV-3.1": "Locate into an XRT_MAX_VIEWS (8)-wide buffer; render/submit the active mode's viewCount, never a hardcoded 2.",
+    "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
@@ -103,12 +103,14 @@ class Finding:
 
 
 # --- compiled source patterns: (regex, level, rule, message, fix, multiview_only) ---
-# multiview_only=True patterns apply only to N-view EXTENSION apps; they're skipped
-# for legacy / non-extension apps (which are legitimately fixed 2-view).
+# multiview_only=True patterns apply only to apps that opted into
+# XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR; they're skipped for stereo-fixed
+# apps, which are legitimately 2-wide (PRIMARY_STEREO reports exactly 2).
 SRC_PATTERNS = [
     (re.compile(r"\bXrView\s+\w+\s*\[\s*2\s*\]"),
      ERROR, "INV-3.1",
-     "XrView array hardcoded to [2] — quad modes have 4 views.",
+     "XrView array hardcoded to [2] — this app begins PRIMARY_MULTIVIEW_DXR, where "
+     "xrLocateViews reports the device max (4 in a quad mode).",
      "Size it XrView views[8] (XRT_MAX_VIEWS) and locate with viewCapacityInput=8.", True),
     (re.compile(r"\bXrCompositionLayerProjectionView\s+\w+\s*\[\s*2\s*\]"),
      ERROR, "INV-3.1",
@@ -152,11 +154,35 @@ SRGB_TOKENS = re.compile(
     re.IGNORECASE,
 )
 CREATES_SWAPCHAIN = re.compile(r"\bxrCreateSwapchain\b")
-# An N-view extension app drives the rendering-mode enumeration; a legacy / fixed-2-view
-# app does not. Used to gate the multiview-only checks (so legacy apps aren't false-flagged).
-N_VIEW_MARKER = re.compile(
+# INV-3.1 (#1486). Two different questions, two different markers:
+#
+#   MULTIVIEW_OPT_IN  — does the app BEGIN the N-view view configuration? Only a
+#       session begun on XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR is ever
+#       handed more than 2 views; under PRIMARY_STEREO the runtime reports exactly
+#       2 and rejects a projection layer with viewCount > 2. So THIS is what gates
+#       the "don't hardcode 2" checks — a stereo-fixed app is legitimately 2-wide.
+#   MODE_ENUM_MARKER  — does the app drive the rendering-mode enumeration (and so
+#       typically derive eyeCount from the active mode's viewCount)? That used to
+#       be the gate. On its own it is now an ERROR: mode-derived view counts with
+#       no PRIMARY_MULTIVIEW_DXR opt-in breaks the first time the app lands in a
+#       4-view mode.
+#
+# The opt-in counts either spelling: the enum named directly, or the shared
+# helper test_apps/common/dxr_view_config.h's DxrSelectViewConfigType(), which
+# does the enumerate-and-pick and is how every in-tree app opts in (the app then
+# never names the enum itself).
+MULTIVIEW_OPT_IN = re.compile(
+    r"\bXR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR\b|\bDxrSelectViewConfigType\b"
+)
+MODE_ENUM_MARKER = re.compile(
     r"xrEnumerateDisplayRenderingModesDXR|renderingModeCount|XrDisplayRenderingModeInfoDXR"
 )
+# Explicit opt-OUT for an app that enumerates rendering modes but is
+# deliberately 2-view (hard-capped submission, or never submits a projection
+# layer at all — e.g. a weave-RPC probe). The marker is a COMMENT token, so it is
+# searched in the raw source, not the comment-stripped text the other patterns
+# see. Put it next to the cap it vouches for.
+STEREO_FIXED_MARKER = re.compile(r"\bDXR_STEREO_FIXED_APP\b")
 ICON_LAYOUTS = {"sbs-lr", "sbs-rl", "tb", "bt"}
 
 
@@ -201,28 +227,60 @@ def scan_sources(root: Path, findings: list):
     # First pass: read files once; detect whether this is an N-view extension app
     # and whether an sRGB swapchain format appears anywhere.
     files = []
+    stereo_fixed_marked = False
     for path in iter_source_files(root):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         files.append((path, strip_comments(text)))
-    is_extension_app = any(N_VIEW_MARKER.search(t) for _, t in files)
+        if STEREO_FIXED_MARKER.search(text):
+            stereo_fixed_marked = True
+    is_multiview_app = any(MULTIVIEW_OPT_IN.search(t) for _, t in files)
     any_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
 
-    if not is_extension_app and files:
-        findings.append(Finding(
-            INFO, "note", str(root.name or root), 1,
-            "Treated as a legacy / non-extension app (no rendering-mode enumeration) — "
-            "multiview view-count checks (INV-3.1) skipped; fixed 2-view is valid here.",
-            "If this is meant to be an N-view extension app, enumerate modes "
-            "(xrEnumerateDisplayRenderingModesDXR, INV-2.3) and size view arrays to XRT_MAX_VIEWS.",
-        ))
+    # INV-3.1 (#1486): mode-derived view counts WITHOUT the PRIMARY_MULTIVIEW_DXR
+    # opt-in. The app reads the active mode's viewCount (so it can reach 4) but
+    # begins PRIMARY_STEREO, where the runtime reports 2 and rejects viewCount > 2.
+    if not is_multiview_app and not stereo_fixed_marked:
+        mode_enum_loc = None
+        for path, text in files:
+            m = MODE_ENUM_MARKER.search(text)
+            if m:
+                mode_enum_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if mode_enum_loc:
+            p, ln = mode_enum_loc
+            findings.append(Finding(
+                ERROR, "INV-3.1", p, ln,
+                "N-view mode handling without PRIMARY_MULTIVIEW_DXR opt-in — under "
+                "PRIMARY_STEREO the runtime reports 2 views and rejects viewCount>2 (INV-3.1).",
+                "Call DxrSelectViewConfigType(instance, systemId) "
+                "(test_apps/common/dxr_view_config.h) once after xrGetSystem, and feed that "
+                "type to xrEnumerateViewConfigurationViews, "
+                "XrSessionBeginInfo::primaryViewConfigurationType and "
+                "XrViewLocateInfo::viewConfigurationType. It returns "
+                "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR when the runtime enumerates "
+                "it (needs XR_DXR_display_info enabled) and degrades to PRIMARY_STEREO "
+                "otherwise. If the app is deliberately stereo-fixed (hard-capped at 2 or "
+                "never submits a projection layer), put the comment token "
+                "DXR_STEREO_FIXED_APP next to the cap to acknowledge it.",
+            ))
+        elif files:
+            findings.append(Finding(
+                INFO, "note", str(root.name or root), 1,
+                "Treated as a stereo-fixed app (no PRIMARY_MULTIVIEW_DXR opt-in) — multiview "
+                "view-count checks (INV-3.1) skipped; a fixed 2-view app is valid here and the "
+                "runtime reports exactly 2 under PRIMARY_STEREO.",
+                "If this is meant to be an N-view app, begin the session with "
+                "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (enumerate it first; it needs "
+                "XR_DXR_display_info) and size view arrays to XRT_MAX_VIEWS.",
+            ))
 
     swapchain_loc = None
     for path, text in files:
         for regex, level, rule, msg, fix, multiview_only in SRC_PATTERNS:
-            if multiview_only and not is_extension_app:
+            if multiview_only and not is_multiview_app:
                 continue
             for m in regex.finditer(text):
                 line_no = text.count("\n", 0, m.start()) + 1

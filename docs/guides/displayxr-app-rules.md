@@ -212,20 +212,62 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 
 ## 3. Views — the locate-views gotcha
 
-- **INV-3.1 — Locate over a MAX-sized buffer (8), render/submit the *active mode's* count.**
-  Two distinct counts are in play and conflating them is the single most common bug:
+- **INV-3.1 — Begin the right view configuration; locate over a MAX-sized buffer (8); render
+  and submit the *active mode's* count.** Which half of this applies to you is decided by one
+  question: **does your app render more than two views of content?**
+
+  - **A stereo-fixed app** (Unity-style, and every app that renders exactly one left/right
+    pair) begins `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`, which reports **exactly 2**
+    views and rejects a projection layer with `viewCount > 2`. `XrView views[2]` is correct
+    here, and there is nothing to opt into.
+  - **An N-view app** enables `XR_DXR_display_info`, finds
+    `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` in `xrEnumerateViewConfigurations`,
+    and **begins its session with that type**. Only then does the runtime report (and
+    accept) the device's max view count across modes. Under `PRIMARY_STEREO` the runtime
+    reports 2 no matter what the device can do. Full model:
+    [`docs/reference/view-configuration-model.md`](../reference/view-configuration-model.md).
+
+  Then two distinct counts are in play, and conflating them is the single most common bug:
   1. `xrLocateViews` fills an array sized to `XRT_MAX_VIEWS` (8, max across all modes); only the
      first `viewCountOutput` entries are valid.
   2. The number of views you actually **render and submit** is the **active mode's**
      `viewCount`, *not* the locate output and *not* a hardcoded 2.
 
-  - **Wrong** (has shipped as `XR_ERROR_SIZE_INSUFFICIENT` — quad mode = 4 views):
+  - **Right** — pick the view configuration once, at startup (before `xrBeginSession`):
+    ```cpp
+    uint32_t n = 0;
+    xrEnumerateViewConfigurations(instance, systemId, 0, &n, nullptr);
+    std::vector<XrViewConfigurationType> types(n);
+    xrEnumerateViewConfigurations(instance, systemId, n, &n, types.data());
+
+    XrViewConfigurationType viewConfig = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    if (appRendersNViewModes) {                       // false for a stereo-fixed app
+        for (auto t : types)
+            if (t == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) { viewConfig = t; break; }
+    }
+    // use `viewConfig` for xrEnumerateViewConfigurationViews, XrSessionBeginInfo
+    // ::primaryViewConfigurationType AND XrViewLocateInfo::viewConfigurationType.
+    ```
+    Never hardcode the DXR type: it is only enumerated when `XR_DXR_display_info` is enabled,
+    and naming it otherwise is `XR_ERROR_VALIDATION_FAILURE`. In-tree that probe is packaged
+    as a one-call header-only helper — `DxrSelectViewConfigType(instance, systemId)` in
+    `test_apps/common/dxr_view_config.h` — which returns `PRIMARY_MULTIVIEW_DXR` when the
+    runtime enumerates it and degrades to `PRIMARY_STEREO` otherwise, so it is safe to call
+    unconditionally. Store the result once and feed **that same variable** to every
+    view-configuration-typed call.
+  - **Wrong for an N-view app** (has shipped as `XR_ERROR_SIZE_INSUFFICIENT` — quad mode =
+    4 views). Perfectly fine for a stereo-fixed app on `PRIMARY_STEREO`:
     ```cpp
     XrView views[2];
-    xrLocateViews(session, ..., 2, &count, views);   // too small
+    xrLocateViews(session, ..., 2, &count, views);   // too small under MULTIVIEW_DXR
     for (int eye = 0; eye < 2; eye++) { ... }          // hardcoded 2
     ```
     Documented at `docs/specs/runtime/multiview-tiling.md:176`.
+  - **Wrong, and the one the linter now flags as an error:** deriving `eyeCount` from
+    `xrEnumerateDisplayRenderingModesDXR`'s per-mode `viewCount` while still beginning
+    `PRIMARY_STEREO`. The runtime reports 2 and rejects a `viewCount > 2` submission, so the
+    app breaks the first time it lands in a 4-view mode. Enumerate rendering modes **and**
+    opt into `PRIMARY_MULTIVIEW_DXR`, or stay stereo-fixed on both.
   - **Right** — locate into 8:
     ```cpp
     uint32_t viewCount = 8;  XrView views[8];
@@ -243,10 +285,16 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     EndFrame(..., projectionViews.data(), eyeCount);        // submit eyeCount, not 2
     ```
     (`test_apps/handle/cube_handle_d3d11_win/main.cpp:404-415,719,761,791-793`)
+  - Submitting **fewer** views than the active mode has tiles is always legal — the
+    compositor paints the first `eyeCount` tiles (and collapses `eyeCount == 1` to a full
+    mono tile). Submitting **more** than the begun view configuration allows is not.
 
 - **INV-3.2 — Use dynamic/`XRT_MAX_VIEWS`-sized arrays for projection views.** Allocate
   `std::vector<XrCompositionLayerProjectionView>(eyeCount, ...)` each frame. Ref:
   `main.cpp:412`; VK equivalent `test_apps/handle/cube_handle_vk_win/main.cpp:537,566`.
+  A stereo-fixed app on `PRIMARY_STEREO` may use a fixed 2-element array — `eyeCount` there
+  is only ever 1 or 2 — but the dynamic form costs nothing and survives a later opt-in to
+  `PRIMARY_MULTIVIEW_DXR`.
 
 ---
 
@@ -258,7 +306,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `docs/specs/runtime/swapchain-model.md:6-21`.
 
 - **INV-4.2 — Size the app swapchain once, to the worst-case atlas across all modes.** Do not
-  resize it on window resize or mode change.
+  resize it on window resize or mode change. This is unchanged by which view configuration you
+  begin (INV-3.1): the atlas geometry comes from the **rendering mode's** tile grid, which a
+  stereo-fixed app can still be placed into — it just paints the first two tiles.
   ```cpp
   for (mode i) {
       aw = tileColumns[i] * scaleX[i] * displayPixelWidth;
@@ -817,7 +867,7 @@ macOS app (no manifest → no Android findings).
 - [ ] Display info queried once via `XrSystemProperties`, treated as static (INV-2.1)
 - [ ] Modes enumerated; active mode tracked via the *event*, not set locally (INV-2.4); per-mode state re-derived each frame (INV-2.6)
 - [ ] (MANUAL eye tracking) `XrEventDataEyeTrackingStateChangedDXR` handled — own transition + 2D mode request on loss (INV-2.8)
-- [ ] `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
+- [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; render/submit `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
