@@ -411,6 +411,27 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     VK render-pass `loadOp = CLEAR` per per-slice framebuffer). Tiled views are immune — their tile
     viewports occupy disjoint depth regions and share one clear. Ref: `#613`, `#681`.
 
+- **INV-4.9 — On a view-size change, MOVE `subImage.imageRect`. Never reallocate from the event
+  handler.** An app that enables the Khronos
+  [`XR_EXT_view_configuration_views_change`](../specs/extensions/XR_EXT_view_configuration_views_change.md)
+  gets `XrEventDataViewConfigurationViewsChangedEXT` whenever
+  `xrEnumerateViewConfigurationViews` would return different `recommendedImageRect*` values.
+  **Do not call `xrCreateSwapchain` from that handler.** Re-enumerate, recompute your tile rects,
+  and keep the swapchain you already have.
+
+  Why this is safe rather than merely allowed: the extension forbids the runtime from ever moving
+  `maxImageRect*` or either sample count — **only the two `recommended*` fields change** — and
+  INV-4.2 already requires you to size at the worst case. So, in the spec's own words, *an app that
+  sized at `maxImageRect*` never needs to reallocate*. No VU ties the event to swapchain lifetime:
+  `xrCreateSwapchain` is a `should:` and ignoring the event entirely is an explicit `may:`.
+
+  The anti-pattern is real and has a name — LÖVR's handler calls `createSwapchains()`
+  unconditionally on the event. Copying that shape reintroduces exactly the reallocation stutter
+  the worst-case swapchain exists to prevent. Filter on **both** `systemId` and
+  `viewConfigurationType` (the event is instance-level and carries no `XrSession`), and expect at
+  most one event per view configuration per second — the runtime coalesces, as the spec requires.
+  Advisory rule (WARN). Ref: `#1488`.
+
 ---
 
 ## 5. Texture apps: express regions via display-zones
@@ -871,6 +892,7 @@ macOS app (no manifest → no Android findings).
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
 - [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
+- [ ] (if `XR_EXT_view_configuration_views_change` is enabled) the handler re-enumerates and **moves `subImage.imageRect`** — no `xrCreateSwapchain` from the event; filters on `systemId` **and** `viewConfigurationType` (INV-4.9)
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)

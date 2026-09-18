@@ -74,6 +74,13 @@ extern "C" {
 #define XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR               ((XrStructureType)1004999150)
 #define XR_TYPE_DISPLAY_ZONE_DXR                            ((XrStructureType)1004999151)
 #define XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR            ((XrStructureType)1004999152)
+// DEPRECATED, NEVER EMITTED (runtime#1488). The value stays allocated — it is
+// permanently reserved and must never be reused — so consumers that `case` on
+// it, and displayxr-unreal's abi-guard, keep compiling. The runtime has no
+// push site for it and never had one; nothing will ever queue it. Poll
+// xrGetDisplayZoneRecommendedViewSizeDXR per zone instead (what shipping code
+// already does), or, for the single-size case, enable
+// XR_EXT_view_configuration_views_change.
 #define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR ((XrStructureType)1004999153)
 #define XR_TYPE_DISPLAY_ZONE_FEATHER_DXR                    ((XrStructureType)1004999154)
 
@@ -184,11 +191,27 @@ typedef struct XrDisplayZonesFrameEndInfoDXR {
  * @brief Advisory: per-zone recommended view sizes may have changed
  *        (display-mode / tile-count switch, window DPI change).
  *
- * Re-query each zone via xrGetDisplayZoneRecommendedViewSizeDXR; stale sizes
- * stay correct, just soft (the runtime scaled-blits view tiles to rects). The
- * N-zone analog of XrEventDataLocal3DZoneViewSizeChangedDXR (which is
- * single-size and cannot describe N zones; it keeps firing for legacy
- * sessions).
+ * @deprecated DEPRECATED AND NEVER EMITTED (runtime#1488). This event was
+ * specified as the N-zone successor to XrEventDataLocal3DZoneViewSizeChangedDXR
+ * but was never wired at either end: the runtime has no push site for it, and
+ * the one real zone-metrics consumer already routes around it by polling. The
+ * TYPE is kept — deleting it would be a source break for anything that `case`s
+ * on it, including displayxr-unreal's abi-guard — but no runtime will ever
+ * queue it, and no app should wait on it.
+ *
+ * What to do instead:
+ *   - PER-ZONE sizes: poll xrGetDisplayZoneRecommendedViewSizeDXR for each zone
+ *     (per frame is cheap, or on any resize you already observe). This is the
+ *     shipping path.
+ *   - SINGLE-SIZE sessions: enable XR_EXT_view_configuration_views_change and
+ *     re-read xrEnumerateViewConfigurationViews on
+ *     XrEventDataViewConfigurationViewsChangedEXT. That event is instance-level
+ *     and carries one size, so it cannot describe N zones — hence the split.
+ *
+ * Either way: stale sizes stay correct, just soft (the runtime scaled-blits
+ * view tiles to rects), and an app sized at maxImageRect* per ADR-010 never
+ * needs to reallocate — move subImage.imageRect.
+ * See docs/specs/extensions/XR_EXT_view_configuration_views_change.md.
  */
 typedef struct XrEventDataDisplayZoneMetricsChangedDXR {
     XrStructureType          type;    //!< XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR
@@ -207,8 +230,9 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetDisplayZoneRecommendedViewSizeDXR)(
 //! Local2D rects (client-window pixels) should be authored against this so a
 //! minimized engine tile (whose backbuffer can't track the OS resize) can
 //! re-fit each frame. Standalone: the client's own window client-area size.
-//! 0x0 before the slot binds. Re-query per frame (cheap) or on
-//! XrEventDataDisplayZoneMetricsChangedDXR.
+//! 0x0 before the slot binds. Re-query PER FRAME (cheap) — the old advice to
+//! wait on XrEventDataDisplayZoneMetricsChangedDXR is dead, that event is
+//! deprecated and never emitted (runtime#1488).
 typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceTileSizeDXR)(
     XrSession session, XrExtent2Di* tileSize);
 

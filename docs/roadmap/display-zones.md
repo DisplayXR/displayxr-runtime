@@ -37,7 +37,12 @@ consumer change is this one, after the runtime phases land.
 
 ```c
 while (running) {
-    poll_events();  // XrEventDataDisplayZoneMetricsChangedDXR -> re-query + recreate swapchains
+    poll_events();  // no zone-metrics doorbell exists: XrEventDataDisplayZoneMetricsChangedDXR
+                    // is deprecated and NEVER emitted (runtime#1488). Re-query each zone with
+                    // xrGetDisplayZoneRecommendedViewSizeDXR (per frame is cheap), and MOVE
+                    // subImage.imageRect rather than recreating swapchains — an app sized at
+                    // maxImageRect* per ADR-010 never needs to reallocate. Single-size sessions
+                    // can instead enable XR_EXT_view_configuration_views_change.
 
     xrWaitFrame(); xrBeginFrame();
 

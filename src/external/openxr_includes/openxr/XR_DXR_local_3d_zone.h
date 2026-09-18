@@ -55,7 +55,15 @@ extern "C" {
 // reserved it first). No struct/field/entry-point changes; consumers only
 // need a header re-sync + rebuild. See README.md (allocation registry) in
 // this directory.
-#define XR_DXR_local_3d_zone_SPEC_VERSION 4
+// SPEC_VERSION 5 (runtime#1488): XrEventDataLocal3DZoneViewSizeChangedDXR is
+// SOFT-DEPRECATED in favour of the Khronos XR_EXT_view_configuration_views_change
+// event (extension 840, OpenXR SDK 1.1.58). It is STILL EMITTED, with an
+// UNCHANGED layout, and will keep being emitted — no struct/field/entry-point
+// change, no ABI break, no consumer rebuild. New apps should prefer the EXT
+// event, which is standard and carries the same information through
+// xrEnumerateViewConfigurationViews. Adoption note:
+// docs/specs/extensions/XR_EXT_view_configuration_views_change.md.
+#define XR_DXR_local_3d_zone_SPEC_VERSION 5
 #define XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME "XR_DXR_local_3d_zone"
 
 // Extension type-value range (1004999xxx); replace with a Khronos-assigned
@@ -202,10 +210,21 @@ typedef struct XrCompositionLayerLocal2DDXR {
  * @brief Queued when the runtime's recommended view size changes — mask
  *        activation / deactivation / window resize (spec v3, #439 Phase 3).
  *
- * The app should recreate its projection swapchains at the new size. Purely
- * advisory — the projection pass scales arbitrary submitted sizes, so a
- * laggy app stays correct (just soft); there is no hard protocol step.
- * Fired only when the dimensions actually change.
+ * @deprecated SOFT-DEPRECATED in spec v5 (runtime#1488) in favour of the
+ * Khronos XR_EXT_view_configuration_views_change event
+ * (XrEventDataViewConfigurationViewsChangedEXT). This event is STILL EMITTED
+ * with an unchanged layout — nothing breaks — but consumers should prefer the
+ * EXT event: it is standard, it is what engines will eventually route, and it
+ * pairs with a re-read of xrEnumerateViewConfigurationViews.
+ *
+ * Purely advisory in BOTH spellings, and the advice is the same: an app sized
+ * at maxImageRect* per ADR-010 never needs to reallocate — MOVE
+ * subImage.imageRect, do not recreate the swapchain. The projection pass
+ * scales arbitrary submitted sizes, so a laggy app stays correct (just soft);
+ * there is no hard protocol step. Fired only when the dimensions actually
+ * change.
+ *
+ * See docs/specs/extensions/XR_EXT_view_configuration_views_change.md.
  */
 typedef struct XrEventDataLocal3DZoneViewSizeChangedDXR {
     XrStructureType          type;   //!< XR_TYPE_EVENT_DATA_LOCAL_3D_ZONE_VIEW_SIZE_CHANGED_DXR

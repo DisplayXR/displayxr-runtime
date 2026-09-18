@@ -199,7 +199,9 @@ alive for single-canvas apps instead of deprecating a months-old extension.
 The cost — apps enable three extensions instead of one — is one line of code.
 
 New surface in full: `XrDisplayZoneCapabilitiesDXR`, `XrDisplayZoneDXR`,
-`XrDisplayZonesFrameEndInfoDXR`, `XrEventDataDisplayZoneMetricsChangedDXR`,
+`XrDisplayZonesFrameEndInfoDXR`, `XrEventDataDisplayZoneMetricsChangedDXR`
+(**retired, never emitted** — runtime#1488; the type remains for source
+compatibility, apps poll `xrGetDisplayZoneRecommendedViewSizeDXR` instead),
 `xrGetDisplayZoneCapabilitiesDXR`, `xrGetDisplayZoneRecommendedViewSizeDXR`.
 Type values 1004999150–153. Header-level sketch:
 `docs/specs/extensions/XR_DXR_display_zones.md`.
@@ -338,8 +340,14 @@ substitutes rig tunables on every zone-scoped locate; zone rects stay app-owned
   zero-copy tiling is off in zones mode — the same costs supersede mode already
   pays today whenever Local2D is active. Zone swapchains are fixed-size; an
   animating rect is scaled-blitted (precedent: ADR-010 worst-case sizing),
-  trading sharpness — apps wanting 1:1 recreate on resize, prompted by
-  `XrEventDataDisplayZoneMetricsChangedDXR` + `xrGetDisplayZoneRecommendedViewSizeDXR`.
+  trading sharpness — apps wanting 1:1 recreate on resize, prompted by polling
+  `xrGetDisplayZoneRecommendedViewSizeDXR` per zone. (The doorbell this ADR
+  originally paired with that poll, `XrEventDataDisplayZoneMetricsChangedDXR`,
+  was never wired at either end and is **retired, never emitted** — runtime#1488.
+  For a single-size session the Khronos `XR_EXT_view_configuration_views_change`
+  now covers the doorbell role; it is instance-level and carries one size, so it
+  cannot describe N zones. Either way, an app sized at `maxImageRect*` per
+  ADR-010 never *needs* to reallocate — move `subImage.imageRect`.)
 - IPC: the zone rect rides the rig-chained locate (already server-routed); the
   zone layer serializes like projection + 16 bytes; the wish mask is the one
   genuinely new cross-process surface and may slip independently.
