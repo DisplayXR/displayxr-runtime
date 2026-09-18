@@ -242,6 +242,19 @@ if(TARGET tests_oxr_view_space)
 	set_tests_properties(
 		tests_oxr_view_space_mode_pinned PROPERTIES ENVIRONMENT "SIM_DISPLAY_FORCE_MODE=4"
 		)
+
+	# #1499 kill switch, in a process of its OWN for the third time: the runtime
+	# reads DXR_MODE_FLOOR through DEBUG_GET_ONCE_BOOL_OPTION, so a process that
+	# has already answered "on" cannot also answer "off". This is what makes the
+	# switch mean something -- the other arms only prove that the TEST reads the
+	# variable, not that the runtime does.
+	add_test(NAME tests_oxr_view_space_mode_floor_off
+		 COMMAND tests_oxr_view_space "[mode_floor_off]" --success --allow-running-no-tests
+		)
+	set_tests_properties(
+		tests_oxr_view_space_mode_floor_off
+		PROPERTIES ENVIRONMENT "SIM_DISPLAY_OUTPUT=quad;DXR_MODE_FLOOR=0"
+		)
 endif()
 
 # #1380 — the sim_input scripted NAVIGATION device: the hardware-free reference

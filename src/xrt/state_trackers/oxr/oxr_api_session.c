@@ -1531,29 +1531,65 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	 * floor just took it out of, and the runtime would have no honest answer
 	 * for the tiles that stay at the clear colour.
 	 *
+	 * THE SAME TWO CARVE-OUTS AS THE FLOOR, through the same helper. This is
+	 * not symmetry for its own sake:
+	 *   - a PINNED device (SIM_DISPLAY_FORCE_MODE) is never floored, so it is
+	 *     sitting in its pinned mode - and denying it would mean refusing a
+	 *     session permission to re-request the mode it is already in. The
+	 *     DEVICE is the authority there; it swallows the request and says so.
+	 *   - in service mode the panel lease owns the display-global mode, so
+	 *     this request has to REACH the lease holder (the forward just below).
+	 *     Answering it here would decide a question that is not ours, and the
+	 *     lease holder may legitimately be moving the panel for someone else.
+	 * Getting this wrong is exactly what the first cut of this gate did.
+	 *
 	 * Gated on the session having BEGUN a view configuration, because that is
-	 * what makes "how many views can it submit?" a real question. A session
-	 * that was created but never begun is not a painter: the shell's
-	 * workspace-controller session (shell_openxr.cpp) calls this entry point
-	 * to drive the PANEL on behalf of its clients and never begins a frame
-	 * loop of its own, so gating it would break the workspace. It is also why
-	 * this sits AFTER the range check and BEFORE the service-mode forward: a
-	 * request this session cannot fill never leaves the process.
+	 * what makes "how many views can it submit?" a real question, and on the
+	 * session not being an ORCHESTRATOR. A workspace controller and a bridge
+	 * relay drive the PANEL on behalf of their clients rather than painting
+	 * into it, so a painter's constraint does not apply to them: the shell's
+	 * controller session (shell_openxr.cpp) never begins a frame loop at all,
+	 * and the two explicit flags cover the in-process controller and relay
+	 * cases that a has-begun test alone would catch by accident.
+	 *
+	 * The relay case is not hypothetical and not narrow: is_bridge_relay is
+	 * set for ANY session with XR_DXR_display_info + XR_MND_headless
+	 * (oxr_session.c), i.e. every headless display-aware session. Such a
+	 * session has no compositor and submits nothing, so its own view count
+	 * measures the wrong thing entirely - the pixels belong to a separate,
+	 * graphics-bound session elsewhere, which gets the S4 observation warning
+	 * if the resulting mode does not suit it. The controller path above
+	 * already treats `compositor == NULL` as a mode-authority holder for the
+	 * same reason. CONSEQUENCE FOR TESTS: this rule can only be exercised
+	 * end-to-end by a GRAPHICS-BOUND session; the headless suite pins the
+	 * exemption instead.
+	 *
+	 * Placed AFTER the range check and BEFORE the service-mode forward, so a
+	 * request the caller could not fill never leaves the process - while a
+	 * request we are not entitled to judge still does.
 	 *
 	 * Returns XR_SUCCESS with an event, not an error: both request entry
 	 * points answer at call time and report the outcome by event (v17/#961).
 	 */
 	if (oxr_session_mode_floor_enabled() && oxr_frame_sync_is_session_running(&sess->frame_sync) &&
-	    !oxr_mode_fillable_by(&head->rendering_modes[modeIndex], sess->view_config_view_count)) {
-		U_LOG_W(
-		    "oxr: DENYING rendering mode %u ('%s', %u views) - this session's view "
-		    "configuration (0x%08x) reports %u views, so it cannot fill that mode (#1499)",
-		    modeIndex, head->rendering_modes[modeIndex].mode_name, head->rendering_modes[modeIndex].view_count,
-		    (uint32_t)sess->view_config_type, sess->view_config_view_count);
-		oxr_event_push_XrEventDataDisplayModeRequestDenied(
-		    &log, sess, modeIndex, /*requestedHardware3D=*/-1,
-		    XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL);
-		return XR_SUCCESS;
+	    !sess->is_active_workspace_controller && !sess->is_bridge_relay &&
+	    oxr_session_may_move_display_mode(sess, head, NULL, NULL)) {
+		// Same fallback as the floor: a session that somehow has no view
+		// count yet is a 2-view session, NOT a session that can fill nothing
+		// (passing 0 to oxr_mode_fillable_by would deny every mode).
+		const uint32_t max_submit = sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+
+		if (!oxr_mode_fillable_by(&head->rendering_modes[modeIndex], max_submit)) {
+			U_LOG_W(
+			    "oxr: DENYING rendering mode %u ('%s', %u views) - this session's view "
+			    "configuration (0x%08x) reports %u views, so it cannot fill that mode (#1499)",
+			    modeIndex, head->rendering_modes[modeIndex].mode_name,
+			    head->rendering_modes[modeIndex].view_count, (uint32_t)sess->view_config_type, max_submit);
+			oxr_event_push_XrEventDataDisplayModeRequestDenied(
+			    &log, sess, modeIndex, /*requestedHardware3D=*/-1,
+			    XRT_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL);
+			return XR_SUCCESS;
+		}
 	}
 
 	// #961: service-mode APP path — forward to the panel-lease holder and let

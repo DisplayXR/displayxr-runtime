@@ -207,14 +207,41 @@ TEST_CASE("degenerate pick inputs are returned untouched (#1499)", "[oxr][mode_f
 	CHECK(oxr_pick_fillable_mode_index(kSim, kSimCount, 1, 0) == 1);
 }
 
+/*
+ * The carve-out both call sites share.
+ *
+ * The runtime-side helper is oxr_session_may_move_display_mode(), which is NOT
+ * host-drivable - it queries the head device for
+ * XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED and reads the system compositor's
+ * is_service_mode. Its DECISION, though, is this pure function, and that is the
+ * half that has to be right: the begin-time floor and the request denial are
+ * the same rule pointing in two directions, and when they disagreed (the first
+ * cut of the denial gate skipped these entirely) the result was a pinned
+ * session being refused permission to re-request the mode it was already in,
+ * and a service-mode client's request never reaching the lease holder.
+ */
 TEST_CASE("only an unpinned, non-service device may be floored (#1499)", "[oxr][mode_fillable]")
 {
 	CHECK(oxr_may_demote(false, false));
 	// SIM_DISPLAY_FORCE_MODE: the dev pin outranks the floor, deliberately —
-	// it is what keeps the N-view under-submit path testable.
+	// it is what keeps the N-view under-submit path testable. It equally
+	// outranks the DENIAL: the device holds the mode, so the runtime has no
+	// business refusing a request for the mode the session is already in.
 	CHECK_FALSE(oxr_may_demote(true, false));
-	// Service mode: the panel lease owns the display-global mode. #1499 tells
-	// the session (S4's observation WARN) instead of clamping it.
+	// Service mode: the panel lease owns the display-global mode, so the
+	// request must be FORWARDED, not answered locally. #1499 tells the session
+	// (S4's observation WARN) instead of clamping it.
 	CHECK_FALSE(oxr_may_demote(false, true));
 	CHECK_FALSE(oxr_may_demote(true, true));
+
+	// Stated as the truth table both call sites are required to share: the
+	// runtime may act on its own opinion of the mode in exactly one of the
+	// four states.
+	uint32_t may = 0;
+	for (int pinned = 0; pinned < 2; pinned++) {
+		for (int service = 0; service < 2; service++) {
+			may += oxr_may_demote(pinned != 0, service != 0) ? 1u : 0u;
+		}
+	}
+	CHECK(may == 1u);
 }
