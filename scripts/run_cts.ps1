@@ -16,21 +16,24 @@
 .PARAMETER Plugin     sim-display (default) | leia-sr | none (leave plugins as-is)
 .PARAMETER Graphics   d3d11 (default) | d3d12 | vulkan | opengl
 .PARAMETER ApiVersion 1.1 (default) | 1.0
-.PARAMETER TestSpec   Catch2 spec; default
-                      "exclude:[interactive]~xrLocateSpace_xrLocateViews"
+.PARAMETER TestSpec   Catch2 spec; default "exclude:[interactive]"
 
-                      KNOWN-RED EXCLUSION (#1486): xrLocateSpace_xrLocateViews
-                      (added CTS 1.1.57) asserts views.size() == 2 for
-                      PRIMARY_STEREO. DisplayXR advertises PRIMARY_STEREO with
-                      the max-across-modes view count (4 on sim-display, which
-                      has a Quad mode), so the test fails by construction. It is
-                      excluded BY NAME — not silently — until the deviation is
-                      fixed; we do not claim conformance on it. Rationale +
-                      planned fix: docs/reference/view-configuration-model.md.
-                      Catch2 note: patterns inside ONE filter are ANDed
-                      (all m_required match, no m_forbidden matches); a comma
-                      would start a SECOND filter and the two are OR'd, which
-                      would not exclude anything. Hence no comma here.
+                      No known-red exclusions. The #1486 exclusion of
+                      xrLocateSpace_xrLocateViews (that test asserts
+                      views.size() == 2 for PRIMARY_STEREO, which the old
+                      max-across-modes mapping could not satisfy on sim-display)
+                      was REMOVED once PRIMARY_STEREO began reporting exactly 2
+                      and the N-view path moved to
+                      XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR. That
+                      test passing is now the acceptance signal for the view
+                      configuration model — see
+                      docs/reference/view-configuration-model.md. If a future
+                      known-red has to be excluded, exclude it BY NAME with a
+                      comment naming its issue, and note that Catch2 patterns
+                      inside ONE filter are ANDed (all m_required match, no
+                      m_forbidden matches) — a comma starts a SECOND filter and
+                      filters are OR'd, so an appended exclusion must carry no
+                      comma or it excludes nothing.
 .PARAMETER TimeoutSec Kill + restore after this many seconds (default 1800)
 .PARAMETER Tag        Label for output files (default automated_<graphics>_<api>)
 #>
@@ -38,9 +41,9 @@ param(
   [string]$Plugin     = "sim-display",
   [string]$Graphics   = "d3d11",
   [string]$ApiVersion = "1.1",
-  # See .PARAMETER TestSpec above for why xrLocateSpace_xrLocateViews is
-  # excluded by name (#1486 — docs/reference/view-configuration-model.md).
-  [string]$TestSpec   = "exclude:[interactive]~xrLocateSpace_xrLocateViews",
+  # No known-red exclusions — see .PARAMETER TestSpec above (#1486 removed the
+  # last one; docs/reference/view-configuration-model.md).
+  [string]$TestSpec   = "exclude:[interactive]",
   [int]   $TimeoutSec = 1800,
   [string]$Tag        = "",
   # Enable the CTS's required XR_APILAYER_KHRONOS_runtime_conformance layer for a
