@@ -3272,8 +3272,11 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         }
 
         const uint32_t n = viewCountOutput < z.tileCount ? viewCountOutput : z.tileCount;
-        submitViewCounts[zi] = n;
-        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        // ADR-041: a zone layer is an XrCompositionLayerProjection too, so it
+        // goes through the same gate — render n tiles, submit every located
+        // view, alias the inactive tail after the fill loop below.
+        submitViewCounts[zi] = viewCountOutput;
+        projViews[zi].assign(viewCountOutput, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render-ready views -> matrices. ZDP-anchored clip: near = ez - vH,
         // far = ez + 1000*vH (identity rig here, so ez = pose z). Same
@@ -3301,6 +3304,10 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
             projViews[zi][vi].pose = v.pose;
             projViews[zi][vi].fov = v.fov;
         }
+
+        // ADR-041: the inactive tail keeps its own located pose/fov and aliases
+        // tile 0's subimage — zone-sized, which is what this layer wants.
+        DxrAliasInactiveViews(projViews[zi].data(), zoneViews, viewCountOutput, n);
 
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;
@@ -3711,8 +3718,17 @@ int main() {
                     ? xr.renderingModeTileRows[xr.currentModeIndex] : 1;
                 int eyeCount = display3D ? (int)modeViewCount : 1;
 
+                // ADR-041: the projection layer must carry EVERY view
+                // xrLocateViews returns, not just the ones the active mode
+                // renders. That count is the view configuration's, so the array
+                // can be sized here; the locate below narrows it if it ever
+                // disagrees. Render eyeCount tiles, submit locatedCount views.
+                uint32_t locatedCount = xr.configViews.empty()
+                    ? (uint32_t)eyeCount : (uint32_t)xr.configViews.size();
+                if (eyeCount > (int)locatedCount) eyeCount = (int)locatedCount;
+
                 // Dynamic arrays for N-view rendering
-                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                std::vector<XrCompositionLayerProjectionView> projectionViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
                 if (frameState.shouldRender) {
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -3883,6 +3899,17 @@ int main() {
                                 projectionViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                                 projectionViews[eye].fov = submitFov;
                             }
+
+                            // ADR-041: fill the inactive tail
+                            // [eyeCount, locatedCount). Each keeps its OWN
+                            // located pose/fov; only the subimage is aliased
+                            // onto view 0's, and the runtime discards it.
+                            if (viewCount > 0 && viewCount < locatedCount) {
+                                locatedCount = viewCount;
+                            }
+                            DxrAliasInactiveViews(projectionViews.data(), views.data(),
+                                                  locatedCount, (uint32_t)eyeCount);
+
                             RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
 
                             // 'I' key: snapshot the multi-view atlas via the
@@ -3955,10 +3982,10 @@ int main() {
                     SubmitWindowSpaceHudFrame(
                         xr.session, xr.localSpace, frameState.predictedDisplayTime,
                         XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
-                        projectionViews.data(), (uint32_t)eyeCount,
+                        projectionViews.data(), locatedCount,
                         hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
                 } else if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), (uint32_t)eyeCount);
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), locatedCount);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;

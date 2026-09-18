@@ -54,6 +54,7 @@ RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
+    "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in test_apps/common/dxr_view_config.h). Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
     "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
@@ -178,6 +179,22 @@ MULTIVIEW_OPT_IN = re.compile(
 MODE_ENUM_MARKER = re.compile(
     r"xrEnumerateDisplayRenderingModesDXR|renderingModeCount|XrDisplayRenderingModeInfoDXR"
 )
+
+# INV-3.4 (ADR-041). Two markers, and the pair is the whole check:
+#
+#   SUBMITS_PROJECTION — does the app build an XrCompositionLayerProjection at
+#       all? A probe that only drives the XR_DXR_weave RPC has an
+#       XrWeaveSubmitLayoutDXR::viewCount and never reaches xrEndFrame, so it is
+#       out of scope (weave_probe_vk_macos, weave_rpc_probe_d3d11_win).
+#   ALIASES_INACTIVE — does it fill the inactive tail? DxrAliasInactiveViews() is
+#       the in-tree way; an app that rolls its own loop should still name it in a
+#       comment so this check can see it.
+#
+# The check only fires for an app whose per-frame count is MODE-DERIVED. An app
+# that renders every located view every frame has no tail to alias and needs
+# nothing.
+SUBMITS_PROJECTION = re.compile(r"\bXrCompositionLayerProjection\b(?!View)")
+ALIASES_INACTIVE = re.compile(r"\bDxrAliasInactiveViews\b")
 # Explicit opt-OUT for an app that enumerates rendering modes but is
 # deliberately 2-view (hard-capped submission, or never submits a projection
 # layer at all — e.g. a weave-RPC probe). The marker is a COMMENT token, so it is
@@ -276,6 +293,36 @@ def scan_sources(root: Path, findings: list):
                 "If this is meant to be an N-view app, begin the session with "
                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (enumerate it first; it needs "
                 "XR_DXR_display_info) and size view arrays to XRT_MAX_VIEWS.",
+            ))
+
+    # INV-3.4 (ADR-041): a mode-derived count that is SUBMITTED as-is is
+    # under-submit. The app must submit what xrLocateViews returned and alias the
+    # inactive tail. Scoped to apps that both derive a count from the rendering
+    # mode AND build a projection layer — a stereo-fixed app that always renders
+    # both located views has no tail, and a weave-RPC probe never reaches
+    # xrEndFrame at all.
+    if not stereo_fixed_marked and not any(ALIASES_INACTIVE.search(t) for _, t in files):
+        proj_loc = None
+        for path, text in files:
+            if not MODE_ENUM_MARKER.search(text):
+                continue
+            m = SUBMITS_PROJECTION.search(text)
+            if m:
+                proj_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if proj_loc:
+            p, ln = proj_loc
+            findings.append(Finding(
+                ERROR, "INV-3.4", p, ln,
+                "Mode-derived view count submitted as the projection layer's viewCount — "
+                "xrEndFrame now requires the LOCATED count for every view configuration type "
+                "(ADR-041); the active count is under-submit and is refused.",
+                "Size the projection-view array to xrLocateViews' viewCountOutput, render only "
+                "the active views, then call DxrAliasInactiveViews(projViews, views, located, "
+                "active) (test_apps/common/dxr_view_config.h) and submit `located`. Chain "
+                "XrViewActivityStateDXR on XrViewState to read the active count from the "
+                "runtime instead of deriving it. 3D zone layers are projection layers and need "
+                "the same treatment, per zone.",
             ))
 
     swapchain_loc = None

@@ -2444,8 +2444,11 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         }
 
         const uint32_t n = viewCountOutput < z.tileCount ? viewCountOutput : z.tileCount;
-        submitViewCounts[zi] = n;
-        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        // ADR-041: a zone layer is an XrCompositionLayerProjection too, so it
+        // goes through the same gate — render n tiles, submit every located
+        // view, alias the inactive tail after the fill loop below.
+        submitViewCounts[zi] = viewCountOutput;
+        projViews[zi].assign(viewCountOutput, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render-ready views -> matrices. ZDP-anchored clip: near = ez - vH,
         // far = ez + 1000*vH, ez = rig-local eye distance to the zone's
@@ -2472,6 +2475,10 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
             projViews[zi][vi].pose = v.pose;
             projViews[zi][vi].fov = v.fov;
         }
+
+        // ADR-041: the inactive tail keeps its own located pose/fov and aliases
+        // tile 0's subimage — zone-sized, which is what this layer wants.
+        DxrAliasInactiveViews(projViews[zi].data(), zoneViews, viewCountOutput, n);
 
         // Acquire this zone's swapchain image and render every view tile.
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -3073,8 +3080,14 @@ int main(int argc, char **argv)
             ? app.renderingModeTileRows[app.currentModeIndex] : 1;
         int eyeCount = display3D ? (int)modeViewCount : 1;
 
+        // ADR-041: the projection layer must carry EVERY view xrLocateViews
+        // returned, not just the ones the active mode renders. Render eyeCount
+        // tiles, submit locatedCount views, alias the inactive tail below.
+        uint32_t locatedCount = (viewCount > 0) ? viewCount : (uint32_t)eyeCount;
+        if (eyeCount > (int)locatedCount) eyeCount = (int)locatedCount;
+
         // Dynamic arrays for N-view rendering
-        std::vector<XrCompositionLayerProjectionView> projViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        std::vector<XrCompositionLayerProjectionView> projViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render
         if (frameState.shouldRender && viewCount >= 1) {
@@ -3162,6 +3175,11 @@ int main(int argc, char **argv)
                 projViews[eye].fov = submitFov;
             }
 
+            // ADR-041: fill the inactive tail [eyeCount, locatedCount). Each
+            // keeps its OWN located pose/fov; only the subimage is aliased onto
+            // view 0's, and the runtime discards those pixels.
+            DxrAliasInactiveViews(projViews.data(), views.data(), locatedCount, (uint32_t)eyeCount);
+
             RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
@@ -3236,12 +3254,12 @@ int main(int argc, char **argv)
             SubmitWindowSpaceHudFrame(
                 app.session, app.localSpace, frameState.predictedDisplayTime,
                 XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
-                projViews.data(), (uint32_t)eyeCount,
+                projViews.data(), locatedCount,
                 hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
         } else {
             XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             projLayer.space = app.localSpace;
-            projLayer.viewCount = (uint32_t)eyeCount;
+            projLayer.viewCount = locatedCount;
             projLayer.views = projViews.data();
 
             // #439 cases 2/3/4: Local2D panel layers ride the normal layer

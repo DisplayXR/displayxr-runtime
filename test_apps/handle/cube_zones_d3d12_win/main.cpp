@@ -64,10 +64,11 @@
 #include <windows.h>
 #include <wrl/client.h>
 
-#include "logging.h"
-#include "xr_session.h"
 #include "d3d12_renderer.h"
+#include "dxr_view_config.h" // ADR-041: DxrAliasInactiveViews
+#include "logging.h"
 #include "projection_depth.h"
+#include "xr_session.h"
 
 #include <algorithm>
 #include <atomic>
@@ -954,6 +955,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
     const float featherPx = ZonesFeatherRadiusPx();
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
+    // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
+    uint32_t locatedViewCounts[kNumZones] = {};
 
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
@@ -1025,7 +1028,13 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         }
         const uint32_t n = (std::min)((std::min)(viewCountOutput, kZoneArraySlices), activeViewCount);
         submitViewCounts[zi] = n;
-        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        // ADR-041: each zone layer carries the LOCATED count; only the active
+        // views are rendered, the tail aliases view 0 and the runtime drops it.
+        const uint32_t locatedCount =
+            (viewCountOutput > 0) ? viewCountOutput : 2u;
+        locatedViewCounts[zi] = locatedCount;
+        projViews[zi].assign(locatedCount,
+                             {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render-ready views -> matrices. ZDP-anchored clip: near = ez - vH,
         // far = ez + 1000*vH (ez = rig-local eye z; identity rig -> pose z).
@@ -1084,6 +1093,10 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
 
         renderer.cubeRotation = savedRotation;
 
+        // ADR-041: this zone rendered only `n` views — point the inactive tail
+        // at this zone's view-0 slice so the layer can carry `locatedCount`.
+        DxrAliasInactiveViews(projViews[zi].data(), zoneViews, locatedCount, n);
+
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(z.swapchain, &ri);
     }
@@ -1101,7 +1114,8 @@ static void RenderZonesFrame(XrSessionManager& xr, D3D12Renderer& renderer,
         // Content alpha is meaningful (zone B transparent bg): premultiplied bytes.
         projLayers[zi].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         projLayers[zi].space = xr.localSpace;
-        projLayers[zi].viewCount = submitViewCounts[zi];
+        projLayers[zi].viewCount =
+            locatedViewCounts[zi]; // ADR-041: located, not active
         projLayers[zi].views = projViews[zi].data();
         layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&projLayers[zi];
     }

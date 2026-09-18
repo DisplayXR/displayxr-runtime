@@ -3137,9 +3137,14 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
             continue;
         }
 
+        // ADR-041: a zone layer is a projection layer too, so it carries the
+        // LOCATED count; only the zone's `tileCount` tiles are rendered, the
+        // tail aliases view 0 and the runtime drops it.
+        const uint32_t locatedCount = viewCountOutput;
         const uint32_t n = viewCountOutput < z.tileCount ? viewCountOutput : z.tileCount;
-        submitViewCounts[zi] = n;
-        projViews[zi].assign(n, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        submitViewCounts[zi] = locatedCount;
+        projViews[zi].assign(locatedCount,
+                             {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
         // Render-ready views -> matrices. ZDP-anchored clip: near = ez - vH,
         // far = ez + 1000*vH (identity rig here, so ez = pose z). Same recipe as
@@ -3167,6 +3172,10 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
             projViews[zi][vi].pose = v.pose;
             projViews[zi][vi].fov = v.fov;
         }
+
+        // ADR-041: fill the inactive tail — own located pose/fov, view 0's
+        // subimage.
+        DxrAliasInactiveViews(projViews[zi].data(), zoneViews, locatedCount, n);
 
         XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
         uint32_t imageIndex = 0;
@@ -3530,17 +3539,29 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            // 2-view SBS. Per-eye RENDER TILE = window × view_scale
-                            // (docs/specs/runtime/multiview-tiling.md §"Swapchain
-                            // images are worst-case sized" + ADR-010/030): the
-                            // swapchain is the worst-case `display × scale` envelope,
-                            // but a WINDOWED app renders `view = window × scale` and
-                            // the compositor crops. Using the frozen recommended tile
-                            // (= display × scale) made the window-relative Kooima fov
-                            // render into a panel-sized tile → oversized + off-center
-                            // when windowed. Query the LIVE window each frame; clamp
-                            // to the swapchain envelope.
+                            // 2-view SBS. Per-eye RENDER TILE = window ×
+                            // view_scale
+                            // (docs/specs/runtime/multiview-tiling.md
+                            // §"Swapchain images are worst-case sized" +
+                            // ADR-010/030): the swapchain is the worst-case
+                            // `display × scale` envelope, but a WINDOWED app
+                            // renders `view = window × scale` and the
+                            // compositor crops. Using the frozen recommended
+                            // tile
+                            // (= display × scale) made the window-relative
+                            // Kooima fov render into a panel-sized tile →
+                            // oversized + off-center when windowed. Query the
+                            // LIVE window each frame; clamp to the swapchain
+                            // envelope.
+                            //
+                            // ADR-041: the layer carries the LOCATED count;
+                            // only the active views are rendered, the tail
+                            // aliases view 0 and the runtime drops it.
+                            const uint32_t locatedCount =
+                                (viewCount > 0) ? viewCount : 2;
                             uint32_t eyeCount = 2;
+                            if (eyeCount > locatedCount)
+                              eyeCount = locatedCount;
                             uint32_t winW = 0, winH = 0;
                             {
                                 XWindowAttributes wa = {};
@@ -3566,7 +3587,7 @@ int main() {
                             if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
 
                             EyeRenderParams eyeParams[2];
-                            projectionViews.resize(eyeCount, {});
+                            projectionViews.resize(locatedCount, {});
                             for (uint32_t i = 0; i < eyeCount; i++) {
                                 eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
                                 eyeParams[i].viewportY = 0;
@@ -3601,6 +3622,12 @@ int main() {
                                 projectionViews[i].pose = views[i].pose;
                                 projectionViews[i].fov = views[i].fov;
                             }
+
+                            // ADR-041: fill the inactive tail — own located
+                            // pose/fov, view 0's subimage.
+                            DxrAliasInactiveViews(projectionViews.data(),
+                                                  views.data(), locatedCount,
+                                                  eyeCount);
 
                             RenderScene(vkRenderer, imageIndex, eyeParams, (int)eyeCount);
                             ReleaseSwapchainImage(xr);

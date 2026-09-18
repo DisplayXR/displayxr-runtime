@@ -12,14 +12,15 @@
 #define _UNICODE
 #include <windows.h>
 
-#include "logging.h"
-#include "input_handler.h"
-#include "xr_session.h"
-#include "d3d12_renderer.h"
-#include "hud_renderer.h"
-#include "text_overlay.h"
-#include "projection_depth.h"
 #include "atlas_capture.h"
+#include "d3d12_renderer.h"
+#include "dxr_view_config.h"
+#include "hud_renderer.h"
+#include "input_handler.h"
+#include "logging.h"
+#include "projection_depth.h"
+#include "text_overlay.h"
+#include "xr_session.h"
 
 #include <atomic>
 #include <chrono>
@@ -645,7 +646,19 @@ static void RenderThreadFunc(
                     xr->recommendedViewScaleY = xr->renderingModeScaleY[xr->currentModeIndex];
                 }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
-                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                // ADR-041: the layer carries the LOCATED count, not the active
+                // mode's. xrLocateViews always reports the view configuration's
+                // count, so it is known before the frame; only eyeCount of them
+                // are rendered and the tail is aliased below.
+                uint32_t locatedCount = !xr->configViews.empty()
+                                            ? (uint32_t)xr->configViews.size()
+                                            : (uint32_t)eyeCount;
+                if (locatedCount > 8)
+                    locatedCount = 8; // rawViews[] capacity
+                if (eyeCount > (int)locatedCount)
+                    eyeCount = (int)locatedCount;
+                std::vector<XrCompositionLayerProjectionView> projectionViews(
+                    locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                 bool rendered = false;
                 bool hudSubmitted = false;
 
@@ -850,6 +863,14 @@ static void RenderThreadFunc(
                                     stereoViews[monoMode ? 0 : eye].fov :
                                     (monoMode ? rawViews[0].fov : rawViews[rawIdx].fov);
                             }
+
+                            // ADR-041: point the inactive tail
+                            // [eyeCount, locatedCount) at view 0's subimage,
+                            // keeping each view's own located pose/fov, so the
+                            // layer is complete without rendering it.
+                            DxrAliasInactiveViews(projectionViews.data(),
+                                                  rawViews, locatedCount,
+                                                  (uint32_t)eyeCount);
 
                             // 'I' key: snapshot the multi-view atlas. Skipped
                             // for mono (1×1) layouts. RenderScene leaves the
@@ -1086,12 +1107,15 @@ static void RenderThreadFunc(
                 // build the layer list manually (projection + panels in list
                 // order) and submit raw — the shared EndFrame helpers don't
                 // carry the Local2D layer type. Otherwise the normal paths.
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
-                LOG_INFO("[FRAME] EndFrame: rendered=%d hudSubmitted=%d viewCount=%u", rendered, hudSubmitted, submitViewCount);
+                // ADR-041: submit the located count (the rendered count is
+                // eyeCount).
+                LOG_INFO("[FRAME] EndFrame: rendered=%d hudSubmitted=%d "
+                         "viewCount=%u (rendered=%d)",
+                         rendered, hudSubmitted, locatedCount, eyeCount);
                 if (g_l2dActive && g_panel1.swapchain != XR_NULL_HANDLE) {
                     XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
                     projLayer.space = xr->localSpace;
-                    projLayer.viewCount = (uint32_t)eyeCount;
+                    projLayer.viewCount = locatedCount;
                     projLayer.views = projectionViews.data();
 
                     XrCompositionLayerLocal2DDXR panel1Layer = {
@@ -1152,10 +1176,13 @@ static void RenderThreadFunc(
                     float fracW = HUD_WIDTH_FRACTION;
                     float fracH = fracW * windowAR / hudAR;
                     if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
-                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews.data(),
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount);
+                    EndFrameWithWindowSpaceHud(
+                        *xr, frameState.predictedDisplayTime,
+                        projectionViews.data(), 0.0f, 0.0f, fracW, fracH, 0.0f,
+                        locatedCount);
                 } else if (rendered) {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews.data(), submitViewCount);
+                    EndFrame(*xr, frameState.predictedDisplayTime,
+                             projectionViews.data(), locatedCount);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
