@@ -160,6 +160,25 @@
     "_schema": {
       "gate": "How the consumer behaves against a too-old runtime. hard = refuses or chains an upgrade. soft = degrades with a warning. none = no check at all.",
       "spec_sources": "Files to scan for `#define XR_DXR_<ext>_SPEC_VERSION <n>`. The ext segment is matched case-insensitively -- Unity writes XR_DXR_DISPLAY_INFO_SPEC_VERSION, the runtime writes XR_DXR_display_info_SPEC_VERSION -- and normalised to the runtime's lowercase header naming.",
+      "spec_sources[]": [
+        "Each item is EITHER a string -- a path in THIS consumer's repo at its default",
+        "branch, the original and still the common case -- OR an object",
+        "{repo, ref, path} naming a DIFFERENT repo at a pinned ref.",
+        "",
+        "The object form exists for a consumer that vendors no headers at all and",
+        "clones them at build time: it has nothing of its own to point at, so the",
+        "readable source is THE PIN. The shell is the worked example. Use it ONLY",
+        "together with pin_sync -- an unproven ref would let the audit derive a",
+        "confident floor from headers the consumer never compiled against, which is",
+        "worse than not auditing it."
+      ],
+      "pin_sync": [
+        "Required companion to any pinned-ref spec_sources entry. {file, regex} in",
+        "the CONSUMER's own repo at its default branch; capture group 1 must equal",
+        "the spec_sources ref. A mismatch is a consumer-floor-pin-desync FINDING (the",
+        "two halves of the pin have drifted apart); an unreadable file or a regex that",
+        "does not match is a note naming the unchecked ref, never a silent pass."
+      ],
       "declared_floor": "Where the consumer writes its minimum-runtime literal, if it has one. The audit compares it against the floor DERIVED from spec_sources.",
       "requires": "Escape hatch: an explicit {ext: version} map for a consumer whose headers are not readable files. Prefer spec_sources.",
       "behavioural_floor": [
@@ -222,6 +241,40 @@
         "The audit cross-checks this number against requires_anchor's prose and",
         "emits a note (not a finding) when it cannot confirm it there."
       ]
+    },
+
+    "displayxr-shell-pvt": {
+      "role": "The reference workspace controller: the spatial shell, and the largest XR_DXR_spatial_workspace consumer. Windows + macOS.",
+      "gate": "hard",
+      "gate_note": "The shell has no degraded mode -- its ENTIRE API is XR_DXR_spatial_workspace, so against a runtime that rejects those structs every oxr_workspace call returns XR_ERROR_VALIDATION_FAILURE and the workspace does not function at all. Its installer therefore aborts rather than warning (shell-pvt#113 PR 1), unlike the browser, which still renders 2D and so is soft.",
+      "repo_note": [
+        "PRIVATE repo; reads need the publish-bot App installation token that",
+        "drift-audit.yml already mints. On the default GITHUB_TOKEN this consumer",
+        "reads as unfetchable and is reported, not silently skipped.",
+        "",
+        "THE AWKWARD CASE, and why spec_sources points somewhere else. The shell",
+        "vendors NO extension headers -- external/openxr_extensions/ is .gitkeep",
+        "only -- because its build clones DisplayXR/displayxr-extensions. So there",
+        "is no file in THIS repo to scan, and the readable source of truth is the",
+        "clone's pin. spec_sources below therefore names the MIRROR at a tag; that",
+        "keeps the 'never write the version numbers down' rule intact (the tag is",
+        "a pin, not a floor), which the `requires` escape hatch would have broken.",
+        "",
+        "The ref below and DXR_EXTENSIONS_REF in the shell's build are an ATOMIC",
+        "GROUP of three: .github/workflows/build-shell.yml (both the Windows and",
+        "the macOS/POSIX clone read the one workflow-level env var) and",
+        "scripts/build-shell.bat. Bumping the pin means bumping all of them and",
+        "this ref together. pin_sync executes that comparison against the workflow",
+        "on every run -- it is the detector for the drift the pin itself creates."
+      ],
+      "spec_sources": [
+        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_spatial_workspace.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_display_info.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_workspace_file_dialog.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_win32_window_binding.h" }
+      ],
+      "pin_sync": { "file": ".github/workflows/build-shell.yml", "regex": "DXR_EXTENSIONS_REF:\\s*(\\S+)" },
+      "declared_floor": { "file": "installer/DisplayXRShellInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" }
     },
 
     "displayxr-unity": {

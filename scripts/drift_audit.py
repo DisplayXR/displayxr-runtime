@@ -587,6 +587,21 @@ def _dxr_specs(text: str) -> dict[str, int]:
     return out
 
 
+def _spec_source(consumer: str, src: str | dict) -> tuple[str, str, str]:
+    """Resolve one ``spec_sources`` item to ``(repo, ref, path)``.
+
+    A plain string is a path in the CONSUMER's own repo at its default branch —
+    the original and still the common case. An object ``{repo, ref, path}``
+    names a *different* repo at a pinned ref, which is the only readable source
+    for a consumer that vendors no headers and clones them at build time (the
+    shell — see downstream-pins.json). Pairing it with ``pin_sync`` is what
+    keeps that ref honest.
+    """
+    if isinstance(src, dict):
+        return src["repo"], src.get("ref", "HEAD"), src["path"]
+    return consumer, "HEAD", src
+
+
 def runtime_spec(ext: str, ref: str = "HEAD") -> int | None:
     text = gh_raw("displayxr-runtime", RUNTIME_EXT_HEADER.format(ext=ext), ref)
     if text is None:
@@ -710,16 +725,48 @@ def check_consumer_floors(report: Report) -> None:
 
         # 1. What does this consumer actually require?
         requires: dict[str, int] = dict(spec.get("requires") or {})
-        for path in spec.get("spec_sources") or []:
-            text = gh_raw(repo, path)
+        sources = [_spec_source(repo, s) for s in spec.get("spec_sources") or []]
+        for src_repo, src_ref, path in sources:
+            text = gh_raw(src_repo, path, src_ref)
             if text is None:
-                report.note(f"consumer-floors: could not fetch {repo}:{path} — skipped")
+                report.note(
+                    f"consumer-floors: could not fetch {src_repo}@{src_ref}:{path} "
+                    f"for {repo} — skipped"
+                )
                 continue
             for ext, ver in _dxr_specs(text).items():
                 requires[ext] = max(requires.get(ext, 0), ver)
 
+        # A pinned ref in THIS file is only the truth if the consumer's build
+        # actually clones that ref. Compare the two every run, or the audit
+        # would derive a floor from headers the consumer never compiled with —
+        # a new drift vector introduced by the pin itself.
+        sync = spec.get("pin_sync")
+        pinned = sorted({r for _, r, _ in sources if r != "HEAD"})
+        if sync and pinned:
+            sync_text = gh_raw(repo, sync["file"])
+            m = re.search(sync["regex"], sync_text) if sync_text else None
+            if m is None:
+                report.note(
+                    f"consumer-floors: could not read {repo}:{sync['file']} "
+                    f"/{sync['regex']}/ — spec_sources pin {', '.join(pinned)} unchecked"
+                )
+            elif m.group(1).strip("\"'") not in pinned:
+                report.add(
+                    repo,
+                    "consumer-floor-pin-desync",
+                    f"downstream-pins.json derives this consumer's floor from "
+                    f"{', '.join(pinned)}, but {sync['file']} builds against "
+                    f"{m.group(1)} — the derived floor describes headers the "
+                    f"consumer does not compile with. Move both together.",
+                )
+
         if not requires:
-            report.note(f"consumer-floors: no requirements resolved for {repo} — skipped")
+            looked = ", ".join(f"{r}@{f}:{p}" for r, f, p in sources) or "no spec_sources"
+            report.note(
+                f"consumer-floors: no requirements resolved for {repo} "
+                f"({looked}) — skipped"
+            )
             continue
 
         # A hand-maintained number is the thing this block exists to distrust,
