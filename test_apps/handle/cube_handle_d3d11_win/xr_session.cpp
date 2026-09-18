@@ -12,6 +12,7 @@
 // XR_DXR_view_rig (#396 W7): app-local availability flag (see xr_session.h).
 bool g_hasViewRigExt = false;
 bool g_hasHandTrackingExt = false;
+bool g_hasViewsChangeExt = false; // #1488
 
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (see xr_session.h).
 ZoneMaskHarness g_zone;
@@ -113,6 +114,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
             g_hasHandTrackingExt = true;
         }
+        if (strcmp(ext.extensionName,
+                   XR_EXT_VIEW_CONFIGURATION_VIEWS_CHANGE_EXTENSION_NAME) ==
+            0) {
+            g_hasViewsChangeExt = true; // #1488
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
@@ -124,6 +130,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_view_rig: %s", g_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_local_3d_zone: %s", g_zone.available ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_hand_tracking: %s", g_hasHandTrackingExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_configuration_views_change: %s",
+             g_hasViewsChangeExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
@@ -161,6 +169,22 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (g_hasHandTrackingExt) {
         enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
+    if (g_hasViewsChangeExt) {
+        // #1488 reference consumer. Enabling this opts the app into LIVE
+        // recommendedImageRect{Width,Height} from
+        // xrEnumerateViewConfigurationViews - an app that does NOT enable it
+        // keeps the frozen xrCreateInstance-time snapshot, which is the core
+        // spec's "identical buffer contents" rule.
+        //
+        // This app must NOT recreate its swapchain in response: it already
+        // allocates at maxImageRect{Width,Height} (the ADR-010 worst case,
+        // which the extension forbids moving) and re-points
+        // subImage.imageRect per frame. Moving the rect IS the whole response.
+        // Recreating swapchains here would reintroduce exactly the
+        // reallocation stutter the worst-case swapchain exists to prevent.
+        enabledExtensions.push_back(
+            XR_EXT_VIEW_CONFIGURATION_VIEWS_CHANGE_EXTENSION_NAME);
     }
 
     LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
@@ -318,6 +342,77 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 
     LOG_INFO("OpenXR initialization complete");
     return true;
+}
+
+// #1488 XR_EXT_view_configuration_views_change reference consumer.
+//
+// THE EVENT, AND WHY THIS IS A POLL. The runtime emits
+// XrEventDataViewConfigurationViewsChangedEXT (rate limited to 1 Hz per view
+// configuration, as the spec requires). This app drains its event queue through
+// displayxr-common's PollEvents(), whose switch has no case for that type and
+// whose `default:` consumes it -- so an app-local `case` here would never run
+// until displayxr-common gains one. Rather than fork the event loop, this
+// re-enumerates on a 1 Hz tick: strictly weaker than event-driven (it can lag
+// by up to a second) but it exercises the live-enumerate read path from a real
+// app, which is the half that matters on hardware. The event-driven `case`
+// lands with the displayxr-common change; see the PR for #1488.
+//
+// WHAT A CONFORMANT CONSUMER DOES, mirrored below: filter on BOTH systemId and
+// viewConfigurationType, then re-enumerate. It does NOT recreate swapchains --
+// this app allocates at maxImageRect{Width,Height} (the ADR-010 worst case,
+// which the extension forbids moving) and re-points subImage.imageRect per
+// frame, so moving the rect is the entire correct response.
+void ReportViewsChange(XrSessionManager &xr) {
+    if (!g_hasViewsChangeExt || xr.instance == XR_NULL_HANDLE ||
+        xr.systemId == XR_NULL_SYSTEM_ID) {
+        return;
+    }
+
+    // 1 Hz tick: the runtime cannot legally signal faster than that anyway.
+    static ULONGLONG lastTickMs = 0;
+    ULONGLONG nowMs = GetTickCount64();
+    if (lastTickMs != 0 && nowMs - lastTickMs < 1000) {
+        return;
+    }
+    lastTickMs = nowMs;
+
+    // A conformant consumer filters on BOTH fields the event carries. We have
+    // no event here, so assert the same pair against what we are about to ask
+    // for: a mismatch means the notification was not for us.
+    const XrSystemId systemId = xr.systemId;
+    const XrViewConfigurationType viewConfigType = xr.viewConfigType;
+
+    uint32_t count = 0;
+    if (XR_FAILED(xrEnumerateViewConfigurationViews(
+            xr.instance, systemId, viewConfigType, 0, &count, nullptr)) ||
+        count == 0) {
+        return;
+    }
+    static std::vector<XrViewConfigurationView> views;
+    views.assign(count, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    if (XR_FAILED(xrEnumerateViewConfigurationViews(xr.instance, systemId,
+                                                    viewConfigType, count,
+                                                    &count, views.data()))) {
+        return;
+    }
+
+    static uint32_t lastW = 0, lastH = 0;
+    static uint64_t changeCount = 0;
+    const uint32_t w = views[0].recommendedImageRectWidth;
+    const uint32_t h = views[0].recommendedImageRectHeight;
+    if (lastW != 0 && (w != lastW || h != lastH)) {
+        changeCount++;
+        LOG_INFO("[#1488] views changed: recommendedImageRect %ux%u -> %ux%u "
+                 "(max %ux%u UNCHANGED, "
+                 "views=%u, systemId=%llu, viewConfigType=%d) -- change #%llu, "
+                 "NO swapchain recreate",
+                 lastW, lastH, w, h, views[0].maxImageRectWidth,
+                 views[0].maxImageRectHeight, count,
+                 (unsigned long long)systemId, (int)viewConfigType,
+                 (unsigned long long)changeCount);
+    }
+    lastW = w;
+    lastH = h;
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {

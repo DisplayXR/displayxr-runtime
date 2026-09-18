@@ -32,6 +32,20 @@ extern bool g_hasViewRigExt;
 // hand-tracking verify vehicle (`--hands` joint markers).
 extern bool g_hasHandTrackingExt;
 
+// #1488 — XR_EXT_view_configuration_views_change available + enabled on the
+// instance. This app is the reference consumer: it enables the extension and
+// re-enumerates when the recommended view size moves, but NEVER recreates a
+// swapchain (it allocates at maxImageRect*, which the extension forbids
+// moving, and re-points subImage.imageRect per frame).
+extern bool g_hasViewsChangeExt;
+
+// #1488 — re-enumerate xrEnumerateViewConfigurationViews and LOG_INFO the
+// recommendedImageRect dims when they move, with a running counter. Filters on
+// systemId + viewConfigurationType exactly as a conformant event consumer
+// would. Cheap (a two-call enumerate, no allocation past the first) and rate
+// limited internally, so it is safe to call every frame.
+void ReportViewsChange(XrSessionManager &xr);
+
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (header v3 carries the Local2D
 // composition-layer + view-size-changed types). App-local for the same reason
 // as the view-rig flag: the shared XrSessionManager doesn't carry this
