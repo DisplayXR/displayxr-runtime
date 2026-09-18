@@ -201,8 +201,11 @@ if(TARGET tests_oxr_view_space)
 	# variable through DEBUG_GET_ONCE_BOOL_OPTION, which caches the first read
 	# for the life of the process, so one process cannot host both the new and
 	# the legacy view-configuration mapping. The tag filter keeps this run to the
-	# legacy case, and the case itself SKIPs unless the variable is set (so the
-	# plain registration above, which runs every case, never executes it).
+	# legacy case, and the case itself returns early (a SUCCEED, deliberately
+	# not a Catch2 SKIP - build-windows.yml reads any "SKIPPED:" from this
+	# binary as "the headless runtime did not come up") unless the variable is
+	# set, so the plain registration above, which runs every case, pins nothing
+	# there.
 	add_test(NAME tests_oxr_view_space_legacy
 		 COMMAND tests_oxr_view_space "[view_config_legacy]" --success --allow-running-no-tests
 		)
