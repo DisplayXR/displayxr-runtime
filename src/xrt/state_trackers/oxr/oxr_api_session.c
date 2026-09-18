@@ -309,7 +309,9 @@ oxr_xrLocateViews(XrSession session,
 		                 viewLocateInfo->displayTime);
 	}
 
-	if (viewLocateInfo->viewConfigurationType != sess->sys->view_config_type) {
+	// #1486: the view configuration THIS session was begun with - the system
+	// may advertise more than one, but a session locates in exactly one.
+	if (viewLocateInfo->viewConfigurationType != sess->view_config_type) {
 		return oxr_error(&log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 		                 "(viewConfigurationType == 0x%08x) "
 		                 "unsupported view configuration type",
@@ -367,7 +369,7 @@ oxr_xrGetVisibilityMaskKHR(XrSession session,
 	visibilityMask->indexCountOutput = 0;
 
 	OXR_VERIFY_VIEW_CONFIG_TYPE(&log, sess->sys->inst, viewConfigurationType);
-	if (viewConfigurationType != sess->sys->view_config_type) {
+	if (viewConfigurationType != sess->view_config_type) {
 		return oxr_error(&log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 		                 "(viewConfigurationType == 0x%08x) unsupported view configuration type",
 		                 viewConfigurationType);
