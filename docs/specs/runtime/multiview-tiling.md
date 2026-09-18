@@ -127,7 +127,7 @@ Commit `fc5f82ff1` + follow-up fixes (`febd2fd05`, `c4cd31b1e`, `735e6dfa8`, `91
 ### Phase B: Swapchain sizing
 
 - `oxr_system.c`: `recommendedImageRectWidth = displayPixelWidth * view_scale_x`, `recommendedImageRectHeight = displayPixelHeight * view_scale_y`
-- `recommended_view_scale_x = min(scaleX across all modes)` set in `target_instance.c`
+- `recommended_view_scale_x = min(scaleX across all modes)` set in `target_instance.c` (the plug-in's own value wins when it reports one). It is the **display-level baseline** and is immutable after that: a mode change does not rewrite it — the active mode's scale is derived from `rendering_modes[active_rendering_mode_index]` via `xrt_device_get_active_mode_view_scale()`
 - Apps compute swapchain size as `max(tileColumns[i] * scaleX[i] * displayPixelWidth)` across all modes for width, similar for height
 - Legacy apps (no `XR_DXR_display_info`): max taken over modes 0 and 1 only; special compromise scale logic for `view_count == 2 && scaleX <= 0.5 && scaleY <= 0.5` -> uses 0.5x1.0
 - Zero-copy passthrough: gated solely by `u_tiling_can_zero_copy()` — see [Zero-copy eligibility — the single rule](#zero-copy-eligibility--the-single-rule) for the normative contract
