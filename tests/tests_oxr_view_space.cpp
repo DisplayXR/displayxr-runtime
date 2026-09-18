@@ -1232,28 +1232,36 @@ TEST_CASE("a PRIMARY_STEREO session is floored out of a >2-view mode (#1499)", "
 		CHECK(active.hardwareDisplay3D == XR_TRUE);
 	}
 
-	SECTION("the app is TOLD, so a cached isActive cannot go stale")
+	SECTION("the app is TOLD exactly once, and told the truth")
 	{
 		// Apps enumerate the modes before xrBeginSession, so the floor has to
 		// announce itself; the event is queued during xrBeginSession and this
 		// is the first poll.
-		bool saw_mode_change = false;
+		uint32_t mode_changes = 0;
+		uint32_t changed_from = 0;
 		uint32_t changed_to = 0;
 		for (const XrEventDataBuffer &ev : rt.drain_events()) {
 			if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
 				const auto *rm = reinterpret_cast<const XrEventDataRenderingModeChangedDXR *>(&ev);
-				saw_mode_change = true;
+				mode_changes++;
+				changed_from = rm->previousModeIndex;
 				changed_to = rm->currentModeIndex;
 				INFO("rendering mode changed " << rm->previousModeIndex << " -> "
 				                               << rm->currentModeIndex);
 			}
 		}
-		REQUIRE(saw_mode_change);
+		// EXACTLY one: a second event would mean the floor ran twice, or that
+		// something else moved the mode behind it.
+		REQUIRE(mode_changes == 1);
+		// previousModeIndex is the mode the floor took us OUT of - Quad, the
+		// mode SIM_DISPLAY_OUTPUT=quad started us in.
+		CHECK(changed_from == 4u);
 
 		XrDisplayRenderingModeInfoDXR active{};
 		REQUIRE(rt.active_mode(&active));
 		// The event and the enumerator agree - the whole point of pushing it.
 		CHECK(changed_to == active.modeIndex);
+		CHECK(changed_to != changed_from);
 	}
 
 	tear_down(rt);
@@ -1334,10 +1342,43 @@ TEST_CASE("a device that PINS its mode outranks the floor (#1499)", "[oxr][view_
 	CHECK(active.modeIndex == 4u); // SIM_DISPLAY_FORCE_MODE=4, Quad
 	CHECK(active.viewCount > 2);
 
+	/*
+	 * ...and the pin exempts the DENIAL too, not just the floor. This session
+	 * is SITTING in mode 4, so denying a request for mode 4 would be refusing
+	 * it permission to ask for the mode it is already in - and the device, not
+	 * the runtime, is the authority on a pinned mode. The first cut of the
+	 * denial gate got this wrong.
+	 */
+	rt.drain_events();
+	auto request = rt.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
+	CHECK(request(rt.session, 4u) == XR_SUCCESS);
+	for (const XrEventDataBuffer &ev : rt.drain_events()) {
+		CHECK(ev.type != XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR);
+	}
+	// The device still holds the mode, which is the whole point of the pin.
+	REQUIRE(rt.active_mode(&active));
+	CHECK(active.modeIndex == 4u);
+
 	tear_down(rt);
 }
 
-TEST_CASE("a PRIMARY_STEREO session's request for a >2-view mode is denied (#1499)", "[oxr][view_space][mode_floor]")
+/*
+ * #1499 F6: an ORCHESTRATOR is exempt from the painter's rule.
+ *
+ * This arm looks like it should assert the DENIAL, and originally did - which
+ * was a bug in the test, not in the runtime. `is_bridge_relay` is set for ANY
+ * session with XR_DXR_display_info + XR_MND_headless (oxr_session.c), so every
+ * session this headless suite can create is a relay by construction: no
+ * compositor, nothing submitted, its own view count measuring the wrong thing.
+ * Denying it would be measuring the relay to protect pixels that belong to a
+ * different session entirely.
+ *
+ * So what is pinned here is the exemption, and the end-to-end denial of a
+ * genuine PAINTER is on the graphics-bound list (it needs a compositor, which
+ * this suite deliberately does not have). The rule itself -
+ * oxr_mode_fillable_by() - is pinned in tests_oxr_mode_fillable_rule.cpp.
+ */
+TEST_CASE("an orchestrator session is exempt from the fillability rule (#1499)", "[oxr][view_space][mode_floor]")
 {
 	if (legacy_switch_set() || mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
 		WARN(
@@ -1362,38 +1403,32 @@ TEST_CASE("a PRIMARY_STEREO session's request for a >2-view mode is denied (#149
 	REQUIRE(unfillable >= 0); // Quad
 	INFO("requesting mode " << unfillable);
 
-	// The floor already moved us out of Quad at xrBeginSession; drain that
-	// event so what follows can only be the answer to OUR request.
+	// The floor DID fire at xrBeginSession (the floor has no orchestrator
+	// exemption - it only moves the display somewhere the mode is coherent,
+	// and a relay has no stake in that). Drain it so what follows can only be
+	// the answer to OUR request.
 	rt.drain_events();
 
 	auto request = rt.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
-
-	// XR_SUCCESS at call time - both request entry points answer by EVENT
-	// (v17 / #961), so a denial is not an error code.
 	CHECK(request(rt.session, (uint32_t)unfillable) == XR_SUCCESS);
 
 	bool saw_denial = false;
 	for (const XrEventDataBuffer &ev : rt.drain_events()) {
-		// Nothing may claim the mode actually moved.
-		CHECK(ev.type != XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR);
 		if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR) {
-			const auto *d = reinterpret_cast<const XrEventDataDisplayModeRequestDeniedDXR *>(&ev);
 			saw_denial = true;
-			CHECK(d->requestedModeIndex == (uint32_t)unfillable);
-			CHECK(d->requestedHardware3D == -1);
-			CHECK(d->reason == XR_DISPLAY_MODE_DENIAL_REASON_VIEW_CONFIG_CANNOT_FILL_DXR);
 		}
 	}
-	CHECK(saw_denial);
+	// NOT denied: this session orchestrates, it does not paint.
+	CHECK_FALSE(saw_denial);
 
-	// ...and the display really did not move.
+	// ...and the request really took, which is what "exempt" has to mean.
 	XrDisplayRenderingModeInfoDXR active{};
 	REQUIRE(rt.active_mode(&active));
 	INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount " << active.viewCount);
-	CHECK(active.viewCount <= 2);
+	CHECK(active.modeIndex == (uint32_t)unfillable);
 
-	// The same request from a MULTIVIEW session is NOT denied - the rule is
-	// about the session's width, not about the mode.
+	// A MULTIVIEW session is equally undenied - for the other reason (it can
+	// fill the mode). Both paths reach XR_SUCCESS; only the rationale differs.
 	tear_down(rt);
 
 	Runtime wide;
@@ -1414,4 +1449,73 @@ TEST_CASE("a PRIMARY_STEREO session's request for a >2-view mode is denied (#149
 	CHECK(wactive.modeIndex == (uint32_t)unfillable);
 
 	tear_down(wide);
+}
+
+TEST_CASE("DXR_MODE_FLOOR=0 restores the pre-#1499 behaviour", "[oxr][view_space][mode_floor_off]")
+{
+	if (legacy_switch_set() || !mode_floor_disabled() || !sim_quad_requested() || sim_mode_pinned()) {
+		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+		// binary as "the headless runtime did not come up" (#1370).
+		WARN(
+		    "this arm needs DXR_MODE_FLOOR=0 AND SIM_DISPLAY_OUTPUT=quad - see "
+		    "tests_oxr_view_space_mode_floor_off in tests/CMakeLists.txt");
+		SUCCEED("not the kill-switch process; nothing to pin here");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	opt.begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		SKIP("XR_DXR_display_info not advertised by this build");
+	}
+
+	const uint32_t device_max = rt.device_max_view_count();
+	REQUIRE(device_max > 2); // SIM_DISPLAY_OUTPUT=quad must have taken.
+
+	SECTION("the floor does not fire: a 2-view session is left sitting in Quad")
+	{
+		XrDisplayRenderingModeInfoDXR active{};
+		REQUIRE(rt.active_mode(&active));
+		INFO("active mode " << active.modeIndex << " '" << active.modeName << "' viewCount "
+		                    << active.viewCount);
+		// The pre-#1499 state, deliberately restored: the app will paint the
+		// first two tiles and the rest stay at the clear colour.
+		CHECK(active.viewCount == device_max);
+
+		// ...and nothing was announced, because nothing moved.
+		for (const XrEventDataBuffer &ev : rt.drain_events()) {
+			CHECK(ev.type != XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR);
+		}
+	}
+
+	SECTION("the denial does not fire either: an unfillable request is honoured")
+	{
+		// NOTE: headless, so this session is also orchestrator-exempt (see the
+		// exemption arm above) and would not be denied with the switch ON
+		// either. What this pins is the SWITCH-OFF half of the pair - the
+		// request path reaching XR_SUCCESS and the mode actually moving - not
+		// the denial's absence on its own.
+		const int32_t unfillable = rt.first_unfillable_mode(2);
+		REQUIRE(unfillable >= 0);
+		rt.drain_events();
+
+		auto request = rt.fn<PFN_xrRequestDisplayRenderingModeDXR>("xrRequestDisplayRenderingModeDXR");
+		CHECK(request(rt.session, (uint32_t)unfillable) == XR_SUCCESS);
+
+		for (const XrEventDataBuffer &ev : rt.drain_events()) {
+			CHECK(ev.type != XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR);
+		}
+
+		// Both halves are off together, so the request really took.
+		XrDisplayRenderingModeInfoDXR active{};
+		REQUIRE(rt.active_mode(&active));
+		CHECK(active.modeIndex == (uint32_t)unfillable);
+	}
+
+	tear_down(rt);
 }

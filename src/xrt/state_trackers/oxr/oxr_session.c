@@ -227,6 +227,56 @@ oxr_session_mode_floor_enabled(void)
 	return debug_get_bool_option_mode_floor();
 }
 
+bool
+oxr_session_may_move_display_mode(struct oxr_session *sess,
+                                  struct xrt_device *head,
+                                  bool *out_pinned,
+                                  bool *out_service)
+{
+	/*
+	 * #1499: the TWO carve-outs, read in ONE place.
+	 *
+	 * The begin-time floor and the xrRequestDisplayRenderingModeDXR denial
+	 * are the same rule pointing in two directions, so they must agree about
+	 * when the runtime is allowed to have an opinion on the display mode at
+	 * all. They did not, at first: the denial was written without these, and
+	 * the result was that a PINNED session could not re-request the mode it
+	 * was already sitting in, and a service-mode client's request was refused
+	 * locally instead of reaching the panel-lease holder that owns the answer.
+	 * Both directly contradicted the carve-outs the floor documents.
+	 *
+	 * Hence one helper rather than two copies of the same four lines.
+	 *
+	 *   - mode_pinned: the device answered
+	 *     XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED (sim-display's
+	 *     SIM_DISPLAY_FORCE_MODE). The pin exists to hold a mode against
+	 *     every later request, which is what keeps the N-view under-submit
+	 *     path testable at all - so the runtime does not floor it, and it
+	 *     does not refuse an app's request on its behalf either (the DEVICE
+	 *     refuses, and says so).
+	 *   - service_mode: the panel lease, not this session, owns the
+	 *     display-global mode (ADR-035 D2). A client's request must be
+	 *     FORWARDED to the lease holder; deciding it here would answer a
+	 *     question that is not ours.
+	 *
+	 * The pure decision is @ref oxr_may_demote; this only gathers its inputs.
+	 */
+	int32_t mode_pinned = 0;
+	if (head == NULL ||
+	    xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED, &mode_pinned) != XRT_SUCCESS) {
+		mode_pinned = 0; // no device, or it doesn't implement the query ⟹ not pinned
+	}
+	const bool service_mode = sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
+
+	if (out_pinned != NULL) {
+		*out_pinned = mode_pinned != 0;
+	}
+	if (out_service != NULL) {
+		*out_service = service_mode;
+	}
+	return oxr_may_demote(mode_pinned != 0, service_mode);
+}
+
 
 /*
  *
@@ -1086,15 +1136,9 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 				const uint32_t max_submit =
 				    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
 
-				int32_t mode_pinned = 0;
-				if (xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED,
-				                            &mode_pinned) != XRT_SUCCESS) {
-					mode_pinned = 0; // device doesn't implement the query ⟹ not pinned
-				}
-				const bool service_mode =
-				    sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode;
-
-				if (oxr_may_demote(mode_pinned != 0, service_mode) &&
+				// The two carve-outs, shared verbatim with the denial in
+				// oxr_xrRequestDisplayRenderingModeDXR so they cannot diverge.
+				if (oxr_session_may_move_display_mode(sess, head, NULL, NULL) &&
 				    default_mode < head->rendering_mode_count) {
 					const uint32_t floored = oxr_pick_fillable_mode_index(
 					    head->rendering_modes, head->rendering_mode_count, default_mode,
@@ -1119,24 +1163,42 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 						head->hmd->active_rendering_mode_index = floored;
 
 						/*
-						 * The floored mode's per-view scales are what the
-						 * compositor must now size views from. Same two
-						 * writes as the request path
-						 * (oxr_api_session.c, step 4) and the
-						 * RENDERING_MODE_CHANGE poll arm below.
+						 * The floored mode's per-view scales. Same two
+						 * writes as the request path (oxr_api_session.c,
+						 * step 4) and the RENDERING_MODE_CHANGE poll arm
+						 * below, so all three agree on what the compositor
+						 * was told.
 						 *
-						 * Deliberately NOT written into the #1488
-						 * live-views shadow (oxr_views_change_*): that
-						 * shadow's contract is "emit a doorbell iff
-						 * xrEnumerateViewConfigurationViews would now
-						 * answer differently", and it is fed from the
-						 * compositor's REAL per-view dims at xrEndFrame,
-						 * which are derived from exactly these scales. So
-						 * the first frame after this floor produces the
-						 * edge, the clamp and the throttle for free;
-						 * writing the shadow here would duplicate the edge
-						 * and could ring the doorbell for a size the
-						 * compositor never adopted.
+						 * The #1488 live-views shadow (oxr_views_change_*)
+						 * is deliberately NOT written here, and the reason
+						 * is NOT "it derives from these scales" - it does
+						 * not. The shadow is fed at xrEndFrame from the
+						 * RENDERER's view dims
+						 * (comp_*_compositor_get_recommended_view_size),
+						 * which the renderer recomputes from
+						 * active_rendering_mode_index - the mode's
+						 * view_width_pixels through
+						 * u_tiling_compute_canvas_view() - not from these
+						 * scales at all.
+						 *
+						 * So the right thing is to leave it alone and let
+						 * the seeded-but-frozen shadow do its job:
+						 * oxr_views_change_seed() baselines the edge
+						 * detector on the FROZEN xrCreateInstance snapshot
+						 * precisely so that the first sample which differs
+						 * from it counts as a change, and the first
+						 * xrEndFrame after this floor is exactly such a
+						 * sample. The clamp, the 1 Hz throttle and the EXT
+						 * doorbell all follow from there.
+						 *
+						 * Writing it here would also be writing a number we
+						 * do not have: a hosted/IPC-class session has no
+						 * pixel dims at xrBeginSession (no window yet, no
+						 * first frame), so the value would be a guess that
+						 * could ring the doorbell for a size the compositor
+						 * never adopts. Consequence worth knowing: an
+						 * XR_EXT_view_configuration_views_change app sees
+						 * PRE-floor dims until its first xrEndFrame.
 						 */
 						struct xrt_system_compositor *xsysc = sess->sys->xsysc;
 						if (xsysc != NULL) {
@@ -1153,9 +1215,17 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 						 * otherwise be stale from the first frame - and an
 						 * extension app is entitled to know which mode it
 						 * is painting.
+						 *
+						 * sess->hardware_display_3d is NOT written here.
+						 * Every other writer sets it only once the mode
+						 * change has actually taken (on the request path's
+						 * success, or from the service's
+						 * HARDWARE_DISPLAY_STATE_CHANGE event), and
+						 * oxr_session_request_display_mode() below sets it
+						 * on success anyway. Setting it optimistically here
+						 * would make a LATER, real hardware toggle look
+						 * like a no-op if this request failed.
 						 */
-						sess->hardware_display_3d =
-						    head->rendering_modes[floored].hardware_display_3d;
 						oxr_event_push_XrEventDataRenderingModeChanged(log, sess, prev,
 						                                               floored);
 					}
@@ -1639,8 +1709,15 @@ skip_macos_pump:
 				 * re-sync writes it idempotently), and a per-entry
 				 * one-shot is both what "once per mode" means here and
 				 * what avoids growing struct oxr_session.
+				 *
+				 * Gated on DXR_MODE_FLOOR like the floor and the
+				 * denial: the switch promises PRE-#1499 behaviour, and
+				 * a log line the runtime never used to print is part
+				 * of that promise. Observation-only, so silencing it
+				 * costs nothing but the diagnosis.
 				 */
-				if (cur != sess->last_rendering_mode_index && sess->view_config_view_count > 0 &&
+				if (oxr_session_mode_floor_enabled() && cur != sess->last_rendering_mode_index &&
+				    sess->view_config_view_count > 0 &&
 				    oxr_frame_sync_is_session_running(&sess->frame_sync) &&
 				    mode->view_count > sess->view_config_view_count) {
 					U_LOG_W(

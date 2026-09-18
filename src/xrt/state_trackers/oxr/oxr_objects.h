@@ -1324,6 +1324,33 @@ oxr_system_views_change_live_enabled(void);
 bool
 oxr_session_mode_floor_enabled(void);
 
+/*!
+ * #1499: may the runtime move the display out of a mode @p sess cannot fill?
+ *
+ * Gathers the two carve-outs — the device PINS its mode
+ * (XRT_DEVICE_PROPERTY_OUTPUT_MODE_PINNED; a failed query means "not pinned")
+ * and service mode, where the panel lease owns the display-global mode — and
+ * answers with @ref oxr_may_demote.
+ *
+ * ONE helper because the begin-time floor and the
+ * xrRequestDisplayRenderingModeDXR denial are the same rule pointing in two
+ * directions and MUST agree: a pinned session that cannot re-request the mode
+ * it is already in, or a service-mode client whose request never reaches the
+ * lease holder, is the exact divergence this exists to prevent.
+ *
+ * @param      sess        The session asking.
+ * @param      head        The head device; NULL is treated as "not pinned".
+ * @param[out] out_pinned  Optional: did the device report a pin?
+ * @param[out] out_service Optional: is this a service-mode session?
+ *
+ * @public @memberof oxr_session
+ */
+bool
+oxr_session_may_move_display_mode(struct oxr_session *sess,
+                                  struct xrt_device *head,
+                                  bool *out_pinned,
+                                  bool *out_service);
+
 XrResult
 oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
                                      struct oxr_system *sys,
