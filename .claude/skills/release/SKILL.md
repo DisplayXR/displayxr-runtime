@@ -71,7 +71,9 @@ moved into the workflows themselves per #290.
 
 ## CRITICAL: Launch Subagent
 
-**You MUST use the Agent tool with `subagent_type="general-purpose"` to execute this workflow.**
+**You MUST use the Agent tool with `subagent_type="general-purpose"` and `model="opus"` to execute this workflow.**
+
+**Model: pass `model="opus"` on that Agent call.** The Agent tool otherwise inherits the hub session's model, and when the hub runs on Fable 5 every release subagent runs on Fable too — a ~1 h `gh run watch` loop at Fable rates for work that is mechanical. Opus is the right tier for this workflow (David, 2026-09-18).
 
 ### Argument parsing
 

@@ -156,7 +156,9 @@ tell them to use `/installer-release`.
 
 ## CRITICAL: Launch Subagent
 
-**Use the Agent tool with `subagent_type="general-purpose"`.** The
+**Use the Agent tool with `subagent_type="general-purpose"` and `model="opus"`.**
+
+**Model: pass `model="opus"` on that Agent call.** The Agent tool otherwise inherits the hub session's model, and when the hub runs on Fable 5 every release subagent runs on Fable too — a ~1 h `gh run watch` loop at Fable rates for work that is mechanical. Opus is the right tier for this workflow (David, 2026-09-18). The
 subagent runs the clone + tag + multi-poll without blocking the main
 thread.
 
