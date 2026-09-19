@@ -302,11 +302,31 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
 		return false;
 	}
 
-	if (best->scale != 1.0f && !g->warned_scale) {
-		U_LOG_W("wl_geom: monitor scale %.2f != 1.0 — logical != physical pixels, weave phase will "
-		        "be wrong; set the 3D display to 100%% scale",
-		        best->scale);
-		g->warned_scale = true;
+	// Fractional/integer desktop scaling makes this rect unusable, so refuse it
+	// rather than hand back a position we know is in the wrong units.
+	//
+	// Mutter reports LOGICAL pixels. At scale 1.0 those are physical desktop
+	// pixels; at any other scale they are not, so the weave phase derived from
+	// them is wrong by exactly that factor. Worse, the compositor also resamples
+	// the surface on its way to the panel, which destroys a 1-pixel-period
+	// interlace pattern outright — no phase correction can survive it.
+	//
+	// Returning the rect anyway produced windowed weaving at a KNOWN-wrong
+	// phase: visibly broken 3D. Display-scoped weaving is the honest outcome and
+	// is what the spec's degradation ladder already specifies — every failure
+	// path ends at pre-#817 behavior. This path was the one exception.
+	// See docs/specs/runtime/wayland-window-geometry.md §3.
+	if (best->scale != 1.0f) {
+		if (!g->warned_scale) {
+			U_LOG_W(
+			    "wl_geom: monitor scale %.2f != 1.0 — logical != physical pixels, so the "
+			    "window origin cannot anchor the weave phase (and the compositor resamples "
+			    "the surface anyway). Falling back to display-scoped weaving; set the 3D "
+			    "display to 100%% scale for windowed weaving.",
+			    (double)best->scale);
+			g->warned_scale = true;
+		}
+		return false;
 	}
 
 	if (out_left_px != NULL) {
