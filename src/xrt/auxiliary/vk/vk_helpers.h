@@ -699,6 +699,52 @@ vk_append_to_pnext_chain(VkBaseInStructure *head, VkBaseInStructure *new_struct)
 
 /*
  *
+ * Win32 external-object capability checks (#1539).
+ *
+ * `VK_KHR_external_memory_win32`, `VK_KHR_external_semaphore_win32` and
+ * `VK_KHR_external_fence_win32` are **optional-if-present** on Windows: the
+ * app-facing lists only request them when the physical device reports them, so
+ * every import/export call site must ask before it calls. A software ICD
+ * (lavapipe, SwiftShader, dzn) exposes none of them, and in-process
+ * `_handle`/`_hosted` rendering does not need any of them — see #1539.
+ *
+ * Resolved from the already-loaded entry points rather than from a new
+ * `has_KHR_external_*_win32` slot: `vk_bundle` crosses the plug-in ABI
+ * boundary (the DP factory receives `&c->vk`), so a new field is an ADR-020
+ * concern, while `vkGetDeviceProcAddr` already returns NULL for a command
+ * whose device extension was not enabled. This is the same local-resolution
+ * precedent as `comp_vk_native_compositor.c::import_shared_d3d11_texture`.
+ *
+ * Note the memory case: `VK_KHR_external_memory_win32`'s *import* direction
+ * carries no entry point of its own (it rides `pNext` on `vkAllocateMemory`),
+ * so the export proc from the same extension stands in for it.
+ *
+ */
+
+//! Is `VK_KHR_external_memory_win32` enabled on this device? @ingroup aux_vk
+static inline bool
+vk_has_external_memory_win32(const struct vk_bundle *vk)
+{
+	return vk->vkGetMemoryWin32HandleKHR != NULL;
+}
+
+//! Is `VK_KHR_external_semaphore_win32` enabled on this device? @ingroup aux_vk
+static inline bool
+vk_has_external_semaphore_win32(const struct vk_bundle *vk)
+{
+	return vk->vkImportSemaphoreWin32HandleKHR != NULL && vk->vkGetSemaphoreWin32HandleKHR != NULL;
+}
+
+//! Is `VK_KHR_external_fence_win32` enabled on this device? @ingroup aux_vk
+static inline bool
+vk_has_external_fence_win32(const struct vk_bundle *vk)
+{
+	return vk->vkImportFenceWin32HandleKHR != NULL && vk->vkGetFenceWin32HandleKHR != NULL;
+}
+
+
+/*
+ *
  * String helper functions.
  *
  */

@@ -77,6 +77,14 @@ Kept out of the preceding table to limit its width.
       Vulkan 1.1, only the platform-independent base extension.
   * 8: Promoted to Vulkan 1.1 Core
 
+**DisplayXR note (#1539):** on Windows the three `*_win32` extensions above
+(`VK_KHR_external_memory_win32`, `VK_KHR_external_semaphore_win32`,
+`VK_KHR_external_fence_win32`) are **optional-if-present** for the app's
+device, mirroring the `*_fd` set on Linux/macOS. Only the out-of-process IPC
+client compositor genuinely needs them; in-process `_handle`/`_hosted` apps run
+on the app's own `VkDevice` with no cross-device sharing. Set
+`DXR_VK_REQUIRE_WIN32_EXTERNAL=1` to put them back in the required set.
+
 <!-- links to the extension references, out of line to keep the table source readable -->
 <!-- They don't show up like this in the formatted document. -->
 

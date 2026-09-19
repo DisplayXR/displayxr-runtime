@@ -1316,6 +1316,20 @@ import_shared_d3d11_texture(struct comp_vk_native_compositor *c, void *shared_ha
 		return false;
 	}
 
+	/*
+	 * #1539: VK_KHR_external_memory_win32 is optional-if-present now. The
+	 * texture class has no fallback — the whole point is to weave into the
+	 * app's shared texture — so fail cleanly here and let create() turn it
+	 * into XRT_ERROR_VULKAN at xrCreateSession.
+	 */
+	if (!vk_has_external_memory_win32(vk)) {
+		U_LOG_E(
+		    "Texture-class Vulkan app: VK_KHR_external_memory_win32 is not enabled on this VkDevice - "
+		    "cannot import the shared D3D11 texture. Enable the extension returned by "
+		    "xrGetVulkanDeviceExtensionsKHR, or use a handle/hosted-class app.");
+		return false;
+	}
+
 	// Size the VkImage to match the app's shared texture exactly. The app sizes
 	// it to the display-native worst-case atlas (ADR-010 — display pixels), and
 	// `settings.preferred` isn't populated yet at import time (the HWND/screen

@@ -1082,6 +1082,21 @@ vk_create_image_from_native(struct vk_bundle *vk,
 {
 	VkResult ret = VK_SUCCESS;
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	/*
+	 * #1539: the import below chains VkImportMemoryWin32HandleInfoKHR onto
+	 * vkAllocateMemory, which is only legal with VK_KHR_external_memory_win32
+	 * enabled — now optional-if-present. Fail here rather than feed an ICD a
+	 * pNext it never opted into.
+	 */
+	if (!vk_has_external_memory_win32(vk)) {
+		VK_ERROR(vk,
+		         "vk_create_image_from_native: VK_KHR_external_memory_win32 is not enabled on this device "
+		         "- cannot import a native image handle");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#endif
+
 	// This is the format we allocate the image in, can be changed further down.
 	VkFormat image_format = (VkFormat)info->format;
 
@@ -1443,6 +1458,14 @@ get_device_memory_handle(struct vk_bundle *vk, VkDeviceMemory device_memory, xrt
 static VkResult
 get_device_memory_handle(struct vk_bundle *vk, VkDeviceMemory device_memory, xrt_graphics_buffer_handle_t *out_handle)
 {
+	// #1539: VK_KHR_external_memory_win32 is optional-if-present.
+	if (!vk_has_external_memory_win32(vk)) {
+		VK_ERROR(vk,
+		         "vk_get_native_handle_from_device_memory: VK_KHR_external_memory_win32 is not enabled on "
+		         "this device - cannot export a native memory handle");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+
 	// vkGetMemoryWin32HandleKHR parameter
 	VkMemoryGetWin32HandleInfoKHR win32_info = {
 	    .sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR,

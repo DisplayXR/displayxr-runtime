@@ -32,6 +32,16 @@ vk_get_semaphore_handle_type(struct vk_bundle *vk)
 	}
 
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	/*
+	 * #1539: `vk->external.*` reports what the PHYSICAL DEVICE can do, which
+	 * says nothing about whether the now-optional
+	 * VK_KHR_external_semaphore_win32 was enabled on the logical device. Both
+	 * handle types below are exported/imported through that extension's entry
+	 * points, so answer "none" when it is absent and let the caller degrade.
+	 */
+	if (!vk_has_external_semaphore_win32(vk)) {
+		return 0;
+	}
 	if (vk->external.binary_semaphore_d3d12_fence) {
 		return VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
 	}
@@ -53,6 +63,10 @@ vk_get_timeline_semaphore_handle_type(struct vk_bundle *vk)
 		return VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
 	}
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	// #1539: see vk_get_semaphore_handle_type().
+	if (!vk_has_external_semaphore_win32(vk)) {
+		return 0;
+	}
 	if (vk->external.timeline_semaphore_d3d12_fence) {
 		return VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
 	}
@@ -111,6 +125,13 @@ vk_create_and_submit_fence_native(struct vk_bundle *vk, xrt_graphics_sync_handle
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
 	const VkExternalFenceHandleTypeFlags handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	// #1539: VK_KHR_external_fence_win32 is optional-if-present.
+	if (!vk_has_external_fence_win32(vk)) {
+		VK_ERROR(vk,
+		         "vk_create_and_submit_fence_native: VK_KHR_external_fence_win32 is not enabled on this "
+		         "device - cannot export a fence handle");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
 	const VkExternalFenceHandleTypeFlags handle_type = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 #else
 #error "Need port to export fence sync handles"
@@ -340,6 +361,16 @@ vk_create_fence_sync_from_native(struct vk_bundle *vk, xrt_graphics_sync_handle_
 	VkFence fence = VK_NULL_HANDLE;
 	VkResult ret;
 
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	// #1539: VK_KHR_external_fence_win32 is optional-if-present.
+	if (!vk_has_external_fence_win32(vk)) {
+		VK_ERROR(vk,
+		         "vk_create_fence_sync_from_native: VK_KHR_external_fence_win32 is not enabled on this "
+		         "device - cannot import a fence handle");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#endif
+
 	VkFenceCreateInfo create_info = {
 	    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 	    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
@@ -409,6 +440,16 @@ create_semaphore_from_native(struct vk_bundle *vk,
                              VkSemaphore *out_sem)
 {
 	VkResult ret;
+
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+	// #1539: VK_KHR_external_semaphore_win32 is optional-if-present.
+	if (!vk_has_external_semaphore_win32(vk)) {
+		VK_ERROR(vk,
+		         "create_semaphore_from_native: VK_KHR_external_semaphore_win32 is not enabled on this "
+		         "device - cannot import a semaphore handle");
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	}
+#endif
 
 	VkSemaphoreCreateInfo semaphore_create_info = {
 	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,

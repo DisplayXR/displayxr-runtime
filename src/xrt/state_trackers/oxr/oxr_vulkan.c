@@ -71,6 +71,15 @@ oxr_vk_get_instance_exts(struct oxr_logger *log,
 	                    xrt_gfx_vk_instance_extensions, XR_SUCCESS);
 }
 
+/*!
+ * #1539: the enable1 answer, filtered against the suggested physical device.
+ * Defined below with the extension lists; writes into @p buf and returns it, or
+ * returns the static string when no filtering applies. @p buf must hold at
+ * least `strlen(xrt_gfx_vk_device_extensions) + 1`.
+ */
+static const char *
+oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, char *buf, size_t buf_size);
+
 XrResult
 oxr_vk_get_device_exts(struct oxr_logger *log,
                        struct oxr_system *sys,
@@ -78,10 +87,20 @@ oxr_vk_get_device_exts(struct oxr_logger *log,
                        uint32_t *namesCountOutput,
                        char *namesString)
 {
-	size_t length = strlen(xrt_gfx_vk_device_extensions) + 1;
+	/*
+	 * #1539: `xrt_gfx_vk_device_extensions` (comp_vk_glue.c) is a compile-time
+	 * string the app must enable VERBATIM, so it cannot itself express
+	 * "optional-if-present" the way the enable2 list can. Filter it here
+	 * instead — on real Windows GPU drivers every name survives and the answer
+	 * is byte-identical to before; on a software ICD the Win32 external trio
+	 * drops out and vkCreateDevice stops failing.
+	 */
+	char filtered[1024];
+	const char *exts = oxr_vk_device_exts_for_system(log, sys, filtered, ARRAY_SIZE(filtered));
 
-	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length,
-	                    xrt_gfx_vk_device_extensions, XR_SUCCESS);
+	size_t length = strlen(exts) + 1;
+
+	OXR_TWO_CALL_HELPER(log, namesCapacityInput, namesCountOutput, namesString, length, exts, XR_SUCCESS);
 }
 
 XrResult
@@ -172,7 +191,7 @@ static const char *required_vk_device_extensions[] = {
     VK_KHR_SWAPCHAIN_EXTENSION_NAME, // VK native compositor needs swapchain for presentation
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
-    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+    // VK_KHR_external_memory_win32 is OPTIONAL — see optional_device_extensions[] (#1539).
     // VK native compositor on Windows needs swapchain for direct presentation
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #else
@@ -182,21 +201,59 @@ static const char *required_vk_device_extensions[] = {
 // Platform version of "external_fence" and "external_semaphore"
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD) // Optional
 
-#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
-    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-    VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE) // Optional too, since #1539
 
 #else
 #error "Need port!"
 #endif
 };
 
+/*!
+ * #1539: the three Win32 external-object extensions, kept as their own list so
+ * the kill switch below can put them back in the REQUIRED set verbatim.
+ *
+ * They were required for every Windows Vulkan app, but only the IPC client
+ * compositor genuinely needs them (cross-process image + sync import); the
+ * in-process `_handle`/`_hosted` compositors run on the app's own VkDevice
+ * with no cross-device sharing at all, and the three sub-paths that do import
+ * (texture-class shared texture, the DComp transparent bridge, the
+ * DXR_VK_DEPOSIT path) are optional and gated. Requiring them blocked every
+ * software ICD — lavapipe fails vkCreateDevice outright, which is what killed
+ * the CTS `vulkan`/`vulkan2` arms (#1523, #1525).
+ */
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE) && defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+#define OXR_HAVE_WIN32_EXTERNAL_LIST
+static const char *win32_external_device_extensions[] = {
+    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,    //
+    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, //
+    VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,     //
+};
+
+/*!
+ * Kill switch for #1539. `DXR_VK_REQUIRE_WIN32_EXTERNAL=1` restores the old
+ * behaviour — the trio goes back into the required device-extension set for
+ * `xrCreateVulkanDeviceKHR` and back into the verbatim string returned by
+ * `xrGetVulkanDeviceExtensionsKHR`. This lever exists because the change
+ * touches device creation for *every* Windows Vulkan app.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(vk_require_win32_external, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
+#endif
+
 static const char *optional_device_extensions[] = {
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
     VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
     VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,
 
-#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE) // Not optional
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    /*
+     * #1539: optional-if-present, mirroring the FD arm above. The import/export
+     * call sites ask `vk_has_external_{memory,semaphore,fence}_win32()` before
+     * they touch the entry points, and the IPC client compositor — the one path
+     * that cannot work without them — fails session creation with a named
+     * error instead of crashing.
+     */
+    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,
 
 #else
 #error "Need port!"
@@ -271,6 +328,112 @@ vk_check_extension(VkExtensionProperties *props, uint32_t prop_count, const char
 	}
 
 	return false;
+}
+
+static const char *
+oxr_vk_device_exts_for_system(struct oxr_logger *log, struct oxr_system *sys, char *buf, size_t buf_size)
+{
+#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST
+	if (buf == NULL || buf_size < strlen(xrt_gfx_vk_device_extensions) + 1) {
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	// Kill switch: hand back exactly what we always handed back.
+	if (debug_get_bool_option_vk_require_win32_external()) {
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	VkPhysicalDevice phys = sys->suggested_vulkan_physical_device;
+	VkInstance vk_instance = sys->suggested_vulkan_instance;
+	PFN_vkGetInstanceProcAddr get_proc = sys->suggested_vulkan_get_proc;
+	if (phys == VK_NULL_HANDLE || vk_instance == VK_NULL_HANDLE || get_proc == NULL) {
+		/*
+		 * Asked before xrGetVulkanGraphicsDevice[2]KHR, so there is no
+		 * physical device to filter against. Answer as before: a conforming
+		 * app on real hardware is unaffected, a software ICD will still fail
+		 * vkCreateDevice.
+		 */
+		oxr_warn(log,
+		         "xrGetVulkanDeviceExtensionsKHR called before xrGetVulkanGraphicsDeviceKHR - cannot filter "
+		         "the optional Win32 external extensions (#1539)");
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties =
+	    (PFN_vkEnumerateDeviceExtensionProperties)get_proc(vk_instance, "vkEnumerateDeviceExtensionProperties");
+	if (EnumerateDeviceExtensionProperties == NULL) {
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	uint32_t prop_count = 0;
+	if (EnumerateDeviceExtensionProperties(phys, NULL, &prop_count, NULL) != VK_SUCCESS || prop_count == 0) {
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	VkExtensionProperties *props = U_TYPED_ARRAY_CALLOC(VkExtensionProperties, prop_count);
+	if (props == NULL) {
+		return xrt_gfx_vk_device_extensions;
+	}
+	if (EnumerateDeviceExtensionProperties(phys, NULL, &prop_count, props) != VK_SUCCESS) {
+		free(props);
+		return xrt_gfx_vk_device_extensions;
+	}
+
+	// Rebuild the space-separated list, dropping any of the trio the device does not report.
+	size_t out = 0;
+	bool dropped = false;
+	const char *p = xrt_gfx_vk_device_extensions;
+	while (*p != '\0') {
+		while (*p == ' ') {
+			p++;
+		}
+		const char *start = p;
+		while (*p != '\0' && *p != ' ') {
+			p++;
+		}
+		size_t len = (size_t)(p - start);
+		if (len == 0) {
+			continue;
+		}
+
+		bool keep = true;
+		for (uint32_t i = 0; i < ARRAY_SIZE(win32_external_device_extensions); i++) {
+			const char *name = win32_external_device_extensions[i];
+			if (strlen(name) == len && strncmp(start, name, len) == 0) {
+				keep = vk_check_extension(props, prop_count, name);
+				break;
+			}
+		}
+		if (!keep) {
+			dropped = true;
+			continue;
+		}
+
+		if (out != 0) {
+			buf[out++] = ' ';
+		}
+		memcpy(buf + out, start, len);
+		out += len;
+	}
+	buf[out] = '\0';
+
+	free(props);
+
+	if (dropped) {
+		oxr_warn(log,
+		         "Win32 external memory/semaphore/fence not reported by the suggested physical device - "
+		         "dropped from xrGetVulkanDeviceExtensionsKHR (#1539). Answer: %s",
+		         buf);
+	}
+
+	return buf;
+#else
+	(void)log;
+	(void)sys;
+	(void)buf;
+	(void)buf_size;
+	return xrt_gfx_vk_device_extensions;
+#endif
 }
 
 static XrResult
@@ -564,6 +727,16 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 
 	struct u_string_list *device_extension_list =
 	    u_string_list_create_from_array(required_vk_device_extensions, ARRAY_SIZE(required_vk_device_extensions));
+
+#ifdef OXR_HAVE_WIN32_EXTERNAL_LIST
+	// #1539 kill switch: put the Win32 external trio back in the REQUIRED set.
+	if (debug_get_bool_option_vk_require_win32_external()) {
+		oxr_log(log, "DXR_VK_REQUIRE_WIN32_EXTERNAL=1: Win32 external memory/semaphore/fence forced REQUIRED");
+		for (uint32_t i = 0; i < ARRAY_SIZE(win32_external_device_extensions); i++) {
+			u_string_list_append_unique(device_extension_list, win32_external_device_extensions[i]);
+		}
+	}
+#endif
 
 	for (uint32_t i = 0; i < createInfo->vulkanCreateInfo->enabledExtensionCount; i++) {
 		u_string_list_append_unique(device_extension_list,
@@ -987,6 +1160,13 @@ oxr_vk_get_physical_device(struct oxr_logger *log,
 		sys->vulkan_enable2_instance = vkInstance;
 	}
 	sys->suggested_vulkan_physical_device = *vkPhysicalDevice;
+	/*
+	 * #1539: remember how to talk to that physical device, so
+	 * xrGetVulkanDeviceExtensionsKHR (enable1) can filter its answer against
+	 * what the device actually reports.
+	 */
+	sys->suggested_vulkan_instance = vkInstance;
+	sys->suggested_vulkan_get_proc = getProc;
 	if (log_level <= U_LOGGING_DEBUG) {
 		oxr_log(log, "Suggesting vulkan physical device %p", (void *)*vkPhysicalDevice);
 	}

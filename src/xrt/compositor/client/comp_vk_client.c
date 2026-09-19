@@ -1200,6 +1200,31 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		goto err_free;
 	}
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	/*
+	 * #1539: the Win32 external-object extensions are optional-if-present for
+	 * every app — but NOT for this compositor. The IPC client imports the
+	 * service's swapchain images (vk_create_image_from_native) and its sync
+	 * objects across a process boundary; without VK_KHR_external_memory_win32
+	 * there is nothing to import and no fallback exists. Fail session creation
+	 * here with a named error rather than later, per-swapchain, as a black
+	 * window.
+	 *
+	 * An app reaches this only if it declined an extension the runtime offered
+	 * (xrGetVulkanDeviceExtensionsKHR / xrCreateVulkanDeviceKHR both list it
+	 * when the physical device reports it), or if it is on a device that
+	 * genuinely cannot share memory between processes.
+	 */
+	if (!vk_has_external_memory_win32(&c->vk)) {
+		U_LOG_E(
+		    "IPC Vulkan client: VK_KHR_external_memory_win32 is not enabled on the app's VkDevice - the "
+		    "out-of-process compositor cannot hand over swapchain images without it. Enable the extension "
+		    "returned by xrGetVulkanDeviceExtensionsKHR, or run in-process (this device may not support "
+		    "cross-process sharing at all).");
+		goto err_free;
+	}
+#endif
+
 	// If the native compositor says no external fence sync, clear the flag
 	// so submit_fence is skipped and submit_fallback (vkQueueWaitIdle) is used.
 	if (xcn->base.info.disable_fence_sync) {
