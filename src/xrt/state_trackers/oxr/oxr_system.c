@@ -198,6 +198,9 @@ oxr_system_fill_in(
 #ifdef XR_USE_GRAPHICS_API_VULKAN
 	sys->vulkan_enable2_instance = VK_NULL_HANDLE;
 	sys->suggested_vulkan_physical_device = VK_NULL_HANDLE;
+	// #1539: paired with the physical device above — see oxr_vk_get_device_exts.
+	sys->suggested_vulkan_instance = VK_NULL_HANDLE;
+	sys->suggested_vulkan_get_proc = NULL;
 	/*
 	 * #868: -1 = "no runtime-owned queue". MUST be set here and not only in
 	 * oxr_vk_create_vulkan_device, because that function never runs under

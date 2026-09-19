@@ -610,6 +610,18 @@ comp_vk_deposit_create(struct vk_bundle *vk,
 		return XRT_ERROR_VULKAN;
 	}
 
+	/*
+	 * #1539: the deposit is built entirely on importing NT-shared D3D11
+	 * textures into VK, so VK_KHR_external_memory_win32 — optional-if-present
+	 * since #1539 — is a hard prerequisite for it. DXR_VK_DEPOSIT is opt-in
+	 * and the caller already treats a failed create as "no deposit", so this
+	 * just keeps the opt-in honest instead of failing deeper in.
+	 */
+	if (!vk_has_external_memory_win32(vk)) {
+		U_LOG_W("vk deposit: VK_KHR_external_memory_win32 not enabled on this VkDevice - deposit unavailable");
+		return XRT_ERROR_VULKAN;
+	}
+
 	const uint64_t want_luid = deposit_vk_packed_luid(vk);
 
 	/*

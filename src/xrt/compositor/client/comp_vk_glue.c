@@ -81,6 +81,13 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
     " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+    // #1539: listed here, but OPTIONAL-if-present. This string is a
+    // compile-time constant, so it cannot express that on its own — the filter
+    // lives at the one place that reads it, oxr_vulkan.c's
+    // oxr_vk_get_device_exts(), which drops the Win32 external trio from the
+    // xrGetVulkanDeviceExtensionsKHR answer when the suggested physical device
+    // does not report them (a software ICD). Keep the names here so a real GPU
+    // driver still gets the full, unchanged list.
     " " VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
     // VK native compositor on Windows needs swapchain for direct presentation
     " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
@@ -105,6 +112,9 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
     ;
 
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // #1539: the two Win32 sync extensions are OPTIONAL-if-present — see the
+    // note on VK_KHR_external_memory_win32 above. Timeline semaphore stays
+    // unconditional (core since Vulkan 1.2; every ICD we target has it).
     " " VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME " " VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME
     " " VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
 

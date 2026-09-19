@@ -120,10 +120,8 @@ static const char *required_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
-    VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
-    VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
-    VK_KHR_MAINTENANCE_1_EXTENSION_NAME,
-    VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
+    VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
+    VK_KHR_MAINTENANCE_1_EXTENSION_NAME, VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
     VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
@@ -131,6 +129,15 @@ static const char *required_device_extensions[] = {
     VK_EXT_METAL_OBJECTS_EXTENSION_NAME,
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+    /*
+     * #1539 made this trio optional-if-present in the APP-facing lists
+     * (oxr_vulkan.c / comp_vk_glue.c). Deliberately NOT mirrored here: those
+     * lists describe the app's device, which only imports when it is an IPC
+     * client, whereas this compositor creates its own VkDevice and is the
+     * EXPORT side of the handoff — it cannot produce a shareable swapchain
+     * image without external memory. It is also never on the CTS path (the
+     * conformance suite runs against the real compositors, in process).
+     */
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
 
 #else
@@ -141,6 +148,7 @@ static const char *required_device_extensions[] = {
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD) // Optional
 
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // Required here on purpose — see the note above (#1539).
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, //
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,     //
 

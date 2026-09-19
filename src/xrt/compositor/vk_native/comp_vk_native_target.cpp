@@ -988,7 +988,8 @@ create_swapchain(struct comp_vk_native_target *target)
  *      adapter the VK GPU is on, we'll Copy across them via the system bus).
  *   2. For each ring slot create an ID3D11Texture2D with KMT_BIT shared NT
  *      handle + KEYEDMUTEX. Open the KMT handle in VK via
- *      VK_KHR_external_memory_win32 (which the runtime already requires).
+ *      VK_KHR_external_memory_win32 — OPTIONAL-if-present since #1539, so
+ *      dcomp_setup() checks for it and falls back to opaque WSI when absent.
  *   3. Create a flip-model DXGI swapchain via CreateSwapChainForComposition
  *      with PRE_MULTIPLIED alpha. Bind to the HWND through DComp visual+target.
  *   4. Each frame: VK renders into ring[i]'s VkImage. After vkQueueWaitIdle,
@@ -1184,6 +1185,17 @@ static bool
 dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_t h)
 {
 	struct vk_bundle *vk = target->vk;
+
+	// #1539: the bridge opens KMT-shared D3D11 textures in VK, which needs
+	// VK_KHR_external_memory_win32 — no longer required of every app. Returning
+	// false here takes the caller's existing fall-through to the opaque WSI
+	// path, so a device without it still renders, just without see-through.
+	if (!vk_has_external_memory_win32(vk)) {
+		U_LOG_W(
+		    "DComp bridge: VK_KHR_external_memory_win32 not enabled on this VkDevice - "
+		    "transparent background unavailable, falling back to opaque WSI");
+		return false;
+	}
 
 	// The bridge's D3D11 device MUST live on the same adapter as the
 	// VkDevice: the ring textures are KMT-shared between the two, and a

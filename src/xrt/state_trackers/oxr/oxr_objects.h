@@ -2246,6 +2246,17 @@ struct oxr_system
 	VkPhysicalDevice suggested_vulkan_physical_device;
 
 	/*!
+	 * #1539: the VkInstance + loader entry point that came with the call that
+	 * set @ref suggested_vulkan_physical_device, so
+	 * `xrGetVulkanDeviceExtensionsKHR` can enumerate that physical device's
+	 * extensions and drop the optional-if-present Win32 external trio from its
+	 * answer when the driver lacks them. `VK_NULL_HANDLE` / `NULL` until
+	 * `xrGetVulkanGraphicsDevice[2]KHR` has been called.
+	 */
+	VkInstance suggested_vulkan_instance;
+	PFN_vkGetInstanceProcAddr suggested_vulkan_get_proc;
+
+	/*!
 	 * #868: a queue the RUNTIME owns exclusively, for weaving off the app's
 	 * frame thread.
 	 *
