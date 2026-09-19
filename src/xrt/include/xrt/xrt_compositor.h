@@ -2762,10 +2762,24 @@ struct xrt_system_compositor_info
 	//! Physical display height in meters (from SR SDK). 0 if unknown.
 	float display_height_m;
 
-	//! Recommended horizontal view scale: sr_recommended_w / display_pixel_w. 0 if unknown.
+	/*!
+	 * Recommended horizontal view scale: sr_recommended_w / display_pixel_w.
+	 * 0 if unknown.
+	 *
+	 * DISPLAY-level baseline, IMMUTABLE after system-compositor creation: the
+	 * vendor plug-in's own recommendation when it offers one, otherwise the
+	 * worst case (minimum) across the device's rendering-mode table. It is a
+	 * property of the panel, not of whatever mode happens to be active.
+	 *
+	 * For "what does one view cover in the mode being painted RIGHT NOW",
+	 * derive it from the mode table instead —
+	 * @ref xrt_device_get_active_mode_view_scale(). This field used to be
+	 * overwritten with the active mode's scale at three hand-maintained
+	 * mode-change sites, which made two sources of truth out of one number.
+	 */
 	float recommended_view_scale_x;
 
-	//! Recommended vertical view scale: sr_recommended_h / display_pixel_h. 0 if unknown.
+	//! Recommended vertical view scale. See @ref recommended_view_scale_x.
 	float recommended_view_scale_y;
 
 	//! Nominal viewer X position in display space (meters). 0 if unknown.

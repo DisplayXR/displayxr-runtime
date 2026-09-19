@@ -230,6 +230,16 @@ oxr_system_fill_in(
 	struct xrt_system_compositor_info *info = &sys->xsysc->info;
 
 #define imin(a, b) (a < b ? a : b)
+	/*
+	 * Deliberately the DISPLAY-level baseline, not the active mode's scale.
+	 * oxr_system_fill_in() runs exactly once, from xrCreateInstance, before any
+	 * session exists and therefore before any mode change could have happened —
+	 * so the baseline is what it has always read here, and sizing sys->views[]
+	 * from a per-mode number would be a behaviour change dressed up as a
+	 * refactor. The legacy branch below replaces both values with the
+	 * compromise scale anyway (oxr_legacy_compromise_scale), which DOES read the
+	 * mode table, through the picked legacy index.
+	 */
 	float view_scale_x = info->recommended_view_scale_x;
 	float view_scale_y = info->recommended_view_scale_y;
 
@@ -832,10 +842,26 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 
 	if (display_info) {
+		/*
+		 * recommendedViewScaleX/Y is "the ACTIVE mode's per-view scale, at
+		 * query time" — derived from the head's mode table rather than read
+		 * out of a scalar that mode changes had to remember to refresh. That
+		 * is what apps already observed after any mode change; the only
+		 * behaviour delta is that a query made BEFORE the first mode change
+		 * now also answers per-mode instead of handing back the plug-in's
+		 * display-level baseline.
+		 *
+		 * The baseline is the fallback, and it is the whole answer for a
+		 * device with no mode table or whose active mode declares no scale.
+		 */
+		float rec_scale_x = info ? info->recommended_view_scale_x : 1.0f;
+		float rec_scale_y = info ? info->recommended_view_scale_y : 1.0f;
+		xrt_device_get_active_mode_view_scale(GET_XDEV_BY_ROLE(sys, head), &rec_scale_x, &rec_scale_y);
+
 		display_info->displaySizeMeters.width = info ? info->display_width_m : 0.0f;
 		display_info->displaySizeMeters.height = info ? info->display_height_m : 0.0f;
-		display_info->recommendedViewScaleX = info ? info->recommended_view_scale_x : 1.0f;
-		display_info->recommendedViewScaleY = info ? info->recommended_view_scale_y : 1.0f;
+		display_info->recommendedViewScaleX = rec_scale_x;
+		display_info->recommendedViewScaleY = rec_scale_y;
 		// Nominal viewer position from SR SDK (or fallback defaults)
 		display_info->nominalViewerPositionInDisplaySpace.x = info ? info->nominal_viewer_x_m : 0.0f;
 		display_info->nominalViewerPositionInDisplaySpace.y = info ? info->nominal_viewer_y_m : 0.0f;

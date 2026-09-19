@@ -1163,11 +1163,15 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 						head->hmd->active_rendering_mode_index = floored;
 
 						/*
-						 * The floored mode's per-view scales. Same two
-						 * writes as the request path (oxr_api_session.c,
-						 * step 4) and the RENDERING_MODE_CHANGE poll arm
-						 * below, so all three agree on what the compositor
-						 * was told.
+						 * Nothing to cache for the floored mode's per-view
+						 * scales. The write above is the whole update: the
+						 * scale of the mode now active is derived from the
+						 * mode table on demand
+						 * (xrt_device_get_active_mode_view_scale), so this
+						 * path, the request path (oxr_api_session.c, step 4)
+						 * and the RENDERING_MODE_CHANGE poll arm below cannot
+						 * disagree the way three hand-maintained copies of
+						 * one number could.
 						 *
 						 * The #1488 live-views shadow (oxr_views_change_*)
 						 * is deliberately NOT written here, and the reason
@@ -1200,13 +1204,6 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 						 * XR_EXT_view_configuration_views_change app sees
 						 * PRE-floor dims until its first xrEndFrame.
 						 */
-						struct xrt_system_compositor *xsysc = sess->sys->xsysc;
-						if (xsysc != NULL) {
-							xsysc->info.recommended_view_scale_x =
-							    head->rendering_modes[floored].view_scale_x;
-							xsysc->info.recommended_view_scale_y =
-							    head->rendering_modes[floored].view_scale_y;
-						}
 
 						/*
 						 * Tell the app. It enumerated the modes before
@@ -1686,11 +1683,11 @@ skip_macos_pump:
 				// the same value the device already holds in-process, so it is a
 				// harmless idempotent store on the non-IPC path.
 				head->hmd->active_rendering_mode_index = cur;
-				struct xrt_system_compositor *xsysc = sess->sys->xsysc;
-				if (xsysc != NULL) {
-					xsysc->info.recommended_view_scale_x = mode->view_scale_x;
-					xsysc->info.recommended_view_scale_y = mode->view_scale_y;
-				}
+				// That index IS the update: the active mode's per-view scale is
+				// derived from the mode table on demand
+				// (xrt_device_get_active_mode_view_scale), never cached into
+				// xsysc->info.recommended_view_scale_*, which stays the immutable
+				// display-level baseline.
 
 				/*
 				 * #1499 S4: the honest half for the two cases the

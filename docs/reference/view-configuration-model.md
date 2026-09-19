@@ -247,8 +247,13 @@ configuration is a *per-session* fact the app names in `xrBeginSession`, so that
 is the first moment `view_config_view_count` is authoritative (it is seeded from
 the system's first advertised type at `xrCreateSession`). **Nothing is resized**:
 the swapchain is worst-case-sized across all modes
-([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)), so only
-`recommended_view_scale_{x,y}` move.
+([ADR-010](../adr/ADR-010-shared-app-iosurface-worst-case-sized.md)), so the
+only thing that moves is `active_rendering_mode_index` — and with it everything
+derived from it, including the per-view scale `XrDisplayInfoDXR` reports. (The
+floor used to also overwrite the scalar
+`xrt_system_compositor_info::recommended_view_scale_{x,y}`; that cache is gone,
+the scalar is now the immutable display-level baseline and the active mode's
+scale is derived on demand from the mode table.)
 
 **What an `XR_EXT_view_configuration_views_change` app sees.** The
 [#1488](https://github.com/DisplayXR/displayxr-runtime/issues/1488) live-view
