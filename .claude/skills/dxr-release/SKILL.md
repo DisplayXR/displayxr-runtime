@@ -660,7 +660,19 @@ if [ "$SIGNED" = yes ]; then
   else
     echo "NOTE: no CI installer asset found to delete — verify the release has exactly one .exe"
   fi
-  gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REL_REPO"
+  # Upload with retries, then PROVE the swap by size. A `--clobber` that dies mid-transfer
+  # (seen: `connection reset by peer`, modelviewer v0.28.7) can leave the block at exit 0
+  # with the UNSIGNED CI asset still in place — and the count check below passes on it,
+  # because signed and unsigned share the filename. Size (or digest) is the real gate.
+  WANT=$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")
+  for i in 1 2 3 4; do
+    gh release upload "$NEW_TAG" "$SIGNED_EXE" --clobber -R "$REL_REPO" && sleep 3
+    GOT=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
+           --jq ".assets[] | select(.name==\"$(basename "$SIGNED_EXE")\") | .size")
+    [ "$GOT" = "$WANT" ] && break
+    echo "upload attempt $i: release asset size $GOT != signed $WANT — retrying"; sleep 10
+  done
+  [ "$GOT" = "$WANT" ] || { echo "ERROR: signed installer NOT on the release after 4 attempts (size $GOT vs $WANT) — the UNSIGNED CI asset is what users get. Fix before reporting."; SIGNED=no; }
 
   # Never ship signed + unsigned together.
   N=$(gh release view "$NEW_TAG" -R "$REL_REPO" --json assets \
@@ -811,15 +823,22 @@ Spec: `docs/specs/runtime/versions-json-autobump.md` §"The browser pin LAGS the
 release on purpose".
 
 ```bash
-BUMP_RUN=""
-for i in $(seq 1 12); do
-  BUMP_RUN=$(gh run list -R DisplayXR/displayxr-runtime \
-              --workflow=versions-bump.yml --event=repository_dispatch \
-              --limit=3 --created=">$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ)" \
-              --json databaseId --jq '.[0].databaseId // empty')
-  [ -n "$BUMP_RUN" ] && break
+# Resolve the bump by its RESULT, not by "newest run": several components release
+# concurrently (2026-09-18: shell, modelviewer, avatar, earthview, mediaplayer bumped within
+# minutes) and `.[0]` then returns another component's run. The pin on runtime/main is the
+# authoritative signal; the run id is looked up afterwards by matching its display title.
+for i in $(seq 1 40); do
+  PINNED=$(gh api repos/DisplayXR/displayxr-runtime/contents/versions.json --jq .content | base64 -d | jq -r ".${FIELD}")
+  [ "$PINNED" = "$NEW_TAG" ] && break
   sleep 15
 done
+BUMP_RUN=$(gh run list -R DisplayXR/displayxr-runtime \
+            --workflow=versions-bump.yml --event=repository_dispatch --limit=15 \
+            --json databaseId,displayTitle,createdAt \
+            --jq "[.[] | select(.displayTitle | test(\"${FIELD}|${NEW_TAG}\"))] | sort_by(.createdAt) | last | .databaseId // empty")
+[ -n "$BUMP_RUN" ] || BUMP_RUN=$(gh run list -R DisplayXR/displayxr-runtime \
+            --workflow=versions-bump.yml --event=repository_dispatch --limit=3 \
+            --json databaseId --jq '.[0].databaseId // empty')   # fallback; say "run id ambiguous" in the report
 while :; do
   S=$(gh run view "$BUMP_RUN" -R DisplayXR/displayxr-runtime --json status,conclusion \
         --jq '.status + "/" + (.conclusion // "?")')

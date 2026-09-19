@@ -420,8 +420,18 @@ if [ "$SIGNED" = yes ]; then
   else
     echo "NOTE: no CI installer asset found to delete — verify the release has exactly one .exe"
   fi
-  gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber \
-    --repo DisplayXR/displayxr-runtime
+  # Upload with retries, then PROVE the swap by size — a `--clobber` that dies mid-transfer
+  # leaves the UNSIGNED CI asset in place under the same name, and the count check alone
+  # passes on it (seen on a demo release, 2026-09-18).
+  WANT=$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")
+  for i in 1 2 3 4; do
+    gh release upload [FULL_TAG] "$SIGNED_EXE" --clobber --repo DisplayXR/displayxr-runtime && sleep 3
+    GOT=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json assets \
+           --jq ".assets[] | select(.name==\"$(basename "$SIGNED_EXE")\") | .size")
+    [ "$GOT" = "$WANT" ] && break
+    echo "upload attempt $i: asset size $GOT != signed $WANT — retrying"; sleep 10
+  done
+  [ "$GOT" = "$WANT" ] || { echo "ERROR: signed installer NOT on the release (size $GOT vs $WANT) — users would get the UNSIGNED CI asset."; SIGNED=no; }
 
   # Fail loudly if more than one installer survived — never ship signed + unsigned together.
   N=$(gh release view [FULL_TAG] --repo DisplayXR/displayxr-runtime --json assets \
