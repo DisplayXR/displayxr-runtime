@@ -68,7 +68,15 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | No session bus | Provider create returns NULL (one WARN); display-scoped |
 | Extension not installed/enabled | Snapshot empty; bounded retry every 5 s; display-scoped until it appears |
 | No window matches our PID | `get_window_metrics` invalid; display-scoped |
-| Monitor scale ≠ 1.0 | Rect returned, one WARN — weave phase will be wrong until the display is set to 100 % scale (same constraint as X11 windowed weaving) |
+| Monitor scale ≠ 1.0 | Rect **refused**, one WARN; display-scoped until the display is set to 100 % scale (same constraint as X11 windowed weaving) |
+
+The scale row is the one that used to break the ladder's promise: the rect was
+returned with a warning, so the outcome was not pre-#817 behavior but *windowed
+weaving at a known-wrong phase* — visibly broken 3D rather than a clean
+fallback. Mutter reports logical pixels, which equal physical pixels only at
+scale 1.0, and at any other scale the compositor additionally resamples the
+surface on its way to the panel, destroying a 1-pixel-period interlace pattern
+outright. No phase correction survives that, so the geometry is refused.
 
 ## 4. Packaging contract — the publisher is a shared asset
 
