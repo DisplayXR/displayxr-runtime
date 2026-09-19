@@ -233,7 +233,7 @@ sim_zone_downsample_map(const uint8_t *pixels,
 	}
 //! #842: per-variant pipeline/shader table size — one entry per user-selectable
 //! output mode (enum sim_display_output_mode indexes the table directly).
-#define SIM_DP_PIPELINE_COUNT 6
+#define SIM_DP_PIPELINE_COUNT 7
 
 /*!
  * #842 — position-preserving substitution rule, shared by all five variants.
@@ -246,8 +246,9 @@ sim_zone_downsample_map(const uint8_t *pixels,
  * active zone mask they must be replaced by a position-preserving one. We
  * substitute ANAGLYPH: it already exists in every variant, is a per-pixel
  * colour combine (so pixel (x,y) keeps showing the content that belongs at
- * (x,y)), and reads as depth on a flat panel. Anaglyph, Blend and Passthrough
- * are already position-preserving and stay as selected. One-shot WARN per
+ * (x,y)), and reads as depth on a flat panel. Anaglyph, Blend, Passthrough and
+ * Interlaced (#817 — a per-pixel column pick at the same UV) are already
+ * position-preserving and stay as selected. One-shot WARN per
  * variant (static is per-TU).
  */
 static inline bool
@@ -263,6 +264,36 @@ sim_zone_substitute_position_preserving(enum sim_display_output_mode mode, bool 
 		U_LOG_W("sim_display %s: zone mask active — substituting position-preserving anaglyph "
 		        "for rearranging output mode %d (#842)",
 		        variant, (int)mode);
+	}
+	return true;
+}
+
+/*!
+ * #817 — per-backend availability of SIM_DISPLAY_OUTPUT=interlaced.
+ *
+ * The interlaced mode needs the weave target's panel-relative X origin
+ * (`canvas_offset_x`) inside the fragment shader, which means extending each
+ * backend's shader-constant block. That landed for the Vulkan and GL variants;
+ * the D3D11, D3D12 and Metal variants share a constant-buffer layout that
+ * could not be compiled or run where this was written, so rather than ship an
+ * unvalidated HLSL/MSL change they fall back to anaglyph — position-preserving,
+ * same atlas geometry, just not phase-sensitive.
+ *
+ * Returns true when the caller should substitute
+ * SIM_DISPLAY_OUTPUT_ANAGLYPH. One-shot WARN per variant (static is per-TU).
+ */
+static inline bool
+sim_interlaced_fallback_to_anaglyph(enum sim_display_output_mode mode, const char *variant)
+{
+	if (mode != SIM_DISPLAY_OUTPUT_INTERLACED) {
+		return false;
+	}
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W("sim_display: interlaced output not implemented on %s yet — falling back to anaglyph "
+		        "(#817); use the Vulkan or GL display processor for the phase-sensitive mode",
+		        variant);
 	}
 	return true;
 }

@@ -37,6 +37,10 @@
 
 DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_gl, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
+//! #817: interlace stripe width in panel pixels (see the VK processor for why
+//! 1 is the default). Clamped to >= 1 at upload.
+DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period_gl, "SIM_DISPLAY_INTERLACE_PERIOD", 1)
+
 
 /*
  *
@@ -186,6 +190,35 @@ static const char *FS_PASSTHROUGH =
     "}\n";
 
 
+//! #817 Interlaced: pick the view per PANEL column — a phase-sensitive proxy
+//! for a lenticular weave. Both views are sampled at the same normalized UV,
+//! so the output stays position-preserving (like anaglyph, unlike SBS).
+//! `u_phase_px` is the weave target's panel-relative X origin
+//! (canvas_offset_x), so moving the window shifts the pattern; any resample
+//! between this output and scanout smears the stripes into grey/moire. Mirrors
+//! shaders/interlaced.frag.
+static const char *FS_INTERLACED =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
+    "uniform float u_phase_px;\n"
+    "uniform float u_period_px;\n"
+    "void main() {\n"
+    "    float period = max(u_period_px, 1.0);\n"
+    "    float panel_col = floor(gl_FragCoord.x) + u_phase_px;\n"
+    "    float eye_index = mod(floor(panel_col / period), 2.0);\n"
+    "    float col = mod(eye_index, u_tile_cols);\n"
+    "    float row = floor(eye_index / u_tile_cols);\n"
+    "    vec2 uv = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
+    "    fragColor = texture(u_texture, uv);\n"
+    "}\n";
+
+
 
 /*!
  * Implementation struct for the GL simulation display processor.
@@ -193,7 +226,11 @@ static const char *FS_PASSTHROUGH =
 struct sim_display_processor_gl
 {
 	struct xrt_display_processor_gl base;
-	GLuint programs[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	//! One per output mode (SBS, anaglyph, blend, squeezed SBS, quad,
+	//! passthrough, interlaced).
+	GLuint programs[SIM_DP_PIPELINE_COUNT];
+	//! #817: SIM_DISPLAY_INTERLACE_PERIOD, latched at creation.
+	int32_t interlace_period_px;
 	GLuint vao_empty;   //!< Empty VAO for vertex-shader-generated fullscreen triangle
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -244,7 +281,8 @@ sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 {
 	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
 	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
+	// #817: canvas_offset_x IS consumed below — it is the interlace phase for
+	// SIM_DISPLAY_OUTPUT=interlaced.
 	(void)canvas_offset_y;
 	(void)canvas_width;
 	(void)canvas_height;
@@ -285,6 +323,14 @@ sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 	glUniform1f(loc_rows, tile_rows_inv);
 	glUniform1f(loc_tc, (float)tile_columns);
 	glUniform1f(loc_tr, (float)tile_rows);
+
+	// #817: interlace phase + stripe width. Only FS_INTERLACED declares these;
+	// glGetUniformLocation returns -1 for the other programs and glUniform1f on
+	// -1 is a defined no-op, so this stays a single unconditional upload.
+	GLint loc_phase = glGetUniformLocation(active_program, "u_phase_px");
+	GLint loc_period = glGetUniformLocation(active_program, "u_period_px");
+	glUniform1f(loc_phase, (float)canvas_offset_x);
+	glUniform1f(loc_period, (float)sdp->interlace_period_px);
 
 	glBindVertexArray(sdp->vao_empty);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -601,11 +647,17 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->nominal_y_m = 0.1f;
 	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m_gl();
 
+	// #817: interlace stripe width; clamp so the shader can never divide by 0.
+	sdp->interlace_period_px = (int32_t)debug_get_num_option_sim_display_interlace_period_gl();
+	if (sdp->interlace_period_px < 1) {
+		sdp->interlace_period_px = 1;
+	}
+
 	// Compile all shader programs for instant runtime switching
-	const char *fs_sources[SIM_DP_PIPELINE_COUNT] = {FS_SBS,  FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS,
-	                                                 FS_QUAD, FS_PASSTHROUGH};
-	const char *mode_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
-	                                                 "Quad", "Passthrough"};
+	const char *fs_sources[SIM_DP_PIPELINE_COUNT] = {FS_SBS,  FS_ANAGLYPH,    FS_BLEND, FS_SQUEEZED_SBS,
+	                                                 FS_QUAD, FS_PASSTHROUGH, FS_INTERLACED};
+	const char *mode_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph",    "Blend", "Squeezed SBS",
+	                                                 "Quad", "Passthrough", "Interlaced"};
 
 	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		sdp->programs[i] = create_program(VS_FULLSCREEN, fs_sources[i]);
@@ -627,6 +679,7 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;

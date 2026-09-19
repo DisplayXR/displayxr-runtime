@@ -37,6 +37,7 @@ struct vk_bundle;
  * - "sbs": side-by-side left/right views
  * - "anaglyph": red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
+ * - "interlaced": 1-pixel column interlace (phase-sensitive weave proxy, #817)
  *
  * Always available as fallback. Use FORCE_SIM_DISPLAY=1 to override vendor drivers.
  */
@@ -53,6 +54,29 @@ enum sim_display_output_mode
 	SIM_DISPLAY_OUTPUT_SQUEEZED_SBS = 3, //!< Squeezed SBS (no crop, tiles placed as-is)
 	SIM_DISPLAY_OUTPUT_QUAD = 4,         //!< 2x2 quad view (4 views)
 	SIM_DISPLAY_OUTPUT_PASSTHROUGH = 5,  //!< Passthrough (2D mode — first tile fills screen)
+	/*!
+	 * #817 — 1-pixel-period column interlace: a phase-sensitive proxy for a
+	 * lenticular weave.
+	 *
+	 * Output pixel at PANEL column X shows view 0 when
+	 * `(X + phase) % 2 == 0` and view 1 otherwise, both sampled at the same
+	 * normalized UV (position-preserving, like anaglyph — not a rearranging
+	 * layout like SBS). `phase` is the weave target's panel-relative X
+	 * origin (`canvas_offset_x`, as handed to `process_atlas`).
+	 *
+	 * Every other sim_display mode renders "correctly" at any size, any
+	 * offset and through any resample, so sim_display is structurally blind
+	 * to the two properties a real weaver lives or dies by. This one is not:
+	 * a resample (desktop scale != 100%, a mis-sized swapchain) smears the
+	 * alternating columns into grey/moire, and a wrong origin flips which
+	 * eye lands on the even columns. `SIM_DISPLAY_INTERLACE_PERIOD=N`
+	 * widens the stripes so the pattern is visible by eye; 1 is the default
+	 * because 1 is what a lenticular actually needs.
+	 *
+	 * Still a proxy, not a weaver: there is no lens model here, so it can
+	 * show that geometry is wrong but never that a vendor weave is right.
+	 */
+	SIM_DISPLAY_OUTPUT_INTERLACED = 6,
 };
 
 /*!

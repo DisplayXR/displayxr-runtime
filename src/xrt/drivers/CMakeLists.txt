@@ -84,6 +84,7 @@ if(XRT_HAVE_VULKAN)
 		sim_display/shaders/squeezed_sbs.frag
 		sim_display/shaders/quad.frag
 		sim_display/shaders/passthrough.frag
+		sim_display/shaders/interlaced.frag
 		)
 	list(APPEND SIM_DISPLAY_SOURCES
 		${SIM_DISPLAY_SHADER_HEADERS}
