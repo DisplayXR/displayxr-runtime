@@ -142,13 +142,28 @@ static const char *required_vk_instance_extensions[] = {
     // compositor fails target creation at xrCreateSession.
     VK_KHR_SURFACE_EXTENSION_NAME,         //
     VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, //
-#elif defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX)
-    // VK native compositor on Linux needs VkSurfaceKHR via VK_KHR_xcb_surface
-    // (xcb_connection_t + xcb_window_t -> VkSurfaceKHR in comp_vk_native_target).
-    // Without this the instance-level vkCreateXcbSurfaceKHR PFN is never loaded
-    // and the compositor fails target creation at xrCreateSession.
-    VK_KHR_SURFACE_EXTENSION_NAME,      //
-    VK_KHR_XCB_SURFACE_EXTENSION_NAME,  //
+#elif defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+    // VK native compositor on desktop Linux needs VkSurfaceKHR plus whichever
+    // window-system surface extension the app's binding will end up using
+    // (xcb_connection_t + xcb_window_t, or wl_display* + wl_surface* ->
+    // VkSurfaceKHR in comp_vk_native_target). Without them the instance-level
+    // vkCreateXcbSurfaceKHR / vkCreateWaylandSurfaceKHR PFN is never loaded and
+    // the compositor fails target creation at xrCreateSession.
+    //
+    // ADDITIVE, not either/or: this list is baked into the VkInstance that
+    // xrCreateVulkanInstanceKHR builds, which runs long before xrCreateSession
+    // — so the runtime does not yet know whether the app will chain
+    // XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding. Both
+    // compiled-in platforms must therefore be enabled unconditionally; an
+    // unused surface extension costs nothing on any Linux ICD, whereas a
+    // missing one is unrecoverable by the time the binding is known.
+    VK_KHR_SURFACE_EXTENSION_NAME, //
+#ifdef VK_KHR_xcb_surface
+    VK_KHR_XCB_SURFACE_EXTENSION_NAME, //
+#endif
+#ifdef VK_KHR_wayland_surface
+    VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, //
+#endif
 #endif
 };
 
@@ -171,9 +186,12 @@ static const char *required_vk_device_extensions[] = {
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
     VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-#if defined(VK_KHR_xcb_surface) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
+#if (defined(VK_KHR_xcb_surface) || defined(VK_KHR_wayland_surface)) && defined(XRT_OS_LINUX) &&                       \
+    !defined(XRT_OS_ANDROID)
     // VK native compositor on desktop Linux presents on the app's VkDevice via a
-    // swapchain over the XCB surface (comp_vk_native_target)
+    // swapchain over the XCB *or* Wayland surface (comp_vk_native_target) — the
+    // gate has to name both, or an XRT_HAVE_XCB=OFF / XRT_HAVE_WAYLAND=ON build
+    // enables a surface it can never present on.
     VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 #endif
 
