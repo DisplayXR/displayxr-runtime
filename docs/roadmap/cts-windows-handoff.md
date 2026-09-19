@@ -44,16 +44,39 @@ runs on today:
 |---|---|---|---|
 | `d3d11` | GitHub-hosted `windows-2022`, **WARP** (D3D software rasterizer, always present in the image) | **yes** | — |
 | `d3d12` | GitHub-hosted `windows-2022`, **WARP** | **yes** | — |
-| `opengl` | needs a **software ICD** (Mesa llvmpipe) — the hosted image has no usable GL 4.x context | no — `continue-on-error`, reported only | #1525, then #1522 (GL teardown race) |
-| `vulkan` | needs a **software ICD** (lavapipe / SwiftShader) — the hosted image ships no Vulkan ICD | no — `continue-on-error`, reported only | #1525 |
-| `vulkan2` | same as `vulkan` | no — `continue-on-error`, reported only | #1525 |
+| `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
+| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | no — `continue-on-error`, reported only | #1542 — SIGSEGV in `SessionState`, past `vkCreateDevice` since #1539; fix in flight as #1550 |
+| `vulkan2` | same as `vulkan` | no — `continue-on-error`, reported only | #1542 (→ #1550) |
 | Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
-The three experimental Windows arms are driven by **one flag**: the
-`EXPERIMENTAL="opengl vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets
-each arm's `continue-on-error` and tells the `summary` job which arms to exclude
-from the gate. #1525 empties that string and nothing else changes.
+The remaining experimental Windows arms are driven by **one flag**: the
+`EXPERIMENTAL="vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets each
+arm's `continue-on-error` and tells the `summary` job which arms to exclude from
+the gate. Removing a name from that string is all it takes to make the arm gate;
+nothing else in the file changes.
+
+**`opengl` graduated (#1523).** #1525 provisioned llvmpipe, and once #1540
+(qwerty use-after-free at instance teardown) and #1549 (`comp_gl` NULL layer
+slots) landed, the full non-interactive GL suite ran to completion on llvmpipe
+for the first time — [run 35433846568][gl-run]: **27515 assertions, 1 failure,
+0 errors, 42 skipped**. The lone failure is `Timed_Pipelined_Frame_Submission`
+(`REQUIRE( timingResults.GetOverheadFactor() < 0.5 )`, expansion
+`1.08553478400000003 < 0.5` — an *Overhead score : 108.6%* against the CTS's
+hard 50% cap). That is a CPU rasterizer on a 2-vCPU runner missing a frame
+budget predicted as if a GPU were scanning out; the same arm on a real GPU has
+no unexpected failures. So it is quarantined **by name, on the software tier
+only**, and `opengl` gates on everything else. The earlier "dies at session
+teardown (#1522)" reading is fixed and stale — do not cite it.
+
+The one cost, stated where it can be found: the `Report frame-timing metrics`
+step scrapes that test's printed overhead to trend runner frame timing (#589),
+so on the software tier it now prints `No Timed_Pipelined_Frame_Submission
+metrics in console log` instead of a percentage. Any tier that does not pass
+the quarantine list — the PR lane's WARP arms, the real-GPU tier (#1526) —
+still gets the number.
+
+[gl-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35433846568
 
 Beyond software rasterizers, **#1526** tracks a self-hosted Windows runner on a
 hybrid iGPU+dGPU box — a real-GPU lane is what turns the three software-ICD arms
@@ -301,7 +324,10 @@ Three more things that are easy to get wrong here:
 **Quarantine:** `scripts/cts_quarantine_software_tier.txt` is the single place
 software-tier exclusions live, passed via `run_cts.ps1 -QuarantineList` and
 **only** on this tier — a real-GPU tier gets an empty exclusion set by
-construction. A test quarantined on every tier is hiding a defect.
+construction. A test quarantined on every tier is hiding a defect. It holds
+**one** entry, `Timed_Pipelined_Frame_Submission` (108.6% frame-timing overhead
+vs the CTS's 50% cap on llvmpipe — see *`opengl` graduated* above); the file's
+own header carries the evidence and the re-check rule.
 
 Kill switch: workflow-level `DXR_CTS_SOFTWARE_ICD: '0'` in `cts.yml`.
 

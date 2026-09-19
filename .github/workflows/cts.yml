@@ -109,26 +109,35 @@ jobs:
           # we advertise both, so both are owed a submission run (#1523).
           ALL_ARMS="d3d11 d3d12 opengl vulkan vulkan2"
 
-          # ===== THE EXPERIMENTAL FLAG — #1525 FLIPS EXACTLY THIS LINE =====
-          # opengl / vulkan / vulkan2 cannot even START on a GitHub-hosted
-          # windows-2022 runner: the image ships no usable GL 4.x context and no
-          # Vulkan ICD, so conformance_cli aborts before the first test. Until
-          # #1525 lands the software rasterizers (llvmpipe / lavapipe), those
-          # three arms run with continue-on-error and are EXCLUDED FROM THE GATE
-          # (but still reported in the summary table). When #1525 lands, set this
-          # to the empty string — nothing else in this file needs to change.
-          EXPERIMENTAL="opengl vulkan vulkan2"
-          # =================================================================
-          # NOTE (#1525, landed): the software rasterizers ARE provisioned now
-          # and those three arms do start — opengl runs ~493 assertions on
-          # llvmpipe before SIGSEGV (#1522). vulkan/vulkan2 used to run 1442
-          # and stop at vkCreateDevice (the runtime required the Win32
-          # external memory/semaphore/fence trio of every app); #1539 made
-          # that trio optional-if-present, so both arms now create the device,
-          # PASS Swapchains, and stop at a SIGSEGV in SessionState — a
-          # separate crash, the Vulkan sibling of #1522. So the list above
-          # stays as it is: they report real counts in the summary table
-          # instead of MISSING, but none of the three can gate yet. See
+          # ===== THE EXPERIMENTAL FLAG — ONE LINE GATES AN ARM =====
+          # An arm named here runs with continue-on-error and is EXCLUDED FROM
+          # THE GATE (still reported, with real counts, in the summary table).
+          # Removing a name is all it takes to make that arm gate.
+          EXPERIMENTAL="vulkan vulkan2"
+          # =========================================================
+          # WHY opengl IS NO LONGER HERE (#1523). #1525 provisioned the
+          # software rasterizers, and once #1540 (qwerty use-after-free) and
+          # #1549 (comp_gl NULL layer slots) landed, the full non-interactive
+          # GL suite ran to completion on llvmpipe for the first time — run
+          # 35433846568, 27515 assertions / 1 failure / 0 errors / 42 skipped.
+          # The one failure was Timed_Pipelined_Frame_Submission's 108.6%
+          # frame-timing overhead against the CTS's 50% cap, which is a
+          # property of a CPU rasterizer on a 2-vCPU runner and not of the
+          # runtime (the same arm on a real GPU has no unexpected failures).
+          # It is quarantined BY NAME on the software tier only —
+          # scripts/cts_quarantine_software_tier.txt — so opengl now gates on
+          # everything else. The old note here said "~493 assertions before
+          # SIGSEGV (#1522)"; that crash is fixed and that number is stale.
+          #
+          # vulkan / vulkan2 stay here, for a blocker that MOVED. They used to
+          # run 1442 and stop at vkCreateDevice (the runtime required the
+          # Win32 external memory/semaphore/fence trio of every app); #1539
+          # made that trio optional-if-present, so both arms now create the
+          # device, PASS Swapchains, and stop at a SIGSEGV in SessionState
+          # (#1542) — a separate crash, the Vulkan sibling of #1522, with the
+          # fix in flight as #1550. A crash is not a nameable set of tests, so
+          # it can never be a quarantine entry; these two flip out of this
+          # string after #1550 and a full run, not before. See
           # docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 
           # Which arms get Mesa llvmpipe/lavapipe. Exactly the ones that cannot
@@ -545,6 +554,12 @@ jobs:
       # CTS hard-fails at >= 50%. We warn at >= 40% as an early signal that the
       # hosted runner's timer/scheduling jitter is creeping toward the cliff
       # (see #589 for why this test is timer-granularity sensitive on Windows).
+      #
+      # EXPECT "No ... metrics in console log" ON THE SOFTWARE TIER: the test is
+      # quarantined by name there (#1523), so it prints nothing to scrape. That
+      # line is the honest reading, not a scrape regression — the percentage
+      # comes back on any tier that does not pass the quarantine list (the PR
+      # lane's WARP arms, and the real-GPU tier #1526).
       - name: Report frame-timing metrics
         if: always()
         shell: pwsh
@@ -703,14 +718,18 @@ jobs:
                    "| arm | tests | failures | errors | status |",
                    "|---|---:|---:|---:|---|"]
           for arm, tests, failures, errors, status, exp in rows:
-              label = f"`{arm}`" + (" _(experimental, #1525)_" if exp else "")
+              label = f"`{arm}`" + (" _(experimental, #1542)_" if exp else "")
               lines.append(f"| {label} | {tests} | {failures} | {errors} | {status} |")
           lines += ["",
-                    "Experimental arms (`opengl` / `vulkan` / `vulkan2`) run against Mesa's software",
-                    "rasterizers on the hosted runner (#1525) and report real counts, but are not",
-                    "gated: `opengl` still dies at session teardown (#1522), and `vulkan`/`vulkan2`",
-                    "now get past `vkCreateDevice` (#1539) but SIGSEGV in SessionState — the Vulkan",
-                    "sibling of that crash. See docs/roadmap/cts-windows-handoff.md."]
+                    "`opengl` runs against Mesa **llvmpipe** on the hosted runner (#1525) and **is gated**",
+                    "(#1523), with `Timed_Pipelined_Frame_Submission` quarantined by name on the software",
+                    "tier only — its 108.6% frame-timing overhead is the CPU rasterizer, not the runtime",
+                    "(scripts/cts_quarantine_software_tier.txt).",
+                    "",
+                    "Experimental arms (`vulkan` / `vulkan2`) run against **lavapipe**, report real counts,",
+                    "and are not gated: they now get past `vkCreateDevice` (#1539) and PASS `Swapchains`,",
+                    "but SIGSEGV in `SessionState` (#1542) — the Vulkan sibling of the `opengl` crash,",
+                    "fix in flight as #1550. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")
