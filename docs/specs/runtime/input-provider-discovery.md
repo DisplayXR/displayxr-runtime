@@ -188,6 +188,22 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    anything else = on). Forces the fallback, registry/config-gated by
    convention (not an env var). Providers are then not loaded at all,
    so behavior is bit-identical to a box with none registered.
+3a. **`DXR_INPUT_PROVIDERS=0`** (process environment, all platforms) does the
+   same thing for **one process**: the lazy discovery pass in
+   `target_input_plugin_get_iface()` is skipped entirely, no provider DLL is
+   loaded, `target_input_plugin_get_count()` stays 0, `create_devices` is
+   never called, and the hand roles sit on the qwerty floor. One `U_LOG_W` at
+   the first (and only) discovery attempt records it.
+   Why an env var when `ForceQwerty` exists: a CTS lane needs the suppression
+   scoped to the process it launches, and a run killed mid-flight (the harness
+   kills on timeout) must not be able to leave the box with input disabled
+   machine-wide. `scripts/run_cts.ps1` sets it for every run (#1545, #1523) —
+   the Ultraleap provider re-spins its LeapC thread pool on every
+   `xrCreateInstance`, and those threads are what race the NVIDIA GL ICD the
+   display-plug-in side drags in (see
+   [plugin discovery §2.2](plugin-discovery.md#22-dxr_plugin_exclusive--load-one-plug-in-and-nothing-else)).
+   Set it in the inherited environment — CRT `getenv`, same caveat as the DP
+   loader's env overrides.
 4. **Input providers never supply the head**, and the DP's
    `set_pose_source` hook is still the single binding point. What that
    hook receives is now the runtime's own **rig composer** rather than the

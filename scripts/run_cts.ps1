@@ -14,6 +14,12 @@
   emitting a ctsxml report (for the pass/fail matrix) plus a console log.
 
 .PARAMETER Plugin     sim-display (default) | leia-sr | none (leave plugins as-is)
+                      Also sets DXR_PLUGIN_EXCLUSIVE=<Plugin> for the run, so
+                      the named plug-in is the ONLY display plug-in the runtime
+                      loads — ProbeOrder alone decides which one WINS, not
+                      which ones get loaded (#1545). Input providers are
+                      skipped too (DXR_INPUT_PROVIDERS=0). Both are process
+                      env, so nothing on the box changes.
 .PARAMETER Graphics   d3d11 (default) | d3d12 | opengl | vulkan | vulkan2
                       These are the five CTS graphics plugins Windows supports,
                       and a conformance submission owes one automated run per
@@ -403,6 +409,27 @@ try {
   # self-creates one per session. Keep it windowed (not fullscreen) so a run
   # doesn't repeatedly take over the display.
   $env:XRT_COMPOSITOR_START_WINDOWED = "true"
+  # #1545: run the lane EXCLUSIVE — the named display plug-in is the only one
+  # loaded, and input providers are not discovered at all.
+  #
+  # Lowering $Plugin's ProbeOrder only decides which plug-in WINS; every other
+  # registered one is still LoadLibrary'd, because display-claim collection
+  # consults all of them (#69 / ADR-015). On a box with the Leia SR plug-in
+  # installed that drags SimulatedRealityOpenGL.dll -> opengl32 -> the NVIDIA
+  # GL ICD into a `-G d3d11` process, and the multithreading case then faults
+  # in an NV ICD worker with rip=0 after ~547 instance cycles. The other half
+  # of that crash is the Ultraleap provider re-spinning its LeapC thread pool
+  # on every xrCreateInstance, which is what creates the racing thread.
+  #
+  # Set on the PowerShell process (NOT via the run script) so the child's CRT
+  # captures them at startup: the runtime DLL has its own static-CRT
+  # environment block, same reason XRT_FORCE_MODE is set this way.
+  if ($Plugin -ne "none") {
+    $env:DXR_PLUGIN_EXCLUSIVE = $Plugin
+    Write-Output "APPLIED DXR_PLUGIN_EXCLUSIVE=$Plugin (no other display plug-in is loaded)"
+  }
+  $env:DXR_INPUT_PROVIDERS = "0"
+  Write-Output "APPLIED DXR_INPUT_PROVIDERS=0 (input-provider discovery skipped; hands stay on qwerty)"
 
   # OpenXR-CTS renamed the API-version CLI arg `--apiVersion` -> `--minApiVersion`
   # in openxr-cts-1.1.44+ (Khronos CHANGELOG.CTS.md, internal MR 3576). Under
@@ -521,6 +548,7 @@ try {
   $idLines.Add("tag:        $Tag")
   $idLines.Add("graphics:   $Graphics (OpenXR $ApiVersion)")
   $idLines.Add("plugin:     $Plugin")
+  $idLines.Add("exclusive:  DXR_PLUGIN_EXCLUSIVE=$($env:DXR_PLUGIN_EXCLUSIVE) DXR_INPUT_PROVIDERS=$($env:DXR_INPUT_PROVIDERS)")
   $swVer = $env:DXR_CTS_SOFTWARE_GFX_VERSION
   if ($swVer) {
     $idLines.Add("software:   $swVer")
@@ -559,3 +587,10 @@ Write-Output "XML:      $xml"
 Write-Output "CONSOLE:  $console"
 Write-Output "STDOUT:   $stdoutLog"
 Write-Output "IDENTITY: $identity"
+
+# Unset the two exclusivity vars now the identity block has recorded them.
+# `& run_cts.ps1` runs in the CALLER's session, so leaving DXR_PLUGIN_EXCLUSIVE
+# set would silently pin the next app launched from that same prompt to one
+# display plug-in — a confusing state to debug hours later.
+Remove-Item -Path Env:\DXR_PLUGIN_EXCLUSIVE -ErrorAction SilentlyContinue
+Remove-Item -Path Env:\DXR_INPUT_PROVIDERS  -ErrorAction SilentlyContinue

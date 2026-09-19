@@ -1063,12 +1063,43 @@ target_input_plugin_get_active(void)
 	return target_input_plugin_get_iface(0);
 }
 
+/*!
+ * `DXR_INPUT_PROVIDERS=0` — skip input-provider discovery entirely (#1545,
+ * #1523): no provider DLL is loaded, `get_count()` stays 0, the builder never
+ * calls `create_devices`, and the hand roles sit on the qwerty floor. Behavior
+ * is bit-identical to a box with no provider registered.
+ *
+ * Same effect as the `HKLM\Software\DisplayXR\Input\ForceQwerty` gate (§4.3 of
+ * the discovery spec), deliberately as an **env var** rather than reusing it:
+ * a CTS lane wants the suppression scoped to the one process it launches, and
+ * a run killed mid-flight (which the harness does on timeout) must not be able
+ * to leave the box with input machine-wide disabled.
+ *
+ * Read via CRT `getenv`, so it must be inherited from the launching process —
+ * see the note on `DXR_PLUGIN_EXCLUSIVE` in `target_plugin_loader.c`.
+ */
+static bool
+input_providers_disabled_by_env(void)
+{
+	const char *env = getenv("DXR_INPUT_PROVIDERS");
+	return env != NULL && env[0] == '0' && env[1] == '\0';
+}
+
 const struct xrt_input_plugin_iface *
 target_input_plugin_get_iface(int index)
 {
 	if (!g_input_load_attempted) {
 		g_input_load_attempted = 1;
-		input_discover_all();
+		if (input_providers_disabled_by_env()) {
+			/* One WARN, once per process: the scan is one-shot, so
+			 * this cannot bloat a log even across the hundreds of
+			 * instances a CTS run creates. */
+			U_LOG_W(
+			    "input plugin loader: DXR_INPUT_PROVIDERS=0 — skipping input-provider discovery "
+			    "entirely; no provider is loaded and the hand roles stay on qwerty.");
+		} else {
+			input_discover_all();
+		}
 	}
 	if (index < 0 || index >= g_input_provider_count) {
 		return NULL;
