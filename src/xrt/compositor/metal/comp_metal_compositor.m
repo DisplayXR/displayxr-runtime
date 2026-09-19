@@ -1510,6 +1510,87 @@ metal_compositor_layer_quad(struct xrt_compositor *xc,
 }
 
 /*!
+ * KHR cube / cylinder / equirect(1,2) layers (#1547, same gap as the GL lane
+ * in #1544).
+ *
+ * The instance advertises the KHR layer extensions instance-wide — this build
+ * ships XR_KHR_composition_layer_cylinder and _equirect2 (their
+ * XRT_FEATURE_OPENXR_LAYER_* options default ON; the cube and equirect1 ones
+ * default OFF but are plain CMake switches). A NULL slot here is therefore not
+ * "unsupported" — it is a call through a null function pointer inside
+ * xrEndFrame. A NULL slot must fail the layer, not the process; all four are
+ * wired so no build configuration can put the crash back.
+ *
+ * Accumulate-only, exactly like gl/d3d11/d3d12/vk_native. The Metal render
+ * path filters on PROJECTION/PROJECTION_DEPTH/ZONE_3D/LOCAL_2D/WINDOW_SPACE,
+ * so these shapes are accumulated and never drawn. Conformance needs
+ * xrEndFrame to succeed. Once-latched U_LOG_I per type.
+ */
+static xrt_result_t
+metal_compositor_layer_cube(struct xrt_compositor *xc,
+                            struct xrt_device *xdev,
+                            struct xrt_swapchain *xsc,
+                            const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	static bool noted = false;
+	if (!noted) {
+		U_LOG_I("Metal compositor: cube layers are accepted but not drawn (#1547)");
+		noted = true;
+	}
+	comp_layer_accum_cube(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+metal_compositor_layer_cylinder(struct xrt_compositor *xc,
+                                struct xrt_device *xdev,
+                                struct xrt_swapchain *xsc,
+                                const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	static bool noted = false;
+	if (!noted) {
+		U_LOG_I("Metal compositor: cylinder layers are accepted but not drawn (#1547)");
+		noted = true;
+	}
+	comp_layer_accum_cylinder(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+metal_compositor_layer_equirect1(struct xrt_compositor *xc,
+                                 struct xrt_device *xdev,
+                                 struct xrt_swapchain *xsc,
+                                 const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	static bool noted = false;
+	if (!noted) {
+		U_LOG_I("Metal compositor: equirect1 layers are accepted but not drawn (#1547)");
+		noted = true;
+	}
+	comp_layer_accum_equirect1(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+metal_compositor_layer_equirect2(struct xrt_compositor *xc,
+                                 struct xrt_device *xdev,
+                                 struct xrt_swapchain *xsc,
+                                 const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	static bool noted = false;
+	if (!noted) {
+		U_LOG_I("Metal compositor: equirect2 layers are accepted but not drawn (#1547)");
+		noted = true;
+	}
+	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
  * Window-space layer (XR_DXR_win32_window_binding). Positioned in fractional
  * window coordinates with per-eye horizontal disparity shift. Mirrors
  * d3d11_compositor_layer_window_space — here we just accumulate; rendering
@@ -4408,6 +4489,12 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	xc->layer_projection = metal_compositor_layer_projection;
 	xc->layer_projection_depth = metal_compositor_layer_projection_depth;
 	xc->layer_quad = metal_compositor_layer_quad;
+	// #1547: the Metal lane advertises the KHR layer extensions instance-wide;
+	// a NULL slot must fail the layer, not the process (#1544).
+	xc->layer_cube = metal_compositor_layer_cube;
+	xc->layer_cylinder = metal_compositor_layer_cylinder;
+	xc->layer_equirect1 = metal_compositor_layer_equirect1;
+	xc->layer_equirect2 = metal_compositor_layer_equirect2;
 	xc->layer_window_space = metal_compositor_layer_window_space;
 	xc->layer_local_2d = metal_compositor_layer_local_2d;
 	xc->layer_zone_3d = metal_compositor_layer_zone_3d;
