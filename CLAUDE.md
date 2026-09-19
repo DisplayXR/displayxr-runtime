@@ -114,7 +114,7 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 # apt deps listed in the script header (Vulkan, XCB, glslang, …)
 ./scripts/build_linux.sh              # headless build + selftest
 ./scripts/build_linux.sh --service    # + displayxr-service / IPC
-./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux; --backend=x11|wayland|auto with the dual-backend app, in flight)
+./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux; --backend=x11|wayland|auto picks the window system)
 ./scripts/build_linux.sh --clean      # after installing a dependency into an already-configured tree (#1556)
 ./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
 ```
