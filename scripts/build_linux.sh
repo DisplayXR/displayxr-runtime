@@ -37,6 +37,19 @@
 #   # optional (enables the legacy udev VR prober — NOT needed for selftest):
 #   sudo apt-get install -y libudev-dev
 #
+#   # CI PARITY — install these too if you want a local build to PREDICT CI.
+#   sudo apt-get install -y libgl-dev libegl-dev libglvnd-dev \
+#       libxxf86vm-dev libxcb-glx0-dev libxrandr-dev
+#   # The Selftest/Service jobs in .github/workflows/build-linux.yml install
+#   # GL/EGL on purpose: they flip XRT_HAVE_OPENGL/XRT_HAVE_EGL ON so CI
+#   # configures like a real desktop (aux_ogl + the GL client bindings compile)
+#   # and keeps the comp_gl platform gate honest (#709), and once GL is found
+#   # the --apps OpenXR-loader build additionally needs Xxf86vm/Xrandr
+#   # (gfxwrapper) and xcb/glx.h. Without them a local build compiles a
+#   # strictly SMALLER set of targets than CI does, so green here does not mean
+#   # green there. (The .deb deliberately ships without GL/EGL — see the Deb
+#   # job's comment.)
+#
 #   NOTE: install the dependencies BEFORE the first configure. CMake caches a
 #   failed feature probe permanently, so a package installed afterwards is not
 #   picked up — and the mismatch can wedge the tree outright (see --clean).
@@ -124,8 +137,7 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
   -DXRT_HAVE_SDL2=OFF \
   -DXRT_HAVE_OPENCV=OFF \
-  -DXRT_HAVE_LIBUSB=OFF \
-  -DXRT_BUILD_DRIVER_EUROC=OFF
+  -DXRT_HAVE_LIBUSB=OFF
 
 echo "=== Building runtime + displayxr-cli + sim_display plug-in ==="
 cmake --build "$BUILD_DIR"
