@@ -41,6 +41,9 @@ build/
 build*/
 cmake-build-*/
 
+# Mesa llvmpipe/lavapipe download + unpack cache (scripts/fetch_mesa_rasterizers.ps1, #1525)
+mesa-sw-gfx/
+
 # Ignore Claude Code local files (keep skills shared)
 .claude/*
 !.claude/skills/

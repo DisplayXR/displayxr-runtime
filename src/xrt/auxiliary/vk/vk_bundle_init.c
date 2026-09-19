@@ -815,6 +815,22 @@ select_physical_device(struct vk_bundle *vk, int forced_index)
 	(void)snprintf(title, sizeof(title), "Selected GPU: %u\n", gpu_index);
 	vk_print_device_info(vk, U_LOGGING_DEBUG, &pdp, gpu_index, title);
 
+	/*
+	 * #1525: state, ONCE per process, which physical device won. The GL path
+	 * already announces its GL_RENDERER at WARN (comp_gl_compositor.cpp), but
+	 * the Vulkan deviceName was DEBUG-only — so a CTS result file could never
+	 * say whether it was produced by a real GPU, by lavapipe, or by anything
+	 * else, which is the one fact a tiered conformance lane must record.
+	 * Once-only because the CTS creates hundreds of sessions and a per-session
+	 * WARN would bury the log.
+	 */
+	static bool selected_gpu_announced = false;
+	if (!selected_gpu_announced) {
+		selected_gpu_announced = true;
+		U_LOG_W("Vulkan selected GPU %u: %s (%s, driver 0x%08x)", gpu_index, pdp.deviceName,
+		        vk_physical_device_type_string(pdp.deviceType), pdp.driverVersion);
+	}
+
 	char *tegra_substr = strstr(pdp.deviceName, "Tegra");
 	if (tegra_substr) {
 		vk->is_tegra = true;
@@ -1221,7 +1237,15 @@ build_device_extensions(struct vk_bundle *vk,
 	for (uint32_t i = 0; i < required_device_ext_count; i++) {
 		const char *ext = required_device_exts[i];
 		if (!check_extension(vk, props, prop_count, ext)) {
-			VK_DEBUG(vk, "VkPhysicalDevice does not support required extension %s", ext);
+			/*
+			 * #1525: this is a hard failure — the caller turns it straight
+			 * into VK_ERROR_EXTENSION_NOT_PRESENT and no device is created —
+			 * but the only line that NAMES the extension was DEBUG, so every
+			 * report of it ("vkCreateDevice returned
+			 * VK_ERROR_EXTENSION_NOT_PRESENT") was unactionable without a
+			 * debug-level rebuild. Errors say what went wrong.
+			 */
+			VK_ERROR(vk, "VkPhysicalDevice does not support required extension %s", ext);
 			free(props);
 			return false;
 		}

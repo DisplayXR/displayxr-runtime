@@ -1,0 +1,47 @@
+# OpenXR CTS — SOFTWARE-TIER quarantine list                         (#1525 / #1523)
+# =============================================================================
+# Tests excluded BY NAME when the CTS runs against Mesa's software rasterizers
+# (llvmpipe / lavapipe) on a GitHub-hosted runner with no GPU.
+#
+# This file is the ONE place the software tier's exclusions live. It is passed
+# to scripts/run_cts.ps1 via -QuarantineList, and ONLY on the software tier:
+#
+#   * the PR lane (d3d11/d3d12 on WARP)              -> not passed
+#   * the self-hosted, real-GPU tier (#1526)         -> not passed
+#
+# so an entry here can never silently hide a defect on a tier that has real
+# hardware. That is the point: a test quarantined *everywhere* is a defect
+# nobody is looking at. If something has to be excluded on real hardware too,
+# it belongs in an issue and in the default TestSpec, not in this file.
+#
+# FORMAT
+#   One Catch2 test-case NAME per line. Everything from a leading '#' to the
+#   end of the line is a comment; blank lines are ignored. Names are appended
+#   to the test spec as `~name` filters (Catch2 ANDs patterns inside one
+#   filter, so there is deliberately NO comma — see run_cts.ps1).
+#
+# RULES FOR ADDING AN ENTRY
+#   1. State the reason and link an issue. No bare names.
+#   2. The reason must be a property of the SOFTWARE ENVIRONMENT (no GPU, no
+#      timer/scheduling headroom, a rasterizer that is 100x slower), not a
+#      property of the runtime. If the runtime is wrong, fix the runtime.
+#   3. Re-check entries when the Mesa pin or the runner image moves. An entry
+#      that would now pass is worse than no entry.
+#
+# NOT A PLACE TO PUT THE VULKAN ARMS.
+# vulkan / vulkan2 are currently blocked on the hosted tier because no Windows
+# software ICD implements VK_KHR_external_memory_win32 (lavapipe and
+# SwiftShader are FD-only; Mesa dzn has memory+semaphore but no external_fence
+# at all), which the runtime requires unconditionally on Windows. That failure
+# is at vkCreateDevice, so it takes out EVERY session-creating test rather than
+# a nameable few — listing them here would be renaming a blocker as a flake.
+# See docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
+#
+# CURRENTLY EMPTY — ON PURPOSE.
+# The first software-tier runs have to be allowed to fail honestly before
+# anything is named here; pre-populating it from guesswork would quarantine
+# tests that pass and hide the ones that do not. Note in particular that
+# Timed_Pipelined_Frame_Submission is deliberately NOT listed: cts.yml scrapes
+# its printed overhead numbers to trend the runner's frame timing (#589), and
+# excluding it would blind that scrape exactly on the tier where the timing is
+# worst.
