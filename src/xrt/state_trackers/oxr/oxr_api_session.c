@@ -1774,3 +1774,53 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
 }
 
 #endif // OXR_HAVE_DXR_display_info
+
+
+#ifdef OXR_HAVE_DXR_wayland_surface_binding
+/*
+ * XR_DXR_wayland_surface_binding spec v2 — the SIZE half of the binding.
+ *
+ * Why a runtime call at all, when X11 needs none: a wl_surface has no intrinsic
+ * size. Wayland's WSI answers `currentExtent == {UINT32_MAX, UINT32_MAX}`
+ * precisely to say "the client chooses", and the buffer the runtime attaches is
+ * what DEFINES the surface — so a runtime that guesses does not mis-size the
+ * window, it RESIZES it. There is nothing to poll the way the XCB leg polls
+ * xcb_get_geometry, and the compositor-side geometry service (#817) cannot
+ * bootstrap the value either: Mutter lists a window only once it has a mapped
+ * buffer, and the first buffer comes from the very swapchain whose size is in
+ * question. The app is the only party that knows — it received and acked the
+ * xdg_toplevel.configure. Position keeps coming from the geometry service
+ * (ADR-033 unchanged: both channels report geometry, the weaver owns phase).
+ *
+ * Shaped after the Android sibling xrSetAndroidWindowGeometryDXR (ADR-036 D6),
+ * which exists for the same underlying reason.
+ */
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWaylandSurfaceGeometryDXR(XrSession session, uint32_t width, uint32_t height, uint32_t refreshMilliHertz)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWaylandSurfaceGeometryDXR");
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, DXR_wayland_surface_binding);
+
+	if (width == 0 || height == 0) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWaylandSurfaceGeometryDXR: width and height must be non-zero (%ux%u)", width,
+		                 height);
+	}
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && comp_vk_native_compositor_set_wayland_surface_geometry(
+	                                         &sess->xcn->base, width, height, refreshMilliHertz)) {
+		// De-duplicated + logged inside, so this stays silent per frame.
+		return XR_SUCCESS;
+	}
+#endif
+
+	return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+	                 "xrSetWaylandSurfaceGeometryDXR: this session was not created with a chained "
+	                 "XrWaylandSurfaceBindingCreateInfoDXR");
+}
+#endif // OXR_HAVE_DXR_wayland_surface_binding

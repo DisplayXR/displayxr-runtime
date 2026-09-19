@@ -931,6 +931,12 @@ oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
                                  const XrWorkspaceClientStyleDXR *style);
 #endif
 
+#ifdef OXR_HAVE_DXR_wayland_surface_binding
+//! OpenXR API function @ep{xrSetWaylandSurfaceGeometryDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWaylandSurfaceGeometryDXR(XrSession session, uint32_t width, uint32_t height, uint32_t refreshMilliHertz);
+#endif
+
 #ifdef OXR_HAVE_DXR_android_surface_binding
 //! OpenXR API function @ep{xrSetAndroidSurfaceDXR}
 XRAPI_ATTR XrResult XRAPI_CALL

@@ -482,6 +482,10 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrCaptureAtlasDXR, DXR_atlas_capture);
 #endif
 
+#ifdef OXR_HAVE_DXR_wayland_surface_binding
+	ENTRY_IF_EXT(xrSetWaylandSurfaceGeometryDXR, DXR_wayland_surface_binding);
+#endif
+
 #ifdef OXR_HAVE_DXR_android_surface_binding
 	ENTRY_IF_EXT(xrSetAndroidSurfaceDXR, DXR_android_surface_binding);
 	ENTRY_IF_EXT(xrSetAndroidWindowGeometryDXR, DXR_android_surface_binding);
