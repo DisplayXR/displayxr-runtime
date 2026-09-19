@@ -224,10 +224,33 @@ Fields to populate:
 | `display_width_m`, `display_height_m` | meters (float) | Physical panel dimensions |
 | `nominal_viewer_x_m`, `nominal_viewer_y_m`, `nominal_viewer_z_m` | meters (float) | Default viewer position relative to display center. Drives Kooima projection defaults when the app has no head tracking. |
 | `display_pixel_width`, `display_pixel_height` | pixels (uint32) | Native panel resolution |
-| `recommended_view_scale_x`, `recommended_view_scale_y` | float, 1.0 = native | Vendor-recommended per-view scaling. <1.0 means downscale. |
+| `recommended_view_scale_x`, `recommended_view_scale_y` | float, 1.0 = native | Vendor-recommended per-view scaling. <1.0 means downscale. **Baseline hint only** — see the rule below. |
 | `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference / display origin == desktop origin" (sim-display picks this). |
 | `supported_eye_tracking_modes` | bitmask | bit 0 = MANAGED, bit 1 = MANUAL, `0` = no eye tracking. A typical hardware DP is MANAGED-only; the reference simulator (sim_display) declares `0` — its positions are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL for testing). Must be non-zero iff at least one `xrt_rendering_mode` sets `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` in `mode_flags` (ABI v3, #441). |
 | `default_eye_tracking_mode` | enum | 0 = MANAGED, 1 = MANUAL. |
+
+**The view-scale rule — one derivation, never two.**
+`xrt_rendering_mode::view_scale_x/y` (your device's mode table) is the **single
+source of truth** for view, tile and atlas sizing; `recommended_view_scale_*` is
+a **baseline hint only**, so leave it at `0` (the runtime derives it from the
+mode table) or derive it from the *same* numbers as the active 3D mode's scale —
+never compute it independently.
+
+The two feed different consumers, which is why a disagreement is a bug and not a
+rounding difference:
+
+| Consumer | Reads |
+|---|---|
+| `XrViewConfigurationView.recommended*` | the **scalar** (`oxr_system_fill_in`, frozen at `xrCreateInstance`) |
+| `XrDisplayRenderingModeInfoDXR.viewScale*` / `viewWidthPixels` | the **mode table** |
+| per-mode view dims + worst-case atlas (`u_tiling_compute_mode`, `u_tiling_compute_system_atlas_oriented`) | the **mode table** |
+| the compositor's tile grid (`u_tiling_compute_canvas_view`) | the **mode table** |
+
+A scalar *larger* than the mode's scale is the dangerous direction: the app is
+sized per view from the scalar while the declared atlas was sized from the mode
+table, so the atlas cannot hold the tiles the app was told to render. The runtime
+also overwrites the scalar from the mode table on every rendering-mode change, so
+a disagreeing value does not survive the first mode switch anyway.
 
 **Returns:**
 - `true` → struct populated, runtime uses your values

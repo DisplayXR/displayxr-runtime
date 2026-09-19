@@ -272,6 +272,17 @@ The reference implementation is already in the tree: `sim_display`'s
 `shaders/squeezed_sbs.frag` (2 × 1), `shaders/sbs.frag` (1 × 2) and
 `shaders/quad.frag` (2 × 2 quilt) are exactly these repacks.
 
+**Declare the scale ONCE.** The numbers in that table are your mode table's
+`view_scale_x/y`, and they — not `xrt_plugin_display_info::recommended_view_scale_*`
+— are the single source of truth for view, tile and atlas sizing. Leave the
+`recommended_view_scale_*` scalar at `0` (the runtime then derives it from your
+modes, which is what the template does) or derive it from the same numbers as the
+active 3D mode; never compute it a second time. They feed different consumers —
+the scalar sizes `XrViewConfigurationView.recommended*`, the mode table sizes the
+tiles, the atlas and the compositor grid — so a scalar that disagrees with (and is
+larger than) your mode's scale declares an atlas too small to hold your own tiles.
+Full contract: [`xrt_plugin_iface.md`](../reference/xrt_plugin_iface.md#get_display_info).
+
 **A free optimization.** Declare `2D = 1×1 @ 1.0,1.0` and `3D = 2×1 @ 0.5,1.0`
 and the worst-case swapchain envelope becomes `W × H`, which *both* modes fill
 exactly — so `u_tiling_can_zero_copy()` fires full-screen in both and the app's
