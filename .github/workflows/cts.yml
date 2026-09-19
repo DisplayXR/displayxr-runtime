@@ -305,6 +305,9 @@ jobs:
           path: cts-build-tree.tar
           retention-days: 1
           if-no-files-found: error
+          # See the note on the per-arm upload below: without this, a re-run
+          # leaves the previous attempt's artifact in place under the same name.
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # One arm per graphics plugin, all reusing the single build above.
@@ -474,6 +477,12 @@ jobs:
           name: cts-results-${{ matrix.graphics }}
           path: cts-results/
           if-no-files-found: warn
+          # Artifacts are per-RUN, not per-attempt. Without overwrite, re-running
+          # a failed arm adds a SECOND artifact under the same name and the
+          # summary's download resolves the OLD one — a fresh green arm was
+          # gated red off attempt 1's XML (run 35406623715), and the same
+          # mechanism would just as happily report a stale green over a real red.
+          overwrite: true
 
   # ---------------------------------------------------------------------------
   # The lane's gate. Every arm's XML in one table; fails if any NON-experimental
