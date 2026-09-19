@@ -32,6 +32,14 @@
  *     This helper commits exactly once, during create(), before the session.
  *   - The runtime never pumps the Wayland queue (there is no wl_display_* call
  *     anywhere in src/), so pump() must be called every frame.
+ *   - A wl_surface has NO intrinsic size: the WSI reports
+ *     `currentExtent == UINT32_MAX` and the buffer the runtime attaches is what
+ *     DEFINES the surface. So the app must DECLARE its size — this helper
+ *     chains XrWaylandSurfaceGeometryDXR at session create and republishes
+ *     through xrSetWaylandSurfaceGeometryDXR on every later configure that
+ *     changes it (extension spec v2). Call attach_session() right after
+ *     xrCreateSession to arm that; against an older runtime the function is
+ *     simply absent and the helper logs once and stays quiet.
  */
 #pragma once
 
@@ -99,12 +107,14 @@ struct DxrLinuxWindowDesc
 	const char *title = "DisplayXR";               //!< toplevel title
 	const char *app_id = "com.displayxr.test_app"; //!< Wayland xdg app-id
 
-	//! Wayland only. The runtime sizes its WSI swapchain to the PANEL, never to
-	//! the surface, and never follows a Wayland resize
-	//! (comp_vk_native_compositor.c: `c->settings.preferred`), because on
-	//! Wayland `currentExtent` is UINT32_MAX. Fullscreen-on-the-panel is
-	//! therefore the only mode where the weave can be 1:1. Clear this to
-	//! observe the windowed limitation on purpose.
+	//! Wayland only. Fullscreen-on-the-panel is the INV-1.3 substitute (a
+	//! Wayland client cannot place itself), so it stays the default. Clearing
+	//! it gives a windowed toplevel, which IS supported from extension spec
+	//! v2: this helper declares `width`/`height` through
+	//! XrWaylandSurfaceGeometryDXR so the runtime sizes its WSI swapchain to
+	//! the surface instead of the panel. Note the weave PHASE still needs the
+	//! compositor geometry service for a windowed surface — the size comes
+	//! from here, the position does not.
 	bool fullscreen_on_wayland = true;
 };
 
@@ -171,9 +181,40 @@ public:
 	 * Pointer to the filled window-binding struct, with `.next = next`, ready
 	 * to hand to XrSessionCreateInfo::next. Member storage: valid until this
 	 * object is destroyed. Returns `next` unchanged if no window exists.
+	 *
+	 * On Wayland the returned chain is TWO structs: the binding, followed by
+	 * XrWaylandSurfaceGeometryDXR carrying the acked configure size and the
+	 * matched output's refresh (spec v2). Without the second one the runtime
+	 * would size its swapchain to the panel and thereby resize the surface.
 	 */
 	const void *
 	session_binding_chain(const void *next);
+
+	/*!
+	 * Arm the mid-session geometry channel. Call once, right after
+	 * xrCreateSession; no-op on X11.
+	 *
+	 * Resolves xrSetWaylandSurfaceGeometryDXR through xrGetInstanceProcAddr.
+	 * An older runtime returns NULL for it — that is not an error, it just
+	 * means the session is stuck with the size declared at create; the helper
+	 * logs once and never asks again.
+	 */
+	void
+	attach_session(XrInstance instance, XrSession session);
+
+	/*!
+	 * Republish the surface size to the runtime NOW, whatever the compositor
+	 * last configured.
+	 *
+	 * pump() already does this for every real xdg_toplevel.configure, so apps
+	 * do not need it. It exists for the test hook that exercises the runtime's
+	 * resize-follow without a user dragging a window edge (see
+	 * DXR_CUBE_TEST_RESIZE in the Linux cube apps).
+	 *
+	 * @return false when there is no Wayland session to publish to.
+	 */
+	bool
+	force_declare_geometry(uint32_t width, uint32_t height);
 
 	//! Name of the binding extension this backend needs enabled at
 	//! xrCreateInstance, or nullptr when no window exists.
@@ -205,6 +246,19 @@ private:
 	// --- Binding storage (handed to xrCreateSession) ------------------------
 	XrXlibWindowBindingCreateInfoDXR m_xlib_binding = {};
 	XrWaylandSurfaceBindingCreateInfoDXR m_wl_binding = {};
+	XrWaylandSurfaceGeometryDXR m_wl_geometry = {};
+
+	// --- Mid-session geometry channel (spec v2) -----------------------------
+	XrSession m_session = XR_NULL_HANDLE;
+	PFN_xrSetWaylandSurfaceGeometryDXR m_pfn_set_wl_geometry = nullptr;
+	//! Last size actually published, so pump() only calls on a real change.
+	uint32_t m_wl_published_w = 0;
+	uint32_t m_wl_published_h = 0;
+
+	//! Push the current configure size to the runtime when it differs from
+	//! what was last published. Cheap; safe to call every frame.
+	void
+	publish_wayland_geometry_if_changed();
 
 #ifdef DXR_APP_HAVE_WAYLAND
 	// --- Wayland leg -------------------------------------------------------
@@ -215,6 +269,7 @@ private:
 		int32_t x = 0, y = 0;
 		int32_t width = 0, height = 0;
 		int32_t scale = 1;
+		int32_t refresh_mhz = 0; //!< wl_output.mode refresh, milli-hertz
 	};
 
 	struct wl_display *m_wl_display = nullptr;
@@ -231,6 +286,29 @@ private:
 	bool m_wl_configured = false;
 	int32_t m_wl_config_w = 0;
 	int32_t m_wl_config_h = 0;
+	//! Refresh of the output the surface went fullscreen on (0 = unknown).
+	uint32_t m_wl_refresh_mhz = 0;
+	/*!
+	 * Mode size, in DEVICE pixels, of the output this surface went fullscreen
+	 * on; 0 when windowed or when no output matched.
+	 *
+	 * This is what a fullscreen surface must declare, and it is NOT the
+	 * configure size. xdg_toplevel.configure is in LOGICAL units, so on a
+	 * fractionally-scaled desktop (this box runs 166.67%) a fullscreen
+	 * toplevel is configured at 1728x1080 while the panel is 2880x1800. What
+	 * reaches the panel 1:1 is a buffer of the output's MODE size: the
+	 * compositor maps that whole buffer onto the output, so buffer pixels and
+	 * panel pixels line up exactly. Declaring the logical size instead would
+	 * hand the weaver a 1728x1080 image for Mutter to upscale — a resample,
+	 * which destroys the interlace.
+	 */
+	int32_t m_wl_fullscreen_mode_w = 0;
+	int32_t m_wl_fullscreen_mode_h = 0;
+
+	//! Size to declare to the runtime: the fullscreen output mode when there
+	//! is one, else the acked configure size.
+	void
+	wl_declared_size(uint32_t *w, uint32_t *h) const;
 
 	// Per-frame scratch, set by the listeners and consumed by pump().
 	std::vector<DxrKey> m_wl_key_queue;

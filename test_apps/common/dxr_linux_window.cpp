@@ -394,7 +394,6 @@ DxrLinuxWindow::s_output_geometry(void *data,
 void
 DxrLinuxWindow::s_output_mode(void *data, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t refresh)
 {
-	(void)refresh;
 	if ((flags & WL_OUTPUT_MODE_CURRENT) == 0) {
 		return;
 	}
@@ -403,6 +402,12 @@ DxrLinuxWindow::s_output_mode(void *data, struct wl_output *o, uint32_t flags, i
 		if (out.output == o) {
 			out.width = w;
 			out.height = h;
+			// Already milli-hertz on the wire; XrWaylandSurfaceGeometryDXR
+			// takes the same unit, so it passes through untouched. The runtime
+			// needs it because Wayland has no XCB connection for the RandR
+			// query that serves the X11 leg, and its fallback is a hardcoded
+			// 60 Hz.
+			out.refresh_mhz = refresh;
 			return;
 		}
 	}
@@ -632,6 +637,11 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 			if (out.x == desc.panel_left && out.y == desc.panel_top &&
 			    out.width == (int32_t)desc.panel_width && out.height == (int32_t)desc.panel_height) {
 				chosen = out.output;
+				m_wl_refresh_mhz = out.refresh_mhz > 0 ? (uint32_t)out.refresh_mhz : 0;
+				// Device-pixel mode size — the buffer size that lands 1:1 on
+				// this output. See m_wl_fullscreen_mode_w in the header.
+				m_wl_fullscreen_mode_w = out.width;
+				m_wl_fullscreen_mode_h = out.height;
 				break;
 			}
 		}
@@ -647,9 +657,16 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		}
 		xdg_toplevel_set_fullscreen(m_wl_toplevel, chosen);
 	} else {
-		DXRW_WARN("Wayland: windowed mode requested — the runtime sizes its WSI swapchain to the PANEL and never "
-		          "follows a Wayland resize (comp_vk_native_compositor.c), so the weave will NOT be 1:1. This is "
-		          "for observing the limitation, not a supported mode.");
+		// Windowed is supported from extension spec v2: the size below is
+		// declared through XrWaylandSurfaceGeometryDXR, so the runtime sizes
+		// its swapchain to this surface instead of resizing it to the panel.
+		// What windowed still needs, and fullscreen does not, is the
+		// compositor geometry service for the weave PHASE — Wayland never
+		// tells a client where its surface is.
+		DXRW_WARN("Wayland: windowed mode — the surface size is declared to the runtime "
+		          "(XrWaylandSurfaceGeometryDXR), so the swapchain follows the window. The weave PHASE still "
+		          "needs the window-geometry service (window-geometry@displayxr.org); without it the runtime "
+		          "weaves display-scoped, which is wrong for a window that is not at the panel origin.");
 	}
 
 	// The role is attached and the state requested; commit so the compositor
@@ -675,22 +692,50 @@ DxrLinuxWindow::create_wayland(const DxrLinuxWindowDesc &desc)
 		return false;
 	}
 
-	DXRW_INFO("Created app-owned Wayland surface %p (xdg toplevel, %s), configure size %dx%d",
-	          (void *)m_wl_surface, desc.fullscreen_on_wayland ? "fullscreen" : "windowed", m_wl_config_w,
-	          m_wl_config_h);
+	// Refresh for the geometry struct. Fullscreen took it from the matched
+	// output above; windowed has no wl_surface.enter listener here, so fall
+	// back to the first output that reported a mode. Wrong only on a
+	// mixed-refresh multi-head desktop, and 0 (unknown) is always safe — the
+	// runtime then keeps its 60 Hz default.
+	if (m_wl_refresh_mhz == 0) {
+		for (const auto &out : m_wl_outputs) {
+			if (out.refresh_mhz > 0) {
+				m_wl_refresh_mhz = (uint32_t)out.refresh_mhz;
+				break;
+			}
+		}
+	}
 
-	// The runtime's WSI swapchain is created at the PANEL pixel size, because
-	// Wayland reports currentExtent == UINT32_MAX and the compositor has no
-	// Wayland branch in its Linux extent fix-up (comp_vk_native_compositor.c).
-	// Any difference between the surface and the panel therefore means the
-	// weave is resampled by the compositor and the lenticular phase is wrong.
+	{
+		uint32_t dw = 0, dh = 0;
+		wl_declared_size(&dw, &dh);
+		if ((int32_t)dw != m_wl_config_w || (int32_t)dh != m_wl_config_h) {
+			DXRW_WARN("Wayland: declaring a %ux%u BUFFER for a %dx%d logical surface — the desktop is "
+			          "fractionally scaled (%.3fx). The buffer is the output's mode size, so it still "
+			          "lands 1:1 on the panel; the configure size would have been upscaled.",
+			          dw, dh, m_wl_config_w, m_wl_config_h,
+			          m_wl_config_w > 0 ? (double)dw / (double)m_wl_config_w : 0.0);
+		}
+	}
+
+	DXRW_INFO("Created app-owned Wayland surface %p (xdg toplevel, %s), configure size %dx%d @ %u mHz",
+	          (void *)m_wl_surface, desc.fullscreen_on_wayland ? "fullscreen" : "windowed", m_wl_config_w,
+	          m_wl_config_h, m_wl_refresh_mhz);
+
+	// A fullscreen surface only weaves 1:1 when the buffer we declare covers
+	// the panel exactly. It normally does (the declared size is the matched
+	// output's mode), so this fires when no output matched — then the buffer
+	// is the LOGICAL configure size and the compositor will resample it.
 	// One WARN, at create time — never per frame.
-	if (desc.fullscreen_on_wayland && desc.panel_width > 0 && desc.panel_height > 0 &&
-	    (m_wl_config_w != (int32_t)desc.panel_width || m_wl_config_h != (int32_t)desc.panel_height)) {
-		DXRW_WARN("Wayland: fullscreen surface is %dx%d but the 3D panel is %ux%u — compositor scaling is "
-		          "active (desktop scale != 100%%). The weave CANNOT be 1:1 in this session; expect no correct "
-		          "3D. Set the display scale to 100%% for a valid Wayland weave.",
-		          m_wl_config_w, m_wl_config_h, desc.panel_width, desc.panel_height);
+	if (desc.fullscreen_on_wayland && desc.panel_width > 0 && desc.panel_height > 0) {
+		uint32_t dw = 0, dh = 0;
+		wl_declared_size(&dw, &dh);
+		if (dw != desc.panel_width || dh != desc.panel_height) {
+			DXRW_WARN("Wayland: fullscreen buffer will be %ux%u but the 3D panel is %ux%u — no wl_output "
+			          "matched, so the declared size is the LOGICAL configure size and the compositor "
+			          "will resample it. The weave CANNOT be 1:1 in this session.",
+			          dw, dh, desc.panel_width, desc.panel_height);
+		}
 	}
 
 	return true;
@@ -856,6 +901,11 @@ DxrLinuxWindow::pump(const std::function<void(DxrKey)> &on_key, bool *running)
 				*running = false;
 			}
 		}
+		// A configure may have changed the size in the dispatch above. The
+		// runtime has no other way to learn it — Wayland gives the WSI no
+		// currentExtent — so republish before the next frame is drawn.
+		publish_wayland_geometry_if_changed();
+
 		if (on_key) {
 			for (DxrKey k : m_wl_key_queue) {
 				on_key(k);
@@ -929,15 +979,133 @@ DxrLinuxWindow::session_binding_chain(const void *next)
 
 #ifdef DXR_APP_HAVE_WAYLAND
 	if (m_backend == DxrWindowBackend::Wayland && m_wl_surface != nullptr) {
+		// Spec v2: declare the SIZE. A wl_surface has none of its own — the
+		// WSI reports currentExtent == UINT32_MAX and the buffer the runtime
+		// attaches is what defines the surface — so omitting this does not
+		// leave the window alone, it lets the runtime resize it to the panel.
+		// The size is the configure this helper already acked in create().
+		uint32_t decl_w = 0, decl_h = 0;
+		wl_declared_size(&decl_w, &decl_h);
+		m_wl_geometry = {};
+		m_wl_geometry.type = XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR;
+		m_wl_geometry.next = next;
+		m_wl_geometry.width = decl_w;
+		m_wl_geometry.height = decl_h;
+		m_wl_geometry.refreshMilliHertz = m_wl_refresh_mhz;
+		m_wl_published_w = decl_w;
+		m_wl_published_h = decl_h;
+
 		m_wl_binding = {};
 		m_wl_binding.type = XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR;
-		m_wl_binding.next = next;
+		m_wl_binding.next = &m_wl_geometry;
 		m_wl_binding.wlDisplay = m_wl_display;
 		m_wl_binding.wlSurface = m_wl_surface;
 		return &m_wl_binding;
 	}
 #endif
 	return next;
+}
+
+void
+DxrLinuxWindow::wl_declared_size(uint32_t *w, uint32_t *h) const
+{
+	*w = 0;
+	*h = 0;
+#ifdef DXR_APP_HAVE_WAYLAND
+	// Fullscreen on a matched output: declare the output's MODE, in device
+	// pixels. That is the buffer that maps 1:1 onto the panel; the configure
+	// size is logical and, on a fractionally-scaled desktop, smaller.
+	if (m_wl_fullscreen_mode_w > 0 && m_wl_fullscreen_mode_h > 0) {
+		*w = (uint32_t)m_wl_fullscreen_mode_w;
+		*h = (uint32_t)m_wl_fullscreen_mode_h;
+		return;
+	}
+	// Windowed (or fullscreen with no output match): the configure size is the
+	// only thing known. It equals the buffer size at desktop scale 1.0, which
+	// is the only scale at which a Wayland weave can be 1:1 anyway — #817 has
+	// the runtime refuse window geometry at any other scale.
+	if (m_wl_config_w > 0 && m_wl_config_h > 0) {
+		*w = (uint32_t)m_wl_config_w;
+		*h = (uint32_t)m_wl_config_h;
+	}
+#endif
+}
+
+void
+DxrLinuxWindow::attach_session(XrInstance instance, XrSession session)
+{
+	m_session = session;
+
+#ifdef DXR_APP_HAVE_WAYLAND
+	if (m_backend != DxrWindowBackend::Wayland || instance == XR_NULL_HANDLE) {
+		return;
+	}
+	// Resolved, not linked: an older runtime (extension spec v1) has no such
+	// function and xrGetInstanceProcAddr answers XR_ERROR_FUNCTION_UNSUPPORTED.
+	// That is a degraded session, not a broken one — the create-time size still
+	// applies, only later resizes stop being followed. Log once.
+	PFN_xrVoidFunction fn = nullptr;
+	if (xrGetInstanceProcAddr(instance, "xrSetWaylandSurfaceGeometryDXR", &fn) == XR_SUCCESS && fn != nullptr) {
+		m_pfn_set_wl_geometry = reinterpret_cast<PFN_xrSetWaylandSurfaceGeometryDXR>(fn);
+		DXRW_INFO("Wayland: xrSetWaylandSurfaceGeometryDXR resolved — surface resizes will be followed");
+	} else {
+		DXRW_WARN("Wayland: this runtime has no xrSetWaylandSurfaceGeometryDXR "
+		          "(XR_DXR_wayland_surface_binding spec < 2). The size declared at session create still "
+		          "applies; later xdg_toplevel.configure resizes will NOT be followed.");
+	}
+#else
+	(void)instance;
+#endif
+}
+
+void
+DxrLinuxWindow::publish_wayland_geometry_if_changed()
+{
+#ifdef DXR_APP_HAVE_WAYLAND
+	if (m_pfn_set_wl_geometry == nullptr || m_session == XR_NULL_HANDLE) {
+		return;
+	}
+	uint32_t w = 0, h = 0;
+	wl_declared_size(&w, &h);
+	if (w == 0 || h == 0) {
+		return;
+	}
+	if (w == m_wl_published_w && h == m_wl_published_h) {
+		return;
+	}
+	const XrResult res = m_pfn_set_wl_geometry(m_session, w, h, m_wl_refresh_mhz);
+	if (res != XR_SUCCESS) {
+		DXRW_WARN("xrSetWaylandSurfaceGeometryDXR(%ux%u) failed: %d", w, h, (int)res);
+		return;
+	}
+	m_wl_published_w = w;
+	m_wl_published_h = h;
+	DXRW_INFO("Wayland: declared new surface geometry %ux%u @ %u mHz", w, h, m_wl_refresh_mhz);
+#endif
+}
+
+bool
+DxrLinuxWindow::force_declare_geometry(uint32_t width, uint32_t height)
+{
+#ifdef DXR_APP_HAVE_WAYLAND
+	if (m_backend != DxrWindowBackend::Wayland || width == 0 || height == 0) {
+		return false;
+	}
+	// Pretend a configure arrived. On Wayland this is not a lie: the buffer
+	// the runtime attaches defines the surface, so declaring a new size IS how
+	// a client resizes itself. Drop any fullscreen mode override — the test
+	// hook is asking for this exact buffer size, not the output's.
+	m_wl_fullscreen_mode_w = 0;
+	m_wl_fullscreen_mode_h = 0;
+	m_wl_config_w = (int32_t)width;
+	m_wl_config_h = (int32_t)height;
+	publish_wayland_geometry_if_changed();
+	return m_wl_published_w == width && m_wl_published_h == height;
+#else
+	(void)width;
+	(void)height;
+	return false;
+#endif
 }
 
 const char *
