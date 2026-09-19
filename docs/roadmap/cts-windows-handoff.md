@@ -45,8 +45,8 @@ runs on today:
 | `d3d11` | GitHub-hosted `windows-2022`, **WARP** (D3D software rasterizer, always present in the image) | **yes** | — |
 | `d3d12` | GitHub-hosted `windows-2022`, **WARP** | **yes** | — |
 | `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
-| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | no — `continue-on-error`, reported only | #1542 — SIGSEGV in `SessionState`, past `vkCreateDevice` since #1539; fix in flight as #1550 |
-| `vulkan2` | same as `vulkan` | no — `continue-on-error`, reported only | #1542 (→ #1550) |
+| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | not yet — `continue-on-error`, reported only | none known: `vkCreateDevice` (#1539) and the `SessionState` SIGSEGV (#1542 / #1550) are both fixed. Awaiting a full run to earn the flip |
+| `vulkan2` | same as `vulkan` | not yet — `continue-on-error`, reported only | same as `vulkan` |
 | Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
@@ -269,9 +269,12 @@ on the hosted lane, same build, kill switch as the only variable:
 | `1` (old behaviour) | 1442 | 0 | 12 | `vkCreateDevice`, every session-creating test |
 | unset (default) | 418 | 1 | 0 | `Swapchains` **PASSES**; SIGSEGV in `SessionState/Cycle through all states` |
 
-So the next blocker on these arms is a **crash**, not an extension — the Vulkan
-sibling of the `opengl` SIGSEGV (#1522). Still not gateable, but for a new
-reason, and the real-GPU tier (#1526) remains the way to make these arms count.
+So the next blocker on these arms was a **crash**, not an extension — the Vulkan
+sibling of the `opengl` SIGSEGV (#1522). That one is fixed too (#1542, by
+#1550), which leaves **no known blocker** on `vulkan`/`vulkan2`: they stay
+experimental only until a full run on `main` proves it, and they flip the same
+way `opengl` did — on evidence, in a change of its own. The real-GPU tier
+(#1526) remains the way to make these arms actually count.
 
 Note the null compositor keeps the trio **required** on purpose
 (`null_compositor.c`): it creates its own `VkDevice` and is the export side of

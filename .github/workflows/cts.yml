@@ -129,15 +129,17 @@ jobs:
           # everything else. The old note here said "~493 assertions before
           # SIGSEGV (#1522)"; that crash is fixed and that number is stale.
           #
-          # vulkan / vulkan2 stay here, for a blocker that MOVED. They used to
-          # run 1442 and stop at vkCreateDevice (the runtime required the
-          # Win32 external memory/semaphore/fence trio of every app); #1539
-          # made that trio optional-if-present, so both arms now create the
-          # device, PASS Swapchains, and stop at a SIGSEGV in SessionState
-          # (#1542) — a separate crash, the Vulkan sibling of the GL one that
-          # #1522 fixed, with its own fix in flight as #1550. A crash is not a nameable set of tests, so
-          # it can never be a quarantine entry; these two flip out of this
-          # string after #1550 and a full run, not before. See
+          # vulkan / vulkan2 stay here, for a blocker that MOVED TWICE. They
+          # used to run 1442 and stop at vkCreateDevice (the runtime required
+          # the Win32 external memory/semaphore/fence trio of every app);
+          # #1539 made that trio optional-if-present, so both arms create the
+          # device and PASS Swapchains, then SIGSEGV'd in SessionState
+          # (#1542) — the Vulkan sibling of the GL crash #1522 fixed. #1550
+          # has now landed for that too, so nothing KNOWN blocks them; they
+          # stay experimental only until a full run on this main proves it.
+          # Flipping them is a separate change with its own evidence, exactly
+          # as opengl got — a crash is never a quarantine entry, so a green
+          # full run is the only thing that earns the flip. See
           # docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 
           # Which arms get Mesa llvmpipe/lavapipe. Exactly the ones that cannot
@@ -727,10 +729,9 @@ jobs:
                     "(scripts/cts_quarantine_software_tier.txt).",
                     "",
                     "Experimental arms (`vulkan` / `vulkan2`) run against **lavapipe**, report real counts,",
-                    "and are not gated: they now get past `vkCreateDevice` (#1539) and PASS `Swapchains`,",
-                    "but SIGSEGV in `SessionState` (#1542) — the Vulkan sibling of the GL crash that",
-                    "#1522 fixed, with its own fix in flight as #1550.",
-                    "See docs/roadmap/cts-windows-handoff.md."]
+                    "and are not gated yet: `vkCreateDevice` (#1539) and the `SessionState` SIGSEGV",
+                    "(#1542 / #1550) are both fixed, so nothing known blocks them — they flip once a",
+                    "full run on main proves it. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")

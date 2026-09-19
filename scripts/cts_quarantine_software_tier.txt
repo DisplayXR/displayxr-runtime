@@ -29,12 +29,17 @@
 #      that would now pass is worse than no entry.
 #
 # NOT A PLACE TO PUT THE VULKAN ARMS.
-# vulkan / vulkan2 are currently blocked on the hosted tier because no Windows
-# software ICD implements VK_KHR_external_memory_win32 (lavapipe and
-# SwiftShader are FD-only; Mesa dzn has memory+semaphore but no external_fence
-# at all), which the runtime requires unconditionally on Windows. That failure
-# is at vkCreateDevice, so it takes out EVERY session-creating test rather than
-# a nameable few — listing them here would be renaming a blocker as a flake.
+# Their history is the worked example of rule 2. They were blocked at
+# vkCreateDevice (the runtime required the Win32 external
+# memory/semaphore/fence trio unconditionally; no Windows software ICD has it
+# — lavapipe and SwiftShader are FD-only, Mesa dzn has memory+semaphore but no
+# external_fence at all), and then by a SIGSEGV in SessionState. Neither was
+# ever a candidate for this file: a device-creation failure takes out EVERY
+# session-creating test rather than a nameable few, and a crash is not a test
+# name — listing either would have been renaming a blocker as a flake. Both
+# are now fixed (#1539, #1542 via #1550) and the arms still are not gated,
+# because "no known blocker" is not the same as a green run. If they ever do
+# need an entry here, it has to clear rule 2 on its own evidence.
 # See docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 #
 # WHY THERE IS EXACTLY ONE ENTRY.
