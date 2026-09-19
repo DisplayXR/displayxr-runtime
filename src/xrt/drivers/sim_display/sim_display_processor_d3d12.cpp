@@ -271,6 +271,10 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
+	// #817: no phase-sensitive interlace on this backend yet — see the helper.
+	if (sim_interlaced_fallback_to_anaglyph(mode, "D3D12")) {
+		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+	}
 	ID3D12PipelineState *active_pso = sdp->psos[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "D3D12")) {
 		active_pso = sdp->psos[SIM_DISPLAY_OUTPUT_ANAGLYPH];
@@ -677,10 +681,14 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	}
 
 	// Compile all pixel shaders and create PSOs
-	const char *ps_sources[SIM_DP_PIPELINE_COUNT] = {ps_sbs_source,  ps_anaglyph_source, ps_blend_source,
-	                                                 ps_squeezed_sbs_source, ps_quad_source, ps_passthrough_source};
-	const char *ps_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
-	                                               "Quad", "Passthrough"};
+	// #817: the interlaced slot builds the anaglyph PSO — the mode falls back
+	// to anaglyph on this backend, and keeping the slot populated means nothing
+	// can dereference a null PSO if it is ever indexed directly.
+	const char *ps_sources[SIM_DP_PIPELINE_COUNT] = {ps_sbs_source,          ps_anaglyph_source, ps_blend_source,
+	                                                 ps_squeezed_sbs_source, ps_quad_source,
+	                                                 ps_passthrough_source,  ps_anaglyph_source};
+	const char *ps_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph",    "Blend", "Squeezed SBS",
+	                                               "Quad", "Passthrough", "Interlaced (anaglyph fallback)"};
 
 	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		ID3DBlob *ps_blob = nullptr;
@@ -735,6 +743,7 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_INTERLACED     ? "Interlaced (anaglyph fallback)" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;

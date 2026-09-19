@@ -52,6 +52,17 @@ DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 
  */
 DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL", false)
 
+/*!
+ * #817 — stripe width, in panel pixels, for SIM_DISPLAY_OUTPUT=interlaced.
+ *
+ * 1 is the default because 1 is what a lenticular actually needs: at a
+ * one-pixel period any resample between the woven texture and scanout
+ * destroys the pattern, which is the whole point of the mode. A larger value
+ * widens the stripes so a human can see the pattern (and the phase shift when
+ * the window moves) at a glance, at the cost of some of that sensitivity.
+ */
+DEBUG_GET_ONCE_NUM_OPTION(sim_display_interlace_period, "SIM_DISPLAY_INTERLACE_PERIOD", 1)
+
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "sim_display/shaders/fullscreen.vert.h"
 #include "sim_display/shaders/anaglyph.frag.h"
@@ -60,6 +71,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(sim_display_strict_panel, "SIM_DISPLAY_STRICT_PANEL",
 #include "sim_display/shaders/squeezed_sbs.frag.h"
 #include "sim_display/shaders/quad.frag.h"
 #include "sim_display/shaders/passthrough.frag.h"
+#include "sim_display/shaders/interlaced.frag.h"
 
 
 /*!
@@ -70,7 +82,11 @@ struct sim_display_processor
 	struct xrt_display_processor base;
 	struct vk_bundle *vk;
 	VkRenderPass render_pass;
-	VkPipeline pipelines[SIM_DP_PIPELINE_COUNT]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
+	//! One per output mode (SBS, anaglyph, blend, squeezed SBS, quad,
+	//! passthrough, interlaced).
+	VkPipeline pipelines[SIM_DP_PIPELINE_COUNT];
+	//! #817: SIM_DISPLAY_INTERLACE_PERIOD, latched at creation.
+	int32_t interlace_period_px;
 	VkPipelineLayout pipeline_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
@@ -142,6 +158,14 @@ struct tile_push_constants
 	float inv_tile_rows;
 	float tile_columns;
 	float tile_rows;
+	//! #817: interlace phase (canvas_offset_x) and stripe width, in panel
+	//! pixels. Only interlaced.frag declares these; the other fragment
+	//! shaders declare just the first four floats, which is legal — a
+	//! smaller push block reading the head of a larger range.
+	float phase_px;
+	float period_px;
+	float pad0;
+	float pad1;
 };
 
 static void
@@ -165,11 +189,14 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
                      uint32_t canvas_height)
 {
 	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset. The canvas
-	// rect does not affect what sim_display renders (a fullscreen triangle is
-	// correct at any size or offset) — it is consumed below only by the
-	// SIM_DISPLAY_STRICT_PANEL audit, which reports the geometry a real
-	// lenticular weaver would be sensitive to.
+	// phase correction once Leia SR SDK supports sub-rect offset. For every
+	// sim_display mode BUT interlaced the canvas rect does not affect what is
+	// rendered (a fullscreen triangle is correct at any size or offset) — it
+	// is otherwise consumed only by the SIM_DISPLAY_STRICT_PANEL audit, which
+	// reports the geometry a real lenticular weaver would be sensitive to.
+	// SIM_DISPLAY_OUTPUT=interlaced (#817) does consume canvas_offset_x: it is
+	// the interlace phase, so a displaced target visibly flips which eye lands
+	// on the even columns.
 
 	(void)view_format; // colorspace handled by SRV/format selection, not this arg
 
@@ -202,13 +229,20 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 			        fills_panel ? "target is EXACTLY panel-sized (a real weaver gets 1:1 pixels)"
 			                    : "target is NOT panel-sized — windowed, or the desktop is SCALED; a "
 			                      "real weaver would be resampled and lose the interlace pattern");
-			U_LOG_W(
-			    "sim_display STRICT PANEL (#817): canvas offset (%d,%d) size %ux%u%s; atlas view "
-			    "%ux%u grid %ux%u. sim_display ignores the offset (it has no set_present_origin "
-			    "slot), so phase errors are INVISIBLE here by construction.",
-			    canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
-			    at_origin ? " (panel origin)" : " (displaced — phase-critical for a real weaver)",
-			    view_width, view_height, tile_columns, tile_rows);
+			// #817: only the interlaced output consumes the offset. Every
+			// other mode renders the same pixels wherever the target sits,
+			// so a phase error genuinely cannot show up in what it draws.
+			const bool phase_visible = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_INTERLACED;
+			U_LOG_W("sim_display STRICT PANEL (#817): canvas offset (%d,%d) size %ux%u%s; atlas view "
+			        "%ux%u grid %ux%u. %s",
+			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
+			        at_origin ? " (panel origin)" : " (displaced — phase-critical for a real weaver)",
+			        view_width, view_height, tile_columns, tile_rows,
+			        phase_visible ? "SIM_DISPLAY_OUTPUT=interlaced USES the offset as the "
+			                        "interlace phase, so a phase error is visible in the output."
+			                      : "This mode ignores the offset (sim_display has no "
+			                        "set_present_origin slot), so phase errors are INVISIBLE in "
+			                        "what it draws — run SIM_DISPLAY_OUTPUT=interlaced to see them.");
 
 			sdp->geom_reported = true;
 			sdp->geom_last_target_w = target_width;
@@ -284,6 +318,9 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
 	    .inv_tile_rows = 1.0f / (float)tile_rows,
 	    .tile_columns = (float)tile_columns,
 	    .tile_rows = (float)tile_rows,
+	    // #817: the interlace phase is the target's panel-relative X origin.
+	    .phase_px = (float)canvas_offset_x,
+	    .period_px = (float)sdp->interlace_period_px,
 	};
 	vk->vkCmdPushConstants(cmd_buffer, sdp->pipeline_layout,
 	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -443,6 +480,7 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	    {sim_display_shaders_squeezed_sbs_frag, sizeof(sim_display_shaders_squeezed_sbs_frag), "Squeezed SBS"},
 	    {sim_display_shaders_quad_frag, sizeof(sim_display_shaders_quad_frag), "Quad"},
 	    {sim_display_shaders_passthrough_frag, sizeof(sim_display_shaders_passthrough_frag), "Passthrough"},
+	    {sim_display_shaders_interlaced_frag, sizeof(sim_display_shaders_interlaced_frag), "Interlaced"},
 		};
 
 	// Create all fragment shader modules upfront (keep alive until all pipelines are created)
@@ -890,6 +928,13 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	sdp->nominal_y_m = 0.1f;
 	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m();
 
+	// #817: interlace stripe width; clamped to >= 1 so a bad value can never
+	// divide by zero in the shader.
+	sdp->interlace_period_px = (int32_t)debug_get_num_option_sim_display_interlace_period();
+	if (sdp->interlace_period_px < 1) {
+		sdp->interlace_period_px = 1;
+	}
+
 	if (vk == NULL) {
 		U_LOG_E("sim_display: Vulkan bundle required for display processor");
 		free(sdp);
@@ -913,6 +958,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;

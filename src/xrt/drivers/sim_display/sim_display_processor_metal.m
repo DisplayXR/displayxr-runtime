@@ -250,6 +250,10 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
 	}
+	// #817: no phase-sensitive interlace on this backend yet — see the helper.
+	if (sim_interlaced_fallback_to_anaglyph(mode, "Metal")) {
+		mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+	}
 	id<MTLRenderPipelineState> active_pipeline = sdp->pipelines[mode];
 	if (sim_zone_substitute_position_preserving(mode, sdp->zone_active, "Metal")) {
 		active_pipeline = sdp->pipelines[SIM_DISPLAY_OUTPUT_ANAGLYPH];
@@ -373,11 +377,16 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		return false;
 	}
 
-	NSString *frag_names[SIM_DP_PIPELINE_COUNT] = {@"sbs_fragment",  @"anaglyph_fragment",
+	// #817: the interlaced slot builds a second anaglyph pipeline — the mode
+	// falls back to anaglyph on this backend, and keeping the slot populated
+	// means nothing can dereference a nil pipeline if it is ever indexed
+	// directly.
+	NSString *frag_names[SIM_DP_PIPELINE_COUNT] = {@"sbs_fragment",   @"anaglyph_fragment",
 	                                               @"blend_fragment", @"squeezed_sbs_fragment",
-	                                               @"quad_fragment",  @"passthrough_fragment"};
-	const char *mode_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph", "Blend", "Squeezed SBS",
-	                                                 "Quad", "Passthrough"};
+	                                               @"quad_fragment",  @"passthrough_fragment",
+	                                               @"anaglyph_fragment"};
+	const char *mode_names[SIM_DP_PIPELINE_COUNT] = {"SBS",  "Anaglyph",    "Blend", "Squeezed SBS",
+	                                                 "Quad", "Passthrough", "Interlaced (anaglyph fallback)"};
 
 	for (int i = 0; i < SIM_DP_PIPELINE_COUNT; i++) {
 		id<MTLFunction> frag_fn = [library newFunctionWithName:frag_names[i]];
@@ -613,6 +622,7 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced (anaglyph fallback)" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;
