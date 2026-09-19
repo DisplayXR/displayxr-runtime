@@ -111,9 +111,14 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
 ## 1. Window binding & app class
 
 - **INV-1.1 — Pass a real window for handle/texture; NULL for hosted.** Create your window
-  *before* OpenXR init and pass it at session creation via the binding struct
-  (`XrWin32WindowBindingCreateInfoDXR` / `XrCocoaWindowBindingCreateInfoDXR`). Hosted apps pass
-  NULL and the runtime self-creates a native-resolution window.
+  *before* OpenXR init and pass it at session creation via the binding struct for your
+  platform — `XrWin32WindowBindingCreateInfoDXR` (HWND),
+  `XrCocoaWindowBindingCreateInfoDXR` (NSView), `XrXlibWindowBindingCreateInfoDXR`
+  (X11 `Display*` + `Window`), or `XrWaylandSurfaceBindingCreateInfoDXR`
+  (`wl_display*` + `wl_surface*`). Hosted apps pass NULL and the runtime self-creates a
+  native-resolution window. On desktop Linux a single binary can carry both legs and pick
+  at runtime — see `test_apps/common/dxr_linux_window.{h,cpp}` and `cube_handle_vk_linux`
+  (`--backend=x11|wayland|auto`).
   Ref: `test_apps/handle/cube_handle_d3d11_win/main.cpp:675`, `xr_session.cpp:193-194`.
 
 - **INV-1.2 — The texture vs handle difference is one field.** A texture app sets
@@ -130,6 +135,20 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   instance → get system → `xrGetSystemProperties` → **create window at the reported
   position** → create session with the binding. Hosted apps need none of this — the runtime
   places its own window (#715).
+
+  **Wayland substitute.** A Wayland client is never told where it is and cannot place
+  itself, so there is no position to create at. The compliant substitute is
+  `xdg_toplevel_set_fullscreen()` on the `wl_output` matched to the reported panel rect
+  (compare `wl_output.geometry(x,y)` + the current `wl_output.mode(width,height)` against
+  `XrDisplayDesktopPositionDXR` `left/top` + `XrDisplayInfoDXR` `displayPixelWidth/Height`);
+  fall back to `set_fullscreen(NULL)` and log when nothing matches. The match only works at
+  **desktop scale 1.0** — `wl_output` geometry is logical, the runtime's rect is device
+  pixels. Fullscreen is in any case the only mode the runtime supports on Wayland today,
+  and *windowed* Wayland additionally needs the compositor geometry service
+  (`docs/specs/runtime/wayland-window-geometry.md`) for the phase anchor. Reference
+  implementation: `test_apps/common/dxr_linux_window.cpp`
+  (`DxrLinuxWindow::create_wayland`); full contract:
+  `docs/specs/extensions/XR_DXR_wayland_surface_binding.md`.
 
 - **INV-1.4 (Android) — Opt out of view-bounds sandboxing in YOUR manifest.** The runtime
   anchors the weave's interlace phase to your window's on-screen origin, which it learns by
