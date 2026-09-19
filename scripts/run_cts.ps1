@@ -63,6 +63,12 @@ if (-not $Tag) { $Tag = "${Graphics}_${ApiVersion}" }
 $tmp     = $env:TEMP
 $xml     = "$tmp\cts_${Tag}.xml"
 $console = "$tmp\cts_${Tag}_console.log"
+# conformance_cli prints its frame-timing block (Average xrWaitFrame wait time,
+# Overhead score, ...) on its own STDOUT, not through the Catch2 console
+# reporter — so those numbers were never in $console and anything scraping
+# $console for them found nothing. Capture stdout separately; $console keeps
+# the reporter output untouched.
+$stdoutLog = "$tmp\cts_${Tag}_stdout.log"
 
 foreach ($p in @($exe,$devManifest)) { if (-not (Test-Path $p)) { throw "missing: $p" } }
 
@@ -141,6 +147,7 @@ try {
 
   if (Test-Path $xml)     { Remove-Item $xml -Force }
   if (Test-Path $console) { Remove-Item $console -Force }
+  if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 
   # Reduce per-instance overhead/noise: the CTS creates hundreds of instances.
   # MCP spins a named-pipe server per instance; implicit Vulkan layers (e.g. an
@@ -170,7 +177,7 @@ try {
   # *.glb, ...) relative to the working directory, and the D3D11 plugin's
   # InitializeDevice swallows the failed read into `return false` -> every
   # session-creating test errors with XR_ERROR_RUNTIME_FAILURE (#830).
-  $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory (Split-Path $exe) -PassThru -NoNewWindow
+  $proc = Start-Process -FilePath $exe -ArgumentList $cliArgs -WorkingDirectory (Split-Path $exe) -PassThru -NoNewWindow -RedirectStandardOutput $stdoutLog
   $null = $proc.Handle   # cache the handle NOW or .ExitCode reads back empty after exit (PS quirk)
   if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
     Write-Output "TIMEOUT after ${TimeoutSec}s - killing."
@@ -179,6 +186,15 @@ try {
     Write-Output "EXITCODE: (killed)"
   } else {
     Write-Output "EXITCODE: $($proc.ExitCode)"
+  }
+
+  # -RedirectStandardOutput can only target a FILE, so the live view of
+  # conformance_cli's progress in the terminal / CI job log would otherwise
+  # disappear. Replay it once the process is done — as ONE write, because
+  # piping 40k+ lines through Write-Host takes minutes.
+  if (Test-Path $stdoutLog) {
+    $raw = Get-Content $stdoutLog -Raw
+    if ($raw) { Write-Host $raw }
   }
 }
 finally {
@@ -213,3 +229,4 @@ finally {
 
 Write-Output "XML:     $xml"
 Write-Output "CONSOLE: $console"
+Write-Output "STDOUT:  $stdoutLog"
