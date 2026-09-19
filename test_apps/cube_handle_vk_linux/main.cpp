@@ -4,31 +4,44 @@
  * @file
  * @brief  Linux handle-class Vulkan OpenXR spinning cube test app
  *
- * Self-contained single-file app that renders a spinning cube + grid floor
- * via Vulkan + OpenXR. Handle class: the app creates and owns its X11 window
- * and passes it to the runtime via XR_DXR_xlib_window_binding — the Phase 3
- * validation vehicle for app-provided windows on desktop Linux
- * (docs/roadmap/linux-support.md, #660). Adapted from
+ * Self-contained app that renders a spinning cube + grid floor via Vulkan +
+ * OpenXR. Handle class: the app creates and owns its toplevel window and hands
+ * it to the runtime — the Phase 3 validation vehicle for app-provided windows
+ * on desktop Linux (docs/roadmap/linux-support.md, #660). Adapted from
  * cube_hosted_legacy_vk_linux; the render path (fixed 2-view SBS, no mode
  * adaptation) is unchanged — the delta is the window + binding.
  * XR_DXR_display_info is enabled (when present) solely for the INV-1.3 panel
  * desktop-position query (#715), which also moves view sizing off the
  * legacy-compromise path.
  *
- * The app owns the X event loop (pumped once per frame) and the window
- * lifecycle; the runtime derives its XCB connection from the app's Display
- * (XGetXCBConnection) and presents into the app's window.
+ * ONE BINARY, TWO WINDOW BACKENDS, chosen at runtime (`--backend=` /
+ * DXR_WINDOW_BACKEND, default auto):
+ *   X11     -> XR_DXR_xlib_window_binding    (runtime: XGetXCBConnection +
+ *              VK_KHR_xcb_surface). Windowed or fullscreen; the proven path,
+ *              and what `auto` picks whenever DISPLAY resolves — including
+ *              under XWayland.
+ *   Wayland -> XR_DXR_wayland_surface_binding (runtime: VK_KHR_wayland_surface).
+ *              This app is the first in the tree to exercise it. FULLSCREEN
+ *              ONLY: the runtime sizes its WSI swapchain to the panel and never
+ *              follows a Wayland resize, so anything else cannot weave 1:1 —
+ *              see docs/specs/extensions/XR_DXR_wayland_surface_binding.md.
+ *
+ * Both legs live in the shared helper test_apps/common/dxr_linux_window.{h,cpp};
+ * the app owns the window-system event loop (pumped once per frame) and the
+ * window lifecycle, because the runtime pumps neither.
  */
 
-#include <X11/Xlib.h> // before the extension header so it sees real Xlib types
-#include <X11/Xutil.h> // XSizeHints for INV-1.3 window placement
+// Dual-backend app-owned window. This header pulls in Xlib (and, in a build
+// with libwayland, <wayland-client.h>) BEFORE the window-binding extension
+// headers, which is what makes those headers see the real Display / Window /
+// wl_display / wl_surface types instead of their self-contained stand-ins.
+#include "dxr_linux_window.h"
 
 #include <vulkan/vulkan.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_DXR_xlib_window_binding.h>
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 
@@ -97,96 +110,33 @@
 static const float kVirtualDisplayHeight = 0.24f;
 
 // ============================================================================
-// App-owned X11 window (handle class — XR_DXR_xlib_window_binding)
+// App-owned window (handle class — xlib or wayland binding, picked at runtime)
 // ============================================================================
 
 static volatile bool g_running = true;
 
-static Display* g_xDisplay = nullptr;
-static ::Window g_xWindow = 0;
-static Atom g_wmDeleteWindow = 0;
+//! The one window. Owns either the X11 toplevel or the Wayland xdg toplevel and
+//! produces the matching XrSessionCreateInfo binding struct. Destroyed LAST —
+//! the runtime's VkSurfaceKHR borrows its connection.
+static DxrLinuxWindow g_window;
 
-static bool CreateAppWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
-    g_xDisplay = XOpenDisplay(nullptr);
-    if (g_xDisplay == nullptr) {
-        LOG_ERROR("XOpenDisplay failed — is DISPLAY set?");
-        return false;
-    }
+//! Non-volatile mirror of g_running that the window helper can write through a
+//! plain bool*; copied back into g_running right after each pump.
+static bool g_windowRunning = true;
 
-    // INV-1.3: open on the 3D panel (#715). (screenLeft, screenTop) is the
-    // panel top-left in virtual-desktop pixels (top-down, origin = primary
-    // top-left, XrDisplayDesktopPositionDXR); (0,0) = primary/unknown is a
-    // safe create position either way.
-    int screen = DefaultScreen(g_xDisplay);
-    g_xWindow = XCreateSimpleWindow(
-        g_xDisplay, RootWindow(g_xDisplay, screen),
-        screenLeft, screenTop, width, height, 0,
-        BlackPixel(g_xDisplay, screen), BlackPixel(g_xDisplay, screen));
-    if (g_xWindow == 0) {
-        LOG_ERROR("XCreateSimpleWindow failed");
-        return false;
-    }
-
-    // WM_NORMAL_HINTS with USPosition|PPosition, so the window manager treats
-    // the create-time position as intentional instead of auto-placing the
-    // window (ICCCM §4.1.2.3; GNOME/Mutter auto-places without this). Mirrors
-    // the runtime's own hosted-window placement (comp_vk_native_window_xcb.c).
-    {
-        XSizeHints hints = {};
-        hints.flags = USPosition | PPosition;
-        hints.x = screenLeft;
-        hints.y = screenTop;
-        XSetWMNormalHints(g_xDisplay, g_xWindow, &hints);
-    }
-
-    XStoreName(g_xDisplay, g_xWindow, "Cube Handle VK (DisplayXR)");
-    XSelectInput(g_xDisplay, g_xWindow, StructureNotifyMask | KeyPressMask);
-
-    // Clean close on the window manager's close button.
-    g_wmDeleteWindow = XInternAtom(g_xDisplay, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(g_xDisplay, g_xWindow, &g_wmDeleteWindow, 1);
-
-    XMapWindow(g_xDisplay, g_xWindow);
-    XFlush(g_xDisplay);
-
-    // Re-assert the position after mapping — many WMs (Mutter included)
-    // ignore the create-time x/y of a freshly mapped toplevel, but honor a
-    // post-map ConfigureRequest (this is what `xdotool windowmove` sends).
-    XMoveWindow(g_xDisplay, g_xWindow, screenLeft, screenTop);
-    XFlush(g_xDisplay);
-
-    LOG_INFO("Created app-owned X11 window 0x%lx (%ux%u) at (%d, %d)",
-             g_xWindow, width, height, screenLeft, screenTop);
-    return true;
-}
-
-// Pump pending X events. The runtime borrows this Display's connection for
-// its XCB surface but never reads events from it, so the app owns the queue.
-static void PumpAppWindowEvents() {
-    if (g_xDisplay == nullptr) {
+/*!
+ * Key handler. X11 keeps its historical behaviour to the letter — this app has
+ * never bound a key there, and the window manager's close button plus SIGINT
+ * are the exits. On Wayland a fullscreen surface has no close affordance at
+ * all, so ESC / Q are wired up as the only way out short of a signal.
+ */
+static void OnWindowKey(DxrKey key) {
+    if (g_window.backend() != DxrWindowBackend::Wayland) {
         return;
     }
-    while (XPending(g_xDisplay) > 0) {
-        XEvent ev;
-        XNextEvent(g_xDisplay, &ev);
-        if (ev.type == ClientMessage &&
-            (Atom)ev.xclient.data.l[0] == g_wmDeleteWindow) {
-            LOG_INFO("Window closed by user — exiting");
-            g_running = false;
-        }
-    }
-}
-
-// Destroy AFTER the session is torn down — the runtime's VkSurface borrows
-// this Display's XCB connection.
-static void DestroyAppWindow() {
-    if (g_xDisplay != nullptr) {
-        if (g_xWindow != 0) {
-            XDestroyWindow(g_xDisplay, g_xWindow);
-            g_xWindow = 0;
-        }
-        XCloseDisplay(g_xDisplay);
-        g_xDisplay = nullptr;
+    if (key == DxrKey::Escape || key == DxrKey::Q) {
+        LOG_INFO("Exit key — exiting");
+        g_windowRunning = false;
     }
 }
 
@@ -1854,9 +1804,14 @@ struct AppXrSession {
     // xrLocateViews and the RUNTIME does the window-relative Kooima (it has the
     // window handle + display info + view poses), returning render-ready views.
     bool hasViewRig = false;
+
+    // Which window backend (and therefore which binding extension) this run
+    // resolved to. Set by InitializeOpenXR from --backend / DXR_WINDOW_BACKEND
+    // + what the runtime advertises; consumed when the window is created.
+    DxrWindowBackend windowBackend = DxrWindowBackend::Auto;
 };
 
-static bool InitializeOpenXR(AppXrSession& xr) {
+static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend) {
     LOG_INFO("Initializing OpenXR...");
 
     uint32_t extensionCount = 0;
@@ -1867,6 +1822,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     bool hasVulkan = false;
     bool hasXlibBinding = false;
+    bool hasWaylandBinding = false;
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
     for (const auto& ext : extensions) {
@@ -1875,6 +1831,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             hasXlibBinding = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) {
+            hasWaylandBinding = true;
         }
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             hasDisplayInfo = true;
@@ -1891,14 +1850,24 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     }
 
     LOG_INFO("XR_DXR_xlib_window_binding: %s", hasXlibBinding ? "AVAILABLE" : "NOT FOUND");
-    if (!hasXlibBinding) {
-        // Handle class needs the binding — without it the runtime would
-        // self-create a second window (hosted fallback), defeating the test.
-        LOG_ERROR("XR_DXR_xlib_window_binding not available — this is the "
-                  "handle-class vehicle; use cube_hosted_legacy_vk_linux against "
-                  "runtimes without the extension");
+    LOG_INFO("XR_DXR_wayland_surface_binding: %s", hasWaylandBinding ? "AVAILABLE" : "NOT FOUND");
+
+    // Resolve the window backend BEFORE xrCreateInstance so only the binding
+    // extension we will actually chain is enabled. Handle class needs one of
+    // them — without a binding the runtime would self-create a second window
+    // (hosted fallback), defeating the test.
+    std::string backendReason;
+    xr.windowBackend = DxrLinuxWindow::select(requestedBackend, hasXlibBinding, hasWaylandBinding, &backendReason);
+    if (xr.windowBackend == DxrWindowBackend::Auto) {
+        LOG_ERROR("No usable window backend: %s", backendReason.c_str());
+        LOG_ERROR("This is the handle-class vehicle; use cube_hosted_legacy_vk_linux against "
+                  "runtimes without a window-binding extension");
         return false;
     }
+    LOG_INFO("Window backend: %s (requested %s)%s%s",
+             DxrLinuxWindow::backend_name(xr.windowBackend),
+             DxrLinuxWindow::backend_name(requestedBackend),
+             backendReason.empty() ? "" : " — ", backendReason.c_str());
 
     // vulkan_enable2 (INV-5.9): the RUNTIME creates the VkInstance/VkDevice on
     // our behalf (xrCreateVulkanInstanceKHR / xrCreateVulkanDeviceKHR), so it can
@@ -1907,7 +1876,11 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     // atlas against fresh eyes at panel rate) + present_id/present_wait pacing.
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
-    enabledExtensions.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+    // Exactly the one binding extension this run will chain — enabling the
+    // other would claim a capability the app never uses.
+    enabledExtensions.push_back(xr.windowBackend == DxrWindowBackend::Wayland
+                                    ? XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME
+                                    : XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
     if (hasDisplayInfo) {
         // Enabled for the INV-1.3 panel desktop-position query below (#715).
         // NOTE: enabling XR_DXR_display_info also switches the runtime's view
@@ -2163,19 +2136,18 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = queueFamilyIndex;
     vkBinding.queueIndex = 0;
 
-    // Handle class: hand the app-owned X11 window to the runtime.
-    XrXlibWindowBindingCreateInfoDXR xlibBinding = {XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR};
-    xlibBinding.next = &vkBinding;
-    xlibBinding.xDisplay = g_xDisplay;
-    xlibBinding.window = g_xWindow;
-
+    // Handle class: hand the app-owned window to the runtime. The helper fills
+    // whichever binding struct matches the live backend and chains the Vulkan
+    // graphics binding behind it. transparentBackgroundEnabled stays XR_FALSE
+    // on both legs (this app paints an opaque scene).
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-    sessionInfo.next = &xlibBinding;
+    sessionInfo.next = g_window.session_binding_chain(&vkBinding);
     sessionInfo.systemId = xr.systemId;
 
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
-    LOG_INFO("Session created (window binding: Display %p, Window 0x%lx)",
-             (void*)g_xDisplay, g_xWindow);
+    LOG_INFO("Session created (%s via %s: %s)",
+             DxrLinuxWindow::backend_name(g_window.backend()),
+             g_window.required_openxr_extension(), g_window.describe().c_str());
 
     return true;
 }
@@ -2382,18 +2354,65 @@ static void SignalHandler(int sig) {
     g_running = false;
 }
 
-int main() {
+static void PrintUsage(const char* argv0) {
+    fprintf(stdout,
+        "Usage: %s [--backend=x11|wayland|auto] [--windowed] [--help]\n"
+        "\n"
+        "  --backend=x11      app-owned X11 window, XR_DXR_xlib_window_binding\n"
+        "  --backend=wayland  app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
+        "  --backend=auto     (default) X11 whenever DISPLAY resolves and the runtime\n"
+        "                     advertises the xlib binding - including under XWayland,\n"
+        "                     which is the proven path; native Wayland otherwise.\n"
+        "  --windowed         Wayland only: skip xdg_toplevel.set_fullscreen. The\n"
+        "                     runtime's WSI swapchain is panel-sized and it never\n"
+        "                     follows a Wayland resize, so the weave will NOT be 1:1 -\n"
+        "                     this exists to observe that limitation, not to use it.\n"
+        "\n"
+        "Env: DXR_WINDOW_BACKEND=x11|wayland|auto (--backend wins)\n"
+        "     DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative (X11)\n",
+        argv0);
+}
+
+int main(int argc, char** argv) {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== Cube Handle VK Linux (XR_DXR_xlib_window_binding) ===");
+    // Window backend: env first, CLI overrides it.
+    DxrWindowBackend requestedBackend = DxrWindowBackend::Auto;
+    bool waylandWindowed = false;
+    if (const char* benv = getenv("DXR_WINDOW_BACKEND")) {
+        if (!DxrLinuxWindow::parse_backend(benv, &requestedBackend)) {
+            LOG_ERROR("DXR_WINDOW_BACKEND=\"%s\" is not one of x11|wayland|auto", benv);
+            return 2;
+        }
+    }
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        if (strncmp(a, "--backend=", 10) == 0) {
+            if (!DxrLinuxWindow::parse_backend(a + 10, &requestedBackend)) {
+                LOG_ERROR("--backend must be one of x11|wayland|auto (got \"%s\")", a + 10);
+                return 2;
+            }
+        } else if (strcmp(a, "--windowed") == 0) {
+            waylandWindowed = true;
+        } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+            PrintUsage(argv[0]);
+            return 0;
+        } else {
+            LOG_ERROR("Unknown argument \"%s\"", a);
+            PrintUsage(argv[0]);
+            return 2;
+        }
+    }
+
+    LOG_INFO("=== Cube Handle VK Linux (dual-backend: xlib / wayland window binding) ===");
 
     // Initialize OpenXR FIRST — xrGetSystemProperties needs only instance +
     // system id, and returns the panel desktop position the window below is
     // created at (INV-1.3 ordering: instance → system → properties → window
     // → session).
     AppXrSession xr = {};
-    if (!InitializeOpenXR(xr)) {
+    if (!InitializeOpenXR(xr, requestedBackend)) {
         LOG_ERROR("OpenXR initialization failed");
         return 1;
     }
@@ -2411,17 +2430,48 @@ int main() {
     // DXR_CUBE_WINDOW="WxH+X+Y" (offset relative to the panel) forces a windowed
     // size/position — for exercising the window-relative Kooima off-center.
     // Absent → fullscreen on the panel (window == display).
+    bool cubeWindowRequested = false;
     if (const char* wenv = getenv("DXR_CUBE_WINDOW")) {
         unsigned w = 0, h = 0; int ox = 0, oy = 0;
         if (sscanf(wenv, "%ux%u+%d+%d", &w, &h, &ox, &oy) >= 2 && w > 0 && h > 0) {
             winW = w; winH = h;
             winLeft = xr.displayScreenLeft + ox;
             winTop  = xr.displayScreenTop  + oy;
+            cubeWindowRequested = true;
             LOG_INFO("DXR_CUBE_WINDOW override: %ux%u at panel-relative (%d,%d)", w, h, ox, oy);
         }
     }
-    if (!CreateAppWindow(winW, winH, winLeft, winTop)) {
-        LOG_ERROR("X11 window creation failed");
+
+    DxrLinuxWindowDesc winDesc = {};
+    winDesc.width = winW;
+    winDesc.height = winH;
+    winDesc.panel_left = winLeft;
+    winDesc.panel_top = winTop;
+    winDesc.panel_width = xr.displayPixelWidth;
+    winDesc.panel_height = xr.displayPixelHeight;
+    winDesc.title = "Cube Handle VK (DisplayXR)";
+    winDesc.app_id = "com.displayxr.cube_handle_vk_linux";
+    winDesc.fullscreen_on_wayland = true;
+
+    if (xr.windowBackend == DxrWindowBackend::Wayland) {
+        // A Wayland client cannot place or size itself against the desktop, and
+        // the runtime's WSI swapchain is panel-sized regardless (it never sees a
+        // Wayland resize). DXR_CUBE_WINDOW therefore cannot be honoured here;
+        // say so instead of silently producing a wrong weave.
+        if (cubeWindowRequested && !waylandWindowed) {
+            LOG_WARN("DXR_CUBE_WINDOW is ignored on the Wayland backend — windowed Wayland is not supported "
+                     "by the runtime yet (panel-sized WSI swapchain, no resize follow). Staying fullscreen; "
+                     "pass --windowed to force it anyway and observe the limitation.");
+        }
+        if (waylandWindowed) {
+            winDesc.fullscreen_on_wayland = false;
+        }
+    } else if (waylandWindowed) {
+        LOG_WARN("--windowed only affects the Wayland backend — ignored on X11 (use DXR_CUBE_WINDOW)");
+    }
+
+    if (!g_window.create(xr.windowBackend, winDesc)) {
+        LOG_ERROR("%s window creation failed", DxrLinuxWindow::backend_name(xr.windowBackend));
         CleanupOpenXR(xr);
         return 1;
     }
@@ -2558,7 +2608,13 @@ int main() {
             vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
         }
 
-        PumpAppWindowEvents();
+        // The runtime pumps neither window system, so the app must. On Wayland
+        // this is also what answers xdg_wm_base.ping — miss it and the
+        // compositor kills the client as unresponsive.
+        g_window.pump(OnWindowKey, &g_windowRunning);
+        if (!g_windowRunning) {
+            g_running = false; // one-way: never resurrect a SIGINT-cleared flag
+        }
         PollEvents(xr);
 
         if (xr.sessionRunning) {
@@ -2631,14 +2687,9 @@ int main() {
                             if (eyeCount > locatedCount)
                               eyeCount = locatedCount;
                             uint32_t winW = 0, winH = 0;
-                            {
-                                XWindowAttributes wa = {};
-                                if (g_xDisplay != nullptr && g_xWindow != 0 &&
-                                    XGetWindowAttributes(g_xDisplay, g_xWindow, &wa) &&
-                                    wa.width > 0 && wa.height > 0) {
-                                    winW = (uint32_t)wa.width;
-                                    winH = (uint32_t)wa.height;
-                                }
+                            if (!g_window.current_size(&winW, &winH)) {
+                                winW = 0;
+                                winH = 0;
                             }
                             uint32_t eyeW, eyeH;
                             if (winW > 0 && winH > 0) {
@@ -2747,8 +2798,9 @@ int main() {
     vkDestroyDevice(vkDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
 
-    // Last: the session's VkSurface borrowed this Display's XCB connection.
-    DestroyAppWindow();
+    // Last: the session's VkSurface borrowed this window's connection (the Xlib
+    // Display, or the wl_display).
+    g_window.destroy();
 
     LOG_INFO("Application shutdown complete");
     return 0;
