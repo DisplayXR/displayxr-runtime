@@ -546,6 +546,12 @@ struct comp_vk_native_compositor
 	uint32_t last_window_px_h;
 	bool have_last_window_size;
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	//! One-shot guard for the X11 present-origin refusal WARN (see
+	//! @ref vk_x11_present_origin_is_panel_native). Never per frame.
+	bool warned_x11_origin_units;
+#endif
+
 #ifdef XRT_OS_ANDROID
 	//! Last window-rect generation (android_globals) already handed to the DP
 	//! / already logged, so the per-window rect feed and its Kooima line stay
@@ -9590,6 +9596,104 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 #endif
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Does this DP actually implement the (ADR-020, optional) `set_present_origin`
+ * slot? Same struct_size + NULL test the
+ * @ref xrt_display_processor_vk_set_present_origin wrapper performs before
+ * dispatching — replicated here only so the honesty WARN below can stay silent
+ * for a DP that is fed nothing either way (sim_display).
+ */
+static bool
+vk_dp_has_present_origin_slot(const struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL) {
+		return false;
+	}
+	const struct xrt_display_processor_vk *xdp = (const struct xrt_display_processor_vk *)c->display_processor;
+	const char *slot_end = (const char *)&xdp->set_present_origin + sizeof(xdp->set_present_origin);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size) {
+		return false;
+	}
+	return xdp->set_present_origin != NULL;
+}
+
+/*!
+ * X11 twin of the Wayland refusal in `comp_vk_native_wl_geom.c` (#1557): may the
+ * X11 root coordinates this compositor reads be used as a **weave phase**?
+ *
+ * Only when the desktop rect the runtime resolved for the panel is the panel's
+ * own native pixel size. `target_instance.c`'s `fill_display_desktop_info()`
+ * already computes exactly that comparison and publishes it as
+ * `xrt_system_compositor_info::display_desktop_rect_is_panel` (apps see it as
+ * `XrDisplayDesktopInfoDXR::isPanelConfirmed`) — but until now nothing in the
+ * runtime ACTED on it.
+ *
+ * Under XWayland at a non-unit scale the X screen is a fiction: this box reports
+ * a 3456x2160 root for a 2880x1800 panel. Window positions read out of that root
+ * are in logical, not physical, pixels, so an origin derived from them is wrong
+ * by exactly the scale factor — and the display server resamples the surface on
+ * its way to the panel anyway, which destroys a 1-pixel-period interlace pattern
+ * outright. Feeding it was windowed weaving at a KNOWN-wrong phase; refusing it
+ * leaves the DP display-scoped, which is the honest fallback and is what the
+ * degradation ladder in docs/specs/runtime/wayland-window-geometry.md §3 already
+ * promises for the Wayland side.
+ *
+ * Deliberately scoped to the PHASE feed only. The window-scoped Kooima /
+ * `get_window_metrics` projection path is NOT gated on this flag: its units are
+ * ratios of the same root coordinate space (window size and centre offset
+ * against the display rect), which stay self-consistent under a uniformly
+ * scaled root, and the flag is false on every dev box by construction anyway
+ * (sim_display declares a 1920x1080 panel that no real desktop rect matches),
+ * so gating projection on it would visibly change sim behaviour everywhere.
+ */
+static bool
+vk_x11_present_origin_is_panel_native(struct comp_vk_native_compositor *c)
+{
+	if (c->sys_info_set && c->sys_info.display_desktop_rect_is_panel) {
+		if (!c->warned_x11_origin_units) {
+			c->warned_x11_origin_units = true;
+			// One-shot, not per frame: says which way the gate went, so a
+			// box that IS feeding a windowed phase can be told apart from
+			// one that silently is not.
+			U_LOG_I(
+			    "X11 present origin accepted: panel desktop rect %ux%u == panel native size — "
+			    "root coordinates are physical panel pixels, windowed weave phase is fed.",
+			    c->sys_info.display_desktop_width, c->sys_info.display_desktop_height);
+		}
+		return true;
+	}
+
+	// Refused. WARN about the phase only when the DP would have consumed it —
+	// sim_display has no set_present_origin slot, so nothing is fed with or
+	// without this gate and a phase warning there would be pure noise. The
+	// no-slot case still gets one INFO so the gate is observable on a dev box.
+	if (!c->warned_x11_origin_units) {
+		c->warned_x11_origin_units = true;
+		const uint32_t dw = c->sys_info_set ? c->sys_info.display_desktop_width : 0u;
+		const uint32_t dh = c->sys_info_set ? c->sys_info.display_desktop_height : 0u;
+		const uint32_t pw = c->sys_info_set ? c->sys_info.display_pixel_width : 0u;
+		const uint32_t ph = c->sys_info_set ? c->sys_info.display_pixel_height : 0u;
+		if (vk_dp_has_present_origin_slot(c)) {
+			U_LOG_W(
+			    "X11 present origin refused: the panel's desktop rect (%ux%u) is not the panel's "
+			    "native size (%ux%u), so root-window coordinates are not physical panel pixels and "
+			    "cannot anchor the weave phase. Falling back to display-scoped weaving; set the 3D "
+			    "display to 100%% scale, or run a real X11 session instead of XWayland, for "
+			    "windowed weaving.",
+			    dw, dh, pw, ph);
+		} else {
+			U_LOG_I(
+			    "X11 present origin refused (desktop rect %ux%u != panel native %ux%u) — "
+			    "display-scoped weaving. No phase warning: this display processor exposes no "
+			    "set_present_origin slot, so nothing was being fed either way.",
+			    dw, dh, pw, ph);
+		}
+	}
+	return false;
+}
+#endif /* XRT_OS_LINUX_DESKTOP */
+
 /*!
  * Windowed weaving (runtime#757 / LeiaSR#85): tell the DP where the app window's
  * client area sits on the 3D panel so it can anchor the interlacing phase there,
@@ -9689,6 +9793,24 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	c->last_present_origin_x = ox;
 	c->last_present_origin_y = oy;
 	c->have_last_present_origin = true;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * Phase-unit honesty. The Wayland arm already refuses inside
+	 * comp_vk_native_wl_geom_get_window_rect() (#1557) — by the time we get
+	 * here a Wayland session's metrics are known-good, so only the X11 arm
+	 * needs the check.
+	 */
+#ifdef XRT_HAVE_WAYLAND
+	const bool origin_from_x11 = !c->use_wayland;
+#else
+	const bool origin_from_x11 = true;
+#endif
+	if (origin_from_x11 && !vk_x11_present_origin_is_panel_native(c)) {
+		return; // display-scoped weaving; the DP's origin stays (0,0)
+	}
+#endif
+
 	xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)c->display_processor,
 	                                            ox, oy);
 }
