@@ -93,7 +93,21 @@ struct xrt_plugin_display_info
 
 	/*! Vendor-recommended per-view scaling. 1.0 means "render at the
 	 *  native panel resolution per view"; <1.0 means downscale. The
-	 *  compositor reads this into `xrt_system_compositor_info::recommended_view_scale_*`. */
+	 *  compositor reads this into `xrt_system_compositor_info::recommended_view_scale_*`.
+	 *
+	 *  **The rule:** `xrt_rendering_mode::view_scale_x/y` is the single source
+	 *  of truth for view, tile and atlas sizing; this scalar is only a baseline
+	 *  hint, so set it to 0 (the runtime then derives it from the mode table)
+	 *  or to a value DERIVED FROM THE SAME NUMBERS as the active 3D mode's
+	 *  scale — never to a second, independently computed figure.
+	 *
+	 *  Why it matters: the mode table sizes per-mode view dims, the worst-case
+	 *  atlas and the compositor's tile grid, while this scalar sizes
+	 *  `XrViewConfigurationView.recommended*`. If they disagree, an app is sized
+	 *  per view from one number and tiled from the other, and a scalar larger
+	 *  than the mode's scale declares an atlas too small to hold the real tiles.
+	 *  The runtime also overwrites this scalar from the mode table on every
+	 *  rendering-mode change, so a disagreeing value does not even survive. */
 	float recommended_view_scale_x;
 	float recommended_view_scale_y;
 
