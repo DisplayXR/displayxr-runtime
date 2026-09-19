@@ -537,6 +537,15 @@ struct comp_vk_native_compositor
 	int last_present_origin_y;
 	bool have_last_present_origin;
 
+	//! Last CLIENT-AREA size seen by @ref vk_update_present_origin, in panel
+	//! pixels. Cached rather than re-queried because @ref vk_dp_canvas_rect
+	//! runs immediately after that call on every weave and must add no window-
+	//! system round trip of its own (an X11 `get_window_metrics` already costs
+	//! a `xcb_get_geometry` + `xcb_translate_coordinates` per frame).
+	uint32_t last_window_px_w;
+	uint32_t last_window_px_h;
+	bool have_last_window_size;
+
 #ifdef XRT_OS_ANDROID
 	//! Last window-rect generation (android_globals) already handed to the DP
 	//! / already logged, so the per-window rect feed and its Kooima line stay
@@ -3870,12 +3879,40 @@ static struct vk_frame_timing s_ftiming = {0};
  * The canvas sub-rect this compositor hands `xrt_display_processor_process_atlas`,
  * window-relative — the ONE place that answers "what region will the DP write".
  *
- * In-process the answer is always the degenerate rect, i.e. "fill the whole
- * target". A zones frame is not an exception: each zone rect is its own canvas
- * and drives the lens mask, while the weave output rect stays the full client
- * window (same rule `vk_effective_canvas` encodes for the view dims). The
- * out-of-process `comp_multi` path differs — it passes the frame's zone-3D rect
- * down and the DP confines the weave to it.
+ * Units, because this is the parameter people get wrong: the offset is in the
+ * DP TARGET's own pixels (`xrt_display_processor::process_atlas` doc: "canvas
+ * left edge in window client-area pixels"), NOT panel-relative. The window's
+ * position on the panel is a separate feed — `set_present_origin` /
+ * `set_window_screen_rect` — and the DP ADDS the two (`phase = present_origin +
+ * canvas_offset`, see xrt_display_processor_vk.h and
+ * `comp_bg2d_backdrop_source_rect`). Putting the panel origin here would
+ * double-count it in the weave phase.
+ *
+ * So the offset is always (0,0): one compositor instance weaves one window, and
+ * a zones frame is not an exception (each zone rect is its own canvas and drives
+ * the lens mask, while the weave output rect stays the full client window — the
+ * same rule `vk_effective_canvas` encodes for the view dims). The out-of-process
+ * `comp_multi` path differs: it passes the frame's zone-3D rect down and the DP
+ * confines the weave to it.
+ *
+ * The SIZE, though, used to be a hardcoded 0 as well, and that was a real hole.
+ * A zero extent is the ABI's "fills the full target" sentinel, which is true
+ * only while the target IS the window. On the shared-texture path it is not: the
+ * shared image is worst-case display-sized (ADR-010) while the app blits back
+ * only its client rect, so "fill the target" told the DP to weave across a region
+ * the app never shows. Nobody noticed because the two in-tree DPs that see this
+ * value both discard it — sim_display ignores the canvas entirely, and the
+ * Windows shared-texture path had the vendor weaver deriving geometry from the
+ * HWND instead — and the one instrument that would have shown it, the
+ * `SIM_DISPLAY_STRICT_PANEL` audit, prints exactly what it is handed: `canvas
+ * offset (0,0) size 0x0` on every vk_native frame, panel-sized or windowed.
+ *
+ * Reporting the real client size costs nothing (it is cached by
+ * @ref vk_update_present_origin, which every weave site already calls one line
+ * earlier) and is a no-op wherever target == window, because an explicit
+ * full-target rect and the zero sentinel mean the same thing to every consumer
+ * — including `comp_bg2d_backdrop_source_rect`, whose degenerate branch and
+ * arithmetic branch agree exactly in that case.
  *
  * It exists as a function, and is read by the `process_atlas` call sites rather
  * than open-coded there, because the compose-under backdrop must be cut to
@@ -3885,8 +3922,32 @@ static struct vk_frame_timing s_ftiming = {0};
 static struct xrt_rect
 vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 {
-	(void)c;
-	return (struct xrt_rect){0};
+	struct xrt_rect r = {0};
+	if (c == NULL || !c->have_last_window_size) {
+		// No live window metrics (headless, or a DP that reports no display
+		// info): the zero sentinel is the honest answer — "whatever the
+		// target is". Byte-for-byte the pre-fix behaviour.
+		return r;
+	}
+	r.extent.w = (int)c->last_window_px_w;
+	r.extent.h = (int)c->last_window_px_h;
+
+	// Clamp to the live swapchain target. A window that has just grown reports
+	// its new client size here one or more frames before the swapchain is
+	// recreated at that size, and a canvas larger than the framebuffer is not a
+	// rect any weaver can honour. No clamp when there is no swapchain target
+	// (shared-texture mode), where the client rect IS the answer.
+	if (c->target != NULL) {
+		uint32_t tw = 0, th = 0;
+		comp_vk_native_target_get_dimensions(c->target, &tw, &th);
+		if (tw > 0 && r.extent.w > (int)tw) {
+			r.extent.w = (int)tw;
+		}
+		if (th > 0 && r.extent.h > (int)th) {
+			r.extent.h = (int)th;
+		}
+	}
+	return r;
 }
 
 /*!
@@ -9604,6 +9665,17 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		// display-scoped (its present origin defaults to (0,0)).
 		return;
 	}
+	// Cache the client-area SIZE from this metrics read, so vk_dp_canvas_rect()
+	// can report the real canvas without a second window-system round trip (it
+	// runs a few lines later on every weave). Done BEFORE any phase gate below,
+	// because the canvas is geometry inside the target and has nothing to do
+	// with whether the ORIGIN is expressed in trustworthy units.
+	if (m.window_pixel_width > 0 && m.window_pixel_height > 0) {
+		c->last_window_px_w = m.window_pixel_width;
+		c->last_window_px_h = m.window_pixel_height;
+		c->have_last_window_size = true;
+	}
+
 	const int ox = m.window_screen_left - m.display_screen_left;
 	const int oy = m.window_screen_top - m.display_screen_top;
 	// Origin changed ⟹ the window is being dragged: have the target clamp
