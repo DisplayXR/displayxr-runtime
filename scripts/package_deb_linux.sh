@@ -146,7 +146,10 @@ compute_depends() {
     local sonames pkgs="" so pkg
     sonames="$(objdump -p "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO" 2>/dev/null \
                 | awk '/NEEDED/{print $2}' | sort -u)"
-    [ -n "$sonames" ] || { echo "libc6, libcjson1, libvulkan1, libx11-6, libx11-xcb1, libxcb1, libxcb-randr0"; return; }
+    # (libdbus-1-3: the #817 Wayland window-geometry provider. NOT
+    # libwayland-client0 — no wl_* symbol is referenced, so --as-needed drops
+    # -lwayland-client and libwayland-dev is a build-time-only dependency.)
+    [ -n "$sonames" ] || { echo "libc6, libcjson1, libvulkan1, libx11-6, libx11-xcb1, libxcb1, libxcb-randr0, libdbus-1-3"; return; }
     for so in $sonames; do
         # Resolve the soname to its owning package via dpkg's file DB. Search by
         # BARE soname (no leading '/': a leading slash makes dpkg-query treat it

@@ -41,11 +41,15 @@ if [ "$REBUILD_IMAGE" = 1 ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; 
     docker build -t "$IMAGE" -f - "$ROOT" <<'DOCKERFILE'
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
+# libwayland-dev + libdbus-1-dev must match the Deb job in build-linux.yml —
+# without them this image would build a Wayland-less .deb and the acceptance
+# test would not be testing the artifact CI ships.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake ninja-build pkg-config git ca-certificates \
         binutils dpkg-dev fakeroot \
         libvulkan-dev glslang-tools libeigen3-dev libcjson-dev \
         libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev \
+        libwayland-dev libdbus-1-dev \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 fi
