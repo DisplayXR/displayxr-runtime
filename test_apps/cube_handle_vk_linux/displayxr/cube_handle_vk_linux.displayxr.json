@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "name": "Cube Handle VK Linux",
+  "id": "cube-handle-vk-linux",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "Handle-class Vulkan spinning cube on desktop Linux. One binary, two app-owned window backends picked at runtime (--backend=x11|wayland|auto): X11 via XR_DXR_xlib_window_binding, or a native Wayland xdg toplevel via XR_DXR_wayland_surface_binding (fullscreen-only).",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}
