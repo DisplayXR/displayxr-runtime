@@ -225,6 +225,13 @@ plugin_warn_exclusive_miss(const char *const *ids, int n)
 			return;
 		}
 	}
+	/* Once per process: discovery also runs on the mid-install refresh
+	 * (#342), which a service hits on every compositor create. */
+	static bool s_warned = false;
+	if (s_warned) {
+		return;
+	}
+	s_warned = true;
 
 	char list[512];
 	size_t used = 0;
