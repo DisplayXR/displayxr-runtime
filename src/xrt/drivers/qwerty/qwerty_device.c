@@ -706,6 +706,13 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 		free(qs);
 		return NULL;
 	}
+	// #1538: leaf lock for the platform input front-end state. See the
+	// LOCK ORDER note on struct qwerty_system.
+	if (os_mutex_init(&qs->input_lock) != 0) {
+		os_mutex_destroy(&qs->view_lock);
+		free(qs);
+		return NULL;
+	}
 	qs->hmd = qhmd;
 	qs->lctrl = qleft;
 	qs->rctrl = qright;
@@ -795,6 +802,7 @@ qwerty_system_destroy(struct qwerty_system *qs)
 		return;
 	}
 	u_var_remove_root(qs);
+	os_mutex_destroy(&qs->input_lock);
 	os_mutex_destroy(&qs->view_lock);
 	free(qs);
 }

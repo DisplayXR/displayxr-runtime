@@ -46,7 +46,13 @@ find_qwerty_system(struct xrt_device **xdevs, size_t xdev_count)
 {
 	struct xrt_device *xdev = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		// Guard tracking_origin (#59, ported from the macOS front-end): an
+		// out-of-process content client's xdevs are IPC proxies that may have no
+		// tracking origin, and during session exit they can be partially torn
+		// down while this is still pumped — derefing tracking_origin->name then
+		// crashes. This resolver now runs on every message (#1538), so the guard
+		// is load-bearing here too.
+		if (xdevs[i] == NULL || xdevs[i]->tracking_origin == NULL) {
 			continue;
 		}
 		// Check against tracker name to find qwerty devices
@@ -147,38 +153,97 @@ qwerty_process_win32(struct xrt_device **xdevs,
                      long long lParam,
                      bool *out_handled)
 {
-	// Cached state (persists across calls)
-	static struct qwerty_system *qsys = NULL;
-	static bool ctrl_pressed = false;  // CTRL = left controller focus
-	static bool alt_pressed = false;   // ALT = right controller focus
-	static struct qwerty_device *default_qdev = NULL;
-	static struct qwerty_controller *default_qctrl = NULL;
-	static bool cached = false;
-	static bool mouse_look_active = false;
-	static POINT last_mouse_pos = {0, 0};
-	static bool lmb_was_down = false; // Tracks LMB state from wParam (touchpad fallback)
-	static bool mmb_was_down = false; // Tracks MMB state from wParam (touchpad fallback)
-
 	// Default: not handled
 	if (out_handled != NULL) {
 		*out_handled = false;
 	}
 
-	// Initialize cache on first call
-	if (!cached) {
-		qsys = find_qwerty_system(xdevs, xdev_count);
-		if (qsys == NULL) {
-			return; // No qwerty devices found
-		}
-		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
-		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		cached = true;
-		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, RMB+drag look, F/G controller focus");
+	// #1538: resolve the qwerty system from the xdevs the CALLER handed us, on
+	// every call.
+	//
+	// INVARIANT: the caller owns the @p xdevs array it passes and keeps it alive
+	// for the duration of this call. Every call site is a window thread passing
+	// its own window's xsysd, and comp_d3d11_window_destroy joins that thread
+	// before the system devices are freed. Do NOT call this with an array you do
+	// not own.
+	//
+	// This used to be a one-time cache behind a `cached` flag that was never
+	// reset. A qwerty_system belongs to ONE xrt_system_devices and is free()d
+	// with it (qwerty_system_destroy), so a process that builds several
+	// instances in sequence — every OpenXR CTS run does, 46-59 of them in one
+	// conformance_cli process — dereferenced the first one's freed system
+	// forever: the nondeterministic ACCESS_VIOLATION in #1538.
+	struct qwerty_system *qsys = find_qwerty_system(xdevs, xdev_count);
+	if (qsys == NULL) {
+		return; // No qwerty devices in this device list.
 	}
 
-	if (qsys == NULL || !qsys->process_keys) {
+	// The latched front-end state lives in the system (see struct qwerty_system
+	// § "Platform input front-end state"), so it cannot outlive the devices it
+	// points at and is not shared across instances. input_lock is a LEAF: load a
+	// snapshot here, work on the locals below — every qwerty_press_* /
+	// qwerty_release_* / view helper takes its own lock and must be called with
+	// input_lock released — and store back before each exit.
+	struct qwerty_device *default_qdev = NULL;
+	struct qwerty_controller *default_qctrl = NULL;
+	bool ctrl_pressed = false; // CTRL = left controller focus
+	bool alt_pressed = false;  // ALT = right controller focus
+	bool mouse_look_active = false;
+	POINT last_mouse_pos = {0, 0};
+	bool lmb_was_down = false; // Tracks LMB state from wParam (touchpad fallback)
+	bool mmb_was_down = false; // Tracks MMB state from wParam (touchpad fallback)
+	bool first_bind = false;
+
+	os_mutex_lock(&qsys->input_lock);
+	if (!qsys->input_bound) {
+		// First message for this system: resolve the defaults once. They are
+		// immutable for the rest of the system's life, so no later call can
+		// observe a torn pointer even with several window threads active.
+		qsys->input_default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
+		qsys->input_default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
+		POINT p = {0, 0};
+		GetCursorPos(&p);
+		qsys->input_last_mouse_x = (float)p.x;
+		qsys->input_last_mouse_y = (float)p.y;
+		qsys->input_bound = true;
+		first_bind = true;
+	}
+	bool process_keys = qsys->process_keys;
+	default_qdev = qsys->input_default_qdev;
+	default_qctrl = qsys->input_default_qctrl;
+	ctrl_pressed = qsys->input_ctrl_pressed;
+	alt_pressed = qsys->input_alt_pressed;
+	mouse_look_active = qsys->input_mouse_look_active;
+	last_mouse_pos.x = (LONG)qsys->input_last_mouse_x;
+	last_mouse_pos.y = (LONG)qsys->input_last_mouse_y;
+	lmb_was_down = qsys->input_lmb_was_down;
+	mmb_was_down = qsys->input_mmb_was_down;
+	os_mutex_unlock(&qsys->input_lock);
+
+	if (first_bind) {
+		U_LOG_W(
+		    "QWERTY Win32 input bound to qwerty system %p - WASDQE move, RMB+drag look, "
+		    "F/G controller focus",
+		    (void *)qsys);
+	}
+
+	if (!process_keys) {
 		return;
 	}
+
+// Store the snapshot back. Must run before every exit from here on.
+#define QW32_STORE_STATE()                                                                                             \
+	do {                                                                                                           \
+		os_mutex_lock(&qsys->input_lock);                                                                      \
+		qsys->input_ctrl_pressed = ctrl_pressed;                                                               \
+		qsys->input_alt_pressed = alt_pressed;                                                                 \
+		qsys->input_mouse_look_active = mouse_look_active;                                                     \
+		qsys->input_last_mouse_x = (float)last_mouse_pos.x;                                                    \
+		qsys->input_last_mouse_y = (float)last_mouse_pos.y;                                                    \
+		qsys->input_lmb_was_down = lmb_was_down;                                                               \
+		qsys->input_mmb_was_down = mmb_was_down;                                                               \
+		os_mutex_unlock(&qsys->input_lock);                                                                    \
+	} while (0)
 
 	// Get device views
 	struct qwerty_controller *qleft = qsys->lctrl;
@@ -226,6 +291,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		ctrl_pressed = false;
 		alt_pressed = false;
 		GetCursorPos(&last_mouse_pos);
+		QW32_STORE_STATE();
 		return;
 	}
 	if (message == WM_SETFOCUS) {
@@ -244,6 +310,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			alt_pressed = alt_now;
 		}
 		GetCursorPos(&last_mouse_pos);
+		QW32_STORE_STATE();
 		return;
 	}
 
@@ -740,4 +807,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	default:
 		break;
 	}
+
+	QW32_STORE_STATE();
+#undef QW32_STORE_STATE
 }

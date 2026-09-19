@@ -112,31 +112,68 @@ qwerty_process_macos(struct xrt_device **xdevs,
 {
 	NSEvent *event = (__bridge NSEvent *)ns_event_ptr;
 
-	// Cached state (persists across calls)
-	static struct qwerty_system *qsys = NULL;
-	static bool ctrl_pressed = false;  // CTRL = left controller focus
-	static bool alt_pressed = false;   // ALT/Option = right controller focus
-	static struct qwerty_device *default_qdev = NULL;
-	static struct qwerty_controller *default_qctrl = NULL;
-	static bool cached = false;
-	static bool mouse_look_active = false;
-	static NSPoint last_mouse_pos = {0, 0};
-
-	// Initialize cache on first call
-	if (!cached) {
-		qsys = find_qwerty_system(xdevs, xdev_count);
-		if (qsys == NULL) {
-			return; // No qwerty devices found
-		}
-		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
-		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
-		cached = true;
-		U_LOG_W("QWERTY macOS input initialized - WASDQE move, RMB+drag look, F/G controller focus");
+	// #1538: resolve from the caller's xdevs every call rather than caching once
+	// behind a flag that is never reset.
+	//
+	// INVARIANT: the caller owns the @p xdevs array it passes and keeps it alive
+	// for the duration of this call.
+	//
+	// A qwerty_system belongs to ONE xrt_system_devices and is free()d with it
+	// at xrDestroyInstance, so a process that builds several instances in
+	// sequence (the OpenXR CTS builds dozens) otherwise dereferences the first
+	// one's freed system forever.
+	struct qwerty_system *qsys = find_qwerty_system(xdevs, xdev_count);
+	if (qsys == NULL) {
+		return; // No qwerty devices in this device list.
 	}
 
-	if (qsys == NULL || !qsys->process_keys) {
+	// Latched front-end state lives in the system (see struct qwerty_system
+	// § "Platform input front-end state"). input_lock is a LEAF: snapshot here,
+	// work on the locals below with it released — every qwerty_press_* /
+	// qwerty_release_* / view helper takes its own lock — then store back.
+	bool first_bind = false;
+	os_mutex_lock(&qsys->input_lock);
+	if (!qsys->input_bound) {
+		// Resolved once per system; immutable afterwards, so no later call can
+		// observe a torn pointer.
+		qsys->input_default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
+		qsys->input_default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
+		NSPoint p = [NSEvent mouseLocation];
+		qsys->input_last_mouse_x = (float)p.x;
+		qsys->input_last_mouse_y = (float)p.y;
+		qsys->input_bound = true;
+		first_bind = true;
+	}
+	bool process_keys = qsys->process_keys;
+	struct qwerty_device *default_qdev = qsys->input_default_qdev;
+	struct qwerty_controller *default_qctrl = qsys->input_default_qctrl;
+	bool ctrl_pressed = qsys->input_ctrl_pressed; // CTRL = left controller focus
+	bool alt_pressed = qsys->input_alt_pressed;   // ALT/Option = right controller focus
+	bool mouse_look_active = qsys->input_mouse_look_active;
+	NSPoint last_mouse_pos = NSMakePoint(qsys->input_last_mouse_x, qsys->input_last_mouse_y);
+	os_mutex_unlock(&qsys->input_lock);
+
+	if (first_bind) {
+		U_LOG_W("QWERTY macOS input bound to qwerty system %p - WASDQE move, RMB+drag look, "
+		        "F/G controller focus",
+		        (void *)qsys);
+	}
+
+	if (!process_keys) {
 		return;
 	}
+
+// Store the snapshot back. Must run before every exit from here on.
+#define QMAC_STORE_STATE()                                                                                             \
+	do {                                                                                                           \
+		os_mutex_lock(&qsys->input_lock);                                                                      \
+		qsys->input_ctrl_pressed = ctrl_pressed;                                                               \
+		qsys->input_alt_pressed = alt_pressed;                                                                 \
+		qsys->input_mouse_look_active = mouse_look_active;                                                     \
+		qsys->input_last_mouse_x = (float)last_mouse_pos.x;                                                    \
+		qsys->input_last_mouse_y = (float)last_mouse_pos.y;                                                    \
+		os_mutex_unlock(&qsys->input_lock);                                                                    \
+	} while (0)
 
 	struct qwerty_controller *qleft = qsys->lctrl;
 	struct qwerty_device *qd_left = &qleft->base;
@@ -212,6 +249,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			qsys->rctrl_focused = alt_pressed;
 			qsys->hmd_focused = (!ctrl_pressed && !alt_pressed && targets[0] == qd_hmd);
 		}
+		QMAC_STORE_STATE();
 		return; // Modifier change consumed
 	}
 
@@ -538,4 +576,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 	default:
 		break;
 	}
+
+	QMAC_STORE_STATE();
+#undef QMAC_STORE_STATE
 }
