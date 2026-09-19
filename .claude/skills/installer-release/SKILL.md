@@ -278,8 +278,24 @@ if [ "$SIGNED" = yes ]; then
     # published (bit v2.0.15 for real). Test the path / use find instead.
     SIGNED_EXE="$D/signed/$EXE"; [ -f "$SIGNED_EXE" ] || SIGNED_EXE=$(find "$D/out" -type f -name "$EXE" 2>/dev/null | head -1)
     if [ -n "$SIGNED_EXE" ]; then
-      gh release upload "$TAG" "$SIGNED_EXE" --clobber -R DisplayXR/displayxr-installer
-      echo "Bundle .exe signed on the provider runner and re-uploaded."
+      # `--clobber` DELETES the CI asset first, then uploads. On a flaky link the delete
+      # succeeds and the 60 MB upload dies (TLS timeout) — the release is then .exe-LESS
+      # (bundle v2.3.11, 2026-09-19, twice). So: retry with backoff, PROVE by size, and
+      # if it still fails put the unsigned CI copy back so users are never left with nothing.
+      WANT=$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")
+      for i in 1 2 3 4 5; do
+        gh release upload "$TAG" "$SIGNED_EXE" --clobber -R DisplayXR/displayxr-installer && sleep 5
+        GOT=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
+               --jq ".assets[] | select(.name==\"$EXE\") | .size" 2>/dev/null)
+        [ "$GOT" = "$WANT" ] && break; echo "upload attempt $i: on release=${GOT:-none} want=$WANT"; sleep $((i*15))
+      done
+      if [ "$GOT" = "$WANT" ]; then
+        echo "Bundle .exe signed on the provider runner and re-uploaded (size-verified)."
+      else
+        echo "ERROR: signed upload failed after 5 attempts — restoring the UNSIGNED CI asset so the release is not .exe-less"
+        gh release upload "$TAG" "$D/in/$EXE" --clobber -R DisplayXR/displayxr-installer || echo "ERROR: restore failed too — release has NO .exe; re-run Phase 4.5 by hand from $D"
+        SIGNED=no
+      fi
     else
       echo "⚠ signed .exe not returned — leaving the unsigned CI bundle."; SIGNED=no
     fi
