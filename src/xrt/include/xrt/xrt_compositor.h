@@ -1957,6 +1957,33 @@ xrt_comp_layer_quad(struct xrt_compositor *xc,
 }
 
 /*!
+ * Guard for an optional layer slot (#1544).
+ *
+ * A KHR composition-layer extension is advertised instance-wide whenever its
+ * XRT_FEATURE_OPENXR_LAYER_* option is on (cylinder and equirect2 are ON by
+ * default), yet not every backend wires the matching slot — the GL lane did
+ * not. A NULL slot must fail the layer, not the process: calling through a NULL
+ * function pointer kills the app inside xrEndFrame, returning an error does not.
+ *
+ * Silent by design: include/xrt has no logger — it must not include the
+ * auxiliary u_logging.h (same reason as the note in xrt_defines.h). The
+ * one-shot diagnostic lives at the call site, in oxr_session_frame_end.c.
+ *
+ * @note oxr_session_frame_end.c wraps these helpers in OXR_CHECK_XRET, which
+ * maps any non-IPC xrt_result_t error to XR_ERROR_RUNTIME_FAILURE. That is
+ * accepted for this belt — the primary fix wires the four GL slots, so this
+ * guard never fires on the GL lane.
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_COMP_REQUIRE_LAYER_SLOT(XC, SLOT)                                                                          \
+	do {                                                                                                           \
+		if ((XC)->SLOT == NULL) {                                                                              \
+			return XRT_ERROR_NOT_IMPLEMENTED;                                                              \
+		}                                                                                                      \
+	} while (false)
+
+/*!
  * @copydoc xrt_compositor::layer_cube
  *
  * Helper for calling through the function pointer.
@@ -1969,6 +1996,8 @@ xrt_comp_layer_cube(struct xrt_compositor *xc,
                     struct xrt_swapchain *xsc,
                     const struct xrt_layer_data *data)
 {
+	XRT_COMP_REQUIRE_LAYER_SLOT(xc, layer_cube);
+
 	return xc->layer_cube(xc, xdev, xsc, data);
 }
 
@@ -1985,6 +2014,8 @@ xrt_comp_layer_cylinder(struct xrt_compositor *xc,
                         struct xrt_swapchain *xsc,
                         const struct xrt_layer_data *data)
 {
+	XRT_COMP_REQUIRE_LAYER_SLOT(xc, layer_cylinder);
+
 	return xc->layer_cylinder(xc, xdev, xsc, data);
 }
 
@@ -2002,6 +2033,8 @@ xrt_comp_layer_equirect1(struct xrt_compositor *xc,
                          struct xrt_swapchain *xsc,
                          const struct xrt_layer_data *data)
 {
+	XRT_COMP_REQUIRE_LAYER_SLOT(xc, layer_equirect1);
+
 	return xc->layer_equirect1(xc, xdev, xsc, data);
 }
 
@@ -2018,6 +2051,8 @@ xrt_comp_layer_equirect2(struct xrt_compositor *xc,
                          struct xrt_swapchain *xsc,
                          const struct xrt_layer_data *data)
 {
+	XRT_COMP_REQUIRE_LAYER_SLOT(xc, layer_equirect2);
+
 	return xc->layer_equirect2(xc, xdev, xsc, data);
 }
 
@@ -2031,6 +2066,8 @@ xrt_comp_layer_equirect2(struct xrt_compositor *xc,
 static inline xrt_result_t
 xrt_comp_layer_passthrough(struct xrt_compositor *xc, struct xrt_device *xdev, const struct xrt_layer_data *data)
 {
+	XRT_COMP_REQUIRE_LAYER_SLOT(xc, layer_passthrough);
+
 	return xc->layer_passthrough(xc, xdev, data);
 }
 
