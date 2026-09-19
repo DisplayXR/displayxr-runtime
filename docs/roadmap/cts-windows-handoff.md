@@ -45,38 +45,82 @@ runs on today:
 | `d3d11` | GitHub-hosted `windows-2022`, **WARP** (D3D software rasterizer, always present in the image) | **yes** | — |
 | `d3d12` | GitHub-hosted `windows-2022`, **WARP** | **yes** | — |
 | `opengl` | GitHub-hosted `windows-2022`, Mesa **llvmpipe** (provisioned — the image's own GL is GDI generic 1.1) | **yes** (#1523) | — · one software-tier quarantine entry, below |
-| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | not yet — `continue-on-error`, reported only | none known: `vkCreateDevice` (#1539) and the `SessionState` SIGSEGV (#1542 / #1550) are both fixed. Awaiting a full run to earn the flip |
-| `vulkan2` | same as `vulkan` | not yet — `continue-on-error`, reported only | same as `vulkan` |
+| `vulkan` | GitHub-hosted `windows-2022`, Mesa **lavapipe** (provisioned — the image ships no Vulkan ICD) | **yes** (#1523) | — |
+| `vulkan2` | same as `vulkan` | **yes** (#1523) | — |
 | Linux `vulkan` / `vulkan2` | **real GPU** (hardware-validated on NVIDIA / Ubuntu 22.04) — no runner yet | not in CI | #1523 part 2 |
 | Android `vulkan` / `vulkan2` | **real device** — no runner yet | not in CI | #1523 part 2, #1212 |
 
-The remaining experimental Windows arms are driven by **one flag**: the
-`EXPERIMENTAL="vulkan vulkan2"` line in `cts.yml`'s `plan` job. It sets each
-arm's `continue-on-error` and tells the `summary` job which arms to exclude from
-the gate. Removing a name from that string is all it takes to make the arm gate;
-nothing else in the file changes.
+**All five Windows arms gate on the hosted lane** — `d3d11`/`d3d12` on WARP,
+`opengl` on Mesa llvmpipe, `vulkan`/`vulkan2` on Mesa lavapipe. A red arm fails
+the lane; no arm is exempt.
 
-**`opengl` graduated (#1523).** #1525 provisioned llvmpipe, and once #1540
-(qwerty use-after-free at instance teardown) and #1549 (`comp_gl` NULL layer
-slots) landed, the full non-interactive GL suite ran to completion on llvmpipe
-for the first time — [run 35433846568][gl-run]: **27515 assertions, 1 failure,
-0 errors, 42 skipped**. The lone failure is `Timed_Pipelined_Frame_Submission`
-(`REQUIRE( timingResults.GetOverheadFactor() < 0.5 )`, expansion
-`1.08553478400000003 < 0.5` — an *Overhead score : 108.6%* against the CTS's
-hard 50% cap). That is a CPU rasterizer on a 2-vCPU runner missing a frame
-budget predicted as if a GPU were scanning out; the same arm on a real GPU has
-no unexpected failures. So it is quarantined **by name, on the software tier
-only**, and `opengl` gates on everything else. The earlier "dies at session
-teardown (#1522)" reading is fixed and stale — do not cite it.
+The exemption mechanism still exists and is deliberately kept: the
+`EXPERIMENTAL=""` line in `cts.yml`'s `plan` job. Putting an arm's name back in
+that string sets its `continue-on-error` and tells the `summary` job to leave it
+out of the gate — nothing else in the file changes. Prefer that to deleting an
+arm if one ever regresses beyond a quick fix: a reported-but-ungated arm still
+produces numbers every run, and a deleted arm produces silence. Record the
+reason here when you do.
 
-The one cost, stated where it can be found: the `Report frame-timing metrics`
-step scrapes that test's printed overhead to trend runner frame timing (#589),
-so on the software tier it now prints `No Timed_Pipelined_Frame_Submission
-metrics in console log` instead of a percentage. Any tier that does not pass
-the quarantine list — the PR lane's WARP arms, the real-GPU tier (#1526) —
-still gets the number.
+### Evidence — what earned each flip
+
+Gating is earned by a **run**, never by "no known blocker". Each arm needed the
+software ICD from #1525 plus real runtime fixes:
+
+| Arm | Runtime fixes it needed | Flip evidence |
+|---|---|---|
+| `d3d11`, `d3d12` | — (WARP is in the image) | gated from the start |
+| `opengl` | #1540 (qwerty use-after-free at instance teardown), #1549 (`comp_gl` NULL layer slots) | [run 35433846568][gl-run] — first full GL suite to completion on llvmpipe: 27515 assertions, **1 failure**, 0 errors, 42 skipped. That one failure is the quarantine entry below. |
+| `vulkan`, `vulkan2` | #1539 (Win32 external memory/semaphore/fence trio made optional-if-present → past `vkCreateDevice`), #1550 (the #1542 `SessionState` SIGSEGV), #1560 (#1558 — map every swapchain usage bit through `vk_csci_get_image_usage_flags`) | [run 35458623141][all-run] below |
+
+**The all-arm zero-red run.** `graphics=all scope=full software_gfx=on`,
+[run 35458623141][all-run], on `f39d6bc63` (the #1560 branch tip; squash-merged
+to `main` as `fc1cb421b`, same content):
+
+| Arm | assertions | failures | errors | skipped | status |
+|---|---:|---:|---:|---:|---|
+| `d3d11` | 38140 | 0 | 0 | 42 | PASS |
+| `d3d12` | 37942 | 0 | 0 | 42 | PASS |
+| `opengl` | 27511 | 0 | 0 | 42 | PASS |
+| `vulkan` | 40086 | 0 | 0 | 42 | PASS |
+| `vulkan2` | 40070 | 0 | 0 | 42 | PASS |
+
+Read the **assertion** column as the CTS reports it (`tests` in the JUnit XML).
+Subtracting `skipped` gives a number 42 lower per arm — a real quantity, but not
+the one the summary table prints, so quoting the two interchangeably will make
+two correct reports look like they disagree.
+
+**Caveat on that run, because it is easy to over-read.** `software_gfx=on` is an
+explicit override that forces `software: true` for **every** arm, so `d3d11` and
+`d3d12` were handed the software-tier quarantine list too and skipped
+`Timed_Pipelined_Frame_Submission` along with the rest. Their zero-red above is
+therefore *with* that test excluded. On `auto` — which is what the nightly, the
+tag lane and the PR lane use — the WARP arms get `software: false`, no quarantine
+list, and they do run it. The PR lane exercises exactly that and is green.
+
+**Real-GPU cross-check (win box, not CI).** Reported by the Windows box session
+against `main` `27260eaee` on an **RTX 3080**, full non-interactive suite:
+`vulkan` 40027 and `vulkan2` 40011 assertions, with only **two** reds, both the
+known layer-not-enabled case rather than runtime defects. Recorded here as
+**reported, not independently verified** — it came from a hand-run on hardware
+this lane cannot reach, there is no artefact URL to cite, and the numbers differ
+from the hosted lane's because the runs are not the same build. It is corroboration
+for #1526, not a substitute for it.
 
 [gl-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35433846568
+[all-run]: https://github.com/DisplayXR/displayxr-runtime/actions/runs/35458623141
+
+**The `opengl` quarantine entry, and its one cost.** The lone failure in the GL
+run above is `Timed_Pipelined_Frame_Submission`
+(`REQUIRE( timingResults.GetOverheadFactor() < 0.5 )`, expansion
+`1.08553478400000003 < 0.5` — an *Overhead score : 108.6%* against the CTS's hard
+50% cap): a CPU rasterizer on a 2-vCPU runner missing a frame budget predicted as
+if a GPU were scanning out. It is quarantined **by name, on the software tier
+only**. The cost is that `Report frame-timing metrics` scrapes that same test to
+trend runner frame timing (#589), so on the software tier it prints `No
+Timed_Pipelined_Frame_Submission metrics in console log` instead of a percentage;
+every tier that does not pass the quarantine list still gets the number.
+
 
 Beyond software rasterizers, **#1526** tracks a self-hosted Windows runner on a
 hybrid iGPU+dGPU box. A software-rasterized green is a real result but not a
@@ -93,8 +137,8 @@ Each arm writes `%TEMP%\cts_ci_<graphics>.xml` (ctsxml) plus
 Khronos submission package unmodified — one XML per graphics plugin, named after
 it. The `summary` job downloads every arm, prints one table (arm / tests /
 failures / errors / status) into the run summary, and **fails the lane if any
-non-experimental arm was red or produced no XML**. A single arm no longer gates
-alone.
+non-experimental arm was red or produced no XML** — which, with `EXPERIMENTAL`
+empty, means every arm. A single arm no longer gates alone.
 
 Triggers: PR → `smoke` / `d3d11` only (fast); nightly cron + `v*` tag → `full`
 over all five Windows arms; `workflow_dispatch` → any single plugin or `all`,
@@ -270,11 +314,13 @@ on the hosted lane, same build, kill switch as the only variable:
 | unset (default) | 418 | 1 | 0 | `Swapchains` **PASSES**; SIGSEGV in `SessionState/Cycle through all states` |
 
 So the next blocker on these arms was a **crash**, not an extension — the Vulkan
-sibling of the `opengl` SIGSEGV (#1522). That one is fixed too (#1542, by
-#1550), which leaves **no known blocker** on `vulkan`/`vulkan2`: they stay
-experimental only until a full run on `main` proves it, and they flip the same
-way `opengl` did — on evidence, in a change of its own. The real-GPU tier
-(#1526) remains the way to make these arms actually count.
+sibling of the `opengl` SIGSEGV (#1522), fixed as #1542 by #1550. One more
+followed it, #1558 (swapchain usage bits not mapped through
+`vk_csci_get_image_usage_flags`), fixed by #1560. With those three in,
+`vulkan`/`vulkan2` came back **zero-red on the full suite** and now **gate** —
+see the evidence table near the top of this document. The real-GPU tier (#1526)
+is still what makes these arms count for a submission: lavapipe green is a real
+result, not a submittable one.
 
 Note the null compositor keeps the trio **required** on purpose
 (`null_compositor.c`): it creates its own `VkDevice` and is the export side of
