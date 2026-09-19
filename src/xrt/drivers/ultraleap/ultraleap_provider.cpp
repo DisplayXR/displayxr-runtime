@@ -52,6 +52,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <mutex>
+
 
 /*
  *
@@ -65,6 +67,19 @@
 #define UL_GRIP 2
 #define UL_AIM 3
 #define UL_HAND_TRACKING 4
+
+/*!
+ * Live device slots on the ONE process-scoped hub (#1545).
+ *
+ * Before the hub outlived its devices, two slots were enough: a hub served
+ * exactly one XrInstance's left+right pair. A shared hub can be feeding
+ * several instances at once — the conformance `multithreading` case creates
+ * and destroys instances from several threads concurrently — so the slots
+ * hold every live device and the poll thread updates each one whose hand
+ * matches. Over-subscribing is survivable (the extra devices simply report
+ * untracked), so this is a generous bound, not a contract.
+ */
+#define UL_MAX_DEVICES 16
 
 // Pinch/grab hysteresis (LeapC strengths are 0..1).
 #define UL_PRESS_THRESHOLD 0.85f
@@ -206,9 +221,12 @@ struct ul_hub
 	 */
 	bool eager_reconnect;
 
-	struct ul_device *devices[2];
+	//! Every live device across every XrInstance sharing this hub.
+	//! Guarded by mutex; a NULL slot is free.
+	struct ul_device *devices[UL_MAX_DEVICES];
 
-	//! Live device count; the last xrt_device::destroy tears the hub down.
+	//! Live device count. Reaching 0 no longer tears the hub down — see
+	//! @ref g_ul_hub (#1545).
 	int device_refcount;
 };
 
@@ -439,50 +457,61 @@ ul_handle_tracking_event(struct ul_hub *hub, const LEAP_TRACKING_EVENT *ev, int6
 	for (uint32_t i = 0; i < ev->nHands; i++) {
 		const LEAP_HAND *hand = &ev->pHands[i];
 		int idx = hand->type == eLeapHandType_Left ? 0 : 1;
-		struct ul_device *dev = hub->devices[idx];
-		if (dev == NULL || seen[idx]) {
+		if (seen[idx]) {
 			continue;
 		}
 		seen[idx] = true;
 
-		// Pose → relation history (palm = grip/aim anchor).
-		struct xrt_space_relation rel = {};
-		rel.pose.position = ul_map_position(hub, hand->palm.position);
-		rel.pose.orientation = ul_map_orientation(hand->palm.orientation);
-		rel.relation_flags = ul_valid_flags;
-		m_relation_history_push(dev->history, &rel, ts);
-
-		// Buttons + joints under the lock.
+		// The slot is both READ and USED under the hub lock. The hub
+		// now outlives any one XrInstance's devices (#1545), so this
+		// thread runs while devices come and go; ul_device_destroy
+		// clears the slot under this same lock and only frees the
+		// device afterwards, which makes a pointer fetched outside the
+		// lock a use-after-free waiting to happen.
 		os_mutex_lock(&hub->mutex);
-		dev->tracked = true;
-		if (hand->pinch_strength > UL_PRESS_THRESHOLD) {
-			dev->btn_select = true;
-		} else if (hand->pinch_strength < UL_RELEASE_THRESHOLD) {
-			dev->btn_select = false;
+		for (int s = 0; s < UL_MAX_DEVICES; s++) {
+			struct ul_device *dev = hub->devices[s];
+			if (dev == NULL || dev->hand != idx) {
+				continue;
+			}
+
+			// Pose → relation history (palm = grip/aim anchor).
+			struct xrt_space_relation rel = {};
+			rel.pose.position = ul_map_position(hub, hand->palm.position);
+			rel.pose.orientation = ul_map_orientation(hand->palm.orientation);
+			rel.relation_flags = ul_valid_flags;
+			m_relation_history_push(dev->history, &rel, ts);
+
+			dev->tracked = true;
+			if (hand->pinch_strength > UL_PRESS_THRESHOLD) {
+				dev->btn_select = true;
+			} else if (hand->pinch_strength < UL_RELEASE_THRESHOLD) {
+				dev->btn_select = false;
+			}
+			if (hand->grab_strength > UL_PRESS_THRESHOLD) {
+				dev->btn_menu = true;
+			} else if (hand->grab_strength < UL_RELEASE_THRESHOLD) {
+				dev->btn_menu = false;
+			}
+			ul_process_hand(hub, hand, &dev->joint_set);
 		}
-		if (hand->grab_strength > UL_PRESS_THRESHOLD) {
-			dev->btn_menu = true;
-		} else if (hand->grab_strength < UL_RELEASE_THRESHOLD) {
-			dev->btn_menu = false;
-		}
-		ul_process_hand(hub, hand, &dev->joint_set);
 		os_mutex_unlock(&hub->mutex);
 	}
 
 	// A hand that vanished from the frame goes untracked (inputs
 	// deactivate; the pose history keeps predicting briefly, which is
 	// the desired coast-out).
-	for (int idx = 0; idx < 2; idx++) {
-		struct ul_device *dev = hub->devices[idx];
-		if (dev == NULL || seen[idx]) {
+	os_mutex_lock(&hub->mutex);
+	for (int s = 0; s < UL_MAX_DEVICES; s++) {
+		struct ul_device *dev = hub->devices[s];
+		if (dev == NULL || seen[dev->hand]) {
 			continue;
 		}
-		os_mutex_lock(&hub->mutex);
 		dev->tracked = false;
 		dev->btn_select = false;
 		dev->btn_menu = false;
-		os_mutex_unlock(&hub->mutex);
 	}
+	os_mutex_unlock(&hub->mutex);
 }
 
 static bool
@@ -502,8 +531,8 @@ static void
 ul_set_all_untracked(struct ul_hub *hub)
 {
 	os_mutex_lock(&hub->mutex);
-	for (int idx = 0; idx < 2; idx++) {
-		struct ul_device *dev = hub->devices[idx];
+	for (int s = 0; s < UL_MAX_DEVICES; s++) {
+		struct ul_device *dev = hub->devices[s];
 		if (dev != NULL) {
 			dev->tracked = false;
 			dev->btn_select = false;
@@ -726,6 +755,70 @@ ul_poll_thread(void *ptr)
  *
  */
 
+/*!
+ * THE hub — one per process (#1545).
+ *
+ * The LeapC connection and the ~10 threads LeapC spawns behind it are the
+ * expensive, long-lived half of this provider; the two `xrt_device`s in
+ * front of them are cheap and belong to one XrInstance's system devices.
+ * The hub used to be refcounted onto the devices ALONE, so every
+ * `xrCreateInstance` / `xrDestroyInstance` pair created and destroyed a
+ * LeapC connection — 547 of them in the conformance run of #1545, each one
+ * a fresh thread-pool spin-up racing everything else in the process. (The
+ * fault landed in an NVIDIA GL ICD worker published mid-spin-up, not in
+ * DisplayXR code; the churn is what kept handing it the chance.)
+ *
+ * So the hub now outlives the devices: created on the first
+ * `create_devices`, retained across every later teardown, reused by the
+ * next instance. Nothing is kept busy meanwhile — the #941 idle watchdog
+ * already closes the LeapC connection once nothing polls it and reopens it
+ * on the next device's first activity mark, so a resident hub with no
+ * devices costs one sleeping poll thread and no tracking-service client.
+ *
+ * Deliberately NOT torn down at process exit. The only hooks available are
+ * `atexit` / DLL detach, which on Windows run AFTER every other thread has
+ * been terminated — joining the poll thread or calling into LeapC there is
+ * how you acquire an exit hang, not how you avoid one. The provider DLL is
+ * never unloaded either, for the same reason the DP loader leaks its
+ * handles (`target_input_plugin_loader.h`).
+ *
+ * `DXR_ULTRALEAP_PERSIST_HUB=0` restores the pre-#1545 per-instance
+ * teardown, for bisecting.
+ */
+static struct ul_hub *g_ul_hub = NULL;
+
+/*!
+ * Guards @ref g_ul_hub and the create/destroy transitions around it.
+ *
+ * A function-local static so its own initialisation is race-free without
+ * `<stdatomic.h>` (banned here for portability — see CLAUDE.md) and
+ * without assuming a single-threaded first call: the conformance
+ * `multithreading` case creates instances from several threads at once.
+ * Lock order is always `ul_hub_lock()` → `hub->mutex`; the poll thread
+ * takes only the latter.
+ */
+static std::mutex &
+ul_hub_lock(void)
+{
+	static std::mutex lock;
+	return lock;
+}
+
+//! Does the hub outlive its devices? Read once. Caller holds ul_hub_lock().
+static bool
+ul_hub_persists(void)
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *env = getenv("DXR_ULTRALEAP_PERSIST_HUB");
+		cached = (env == NULL || env[0] != '0') ? 1 : 0;
+		if (cached == 0) {
+			U_LOG_W("ultraleap: DXR_ULTRALEAP_PERSIST_HUB=0 — hub torn down per XrInstance.");
+		}
+	}
+	return cached != 0;
+}
+
 static void
 ul_hub_destroy(struct ul_hub *hub)
 {
@@ -743,6 +836,68 @@ ul_hub_destroy(struct ul_hub *hub)
 	os_thread_helper_destroy(&hub->oth);
 	os_mutex_destroy(&hub->mutex);
 	free(hub);
+}
+
+/*!
+ * Build the hub: LeapC connection + poll thread + debug vars. Returns NULL
+ * and sets @p out_err on failure. Caller holds ul_hub_lock().
+ */
+static struct ul_hub *
+ul_hub_create(xrt_result_t *out_err)
+{
+	*out_err = XRT_ERROR_ALLOCATION;
+
+	struct ul_hub *hub = U_TYPED_CALLOC(struct ul_hub);
+	if (hub == NULL) {
+		return NULL;
+	}
+	hub->mount_offset = ul_mount_offset_default;
+	hub->presence = XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
+	g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
+	// #941: startup grace — the idle watchdog only fires once nothing has
+	// polled for the timeout, so probes/tests see frames immediately.
+	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
+
+	if (os_mutex_init(&hub->mutex) != 0) {
+		free(hub);
+		return NULL;
+	}
+	if (os_thread_helper_init(&hub->oth) != 0) {
+		os_mutex_destroy(&hub->mutex);
+		free(hub);
+		return NULL;
+	}
+
+	eLeapRS result = LeapCreateConnection(NULL, &hub->connection);
+	if (result != eLeapRS_Success) {
+		U_LOG_E("ultraleap: LeapCreateConnection failed (%s) — falling back.", leap_result_to_string(result));
+		os_thread_helper_destroy(&hub->oth);
+		os_mutex_destroy(&hub->mutex);
+		free(hub);
+		*out_err = XRT_ERROR_DEVICE_CREATION_FAILED;
+		return NULL;
+	}
+
+	// Started before any device exists: every slot is NULL and the poll
+	// thread skips them, which is exactly the state it has to survive
+	// between instances anyway.
+	if (os_thread_helper_start(&hub->oth, ul_poll_thread, hub) != 0) {
+		LeapDestroyConnection(hub->connection);
+		os_thread_helper_destroy(&hub->oth);
+		os_mutex_destroy(&hub->mutex);
+		free(hub);
+		return NULL;
+	}
+
+	u_var_add_root(hub, "Ultraleap Input Hub", true);
+	u_var_add_ro_u64(hub, &hub->frame_count, "tracking_frame_count");
+	u_var_add_vec3_f32(hub, &hub->mount_offset, "mount_offset_m");
+	u_var_add_bool(hub, &hub->leap_connected, "leap_connected");
+	u_var_add_ro_u64(hub, &hub->idle_disconnects, "idle_disconnects");
+	u_var_add_ro_i32(hub, &hub->attached_devices, "attached_devices");
+
+	*out_err = XRT_SUCCESS;
+	return hub;
 }
 
 
@@ -764,17 +919,55 @@ ul_device_destroy(struct xrt_device *xdev)
 	struct ul_device *dev = ul_device(xdev);
 	struct ul_hub *hub = dev->hub;
 
+	// Lock order: process hub lock, then hub->mutex — ul_create_devices
+	// takes them in the same order.
+	std::lock_guard<std::mutex> guard(ul_hub_lock());
+
 	os_mutex_lock(&hub->mutex);
-	hub->devices[dev->hand] = NULL;
+	for (int s = 0; s < UL_MAX_DEVICES; s++) {
+		if (hub->devices[s] == dev) {
+			hub->devices[s] = NULL;
+			break;
+		}
+	}
 	int remaining = --hub->device_refcount;
 	os_mutex_unlock(&hub->mutex);
 
+	// Safe only because the slot was cleared under hub->mutex above: the
+	// poll thread reads and uses a slot under that same lock.
 	m_relation_history_destroy(&dev->history);
 	u_device_free(&dev->base);
 
-	if (remaining == 0) {
-		ul_hub_destroy(hub);
+	if (remaining > 0) {
+		return;
 	}
+
+	if (ul_hub_persists()) {
+		// #1545: the hub stays for the process. The #941 watchdog
+		// closes the LeapC connection shortly after this, so an idle
+		// box is left with a sleeping poll thread and no
+		// tracking-service client — and the NEXT xrCreateInstance
+		// reuses this connection instead of spinning a new LeapC
+		// thread pool up alongside whatever else the process is doing.
+		// WARN once, then INFO: the first retain is the lifecycle
+		// event worth seeing in a log, the next 500 are the steady
+		// state (aux INFO is dropped from the hot path anyway).
+		static bool announced = false;
+		if (!announced) {
+			announced = true;
+			U_LOG_W(
+			    "ultraleap: last device destroyed — hub retained for the process (#1545); "
+			    "the next XrInstance reuses this LeapC connection.");
+		} else {
+			U_LOG_I("ultraleap: last device destroyed — hub retained (#1545).");
+		}
+		return;
+	}
+
+	if (g_ul_hub == hub) {
+		g_ul_hub = NULL;
+	}
+	ul_hub_destroy(hub);
 }
 
 static xrt_result_t
@@ -963,54 +1156,59 @@ ul_create_device(struct ul_hub *hub, int hand)
 extern "C" xrt_result_t
 ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 {
-	struct ul_hub *hub = U_TYPED_CALLOC(struct ul_hub);
-	if (hub == NULL) {
-		return XRT_ERROR_ALLOCATION;
-	}
-	hub->mount_offset = ul_mount_offset_default;
-	hub->presence = XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
-	g_ul_presence = (int)XRT_INPUT_PROVIDER_PRESENCE_UNKNOWN;
-	// #941: startup grace — the idle watchdog only fires once nothing has
-	// polled for the timeout, so probes/tests see frames immediately.
-	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
+	// Held across the whole create, including the settle wait below: a
+	// second thread asking for devices at the same moment must reuse the
+	// hub this one is bringing up, not race a second LeapC connection
+	// into existence (#1545).
+	std::lock_guard<std::mutex> guard(ul_hub_lock());
 
-	if (os_mutex_init(&hub->mutex) != 0) {
-		free(hub);
-		return XRT_ERROR_ALLOCATION;
+	const bool reused = g_ul_hub != NULL;
+	if (!reused) {
+		xrt_result_t xret = XRT_SUCCESS;
+		g_ul_hub = ul_hub_create(&xret);
+		if (g_ul_hub == NULL) {
+			return xret;
+		}
 	}
-	if (os_thread_helper_init(&hub->oth) != 0) {
-		os_mutex_destroy(&hub->mutex);
-		free(hub);
-		return XRT_ERROR_ALLOCATION;
-	}
-
-	eLeapRS result = LeapCreateConnection(NULL, &hub->connection);
-	if (result != eLeapRS_Success) {
-		U_LOG_E("ultraleap: LeapCreateConnection failed (%s) — falling back.", leap_result_to_string(result));
-		os_thread_helper_destroy(&hub->oth);
-		os_mutex_destroy(&hub->mutex);
-		free(hub);
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
+	struct ul_hub *hub = g_ul_hub;
 
 	struct ul_device *left = ul_create_device(hub, 0);
 	struct ul_device *right = ul_create_device(hub, 1);
-	hub->devices[0] = left;
-	hub->devices[1] = right;
-	hub->device_refcount = 2;
-
-	if (os_thread_helper_start(&hub->oth, ul_poll_thread, hub) != 0) {
-		left->base.destroy(&left->base);   // refcount 2 → 1
-		right->base.destroy(&right->base); // refcount 1 → 0, destroys hub
+	if (left == NULL || right == NULL) {
+		if (left != NULL) {
+			m_relation_history_destroy(&left->history);
+			u_device_free(&left->base);
+		}
+		if (right != NULL) {
+			m_relation_history_destroy(&right->history);
+			u_device_free(&right->base);
+		}
+		// The hub stays — it is the process's, not this instance's.
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	u_var_add_root(hub, "Ultraleap Input Hub", true);
-	u_var_add_ro_u64(hub, &hub->frame_count, "tracking_frame_count");
-	u_var_add_vec3_f32(hub, &hub->mount_offset, "mount_offset_m");
-	u_var_add_bool(hub, &hub->leap_connected, "leap_connected");
-	u_var_add_ro_u64(hub, &hub->idle_disconnects, "idle_disconnects");
-	u_var_add_ro_i32(hub, &hub->attached_devices, "attached_devices");
+	os_mutex_lock(&hub->mutex);
+	int placed = 0;
+	struct ul_device *pair[2] = {left, right};
+	for (int s = 0; s < UL_MAX_DEVICES && placed < 2; s++) {
+		if (hub->devices[s] == NULL) {
+			hub->devices[s] = pair[placed++];
+		}
+	}
+	hub->device_refcount += 2;
+	// A revived hub must not be torn down by the #941 watchdog before its
+	// new devices are ever polled, and this mark is also what makes the
+	// poll thread reopen a connection it closed while no instance existed.
+	hub->last_activity_ns = (int64_t)os_monotonic_get_ns();
+	os_mutex_unlock(&hub->mutex);
+
+	if (placed < 2) {
+		// More concurrent instances than slots: the devices are valid
+		// OpenXR devices, they just never receive tracking.
+		U_LOG_W(
+		    "ultraleap: only %d of this instance's 2 devices got a slot (%d live max) — the rest never track.",
+		    placed, UL_MAX_DEVICES);
+	}
 
 	// Give the connection a bounded chance to say whether a device is
 	// attached, so the runtime's FIRST role arbitration (which happens
@@ -1033,7 +1231,7 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 		}
 		os_nanosleep(20 * 1000 * 1000);
 	}
-	U_LOG_W("ultraleap: devices created; presence after settle = %s.",
+	U_LOG_W("ultraleap: devices created (%s hub); presence after settle = %s.", reused ? "reused" : "new",
 	        g_ul_presence == (int)XRT_INPUT_PROVIDER_PRESENCE_PRESENT  ? "PRESENT"
 	        : g_ul_presence == (int)XRT_INPUT_PROVIDER_PRESENCE_ABSENT ? "ABSENT"
 	                                                                   : "UNKNOWN (still settling)");
@@ -1041,6 +1239,32 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right)
 	*out_left = &left->base;
 	*out_right = &right->base;
 	return XRT_SUCCESS;
+}
+
+extern "C" void
+ul_shutdown(void)
+{
+	std::lock_guard<std::mutex> guard(ul_hub_lock());
+
+	struct ul_hub *hub = g_ul_hub;
+	if (hub == NULL) {
+		return;
+	}
+
+	os_mutex_lock(&hub->mutex);
+	int live = hub->device_refcount;
+	os_mutex_unlock(&hub->mutex);
+	if (live > 0) {
+		// The devices belong to a system that has not been torn down;
+		// destroying the hub under them would strand their poll-thread
+		// feed and free memory they still point at.
+		U_LOG_W("ultraleap: shutdown requested with %d device(s) still live — hub kept.", live);
+		return;
+	}
+
+	g_ul_hub = NULL;
+	ul_hub_destroy(hub);
+	U_LOG_W("ultraleap: hub shut down (provider destroy).");
 }
 
 extern "C" enum xrt_input_provider_presence

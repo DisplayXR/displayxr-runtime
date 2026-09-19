@@ -137,6 +137,30 @@ ranked list is exposed via `target_input_plugin_get_count()/get_iface(i)`;
 `get_active()` aliases index 0. No registered provider is not an error: the
 builder falls back to qwerty.
 
+### Lifetime — the provider is per-process, its devices are per-instance
+
+A provider is loaded, negotiated and probed **once per process** and then
+never unloaded (`target_input_plugin_loader.h`); the runtime does not call
+`destroy()` at all today. What DOES churn is `create_devices()`: the builder
+calls it once per `xrt_system_devices`, i.e. once per `xrCreateInstance`,
+and the devices it returns are destroyed through their own
+`xrt_device::destroy` at `xrDestroyInstance`. A process may go round that
+loop hundreds of times — the OpenXR conformance suite does.
+
+So a provider **must not** hang its expensive machinery (a vendor SDK
+connection, a thread pool, a device enumeration) off the device lifetime.
+Create it lazily on the first `create_devices()`, keep it for the process,
+and let the device objects be the cheap per-instance part. Re-spawning a
+vendor SDK's thread pool on every instance is what #1545 diagnosed: 547
+create/destroy cycles in one conformance process, each one racing a fresh
+LeapC pool spin-up against the rest of the process's DLLs.
+
+The in-tree Ultraleap provider is the reference shape: `g_ul_hub` (LeapC
+connection + poll thread) is process-scoped and mutex-guarded, the two
+motion controllers come and go, and the #941 idle watchdog closes the
+tracking-service connection a few seconds after the last device stops
+polling — so an idle box keeps a sleeping thread, not a live client.
+
 ## 4. Role arbitration (builder contract)
 
 In `target_builder_sim_display.c`:
