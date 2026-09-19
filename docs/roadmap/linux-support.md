@@ -21,7 +21,10 @@ desktops.
 **Still open** — none of these gate an in-process `_handle`/`_hosted` app, which
 is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
 only); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
-windowed weaving awaiting hardware validation (**#817** — X11 is unaffected); the
+windowed weaving (**#817**) — the extension + runtime consumer are validated
+live on GNOME 50 / Ubuntu 26.04 (2026-09-19), but the weave *phase* still needs
+a 3D panel, and windowed Wayland is fullscreen-on-panel only today (see
+[Wayland](#wayland)); X11 is unaffected; the
 deployment target (Ubuntu 26.04 + Intel Arc), blocked on hardware; and the Track B
 shippable re-pin onto a merged `sr-sdk-v*` tag. Note that vendor-side weave
 maturity is tracked separately from runtime readiness — the runtime hands the
@@ -36,6 +39,11 @@ pixels on a Linux display, plus there's no Linux build tooling. So the port is
 narrow and well-bounded, sequenced as: prove the substrate headless (Phase 0),
 then add an in-process Vulkan/XCB compositor (Phase 1), then the service/IPC
 path (Phase 2), then a window-binding extension for app-owned windows (Phase 3).
+A **second present path for Wayland sessions** landed alongside Phase 3 —
+`XR_DXR_wayland_surface_binding` plus the #817 window-geometry provider — and
+has its own section: [Wayland](#wayland). Its extension and runtime consumer
+are validated live (GNOME 50 / Ubuntu 26.04, 2026-09-19); weave phase is not,
+because that needs a 3D panel.
 
 ## What already works on Linux (inherited from Monado, kept compiling)
 
@@ -354,6 +362,89 @@ with it:
 
 Full detail, including exactly what is and is not ported from the Windows
 harness: `docs/roadmap/cts-windows-handoff.md` § *Linux arms*.
+
+## Wayland
+
+The phase plan above is X11/XCB throughout — deliberately, because X11 hands a
+client its own absolute window position and Wayland does not (see *Decisions*).
+Wayland is now a **second, parallel present path**, not a later phase: an app
+in a Wayland session binds its own `wl_display*`/`wl_surface*` and the same
+`comp_vk_native` compositor presents through a `VkWaylandSurfaceKHR`. Internal
+shorthand for this work is **WS3b** (runtime#757) — a tag that appeared in five
+source comments and, until this section, in no document at all.
+
+### What ships
+
+- **Present path** — `XR_DXR_wayland_surface_binding`. `oxr_session.c` packs
+  the app's `wl_display*`/`wl_surface*` pair into a
+  `comp_vk_native_wayland_handle`, the compositor takes the Wayland arm of its
+  Linux window block (`use_wayland`, `owns_window=false`, no XCB window, no
+  xdg-shell — the app owns the surface lifecycle), and
+  `comp_vk_native_target.cpp` builds the `VkWaylandSurfaceKHR` directly. Built
+  when `XRT_HAVE_WAYLAND` (pkg-config `wayland-client` + Vulkan); the CMake
+  config summary prints `WAYLAND:`.
+- **Window geometry (#817)** — a GNOME Shell publisher
+  (`contrib/gnome-shell/window-geometry@displayxr.org`) reports every window's
+  global rect on the session bus, and the runtime consumer
+  `comp_vk_native_wl_geom` (built when `XRT_HAVE_WAYLAND && XRT_HAVE_DBUS`;
+  summary line `DBUS:`) feeds it into the existing
+  `get_window_metrics → vk_update_present_origin → DP set_present_origin`
+  chain as a third window source next to the two XCB ones. Without it Wayland
+  weaves display-scoped.
+- **Shipped in the artifacts** — the `.deb` and the tarball are both built with
+  `libwayland-dev` + `libdbus-1-dev` (#1565), so the released runtime carries
+  both. Only `libdbus-1-3` lands in the `.deb`'s derived `Depends` — no `wl_*`
+  symbol is referenced, so `--as-needed` drops `-lwayland-client`.
+- **Validated live** — the GNOME Shell extension and the runtime-side consumer
+  were exercised end to end on **GNOME 50 / Ubuntu 26.04 on 2026-09-19**
+  (publisher owns the bus name, payload parses, consumer resolves the app's own
+  window by PID). That is the plumbing, not the picture: see the constraint on
+  weave phase below.
+
+### Constraints (all of them current, none of them bugs to file twice)
+
+- **100 % desktop scale is required.** Mutter reports *logical* pixels, which
+  equal physical pixels only at scale 1.0, and at any other scale the
+  compositor additionally resamples the surface on its way to the panel —
+  which destroys a 1-pixel-period interlace pattern outright, with no phase
+  correction possible. The provider therefore **refuses** a rect from a
+  non-1.0 monitor (one WARN) and falls back to display-scoped rather than
+  weave at a known-wrong phase. Same constraint as X11 windowed weaving.
+- **Fullscreen-on-panel only, today.** The Wayland target is created at the
+  panel dimensions (`settings.preferred.width/height`) and the live-resize poll
+  is the XCB geometry path, which a Wayland surface has no equivalent of — so a
+  resize is not followed. A window that is not covering the panel is a
+  display-scoped weave at best.
+- **Position comes from the geometry service, never from the client.** Wayland
+  has no `xcb_translate_coordinates`; if the extension is absent, disabled, or
+  the session bus is unavailable, the runtime degrades to display-scoped. The
+  full ladder is in the spec.
+- **The extension takes effect at the next login.** Wayland cannot hot-reload
+  GNOME Shell, so installing or updating the publisher requires a log out/in
+  before `gnome-extensions enable` has any effect on a running session.
+- **Weave phase is NOT validated.** Everything above was proven on sim_display
+  and on the D-Bus wire. sim_display's anaglyph/SBS output degrades gracefully
+  under resampling and a wrong origin, so it cannot establish geometric
+  correctness at all — that needs a real 3D panel in a Wayland session.
+- **PID matching assumes in-process.** The consumer matches windows owned by
+  `getpid()`; service/IPC mode needs the client PID plumbed through (#817
+  follow-up).
+
+### Where the detail lives
+
+- `docs/specs/runtime/wayland-window-geometry.md` — the #817 provider: D-Bus
+  interface, JSON schema + versioning, degradation ladder, and the packaging
+  contract (the publisher is a shared asset; exactly one installed owner via
+  the `displayxr-window-geometry-publisher` virtual package).
+- `contrib/gnome-shell/window-geometry@displayxr.org/README.md` — install,
+  verify with `gdbus call`, and the distributor notes.
+- `docs/specs/extensions/XR_DXR_wayland_surface_binding.md` — the extension
+  spec. **Not on `main` yet** — the extension is published (header
+  `src/external/openxr_includes/openxr/XR_DXR_wayland_surface_binding.h`,
+  `SPEC_VERSION 1`, noted in `docs/specs/extensions/index.json`) but has no
+  prose spec, so until that file lands the authoritative description is the
+  header plus the `oxr_session.c` / `comp_vk_native_target.cpp` Wayland arms
+  cited above.
 
 ## Decisions
 
