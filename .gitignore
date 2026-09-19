@@ -122,6 +122,9 @@ cnsdk
 _package/
 _release_assets/
 _signed/
+# Linux packaging output: scripts/package_linux.sh (tarball) and
+# scripts/package_deb_linux.sh (.deb) both write here.
+dist/
 
 # Ignore Unity plugin build artifacts (native binaries built from native~/)
 com.monado.display3d/Runtime/Plugins/
