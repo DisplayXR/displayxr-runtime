@@ -223,28 +223,6 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	VkFormat vk_format = xrt_format_to_vk(info->format);
 	bool depth = is_depth_format(vk_format);
 
-	// Determine usage flags
-	VkImageUsageFlags usage = 0;
-	if (info->bits & XRT_SWAPCHAIN_USAGE_COLOR) {
-		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) {
-		usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_SAMPLED) {
-		usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_TRANSFER_SRC) {
-		usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_TRANSFER_DST) {
-		usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-	}
-	// Always allow sampling for color textures
-	if (!depth) {
-		usage |= VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	}
-
 	// sRGB passthrough (mirrors the GL/D3D11/D3D12 fixes): the compose
 	// vkCmdBlitImage reads the source in the IMAGE's format, so an sRGB image
 	// would auto-decode sRGB->linear with no re-encode into the UNORM atlas,
@@ -269,6 +247,68 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		}
 	}
 	const bool mutable_srgb = (srgb_view_format != VK_FORMAT_UNDEFINED);
+
+	/*
+	 * Usage flags. Go through vk_csci_get_image_usage_flags() rather than
+	 * hand-rolling the map here (#1558): the shared helper covers every
+	 * xrt_swapchain_usage_bits value — including UNORDERED_ACCESS ->
+	 * VK_IMAGE_USAGE_STORAGE_BIT and INPUT_ATTACHMENT, which the hand-rolled
+	 * version silently dropped — and it validates each bit against the
+	 * format's optimalTilingFeatures instead of trusting the app.
+	 *
+	 * Dropping a requested usage bit is undefined behaviour, not a harmless
+	 * optimisation: a driver that allocates strictly per-usage (Mesa lavapipe
+	 * creates a storage image handle only when VK_IMAGE_USAGE_STORAGE_BIT was
+	 * set at vkCreateImage) hands the app a NULL descriptor and the shader
+	 * faults. Real GPU drivers tolerate it, which is why this hid for so long.
+	 *
+	 * Query against image_format, not vk_format: for the sRGB substitution
+	 * above the app's bits have to be satisfiable by the image we actually
+	 * create, and sRGB formats never advertise the storage-image feature.
+	 *
+	 * MUTABLE_FORMAT is deliberately not the helper's job (it is an image
+	 * create flag, not a usage flag) and is handled by mutable_srgb below.
+	 */
+	const enum xrt_swapchain_usage_bits mappable_bits = info->bits & ~XRT_SWAPCHAIN_USAGE_MUTABLE_FORMAT;
+	VkImageUsageFlags usage = 0;
+	if (mappable_bits != 0) {
+		usage = vk_csci_get_image_usage_flags(vk, image_format, mappable_bits);
+		if (usage == 0) {
+			// One-shot: a mis-matched app would otherwise log per swapchain.
+			static bool reported = false;
+			if (!reported) {
+				reported = true;
+				U_LOG_W(
+				    "#1558: xrCreateSwapchain: %s does not support every requested usage bit "
+				    "(0x%08x) — see the preceding vk_csci_get_image_usage_flags error for the "
+				    "offending bit. Failing with XR_ERROR_FEATURE_UNSUPPORTED rather than handing "
+				    "back an image that ignores the request.",
+				    vk_format_string(image_format), (unsigned)mappable_bits);
+			}
+			vk_swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+	}
+
+	/*
+	 * Colour swapchains additionally need SAMPLED + TRANSFER_SRC for the
+	 * compositor's own compose/blit, whether or not the app asked. These are
+	 * runtime-internal, so a format that cannot do them must NOT fail the
+	 * app's swapchain — but they still get feature-checked through the same
+	 * helper rather than assumed. (Every colour format the runtime advertises
+	 * has both as mandatory optimal-tiling features, so in practice this never
+	 * degrades; the check is there so an added format cannot regress it.)
+	 */
+	if (!depth) {
+		static const enum xrt_swapchain_usage_bits extra_bits[] = {
+		    XRT_SWAPCHAIN_USAGE_SAMPLED,
+		    XRT_SWAPCHAIN_USAGE_TRANSFER_SRC,
+		};
+		for (size_t i = 0; i < ARRAY_SIZE(extra_bits); i++) {
+			usage |= vk_csci_get_image_usage_flags(vk, image_format, extra_bits[i]);
+		}
+	}
+
 	VkFormat view_format_list[2] = {image_format, srgb_view_format};
 	VkImageFormatListCreateInfo format_list_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
