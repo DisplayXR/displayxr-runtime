@@ -935,25 +935,41 @@ create_swapchain(struct comp_vk_native_target *target)
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Get swapchain images. Query the real count first — the driver may
-	// create more images than the minImageCount we requested (Adreno does),
-	// and acquire can return any index in [0, count), so we must capture all
-	// of them. Under-capturing makes get_current_image read past images[]/
-	// views[] and hand the DP a garbage handle.
-	uint32_t actual_count = 0;
-	res = vk->vkGetSwapchainImagesKHR(vk->device, target->swapchain, &actual_count, NULL);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to query swapchain image count: %d", res);
-		return XRT_ERROR_VULKAN;
-	}
-	if (actual_count > MAX_TARGET_IMAGES) {
-		U_LOG_E("Swapchain has %u images, exceeds MAX_TARGET_IMAGES=%u — raise the cap",
-		        actual_count, (uint32_t)MAX_TARGET_IMAGES);
-		return XRT_ERROR_VULKAN;
-	}
-	target->image_count = actual_count;
+	/*
+	 * Get swapchain images. The driver may create MORE images than the
+	 * minImageCount we asked for (Adreno does), and acquire can return any
+	 * index in [0, count), so we must capture all of them — under-capturing
+	 * makes get_current_image read past images[]/views[] and hand the DP a
+	 * garbage handle.
+	 *
+	 * ONE call, not the usual size-query-then-fill pair (#1542). `images` is
+	 * already a fixed MAX_TARGET_IMAGES array — the cap is ours, not the
+	 * driver's — so asking with the capacity preset is equivalent: the
+	 * driver writes min(capacity, actual) handles and returns VK_INCOMPLETE
+	 * iff it has more than we can hold. VK_INCOMPLETE therefore IS the
+	 * "exceeds the cap" condition the size query used to detect, and it is
+	 * reported with the same diagnostic.
+	 *
+	 * The size-query form is spec-legal but passes pSwapchainImages = NULL,
+	 * and the OpenXR CTS conformance layer — which registers a VULKAN layer
+	 * as well (VK_LAYER_OPENXR_xr_runtime_conformance, OpenXR-CTS
+	 * src/conformance/conformance_layer/VulkanLayer.cpp:495-503) — hooks
+	 * vkGetSwapchainImagesKHR and unconditionally indexes pSwapchainImages
+	 * after calling down. On the NULL query that is a read through a null
+	 * pointer, which SIGSEGVs conformance_cli before xrCreateSession can
+	 * return. Nothing about that is driver- or lavapipe-specific: it is any
+	 * Vulkan CTS run with the conformance layer on. Avoiding the NULL form
+	 * costs us nothing and keeps the lane alive; the layer bug is reported
+	 * upstream separately.
+	 */
+	target->image_count = MAX_TARGET_IMAGES;
 	res = vk->vkGetSwapchainImagesKHR(vk->device, target->swapchain,
 	                                    &target->image_count, target->images);
+	if (res == VK_INCOMPLETE) {
+		U_LOG_E("Swapchain has more than MAX_TARGET_IMAGES=%u images — raise the cap",
+		        (uint32_t)MAX_TARGET_IMAGES);
+		return XRT_ERROR_VULKAN;
+	}
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to get swapchain images: %d", res);
 		return XRT_ERROR_VULKAN;
