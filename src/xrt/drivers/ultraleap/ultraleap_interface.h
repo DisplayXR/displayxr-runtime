@@ -32,12 +32,19 @@ extern "C" {
 struct xrt_device;
 
 /*!
- * Create the Ultraleap hub (LeapC connection + poll thread) and its
- * left+right motion-controller devices. Hub lifetime is refcounted onto
- * the two devices, like net_input. Fails only if the LeapC connection
+ * Create the left+right motion-controller devices, bringing the hub
+ * (LeapC connection + poll thread) up on the FIRST call of the process and
+ * reusing it on every later one (#1545). Fails only if the LeapC connection
  * cannot be created at all (tracking service absent) — with the service
  * up but no device plugged in, the devices exist and report untracked
  * until hands appear, mirroring net_input's no-feeder semantics.
+ *
+ * May be called many times per process: the runtime creates a device set
+ * per `xrt_system_devices`, i.e. per `xrCreateInstance`, while the provider
+ * itself is loaded once and never unloaded. The devices are per-instance
+ * and cheap; the hub is per-process and expensive, so only the devices are
+ * torn down at `xrDestroyInstance` (the #941 idle watchdog drops the
+ * tracking-service connection a few seconds later if nothing polls).
  *
  * Before returning it waits a bounded settle window
  * (`DXR_ULTRALEAP_SETTLE_MS`, default 300) for the LeapC connection to
@@ -64,6 +71,22 @@ ul_create_devices(struct xrt_device **out_left, struct xrt_device **out_right);
  */
 enum xrt_input_provider_presence
 ul_get_presence(void);
+
+/*!
+ * Tear the process-scoped hub down (LeapC connection + poll thread).
+ *
+ * Backs @ref xrt_input_plugin_iface::destroy, whose contract is "free all
+ * provider-owned resources (threads, transport)". The runtime's loader
+ * keeps providers resident for the process and never calls it today
+ * (`target_input_plugin_loader.h`), so this is the honest implementation of
+ * a path that exists in the ABI rather than a path the runtime walks. A
+ * no-op when no hub exists; refuses (and logs) while any device is still
+ * live, since those devices point into the hub.
+ *
+ * @ingroup drv_ultraleap
+ */
+void
+ul_shutdown(void);
 
 #ifdef __cplusplus
 }

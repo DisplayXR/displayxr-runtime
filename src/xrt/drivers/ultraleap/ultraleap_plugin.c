@@ -76,7 +76,16 @@ static void
 ul_plugin_destroy(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
-	/* Hub teardown rides the devices' refcounted destroy. */
+	/*
+	 * Devices are destroyed by the runtime through their own
+	 * xrt_device::destroy at every system teardown; the hub behind them
+	 * is process-scoped since #1545 and outlives them. This is the one
+	 * call that means "the provider itself is going away", so it is what
+	 * tears the hub down — a no-op while devices are still live, and
+	 * never reached at all on a runtime whose loader keeps providers
+	 * resident for the process (today's does).
+	 */
+	ul_shutdown();
 }
 
 static enum xrt_input_provider_presence
