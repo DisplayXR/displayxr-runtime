@@ -335,6 +335,32 @@ do_equirect2_layer(struct xrt_compositor *xc, struct multi_compositor *mc, struc
 	xrt_comp_layer_equirect2(xc, xdev, xcs, data);
 }
 
+/*!
+ * Passthrough layer (#1547). No swapchain — do_single() cannot be used, it
+ * rejects a NULL xscs[0]. Forwarded so the target compositor sees the same
+ * layer stream a native compositor would; every native compositor accepts it
+ * and draws nothing. xrt_comp_layer_passthrough() guards a NULL slot (#1544),
+ * so a target without one fails the layer rather than the process.
+ */
+static void
+do_passthrough_layer(struct xrt_compositor *xc,
+                     struct multi_compositor *mc,
+                     struct multi_layer_entry *layer,
+                     uint32_t i)
+{
+	struct xrt_device *xdev = layer->xdev;
+
+	if (xdev == NULL) {
+		U_LOG_E("Invalid xdev for passthrough layer #%u!", i);
+		return;
+	}
+
+	// Cast away
+	struct xrt_layer_data *data = (struct xrt_layer_data *)&layer->data;
+
+	xrt_comp_layer_passthrough(xc, xdev, data);
+}
+
 static int
 overlay_sort_func(const void *a, const void *b)
 {
@@ -5648,6 +5674,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			case XRT_LAYER_CYLINDER: do_cylinder_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_EQUIRECT1: do_equirect1_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_EQUIRECT2: do_equirect2_layer(xc, mc, layer, i); break;
+			case XRT_LAYER_PASSTHROUGH: do_passthrough_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_ZONE_3D: do_zone_3d_layer(xc, mc, layer, i); break;
 			case XRT_LAYER_LOCAL_2D:
 				// 2D overlay consumed only by the per-session render path

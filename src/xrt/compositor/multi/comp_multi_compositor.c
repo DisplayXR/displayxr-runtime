@@ -1200,6 +1200,32 @@ multi_compositor_layer_equirect2(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Passthrough layer (#1547). No swapchain — the app is asking for an
+ * environment-blend composition, not handing over pixels — so only the xdev
+ * and the layer data are enqueued. comp_multi_system's transfer switch hands
+ * it to the target compositor (do_passthrough_layer), which accepts it and
+ * draws nothing, exactly like the native compositors do.
+ *
+ * Wiring the slot is the point: ipc_server_handler's
+ * _update_passthrough_layer() calls xrt_comp_layer_passthrough() on this
+ * compositor, and a NULL slot there was a call through a null function
+ * pointer on the service thread (the same gap #1544 fixed in the GL lane).
+ */
+static xrt_result_t
+multi_compositor_layer_passthrough(struct xrt_compositor *xc,
+                                   struct xrt_device *xdev,
+                                   const struct xrt_layer_data *data)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+
+	size_t index = mc->progress.layer_count++;
+	mc->progress.layers[index].xdev = xdev;
+	mc->progress.layers[index].data = *data;
+
+	return XRT_SUCCESS;
+}
+
 static xrt_result_t
 multi_compositor_layer_window_space(struct xrt_compositor *xc,
                                     struct xrt_device *xdev,
@@ -2558,6 +2584,7 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->base.base.layer_cylinder = multi_compositor_layer_cylinder;
 	mc->base.base.layer_equirect1 = multi_compositor_layer_equirect1;
 	mc->base.base.layer_equirect2 = multi_compositor_layer_equirect2;
+	mc->base.base.layer_passthrough = multi_compositor_layer_passthrough;
 	mc->base.base.layer_window_space = multi_compositor_layer_window_space;
 	mc->base.base.layer_local_2d = multi_compositor_layer_local_2d;
 	mc->base.base.layer_zone_3d = multi_compositor_layer_zone_3d;
