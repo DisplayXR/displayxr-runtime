@@ -9,8 +9,12 @@ Acer SpatialLabs DS1; #708 / #706), and the **Track B real srSDK Vulkan weave is
 HW-validated on the DS1** (lens enables). Runtime **v1.28.0** was the first tag
 with complete Linux support. **Distribution:** a `displayxr-runtime_<ver>_amd64.deb`
 is built on every PR and attached to every `v*` GitHub Release (#781), alongside
-the user-level tarball from `scripts/package_linux.sh` (#705/#713). **CI:** a
-tri-LTS matrix (Ubuntu 22.04/24.04/26.04) is a required check on the runtime and
+the user-level tarball from `scripts/package_linux.sh` (#705/#713); the `.deb` is
+built with `libwayland-dev` + `libdbus-1-dev` like every other Linux artifact, so
+it carries the Wayland present path and the #817 window-geometry provider (only
+`libdbus-1-3` lands in its derived `Depends` — no `wl_*` symbol is referenced, so
+`--as-needed` drops `-lwayland-client`). **CI:** a tri-LTS matrix (Ubuntu
+22.04/24.04/26.04) is a required check on the runtime and
 all 5 demos (#714/#722); all 5 demos are build-green on real 22.04/24.04/26.04
 desktops.
 
