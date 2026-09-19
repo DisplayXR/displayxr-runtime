@@ -228,18 +228,31 @@ guessed:
 | Mesa **dzn** / Dozen (`dzn_device.c`) | ✓ | ✓ | ✗ — no `external_fence` at all |
 | **SwiftShader** (`libVulkan.cpp`) | ✗ — opaque-FD and Fuchsia only | ✗ | ✗ |
 
-So switching ICD does not rescue this, and neither does naming tests in the
-quarantine list: the failure is at device creation, so it takes out *every*
-session-creating test rather than a nameable few. The `vulkan`/`vulkan2` arms
-need either the real-GPU tier (#1526) or a deliberate decision about that
-required set — note the asymmetry that the POSIX block marks the equivalent
-`_fd` sync extensions **optional** while the Win32 block marks them required,
-which looks inherited rather than reasoned. That is a runtime behaviour change
-and wants its own issue and hardware validation, not a CI workaround.
+So switching ICD did not rescue this, and neither did naming tests in the
+quarantine list: the failure was at device creation, so it took out *every*
+session-creating test rather than a nameable few.
 
-What the hosted lane *does* now give for Vulkan: the CTS is built with the
-`vulkan`/`vulkan2` plugins at all (see below), and the arm gets as far as
-device creation with a named reason. Both are prerequisites for #1526.
+**RESOLVED by #1539.** The asymmetry called out here — the POSIX block marks the
+equivalent `_fd` sync extensions **optional** while the Win32 block marked them
+required — was indeed inherited rather than reasoned. The Win32 trio is now
+**optional-if-present** in both app-facing lists, gated at every import/export
+call site, with `DXR_VK_REQUIRE_WIN32_EXTERNAL=1` as the kill switch. Measured
+on the hosted lane, same build, kill switch as the only variable:
+
+| `DXR_VK_REQUIRE_WIN32_EXTERNAL` | assertions | failures | errors | where it stops |
+|---|---:|---:|---:|---|
+| `1` (old behaviour) | 1442 | 0 | 12 | `vkCreateDevice`, every session-creating test |
+| unset (default) | 418 | 1 | 0 | `Swapchains` **PASSES**; SIGSEGV in `SessionState/Cycle through all states` |
+
+So the next blocker on these arms is a **crash**, not an extension — the Vulkan
+sibling of the `opengl` SIGSEGV (#1522). Still not gateable, but for a new
+reason, and the real-GPU tier (#1526) remains the way to make these arms count.
+
+Note the null compositor keeps the trio **required** on purpose
+(`null_compositor.c`): it creates its own `VkDevice` and is the export side of
+the handoff. On lavapipe its Vulkan init fails with the message above and it
+falls back to D3D11 at session level — expected, non-fatal, and visible in
+every `vulkan`/`vulkan2` log.
 
 Three more things that are easy to get wrong here:
 

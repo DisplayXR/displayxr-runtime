@@ -121,11 +121,14 @@ jobs:
           # =================================================================
           # NOTE (#1525, landed): the software rasterizers ARE provisioned now
           # and those three arms do start — opengl runs ~493 assertions on
-          # llvmpipe before SIGSEGV (#1522), vulkan/vulkan2 run 1442 and stop
-          # at vkCreateDevice because no Windows software ICD implements
-          # VK_KHR_external_memory_win32. So the list above stays as it is:
-          # they report real counts in the summary table instead of MISSING,
-          # but none of the three can gate yet. See
+          # llvmpipe before SIGSEGV (#1522). vulkan/vulkan2 used to run 1442
+          # and stop at vkCreateDevice (the runtime required the Win32
+          # external memory/semaphore/fence trio of every app); #1539 made
+          # that trio optional-if-present, so both arms now create the device,
+          # PASS Swapchains, and stop at a SIGSEGV in SessionState — a
+          # separate crash, the Vulkan sibling of #1522. So the list above
+          # stays as it is: they report real counts in the summary table
+          # instead of MISSING, but none of the three can gate yet. See
           # docs/roadmap/cts-windows-handoff.md § Software-rasterizer tier.
 
           # Which arms get Mesa llvmpipe/lavapipe. Exactly the ones that cannot
@@ -706,8 +709,8 @@ jobs:
                     "Experimental arms (`opengl` / `vulkan` / `vulkan2`) run against Mesa's software",
                     "rasterizers on the hosted runner (#1525) and report real counts, but are not",
                     "gated: `opengl` still dies at session teardown (#1522), and `vulkan`/`vulkan2`",
-                    "stop at `vkCreateDevice` because no Windows software ICD implements",
-                    "`VK_KHR_external_memory_win32`. See docs/roadmap/cts-windows-handoff.md."]
+                    "now get past `vkCreateDevice` (#1539) but SIGSEGV in SessionState — the Vulkan",
+                    "sibling of that crash. See docs/roadmap/cts-windows-handoff.md."]
           out = "\n".join(lines) + "\n"
           print(out)
           path = os.environ.get("GITHUB_STEP_SUMMARY")
