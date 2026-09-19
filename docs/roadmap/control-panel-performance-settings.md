@@ -105,7 +105,9 @@ the service, next-launch in-app*.
 All `DXR_TEST_*` · every `_DIAG` / `_DUMP` / `_PROBE` / `_JIGGLE` / `_REFLATTEN` /
 `_DRAIN` / `_NO2D` bisect probe · `DXR_WEAVE_REPAINT_FORCE` (documented as *"it **will**
 cost frame rate"*) · `DXR_SIM_INPUT` (+ `DXR_SIM_INPUT_NAV*`) · `DXR_LEGACY_STANDALONE` · `DXR_IPC_FD` /
-`DXR_IPC_HANDLE` · `DXR_ALLOW_UNVERIFIED_CONTROLLER`.
+`DXR_IPC_HANDLE` · `DXR_ALLOW_UNVERIFIED_CONTROLLER` · `DXR_PLUGIN_EXCLUSIVE` /
+`DXR_INPUT_PROVIDERS=0` (the #1545 CTS-lane exclusivity pair — they *remove* hardware support
+from a run on purpose).
 
 Plus the **rear-depth-budget A/B kill switches** — `DXR_REAR_BUDGET` (`clip`/`open`/`auto`),
 `DXR_REAR_BUDGET_OPEN_DWELL_MS` / `_CLOSE_MS` / `_RAMP_OPEN_MS` / `_RAMP_CLOSE_MS` /
@@ -538,6 +540,8 @@ as `docs/specs/vendor/oem-android-platform-requirements.md` §R6.
 | `DXR_TEST_EXIT_ON_DISCONNECT` | `ipc/server/ipc_server_per_client_thread.c:19` | 0 | Svc | #950 fault injection |
 | `DXR_ALLOW_DEV_PLUGIN_PATHS` | `targets/common/target_plugin_path_guard.c:91` (`GetEnvironmentVariableW`) | unset | Both | **Disables the #943 plug-in-path guard.** Env-only, permanently — see the carve-out above |
 | `DXR_ALLOW_UNVERIFIED_CONTROLLER` | `ipc/server/ipc_server_handler.c:167` | off | Svc | Accepts an unverified `CONTROLLER` claim. "Never set on a production box" |
+| `DXR_PLUGIN_EXCLUSIVE` | `targets/common/target_plugin_loader.c` (`plugin_exclusive_id` / `plugin_id_excluded`; applied in all three platforms' `discover_active_plugin` and in `collect_display_sources_platform`) | unset | Both | Loads ONLY the named display plug-in — every other registered one is skipped **before** `LoadLibrary`/`dlopen`, which `ProbeOrder` and `PreferredPlugin` never do (claim collection loads them all, #69/ADR-015). For the CTS lanes: on a box with the Leia SR plug-in installed, a `-G d3d11` run otherwise drags `SimulatedRealityOpenGL.dll` → `opengl32` → the NVIDIA GL ICD into the process and the `multithreading` case faults in an ICD worker (#1545). **No fallback on a miss** — a typo loads nothing and logs one WARN listing the registered ids. Excluded entries bypass the #1212 reject tally so `selftest` stays green. Set by `scripts/run_cts.ps1 -Plugin <name>`; not a user setting |
+| `DXR_INPUT_PROVIDERS` | `targets/common/target_input_plugin_loader.c` (`input_providers_disabled_by_env`, at the one-shot discovery site in `target_input_plugin_get_iface`) | unset (= discover) | Both | `0` skips input-provider discovery entirely: no provider DLL is loaded, `get_count()` is 0, `create_devices` is never called, hands stay on qwerty. Process-scoped twin of `HKLM\…\Input\ForceQwerty` — an env var precisely so a killed CTS run cannot leave input disabled machine-wide. Second half of the #1545 fix (the Ultraleap provider re-spins its LeapC thread pool per `xrCreateInstance`). One WARN per process |
 | `DXR_SIM_INPUT` | `drivers/sim_input/sim_input_plugin.c:59` | off | Both | Simulated-input opt-in |
 | `DXR_SIM_INPUT_NAV` | `drivers/sim_input/sim_input_plugin.c:139` | off | Both | With `DXR_SIM_INPUT=1`: adds the scripted "Sim navigation" device (rig role, ADR-034 Amendment 4) and puts the sim controllers on `RIG_LOCAL` origins. Test/CI only |
 | `DXR_SIM_INPUT_NAV_HOLD_MS` | `drivers/sim_input/sim_input_plugin.c:153` | 0 (never) | Both | Every *n* ms the scripted navigation pose reports invalid for 500 ms — exercises the composer's hold / re-align path |

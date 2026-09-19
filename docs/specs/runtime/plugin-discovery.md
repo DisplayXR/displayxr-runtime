@@ -195,6 +195,47 @@ New-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "Prefe
 Remove-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
 ```
 
+### 2.2 `DXR_PLUGIN_EXCLUSIVE` — load one plug-in and nothing else
+
+`PreferredPlugin` and `ProbeOrder` decide which plug-in **wins**. Neither
+decides which plug-ins are **loaded**: the per-display claim registry
+(§ADR-015 / #69) asks *every* registered plug-in for its claims, so on a box
+with a vendor plug-in installed that DLL — and its whole dependency chain — is
+`LoadLibrary`d into the process even when sim-display is the active DP.
+
+`DXR_PLUGIN_EXCLUSIVE=<id>` (process environment, all platforms) makes
+discovery skip every entry whose id is not `<id>`, **before** any
+`LoadLibrary`/`dlopen`. It applies to the active-plug-in walk, the
+display-claim collection and the mid-install refresh, and it outranks
+`PreferredPlugin` (honoring a preference would load the very DLL the caller
+asked to keep out).
+
+This exists for the CTS lanes (#1545, #1523). A `-G d3d11` conformance run on
+a box with the Leia SR plug-in installed pulls `SimulatedRealityOpenGL.dll` →
+`opengl32` → the NVIDIA GL ICD into the process purely through claim
+collection, and the `multithreading` case then faults in an NV ICD worker
+thread. `scripts/run_cts.ps1 -Plugin <name>` sets it for the run.
+
+Semantics differing from `PreferredPlugin`, deliberately:
+
+- **No fallback on a miss.** An id nothing is registered under loads *nothing*;
+  the loader emits one WARN naming the value and every registered id. A
+  silent fallback would defeat the only purpose of the variable.
+- **Exact match** on the id (registry subkey name on Windows, manifest `id` on
+  POSIX), same comparison `PreferredPlugin` uses.
+- **Skipped ≠ rejected.** Excluded entries are not counted by the #1212
+  better-ranked-candidate tally, so `displayxr-cli selftest` stays green.
+- **Not machine state.** Unset = today's behaviour; nothing is written
+  anywhere, and a killed run leaves no trace. `displayxr-cli dp list` still
+  enumerates everything that is registered.
+
+Read with CRT `getenv`, like `XRT_PLUGIN_SEARCH_PATH` and
+`XRT_PREFERRED_PLUGIN_ID` — set it in the environment the process **inherits**
+(a launcher, or the parent shell before `Start-Process`). An in-process client
+calling `SetEnvironmentVariableW` after startup is silently ignored; see
+[adapter selection](../../reference/adapter-selection.md) § *The `getenv()`
+caveat*.
+
 ---
 
 ## 3. Per-platform filesystem discovery

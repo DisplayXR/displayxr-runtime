@@ -134,6 +134,117 @@ plugin_note_reject(const char *id, uint32_t probe_order)
 	g_last_reject_reason[0] = '\0';
 }
 
+/*!
+ * `DXR_PLUGIN_EXCLUSIVE=<plugin-id>` — load ONLY the named display plug-in and
+ * do not even `LoadLibrary`/`dlopen` any other registered one (#1545, #1523).
+ *
+ * This is NOT `PreferredPlugin` (#378) and NOT a ProbeOrder tweak: both of
+ * those only change WHICH plug-in wins, while every other registered plug-in
+ * is still loaded — `collect_display_sources_platform` deliberately consults
+ * all of them for display claims (#69 / ADR-015). Loading is the problem this
+ * variable exists for: on a box with a vendor plug-in installed, that load
+ * drags the vendor's whole dependency chain into the process (Leia SR →
+ * `SimulatedRealityOpenGL.dll` → `opengl32` → the NVIDIA GL ICD), which is
+ * how a `-G d3d11` CTS run ends up faulting in an OpenGL ICD worker thread
+ * (#1545). A CTS lane wants one plug-in resident and nothing else.
+ *
+ * Deliberately NO fallback on a miss, which is the other difference from
+ * `PreferredPlugin`: a stale preference falls through to ProbeOrder so a bad
+ * value can never brick discovery, but "exclusive" that quietly loaded
+ * something else would defeat its only purpose. A typo therefore loads
+ * nothing, and the WARN below names every registered id so the typo is
+ * obvious in the log rather than in a mystery crash.
+ *
+ * Read with CRT `getenv` like the loader's other env overrides
+ * (`XRT_PLUGIN_SEARCH_PATH`, `XRT_PREFERRED_PLUGIN_ID`), so it must be set in
+ * the environment the process INHERITS — a launcher script, or the PowerShell
+ * process env before `Start-Process` (what `scripts/run_cts.ps1` does). An
+ * in-process client calling `SetEnvironmentVariableW` after startup is
+ * silently ignored; see `docs/reference/adapter-selection.md` § *The getenv()
+ * caveat*.
+ */
+static const char *
+plugin_exclusive_id(void)
+{
+	static const char *s_id = NULL;
+	static bool s_read = false;
+	if (!s_read) {
+		s_read = true;
+		const char *env = getenv("DXR_PLUGIN_EXCLUSIVE");
+		if (env != NULL && env[0] != '\0') {
+			s_id = env;
+			U_LOG_W(
+			    "plugin loader: DXR_PLUGIN_EXCLUSIVE='%s' — loading ONLY that display plug-in; "
+			    "every other registered plug-in is skipped (not loaded).",
+			    s_id);
+		}
+	}
+	return s_id;
+}
+
+/*!
+ * True when @p id is NOT the exclusive plug-in and must therefore be skipped
+ * before any load attempt. Exact `strcmp`, matching the `PreferredPlugin`
+ * comparison — the id is the registry subkey name on Windows and the
+ * manifest's `id` on POSIX.
+ *
+ * Callers must skip such an entry WITHOUT calling @ref plugin_note_reject: a
+ * deliberately-excluded plug-in is not a better-ranked candidate that failed,
+ * and counting it would turn `displayxr-cli selftest`'s vendor-DP check red on
+ * a lane that is working exactly as asked (#1212 keys off that counter).
+ */
+static bool
+plugin_id_excluded(const char *id)
+{
+	const char *only = plugin_exclusive_id();
+	if (only == NULL) {
+		return false;
+	}
+	return id == NULL || strcmp(id, only) != 0;
+}
+
+/*!
+ * One WARN when `DXR_PLUGIN_EXCLUSIVE` names an id nothing is registered
+ * under. Since there is no fallback by design, that run loads no display
+ * plug-in at all and every downstream failure ("Failed to initialize OpenXR",
+ * `XRT_ERROR_DEVICE_CREATION_FAILED`) would otherwise look like a broken box
+ * rather than a typo, so the message lists what IS registered.
+ *
+ * Call sites pass the ids they enumerated; harmless (and silent) when the
+ * variable is unset or does match.
+ */
+static void
+plugin_warn_exclusive_miss(const char *const *ids, int n)
+{
+	const char *only = plugin_exclusive_id();
+	if (only == NULL) {
+		return;
+	}
+	for (int i = 0; i < n; i++) {
+		if (ids[i] != NULL && strcmp(ids[i], only) == 0) {
+			return;
+		}
+	}
+
+	char list[512];
+	size_t used = 0;
+	list[0] = '\0';
+	for (int i = 0; i < n && used + 1 < sizeof(list); i++) {
+		int wrote = snprintf(list + used, sizeof(list) - used, "%s%s", used > 0 ? ", " : "",
+		                     ids[i] != NULL ? ids[i] : "?");
+		if (wrote < 0) {
+			break;
+		}
+		used += (size_t)wrote;
+	}
+
+	U_LOG_W(
+	    "plugin loader: DXR_PLUGIN_EXCLUSIVE='%s' matches none of the %d registered plug-in(s) [%s] — "
+	    "NOTHING will be loaded (no fallback, by design). Check the id: it is the registry subkey name on "
+	    "Windows and the manifest 'id' on POSIX.",
+	    only, n, list);
+}
+
 void
 target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out)
 {
@@ -697,6 +808,15 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
 
+	// DXR_PLUGIN_EXCLUSIVE (#1545): warn once if the pin matches nothing.
+	{
+		const char *ids[MAX_PLUGIN_ENTRIES];
+		for (int i = 0; i < n; i++) {
+			ids[i] = entries[i].id;
+		}
+		plugin_warn_exclusive_miss(ids, n);
+	}
+
 	// PreferredPlugin override (#378): try the user-pinned plug-in before
 	// the ProbeOrder sort. A stale or failed preference falls through to
 	// the normal order, so a bad value can never brick discovery.
@@ -705,6 +825,13 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		for (int i = 0; i < n; i++) {
 			if (strcmp(entries[i].id, preferred) != 0) {
 				continue;
+			}
+			// An exclusive pin outranks the user preference: the
+			// point is that nothing else is LOADED, and honoring a
+			// preference here would load exactly the DLL the lane
+			// asked to keep out of the process (#1545).
+			if (plugin_id_excluded(entries[i].id)) {
+				break;
 			}
 			// Refresh path: only honor the preference if it is also
 			// strictly-better; the sticky-preference guard in
@@ -732,6 +859,12 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		// re-probe the already-active one. First-call path passes
 		// UINT32_MAX, so no entry is skipped.
 		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
+		/* #1545: skipped BEFORE LoadLibrary, and deliberately without
+		 * plugin_note_reject — an excluded plug-in is not a failure. */
+		if (plugin_id_excluded(entries[i].id)) {
+			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
 			continue;
 		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
@@ -784,6 +917,13 @@ collect_display_sources_platform(struct plugin_display_source *out, int max)
 
 	int count = 0;
 	for (int i = 0; i < n && count < max; i++) {
+		// #1545: THE load site this variable exists for. Claim
+		// collection consults every registered plug-in, so without this
+		// an exclusive lane would still LoadLibrary the vendor DLL (and
+		// its GL ICD) even though it never becomes the active DP.
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
 		// Reuse the already-loaded active plug-in rather than loading a
 		// second instance of it.
 		if (active_id != NULL && strcmp(entries[i].id, active_id) == 0) {
@@ -1665,11 +1805,24 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 	 * package — see plugin_host_get_android_class_host_context(). */
 	remember_runtime_package_from_lib_dir(root);
 
+	{
+		const char *ids[MAX_PLUGIN_ENTRIES];
+		for (int i = 0; i < n; i++) {
+			ids[i] = entries[i].id;
+		}
+		plugin_warn_exclusive_miss(ids, n);
+	}
+
 	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
 	for (int i = 0; i < n; i++) {
 		// Refresh path (#342): only attempt strictly-better candidates.
 		// First-call path passes UINT32_MAX so no entry is skipped.
 		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
+		/* #1545: skipped before dlopen, and not counted as a reject. */
+		if (plugin_id_excluded(entries[i].id)) {
+			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
 			continue;
 		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
@@ -2199,6 +2352,15 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 
 	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
 
+	// DXR_PLUGIN_EXCLUSIVE (#1545): warn once if the pin matches nothing.
+	{
+		const char *ids[MAX_PLUGIN_ENTRIES];
+		for (int i = 0; i < n; i++) {
+			ids[i] = entries[i].id;
+		}
+		plugin_warn_exclusive_miss(ids, n);
+	}
+
 	// PreferredPlugin override (#378): try the user-pinned plug-in before
 	// the filename/ProbeOrder order. A stale or failed preference falls
 	// through to the normal order, so it can never brick discovery.
@@ -2207,6 +2369,10 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		for (int i = 0; i < n; i++) {
 			if (strcmp(entries[i].id, preferred) != 0) {
 				continue;
+			}
+			// An exclusive pin outranks the user preference (#1545).
+			if (plugin_id_excluded(entries[i].id)) {
+				break;
 			}
 			if (entries[i].probe_order >= max_probe_order) {
 				break; // refresh path: not strictly-better
@@ -2228,6 +2394,11 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		// Refresh path (#342): only attempt strictly-better candidates.
 		// First-call path passes UINT32_MAX so no entry is skipped.
 		if (entries[i].probe_order >= max_probe_order) {
+			continue;
+		}
+		/* #1545: skipped before dlopen, and not counted as a reject. */
+		if (plugin_id_excluded(entries[i].id)) {
+			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
 			continue;
 		}
 		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
