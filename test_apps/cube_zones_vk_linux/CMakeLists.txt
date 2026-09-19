@@ -18,7 +18,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# Xlib for the app-owned window (libx11-dev).
+# Xlib for the app-owned window (libx11-dev). Wayland is optional and wired
+# up by dxr_target_add_linux_window() below.
 find_package(X11 REQUIRED)
 
 # OpenXR headers from the runtime source tree.
@@ -82,6 +83,12 @@ target_include_directories(cube_zones_vk_linux PRIVATE
     ${OPENXR_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/../common
 )
+
+# Dual-backend app-owned window (X11 always; native Wayland when
+# libwayland-client + wayland-scanner are present, which also defines
+# DXR_APP_HAVE_WAYLAND and generates the xdg-shell glue from the vendored XML).
+include(${CMAKE_SOURCE_DIR}/../common/dxr_linux_window.cmake)
+dxr_target_add_linux_window(cube_zones_vk_linux)
 
 # Copy texture files next to the built executable.
 file(GLOB TEXTURE_FILES "${CMAKE_SOURCE_DIR}/../common/textures/*.jpg")
