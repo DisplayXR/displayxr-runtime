@@ -434,8 +434,18 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $log = "$env:TEMP\cts_$($env:CTS_TAG)_console.log"
-          if (-not (Test-Path $log)) { Write-Host "No CTS console log to scrape metrics from."; exit 0 }
+          # The timing block is on conformance_cli's STDOUT, not in the Catch2
+          # console-reporter file — scraping the reporter file found nothing on
+          # every run since this step was written (verified against main @
+          # v2.17.1, run 35401166847: "No Timed_Pipelined_Frame_Submission
+          # metrics in console log"). run_cts.ps1 now captures stdout to
+          # cts_<tag>_stdout.log; fall back to the reporter file so an older
+          # run_cts.ps1 still produces the old (empty) behaviour rather than an
+          # error.
+          $log = "$env:TEMP\cts_$($env:CTS_TAG)_stdout.log"
+          if (-not (Test-Path $log)) { $log = "$env:TEMP\cts_$($env:CTS_TAG)_console.log" }
+          if (-not (Test-Path $log)) { Write-Host "No CTS stdout/console log to scrape metrics from."; exit 0 }
+          Write-Host "scraping frame-timing metrics from: $log"
           $lines = Get-Content $log |
             Select-String -Pattern 'Average (xrWaitFrame|time spent|predicted|xrBeginFrame)|Overhead score'
           if (-not $lines) { Write-Host "No Timed_Pipelined_Frame_Submission metrics in console log."; exit 0 }
@@ -462,7 +472,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force cts-results | Out-Null
-          foreach ($f in @("cts_$($env:CTS_TAG).xml", "cts_$($env:CTS_TAG)_console.log")) {
+          foreach ($f in @("cts_$($env:CTS_TAG).xml", "cts_$($env:CTS_TAG)_console.log", "cts_$($env:CTS_TAG)_stdout.log")) {
             $src = Join-Path $env:TEMP $f
             if (Test-Path $src) { Copy-Item $src cts-results\ }
           }
