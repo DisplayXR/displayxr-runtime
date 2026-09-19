@@ -114,7 +114,8 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 # apt deps listed in the script header (Vulkan, XCB, glslang, …)
 ./scripts/build_linux.sh              # headless build + selftest
 ./scripts/build_linux.sh --service    # + displayxr-service / IPC
-./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux)
+./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux; --backend=x11|wayland|auto with the dual-backend app, in flight)
+./scripts/build_linux.sh --clean      # after installing a dependency into an already-configured tree (#1556)
 ./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
 ```
 Linux is **Vulkan-only** — a native Vulkan compositor presents over an X11/XCB surface (`comp_vk_native_window_xcb.c`); no D3D/Metal/GL backend. Apps pass their window via `XR_DXR_xlib_window_binding`. Full walkthrough: `docs/getting-started/building.md` § *Linux*; status + phases: `docs/roadmap/linux-support.md`. **Guard convention:** desktop-Linux code must gate on **`XRT_OS_LINUX_DESKTOP`** (`= XRT_OS_LINUX && !XRT_OS_ANDROID`) — a bare `XRT_OS_LINUX` also matches Android and will pull desktop-only symbols into the Android build.
