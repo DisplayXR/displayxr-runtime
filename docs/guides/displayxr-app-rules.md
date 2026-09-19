@@ -143,12 +143,17 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `XrDisplayDesktopPositionDXR` `left/top` + `XrDisplayInfoDXR` `displayPixelWidth/Height`);
   fall back to `set_fullscreen(NULL)` and log when nothing matches. The match only works at
   **desktop scale 1.0** — `wl_output` geometry is logical, the runtime's rect is device
-  pixels. Fullscreen is in any case the only mode the runtime supports on Wayland today,
-  and *windowed* Wayland additionally needs the compositor geometry service
-  (`docs/specs/runtime/wayland-window-geometry.md`) for the phase anchor. Reference
-  implementation: `test_apps/common/dxr_linux_window.cpp`
-  (`DxrLinuxWindow::create_wayland`); full contract:
-  `docs/specs/extensions/XR_DXR_wayland_surface_binding.md`.
+  pixels. **Also declare your size.** A `wl_surface` has no intrinsic size — the buffer
+  the runtime attaches is what *defines* it — so chain `XrWaylandSurfaceGeometryDXR`
+  (spec v2) with the size from the configure you just acked, plus the matched output's
+  `wl_output.mode` refresh, and call `xrSetWaylandSurfaceGeometryDXR` on every later
+  configure that changes the size. Omit it and the runtime falls back to sizing the
+  swapchain to the panel, which on Wayland does not mis-size your window — it *resizes*
+  it to the panel. Windowed Wayland additionally needs the compositor geometry service
+  (`docs/specs/runtime/wayland-window-geometry.md`) for the phase anchor: the size comes
+  from you, the position comes from the compositor. Reference implementation:
+  `test_apps/common/dxr_linux_window.cpp` (`DxrLinuxWindow::create_wayland`); full
+  contract: `docs/specs/extensions/XR_DXR_wayland_surface_binding.md`.
 
 - **INV-1.4 (Android) — Opt out of view-bounds sandboxing in YOUR manifest.** The runtime
   anchors the weave's interlace phase to your window's on-screen origin, which it learns by

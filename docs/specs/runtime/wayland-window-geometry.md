@@ -116,7 +116,11 @@ than on any particular vendor. Files install system-wide to
 per-user `~/.local/share/...` path used for manual dev installs). Note the
 extension still has to be *enabled* per user session — a package can seed this
 via a dconf default for `org.gnome.shell enabled-extensions`, but it cannot be
-force-enabled for users who have opted out.
+force-enabled for users who have opted out. A package must also **say in its
+post-install output that a newly installed extension only takes effect at the
+user's next login** — a Wayland session cannot restart GNOME Shell the way Alt+F2
+`r` does under X11, so until the user logs out the publisher is simply absent and
+every consumer silently falls back to display-scoped weaving.
 
 **Schema evolution is additive within a version.** Publishers may add fields
 freely; consumers look up only what they know and ignore the rest. Anything
